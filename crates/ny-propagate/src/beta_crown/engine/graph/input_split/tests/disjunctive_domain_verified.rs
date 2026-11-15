@@ -4,7 +4,7 @@
 
 //! Parity tests for `disjunctive_domain_verified` against the reference
 //! `stop_criterion_general` from alpha-beta-CROWN
-//! (`auto_LiRPA/utils.py:115-137`). Part of #3740.
+//! (`auto_LiRPA/utils.py:115-137`).
 
 use super::*;
 

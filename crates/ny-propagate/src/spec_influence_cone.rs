@@ -251,6 +251,11 @@ pub(crate) fn compute(
                     cols: current.cols.through_window(kw, sw, pw),
                 })
             }
+            // Global-3d pool: every output channel depends on the WHOLE
+            // (D, H, W) volume, and this cone only models an (H, W) plane —
+            // fail OPEN (fully live) rather than under-approximate influence,
+            // which could wrongly prune inputs that matter.
+            Layer::AveragePool(pool) if pool.global_3d => None,
             Layer::AveragePool(pool) => {
                 let (kh, kw) = pool.kernel_size;
                 let (sh, sw) = pool.stride;

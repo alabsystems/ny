@@ -52,7 +52,7 @@ impl GraphBetaState {
     /// Compute analytical β gradients for multi-objective verification.
     ///
     /// Disjunctive: optimize min margin (all objectives must verify → focus on worst).
-    /// Conjunctive: optimize max margin (any objective suffices → focus on best). #3334
+    /// Conjunctive: optimize max margin (any objective suffices → focus on best).
     ///
     /// The gradient is computed for the "critical" objective (the one with min/max margin).
     /// This is a subgradient of the max-min (or max-max) function.
@@ -124,7 +124,7 @@ impl GraphBetaState {
     }
 
     /// Compute analytical β gradients when intermediate rows already correspond
-    /// one-to-one with objective rows from a dense spec matrix (#4306).
+    /// one-to-one with objective rows from a dense spec matrix.
     pub fn compute_analytical_gradients_multi_objective_spec_rows(
         &mut self,
         intermediate: &GraphAlphaCrownIntermediate,

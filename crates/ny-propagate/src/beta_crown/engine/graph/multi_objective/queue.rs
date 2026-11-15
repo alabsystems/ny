@@ -260,6 +260,8 @@ pub(super) fn apply_leaf_verdict(
     match verdict {
         GraphMipLeafVerdict::VerifiedAllRows => {
             lifecycle.domains_verified += 1;
+            // #vit-v3-bankable: counted for the per-row cover frame.
+            lifecycle.domains_verified_by_leaf_oracle += 1;
             // This exact close has the same region-wide authority as a bound
             // close. Publish its pure ReLU history once, at the sole terminal
             // disposition point for the leaf verdict.
@@ -695,6 +697,37 @@ pub(super) fn apply_batched_results(
                 lifecycle.unresolved_due_to_violated_drop = true;
             }
             MultiObjectiveGraphDomainResult::Children(children) => {
+                // `Children([])` is the both-children-infeasible fold: every
+                // evaluated child of the parent raised `InfeasibleDomain`, so
+                // the PARENT'S whole region is claimed empty by two error
+                // returns and no bound (the only producer is the batched
+                // fold's assembly, `batched_multi.rs`, which builds an empty
+                // vec exactly when EVERY evaluated child came back
+                // `Infeasible`).
+                //
+                // #spine-legacy-lanes, the certified-infeasibility rule of M2c
+                // (ENGINE_PROGRAM §2: "Infeasible-domain closes must be
+                // certified; Err-as-close is forbidden — the vit alarm's
+                // double-Infeasible path"): the graph lane carries no
+                // certified emptiness value, so this close is REFUSED on every
+                // run, fenced or not. It folds EXACTLY like
+                // `InfeasibleCoverRefused` — the with_constraint-level double
+                // infeasibility, which was always conservative — so the
+                // run can no longer publish `Verified` on it, and it stays
+                // counted. Downgrade-only: nothing is queued, no bound or
+                // verdict is created. Measured exposure before the change:
+                // 1,549 `[bab-stop]` lines in scratchpad run logs (496 of them
+                // `status=verified`) all read `infeasible=0`, and no run log
+                // holds a `[mo-fold] infeasible-pair` line.
+                if children.is_empty() {
+                    lifecycle.domains_infeasible += 1;
+                    lifecycle.unresolved_due_to_propagation_failure = true;
+                    // #vit-margin-alpha-complex (P8): counted for the
+                    // fenced run's emptiness gate (bookkeeping only).
+                    super::containment_fence_lane::note_emptiness_claim(
+                        super::containment_fence_lane::EmptinessClaim::FoldPair,
+                    );
+                }
                 apply_batched_children(
                     children,
                     queue,
@@ -743,6 +776,27 @@ pub(super) fn apply_batched_results(
             MultiObjectiveGraphDomainResult::DeadlineExpired => {
                 // The pre-scan above already latched the typed batch status.
             }
+            MultiObjectiveGraphDomainResult::InfeasibleEmpty => {
+                // #vit-bank-gate: EXACTLY the `AlreadyVerified` fold (the
+                // verified count is what `finalize_multi_objective_result`
+                // reads, so it must not move), PLUS the infeasibility count
+                // that makes the emptiness claim visible in `[bab-stop]`.
+                lifecycle.domains_verified += 1;
+                lifecycle.domains_infeasible += 1;
+                super::containment_fence_lane::note_emptiness_claim(
+                    super::containment_fence_lane::EmptinessClaim::FoldEmpty,
+                );
+            }
+            MultiObjectiveGraphDomainResult::InfeasibleCoverRefused => {
+                // #vit-bank-gate: EXACTLY the `PropagationFailure` fold (the
+                // conservative disposition — this run cannot publish
+                // `Verified`), PLUS the infeasibility count.
+                lifecycle.unresolved_due_to_propagation_failure = true;
+                lifecycle.domains_infeasible += 1;
+                super::containment_fence_lane::note_emptiness_claim(
+                    super::containment_fence_lane::EmptinessClaim::FoldCover,
+                );
+            }
         }
     }
 
@@ -756,6 +810,199 @@ pub(super) fn apply_batched_results(
     }
 
     Ok((status, leaf_violation))
+}
+
+#[cfg(test)]
+mod infeasible_pair_fold_tests {
+    use std::collections::BinaryHeap;
+    use std::time::Instant;
+
+    use super::*;
+
+    /// #spine-legacy-lanes (M2c certified-infeasibility rule): the
+    /// both-children-infeasible fold (`Children([])`) queues nothing, is
+    /// counted in `domains_infeasible`, and — the vit alarm's silent path —
+    /// now RAISES the propagation-failure flag, exactly like the
+    /// with_constraint-level `InfeasibleCoverRefused`, so a drain through it
+    /// can never finalize `Verified`. A non-empty `Children` must not be
+    /// counted or flagged.
+    #[test]
+    fn vit_bank_gate_infeasible_pair_folds_like_propagation_failure_and_is_counted() {
+        let mut queue = BinaryHeap::new();
+        let mut cut_pool = GraphCutPool::new(8);
+        let mut lifecycle = GraphBabLifecycle::new(Instant::now());
+        let mut clause_store = GraphClauseStore::disabled();
+
+        let (status, leaf_violation) = apply_batched_results(
+            vec![
+                MultiObjectiveGraphDomainResult::Children(Vec::new()),
+                MultiObjectiveGraphDomainResult::Children(Vec::new()),
+            ],
+            &mut queue,
+            &mut cut_pool,
+            &mut lifecycle,
+            false,
+            None,
+            &mut clause_store,
+        )
+        .expect("an empty children fold is infallible");
+
+        assert_eq!(status, MultiObjectiveBatchApplyStatus::Completed);
+        assert!(leaf_violation.is_none());
+        assert_eq!(
+            lifecycle.domains_infeasible, 2,
+            "one count per infeasible pair"
+        );
+        assert_eq!(
+            lifecycle.domains_verified, 0,
+            "an infeasible pair is not a verified domain"
+        );
+        assert!(queue.is_empty(), "nothing is queued for an empty child set");
+        assert!(
+            lifecycle.unresolved_due_to_propagation_failure && lifecycle.has_unresolved(),
+            "an uncertified double-infeasible close must leave the run unresolved"
+        );
+        // It is the SAME verdict-bearing state as the with_constraint-level
+        // refusal, and the drain can no longer finalize `Verified`.
+        let mut refused = GraphBabLifecycle::new(Instant::now());
+        let mut refused_queue = BinaryHeap::new();
+        let (refused_status, _) = apply_batched_results(
+            vec![MultiObjectiveGraphDomainResult::InfeasibleCoverRefused],
+            &mut refused_queue,
+            &mut GraphCutPool::new(8),
+            &mut refused,
+            false,
+            None,
+            &mut GraphClauseStore::disabled(),
+        )
+        .expect("a terminal fold is infallible");
+        assert_eq!(refused_status, MultiObjectiveBatchApplyStatus::Completed);
+        assert_eq!(
+            (
+                lifecycle.unresolved_due_to_propagation_failure,
+                lifecycle.domains_verified
+            ),
+            (
+                refused.unresolved_due_to_propagation_failure,
+                refused.domains_verified
+            )
+        );
+        assert!(!matches!(
+            super::super::finalize::finalize_multi_objective_result(&lifecycle, true).result,
+            BabVerificationStatus::Verified
+        ));
+
+        // A non-empty child set is neither counted nor flagged (the same
+        // minimal unverified domain as `violdrop_tests::unverified_domain`).
+        let input = ny_tensor::BoundedTensor::new(
+            ndarray::arr1(&[-1.0_f32, -1.0]).into_dyn(),
+            ndarray::arr1(&[1.0_f32, 1.0]).into_dyn(),
+        )
+        .expect("input box");
+        let child = MultiObjectiveGraphBabDomain::root(
+            std::collections::HashMap::new(),
+            vec![(-2.0, -0.5)],
+            &input,
+            &[0.0],
+            false,
+        )
+        .expect("root domain");
+        let mut plain = GraphBabLifecycle::new(Instant::now());
+        let mut plain_queue = BinaryHeap::new();
+        let (plain_status, _) = apply_batched_results(
+            vec![MultiObjectiveGraphDomainResult::Children(vec![(
+                child, false,
+            )])],
+            &mut plain_queue,
+            &mut GraphCutPool::new(8),
+            &mut plain,
+            false,
+            None,
+            &mut GraphClauseStore::disabled(),
+        )
+        .expect("folding children must not error");
+        assert_eq!(plain_status, MultiObjectiveBatchApplyStatus::Completed);
+        assert_eq!(plain_queue.len(), 1, "the surviving child is queued");
+        assert_eq!(plain.domains_infeasible, 0);
+        assert!(!plain.unresolved_due_to_propagation_failure);
+    }
+
+    /// #vit-bank-gate: the NoUnstable-infeasible site used to return
+    /// `AlreadyVerified`, byte-indistinguishable from a bound proof. Its new
+    /// variant must fold to EXACTLY the old verdict state (counted verified,
+    /// resolved, nothing queued — `finalize_multi_objective_result` needs
+    /// `domains_verified > 0`, so that count may not move) and ADDITIONALLY
+    /// be counted infeasible.
+    #[test]
+    fn vit_bank_gate_infeasible_empty_folds_like_already_verified_and_is_counted() {
+        let fold = |result: MultiObjectiveGraphDomainResult| {
+            let mut queue = BinaryHeap::new();
+            let mut cut_pool = GraphCutPool::new(8);
+            let mut lifecycle = GraphBabLifecycle::new(Instant::now());
+            let mut clause_store = GraphClauseStore::disabled();
+            let (status, leaf_violation) = apply_batched_results(
+                vec![result],
+                &mut queue,
+                &mut cut_pool,
+                &mut lifecycle,
+                false,
+                None,
+                &mut clause_store,
+            )
+            .expect("a terminal fold is infallible");
+            assert_eq!(status, MultiObjectiveBatchApplyStatus::Completed);
+            assert!(leaf_violation.is_none());
+            assert!(queue.is_empty());
+            (
+                lifecycle.domains_verified,
+                lifecycle.domains_infeasible,
+                lifecycle.has_unresolved(),
+            )
+        };
+        let (legacy_verified, legacy_infeasible, legacy_unresolved) =
+            fold(MultiObjectiveGraphDomainResult::AlreadyVerified);
+        let (new_verified, new_infeasible, new_unresolved) =
+            fold(MultiObjectiveGraphDomainResult::InfeasibleEmpty);
+        assert_eq!(
+            (new_verified, new_unresolved),
+            (legacy_verified, legacy_unresolved),
+            "verdict-bearing fold state must be identical to the legacy AlreadyVerified"
+        );
+        assert_eq!(legacy_infeasible, 0);
+        assert_eq!(new_infeasible, 1, "the emptiness claim must now be counted");
+    }
+
+    /// #vit-bank-gate: the zero-children parent used to fold as a bare
+    /// `PropagationFailure` with only a `debug!` line. The new variant keeps
+    /// that conservative verdict state exactly (unresolved, so the run cannot
+    /// publish `Verified`) and additionally counts it infeasible.
+    #[test]
+    fn vit_bank_gate_infeasible_cover_refused_folds_like_propagation_failure_and_is_counted() {
+        let mut queue = BinaryHeap::new();
+        let mut cut_pool = GraphCutPool::new(8);
+        let mut lifecycle = GraphBabLifecycle::new(Instant::now());
+        let mut clause_store = GraphClauseStore::disabled();
+        let (status, leaf_violation) = apply_batched_results(
+            vec![MultiObjectiveGraphDomainResult::InfeasibleCoverRefused],
+            &mut queue,
+            &mut cut_pool,
+            &mut lifecycle,
+            false,
+            None,
+            &mut clause_store,
+        )
+        .expect("a terminal fold is infallible");
+        assert_eq!(status, MultiObjectiveBatchApplyStatus::Completed);
+        assert!(leaf_violation.is_none());
+        assert!(queue.is_empty());
+        assert_eq!(lifecycle.domains_verified, 0);
+        assert_eq!(lifecycle.domains_infeasible, 1);
+        assert!(
+            lifecycle.unresolved_due_to_propagation_failure,
+            "the refused cover must stay the conservative #2143 PropagationFailure"
+        );
+        assert_eq!(lifecycle.unresolved_tags(), "propagation_failure");
+    }
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@
 //! Extracted from crown_partial.rs to stay within the 500-line limit.
 
 use super::crown_partial::PartialCrownPropagationResult;
+use super::forward::CertifiedIbpBox;
 use super::sparse_merge::{find_unstable_dense_indices, scatter_sparse_crown_into_ibp};
 use crate::contiguous_flat_slice;
 use crate::layers::Layer;
@@ -69,11 +70,21 @@ fn try_gpu_partial_spec(
 /// `γ_n·S` coefficient-rounding error through the on-device backward GEMM
 /// chain — so this verdict-relevant INTERMEDIATE CROWN bound is a sound
 /// enclosure decided on GPU instead of on the CPU fallback. When `false`
-/// (speed-only callers, no gate), the existing fast unsound `crown_backward_gpu`
-/// is used. Either way, an `Err`/NaN below falls back to the proven CPU sound
-/// loop (the 0-wrong moat holds).
+/// this route now REFUSES (`Ok(None)`, the caller takes the proven CPU sound
+/// loop) instead of running the fast unsound `crown_backward_gpu`:
+/// #crown-partial-sound-forward — every result of this function is published
+/// by the sequential CROWN-IBP collector as an intermediate bound, i.e. it
+/// feeds a verdict, and an unsound (round-to-nearest, no `γ_n·S`) CROWN half
+/// wins the per-element intersection below whenever it is tighter, so a
+/// certified `output_bounds` alone cannot sanitize it. The gate defaults ON
+/// in production (`sound_gpu_gate::DEFAULT_SOUND_GPU_CROWN`) and the CLI
+/// exposes no opt-out, so the refusal changes no scored run; it closes the
+/// programmatic/test opt-out for this one verdict-feeding site. An `Err`/NaN
+/// from the sound dispatch still falls back to the CPU sound loop.
 ///
-/// Part of #3599 Phase 1
+/// `output_bounds` is the CERTIFIED per-layer box (`propagate_ibp_certified`):
+/// it selects the unstable rows, is scattered verbatim into the stable rows,
+/// and is the IBP operand of the final intersection.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn try_gpu_crown_partial_backward(
     layers: &[Layer],
@@ -83,7 +94,7 @@ pub(super) fn try_gpu_crown_partial_backward(
     use_sound: bool,
     output_dim: usize,
     output_shape: &[usize],
-    output_bounds: &BoundedTensor,
+    output_bounds: &CertifiedIbpBox,
     deadline: Option<Instant>,
 ) -> Result<Option<PartialCrownPropagationResult>> {
     if deadline.is_some_and(|limit| Instant::now() >= limit) {
@@ -91,6 +102,19 @@ pub(super) fn try_gpu_crown_partial_backward(
             "CROWN-IBP GPU partial: deadline exceeded before setup".to_string(),
         ));
     }
+    // #crown-partial-sound-forward: refuse the unsound backward outright — see
+    // the `use_sound` paragraph in the doc comment. Decided before any host
+    // work so a released gate costs nothing but this branch.
+    if !use_sound {
+        info!(
+            "CROWN-IBP GPU partial: soundness gate released (use_sound=false) — refusing the \
+             unsound GPU backward for a verdict-feeding intermediate bound, falling back to \
+             the CPU sound loop"
+        );
+        return Ok(None);
+    }
+    let certified_output_bounds = output_bounds;
+    let output_bounds = output_bounds.as_tensor();
     // Skip GPU dispatch for very small sub-networks — the identity spec
     // construction and GPU upload/download overhead exceeds the CPU backward
     // cost for ≤2 layers.
@@ -98,7 +122,7 @@ pub(super) fn try_gpu_crown_partial_backward(
         return Ok(None);
     }
 
-    // Phase 2 (#3599): compute unstable indices to determine effective spec count.
+    // Phase 2: compute unstable indices to determine effective spec count.
     // With >90% stable neurons, only bound unstable ones — reduces GPU GEMM work
     // and allows layers with large output_dim but few unstable neurons to fit.
     let unstable_indices = find_unstable_dense_indices(
@@ -152,7 +176,7 @@ pub(super) fn try_gpu_crown_partial_backward(
     }
 
     // Step 2: Build specification matrix.
-    // Phase 2 (#3599): when unstable indices are available, build a sparse
+    // Phase 2: when unstable indices are available, build a sparse
     // (n_unstable × output_dim) spec instead of the full (output_dim × output_dim)
     // identity. Each row selects one unstable output neuron.
     let spec = if let Some(ref idx) = unstable_indices {
@@ -190,11 +214,11 @@ pub(super) fn try_gpu_crown_partial_backward(
             "CROWN-IBP GPU partial: deadline exceeded before launch".to_string(),
         ));
     }
-    let dispatch = if use_sound {
-        gpu.crown_backward_gpu_sound(&gpu_layers, &spec, n_specs, &input_lower, &input_upper)
-    } else {
-        gpu.crown_backward_gpu(&gpu_layers, &spec, n_specs, &input_lower, &input_upper)
-    };
+    // `use_sound` is `true` on every path that reaches here (the `false` arm
+    // refused above), so only the SOUND resident backward is ever dispatched
+    // from this site.
+    let dispatch =
+        gpu.crown_backward_gpu_sound(&gpu_layers, &spec, n_specs, &input_lower, &input_upper);
     let gpu_result = match dispatch {
         Ok(r) => r,
         Err(e) => {
@@ -225,13 +249,14 @@ pub(super) fn try_gpu_crown_partial_backward(
     }
 
     // Step 5: Build BoundedTensor from GPU results.
-    // Phase 2 (#3599): sparse mode returns n_unstable bounds — scatter into
-    // full output_dim using IBP for stable positions before intersection.
+    // Phase 2: sparse mode returns n_unstable bounds — scatter into
+    // full output_dim using the CERTIFIED IBP box for stable positions before
+    // intersection.
     let crown_result = if let Some(ref idx) = unstable_indices {
         let scattered = scatter_sparse_crown_into_ibp(
             &gpu_result.lower_bounds,
             &gpu_result.upper_bounds,
-            output_bounds,
+            certified_output_bounds,
             idx,
             output_shape,
         );
@@ -255,10 +280,11 @@ pub(super) fn try_gpu_crown_partial_backward(
         bounds
     };
 
-    // Step 6: Intersect GPU-computed CROWN bounds with IBP bounds for tightening.
+    // Step 6: Intersect GPU-computed CROWN bounds with the CERTIFIED IBP box.
     // Per-element intersection keeps the tighter of CROWN vs IBP per neuron,
     // with disjoint fallback to union (conservative). Same pattern as the
-    // CPU CROWN-IBP tightening path.
+    // CPU CROWN-IBP tightening path. Both operands enclose (sound resident
+    // backward, certified forward), so the result encloses.
     let tightened = match output_bounds.intersection_per_element(&crown_result) {
         Some((result, disjoint)) => {
             if disjoint > 0 {
@@ -272,7 +298,7 @@ pub(super) fn try_gpu_crown_partial_backward(
         None => {
             // Shape mismatch — should not happen since both tensors are
             // constructed from the same output_shape. NaN is caught by the
-            // Step 4b pre-check above (#3752).
+            // Step 4b pre-check above.
             info!("CROWN-IBP GPU partial: intersection failed (shape mismatch?), using IBP bounds");
             return Ok(None);
         }

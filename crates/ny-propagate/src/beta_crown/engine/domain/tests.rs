@@ -13,12 +13,12 @@ use super::clip::merge_domain_bounds;
 use crate::beta_crown::branching::{NeuronConstraint, SplitHistory};
 use crate::beta_crown::engine::BetaCrownVerifier;
 
-/// Regression test (#2858, #2876): Exercises the production
+/// Regression test: Exercises the production
 /// `merge_domain_bounds` function — the same code path used by
 /// `apply_clip_interm_domain` in `domain/clip.rs` — to ensure NaN in
 /// either old or new bounds propagates through the merge.
 ///
-/// Before #2858 fix, the production merge used `f32::max`/`f32::min`
+/// Before the fix, the production merge used `f32::max`/`f32::min`
 /// (IEEE 754), which returns the non-NaN operand, silently absorbing
 /// NaN corruption into finite (unsound) bounds.
 #[test]
@@ -51,7 +51,7 @@ fn test_domain_merge_nan_propagation() {
     assert_eq!(4.0_f32.min(f32::NAN), 4.0, "f32::min absorbs NaN — unsound");
 }
 
-/// Regression test (#2858): NaN-aware change detection. IEEE 754 comparisons
+/// Regression test: NaN-aware change detection. IEEE 754 comparisons
 /// like `NaN > x` return false, so NaN-only changes would be classified as
 /// "unchanged" without explicit NaN checks. The fix adds `is_nan()` checks
 /// to the change detection loop.
@@ -105,7 +105,7 @@ fn make_layer_bounds(lower: &[f32], upper: &[f32]) -> Arc<BoundedTensor> {
     )
 }
 
-/// Regression test for #2710: apply_history_constraints must skip
+/// Regression test: apply_history_constraints must skip
 /// constraints with layer_idx == 0 (no pre-activation bounds for input layer).
 /// Skipping is sound — it produces looser bounds (original bounds unchanged).
 #[test]
@@ -133,7 +133,7 @@ fn test_apply_history_constraints_skip_layer_idx_zero() {
     assert_eq!(bounds[1].upper()[[0]], 3.0);
 }
 
-/// Regression test for #2710: apply_history_constraints must skip
+/// Regression test: apply_history_constraints must skip
 /// constraints with layer_idx > layer_bounds.len().
 #[test]
 fn test_apply_history_constraints_skip_layer_idx_too_large() {
@@ -154,7 +154,7 @@ fn test_apply_history_constraints_skip_layer_idx_too_large() {
     assert_eq!(bounds[0].upper()[[0]], 1.0);
 }
 
-/// Regression test for #2710: apply_history_constraints must skip
+/// Regression test: apply_history_constraints must skip
 /// constraints with neuron_idx >= neuron count in the layer.
 #[test]
 fn test_apply_history_constraints_skip_neuron_idx_out_of_bounds() {

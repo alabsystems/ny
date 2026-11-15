@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Regression test for #4321: the multi-objective graph verifier must reliably
+//! Regression test: the multi-objective graph verifier must reliably
 //! self-terminate at its own deadline on deep conv models.
 //!
 //! Symptom (TinyImageNet ResNet): the root/output-bound phase is dominated by
@@ -70,7 +70,7 @@ fn build_deep_conv_graph(
         graph.add_node(GraphNode::new(
             &relu_name,
             Layer::ReLU(ReLULayer),
-            vec![conv_name.clone()],
+            vec![conv_name],
         ));
         prev = relu_name;
     }

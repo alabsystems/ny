@@ -4,9 +4,6 @@
 
 //! INVPROP constraint-aware backward propagation routing.
 //!
-//! This module implements the INVPROP backward routing described in
-//! `designs/2026-01-29-invprop-output-constraint-propagation.md`.
-//!
 //! When INVPROP is enabled:
 //! - Layers in `apply_output_constraints_to` route to INVPROP-specific backward
 //! - Output constraints are applied via coefficient augmentation

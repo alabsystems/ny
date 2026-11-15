@@ -374,7 +374,7 @@ fn test_streaming_crown_batchnorm_negative_scale() {
     use crate::layers::BatchNormLayer;
 
     // Test BatchNorm with negative scale
-    // NOTE: Current impl swaps bounds for negative scale - potentially unsound (#306)
+    // NOTE: Current impl swaps bounds for negative scale - potentially unsound
     let weight = Array2::<f32>::eye(4);
     let bias = Some(Array1::<f32>::zeros(4));
     let linear = LinearLayer::new(weight, bias).unwrap();
@@ -492,7 +492,7 @@ fn test_streaming_crown_batchnorm_with_relu() {
     }
 }
 
-/// Regression test for #2280: streaming CROWN sound path must produce
+/// Regression test: streaming CROWN sound path must produce
 /// finite, non-inverted bounds. Exercises the NaN/inversion guard.
 #[ntest::timeout(10000)]
 #[test]
@@ -515,7 +515,7 @@ fn streaming_crown_sound_produces_valid_bounds_2280() {
     }
 }
 
-/// Verify centralized invalid-bound repair via new_repaired(Widen) (#2287, #3423).
+/// Verify centralized invalid-bound repair via new_repaired(Widen).
 #[test]
 fn streaming_invalid_bounds_repair_is_centralized() {
     use ny_tensor::RepairStrategy;
@@ -570,7 +570,6 @@ fn streaming_invalid_bounds_repair_is_centralized() {
 ///
 /// This is the only test in this file that checks concrete-output-inside-bounds
 /// (as opposed to equivalence with regular CROWN or shape-only checks).
-/// See #1928 for the broader test-quality gap this addresses.
 fn assert_streaming_crown_contains_concrete_outputs(
     network: &Network,
     input: &BoundedTensor,
@@ -787,7 +786,7 @@ fn streaming_crown_concrete_soundness_recomputes_between_checkpoints() {
     assert_streaming_crown_contains_concrete_outputs_with_config(&network, &input, 10, config);
 }
 
-/// #3082: Streaming CROWN falls back to IBP when CROWN backward degrades.
+/// Streaming CROWN falls back to IBP when CROWN backward degrades.
 ///
 /// Uses large weights that cause f32 overflow in CROWN backward, producing
 /// non-finite bounds. The streaming path should detect degradation via

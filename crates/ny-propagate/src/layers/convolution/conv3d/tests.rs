@@ -175,8 +175,8 @@ fn box_samples(input: &BoundedTensor) -> Vec<ArrayD<f32>> {
             let u = f64::from(upper.iter().nth(index).copied().unwrap_or(0.0));
             let t = match corner {
                 0 => 0.5,
-                1 => 0.5 * (f64::from(mixes[index]) + 1.0),
-                _ => 0.5 * (f64::from(mixes[len + index]) + 1.0),
+                1 => f64::midpoint(f64::from(mixes[index]), 1.0),
+                _ => f64::midpoint(f64::from(mixes[len + index]), 1.0),
             };
             *value = (l + t * (u - l)) as f32;
         }

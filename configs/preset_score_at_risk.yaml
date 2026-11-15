@@ -244,6 +244,18 @@ roots:
       CROWN axis (raw root bound 3.6e8x wider than IBP). A load refusal here
       costs nothing TODAY, which is exactly why it must still be recorded —
       the moment the category is recovered the stake stops being zero.
+      THE 2026 BANK DOES NOT PRICE THIS ROW (checked 2026-10-08). 2567586c6
+      banked the 2026 competition's yolo_2023 set
+      (reports/measured-2026/yolo_2023.csv, 56/72 unsat since e7a714bb9), so
+      the "dead on the CROWN axis" reading above is a 2026-08-11 fact, not a
+      current one. That set shares 10 of its 72 vnnlib properties with this
+      2025 set (9 of the 10 are unsat there), and it is not an input of the
+      2025 scorer (--measured reports/measured, --ext-measured
+      reports/measured-ext), which binds credit to the vnncomp2025 instances;
+      no 2025-set bank exists. This row therefore stays 0.0 until the 2025 set
+      is measured and the scorecard rerun. A load refusal of TinyYOLO.onnx
+      does delete the 2026 field's bank today; this file is the 2025 board and
+      does not price that field.
 
   # ---- vnncomp2024 (alternate-year roots for already-scored benchmarks) ----
   - root: benchmarks/vnncomp2024/benchmarks/cifar100

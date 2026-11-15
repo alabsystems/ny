@@ -4,7 +4,7 @@
 
 //! DAG gradient dispatch delegation for the root alpha collection path.
 //!
-//! Part of #4036: when `config.gradient_method` is not SPSA, the root
+//! When `config.gradient_method` is not SPSA, the root
 //! collection loop delegates to the full DAG optimizer which properly
 //! dispatches AnalyticChain, FD, and Analytic gradient methods.
 
@@ -152,7 +152,22 @@ impl GraphNetwork {
         // only 54 seconds left after the first decisive 101-second cascade.
         //
         // Keep every ordinary route on its historical recollection contract.
-        let typed_reference = cgan_sparse_target_complete || cgan_complete_crown_ibp;
+        //
+        // #vit-crown-interm: the capped `fix_interm_bounds: false` route
+        // (`crown_ibp_reference_cap_secs`) also publishes the optimizer's own
+        // map. That map is the CROWN-IBP reference the loop started from,
+        // intersected with every mid-loop refresh — a certified, shrink-only
+        // enclosure. Re-collecting it here would spend another cap on the same
+        // box (a capped collection never enters the complete-map cache) and,
+        // once the alpha deadline has expired, would publish plain IBP.
+        let capped_fi_reference = config.crown_ibp_reference_cap().is_some()
+            && matches!(
+                reference_bounds_source,
+                AlphaReferenceBoundsSource::CrownIbp
+            );
+        let typed_reference =
+            cgan_sparse_target_complete || cgan_complete_crown_ibp || capped_fi_reference;
+        let publication_started = std::time::Instant::now();
         let phase_deadline_expired = checkpoint_candidate && config.past_deadline();
         let (mut reference_bounds, phase_cap_checkpoint) =
             match resolve_reference_bounds_publication(
@@ -237,13 +252,39 @@ impl GraphNetwork {
             )));
         }
 
+        // #vit-crown-interm: say which map the typed route published, and
+        // bound the all-node alpha pass below by the same reference cap. A node
+        // the capped pass does not reach keeps its box from `reference_bounds`
+        // (the CROWN-IBP map just published), so the cap can only forgo
+        // alpha-tightening, never loosen the published map.
+        let reference_cap = config.crown_ibp_reference_cap();
+        ref_map_telemetry::emit_typed_route_publication(
+            if capped_fi_reference {
+                "artifact"
+            } else {
+                "recollect"
+            },
+            reference_bounds.len(),
+            reference_cap,
+            publication_started.elapsed(),
+        );
+        let post_pass_deadline = match reference_cap {
+            Some(cap) => {
+                let capped = std::time::Instant::now()
+                    .checked_add(cap)
+                    .unwrap_or_else(std::time::Instant::now);
+                Some(config.deadline.map_or(capped, |outer| outer.min(capped)))
+            }
+            None => config.deadline,
+        };
+
         // Collect bounds at all nodes using the optimized alpha state.
         let all_bounds = self.collect_crown_bounds_with_alpha(
             input,
             &reference_bounds,
             &alpha_state,
             engine,
-            config.deadline,
+            post_pass_deadline,
         )?;
 
         // Intersect the DAG optimizer's output bounds with the collection bounds.

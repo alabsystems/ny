@@ -8,7 +8,7 @@ use ny_propagate::BetaCrownConfig;
 
 /// Verify that solver.alpha-crown.full_conv_alpha flows through to
 /// AlphaCrownConfig. The reference cifar100 config sets this to false
-/// to enable channel-shared alpha (63x fewer parameters). #4404.
+/// to enable channel-shared alpha (63x fewer parameters).
 #[test]
 fn apply_preset_maps_full_conv_alpha_into_alpha_config_4404() {
     let preset = PresetConfig {
@@ -174,6 +174,130 @@ bab:
     assert!(enabled.alpha_config.forward_linear_deadline_fallback_to_ibp);
 }
 
+/// #vit-crown-interm: `crown_ibp_reference_cap_secs` parses from the production
+/// spelling (`solver: alpha-crown:`), arrives in `AlphaCrownConfig`, resolves
+/// only together with `fix_interm_bounds: false`, and inadmissible values are
+/// refused at load instead of silently measuring the uncapped route.
+#[test]
+fn apply_preset_maps_crown_ibp_reference_cap_and_rejects_bad_values() {
+    let mut absent = BetaCrownConfig::default();
+    apply_preset(&mut absent, &PresetConfig::default()).expect("empty preset should apply");
+    assert_eq!(absent.alpha_config.crown_ibp_reference_cap_secs, None);
+    assert_eq!(absent.alpha_config.crown_ibp_reference_cap(), None);
+
+    let preset: PresetConfig = serde_yaml::from_str(
+        r#"
+solver:
+  alpha-crown:
+    fix_interm_bounds: false
+    crown_ibp_reference_cap_secs: 12
+"#,
+    )
+    .expect("typed reference-cap key must parse");
+    assert_eq!(
+        preset.solver.alpha_crown.crown_ibp_reference_cap_secs,
+        Some(12)
+    );
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).expect("valid reference cap must apply");
+    assert_eq!(config.alpha_config.crown_ibp_reference_cap_secs, Some(12));
+    assert_eq!(
+        config.alpha_config.crown_ibp_reference_cap(),
+        Some(std::time::Duration::from_secs(12))
+    );
+
+    // Without `fix_interm_bounds: false` the key arrives but is inert.
+    let inert: PresetConfig = serde_yaml::from_str(
+        r#"
+bab:
+  alpha_crown:
+    crown_ibp_reference_cap_secs: 30
+"#,
+    )
+    .expect("typed reference-cap key must parse under bab");
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &inert).expect("valid reference cap must apply");
+    assert_eq!(config.alpha_config.crown_ibp_reference_cap_secs, Some(30));
+    assert_eq!(config.alpha_config.crown_ibp_reference_cap(), None);
+
+    for invalid in [0u64, 3601] {
+        let bad = PresetConfig {
+            solver: SolverPreset {
+                alpha_crown: AlphaCrownPreset {
+                    crown_ibp_reference_cap_secs: Some(invalid),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let error = apply_preset(&mut BetaCrownConfig::default(), &bad)
+            .expect_err("an inadmissible reference cap must be refused")
+            .to_string();
+        assert!(
+            error.contains("crown_ibp_reference_cap_secs"),
+            "refusal must name the key: {error}"
+        );
+    }
+}
+
+/// #softmax-fixed-index: `solver.alpha-crown.softmax` accepts exactly the two
+/// decomposition modes (ASCII case-insensitive) in BOTH preset sections, and
+/// refuses anything else at load — a misspelled `complex_fixed_index` must not
+/// silently measure the default direct-LSE relaxation.
+#[test]
+fn apply_preset_accepts_only_the_known_softmax_modes() {
+    for (yaml, section) in [
+        (
+            "solver:\n  alpha-crown:\n    softmax: complex_fixed_index\n",
+            "solver",
+        ),
+        ("solver:\n  alpha-crown:\n    softmax: complex\n", "solver"),
+        (
+            "solver:\n  alpha-crown:\n    softmax: Complex_Fixed_Index\n",
+            "solver",
+        ),
+        (
+            "bab:\n  alpha_crown:\n    softmax: complex_fixed_index\n",
+            "bab",
+        ),
+    ] {
+        let preset: PresetConfig =
+            serde_yaml::from_str(yaml).unwrap_or_else(|e| panic!("{section}: {yaml:?}: {e}"));
+        apply_preset(&mut BetaCrownConfig::default(), &preset)
+            .unwrap_or_else(|e| panic!("{section}: a known softmax mode must apply: {e}"));
+    }
+    assert_eq!(
+        SOFTMAX_PRESET_MODES,
+        ["complex", "complex_fixed_index"],
+        "the resolver in commands/beta_crown matches these spellings"
+    );
+
+    for (yaml, location) in [
+        (
+            "solver:\n  alpha-crown:\n    softmax: fixed_index\n",
+            "solver.alpha_crown.softmax",
+        ),
+        (
+            "bab:\n  alpha_crown:\n    softmax: complex_fixed_idx\n",
+            "bab.alpha_crown.softmax",
+        ),
+        (
+            "solver:\n  alpha-crown:\n    softmax: lse\n",
+            "solver.alpha_crown.softmax",
+        ),
+    ] {
+        let preset: PresetConfig = serde_yaml::from_str(yaml).expect("the key itself parses");
+        let error = apply_preset(&mut BetaCrownConfig::default(), &preset)
+            .expect_err("an unknown softmax mode must be refused at preset load")
+            .to_string();
+        assert!(
+            error.contains(location),
+            "refusal must name {location}: {error}"
+        );
+    }
+}
+
 /// `alpha_crown.fix_interm_bounds` reaches `AlphaCrownConfig::fix_interm_bounds`
 /// from BOTH the `solver:` and the `bab:` section (the two locations
 /// `apply_preset` feeds through `apply_alpha_preset`), and an ABSENT key leaves
@@ -295,6 +419,179 @@ bab:
     assert!(config.alpha_config.fix_interm_bounds);
     assert!(config.alpha_config.cgan_complete_crown_ibp_root);
     assert!(!config.alpha_config.cgan_sparse_target_complete_root);
+}
+
+/// `#crown-root-map`: `bab.alpha_crown.cgan_crown_root_map` resolves from a
+/// yaml into `AlphaCrownConfig::cgan_crown_root_map`, and an empty preset
+/// leaves the dark default (false) untouched. The key names a CONSUMER of the
+/// cascade `cgan_complete_crown_ibp_root` arms; the resolver does not couple
+/// them, the input-split root collector re-checks eligibility at runtime.
+#[test]
+fn cgan_crown_root_map_is_typed_and_default_dark() {
+    let mut default_config = BetaCrownConfig::default();
+    assert!(!default_config.alpha_config.cgan_crown_root_map);
+    apply_preset(&mut default_config, &PresetConfig::default())
+        .expect("empty preset should preserve the dark default");
+    assert!(!default_config.alpha_config.cgan_crown_root_map);
+
+    // The shipped cgan shape: `bound_prop_method: crown` selects the arm the
+    // key is consumed by; the key itself must not touch the method.
+    let preset: PresetConfig = serde_yaml::from_str(
+        r#"
+solver:
+  bound_prop_method: crown
+bab:
+  alpha_crown:
+    cgan_complete_crown_ibp_root: true
+    cgan_crown_root_map: true
+"#,
+    )
+    .expect("typed crown root-map policy");
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).expect("typed crown root-map policy should apply");
+    assert!(config.alpha_config.cgan_crown_root_map);
+    assert!(config.alpha_config.cgan_complete_crown_ibp_root);
+    assert!(!config.use_alpha_crown);
+    assert!(!config.use_forward_bounds);
+
+    let mut alpha_lane = BetaCrownConfig::default();
+    let key_only: PresetConfig = serde_yaml::from_str(
+        r#"
+bab:
+  alpha_crown:
+    cgan_crown_root_map: true
+"#,
+    )
+    .expect("key-only preset");
+    let method_before = alpha_lane.use_alpha_crown;
+    apply_preset(&mut alpha_lane, &key_only).expect("key-only preset should apply");
+    assert!(alpha_lane.alpha_config.cgan_crown_root_map);
+    assert_eq!(
+        alpha_lane.use_alpha_crown, method_before,
+        "the key must not switch the lane's bound-prop method"
+    );
+}
+
+/// `#cgan-collector-dense` (E5): `bab.alpha_crown.cgan_collector_dense`
+/// resolves from a yaml into `AlphaCrownConfig::cgan_collector_dense`, an
+/// empty preset leaves the dark default (false) untouched, and an explicit
+/// `false` clears it. The key changes the conv MODE of the typed cascade,
+/// never which cascade runs or the lane's bound-prop method.
+#[test]
+fn cgan_collector_dense_is_typed_and_default_dark() {
+    let mut default_config = BetaCrownConfig::default();
+    assert!(!default_config.alpha_config.cgan_collector_dense);
+    apply_preset(&mut default_config, &PresetConfig::default())
+        .expect("empty preset should preserve the dark default");
+    assert!(!default_config.alpha_config.cgan_collector_dense);
+
+    let preset: PresetConfig = serde_yaml::from_str(
+        r#"
+solver:
+  bound_prop_method: crown
+bab:
+  alpha_crown:
+    cgan_complete_crown_ibp_root: true
+    cgan_crown_root_map: true
+    cgan_collector_dense: true
+"#,
+    )
+    .expect("typed dense-collector policy");
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).expect("typed dense-collector policy should apply");
+    assert!(config.alpha_config.cgan_collector_dense);
+    assert!(config.alpha_config.cgan_crown_root_map);
+    assert!(config.alpha_config.cgan_complete_crown_ibp_root);
+    assert!(!config.use_alpha_crown);
+
+    let explicit_off: PresetConfig = serde_yaml::from_str(
+        r#"
+bab:
+  alpha_crown:
+    cgan_collector_dense: false
+"#,
+    )
+    .expect("explicit-off preset");
+    let mut off = BetaCrownConfig::default();
+    off.alpha_config.cgan_collector_dense = true;
+    apply_preset(&mut off, &explicit_off).expect("explicit-off preset should apply");
+    assert!(
+        !off.alpha_config.cgan_collector_dense,
+        "an explicit false must clear the key"
+    );
+}
+
+/// `#cgan-unstable-rows`: `bab.alpha_crown.cgan_unstable_rows` and its
+/// companion `…_max_frac` resolve from a yaml into `AlphaCrownConfig`, an empty
+/// preset leaves the dark defaults (false / 0.9) untouched, and an explicit
+/// `false` clears the gate.
+///
+/// This asserts the RESOLVER only. It is necessary and NOT sufficient: the CLI
+/// bridge that writes the cell before the lane starts has been clobbered in a
+/// merge before. The collector's own unconditional
+/// `[unstable-rows] root armed=true source=typed` line under an armed yaml with
+/// ZERO `NY_*` set is the arrival proof.
+#[test]
+fn cgan_unstable_rows_is_typed_and_default_dark() {
+    let mut default_config = BetaCrownConfig::default();
+    assert!(!default_config.alpha_config.cgan_unstable_rows);
+    assert_eq!(default_config.alpha_config.cgan_unstable_rows_max_frac, 0.9);
+    apply_preset(&mut default_config, &PresetConfig::default())
+        .expect("empty preset should preserve the dark default");
+    assert!(!default_config.alpha_config.cgan_unstable_rows);
+    assert_eq!(default_config.alpha_config.cgan_unstable_rows_max_frac, 0.9);
+
+    let preset: PresetConfig = serde_yaml::from_str(
+        r#"
+solver:
+  bound_prop_method: crown
+bab:
+  alpha_crown:
+    cgan_complete_crown_ibp_root: true
+    cgan_crown_root_map: true
+    cgan_collector_dense: true
+    cgan_unstable_rows: true
+    cgan_unstable_rows_max_frac: 0.75
+"#,
+    )
+    .expect("typed unstable-rows policy");
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).expect("typed unstable-rows policy should apply");
+    assert!(config.alpha_config.cgan_unstable_rows);
+    assert_eq!(config.alpha_config.cgan_unstable_rows_max_frac, 0.75);
+    assert!(config.alpha_config.cgan_collector_dense);
+    assert!(config.alpha_config.cgan_complete_crown_ibp_root);
+
+    // The ceiling is independent of the gate: naming only the fraction must not
+    // arm the mechanism.
+    let frac_only: PresetConfig = serde_yaml::from_str(
+        r#"
+bab:
+  alpha_crown:
+    cgan_unstable_rows_max_frac: 0.5
+"#,
+    )
+    .expect("fraction-only preset");
+    let mut frac_config = BetaCrownConfig::default();
+    apply_preset(&mut frac_config, &frac_only).expect("fraction-only preset should apply");
+    assert!(!frac_config.alpha_config.cgan_unstable_rows);
+    assert_eq!(frac_config.alpha_config.cgan_unstable_rows_max_frac, 0.5);
+
+    let explicit_off: PresetConfig = serde_yaml::from_str(
+        r#"
+bab:
+  alpha_crown:
+    cgan_unstable_rows: false
+"#,
+    )
+    .expect("explicit-off preset");
+    let mut off = BetaCrownConfig::default();
+    off.alpha_config.cgan_unstable_rows = true;
+    apply_preset(&mut off, &explicit_off).expect("explicit-off preset should apply");
+    assert!(
+        !off.alpha_config.cgan_unstable_rows,
+        "an explicit false must clear the key"
+    );
 }
 
 /// `alpha_crown.alpha_zero_yield_frac` reaches `AlphaCrownConfig::alpha_zero_yield_frac`,
@@ -893,5 +1190,393 @@ fn apply_preset_maps_alpha_envelope_grad_into_alpha_config() {
     assert!(
         !config.alpha_config.alpha_envelope_grad,
         "an explicit `false` must disarm, not be indistinguishable from absent"
+    );
+}
+
+/// #mip-demand — the typed kill switch must arrive through the YAML ROUTE, not
+/// through an env var.
+///
+/// `vnncomp_scripts/run_instance.sh` exports ZERO `NY_*` variables, so a lever
+/// that can only be reached from the environment is dead capability in
+/// competition. This asserts the whole delivery seam for
+/// `bab.phase_budget.demand_sized_mip_reserve`: the key PARSES from production
+/// YAML, `apply_preset` writes it into the typed `BetaCrownConfig` cell the
+/// ledger reads, and the shipped default (nothing set) is the armed sizing
+/// rule. Shown able to fail in both directions — the default and the override
+/// are asserted to be DIFFERENT values.
+#[test]
+fn demand_sized_mip_reserve_is_delivered_by_the_typed_preset_key() {
+    let mut default_config = BetaCrownConfig::default();
+    apply_preset(&mut default_config, &PresetConfig::default())
+        .expect("an empty preset must preserve the shipped default");
+    assert!(
+        default_config.phase_budget.demand_sized_mip_reserve,
+        "#mip-demand ships ARMED: an unset key must leave the sizing rule on"
+    );
+
+    let preset: PresetConfig = serde_yaml::from_str(
+        r#"
+bab:
+  phase_budget:
+    demand_sized_mip_reserve: false
+"#,
+    )
+    .expect("the typed kill switch must parse from production YAML");
+    assert_eq!(
+        preset.bab.phase_budget.demand_sized_mip_reserve,
+        Some(false),
+        "the yaml key must reach the preset struct"
+    );
+
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).expect("apply");
+    assert!(
+        !config.phase_budget.demand_sized_mip_reserve,
+        "the kill switch must reach the typed cell the phase ledger reads — \
+         the whole point of the seam"
+    );
+    assert_ne!(
+        config.phase_budget.demand_sized_mip_reserve,
+        default_config.phase_budget.demand_sized_mip_reserve,
+        "the test must be able to fail: override and default must differ"
+    );
+}
+
+/// #seq-single-reserve / #seq-early-attack — both typed kill switches must
+/// arrive through the YAML ROUTE, not through an env var.
+///
+/// `vnncomp_scripts/run_instance.sh` exports ZERO `NY_*` variables, so a
+/// lever reachable only from the environment is dead capability in
+/// competition. This asserts the whole delivery seam for
+/// `bab.phase_budget.sequential_warmup_single_reserve` and
+/// `bab.phase_budget.sequential_early_quit_attack`: the keys PARSE from
+/// production YAML, `apply_preset` writes them into the typed
+/// `BetaCrownConfig` cells the engine reads, and the shipped default
+/// (nothing set) is the armed fix. Shown able to fail in both directions —
+/// the default and the override are asserted to be DIFFERENT values.
+#[test]
+fn sequential_initial_phase_kill_switches_are_delivered_by_typed_preset_keys() {
+    let mut default_config = BetaCrownConfig::default();
+    apply_preset(&mut default_config, &PresetConfig::default())
+        .expect("an empty preset must preserve the shipped defaults");
+    assert!(
+        default_config.phase_budget.sequential_warmup_single_reserve,
+        "#seq-single-reserve ships ARMED: an unset key must leave the fix on"
+    );
+    assert!(
+        default_config.phase_budget.sequential_early_quit_attack,
+        "#seq-early-attack ships ARMED: an unset key must leave the fix on"
+    );
+
+    let preset: PresetConfig = serde_yaml::from_str(
+        r#"
+bab:
+  phase_budget:
+    sequential_warmup_single_reserve: false
+    sequential_early_quit_attack: false
+"#,
+    )
+    .expect("the typed kill switches must parse from production YAML");
+    assert_eq!(
+        preset.bab.phase_budget.sequential_warmup_single_reserve,
+        Some(false),
+        "the warmup-reserve yaml key must reach the preset struct"
+    );
+    assert_eq!(
+        preset.bab.phase_budget.sequential_early_quit_attack,
+        Some(false),
+        "the early-attack yaml key must reach the preset struct"
+    );
+
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).expect("apply");
+    assert!(
+        !config.phase_budget.sequential_warmup_single_reserve,
+        "the warmup-reserve kill switch must reach the typed cell the \
+         sequential initial phase reads — the whole point of the seam"
+    );
+    assert!(
+        !config.phase_budget.sequential_early_quit_attack,
+        "the early-attack kill switch must reach the typed cell the \
+         sequential initial phase reads"
+    );
+    assert_ne!(
+        config.phase_budget.sequential_warmup_single_reserve,
+        default_config.phase_budget.sequential_warmup_single_reserve,
+        "the test must be able to fail: override and default must differ"
+    );
+    assert_ne!(
+        config.phase_budget.sequential_early_quit_attack,
+        default_config.phase_budget.sequential_early_quit_attack,
+        "the test must be able to fail: override and default must differ"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #vit-margin-alpha: the two typed keys of the certified C-row margin ascent.
+// ---------------------------------------------------------------------------
+
+/// Both keys must reach `AlphaCrownConfig` from a YAML at BOTH locations
+/// `apply_preset` feeds (`solver.alpha-crown`, the spelling the shipped vit
+/// preset uses, and `bab.alpha_crown`), and an omitted key must stay dark.
+#[test]
+fn vit_margin_alpha_keys_reach_the_alpha_config_from_both_locations() {
+    let solver: PresetConfig = serde_yaml::from_str(
+        "solver:\n  alpha-crown:\n    root_alpha_margin: true\n    \
+         root_alpha_margin_gradient: true\n    matmul_alpha: true\n    spec_slots: 9\n",
+    )
+    .expect("solver.alpha-crown margin keys should parse");
+    let mut config = BetaCrownConfig::default();
+    assert!(
+        !config.alpha_config.root_alpha_margin_gradient && !config.alpha_config.matmul_alpha,
+        "the test must be able to fail: both defaults are dark"
+    );
+    apply_preset(&mut config, &solver).expect("solver-located keys apply");
+    assert!(config.alpha_config.root_alpha_margin);
+    assert!(config.alpha_config.root_alpha_margin_gradient);
+    assert!(config.alpha_config.matmul_alpha);
+    assert_eq!(config.alpha_config.alpha_spec_slots, 9);
+
+    let bab: PresetConfig = serde_yaml::from_str(
+        "bab:\n  alpha_crown:\n    root_alpha_margin_gradient: true\n    matmul_alpha: false\n",
+    )
+    .expect("bab.alpha_crown margin keys should parse");
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &bab).expect("bab-located keys apply");
+    assert!(config.alpha_config.root_alpha_margin_gradient);
+    assert!(!config.alpha_config.matmul_alpha);
+
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &PresetConfig::default()).expect("empty preset applies");
+    assert!(!config.alpha_config.root_alpha_margin_gradient);
+    assert!(!config.alpha_config.matmul_alpha);
+}
+
+/// Promotion is not arming: no shipped preset may set either key until a
+/// current sound-path measurement justifies it in its own commit.
+#[test]
+fn no_shipped_preset_arms_the_vit_margin_alpha_keys() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+    let mut armed: Vec<String> = Vec::new();
+    for year in ["vnncomp24", "vnncomp25", "vnncomp26"] {
+        let Ok(entries) = fs::read_dir(root.join(year)) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let raw = fs::read_to_string(&path).expect("readable preset");
+            let preset: PresetConfig = serde_yaml::from_str(&raw)
+                .unwrap_or_else(|error| panic!("preset {} must parse: {error}", path.display()));
+            for alpha in [&preset.solver.alpha_crown, &preset.bab.alpha_crown] {
+                if alpha.root_alpha_margin_gradient.is_some() || alpha.matmul_alpha.is_some() {
+                    armed.push(format!(
+                        "{year}/{}",
+                        path.file_name().unwrap().to_string_lossy()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        armed.is_empty(),
+        "these shipped presets set a #vit-margin-alpha key without a measurement \
+         commit: {armed:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #vit-margin-alpha-complex (P6): the freeze key of the certified C-row margin
+// ascent (MulBinary / Reciprocal α frozen at their DAG-init values).
+// ---------------------------------------------------------------------------
+
+/// The freeze key must reach `AlphaCrownConfig` from BOTH locations
+/// `apply_preset` feeds, an explicit `false` must overwrite, and an omitted key
+/// must stay dark (the default the lane's refusal depends on).
+#[test]
+fn vit_margin_alpha_freeze_key_reaches_the_alpha_config_and_defaults_dark() {
+    assert!(
+        !BetaCrownConfig::default()
+            .alpha_config
+            .margin_alpha_freeze_mul_reciprocal,
+        "the freeze key must be default-dark so every shipped preset is byte-identical"
+    );
+    let solver: PresetConfig = serde_yaml::from_str(
+        "solver:\n  alpha-crown:\n    root_alpha_margin: true\n    \
+         root_alpha_margin_gradient: true\n    matmul_alpha: true\n    \
+         margin_alpha_freeze_mul_reciprocal: true\n",
+    )
+    .expect("solver.alpha-crown freeze key should parse");
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &solver).expect("solver-located freeze key applies");
+    assert!(config.alpha_config.margin_alpha_freeze_mul_reciprocal);
+    assert!(config.alpha_config.root_alpha_margin_gradient);
+
+    let bab: PresetConfig = serde_yaml::from_str(
+        "bab:\n  alpha_crown:\n    margin_alpha_freeze_mul_reciprocal: true\n",
+    )
+    .expect("bab.alpha_crown freeze key should parse");
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &bab).expect("bab-located freeze key applies");
+    assert!(config.alpha_config.margin_alpha_freeze_mul_reciprocal);
+
+    let off: PresetConfig = serde_yaml::from_str(
+        "bab:\n  alpha_crown:\n    margin_alpha_freeze_mul_reciprocal: false\n",
+    )
+    .expect("an explicit false parses");
+    let mut config = BetaCrownConfig::default();
+    config.alpha_config.margin_alpha_freeze_mul_reciprocal = true;
+    apply_preset(&mut config, &off).expect("explicit false applies");
+    assert!(
+        !config.alpha_config.margin_alpha_freeze_mul_reciprocal,
+        "an explicit false must overwrite"
+    );
+
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &PresetConfig::default()).expect("empty preset applies");
+    assert!(!config.alpha_config.margin_alpha_freeze_mul_reciprocal);
+}
+
+/// Promotion is not arming: no shipped preset may set the freeze key until a
+/// measured, moat-checked arming commit edits this test.
+#[test]
+fn no_shipped_preset_arms_the_vit_margin_alpha_freeze_key() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+    let mut armed: Vec<String> = Vec::new();
+    let mut parsed = 0usize;
+    for year in ["vnncomp24", "vnncomp25", "vnncomp26"] {
+        let Ok(entries) = fs::read_dir(root.join(year)) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let raw = fs::read_to_string(&path).expect("readable preset");
+            let preset: PresetConfig = serde_yaml::from_str(&raw)
+                .unwrap_or_else(|error| panic!("preset {} must parse: {error}", path.display()));
+            parsed += 1;
+            for alpha in [&preset.solver.alpha_crown, &preset.bab.alpha_crown] {
+                if alpha.margin_alpha_freeze_mul_reciprocal.is_some() {
+                    armed.push(format!(
+                        "{year}/{}",
+                        path.file_name().unwrap().to_string_lossy()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(parsed > 0, "the shipped preset directories must resolve");
+    assert!(
+        armed.is_empty(),
+        "these shipped presets set the #vit-margin-alpha-complex freeze key without a \
+         measurement commit: {armed:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #vit-root-alpha (ENGINE_PROGRAM V2): the margin lane's search selector.
+// ---------------------------------------------------------------------------
+
+/// The selector reaches `AlphaCrownConfig` from BOTH locations, only the two
+/// tokens parse, an explicit `ascent` overwrites, and an omitted key stays at
+/// the certified ascent (bit-identical to the lane before V2).
+#[test]
+fn vit_root_alpha_search_key_reaches_the_alpha_config_and_defaults_dark() {
+    use ny_propagate::bounds::MarginAlphaSearch;
+    assert_eq!(
+        BetaCrownConfig::default().alpha_config.margin_alpha_search,
+        MarginAlphaSearch::Ascent,
+        "the selector must be default-dark so every shipped preset is byte-identical"
+    );
+    let solver: PresetConfig = serde_yaml::from_str(
+        "solver:\n  alpha-crown:\n    root_alpha_margin: true\n    \
+         root_alpha_margin_gradient: true\n    matmul_alpha: true\n    \
+         margin_alpha_search: joint_f32\n",
+    )
+    .expect("solver.alpha-crown selector should parse");
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &solver).expect("solver-located selector applies");
+    assert_eq!(
+        config.alpha_config.margin_alpha_search,
+        MarginAlphaSearch::JointF32
+    );
+
+    let bab: PresetConfig =
+        serde_yaml::from_str("bab:\n  alpha_crown:\n    margin_alpha_search: joint_f32\n")
+            .expect("bab.alpha_crown selector should parse");
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &bab).expect("bab-located selector applies");
+    assert_eq!(
+        config.alpha_config.margin_alpha_search,
+        MarginAlphaSearch::JointF32
+    );
+
+    let back: PresetConfig =
+        serde_yaml::from_str("bab:\n  alpha_crown:\n    margin_alpha_search: ascent\n")
+            .expect("an explicit ascent parses");
+    let mut config = BetaCrownConfig::default();
+    config.alpha_config.margin_alpha_search = MarginAlphaSearch::JointF32;
+    apply_preset(&mut config, &back).expect("explicit ascent applies");
+    assert_eq!(
+        config.alpha_config.margin_alpha_search,
+        MarginAlphaSearch::Ascent,
+        "an explicit ascent must overwrite"
+    );
+
+    assert!(
+        serde_yaml::from_str::<PresetConfig>(
+            "bab:\n  alpha_crown:\n    margin_alpha_search: joint\n"
+        )
+        .is_err(),
+        "an unknown token must not parse"
+    );
+
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &PresetConfig::default()).expect("empty preset applies");
+    assert_eq!(
+        config.alpha_config.margin_alpha_search,
+        MarginAlphaSearch::Ascent
+    );
+}
+
+/// Promotion is not arming: no shipped preset may set the V2 selector until a
+/// measured, moat-checked arming commit edits this test.
+#[test]
+fn no_shipped_preset_arms_the_vit_root_alpha_search_key() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+    let mut armed: Vec<String> = Vec::new();
+    let mut parsed = 0usize;
+    for year in ["vnncomp24", "vnncomp25", "vnncomp26"] {
+        let Ok(entries) = fs::read_dir(root.join(year)) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let raw = fs::read_to_string(&path).expect("readable preset");
+            let preset: PresetConfig = serde_yaml::from_str(&raw)
+                .unwrap_or_else(|error| panic!("preset {} must parse: {error}", path.display()));
+            parsed += 1;
+            for alpha in [&preset.solver.alpha_crown, &preset.bab.alpha_crown] {
+                if alpha.margin_alpha_search.is_some() {
+                    armed.push(format!(
+                        "{year}/{}",
+                        path.file_name().unwrap().to_string_lossy()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(parsed > 0, "the shipped preset directories must resolve");
+    assert!(
+        armed.is_empty(),
+        "these shipped presets set the #vit-root-alpha selector without a measurement \
+         commit: {armed:?}"
     );
 }

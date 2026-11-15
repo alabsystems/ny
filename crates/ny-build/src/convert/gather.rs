@@ -39,7 +39,7 @@ impl ConvertContext<'_> {
         } else if onnx_axis == 0 && data_is_constant {
             // Embedding lookup: constant data (weight table) never had a batch
             // dimension; axis=0 indexes the vocabulary axis. Reference:
-            // alpha-beta-CROWN BoundGather (indexing.py:38-39). Part of #3312.
+            // alpha-beta-CROWN BoundGather (indexing.py:38-39).
             debug!(
                 "Gather '{}': axis=0 with constant data — embedding lookup, no batch adjustment",
                 spec.name
@@ -50,7 +50,7 @@ impl ConvertContext<'_> {
             // kept its ONNX rank (leading size-1 retained) or had the batch
             // dim stripped; GatherLayer resolves negative axes against the
             // actual runtime rank. Refuses ambiguous cases (unknown recorded
-            // rank; batch axis 0 of a rank>1 activation tensor, per #2848).
+            // rank; batch axis 0 of a rank>1 activation tensor).
             // See `ConvertContext::remap_axis_trailing`.
             self.remap_axis_trailing(
                 "Gather",
@@ -58,6 +58,7 @@ impl ConvertContext<'_> {
                 &spec.inputs[0],
                 onnx_axis,
                 crate::convert::LegacyBatchAxisPolicy::RejectZero,
+                crate::convert::legacy_axis_authority(spec)?,
             )?
         };
 
@@ -308,22 +309,21 @@ mod tests {
         }
     }
 
-    /// A positive axis with no recorded ONNX shape keeps the legacy
-    /// `axis - 1` adjustment (ny-synthesized-subgraph compatibility).
+    /// A positive axis with no recorded ONNX shape refuses rather than guessing
+    /// whether the runtime tensor retained its leading dimension.
     #[test]
-    fn gather_positive_axis_unknown_rank_keeps_legacy() {
+    fn gather_positive_axis_unknown_rank_refuses() {
         let mut ws = WeightStore::new();
         ws.insert("indices".to_string(), arr1(&[0.0_f32]).into_dyn());
         let m = make_context(&ws);
         let spec = gather_spec("g_axis1_norank", 1);
-        let layer = m.convert_gather(&spec).unwrap();
-        let Layer::Gather(gather) = layer else {
-            panic!("expected Gather layer");
-        };
-        assert_eq!(gather.axis_raw(), 0);
+        let error = m
+            .convert_gather(&spec)
+            .expect_err("unknown rank must not authorize an axis-minus-one guess");
+        assert!(matches!(error, NyError::UnsupportedOp(_)));
     }
 
-    /// Regression test for #2848: Gather with default axis=0 on a rank-2
+    /// Regression test: Gather with default axis=0 on a rank-2
     /// activation tensor must be rejected (batch axis).
     #[test]
     fn gather_default_axis_0_rejected() {
@@ -340,7 +340,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #2848: Gather with explicit axis=0 must be rejected.
+    /// Regression test: Gather with explicit axis=0 must be rejected.
     #[test]
     fn gather_explicit_axis_0_rejected() {
         let mut ws = WeightStore::new();
@@ -449,7 +449,7 @@ mod tests {
 
     /// Embedding lookup: axis=0 with constant data should succeed.
     /// When data is a weight tensor (e.g., [vocab_size, embed_dim]), axis=0
-    /// indexes vocabulary, not batch dimension. Part of #3312.
+    /// indexes vocabulary, not batch dimension.
     #[test]
     fn gather_axis_0_constant_data_succeeds() {
         use ndarray::array;
@@ -467,7 +467,7 @@ mod tests {
     }
 
     /// axis=0 without constant data still rejected (activation tensor).
-    /// This preserves the #2848 guard for non-embedding Gather ops.
+    /// This preserves the batch-axis guard for non-embedding Gather ops.
     #[test]
     fn gather_axis_0_dynamic_data_rejected() {
         let mut ws = WeightStore::new();
@@ -540,7 +540,7 @@ mod tests {
     }
 
     /// Guard preserved: a known rank-2 non-constant tensor's axis=0 IS the stripped
-    /// batch axis and must still be rejected in unbatched mode (#2848).
+    /// batch axis and must still be rejected in unbatched mode.
     #[test]
     fn gather_axis_0_rank2_nonconstant_data_still_rejected() {
         let mut ws = WeightStore::new();

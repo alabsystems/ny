@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! SDP-CROWN ℓ2 ball propagation for Linear/ReLU networks.
-//!
-//! Extracted from `crown.rs` as part of #4233 Packet C.
 
 use crate::bounds::LinearBounds;
 use crate::layers::{BoundPropagation, Layer};
@@ -53,6 +51,7 @@ impl Network {
         x_hat: &Array1<f32>,
         rho: f32,
     ) -> Result<BoundedTensor> {
+        self.ensure_proof_eligible()?;
         if self.layers.is_empty() {
             return Ok(input.clone());
         }
@@ -137,7 +136,7 @@ impl Network {
                 }
                 Layer::ReLU(_) => {
                     relu_preactivation[i] = Some((center.clone(), radius));
-                    // NaN-propagating ReLU: if v is NaN, result stays NaN (#2851).
+                    // NaN-propagating ReLU: if v is NaN, result stays NaN.
                     center.mapv_inplace(|v| if v.is_nan() { v } else { v.max(0.0) });
                 }
                 _ => unreachable!("validated by validate_linear_relu_only"),

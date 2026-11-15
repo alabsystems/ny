@@ -5,9 +5,9 @@
 //! Gated bridge from an exact-decimal VNN-LIB box through the first
 //! normalized ONNX `Conv2d` in a constrained-zonotope domain.
 //!
-//! HISTORY AND CURRENT STATUS. This module's stem/propagation surface and the
-//! `qualification` submodule's probes were deliberately unwired from every
-//! command and verdict path through 2026-08-24. Since #cz-hybrid, the
+//! CURRENT STATUS. This module's stem/propagation surface and the
+//! `qualification` submodule's probes are deliberately unwired from every
+//! command and verdict path, with one exception from #cz-hybrid: the
 //! qualification submodule exposes ONE wired production entry —
 //! `qualification::run_wired_metaroom_cz_hybrid` — reached from
 //! `handle_vnncomp_command` via `commands::cz_metaroom_wired`, gated by the

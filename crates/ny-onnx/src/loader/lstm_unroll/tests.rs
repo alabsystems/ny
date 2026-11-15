@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Tests for unidirectional LSTM node unrolling.
-//! BiLSTM tests (integration + weight slicing) are in tests_bilstm.rs (#3497).
+//! BiLSTM tests (integration + weight slicing) are in tests_bilstm.rs.
 
 use super::node_builder::make_int_attr;
 use super::*;

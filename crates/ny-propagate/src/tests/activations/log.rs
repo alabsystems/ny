@@ -214,12 +214,12 @@ fn test_log_crown_wide_interval() {
     }
 }
 
-// ── Strict zero-tolerance CROWN relaxation proptest (#3292) ──────────────
+// ── Strict zero-tolerance CROWN relaxation proptest ──────────────
 //
-// Pattern from #3285: f64-evaluated reference with zero tolerance catches
+// Pattern: f64-evaluated reference with zero tolerance catches
 // f32 cancellation bugs invisible to magnitude-scaled tolerance tests.
 
-/// Independent f64 log reference for strict proptest. (#3292)
+/// Independent f64 log reference for strict proptest.
 fn log_f64_reference(x: f64) -> f64 {
     x.ln()
 }
@@ -231,7 +231,7 @@ proptest! {
     /// Uses f64 reference (log_f64_reference) with zero tolerance on 200-point grid.
     /// log is concave on (0, +inf): lower bound = chord, upper bound = tangent.
     /// Domain restricted to positive l (log undefined for x <= 0).
-    /// Ref: alpha-beta-CROWN auto_LiRPA log relaxation, #3292.
+    /// Ref: alpha-beta-CROWN auto_LiRPA log relaxation.
     #[test]
     fn proptest_log_relaxation_strict_soundness(
         l in 0.01f32..10.0,

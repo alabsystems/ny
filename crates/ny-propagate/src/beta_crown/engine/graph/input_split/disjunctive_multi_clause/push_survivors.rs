@@ -10,8 +10,6 @@
 //! avoiding per-child BoundedTensor construction and per-child clip calls.
 //!
 //! Per-child fallback for `InputClipType::Complete` or missing parent LinearBounds.
-//!
-//! Part of #4366 Packet C, #4367 joint multi-spec.
 
 use std::collections::BinaryHeap;
 use std::sync::Arc;
@@ -51,7 +49,6 @@ enum ChildDisposition {
 /// After batched clipping, performs per-child grouped disjunctive verification
 /// using concretized post-clip lower bounds (OR-within-clause, AND-across-clauses).
 ///
-/// Part of #4366 batched child construction + clip, #4367 joint multi-spec.
 /// Reference: alpha-beta-CROWN `clip_domains` (`input_split/clip.py:174-274`).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn push_batched_relaxed_survivors(
@@ -244,7 +241,7 @@ fn push_batched_clip_children(
 ///   if a_d < 0:  use x_u_d (minimum of a_d * x_d)
 ///
 /// Uses f64 accumulation and a directed `next_down_f32` cast, matching
-/// `concretize_bounds` in `relaxed_clip.rs` (#2303). Results are paired with
+/// `concretize_bounds` in `relaxed_clip.rs`. Results are paired with
 /// `f32::INFINITY` (unknown upper) for the grouped disjunctive verification
 /// check.
 ///

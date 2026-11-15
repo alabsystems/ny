@@ -190,7 +190,7 @@ fn test_propagate_crown_with_batched_domains_multi_domain_success() {
     // with multiple domains, ensuring the batch processing path works correctly
     // without falling back to single-domain serial processing.
     //
-    // Redesigned for #2992: uses `propagate_crown_with_batched_domains_full`
+    // Uses `propagate_crown_with_batched_domains_full`
     // which carries per-domain alpha states. Constrained domains have fewer
     // unstable neurons (the constrained neuron uses a fixed slope 0 or 1
     // instead of an optimizable alpha), producing genuinely different CROWN
@@ -345,7 +345,7 @@ fn test_propagate_crown_with_batched_domains_multi_domain_success() {
     );
 }
 
-/// Regression for #1840: batched graph backward wildcard dispatch must use per-layer
+/// Regression: batched graph backward wildcard dispatch must use per-layer
 /// CROWN backward (Sigmoid here), not identity/pass-through fallback.
 #[ntest::timeout(5000)]
 #[test]
@@ -428,14 +428,14 @@ fn test_batched_graph_dispatches_sigmoid_backward_1840() {
     );
 }
 
-/// Regression for #1845: batched graph backward must consume per-domain alpha
+/// Regression: batched graph backward must consume per-domain alpha
 /// state (propagate_linear_with_alpha), not always the fixed heuristic path.
 ///
 /// Uses the BatchedBackwardContext API (the real GPU BaB path) rather than the
 /// deprecated tuple-based propagate_crown_batched_backward which hardcodes
 /// empty alpha states.
 ///
-/// Redesigned for #2992: uses a 3-layer network (2 ReLU layers) where CROWN
+/// Uses a 3-layer network (2 ReLU layers) where CROWN
 /// provides tighter bounds than IBP. Alpha=0 at relu1 zeroes the CROWN
 /// coefficients for relu1's crossing neurons, giving a tight lower bound
 /// (-0.476) that survives IBP tightening (-1.125). The heuristic alpha=1
@@ -457,7 +457,7 @@ fn test_batched_graph_uses_alpha_state_for_relu_backward_1845() {
     //    the negative coefficient creates IBP pessimism that CROWN can avoid.
     // 3. Asymmetric input bounds: ensures heuristic alpha=1 (not alpha=0).
     //
-    // Math trace (see #2992 for detailed derivation):
+    // Math trace:
     //   alpha=heuristic(=1) at relu1: CROWN lower ≈ -1.46, tightened to IBP ≈ -1.13
     //   alpha=0 at relu1:             CROWN lower ≈ -0.48, tightened stays -0.48
     //   Difference ≈ 0.65, well above numerical noise.
@@ -594,7 +594,7 @@ fn test_batched_graph_uses_alpha_state_for_relu_backward_1845() {
     // With a multi-layer network, CROWN is tighter than IBP at the output.
     // Different alpha values (heuristic vs zero) produce different CROWN
     // relaxation slopes, yielding different lower bounds that survive IBP
-    // tightening. This is the #2992 regression: the original single-ReLU
+    // tightening. Why multi-layer: the original single-ReLU
     // topology had exact IBP bounds that clamped away all alpha effects.
     assert!(
         (lower_bounds[0] - lower_bounds[1]).abs() > 1e-6,
@@ -605,7 +605,7 @@ fn test_batched_graph_uses_alpha_state_for_relu_backward_1845() {
     );
 }
 
-/// Regression for #3782 Slice 2: batched graph backward must thread the
+/// Regression: batched graph backward must thread the
 /// upper-path alpha state into ReLU backward instead of hardcoding `None`.
 #[ntest::timeout(5000)]
 #[test]
@@ -729,7 +729,7 @@ fn test_batched_graph_uses_upper_alpha_state_for_relu_backward_3782() {
     );
 }
 
-/// Regression test for #3008: sequential BaB prefilter now checks domain_is_violation.
+/// Regression test: sequential BaB prefilter now checks domain_is_violation.
 ///
 /// The simple_network computes |x1-x2| for input in [-1,1]². With threshold=1.5,
 /// the property |x1-x2| > 1.5 is false for inputs near x1≈x2 (output ≈ 0).
@@ -755,7 +755,7 @@ fn test_sequential_bab_prefilter_detects_violation_3008() {
     let result = verifier.verify(&network, &input, 1.5).unwrap();
 
     // The property |x1-x2| > 1.5 is false (x1=x2=0 gives output 0).
-    // With the #3008 fix, the prefilter detects violation in a child domain.
+    // With the prefilter fix, the violation is detected in a child domain.
     // Without the fix, BaB would still terminate correctly but waste more work.
     assert!(
         matches!(

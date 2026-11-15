@@ -500,7 +500,7 @@ fn serialize_constraints(history: &GraphSplitHistory) -> Result<Vec<ConstraintTu
         }
     }
 
-    // Soundness guard (#2248): reject histories where split_count under-consumes constraints.
+    // Soundness guard: reject histories where split_count under-consumes constraints.
     if relu_idx != history.constraints.len() || genbab_idx != history.genbab_constraints.len() {
         return Err(NyError::InvalidSpec(format!(
             "serialize_constraints: not all constraints consumed (split_count={}, relu={}/{}, genbab={}/{})",

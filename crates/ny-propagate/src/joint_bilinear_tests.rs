@@ -226,7 +226,7 @@ fn jacobi_residual_is_charged_so_a_truncated_sweep_stays_sound() {
     // symmetrize
     for i in 0..n {
         for j in 0..i {
-            let s = 0.5 * (h[i * n + j] + h[j * n + i]);
+            let s = f64::midpoint(h[i * n + j], h[j * n + i]);
             h[i * n + j] = s;
             h[j * n + i] = s;
         }

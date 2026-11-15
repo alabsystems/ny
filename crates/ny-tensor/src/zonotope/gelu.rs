@@ -6,7 +6,7 @@
 //!
 //! Linearizes GELU around each element's center value and adds conservative
 //! per-element error symbols bounded by `max|GELU''| * r² / 2`.
-//! Fix for #2470: the GELU arm previously called `silu_affine()` which
+//! This replaces an earlier GELU arm that called `silu_affine()`, which
 //! evaluates SiLU, not GELU.
 
 use ndarray::Axis;
@@ -33,7 +33,7 @@ fn erff_approx(x: f32) -> f32 {
 
 fn gelu_erf(x: f32) -> f32 {
     // Guard against 0 * inf = NaN when x = ±inf.
-    // GELU(-inf) = 0, GELU(+inf) = +inf. Ref: #1836.
+    // GELU(-inf) = 0, GELU(+inf) = +inf.
     if !x.is_finite() {
         if x.is_nan() {
             return f32::NAN;
@@ -58,7 +58,7 @@ fn gelu_tanh(x: f32) -> f32 {
 fn gelu_erf_derivative(x: f32) -> f32 {
     // GELU'(x) = Φ(x) + x·φ(x) where Φ = normal CDF, φ = normal PDF
     //
-    // #2676: For ±Inf, pdf=exp(-Inf)=0 but x·pdf = ±Inf·0 = NaN.
+    // For ±Inf, pdf=exp(-Inf)=0 but x·pdf = ±Inf·0 = NaN.
     // Correct limits: GELU'(+∞) = 1, GELU'(-∞) = 0.
     // NaN input propagates as NaN (correct diagnostic signal).
     if x.is_infinite() {
@@ -78,7 +78,7 @@ fn gelu_erf_derivative(x: f32) -> f32 {
 // derivative. Keep the formula literal — relaxation anchors must stay bit-identical.
 #[allow(clippy::manual_midpoint)]
 fn gelu_tanh_derivative(x: f32) -> f32 {
-    // #2676: For ±Inf, sech²(g)=0 but x·sech²·dt_dx = Inf·0·Inf = NaN.
+    // For ±Inf, sech²(g)=0 but x·sech²·dt_dx = Inf·0·Inf = NaN.
     // Correct limits: GELU'(+∞) = 1, GELU'(-∞) = 0.
     // NaN input propagates as NaN (correct diagnostic signal).
     if x.is_infinite() {
@@ -96,7 +96,7 @@ fn gelu_erf_second_derivative(x: f32) -> f32 {
     // GELU''(x) = φ(x)·(2 - x²) where φ is the standard normal PDF.
     // Closed-form from differentiating GELU'(x) = Φ(x) + x·φ(x).
     //
-    // #2676 Site 2: For ±Inf, pdf=exp(-Inf)=0 but (2-x²)=-Inf,
+    // For ±Inf, pdf=exp(-Inf)=0 but (2-x²)=-Inf,
     // giving 0·(-Inf)=NaN. Guard: GELU''(x) → 0 as |x| → ∞.
     // NaN input propagates as NaN (correct diagnostic signal).
     if x.is_infinite() {
@@ -125,7 +125,7 @@ const GELU_CURVATURE_BOUND_GLOBAL: f32 = 0.8;
 /// {-2, 0, 2}; GELU'' is monotone between consecutive candidates, so no other
 /// point of the interval can exceed them. (A sampled maximum would only be a
 /// lower bound on max|f''| and could under-estimate the Taylor remainder.)
-/// Uses nan_propagating_max so a NaN endpoint surfaces as NaN (#2850).
+/// Uses nan_propagating_max so a NaN endpoint surfaces as NaN.
 fn gelu_erf_max_curvature(lo: f32, hi: f32) -> f32 {
     let mut max_val = nan_propagating_max(
         gelu_erf_second_derivative(lo).abs(),

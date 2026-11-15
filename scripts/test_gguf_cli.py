@@ -26,7 +26,7 @@ except ImportError as exc:
 
 def run_ny(args: list[str], features: list[str] = None) -> tuple[int, str, str]:
     """Run ny CLI command and return (returncode, stdout, stderr)."""
-    cmd = ["cargo", "run", "-p", "ny-cli"]
+    cmd = ["targo", "--unverified", "run", "-p", "ny-cli"]
     if features:
         cmd.extend(["--features", ",".join(features)])
     cmd.append("--")

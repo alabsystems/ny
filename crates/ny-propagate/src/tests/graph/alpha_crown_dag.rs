@@ -10,8 +10,6 @@
 //! - Single-iteration vs multi-iteration alpha optimization convergence
 //! - `restore_dag_alpha_snapshot` behavior after gradient perturbation errors
 //! - Non-finite pre-activation bound handling
-//!
-//! Part of #2837.
 
 use crate::bounds::{AlphaCrownConfig, AlphaSpecEarlyExit, GradientMethod};
 use crate::*;
@@ -129,7 +127,7 @@ fn diamond_forward(x: &[f32; 2]) -> [f32; 2] {
 ///        \-> Linear_skip -------------/
 /// ```
 ///
-/// This exercises the `#3619` path directly:
+/// This exercises the DAG alpha-CROWN Sigmoid/Tanh tangent-point path directly:
 /// - no ReLU alpha state is available
 /// - the graph is non-sequential, so `propagate_dag.rs` is used
 /// - both Sigmoid and Tanh tangent-point bundles must be optimized to beat the
@@ -223,8 +221,6 @@ fn dag_test_config(iterations: usize) -> AlphaCrownConfig {
 ///
 /// This exercises the DAG backward bound accumulation at merge nodes, where
 /// relu1 fans out to two linear layers that merge via Add.
-///
-/// Part of #2837.
 #[ntest::timeout(10000)]
 #[test]
 fn test_dag_diamond_alpha_crown_soundness() {
@@ -271,8 +267,6 @@ fn test_dag_diamond_alpha_crown_soundness() {
 /// The optimization loop maximizes the lower bound sum and minimizes the upper
 /// bound sum. Even with 1 iteration, alpha-CROWN should not produce wider bounds
 /// than IBP (within tolerance).
-///
-/// Part of #2837.
 #[ntest::timeout(10000)]
 #[test]
 fn test_dag_diamond_alpha_crown_at_least_ibp() {
@@ -300,7 +294,7 @@ fn test_dag_diamond_alpha_crown_at_least_ibp() {
     }
 }
 
-/// Regression for #3619 Packet A: DAG alpha-CROWN must optimize Sigmoid/Tanh
+/// Regression: DAG alpha-CROWN must optimize Sigmoid/Tanh
 /// tangent points even when no ReLU alpha state exists.
 #[ntest::timeout(10000)]
 #[test]
@@ -354,8 +348,6 @@ fn test_dag_sigmoid_tanh_alpha_crown_beats_fixed_crown_3619() {
 /// Alpha-CROWN with more iterations should produce bounds at least as tight as
 /// fewer iterations. The optimization loop accumulates element-wise best bounds
 /// across iterations, so bound quality is monotonically non-decreasing.
-///
-/// Part of #2837.
 #[ntest::timeout(10000)]
 #[test]
 fn test_dag_alpha_crown_convergence_monotonic() {
@@ -402,8 +394,6 @@ fn test_dag_alpha_crown_convergence_monotonic() {
 
 /// A DAG with no ReLU nodes should produce bounds identical to CROWN,
 /// since alpha-CROWN has no alpha parameters to optimize.
-///
-/// Part of #2837.
 #[ntest::timeout(10000)]
 #[test]
 fn test_dag_no_relu_falls_back_to_crown() {
@@ -483,8 +473,6 @@ fn test_dag_no_relu_falls_back_to_crown() {
 /// mechanism were broken, gradient estimation would corrupt the alpha state,
 /// causing subsequent iterations to diverge and produce different final bounds
 /// across runs (due to corrupted optimizer state).
-///
-/// Part of #2837.
 #[ntest::timeout(10000)]
 #[test]
 fn test_dag_alpha_state_consistent_across_runs() {
@@ -542,8 +530,6 @@ fn test_dag_alpha_state_consistent_across_runs() {
 /// Verify that SPSA gradient estimation on a DAG produces sound bounds.
 /// SPSA perturbs all alpha values simultaneously and uses the restore_snapshot
 /// mechanism to undo perturbations. If restore is broken, bounds may be unsound.
-///
-/// Part of #2837.
 #[ntest::timeout(60000)]
 #[test]
 fn test_dag_spsa_gradient_soundness() {
@@ -602,8 +588,6 @@ fn test_dag_spsa_gradient_soundness() {
 ///
 /// This tests the DAG code path's error propagation from layer-level CROWN
 /// backward through the DAG backward pass machinery.
-///
-/// Part of #2837.
 #[ntest::timeout(10000)]
 #[test]
 fn test_dag_crown_error_on_zero_crossing_reciprocal() {
@@ -633,7 +617,7 @@ fn test_dag_crown_error_on_zero_crossing_reciprocal() {
     .unwrap();
 
     // Reciprocal on zero-crossing interval produces [-inf, +inf], but
-    // new_repaired (replacing repair_non_finite, #3030, #3423) converts these to conservative
+    // new_repaired (replacing repair_non_finite) converts these to conservative
     // finite fallback bounds. IBP now succeeds with wide bounds.
     let ibp_result = graph.propagate_ibp(&input);
     assert!(
@@ -656,15 +640,13 @@ fn test_dag_crown_error_on_zero_crossing_reciprocal() {
 // Test 8: INVPROP ny clipping — gammas stay non-negative after DAG optimization
 // ---------------------------------------------------------------------------
 
-/// Regression test for #2970: DAG alpha-CROWN with INVPROP must clip gammas
+/// Regression test: DAG alpha-CROWN with INVPROP must clip gammas
 /// to non-negative after each optimizer step. Without clipping, negative gammas
 /// invert constraint contributions, producing unsound (too-tight) bounds.
 ///
 /// Verifies output bounds are sound (contain sampled true outputs) when INVPROP
 /// is active. Uses `propagate_alpha_crown_with_config` which dispatches to
 /// `propagate_dag_alpha_crown_with_config_and_engine` for the diamond DAG.
-///
-/// Part of #2970.
 #[ntest::timeout(10000)]
 #[test]
 fn test_dag_invprop_ny_clipping_2970() {
@@ -782,7 +764,7 @@ fn test_dag_invprop_optimize_box_soundness() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 9: Regression #3298 — alpha-CROWN default config improves over CROWN
+// Test 9: Regression — alpha-CROWN default config improves over CROWN
 // on a deep ResNet-like DAG with gradient attenuation
 // ---------------------------------------------------------------------------
 
@@ -855,7 +837,7 @@ fn add_linear_relu(
 /// Structure: Input[3] → L0→R0 → (L1→R1 + Lskip) → Add → R2 → L2→R3 → Lout[2]
 ///
 /// The residual skip from R0 creates gradient attenuation through the main path,
-/// mimicking ResNet-2b where the old pilot check would exit prematurely (#3298).
+/// mimicking ResNet-2b where the old pilot check would exit prematurely.
 fn build_deep_residual_dag() -> (GraphNetwork, BoundedTensor) {
     let w = residual_weights();
     let mut graph = GraphNetwork::new();
@@ -948,15 +930,13 @@ fn assert_residual_dag_soundness(bounds: &BoundedTensor, label: &str) {
     }
 }
 
-/// Regression test for #3298: alpha-CROWN with default config (pilot disabled,
+/// Regression test: alpha-CROWN with default config (pilot disabled,
 /// patience=10) must produce strictly tighter bounds than plain CROWN on a deep
 /// ResNet-like DAG with residual connections.
 ///
-/// Before #3298, the adaptive_skip_pilot check exited after 1 iteration when
+/// Previously, the adaptive_skip_pilot check exited after 1 iteration when
 /// improvement < 1e-3, which happened on deep DAGs due to gradient attenuation.
 /// The fix: `adaptive_skip_pilot: false`, `early_stop_patience: 10` (was 3).
-///
-/// Part of #3298.
 #[ntest::timeout(60000)]
 #[test]
 fn test_dag_alpha_crown_default_config_improves_over_crown_3298() {
@@ -971,7 +951,7 @@ fn test_dag_alpha_crown_default_config_improves_over_crown_3298() {
     assert_residual_dag_soundness(&public_crown_bounds, "public-CROWN");
     let public_crown_width = total_width(&public_crown_bounds);
 
-    // Alpha-CROWN with DEFAULT config (production config changed in #3298).
+    // Alpha-CROWN with DEFAULT config (the production config after the fix above).
     let alpha_bounds = graph
         .propagate_alpha_crown_with_config(&input, &AlphaCrownConfig::default())
         .unwrap();
@@ -1062,7 +1042,7 @@ fn test_alpha_spec_early_exit_projection_and_verified() {
         ..spec.clone()
     };
     assert!(!spec_unverified.is_verified(lo, hi));
-    // Non-finite inputs never verify (#2993 parity).
+    // Non-finite inputs never verify.
     assert!(!spec.is_verified(f32::NAN, hi));
     assert!(!spec.is_verified(lo, f32::INFINITY));
     // Length mismatch → None (loop then skips the check that iteration).
@@ -1248,4 +1228,82 @@ fn test_spsa_warmup_plateau_exit_matches_capped_run() {
     // setup but a large patience and the same iteration cap produces identical bounds
     // (the plateau branch never fires). This is the capped_config above, already
     // asserted equal — i.e. the plateau machinery is inert until patience is hit.
+}
+
+/// #inert-ascent-exit at the LOOP level: with `learning_rate: 0.0` the α
+/// state never moves, so every iteration's best improvement is EXACTLY zero
+/// (the frame is inert, the ml4acopf shape). Unarmed, the loop runs to the
+/// historical patience (`Converged`, 10 iterations — 11 if iteration 0
+/// registered a nonzero refresh gain); armed with N=3 it retires as `inert`
+/// after 3 (or 4) iterations. The returned enclosure is identical on both
+/// arms, which is the soundness claim: stopping earlier returns a bound the
+/// unguarded loop was entitled to return. Route evidence comes from the same
+/// recorder the `[alpha-ascent]` line writes, so the test observes the loop's
+/// own exit rather than inferring it.
+#[ntest::timeout(20000)]
+#[test]
+fn test_inert_ascent_exit_retires_a_frozen_ascent_early_and_keeps_the_bound() {
+    use crate::network::{clear_last_alpha_ascent_exit, last_alpha_ascent_exit};
+
+    let (graph, input) = build_diamond_dag();
+    let frozen = |inert: Option<usize>| AlphaCrownConfig {
+        iterations: 50,
+        learning_rate: 0.0,
+        early_stop_patience: 10,
+        inert_ascent_exit_iters: inert,
+        adaptive_skip: false,
+        adaptive_skip_pilot: false,
+        ..AlphaCrownConfig::default()
+    };
+
+    clear_last_alpha_ascent_exit();
+    let unarmed = graph
+        .propagate_alpha_crown_with_config(&input, &frozen(None))
+        .unwrap();
+    let (unarmed_iters, unarmed_exit) =
+        last_alpha_ascent_exit().expect("the DAG ascent records its exit");
+    assert_eq!(
+        unarmed_exit, "converged",
+        "unarmed: the historical patience rule"
+    );
+    assert!(
+        (10..=11).contains(&unarmed_iters),
+        "unarmed: patience 10 retires the frozen ascent after 10 iterations, got {unarmed_iters}"
+    );
+
+    clear_last_alpha_ascent_exit();
+    let armed = graph
+        .propagate_alpha_crown_with_config(&input, &frozen(Some(3)))
+        .unwrap();
+    let (armed_iters, armed_exit) =
+        last_alpha_ascent_exit().expect("the DAG ascent records its exit");
+    assert_eq!(
+        armed_exit, "inert",
+        "armed: three exactly-zero iterations retire the ascent"
+    );
+    assert!(
+        (3..=4).contains(&armed_iters),
+        "armed: N=3 retires the frozen ascent after 3 iterations, got {armed_iters}"
+    );
+    assert!(armed_iters < unarmed_iters);
+
+    let (al, au) = (
+        armed.lower().as_slice().unwrap(),
+        armed.upper().as_slice().unwrap(),
+    );
+    let (ul, uu) = (
+        unarmed.lower().as_slice().unwrap(),
+        unarmed.upper().as_slice().unwrap(),
+    );
+    assert_eq!(al.len(), ul.len());
+    for d in 0..al.len() {
+        assert_eq!(
+            al[d], ul[d],
+            "dim {d}: lower differs between arms of a frozen ascent"
+        );
+        assert_eq!(
+            au[d], uu[d],
+            "dim {d}: upper differs between arms of a frozen ascent"
+        );
+    }
 }

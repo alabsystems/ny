@@ -8,8 +8,6 @@
 //! backward loop body: deadline budgeting, Dense→Patches re-entry, and
 //! layer-specific dispatch. This module extracts the duplicated core so
 //! each coordinator only contains its site-specific accumulation logic.
-//!
-//! Part of #3935 / design: `designs/2026-03-16-graph-crown-backward-loop-dedup.md`
 
 use crate::bounds::patches::CrownBounds;
 use crate::bounds::{certified_affine_sum_f32, LinearBounds, OutwardDirection};
@@ -35,11 +33,11 @@ use std::mem::size_of;
 use std::time::{Duration, Instant};
 use tracing::debug;
 
-/// Compute a per-node deadline from the remaining global budget (#3795).
+/// Compute a per-node deadline from the remaining global budget.
 ///
 /// Budget policy: `per_node = max(remaining / nodes_left, remaining * fraction)`.
 /// Returns `None` only when the global deadline has already expired.
-/// Sub-floor shares keep the global deadline (#3881).
+/// Sub-floor shares keep the global deadline.
 ///
 /// Shared between `propagation.rs` and `spec_propagation.rs`.
 pub(super) fn compute_node_deadline(
@@ -67,7 +65,7 @@ pub(super) fn compute_node_deadline(
     })
 }
 
-/// Try to convert Dense bounds to Patches at a unary Conv2d boundary (#3813).
+/// Try to convert Dense bounds to Patches at a unary Conv2d boundary.
 ///
 /// When the classifier-head logits reach Conv2d nodes through Dense rows,
 /// this re-enters Patches mode so the CNN trunk backward runs on the
@@ -107,7 +105,7 @@ pub(super) enum NodeDispatchResult {
     IbpFallback(CrownIbpFallbackReason),
 }
 
-/// Result from the shared non-ReLU graph dispatch core (#3936).
+/// Result from the shared non-ReLU graph dispatch core.
 pub(super) enum SharedDispatchResult {
     Dispatch(Box<BackwardDispatchResult>),
     IbpFallback(CrownIbpFallbackReason),
@@ -519,7 +517,7 @@ pub(crate) fn backward_div_to_numerator_with_deadline(
 
     // Migrated from from_parts_unchecked: reciprocal-scaling arithmetic can
     // produce NaN (e.g., Inf * 0.0) or Inf (near-zero denominator overflow).
-    // NaN firewall falls back to conservative bounds. See #3438.
+    // NaN firewall falls back to conservative bounds.
     Ok(DivBackwardResult::PropagateNumerator(Box::new(
         LinearBounds::new_or_conservative(new_lower_a, new_lower_b, new_upper_a, new_upper_b)?,
     )))
@@ -561,16 +559,48 @@ pub(super) fn dispatch_mul_binary_backward(
         )));
     };
 
+    // DISCHARGE THE INCOMING COEFFICIENT ERROR BEFORE COMPOSING.
+    //
+    // Both `propagate_linear_binary*` publish through constructors that do not carry an
+    // incoming `coeff_err` plane, and `bounds/concretize.rs:1599-1620` charges a
+    // coefficient penalty ONLY from that plane — so an err-bearing carrier arriving here
+    // (Linear/Conv always publish one) would have its charge silently vanish, leaving the
+    // bound tighter than the arithmetic justifies.
+    //
+    // Fold it into the bias over THIS node's OUTPUT box, because the carrier's columns
+    // index the output. The box comes from the layer's OWN forward, which already
+    // implements MulBinary's broadcast rule — reimplementing that rule here would risk
+    // charging the wrong magnitudes, which is worse than not charging at all because it
+    // still looks certified. `fold_coeff_err_into_bias` additionally fails closed: a
+    // length that does not match the carrier's columns routes to the conservative
+    // row-degrade rather than charging a mismatched element.
+    let discharged;
+    let node_lb = if ctx.node_lb.has_coeff_err() {
+        let out_box = ctx
+            .node
+            .layer
+            .propagate_ibp_binary(ctx.input_a_bounds, ctx.input_b_bounds)?;
+        let flat = out_box.flatten();
+        let box_lo: Vec<f32> = flat.lower().iter().copied().collect();
+        let box_up: Vec<f32> = flat.upper().iter().copied().collect();
+        let mut owned = ctx.node_lb.clone();
+        owned.fold_coeff_err_into_bias(&box_lo, &box_up);
+        discharged = owned;
+        &discharged
+    } else {
+        ctx.node_lb
+    };
+
     match if ctx.mul_binary_alpha.is_some() {
         mul.propagate_linear_binary_with_alpha(
-            ctx.node_lb,
+            node_lb,
             ctx.input_a_bounds,
             ctx.input_b_bounds,
             ctx.mul_binary_alpha,
         )
     } else {
         mul.propagate_linear_binary(
-            ctx.node_lb,
+            node_lb,
             ctx.input_a_bounds,
             ctx.input_b_bounds,
             ctx.mul_binary_relaxation,
@@ -629,7 +659,7 @@ pub(super) fn dispatch_mul_binary_backward(
     }
 }
 
-/// Check Linear layer dimension compatibility before dispatch (#2817).
+/// Check Linear layer dimension compatibility before dispatch.
 ///
 /// Returns `true` when a Linear node must fall back to IBP with `ShapeMismatch`.
 pub(super) fn linear_dimension_mismatch(node: &GraphNode, node_lb: &LinearBounds) -> bool {
@@ -637,7 +667,7 @@ pub(super) fn linear_dimension_mismatch(node: &GraphNode, node_lb: &LinearBounds
         let expected_inputs = l.out_features();
         let got_inputs = node_lb.num_inputs();
         // Guard: zero out_features is always a mismatch (and keeps the
-        // multiple-of check on a nonzero divisor). (#2817)
+        // multiple-of check on a nonzero divisor).
         expected_inputs == 0
             || (got_inputs != expected_inputs && !got_inputs.is_multiple_of(expected_inputs))
     } else {
@@ -718,7 +748,7 @@ pub(super) struct SharedDispatchCtx<'a> {
     pub label: &'a str,
 }
 
-/// Dispatch a node through the shared backward dispatch core (#1949 Step B).
+/// Dispatch a node through the shared backward dispatch core.
 ///
 /// Handles: Linear, Transpose, Conv{1d,2d,Transpose{1d,2d}}, Add, Sub, Concat,
 /// MatMul, BilinearCrown, SkipMerge, OpaqueSkip, and all unary layers.

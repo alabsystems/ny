@@ -4,7 +4,7 @@
 
 //! Inf/NaN/domain-boundary edge case tests for activation IBP propagation.
 //!
-//! #2435: Log missing Inf/NaN edge cases, Sigmoid/Tanh/Cos/Softplus missing
+//! Log missing Inf/NaN edge cases, Sigmoid/Tanh/Cos/Softplus missing
 //! Inf/NaN edge case coverage.
 //!
 //! These are deterministic unit tests (not property tests) targeting specific
@@ -17,7 +17,7 @@ use ntest::timeout;
 use ny_tensor::BoundedTensor;
 
 // =========================================================================
-// LOG EDGE CASES (#2435)
+// LOG EDGE CASES
 // Log domain: (0, +inf). log(0) = -inf, log(-x) = NaN.
 // =========================================================================
 
@@ -132,7 +132,7 @@ fn log_ibp_large_positive() {
 }
 
 // =========================================================================
-// SIGMOID EDGE CASES (#2435)
+// SIGMOID EDGE CASES
 // Sigmoid range: (0, 1). sigmoid(-inf) → 0, sigmoid(+inf) → 1.
 // =========================================================================
 
@@ -223,7 +223,7 @@ fn sigmoid_ibp_full_infinite_no_nan() {
 }
 
 // =========================================================================
-// TANH EDGE CASES (#2435)
+// TANH EDGE CASES
 // Tanh range: (-1, 1). tanh(-inf) → -1, tanh(+inf) → 1.
 // =========================================================================
 
@@ -314,7 +314,7 @@ fn tanh_ibp_full_infinite_no_nan() {
 }
 
 // =========================================================================
-// COS EDGE CASES (#2435)
+// COS EDGE CASES
 // Cos range: [-1, 1]. cos(inf) = NaN (IEEE 754). cos has non-finite guard.
 // =========================================================================
 
@@ -393,7 +393,7 @@ fn sin_ibp_infinite_falls_back_to_full_range() {
 }
 
 // =========================================================================
-// SOFTPLUS EDGE CASES (#2435)
+// SOFTPLUS EDGE CASES
 // Softplus range: (0, +inf). softplus(x) = log(1 + exp(x)).
 // softplus(-inf) → 0, softplus(+inf) → +inf.
 // =========================================================================

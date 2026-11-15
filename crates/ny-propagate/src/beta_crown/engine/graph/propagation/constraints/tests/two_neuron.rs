@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Multi-neuron graph regressions (#1813, #2826).
+//! Multi-neuron graph regressions.
 
 use ndarray::{arr1, arr2};
 
@@ -18,7 +18,6 @@ use super::TOL;
 use ny_test_utils::assert_bounded_tensor_close;
 // ====================================================================
 // Multi-neuron graph tests — exercise backward.rs with non-trivial networks.
-// Part of proof_coverage phase: backward.rs extracted in #1813 with zero tests.
 // ====================================================================
 
 /// Build a 2-input, 2-neuron graph: linear1(2→2) → relu1 → linear2(2→1)

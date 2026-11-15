@@ -125,7 +125,7 @@ fn test_whisper_attention_core_ibp() {
             println!("CROWN output shape: {:?}", output.shape());
             println!("CROWN max width: {:.6}", output.max_width());
 
-            // Soundness check: lower <= upper for all elements. Part of #1721.
+            // Soundness check: lower <= upper for all elements.
             let unsound_count = output
                 .lower()
                 .iter()
@@ -594,7 +594,7 @@ fn test_whisper_attention_with_real_weights_zonotope_context_shape_regression_34
     let input_data = ArrayD::from_elem(ndarray::IxDyn(&input_shape), 0.0f32);
     let input = ny_tensor::BoundedTensor::from_epsilon(input_data, 1e-4).expect("valid input");
 
-    // #3464 fix: transpose_b check now precedes expand_to_match, so the context
+    // The transpose_b check now precedes expand_to_match, so the context
     // matmul (softmax @ V, transpose_b=false) falls back to IBP instead of
     // hitting a spurious ShapeMismatch on expand_to_match.
     let output = graph

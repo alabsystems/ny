@@ -2,10 +2,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Direct raw-input boundary certificates for the ECAPA MFA seam (#3499).
+//! Direct raw-input boundary certificates for the ECAPA MFA seam.
 //!
-//! This module implements Packet 1 of the alternative design:
-//! `designs/2026-03-13-issue-3499-linear-boundary-certificates-alternative.md`
+//! This module implements Packet 1 of the alternative (direct-boundary) design.
 //!
 //! Instead of chaining Stage A → box → Stage B → box → Stage C → box → concat,
 //! this approach extracts three prefix graphs (input→x2, input→x3, input→x4)

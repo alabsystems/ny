@@ -20,7 +20,7 @@
 //! not globally ordered against other approximations once composed with CROWN
 //! relaxation gaps and numerical search tolerances.
 //!
-//! Part of #3921 / #4249. Technique from AI Provider 5.4 review.
+//! Technique from AI Provider 5.4 review.
 
 use ndarray::{Array1, ArrayD, IxDyn};
 use ny_core::{NyError, Result};
@@ -63,7 +63,6 @@ impl ElementCgf {
             ElementCgf::Uniform { lower, upper } => {
                 // Point-mass guard: when lower == upper, CGF is theta * v.
                 // Without this, the log-sum-exp produces NaN from 0.0.ln().
-                // Part of #4286.
                 if (upper - lower).abs() < 1e-15 {
                     return theta * lower;
                 }
@@ -88,7 +87,6 @@ impl ElementCgf {
             ElementCgf::Uniform { lower, upper } => {
                 // Point-mass guard: derivative of theta*v is v.
                 // Without this, eu - el = 0 causes division by zero.
-                // Part of #4286.
                 if (upper - lower).abs() < 1e-15 {
                     return *lower;
                 }

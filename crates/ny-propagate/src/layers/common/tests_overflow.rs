@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! #3009: Non-finite coeff × slope overflow fallback tests for activation CROWN backward.
+//! Non-finite coeff × slope overflow fallback tests for activation CROWN backward.
 
 use super::*;
 
@@ -14,7 +14,7 @@ use proptest::prelude::*;
 
 #[test]
 fn test_elementwise_large_coeff_slope_overflow_3009() -> Result<()> {
-    // #3009: When coefficient × slope overflows f32 to Inf, the affected row
+    // When coefficient × slope overflows f32 to Inf, the affected row
     // should fall back to zero A-coefficients and ±Inf bias (sound but loose),
     // rather than returning NumericalInstability error.
     //
@@ -83,7 +83,7 @@ fn test_elementwise_large_coeff_slope_overflow_3009() -> Result<()> {
 
 #[test]
 fn test_elementwise_large_coeff_slope_overflow_soundness_3009() -> Result<()> {
-    // #3009 soundness: After overflow fallback, the bounds must be sound.
+    // Soundness: after the overflow fallback, the bounds must be sound.
     // For the overflowed row, bounds are [-Inf, +Inf] which trivially contain
     // any true output. For the non-overflowed row, bounds must contain the
     // true activation output for sampled inputs.
@@ -126,7 +126,7 @@ fn test_elementwise_large_coeff_slope_overflow_soundness_3009() -> Result<()> {
 
 #[test]
 fn test_batched_elementwise_large_coeff_slope_overflow_3009() -> Result<()> {
-    // #3009: Same overflow test for the batched path.
+    // Same overflow test for the batched path.
     fn large_slope_relax(_l: f32, _u: f32, _i: usize) -> LinearRelaxation {
         LinearRelaxation::new(1e20, 0.5, 1e20, 0.5)
     }
@@ -163,7 +163,7 @@ fn test_batched_elementwise_large_coeff_slope_overflow_3009() -> Result<()> {
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(500) })]
 
-    /// #3009: CROWN backward through activation with large coefficients returns
+    /// CROWN backward through activation with large coefficients returns
     /// sound conservative bounds, not NumericalInstability error.
     ///
     /// Property: For any combination of coefficient magnitude and slope magnitude
@@ -251,7 +251,7 @@ proptest! {
         prop_assert!(result.upper_b[1].is_finite(), "row 1 upper_b not finite");
     }
 
-    /// #3009 strengthened: CROWN backward with negative coefficients and asymmetric
+    /// Strengthened: CROWN backward with negative coefficients and asymmetric
     /// relaxation slopes.
     ///
     /// The original proptest only uses positive coefficients and symmetric slopes.
@@ -390,7 +390,7 @@ proptest! {
         prop_assert!(result.upper_b[1].is_finite(), "row 1 upper_b not finite");
     }
 
-    /// #2786: Verify directed rounding on slope products in CROWN backward.
+    /// Verify directed rounding on slope products in CROWN backward.
     ///
     /// Property: For any finite coefficient and slope, the backward pass must
     /// produce slope products rounded in the sound direction:

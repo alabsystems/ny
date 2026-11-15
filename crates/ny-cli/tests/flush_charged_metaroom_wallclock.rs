@@ -2,6 +2,8 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+#![recursion_limit = "256"]
+
 //! #flush-charge Lane B: METAROOM WALL-CLOCK acceptance measurement on the
 //! TEST-SCOPED charged device.
 //!
@@ -24,8 +26,8 @@
 //! (`ny_gpu::ComputeDevice::test_only_new_for_proof_flush_charged_acceptance_evidence`),
 //! compiled only under ny-gpu's `gpu-tests` feature (a dev-only edge of this
 //! crate) — measurement without production authority. The production charged
-//! source gate is OPEN since the 2026-08-13 review; production admission
-//! still runs its own full live ladder through the typed constructor.
+//! source gate is OPEN; production admission still runs its own full live
+//! ladder through the typed constructor.
 //!
 //! ENVIRONMENT (admission-config): the charged constructors now FORCE the
 //! plain-WGSL (flushing) loading path per-device, so the measurement legs run

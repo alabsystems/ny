@@ -493,7 +493,7 @@ fn test_multi_objective_child_joint_spec_helper_matches_direct_crown_3870() {
 /// Positive parity: dense-spec batched helper matches direct joint-spec CROWN
 /// for one child domain with a multi-row spec matrix.
 ///
-/// This is the #4116 Packet A flip: the old test above proves the scalar helper
+/// Counterpart of the old test above: that one proves the scalar helper
 /// rejects multi-row specs, while this test proves the new dense-spec helper
 /// accepts them and produces identical bounds.
 ///
@@ -501,8 +501,6 @@ fn test_multi_objective_child_joint_spec_helper_matches_direct_crown_3870() {
 ///   * agreement within the DERIVED cross-lane certificate gap (bounds and
 ///     linear bounds), and
 ///   * soundness of each against an independent f64 forward evaluation.
-///
-/// Part of #4116 Packet A Step 5.
 #[test]
 fn test_dense_spec_batched_helper_matches_direct_crown_4116() {
     let graph = build_multi_objective_child_parity_graph();
@@ -682,8 +680,6 @@ fn test_multi_objective_build_batch_size_preserves_status_4354() {
 
 /// Two-domain dense-spec parity: two independent domains through the dense-spec
 /// batched helper match two independent direct calls.
-///
-/// Part of #4116 Packet A Step 5.
 #[test]
 fn test_dense_spec_batched_two_domains_match_independent_calls_4116() {
     let graph = build_multi_objective_child_parity_graph();

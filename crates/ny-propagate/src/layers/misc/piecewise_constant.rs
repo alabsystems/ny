@@ -175,7 +175,6 @@ macro_rules! piecewise_constant_layer {
             }
 
             /// Patches CROWN backward propagation with pre-activation bounds.
-            /// Part of #2613 Phase 2: generic activation Patches support.
             pub(crate) fn propagate_patches_with_bounds(
                 &self,
                 bounds: &crate::bounds::patches::PatchesLinearBounds,
@@ -192,14 +191,18 @@ piecewise_constant_layer!(
     /// Floor layer: y = floor(x) - rounds towards negative infinity.
     ///
     /// Common in quantization and index computation.
-    FloorLayer, floor, "Floor"
+    FloorLayer,
+    floor,
+    "Floor"
 );
 
 piecewise_constant_layer!(
     /// Ceil layer: y = ceil(x) - rounds towards positive infinity.
     ///
     /// Common in quantization and index computation.
-    CeilLayer, ceil, "Ceil"
+    CeilLayer,
+    ceil,
+    "Ceil"
 );
 
 /// The smallest value ONNX `Round` can take at `x`, over BOTH tie conventions.

@@ -353,7 +353,7 @@ impl GraphNetwork {
         Ok(())
     }
 
-    /// MulBinary SPSA supplement (#3439 Phase 3).
+    /// MulBinary SPSA supplement.
     ///
     /// Targeted SPSA for MulBinary alphas when using non-SPSA methods. AnalyticChain/
     /// Analytic/FD compute only ReLU gradients — MulBinary alphas receive zero gradients
@@ -495,7 +495,7 @@ impl GraphNetwork {
         Ok(())
     }
 
-    /// Monotone S-shaped (Sigmoid/Tanh) SPSA supplement (#3619 Packet A).
+    /// Monotone S-shaped (Sigmoid/Tanh) SPSA supplement.
     ///
     /// Tangent-point parameters do not yet have a chain-rule gradient path.
     /// Uses perturbation-based SPSA loop with `config.spsa_samples` samples.
@@ -812,7 +812,7 @@ impl GraphNetwork {
         Ok(())
     }
 
-    /// Reciprocal SPSA supplement (#4399 Slice 2).
+    /// Reciprocal SPSA supplement.
     ///
     /// Same pattern as Sqrt supplement but for Reciprocal tangent-point parameters.
     #[allow(clippy::too_many_arguments)]

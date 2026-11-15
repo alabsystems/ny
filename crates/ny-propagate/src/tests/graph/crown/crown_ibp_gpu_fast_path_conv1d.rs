@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Conv1d graph-level GPU CROWN-IBP fast-path coverage (#4023 item 1).
+//! Conv1d graph-level GPU CROWN-IBP fast-path coverage.
 //!
 //! `crown_ibp_gpu_fast_path.rs` exercises the sequential-graph GPU fast path on
 //! Linear-ReLU-Linear graphs. This module verifies the same path with Conv1d
@@ -141,8 +141,9 @@ impl GemmEngine for Conv1dScriptedGpuEngine {
     }
 }
 
-impl GpuCrownBackward for Conv1dScriptedGpuEngine {
-    fn crown_backward_gpu(
+impl Conv1dScriptedGpuEngine {
+    /// The scripted body shared by BOTH trait methods below.
+    fn scripted_dispatch(
         &self,
         layers: &[GpuCrownLayer],
         spec: &[f32],
@@ -194,6 +195,38 @@ impl GpuCrownBackward for Conv1dScriptedGpuEngine {
             lower_bounds: expectation.result_lower,
             upper_bounds: expectation.result_upper,
         })
+    }
+}
+
+/// #crown-partial-sound-forward: the CROWN-IBP partial route now REFUSES the
+/// unsound `crown_backward_gpu` (`crown_partial_gpu.rs`, `use_sound == false`
+/// returns `Ok(None)`), so the only GPU dispatch that can reach a published
+/// intermediate bound is `crown_backward_gpu_sound` under an ENGAGED gate. The
+/// mock therefore advertises the sound contract and serves the SAME scripted
+/// expectations through both methods; each plumbing test engages the gate.
+impl GpuCrownBackward for Conv1dScriptedGpuEngine {
+    fn crown_backward_gpu(
+        &self,
+        layers: &[GpuCrownLayer],
+        spec: &[f32],
+        num_specs: usize,
+        input_lower: &[f32],
+        input_upper: &[f32],
+    ) -> Result<GpuCrownResult> {
+        self.scripted_dispatch(layers, spec, num_specs, input_lower, input_upper)
+    }
+    fn crown_backward_gpu_sound(
+        &self,
+        layers: &[GpuCrownLayer],
+        spec: &[f32],
+        num_specs: usize,
+        input_lower: &[f32],
+        input_upper: &[f32],
+    ) -> Result<GpuCrownResult> {
+        self.scripted_dispatch(layers, spec, num_specs, input_lower, input_upper)
+    }
+    fn provides_sound_gpu_crown(&self) -> bool {
+        true
     }
 }
 
@@ -277,7 +310,7 @@ fn assert_gpu_output_matches_script(
     );
 }
 
-/// #4023 regression: a Conv1d graph must exercise the GPU CROWN-IBP fast path,
+/// Regression: a Conv1d graph must exercise the GPU CROWN-IBP fast path,
 /// confirming that Conv1d → Conv2d GPU layer mapping (height=1 equivalence from
 /// `gpu_extraction.rs`) flows through graph CROWN-IBP collection end-to-end.
 ///
@@ -286,12 +319,14 @@ fn assert_gpu_output_matches_script(
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_ibp_dag_graph_conv1d_uses_gpu_partial_fast_path_4023() {
-    // This test exercises the FAST (unsound f32) GPU CROWN partial backward,
-    // which the process-global soundness gate masks by default — hold the
-    // shared gate lock (it sets the gate OFF) instead of depending on another
-    // gate test having leaked an OFF state (lock order: gate → env budget,
-    // same as gpu_partial_oracle).
+    // Hold the shared gate lock (lock order: gate → env budget, same as
+    // gpu_partial_oracle) and ENGAGE the gate: #crown-partial-sound-forward
+    // made the CROWN-IBP partial route refuse the fast unsound backward, so the
+    // GPU plumbing under test is reachable only through the SOUND resident
+    // method of a sound-advertising engine (the mock serves the same script
+    // through both).
     let _gate = sound_gpu_gate::test_lock::lock_gate();
+    set_sound_gpu_crown_required(true);
     tests::with_crown_dense_budget_mb("2048", || {
         let (graph, input) = build_conv1d_relu_flatten_linear_graph();
 

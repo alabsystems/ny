@@ -131,7 +131,6 @@ impl BlockWiseResult {
     ///
     /// NaN values sort last via `crate::cmp_utils::nan_propagating_cmp`. If NaN
     /// reaches either median slot after sorting, the returned median is NaN
-    /// (#2601).
     pub fn median_sensitivity(&self) -> f32 {
         if self.blocks.is_empty() {
             return f32::NAN;
@@ -155,7 +154,7 @@ impl BlockWiseResult {
     /// Returns (block_index, block_name, sensitivity, output_width).
     ///
     /// NaN-sensitivity blocks sort last via `crate::cmp_utils::nan_last_descending_cmp`,
-    /// so they never displace finite-valued blocks from the "worst" ranking (#2601).
+    /// so they never displace finite-valued blocks from the "worst" ranking.
     pub fn worst_k_blocks(&self, k: usize) -> Vec<(usize, String, f32, f32)> {
         let mut indexed: Vec<_> = self
             .blocks
@@ -169,7 +168,7 @@ impl BlockWiseResult {
                 )
             })
             .collect();
-        // Sort by sensitivity descending (highest first, NaN last — #2995)
+        // Sort by sensitivity descending (highest first, NaN last)
         indexed.sort_by(|a, b| crate::cmp_utils::nan_last_descending_cmp(&a.2, &b.2));
         indexed.truncate(k);
         indexed
@@ -370,7 +369,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #2601: median_sensitivity with NaN values produces
+    /// Regression test: median_sensitivity with NaN values produces
     /// deterministic ordering — NaN sorts last so the median is computed from
     /// finite values when fewer than half are NaN.
     #[ntest::timeout(5000)]
@@ -386,7 +385,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #2601: when the majority of blocks have NaN
+    /// Regression test: when the majority of blocks have NaN
     /// sensitivity, the median itself is NaN (NaN reaches the median position).
     #[ntest::timeout(5000)]
     #[test]
@@ -400,7 +399,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #2601: with an even number of blocks, NaN in either
+    /// Regression test: with an even number of blocks, NaN in either
     /// median slot propagates into the averaged median.
     #[ntest::timeout(5000)]
     #[test]
@@ -415,7 +414,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #2601: worst_k_blocks places NaN-sensitivity blocks
+    /// Regression test: worst_k_blocks places NaN-sensitivity blocks
     /// last so they never displace finite-valued blocks from the ranking.
     #[ntest::timeout(5000)]
     #[test]
@@ -432,7 +431,7 @@ mod tests {
         assert!(worst[4].2.is_nan(), "5th should be NaN");
     }
 
-    /// Regression test for #2601: worst_k_blocks(k) with k < total_blocks
+    /// Regression test: worst_k_blocks(k) with k < total_blocks
     /// picks the top-k finite blocks, not NaN-contaminated ones.
     #[ntest::timeout(5000)]
     #[test]

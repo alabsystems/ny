@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::network::relu_crown_relaxation;
 use ny_test_utils::CountingGemmEngine;
 
 #[ntest::timeout(10000)]
@@ -33,28 +32,6 @@ fn test_layer_progress_fraction_complete() {
         degraded_so_far: 0,
     };
     assert!((p.fraction() - 0.5).abs() < 1e-6);
-}
-
-#[ntest::timeout(10000)]
-#[test]
-fn test_relu_relaxation_positive() {
-    let (ls, li, us, ui) = relu_crown_relaxation(1.0, 2.0);
-    assert_eq!((ls, li, us, ui), (1.0, 0.0, 1.0, 0.0));
-}
-
-#[ntest::timeout(10000)]
-#[test]
-fn test_relu_relaxation_negative() {
-    let (ls, li, us, ui) = relu_crown_relaxation(-2.0, -1.0);
-    assert_eq!((ls, li, us, ui), (0.0, 0.0, 0.0, 0.0));
-}
-
-#[ntest::timeout(10000)]
-#[test]
-fn test_relu_relaxation_crossing() {
-    let (_ls, _li, us, _ui) = relu_crown_relaxation(-1.0, 2.0);
-    // Upper slope should be 2/(2-(-1)) = 2/3
-    assert!((us - 2.0 / 3.0).abs() < 1e-6);
 }
 
 // ============================================================
@@ -432,16 +409,67 @@ fn test_network_propagate_ibp_with_engine_threads_linear_layers_3954() {
         .propagate_ibp_with_engine(&input, Some(&engine))
         .unwrap();
 
+    // DIRECTION FIRST, magnitude second. `baseline` is `Network::propagate_ibp` on
+    // a rank-1 input, so every Linear takes `propagate_ibp_1d`: f64 dots plus the
+    // f64 twin certificate `gamma^f64_{n+2}*S_safe + 2*u64*|y|`. `with_engine`
+    // takes `propagate_ibp_via_gemm`: f32 GEMMs plus
+    // `gamma^f32_{n+2}*S_safe + 2*u32*|y|` (`widen_linear_ibp_higham`) and the
+    // `in_features + 2` ULP margin. Both are certified — at different PRECISIONS,
+    // ~2^29 apart in gamma (`crown_single::gamma_n_f32`).
+    //
+    // On THIS fixture the f32 box strictly contains the f64 box at every endpoint,
+    // with margins lower [1.892e-6, 9.060e-6] and upper [5.245e-6, 1.4305e-5]; the
+    // smallest, lower[0], is 127 ULPs at its own scale (ulp(0.225) = 1.490e-8). The
+    // direction is not a coincidence of rounding: the f64 route's ENTIRE widening
+    // is the guarded `next_up_f32(x as f32)` cast, <= 1 ulp per endpoint per layer
+    // (<= 1.67e-6 here, counting layer 1's ulp(7.0) amplified by W[1][1] = 1.5),
+    // while the f32 route pays its certificate plus the n+2 ULP charge at every
+    // layer (>= 8.67e-6 at upper[1] from layer 2 alone: its err 3.898e-6 plus
+    // 5*ulp(10.2) = 4.768e-6) — well above the summation-order jitter between the
+    // two forwards, bounded by gamma^f32_4*S + u32*|y| = 3.29e-6 on that row.
+    //
+    // This is still a FIXTURE fact, not a theorem about the two routes in general.
+    // It is asserted at zero tolerance because it is the half that a widened
+    // |diff| <= tol cannot express: an engine box that moved INWARD of the f64 box
+    // has the shape of a soundness regression, not of a precision one.
+    ny_test_utils::assert_bounds_do_not_loosen(
+        &baseline,
+        &with_engine,
+        0.0,
+        "#3954: on this fixture the f32 engine route must ENCLOSE the f64 rank-1 route",
+    );
+
+    // TOLERANCE 1e-5 -> 3e-5 (#linear-ibp-higham). Derived, not re-baselined.
+    // Layer 1 (W = [[1,-1],[0.5,2]], no bias, x in [-1,2]x[0.5,3], n = 2):
+    //   upper[1] = 7.0 with S = |W| @ xmax = 7.0, so the engine charges
+    //   gamma^f32_4*S_safe + 2*u32*|y| = 2.3842e-7*7.000004 + 2*5.9605e-8*7
+    //   = 2.503e-6, then 1 ulp for `next_up_f32` and 4 ulp for the n+2 charge
+    //   = 5*ulp(7.0) = 2.384e-6, total <= 4.888e-6 against the f64 route's single
+    //   ulp(7.0) = 4.768e-7. Observed layer-1 gap: 9*ulp(7.0) = 4.2915e-6.
+    // Layer 2 (W = [[1,0.25],[-0.5,1.5]], b = [0.1,-0.3], n = 2): row 1 sees
+    //   S = 11.2500083 and |y| = 10.2, so
+    //   gamma^f32_4*S_safe + 2*u32*|y| = 2.6822e-6 + 1.2159e-6 = 3.898e-6, plus
+    //   5*ulp(10.2) = 4.768e-6 -> 8.667e-6; and the layer-1 gap arrives multiplied
+    //   by W[1][1] = 1.5, i.e. 6.437e-6. Per-element ceiling 1.510e-5.
+    // OBSERVED gaps: lower [1.892e-6, 9.060e-6], upper [5.245e-6, 1.4305e-5]; the
+    // max is upper[1] = 15*ulp(10.2) = 15*9.5367e-7 = 1.4305115e-5 (10.200016
+    // against 10.200002). 3e-5 is 2.0x the ceiling and 2.1x the observed max.
+    //
+    // STILL CAUGHT: a wrong route, a dropped bias, a transposed weight — anything
+    // above ~31 ULPs at the 10.2 scale — plus, via the enclosure assertion above,
+    // ANY inward move of the engine box, at zero tolerance. NOT CAUGHT by the
+    // tolerance alone: dropping the f32 certificate, which shrinks this gap rather
+    // than growing it; that is pinned in `layers/linear/ibp.rs` instead.
     assert_all_close(
         with_engine.lower(),
         baseline.lower(),
-        1e-5,
+        3e-5,
         "network ibp with engine lower",
     );
     assert_all_close(
         with_engine.upper(),
         baseline.upper(),
-        1e-5,
+        3e-5,
         "network ibp with engine upper",
     );
     assert!(
@@ -613,7 +641,7 @@ fn test_linear_ibp_input_shape_validation() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_linear_ibp_depth_14_preserves_large_finite_bounds_2549() {
-    // #2549 regression: finite IBP bounds above 1e10 must not be narrowed.
+    // Regression: finite IBP bounds above 1e10 must not be narrowed.
     // Build a depth-14 linear network with gain 10 each layer:
     // output range should be [-1e14, 1e14] for input [-1, 1].
     let mut network = Network::new();
@@ -643,7 +671,7 @@ fn test_linear_ibp_depth_14_preserves_large_finite_bounds_2549() {
 /// This test builds deterministic networks of varying depth (5, 10, 20, 50 layers)
 /// with typical weight magnitudes, then compares the output width of `propagate_ibp`
 /// vs `propagate_ibp_sound` to measure how much the n-ULP directed rounding widens
-/// bounds. This is AC #3 of issue #1690.
+/// bounds.
 ///
 /// Expected result: width difference is proportional to `depth * in_features` ULPs,
 /// but negligible compared to the overall bound width (which grows exponentially

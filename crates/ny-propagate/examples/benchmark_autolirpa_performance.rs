@@ -4,7 +4,7 @@
 
 //! Performance comparison benchmark: ny vs Auto-LiRPA references.
 //!
-//! Run with: cargo run --release --example benchmark_autolirpa_performance -p ny-propagate
+//! Run with: targo --unverified run --release --example benchmark_autolirpa_performance -p ny-propagate
 
 use ndarray::{arr1, arr2};
 use ny_propagate::layers::{LinearLayer, ReLULayer};

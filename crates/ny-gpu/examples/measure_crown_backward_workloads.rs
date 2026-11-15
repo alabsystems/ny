@@ -1,23 +1,23 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
-//! One-shot measurement runner for #3397 representative workloads.
+//! One-shot measurement runner for representative CROWN backward workloads.
 //!
 //! Includes both sequential `Network` phases (GPU fast-path) and optional
 //! `GraphNetwork` phases (per-node CROWN-IBP loop) for the same workloads,
-//! quantifying the benchmark-reality gap identified in #3716.
+//! quantifying the benchmark-reality gap.
 //!
 //! Run with:
-//! `cargo run -p ny-gpu --release --example measure_crown_backward_workloads`
+//! `targo --unverified run -p ny-gpu --release --example measure_crown_backward_workloads`
 //! Optional filter:
-//! `cargo run -p ny-gpu --release --example measure_crown_backward_workloads -- --case soundnessbench_exact_like`
+//! `targo --unverified run -p ny-gpu --release --example measure_crown_backward_workloads -- --case soundnessbench_exact_like`
 //! Write a clean CSV artifact directly from the example process:
-//! `cargo run -p ny-gpu --release --example measure_crown_backward_workloads -- --output reports/benchmarks/gpu_crown_backward_timing_current.csv`
+//! `targo --unverified run -p ny-gpu --release --example measure_crown_backward_workloads -- --output reports/benchmarks/gpu_crown_backward_timing_current.csv`
 //! Add `--production-only` to skip the IBP/CROWN-IBP pipeline and measure just
 //! the warm production/profile path. This is useful when an intermediate phase
 //! is intentionally known-broken but the device profiling path still needs
 //! fresh artifacts on current HEAD.
-//! Add `--graph` to include GraphNetwork measurement phases (#3716).
+//! Add `--graph` to include GraphNetwork measurement phases.
 //! These convert each sequential workload to `GraphNetwork` and measure the
 //! graph CROWN-IBP collection path that real VNN-COMP ONNX models exercise.
 //! Add `--graph-engine-only` to keep the graph IBP and engine-accelerated
@@ -230,7 +230,7 @@ fn write_unsupported_profile_phase(
     )
 }
 
-/// Graph path measurement phases (#3716): convert the sequential workload to
+/// Graph path measurement phases: convert the sequential workload to
 /// `GraphNetwork` and measure the CROWN-IBP collection path that real VNN-COMP
 /// ONNX models exercise through `verify_graph`.
 ///
@@ -302,7 +302,7 @@ fn measure_case(
         args.profile_gpu(),
         args.profile_host(),
     )?;
-    // GraphNetwork phases (#3716): gated behind --graph.
+    // GraphNetwork phases: gated behind --graph.
     // --graph: fast phases (IBP + CROWN-IBP collection) matching VNN-COMP path.
     // --graph-full: case-scoped opt-in for the extremely slow full graph CROWN
     // backward.

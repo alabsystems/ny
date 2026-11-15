@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Shared reciprocal -> sqrt -> mean -> square accumulation for normalization.
-//!
-//! Part of #3911.
 
 use ny_tensor::{next_down_f32, next_up_f32};
 

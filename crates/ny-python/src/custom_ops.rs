@@ -216,9 +216,9 @@ impl CustomOpSchema {
 
 /// Register a custom operator for bound propagation.
 ///
-/// Custom-op dispatch from Python is not yet wired into the verification runtime
-/// (tracking issue: #1820, part of #1696). To avoid misleading no-op behavior,
-/// this API rejects all registrations until runtime dispatch exists.
+/// Custom-op dispatch from Python is not yet wired into the verification runtime.
+/// To avoid misleading no-op behavior, this API rejects all registrations until
+/// runtime dispatch exists.
 #[pyfunction]
 fn register_custom_op(
     _py: Python<'_>,

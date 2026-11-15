@@ -27,8 +27,7 @@ mod api_tests {
     //! Compile-level API compatibility guard for the state module split.
     //!
     //! These tests verify that both import path families remain functional
-    //! after the state.rs → state/ directory migration (#1698).
-    //! Required by: designs/2026-02-08-beta-crown-state-api-compat-contract.md
+    //! after the state.rs → state/ directory migration.
 
     use std::mem::size_of;
 

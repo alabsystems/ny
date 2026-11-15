@@ -15,7 +15,7 @@ use ny_core::{checked_shape_product, NyError, Result};
 ///
 /// Writes `m` results into `out[offset..offset+m]`.
 /// Uses `safe_mul_for_bounds` for 0*inf=0 semantics, f64 accumulation to reduce
-/// rounding error (#2214), and a NaN guard that distinguishes inf-cancellation NaN
+/// rounding error, and a NaN guard that distinguishes inf-cancellation NaN
 /// from input NaN (preserves propagation).
 ///
 /// When `is_lower` is true, inf-cancellation NaN maps to `f32::NEG_INFINITY`
@@ -84,7 +84,7 @@ pub(crate) fn matvec_fast_f64(
 /// Uses safe_mul_for_bounds to handle cases where A contains zeros and x contains
 /// infinite values, which would otherwise produce NaN in standard multiplication.
 /// Uses f64 accumulators to reduce rounding error for high-dimensional inner products
-/// (same rationale as `batched_interval_matvec_checked` — see #2214).
+/// (same rationale as `batched_interval_matvec_checked`).
 ///
 /// `is_lower` controls NaN polarity for inf-cancellation: when true, NaN from
 /// `inf + (-inf)` maps to `f32::NEG_INFINITY` (sound lower bound); when false,

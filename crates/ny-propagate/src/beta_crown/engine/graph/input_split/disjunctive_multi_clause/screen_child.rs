@@ -621,7 +621,6 @@ fn clause_aware_child_relaxed_clip(
 }
 
 /// Screen a disjunctive child domain through clipping and bounding.
-/// Part of #3740 Packet B and #4267.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn screen_disjunctive_child(
     verifier: &BetaCrownVerifier,
@@ -651,7 +650,6 @@ pub(super) fn screen_disjunctive_child(
         // For small models (lsnc_relu), clipping is expensive relative to IBP/CROWN
         // because relaxed_iterations × num_thresholds clip evaluations dominate.
         // Moving IBP before clipping avoids that overhead for IBP-verified domains.
-        // Part of #4283.
         if verifier.config.input_split_ibp_enhancement {
             if let Some(ibp_bounds) = try_graph_spec_ibp_prescreen_bounds(
                 graph,
@@ -1133,7 +1131,7 @@ mod tests {
         );
     }
 
-    /// Verify that the IBP-first early exit in the reorder_bab path (#4283)
+    /// Verify that the IBP-first early exit in the reorder_bab path
     /// actually fires. Both existing tests set `input_split_ibp_enhancement: false`,
     /// so lines 51-59 of screen_child.rs had zero test coverage.
     ///

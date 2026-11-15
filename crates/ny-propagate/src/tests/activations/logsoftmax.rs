@@ -1011,7 +1011,7 @@ fn test_logsoftmax_crown_network_integration() {
     }
 }
 
-/// Regression test for #2591: heuristic LogSoftmax CROWN must NOT return identity
+/// Regression test: heuristic LogSoftmax CROWN must NOT return identity
 /// bounds when pre-activation contains non-finite values. The old code returned
 /// `bounds.clone()` (identity passthrough), which is unsound because LogSoftmax
 /// is not the identity function. The fix returns NumericalInstability instead.
@@ -1050,7 +1050,7 @@ fn test_logsoftmax_heuristic_crown_rejects_non_finite_preactivation() {
     );
 }
 
-/// Regression test for #2591: heuristic CausalSoftmax CROWN must NOT return identity
+/// Regression test: heuristic CausalSoftmax CROWN must NOT return identity
 /// bounds when pre-activation contains non-finite values. Same fix as LogSoftmax.
 #[ntest::timeout(10000)]
 #[test]

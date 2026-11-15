@@ -86,7 +86,7 @@ impl SubConstantLayer {
     /// scatter-add class as `ExpandLikeLastAxisLayer::propagate_linear_binary`
     /// — so it carries the certified `gamma_{fan_in} * S + prop` coefficient
     /// error outward via `new_or_conservative_with_err`. The bias dot product
-    /// accumulates in f64 with directed rounding on the f32 cast (#3157).
+    /// accumulates in f64 with directed rounding on the f32 cast.
     fn propagate_linear_broadcast_backward(
         &self,
         bounds: &LinearBounds,
@@ -120,7 +120,7 @@ impl SubConstantLayer {
             })?
             .max(1);
 
-        // Bias contribution: A @ broadcast(c), f64 accumulation (#3157).
+        // Bias contribution: A @ broadcast(c), f64 accumulation.
         let c_broadcast: Array1<f32> = self
             .constant
             .broadcast(IxDyn(&out_shape))
@@ -362,7 +362,7 @@ impl BoundPropagation for SubConstantLayer {
         // Special case: scalar constant (broadcasts to input shape)
         // If c is scalar, c_flat has len=1 but layer_dim > 1
         // In this case, lA @ c_broadcast = c * sum(lA, axis=1)
-        // Compute A @ c with f64 accumulation + directed rounding (#3157, #1863).
+        // Compute A @ c with f64 accumulation + directed rounding.
         let layer_dim = bounds.lower_a().ncols();
         let (lower_c_f64, upper_c_f64) = if c_flat.len() == 1 && layer_dim > 1 {
             scalar_row_sum_f64(bounds.lower_a(), bounds.upper_a(), c_flat[0])
@@ -390,7 +390,6 @@ impl BoundPropagation for SubConstantLayer {
             // Before: lA @ y + lb, uA @ y + ub
             // Substitute y = c - x: lA @ (c - x) + lb = -lA @ x + (lb + lA @ c)
             // No swap: CROWN composes by substitution, not IBP.
-            // Reference: designs/2026-01-29-crown-affine-negative-scale.md
             let lb_f64 = bounds.lower_b().mapv(|x| x as f64) + &lower_c_f64;
             let ub_f64 = bounds.upper_b().mapv(|x| x as f64) + &upper_c_f64;
             let new_lower_b = lb_f64.mapv(|x| next_down_f32(x as f32));
@@ -435,7 +434,7 @@ impl SubConstantLayer {
         let c_val = extract_scalar_constant_for_batched(&self.constant, "SubConstant")?;
         debug!("SubConstant batched CROWN: scalar c = {}", c_val);
 
-        // f64 accumulation + directed rounding to match non-batched path (#2423).
+        // f64 accumulation + directed rounding to match non-batched path.
         // Previous f32 sum_axis lost precision in large reductions.
         let ndim = bounds.lower_a.ndim();
         let c_f64 = c_val as f64;
@@ -451,7 +450,6 @@ impl SubConstantLayer {
         if self.reverse {
             // y = c - x: CROWN backward substitution (no swap).
             // Substitute y = c - x: lA @ (c - x) + lb = -lA @ x + (lb + lA @ c)
-            // Reference: designs/2026-01-29-crown-affine-negative-scale.md
             debug!("SubConstant batched CROWN: reverse mode (c - x)");
             // Add bias + contribution in f64, directed rounding, NaN → conservative.
             let lb_f64 = bounds.lower_b.mapv(|v| v as f64) + &lower_contrib_f64;

@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Unified input-split disjunctive BaB (Packet B of #3740).
+//! Unified input-split disjunctive BaB.
 //!
 //! Replaces the per-clause timeout-slicing loop with a single shared BaB tree
 //! that uses grouped stop semantics (`disjunctive_domain_verified`). The full
@@ -19,7 +19,7 @@ use ny_propagate::{
     GraphNetwork,
 };
 use ny_tensor::BoundedTensor;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use super::super::constraint_plan::build_grouped_disjunctive_objectives;
@@ -107,6 +107,11 @@ fn disjunctive_restart_root_cache_enabled(config: &BetaCrownConfig, raw: Option<
         || (config.use_alpha_crown
             && (config.alpha_config.cgan_complete_crown_ibp_root
                 || config.alpha_config.cgan_sparse_target_complete_root))
+        // #crown-root-map: the `crown` input-split arm pays the same bounded
+        // complete-cascade transaction when it publishes the map, so a restart
+        // must be able to reuse it exactly rather than re-collect it.
+        || (config.alpha_config.cgan_crown_root_map
+            && config.alpha_config.cgan_complete_crown_ibp_root)
 }
 
 /// One absolute authority boundary for the grouped BaB restart sweep.
@@ -145,7 +150,7 @@ pub(super) fn supports_grouped_disjunctive_contract(
 ///
 /// This preserves the legacy clause-screening win on lsnc-style workloads:
 /// the unified lane should only spend spec-guided CROWN time on unresolved
-/// clauses, not on clauses that the cheap precheck already discharged. #4257
+/// clauses, not on clauses that the cheap precheck already discharged.
 pub(super) fn filter_unverified_clauses_for_unified(
     vnnlib: &VnnLibSpec,
     clauses: &[Vec<OutputConstraint>],
@@ -591,7 +596,38 @@ fn try_independent_singleton_domain_list(
         shared_bab_deadline,
         overall_start,
         provenance,
-        |_, objective, threshold, deadline| {
+        |clause_index, objective, threshold, deadline| {
+            // #lowdim-prover runs FIRST: forward-linear intermediates plus a
+            // backward objective, batched over input-split domains. On
+            // linearizenn it proves in 10^2-10^4 domains rows this driver
+            // times out on after 730k (IBP intermediates). It only ever
+            // returns a PROOF; any other outcome falls through to the
+            // DomainList driver below, unchanged, with the time that remains.
+            let started = Instant::now();
+            let lane_deadline = match deadline {
+                Some(end) => started + end.saturating_duration_since(started) / 2,
+                None => started + Duration::from_secs(120),
+            };
+            let outcome = ny_propagate::lowdim::prove_objective_lower_bound(
+                graph,
+                input,
+                objective,
+                threshold,
+                lane_deadline,
+                &singleton_lowdim_config(config),
+            );
+            ny_propagate::lowdim::emit_line(clause_index, &outcome);
+            if let ny_propagate::lowdim::LowDimOutcome::Verified(stats) = outcome {
+                return Ok(BetaCrownResult {
+                    result: BabVerificationStatus::Verified,
+                    domains_explored: usize::try_from(stats.domains).unwrap_or(usize::MAX),
+                    time_elapsed: started.elapsed(),
+                    max_depth_reached: stats.max_depth as usize,
+                    output_bounds: None,
+                    cuts_generated: 0,
+                    domains_verified: usize::try_from(stats.closed).unwrap_or(usize::MAX),
+                });
+            }
             Ok(domain_verifier.verify_graph_gpu_domain_list(
                 graph,
                 input,
@@ -658,7 +694,7 @@ fn try_independent_singleton_domain_list(
 /// Variant of the unified grouped lane that preserves the legacy clause-screening
 /// contract by pruning any clauses already discharged by the disjunctive
 /// precheck. This keeps lsnc-style grouped searches from spending spec-guided
-/// CROWN work on clauses the cheap precheck already proved UNSAT. #4257
+/// CROWN work on clauses the cheap precheck already proved UNSAT.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn try_prechecked_unified_input_split_disjunctive_bab(
     model_net: &BetaCrownModel,
@@ -766,7 +802,7 @@ pub(super) fn try_unified_input_split_disjunctive_bab(
         return Ok(None);
     }
 
-    let plan = build_grouped_disjunctive_objectives(vnnlib)?;
+    let mut plan = build_grouped_disjunctive_objectives(vnnlib)?;
     if plan.objectives.is_empty() {
         return Ok(None);
     }
@@ -815,8 +851,29 @@ pub(super) fn try_unified_input_split_disjunctive_bab(
         }
     };
 
+    // #lowdim-prover pre-pass (typed opt-in `bab.branching.input_split.lowdim_prover`):
+    // the grouped search must prove EVERY clause infeasible, and a clause is
+    // infeasible on a leaf as soon as ANY of its rows has `lower > threshold`
+    // (grouped_semantics::disjunctive_domain_priority) — exactly the lane's
+    // conjunction rule. So run the lane per clause, within its share of the BaB
+    // slice: all clauses proved is a proof; a clause proved is DROPPED from the
+    // grouped plan (the all-or-none authority is unchanged — the rest must still
+    // be proved below); anything else claims nothing.
+    if let Some(result) = lowdim_grouped_prepass(
+        &graph,
+        input,
+        config,
+        use_relu_split,
+        &mut plan,
+        clauses,
+        bab_deadline.unwrap_or_else(|| Instant::now() + remaining_timeout),
+        overall_start,
+    ) {
+        return Ok(Some(result));
+    }
+
     // Dispatch to input-split multi-clause disjunctive BaB.
-    // gpu_bab DomainList multi-clause variant is not yet implemented (#4398);
+    // gpu_bab DomainList multi-clause variant is not yet implemented;
     // fall through to the CPU input-split path for all disjunctive cases.
     if gpu_bab {
         debug!(
@@ -990,7 +1047,7 @@ pub(super) fn try_unified_input_split_disjunctive_bab(
         domains_verified: 0,
     });
 
-    // Fallback PGD when BaB has no branchable neurons (#3769).
+    // Fallback PGD when BaB has no branchable neurons.
     if let Some(sat) = try_no_branchable_neuron_pgd_fallback(
         &result,
         pgd_attack,
@@ -1012,7 +1069,411 @@ pub(super) fn try_unified_input_split_disjunctive_bab(
     Ok(Some(result))
 }
 
-/// Fallback PGD for no-branchable-neuron BaB results (#3769).
+/// M8a (`#m8-input-split-batch`): the lane config of the independent-singleton
+/// route. The two M8 keys ARRIVE (resolved into `config` by the CLI); every
+/// other field stays at `LowDimConfig::default()`, so with both keys at their
+/// `legacy` default this is byte-identical to the route before M8 (the
+/// linearizenn 60/60 bank path).
+fn singleton_lowdim_config(config: &BetaCrownConfig) -> ny_propagate::lowdim::LowDimConfig {
+    ny_propagate::lowdim::LowDimConfig {
+        batch_engine: config.input_split_lowdim_batch_engine,
+        engine: config.input_split_engine,
+        ..ny_propagate::lowdim::LowDimConfig::default()
+    }
+}
+
+/// Run the #lowdim-prover lane over each clause of a grouped disjunctive plan.
+///
+/// Returns `Some(Verified)` when the lane proves every clause infeasible.
+/// Otherwise removes the clauses it DID prove from `plan` (so the grouped
+/// search only has to close the rest) and returns `None`. Unarmed, or outside
+/// the lane's contract (ReLU split, upper-bound objectives, a non-input-split
+/// heuristic), it is a no-op.
+///
+/// #lsnc-lane: the graph is lowered ONCE for all clauses (through its bound
+/// lane twin when it has one, see `ny_propagate::lowdim::admit`), and a clause
+/// the lane stops on a violation CANDIDATE is no longer dropped: the candidate
+/// point is re-evaluated on the trusted ONNX Runtime forward of the ORIGINAL
+/// model (the graph's own concrete forward when no oracle is registered), and
+/// only a point that satisfies EVERY constraint of some clause of `clauses`
+/// inside the declared box is returned, as `Violated` — still subject to the
+/// unchanged trusted-oracle gate before any `sat` is scored. A point that does
+/// not re-verify is dropped and the pre-pass continues as before.
+///
+/// #lsnc-lane stage 2: the clauses are SCHEDULED in two passes so one hard
+/// clause cannot starve the rest (see the CLAUSE SCHEDULE comment below; a
+/// clause the lane never reached prints `verdict=skipped`), and the joint
+/// engagement line (`[lowdim] joint sites=..`) is printed whenever the program
+/// has a joint site or the joint bound is armed.
+#[allow(clippy::too_many_arguments)]
+fn lowdim_grouped_prepass(
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    config: &BetaCrownConfig,
+    use_relu_split: bool,
+    plan: &mut super::super::constraint_plan::GroupedObjectivePlan,
+    clauses: &[Vec<OutputConstraint>],
+    bab_end: Instant,
+    overall_start: Instant,
+) -> Option<BetaCrownResult> {
+    // Grouped objectives are lower-bound objectives; an upper-bound verifier
+    // would read them with the opposite sense.
+    if !config.input_split_lowdim_prover
+        || use_relu_split
+        || config.verify_upper_bound
+        || !matches!(&config.branching_heuristic, BranchingHeuristic::InputSplit)
+    {
+        return None;
+    }
+    let n = plan.clause_sizes.len();
+    if n == 0 || plan.clause_sizes.iter().sum::<usize>() != plan.objectives.len() {
+        return None;
+    }
+    // Lower once; every clause shares the graph and the box.
+    // #lowdim-bundle (1): `admit_with` is `admit` exactly unless the typed
+    // `lowdim_varying_dims` key is armed (varying-dims admission + Sigmoid).
+    let admission = ny_propagate::lowdim::admit_with(graph, input, &config.lowdim_config());
+    let (lowered_ops, interval_consts, bilinear) = admission.as_ref().map_or((0, 0, 0), |a| {
+        (a.lowered_ops(), a.interval_consts(), a.bilinear_ops())
+    });
+    eprintln!(
+        "[lowdim] armed=1 entry=grouped-disjunctive clauses={n} rows={} lowered_ops={lowered_ops} \
+         interval_consts={interval_consts} bilinear={bilinear} twin={}",
+        plan.objectives.len(),
+        graph.lowdim_twin_state()
+    );
+    let admission = match admission {
+        Ok(admission) => admission,
+        Err(reason) => {
+            // The graph and box are shared by every clause: a decline repeats.
+            ny_propagate::lowdim::emit_line(
+                0,
+                &ny_propagate::lowdim::LowDimOutcome::Declined(reason),
+            );
+            eprintln!("[lowdim] entry=grouped-disjunctive proved=0/{n}");
+            return None;
+        }
+    };
+    let started = Instant::now();
+    let lane_end = started
+        + bab_end
+            .saturating_duration_since(started)
+            .mul_f32(config.lowdim_prover_share());
+    let cfg = config.lowdim_config();
+    // #lsnc-lane stage 3: the lane configuration this run actually received
+    // (split / clip / joint / wave mode / threads), unconditionally.
+    ny_propagate::lowdim::emit_config_line(&cfg);
+    // #lsnc-lane stage 2: the joint engagement line, whenever the program has
+    // a ReduceSum(Mul) site or the joint is armed (`planes=1` at every site is
+    // the proof the joint ran; armed with `planes=0` is VOID).
+    if admission.joint_sites() > 0 || cfg.joint_quadratic {
+        ny_propagate::lowdim::emit_joint_line(&ny_propagate::lowdim::joint_root_report(
+            &admission, &cfg,
+        ));
+    }
+    // #lsnc-lane stage 2 — CLAUSE SCHEDULE. The clauses share ONE lane
+    // deadline, and one hard clause (lsnc's `dV >= 1e-6`) could spend all of
+    // it, leaving the cheap output-box clauses unrun and the row unprovable
+    // however good the bounds are. Pass 1 gives each clause at most HALF of its
+    // fair share of what remains (the last one, when nothing waits for a
+    // retry, gets everything); a clause that ran out of TIME there (and only
+    // that: a candidate, the resolution floor or the queue cap would recur) is
+    // retried in pass 2 with an equal share of what then remains, the last one
+    // with everything. The lane keeps no state between runs, so a retry starts
+    // from the root: at most half a fair share is lost per retried clause.
+    // Order never affects soundness: every proof is a whole clause's.
+    let mut offsets = Vec::with_capacity(n);
+    let mut acc = 0usize;
+    for &size in &plan.clause_sizes {
+        offsets.push(acc);
+        acc += size;
+    }
+    let mut proved = vec![false; n];
+    let mut ran = vec![false; n];
+    let mut retry: Vec<usize> = Vec::new();
+    let mut retried = 0usize;
+    let (mut domains, mut closed, mut depth) = (0u64, 0u64, 0u32);
+    let mut clip_closed = 0u64;
+    // M8a (#m8-input-split-batch): `input_split.engine: bbe` proves every
+    // clause on ONE disjunction tree (the clauses share this lowering and this
+    // box): one forward per node for every clause still open on it, a clause
+    // dropped from a leaf only on its own strict f64 close. A candidate goes
+    // to the unchanged confirmer; a confirmed one stops the tree. The per-
+    // clause schedule below then does not run (zero passes).
+    let use_disjunction = cfg.engine == ny_propagate::lowdim::InputSplitEngine::Bbe
+        && ny_propagate::lowdim::disjunction_admits(n, &admission).is_ok();
+    if use_disjunction {
+        let dclauses: Vec<ny_propagate::lowdim::DisjunctionClause> = (0..n)
+            .map(|c| {
+                let rows = offsets[c]..offsets[c] + plan.clause_sizes[c];
+                ny_propagate::lowdim::DisjunctionClause {
+                    objectives: plan.objectives[rows.clone()].to_vec(),
+                    thresholds: plan.thresholds[rows].to_vec(),
+                }
+            })
+            .collect();
+        let mut confirmed: Option<(usize, Vec<f32>, Vec<f32>)> = None;
+        let out = ny_propagate::lowdim::prove_disjunction_admitted_with(
+            &admission,
+            &dclauses,
+            lane_end,
+            &cfg,
+            &mut |c: usize, point: &[f64]| match confirm_lowdim_candidate(
+                graph, input, point, clauses,
+            ) {
+                Some((counterexample, output)) => {
+                    confirmed = Some((c, counterexample, output));
+                    true
+                }
+                None => {
+                    eprintln!("[lowdim] entry=grouped-disjunctive clause={c} witness=rejected");
+                    false
+                }
+            },
+        );
+        for (clause, outcome) in out.per_clause.iter().enumerate() {
+            ny_propagate::lowdim::emit_line(clause, outcome);
+            ran[clause] = true;
+            match outcome {
+                ny_propagate::lowdim::LowDimOutcome::Verified(s) => {
+                    proved[clause] = true;
+                    closed += s.closed;
+                    clip_closed += s.clip_closed;
+                    depth = depth.max(s.max_depth);
+                }
+                ny_propagate::lowdim::LowDimOutcome::Unproved(s, _) => {
+                    closed += s.closed;
+                    clip_closed += s.clip_closed;
+                    depth = depth.max(s.max_depth);
+                }
+                ny_propagate::lowdim::LowDimOutcome::Declined(_) => {}
+            }
+        }
+        // One tree: its leaves are bounded once, whatever their masks.
+        domains = out.stats.domains;
+        if let Some((clause, counterexample, output)) = confirmed {
+            let n_proved = proved.iter().filter(|&&p| p).count();
+            eprintln!(
+                "[lowdim] entry=grouped-disjunctive clause={clause} witness=confirmed \
+                 proved={n_proved}/{n} scheduler=disjunction"
+            );
+            return Some(BetaCrownResult {
+                result: BabVerificationStatus::Violated {
+                    counterexample,
+                    output,
+                },
+                domains_explored: usize::try_from(domains).unwrap_or(usize::MAX),
+                time_elapsed: overall_start.elapsed(),
+                max_depth_reached: depth as usize,
+                output_bounds: None,
+                cuts_generated: 0,
+                domains_verified: usize::try_from(closed).unwrap_or(usize::MAX),
+            });
+        }
+    }
+    let passes = if use_disjunction { 0 } else { 2 };
+    'passes: for pass in 0..passes {
+        let queue: Vec<usize> = if pass == 0 {
+            (0..n).collect()
+        } else {
+            std::mem::take(&mut retry)
+        };
+        if pass == 1 {
+            if queue.is_empty() {
+                break;
+            }
+            retried = queue.len();
+            eprintln!("[lowdim] entry=grouped-disjunctive pass=2 retry={queue:?}");
+        }
+        let total = queue.len();
+        for (pos, &clause) in queue.iter().enumerate() {
+            let now = Instant::now();
+            if now >= lane_end {
+                break 'passes;
+            }
+            let left = u32::try_from(total - pos).unwrap_or(u32::MAX).max(1);
+            let remaining = lane_end.saturating_duration_since(now);
+            let clause_end = if pass == 1 {
+                if left == 1 {
+                    lane_end
+                } else {
+                    now + remaining / left
+                }
+            } else if left == 1 && retry.is_empty() {
+                lane_end
+            } else {
+                now + remaining / left.saturating_mul(2)
+            };
+            let rows = offsets[clause]..offsets[clause] + plan.clause_sizes[clause];
+            ran[clause] = true;
+            let mut candidate: Option<Vec<f64>> = None;
+            let outcome = ny_propagate::lowdim::prove_conjunction_admitted(
+                &admission,
+                &plan.objectives[rows.clone()],
+                &plan.thresholds[rows],
+                clause_end,
+                &cfg,
+                &mut candidate,
+            );
+            ny_propagate::lowdim::emit_line(clause, &outcome);
+            match outcome {
+                ny_propagate::lowdim::LowDimOutcome::Verified(s) => {
+                    proved[clause] = true;
+                    domains += s.domains;
+                    closed += s.closed;
+                    clip_closed += s.clip_closed;
+                    depth = depth.max(s.max_depth);
+                }
+                ny_propagate::lowdim::LowDimOutcome::Unproved(s, stop) => {
+                    domains += s.domains;
+                    closed += s.closed;
+                    clip_closed += s.clip_closed;
+                    depth = depth.max(s.max_depth);
+                    if stop == ny_propagate::lowdim::LowDimStop::Deadline && pass == 0 {
+                        retry.push(clause);
+                    }
+                    if stop == ny_propagate::lowdim::LowDimStop::Candidate {
+                        let confirmed = candidate.as_deref().and_then(|point| {
+                            confirm_lowdim_candidate(graph, input, point, clauses)
+                        });
+                        match confirmed {
+                            Some((counterexample, output)) => {
+                                let n_proved = proved.iter().filter(|&&p| p).count();
+                                eprintln!(
+                                    "[lowdim] entry=grouped-disjunctive clause={clause} \
+                                     witness=confirmed proved={n_proved}/{n}"
+                                );
+                                return Some(BetaCrownResult {
+                                    result: BabVerificationStatus::Violated {
+                                        counterexample,
+                                        output,
+                                    },
+                                    domains_explored: usize::try_from(domains)
+                                        .unwrap_or(usize::MAX),
+                                    time_elapsed: overall_start.elapsed(),
+                                    max_depth_reached: depth as usize,
+                                    output_bounds: None,
+                                    cuts_generated: 0,
+                                    domains_verified: usize::try_from(closed).unwrap_or(usize::MAX),
+                                });
+                            }
+                            None => eprintln!(
+                                "[lowdim] entry=grouped-disjunctive clause={clause} \
+                                 witness=rejected"
+                            ),
+                        }
+                    }
+                }
+                // The graph and box are shared by every clause: a decline repeats.
+                ny_propagate::lowdim::LowDimOutcome::Declined(_) => break 'passes,
+            }
+        }
+    }
+    let skipped: Vec<usize> = (0..n).filter(|&c| !ran[c]).collect();
+    for &clause in &skipped {
+        eprintln!("[lowdim] clause={clause} verdict=skipped reason=lane-deadline");
+    }
+    let n_proved = proved.iter().filter(|&&p| p).count();
+    eprintln!(
+        "[lowdim] entry=grouped-disjunctive proved={n_proved}/{n} retried={retried} \
+         skipped={} domains={domains} clip_closed={clip_closed} secs={:.3} \
+         scheduler={}",
+        skipped.len(),
+        started.elapsed().as_secs_f64(),
+        if use_disjunction {
+            "disjunction"
+        } else {
+            "per_clause"
+        }
+    );
+    if n_proved == n {
+        return Some(BetaCrownResult {
+            result: BabVerificationStatus::Verified,
+            domains_explored: usize::try_from(domains).unwrap_or(usize::MAX),
+            time_elapsed: overall_start.elapsed(),
+            max_depth_reached: depth as usize,
+            output_bounds: None,
+            cuts_generated: 0,
+            domains_verified: usize::try_from(closed).unwrap_or(usize::MAX),
+        });
+    }
+    if n_proved > 0 {
+        drop_proved_clauses(plan, &proved);
+    }
+    None
+}
+
+/// #lsnc-lane: re-verify a lowdim violation CANDIDATE (a leaf centre the lane's
+/// f64 lowering scored as violating every conjunct of one clause) on a trusted
+/// forward, against the FULL disjunction.
+///
+/// The point is rounded to f32 (it lies in the f32-bounded root box, so the
+/// rounding stays inside) and must lie in the DECLARED box with finite bounds
+/// (rejected, never clamped). It is evaluated by the registered ONNX Runtime
+/// forward of the ORIGINAL model, or — with no oracle — the graph's own
+/// concrete forward (which fails closed, non-finite, on an `OpaqueSkip`), and
+/// accepted only when some clause holds on every constraint at that output
+/// (`check_unsafe_counterexample`, zero tolerance, non-finite rejected). This
+/// claims nothing by itself: the returned point still passes the unchanged
+/// trusted-oracle gate before a `sat` is scored.
+fn confirm_lowdim_candidate(
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    point: &[f64],
+    clauses: &[Vec<OutputConstraint>],
+) -> Option<(Vec<f32>, Vec<f32>)> {
+    if clauses.is_empty() || point.len() != input.len() {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let x: Vec<f32> = point.iter().map(|&v| v as f32).collect();
+    let inside = x
+        .iter()
+        .zip(input.lower().iter().zip(input.upper().iter()))
+        .all(|(v, (lo, hi))| {
+            v.is_finite() && lo.is_finite() && hi.is_finite() && *v >= *lo && *v <= *hi
+        });
+    if !inside {
+        return None;
+    }
+    let arr = ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(input.shape()), x.clone()).ok()?;
+    let output = match super::ort_attack::ort_forward_point(&arr) {
+        Some(output) => output,
+        None => graph
+            .propagate_concrete_point(&BoundedTensor::concrete(arr).ok()?, None, None)
+            .ok()?
+            .center(),
+    };
+    clauses
+        .iter()
+        .any(|clause| super::check_unsafe_counterexample(&output, clause))
+        .then(|| (x, output.iter().copied().collect()))
+}
+
+/// Remove the clauses marked `proved` from a grouped plan, keeping the
+/// remaining clauses' rows, thresholds and sizes aligned and in order.
+fn drop_proved_clauses(
+    plan: &mut super::super::constraint_plan::GroupedObjectivePlan,
+    proved: &[bool],
+) {
+    let mut objectives = Vec::with_capacity(plan.objectives.len());
+    let mut thresholds = Vec::with_capacity(plan.thresholds.len());
+    let mut clause_sizes = Vec::with_capacity(plan.clause_sizes.len());
+    let mut offset = 0;
+    for (clause, &size) in plan.clause_sizes.iter().enumerate() {
+        if !proved[clause] {
+            objectives.extend_from_slice(&plan.objectives[offset..offset + size]);
+            thresholds.extend_from_slice(&plan.thresholds[offset..offset + size]);
+            clause_sizes.push(size);
+        }
+        offset += size;
+    }
+    plan.objectives = objectives;
+    plan.thresholds = thresholds;
+    plan.clause_sizes = clause_sizes;
+}
+
+/// Fallback PGD for no-branchable-neuron BaB results.
 ///
 /// BNN Sign models and trivially-stable networks produce "No unstable ReLU
 /// neurons" immediately. This reclaims remaining timeout for a PGD round.
@@ -1089,10 +1550,21 @@ mod restart_root_cache_policy_tests {
         complete.alpha_config.cgan_complete_crown_ibp_root = true;
         assert!(disjunctive_restart_root_cache_enabled(&complete, None));
 
-        let mut sparse = ordinary;
+        let mut sparse = ordinary.clone();
         sparse.use_alpha_crown = true;
         sparse.alpha_config.cgan_sparse_target_complete_root = true;
         assert!(disjunctive_restart_root_cache_enabled(&sparse, Some("0")));
+
+        // #crown-root-map: on the `bound_prop_method: crown` lane (no alpha
+        // authority) the crown arm's published cascade map is reusable across
+        // restarts; the key alone (no cascade armed) has nothing to cache and
+        // keeps the ordinary default.
+        let mut crown_map = ordinary;
+        crown_map.use_alpha_crown = false;
+        crown_map.alpha_config.cgan_complete_crown_ibp_root = true;
+        assert!(!disjunctive_restart_root_cache_enabled(&crown_map, None));
+        crown_map.alpha_config.cgan_crown_root_map = true;
+        assert!(disjunctive_restart_root_cache_enabled(&crown_map, None));
     }
 
     #[test]
@@ -1637,5 +2109,272 @@ mod independent_singleton_tests {
         assert_eq!(failure.metrics.cuts_generated, 2);
         assert_eq!(failure.metrics.max_depth_reached, 3);
         assert_eq!(failure.metrics.failed_original_clause_index, Some(1));
+    }
+}
+
+#[cfg(test)]
+mod lowdim_grouped_prepass_tests {
+    use super::*;
+    use ndarray::arr2;
+    use ny_onnx::vnnlib::parse_vnnlib;
+    use ny_propagate::{layers::LinearLayer, Layer, Network};
+
+    /// `y = x` on `[0, 1]^2`, as the Graph the grouped lane receives.
+    fn identity_graph_and_box() -> (GraphNetwork, BoundedTensor) {
+        let mut net = Network::new();
+        net.add_layer(Layer::Linear(
+            LinearLayer::new(arr2(&[[1.0_f32, 0.0], [0.0, 1.0]]), None).expect("linear"),
+        ));
+        let graph = GraphNetwork::from_sequential(&net).expect("converts");
+        let input = BoundedTensor::new(
+            ndarray::arr1(&[0.0_f32, 0.0]).into_dyn(),
+            ndarray::arr1(&[1.0_f32, 1.0]).into_dyn(),
+        )
+        .expect("box");
+        (graph, input)
+    }
+
+    fn spec(clauses: &str) -> VnnLibSpec {
+        parse_vnnlib(&format!(
+            "(declare-const X_0 Real)
+             (declare-const X_1 Real)
+             (declare-const Y_0 Real)
+             (declare-const Y_1 Real)
+             (assert (>= X_0 0.0))
+             (assert (<= X_0 1.0))
+             (assert (>= X_1 0.0))
+             (assert (<= X_1 1.0))
+             (assert (or {clauses}))"
+        ))
+        .expect("parses")
+    }
+
+    fn armed() -> BetaCrownConfig {
+        BetaCrownConfig {
+            branching_heuristic: BranchingHeuristic::InputSplit,
+            input_split_lowdim_prover: true,
+            ..Default::default()
+        }
+    }
+
+    const IMPOSSIBLE: &str = "(and (<= Y_0 -1.0) (>= Y_1 0.5))";
+    const ALSO_IMPOSSIBLE: &str = "(and (>= Y_0 0.25) (>= Y_1 2.0))";
+    const SATISFIABLE: &str = "(and (>= Y_0 0.25) (<= Y_1 0.75))";
+
+    fn run(
+        config: &BetaCrownConfig,
+        vnnlib: &VnnLibSpec,
+    ) -> (Option<BetaCrownResult>, usize, usize) {
+        let (graph, input) = identity_graph_and_box();
+        let mut plan = build_grouped_disjunctive_objectives(vnnlib).expect("plan");
+        let now = Instant::now();
+        let out = lowdim_grouped_prepass(
+            &graph,
+            &input,
+            config,
+            false,
+            &mut plan,
+            &vnnlib.output_constraint_clauses,
+            now + Duration::from_secs(30),
+            now,
+        );
+        assert_eq!(
+            plan.clause_sizes.iter().sum::<usize>(),
+            plan.objectives.len()
+        );
+        assert_eq!(plan.objectives.len(), plan.thresholds.len());
+        (out, plan.clause_sizes.len(), plan.objectives.len())
+    }
+
+    /// Every clause infeasible (through the REAL VNN-LIB -> grouped-plan
+    /// objectives) is a proof.
+    #[test]
+    fn every_impossible_clause_is_a_proof() {
+        let (out, _, _) = run(&armed(), &spec(&format!("{IMPOSSIBLE} {ALSO_IMPOSSIBLE}")));
+        let out = out.expect("all clauses proved");
+        assert_eq!(out.result, BabVerificationStatus::Verified);
+    }
+
+    /// A satisfiable clause is never proved. #lsnc-lane: its violation
+    /// CANDIDATE is no longer dropped — the lane's leaf centre re-verifies on
+    /// the graph's concrete forward (no ORT oracle is registered here), so the
+    /// pre-pass hands back a `Violated` whose point satisfies that clause
+    /// inside the box. Never `Verified`.
+    #[test]
+    fn a_satisfiable_clause_yields_a_reverified_counterexample_never_a_proof() {
+        let vnnlib = spec(&format!("{IMPOSSIBLE} {SATISFIABLE} {ALSO_IMPOSSIBLE}"));
+        let (out, _, _) = run(&armed(), &vnnlib);
+        let out = out.expect("the satisfiable clause's candidate must re-verify");
+        let BabVerificationStatus::Violated {
+            counterexample,
+            output,
+        } = &out.result
+        else {
+            panic!("a satisfiable disjunction must not verify: {out:?}");
+        };
+        assert_eq!(counterexample.len(), 2);
+        assert!(
+            counterexample.iter().all(|v| (0.0..=1.0).contains(v)),
+            "the point must lie in the box: {counterexample:?}"
+        );
+        // y = x: the SATISFIABLE clause is `Y_0 >= 0.25 AND Y_1 <= 0.75`.
+        assert_eq!(output, counterexample);
+        assert!(output[0] >= 0.25 && output[1] <= 0.75, "{output:?}");
+    }
+
+    /// Removing proved clauses keeps the remaining rows, thresholds and sizes
+    /// aligned and in order.
+    #[test]
+    fn only_proved_clauses_are_dropped() {
+        let vnnlib = spec(&format!("{IMPOSSIBLE} {SATISFIABLE} {ALSO_IMPOSSIBLE}"));
+        let full = build_grouped_disjunctive_objectives(&vnnlib).expect("plan");
+        let mut plan = build_grouped_disjunctive_objectives(&vnnlib).expect("plan");
+        drop_proved_clauses(&mut plan, &[true, false, true]);
+        assert_eq!(plan.clause_sizes, vec![2]);
+        assert_eq!(plan.objectives, full.objectives[2..4].to_vec());
+        assert_eq!(plan.thresholds, full.thresholds[2..4].to_vec());
+    }
+
+    /// #lsnc-lane: the candidate confirmer accepts only an in-box point that
+    /// satisfies EVERY constraint of some clause at the concrete forward, and
+    /// rejects (never clamps) anything else.
+    #[test]
+    fn the_candidate_confirmer_accepts_only_an_in_box_clause_satisfying_point() {
+        let (graph, input) = identity_graph_and_box();
+        let vnnlib = spec(&format!("{IMPOSSIBLE} {SATISFIABLE}"));
+        let clauses = &vnnlib.output_constraint_clauses;
+        let hit = confirm_lowdim_candidate(&graph, &input, &[0.5, 0.5], clauses)
+            .expect("(0.5, 0.5) satisfies the SATISFIABLE clause");
+        assert_eq!(hit.0, vec![0.5_f32, 0.5]);
+        assert_eq!(hit.1, vec![0.5_f32, 0.5]);
+        // Satisfies no clause (Y_1 > 0.75, and Y_0 > -1).
+        assert!(confirm_lowdim_candidate(&graph, &input, &[0.5, 0.9], clauses).is_none());
+        // Outside the declared box: rejected even though y = x would satisfy it.
+        assert!(confirm_lowdim_candidate(&graph, &input, &[1.5, 0.5], clauses).is_none());
+        // Wrong dimension, non-finite, or no clauses at all: rejected.
+        assert!(confirm_lowdim_candidate(&graph, &input, &[0.5], clauses).is_none());
+        assert!(confirm_lowdim_candidate(&graph, &input, &[f64::NAN, 0.5], clauses).is_none());
+        assert!(confirm_lowdim_candidate(&graph, &input, &[0.5, 0.5], &[]).is_none());
+    }
+
+    /// #lsnc-lane stage 2 — the CLAUSE SCHEDULE: a clause that can never
+    /// close (feasible only on the line `x0 = 0.5`, so the leaves touching it
+    /// never close, and no leaf centre violates both conjuncts, so it never
+    /// stops on a candidate) runs FIRST and must not starve the clause after
+    /// it. Under the old single-deadline loop it consumed the whole lane and
+    /// the impossible clause never ran; now pass 1 caps it, the impossible
+    /// clause is proved and dropped, and only the stuck clause remains.
+    #[test]
+    fn a_stuck_clause_does_not_starve_the_clauses_after_it() {
+        const STUCK: &str = "(and (>= Y_0 0.5) (<= Y_0 0.5))";
+        let vnnlib = spec(&format!("{STUCK} {IMPOSSIBLE}"));
+        let (graph, input) = identity_graph_and_box();
+        let mut plan = build_grouped_disjunctive_objectives(&vnnlib).expect("plan");
+        assert_eq!(plan.clause_sizes, vec![2, 2]);
+        let stuck_rows = plan.objectives[..2].to_vec();
+        let now = Instant::now();
+        let out = lowdim_grouped_prepass(
+            &graph,
+            &input,
+            &armed(),
+            false,
+            &mut plan,
+            &vnnlib.output_constraint_clauses,
+            now + Duration::from_secs(2),
+            now,
+        );
+        assert!(out.is_none(), "the stuck clause is not provable: {out:?}");
+        assert_eq!(
+            plan.clause_sizes,
+            vec![2],
+            "the impossible clause must have been proved and dropped"
+        );
+        assert_eq!(plan.objectives, stuck_rows, "only the stuck clause remains");
+    }
+
+    /// M8a (#m8-input-split-batch): under `input_split.engine: bbe` the
+    /// grouped prepass proves every clause on ONE disjunction tree (its
+    /// `[lowdim-disjunction] done` line is this thread's), with the per-clause
+    /// schedule's verdicts: a proof when every clause is impossible, a
+    /// reverified counterexample (never a proof) when one is satisfiable.
+    /// Unarmed, no disjunction tree runs.
+    #[test]
+    fn grouped_prepass_with_engine_bbe_runs_one_disjunction_tree() {
+        let engine = BetaCrownConfig {
+            input_split_engine: ny_propagate::lowdim::InputSplitEngine::Bbe,
+            ..armed()
+        };
+        let _ = ny_propagate::lowdim::take_last_disjunction_summary();
+        let (out, _, _) = run(&engine, &spec(&format!("{IMPOSSIBLE} {ALSO_IMPOSSIBLE}")));
+        let line = ny_propagate::lowdim::take_last_disjunction_summary()
+            .expect("the grouped prepass ran one disjunction tree");
+        assert!(line.contains("clauses=2 proved=2"), "{line}");
+        assert_eq!(
+            out.expect("both clauses proved").result,
+            BabVerificationStatus::Verified
+        );
+        let (out, _, _) = run(
+            &engine,
+            &spec(&format!("{IMPOSSIBLE} {SATISFIABLE} {ALSO_IMPOSSIBLE}")),
+        );
+        assert!(ny_propagate::lowdim::take_last_disjunction_summary().is_some());
+        let out = out.expect("the satisfiable clause's candidate must re-verify");
+        let BabVerificationStatus::Violated { output, .. } = &out.result else {
+            panic!("a satisfiable disjunction must not verify: {out:?}");
+        };
+        assert!(output[0] >= 0.25 && output[1] <= 0.75, "{output:?}");
+        // The legacy scheduler runs one tree per clause.
+        let (out, _, _) = run(&armed(), &spec(&format!("{IMPOSSIBLE} {ALSO_IMPOSSIBLE}")));
+        assert!(ny_propagate::lowdim::take_last_disjunction_summary().is_none());
+        assert_eq!(out.expect("proof").result, BabVerificationStatus::Verified);
+    }
+
+    /// M8a: the independent-singleton route's lane config carries the two M8
+    /// keys and NOTHING else of the resolved config (the linearizenn bank
+    /// path stays `LowDimConfig::default()` exactly while both are legacy).
+    #[test]
+    fn singleton_route_receives_the_m8_keys() {
+        use ny_propagate::lowdim::{InputSplitEngine, LowDimBatchEngine, LowDimConfig};
+        let historical = format!("{:?}", LowDimConfig::default());
+        let dark = singleton_lowdim_config(&BetaCrownConfig::default());
+        assert_eq!(format!("{dark:?}"), historical);
+        let config = BetaCrownConfig {
+            input_split_lowdim_batch_engine: LowDimBatchEngine::Bbe,
+            input_split_engine: InputSplitEngine::Bbe,
+            input_split_lowdim_clip: true,
+            input_split_lowdim_split: ny_propagate::lowdim::LowDimSplit::SbWr,
+            input_split_lowdim_prover_refine_width: 7,
+            ..Default::default()
+        };
+        let lane = singleton_lowdim_config(&config);
+        assert_eq!(lane.batch_engine, LowDimBatchEngine::Bbe);
+        assert_eq!(lane.engine, InputSplitEngine::Bbe);
+        let reset = LowDimConfig {
+            batch_engine: LowDimBatchEngine::Legacy,
+            engine: InputSplitEngine::Legacy,
+            ..lane
+        };
+        assert_eq!(
+            format!("{reset:?}"),
+            historical,
+            "only the two M8 keys may reach the singleton route"
+        );
+    }
+
+    /// Unarmed, or outside the lane's contract, the plan is untouched.
+    #[test]
+    fn unarmed_or_upper_bound_is_a_no_op() {
+        let vnnlib = spec(&format!("{IMPOSSIBLE} {ALSO_IMPOSSIBLE}"));
+        for config in [
+            BetaCrownConfig::default(),
+            BetaCrownConfig {
+                verify_upper_bound: true,
+                ..armed()
+            },
+        ] {
+            let (out, clauses, rows) = run(&config, &vnnlib);
+            assert!(out.is_none());
+            assert_eq!((clauses, rows), (2, 4));
+        }
     }
 }

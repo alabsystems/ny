@@ -9,20 +9,12 @@
 //! β-CROWN splits unstable neurons into "always active" (x ≥ 0) and "always inactive"
 //! (x ≤ 0) branches, encoding these constraints as β parameters in the bound computation.
 //!
-//! ## Key Features
-//!
-//! - **Joint α-β optimization**: Optimizes both ReLU relaxation slopes (α) and Lagrangian
-//!   multipliers (β) together within each domain for tighter bounds.
-//! - **Exact β gradients**: Uses augmented chain rule for precise gradient computation.
-//! - **Parallel domain processing**: Processes multiple domains concurrently via Rayon.
-//! - **Adaptive optimization**: Adam-style optimizer with configurable variants.
-//!
 //! ## Algorithm
 //!
 //! 1. Initialize with root domain (no splits)
 //! 2. While domains remain and not timed out:
-//!    a. Pick domain with worst (highest) lower bound
-//!    b. If lower bound > threshold, domain is verified
+//!    a. Pick the domain with highest configured violation priority
+//!    b. Verify it if its bound excludes the unsafe region
 //!    c. Select an unstable neuron to split
 //!    d. Create two child domains (neuron active vs inactive)
 //!    e. Compute bounds for children with joint α-β optimization
@@ -31,15 +23,14 @@
 //!
 //! ## Optimizer Defaults
 //!
-//! `AdaptiveOptConfig::default()` follows the alpha-beta-CROWN optimizer
-//! defaults for β-CROWN's adaptive path:
+//! [`AdaptiveOptConfig::default()`] configures the adaptive path:
 //!
 //! | Setting | Default | Notes |
 //! |---------|---------|-------|
 //! | Base optimizer | Adam | AMSGrad and Lookahead+Adam remain available overrides |
 //! | RAdam | `false` | Avoid warmup-heavy behavior for short per-domain runs |
 //! | AdamW (weight_decay) | `0.0` | Regularization is disabled by default |
-//! | LR scheduler | `ExponentialDecay { ny: 0.98 }` | Matches `optimized_bounds.py:74,498` |
+//! | LR scheduler | `ExponentialDecay { ny: 0.98 }` | Per-iteration decay |
 //! | bias_correction | `true` | Essential for short iteration runs |
 //! | grad_clip | `10.0` | Moderate clipping for stability |
 //!
@@ -54,6 +45,8 @@ pub(crate) mod bab_cuts;
 pub mod bab_frontier_export;
 mod biccos_q_stage0;
 pub(crate) mod branching;
+/// Runtime resource custody for one same-source certified root-cut attempt.
+pub mod certified_root_cut;
 pub(crate) mod config;
 mod conflict_clause_replay;
 pub(crate) mod conflict_clauses;
@@ -67,6 +60,14 @@ pub mod graph_mip_leaf;
 pub(crate) mod nonlinear_branching;
 mod objective_owner;
 pub(crate) mod result;
+/// #vit-margin-alpha-complex (P8): independent-forward (ONNX Runtime) oracle
+/// seam for adjudicating a root-terminal multi-objective `Verified`;
+/// implemented by ny-cli, consumed by the default-off containment fence.
+pub mod root_adjudication;
+/// #relusplitter-lp-refine (wave-6 C7): root intermediate-bound refiner seam;
+/// implemented by ny-cli (rigorous LP over ny-mip), consumed by the
+/// multi-objective graph BaB root as a shrink-only intersection.
+pub mod root_interm_refine;
 pub(crate) mod state;
 // Exposed at crate scope to support internal test helpers.
 pub(crate) mod engine;
@@ -97,12 +98,17 @@ pub use branching::{
     SplitHistory,
 };
 pub use config::KfsbReduceOp;
+pub use config::MipRefineIntermediates;
+pub use config::SingleHiddenHullMode;
+// #graph-lane-search (ENGINE_PROGRAM M7): own line.
+pub use config::GraphLaneSearch;
+// #vit-v3-bankable: own line.
+pub use config::MoCoverCertify;
 pub use config::{
-    AdaptiveOptConfig, BetaCrownConfig, ChildBoundCalibrationConfig, ConvMode,
-    CutEvictionPolicy, CutScoreWeights, DepthTwoBranchLookaheadConfig,
-    DepthTwoBranchLookaheadMode, InputClipType, LRScheduler,
-    LookaheadConfig, PerLayerLR, PhaseBudgetConfig, VerificationArtifactAuthority,
-    ATOMIC_ROOT_C_MARGIN_MAX_ITERATIONS,
+    AdaptiveOptConfig, BetaCrownConfig, ChildBoundCalibrationConfig, ConvMode, CutEvictionPolicy,
+    CutScoreWeights, DepthTwoBranchLookaheadConfig, DepthTwoBranchLookaheadMode, EdgeWaveCapConfig,
+    InputClipType, LRScheduler, LookaheadConfig, PerLayerLR, PhaseBudgetConfig,
+    SequentialInitialSchedule, VerificationArtifactAuthority, ATOMIC_ROOT_C_MARGIN_MAX_ITERATIONS,
 };
 pub use conjunctive_proof_objectives::{
     ConjunctiveProofObjectiveProvenance, ConjunctiveProofObjectives,
@@ -117,7 +123,8 @@ pub use domain::{
     MultiObjectiveGraphBabDomain, MultiObjectiveTargets, NodeBoundsHostAllocationInvalidV1,
     NodeBoundsHostAllocationObservationV1, NodeBoundsHostAllocationReceiptV1,
     NodeBoundsHostAllocationUnsupportedV1, NodeBoundsMap, NodeBoundsMapIter, NodeBoundsView,
-    NodeBoundsViewIter, ObjectiveAggregation, NODE_BOUNDS_HOST_ALLOCATION_MODEL_V1,
+    NodeBoundsViewIter, ObjectiveAggregation, SharedGraphBootstrap,
+    NODE_BOUNDS_HOST_ALLOCATION_MODEL_V1,
 };
 pub use engine::{
     BatchedSpecBackwardResult, BetaCrownVerifier, DenseSpecReboundMode, DenseSpecStageTiming,
@@ -138,8 +145,10 @@ pub use objective_owner::{
     ResidentObjectiveReceiptV1, ResidentObjectiveUnsupportedV1,
 };
 pub use result::{
-    reset_global_timeout_deadline_source, take_global_timeout_deadline_source,
-    BabVerificationStatus, BetaCrownResult, ViolationWitness,
+    reset_global_timeout_deadline_source, reset_sequential_initial_schedule_receipt,
+    take_global_timeout_deadline_source, take_sequential_initial_schedule_receipt,
+    BabVerificationStatus, BetaCrownResult, SequentialEarlyQuitDisposition,
+    SequentialInitialScheduleReceipt, ViolationWitness,
 };
 pub use state::{
     AlphaNeuronState, BetaEntry, BetaState, DomainAlphaState, GraphAlphaStateByteCensus,

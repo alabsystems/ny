@@ -152,7 +152,7 @@ pub struct QuantizeResult {
     pub input_epsilon: f32,
 }
 
-#[deprecated(note = "use QuantizeResult")]
+#[deprecated(since = "0.1.0", note = "use QuantizeResult")]
 pub type QuantizationResult = QuantizeResult;
 
 impl QuantizeResult {

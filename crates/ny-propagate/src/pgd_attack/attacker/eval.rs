@@ -12,7 +12,10 @@ use tracing::debug;
 use crate::contiguous_flat_slice;
 use crate::layers::common::BoundPropagation;
 use crate::layers::Layer;
-use crate::network::ibp::try_lower_dense_chain;
+use crate::network::ibp::{
+    propagate_concrete_point_until, try_lower_dense_chain, try_lower_dense_chain_until,
+    LeadingAxisMode,
+};
 use crate::Network;
 
 use super::{CachedGpuIbpPlanEntry, CachedGpuIbpPlanKey, PgdAttacker};
@@ -21,7 +24,7 @@ use super::{CachedGpuIbpPlanEntry, CachedGpuIbpPlanKey, PgdAttacker};
 ///
 /// tanh(SMOOTH_SIGN_BETA * x) closely approximates sign(x) but has
 /// nonzero gradient everywhere, giving SPSA a meaningful gradient signal
-/// through BNN Sign layers (#3769).
+/// through BNN Sign layers.
 ///
 /// At beta=10: tanh(10 * 0.1) = tanh(1) ≈ 0.76 (gradient ≈ 4.2)
 ///             tanh(10 * 0.5) ≈ 1.0           (gradient ≈ 0)
@@ -33,7 +36,7 @@ pub(in crate::pgd_attack) const SMOOTH_SIGN_BETA: f32 = 10.0;
 /// unaffected regardless of variant.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::pgd_attack) enum SignSurrogate {
-    /// Legacy smooth relaxation `tanh(β·x)` (#3769). Finite differences
+    /// Legacy smooth relaxation `tanh(β·x)`. Finite differences
     /// vanish once `|β·x| ≳ 10` — BNN pre-activations saturate it.
     Tanh(f32),
     /// Plain straight-through estimator: sign(x) → x, so `d/dx sign(x) = 1`
@@ -77,11 +80,54 @@ fn bounded_tensor_from_gpu_ibp_result(result: GpuIbpResult) -> Result<BoundedTen
 }
 
 impl PgdAttacker<'_> {
+    fn attack_point_tensor(&self, values: ArrayD<f32>) -> Result<BoundedTensor> {
+        if self.effective_deadline().is_some() {
+            BoundedTensor::concrete_with_poll(values, || {
+                self.checkpoint("during point construction")
+            })
+        } else {
+            BoundedTensor::concrete(values)
+        }
+    }
+
+    fn attack_point_center(&self, bounds: &BoundedTensor) -> Result<ArrayD<f32>> {
+        if self.effective_deadline().is_some() {
+            bounds.center_with_poll(|| self.checkpoint("during point center"))
+        } else {
+            Ok(bounds.center())
+        }
+    }
+
+    fn apply_sign_surrogate_until(
+        &self,
+        current: &BoundedTensor,
+        surrogate: SignSurrogate,
+    ) -> Result<BoundedTensor> {
+        self.checkpoint("before Sign surrogate allocation")?;
+        let smoothed = if self.effective_deadline().is_some() {
+            let mut values = ArrayD::zeros(IxDyn(current.shape()));
+            for (index, (value, &source)) in
+                values.iter_mut().zip(current.lower().iter()).enumerate()
+            {
+                if index.is_multiple_of(4_096) {
+                    self.checkpoint("during Sign surrogate transformation")?;
+                }
+                *value = surrogate.apply(source);
+            }
+            values
+        } else {
+            current.lower().mapv(|x| surrogate.apply(x))
+        };
+        self.attack_point_tensor(smoothed)
+    }
+
     fn evaluate_with_cached_model_plan(
         &self,
         network: &Network,
         input_bounds: &BoundedTensor,
     ) -> Result<Option<BoundedTensor>> {
+        self.checkpoint("before cached point evaluation")?;
+        let deadline = self.effective_deadline();
         let Some(plan_factory) = self
             .engine
             .and_then(|engine| engine.as_gpu_ibp_forward_ext())
@@ -92,9 +138,24 @@ impl PgdAttacker<'_> {
         let key = CachedGpuIbpPlanKey::new(network, input_bounds.shape());
         let input_lower = contiguous_flat_slice(input_bounds.lower());
         let input_upper = contiguous_flat_slice(input_bounds.upper());
-        let mut cached = self.model_plan.lock().map_err(|_| {
-            NyError::InternalError("PGD cached model-plan mutex poisoned".to_string())
-        })?;
+        let mut cached = if deadline.is_some() {
+            loop {
+                self.checkpoint("while acquiring cached plan")?;
+                match self.model_plan.try_lock() {
+                    Ok(guard) => break guard,
+                    Err(std::sync::TryLockError::WouldBlock) => std::thread::yield_now(),
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        return Err(NyError::InternalError(
+                            "PGD cached model-plan mutex poisoned".into(),
+                        ));
+                    }
+                }
+            }
+        } else {
+            self.model_plan.lock().map_err(|_| {
+                NyError::InternalError("PGD cached model-plan mutex poisoned".to_string())
+            })?
+        };
 
         let needs_refresh = cached
             .as_ref()
@@ -102,14 +163,29 @@ impl PgdAttacker<'_> {
                 entry.key.layers_ptr != key.layers_ptr
                     || entry.key.layer_count != key.layer_count
                     || entry.key.input_shape != key.input_shape
+                    || entry.deadline_aware != deadline.is_some()
             })
             .unwrap_or(true);
 
         if needs_refresh {
-            let plan = match try_lower_dense_chain(network, input_bounds.shape()) {
+            let layers = match deadline {
+                Some(limit) => try_lower_dense_chain_until(network, input_bounds.shape(), limit)?,
+                None => try_lower_dense_chain(network, input_bounds.shape()),
+            };
+            let plan = match layers {
                 Some(layers) => {
-                    match plan_factory.prepare_model_plan(&layers, input_bounds.shape()) {
+                    self.checkpoint("before cached plan preparation")?;
+                    let prepared = match deadline {
+                        Some(limit) => plan_factory.prepare_model_plan_with_deadline(
+                            &layers,
+                            input_bounds.shape(),
+                            limit,
+                        ),
+                        None => plan_factory.prepare_model_plan(&layers, input_bounds.shape()),
+                    };
+                    match prepared {
                         Ok(plan) => plan,
+                        Err(err) if Self::has_deadline_source(&err) => return Err(err),
                         Err(err) => {
                             debug!(
                             ?err,
@@ -121,7 +197,12 @@ impl PgdAttacker<'_> {
                 }
                 None => None,
             };
-            *cached = Some(CachedGpuIbpPlanEntry { key, plan });
+            self.checkpoint("after cached plan preparation")?;
+            *cached = Some(CachedGpuIbpPlanEntry {
+                key,
+                deadline_aware: deadline.is_some(),
+                plan,
+            });
         }
 
         let Some(entry) = cached.as_mut() else {
@@ -130,13 +211,32 @@ impl PgdAttacker<'_> {
         let Some(plan) = entry.plan.as_ref() else {
             return Ok(None);
         };
+        if deadline.is_some() && !plan.supports_deadline_execution() {
+            return Ok(None);
+        }
 
-        match plan.ibp_forward_cached(
-            input_lower.as_ref(),
-            input_upper.as_ref(),
-            input_bounds.shape(),
-        ) {
-            Ok(result) => bounded_tensor_from_gpu_ibp_result(result).map(Some),
+        self.checkpoint("before cached plan execution")?;
+        let evaluated = match deadline {
+            Some(limit) => plan.ibp_forward_cached_with_deadline(
+                input_lower.as_ref(),
+                input_upper.as_ref(),
+                input_bounds.shape(),
+                limit,
+            ),
+            None => plan.ibp_forward_cached(
+                input_lower.as_ref(),
+                input_upper.as_ref(),
+                input_bounds.shape(),
+            ),
+        };
+        self.checkpoint("after cached plan execution")?;
+        match evaluated {
+            Ok(result) => {
+                let output = bounded_tensor_from_gpu_ibp_result(result)?;
+                self.checkpoint("after cached output construction")?;
+                Ok(Some(output))
+            }
+            Err(err) if Self::has_deadline_source(&err) => Err(err),
             Err(err) => {
                 debug!(
                     ?err,
@@ -152,20 +252,28 @@ impl PgdAttacker<'_> {
     ///
     /// Returns the network output as a flat f32 array.
     pub(crate) fn evaluate(&self, network: &Network, input: &ArrayD<f32>) -> Result<ArrayD<f32>> {
-        let input_bounds = BoundedTensor::concrete(input.clone())?;
+        self.checkpoint("before point input allocation")?;
+        let input_bounds = self.attack_point_tensor(input.clone())?;
         if let Some(output_bounds) = self.evaluate_with_cached_model_plan(network, &input_bounds)? {
             // The cached plan only fires for pure dense chains
             // (Linear/ReLU/Flatten/Reshape), which preserve a point exactly, so the
             // box stays degenerate — its center is the faithful forward value.
-            return Ok(output_bounds.center());
+            return self.attack_point_center(&output_bounds);
         }
         // TRUE concrete (point) forward: collapse to the interval center after each
         // layer. The whole-box `propagate_ibp_with_engine` returns a NON-degenerate
         // box even for a point input — per-layer soundness widening (esp. BatchNorm)
         // amplified by a deep conv stack — so `.lower()` is NOT the forward value and
         // fabricates false counterexamples (cgan_2023 unknown-downgrade). #cgan-eval.
-        let output_bounds = network.propagate_concrete_point(&input_bounds, self.eval_engine())?;
-        Ok(output_bounds.center())
+        let output_bounds = propagate_concrete_point_until(
+            network,
+            &input_bounds,
+            self.eval_engine(),
+            LeadingAxisMode::Plain,
+            self.effective_deadline(),
+        )?;
+        self.checkpoint("after point evaluation")?;
+        self.attack_point_center(&output_bounds)
     }
 
     /// Evaluate network at a batch of concrete points.
@@ -184,18 +292,25 @@ impl PgdAttacker<'_> {
         network: &Network,
         inputs: &ArrayD<f32>,
     ) -> Result<ArrayD<f32>> {
-        let input_bounds = BoundedTensor::concrete(inputs.clone())?;
+        self.checkpoint("before batch input allocation")?;
+        let input_bounds = self.attack_point_tensor(inputs.clone())?;
         if let Some(output_bounds) = self.evaluate_with_cached_model_plan(network, &input_bounds)? {
             // Dense-chain plan preserves a point exactly (see `evaluate`).
-            return Ok(output_bounds.center());
+            return self.attack_point_center(&output_bounds);
         }
         // Batched PGD prepends a restart axis; preserve it across sequential
         // Flatten/Reshape layers so the stored unbatched network contract still
-        // reaches downstream Linear layers (#4345). TRUE point forward (center-
+        // reaches downstream Linear layers. TRUE point forward (center-
         // collapse per layer) so per-layer widening cannot amplify (#cgan-eval).
-        let output_bounds = network
-            .propagate_concrete_point_preserve_leading_axis(&input_bounds, self.eval_engine())?;
-        Ok(output_bounds.center())
+        let output_bounds = propagate_concrete_point_until(
+            network,
+            &input_bounds,
+            self.eval_engine(),
+            LeadingAxisMode::PreserveLeadingAxis,
+            self.effective_deadline(),
+        )?;
+        self.checkpoint("after batch evaluation")?;
+        self.attack_point_center(&output_bounds)
     }
 
     /// The Sign surrogate the attack's gradient estimation should evaluate
@@ -211,7 +326,7 @@ impl PgdAttacker<'_> {
 
     /// Evaluate concrete input through a network where Sign layers are replaced
     /// with `tanh(β*x)` — a smooth approximation that preserves Sign's overall
-    /// shape but has nonzero gradient everywhere (#3769).
+    /// shape but has nonzero gradient everywhere.
     ///
     /// Used during SPSA gradient estimation only. The violation check still uses
     /// the original Sign layer so soundness is unaffected.
@@ -231,72 +346,98 @@ impl PgdAttacker<'_> {
     }
 
     /// Evaluate concrete input through a network where Sign layers are replaced
-    /// by the configured attack surrogate (#3769, #surrogate-sign).
+    /// by the configured attack surrogate (#surrogate-sign).
     pub(super) fn evaluate_sign_surrogate(
         &self,
         network: &Network,
         input: &ArrayD<f32>,
         surrogate: SignSurrogate,
     ) -> Result<ArrayD<f32>> {
-        let mut current = BoundedTensor::concrete(input.clone())?;
+        self.checkpoint("before Sign surrogate input allocation")?;
+        let mut current = self.attack_point_tensor(input.clone())?;
         for (i, layer) in network.layers.iter().enumerate() {
+            self.checkpoint("before Sign surrogate layer")?;
             let next = match layer {
-                Layer::Sign(_) => {
-                    let smoothed = current.lower().mapv(|x| surrogate.apply(x));
-                    BoundedTensor::concrete(smoothed)?
-                }
+                Layer::Sign(_) => self.apply_sign_surrogate_until(&current, surrogate)?,
                 Layer::Linear(linear) => {
-                    linear.propagate_ibp_with_engine(&current, self.eval_engine())?
+                    if self.effective_deadline().is_some() {
+                        linear.propagate_concrete_point_with_engine_and_deadline(
+                            &current,
+                            self.eval_engine(),
+                            self.effective_deadline(),
+                        )?
+                    } else {
+                        linear.propagate_ibp_with_engine(&current, self.eval_engine())?
+                    }
                 }
                 _ => layer.propagate_ibp(&current)?,
             };
             // NaN check consistent with IBP forward path
-            if next.lower().iter().any(|v| v.is_nan()) {
-                return Err(NyError::NumericalInstability(format!(
-                    "smooth Sign evaluation NaN at layer {} ({})",
-                    i,
-                    layer.layer_type()
-                )));
+            for (index, value) in next.lower().iter().enumerate() {
+                if index.is_multiple_of(4_096) {
+                    self.checkpoint("during Sign surrogate result validation")?;
+                }
+                if value.is_nan() {
+                    return Err(NyError::NumericalInstability(format!(
+                        "smooth Sign evaluation NaN at layer {} ({})",
+                        i,
+                        layer.layer_type()
+                    )));
+                }
             }
             // Collapse to the interval center so per-layer soundness widening cannot
             // amplify across the network (#cgan-eval); a point input must stay a point.
-            current = BoundedTensor::concrete(next.center())?;
+            current = self.attack_point_tensor(self.attack_point_center(&next)?)?;
         }
-        Ok(current.center())
+        self.checkpoint("after Sign surrogate evaluation")?;
+        self.attack_point_center(&current)
     }
 
     /// Evaluate a batch of concrete inputs with the configured Sign surrogate
-    /// (#3769, #surrogate-sign).
+    /// (#surrogate-sign).
     pub(super) fn evaluate_batch_sign_surrogate(
         &self,
         network: &Network,
         inputs: &ArrayD<f32>,
         surrogate: SignSurrogate,
     ) -> Result<ArrayD<f32>> {
-        let mut current = BoundedTensor::concrete(inputs.clone())?;
+        self.checkpoint("before batched Sign surrogate input allocation")?;
+        let mut current = self.attack_point_tensor(inputs.clone())?;
         for (i, layer) in network.layers.iter().enumerate() {
+            self.checkpoint("before batched Sign surrogate layer")?;
             let next = match layer {
-                Layer::Sign(_) => {
-                    let smoothed = current.lower().mapv(|x| surrogate.apply(x));
-                    BoundedTensor::concrete(smoothed)?
-                }
+                Layer::Sign(_) => self.apply_sign_surrogate_until(&current, surrogate)?,
                 Layer::Linear(linear) => {
-                    linear.propagate_ibp_with_engine(&current, self.eval_engine())?
+                    if self.effective_deadline().is_some() {
+                        linear.propagate_concrete_point_with_engine_and_deadline(
+                            &current,
+                            self.eval_engine(),
+                            self.effective_deadline(),
+                        )?
+                    } else {
+                        linear.propagate_ibp_with_engine(&current, self.eval_engine())?
+                    }
                 }
                 Layer::Flatten(layer) => layer.propagate_ibp_preserve_leading_axis(&current)?,
                 Layer::Reshape(layer) => layer.propagate_ibp_preserve_leading_axis(&current)?,
                 _ => layer.propagate_ibp(&current)?,
             };
-            if next.lower().iter().any(|v| v.is_nan()) {
-                return Err(NyError::NumericalInstability(format!(
-                    "smooth Sign batch evaluation NaN at layer {} ({})",
-                    i,
-                    layer.layer_type()
-                )));
+            for (index, value) in next.lower().iter().enumerate() {
+                if index.is_multiple_of(4_096) {
+                    self.checkpoint("during batched Sign surrogate result validation")?;
+                }
+                if value.is_nan() {
+                    return Err(NyError::NumericalInstability(format!(
+                        "smooth Sign batch evaluation NaN at layer {} ({})",
+                        i,
+                        layer.layer_type()
+                    )));
+                }
             }
             // Collapse to the interval center (#cgan-eval): keep a point a point.
-            current = BoundedTensor::concrete(next.center())?;
+            current = self.attack_point_tensor(self.attack_point_center(&next)?)?;
         }
-        Ok(current.center())
+        self.checkpoint("after batched Sign surrogate evaluation")?;
+        self.attack_point_center(&current)
     }
 }

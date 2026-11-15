@@ -16,6 +16,18 @@ name = "ny"
 path = "src/main.rs"
 
 [[example]]
+name = "certified-root-cut-conformance"
+path = "examples/certified_root_cut_conformance.rs"
+required-features = ["cuda", "mip"]
+test = false
+
+[[example]]
+name = "convtranspose-cuda-conformance"
+path = "examples/convtranspose_cuda_conformance.rs"
+required-features = ["cuda", "mip"]
+test = false
+
+[[example]]
 name = "cz-metaroom-qualification"
 path = "examples/cz_metaroom_qualification.rs"
 required-features = ["mip"]
@@ -32,6 +44,18 @@ name = "cz-cgan-protected-cover-probe"
 path = "examples/cz_cgan_protected_cover_probe.rs"
 required-features = ["mip"]
 test = false
+
+# Integration targets that read the gitignored VNN-COMP corpus belong to the
+# explicit `external-vnncomp` lane (absent from the default lane, a hard failure
+# when selected without the corpus) rather than to `#[ignore]` in the default
+# lane, which `source_policy` forbids. See EXTERNAL_CONFORMANCE.md.
+[[test]]
+name = "proof_check_real"
+required-features = ["external-vnncomp"]
+
+[[test]]
+name = "f64_tail_census"
+required-features = ["external-vnncomp"]
 
 [features]
 default = ["pytorch", "coreml", "gguf"]
@@ -64,11 +88,21 @@ rayon.workspace = true
 ny-core = { path = "../ny-core" }
 ny-tensor = { path = "../ny-tensor" }
 ny-propagate = { path = "../ny-propagate" }
+# #bbe (ENGINE_PROGRAM §1.3): the UNTRUSTED search backends. ny-cli is the ONLY
+# crate that sees both sides: it constructs `ny_bbe::CpuF32Backend` and injects
+# it into ny-propagate as `&dyn ny_core::search::SearchBackend`. ny-propagate
+# never depends on ny-bbe (`crates/ny-bbe/tests/crate_dag_ratchet.rs`).
+ny-bbe = { path = "../ny-bbe" }
 ny-onnx = { path = "../ny-onnx" }
 ny-trace-bridge = { path = "../ny-trace-bridge" }
 ny-gpu = { path = "../ny-gpu" }
 ny-cuda = { path = "../ny-cuda", optional = true }
 ny-cert = { path = "../ny-cert" }
+# ENGINE_PROGRAM §1.7 B2.1: the offline proof-bundle checker behind
+# `ny proof-check`. ny-cli is the ONLY crate that may depend on it, and only
+# `commands/proof_check.rs` may name it; no verdict path reads its report
+# (`tests/proof_check_ratchet.rs`).
+ny-proofcheck = { path = "../ny-proofcheck" }
 ny-api = { path = "../ny-api", features = ["cert"] }
 ny-groundtruth = { path = "../ny-groundtruth" }
 ny-levers = { path = "../ny-levers" }
@@ -95,7 +129,7 @@ ny-mip = { path = "../ny-mip", optional = true }
 # `ResolutionDag::validate` — the in-memory refutation certificate and its
 # independent RUP replay that the UNSAT direction is required to pass before
 # any `Verified` verdict is emitted.
-ay-sat = { version = "0.20.0", git = "https://github.com/alabsystems/ay.git", rev = "0ef4657b7ebca2855d9d044823a40825c8c300dd", default-features = false, features = ["unsat-cert"] }
+ay-sat = { version = "0.28.0", git = "https://github.com/alabsystems/ay.git", rev = "9dfa20b5790b03c8ffe57fbbe67316ece665c5be", default-features = false, features = ["unsat-cert"] }
 # Exact rational arithmetic for the graph-MIP pinned-column fold (inc5c) —
 # the same exact seam ny-mip already uses (`num_rational::BigRational`).
 num-rational = { workspace = true, optional = true }

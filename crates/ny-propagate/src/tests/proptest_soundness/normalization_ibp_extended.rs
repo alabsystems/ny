@@ -8,8 +8,6 @@
 //! - AdaIN1d forward-mode IBP (delegates to InstanceNorm forward-mode + style affine)
 //! - Negative ny for RmsNorm, InstanceNorm1d, LayerNorm (exercises g<0 bound-swap)
 //! - AdaIN1d conservative IBP with large perturbation (σ_min regression)
-//!
-//! Part of #3326.
 
 use crate::layers::common::BoundPropagation;
 use crate::layers::normalization::AdaIN1dLayer;
@@ -100,7 +98,7 @@ proptest! {
 
     /// AdaIN1d forward-mode IBP with large perturbation.
     ///
-    /// Regression test for σ_min fix (#3159): exercises the path where the
+    /// Regression test for σ_min fix: exercises the path where the
     /// inner InstanceNorm forward-mode encounters large input boxes that
     /// include near-zero-variance configurations.
     #[ntest::timeout(10000)]
@@ -314,7 +312,6 @@ proptest! {
     /// MeanOnly: y_i = ny_i * (x_i - mean(X)) + beta_i is an affine function.
     /// The forward-mode IBP uses interval mean bounds for soundness.
     /// No IBP proptest existed for MeanOnly (only CROWN proptests).
-    /// Part of #3333.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_layernorm_mean_only_forward_mode_ibp(
@@ -371,7 +368,6 @@ proptest! {
     /// Exercises MeanOnly with wide input boxes. MeanOnly is affine, so
     /// there's no sigma_min concern, but large perturbation tests the
     /// interval arithmetic precision with wide ranges.
-    /// Part of #3333.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_layernorm_mean_only_forward_mode_large_perturbation(
@@ -433,7 +429,7 @@ proptest! {
 
     /// AdaIN1d conservative IBP soundness with large perturbation.
     ///
-    /// Regression test for σ_min fix (#3159): exercises conservative IBP
+    /// Regression test for σ_min fix: exercises conservative IBP
     /// (not forward-mode) with wide input boxes where variance can be very
     /// small. All other normalization layers have this regression variant.
     #[ntest::timeout(10000)]

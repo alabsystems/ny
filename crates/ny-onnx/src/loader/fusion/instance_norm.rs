@@ -4,7 +4,7 @@
 
 //! InstanceNorm/LayerNorm discrimination for proto-level fusion.
 //!
-//! Part of #3591: decomposed AdaIN patterns (e.g., kokoro vocoder) produce the
+//! Decomposed AdaIN patterns (e.g., kokoro vocoder) produce the
 //! same ReduceMean→Sub→Pow/Mul→ReduceMean→Add(eps)→Sqrt→Div/Reciprocal+Mul
 //! sequence as LayerNorm. The only discriminator is ny shape vs input shape:
 //!

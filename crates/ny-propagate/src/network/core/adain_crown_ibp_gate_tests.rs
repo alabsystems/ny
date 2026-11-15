@@ -9,7 +9,7 @@ use crate::layers::{AdaIN1dLayer, InstanceNorm1dLayer, Layer, ReLULayer};
 
 /// AdaIN1d now routes `IbpValidated` CROWN through its effective
 /// InstanceNorm1d equivalent, so AdaIN-only CNN graphs are also allowed to use
-/// CROWN-IBP intermediates. Part of #3912.
+/// CROWN-IBP intermediates.
 #[ntest::timeout(10000)]
 #[test]
 fn test_should_use_crown_ibp_intermediates_adain_3912() {

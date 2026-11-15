@@ -31,12 +31,12 @@ impl PgdAttacker<'_> {
         seed: u64,
     ) -> Result<RestartResult> {
         let mut rng = self.seeded_rng(seed);
-        let mut x = self.initialize_restart(network, input_bounds, &mut rng)?;
+        let mut x = self.initialize_restart_for_seed(network, input_bounds, &mut rng, seed)?;
         let mut evals = 0;
         let mut consecutive_nan_skips: u32 = 0;
         const MAX_CONSECUTIVE_NAN_SKIPS: u32 = 5;
 
-        // Create step state for this restart (#4277: AdamClipping optimizer).
+        // Create step state for this restart (AdamClipping optimizer).
         // Gradient descent (sign=-1): minimize max(Y_j - Y_target).
         let mut step_state = self.config().create_step_state(input_bounds);
 
@@ -79,7 +79,7 @@ impl PgdAttacker<'_> {
             // To minimize, take negative gradient step
             let gradient_diff = &grad_j - &grad_target;
 
-            // NaN guard (#2745): same pattern as conjunctive_less_eq.
+            // NaN guard: same pattern as conjunctive_less_eq.
             if gradient_diff.iter().any(|v| v.is_nan()) {
                 consecutive_nan_skips += 1;
                 if consecutive_nan_skips >= MAX_CONSECUTIVE_NAN_SKIPS {
@@ -94,7 +94,7 @@ impl PgdAttacker<'_> {
             }
             consecutive_nan_skips = 0;
 
-            // Apply the step using the configured optimizer (#4277).
+            // Apply the step using the configured optimizer.
             // Descent on the constraint: sign=-1.
             let projected = step_state.step(&gradient_diff, &x, input_bounds, false);
             x = projected;

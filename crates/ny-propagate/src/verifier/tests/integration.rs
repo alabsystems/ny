@@ -330,7 +330,7 @@ fn test_verify_beta_crown_with_stored_engine_preserves_finite_gpu_crown_fallback
     );
 }
 
-/// Regression for #2241: multi-output beta-CROWN with asymmetric thresholds.
+/// Regression: multi-output beta-CROWN with asymmetric thresholds.
 ///
 /// Network: 2→2 identity + ReLU + 2→2 with bias [5, 5].
 /// For input in [-0.1, 0.1]², output ∈ [4.9, 5.1]² (ReLU passes positive, bias shifts).
@@ -378,7 +378,7 @@ fn test_verify_beta_crown_multi_output_asymmetric_thresholds_2241() {
     let result = verifier.verify(&network, &spec).unwrap();
 
     // Must be Verified — not just "not Violated". The old test used a conditional
-    // `if let Verified` that silently passed on Unknown (#2346).
+    // `if let Verified` that silently passed on Unknown.
     let output_bounds = match &result {
         VerificationResult::Verified { output_bounds, .. } => output_bounds,
         other => panic!(
@@ -401,7 +401,7 @@ fn test_verify_beta_crown_multi_output_asymmetric_thresholds_2241() {
     );
 }
 
-/// Regression for #2241: second output's threshold is stricter and unsatisfiable.
+/// Regression: second output's threshold is stricter and unsatisfiable.
 ///
 /// Network: 2→2 identity + ReLU + 2→2 with bias [10, 0].
 /// output[0] = relu(x0) + 10 ∈ [10, 11], output[1] = relu(x1) ∈ [0, 1].
@@ -462,8 +462,8 @@ fn test_verify_beta_crown_multi_output_second_threshold_stricter_2241() {
     );
 }
 
-/// Regression for #2238: Empty output_bounds must be rejected.
-/// Since #2367 added custom Deserialize validation, serde itself rejects empty
+/// Regression: Empty output_bounds must be rejected.
+/// With custom Deserialize validation, serde itself rejects empty
 /// output_bounds before the verifier is ever invoked — this is strictly better
 /// (fail-fast at the trust boundary).
 #[ntest::timeout(10000)]
@@ -487,8 +487,8 @@ fn test_verify_rejects_deserialized_empty_output_bounds_2238() {
     );
 }
 
-/// Regression for #2238: β-CROWN path — empty output_bounds rejected at deserialization.
-/// Since #2367, the custom Deserialize impl validates output_bounds, so the verifier
+/// Regression: β-CROWN path — empty output_bounds rejected at deserialization.
+/// The custom Deserialize impl validates output_bounds, so the verifier
 /// never sees the invalid spec. This test confirms the deserialization guard.
 #[ntest::timeout(10000)]
 #[test]

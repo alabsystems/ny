@@ -39,6 +39,9 @@ mod screen_child;
 
 use self::process_batch::process_single_objective_domain_batch;
 
+/// The ledger lane name of the single-objective input-split driver.
+const INPUT_SPLIT_LANE: &str = "graph_input_split";
+
 #[cfg(test)]
 thread_local! {
     static ROOT_SPEC_CROWN_ENTRY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -68,7 +71,7 @@ impl BetaCrownVerifier {
     /// Verify GraphNetwork with input splitting and optional GPU acceleration.
     ///
     /// `deadline`: If `Some`, the BaB engine derives its phase budgets from
-    /// remaining wall-clock time instead of `self.config.timeout` (#4321).
+    /// remaining wall-clock time instead of `self.config.timeout`.
     pub fn verify_graph_input_split_with_engine(
         &self,
         graph: &GraphNetwork,
@@ -83,6 +86,11 @@ impl BetaCrownVerifier {
     }
 
     /// Internal implementation with optional GemmEngine for GPU acceleration.
+    ///
+    /// #graph-bab-cover-ledger: the search runs under an armed completeness
+    /// ledger over input BOXES (every closed box, every clip's excluded slabs);
+    /// a `Verified` it returns is kept only if the closed boxes cover `input`
+    /// exactly (see `graph::cover_ledger`).
     pub(crate) fn verify_graph_input_split_impl(
         &self,
         graph: &GraphNetwork,
@@ -92,6 +100,31 @@ impl BetaCrownVerifier {
         engine: Option<&dyn GemmEngine>,
         deadline: Option<Instant>,
     ) -> Result<BetaCrownResult> {
+        graph.ensure_proof_eligible()?;
+        let scope = self.graph_cover.arm_boxes(
+            INPUT_SPLIT_LANE,
+            input,
+            objective,
+            threshold,
+            self.config.verify_upper_bound,
+        );
+        let result = self.verify_graph_input_split_unledgered(
+            graph, input, objective, threshold, engine, deadline,
+        )?;
+        Ok(self.settle_graph_cover(INPUT_SPLIT_LANE, scope, result, deadline))
+    }
+
+    fn verify_graph_input_split_unledgered(
+        &self,
+        graph: &GraphNetwork,
+        input: &BoundedTensor,
+        objective: &[f32],
+        threshold: f32,
+        engine: Option<&dyn GemmEngine>,
+        deadline: Option<Instant>,
+    ) -> Result<BetaCrownResult> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BabLoop);
         self.config.validate()?;
         let graph = self.configured_graph_for_crown(graph);
         let graph = &graph;
@@ -108,10 +141,10 @@ impl BetaCrownVerifier {
 
         let now = Instant::now();
         let mut lifecycle = GraphBabLifecycle::new(now);
-        // Warmup cap (#2206 Packet C, #4095): initial bounds get at most
+        // Warmup cap: initial bounds get at most
         // `initial_bounds_fraction` of the BaB timeout. Mirrors core.rs pattern.
         //
-        // When a wall-clock deadline is provided (#4321), derive the effective
+        // When a wall-clock deadline is provided, derive the effective
         // timeout from remaining time instead of the configured timeout.
         let pgd_frac = self
             .config
@@ -179,6 +212,7 @@ impl BetaCrownVerifier {
                 info!(
                     "Graph input split: certified root-map output box verifies the root; skipping fresh spec-CROWN and child bounding"
                 );
+                self.cover_note_box_bound(objective, threshold, input, root_lower, root_upper);
                 lifecycle.domains_explored = 1;
                 lifecycle.domains_verified = 1;
                 return Ok(lifecycle.build_result_with_bounds(
@@ -201,8 +235,8 @@ impl BetaCrownVerifier {
             }
         }
 
-        // Phase 4 (#3439): MulBinary SPSA alpha optimization.
-        // Uses initial_deadline so warmup phases respect the cap (#4095).
+        // Phase 4: MulBinary SPSA alpha optimization.
+        // Uses initial_deadline so warmup phases respect the cap.
         let mul_binary_alphas = maybe_optimize_mul_binary_alphas(
             graph,
             input,
@@ -217,7 +251,7 @@ impl BetaCrownVerifier {
             warmup_start.elapsed().as_secs_f64()
         );
 
-        // Per-domain bound computation via shared CROWN-or-IBP helper. Part of #3453.
+        // Per-domain bound computation via shared CROWN-or-IBP helper.
         let crown_bkwd = self.config.crown_backward_layers;
         let compute_bounds = |input_bounds: &BoundedTensor,
                               node_bounds: Option<&HashMap<String, BoundedTensor>>|
@@ -284,7 +318,7 @@ impl BetaCrownVerifier {
                 None
             };
 
-        // IBP enhancement: screen root domain before CROWN. Part of #3813.
+        // IBP enhancement: screen root domain before CROWN.
         if self.config.input_split_ibp_enhancement {
             match graph_spec_ibp_root_screen_with_deadline(
                 graph,
@@ -316,6 +350,9 @@ impl BetaCrownVerifier {
                                  (lower={}, upper={}, threshold={})",
                                 ibp_lower, ibp_upper, threshold
                             );
+                            self.cover_note_box_bound(
+                                objective, threshold, input, ibp_lower, ibp_upper,
+                            );
                             lifecycle.domains_explored = 1;
                             lifecycle.domains_verified = 1;
                             return Ok(lifecycle.build_result_with_bounds(
@@ -343,7 +380,7 @@ impl BetaCrownVerifier {
             }
         }
 
-        // Root domain bounds via shared CROWN-or-IBP dispatch (#3453).
+        // Root domain bounds via shared CROWN-or-IBP dispatch.
         #[cfg(test)]
         ROOT_SPEC_CROWN_ENTRY_COUNT.set(ROOT_SPEC_CROWN_ENTRY_COUNT.get() + 1);
         let (root_lower, root_upper, root_linear) = {
@@ -398,7 +435,7 @@ impl BetaCrownVerifier {
             self.config.use_forward_bounds
         );
 
-        // Use bab_timeout so post-BaB PGD reservation is respected (#4095).
+        // Use bab_timeout so post-BaB PGD reservation is respected.
         if lifecycle.start_time.elapsed() > bab_timeout {
             return Ok(lifecycle.timeout_result());
         }
@@ -406,6 +443,7 @@ impl BetaCrownVerifier {
             .config
             .domain_is_verified(root_lower, root_upper, threshold)
         {
+            self.cover_note_box_bound(objective, threshold, input, root_lower, root_upper);
             lifecycle.domains_explored = 1;
             lifecycle.domains_verified = 1;
             return Ok(lifecycle.build_result_with_bounds(
@@ -425,11 +463,11 @@ impl BetaCrownVerifier {
         }
 
         // Non-finite root bounds cannot enter the BaB queue (a ±inf/NaN
-        // priority would create zombie domains, #2982/#3125). Degrade to the
+        // priority would create zombie domains). Degrade to the
         // honest Unknown — same unresolved flag the loop sets when a popped
         // domain cannot be split — instead of hard-erroring the whole run
         // (mirrors the loop's unsplittable handling and the GPU path's
-        // graceful degradation, #1860).
+        // graceful degradation).
         let priority = match self.config.domain_priority(root_lower, root_upper) {
             Ok(priority) => priority,
             Err(NyError::NumericalInstability(_)) => {
@@ -454,7 +492,13 @@ impl BetaCrownVerifier {
             upper_bound: root_upper,
             depth: 0,
             priority,
-            linear_bounds: root_linear,
+            linear_bounds: {
+                // #split-hint: publish before the plane moves into the domain.
+                if let Some(plane) = root_linear.as_ref() {
+                    self.install_root_split_hint(plane, self.config.verify_upper_bound);
+                }
+                root_linear
+            },
             needs_bounding: false,
             node_bounds_override: None,
             inherited_alpha_state: root_inherited_alpha,
@@ -471,11 +515,16 @@ impl BetaCrownVerifier {
             );
         }
 
-        let loop_batch_size = if self.config.reorder_bab {
-            input_split_loop_batch_size(self.config.batch_size, input.len())?.effective_batch_size
-        } else {
-            1
-        };
+        // #router-r6 `rule.trial_width`: the width the loop pops. Today's
+        // value (the clamped decision under `reorder_bab`, else the dormant
+        // 1) unless the acting optimizer armed the site AND the batch is
+        // live on this route (`LoopWidth`: a dormant batch is never
+        // trialled).
+        let mut loop_width = super::loop_width::LoopWidth::resolve(
+            self.config.reorder_bab,
+            self.config.batch_size,
+            input.len(),
+        )?;
         let mut batch_index = 0usize;
 
         while !queue.is_empty() {
@@ -485,7 +534,7 @@ impl BetaCrownVerifier {
                 return Ok(termination);
             }
 
-            let mut domains = pop_input_domain_batch(&mut queue, loop_batch_size);
+            let mut domains = pop_input_domain_batch(&mut queue, loop_width.width());
             bound_deferred_domains_batch_with_metrics(
                 &mut domains,
                 graph,
@@ -552,6 +601,12 @@ impl BetaCrownVerifier {
             )? {
                 return Ok(result);
             }
+            // #router-r6: the batch boundary is this loop's safe point.
+            loop_width.after_batch(
+                lifecycle.domains_verified as u64,
+                lifecycle.start_time,
+                bab_timeout,
+            );
         }
 
         if self.config.input_split_ibp_enhancement {

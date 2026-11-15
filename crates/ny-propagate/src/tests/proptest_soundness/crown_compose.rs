@@ -9,7 +9,7 @@
 //! 2. NaN freedom: no NaN in outputs for any IEEE 754 input
 //! 3. Overflow detection: nonfinite flag ↔ non-finite product
 //!
-//! Part of #3517 composition soundness hardening.
+//! Part of the composition soundness hardening.
 
 use proptest::prelude::*;
 

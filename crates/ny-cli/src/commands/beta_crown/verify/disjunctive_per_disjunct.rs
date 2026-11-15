@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Per-disjunct alpha multi-objective routing for disjunctive properties (#4355).
+//! Per-disjunct alpha multi-objective routing for disjunctive properties.
 //!
 //! When `optimize_disjuncts_separately` is enabled, routes to a shared BaB tree
 //! with per-disjunct alpha optimization instead of splitting the time budget

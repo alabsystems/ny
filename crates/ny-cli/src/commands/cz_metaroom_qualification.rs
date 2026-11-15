@@ -1448,7 +1448,7 @@ struct MetaroomBoxDiagnostic {
 impl MetaroomBoxDiagnostic {
     fn initialize(&mut self, input_box: &CertifiedInputBox) {
         assert!(self.current.is_none());
-        assert!(self.auxiliary_preactivations.is_empty());
+        assert_eq!(self.auxiliary_preactivations.len(), 0);
         self.current = Some(
             CertifiedBox64::from_certified_bounds(
                 input_box.lower(),
@@ -2055,7 +2055,7 @@ fn qualify_real_metaroom_119_full_conv_relu_trunk_impl(
     assert_eq!(model_relu2.layer_type, LayerType::ReLU);
     assert_eq!(model_relu2.inputs, vec![model_conv2.outputs[0].clone()]);
     assert_eq!(model_relu2.outputs.len(), 1);
-    assert!(!model_relu2.outputs[0].is_empty());
+    assert_ne!(model_relu2.outputs[0], "");
     assert!(model_relu2.weights.is_none());
     assert!(model_relu2.attributes.is_empty());
 
@@ -2272,7 +2272,7 @@ fn qualify_real_metaroom_119_full_conv_relu_trunk_impl(
     assert_eq!(model_relu3.layer_type, LayerType::ReLU);
     assert_eq!(model_relu3.inputs, vec![model_conv3.outputs[0].clone()]);
     assert_eq!(model_relu3.outputs.len(), 1);
-    assert!(!model_relu3.outputs[0].is_empty());
+    assert_ne!(model_relu3.outputs[0], "");
     assert!(model_relu3.weights.is_none());
     assert!(model_relu3.attributes.is_empty());
 
@@ -2509,7 +2509,7 @@ fn qualify_real_metaroom_119_full_conv_relu_trunk_impl(
     assert_eq!(model_relu4.layer_type, LayerType::ReLU);
     assert_eq!(model_relu4.inputs, vec![model_conv4.outputs[0].clone()]);
     assert_eq!(model_relu4.outputs.len(), 1);
-    assert!(!model_relu4.outputs[0].is_empty());
+    assert_ne!(model_relu4.outputs[0], "");
     assert!(model_relu4.weights.is_none());
     assert!(model_relu4.attributes.is_empty());
 
@@ -4034,7 +4034,7 @@ fn run_metaroom_tail_dual_pass(
     outer_deadline: Instant,
     certificates: &mut [MetaroomTailCertificateState],
 ) -> bool {
-    assert!(!challengers.is_empty());
+    assert_ne!(challengers.len(), 0);
     assert!(challengers.len() <= 19);
     assert_eq!(auxiliary.value_dim(), prepared.geometry.value_dim());
     let per_margin_wall_cap = match iterations {

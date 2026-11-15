@@ -170,7 +170,7 @@ impl GpuCrownBackward for MockGpuCrownEngine {
 
         // Return configured bounds when num_specs matches expected output dim.
         // Otherwise return conservative wide bounds that let IBP intersection
-        // dominate (#3599 Phase 1: varying num_specs for per-node CROWN-IBP).
+        // dominate (varying num_specs for per-node CROWN-IBP).
         if num_specs == self.expected_lower.len() {
             Ok(GpuCrownResult {
                 lower_bounds: self.expected_lower.clone(),

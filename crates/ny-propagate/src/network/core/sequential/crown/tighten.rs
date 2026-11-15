@@ -7,10 +7,10 @@
 //! After CROWN backward propagation produces output bounds, these helpers
 //! intersect them with forward (IBP) bounds to produce tighter results.
 //! NaN and non-finite values are handled defensively: NaN triggers full
-//! fallback to IBP, ±Inf is handled by per-element intersection (#2681).
+//! fallback to IBP, ±Inf is handled by per-element intersection.
 //!
 //! Reference: alpha-beta-CROWN `optimized_bounds.py:937-947`.
-//! Reference: #3043 — duplication of this pattern caused #2990 and #3037.
+//! Keep this pattern here: duplicated copies of it caused bugs.
 
 use crate::network::tighten_crown_with_forward_bounds;
 use crate::types::{BoundsProvenance, CrownIbpFallbackReason};
@@ -121,7 +121,6 @@ pub(super) fn clone_forward_bounds_with_deadline(
     })
 }
 
-/// Reference: #3043 — duplication of this pattern caused #2990 and #3037.
 /// Reference: alpha-beta-CROWN optimized_bounds.py:937-947.
 pub(crate) fn tighten_crown_output(
     crown_output: BoundedTensor,
@@ -130,7 +129,7 @@ pub(crate) fn tighten_crown_output(
 ) -> Result<BoundedTensor> {
     // NaN indicates a computational error — per-element intersection would
     // propagate NaN, so fall back entirely to IBP.
-    // ±Inf is handled correctly by per-element intersection (#2681).
+    // ±Inf is handled correctly by per-element intersection.
     if has_nan_bounds(&crown_output) {
         debug!(
             "{}: falling back to IBP — output contains NaN bounds",
@@ -138,7 +137,7 @@ pub(crate) fn tighten_crown_output(
         );
         return Ok(forward_bounds.clone());
     }
-    // Forward-bounds NaN would contaminate the intersection result (#3043).
+    // Forward-bounds NaN would contaminate the intersection result.
     // Keep the CROWN output (known NaN-free from above) rather than introducing NaN.
     if has_nan_bounds(forward_bounds) {
         debug!(
@@ -147,7 +146,7 @@ pub(crate) fn tighten_crown_output(
         );
         return Ok(crown_output);
     }
-    // #3300: Shape-tolerant intersection. Reshape CROWN output to match forward
+    // Shape-tolerant intersection. Reshape CROWN output to match forward
     // bounds shape when element counts match but shapes differ.
     let crown_output = if crown_output.shape() != forward_bounds.shape()
         && crown_output.len() == forward_bounds.len()
@@ -334,7 +333,6 @@ pub(crate) fn tighten_crown_output_with_provenance_and_deadline(
 /// Used by graph CROWN backward propagation where provenance tracking is needed
 /// for diagnostic reporting. Replaces ~70 lines of inline logic in propagation.rs.
 ///
-/// Reference: #3043 — graph_crown had its own `bounds_invalid_flags` + inline logic.
 /// Reference: alpha-beta-CROWN optimized_bounds.py:937-947.
 #[cfg(test)]
 pub(crate) fn tighten_crown_output_with_provenance(
@@ -352,7 +350,7 @@ pub(crate) fn tighten_crown_output_with_provenance(
     // single output row overflowed to ±Inf — common on deep ResNets where the
     // certified A-matrix L1 explodes for a few outputs but stays tight for the
     // rest. Per-element intersection keeps those healthy rows CROWN-tight while
-    // tightening the overflowed rows to IBP. (#2681 mechanism, applied here.)
+    // tightening the overflowed rows to IBP.
     let crown_nan = has_nan_bounds(&crown_output);
     let fwd_nan = has_nan_bounds(forward_bounds);
 
@@ -370,7 +368,7 @@ pub(crate) fn tighten_crown_output_with_provenance(
     }
 
     // Stage 2: Intersection tightening.
-    // #3300: Shape-tolerant intersection. Reshape CROWN output to match forward
+    // Shape-tolerant intersection. Reshape CROWN output to match forward
     // bounds shape when element counts match but shapes differ.
     let crown_output = if crown_output.shape() != forward_bounds.shape()
         && crown_output.len() == forward_bounds.len()

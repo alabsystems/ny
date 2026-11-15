@@ -1,0 +1,14 @@
+{
+ "bad_receipt": 0,
+ "category_mismatch": 0,
+ "identities": 2014,
+ "loaded": 232,
+ "no_features": 0,
+ "no_params": 0,
+ "no_receipt": 10,
+ "observations": 2441,
+ "other_host": 26,
+ "paired_model": 0,
+ "receipts_used": 1665,
+ "unresolved_path": 0
+}

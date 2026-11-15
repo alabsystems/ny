@@ -2,6 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+mod expand_identity_admission;
 mod instance_norm_discrimination;
 mod merge_tensor_shape;
 mod opset8_dropout_admission;

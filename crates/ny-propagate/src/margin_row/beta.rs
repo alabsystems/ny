@@ -500,8 +500,11 @@ pub(crate) fn step_scales(
         })
         .collect();
     let want_head = !heads.is_empty();
-    let (u_out, yhat) =
-        super::alpha_opt::linearized_walk(net, root, &alpha, vsigns, col, &xstar, want_head)?;
+    let (u_out, yhat) = {
+        // #mr-census: the β direction's single-column linearized walk.
+        let _census = super::census::SiteTimer::start(super::census::Site::WalkBeta, 1);
+        super::alpha_opt::linearized_walk(net, root, &alpha, vsigns, col, &xstar, want_head)?
+    };
     let mut trunk_out = Vec::with_capacity(trunk.len());
     for &(li, pos, sign) in trunk {
         let zhat = u_out.get(&li).and_then(|v| v.get(pos)).copied();

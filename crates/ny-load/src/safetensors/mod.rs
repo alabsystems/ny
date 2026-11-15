@@ -51,7 +51,7 @@ pub fn load_safetensors<P: AsRef<Path>>(path: P) -> Result<WeightStore> {
         let shape: Vec<usize> = tensor_view.shape().to_vec();
         let arr = convert::tensor_view_to_f32_array(&tensor_view, &shape, &name)?;
         debug!("Loaded tensor: {} shape {:?}", name, arr.shape());
-        weights.insert(name.clone(), arr);
+        weights.insert(name, arr);
     }
 
     weights.validate_no_nan()?;
@@ -91,7 +91,7 @@ pub fn safetensors_info<P: AsRef<Path>>(path: P) -> Result<SafeTensorsInfo> {
             ))
         })?;
         param_count += elements;
-        tensor_info.push((name.clone(), shape, dtype));
+        tensor_info.push((name, shape, dtype));
     }
 
     Ok(SafeTensorsInfo {

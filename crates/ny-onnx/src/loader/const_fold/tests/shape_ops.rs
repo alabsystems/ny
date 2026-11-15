@@ -51,8 +51,7 @@ fn test_constant_of_shape_fill_value() {
 
     let out = weights.get("out").expect("missing ConstantOfShape output");
     // Shape [1, 2] is squeezed to [2] by the unbatched-mode leading-1 squeeze
-    // in fold_constant_nodes (added in W4-1151 for #3194). The fill value and
-    // element count are preserved.
+    // in fold_constant_nodes. The fill value and element count are preserved.
     assert_eq!(out.shape(), &[2]);
     assert!(out.iter().all(|v| (*v - 3.5).abs() < 1.0e-6));
 }

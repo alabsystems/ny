@@ -8,8 +8,6 @@
 //! treating each channel as a LayerNorm over the time axis. `Sampling`
 //! remains the explicit opt-in heuristic path via
 //! [`super::super::crown_batched_common`].
-//!
-//! Reference: designs/2026-03-14-instance-norm-decomposed-crown-backward.md
 
 use ny_core::{NyError, Result};
 use ny_tensor::BoundedTensor;

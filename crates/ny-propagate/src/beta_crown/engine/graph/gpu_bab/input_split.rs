@@ -24,9 +24,6 @@
 //! the benchmark configs under `complete_verifier/exp_configs/vnncomp*/`.
 //!
 //! Extracted from `verify_graph_gpu_domain_list` lines 229-383.
-//!
-//! Part of #1891, Phase 1.
-//! Reference: designs/2026-02-10-input-split-domain-list.md §1.4
 
 use ny_core::{GemmEngine, Result};
 use tracing::{info, warn};
@@ -464,7 +461,7 @@ mod tests {
     }
 
     /// A dropped domain must surface as `Unknown` with the propagation-failure
-    /// reason — NOT the "no unstable neurons" reason (#2102's wrong-flag bug),
+    /// reason — NOT the "no unstable neurons" reason (an earlier wrong-flag bug),
     /// and never as `Verified`.
     fn assert_unknown_due_to_propagation_failure(state: &BabLoopState) {
         assert!(
@@ -491,7 +488,7 @@ mod tests {
         }
     }
 
-    /// Regression test for #2102: `BoundedTensor::new` failure on bisected
+    /// Regression test: `BoundedTensor::new` failure on bisected
     /// child input bounds must set `unresolved_due_to_propagation_failure`,
     /// not `unresolved_due_to_no_unstable_neurons`.
     ///
@@ -530,7 +527,7 @@ mod tests {
         assert_unknown_due_to_propagation_failure(&state);
     }
 
-    /// Regression test for #2922: non-finite parent bounds must set
+    /// Regression test: non-finite parent bounds must set
     /// `unresolved_due_to_propagation_failure` and NOT reach
     /// check_domain_bounds.
     ///
@@ -621,7 +618,7 @@ mod tests {
         assert_unknown_due_to_propagation_failure(&state);
     }
 
-    /// Regression test for #2102: a failed child CROWN/IBP bound computation
+    /// Regression test: a failed child CROWN/IBP bound computation
     /// must set `unresolved_due_to_propagation_failure`.
     ///
     /// Drives `screen_child_domain` against a fixed node-bounds map that lacks

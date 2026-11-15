@@ -54,7 +54,7 @@ pub(crate) fn cosine_bounds_from_stage_result(
         .collect_node_bounds(&stage_result.mfa_bounds)
         .map_err(|e| format!("{label_prefix} normsq suffix IBP failed: {e}"))?;
 
-    // Step 2: CROWN-IBP tighten suffix intermediates (#3499).
+    // Step 2: CROWN-IBP tighten suffix intermediates.
     //
     // The suffix includes attentive statistics pooling (Softmax, Sqrt) and
     // linear layers (Conv1d, Dense). CROWN-IBP tightening on this small

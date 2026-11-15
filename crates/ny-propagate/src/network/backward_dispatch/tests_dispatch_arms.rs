@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for untested backward CROWN dispatch arms (#3448).
+//! Tests for untested backward CROWN dispatch arms.
 //!
 //! Covers: Transpose, Tile, Slice, Gather, ConvTranspose1d,
 //! ConvTranspose2d, MatMul success-path, BilinearCrown success-path.
@@ -67,7 +67,7 @@ fn make_ctx<'a>(
 }
 
 // ===================================================================
-// Transpose dispatch (#3448)
+// Transpose dispatch
 // ===================================================================
 
 /// Transpose dispatch: 2D transpose [3, 4] → [4, 3] returns Single.
@@ -136,7 +136,7 @@ fn dispatch_transpose_a_matrix_nontrivial_3448() {
 }
 
 // ===================================================================
-// Tile dispatch (#3448)
+// Tile dispatch
 // ===================================================================
 
 /// Tile dispatch: repeat [4] along axis 0 twice → [8] returns Single
@@ -192,7 +192,7 @@ fn dispatch_tile_returns_single_3448() {
 }
 
 // ===================================================================
-// Slice dispatch (#3448)
+// Slice dispatch
 // ===================================================================
 
 /// Slice dispatch: slice [6] at axis 0 from [1..4] → [3] returns Single.
@@ -263,7 +263,7 @@ fn dispatch_slice_a_matrix_structure_3448() {
 }
 
 // ===================================================================
-// Gather dispatch (#3448)
+// Gather dispatch
 // ===================================================================
 
 /// Gather dispatch: gather from [4] at indices [1, 3] → [2] returns Single.
@@ -322,7 +322,7 @@ fn dispatch_gather_a_matrix_structure_3448() {
 }
 
 // ===================================================================
-// ConvTranspose1d dispatch (#3448)
+// ConvTranspose1d dispatch
 // ===================================================================
 
 /// ConvTranspose1d dispatch: 1D transposed convolution returns Single.
@@ -380,7 +380,7 @@ fn dispatch_conv_transpose1d_1d_input_returns_error_3448() {
 }
 
 // ===================================================================
-// ConvTranspose2d dispatch (#3448)
+// ConvTranspose2d dispatch
 // ===================================================================
 
 /// ConvTranspose2d dispatch: valid 3D input returns Single with shaped bounds.
@@ -447,7 +447,7 @@ fn dispatch_conv_transpose2d_2d_input_returns_unsupported_op_3448() {
 }
 
 // ===================================================================
-// MatMul success-path dispatch (#3448)
+// MatMul success-path dispatch
 // ===================================================================
 
 /// MatMul dispatch: success path with valid 2-input bounds returns Binary.
@@ -473,7 +473,7 @@ fn dispatch_matmul_success_returns_binary_3448() {
             bias_lower,
             bias_upper,
         } => {
-            // #2617: A-matrix bounds must have zero bias
+            // A-matrix bounds must have zero bias
             assert!(
                 bounds_a.lower_b.iter().all(|&v| v == 0.0),
                 "MatMul bounds_a lower_b should be zero"
@@ -499,7 +499,7 @@ fn dispatch_matmul_success_returns_binary_3448() {
 }
 
 // ===================================================================
-// BilinearCrown success-path dispatch (#3448)
+// BilinearCrown success-path dispatch
 // ===================================================================
 
 /// BilinearCrown dispatch: success path with valid 2-input bounds returns Binary.
@@ -524,7 +524,7 @@ fn dispatch_bilinear_success_returns_binary_3448() {
             bias_lower,
             bias_upper,
         } => {
-            // #2617: A-matrix bounds must have zero bias
+            // A-matrix bounds must have zero bias
             assert!(
                 bounds_a.lower_b.iter().all(|&v| v == 0.0),
                 "BilinearCrown bounds_a lower_b should be zero"
@@ -557,11 +557,11 @@ fn dispatch_bilinear_success_returns_binary_3448() {
 }
 
 // ===================================================================
-// Conv2d dispatch (#3720): verify dispatch_conv_engine_aware path
+// Conv2d dispatch: verify dispatch_conv_engine_aware path
 // ===================================================================
 
 /// Conv2d dispatch: success path with valid 3D input returns Single.
-/// #3720: Conv2d now uses dispatch_conv_engine_aware (same as Conv1d,
+/// Conv2d now uses dispatch_conv_engine_aware (same as Conv1d,
 /// ConvTranspose1d, ConvTranspose2d) instead of inline map_err.
 #[test]
 fn dispatch_conv2d_returns_single_3720() {
@@ -588,7 +588,7 @@ fn dispatch_conv2d_returns_single_3720() {
 }
 
 /// Conv2d dispatch: 2D input (below 3D requirement) returns UnsupportedOp.
-/// #3720: After refactor to dispatch_conv_engine_aware, the dimension check
+/// After refactor to dispatch_conv_engine_aware, the dimension check
 /// returns UnsupportedOp (structured) instead of being inline.
 #[test]
 fn dispatch_conv2d_2d_input_returns_unsupported_op_3720() {

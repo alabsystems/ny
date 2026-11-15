@@ -337,6 +337,60 @@ const FALSIFY_PORTFOLIO_SECONDS_READERS: &[ReaderSite] = &[ReaderSite {
            (portfolio_wall_cap)",
 }];
 
+const FLAT_SURROGATE: Scope = Scope {
+    package: "ny-cli",
+    subsystem: "flat-objective-surrogate",
+};
+
+const FLAT_SURROGATE_MAX_BLOCKS_READERS: &[ReaderSite] = &[ReaderSite {
+    scope: FLAT_SURROGATE,
+    role: "the cap on the ACTIVE Hadamard block count in the flat-objective \
+           surrogate ladder; 0 (the default) keeps the historical split-all \
+           schedule byte-identically, a cap >= 2 switches the ladder to selective \
+           refinement of the top cap/2 blocks by recovered effect once a split \
+           would exceed the cap",
+    site: "crates/ny-cli/src/commands/vnncomp.rs \
+           (flat_surrogate_max_blocks_override in flat_surrogate_hadamard_search)",
+}];
+
+const FLAT_SURROGATE_TRANSFER_READERS: &[ReaderSite] = &[ReaderSite {
+    scope: FLAT_SURROGATE,
+    role: "arms the surrogate->real transfer stage: when the flat-objective \
+           surrogate ladder drives its pre-saturation margin past zero but the \
+           REAL property margin stays quantizer-pinned at the decision boundary, \
+           the stage seeds at the surrogate optimum and walks the real output's \
+           quantizer staircase directly; false (the default) ends the search \
+           exactly where the pre-lever tree ends it",
+    site: "crates/ny-cli/src/commands/vnncomp.rs \
+           (flat_surrogate_transfer_armed in flat_surrogate_hadamard_search)",
+}];
+
+const GRAPH_FREE_SAT: Scope = Scope {
+    package: "ny-cli",
+    subsystem: "graph-free-sat",
+};
+
+const GRAPH_FREE_CANDIDATE_SIDEFILE_READERS: &[ReaderSite] = &[
+    ReaderSite {
+        scope: GRAPH_FREE_SAT,
+        role: "decides, once per graph-free lane entry, whether the lane records every \
+               counterexample candidate it offers to its acceptance gates (accepted or \
+               rejected, with the gate that decided it) plus a bounded sample of \
+               surrogate incumbents to a per-row JSONL beside RESULTS_FILE; false (the \
+               default) constructs no recorder, so the lane runs byte-identically",
+        site: "crates/ny-cli/src/commands/vnncomp/graph_free_sidefile.rs \
+               (CandidateSidefile::from_gates via graph_free_candidate_sidefile_armed)",
+    },
+    ReaderSite {
+        scope: GRAPH_FREE_SAT,
+        role: "prints the fixed-schema `[graph-free-candidates] armed=1` line once per \
+               armed run, before any lane starts, so an armed run whose graph-free lane \
+               never engages is distinguishable from a dark run",
+        site: "crates/ny-cli/src/commands/vnncomp.rs \
+               (graph_free_candidate_sidefile_armed in run_and_translate)",
+    },
+];
+
 declare_levers! {
     registry DARK_PROBE_LEVERS;
 
@@ -644,7 +698,7 @@ to understand a row, not to measure one.",
         bucket: Bucket::Debug,
         moat: MoatRisk::High,
         doc: "\
-Changes WHICH SCALAR the incumbent `gradient_guided_falsify_with_traffic_objective` \
+Changes WHICH SCALAR the incumbent `gradient_guided_falsify_with_schedule` \
 lane hill-climbs. Exact \"1\" arms it and exact \"0\" disarms it; every other byte \
 string is a RECORDED REJECTION resolving to this declaration's `false` default. \
 Disarmed, the reader returns before the admission guard runs and before any \
@@ -915,6 +969,154 @@ on every arm.",
         },
         owner: FALSIFY_PORTFOLIO,
         readers: FALSIFY_PORTFOLIO_SECONDS_READERS,
+    };
+
+    /// `NY_FLAT_SURROGATE_MAX_BLOCKS` — active-block cap for the
+    /// flat-objective surrogate Hadamard ladder (#flat-ladder-depth).
+    pub FLAT_SURROGATE_MAX_BLOCKS = LeverDecl {
+        name: "NY_FLAT_SURROGATE_MAX_BLOCKS",
+        kind: LeverKind::U64Trimmed,
+        default: DefaultSpec::U64(0),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::Low,
+        doc: "\
+Caps the ACTIVE Hadamard block count in the flat-objective surrogate ladder \
+(#flat-objective-surrogate, `flat_surrogate_hadamard_search`). Zero — the \
+default, set by no shipped yaml — keeps the historical schedule byte-identically: \
+`split_all` doubles the block count every level, so each level's probe bill \
+doubles and the ladder stops at the first level the remaining budget cannot \
+finish IN FULL (a partial Hadamard level has no orthogonality and recovers \
+nothing). Measured on smart_turn_multimodal_2026 (2026-08-31 resweep): all 17 \
+engaged-negative unknowns finish level 12 (4096 blocks, ~8216 probes, ~80 s at \
+~0.0098 s/probe) and stop before level 13, whose ~8194 probes cost as much as \
+the entire preceding search — so under the official 100 s budget the doubling \
+schedule can NEVER go deeper, while the per-level surrogate-margin gains were \
+still large (row 6: -2.59 -> -1.44 over the last completed level, threshold 0).
+
+A cap >= 2 switches the ladder to SELECTIVE refinement once a split would \
+exceed the cap: only the top cap/2 blocks by recovered per-block effect stay \
+active (block 0 always stays — its effect rides the Hadamard's constant column \
+and cannot be ranked), the rest freeze at their incumbent faces, and per-level \
+cost stays ~cap probes while refinement continues to single coordinates inside \
+the region the measurements say matters. The lever's own observables are the \
+`#flat-ladder-depth:` stderr lines (armed cap, each freeze event, and the level \
+reached plus the reason the ladder stopped).
+
+MoatRisk::Low: the surrogate ladder STEERS a falsification search and never \
+decides. Every incumbent improvement is re-scored on the ORIGINAL model and a \
+candidate becomes `sat` only through the unchanged acceptance stack \
+(zero-tolerance box membership, dual-optimization-level gate, neighbourhood \
+corroboration, `gate_sat_with_trusted_oracle`); no setting can produce `unsat`. \
+A wrong cap costs probes, never a verdict.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "default 0 leaves the ladder's schedule, probe sequence and stderr \
+                     byte-identical to the pre-lever tree (the selective branch is \
+                     never entered and the frozen set stays empty); armed values only \
+                     redirect zeroth-order probes inside a search whose acceptance \
+                     path is unchanged and verdict-incapable on the unsat side",
+        },
+        owner: FLAT_SURROGATE,
+        readers: FLAT_SURROGATE_MAX_BLOCKS_READERS,
+    };
+
+
+    /// `NY_FLAT_SURROGATE_TRANSFER` — surrogate->real transfer stage for
+    /// quantizer-pinned rows (#flat-surrogate-transfer).
+    pub FLAT_SURROGATE_TRANSFER = LeverDecl {
+        name: "NY_FLAT_SURROGATE_TRANSFER",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(false),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::Low,
+        doc: "\
+Arms the surrogate->real TRANSFER stage of the flat-objective surrogate search \
+(#flat-objective-surrogate, `flat_surrogate_hadamard_search`). Measured on \
+smart_turn_multimodal_2026 row 11 (2026-08-31 #flat-ladder-depth probe): the \
+capped ladder drove the pre-saturation SURROGATE margin positive (+1.4373 after \
+refinement) while the REAL property margin stayed at exactly +0.0 — the terminal \
+activation is quantizer/saturation-pinned AT the decision boundary, and the \
+spec's strict `(> Y 0.5)` correctly refuses a margin of exactly zero. Deeper \
+surrogate ladders cannot convert such a row; what is missing is a stage that \
+transfers the surrogate's zero-crossing to the real output.
+
+Armed, once the surrogate margin crosses zero the ladder hands over early, the \
+refinement keeps half of the remaining search budget (a deeper surrogate \
+optimum is a deeper seed), and the transfer stage spends the other half walking \
+the REAL output's quantizer staircase from the surrogate optimum: whole-face \
+and halving block moves inside the surrogate-flat subspace (the frozen inputs \
+the surrogate cannot see are exactly the coordinates still free to tip a \
+boundary-pinned rounding), interleaved with whole-box block moves, scored on \
+the ORIGINAL model's margin, down to single-coordinate refinement. It is \
+strict-inequality aware: a boundary point (margin exactly 0.0) is OFFERED to \
+the unchanged acceptance stack, whose zero-tolerance `property_violated_f64` \
+admits it iff every binding constraint is non-strict. Its own observables are \
+the `#flat-surrogate-transfer:` stderr lines (seed surrogate/real margins, real \
+margin after, observed quantizer bucket step and distance, and why it stopped). \
+False — the default, set by no shipped yaml — keeps the search, probe sequence \
+and stderr byte-identical to the pre-lever tree.
+
+MoatRisk::Low: the stage STEERS a falsification search and never decides. \
+Every candidate becomes `sat` only through the unchanged acceptance stack \
+(zero-tolerance box membership, dual-optimization-level gate, neighbourhood \
+corroboration, `gate_sat_with_trusted_oracle`); no setting can produce \
+`unsat`. A wrong transfer costs probes, never a verdict.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "default false leaves the ladder, refinement and stderr byte-identical \
+                     to the pre-lever tree (the transfer stage is never entered and the \
+                     armed-only budget split never happens); armed values only redirect \
+                     zeroth-order probes inside a search whose acceptance path is \
+                     unchanged and verdict-incapable on the unsat side",
+        },
+        owner: FLAT_SURROGATE,
+        readers: FLAT_SURROGATE_TRANSFER_READERS,
+    };
+
+    /// `NY_GRAPH_FREE_CANDIDATE_SIDEFILE` — diagnostic-only per-row JSONL of
+    /// every graph-free counterexample candidate and its gate outcome
+    /// (#graph-free-candidates, #smart-turn-x86-harvest).
+    pub GRAPH_FREE_CANDIDATE_SIDEFILE = LeverDecl {
+        name: "NY_GRAPH_FREE_CANDIDATE_SIDEFILE",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(false),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::Low,
+        doc: "\
+Arms a DIAGNOSTIC-ONLY side file for the graph-free falsification lane \
+(#graph-free-sat, `try_graph_free_ort_falsify`, the lane smart_turn_multimodal_2026 \
+runs because ny cannot load its QDQ graph). Armed, every point the lane offers to its \
+acceptance stack is written to `<RESULTS_FILE>.graph_free_candidates.jsonl` together \
+with the exact f32 input tensor that was run (little-endian, base64, sha256), ny's own \
+default-level ONNX Runtime outputs on this host, the Disable-level outputs where the \
+dual-level gate computed them, and the outcome: accepted by the lane, or rejected by \
+the zero-tolerance re-check, the dual-optimization-level gate, the violating-extent \
+measurement, neighbourhood corroboration, a forward failure or the deadline. The \
+flat-objective surrogate additionally contributes a BOUNDED sample of the incumbents \
+it re-scores on the original model (power-of-two improvement indices, at most 16, \
+plus the final incumbent). An accepted candidate also gets the caller's \
+trusted-oracle outcome appended. The file exists so candidates can be replayed \
+OFFLINE on a checker-parity-certified x86-64 configuration \
+(scratchpad/x86replay/harvest): MEASURED 2026-09-26, arm64 ONNX Runtime is not the \
+organisers' checker on this quantized model (qemu Haswell-v4 reproduces the \
+organiser's Y 100/100; native aarch64 11/100). Its observables are the \
+`[graph-free-candidates] armed=1` line and the per-lane \
+`#graph-free-candidates: v1 armed=1 ...` receipt, printed on every exit of an armed \
+lane. False — the default, set by no shipped yaml — constructs no recorder and \
+leaves the lane, its probe sequence and its stderr byte-identical.
+
+MoatRisk::Low: the recorder only READS values the gates already computed; no gate, \
+threshold, radius or probe changes, nothing in the file is published, and no setting \
+can produce `sat` or `unsat`. It costs wall clock inside the lane (encoding and \
+writing ~6.7 MB per smart_turn record, capped at 256 candidate records and 2 GiB per \
+row), which can only shorten a falsification search, never admit a candidate.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "default false constructs no recorder: every hook is an `if let \
+                     Some(..)` on an absent value, so the lane's candidates, gates, RNG \
+                     draws, probe sequence and stderr are byte-identical to the \
+                     pre-lever tree; armed, the recorder is report-only and \
+                     verdict-incapable",
+        },
+        owner: GRAPH_FREE_SAT,
+        readers: GRAPH_FREE_CANDIDATE_SIDEFILE_READERS,
     };
 
 

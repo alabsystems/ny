@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Per-region scoring logic for weak-region mining (#3520).
+//! Per-region scoring logic for weak-region mining.
 //!
 //! Extracted from `runner.rs` to keep the runner focused on orchestration
 //! (loop, sort, winner collection, manifest) and the scoring functions

@@ -245,7 +245,7 @@ fn test_layernorm_crown_soundness() {
 #[test]
 fn test_layernorm_crown_tighter_than_ibp() {
     // Verify both IBP and CROWN bounds are sound (contain true LayerNorm output).
-    // Note: sampling CROWN is not guaranteed tighter than IBP for LayerNorm (#3169).
+    // Note: sampling CROWN is not guaranteed tighter than IBP for LayerNorm.
     use crate::layers::LayerNormCrownMode;
 
     let ny = arr1(&[1.0_f32, 1.0, 1.0, 1.0]);

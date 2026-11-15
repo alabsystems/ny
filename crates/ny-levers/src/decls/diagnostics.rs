@@ -2,11 +2,12 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Legacy convolution-Patches diagnostics.
+//! Legacy convolution-Patches diagnostics and explicit conformance inputs.
 //!
 //! The other late propagation controls live in [`super::dark_probes`]. This
-//! module retains only the distinct presence-style Patches diagnostic, avoiding
-//! duplicate declarations while keeping its historical parser enumerable.
+//! module retains distinct diagnostic policies and required original-fixture
+//! request paths, avoiding duplicate declarations while keeping their parsers
+//! and absence policies enumerable.
 
 use crate::{
     declare_levers, Bucket, DefaultSpec, LeverDecl, LeverKind, MoatRisk, Provenance, ReaderSite,
@@ -59,6 +60,48 @@ const FORCE_SELFCHECK_FAIL_READERS: &[ReaderSite] = &[ReaderSite {
 
 declare_levers! {
     registry DIAGNOSTIC_LEVERS;
+
+    /// `NY_HULL_RESOURCE_ORIGINAL_REQUEST` — explicit original-fixture input.
+    pub HULL_RESOURCE_ORIGINAL_REQUEST = LeverDecl {
+        name: "NY_HULL_RESOURCE_ORIGINAL_REQUEST",
+        kind: LeverKind::Text,
+        default: DefaultSpec::Unset,
+        bucket: Bucket::Debug,
+        moat: MoatRisk::None,
+        doc: "Selects the closed original-model request for the external hull-resource \
+              conformance probe. RawLeverInputs retains exact OS path bytes, empty \
+              is an explicit path, absence remains a hard error, and the existing \
+              path-length/byte/hash/resource checks remain mandatory. Test-only; \
+              no request receipt becomes a production proof authority.",
+        provenance: Provenance::Unmeasured { why_ok: "external conformance input only; default absent and no scored route consumes it" },
+        owner: Scope { package: "ny-cli", subsystem: "original-hull-resource-conformance" },
+        readers: &[ReaderSite {
+            scope: Scope { package: "ny-cli", subsystem: "original-hull-resource-conformance" },
+            role: "freeze the explicit original request path without dropping non-Unicode bytes",
+            site: "crates/ny-cli/src/commands/beta_crown/single_hidden_hull_resource_original_probe.rs",
+        }],
+    };
+
+    /// `NY_GROUPED_ORIGINAL_PROBE_REQUEST` — explicit grouped prototype input.
+    pub GROUPED_ORIGINAL_PROBE_REQUEST = LeverDecl {
+        name: "NY_GROUPED_ORIGINAL_PROBE_REQUEST",
+        kind: LeverKind::Text,
+        default: DefaultSpec::Unset,
+        bucket: Bucket::Debug,
+        moat: MoatRisk::None,
+        doc: "Selects the required original-model request for the private grouped \
+              conformance probe. RawLeverInputs retains exact OS path bytes, empty \
+              stays explicit, absence remains a hard error, and all existing \
+              request caps and pinned-input checks remain unchanged. This test-only \
+              path supplies no deployed-kernel or production verdict qualification.",
+        provenance: Provenance::Unmeasured { why_ok: "external conformance input only; default absent and no scored route consumes it" },
+        owner: Scope { package: "ny-propagate", subsystem: "grouped-original-conformance" },
+        readers: &[ReaderSite {
+            scope: Scope { package: "ny-propagate", subsystem: "grouped-original-conformance" },
+            role: "freeze the explicit original request path while preserving OS bytes",
+            site: "crates/ny-propagate/src/decoder/normalized_head/groups/original_probe.rs",
+        }],
+    };
 
     /// `NY_PATCHES_FINITE_EXPIRY` — decide finite Patches authority by expiry, not
     /// presence. Ships ARMED; `=0` is the kill switch back to the presence test.

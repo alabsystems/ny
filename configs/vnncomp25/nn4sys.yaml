@@ -36,11 +36,20 @@ bab:
   branching:
     method: input
     candidates: 10
-    reduceop: max
     input_split:
       enable: true
       sb_coeff_thresh: 0.1
       reorder_bab: true
+      # #lowdim-fold (2026-09-23). Every per-clause cardinality_*_2048 box has 1-4 FREE
+      # coordinates; the fold compiles each clause over them (constants folded as
+      # intervals, cross-checked against the graph forward at the box centre) and
+      # the #lowdim-prover lane proves it. MEASURED on the GB10 with this key armed
+      # through the yaml (no NY_*): cardinality_1_1_2048_dual timeout -> unsat 2.5 s,
+      # 0_1_2048 held (12.5 s -> 1.25 s). Many-clause rows are throughput-bound
+      # (prepare + candidate test, see feat/lowdim-fold-batch). Moat: every
+      # per-clause-box nn4sys row of both years (foldfollow2).
+      lowdim_fold: true
+      lowdim_prover_share: 0.9
       # Saturation-Escape Branching (#nn4sys-seb-dark, B8): arm the dual-pool
       # input brancher AND the precheck budget cap that lets the per-clause
       # input-split BaB loop run at all (without it the box-refinement screen
@@ -75,8 +84,3 @@ bab:
       sat_escape_branch: false
   alpha_crown:
     lr_alpha: 0.2
-    iterations: 100
-  beta_crown:
-    lr_alpha: 0.1
-    lr_beta: 0.15
-    iterations: 15

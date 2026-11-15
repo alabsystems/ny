@@ -245,7 +245,7 @@ fn test_ibp_forward_mode_contains_concrete_evals() -> Result<()> {
     Ok(())
 }
 
-/// Regression test for #2074: forward-mode IBP with large ny must contain
+/// Regression test: forward-mode IBP with large ny must contain
 /// concrete evaluations at corners. Before the fix, heuristic caps
 /// (MAX_EFFECTIVE_NY=3.0, MIN_EFFECTIVE_STD=0.3) would underestimate
 /// sensitivity for ny=10, producing bounds that miss actual outputs.
@@ -623,7 +623,7 @@ fn test_ibp_2d_batch_contains_eval() -> Result<()> {
     Ok(())
 }
 
-/// Regression test for #2806: LayerNorm IBP with zero-valued dimension must
+/// Regression test: LayerNorm IBP with zero-valued dimension must
 /// return an error, not panic from integer division-by-zero. Tests both
 /// standard and forward-mode code paths.
 #[ntest::timeout(10000)]
@@ -653,7 +653,7 @@ fn test_ibp_zero_dimension_returns_error_2806() {
     );
 }
 
-// ---- Invalid epsilon regression tests (#2729) ----
+// ---- Invalid epsilon regression tests ----
 
 #[ntest::timeout(10000)]
 #[test]
@@ -685,7 +685,7 @@ fn test_new_rejects_inf_eps() {
     );
 }
 
-/// Regression test for #2901: LayerNorm CROWN Jacobian overflows to Inf when
+/// Regression test: LayerNorm CROWN Jacobian overflows to Inf when
 /// ny is large and inputs are nearly constant (std ≈ sqrt(eps) is tiny).
 /// CROWN backward must return NumericalInstability, not silently produce Inf bounds.
 #[ntest::timeout(10000)]
@@ -720,10 +720,10 @@ fn test_crown_sampling_jacobian_overflow_returns_error_2901() {
     );
 }
 
-// ---- Inf coefficient NaN regression tests (#3027) ----
+// ---- Inf coefficient NaN regression tests ----
 
 /// Helper: build batched mean-only LayerNorm CROWN result from Inf-coefficient input.
-/// Before #3027 fix, this produced NumericalInstability from Inf-Inf=NaN.
+/// Regression: this used to produce NumericalInstability from Inf-Inf=NaN.
 fn batched_mean_only_inf_result_3027() -> BatchedLinearBounds {
     let layer = LayerNormLayer::new(arr1(&[1.0, 1.0, 1.0]), arr1(&[0.0, 0.0, 0.0]), 1e-5)
         .unwrap()
@@ -753,7 +753,7 @@ fn batched_mean_only_inf_result_3027() -> BatchedLinearBounds {
         .expect("should not fail after #3027 fix")
 }
 
-/// Regression test for #3027 (batched path): no NaN in output after Inf input.
+/// Regression test (batched path): no NaN in output after Inf input.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_batched_mean_only_inf_no_nan_3027() {
@@ -764,7 +764,7 @@ fn test_crown_batched_mean_only_inf_no_nan_3027() {
     assert!(!result.upper_b.iter().any(|v| v.is_nan()), "upper_b NaN");
 }
 
-/// Regression test for #3027 (batched path): Inf row gets conservative bounds.
+/// Regression test (batched path): Inf row gets conservative bounds.
 ///
 /// Per-row NaN guard (P1#759 fix): when any element in a row produces NaN from
 /// Inf-Inf cancellation, the ENTIRE row is zeroed and bias becomes ±Inf.
@@ -800,7 +800,7 @@ fn test_crown_batched_mean_only_inf_row_conservative_3027() {
     );
 }
 
-/// Regression test for #3027 (batched path): finite row preserved correctly.
+/// Regression test (batched path): finite row preserved correctly.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_batched_mean_only_finite_row_preserved_3027() {
@@ -844,7 +844,7 @@ fn scalar_mean_only_inf_result_3027() -> LinearBounds {
     // Direct struct construction: both new() and from_parts_unchecked reject
     // Inf coefficients (new() validates, from_parts_unchecked has debug_assert).
     // This test intentionally needs Inf A-coefficients to simulate compose()'s
-    // NaN→Inf fallback (#3027), so we construct the struct directly.
+    // NaN→Inf fallback, so we construct the struct directly.
     let bounds = LinearBounds {
         lower_a: ndarray::Array2::from_shape_vec(
             (2, 3),
@@ -871,7 +871,7 @@ fn scalar_mean_only_inf_result_3027() -> LinearBounds {
         .expect("should not fail after #3027 fix")
 }
 
-/// Regression test for #3027 (scalar path): Inf row gets conservative bounds.
+/// Regression test (scalar path): Inf row gets conservative bounds.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_scalar_mean_only_inf_row_conservative_3027() {
@@ -894,7 +894,7 @@ fn test_crown_scalar_mean_only_inf_row_conservative_3027() {
     assert_eq!(result.upper_b[0], f32::INFINITY, "upper_b[0]");
 }
 
-/// Regression test for #3027 (scalar path): finite row preserved correctly.
+/// Regression test (scalar path): finite row preserved correctly.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_scalar_mean_only_finite_row_preserved_3027() {
@@ -908,9 +908,9 @@ fn test_crown_scalar_mean_only_finite_row_preserved_3027() {
     assert!(result.upper_b[1].is_finite(), "upper_b[1]");
 }
 
-// ── Forward-mode IBP soundness: Jacobian-based (#3098) ──────────────────────
+// ── Forward-mode IBP soundness: Jacobian-based ──────────────────────
 
-/// Regression test for #3098: forward-mode IBP must contain all concrete
+/// Regression test: forward-mode IBP must contain all concrete
 /// evaluations within the input interval. The old `max_radius / n` coupling
 /// correction underestimated the effect of input perturbation on the
 /// normalization denominator.
@@ -1091,7 +1091,7 @@ fn test_ibp_forward_mode_narrow_box_contains_mixed_corner_exactly() -> Result<()
     Ok(())
 }
 
-// ── Forward-mode MeanOnly interval mean regression (#3142) ──────────────────
+// ── Forward-mode MeanOnly interval mean regression ──────────────────
 // The forward-mode MeanOnly path previously used center-point mean instead of
 // interval mean bounds, producing unsound bounds. The path is currently
 // unreachable through propagate_ibp (MeanOnly returns before forward_mode check),
@@ -1099,7 +1099,7 @@ fn test_ibp_forward_mode_narrow_box_contains_mixed_corner_exactly() -> Result<()
 // if the call graph is refactored.
 
 /// Forward-mode MeanOnly IBP must contain all concrete evaluations. Regression
-/// for #3142: center-point mean made lower bounds too tight (unsound).
+/// test: a center-point mean made lower bounds too tight (unsound).
 #[ntest::timeout(10000)]
 #[test]
 fn test_ibp_forward_mode_mean_only_contains_evals_3142() -> Result<()> {
@@ -1213,7 +1213,7 @@ fn test_crown_scalar_nan_pre_activation_lower_returns_constant_bounds() {
         .with_crown_mode(LayerNormCrownMode::Sampling);
 
     let bounds = LinearBounds::identity(3);
-    // NaN in lower bound → non-finite guard fires → constant bounds (#3259).
+    // NaN in lower bound → non-finite guard fires → constant bounds.
     // Use new_unchecked since BoundedTensor::new rejects NaN/Inf inputs.
     let pre_act = BoundedTensor::new_unchecked(
         ArrayD::from_shape_vec(IxDyn(&[3]), vec![f32::NAN, 1.0, 2.0]).expect("valid shape"),
@@ -1225,7 +1225,7 @@ fn test_crown_scalar_nan_pre_activation_lower_returns_constant_bounds() {
         .propagate_linear_with_bounds(&bounds, &pre_act)
         .expect("NaN pre-activation should return constant bounds, not error");
 
-    // Constant bounds: A = 0, bias = [-inf, +inf] (trivially sound, #3259).
+    // Constant bounds: A = 0, bias = [-inf, +inf] (trivially sound).
     assert!(
         result.lower_a().iter().all(|&v| v == 0.0),
         "lower_a should be all zeros"
@@ -1244,7 +1244,7 @@ fn test_crown_scalar_nan_pre_activation_lower_returns_constant_bounds() {
     );
 }
 
-/// NaN in pre-activation upper bound triggers constant bounds fallback (#3259).
+/// NaN in pre-activation upper bound triggers constant bounds fallback.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_scalar_nan_pre_activation_upper_returns_constant_bounds() {
@@ -1282,7 +1282,7 @@ fn test_crown_scalar_nan_pre_activation_upper_returns_constant_bounds() {
     );
 }
 
-/// Inf in pre-activation bounds triggers constant bounds fallback (#3259).
+/// Inf in pre-activation bounds triggers constant bounds fallback.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_scalar_inf_pre_activation_returns_constant_bounds() {
@@ -1321,7 +1321,7 @@ fn test_crown_scalar_inf_pre_activation_returns_constant_bounds() {
     );
 }
 
-// ── CROWN scalar Sampling path per-row NaN guard (#3128) ────────────────────
+// ── CROWN scalar Sampling path per-row NaN guard ────────────────────
 // The Standard Sampling path (crown_scalar.rs:213-249) accumulates Jacobian
 // coefficients via la_f64 * jacobian[[i, k]]. When compose() sends Inf
 // coefficients, Inf * 0.0 = NaN can poison the A-matrix. The per-row guard
@@ -1360,7 +1360,7 @@ fn scalar_sampling_inf_result_3128() -> LinearBounds {
         .expect("should not fail after #3128 fix")
 }
 
-/// Regression test for #3128: Inf row gets conservative bounds in Sampling path.
+/// Regression test: Inf row gets conservative bounds in Sampling path.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_scalar_sampling_inf_row_conservative_3128() {
@@ -1399,7 +1399,7 @@ fn test_crown_scalar_sampling_inf_row_conservative_3128() {
     );
 }
 
-/// Regression test for #3128: finite row preserved in Sampling path.
+/// Regression test: finite row preserved in Sampling path.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_scalar_sampling_finite_row_preserved_3128() {
@@ -1413,7 +1413,7 @@ fn test_crown_scalar_sampling_finite_row_preserved_3128() {
     assert!(result.upper_b[1].is_finite(), "upper_b[1]");
 }
 
-/// Regression test for #3128: no coefficient inversions in Sampling path.
+/// Regression test: no coefficient inversions in Sampling path.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_scalar_sampling_inf_no_coefficient_inversion_3128() {
@@ -1430,7 +1430,7 @@ fn test_crown_scalar_sampling_inf_no_coefficient_inversion_3128() {
     }
 }
 
-// ── LayerNorm IBP NaN integration tests (#2627) ─────────────────────────────
+// ── LayerNorm IBP NaN integration tests ─────────────────────────────
 // LayerNorm IBP rejects NaN input bounds with NumericalInstability error per
 // Category B domain validation policy (ibp/common.rs). The input guard fires
 // before the nan_propagating_min/max fold sites, preventing NaN from reaching
@@ -1517,7 +1517,7 @@ fn test_ibp_2d_nan_in_batch_returns_error_2627() {
     );
 }
 
-/// Both NaN and Inf in pre-activation bounds triggers constant bounds fallback (#3259).
+/// Both NaN and Inf in pre-activation bounds triggers constant bounds fallback.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_scalar_mixed_nan_inf_pre_activation_returns_constant_bounds() {
@@ -1557,7 +1557,7 @@ fn test_crown_scalar_mixed_nan_inf_pre_activation_returns_constant_bounds() {
     );
 }
 
-// ── Low-rank sampling parity tests (#1957) ──────────────────────────────────
+// ── Low-rank sampling parity tests ──────────────────────────────────
 //
 // The low-rank path in `sampling_low_rank.rs` must produce results equivalent
 // to the dense generic path in `crown_common::sampling_crown_scalar()`. Since

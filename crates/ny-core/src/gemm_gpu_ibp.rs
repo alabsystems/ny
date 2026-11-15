@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::{NyError, Result};
 
@@ -24,8 +25,6 @@ pub struct GpuIbpResult {
 /// Describes one layer in the forward propagation sequence. The first
 /// resident packet supports dense and conv chains: `Linear`, `Conv2d`,
 /// `ReLU`, and metadata-only `View` (covers `Flatten` / `Reshape`).
-///
-/// Reference: designs/2026-03-20-issue-4258-gpu-resident-pgd-dag-ibp-forward.md
 #[derive(Clone)]
 #[allow(clippy::large_enum_variant)] // Conv2d variant is larger but Boxing adds indirection on GPU dispatch hot path
 pub enum GpuIbpLayer {
@@ -72,9 +71,6 @@ pub enum GpuIbpLayer {
 /// this trait uploads input bounds once, encodes all layer passes into one
 /// command buffer, and reads back only the final output bounds. This eliminates
 /// N-1 host roundtrips for an N-layer resident chain.
-///
-/// Reference: designs/2026-03-18-issue-4081-gpu-ibp-forward-gap2-addendum.md
-/// Part of #4081.
 pub trait GpuIbpForward: Sync + Send {
     /// Run complete IBP forward pass on GPU.
     ///
@@ -140,6 +136,30 @@ pub trait GpuIbpModelPlan: Sync + Send {
         input_upper: &[f32],
         input_shape: &[usize],
     ) -> Result<GpuIbpResult>;
+
+    /// A cached plan may opt into execution with the caller's original absolute
+    /// deadline. Legacy implementations are never called through this entry.
+    fn ibp_forward_cached_with_deadline(
+        &self,
+        _input_lower: &[f32],
+        _input_upper: &[f32],
+        _input_shape: &[usize],
+        deadline: Instant,
+    ) -> Result<GpuIbpResult> {
+        if Instant::now() >= deadline {
+            return Err(NyError::DeadlineExceeded(
+                "cached GPU IBP: original deadline expired".into(),
+            ));
+        }
+        Err(NyError::UnsupportedOp(
+            "cached GPU IBP plan does not support deadline execution".into(),
+        ))
+    }
+
+    /// Supporting cached execution alone does not grant deadline capability.
+    fn supports_deadline_execution(&self) -> bool {
+        false
+    }
 }
 
 /// Optional cached-plan preparation for GPU-resident IBP forward backends.
@@ -155,4 +175,96 @@ pub trait GpuIbpForwardExt: GpuIbpForward {
         layers: &[GpuIbpLayer],
         input_shape: &[usize],
     ) -> Result<Option<Box<dyn GpuIbpModelPlan>>>;
+
+    /// Prepare using the original caller deadline; do not restart a duration or
+    /// invoke legacy preparation without a deadline. None admits CPU fallback.
+    fn prepare_model_plan_with_deadline(
+        &self,
+        _layers: &[GpuIbpLayer],
+        _input_shape: &[usize],
+        deadline: Instant,
+    ) -> Result<Option<Box<dyn GpuIbpModelPlan>>> {
+        if Instant::now() >= deadline {
+            return Err(NyError::DeadlineExceeded(
+                "GPU IBP plan preparation: original deadline expired".into(),
+            ));
+        }
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod deadline_plan_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    struct Legacy(AtomicUsize);
+    impl GpuIbpForward for Legacy {
+        fn ibp_forward_gpu(
+            &self,
+            _: &[GpuIbpLayer],
+            _: &[f32],
+            _: &[f32],
+            _: &[usize],
+        ) -> Result<GpuIbpResult> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            panic!("legacy resident call must not run during deadline preparation");
+        }
+    }
+    impl GpuIbpForwardExt for Legacy {
+        fn prepare_model_plan(
+            &self,
+            _: &[GpuIbpLayer],
+            _: &[usize],
+        ) -> Result<Option<Box<dyn GpuIbpModelPlan>>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(None)
+        }
+    }
+    impl GpuIbpModelPlan for Legacy {
+        fn ibp_forward_cached(&self, _: &[f32], _: &[f32], _: &[usize]) -> Result<GpuIbpResult> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(GpuIbpResult {
+                lower_bounds: vec![1.0],
+                upper_bounds: vec![1.0],
+                output_shape: vec![1],
+            })
+        }
+    }
+
+    #[test]
+    fn finite_deadline_defaults_never_call_legacy_plan_routes() {
+        let backend = Legacy(AtomicUsize::new(0));
+        let live = Instant::now() + Duration::from_secs(10);
+        assert!(backend
+            .prepare_model_plan_with_deadline(&[], &[1], live)
+            .unwrap()
+            .is_none());
+        assert!(!backend.supports_deadline_execution());
+        assert!(matches!(
+            backend.ibp_forward_cached_with_deadline(&[1.0], &[1.0], &[1], live),
+            Err(NyError::UnsupportedOp(_))
+        ));
+        assert_eq!(backend.0.load(Ordering::Relaxed), 0);
+        backend.prepare_model_plan(&[], &[1]).unwrap();
+        let value = backend.ibp_forward_cached(&[1.0], &[1.0], &[1]).unwrap();
+        assert_eq!(value.lower_bounds, [1.0]);
+        assert_eq!(backend.0.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn expired_deadline_defaults_refuse_before_legacy_work() {
+        let backend = Legacy(AtomicUsize::new(0));
+        let expired = Instant::now();
+        assert!(matches!(
+            backend.prepare_model_plan_with_deadline(&[], &[1], expired),
+            Err(NyError::DeadlineExceeded(_))
+        ));
+        assert!(matches!(
+            backend.ibp_forward_cached_with_deadline(&[1.0], &[1.0], &[1], expired),
+            Err(NyError::DeadlineExceeded(_))
+        ));
+        assert_eq!(backend.0.load(Ordering::Relaxed), 0);
+    }
 }

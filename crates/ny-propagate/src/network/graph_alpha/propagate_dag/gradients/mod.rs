@@ -8,6 +8,8 @@
 //! methods for the optimization loop. Each method computes per-ReLU gradients;
 //! SPSA additionally accumulates bilinear and mul_binary gradients.
 
+#[cfg(test)]
+mod envelope_cpu_tests;
 mod finite_differences;
 mod spsa;
 
@@ -18,8 +20,246 @@ use ndarray::{Array1, Array2, Array4};
 use ny_core::{GpuCrownSeed, GpuResnetSegment, Result};
 use ny_tensor::BoundedTensor;
 use std::collections::{BTreeMap, HashMap};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, info};
+
+/// Share of the remaining request budget one AnalyticChain gradient replay may
+/// consume. The ascent runs many iterations, so a single gradient pass must
+/// never be able to eat the budget the tree needs.
+const CHAIN_GRADIENT_BUDGET_FRACTION: f64 = 0.25;
+
+/// Hard ceiling on one chain-gradient replay, independent of how much budget
+/// remains. Bounds the worst case on long-budget categories (cgan at 900-1800 s)
+/// where a quarter of the remainder would still be minutes.
+const CHAIN_GRADIENT_BUDGET_CAP: Duration = Duration::from_secs(20);
+
+/// Below this, do not start a replay at all: a pass that cannot finish produces
+/// a partial A-matrix map, which is useless as a gradient and is discarded, so
+/// starting one would spend budget for nothing.
+const CHAIN_GRADIENT_BUDGET_FLOOR: Duration = Duration::from_millis(250);
+
+/// #coop-chain-alpha-grad LANDING GATE: has a chain replay already been abandoned
+/// for lack of budget in this process?
+///
+/// # Why a latch is CORRECT here, not merely cheaper
+///
+/// The slice is `min(0.25 * remaining, 20s)` and `remaining` only ever SHRINKS.
+/// So if a replay did not fit once, it cannot fit later — every later attempt
+/// spends its slice and then falls back to local gradients having produced
+/// nothing. Without this latch that waste is paid once per alpha iteration, and
+/// `config.iterations` reaches 100 on some categories.
+///
+/// # The failure this exists to prevent, which THIS BOX CANNOT SEE
+///
+/// ResNets normally dodge the AnalyticChain branch via
+/// `try_gpu_resnet_warmup_gradients`, but that bypass requires
+/// `gpu_crown_backend_honors_deadline`. wgpu returns `true`, so on this GB10 the
+/// bypass holds and cifar100/tinyimagenet never reach here. **CUDA does not
+/// override that method and takes the trait default `false`**, so on a CUDA host
+/// — the competition target — the bypass is GONE, those families fall into this
+/// branch, and the CPU pass (~27s/iter on cifar100 resnet_medium) ALWAYS aborts
+/// against the 20s cap. No measurement on this host can clear that, which is why
+/// this guard is structural rather than measured.
+static CHAIN_REPLAY_ABANDONED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only: clear the landing gate AND the cumulative replay ledger between
+/// solves in one process (latch, ledger total, ledger spend, and the one-time
+/// exhaustion announcement all reset together — they describe one request).
+#[cfg(test)]
+pub(super) fn reset_chain_replay_latch() {
+    CHAIN_REPLAY_ABANDONED.store(false, std::sync::atomic::Ordering::Relaxed);
+    CHAIN_REPLAY_LEDGER_TOTAL_MS.store(CHAIN_LEDGER_UNSET, std::sync::atomic::Ordering::Relaxed);
+    CHAIN_REPLAY_LEDGER_SPENT_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+    CHAIN_LEDGER_EXHAUSTION_ANNOUNCED.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Test-only: the ONE lock every test that toggles or depends on the latch and
+/// ledger above must hold. They are process-global statics, so a test that
+/// needs the chain replay to RUN (e.g. `envelope_cpu_tests`) must not overlap a
+/// test that deliberately abandons it. Poison is recovered: every holder resets
+/// the latch on entry, so a panicked holder leaves nothing stale behind.
+#[cfg(test)]
+pub(super) fn chain_replay_test_serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Has the chain replay been abandoned for budget in this process?
+pub(super) fn chain_replay_abandoned() -> bool {
+    CHAIN_REPLAY_ABANDONED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Record that a budgeted chain replay failed, so no later iteration retries it.
+pub(super) fn abandon_chain_replay() {
+    CHAIN_REPLAY_ABANDONED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// #coop-chain-alpha-grad CUMULATIVE LEDGER: sentinel meaning "no armed
+/// budgeted call has happened yet for this request".
+const CHAIN_LEDGER_UNSET: u64 = u64::MAX;
+
+/// #coop-chain-alpha-grad CUMULATIVE LEDGER — the missing half of the landing
+/// gate above.
+///
+/// # The geometric-sum defect this closes
+///
+/// `chain_gradient_budget` used to grant a FRESH `min(0.25 * remaining, 20s)`
+/// slice on EVERY alpha-ascent iteration. Each fully-spent pass leaves 0.75 of
+/// the remainder, so over k passes the replay family consumes `1 - 0.75^k` of
+/// the entire request — 99.7% by k = 20, and cora's ascent runs ~20 iterations.
+/// Long-budget rows never notice (the 20 s cap binds and the tree still gets
+/// minutes); a 30 s row's PROOF starves. Regression receipt: cora_2024
+/// cifar10-set img398, banked unsat 6.5 s, timed out at the ~25 s internal
+/// deadline with no tree-side code changed at all
+/// (docs/REGRESSION_FC_UNSAT_LOST_2026-08-14.md, 2026-08-30 sections).
+///
+/// # The ledger law
+///
+/// A replay FAMILY that has spent its aggregate slice cannot spend more — the
+/// cumulative statement of the latch's own per-pass law ("a replay that did
+/// not fit once cannot fit later"). The TOTAL allowance for the whole ascent
+/// is `min(0.25 * remaining_at_first_armed_call, CAP)`: exactly the pre-fix
+/// INTENT. The design reserved a quarter of the budget for steering; the
+/// implementation accidentally re-reserved that quarter every iteration. Every
+/// pass's slice is additionally clamped to what the ledger has left, a
+/// remainder under the FLOOR skips (a pass that cannot finish produces a
+/// discarded partial map), and ACTUAL elapsed replay wall is recorded after
+/// every pass — success, Err, or deadline-abort alike, because spend is spend.
+///
+/// # Process exposure
+///
+/// Same one-solve-per-process exposure as `CHAIN_REPLAY_ABANDONED` above: the
+/// statics are per-process, competition runs one instance per process
+/// (`run_instance.sh`), and tests clear them via `reset_chain_replay_latch`.
+static CHAIN_REPLAY_LEDGER_TOTAL_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(CHAIN_LEDGER_UNSET);
+
+/// Millis of replay wall actually spent by this request's chain-replay family.
+static CHAIN_REPLAY_LEDGER_SPENT_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Once-latch for the "[chain-alpha-grad] ledger exhausted" line: exhaustion
+/// happens at whatever iteration drains the ledger, so an `iter == 0` gate
+/// would never print it; this is the same say-it-exactly-once discipline.
+static CHAIN_LEDGER_EXHAUSTION_ANNOUNCED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The ledger as `(total_ms, spent_ms)`, or `None` before the first armed
+/// budgeted call of this request. Telemetry and tests only.
+pub(super) fn chain_replay_ledger() -> Option<(u64, u64)> {
+    let total = CHAIN_REPLAY_LEDGER_TOTAL_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if total == CHAIN_LEDGER_UNSET {
+        return None;
+    }
+    Some((
+        total,
+        CHAIN_REPLAY_LEDGER_SPENT_MS.load(std::sync::atomic::Ordering::Relaxed),
+    ))
+}
+
+/// Record ACTUAL elapsed replay wall into the per-request ledger. Spend is
+/// spend: success, Err, and deadline-abort all consumed time the ascent can
+/// never get back, so the caller records unconditionally after every budgeted
+/// pass (never after a `Run(None)` unbudgeted pass — those meter nothing).
+pub(super) fn record_chain_replay_spend(elapsed: Duration) {
+    let ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    CHAIN_REPLAY_LEDGER_SPENT_MS.fetch_add(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// One-time claim on the "ledger exhausted" announcement: `true` exactly once
+/// per process (until the test-only reset), so the line cannot spam the log
+/// once per remaining alpha iteration.
+pub(super) fn take_ledger_exhaustion_announcement() -> bool {
+    !CHAIN_LEDGER_EXHAUSTION_ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// What the AnalyticChain branch should do about time, for one gradient pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChainGradientBudget {
+    /// Run the replay under this optional node deadline. `None` reproduces the
+    /// historical unbudgeted route byte-for-byte for no-deadline callers.
+    Run(Option<Instant>),
+    /// Not enough budget remains to complete a pass; use local gradients.
+    Skip,
+    /// The per-request cumulative ledger is spent: the replay family has
+    /// consumed its aggregate slice, so local gradients for the rest of this
+    /// request. Distinct from `Skip` so the call site can announce the ledger
+    /// (not the clock floor) as the reason, exactly once.
+    SkipLedgerExhausted,
+}
+
+/// Derive a PRIVATE sub-budget for one AnalyticChain gradient replay, metered
+/// against the request's cumulative replay ledger (see
+/// `CHAIN_REPLAY_LEDGER_TOTAL_MS`): the per-pass slice is fresh, the aggregate
+/// allowance is not.
+///
+/// Why a private budget rather than the caller's deadline: handing the
+/// replay the global deadline made the first deadline-aware node in reverse
+/// order abort as soon as the collector/refresh had spent the budget, dropping
+/// the A-matrices for every downstream ReLU and yielding zero-length chain
+/// gradients — i.e. frozen alpha. The pass is all-or-nothing, so it needs a
+/// budget it can actually finish inside, not the remains of someone else's.
+///
+/// Why running it under a deadline at all is sound: the replay's BOUNDS are
+/// discarded by the caller (`Ok((_bounds, intermediate))`) and only its
+/// A-matrices are consumed, to move alpha. Every alpha write is clamped to
+/// [0,1] (`runtime_state.rs`), and any alpha in [0,1] is a valid lower
+/// relaxation, so this path is steering data and cannot make a bound unsound.
+/// Under a finite deadline the ConvTranspose planners take their certified
+/// Anchored route, which honors one unchanged node deadline from admission
+/// through publication — which is exactly the cooperative behaviour the
+/// historical gate was waiting for.
+pub(super) fn chain_gradient_budget(
+    request_deadline: Option<Instant>,
+    now: Instant,
+) -> ChainGradientBudget {
+    // LANDING GATE. A replay that did not fit once cannot fit later: `remaining`
+    // decreases monotonically, so the slice can only shrink. Retrying spends the
+    // slice and produces nothing, once per alpha iteration.
+    if chain_replay_abandoned() {
+        return ChainGradientBudget::Skip;
+    }
+    let Some(deadline) = request_deadline else {
+        // No-deadline callers keep the historical route unchanged.
+        return ChainGradientBudget::Run(None);
+    };
+    let remaining = deadline.saturating_duration_since(now);
+    if remaining < CHAIN_GRADIENT_BUDGET_FLOOR {
+        return ChainGradientBudget::Skip;
+    }
+    let scaled = remaining.mul_f64(CHAIN_GRADIENT_BUDGET_FRACTION);
+    let slice = scaled.min(CHAIN_GRADIENT_BUDGET_CAP);
+    if slice < CHAIN_GRADIENT_BUDGET_FLOOR {
+        return ChainGradientBudget::Skip;
+    }
+    // #coop-chain-alpha-grad CUMULATIVE LEDGER (see the statics for the full
+    // law). The first call that would arm fixes the ascent's TOTAL replay
+    // allowance at exactly this pass's slice — `min(0.25 * remaining, CAP)`
+    // once per request, not once per iteration. Without this, k passes eat
+    // `1 - 0.75^k` of the whole request (the geometric-sum defect).
+    let slice_ms = u64::try_from(slice.as_millis()).unwrap_or(u64::MAX);
+    let total_ms = match CHAIN_REPLAY_LEDGER_TOTAL_MS.compare_exchange(
+        CHAIN_LEDGER_UNSET,
+        slice_ms,
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    ) {
+        Ok(_) => slice_ms,
+        Err(existing) => existing,
+    };
+    let spent_ms = CHAIN_REPLAY_LEDGER_SPENT_MS.load(std::sync::atomic::Ordering::Relaxed);
+    let ledger_remaining = Duration::from_millis(total_ms.saturating_sub(spent_ms));
+    if ledger_remaining < CHAIN_GRADIENT_BUDGET_FLOOR {
+        // The LEDGER refuses, not the clock: a family that has spent its
+        // aggregate slice cannot spend more, however much request budget the
+        // tree still holds — that budget is the tree's, not the replay's.
+        return ChainGradientBudget::SkipLedgerExhausted;
+    }
+    let slice = slice.min(ledger_remaining);
+    ChainGradientBudget::Run(Some(now + slice))
+}
 
 use super::super::runtime_state::DagAlphaRuntimeState;
 use super::DagAlphaLoopContext;
@@ -37,7 +277,7 @@ use crate::network::graph_alpha::resnet_decompose::{
 /// to drive the supplement computation and alpha update steps.
 pub(super) struct GradientDispatchResult {
     pub(super) numerical_gradients: Vec<Array1<f32>>,
-    /// Upper-path gradients. `None` means same as `numerical_gradients` (#2297:
+    /// Upper-path gradients. `None` means same as `numerical_gradients` (this
     /// avoids a full `Vec<Array1<f32>>` clone for non-Analytic gradient methods).
     pub(super) numerical_gradients_upper: Option<Vec<Array1<f32>>>,
     pub(super) bilinear_grads: HashMap<String, Array4<f32>>,
@@ -407,12 +647,12 @@ impl GraphNetwork {
     ) -> Result<GradientDispatchResult> {
         // Initialize gradient accumulators.
         // Bilinear gradient accumulator — populated by SPSA, left as zeros for other
-        // methods. Available for the bilinear Adam update below (#3287).
+        // methods. Available for the bilinear Adam update below.
         let mut bilinear_grads: HashMap<String, Array4<f32>> = bilinear_alphas
             .iter()
             .map(|(name, alpha)| (name.clone(), Array4::zeros(alpha.raw_dim())))
             .collect();
-        // MulBinary gradient accumulator (#3439 Phase 3).
+        // MulBinary gradient accumulator.
         let mut mul_binary_grads: HashMap<String, Array2<f32>> = mul_binary_alphas
             .iter()
             .map(|(name, alpha)| (name.clone(), Array2::zeros(alpha.raw_dim())))
@@ -528,25 +768,107 @@ impl GraphNetwork {
                         gradients.to_vec()
                     }
                     GradientMethod::AnalyticChain => {
-                        // The historical replay below intentionally erases
-                        // the request deadline and performs a complete
-                        // intermediate/chain-gradient pass. It may create an
-                        // Anchored ConvTranspose carrier, so entering it from
-                        // a finite request would escape the absolute proof
-                        // authority. Local analytic gradients are already
-                        // available and are soundness-neutral steering data;
-                        // use them until the replay itself is cooperative.
-                        if ctx.config.deadline.is_some() {
+                        // #coop-chain-alpha-grad. This branch used to be skipped
+                        // outright whenever `ctx.config.deadline.is_some()` —
+                        // i.e. on EVERY scored run — because the replay erased
+                        // the request deadline and could build an Anchored
+                        // ConvTranspose carrier on the unbudgeted route. The
+                        // consequence was that on every non-ResNet graph (cgan,
+                        // cora, collins, malbeware, metaroom, traffic_signs,
+                        // yolo, vit, challenging_certified_training) the root
+                        // alpha ascent fell back to the LOCAL per-ReLU gradient,
+                        // which is sign-definite (<=0) unless the envelope
+                        // surrogate is armed — so the ascent had no usable
+                        // direction in competition at all.
+                        //
+                        // It now runs under a PRIVATE, FRESH sub-budget instead
+                        // (see `chain_gradient_budget`): the ConvTranspose
+                        // planners take their certified Anchored route, which
+                        // honors one unchanged node deadline from admission
+                        // through publication, and a pass that cannot finish
+                        // inside its own slice returns Err and lands on the
+                        // all-or-nothing local-gradient fallback below. Handing
+                        // it the caller's own (already-spent) deadline is what
+                        // must NOT be done.
+                        //
+                        // Soundness: the replay's bounds are discarded
+                        // (`Ok((_bounds, intermediate))`) and only its
+                        // A-matrices move alpha, which is clamped to [0,1] on
+                        // every write; any alpha in [0,1] is a valid lower
+                        // relaxation. This is steering data, not a bound.
+                        let now = Instant::now();
+                        let chain_budget = chain_gradient_budget(ctx.config.deadline, now);
+                        if matches!(chain_budget, ChainGradientBudget::SkipLedgerExhausted) {
+                            // #coop-chain-alpha-grad CUMULATIVE LEDGER: the
+                            // LEDGER refused, not the clock floor. This fires
+                            // at whatever iteration drains the ledger — never
+                            // iter 0 — so the once-latch, not an `iter == 0`
+                            // gate, is what keeps it to exactly one line.
+                            if take_ledger_exhaustion_announcement() {
+                                let (ledger_total_ms, ledger_spent_ms) =
+                                    chain_replay_ledger().unwrap_or((0, 0));
+                                eprintln!(
+                                    "[chain-alpha-grad] ledger exhausted: \
+                                     ledger_total_ms={ledger_total_ms} \
+                                     ledger_spent_ms={ledger_spent_ms} — the replay family \
+                                     has spent its aggregate slice; steering on local \
+                                     gradients for the rest of this request"
+                                );
+                            }
+                            gradients.to_vec()
+                        } else if matches!(chain_budget, ChainGradientBudget::Skip) {
+                            // #coop-chain-alpha-grad R9: a silent fallback is
+                            // indistinguishable from "the lever never existed",
+                            // which is how a null becomes VOID instead of
+                            // negative. Say so, once.
+                            if iter == 0 {
+                                eprintln!(
+                                    "[chain-alpha-grad] skipped: remaining_ms={} below floor \
+                                     — steering on local gradients",
+                                    ctx.config
+                                        .deadline
+                                        .map(|d| d.saturating_duration_since(now).as_millis())
+                                        .unwrap_or(0)
+                                );
+                            }
                             gradients.to_vec()
                         } else {
+                            let chain_deadline = match chain_budget {
+                                ChainGradientBudget::Run(dl) => dl,
+                                ChainGradientBudget::Skip
+                                | ChainGradientBudget::SkipLedgerExhausted => {
+                                    unreachable!("checked above")
+                                }
+                            };
+                            if iter == 0 {
+                                let (ledger_total_ms, ledger_spent_ms) =
+                                    chain_replay_ledger().unwrap_or((0, 0));
+                                eprintln!(
+                                    "[chain-alpha-grad] armed: slice_ms={} remaining_ms={} \
+                                     deadline_present={} ledger_total_ms={} \
+                                     ledger_spent_ms={} ledger_ms_remaining={}",
+                                    chain_deadline
+                                        .map(|d| d.saturating_duration_since(now).as_millis())
+                                        .unwrap_or(0),
+                                    ctx.config
+                                        .deadline
+                                        .map(|d| d.saturating_duration_since(now).as_millis())
+                                        .unwrap_or(0),
+                                    ctx.config.deadline.is_some(),
+                                    ledger_total_ms,
+                                    ledger_spent_ms,
+                                    ledger_total_ms.saturating_sub(ledger_spent_ms)
+                                );
+                            }
                             // True chain-rule gradients using intermediate A matrices.
                             // Run backward pass that stores A matrices at each ReLU node.
                             let mut scratch = zeros_like_gradients(gradients);
                             let mut scratch_upper = zeros_like_gradients(gradients);
-                            // Pass current bilinear/mul_binary alphas through backward call (#3287, #3439).
+                            // Pass current bilinear/mul_binary alphas through backward call.
                             let (bl, mb) = alpha_refs(ctx, bilinear_alphas, mul_binary_alphas);
 
-                            match self.dag_alpha_backward_pass_with_intermediates(
+                            let replay_started = Instant::now();
+                            let replay_result = self.dag_alpha_backward_pass_with_intermediates(
                                 ctx.input,
                                 node_bounds,
                                 ctx.exec_order,
@@ -560,29 +882,49 @@ impl GraphNetwork {
                                 ctx.engine,
                                 bl,
                                 mb,
-                                // #cgan-alpha-amatrix: NO deadline for the AnalyticChain
-                                // gradient backward — mirror the sequential twin
-                                // (sequential_gradients.rs, #3393). Handing it the global
-                                // deadline made the FIRST deadline-aware node in reverse
-                                // order (e.g. the output Gemm) abort once the budget was
-                                // spent by the collector/refresh, dropping the A-matrices for
-                                // EVERY downstream ReLU (all 7 cgan generator ReLUs) → zero-
-                                // length chain gradients → frozen alpha. A truncated gradient
-                                // records no A-matrices and is useless anyway, so an
-                                // unbounded-but-complete pass strictly dominates; the
-                                // output_dim-row pass is bounded and the top-level loop
-                                // deadline (config.past_deadline) still bounds total time.
-                                None,
-                            ) {
+                                // #coop-chain-alpha-grad: a PRIVATE sub-budget, never the
+                                // caller's deadline. The constraint this
+                                // respects: handing this pass the global deadline made the
+                                // FIRST deadline-aware node in reverse order (e.g. the output
+                                // Gemm) abort once the budget was already spent by the
+                                // collector/refresh, dropping the A-matrices for EVERY
+                                // downstream ReLU (all 7 cgan generator ReLUs) → zero-length
+                                // chain gradients → frozen alpha. The fix is not "no
+                                // deadline", it is "a deadline this pass can finish inside":
+                                // `chain_gradient_budget` hands it a fresh slice of the
+                                // remaining budget, and a pass that overruns its own slice
+                                // fails closed to the local-gradient fallback below rather
+                                // than emitting a truncated map. `None` here still means the
+                                // historical unbudgeted route, and no-deadline callers still
+                                // get it byte-for-byte.
+                                chain_deadline,
+                            );
+                            if chain_deadline.is_some() {
+                                // #coop-chain-alpha-grad CUMULATIVE LEDGER:
+                                // spend is spend. Success, Err and
+                                // deadline-abort alike consumed wall the
+                                // ascent can never recover, so record ACTUAL
+                                // elapsed — not the granted slice — after
+                                // every budgeted pass. `Run(None)` (the
+                                // historical unbudgeted route) meters nothing.
+                                record_chain_replay_spend(replay_started.elapsed());
+                            }
+                            match replay_result {
                                 Ok((_bounds, intermediate)) => {
                                     // Chain-rule gradients now include Patches-mode ReLUs
-                                    // because backward.rs stores Dense intermediates for them
-                                    // (#3293 Approach B). No local gradient fallback needed.
+                                    // because backward.rs stores Dense intermediates for them.
+                                    // No local gradient fallback needed.
                                     let relu_names: Vec<String> = ctx
                                         .relu_nodes
                                         .iter()
                                         .map(|(name, _)| name.clone())
                                         .collect();
+                                    // #alpha-envelope-grad-cpu: thread the TYPED
+                                    // preset value, exactly as the three GPU
+                                    // warmup sites below do. This call used to
+                                    // resolve env-only, which left
+                                    // `bab.alpha_crown.alpha_envelope_grad` dark
+                                    // on every lane that reaches this replay.
                                     let chain_grads = self
                                         .compute_graph_chain_rule_gradients_with_binding(
                                             ctx.input,
@@ -590,8 +932,9 @@ impl GraphNetwork {
                                             &intermediate,
                                             Some(runtime.graph()),
                                             ctx.engine,
+                                            Some(ctx.config.alpha_envelope_grad),
                                         );
-                                    // #4404: reduce per-neuron chain-rule gradients to per-channel
+                                    // Reduce per-neuron chain-rule gradients to per-channel
                                     // for nodes using channel-only alpha (full_conv_alpha: False).
                                     //
                                     // #cgan-alpha-amatrix robustness: if a ReLU's A-matrix was
@@ -616,12 +959,25 @@ impl GraphNetwork {
                                         .collect()
                                 }
                                 Err(e) => {
-                                    // Fall back to local gradients if intermediate storage failed
+                                    // Fall back to local gradients if intermediate storage failed.
+                                    // LANDING GATE: if this attempt was BUDGETED, the failure may
+                                    // be the slice running out — and the slice only shrinks, so
+                                    // never retry it in this process.
+                                    if chain_deadline.is_some() {
+                                        abandon_chain_replay();
+                                    }
                                     if iter == 0 {
                                         debug!(
                                     "DAG α-CROWN: AnalyticChain failed ({}), using local gradients",
                                     e
                                 );
+                                        // All-or-nothing: a truncated A-matrix map
+                                        // is discarded, never consumed. Distinguish
+                                        // it from "never ran" in the log.
+                                        eprintln!(
+                                            "[chain-alpha-grad] declined: {e} \
+                                             — discarded, steering on local gradients"
+                                        );
                                     }
                                     gradients.to_vec()
                                 }
@@ -633,11 +989,11 @@ impl GraphNetwork {
             }
         };
 
-        // Upper-path gradients (#3393). Analytic method has real upper gradients
+        // Upper-path gradients. Analytic method has real upper gradients
         // from the backward pass. Other methods use the same gradient for both paths
         // (SPSA/FiniteDiff perturb jointly, AnalyticChain doesn't separate paths).
         // Non-Analytic methods store `None` and fall back to `numerical_gradients`
-        // at the call site, avoiding a full Vec<Array1<f32>> clone (#2297).
+        // at the call site, avoiding a full Vec<Array1<f32>> clone.
         let numerical_gradients_upper: Option<Vec<Array1<f32>>> = match ctx.config.gradient_method {
             GradientMethod::Analytic => Some(gradients_upper.to_vec()),
             _ => None,
@@ -890,23 +1246,18 @@ impl GraphNetwork {
             if !resnet_warmup_gpu_enabled() {
                 return None;
             }
-            // #envelope-grad AND THE GPU LANE — CORRECTED 2026-08-17.
+            // #envelope-grad AND THE GPU LANE (corrected 2026-08-17).
             //
-            // This block used to `warn!` that NY_ALPHA_ENVELOPE_GRAD=1 is IGNORED
-            // here. That was true when written (the resident kernel computes the
-            // same sign-definite local rule `grad[i] = pre_lower[i] * sum_j
-            // max(a_lower[j,i],0)`, CROWN_ALPHA_GRADIENT_SHADER) and became FALSE
-            // about three hours later, when `de451dc68` landed the host-side
+            // NY_ALPHA_ENVELOPE_GRAD=1 is NOT ignored here. The resident kernel computes
+            // the sign-definite local rule `grad[i] = pre_lower[i] * sum_j
+            // max(a_lower[j,i],0)` (CROWN_ALPHA_GRADIENT_SHADER), and the host-side
             // rescale `envelope_rescaled_warmup_gradients` (#envelope-grad-gpu,
-            // dispatched below). The rescale is exact — `S = g/l` recovers the
-            // device sum and re-multiplies by `clamp(h_hat(x*), l, u)` — and was
-            // verified end-to-end: `x*` is BIT-IDENTICAL across the CPU and GPU
-            // lanes (same binding_row, same sign digest), `S` is non-zero in both.
-            //
-            // The stale warning survived three commits telling readers to disable
-            // the GPU lane to get a corrected direction they were already getting.
-            // A comment that documents a fixed defect as live costs exactly what
-            // the defect cost. Do not restore it.
+            // dispatched below) turns it into the envelope rule. The rescale is
+            // exact — `S = g/l` recovers the device sum and re-multiplies by
+            // `clamp(h_hat(x*), l, u)` — and was verified end-to-end: `x*` is
+            // BIT-IDENTICAL across the CPU and GPU lanes (same binding_row, same
+            // sign digest), `S` is non-zero in both. Do not restore the old warning
+            // that told readers to disable the GPU lane to get this direction.
             //
             // What is NOT settled: whether the envelope rule HELPS here. The old
             // "CPU+envelope 132 vs GPU+rescale 51" comparison was never a valid
@@ -2242,7 +2593,7 @@ impl GraphNetwork {
     }
 
     /// Masked pre-activation lower bound per ReLU in FOLD order (mirrors
-    /// `extract_node_layer`'s mask handling, incl. #4404 channel→spatial
+    /// `extract_node_layer`'s mask handling, incl. channel→spatial
     /// expansion). Shared by the warmup bound and gradient folds — previously
     /// duplicated at both sites.
     fn warmup_masked_pre_lowers(
@@ -2541,6 +2892,383 @@ fn identity_warmup_seed(od: usize) -> Option<GpuCrownSeed> {
 // #root-alpha-gpu oracles: (a) gate-off byte-identity, (b) skeleton-fold vs
 // legacy parity at the warmup site, (c) cache-reuse bitwise parity + one fold
 // per iteration, (d) refresh/iter invalidation.
+#[cfg(test)]
+mod chain_gradient_budget_tests {
+    use super::*;
+
+    /// The latch and ledger are process-global statics; serialize every test
+    /// that touches them so `--test-threads=4` cannot interleave two tests'
+    /// state. Each test still resets on entry, so order never matters.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        chain_replay_test_serial()
+    }
+
+    /// THE LANDING GATE. Once a budgeted replay is abandoned, no later iteration
+    /// may start another one — because `remaining` only shrinks, so a slice that
+    /// was too small stays too small, and each retry spends the slice to produce
+    /// nothing. Without this, the waste is paid once per alpha iteration (up to
+    /// 100 on some categories).
+    #[test]
+    fn an_abandoned_replay_is_never_retried_in_this_process() {
+        let _g = serial();
+        reset_chain_replay_latch();
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(60);
+        // Plenty of budget: the gate is open.
+        assert!(
+            matches!(
+                chain_gradient_budget(Some(deadline), now),
+                ChainGradientBudget::Run(_)
+            ),
+            "a 60s budget must arm before the latch is set"
+        );
+        abandon_chain_replay();
+        // Same generous budget, now refused.
+        assert!(
+            matches!(
+                chain_gradient_budget(Some(deadline), now),
+                ChainGradientBudget::Skip
+            ),
+            "after abandonment even a 60s budget must NOT start another replay"
+        );
+        reset_chain_replay_latch();
+        assert!(
+            matches!(
+                chain_gradient_budget(Some(deadline), now),
+                ChainGradientBudget::Run(_)
+            ),
+            "the latch must be resettable so one process can run many solves"
+        );
+    }
+
+    /// The latch must not silently disable the UNBUDGETED route, which is the
+    /// developer/no-deadline path and cannot run out of slice.
+    #[test]
+    fn the_latch_also_gates_the_unbudgeted_route_conservatively() {
+        let _g = serial();
+        reset_chain_replay_latch();
+        assert!(matches!(
+            chain_gradient_budget(None, Instant::now()),
+            ChainGradientBudget::Run(None)
+        ));
+        abandon_chain_replay();
+        // Deliberate: once a replay has proven it does not fit, we do not try
+        // again even without a deadline, because the cost that made it fail is a
+        // property of the NETWORK, not of the clock.
+        assert!(matches!(
+            chain_gradient_budget(None, Instant::now()),
+            ChainGradientBudget::Skip
+        ));
+        reset_chain_replay_latch();
+    }
+
+    /// No-deadline callers must keep the historical unbudgeted route EXACTLY —
+    /// and must never touch the ledger: there is no request budget to meter.
+    #[test]
+    fn no_deadline_runs_the_historical_unbudgeted_route() {
+        let _g = serial();
+        reset_chain_replay_latch();
+        assert_eq!(
+            chain_gradient_budget(None, Instant::now()),
+            ChainGradientBudget::Run(None),
+            "a no-deadline caller must still get `None`, i.e. the byte-for-byte historical route"
+        );
+        assert_eq!(
+            chain_replay_ledger(),
+            None,
+            "Run(None) is the historical route: no snapshot, no ledger interaction"
+        );
+    }
+
+    /// The regression this whole change exists to remove: under a deadline the
+    /// branch used to be skipped outright, so the ascent ran on the
+    /// sign-definite local gradient on every scored non-ResNet run.
+    #[test]
+    fn a_finite_request_now_runs_the_chain_replay() {
+        let _g = serial();
+        reset_chain_replay_latch();
+        let now = Instant::now();
+        let budget = chain_gradient_budget(Some(now + Duration::from_secs(100)), now);
+        match budget {
+            ChainGradientBudget::Run(Some(_)) => {}
+            other => panic!("a finite request must RUN the chain replay, got {other:?}"),
+        }
+    }
+
+    /// It must never be handed the caller's own deadline: the slice is
+    /// a fresh fraction, strictly inside the request. Uses a remaining budget
+    /// small enough that the FRACTION binds rather than the cap, so this test
+    /// exercises the proportional path (the cap has its own test below).
+    #[test]
+    fn the_slice_is_private_and_strictly_inside_the_request() {
+        let _g = serial();
+        reset_chain_replay_latch();
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(40);
+        let ChainGradientBudget::Run(Some(slice)) = chain_gradient_budget(Some(deadline), now)
+        else {
+            panic!("expected a budgeted run");
+        };
+        assert!(
+            slice < deadline,
+            "the replay must get its OWN slice, never the caller's deadline"
+        );
+        assert_eq!(
+            slice.saturating_duration_since(now),
+            Duration::from_secs(10),
+            "25% of the 40 s remaining, which is under the {CHAIN_GRADIENT_BUDGET_CAP:?} cap"
+        );
+    }
+
+    /// A quarter of a long budget is still minutes; the cap bounds one pass.
+    #[test]
+    fn the_cap_bounds_one_pass_on_long_budget_categories() {
+        let _g = serial();
+        reset_chain_replay_latch();
+        let now = Instant::now();
+        // cgan ships 900-1800 s budgets: 25% would be 225-450 s for ONE gradient.
+        let ChainGradientBudget::Run(Some(slice)) =
+            chain_gradient_budget(Some(now + Duration::from_mins(15)), now)
+        else {
+            panic!("expected a budgeted run");
+        };
+        assert_eq!(
+            slice.saturating_duration_since(now),
+            CHAIN_GRADIENT_BUDGET_CAP,
+            "one replay must not exceed the cap however much budget remains"
+        );
+    }
+
+    /// A pass that cannot finish yields a partial A-matrix map, which is
+    /// discarded anyway — so do not start one.
+    #[test]
+    fn a_nearly_spent_budget_skips_rather_than_starting_a_doomed_pass() {
+        let _g = serial();
+        reset_chain_replay_latch();
+        let now = Instant::now();
+        assert_eq!(
+            chain_gradient_budget(Some(now + Duration::from_millis(10)), now),
+            ChainGradientBudget::Skip
+        );
+        assert_eq!(
+            chain_gradient_budget(Some(now), now),
+            ChainGradientBudget::Skip,
+            "an exactly-expired deadline must skip, not run with a zero slice"
+        );
+    }
+
+    /// An already-expired deadline must not underflow into a huge slice.
+    #[test]
+    fn an_expired_deadline_skips_and_never_underflows() {
+        let _g = serial();
+        reset_chain_replay_latch();
+        let now = Instant::now();
+        let expired = now.checked_sub(Duration::from_secs(30)).unwrap();
+        assert_eq!(
+            chain_gradient_budget(Some(expired), now),
+            ChainGradientBudget::Skip,
+            "saturating_duration_since must floor at zero, not wrap"
+        );
+    }
+
+    /// THE CUMULATIVE LEDGER. The first armed call fixes the request's TOTAL
+    /// replay allowance at `min(0.25 * remaining, CAP)` — once. A later call,
+    /// even against a larger remaining budget, must not re-snapshot.
+    #[test]
+    fn the_first_armed_call_snapshots_the_request_ledger_once() {
+        let _g = serial();
+        reset_chain_replay_latch();
+        assert_eq!(
+            chain_replay_ledger(),
+            None,
+            "no snapshot before the first armed call"
+        );
+        let now = Instant::now();
+        // 80 s remaining: 0.25 * 80 = 20 s, and the cap is also 20 s.
+        let ChainGradientBudget::Run(Some(slice)) =
+            chain_gradient_budget(Some(now + Duration::from_secs(80)), now)
+        else {
+            panic!("expected a budgeted run");
+        };
+        assert_eq!(
+            slice.saturating_duration_since(now),
+            CHAIN_GRADIENT_BUDGET_CAP
+        );
+        assert_eq!(
+            chain_replay_ledger(),
+            Some((20_000, 0)),
+            "the total is exactly the first pass's slice; nothing spent yet"
+        );
+        // Second call with FOUR HUNDRED seconds remaining: per-pass math would
+        // grant the cap again, and the total must not move.
+        let _ = chain_gradient_budget(Some(now + Duration::from_secs(400)), now);
+        assert_eq!(
+            chain_replay_ledger(),
+            Some((20_000, 0)),
+            "a later, larger remaining must NOT re-snapshot the ledger total"
+        );
+        reset_chain_replay_latch();
+    }
+
+    /// The geometric-sum defect, refuted by construction: the second pass's
+    /// slice is bounded by what the ledger has LEFT, not by a fresh coupon.
+    #[test]
+    fn every_slice_is_bounded_by_what_the_ledger_has_left() {
+        let _g = serial();
+        reset_chain_replay_latch();
+        let now = Instant::now();
+        let deadline = Some(now + Duration::from_secs(40));
+        // First armed call: 0.25 * 40 s = 10 s slice, ledger total 10_000 ms.
+        let ChainGradientBudget::Run(Some(first)) = chain_gradient_budget(deadline, now) else {
+            panic!("expected a budgeted run");
+        };
+        assert_eq!(
+            first.saturating_duration_since(now),
+            Duration::from_secs(10)
+        );
+        record_chain_replay_spend(Duration::from_millis(7_500));
+        // Same clock, same deadline: the pre-fix code would hand out a fresh
+        // 10 s. The ledger has 2_500 ms left and that is all this pass gets.
+        let ChainGradientBudget::Run(Some(second)) = chain_gradient_budget(deadline, now) else {
+            panic!("expected a budgeted run against a 2.5 s ledger remainder");
+        };
+        assert_eq!(
+            second.saturating_duration_since(now),
+            Duration::from_millis(2_500),
+            "the slice must be min(0.25 * remaining, CAP, ledger_remaining)"
+        );
+        reset_chain_replay_latch();
+    }
+
+    /// A family that has spent its aggregate slice cannot spend more — and the
+    /// refusal is the LEDGER variant, so the call site can announce it.
+    #[test]
+    fn an_exhausted_ledger_forces_skip_not_another_coupon() {
+        let _g = serial();
+        reset_chain_replay_latch();
+        let now = Instant::now();
+        let deadline = Some(now + Duration::from_secs(40));
+        let _ = chain_gradient_budget(deadline, now); // snapshot: total 10_000 ms
+        record_chain_replay_spend(Duration::from_millis(10_000));
+        assert_eq!(
+            chain_gradient_budget(deadline, now),
+            ChainGradientBudget::SkipLedgerExhausted,
+            "36+ s still on the request clock, but the family's allowance is spent"
+        );
+        // Overspend (a pass that overran its slice) must saturate, not wrap.
+        record_chain_replay_spend(Duration::from_millis(5_000));
+        assert_eq!(
+            chain_gradient_budget(deadline, now),
+            ChainGradientBudget::SkipLedgerExhausted,
+            "spent > total must stay exhausted, never underflow into a huge remainder"
+        );
+        reset_chain_replay_latch();
+    }
+
+    /// FLOOR interaction, both directions: a ledger remainder under the floor
+    /// is exhausted (a pass that cannot finish is a discarded partial map); a
+    /// remainder exactly AT the floor still runs, clamped to it.
+    #[test]
+    fn a_ledger_remainder_below_the_floor_is_exhausted_at_it_still_runs() {
+        let _g = serial();
+        reset_chain_replay_latch();
+        let now = Instant::now();
+        let deadline = Some(now + Duration::from_secs(40));
+        let _ = chain_gradient_budget(deadline, now); // total 10_000 ms
+        record_chain_replay_spend(Duration::from_millis(9_800)); // 200 ms < 250 ms floor
+        assert_eq!(
+            chain_gradient_budget(deadline, now),
+            ChainGradientBudget::SkipLedgerExhausted
+        );
+        reset_chain_replay_latch();
+        let _ = chain_gradient_budget(deadline, now); // total 10_000 ms
+        record_chain_replay_spend(Duration::from_millis(9_750)); // exactly the floor left
+        let ChainGradientBudget::Run(Some(slice)) = chain_gradient_budget(deadline, now) else {
+            panic!("a remainder exactly at the floor must still run");
+        };
+        assert_eq!(
+            slice.saturating_duration_since(now),
+            CHAIN_GRADIENT_BUDGET_FLOOR,
+            "the last slice is clamped to the ledger remainder"
+        );
+        reset_chain_replay_latch();
+    }
+
+    /// A clock-side sub-floor slice is the plain `Skip`, not a ledger verdict —
+    /// and it must not touch the ledger (no snapshot, no spend).
+    #[test]
+    fn a_sub_floor_clock_slice_is_a_plain_skip_and_never_snapshots() {
+        let _g = serial();
+        reset_chain_replay_latch();
+        let now = Instant::now();
+        // 800 ms remaining clears the remaining-floor, but 0.25 * 800 = 200 ms
+        // is under the 250 ms floor: the CLOCK refuses, before any ledger math.
+        assert_eq!(
+            chain_gradient_budget(Some(now + Duration::from_millis(800)), now),
+            ChainGradientBudget::Skip
+        );
+        assert_eq!(
+            chain_replay_ledger(),
+            None,
+            "a call that never arms must not fix the request's ledger total"
+        );
+        reset_chain_replay_latch();
+    }
+
+    /// The abandonment latch outranks the ledger: after `abandon_chain_replay`
+    /// the refusal is the plain `Skip` even with a fresh, untouched ledger.
+    #[test]
+    fn the_latch_outranks_a_fresh_ledger() {
+        let _g = serial();
+        reset_chain_replay_latch();
+        let now = Instant::now();
+        abandon_chain_replay();
+        assert_eq!(
+            chain_gradient_budget(Some(now + Duration::from_secs(60)), now),
+            ChainGradientBudget::Skip,
+            "abandonment is a property of the NETWORK; the ledger never gets a say"
+        );
+        assert_eq!(
+            chain_replay_ledger(),
+            None,
+            "and the latch path must not snapshot"
+        );
+        reset_chain_replay_latch();
+    }
+
+    /// The exhaustion announcement fires exactly once per request, and the
+    /// reset hook re-arms it along with the rest of the ledger state.
+    #[test]
+    fn the_reset_hook_clears_latch_ledger_and_announcement_together() {
+        let _g = serial();
+        reset_chain_replay_latch();
+        assert!(
+            take_ledger_exhaustion_announcement(),
+            "first claim after reset"
+        );
+        assert!(
+            !take_ledger_exhaustion_announcement(),
+            "second claim must be refused"
+        );
+        let now = Instant::now();
+        let _ = chain_gradient_budget(Some(now + Duration::from_secs(40)), now);
+        record_chain_replay_spend(Duration::from_millis(5_000));
+        abandon_chain_replay();
+        reset_chain_replay_latch();
+        assert_eq!(
+            chain_replay_ledger(),
+            None,
+            "reset must clear total AND spend"
+        );
+        assert!(!chain_replay_abandoned(), "reset must clear the latch");
+        assert!(
+            take_ledger_exhaustion_announcement(),
+            "reset must re-arm the one-time exhaustion line"
+        );
+        reset_chain_replay_latch();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3122,7 +3850,7 @@ mod tests {
                 "expired warmup GPU work must fail closed"
             );
             assert_eq!(expired_engine.calls(), 0);
-            assert!(expired_engine.deadline_writes().is_empty());
+            assert_eq!((expired_engine.deadline_writes()).len(), 0);
 
             let mut noncoop_fix = warmup_fixture();
             noncoop_fix.config.deadline = Some(Instant::now() + Duration::from_secs(30));
@@ -3765,7 +4493,7 @@ mod tests {
             );
             assert_eq!(expired_engine.calls(), 0);
             assert_eq!(expired_engine.joint_calls(), 0);
-            assert!(expired_engine.deadline_writes().is_empty());
+            assert_eq!((expired_engine.deadline_writes()).len(), 0);
 
             let mut noncoop_fix = warmup_fixture();
             noncoop_fix.config.deadline = Some(Instant::now() + Duration::from_secs(30));
@@ -3789,7 +4517,7 @@ mod tests {
             );
             assert_eq!(noncoop_engine.calls(), 0);
             assert_eq!(noncoop_engine.joint_calls(), 0);
-            assert!(noncoop_engine.deadline_writes().is_empty());
+            assert_eq!((noncoop_engine.deadline_writes()).len(), 0);
         });
     }
 

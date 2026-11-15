@@ -117,7 +117,7 @@ fn layer_norm_bounds(
             let l = lower_row[i];
             let u = upper_row[i];
             // NaN-propagating max: if l or u is NaN (from upstream), NaN must
-            // surface rather than silently picking the non-NaN operand (#2635).
+            // surface rather than silently picking the non-NaN operand.
             let from_lower = nan_propagating_max((l - mean_upper).abs(), (l - mean_lower).abs());
             let from_upper = nan_propagating_max((u - mean_upper).abs(), (u - mean_lower).abs());
             let dev = nan_propagating_max(from_lower, from_upper);
@@ -138,7 +138,7 @@ fn layer_norm_bounds(
                 num_upper / std_lower,
                 num_upper / std_upper,
             ];
-            // NaN-propagating fold: division by std near zero can produce NaN — see #2577.
+            // NaN-propagating fold: division by std near zero can produce NaN.
             let norm_lower = candidates
                 .iter()
                 .cloned()
@@ -149,7 +149,7 @@ fn layer_norm_bounds(
                 .fold(f32::NEG_INFINITY, nan_propagating_max);
             // LayerNorm outputs are bounded by sqrt(n-1) for n elements since sum devs = 0.
             // NaN-propagating clamp: if the fold above produced NaN (from division by
-            // near-zero std), the clamp must not silently replace it with max_norm (#2635).
+            // near-zero std), the clamp must not silently replace it with max_norm.
             let norm_lower = nan_propagating_max(norm_lower, -max_norm);
             let norm_upper = nan_propagating_min(norm_upper, max_norm);
 

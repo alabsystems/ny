@@ -24,7 +24,6 @@ bab:
   branching:
     method: input
     candidates: 5
-    reduceop: max
     input_split:
       enable: true
       sb_coeff_thresh: 1.0e-2
@@ -40,8 +39,5 @@ bab:
     post_bab_pgd_fraction: 0.10
   alpha_crown:
     lr_alpha: 0.2
-    iterations: 100
   beta_crown:
-    lr_alpha: 0.1
-    lr_beta: 0.15
     iterations: 25

@@ -85,7 +85,7 @@ impl GraphNetwork {
         } else if let Some(cached) = bounds_cache.get(input_name) {
             Ok(cached.clone())
         } else {
-            // #2812 Finding 51: Missing cache entry for non-NETWORK_INPUT node.
+            // Missing cache entry for non-NETWORK_INPUT node.
             // This may be legitimate (input from outside this block) or a
             // dependency ordering error within the block. Log a warning so
             // callers can detect potential topology bugs.

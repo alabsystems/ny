@@ -116,6 +116,14 @@ bab:
   branching:
     method: input
     input_split:
+      # #lsnc-lane stage-3 search keys ARMED 2026-09-26 (scratchpad/w6q M2, pin ny_ship26_5d6ca4577, 116 s, 3 reps rotated):
+      # 1_1 p5 / 4_2 p2 / 4_5 p10 timeout 3/3 (ctl) -> UNSAT 3/3 at 57/70/57 s; 1_5 p2 sat 3/3 (ctl 1/3); 3_3 p2 unchanged.
+      lowdim_split: sbwr
+      lowdim_prover_refine_width: 64
+      lowdim_parallel: true
+      lowdim_clip: true
+      lowdim_prover_share: 0.9
+      lowdim_prover: true
       reorder_bab: true
       # Multi-dimensional input split: split the top 2 SB dims per parent,
       # producing up to 2^2=4 children that exactly cover the parent (BaB

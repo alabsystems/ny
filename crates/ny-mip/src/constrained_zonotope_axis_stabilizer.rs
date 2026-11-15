@@ -634,7 +634,7 @@ mod tests {
         .unwrap();
         assert_eq!(result.status, BatchedAdamStatus::NoSearchNeeded);
         assert_eq!(result.axis_plan.direction_elements, 0);
-        assert!(result.axes.is_empty());
+        assert_eq!(result.axes, [] as [CertifiedAxisProposal; 0]);
         assert_eq!(result.engine_calls, 0);
     }
 

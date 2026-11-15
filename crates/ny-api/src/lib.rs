@@ -32,13 +32,13 @@
 pub use crate::annotation::{AnnotatedSpec, AnnotationConstraint, SpecBuilder};
 /// Stable device-to-host materialization boundary for verification inputs.
 pub use crate::materialize::VerificationBoundsSource;
-/// NaN-propagating min/max for sound bound computation (#3119).
+/// NaN-propagating min/max for sound bound computation.
 pub use ny_core::{nan_propagating_max, nan_propagating_min};
 /// Core error and result types from ny-core.
 pub use ny_core::{
     Bound, MethodUsed, NyError, Result, UnknownReason, VerificationResult, VerificationSpec,
 };
-/// Soundness provenance types for tracking heuristic usage (#3119).
+/// Soundness provenance types for tracking heuristic usage.
 pub use ny_core::{HeuristicUsed, SoundnessProvenance, VerificationSoundnessMode};
 /// Bounded tensor types from ny-tensor for specifying input regions.
 /// `BoundedTensor64` is the double-precision carrier consumed by the f64
@@ -50,6 +50,9 @@ pub mod annotation;
 /// Curated inter-model composition surface (requires `propagate` feature).
 #[cfg(feature = "propagate")]
 pub mod composition;
+/// Complete-vocabulary affine-head certificates (requires `propagate`).
+#[cfg(feature = "propagate")]
+pub mod decoder;
 /// Device/lazy bounds materialization helpers for external integrations.
 pub mod materialize;
 

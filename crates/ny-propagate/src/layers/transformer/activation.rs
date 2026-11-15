@@ -53,7 +53,7 @@ mod tests {
         assert!(matches!(err, NyError::NumericalInstability(_)));
     }
 
-    /// Regression test for #2262: the old code used an approximate critical point
+    /// Regression test: the old code used an approximate critical point
     /// of -0.75 instead of the precise ~-0.7517. For intervals in the narrow
     /// window [-0.76, -0.75], the old code treated GELU as monotonically
     /// decreasing and returned (gelu(-0.75), gelu(-0.76)), but the true minimum

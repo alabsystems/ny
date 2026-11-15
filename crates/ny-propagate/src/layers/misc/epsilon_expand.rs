@@ -5,11 +5,11 @@
 //! Certified additive widening: y = x + e with e in [-epsilon, +epsilon].
 //!
 //! The Minkowski-sum enclosure of a per-element perturbation budget. Unlike
-//! `QdqPerturbationLayer` — whose constructor fails closed because the typed
-//! FLOAT32 QDQ rounding program has no certificate — this layer carries no
-//! quantization story at all: the additive widening IS the declared op
-//! semantics, so the interval image below is the exact set image and every
-//! propagation path is an enclosure by construction.
+//! `QdqPerturbationLayer` — whose envelope certifies the typed FLOAT32 QDQ
+//! rounding program (division, ties-to-even, saturation, reconstruction) —
+//! this layer carries no quantization story at all: the additive widening IS
+//! the declared op semantics, so the interval image below is the exact set
+//! image and every propagation path is an enclosure by construction.
 //!
 //! Downstream consumers (nn) use it for index-agnostic Embedding relaxations:
 //! a midpoint row plus a per-dimension epsilon budget covering every row the

@@ -7,7 +7,7 @@
 //! Select one measurement, for example:
 //!
 //! ```text
-//! cargo run --release -p ny-accelerate --example audit_speedup -- isolated
+//! targo --unverified run --release -p ny-accelerate --example audit_speedup -- isolated
 //! ```
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

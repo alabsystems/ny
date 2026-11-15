@@ -32,10 +32,10 @@ impl DecoderModel {
     ///
     /// Iterates through all layers and evaluates constant-producing ops
     /// (ConstantOfShape, Add with all-constant inputs, etc.) so their values can
-    /// be embedded into ConcatLayer via `convert_concat_with_evaluated` (#3317).
+    /// be embedded into ConcatLayer via `convert_concat_with_evaluated`.
     ///
     /// This mirrors `WhisperModel::evaluate_block_constants` from the whisper
-    /// pipeline (#696), adapted for decoder subgraph extraction.
+    /// pipeline, adapted for decoder subgraph extraction.
     pub(super) fn evaluate_model_constants(&self) -> HashMap<String, ArrayD<f32>> {
         let mut evaluated: HashMap<String, ArrayD<f32>> = HashMap::new();
         let context = self.model.convert_context();
@@ -165,7 +165,7 @@ impl DecoderModel {
                 .map(|l| l.name.clone()),
         );
 
-        // Pre-evaluate constant chains (#3317).
+        // Pre-evaluate constant chains.
         let evaluated_constants = self.evaluate_model_constants();
 
         for spec in &self.model.network.layers {
@@ -184,7 +184,7 @@ impl DecoderModel {
             if let Some(output_name) = spec.outputs.first() {
                 tensor_to_node.insert(output_name.clone(), spec.name.clone());
             }
-            // Insert shape transform nodes after Q/K/V projections (#2686)
+            // Insert shape transform nodes after Q/K/V projections
             if spec.name == *q_src || spec.name == *k_src || spec.name == *v_src {
                 Self::add_qkv_shape_transform(
                     &mut graph,
@@ -255,7 +255,7 @@ impl DecoderModel {
     /// - Otherwise: use "_input" (external input)
     ///
     /// Evaluated constants are filtered because their values are embedded
-    /// directly into ConcatLayer via `convert_concat_with_evaluated` (#3317).
+    /// directly into ConcatLayer via `convert_concat_with_evaluated`.
     pub(super) fn find_input_nodes_decoder(
         &self,
         spec: &LayerSpec,
@@ -278,7 +278,7 @@ impl DecoderModel {
                 if self.model.weights.contains_key(name) {
                     return false;
                 }
-                // Skip evaluated constants — values embedded in ConcatLayer (#3317).
+                // Skip evaluated constants — values embedded in ConcatLayer.
                 if evaluated_constants.contains_key(*name) {
                     return false;
                 }
@@ -322,7 +322,7 @@ impl DecoderModel {
         input_nodes
     }
 
-    /// Convert a layer, using `convert_concat_with_evaluated` for Concat (#3317).
+    /// Convert a layer, using `convert_concat_with_evaluated` for Concat.
     pub(super) fn convert_layer_with_constants(
         &self,
         spec: &LayerSpec,

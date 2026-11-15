@@ -330,7 +330,7 @@ fn test_bias_correction() {
     assert!(value_with_correction > 0.0, "Update should be positive");
 }
 
-/// Regression test for #2575/#2586: BetaState Adam must not produce NaN/Inf
+/// Regression test: BetaState Adam must not produce NaN/Inf
 /// when beta1=1.0 (disables momentum — valid config).
 #[ntest::timeout(10000)]
 #[test]
@@ -365,7 +365,7 @@ fn test_beta_state_adam_beta1_one_no_div_by_zero_2575() {
     );
 }
 
-/// Regression test for #2575/#2586: BetaState Adam must not produce NaN/Inf
+/// Regression test: BetaState Adam must not produce NaN/Inf
 /// when beta2=1.0.
 #[ntest::timeout(10000)]
 #[test]
@@ -400,8 +400,8 @@ fn test_beta_state_adam_beta2_one_no_div_by_zero_2575() {
     );
 }
 
-/// Test for #3112: NaN gradients are filtered at accumulate_grad gate.
-/// Previously (#2596), NaN entered the optimizer and was cleaned up post-step.
+/// NaN gradients are filtered at the accumulate_grad gate.
+/// Previously, NaN entered the optimizer and was cleaned up post-step.
 /// Now, accumulate_grad skips NaN entirely — optimizer state is never corrupted.
 #[ntest::timeout(10000)]
 #[test]
@@ -425,7 +425,7 @@ fn test_beta_state_adam_nan_gradient_filtered_at_gate_3112() {
         "beta should be positive after normal step"
     );
 
-    // Second: inject NaN gradient — filtered at the gate by #3112.
+    // Second: inject NaN gradient — filtered at the gate.
     beta_state.zero_grad();
     beta_state.accumulate_grad(1, 0, f32::NAN);
     assert_eq!(

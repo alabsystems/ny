@@ -269,10 +269,10 @@ fn test_alpha_state_empty_layers() {
     let state = AlphaState::from_preactivation_bounds(&bounds, &relu_indices).unwrap();
 
     assert_eq!(state.num_unstable(), 0);
-    assert!(state.alphas.is_empty());
+    assert_eq!((state.alphas).len(), 0);
 }
 
-/// Regression test for #1937: gradient-length mismatch must not panic.
+/// Regression test: gradient-length mismatch must not panic.
 ///
 /// When AnalyticChain falls back to a zero gradient with wrong length,
 /// the update methods must skip the update instead of indexing out-of-bounds.
@@ -289,7 +289,7 @@ fn test_alpha_state_update_gradient_length_mismatch_no_panic_1937() {
     assert_eq!(state.alphas[0].len(), 3);
     let alpha_before = state.alphas[0].clone();
 
-    // Gradient with wrong length (1 vs 3) — this is the bug scenario from #1937.
+    // Gradient with wrong length (1 vs 3) — the original bug scenario.
     let wrong_gradient = array![0.5_f32];
     state.update(0, &wrong_gradient, 0.1, 0.0);
 
@@ -297,7 +297,7 @@ fn test_alpha_state_update_gradient_length_mismatch_no_panic_1937() {
     assert_eq!(state.alphas[0], alpha_before);
 }
 
-/// Regression test for #1937: Adam update with wrong gradient length.
+/// Regression test: Adam update with wrong gradient length.
 #[ntest::timeout(10000)]
 #[test]
 fn test_alpha_state_update_adam_gradient_length_mismatch_no_panic_1937() {
@@ -317,7 +317,7 @@ fn test_alpha_state_update_adam_gradient_length_mismatch_no_panic_1937() {
     assert_eq!(state.alphas[0], alpha_before);
 }
 
-/// Regression test for #2025: NaN gradient must not permanently corrupt alpha/m/v state.
+/// Regression test: NaN gradient must not permanently corrupt alpha/m/v state.
 #[ntest::timeout(10000)]
 #[test]
 fn test_alpha_state_update_adam_nan_gradient_sanitized_2025() {
@@ -376,7 +376,7 @@ fn test_alpha_state_update_adam_nan_gradient_sanitized_2025() {
     }
 }
 
-/// Regression test for #2025: NaN gradient in SGD update must not corrupt alpha/velocity state.
+/// Regression test: NaN gradient in SGD update must not corrupt alpha/velocity state.
 /// The Adam path was tested by test_alpha_state_update_adam_nan_gradient_sanitized_2025;
 /// this test covers the SGD path (AlphaState::update with momentum).
 #[ntest::timeout(10000)]

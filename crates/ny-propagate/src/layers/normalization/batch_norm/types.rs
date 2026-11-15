@@ -4,6 +4,8 @@
 
 //! Type definitions and constructors for BatchNorm.
 
+use std::sync::Arc;
+
 use ndarray::ArrayD;
 use ny_core::dd::{next_down_f64, next_up_f64};
 use ny_core::{
@@ -99,6 +101,72 @@ fn interval_radius_f32(center: f32, interval: RealInterval) -> Option<f32> {
     (radius.is_finite() && radius >= 0.0).then_some(radius)
 }
 
+/// A binary64 centre and a certified binary64 radius for a finite binary64
+/// interval: every real of `[lo, hi]` lies within `radius` of `centre`.
+///
+/// SOUND. The centre is any finite binary64 value (the rounded midpoint; for
+/// subnormal endpoints the halving may round, which only moves the centre).
+/// Each gap `centre - lo`, `hi - centre` is computed in round-to-nearest, so
+/// the computed gap is within half an ulp of the exact one; two outward ulp
+/// steps (`up2`) then dominate the exact gap (a subnormal difference is exact
+/// under gradual underflow, which [`BatchNormLayer::new`] requires of the
+/// environment). A non-finite or inverted interval yields `None`.
+fn centre_radius(lo: f64, hi: f64) -> Option<(f64, f64)> {
+    if !lo.is_finite() || !hi.is_finite() || lo > hi {
+        return None;
+    }
+    let centre = 0.5 * lo + 0.5 * hi;
+    let radius = up2((centre - lo).abs().max((hi - centre).abs()));
+    (centre.is_finite() && radius.is_finite() && radius >= 0.0).then_some((centre, radius))
+}
+
+/// The EXACT-REAL BatchNorm affine of the authored binary32 statistics,
+/// enclosed per channel by the outward-rounded binary64 intervals that
+/// [`BatchNormLayer::new`] computes to certify `scale_err` / `bias_err` — kept
+/// instead of discarded (#zono-exact-bn).
+///
+/// The binary32 `scale` / `bias` carry a certified radius of about one binary32
+/// ulp (~`6e-8` relative) to the exact-real coefficients; these intervals are
+/// a few binary64 ulps wide (~`1e-15` relative). Only the certified zonotope
+/// core (`zono_core`) consumes them, through
+/// `BatchNormLayer::exact_affine_channels`; every other consumer keeps the
+/// binary32 affine and its radii, bit-identically.
+///
+/// The fields are private and there is no public constructor, so an enclosure
+/// can only come from [`BatchNormLayer::new`]. It records the binary32
+/// `(scale, bias, scale_err, bias_err)` bit patterns it was built beside; a
+/// layer whose public binary32 fields no longer match them (a struct literal
+/// or a mutation after construction) is read as having NO exact enclosure, so
+/// its consumers fall back to the binary32 affine (fail closed).
+#[derive(Clone, PartialEq)]
+pub struct BatchNormExactAffine {
+    scale_lo: Vec<f64>,
+    scale_hi: Vec<f64>,
+    bias_lo: Vec<f64>,
+    bias_hi: Vec<f64>,
+    stored_bits: Vec<[u32; 4]>,
+}
+
+impl std::fmt::Debug for BatchNormExactAffine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BatchNormExactAffine")
+            .field("channels", &self.scale_lo.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Per-channel binary64 centres and certified radii of the exact-real
+/// BatchNorm affine: `|scale_real[c] - scale[c]| <= scale_err[c]` and
+/// `|bias_real[c] - bias[c]| <= bias_err[c]`, every entry finite and every
+/// radius non-negative (see `BatchNormLayer::exact_affine_channels`).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BatchNormExactChannels {
+    pub(crate) scale: Vec<f64>,
+    pub(crate) bias: Vec<f64>,
+    pub(crate) scale_err: Vec<f64>,
+    pub(crate) bias_err: Vec<f64>,
+}
+
 /// Authenticated interpretation of BatchNorm's channel dimension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchNormChannelAxisHint {
@@ -165,6 +233,14 @@ pub struct BatchNormLayer {
     /// shapes such as `[C,L]` with `C == L`, where dimensions alone cannot
     /// distinguish channels from a manually batched `[N,C]` tensor.
     pub channel_axis_hint: Option<BatchNormChannelAxisHint>,
+    /// Binary64 enclosure of the EXACT-REAL coefficients behind `scale` /
+    /// `bias` (#zono-exact-bn), set only by [`Self::new`]; `None` for
+    /// [`Self::from_scale_bias`] (whose binary32 coefficients ARE exact) and
+    /// for struct literals. Read ONLY by the certified zonotope core, through
+    /// `Self::exact_affine_channels`, which ignores it unless it still
+    /// matches this layer's binary32 fields bit for bit. Every other consumer
+    /// ignores it, so its presence changes no other lane's arithmetic.
+    pub exact_affine: Option<Arc<BatchNormExactAffine>>,
 }
 
 impl BatchNormLayer {
@@ -276,6 +352,11 @@ impl BatchNormLayer {
         let mut bias_values = Vec::with_capacity(ny.len());
         let mut scale_error_values = Vec::with_capacity(ny.len());
         let mut bias_error_values = Vec::with_capacity(ny.len());
+        let mut exact_scale_lo = Vec::with_capacity(ny.len());
+        let mut exact_scale_hi = Vec::with_capacity(ny.len());
+        let mut exact_bias_lo = Vec::with_capacity(ny.len());
+        let mut exact_bias_hi = Vec::with_capacity(ny.len());
+        let mut exact_stored_bits = Vec::with_capacity(ny.len());
 
         for (((&gamma, &beta_value), &mean_value), &variance) in
             ny.iter().zip(beta.iter()).zip(mean.iter()).zip(var.iter())
@@ -350,6 +431,19 @@ impl BatchNormLayer {
             bias_values.push(bias_f32);
             scale_error_values.push(scale_error);
             bias_error_values.push(bias_error);
+            // Keep the exact-real enclosures the radii above were derived
+            // from (#zono-exact-bn), tagged with the binary32 values they sit
+            // beside so a later drift of the public fields is detectable.
+            exact_scale_lo.push(scale_interval.lo);
+            exact_scale_hi.push(scale_interval.hi);
+            exact_bias_lo.push(bias_interval.lo);
+            exact_bias_hi.push(bias_interval.hi);
+            exact_stored_bits.push([
+                scale_f32.to_bits(),
+                bias_f32.to_bits(),
+                scale_error.to_bits(),
+                bias_error.to_bits(),
+            ]);
         }
 
         let build_array = |values: Vec<f32>, label: &str| {
@@ -364,6 +458,13 @@ impl BatchNormLayer {
         let scale_err = build_array(scale_error_values, "scale error")?;
         let bias_err = build_array(bias_error_values, "bias error")?;
         let num_channels = scale.len();
+        let exact_affine = Some(Arc::new(BatchNormExactAffine {
+            scale_lo: exact_scale_lo,
+            scale_hi: exact_scale_hi,
+            bias_lo: exact_bias_lo,
+            bias_hi: exact_bias_hi,
+            stored_bits: exact_stored_bits,
+        }));
 
         Ok(Self {
             scale,
@@ -372,7 +473,70 @@ impl BatchNormLayer {
             bias_err,
             num_channels,
             channel_axis_hint: None,
+            exact_affine,
         })
+    }
+
+    /// Per-channel binary64 centres and certified radii of the EXACT-REAL
+    /// affine (#zono-exact-bn): the enclosure [`Self::new`] computed, as
+    /// `(centre, radius)` pairs via `centre_radius`. For the certified
+    /// zonotope core only; every other consumer keeps the binary32 affine.
+    ///
+    /// `None` — and the caller must then use the binary32 affine with its
+    /// `scale_err` / `bias_err` radii — when the layer carries no exact
+    /// enclosure, when its public affine fields fail
+    /// [`Self::validate_affine_parameters`], or when ANY channel's binary32
+    /// `(scale, bias, scale_err, bias_err)` differs bit-wise from the values
+    /// the enclosure was built beside (the fields are public; an enclosure of
+    /// the authored statistics says nothing about coefficients edited after
+    /// construction).
+    pub(crate) fn exact_affine_channels(&self) -> Option<BatchNormExactChannels> {
+        let exact = self.exact_affine.as_deref()?;
+        self.validate_affine_parameters().ok()?;
+        let n = self.num_channels;
+        if [
+            exact.scale_lo.len(),
+            exact.scale_hi.len(),
+            exact.bias_lo.len(),
+            exact.bias_hi.len(),
+            exact.stored_bits.len(),
+        ]
+        .iter()
+        .any(|&len| len != n)
+        {
+            return None;
+        }
+        let mut channels = BatchNormExactChannels {
+            scale: Vec::with_capacity(n),
+            bias: Vec::with_capacity(n),
+            scale_err: Vec::with_capacity(n),
+            bias_err: Vec::with_capacity(n),
+        };
+        for (c, (((&scale, &bias), &scale_err), &bias_err)) in self
+            .scale
+            .iter()
+            .zip(self.bias.iter())
+            .zip(self.scale_err.iter())
+            .zip(self.bias_err.iter())
+            .enumerate()
+        {
+            let current = [
+                scale.to_bits(),
+                bias.to_bits(),
+                scale_err.to_bits(),
+                bias_err.to_bits(),
+            ];
+            if current != exact.stored_bits[c] {
+                return None;
+            }
+            let (scale_centre, scale_radius) = centre_radius(exact.scale_lo[c], exact.scale_hi[c])?;
+            let (bias_centre, bias_radius) = centre_radius(exact.bias_lo[c], exact.bias_hi[c])?;
+            channels.scale.push(scale_centre);
+            channels.bias.push(bias_centre);
+            channels.scale_err.push(scale_radius);
+            channels.bias_err.push(bias_radius);
+        }
+        (channels.scale.len() == n).then_some(channels)
     }
 
     /// Create from pre-computed scale and bias.
@@ -418,6 +582,9 @@ impl BatchNormLayer {
             bias_err,
             num_channels,
             channel_axis_hint: None,
+            // The binary32 coefficients are the exact ones here; the zonotope
+            // core charges them with their (zero) radii as before.
+            exact_affine: None,
         })
     }
 

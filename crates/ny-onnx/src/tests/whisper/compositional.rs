@@ -245,7 +245,7 @@ fn test_unsupported_config_requests_fail_closed_without_bounds() {
 #[cfg(feature = "external-whisper")]
 #[test]
 fn test_attention_ibp_projection_lookup_3450() {
-    // Regression #3450: building the real Whisper-tiny attention subgraph must
+    // Regression: building the real Whisper-tiny attention subgraph must
     // locate its Q/K/V/out projection MatMuls. The historical
     // `attention_ibp_gpu` entry point no longer exists; the builder lookup is
     // exercised before this helper narrows the graph output to LayerNorm.

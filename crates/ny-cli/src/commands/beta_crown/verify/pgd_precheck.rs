@@ -4,7 +4,7 @@
 
 //! PGD precheck types and wrappers for the sequential MIP path.
 //!
-//! Part of #3865: PGD-to-MIP warm start.
+//! Part of the PGD-to-MIP warm start.
 
 use anyhow::Result;
 use ndarray::ArrayD;
@@ -47,6 +47,8 @@ pub(in crate::commands::beta_crown) fn try_pgd_before_mip(
     gemm_engine: Option<&dyn GemmEngine>,
     json: bool,
 ) -> Result<PgdMipPrecheck> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Attack);
     if vnnlib.output_constraint_clauses.len() > 1 {
         return Ok(PgdMipPrecheck::default());
     }

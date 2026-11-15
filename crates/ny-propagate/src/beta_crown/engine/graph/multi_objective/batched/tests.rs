@@ -173,7 +173,7 @@ fn shared_single_objective_executor_caps_each_parent_at_max_depth() {
         let GraphDomainResult::Children(children) = result else {
             panic!("mixed-depth shared executor must produce children");
         };
-        assert!(!children.is_empty());
+        assert_ne!((children).len(), 0);
         assert!(children
             .iter()
             .all(|(child, _)| child.depth <= verifier.config.max_depth));
@@ -1750,8 +1750,8 @@ mod kfsb_multi_tests {
         assert_eq!(prep.candidates.len(), 1);
         assert_eq!(prep.sides.len(), 1);
         assert!(prep.depth_two_lookahead_candidates.is_none());
-        assert!(sims.is_empty());
-        assert!(owners.is_empty());
+        assert_eq!((sims).len(), 0);
+        assert_eq!((owners).len(), 0);
     }
 
     #[test]
@@ -3758,9 +3758,17 @@ mod kfsb_multi_tests {
             ] {
                 env.remove(name);
             }
+            // #general-defaults 2026-08-31 (26b9d74f7) flipped the engine default
+            // kfsb_reduce_op Min -> Max. The typed depth-two gate only admits a Min
+            // reducer (depth_two_lookahead_supported_at_round, beta_config.rs), so
+            // every config in this test pins Min explicitly: the test exercises the
+            // GATE, and inheriting the Max default would collapse each case into the
+            // same reducer decline instead of the branch it was written to cover.
+            // The Max decline itself stays covered below via NY_MO_KFSB_REDUCE=max.
             let verifier = BetaCrownVerifier::new(BetaCrownConfig {
                 branching_heuristic: BranchingHeuristic::Kfsb,
                 use_kfsb_multi_branching: false,
+                kfsb_reduce_op: KfsbReduceOp::Min,
                 depth_two_branch_lookahead: DepthTwoBranchLookaheadConfig {
                     mode: DepthTwoBranchLookaheadMode::Select,
                     ..Default::default()
@@ -3847,6 +3855,8 @@ mod kfsb_multi_tests {
                 branching_heuristic: BranchingHeuristic::Kfsb,
                 fsb_candidates: 2,
                 use_kfsb_multi_branching: false,
+                // Min, so Shadow mode is what keeps the lane off (not a Max decline).
+                kfsb_reduce_op: KfsbReduceOp::Min,
                 depth_two_branch_lookahead: DepthTwoBranchLookaheadConfig {
                     mode: DepthTwoBranchLookaheadMode::Shadow,
                     ..Default::default()
@@ -3861,6 +3871,7 @@ mod kfsb_multi_tests {
                 branching_heuristic: BranchingHeuristic::Kfsb,
                 fsb_candidates: 2,
                 use_kfsb_multi_branching: true,
+                kfsb_reduce_op: KfsbReduceOp::Min,
                 depth_two_branch_lookahead: DepthTwoBranchLookaheadConfig {
                     mode: DepthTwoBranchLookaheadMode::Shadow,
                     ..Default::default()
@@ -3875,6 +3886,8 @@ mod kfsb_multi_tests {
                 branching_heuristic: BranchingHeuristic::Kfsb,
                 fsb_candidates: 0,
                 use_kfsb_multi_branching: false,
+                // Min, so the zero candidate prefix is what declines (not the reducer).
+                kfsb_reduce_op: KfsbReduceOp::Min,
                 depth_two_branch_lookahead: DepthTwoBranchLookaheadConfig {
                     mode: DepthTwoBranchLookaheadMode::Select,
                     ..Default::default()
@@ -3887,6 +3900,8 @@ mod kfsb_multi_tests {
             );
             let invalid = BetaCrownVerifier::new(BetaCrownConfig {
                 branching_heuristic: BranchingHeuristic::Kfsb,
+                // Min, so validate() rejecting candidates=16 is what declines.
+                kfsb_reduce_op: KfsbReduceOp::Min,
                 depth_two_branch_lookahead: DepthTwoBranchLookaheadConfig {
                     mode: DepthTwoBranchLookaheadMode::Select,
                     candidates: 16,
@@ -4169,4 +4184,131 @@ fn test_kfsb_shim_carries_candidate_delta_pre_node_cone_delta() {
         "shim transfers the candidate's delta verbatim"
     );
     assert_eq!(shim.history().constraints.len(), 1);
+}
+
+/// #alpha-split-refresh at child birth reaches the dense-spec adapter: the
+/// `graph_bab_domain_shim` a depth>`beta_max_depth` child is scored through
+/// carries the CHILD's stored alpha state verbatim, so that state must
+/// already be delta-form (split_refresh=true, values neutralized to 0.5) —
+/// composing to the current-box heuristic instead of the ancestor-box
+/// absolute values the parent carried. Receipted law: stale inherited alpha
+/// measurably loses to the plain current-box heuristic (REGRESSION doc;
+/// cora_2024 img398 channel-A discrimination, 2026-08-30).
+#[test]
+fn test_shim_inherits_split_refreshed_child_alpha() {
+    let linear1 = LinearLayer::new(
+        arr2(&[[1.0_f32, -0.5], [0.25, 0.75]]),
+        Some(arr1(&[0.0_f32, 0.1])),
+    )
+    .expect("linear1");
+    let linear2 =
+        LinearLayer::new(arr2(&[[1.0_f32, -1.0]]), Some(arr1(&[0.0_f32]))).expect("linear2");
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input("linear1", Layer::Linear(linear1)));
+    graph.add_node(GraphNode::new(
+        "relu1",
+        Layer::ReLU(ReLULayer),
+        vec!["linear1".to_string()],
+    ));
+    graph.add_node(GraphNode::new(
+        "linear2",
+        Layer::Linear(linear2),
+        vec!["relu1".to_string()],
+    ));
+    graph.set_output("linear2");
+
+    let input = BoundedTensor::new(
+        arr1(&[-1.0_f32, -0.5]).into_dyn(),
+        arr1(&[1.0_f32, 0.75]).into_dyn(),
+    )
+    .expect("input box");
+    let node_bounds = graph.collect_node_bounds(&input).expect("node bounds");
+    let mut parent =
+        MultiObjectiveGraphBabDomain::root(node_bounds, vec![(0.0, 1.0)], &input, &[0.0], false)
+            .expect("root domain");
+    let parent_node_bounds: HashMap<String, Arc<BoundedTensor>> =
+        parent.node_bounds().to_shared_hash_map();
+    parent.set_alpha_state(
+        crate::beta_crown::state::GraphDomainAlphaState::from_graph_bounds(
+            &graph,
+            &parent_node_bounds,
+            parent.history(),
+            &input,
+        ),
+    );
+    // Ancestor-box "optimized" value that must NOT survive into the child
+    // store (both relu1 neurons are unstable on this box; split neuron 0,
+    // observe neuron 1).
+    parent
+        .alpha_state_mut()
+        .neuron_mut("relu1", 1)
+        .expect("relu1 neuron 1 should be unstable at the root")
+        .set_alpha(0.37);
+    assert!(
+        !parent.alpha_state().split_refresh(),
+        "the root keeps absolute stored alpha (no split constraints)"
+    );
+
+    let child = parent
+        .with_constraint(
+            &graph,
+            GraphNeuronConstraint {
+                node_name: "relu1".to_string(),
+                neuron_idx: 0,
+                is_active: true,
+                score: 1.0,
+            },
+            false,
+            &[0.0],
+        )
+        .expect("with_constraint")
+        .expect("feasible child");
+
+    assert!(
+        child.alpha_state().split_refresh(),
+        "split child stored alpha must be delta-form"
+    );
+    let stored = child
+        .alpha_state()
+        .neuron("relu1", 1)
+        .expect("unconstrained neuron keeps an optimizable entry")
+        .alpha();
+    assert!(
+        (stored - 0.5).abs() < 1e-6,
+        "child stored value must be the neutral delta 0.5, got {stored}"
+    );
+
+    // The dense-spec adapter consumes exactly `shim.alpha_state`.
+    let shim = super::batched_dense_specs::graph_bab_domain_shim(&child);
+    assert!(
+        shim.alpha_state.split_refresh(),
+        "shim must inherit the delta-form flag with the child state"
+    );
+    let shim_stored = shim
+        .alpha_state
+        .neuron("relu1", 1)
+        .expect("shim carries the child's optimizable entry")
+        .alpha();
+    assert!(
+        (shim_stored - 0.5).abs() < 1e-6,
+        "shim stored value must be the neutral delta 0.5, got {shim_stored}"
+    );
+
+    // Composed slope through the shim equals the CURRENT-box heuristic for
+    // relu1's pre-activation, independent of the parent's 0.37.
+    let pre = child
+        .node_bounds()
+        .get("linear1")
+        .expect("pre-activation bounds present")
+        .clone();
+    let composed = shim.alpha_state.build_alpha_array("relu1", &pre);
+    let pre_flat = pre.flatten();
+    let (l, u) = (pre_flat.lower()[[1]], pre_flat.upper()[[1]]);
+    assert!(l < 0.0 && u > 0.0, "neuron 1 must be unstable for the pin");
+    let heuristic = if u > -l { 1.0 } else { 0.0 };
+    assert!(
+        (composed[1] - heuristic).abs() < 1e-6,
+        "composed slope {} must equal the current-box heuristic {heuristic}",
+        composed[1]
+    );
 }

@@ -24,6 +24,17 @@
 //! exact (`lower_a == upper_a` up to floating-point roundoff), and the row that
 //! lands on the network input IS the exact gradient.
 //!
+//! The same collapse makes the live×live product (`MulBinary`) exact: over a
+//! degenerate box every McCormick facet has slopes `(y0, x0)`, the partials of
+//! `x·y`. Linear graph plumbing (`Sub`, `Concat`, `Slice`, static-index
+//! `Gather`, `Unsqueeze`, `Squeeze`, …) is exact at every point by
+//! construction. Smooth element-wise ops (`Sigmoid`, `Sin`, `Cos`,
+//! `PowConstant`) and the piecewise-constant `Floor` are the exception: their
+//! CROWN relaxations are exact only in the width→0 limit (and Sin/Cos degrade to
+//! a slope-0 constant relaxation across a normalisation boundary), so the
+//! backward loop applies their ANALYTIC point derivative instead
+//! (`ExactPointDerivative`, #ml4acopf-vjp).
+//!
 //! # Implementation
 //!
 //! This mirrors the reverse loop in [`super::propagation`]
@@ -511,14 +522,270 @@ fn layer_is_interval_enclosed(layer: &Layer) -> bool {
         || (ste_pool_window_enabled() && matches!(layer, Layer::MaxPool2d(_)))
 }
 
+/// Is `layer` inside the exact point-VJP fragment, i.e. does
+/// [`GraphNetwork::attack_point_gradient`] have an arm that yields the EXACT
+/// point-Jacobian through it (or, for `Sign`/`Softmax` only, a documented
+/// attack surrogate)?
+///
+/// The per-node half of [`GraphNetwork::supports_attack_point_gradient`]; a net
+/// is admitted iff every node answers `true`. The list only GROWS: every arm
+/// that predates #ml4acopf-vjp is unchanged, so a net that was inside the
+/// fragment is byte-identical.
+fn layer_in_point_vjp_fragment(layer: &Layer) -> bool {
+    // Global-3d AveragePool is IBP-only: its CROWN backward
+    // refuses, so the exact-VJP fragment must exclude it here —
+    // the caller then gets `Ok(None)` and falls back to its
+    // slower gradient instead of erroring mid-attack.
+    if let Layer::AveragePool(pool) = layer {
+        return !pool.global_3d;
+    }
+    // #ml4acopf-vjp: Gather is an exact scatter-transpose ONLY with STATIC
+    // indices in the standard (data) mode — `GatherLayer::propagate_linear`
+    // scatter-adds each output column back onto the input column it read
+    // (duplicate indices sum, which is the exact fan-in rule). Dynamic indices
+    // make its backward a conservative union, not a Jacobian, and the
+    // runtime-last-axis shape query is not a data op at all, so both stay out.
+    if let Layer::Gather(gather) = layer {
+        return gather.constant_indices().is_some() && !gather.is_runtime_last_axis_len();
+    }
+    matches!(
+        layer,
+        Layer::Conv2d(_)
+            | Layer::Linear(_)
+            | Layer::ReLU(_)
+            | Layer::Add(_)
+            // MaxPool2d: EXACT at a point. The degenerate box [x, x]
+            // makes every pooling window have a definite winner (the
+            // argmax input, l == u), so dispatch_backward_layer's
+            // generic unary arm routes propagate_crown_backward →
+            // MaxPool2dLayer::propagate_linear_with_bounds, which
+            // routes the gradient through that winner (exact
+            // route-to-max — see max.rs "If one input definitely
+            // dominates … route gradient through it"). Needed for the
+            // deeper traffic_signs BNNs (net-2/net-3) which stack
+            // MaxPool + BatchNorm between the Sign conv blocks.
+            | Layer::MaxPool2d(_)
+            | Layer::Flatten(_)
+            | Layer::Reshape(_)
+            // Shape/linear plumbing exact at a point: Transpose is a
+            // pure permutation and MatMul(live, const-weight) is affine
+            // (the dense head of the traffic_signs BNNs).
+            // dispatch_backward_layer routes both through the exact
+            // linear transpose.
+            | Layer::Transpose(_)
+            | Layer::MatMul(_)
+            // GAN/deconv fragment (cgan): ConvTranspose + BatchNorm.
+            // dispatch_backward_layer handles all three; attack-only.
+            | Layer::ConvTranspose1d(_)
+            | Layer::ConvTranspose2d(_)
+            | Layer::BatchNorm(_)
+            // Affine constant arithmetic (cora_2024 MLP fragment:
+            // unfused Gemm = MatMul + AddConstant bias, and the
+            // mnist Div-by-constant normalization; d/dx (x/c) = 1/c).
+            // All exact at a point — dispatch_backward_layer routes
+            // them through the plain unary CROWN backward, which is
+            // the exact affine transpose for these layers.
+            | Layer::AddConstant(_)
+            | Layer::SubConstant(_)
+            | Layer::MulConstant(_)
+            | Layer::DivConstant(_)
+            // Sign / binarized nets (traffic_signs_recognition BNNs)
+            // and the trailing Softmax classifier head.
+            // ATTACK-ONLY, NON-EXACT: unlike every other layer above
+            // (each exact at a point), Sign's true point-Jacobian is
+            // 0 a.e. and Softmax's certified relaxation carries a
+            // vanishing gradient. The backward loop special-cases BOTH
+            // — Sign with a soft-sign surrogate slope, Softmax as a
+            // monotone identity pass-through (the logit-margin
+            // direction, matching the external bnn_falsifier prototype)
+            // — so PGD can descend. Each direction is a heuristic, never
+            // a certified bound: every candidate it yields is still
+            // concretely re-checked by the unchanged trusted-oracle
+            // gate. See the Sign / Softmax arms in attack_point_gradient.
+            | Layer::Sign(_)
+            | Layer::Softmax(_)
+    ) || layer_is_ml4acopf_vjp_addition(layer)
+}
+
+/// #ml4acopf-vjp — the layers admitted into the exact point-VJP fragment for
+/// the ml4acopf_2024 power-flow nets. Every one is EXACT at a point; none is a
+/// surrogate. `Gather` is listed here but only admitted by
+/// [`layer_in_point_vjp_fragment`] with static indices.
+///
+/// Also the scoping predicate of
+/// [`GraphNetwork::attack_point_gradient_input_shape`]: no net that could reach
+/// the attack lanes before these were admitted contains any of them.
+fn layer_is_ml4acopf_vjp_addition(layer: &Layer) -> bool {
+    matches!(
+        layer,
+        // Exact LINEAR graph plumbing, routed by dispatch_backward_layer
+        // through the op's own column transpose, identical to the
+        // certified path: live−live `Sub` (Binary split, B negated),
+        // N-ary `Concat` (embedded constants fold into the bias
+        // channel, which the extracted gradient row never reads),
+        // `Slice` (zero-pad back to the input shape), static-index
+        // `Gather` (scatter-add back onto the read columns), and the pure
+        // reshapes `Unsqueeze` / `Squeeze` (identity on the flat
+        // buffer; `Squeeze(-1)` is what the builder inserts after a
+        // MatMul with a 1-D constant weight, e.g. the ml4acopf
+        // `Relu @ delta_m` piecewise-linear activation heads).
+        Layer::Sub(_)
+            | Layer::Concat(_)
+            | Layer::Slice(_)
+            | Layer::Gather(_)
+            | Layer::Unsqueeze(_)
+            | Layer::Squeeze(_)
+            // Live×live element-wise product (the bilinear power-flow
+            // terms, including the square `Mul(v, v)`). At a point every
+            // input interval is degenerate up to the certified forward's
+            // ULP widening, so EVERY McCormick facet has slopes
+            // (y0, x0) — the exact partials of x·y — and the two
+            // routed rows sum on a shared input (`Mul(v, v)` → 2v).
+            | Layer::MulBinary(_)
+            // Smooth / piecewise-constant element-wise ops: NOT routed
+            // through their CROWN relaxation (Sin/Cos fall back to a
+            // slope-0 constant relaxation whenever the pre-activation box
+            // straddles a normalisation boundary, e.g. z ≈ 2πk, and a
+            // chord is only exact in the width→0 limit). The backward loop
+            // instead applies the ANALYTIC derivative at the point — see
+            // `ExactPointDerivative`.
+            | Layer::Sigmoid(_)
+            | Layer::Sin(_)
+            | Layer::Cos(_)
+            | Layer::PowConstant(_)
+            | Layer::Floor(_)
+    )
+}
+
+/// Which layer set the exact point-VJP walk admits (#lsnc-attack-twin).
+///
+/// Every historical caller reaches [`PointVjpFragment::Standard`] through the
+/// unsuffixed methods ([`GraphNetwork::attack_point_gradient`],
+/// [`GraphNetwork::supports_attack_point_gradient`],
+/// [`GraphNetwork::first_attack_point_gradient_refusal`]) and is
+/// byte-identical. The wider set is reachable ONLY through the explicitly named
+/// `*_with_exact_reductions` methods, whose one production caller is the
+/// point-folded ATTACK twin (`ny_onnx::attack_twin::PointFoldedAttackTwin`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PointVjpFragment {
+    /// [`layer_in_point_vjp_fragment`], unchanged.
+    Standard,
+    /// [`Self::Standard`] plus the EXACT linear reduction `ReduceSum`.
+    WithExactReductions,
+}
+
+/// [`layer_in_point_vjp_fragment`], optionally widened by the exact linear
+/// reductions (#lsnc-attack-twin).
+///
+/// `ReduceSum` is a fixed 0/1 linear map. Its CROWN backward (`reduce_backward`
+/// with scale 1, reached through `dispatch_backward_layer`'s generic unary arm
+/// with the node's own pre-activation for the shape) broadcasts each output
+/// column back onto every input position it summed — the EXACT transpose, at
+/// every point, with no surrogate and no width→0 limit. It stays OUT of the
+/// standard fragment only so that admitting it changes nothing for a net whose
+/// attack lanes are decided today: widening the standard gate would hand the
+/// gradient lanes (and their wall-clock) to every net whose only refusal is a
+/// `ReduceSum`, a scheduling change nobody has measured. The Lyapunov nets
+/// (`lsnc_relu`, `V = sum(x ⊙ (x P))`) are the motivating case.
+///
+/// ATTACK-ONLY: this admits a node into a point-GRADIENT walk. No bound path
+/// consults it.
+fn layer_in_point_vjp_fragment_for(layer: &Layer, fragment: PointVjpFragment) -> bool {
+    layer_in_point_vjp_fragment(layer)
+        || (fragment == PointVjpFragment::WithExactReductions
+            && matches!(layer, Layer::ReduceSum(_)))
+}
+
+/// ATTACK-ONLY (#ml4acopf-vjp): the analytic point derivative of an
+/// element-wise layer whose CROWN relaxation is not exact at a point.
+///
+/// [`GraphNetwork::attack_point_gradient`] scales the incoming cotangent's
+/// column `j` by `slope(z_j)`, where `z_j` is the centre of the certified
+/// forward's (ULP-wide) pre-activation box — exactly the diagonal Jacobian of
+/// the layer at the point. Every slope is evaluated in f64 and a non-finite
+/// value (e.g. `x^p` with `p < 1` at `x = 0`, or a non-integer power of a
+/// negative base, where the forward itself is undefined) degrades to `0`, so a
+/// single bad unit can never poison the whole gradient with NaN.
+///
+/// ATTACK DIRECTION ONLY: a slope here steers PGD; acceptance is always the
+/// unchanged trusted-ORT + true-f64 gate, so no value can make ny unsound.
+#[derive(Clone, Copy, Debug)]
+enum ExactPointDerivative {
+    /// `σ'(z) = σ(z)·(1 − σ(z))`.
+    Sigmoid,
+    /// `d sin(z) = cos(z)`.
+    Sin,
+    /// `d cos(z) = −sin(z)`.
+    Cos,
+    /// `d z^p = p·z^(p−1)` for the layer's constant exponent `p`.
+    Pow(f32),
+    /// `Floor` is piecewise constant: its derivative is EXACTLY `0` almost
+    /// everywhere. This is deliberately NOT a straight-through identity: the
+    /// ml4acopf-linear-residual nets use Floor only for periodic range
+    /// reduction, `r = z − p·floor((z + c)/p)`, whose true derivative is `1`
+    /// through the `z` path. A straight-through Floor would add `−p·(1/p) = −1`
+    /// and cancel it to a dead `0`; the exact `0` keeps the `+1`.
+    Zero,
+}
+
+impl ExactPointDerivative {
+    fn of(layer: &Layer) -> Option<Self> {
+        match layer {
+            Layer::Sigmoid(_) => Some(Self::Sigmoid),
+            Layer::Sin(_) => Some(Self::Sin),
+            Layer::Cos(_) => Some(Self::Cos),
+            Layer::PowConstant(pow) => Some(Self::Pow(pow.exponent())),
+            Layer::Floor(_) => Some(Self::Zero),
+            _ => None,
+        }
+    }
+
+    fn slope(self, z: f64) -> f32 {
+        let d = match self {
+            Self::Sigmoid => {
+                let s = 1.0 / (1.0 + (-z).exp());
+                s * (1.0 - s)
+            }
+            Self::Sin => z.cos(),
+            Self::Cos => -z.sin(),
+            Self::Pow(p) => pow_constant_point_derivative(f64::from(p), z),
+            Self::Zero => 0.0,
+        };
+        if d.is_finite() {
+            d as f32
+        } else {
+            0.0
+        }
+    }
+}
+
+/// `d/dz z^p` at a point, mirroring [`crate::layers::PowConstantLayer`]'s own
+/// integer-exponent classification (`|p − round(p)| < 1e-6`): an integer
+/// exponent is defined for every real base (`powi`), a non-integer one only for
+/// a positive base. Anything undefined returns a non-finite value, which
+/// [`ExactPointDerivative::slope`] maps to `0`.
+fn pow_constant_point_derivative(p: f64, z: f64) -> f64 {
+    let rounded = p.round();
+    if (p - rounded).abs() < 1e-6 && rounded.abs() < f64::from(i32::MAX) {
+        // `rounded` is integral and in range, so the cast is exact.
+        rounded * z.powi(rounded as i32 - 1)
+    } else if z > 0.0 {
+        p * z.powf(p - 1.0)
+    } else {
+        f64::NAN
+    }
+}
+
 impl GraphNetwork {
     /// Whitelist gate: the point back-prop only runs when EVERY node is in the
-    /// exact-gradient fragment `{Conv2d, Linear, ReLU, Add, AveragePool, Flatten,
-    /// Reshape}` plus the affine constant-arithmetic ops below. Mirrors
-    /// `layer_supports_exact_gradient` in `ny-cli graph_pgd_exact.rs`. Any other
+    /// exact-gradient fragment ([`layer_in_point_vjp_fragment`]). Any other
     /// layer → the caller gets `Ok(None)` and falls back to its slower gradient
-    /// (certified CROWN / SPSA).
-    /// Public, ZERO-COST view of the [`Self::point_vjp_supported_fragment`] gate
+    /// (certified CROWN / SPSA). NOTE: `layer_supports_exact_gradient` in
+    /// `ny-cli graph_pgd_exact.rs` is a DIFFERENT, deliberately narrower list (it
+    /// also gates that module's certified-CROWN fallback and its tightness
+    /// guards); this fragment has grown past it since MaxPool2d / Sign.
+    ///
+    /// Public, ZERO-COST view of the [`Self::point_vjp_supported_fragment_in`] gate
     /// below (#deadlane): `false` means [`Self::attack_point_gradient`] will
     /// return `Ok(None)` for EVERY point on this net, no matter the budget.
     ///
@@ -530,7 +797,89 @@ impl GraphNetwork {
     /// on vit_2023: 87.8 s granted, ~0.05 s used, "exact gradient unavailable for
     /// this net", then `unknown`).
     pub fn supports_attack_point_gradient(&self) -> bool {
-        !self.nodes.is_empty() && self.point_vjp_supported_fragment()
+        self.supports_attack_point_gradient_in(PointVjpFragment::Standard)
+    }
+
+    /// [`Self::supports_attack_point_gradient`] over the standard fragment
+    /// widened by the exact linear reductions ([`layer_in_point_vjp_fragment_for`]).
+    ///
+    /// #lsnc-attack-twin: the admission question the point-folded ATTACK twin
+    /// asks of its own graph. Purely static, like the standard gate.
+    pub fn supports_attack_point_gradient_with_exact_reductions(&self) -> bool {
+        self.supports_attack_point_gradient_in(PointVjpFragment::WithExactReductions)
+    }
+
+    fn supports_attack_point_gradient_in(&self, fragment: PointVjpFragment) -> bool {
+        !self.nodes.is_empty() && self.point_vjp_supported_fragment_in(fragment)
+    }
+
+    /// The FIRST node (in insertion order) that keeps this net outside the
+    /// exact point-VJP fragment, as `(node name, layer type)`; `None` when every
+    /// node is admitted.
+    ///
+    /// Diagnostic companion of [`Self::supports_attack_point_gradient`]: a bare
+    /// `false` says the attack lanes are dead but not WHICH op killed them, and
+    /// the next person then has to re-derive the op census by hand. Purely
+    /// static; never consulted for a bound or an admission decision.
+    pub fn first_attack_point_gradient_refusal(&self) -> Option<(String, &'static str)> {
+        self.first_attack_point_gradient_refusal_in(PointVjpFragment::Standard)
+    }
+
+    /// [`Self::first_attack_point_gradient_refusal`] for the fragment widened by
+    /// the exact linear reductions (#lsnc-attack-twin). Diagnostic only.
+    pub fn first_attack_point_gradient_refusal_with_exact_reductions(
+        &self,
+    ) -> Option<(String, &'static str)> {
+        self.first_attack_point_gradient_refusal_in(PointVjpFragment::WithExactReductions)
+    }
+
+    fn first_attack_point_gradient_refusal_in(
+        &self,
+        fragment: PointVjpFragment,
+    ) -> Option<(String, &'static str)> {
+        self.node_names()
+            .iter()
+            .find_map(|name| match self.node(name) {
+                Some(node) if layer_in_point_vjp_fragment_for(node.layer(), fragment) => None,
+                Some(node) => Some((name.clone(), node.layer().layer_type())),
+                None => Some((name.clone(), "<missing node>")),
+            })
+    }
+
+    /// The input shape an attack lane must give [`Self::attack_point_gradient`]
+    /// (and every other graph-side attack evaluation) for a point whose trusted
+    /// ORT forward runs on `declared`, the ONNX-declared input shape (e.g.
+    /// `[1, n]`, as `read_input_shape_maybe_gzip` returns it).
+    ///
+    /// ny's loader authors a batched model's graph in the STRIPPED-batch
+    /// convention: the verifier drops a leading size-1 axis before it ever runs
+    /// a graph model (`ny-cli beta_crown/inputs.rs`: "all layer conversions …
+    /// assume the batch dimension is removed"). Most layers do not care
+    /// (trailing-relative axes), which is why the attack lanes have always passed
+    /// `declared` verbatim and worked. The #ml4acopf-vjp nets do care: ml4acopf
+    /// feeds `Transpose(perm [1, 0])` into a constant-left MatMul that the
+    /// builder lowers to a last-axis `Linear` on the rank-1 internal tensor
+    /// (`ny-build convert/matmul.rs`, "internally rank-1 vector"), so a retained
+    /// `[1, n]` input transposes to `[n, 1]` and that `Linear` fails its
+    /// in-features check — the lane would be admitted and then die on its first
+    /// step.
+    ///
+    /// SCOPED so every historical net is byte-identical: a net using none of the
+    /// #ml4acopf-vjp additions — which includes every net the attack lanes could
+    /// run on before they were admitted — gets `declared` back verbatim. A net
+    /// that uses them has no historical attack behaviour to preserve and gets the
+    /// verifier's own convention. Only a leading size-1 axis is ever dropped, so
+    /// the flat element order (and therefore every candidate point and gradient
+    /// index) is unchanged.
+    pub fn attack_point_gradient_input_shape(&self, declared: &[usize]) -> Vec<usize> {
+        let uses_additions = self
+            .nodes
+            .values()
+            .any(|node| layer_is_ml4acopf_vjp_addition(&node.layer));
+        match declared {
+            [1, rest @ ..] if uses_additions && !rest.is_empty() => rest.to_vec(),
+            _ => declared.to_vec(),
+        }
     }
 
     /// Does this graph contain a [`Layer::Sign`] node — i.e. is it a binarized
@@ -763,68 +1112,10 @@ impl GraphNetwork {
         None
     }
 
-    fn point_vjp_supported_fragment(&self) -> bool {
+    fn point_vjp_supported_fragment_in(&self, fragment: PointVjpFragment) -> bool {
         self.node_names().iter().all(|name| {
-            self.node(name).is_some_and(|node| {
-                matches!(
-                    node.layer(),
-                    Layer::Conv2d(_)
-                        | Layer::Linear(_)
-                        | Layer::ReLU(_)
-                        | Layer::Add(_)
-                        | Layer::AveragePool(_)
-                        // MaxPool2d: EXACT at a point. The degenerate box [x, x]
-                        // makes every pooling window have a definite winner (the
-                        // argmax input, l == u), so dispatch_backward_layer's
-                        // generic unary arm routes propagate_crown_backward →
-                        // MaxPool2dLayer::propagate_linear_with_bounds, which
-                        // routes the gradient through that winner (exact
-                        // route-to-max — see max.rs "If one input definitely
-                        // dominates … route gradient through it"). Needed for the
-                        // deeper traffic_signs BNNs (net-2/net-3) which stack
-                        // MaxPool + BatchNorm between the Sign conv blocks.
-                        | Layer::MaxPool2d(_)
-                        | Layer::Flatten(_)
-                        | Layer::Reshape(_)
-                        // Shape/linear plumbing exact at a point: Transpose is a
-                        // pure permutation and MatMul(live, const-weight) is affine
-                        // (the dense head of the traffic_signs BNNs).
-                        // dispatch_backward_layer routes both through the exact
-                        // linear transpose.
-                        | Layer::Transpose(_)
-                        | Layer::MatMul(_)
-                        // GAN/deconv fragment (cgan): ConvTranspose + BatchNorm.
-                        // dispatch_backward_layer handles all three; attack-only.
-                        | Layer::ConvTranspose1d(_)
-                        | Layer::ConvTranspose2d(_)
-                        | Layer::BatchNorm(_)
-                        // Affine constant arithmetic (cora_2024 MLP fragment:
-                        // unfused Gemm = MatMul + AddConstant bias, and the
-                        // mnist Div-by-constant normalization; d/dx (x/c) = 1/c).
-                        // All exact at a point — dispatch_backward_layer routes
-                        // them through the plain unary CROWN backward, which is
-                        // the exact affine transpose for these layers.
-                        | Layer::AddConstant(_)
-                        | Layer::SubConstant(_)
-                        | Layer::MulConstant(_)
-                        | Layer::DivConstant(_)
-                        // Sign / binarized nets (traffic_signs_recognition BNNs)
-                        // and the trailing Softmax classifier head.
-                        // ATTACK-ONLY, NON-EXACT: unlike every other layer above
-                        // (each exact at a point), Sign's true point-Jacobian is
-                        // 0 a.e. and Softmax's certified relaxation carries a
-                        // vanishing gradient. The backward loop special-cases BOTH
-                        // — Sign with a soft-sign surrogate slope, Softmax as a
-                        // monotone identity pass-through (the logit-margin
-                        // direction, matching the external bnn_falsifier prototype)
-                        // — so PGD can descend. Each direction is a heuristic, never
-                        // a certified bound: every candidate it yields is still
-                        // concretely re-checked by the unchanged trusted-oracle
-                        // gate. See the Sign / Softmax arms in attack_point_gradient.
-                        | Layer::Sign(_)
-                        | Layer::Softmax(_)
-                )
-            })
+            self.node(name)
+                .is_some_and(|node| layer_in_point_vjp_fragment_for(node.layer(), fragment))
         })
     }
 
@@ -1034,11 +1325,46 @@ impl GraphNetwork {
         engine: Option<&dyn GemmEngine>,
         deadline: Option<Instant>,
     ) -> anyhow::Result<Option<ArrayD<f32>>> {
+        self.attack_point_gradient_in(x, spec_row, engine, deadline, PointVjpFragment::Standard)
+    }
+
+    /// [`Self::attack_point_gradient`] over the standard fragment widened by the
+    /// exact linear reductions ([`layer_in_point_vjp_fragment_for`]).
+    ///
+    /// #lsnc-attack-twin: the only production caller is the point-folded ATTACK
+    /// twin, whose graph carries the Lyapunov `ReduceSum`. The walk is the SAME
+    /// function body as the standard one — only the admission gate differs — so
+    /// every other layer takes exactly the arm it takes today. ATTACK-ONLY: the
+    /// result steers a search; acceptance is always the trusted-oracle gate.
+    pub fn attack_point_gradient_with_exact_reductions(
+        &self,
+        x: &ArrayD<f32>,
+        spec_row: &Array2<f32>,
+        engine: Option<&dyn GemmEngine>,
+        deadline: Option<Instant>,
+    ) -> anyhow::Result<Option<ArrayD<f32>>> {
+        self.attack_point_gradient_in(
+            x,
+            spec_row,
+            engine,
+            deadline,
+            PointVjpFragment::WithExactReductions,
+        )
+    }
+
+    fn attack_point_gradient_in(
+        &self,
+        x: &ArrayD<f32>,
+        spec_row: &Array2<f32>,
+        engine: Option<&dyn GemmEngine>,
+        deadline: Option<Instant>,
+        fragment: PointVjpFragment,
+    ) -> anyhow::Result<Option<ArrayD<f32>>> {
         // --- Gate: supported fragment + non-empty graph. -------------------
         if self.nodes.is_empty() {
             return Ok(None);
         }
-        if !self.point_vjp_supported_fragment() {
+        if !self.point_vjp_supported_fragment_in(fragment) {
             return Ok(None);
         }
         if deadline.is_some_and(|limit| Instant::now() >= limit) {
@@ -1482,6 +1808,59 @@ impl GraphNetwork {
                 continue;
             }
 
+            // === #ml4acopf-vjp: EXACT analytic derivative of an element-wise
+            //     smooth / piecewise-constant op (Sigmoid, Sin, Cos, PowConstant,
+            //     Floor). ===
+            // These layers' CROWN relaxations are exact only in the width→0
+            // limit, and Sin/Cos fall back to a slope-0 CONSTANT relaxation
+            // whenever the (ULP-wide) point box straddles a normalisation
+            // boundary such as z ≈ 2πk — a silently dead gradient. So instead of
+            // `propagate_crown_backward` we apply the layer's own derivative at
+            // the point: column j of the incoming cotangent is scaled by
+            // f'(z_j), with z_j the centre of the certified forward's
+            // pre-activation box. Element-wise ⇒ in-dim == out-dim, the same
+            // diagonal SingleDense accumulation as the Sign arm; biases carry
+            // through unchanged (they route to the network input as a constant
+            // channel the extracted gradient row never reads). Unreachable for
+            // any net that was inside the fragment before these layers were
+            // admitted, so every such net is byte-identical.
+            // ATTACK-ONLY: the direction steers PGD, and every candidate is still
+            // re-checked by the unchanged trusted-oracle gate.
+            if let Some(derivative) = ExactPointDerivative::of(&node.layer) {
+                if pre_activation.len() != node_lb.num_inputs() {
+                    return Ok(None);
+                }
+                let slopes: Vec<f32> = pre_activation
+                    .lower()
+                    .iter()
+                    .zip(pre_activation.upper().iter())
+                    .map(|(&l, &u)| derivative.slope(f64::midpoint(f64::from(l), f64::from(u))))
+                    .collect();
+                let mut scaled = node_lb;
+                scaled
+                    .lower_a_mut()
+                    .indexed_iter_mut()
+                    .for_each(|((_, j), v)| *v *= slopes[j]);
+                scaled
+                    .upper_a_mut()
+                    .indexed_iter_mut()
+                    .for_each(|((_, j), v)| *v *= slopes[j]);
+                if !attack_publication_completed(
+                    self.accumulate_dense_bounds_to_input_with_deadline(
+                        first_input,
+                        scaled,
+                        &mut acc,
+                        SPEC_ROWS,
+                        input_dim,
+                        &mut input_accumulated,
+                        deadline,
+                    ),
+                )? {
+                    return Ok(None);
+                }
+                continue;
+            }
+
             // === All other whitelist layers: shared canonical dispatch. ===
             // PERF: for `Layer::Linear` this enters `aw_f64_with_abssum` (f64 A·W
             // with abssum error) and for `Layer::Conv2d` the sound conv-transpose
@@ -1579,3 +1958,11 @@ impl GraphNetwork {
 #[cfg(test)]
 #[path = "point_vjp_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "point_vjp_ml4acopf_tests.rs"]
+mod ml4acopf_tests;
+
+#[cfg(test)]
+#[path = "point_vjp_exact_reductions_tests.rs"]
+mod exact_reductions_tests;

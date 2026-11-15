@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Batched command encoding for GPU CROWN backward pass (#3397).
+//! Batched command encoding for GPU CROWN backward pass.
 //!
 //! Encodes all dispatch steps into a single `CommandEncoder`, copying
 //! per-dispatch data from the staging buffer via `copy_buffer_to_buffer`
@@ -35,7 +35,7 @@ pub(super) fn count_encoded_compute_passes(steps: &[DispatchStep]) -> u32 {
 }
 
 impl WgpuDevice {
-    /// Encode all dispatch steps using pre-built bind groups (#3397 Step 4).
+    /// Encode all dispatch steps using pre-built bind groups.
     ///
     /// Unlike `encode_crown_steps`, this method uses bind groups that were
     /// created at plan build time and stored in `plan.step_bind_groups`.
@@ -75,7 +75,7 @@ impl WgpuDevice {
                         0,
                         *slopes_size,
                     );
-                    // Select pipeline: dual-alpha uses sign-specific routing (#4313).
+                    // Select pipeline: dual-alpha uses sign-specific routing.
                     let pipeline = if *dual_alpha {
                         &self.crown_activation_relu_dual_alpha_pipeline
                     } else {
@@ -192,7 +192,7 @@ impl WgpuDevice {
                         0,
                         *weight_size,
                     );
-                    // Select pipeline based on K dimension (#3599).
+                    // Select pipeline based on K dimension.
                     let (pipeline, wg_x, wg_y) = self.gemm_pipeline_and_dispatch(gemm_params);
                     Self::encode_compute(
                         encoder,
@@ -235,7 +235,7 @@ impl WgpuDevice {
                         0,
                         *weight_size,
                     );
-                    // Select pipeline based on K dimension (#3599).
+                    // Select pipeline based on K dimension.
                     let (pipeline, wg_x, wg_y) = self.gemm_pipeline_and_dispatch(gemm_params);
                     Self::encode_compute(
                         encoder,
@@ -355,7 +355,7 @@ impl WgpuDevice {
         Ok(())
     }
 
-    /// Select GEMM pipeline and compute dispatch dimensions based on K (#3599).
+    /// Select GEMM pipeline and compute dispatch dimensions based on K.
     ///
     /// Delegates to `select_gemm_dispatch()` — single source of truth for the
     /// tiled-vs-small-K decision. Maps the pure dispatch result to a pipeline ref.

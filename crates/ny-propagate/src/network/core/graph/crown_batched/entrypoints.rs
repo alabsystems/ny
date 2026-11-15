@@ -18,6 +18,34 @@ use super::binary_ops::AttentionCompositionRuntime;
 use super::GraphNetwork;
 
 impl GraphNetwork {
+    /// Run the ordinary production batched route and its existing memory
+    /// fallback, returning observational decomposed-attention arrival counters.
+    /// The receipt covers the batched attempt, including work completed before
+    /// a fallback; it supplies no additional proof authority.
+    pub fn propagate_crown_batched_with_attention_region_receipt(
+        &self,
+        input: &BoundedTensor,
+    ) -> Result<(CrownBackwardResult, crate::network::AttentionRegionReceipt)> {
+        self.propagate_crown_batched_with_attention_region_receipt_and_deadline(input, None)
+    }
+
+    /// The same production route with an original caller deadline. Expiry and
+    /// memory refusal keep the ordinary complete forward/DAG fallback policies.
+    pub fn propagate_crown_batched_with_attention_region_receipt_and_deadline(
+        &self,
+        input: &BoundedTensor,
+        deadline: Option<Instant>,
+    ) -> Result<(CrownBackwardResult, crate::network::AttentionRegionReceipt)> {
+        let mut receipt = Default::default();
+        let result = self.propagate_crown_batched_with_provenance_runtime(
+            input,
+            None,
+            deadline,
+            AttentionCompositionRuntime::production_with_region_receipt(&mut receipt),
+        );
+        result.map(|result| (result, receipt))
+    }
+
     /// Propagate bounds through the graph using N-D batched CROWN.
     ///
     /// This preserves tensor shape structure throughout propagation instead of
@@ -82,7 +110,7 @@ impl GraphNetwork {
     ///
     /// When the batched path hits the shared CPU dense-materialization budget
     /// (`NyError::CpuMemoryExceeded`), reuse the existing unbatched DAG-CROWN
-    /// provenance path instead of surfacing a raw error (#3550).
+    /// provenance path instead of surfacing a raw error.
     #[instrument(skip(self, input), fields(num_nodes = self.nodes.len(), input_shape = ?input.shape()))]
     pub fn propagate_crown_batched_with_provenance(
         &self,
@@ -91,7 +119,7 @@ impl GraphNetwork {
         self.propagate_crown_batched_with_provenance_and_engine(input, None)
     }
 
-    /// Batched CROWN with fallback provenance and optional GPU GEMM engine (#3597).
+    /// Batched CROWN with fallback provenance and optional GPU GEMM engine.
     ///
     /// Threads `engine` through both the batched inner path and the DAG-CROWN
     /// fallback, ensuring GPU acceleration is available in both code paths.
@@ -101,13 +129,32 @@ impl GraphNetwork {
         input: &BoundedTensor,
         engine: Option<&dyn GemmEngine>,
     ) -> Result<CrownBackwardResult> {
+        self.propagate_crown_batched_with_provenance_runtime(
+            input,
+            engine,
+            None,
+            AttentionCompositionRuntime::production(),
+        )
+    }
+
+    fn propagate_crown_batched_with_provenance_runtime(
+        &self,
+        input: &BoundedTensor,
+        engine: Option<&dyn GemmEngine>,
+        deadline: Option<Instant>,
+        runtime: AttentionCompositionRuntime<'_>,
+    ) -> Result<CrownBackwardResult> {
+        // Keep the same incremental region allowance alive across the public
+        // memory fallback into DAG-CROWN; the inner runtime alone ends first.
+        let _region_scope =
+            crate::network::graph_crown::attention_region::AttentionRegionScope::enter(deadline);
         match self.propagate_crown_batched_inner(
             input,
             MulBinaryRelaxationMode::default(),
             None,
-            None,
+            deadline,
             engine,
-            AttentionCompositionRuntime::production(),
+            runtime,
         ) {
             Ok(result) => Ok(result),
             Err(err @ NyError::CpuMemoryExceeded { .. }) => {
@@ -115,13 +162,25 @@ impl GraphNetwork {
                     "GraphNetwork batched CROWN: {}. Falling back to DAG-CROWN provenance path",
                     err
                 );
-                self.propagate_crown_with_provenance_and_engine(input, engine)
-                    .map(|fallback| CrownBackwardResult {
-                        bounds: fallback.bounds,
-                        provenance: BoundsProvenance::ForwardFallback(
-                            CrownIbpFallbackReason::MemoryBudgetExceeded,
-                        ),
-                    })
+                let fallback = if deadline.is_some() {
+                    self.propagate_crown_with_engine_and_deadline(input, engine, deadline)
+                } else {
+                    self.propagate_crown_with_provenance_and_engine(input, engine)
+                };
+                fallback.map(|fallback| CrownBackwardResult {
+                    bounds: fallback.bounds,
+                    provenance: BoundsProvenance::ForwardFallback(
+                        CrownIbpFallbackReason::MemoryBudgetExceeded,
+                    ),
+                })
+            }
+            Err(error) if deadline.is_some() && error.is_deadline_exceeded() => {
+                self.propagate_ibp(input).map(|bounds| CrownBackwardResult {
+                    bounds,
+                    provenance: BoundsProvenance::ForwardFallback(
+                        CrownIbpFallbackReason::DeadlineExceeded,
+                    ),
+                })
             }
             Err(err) => Err(err),
         }
@@ -146,7 +205,7 @@ impl GraphNetwork {
         self.propagate_crown_batched_with_bilinear_alphas_and_engine(input, bilinear_alphas, None)
     }
 
-    /// Engine-aware variant of `propagate_crown_batched_with_bilinear_alphas` (#3588, #3772).
+    /// Engine-aware variant of `propagate_crown_batched_with_bilinear_alphas`.
     ///
     /// Threads `engine` through the batched CROWN backward pass so that the
     /// pure-attention alpha-CROWN optimizer (no-ReLU DAG path) can benefit from
@@ -168,7 +227,7 @@ impl GraphNetwork {
         .map(|result| result.bounds)
     }
 
-    /// Engine-aware variant of `propagate_crown_batched` (#3588).
+    /// Engine-aware variant of `propagate_crown_batched`.
     ///
     /// Threads `engine` into the batched CROWN backward pass for GPU acceleration.
     pub(crate) fn propagate_crown_batched_with_engine(
@@ -187,7 +246,7 @@ impl GraphNetwork {
         .map(|result| result.bounds)
     }
 
-    /// Experimental: propagate bounds using full attention-CROWN composition (#318).
+    /// Experimental: propagate bounds using full attention-CROWN composition.
     ///
     /// Unlike the production `propagate_crown_batched`, which concretizes with IBP
     /// at attention-shaped MatMul boundaries (partial CROWN), this method
@@ -196,7 +255,7 @@ impl GraphNetwork {
     /// MatMul at the cost of McCormick independence assumptions on Q and K.
     ///
     /// Use this only for diagnostic comparisons against IBP and zonotope seeds.
-    /// On the current Whisper block-0 regression surface, the committed #318
+    /// On the current Whisper block-0 regression surface, the committed
     /// tests show this lane already collapses to the IBP seed at `context`, so
     /// it is intentionally kept out of the production verifier/config routing.
     ///
@@ -211,7 +270,7 @@ impl GraphNetwork {
         self.propagate_crown_batched_with_attention_full_composition_and_engine(input, None)
     }
 
-    /// Engine-aware variant of `propagate_crown_batched_with_attention_full_composition` (#3772).
+    /// Engine-aware variant of `propagate_crown_batched_with_attention_full_composition`.
     pub fn propagate_crown_batched_with_attention_full_composition_and_engine(
         &self,
         input: &BoundedTensor,
@@ -265,7 +324,7 @@ impl GraphNetwork {
         .map(|result| result.bounds)
     }
 
-    /// Propagate bounds through the graph using N-D batched CROWN with deadline enforcement (#3398).
+    /// Propagate bounds through the graph using N-D batched CROWN with deadline enforcement.
     ///
     /// When `deadline` is `Some`, checks at each node in the backward loop.
     /// If exceeded, falls back to IBP (always sound). This prevents batched CROWN
@@ -297,6 +356,8 @@ impl GraphNetwork {
         mul_binary_relaxation: MulBinaryRelaxationMode,
         deadline: Option<Instant>,
     ) -> Result<CrownBackwardResult> {
+        let _region_scope =
+            crate::network::graph_crown::attention_region::AttentionRegionScope::enter(deadline);
         match self.propagate_crown_batched_inner(
             input,
             mul_binary_relaxation,

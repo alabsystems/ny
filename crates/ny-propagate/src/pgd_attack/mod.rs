@@ -35,8 +35,15 @@ pub mod gama;
 pub(crate) mod optimizer;
 mod result;
 
-pub use attacker::PgdAttacker;
-pub use config::{ExactVjpPgdConfig, PgdConfig, PgdInitialization, GAMA_LAMBDA_DEFAULT};
+pub use attacker::{corner_seed_kind, corner_seed_point, PgdAttacker};
+pub use config::{
+    ExactVjpPgdConfig, PgdCancelToken, PgdConfig, PgdInitialization, PgdSetupRegrant,
+    GAMA_LAMBDA_DEFAULT,
+};
+pub use config::{
+    OpenDisjunctAttackConfig, OPEN_DISJUNCT_DEFAULT_MAX_FRAC, OPEN_DISJUNCT_DEFAULT_MAX_SECS,
+    OPEN_DISJUNCT_DEFAULT_MIN_SECS, OPEN_DISJUNCT_DEFAULT_RESTARTS,
+};
 pub use optimizer::{
     auto_alpha, project_to_bounds, project_to_bounds_in_place, AdamClippingParams, PgdAlphaMode,
     PgdOptimizer, PgdStepState,

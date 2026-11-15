@@ -46,7 +46,6 @@ where
 ///
 /// # References
 ///
-/// - `designs/2026-01-28-clip-and-verify-algorithms.md:428`
 /// - `alpha-beta-CROWN/auto_LiRPA/concretize_func.py:_solve_dual_var`
 #[cfg(test)]
 pub(crate) fn solve_dual_variable(

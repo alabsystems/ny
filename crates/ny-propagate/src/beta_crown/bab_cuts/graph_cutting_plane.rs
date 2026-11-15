@@ -58,7 +58,7 @@ impl GraphCuttingPlane {
             )));
         }
         // Validate term coefficients: NaN/Inf coefficients would propagate
-        // through evaluate() and corrupt bound computations (#3076).
+        // through evaluate() and corrupt bound computations.
         for (i, term) in terms.iter().enumerate() {
             if !term.coefficient.is_finite() {
                 return Err(NyError::NumericalInstability(format!(
@@ -112,7 +112,7 @@ impl GraphCuttingPlane {
     ///
     /// Gradient: d(lb)/d(lambda) = bias - constraint_min.
     /// NaN/Inf gradients are reset to 0.0 to prevent corruption of Adam
-    /// moment estimates (#3076).
+    /// moment estimates.
     pub fn set_lambda_grad(&mut self, value: f32) {
         self.lambda_grad = if value.is_finite() { value } else { 0.0 };
     }
@@ -184,7 +184,7 @@ impl GraphCuttingPlane {
     /// Update lambda using Adam optimizer.
     pub fn update_lambda_adam(&mut self, lr: f32, beta1: f32, beta2: f32, epsilon: f32, t: usize) {
         // Guard against t=0: bias correction divides by (1 - beta^t), which is
-        // zero when t=0 (#2575).
+        // zero when t=0.
         let t = t.max(1);
 
         // Update biased first moment estimate
@@ -194,7 +194,7 @@ impl GraphCuttingPlane {
         self.lambda_v = beta2 * self.lambda_v + (1.0 - beta2) * self.lambda_grad * self.lambda_grad;
 
         // Compute bias-corrected estimates
-        // Guard: beta=1.0 makes denominator=0, causing division by zero (#2575, #2586).
+        // Guard: beta=1.0 makes denominator=0, causing division by zero.
         // Matches alpha.rs:116-117 pattern.
         let t_f32 = t as f32;
         let m_hat = self.lambda_m / (1.0 - beta1.powf(t_f32)).max(f32::EPSILON);
@@ -208,7 +208,6 @@ impl GraphCuttingPlane {
         const MAX_LAMBDA: f32 = 10.0;
         // NaN guard: clamp() propagates NaN (IEEE 754). Check lambda, m, v —
         // lambda can become NaN independently if lr is NaN while grad is zero
-        // (#2598, #3076).
         if !self.lambda.is_finite() || !self.lambda_m.is_finite() || !self.lambda_v.is_finite() {
             self.lambda = 0.0;
             self.lambda_m = 0.0;

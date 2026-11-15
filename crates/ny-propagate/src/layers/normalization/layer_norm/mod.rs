@@ -32,6 +32,8 @@ mod tests;
 mod tests_inv_n;
 #[cfg(test)]
 mod tests_multi_dim;
+#[cfg(test)]
+mod tests_radial;
 pub mod types;
 
 pub use types::{LayerNormCrownMode, LayerNormLayer, LayerNormMode};

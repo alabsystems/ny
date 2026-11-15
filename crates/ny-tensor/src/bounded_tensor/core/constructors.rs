@@ -15,7 +15,7 @@ use super::BoundedTensor;
 /// Strategy for repairing non-finite (NaN/Inf) values in bound arrays.
 ///
 /// Used by [`BoundedTensor::new_repaired`] to centralize NaN/Inf handling
-/// at the type boundary instead of at 164 ad-hoc repair sites. Part of #3423.
+/// at the type boundary instead of at 164 ad-hoc repair sites.
 ///
 /// Unlike [`BoundedTensor::new_sanitized`] which clamps all values (including
 /// finite ones), `new_repaired` only repairs NaN elements; ±Inf endpoints and
@@ -505,7 +505,7 @@ impl BoundedTensor {
     /// Construct BoundedTensor with automatic NaN repair per the given strategy.
     ///
     /// This is the preferred constructor for all propagation output. Centralizes
-    /// NaN/Inf handling at the type boundary. Part of #3423.
+    /// NaN/Inf handling at the type boundary.
     ///
     /// Unlike [`Self::new_sanitized`], only NaN values are modified — finite
     /// values are left unchanged regardless of magnitude, and ±Inf endpoints
@@ -517,7 +517,7 @@ impl BoundedTensor {
     /// 1. Shape validation
     /// 2. Repair NaN per strategy
     /// 3. Fix inverted bounds (swap where lower > upper after repair)
-    /// 4. Log repair count for observability (#2717)
+    /// 4. Log repair count for observability
     pub fn new_repaired(
         lower: ArrayD<f32>,
         upper: ArrayD<f32>,

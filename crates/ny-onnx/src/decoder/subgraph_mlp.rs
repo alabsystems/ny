@@ -311,7 +311,7 @@ impl DecoderModel {
     ///
     /// Shared graph construction logic used by all MLP subgraph variants.
     /// Pre-evaluates constant chains and uses `convert_concat_with_evaluated`
-    /// for Concat layers (#3317).
+    /// for Concat layers.
     pub(super) fn build_mlp_graph(
         &self,
         mlp_layer_names: &std::collections::HashSet<String>,
@@ -320,7 +320,7 @@ impl DecoderModel {
         let mut tensor_to_node: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
 
-        // Pre-evaluate constant chains (#3317).
+        // Pre-evaluate constant chains.
         let evaluated_constants = self.evaluate_model_constants();
 
         for spec in &self.model.network.layers {

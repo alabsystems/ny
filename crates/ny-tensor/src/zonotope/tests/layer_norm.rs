@@ -47,7 +47,7 @@ fn test_layer_norm_affine_with_error() {
 
     let result = z.layer_norm_affine(&ny, &beta, eps).unwrap();
 
-    // Should have original error terms + per-element approximation error terms (#2522)
+    // Should have original error terms + per-element approximation error terms
     // prefix_size=2, dim=3, n_new_error_terms = 2*3 = 6
     assert_eq!(result.n_error_terms, z.n_error_terms + 6);
     assert_eq!(result.element_shape, z.element_shape);
@@ -426,9 +426,9 @@ fn test_layer_norm_affine_mean_deriv_division() {
     );
 }
 
-// ==================== Per-element error cancellation regression test (#2522) ====================
+// ==================== Per-element error cancellation regression test ====================
 
-/// Regression test for #2522: layer_norm approximation errors must be independent per element
+/// Regression test: layer_norm approximation errors must be independent per element
 /// so they cannot cancel under downstream [1, -1] linear projection.
 ///
 /// With shared error (the bug), layer_norm(x)[0] - layer_norm(x)[1] would have error
@@ -550,9 +550,9 @@ fn test_layer_norm_affine_mixed_sign_gamma_containment() {
     }
 }
 
-// ==================== NaN safety tests (#2676 Sites 3+4) ====================
+// ==================== NaN safety tests ====================
 
-/// #2676 Site 3: LayerNorm with NaN in center should return Err, not silently
+/// LayerNorm with NaN in center should return Err, not silently
 /// mask via f32::max(NaN, 1e-10) = 1e-10 and produce huge amplified coefficients.
 #[test]
 fn test_layer_norm_affine_nan_center_returns_error_2676() {
@@ -566,7 +566,7 @@ fn test_layer_norm_affine_nan_center_returns_error_2676() {
 
     let result = z.layer_norm_affine(&ny, &beta, 1e-5);
 
-    // With #2676 fix: should return Err because std is NaN.
+    // With the fix: should return Err because std is NaN.
     // Without fix: f32::max(NaN, 1e-10) = 1e-10, producing silently wrong output.
     assert!(
         result.is_err(),
@@ -574,7 +574,7 @@ fn test_layer_norm_affine_nan_center_returns_error_2676() {
     );
 }
 
-/// #2676 Site 3: LayerNorm with all-NaN center should return Err.
+/// LayerNorm with all-NaN center should return Err.
 #[test]
 fn test_layer_norm_affine_all_nan_center_returns_error_2676() {
     let data: Vec<f32> = vec![f32::NAN, f32::NAN];
@@ -591,7 +591,7 @@ fn test_layer_norm_affine_all_nan_center_returns_error_2676() {
     );
 }
 
-/// #2676 Site 4: Verify that non-NaN inputs still work correctly after the guard.
+/// Verify that non-NaN inputs still work correctly after the guard.
 /// The std.max(1e-10) guard for legitimate near-zero variance must still function.
 #[test]
 fn test_layer_norm_affine_near_zero_variance_still_works_2676() {

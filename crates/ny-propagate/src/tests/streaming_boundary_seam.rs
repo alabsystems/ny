@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Seam discontinuity and multi-chunk sequential continuity tests for
-//! streaming vocoder boundary verification (#3500).
+//! streaming vocoder boundary verification.
 //!
 //! Split from `streaming_boundary.rs` for file-size compliance.
 //! Tests the "no click" property: |chunk_a[end] - chunk_b[start]| < ε.

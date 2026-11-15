@@ -27,7 +27,7 @@ impl ThresholdedReluLayer {
     ///
     /// Returns an error if `alpha` is NaN or infinite, since non-finite
     /// thresholds cause NaN comparisons in IBP (x > alpha is always false
-    /// for NaN alpha). Part of #2551.
+    /// for NaN alpha).
     pub fn try_new(alpha: f32) -> Result<Self> {
         Ok(Self {
             alpha: validate_finite(alpha, "ThresholdedReluLayer", "alpha")?,
@@ -57,7 +57,6 @@ impl BoundPropagation for ThresholdedReluLayer {
         // Guard: NaN input bounds fail closed — NaN comparisons always return
         // false (NaN > alpha = false, NaN <= alpha = false), so NaN would fall
         // to the crossing case which pushes NaN u into upper bounds unchecked.
-        // (#3203, Finding 3)
         //
         // ±Inf endpoints are NOT rejected (deep-stack IBP overflow saturation,
         // dc9da0fde class): the piecewise analysis below is limit-correct at
@@ -141,18 +140,18 @@ impl ThresholdedReluLayer {
 ///
 /// Upper bound: identity y=x when l >= 0 (avoids catastrophic f32 cancellation
 /// from steep slope); line through (l,0) when l < 0 with f64 directed rounding.
-/// Lower bound: y = x - max(alpha, 0). Part of #3313.
+/// Lower bound: y = x - max(alpha, 0).
 pub(super) fn thresholded_relu_crossing(l: f32, u: f32, alpha: f32) -> LinearRelaxation {
     let (us, ui) = if l >= 0.0 {
         (1.0, 0.0)
     } else {
         // l < 0: identity invalid, use line through (l, 0).
-        // Compute slope/intercept in f64 with directed rounding. Part of #3313.
+        // Compute slope/intercept in f64 with directed rounding.
         let denom = alpha - l;
         if denom.abs() < f32::EPSILON {
             // l ≈ alpha: slope_threshold = alpha/denom is unstable (Inf when
             // l == alpha exactly). Conservative fallback: slope=1, intercept=-l.
-            // Restores guard from #1759 (commit e5554173).
+            // Restores an earlier guard (commit e5554173).
             let li = if alpha > 0.0 { -alpha } else { 0.0 };
             return LinearRelaxation::new(1.0, li, 1.0, (-l).max(0.0));
         }
@@ -166,7 +165,7 @@ pub(super) fn thresholded_relu_crossing(l: f32, u: f32, alpha: f32) -> LinearRel
         // Recompute intercept from all constraint points:
         // y(l) >= 0, y(alpha) >= 0, y(u) >= u. Take max and round up.
         // When lam < 0 (both l, u negative), the dead-zone interior at alpha
-        // is the binding constraint, not the endpoints. Part of #3321.
+        // is the binding constraint, not the endpoints.
         let c_from_l = -(lam as f64) * l_f64;
         let c_from_alpha = -(lam as f64) * alpha_f64;
         let c_from_u = u_f64 - (lam as f64) * u_f64;
@@ -200,7 +199,7 @@ pub(super) fn thresholded_relu_linear_relaxation(l: f32, u: f32, alpha: f32) -> 
         // NaN or l=-inf: safe ±inf intercepts so CROWN drives bounds to ±inf.
         // l=-inf must be caught here; without this guard it falls through to the
         // crossing case where inf-in-denominator produces slope→0, yielding an unsound
-        // upper bound of y=0 (#2334). u=+inf is handled explicitly below with tighter
+        // upper bound of y=0. u=+inf is handled explicitly below with tighter
         // relaxation math (the u.is_infinite() branch computes finite slopes).
         return LinearRelaxation::nan_fallback();
     }
@@ -257,7 +256,7 @@ mod tests {
         }
     }
 
-    // ── Constructor validation tests (#2551) ────────────────────────────
+    // ── Constructor validation tests ────────────────────────────
 
     #[test]
     fn test_try_new_rejects_invalid_alpha_2551() {
@@ -572,7 +571,7 @@ mod tests {
         assert!(matches!(err, NyError::InvalidSpec(_)));
     }
 
-    // ── Regression: infinite lower bound (#2334) ─────────────────────
+    // ── Regression: infinite lower bound ─────────────────────
     //
     // When l = -inf, the relaxation must produce safe fallback bounds.
     // Without the Inf guard, the crossing region produces slope → 0 via
@@ -636,7 +635,7 @@ mod tests {
         assert_eq!(r.upper_intercept, f32::INFINITY);
     }
 
-    // ── Regression: l == alpha division-by-zero (#3088, reopens #1759) ──
+    // ── Regression: l == alpha division-by-zero ──
     //
     // When l == alpha exactly and l < 0, denom = alpha - l = 0, so
     // alpha / denom = Inf. This Inf slope produces unsound Inf upper
@@ -805,7 +804,7 @@ mod tests {
         }
     }
 
-    // ── IBP guard regression tests (#3203) ────────────────────────────
+    // ── IBP guard regression tests ────────────────────────────
 
     #[test]
     fn test_ibp_nan_input_lower_rejected() {
@@ -947,7 +946,7 @@ mod tests {
         }
     }
 
-    // ── CROWN relaxation soundness proptest (#3321) ─────────────────────
+    // ── CROWN relaxation soundness proptest ─────────────────────
 
     /// Reference ThresholdedReLU in f64, independent of the crate f32 implementation.
     fn thresholded_relu_f64_reference(x: f64, alpha: f64) -> f64 {
@@ -961,7 +960,7 @@ mod tests {
     proptest::proptest! {
         #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(1000) })]
 
-        /// #3321: Verify thresholded_relu_linear_relaxation produces strictly sound bounds.
+        /// Verify thresholded_relu_linear_relaxation produces strictly sound bounds.
         /// For random intervals, the lower bound must satisfy
         ///   lower_slope * x + lower_intercept <= ThresholdedReLU(x)  for all x in [l, u]
         /// and the upper bound must satisfy

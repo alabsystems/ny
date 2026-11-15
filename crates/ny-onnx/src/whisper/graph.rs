@@ -261,8 +261,8 @@ impl WhisperModel {
 
         // Pre-evaluate constant chains (e.g., ConstantOfShape + Add → CLS token).
         // Without this, constant tensors from ConstantOfShape/Shape ops have no values
-        // and cannot be embedded into ConcatLayer, causing unresolvable graph inputs (#696).
-        // Must run before find_block_entry_tensor so evaluated_constants are filtered (#697).
+        // and cannot be embedded into ConcatLayer, causing unresolvable graph inputs.
+        // Must run before find_block_entry_tensor so evaluated_constants are filtered.
         let evaluated_constants =
             self.evaluate_block_constants(block_start, block_end, &constant_tensors_local);
 
@@ -363,7 +363,7 @@ impl WhisperModel {
             }
 
             // Check if this is a constant-only operation (all inputs are weights/constants).
-            // Also filter evaluated_constants (#697): pre-evaluated constant chains
+            // Also filter evaluated_constants: pre-evaluated constant chains
             // (e.g., ConstantOfShape from adjacent block indices) may not be in
             // constant_tensors_local but are still constant.
             let activation_inputs: Vec<&String> = spec
@@ -447,7 +447,7 @@ impl WhisperModel {
 
             // Convert LayerSpec to Layer.
             // For Concat, use convert_concat_with_evaluated to embed pre-evaluated
-            // constant values into ConcatLayer (#696).
+            // constant values into ConcatLayer.
             let mut layer = match if spec.layer_type == LayerType::Concat {
                 self.model
                     .convert_context()
@@ -528,7 +528,7 @@ impl WhisperModel {
 
             // Determine input node names.
             // Pass evaluated_constants so pre-evaluated constant inputs are filtered
-            // from graph edges (they're already embedded in the layer) (#696).
+            // from graph edges (they're already embedded in the layer).
             let mut input_nodes = self.find_input_nodes(
                 spec,
                 &layer,
@@ -674,7 +674,7 @@ impl WhisperModel {
     ///
     /// `evaluated_constants` contains pre-evaluated constant tensor values that have
     /// been embedded into the layer (e.g., `ConcatLayer::constant_inputs`). These
-    /// are filtered from graph edges since the layer handles them internally (#696).
+    /// are filtered from graph edges since the layer handles them internally.
     pub(crate) fn find_input_nodes(
         &self,
         spec: &LayerSpec,
@@ -725,7 +725,7 @@ impl WhisperModel {
                     } else {
                         // Constant tensor with no evaluated value and no producing node.
                         // Previously pushed raw tensor name which fails at propagation.
-                        // Return error with actionable message (#696).
+                        // Return error with actionable message.
                         return Err(NyError::InvalidSpec(format!(
                             "Layer '{}': constant tensor '{}' has no evaluated value and \
                              no producing graph node — cannot resolve as Concat input",
@@ -769,7 +769,7 @@ impl WhisperModel {
     /// Returns a map of tensor name → evaluated value.
     ///
     /// This mirrors `ny-build::builder.rs` constant pre-evaluation for the
-    /// whisper pipeline, which previously lacked it (#696).
+    /// whisper pipeline, which previously lacked it.
     pub(crate) fn evaluate_block_constants(
         &self,
         block_start: usize,

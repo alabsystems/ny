@@ -6,7 +6,7 @@ use super::*;
 use ny_propagate::{BetaCrownConfig, BranchingHeuristic};
 
 /// Test that solver.bound_prop_method: "crown" disables alpha-CROWN.
-/// This is critical for ACAS-Xu where frozen root alpha regresses to 0% (#3453).
+/// This is critical for ACAS-Xu where frozen root alpha regresses to 0%.
 #[test]
 fn bound_prop_method_crown_disables_alpha() {
     let preset = PresetConfig {

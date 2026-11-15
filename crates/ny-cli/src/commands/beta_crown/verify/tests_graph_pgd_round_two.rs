@@ -49,7 +49,7 @@ fn graph_pgd_whitelist_rejects_pad_graphs_4096() {
     );
 }
 
-// --- #4096 equivalence tests round 2: elementwise activations ---
+// --- Equivalence tests round 2: elementwise activations ---
 
 fn make_leaky_relu_graph() -> GraphNetwork {
     let mut network = Network::new();
@@ -107,7 +107,7 @@ fn graph_pgd_preserve_leading_axis_matches_sequential_log_4096() {
     assert_preserve_leading_axis_matches_sequential(&graph, &samples, Some(&engine));
 }
 
-// --- #4096 equivalence tests round 2: binary operations ---
+// --- Equivalence tests round 2: binary operations ---
 
 fn make_sub_graph() -> GraphNetwork {
     let linear_a = LinearLayer::new(arr2(&[[1.0]]), Some(arr1(&[0.25]))).unwrap();
@@ -198,7 +198,7 @@ fn graph_pgd_preserve_leading_axis_matches_sequential_div_4096() {
     assert_preserve_leading_axis_matches_sequential(&graph, &samples, Some(&engine));
 }
 
-// --- #4096 equivalence tests round 2: unary-constant operations ---
+// --- Equivalence tests round 2: unary-constant operations ---
 
 fn make_add_constant_graph() -> GraphNetwork {
     let constant = ArrayD::from_shape_vec(IxDyn(&[1]), vec![0.5]).unwrap();

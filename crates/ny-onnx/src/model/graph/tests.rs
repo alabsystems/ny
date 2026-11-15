@@ -61,7 +61,7 @@ fn build_graph_with_options(model: &OnnxModel, options: GraphNetworkOptions) -> 
 #[test]
 fn skip_single_input_inserts_opaque_skip() {
     // Previously, single-input unsupported ops were treated as identity (pass-through).
-    // After #2231 fix: they must insert OpaqueSkipLayer with [-inf, +inf] bounds.
+    // Now they must insert OpaqueSkipLayer with [-inf, +inf] bounds.
     let relu = LayerSpec {
         name: "relu".to_string(),
         layer_type: LayerType::ReLU,
@@ -1164,7 +1164,7 @@ fn output_selection_uses_mid_graph_output_not_last_node() {
     assert_eq!(graph.output_name(), "relu");
 }
 
-/// Regression test for #2231: unsupported single-input ops must produce OpaqueSkip
+/// Regression test: unsupported single-input ops must produce OpaqueSkip
 /// (conservative [-inf, +inf] bounds), not identity pass-through.
 ///
 /// Scenario: Linear -> Reciprocal (unsupported) -> output
@@ -1325,9 +1325,7 @@ fn assert_graph_networks_equivalent(
 
 /// OnnxModel → GraphModel round-trip produces the same GraphNetwork as the
 /// direct OnnxModel → GraphNetwork path. Proves the format-neutral GraphModel
-/// contract (#3288) faithfully represents ONNX-loaded models.
-///
-/// Part of #3288.
+/// contract faithfully represents ONNX-loaded models.
 #[test]
 fn onnx_to_graph_model_round_trip_produces_equivalent_graph_network() {
     // Path A: OnnxModel → GraphNetwork (direct)
@@ -1344,7 +1342,7 @@ fn onnx_to_graph_model_round_trip_produces_equivalent_graph_network() {
     assert_graph_networks_equivalent(&graph_a, &graph_b, &["relu", "sigmoid", "add"]);
 }
 
-/// Build a single-layer LayerNorm OnnxModel matching the #4172 builder-test shape.
+/// Build a single-layer LayerNorm OnnxModel matching the `ny-build` builder-test shape.
 fn build_standard_layernorm_model() -> OnnxModel {
     let mut weights = WeightStore::new();
     weights.insert("ny".to_string(), arr1(&[1.0_f32, 1.5, 0.5, 2.0]).into_dyn());
@@ -1390,8 +1388,7 @@ fn build_standard_layernorm_model() -> OnnxModel {
 /// Public-surface regression: `CompoundNodePolicy::DecomposeNormalization` is importable from
 /// the crate root and drives the LayerNorm rewrite through `ny-onnx` without `ny-build`.
 ///
-/// Mirrors the committed `ny-build` builder-test shape from #4172.
-/// Part of #4173.
+/// Mirrors the committed `ny-build` builder-test shape.
 #[test]
 fn compound_node_policy_public_facade_rewrites_layernorm_4173() {
     let model = build_standard_layernorm_model();

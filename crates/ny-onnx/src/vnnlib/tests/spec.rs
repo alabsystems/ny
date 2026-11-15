@@ -10,8 +10,8 @@ fn test_vnnlib_spec_new() {
     let spec = VnnLibSpec::new();
     assert_eq!(spec.num_inputs, 0);
     assert_eq!(spec.num_outputs, 0);
-    assert!(spec.input_bounds.is_empty());
-    assert!(spec.output_constraints.is_empty());
+    assert_eq!((spec.input_bounds).len(), 0);
+    assert_eq!((spec.output_constraints).len(), 0);
     assert!(!spec.is_disjunction);
     assert!(spec.version.is_none());
 }
@@ -22,8 +22,8 @@ fn test_vnnlib_spec_default() {
     let spec = VnnLibSpec::default();
     assert_eq!(spec.num_inputs, 0);
     assert_eq!(spec.num_outputs, 0);
-    assert!(spec.input_bounds.is_empty());
-    assert!(spec.output_constraints.is_empty());
+    assert_eq!((spec.input_bounds).len(), 0);
+    assert_eq!((spec.output_constraints).len(), 0);
     assert!(!spec.is_disjunction);
     assert!(spec.version.is_none());
 }
@@ -188,7 +188,7 @@ fn test_get_input_bounds_f64() {
     assert!((upper[1] - 2.75).abs() < 1e-10);
 }
 
-// --- validate_output_indices tests (#1886) ---
+// --- validate_output_indices tests ---
 
 #[ntest::timeout(10000)]
 #[test]
@@ -329,7 +329,7 @@ fn test_max_output_index_const() {
     );
 }
 
-/// Regression test for #2658: get_input_bounds_f32 must use directed rounding
+/// Regression test: get_input_bounds_f32 must use directed rounding
 /// so the f32 region is a superset of the f64 region.
 ///
 /// Uses 0.1 as a test value because 0.1_f64 != 0.1_f32 (neither is exactly
@@ -371,7 +371,7 @@ fn test_get_input_bounds_f32_directed_rounding_2658() {
     );
 }
 
-/// Regression test for #2658: constraint rhs values must use directed rounding
+/// Regression test: constraint rhs values must use directed rounding
 /// so the unsafe region is widened (sound overapproximation).
 #[ntest::timeout(10000)]
 #[test]
@@ -477,7 +477,7 @@ fn test_programmatic_output_constraint_index_fails_before_matrix_indexing() {
     assert!(message.contains("Y_1"), "unexpected error: {message}");
 }
 
-/// Regression test for #2800: contradictory VNN-LIB assertions (X_0 >= 1 AND X_0 <= 0)
+/// Regression test: contradictory VNN-LIB assertions (X_0 >= 1 AND X_0 <= 0)
 /// must be rejected at the VNN-LIB boundary with the offending variable named.
 #[ntest::timeout(10000)]
 #[test]
@@ -493,7 +493,7 @@ fn test_contradictory_vnnlib_bounds_detected_2800() {
     assert_invalid_spec_contains(err, "Input variable X_0 has an invalid bound");
 }
 
-/// Regression test for #2800: unconstrained VNN-LIB input produces infinite bounds.
+/// Regression test: unconstrained VNN-LIB input produces infinite bounds.
 /// `Bound::try_new` (finite-only) would reject these — callers must use
 /// `try_new_allow_infinite` or validate before conversion.
 #[ntest::timeout(10000)]
@@ -533,7 +533,7 @@ fn test_unconstrained_vnnlib_input_produces_infinite_bounds_2800() {
     );
 }
 
-/// Regression test for #2813: NaN constraints must propagate, not be silently absorbed.
+/// Regression test: NaN constraints must propagate, not be silently absorbed.
 ///
 /// IEEE 754 f64::max(NaN, x) returns x, which would silently drop a NaN bound
 /// when intersecting multiple constraints on the same variable. The parser now
@@ -554,7 +554,7 @@ fn test_nan_constraint_propagates_not_absorbed_2813() {
     assert_invalid_spec_contains(err, "Input variable X_0 has an invalid (NaN) bound");
 }
 
-/// Regression test for #2813: NaN in upper bound constraints must be rejected.
+/// Regression test: NaN in upper bound constraints must be rejected.
 #[ntest::timeout(10000)]
 #[test]
 fn test_nan_upper_bound_propagates_2813() {
@@ -663,4 +663,159 @@ fn test_parse_vnnlib_declared_input_bounds_survive_clause_union_widening() {
         plain.declared_input_bounds[1],
         (f64::NEG_INFINITY, f64::INFINITY)
     );
+}
+
+// ---------------------------------------------------------------------------
+// snap_box_outward_from_subnormals (#flush-charge 5th gate, 2026-08-30):
+// the one-ULP directed-rounding nudge in split_input_bounds_f32 minted
+// subnormal endpoints (next_down_f32(0.0) = -2^-149) that the sound-GPU
+// charged-flush lane refuses fail-closed. The snap widens them outward to
+// 0.0 / ±f32::MIN_POSITIVE — a superset enclosure.
+// ---------------------------------------------------------------------------
+
+#[ntest::timeout(10000)]
+#[test]
+fn snap_box_outward_widens_subnormals_both_signs() {
+    use super::snap_box_outward_from_subnormals;
+    let neg_sub = f32::from_bits(0x8000_0001); // -2^-149, next_down_f32(0.0)
+    let pos_sub = f32::from_bits(0x0000_0001); // +2^-149, next_up_f32(0.0)
+    let big_sub = f32::from_bits(0x007F_FFFF); // largest positive subnormal
+
+    let mut lower = vec![neg_sub, pos_sub, -big_sub, big_sub];
+    let mut upper = vec![pos_sub, neg_sub, big_sub, -big_sub];
+    snap_box_outward_from_subnormals(&mut lower, &mut upper);
+
+    // Lower endpoints widen toward -inf.
+    assert_eq!(lower[0], -f32::MIN_POSITIVE, "negative subnormal lower");
+    assert_eq!(lower[1], 0.0, "positive subnormal lower snaps to zero");
+    assert_eq!(lower[2], -f32::MIN_POSITIVE);
+    assert_eq!(lower[3], 0.0);
+    // Upper endpoints widen toward +inf.
+    assert_eq!(upper[0], f32::MIN_POSITIVE, "positive subnormal upper");
+    assert_eq!(upper[1], 0.0, "negative subnormal upper snaps to zero");
+    assert_eq!(upper[2], f32::MIN_POSITIVE);
+    assert_eq!(upper[3], 0.0);
+    // No subnormal survives.
+    for v in lower.iter().chain(upper.iter()) {
+        assert!(!v.is_subnormal(), "no endpoint may remain subnormal: {v:e}");
+    }
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn snap_box_outward_leaves_normals_zeros_nan_inf_untouched() {
+    use super::snap_box_outward_from_subnormals;
+    let originals: Vec<f32> = vec![
+        0.0,
+        -0.0,
+        f32::MIN_POSITIVE,
+        -f32::MIN_POSITIVE,
+        1.5,
+        -1.5,
+        f32::MAX,
+        -f32::MAX,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+    ];
+    let mut lower = originals.clone();
+    let mut upper = originals.clone();
+    snap_box_outward_from_subnormals(&mut lower, &mut upper);
+    for (i, orig) in originals.iter().enumerate() {
+        // Bit-exact pass-through (covers -0.0 vs 0.0 and NaN payloads).
+        assert_eq!(
+            lower[i].to_bits(),
+            orig.to_bits(),
+            "lower[{i}] must be untouched"
+        );
+        assert_eq!(
+            upper[i].to_bits(),
+            orig.to_bits(),
+            "upper[{i}] must be untouched"
+        );
+    }
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn snap_box_outward_property_never_shrinks_the_box() {
+    use super::snap_box_outward_from_subnormals;
+    // Battery spanning zeros, subnormals of both signs and magnitudes,
+    // boundary normals, ordinary values, and infinities.
+    let battery: Vec<f32> = vec![
+        0.0,
+        -0.0,
+        f32::from_bits(0x0000_0001),
+        f32::from_bits(0x8000_0001),
+        f32::from_bits(0x0040_0000),
+        f32::from_bits(0x8040_0000),
+        f32::from_bits(0x007F_FFFF),
+        f32::from_bits(0x807F_FFFF),
+        f32::MIN_POSITIVE,
+        -f32::MIN_POSITIVE,
+        1e-30,
+        -1e-30,
+        0.05,
+        -0.05,
+        1.0,
+        -1.0,
+        f32::MAX,
+        -f32::MAX,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+    ];
+    let old_lower = battery.clone();
+    let old_upper = battery.clone();
+    let mut new_lower = battery.clone();
+    let mut new_upper = battery.clone();
+    snap_box_outward_from_subnormals(&mut new_lower, &mut new_upper);
+    for i in 0..battery.len() {
+        assert!(
+            new_lower[i] <= old_lower[i],
+            "lower[{i}] moved inward: {} -> {}",
+            old_lower[i],
+            new_lower[i]
+        );
+        assert!(
+            new_upper[i] >= old_upper[i],
+            "upper[{i}] moved inward: {} -> {}",
+            old_upper[i],
+            new_upper[i]
+        );
+        assert!(!new_lower[i].is_subnormal());
+        assert!(!new_upper[i].is_subnormal());
+    }
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn split_input_bounds_f32_zero_literals_yield_no_subnormal_endpoints() {
+    // End-to-end regression for the 5th gate: a vnnlib `(>= X_i 0.0)` literal
+    // must NOT produce a subnormal lower endpoint (pre-fix it produced
+    // next_down_f32(0.0) = -2^-149, bits 0x8000_0001, refused by the GPU
+    // charged-flush lane), and a `(<= X_i 0.0)` must not produce a subnormal
+    // upper endpoint.
+    let content = "
+(declare-const X_0 Real)
+(declare-const X_1 Real)
+(declare-const Y_0 Real)
+(assert (>= X_0 0.0))
+(assert (<= X_0 0.05))
+(assert (>= X_1 -0.05))
+(assert (<= X_1 0.0))
+(assert (<= Y_0 0.0))
+";
+    let spec = parse_vnnlib(content).expect("spec must parse");
+    let (lower, upper) = spec.split_input_bounds_f32();
+    // Outward and subnormal-free: superset of [0, 0.05] x [-0.05, 0].
+    assert_eq!(lower[0], -f32::MIN_POSITIVE);
+    assert_eq!(upper[1], f32::MIN_POSITIVE);
+    assert!(lower[0] <= 0.0 && upper[0] >= 0.05);
+    assert!(lower[1] <= -0.05 && upper[1] >= 0.0);
+    for v in lower.iter().chain(upper.iter()) {
+        assert!(
+            !v.is_subnormal(),
+            "split_input_bounds_f32 published a subnormal endpoint: {v:e}"
+        );
+    }
 }

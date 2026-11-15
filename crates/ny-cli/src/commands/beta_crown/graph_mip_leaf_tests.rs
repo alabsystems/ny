@@ -395,6 +395,60 @@ fn leaf_scale_gates_decline_oversize_leaves() {
     assert_eq!(leaf_max_nnz(), 5_000_000, "default leaf nnz cap");
 }
 
+/// #mip-demand — the pre-BaB static probe is a LOWER BOUND on the runtime
+/// estimate, which is the whole soundness argument for moving the decline
+/// before `mip_reserved_slice()` carves.
+///
+/// If this inequality ever inverted, the reserve would be dropped on a model
+/// the escalation would have admitted, and the Graph-MIP lane would lose a
+/// window it could have used. The tiny net makes the two terms explicit: the
+/// runtime estimate is 20 (6 Linear coefficients + 2 unstable ReLUs × 7), the
+/// static floor is 6 — the Linear term alone, because the ReLU term is the one
+/// that depends on BOUNDS and is therefore dropped.
+#[test]
+fn static_nnz_floor_never_exceeds_the_runtime_estimate() {
+    let graph = tiny_graph();
+    let nb = tiny_node_bounds();
+    let flat = clamped_flat_bounds(&graph, &nb, &[]).expect("clamp");
+    let runtime = estimate_encode_nnz(&graph, &flat).expect("runtime estimate");
+    let floor = static_encode_nnz_floor(&graph, &[2]).expect("static floor");
+    assert_eq!(
+        runtime, 20,
+        "runtime estimate counts the bounds-dependent term"
+    );
+    assert_eq!(
+        floor, 6,
+        "the static floor is the bounds-INDEPENDENT part: out*(in+1) = 2*3"
+    );
+    assert!(
+        floor <= runtime,
+        "the static probe must never over-estimate: floor={floor} runtime={runtime}"
+    );
+}
+
+/// #mip-demand — FAIL CLOSED. A shape the walk cannot derive, and a layer
+/// outside the escalation gate's own set, both make NO static claim rather than
+/// a wrong one. Shown able to fail: the same graph with the right shape DOES
+/// produce a claim, so a blanket `None` would not pass this test.
+#[test]
+fn static_nnz_floor_fails_closed_on_a_shape_it_cannot_walk() {
+    let graph = tiny_graph();
+    assert!(
+        static_encode_nnz_floor(&graph, &[2]).is_some(),
+        "the walk must produce a claim on the shape it does model"
+    );
+    assert_eq!(
+        static_encode_nnz_floor(&graph, &[3]),
+        None,
+        "a last axis that is not the Linear's input dimension must make no claim"
+    );
+    assert_eq!(
+        static_encode_nnz_floor(&graph, &[]),
+        None,
+        "an empty input shape must make no claim"
+    );
+}
+
 /// Defect-3: after a confirmed SAT the oracle latches OFF — subsequent
 /// consults decline immediately (no repeated solver spend), and the verdict
 /// that latched it was `Violated` (advisory; the loop requeues).
@@ -1227,7 +1281,7 @@ pub(crate) mod whole_net_diff_mip {
                 let eps = ny_tensor::next_up_f32(epsilon as f32);
                 let mut coeffs = vec![0.0f32; n_out];
                 coeffs[0] = 1.0;
-                let mut flat_cond = flat_alpha.clone();
+                let mut flat_cond = flat_alpha;
                 let cond_deadline = Instant::now() + Duration::from_secs_f64(obbt_budget_s);
                 let t1 = Instant::now();
                 let cdiag = super::super::obbt_tighten_boxes(

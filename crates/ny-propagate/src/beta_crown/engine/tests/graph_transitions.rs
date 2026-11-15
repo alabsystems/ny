@@ -14,8 +14,6 @@
 //! - `MultiObjectiveGraphBabDomain::with_constraint`
 //! - `beta_crown/domain.rs` `with_constraint` depth increment (`depth: self.depth + 1`)
 //! - branching.rs:332-333 (split_count += 1)
-//!
-//! Part of #1959.
 
 use super::gpu_bab::simple_graph_network;
 use super::prelude::*;
@@ -312,10 +310,19 @@ fn test_domain_depth_increments_with_general_split() -> Result<()> {
     Ok(())
 }
 
-/// with_constraint returns None for a non-ReLU node.
+/// with_constraint FAILS CLOSED for a non-ReLU node.
+///
+/// This used to assert `Ok(None)`, which reads downstream as "this child has an
+/// empty region": `relu_split/child_eval.rs` turns it into
+/// `ChildOutcome::NoChild` and `relu_split/split.rs` handles that with an empty
+/// arm, setting no `unresolved_*` latch. A structural mismatch would therefore
+/// have deleted the parent's sub-region from the search and let
+/// `build_final_result` publish `Verified` over a non-exhaustive queue. The
+/// multi-objective twin has always returned `Err` here
+/// (`test_multi_objective_rejects_non_relu` below); the two now agree.
 #[ntest::timeout(10000)]
 #[test]
-fn test_constraint_on_non_relu_returns_none() -> Result<()> {
+fn test_constraint_on_non_relu_fails_closed() -> Result<()> {
     let (graph, _input, root) = root_domain(true);
 
     let bad_constraint = GraphNeuronConstraint {
@@ -325,18 +332,25 @@ fn test_constraint_on_non_relu_returns_none() -> Result<()> {
         score: 1.0,
     };
 
+    let error = root
+        .with_constraint(&graph, bad_constraint, true)
+        .expect_err("constraint on a linear node must fail closed, not prune silently");
     assert!(
-        root.with_constraint(&graph, bad_constraint, true)?
-            .is_none(),
-        "constraint on linear node should return None"
+        matches!(error, ny_core::NyError::InternalError(_)),
+        "structural split inconsistency must be an internal error: {error}"
+    );
+    assert!(
+        !error.is_infeasible_domain(),
+        "a structural refusal must NOT be classified as an infeasible (empty) domain, \
+         or callers take the prune-and-forget arm: {error}"
     );
     Ok(())
 }
 
-/// with_constraint returns None for neuron_idx out of bounds.
+/// with_constraint FAILS CLOSED for neuron_idx out of bounds.
 #[ntest::timeout(10000)]
 #[test]
-fn test_constraint_oob_neuron_returns_none() -> Result<()> {
+fn test_constraint_oob_neuron_fails_closed() -> Result<()> {
     let (graph, _input, root) = root_domain(true);
 
     let oob_constraint = GraphNeuronConstraint {
@@ -346,18 +360,24 @@ fn test_constraint_oob_neuron_returns_none() -> Result<()> {
         score: 1.0,
     };
 
+    let error = root
+        .with_constraint(&graph, oob_constraint, true)
+        .expect_err("an out-of-bounds neuron index must fail closed");
     assert!(
-        root.with_constraint(&graph, oob_constraint, true)?
-            .is_none(),
-        "out-of-bounds neuron index should return None"
+        matches!(error, ny_core::NyError::InternalError(_)),
+        "structural split inconsistency must be an internal error: {error}"
+    );
+    assert!(
+        !error.is_infeasible_domain(),
+        "out-of-range index is not an empty region: {error}"
     );
     Ok(())
 }
 
-/// with_constraint returns None for a nonexistent node name.
+/// with_constraint FAILS CLOSED for a nonexistent node name.
 #[ntest::timeout(10000)]
 #[test]
-fn test_constraint_nonexistent_node_returns_none() -> Result<()> {
+fn test_constraint_nonexistent_node_fails_closed() -> Result<()> {
     let (graph, _input, root) = root_domain(true);
 
     let bad_constraint = GraphNeuronConstraint {
@@ -367,10 +387,87 @@ fn test_constraint_nonexistent_node_returns_none() -> Result<()> {
         score: 1.0,
     };
 
+    let error = root
+        .with_constraint(&graph, bad_constraint, true)
+        .expect_err("a constraint naming a node outside the graph must fail closed");
     assert!(
-        root.with_constraint(&graph, bad_constraint, true)?
-            .is_none(),
-        "nonexistent node name should return None"
+        matches!(error, ny_core::NyError::InternalError(_)),
+        "structural split inconsistency must be an internal error: {error}"
+    );
+    assert!(
+        !error.is_infeasible_domain(),
+        "a missing split node is not an empty region: {error}"
+    );
+    Ok(())
+}
+
+/// The single-objective and multi-objective twins agree on WHICH conditions are
+/// `Err` and which are `Ok(None)`.
+///
+/// This is the wiring assertion, not a kernel assertion: it drives both public
+/// entry points with the same graph and the same constraint and compares their
+/// classification, so re-introducing a fail-open arm on either side fails here
+/// even if that side's own dedicated test is deleted.
+#[ntest::timeout(10000)]
+#[test]
+fn single_and_multi_objective_with_constraint_classify_alike() -> Result<()> {
+    let (graph, _input, root) = root_domain(true);
+    let (graph_m, _input_m, root_m, thresholds) = root_multi_domain(true);
+
+    // Structural: both must be Err.
+    for (label, constraint) in [
+        (
+            "non-activation split node",
+            GraphNeuronConstraint {
+                node_name: "linear1".to_string(),
+                neuron_idx: 0,
+                is_active: true,
+                score: 1.0,
+            },
+        ),
+        (
+            "split node outside the graph",
+            GraphNeuronConstraint {
+                node_name: "nonexistent_relu".to_string(),
+                neuron_idx: 0,
+                is_active: true,
+                score: 1.0,
+            },
+        ),
+        (
+            "neuron index out of range",
+            GraphNeuronConstraint {
+                node_name: "relu1".to_string(),
+                neuron_idx: 999,
+                is_active: true,
+                score: 1.0,
+            },
+        ),
+    ] {
+        let single = root.with_constraint(&graph, constraint.clone(), true);
+        let multi = root_m.with_constraint(&graph_m, constraint, true, &thresholds);
+        assert!(
+            single.is_err(),
+            "single-objective must fail closed on {label}"
+        );
+        assert!(
+            multi.is_err(),
+            "multi-objective must fail closed on {label}"
+        );
+    }
+
+    // Genuine feasibility: both must be Ok, and agree on Some/None.
+    let feasible = relu1_active();
+    let single = root
+        .with_constraint(&graph, feasible.clone(), true)
+        .expect("a feasible ReLU split must not error");
+    let multi = root_m
+        .with_constraint(&graph_m, feasible, true, &thresholds)
+        .expect("a feasible ReLU split must not error");
+    assert_eq!(
+        single.is_some(),
+        multi.is_some(),
+        "twins must agree on whether a feasible split yields a child"
     );
     Ok(())
 }
@@ -722,7 +819,7 @@ fn test_general_split_nonexistent_node_returns_none() -> Result<()> {
     Ok(())
 }
 
-/// with_general_split rejects NaN split bounds instead of silently absorbing them (#2954).
+/// with_general_split rejects NaN split bounds instead of silently absorbing them.
 ///
 /// Before the fix, IEEE 754 `f32::max(current_l, NaN) = current_l` would silently
 /// drop the NaN, producing a child domain with seemingly valid bounds. The fix uses
@@ -768,7 +865,7 @@ fn test_general_split_nan_lower_bound_not_absorbed_2954() -> Result<()> {
     Ok(())
 }
 
-/// with_general_split rejects NaN upper split bound (#2954).
+/// with_general_split rejects NaN upper split bound.
 #[ntest::timeout(10000)]
 #[test]
 fn test_general_split_nan_upper_bound_not_absorbed_2954() -> Result<()> {
@@ -798,7 +895,7 @@ fn test_general_split_nan_upper_bound_not_absorbed_2954() -> Result<()> {
     Ok(())
 }
 
-/// with_general_split rejects NaN split bounds on non-NETWORK_INPUT path (#2954).
+/// with_general_split rejects NaN split bounds on non-NETWORK_INPUT path.
 ///
 /// When splitting on relu1, the pre-activation is linear1 (not NETWORK_INPUT),
 /// so the code takes the else branch at line 362. Without the explicit NaN guard,

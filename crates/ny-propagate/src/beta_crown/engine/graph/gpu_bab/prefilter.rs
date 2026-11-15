@@ -40,7 +40,7 @@ pub(crate) fn prefilter_picked_domains(
     for (idx, meta) in metadata.iter().enumerate() {
         state.max_depth_reached = state.max_depth_reached.max(meta.depth);
 
-        // Guard: NaN/Inf bounds from upstream propagation failure (#2933).
+        // Guard: NaN/Inf bounds from upstream propagation failure.
         // Without this, NaN domains fall through check_domain_bounds to Undecided,
         // enter the branching pipeline, and produce NaN children indefinitely.
         if !meta.lower_bound.is_finite() || !meta.upper_bound.is_finite() {

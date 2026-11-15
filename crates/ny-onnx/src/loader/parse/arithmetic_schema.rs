@@ -14,11 +14,13 @@
 use crate::onnx_proto::NodeProto;
 use ny_core::{NyError, Result};
 
+use super::expand_identity::ExpandIdentityCones;
 use super::literal_cone::{is_exact_integer_literal_node, LiteralCone, LiteralExemptions};
 use super::quantization_preflight::RawDtypeResolver;
 use super::structural_schema::StructuralAuthentication;
 
 const FLOAT: i32 = 1;
+const INT64: i32 = 7;
 
 /// Validate an arithmetic node if it is one of the operators owned here.
 /// Returns `true` when the node was recognized.
@@ -54,6 +56,7 @@ pub(super) fn validate_arithmetic_float32_data_path(
     literals: &LiteralCone,
     exemptions: &mut LiteralExemptions,
     authenticated: &StructuralAuthentication,
+    expand_identity: &ExpandIdentityCones,
 ) -> Result<()> {
     for value in node
         .input
@@ -84,13 +87,46 @@ pub(super) fn validate_arithmetic_float32_data_path(
             // static it is. The two tests are alternatives, not a widening —
             // both land on the SAME deferral, so the node is admitted only if
             // folding actually erases it.
-            if !is_exact_integer_literal_node(node, literals, raw_dtypes)?
-                && !node_is_structurally_authenticated(node, raw_dtypes, authenticated)?
-            {
-                return Err(refusal);
+            if is_exact_integer_literal_node(node, literals, raw_dtypes)? {
+                exemptions.record(node, &refusal);
+                return Ok(());
             }
-            exemptions.record(node, &refusal);
-            return Ok(());
+            // #cctsdb-expand-identity: an integer node inside a certified
+            // expand-identity cone (the `Mul` building the provably negative
+            // operand) exists only to feed the certified constant-false
+            // comparison; canonicalization deletes it, and if it survives —
+            // for example because another consumer keeps it alive — this
+            // refusal re-raises verbatim.  Checked BEFORE the structural
+            // deferral: the cone cannot constant-fold (its `ConstantOfShape`
+            // shape input is runtime), so the fold-only ratchet could never
+            // discharge it.
+            if expand_identity.is_certified_cone_node(node) {
+                exemptions.record_canonicalizable(node, &refusal);
+                return Ok(());
+            }
+            if node_is_structurally_authenticated(node, raw_dtypes, authenticated)? {
+                exemptions.record(node, &refusal);
+                return Ok(());
+            }
+            // #cctsdb-trunc-gated-index: exact INT64 index arithmetic whose
+            // every tensor the structural pass classified, with at least one
+            // in the trunc-gated RUNTIME ledger, is ADMITTED as a real layer
+            // rather than deferred — it cannot fold, by construction: its
+            // values are integer functions of the verified input, read through
+            // guarded `Trunc` lowerings.  The admission's obligations live
+            // where they always did: consumer positions are bounded by the
+            // structural control audit (any INT64 leak still refuses the
+            // load), and value-range exactness (f32 mirror < 2^24, Slice
+            // bounds in range) is discharged at solve time by the Trunc
+            // gating, the bounded-index ScatterND path, the taint-gated IBP
+            // degrade and the per-cell enumeration driver, which fail closed
+            // to `unknown`.  A runtime INT64 chain that does NOT certify — one
+            // rooted anywhere but a guarded FLOAT truncation — keeps this
+            // refusal verbatim.
+            if node_is_trunc_gated_runtime_index(node, raw_dtypes, authenticated)? {
+                return Ok(());
+            }
+            return Err(refusal);
         }
     }
     Ok(())
@@ -120,6 +156,37 @@ fn node_is_structurally_authenticated(
         }
     }
     Ok(true)
+}
+
+/// Is this node an exact INT64 index computation over values the structural
+/// pass classified, at least one of them in the trunc-gated runtime ledger?
+///
+/// Stricter than testing only the tensor that triggered the refusal: every
+/// tensor must be INT64 and classified, so a node mixing a FLOAT or unproven
+/// operand IS on the arithmetic data path and stays refused
+/// (#cctsdb-trunc-gated-index).
+fn node_is_trunc_gated_runtime_index(
+    node: &NodeProto,
+    raw_dtypes: &mut RawDtypeResolver<'_>,
+    authenticated: &StructuralAuthentication,
+) -> Result<bool> {
+    let mut any_runtime = false;
+    for value in node
+        .input
+        .iter()
+        .chain(node.output.iter())
+        .filter(|value| !value.is_empty())
+    {
+        if raw_dtypes.resolve(value)? != Some(INT64) {
+            return Ok(false);
+        }
+        if authenticated.contains_runtime(value) {
+            any_runtime = true;
+        } else if !authenticated.contains(value) {
+            return Ok(false);
+        }
+    }
+    Ok(any_runtime)
 }
 
 fn require_minimum_opset(node: &NodeProto, opset: i64, minimum: i64) -> Result<()> {
@@ -274,12 +341,13 @@ mod tests {
                 &literals,
                 &mut exemptions,
                 &StructuralAuthentication::default(),
+                &ExpandIdentityCones::certify(&graph),
             )
             .is_ok()
                 // A deferred literal-cone refusal is not an acceptance: this
                 // unit test never folds, so require it to re-raise.
                 && exemptions
-                    .require_all_folded(&crate::WeightStore::new())
+                    .require_all_folded(&crate::WeightStore::new(), &graph)
                     .is_ok();
             assert_eq!(accepted, should_pass);
         }

@@ -44,10 +44,10 @@ impl TanhLayer {
 /// Compute tanh bound interval for [l, u].
 /// Since tanh is monotonically increasing: tanh(l) <= tanh(x) <= tanh(u) for all x in [l, u].
 /// Directed rounding: compute in f64, apply next_down/next_up to guarantee
-/// lower bounds round DOWN and upper bounds round UP. (#3245)
+/// lower bounds round DOWN and upper bounds round UP.
 fn tanh_bound_interval(l: f32, u: f32) -> (f32, f32) {
     // Range clamp: -1 < tanh(x) < 1 for all finite x. Directed rounding can
-    // push past ±1 for extreme inputs (e.g., tanh(1000) → 1 → next_up > 1). (#3316)
+    // push past ±1 for extreme inputs (e.g., tanh(1000) → 1 → next_up > 1).
     (
         next_down_f32((l as f64).tanh() as f32).max(-1.0),
         next_up_f32((u as f64).tanh() as f32).min(1.0),
@@ -177,7 +177,6 @@ impl TanhLayer {
     }
 
     /// Patches CROWN backward propagation with pre-activation bounds.
-    /// Part of #2613 Phase 2: generic activation Patches support.
     pub(crate) fn propagate_patches_with_bounds(
         &self,
         bounds: &crate::bounds::patches::PatchesLinearBounds,

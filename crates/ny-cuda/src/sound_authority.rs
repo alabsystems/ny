@@ -126,7 +126,7 @@
 //!
 //! # MEASURED VERDICT for rung C2 on Apple M5 Max, 2026-08-06, NO CUDA DEVICE
 //!
-//! `cargo test -p ny-cuda report_cuda_sentinel_taint_lanes -- --nocapture`:
+//! `targo --unverified test -p ny-cuda report_cuda_sentinel_taint_lanes -- --nocapture`:
 //!
 //! ```text
 //! lane 0 cancel-add, slope 1      v=0      lin_err=8.88e-6  coeff=0      err=1.78e-5   FAIL

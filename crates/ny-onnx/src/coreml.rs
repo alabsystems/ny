@@ -728,6 +728,6 @@ mod tests {
         };
         assert_eq!(info.tensor_count, 0);
         assert_eq!(info.param_count, 0);
-        assert!(info.tensors.is_empty());
+        assert_eq!((info.tensors).len(), 0);
     }
 }

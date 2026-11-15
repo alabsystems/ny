@@ -4,7 +4,7 @@
 
 //! IBP soundness proptests for s-shaped and trigonometric activations.
 //!
-//! Covers the 7 activations identified as missing IBP proptest coverage in #2435:
+//! Covers the 7 activations identified as missing IBP proptest coverage:
 //! Sigmoid, Tanh, Softplus, Sin, Cos, Tan, Arctan.
 //!
 //! Each test verifies that for any concrete input x within [l, u],
@@ -113,7 +113,6 @@ proptest! {
 // GELU has two approximation variants: tanh and erf. Both need independent IBP
 // coverage because they use different evaluation formulas and may have different
 // IBP implementations (e.g., different critical-point computations).
-// Part of #3126, #2435.
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(1000) })]

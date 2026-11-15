@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Timestamp-query profiling for GPU CROWN backward compute passes (#3599).
+//! Timestamp-query profiling for GPU CROWN backward compute passes.
 
 use std::collections::BTreeMap;
 

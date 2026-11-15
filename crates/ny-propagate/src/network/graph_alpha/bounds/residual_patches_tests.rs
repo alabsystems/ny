@@ -433,6 +433,223 @@ fn residual_patches_bounds_enclose_sampled_outputs() {
         }
     }
 }
+
+/// The f32 weights of `residual_conv(seed)`, computed by the SAME f32
+/// expression that fixture uses, widened exactly to f64.
+fn residual_kernel_f64(seed: f32) -> [[f64; 3]; 3] {
+    let mut kernel = [[0.0_f64; 3]; 3];
+    for (i, row) in kernel.iter_mut().enumerate() {
+        for (j, weight) in row.iter_mut().enumerate() {
+            *weight = f64::from(seed * (((i * 3 + j) as f32) - 4.0) / 10.0);
+        }
+    }
+    kernel
+}
+
+/// f64 reference for one `residual_conv(seed)` layer over the single-channel
+/// `SPATIAL x SPATIAL` map: cross-correlation (`ih = oh + ki - pad`, as in
+/// `conv2d_tap_axis`), stride 1, zero padding 1, bias `0.01_f32`.
+fn residual_conv_f64(input: &[f64], seed: f32) -> Vec<f64> {
+    let kernel = residual_kernel_f64(seed);
+    let bias = f64::from(0.01_f32);
+    let mut output = vec![0.0_f64; SPATIAL * SPATIAL];
+    for oh in 0..SPATIAL {
+        for ow in 0..SPATIAL {
+            let mut acc = bias;
+            for (ki, row) in kernel.iter().enumerate() {
+                for (kj, &weight) in row.iter().enumerate() {
+                    let (Some(ih), Some(iw)) = ((oh + ki).checked_sub(1), (ow + kj).checked_sub(1))
+                    else {
+                        continue;
+                    };
+                    if ih < SPATIAL && iw < SPATIAL {
+                        acc += weight * input[ih * SPATIAL + iw];
+                    }
+                }
+            }
+            output[oh * SPATIAL + ow] = acc;
+        }
+    }
+    output
+}
+
+/// f64 forward pass of `build_resnet_block_graph` at one concrete input,
+/// returning the demanded targets' activations. Accumulation error is
+/// ~1e-15, six orders below the 1e-9 soundness tolerance it is checked at.
+fn resnet_block_reference_f64(input: &[f64]) -> [(&'static str, Vec<f64>); 3] {
+    let conv1 = residual_conv_f64(input, 1.0);
+    let relu1: Vec<f64> = conv1.iter().map(|value| value.max(0.0)).collect();
+    let conv2 = residual_conv_f64(&relu1, 0.7);
+    let add: Vec<f64> = conv2.iter().zip(&conv1).map(|(a, b)| a + b).collect();
+    let relu2: Vec<f64> = add.iter().map(|value| value.max(0.0)).collect();
+    let conv3 = residual_conv_f64(&relu2, 0.5);
+    [("conv1", conv1), ("add", add), ("conv3", conv3)]
+}
+
+/// #patches-merge-expiry (audit N6) end to end: CROWN-IBP collection under a
+/// LIVE HARD deadline keeps CROWN at the targets whose walks cross the residual
+/// join, and those bounds enclose the network's exact forward values.
+///
+/// `add` joins a pending virtual identity (the skip branch) with a 3x3 pad-1
+/// carrier at `conv1`; `conv3` joins a 3x3 pad-1 carrier with a 5x5 pad-2 one
+/// there — the yolo_2023 `Add_8` and `Conv_5` join shapes in miniature. Before
+/// the fix a hard deadline skipped the native merge, the Dense promotion asked
+/// >= 64 MiB of this 4 MiB budget, and both targets fell back to IBP.
+#[ntest::timeout(180000)]
+#[test]
+fn hard_deadline_collection_keeps_crown_at_residual_join_and_encloses_samples() {
+    assert!(
+        crate::network::core::sequential::crown::patches_step::expiry_authority_armed(),
+        "this regression requires the shipped-default ARMED patches expiry lever"
+    );
+
+    // 4 MiB is below the 8 MiB dense identity pair (every target starts in
+    // Patches), above the ~1.3 MiB native merge receipt, and far below the
+    // Dense promotion the hard route used to request at the join.
+    let (graph, input) = build_resnet_block_graph();
+    let (unbounded_graph, _) = build_resnet_block_graph();
+    let far_future = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+    let (saved_before, _) =
+        crate::network::core::graph::merge_accumulator::patches_merge_graph_preserve_snapshot();
+    let (result, unbounded) = crate::tests::with_crown_dense_budget_mb("4", || {
+        (
+            graph.collect_crown_ibp_bounds_dag_with_status_and_deadline(
+                &input,
+                Some(far_future),
+                None,
+            ),
+            // A separate graph object: the collection cache is per graph, so
+            // this no-deadline control cannot be served the hard-deadline map.
+            unbounded_graph.collect_crown_ibp_bounds_dag_with_status(&input),
+        )
+    });
+    let result = result.expect("hard-deadline collection succeeds");
+    let unbounded = unbounded.expect("no-deadline control collection succeeds");
+    let (saved_after, _) =
+        crate::network::core::graph::merge_accumulator::patches_merge_graph_preserve_snapshot();
+
+    let details: Vec<String> = result
+        .fallback_events
+        .iter()
+        .map(|e| format!("{:?}: {}", e.reason, e.details))
+        .collect();
+    for name in ["conv1", "add", "conv3"] {
+        assert_eq!(
+            result.provenance.get(name),
+            Some(&BoundsProvenance::Crown),
+            "#patches-merge-expiry: '{name}' lost CROWN under a live hard deadline \
+             (the residual join densified or refused). fallbacks: {details:#?}"
+        );
+    }
+    assert!(
+        saved_after >= saved_before + 2,
+        "[deadline-preserve] patches-merge-graph never counted a saved join \
+         ({saved_before} -> {saved_after}): the hard-authority native merge did not \
+         engage, so this collection did not exercise the fix (VOID)"
+    );
+
+    // Parity with the no-deadline control: a deadline that cannot expire must
+    // not loosen the join targets (tolerance covers the certified-f64 conv IBP
+    // a deadlined collection computes, audit item N24).
+    for name in ["add", "conv3"] {
+        let hard = &result.bounds[name];
+        let control = &unbounded.bounds[name];
+        for ((&hl, &hu), (&cl, &cu)) in hard
+            .lower()
+            .iter()
+            .zip(hard.upper().iter())
+            .zip(control.lower().iter().zip(control.upper().iter()))
+        {
+            let scale = cl.abs().max(cu.abs()).max(1.0);
+            assert!(
+                hl >= cl - 1e-4 * scale && hu <= cu + 1e-4 * scale,
+                "#patches-merge-expiry: hard-deadline '{name}' bound [{hl}, {hu}] is looser \
+                 than the no-deadline control [{cl}, {cu}]"
+            );
+        }
+    }
+
+    // Soundness: every collected bound encloses the exact forward value at
+    // interior, corner and mixed-vertex samples of the input box. The point
+    // IBP below runs outside the budget scope, so exclude env writers.
+    let _env = crate::tests::lock_env_shared();
+    let lower_in: Vec<f32> = input.lower().iter().copied().collect();
+    let upper_in: Vec<f32> = input.upper().iter().copied().collect();
+    let mut samples: Vec<(String, Vec<f32>)> = Vec::new();
+    for t in [0.0_f32, 0.25, 0.5, 0.75, 1.0] {
+        let point = lower_in
+            .iter()
+            .zip(&upper_in)
+            .map(|(&l, &u)| (l + t * (u - l)).clamp(l, u))
+            .collect();
+        samples.push((format!("t={t}"), point));
+    }
+    for pattern in 0..4_usize {
+        let point = lower_in
+            .iter()
+            .zip(&upper_in)
+            .enumerate()
+            .map(
+                |(i, (&l, &u))| {
+                    if (i * 7 + pattern * 3) % 5 < 2 {
+                        l
+                    } else {
+                        u
+                    }
+                },
+            )
+            .collect();
+        samples.push((format!("vertex pattern {pattern}"), point));
+    }
+
+    for (label, point_f32) in samples {
+        let point_f64: Vec<f64> = point_f32.iter().map(|&value| f64::from(value)).collect();
+        let reference = resnet_block_reference_f64(&point_f64);
+        // Fixture sanity (not the soundness check): the network's own IBP at
+        // this degenerate box agrees with the f64 reference, so the reference
+        // really is this graph's forward function.
+        let point_box = BoundedTensor::concrete(
+            ArrayD::from_shape_vec(IxDyn(&[1, SPATIAL, SPATIAL]), point_f32)
+                .expect("valid point shape"),
+        )
+        .expect("valid concrete point");
+        let point_bounds = graph
+            .collect_node_bounds(&point_box)
+            .expect("point IBP succeeds");
+
+        for (name, values) in &reference {
+            let bound = &result.bounds[*name];
+            let point_bound = &point_bounds[*name];
+            assert_eq!(bound.len(), values.len(), "{name} width");
+            for (idx, (((&value, &lower), &upper), (&point_lower, &point_upper))) in values
+                .iter()
+                .zip(bound.lower().iter())
+                .zip(bound.upper().iter())
+                .zip(point_bound.lower().iter().zip(point_bound.upper().iter()))
+                .enumerate()
+            {
+                assert!(
+                    (value - f64::from(point_lower)).abs() <= 1e-4
+                        && (value - f64::from(point_upper)).abs() <= 1e-4,
+                    "fixture error, not a soundness result: f64 reference {name}[{idx}] = \
+                     {value} disagrees with the network's point IBP \
+                     [{point_lower}, {point_upper}] ({label})"
+                );
+                assert!(
+                    f64::from(lower) <= value + 1e-9,
+                    "UNSOUND LOWER under a hard deadline: {name}[{idx}] exact {value} < \
+                     collected lower {lower} ({label})"
+                );
+                assert!(
+                    f64::from(upper) >= value - 1e-9,
+                    "UNSOUND UPPER under a hard deadline: {name}[{idx}] exact {value} > \
+                     collected upper {upper} ({label})"
+                );
+            }
+        }
+    }
+}
+
 /// FALSE-BOUND regression for `Sub` CROWN backward.
 ///
 /// `SubLayer::propagate_linear_binary` used to give the right operand
@@ -819,7 +1036,7 @@ fn finite_deadline_conv_backward_is_not_orders_slower_than_gemm() {
 /// row-major source with stride `k` — one cache line per element. Profiling the
 /// patches compose seam attributed 52.8% of its samples to that repack.
 ///
-/// MEASURE THIS IN RELEASE (`cargo test --release`). In the dev profile faer is
+/// MEASURE THIS IN RELEASE (`targo --unverified test --release`). In the dev profile faer is
 /// unoptimised and the whole GEMM runs at ~2.9 GFLOP/s, where the repack is
 /// invisible and the comparison INVERTS — dev showed the repack "faster"
 /// (149 vs 162 ms) while release shows the opposite:

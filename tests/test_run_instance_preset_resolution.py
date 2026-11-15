@@ -143,7 +143,12 @@ def _captured_ny_env(tmp_path: Path) -> dict[str, str]:
 
 
 def _write_fake_cargo(tmp_path: Path) -> None:
-    """Create a fake Cargo that emits one fresh, authenticated ny artifact."""
+    """Create a fake Cargo that emits one fresh, authenticated ny artifact.
+
+    Installed as both `targo` (the private tree's Trust build tool, which must
+    be handed its unverified lane) and `cargo` (the public snapshot's stock
+    pin); either way it records the build arguments without the lane flag.
+    """
     cargo = tmp_path / "bin" / "cargo"
     cargo.parent.mkdir(parents=True, exist_ok=True)
     cargo.write_text(
@@ -151,6 +156,10 @@ def _write_fake_cargo(tmp_path: Path) -> None:
             #!/bin/bash
             set -euo pipefail
 
+            if [ "$(basename "$0")" = targo ]; then
+                [ "${1:-}" = --unverified ] || { echo "fake targo: build without a lane: $*" >&2; exit 97; }
+                shift
+            fi
             printf '%s\\n' "$@" > "$PWD/cargo-args.txt"
             : "${CARGO_TARGET_DIR:?missing invocation-scoped target directory}"
             artifact="$CARGO_TARGET_DIR/release/ny"
@@ -167,6 +176,7 @@ def _write_fake_cargo(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     cargo.chmod(0o755)
+    shutil.copy(cargo, tmp_path / "bin" / "targo")
 
 
 def _write_archive_source_identity(tmp_path: Path) -> None:
@@ -205,6 +215,9 @@ def _run_build_submission_binary(tmp_path: Path) -> subprocess.CompletedProcess[
     script = _copy_build_submission_binary(tmp_path)
     _write_fake_cargo(tmp_path)
     env = os.environ.copy()
+    # Exercise the script's default target placement independently of an
+    # outer gate's shared build cache.
+    env.pop("CARGO_TARGET_DIR", None)
     env["PATH"] = f"{tmp_path / 'bin'}:{env.get('PATH', '')}"
     return subprocess.run(
         [str(script)],
@@ -648,6 +661,7 @@ def test_build_submission_binary_fails_closed_when_full_tier_fails(
         encoding="utf-8",
     )
     cargo.chmod(0o755)
+    shutil.copy(cargo, tmp_path / "bin" / "targo")
     env = os.environ.copy()
     env["PATH"] = f"{tmp_path / 'bin'}:{env.get('PATH', '')}"
 

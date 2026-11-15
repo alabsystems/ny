@@ -24,7 +24,7 @@ use std::sync::{Arc, OnceLock};
 
 use faer::Mat;
 use ndarray::{Array, Array1, Axis, Dimension, Slice};
-use ny_core::Result;
+use ny_core::{NyError, Result};
 use ny_tensor::next_up_f32;
 
 use super::LinearLayer;
@@ -448,6 +448,45 @@ impl<D: Dimension> TrackedLinearArray<D> {
     #[inline]
     pub(crate) fn as_array(&self) -> &Array<f32, D> {
         &self.value
+    }
+
+    /// Release this read-only carrier without changing the original ndarray
+    /// allocation, logical offset, dimensions, strides or value bits.
+    pub(crate) fn into_array(self) -> Array<f32, D> {
+        self.value
+    }
+
+    /// Non-authorizing capacity observation for another fixed-rank owner.
+    /// Unsupported layout remains distinct from a hard provenance invariant.
+    /// The carrier exposes no mutable array or allocation-changing operation.
+    pub(crate) fn observed_payload_bytes_v1(&self) -> Result<Option<usize>> {
+        if self.value.ndim() > 2 {
+            return Err(NyError::InvalidSpec(
+                "Tracked fixed-rank owner exceeds rank two".into(),
+            ));
+        }
+        // Reuse the original pointer/offset/capacity invariant checks. The
+        // intermediate role tag does not escape this capacity-only observer.
+        match self.allocation_fact(LinearNdArrayRoleV1::Weight) {
+            Ok(fact) => Ok(Some(fact.exact_payload_capacity_bytes)),
+            Err(TrackedArrayObservationFailureV1::Unsupported(_)) => Ok(None),
+            Err(reason) => Err(NyError::InvalidSpec(format!(
+                "Tracked ndarray allocation invariant: {reason:?}"
+            ))),
+        }
+    }
+
+    /// Requested backing capacity, without cloning the owned ndarray.
+    pub(super) fn retained_payload_bytes(&self) -> Result<usize> {
+        match self.allocation {
+            TrackedArrayStateV1::Accounted(fact) => fact
+                .element_capacity
+                .checked_mul(size_of::<f32>())
+                .ok_or_else(|| NyError::InvalidSpec("Linear allocation capacity overflow".into())),
+            _ => Err(NyError::InvalidSpec(
+                "Linear allocation census requires accounted ndarray ownership".into(),
+            )),
+        }
     }
 
     fn allocation_fact(

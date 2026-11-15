@@ -491,7 +491,7 @@ fn test_unknown_output_operator_errors() {
     assert!(parse_vnnlib(content).is_err());
 }
 
-// --- Output index validation at parse time (#1886) ---
+// --- Output index validation at parse time ---
 
 #[ntest::timeout(10000)]
 #[test]

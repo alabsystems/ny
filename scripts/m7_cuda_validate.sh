@@ -85,7 +85,7 @@ fi
 # one Cargo invocation covers both hermetic contracts and live device probes.
 # The `cuda` feature lives on ny-cli (`cuda = ["dep:ny-cuda"]`); the ny-cuda
 # crate itself intentionally has no feature by that name.
-cargo test --locked --release -p ny-cuda -- --nocapture \
+targo --unverified test --locked --release -p ny-cuda -- --nocapture \
   2>&1 | tee /tmp/m7_devtests.log | grep -E "test result|device|FAILED"
 device_test_status="${PIPESTATUS[0]}"
 if [ "${device_test_status}" -ne 0 ] || ! grep -q "test result: ok" /tmp/m7_devtests.log; then

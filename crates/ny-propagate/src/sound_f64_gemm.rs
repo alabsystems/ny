@@ -246,6 +246,15 @@ fn preinitialized_engine(engine: &OnceLock<Option<SharedEngine>>) -> Option<&Sha
     engine.get().and_then(Option::as_ref)
 }
 
+/// Borrow an already-published engine for the original-root checked route.
+/// This get-only observation never invokes, waits for, or starts a factory.
+/// The caller must check CPU-only custody and the exact checked capabilities.
+pub(crate) fn preinitialized_root_cut_engine() -> Option<&'static dyn GemmEngine> {
+    #[cfg(test)]
+    note_cpu_only_global_accessor_attempt();
+    preinitialized_engine(&ENGINE).map(|engine| engine.as_ref())
+}
+
 /// Run `f` against an engine that is ALREADY materialized, or return `None`.
 ///
 /// Unlike [`with_engine`] this never invokes the factory, and unlike
@@ -319,13 +328,51 @@ fn spawn_initializer_once() -> bool {
 /// the broad deadline slot. A partial or non-cooperative engine remains usable
 /// by its existing root/f64 call sites, but is deliberately refused here.
 fn shared_bab_engine_from_preinitialized(engine: Option<&SharedEngine>) -> Option<&dyn GemmEngine> {
-    let engine = engine?;
+    let verdict = |why: &str| shared_bab_admission_note(why);
+    let Some(engine) = engine else {
+        verdict("no-engine (factory not materialized on this thread)");
+        return None;
+    };
     if !engine.supports_deadline_safe_post_root_multi_objective_bab() {
+        verdict("refused: !supports_deadline_safe_post_root_multi_objective_bab");
         return None;
     }
-    let gpu = engine.as_gpu_crown_backward()?;
-    (gpu.provides_sound_gpu_crown() && gpu.honors_crown_backward_deadline())
-        .then_some(engine.as_ref())
+    let Some(gpu) = engine.as_gpu_crown_backward() else {
+        verdict("refused: as_gpu_crown_backward()==None (engine is not a GPU CROWN backward)");
+        return None;
+    };
+    let sound = gpu.provides_sound_gpu_crown();
+    let deadline = gpu.honors_crown_backward_deadline();
+    if sound && deadline {
+        verdict("ADMITTED");
+        return Some(engine.as_ref());
+    }
+    verdict(if !sound {
+        "refused: !provides_sound_gpu_crown (needs a cuBLAS f64 backend; WgpuDevice returns false)"
+    } else {
+        "refused: !honors_crown_backward_deadline"
+    });
+    None
+}
+
+/// One-shot observable for the shared graph-BaB GPU engine admission.
+///
+/// R9. Before this line the admission had NO runtime signal of any kind — this
+/// file contained zero `eprintln!` — so a cgan run showing a CPU-speed backward
+/// could not distinguish "the engine was refused" from "the engine was admitted
+/// and is simply silent". Measured 2026-09-01: ny explores ~1900 domains in
+/// 560 s where abc, on the same box and the same row, refines 21041 unstable
+/// neurons in ~1.1 s and finishes in 2 domains. Which of those two worlds we are
+/// in decides whether the gap is a missing backend or a slow kernel, and the log
+/// could not say. `eprintln!` and not `info!`: the scored vnncomp entry point
+/// swallows `info!`, which is how the cgan dark tail stayed invisible for weeks.
+///
+/// Prints at most once per process and carries no cost on the hot path.
+fn shared_bab_admission_note(why: &str) {
+    static ANNOUNCED: OnceLock<()> = OnceLock::new();
+    ANNOUNCED.get_or_init(|| {
+        eprintln!("[gpu-bab-engine] {why}");
+    });
 }
 
 /// Return the already-materialized sound-f64 engine only when it is safe for a

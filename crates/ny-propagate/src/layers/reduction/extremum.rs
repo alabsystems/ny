@@ -16,6 +16,7 @@ use ny_core::{checked_shape_product, nan_propagating_max, nan_propagating_min, N
 use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor, RepairStrategy};
 
 use super::{compute_strides, resolve_reduction_axes};
+use crate::layers::linear::bias::{add_f64_down, add_f64_up};
 use crate::{BoundPropagation, LinearBounds};
 
 /// Compute max reduction along an axis, returning the reduced array.
@@ -201,17 +202,31 @@ pub(super) fn reduce_extremum_backward(
                 for row in 0..num_outputs {
                     let la = bounds.lower_a()[[row, output_idx]];
                     let ua = bounds.upper_a()[[row, output_idx]];
+                    // Each `la/ua as f64 * ext as f64` is EXACT (a binary32 product
+                    // widened to binary64), so the ADDITION CHAIN is the only error
+                    // here — and it is mixed-sign, one term per unstable group per
+                    // row. The single directed f32 step at publication cannot cover
+                    // a chain that has already cancelled in f64: the sibling
+                    // `pooling/max.rs` (same fold, `add_f64_down`/`add_f64_up` at
+                    // :529,:536,:545,:556) ships the counterexample — +2^40, -2^-14,
+                    // -2^40 lands the chain on exactly 0.0, and `next_down_f32(0.0)`
+                    // is then 6.1e-5 ABOVE the constant it must under-approximate.
+                    // Accumulate directed instead (idiom (b)).
                     // Lower row: minimize la*y over y in [ext_lower, ext_upper].
                     if la > 0.0 {
-                        new_lower_b[row] += la as f64 * ext_lower as f64;
+                        new_lower_b[row] =
+                            add_f64_down(new_lower_b[row], la as f64 * ext_lower as f64);
                     } else if la < 0.0 {
-                        new_lower_b[row] += la as f64 * ext_upper as f64;
+                        new_lower_b[row] =
+                            add_f64_down(new_lower_b[row], la as f64 * ext_upper as f64);
                     }
                     // Upper row: maximize ua*y over y in [ext_lower, ext_upper].
                     if ua > 0.0 {
-                        new_upper_b[row] += ua as f64 * ext_upper as f64;
+                        new_upper_b[row] =
+                            add_f64_up(new_upper_b[row], ua as f64 * ext_upper as f64);
                     } else if ua < 0.0 {
-                        new_upper_b[row] += ua as f64 * ext_lower as f64;
+                        new_upper_b[row] =
+                            add_f64_up(new_upper_b[row], ua as f64 * ext_lower as f64);
                     }
                 }
             }
@@ -352,7 +367,7 @@ fn propagate_extremum_ibp(
         }
     }
 
-    // Centralized NaN/Inf repair at constructor (#3423).
+    // Centralized NaN/Inf repair at constructor.
     BoundedTensor::new_repaired(lower, upper, RepairStrategy::Conservative)
 }
 

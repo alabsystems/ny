@@ -39,6 +39,9 @@
 //! proven-sound CPU dense backward. The decomposition can only *refuse*; it can never
 //! produce an unsound bound.
 
+/// Charged raw-BatchNorm pure-chain extraction for the certified root route.
+pub(crate) mod raw_bn;
+
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -448,7 +451,7 @@ pub(crate) fn resnet_refold_guard_enabled() -> bool {
 /// sub-domain and only the element-wise-tightest sound iterate is kept — never
 /// looser than the single-shot lane.
 ///
-/// **DEFAULT FLIPPED TO OFF 2026-08-13 — it was a MEASURED PESSIMISATION.** The
+/// **Formerly flipped OFF (2026-08-13) as a MEASURED PESSIMISATION; reversed below.** The
 /// lane shipped default-ON to apply "wide-fold throughput to the β-opt-eligible
 /// (scored) path". Measured through `[phase] mo-wave-stage` on cifar100
 /// idx_7641, IN THE SCORED CONFIGURATION (`OMP_NUM_THREADS=1`, as
@@ -470,7 +473,7 @@ pub(crate) fn resnet_refold_guard_enabled() -> bool {
 /// from the wide fold's absence. Always A/B this at OMP_NUM_THREADS=1: measuring
 /// it at 20 understates the gap.
 ///
-/// Opt back in with `NY_BAB_RESNET_WIDE_BETA=1`.
+/// While it was OFF, `NY_BAB_RESNET_WIDE_BETA=1` opted back in.
 /// #wide-beta-reflip: DEFAULT-ON again, and the reversal is the point.
 ///
 /// This was flipped OFF earlier on a measured 1.76x pessimization (per_child
@@ -657,7 +660,7 @@ pub(in crate::network::graph_alpha) fn bake_relu_layer(
             if let Some(unstable_mask) = alpha_state.relu_unstable_mask(node_name) {
                 let pre_l = pre_activation.lower().as_slice()?;
                 let pre_u = pre_activation.upper().as_slice()?;
-                // #4404: expand channel-only alpha to full spatial for GPU extraction.
+                // Expand channel-only alpha to full spatial for GPU extraction.
                 let al = alpha_state.expand_alpha(node_name, alpha_lower);
                 let au = alpha_state.expand_alpha(node_name, alpha_upper);
                 let mask = if alpha_state.spatial_shape(node_name).is_some() {
@@ -2332,7 +2335,7 @@ mod tests {
             "the request itself must dispatch one K-row transaction, not K scalar calls"
         );
         assert!(!result.segments.is_empty());
-        assert!(!result.relu_names.is_empty());
+        assert_ne!((result.relu_names).len(), 0);
 
         let batched_lower: Vec<f32> = result.bounds.lower().iter().copied().collect();
         let batched_upper: Vec<f32> = result.bounds.upper().iter().copied().collect();

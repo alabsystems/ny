@@ -191,8 +191,8 @@ fn test_graph_network_ibp_where_wrong_arity_returns_invalid_spec_2633() {
     );
 }
 
-/// #2991: Concat with single input is now caught at construction time by
-/// GraphNode::try_new() arity validation (#2481, #2686).
+/// Concat with single input is now caught at construction time by
+/// GraphNode::try_new() arity validation.
 #[ntest::timeout(10000)]
 #[test]
 fn test_graph_network_ibp_concat_requires_two_inputs() {
@@ -243,7 +243,7 @@ fn test_graph_network_collect_node_bounds_concat_requires_two_inputs() {
     );
 }
 
-/// #4112 follow-up: fully-constant Concat may have zero graph-edge inputs, but
+/// Fully-constant Concat may have zero graph-edge inputs, but
 /// an empty constant list is still malformed and must fail at construction.
 #[ntest::timeout(10000)]
 #[test]

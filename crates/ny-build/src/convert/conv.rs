@@ -31,7 +31,6 @@ fn parse_non_negative_usize(
 /// Strides of 0 cause divide-by-zero in output-size formulas.
 /// Defense-in-depth: constructors also reject stride=0, but catching it
 /// at the conversion boundary prevents invalid values from propagating.
-/// Part of #2828.
 fn parse_positive_usize(
     value: i64,
     op_name: &str,
@@ -50,7 +49,6 @@ fn parse_positive_usize(
 /// Parse stride attributes, enforcing strictly positive values (>= 1).
 ///
 /// Strides must be >= 1 to prevent divide-by-zero in output-size formulas.
-/// Part of #2828.
 fn parse_stride_attr(spec: &LayerSpec, op_name: &str, spatial_rank: usize) -> Result<Vec<usize>> {
     parse_positive_spatial_attr(spec, op_name, spatial_rank, "strides")
 }
@@ -1143,7 +1141,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #2828: stride=0 must be rejected at conversion time.
+    /// Regression test: stride=0 must be rejected at conversion time.
     /// Now caught by parse_stride_attr (ModelLoad) before reaching the constructor.
     #[ntest::timeout(10000)]
     #[test]
@@ -1161,7 +1159,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #2828: stride=0 in both dims must be rejected.
+    /// Regression test: stride=0 in both dims must be rejected.
     #[ntest::timeout(10000)]
     #[test]
     fn conv2d_zero_stride_both_dims_is_rejected() {
@@ -1178,7 +1176,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #2828: stride=0 in ConvTranspose2d must be rejected.
+    /// Regression test: stride=0 in ConvTranspose2d must be rejected.
     #[ntest::timeout(10000)]
     #[test]
     fn conv_transpose2d_zero_stride_is_rejected() {
@@ -1195,7 +1193,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #2828: stride=0 in Conv1d must be rejected at conversion.
+    /// Regression test: stride=0 in Conv1d must be rejected at conversion.
     #[ntest::timeout(10000)]
     #[test]
     fn conv1d_zero_stride_is_rejected() {
@@ -1212,7 +1210,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #2828: negative stride in Conv1d must be rejected.
+    /// Regression test: negative stride in Conv1d must be rejected.
     #[ntest::timeout(10000)]
     #[test]
     fn conv1d_negative_stride_is_rejected() {
@@ -1229,7 +1227,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #2828: stride=0 in ConvTranspose1d must be rejected.
+    /// Regression test: stride=0 in ConvTranspose1d must be rejected.
     #[ntest::timeout(10000)]
     #[test]
     fn conv_transpose1d_zero_stride_is_rejected() {

@@ -2,6 +2,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+/// `#cgan-child-seed`: shrink-only seeding of a BaB child's cascade baseline.
+#[path = "alpha_child_seed.rs"]
+mod child_seed;
 #[path = "alpha_reciprocal_support.rs"]
 mod reciprocal_support;
 #[path = "alpha_spec_objective.rs"]
@@ -68,6 +71,20 @@ impl AlphaReferenceBoundsSource {
             self,
             Self::CganCompleteCrownIbp { .. } | Self::CganSparseTargetComplete { .. }
         )
+    }
+
+    /// Whether this map came from the COMPLETE cGAN CROWN-IBP cascade
+    /// specifically (`#cgan-child-interm-refine`).
+    ///
+    /// Kept as a predicate, like `is_crown_ibp` below, so the input-split
+    /// child-refinement lane can assert that a child ENTERED the cascade
+    /// without naming this private module's enum. It is a production reader,
+    /// not a test helper: a refined child map is installed only on the
+    /// collector's OWN reported provenance, because a silently-refused cascade
+    /// would otherwise publish a map the lever never actually produced, and
+    /// read as a negative result rather than the void one it is.
+    pub(crate) const fn is_cgan_complete_crown_ibp(self) -> bool {
+        matches!(self, Self::CganCompleteCrownIbp { .. })
     }
 
     #[cfg(test)]
@@ -154,16 +171,51 @@ impl GraphNetwork {
     /// it. Requiring the ordinary fixed-intermediate contract makes the policy
     /// a targeted replacement for the otherwise-selected forward-linear root
     /// map without enabling the historical post-optimization all-node pass.
+    /// #cgan-eligibility-observable: report WHICH clause declined.
+    ///
+    /// This is a five-way AND behind the whole typed cGAN root cascade
+    /// (`cgan_complete_crown_ibp_root`, `cgan_collector_dense`,
+    /// `cgan_unstable_rows`, `cgan_crown_root_map`). When it returns false the
+    /// cascade silently falls back to `CrownIbpCollectionMode::Standard`, the
+    /// `[collector-mode]` and `[unstable-rows]` lines are never printed —
+    /// they are gated on `requires_shrink_only_publication()` — and the run
+    /// produces a verdict that is INDISTINGUISHABLE from a capability result.
+    ///
+    /// Measured 2026-09-14: on `cGAN_imgSz32_nCh_3_nonlinear_activations` and
+    /// `..._upsample` the whole cascade was inert (`collector-mode=0
+    /// unstable-rows=0`) while the two ReLU-only rows beside them engaged
+    /// (`collector-mode=2`). Both inert rows timed out at 100% of budget and
+    /// read as capability-bound; by this repo's own rule a silent lever makes
+    /// the result VOID, not negative. Those two rows are 9.5 of cgan's 14.3
+    /// remaining points.
+    ///
+    /// One line, no behaviour change, rate-limited to the first refusal per
+    /// process so a BaB loop cannot flood the log.
     pub(crate) fn cgan_complete_crown_ibp_root_eligible(
         &self,
         config: &AlphaCrownConfig,
         exec_order: &[String],
     ) -> bool {
-        config.cgan_complete_crown_ibp_root
-            && config.fix_interm_bounds
-            && !config.cgan_sparse_target_complete_root
-            && self.is_sequential_graph(exec_order)
-            && self.should_collect_forward_linear_intermediate_reference()
+        let requested = config.cgan_complete_crown_ibp_root;
+        let fix_interm = config.fix_interm_bounds;
+        let not_sparse_target = !config.cgan_sparse_target_complete_root;
+        let sequential = self.is_sequential_graph(exec_order);
+        let fl_reference = self.should_collect_forward_linear_intermediate_reference();
+        let eligible = requested && fix_interm && not_sparse_target && sequential && fl_reference;
+        if requested && !eligible {
+            static REPORTED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[cgan-root] DECLINED: requested=true but fix_interm_bounds={fix_interm} \
+not_sparse_target={not_sparse_target} is_sequential_graph={sequential} \
+forward_linear_reference={fl_reference} — the typed cGAN root cascade (dense \
+collector, unstable rows, crown root map) is INERT for this graph, so any null \
+from it is VOID rather than a capability result"
+                );
+            }
+        }
+        eligible
     }
 
     /// Whether this graph/config pair is allowed to request the typed cGAN
@@ -187,7 +239,7 @@ impl GraphNetwork {
     ///
     /// With `fix_interm_bounds=true`, DAGs now follow the same IBP reference-bound
     /// contract as sequential graphs, except for the existing deep-sequential
-    /// CROWN-IBP override (#3628, #4404).
+    /// CROWN-IBP override.
     pub(crate) fn collect_alpha_reference_bounds_with_engine(
         &self,
         input: &BoundedTensor,
@@ -201,14 +253,201 @@ impl GraphNetwork {
         .map(|(bounds, _source)| bounds)
     }
 
+    /// The complete cGAN CROWN-IBP cascade over an already-certified
+    /// `baseline` map for `input`.
+    ///
+    /// Extracted verbatim from the typed root branch of
+    /// [`Self::collect_alpha_reference_bounds_with_engine_and_source`] so the
+    /// `#cgan-child-seed` child collector runs the IDENTICAL cascade; the only
+    /// thing that differs between the two callers is the baseline handed in.
+    /// The collector publishes every node as the baseline or its shrink-only
+    /// intersection with another sound enclosure, so the result is never wider
+    /// than `baseline`.
+    fn cgan_complete_cascade_from_baseline(
+        &self,
+        input: &BoundedTensor,
+        config: &AlphaCrownConfig,
+        engine: Option<&dyn ny_core::GemmEngine>,
+        baseline: std::collections::HashMap<String, BoundedTensor>,
+    ) -> Result<(
+        std::collections::HashMap<String, BoundedTensor>,
+        AlphaReferenceBoundsSource,
+    )> {
+        let result = self.collect_crown_ibp_bounds_dag_with_options(
+            input,
+            crown::CrownIbpCollectOptions {
+                engine,
+                deadline: config.deadline,
+                precomputed_ibp: Some(baseline),
+                tightening_cap: Some(CGAN_COMPLETE_CROWN_IBP_ROOT_CAP),
+                collection_mode: crown_tighten::CrownIbpCollectionMode::CganComplete,
+                cgan_narrow_target_max_rows: config.cgan_narrow_target_max_rows,
+                // #cgan-collector-dense (E5): dense (matrix) conv
+                // walks for the complete cascade.
+                cgan_collector_dense: config.cgan_collector_dense,
+                // #cgan-unstable-rows: typed delivery of the
+                // sparse ReLU-row seed for this cascade.
+                cgan_unstable_rows: config.cgan_unstable_rows,
+                cgan_unstable_rows_max_frac: Some(config.cgan_unstable_rows_max_frac),
+                ..Default::default()
+            },
+        )?;
+        let all_demanded_targets_completed = result.all_requested_crown_targets_completed();
+        Ok((
+            result.bounds,
+            AlphaReferenceBoundsSource::CganCompleteCrownIbp {
+                all_demanded_targets_completed,
+            },
+        ))
+    }
+
+    /// `#cgan-child-seed`: the complete cGAN cascade for ONE BaB child box,
+    /// with its certified forward-linear baseline first intersected, in order,
+    /// with each map in `parent_seeds` — the domain's inherited intermediate
+    /// maps (the frozen root CROWN map, then any child-local override).
+    ///
+    /// Returns `Ok(None)` exactly where the unseeded child prepass would have
+    /// declined: the typed cascade is ineligible for this graph/config, or its
+    /// forward-linear baseline refuses with one of the routing-level errors
+    /// the root branch also treats as a refusal. It never falls through to
+    /// the ordinary (non-cascade) routing, because the child prepass installs
+    /// only maps the cascade itself produced.
+    ///
+    /// SOUNDNESS: see `alpha_child_seed.rs`. The seed and the baseline are
+    /// certified enclosures of the same child box's image; the merge is
+    /// shrink-only and fail-closed per node; the cascade then only shrinks
+    /// the merged baseline further.
+    pub(crate) fn collect_cgan_child_reference_bounds_seeded(
+        &self,
+        input: &BoundedTensor,
+        config: &AlphaCrownConfig,
+        engine: Option<&dyn ny_core::GemmEngine>,
+        exec_order: &[String],
+        parent_seeds: &[&std::collections::HashMap<String, BoundedTensor>],
+    ) -> Result<
+        Option<(
+            std::collections::HashMap<String, BoundedTensor>,
+            AlphaReferenceBoundsSource,
+            child_seed::ChildSeedReport,
+        )>,
+    > {
+        if !self.cgan_complete_crown_ibp_root_eligible(config, exec_order) {
+            return Ok(None);
+        }
+        let bounds = match self.collect_forward_linear_bounds_dag_cached_for_typed_cgan(
+            input,
+            config,
+            engine,
+            config.deadline,
+        ) {
+            Ok(bounds) => bounds,
+            Err(
+                error @ (NyError::UnsupportedOp(_)
+                | NyError::UnsupportedConfiguration(_)
+                | NyError::DeadlineExceeded(_)
+                | NyError::ShapeMismatch { .. }
+                | NyError::CpuMemoryExceeded { .. }),
+            ) => {
+                info!(
+                    "cGAN child-seed forward-linear baseline unavailable ({error}); \
+                     declining the seeded child cascade"
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let mut baseline = (*bounds).clone();
+        let unstable_rows_unseeded =
+            child_seed::count_unstable_relu_rows(self, &baseline, exec_order);
+        let mut merge = child_seed::SeedMergeStats::default();
+        for seed in parent_seeds {
+            let step = child_seed::intersect_parent_seed_into_baseline(&mut baseline, seed);
+            merge.nodes_seeded += step.nodes_seeded;
+            merge.nodes_declined += step.nodes_declined;
+            merge.elems_tightened += step.elems_tightened;
+        }
+        let unstable_rows_seeded =
+            child_seed::count_unstable_relu_rows(self, &baseline, exec_order);
+        let report = child_seed::ChildSeedReport {
+            nodes_seeded: merge.nodes_seeded,
+            nodes_declined: merge.nodes_declined,
+            elems_tightened: merge.elems_tightened,
+            unstable_rows_unseeded,
+            unstable_rows_seeded,
+        };
+        let (map, source) =
+            self.cgan_complete_cascade_from_baseline(input, config, engine, baseline)?;
+        Ok(Some((map, source, report)))
+    }
+
     /// Like [`Self::collect_alpha_reference_bounds_with_engine`] but also
     /// reports which collector produced the map (#dedup-root-collections).
+    ///
+    /// #vit-zono-root (DARK, typed `bab.vit_zono_root`): when the graph
+    /// carries a [`crate::zono_core::VitZonoRootPlan`], the certified
+    /// forward-zonotope root map (`zono_core::vit_root`, exact-box cached) is
+    /// computed first, handed to the CROWN-IBP branch as its baseline, and
+    /// finally intersected SHRINK-ONLY into whichever map the ordinary routing
+    /// returned. Both are certified enclosures of the same nodes over the same
+    /// input box, so the result encloses every reachable value and is never
+    /// wider than either: the routed map, or the zonotope ∩ IBP box. (On every
+    /// non-CROWN-IBP route the routed map IS the historical one, so the armed
+    /// map is elementwise inside the dark map.) A declined zonotope publishes
+    /// nothing. Without a plan (every shipped preset) this is exactly the
+    /// historical routing, byte-for-byte.
     pub(crate) fn collect_alpha_reference_bounds_with_engine_and_source(
         &self,
         input: &BoundedTensor,
         config: &AlphaCrownConfig,
         engine: Option<&dyn ny_core::GemmEngine>,
         exec_order: &[String],
+    ) -> Result<(
+        std::collections::HashMap<String, BoundedTensor>,
+        AlphaReferenceBoundsSource,
+    )> {
+        let Some(plan) = self.vit_zono_root_plan else {
+            return self.collect_alpha_reference_bounds_with_engine_and_source_routed(
+                input, config, engine, exec_order, None,
+            );
+        };
+        let (zono, cache_hit) =
+            crate::zono_core::vit_zono_root_map(self, input, &plan, config.deadline);
+        let (mut bounds, source) = self
+            .collect_alpha_reference_bounds_with_engine_and_source_routed(
+                input,
+                config,
+                engine,
+                exec_order,
+                zono.as_deref(),
+            )?;
+        let route = match source {
+            AlphaReferenceBoundsSource::CganCompleteCrownIbp { .. } => "cgan-complete",
+            AlphaReferenceBoundsSource::CganSparseTargetComplete { .. } => "cgan-sparse",
+            AlphaReferenceBoundsSource::CrownIbp => "crown-ibp",
+            AlphaReferenceBoundsSource::ForwardLinear => "forward-linear",
+            AlphaReferenceBoundsSource::Ibp => "ibp",
+        };
+        match zono.as_deref() {
+            Some(zono) => {
+                let stats = crate::zono_core::merge_shrink_only(&mut bounds, &zono.bounds);
+                crate::zono_core::vit_root::emit_stage("reference-merge", route, &stats, cache_hit);
+            }
+            None => crate::zono_core::vit_root::emit_unavailable(route, cache_hit),
+        }
+        Ok((bounds, source))
+    }
+
+    /// The historical reference-map routing. `vit_zono_seed` is `None` on
+    /// every dark path; when present (#vit-zono-root) it only replaces the
+    /// CROWN-IBP branch's foundational IBP map by its certified shrink-only
+    /// baseline.
+    fn collect_alpha_reference_bounds_with_engine_and_source_routed(
+        &self,
+        input: &BoundedTensor,
+        config: &AlphaCrownConfig,
+        engine: Option<&dyn ny_core::GemmEngine>,
+        exec_order: &[String],
+        vit_zono_seed: Option<&crate::zono_core::VitZonoRootMap>,
     ) -> Result<(
         std::collections::HashMap<String, BoundedTensor>,
         AlphaReferenceBoundsSource,
@@ -244,26 +483,8 @@ impl GraphNetwork {
                         "cGAN complete CROWN-IBP root reference ({} forward-linear baseline nodes)",
                         baseline.len()
                     );
-                    let result = self.collect_crown_ibp_bounds_dag_with_options(
-                        input,
-                        crown::CrownIbpCollectOptions {
-                            engine,
-                            deadline: config.deadline,
-                            precomputed_ibp: Some(baseline),
-                            tightening_cap: Some(CGAN_COMPLETE_CROWN_IBP_ROOT_CAP),
-                            collection_mode: crown_tighten::CrownIbpCollectionMode::CganComplete,
-                            cgan_narrow_target_max_rows: config.cgan_narrow_target_max_rows,
-                            ..Default::default()
-                        },
-                    )?;
-                    let all_demanded_targets_completed =
-                        result.all_requested_crown_targets_completed();
-                    return Ok((
-                        result.bounds,
-                        AlphaReferenceBoundsSource::CganCompleteCrownIbp {
-                            all_demanded_targets_completed,
-                        },
-                    ));
+                    return self
+                        .cgan_complete_cascade_from_baseline(input, config, engine, baseline);
                 }
                 Err(
                     error @ (NyError::UnsupportedOp(_)
@@ -381,16 +602,17 @@ impl GraphNetwork {
         // cifar10-set: the reference collect burns ~14s of a 25s budget in the
         // single-threaded deep_seq CROWN-IBP sweep before α even starts).
         // Research gate for measuring forward-linear references on such
-        // chains; gate-off is byte-identical.
-        let seq_conv_gate = std::env::var("NY_FORWARD_LINEAR_SEQ_CONV_REF")
-            .ok()
-            .as_deref()
-            == Some("1")
-            && exec_order.iter().any(|n| {
-                self.nodes
-                    .get(n)
-                    .is_some_and(|node| matches!(node.layer, Layer::Conv2d(_)))
-            });
+        // chains; gate-off is byte-identical. Read through its declaration
+        // (exact "1"), so the flight receipt and this gate cannot disagree.
+        let seq_conv_gate =
+            ny_levers::read(&ny_levers::decls::forward_linear::FORWARD_LINEAR_SEQ_CONV_REF)
+                .value
+                .as_bool()
+                && exec_order.iter().any(|n| {
+                    self.nodes
+                        .get(n)
+                        .is_some_and(|node| matches!(node.layer, Layer::Conv2d(_)))
+                });
         let conv_transpose_surface =
             GraphNetwork::forward_linear_conv_transpose_reference_enabled()
                 && exec_order.iter().any(|n| {
@@ -564,21 +786,63 @@ impl GraphNetwork {
                 "CROWN-IBP reference bounds (dag={is_dag}, deep_seq={deep_seq}, \
                  dense_dag={dense_dag}, {act_count} acts)"
             );
-            let collector_cap = crown_ibp_collector_cap();
-            return Ok((
-                self.collect_crown_ibp_bounds_dag_with_options(
-                    input,
-                    crown::CrownIbpCollectOptions {
-                        engine,
-                        deadline: config.deadline,
-                        tightening_cap: collector_cap,
-                        complete_cache_lookup_only: collector_cap.is_some(),
-                        ..Default::default()
+            // #vit-crown-interm: the typed `fix_interm_bounds: false` route may
+            // carry its own tightening cap (`crown_ibp_reference_cap_secs`,
+            // `None` everywhere it is not set, so unset is byte-identical). The
+            // research environment cap keeps precedence where present.
+            let typed_route = !config.fix_interm_bounds;
+            let collector_cap = crown_ibp_collector_cap().or(config.crown_ibp_reference_cap());
+            let started = std::time::Instant::now();
+            // #vit-zono-root: the zonotope-seeded baseline replaces only the
+            // foundational IBP map (`None` when dark: the historical default).
+            // Every CROWN target is intersected with its baseline entry and
+            // every refused/truncated target keeps it, so the collection is
+            // never wider than the certified zonotope ∩ IBP box.
+            let precomputed_ibp = vit_zono_seed.map(|seed| seed.baseline.clone());
+            if let Some(seed) = vit_zono_seed {
+                crate::zono_core::vit_root::emit_stage(
+                    "crown-ibp-seed",
+                    if typed_route {
+                        "fix_interm"
+                    } else {
+                        "crown-ibp"
                     },
-                )?
-                .bounds,
-                AlphaReferenceBoundsSource::CrownIbp,
-            ));
+                    &crate::zono_core::VitZonoMergeStats {
+                        nodes: seed.baseline.len(),
+                        nodes_merged: seed.bounds.len(),
+                        elems_tightened: seed.tightened_elems,
+                        ..crate::zono_core::VitZonoMergeStats::default()
+                    },
+                    false,
+                );
+            }
+            let collected = self.collect_crown_ibp_bounds_dag_with_options(
+                input,
+                crown::CrownIbpCollectOptions {
+                    engine,
+                    deadline: config.deadline,
+                    tightening_cap: collector_cap,
+                    complete_cache_lookup_only: collector_cap.is_some(),
+                    precomputed_ibp,
+                    ..Default::default()
+                },
+            )?;
+            let route = if typed_route {
+                "fix_interm"
+            } else if deep_seq {
+                "deep_seq"
+            } else {
+                "dense_dag"
+            };
+            ref_map_telemetry::emit_crown_ibp_reference_collect(
+                self,
+                &collected,
+                route,
+                is_dag,
+                collector_cap,
+                started.elapsed(),
+            );
+            return Ok((collected.bounds, AlphaReferenceBoundsSource::CrownIbp));
         }
 
         // Conv-DAG forward-linear reference bounds (#vnncomp-image-forward-linear):
@@ -701,7 +965,7 @@ impl GraphNetwork {
             }
         }
 
-        // #4036: non-SPSA gradient methods delegate to the DAG optimizer
+        // Non-SPSA gradient methods delegate to the DAG optimizer
         // which dispatches AnalyticChain, FD, and Analytic gradients.
         if config.gradient_method != crate::bounds::GradientMethod::Spsa {
             if let Some(result) = self.try_dag_gradient_dispatch(
@@ -715,7 +979,7 @@ impl GraphNetwork {
             }
         }
 
-        // Step 1: collect bounds at all nodes. (#3357)
+        // Step 1: collect bounds at all nodes.
         let reference_bounds = match precomputed_reference.take() {
             Some(reference) => reference.bounds,
             None => {
@@ -758,12 +1022,8 @@ impl GraphNetwork {
             let node = self.nodes.get(node_name).ok_or_else(|| {
                 NyError::InvalidSpec(format!("S-shaped node {} not found", node_name))
             })?;
-            let pre_activation = reference_bounds.get(node_name).ok_or_else(|| {
-                NyError::InvalidSpec(format!(
-                    "Pre-activation bounds for monotone node '{}' not found",
-                    node_name
-                ))
-            })?;
+            let pre_activation =
+                s_shaped_preactivation::resolve(node, node_name, input, &reference_bounds)?;
             match &node.layer {
                 Layer::Sigmoid(_) => alpha_state.add_sigmoid_node(node_name, pre_activation)?,
                 Layer::Tanh(_) => alpha_state.add_tanh_node(node_name, pre_activation)?,
@@ -797,7 +1057,7 @@ impl GraphNetwork {
         // diminishing returns due to bound explosion through many ReLU layers.
         // Skip optimization and return IBP/CROWN-IBP bounds directly. This
         // matches the check in propagate_dag.rs and saves ~20 backward passes
-        // for 16+ layer models like malbeware 16-25. #3218
+        // for 16+ layer models like malbeware 16-25.
         if config.adaptive_skip && relu_nodes.len() > config.adaptive_skip_depth_threshold {
             info!(
                 "GraphNetwork α-CROWN: adaptive skip — {} ReLU nodes > threshold {}, returning bounds without optimization",
@@ -840,7 +1100,7 @@ impl GraphNetwork {
         let mut no_improve_iters = 0usize;
         // Element-wise best output bounds: track per-dimension tightest lower/upper
         // across iterations. Without this, a scalar sum comparison can discard
-        // per-dimension tightness improvements. See #2251.
+        // per-dimension tightness improvements.
         let mut best_output_lower_arr: Option<ArrayD<f32>> = None;
         let mut best_output_upper_arr: Option<ArrayD<f32>> = None;
         let mut lr = config.learning_rate;
@@ -852,7 +1112,7 @@ impl GraphNetwork {
         let use_sparse = config.sparse_ratio < 1.0 && config.sparse_ratio > 0.0;
 
         for iter in 0..config.iterations {
-            // Deadline check (#2698): bail early if verification timeout budget
+            // Deadline check: bail early if verification timeout budget
             // is exhausted. Return current best bounds instead of running all iterations.
             if config.past_deadline() {
                 info!(
@@ -864,7 +1124,7 @@ impl GraphNetwork {
 
             // Compute CROWN bounds at OUTPUT node only (for efficiency)
             // We only need output bounds for the objective during optimization.
-            // #3218: Catch UnsupportedOp/UnsupportedConfiguration from nodes in the
+            // Catch UnsupportedOp/UnsupportedConfiguration from nodes in the
             // backward path (e.g., Gather) and fall back to IBP bounds. The
             // best_bounds is initialized to reference_bounds, so breaking out returns
             // correct (conservative) IBP bounds. Matches the catch at line 423 for
@@ -913,10 +1173,10 @@ impl GraphNetwork {
 
             // Compute objective: sum of OUTPUT lower bounds (higher is better).
             // Filter -Inf elements to prevent NaN from (-Inf)-(-Inf) in
-            // early-stopping and gradient computation (#3272, #2857).
+            // early-stopping and gradient computation.
             let output_lower: f32 = finite_lower_sum(output_bounds.lower());
 
-            // NaN guard (#2663): If upstream instability produces NaN bounds,
+            // NaN guard: If upstream instability produces NaN bounds,
             // skip bounds update to prevent NaN from contaminating best bounds
             // and downstream CROWN backward passes. LR decay still occurs.
             let output_nan = !output_lower.is_finite()
@@ -938,7 +1198,7 @@ impl GraphNetwork {
                     );
                 }
 
-                // Update element-wise best output bounds (#2251).
+                // Update element-wise best output bounds.
                 // Matches the sequential alpha-CROWN pattern in alpha_crown.rs and
                 // propagate_dag.rs which call update_elementwise_best_bounds().
                 // Skip updates during warmup window to avoid locking in noisy
@@ -1069,14 +1329,14 @@ impl GraphNetwork {
             }
 
             // Update alpha values with gradient ascent (maximize output lower bound).
-            // Per-ReLU non-finite guard (#2867, #2835): only skip the affected ReLU,
+            // Per-ReLU non-finite guard: only skip the affected ReLU,
             // not all ReLUs. Matches the per-ReLU guard pattern in
             // alpha_crown_loop.rs:188 and propagate_dag.rs:670.
             let adam_params = config.adam_params(lr, iter + 1);
             for relu_name in &relu_nodes {
                 if let Some(grad) = gradients.relu.get(relu_name) {
                     // Per-ReLU non-finite guard: skip only this ReLU if its gradient
-                    // contains NaN/Inf. Healthy ReLUs still get updated. (#2867)
+                    // contains NaN/Inf. Healthy ReLUs still get updated.
                     if grad.iter().any(|v| !v.is_finite()) {
                         warn!(
                             iter = iter,
@@ -1098,10 +1358,11 @@ impl GraphNetwork {
                     } else {
                         -grad
                     };
-                    // Channel-only alpha reduction (#4404): reduce per-neuron gradient
+                    // Channel-only alpha reduction: reduce per-neuron gradient
                     // to per-channel when full_conv_alpha is False.
                     let neg_grad = alpha_state.reduce_gradient(relu_name, &neg_grad);
-                    // Update lower + upper alpha paths (#3782, cf. propagate_dag.rs:1597).
+                    // Update lower + upper alpha paths (cf.
+                    // network/graph_alpha/propagate_dag/alpha_update.rs).
                     match config.optimizer {
                         Optimizer::Adam => {
                             alpha_state.update_adam(relu_name, &neg_grad, &adam_params);
@@ -1155,7 +1416,7 @@ impl GraphNetwork {
             );
 
             // Learning rate decay — always applied to keep schedule consistent
-            // even when NaN causes gradient or bounds updates to be skipped (#2663).
+            // even when NaN causes gradient or bounds updates to be skipped.
             lr *= config.lr_decay;
         }
 
@@ -1179,7 +1440,7 @@ impl GraphNetwork {
             for (name, reference_bound) in &reference_bounds {
                 if let Some(crown_bound) = current_bounds.get(name) {
                     if crown_bound.shape() == reference_bound.shape() {
-                        // Per-element intersection with union fallback (#2935).
+                        // Per-element intersection with union fallback.
                         let (tightened, disjoint) = reference_bound
                             .intersection_per_element(crown_bound)
                             .unwrap_or_else(|| {
@@ -1208,7 +1469,7 @@ impl GraphNetwork {
             }
         }
 
-        // Merge element-wise best output bounds into the output node's bounds (#2251).
+        // Merge element-wise best output bounds into the output node's bounds.
         // The optimization loop tracked per-dimension best lower/upper across iterations.
         // Without this, the scalar sum comparison can discard per-dimension improvements.
         if let (Some(mut ew_lower), Some(mut ew_upper)) =
@@ -1259,6 +1520,10 @@ impl GraphNetwork {
         Ok((best_bounds, alpha_state))
     }
 }
+
+#[cfg(test)]
+#[path = "alpha/s_shaped_preactivation_tests.rs"]
+mod s_shaped_preactivation_tests;
 
 #[cfg(test)]
 mod crown_ibp_collector_cap_tests {

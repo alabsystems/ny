@@ -7,8 +7,7 @@
 //! Contains `process_graph_domain_parallel` (ReLU branching) and
 //! `process_graph_domain_genbab` (general nonlinearity branching).
 //!
-//! Extracted from `multi_objective.rs` per design doc
-//! `designs/2026-02-09-code-structure-wave2-graph-engine-split.md` Step 5.
+//! Extracted from `multi_objective.rs`.
 
 use ny_core::GemmEngine;
 use ny_tensor::BoundedTensor;
@@ -29,13 +28,13 @@ impl BetaCrownVerifier {
     /// This is the parallel-safe workhorse for batched Graph BaB. It processes
     /// one domain and returns its children without touching mutable shared state.
     ///
-    /// `split_depth` controls multi-depth ReLU splitting (#2767): when > 1,
+    /// `split_depth` controls multi-depth ReLU splitting: when > 1,
     /// selects top-k unstable neurons and creates 2^k child domains per parent.
     ///
     /// Note: Does NOT use cuts (cut_pool is not passed) because this function
     /// is used in the CPU-parallel path where cuts require mutable access.
     /// The GPU-batched path (`process_graph_domains_batched_gpu`) accepts a
-    /// read-only cut pool as of #3813. Cut generation happens after parallel
+    /// read-only cut pool. Cut generation happens after parallel
     /// processing in both paths.
     // Justification: domain processing needs graph, domain, relu nodes, objective,
     // threshold, engine, and split depth — full verification context.
@@ -55,6 +54,14 @@ impl BetaCrownVerifier {
             self.config
                 .domain_is_verified(domain.lower_bound, domain.upper_bound, threshold);
         if already_verified {
+            self.cover_note_bound(
+                objective,
+                threshold,
+                &domain.history,
+                Some(&domain.beta_state),
+                domain.lower_bound,
+                domain.upper_bound,
+            );
             return GraphDomainResult::AlreadyVerified;
         }
 
@@ -82,7 +89,7 @@ impl BetaCrownVerifier {
         }
         // Check for GenBaB heuristic FIRST — GenBaB handles all nonlinearities
         // (GELU, Sigmoid, BilinearCrown, etc.), not just ReLU. The GenBaB path
-        // has its own split_nodes discovery that includes BilinearCrown (#286).
+        // has its own split_nodes discovery that includes BilinearCrown.
         // If checked after find_unstable_graph_neurons, graphs with no ReLU nodes
         // would short-circuit to NoUnstable before GenBaB gets a chance to split.
         if let BranchingHeuristic::GenBaB(ref genbab_config) = self.config.branching_heuristic {
@@ -104,14 +111,14 @@ impl BetaCrownVerifier {
             // (split-constrained) input box and the exact bound is computable.
             // A single CROWN pass with *inherited* β multipliers leaves the
             // split constraints loosely enforced and can return Undecided on a
-            // leaf that is in fact verifiable (#1896). Optimize the β (and α)
+            // leaf that is in fact verifiable. Optimize the β (and α)
             // multipliers here so the split constraints are tightened to their
             // exact contribution, then verify against the threshold.
             return self
                 .process_graph_leaf_no_unstable(graph, domain, objective, threshold, engine);
         }
 
-        // Multi-depth splitting (#2767): when split_depth > 1, select top-k
+        // Multi-depth splitting: when split_depth > 1, select top-k
         // neurons and create 2^k child domains per parent to fill GPU batches.
         // Falls back to single-neuron split when depth=1 or only 1 unstable.
         // Reference: alpha-beta-CROWN depth mode (domain_updater.py:63-304).
@@ -129,10 +136,13 @@ impl BetaCrownVerifier {
                     return GraphDomainResult::PropagationFailure;
                 }
             };
-            let child_domains = match domain.with_multi_constraints(
+            let child_domains = match domain.with_multi_constraints_observed(
                 graph,
                 &branches,
                 self.config.verify_upper_bound,
+                &mut |history, constraint| {
+                    self.cover_note_infeasible(objective, threshold, history, Some(constraint));
+                },
             ) {
                 Ok(c) => c,
                 Err(e) => {
@@ -167,6 +177,7 @@ impl BetaCrownVerifier {
                     }
                     Err(ref e) if e.is_infeasible_domain() => {
                         debug!("Multi-depth child infeasible (empty): {e}");
+                        self.cover_note_infeasible(objective, threshold, &child.history, None);
                     }
                     _ => {
                         any_child_failed = true;
@@ -199,7 +210,8 @@ impl BetaCrownVerifier {
                 is_active,
                 score,
             };
-            match domain.with_constraint(graph, constraint, self.config.verify_upper_bound) {
+            match domain.with_constraint(graph, constraint.clone(), self.config.verify_upper_bound)
+            {
                 Ok(Some(mut child)) => {
                     match self.evaluate_graph_child_bounds(
                         graph,
@@ -217,15 +229,29 @@ impl BetaCrownVerifier {
                         }
                         Err(ref e) if e.is_infeasible_domain() => {
                             tracing::debug!("Child infeasible (empty domain): {e}");
+                            self.cover_note_infeasible(objective, threshold, &child.history, None);
                         }
                         _ => {
                             any_child_failed = true;
                         }
                     }
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    self.cover_note_infeasible(
+                        objective,
+                        threshold,
+                        &domain.history,
+                        Some(&constraint),
+                    );
+                }
                 Err(ref e) if e.is_infeasible_domain() => {
                     tracing::debug!("with_constraint infeasible: {e}");
+                    self.cover_note_infeasible(
+                        objective,
+                        threshold,
+                        &domain.history,
+                        Some(&constraint),
+                    );
                 }
                 Err(e) => {
                     tracing::warn!("with_constraint failed: {e}");
@@ -249,8 +275,8 @@ impl BetaCrownVerifier {
     /// network is *affine* over the split-constrained input box and its exact
     /// bound is computable. A single CROWN pass with the leaf's *inherited* β
     /// multipliers leaves the split constraints loosely enforced and can yield a
-    /// bound that fails the threshold on a leaf that is in fact verifiable
-    /// (#1896). We therefore optimize the β (and α) multipliers here, exactly as
+    /// bound that fails the threshold on a leaf that is in fact verifiable.
+    /// We therefore optimize the β (and α) multipliers here, exactly as
     /// the child-bound path does, so the split constraints contribute their
     /// tightest sound value.
     ///
@@ -276,8 +302,8 @@ impl BetaCrownVerifier {
             engine,
         );
 
-        // Baseline: single CROWN pass with inherited β and α. This is the
-        // pre-#1896 behavior and is always a sound bound.
+        // Baseline: single CROWN pass with inherited β and α (no leaf
+        // optimization). This is always a sound bound.
         let baseline = {
             let ctx = context.with_alpha(&domain.alpha_state);
             self.propagate_crown_with_graph_beta(
@@ -292,8 +318,9 @@ impl BetaCrownVerifier {
         let (mut best_lower, mut best_upper) = match baseline {
             Ok((output, _node_cache)) => (output.lower_scalar(), output.upper_scalar()),
             Err(ref e) if e.is_infeasible_domain() => {
-                // #2926: Infeasible domain = empty = trivially verified.
+                // Infeasible domain = empty = trivially verified.
                 debug!(error = %e, depth = domain.depth, "NoUnstable domain infeasible (empty)");
+                self.cover_note_infeasible(objective, threshold, &domain.history, None);
                 return GraphDomainResult::AlreadyVerified;
             }
             Err(e) => {
@@ -303,7 +330,7 @@ impl BetaCrownVerifier {
         };
 
         // Optimize β (and α) on the leaf so the split constraints are tightened
-        // to their exact contribution for this affine subproblem (#1896). Clone
+        // to their exact contribution for this affine subproblem. Clone
         // the states because `domain` is shared/immutable in the parallel path.
         //
         // The leaf must be optimized regardless of `beta_iterations`/`beta_max_depth`:
@@ -311,8 +338,8 @@ impl BetaCrownVerifier {
         // no-unstable-neuron leaf is the final, exactly-determined affine
         // subproblem — its bound directly decides Verified vs Undecided. Per-domain
         // `beta_iterations` defaults to 0, which is exactly why this leaf path
-        // previously never optimized and returned Undecided on verifiable leaves
-        // (#1896). Use `root_beta_iterations` as the leaf budget.
+        // previously never optimized and returned Undecided on verifiable leaves.
+        // Use `root_beta_iterations` as the leaf budget.
         //
         // `optimize_graph_leaf_beta_directional` keeps the tightest bound in the
         // *verification direction* (min upper bound when `verify_upper_bound`),
@@ -356,9 +383,17 @@ impl BetaCrownVerifier {
             .domain_is_verified(best_lower, best_upper, threshold);
 
         // Soundness sanity check: a "Verified" leaf must actually satisfy the
-        // threshold via the bound we are reporting (#1896 must only verify MORE
-        // TRUE things, never a false property).
+        // threshold via the bound we are reporting (leaf optimization must only
+        // verify MORE TRUE things, never a false property).
         if verified {
+            self.cover_note_bound(
+                objective,
+                threshold,
+                &domain.history,
+                Some(&domain.beta_state),
+                best_lower,
+                best_upper,
+            );
             debug_assert!(
                 self.config
                     .domain_is_verified(best_lower, best_upper, threshold),
@@ -382,6 +417,117 @@ impl BetaCrownVerifier {
         }
     }
 
+    /// #beta-ascent-sat engagement observable.
+    ///
+    /// `tightened` = the child's own bound was strictly tighter on the violation
+    /// side and was kept; `passthrough` = the leaf bound was adopted unchanged
+    /// (the pre-fix behavior, and still the common case).
+    ///
+    /// Recording happens strictly AFTER the merge decision and never touches a
+    /// bound value or a route, so it cannot affect soundness or the verdict — it
+    /// only makes the decision observable. A null measured through this fix with
+    /// `tightened=0` is VACUOUS, not negative; these counts are how the two are
+    /// told apart. Rate-limited by construction: a line is printed only when the
+    /// just-bumped counter crosses a power of two.
+    ///
+    /// Mirrors `DeadlinePreserveCounters` (network/core/graph/backward_helpers.rs).
+    fn record_leaf_merge(tightened: bool) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TIGHTENED: AtomicU64 = AtomicU64::new(0);
+        static PASSTHROUGH: AtomicU64 = AtomicU64::new(0);
+
+        let bumped = if tightened { &TIGHTENED } else { &PASSTHROUGH };
+        let after = bumped.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        if after.is_power_of_two() {
+            eprintln!(
+                "[beta-ascent-sat] leaf-merge: tightened={} passthrough={}",
+                TIGHTENED.load(Ordering::Relaxed),
+                PASSTHROUGH.load(Ordering::Relaxed),
+            );
+        }
+    }
+
+    /// Combine a child's existing bound with the leaf-optimized bound, keeping the
+    /// tighter value on the **violation** side only.
+    ///
+    /// # Why this exists (#beta-ascent-sat)
+    ///
+    /// Verification and violation read OPPOSITE ends of the same interval:
+    ///
+    /// | `verify_upper_bound` | verified when      | violation when      |
+    /// |----------------------|--------------------|---------------------|
+    /// | `false`              | `lower > threshold`| `upper < threshold` |
+    /// | `true`               | `upper < threshold`| `lower >= threshold`|
+    ///
+    /// Every β/α optimizer in this engine ascends the **lower** bound, and both
+    /// `optimize_graph_beta_analytical` and `optimize_graph_leaf_beta_directional`
+    /// select their returned iterate by the **verification** direction. The
+    /// off-direction value is a passenger: it is whatever accompanied the chosen
+    /// iterate, never the tightest one observed. So the violation side degrades as
+    /// soon as ascent is enabled, and BaB reports `Unknown` on domains where a
+    /// violation witness was already in hand.
+    ///
+    /// # Soundness
+    ///
+    /// Both inputs are independently sound CROWN(-βα) bounds for the *same*
+    /// subproblem (β-CROWN is a valid Lagrangian dual for any β ≥ 0, and any α in
+    /// range is a valid relaxation slope), and shipped code already treats each of
+    /// them as verdict-authoritative on its own. Taking the smaller of two sound
+    /// upper bounds — or the larger of two sound lower bounds — is therefore sound:
+    /// this is CONTAINMENT, and it can only ever TIGHTEN. It never widens a bound
+    /// and never manufactures finiteness (a non-finite candidate is ignored).
+    ///
+    /// # Why this cannot move an unsat verdict
+    ///
+    /// The value on the **verification** side is passed through from `leaf`
+    /// unchanged in both modes, so `domain_is_verified` returns bit-identical
+    /// results before and after this merge. This function is structurally
+    /// incapable of producing a new `Verified` domain; it can only make
+    /// `domain_is_violation` fire on a domain that already carried the witness.
+    /// A `PotentialViolation` is a search signal — a sat verdict must still clear
+    /// the unchanged trusted-oracle gate — so the 0-wrong moat is untouched.
+    ///
+    /// An inverted result (`lower > upper`) would mean the two bound pairs are
+    /// disjoint, i.e. at least one is unsound; rather than trust either, the merge
+    /// declines and returns `leaf` unchanged (today's behavior).
+    pub(in crate::beta_crown::engine::graph) fn merge_leaf_bound_violation_side(
+        verify_upper_bound: bool,
+        existing: (f32, f32),
+        leaf: (f32, f32),
+    ) -> (f32, f32) {
+        let (existing_lower, existing_upper) = existing;
+        let (leaf_lower, leaf_upper) = leaf;
+
+        // Fail closed on ANY non-finite component, matching
+        // `domain_is_violation_for_mode`. A NaN/Inf in either half of a bound pair
+        // is evidence that the propagation which produced it was corrupted, so the
+        // finite half is not independently trustworthy either.
+        if !existing_lower.is_finite()
+            || !existing_upper.is_finite()
+            || !leaf_lower.is_finite()
+            || !leaf_upper.is_finite()
+        {
+            Self::record_leaf_merge(false);
+            return leaf;
+        }
+
+        if verify_upper_bound {
+            // Violation side is the LOWER bound: keep the larger sound value.
+            if existing_lower > leaf_lower && existing_lower <= leaf_upper {
+                Self::record_leaf_merge(true);
+                return (existing_lower, leaf_upper);
+            }
+        } else {
+            // Violation side is the UPPER bound: keep the smaller sound value.
+            if existing_upper < leaf_upper && existing_upper >= leaf_lower {
+                Self::record_leaf_merge(true);
+                return (leaf_lower, existing_upper);
+            }
+        }
+        Self::record_leaf_merge(false);
+        leaf
+    }
+
     /// Decide whether a freshly-evaluated child domain is verified, applying the
     /// fully-decided-leaf β/α optimization inline when the child has no unstable
     /// neurons left.
@@ -391,8 +537,14 @@ impl BetaCrownVerifier {
     /// still gets a loose CROWN bound from `evaluate_graph_child_bounds` and would
     /// be re-queued, only to verify later at the no-unstable pop path. Verifying
     /// it here — via the same sound directional leaf optimization — resolves it
-    /// inline (#1896), avoiding a redundant BaB iteration and matching the
+    /// inline, avoiding a redundant BaB iteration and matching the
     /// branch-time verification semantics.
+    ///
+    /// The "loose child bound" premise above holds only while β ascent is OFF.
+    /// With `beta_iterations > 0` the child bound can be strictly TIGHTER than the
+    /// leaf recompute on both sides (see `merge_leaf_bound_violation_side`), so the
+    /// leaf bound is adopted on the verification side but merged — never blindly
+    /// substituted — on the violation side.
     ///
     /// Soundness: returns `true` only when `domain_is_verified` holds for a sound
     /// CROWN(-βα) bound (either the standard child bound or a tighter sound bound
@@ -410,6 +562,14 @@ impl BetaCrownVerifier {
             .config
             .domain_is_verified(child.lower_bound, child.upper_bound, threshold)
         {
+            self.cover_note_bound(
+                objective,
+                threshold,
+                &child.history,
+                Some(&child.beta_state),
+                child.lower_bound,
+                child.upper_bound,
+            );
             return true;
         }
 
@@ -430,10 +590,25 @@ impl BetaCrownVerifier {
                 upper,
                 verified,
             } => {
-                // Adopt the tighter sound bound so downstream bookkeeping and any
-                // re-check (GPU/CPU result aggregation) see the verified interval.
-                child.lower_bound = lower;
-                child.upper_bound = upper;
+                // #beta-ascent-sat: adopt the leaf bound, but do NOT discard the
+                // bound the child already carries on the VIOLATION side.
+                //
+                // The doc comment above assumes the incoming `child.{lower,upper}_bound`
+                // is the loose one. That holds only when ascent is off. With
+                // `beta_iterations > 0`, `evaluate_graph_child_bounds` runs
+                // `optimize_graph_beta_analytical`, which returns the bound from its
+                // BEST-seen iterate while leaving `beta_state`/`alpha_state` at the
+                // FINAL iterate. `process_graph_leaf_no_unstable` then re-propagates
+                // from that final-iterate state, so its bound can be strictly LOOSER
+                // on both sides than the one the child already holds — and the
+                // unconditional overwrite threw the tighter one away.
+                let (merged_lower, merged_upper) = Self::merge_leaf_bound_violation_side(
+                    self.config.verify_upper_bound,
+                    (child.lower_bound, child.upper_bound),
+                    (lower, upper),
+                );
+                child.lower_bound = merged_lower;
+                child.upper_bound = merged_upper;
                 verified
             }
             // Violation/PropagationFailure: leave unverified; the child stays in
@@ -585,11 +760,11 @@ impl BetaCrownVerifier {
                             // #cone-delta: post-bounding replacement — delta
                             // restarts empty.
                             child.delta_pre_nodes.clear();
-                            // Use validated mutator to enforce NaN/Inf rejection (#3125).
+                            // Use validated mutator to enforce NaN/Inf rejection.
                             let priority = match self.config.domain_priority(l, u) {
                                 Ok(p) => p,
                                 Err(e) => {
-                                    // NaN in domain bounds → treat as propagation failure (#2982)
+                                    // NaN in domain bounds → treat as propagation failure
                                     tracing::warn!(
                                         "GenBaB domain_priority failed (NaN bounds): {e}"
                                     );
@@ -604,23 +779,45 @@ impl BetaCrownVerifier {
                             }
 
                             let verified = self.config.domain_is_verified(l, u, threshold);
+                            if verified {
+                                self.cover_note_bound(
+                                    objective,
+                                    threshold,
+                                    &child.history,
+                                    Some(&child.beta_state),
+                                    l,
+                                    u,
+                                );
+                            }
                             children.push((child, verified));
                         }
                         Err(ref e) if e.is_infeasible_domain() => {
-                            // #2926: Infeasible domain = empty = trivially verified.
+                            // Infeasible domain = empty = trivially verified.
                             tracing::debug!("GenBaB child infeasible (empty): {e}");
+                            self.cover_note_infeasible(objective, threshold, &child.history, None);
                         }
                         Err(e) => {
-                            // #1861: child propagation failed — sub-region unexplored.
+                            // Child propagation failed — sub-region unexplored.
                             tracing::warn!("GenBaB child propagation failed: {e}");
                             any_child_failed = true;
                         }
                     }
                 }
-                Ok(None) => {}
+                // An EMPTY child: the region really is empty, so dropping it is
+                // sound, but its sibling is the unchanged parent — a no-op split.
+                // Counted so `[genbab-select] empty_children=` exposes any
+                // selector/`with_general_split` convention mismatch
+                // (#genbab-selector-convention; must stay 0).
+                Ok(None) => {
+                    crate::beta_crown::nonlinear_branching::record_genbab_empty_child();
+                    // The ledger does not rebuild a general split's half-space
+                    // from the decision: leave the frame UNBUILT (legacy door).
+                    self.cover_note_unbuildable("genbab_empty_child");
+                }
                 Err(ref e) if e.is_infeasible_domain() => {
-                    // #2926: Infeasible split child = empty = skip.
+                    // Infeasible split child = empty = skip.
                     tracing::debug!("with_general_split infeasible: {e}");
+                    self.cover_note_unbuildable("genbab_infeasible_split");
                 }
                 Err(e) => {
                     tracing::warn!("with_general_split failed: {e}");
@@ -645,6 +842,172 @@ mod tests {
     use super::*;
     use crate::beta_crown::BetaCrownConfig;
     use crate::{GraphNode, Layer, LinearLayer, ReLULayer};
+
+    // ---- #beta-ascent-sat: violation-side bound merge -------------------------
+    //
+    // These pin the exact quantity the pre-fix code discarded. Each one is
+    // written so that the OLD behavior (`leaf` adopted unconditionally) reads
+    // RED: the expected value differs from `leaf` on the violation side.
+
+    /// The regression witness, in the numbers actually measured on
+    /// `y = relu(x), x in [-1,1] |= y > 0.5` with `beta_iterations = 15`.
+    ///
+    /// The ascent returned its best-iterate pair `(-1.1754944e-38, 1.1754944e-38)`
+    /// for the inactive child while leaving β/α at the final iterate; the leaf
+    /// recompute then re-propagated from that state and produced the strictly
+    /// looser `(-0.7499974, 0.7499974)`, which the unconditional overwrite
+    /// adopted. `upper = 0.75` fails `upper < 0.5`, so the violation witness was
+    /// lost and BaB ended `Unknown`.
+    #[test]
+    fn merge_leaf_bound_keeps_violation_side_upper_under_ascent() {
+        let existing = (-1.1754944e-38_f32, 1.1754944e-38_f32);
+        let leaf = (-0.7499974_f32, 0.7499974_f32);
+
+        let (lower, upper) =
+            BetaCrownVerifier::merge_leaf_bound_violation_side(false, existing, leaf);
+
+        assert_eq!(
+            upper, existing.1,
+            "violation side (upper, verify_upper_bound=false) must keep the tighter \
+             already-computed bound; adopting the leaf's {} loses the witness",
+            leaf.1
+        );
+        assert_eq!(
+            lower, leaf.0,
+            "verification side (lower) must pass through from the leaf unchanged"
+        );
+        // The property the whole fix exists to restore.
+        assert!(
+            upper < 0.5,
+            "merged upper must certify the violation of `y > 0.5`"
+        );
+    }
+
+    /// Mirror case: in upper-bound mode the violation side is the LOWER bound.
+    #[test]
+    fn merge_leaf_bound_keeps_violation_side_lower_in_upper_bound_mode() {
+        let existing = (0.90_f32, 2.0_f32);
+        let leaf = (0.10_f32, 1.5_f32);
+
+        let (lower, upper) =
+            BetaCrownVerifier::merge_leaf_bound_violation_side(true, existing, leaf);
+
+        assert_eq!(
+            lower, existing.0,
+            "violation side (lower, verify_upper_bound=true) must keep the larger \
+             already-computed bound"
+        );
+        assert_eq!(
+            upper, leaf.1,
+            "verification side (upper) must pass through from the leaf unchanged"
+        );
+    }
+
+    /// The merge must never move the VERIFICATION side, in either mode. This is
+    /// what makes the change structurally incapable of creating a new `Verified`
+    /// domain — and therefore incapable of moving an unsat verdict.
+    #[test]
+    fn merge_leaf_bound_never_moves_the_verification_side() {
+        let cases: [((f32, f32), (f32, f32)); 6] = [
+            ((-1e-30, 1e-30), (-0.75, 0.75)),
+            ((0.9, 2.0), (0.1, 1.5)),
+            ((-5.0, -4.0), (-1.0, 1.0)),
+            ((f32::NAN, 0.0), (-1.0, 1.0)),
+            ((0.0, f32::INFINITY), (-1.0, 1.0)),
+            ((-1.0, 1.0), (-1.0, 1.0)),
+        ];
+        for (existing, leaf) in cases {
+            let (lo_f, up_f) =
+                BetaCrownVerifier::merge_leaf_bound_violation_side(false, existing, leaf);
+            assert_eq!(
+                lo_f, leaf.0,
+                "verify_upper_bound=false must pass the lower bound through: {existing:?} {leaf:?}"
+            );
+            assert!(
+                up_f <= leaf.1,
+                "verify_upper_bound=false may only tighten the upper bound: {existing:?} {leaf:?}"
+            );
+
+            let (lo_t, up_t) =
+                BetaCrownVerifier::merge_leaf_bound_violation_side(true, existing, leaf);
+            assert_eq!(
+                up_t, leaf.1,
+                "verify_upper_bound=true must pass the upper bound through: {existing:?} {leaf:?}"
+            );
+            assert!(
+                lo_t >= leaf.0,
+                "verify_upper_bound=true may only tighten the lower bound: {existing:?} {leaf:?}"
+            );
+        }
+    }
+
+    /// Non-finite candidates must never win: the merge tightens, it never
+    /// manufactures finiteness, and NaN must not poison a sound leaf bound.
+    #[test]
+    fn merge_leaf_bound_ignores_non_finite_candidates() {
+        let leaf = (-1.0_f32, 1.0_f32);
+        for existing in [
+            (f32::NAN, f32::NAN),
+            (0.0, f32::NAN),
+            (f32::NEG_INFINITY, f32::NEG_INFINITY),
+            (0.0, f32::NEG_INFINITY),
+        ] {
+            assert_eq!(
+                BetaCrownVerifier::merge_leaf_bound_violation_side(false, existing, leaf),
+                leaf,
+                "non-finite existing bound must leave the leaf pair untouched: {existing:?}"
+            );
+            assert_eq!(
+                BetaCrownVerifier::merge_leaf_bound_violation_side(true, existing, leaf),
+                leaf,
+                "non-finite existing bound must leave the leaf pair untouched: {existing:?}"
+            );
+        }
+    }
+
+    /// Disjoint bound pairs mean at least one input is unsound. The merge must
+    /// decline rather than build an inverted interval, which `domain_is_violation`
+    /// rejects anyway (#violdrop) and `domain_priority` treats as an error.
+    #[test]
+    fn merge_leaf_bound_declines_when_it_would_invert_the_interval() {
+        // existing upper (-5.0) sits below the leaf lower (-1.0): disjoint.
+        let leaf = (-1.0_f32, 1.0_f32);
+        assert_eq!(
+            BetaCrownVerifier::merge_leaf_bound_violation_side(false, (-6.0, -5.0), leaf),
+            leaf,
+            "must not produce lower > upper"
+        );
+        // existing lower (5.0) sits above the leaf upper (1.0): disjoint.
+        assert_eq!(
+            BetaCrownVerifier::merge_leaf_bound_violation_side(true, (5.0, 6.0), leaf),
+            leaf,
+            "must not produce lower > upper"
+        );
+        // And in general the result is never inverted.
+        for existing in [(-6.0_f32, -5.0_f32), (5.0, 6.0), (0.0, 0.0)] {
+            for mode in [false, true] {
+                let (lo, up) =
+                    BetaCrownVerifier::merge_leaf_bound_violation_side(mode, existing, leaf);
+                assert!(lo <= up, "merged interval inverted: {lo} > {up}");
+            }
+        }
+    }
+
+    /// A looser existing bound must not be adopted — the merge only ever tightens.
+    #[test]
+    fn merge_leaf_bound_ignores_a_looser_existing_bound() {
+        let leaf = (-1.0_f32, 1.0_f32);
+        assert_eq!(
+            BetaCrownVerifier::merge_leaf_bound_violation_side(false, (-2.0, 2.0), leaf),
+            leaf,
+            "a looser existing upper must not replace the leaf's"
+        );
+        assert_eq!(
+            BetaCrownVerifier::merge_leaf_bound_violation_side(true, (-2.0, 2.0), leaf),
+            leaf,
+            "a looser existing lower must not replace the leaf's"
+        );
+    }
 
     #[test]
     fn test_select_graph_branch_failure_maps_to_propagation_failure_1915() {

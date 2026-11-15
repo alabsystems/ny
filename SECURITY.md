@@ -32,9 +32,11 @@ Out of scope:
 
 ## Before publishing artifacts
 
-Run a quick pre-publish sweep:
+Check that the tree builds, then scan the commit history and the artifacts you
+are about to publish for secrets with the repository's gitleaks configuration:
 
 ```sh
-cargo check --workspace --exclude ny-python
-rg -n "token|secret|password|credential" --glob '!target/**'
+targo --unverified check --locked --workspace --exclude ny-python
+gitleaks detect --source . --config .gitleaks.toml                       # committed history
+gitleaks detect --no-git --source <artifact-dir> --config .gitleaks.toml # files to publish
 ```

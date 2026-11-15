@@ -40,8 +40,6 @@ const RELU_INTERCEPT_MIN_WIDTH: f32 = 1e-6;
 /// Both ReLU and Sign split at x=0 with the same child-domain half-space semantics:
 /// - active branch: constrain pre-activation to [0, u]
 /// - inactive branch: constrain pre-activation to [l, 0]
-///
-/// Part of #3769: enable BaB branching on Sign neurons.
 #[inline]
 fn is_zero_threshold_binary_activation(layer: &Layer) -> bool {
     matches!(layer, Layer::ReLU(_) | Layer::Sign(_))
@@ -56,7 +54,6 @@ fn is_zero_threshold_binary_activation(layer: &Layer) -> bool {
 /// [-1, 1] there (non-zero slopes belong to a future BoundSignMerge alpha packet).
 ///
 /// Reference: piecewise_constant.rs `sign_crown_relaxation`.
-/// Part of #3769.
 fn sign_fixed_crown_proxy_slope(lower: f32, upper: f32) -> f32 {
     if !lower.is_finite() || !upper.is_finite() {
         return 0.0;

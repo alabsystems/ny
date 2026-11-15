@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! GPU CROWN-IBP partial backward parity tests (#3599).
+//! GPU CROWN-IBP partial backward parity tests.
 //!
 //! These tests verify that the `try_gpu_crown_partial_backward` path in
 //! `ibp.rs` correctly constructs spec matrices, dispatches to the GPU engine,
@@ -15,8 +15,6 @@
 //! dimensions — bugs that the existing `MockGpuCrownEngine` (which returns
 //! wide `[-1e6, +1e6]` for size mismatches) silently erases via IBP
 //! intersection.
-//!
-//! Design doc: designs/2026-03-13-issue-3599-gpu-crown-ibp-partial-parity-packet.md
 
 use super::helpers::assert_bounded_tensor_close;
 use super::*;
@@ -120,14 +118,12 @@ impl GemmEngine for ScriptedPartialGpuCrownEngine {
     }
 }
 
-impl GpuCrownBackward for ScriptedPartialGpuCrownEngine {
-    fn crown_backward_gpu(
+impl ScriptedPartialGpuCrownEngine {
+    /// The scripted body shared by BOTH trait methods below.
+    fn scripted_dispatch(
         &self,
         layers: &[GpuCrownLayer],
-        _spec: &[f32],
         num_specs: usize,
-        _input_lower: &[f32],
-        _input_upper: &[f32],
     ) -> Result<GpuCrownResult> {
         self.calls.fetch_add(1, Ordering::SeqCst);
 
@@ -178,6 +174,38 @@ impl GpuCrownBackward for ScriptedPartialGpuCrownEngine {
                 }
             }),
         }
+    }
+}
+
+/// #crown-partial-sound-forward: the CROWN-IBP partial route now REFUSES the
+/// unsound `crown_backward_gpu` (`crown_partial_gpu.rs`, `use_sound == false`
+/// returns `Ok(None)`), so the only GPU dispatch that can reach a published
+/// intermediate bound is `crown_backward_gpu_sound` under an ENGAGED gate. The
+/// mock therefore advertises the sound contract and serves the SAME scripted
+/// expectations through both methods; each plumbing test engages the gate.
+impl GpuCrownBackward for ScriptedPartialGpuCrownEngine {
+    fn crown_backward_gpu(
+        &self,
+        layers: &[GpuCrownLayer],
+        _spec: &[f32],
+        num_specs: usize,
+        _input_lower: &[f32],
+        _input_upper: &[f32],
+    ) -> Result<GpuCrownResult> {
+        self.scripted_dispatch(layers, num_specs)
+    }
+    fn crown_backward_gpu_sound(
+        &self,
+        layers: &[GpuCrownLayer],
+        _spec: &[f32],
+        num_specs: usize,
+        _input_lower: &[f32],
+        _input_upper: &[f32],
+    ) -> Result<GpuCrownResult> {
+        self.scripted_dispatch(layers, num_specs)
+    }
+    fn provides_sound_gpu_crown(&self) -> bool {
+        true
     }
 }
 
@@ -261,6 +289,9 @@ fn build_parity_network(
 #[test]
 fn test_crown_ibp_gpu_partial_dense_parity_matches_cpu_3599() -> Result<()> {
     let _g = lock_gate();
+    // #crown-partial-sound-forward: the partial route refuses the unsound
+    // backward, so the plumbing under test is reachable only with the gate ON.
+    set_sound_gpu_crown_required(true);
     tests::with_crown_dense_budget_mb("2048", || -> Result<()> {
         // Dense parity fixture from the design doc.
         // 2 outputs, both potentially unstable → stable_frac < 0.9 → dense mode.
@@ -322,6 +353,9 @@ fn test_crown_ibp_gpu_partial_dense_parity_matches_cpu_3599() -> Result<()> {
 #[test]
 fn test_crown_ibp_gpu_partial_sparse_parity_matches_cpu_3599() -> Result<()> {
     let _g = lock_gate();
+    // #crown-partial-sound-forward: the partial route refuses the unsound
+    // backward, so the plumbing under test is reachable only with the gate ON.
+    set_sound_gpu_crown_required(true);
     tests::with_crown_dense_budget_mb("2048", || -> Result<()> {
         // Sparse parity fixture from the design doc.
         // 10 outputs, exactly 1 unstable (output 0) → stable_frac = 0.9 → sparse.
@@ -403,6 +437,9 @@ fn test_crown_ibp_gpu_partial_sparse_parity_matches_cpu_3599() -> Result<()> {
 #[test]
 fn test_crown_ibp_gpu_partial_skips_oversized_spec_guard_3599() -> Result<()> {
     let _g = lock_gate();
+    // #crown-partial-sound-forward: the partial route refuses the unsound
+    // backward, so the plumbing under test is reachable only with the gate ON.
+    set_sound_gpu_crown_required(true);
     // Build a network with 8193 outputs — exceeds GPU_PARTIAL_MAX_SPECS.
     // The GPU path should be skipped entirely.
     //
@@ -464,6 +501,9 @@ fn test_crown_ibp_gpu_partial_skips_oversized_spec_guard_3599() -> Result<()> {
 #[test]
 fn test_crown_ibp_gpu_partial_falls_back_on_unsupported_layer_3599() -> Result<()> {
     let _g = lock_gate();
+    // #crown-partial-sound-forward: the partial route refuses the unsound
+    // backward, so the plumbing under test is reachable only with the gate ON.
+    set_sound_gpu_crown_required(true);
     // Use GELU — CPU-supported but GPU-unsupported (no extraction).
     let mut network = Network::new();
     network.add_layer(Layer::Linear(LinearLayer::new(
@@ -509,6 +549,9 @@ fn test_crown_ibp_gpu_partial_falls_back_on_unsupported_layer_3599() -> Result<(
 #[test]
 fn test_crown_ibp_gpu_partial_falls_back_on_gpu_error_3599() -> Result<()> {
     let _g = lock_gate();
+    // #crown-partial-sound-forward: the partial route refuses the unsound
+    // backward, so the plumbing under test is reachable only with the gate ON.
+    set_sound_gpu_crown_required(true);
     tests::with_crown_dense_budget_mb("2048", || -> Result<()> {
         // Reuse the dense parity network.
         let w2 = arr2(&[[0.6, -0.4, 0.3], [-0.2, 0.5, 0.1]]);
@@ -553,6 +596,9 @@ fn test_crown_ibp_gpu_partial_falls_back_on_gpu_error_3599() -> Result<()> {
 #[test]
 fn partial_gpu_runtime_refusals_all_reach_cpu_crown() -> Result<()> {
     let _g = lock_gate();
+    // #crown-partial-sound-forward: the partial route refuses the unsound
+    // backward, so the plumbing under test is reachable only with the gate ON.
+    set_sound_gpu_crown_required(true);
     tests::with_crown_dense_budget_mb("2048", || -> Result<()> {
         let w2 = arr2(&[[0.6, -0.4, 0.3], [-0.2, 0.5, 0.1]]);
         let b2 = arr1(&[0.0, 0.15]);
@@ -585,15 +631,18 @@ fn partial_gpu_runtime_refusals_all_reach_cpu_crown() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Test F: NaN in GPU results triggers CPU fallback (#3752)
+// Test F: NaN in GPU results triggers CPU fallback
 // ---------------------------------------------------------------------------
 
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_ibp_gpu_partial_nan_triggers_cpu_fallback_3752() -> Result<()> {
     let _g = lock_gate();
+    // #crown-partial-sound-forward: the partial route refuses the unsound
+    // backward, so the plumbing under test is reachable only with the gate ON.
+    set_sound_gpu_crown_required(true);
     tests::with_crown_dense_budget_mb("2048", || -> Result<()> {
-        // Fix for #3752: NaN in raw GPU bounds must discard the entire GPU result
+        // NaN in raw GPU bounds must discard the entire GPU result
         // and fall back to CPU CROWN. Previously, RepairStrategy::Widen converted
         // NaN → ±inf before intersection_per_element could detect it, letting
         // incorrect non-NaN siblings through into the final bounds.
@@ -607,7 +656,7 @@ fn test_crown_ibp_gpu_partial_nan_triggers_cpu_fallback_3752() -> Result<()> {
         let cpu_final = &cpu.bounds[2];
 
         // Script GPU engine to return bounds with NaN elements.
-        // The NaN pre-check (#3752) should discard this entirely.
+        // The NaN pre-check should discard this entirely.
         let scripted = ScriptedPartialGpuCrownEngine::new(vec![PartialGpuExpectation {
             num_specs: 2,
             layer_kinds: vec!["Linear", "Activation", "Linear"],
@@ -642,6 +691,9 @@ fn test_crown_ibp_gpu_partial_nan_triggers_cpu_fallback_3752() -> Result<()> {
 #[test]
 fn partial_gpu_wrong_shape_and_infinity_fall_back_to_cpu() -> Result<()> {
     let _g = lock_gate();
+    // #crown-partial-sound-forward: the partial route refuses the unsound
+    // backward, so the plumbing under test is reachable only with the gate ON.
+    set_sound_gpu_crown_required(true);
     tests::with_crown_dense_budget_mb("2048", || -> Result<()> {
         let w2 = arr2(&[[0.6, -0.4, 0.3], [-0.2, 0.5, 0.1]]);
         let b2 = arr1(&[0.0, 0.15]);
@@ -688,6 +740,9 @@ fn partial_gpu_wrong_shape_and_infinity_fall_back_to_cpu() -> Result<()> {
 #[test]
 fn test_crown_ibp_gpu_partial_inversion_falls_back_to_cpu_3599() -> Result<()> {
     let _g = lock_gate();
+    // #crown-partial-sound-forward: the partial route refuses the unsound
+    // backward, so the plumbing under test is reachable only with the gate ON.
+    set_sound_gpu_crown_required(true);
     // Reuse the dense parity network.
     let w2 = arr2(&[[0.6, -0.4, 0.3], [-0.2, 0.5, 0.1]]);
     let b2 = arr1(&[0.0, 0.15]);
@@ -900,12 +955,21 @@ fn crown_ibp_partial_gate_on_routes_to_sound_gpu_backward() -> Result<()> {
     Ok(())
 }
 
-/// GATE OFF (speed-only): the IBP-partial path keeps the fast UNSOUND
-/// `crown_backward_gpu` and the sound method is NOT consulted — proving the
-/// un-gating is gate-scoped and the speed-only behavior is preserved.
+/// GATE OFF: the IBP-partial path REFUSES the GPU route entirely and decides
+/// the intermediate bound on the proven CPU loop — NEITHER the fast unsound
+/// `crown_backward_gpu` NOR the sound method is consulted.
+///
+/// #crown-partial-sound-forward. This test used to assert the OPPOSITE
+/// ("gate off keeps the fast unsound backward"): with the gate released the
+/// unsound GPU half was intersected with the per-layer box and published as an
+/// intermediate bound, i.e. an unsound value could decide a verdict through
+/// this site whenever it was tighter. Every result of the partial walk feeds
+/// the collector's published vector, so the refusal is unconditional on
+/// `use_sound == false` (`crown_partial_gpu.rs`). The gate defaults ON in
+/// production and the CLI exposes no opt-out, so no scored run changes.
 #[ntest::timeout(10000)]
 #[test]
-fn crown_ibp_partial_gate_off_keeps_fast_unsound_backward() -> Result<()> {
+fn crown_ibp_partial_gate_off_refuses_unsound_backward_and_decides_on_cpu() -> Result<()> {
     let _g = lock_gate();
     let w2 = arr2(&[[0.6, -0.4, 0.3], [-0.2, 0.5, 0.1]]);
     let b2 = arr1(&[0.0, 0.15]);
@@ -930,17 +994,26 @@ fn crown_ibp_partial_gate_off_keeps_fast_unsound_backward() -> Result<()> {
     };
 
     assert!(!is_sound_gpu_crown_required());
-    let _gpu = network.collect_crown_ibp_bounds_with_engine_and_status(&input, Some(&engine))?;
+    let gpu = network.collect_crown_ibp_bounds_with_engine_and_status(&input, Some(&engine))?;
 
-    assert!(
-        engine.unsound_calls.load(Ordering::SeqCst) >= 1,
-        "gate-off IBP-partial path must use the fast unsound GPU backward, got {} calls",
+    assert_eq!(
+        engine.unsound_calls.load(Ordering::SeqCst),
+        0,
+        "gate-off IBP-partial path must REFUSE the unsound GPU backward (it feeds a verdict), \
+         got {} calls",
         engine.unsound_calls.load(Ordering::SeqCst)
     );
     assert_eq!(
         engine.sound_calls.load(Ordering::SeqCst),
         0,
-        "the sound GPU backward must NOT be consulted when the gate is off"
+        "the sound GPU backward is not routed when the gate is off"
+    );
+    // The bound was decided on the CPU sound loop: equal to the engine-free oracle.
+    assert_bounded_tensor_close(
+        &gpu.bounds[2],
+        cpu_final,
+        1e-6,
+        "gate-off partial: CPU sound loop must decide the intermediate bound",
     );
     Ok(())
 }

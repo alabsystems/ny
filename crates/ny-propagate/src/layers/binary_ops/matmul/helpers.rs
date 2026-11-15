@@ -42,7 +42,7 @@ pub(super) fn view_batch_2d<'a>(
 /// Apply optional scaling to interval bound arrays.
 ///
 /// NaN/Inf repair is NOT done here — it happens at the BoundedTensor type boundary
-/// via `new_repaired(Conservative)` when the caller constructs the final tensor (#3423).
+/// via `new_repaired(Conservative)` when the caller constructs the final tensor.
 pub(super) fn apply_scale(lower: &mut Array2<f32>, upper: &mut Array2<f32>, scale: Option<f32>) {
     if let Some(scale) = scale {
         if scale >= 0.0 {

@@ -7,7 +7,6 @@
 //! Output is {0.0, 1.0}. IBP uses paired bounds analysis; CROWN uses
 //! zero-slope relaxation (piecewise constant, like Sign/Floor/Ceil).
 //!
-//! Reference: design doc `designs/2026-03-21-issue-4269-compare-propagation-layer.md`
 //! Supports transformer masking ops for external verifier consumers.
 
 use ndarray::{ArrayD, IxDyn};

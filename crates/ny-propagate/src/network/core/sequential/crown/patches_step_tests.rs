@@ -1212,3 +1212,123 @@ fn nonzero_pad_does_not_take_the_identity_shortcut() -> Result<()> {
     );
     Ok(())
 }
+
+// ── #patches-engine-refusal-containment integration ───────────────────────
+// reports/measured-2026/cct_bound_gap_2026-08-31: on wgpu hosts the Conv2d
+// Patches compose's GEMM of last resort is the process-global proof adapter,
+// whose `gemm_f32` refuses BY DESIGN. Today that policy refusal escapes the
+// seam as a compose failure, `patches_step` retries DENSE, and on the real
+// cct interfaces the dense pair blows the memory budget so the target keeps
+// IBP bounds (`conv2d_patches_unsupported_fallback`). Armed, the seam treats
+// the refusing engine as an absent accelerator and the walk completes IN
+// PATCHES on its byte-identical CPU scatter.
+
+/// Mock of the quarantined WGPU proof adapter (`ny-gpu/src/backend.rs`).
+struct QuarantinedProofAdapter;
+
+impl GemmEngine for QuarantinedProofAdapter {
+    fn gemm_f32(
+        &self,
+        _m: usize,
+        _k: usize,
+        _n: usize,
+        _a: &[f32],
+        _b: &[f32],
+    ) -> Result<Vec<f32>> {
+        Err(NyError::UnsupportedConfiguration(
+            "mock WGPU GEMM quarantine: only CROWN backward is exposed on an explicitly \
+             qualified proof device"
+                .into(),
+        ))
+    }
+}
+
+/// Drive the cct CNN7 mechanism site — a conv-through-conv Patches backward
+/// walk (conv → ReLU → conv, the composition every deeper cct conv target
+/// repeats) — with a QUARANTINED engine present and the compose seam enabled
+/// (`NY_PATCHES_GPU=1`, the state a wgpu host reaches whenever the fast-f32
+/// factory is installed).
+///
+/// Returns the final carrier so each arm asserts its own shape.
+fn walk_conv_relu_conv_with_quarantined_engine() -> CrownBounds {
+    let conv_kernel = |value: f32| ArrayD::from_elem(IxDyn(&[1, 1, 3, 3]), value);
+    // Backward walk (output → input): conv2 (in 1x4x4 → out 1x2x2), ReLU,
+    // conv1 (in 1x6x6 → out 1x4x4). Composed kernel 5x5 < 6x6 input, so the
+    // early Patches→Dense bail does not fire and the compose seam decides.
+    let conv2 = Layer::Conv2d(
+        Conv2dLayer::with_input_shape(conv_kernel(0.5), None, (1, 1), (0, 0), 4, 4)
+            .expect("conv2 builds"),
+    );
+    let relu = Layer::ReLU(ReLULayer::new());
+    let conv1 = Layer::Conv2d(
+        Conv2dLayer::with_input_shape(conv_kernel(0.25), None, (1, 1), (0, 0), 6, 6)
+            .expect("conv1 builds"),
+    );
+
+    let mut bounds = CrownBounds::Patches(Box::new(PatchesLinearBounds::identity(
+        (1, 2, 2),
+        (1, 2, 2),
+    )));
+    let engine = QuarantinedProofAdapter;
+
+    let steps: [(&Layer, BoundedTensor); 3] = [
+        (&conv2, bounded_3d((1, 4, 4), -1.0, 1.0)),
+        (&relu, bounded_3d((1, 4, 4), -1.0, 1.0)),
+        (&conv1, bounded_3d((1, 6, 6), -1.0, 1.0)),
+    ];
+    for (idx, (layer, pre_act)) in steps.iter().enumerate() {
+        let result = crown_backward_step_patches(
+            layer,
+            &mut bounds,
+            pre_act,
+            Some(&engine),
+            idx,
+            "test",
+            None,
+        )
+        .expect("walk step stays structured");
+        assert!(
+            matches!(result, CrownStepResult::Continue),
+            "step {idx} must continue the walk"
+        );
+    }
+    bounds
+}
+
+/// ARMED: the walk completes with `CrownBounds::Patches` — zero
+/// Patches→Dense fallbacks — because every engine policy refusal falls
+/// through to the seam's own CPU scatter.
+///
+/// Shown able to fail: on today's dark code (see the pinned control below)
+/// the same walk densifies, so this assertion is red until the containment
+/// is armed and wired.
+#[test]
+fn armed_containment_completes_conv_walk_in_patches_despite_quarantined_engine() {
+    crate::tests::with_env_edits(|env| {
+        env.set("NY_PATCHES_GPU", "1");
+        env.set("NY_PATCHES_ENGINE_REFUSAL_CONTAINMENT", "1");
+        let bounds = walk_conv_relu_conv_with_quarantined_engine();
+        assert!(
+            matches!(bounds, CrownBounds::Patches(_)),
+            "armed containment must keep the conv-through-conv walk in Patches \
+             (zero conv2d_patches_unsupported_fallback events)"
+        );
+    });
+}
+
+/// DARK control (the shipped default): the identical walk densifies — the
+/// policy refusal escapes the seam and `patches_step` takes the
+/// `conv2d_patches_unsupported_fallback` dense retry. This pins today's
+/// behavior byte-identically AND proves the armed test above can fail.
+#[test]
+fn dark_default_conv_walk_densifies_on_quarantined_engine() {
+    crate::tests::with_env_edits(|env| {
+        env.set("NY_PATCHES_GPU", "1");
+        env.remove("NY_PATCHES_ENGINE_REFUSAL_CONTAINMENT");
+        let bounds = walk_conv_relu_conv_with_quarantined_engine();
+        assert!(
+            matches!(bounds, CrownBounds::Dense(_)),
+            "the dark default must preserve today's Patches->Dense fallback escape"
+        );
+    });
+}

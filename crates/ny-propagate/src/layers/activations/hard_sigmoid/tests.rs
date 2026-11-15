@@ -220,7 +220,7 @@ fn test_crown_crossing_soundness() {
 
 // ── Division-by-zero guard regression tests ─────────────────────
 
-/// Regression: alpha=0 caused division by zero computing x_low and x_high (#2314).
+/// Regression: alpha=0 caused division by zero computing x_low and x_high.
 #[test]
 fn test_relaxation_alpha_zero_no_div_by_zero() {
     let r = hard_sigmoid_linear_relaxation(-1.0, 1.0, 0.0, 0.5);
@@ -237,7 +237,7 @@ fn test_relaxation_alpha_zero_no_div_by_zero() {
     );
 }
 
-/// Regression: alpha=0 with beta outside [0,1] should clamp (#2314).
+/// Regression: alpha=0 with beta outside [0,1] should clamp.
 #[test]
 fn test_relaxation_alpha_zero_beta_clamps() {
     let r = hard_sigmoid_linear_relaxation(-1.0, 1.0, 0.0, 2.0);
@@ -249,7 +249,7 @@ fn test_relaxation_alpha_zero_beta_clamps() {
     assert!(r.upper_intercept.abs() < 1e-6, "beta=-1 clamps to 0");
 }
 
-/// Regression: point interval (l == u) caused division by zero in crossing branches (#2314).
+/// Regression: point interval (l == u) caused division by zero in crossing branches.
 #[test]
 fn test_relaxation_point_interval() {
     let r = hard_sigmoid_linear_relaxation(1.0, 1.0, 0.2, 0.5);
@@ -282,7 +282,7 @@ fn test_propagate_linear_requires_preact() {
     assert!(matches!(err, NyError::InvalidSpec(_)));
 }
 
-// ── IBP guard regression tests (#3203) ────────────────────────────
+// ── IBP guard regression tests ────────────────────────────
 
 #[test]
 fn test_ibp_invalid_params_rejected() {

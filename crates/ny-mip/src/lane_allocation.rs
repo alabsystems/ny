@@ -1083,6 +1083,29 @@ fn build(request: &AllocationRequest) -> Result<Built, FallOpen> {
         }
     }
 
+    // (E) and (C5) require each nonzeroed lane to choose an available
+    // rung at or above its whole-second floor. Their sum is a necessary
+    // lower bound on (B), irrespective of objective weights or precedence.
+    // Prove this contradiction before a flat objective can make the exact
+    // backend search for an infeasibility witness it need not construct.
+    let pool_secs = u128::from(request.pool().as_secs());
+    let mut mandatory_secs = 0u128;
+    for lane in lanes {
+        if lane.structural_zero.is_some() {
+            continue; // (A) pins rung zero and deliberately overrides (C5).
+        }
+        let floor = lane.no_regression_floor.map_or(0, |d| d.as_secs());
+        let Some(minimum) = lane.ladder.rungs.iter().find(|r| r.cap.as_secs() >= floor) else {
+            return Err(FallOpen::Infeasible);
+        };
+        mandatory_secs = mandatory_secs
+            .checked_add(u128::from(minimum.cap.as_secs()))
+            .ok_or(FallOpen::Infeasible)?;
+        if mandatory_secs > pool_secs {
+            return Err(FallOpen::Infeasible);
+        }
+    }
+
     let mut problem = MilpProblem::new();
     let mut cols: Vec<Vec<usize>> = Vec::with_capacity(lanes.len());
     let mut objective: Vec<(usize, f64)> = Vec::new();
@@ -1118,7 +1141,7 @@ fn build(request: &AllocationRequest) -> Result<Built, FallOpen> {
         cols.push(row.iter().map(|c| c.0).collect());
     }
 
-    // (B) the pool, in whole milliseconds so the row arithmetic is exact.
+    // (B) the pool, in whole seconds, matching the validated rung granularity.
     let pool = whole_secs_f64(request.pool());
     let mut budget_terms: Vec<(Col, f64)> = Vec::new();
     for (k, lane) in lanes.iter().enumerate() {
@@ -1302,7 +1325,10 @@ fn finish(request: &AllocationRequest, chosen: &[usize]) -> AllocationOutcome {
                 return AllocationOutcome::UseExistingPlan(FallOpen::ConstraintViolatedInReadback);
             }
         }
-        spent_secs += rung.cap.as_secs();
+        let Some(next_spent) = spent_secs.checked_add(rung.cap.as_secs()) else {
+            return AllocationOutcome::UseExistingPlan(FallOpen::ConstraintViolatedInReadback);
+        };
+        spent_secs = next_spent;
         log_miss_total += lane.log_miss_cost_at(j);
         grants.push(LaneGrant {
             lane: k,

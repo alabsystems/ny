@@ -82,8 +82,8 @@ impl ZonotopeTensor {
 
         let center_2d = coeffs_3d.index_axis(Axis(0), 0);
 
-        // Each element gets its own approximation-error symbol (#2522).
-        // Same per-element fix as GELU (#2470), SiLU (#2486), and softmax.
+        // Each element gets its own approximation-error symbol.
+        // Same per-element fix as GELU, SiLU, and softmax.
         let n_new_error_terms = prefix_size * dim;
         let n_rows = 1 + self.n_error_terms + n_new_error_terms;
         let mut result_coeffs = ndarray::Array3::<f32>::zeros((n_rows, prefix_size, dim));
@@ -97,9 +97,9 @@ impl ZonotopeTensor {
             let var: f32 = centered.iter().map(|&c| c * c).sum::<f32>() / dim as f32;
             let std = (var + eps).sqrt();
 
-            // #2676 Site 3: NaN center coefficients → NaN mean → NaN var → NaN std.
+            // NaN center coefficients → NaN mean → NaN var → NaN std.
             // f32::max(NaN, 1e-10) returns 1e-10, silently masking the NaN and
-            // producing extremely large but finite coefficients downstream (Site 4).
+            // producing extremely large but finite coefficients downstream.
             // Propagate the error instead of masking.
             if std.is_nan() {
                 return Err(NyError::InvalidSpec(
@@ -228,7 +228,7 @@ impl ZonotopeTensor {
                 }
                 let approx_error = gap_hi.max(gap_lo).max(0.0);
 
-                // Per-element error terms (#2522): each (row_idx, d) gets its own row.
+                // Per-element error terms: each (row_idx, d) gets its own row.
                 let approx_err_row = self.n_error_terms + 1 + row_idx * dim + d;
                 result_coeffs[[approx_err_row, row_idx, d]] = approx_error;
             }

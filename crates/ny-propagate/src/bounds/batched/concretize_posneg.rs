@@ -5,7 +5,6 @@
 //! Positive/negative coefficient split helpers for batched concretization.
 //!
 //! Extracted from `concretize.rs` to stay within file-size limits.
-//! Part of #2220 Packet B.
 
 use super::BatchedLinearBounds;
 use crate::bounds::{certified_affine_sum_f32, OutwardDirection};
@@ -618,7 +617,7 @@ impl BatchedLinearBounds {
                 let ub = ub_flat[[b, i]];
 
                 // Per-direction row degradation (mirrors
-                // `LinearBounds::concretize_scalar_f64`, #1932): a bias already at
+                // `LinearBounds::concretize_scalar_f64`): a bias already at
                 // ±inf, or any coefficient outside the strict
                 // `is_crown_coeff_safe` envelope — which
                 // includes the ±Inf conservative NaN guards `compose` emits —
@@ -680,7 +679,7 @@ impl BatchedLinearBounds {
                 );
 
                 // Only write back non-degraded directions: overwriting would
-                // silently defeat the row guard above (#3202).
+                // silently defeat the row guard above.
                 if !lower_degraded {
                     result_lower[[b, i]] = if sum_l.is_nan() {
                         f32::NEG_INFINITY

@@ -116,11 +116,56 @@ where
     copy_array2_with_poll(view, poll).map(Some)
 }
 
+/// A 2D convolution layer: `y = conv2d(x, kernel) + bias`.
+///
+/// # Parameter-mutation contract (#conv2d-parameter-boundary)
+///
+/// [`Self::replace_parameters`] is the supported way to change `kernel` or
+/// `bias` on a constructed layer. It commits through the constructor
+/// (`*self = Self::new_dilated(..)`), so anything the constructor derives is
+/// rebuilt *with* the parameters instead of surviving them. That is the same
+/// boundary [`crate::layers::LinearLayer::replace_parameters`] provides, and it
+/// is the reason `LinearLayer` may hold weight-derived caches soundly.
+///
+/// The contract here is WEAKER than `LinearLayer`'s in one respect that is
+/// load-bearing, so do not read across from it. `LinearLayer::weight` is not
+/// publicly assignable; `kernel` and `bias` below still are. Any holder of a
+/// `&mut Conv2dLayer`, in this crate or another, can replace or edit them in
+/// place with no revalidation and no rebuild, and writers of exactly that shape
+/// exist in the tree today: a subnormal-weight sanitiser that walks
+/// `kernel.iter_mut()` (`ny-cli/tests/flush_charged_metaroom_wallclock.rs`) and
+/// several tests that assign a deliberately malformed kernel to prove the
+/// consuming code refuses it instead of panicking (this module's `tests.rs`,
+/// `ny-cli`'s `cz_metaroom_qualification.rs`). That exposure is why the
+/// propagation and output-size entry points revalidate through
+/// `validate_geometry` rather than trusting construction.
+///
+/// The consequence, and the reason this block exists:
+///
+/// **`Conv2dLayer` must not gain a field derived from `kernel` or `bias`.** A
+/// derived field would be built once, would not be reached by a `pub` write,
+/// and would then publish a bound computed from parameters the layer no longer
+/// holds — a wrong bound, not merely a stale one. Adding one requires FIRST
+/// making `kernel`/`bias` non-`pub` and migrating every reader onto
+/// [`Self::kernel()`] / [`Self::bias()`], which is what those accessors exist
+/// for. `parameter_boundary_tests::conv_structs_carry_no_parameter_derived_field`
+/// destructures this struct exhaustively with no `..`, so adding any field
+/// stops that module compiling until an author lists the field there — which
+/// is where the choice above has to be made deliberately.
 #[derive(Debug, Clone)]
 pub struct Conv2dLayer {
     /// Convolution kernel of shape (out_channels, in_channels/groups, kernel_h, kernel_w)
+    ///
+    /// Publicly assignable — see the parameter-mutation contract on the struct.
+    /// Prefer [`Self::kernel()`] to read and [`Self::replace_parameters`] to
+    /// write; a direct write skips every constructor check.
     pub kernel: ArrayD<f32>,
     /// Optional bias of shape (out_channels,)
+    ///
+    /// Publicly assignable on the same terms as `kernel`. Prefer
+    /// [`Self::bias()`] and [`Self::replace_parameters`]; a direct write can
+    /// leave `bias.len() != out_channels`, which only the entry-point
+    /// `validate_geometry` call then catches.
     pub bias: Option<Array1<f32>>,
     /// Stride (height, width)
     pub stride: (usize, usize),
@@ -329,6 +374,88 @@ impl Conv2dLayer {
         self.input_shape = Some((height, width));
     }
 
+    /// Immutable convolution kernel, shape
+    /// `(out_channels, in_channels/groups, kernel_h, kernel_w)`.
+    ///
+    /// The read half of the parameter-mutation contract on [`Conv2dLayer`].
+    /// Prefer this over the `kernel` field: it is the migration target if the
+    /// field is ever made non-`pub`, so a reader written against it does not
+    /// have to change.
+    pub fn kernel(&self) -> &ArrayD<f32> {
+        &self.kernel
+    }
+
+    /// Immutable optional bias, shape `(out_channels,)`.
+    ///
+    /// Same role as [`Self::kernel()`]; prefer it over the `bias` field.
+    pub fn bias(&self) -> Option<&Array1<f32>> {
+        self.bias.as_ref()
+    }
+
+    /// Replace both parameter tensors, rebuilding the layer through the
+    /// constructor.
+    ///
+    /// This is the supported mutation boundary for a constructed layer, and the
+    /// counterpart of `LinearLayer::replace_parameters`. It commits via
+    /// `*self = Self::new_dilated(..)`, so the replacement is a value the
+    /// constructor produced: whatever a future revision of that constructor
+    /// derives from the parameters is rebuilt here, and cannot be left over
+    /// from the previous ones. `input_shape` is not a parameter and is carried
+    /// across (`new_dilated` leaves it `None`); `stride`, `padding`,
+    /// `dilation`, and `groups` are likewise reused from `self`.
+    ///
+    /// Because it goes through the constructor it revalidates the WHOLE
+    /// geometry, not just the new tensors — so it also refuses on a layer whose
+    /// public geometry fields were already corrupted by a direct write. That is
+    /// deliberate: refusing is the safe direction.
+    ///
+    /// # Errors
+    ///
+    /// Returns the constructor's error if the kernel is not 4-D, has a zero
+    /// dimension, if `bias.len() != out_channels`, or if `self`'s existing
+    /// `stride`/`dilation`/`groups` no longer satisfy the constructor's
+    /// invariants. On any error `self` is left **unchanged**.
+    pub fn replace_parameters(
+        &mut self,
+        kernel: ArrayD<f32>,
+        bias: Option<Array1<f32>>,
+    ) -> Result<()> {
+        let mut replacement = Self::new_dilated(
+            kernel,
+            bias,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups,
+        )?;
+        replacement.input_shape = self.input_shape;
+        *self = replacement;
+        Ok(())
+    }
+
+    /// Replace the kernel, retaining the existing bias, via
+    /// [`Self::replace_parameters`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a shape error if the retained bias does not match the new
+    /// `out_channels`, or on any other constructor violation. `self` is left
+    /// unchanged.
+    pub fn set_kernel(&mut self, kernel: ArrayD<f32>) -> Result<()> {
+        self.replace_parameters(kernel, self.bias.clone())
+    }
+
+    /// Replace the bias, retaining the existing kernel, via
+    /// [`Self::replace_parameters`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a shape error if the new bias does not match `out_channels`, or
+    /// on any other constructor violation. `self` is left unchanged.
+    pub fn set_bias(&mut self, bias: Option<Array1<f32>>) -> Result<()> {
+        self.replace_parameters(self.kernel.clone(), bias)
+    }
+
     /// Output channels.
     ///
     /// This legacy infallible accessor returns `0` if callers have replaced the
@@ -520,7 +647,7 @@ impl Conv2dLayer {
         out_b_shape.push(out_dim);
 
         // Flatten (total_batch, out_dim, mid_dim) → (total_batch * out_dim, mid_dim)
-        // for batched GEMM. Same approach as conv2d/bound.rs propagate_linear (#3382).
+        // for batched GEMM. Same approach as conv2d/bound.rs propagate_linear.
         let total_rows = total_batch.checked_mul(out_dim).ok_or_else(|| {
             NyError::InvalidSpec(format!(
                 "Conv2d CROWN: total_batch * out_dim overflows: {total_batch} * {out_dim}"
@@ -548,9 +675,9 @@ impl Conv2dLayer {
         let want_recompute =
             crate::layers::convolution::crown_helpers::conv_should_f64_recompute(n_contraction);
 
-        // Per-group batched GEMM replaces N per-row conv2d_transpose calls (#3382).
-        // #3399: engine parameter enables GPU acceleration via GemmEngine.
-        // #3770: groups parameter enables depthwise/grouped convolutions.
+        // Per-group batched GEMM replaces N per-row conv2d_transpose calls.
+        // Engine parameter enables GPU acceleration via GemmEngine.
+        // Groups parameter enables depthwise/grouped convolutions.
         let lower_a_2d = if bounded_engine.is_some() {
             copy_array2_with_poll(lower_a_flat, &mut poll_bounded)?
         } else {
@@ -860,7 +987,7 @@ impl Conv2dLayer {
             }
         }
 
-        // Track which output rows have unsafe coefficients (#3256, #2812, #3228).
+        // Track which output rows have unsafe coefficients.
         // Scan GEMM output for non-finite or near-overflow values (same pattern as bound.rs).
         // Rows whose f64 recompute failed are forced unsafe so they degrade to the
         // maximally-loose ±inf bias (the f32-GEMM coefficient cannot be soundly
@@ -914,7 +1041,7 @@ impl Conv2dLayer {
             }
         }
 
-        // #3256: For rows with non-finite A-matrix coefficients, zero the entire row.
+        // For rows with non-finite A-matrix coefficients, zero the entire row.
         // Bias override happens after bias computation below.
         // Reference: conv2d/bound.rs:328-355 (scalar path).
         let (lower_affected, upper_affected) = if bounded_engine.is_some() {
@@ -1037,7 +1164,7 @@ impl Conv2dLayer {
                 )?
             };
 
-            // #3256: Override bias for non-finite A-matrix rows.
+            // Override bias for non-finite A-matrix rows.
             // Setting bias to ±inf with zeroed A-row produces sound [-inf,+inf] bounds.
             for row_idx in 0..total_rows {
                 if bounded_engine.is_some() && row_idx.is_multiple_of(BOUNDED_CROWN_POLL_ELEMENTS) {
@@ -1063,7 +1190,7 @@ impl Conv2dLayer {
                     .map_err(|_| NyError::InvalidSpec("Cannot reshape new_upper_b".to_string()))?,
             )
         } else {
-            // #3256: Even without conv bias, override for non-finite A-matrix rows.
+            // Even without conv bias, override for non-finite A-matrix rows.
             let mut lb = if bounded_engine.is_some() {
                 copy_arrayd_with_poll(&bounds.lower_b, &mut poll_bounded)?
             } else {
@@ -1113,7 +1240,7 @@ impl Conv2dLayer {
             shape
         };
 
-        // CROWN backward NaN firewall (#2812): conservative fallback instead of hard error.
+        // CROWN backward NaN firewall: conservative fallback instead of hard error.
         poll_bounded()?;
         let out = if bounded_engine.is_some() {
             // The pollable scans above already applied the per-row conservative
@@ -1149,16 +1276,28 @@ impl Conv2dLayer {
     }
 }
 
-/// Perform 2D convolution on a single (channels, height, width) input.
+/// A 2D transposed convolution layer: `y = conv_transpose2d(x, kernel) + bias`.
 ///
-/// This is a straightforward implementation for correctness testing.
-/// For production, use optimized backends (ONNX Runtime, Metal, etc.)
-
+/// # Parameter-mutation contract (#conv2d-parameter-boundary)
+///
+/// Identical in every respect to the contract documented on [`Conv2dLayer`],
+/// including the part that is weaker than `LinearLayer`'s: `kernel` and `bias`
+/// are `pub` and directly assignable, so **this struct must not gain a field
+/// derived from them** either. [`Self::replace_parameters`] is the supported
+/// mutation boundary and commits through `Self::new_full`. Read the block on
+/// [`Conv2dLayer`] before adding any field here.
 #[derive(Debug, Clone)]
 pub struct ConvTranspose2dLayer {
     /// Transposed convolution kernel of shape (in_channels, out_channels, kernel_h, kernel_w)
+    ///
+    /// Publicly assignable — see the parameter-mutation contract on the struct.
+    /// Prefer [`Self::kernel()`] to read and [`Self::replace_parameters`] to
+    /// write; a direct write skips every constructor check.
     pub kernel: ArrayD<f32>,
     /// Optional bias of shape (out_channels,)
+    ///
+    /// Publicly assignable on the same terms as `kernel`. Prefer
+    /// [`Self::bias()`] and [`Self::replace_parameters`].
     pub bias: Option<Array1<f32>>,
     /// Stride (height, width)
     pub stride: (usize, usize),
@@ -1321,6 +1460,74 @@ impl ConvTranspose2dLayer {
     /// Set the input spatial dimensions. Required for CROWN backward propagation.
     pub fn set_input_shape(&mut self, height: usize, width: usize) {
         self.input_shape = Some((height, width));
+    }
+
+    /// Immutable transposed-convolution kernel, shape
+    /// `(in_channels, out_channels, kernel_h, kernel_w)`.
+    ///
+    /// The read half of the parameter-mutation contract; see [`Conv2dLayer`].
+    pub fn kernel(&self) -> &ArrayD<f32> {
+        &self.kernel
+    }
+
+    /// Immutable optional bias, shape `(out_channels,)`.
+    pub fn bias(&self) -> Option<&Array1<f32>> {
+        self.bias.as_ref()
+    }
+
+    /// Replace both parameter tensors, rebuilding the layer through the
+    /// constructor.
+    ///
+    /// The [`Conv2dLayer::replace_parameters`] contract, applied to
+    /// `Self::new_full`: `stride`, `padding`, `dilation`, and `output_padding`
+    /// are reused from `self`, `input_shape` is carried across, and the whole
+    /// geometry is revalidated.
+    ///
+    /// # Errors
+    ///
+    /// Returns the constructor's error if the kernel is not 4-D, has a zero
+    /// dimension, if `bias.len() != out_channels`, or if `self`'s existing
+    /// `stride`/`dilation`/`output_padding` no longer satisfy the constructor's
+    /// invariants. On any error `self` is left **unchanged**.
+    pub fn replace_parameters(
+        &mut self,
+        kernel: ArrayD<f32>,
+        bias: Option<Array1<f32>>,
+    ) -> Result<()> {
+        let mut replacement = Self::new_full(
+            kernel,
+            bias,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.output_padding,
+        )?;
+        replacement.input_shape = self.input_shape;
+        *self = replacement;
+        Ok(())
+    }
+
+    /// Replace the kernel, retaining the existing bias, via
+    /// [`Self::replace_parameters`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a shape error if the retained bias does not match the new
+    /// `out_channels`, or on any other constructor violation. `self` is left
+    /// unchanged.
+    pub fn set_kernel(&mut self, kernel: ArrayD<f32>) -> Result<()> {
+        self.replace_parameters(kernel, self.bias.clone())
+    }
+
+    /// Replace the bias, retaining the existing kernel, via
+    /// [`Self::replace_parameters`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a shape error if the new bias does not match `out_channels`, or
+    /// on any other constructor violation. `self` is left unchanged.
+    pub fn set_bias(&mut self, bias: Option<Array1<f32>>) -> Result<()> {
+        self.replace_parameters(self.kernel.clone(), bias)
     }
 
     /// Output channels.
@@ -1773,7 +1980,7 @@ impl ConvTranspose2dLayer {
             }
         }
 
-        // #3256: Zero rows with unsafe A-matrix coefficients.
+        // Zero rows with unsafe A-matrix coefficients.
         let lower_affected = lower_nonfinite_rows.iter().filter(|&&r| r).count();
         let upper_affected = upper_nonfinite_rows.iter().filter(|&&r| r).count();
         if lower_affected > 0 || upper_affected > 0 {
@@ -1838,7 +2045,7 @@ impl ConvTranspose2dLayer {
                 })?,
             )?;
 
-            // #3256: Override bias for non-finite A-matrix rows.
+            // Override bias for non-finite A-matrix rows.
             for row_idx in 0..total_rows {
                 if lower_nonfinite_rows[row_idx] {
                     new_lower_b[row_idx] = f32::NEG_INFINITY;
@@ -1857,7 +2064,7 @@ impl ConvTranspose2dLayer {
                     .map_err(|_| NyError::InvalidSpec("Cannot reshape new_upper_b".to_string()))?,
             )
         } else {
-            // #3256: Even without conv bias, override for non-finite A-matrix rows.
+            // Even without conv bias, override for non-finite A-matrix rows.
             let mut lb = bounds.lower_b.clone();
             let mut ub = bounds.upper_b.clone();
             if lower_affected > 0 || upper_affected > 0 {
@@ -1890,7 +2097,7 @@ impl ConvTranspose2dLayer {
             shape
         };
 
-        // CROWN backward NaN firewall (#2812): conservative fallback instead of hard error.
+        // CROWN backward NaN firewall: conservative fallback instead of hard error.
         let mut out = BatchedLinearBounds::new_or_conservative(
             new_lower_a,
             new_lower_b,
@@ -1902,5 +2109,272 @@ impl ConvTranspose2dLayer {
         // Attach the certified coefficient error (#vnncomp-aw-soundness).
         out.set_coeff_err(new_lower_a_err, new_upper_a_err);
         Ok(out)
+    }
+}
+
+/// Tests for the parameter-mutation boundary documented on [`Conv2dLayer`]
+/// (#conv2d-parameter-boundary).
+///
+/// These live beside the structs rather than in this module's `tests.rs`
+/// because the first of them is a compile-time ratchet on the struct
+/// definitions themselves, and must break in the same file the definitions
+/// change in.
+#[cfg(test)]
+mod parameter_boundary_tests {
+    use super::{Conv2dLayer, ConvTranspose2dLayer};
+    use ndarray::{Array1, ArrayD, IxDyn};
+    use ny_core::NyError;
+
+    /// out_channels = 2, in_channels/groups = 1, 1x1 kernel, bias of length 2,
+    /// groups = 1, input_shape = (3, 4).
+    fn conv2d_fixture() -> Conv2dLayer {
+        Conv2dLayer::with_input_shape(
+            ArrayD::<f32>::from_elem(IxDyn(&[2, 1, 1, 1]), 1.0),
+            Some(Array1::from_vec(vec![0.5_f32, -0.25])),
+            (1, 1),
+            (0, 0),
+            3,
+            4,
+        )
+        .expect("the Conv2d fixture must construct")
+    }
+
+    /// in_channels = 1, out_channels = 2, 1x1 kernel, bias of length 2,
+    /// input_shape = (3, 4).
+    fn convtranspose2d_fixture() -> ConvTranspose2dLayer {
+        ConvTranspose2dLayer::with_input_shape(
+            ArrayD::<f32>::from_elem(IxDyn(&[1, 2, 1, 1]), 1.0),
+            Some(Array1::from_vec(vec![0.5_f32, -0.25])),
+            (1, 1),
+            (0, 0),
+            3,
+            4,
+        )
+        .expect("the ConvTranspose2d fixture must construct")
+    }
+
+    /// COMPILE-TIME RATCHET, not a runtime assertion.
+    ///
+    /// Both patterns are exhaustive with no `..`, so adding ANY field to either
+    /// struct stops this module compiling (E0027). That is the intended
+    /// failure: a new field is either derived from `kernel`/`bias` — which
+    /// these structs must not hold while those fields are `pub`, because a
+    /// direct write would leave it stale and publish a wrong bound — or it is
+    /// not, and the author says which by listing it here.
+    #[ntest::timeout(10000)]
+    #[test]
+    fn conv_structs_carry_no_parameter_derived_field() {
+        let Conv2dLayer {
+            kernel,
+            bias,
+            stride,
+            padding,
+            dilation,
+            groups,
+            input_shape,
+        } = conv2d_fixture();
+        assert_eq!(kernel.shape(), &[2, 1, 1, 1]);
+        assert_eq!(bias.map(|b| b.len()), Some(2));
+        assert_eq!(stride, (1, 1));
+        assert_eq!(padding, (0, 0));
+        assert_eq!(dilation, (1, 1));
+        assert_eq!(groups, 1);
+        assert_eq!(input_shape, Some((3, 4)));
+
+        let ConvTranspose2dLayer {
+            kernel,
+            bias,
+            stride,
+            padding,
+            dilation,
+            output_padding,
+            input_shape,
+        } = convtranspose2d_fixture();
+        assert_eq!(kernel.shape(), &[1, 2, 1, 1]);
+        assert_eq!(bias.map(|b| b.len()), Some(2));
+        assert_eq!(stride, (1, 1));
+        assert_eq!(padding, (0, 0));
+        assert_eq!(dilation, (1, 1));
+        assert_eq!(output_padding, (0, 0));
+        assert_eq!(input_shape, Some((3, 4)));
+    }
+
+    /// A malformed kernel is refused and `self` is left untouched.
+    ///
+    /// Fails closed against the defect this method exists to prevent: an
+    /// implementation that assigned the fields directly would return `Ok` here
+    /// and leave a rank-1 kernel in place.
+    #[ntest::timeout(10000)]
+    #[test]
+    fn conv2d_replace_parameters_refuses_malformed_kernel_without_mutating() {
+        let mut layer = conv2d_fixture();
+        let kernel_before = layer.kernel().clone();
+        let error = layer
+            .replace_parameters(ArrayD::<f32>::zeros(IxDyn(&[1])), None)
+            .expect_err("a rank-1 kernel must be refused");
+        assert!(matches!(&error, NyError::ShapeMismatch { .. }), "{error:?}");
+        assert_eq!(layer.kernel(), &kernel_before);
+        assert_eq!(layer.bias().map(|b| b.to_vec()), Some(vec![0.5, -0.25]));
+        assert_eq!(layer.out_channels(), 2);
+        assert_eq!(layer.input_shape, Some((3, 4)));
+    }
+
+    /// A bias whose length does not match the NEW `out_channels` is refused,
+    /// and `self` is left untouched.
+    ///
+    /// This is the exact incoherent state a direct `layer.kernel = ..` write
+    /// produces, pinned here as something the boundary rejects.
+    #[ntest::timeout(10000)]
+    #[test]
+    fn conv2d_replace_parameters_refuses_bias_arity_mismatch_without_mutating() {
+        let mut layer = conv2d_fixture();
+        let error = layer
+            .replace_parameters(
+                ArrayD::<f32>::from_elem(IxDyn(&[3, 1, 1, 1]), 1.0),
+                Some(Array1::from_vec(vec![0.0_f32, 0.0])),
+            )
+            .expect_err("a length-2 bias cannot match out_channels 3");
+        assert!(matches!(&error, NyError::ShapeMismatch { .. }), "{error:?}");
+        assert_eq!(layer.kernel().shape(), &[2, 1, 1, 1]);
+        assert_eq!(layer.out_channels(), 2);
+        assert_eq!(layer.bias().map(|b| b.to_vec()), Some(vec![0.5, -0.25]));
+    }
+
+    /// The success path commits a value the constructor produced: the derived
+    /// geometry accessors follow the new kernel, and the non-parameter geometry
+    /// — `input_shape` in particular, which `new_dilated` leaves `None` —
+    /// survives.
+    #[ntest::timeout(10000)]
+    #[test]
+    fn conv2d_replace_parameters_commits_through_the_constructor() {
+        let mut layer = conv2d_fixture();
+        layer
+            .replace_parameters(
+                ArrayD::<f32>::from_elem(IxDyn(&[3, 1, 2, 2]), 0.25),
+                Some(Array1::from_vec(vec![1.0_f32, 2.0, 3.0])),
+            )
+            .expect("a well-formed replacement must be accepted");
+
+        assert_eq!(layer.kernel().shape(), &[3, 1, 2, 2]);
+        assert_eq!(layer.bias().map(|b| b.to_vec()), Some(vec![1.0, 2.0, 3.0]));
+        assert_eq!(layer.out_channels(), 3);
+        assert_eq!(layer.in_channels(), 1);
+        assert_eq!(layer.kernel_size(), (2, 2));
+        assert_eq!(layer.stride, (1, 1));
+        assert_eq!(layer.padding, (0, 0));
+        assert_eq!(layer.dilation, (1, 1));
+        assert_eq!(layer.groups, 1);
+        assert_eq!(
+            layer.input_shape,
+            Some((3, 4)),
+            "input_shape is not a parameter and must be carried across"
+        );
+        assert_eq!(
+            layer.output_size(3, 4).expect("geometry must revalidate"),
+            (2, 3)
+        );
+    }
+
+    /// `set_kernel` / `set_bias` inherit the boundary's validation rather than
+    /// writing their field.
+    #[ntest::timeout(10000)]
+    #[test]
+    fn conv2d_set_kernel_and_set_bias_route_through_replace_parameters() {
+        let mut layer = conv2d_fixture();
+
+        let error = layer
+            .set_kernel(ArrayD::<f32>::from_elem(IxDyn(&[3, 1, 1, 1]), 1.0))
+            .expect_err("the retained length-2 bias cannot match out_channels 3");
+        assert!(matches!(&error, NyError::ShapeMismatch { .. }), "{error:?}");
+        assert_eq!(layer.kernel().shape(), &[2, 1, 1, 1]);
+
+        let replacement = ArrayD::<f32>::from_elem(IxDyn(&[2, 1, 1, 1]), 7.0);
+        layer
+            .set_kernel(replacement.clone())
+            .expect("a shape-preserving kernel must be accepted");
+        assert_eq!(layer.kernel(), &replacement);
+        assert_eq!(layer.bias().map(|b| b.to_vec()), Some(vec![0.5, -0.25]));
+        assert_eq!(layer.input_shape, Some((3, 4)));
+
+        let error = layer
+            .set_bias(Some(Array1::from_vec(vec![0.0_f32])))
+            .expect_err("a length-1 bias cannot match out_channels 2");
+        assert!(matches!(&error, NyError::ShapeMismatch { .. }), "{error:?}");
+        assert_eq!(layer.bias().map(|b| b.to_vec()), Some(vec![0.5, -0.25]));
+
+        layer.set_bias(None).expect("dropping the bias is valid");
+        assert!(layer.bias().is_none());
+        assert_eq!(layer.kernel(), &replacement);
+    }
+
+    /// Pins the exposure the struct doc describes, so that doc cannot go stale.
+    ///
+    /// The parameter fields are still `pub`, so a direct write lands with no
+    /// revalidation and leaves the layer incoherent; only the entry-point
+    /// `validate_geometry` call catches it afterwards. The supported boundary
+    /// refuses the identical transition up front. If `kernel` is ever made
+    /// non-`pub`, this test stops compiling — the correct failure, because the
+    /// struct doc must be rewritten in the same change.
+    #[ntest::timeout(10000)]
+    #[test]
+    fn conv2d_direct_field_assignment_still_bypasses_validation() {
+        let mut unguarded = conv2d_fixture();
+        unguarded.kernel = ArrayD::<f32>::from_elem(IxDyn(&[3, 1, 1, 1]), 1.0);
+        assert_eq!(
+            unguarded.out_channels(),
+            3,
+            "the direct write landed with no revalidation"
+        );
+        assert_eq!(
+            unguarded.bias().map(|b| b.len()),
+            Some(2),
+            "and left a bias the new out_channels cannot match"
+        );
+        assert!(
+            matches!(
+                unguarded.validate_geometry(),
+                Err(NyError::ShapeMismatch { .. })
+            ),
+            "the entry-point revalidation is the only thing that still catches this"
+        );
+
+        let mut guarded = conv2d_fixture();
+        let error = guarded
+            .set_kernel(ArrayD::<f32>::from_elem(IxDyn(&[3, 1, 1, 1]), 1.0))
+            .expect_err("the boundary must refuse what the field write allows");
+        assert!(matches!(&error, NyError::ShapeMismatch { .. }), "{error:?}");
+        assert_eq!(guarded.out_channels(), 2);
+        assert!(guarded.validate_geometry().is_ok());
+    }
+
+    /// The ConvTranspose2d boundary behaves identically: refuse-and-leave on a
+    /// malformed kernel, commit-through-the-constructor on a valid one.
+    #[ntest::timeout(10000)]
+    #[test]
+    fn convtranspose2d_replace_parameters_refuses_then_commits() {
+        let mut layer = convtranspose2d_fixture();
+        let kernel_before = layer.kernel().clone();
+        let error = layer
+            .replace_parameters(ArrayD::<f32>::zeros(IxDyn(&[1, 1, 1])), None)
+            .expect_err("a rank-3 kernel must be refused");
+        assert!(matches!(&error, NyError::ShapeMismatch { .. }), "{error:?}");
+        assert_eq!(layer.kernel(), &kernel_before);
+        assert_eq!(layer.bias().map(|b| b.len()), Some(2));
+
+        layer
+            .replace_parameters(
+                ArrayD::<f32>::from_elem(IxDyn(&[1, 3, 2, 2]), 0.5),
+                Some(Array1::from_vec(vec![1.0_f32, 2.0, 3.0])),
+            )
+            .expect("a well-formed replacement must be accepted");
+        assert_eq!(layer.in_channels(), 1);
+        assert_eq!(layer.out_channels(), 3);
+        assert_eq!(layer.kernel_size(), (2, 2));
+        assert_eq!(layer.output_padding, (0, 0));
+        assert_eq!(
+            layer.input_shape,
+            Some((3, 4)),
+            "input_shape is not a parameter and must be carried across"
+        );
     }
 }

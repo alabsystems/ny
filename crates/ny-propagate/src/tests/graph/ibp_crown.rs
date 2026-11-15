@@ -4,7 +4,7 @@
 
 //! CROWN-IBP and NaN guard tests for GraphNetwork IBP propagation.
 //!
-//! Split from `ibp.rs` to keep files under 500 lines (#2633).
+//! Split from `ibp.rs` to keep files under 500 lines.
 
 use crate::*;
 use ndarray::{arr1, arr2, ArrayD, IxDyn};
@@ -114,7 +114,7 @@ fn test_graph_crown_ibp_dag_status_reports_nonzero_fallback_provenance() {
     });
 }
 
-/// Regression: non-sound IBP must return error on NaN input (#2563).
+/// Regression: non-sound IBP must return error on NaN input.
 #[ntest::timeout(10000)]
 #[test]
 fn test_graph_ibp_nonsound_nan_input_returns_error() {
@@ -172,7 +172,7 @@ fn test_graph_ibp_sound_nan_input_returns_error() {
     }
 }
 
-/// Build the #3680 extracted-stage reproducer graph.
+/// Build the extracted-stage reproducer graph.
 fn build_extracted_stage_graph_3680() -> (GraphNetwork, BoundedTensor) {
     use crate::layers::{AddLayer, Conv1dLayer, PadLayer, PadMode, SliceLayer};
 
@@ -257,7 +257,7 @@ fn build_encoder_prefix_3775(graph: &mut GraphNetwork) {
 }
 
 /// Graph: linear0 → relu → linear_pre_ln → layernorm → linear1 → gelu → linear2.
-/// ReLU lets CROWN backward from linear_pre_ln exploit linear relaxation (#3775).
+/// ReLU lets CROWN backward from linear_pre_ln exploit linear relaxation.
 fn build_unary_transformer_graph_3775() -> (GraphNetwork, BoundedTensor) {
     let mut graph = GraphNetwork::new();
     build_encoder_prefix_3775(&mut graph);
@@ -307,7 +307,7 @@ fn build_unary_transformer_graph_3775() -> (GraphNetwork, BoundedTensor) {
     (graph, input)
 }
 
-/// Regression #3680: CROWN-IBP on extracted-subgraph must not degrade to fallback.
+/// Regression: CROWN-IBP on extracted-subgraph must not degrade to fallback.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_ibp_extracted_graph_no_propagation_error_fallback_3680() {
@@ -406,7 +406,7 @@ fn test_graph_crown_ibp_unary_transformer_selected_nodes_tighten_3775() {
     });
 }
 
-/// Build a variable-style AdaIN ternary graph for #4142.
+/// Build a variable-style AdaIN ternary graph.
 ///
 /// Graph: _input → add_x (+0.0) ───────────────────┐
 ///        _input → mul_g (*0.5) → add_g (+1.0) ──── AdaIN(variable) → output
@@ -512,7 +512,7 @@ fn hash_sample(seed: u32, idx: u32, offset: u32) -> u32 {
     h
 }
 
-/// #4142 regression: variable-style AdaIN graph IBP must route through the
+/// Regression: variable-style AdaIN graph IBP must route through the
 /// ternary classify path and produce sound bounds.
 #[ntest::timeout(10000)]
 #[test]

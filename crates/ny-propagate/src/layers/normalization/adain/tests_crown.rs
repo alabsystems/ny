@@ -5,10 +5,8 @@
 //! CROWN backward tests for AdaIN1d layer.
 //!
 //! Tests the CROWN scalar path (crown_common.rs) including:
-//! - NaN/Inf pre-activation guard (non-finite → constant bounds, #3259)
+//! - NaN/Inf pre-activation guard (non-finite → constant bounds)
 //! - Sound mode refusal
-//!
-//! Part of #3103.
 
 use ndarray::{Array1, Array2, ArrayD, IxDyn};
 use ny_tensor::BoundedTensor;
@@ -32,9 +30,9 @@ fn make_adain(num_channels: usize, style_gamma: &[f32], style_beta: &[f32]) -> A
 // ── CROWN scalar NaN/Inf pre-activation guard tests ─────────────────────────
 // These test the non-finite guard in crown_common.rs which returns constant
 // bounds (A=0, bias=[-inf, +inf]) when pre-activation bounds contain NaN or
-// Inf. Previously returned unsound identity passthrough (#3259).
+// Inf. Previously returned unsound identity passthrough.
 
-/// NaN in pre-activation lower bound triggers constant bounds fallback (#3259).
+/// NaN in pre-activation lower bound triggers constant bounds fallback.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_scalar_nan_pre_activation_lower_returns_constant_bounds() {
@@ -74,7 +72,7 @@ fn test_crown_scalar_nan_pre_activation_lower_returns_constant_bounds() {
     );
 }
 
-/// NaN in pre-activation upper bound triggers constant bounds fallback (#3259).
+/// NaN in pre-activation upper bound triggers constant bounds fallback.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_scalar_nan_pre_activation_upper_returns_constant_bounds() {
@@ -113,7 +111,7 @@ fn test_crown_scalar_nan_pre_activation_upper_returns_constant_bounds() {
     );
 }
 
-/// Inf in pre-activation bounds triggers constant bounds fallback (#3259).
+/// Inf in pre-activation bounds triggers constant bounds fallback.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_scalar_inf_pre_activation_returns_constant_bounds() {

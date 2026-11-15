@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Competition-shape GPU CROWN backward timing tests (#3397).
+//! Competition-shape GPU CROWN backward timing tests.
 //!
 //! Builds networks matching metaroom_6cnn_ry and soundnessbench_exact shapes,
 //! then measures GPU backward pass time. These tests validate that the GPU path
@@ -30,8 +30,8 @@ fn timing_test_memory_budget_bytes() -> usize {
 
 /// Check that estimated memory is within the production GPU budget before running
 /// a timing test. Reuses the production helper, but preserves a 16 GiB hard cap
-/// so local env overrides cannot re-enable the high-RSS timing runs that #3515
-/// was meant to prevent.
+/// so local env overrides cannot re-enable the high-RSS timing runs that the
+/// budget gate exists to prevent.
 fn check_memory_budget(label: &str, layers: &[GpuCrownLayer], num_specs: usize) {
     let estimated = estimate_crown_backward_peak_bytes(layers, num_specs);
     let budget = timing_test_memory_budget_bytes();
@@ -307,7 +307,7 @@ fn test_crown_backward_gpu_soundnessbench_like_timing() {
     run_timing_test(SOUNDNESSBENCH_CASE_NAME, &layers, num_specs, &inp_l, &inp_u);
 }
 
-/// Regression for #3397 spec batching: the competition-shape soundnessbench
+/// Regression for spec batching: the competition-shape soundnessbench
 /// workload must produce the same bounds whether specs are run in one
 /// auto-batched invocation or in explicit manual chunks.
 #[test]

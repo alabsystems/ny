@@ -187,8 +187,8 @@ pub(crate) fn ds_add(x: Ds, y: Ds) -> Ds {
 
 /// ds * ds: one-fma DWTimesDW in the `xl*yl`-DROPPING shape (Joldes et al.'s
 /// DWTimesDW2 — Algorithm 12 WITHOUT its `xl*yl` term). Published relative
-/// error for THIS shape: `<= 6u^2`. TRAP (verify-fix, 2026-08-20): the
-/// tighter `5u^2` bound this comment used to cite belongs to the
+/// error for THIS shape: `<= 6u^2`. TRAP: the tighter `5u^2` bound
+/// sometimes quoted belongs to the
 /// `xl*yl`-CARRYING Algorithm 12 — a DIFFERENT sequence — and must not be
 /// imported here: a "tighten 10u^2 -> 9u^2/tap" edit derived from `5u^2 + 3u^2`
 /// would UNDERCHARGE [`DS_TAP_EPS`], which correctly charges the `6u^2`
@@ -422,8 +422,7 @@ pub(crate) fn gamma_ds(n: usize) -> f64 {
 /// production dot shape: `10 * 2^-48 = 10 u^2`, `u = 2^-24`. Exact in f64
 /// (3-bit mantissa: `5 * 2^-47`).
 ///
-/// DOCUMENTED constituents (design §4, the error-charge-tightening session;
-/// constituent citation corrected in the verify-fix, 2026-08-20):
+/// DOCUMENTED constituents (design §4):
 /// ACCURATE DWPlusDW (the [`ds_add`] shape) `<= 3u^2/(1-4u) < 3.0000008u^2`
 /// unconditional; one-fma DWTimesDW in the `xl*yl`-DROPPING DWTimesDW2
 /// shape (the [`ds_mul`] sequence) has published bound `6u^2` — the `5u^2`

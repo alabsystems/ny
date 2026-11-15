@@ -139,14 +139,11 @@ fn test_gpu_bab_branching_creates_children() {
 }
 
 // =============================================================================
-// Additional GPU BaB test coverage (Part of #1534)
+// Additional GPU BaB test coverage
 // =============================================================================
-// Note: These tests depend on the branching path which is currently broken (#1536).
-// The tensor shape mismatch bug must be fixed before these tests can pass.
 
 /// Test deeper branching tree exploration (depth > 1).
-/// Part of #1534: Exercise multiple branching iterations with deeper trees.
-/// Blocked by #1536 until tensor shape mismatch is fixed.
+/// Exercises multiple branching iterations with deeper trees.
 #[ntest::timeout(10000)]
 #[test]
 fn test_gpu_bab_deeper_branching() {
@@ -189,8 +186,7 @@ fn test_gpu_bab_deeper_branching() {
 }
 
 /// Test unresolved_due_to_depth exit path.
-/// Part of #1534: When max_depth=1, domains at depth 1 should be dropped.
-/// Blocked by #1536 until tensor shape mismatch is fixed.
+/// When max_depth=1, domains at depth 1 should be dropped.
 #[ntest::timeout(10000)]
 #[test]
 fn test_gpu_bab_unresolved_due_to_depth() {
@@ -234,7 +230,7 @@ fn test_gpu_bab_unresolved_due_to_depth() {
 }
 
 /// Test that GPU BaB processes child domains correctly.
-/// Part of #1534: Verify child domain creation and processing in BaB loop.
+/// Verifies child domain creation and processing in the BaB loop.
 ///
 /// Note: This test verifies that child domains are created and verified,
 /// not the actual bound values (which would require introspection of domain internals).
@@ -283,7 +279,7 @@ fn test_gpu_bab_child_domain_processing() {
     );
 }
 
-/// #1896 regression: GPU BaB must return Verified when BaB tree is exhausted
+/// Regression: GPU BaB must return Verified when BaB tree is exhausted
 /// with branching (depth >= 1) and all leaf domains are verified.
 ///
 /// Network: 3-hidden-layer MLP [2]->[4]->[4]->[4]->[1] with 12 ReLU neurons.
@@ -452,7 +448,7 @@ fn test_gpu_bab_verified_after_branching_1896() {
     );
     // Bug trigger shape: parent domains count as explored, but children that
     // verify inline increment domains_verified without incrementing explored.
-    // Before #1896, `domains_verified == domains_explored` rejected this case.
+    // Before the fix, `domains_verified == domains_explored` rejected this case.
     assert!(
         result.domains_verified > result.domains_explored,
         "Expected branching mismatch (verified > explored), got explored={}, verified={} \
@@ -467,7 +463,7 @@ fn test_gpu_bab_verified_after_branching_1896() {
 }
 
 /// Test GPU BaB with stable neurons returns correct status.
-/// Part of #1534: Test stable neuron exit path.
+/// Exercises the stable neuron exit path.
 #[ntest::timeout(10000)]
 #[test]
 fn test_gpu_bab_stable_neurons() {

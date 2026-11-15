@@ -12,6 +12,7 @@ set -euo pipefail
 RECEIPT_SCHEMA="ny-submission-binary-receipt-v1"
 SOURCE_SCHEMA="ny-vnncomp-source-v1"
 PREBUILT_SCHEMA="ny-vnncomp-prebuilt-v1"
+RELEASE_SCHEMA="ny-release-manifest-v1"
 RECEIPT_MAX_BYTES=8192
 
 receipt_fail() {
@@ -421,11 +422,11 @@ receipt_parse() {
         receipt_fail "ay_commit must be one exact commit or none"
         return 1
     fi
-    case "${NY_RECEIPT_SOURCE_KIND}" in git|archive|prebuilt) ;; *)
+    case "${NY_RECEIPT_SOURCE_KIND}" in git|archive|prebuilt|release) ;; *)
         receipt_fail "unknown source_kind ${NY_RECEIPT_SOURCE_KIND}"
         return 1
     esac
-    case "${NY_RECEIPT_TOOLCHAIN_KIND}" in rustc-vv|trust-sealed) ;; *)
+    case "${NY_RECEIPT_TOOLCHAIN_KIND}" in rustc-vv|trust-sealed|trust-unverified) ;; *)
         receipt_fail "unknown toolchain_kind ${NY_RECEIPT_TOOLCHAIN_KIND}"
         return 1
     esac
@@ -509,7 +510,8 @@ receipt_create_local() {
     receipt_load_source_identity "${tool_dir}" || return 1
     binary_sha="$(receipt_sha256_file "${binary}")" || return 1
 
-    rustc_command="${RUSTC:-rustc}"
+    # The Trust toolchain's compiler (owner directive 2026-09-28).
+    rustc_command="${RUSTC:-trustc}"
     if ! command -v "${rustc_command}" >/dev/null 2>&1; then
         receipt_fail "could not locate the compiler used for receipt identity: ${rustc_command}"
         return 1
@@ -604,11 +606,427 @@ receipt_create_prebuilt() {
         "${manifest_sha}"
 }
 
+# --- release artifacts: dist/bin/<target>/MANIFEST (scripts/release/make_submission.sh)
+# vnncomp_scripts/verify_release.py is the full admission check; this parser
+# reads only the identities a receipt binds, but it is just as strict about
+# them: exact schema, one value per key, canonical hex.
+receipt_parse_release_manifest() {
+    local manifest="$1"
+    local line key value seen="|"
+
+    NY_RELEASE_SCHEMA=""
+    NY_RELEASE_TARGET=""
+    NY_RELEASE_FEATURES=""
+    NY_RELEASE_NY_COMMIT=""
+    NY_RELEASE_NY_COMMIT_TREE=""
+    NY_RELEASE_NY_COMMIT_OBJECT=""
+    NY_RELEASE_PATHS=""
+    NY_RELEASE_LOCK=""
+    NY_RELEASE_AY=""
+    NY_RELEASE_BINARY=""
+    NY_RELEASE_TRUSTC=""
+
+    receipt_require_regular_file "${manifest}" "release MANIFEST" || return 1
+    while IFS= read -r line; do
+        case "${line}" in
+            *=*) key="${line%%=*}"; value="${line#*=}" ;;
+            *)
+                receipt_fail "release MANIFEST has a line that is not key=value"
+                return 1
+                ;;
+        esac
+        case "${key}" in
+            schema|target|features|ny_commit|ny_commit_tree|ny_commit_object|release_paths|cargo_lock_sha256|ay_lock_commit|binary_sha256|trustc_sha256) ;;
+            *) continue ;;
+        esac
+        case "${seen}" in
+            *"|${key}|"*)
+                receipt_fail "release MANIFEST has duplicate key ${key}"
+                return 1
+                ;;
+        esac
+        seen="${seen}${key}|"
+        case "${key}" in
+            schema) NY_RELEASE_SCHEMA="${value}" ;;
+            target) NY_RELEASE_TARGET="${value}" ;;
+            features) NY_RELEASE_FEATURES="${value}" ;;
+            ny_commit) NY_RELEASE_NY_COMMIT="${value}" ;;
+            ny_commit_tree) NY_RELEASE_NY_COMMIT_TREE="${value}" ;;
+            ny_commit_object) NY_RELEASE_NY_COMMIT_OBJECT="${value}" ;;
+            release_paths) NY_RELEASE_PATHS="${value}" ;;
+            cargo_lock_sha256) NY_RELEASE_LOCK="${value}" ;;
+            ay_lock_commit) NY_RELEASE_AY="${value}" ;;
+            binary_sha256) NY_RELEASE_BINARY="${value}" ;;
+            trustc_sha256) NY_RELEASE_TRUSTC="${value}" ;;
+        esac
+    done < "${manifest}"
+    if [ "${NY_RELEASE_SCHEMA}" != "${RELEASE_SCHEMA}" ] || [ "${NY_RELEASE_FEATURES}" != "mip,cuda" ]; then
+        receipt_fail "release MANIFEST has the wrong schema or feature tier"
+        return 1
+    fi
+    case "${NY_RELEASE_TARGET}" in
+        x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu) ;;
+        *)
+            receipt_fail "release MANIFEST names an unsupported target"
+            return 1
+            ;;
+    esac
+    receipt_is_lower_hex "${NY_RELEASE_NY_COMMIT}" 40 && receipt_is_lower_hex "${NY_RELEASE_AY}" 40 \
+        && receipt_is_lower_hex "${NY_RELEASE_NY_COMMIT_TREE}" 40 || {
+        receipt_fail "release MANIFEST ny_commit/ny_commit_tree/ay_lock_commit is malformed"
+        return 1
+    }
+    if ! [[ "${NY_RELEASE_NY_COMMIT_OBJECT}" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]; then
+        receipt_fail "release MANIFEST ny_commit_object is missing or not base64"
+        return 1
+    fi
+    if [ "${NY_RELEASE_PATHS}" != "$(IFS=,; printf '%s' "${RELEASE_PATHS[*]}")" ]; then
+        receipt_fail "release MANIFEST release_paths is not exactly the release files this receipt removes"
+        return 1
+    fi
+    receipt_require_digest "${NY_RELEASE_LOCK}" "release cargo_lock_sha256" || return 1
+    receipt_require_digest "${NY_RELEASE_BINARY}" "release binary_sha256" || return 1
+    receipt_require_digest "${NY_RELEASE_TRUSTC}" "release trustc_sha256" || return 1
+}
+
+# The same package roots vnncomp_scripts/verify_release.py binds at install
+# time (its PACKAGE_ROOTS; release_pipeline_black_box.rs pins the two lists
+# equal): an untracked, non-ignored file under one of them is an input
+# ny_commit does not cover -- the binary reads configs/ presets at run time.
+RELEASE_PACKAGE_ROOTS=(
+    ".cargo"
+    "benchmarks/download_benchmarks.sh"
+    "Cargo.lock"
+    "Cargo.toml"
+    "LICENSE"
+    "README.md"
+    "_typos.toml"
+    "clippy.toml"
+    "configs"
+    "crates"
+    "install_tool.sh"
+    "prepare_instance.sh"
+    "requirements.txt"
+    "rust-toolchain.toml"
+    "run_instance.sh"
+    "scripts/vnncomp_coverage.py"
+    "scripts/release"
+    "vnncomp_scripts"
+)
+
+# Every path a release commit may add on top of ny_commit, for every target:
+# the same list as vnncomp_scripts/verify_release.py RELEASE_PATHS and the
+# `release_paths` make_submission.sh records (release_pipeline_black_box.rs
+# pins the three equal).
+RELEASE_PATHS=(
+    "dist/bin/aarch64-unknown-linux-gnu/MANIFEST"
+    "dist/bin/aarch64-unknown-linux-gnu/ny.sha256"
+    "dist/bin/aarch64-unknown-linux-gnu/ny.xz"
+    "dist/bin/x86_64-unknown-linux-gnu/MANIFEST"
+    "dist/bin/x86_64-unknown-linux-gnu/ny.sha256"
+    "dist/bin/x86_64-unknown-linux-gnu/ny.xz"
+)
+
+# `git` on the release checkout DIR (canonical, from realpath): read-only, and
+# with DIR -- exactly DIR, never `*` -- as safe.directory, so a clone owned by
+# another user than the one running the install or the instance is read rather
+# than refused as "dubious ownership"; every comparison is the one the owner
+# would run. git matches the entry against the worktree, so a linked
+# worktree's gitdir (a gitfile target) is opened under it too. This trusts
+# nothing new but makes the clone's own .git live for these calls (its config
+# -- a core.fsmonitor hook there runs as the caller --, index flags,
+# refs/replace, shallow file): whoever can write that .git can already edit
+# this script and run_instance.sh, which the same caller runs from the same
+# clone. The binding is of committed content under git's own clone state, never
+# a defence against the clone's owner (docs/RELEASE.md).
+receipt_git() { # dir git-arguments...
+    local dir="$1"
+    shift
+    git -c "safe.directory=${dir}" --no-optional-locks -C "${dir}" "$@"
+}
+
+receipt_is_release_path() {
+    local candidate
+    for candidate in "${RELEASE_PATHS[@]}"; do
+        [ "${candidate}" = "$1" ] && return 0
+    done
+    return 1
+}
+
+receipt_release_path_below() {
+    local candidate
+    for candidate in "${RELEASE_PATHS[@]}"; do
+        [[ "${candidate}" == "$1"/* ]] && return 0
+    done
+    return 1
+}
+
+# Prints the id of TREE (at path PREFIX) with every RELEASE_PATHS file removed,
+# or "-" when nothing is left (git never stores an empty directory, so an
+# emptied one goes too). Only a regular file (100644/100755) at a release path
+# is removed: a symlink, directory or submodule there stays, so the comparison
+# refuses it. Computable in a shallow clone: it reads only HEAD's own trees and
+# hashes the rebuilt ones without writing (`hash-object` without -w). The same
+# computation as verify_release.py tree_without_release_paths().
+receipt_tree_without_release_paths() { # dir tree prefix
+    local dir="$1" tree="$2" prefix="$3"
+    local listing="" staged="" record meta name mode kind oid path stripped escaped index
+    local changed=0 problem=""
+    listing="$(mktemp "${TMPDIR:-/tmp}/ny-release-tree.XXXXXX")" || {
+        receipt_fail "could not stage a tree listing"
+        return 1
+    }
+    staged="$(mktemp "${TMPDIR:-/tmp}/ny-release-tree.XXXXXX")" || {
+        rm -f -- "${listing}"
+        receipt_fail "could not stage a tree"
+        return 1
+    }
+    if ! receipt_git "${dir}" ls-tree --full-tree -z "${tree}" > "${listing}"; then
+        rm -f -- "${listing}" "${staged}"
+        receipt_fail "could not list tree ${tree}"
+        return 1
+    fi
+    while IFS= read -r -d '' record; do
+        meta="${record%%$'\t'*}"
+        name="${record#*$'\t'}"
+        read -r mode kind oid <<<"${meta}"
+        if [ "${meta}" = "${record}" ] || [ -z "${name}" ] || ! receipt_is_lower_hex "${oid}" 40 \
+            || [ "${meta}" != "${mode} ${kind} ${oid}" ]; then
+            problem="unexpected git ls-tree record under ${prefix:-<root>}"
+            break
+        fi
+        path="${prefix}${name}"
+        if [ "${kind}" = blob ] && { [ "${mode}" = 100644 ] || [ "${mode}" = 100755 ]; } \
+            && receipt_is_release_path "${path}"; then
+            changed=1
+            continue
+        fi
+        if [ "${kind}" = tree ] && receipt_release_path_below "${path}"; then
+            if ! stripped="$(receipt_tree_without_release_paths "${dir}" "${oid}" "${path}/")"; then
+                problem="could not strip the release files below ${path}"
+                break
+            fi
+            [ "${stripped}" = "${oid}" ] || changed=1
+            [ "${stripped}" = "-" ] && continue
+            oid="${stripped}"
+        fi
+        escaped=""
+        for ((index = 0; index < 40; index += 2)); do
+            escaped+="\\x${oid:index:2}"
+        done
+        # shellcheck disable=SC2059 # the format is only \xHH escapes of a checked 40-hex id
+        if ! { printf '%s %s\0' "${mode#0}" "${name}"; printf "${escaped}"; } >> "${staged}"; then
+            problem="could not stage tree ${tree}"
+            break
+        fi
+    done < "${listing}"
+    rm -f -- "${listing}"
+    if [ -n "${problem}" ]; then
+        rm -f -- "${staged}"
+        receipt_fail "${problem}"
+        return 1
+    fi
+    if [ "${changed}" -eq 0 ]; then
+        rm -f -- "${staged}"
+        printf '%s\n' "${tree}"
+        return 0
+    fi
+    if [ ! -s "${staged}" ]; then
+        rm -f -- "${staged}"
+        printf -- '-\n'
+        return 0
+    fi
+    if ! stripped="$(receipt_git "${dir}" hash-object -t tree --stdin < "${staged}")" \
+        || ! receipt_is_lower_hex "${stripped}" 40; then
+        rm -f -- "${staged}"
+        receipt_fail "could not hash the tree rebuilt from ${tree}"
+        return 1
+    fi
+    rm -f -- "${staged}"
+    printf '%s\n' "${stripped}"
+}
+
+# MANIFEST's ny_commit_object is ny_commit's raw commit object (base64): its git
+# SHA-1 must be ny_commit -- the commit the binary embeds -- and its first
+# header must name ny_commit_tree. That binds the recorded tree id to ny_commit
+# without any history, so a shallow clone whose MANIFEST re-points
+# ny_commit_tree at an edited source tree is refused as a full clone refuses
+# it. The same check as verify_release.py verify_commit_object().
+receipt_release_commit_object_binds() { # dir ny_commit ny_commit_tree object-base64
+    local dir="$1" ny_commit="$2" ny_commit_tree="$3" encoded="$4"
+    local decoded hashed header="" size
+    decoded="$(mktemp "${TMPDIR:-/tmp}/ny-release-commit.XXXXXX")" || {
+        receipt_fail "could not stage the ny_commit object"
+        return 1
+    }
+    if ! printf '%s' "${encoded}" | base64 -d > "${decoded}" 2>/dev/null; then
+        rm -f -- "${decoded}"
+        receipt_fail "release MANIFEST ny_commit_object does not decode"
+        return 1
+    fi
+    size="$(wc -c < "${decoded}")"
+    if [ "${size}" -gt 32768 ]; then
+        rm -f -- "${decoded}"
+        receipt_fail "release MANIFEST ny_commit_object is larger than 32768 bytes"
+        return 1
+    fi
+    hashed="$(receipt_git "${dir}" hash-object --literally -t commit --stdin < "${decoded}" 2>/dev/null || true)"
+    IFS= read -r header < "${decoded}" || true
+    rm -f -- "${decoded}"
+    if [ "${hashed}" != "${ny_commit}" ]; then
+        receipt_fail "release MANIFEST ny_commit_object hashes to ${hashed:-<nothing>}, not ny_commit ${ny_commit}"
+        return 1
+    fi
+    if [ "${header}" != "tree ${ny_commit_tree}" ]; then
+        receipt_fail "ny_commit ${ny_commit} names '${header}', not release ny_commit_tree ${ny_commit_tree}"
+        return 1
+    fi
+}
+
+# The checkout must be ny_commit's source plus at most the release files, and it
+# must still be the UNMODIFIED checkout verify_release.py admitted at install
+# time: no tracked edit relative to HEAD and no untracked file under a package
+# root. Without that, editing a preset under configs/ after the install would
+# change what every scored run does while this receipt still validated.
+# "ny_commit's source" is bound by content in every case -- HEAD's tree with the
+# release files removed is MANIFEST's ny_commit_tree, which MANIFEST's
+# ny_commit_object proves is ny_commit's own tree -- so a SHALLOW clone of the
+# release commit (no ny_commit object) binds as a full one does; when ny_commit
+# IS present it must also have that tree and, unless HEAD is ny_commit, be an
+# ancestor of HEAD that differs only in release files.
+# Read-only (--no-optional-locks: no index refresh). An extracted archive is
+# bound by its packaged source marker instead.
+receipt_release_source_binding() {
+    local tool_dir="$1" ny_commit="$2" ny_commit_tree="$3" ny_commit_object="$4"
+    local canonical git_root head head_tree commit_tree source_tree path marker stray diff_rc=0 present=0
+    canonical="$(realpath "${tool_dir}")" || {
+        receipt_fail "could not resolve ${tool_dir}"
+        return 1
+    }
+    git_root="$(receipt_git "${canonical}" rev-parse --show-toplevel 2>/dev/null || true)"
+    if [ -n "${git_root}" ] && [ "$(realpath "${git_root}")" = "${canonical}" ]; then
+        receipt_git "${canonical}" diff --quiet HEAD -- >/dev/null 2>&1 || diff_rc=$?
+        if [ "${diff_rc}" -ne 0 ]; then
+            receipt_fail "tracked files are modified relative to HEAD (git diff rc=${diff_rc}); the release binds an unmodified checkout"
+            return 1
+        fi
+        if ! stray="$(receipt_git "${canonical}" ls-files --others --exclude-standard \
+            -- "${RELEASE_PACKAGE_ROOTS[@]}" 2>/dev/null)"; then
+            receipt_fail "could not list untracked files under the release package roots"
+            return 1
+        fi
+        if [ -n "${stray}" ]; then
+            receipt_fail "untracked files under the release package roots are not covered by ny_commit: $(printf '%s\n' "${stray}" | head -5 | paste -sd' ' -)"
+            return 1
+        fi
+        head="$(receipt_git "${canonical}" rev-parse --verify 'HEAD^{commit}' 2>/dev/null || true)"
+        if ! receipt_is_lower_hex "${head}" 40; then
+            receipt_fail "could not resolve the checkout HEAD"
+            return 1
+        fi
+        if receipt_git "${canonical}" cat-file -e "${ny_commit}^{commit}" 2>/dev/null; then
+            present=1
+            commit_tree="$(receipt_git "${canonical}" rev-parse --verify "${ny_commit}^{tree}" 2>/dev/null || true)"
+            if [ "${commit_tree}" != "${ny_commit_tree}" ]; then
+                receipt_fail "release MANIFEST ny_commit_tree ${ny_commit_tree} is not the tree of ny_commit ${ny_commit} (${commit_tree:-unresolved})"
+                return 1
+            fi
+        fi
+        if [ "${head}" = "${ny_commit}" ]; then
+            :
+        elif [ "${present}" = 1 ] \
+            && receipt_git "${canonical}" merge-base --is-ancestor "${ny_commit}" "${head}" 2>/dev/null; then
+            while IFS= read -r -d '' path; do
+                receipt_is_release_path "${path}" && continue
+                receipt_fail "HEAD differs from release ny_commit outside the release files: ${path}"
+                return 1
+            done < <(receipt_git "${canonical}" diff --name-only -z "${ny_commit}" "${head}" --)
+        elif [ "$(receipt_git "${canonical}" rev-parse --is-shallow-repository 2>/dev/null)" = true ]; then
+            # `git clone --depth 1` of the release commit: history above HEAD is
+            # cut, so ancestry is unknowable; the tree check below binds it.
+            :
+        else
+            receipt_fail "release ny_commit ${ny_commit} is neither HEAD nor an ancestor of HEAD ${head}"
+            return 1
+        fi
+        head_tree="$(receipt_git "${canonical}" rev-parse --verify 'HEAD^{tree}' 2>/dev/null || true)"
+        if ! receipt_is_lower_hex "${head_tree}" 40; then
+            receipt_fail "could not resolve the checkout HEAD tree"
+            return 1
+        fi
+        source_tree="$(receipt_tree_without_release_paths "${canonical}" "${head_tree}" "")" || return 1
+        if [ "${source_tree}" != "${ny_commit_tree}" ]; then
+            receipt_fail "HEAD ${head}'s tree without the release files is ${source_tree}, not release ny_commit_tree ${ny_commit_tree}: the checkout is not ny_commit's source plus release files"
+            return 1
+        fi
+        receipt_release_commit_object_binds "${canonical}" "${ny_commit}" "${ny_commit_tree}" "${ny_commit_object}" \
+            || return 1
+        return 0
+    fi
+    marker="${tool_dir}/.ny-vnncomp-source.txt"
+    if [ ! -f "${marker}" ] || [ -L "${marker}" ]; then
+        receipt_fail "no Git checkout and no ${marker}: the release source identity is unknown"
+        return 1
+    fi
+    receipt_parse_source_marker "${marker}" || return 1
+    if [ "${NY_MARKER_COMMIT}" != "${ny_commit}" ]; then
+        receipt_fail "the archive source marker names ${NY_MARKER_COMMIT}, the release names ${ny_commit}"
+        return 1
+    fi
+}
+
+receipt_release_identity_matches_checkout() {
+    local tool_dir="$1"
+    local lock_sha ay_commit
+    lock_sha="$(receipt_sha256_file "${tool_dir}/Cargo.lock")" || return 1
+    ay_commit="$(receipt_ay_commit "${tool_dir}/Cargo.lock")" || return 1
+    if [ "${lock_sha}" != "${NY_RELEASE_LOCK}" ] || [ "${ay_commit}" != "${NY_RELEASE_AY}" ]; then
+        receipt_fail "release Cargo.lock/AY identity does not match this checkout"
+        return 1
+    fi
+    receipt_release_source_binding "${tool_dir}" "${NY_RELEASE_NY_COMMIT}" "${NY_RELEASE_NY_COMMIT_TREE}" \
+        "${NY_RELEASE_NY_COMMIT_OBJECT}"
+}
+
+receipt_create_release() {
+    local binary="$1"
+    local tool_dir="$2"
+    local manifest="$3"
+    local receipt="${4:-${binary}.receipt}"
+    local binary_sha manifest_sha
+
+    receipt_require_executable "${binary}" || return 1
+    receipt_parse_release_manifest "${manifest}" || return 1
+    if [ "$(realpath "$(dirname "${manifest}")")" != "$(realpath "${tool_dir}/dist/bin/${NY_RELEASE_TARGET}")" ]; then
+        receipt_fail "release MANIFEST must be ${tool_dir}/dist/bin/${NY_RELEASE_TARGET}/MANIFEST"
+        return 1
+    fi
+    binary_sha="$(receipt_sha256_file "${binary}")" || return 1
+    if [ "${binary_sha}" != "${NY_RELEASE_BINARY}" ]; then
+        receipt_fail "the release binary's bytes do not match binary_sha256"
+        return 1
+    fi
+    receipt_release_identity_matches_checkout "${tool_dir}" || return 1
+    manifest_sha="$(receipt_sha256_file "${manifest}")" || return 1
+    receipt_publish \
+        "${receipt}" \
+        "${binary_sha}" \
+        "release" \
+        "${NY_RELEASE_NY_COMMIT}" \
+        "${manifest_sha}" \
+        "${NY_RELEASE_LOCK}" \
+        "${NY_RELEASE_AY}" \
+        "${NY_RELEASE_FEATURES}" \
+        "trust-unverified" \
+        "${NY_RELEASE_TRUSTC}" \
+        "${manifest_sha}"
+}
+
 receipt_validate() {
     local binary="$1"
     local tool_dir="$2"
     local receipt="${3:-${binary}.receipt}"
-    local binary_sha manifest manifest_sha lock_sha ay_commit git_root marker
+    local binary_sha manifest manifest_sha lock_sha ay_commit git_root marker candidate
 
     receipt_require_executable "${binary}" || return 1
     receipt_parse "${receipt}" || return 1
@@ -671,6 +1089,38 @@ receipt_validate() {
                 fi
             fi
             ;;
+        release)
+            # The receipt names its MANIFEST by content: exactly one
+            # dist/bin/<target>/MANIFEST must still hash to it.
+            manifest=""
+            for candidate in "${tool_dir}"/dist/bin/*/MANIFEST; do
+                [ -f "${candidate}" ] && [ ! -L "${candidate}" ] || continue
+                if [ "$(receipt_sha256_file "${candidate}")" = "${NY_RECEIPT_ARTIFACT_PROVENANCE}" ]; then
+                    if [ -n "${manifest}" ]; then
+                        receipt_fail "more than one release MANIFEST matches this receipt"
+                        return 1
+                    fi
+                    manifest="${candidate}"
+                fi
+            done
+            if [ -z "${manifest}" ]; then
+                receipt_fail "the release MANIFEST this receipt was bound to is gone or has changed"
+                return 1
+            fi
+            receipt_parse_release_manifest "${manifest}" || return 1
+            if [ "${NY_RECEIPT_ARTIFACT_PROVENANCE}" != "${NY_RECEIPT_SOURCE_STATE}" ] \
+                || [ "${NY_RELEASE_BINARY}" != "${NY_RECEIPT_BINARY}" ] \
+                || [ "${NY_RELEASE_NY_COMMIT}" != "${NY_RECEIPT_SOURCE_COMMIT}" ] \
+                || [ "${NY_RELEASE_LOCK}" != "${NY_RECEIPT_LOCK}" ] \
+                || [ "${NY_RELEASE_AY}" != "${NY_RECEIPT_AY}" ] \
+                || [ "${NY_RELEASE_FEATURES}" != "${NY_RECEIPT_FEATURES}" ] \
+                || [ "${NY_RELEASE_TRUSTC}" != "${NY_RECEIPT_TOOLCHAIN}" ] \
+                || [ "${NY_RECEIPT_TOOLCHAIN_KIND}" != "trust-unverified" ]; then
+                receipt_fail "release receipt does not match its MANIFEST"
+                return 1
+            fi
+            receipt_release_identity_matches_checkout "${tool_dir}" || return 1
+            ;;
     esac
 
     printf 'NY binary receipt OK: sha256=%s source=%s@%s features=%s toolchain=%s:%s\n' \
@@ -687,6 +1137,7 @@ usage() {
     echo "  $0 identity TOOL_DIR" >&2
     echo "  $0 create-local BINARY TOOL_DIR FEATURES [RECEIPT]" >&2
     echo "  $0 create-prebuilt BINARY TOOL_DIR MANIFEST [RECEIPT]" >&2
+    echo "  $0 create-release BINARY TOOL_DIR MANIFEST [RECEIPT]" >&2
     echo "  $0 validate BINARY TOOL_DIR [RECEIPT]" >&2
     exit 2
 }
@@ -709,6 +1160,10 @@ case "${1:-}" in
     create-prebuilt)
         [ "$#" -eq 4 ] || [ "$#" -eq 5 ] || usage
         receipt_create_prebuilt "$2" "$3" "$4" "${5:-${2}.receipt}"
+        ;;
+    create-release)
+        [ "$#" -eq 4 ] || [ "$#" -eq 5 ] || usage
+        receipt_create_release "$2" "$3" "$4" "${5:-${2}.receipt}"
         ;;
     validate)
         [ "$#" -eq 3 ] || [ "$#" -eq 4 ] || usage

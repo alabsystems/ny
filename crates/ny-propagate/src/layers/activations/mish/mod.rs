@@ -39,7 +39,7 @@ impl MishLayer {
 /// TEST ORACLE, not a production path. Since 129e948a4 every relaxation site in
 /// this module evaluates in f64 through [`mish_eval_f64`] and casts outward with
 /// `cast_f64_to_f32_{down,up}`, so nothing in the lib build calls this; its only
-/// callers are `mish/tests.rs`, including the three #1836 regression tests that
+/// callers are `mish/tests.rs`, including the three regression tests that
 /// pin Mish(-inf)=0, Mish(+inf)=+inf and Mish(NaN)=NaN. Hence `#[cfg(test)]`
 /// rather than deletion — dropping it would silently retire those tests — and
 /// rather than `#[allow(dead_code)]`, which would keep an f32 evaluator sitting
@@ -53,7 +53,7 @@ fn mish_eval(x: f32) -> f32 {
     // Guard against 0 * inf = NaN when x = ±inf.
     // Mish(x) = x * tanh(softplus(x)). At x = -inf: (-inf)*tanh(0) = (-inf)*0 = NaN.
     // Correct limits: Mish(-inf) = 0, Mish(+inf) = +inf.
-    // Ref: SiLU guard pattern (silu.rs:100-105), fix for #1836.
+    // Ref: SiLU guard pattern (silu.rs:100-105).
     if !x.is_finite() {
         if x.is_nan() {
             return f32::NAN;
@@ -102,7 +102,7 @@ fn mish_eval_f64(x: f64) -> f64 {
 /// - `upper_intercept`: guaranteed `slope*x + upper_intercept >= true_chord(x)` ∀x∈[l,u]
 ///
 /// Ref: Exp (exp.rs:119-125), SiLU (silu/math.rs:177-201) directed rounding pattern.
-/// Fixes: #3146 — Mish chord used raw `as f32` without directed rounding.
+/// Fixes: the Mish chord formerly used raw `as f32` without directed rounding.
 #[inline]
 fn mish_chord_f64(l: f32, u: f32) -> (f32, f32, f32) {
     let l64 = l as f64;
@@ -131,7 +131,7 @@ fn mish_chord_f64(l: f32, u: f32) -> (f32, f32, f32) {
 ///
 /// Used by the point-interval directed rounding path to avoid f32 precision loss.
 /// Ref: mish_derivative (f32 version below), Exp point-interval (exp.rs:114-124).
-/// Fixes: #3190 — point-interval path used f32-only computation.
+/// Fixes: the point-interval path formerly used f32-only computation.
 #[inline]
 fn mish_derivative_f64(x: f64) -> f64 {
     let softplus = if x > 20.0 {
@@ -315,7 +315,7 @@ impl BoundPropagation for MishLayer {
         // BEFORE min/max selection. Plain `as f32` rounds to nearest — a candidate
         // min could round UP, causing the final min to miss the true minimum.
         // next_down/next_up on the final result alone cannot recover.
-        // Ref: #3336, same pattern as GELU and SiLU directed rounding fixes.
+        // Same pattern as the GELU and SiLU directed rounding fixes.
         let bound_fn = |l: f32, u: f32| -> (f32, f32) {
             let fl = mish_eval_f64(l as f64) as f32;
             let fu = mish_eval_f64(u as f64) as f32;
@@ -464,7 +464,7 @@ fn mish_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
         // loosens, by at most one f32 ULP.
         let fu64 = mish_eval_f64(f64::from(u));
         // NaN-propagating: if fu is NaN, the NaN flows through instead of
-        // being silently absorbed by IEEE .min()/.max(). (#2714)
+        // being silently absorbed by IEEE.min()/.max().
         // Both directed casts are NaN-preserving, so that path is unchanged.
         return LinearRelaxation::new(
             0.0,
@@ -483,7 +483,7 @@ fn mish_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
     // Point interval: tangent at l with directed rounding.
     // Uses f64 intermediates to avoid catastrophic cancellation in f(l) - f'(l)*l.
     // Ref: Exp point-interval (exp.rs:114-124), SiLU tangent (silu/math.rs:216-231).
-    // Fixes: #3190 — previously used pure f32 without directed rounding.
+    // Fixes: the point-interval path formerly used pure f32 without directed rounding.
     if (u - l).abs() < 1e-8 {
         let l64 = l as f64;
         let y64 = mish_eval_f64(l64);
@@ -883,7 +883,7 @@ fn binary_search_tangent(
 
 /// Sound chord ± analytical-deviation band for Mish on [l, u].
 ///
-/// This is the historical relaxation (#3146, #3285): a parallel band around the
+/// This is the historical relaxation: a parallel band around the
 /// endpoint chord, widened by the max/min deviation of Mish from the chord found
 /// via root isolation + dense f64 grid sampling. It is always sound (the band
 /// fully encloses Mish) but generally looser than the region-classified lines.
@@ -894,7 +894,7 @@ fn binary_search_tangent(
 /// Precondition: l, u finite, l < u, (u - l) >= 1e-8.
 fn mish_fallback_band(l: f32, u: f32) -> LinearRelaxation {
     // Chord through endpoints (f64 to avoid catastrophic cancellation)
-    // Now returns directed-rounded intercepts (#3146).
+    // Now returns directed-rounded intercepts.
     let (chord_slope, lower_intercept, upper_intercept) = mish_chord_f64(l, u);
     // Nominal intercept for deviation measurement (midpoint of directed bounds).
     // Bit-identical band nominal: f32::midpoint rounds differently at overflow/subnormal edges.
@@ -910,7 +910,7 @@ fn mish_fallback_band(l: f32, u: f32) -> LinearRelaxation {
 
     // Track max/min of h in f64 to avoid catastrophic cancellation.
     // At large |x|, Mish(x) ≈ x and chord(x) ≈ x, so h(x) is small relative
-    // to Mish(x). f32 subtraction loses significant digits here. (#3285)
+    // to Mish(x). f32 subtraction loses significant digits here.
     let chord_slope64 = chord_slope as f64;
     let nominal_intercept64 = nominal_intercept as f64;
     let mut max_h: f64 = 0.0;
@@ -966,7 +966,7 @@ fn mish_fallback_band(l: f32, u: f32) -> LinearRelaxation {
 
     // Dense f64 grid sampling: catches deviations when the root-finding scan
     // misses sign changes (e.g., for nearly-linear intervals at large |x| where
-    // Mish'(x) - chord_slope is within f32 ULP of zero). (#3285)
+    // Mish'(x) - chord_slope is within f32 ULP of zero).
     let l64 = l as f64;
     let u64 = u as f64;
     for k in 1..n_scan {
@@ -982,13 +982,13 @@ fn mish_fallback_band(l: f32, u: f32) -> LinearRelaxation {
     }
 
     // Cast deviation to f32 with directed rounding: min_h rounds down, max_h rounds up.
-    // This ensures the f32 deviation values are conservative. (#3285)
+    // This ensures the f32 deviation values are conservative.
     let max_h_f32 = next_up_f32(max_h as f32);
     let min_h_f32 = next_down_f32(min_h as f32);
 
     // Lower bound: lower_intercept (sound below true chord) + min_h.
     // Upper bound: upper_intercept (sound above true chord) + max_h.
-    // Apply next_down/next_up to the final f32 sum to absorb the addition rounding. (#3285)
+    // Apply next_down/next_up to the final f32 sum to absorb the addition rounding.
     LinearRelaxation::new(
         chord_slope,
         next_down_f32(lower_intercept + min_h_f32),
@@ -1021,7 +1021,7 @@ impl MishLayer {
     }
 
     /// Patches CROWN backward propagation with pre-activation bounds.
-    /// Part of #2613 Phase 2: generic activation Patches support.
+    /// Generic activation Patches support.
     pub(crate) fn propagate_patches_with_bounds(
         &self,
         bounds: &crate::bounds::patches::PatchesLinearBounds,

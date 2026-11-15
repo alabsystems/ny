@@ -495,7 +495,7 @@ impl ConvTranspose1dLayer {
             }
         }
 
-        // #3256: Zero rows with unsafe A-matrix coefficients.
+        // Zero rows with unsafe A-matrix coefficients.
         zero_nonfinite_rows(
             &mut new_lower_a,
             &mut new_upper_a,
@@ -543,7 +543,7 @@ impl ConvTranspose1dLayer {
 
         let new_input_shape = flattened_input_shape(bounds, conv_in_size);
 
-        // CROWN backward NaN firewall (#2812): conservative fallback instead of hard error.
+        // CROWN backward NaN firewall: conservative fallback instead of hard error.
         let mut out = BatchedLinearBounds::new_or_conservative(
             new_lower_a,
             new_lower_b,

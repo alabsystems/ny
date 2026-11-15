@@ -15,8 +15,6 @@
 //!
 //! Needed for Kokoro TTS (T=24000). The O(n) AddLayer decomposition
 //! creates T layers; a native CumSum is a single layer with O(T) backward.
-//!
-//! Part of #3919.
 
 use ndarray::{Array2, Axis};
 use ny_core::{checked_shape_product, NyError, Result};

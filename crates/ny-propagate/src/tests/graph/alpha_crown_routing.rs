@@ -7,8 +7,6 @@
 //! Verifies that the sequential entry point correctly routes models with
 //! non-ReLU activations (Sigmoid, Tanh) to DAG alpha-CROWN rather than
 //! falling back to fixed-slope CROWN with no alpha optimization.
-//!
-//! Part of #3619.
 
 use crate::bounds::{AlphaCrownConfig, GradientMethod};
 use crate::tests::crown::helpers::{assert_bounds_finite, CountingGemmEngine};
@@ -26,7 +24,7 @@ fn total_width(bounds: &BoundedTensor) -> f32 {
 ///
 /// The default gradient method (AnalyticChain) only computes ReLU gradients, so
 /// monotone Sigmoid/Tanh tangent-point alphas get zero gradients. SPSA is the
-/// only gradient method that perturbs monotone alpha parameters today (#3619).
+/// only gradient method that perturbs monotone alpha parameters today.
 #[ntest::timeout(60000)]
 #[test]
 fn test_sequential_pure_sigmoid_routes_to_dag_alpha_crown_3619() {
@@ -218,7 +216,7 @@ fn make_layernorm_alpha_routing_config(iterations: usize) -> AlphaCrownConfig {
 }
 
 /// Sequential LayerNorm + ReLU: alpha-CROWN must not collapse to fixed-slope
-/// CROWN when normalization is present. The old #3825 bug routed this shape to
+/// CROWN when normalization is present. An old bug routed this shape to
 /// plain CROWN, so equal widths alone are not enough to prove the fix: some
 /// networks legitimately see zero width improvement even when alpha runs, and
 /// the shared CROWN-IBP setup happens before the routing decision.

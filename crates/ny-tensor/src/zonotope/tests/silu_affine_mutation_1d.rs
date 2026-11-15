@@ -458,7 +458,7 @@ fn test_silu_affine_non_finite_approx_error_not_nan() {
 
 /// Cancellation regression: with a shared error symbol, a [1, -1] projection
 /// could produce bounds tighter than the true range — a soundness violation.
-/// Per-element independent error symbols (#2486, same fix as GELU #2470) prevent this.
+/// Per-element independent error symbols (same fix as GELU) prevent this.
 #[test]
 fn test_silu_affine_linear_projection_soundness_1d_independent_error_terms() {
     use ndarray::arr2;

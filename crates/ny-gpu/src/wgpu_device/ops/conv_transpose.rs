@@ -7,10 +7,8 @@
 //! Chains the existing GEMM shader and col2im shader with no host roundtrip
 //! between them — the GEMM output stays GPU-resident as the col2im input.
 //!
-//! Part of #3813: eliminates the CPU col2im bottleneck that causes RSPLITTER
-//! biasfield timeouts.
-//!
-//! Reference: designs/2026-03-15-issue-3813-fused-gpu-conv2d-backward.md
+//! Eliminates the CPU col2im bottleneck that causes RSPLITTER biasfield
+//! timeouts.
 
 use ny_core::{ConvTranspose2dParams, NyError, Result};
 
@@ -19,6 +17,96 @@ use super::gpu_checked_u32;
 use crate::wgpu_device::params::{ConvCol2imParams, GemmParams};
 
 use super::gemm::select_gemm_dispatch;
+
+/// Largest element count a fused conv_transpose binding may hold: the GEMM and
+/// col2im shaders index every binding with WGSL `u32` arithmetic, and each
+/// index they compute is below its binding's element count.
+///
+/// wgpu 29 reports `max_storage_buffer_binding_size` as a `u64`, but every
+/// backend it ships clamps it to at most `u32::MAX` bytes (Metal grants
+/// 4 GiB - 4 B on Apple M-series), so the live element budget stays below this
+/// today. The gate enforces it rather than rely on that, so a future adapter
+/// granting a larger binding gets a typed refusal, never a wrapped index.
+const CONV_TRANSPOSE_U32_INDEXABLE_ELEMS: usize = u32::MAX as usize;
+
+/// #hard-caps: THE storage-binding fit gate for the fused conv_transpose_2d
+/// dispatch (GEMM `(m, k) x (k, n)` followed by col2im into `out_elems`).
+///
+/// Shared by the per-call path ([`WgpuDevice::conv_transpose_2d`]) and the
+/// cached, weight-resident pair plan (`conv_transpose_plan.rs`), so the two can
+/// never admit different shapes. They did: the per-call gate moved to the live
+/// device limit in d153bf0a4 while the plan kept wgpu's DEFAULT 128 MiB, so on
+/// an adapter granting more (an M5 Max grants 4 GiB - 4 B) the plan refused
+/// every fused pair whose bindings were past 112 MB that two per-call
+/// dispatches of the same work ran.
+///
+/// Checks the four storage bindings: the weight column `k x n`, the input
+/// `m x k`, the GEMM output `m x n`, and the col2im destination `out_elems`.
+/// Each must be at most `max_elems` (and u32-indexable). Products are checked,
+/// so an overflowing shape is a refusal, not a wrapped product that passes.
+/// The refusal names the LARGEST binding's bytes and `budget_bytes`, capped at
+/// the u32-indexable bytes when that is the tighter bound.
+///
+/// Pure, so the edges are pinned without a GPU.
+fn check_conv_transpose_bindings_fit(
+    gemm_m: usize,
+    gemm_k: usize,
+    gemm_n: usize,
+    out_elems: usize,
+    max_elems: usize,
+    budget_bytes: usize,
+) -> Result<()> {
+    let cap = max_elems.min(CONV_TRANSPOSE_U32_INDEXABLE_ELEMS);
+    let bindings = [
+        gemm_k.checked_mul(gemm_n),
+        gemm_m.checked_mul(gemm_k),
+        gemm_m.checked_mul(gemm_n),
+        Some(out_elems),
+    ];
+    if bindings
+        .iter()
+        .all(|elems| elems.is_some_and(|elems| elems <= cap))
+    {
+        return Ok(());
+    }
+    let largest = bindings
+        .iter()
+        .map(|elems| elems.unwrap_or(usize::MAX))
+        .max()
+        .unwrap_or(usize::MAX);
+    let budget_bytes = if cap < max_elems {
+        budget_bytes.min(cap.saturating_mul(size_of::<f32>()))
+    } else {
+        budget_bytes
+    };
+    Err(NyError::GpuMemoryExceeded {
+        required_bytes: largest.saturating_mul(size_of::<f32>()),
+        budget_bytes,
+    })
+}
+
+impl WgpuDevice {
+    /// [`check_conv_transpose_bindings_fit`] against this device's LIVE binding
+    /// limit ([`Self::max_binding_elems_live`], floored at wgpu's default, so it
+    /// can only raise the ceiling). Both fused conv_transpose paths call this,
+    /// so the budget's source cannot drift between them either.
+    pub(super) fn check_conv_transpose_bindings_live(
+        &self,
+        gemm_m: usize,
+        gemm_k: usize,
+        gemm_n: usize,
+        out_elems: usize,
+    ) -> Result<()> {
+        check_conv_transpose_bindings_fit(
+            gemm_m,
+            gemm_k,
+            gemm_n,
+            out_elems,
+            self.max_binding_elems_live(),
+            self.max_binding_bytes_live(),
+        )
+    }
+}
 
 fn checked_col2im_workgroups(out_elems: usize) -> Result<u32> {
     let workgroups = out_elems.div_ceil(256);
@@ -88,24 +176,15 @@ impl WgpuDevice {
             )));
         }
 
-        // Check buffer limits: if any single buffer exceeds wgpu binding limit,
+        // Check buffer limits: if any single buffer exceeds the binding limit,
         // fall back to error (caller uses CPU path).
         // #hard-caps: compare against the LIVE device limit, not wgpu's 128 MiB
         // default. `WgpuDevice::new` requests the adapter's real limits, which on
         // an Apple M4 Pro is 4095 MiB — 32x the constant this used to use. The
         // old gate refused shapes the device could run, on the conv backward path
-        // that all four scoreboard deficits share.
-        let max_elems = self.max_binding_elems_live();
-        if gemm_k * gemm_n > max_elems
-            || gemm_m * gemm_k > max_elems
-            || gemm_out_elems > max_elems
-            || out_elems > max_elems
-        {
-            return Err(NyError::GpuMemoryExceeded {
-                required_bytes: gemm_out_elems.max(out_elems) * size_of::<f32>(),
-                budget_bytes: self.max_binding_bytes_live(),
-            });
-        }
+        // that all four scoreboard deficits share. The cached pair plan applies
+        // this same gate (`check_conv_transpose_bindings_live`).
+        self.check_conv_transpose_bindings_live(gemm_m, gemm_k, gemm_n, out_elems)?;
 
         let gemm_params = GemmParams {
             m: m_u32,
@@ -281,7 +360,149 @@ impl WgpuDevice {
 
 #[cfg(test)]
 mod tests {
-    use super::checked_col2im_workgroups;
+    use super::{
+        check_conv_transpose_bindings_fit, checked_col2im_workgroups,
+        CONV_TRANSPOSE_U32_INDEXABLE_ELEMS,
+    };
+    use crate::wgpu_device::ops::gemm::{MAX_BINDING_ELEMS, WGPU_MAX_BINDING_BYTES};
+    use ny_core::{NyError, Result};
+
+    /// Largest live element budget wgpu 29 can produce: a `u32::MAX`-byte
+    /// binding after the pool's 1.2x growth (an M5 Max grants 4 GiB - 4 B,
+    /// one element less).
+    const LARGEST_LIVE_ELEMS: usize = (u32::MAX as usize) * 5 / 6 / size_of::<f32>();
+    const LARGEST_LIVE_BYTES: usize = u32::MAX as usize;
+
+    /// `(required_bytes, budget_bytes)` of a `GpuMemoryExceeded` refusal.
+    fn refused(result: Result<()>, at: &str) -> (usize, usize) {
+        match result {
+            Err(NyError::GpuMemoryExceeded {
+                required_bytes,
+                budget_bytes,
+            }) => (required_bytes, budget_bytes),
+            Err(other) => panic!("{at}: expected GpuMemoryExceeded, got {other}"),
+            Ok(()) => panic!("{at}: expected a refusal, got Ok"),
+        }
+    }
+
+    /// #hard-caps: every one of the four bindings is admitted AT the budget and
+    /// refused one element past it, on the static budget and the largest live
+    /// one; a refusal names the largest binding and the caller's budget.
+    #[test]
+    fn conv_transpose_bindings_fit_edges_per_binding() {
+        for (max, bytes) in [
+            (MAX_BINDING_ELEMS, WGPU_MAX_BINDING_BYTES),
+            (LARGEST_LIVE_ELEMS, LARGEST_LIVE_BYTES),
+        ] {
+            // 2 * half is max + 1 or max + 2, and half itself fits.
+            let half = max / 2 + 1;
+            // (m, k, n, out_elems) exactly at the budget: admitted.
+            for (m, k, n, out) in [
+                (1, max, 1, 1),
+                (max, 1, 1, 1),
+                (1, 1, max, 1),
+                (1, 1, 1, max),
+            ] {
+                check_conv_transpose_bindings_fit(m, k, n, out, max, bytes).unwrap_or_else(|e| {
+                    panic!("({m},{k},{n},{out}) at budget {max} must fit: {e}")
+                });
+            }
+            // One past, and each binding as the SOLE offender:
+            // (m, k, n, out_elems, largest binding).
+            for (m, k, n, out, largest) in [
+                (1, max + 1, 1, 1, max + 1), // weight and input
+                (max + 1, 1, 1, 1, max + 1), // input and GEMM output
+                (1, 1, max + 1, 1, max + 1), // weight and GEMM output
+                (1, 1, 1, max + 1, max + 1), // col2im destination
+                (1, 2, half, 1, 2 * half),   // weight k*n only
+                (half, 2, 1, 1, 2 * half),   // input m*k only
+                (2, 1, half, 1, 2 * half),   // GEMM output m*n only
+            ] {
+                let at = format!("({m},{k},{n},{out}) budget {max}");
+                let (required, budget) = refused(
+                    check_conv_transpose_bindings_fit(m, k, n, out, max, bytes),
+                    &at,
+                );
+                assert_eq!(required, largest * 4, "{at}: names the largest binding");
+                assert_eq!(budget, bytes, "{at}: names the caller's budget");
+            }
+        }
+    }
+
+    /// The defect in pure form: the gpu-tests pin's fused pair (GEMM output
+    /// 98304 x 400 = 157.3 MB) is refused by wgpu's DEFAULT binding budget and
+    /// admitted by a live one. The cached plan used to apply the former while
+    /// the per-call path applied the latter.
+    #[test]
+    fn conv_transpose_bindings_fit_static_wall_vs_live_budget() {
+        let (m, k, n, out) = (98_304, 2, 400, 96 * 16 * 36 * 36);
+        let (required, budget) = refused(
+            check_conv_transpose_bindings_fit(
+                m,
+                k,
+                n,
+                out,
+                MAX_BINDING_ELEMS,
+                WGPU_MAX_BINDING_BYTES,
+            ),
+            "static budget",
+        );
+        assert_eq!((required, budget), (m * n * 4, WGPU_MAX_BINDING_BYTES));
+        check_conv_transpose_bindings_fit(m, k, n, out, LARGEST_LIVE_ELEMS, LARGEST_LIVE_BYTES)
+            .expect("the live budget admits the fused pair");
+    }
+
+    /// Overflowing products refuse (they never wrap into a passing value) and
+    /// the reported bytes saturate instead of panicking.
+    ///
+    /// The first three shapes wrap to values that would still be refused, so
+    /// they alone cannot tell a checked product from a wrapping one. The last
+    /// two wrap to values every budget admits: `half_word` cubed wraps each
+    /// product to exactly 0, and `3 * (usize::MAX / 3 + 1)` is
+    /// `usize::MAX + 3`, which wraps to 2. Both callers bound each dimension
+    /// with `gpu_checked_u32` before this gate, so production never reaches
+    /// such a product; the gate refuses it anyway.
+    #[test]
+    fn conv_transpose_bindings_fit_refuses_overflowing_products() {
+        let half_word = 1usize << (usize::BITS / 2);
+        let wraps_to_two = usize::MAX / 3 + 1;
+        assert_eq!(half_word.wrapping_mul(half_word), 0);
+        assert_eq!(3usize.wrapping_mul(wraps_to_two), 2);
+        for (m, k, n) in [
+            (usize::MAX, 2, 1),
+            (1, usize::MAX, 2),
+            (2, 1, usize::MAX),
+            (half_word, half_word, half_word),
+            (3, wraps_to_two, 3),
+        ] {
+            let at = format!("({m},{k},{n}) overflow");
+            let (required, budget) = refused(
+                check_conv_transpose_bindings_fit(m, k, n, 1, usize::MAX, usize::MAX),
+                &at,
+            );
+            assert_eq!(required, usize::MAX, "{at}");
+            assert_eq!(budget, CONV_TRANSPOSE_U32_INDEXABLE_ELEMS * 4, "{at}");
+        }
+    }
+
+    /// The shaders index in `u32`: a budget past the u32-indexable element
+    /// count (no wgpu 29 backend grants one) still refuses a binding past it,
+    /// naming the u32-indexable bytes as the budget.
+    #[test]
+    fn conv_transpose_bindings_fit_caps_at_u32_indexable() {
+        let cap = CONV_TRANSPOSE_U32_INDEXABLE_ELEMS;
+        assert!(
+            LARGEST_LIVE_ELEMS < cap,
+            "wgpu 29's largest budget is below the cap"
+        );
+        check_conv_transpose_bindings_fit(1, 1, 1, cap, usize::MAX, usize::MAX)
+            .expect("a u32-indexable binding fits an unbounded budget");
+        let (required, budget) = refused(
+            check_conv_transpose_bindings_fit(1, 1, 1, cap + 1, usize::MAX, usize::MAX),
+            "past u32",
+        );
+        assert_eq!((required, budget), ((cap + 1) * 4, cap * 4));
+    }
 
     /// #hard-caps: what the adapter ACTUALLY grants, vs the hard-coded
     /// `WGPU_MAX_BINDING_BYTES` the buffer-fit gate compares against.
@@ -291,7 +512,7 @@ mod tests {
         let _g = crate::wgpu_device::test_support::gpu_test_serial_guard();
         let device = crate::wgpu_device::test_support::require_device();
         let l = device.device.limits();
-        let routing_cap = u64::try_from(crate::wgpu_device::ops::gemm::WGPU_MAX_BINDING_BYTES)
+        let routing_cap = u64::try_from(WGPU_MAX_BINDING_BYTES)
             .expect("WGPU routing cap must fit the API's u64 byte unit");
         assert!(
             l.max_storage_buffer_binding_size >= routing_cap,

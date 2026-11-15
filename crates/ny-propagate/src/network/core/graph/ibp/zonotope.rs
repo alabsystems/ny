@@ -133,6 +133,7 @@ impl GraphNetwork {
         _epsilon: f32,
         options: ZonotopePropagationOptions,
     ) -> Result<BoundedTensor> {
+        self.ensure_proof_eligible()?;
         if self.nodes.is_empty() {
             // Empty graph: nothing to do.
             return Ok(input.clone());
@@ -153,7 +154,7 @@ impl GraphNetwork {
 
         // Reject non-finite input early: if a previous block produced NaN/Inf,
         // zonotope construction is not meaningful. Return a fallback-class error
-        // so the caller (e.g. Whisper verifier) can recover via IBP. Part of #3548.
+        // so the caller (e.g. Whisper verifier) can recover via IBP.
         if input.has_overflow() {
             return Err(NyError::UnsupportedConfiguration(
                 "zonotope propagation requires finite input bounds".to_string(),
@@ -206,11 +207,11 @@ impl GraphNetwork {
                     bounds_cache.insert(node_name.clone(), z.to_bounded_tensor()?);
                     zonotope_cache.insert(node_name.clone(), z);
                 }
-                // #3166, #3548: UnsupportedOp/UnsupportedConfiguration/NumericalInstability:
+                // UnsupportedOp/UnsupportedConfiguration/NumericalInstability:
                 // zonotope propagation not available or produced non-finite values for
                 // this node. IBP fallback is sound — it is the conservative degradation
                 // for optional tightening paths. Other errors (SoundnessRefusal, etc.)
-                // must propagate (#3106).
+                // must propagate.
                 Err(e @ NyError::UnsupportedOp(_))
                 | Err(e @ NyError::UnsupportedConfiguration(_))
                 | Err(e @ NyError::NumericalInstability(_)) => {
@@ -219,7 +220,7 @@ impl GraphNetwork {
                         node_name, e
                     );
 
-                    // Use unified dispatch for IBP fallback (#2405).
+                    // Use unified dispatch for IBP fallback.
                     // This correctly handles Concat before is_binary().
                     let ibp_bounds = dispatch_ibp_for_node(node, node_name, &mut |name| {
                         Ok(self.bounds_ref(name, input, &bounds_cache)?.clone())
@@ -247,7 +248,7 @@ impl GraphNetwork {
                 Err(e) => return Err(e),
             }
 
-            // NaN firewall (#2812 Slice 4, #2706).
+            // NaN firewall.
             if let Some(output_bounds) = bounds_cache.get(node_name) {
                 check_nan_firewall(
                     output_bounds,
@@ -341,8 +342,8 @@ impl GraphNetwork {
                     // node has fallen back to interval bounds and been reintroduced
                     // as a zonotope with fresh, disjoint error symbols. Use the
                     // conservative disjoint-symbol bilinear path instead of faking
-                    // shared-symbol provenance (#318 Packet C). Keep the previous
-                    // interval fallback if it is narrower on this node.
+                    // shared-symbol provenance. Keep the previous interval fallback if
+                    // it is narrower on this node.
                     return propagate_disjoint_matmul(matmul, &q_z, &k_z);
                 }
 
@@ -439,7 +440,7 @@ impl GraphNetwork {
                 input_z.silu_affine()
             }
             // GELU: use affine approximation to preserve correlations
-            // Uses correct GELU math (not SiLU). Fix for #2470.
+            // Uses correct GELU math (not SiLU).
             Layer::GELU(g) => {
                 let input_z = get_unary_zonotope()?;
                 let use_tanh = matches!(
@@ -465,9 +466,9 @@ impl GraphNetwork {
                     options.softmax_mode(),
                     ZonotopeSoftmaxMode::IntervalFallback
                 ) {
-                    // #318 Packet B: cut the zonotope pipeline at Softmax so the
-                    // existing node-local IBP fallback can isolate whether the
-                    // widener is Softmax itself or a later attention operator.
+                    // Cut the zonotope pipeline at Softmax so the existing node-local
+                    // IBP fallback can isolate whether the widener is Softmax itself or
+                    // a later attention operator.
                     return Err(NyError::UnsupportedOp(
                         "Zonotope Softmax explicitly configured to fall back to IBP".to_string(),
                     ));
@@ -511,14 +512,14 @@ impl GraphNetwork {
             | Layer::Arctan(_)
             | Layer::Sqrt(_)
             | Layer::PowConstant(_) => {
-                // These operations break zonotope form — fall back to IBP (#3117).
+                // These operations break zonotope form — fall back to IBP.
                 Err(NyError::UnsupportedOp(format!(
                     "Operation {} not supported for zonotope propagation",
                     node.layer.layer_type()
                 )))
             }
 
-            // Other operations — not yet implemented (#3117).
+            // Other operations — not yet implemented.
             _ => Err(NyError::UnsupportedOp(format!(
                 "Operation {} not yet implemented for zonotope propagation",
                 node.layer.layer_type()

@@ -310,7 +310,7 @@ fn compute_crown_or_ibp_bounds_ibp_enhancement_deadline_returns_conservative_bou
 /// When cached alpha_node_bounds exist and the IBP-enhancement deadline expires,
 /// the fallback should reuse those cached bounds for plain IBP rather than
 /// returning conservative `[-INF, +INF]`. This exercises the cache-hit branch
-/// at shared.rs lines 249-259 (#4207, #4208).
+/// at shared.rs lines 249-259.
 #[ntest::timeout(10000)]
 #[test]
 fn compute_crown_or_ibp_bounds_ibp_enhancement_deadline_cache_hit_returns_ibp_bounds_4207() {
@@ -388,7 +388,7 @@ fn compute_crown_or_ibp_bounds_ibp_enhancement_deadline_cache_hit_returns_ibp_bo
     );
 }
 
-/// #4384: `ibp_enhancement=true` on a DAG graph with Concat must complete
+/// `ibp_enhancement=true` on a DAG graph with Concat must complete
 /// without error. The shape-mismatch skip guard in `merge_reference_bound_maps`
 /// silently discards nodes where IBP and warmup CROWN produce different shapes,
 /// keeping the (wider) warmup bounds for those nodes.
@@ -414,7 +414,7 @@ fn compute_crown_or_ibp_bounds_dag_concat_ibp_enhancement_completes_4384() {
     // Call with ibp_enhancement=true: this triggers a fresh IBP forward pass
     // inside compute_crown_or_ibp_bounds_with_node_bounds, then merges with
     // alpha_node_bounds via build_input_split_reference_bounds →
-    // merge_reference_bound_maps. If shapes disagree, the skip guard (#4384)
+    // merge_reference_bound_maps. If shapes disagree, the skip guard
     // keeps the wider warmup bounds and continues.
     let (bounds, _linear) = compute_crown_or_ibp_bounds_with_node_bounds(
         &configured_graph,

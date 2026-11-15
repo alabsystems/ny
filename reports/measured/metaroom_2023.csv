@@ -98,4 +98,3 @@ metaroom_2023,./onnx/6cnn_ry_92_15_no_custom_OP.onnx,./vnnlib/spec_idx_147_eps_0
 metaroom_2023,./onnx/6cnn_ry_39_6_no_custom_OP.onnx,./vnnlib/spec_idx_119_eps_0.00000436.vnnlib,prepared,timeout,209,rebank-20260824-rev4903-9e695ba9
 metaroom_2023,./onnx/4cnn_tz_39_6_no_custom_OP.onnx,./vnnlib/spec_idx_63_eps_0.00001000.vnnlib,prepared,unsat,0.08,lane4-20260803-3ab7022e
 metaroom_2023,./onnx/6cnn_tz_23_3_no_custom_OP.onnx,./vnnlib/spec_idx_172_eps_0.00001000.vnnlib,prepared,unsat,0.24,lane4-20260803-3ab7022e
-metaroom_2023,onnx/test_nano.onnx,vnnlib/test_nano.vnnlib,0,unsat,0,inherited-unverified

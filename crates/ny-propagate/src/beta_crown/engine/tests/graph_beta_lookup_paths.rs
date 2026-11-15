@@ -4,7 +4,7 @@
 
 //! Graph β lookup path regressions.
 //!
-//! Part of #2936: prove the public constrained-CROWN graph path accumulates
+//! Prove the public constrained-CROWN graph path accumulates
 //! duplicate same-node β entries correctly on both fresh and stale indexes.
 
 use super::gpu_bab::simple_graph_network;

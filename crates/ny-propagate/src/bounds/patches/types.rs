@@ -16,7 +16,6 @@ use super::PatchesMaterializationDeadline;
 /// maps sparse index `i` to output position `(c, h, w)` in the full grid.
 ///
 /// Reference: alpha-beta-CROWN `auto_LiRPA/patches.py` `Patches.unstable_idx`
-/// Part of #2613 Phase 4 step 19
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UnstableIdx {
     /// Channel indices of unstable output neurons.
@@ -674,7 +673,6 @@ pub(crate) struct PatchesData {
     /// When `Some`, only unstable neurons are tracked (sparse patches, 4D).
     ///
     /// Reference: alpha-beta-CROWN `auto_LiRPA/patches.py` `Patches.unstable_idx`
-    /// Part of #2613 Phase 4 step 19
     pub(crate) unstable_idx: Option<UnstableIdx>,
 
     /// Certified per-logical-ROW coefficient error (#patches-coeff-err-soundness).
@@ -886,7 +884,7 @@ impl PatchesData {
     /// This pre-check therefore bails to dense only when patches reach or exceed
     /// the dense element count (the true memory/compute crossover), keeping patches
     /// mode active for deep conv trunks where the receptive field is still smaller
-    /// than the input — previously a fixed 75%-per-dimension heuristic (#3813)
+    /// than the input — previously a fixed 75%-per-dimension heuristic
     /// bailed at ~56% of the dense area (0.75² per dim), abandoning patches while
     /// it was still nearly 2x cheaper. Switching to the area crossover keeps patches
     /// active far deeper without ever letting the patches tensor exceed dense. (#hotpath)
@@ -929,8 +927,6 @@ impl PatchesData {
     /// only the diagonal channel entries are 1.0. This is needed before
     /// element-wise activation backward, which must scale individual coefficients
     /// by per-neuron slopes.
-    ///
-    /// Reference: designs/2026-02-28-patches-mode-wrapper-enum-design.md Phase 2
     #[cfg(test)]
     pub(crate) fn materialize_identity(&self) -> PatchesData {
         self.try_materialize_identity()

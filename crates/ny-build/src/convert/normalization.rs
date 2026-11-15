@@ -43,7 +43,7 @@ impl ConvertContext<'_> {
     pub(crate) fn convert_layer_norm(&self, spec: &LayerSpec) -> Result<Layer> {
         let attr_norm_size = match spec.attributes.get("normalized_shape") {
             Some(AttributeValue::Ints(dims)) if !dims.is_empty() => {
-                // #2983: Guard negative normalized_shape dimension.
+                // Guard negative normalized_shape dimension.
                 Some(dims.last().copied().unwrap_or(1).max(1) as usize)
             }
             _ => None,
@@ -254,7 +254,6 @@ impl ConvertContext<'_> {
     pub(crate) fn convert_group_norm(&self, spec: &LayerSpec) -> Result<Layer> {
         // ONNX GroupNormalization inputs: X, scale (ny), bias (beta)
         // Attributes: epsilon (float, default 1e-5), num_groups (int, required)
-        // Part of #3205.
         if let Some(input_shape) = spec
             .inputs
             .first()

@@ -139,7 +139,7 @@ fn test_ibp_reps0_error() {
     );
 }
 
-/// Tile with zero-valued dimension should error, not panic with division-by-zero. (#2806)
+/// Tile with zero-valued dimension should error, not panic with division-by-zero.
 #[ntest::timeout(5000)]
 #[test]
 fn test_ibp_zero_dimension_returns_error() {
@@ -155,7 +155,7 @@ fn test_ibp_zero_dimension_returns_error() {
     );
 }
 
-/// CROWN backward with zero-valued dimension should error, not panic. (#2806)
+/// CROWN backward with zero-valued dimension should error, not panic.
 #[ntest::timeout(5000)]
 #[test]
 fn test_crown_backward_zero_dimension_returns_error() {
@@ -177,7 +177,7 @@ fn test_crown_backward_zero_dimension_returns_error() {
     );
 }
 
-/// CROWN backward with bounds (propagate_linear_with_bounds) zero-dimension error. (#2806)
+/// CROWN backward with bounds (propagate_linear_with_bounds) zero-dimension error.
 #[ntest::timeout(5000)]
 #[test]
 fn test_crown_backward_with_bounds_zero_dimension_returns_error() {
@@ -430,7 +430,7 @@ fn test_crown_backward_size_mismatch_error() {
 }
 
 // =========================================================================
-// Batched CROWN backward propagation (#287)
+// Batched CROWN backward propagation
 // =========================================================================
 
 /// Batched CROWN backward: tile 1D [3] along axis 0 with reps=2.
@@ -649,7 +649,7 @@ fn test_batched_crown_backward_reps0_error() {
     );
 }
 
-/// Batched CROWN backward: zero-valued dimension should error. (#2806)
+/// Batched CROWN backward: zero-valued dimension should error.
 #[ntest::timeout(5000)]
 #[test]
 fn test_batched_crown_backward_zero_dimension_error() {

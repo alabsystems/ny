@@ -116,13 +116,13 @@ fn sound_affine_intercepts(
 /// Uses precomputed tangent tables instead of sampling.
 /// Reference: α,β-CROWN Team, auto_LiRPA @ 9d100ec070868440b48d34e2f1dd21b97aab9172
 pub fn gelu_sound_linear_relaxation(l: f32, u: f32) -> (f32, f32, f32, f32) {
-    // Handle infinite/NaN bounds: identity relaxation is UNSOUND (see #1837).
+    // Handle infinite/NaN bounds: identity relaxation is UNSOUND.
     if let Some(result) = gelu_infinite_bounds_relaxation(l, u, GeluApproximation::Erf) {
         return result;
     }
 
     // Maximum absolute value in the evaluation interval — used to bound slope
-    // truncation error for directed rounding (#3156).
+    // truncation error for directed rounding.
     let max_abs_x = l.abs().max(u.abs());
 
     if (u - l).abs() < 1e-8 {
@@ -135,8 +135,8 @@ pub fn gelu_sound_linear_relaxation(l: f32, u: f32) -> (f32, f32, f32, f32) {
 
     // Compute chord slope and intercept in f64 to avoid catastrophic cancellation
     // when u ≈ l (both numerator and denominator approach 0 in f32).
-    // Same pattern as exp/log relaxation f64 upgrade (#1745).
-    // Directed rounding (#3156): absorb f64→f32 slope truncation error in intercepts.
+    // Same pattern as exp/log relaxation f64 upgrade.
+    // Directed rounding: absorb f64→f32 slope truncation error in intercepts.
     let gl_64 = gelu_erf_f64(l as f64);
     let gu_64 = gelu_erf_f64(u as f64);
     let k_direct_64 = (gu_64 - gl_64) / (u as f64 - l as f64);
@@ -147,7 +147,7 @@ pub fn gelu_sound_linear_relaxation(l: f32, u: f32) -> (f32, f32, f32, f32) {
 
     // auto_LiRPA "not optimized (vanilla CROWN)" mode uses a mid-point tangent in some cases.
     // Compute in f64 to avoid cancellation in b_mid = gelu(m) - k_mid * m.
-    // Directed rounding (#3156): same slope truncation error pattern as chord.
+    // Directed rounding: same slope truncation error pattern as chord.
     // Bit-identical tangent anchor: f32::midpoint rounds differently at overflow/subnormal edges.
     #[allow(clippy::manual_midpoint)]
     let m = 0.5 * (l + u);
@@ -278,12 +278,12 @@ pub fn gelu_sound_linear_relaxation(l: f32, u: f32) -> (f32, f32, f32, f32) {
 ///
 /// Uses precomputed tangent tables instead of sampling.
 pub fn gelu_tanh_sound_linear_relaxation(l: f32, u: f32) -> (f32, f32, f32, f32) {
-    // Handle infinite/NaN bounds: identity relaxation is UNSOUND (see #1837).
+    // Handle infinite/NaN bounds: identity relaxation is UNSOUND.
     if let Some(result) = gelu_infinite_bounds_relaxation(l, u, GeluApproximation::Tanh) {
         return result;
     }
 
-    // Maximum absolute value in the evaluation interval — directed rounding (#3156).
+    // Maximum absolute value in the evaluation interval — directed rounding.
     let max_abs_x = l.abs().max(u.abs());
 
     if (u - l).abs() < 1e-8 {
@@ -297,8 +297,8 @@ pub fn gelu_tanh_sound_linear_relaxation(l: f32, u: f32) -> (f32, f32, f32, f32)
 
     // Compute chord slope and intercept in f64 to avoid catastrophic cancellation
     // when u ≈ l (both numerator and denominator approach 0 in f32).
-    // Same pattern as exp/log relaxation f64 upgrade (#1745).
-    // Directed rounding (#3156): absorb f64→f32 slope truncation error in intercepts.
+    // Same pattern as exp/log relaxation f64 upgrade.
+    // Directed rounding: absorb f64→f32 slope truncation error in intercepts.
     let gl_64 = gelu_tanh_f64(l as f64);
     let gu_64 = gelu_tanh_f64(u as f64);
     let k_direct_64 = (gu_64 - gl_64) / (u as f64 - l as f64);
@@ -308,7 +308,7 @@ pub fn gelu_tanh_sound_linear_relaxation(l: f32, u: f32) -> (f32, f32, f32, f32)
         sound_affine_intercepts(k_direct_64, k_direct, b_direct_64, max_abs_x);
 
     // Compute midpoint tangent in f64 to avoid cancellation in b_mid = gelu(m) - k_mid * m.
-    // Directed rounding (#3156): same slope truncation error pattern as chord.
+    // Directed rounding: same slope truncation error pattern as chord.
     // Bit-identical tangent anchor: f32::midpoint rounds differently at overflow/subnormal edges.
     #[allow(clippy::manual_midpoint)]
     let m = 0.5 * (l + u);
@@ -740,13 +740,13 @@ mod tests {
     }
 
     // =========================================================================
-    // Narrow-interval regression tests for f64 upgrade (#2488)
+    // Narrow-interval regression tests for f64 upgrade
     // =========================================================================
 
     /// Narrow intervals just above the 1e-8 early-return threshold trigger
     /// the chord computation (gu - gl) / (u - l). In f32, both numerator and
     /// denominator approach 0, causing catastrophic cancellation.
-    /// The f64 upgrade (#2488) prevents this.
+    /// The f64 upgrade prevents this.
     #[test]
     fn test_sound_erf_narrow_interval_no_cancellation() {
         // Interval width 1e-5 at various locations — well above 1e-8 threshold
@@ -820,7 +820,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Alpha-parameterized relaxation (Phase 4, #3221)
+    // Alpha-parameterized relaxation
     // =========================================================================
 
     /// Alpha-parameterized relaxation is sound for all alpha in [0, 1].

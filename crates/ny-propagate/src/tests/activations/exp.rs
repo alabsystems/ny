@@ -169,8 +169,8 @@ fn test_exp_crown_wide_interval() {
 }
 
 // ==================== Overflow saturation tests ====================
-// (#1654 introduced a hard refusal; the dc9da0fde deep-stack overflow
-// saturation class replaced it: finite inputs beyond the f32 exp range
+// (An earlier hard refusal was replaced by the dc9da0fde deep-stack overflow
+// saturation class: finite inputs beyond the f32 exp range
 // SATURATE the upper endpoint to +inf instead of aborting verification.)
 
 #[ntest::timeout(10000)]
@@ -377,12 +377,12 @@ fn test_exp_ibp_negative_large_safe_1654() {
     }
 }
 
-// ── Strict zero-tolerance CROWN relaxation proptest (#3292) ──────────────
+// ── Strict zero-tolerance CROWN relaxation proptest ──────────────
 //
-// Pattern from #3285: f64-evaluated reference with zero tolerance catches
+// Pattern: f64-evaluated reference with zero tolerance catches
 // f32 cancellation bugs invisible to magnitude-scaled tolerance tests.
 
-/// Independent f64 exp reference for strict proptest. (#3292)
+/// Independent f64 exp reference for strict proptest.
 fn exp_f64_reference(x: f64) -> f64 {
     x.exp()
 }
@@ -393,7 +393,7 @@ proptest! {
     /// Strict soundness proptest for exp CROWN relaxation.
     /// Uses f64 reference (exp_f64_reference) with zero tolerance on 200-point grid.
     /// exp is convex: lower bound = tangent, upper bound = chord.
-    /// Ref: alpha-beta-CROWN auto_LiRPA exp relaxation, #3292.
+    /// Ref: alpha-beta-CROWN auto_LiRPA exp relaxation.
     #[test]
     fn proptest_exp_relaxation_strict_soundness(
         l in -10.0f32..10.0,

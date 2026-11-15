@@ -192,23 +192,53 @@ pub(super) fn is_exact_integer_literal_node(
     Ok(true)
 }
 
+/// How a deferred refusal can be discharged after `prepare_graph` runs.
+#[derive(Debug)]
+enum Discharge {
+    /// Only by constant folding erasing the node into a `WeightStore` literal.
+    Fold,
+    /// By folding, OR by a certified load-time canonicalization erasing the
+    /// node from the graph (#cctsdb-expand-identity: the certified `Where`
+    /// pass-through rewrites to `Identity`, and the certified all-false
+    /// `Equal` is deleted with its private cone; neither output can be a
+    /// `WeightStore` literal because the pass-through value is runtime).
+    FoldOrCanonicalize,
+}
+
 /// A refusal that was deferred because the node looked like a load-time
 /// literal, together with the message to re-raise if it turns out not to be one.
+#[derive(Debug)]
 struct DeferredRefusal {
     output: String,
     node: String,
     op_type: String,
     original: String,
+    discharge: Discharge,
 }
 
 /// Every raw-schema refusal that the literal-cone exemption suspended.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(super) struct LiteralExemptions {
     deferred: Vec<DeferredRefusal>,
 }
 
 impl LiteralExemptions {
     pub(super) fn record(&mut self, node: &NodeProto, original: &NyError) {
+        self.record_with_discharge(node, original, Discharge::Fold);
+    }
+
+    /// Defer a refusal whose certified discharge is a canonicalization that
+    /// ERASES the node rather than folding its output (see [`Discharge`]).
+    pub(super) fn record_canonicalizable(&mut self, node: &NodeProto, original: &NyError) {
+        self.record_with_discharge(node, original, Discharge::FoldOrCanonicalize);
+    }
+
+    fn record_with_discharge(
+        &mut self,
+        node: &NodeProto,
+        original: &NyError,
+        discharge: Discharge,
+    ) {
         let Some(output) = node.output.first().filter(|output| !output.is_empty()) else {
             return;
         };
@@ -217,6 +247,7 @@ impl LiteralExemptions {
             node: node.name.clone(),
             op_type: node.op_type.clone(),
             original: original.to_string(),
+            discharge,
         });
     }
 
@@ -227,18 +258,58 @@ impl LiteralExemptions {
     /// by the time propagation runs.  A node still present here would reach
     /// graph conversion as a real f32 layer — exactly the situation the raw gate
     /// exists to prevent — so it fails with the original message.
-    pub(super) fn require_all_folded(&self, weights: &WeightStore) -> Result<()> {
+    ///
+    /// `graph` is the post-`prepare` graph: a [`Discharge::FoldOrCanonicalize`]
+    /// deferral is additionally discharged when the recorded node no longer
+    /// exists in it (the certified canonicalization rewrote or deleted it).
+    /// [`Discharge::Fold`] deferrals never consult the graph, so the historical
+    /// fold-only ratchet is byte-identical.
+    pub(super) fn require_all_folded(
+        &self,
+        weights: &WeightStore,
+        graph: &GraphProto,
+    ) -> Result<()> {
         for deferred in &self.deferred {
-            if !weights.contains_key(&deferred.output) {
-                return Err(NyError::UnsupportedOp(format!(
-                    "{}; its inputs are load-time literals but constant folding did not \
-                     materialize '{}' for {} node '{}', so the node would reach ny's f32 \
-                     runtime graph",
-                    deferred.original, deferred.output, deferred.op_type, deferred.node
-                )));
+            if weights.contains_key(&deferred.output) {
+                continue;
             }
+            if matches!(deferred.discharge, Discharge::FoldOrCanonicalize) {
+                let survives = graph.node.iter().any(|node| {
+                    node.op_type == deferred.op_type
+                        && node.name == deferred.node
+                        && node.output.first() == Some(&deferred.output)
+                });
+                if !survives {
+                    continue;
+                }
+            }
+            return Err(NyError::UnsupportedOp(format!(
+                "{}; its inputs are load-time literals but constant folding did not \
+                 materialize '{}' for {} node '{}', so the node would reach ny's f32 \
+                 runtime graph",
+                deferred.original, deferred.output, deferred.op_type, deferred.node
+            )));
         }
         Ok(())
+    }
+
+    /// Output names whose deferred refusal is dischargeable ONLY by constant
+    /// folding materializing them as `WeightStore` literals
+    /// ([`Discharge::Fold`]). `prepare_graph` hands this set to
+    /// `canonicalize_identity_float_casts` so the identity-cast erasure
+    /// (#cctsdb-readout-continuity) cannot delete a node that folding is
+    /// contracted to discharge (#qdq-crown-followup: the erased
+    /// `Shape -> Slice -> Cast(FLOAT)` head-dim cast left its obligation
+    /// unmet and made smart_turn unloadable with the QDQ gate armed — and the
+    /// cast is semantically load-bearing, because the INT64->FLOAT fold is
+    /// what launders the integer provenance the downstream float folds
+    /// refuse).
+    pub(super) fn fold_obligated_outputs(&self) -> HashSet<String> {
+        self.deferred
+            .iter()
+            .filter(|deferred| matches!(deferred.discharge, Discharge::Fold))
+            .map(|deferred| deferred.output.clone())
+            .collect()
     }
 
     #[cfg(test)]
@@ -398,8 +469,12 @@ mod tests {
         assert_eq!(exemptions.len(), 1);
 
         let empty = WeightStore::new();
+        let graph = GraphProto {
+            node: vec![node.clone()],
+            ..Default::default()
+        };
         let error = exemptions
-            .require_all_folded(&empty)
+            .require_all_folded(&empty, &graph)
             .expect_err("an unfolded literal node must re-raise its refusal");
         assert!(error.to_string().contains("original refusal"));
 
@@ -409,7 +484,54 @@ mod tests {
             ndarray::ArrayD::zeros(ndarray::IxDyn(&[2])),
         );
         exemptions
-            .require_all_folded(&folded)
+            .require_all_folded(&folded, &graph)
             .expect("an erased literal node carries no refusal");
+    }
+
+    #[test]
+    fn canonicalizable_deferral_discharges_only_when_the_node_is_erased() {
+        let node = binary("Where", "expand_where", "cond", "x", "where_out");
+        let mut exemptions = LiteralExemptions::default();
+        exemptions.record_canonicalizable(
+            &node,
+            &NyError::UnsupportedOp("original refusal".to_string()),
+        );
+
+        let empty = WeightStore::new();
+        // The node survives (e.g. certification and canonicalization diverged):
+        // fail closed with the original message.
+        let surviving = GraphProto {
+            node: vec![node.clone()],
+            ..Default::default()
+        };
+        let error = exemptions
+            .require_all_folded(&empty, &surviving)
+            .expect_err("a surviving canonicalizable node must re-raise its refusal");
+        assert!(error.to_string().contains("original refusal"));
+
+        // Canonicalization rewrote the Where into an Identity of its Y input:
+        // no Where node with this identity remains, so the deferral is paid.
+        let mut rewritten_node = node.clone();
+        rewritten_node.op_type = "Identity".to_string();
+        rewritten_node.input = vec!["x".to_string()];
+        let rewritten = GraphProto {
+            node: vec![rewritten_node],
+            ..Default::default()
+        };
+        exemptions
+            .require_all_folded(&empty, &rewritten)
+            .expect("an erased canonicalizable node carries no refusal");
+
+        // A plain Fold deferral must NOT gain the erasure discharge.
+        let fold_node = binary("Equal", "eq", "a", "b", "eq_out");
+        let mut fold_only = LiteralExemptions::default();
+        fold_only.record(
+            &fold_node,
+            &NyError::UnsupportedOp("fold-only refusal".to_string()),
+        );
+        let error = fold_only
+            .require_all_folded(&empty, &rewritten)
+            .expect_err("a fold-only deferral ignores graph erasure");
+        assert!(error.to_string().contains("fold-only refusal"));
     }
 }

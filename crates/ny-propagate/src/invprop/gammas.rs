@@ -293,7 +293,7 @@ impl InvpropState {
     /// Update ny parameters from a flat vector (after optimization step).
     ///
     /// Returns `Err` if `params.len()` doesn't match total ny count from
-    /// `all_ny_params`. (#2712: converted from assert_eq! to Result)
+    /// `all_ny_params`.
     pub fn update_ny_params(&mut self, params: &[f32]) -> Result<()> {
         let expected_len: usize = self
             .layer_gammas

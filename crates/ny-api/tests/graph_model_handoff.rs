@@ -4,8 +4,8 @@
 
 //! Executable handoff examples for traced producers populating `GraphModel`.
 //!
-//! `#3288` needs a concrete contract for non-ONNX integrations that record a
-//! computation graph after tracing imperative code. These tests exercise the
+//! Non-ONNX integrations that record a computation graph after tracing
+//! imperative code need a concrete contract. These tests exercise the
 //! curated `ny_api::model` surface the same way an external producer would:
 //! assemble a neutral graph contract, attach tracing metadata, then call
 //! `GraphModel::build_graph_network(...)`.
@@ -678,7 +678,7 @@ fn test_cumsum_handoff_layer_type_builds_to_layer_cumsum_3949() {
 }
 
 // ---------------------------------------------------------------------------
-// Owned `GraphModel::new(...)` traced-producer contract (#3958)
+// Owned `GraphModel::new(...)` traced-producer contract
 //
 // Mirrors the builder-based talker-like rotary-bias packet above, but
 // constructs the `NetworkSpec` and `WeightStore` directly — the shape an

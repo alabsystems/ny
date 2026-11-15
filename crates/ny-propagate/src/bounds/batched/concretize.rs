@@ -4,9 +4,9 @@
 
 //! Concretization of batched linear bounds given input intervals.
 //!
-//! Extracted from `mod.rs` as part of #4212.
+//! Extracted from `mod.rs`.
 //!
-//! # Concretization via positive/negative coefficient split (#2220 Packet B)
+//! # Concretization via positive/negative coefficient split
 //!
 //! For separate lower/upper bound functions f_L(x) = A_L @ x + b_L and
 //! f_U(x) = A_U @ x + b_U, concretization computes:
@@ -153,6 +153,11 @@ fn nonnegative_error_or_infinity(value: f32) -> f32 {
 
 /// Directed binary64-to-binary32 publication that cannot leave a subnormal
 /// endpoint for an FTZ consumer to move inward.
+///
+/// A finite positive value that overflows the cast must publish `f32::MAX`,
+/// not `+inf`: [`next_down_f32`] preserves infinity as a sentinel, so applying
+/// it directly to the overflowing cast would leave a lower endpoint above the
+/// finite real value it is meant to bound.
 #[inline]
 fn publish_lower_zero_or_normal(value: f64) -> f32 {
     if value.is_nan() || value == f64::NEG_INFINITY {
@@ -172,7 +177,11 @@ fn publish_lower_zero_or_normal(value: f64) -> f32 {
             0.0
         };
     }
-    let published = next_down_f32(value as f32);
+    let candidate = value as f32;
+    if candidate == f32::INFINITY {
+        return f32::MAX;
+    }
+    let published = next_down_f32(candidate);
     let magnitude = published.to_bits() & 0x7fff_ffff;
     if magnitude != 0 && magnitude < f32::MIN_POSITIVE.to_bits() {
         if value.is_sign_negative() {
@@ -185,6 +194,8 @@ fn publish_lower_zero_or_normal(value: f64) -> f32 {
     }
 }
 
+/// Upper-bound mirror of [`publish_lower_zero_or_normal`]. A finite negative
+/// value that overflows the cast publishes `f32::MIN`, not `-inf`.
 #[inline]
 fn publish_upper_zero_or_normal(value: f64) -> f32 {
     if value.is_nan() || value == f64::INFINITY {
@@ -204,7 +215,11 @@ fn publish_upper_zero_or_normal(value: f64) -> f32 {
             f32::MIN_POSITIVE
         };
     }
-    let published = next_up_f32(value as f32);
+    let candidate = value as f32;
+    if candidate == f32::NEG_INFINITY {
+        return f32::MIN;
+    }
+    let published = next_up_f32(candidate);
     let magnitude = published.to_bits() & 0x7fff_ffff;
     if magnitude != 0 && magnitude < f32::MIN_POSITIVE.to_bits() {
         if value.is_sign_negative() {
@@ -872,6 +887,18 @@ impl BatchedLinearBounds {
 
         lower = widen_lower_zero_or_normal(lower);
         upper = widen_upper_zero_or_normal(upper);
+
+        // Wrong-direction infinities are sentinels, never certified endpoints.
+        // Repair them before testing order: `+inf > +inf` is false, so the
+        // inversion check alone cannot catch the unsound `[+inf, +inf]` case.
+        // Preserve a sound independent half (`[-inf, u]` or `[l, +inf]`) rather
+        // than widening both directions merely because one degraded.
+        if lower.is_nan() || lower == f32::INFINITY {
+            lower = f32::NEG_INFINITY;
+        }
+        if upper.is_nan() || upper == f32::NEG_INFINITY {
+            upper = f32::INFINITY;
+        }
         if lower > upper {
             lower = f32::NEG_INFINITY;
             upper = f32::INFINITY;
@@ -1200,7 +1227,7 @@ impl BatchedLinearBounds {
             )
         };
 
-        // Positive/negative coefficient split (#2220 Packet B).
+        // Positive/negative coefficient split.
         //
         // lower_a and upper_a are coefficients of SEPARATE linear bound functions,
         // not interval bounds on the same coefficient. The correct concretization is:
@@ -1230,7 +1257,7 @@ impl BatchedLinearBounds {
         let (concrete_lower, concrete_upper) =
             self.apply_coeff_err_penalty(concrete_lower, concrete_upper, &in_lower, &in_upper)?;
 
-        // Repair NaN/Inf at the type boundary (#3423). Widen strategy replaces NaN
+        // Repair NaN/Inf at the type boundary. Widen strategy replaces NaN
         // with ±inf and fixes inversions.
         BoundedTensor::new_repaired(concrete_lower, concrete_upper, RepairStrategy::Widen)
     }
@@ -1252,7 +1279,7 @@ impl BatchedLinearBounds {
     /// therefore sound and equally tight. The extra 1-ULP applied here is strictly
     /// additive widening — it only makes bounds safer.
     ///
-    /// NaN/Inf repair is centralized in `concretize` via `new_repaired(Widen)` (#3423).
+    /// NaN/Inf repair is centralized in `concretize` via `new_repaired(Widen)`.
     /// `round_for_soundness_inplace` (1-ULP widening) cannot introduce NaN or inversions.
     ///
     /// Reference: alpha-beta-CROWN `__double2float_rd`/`__double2float_ru`
@@ -1327,3 +1354,7 @@ impl BatchedLinearBounds {
         )
     }
 }
+
+#[cfg(test)]
+#[path = "concretize_finite_publication_tests.rs"]
+mod finite_publication_tests;

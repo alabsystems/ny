@@ -27,25 +27,59 @@ pub(crate) fn certified_affine_sum_f32<I>(bias: f32, terms: I, direction: Outwar
 where
     I: IntoIterator<Item = (f32, f32)>,
 {
-    certified_affine_sum_f32_with_poll(bias, terms, direction, |_| Ok(()))
+    // #poll-amortise: `NoPoll` compiles to nothing, so the ubiquitous
+    // no-deadline reduction keeps a hot loop with no counter, no branch and no
+    // `Result` in it. Routing it through the counting adapter would tax every
+    // caller of this wrapper. NOT every no-deadline concretization comes here:
+    // `LinearBounds::concretize` reaches the POLLABLE form below through
+    // `PatchesMaterializationDeadline::new(None)`, so it pays the per-term
+    // counter and one flush -- two relaxed atomics on process-global counters --
+    // per reduction, and those reductions also dominate the `poll_*` fields of
+    // the `[poll-amortise]` observable.
+    certified_affine_sum_f32_polled(bias, terms, direction, crate::amortise::NoPoll)
         .expect("the no-op certified-reduction poll cannot fail")
 }
 
 /// Pollable form of [`certified_affine_sum_f32`].
 ///
-/// The poll receives one unit after each exact binary32 product has been folded
-/// into the private reduction state. A refusal discards that state, so no
-/// partial endpoint can cross a proof boundary. The no-op wrapper above keeps
-/// the ubiquitous no-deadline arithmetic and iteration order byte-identical.
+/// The poll is charged one unit per exact binary32 product folded into the
+/// private reduction state, and DELIVERED once per
+/// [`crate::amortise::POLL_CHUNK_UNITS`] units plus one final flush before
+/// publication (#poll-amortise). A refusal still discards the whole private
+/// state, so no partial endpoint can cross a proof boundary; the only change
+/// is that expiry is noticed at most one stride -- 4096 MACs, microseconds --
+/// later. This is the innermost loop of every CROWN concretization, so the
+/// per-unit form put a foreign call and a `Result` branch in the hot kernel.
+/// The no-op wrapper above keeps the ubiquitous no-deadline arithmetic and
+/// iteration order byte-identical.
 pub(crate) fn certified_affine_sum_f32_with_poll<I, P>(
     bias: f32,
     terms: I,
     direction: OutwardDirection,
-    mut poll: P,
+    poll: P,
 ) -> Result<f64>
 where
     I: IntoIterator<Item = (f32, f32)>,
     P: FnMut(usize) -> Result<()>,
+{
+    certified_affine_sum_f32_polled(
+        bias,
+        terms,
+        direction,
+        crate::amortise::ChunkedPoll::new(poll),
+    )
+}
+
+/// The single certified-reduction kernel, generic over how it polls.
+fn certified_affine_sum_f32_polled<I, R>(
+    bias: f32,
+    terms: I,
+    direction: OutwardDirection,
+    mut poll: R,
+) -> Result<f64>
+where
+    I: IntoIterator<Item = (f32, f32)>,
+    R: crate::amortise::ReductionPoll,
 {
     let bias64 = f32_to_f64_exact(bias);
     let mut dd = Dd::from_f64(bias64);
@@ -92,8 +126,11 @@ where
         } else {
             dd_authorized = false;
         }
-        poll(1)?;
+        poll.tick()?;
     }
+    // Deliver the remainder BEFORE any publication path below, so a refusal
+    // still lands ahead of the proof boundary.
+    poll.flush()?;
 
     // A zero bias and all-zero products have exact real sum zero. Applying
     // the generic `next_*` publication below would invent a nonzero penalty
@@ -187,6 +224,9 @@ mod tests {
         assert_eq!(actual.to_bits(), expected.to_bits());
         assert_eq!(polls, terms.len());
 
+        // #poll-amortise: three terms are far inside one stride, so they are
+        // delivered in a single flush. The refusal must still land before the
+        // reduction publishes anything.
         let mut injected_polls = 0usize;
         let error =
             certified_affine_sum_f32_with_poll(1.0, terms, OutwardDirection::Lower, |units| {
@@ -201,6 +241,68 @@ mod tests {
             })
             .expect_err("injected poll must refuse the private reduction");
         assert!(matches!(error, NyError::DeadlineExceeded(_)));
-        assert_eq!(injected_polls, 2);
+        assert_eq!(injected_polls, terms.len());
+    }
+
+    #[test]
+    fn chunked_reduction_poll_is_amortised_at_the_declared_stride() {
+        let count = crate::amortise::POLL_CHUNK_UNITS * 2 + 7;
+        let terms: Vec<(f32, f32)> = (0..count)
+            .map(|index| match index % 3 {
+                0 => (1.0_f32, 0.5_f32),
+                1 => (-2.0_f32, 0.25_f32),
+                _ => (0.125_f32, -4.0_f32),
+            })
+            .collect();
+
+        let mut calls = 0usize;
+        let mut units = 0usize;
+        let amortised = certified_affine_sum_f32_with_poll(
+            1.0,
+            terms.iter().copied(),
+            OutwardDirection::Lower,
+            |charged| {
+                calls += 1;
+                units += charged;
+                Ok(())
+            },
+        )
+        .expect("no refusal");
+
+        assert_eq!(units, count, "every MAC must still be charged to the poll");
+        assert_eq!(calls, 3, "two full strides plus the remainder flush");
+
+        let reference =
+            certified_affine_sum_f32(1.0, terms.iter().copied(), OutwardDirection::Lower);
+        assert_eq!(
+            amortised.to_bits(),
+            reference.to_bits(),
+            "amortising the poll must not move a certified endpoint by one ulp"
+        );
+    }
+
+    #[test]
+    fn amortised_reduction_still_refuses_within_one_stride_of_expiry() {
+        let count = crate::amortise::POLL_CHUNK_UNITS * 3;
+        let terms: Vec<(f32, f32)> = (0..count).map(|_| (1.0_f32, 1.0_f32)).collect();
+        let mut units = 0usize;
+        let error = certified_affine_sum_f32_with_poll(
+            0.0,
+            terms.iter().copied(),
+            OutwardDirection::Upper,
+            |charged| {
+                units += charged;
+                Err(NyError::DeadlineExceeded(
+                    "expired at the first stride".into(),
+                ))
+            },
+        )
+        .expect_err("the first stride boundary must refuse");
+        assert!(matches!(error, NyError::DeadlineExceeded(_)));
+        assert_eq!(
+            units,
+            crate::amortise::POLL_CHUNK_UNITS,
+            "refusal must arrive at the first stride, not at the end of the reduction"
+        );
     }
 }

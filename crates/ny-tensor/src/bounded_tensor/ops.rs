@@ -55,7 +55,7 @@ impl BoundedTensor {
         let upper = ndarray::Zip::from(self.upper())
             .and(other.upper())
             .map_collect(|&x, &y| add_up_f32(x, y));
-        // Repair NaN from inf + (-inf) etc. at the type boundary (#3423).
+        // Repair NaN from inf + (-inf) etc. at the type boundary.
         BoundedTensor::new_repaired(lower, upper, RepairStrategy::Conservative)
     }
 
@@ -122,7 +122,7 @@ impl BoundedTensor {
     ///
     /// If `scalar` is NaN or Inf, returns conservative `[-inf, +inf]` bounds.
     /// Without this guard, `NaN >= 0.0` → false (IEEE 754), causing the code
-    /// to incorrectly treat NaN as negative and swap bounds. See #2895.
+    /// to incorrectly treat NaN as negative and swap bounds.
     pub fn scale(&self, scalar: f32) -> BoundedTensor {
         if !scalar.is_finite() {
             return BoundedTensor::new_conservative(self.shape());
@@ -142,12 +142,12 @@ impl BoundedTensor {
                 self.lower().mapv(|v| mul_up_f32(v, scalar)),
             )
         };
-        // SAFETY: new_repaired() repairs NaN from edge cases like 0 * inf (#3423).
+        // SAFETY: new_repaired() repairs NaN from edge cases like 0 * inf.
         // The .expect() can only fail on shape mismatch, which is impossible here
         // because both arrays derive from the same BoundedTensor via mapv().
         // WARNING: Do NOT replace new_repaired().expect() with from_parts_unchecked —
         // new_repaired() performs essential NaN repair (e.g., inf * 0.0 → NaN → [-inf, +inf])
-        // that from_parts_unchecked would skip in release builds. (#4253)
+        // that from_parts_unchecked would skip in release builds.
         BoundedTensor::new_repaired(lower, upper, RepairStrategy::Conservative)
             .expect("invariant: shapes from same BoundedTensor always match")
     }
@@ -157,12 +157,12 @@ impl BoundedTensor {
         // DIRECTED, same reasoning as `add`.
         let lower = self.lower().mapv(|v| add_down_f32(v, scalar));
         let upper = self.upper().mapv(|v| add_up_f32(v, scalar));
-        // SAFETY: new_repaired() repairs NaN from inf + (-inf) etc. (#3423).
+        // SAFETY: new_repaired() repairs NaN from inf + (-inf) etc..
         // The .expect() can only fail on shape mismatch, which is impossible here
         // because both arrays derive from the same BoundedTensor via mapv().
         // WARNING: Do NOT replace new_repaired().expect() with from_parts_unchecked —
         // new_repaired() performs essential NaN repair that from_parts_unchecked would
-        // skip in release builds. (#4253)
+        // skip in release builds.
         BoundedTensor::new_repaired(lower, upper, RepairStrategy::Conservative)
             .expect("invariant: shapes from same BoundedTensor always match")
     }

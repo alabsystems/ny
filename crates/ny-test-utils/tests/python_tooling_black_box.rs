@@ -122,6 +122,472 @@ fn read_repository_text(path: PathBuf) -> std::io::Result<String> {
     fs::read_to_string(path).map(normalize_newlines)
 }
 
+// ---------------------------------------------------------------------------
+// scripts/check_score_at_risk_drift.py (gate lane [n])
+// ---------------------------------------------------------------------------
+
+/// A minimal stand-in for scripts/ny_retroactive_scorecard.py: the drift
+/// checker reads only its two benchmark lists and its two bank-directory
+/// argparse defaults, by text.
+const SCORE_DRIFT_SCORER_FIXTURE: &str = r#"REGULAR = [
+    "alpha",
+]
+EXTENDED = [
+    "beta",
+]
+
+
+def main():
+    ap.add_argument("--measured", default="reports/measured")
+    ap.add_argument(
+        "--ext-measured",
+        default="reports/measured-ext",
+    )
+"#;
+
+const SCORE_DRIFT_YAML_FIXTURE: &str = r#"measured_on: "2026-10-04"
+measured_at_sha: "fixture"
+command: python3 scripts/ny_retroactive_scorecard.py --extended
+totals:
+  regular_16: 50.0
+  extended_9: 0.0
+  full_field_25: 50.0
+roots:
+  - root: benchmarks/vnncomp2025/benchmarks/alpha
+    benchmark: alpha
+    track: regular
+    banked_normalized: 50.0
+  - root: benchmarks/vnncomp2025/benchmarks/beta
+    benchmark: beta
+    track: extended
+    banked_normalized: 0.0
+"#;
+
+/// A copy of the real checker under a synthetic repository root (the script
+/// resolves every input relative to its own location).
+fn score_drift_fixture(label: &str) -> TestDirectory {
+    let directory = TestDirectory::new(label);
+    let root = directory.path();
+    let script =
+        read_repository_text(workspace_root().join("scripts/check_score_at_risk_drift.py"))
+            .expect("the drift checker must be readable");
+    write(&root.join("scripts/check_score_at_risk_drift.py"), &script);
+    write(
+        &root.join("scripts/ny_retroactive_scorecard.py"),
+        SCORE_DRIFT_SCORER_FIXTURE,
+    );
+    write(
+        &root.join("configs/preset_score_at_risk.yaml"),
+        SCORE_DRIFT_YAML_FIXTURE,
+    );
+    // The regular member's bank, in the 6-field shape (index 3 = "prepared").
+    write(
+        &root.join("reports/measured/alpha.csv"),
+        "alpha,onnx/a.onnx,vnnlib/a.vnnlib,prepared,unsat,1.0\n",
+    );
+    // The extended directory exists (as in the repository) and holds no bank
+    // for `beta`, which the fixture yaml prices at 0.0.
+    write(&root.join("reports/measured-ext/README.md"), "fixture\n");
+    directory
+}
+
+/// The fixture yaml with `beta` (extended) priced at 10.0 and the totals to match.
+fn score_drift_yaml_with_a_beta_stake() -> String {
+    SCORE_DRIFT_YAML_FIXTURE
+        .replace("extended_9: 0.0", "extended_9: 10.0")
+        .replace("full_field_25: 50.0", "full_field_25: 60.0")
+        .replace(
+            "    track: extended\n    banked_normalized: 0.0",
+            "    track: extended\n    banked_normalized: 10.0",
+        )
+}
+
+fn run_score_drift(root: &Path) -> Output {
+    // An absolute script path: `Path::join` keeps it, so the shared runner (and
+    // its interpreter isolation) executes the fixture COPY, not the repository's.
+    let script = root.join("scripts/check_score_at_risk_drift.py");
+    run_repository_script(
+        script.to_str().expect("fixture path must be UTF-8"),
+        &[],
+        root,
+    )
+}
+
+/// The yaml prices the 2025 retroactive scorecard, so a solved bank for the
+/// same benchmark NAME in another field's ledger (reports/measured-2026: the
+/// yolo_2023 case, whose 2026 instances share 10 of 72 with the 2025 set) is a
+/// note, not drift — the scorer cannot credit it.
+#[test]
+fn score_at_risk_drift_ignores_another_fields_bank() {
+    let fixture = score_drift_fixture("score-drift-other-field");
+    let root = fixture.path();
+    write(
+        &root.join("reports/measured-2026/beta.csv"),
+        "beta,onnx/b.onnx,vnnlib/b.vnnlib,0.0,unsat,1.0\n",
+    );
+
+    let output = run_score_drift(root);
+    let out = stdout(&output);
+    assert!(
+        output.status.success(),
+        "a 2026-field bank must not price a 2025 stake\nstdout:\n{out}\nstderr:\n{}",
+        stderr(&output)
+    );
+    assert!(
+        out.contains("(read from reports/measured + reports/measured-ext)"),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "note: beta: no bank under reports/measured-ext; reports/measured-2026/beta.csv is \
+             not an input of the scorer for this extended row"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("PASS:"), "{out}");
+}
+
+/// The check still fires for the scorer's OWN banks: a solved row in the
+/// extended directory for a member priced 0.0 is a recovered category whose
+/// stake was never restored.
+#[test]
+fn score_at_risk_drift_fires_on_the_scorers_own_recovered_bank() {
+    let fixture = score_drift_fixture("score-drift-recovered");
+    let root = fixture.path();
+    write(
+        &root.join("reports/measured-ext/beta.csv"),
+        "beta,onnx/b.onnx,vnnlib/b.vnnlib,unsat,1.0\n",
+    );
+
+    let output = run_score_drift(root);
+    let out = stdout(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout:\n{out}\nstderr:\n{}",
+        stderr(&output)
+    );
+    assert!(
+        out.contains("beta: bank has 1 solved rows but is priced at 0.0"),
+        "{out}"
+    );
+}
+
+/// The vit_2023 shape: a bank with zero solved rows priced above 0.0.
+#[test]
+fn score_at_risk_drift_fires_on_a_zero_solved_bank_with_a_stake() {
+    let fixture = score_drift_fixture("score-drift-zeroed");
+    let root = fixture.path();
+    write(
+        &root.join("reports/measured/alpha.csv"),
+        "alpha,onnx/a.onnx,vnnlib/a.vnnlib,prepared,timeout,1.0\n",
+    );
+
+    let output = run_score_drift(root);
+    let out = stdout(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout:\n{out}\nstderr:\n{}",
+        stderr(&output)
+    );
+    assert!(
+        out.contains("alpha: bank has ZERO sat/unsat rows but is priced at 50.0"),
+        "{out}"
+    );
+}
+
+/// The yaml's recorded command is CHECKED against the scorer, never followed:
+/// it is part of the file under test, and a check that reads the bank from
+/// wherever that file points lets one wrong token choose what the file is
+/// compared against. Naming another ledger is itself drift, and the bank is
+/// still read from the scorer's directory (so the 2026-field row below stays
+/// a note, not a "recovered category").
+#[test]
+fn score_at_risk_drift_refuses_a_recorded_command_that_names_another_ledger() {
+    let fixture = score_drift_fixture("score-drift-command");
+    let root = fixture.path();
+    let yaml = SCORE_DRIFT_YAML_FIXTURE.replace(
+        "command: python3 scripts/ny_retroactive_scorecard.py --extended",
+        "command: python3 scripts/ny_retroactive_scorecard.py --measured reports/measured \
+         --ext-measured reports/measured-2026 --extended",
+    );
+    write(&root.join("configs/preset_score_at_risk.yaml"), &yaml);
+    write(
+        &root.join("reports/measured-2026/beta.csv"),
+        "beta,onnx/b.onnx,vnnlib/b.vnnlib,0.0,unsat,1.0\n",
+    );
+
+    let output = run_score_drift(root);
+    let out = stdout(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout:\n{out}\nstderr:\n{}",
+        stderr(&output)
+    );
+    assert!(
+        out.contains("(read from reports/measured + reports/measured-ext)"),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "recorded `command` passes `--ext-measured reports/measured-2026` but the scorer \
+             reads `reports/measured-ext` by default"
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("beta: bank has 1 solved rows"), "{out}");
+    // The directory the scorer does read, spelled either way, is not drift.
+    assert!(!out.contains("`--measured reports/measured`"), "{out}");
+}
+
+/// The reviewer's plant (2026-10-08): a member's bank loses every solved row
+/// while its stake stays, and the yaml's recorded command carries a mistyped
+/// bank directory. When the checker followed that command it read nothing for
+/// the member, printed a note and PASSED. Both defects must be reported.
+#[test]
+fn score_at_risk_drift_a_mistyped_recorded_directory_cannot_narrow_the_check() {
+    for (label, create_the_typo_directory) in [("absent", false), ("empty", true)] {
+        let fixture = score_drift_fixture(&format!("score-drift-typo-{label}"));
+        let root = fixture.path();
+        let yaml = SCORE_DRIFT_YAML_FIXTURE.replace(
+            "command: python3 scripts/ny_retroactive_scorecard.py --extended",
+            "command: python3 scripts/ny_retroactive_scorecard.py --measured=reports/measured-typo \
+             --extended",
+        );
+        write(&root.join("configs/preset_score_at_risk.yaml"), &yaml);
+        write(
+            &root.join("reports/measured/alpha.csv"),
+            "alpha,onnx/a.onnx,vnnlib/a.vnnlib,prepared,timeout,1.0\n",
+        );
+        if create_the_typo_directory {
+            write(&root.join("reports/measured-typo/README.md"), "fixture\n");
+        }
+
+        let output = run_score_drift(root);
+        let out = stdout(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{label}\nstdout:\n{out}\nstderr:\n{}",
+            stderr(&output)
+        );
+        assert!(
+            out.contains("alpha: bank has ZERO sat/unsat rows but is priced at 50.0"),
+            "{label}: {out}"
+        );
+        assert!(
+            out.contains(
+                "recorded `command` passes `--measured reports/measured-typo` but the scorer \
+                 reads `reports/measured` by default"
+            ),
+            "{label}: {out}"
+        );
+    }
+}
+
+/// A scored member priced above 0.0 with no bank in the directory the scorer
+/// reads for its track: the scorer credits an unmeasured benchmark 0, so the
+/// stake has nothing behind it. (Before, a missing bank was skipped silently.)
+#[test]
+fn score_at_risk_drift_fires_on_a_stake_with_no_bank() {
+    let fixture = score_drift_fixture("score-drift-no-bank");
+    let root = fixture.path();
+    write(
+        &root.join("configs/preset_score_at_risk.yaml"),
+        &score_drift_yaml_with_a_beta_stake(),
+    );
+
+    let output = run_score_drift(root);
+    let out = stdout(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout:\n{out}\nstderr:\n{}",
+        stderr(&output)
+    );
+    assert!(
+        out.contains("beta: priced at 10.0 but has no bank under reports/measured-ext"),
+        "{out}"
+    );
+}
+
+/// Each row is read from the ONE directory the scorer reads for its track. An
+/// extended benchmark's file under the REGULAR directory is not its bank (the
+/// repository has seven such pairs; lsnc_relu holds 80 solved rows there and
+/// 11 in reports/measured-ext): its extended bank losing every solved row is
+/// the vit_2023 drift even while the other file is full.
+#[test]
+fn score_at_risk_drift_reads_an_extended_row_only_from_the_extended_bank() {
+    let fixture = score_drift_fixture("score-drift-track");
+    let root = fixture.path();
+    write(
+        &root.join("configs/preset_score_at_risk.yaml"),
+        &score_drift_yaml_with_a_beta_stake(),
+    );
+    write(
+        &root.join("reports/measured/beta.csv"),
+        "beta,onnx/b.onnx,vnnlib/b.vnnlib,prepared,unsat,1.0\n",
+    );
+    write(
+        &root.join("reports/measured-ext/beta.csv"),
+        "beta,onnx/b.onnx,vnnlib/b.vnnlib,timeout,1.0\n",
+    );
+
+    let output = run_score_drift(root);
+    let out = stdout(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout:\n{out}\nstderr:\n{}",
+        stderr(&output)
+    );
+    assert!(
+        out.contains("beta: bank has ZERO sat/unsat rows but is priced at 10.0"),
+        "{out}"
+    );
+
+    // The same stake with its solved row in the extended bank is not drift,
+    // under either file name `load_ny_ext` accepts.
+    for name in ["beta.csv", "ext_beta_results.csv"] {
+        let fixture = score_drift_fixture("score-drift-track-ok");
+        let root = fixture.path();
+        write(
+            &root.join("configs/preset_score_at_risk.yaml"),
+            &score_drift_yaml_with_a_beta_stake(),
+        );
+        write(
+            &root.join("reports/measured-ext").join(name),
+            "beta,onnx/b.onnx,vnnlib/b.vnnlib,unsat,1.0\n",
+        );
+        let output = run_score_drift(root);
+        let out = stdout(&output);
+        assert!(
+            output.status.success() && out.contains("2 with banks") && out.contains("PASS:"),
+            "{name}\nstdout:\n{out}\nstderr:\n{}",
+            stderr(&output)
+        );
+    }
+}
+
+/// A bank directory the scorer reads that does not exist is VOID (exit 2: the
+/// check could not look), never a pass and not the drift code.
+#[test]
+fn score_at_risk_drift_is_void_when_a_scorer_bank_directory_is_missing() {
+    let fixture = score_drift_fixture("score-drift-void");
+    let root = fixture.path();
+    fs::remove_dir_all(root.join("reports/measured-ext")).expect("fixture directory");
+
+    let output = run_score_drift(root);
+    let out = stdout(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout:\n{out}\nstderr:\n{}",
+        stderr(&output)
+    );
+    assert!(
+        out.contains(
+            "VOID: bank directory `reports/measured-ext` (the scorer's `--ext-measured` \
+             default) does not exist"
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("PASS:"), "{out}");
+}
+
+// ---------------------------------------------------------------------------
+// The transitional pytest suite (gate lane [e]) under an inherited GIT_DIR
+// ---------------------------------------------------------------------------
+
+fn git_in(dir: &Path, arguments: &[&str]) -> Output {
+    Command::new("git")
+        .args(arguments)
+        .current_dir(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .output()
+        .unwrap_or_else(|error| panic!("git is required for this contract: {error}"))
+}
+
+/// Git exports GIT_DIR to the commands it runs from a linked worktree (hooks,
+/// `git bisect run`, `git rebase -x`). The suite's fixture repositories are
+/// built with plain `git init/config/commit`, so before tests/conftest.py
+/// dropped git's repository-local environment, every fixture command acted on
+/// the ENCLOSING repository: on 2026-10-04 a `git bisect run` over this suite
+/// set `core.bare = true` and `user.name = NY Test` in the shared clone's
+/// config and committed the fixture onto the worktree's HEAD. A git-fixture
+/// test must pass and leave an inherited GIT_DIR's repository untouched.
+#[test]
+fn pytest_suite_fixtures_never_touch_an_inherited_git_dir() {
+    let directory = TestDirectory::new("inherited-git-dir");
+    let outer = directory.path().join("outer");
+    fs::create_dir_all(&outer).expect("outer repository directory must be created");
+    for arguments in [
+        &["init", "-q"][..],
+        &[
+            "-c",
+            "user.name=outer",
+            "-c",
+            "user.email=outer@example.invalid",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "outer",
+        ][..],
+    ] {
+        let output = git_in(&outer, arguments);
+        assert!(
+            output.status.success(),
+            "git {arguments:?}: {}",
+            stderr(&output)
+        );
+    }
+    let config_before = fs::read(outer.join(".git/config")).expect("outer config");
+    let head_before = stdout(&git_in(&outer, &["rev-parse", "HEAD"]));
+
+    // The selected test clears every NY_* variable itself. Cargo adds
+    // DYLD_FALLBACK_LIBRARY_PATH to a test binary's environment on macOS; the
+    // provenance capture rightly refuses that as loader injection, and the
+    // gate's own `pytest tests` never carries it, so it is not inherited here.
+    let output = Command::new(python_executable())
+        .args(["-B", "-s", "-m", "pytest", "-q", "-p", "no:cacheprovider"])
+        .arg("tests/test_ny_measurement_provenance.py")
+        .args([
+            "-k",
+            "test_start_manifest_refuses_current_evidence_without_a_predicate",
+        ])
+        .current_dir(workspace_root())
+        .env_remove("DYLD_FALLBACK_LIBRARY_PATH")
+        .env_remove("PYTHONHOME")
+        .env_remove("PYTHONPATH")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("PYTHONNOUSERSITE", "1")
+        .env("GIT_DIR", outer.join(".git"))
+        .output()
+        .unwrap_or_else(|error| panic!("the selected Python interpreter is unavailable: {error}"));
+    let out = stdout(&output);
+    assert!(
+        output.status.success() && out.contains("1 passed"),
+        "the git-fixture test must pass under an inherited GIT_DIR\nstdout:\n{out}\nstderr:\n{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&fs::read(outer.join(".git/config")).expect("outer config")),
+        String::from_utf8_lossy(&config_before),
+        "a fixture git command rewrote the inherited repository's config"
+    );
+    assert_eq!(
+        stdout(&git_in(&outer, &["rev-parse", "HEAD"])),
+        head_before,
+        "a fixture commit landed on the inherited repository's HEAD"
+    );
+}
+
 fn assert_success(output: &Output, context: &str) {
     assert!(
         output.status.success(),
@@ -184,7 +650,12 @@ fn workload_metadata(source: &str, prefix: &str) -> (String, usize, usize) {
         0,
         "{prefix} Conv specification changed shape"
     );
-    let specifications: Vec<_> = raw_specs.chunks_exact(9).collect();
+    let specifications: Vec<&[usize]> = raw_specs
+        .as_chunks::<9>()
+        .0
+        .iter()
+        .map(<[usize; 9]>::as_slice)
+        .collect();
     let convolution_parameters: usize = specifications
         .iter()
         .map(|specification| {
@@ -1003,8 +1474,8 @@ expect_rejected(
     start,
     dark,
     "sealed required flight event did not earn current execution credit: "
-    "governed NY_PGD_FAST_GRAD=0 was not accepted exactly from config or "
-    "the child environment",
+    "governed NY_PGD_FAST_GRAD=0 was not accepted exactly from its sealed "
+    "config or child-environment authority",
     exact=True,
 )
 
@@ -1296,4 +1767,181 @@ fn measured_2026_coverage_census_rejects_an_unreviewed_bank_byte_change() {
     assert_eq!(rejected.status.code(), Some(2));
     assert!(stderr(&rejected).contains("bank CSV sha256"));
     assert!(stderr(&rejected).contains("review the result change"));
+}
+
+// ---------------------------------------------------------------------------
+// The M0 arming harness (scripts/m0/): its self-test with the runner under the
+// host's STOCK shell, /bin/bash.
+//
+// macOS ships bash 3.2 as /bin/bash. The runner, moat_both_profiles.sh, used
+// bash 4's `mapfile` and `declare -A`, so every one of its end-to-end tests
+// failed on that shell while passing under Linux's bash 5, and the failure
+// read as a host quirk. bash 3.2 does not merely reject `declare -A`: the
+// assignment then runs on an INDEXED array whose string subscripts evaluate
+// arithmetically (docs/DEFECT_REGISTER_2026-07-31.md D1 `#bash32-declare-A`,
+// which sent nine A/B runs to one instance). The contract here runs the
+// self-test with `--bash /bin/bash` and requires every test's `ok` by name, so
+// on a host whose stock shell is bash 3.2 either construct is a red. On Linux
+// /bin/bash is bash 5 and this run cannot see them; the lexical scan that
+// refuses bash-4-only constructs on EVERY host, including in the Linux-only
+// `--launch` path the self-test cannot execute, is in the default lane:
+// `source_policy`'s `m0_runner_has_no_bash4_only_construct` (gate check [a]).
+// The self-test needs requirements.txt's PyYAML, like the other tools here.
+// ---------------------------------------------------------------------------
+
+/// Every runner test the self-test's default lane defines. Each one drives
+/// `moat_both_profiles.sh --run` end to end, so each one exercises the shell.
+const M0_RUNNER_TESTS: &[&str] = &[
+    "test_runner_clean_run_exits_zero_and_done_propagates_rc",
+    "test_runner_fixture_isolates_inherited_verdict_env",
+    "test_runner_stops_before_a_run_while_its_stop_file_exists",
+    "test_runner_out_dir_must_live_under_its_root_and_the_root_is_overridable",
+    "test_runner_stops_on_an_emergency_with_rc3",
+    "test_runner_void_run_is_not_a_pass",
+    "test_runner_profile_split_is_an_emergency",
+    "test_runner_refuses_ny_env_before_measuring",
+    "test_runner_refuses_a_wrong_pin",
+    "test_runner_resume_skips_judged_runs",
+    "test_runner_runs_under_the_competition_backstop",
+    "test_runner_backstop_kill_is_judged_from_the_results_file",
+    "test_runner_results_file_unsat_is_an_emergency_when_the_log_says_timeout",
+    "test_runner_refuses_to_relaunch_after_an_emergency",
+    "test_runner_refuses_verdict_affecting_non_ny_env",
+    "test_runner_refuses_an_address_space_rlimit",
+    "test_runner_resolver_checks_each_category_configs_preset_key_once",
+    "test_runner_moves_a_stale_flight_record_aside",
+];
+
+/// Step-0 refusals of THIS HOST's memory envelope in a failed self-test's
+/// output: the reason of every `M0MOAT_DONE rc=86` line, in first-seen order.
+///
+/// 16 of the 18 runner tests reach the runner's real step-0 memory check
+/// (scripts/m0/README.md). On Linux it refuses a cgroup `memory.max` below
+/// 96 GiB anywhere on the process's cgroup path, and an unreadable one; on
+/// every host it refuses a finite `RLIMIT_AS`. A self-test run inside such a
+/// cap fails those tests with rc 86 for a reason that has nothing to do with
+/// the shell, so the contract below names it instead of leaving it in the
+/// transcript. (The one test that expects rc 86 prints nothing when it
+/// passes, so a printed rc-86 line is always a refusal a test did not expect.)
+fn m0_host_envelope_refusals(transcript: &str) -> Vec<String> {
+    let mut reasons: Vec<String> = Vec::new();
+    for line in transcript.lines() {
+        let Some((_, done)) = line.split_once("M0MOAT_DONE rc=86 ") else {
+            continue;
+        };
+        let Some((_, reason)) = done.split_once("reason=") else {
+            continue;
+        };
+        // `reason=<text, spaces allowed> <ISO timestamp>`
+        let reason = reason
+            .rsplit_once(' ')
+            .map_or(reason, |(text, _timestamp)| text);
+        if !reasons.iter().any(|seen| seen == reason) {
+            reasons.push(reason.to_owned());
+        }
+    }
+    reasons
+}
+
+/// The field value of `key=` in a `M0_SELFTEST_DONE` line.
+fn done_field<'a>(done: &'a str, key: &str) -> &'a str {
+    let prefix = format!("{key}=");
+    done.split_whitespace()
+        .find_map(|field| field.strip_prefix(prefix.as_str()))
+        .unwrap_or_else(|| panic!("DONE line lacks {key}=: {done}"))
+}
+
+#[test]
+fn m0_selftest_default_lane_is_green_with_the_runner_under_stock_bin_bash() {
+    let root = workspace_root();
+    let output = run_repository_script(
+        "scripts/m0/m0_selftest.py",
+        &["--bash".to_owned(), "/bin/bash".to_owned()],
+        &root,
+    );
+    let printed = stdout(&output);
+    let context = format!(
+        "status {}\nstdout:\n{printed}\nstderr:\n{}",
+        output.status,
+        stderr(&output)
+    );
+    // A lane that cannot run its contract on this host says exactly why.
+    let refusals = m0_host_envelope_refusals(&context);
+    assert!(
+        refusals.is_empty(),
+        "the M0 runner's step-0 memory check refused THIS HOST (rc 86: {}), so its end-to-end \
+         tests cannot run here. The refusal is the runner's contract, not a shell-portability \
+         red: on Linux a cgroup memory.max below 96 GiB on the process's cgroup path (or an \
+         unreadable one) moves ny's dense clamp, and a finite RLIMIT_AS is refused on every \
+         host (scripts/m0/README.md). Run this lane outside the cap.\n{context}",
+        refusals.join("; ")
+    );
+    assert!(output.status.success(), "m0 self-test failed: {context}");
+
+    let done = printed
+        .lines()
+        .rfind(|line| line.starts_with("M0_SELFTEST_DONE "))
+        .unwrap_or_else(|| panic!("no M0_SELFTEST_DONE line: {context}"));
+    for (key, want) in [
+        ("rc", "0"),
+        ("failures", "0"),
+        ("errors", "0"),
+        ("skipped", "0"),
+        ("lane", "default"),
+        ("bash", "/bin/bash"),
+    ] {
+        assert_eq!(done_field(done, key), want, "{key} in {done}");
+    }
+    // The stock macOS shell is the bash 3.2 the runner must support. A newer
+    // /bin/bash there would make this check stop exercising 3.2, so say so.
+    #[cfg(target_os = "macos")]
+    assert!(
+        done_field(done, "bash_version").starts_with("3."),
+        "/bin/bash on macOS is no longer bash 3.x, so this check no longer covers it: {done}"
+    );
+
+    // Every test line, by name: `ran=` must equal the `... ok` lines, so a
+    // test that vanished or reported anything but ok cannot hide in a count.
+    let test_lines: Vec<&str> = printed
+        .lines()
+        .filter(|line| line.starts_with("test_") && line.contains(" (__main__."))
+        .collect();
+    let ran: usize = done_field(done, "ran")
+        .parse()
+        .unwrap_or_else(|error| panic!("ran= is not a count ({error}): {done}"));
+    assert_eq!(test_lines.len(), ran, "one result line per test: {context}");
+    for line in &test_lines {
+        assert!(line.ends_with(" ... ok"), "not ok: {line}");
+    }
+    for name in M0_RUNNER_TESTS {
+        let prefix = format!("{name} (__main__.Runner.{name}) ... ok");
+        assert!(
+            test_lines.iter().any(|line| *line == prefix),
+            "runner test {name} did not report ok: {context}"
+        );
+    }
+}
+
+#[test]
+fn m0_host_envelope_refusal_is_named_from_a_failed_selftest_transcript() {
+    // Positive control for the refusal the self-test contract names: the two
+    // shapes a failing runner test prints (the DONE line alone, as an
+    // assertion message; and inside the runner's log tail), one reason per
+    // distinct refusal, the timestamp dropped, other DONE lines untouched.
+    let transcript = "\
+AssertionError: 86 != 0 : M0MOAT_DONE rc=86 WORST=86 reason=rlimit-as-set:1024(KiB; refused on every host) 2026-10-08T13:53:39-07:00
+  cgroup: 0::/user.slice/x.scope memory.max=68719476736
+M0MOAT_DONE rc=86 WORST=86 reason=cgroup-memory-cap-below-96G:68719476736 2026-10-08T13:53:40-07:00
+M0MOAT_DONE rc=86 WORST=86 reason=cgroup-memory-cap-below-96G:68719476736 2026-10-08T13:53:41-07:00
+M0MOAT_DONE rc=97 WORST=97 reason=spec has no rows 2026-10-08T13:53:42-07:00
+M0MOAT_DONE rc=0 WORST=0 ran=2 box_refused=0 2026-10-08T13:53:43-07:00
+";
+    assert_eq!(
+        m0_host_envelope_refusals(transcript),
+        [
+            "rlimit-as-set:1024(KiB; refused on every host)",
+            "cgroup-memory-cap-below-96G:68719476736",
+        ]
+    );
+    assert!(m0_host_envelope_refusals("M0_SELFTEST_DONE rc=0 ran=59 failures=0").is_empty());
 }

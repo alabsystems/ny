@@ -2,10 +2,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Real speaker encoder integration tests for training_signal (#3520 Packet A).
+//! Real speaker encoder integration tests for training_signal (Packet A).
 //!
-//! Uses the seq5 epsilon ladder from the fixture contract:
-//! designs/2026-03-12-issue-3520-speaker-region-fixture-contract.md
+//! Uses the seq5 epsilon ladder from the speaker-region fixture contract.
 //!
 //! Consolidated single-region smoke test: proves the full end-to-end pipeline
 //! on real ONNX within the 600s cargo wrapper timeout. Multi-region ranking

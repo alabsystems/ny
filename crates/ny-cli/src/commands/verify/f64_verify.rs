@@ -9,7 +9,6 @@
 //! are converted back to f32 with directed rounding (sound) before rendering.
 //!
 //! Reference: alpha-beta-CROWN `double_fp: true` (`abcrown.py:81-82`).
-//! Design: `designs/2026-03-04-f64-propagation-path.md` step 6.
 
 use anyhow::Result;
 use ny_core::{Bound, SoundnessProvenance, VerificationResult, VerificationSpec};
@@ -310,7 +309,7 @@ fn render_f64_text(
         reported_status(result, property_status).to_uppercase()
     );
     if let VerificationResult::Unknown { reason, .. } = result {
-        println!("  Reason: {reason:?}");
+        println!("  Reason: {reason}");
     }
 
     if !output_bounds.is_empty() {

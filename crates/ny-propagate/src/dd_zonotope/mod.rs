@@ -341,7 +341,7 @@ impl DdZonoPlan {
         }
         // The EXACT-decimal box is mandatory, not an optimisation: the
         // engine's f32 box is 2 f32 ULPs wide on every declared-point pixel
-        // (`split_input_bounds_f32`, #2658), which would make `k = 150528` and,
+        // (`split_input_bounds_f32`), which would make `k = 150528` and,
         // if carried in the interval channel instead, IBP-explode. See
         // `certified_box` for the measurement behind that.
         let Some(exact) = certified_box::lookup(input) else {
@@ -767,7 +767,7 @@ fn retire_dead(needed: &[String], live: &mut HashMap<String, DdZono>) {
 /// # The f32 gap (scoping risk R7), and why it forced a new seam
 ///
 /// `ny_core::Bound` is f32 and `VnnLibSpec::split_input_bounds_f32`
-/// (`ny-onnx/src/vnnlib/spec.rs:414`, #2658) widens every endpoint outward by
+/// (`ny-onnx/src/vnnlib/spec.rs:414`) widens every endpoint outward by
 /// one f32 ULP, so the engine's box is a strict SUPERSET of the VNN-LIB
 /// region — sound, and unusable here: it makes all 150528 vggnet16 pixels
 /// non-degenerate. Carrying that as generators is unaffordable and carrying it

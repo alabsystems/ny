@@ -79,6 +79,19 @@ const ACCEPTED_DEBT: &[(&str, &str)] = &[
          pruning is more work and never a looser bound.",
     ),
     (
+        "bab.branching.candidates",
+        "TWO DIFFERENT FIELDS SHARE THIS ENGLISH NAME. `preset::apply` delivers \
+         `branching.candidates` to `fsb_candidates`, whose only readers are the sequential \
+         selector and the two kFSB lanes — none of which a GenBaB preset runs. The GenBaB \
+         selector truncates its scored list to `nonlinear_split.num_candidates` (default 1) \
+         instead. ml4acopf_2024 asks for 100 here; it now also sets \
+         `nonlinear_split.num_candidates: 100`, the key that reaches the selector. \
+         Reported, NOT silently redirected: guessing that a `candidates:` beside \
+         `method: nonlinear` meant the other key would make a preset mean something other \
+         than it says. Branching is search-only, so this costs proofs and cannot admit a \
+         false one; set `nonlinear_split.num_candidates` to change the budget.",
+    ),
+    (
         "bab.branching.nonlinear_split.filter",
         "GenBaB candidate filtering is unimplemented; branching order and cost only.",
     ),

@@ -8,7 +8,7 @@
 //! `ny_core::Result<T>` can use `?` on calls to diff, quantize, profile,
 //! and sensitivity analysis without manual `.map_err()`.
 //!
-//! Mapping policy (per designs/2026-02-11-nyerror-bridge-plan.md):
+//! Mapping policy:
 //! - Loading/parsing failures → `NyError::ModelLoad`
 //! - Input/config/schema failures → `NyError::InvalidSpec`
 //! - Propagation/internal analysis failures → `NyError::InternalError`
@@ -49,7 +49,7 @@ impl From<DiffError> for NyError {
 /// module-specific error alias). Now that the three error types are unified
 /// into `AnalysisError`, a single impl handles all three.
 ///
-/// With structured payloads (#2295), `LoadError` and `PropagationError` now
+/// With structured payloads, `LoadError` and `PropagationError` now
 /// carry `Box<NyError>` instead of `String`. The bridge recovers the
 /// original `NyError` variant, preserving type fidelity across the
 /// analysis boundary.
@@ -155,7 +155,7 @@ mod tests {
             "PropagationError wrapping InternalError should recover InternalError, got: {e:?}"
         );
 
-        // PropagationError wrapping ShapeMismatch → recovers ShapeMismatch (#2295)
+        // PropagationError wrapping ShapeMismatch → recovers ShapeMismatch
         let e: NyError = AnalysisError::propagation(
             "test",
             NyError::ShapeMismatch {

@@ -71,12 +71,42 @@ pub(crate) fn current_seed() -> u64 {
 /// single explicit re-export.
 #[must_use]
 pub fn set_restart_offset(offset: u64) -> RestartOffsetGuard {
+    // Test harness only: hold the writer/reader serialization lock for the
+    // guard's lifetime, so a non-zero offset can never be observed by a
+    // concurrently-running seed-sensitive test (see
+    // `restart_offset_test_lock`). Production builds compile without the
+    // field — one solve per process, no concurrent test threads.
+    #[cfg(test)]
+    let serial = Some(restart_offset_test_lock());
     RESTART_OFFSET.store(offset, Ordering::Relaxed);
-    RestartOffsetGuard
+    RestartOffsetGuard {
+        #[cfg(test)]
+        _serial: serial,
+    }
+}
+
+/// Test-only serialization between restart-offset WRITERS (the guard above)
+/// and seed-SENSITIVE tests. The offset is process-global: a guard held on
+/// one `--test-threads=4` worker shifts `current_seed()` — and therefore
+/// every SPSA trajectory — on every other worker. Receipted victim:
+/// `proptest_graph_alpha_crown_sequential_dual_alpha_soundness` failed 4-of-6
+/// parallel batteries while `input_split::root_bounds_tests` held offsets
+/// 0/1, with every failing input replaying clean solo (2026-08-30 FC
+/// ledger, "FLAKE ROOT-CAUSED"). Writers hold this lock via the guard;
+/// sensitive tests acquire it for their body. Poisoning is ignored — the
+/// lock protects seed visibility, not data invariants.
+#[cfg(test)]
+pub(crate) fn restart_offset_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// RAII guard that resets the restart offset to 0 when dropped.
-pub struct RestartOffsetGuard;
+pub struct RestartOffsetGuard {
+    #[cfg(test)]
+    _serial: Option<std::sync::MutexGuard<'static, ()>>,
+}
 
 impl Drop for RestartOffsetGuard {
     fn drop(&mut self) {

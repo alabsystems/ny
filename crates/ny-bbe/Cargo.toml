@@ -1,0 +1,32 @@
+[package]
+name = "ny-bbe"
+description = "Untrusted batched bound search (ENGINE_PROGRAM ny-bbe): f32 search that only proposes hints, never certifies"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+# Throughput probes (`fd_cpu_rate_probe`, `fl_cpu_rate_probe`): they print
+# rates and assert nothing about speed, so they are evidence jobs, not
+# correctness tests. They are absent from the default lane rather than
+# `#[ignore]`d in it (TEST_CONFORMANCE.md; `source_policy` forbids ignore),
+# exactly as ny-propagate's `benchmarks` feature gates its wall-clock tests.
+# Run release, under `scripts/ny_box.sh measure`:
+#   targo --unverified test --release --locked --offline -p ny-bbe \
+#     --features benchmarks --lib rate_probe -- --nocapture
+benchmarks = []
+
+# THE CRATE DAG (ENGINE_PROGRAM R2, JE C9): ny-bbe depends on ny-core ONLY.
+# It cannot name ny-propagate (so it cannot name a certified type), and
+# ny-propagate never depends on it (it sees the backend as
+# `&dyn ny_core::search::SearchBackend`, injected by ny-cli). Pinned by
+# `tests/crate_dag_ratchet.rs`; adding a dependency here fails that test.
+[dependencies]
+ny-core = { path = "../ny-core" }

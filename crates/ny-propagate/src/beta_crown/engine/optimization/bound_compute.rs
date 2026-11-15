@@ -76,7 +76,7 @@ impl BetaCrownVerifier {
             )?;
         }
 
-        // Concretize with input bounds (#2239: directed rounding for soundness).
+        // Concretize with input bounds (directed rounding for soundness).
         Ok(lin_bounds.concretize_sound(input))
     }
 
@@ -156,7 +156,7 @@ impl BetaCrownVerifier {
             )?;
         }
 
-        // Concretize with input bounds (#2239: directed rounding for soundness).
+        // Concretize with input bounds (directed rounding for soundness).
         //
         // No post-hoc cut term is added here. The legacy GCP-CROWN "scalar
         // contribution after concretization" fold was deleted: it was never a
@@ -203,7 +203,7 @@ impl BetaCrownVerifier {
 
     /// Inner implementation for beta-CROWN bound computation with intermediate capture.
     ///
-    /// Always uses `concretize_sound()` for directed rounding on f64→f32 (#2239).
+    /// Always uses `concretize_sound()` for directed rounding on f64→f32.
     // Justification: 9 parameters is the minimum for the beta-CROWN backward pass
     // (network, input, history, layer bounds, beta/alpha/cut state, engine).
     #[allow(clippy::too_many_arguments)]
@@ -286,7 +286,7 @@ impl BetaCrownVerifier {
             )?;
         }
 
-        // #2239: Always use directed rounding on f64→f32 for soundness.
+        // Always use directed rounding on f64→f32 for soundness.
         // Matches alpha-beta-CROWN's __double2float_rd/__double2float_ru.
         // (No post-hoc cut term — see `compute_bounds_with_alpha_beta`.)
         let output_bounds = lin_bounds.concretize_sound(input);
@@ -302,7 +302,7 @@ impl BetaCrownVerifier {
     /// Compute output bounds starting from a given layer using parent's intermediate bounds.
     ///
     /// Uses sound directed rounding (`concretize_sound`) for the final f64→f32 cast.
-    /// All concretization in the inner implementation is sound since #2239.
+    /// All concretization in the inner implementation is sound.
     ///
     /// This is the key optimization for intermediate bound transfer: instead of running
     /// a full backward pass from the output layer, we start from `start_layer` using
@@ -483,7 +483,7 @@ impl BetaCrownVerifier {
             )?;
         }
 
-        // #2239: Always use directed rounding on f64→f32 for soundness.
+        // Always use directed rounding on f64→f32 for soundness.
         // (No post-hoc cut term — see `compute_bounds_with_alpha_beta`.)
         let output_bounds = lin_bounds.concretize_sound(input);
 

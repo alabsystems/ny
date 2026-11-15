@@ -6,11 +6,7 @@
 //!
 //! Replaces `HashMap<String, BatchedCrownBounds>` + `input_accumulated: bool`
 //! with O(1) Vec-indexed access using the pre-compiled [`CrownDispatchPlan`].
-//!
-//! Design: `designs/2026-03-21-issue-4258-crown-dispatch-plan-compiled.md` Phase 3.
-//! Part of #4297.
 
-use std::collections::HashMap;
 use std::time::Instant;
 
 use ny_core::{NyError, Result};
@@ -19,7 +15,7 @@ use tracing::error;
 use crate::bounds::patches_batched::BatchedCrownBounds;
 use crate::bounds::BatchedLinearBounds;
 
-use super::dispatch_plan::CrownDispatchPlan;
+use super::dispatch_plan::{CrownDispatchPlan, SharedNameIndex};
 
 /// Vec-backed indexed storage for `BatchedCrownBounds` in the batched CROWN
 /// backward loop.
@@ -31,7 +27,7 @@ use super::dispatch_plan::CrownDispatchPlan;
 /// The `NETWORK_INPUT` sentinel occupies the final slot in `storage`.
 pub(crate) struct BatchedCrownAccumulator {
     storage: Vec<Option<BatchedCrownBounds>>,
-    name_to_idx: HashMap<String, usize>,
+    name_to_idx: SharedNameIndex,
     deadline: Option<Instant>,
 }
 
@@ -141,7 +137,7 @@ impl BatchedCrownAccumulator {
             // First insertion: preserve variant (Patches stays Patches).
             self.storage[idx] = Some(new_bounds);
         } else {
-            // Merge point: convert new to Dense, then safe_add (#3550: checked).
+            // Merge point: convert new to Dense, then safe_add (checked).
             let new_blb = new_bounds.into_batched_dense_checked_with_deadline(
                 "batched_accumulator:accumulate:new",
                 self.deadline,
@@ -243,5 +239,39 @@ mod tests {
         let bounds = BatchedCrownBounds::Dense(BatchedLinearBounds::identity(&[3]).unwrap());
         acc.accumulate(super::super::NETWORK_INPUT, bounds).unwrap();
         assert!(acc.contains_key(super::super::NETWORK_INPUT));
+    }
+}
+
+#[cfg(test)]
+mod sharing_tests {
+    use super::*;
+    use crate::{GraphNetwork, GraphNode, Layer, LinearLayer};
+    #[test]
+    fn batched_accumulators_share_the_original_index_and_route_after_plan_drop() {
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input(
+            "linear",
+            Layer::Linear(LinearLayer::new(ndarray::Array2::eye(2), None).unwrap()),
+        ));
+        graph.set_output("linear");
+        let plan = CrownDispatchPlan::build(&graph).unwrap();
+        let mut first = BatchedCrownAccumulator::new(&plan);
+        let second = BatchedCrownAccumulator::new(&plan);
+        let identity = plan.name_to_idx.owner_identity();
+        assert_eq!(first.name_to_idx.owner_identity(), identity);
+        assert_eq!(second.name_to_idx.owner_identity(), identity);
+        let index = plan.output_node_idx;
+        drop(plan);
+        drop(graph);
+        drop(second);
+        first
+            .accumulate(
+                "linear",
+                BatchedCrownBounds::Dense(BatchedLinearBounds::identity(&[2]).unwrap()),
+            )
+            .unwrap();
+        assert!(first.contains_key("linear"));
+        assert!(first.take_idx(index).is_some());
+        assert!(first.is_empty());
     }
 }

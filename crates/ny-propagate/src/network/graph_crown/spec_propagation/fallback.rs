@@ -6,8 +6,7 @@
 //! CROWN backward propagation.
 //!
 //! Every "stop here and return sound bounds" path lives in this module instead
-//! of mixing with the main coordinator loop. Split from `core.rs` as part of
-//! #3960.
+//! of mixing with the main coordinator loop. Split from `core.rs`.
 
 use crate::batched_domain::CachedLinearBounds;
 use crate::bounds::patches::{
@@ -110,7 +109,13 @@ fn capture_final_linear_bounds(
     retained_extra_bytes: usize,
 ) -> Result<()> {
     if deadline.is_none() {
-        map.insert(node_name.to_string(), bounds.clone());
+        // #warm-cache-err: fold the certified coefficient error over the input
+        // box before publication (the finite branch below does the same);
+        // an unfoldable block is left out of the cache.
+        let mut captured = bounds.clone();
+        if CachedLinearBounds::fold_capture_coeff_err(&mut captured, Some(input_box), None)? {
+            map.insert(node_name.to_string(), captured);
+        }
         return Ok(());
     }
     let budget_bytes = crate::network::crown_memory::cpu_crown_dense_budget_bytes();
@@ -285,6 +290,7 @@ fn cached_linear_bounds_from_map_with_deadline(
         upper_a,
         lower_b,
         upper_b,
+        frontiers: HashMap::new(),
     }))
 }
 
@@ -498,7 +504,7 @@ pub(super) fn empty_graph_fast_path(
 }
 
 /// Truncation early return: finalize when `crown_backward_layers` limit is
-/// reached (#3218).
+/// reached.
 ///
 /// Concretizes the current CROWN frontier to the network input and intersects
 /// with IBP bounds for tightening.
@@ -655,6 +661,7 @@ pub(super) fn finalize_backward_output(
     mut node_crown_bounds: CrownMergeAccumulator,
     mut captured_linear_bounds: Option<HashMap<String, LinearBounds>>,
     mut cache_capture_valid: bool,
+    captured_frontiers: Option<HashMap<String, crate::batched_domain::WarmFrontier>>,
     num_specs: usize,
     deadline: Option<Instant>,
 ) -> SpecCrownResult {
@@ -771,12 +778,12 @@ pub(super) fn finalize_backward_output(
         );
     }
 
-    // Intersect with IBP-applied-spec forward bounds (#3037, same class as #2990).
+    // Intersect with IBP-applied-spec forward bounds.
     // CROWN backward can be strictly looser than IBP for certain weight/input
     // configurations (e.g., negative weight amplifying ReLU lower relaxation error).
     // Reference: alpha-beta-CROWN bound_general.py:1452-1453 does
     // torch.max(crown_lower, ibp_lower), torch.min(crown_upper, ibp_upper).
-    // Shared tighten_crown_output handles NaN-in-forward-bounds and shape mismatch (#3043).
+    // Shared tighten_crown_output handles NaN-in-forward-bounds and shape mismatch.
     let ibp_spec_bounds = graph.propagate_crown_with_specs_fallback_ibp_with_deadline(
         input,
         spec_matrix,
@@ -898,6 +905,13 @@ pub(super) fn finalize_backward_output(
     } else {
         None
     };
+    // #la-warm-frontier: `None` unless the request was armed (byte-identical).
+    let cached_linear_bounds = match (cached_linear_bounds, captured_frontiers) {
+        (Some(cache), Some(frontiers)) if !frontiers.is_empty() => {
+            Some(cache.with_frontiers(frontiers))
+        }
+        (cache, _) => cache,
+    };
 
     Ok((
         CrownBackwardResult {
@@ -909,7 +923,7 @@ pub(super) fn finalize_backward_output(
     ))
 }
 
-/// IBP fallback with structured reason for provenance tracking (#3520 Packet C).
+/// IBP fallback with structured reason for provenance tracking.
 ///
 /// Replaces the old `fallback_to_ibp` by attaching a `CrownIbpFallbackReason`
 /// to the returned `CrownBackwardResult` so callers can distinguish deadline

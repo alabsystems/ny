@@ -1,0 +1,52 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# LEGACY FRONTIER BASELINE — distinct `NY_*` lever NAMES that still have at
+# least one `legacy` (undeclared) executable site in ny_literal_frontier.tsv.
+#
+# Counted by crates/ny-levers/tests/source_frontier.rs. This number may only
+# ever go DOWN. It is not a budget to spend.
+#
+# WHY THIS EXISTS, and why the sibling gates did not already cover it.
+#
+# `reachability_ratchet.rs` pins BASELINE_UNREACHABLE = 0: every
+# Class::VerdictAffecting axis IN THE REGISTRY has typed preset delivery. But it
+# iterates `ny_levers::space::axes()`, so it can only see mechanisms that
+# someone chose to declare. On 2026-08-25 the census
+# (docs/DEAD_MECHANISM_CENSUS_2026-08-25.md) measured what that leaves out:
+#
+#   137 registered names   vs   828 names with a legacy site
+#
+# i.e. the reachability ratchet governs ~11% of the executable lever surface,
+# and 89 of the undeclared names are subsystem MASTER GATES that are dark by
+# default with no preset route at all — among them an entire cGAN verification
+# subsystem (NY_IMB, ~40 knobs) and conflict-clause learning for both BaB lanes.
+#
+# `executable_ny_source_frontier_matches_reviewed_manifests` pins every SITE
+# exactly, which sounds like it covers this — but its remedy is to regenerate
+# the manifest (UPDATE_NY_SOURCE_FRONTIER=1), and a regenerated manifest
+# classifies a brand-new undeclared lever as `legacy` and goes green. That is
+# the blessing path this file closes: the manifest may be regenerated freely,
+# and the count of undeclared lever NAMES still may not rise.
+#
+# NAMES, not sites, deliberately. Sites are already pinned exactly by the
+# manifest test and move under any refactor. The name count is the count of
+# ungoverned MECHANISMS, which is the quantity that should only shrink.
+#
+# HOW TO LOWER IT: declare the lever in ny-levers (LeverDecl + module registry)
+# and route its reader through the chokepoint, which moves its sites from
+# `legacy` to `registered`. Then lower this number in the SAME commit — the
+# `..._is_not_stale` floor test will tell you the exact value.
+#
+# HOW NOT TO LOWER IT: deleting the mechanism is legitimate; reclassifying a
+# real lever as `permanent` to dodge the count is not. `permanent` is reviewed
+# build/test/non-lever surface only.
+#
+# 2026-08-25  828   Landing measurement, taken at 1aa8baccc. 828 distinct names
+#                   carry at least one legacy site across 1972 legacy sites.
+#                   818 of them appear ONLY as legacy; the other 10 are the
+#                   NY_BUILD_* build-stamp names, which are `permanent` at their
+#                   reviewed sites and `legacy` at the rest — migrating those
+#                   remaining sites is a real, countable reduction.
+828

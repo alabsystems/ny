@@ -64,7 +64,7 @@ pub(super) fn patches_dense_materialization_fallback(
 /// to layer `k + 1`. If that next backward step is exact and does not consult the
 /// interval values, a full partial backward pass for layer `k` can be redundant.
 ///
-/// Keep this shortcut deliberately narrow. The #3397 benchmark networks only need
+/// Keep this shortcut deliberately narrow. The benchmark networks it targets only need
 /// ReLU/reshape/flatten/affine hops, and widening it to layers whose forward IBP
 /// is merely sound (not exact) would silently loosen unrelated sequential models.
 pub(super) fn layer_supports_forward_tightening_shortcut(layer: &Layer) -> bool {

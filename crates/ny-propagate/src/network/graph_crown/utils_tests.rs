@@ -56,7 +56,7 @@ fn test_safe_add_dynamic_nan_inputs_map_to_conservative_infinity_2476() {
     assert!(upper.iter().all(|v| !v.is_nan()));
 }
 
-/// #2907: safe_add with mismatched 2D shapes returns conservative bounds
+/// safe_add with mismatched 2D shapes returns conservative bounds
 /// instead of panicking.
 #[test]
 fn test_safe_add_2d_shape_mismatch_returns_conservative_2907() {
@@ -72,7 +72,7 @@ fn test_safe_add_2d_shape_mismatch_returns_conservative_2907() {
     assert!(upper.iter().all(|&v| v == f32::INFINITY));
 }
 
-/// #2907: safe_add with mismatched 1D lengths returns conservative bounds
+/// safe_add with mismatched 1D lengths returns conservative bounds
 /// instead of panicking.
 #[test]
 fn test_safe_add_1d_length_mismatch_returns_conservative_2907() {
@@ -88,7 +88,7 @@ fn test_safe_add_1d_length_mismatch_returns_conservative_2907() {
     assert!(upper.iter().all(|&v| v == f32::INFINITY));
 }
 
-/// #4243: shape-mismatched arrays with the same element count should reshape
+/// Shape-mismatched arrays with the same element count should reshape
 /// instead of widening to conservative infinities.
 #[test]
 fn test_safe_add_same_count_shape_mismatch_reshapes_4243() {
@@ -102,7 +102,7 @@ fn test_safe_add_same_count_shape_mismatch_reshapes_4243() {
     assert_eq!(upper, array![[11.0_f32, 22.0], [33.0, 44.0]]);
 }
 
-/// #2907: safe_add with mismatched dynamic shapes returns conservative bounds
+/// safe_add with mismatched dynamic shapes returns conservative bounds
 /// instead of panicking.
 #[test]
 fn test_safe_add_dynamic_shape_mismatch_returns_conservative_2907() {
@@ -120,7 +120,7 @@ fn test_safe_add_dynamic_shape_mismatch_returns_conservative_2907() {
     assert!(upper.iter().all(|&v| v == f32::INFINITY));
 }
 
-/// #2907: verify_split_path_bias_zero returns Err for non-zero lower bias.
+/// verify_split_path_bias_zero returns Err for non-zero lower bias.
 #[test]
 fn test_verify_split_path_bias_zero_rejects_nonzero_lower_2907() {
     use crate::bounds::LinearBounds;
@@ -138,7 +138,7 @@ fn test_verify_split_path_bias_zero_rejects_nonzero_lower_2907() {
     assert!(result.is_err(), "should reject non-zero lower_b");
 }
 
-/// #2907: verify_split_path_bias_zero returns Err for non-zero upper bias.
+/// verify_split_path_bias_zero returns Err for non-zero upper bias.
 #[test]
 fn test_verify_split_path_bias_zero_rejects_nonzero_upper_2907() {
     use crate::bounds::LinearBounds;
@@ -156,7 +156,7 @@ fn test_verify_split_path_bias_zero_rejects_nonzero_upper_2907() {
     assert!(result.is_err(), "should reject non-zero upper_b");
 }
 
-/// #2907: verify_split_path_bias_zero accepts all-zero biases.
+/// verify_split_path_bias_zero accepts all-zero biases.
 #[test]
 fn test_verify_split_path_bias_zero_accepts_zero_2907() {
     use crate::bounds::LinearBounds;
@@ -174,7 +174,7 @@ fn test_verify_split_path_bias_zero_accepts_zero_2907() {
     assert!(result.is_ok(), "should accept zero biases");
 }
 
-/// #2700: NaN in bias produces error message mentioning "NaN", not "non-zero".
+/// NaN in bias produces error message mentioning "NaN", not "non-zero".
 #[test]
 fn test_verify_split_path_bias_zero_nan_diagnostic_2700() {
     use crate::bounds::LinearBounds;
@@ -197,7 +197,7 @@ fn test_verify_split_path_bias_zero_nan_diagnostic_2700() {
     );
 }
 
-/// #2700: non-zero error includes max absolute value for diagnosis.
+/// Non-zero error includes max absolute value for diagnosis.
 #[test]
 fn test_verify_split_path_bias_zero_includes_max_abs_2700() {
     use crate::bounds::LinearBounds;
@@ -220,7 +220,7 @@ fn test_verify_split_path_bias_zero_includes_max_abs_2700() {
     );
 }
 
-/// #3044: IBP spec fallback preserves finite terms when zero-coefficient
+/// IBP spec fallback preserves finite terms when zero-coefficient
 /// neurons have Inf bounds. Before the fix, `0.0 * Inf = NaN` poisoned
 /// the accumulator, causing the entire row to collapse to `[-Inf, +Inf]`.
 /// With `safe_mul_for_bounds`, `0 * Inf = 0`, so finite terms survive.
@@ -284,7 +284,7 @@ fn test_ibp_spec_fallback_zero_coeff_inf_bound_3044() {
     );
 }
 
-/// #3044: Negative coefficient branch coverage for IBP spec fallback.
+/// Negative coefficient branch coverage for IBP spec fallback.
 /// Prover finding: the c < 0 branch (lines 46-49 in utils.rs) swaps
 /// `input_l`/`input_u` before safe_mul_for_bounds. This test exercises
 /// that swap with a mix of positive, zero, and negative spec coefficients.

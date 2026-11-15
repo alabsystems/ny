@@ -10,4 +10,3 @@ cersyve,onnx/point_mass_pretrain_con.onnx,vnnlib/prop_point_mass.vnnlib,prepared
 cersyve,onnx/point_mass_pretrain_inv.onnx,vnnlib/prop_point_mass.vnnlib,prepared,sat,0.26,l1audit-20260804-d1282d23
 cersyve,onnx/point_mass_finetune_con.onnx,vnnlib/prop_point_mass.vnnlib,prepared,unsat,2.52,l1audit-20260804-d1282d23
 cersyve,onnx/point_mass_finetune_inv.onnx,vnnlib/prop_point_mass.vnnlib,prepared,unsat,56.49,l1audit-20260804-d1282d23
-cersyve,onnx/test_nano.onnx,vnnlib/test_nano.vnnlib,0,unsat,0

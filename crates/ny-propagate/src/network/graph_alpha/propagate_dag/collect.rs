@@ -4,7 +4,7 @@
 
 //! Collection entry point for DAG α-CROWN that exposes `GraphAlphaState`.
 //!
-//! Part of #4036: the root alpha collection path delegates here when the
+//! The root alpha collection path delegates here when the
 //! configured gradient method is not SPSA, so the DAG optimizer's full
 //! gradient dispatch (SPSA, FD, Analytic, AnalyticChain) is used.
 
@@ -16,7 +16,10 @@ use ny_core::{GemmEngine, Result};
 use ny_tensor::BoundedTensor;
 
 use super::init::DagAlphaInitResult;
-use super::{final_alpha_bound_only_enabled, DagAlphaCollectionArtifact, DagAlphaLoopResultUse};
+use super::{
+    final_alpha_bound_only_enabled, DagAlphaCollectionArtifact, DagAlphaLoopResultUse,
+    RootFixedReferenceCollection,
+};
 
 impl GraphNetwork {
     /// α-CROWN for DAG graphs, returning optimized bounds, the
@@ -81,6 +84,79 @@ impl GraphNetwork {
         )
     }
 
+    /// Explicit root policy: the reference was certified by this same graph/input
+    /// call, fixed intermediates are required, and a completed artifact may
+    /// survive a later local deadline. The public crate entry owns admission.
+    pub(in crate::network::graph_alpha) fn propagate_dag_alpha_crown_collect_root_fixed_reference(
+        &self,
+        input: &BoundedTensor,
+        config: &AlphaCrownConfig,
+        engine: Option<&dyn GemmEngine>,
+        reference: crate::network::graph_alpha::PrecomputedAlphaReferenceBounds,
+    ) -> Result<RootFixedReferenceCollection> {
+        let init = match self.init_dag_alpha_state_with_root_reference_policy(
+            input,
+            config,
+            engine,
+            Some(reference),
+            true,
+        )? {
+            DagAlphaInitResult::EarlyReturn {
+                collection_artifact,
+                ..
+            } => {
+                return collection_artifact
+                    .map(RootFixedReferenceCollection::ReferenceOnly)
+                    .ok_or_else(|| {
+                        ny_core::NyError::InternalError(
+                            "root fixed-reference init returned no owned reference".into(),
+                        )
+                    });
+            }
+            DagAlphaInitResult::Ready(state) => *state,
+        };
+        // Adaptive skip is an explicit no-optimizer decision, not a completed
+        // fold. Return the already certified reference without a second fold
+        // or collection, and without fabricating optimizer counters.
+        if config.adaptive_skip && init.relu_nodes.len() > config.adaptive_skip_depth_threshold {
+            let output_name = if self.output_node.is_empty() {
+                init.exec_order.last().ok_or_else(|| {
+                    ny_core::NyError::InvalidSpec(
+                        "root fixed-reference adaptive skip has no output".into(),
+                    )
+                })?
+            } else {
+                &self.output_node
+            };
+            let output_bounds = init.node_bounds.get(output_name).cloned().ok_or_else(|| {
+                ny_core::NyError::InvalidSpec(
+                    "root fixed-reference adaptive skip lost output".into(),
+                )
+            })?;
+            return Ok(RootFixedReferenceCollection::ReferenceOnly(
+                DagAlphaCollectionArtifact {
+                    output_bounds,
+                    alpha_state: init.runtime.into_graph_alpha_state(),
+                    reference_bounds: init.node_bounds,
+                    reference_bounds_source: init.node_bounds_source,
+                    completed_iterations: 0,
+                    optimizer_updates_completed: 0,
+                },
+            ));
+        }
+        self.dag_alpha_optimize_loop(
+            input,
+            config,
+            engine,
+            init,
+            final_alpha_bound_only_enabled(),
+            DagAlphaLoopResultUse::BoundsAndState,
+            true,
+            true,
+        )
+        .map(RootFixedReferenceCollection::Optimized)
+    }
+
     /// Gate-injected collection core. Collection always marks the returned
     /// state as observable; the explicit gate argument exists so regression
     /// tests can prove enabled/disabled collection identity without mutating
@@ -109,6 +185,7 @@ impl GraphNetwork {
             final_bound_only_gate,
             DagAlphaLoopResultUse::BoundsAndState,
             retain_completed_on_deadline,
+            false,
         )
         .map(Some)
     }

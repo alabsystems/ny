@@ -37,13 +37,28 @@ impl BetaCrownVerifier {
         graph_domain_batch_metrics_sink: Option<Arc<dyn GraphDomainBatchMetricsSink>>,
     ) -> Self {
         let mut config = config;
+        // #vit-collector-throughput / #vit-batched-bilinear: deliver the typed
+        // collector-kernel keys (`bab.bilinear_rowpar_kernel`,
+        // `bab.linear_position_stack`, `bab.reciprocal_unbounded_upper`,
+        // `bab.bilinear_gemm_kernel`) to the layer kernels, which sit under
+        // the configuration-free backward dispatcher. STICKY-ON: an unset key
+        // never disarms, and an all-default config (every shipped preset)
+        // touches nothing — see `layers::collector_kernels`.
+        crate::layers::collector_kernels::arm(
+            crate::layers::collector_kernels::CollectorKernelArming {
+                bilinear_rowpar: config.bilinear_rowpar_kernel,
+                linear_pos_stack: config.linear_position_stack,
+                reciprocal_unbounded: config.reciprocal_unbounded_upper,
+                bilinear_gemm: config.bilinear_gemm_kernel,
+            },
+        );
         // `BetaCrownConfig::timeout` is the verifier's concrete engine budget:
         // zero therefore means an immediately expired verifier. The CLI maps
         // its user-facing zero/unbounded sentinel to a representable long
         // engine horizon before construction. Use checked arithmetic so a
         // direct caller's platform-unrepresentable duration cannot panic.
         let now = Instant::now();
-        // CONSEQUENCE WORTH KNOWING (documented 2026-08-17, behavior unchanged):
+        // CONSEQUENCE WORTH KNOWING (historical; the UPDATE below records the fix):
         // this is unconditional, so EVERY engine-driven run carries
         // `alpha_config.deadline == Some(..)`. That silently disables
         // `GradientMethod::AnalyticChain` on the DAG lane, which refuses under
@@ -58,6 +73,16 @@ impl BetaCrownVerifier {
         // The fix is to make the replay cooperative (a private finite sub-budget
         // with all-or-nothing consumption), not to weaken the deadline here — an
         // engine without a deadline is the actual defect.
+        //
+        // UPDATE: both halves are now fixed. #coop-chain-alpha-grad runs the
+        // replay under a private slice (`chain_gradient_budget`; the log line is
+        // `[chain-alpha-grad] armed: slice_ms=...`), and #alpha-envelope-grad-cpu
+        // threads the TYPED `alpha_config.alpha_envelope_grad` into the replay's
+        // CPU chain gradient, which previously resolved env-only, so the preset
+        // key `bab.alpha_crown.alpha_envelope_grad` is now THREADED to this lane.
+        // That is delivery, not arrival: arrival on a scored row is unmeasured
+        // until that row prints the unconditional `[alpha-envelope-grad] cpu=1
+        // ... source=config` line with no NY_* set.
         config.alpha_config.deadline = Some(now.checked_add(config.timeout).unwrap_or(now));
         Self {
             config,
@@ -65,7 +90,15 @@ impl BetaCrownVerifier {
             input_split_metrics_sink,
             graph_domain_batch_metrics_sink,
             joint_margin_closer: None,
+            input_head_continuation: None,
             graph_mip_leaf_oracle: None,
+            // #vit-margin-alpha-complex (P8): attached only by an armed CLI.
+            root_adjudication_oracle: None,
+            // #relusplitter-lp-refine: attached only by an armed CLI.
+            root_interm_refiner: None,
+            // #split-hint: empty until a root publishes its influence vector.
+            // Disarmed (`SPLIT_HINT == false`) nothing ever writes it.
+            root_split_hint: Default::default(),
             disjunctive_restart_root_cache: None,
             // #extract-skeleton increment 3: fresh (empty) per verifier —
             // entries are built lazily by the prep call sites and re-validated
@@ -77,6 +110,10 @@ impl BetaCrownVerifier {
             adaptive_depth_shadow_fired: std::sync::atomic::AtomicBool::new(false),
             kfsb_f64_shadow_fired: std::sync::atomic::AtomicBool::new(false),
             attribution_diag_fired: std::sync::atomic::AtomicBool::new(false),
+            graph_cover: Default::default(),
+            la_warm_frontier_counters: Default::default(),
+            kfsb_single_shot_telemetry: Default::default(),
+            mo_cover: Default::default(),
         }
     }
 
@@ -85,7 +122,7 @@ impl BetaCrownVerifier {
     /// Sets `alpha_config.deadline` from `timeout` so that per-domain beta
     /// optimization loops can bail early when the verification budget is
     /// exhausted. Without this, `past_deadline()` always returns `false`
-    /// and a single BaB batch can exceed the total budget by 2-10x. (#3109)
+    /// and a single BaB batch can exceed the total budget by 2-10x.
     pub fn new(config: BetaCrownConfig) -> Self {
         Self::new_with_resources(config, None, None, None)
     }
@@ -115,7 +152,7 @@ impl BetaCrownVerifier {
     /// Create a new β-CROWN verifier with a different config but reusing
     /// the engine from an existing verifier. This ensures sub-verifiers
     /// (per-constraint, reduced, bounds precomputation) inherit GPU
-    /// acceleration without per-call engine threading (#3627).
+    /// acceleration without per-call engine threading.
     pub fn with_config_from(&self, config: BetaCrownConfig) -> Self {
         let mut v = Self::new_with_resources(
             config,
@@ -124,8 +161,15 @@ impl BetaCrownVerifier {
             self.graph_domain_batch_metrics_sink_arc(),
         );
         v.joint_margin_closer = self.joint_margin_closer.clone();
+        v.input_head_continuation = self.input_head_continuation.clone();
         v.graph_mip_leaf_oracle = self.graph_mip_leaf_oracle.clone();
+        v.root_adjudication_oracle = self.root_adjudication_oracle.clone();
+        v.root_interm_refiner = self.root_interm_refiner.clone();
         v.disjunctive_restart_root_cache = self.disjunctive_restart_root_cache.clone();
+        // #la-warm-frontier: one lane, one set of counters.
+        v.la_warm_frontier_counters = Arc::clone(&self.la_warm_frontier_counters);
+        // #kfsb-production: one lane, one line budget, one fan-out lease.
+        v.kfsb_single_shot_telemetry = Arc::clone(&self.kfsb_single_shot_telemetry);
         v
     }
 
@@ -219,6 +263,55 @@ impl BetaCrownVerifier {
         self.graph_mip_leaf_oracle.as_deref()
     }
 
+    /// Attach the independent-forward oracle (#vit-margin-alpha-complex, P8)
+    /// the default-off containment fence uses to adjudicate a ROOT-terminal
+    /// multi-objective `Verified` (see
+    /// [`RootAdjudicationOracle`](crate::beta_crown::root_adjudication::RootAdjudicationOracle)).
+    /// Consulted only when BOTH `mo_containment_fence` and
+    /// `mo_root_ort_adjudication` are armed; it can only downgrade a verdict.
+    /// Runtime-only; `None` (never attached) is byte-for-byte inert. Preserved
+    /// across `with_config_from`.
+    #[must_use]
+    pub fn with_root_adjudication_oracle(
+        mut self,
+        oracle: Arc<dyn crate::beta_crown::root_adjudication::RootAdjudicationOracle>,
+    ) -> Self {
+        self.root_adjudication_oracle = Some(oracle);
+        self
+    }
+
+    /// The attached root-adjudication oracle, if any (see
+    /// [`with_root_adjudication_oracle`](Self::with_root_adjudication_oracle)).
+    pub(crate) fn root_adjudication_oracle(
+        &self,
+    ) -> Option<&dyn crate::beta_crown::root_adjudication::RootAdjudicationOracle> {
+        self.root_adjudication_oracle.as_deref()
+    }
+
+    /// Attach the ROOT intermediate-bound refiner (#relusplitter-lp-refine,
+    /// wave-6 C7; see
+    /// [`RootIntermRefiner`](crate::beta_crown::root_interm_refine::RootIntermRefiner)).
+    /// The multi-objective graph root consults it once, after the bootstrap,
+    /// and intersects its certified candidates shrink-only into the stored
+    /// node boxes. Runtime-only; `None` (never attached) is byte-for-byte
+    /// inert. Preserved across `with_config_from`.
+    #[must_use]
+    pub fn with_root_interm_refiner(
+        mut self,
+        refiner: Arc<dyn crate::beta_crown::root_interm_refine::RootIntermRefiner>,
+    ) -> Self {
+        self.root_interm_refiner = Some(refiner);
+        self
+    }
+
+    /// The attached root intermediate-bound refiner, if any (see
+    /// [`with_root_interm_refiner`](Self::with_root_interm_refiner)).
+    pub(crate) fn root_interm_refiner(
+        &self,
+    ) -> Option<&dyn crate::beta_crown::root_interm_refine::RootIntermRefiner> {
+        self.root_interm_refiner.as_deref()
+    }
+
     /// Attach a per-domain joint-margin closer for same-LHS conjunctive
     /// (max-diff) input-split BaB (acasxu prop_2/3/4). The closer certifies a
     /// tighter JOINT lower bound than CROWN's single-conjunct MaxPool relaxation
@@ -229,6 +322,24 @@ impl BetaCrownVerifier {
     pub fn with_joint_margin_closer(mut self, closer: Arc<super::JointMarginCloser>) -> Self {
         self.joint_margin_closer = Some(closer);
         self
+    }
+
+    /// Attach the concrete original singleton continuation. Numerical source
+    /// binding is checked by the consuming input-split route; generic leaves
+    /// do not become original-instance evidence merely through this API.
+    #[must_use]
+    pub fn with_input_head_continuation(
+        mut self,
+        continuation: Arc<crate::margin_row::InputHeadContinuation>,
+    ) -> Self {
+        self.input_head_continuation = Some(continuation);
+        self
+    }
+
+    pub(crate) fn input_head_continuation(
+        &self,
+    ) -> Option<&crate::margin_row::InputHeadContinuation> {
+        self.input_head_continuation.as_deref()
     }
 
     pub(crate) fn joint_margin_closer(&self) -> Option<&super::JointMarginCloser> {
@@ -285,6 +396,14 @@ impl BetaCrownVerifier {
                 .alpha_config
                 .forward_linear_deadline_fallback_to_ibp,
         );
+        // #vit-zono-root (DARK, typed `bab.vit_zono_root`): STICKY-ON stamp of
+        // the certified forward-zonotope root-map plan. An unarmed config never
+        // clears a plan the CLI stamped (a sub-verifier built from a partial
+        // config cannot turn the lane dark mid-run), and an unarmed config on
+        // an unstamped graph (every shipped preset) touches nothing.
+        if let Some(plan) = crate::zono_core::vit_zono_root_plan(&self.config) {
+            configured.set_vit_zono_root_plan(Some(plan));
+        }
         // Carry the source's certified forward-linear reference map into the
         // clone (#w5-bab-throughput): `Clone` resets it and `set_use_patches_mode`
         // invalidates it, so every verify entry repaid the full O(L) certified
@@ -316,7 +435,7 @@ impl BetaCrownVerifier {
     /// linear layer CROWN backward passes.
     ///
     /// `deadline`: If `Some`, the BaB engine derives its phase budgets from
-    /// remaining wall-clock time instead of `self.config.timeout` (#4321).
+    /// remaining wall-clock time instead of `self.config.timeout`.
     pub fn verify_with_engine(
         &self,
         network: &Network,
@@ -365,6 +484,42 @@ impl BetaCrownVerifier {
         engine: Option<&dyn GemmEngine>,
         deadline: Option<Instant>,
     ) -> Result<BetaCrownResult> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BabLoop);
+        let mut result = self.verify_impl_inner(network, input, threshold, engine, deadline)?;
+        if matches!(result.result, BabVerificationStatus::Verified) {
+            if let Some(source) = self.input_head_continuation() {
+                if source.dependent_use() {
+                    let lo = input.lower().iter().copied().collect::<Vec<_>>();
+                    let hi = input.upper().iter().copied().collect::<Vec<_>>();
+                    let bound_deadline = deadline
+                        .or(self.config.alpha_config.deadline)
+                        .unwrap_or_else(Instant::now);
+                    if threshold != 0.0
+                        || self.config.verify_upper_bound
+                        || !source.matches_scalar_network(network)
+                        || !source.root_box_matches(&lo, &hi)
+                        || !source.has_complete_source_cover(bound_deadline)
+                    {
+                        result.result = BabVerificationStatus::Unknown {
+                            reason: "source-dependent singleton search lacks a complete original input-box cover".into(),
+                        };
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    fn verify_impl_inner(
+        &self,
+        network: &Network,
+        input: &BoundedTensor,
+        threshold: f32,
+        engine: Option<&dyn GemmEngine>,
+        deadline: Option<Instant>,
+    ) -> Result<BetaCrownResult> {
+        network.ensure_proof_eligible()?;
         self.config.validate()?;
         note_global_timeout_engine_invocation();
         // Disable the L2/Cauchy–Schwarz lever for the entire beta-CROWN verify
@@ -401,6 +556,97 @@ impl BetaCrownVerifier {
                 ))
             })?),
         };
+        // #lowdim-prover (typed opt-in `bab.branching.input_split.lowdim_prover`):
+        // this lane proves `network(x)[0] > threshold` (or `< threshold` in
+        // upper-bound mode — the lane proves that as `lower(-y0) > -threshold`,
+        // an exact negation). On a small-input network, try the sound
+        // forward-linear lane first on a Graph copy of the network with half of
+        // the budget. Only a proof returns early; Unproved/Declined continue
+        // into this lane unchanged. A single-constraint spec arrives here in
+        // upper-bound mode (verify_standard), which an earlier `!upper` gate
+        // skipped SILENTLY — measured as a VOID tll probe.
+        let lowdim_input_split = matches!(
+            self.config.branching_heuristic,
+            crate::beta_crown::branching::BranchingHeuristic::InputSplit
+        );
+        if self.config.input_split_lowdim_prover {
+            // The lever's own observable: armed, which entry, and every gate.
+            eprintln!(
+                "[lowdim] armed=1 entry=sequential input_split={} upper={}",
+                u8::from(lowdim_input_split),
+                u8::from(self.config.verify_upper_bound)
+            );
+        }
+        if self.config.input_split_lowdim_prover && lowdim_input_split {
+            let mut candidate: Option<Vec<f64>> = None;
+            let outcome = match GraphNetwork::from_sequential(network) {
+                Ok(graph) => {
+                    let end = crown_deadline.unwrap_or(start_time + self.config.timeout);
+                    let lane_deadline = start_time
+                        + end
+                            .saturating_duration_since(start_time)
+                            .mul_f32(self.config.lowdim_prover_share());
+                    crate::lowdim::prove_first_output_witnessed(
+                        &graph,
+                        input,
+                        threshold,
+                        self.config.verify_upper_bound,
+                        lane_deadline,
+                        &self.config.lowdim_config(),
+                        &mut candidate,
+                    )
+                }
+                Err(e) => {
+                    crate::lowdim::LowDimOutcome::Declined(format!("from_sequential failed: {e}"))
+                }
+            };
+            crate::lowdim::emit_line(0, &outcome);
+            if let crate::lowdim::LowDimOutcome::Verified(stats) = outcome {
+                return Ok(BetaCrownResult {
+                    result: BabVerificationStatus::Verified,
+                    domains_explored: usize::try_from(stats.domains).unwrap_or(usize::MAX),
+                    time_elapsed: start_time.elapsed(),
+                    max_depth_reached: stats.max_depth as usize,
+                    output_bounds: None,
+                    cuts_generated: 0,
+                    domains_verified: usize::try_from(stats.closed).unwrap_or(usize::MAX),
+                });
+            }
+            // A Candidate stop hands back the leaf centre the lane's f64
+            // lowering scored as violating. Re-evaluate it on THIS network's
+            // own f32 concrete forward; only a point that violates there is
+            // carried out, as a PotentialViolation witness, so the post-BaB
+            // confirmer re-checks it against the full VNN-LIB property and the
+            // trusted ONNX-Runtime gate still decides any scored `sat`. A point
+            // that does not re-verify is dropped and the lane below runs
+            // exactly as before.
+            if let (crate::lowdim::LowDimOutcome::Unproved(stats, _), Some(point)) =
+                (&outcome, candidate)
+            {
+                if let Some(witness) = lowdim_candidate_witness(
+                    network,
+                    input,
+                    &point,
+                    threshold,
+                    self.config.verify_upper_bound,
+                ) {
+                    eprintln!(
+                        "[lowdim] witness=confirmed output0={:e} threshold={threshold:e}",
+                        witness.output[0]
+                    );
+                    return Ok(BetaCrownResult {
+                        result: BabVerificationStatus::potential_violation_with(witness),
+                        domains_explored: usize::try_from(stats.domains).unwrap_or(usize::MAX),
+                        time_elapsed: start_time.elapsed(),
+                        max_depth_reached: stats.max_depth as usize,
+                        output_bounds: None,
+                        cuts_generated: 0,
+                        domains_verified: usize::try_from(stats.closed).unwrap_or(usize::MAX),
+                    });
+                }
+                eprintln!("[lowdim] witness=rejected (f32 concrete forward does not violate)");
+            }
+        }
         let mut cut_gate = CutGateState::new(&self.config);
         let mut state = BabLoopState::new(self.config.enable_cuts);
         // Conflict-clause learning (win-plan arc C, v1): per-run store, gated
@@ -819,6 +1065,51 @@ impl BetaCrownVerifier {
     }
 }
 
+/// Round a #lowdim-prover candidate (f64 input coordinates) into the f32 input
+/// box and keep it only if THIS network's own concrete f32 forward violates the
+/// sequential contract there (`output[0] <= threshold`, or `>= threshold` in
+/// upper-bound mode). Rounding then clamping keeps the point inside the box.
+/// `None` means the candidate did not survive; it never means the property holds.
+fn lowdim_candidate_witness(
+    network: &Network,
+    input: &BoundedTensor,
+    point: &[f64],
+    threshold: f32,
+    upper: bool,
+) -> Option<crate::beta_crown::result::ViolationWitness> {
+    let (lo, hi) = (input.lower(), input.upper());
+    if point.len() != lo.len() {
+        return None;
+    }
+    let x: Vec<f32> = point
+        .iter()
+        .zip(lo.iter().zip(hi.iter()))
+        .map(|(&p, (&l, &h))| (p as f32).clamp(l, h))
+        .collect();
+    if x.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let arr = ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(input.shape()), x.clone()).ok()?;
+    let out = network
+        .propagate_concrete_point(&BoundedTensor::concrete(arr).ok()?, None)
+        .ok()?
+        .center();
+    let y0 = *out.iter().next()?;
+    // The same margin the lane's candidate test uses: a boundary point is
+    // not carried (ONNX Runtime may evaluate it on the other side).
+    let margin = crate::lowdim::candidate_margin(f64::from(threshold));
+    let violates = if upper {
+        f64::from(y0) >= f64::from(threshold) + margin
+    } else {
+        f64::from(y0) <= f64::from(threshold) - margin
+    };
+    violates.then(|| crate::beta_crown::result::ViolationWitness {
+        input: x,
+        input_shape: input.shape().to_vec(),
+        output: out.iter().copied().collect(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -883,6 +1174,60 @@ mod tests {
         assert!(deadline >= before);
         assert!(deadline <= after);
         assert!(verifier.past_effective_graph_bab_deadline());
+    }
+
+    fn identity_1d() -> (Network, BoundedTensor) {
+        let linear = crate::LinearLayer::new(ndarray::arr2(&[[1.0_f32]]), None).expect("linear");
+        let mut network = Network::new();
+        network.add_layer(crate::Layer::Linear(linear));
+        let input = BoundedTensor::new(arr1(&[0.0_f32]).into_dyn(), arr1(&[1.0_f32]).into_dyn())
+            .expect("valid input");
+        (network, input)
+    }
+
+    /// The #lowdim-prover candidate is carried out only when the network's own
+    /// f32 forward violates at the (box-clamped) point, in the right direction
+    /// for the mode.
+    #[test]
+    fn lowdim_candidate_witness_is_kept_only_when_the_real_forward_violates() {
+        let (net, input) = identity_1d();
+        let w = lowdim_candidate_witness(&net, &input, &[0.25], 0.5, false).expect("0.25 <= 0.5");
+        assert_eq!(w.input, vec![0.25]);
+        assert!(w.output[0] <= 0.5);
+        assert!(lowdim_candidate_witness(&net, &input, &[0.75], 0.5, false).is_none());
+        // upper mode: a violation is y0 >= t
+        assert!(lowdim_candidate_witness(&net, &input, &[0.75], 0.5, true).is_some());
+        assert!(lowdim_candidate_witness(&net, &input, &[0.25], 0.5, true).is_none());
+        // out-of-box coordinates are clamped INTO the box before evaluation
+        let w = lowdim_candidate_witness(&net, &input, &[-3.0], 0.5, false).expect("clamps to 0");
+        assert_eq!(w.input, vec![0.0]);
+        assert!(lowdim_candidate_witness(&net, &input, &[2.0], 0.5, false).is_none());
+        // a point of the wrong dimension is refused, never padded
+        assert!(lowdim_candidate_witness(&net, &input, &[0.1, 0.1], 0.5, false).is_none());
+    }
+
+    /// End to end through `verify`: armed, the lane proves a true margin and
+    /// hands a violated one to the confirmer as a CARRIED witness, never as a
+    /// verdict.
+    #[test]
+    fn armed_lowdim_lane_proves_a_true_margin_and_carries_a_witness_for_a_false_one() {
+        let (net, input) = identity_1d();
+        let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+            timeout: Duration::from_secs(30),
+            branching_heuristic: crate::beta_crown::branching::BranchingHeuristic::InputSplit,
+            input_split_lowdim_prover: true,
+            ..Default::default()
+        });
+        let proved = verifier.verify(&net, &input, -0.5).expect("runs");
+        assert_eq!(proved.result, BabVerificationStatus::Verified);
+        let found = verifier.verify(&net, &input, 0.5).expect("runs");
+        let witness = found
+            .result
+            .potential_violation_witness()
+            .unwrap_or_else(|| panic!("expected a carried witness, got {:?}", found.result));
+        assert_eq!(witness.input.len(), 1);
+        assert!((0.0..=0.5).contains(&witness.input[0]), "{witness:?}");
+        assert!(witness.output[0] <= 0.5, "{witness:?}");
     }
 
     #[test]

@@ -82,8 +82,6 @@ pub(crate) fn record_best_margin_candidate_exploit(margin: f32, point: &ArrayD<f
     record_slot(1, margin, point);
 }
 
-/// Take (and clear) the candidates recorded since the last reset, best margin
-/// first, deduplicated (identical points collapse to one).
 pub(crate) fn take_best_margin_candidates() -> Vec<BestMarginCandidate> {
     let mut slots = lock();
     let mut out: Vec<BestMarginCandidate> = slots.iter_mut().filter_map(Option::take).collect();

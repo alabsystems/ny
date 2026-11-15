@@ -5,7 +5,7 @@
 //! Non-delegating CROWN methods for GraphNetwork.
 //!
 //! Delegation methods (that imported from sibling `graph_crown`) moved to
-//! `network/dispatch/graph_crown.rs` (#2380). This file retains only methods
+//! `network/dispatch/graph_crown.rs`. This file retains only methods
 //! that are self-contained (no sibling imports).
 
 use std::borrow::Cow;
@@ -40,16 +40,17 @@ impl GraphNetwork {
         self.propagate_crown_per_position_with_engine(input, None)
     }
 
-    /// Engine-aware variant of `propagate_crown_per_position` (#3772).
+    /// Engine-aware variant of `propagate_crown_per_position`.
     pub fn propagate_crown_per_position_with_engine(
         &self,
         input: &BoundedTensor,
         engine: Option<&dyn GemmEngine>,
     ) -> Result<BoundedTensor> {
+        self.ensure_proof_eligible()?;
         let shape = input.shape();
         let ndim = shape.len();
 
-        // Guard: scalar input (ndim==0) would underflow shape[ndim-1] indexing (#2690).
+        // Guard: scalar input (ndim==0) would underflow shape[ndim-1] indexing.
         if ndim == 0 {
             return Err(NyError::InvalidSpec(
                 "propagate_crown_per_position: scalar input (ndim=0) is not supported".into(),
@@ -71,7 +72,7 @@ impl GraphNetwork {
             ))
         })?;
 
-        // Guard: zero-batch input would panic at flat_lower.row(0) (#2690).
+        // Guard: zero-batch input would panic at flat_lower.row(0).
         if num_positions == 0 {
             return Err(NyError::InvalidSpec(format!(
                 "propagate_crown_per_position: zero-batch input (shape={shape:?}, \
@@ -202,12 +203,10 @@ impl GraphNetwork {
     /// which attempts decomposed LayerNorm/RmsNorm backward inside each block
     /// before falling back to interval-derived bias-only bounds.
     ///
-    /// This path is primarily for #318-style transformer experiments. Current
+    /// This path is primarily for transformer experiments. Current
     /// measurements show that forward-mode LayerNorm decomposition behaves like
     /// Cut plus forward-mode IBP, and the fully sound decomposition can still be
     /// looser than fused LayerNorm IBP when normalization dominates block width.
-    ///
-    /// Part of #318.
     pub fn propagate_crown_within_graph_per_position(
         &self,
         input: &BoundedTensor,
@@ -215,7 +214,7 @@ impl GraphNetwork {
         self.propagate_crown_within_graph_per_position_with_engine(input, None)
     }
 
-    /// Engine-aware variant of `propagate_crown_within_graph_per_position` (#3772).
+    /// Engine-aware variant of `propagate_crown_within_graph_per_position`.
     pub fn propagate_crown_within_graph_per_position_with_engine(
         &self,
         input: &BoundedTensor,
@@ -231,7 +230,7 @@ impl GraphNetwork {
     /// Same as `propagate_crown_within_graph_per_position` but returns per-site
     /// `LayerNormValidationStats` with `fallback_rows`/`total_rows` summed across
     /// all positions for LayerNorm/RmsNorm/InstanceNorm1d sites. Sorted by
-    /// `node_name` for deterministic output. Part of #318, #3892.
+    /// `node_name` for deterministic output.
     pub fn propagate_crown_within_graph_per_position_with_stats(
         &self,
         input: &BoundedTensor,
@@ -239,12 +238,13 @@ impl GraphNetwork {
         self.propagate_crown_within_graph_per_position_with_stats_and_engine(input, None)
     }
 
-    /// Engine-aware variant of `propagate_crown_within_graph_per_position_with_stats` (#3772).
+    /// Engine-aware variant of `propagate_crown_within_graph_per_position_with_stats`.
     pub fn propagate_crown_within_graph_per_position_with_stats_and_engine(
         &self,
         input: &BoundedTensor,
         engine: Option<&dyn GemmEngine>,
     ) -> Result<(BoundedTensor, Vec<LayerNormValidationStats>)> {
+        self.ensure_proof_eligible()?;
         use std::collections::HashMap;
 
         let shape = input.shape();

@@ -11,13 +11,13 @@ use super::{
 };
 use crate::layers::activations::LinearRelaxation;
 use crate::layers::BoundPropagation;
-use crate::{BatchedLinearBounds, LinearBounds};
+use crate::{BatchedLinearBounds, Layer, LinearBounds};
 use ndarray::{array, Array2, ArrayD, IxDyn};
 use ny_core::NyError;
 use ny_tensor::BoundedTensor;
 use proptest::prelude::*;
 
-/// Independent f64 sqrt reference for strict proptest. (#3292)
+/// Independent f64 sqrt reference for strict proptest.
 fn sqrt_f64_reference(x: f64) -> f64 {
     x.sqrt()
 }
@@ -203,7 +203,7 @@ fn sqrt_relaxation_all_negative_interval() {
 #[ntest::timeout(5000)]
 #[test]
 fn sqrt_relaxation_accepts_negative_pre_activation() {
-    // #4113: ensure_nonnegative_bounds now returns Ok(()) for negative lower
+    // ensure_nonnegative_bounds now returns Ok(()) for negative lower
     // bounds because the linear relaxation clamps l to max(l, 0) (line 143 in
     // sqrt.rs) and adjusts the upper intercept (lines 200-206). This preserves
     // CROWN tightness instead of falling back to IBP.
@@ -473,7 +473,11 @@ fn test_add_constant_crown_backward_multi_output() {
     // 2D CROWN: A = [[1, 0], [0, 1]], y = x + [c1, c2]
     let layer = AddConstantLayer::new(array![1.0, -2.0].into_dyn());
     let bounds = LinearBounds::identity(2);
-    let result = layer.propagate_linear(&bounds).unwrap();
+    let pre_activation =
+        BoundedTensor::new(ArrayD::zeros(IxDyn(&[2])), ArrayD::zeros(IxDyn(&[2]))).unwrap();
+    let result = layer
+        .propagate_crown_backward(&bounds, Some(&pre_activation))
+        .unwrap();
     assert_close(
         result.lower_b[0],
         1.0,
@@ -507,7 +511,11 @@ fn test_add_constant_crown_backward_non_identity_a() {
     let layer = AddConstantLayer::new(array![3.0, 5.0].into_dyn());
     let a = Array2::from_shape_vec((1, 2), vec![2.0, -1.0]).unwrap();
     let bounds = LinearBounds::new(a.clone(), array![0.0], a, array![0.0]).unwrap();
-    let result = layer.propagate_linear(&bounds).unwrap();
+    let pre_activation =
+        BoundedTensor::new(ArrayD::zeros(IxDyn(&[2])), ArrayD::zeros(IxDyn(&[2]))).unwrap();
+    let result = layer
+        .propagate_crown_backward(&bounds, Some(&pre_activation))
+        .unwrap();
     // Expected bias: 0 + (2*3 + (-1)*5) = 1
     assert_close(
         result.lower_b[0],
@@ -547,18 +555,175 @@ fn test_add_constant_batched_crown() {
 
 #[test]
 fn test_add_constant_batched_crown_handles_vector_constant() {
-    // Batched CROWN supports vector constants via flatten_constant_to_in_dim.
+    // Batched CROWN supports vector constants via
+    // `batched_constant_along_last_axis`, which admits a constant only when it
+    // varies along the LAST axis — here `[2]` against a `[2]` operand, i.e. the
+    // elementwise case.
     // For c = [1.0, 2.0] with identity A and zero b:
     // new_bias = A @ c + b = [1.0, 2.0]
     let layer = AddConstantLayer::new(array![1.0, 2.0].into_dyn());
     let bounds = BatchedLinearBounds::identity(&[2]).unwrap();
-    let result = layer
-        .propagate_linear_batched(&bounds)
+    let pre_activation =
+        BoundedTensor::new(ArrayD::zeros(IxDyn(&[2])), ArrayD::zeros(IxDyn(&[2]))).unwrap();
+    let result = Layer::AddConstant(layer)
+        .propagate_crown_backward_batched(&bounds, Some(&pre_activation), None)
         .expect("batched CROWN should handle vector AddConstant");
     assert_close(result.lower_b[[0]], 1.0, 1e-4, "batched add lower_b[0]");
     assert_close(result.lower_b[[1]], 2.0, 1e-4, "batched add lower_b[1]");
     assert_close(result.upper_b[[0]], 1.0, 1e-4, "batched add upper_b[0]");
     assert_close(result.upper_b[[1]], 2.0, 1e-4, "batched add upper_b[1]");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// AddConstant broadcast-AXIS agreement (soundness).
+//
+// `propagate_concrete_point` (network/graph_ibp.rs) evaluates the graph by
+// running IBP on a degenerate box, so `AddConstantLayer::propagate_ibp` IS
+// ny's reference for what an Add-with-constant node computes. CROWN backward
+// used to tile a short constant as `c[i % const_len]` — an unchecked LAST-AXIS
+// assumption — while a per-channel constant varies along the SLOWEST axis
+// (`c[i / (H*W)]`). The two paths therefore certified DIFFERENT FUNCTIONS, and
+// nothing made the mis-placed bias conservative. These tests pin the agreement
+// and the fail-closed refusals; every one of them fails on the tiling code.
+// ═══════════════════════════════════════════════════════════════════════
+
+/// `[C,1,1]` over a `[C,H,W]` operand — an ONNX-legal per-channel bias.
+/// Returns the layer, an input box `[0,1]^{2,3,3}`, and the ONNX-correct flat
+/// constant `[c0 ×9, c1 ×9]`.
+fn channel_bias_case() -> (AddConstantLayer, BoundedTensor, Vec<f32>) {
+    let constant = ArrayD::from_shape_vec(IxDyn(&[2, 1, 1]), vec![10.0_f32, 20.0]).unwrap();
+    let layer = AddConstantLayer::new(constant);
+    let input = BoundedTensor::new(
+        ArrayD::zeros(IxDyn(&[2, 3, 3])),
+        ArrayD::ones(IxDyn(&[2, 3, 3])),
+    )
+    .unwrap();
+    let onnx: Vec<f32> = (0..18).map(|i| if i < 9 { 10.0 } else { 20.0 }).collect();
+    (layer, input, onnx)
+}
+
+#[test]
+fn add_constant_ibp_channel_bias_follows_onnx_broadcasting() {
+    // Right-aligning [2,1,1] against [2,3,3] pairs axis 0 with axis 0, so the
+    // constant varies along the SLOWEST axis. This is the ONNX answer, and it
+    // is the answer `propagate_concrete_point` gives for the real network.
+    let (layer, input, onnx) = channel_bias_case();
+    let ibp = layer
+        .propagate_ibp(&input)
+        .expect("channel bias broadcasts");
+    let got: Vec<f32> = ibp.lower().iter().copied().collect();
+    for (i, want) in onnx.iter().enumerate() {
+        assert_close(got[i], *want, 1e-6, format!("ibp lower[{i}]"));
+    }
+}
+
+#[test]
+fn add_constant_crown_backward_channel_bias_agrees_with_ibp_and_encloses_it() {
+    let (layer, input, onnx) = channel_bias_case();
+    let ibp = layer
+        .propagate_ibp(&input)
+        .expect("channel bias broadcasts");
+
+    let crown = layer
+        .propagate_crown_backward(&LinearBounds::identity(18), Some(&input))
+        .expect("a per-channel bias is an ordinary elementwise Add");
+
+    // A = I and b = 0, so the new bias IS the broadcast constant.
+    for (i, want) in onnx.iter().enumerate() {
+        assert_close(crown.lower_b[i], *want, 1e-4, format!("crown lower_b[{i}]"));
+        assert_close(crown.upper_b[i], *want, 1e-4, format!("crown upper_b[{i}]"));
+    }
+
+    // The certificate must ENCLOSE what the network computes. The old tiling put
+    // c1 = 20 at flat position 1, whose true range is [10, 11]: the certified
+    // lower bound EXCLUDED the true value — a false proof, not a loose bound.
+    let concrete = crown.concretize(&input);
+    let cl: Vec<f32> = concrete.lower().iter().copied().collect();
+    let cu: Vec<f32> = concrete.upper().iter().copied().collect();
+    let il: Vec<f32> = ibp.lower().iter().copied().collect();
+    let iu: Vec<f32> = ibp.upper().iter().copied().collect();
+    for i in 0..18 {
+        assert!(
+            cl[i] <= il[i] + 1e-4,
+            "CROWN lower {} excludes the true lower {} at flat index {i}",
+            cl[i],
+            il[i]
+        );
+        assert!(
+            cu[i] >= iu[i] - 1e-4,
+            "CROWN upper {} excludes the true upper {} at flat index {i}",
+            cu[i],
+            iu[i]
+        );
+    }
+}
+
+#[test]
+fn add_constant_crown_backward_matches_the_rank1_cnn_bias_reading() {
+    // A rank-1 `[C]` constant on a rank-3 `[C,H,W]` operand is read as a CHANNEL
+    // bias (`effective_constant_shape`) — the same reading `propagate_ibp`,
+    // `propagate_concrete_point` and `one_axis_phase.rs::add_constant_tensor`
+    // use, and a deliberate departure from strict ONNX right-alignment. CROWN
+    // must MIRROR the forward reference, not out-vote it with a last-axis guess.
+    let layer = AddConstantLayer::new(array![10.0_f32, 20.0].into_dyn());
+    let input = BoundedTensor::new(
+        ArrayD::zeros(IxDyn(&[2, 3, 3])),
+        ArrayD::ones(IxDyn(&[2, 3, 3])),
+    )
+    .unwrap();
+    let ibp: Vec<f32> = layer
+        .propagate_ibp(&input)
+        .expect("cnn bias broadcasts")
+        .lower()
+        .iter()
+        .copied()
+        .collect();
+
+    let crown = layer
+        .propagate_crown_backward(&LinearBounds::identity(18), Some(&input))
+        .expect("the operand shape resolves the CNN-bias reading");
+    for i in 0..18 {
+        assert_close(
+            crown.lower_b[i],
+            ibp[i],
+            1e-4,
+            format!("cnn-bias crown lower_b[{i}]"),
+        );
+    }
+}
+
+#[test]
+fn add_constant_crown_backward_without_a_shape_refuses_an_ambiguous_rank1_constant() {
+    // With no operand shape, `[2]` against 18 output positions is ambiguous
+    // between the channel reading (`c[i / 9]`) and the last-axis reading
+    // (`c[i % 2]`). Guessing is what produced the wrong-function certificate.
+    let layer = AddConstantLayer::new(array![10.0_f32, 20.0].into_dyn());
+    let err = layer
+        .propagate_linear(&LinearBounds::identity(18))
+        .expect_err("an ambiguous broadcast axis must fail closed, not be guessed");
+    assert!(
+        matches!(err, NyError::UnsupportedOp(_)),
+        "refusal must be UnsupportedOp so callers degrade to IBP, got {err:?}"
+    );
+}
+
+#[test]
+fn add_constant_batched_crown_refuses_a_leading_axis_constant() {
+    // The batched substitution folds ONE shared column vector into every
+    // position's bias, so it can only represent a constant that varies along the
+    // LAST axis. `[2,1,1]` over `[2,3,2]` varies along axis 0, yet the old code
+    // accepted it because `const_len == in_dim` and applied it to the wrong
+    // axis. Refusing routes the node to the partial-CROWN / IBP fallback.
+    let constant = ArrayD::from_shape_vec(IxDyn(&[2, 1, 1]), vec![10.0_f32, 20.0]).unwrap();
+    let layer = AddConstantLayer::new(constant);
+    let bounds = BatchedLinearBounds::identity(&[2, 3, 2]).unwrap();
+    let err = layer
+        .propagate_linear_batched(&bounds)
+        .expect_err("a leading-axis constant must fail closed in the batched path");
+    assert!(
+        matches!(err, NyError::UnsupportedOp(_)),
+        "refusal must be UnsupportedOp so the dispatcher degrades, got {err:?}"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -823,7 +988,7 @@ fn test_mul_constant_crown_backward_negative() {
     let layer = MulConstantLayer::scalar(-3.0);
     let bounds = LinearBounds::identity(1);
     let result = layer.propagate_linear(&bounds).unwrap();
-    // No swap per CROWN substitution rule (designs/2026-01-29-crown-affine-negative-scale.md)
+    // No swap per CROWN substitution rule.
     assert_eq!(result.lower_a[[0, 0]], -3.0);
     assert_eq!(result.upper_a[[0, 0]], -3.0);
 }
@@ -1067,7 +1232,7 @@ fn test_div_constant_crown_backward_runtime_shape_recovery() {
     }
 }
 
-/// #3034: MulConstant CROWN backward with c=0.0 and Inf input coefficients
+/// MulConstant CROWN backward with c=0.0 and Inf input coefficients
 /// must produce zero output coefficients, not NaN from Inf * 0.0.
 ///
 /// Uses direct struct construction because LinearBounds::new() rejects Inf
@@ -1116,7 +1281,7 @@ fn test_mul_constant_crown_backward_zero_with_inf_coeff_3034() {
     assert_eq!(result.upper_b[0], 3.0);
 }
 
-/// #3034: MulConstant batched CROWN backward with c=0.0 and Inf coefficients.
+/// MulConstant batched CROWN backward with c=0.0 and Inf coefficients.
 #[test]
 fn test_mul_constant_batched_crown_zero_with_inf_coeff_3034() {
     use ndarray::ArrayD;
@@ -1159,7 +1324,7 @@ fn test_mul_constant_batched_crown_zero_with_inf_coeff_3034() {
     assert_eq!(result.upper_b[[1]], 4.0);
 }
 
-/// #3273: MulConstant IBP with c=0.0 and Inf input bounds must not produce NaN.
+/// MulConstant IBP with c=0.0 and Inf input bounds must not produce NaN.
 /// Prior to fix, `Inf * 0.0 = NaN` poisoned output bounds.
 #[test]
 fn test_mul_constant_ibp_zero_with_inf_bounds_3273() {
@@ -1185,7 +1350,7 @@ fn test_mul_constant_ibp_zero_with_inf_bounds_3273() {
     );
 }
 
-/// #3273: MulConstant IBP with c=0.0, multi-element tensor mixing Inf and finite bounds.
+/// MulConstant IBP with c=0.0, multi-element tensor mixing Inf and finite bounds.
 #[test]
 fn test_mul_constant_ibp_zero_multi_element_with_inf_3273() {
     let layer = MulConstantLayer::new(array![0.0, 2.0, 0.0].into_dyn());
@@ -2006,9 +2171,9 @@ fn test_div_constant_eps_is_positive_and_small() {
     assert!(eps < 1e-6, "DIV_CONSTANT_EPS must be small, got {eps}");
 }
 
-// ── Strict zero-tolerance CROWN relaxation proptest (#3292) ──────────────
+// ── Strict zero-tolerance CROWN relaxation proptest ──────────────
 //
-// Pattern from #3285: f64-evaluated reference with zero tolerance catches
+// Pattern: f64-evaluated reference with zero tolerance catches
 // f32 cancellation bugs invisible to magnitude-scaled tolerance tests.
 
 proptest! {
@@ -2018,7 +2183,7 @@ proptest! {
     /// Uses f64 reference (sqrt_f64_reference) with zero tolerance on 200-point grid.
     /// sqrt is concave on [0, +inf): lower bound = chord, upper bound = tangent.
     /// Domain restricted to non-negative l (sqrt undefined for x < 0).
-    /// Ref: alpha-beta-CROWN auto_LiRPA sqrt relaxation, #3292.
+    /// Ref: alpha-beta-CROWN auto_LiRPA sqrt relaxation.
     #[test]
     fn proptest_sqrt_relaxation_strict_soundness(
         l in 0.0f32..10.0,

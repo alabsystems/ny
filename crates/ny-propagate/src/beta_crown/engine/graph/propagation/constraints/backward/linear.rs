@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Linear layer override for constrained backward CROWN.
-//!
-//! Part of #4293 (directory-module split from former backward.rs monolith).
 
 use std::collections::HashMap;
 use std::sync::Arc;

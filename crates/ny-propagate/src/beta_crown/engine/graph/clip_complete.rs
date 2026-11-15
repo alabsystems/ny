@@ -16,7 +16,6 @@
 //! ## References
 //!
 //! - `auto_LiRPA/concretize_bounds.py:concretize_bounds` — two-pass approach
-//! - `designs/2026-03-17-issue-3552-complete-clipping-semantics-execution-packet.md` Packet 4
 
 use std::collections::HashMap;
 
@@ -362,7 +361,7 @@ fn select_graph_neurons_by_uncertainty(
     };
 
     // Sort descending by gap (largest uncertainty first).
-    // NaN-safe: nan_last_descending_cmp sorts NaN last (#4288).
+    // NaN-safe: nan_last_descending_cmp sorts NaN last.
     // Defense-in-depth: the is_finite() filter above excludes NaN gaps,
     // but the safe comparator prevents silent corruption if the filter changes.
     unstable.sort_by(|a, b| nan_last_descending_cmp(&a.1, &b.1));
@@ -472,7 +471,7 @@ mod tests {
         let lower = array![0.1, 0.2, 0.3];
         let upper = array![1.0, 2.0, 3.0];
         let selected = select_graph_neurons_by_uncertainty(&lower, &upper, -1.0);
-        assert!(selected.is_empty());
+        assert_eq!((selected).len(), 0);
     }
 
     #[test]

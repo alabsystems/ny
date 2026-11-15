@@ -56,7 +56,7 @@ impl BilinearCrownLayer {
             ));
         }
 
-        // N-D compose path (#286): when downstream has N-D structure (last dim = n,
+        // N-D compose path: when downstream has N-D structure (last dim = n,
         // not m*n) AND interval coefficients (from composition through >=1 layer),
         // compose along the n dimension only. K contribution is eagerly concretized
         // and folded into Q bias. This is tighter than partial CROWN when the
@@ -85,7 +85,7 @@ impl BilinearCrownLayer {
             );
         }
 
-        // Per-batch broadcast McCormick backward (#286, Approach A):
+        // Per-batch broadcast McCormick backward:
         // Use per-batch-position element-wise [batch, m, n, k] coefficients composed
         // with downstream bounds via broadcast einsum, avoiding:
         //   1. Dense O(seq^4) identity matrix materialization
@@ -95,7 +95,6 @@ impl BilinearCrownLayer {
         //
         // Reference: auto_LiRPA operators/linear.py `propagate_A_xy` and
         // operators/bivariate.py `bound_backward_both_perturbed`
-        // Design: designs/2026-03-04-286-attention-bilinear-alternative.md Approach A
         debug!(
             "BilinearCrown per-batch broadcast backward (m={}, n={}, k={})",
             dims.m, dims.n, dims.k
@@ -190,7 +189,6 @@ impl BilinearCrownLayer {
         // per McCormick element.
         //
         // Reference: auto_LiRPA bivariate.py:306-315 (sign-dependent dispatch)
-        // Design: designs/2026-03-04-286-attention-bilinear-alternative.md Approach B
         let mut rl_ru_lower = ndarray::Array4::zeros((2, dims.m, dims.n, dims.k));
         rl_ru_lower
             .slice_mut(ndarray::s![0, .., .., ..])
@@ -209,12 +207,11 @@ impl BilinearCrownLayer {
 
         validate_mccormick_inputs(input_a_bounds, input_b_bounds, "BilinearCrown")?;
 
-        // Per-batch broadcast McCormick backward with direction-dependent alpha (#286, Approach B):
+        // Per-batch broadcast McCormick backward with direction-dependent alpha:
         // Lower-bound direction uses relax_lower (from alpha[0], alpha[2]).
         // Upper-bound direction uses relax_upper (from alpha[1], alpha[3]).
         //
         // Reference: auto_LiRPA operators/bivariate.py `MulHelper.get_relaxation`
-        // Design: designs/2026-03-04-286-attention-bilinear-alternative.md Approach A+B
         debug!(
             "BilinearCrown per-batch direction-dependent alpha broadcast backward (m={}, n={}, k={})",
             dims.m, dims.n, dims.k

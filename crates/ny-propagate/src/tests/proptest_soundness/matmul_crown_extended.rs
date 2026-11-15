@@ -7,11 +7,10 @@
 //! Tests batched CROWN, non-identity incoming coefficients, asymmetric
 //! incoming bounds, transpose_b, scale, and f64 directed rounding.
 //! Split from matmul.rs to stay under the 1000-line file limit.
-//! Part of #2170.
 
 use crate::{BatchedLinearBounds, LinearBounds, MatMulLayer};
 use ndarray::{Array1, Array2, ArrayD, IxDyn};
-use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
+use ny_tensor::{next_down_f32, next_up_f32, shift_down_n_ulps, shift_up_n_ulps, BoundedTensor};
 use proptest::prelude::*;
 
 use super::matmul::{bounded_2d, eval_matmul, valid_interval_vec};
@@ -19,7 +18,6 @@ use super::CROWN_TOLERANCE;
 
 // ============================================================================
 // Batched CROWN backward soundness (propagate_linear_batched_binary)
-// Part of #2170.
 // ============================================================================
 
 proptest! {
@@ -28,7 +26,6 @@ proptest! {
     /// Batched CROWN backward with identity bounds for scalar matmul (1x1 @ 1x1).
     /// Exercises `propagate_linear_batched_binary` — the N-D batched version
     /// of McCormick CROWN used in transformer attention.
-    /// Part of #2170.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_matmul_batched_crown_scalar(
@@ -91,7 +88,6 @@ proptest! {
 
     /// Batched CROWN backward for 2x1 @ 1x1 matmul: C[0] = a0*b, C[1] = a1*b.
     /// Tests batched path with multi-element output.
-    /// Part of #2170.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_matmul_batched_crown_2x1(
@@ -163,7 +159,6 @@ proptest! {
 // Non-identity incoming CROWN bounds
 // Tests McCormick plane selection with positive and negative incoming
 // coefficients (sign-switching logic).
-// Part of #2170.
 // ============================================================================
 
 proptest! {
@@ -171,7 +166,6 @@ proptest! {
 
     /// CROWN backward with random (positive or negative) incoming coefficient.
     /// When c < 0, the McCormick plane selection must swap bound directions.
-    /// Part of #2170.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_matmul_crown_nonidentity_coeff(
@@ -246,7 +240,6 @@ proptest! {
     /// CROWN backward with asymmetric incoming bounds (lower_a != upper_a).
     /// This occurs after ReLU relaxation where the lower and upper relaxation
     /// slopes differ. Tests the full asymmetric McCormick case.
-    /// Part of #2170.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_matmul_crown_asymmetric_incoming(
@@ -327,7 +320,7 @@ proptest! {
 
 // ============================================================================
 // CROWN backward with transpose_b and scale parameters
-// Part of #2170: Prover finding — zero CROWN proptest coverage for these params.
+// Added after a prover finding of zero CROWN proptest coverage for these params.
 // ============================================================================
 
 proptest! {
@@ -335,7 +328,6 @@ proptest! {
 
     /// CROWN backward with transpose_b: A [1,2] @ B^T [1,2] → [1,1].
     /// Verifies McCormick envelope is sound when B is transposed.
-    /// Part of #2170.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_matmul_crown_transpose_b(
@@ -387,7 +379,6 @@ proptest! {
 
     /// CROWN backward with scale: scalar matmul C = scale * (a * b).
     /// Verifies McCormick envelope is sound when scale is applied.
-    /// Part of #2170.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_matmul_crown_with_scale(
@@ -447,12 +438,17 @@ proptest! {
 }
 
 // ============================================================================
-// f64 precision regression tests for directed rounding (#2164, #2183)
+// f64 precision regression tests for directed rounding
 // ============================================================================
 
 /// Setup for f64 directed rounding tests: creates point-interval inputs
 /// that trigger f32 vs f64 accumulation divergence.
 /// Returns (a_bounds, b_bounds, true_total_f64, expected_lower_half, expected_upper_half).
+///
+/// The two expected halves are the BARE directed cast — f64 accumulation, halve,
+/// narrow with `next_down_f32` / `next_up_f32` and nothing else. A path that also
+/// charges a certified widening before that cast lands further out; callers pass the
+/// derived ULP offset to `assert_directed_rounding_bias` rather than adjusting these.
 fn directed_rounding_setup(k: usize) -> (BoundedTensor, BoundedTensor, f64, f32, f32) {
     let a_bounds = bounded_2d(vec![1.0; k], vec![1.0; k], 1, k);
     let b_bounds = bounded_2d(vec![-0.1_f32; k], vec![-0.1_f32; k], k, 1);
@@ -481,23 +477,74 @@ fn directed_rounding_setup(k: usize) -> (BoundedTensor, BoundedTensor, f64, f32,
     )
 }
 
-/// Assert that a bias value uses directed rounding: lower uses next_down, upper uses next_up.
+/// Further f32 ULPs the McCormick envelope-constant certificate moves each half of the
+/// `directed_rounding_setup(100)` bias, on top of the bare directed cast, on the
+/// NON-batched dense path (`crown_dense::widen_mccormick_constant`,
+/// #matmul-dense-mccormick-const).
+///
+/// DERIVED from that function's own formula, not read off a failing run. For this
+/// fixture `a` and `b` are point intervals (`lx = ux = 1.0`, `ly = uy = -0.1`), so all
+/// four McCormick corners coincide and `select_mccormick_plane` returns
+/// `c = -lx·ly = 0.1f32` for the lower AND the upper plane; the incoming weight is
+/// `1.0`. Hence `adds = 100` and
+/// `magnitude_sum = term_magnitude_sum = accumulated = 10.000000149011612`, giving
+///
+/// ```text
+/// err = γ^f64_101·S·inflate + γ^f32_3·S·inflate
+///     = 1.12e-13            + 1.7881397e-6      = 1.7881398e-6
+/// ```
+///
+/// — dominated by the `γ^f32_3` plane term, i.e. the three f32 roundings
+/// (`w = fl32(lower_a·scale)`, the corner product, one step of slack) that
+/// `widen_mccormick_constant` charges for. Halving gives 8.9407e-7, which is 1.875
+/// ULP at 5.0 (ULP = 4.76837e-7), so `(widened * 0.5) as f32` lands exactly 2 ULPs
+/// out in each direction and the `next_down_f32`/`next_up_f32` step then adds its own
+/// third ULP exactly as before. Cross-check: the pre-certificate pins were bits
+/// 1084227583 / 1084227585 and the certified path produces 1084227581 / 1084227587.
+///
+/// The BATCHED twin (`crown_batched::widen_mccormick_constant`,
+/// #matmul-batched-mccormick-const) now certifies the SAME fold, and on THIS fixture
+/// it is bit-identical to the dense one — one incoming weight `1.0`, the same 100
+/// coincident-corner planes, the same `adds = 100`, the same magnitude sums — so it
+/// shares this constant rather than getting a second, separately-derived one. If the
+/// two ever need different values here, one of the two copies of the certificate has
+/// drifted from the other; fix the copy, do not fork the constant.
+const MCCORMICK_CONST_CERT_ULPS: u32 = 2;
+
+/// Assert that a bias value uses directed rounding: lower uses next_down, upper uses
+/// next_up — measured against the bare directed cast shifted `cert_ulps` further
+/// OUTWARD, `cert_ulps` being the certified widening the path under test applies
+/// before that cast. `cert_ulps == 0` reproduces the historical assertion exactly
+/// (`shift_*_n_ulps` returns its input for `n == 0`).
+///
+/// # Why this stays an EXACT pin rather than becoming `<=` / `>=`
+///
+/// A `lower_b <= expected_lower` form would NOT fail if `next_down_f32` were dropped:
+/// on this fixture the certificate alone already puts the value 2 ULPs below
+/// `expected_lower`, so the missing third ULP is invisible to an inequality, and an
+/// INVERTED rounding lands exactly ON `expected_lower` and passes a non-strict
+/// compare. Only an exact pin keeps the 1-ULP resolution this regression needs.
+/// If the certificate changes, RE-DERIVE `MCCORMICK_CONST_CERT_ULPS` from
+/// `widen_mccormick_constant`; never re-baseline it by copying an observed value.
 fn assert_directed_rounding_bias(
     lower_b: f32,
     upper_b: f32,
     expected_lower: f32,
     expected_upper: f32,
+    cert_ulps: u32,
     true_half: f64,
 ) {
+    let expected_lower = shift_down_n_ulps(expected_lower, cert_ulps);
+    let expected_upper = shift_up_n_ulps(expected_upper, cert_ulps);
     assert_eq!(
         lower_b.to_bits(),
         expected_lower.to_bits(),
-        "lower_b must use next_down_f32"
+        "lower_b must use next_down_f32 after the {cert_ulps}-ULP certified widening"
     );
     assert_eq!(
         upper_b.to_bits(),
         expected_upper.to_bits(),
-        "upper_b must use next_up_f32"
+        "upper_b must use next_up_f32 after the {cert_ulps}-ULP certified widening"
     );
     assert!(
         (lower_b as f64) <= true_half,
@@ -509,7 +556,7 @@ fn assert_directed_rounding_bias(
     );
 }
 
-/// Regression for #2183: MatMul CROWN bias path must accumulate in f64 and
+/// Regression: MatMul CROWN bias path must accumulate in f64 and
 /// apply directed rounding on the final f32 cast.
 #[ntest::timeout(10000)]
 #[test]
@@ -535,14 +582,14 @@ fn soundness_matmul_crown_directed_rounding_bias_2183() {
             branch.upper_b[0],
             exp_lower,
             exp_upper,
+            MCCORMICK_CONST_CERT_ULPS,
             true_half_f64,
         );
     }
 }
 
-/// Regression for #2164/#2183: Batched CROWN bias path must also accumulate
+/// Regression: Batched CROWN bias path must also accumulate
 /// in f64 and apply directed rounding, same as the unbatched path.
-/// Part of #2170.
 #[ntest::timeout(10000)]
 #[test]
 fn soundness_matmul_batched_crown_directed_rounding_bias() {
@@ -573,6 +620,17 @@ fn soundness_matmul_batched_crown_directed_rounding_bias() {
     for branch in [&bounds_a, &bounds_b] {
         let lb = *branch.lower_b.iter().next().unwrap();
         let ub = *branch.upper_b.iter().next().unwrap();
-        assert_directed_rounding_bias(lb, ub, exp_lower, exp_upper, true_half_f64);
+        // `crown_batched.rs` carries its own private copy of `widen_mccormick_constant`
+        // (#matmul-batched-mccormick-const), so this path now charges the identical
+        // certified widening as the dense one and lands on the same 2-ULP offset. See
+        // `MCCORMICK_CONST_CERT_ULPS` for why the two share one derived constant.
+        assert_directed_rounding_bias(
+            lb,
+            ub,
+            exp_lower,
+            exp_upper,
+            MCCORMICK_CONST_CERT_ULPS,
+            true_half_f64,
+        );
     }
 }

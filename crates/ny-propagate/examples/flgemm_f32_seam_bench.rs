@@ -14,7 +14,7 @@
 //!   3. `f32 seam`   — (2) plus the seam's real per-call overhead: narrowing
 //!      both f64 operands to f32 and widening the result back.
 //!
-//! Run with: cargo run --release --example flgemm_f32_seam_bench -p ny-propagate
+//! Run with: targo --unverified run --release --example flgemm_f32_seam_bench -p ny-propagate
 
 use std::time::Instant;
 

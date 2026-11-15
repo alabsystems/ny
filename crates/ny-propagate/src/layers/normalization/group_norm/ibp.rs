@@ -16,14 +16,14 @@
 //!    with per-element ny/beta
 //!
 //! Forward-mode IBP lives in `ibp_forward.rs`.
-//!
-//! Part of #3205.
 
 use std::borrow::Cow;
 
 use ndarray::{ArrayD, IxDyn};
 use ny_core::{checked_dim_product, NyError, Result};
-use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor, RepairStrategy};
+use ny_tensor::{
+    div_down_f32, div_up_f32, next_down_f32, next_up_f32, BoundedTensor, RepairStrategy,
+};
 
 use super::super::math_common::{compute_batch_prefix, square_interval_bounds};
 
@@ -106,7 +106,7 @@ impl GroupNormLayer {
             return BoundedTensor::new(ArrayD::zeros(IxDyn(shape)), ArrayD::zeros(IxDyn(shape)));
         }
 
-        // next_up: z_max is a range bound → round UP for soundness (#3344).
+        // next_up: z_max is a range bound → round UP for soundness.
         let z_max = if group_size <= 1 {
             0.0
         } else {
@@ -122,7 +122,7 @@ impl GroupNormLayer {
         for c in 0..num_channels {
             let ny = self.ny[c];
             let beta = self.beta[c];
-            // Directed rounding on fallback bounds (#3344).
+            // Directed rounding on fallback bounds.
             let (ch_lower, ch_upper) = if !ny.is_finite() || !beta.is_finite() {
                 (f32::NEG_INFINITY, f32::INFINITY)
             } else if ny >= 0.0 {
@@ -165,7 +165,7 @@ impl GroupNormLayer {
         let cpg = self.channels_per_group();
         let n = x_lowers.len();
         let time_len = n / cpg;
-        // f64 accumulation + directed rounding for mean/variance (#3327, pattern from #3324)
+        // f64 accumulation + directed rounding for mean/variance
         let nf_64 = n as f64;
         let group_start_ch = group_idx * cpg;
 
@@ -185,7 +185,7 @@ impl GroupNormLayer {
         let (std_lower, std_upper) =
             Self::bound_group_std(x_lowers, x_uppers, mean_lower, mean_upper, self.eps);
 
-        // Sound f32 float-error margin for the sqrt(n-1) z-clamp (#3196 leak fix).
+        // Sound f32 float-error margin for the sqrt(n-1) z-clamp.
         //
         // GroupNorm is a MEAN-SUBTRACT (centered) norm: z_i = (x_i - mean)/std with
         // the n group elements satisfying sum_i (x_i - mean) = 0. In exact reals this
@@ -220,12 +220,12 @@ impl GroupNormLayer {
         // final base+delta is next_up'd. So max_norm >= the true f32 ceiling and the
         // clamped interval [-max_norm, max_norm] is a sound SUPERSET of the reachable set,
         // while still tighter than the unclamped 4-corner interval in the
-        // high-magnitude/low-variance regime (retains the #3196 tightening).
+        // high-magnitude/low-variance regime (retains the z-clamp tightening).
         //
         // Non-finite guard: if max_abs_x is not finite (Inf inputs slipped past the
         // finite-input check, or NaN), fall through to max_norm = +INF so the unclamped
         // interval is kept and repaired downstream, never tightened.
-        // next_up: max_norm is a range bound → round UP (#3344).
+        // next_up: max_norm is a range bound → round UP.
         let max_norm = if n > 1 {
             let max_abs_x = x_lowers
                 .iter()
@@ -262,32 +262,45 @@ impl GroupNormLayer {
             let b = self.beta[c];
 
             // Directed rounding on intermediate deviation: if centered_lower
-            // rounds UP, the 4-corner domain is too narrow → unsound. Part of #3344.
+            // rounds UP, the 4-corner domain is too narrow → unsound.
             let centered_lower = next_down_f32(x_lowers[i] - mean_upper);
             let centered_upper = next_up_f32(x_uppers[i] - mean_lower);
 
-            let corners = [
-                centered_lower / std_upper,
-                centered_lower / std_lower,
-                centered_upper / std_upper,
-                centered_upper / std_lower,
+            // The corner divisions were the ONE bare (round-to-nearest) step in an
+            // otherwise fully directed chain. A corner that rounds inward narrows the
+            // ratio interval, and the directed step on the final `g*norm + b` is at the
+            // scale of that SUM -- it collapses whenever beta cancels the product.
+            // Compute each corner TWICE (down for the min-fold, up for the max-fold),
+            // mirroring `BoundedTensor::mul`. div_down/div_up_f32 are exact-remainder
+            // (fma) certified and pass NaN through to the folds unchanged.
+            let corners_down = [
+                div_down_f32(centered_lower, std_upper),
+                div_down_f32(centered_lower, std_lower),
+                div_down_f32(centered_upper, std_upper),
+                div_down_f32(centered_upper, std_lower),
+            ];
+            let corners_up = [
+                div_up_f32(centered_lower, std_upper),
+                div_up_f32(centered_lower, std_lower),
+                div_up_f32(centered_upper, std_upper),
+                div_up_f32(centered_upper, std_lower),
             ];
 
             let ratio_l = nan_propagating_max(
-                corners
+                corners_down
                     .iter()
                     .fold(f32::INFINITY, |a, &v| nan_propagating_min(a, v)),
                 -max_norm,
             );
             let ratio_u = nan_propagating_min(
-                corners
+                corners_up
                     .iter()
                     .fold(f32::NEG_INFINITY, |a, &v| nan_propagating_max(a, v)),
                 max_norm,
             );
 
             // Directed rounding on final bounds: bare f32 mul+add from
-            // corner division results. Part of #3344.
+            // corner division results.
             let (y_l, y_u) = if g >= 0.0 {
                 (next_down_f32(g * ratio_l + b), next_up_f32(g * ratio_u + b))
             } else {
@@ -307,7 +320,7 @@ impl GroupNormLayer {
         eps: f32,
     ) -> (f32, f32) {
         let n = x_lowers.len();
-        // f64 accumulation for variance bounds (#3327, pattern from #3324)
+        // f64 accumulation for variance bounds
         let nf_64 = n as f64;
         let eps_64 = eps as f64;
         let mut sq_sum_lower_f64 = 0.0_f64;
@@ -315,7 +328,6 @@ impl GroupNormLayer {
         for i in 0..n {
             // Directed rounding on intermediate deviation: feeds variance via
             // square_interval_bounds — too-narrow domain → too-narrow variance → unsound.
-            // Part of #3344.
             let centered_lower = next_down_f32(x_lowers[i] - mean_upper);
             let centered_upper = next_up_f32(x_uppers[i] - mean_lower);
             let (sq_l, sq_u) = square_interval_bounds(centered_lower, centered_upper);
@@ -326,7 +338,7 @@ impl GroupNormLayer {
         let var_lower = next_down_f32((sq_sum_lower_f64 / nf_64) as f32);
         let var_upper = next_up_f32((sq_sum_upper_f64 / nf_64) as f32);
         // Directed rounding on sqrt: std_lower is denominator → round DOWN,
-        // std_upper rounds UP (wider interval = sound). #3327.
+        // std_upper rounds UP (wider interval = sound).
         (
             next_down_f32(((var_lower as f64 + eps_64).sqrt()) as f32),
             next_up_f32(((var_upper as f64 + eps_64).sqrt()) as f32),
@@ -343,7 +355,7 @@ impl GroupNormLayer {
         time_len: usize,
         n: usize,
     ) {
-        // next_up: z_max is a range bound → round UP for soundness (#3344).
+        // next_up: z_max is a range bound → round UP for soundness.
         let z_max = if n > 1 {
             next_up_f32(((n as f32) - 1.0).sqrt())
         } else {
@@ -356,7 +368,7 @@ impl GroupNormLayer {
             let (ch_lower, ch_upper) = if !g.is_finite() || !b.is_finite() {
                 (f32::NEG_INFINITY, f32::INFINITY)
             } else if g >= 0.0 {
-                // Directed rounding on overflow fallback bounds (#3344).
+                // Directed rounding on overflow fallback bounds.
                 (
                     affine_fallback_down(b, g, -z_max),
                     affine_fallback_up(b, g, z_max),

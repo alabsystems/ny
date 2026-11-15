@@ -456,6 +456,25 @@ pub(crate) struct SweepRow {
     /// (the recorder is best-effort by contract, and so is this copy).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) flight: Option<serde_json::Value>,
+    /// #stop-evidence: marker lines harvested VERBATIM from the child's
+    /// bounded stderr tail — the terminal `[stop]` accounting line, `[budget]`
+    /// phase telemetry, and `route=` lane markers.
+    ///
+    /// The child prints all of these at default verbosity, but the sweep keeps
+    /// only a bounded stderr tail surfaced solely on `Error`, so for every
+    /// banked row this evidence existed and was then discarded — which is how
+    /// eight tllverifybench early-quit rows (unspent_frac ~0.85) and the
+    /// linearizenn cap string became unattributable post hoc. The flight embed
+    /// above now carries the child's own `stop` field too; this stderr harvest
+    /// is the channel that still works when the sidecar was not written, not
+    /// parsable, or predates that field.
+    ///
+    /// Bounded by [`STOP_EVIDENCE_MAX_LINES`]/[`STOP_EVIDENCE_MAX_LINE_CHARS`].
+    /// Empty (and omitted) on legacy banks, cached rows measured before this
+    /// field, and children that printed no markers, so existing banks
+    /// round-trip byte-identically.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) stop_evidence: Vec<String>,
     /// #arm-overrides: the lever assignment this row was measured under, sorted.
     ///
     /// A verdict is only interpretable together with the configuration that
@@ -2630,6 +2649,36 @@ fn stderr_tail_lines(stderr: &str) -> String {
     lines.join(" | ")
 }
 
+/// #stop-evidence bounds. The 16 KiB child stderr tail already bounds the
+/// input; these bound the OUTPUT so a marker-chatty child cannot bloat its
+/// metadata row. The `[stop]` line is the LAST stop-evidence line `finish`
+/// prints (the `[poll-amortise]` line after it does not match the harvest
+/// filter), so keeping the trailing matches always retains it when it exists
+/// in the tail.
+const STOP_EVIDENCE_MAX_LINES: usize = 16;
+const STOP_EVIDENCE_MAX_LINE_CHARS: usize = 512;
+
+/// Harvest the child's stop evidence from its bounded stderr tail
+/// (#stop-evidence): `[stop]`/`[budget]` telemetry lines (both `eprintln!`ed
+/// at any verbosity — `flight.rs` `finish`, `phase_budget.rs`) and `route=`
+/// lane markers. Verbatim, order-preserving, keeping the LAST matches so the
+/// terminal `[stop]` line can never be the one squeezed out. Pure so the
+/// harvest is testable without a child process.
+fn stderr_stop_evidence(stderr_tail: &str) -> Vec<String> {
+    let matching: Vec<&str> = stderr_tail
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            line.starts_with("[stop]") || line.starts_with("[budget]") || line.contains("route=")
+        })
+        .collect();
+    matching
+        .iter()
+        .skip(matching.len().saturating_sub(STOP_EVIDENCE_MAX_LINES))
+        .map(|line| line.chars().take(STOP_EVIDENCE_MAX_LINE_CHARS).collect())
+        .collect()
+}
+
 pub(crate) fn enforce_scoring_deadline(
     verdict: SweepVerdict,
     elapsed: Duration,
@@ -2897,6 +2946,9 @@ struct InstanceOutcome {
     seconds: f64,
     detail: Option<String>,
     flight: Option<serde_json::Value>,
+    /// #stop-evidence harvested from the child's bounded stderr tail; see
+    /// [`SweepRow::stop_evidence`].
+    stop_evidence: Vec<String>,
     /// The witness block a sat child appended to its result file, extracted
     /// here because the private instance tempdir is deleted on return.
     witness_text: Option<String>,
@@ -2932,6 +2984,7 @@ fn run_instance(
                 seconds: 0.0,
                 detail: Some(format!("resolve instance arguments: {error:#}")),
                 flight: None,
+                stop_evidence: Vec::new(),
                 witness_text: None,
             });
         }
@@ -2974,14 +3027,18 @@ fn run_instance(
     let watchdog = Duration::from_secs(budget).saturating_add(CHILD_WATCHDOG_GRACE);
     let output = run_bounded_child(&mut cmd, watchdog, CHILD_STDERR_TAIL_BYTES);
 
-    let (ran_ok, watchdog_fired, elapsed, stderr_tail) = match output {
+    let (ran_ok, watchdog_fired, elapsed, stderr_tail, stop_evidence) = match output {
         Ok(out) => (
             out.success,
             out.timed_out,
             out.elapsed,
             stderr_tail_lines(&out.stderr_tail),
+            // Harvested UNCONDITIONALLY (#stop-evidence): the whole point is
+            // that non-`Error` rows — the early quits — carry their own stop
+            // line into the bank.
+            stderr_stop_evidence(&out.stderr_tail),
         ),
-        Err(err) => (false, false, started.elapsed(), err.to_string()),
+        Err(err) => (false, false, started.elapsed(), err.to_string(), Vec::new()),
     };
 
     let first_line = read_result_first_line(&result_file);
@@ -3027,6 +3084,7 @@ fn run_instance(
         seconds: elapsed.as_secs_f64(),
         detail,
         flight,
+        stop_evidence,
         witness_text,
     })
 }
@@ -3196,8 +3254,7 @@ fn serve_from_cache(
 }
 
 pub(crate) fn run_sweep(opts: &SweepOptions) -> Result<SweepSummary> {
-    // State WHICH VERIFIER is about to run, before anything else. This is the
-    // line that was missing on 2026-08-21 (#binary-identity).
+    // State WHICH VERIFIER is about to run, before anything else (#binary-identity).
     crate::build_id::log_once();
     // State the compute regime before planning: it is sealed into the
     // manifest, and a human watching the sweep should not have to wait for
@@ -3558,6 +3615,10 @@ pub(crate) fn run_sweep(opts: &SweepOptions) -> Result<SweepSummary> {
                     capped_from: entry.capped_from,
                     detail: cached.detail,
                     flight: cached.flight,
+                    // Carried from the cached measurement, like the flight
+                    // record: the evidence describes HOW that row's child
+                    // stopped, which a replay does not change.
+                    stop_evidence: cached.stop_evidence,
                     // The flight record above belongs to a DIFFERENT process.
                     // Mark the row so no downstream gate can read it as
                     // evidence that a child ran here.
@@ -3614,6 +3675,7 @@ pub(crate) fn run_sweep(opts: &SweepOptions) -> Result<SweepSummary> {
                     capped_from: entry.capped_from,
                     detail: outcome.detail,
                     flight: outcome.flight,
+                    stop_evidence: outcome.stop_evidence,
                     from_cache: false,
                     witness,
                 };
@@ -3671,6 +3733,7 @@ pub(crate) fn run_sweep(opts: &SweepOptions) -> Result<SweepSummary> {
                     capped_from: entry.capped_from,
                     detail: Some("dry run: instance was not executed".into()),
                     flight: None,
+                    stop_evidence: Vec::new(),
                     from_cache: false,
                     witness: None,
                 });
@@ -3730,8 +3793,8 @@ pub(crate) fn run_sweep(opts: &SweepOptions) -> Result<SweepSummary> {
         }
         if summary.sat_rows_without_witness > 0 {
             println!(
-                "WARNING: {} sat row(s) without retained witnesses — organizer-style \
-                 replay cannot revalidate them (#witness-retention-gap).",
+                "WARNING: {} sat row(s) without retained witnesses; organizer-style \
+                 replay cannot revalidate them.",
                 summary.sat_rows_without_witness
             );
         }
@@ -4355,6 +4418,186 @@ mod tests {
         assert_eq!(fields[4], "sat");
     }
 
+    /// #stop-evidence — the harvest keeps exactly the marker lines, verbatim,
+    /// and drops everything else. This is the pure half of the capture; the
+    /// child-process half is exercised below.
+    #[test]
+    fn stop_evidence_harvests_stop_budget_and_route_markers_only() {
+        let tail = "some allocator chatter\n\
+            [budget] disjunctive-graph-handoff total_s=600 elapsed_s=12\n\
+            route=AdaptiveReleasedAlphaBetaTier solver_timeout=570s\n\
+            WARNING: something unrelated\n\
+            [stop] verdict=unknown wall_s=88.40 budget_s=600 unspent_s=511.60 \
+            unspent_frac=0.853 reason=Domain limit 100000 reached\n";
+        let evidence = stderr_stop_evidence(tail);
+        assert_eq!(
+            evidence,
+            vec![
+                "[budget] disjunctive-graph-handoff total_s=600 elapsed_s=12".to_string(),
+                "route=AdaptiveReleasedAlphaBetaTier solver_timeout=570s".to_string(),
+                "[stop] verdict=unknown wall_s=88.40 budget_s=600 unspent_s=511.60 \
+            unspent_frac=0.853 reason=Domain limit 100000 reached"
+                    .to_string(),
+            ],
+            "markers verbatim and in order, noise dropped"
+        );
+    }
+
+    /// #stop-evidence — the bounds. A marker-chatty child keeps the LAST
+    /// [`STOP_EVIDENCE_MAX_LINES`] matches, so the terminal `[stop]` line is
+    /// never the one squeezed out, and an absurdly long line is truncated to
+    /// [`STOP_EVIDENCE_MAX_LINE_CHARS`] characters.
+    #[test]
+    fn stop_evidence_is_bounded_and_keeps_the_terminal_stop_line() {
+        let mut tail = String::new();
+        for index in 0..40 {
+            tail.push_str(&format!("[budget] phase-{index} elapsed_s={index}\n"));
+        }
+        let long_reason = "r".repeat(4 * STOP_EVIDENCE_MAX_LINE_CHARS);
+        tail.push_str(&format!("[stop] verdict=unknown reason={long_reason}\n"));
+        let evidence = stderr_stop_evidence(&tail);
+        assert_eq!(evidence.len(), STOP_EVIDENCE_MAX_LINES);
+        assert_eq!(
+            evidence.first().map(String::as_str),
+            Some("[budget] phase-25 elapsed_s=25"),
+            "the OLDEST markers are the ones dropped"
+        );
+        let last = evidence.last().expect("terminal line");
+        assert!(
+            last.starts_with("[stop] verdict=unknown "),
+            "the [stop] line must survive the line cap: {last}"
+        );
+        assert_eq!(
+            last.chars().count(),
+            STOP_EVIDENCE_MAX_LINE_CHARS,
+            "an oversized line is truncated, not dropped"
+        );
+    }
+
+    /// #stop-evidence — the child-process half of the capture, for BOTH row
+    /// shapes the instrument exists to separate: a decided row and an
+    /// undecided early-quit row. A fixture child plays the verifier: it
+    /// commits its verdict token to the result file and prints the `[stop]`
+    /// accounting line on stderr exactly where `flight::finish` does, and the
+    /// harvest must carry that line — not the surrounding noise — into the
+    /// outcome that the banking loop persists.
+    #[cfg(unix)]
+    #[test]
+    fn run_instance_banks_the_child_stop_line_for_decided_and_undecided_rows() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let category_dir = dir.path().join("family");
+        std::fs::create_dir_all(&category_dir).expect("category dir");
+        std::fs::write(category_dir.join("model.onnx"), b"onnx-bytes").expect("model");
+        std::fs::write(category_dir.join("property.vnnlib"), b"vnnlib-bytes").expect("property");
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(&scratch).expect("scratch");
+
+        for (token, reason) in [
+            // DECIDED: a proof, stopped by its own completion.
+            ("unsat", "none-recorded"),
+            // UNDECIDED at 15% of budget: the early-quit shape, where the
+            // reason string is the entire diagnosis.
+            ("unknown", "Domain limit 100000 reached"),
+        ] {
+            let exe = dir.path().join(format!("fake-child-{token}.sh"));
+            std::fs::write(
+                &exe,
+                format!(
+                    "#!/bin/sh\nprintf '{token}\\n' > \"$6\"\n\
+                     echo 'allocator noise the harvest must drop' >&2\n\
+                     echo '[stop] verdict={token} wall_s=88.40 budget_s=600 \
+                     unspent_s=511.60 unspent_frac=0.853 reason={reason}' >&2\n"
+                ),
+            )
+            .expect("write fixture child");
+            let mut permissions = std::fs::metadata(&exe).expect("stat").permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&exe, permissions).expect("chmod");
+
+            let outcome = run_instance(
+                &exe,
+                "family",
+                &category_dir,
+                &SweepInstance {
+                    onnx_field: "model.onnx".into(),
+                    vnnlib_field: "property.vnnlib".into(),
+                    budget_secs: 600,
+                },
+                600,
+                None,
+                &scratch,
+                &[],
+            )
+            .expect("run fixture child");
+            assert_eq!(outcome.verdict.as_str(), token);
+            assert_eq!(
+                outcome.stop_evidence.len(),
+                1,
+                "{token}: exactly the [stop] line, no noise: {:?}",
+                outcome.stop_evidence
+            );
+            let stop = &outcome.stop_evidence[0];
+            assert!(
+                stop.starts_with(&format!("[stop] verdict={token} ")),
+                "{stop}"
+            );
+            assert!(stop.ends_with(&format!("reason={reason}")), "{stop}");
+        }
+    }
+
+    /// #stop-evidence — persistence: the harvested lines survive the
+    /// metadata sidecar round trip, and an evidence-free row serializes
+    /// byte-identically to a pre-field bank.
+    #[test]
+    fn metadata_round_trips_stop_evidence_and_omits_it_when_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = dir.path().join("results.csv");
+        let metadata = metadata_path_for(&output);
+        let stop_line = "[stop] verdict=unknown wall_s=88.40 budget_s=600 unspent_s=511.60 \
+                         unspent_frac=0.853 reason=Domain limit 100000 reached"
+            .to_string();
+        let mut quit = metadata_row("c", 0, SweepVerdict::Unknown);
+        quit.stop_evidence = vec![stop_line.clone()];
+        let mut state = SweepState::new();
+        state.insert(
+            ("c".into(), "model.onnx".into(), "property.vnnlib".into(), 0),
+            quit,
+        );
+        state.insert(
+            ("c".into(), "model.onnx".into(), "property.vnnlib".into(), 1),
+            metadata_row("c", 1, SweepVerdict::Unsat),
+        );
+        publish_state(&metadata, &output, &state).expect("publish");
+
+        let loaded = metadata_state(&metadata).expect("reload");
+        assert_eq!(
+            loaded
+                .get(&("c".into(), "model.onnx".into(), "property.vnnlib".into(), 0))
+                .expect("quit row")
+                .stop_evidence,
+            vec![stop_line],
+            "the stop evidence must survive the sidecar round trip"
+        );
+        assert_eq!(
+            (loaded
+                .get(&("c".into(), "model.onnx".into(), "property.vnnlib".into(), 1))
+                .expect("clean row")
+                .stop_evidence)
+                .len(),
+            0
+        );
+        let body = std::fs::read_to_string(&metadata).expect("read sidecar");
+        let clean_line = body
+            .lines()
+            .find(|line| line.contains("\"unsat\""))
+            .expect("clean row line");
+        assert!(
+            !clean_line.contains("stop_evidence"),
+            "an evidence-free row must serialize exactly as a pre-field bank did: {clean_line}"
+        );
+    }
+
     fn metadata_row(category: &str, occurrence: usize, verdict: SweepVerdict) -> SweepRow {
         SweepRow {
             arm: Vec::new(),
@@ -4370,6 +4613,7 @@ mod tests {
             capped_from: None,
             detail: None,
             flight: None,
+            stop_evidence: Vec::new(),
             from_cache: false,
             witness: None,
         }
@@ -5863,6 +6107,7 @@ mod tests {
                 "levers": {"status": "not_materialized"},
                 "events": [{"method": "result_publish", "status": "ran"}],
             })),
+            stop_evidence: Vec::new(),
             from_cache: false,
             witness: None,
         };
@@ -6221,6 +6466,7 @@ mod tests {
                 capped_from: None,
                 detail: None,
                 flight: None,
+                stop_evidence: Vec::new(),
                 from_cache: false,
                 witness: None,
             });

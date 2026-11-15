@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! SPSA gradient computation for DAG α-CROWN.
-//!
-//! Extracted from `gradients.rs` as part of #4187.
 
 use super::super::super::runtime_state::DagAlphaRuntimeState;
 use super::super::DagAlphaLoopContext;
@@ -53,9 +51,9 @@ impl GraphNetwork {
             .collect::<Result<Vec<_>>>()?;
 
         let original_graph = runtime.snapshot_graph();
-        // Save bilinear originals for restoration after SPSA perturbation (#3287).
+        // Save bilinear originals for restoration after SPSA perturbation.
         let original_bilinear: HashMap<String, Array4<f32>> = bilinear_alphas.clone();
-        // Save MulBinary originals (#3439 Phase 3).
+        // Save MulBinary originals.
         let original_mul_binary: HashMap<String, Array2<f32>> = mul_binary_alphas.clone();
 
         // Scratch gradient buffers (required by DAG pass signature).
@@ -86,10 +84,10 @@ impl GraphNetwork {
 
         // Wrap loop body in closure so `?` returns to the closure,
         // not the outer function. Ensures alpha restoration runs
-        // unconditionally, even on CROWN propagation error (#2554).
+        // unconditionally, even on CROWN propagation error.
         let result = (|| -> Result<()> {
             for _sample in 0..ctx.config.spsa_samples {
-                // Refill ReLU perturbations in place (#2297).
+                // Refill ReLU perturbations in place.
                 for relu_idx in 0..num_relus {
                     let mask = runtime.relu_unstable_mask(relu_idx).ok_or_else(|| {
                         NyError::InternalError(format!(
@@ -109,7 +107,7 @@ impl GraphNetwork {
                     }
                 }
 
-                // Refill bilinear perturbations in place (#2297, #3287).
+                // Refill bilinear perturbations in place.
                 for pert in bilinear_perts.values_mut() {
                     pert.mapv_inplace(|_| {
                         if rng.random_bool(0.5) {
@@ -119,7 +117,7 @@ impl GraphNetwork {
                         }
                     });
                 }
-                // Refill MulBinary perturbations in place (#2297, #3439 Phase 3).
+                // Refill MulBinary perturbations in place.
                 for pert in mul_binary_perts.values_mut() {
                     pert.mapv_inplace(|_| {
                         if rng.random_bool(0.5) {
@@ -132,7 +130,7 @@ impl GraphNetwork {
 
                 runtime.restore_graph(&original_graph);
                 runtime.apply_relu_perturbations(&perturbations, eps)?;
-                // Bilinear +eps (#3287).
+                // Bilinear +eps.
                 for (name, alpha) in bilinear_alphas.iter_mut() {
                     let orig = &original_bilinear[name];
                     let pert = &bilinear_perts[name];
@@ -143,7 +141,7 @@ impl GraphNetwork {
                             *a = (o + eps * p).clamp(0.0, 1.0);
                         });
                 }
-                // MulBinary +eps (#3439 Phase 3).
+                // MulBinary +eps.
                 for (name, alpha) in mul_binary_alphas.iter_mut() {
                     let orig = &original_mul_binary[name];
                     let pert = &mul_binary_perts[name];
@@ -156,7 +154,7 @@ impl GraphNetwork {
                 }
                 scratch.iter_mut().for_each(|g| g.fill(0.0));
                 scratch_upper.iter_mut().for_each(|g| g.fill(0.0));
-                // Propagate CROWN errors instead of swallowing them (#2065, #1941).
+                // Propagate CROWN errors instead of swallowing them.
                 let (bl_plus, mb_plus) = alpha_refs(ctx, bilinear_alphas, mul_binary_alphas);
                 let bounds_plus = self.dag_alpha_backward_pass_with_engine(
                     ctx.input,
@@ -178,7 +176,7 @@ impl GraphNetwork {
 
                 runtime.restore_graph(&original_graph);
                 runtime.apply_relu_perturbations(&perturbations, -eps)?;
-                // Bilinear -eps (#3287).
+                // Bilinear -eps.
                 for (name, alpha) in bilinear_alphas.iter_mut() {
                     let orig = &original_bilinear[name];
                     let pert = &bilinear_perts[name];
@@ -189,7 +187,7 @@ impl GraphNetwork {
                             *a = (o - eps * p).clamp(0.0, 1.0);
                         });
                 }
-                // MulBinary -eps (#3439 Phase 3).
+                // MulBinary -eps.
                 for (name, alpha) in mul_binary_alphas.iter_mut() {
                     let orig = &original_mul_binary[name];
                     let pert = &mul_binary_perts[name];
@@ -202,7 +200,7 @@ impl GraphNetwork {
                 }
                 scratch.iter_mut().for_each(|g| g.fill(0.0));
                 scratch_upper.iter_mut().for_each(|g| g.fill(0.0));
-                // Propagate CROWN errors instead of swallowing them (#2065, #1941).
+                // Propagate CROWN errors instead of swallowing them.
                 let (bl_minus, mb_minus) = alpha_refs(ctx, bilinear_alphas, mul_binary_alphas);
                 let bounds_minus = self.dag_alpha_backward_pass_with_engine(
                     ctx.input,
@@ -236,7 +234,7 @@ impl GraphNetwork {
                         }
                     }
                 }
-                // Bilinear SPSA gradient accumulation (#3287).
+                // Bilinear SPSA gradient accumulation.
                 for (name, grad) in bilinear_grads.iter_mut() {
                     if let Some(pert) = bilinear_perts.get(name) {
                         ndarray::Zip::from(grad.view_mut())
@@ -248,7 +246,7 @@ impl GraphNetwork {
                             });
                     }
                 }
-                // MulBinary SPSA gradient accumulation (#3439 Phase 3).
+                // MulBinary SPSA gradient accumulation.
                 for (name, grad) in mul_binary_grads.iter_mut() {
                     if let Some(pert) = mul_binary_perts.get(name) {
                         ndarray::Zip::from(grad.view_mut())
@@ -265,11 +263,11 @@ impl GraphNetwork {
         })();
 
         // Always restore alpha state, including early error
-        // returns from `?` inside the closure (#2554, #3393).
+        // returns from `?` inside the closure.
         runtime.restore_graph(&original_graph);
-        // Restore bilinear alphas from snapshot (#3287).
+        // Restore bilinear alphas from snapshot.
         *bilinear_alphas = original_bilinear;
-        // Restore MulBinary alphas (#3439 Phase 3).
+        // Restore MulBinary alphas.
         *mul_binary_alphas = original_mul_binary;
         result?;
 
@@ -277,11 +275,11 @@ impl GraphNetwork {
         for grad in &mut avg_grads {
             *grad /= num_samples;
         }
-        // Average bilinear gradients (#3287).
+        // Average bilinear gradients.
         for grad in bilinear_grads.values_mut() {
             *grad /= num_samples;
         }
-        // Average MulBinary gradients (#3439 Phase 3).
+        // Average MulBinary gradients.
         for grad in mul_binary_grads.values_mut() {
             *grad /= num_samples;
         }

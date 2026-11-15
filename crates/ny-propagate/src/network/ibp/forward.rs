@@ -15,7 +15,7 @@ use std::time::Instant;
 use tracing::{debug, instrument};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum LeadingAxisMode {
+pub(crate) enum LeadingAxisMode {
     Plain,
     PreserveLeadingAxis,
 }
@@ -72,21 +72,66 @@ pub(super) fn propagate_ibp(network: &Network, input: &BoundedTensor) -> Result<
 /// to the per-layer loop.
 ///
 /// `input_shape` is the shape of the input tensor (from `BoundedTensor::shape()`).
-///
-/// Reference: designs/2026-03-18-issue-4081-gpu-ibp-forward-gap2-addendum.md §1
 pub(crate) fn try_lower_dense_chain(
     network: &Network,
     input_shape: &[usize],
 ) -> Option<Vec<GpuIbpLayer>> {
+    lower_dense_chain_until(network, input_shape, None)
+}
+
+/// The same diagnostic lowering, with bounded polls while copying constants.
+/// A missing supported lowering is distinct from an expired caller authority.
+pub(crate) fn try_lower_dense_chain_until(
+    network: &Network,
+    input_shape: &[usize],
+    deadline: Instant,
+) -> Result<Option<Vec<GpuIbpLayer>>> {
+    lower_checkpoint(Some(deadline))?;
+    let layers = lower_dense_chain_until(network, input_shape, Some(deadline));
+    lower_checkpoint(Some(deadline))?;
+    Ok(layers)
+}
+
+fn lower_checkpoint(deadline: Option<Instant>) -> Result<()> {
+    if deadline.is_some_and(|limit| Instant::now() >= limit) {
+        return Err(NyError::DeadlineExceeded("PGD dense plan lowering".into()));
+    }
+    Ok(())
+}
+
+fn copy_dense_constant_until(
+    values: &[f32],
+    deadline: Option<Instant>,
+) -> Option<std::sync::Arc<[f32]>> {
+    lower_checkpoint(deadline).ok()?;
+    if deadline.is_none() {
+        return Some(values.to_vec().into());
+    }
+    let mut copied = Vec::with_capacity(values.len());
+    for chunk in values.chunks(4_096) {
+        lower_checkpoint(deadline).ok()?;
+        copied.extend_from_slice(chunk);
+    }
+    lower_checkpoint(deadline).ok()?;
+    Some(copied.into())
+}
+
+fn lower_dense_chain_until(
+    network: &Network,
+    input_shape: &[usize],
+    deadline: Option<Instant>,
+) -> Option<Vec<GpuIbpLayer>> {
+    lower_checkpoint(deadline).ok()?;
     let mut gpu_layers = Vec::with_capacity(network.layers.len());
     let mut current_shape = input_shape.to_vec();
     for layer in &network.layers {
+        lower_checkpoint(deadline).ok()?;
         match layer {
             Layer::Linear(linear) => {
                 let weight_slice = linear.weight.as_slice()?;
                 let (out_features, in_features) = linear.weight.dim();
                 let bias = match linear.bias.as_ref() {
-                    Some(bias) => Some(bias.as_slice()?.to_vec().into()),
+                    Some(bias) => Some(copy_dense_constant_until(bias.as_slice()?, deadline)?),
                     None => None,
                 };
                 let last_dim = current_shape.last_mut()?;
@@ -94,7 +139,7 @@ pub(crate) fn try_lower_dense_chain(
                     return None;
                 }
                 gpu_layers.push(GpuIbpLayer::Linear {
-                    weight: weight_slice.to_vec().into(),
+                    weight: copy_dense_constant_until(weight_slice, deadline)?,
                     bias,
                     out_features,
                     in_features,
@@ -132,12 +177,12 @@ pub(crate) fn try_lower_dense_chain(
 
                 let weight_slice = conv.kernel.as_slice()?;
                 let bias = match conv.bias.as_ref() {
-                    Some(b) => Some(b.as_slice()?.to_vec().into()),
+                    Some(b) => Some(copy_dense_constant_until(b.as_slice()?, deadline)?),
                     None => None,
                 };
 
                 gpu_layers.push(GpuIbpLayer::Conv2d {
-                    weight: weight_slice.to_vec().into(),
+                    weight: copy_dense_constant_until(weight_slice, deadline)?,
                     bias,
                     out_channels,
                     in_channels,
@@ -215,17 +260,29 @@ pub(super) fn propagate_ibp_with_engine_preserve_leading_axis(
 /// true network output, fabricating false counterexamples that the trusted ORT
 /// oracle then rejects (cgan_2023 unknown-downgrade bug).
 ///
-/// This routine instead RE-COLLAPSES the running tensor to its interval center
-/// after every layer, so each layer sees a degenerate point and contributes only
-/// its own ~ULP of rounding (which does NOT amplify across layers). The result is
-/// a faithful f32 point forward that matches ONNX Runtime to ~1e-6 on the
-/// cgan_2023 generators. NON-soundness-critical: used only for sat-finding /
-/// witness evaluation, never to decide a Verified/unsat verdict.
+/// Linear and causal softmax use their explicit diagnostic point evaluators.
+/// Other layers still re-collapse their interval output after every operation;
+/// that legacy diagnostic approximation does not promise deployed-kernel parity.
+/// NON-soundness-critical: used only for sat-finding / witness proposals, never
+/// to decide a Verified/unsat verdict.
 pub(super) fn propagate_concrete_point(
     network: &Network,
     input: &BoundedTensor,
     engine: Option<&dyn GemmEngine>,
     leading_axis_mode: LeadingAxisMode,
+) -> Result<BoundedTensor> {
+    propagate_concrete_point_until(network, input, engine, leading_axis_mode, None)
+}
+
+/// Diagnostic point evaluation with an optional earlier caller authority.
+/// The published instance deadline remains a cap; neither authority creates a
+/// fresh duration. This point route never certifies an interval or UNSAT.
+pub(crate) fn propagate_concrete_point_until(
+    network: &Network,
+    input: &BoundedTensor,
+    engine: Option<&dyn GemmEngine>,
+    leading_axis_mode: LeadingAxisMode,
+    caller_deadline: Option<Instant>,
 ) -> Result<BoundedTensor> {
     if network.has_self_attention() {
         return Err(NyError::UnsupportedConfiguration(
@@ -233,35 +290,62 @@ pub(super) fn propagate_concrete_point(
         ));
     }
 
-    // Dense-chain fast path: a pure Linear/ReLU/Flatten/Reshape chain has NO
-    // soundness widening (no BatchNorm, no directed-rounding conv), so a point input
-    // stays degenerate through the whole network and there is nothing to amplify.
-    // Delegate to the regular box forward — which preserves the GPU-resident /
-    // cached-plan fast paths (#4081/#4268) — and take the (degenerate) center.
-    // `try_lower_dense_chain` returns Some ONLY for exactly that widening-free set.
-    if try_lower_dense_chain(network, input.shape()).is_some() {
-        let out = propagate_ibp_with_engine_mode(network, input, engine, leading_axis_mode)?;
-        return BoundedTensor::concrete(out.center());
-    }
-
     // General path: collapse the input to a point up front (callers pass a
     // degenerate box, but be defensive: a point forward is only defined at the box
     // center).
-    let mut current = BoundedTensor::concrete(input.center())?;
+    let deadline = match (caller_deadline, ny_core::instance_budget::deadline()) {
+        (Some(caller), Some(instance)) => Some(caller.min(instance)),
+        (caller, instance) => caller.or(instance),
+    };
+    let poll = || {
+        if deadline.is_some_and(|limit| Instant::now() >= limit) {
+            Err(NyError::DeadlineExceeded(
+                "sequential concrete point".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    let center = |bounds: &BoundedTensor| {
+        let values = bounds.center_with_poll(poll)?;
+        BoundedTensor::concrete_with_poll(values, poll)
+    };
+    let mut current = center(input)?;
+
+    // Whole-network IBP plans return enclosing intervals, including execution
+    // allowances; their centers are not a concrete execution contract. Only
+    // each named point kernel below may evaluate this diagnostic route.
     for (i, layer) in network.layers.iter().enumerate() {
-        let next = propagate_layer_ibp_with_engine(layer, &current, engine, leading_axis_mode)
-            .map_err(|e| NyError::LayerError {
-                layer_index: i,
-                layer_type: layer.layer_type().to_string(),
-                source: Box::new(e),
-            })?;
+        poll()?;
+        let next = match layer {
+            Layer::Linear(linear) => {
+                linear.propagate_concrete_point_with_engine_and_deadline(&current, engine, deadline)
+            }
+            Layer::PointLinear(linear) => linear
+                .propagate_concrete_point_with_receipt(&current, engine, deadline)
+                .map(|(point, _)| point),
+            Layer::CausalSoftmax(softmax) => {
+                softmax.propagate_concrete_point_with_deadline(&current, deadline)
+            }
+            _ => propagate_layer_ibp_with_engine(layer, &current, engine, leading_axis_mode),
+        }
+        .map_err(|e| NyError::LayerError {
+            layer_index: i,
+            layer_type: layer.layer_type().to_string(),
+            source: Box::new(e),
+        })?;
         check_sequential_ibp_nan(&next, "Concrete point forward", i, layer.layer_type())?;
         // Re-collapse to the interval center so the next layer sees a point and the
         // seed width cannot be amplified by the rest of the (deep) network.
-        current = BoundedTensor::concrete(next.center())?;
+        current = center(&next)?;
     }
+    poll()?;
     Ok(current)
 }
+
+#[cfg(test)]
+#[path = "forward/point_tests.rs"]
+mod point_tests;
 
 pub(super) fn propagate_concrete_point_plain(
     network: &Network,
@@ -293,14 +377,14 @@ fn propagate_ibp_with_engine_mode(
 
     // Resident fast path: if the engine supports GPU IBP forward and the network
     // is a pure dense chain (Linear/ReLU/Flatten/Reshape), run the entire forward
-    // pass on GPU with a single command submission (#4081 Gap 2).
+    // pass on GPU with a single command submission.
     //
     // This path fires for both Plain and PreserveLeadingAxis modes.
     // `try_lower_dense_chain` computes shapes from the full (possibly batched)
     // input tensor. For networks with Flatten(0) and a prepended restart axis,
     // the lowerer produces a shape mismatch (batch dim folded into features)
     // and returns None, causing correct fallback to the per-layer loop where
-    // PreserveLeadingAxis mode kicks in (#4345).
+    // PreserveLeadingAxis mode kicks in.
     if let Some(gpu) = engine.and_then(|e| e.as_gpu_ibp_forward()) {
         if let Some(gpu_layers) = try_lower_dense_chain(network, input.shape()) {
             let input_lower = contiguous_flat_slice(input.lower());
@@ -484,9 +568,40 @@ pub(super) fn propagate_ibp_sound_with_engine(
     Ok(current)
 }
 
-pub(super) fn collect_ibp_bounds(
+/// Per-layer IBP collector shared by [`collect_ibp_bounds`] and
+/// [`collect_ibp_bounds_with_deadline`].
+///
+/// # Conv-family / AveragePool arms are CERTIFIED, not plain (#seq-plain-collector-sound)
+///
+/// This collector is the base of every sequential verdict path that is not
+/// `collect_ibp_bounds_sound`: the input-split per-domain layer bounds
+/// (`beta_crown/engine/input_split.rs`), the sequential root IBP fast path and
+/// root layer bounds (`beta_crown/engine/bounds.rs`, `verify_phases/initial.rs`),
+/// the CROWN-IBP base (`network/ibp/crown_ibp.rs`) and the CROWN-fast / batched
+/// intermediate bounds (`core/sequential/crown/{fast,batched}.rs`). Each of those
+/// reads ReLU stability (`l >= 0` / `u <= 0`) and verdict boxes straight off the
+/// collected layer bounds. The PLAIN conv arms (`Conv2dLayer::propagate_ibp`,
+/// `Conv1dLayer::propagate_ibp`, the ConvTranspose variants, `AveragePool`)
+/// accumulate a K-term window sum in round-to-nearest f32 with no directed
+/// rounding and no Higham term, so under cancellation the box can sit INSIDE the
+/// true output (documented at `conv2d/bound.rs` `propagate_ibp_sound_with_engine`:
+/// `W=[2^24,1,-2^24,4]` loses ~1.0). An inward per-layer box classifies a truly
+/// unstable ReLU as stable, or shrinks a domain's output box below the threshold,
+/// which is a false VERIFIED domain and hence a false `unsat`.
+///
+/// The repair is at the funnel rather than at the call sites: conv-family layers
+/// go through their certified Higham forward and AveragePool through its
+/// certified window-sum residual — exactly the dispatch `collect_ibp_bounds_sound`
+/// and the graph lane (`graph_alpha/bounds/ibp.rs`) already use. The generic arm is
+/// UNCHANGED (no `round_for_soundness`), so Linear-only networks — whose plain
+/// `LinearLayer::propagate_ibp` is already Higham-certified — remain byte-identical
+/// and no MLP verdict moves. Looser-or-equal boxes only: this can turn a proof into
+/// a timeout, never the reverse. The `deadline` is forwarded to the pollable conv
+/// kernels so finite authority is preserved; `None` keeps the abssum-certificate arm.
+fn collect_ibp_bounds_core(
     network: &Network,
     input: &BoundedTensor,
+    deadline: Option<Instant>,
 ) -> Result<Vec<BoundedTensor>> {
     let n = network.layers.len();
     if n == 0 {
@@ -500,37 +615,34 @@ pub(super) fn collect_ibp_bounds(
     let mut bounds = Vec::with_capacity(n);
     let mut current = input.clone();
 
-    // Process all but last layer with cloning
-    for (i, layer) in network.layers[..n - 1].iter().enumerate() {
-        current = layer
-            .propagate_ibp(&current)
+    for (i, layer) in network.layers.iter().enumerate() {
+        // One certified router for both the plain and the deadline-bearing
+        // lanes (#crown-partial-sound-forward x #seq-plain-collector-sound):
+        // conv family + AveragePool get their certified enclosures, Linear and
+        // the exact-in-f32 arms stay byte-identical, and every remaining layer
+        // is rounded outward rather than published verbatim.
+        current = propagate_ibp_certified_with_deadline(layer, &current, deadline)
             .map_err(|e| NyError::LayerError {
                 layer_index: i,
                 layer_type: layer.layer_type().to_string(),
                 source: Box::new(e),
-            })?;
+            })?
+            .into_tensor();
         check_sequential_ibp_nan(&current, "Sequential IBP collect", i, layer.layer_type())?;
-        bounds.push(current.clone());
+        if i + 1 < n {
+            bounds.push(current.clone());
+        }
     }
-
-    // Process last layer without cloning (move ownership)
-    let last_layer = &network.layers[n - 1];
-    current = last_layer
-        .propagate_ibp(&current)
-        .map_err(|e| NyError::LayerError {
-            layer_index: n - 1,
-            layer_type: last_layer.layer_type().to_string(),
-            source: Box::new(e),
-        })?;
-    check_sequential_ibp_nan(
-        &current,
-        "Sequential IBP collect",
-        n - 1,
-        last_layer.layer_type(),
-    )?;
-    bounds.push(current); // Move, not clone
+    bounds.push(current); // Move the last layer's bounds, not clone
 
     Ok(bounds)
+}
+
+pub(super) fn collect_ibp_bounds(
+    network: &Network,
+    input: &BoundedTensor,
+) -> Result<Vec<BoundedTensor>> {
+    collect_ibp_bounds_core(network, input, None)
 }
 
 pub(super) fn collect_ibp_bounds_sound(
@@ -583,15 +695,163 @@ pub(super) fn collect_ibp_bounds_sound(
     Ok(bounds)
 }
 
+/// A per-layer interval box produced by [`propagate_ibp_certified`]: every
+/// element is an outward-rounded enclosure of the layer's true output range
+/// over the (enclosing) input box it was computed from.
+///
+/// #crown-partial-sound-forward — type-level provenance for the CROWN-IBP
+/// partial walk. `crown_partial.rs` used to seed, scatter and merge through the
+/// PLAIN `Layer::propagate_ibp` box (`crown_partial.rs` "output_bounds"), and
+/// that box is published VERBATIM into the returned CROWN-IBP bound on every
+/// row the sparse seed does not track (`sparse_merge.rs`
+/// `merge_sparse_crown_with_ibp` / `scatter_sparse_crown_into_ibp`) and wins
+/// the per-element intersection on tracked rows whenever it is tighter. The
+/// plain conv-family arm is round-to-nearest f32 with no directed rounding and
+/// no Higham term, documented as able to sit INWARD of the true supremum
+/// (`conv2d/bound.rs` `propagate_ibp_sound_with_engine` doc, the
+/// `W=[2^24,1,-2^24,4]` cancellation). Inward + published = a false stability
+/// classification = a possible wrong VERIFIED. Those sites now accept only this
+/// type, so a plain box cannot be handed to them without a compile error.
+///
+/// The ONLY constructor is [`propagate_ibp_certified`]: there is deliberately no
+/// `from_tensor`, so a reviewer can grep this file for every way a value of this
+/// type comes into existence. (The boxes those sites INTERSECT with — the
+/// collector's incumbent and the CROWN concretization — are certified by their
+/// own construction, see [`collect_ibp_bounds_with_deadline`] and
+/// `LinearBounds::concretize_sound_with_deadline`; an intersection of two
+/// enclosures encloses, and a disjoint pair unions.)
+#[derive(Debug, Clone)]
+pub(super) struct CertifiedIbpBox(BoundedTensor);
+
+impl CertifiedIbpBox {
+    /// Borrow the enclosing box.
+    #[inline]
+    pub(super) fn as_tensor(&self) -> &BoundedTensor {
+        &self.0
+    }
+
+    /// Unwrap the enclosing box.
+    #[inline]
+    pub(super) fn into_tensor(self) -> BoundedTensor {
+        self.0
+    }
+}
+
+/// CERTIFIED per-layer interval forward for the sequential collector family.
+///
+/// The arm table is the one [`collect_ibp_bounds_sound`] uses, with two
+/// deliberate deviations that keep Linear-only (MLP) networks BYTE-IDENTICAL
+/// to the plain collector while the conv family gains its Higham enclosure:
+///
+/// * `Linear` takes the PLAIN arm: that arm is itself certified — the
+///   abssum-Higham certificate `γ_{n+2}·S + 2u·|y|` is applied inside
+///   `LinearLayer::propagate_ibp` (`linear/ibp.rs`, both the rank-1 f64 path
+///   and the N-D/GEMM f32 path), and `propagate_ibp_sound` only stacks a
+///   further `n+2` ULPs on top of it. Stacking would change every published
+///   MLP bound by a few ULPs for no soundness gain.
+/// * `ReLU`, `Flatten` and `Reshape` are EXACT in f32 (`max(0,x)` and data
+///   movement round nothing), so no widening is applied; the sound collector's
+///   blanket 1-ULP arm would again perturb MLP bounds for no gain.
+///
+/// Everything else follows the sound collector: the conv family (now including
+/// `Conv3d`, which owns a certified arm) and `AveragePool` take their certified
+/// Higham forwards; every remaining kind takes the plain arm plus the 1-ULP
+/// `round_for_soundness_inplace` widening. The 1-ULP class is the residual the
+/// second audit already names for the DAG collector's generic arm and is not
+/// tightened here.
+pub(super) fn propagate_ibp_certified(
+    layer: &Layer,
+    input: &BoundedTensor,
+) -> Result<CertifiedIbpBox> {
+    propagate_ibp_certified_with_deadline(layer, input, None)
+}
+
+/// The deadline-bearing form of [`propagate_ibp_certified`], and the SINGLE
+/// certified layer router — [`propagate_ibp_certified`] and
+/// [`collect_ibp_bounds_core`] both go through it, so the two cannot drift.
+///
+/// The conv family's certified kernels are pollable, so an expired deadline
+/// inside a conv forward surfaces as an error (a timeout) rather than an opaque
+/// kernel running past finite authority (#seq-plain-collector-sound). Every
+/// other arm is not deadline-aware and behaves exactly as before.
+///
+/// Merge note (#crown-partial-sound-forward x #seq-plain-collector-sound): two
+/// branches independently certified this walk, one with the deadline and a
+/// narrower layer set, one with the full layer set and no deadline. Taking
+/// either side alone would have dropped the other's coverage — specifically
+/// `Conv3d` and the outward-rounded generic arm, which the deadline-bearing
+/// version did not have. This is the union of the two, routed once.
+pub(super) fn propagate_ibp_certified_with_deadline(
+    layer: &Layer,
+    input: &BoundedTensor,
+    deadline: Option<Instant>,
+) -> Result<CertifiedIbpBox> {
+    let out = match layer {
+        // Self-certified plain arm (see doc above): byte-identical to the
+        // plain collector on MLPs.
+        Layer::Linear(linear) => linear.propagate_ibp(input)?,
+        // Conv family: certified Higham error term, outward-rounded.
+        Layer::Conv1d(conv) => {
+            conv.propagate_ibp_sound_with_engine_and_deadline(input, None, deadline)?
+        }
+        Layer::Conv2d(conv) => {
+            conv.propagate_ibp_sound_with_engine_and_deadline(input, None, deadline)?
+        }
+        Layer::Conv3d(conv) => {
+            conv.propagate_ibp_sound_with_engine_and_deadline(input, None, deadline)?
+        }
+        Layer::ConvTranspose1d(conv) => {
+            conv.propagate_ibp_sound_with_engine_and_deadline(input, None, deadline)?
+        }
+        Layer::ConvTranspose2d(conv) => {
+            conv.propagate_ibp_sound_with_engine_and_deadline(input, None, deadline)?
+        }
+        // AveragePool: certified γ⁶⁴ window-sum residual (#avgpool-1ulp-arm).
+        Layer::AveragePool(pool) => pool.propagate_ibp_sound(input)?,
+        // Exact in f32: nothing to widen.
+        Layer::ReLU(_) | Layer::Flatten(_) | Layer::Reshape(_) => layer.propagate_ibp(input)?,
+        _ => {
+            let mut result = layer.propagate_ibp(input)?;
+            result.round_for_soundness_inplace();
+            result
+        }
+    };
+    Ok(CertifiedIbpBox(out))
+}
+
+/// Collect the per-layer incumbent for the deadline-bearing (= verdict-bearing)
+/// sequential lanes: CROWN-IBP collection (`crown_ibp.rs` `collect_core`, the
+/// `precomputed_ibp: None` arm) and the sequential β-CROWN engine's root and
+/// per-domain boxes (`beta_crown/engine/bounds.rs`, `input_split.rs`,
+/// `verify_phases/initial.rs`).
+///
+/// #crown-partial-sound-forward: this used to be the PLAIN [`collect_ibp_bounds`].
+/// The incumbent it produces is published VERBATIM by the collector on the
+/// ReLU-stable skip and on every `ForwardFallback` arm, is the operand every
+/// CROWN box is intersected with (tighter wins, so an inward plain incumbent
+/// survives a certified CROWN box), and `bounds.rs` returns `Verified` straight
+/// off its last entry with no CROWN at all. It is therefore built with
+/// [`propagate_ibp_certified`] — Linear-only networks stay byte-identical (see
+/// that function), conv-family networks gain the Higham enclosure. The plain
+/// [`collect_ibp_bounds`] remains for the non-deadline public API.
+///
+/// IBP must run to completion to produce bounds for all layers — the CROWN
+/// backward pass needs pre-activation bounds at every layer. Deadline checking
+/// happens AFTER IBP in the CROWN-IBP collection function, which skips the
+/// expensive per-layer CROWN partial passes when the deadline has been consumed
+/// by IBP.
 pub(super) fn collect_ibp_bounds_with_deadline(
     network: &Network,
     input: &BoundedTensor,
-    _deadline: Option<Instant>,
+    deadline: Option<Instant>,
 ) -> Result<Vec<BoundedTensor>> {
-    // IBP must run to completion to produce bounds for all layers —
-    // the CROWN backward pass needs pre-activation bounds at every layer.
-    // Deadline checking happens AFTER IBP in the CROWN-IBP collection
-    // function, which skips the expensive per-layer CROWN partial passes
-    // when the deadline has been consumed by IBP (#3397).
-    collect_ibp_bounds(network, input)
+    // IBP runs to completion to produce bounds for all layers — the CROWN
+    // backward pass needs pre-activation bounds at every layer. The CROWN-IBP
+    // collection function skips the expensive per-layer CROWN partial passes when
+    // the deadline has been consumed by IBP. The deadline IS forwarded to
+    // the certified conv-family kernels (#seq-plain-collector-sound): those are
+    // pollable, so an expired deadline inside a conv forward surfaces as an
+    // error (a timeout) instead of an opaque kernel running past finite authority.
+    // Linear and the generic arm are not deadline-aware and behave exactly as before.
+    collect_ibp_bounds_core(network, input, deadline)
 }

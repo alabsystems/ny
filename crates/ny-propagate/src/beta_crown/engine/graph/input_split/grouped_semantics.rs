@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Disjunctive (OR-of-AND) domain helpers for grouped input-split BaB (#3740).
+//! Disjunctive (OR-of-AND) domain helpers for grouped input-split BaB.
 //!
 //! Extracted from `disjunctive_multi_clause.rs` (Packet B1) to keep the main
 //! verifier loop under the 500-line guard. These helpers mirror the grouped
@@ -50,7 +50,7 @@ pub(super) fn objective_interval_verified(lower: f32, upper: f32, threshold: f32
 
 /// Disjunctive (OR-of-AND) domain check: clause satisfied if ANY row has
 /// finite `lower > threshold`; domain verified if EVERY clause satisfied.
-/// Mirrors `stop_criterion_general` (`auto_LiRPA/utils.py:115-137`). Part of #3740.
+/// Mirrors `stop_criterion_general` (`auto_LiRPA/utils.py:115-137`).
 pub(crate) fn disjunctive_domain_verified(
     obj_bounds: &[(f32, f32)],
     thresholds: &[f32],
@@ -83,8 +83,6 @@ pub(crate) fn disjunctive_domain_verified(
 /// is bottlenecked by the hardest remaining clause.
 ///
 /// Non-finite rows yield `NEG_INFINITY` gap, matching Packet A's stop helper.
-///
-/// Part of #3740 Packet B.
 pub(crate) fn disjunctive_domain_priority(
     obj_bounds: &[(f32, f32)],
     thresholds: &[f32],

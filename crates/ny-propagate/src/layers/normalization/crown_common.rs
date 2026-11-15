@@ -19,8 +19,6 @@
 //! 4. Sampling-based error estimation (3-level grid + axis-aligned + hash-random)
 //! 5. f64 backward propagation with per-row non-finite guard
 //! 6. Directed rounding on bias
-//!
-//! Reference: designs/2026-02-27-normalization-trait-dedup.md
 
 use ndarray::{Array1, Array2};
 use ny_core::{is_crown_coeff_safe_f64, NyError, Result};
@@ -45,7 +43,7 @@ pub(crate) fn gate_crown_mode<L: NormLayer>(
     match layer.crown_mode() {
         LayerNormCrownMode::IbpValidated => {
             // Every caller intercepts IbpValidated and routes it to its sound
-            // decomposed primitive-chain CROWN (#3775); only Sampling mode
+            // decomposed primitive-chain CROWN; only Sampling mode
             // reaches the shared sampling linearization below.
             Ok(None)
         }
@@ -118,7 +116,7 @@ pub(crate) fn sampling_crown_scalar<L: NormLayer>(
     let num_neurons = pre_lower.len();
     let num_outputs = bounds.num_outputs();
 
-    // Non-finite pre-activation guard (#3259, same pattern as #2591).
+    // Non-finite pre-activation guard.
     // When any dimension has infinite or NaN bounds, sampling-based
     // linearization fails (center = NaN from (-inf + inf)/2).
     // Normalization is NOT the identity function — returning bounds.clone()
@@ -127,7 +125,7 @@ pub(crate) fn sampling_crown_scalar<L: NormLayer>(
     // Return trivially sound constant bounds: A = 0, bias = [-inf, +inf].
     // This means "the output could be anything" — sound but contributes no
     // tightening. Matches the per-row non-finite guard in backward_propagate_f64
-    // and the LogSoftmax constant-bounds fallback for #2591.
+    // and the LogSoftmax constant-bounds fallback.
     let has_non_finite =
         pre_lower.iter().any(|&v| !v.is_finite()) || pre_upper.iter().any(|&v| !v.is_finite());
     if has_non_finite {
@@ -153,7 +151,7 @@ pub(crate) fn sampling_crown_scalar<L: NormLayer>(
 
     // Guard: if Jacobian or eval output contains non-finite entries (Inf from
     // ny/std overflow when std is tiny), return NumericalInstability so the
-    // caller falls back to IBP. (#2901)
+    // caller falls back to IBP.
     if jacobian.iter().any(|v| !v.is_finite()) || y_center.iter().any(|v| !v.is_finite()) {
         return Err(NyError::NumericalInstability(format!(
             "{} CROWN: non-finite Jacobian or eval output (ny/std overflow)",
@@ -173,7 +171,7 @@ pub(crate) fn sampling_crown_scalar<L: NormLayer>(
     // simultaneously, so the worst nonlinear residual can occur at interior
     // points where some coordinates are at their center value (minimizing
     // the denominator). Corner-only sampling (2^n) misses these interior
-    // extrema. (#3103)
+    // extrema.
     let (max_error_above, max_error_below) = estimate_sampling_error(
         layer,
         num_neurons,
@@ -187,10 +185,10 @@ pub(crate) fn sampling_crown_scalar<L: NormLayer>(
     // Apply safety margin and minimum floor
     let (max_error_above, max_error_below) = apply_safety_margin(max_error_above, max_error_below);
 
-    // Backward propagation with f64 accumulation (#1745, #2169).
+    // Backward propagation with f64 accumulation.
     // The Jacobian has mixed signs (rows sum to 0 for LayerNorm), so
     // O(num_neurons) terms with cancellation make f32 accumulation unsound.
-    // Directed rounding on final f32 cast (#1992, #2164).
+    // Directed rounding on final f32 cast.
     backward_propagate_f64(
         num_outputs,
         num_neurons,
@@ -315,9 +313,9 @@ fn apply_safety_margin(
 /// Backward propagation through normalization using linear relaxation.
 ///
 /// Both weight and bias accumulation use f64 to prevent catastrophic
-/// cancellation (#1745, #2169). Per-row non-finite guard (#3128, #3027)
+/// cancellation. Per-row non-finite guard
 /// widens affected rows to conservative bounds. Directed rounding on
-/// final f32 bias cast (#1992, #2164).
+/// final f32 bias cast.
 fn backward_propagate_f64(
     num_outputs: usize,
     num_neurons: usize,
@@ -338,7 +336,7 @@ fn backward_propagate_f64(
             let ua = bounds.upper_a()[[j, i]];
 
             // For lower bound output: need lower bound on each y_i when coeff positive
-            // Guard: skip zero coefficients to avoid 0*inf NaN (#1739).
+            // Guard: skip zero coefficients to avoid 0*inf NaN.
             if la > 0.0 {
                 let la_f64 = la as f64;
                 for k in 0..num_neurons {
@@ -369,7 +367,7 @@ fn backward_propagate_f64(
             }
         }
 
-        // Per-row unsafe coefficient guard (#3128, #3027, #3228): when Inf or
+        // Per-row unsafe coefficient guard: when Inf or
         // near-overflow coefficients from compose() produce Inf*0.0 = NaN or
         // Inf*nonzero = ±Inf in Jacobian accumulation, widen the affected row
         // to conservative bounds rather than poisoning the entire matrix via
@@ -397,7 +395,7 @@ fn backward_propagate_f64(
     // A-matrix: standard f64→f32 rounding (round-to-nearest), matching
     // alpha-beta-CROWN. Directed rounding on A is not unconditionally sound
     // because the sign of the coefficient determines which direction is
-    // conservative during concretization (#2208).
+    // conservative during concretization.
     LinearBounds::new_or_conservative(
         new_lower_a_f64.mapv(|x| x as f32),
         new_lower_b_f64.mapv(|x| next_down_f32(x as f32)),

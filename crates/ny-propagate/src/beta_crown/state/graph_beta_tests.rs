@@ -26,7 +26,7 @@ fn make_state(entries: Vec<GraphBetaEntry>) -> GraphBetaState {
     GraphBetaState::from_entries(entries)
 }
 
-/// Regression test for #2980: from_history_with_warmup must sanitize NaN/Inf
+/// Regression test: from_history_with_warmup must sanitize NaN/Inf
 /// in parent optimizer state fields (value, m, v, v_max) instead of copying
 /// them through to the child domain.
 #[test]
@@ -80,7 +80,7 @@ fn test_from_history_with_warmup_sanitizes_nan_parent_state_2980() {
     assert_eq!(entry.v_max, 0.0);
 }
 
-/// Regression test for #2980: from_history_with_warmup preserves valid parent
+/// Regression test: from_history_with_warmup preserves valid parent
 /// optimizer state (m, v, v_max) when values are finite.
 #[test]
 fn test_from_history_with_warmup_preserves_valid_parent_state_2980() {
@@ -117,7 +117,7 @@ fn test_from_history_with_warmup_preserves_valid_parent_state_2980() {
     assert_eq!(entry.grad(), 0.0, "gradient reset for child domain");
 }
 
-/// Regression test for #2939: standard (non-Adam) gradient_step must recover
+/// Regression test: standard (non-Adam) gradient_step must recover
 /// from NaN gradients instead of permanently corrupting graph beta values.
 #[test]
 fn test_gradient_step_nan_recovery_2939() {
@@ -159,7 +159,7 @@ fn test_gradient_step_nan_recovery_2939() {
     );
 }
 
-/// Regression test for #2939: after NaN recovery, the next gradient step must
+/// Regression test: after NaN recovery, the next gradient step must
 /// work normally (corruption is not permanent).
 #[test]
 fn test_gradient_step_nan_recovery_then_normal_2939() {
@@ -185,7 +185,7 @@ fn test_gradient_step_nan_recovery_then_normal_2939() {
     );
 }
 
-/// Regression test for #2600: NaN-margin objectives must be selected as critical
+/// Regression test: NaN-margin objectives must be selected as critical
 /// (worst case) in multi-objective gradient computation.
 ///
 /// IEEE 754: NaN < min_margin = false, so without the NEG_INFINITY guard,
@@ -239,7 +239,7 @@ fn test_multi_objective_nan_lb_selects_nan_as_critical_2600() {
     );
 }
 
-/// Regression test for #2600: when only one objective has NaN lb and all others
+/// Regression test: when only one objective has NaN lb and all others
 /// are verified, the NaN objective must still be selected (not all-verified).
 #[test]
 fn test_multi_objective_nan_lb_not_masked_by_verified_2600() {
@@ -276,7 +276,7 @@ fn test_multi_objective_nan_lb_not_masked_by_verified_2600() {
     );
 }
 
-/// Regression test for #4306: when spec-guided intermediates already store one
+/// Regression test: when spec-guided intermediates already store one
 /// row per objective, gradient computation must consume the selected row
 /// directly instead of reapplying the objective coefficients.
 #[test]
@@ -311,7 +311,7 @@ fn test_multi_objective_spec_rows_use_direct_row_sensitivity_4306() {
     assert_eq!(max_grad, 3.0);
 }
 
-/// Regression test for #4306: conjunctive critical-objective selection should
+/// Regression test: conjunctive critical-objective selection should
 /// continue using max beta sensitivity even when intermediates are spec rows.
 #[test]
 fn test_multi_objective_spec_rows_conjunctive_prefers_max_sensitivity_4306() {
@@ -385,7 +385,6 @@ fn build_scaled_history(n: usize) -> crate::beta_crown::branching::GraphSplitHis
 ///
 /// Current implementation: O(C²) via linear scan (entry_for_constraint called
 /// C times). Exercises 500 constraints — VNN-COMP realistic BaB depth.
-/// Tracks: #2936, #2999
 #[test]
 fn test_from_history_with_warmup_scaling_500_constraints() {
     let n = 500;
@@ -401,7 +400,7 @@ fn test_from_history_with_warmup_scaling_500_constraints() {
     assert_eq!(child.entries[0].node_name, "relu_0");
     assert!((child.entries[0].value() - 0.1).abs() < 1e-6);
 
-    // Mid entry (#249) inherits parent value and Adam state
+    // Mid entry inherits parent value and Adam state
     let mid = &child.entries[249];
     assert_eq!(mid.node_name, "relu_4");
     assert!((mid.value() - (0.1 + 249.0 * 0.001)).abs() < 1e-4);
@@ -437,7 +436,7 @@ fn make_entry_full(
 }
 
 /// Verifies entry_for_constraint distinguishes same-node constraints by
-/// neuron_idx, split_point, and sign (the common BaB case). Tracks: #2936
+/// neuron_idx, split_point, and sign (the common BaB case).
 #[test]
 fn test_entry_for_constraint_same_node_different_neurons() {
     let state = make_state(vec![
@@ -508,7 +507,7 @@ fn test_graph_beta_state_rebuilds_lookup_after_entries_push_2936() {
     assert!((state.entries[1].grad() - 1.5).abs() < 1e-6);
 }
 
-/// Part of #2936: verify `has_node_entries` and `entries_for_node` produce
+/// Verify `has_node_entries` and `entries_for_node` produce
 /// results consistent with the old linear scan pattern.
 #[test]
 fn test_has_node_entries_and_entries_for_node_2936() {
@@ -548,7 +547,7 @@ fn test_has_node_entries_and_entries_for_node_2936() {
     assert!(relu2.is_empty(), "absent node yields empty iterator");
 }
 
-// ── Performance proofs: O(1) indexed lookups at BaB scale (#2936) ─────────────
+// ── Performance proofs: O(1) indexed lookups at BaB scale ─────────────
 
 /// Performance proof: GraphBetaState index covers all entries after construction,
 /// guaranteeing O(1) `entry()` and `signed_beta()` lookups at BaB-realistic scale.
@@ -558,7 +557,6 @@ fn test_has_node_entries_and_entries_for_node_2936() {
 ///
 /// Verifies: `lookup_index_fresh()` returns true after `from_entries()` at scale,
 /// and every entry is reachable via the indexed path.
-/// Tracks: #2936 Finding 1, Finding 2.
 #[test]
 fn test_graph_beta_state_index_fresh_at_scale_2936() {
     let n = 500;
@@ -601,12 +599,11 @@ fn test_graph_beta_state_index_fresh_at_scale_2936() {
 /// Performance proof: `from_history_with_warmup` produces a fresh index at scale,
 /// so child domain lookups are O(1) from the first access.
 ///
-/// Before the fix (#2936 Finding 2), `from_history_with_warmup` used O(B²) linear
+/// Before the fix, `from_history_with_warmup` used O(B²) linear
 /// scans via `entry_for_constraint` for each of B constraints. Now it uses the
 /// neuron_index for O(1) per constraint.
 ///
 /// Verifies: child state has fresh index and all parent values are correctly warmed.
-/// Tracks: #2936 Finding 2.
 #[test]
 fn test_graph_beta_from_history_warmup_index_fresh_at_scale_2936() {
     let n = 500;
@@ -644,7 +641,6 @@ fn test_graph_beta_from_history_warmup_index_fresh_at_scale_2936() {
 ///
 /// In BaB trees, the same neuron can be constrained multiple times at different
 /// split points. `signed_beta` must find all of them via the index.
-/// Tracks: #2936 Finding 3.
 #[test]
 fn test_graph_beta_signed_beta_indexed_multi_entry_2936() {
     // Create entries with duplicate (node, neuron) pairs but different signs.

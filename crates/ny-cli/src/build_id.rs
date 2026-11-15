@@ -2,53 +2,20 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Binary identity (#binary-identity): what verifier produced a measurement.
+//! Binary identity (#binary-identity) for measurement provenance.
 //!
-//! ## The failure this closes
-//!
-//! Four times this campaign a measurement was attributed to the wrong binary.
-//! The sharpest instance: a corpus re-sweep sealed
-//! `executable.sha256 = cfe490f1…` and `compute_backend = "cuda …"` into its
-//! manifest ONCE at startup, then invoked `target/release/ny` **by mutable
-//! path** for all 330 rows. Somebody rebuilt. The file at that path became
-//! `e3d81cc2…`, mip-only, wgpu — a different verifier. Nothing re-checked, so
-//! 21 rows read as regressions that were actually a different program, and the
-//! whole bank is of unknown provenance. Prior instances: a lock-blocked
-//! `cargo build` that exited 0 so the A/B ran against a binary predating the
-//! edits; a measurement against a five-day-old `ny 0.1.0`.
-//!
-//! Every one of those was survivable only because the binary could not say who
-//! it was. `ny --version` answered `ny 0.3.0` before and after, because
-//! `[workspace.package] version` had not moved for the entire campaign; it
-//! first moved at the `0.3.0 -> 0.4.0` bump in `b791c199a`, long after these
-//! incidents.
-//!
-//! ## The design
-//!
-//! The VERSION is the primary handle, and it is derived, not typed:
+//! `build.rs` derives the display version from the manifest's major/minor and
+//! `git rev-list --count HEAD`, with a commit/diff suffix for dirty sources:
 //!
 //! ```text
 //! <major>.<minor>.4745                         clean build at commit #4745
 //! <major>.<minor>.4745+dirty.2c8538a3.9f1c2ab3  dirty tree: commit prefix + diff digest
 //! ```
 //!
-//! Major/minor come from `Cargo.toml`; the PATCH is `git rev-list --count
-//! HEAD`, stamped by `build.rs`, so two commits can never report the same
-//! version and nobody has to remember to bump. A dirty tree — how nearly all
-//! measurement here happens — is marked explicitly and digests its own diff,
-//! so two different uncommitted states at one commit are still distinguishable.
-//!
-//! The version alone cannot express what else changes the verifier, so the
-//! canonical line qualifies it with the enabled cargo FEATURE TIER (`mip` is
-//! the wgpu dev lane, `mip,cuda` is the tier
-//! `vnncomp_scripts/build_submission_binary.sh:527` requires for submission),
-//! the compiled backend class, the impl provenance markers the campaign
-//! already greps for, the toolchain, and finally the sha256 of the executable
-//! FILE as the tamper/swap check underneath.
-//!
-//! Content-addressed, not path-addressed: [`BinaryIdentityGuard`] re-hashes
-//! the file before every measurement, so replacing the bytes at the same path
-//! with the same mtime is a hard error rather than silent mixed data.
+//! Commit counts can coincide on different branches. The full stamp therefore
+//! includes the commit, source digest, features, backend, markers and toolchain.
+//! [`BinaryIdentity`] adds the executable SHA-256; [`BinaryIdentityGuard`]
+//! rechecks its bytes to detect replacement at the same path.
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -187,19 +154,8 @@ impl BuildStamp {
         ]
     }
 
-    /// The FREE identity line: everything the binary knows about itself with
-    /// no filesystem access at all.
-    ///
-    /// This is what goes in every run log and every flight receipt, and it is
-    /// why the split exists. The content-addressed [`BinaryIdentity`] line has
-    /// to read and hash the whole executable; on the scored path that is per-
-    /// instance overhead charged against a budget as small as 10 s, and it
-    /// would be paid by the child that has nothing to compare against anyway.
-    /// The `stamp=` digest is shared with `NY_BUILD_ID_V1`, so a log line and a
-    /// sweep manifest cross-link exactly.
-    ///
-    /// It already separates the two binaries of the 2026-08-21 incident:
-    /// different `version=`, different `features=`, different `backend=`.
+    /// Compiled identity without filesystem I/O, for run logs and flight receipts.
+    /// Its `stamp=` digest links to the executable identity in a sweep manifest.
     pub(crate) fn canonical_line(&self) -> String {
         format!(
             "{STAMP_SCHEMA} version={} features={} backend={} markers={} commit={} dirty={} \
@@ -821,14 +777,18 @@ mod tests {
         assert_eq!(identity.stamp_sha256, stamp.digest());
         assert_eq!(current_line(), line);
 
-        // And the stamp alone already separates the two binaries of the
-        // 2026-08-21 incident, which both answered `ny 0.3.0`.
+        // Compare explicit tiers so the test also runs in a CUDA build.
+        let baseline_tier = BuildStamp {
+            features: "mip",
+            backend: "wgpu",
+            ..stamp
+        };
         let cuda_tier = BuildStamp {
             features: "mip,cuda",
             backend: "cuda+wgpu",
             ..stamp
         };
-        assert_ne!(cuda_tier.canonical_line(), line);
+        assert_ne!(cuda_tier.canonical_line(), baseline_tier.canonical_line());
     }
 
     /// The canonical line is one line, greppable, and round-trips every field

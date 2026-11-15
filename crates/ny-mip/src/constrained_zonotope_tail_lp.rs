@@ -1389,6 +1389,59 @@ mod tests {
 
     use super::*;
 
+    /// #ay-ns-tier: assert a RIGOROUS LOWER BOUND against the exact optimum it
+    /// may not exceed, plus the looseness we are prepared to accept.
+    ///
+    /// These queries used to fall through to ay-milp's EXACT RATIONAL RIM, so the
+    /// returned bound WAS the optimum and `assert_eq!` against a literal held.
+    /// That fallthrough was itself the defect: ay `95088f2bc` records it costing
+    /// "no answer in 120 s from 96 cols" on the layered shape ny's tighten stream
+    /// drives, now 11.8 ms/solve. The Neumaier-Shcherbina tier that answers in its
+    /// place is still rigorous but no longer exact, so a literal is the wrong
+    /// contract — it pins an implementation detail that upstream deliberately
+    /// changed.
+    ///
+    /// Pin the two properties that actually matter, separately:
+    ///
+    /// * **SOUNDNESS** — a rigorous lower bound may NEVER EXCEED the true
+    ///   optimum. This is the only direction that could become a false proof, and
+    ///   it is asserted EXACTLY, with no tolerance. Note this is strictly MORE
+    ///   than the old `assert_eq!` expressed: equality made the soundness
+    ///   direction implicit, so a future change that moved the bound the unsafe
+    ///   way would have failed with an opaque "not equal" rather than naming the
+    ///   breach.
+    /// * **TIGHTNESS** — and it must stay within `tol` of the optimum, or the
+    ///   tier has regressed into uselessness and this lane silently stops proving
+    ///   things. ay's own commit measures the NS answer "within 1e-6 of the exact
+    ///   rim" on a two-layer slice, which is where the default tolerance below
+    ///   comes from.
+    ///
+    /// The honest cost: this is WEAKER than exact equality as a regression
+    /// detector. That is the necessary trade — the exact value is no longer the
+    /// contract — but it means a drift inside `tol` will not be caught here.
+    fn assert_rigorous_lower_bound_near(
+        actual: &Option<BigRational>,
+        exact: BigRational,
+        what: &str,
+    ) {
+        // 1e-6, the figure ay measured its own NS tier against.
+        let tol = BigRational::new(1.into(), 1_000_000.into());
+        let got = actual
+            .as_ref()
+            .unwrap_or_else(|| panic!("{what}: no rigorous lower bound was produced at all"));
+        assert!(
+            *got <= exact,
+            "{what}: UNSOUND — rigorous lower bound {got} EXCEEDS the exact optimum {exact}; \
+             a lower bound that overshoots the optimum is a false proof"
+        );
+        let floor = &exact - &tol;
+        assert!(
+            *got >= floor,
+            "{what}: bound {got} is more than {tol} below the exact optimum {exact} \
+             (floor {floor}) — the NS tier has regressed in tightness"
+        );
+    }
+
     fn test_limits() -> ConstrainedZonotopeTailLpLimits {
         ConstrainedZonotopeTailLpLimits {
             max_value_dim: 8,
@@ -1446,9 +1499,10 @@ mod tests {
         assert_eq!(diagnostic.plan.model_nonzeros, 14);
         assert_eq!(diagnostic.unresolved_margin_count, 0);
         assert!(diagnostic.all_margins_strictly_positive);
-        assert_eq!(
-            diagnostic.minimum_rigorous_lower_bound,
-            Some(BigRational::new(1.into(), 4.into()))
+        assert_rigorous_lower_bound_near(
+            &diagnostic.minimum_rigorous_lower_bound,
+            BigRational::new(1.into(), 4.into()),
+            "exact_predicate_and_relu_hull_prove_positive_margin",
         );
         assert_eq!(diagnostic.exact_milp.relu_binary_count, 1);
         assert!(diagnostic.exact_milp.within_declared_caps);
@@ -1481,9 +1535,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![3, 1]
         );
-        assert_eq!(
-            diagnostic.minimum_rigorous_lower_bound,
-            Some(BigRational::new(1.into(), 8.into()))
+        assert_rigorous_lower_bound_near(
+            &diagnostic.minimum_rigorous_lower_bound,
+            BigRational::new(1.into(), 8.into()),
+            "challenger_subset_preserves_order_and_prices_only_requested_margins",
         );
         assert!(diagnostic.all_margins_strictly_positive);
     }
@@ -1588,9 +1643,10 @@ mod tests {
 
         assert!(!diagnostic.all_margins_strictly_positive);
         assert_eq!(diagnostic.unresolved_margin_count, 0);
-        assert_eq!(
-            diagnostic.minimum_rigorous_lower_bound,
-            Some(BigRational::new((-1).into(), 4.into()))
+        assert_rigorous_lower_bound_near(
+            &diagnostic.minimum_rigorous_lower_bound,
+            BigRational::new((-1).into(), 4.into()),
+            "absent_predicate_exposes_nonpositive_gap_without_claiming_proof",
         );
     }
 
@@ -1615,9 +1671,10 @@ mod tests {
 
         assert_eq!(diagnostic.plan.active_relus, 1);
         assert_eq!(diagnostic.plan.unstable_relus, 0);
-        assert_eq!(
-            diagnostic.minimum_rigorous_lower_bound,
-            Some(BigRational::new(1.into(), 4.into()))
+        assert_rigorous_lower_bound_near(
+            &diagnostic.minimum_rigorous_lower_bound,
+            BigRational::new(1.into(), 4.into()),
+            "independent_remainder_variable_reaches_the_margin_bound",
         );
         assert!(diagnostic.all_margins_strictly_positive);
     }

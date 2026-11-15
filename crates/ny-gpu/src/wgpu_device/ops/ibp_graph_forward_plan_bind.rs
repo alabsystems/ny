@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bind group builders for graph-DAG GPU-resident IBP (#4319).
+//! Bind group builders for graph-DAG GPU-resident IBP.
 //!
 //! Extracted from `ibp_graph_forward_plan_build.rs` for file-size compliance.
 

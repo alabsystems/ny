@@ -202,6 +202,7 @@ fn analytic_chain_valid_order_does_not_silently_fallback_to_local_gradients() {
         None,
         &local_grads,
         0,
+        None,
     )
     .expect("analytic chain should succeed on valid contiguous ReLU order");
 
@@ -241,6 +242,7 @@ fn analytic_chain_invalid_order_falls_back_to_local_gradients() {
         None,
         &local_grads,
         0,
+        None,
     )
     .expect("invalid order should return the documented local-gradient fallback");
 
@@ -312,6 +314,7 @@ fn analytic_chain_backward_error_records_fallback_after_iter_zero_2544() {
         None,
         &local_grads,
         4,
+        None,
     )
     .expect("AnalyticChain should fall back to local gradients on backward errors");
 
@@ -321,4 +324,92 @@ fn analytic_chain_backward_error_records_fallback_after_iter_zero_2544() {
         1,
         "backward-pass errors must record a fallback on every iteration, not only iter 0 (#2544)"
     );
+}
+
+/// #alpha-envelope-grad-cpu, SEQUENTIAL lane: `compute_sequential_gradients`
+/// must hand the TYPED `config.alpha_envelope_grad` to the CPU chain gradient.
+/// Before the fix `analytic_chain_gradients` resolved the rule env-only, so the
+/// preset key `bab.alpha_crown.alpha_envelope_grad` was dark on this lane no
+/// matter what the yaml said.
+///
+/// The evidence is the chain gradient's OWN per-call tally (the same code that
+/// prints the unconditional `[alpha-envelope-grad]` line), not an inference
+/// from gradient values, and it names the resolving layer: `config`, i.e. the
+/// typed value, with the env layer held ABSENT for the whole test.
+#[test]
+fn sequential_analytic_chain_delivers_typed_alpha_envelope_grad() {
+    use crate::network::graph_alpha::backward::gradients::{
+        take_cpu_envelope_tally, EnvelopeEngagement,
+    };
+    use ny_levers::decls::root_alpha::ALPHA_ENVELOPE_GRAD;
+
+    ny_test_utils::env::with_serialized_env_vars_removed(&[ALPHA_ENVELOPE_GRAD.name], || {
+        for armed in [false, true] {
+            reset_sequential_gradient_diagnostics();
+            let (
+                graph,
+                input,
+                node_bounds,
+                mut alpha_state,
+                exec_order,
+                relu_name_to_idx,
+                local_grads,
+            ) = build_chain_rule_fixture();
+            let config = AlphaCrownConfig {
+                gradient_method: GradientMethod::AnalyticChain,
+                alpha_envelope_grad: armed,
+                ..AlphaCrownConfig::default()
+            };
+            let _ = take_cpu_envelope_tally();
+
+            let gradients = compute_sequential_gradients(
+                &graph,
+                &config,
+                &mut alpha_state,
+                &input,
+                &node_bounds,
+                &exec_order,
+                2,
+                &relu_name_to_idx,
+                None,
+                &local_grads,
+                0,
+            )
+            .expect("AnalyticChain succeeds on the valid chain fixture");
+            let tally = take_cpu_envelope_tally();
+
+            assert_eq!(gradients.len(), 2, "one gradient array per ReLU");
+            assert_eq!(
+                sequential_chain_fallbacks(),
+                0,
+                "armed={armed}: the chain replay must run, or this test proves nothing"
+            );
+            assert_eq!(
+                tally.calls, 1,
+                "armed={armed}: exactly one CPU chain-gradient call per iteration, got {tally:?}"
+            );
+            let (choice, engagement) = tally
+                .last
+                .expect("the CPU chain gradient records its choice");
+            assert_eq!(
+                choice.enabled, armed,
+                "the typed config value must decide the rule on the sequential lane"
+            );
+            assert_eq!(
+                choice.source,
+                Some(ny_levers::Source::Config),
+                "with the env layer absent the answer must come from the typed config"
+            );
+            let expected = if armed {
+                EnvelopeEngagement::Active { nodes: 2 }
+            } else {
+                EnvelopeEngagement::Off
+            };
+            assert_eq!(
+                engagement, expected,
+                "armed={armed}: the envelope factor must be applied on both ReLU nodes \
+                 when armed, and never when not"
+            );
+        }
+    });
 }

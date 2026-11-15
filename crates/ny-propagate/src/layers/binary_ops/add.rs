@@ -99,7 +99,7 @@ impl AddLayer {
             )
         };
 
-        // Centralized NaN/Inf repair at constructor (#3423, replaces ad-hoc #2549).
+        // Centralized NaN/Inf repair at constructor (replaces ad-hoc per-site repair).
         BoundedTensor::new_repaired(out_lower, out_upper, RepairStrategy::Conservative)
     }
 
@@ -117,7 +117,7 @@ impl AddLayer {
     ) -> Result<(LinearBounds, LinearBounds)> {
         // C = A + B => W·C + b = W·A + W·B + b.
         // Split the bias so graph accumulation does not double-count constants.
-        // Directed rounding on f32 halving to preserve soundness (#2173).
+        // Directed rounding on f32 halving to preserve soundness.
         let lower_b_half = bounds.lower_b().mapv(|v| next_down_f32(v * 0.5));
         let upper_b_half = bounds.upper_b().mapv(|v| next_up_f32(v * 0.5));
 
@@ -153,7 +153,7 @@ impl AddLayer {
     ) -> Result<(BatchedLinearBounds, BatchedLinearBounds)> {
         // C = A + B => W·C + b = W·A + W·B + b.
         // Split the bias so graph accumulation does not double-count constants.
-        // Directed rounding on f32 halving to preserve soundness (#2173).
+        // Directed rounding on f32 halving to preserve soundness.
         let lower_b_half = bounds.lower_b.mapv(|v| next_down_f32(v * 0.5));
         let upper_b_half = bounds.upper_b.mapv(|v| next_up_f32(v * 0.5));
 
@@ -280,7 +280,7 @@ mod tests {
     #[ntest::timeout(10000)]
     #[test]
     fn test_ibp_broadcast_transpose_shapes() {
-        // [1, 3] + [3, 1] broadcasts to [3, 3] — the lsnc model pattern (#411)
+        // [1, 3] + [3, 1] broadcasts to [3, 3] — the lsnc model pattern
         let layer = AddLayer;
         let a = make_bt_shape(vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0], &[1, 3]);
         let b = make_bt_shape(vec![10.0, 20.0, 30.0], vec![40.0, 50.0, 60.0], &[3, 1]);
@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn test_crown_bias_splitting_directed_rounding_subnormal_underflow() {
-        // Regression for #2173: when halving underflows to 0.0, directed rounding
+        // Regression: when halving underflows to 0.0, directed rounding
         // must widen in the safe direction.
         let layer = AddLayer;
         let tiny = f32::from_bits(1); // smallest positive subnormal

@@ -636,10 +636,10 @@ fn crown_backward_2x1_matmul_soundness() {
 }
 
 // ============================================================================
-// decode_batch_index zero-dimension guard (#2806)
+// decode_batch_index zero-dimension guard
 // ============================================================================
 
-/// Regression test for #2806: `decode_batch_index` must return an error
+/// Regression test: `decode_batch_index` must return an error
 /// when batch_dims contains a zero, not panic from integer division-by-zero.
 #[ntest::timeout(10000)]
 #[test]
@@ -672,7 +672,7 @@ fn test_decode_batch_index_valid_dims() {
     assert_eq!(indices, vec![1, 2]);
 }
 
-/// Regression test for #2237: the scratch-based decoder should overwrite and
+/// Regression test: the scratch-based decoder should overwrite and
 /// truncate an existing buffer instead of relying on fresh Vec allocation.
 #[ntest::timeout(10000)]
 #[test]

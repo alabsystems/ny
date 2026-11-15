@@ -237,7 +237,7 @@ fn test_flatten_propagate_linear_borrows() {
     assert!(matches!(result, Cow::Borrowed(_)));
 }
 
-/// Regression test for #2911: negative dims (other than -1, 0) should error.
+/// Regression test: negative dims (other than -1, 0) should error.
 #[ntest::timeout(5000)]
 #[test]
 fn test_reshape_negative_dim_error_2911() {

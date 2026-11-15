@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Dark, print-only per-node A-matrix telemetry for the iteration-0 α parity
-//! investigation (#iter0-alpha-parity, docs/SYSTEM_DESIGN_ONE_PIPELINE P0-1).
+//! investigation (#iter0-alpha-parity, docs/SYSTEM_DESIGN_ONE_PIPELINE_2026-07-30.md P0-1).
 //!
 //! `NY_ITER0_PARITY_TRACE=1` enables; the declared `false` default emits no
 //! output. WHY: the cifar100 root α loop evaluates its iteration-0 bound at

@@ -5,7 +5,7 @@
 //! Rectangular BilinearCrown soundness proptests.
 //!
 //! `crown_bilinear.rs` already covers square `transpose_b=true` soundness.
-//! These tests close the remaining #3289 gap by exercising rectangular
+//! These tests close the remaining gap by exercising rectangular
 //! `m != n` shapes and the `transpose_b=false` production path against
 //! concrete matmul outputs.
 

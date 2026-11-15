@@ -135,7 +135,7 @@ impl TileLayer {
         }
 
         // Guard: zero-valued dimensions cause division-by-zero in block index
-        // arithmetic below. (#2806)
+        // arithmetic below.
         if input_shape.contains(&0) {
             return Err(NyError::InvalidSpec(
                 "Tile: zero-valued dimension in input shape".to_string(),
@@ -454,7 +454,7 @@ impl BoundPropagation for TileLayer {
             ));
         }
 
-        // Guard: zero-valued dimensions cause degenerate concatenation. (#2806)
+        // Guard: zero-valued dimensions cause degenerate concatenation.
         if shape.contains(&0) {
             return Err(NyError::InvalidSpec(
                 "Tile: zero-valued dimension in input shape".to_string(),
@@ -515,7 +515,7 @@ impl BoundPropagation for TileLayer {
         }
 
         // Guard: zero-valued dimensions cause division-by-zero in block index
-        // arithmetic below. (#2806)
+        // arithmetic below.
         if input_shape.contains(&0) {
             return Err(NyError::InvalidSpec(
                 "Tile: zero-valued dimension in input shape".to_string(),

@@ -48,7 +48,7 @@ type MultiObjectiveWarmStartResult = (
 /// Final-only widening is insufficient when cancellation follows a lost term.
 ///
 /// ENSURES: `lower <= c^T y <= upper` for every `y` in the output box.
-pub(super) fn objective_bounds(output: &BoundedTensor, objective: &[f32]) -> Result<(f32, f32)> {
+pub(crate) fn objective_bounds(output: &BoundedTensor, objective: &[f32]) -> Result<(f32, f32)> {
     objective_bounds_with_poll(output, objective, |_| Ok(()))
 }
 
@@ -538,7 +538,7 @@ pub(in crate::beta_crown::engine::graph) fn mo_beta_completed_spec_pass_count_fo
 /// whole call).
 ///
 /// Non-finite lower bounds are skipped rather than folded: `-inf` carries no
-/// information and `+inf`/`NaN` come from degenerate CROWN propagation (#2359)
+/// information and `+inf`/`NaN` come from degenerate CROWN propagation
 /// and must not be allowed to poison a row.
 ///
 /// Note the merged lower bound can never cross an upper bound: if `l_i <= v <=
@@ -682,7 +682,6 @@ impl BetaCrownVerifier {
     /// Uses **spec-guided CROWN** with a dense multi-row spec matrix to preserve
     /// output correlations across all objectives in one backward pass, resulting
     /// in tighter bounds compared to post-hoc interval arithmetic.
-    /// See issue #593 and docs/ANALYSIS-resnet-verification-gap-root-cause-2026-01-07.md.
     #[cfg(test)]
     pub(super) fn propagate_multi_objective_with_beta(
         &self,
@@ -791,7 +790,6 @@ impl BetaCrownVerifier {
     /// When `conjunctive` is true, optimizes the **maximum** margin instead of minimum.
     /// For conjunctive (AND) properties, only ONE objective needs to exceed its threshold
     /// to verify the domain, so we optimize the best objective rather than the worst.
-    /// Source: designs/2026-03-05-joint-conjunctive-bab.md, #3334.
     #[cfg(test)]
     pub(super) fn optimize_graph_beta_analytical_multi_objective(
         &self,
@@ -986,6 +984,8 @@ impl BetaCrownVerifier {
         cuda_beta_spsa: MoCudaBetaSpsaPolicy,
         cuda_beta_spsa_frontier: MoCudaBetaSpsaFrontier,
     ) -> Result<MultiObjectiveWarmStartResult> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BetaOpt);
         // Skip if no beta parameters or iterations disabled
         if beta_state.is_empty() || self.config.beta_iterations == 0 {
             // Use spec-guided CROWN for tighter bounds (preserves output correlations)
@@ -1050,8 +1050,8 @@ impl BetaCrownVerifier {
 
         // Compute margin metric for optimization.
         // Disjunctive: min margin (all objectives must be verified → optimize worst).
-        // Conjunctive: max margin (any objective verified suffices → optimize best). #3334
-        // Defense-in-depth: assert lengths match before triple .zip() (#3383).
+        // Conjunctive: max margin (any objective verified suffices → optimize best).
+        // Defense-in-depth: assert lengths match before triple.zip().
         debug_assert_eq!(
             targets.objectives.len(),
             targets.thresholds.len(),
@@ -1100,7 +1100,7 @@ impl BetaCrownVerifier {
         // over the same dense spec matrix as the final pass, so they are valid
         // sound spec-guided CROWN bounds. M5 may seed it from the equivalent
         // Standard helper before iteration zero; otherwise a completed gradient
-        // iteration seeds it as before. We only stop optimizing sooner. (#3109)
+        // iteration seeds it as before. We only stop optimizing sooner.
         type LoopBest = (Vec<(f32, f32)>, HashMap<String, Arc<BoundedTensor>>);
         let mut best_loop_result: Option<LoopBest> = None;
 
@@ -1142,20 +1142,20 @@ impl BetaCrownVerifier {
         // negative output coefficients whose lower bound depends on the output
         // UPPER relaxation, which β doesn't improve). Saving periodic snapshots
         // ensures we evaluate the optimal β that post-hoc tracking may miss.
-        // At most 4 periodic snapshots to bound overhead. (#3334)
+        // At most 4 periodic snapshots to bound overhead.
         let snapshot_interval = (self.config.beta_iterations / 4).max(1);
         let mut periodic_snapshots: Vec<GraphBetaState> = Vec::new();
 
         // Set when the loop bails because the wall-clock deadline was reached
         // (either the between-iteration guard or the inner per-node abort). Drives
-        // the post-loop short-circuit that returns the best loop bounds. (#3109)
+        // the post-loop short-circuit that returns the best loop bounds.
         let mut hit_deadline = false;
         // A typed finite-kernel refusal after a completed iterate must retain
         // that stronger result rather than replacing it with inherited IBP.
         let mut retain_completed_best = false;
 
-        // #alpha-step (2026-08-24): within-eval per-domain alpha, stepped
-        // JOINTLY with beta by the same SPSA slope. The MO lanes never
+        // #alpha-step (2026-08-24): within-eval per-domain alpha, stepped by
+        // SPSA in sparse α-only rounds (schedule below). The MO lanes never
         // stepped alpha (stale inherited values measurably lose to the plain
         // current-box heuristic — see the stale-alpha receipts in the
         // REGRESSION doc). alpha_local persists across iterations of THIS
@@ -1173,16 +1173,14 @@ impl BetaCrownVerifier {
             if domain_has_splits {
                 context.alpha_state.map(|a| {
                     let mut local = a.clone();
-                    local.split_refresh = true;
                     // Delta-form neutralization: stored values become deltas
                     // around the current-box heuristic; 0.5 = zero offset.
-                    for map in [&mut local.neurons, &mut local.upper_neurons] {
-                        for node in map.values_mut() {
-                            for n in node.values_mut() {
-                                n.set_alpha(0.5);
-                            }
-                        }
-                    }
+                    // Since #alpha-split-refresh moved to CHILD BIRTH
+                    // (domain/multi_objective.rs `with_constraint`) split
+                    // domains arrive already neutralized; this eval-local
+                    // pass is kept as the safety net for domains born on
+                    // other paths (idempotent when already delta-form).
+                    local.neutralize_for_split_refresh();
                     local
                 })
             } else {
@@ -1190,7 +1188,7 @@ impl BetaCrownVerifier {
             };
 
         for iter in 0..self.config.beta_iterations {
-            // Deadline check (#3109): bail early if the verification timeout budget
+            // Deadline check: bail early if the verification timeout budget
             // is exhausted BETWEEN iterations. Return the current best bounds
             // instead of running all iterations. This is the cheap guard; the
             // inner per-node deadline check below is what usually fires first.
@@ -1213,7 +1211,7 @@ impl BetaCrownVerifier {
 
             // Compute bounds with current β AND capture per-objective A rows in one pass.
             //
-            // Deadline granularity (#3109): a single spec-guided backward pass over
+            // Deadline granularity: a single spec-guided backward pass over
             // ~99-199 specs in a deep Conv2d graph can take seconds, and the inner
             // per-node deadline check (constraints/backward/mod.rs) aborts that pass
             // mid-flight with `DeadlineExceeded` once the wall clock crosses the
@@ -1291,9 +1289,9 @@ impl BetaCrownVerifier {
             }
             let margin = compute_margin(&obj_bounds);
 
-            // Track best β state by post-hoc margin. See #1694.
+            // Track best β state by post-hoc margin.
             // Also capture the full (bounds, node_bounds) so a mid-loop deadline
-            // can return immediately without an extra spec-guided pass. (#3109)
+            // can return immediately without an extra spec-guided pass.
             if margin > best_margin {
                 best_margin = margin;
                 best_beta_snapshot = Some(beta_state.clone());
@@ -1302,7 +1300,7 @@ impl BetaCrownVerifier {
 
             // Save periodic snapshot for spec-guided evaluation at end.
             // Post-hoc margin can be β-insensitive, so we save at fixed intervals
-            // rather than only when margin improves. (#3334)
+            // rather than only when margin improves.
             if iter.is_multiple_of(snapshot_interval) {
                 periodic_snapshots.push(beta_state.clone());
             }
@@ -1353,18 +1351,31 @@ impl BetaCrownVerifier {
                 // v1 slope was alpha-noise-dominated and regressed the probe
                 // row — receipts in the REGRESSION doc).
                 // Delta-form (#alpha-step v3): reader composes heuristic +
-                // stored delta on the relu_split_route only. The α-only SPSA
-                // rounds are PARKED: measured 2026-08-26 on the probe row,
-                // alternating rounds cost half the β iterations and moved the
-                // 60s frontier -10.18 → -11.42 (α gains did not cover the β
-                // loss at iterations=15). Machinery + delta reader stay —
-                // iteration 0 is byte-equal to the receipted refresh
-                // baseline; a cheaper α schedule (every 4th iter, or a
-                // dedicated α budget) is the scoped follow-up.
+                // stored delta on the relu_split_route only; iteration 0 stays
+                // byte-equal to the receipted refresh baseline. Alternating α/β
+                // rounds, measured 2026-08-26 on the probe row, cost half the
+                // β iterations and moved the 60s frontier -10.18 → -11.42 (α
+                // gains did not cover the β loss at iterations=15).
                 // Sparse schedule: α every 4th iteration (β keeps 12/15) —
                 // the alternating schedule's measured regression came from
                 // the 50% β-iteration cost, not from α stepping itself.
                 let alpha_round = alpha_local.is_some() && iter % 4 == 3;
+                // #alpha-round observability (dark, NY_BETA_GPU_PROBE=1): the
+                // champion sparse-α schedule has no engagement line, so a
+                // silently-None alpha_local (route flag lost, empty history,
+                // missing alpha_state) is indistinguishable from stepping.
+                // Print the gate terms once per eval, at the first α-round
+                // iteration. Print-only.
+                if iter == 3 && crate::beta_gpu_probe_armed() {
+                    eprintln!(
+                        "[alpha-round] alpha_local={} relu_split_route={} \
+                         has_constraints={} ctx_alpha={}",
+                        alpha_local.is_some(),
+                        relu_split_route,
+                        !context.history.constraints.is_empty(),
+                        context.alpha_state.is_some(),
+                    );
+                }
                 let mut plus = beta_state.clone();
                 let mut minus = beta_state.clone();
                 if !alpha_round {
@@ -1378,9 +1389,9 @@ impl BetaCrownVerifier {
                         m.value = (m.value - SPSA_DELTA * d).max(0.0);
                     }
                 }
-                // Joint alpha perturbation (#alpha-step): same Rademacher
-                // stream continues into the alpha entries, so one shared
-                // slope drives both parameter families.
+                // Alpha perturbation (#alpha-step, decoupled): on α-only rounds
+                // the same Rademacher stream continues into the alpha entries;
+                // β is left unperturbed, so the slope drives α alone.
                 const ALPHA_DELTA: f32 = 0.05;
                 const ALPHA_LR: f32 = 0.05;
                 let mut alpha_dirs: Vec<(String, usize, f32)> = Vec::new();
@@ -1481,7 +1492,7 @@ impl BetaCrownVerifier {
             }
         }
 
-        // Deadline short-circuit (#3109): if the loop bailed on the wall-clock
+        // Deadline short-circuit: if the loop bailed on the wall-clock
         // deadline AND we captured a fully-computed baseline or iteration result,
         // do NOT run the final spec-guided pass or the per-candidate
         // snapshot evaluation below — each is a full spec-guided CROWN pass over
@@ -1541,14 +1552,14 @@ impl BetaCrownVerifier {
 
         // Evaluate all snapshot candidates with spec-guided CROWN and return
         // the β state with the best spec-guided margin. This catches the
-        // optimal β that post-hoc tracking may have missed. (#3334, #1694)
+        // optimal β that post-hoc tracking may have missed.
         let mut best_overall_margin = final_margin;
         let mut best_overall_bounds = final_bounds;
         let mut best_overall_node_bounds = final_node_bounds;
         let mut best_overall_cached_las = final_cached_las;
         let mut best_overall_beta: Option<GraphBetaState> = None;
 
-        // Deadline guard (#3813): snapshot evaluation runs N spec-guided CROWN
+        // Deadline guard: snapshot evaluation runs N spec-guided CROWN
         // passes per candidate (one per objective). For expensive Conv2d graphs
         // with many objectives, this can exceed the remaining timeout budget.
         // Skip snapshot evaluation entirely when past deadline — the final
@@ -1587,7 +1598,7 @@ impl BetaCrownVerifier {
                 }
                 let margin = compute_margin(&bounds);
                 // Strict > so that ties prefer the end-of-loop β (most recent
-                // optimizer state for warm-starting downstream). (#1760)
+                // optimizer state for warm-starting downstream).
                 if margin > best_overall_margin {
                     best_overall_margin = margin;
                     best_overall_bounds = bounds;
@@ -1599,7 +1610,7 @@ impl BetaCrownVerifier {
         }
 
         // Update beta_state to match the returned bounds so callers have a
-        // consistent (bounds, beta_state) pair for warm-starting. (#1760)
+        // consistent (bounds, beta_state) pair for warm-starting.
         if let Some(best_beta) = best_overall_beta {
             *beta_state = best_beta;
         }

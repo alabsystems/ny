@@ -31,9 +31,9 @@ pub fn linear_ibp_parallel(
     let shape = input.shape();
 
     // Pre-compute positive and negative weight matrices.
-    // NaN-propagating variants (#2642): Rust's f32::max(NaN, 0.0) = 0.0 (IEEE 754-2008),
+    // NaN-propagating variants: Rust's f32::max(NaN, 0.0) = 0.0 (IEEE 754-2008),
     // silently dropping NaN weights. Use nan_propagating_max_zero/min_zero so NaN weights
-    // poison the accumulator and trigger downstream NaN guards, matching the CPU path (#2415).
+    // poison the accumulator and trigger downstream NaN guards, matching the CPU path.
     let weight_pos: Vec<f32> = weight
         .iter()
         .map(|&w| nan_propagating_max_zero(w))
@@ -91,7 +91,7 @@ pub fn linear_ibp_parallel(
             }
         });
 
-    // Sanitize NaN/Inf values before creating BoundedTensor (#2642 self-audit).
+    // Sanitize NaN/Inf values before creating BoundedTensor.
     // After the nan_propagating weight split, NaN weights correctly poison the
     // accumulator. Convert NaN/Inf to conservative FALLBACK_BOUND before
     // BoundedTensor::new (which rejects NaN), matching the CPU NaN guard in
@@ -221,7 +221,7 @@ pub fn matmul_ibp_parallel(
                         let products = [a_l * b_l, a_l * b_u, a_u * b_l, a_u * b_u];
                         // NaN-propagating min/max: if any product is NaN (e.g., 0*Inf
                         // not caught upstream), NaN must propagate rather than be
-                        // silently absorbed by IEEE 754 min/max. Issue #2577.
+                        // silently absorbed by IEEE 754 min/max.
                         let min_prod = products
                             .iter()
                             .cloned()

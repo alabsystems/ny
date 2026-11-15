@@ -10,7 +10,7 @@
 //!   conjunctive callers and existing tests.
 //! - `clip_multi_objective_grouped_safe`: returns a `MultiSpecRelaxedClipOutcome`
 //!   with per-row lower bounds and an infeasibility flag. Grouped/disjunctive
-//!   callers use these for their own OR-within-clause reduction (see `#3740`).
+//!   callers use these for their own OR-within-clause reduction.
 
 use ndarray::{Array2, Array3};
 use ny_core::Result;
@@ -102,7 +102,6 @@ impl BetaCrownVerifier {
     /// process_batch) performs its own OR-within-clause and AND-across-clauses reduction.
     ///
     /// Reference: `alpha-beta-CROWN/complete_verifier/input_split/clip.py:clip_domains`
-    /// Design: `designs/2026-03-22-issue-4367-grouped-joint-multispec-relaxed-clip.md`
     pub(in crate::beta_crown::engine) fn clip_multi_objective_grouped_safe(
         &self,
         input_bounds: &BoundedTensor,

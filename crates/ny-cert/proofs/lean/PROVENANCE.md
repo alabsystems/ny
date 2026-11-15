@@ -10,27 +10,27 @@ The local Lake package is `nyproof`, its library is `NyProof`, and Clean's
 
 ```text
 repository: https://github.com/alabsystems/clean.git
-revision:   9a9b16e44b9233d0c387839ea205a22fb77ac4bb
+revision:   e7ae5d418cbac2e1a029369a5b5eda690d471c5c
 subDir:     crown-proofs/lean
 ```
 
-The pin is declared in `lakefile.toml`. Local modules live under `NyProof/` and
-use `NyProof.*` module imports for other NY files. Imports of `Crownproof.*`
-resolve to the pinned Clean dependency. Existing theorem namespaces are retained
-where useful, so moving a module from `Crownproof/Foo.lean` to
-`NyProof/Foo.lean` does not gratuitously rename public theorem constants.
+The pin is declared in `lakefile.toml` and recorded in `lake-manifest.json`.
+Local modules live under `NyProof/` and import each other as `NyProof.*`;
+`Crownproof.*` imports resolve to the pinned Clean dependency. Existing theorem
+namespaces are kept where useful (several overlay modules still declare
+`Crownproof.*` namespaces), so moving `Crownproof/Foo.lean` to
+`NyProof/Foo.lean` does not rename public theorem constants.
 
-The root project also pins the Mathlib v4.30.0 release commit
-`c5ea00351c28e24afc9f0f84379aa41082b1188f`. Clean's source declaration names
-that release, but without a committed Clean subproject manifest Lake otherwise
-resolved an older rc2 snapshot whose toolchain did not match Lean v4.30.0. The
-root pin makes the effective dependency graph exact and toolchain-coherent.
+The root also pins Mathlib to the v4.30.0 release commit
+`c5ea00351c28e24afc9f0f84379aa41082b1188f`. Without that pin, Lake resolved
+Clean's Mathlib requirement to an older rc2 snapshot whose toolchain did not
+match Lean v4.30.0.
 
 ## Removed Clean-origin mirrors
 
-The following 78 files were introduced in NY after their corresponding Clean
-files and were byte-identical to Clean at the dependency pin. They have been
-removed from NY; the dependency is now their single source of truth:
+These 78 modules were byte-identical to Clean at the pin and have been removed
+from NY. Each name denotes `crown-proofs/lean/Crownproof/<name>.lean` in Clean,
+which is their single source of truth. Do not copy them back.
 
 - `AcasTree8`, `AcasWholeBox`, `BabProof`, `Block`, `Block2`, `Branch`,
   `BranchTree`, `CakeRepro`
@@ -54,17 +54,12 @@ removed from NY; the dependency is now their single source of truth:
 - `VFBao`, `VFBbn1`, `VFBbn2`, `VFBcompose`, `VFBhid`, `VFBmlp`,
   `VFBvalue`, `Variance`, `VitFullBlock`, `VitRealAttention`
 
-Every name above denotes `crown-proofs/lean/Crownproof/<name>.lean` in Clean.
-NY's old modified `Crownproof.lean` aggregate and stale `lake-manifest.json`
-were also removed. `NyProof.lean` is the valid local aggregate; there is no
-executable target and therefore no nonexistent `Main.lean` root.
-
 ## NY-origin proofs adopted by Clean
 
-Three files were authored in NY first and later adopted by Clean. At the pin,
-Clean carries the exact NY-authored blobs, so NY consumes those upstream copies
-instead of maintaining colliding duplicate modules. Their NY authorship remains
-in this repository's history:
+Three modules were authored in NY first and later adopted by Clean. At the pin,
+Clean carries the exact NY-authored blobs, so NY imports the upstream copies
+instead of keeping duplicate modules. Their NY authorship is in this
+repository's history:
 
 | Module | First NY commit | Clean adoption commit |
 |---|---|---|
@@ -72,24 +67,21 @@ in this repository's history:
 | `Bridge` | `335c90d474c7d2f9d443c140d1d7bbcbbe27c939` (2026-05-30) | `0f9933ea09b567a242aee725f55337370e59e2c1` (2026-05-30) |
 | `Pow2Envelope` | `f647603a099c260e3fc8b2e7881154172c482a01` (2026-07-02) | `17b1eff857a5bb6dce7d8dd843e7de5f4bf3aa71` (2026-07-08) |
 
-Deleting the redundant working-tree copies does not rewrite or discard their
-NY commits, and the pinned dependency supplies the same declarations.
-
 ## Retained NY-owned overlay
 
-The 68 modules under `NyProof/` are NY-origin and are not present in Clean at
+The 70 modules under `NyProof/` are NY-origin and are not present in Clean at
 the pin.
 
-Fourteen reusable proof modules are retained:
+Fifteen reusable proof modules:
 
 - `AristotleLemmas`, `CersyveInduction`, `CertifiedDecision`,
-  `FarkasInterval`, `FloatAdequacy`, `MeanValueChain`, `MeanValueForm`,
-  `RupChecker`, `RupCheckerFast`, `SatReluCnf`, `SatReluGadget`,
-  `SatReluVerdict`, `SignFusion`, `SoftmaxFloatRange`
+  `FarkasInterval`, `FloatAdequacy`, `IntegerInterval`, `MeanValueChain`,
+  `MeanValueForm`, `RupChecker`, `RupCheckerFast`, `SatReluCnf`,
+  `SatReluGadget`, `SatReluVerdict`, `SignFusion`, `SoftmaxFloatRange`
 
-Fifty-four NY-specific audit, instance, and generated modules are retained:
+Fifty-five NY-specific diagnostic, audit, instance, and generated modules:
 
-- `AxiomAudit`
+- `AlphaGradientDefect`, `AxiomAudit`
 - `CersyveInstance_DoubleIntegrator`, `CersyveInstance_Pendulum`,
   `CersyveInstance_Unicycle`
 - `SatReluDemo_v10c26`, `SatReluDemo_v92c117`, `SatReluDemo_v99c485`,
@@ -105,13 +97,14 @@ Fifty-four NY-specific audit, instance, and generated modules are retained:
   `V87C243`, `V90C111`, `V90C449`, `V91C217`, `V92C180`, `V94C313`,
   `V94C377`, `V95C275`
 
-`NyProof.lean` imports the complete retained overlay except `AxiomAudit`, which
-is an explicit diagnostic module because it emits `#print axioms` output.
+`NyProof.lean` imports, directly or transitively, every retained module except
+two: `AxiomAudit`, a diagnostic that emits `#print axioms` output, and
+`AlphaGradientDefect`, which nothing imports. `lake build NyProof` therefore
+does not check either; build them by module name.
 
 ## Reproducible validation
 
-With no Cargo/Targo/rustc build competing for resources, refresh the dependency
-manifest and build the overlay:
+Run with no Cargo/Targo/rustc build competing for resources:
 
 ```sh
 lake update
@@ -121,11 +114,10 @@ lake build NyProof.AxiomAudit
 lake env lean NyProof/AxiomAudit.lean > AXIOM_AUDIT.txt
 ```
 
-`NyProof` deliberately excludes the diagnostic `AxiomAudit` module, so a fresh
-checkout must build `NyProof.AxiomAudit` before invoking Lean on that file
-directly. Relying on a stale dependency `.olean` makes the audit
-machine-dependent and can fail before any axiom is checked.
+Build `NyProof.AxiomAudit` before invoking Lean on that file directly; a stale
+dependency `.olean` makes the audit machine-dependent and can fail before any
+axiom is checked.
 
-The committed `AXIOM_AUDIT.txt` is historical captured output from the same
-theorem set. Regenerate it after changing the Clean pin or any overlay proof;
-`sorryAx`, an unexpected axiom, or an unknown constant is a soundness regression.
+The committed `AXIOM_AUDIT.txt` is captured output. Regenerate it after changing
+the Clean pin or any overlay proof; `sorryAx`, an unexpected axiom, or an
+unknown constant is a soundness regression.

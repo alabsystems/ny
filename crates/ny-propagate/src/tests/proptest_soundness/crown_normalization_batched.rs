@@ -12,8 +12,6 @@
 //! The batched path (propagate_linear_batched_with_bounds) delegates to the
 //! scalar path per batch position. These tests verify the batched wrapper
 //! itself doesn't break soundness during reshape/reassembly.
-//!
-//! Part of #3174.
 
 use crate::layers::normalization::{
     AdaIN1dLayer, InstanceNorm1dLayer, LayerNormCrownMode, RmsNormLayer,
@@ -46,8 +44,6 @@ fn concretize_batched_crown(
 // =============================================================================
 // RMSNORM BATCHED CROWN BACKWARD SOUNDNESS (IBP-VALIDATED MODE)
 // =============================================================================
-//
-// Part of #3174.
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(300) })]
@@ -55,7 +51,6 @@ proptest! {
     /// RmsNorm batched CROWN soundness with identity incoming, tight perturbation.
     /// Verifies that for sampled concrete inputs within bounds, the true RmsNorm
     /// output falls within the CROWN-computed bounds for a 2-batch input.
-    /// Part of #3174.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_rmsnorm_batched_crown_identity_tight(
@@ -158,15 +153,12 @@ proptest! {
 // InstanceNorm1d operates on [C, T] per batch position. For 2 channels and 2
 // timesteps, the flat dimension is C*T = 4. The batched input shape is
 // [batch, C*T] = [2, 4].
-//
-// Part of #3174.
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(300) })]
 
     /// InstanceNorm1d batched CROWN soundness with identity incoming.
     /// Uses 2 channels, 2 timesteps per channel (in_dim=4), batch=2.
-    /// Part of #3174.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_instancenorm_batched_crown_identity_tight(
@@ -288,15 +280,12 @@ proptest! {
 // AdaIN1d wraps InstanceNorm1d and applies style_gamma * norm(x) + style_beta.
 // Uses the same [C, T] layout as InstanceNorm1d: 2 channels, 2 timesteps,
 // in_dim=4, batch=2.
-//
-// Part of #3174.
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(300) })]
 
     /// AdaIN1d batched CROWN soundness with identity incoming.
     /// Uses 2 channels, 2 timesteps per channel (in_dim=4), batch=2.
-    /// Part of #3174.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_adain_batched_crown_identity_tight(
@@ -442,14 +431,11 @@ proptest! {
 // through several layers, lower_a and upper_a diverge. This exercises the
 // coefficient split path where positive/negative handling differs for lower
 // vs upper bounds in the batched wrapper.
-//
-// Part of #3174.
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(200) })]
 
     /// RmsNorm batched CROWN soundness with asymmetric incoming (la != ua).
-    /// Part of #3174.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_rmsnorm_batched_crown_asymmetric(
@@ -574,15 +560,12 @@ proptest! {
 // =============================================================================
 // INSTANCENORM1D BATCHED CROWN BACKWARD SOUNDNESS (IBP-VALIDATED, ASYMMETRIC INCOMING)
 // =============================================================================
-//
-// Part of #3174.
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(200) })]
 
     /// InstanceNorm1d batched CROWN soundness with asymmetric incoming (la != ua).
     /// Uses 2 channels, 2 timesteps per channel (in_dim=4), batch=2, out_dim=1.
-    /// Part of #3174.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_instancenorm_batched_crown_asymmetric(
@@ -713,15 +696,12 @@ proptest! {
 // =============================================================================
 // ADAIN1D BATCHED CROWN BACKWARD SOUNDNESS (IBP-VALIDATED, ASYMMETRIC INCOMING)
 // =============================================================================
-//
-// Part of #3174.
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(200) })]
 
     /// AdaIN1d batched CROWN soundness with asymmetric incoming (la != ua).
     /// Uses 2 channels, 2 timesteps per channel (in_dim=4), batch=2, out_dim=1.
-    /// Part of #3174.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_adain_batched_crown_asymmetric(

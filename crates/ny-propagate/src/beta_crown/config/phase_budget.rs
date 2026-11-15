@@ -10,8 +10,6 @@
 //!
 //! Default values are tuned for VNN-COMP competitive performance
 //! (20% warmup cap, 10% post-BaB PGD reservation).
-//!
-//! Part of #2206. Design: designs/2026-03-16-issue-2206-adaptive-phase-budgeting.md
 
 use ny_core::{NyError, Result};
 use serde::{Deserialize, Serialize};
@@ -41,7 +39,7 @@ pub struct PhaseBudgetConfig {
     /// `initial_deadline = Some(bab_deadline)` — the mandatory foundational
     /// node-bounds sweep must reach every node, and capping it at this fraction
     /// choked conv-heavy DAGs (yolo, tinyimagenet) into "deadline exceeded
-    /// before node 'Conv_0'" with most of the budget unused (#4321). The
+    /// before node 'Conv_0'" with most of the budget unused. The
     /// `[phase] multiobj-budget` telemetry line prints this fraction beside the
     /// window actually selected precisely so the two are not confused.
     ///
@@ -52,7 +50,7 @@ pub struct PhaseBudgetConfig {
     /// `graph-bab-bootstrap start t=0.0s` → `end t=118.5s` — 100% of the
     /// window, of which one CROWN-IBP DAG collection was 103.6s and still
     /// reverted 8/9 demanded targets to IBP on per-node deadlines. That is the
-    /// #4321 design decision working as written, not a cap-enforcement bug; do
+    /// design decision above working as written, not a cap-enforcement bug; do
     /// not "fix" it by dividing the measured warmup by `0.20 * total`.
     pub initial_bounds_fraction: f32,
 
@@ -145,8 +143,6 @@ pub struct PhaseBudgetConfig {
     /// Default: `0.10` (reserve 10% for PGD fallback).
     /// On a 100s timeout: BaB gets 90s, post-BaB PGD gets 10s.
     ///
-    /// Part of #2206 acceptance criterion 3.
-    ///
     /// #reserve-demand: this fraction is a REQUEST, not an entitlement. The
     /// caller ledger drops it when a purely static scan proves the lane that
     /// would spend it cannot take a step on this net — see
@@ -175,6 +171,111 @@ pub struct PhaseBudgetConfig {
     ///
     /// `false` restores the historical unconditional subtraction exactly.
     pub demand_sized_post_bab_reserve: bool,
+
+    /// #seq-single-reserve — base the SEQUENTIAL engine's warmup cap on the
+    /// caller's ledger-true BaB boundary instead of double-reserving the
+    /// post-BaB PGD slice.
+    ///
+    /// When the caller passes an explicit wall-clock deadline, that
+    /// deadline is the caller ledger's ALREADY-RESERVED BaB boundary — the
+    /// ledger has already subtracted [`Self::post_bab_pgd_fraction`] and the
+    /// MIP reserve (`phase_budget.rs::bab_deadline`). Every graph lane
+    /// refuses to reserve again ("do not reserve post-BaB time a second
+    /// time" — `relu_split/bab_loop.rs`, and the same treatment on the
+    /// input-split and gpu_bab lanes). The sequential initial phase
+    /// (`verify_phases/initial.rs`) nevertheless derived its warmup cap from
+    /// `effective_total * (1 - post_bab_pgd_fraction) * initial_bounds_fraction`
+    /// — the PGD reserve taken a SECOND time.
+    ///
+    /// MEASURED 2026-08-31 (two-point validation to 0.1 s, `reports/
+    /// measured-2026/tll_n64_attack_starvation_2026-08-31/README.md`): on a
+    /// tll 600 s row the ledger hands the engine 483.0 s, the double reserve
+    /// cuts it to 434.7 s, and the 0.85 warmup fraction lands the cap at
+    /// 369.5 s + ~2.8 s setup = 372.3 s predicted vs 372.38/372.36 measured
+    /// (and 437.4 predicted vs 437.44/437.46 at fraction 1.00).
+    ///
+    /// SCOPE — this key corrects the WARMUP CAP ONLY. The BaB search
+    /// boundary (`bab_timeout`) deliberately KEEPS the engine's own single
+    /// reserve, because on the sequential route the window
+    /// `[bab_timeout, caller deadline]` is the engine-internal post-BaB PGD
+    /// fallback's ONLY home ("this deadline extends past the BaB timeout so
+    /// PGD has guaranteed time" — `engine/pgd.rs`), and it is the lane that
+    /// produced tll `N=56_3`'s banked sat at +481 s of a 484.9 s run. Moving
+    /// the search boundary onto the caller deadline would zero that window
+    /// and forfeit exactly the attack #seq-early-attack exists to arm.
+    ///
+    /// The warmup cap under this key only ever moves LATER (the historical
+    /// base is `effective_total * (1 - f)`, the corrected base is
+    /// `effective_total`) and never past the caller deadline. Scheduling
+    /// only: no bound or verdict math is touched.
+    ///
+    /// `false` restores the historical double-reserved warmup cap
+    /// byte-identically.
+    pub sequential_warmup_single_reserve: bool,
+
+    /// #seq-early-attack — route a SEQUENTIAL initial-phase deadline expiry
+    /// through the engine's post-BaB PGD fallback instead of forfeiting it.
+    ///
+    /// The initial phase translates a warmup-cap expiry
+    /// (`NyError::DeadlineExceeded`) into an `Early(Timeout)` outcome, and
+    /// `engine/core.rs` returns that outcome BEFORE the `pgd_fallback`
+    /// closure is constructed — so an early-quit row never runs a single PGD
+    /// step, while the in-phase timeout path a few lines below feeds the
+    /// SAME result through `try_pgd_attack_with_deadline`. Measured cost
+    /// (tll, 2026-08-31): the two field-sat N=64 rows spend 100% of a 600 s
+    /// budget on a bounds phase that provably cannot finish and 0 s
+    /// attacking, while the attack that produced the banked `N=56_3` sat
+    /// cost 2.24 s.
+    ///
+    /// Containment is structural: the fallback can only ever produce a
+    /// `Violated` carrying an independently re-validated counterexample
+    /// (`try_pgd_attack_with_deadline` re-runs a clean concrete forward and
+    /// returns the ORIGINAL result otherwise), and the CLI still gates any
+    /// sat through its trusted oracle. It cannot break a proof; its only
+    /// cost is wall time the early quit was already discarding.
+    ///
+    /// `false` restores the historical forfeit byte-identically.
+    pub sequential_early_quit_attack: bool,
+
+    /// #mip-demand — size the Graph-MIP escalation reservation from the
+    /// escalation's own STATIC admission test, instead of always subtracting
+    /// [`Self::mip_min_fraction`]'s slice.
+    ///
+    /// Sibling of [`Self::demand_sized_post_bab_reserve`], and the same
+    /// argument. `bab_deadline` carves the MIP slice out of the SCORED budget
+    /// before BaB runs, so it can only be justified by a capability known
+    /// before BaB. Two of the escalation gate's own predicates are exactly
+    /// that:
+    ///
+    /// 1. the whole-net encode-nnz cap (`NY_GRAPH_MIP_MAX_NNZ`, 5M) — `nnz` is
+    ///    a property of the MODEL, identical on every row of a family;
+    /// 2. the minimum-slice floor (`NY_GRAPH_MIP_MIN_SLICE_S`, 20 s) — a
+    ///    reserve smaller than the floor is refused by the escalation's first
+    ///    gate whatever the model is.
+    ///
+    /// MEASURED 2026-08-30 (`reports/measured-2026/stop_census_2026-08-30/`,
+    /// 7/7 rows produced the `[stop]` line): `challenging_certified` idx1031
+    /// reserved 40 s of a 114 s solver deadline and the escalation declined in
+    /// ~2 ms with `estimated nnz 150936750 > cap 5000000`; `metaroom_2023`
+    /// idx125 reserved 54 s of 200 s and declined with `nnz 50355927`;
+    /// `cora_2024` img141 reserved 6 s of 25 s and declined at the 20 s slice
+    /// floor before the model was ever looked at.
+    ///
+    /// RE-DERIVED, because those `mip_timeout=` figures are TWO reserves: the
+    /// Graph-MIP slice and the separate `post_bab_pgd_fraction` slice. The part
+    /// THIS key governs is the MIP slice alone — 28 s of challenging's 114 s
+    /// solver deadline, 30 s (clamped) of metaroom's 200 s, 6 s of cora's 25 s.
+    /// That is 15–25% of the solver deadline returned, i.e. **+20% to +37% more
+    /// BaB search**, not the census's 24–35%.
+    ///
+    /// This never grants time: it only declines to TAKE time from BaB, and the
+    /// BaB deadline still moves no later than `overall_deadline`. A model the
+    /// escalation could actually encode is unaffected — the static probe, not
+    /// the yaml, is what drops the reserve, and it is a LOWER bound on the
+    /// runtime estimate so it can only fire where the runtime gate would.
+    ///
+    /// `false` restores the historical unconditional reservation exactly.
+    pub demand_sized_mip_reserve: bool,
 
     /// #disj-demand — zero the disjunctive global PGD slice when the net is
     /// STATICALLY outside the exact-gradient fragment, i.e. when the same
@@ -489,6 +590,67 @@ impl PhaseBudgetConfig {
     }
 }
 
+/// The sequential initial phase's derived time schedule (#seq-single-reserve).
+///
+/// Produced by [`PhaseBudgetConfig::sequential_initial_schedule`] so the
+/// arithmetic the engine runs is the same arithmetic the tests pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SequentialInitialSchedule {
+    /// BaB search boundary measured from the phase start. Unchanged by
+    /// #seq-single-reserve in BOTH dispositions: this is the engine's own
+    /// single post-BaB PGD reserve, the internal fallback's only window.
+    pub bab_timeout: std::time::Duration,
+    /// Warmup (initial-bounds) cap measured from the phase start.
+    pub warmup_cap: std::time::Duration,
+    /// Whether the warmup cap was based on the caller's ledger-true boundary
+    /// (`effective_total`) rather than the double-reserved `bab_timeout`.
+    pub warmup_single_reserve_applied: bool,
+}
+
+impl PhaseBudgetConfig {
+    /// Derive the sequential initial phase's schedule from the effective
+    /// total window (#seq-single-reserve).
+    ///
+    /// `caller_deadline` is whether the engine was handed an explicit
+    /// wall-clock deadline — i.e. whether `effective_total` is a
+    /// caller ledger's already-reserved BaB boundary. Only then is there a
+    /// second reserve to decline; a config-timeout run keeps the engine's
+    /// own reserve as the single one, byte-identically.
+    ///
+    /// Invariants, asserted by test on a grid including the measured tll
+    /// two-point validation:
+    /// * `bab_timeout` is the historical `effective_total * (1 - pgd_frac)`
+    ///   in EVERY disposition;
+    /// * `warmup_cap` never moves EARLIER than the historical cap and never
+    ///   past `effective_total`;
+    /// * with the kill switch off, or without a caller deadline, both fields
+    ///   reproduce the historical formulas byte-identically.
+    pub fn sequential_initial_schedule(
+        &self,
+        effective_total: std::time::Duration,
+        caller_deadline: bool,
+    ) -> SequentialInitialSchedule {
+        let pgd_frac = self.post_bab_pgd_fraction.clamp(0.0, 0.5);
+        let bab_timeout = effective_total.mul_f32(1.0 - pgd_frac);
+        let warmup_single_reserve_applied =
+            caller_deadline && self.sequential_warmup_single_reserve;
+        let warmup_base = if warmup_single_reserve_applied {
+            // The caller's deadline already sits behind its ledger's post-BaB
+            // reserve; do not reserve post-BaB time a second time (the graph
+            // lanes' treatment, applied to the warmup cap).
+            effective_total
+        } else {
+            bab_timeout
+        };
+        let frac = self.initial_bounds_fraction.clamp(0.0, 1.0);
+        SequentialInitialSchedule {
+            bab_timeout,
+            warmup_cap: warmup_base.mul_f32(frac),
+            warmup_single_reserve_applied,
+        }
+    }
+}
+
 impl Default for PhaseBudgetConfig {
     fn default() -> Self {
         Self {
@@ -509,6 +671,17 @@ impl Default for PhaseBudgetConfig {
             // the exact-gradient fragment; only a net whose post-BaB lane is
             // statically dead keeps the seconds in BaB.
             demand_sized_post_bab_reserve: true,
+            // #seq-single-reserve: default ON. Warmup-cap-only; the BaB search
+            // boundary and the engine PGD window are byte-identical either way.
+            sequential_warmup_single_reserve: true,
+            // #seq-early-attack: default ON. Adds an attack to a window that
+            // was previously discarded; a row the attack cannot falsify
+            // returns the identical Timeout.
+            sequential_early_quit_attack: true,
+            // #mip-demand: default ON. Byte-identical on every model the
+            // Graph-MIP encoder could admit; only a model the escalation's own
+            // static predicates already refuse keeps the seconds in BaB.
+            demand_sized_mip_reserve: true,
             // #disj-demand: default OFF — the SPSA fallback the zeroing removes
             // is a real searcher (ml4acopf's banked 256 s sat is on a
             // gradient-ineligible net). Categories arm it per measured preset.
@@ -767,7 +940,7 @@ mod tests {
     }
 
     /// Verifies the Duration arithmetic used in all 6 graph BaB entry points
-    /// for phase_budget warmup cap (#4095). The pattern:
+    /// for phase_budget warmup cap. The pattern:
     ///
     /// ```text
     /// let pgd_frac = config.post_bab_pgd_fraction.clamp(0.0, 0.5);
@@ -835,5 +1008,127 @@ mod tests {
             "initial_budget should be ~18s, got {:.1}s",
             initial_budget.as_secs_f64()
         );
+    }
+
+    /// #seq-single-reserve — the measured tll two-point validation, pinned.
+    ///
+    /// The ledger hands the engine 483.0 s of a 600 s row. Historical
+    /// (double-reserved) warmup cap: 483.0 * 0.90 * 0.85 = 369.495 s — the
+    /// arithmetic validated to 0.1 s against two measured arms (372.38 s and
+    /// 372.36 s walls at ~2.8 s setup; 437.44/437.46 at fraction 1.00).
+    /// Corrected cap: 483.0 * 0.85 = 410.55 s. `bab_timeout` — the engine
+    /// PGD fallback's window start — is 434.7 s in BOTH dispositions.
+    #[test]
+    fn seq_single_reserve_tll_two_point_validation() {
+        use std::time::Duration;
+
+        let mut cfg = PhaseBudgetConfig {
+            post_bab_pgd_fraction: 0.10,
+            initial_bounds_fraction: 0.85,
+            ..PhaseBudgetConfig::default()
+        };
+        let ledger_boundary = Duration::from_secs_f64(483.0);
+
+        // Fix ON (shipped default), caller deadline present.
+        assert!(
+            cfg.sequential_warmup_single_reserve,
+            "shipped default is ON"
+        );
+        let on = cfg.sequential_initial_schedule(ledger_boundary, true);
+        assert!(on.warmup_single_reserve_applied);
+        assert!(
+            (on.warmup_cap.as_secs_f64() - 410.55).abs() < 0.05,
+            "corrected cap must be 483.0 * 0.85 = 410.55 s, got {:.3}",
+            on.warmup_cap.as_secs_f64()
+        );
+        assert!(
+            (on.bab_timeout.as_secs_f64() - 434.7).abs() < 0.05,
+            "the BaB search boundary must keep the engine's single reserve \
+             (483.0 * 0.90 = 434.7 s), got {:.3}",
+            on.bab_timeout.as_secs_f64()
+        );
+
+        // Kill switch OFF: the historical double-reserved cap, byte-identically.
+        cfg.sequential_warmup_single_reserve = false;
+        let off = cfg.sequential_initial_schedule(ledger_boundary, true);
+        assert!(!off.warmup_single_reserve_applied);
+        let historical = ledger_boundary
+            .mul_f32(1.0 - cfg.post_bab_pgd_fraction.clamp(0.0, 0.5))
+            .mul_f32(cfg.initial_bounds_fraction.clamp(0.0, 1.0));
+        assert_eq!(
+            off.warmup_cap, historical,
+            "kill switch OFF must reproduce the historical formula byte-identically"
+        );
+        assert!(
+            (off.warmup_cap.as_secs_f64() - 369.495).abs() < 0.05,
+            "historical cap is 483.0 * 0.90 * 0.85 = 369.495 s, got {:.3}",
+            off.warmup_cap.as_secs_f64()
+        );
+
+        // The test must be able to fail: the two dispositions must differ.
+        assert_ne!(on.warmup_cap, off.warmup_cap);
+        assert_eq!(on.bab_timeout, off.bab_timeout);
+    }
+
+    /// #seq-single-reserve — no caller deadline means no second reserve to
+    /// decline: the config-timeout path is byte-identical with the key ON.
+    #[test]
+    fn seq_single_reserve_is_inert_without_a_caller_deadline() {
+        use std::time::Duration;
+
+        let cfg = PhaseBudgetConfig::default();
+        assert!(cfg.sequential_warmup_single_reserve);
+        let total = Duration::from_secs(100);
+
+        let on = cfg.sequential_initial_schedule(total, false);
+        let off = {
+            let mut c = cfg;
+            c.sequential_warmup_single_reserve = false;
+            c.sequential_initial_schedule(total, false)
+        };
+        assert_eq!(on, off, "without a caller deadline the key must be inert");
+        assert!(!on.warmup_single_reserve_applied);
+        assert_eq!(on.warmup_cap, total.mul_f32(0.9).mul_f32(0.2));
+    }
+
+    /// #seq-single-reserve containment: over a grid of budgets and fractions,
+    /// the corrected warmup cap never moves EARLIER than the historical cap,
+    /// never past the effective total, and the BaB search boundary is
+    /// bit-identical in both dispositions.
+    #[test]
+    fn seq_single_reserve_containment_grid() {
+        use std::time::Duration;
+
+        for total_secs in [5_u64, 20, 100, 483, 600, 1800] {
+            for pgd_frac in [0.0_f32, 0.05, 0.10, 0.25, 0.5, 0.9] {
+                for init_frac in [0.0_f32, 0.15, 0.20, 0.85, 1.0] {
+                    let mut cfg = PhaseBudgetConfig {
+                        post_bab_pgd_fraction: pgd_frac,
+                        initial_bounds_fraction: init_frac,
+                        ..PhaseBudgetConfig::default()
+                    };
+                    let total = Duration::from_secs(total_secs);
+                    let on = cfg.sequential_initial_schedule(total, true);
+                    cfg.sequential_warmup_single_reserve = false;
+                    let off = cfg.sequential_initial_schedule(total, true);
+
+                    assert_eq!(
+                        on.bab_timeout, off.bab_timeout,
+                        "the BaB boundary must not move in either disposition \
+                         (total={total_secs}s pgd={pgd_frac} init={init_frac})"
+                    );
+                    assert!(
+                        on.warmup_cap >= off.warmup_cap,
+                        "the corrected cap may only move LATER \
+                         (total={total_secs}s pgd={pgd_frac} init={init_frac})"
+                    );
+                    assert!(
+                        on.warmup_cap <= total,
+                        "the corrected cap must never pass the caller deadline \
+                         (total={total_secs}s pgd={pgd_frac} init={init_frac})"
+                    );
+                }
+            }
+        }
     }
 }

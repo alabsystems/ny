@@ -63,7 +63,7 @@ pub(super) struct SequentialMultiObjectiveContext<'a> {
     /// Whether this is a conjunctive (AND) property. When true, a domain is
     /// verified if ANY objective is verified, and dropped only if ALL violated.
     pub(super) conjunctive: bool,
-    /// Deadline for timeout enforcement (#3388). When set, sequential processing
+    /// Deadline for timeout enforcement. When set, sequential processing
     /// checks this before each domain to bail early when the verification timeout
     /// budget is exhausted. Without this, a single batch of CROWN passes across
     /// many objectives can exceed the timeout without the outer BaB loop noticing.
@@ -349,7 +349,7 @@ impl BetaCrownVerifier {
         }
 
         'domain: for (domain_index, mut domain) in domains_to_process.into_iter().enumerate() {
-            // Deadline check: bail early if verification timeout exceeded (#3388).
+            // Deadline check: bail early if verification timeout exceeded.
             // The outer BaB loop checks timeout only between batches. For large
             // networks with many objectives, a single batch of sequential CROWN
             // passes can exceed the timeout budget. This per-domain check ensures
@@ -358,7 +358,32 @@ impl BetaCrownVerifier {
                 return Ok(SequentialMultiObjectiveBatchStatus::DeadlineExpired);
             }
 
-            // Find unstable neurons to branch on
+            // Find unstable neurons to branch on.
+            //
+            // LANE DIVERGENCE, recorded 2026-09-13 and NOT fixed here. This
+            // lane never reads `config.branching_heuristic` — grep the file —
+            // so a configured `BranchingHeuristic::GenBaB(_)` is silently
+            // ignored and only ReLU/Sign neurons are ever branched
+            // (`branching/graph.rs`'s candidate filter is
+            // `is_zero_threshold_binary_activation`: no MulBinary, GELU or
+            // Sigmoid). `relu_split/split.rs` matches GenBaB FIRST and routes
+            // to `process_graph_domain_parallel`; this lane has no such arm.
+            //
+            // Consequence when it bites: all-stable ReLUs make `unstable`
+            // empty, one CROWN recompute follows, `unresolved_due_to_no_branch`
+            // is set below, and the domain is abandoned with its budget
+            // unspent — byte-for-byte the shape #genbab-precomputed-lane fixed
+            // on the precomputed-bounds lane.
+            //
+            // LATENT TODAY, and the reason is worth writing down so it is
+            // re-checked rather than re-derived: the only shipped preset with
+            // `method: nonlinear` is ml4acopf, `auto_select_branching` can
+            // never return GenBaB, and ml4acopf's clauses arrive here with
+            // `total_constraint_count == 1`. It goes LIVE the moment a
+            // `method: nonlinear` preset meets a clause carrying >= 2 atoms.
+            // Note also that `use_batched_gpu` requires `!conjunctive`
+            // (`multi_objective/verify.rs`), so every conjunctive
+            // multi-objective property runs THIS half.
             let unstable = self.find_unstable_graph_neurons_multi(graph, &domain, relu_nodes);
             if unstable.is_empty() {
                 // No unstable neurons left - recompute bounds one more time
@@ -385,7 +410,7 @@ impl BetaCrownVerifier {
                         match Self::objective_bounds_multi(&output, objectives) {
                             Ok(new_bounds) => {
                                 if domain.update_bounds(new_bounds, thresholds, false).is_err() {
-                                    // NaN in objective bounds → treat as propagation failure (#2982)
+                                    // NaN in objective bounds → treat as propagation failure
                                     *unresolved_due_to_propagation_failure = true;
                                     continue;
                                 }
@@ -401,15 +426,15 @@ impl BetaCrownVerifier {
                                         );
                                     }
                                 } else if is_domain_dropped(&domain, thresholds, conjunctive) {
-                                    // #1866: Fully-constrained domain with conclusive violation.
+                                    // Fully-constrained domain with conclusive violation.
                                     *unresolved_due_to_violated_drop = true;
                                 } else {
-                                    // #1866: No unstable neurons and not verified — unresolved.
+                                    // No unstable neurons and not verified — unresolved.
                                     *unresolved_due_to_no_branch = true;
                                 }
                             }
                             Err(e) => {
-                                // #1871: objective bound extraction failed on a fully-constrained
+                                // Objective bound extraction failed on a fully-constrained
                                 // domain, so this sub-region remains unresolved.
                                 tracing::warn!(
                                     "Objective bound extraction failed (NoUnstable): {e}"
@@ -419,12 +444,17 @@ impl BetaCrownVerifier {
                         }
                     }
                     Err(ref e) if e.is_infeasible_domain() => {
-                        // #2926: Infeasible domain = empty = trivially verified.
+                        // Infeasible domain = empty = trivially verified.
                         tracing::debug!("NoUnstable domain infeasible (empty), pruning: {e}");
                         *domains_verified += 1;
+                        // #vit-margin-alpha-complex (P8): an emptiness claim;
+                        // counted for the fenced run's gate (bookkeeping only).
+                        super::containment_fence_lane::note_emptiness_claim(
+                            super::containment_fence_lane::EmptinessClaim::Sequential,
+                        );
                     }
                     Err(e) => {
-                        // #1871: final constrained propagation failed for a fully-constrained
+                        // Final constrained propagation failed for a fully-constrained
                         // domain, so this sub-region remains unresolved.
                         tracing::warn!("NoUnstable CROWN propagation failed: {e}");
                         *unresolved_due_to_propagation_failure = true;
@@ -439,7 +469,7 @@ impl BetaCrownVerifier {
             ) {
                 Ok(v) => v,
                 Err(e) => {
-                    // #1915/#1871: branch selection failed — domain unexplored, must not claim Verified.
+                    // Branch selection failed — domain unexplored, must not claim Verified.
                     tracing::warn!("select_graph_branch_multi failed: {e} (#1915)");
                     *unresolved_due_to_propagation_failure = true;
                     continue;
@@ -458,6 +488,23 @@ impl BetaCrownVerifier {
                     neuron_idx,
                     is_active,
                     score,
+                };
+                // B2.2: an empty half-space is a close too; keep the split for
+                // the proof tape (a clone only when a tape exists — never
+                // under Competition).
+                let taped_split = domain.proof_tape.as_ref().map(|_| constraint.clone());
+                let note_empty = |split: &Option<GraphNeuronConstraint>| {
+                    if let (Some(tape), Some(split)) = (&domain.proof_tape, split) {
+                        tape.note_splits(
+                            &domain.history,
+                            Some(split),
+                            None,
+                            crate::certify::lane_proof::TapeClose::Empty,
+                            Vec::new(),
+                            f64::NAN,
+                            false,
+                        );
+                    }
                 };
                 match domain.with_constraint(graph, constraint, false, thresholds) {
                     Ok(Some(mut child)) => {
@@ -537,11 +584,21 @@ impl BetaCrownVerifier {
                             }
                         }
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        // #vit-margin-alpha-complex (P8): an empty half-space.
+                        super::containment_fence_lane::note_emptiness_claim(
+                            super::containment_fence_lane::EmptinessClaim::Sequential,
+                        );
+                        note_empty(&taped_split);
+                    }
                     Err(ref e) if e.is_infeasible_domain() => {
                         let label = if is_active { "active" } else { "inactive" };
                         tracing::debug!("with_constraint ({label}) infeasible: {e}");
+                        note_empty(&taped_split);
                         *domains_verified += 1;
+                        super::containment_fence_lane::note_emptiness_claim(
+                            super::containment_fence_lane::EmptinessClaim::Sequential,
+                        );
                     }
                     Err(e) => {
                         let label = if is_active { "active" } else { "inactive" };
@@ -581,7 +638,7 @@ impl BetaCrownVerifier {
         is_active: bool,
         cuda_beta_spsa_frontier: MoCudaBetaSpsaFrontier,
     ) -> Result<ChildOutcome> {
-        // Per-disjunct alpha (#4355): when the child carries per-disjunct alpha
+        // Per-disjunct alpha: when the child carries per-disjunct alpha
         // states, dispatch to the per-disjunct evaluation module which runs
         // separate 1-row CROWN passes per unverified objective.
         if child.per_disjunct_alphas().is_some() {
@@ -705,7 +762,7 @@ impl BetaCrownVerifier {
                     .update_bounds(new_bounds, ctx.thresholds, false)
                     .is_err()
                 {
-                    // NaN in objective bounds → treat as NaN corruption (#2982)
+                    // NaN in objective bounds → treat as NaN corruption
                     return Ok(ChildOutcome::NaNCorruption);
                 }
                 if is_domain_dropped(child, ctx.thresholds, ctx.conjunctive) {
@@ -730,12 +787,16 @@ impl BetaCrownVerifier {
                 }
             }
             Err(ref e) if e.is_infeasible_domain() => {
-                // #2926: Infeasible domain = empty = trivially verified.
+                // Infeasible domain = empty = trivially verified.
                 tracing::debug!("{label} child infeasible (empty): {e}");
+                // #vit-margin-alpha-complex (P8): an emptiness claim.
+                super::containment_fence_lane::note_emptiness_claim(
+                    super::containment_fence_lane::EmptinessClaim::Sequential,
+                );
                 Ok(ChildOutcome::Verified(None))
             }
             Err(e) => {
-                // #1861: propagation failed — sub-region unexplored.
+                // Propagation failed — sub-region unexplored.
                 tracing::warn!("{label} child propagation failed: {e}");
                 Ok(ChildOutcome::PropagationFailure)
             }

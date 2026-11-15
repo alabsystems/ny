@@ -291,7 +291,7 @@ fn test_genbab_gelu_verification_trivial() {
 
 /// Build a Linear1(2→4) → ReLU → Linear2(4→2) → GeLU graph for splitting tests.
 ///
-/// Weights from the multi-objective benchmark (#1851). Linear2 uses small weights
+/// Weights from the multi-objective benchmark. Linear2 uses small weights
 /// (0.04-0.18) to keep GeLU pre-activation ranges narrow (~[-0.3, 0.5]).
 fn build_relu_gelu_splitting_graph() -> GraphNetwork {
     use crate::layers::GELULayer;
@@ -337,7 +337,7 @@ fn build_relu_gelu_splitting_graph() -> GraphNetwork {
 ///   Threshold = -0.05: below true min (property holds), but above root CROWN
 ///   bound, so the initial CROWN pass cannot verify → BaB splitting is required.
 ///
-/// Recalibrated in #3261: original single-layer Identity→GeLU test was unable
+/// Recalibrated: the original single-layer Identity→GeLU test was unable
 /// to require splitting (IBP∩CROWN gives exact bounds for single-layer networks).
 /// This 4-ReLU-neuron network creates cross-layer relaxation gaps that force
 /// multi-domain exploration. Empirical: ~2120 domains explored, 2 verified.
@@ -395,7 +395,7 @@ fn test_genbab_gelu_verification_needs_splitting() {
     // The trivial test (line 232) already asserts Verified for GenBaB GELU.
 }
 
-/// Regression test for #3262: GeLU-only network (no ReLU) must not return
+/// Regression test: GeLU-only network (no ReLU) must not return
 /// Unknown "No unstable ReLU neurons" when GenBaB is configured. The BaB
 /// loop must route to GenBaB processing before checking for ReLU neurons.
 #[ntest::timeout(10000)]
@@ -437,7 +437,7 @@ fn test_genbab_gelu_only_network_does_not_terminate_early_3262() {
         ..Default::default()
     };
     // batch_size=1 forces the sequential path (process_sequential_domains)
-    // where the #3262 fix lives. Default batch_size=64 takes the parallel
+    // where the GenBaB-first fix lives. Default batch_size=64 takes the parallel
     // path which already had the GenBaB-first check before this fix.
     let config = BetaCrownConfig {
         branching_heuristic: BranchingHeuristic::GenBaB(genbab_config),

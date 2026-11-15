@@ -1830,7 +1830,9 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "gpu-tests"))]
+// Every live test here needs an UNCHARGED verdict device (the five-rung
+// ladder), so the module is the `gpu-tests-uncharged` lane (TEST_CONFORMANCE.md).
+#[cfg(all(test, feature = "gpu-tests-uncharged"))]
 mod gpu_tests {
     use super::*;
     use crate::wgpu_device::test_support::{gpu_test_serial_guard, require_verdict_device};

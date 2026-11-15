@@ -42,7 +42,7 @@ fn softsign_scalar(x: f32) -> f32 {
     // Guard against inf/inf = NaN when x = ±inf.
     // Softsign(x) = x / (1 + |x|). At x = ±inf: ±inf / inf = NaN.
     // Correct limits: Softsign(-inf) = -1, Softsign(+inf) = +1.
-    // Ref: SiLU guard pattern (silu.rs:100-105), fix for #1836.
+    // Ref: SiLU guard pattern (silu/math.rs).
     if !x.is_finite() {
         if x.is_nan() {
             return f32::NAN;
@@ -52,7 +52,7 @@ fn softsign_scalar(x: f32) -> f32 {
     x / (1.0 + x.abs())
 }
 
-/// Evaluate Softsign in f64 for directed rounding precision. (#3245)
+/// Evaluate Softsign in f64 for directed rounding precision.
 fn softsign_f64(x: f64) -> f64 {
     if !x.is_finite() {
         if x.is_nan() {
@@ -72,9 +72,9 @@ impl BoundPropagation for SoftsignLayer {
     fn propagate_ibp(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
         // Softsign is monotonically increasing, so we just apply element-wise.
         // Directed rounding: compute in f64, apply next_down/next_up to guarantee
-        // lower bounds round DOWN and upper bounds round UP. (#3245)
+        // lower bounds round DOWN and upper bounds round UP.
         // Range clamp: softsign(x) ∈ [-1, 1] for all x, but directed rounding
-        // can push values one ULP outside the mathematical range. (#3316)
+        // can push values one ULP outside the mathematical range.
         let lower = input
             .lower()
             .mapv(|x| next_down_f32(softsign_f64(x as f64) as f32).clamp(-1.0, 1.0));
@@ -126,7 +126,7 @@ fn softsign_derivative(x: f32) -> f32 {
 /// be evaluated — typically `max(|l|, |u|)` for the relaxation interval [l, u].
 ///
 /// Ref: SiLU (silu/math.rs:216-231) directed rounding pattern.
-/// Fixes: #3146 — Softsign tangent used raw f32 without directed rounding.
+/// Previously the Softsign tangent used raw f32 without directed rounding.
 #[inline]
 fn softsign_tangent(d: f32, max_abs_x: f32) -> (f32, f32, f32) {
     let d64 = d as f64;
@@ -153,7 +153,7 @@ fn softsign_tangent(d: f32, max_abs_x: f32) -> (f32, f32, f32) {
 /// Directed rounding absorbs f64→f32 slope truncation error into the intercept.
 ///
 /// Ref: Exp (exp.rs:119-125), SiLU (silu/math.rs:177-201) directed rounding pattern.
-/// Fixes: #3146 — Softsign chord used raw `as f32` without directed rounding.
+/// Previously the Softsign chord used raw `as f32` without directed rounding.
 #[inline]
 fn softsign_chord_f64(l: f32, u: f32) -> (f32, f32, f32) {
     let l64 = l as f64;
@@ -188,7 +188,7 @@ fn softsign_chord_f64(l: f32, u: f32) -> (f32, f32, f32) {
 /// overshoot more). Binary search: 50 iterations for f64 precision.
 ///
 /// Uses f64 arithmetic throughout to avoid binary search rounding errors that
-/// could place the tangent on the wrong side of the boundary. (#3285)
+/// could place the tangent on the wrong side of the boundary.
 ///
 /// Search in [lo_init, hi_init]. Tangent at hi_init should be valid (above
 /// target), tangent at lo_init may be invalid.
@@ -211,7 +211,7 @@ fn find_upper_tangent(lo_init: f32, hi_init: f32, target_x: f32) -> f32 {
     // Return hi as f32 with conservative ULP bias. The f64 binary search
     // converges to the exact boundary, but f64→f32 rounding may place the
     // point on the wrong side. next_up_f32 biases toward hi_init (away from
-    // boundary, toward the known-valid region for upper tangent). (#3285)
+    // boundary, toward the known-valid region for upper tangent).
     next_up_f32(hi as f32)
 }
 
@@ -225,7 +225,7 @@ fn find_upper_tangent(lo_init: f32, hi_init: f32, target_x: f32) -> f32 {
 /// overshoot more). Binary search converges on the boundary.
 ///
 /// Uses f64 arithmetic throughout to avoid binary search rounding errors that
-/// could place the tangent on the wrong side of the boundary. (#3285)
+/// could place the tangent on the wrong side of the boundary.
 ///
 /// Search in [lo_init, hi_init]. Tangent at lo_init should be valid (below
 /// target), tangent at hi_init may be invalid.
@@ -248,7 +248,7 @@ fn find_lower_tangent(lo_init: f32, hi_init: f32, target_x: f32) -> f32 {
     // Return lo as f32 with conservative ULP bias. The f64 binary search
     // converges to the exact boundary, but f64→f32 rounding may place the
     // point on the wrong side. next_down_f32 biases toward lo_init (away from
-    // boundary, toward the known-valid region for lower tangent). (#3285)
+    // boundary, toward the known-valid region for lower tangent).
     next_down_f32(lo as f32)
 }
 
@@ -273,7 +273,7 @@ fn softsign_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
     // Delegates to softsign_tangent() which uses f64 intermediates and absorbs
     // f64→f32 slope truncation error into the intercept via next_down/next_up.
     // Ref: Exp point-interval (exp.rs:114-124).
-    // Fixes: #3190 — previously used pure f32 without directed rounding.
+    // Previously used pure f32 without directed rounding.
     if (u - l).abs() < 1e-8 {
         let max_abs_x = l.abs().max(u.abs());
         let (slope, lower_i, upper_i) = softsign_tangent(l, max_abs_x);
@@ -281,7 +281,7 @@ fn softsign_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
     }
 
     // Chord through endpoints (f64 to avoid catastrophic cancellation).
-    // Now returns directed-rounded intercepts (#3146).
+    // Now returns directed-rounded intercepts.
     let (chord_slope, chord_lower_i, chord_upper_i) = softsign_chord_f64(l, u);
     let max_abs_x = l.abs().max(u.abs());
 
@@ -372,7 +372,7 @@ impl SoftsignLayer {
     }
 
     /// Patches CROWN backward propagation with pre-activation bounds.
-    /// Part of #2613 Phase 2: generic activation Patches support.
+    /// Part of generic activation Patches support.
     pub(crate) fn propagate_patches_with_bounds(
         &self,
         bounds: &crate::bounds::patches::PatchesLinearBounds,

@@ -181,7 +181,7 @@ fn test_softmax_affine_causal_masks_future_positions() {
 
     let result = z.softmax_affine_causal(-1).unwrap();
 
-    // Causal softmax adds one approximation error term per element (#2522).
+    // Causal softmax adds one approximation error term per element.
     // n_attn_rows = prefix_size * seq_q = 1 * 4 = 4, seq_k = 4.
     assert_eq!(result.n_error_terms, z.n_error_terms + seq * seq);
 
@@ -247,8 +247,8 @@ fn test_softmax_affine_causal_error_term_count_overflow_returns_error_3012() {
 
 #[test]
 fn test_softmax_affine_error_term_added() {
-    // Verify that softmax adds one approximation error term per element (#2522).
-    // Before #2522 this was a single shared error term; per-element independent
+    // Verify that softmax adds one approximation error term per element.
+    // Previously this was a single shared error term; per-element independent
     // error symbols prevent false cancellation under downstream linear ops.
     let values = arr1(&[1.0_f32, 2.0, 3.0]);
     let dim = values.len();
@@ -264,7 +264,7 @@ fn test_softmax_affine_error_term_added() {
     );
 }
 
-/// Regression test for #2473: softmax_affine uses max(radius_k) instead of sum(radius_k)
+/// Regression test: softmax_affine uses max(radius_k) instead of sum(radius_k)
 /// for the perturbation radius in the approximation error bound.
 ///
 /// A zonotope with per-element error terms has worst-case perturbation radius
@@ -282,8 +282,8 @@ fn test_softmax_affine_error_term_added() {
 /// the approximation error. This test currently passes even with the buggy max-radius
 /// because the bounds are loose enough. The bug is more likely to cause unsoundness
 /// after several layers of propagation where error terms become correlated across
-/// all dimensions. This test serves as a smoke-test foundation — after #2473 is
-/// fixed (sum replaces max), it ensures the fix doesn't break corner containment.
+/// all dimensions. This test serves as a smoke-test foundation — with the fix in
+/// place (sum replaces max), it ensures the fix doesn't break corner containment.
 #[test]
 fn test_softmax_affine_elementwise_soundness_regression_2473() {
     // Create a 3-element zonotope with per-element error terms and LARGE epsilon.
@@ -347,7 +347,7 @@ fn test_softmax_affine_elementwise_soundness_regression_2473() {
     }
 }
 
-/// Targeted soundness test for #2473 using *correlated* error terms.
+/// Targeted soundness test for the max-vs-sum radius bug using *correlated* error terms.
 ///
 /// With `from_input_elementwise`, each error term only affects one dimension, so
 /// Jacobian-transformed error coefficients already create wide bounds that mask the
@@ -430,12 +430,12 @@ fn test_softmax_affine_correlated_errors_soundness_2473() {
     }
 }
 
-/// Strengthened regression test for #2473: detects max-vs-sum radius bug.
+/// Strengthened regression test: detects max-vs-sum radius bug.
 ///
 /// The original `test_softmax_affine_correlated_errors_soundness_2473` test passes
 /// even with the buggy `max_radius` formula because at center `[0,0,0]` the
 /// Jacobian-transformed error terms create bounds wide enough to absorb the
-/// underestimated approximation error. (Issue #2512)
+/// underestimated approximation error.
 ///
 /// This test uses:
 /// 1. **Asymmetric center** `[1, 0, 0]` where softmax = `[0.576, 0.212, 0.212]`.
@@ -520,7 +520,7 @@ fn test_softmax_affine_correlated_errors_detects_max_vs_sum_2512() {
     }
 }
 
-/// Soundness test for #2473 on the 2D softmax path with correlated errors.
+/// Max-vs-sum radius soundness test on the 2D softmax path with correlated errors.
 #[test]
 fn test_softmax_affine_2d_correlated_errors_soundness_2473() {
     // Build 2D zonotope: shape (3, 2, 3) = [center + 2 errors, seq=2, dim=3]
@@ -602,7 +602,7 @@ fn test_softmax_affine_2d_correlated_errors_soundness_2473() {
     }
 }
 
-/// Soundness test for #2473 on the causal softmax path with correlated errors.
+/// Max-vs-sum radius soundness test on the causal softmax path with correlated errors.
 #[test]
 fn test_softmax_affine_causal_correlated_errors_soundness_2473() {
     // Build causal softmax zonotope: shape (3, 3, 3) = [center + 2 errors, seq_q=3, seq_k=3]
@@ -684,9 +684,9 @@ fn test_softmax_affine_causal_correlated_errors_soundness_2473() {
     }
 }
 
-// ==================== Per-element error cancellation regression tests (#2522) ====================
+// ==================== Per-element error cancellation regression tests ====================
 
-/// Regression test for #2522: softmax 1D approximation errors must be independent per element
+/// Regression test: softmax 1D approximation errors must be independent per element
 /// so they cannot cancel under downstream [1, -1] linear projection.
 #[test]
 fn test_softmax_affine_1d_linear_projection_soundness_2522() {
@@ -743,7 +743,7 @@ fn test_softmax_affine_1d_linear_projection_soundness_2522() {
     );
 }
 
-/// Regression test for #2522: softmax 2D approximation errors must be independent per element.
+/// Regression test: softmax 2D approximation errors must be independent per element.
 #[test]
 fn test_softmax_affine_2d_linear_projection_soundness_2522() {
     use ndarray::arr2;
@@ -796,7 +796,7 @@ fn test_softmax_affine_2d_linear_projection_soundness_2522() {
     );
 }
 
-/// Regression test for #2522: causal softmax approximation errors must be independent per element.
+/// Regression test: causal softmax approximation errors must be independent per element.
 #[test]
 fn test_softmax_affine_causal_linear_projection_soundness_2522() {
     use ndarray::arr2;
@@ -856,4 +856,4 @@ fn test_softmax_affine_causal_linear_projection_soundness_2522() {
     );
 }
 
-// NaN safety tests (#2676 Site 1) are in softmax_nan.rs to keep this file under 1000 lines.
+// NaN safety tests are in softmax_nan.rs to keep this file under 1000 lines.

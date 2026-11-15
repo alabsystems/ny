@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Domain eviction logic for bounded-queue BaB (#2326).
+//! Domain eviction logic for bounded-queue BaB.
 //!
 //! Count and byte caps share one priority-preserving compaction path. Every
 //! stored domain is unverified, so eviction discards unexplored search space:
@@ -52,8 +52,6 @@ impl DomainList {
     /// scans the current row census in actual queue-priority order, retaining
     /// the longest prefix that fits. The first domain is always retained for
     /// forward progress even when it alone exceeds the byte budget.
-    ///
-    /// Reference: Issue #2326 Finding 1
     pub(super) fn evict_excess_domains(&mut self) -> Result<()> {
         self.validate_grouped_alignment()?;
         let len = self.metadata.len();

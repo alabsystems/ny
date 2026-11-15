@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Demand-driven intermediate-bound selection for CROWN-IBP (#3775).
+//! Demand-driven intermediate-bound selection for CROWN-IBP.
 //!
 //! Computes which graph nodes need CROWN-IBP tightened bounds based on
 //! downstream consumer demand. Nodes that no nonlinear consumer requires
@@ -49,6 +49,17 @@ impl SparseReluRowPlan {
 
     pub(super) fn total_rows(&self) -> usize {
         self.total_rows
+    }
+
+    /// An explicitly empty plan for a target whose every row is sign-stable
+    /// under the baseline. Equivalent to what the row predicate produces for
+    /// such a target; named so a selector that has already classified the
+    /// target does not have to re-scan it.
+    pub(super) const fn all_stable(total_rows: usize) -> Self {
+        Self {
+            selected_rows: Vec::new(),
+            total_rows,
+        }
     }
 
     pub(super) fn is_all_stable(&self) -> bool {
@@ -166,10 +177,41 @@ pub(super) fn sparse_relu_row_plan_for_target(
     output_name: Option<&str>,
     bounds: &BoundedTensor,
 ) -> Option<SparseReluRowPlan> {
+    sparse_relu_row_plan_for_target_with_max_permille(
+        graph,
+        target_name,
+        output_name,
+        bounds,
+        DEFAULT_SPARSE_RELU_MAX_PERMILLE,
+    )
+}
+
+/// alpha-beta-CROWN's `minimum_sparsity` expressed in PER MILLE of the target's
+/// rows (`backward_bound.py:580-589` uses `0.9`).
+///
+/// Integer per-mille, not `f32`: 900 reproduces the historical
+/// `selected * 10 <= total * 9` predicate EXACTLY (`selected * 1000 <= total *
+/// 900`), so the env-armed route stays bit-identical, and the value can sit in
+/// the `Eq`-deriving collection-cache policy without a float comparison.
+pub(crate) const DEFAULT_SPARSE_RELU_MAX_PERMILLE: u16 = 900;
+
+/// `max_permille`-parameterised twin of [`sparse_relu_row_plan_for_target`].
+///
+/// `max_permille` only decides whether a plan is RETURNED (the abc
+/// `minimum_sparsity` fallback to a full-width identity seed); it never changes
+/// WHICH rows are selected, so a wider ceiling can only admit a target that
+/// would otherwise have taken the dense walk.
+pub(super) fn sparse_relu_row_plan_for_target_with_max_permille(
+    graph: &GraphNetwork,
+    target_name: &str,
+    output_name: Option<&str>,
+    bounds: &BoundedTensor,
+    max_permille: u16,
+) -> Option<SparseReluRowPlan> {
     if !relu_only_intermediate_target_is_eligible(graph, target_name, output_name) {
         return None;
     }
-    sparse_relu_row_plan_for_bounds(bounds)
+    sparse_relu_row_plan_for_bounds(bounds, max_permille)
 }
 
 /// Structural half of sparse ReLU-row eligibility.
@@ -191,7 +233,10 @@ pub(super) fn relu_only_intermediate_target_is_eligible(
     relu_consumers > 0 && other_consumers == 0
 }
 
-fn sparse_relu_row_plan_for_bounds(bounds: &BoundedTensor) -> Option<SparseReluRowPlan> {
+fn sparse_relu_row_plan_for_bounds(
+    bounds: &BoundedTensor,
+    max_permille: u16,
+) -> Option<SparseReluRowPlan> {
     let selected_rows: Vec<usize> = bounds
         .lower()
         .iter()
@@ -203,15 +248,22 @@ fn sparse_relu_row_plan_for_bounds(bounds: &BoundedTensor) -> Option<SparseReluR
         })
         .collect();
     let total_rows = bounds.len();
-    sparse_relu_threshold_allows(selected_rows.len(), total_rows).then_some(SparseReluRowPlan {
-        selected_rows,
-        total_rows,
-    })
+    sparse_relu_threshold_allows(selected_rows.len(), total_rows, max_permille).then_some(
+        SparseReluRowPlan {
+            selected_rows,
+            total_rows,
+        },
+    )
 }
 
-fn sparse_relu_threshold_allows(selected_rows: usize, total_rows: usize) -> bool {
+pub(super) fn sparse_relu_threshold_allows(
+    selected_rows: usize,
+    total_rows: usize,
+    max_permille: u16,
+) -> bool {
     selected_rows <= total_rows
-        && (selected_rows as u128).saturating_mul(10) <= (total_rows as u128).saturating_mul(9)
+        && (selected_rows as u128).saturating_mul(1000)
+            <= (total_rows as u128).saturating_mul(u128::from(max_permille))
 }
 
 /// Identify which nodes need CROWN-IBP tightened bounds.
@@ -323,23 +375,61 @@ mod tests {
 
     #[test]
     fn sparse_relu_row_threshold_matches_upstream_ninety_percent_semantics() {
-        let accepted = sparse_relu_row_plan_for_bounds(&bounds_with_crossing_rows(9, 1))
-            .expect("9/10 retained rows engage");
+        let accepted = sparse_relu_row_plan_for_bounds(
+            &bounds_with_crossing_rows(9, 1),
+            DEFAULT_SPARSE_RELU_MAX_PERMILLE,
+        )
+        .expect("9/10 retained rows engage");
         assert_eq!(accepted.selected_len(), 9);
         assert_eq!(accepted.total_rows(), 10);
 
         assert!(
-            sparse_relu_row_plan_for_bounds(&bounds_with_crossing_rows(10, 1)).is_none(),
+            sparse_relu_row_plan_for_bounds(
+                &bounds_with_crossing_rows(10, 1),
+                DEFAULT_SPARSE_RELU_MAX_PERMILLE
+            )
+            .is_none(),
             "10/11 retained rows exceed the 90% threshold"
         );
         assert!(
-            sparse_relu_row_plan_for_bounds(&bounds_with_crossing_rows(10, 0)).is_none(),
+            sparse_relu_row_plan_for_bounds(
+                &bounds_with_crossing_rows(10, 0),
+                DEFAULT_SPARSE_RELU_MAX_PERMILLE
+            )
+            .is_none(),
             "a fully unstable target stays dense"
         );
 
-        let all_stable = sparse_relu_row_plan_for_bounds(&bounds_with_crossing_rows(0, 10))
-            .expect("all-stable target engages as an empty plan");
+        let all_stable = sparse_relu_row_plan_for_bounds(
+            &bounds_with_crossing_rows(0, 10),
+            DEFAULT_SPARSE_RELU_MAX_PERMILLE,
+        )
+        .expect("all-stable target engages as an empty plan");
         assert!(all_stable.is_all_stable());
+    }
+
+    /// The typed ceiling only decides whether the plan is RETURNED. 900 per
+    /// mille must reproduce the historical `selected * 10 <= total * 9`
+    /// predicate exactly, or the env-armed route is no longer bit-identical.
+    #[test]
+    fn sparse_relu_max_permille_ceiling_matches_the_historical_predicate_at_900() {
+        for total in 0usize..64 {
+            for selected in 0..=total {
+                let historical =
+                    (selected as u128).saturating_mul(10) <= (total as u128).saturating_mul(9);
+                assert_eq!(
+                    historical,
+                    sparse_relu_threshold_allows(selected, total, DEFAULT_SPARSE_RELU_MAX_PERMILLE),
+                    "selected={selected} total={total}"
+                );
+            }
+        }
+        // A wider ceiling admits a target the 90% rule declines; a narrower one
+        // declines a target 90% admits.
+        assert!(!sparse_relu_threshold_allows(10, 11, 900));
+        assert!(sparse_relu_threshold_allows(10, 11, 1000));
+        assert!(sparse_relu_threshold_allows(9, 10, 900));
+        assert!(!sparse_relu_threshold_allows(9, 10, 500));
     }
 
     #[test]
@@ -354,7 +444,8 @@ mod tests {
                 .expect("shape"),
         )
         .expect("valid extended-real bounds");
-        let plan = sparse_relu_row_plan_for_bounds(&bounds).expect("3/6 rows engage");
+        let plan = sparse_relu_row_plan_for_bounds(&bounds, DEFAULT_SPARSE_RELU_MAX_PERMILLE)
+            .expect("3/6 rows engage");
         assert_eq!(plan.selected_rows(), &[0, 3, 4]);
     }
 

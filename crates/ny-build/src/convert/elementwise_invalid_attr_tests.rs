@@ -17,6 +17,7 @@ fn make_context() -> ConvertContext<'static> {
     let constant_tensors = Box::leak(Box::new(HashSet::new()));
     let evaluated_constants = Box::leak(Box::new(HashMap::<String, ArrayD<f32>>::new()));
     ConvertContext {
+        linear_storage: crate::LinearStoragePolicy::EagerBounds,
         weights,
         tensor_shapes,
         constant_tensors,
@@ -78,7 +79,7 @@ fn convert_elu_admits_zero_alpha_as_exact_relu() {
 
 /// Negative / non-finite ELU alpha stays refused: negative alpha makes the
 /// negative branch DECREASING, so ELU is no longer monotone and the pointwise
-/// IBP endpoint mapping would invert the bounds (#2779).
+/// IBP endpoint mapping would invert the bounds.
 #[test]
 fn convert_elu_rejects_invalid_alpha_2551() {
     let ctx = make_context();

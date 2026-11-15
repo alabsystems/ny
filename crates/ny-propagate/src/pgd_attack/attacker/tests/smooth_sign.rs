@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Smooth Sign relaxation and batched SPSA regression tests (#3769).
+//! Smooth Sign relaxation and batched SPSA regression tests.
 
 use ndarray::{arr1, arr2, ArrayD, IxDyn};
 use ny_core::NaiveCpuGemmEngine;
@@ -73,7 +73,7 @@ fn test_spsa_with_bounds_reaches_max_delta_with_default_config_3769() {
     );
     assert_eq!(baseline_evals, 2);
 
-    // Smooth Sign relaxation (#3769): dispatches to tanh(β*x) path,
+    // Smooth Sign relaxation: dispatches to tanh(β*x) path,
     // yielding nonzero gradient in exactly 2 evaluations.
     let mut bounded_rng = StdRng::seed_from_u64(42);
     let (gradient, evals) = attacker
@@ -141,7 +141,7 @@ fn test_evaluate_smooth_sign_produces_continuous_output_3769() {
     );
 }
 
-/// Verify smooth Sign gives nonzero SPSA gradient at Sign plateau (#3769).
+/// Verify smooth Sign gives nonzero SPSA gradient at Sign plateau.
 ///
 /// With discrete Sign, SPSA at delta=0.001 gives zero gradient because both
 /// probes land on the same side of the threshold. Smooth Sign gives nonzero
@@ -196,7 +196,7 @@ fn test_smooth_sign_spsa_gives_nonzero_gradient_at_plateau_3769() {
 }
 
 /// Verify estimate_gradient_spsa_with_bounds dispatches to smooth Sign
-/// path for networks with Sign layers (#3769).
+/// path for networks with Sign layers.
 #[ntest::timeout(10000)]
 #[test]
 fn test_spsa_with_bounds_dispatches_smooth_sign_for_sign_networks_3769() {
@@ -231,7 +231,7 @@ fn test_spsa_with_bounds_dispatches_smooth_sign_for_sign_networks_3769() {
     );
 }
 
-/// Verify batched smooth Sign SPSA gives nonzero gradients (#3769).
+/// Verify batched smooth Sign SPSA gives nonzero gradients.
 #[ntest::timeout(10000)]
 #[test]
 fn test_batched_smooth_sign_spsa_gives_nonzero_gradient_3769() {

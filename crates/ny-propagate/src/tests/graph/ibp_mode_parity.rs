@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Regression tests for #2706 IBP mode parity.
+//! Regression tests for IBP mode parity.
 
 use crate::domain_clip::DomainClipper;
 use crate::*;
@@ -276,14 +276,14 @@ fn test_graph_network_ibp_modes_fail_fast_on_nan_input_2706() {
     assert_numerical_instability(block_wise_err, "#2706 block-wise");
 }
 
-/// Regression test for #2585: the clipper path must reject a node whose IBP
+/// Regression test: the clipper path must reject a node whose IBP
 /// output contains NaN before `clip_bounds()` or `bounds_cache` can observe it.
 ///
 /// ReLU IBP preserves NaN via `nan_propagating_max_zero`, and the first
 /// interception layer is `BoundedTensor::new_allow_infinite` inside the ReLU
 /// layer itself.  The graph-level `check_nan_firewall()` is a second defence
 /// that would trigger if a layer ever bypassed the tensor constructor check.
-/// Either interception satisfies the #2585 contract: NaN never reaches the
+/// Either interception satisfies the NaN-firewall contract: NaN never reaches the
 /// bounds cache or the clipper.
 #[ntest::timeout(10000)]
 #[test]
@@ -319,7 +319,7 @@ fn test_graph_network_ibp_with_clipper_rejects_nan_node_output_2585() {
     );
 }
 
-/// Regression test for #3768: `collect_node_bounds` is the 5th IBP path and was
+/// Regression test: `collect_node_bounds` is the 5th IBP path and was
 /// missing the NaN firewall that the other 4 paths share.
 #[ntest::timeout(10000)]
 #[test]

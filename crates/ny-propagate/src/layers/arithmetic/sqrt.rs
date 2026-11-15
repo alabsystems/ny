@@ -17,6 +17,7 @@ use crate::layers::common::{
     crown_elementwise_backward, crown_elementwise_backward_batched,
     crown_elementwise_backward_patches, non_finite_domain_guard, BoundPropagation,
 };
+use crate::layers::linear::bias::{add_f64_down, add_f64_up};
 use crate::{BatchedLinearBounds, LinearBounds};
 
 const SQRT_ALPHA_MIN_MID: f32 = 1e-6;
@@ -43,7 +44,7 @@ impl SqrtLayer {
     pub(crate) fn propagate_ibp_lenient(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
         // Directed rounding: compute in f64 then round lower bound down, upper bound up.
         // IEEE 754 sqrt is correctly rounded (max 0.5 ULP), but f64→f32 cast may round
-        // the wrong direction. next_down_f32/next_up_f32 ensures soundness. (#3243)
+        // the wrong direction. next_down_f32/next_up_f32 ensures soundness.
         let out_lower = input
             .lower()
             .mapv(|v| next_down_f32((nan_propagating_max_zero(v) as f64).sqrt() as f32));
@@ -51,13 +52,13 @@ impl SqrtLayer {
             .upper()
             .mapv(|v| next_up_f32((nan_propagating_max_zero(v) as f64).sqrt() as f32));
         // NaN in output indicates NaN in input (data corruption, not overflow).
-        // Must check before repair which would silently swallow NaN (#2635).
+        // Must check before repair which would silently swallow NaN.
         if out_lower.iter().any(|v| v.is_nan()) || out_upper.iter().any(|v| v.is_nan()) {
             return Err(NyError::NumericalInstability(
                 "Sqrt IBP lenient: NaN in bounds (from NaN input)".into(),
             ));
         }
-        // Centralized NaN/Inf repair at constructor (#3423, replaces ad-hoc #3030).
+        // Centralized NaN/Inf repair at constructor (replaces ad-hoc per-site repair).
         // NaN check above ensures only Inf reaches Conservative repair.
         BoundedTensor::new_repaired(out_lower, out_upper, RepairStrategy::Conservative)
     }
@@ -75,11 +76,11 @@ impl BoundPropagation for SqrtLayer {
         // sqrt is monotonically increasing for x >= 0.
         // For negative inputs, clamp to 0 and let the soundness provenance scanner
         // detect and flag the result as heuristic (SqrtNegativeDomain).
-        // This matches the design in #424: gate negative sqrt in sound mode by
+        // This matches the design: gate negative sqrt in sound mode by
         // marking as heuristic, not by returning an error.
         // Directed rounding: compute in f64 then round lower bound down, upper bound up.
         // IEEE 754 sqrt is correctly rounded (max 0.5 ULP), but f64→f32 cast may round
-        // the wrong direction. next_down_f32/next_up_f32 ensures soundness. (#3243)
+        // the wrong direction. next_down_f32/next_up_f32 ensures soundness.
         let out_lower = input
             .lower()
             .mapv(|v| next_down_f32((nan_propagating_max_zero(v) as f64).sqrt() as f32));
@@ -87,13 +88,13 @@ impl BoundPropagation for SqrtLayer {
             .upper()
             .mapv(|v| next_up_f32((nan_propagating_max_zero(v) as f64).sqrt() as f32));
         // NaN in output indicates NaN in input (data corruption, not overflow).
-        // Must check before repair which would silently swallow NaN (#2635).
+        // Must check before repair which would silently swallow NaN.
         if out_lower.iter().any(|v| v.is_nan()) || out_upper.iter().any(|v| v.is_nan()) {
             return Err(NyError::NumericalInstability(
                 "Sqrt IBP: NaN in bounds (from NaN input)".into(),
             ));
         }
-        // Centralized NaN/Inf repair at constructor (#3423, replaces ad-hoc #3030).
+        // Centralized NaN/Inf repair at constructor (replaces ad-hoc per-site repair).
         BoundedTensor::new_repaired(out_lower, out_upper, RepairStrategy::Conservative)
     }
 
@@ -171,7 +172,7 @@ pub(crate) fn sqrt_linear_relaxation_with_alpha(l: f32, u: f32, mid: f32) -> Lin
 
     // Use f64 intermediates to prevent catastrophic cancellation.
     // The chord slope (sqrt(u) - sqrt(l)) / (u - l) cancels when l ≈ u.
-    // Same pattern as Exp fix (#1745).
+    // Same pattern as Exp fix.
     let l64 = l as f64;
     let u64 = u as f64;
 
@@ -253,6 +254,43 @@ impl SqrtLayer {
         non_finite_domain_guard("Sqrt-alpha", pre_activation)?;
         self.ensure_nonnegative_bounds(pre_activation)?;
 
+        // DISCHARGE THE INCOMING COEFFICIENT ERROR BEFORE COMPOSING.
+        //
+        // The alpha composition below publishes through `LinearBounds::new_or_conservative`,
+        // which hardcodes `lower_a_err: None, upper_a_err: None` -- it ERASES the error
+        // plane rather than leaving it stale. `bounds/concretize.rs` reads exactly those
+        // fields to compute `coefficient_penalty_l/u` and charges ZERO when they are None,
+        // and neither production route discharges first, so the error simply vanished.
+        // The dropped quantity is the upstream Linear's full Higham charge (gamma_n * S),
+        // NOT an ULP -- `linear/crown_single.rs` always publishes an error plane, so any
+        // Sqrt node below a Linear/Conv in the backward walk receives an err-bearing
+        // carrier.
+        //
+        // Fold it into the bias over the OUTPUT box: the incoming carrier's COLUMNS index
+        // THIS node's output, not its input, so folding over `pre_activation` would charge
+        // the wrong magnitudes. `fold_coeff_err_into_bias` discharges via
+        // `certified_affine_sum_f32` and falls back to the conservative row-degrade if the
+        // box cannot be mapped onto the columns, so it fails closed either way.
+        //
+        // PARTIAL: this discharges the INCOMING error (the unbounded-magnitude half). It
+        // does not yet publish a FRESH gap for this relaxation's own directed-rounding
+        // error, which is ULP-scale. The certified sibling
+        // `crown_elementwise_backward_dual_indexed` (trigonometric/s_shaped/shared.rs:563)
+        // is the shape to lift for that.
+        let discharged_bounds;
+        let bounds = if bounds.has_coeff_err() {
+            let out_box = self.propagate_ibp(pre_activation)?;
+            let out_flat = out_box.flatten();
+            let out_l: Vec<f32> = out_flat.lower().iter().copied().collect();
+            let out_u: Vec<f32> = out_flat.upper().iter().copied().collect();
+            let mut owned = bounds.clone();
+            owned.fold_coeff_err_into_bias(&out_l, &out_u);
+            discharged_bounds = owned;
+            &discharged_bounds
+        } else {
+            bounds
+        };
+
         let pre_flat = pre_activation.flatten();
         let pre_lower = pre_flat
             .lower()
@@ -323,12 +361,12 @@ impl SqrtLayer {
             for i in 0..num_neurons {
                 let lr = compose_lower(bounds.lower_a()[[j, i]], &lower_path_relaxations[i]);
                 new_lower_a[[j, i]] = lr.new_coeff;
-                new_lower_b_f64[j] += lr.intercept_contrib;
+                new_lower_b_f64[j] = add_f64_down(new_lower_b_f64[j], lr.intercept_contrib);
                 lower_nonfinite_rows[j] |= lr.nonfinite;
 
                 let ur = compose_upper(bounds.upper_a()[[j, i]], &upper_path_relaxations[i]);
                 new_upper_a[[j, i]] = ur.new_coeff;
-                new_upper_b_f64[j] += ur.intercept_contrib;
+                new_upper_b_f64[j] = add_f64_up(new_upper_b_f64[j], ur.intercept_contrib);
                 upper_nonfinite_rows[j] |= ur.nonfinite;
             }
         }
@@ -365,12 +403,11 @@ impl SqrtLayer {
             // clamps l to 0 and adjusts the upper intercept for negative
             // original_l (lines 143, 200-206), so CROWN backward is sound here.
             //
-            // Previously this returned UnsupportedConfiguration (#3499), which
-            // caused the entire graph CROWN backward to fall back to IBP. After
-            // #4112 widened intermediate bounds past multi-input nodes, the Sqrt
+            // Previously this returned UnsupportedConfiguration, which
+            // caused the entire graph CROWN backward to fall back to IBP. Once
+            // intermediate bounds were widened past multi-input nodes, the Sqrt
             // pre-activation can legitimately include negative values even when
-            // the model is correct. Proceeding with CROWN preserves tighter
-            // bounds. Fix: #4113.
+            // the model is correct. Proceeding with CROWN preserves tighter bounds.
             debug!(
                 "Sqrt CROWN backward: pre-activation lower bounds include negative values; \
                  relaxation clamps to [0, u] (domain refinement, proceeding with CROWN)"
@@ -392,7 +429,7 @@ impl SqrtLayer {
     }
 
     /// Patches CROWN backward propagation with pre-activation bounds.
-    /// Part of #2613 Phase 2: generic activation Patches support.
+    /// Part of generic activation Patches support.
     pub(crate) fn propagate_patches_with_bounds(
         &self,
         bounds: &crate::bounds::patches::PatchesLinearBounds,

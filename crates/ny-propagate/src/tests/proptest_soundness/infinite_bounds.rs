@@ -4,8 +4,8 @@
 
 //! Regression tests for infinite-bound soundness bugs.
 //!
-//! #1836: Activation eval functions produce NaN at -inf via 0*inf, corrupting IBP bounds.
-//! #1837: GELU CROWN relaxation returns identity for infinite bounds — lower bound unsound.
+//! Activation eval functions produce NaN at -inf via 0*inf, corrupting IBP bounds.
+//! GELU CROWN relaxation returns identity for infinite bounds — lower bound unsound.
 //!
 //! These are deterministic unit tests, not property tests, since they target
 //! specific infinite-input corner cases that proptest's finite ranges never reach.
@@ -22,10 +22,10 @@ use ntest::timeout;
 use ny_tensor::BoundedTensor;
 
 // =========================================================================
-// #1836: Activation eval NaN at -inf (IBP soundness)
+// Activation eval NaN at -inf (IBP soundness)
 // =========================================================================
 
-/// Regression #1836: gelu_eval(NEG_INFINITY, Erf) must not be NaN.
+/// Regression: gelu_eval(NEG_INFINITY, Erf) must not be NaN.
 /// GELU(-inf) = 0.5 * (-inf) * (1 + erf(-inf/sqrt(2))) = 0.5 * (-inf) * (1 + (-1)) = 0.5 * (-inf) * 0 = NaN
 /// Correct value: 0.0 (limit as x -> -inf)
 #[timeout(10000)]
@@ -42,7 +42,7 @@ fn regression_1836_gelu_erf_eval_neg_inf() {
     );
 }
 
-/// Regression #1836: gelu_eval(NEG_INFINITY, Tanh) must not be NaN.
+/// Regression: gelu_eval(NEG_INFINITY, Tanh) must not be NaN.
 #[timeout(10000)]
 #[test]
 fn regression_1836_gelu_tanh_eval_neg_inf() {
@@ -57,7 +57,7 @@ fn regression_1836_gelu_tanh_eval_neg_inf() {
     );
 }
 
-/// Regression #1836: gelu_eval(+INFINITY) must be +inf, not NaN.
+/// Regression: gelu_eval(+INFINITY) must be +inf, not NaN.
 #[timeout(10000)]
 #[test]
 fn regression_1836_gelu_eval_pos_inf() {
@@ -73,7 +73,7 @@ fn regression_1836_gelu_eval_pos_inf() {
     );
 }
 
-/// Regression #1836: Mish eval at NEG_INFINITY produces NaN.
+/// Regression: Mish eval at NEG_INFINITY produces NaN.
 /// mish(-inf) = (-inf) * tanh(softplus(-inf)) = (-inf) * tanh(exp(-inf))
 ///            = (-inf) * tanh(0) = (-inf) * 0 = NaN
 /// Correct value: 0.0
@@ -124,7 +124,7 @@ fn regression_1836_mish_ibp_neg_inf_soundness() {
     );
 }
 
-/// Regression #1836: HardSwish eval at NEG_INFINITY produces NaN.
+/// Regression: HardSwish eval at NEG_INFINITY produces NaN.
 /// hardswish(-inf) = (-inf) * clamp((-inf+3)/6, 0, 1) = (-inf) * 0 = NaN
 /// Correct value: 0.0
 ///
@@ -164,7 +164,7 @@ fn regression_1836_hardswish_ibp_neg_inf_soundness() {
     );
 }
 
-/// Regression #1836: Softsign eval at +/-INFINITY produces NaN.
+/// Regression: Softsign eval at +/-INFINITY produces NaN.
 /// softsign(±inf) = ±inf / (1 + |±inf|) = ±inf / inf = NaN
 /// Correct values: softsign(-inf) = -1.0, softsign(+inf) = +1.0
 ///
@@ -218,7 +218,7 @@ fn regression_1836_softsign_eval_inf() {
     }
 }
 
-/// Regression #1836: GELU IBP with NEG_INFINITY lower bound must not produce NaN.
+/// Regression: GELU IBP with NEG_INFINITY lower bound must not produce NaN.
 #[timeout(10000)]
 #[test]
 fn regression_1836_gelu_ibp_neg_inf() {
@@ -261,17 +261,13 @@ fn regression_1836_gelu_ibp_neg_inf() {
 }
 
 // =========================================================================
-// #1837: GELU CROWN relaxation identity for infinite bounds (unsound lower)
+// GELU CROWN relaxation identity for infinite bounds (unsound lower)
 // =========================================================================
 
-/// Regression #1837: gelu_linear_relaxation returns identity (1,0,1,0) for infinite bounds.
-/// The lower bound y=x is unsound: GELU(x) < x for x near -0.5.
-/// At x = -0.5: GELU(-0.5) ≈ -0.154, but identity says lower = -0.5 < -0.154.
-/// Wait — that means identity lower IS sound (lower <= f(x)).
-/// The actual issue: identity UPPER says GELU(x) <= x, but GELU(-0.5) ≈ -0.154 > -0.5.
-/// So GELU(x) > x near x = -0.5, violating the upper bound.
-///
-/// Let me re-analyze per the issue:
+/// Regression: gelu_linear_relaxation returns identity (1,0,1,0) for infinite bounds.
+/// The identity is unsound in both directions:
+/// - Upper bound (slope=1, intercept=0): claims GELU(x) <= x.
+///   GELU(-0.5) ≈ -0.154 > -0.5, so it fails for x < 0.
 /// - Lower bound (slope=1, intercept=0): claims GELU(x) >= x.
 ///   GELU(-0.5) ≈ -0.154, x = -0.5, so -0.154 >= -0.5 ✓
 ///   GELU(0.3) ≈ 0.185, x = 0.3, so 0.185 >= 0.3 ✗ — UNSOUND
@@ -324,7 +320,7 @@ fn regression_1837_gelu_relaxation_identity_unsound() {
     }
 }
 
-/// Regression #1837: gelu_sound_linear_relaxation identity for infinite bounds.
+/// Regression: gelu_sound_linear_relaxation identity for infinite bounds.
 #[timeout(10000)]
 #[test]
 fn regression_1837_gelu_sound_relaxation_identity_unsound() {
@@ -361,7 +357,7 @@ fn regression_1837_gelu_sound_relaxation_identity_unsound() {
     }
 }
 
-/// Regression #1837: gelu_tanh_sound_linear_relaxation identity for infinite bounds.
+/// Regression: gelu_tanh_sound_linear_relaxation identity for infinite bounds.
 #[timeout(10000)]
 #[test]
 fn regression_1837_gelu_tanh_sound_relaxation_identity_unsound() {
@@ -398,7 +394,7 @@ fn regression_1837_gelu_tanh_sound_relaxation_identity_unsound() {
     }
 }
 
-/// Regression #1837: GELU CROWN backward with infinite input bounds
+/// Regression: GELU CROWN backward with infinite input bounds
 /// must not produce unsound linear relaxation via the identity fallback.
 #[timeout(10000)]
 #[test]

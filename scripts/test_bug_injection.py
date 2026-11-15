@@ -91,7 +91,7 @@ def run_ny_diff(model_a: str, model_b: str, input_path: str = None, tolerance: f
         tolerance: Maximum allowed difference
     """
     cmd = [
-        "cargo", "run", "--release", "--bin", "ny", "--",
+        "targo", "--unverified", "run", "--release", "--bin", "ny", "--",
         "diff",
         model_a,
         model_b,

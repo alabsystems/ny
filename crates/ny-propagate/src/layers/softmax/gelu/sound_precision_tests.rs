@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! #3158: f64 precision proptests for GELU sound chord and tangent.
+//! f64 precision proptests for GELU sound chord and tangent.
 //!
 //! Every S-shaped activation with f64 chord/tangent computation has dedicated
 //! precision proptests that verify:
@@ -33,7 +33,7 @@ fn ulp_distance(a: f32, b: f32) -> u64 {
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(1000) })]
 
-    /// #3158: Verify GELU sound chord slope has f64 precision for narrow intervals.
+    /// Verify GELU sound chord slope has f64 precision for narrow intervals.
     /// For intervals with width in [1e-7, 1e-4], the sound relaxation computes a
     /// chord slope in f64. When used as a bound, it must match an independent f64
     /// reference within 1 ULP, and directed rounding must bracket the reference
@@ -116,7 +116,7 @@ proptest! {
         }
     }
 
-    /// #3158: Verify GELU sound tangent has f64 precision for both Erf and Tanh.
+    /// Verify GELU sound tangent has f64 precision for both Erf and Tanh.
     /// The tangent line at point d is: y = GELU'(d)·x + (GELU(d) - GELU'(d)·d).
     /// For large |d|, the intercept computation suffers catastrophic cancellation
     /// in f32. Directed rounding must bracket the f64 reference.

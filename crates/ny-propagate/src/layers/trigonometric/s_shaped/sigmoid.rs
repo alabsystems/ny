@@ -43,10 +43,10 @@ impl SigmoidLayer {
 
 /// Compute sigmoid bound interval for [l, u].
 /// Since sigmoid is monotonically increasing: sigmoid(l) <= sigmoid(x) <= sigmoid(u).
-/// Directed rounding: compute in f64, apply next_down/next_up. (#3245)
+/// Directed rounding: compute in f64, apply next_down/next_up.
 fn sigmoid_bound_interval(l: f32, u: f32) -> (f32, f32) {
     // Range clamp: 0 < sigmoid(x) < 1 for all finite x. Directed rounding can
-    // push past 0 or 1 for extreme inputs (e.g., sigmoid(-1000) → 0 → -1e-45). (#3316)
+    // push past 0 or 1 for extreme inputs (e.g., sigmoid(-1000) → 0 → -1e-45).
     (
         next_down_f32(sigmoid_f64(l as f64) as f32).max(0.0),
         next_up_f32(sigmoid_f64(u as f64) as f32).min(1.0),
@@ -183,7 +183,6 @@ impl SigmoidLayer {
     }
 
     /// Patches CROWN backward propagation with pre-activation bounds.
-    /// Part of #2613 Phase 2: generic activation Patches support.
     pub(crate) fn propagate_patches_with_bounds(
         &self,
         bounds: &crate::bounds::patches::PatchesLinearBounds,

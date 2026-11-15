@@ -4,7 +4,7 @@
 
 //! CROWN delegation entry points for GraphNetwork.
 //!
-//! Moved from `core/graph/crown.rs` to break bidirectional dependency (#2380).
+//! Moved from `core/graph/crown.rs` to break bidirectional dependency.
 //! Only the delegation methods (that import from sibling `graph_crown`) are here.
 //! Non-delegating methods (`propagate_crown_per_position`) remain in
 //! `core/graph/crown.rs` since they have no sibling imports.
@@ -68,7 +68,7 @@ impl GraphNetwork {
 
     /// Propagate bounds through the graph using the legacy fixed-slope CROWN path.
     ///
-    /// This preserves the pre-#3619 behavior for regression tests, profiling,
+    /// This preserves the earlier fixed-slope behavior for regression tests, profiling,
     /// and callers that explicitly need the original single-pass baseline.
     pub fn propagate_crown_fixed_slope(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
         self.propagate_crown_fixed_slope_with_engine(input, None)
@@ -104,7 +104,7 @@ impl GraphNetwork {
         )
     }
 
-    /// CROWN backward propagation with deadline enforcement (#3398).
+    /// CROWN backward propagation with deadline enforcement.
     ///
     /// When `deadline` is `Some`, checks at each node in the backward loop.
     /// If exceeded, falls back to IBP (always sound). This prevents graph CROWN
@@ -187,7 +187,7 @@ impl GraphNetwork {
         )
     }
 
-    /// CROWN backward propagation with both relaxation mode and deadline (#3398).
+    /// CROWN backward propagation with both relaxation mode and deadline.
     ///
     /// Combines caller-controlled relaxation with deadline enforcement while
     /// preserving fallback provenance.
@@ -223,7 +223,7 @@ impl GraphNetwork {
         self.propagate_crown_with_provenance_and_engine(input, None)
     }
 
-    /// CROWN backward propagation with provenance and optional GPU GEMM engine (#3597).
+    /// CROWN backward propagation with provenance and optional GPU GEMM engine.
     ///
     /// Like [`propagate_crown_with_provenance`] but threads the engine through
     /// to per-layer CROWN backward passes for GPU acceleration.
@@ -282,7 +282,7 @@ impl GraphNetwork {
     /// them via CROWN-IBP. This produces much tighter output bounds when the
     /// pre-computed bounds come from an optimized method.
     ///
-    /// #1817/#1848: GPU BaB computes alpha-CROWN intermediate bounds in Step 1.
+    /// GPU BaB computes alpha-CROWN intermediate bounds in Step 1.
     /// Passing them here avoids re-computing with the inferior CROWN-IBP method.
     #[instrument(skip(self, input, spec_matrix, engine, node_bounds), fields(num_nodes = self.nodes.len(), num_specs = spec_matrix.nrows()))]
     pub fn propagate_crown_with_specs_and_engine_with_node_bounds(
@@ -299,7 +299,6 @@ impl GraphNetwork {
 
     /// Spec-guided CROWN with pre-computed node bounds and deadline enforcement.
     /// Falls back to IBP if deadline is exceeded during backward propagation.
-    /// #3218/#3328
     #[instrument(skip(self, input, spec_matrix, engine, node_bounds), fields(num_nodes = self.nodes.len(), num_specs = spec_matrix.nrows()))]
     pub fn propagate_crown_with_specs_and_engine_with_node_bounds_and_deadline(
         &self,
@@ -319,7 +318,7 @@ impl GraphNetwork {
     ///
     /// Returns `CrownBackwardResult` carrying `BoundsProvenance` that records
     /// whether the result came from CROWN backward or an IBP fallback (and why).
-    /// Used by `training_signal` Packet C (#3520) to surface fallback metadata
+    /// Used by `training_signal` Packet C to surface fallback metadata
     /// in weak-region mining reports.
     #[instrument(skip(self, input, spec_matrix, engine, node_bounds), fields(num_nodes = self.nodes.len(), num_specs = spec_matrix.nrows()))]
     pub fn propagate_crown_with_specs_and_provenance_and_engine_with_node_bounds_and_deadline(
@@ -351,7 +350,7 @@ impl GraphNetwork {
     ///
     /// Combines `_with_node_bounds` (tighter ReLU relaxation via pre-computed
     /// intermediates) with `_with_linear` (linear coefficient extraction).
-    /// Used by input splitting with alpha-CROWN initial bounds (#3357).
+    /// Used by input splitting with alpha-CROWN initial bounds.
     #[instrument(skip(self, input, spec_matrix, engine, node_bounds), fields(num_nodes = self.nodes.len(), num_specs = spec_matrix.nrows()))]
     pub fn propagate_crown_with_specs_and_node_bounds_and_linear(
         &self,
@@ -369,9 +368,9 @@ impl GraphNetwork {
     /// an optional deadline. When the deadline expires, the backward pass
     /// terminates early and falls back to IBP provenance for remaining nodes.
     ///
-    /// Part of #3499: direct-boundary LinearBounds certificates need a deadline
-    /// on the identity-spec CROWN backward pass to prevent timeout on large
-    /// prefix graphs.
+    /// Direct-boundary LinearBounds certificates need a deadline on the
+    /// identity-spec CROWN backward pass to prevent timeout on large prefix
+    /// graphs.
     #[instrument(skip(self, input, spec_matrix, engine, node_bounds, deadline), fields(num_nodes = self.nodes.len(), num_specs = spec_matrix.nrows()))]
     pub fn propagate_crown_with_specs_and_node_bounds_and_linear_and_deadline(
         &self,
@@ -410,7 +409,7 @@ impl GraphNetwork {
     /// alpha optimization. Combines tighter ReLU relaxation (from alpha-CROWN
     /// warm-start intermediates) with per-element McCormick facet selection.
     ///
-    /// Part of #3453: Per-domain alpha-CROWN in graph input-split BaB.
+    /// Used for per-domain alpha-CROWN in graph input-split BaB.
     #[instrument(skip(self, input, spec_matrix, engine, node_bounds, mul_binary_alphas), fields(num_nodes = self.nodes.len(), num_specs = spec_matrix.nrows()))]
     pub fn propagate_crown_with_specs_and_node_bounds_and_mul_binary_alphas(
         &self,
@@ -429,9 +428,9 @@ impl GraphNetwork {
     /// Spec-guided CROWN with pre-computed ReLU node bounds, optimized
     /// MulBinary alphas, and deadline enforcement.
     ///
-    /// Part of #3814: graph input-split must share one absolute verifier
-    /// deadline across the root MulBinary prepass and all spec-guided CROWN
-    /// calls, instead of hardcoding `deadline: None` for the MulBinary path.
+    /// Graph input-split must share one absolute verifier deadline across the
+    /// root MulBinary prepass and all spec-guided CROWN calls, instead of
+    /// hardcoding `deadline: None` for the MulBinary path.
     #[instrument(skip(self, input, spec_matrix, engine, node_bounds, mul_binary_alphas, deadline), fields(num_nodes = self.nodes.len(), num_specs = spec_matrix.nrows()))]
     pub fn propagate_crown_with_specs_and_node_bounds_and_mul_binary_alphas_and_deadline(
         &self,
@@ -453,7 +452,7 @@ impl GraphNetwork {
     ///
     /// Used by input-split BaB to thread root-optimized MulBinary alphas into
     /// per-domain CROWN backward passes. Returns both output bounds and linear
-    /// coefficients. Part of #3439 Phase 4.
+    /// coefficients.
     #[instrument(skip(self, input, spec_matrix, engine, mul_binary_alphas), fields(num_nodes = self.nodes.len(), num_specs = spec_matrix.nrows()))]
     pub fn propagate_crown_with_specs_and_mul_binary_alphas(
         &self,
@@ -470,8 +469,8 @@ impl GraphNetwork {
     /// Spec-guided CROWN with optimized MulBinary alphas and deadline
     /// enforcement.
     ///
-    /// Part of #3814: graph input-split root and per-domain MulBinary CROWN
-    /// calls must respect the verifier's absolute timeout budget.
+    /// Graph input-split root and per-domain MulBinary CROWN calls must respect
+    /// the verifier's absolute timeout budget.
     #[instrument(skip(self, input, spec_matrix, engine, mul_binary_alphas, deadline), fields(num_nodes = self.nodes.len(), num_specs = spec_matrix.nrows()))]
     pub fn propagate_crown_with_specs_and_mul_binary_alphas_and_deadline(
         &self,

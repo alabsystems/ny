@@ -135,7 +135,7 @@ def test_sync_vnncomp_reference_results_generates_manifest_and_replaces_stale_cs
     assert manifest["reference_files"]["malbeware"]["output_path"] == str(
         Path("reports/benchmarks/reference/malbeware_alpha_beta_crown.csv"),
     ), manifest
-    # Benchmark-asset provenance fields (#4416)
+    # Benchmark-asset provenance fields
     assert "benchmark_repo_root" in manifest, f"missing benchmark_repo_root: {manifest}"
     assert "benchmark_commit" in manifest, f"missing benchmark_commit: {manifest}"
     assert "benchmark_dirty" in manifest, f"missing benchmark_dirty: {manifest}"

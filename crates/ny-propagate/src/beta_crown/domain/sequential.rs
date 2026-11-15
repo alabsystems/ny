@@ -74,7 +74,7 @@ impl IntermediateLinearBounds {
 /// A domain in the branch-and-bound search tree.
 ///
 /// Fields are `pub(crate)` to enforce construction through validated methods
-/// that reject NaN bounds (#3125, #2982). Use accessor methods for reads
+/// that reject NaN bounds. Use accessor methods for reads
 /// and `update_bounds()` for bound/priority updates.
 #[derive(Debug, Clone)]
 pub struct BabDomain {
@@ -95,7 +95,7 @@ pub struct BabDomain {
     /// Default: `lower_bound` (preserves legacy behavior for tests that don't
     /// set priority explicitly).
     ///
-    /// Matches the `GraphBabDomain::priority` pattern (#2682).
+    /// Matches the `GraphBabDomain::priority` pattern.
     pub(crate) priority: f32,
     /// Pre-activation bounds for each layer (tightened by constraints).
     /// Uses Arc for cheap cloning during branch-and-bound splits - only modified
@@ -124,7 +124,7 @@ impl BabDomain {
     /// Create root domain with no constraints.
     ///
     /// Returns `Err(NumericalInstability)` if either bound is NaN, preventing
-    /// zombie domains from entering the BaB queue (#2982).
+    /// zombie domains from entering the BaB queue.
     pub fn root(
         layer_bounds: Vec<BoundedTensor>,
         lower_bound: f32,
@@ -150,7 +150,7 @@ impl BabDomain {
 
     /// Create root domain with input bounds (for input splitting).
     ///
-    /// Returns `Err(NumericalInstability)` if either bound is non-finite (#2982, #3125).
+    /// Returns `Err(NumericalInstability)` if either bound is non-finite.
     pub fn root_with_input(
         layer_bounds: Vec<BoundedTensor>,
         lower_bound: f32,
@@ -177,7 +177,7 @@ impl BabDomain {
 
     /// Create root domain with initialized α state for joint optimization.
     ///
-    /// Returns `Err(NumericalInstability)` if either bound is non-finite (#2982, #3125).
+    /// Returns `Err(NumericalInstability)` if either bound is non-finite.
     pub fn root_with_alpha(
         network: &Network,
         layer_bounds: Vec<BoundedTensor>,
@@ -209,10 +209,10 @@ impl BabDomain {
     ///
     /// This is the validated constructor for all child domain creation within
     /// the BaB engine. Returns `Err(NumericalInstability)` if bounds or priority
-    /// contain NaN, preventing zombie domains (#3125, #2982).
+    /// contain NaN, preventing zombie domains.
     ///
     /// Priority defaults to `lower_bound` (backward compat). The BaB loop
-    /// overwrites priority via `set_priority()` before queue insertion (#2682).
+    /// overwrites priority via `set_priority()` before queue insertion.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn child(
         history: SplitHistory,
@@ -253,7 +253,7 @@ impl BabDomain {
         self.input_bounds.as_ref().map(|arc| arc.as_ref())
     }
 
-    // --- Accessor methods (#3125) ---
+    // --- Accessor methods ---
 
     /// Lower bound on the output.
     pub fn lower_bound(&self) -> f32 {
@@ -313,7 +313,7 @@ impl BabDomain {
 
 // For BinaryHeap: max-heap on priority field.
 // Priority is set by the BaB loop via `BetaCrownConfig::violation_priority()`
-// to respect the `verify_upper_bound` flag (#2682).
+// to respect the `verify_upper_bound` flag.
 impl PartialEq for BabDomain {
     fn eq(&self, other: &Self) -> bool {
         super::cmp_domain_priority(self.priority, other.priority) == std::cmp::Ordering::Equal
@@ -332,7 +332,7 @@ impl Ord for BabDomain {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Max-heap: higher priority = pop first.
         // Priority is computed by BetaCrownConfig::violation_priority() which
-        // respects verify_upper_bound (#2682).
+        // respects verify_upper_bound.
         super::cmp_domain_priority(self.priority, other.priority)
     }
 }
@@ -351,7 +351,7 @@ mod tests {
         )
         .expect("valid test tensor");
 
-        // NaN lower_bound is rejected at construction (#2982)
+        // NaN lower_bound is rejected at construction
         let result = BabDomain::root(vec![bounds.clone()], f32::NAN, 1.0);
         assert!(result.is_err(), "NaN lower_bound should be rejected");
 
@@ -397,7 +397,7 @@ mod tests {
     fn test_bab_domain_priority_overrides_lower_bound_ordering() {
         // When priority is set explicitly, it controls ordering regardless
         // of lower_bound values. This is critical for verify_upper_bound=true
-        // mode where priority is computed from upper_bound (#2682).
+        // mode where priority is computed from upper_bound.
         let bounds = BoundedTensor::new(
             ndarray::arr1(&[0.0_f32]).into_dyn(),
             ndarray::arr1(&[1.0_f32]).into_dyn(),

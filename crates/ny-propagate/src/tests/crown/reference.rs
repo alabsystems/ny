@@ -16,7 +16,7 @@ use ndarray::{arr1, arr2};
 // Performance timing comparisons live in:
 // crates/ny-propagate/examples/benchmark_autolirpa_performance.rs
 //
-// Run with: cargo test -p ny-propagate benchmark_auto_lirpa -- --nocapture
+// Run with: targo --unverified test -p ny-propagate benchmark_auto_lirpa -- --nocapture
 
 #[ntest::timeout(10000)]
 #[test]
@@ -403,7 +403,7 @@ fn test_crown_vs_autolirpa_tiny() {
     // Expected results (from Auto-LiRPA):
     // IBP: lower=[0, 0], upper=[1.5, 1]
     // Raw CROWN: lower=[-0.5, 0], upper=[1.5, 1]
-    // After IBP intersection (#2990): lower=[max(-0.5, 0), max(0, 0)] = [0, 0]
+    // After IBP intersection: lower=[max(-0.5, 0), max(0, 0)] = [0, 0]
     // The intersection tightens CROWN lower[0] from -0.5 to 0.0 because IBP is tighter.
 
     let ibp_output = network.propagate_ibp(&input).unwrap();
@@ -442,7 +442,7 @@ fn test_crown_vs_autolirpa_tiny() {
         ibp_output.upper()[[1]]
     );
 
-    // Check CROWN after IBP intersection (#2990).
+    // Check CROWN after IBP intersection.
     // Raw CROWN lower[0] = -0.5, but IBP lower[0] = 0.0, so intersection gives 0.0.
     assert!(
         (crown_output.lower()[[0]] - 0.0).abs() < 1e-5,

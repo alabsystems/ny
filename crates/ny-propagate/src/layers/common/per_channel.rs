@@ -7,8 +7,6 @@
 //! Used by activation layers with per-channel parameters (Snake, PReLU)
 //! to map a flat neuron index to the correct channel without duplicating
 //! the stride validation or division math.
-//!
-//! Part of #4169.
 
 use ny_core::{NyError, Result};
 

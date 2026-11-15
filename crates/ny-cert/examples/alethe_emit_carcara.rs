@@ -8,7 +8,7 @@
 //! `carcara check proof.alethe problem.smt2`.
 //!
 //! Run explicitly with:
-//! `cargo run -p ny-cert --example alethe_emit_carcara --release`.
+//! `targo --unverified run -p ny-cert --example alethe_emit_carcara --release`.
 //! Invoking the example without a reachable checker (`$NY_CARCARA` or
 //! `carcara` on `PATH`) is a hard failure, never a skip.
 

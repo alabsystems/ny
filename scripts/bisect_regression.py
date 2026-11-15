@@ -22,7 +22,7 @@ attestation, so that is the part this module treats as load-bearing.
 The build attestation
 ---------------------
 Each candidate SHA gets a deterministic *build token* derived from the SHA.  The
-final link is performed through ``cargo rustc -- -C link-arg=-Wl,--build-id=0x<token>``,
+final link is performed through ``targo --unverified rustc -- -C link-arg=-Wl,--build-id=0x<token>``,
 which stamps the token into the produced ELF's ``NT_GNU_BUILD_ID`` note.  The
 token therefore travels *inside the artifact*, not alongside it.  A binary is
 accepted for a probe only when all of the following hold:
@@ -631,7 +631,7 @@ class Builder:
             out_bin.unlink()
 
         cmd = [
-            "cargo",
+            "targo", "--unverified",
             "rustc",
             "--release",
             "--features",
@@ -643,7 +643,7 @@ class Builder:
         ]
         if self.config.jobs:
             cmd += ["-j", str(self.config.jobs)]
-        # `cargo rustc` applies trailing flags to the top crate only, so the
+        # `targo --unverified rustc` applies trailing flags to the top crate only, so the
         # token does not perturb the dependency fingerprints and the shared
         # target dir keeps its value -- while still forcing a relink per SHA.
         cmd += ["--", "-C", f"link-arg=-Wl,--build-id=0x{token}"]
@@ -660,9 +660,9 @@ class Builder:
         failure: str | None = None
         # Gate 2: the process EXITED, and with status 0.
         if proc.returncode != 0:
-            failure = f"cargo exited {proc.returncode}"
+            failure = f"targo exited {proc.returncode}"
         elif not out_bin.exists():
-            failure = "cargo reported success but produced no binary"
+            failure = "targo reported success but produced no binary"
         else:
             mtime = out_bin.stat().st_mtime
             # Gate 3: mtime advanced past the stamp.

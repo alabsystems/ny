@@ -74,6 +74,11 @@ const HARD_MAX_CENTERED_TERMINAL_BATCH_LEAVES: usize = 64;
 const DEFAULT_CENTERED_TERMINAL: bool = false;
 const DEFAULT_PARTIAL_COVER_BUDGET_MS: usize = 30_000;
 const HARD_MAX_PARTIAL_COVER_BUDGET_MS: usize = 120_000;
+/// The admissible interval of the #nn4sys-1d-cover slice fraction. Mirrors the
+/// declaration's `F64ClosedTrimmed { min: 0.02, max: 0.5 }`; pinned by
+/// `cover_slice_interval_matches_the_declaration`.
+const MIN_COVER_SLICE: f64 = 0.02;
+const MAX_COVER_SLICE: f64 = 0.5;
 /// Boundary-enclosure storage, measured as simultaneously resident f64
 /// scalars.  This is not a total byte/RSS limit: collection metadata, graph
 /// activations, and the graph-owned prepared Linear-weight cache are excluded.
@@ -120,7 +125,16 @@ impl Default for ScalarCoverLimits {
 impl ScalarCoverLimits {
     fn from_env() -> Self {
         let defaults = Self::default();
-        let depth = bounded_env_u8("NY_NN4SYS_1D_COVER_DEPTH", defaults.depth, HARD_MAX_DEPTH);
+        // #nn4sys-1d-cover DEPTH, delivered by `bab.nn4sys_1d_cover_depth`.
+        // The declaration default is the same 8 as `DEFAULT_DEPTH` (pinned by
+        // `cover_depth_declaration_default_matches_the_reader_default`), and
+        // the historical `<= HARD_MAX_DEPTH` clamp is retained HERE rather
+        // than moved into the parser, so an out-of-range value falls back to
+        // the shipped default instead of widening the pass.
+        let depth = crate::preset_gates::nn4sys_1d_cover_depth_override()
+            .and_then(|value| u8::try_from(value).ok())
+            .filter(|&value| value <= HARD_MAX_DEPTH)
+            .unwrap_or(defaults.depth);
         Self {
             depth,
             max_leaves: bounded_env_usize(
@@ -189,8 +203,18 @@ fn bounded_env_u8(name: &str, default: u8, hard_max: u8) -> u8 {
         .unwrap_or(default)
 }
 
+/// #nn4sys-1d-cover DELIVERY SEAM. The typed preset key
+/// `bab.nn4sys_1d_cover` is the route that can reach a scored run:
+/// `vnncomp_scripts/run_instance.sh` exports no `NY_*`, so the historical raw
+/// read could never fire in competition however well it measured by hand.
+///
+/// An admissible `NY_NN4SYS_1D_COMPLETE_COVER` still wins in BOTH directions,
+/// so every banked A/B recipe keeps working; absent, the typed preset key
+/// decides; absent that, the declaration default (dark) does. An unwritten
+/// cell resolves exactly as the pre-promotion `ny_levers::read(&DECL)` did,
+/// so a build that ships no preset key is byte-identical.
 fn enabled() -> bool {
-    std::env::var("NY_NN4SYS_1D_COMPLETE_COVER").ok().as_deref() == Some("1")
+    crate::preset_gates::nn4sys_1d_cover_armed()
 }
 
 fn partial_cover_enabled() -> bool {
@@ -1781,6 +1805,64 @@ fn run_complete_scalar_cover_recording(
     ScalarCoverOutcome::Verified(stats, eligible)
 }
 
+/// #nn4sys-1d-cover SLICE, delivered by `bab.nn4sys_1d_cover_slice`.
+///
+/// `None` means no slice was delivered and the legacy millisecond budget
+/// stays in charge, so an unarmed build is byte-identical. A present value
+/// has already been range-checked by the declaration's
+/// `F64ClosedTrimmed { 0.02, 0.5 }` parser; the clamp here is belt-and-braces
+/// against a future widening of that interval reaching this arithmetic
+/// unnoticed.
+fn cover_slice_fraction() -> Option<f64> {
+    crate::preset_gates::nn4sys_1d_cover_slice_override()
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(MIN_COVER_SLICE, MAX_COVER_SLICE))
+}
+
+/// A FRACTION of the time REMAINING at entry, never more than the caller's
+/// own deadline.
+///
+/// The legacy wall-clock constant is not scale-free across this benchmark's
+/// 20 s-800 s budgets: 30 s of a 20 s row is no fence at all. The failure
+/// mode this must prevent is the prepass consuming the whole 0.95 screen
+/// slice and then returning `None`, which is the same blast radius as this
+/// benchmark's own banked `sat_escape_branch` A/B.
+fn sliced_cover_deadline(fraction: f64, caller: Instant) -> Instant {
+    let remaining_ms = caller.saturating_duration_since(Instant::now()).as_millis();
+    // Never zero: a zero-length slice makes the cover report
+    // `outcome=deadline` before its first leaf, which reads exactly like a
+    // priced-out mechanism and is not one.
+    let budget_ms = (remaining_ms as f64 * fraction)
+        .floor()
+        .clamp(1.0, HARD_MAX_PARTIAL_COVER_BUDGET_MS as f64) as u64;
+    Instant::now()
+        .checked_add(Duration::from_millis(budget_ms))
+        .map_or(caller, |local| local.min(caller))
+}
+
+/// #nn4sys-instrument — the cover's arming and effective depth, readable
+/// WITHOUT entering the lane.
+///
+/// The box-refinement screen's summary line carries these so that an absent
+/// `NY_NN4SYS_1D_COMPLETE_COVER_V1` line means "the cover declined or never
+/// published", never "the cover is off" and never "the screen never ran".
+/// Reporting the DEPTH alongside the arming is not decoration: the master
+/// alone delivers `DEFAULT_DEPTH` against an all-or-nothing pass, which is
+/// exactly the legal-value-that-makes-the-mechanism-a-no-op shape
+/// (`alpha_iteration: 1`, `cols=8 -> cols=1`) the preset-arrival ratchet
+/// exists to catch.
+///
+/// `cover_src` is the resolved SOURCE of the master, not its value: env and
+/// preset converge on the same cell, so only the source distinguishes a gate
+/// armed through the yaml route from one armed by hand.
+pub(super) fn cover_screen_telemetry() -> (bool, &'static str, u8) {
+    (
+        enabled(),
+        crate::preset_gates::nn4sys_1d_cover_source(),
+        ScalarCoverLimits::from_env().depth,
+    )
+}
+
 /// Opt-in production seam. By default, only an exact complete cover of the
 /// entire admitted 1D subset publishes. A second, explicitly budgeted partial
 /// opt-in may publish individual clauses only after their entire group cover
@@ -1794,17 +1876,47 @@ pub(super) fn try_nn4sys_scalar_complete_cover(
     deadline: Option<Instant>,
 ) -> Option<Vec<bool>> {
     if !enabled() {
+        // Emit BEFORE the early return. Until this line existed, "the lane is
+        // disarmed" and "the lane was never entered" produced byte-identical
+        // evidence — no output at all — which is the absence-as-evidence trap
+        // that makes a null uninterpretable.
+        eprintln!(
+            "{TELEMETRY_MARKER} outcome=disarmed clauses={}",
+            clauses.len()
+        );
         return None;
     }
     let BetaCrownModel::Graph(graph) = model_net else {
+        eprintln!(
+            "{TELEMETRY_MARKER} outcome=declined reason=\"model is not a Graph\" clauses={}",
+            clauses.len()
+        );
         return None;
     };
     let started = Instant::now();
-    let partial = partial_cover_enabled();
-    let lane_deadline = if partial {
-        partial_cover_deadline(deadline)
-    } else {
-        deadline
+    // #nn4sys-1d-cover: a DELIVERED slice selects the bounded partial mode
+    // whenever the caller carries a deadline. With no deadline there is
+    // nothing to take a fraction of and the legacy path stands unchanged.
+    //
+    // The slice declaration ships a DEFAULT (0.25), so this is in force from
+    // the moment the master is armed — deliberately, because the failure this
+    // fences is the prepass consuming the whole screen slice and returning
+    // `None`. It therefore changes the historical env-only
+    // `NY_NN4SYS_1D_COMPLETE_COVER=1` recipe, which ran unbounded against the
+    // caller's entire deadline. Nothing shipped depended on that (the master
+    // was dark AND env-only, so it could not fire in competition at all), but
+    // a null on the new arm is not a regression against the old one.
+    //
+    // Unarmed, none of this is reached: the `!enabled()` early return above
+    // fires first, so a build that sets no key is byte-identical.
+    let sliced = cover_slice_fraction()
+        .zip(deadline)
+        .map(|(fraction, caller)| sliced_cover_deadline(fraction, caller));
+    let partial = partial_cover_enabled() || sliced.is_some();
+    let lane_deadline = match (sliced, partial) {
+        (Some(local), _) => Some(local),
+        (None, true) => partial_cover_deadline(deadline),
+        (None, false) => deadline,
     };
     let mut completed_clauses = vec![false; clauses.len()];
     let outcome = run_complete_scalar_cover_recording(
@@ -2736,6 +2848,76 @@ mod tests {
             result, None,
             "one open clause must suppress all publication"
         );
+    }
+
+    /// The declaration's default and the reader's own `DEFAULT_DEPTH` are two
+    /// copies of the number 8 in two crates. If they drift, an armed preset
+    /// that omits the depth key silently delivers a different pass than the
+    /// one every measurement was taken on — and because the cover is
+    /// all-or-nothing, "different" can mean "publishes nothing".
+    #[test]
+    fn cover_depth_declaration_default_matches_the_reader_default() {
+        assert_eq!(
+            ny_levers::read(&ny_levers::decls::nn4sys_1d_cover::NN4SYS_1D_COVER_DEPTH)
+                .value
+                .as_u64(),
+            Some(u64::from(DEFAULT_DEPTH)),
+        );
+        const {
+            assert!(
+                DEFAULT_DEPTH <= HARD_MAX_DEPTH,
+                "the shipped default must survive the reader's own clamp"
+            );
+        };
+    }
+
+    /// Same drift risk for the slice: the declaration owns the admissible
+    /// interval and this module re-clamps to it.
+    #[test]
+    fn cover_slice_interval_matches_the_declaration() {
+        let decl = &ny_levers::decls::nn4sys_1d_cover::NN4SYS_1D_COVER_SLICE;
+        assert!(
+            matches!(
+                decl.kind,
+                ny_levers::LeverKind::F64ClosedTrimmed { min, max }
+                    if (min - MIN_COVER_SLICE).abs() < f64::EPSILON
+                        && (max - MAX_COVER_SLICE).abs() < f64::EPSILON
+            ),
+            "the reader's clamp must be the declaration's own interval"
+        );
+        assert_eq!(
+            ny_levers::read(decl).value.as_f64(),
+            Some(0.25),
+            "the shipped default slice"
+        );
+    }
+
+    /// The cover's arming is DELIVERED, not merely readable: the master must
+    /// resolve through the typed preset key that a scored run can reach, and
+    /// must still honour an explicit environment value in both directions.
+    #[test]
+    fn cover_master_is_delivered_by_a_typed_preset_key() {
+        let axis = ny_levers::space::axes()
+            .iter()
+            .find(|axis| axis.name == "NY_NN4SYS_1D_COMPLETE_COVER")
+            .expect("the cover master must be a search axis");
+        assert!(
+            matches!(
+                axis.deliver,
+                ny_levers::space::Deliver::PresetKey("bab.nn4sys_1d_cover")
+            ),
+            "an EnvOnly axis is worth zero on a scored run"
+        );
+        let armed = ny_test_utils::env::with_serialized_env_vars(
+            &[("NY_NN4SYS_1D_COMPLETE_COVER", "1")],
+            enabled,
+        );
+        assert!(armed, "an explicit env value must still win");
+        let dark = ny_test_utils::env::with_serialized_env_vars(
+            &[("NY_NN4SYS_1D_COMPLETE_COVER", "0")],
+            enabled,
+        );
+        assert!(!dark, "exact env 0 must still disarm");
     }
 
     #[test]

@@ -16,6 +16,7 @@ use crate::bounds::patches::{
 use crate::bounds::{LinearBounds, LinearBounds64};
 use ny_core::{
     dd::{next_down_f64, next_up_f64, two_sum},
+    f32_to_f64_exact, f64_to_f32_down, f64_to_f32_up, require_f64_interval_proof_environment,
     NyError, Result,
 };
 
@@ -37,6 +38,40 @@ struct IndexedStorage {
 /// accumulator + the f64 roundoff buffers. See
 /// [`CrownMergeAccumulator::guard_patches_dense_promotion`].
 const MERGE_PROMOTION_PEAK_MULTIPLE: usize = 4;
+
+/// `CpuMemoryExceeded` site of the hard-authority native Patches merge receipt
+/// (#patches-merge-expiry). Distinct from the Dense promotion site so a
+/// refusal names the check that actually refused.
+pub(crate) const NATIVE_PATCHES_MERGE_SITE: &str =
+    "CrownMergeAccumulator native patches merge (hard finite authority)";
+
+/// `[deadline-preserve] patches-merge-graph: saved=N discarded=M` — engagement
+/// observable of the hard-authority native merge (#patches-merge-expiry).
+/// `saved` counts residual joins that kept the native route under a live hard
+/// deadline; `discarded` counts joins refused because the deadline expired or
+/// the `NY_PATCHES_FINITE_EXPIRY` lever is disarmed. Observation only.
+static PATCHES_MERGE_GRAPH_PRESERVE: super::backward_helpers::DeadlinePreserveCounters =
+    super::backward_helpers::DeadlinePreserveCounters::new("patches-merge-graph");
+
+/// Test-only view of the `patches-merge-graph` engagement counters.
+#[cfg(test)]
+pub(crate) fn patches_merge_graph_preserve_snapshot() -> (u64, u64) {
+    PATCHES_MERGE_GRAPH_PRESERVE.snapshot()
+}
+
+/// Outcome of [`CrownMergeAccumulator::try_hard_authority_patches_merge`].
+enum HardAuthorityPatchesMerge {
+    /// The native merge published in place.
+    Merged,
+    /// No native merge is available (lever disarmed, deadline expired, no
+    /// pending Patches carrier, or a pair the operator declines): the legacy
+    /// Dense promotion runs exactly as before.
+    Declined,
+    /// The native merge was available but its transient footprint exceeds the
+    /// budget. The guarded Dense promotion is still tried; this refusal is
+    /// reported only if that guard refuses on memory too.
+    OverBudget(NyError),
+}
 
 /// Admission receipt for the temporary Dense zero-coefficient carrier used to
 /// accumulate a concretized bias at `NETWORK_INPUT`.
@@ -356,14 +391,16 @@ impl CrownMergeAccumulator {
         Ok(Some(CrownBounds::Dense(staged)))
     }
 
+    /// `publishes_error_planes` is whether the downcast will emit coefficient
+    /// error planes: a carried certificate OR an inexact coefficient cast.
     fn guard_sidecar_downcast_staging(
         bounds: &LinearBounds64,
         retained_base_bytes: usize,
+        publishes_error_planes: bool,
     ) -> Result<()> {
         let pair_bytes = Self::linear64_dense_pair_bytes(bounds);
         let matrix_bytes = pair_bytes / 2;
-        let output_error_bytes = if bounds.lower_a_err().is_some() || bounds.upper_a_err().is_some()
-        {
+        let output_error_bytes = if publishes_error_planes {
             matrix_bytes.saturating_mul(2)
         } else {
             0
@@ -657,7 +694,7 @@ impl CrownMergeAccumulator {
     /// - Dense + Dense: route to the checked Dense merge implementation
     /// - Mixed Dense/Patches: convert both to dense, route to f64
     ///
-    /// Part of #4382: patches-native residual merge for CNN DAGs.
+    /// Patches-native residual merge for CNN DAGs.
     #[cfg(test)]
     pub(crate) fn merge_crown(&mut self, key: &str, new_bounds: CrownBounds) -> Result<()> {
         self.merge_crown_with_deadline(key, new_bounds, None)
@@ -665,11 +702,14 @@ impl CrownMergeAccumulator {
 
     /// Deadline-aware merge publication.
     ///
-    /// A hard finite authority deliberately skips the legacy in-place Patches
-    /// merge: that operator is not cooperatively pollable. The exact Dense
-    /// promotion is pollable and keeps the pending carrier borrowed until both
-    /// the dense conversion and f64 sidecar are complete. Thus a deadline or
-    /// memory refusal cannot erase or partially rewrite pending state.
+    /// A `Some` deadline is HARD authority here. Hard authority keeps the
+    /// native in-place Patches merge only while `NY_PATCHES_FINITE_EXPIRY` is
+    /// armed (the shipped default), the deadline has not expired, and the
+    /// merge's own transient footprint fits the CROWN dense budget; otherwise
+    /// it takes the exact Dense promotion, which is pollable and keeps the
+    /// pending carrier borrowed until both the dense conversion and f64
+    /// sidecar are complete. Either way a deadline or memory refusal cannot
+    /// erase or partially rewrite pending state.
     #[cfg(test)]
     pub(crate) fn merge_crown_with_deadline(
         &mut self,
@@ -684,11 +724,13 @@ impl CrownMergeAccumulator {
     /// internal scheduling timestamp.
     ///
     /// Both deadline classes are checked before admission and remain available
-    /// to the cooperative Dense promotion path. Only a hard authority disables
-    /// the historical native Patches merge: an internal collector timestamp
+    /// to the cooperative Dense promotion path. An internal collector
+    /// timestamp (soft) always keeps the historical native Patches merge: it
     /// must not turn two compatible residual carriers into an otherwise
-    /// unnecessary dense allocation. That legacy in-place merge is an
-    /// indivisible scheduling unit, so after its single soft admission check it
+    /// unnecessary dense allocation. Hard authority keeps it too, decided by
+    /// EXPIRY rather than PRESENCE — see
+    /// [`Self::try_hard_authority_patches_merge`]. The in-place merge is an
+    /// indivisible scheduling unit, so after its single admission check it
     /// publishes the complete result without a post-work expiry error.
     pub(crate) fn merge_crown_with_deadline_authority(
         &mut self,
@@ -698,8 +740,9 @@ impl CrownMergeAccumulator {
         deadline_is_hard: bool,
     ) -> Result<()> {
         Self::check_deadline(deadline, "before merge")?;
-        if !deadline_is_hard {
-            if let CrownBounds::Patches(ref new_pb) = new_bounds {
+        let mut native_merge_refusal = None;
+        if let CrownBounds::Patches(ref new_pb) = new_bounds {
+            if !deadline_is_hard {
                 // This legacy native merge has no cooperative polling seam and
                 // mutates only when the complete owned replacement arrays are
                 // ready. Treat it as one admitted soft scheduling unit: a
@@ -708,13 +751,33 @@ impl CrownMergeAccumulator {
                 if self.try_patches_merge(key, new_pb)? {
                     return Ok(());
                 }
+            } else {
+                match self.try_hard_authority_patches_merge(key, new_pb, deadline)? {
+                    HardAuthorityPatchesMerge::Merged => return Ok(()),
+                    HardAuthorityPatchesMerge::Declined => {}
+                    HardAuthorityPatchesMerge::OverBudget(refusal) => {
+                        native_merge_refusal = Some(refusal);
+                    }
+                }
             }
         }
         // A promotion is required when EITHER carrier is Patches.  In
         // particular, a Patches contribution may arrive first and be followed
         // by Dense; guarding only `new_bounds` left that arrival order able to
-        // materialize the pending relation without a receipt (#4382).
-        self.guard_patches_dense_promotion(key, &new_bounds)?;
+        // materialize the pending relation without a receipt.
+        //
+        // A native merge refused on memory still falls through to this guarded
+        // promotion: for 7-D explicit-row carriers (or kernels wider than the
+        // input) the Dense pair can be the SMALLER allocation, and refusing
+        // outright would regress those joins below the legacy hard route. When
+        // both refuse, report the native merge's receipt — it names the route
+        // the join should have taken and the budget that refused it.
+        if let Err(promotion_refusal) = self.guard_patches_dense_promotion(key, &new_bounds) {
+            return Err(match native_merge_refusal {
+                Some(native) if promotion_refusal.is_cpu_memory_exceeded() => native,
+                _ => promotion_refusal,
+            });
+        }
         let new_lb = new_bounds
             .into_dense_with_deadline_for_purpose(deadline, PatchesMaterializationPurpose::Other)?;
         Self::check_deadline(deadline, "after incoming dense materialization")?;
@@ -749,7 +812,7 @@ impl CrownMergeAccumulator {
     /// and its certified-error pair (`to_dense` emits the error pair whenever
     /// the carrier has one, which a post-merge carrier always does), the same
     /// two for the pending carrier, the f64 accumulator
-    /// (`LinearBounds64::from_f32`), and the f64 per-element roundoff buffers
+    /// (`widen_linear64_exact`), and the f64 per-element roundoff buffers
     /// (`accumulate_coeff_array`). [`MERGE_PROMOTION_PEAK_MULTIPLE`] captures
     /// that. Charging one pair would under-count by roughly 4x and let exactly
     /// the allocation this guard exists to stop through.
@@ -837,13 +900,27 @@ impl CrownMergeAccumulator {
         .saturating_mul(size_of::<f64>())
     }
 
+    /// Every allocation keeps the entire nominal output priced. Allocator
+    /// overage is added separately: extra capacity in an early plane must not
+    /// subtract bytes from the later planes that still need to be allocated.
+    fn staging_elements_after_capacity(
+        nominal_elements: usize,
+        capacity_overage_elements: &mut usize,
+        requested_elements: usize,
+        actual_capacity_elements: usize,
+    ) -> usize {
+        *capacity_overage_elements = (*capacity_overage_elements)
+            .saturating_add(actual_capacity_elements.saturating_sub(requested_elements));
+        nominal_elements.saturating_add(*capacity_overage_elements)
+    }
+
     fn try_collect_f64_with_deadline(
         values: impl Iterator<Item = f64>,
         len: usize,
         deadline: &mut PatchesMaterializationDeadline,
         base_bytes: usize,
         total_output_elements: usize,
-        allocated_capacity_elements: &mut usize,
+        capacity_overage_elements: &mut usize,
         site: &'static str,
     ) -> Result<Vec<f64>> {
         deadline.checkpoint(site)?;
@@ -857,15 +934,14 @@ impl CrownMergeAccumulator {
                 budget_bytes,
                 site,
             })?;
-        *allocated_capacity_elements =
-            (*allocated_capacity_elements).saturating_add(output.capacity());
-        let remaining_elements = total_output_elements
-            .saturating_sub((*allocated_capacity_elements).min(total_output_elements));
-        let required_bytes = base_bytes.saturating_add(
-            (*allocated_capacity_elements)
-                .saturating_add(remaining_elements)
-                .saturating_mul(size_of::<f64>()),
+        let staged_elements = Self::staging_elements_after_capacity(
+            total_output_elements,
+            capacity_overage_elements,
+            len,
+            output.capacity(),
         );
+        let required_bytes =
+            base_bytes.saturating_add(staged_elements.saturating_mul(size_of::<f64>()));
         if required_bytes > budget_bytes {
             return Err(NyError::CpuMemoryExceeded {
                 required_bytes,
@@ -879,6 +955,20 @@ impl CrownMergeAccumulator {
         }
         deadline.checkpoint(site)?;
         Ok(output)
+    }
+
+    /// Decode the binary32 representation so a subnormal operand cannot be
+    /// erased by a hardware widening conversion. The unbounded route keeps its
+    /// existing allocation policy; the finite route uses the paid collector.
+    fn widen_linear64_exact(bounds: &LinearBounds) -> LinearBounds64 {
+        LinearBounds64 {
+            lower_a: bounds.lower_a().mapv(f32_to_f64_exact),
+            lower_b: bounds.lower_b().mapv(f32_to_f64_exact),
+            upper_a: bounds.upper_a().mapv(f32_to_f64_exact),
+            upper_b: bounds.upper_b().mapv(f32_to_f64_exact),
+            lower_a_err: bounds.lower_a_err().map(|e| e.mapv(f32_to_f64_exact)),
+            upper_a_err: bounds.upper_a_err().map(|e| e.mapv(f32_to_f64_exact)),
+        }
     }
 
     fn try_widen_linear64_with_deadline(
@@ -902,53 +992,65 @@ impl CrownMergeAccumulator {
         }
 
         let mut poll = PatchesMaterializationDeadline::new(deadline);
-        let mut allocated = 0usize;
+        let mut capacity_overage = 0usize;
         let lower_a = Self::try_collect_f64_with_deadline(
-            bounds.lower_a().iter().map(|&value| f64::from(value)),
+            bounds
+                .lower_a()
+                .iter()
+                .map(|&value| f32_to_f64_exact(value)),
             bounds.lower_a().len(),
             &mut poll,
             base_bytes,
             total_output_elements,
-            &mut allocated,
+            &mut capacity_overage,
             SITE,
         )?;
         let lower_b = Self::try_collect_f64_with_deadline(
-            bounds.lower_b().iter().map(|&value| f64::from(value)),
+            bounds
+                .lower_b()
+                .iter()
+                .map(|&value| f32_to_f64_exact(value)),
             bounds.lower_b().len(),
             &mut poll,
             base_bytes,
             total_output_elements,
-            &mut allocated,
+            &mut capacity_overage,
             SITE,
         )?;
         let upper_a = Self::try_collect_f64_with_deadline(
-            bounds.upper_a().iter().map(|&value| f64::from(value)),
+            bounds
+                .upper_a()
+                .iter()
+                .map(|&value| f32_to_f64_exact(value)),
             bounds.upper_a().len(),
             &mut poll,
             base_bytes,
             total_output_elements,
-            &mut allocated,
+            &mut capacity_overage,
             SITE,
         )?;
         let upper_b = Self::try_collect_f64_with_deadline(
-            bounds.upper_b().iter().map(|&value| f64::from(value)),
+            bounds
+                .upper_b()
+                .iter()
+                .map(|&value| f32_to_f64_exact(value)),
             bounds.upper_b().len(),
             &mut poll,
             base_bytes,
             total_output_elements,
-            &mut allocated,
+            &mut capacity_overage,
             SITE,
         )?;
         let lower_a_err = bounds
             .lower_a_err()
             .map(|source| {
                 Self::try_collect_f64_with_deadline(
-                    source.iter().map(|&value| f64::from(value)),
+                    source.iter().map(|&value| f32_to_f64_exact(value)),
                     source.len(),
                     &mut poll,
                     base_bytes,
                     total_output_elements,
-                    &mut allocated,
+                    &mut capacity_overage,
                     SITE,
                 )
             })
@@ -957,12 +1059,12 @@ impl CrownMergeAccumulator {
             .upper_a_err()
             .map(|source| {
                 Self::try_collect_f64_with_deadline(
-                    source.iter().map(|&value| f64::from(value)),
+                    source.iter().map(|&value| f32_to_f64_exact(value)),
                     source.len(),
                     &mut poll,
                     base_bytes,
                     total_output_elements,
-                    &mut allocated,
+                    &mut capacity_overage,
                     SITE,
                 )
             })
@@ -1005,14 +1107,14 @@ impl CrownMergeAccumulator {
             });
         }
         let mut poll = PatchesMaterializationDeadline::new(deadline);
-        let mut allocated = 0usize;
+        let mut capacity_overage = 0usize;
         let lower_a = Self::try_collect_f64_with_deadline(
             bounds.lower_a().iter().copied(),
             bounds.lower_a().len(),
             &mut poll,
             base_bytes,
             total_output_elements,
-            &mut allocated,
+            &mut capacity_overage,
             SITE,
         )?;
         let lower_b = Self::try_collect_f64_with_deadline(
@@ -1021,7 +1123,7 @@ impl CrownMergeAccumulator {
             &mut poll,
             base_bytes,
             total_output_elements,
-            &mut allocated,
+            &mut capacity_overage,
             SITE,
         )?;
         let upper_a = Self::try_collect_f64_with_deadline(
@@ -1030,7 +1132,7 @@ impl CrownMergeAccumulator {
             &mut poll,
             base_bytes,
             total_output_elements,
-            &mut allocated,
+            &mut capacity_overage,
             SITE,
         )?;
         let upper_b = Self::try_collect_f64_with_deadline(
@@ -1039,7 +1141,7 @@ impl CrownMergeAccumulator {
             &mut poll,
             base_bytes,
             total_output_elements,
-            &mut allocated,
+            &mut capacity_overage,
             SITE,
         )?;
         let lower_a_err = bounds
@@ -1051,7 +1153,7 @@ impl CrownMergeAccumulator {
                     &mut poll,
                     base_bytes,
                     total_output_elements,
-                    &mut allocated,
+                    &mut capacity_overage,
                     SITE,
                 )
             })
@@ -1065,7 +1167,7 @@ impl CrownMergeAccumulator {
                     &mut poll,
                     base_bytes,
                     total_output_elements,
-                    &mut allocated,
+                    &mut capacity_overage,
                     SITE,
                 )
             })
@@ -1103,7 +1205,7 @@ impl CrownMergeAccumulator {
                 if deadline.is_some() {
                     Self::try_widen_linear64_with_deadline(bounds, deadline, retained_base_bytes)?
                 } else {
-                    LinearBounds64::from_f32(bounds)
+                    Self::widen_linear64_exact(bounds)
                 }
             }
             CrownBounds::Patches(bounds) => {
@@ -1120,7 +1222,7 @@ impl CrownMergeAccumulator {
                         None,
                         PatchesMaterializationPurpose::Other,
                     )?;
-                    LinearBounds64::from_f32(&dense)
+                    Self::widen_linear64_exact(&dense)
                 }
             }
         };
@@ -1269,6 +1371,72 @@ impl CrownMergeAccumulator {
             }
         }
         Ok(false)
+    }
+
+    /// #patches-merge-expiry: the native in-place Patches merge under HARD
+    /// finite authority (audit item N6, `docs/DEADLINE_PRESENCE_AUDIT_2026-08-24.md`).
+    ///
+    /// `7b0140d09` skipped the native merge whenever the authority was hard,
+    /// i.e. on deadline PRESENCE. Every CROWN-IBP collection under a caller
+    /// deadline or collector cap is hard, so every residual join promoted both
+    /// carriers to Dense f64: on yolo_2023 that asks ~22.5 GB for `Conv_5`
+    /// against a ~12 GB budget, and `Conv_5`/`Add_8`/`Conv_12` fall back to
+    /// IBP where they had completed CROWN in seconds before the skip.
+    ///
+    /// The decision is the shared `NY_PATCHES_FINITE_EXPIRY` predicate of the
+    /// graph-lane set-mates (`finite_authority_refuses_native_patches`), with
+    /// its own `patches-merge-graph` counters: lever off => refuse on presence,
+    /// byte-identical to the historical guard; armed (shipped default) =>
+    /// refuse only on EXPIRY.
+    ///
+    /// The invariant the skip protected is kept, restated: the native merge
+    /// neither polls a deadline nor charges its allocations (padding copies
+    /// and outward-rounded sums allocate infallibly). So under hard authority
+    /// its whole transient footprint (`native_merge_peak_bytes`, <= 12x the
+    /// largest padded side) is charged against `cpu_crown_dense_budget_bytes()`
+    /// before entry, and one deadline check admits it as a single bounded unit
+    /// — the same accepted "overrun by one indivisible step" tradeoff as every
+    /// other armed set-mate. Nothing is mutated before the merge publishes.
+    fn try_hard_authority_patches_merge(
+        &mut self,
+        key: &str,
+        new_pb: &crate::bounds::patches::PatchesLinearBounds,
+        deadline: Option<Instant>,
+    ) -> Result<HardAuthorityPatchesMerge> {
+        // Carrier check FIRST, as at the residual fan-out: the counters then
+        // mean "a structured merge was at stake", not "this helper ran".
+        let Some(CrownBounds::Patches(existing)) = self.peek_pending(key) else {
+            return Ok(HardAuthorityPatchesMerge::Declined);
+        };
+        if super::backward_helpers::finite_authority_refuses_native_patches(
+            true,
+            deadline,
+            &PATCHES_MERGE_GRAPH_PRESERVE,
+        ) {
+            return Ok(HardAuthorityPatchesMerge::Declined);
+        }
+        // A carrier pair the native operator would decline (anchored, sparse,
+        // incomparable padding, mismatched metadata) — or one whose preflight
+        // cannot authenticate it — keeps the legacy hard route exactly.
+        let Ok(Some(required_bytes)) = existing.native_merge_peak_bytes(new_pb) else {
+            return Ok(HardAuthorityPatchesMerge::Declined);
+        };
+        let budget_bytes = crate::network::crown_memory::cpu_crown_dense_budget_bytes();
+        if required_bytes > budget_bytes {
+            return Ok(HardAuthorityPatchesMerge::OverBudget(
+                NyError::CpuMemoryExceeded {
+                    required_bytes,
+                    budget_bytes,
+                    site: NATIVE_PATCHES_MERGE_SITE,
+                },
+            ));
+        }
+        Self::check_deadline(deadline, "before hard-authority native Patches merge")?;
+        Ok(if self.try_patches_merge(key, new_pb)? {
+            HardAuthorityPatchesMerge::Merged
+        } else {
+            HardAuthorityPatchesMerge::Declined
+        })
     }
 
     /// Fallibly construct the zero-coefficient Dense carrier used to add a
@@ -1494,6 +1662,7 @@ impl CrownMergeAccumulator {
         deadline: Option<Instant>,
     ) -> Result<()> {
         Self::check_deadline(deadline, "before f64 accumulation")?;
+        Self::require_scalar_merge_environment()?;
         if let Some(ref mut idx_store) = self.indexed {
             if let Some(&i) = idx_store.name_to_idx.get(key) {
                 if let Some(ref mut existing) = idx_store.merged_dense[i] {
@@ -1632,21 +1801,34 @@ impl CrownMergeAccumulator {
         retained_base_bytes: usize,
     ) -> Result<LinearBounds> {
         const SITE: &str = "CrownMergeAccumulator f64->f32 downcast staging";
-        Self::guard_sidecar_downcast_staging(bounds, retained_base_bytes)?;
+        let carries_err = bounds.lower_a_err().is_some() || bounds.upper_a_err().is_some();
+        Self::guard_sidecar_downcast_staging(bounds, retained_base_bytes, carries_err)?;
         let mut deadline_state = PatchesMaterializationDeadline::new(deadline);
         deadline_state.checkpoint(SITE)?;
+        Self::require_scalar_merge_environment()?;
 
         // Read the carried certified coefficient error (f64) BEFORE consuming the
         // relation (#vnncomp-aw-soundness).  The borrowed form is also used by
         // transactional frontier staging, where the original sidecar must stay
         // available until every fallible materialization succeeds.
-        let has_err = bounds.lower_a_err().is_some() || bounds.upper_a_err().is_some();
         let lower_err_f64 = bounds.lower_a_err();
         let upper_err_f64 = bounds.upper_a_err();
         let lower_a = bounds.lower_a();
         let lower_b = bounds.lower_b();
         let upper_a = bounds.upper_a();
         let upper_b = bounds.upper_b();
+        // Coefficients multiply SIGNED inputs, so a stored coefficient that
+        // differs from its f64 source is not a lower/upper affine bound in
+        // either rounding direction (`min(c*l, c*u)` is concave in `c`). Every
+        // such gap is paid through the error plane; an exact fan-in sum (every
+        // coefficient representable, nothing carried) needs no plane.
+        let has_err = carries_err
+            || Self::any_coefficient_cast_inexact(lower_a, &mut deadline_state, SITE)?
+            || Self::any_coefficient_cast_inexact(upper_a, &mut deadline_state, SITE)?;
+        if has_err && !carries_err {
+            // Price the two planes the cast gaps now need before allocating.
+            Self::guard_sidecar_downcast_staging(bounds, retained_base_bytes, true)?;
+        }
         let (num_outputs, num_inputs) = (lower_a.nrows(), lower_a.ncols());
         let coefficient_elements =
             num_outputs
@@ -1659,7 +1841,7 @@ impl CrownMergeAccumulator {
         let output_elements = coefficient_elements
             .saturating_mul(if has_err { 4 } else { 2 })
             .saturating_add(num_outputs.saturating_mul(2));
-        let mut allocated_elements = 0usize;
+        let mut capacity_overage_elements = 0usize;
         let mut reserve = |len: usize| -> Result<Vec<f32>> {
             deadline_state.checkpoint(SITE)?;
             let mut values = Vec::new();
@@ -1672,16 +1854,15 @@ impl CrownMergeAccumulator {
                     budget_bytes: crate::network::crown_memory::cpu_crown_dense_budget_bytes(),
                     site: SITE,
                 })?;
-            allocated_elements = allocated_elements.saturating_add(values.capacity());
-            let remaining_elements =
-                output_elements.saturating_sub(allocated_elements.min(output_elements));
+            let staged_elements = Self::staging_elements_after_capacity(
+                output_elements,
+                &mut capacity_overage_elements,
+                len,
+                values.capacity(),
+            );
             let required_bytes = retained_base_bytes
                 .saturating_add(Self::linear64_memory_bytes(bounds))
-                .saturating_add(
-                    allocated_elements
-                        .saturating_add(remaining_elements)
-                        .saturating_mul(size_of::<f32>()),
-                );
+                .saturating_add(staged_elements.saturating_mul(size_of::<f32>()));
             let budget_bytes = crate::network::crown_memory::cpu_crown_dense_budget_bytes();
             if required_bytes > budget_bytes {
                 return Err(NyError::CpuMemoryExceeded {
@@ -1716,8 +1897,8 @@ impl CrownMergeAccumulator {
             let mut row_valid = lower_bias.is_some() && upper_bias.is_some();
             for col in 0..num_inputs {
                 deadline_state.work(1, SITE)?;
-                let lower_value = Self::downcast_lower_coeff(lower_a[[row, col]]);
-                let upper_value = Self::downcast_upper_coeff(upper_a[[row, col]]);
+                let lower_value = Self::downcast_coeff(lower_a[[row, col]]);
+                let upper_value = Self::downcast_coeff(upper_a[[row, col]]);
                 row_valid &= lower_value.is_some() && upper_value.is_some();
                 let stored_lower = lower_value.unwrap_or(0.0);
                 let stored_upper = upper_value.unwrap_or(0.0);
@@ -1725,14 +1906,14 @@ impl CrownMergeAccumulator {
                 out_upper_a.push(stored_upper);
                 if let Some(errors) = out_lower_err.as_mut() {
                     let carried = lower_err_f64.map(|e| e[[row, col]]).unwrap_or(0.0);
-                    let cast_gap = (f64::from(stored_lower) - lower_a[[row, col]]).abs();
+                    let cast_gap = Self::coefficient_cast_gap_up(stored_lower, lower_a[[row, col]]);
                     errors.push(Self::err_to_f32(Self::add_nonnegative_f64_up(
                         carried, cast_gap,
                     )));
                 }
                 if let Some(errors) = out_upper_err.as_mut() {
                     let carried = upper_err_f64.map(|e| e[[row, col]]).unwrap_or(0.0);
-                    let cast_gap = (f64::from(stored_upper) - upper_a[[row, col]]).abs();
+                    let cast_gap = Self::coefficient_cast_gap_up(stored_upper, upper_a[[row, col]]);
                     errors.push(Self::err_to_f32(Self::add_nonnegative_f64_up(
                         carried, cast_gap,
                     )));
@@ -1789,24 +1970,35 @@ impl CrownMergeAccumulator {
         Ok(dense)
     }
 
-    /// Round a non-negative f64 error magnitude UP to a sound f32 error
-    /// (over-approximation is always sound; under-approximation is not).
-    /// A non-finite or negative value becomes `f32::INFINITY` so the affected
-    /// row degrades to `[-inf, +inf]` at concretize.
+    /// The complete f64 difference is charged, including the subtraction's
+    /// residual. Under the checked binary64 environment, TwoSum is exact and
+    /// `|hi + lo| <= |hi| + |lo|`; the latter is accumulated upward.
+    #[inline]
+    fn coefficient_cast_gap_up(stored: f32, source: f64) -> f64 {
+        let (gap, residual) = two_sum(f32_to_f64_exact(stored), -source);
+        Self::add_nonnegative_f64_up(gap.abs(), residual.abs())
+    }
+
+    /// Publish a non-negative f64 error as an outward binary32 value. A
+    /// nonzero subnormal radius must not be flushed or consumed as zero in a
+    /// later f32 kernel, so its ceiling is at least MIN_POSITIVE. Exact zero
+    /// remains zero and does not turn an exact side into an artificial error.
     #[inline]
     fn err_to_f32(e: f64) -> f32 {
         if !e.is_finite() || e < 0.0 {
             return f32::INFINITY;
         }
-        let cast = e as f32;
-        // `as f32` rounds to nearest, which may round the magnitude DOWN; widen
-        // outward so the stored f32 error is never below the true f64 magnitude.
-        let up = next_up_f32(cast);
-        if up.is_finite() {
-            up
-        } else {
-            f32::INFINITY
+        f64_to_f32_up(e)
+    }
+
+    fn require_scalar_merge_environment() -> Result<()> {
+        #[cfg(test)]
+        if scalar_cast_tests::environment_refused_for_test() {
+            return Err(NyError::SoundnessRefusal(
+                "scalar graph merge requires a qualified binary64 environment".into(),
+            ));
         }
+        require_f64_interval_proof_environment()
     }
 
     /// Add non-negative error magnitudes with a certified upward result.
@@ -1828,28 +2020,72 @@ impl CrownMergeAccumulator {
         }
     }
 
-    fn downcast_lower_coeff(value: f64) -> Option<f32> {
-        Self::downcast_coeff(value, true)
+    /// True when publishing a coefficient changes its exact f64 value. This
+    /// uses the publication helper itself, so normal rounding AND deliberate
+    /// removal of binary32 subnormals are both paid. Invalid sources fail their
+    /// row's downcast and yield vacuous biases instead.
+    fn any_coefficient_cast_inexact(
+        source: &Array2<f64>,
+        deadline_state: &mut PatchesMaterializationDeadline,
+        site: &'static str,
+    ) -> Result<bool> {
+        for &value in source {
+            deadline_state.work(1, site)?;
+            if Self::downcast_coeff(value).is_some_and(|stored| f32_to_f64_exact(stored) != value) {
+                return Ok(true);
+            }
+        }
+        deadline_state.checkpoint(site)?;
+        Ok(false)
     }
 
-    fn downcast_upper_coeff(value: f64) -> Option<f32> {
-        Self::downcast_coeff(value, false)
-    }
-
-    fn downcast_coeff(value: f64, is_lower: bool) -> Option<f32> {
+    /// Normal coefficients retain the nearest f32. Tiny nonzero values use
+    /// signed zero rather than a binary32-subnormal operand that a later f32
+    /// kernel may erase. Every changed value is certified by the full gap in
+    /// the coefficient-error plane; exact normal fan-in remains error-free.
+    fn downcast_coeff(value: f64) -> Option<f32> {
         if !value.is_finite() {
             return None;
         }
-
+        let magnitude_bits = value.to_bits() & 0x7fff_ffff_ffff_ffff;
+        if magnitude_bits < f32_to_f64_exact(f32::MIN_POSITIVE).to_bits() {
+            return Some(f32::from_bits(((value.to_bits() >> 63) as u32) << 31));
+        }
         let cast = value as f32;
-        if !cast.is_finite() {
+        // The range check and this final representation check jointly ensure
+        // a binary32-subnormal operand cannot escape this boundary.
+        if cast.is_finite() && (cast.to_bits() & 0x7fff_ffff) < f32::MIN_POSITIVE.to_bits() {
+            return Some(f32::from_bits(cast.to_bits() & 0x8000_0000));
+        }
+        cast.is_finite().then_some(cast)
+    }
+
+    /// Biases are additive constants, so a directed step is a certificate.
+    /// Keep the historical normal-value step and use normal outward endpoints
+    /// near underflow, where a one-subnormal step could be flushed away.
+    fn downcast_bias_directed(value: f64, is_lower: bool) -> Option<f32> {
+        if !value.is_finite() {
             return None;
         }
-
-        Some(if is_lower {
+        if value.abs() <= f32_to_f64_exact(f32::MIN_POSITIVE) {
+            return Some(if is_lower {
+                f64_to_f32_down(value)
+            } else {
+                f64_to_f32_up(value)
+            });
+        }
+        let cast = Self::downcast_coeff(value)?;
+        let directed = if is_lower {
             next_down_f32(cast)
         } else {
             next_up_f32(cast)
+        };
+        // One step from MIN_POSITIVE can itself enter the subnormal range.
+        // Widen that representation outward once more to a normal endpoint.
+        Some(if is_lower {
+            f64_to_f32_down(f32_to_f64_exact(directed))
+        } else {
+            f64_to_f32_up(f32_to_f64_exact(directed))
         })
     }
 
@@ -1857,14 +2093,14 @@ impl CrownMergeAccumulator {
         if value == f64::NEG_INFINITY {
             return Some(f32::NEG_INFINITY);
         }
-        Self::downcast_coeff(value, true)
+        Self::downcast_bias_directed(value, true)
     }
 
     fn downcast_upper_bias(value: f64) -> Option<f32> {
         if value == f64::INFINITY {
             return Some(f32::INFINITY);
         }
-        Self::downcast_coeff(value, false)
+        Self::downcast_bias_directed(value, false)
     }
 
     fn accumulate_linear_bounds64_with_deadline(
@@ -1910,7 +2146,7 @@ impl CrownMergeAccumulator {
         let n_in = existing.num_inputs();
         let coefficient_elements = n_out.saturating_mul(n_in);
         let total_workspace_elements = coefficient_elements.saturating_mul(4);
-        let mut allocated = 0usize;
+        let mut capacity_overage = 0usize;
         let mut make_workspace = || -> Result<Array2<f64>> {
             let values = Self::try_collect_f64_with_deadline(
                 std::iter::repeat_n(0.0, coefficient_elements),
@@ -1918,7 +2154,7 @@ impl CrownMergeAccumulator {
                 &mut poll,
                 live_base_bytes,
                 total_workspace_elements,
-                &mut allocated,
+                &mut capacity_overage,
                 SITE,
             )?;
             Array2::from_shape_vec((n_out, n_in), values)
@@ -1991,7 +2227,7 @@ impl CrownMergeAccumulator {
             *roundoff = 0.0;
             return;
         }
-        let (sum, residual) = two_sum(*existing_value, f64::from(new_value));
+        let (sum, residual) = two_sum(*existing_value, f32_to_f64_exact(new_value));
         *existing_value = sum;
         *roundoff = if sum.is_finite() { residual.abs() } else { 0.0 };
     }
@@ -2014,7 +2250,7 @@ impl CrownMergeAccumulator {
                 *existing_value = nan_fallback;
                 continue;
             }
-            let (sum, residual) = two_sum(*existing_value, f64::from(new_value));
+            let (sum, residual) = two_sum(*existing_value, f32_to_f64_exact(new_value));
             *existing_value = if sum.is_nan() {
                 nan_fallback
             } else if !sum.is_finite() {
@@ -2069,7 +2305,7 @@ impl CrownMergeAccumulator {
         if let Some(new_error) = new_err {
             for (value, &new_value) in accumulator.iter_mut().zip(new_error.iter()) {
                 poll.work(1, site)?;
-                *value = Self::add_nonnegative_f64_up(*value, f64::from(new_value));
+                *value = Self::add_nonnegative_f64_up(*value, f32_to_f64_exact(new_value));
             }
         }
         Ok(())
@@ -2150,7 +2386,7 @@ impl CrownMergeAccumulator {
                     *ro = 0.0;
                     return;
                 }
-                let (sum, residual) = two_sum(*existing_value, f64::from(new_value));
+                let (sum, residual) = two_sum(*existing_value, f32_to_f64_exact(new_value));
                 if sum.is_finite() {
                     // `sum + residual` is the exact real addition, including
                     // cancellation and subnormal cases.
@@ -2201,7 +2437,7 @@ impl CrownMergeAccumulator {
             if ne.shape() == [n_out, n_in] {
                 let acc = existing_err.as_mut().expect("allocated above");
                 Zip::from(acc).and(ne).for_each(|a, &e| {
-                    *a = Self::add_nonnegative_f64_up(*a, f64::from(e));
+                    *a = Self::add_nonnegative_f64_up(*a, f32_to_f64_exact(e));
                 });
             } else {
                 // Incoming error shape mismatch: cannot map it soundly; degrade.
@@ -2234,7 +2470,7 @@ impl CrownMergeAccumulator {
                     *existing_value = nan_fallback;
                     return;
                 }
-                let (sum, residual) = two_sum(*existing_value, f64::from(new_value));
+                let (sum, residual) = two_sum(*existing_value, f32_to_f64_exact(new_value));
                 *existing_value = if sum.is_nan() {
                     nan_fallback
                 } else if !sum.is_finite() {
@@ -2253,3 +2489,7 @@ impl CrownMergeAccumulator {
 #[cfg(test)]
 #[path = "merge_accumulator_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "merge_accumulator_scalar_cast_tests.rs"]
+mod scalar_cast_tests;

@@ -379,8 +379,6 @@ fn does_not_fuse_reciprocal_mul_over_non_terminal_axis_3591() {
 /// Verify Div-variant and Reciprocal+Mul-variant fused graphs produce identical
 /// IBP bounds. Both patterns fuse to InstanceNorm1d(ny=1, beta=0, eps=1e-5),
 /// so their output bounds must be element-wise identical for the same input.
-///
-/// Part of #3591: Prover verification that both fusion paths are equivalent.
 #[test]
 fn fused_div_and_reciprocal_mul_ibp_parity_3591() {
     let graph_div = build_decomposed_instance_norm_graph(2);
@@ -484,7 +482,7 @@ fn assert_ibp_soundness(exact: &[f32], ibp_out: &BoundedTensor, point_idx: usize
 /// Verify fused InstanceNorm graph IBP is sound: for concrete inputs within the
 /// bounded interval, the exact InstanceNorm output falls within IBP bounds.
 ///
-/// Part of #3591: graph-level soundness check for fused InstanceNorm IBP.
+/// Graph-level soundness check for fused InstanceNorm IBP.
 /// Complements layer-level proptest coverage in normalization_ibp.rs.
 #[test]
 fn fused_instance_norm_graph_ibp_soundness_3591() {

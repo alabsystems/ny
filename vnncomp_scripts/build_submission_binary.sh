@@ -134,6 +134,15 @@ trap 'exit 143' TERM
 
 echo "Building ny release binary..."
 
+# --- Build toolchain -------------------------------------------------------
+# The private tree pins the Trust toolchain (owner directive 2026-09-28), so the
+# build is targo in its unverified lane (the statement
+# scripts/vnncomp_trust_linux_build.sh makes) and the compiler identity is
+# trustc's. There is no stock fallback, in the public snapshot either (it keeps
+# the Trust pin; the supported evaluation install is the prebuilt binary).
+NY_BUILD_CARGO=(targo --unverified)
+NY_BUILD_RUSTC=trustc
+
 # --- Build prerequisite diagnostics (fail loudly, never silently) ---
 # The `mip` feature is pure Rust (ay-milp); no CMake/libclang needed. A C
 # compiler and pkg-config are still used by native dep crates (psm/stacker,
@@ -141,12 +150,12 @@ echo "Building ny release binary..."
 # archive over rustls, so a source build needs network access but no system
 # OpenSSL headers.
 missing=""
-for tool in cargo cc pkg-config python3; do
+for tool in "${NY_BUILD_CARGO[0]}" "${NY_BUILD_RUSTC}" cc pkg-config python3; do
     command -v "${tool}" >/dev/null 2>&1 || missing="${missing} ${tool}"
 done
 if [ -n "${missing}" ]; then
     echo "WARNING: build prerequisites appear missing:${missing}" >&2
-    echo "  (cargo=Rust toolchain; cc=C compiler; pkg-config=native dependency discovery; python3=Cargo artifact authentication)" >&2
+    echo "  (${NY_BUILD_CARGO[0]}/${NY_BUILD_RUSTC}=Rust toolchain; cc=C compiler; pkg-config=native dependency discovery; python3=Cargo artifact authentication)" >&2
 fi
 if ! command -v python3 >/dev/null 2>&1; then
     echo "ERROR: Python 3 is required to authenticate Cargo's emitted ny artifact." >&2
@@ -243,7 +252,7 @@ fi
 # assembly time even on a capable host. Enable fp16 only when every reported CPU
 # feature line exposes Advanced-SIMD half precision; never emit it blindly into
 # a portable/cross build.
-rust_host="$(rustc -vV 2>/dev/null | awk '$1 == "host:" { print $2 }' || true)"
+rust_host="$("${NY_BUILD_RUSTC}" -vV 2>/dev/null | awk '$1 == "host:" { print $2 }' || true)"
 effective_build_target="${CARGO_BUILD_TARGET:-}"
 if [ -z "${effective_build_target}" ]; then
     # Cargo may source build.target from user or repository configuration. A
@@ -313,7 +322,7 @@ if [ "${rust_host}" = "aarch64-unknown-linux-gnu" ] \
         }
         END { exit !(seen && !missing) }
     ' /proc/cpuinfo \
-    && ! rustc --print cfg 2>/dev/null | grep -q '^target_feature="fp16"$'; then
+    && ! "${NY_BUILD_RUSTC}" --print cfg 2>/dev/null | grep -q '^target_feature="fp16"$'; then
     case " ${RUSTFLAGS:-} " in
         *"+fp16"*) ;;
         *)
@@ -408,7 +417,7 @@ run_submission_cargo_build() {
 
     # Cargo keeps ordinary progress and rendered diagnostics on stderr. Its
     # stdout is now a JSON-lines protocol used only for artifact provenance.
-    if cargo "${cargo_arguments[@]}" > "${cargo_messages}"; then
+    if "${NY_BUILD_CARGO[@]}" "${cargo_arguments[@]}" > "${cargo_messages}"; then
         cargo_status=0
     else
         cargo_status=$?
@@ -751,7 +760,8 @@ fi
 # Receipt publication is the final readiness sentinel.  If this step is
 # interrupted, a prior receipt either remains and mismatches the new binary or
 # is absent; run_instance.sh rejects both states.
-if ! bash "${RECEIPT_HELPER}" create-local \
+# The receipt records the identity of the compiler that built the binary.
+if ! RUSTC="${RUSTC:-${NY_BUILD_RUSTC}}" bash "${RECEIPT_HELPER}" create-local \
     "${STABLE_SUBMISSION_BIN}" \
     "${TOOL_DIR}" \
     "${receipt_features}" \

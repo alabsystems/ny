@@ -34,6 +34,12 @@ type GraphAlphaCollectionResult = (
 /// establish every claimed verdict independently of the optimizer fold.
 pub(crate) enum GraphAlphaCollectionOutcome {
     Complete(GraphAlphaCollectionResult),
+    /// Same-call certified reference and initialized (possibly empty) alpha.
+    /// No optimizer fold/update or phase-cap checkpoint is claimed. The root
+    /// caller still needs a fresh certified objective evaluation.
+    ReferenceOnly {
+        result: GraphAlphaCollectionResult,
+    },
     PhaseCapCheckpoint {
         result: GraphAlphaCollectionResult,
         completed_iterations: usize,
@@ -44,17 +50,23 @@ pub(crate) enum GraphAlphaCollectionOutcome {
 impl GraphAlphaCollectionOutcome {
     fn into_result(self) -> GraphAlphaCollectionResult {
         match self {
-            Self::Complete(result) | Self::PhaseCapCheckpoint { result, .. } => result,
+            Self::Complete(result)
+            | Self::ReferenceOnly { result }
+            | Self::PhaseCapCheckpoint { result, .. } => result,
         }
     }
 }
 
 mod alpha;
 mod alpha_dag_dispatch;
+mod alpha_root_fixed_reference;
 // Bug #19 budget-monotonicity: shrink-only publication of the DAG-alpha root
 // intermediate map (NY_CENSUS_MONOTONE=1 / NY_CENSUS_COMMIT_TELEMETRY=1,
 // default OFF => byte-identical). See census_commit.rs module docs.
 mod census_commit;
+// #vit-crown-interm: unconditional `[ref-map]` / `[softmax-complex]`
+// engagement lines for the alpha reference map. Print-only.
+mod ref_map_telemetry;
 
 pub(in crate::network::graph_alpha) use alpha::crown_ibp_collector_cap;
 pub(crate) use alpha::AlphaReferenceBoundsSource;
@@ -87,13 +99,27 @@ mod demand;
 // armed root-joint interm-α lane ranks its targets by the SAME demanded list
 // whose CROWN degradation it repairs (one selector, two consumers).
 pub(crate) use demand::nodes_requiring_crown_tightening;
+// #cgan-unstable-rows: the abc `minimum_sparsity` ceiling, re-exported so the
+// collection-cache policy default and the collector read ONE constant.
+pub(crate) use demand::DEFAULT_SPARSE_RELU_MAX_PERMILLE;
+// #fwd-root-screen (V4): the certified zonotope core reuses C1's exact
+// lookup-table helpers (point enclosure, exact range, runtime shape check)
+// instead of forking them. Re-exported only; `pwl_lookup.rs` is unchanged.
+pub(crate) use pwl_lookup::{check_lookup_shapes, pwl_point_enclosure, pwl_range_f64};
 mod div;
 mod gpu_suffix;
 mod ibp;
 mod ibp_batched;
 mod patches_target;
+// #pwl-lookup (DARK, `bab.pwl_lookup_exact_range`): exact 1-D range of ReLU
+// lookup tables, intersected shrink-only into the IBP node box.
+mod pwl_lookup;
 mod reciprocal_support;
+// #cgan-unstable-rows: typed selector + shrink-only k-row refinement kernel.
+mod head_rows;
 mod resident_patches_root;
+mod row_refine;
+mod s_shaped_preactivation;
 mod sequential;
 mod sqrt_support;
 mod target_backward;

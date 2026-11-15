@@ -604,7 +604,7 @@ fn assert_warm_start_and_cold_solve_agree(backend: MipBackend) {
     );
 }
 
-/// #3865: Warm-started and cold solves return the same verdict on a small network.
+/// Warm-started and cold solves return the same verdict on a small network.
 #[test]
 #[ntest::timeout(30_000)]
 fn warm_start_and_cold_solve_agree_on_verdict_3865() {
@@ -644,7 +644,7 @@ fn assert_wrong_length_warm_start_falls_back(backend: MipBackend) {
     );
 }
 
-/// #3865: Warm-start with wrong-length vector falls back to cold solve gracefully.
+/// Warm-start with wrong-length vector falls back to cold solve gracefully.
 #[test]
 #[ntest::timeout(30_000)]
 fn warm_start_wrong_length_falls_back_to_cold_solve_3865() {
@@ -660,7 +660,7 @@ fn ay_proc_warm_start_contracts_3865() {
     assert_wrong_length_warm_start_falls_back(MipBackend::AyProc);
 }
 
-/// #3865: num_cols in MipParts matches the encoder's column count.
+/// num_cols in MipParts matches the encoder's column count.
 #[test]
 fn num_cols_matches_encoder_column_count_3865() {
     let (weights, biases, layer_dims) = small_network();
@@ -690,7 +690,7 @@ fn num_cols_matches_encoder_column_count_3865() {
 }
 
 /// binary_widths is aligned with binary_vars and carries pre-activation u-l.
-/// Drives the phase-split branching selection (designs/scip.md Phase C).
+/// Drives the phase-split branching selection.
 #[test]
 fn binary_widths_align_with_binary_vars() {
     let (weights, biases, layer_dims) = small_network();
@@ -717,10 +717,10 @@ fn binary_widths_align_with_binary_vars() {
 }
 
 // ---------------------------------------------------------------------------
-// Backend verdict property tests (designs/scip.md validation plan): the
-// in-process production backend runs by default. The `external-ay` AyProc lane
-// compares the frozen subprocess lowering against it and hard-requires the
-// exact pinned binary when explicitly selected.
+// Backend verdict property tests: the in-process production backend runs by
+// default. The `external-ay` AyProc lane compares the frozen subprocess
+// lowering against it and hard-requires the exact pinned binary when
+// explicitly selected.
 // ---------------------------------------------------------------------------
 
 /// Sound interval (IBP) pre-activation bounds for the tiny test nets, computed
@@ -898,10 +898,9 @@ proptest::proptest! {
 }
 
 /// Phase-split racing agrees with the serial solve on both fixtures for a
-/// selected backend (designs/scip.md Phase C validation): sat stays sat with a
-/// valid witness, unsat stays unsat. parallel_split=16 forces the maximum
-/// split (capped by the fixture's binary count); parallel_split=1 is the
-/// serial disable path.
+/// selected backend: sat stays sat with a valid witness, unsat stays unsat.
+/// parallel_split=16 forces the maximum split (capped by the fixture's binary
+/// count); parallel_split=1 is the serial disable path.
 fn assert_split_and_serial_solves_agree(backend: MipBackend) {
     let (weights, biases, layer_dims) = small_network();
     let input_bounds = vec![Bound::new(0.0, 1.0), Bound::new(0.0, 1.0)];

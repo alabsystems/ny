@@ -4,6 +4,14 @@
 
 //! Input-splitting helpers for β-CROWN.
 
+#[cfg(test)]
+#[path = "input_head_bridge_consumer_tests.rs"]
+mod input_head_bridge_consumer_tests;
+
+#[cfg(test)]
+#[path = "input_head_dependency_tests.rs"]
+mod input_head_dependency_tests;
+
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -35,6 +43,42 @@ pub(crate) enum InputSplitChildren {
     Unsplittable,
 }
 
+/// `#split-hint` — EXPERIMENT constant, `false` ships.
+///
+/// Armed, the input-split selector falls back to the ROOT-derived influence
+/// vector instead of pure `width` when a domain carries no plane of its own.
+/// abc does the coefficient-weighted thing explicitly (`method: sb`,
+/// `sb_coeff_thresh: 0.1`); ny has the identical constant
+/// (`input_split_coeff_thresh`) and today cannot apply it without a plane.
+///
+/// Disarmed the scorer is byte-identical: the hint is neither read nor
+/// consulted, and nothing writes the `OnceLock`.
+pub(crate) const SPLIT_HINT: bool = false;
+
+/// Reduce a root plane to per-input influence magnitudes: `hint[d] = max_s |a[s,d]|`.
+///
+/// Pure, so the reduction is testable without a network. Returns `None` on an
+/// empty plane so a degenerate root can never install an all-zero hint that
+/// would silently score every dimension identically.
+pub(crate) fn split_hint_from_plane(a: &ndarray::Array2<f32>) -> Option<Vec<f32>> {
+    let (rows, cols) = (a.nrows(), a.ncols());
+    if rows == 0 || cols == 0 {
+        return None;
+    }
+    let mut hint = vec![0.0f32; cols];
+    for d in 0..cols {
+        let mut best = 0.0f32;
+        for s in 0..rows {
+            let v = a[[s, d]].abs();
+            if v.is_finite() && v > best {
+                best = v;
+            }
+        }
+        hint[d] = best;
+    }
+    hint.iter().any(|&v| v > 0.0).then_some(hint)
+}
+
 impl BetaCrownVerifier {
     /// Select input dimension with margin-weighted SB heuristic.
     ///
@@ -44,6 +88,42 @@ impl BetaCrownVerifier {
     /// per the baseline SB heuristic. When `None`, margin weighting is disabled.
     ///
     /// Reference: alpha-beta-CROWN `branching_heuristics.py:input_split_heuristic_sb`
+    /// `#split-hint`: install the root-derived influence vector. Idempotent —
+    /// the first root to publish wins, later calls are ignored.
+    pub(crate) fn install_root_split_hint(&self, plane: &LinearBounds, verify_upper: bool) {
+        if !SPLIT_HINT {
+            return;
+        }
+        let a = if verify_upper {
+            plane.upper_a()
+        } else {
+            plane.lower_a()
+        };
+        if let Some(hint) = split_hint_from_plane(a) {
+            let nonzero = hint.iter().filter(|&&v| v > 0.0).count();
+            let max = hint.iter().fold(0.0f32, |m, &v| m.max(v));
+            if self.root_split_hint.set(hint).is_ok() {
+                // The lever's OWN observable. Absent => the hint was never
+                // installed and any null is VOID, not negative.
+                eprintln!(
+                    "[split-hint] installed dims={} nonzero={nonzero} max={max:.6e}",
+                    self.root_split_hint.get().map_or(0, Vec::len)
+                );
+            }
+        }
+    }
+
+    /// Scoring-only view of the root hint, valid for this input width.
+    fn root_split_hint_for(&self, len: usize) -> Option<&[f32]> {
+        if !SPLIT_HINT {
+            return None;
+        }
+        self.root_split_hint
+            .get()
+            .map(Vec::as_slice)
+            .filter(|h| h.len() == len)
+    }
+
     pub(crate) fn select_input_dimension_sb(
         &self,
         input_bounds: &BoundedTensor,
@@ -51,6 +131,13 @@ impl BetaCrownVerifier {
         domain_bounds: Option<&[f32]>,
         thresholds: Option<&[f32]>,
     ) -> usize {
+        // #phase-cost: see `ny_core::phase_cost` (observability only). A FINE
+        // site (recorded at `detail` only): it runs once per domain inside the
+        // input-split fan-out, where a coarse guard's contended CAS was priced
+        // above the 0.5% budget (review(cost-census): safenlp's 75,504 enters
+        // at 6 in flight); the per-batch `child_bound` guard still covers it.
+        let _phase_cost =
+            ny_core::phase_cost::enter_fine(ny_core::phase_cost::CostPhase::BranchSelect);
         let scores =
             self.input_split_scores(input_bounds, linear_bounds, domain_bounds, thresholds);
         if scores.is_empty() {
@@ -59,7 +146,7 @@ impl BetaCrownVerifier {
         let mut best_dim = scores[0].0;
         let mut best_score = scores[0].1;
         for (dim, score) in scores {
-            // Skip NaN scores — corrupt scores must not win (#2588).
+            // Skip NaN scores — corrupt scores must not win.
             if score.is_nan() {
                 continue;
             }
@@ -81,6 +168,9 @@ impl BetaCrownVerifier {
         domain_bounds: Option<&[f32]>,
         thresholds: Option<&[f32]>,
     ) -> Vec<usize> {
+        // #phase-cost: a FINE site, as in `select_input_dimension_sb` above.
+        let _phase_cost =
+            ny_core::phase_cost::enter_fine(ny_core::phase_cost::CostPhase::BranchSelect);
         let mut scores =
             self.input_split_scores(input_bounds, linear_bounds, domain_bounds, thresholds);
         if scores.is_empty() {
@@ -152,6 +242,64 @@ impl BetaCrownVerifier {
             }
         }
 
+        // #split-hint: SELF-POPULATE from any plane that passes through here.
+        //
+        // The root installer alone is NOT enough: measured 2026-09-17, the FIRST
+        // plane-less selector call arrives BEFORE the root publishes
+        // (`hint=absent dims=5`), so the hint was never available at the one
+        // moment it was needed — three VOID runs with `scoring=0`. Seeding from
+        // the selector's own plane removes the ordering dependency entirely.
+        //
+        // Still SCORING ONLY, and still never written into `domain.linear_bounds`.
+        if SPLIT_HINT && self.root_split_hint.get().is_none() {
+            if let Some(a) = coeffs {
+                if a.ncols() == len {
+                    if let Some(h) = split_hint_from_plane(a) {
+                        if self.root_split_hint.set(h).is_ok() {
+                            eprintln!("[split-hint] seeded from a selector plane dims={len}");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Consulted ONLY when this domain has no plane of its own.
+        let hint = if coeffs.is_none() {
+            self.root_split_hint_for(len)
+        } else {
+            None
+        };
+        // #split-hint DIAGNOSTIC: three VOID runs reported `scoring=0` without
+        // saying WHY. Print once on the first plane-less call, which separates
+        // the only three possibilities:
+        //   line never prints        => `coeffs` is NEVER None here: planes are
+        //                               always present and the banked
+        //                               `path=no-plane` does not reproduce at
+        //                               this site.
+        //   prints hint=absent       => the plane-less call happens BEFORE the
+        //                               root installs the hint (ordering bug).
+        //   prints hint=len_mismatch => the root plane's width != the selector's
+        //                               input width (my filter rejects it).
+        if coeffs.is_none() {
+            static NOPLANE: std::sync::Once = std::sync::Once::new();
+            NOPLANE.call_once(|| {
+                let state = match self.root_split_hint.get() {
+                    None => "absent".to_string(),
+                    Some(h) if h.len() != len => format!("len_mismatch hint={} sel={len}", h.len()),
+                    Some(_) => "usable".to_string(),
+                };
+                eprintln!("[split-hint] FIRST plane-less selector call: hint={state} dims={len}");
+            });
+        }
+        if hint.is_some() {
+            // Once per process: proves the hint actually REPLACED a width-only
+            // score on a real plane-less domain, which is the whole mechanism.
+            static USED: std::sync::Once = std::sync::Once::new();
+            USED.call_once(|| {
+                eprintln!("[split-hint] scoring a plane-less domain dims={len}");
+            });
+        }
+
         let spec_margin = |spec_idx: usize| -> f32 {
             let Some(bounds) = domain_bounds else {
                 return 0.0;
@@ -176,6 +324,14 @@ impl BetaCrownVerifier {
             let mut score = f32::NEG_INFINITY;
             if width.is_finite() && width > 0.0 {
                 score = width;
+                if let Some(h) = hint {
+                    // Same shape as the real SB score with one pseudo-spec row.
+                    let coeff = h[dim];
+                    if coeff > 0.0 {
+                        any_linear_signal = true;
+                    }
+                    score = coeff.max(coeff_thresh) * width * 0.5;
+                }
                 if let Some(a) = coeffs {
                     let num_specs = a.nrows();
 
@@ -235,7 +391,7 @@ impl BetaCrownVerifier {
             }
         }
 
-        if coeffs.is_some() && !any_linear_signal {
+        if (coeffs.is_some() || hint.is_some()) && !any_linear_signal {
             // All coefficients are zero: fall back to width-only selection.
             return width_only();
         }
@@ -273,7 +429,7 @@ impl BetaCrownVerifier {
             Err(_) => None,
         };
         // Thread the active verification-direction output bound through the SB
-        // scorer so per-spec margin weighting matches alpha-beta-CROWN (#1074).
+        // scorer so per-spec margin weighting matches alpha-beta-CROWN.
         let domain_bounds = [if self.config.verify_upper_bound {
             parent.upper_bound
         } else {
@@ -438,6 +594,17 @@ impl BetaCrownVerifier {
 
         let mut new_input_bounds = BoundedTensor::new(new_lower_arr, new_upper_arr)?;
 
+        // Record/prove the ENTIRE actual child before generic clipping can
+        // remove a region. Only a source-owned positive certificate can prune
+        // here; generic clipping never supplies a leaf to that partition.
+        let mut source_floor =
+            self.input_head_support(network, &new_input_bounds, threshold, deadline);
+        if source_floor.is_some_and(|lower| lower > 0.0) && self.input_head_live(deadline) {
+            self.mark_input_head_dependency();
+            trace!("Input-split child verified by original input-head source");
+            return Ok(None);
+        }
+
         // Apply input-domain clipping if enabled (Clip-and-Verify)
         // Dispatches to relaxed or complete clipping based on config.
         if self.config.enable_relaxed_clip {
@@ -459,10 +626,19 @@ impl BetaCrownVerifier {
                 )?,
             };
             if clip_outcome.verified {
+                // The private partition remains incomplete unless its own
+                // full preclip support above proved this original region.
                 trace!("Input-split child verified by clipping, skipping");
                 return Ok(None);
             }
             new_input_bounds = clip_outcome.bounds;
+            // Reprice the actual postclip box. Do not assume a generic clip's
+            // returned endpoints are the same box as the preceding support.
+            source_floor = self.input_head_support(network, &new_input_bounds, threshold, deadline);
+            if source_floor.is_some_and(|lower| lower > 0.0) && self.input_head_live(deadline) {
+                self.mark_input_head_dependency();
+                return Ok(None);
+            }
         }
 
         // #tll-nested-collect-par: permit nested faer (Rayon) parallelism for the
@@ -506,7 +682,6 @@ impl BetaCrownVerifier {
         // hidden-layer bounds using the Lagrangian dual LP solver.
         //
         // Reference: auto_LiRPA/concretize_bounds.py:concretize_bounds (two-pass)
-        // Part of #3552 Packet 3
         if self.config.enable_relaxed_clip {
             use crate::beta_crown::config::InputClipType;
             if self.config.input_clip_type == InputClipType::Complete {
@@ -524,7 +699,7 @@ impl BetaCrownVerifier {
 
         // Compute output bounds with CROWN
         // Thread deadline into alpha config so per-domain α-CROWN bails early
-        // when the BaB timeout budget is exhausted (#2724).
+        // when the BaB timeout budget is exhausted.
         let output_bounds = if self.config.use_alpha_crown {
             let mut alpha_config = self.config.alpha_config.clone();
             alpha_config.deadline = deadline;
@@ -555,6 +730,19 @@ impl BetaCrownVerifier {
 
         let mut new_lower_bound = output_bounds.lower_scalar();
         let new_upper_bound = output_bounds.upper_scalar();
+        if let Some(lower) = source_floor {
+            if lower > new_lower_bound && lower <= new_upper_bound && self.input_head_live(deadline)
+            {
+                new_lower_bound = lower;
+                self.mark_input_head_scalar_max_dependency(
+                    network,
+                    threshold,
+                    lower,
+                    output_bounds.lower().len(),
+                    deadline,
+                );
+            }
+        }
 
         // JOINT-MARGIN closer (same-LHS conjunctive max-diff, acasxu prop_2/3/4).
         // CROWN's scalar bound above routed the MaxPool *lower* relaxation through
@@ -601,9 +789,9 @@ impl BetaCrownVerifier {
             DomainAlphaState::empty()
         };
 
-        // Use validated child constructor to enforce NaN rejection (#3125).
+        // Use validated child constructor to enforce NaN rejection.
         // Priority defaults to lower_bound; BaB loop overwrites via
-        // set_priority()/violation_priority() before queue insertion (#2682).
+        // set_priority()/violation_priority() before queue insertion.
         Ok(Some(BabDomain::child(
             history,
             new_lower_bound,
@@ -625,7 +813,6 @@ impl BetaCrownVerifier {
     /// tightens intermediate layer bounds using the Lagrangian dual LP solver.
     ///
     /// Reference: auto_LiRPA/concretize_bounds.py:concretize_bounds
-    /// Part of #3552 Packet 3
     fn apply_intermediate_complete_clipping(
         &self,
         network: &Network,
@@ -1171,5 +1358,253 @@ mod tests {
         // Missing domain bounds/thresholds disable margin weighting.
         let dim = verifier.select_input_dimension_sb(&input, Some(&linear_bounds), None, None);
         assert_eq!(dim, 0);
+    }
+
+    /// #seq-plain-collector-sound: the per-domain layer bounds at `create_input_split_child`
+    /// (both the `use_crown_ibp=false` default arm and the `use_crown_ibp=true` +
+    /// deadline arm) come from the plain collector. Fixture: 1x1 Conv2d over in_c=2 with
+    /// W = [2^24, 1], bias -2^24; x0 = 1 (point), the child splits x1 to [0.5, 1]. Every
+    /// f32 summation order rounds fl(2^24 + x1) to 2^24 for x1 in [0.5, 1], so the PLAIN
+    /// conv box is exactly [0, 0] while the true pre-activation is [0.5, 1]; the follow-on
+    /// Linear (w = 1, b = -0.5) then reads [-0.5, -0.5] and the second ReLU is classified
+    /// DEAD (u <= 0) although its true input reaches 0.5. The child's layer bounds must
+    /// enclose the truth and must not read that ReLU as dead.
+    fn conv_cancellation_child(use_crown_ibp: bool, deadline: Option<Instant>) -> BabDomain {
+        use crate::layers::{Conv2dLayer, FlattenLayer, LinearLayer, ReLULayer};
+        use ndarray::{arr1, arr2, ArrayD, IxDyn};
+
+        const TWO24: f32 = 16_777_216.0;
+        let kernel = ArrayD::from_shape_vec(IxDyn(&[1, 2, 1, 1]), vec![TWO24, 1.0]).unwrap();
+        let conv =
+            Conv2dLayer::with_input_shape(kernel, Some(arr1(&[-TWO24])), (1, 1), (0, 0), 1, 1)
+                .unwrap();
+        let mut network = Network::new();
+        network.add_layer(crate::Layer::Conv2d(conv));
+        network.add_layer(crate::Layer::ReLU(ReLULayer));
+        network.add_layer(crate::Layer::Flatten(FlattenLayer::flatten_all()));
+        network.add_layer(crate::Layer::Linear(
+            LinearLayer::new(arr2(&[[1.0_f32]]), Some(arr1(&[-0.5_f32]))).unwrap(),
+        ));
+        network.add_layer(crate::Layer::ReLU(ReLULayer));
+
+        // Parent box: x0 = 1 (point), x1 in [0, 1]; the child tightens x1 to [0.5, 1].
+        let parent_input = BoundedTensor::new(
+            ArrayD::from_shape_vec(IxDyn(&[2, 1, 1]), vec![1.0, 0.0]).unwrap(),
+            ArrayD::from_shape_vec(IxDyn(&[2, 1, 1]), vec![1.0, 1.0]).unwrap(),
+        )
+        .unwrap();
+        let config = BetaCrownConfig {
+            use_alpha_crown: false,
+            use_crown_ibp,
+            enable_relaxed_clip: false,
+            ..Default::default()
+        };
+        let verifier = BetaCrownVerifier::new(config);
+        let parent = BabDomain::root_with_input(Vec::new(), 0.0, 0.0, &parent_input).unwrap();
+        verifier
+            .create_input_split_child(
+                &network,
+                &parent_input,
+                &parent,
+                1,
+                0.5,
+                1.0,
+                0.0,
+                deadline,
+                None,
+            )
+            .expect("child creation must succeed")
+            .expect("a width-0.5 split is a valid child")
+    }
+
+    fn assert_child_encloses_conv_cancellation_truth(child: &BabDomain, label: &str) {
+        let bounds = child.layer_bounds();
+        assert_eq!(
+            bounds.len(),
+            5,
+            "{label}: five layers => five per-domain bounds"
+        );
+        let conv_l = bounds[0].lower().iter().copied().next().unwrap();
+        let conv_u = bounds[0].upper().iter().copied().next().unwrap();
+        assert!(
+            conv_l <= 0.5 && conv_u >= 1.0,
+            "{label}: per-domain conv box [{conv_l}, {conv_u}] must enclose the true \
+             [0.5, 1]; [0, 0] is the plain-arm cancellation signature"
+        );
+        let lin_l = bounds[3].lower().iter().copied().next().unwrap();
+        let lin_u = bounds[3].upper().iter().copied().next().unwrap();
+        assert!(
+            lin_l <= 0.0 && lin_u >= 0.5,
+            "{label}: per-domain Linear pre-activation [{lin_l}, {lin_u}] must enclose \
+             the true [0, 0.5]"
+        );
+        assert!(
+            lin_u > 0.0,
+            "{label}: second ReLU classified DEAD (u = {lin_u} <= 0) from an inward \
+             conv box; its true input reaches 0.5"
+        );
+        // The domain's verdict box: true network output is [0, 0.5]. A dead second
+        // ReLU produced exactly [0, 0] here, which a `output <= 0.25` spec would have
+        // read as VERIFIED.
+        assert!(
+            child.upper_bound() >= 0.5,
+            "{label}: domain upper bound {} must enclose the true output 0.5",
+            child.upper_bound()
+        );
+        assert!(
+            child.lower_bound() <= 0.0,
+            "{label}: domain lower bound {} must enclose the true output 0",
+            child.lower_bound()
+        );
+    }
+
+    #[test]
+    #[ntest::timeout(60000)]
+    fn input_split_child_conv_cancellation_not_dead_default_arm() {
+        // `use_crown_ibp: false` is the shipped default (beta_config.rs) and the arm
+        // vnncomp passes — the `network.collect_ibp_bounds(&new_input_bounds)` site.
+        let child = conv_cancellation_child(false, None);
+        assert_child_encloses_conv_cancellation_truth(&child, "input-split default arm");
+    }
+
+    #[test]
+    #[ntest::timeout(60000)]
+    fn input_split_child_conv_cancellation_not_dead_crown_ibp_deadline_arm() {
+        // `use_crown_ibp: true` rests on the CROWN-IBP base collector, which is the
+        // `collect_ibp_bounds_with_deadline` alias; drive it with a finite deadline.
+        let far = Instant::now() + std::time::Duration::from_secs(3600);
+        let child = conv_cancellation_child(true, Some(far));
+        assert_child_encloses_conv_cancellation_truth(&child, "input-split crown-ibp arm");
+    }
+
+    /// Control: the plain per-layer arms really collapse this fixture — the tests
+    /// above are not vacuous.
+    #[test]
+    fn input_split_conv_cancellation_plain_arms_read_dead() {
+        use crate::layers::{BoundPropagation, Conv2dLayer, FlattenLayer, LinearLayer, ReLULayer};
+        use ndarray::{arr1, arr2, ArrayD, IxDyn};
+
+        const TWO24: f32 = 16_777_216.0;
+        let kernel = ArrayD::from_shape_vec(IxDyn(&[1, 2, 1, 1]), vec![TWO24, 1.0]).unwrap();
+        let layers = [
+            crate::Layer::Conv2d(
+                Conv2dLayer::with_input_shape(kernel, Some(arr1(&[-TWO24])), (1, 1), (0, 0), 1, 1)
+                    .unwrap(),
+            ),
+            crate::Layer::ReLU(ReLULayer),
+            crate::Layer::Flatten(FlattenLayer::flatten_all()),
+            crate::Layer::Linear(
+                LinearLayer::new(arr2(&[[1.0_f32]]), Some(arr1(&[-0.5_f32]))).unwrap(),
+            ),
+        ];
+        let mut current = BoundedTensor::new(
+            ArrayD::from_shape_vec(IxDyn(&[2, 1, 1]), vec![1.0, 0.5]).unwrap(),
+            ArrayD::from_shape_vec(IxDyn(&[2, 1, 1]), vec![1.0, 1.0]).unwrap(),
+        )
+        .unwrap();
+        let mut conv_box = None;
+        for (i, layer) in layers.iter().enumerate() {
+            current = layer.propagate_ibp(&current).unwrap();
+            if i == 0 {
+                conv_box = Some((
+                    current.lower().iter().copied().next().unwrap(),
+                    current.upper().iter().copied().next().unwrap(),
+                ));
+            }
+        }
+        assert_eq!(
+            conv_box,
+            Some((0.0, 0.0)),
+            "plain conv box collapses to [0, 0]"
+        );
+        let lin_u = current.upper().iter().copied().next().unwrap();
+        assert!(
+            lin_u <= 0.0,
+            "plain Linear pre-activation upper {lin_u} reads the second ReLU as dead"
+        );
+    }
+}
+
+#[cfg(test)]
+mod split_hint_tests {
+    use super::{split_hint_from_plane, SPLIT_HINT};
+    use ndarray::Array2;
+
+    #[test]
+    fn the_reduction_takes_the_max_absolute_coefficient_per_input() {
+        // 2 specs x 3 inputs. Input 1 has the largest influence via spec 1,
+        // input 2 the smallest — so a selector using this will NOT pick by width.
+        let a = Array2::from_shape_vec((2, 3), vec![0.10, -0.20, 0.01, -0.05, 0.90, 0.02])
+            .expect("shape");
+        let hint = split_hint_from_plane(&a).expect("non-zero plane yields a hint");
+        assert_eq!(hint.len(), 3);
+        assert!((hint[0] - 0.10).abs() < 1e-6, "max(|0.10|,|-0.05|)");
+        assert!(
+            (hint[1] - 0.90).abs() < 1e-6,
+            "max(|-0.20|,|0.90|) — sign ignored"
+        );
+        assert!((hint[2] - 0.02).abs() < 1e-6);
+    }
+
+    #[test]
+    fn an_all_zero_plane_yields_no_hint() {
+        // An all-zero hint would score every dimension identically and silently
+        // replace width-selection with nothing at all. Refuse it instead.
+        let a = Array2::<f32>::zeros((3, 4));
+        assert!(split_hint_from_plane(&a).is_none());
+    }
+
+    #[test]
+    fn an_empty_plane_yields_no_hint() {
+        assert!(split_hint_from_plane(&Array2::<f32>::zeros((0, 4))).is_none());
+        assert!(split_hint_from_plane(&Array2::<f32>::zeros((3, 0))).is_none());
+    }
+
+    #[test]
+    fn non_finite_coefficients_are_ignored_rather_than_poisoning_the_hint() {
+        // The CROWN-succeeded-but-non-finite fallback arm can carry inf/NaN.
+        // One such entry must not make its whole column dominate the ordering.
+        let a = Array2::from_shape_vec((2, 2), vec![f32::INFINITY, 0.30, f32::NAN, 0.40])
+            .expect("shape");
+        let hint = split_hint_from_plane(&a).expect("finite column survives");
+        assert_eq!(hint[0], 0.0, "inf and NaN contribute nothing");
+        assert!((hint[1] - 0.40).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_hint_disagrees_with_width_which_is_the_entire_point() {
+        // Widths ascending, influence descending: a width-only selector picks
+        // dim 2, an influence-weighted one picks dim 0. Pinned so a future
+        // change that silently re-orders back to width fails here.
+        // The influence on dim 0 must beat the WIDTH advantage of dim 2:
+        // 50.0*0.1*0.5 = 2.5  vs  0.20*0.5*0.5 = 0.05  vs  0.01*2.0*0.5 = 0.01.
+        // (An earlier fixture used 0.90 here, which scores 0.045 and loses to
+        // dim 1 at 0.05 — it disagreed with width but not in the direction the
+        // assertion claimed. The gate caught that.)
+        let a = Array2::from_shape_vec((1, 3), vec![50.0, 0.20, 0.01]).expect("shape");
+        let hint = split_hint_from_plane(&a).expect("hint");
+        let widths = [0.1f32, 0.5, 2.0];
+        let by_width = (0..3)
+            .max_by(|x, y| widths[*x].total_cmp(&widths[*y]))
+            .unwrap();
+        let by_hint = (0..3)
+            .max_by(|x, y| (hint[*x] * widths[*x] * 0.5).total_cmp(&(hint[*y] * widths[*y] * 0.5)))
+            .unwrap();
+        assert_eq!(by_width, 2);
+        assert_eq!(
+            by_hint, 0,
+            "influence-weighted scoring must not equal width order"
+        );
+    }
+
+    #[test]
+    fn split_hint_ships_off() {
+        const {
+            assert!(
+                !SPLIT_HINT,
+                "disarmed the scorer is byte-identical: the hint is never read and \
+nothing writes the OnceLock"
+            )
+        };
     }
 }

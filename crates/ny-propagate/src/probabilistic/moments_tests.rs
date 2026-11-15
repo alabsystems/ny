@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Tests for higher-order moment propagation and Cornish-Fisher expansion.
-//! Part of #3921 / #4249.
 
 use super::*;
 use ndarray::{Array1, Array2, ArrayD, IxDyn};

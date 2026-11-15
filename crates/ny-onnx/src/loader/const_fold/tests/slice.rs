@@ -421,14 +421,14 @@ fn test_slice_constant_fold_avoice_pad_shape_chain() {
     );
     let flatten = graph.node.last().expect("flatten node missing");
     assert!(
-        super::super::ops::try_fold_all_const_node(flatten, &weights, false).is_some(),
+        super::super::ops::try_fold_all_const_node(flatten, &weights, false, false).is_some(),
         "final flatten node should be directly constant foldable"
     );
     assert_folded_tensor(&weights, "out", &[6], &[0.0, 0.0, 2.0, 0.0, 0.0, 2.0]);
 }
 
 /// Slice with start clamped to dim produces empty result.
-/// This is the #3206 scenario: Slice(start=2) on dim of size 1.
+/// Scenario: Slice(start=2) on dim of size 1.
 #[test]
 fn test_slice_constant_fold_empty_3206() {
     // data = [42.0] (size 1), starts=[2], ends=[10], axes=[0]

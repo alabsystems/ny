@@ -5,7 +5,6 @@
 //! IBP propagation entry points for sequential networks.
 //!
 //! Moved out of the sequential core module to break bidirectional dependency
-//! (#2380).
 
 use crate::network::ibp::NetworkIbpExt;
 use crate::network::Network;
@@ -220,7 +219,7 @@ impl Network {
         NetworkIbpExt::collect_crown_ibp_bounds_with_engine_and_status_impl(self, input, engine)
     }
 
-    /// Run CROWN-IBP with deadline enforcement (#3328).
+    /// Run CROWN-IBP with deadline enforcement.
     ///
     /// A local per-layer budget may select an IBP bound while the caller's
     /// deadline remains live. Exhausting the caller deadline itself is a typed
@@ -239,7 +238,7 @@ impl Network {
         )
     }
 
-    /// Run CROWN-IBP with pre-computed per-layer IBP bounds (#3397).
+    /// Run CROWN-IBP with pre-computed per-layer IBP bounds.
     ///
     /// Skips the internal IBP forward pass, using `precomputed_ibp` directly.
     /// Saves ~59s for soundnessbench-scale models where IBP is already available.
@@ -275,7 +274,7 @@ impl Network {
         )
     }
 
-    /// Run IBP forward pass and collect bounds at each layer with deadline (#3328).
+    /// Run IBP forward pass and collect bounds at each layer with deadline.
     pub fn collect_ibp_bounds_with_deadline(
         &self,
         input: &BoundedTensor,

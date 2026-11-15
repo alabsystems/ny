@@ -59,6 +59,8 @@
 mod certified_input_box;
 /// Full-coverage dual-network formula DNF extraction (relational gate-flip).
 pub mod dual_formula;
+/// Declaration-prelude probe: how many networks a property declares (#name-blind-routing).
+mod network_prelude;
 pub mod nonlinear;
 mod normalize;
 mod parser;
@@ -72,17 +74,22 @@ pub use certified_input_box::{
     load_vnnlib_with_certified_affine_property, load_vnnlib_with_certified_input_box,
     load_vnnlib_with_certified_scalar_moat, parse_vnnlib_with_certified_affine_property,
     parse_vnnlib_with_certified_input_box, parse_vnnlib_with_certified_scalar_moat,
-    CertifiedInputBox, CertifiedRelationalOutputAtom, CertifiedRelationalOutputConjunction,
-    CertifiedScalarMoat,
+    parse_vnnlib_with_certified_scalar_singleton_property,
+    parse_vnnlib_with_certified_singleton_batch_property, CertifiedInputBox,
+    CertifiedRelationalOutputAtom, CertifiedRelationalOutputConjunction, CertifiedScalarMoat,
+};
+/// Network-arity probe over a property's declaration prelude.
+pub use network_prelude::{
+    load_vnnlib_network_prelude, scan_network_prelude, NetworkPrelude, PreludeEnd,
 };
 /// VNN-LIB parsers for file-based and in-memory property specifications.
 pub use parser::{load_vnnlib, parse_vnnlib};
 pub use parser::{load_vnnlib_assignment_declarations, parse_vnnlib_assignment_declarations};
 /// Parsed VNN-LIB specification types and output-constraint representation.
 pub use spec::{
-    DeclaredNetwork, DualNetworkProperty, DualNetworkSpec, DualNetworkValidation,
-    IsomorphicAtomRelation, IsomorphicOutputAtom, NetworkRelation, OutputConstraint,
-    TensorDeclaration, TensorDeclarationKind, VnnLibSpec,
+    snap_box_outward_from_subnormals, DeclaredNetwork, DualNetworkProperty, DualNetworkSpec,
+    DualNetworkValidation, IsomorphicAtomRelation, IsomorphicOutputAtom, NetworkRelation,
+    OutputConstraint, TensorDeclaration, TensorDeclarationKind, VnnLibSpec,
 };
 
 #[cfg(test)]

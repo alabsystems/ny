@@ -103,7 +103,7 @@ fn flatten_bounds(bt: &BoundedTensor, total: usize) -> BoundedTensor {
     .unwrap()
 }
 
-/// Test BilinearCrown broadcast beyond the old seq=64 limit (#286).
+/// Test BilinearCrown broadcast beyond the old seq=64 limit.
 ///
 /// Key acceptance test: identity_for_attention blocked seq > 64 due to
 /// O(seq^4) dense identity. BilinearRelaxation avoids this entirely.
@@ -146,9 +146,7 @@ fn test_bilinear_broadcast_seq96_beyond_limit() {
     assert_bounds_no_nan_ordered("K", &bk);
 }
 
-/// R1 stall checkpoint: broadcast McCormick CROWN vs IBP (#3320).
-///
-/// Reference: designs/2026-03-04-286-attention-bilinear-alternative.md Phase 3
+/// R1 stall checkpoint: broadcast McCormick CROWN vs IBP.
 #[ntest::timeout(60000)]
 #[test]
 fn test_broadcast_mccormick_vs_ibp_stall_gate_3320() {
@@ -205,9 +203,7 @@ fn test_broadcast_mccormick_vs_ibp_stall_gate_3320() {
     );
 }
 
-/// Scalability: broadcast McCormick at seq=128 (#3320 AC4).
-///
-/// Reference: designs/2026-03-04-286-attention-bilinear-alternative.md
+/// Scalability: broadcast McCormick at seq=128.
 #[ntest::timeout(120000)]
 #[test]
 fn test_bilinear_broadcast_seq128_scalability_3320() {

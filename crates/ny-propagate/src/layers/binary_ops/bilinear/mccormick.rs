@@ -122,3 +122,99 @@ pub(crate) fn interpolated_mccormick(
 
     (alpha_l, beta_l, ny_l, alpha_u, beta_u, ny_u)
 }
+
+/// `∂/∂r` of the interpolated McCormick plane, evaluated at `(x, y)`, in f64.
+///
+/// [`interpolated_mccormick`] is affine in its parameter: the lower plane is
+/// `L(r) = L2 + r·(L1 − L2)` and the upper plane `U(r) = U2 + r·(U1 − U2)`, so
+/// the derivative is the difference of the two supporting planes at the point:
+///
+/// ```text
+/// lower: (L1 − L2)(x, y) = (y_l − y_u)·x + (x_l − x_u)·y + (x_u·y_u − x_l·y_l)
+/// upper: (U1 − U2)(x, y) = (y_u − y_l)·x + (x_l − x_u)·y + (x_u·y_l − x_l·y_u)
+/// ```
+///
+/// #vit-margin-alpha (B4) uses it as the envelope-theorem steering gradient of
+/// a lower bound in the interpolation parameter. It is NEVER part of a bound:
+/// any parameter the optimizer reaches is clamped into `[0, 1]`, where
+/// [`interpolated_mccormick`] certifies the plane.
+#[inline]
+pub(crate) fn interpolated_plane_derivative(
+    x_l: f64,
+    x_u: f64,
+    y_l: f64,
+    y_u: f64,
+    x: f64,
+    y: f64,
+    lower: bool,
+) -> f64 {
+    if lower {
+        (y_l - y_u) * x + (x_l - x_u) * y + (x_u * y_u - x_l * y_l)
+    } else {
+        (y_u - y_l) * x + (x_l - x_u) * y + (x_u * y_l - x_l * y_u)
+    }
+}
+
+#[cfg(test)]
+mod interpolated_plane_derivative_tests {
+    use super::{interpolated_mccormick, interpolated_plane_derivative};
+
+    /// The derivative is the difference of the r=1 and r=0 planes. Checked
+    /// against the certified planes [`interpolated_mccormick`] actually
+    /// returns: their COEFFICIENTS are exact functions of r (rounded to f32),
+    /// so the linear part must match to f32 rounding, and the certified
+    /// constants may differ only by the outward certification slack.
+    #[test]
+    fn interpolated_plane_derivative_is_the_r1_minus_r0_plane_difference() {
+        let boxes: [(f32, f32, f32, f32); 4] = [
+            (-1.0, 2.0, -0.5, 3.0),
+            (0.25, 0.75, -2.0, -1.0),
+            (-3.0, -1.0, 1.5, 4.0),
+            (-0.125, 0.0625, -0.25, 0.5),
+        ];
+        for &(x_l, x_u, y_l, y_u) in &boxes {
+            let (al1, bl1, cl1, au1, bu1, cu1) =
+                interpolated_mccormick(x_l, x_u, y_l, y_u, 1.0, 1.0);
+            let (al0, bl0, cl0, au0, bu0, cu0) =
+                interpolated_mccormick(x_l, x_u, y_l, y_u, 0.0, 0.0);
+            for &(tx, ty) in &[(0.0f64, 0.0f64), (1.0, 1.0), (0.3, 0.7), (0.9, 0.2)] {
+                let x = f64::from(x_l) + tx * (f64::from(x_u) - f64::from(x_l));
+                let y = f64::from(y_l) + ty * (f64::from(y_u) - f64::from(y_l));
+                let plane =
+                    |a: f32, b: f32, c: f32| f64::from(a) * x + f64::from(b) * y + f64::from(c);
+                let fd_lower = plane(al1, bl1, cl1) - plane(al0, bl0, cl0);
+                let fd_upper = plane(au1, bu1, cu1) - plane(au0, bu0, cu0);
+                let d_lower = interpolated_plane_derivative(
+                    f64::from(x_l),
+                    f64::from(x_u),
+                    f64::from(y_l),
+                    f64::from(y_u),
+                    x,
+                    y,
+                    true,
+                );
+                let d_upper = interpolated_plane_derivative(
+                    f64::from(x_l),
+                    f64::from(x_u),
+                    f64::from(y_l),
+                    f64::from(y_u),
+                    x,
+                    y,
+                    false,
+                );
+                let scale =
+                    1.0 + f64::from(x_l.abs().max(x_u.abs())) * f64::from(y_l.abs().max(y_u.abs()));
+                assert!(
+                    (fd_lower - d_lower).abs() <= 1e-5 * scale,
+                    "lower derivative {d_lower} vs plane difference {fd_lower} on box \
+                     x=[{x_l},{x_u}] y=[{y_l},{y_u}] at ({x},{y})"
+                );
+                assert!(
+                    (fd_upper - d_upper).abs() <= 1e-5 * scale,
+                    "upper derivative {d_upper} vs plane difference {fd_upper} on box \
+                     x=[{x_l},{x_u}] y=[{y_l},{y_u}] at ({x},{y})"
+                );
+            }
+        }
+    }
+}

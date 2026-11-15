@@ -123,7 +123,7 @@ impl PickedDomains {
                     // Neuron is unstable if l < 0 && u > 0.
                     // NaN bounds are conservatively treated as unstable — both
                     // NaN < 0 and NaN > 0 return false, so without this guard
-                    // NaN-bounded neurons would be classified as stable (#2246).
+                    // NaN-bounded neurons would be classified as stable.
                     if (l < 0.0 && u > 0.0) || l.is_nan() || u.is_nan() {
                         // Check if already constrained
                         let key = (relu_name.clone(), neuron_idx);
@@ -209,7 +209,7 @@ impl PickedDomains {
                 )?;
 
                 // Skip neurons with NaN bounds — NaN intercept scores would
-                // corrupt branch selection via map_or(true, ...) (#2246).
+                // corrupt branch selection via map_or(true,...).
                 if l.is_nan() || u.is_nan() {
                     continue;
                 }

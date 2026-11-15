@@ -124,9 +124,9 @@ impl WgpuDevice {
 
 #[cfg(all(test, feature = "gpu-tests"))]
 mod tests {
-    use crate::wgpu_device::test_support::{
-        gpu_test_serial_guard, require_device, require_verdict_device,
-    };
+    #[cfg(feature = "gpu-tests-uncharged")]
+    use crate::wgpu_device::test_support::require_verdict_device;
+    use crate::wgpu_device::test_support::{gpu_test_serial_guard, require_device};
     use ny_core::{GpuCrownBackward, GpuCrownLayer, GpuCrownSeed, NyError};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -193,6 +193,7 @@ mod tests {
     /// #w4-refresh-deadline: the sound resident layer walk checks the same
     /// deadline between layer folds (covers the un-batched sound seeded path).
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn sound_resident_walk_honors_cooperative_deadline() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();

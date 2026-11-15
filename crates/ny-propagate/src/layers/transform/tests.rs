@@ -104,7 +104,7 @@ fn gather_ibp_static_indices_axis0() {
     assert_eq!(output.upper().as_slice().unwrap(), &[2.0, 3.0, 6.0, 7.0]);
 }
 
-/// Gather axis 1, contiguous indices (formerly hit reshape bug #1724, now fixed).
+/// Gather axis 1, contiguous indices (formerly hit a reshape bug).
 #[ntest::timeout(5000)]
 #[test]
 fn gather_ibp_axis1_contiguous() {
@@ -122,7 +122,7 @@ fn gather_ibp_axis1_contiguous() {
     assert_eq!(output.upper().as_slice().unwrap(), &[2.0, 3.0, 5.0, 6.0]);
 }
 
-/// Gather axis 1 with reordered indices (formerly hit reshape bug #1724, now fixed).
+/// Gather axis 1 with reordered indices (formerly hit a reshape bug).
 #[ntest::timeout(5000)]
 #[test]
 fn gather_ibp_axis1_reordered() {
@@ -897,7 +897,7 @@ fn transpose_batched_crown_backward_multi_batch() {
     );
 }
 
-// ==================== SliceLayer CROWN panic cliff regression (#2759) ====================
+// ==================== SliceLayer CROWN panic cliff regression ====================
 
 /// CROWN backward with start > end must return Err, not panic from usize underflow.
 #[ntest::timeout(5000)]
@@ -985,7 +985,7 @@ fn slice_crown_with_bounds_start_gt_end_returns_err_2759() {
     );
 }
 
-/// Regression test for #3206: Slice with start exceeding axis size must clamp start
+/// Regression test: Slice with start exceeding axis size must clamp start
 /// (not just end) and produce the "empty after clamping" error.
 /// This is the exact scenario from linearizenn: Slice(axis=0, start=2, end=large)
 /// on an input of size 1 at axis 0.
@@ -1008,7 +1008,7 @@ fn slice_start_exceeds_axis_size_clamped_3206() {
     );
 }
 
-/// Regression test for #3206 (lsnc variant): Slice(axis=0, start=1, end=large)
+/// Regression test (lsnc variant): Slice(axis=0, start=1, end=large)
 /// on an input of size 1 at axis 0. After clamping: start=1, end=1 → empty.
 #[ntest::timeout(5000)]
 #[test]

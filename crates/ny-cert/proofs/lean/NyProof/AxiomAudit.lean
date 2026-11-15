@@ -47,6 +47,30 @@ import NyProof.CersyveInstance_Pendulum
 import NyProof.CersyveInstance_Unicycle
 import NyProof.SignFusion
 import NyProof.IntegerInterval
+import NyProof.PrefixCover
+import NyProof.CenteredNormalization
+
+-- New 2026-10-08 reconstruction: structural cover only. Its explicit original
+-- predicate / all-member-bound premises do not certify floating-point pruning.
+-- AXIOM_AUDIT.txt is unchanged until the complete pinned overlay is executed.
+#print axioms NyProof.PrefixCover.covers_original_parent
+#print axioms NyProof.PrefixCover.member_contained_in_parent
+#print axioms NyProof.PrefixCover.exact_descriptor_count
+#print axioms NyProof.PrefixCover.destination_first
+#print axioms NyProof.PrefixCover.canonical_member_order
+#print axioms NyProof.PrefixCover.sibling_descriptor_correspondence
+#print axioms NyProof.PrefixCover.sibling_final_opposite
+#print axioms NyProof.PrefixCover.sibling_prefix_stops_at_first_opposite
+#print axioms NyProof.PrefixCover.sibling_has_no_later_phase
+#print axioms NyProof.PrefixCover.all_member_safety_transfer
+#print axioms NyProof.PrefixCover.common_lower_bound
+#print axioms NyProof.PrefixCover.strict_safety_of_all_member_bounds
+#print axioms NyProof.PrefixCover.unique_binary_member
+#print axioms NyProof.PrefixCover.exactly_one_binary_descriptor
+#print axioms NyProof.PrefixCover.closed_zero_overlap_control
+#print axioms NyProof.PrefixCover.descriptor_multiplicity_control
+#print axioms NyProof.PrefixCover.minimum_bound_control
+#print axioms NyProof.PrefixCover.maximum_member_bound_is_unsound_control
 
 -- The 6 cite-map grounding theorems (every CertifiedModuloCite rests on these):
 #print axioms Crownproof.farkas_premise_combination
@@ -305,3 +329,20 @@ import NyProof.IntegerInterval
 #print axioms Crownproof.IntegerInterval.post_sign_layer_even
 #print axioms Crownproof.IntegerInterval.softmax_cmp_iff
 #print axioms Crownproof.IntegerInterval.straddling_bound_pins_zero
+
+-- Source-centered exact-real normalization geometry; numeric/Rust transfer is separate.
+#print axioms NyProof.CenteredNormalization.squaredNorm_nonneg
+#print axioms NyProof.CenteredNormalization.dot_sq_le
+#print axioms NyProof.CenteredNormalization.denominator_pos
+#print axioms NyProof.CenteredNormalization.divided_abs_bound_of_sq
+#print axioms NyProof.CenteredNormalization.normalized_direction_bound
+#print axioms NyProof.CenteredNormalization.normalized_direction_bound_card
+#print axioms NyProof.CenteredNormalization.center_sum_zero
+#print axioms NyProof.CenteredNormalization.projected_dot_eq
+#print axioms NyProof.CenteredNormalization.dot_center_right_of_sum_zero
+#print axioms NyProof.CenteredNormalization.projected_normalized_direction_bound
+#print axioms NyProof.CenteredNormalization.centered_coordinate_sq_bound
+#print axioms NyProof.CenteredNormalization.normalized_coordinate_bound
+#print axioms NyProof.CenteredNormalization.normalized_centered_coordinate_bound
+#print axioms NyProof.CenteredNormalization.center_fin_one_zero
+#print axioms NyProof.CenteredNormalization.normalized_direction_with_constant

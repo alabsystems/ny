@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Kokoro vocoder prefix output-width smoke and ranking tests (#3520 Packet D).
+//! Kokoro vocoder prefix output-width smoke and ranking tests (Packet D).
 //!
 //! Proves the weak-region mining pipeline works on the Kokoro vocoder's
 //! CPU-viable prefix subgraph. Full-graph vocoder CROWN is too expensive
@@ -51,8 +51,6 @@ fn kokoro_prefix_region_spec(
 /// within CPU budget (~45s IBP + batched CROWN). The key proof:
 /// `mine_weak_regions_graph` works on a subgraph extracted from a
 /// multi-input model after `freeze_inputs` + prefix extraction.
-///
-/// Part of #3520 Packet D.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
 #[cfg(feature = "external-avoice")]
@@ -132,8 +130,6 @@ fn test_kokoro_prefix_training_signal_smoke_3520() {
 
 /// Multi-region ranking: mines 2 regions with different epsilons on the
 /// Kokoro vocoder prefix to prove the sweep ranks wider bounds higher.
-///
-/// Part of #3520 Packet D.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
 #[cfg(feature = "external-avoice")]

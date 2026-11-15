@@ -39,9 +39,8 @@ impl BoundPropagation for ExpLayer {
     /// (deep-stack IBP overflow saturation, dc9da0fde class) instead of
     /// aborting verification. Only NaN input bounds fail closed.
     ///
-    /// Category B per domain validation policy (designs/2026-02-07-domain-validation-policy.md):
-    /// exp is defined for all real inputs; overflow of the f32 range is a
-    /// sound saturation, not an error.
+    /// Category B per domain validation policy: exp is defined for all real
+    /// inputs; overflow of the f32 range is a sound saturation, not an error.
     #[inline]
     fn propagate_ibp(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
         // Guard: NaN input bounds fail closed — NaN carries no bound
@@ -54,10 +53,10 @@ impl BoundPropagation for ExpLayer {
 
         // Directed rounding: compute exp in f64 for precision, cast to f32 with
         // next_down/next_up to guarantee lower bounds round DOWN and upper bounds
-        // round UP. Raw f32 exp can round either direction. (#1483)
+        // round UP. Raw f32 exp can round either direction.
         // Range clamp: exp(x) >= 0 for all real x. next_down_f32 can push past
-        // zero for extreme underflow (e.g., exp(-1000) → 0 → -1e-45). (#3316)
-        // NaN-propagating: .max() swallows NaN (IEEE 754-2008). (#3316)
+        // zero for extreme underflow (e.g., exp(-1000) → 0 → -1e-45).
+        // NaN-propagating:.max() swallows NaN (IEEE 754-2008).
         let lower = input.lower().mapv(|x| {
             if x == f32::NEG_INFINITY {
                 // Exact limit: exp(-inf) = 0.
@@ -168,7 +167,7 @@ fn finite_exp_relaxation_or_fallback(relaxation: LinearRelaxation) -> LinearRela
 ///   slope_l = exp(m)                 [derivative of exp at m]
 ///   intercept_l = exp(m) * (1 - m)   [tangent: y = exp(m)*(x - m + 1)]
 ///
-/// **Numerical stability (#1745):** Intermediate computation uses f64 to prevent
+/// **Numerical stability:** Intermediate computation uses f64 to prevent
 /// catastrophic cancellation when pre-activation values are large. For x near 8,
 /// `exp(m) * (1 - m)` produces intercepts ~-20000 while slopes ~3000 yield
 /// `slope * x` ~24000. The 8x cancellation in `slope * x + intercept` loses ~3
@@ -186,7 +185,7 @@ pub fn exp_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
         return LinearRelaxation::nan_fallback();
     }
 
-    // Use f64 intermediates to prevent catastrophic cancellation (#1745).
+    // Use f64 intermediates to prevent catastrophic cancellation.
     let l64 = l as f64;
     let u64 = u as f64;
 

@@ -8,8 +8,6 @@
 //! appear in backward coefficients or IBP bounds, the propagation falls back
 //! to IBP instead of producing NaN output. These tests verify the guards
 //! produce sound (widened) bounds: lower → -Inf, upper → +Inf where needed.
-//!
-//! Part of #2912.
 
 use crate::tests::proptest_soundness::{sample_points, valid_interval, FP_TOLERANCE};
 use crate::*;
@@ -621,7 +619,7 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
-// #2439: End-to-end test: NaN in A-matrix → conservative output bounds
+// End-to-end test: NaN in A-matrix → conservative output bounds
 // ---------------------------------------------------------------------------
 // Validates the concretize proof boundary correctly detects a directly-built,
 // malformed carrier and falls back to conservative (maximally loose) bounds

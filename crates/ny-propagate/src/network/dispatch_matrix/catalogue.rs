@@ -32,13 +32,13 @@ use crate::layers::{
     IndexAddLayer, InstanceNorm1dLayer, IntervalConstLayer, Layer, LayerNormLayer, LeakyReLULayer,
     LinearLayer, LogLayer, LogSoftmaxLayer, LogSumExpLayer, MatMulLayer, MaxBinaryLayer,
     MaxPool2dLayer, MinBinaryLayer, MishLayer, MulBinaryLayer, MulConstantLayer, NonZeroLayer,
-    OpaqueSkipLayer, PReluLayer, PadLayer, PadMode, PowConstantLayer, ReLULayer, ReciprocalLayer,
-    ReduceMaxLayer, ReduceMeanLayer, ReduceMinLayer, ReduceSumLayer, ReshapeLayer, ResizeLayer,
-    RmsNormLayer, RopeLayer, RoundLayer, ScatterAddLayer, ScatterNdLayer, SelfAttentionLayer,
-    SeluLayer, ShrinkLayer, SiLULayer, SigmoidLayer, SignLayer, SinLayer, SkipMergeLayer,
-    SliceLayer, SnakeLayer, SoftmaxLayer, SoftplusLayer, SoftsignLayer, SqrtLayer, SqueezeLayer,
-    SubConstantLayer, SubLayer, TanLayer, TanhLayer, ThresholdedReluLayer, TileLayer, TopkLayer,
-    TopkOutputKind, TransposeLayer, TruncLayer, UnsqueezeLayer, WhereLayer,
+    OpaqueSkipLayer, PReluLayer, PadLayer, PadMode, PowConstantLayer, QdqPerturbationLayer,
+    ReLULayer, ReciprocalLayer, ReduceMaxLayer, ReduceMeanLayer, ReduceMinLayer, ReduceSumLayer,
+    ReshapeLayer, ResizeLayer, RmsNormLayer, RopeLayer, RoundLayer, ScatterAddLayer,
+    ScatterNdLayer, SelfAttentionLayer, SeluLayer, ShrinkLayer, SiLULayer, SigmoidLayer, SignLayer,
+    SinLayer, SkipMergeLayer, SliceLayer, SnakeLayer, SoftmaxLayer, SoftplusLayer, SoftsignLayer,
+    SqrtLayer, SqueezeLayer, SubConstantLayer, SubLayer, TanLayer, TanhLayer, ThresholdedReluLayer,
+    TileLayer, TopkLayer, TopkOutputKind, TransposeLayer, TruncLayer, UnsqueezeLayer, WhereLayer,
 };
 
 /// Feature width every catalogue sample is built at.
@@ -56,17 +56,36 @@ pub(super) const CATALOGUE_WIDTH: usize = 4;
 /// classified at compile time and a new variant still breaks the build. What
 /// these variants lack is a *runtime probe*, and that is a property of the
 /// variant, not of the guard.
-pub(super) const UNCONSTRUCTIBLE_VARIANTS: &[(&str, &str)] = &[(
-    "QdqPerturbation",
-    "`QdqPerturbationLayer::new` is its only constructor and it fails closed \
-     unconditionally — the FLOAT32 division/rounding/reconstruction envelope is not \
-     certified — so no `Layer::QdqPerturbation` value can exist. Do NOT add a \
-     test-only constructor to give this guard a sample: that would hand tests a \
-     layer whose relaxation is deliberately uncertified.",
-)];
+pub(super) const UNCONSTRUCTIBLE_VARIANTS: &[(&str, &str)] = &[];
 
 fn dense(n: usize) -> LinearLayer {
     LinearLayer::new(Array2::eye(n), Some(Array1::zeros(n))).expect("identity dense sample")
+}
+
+fn point_only(n: usize) -> crate::layers::PointLinearLayer {
+    let budget = crate::certify::work::WorkBudget::new(
+        None,
+        1 << 20,
+        1 << 20,
+        1 << 20,
+        16,
+        std::time::Duration::ZERO,
+    )
+    .expect("point-only catalogue budget");
+    let weights = Array2::eye(n);
+    crate::layers::PointLinearLayer::from_original_view(
+        weights.view(),
+        false,
+        None,
+        crate::layers::PointLinearBuildPolicy {
+            budget: &budget,
+            deadline: None,
+            max_resident_bytes: 1 << 20,
+            max_scratch_bytes: 1 << 20,
+            max_work: 1 << 20,
+        },
+    )
+    .expect("point-only catalogue sample")
 }
 
 fn ones(n: usize) -> ArrayD<f32> {
@@ -94,6 +113,7 @@ pub(super) fn canonical_layers() -> Vec<(&'static str, Layer)> {
     let n = CATALOGUE_WIDTH;
     vec![
         ("Linear", Layer::Linear(dense(n))),
+        ("PointLinear", Layer::PointLinear(point_only(n))),
         (
             "IntervalConst",
             Layer::IntervalConst(
@@ -376,8 +396,13 @@ pub(super) fn canonical_layers() -> Vec<(&'static str, Layer)> {
         ("Reciprocal", Layer::Reciprocal(ReciprocalLayer::new())),
         ("SkipMerge", Layer::SkipMerge(SkipMergeLayer::new())),
         ("OpaqueSkip", Layer::OpaqueSkip(OpaqueSkipLayer::new())),
-        // `QdqPerturbation` is deliberately ABSENT — see
-        // [`UNCONSTRUCTIBLE_VARIANTS`].
+        (
+            "QdqPerturbation",
+            Layer::QdqPerturbation(
+                QdqPerturbationLayer::try_certified(&[0.1], &[0], 0, 255)
+                    .expect("certified QDQ envelope sample"),
+            ),
+        ),
         (
             "EpsilonExpand",
             Layer::EpsilonExpand(EpsilonExpandLayer::uniform(0.01).expect("epsilon-expand sample")),

@@ -248,7 +248,7 @@ fn test_crown_silu_critical_interval_soundness() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_negative_affine_scale_mulconstant_then_relu() {
-    // Regression test for negative affine scaling in CROWN backward substitution (#306, #307).
+    // Regression test for negative affine scaling in CROWN backward substitution.
     //
     // Network: x -> (-1 * x) -> ReLU
     // Input: x ∈ [-1, 1]
@@ -275,7 +275,7 @@ fn test_crown_negative_affine_scale_mulconstant_then_relu() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_negative_affine_scale_batchnorm_then_relu() {
-    // Regression test for negative BatchNorm scale in CROWN backward substitution (#306, #307).
+    // Regression test for negative BatchNorm scale in CROWN backward substitution.
     //
     // BatchNorm is linear: y = scale * x + bias.
     // Choose scale=-1, bias=0 so this reduces to y = -x, then ReLU.
@@ -626,7 +626,7 @@ fn test_linear_bounds_concretize_negative_coeff() {
     );
 }
 
-/// Regression test for issue #1607: ReLU relaxation divide-by-zero when u ≈ l.
+/// Regression test: ReLU relaxation divide-by-zero when u ≈ l.
 ///
 /// When pre-activation bounds have near-zero width (u ≈ l), the ReLU relaxation
 /// slope/intercept calculation had a division by (u - l) which could produce

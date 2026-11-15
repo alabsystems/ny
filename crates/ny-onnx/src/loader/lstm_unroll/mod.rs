@@ -23,7 +23,7 @@
 //! Bidirectional LSTM: the ONNX spec stores weights as `[num_directions, ...]`.
 //! We split by direction, unroll forward (t=0→T-1) and reverse (t=T-1→0)
 //! independently, then concatenate outputs along the direction dimension.
-//! This enables the Kokoro duration predictor (#3497) BiLSTM + projection path.
+//! This enables the Kokoro duration predictor BiLSTM + projection path.
 //!
 //! ONNX LSTM spec: https://onnx.ai/onnx/operators/onnx__LSTM.html
 

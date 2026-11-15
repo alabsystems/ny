@@ -71,7 +71,7 @@ fn flatten_tensor_data(tensor: &ArrayD<f32>) -> Result<Cow<'_, [f32]>> {
     // as_slice_memory_order() returns data in whatever layout the array uses,
     // which is column-major for Fortran-order arrays — contradicting this
     // function's contract. Fortran-layout arrays fall through to the iterator
-    // path which always yields logical (row-major) order. Part of #2257.
+    // path which always yields logical (row-major) order.
     if let Some(slice) = tensor.as_slice() {
         Ok(Cow::Borrowed(slice))
     } else {

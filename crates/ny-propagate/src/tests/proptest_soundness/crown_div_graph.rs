@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Proptest soundness coverage for spec-guided graph Div CROWN (#3626).
+//! Proptest soundness coverage for spec-guided graph Div CROWN.
 //!
 //! These tests exercise the `spec_propagation.rs` Div handler directly through
 //! `GraphNetwork::propagate_crown_with_specs_and_engine`, covering both:
@@ -103,7 +103,7 @@ proptest! {
     ///
     /// Graph: `y = x / (x + c)` with `c = [4, 5]`.
     /// The positive denominator keeps the reciprocal well-defined while still
-    /// allowing mixed-sign numerators, which is the failure mode from #3626.
+    /// allowing mixed-sign numerators, which is the known failure mode.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_div_spec_guided_crown_elementwise(

@@ -7,6 +7,7 @@ use ny_core::{checked_shape_product, NyError, Result};
 use std::borrow::Cow;
 
 use super::ZonotopeTensor;
+use crate::rounding::add_up_f32;
 
 /// Checked shape product with overflow error, clamped to at least 1.
 fn checked_batch_size(shape: &[usize]) -> Result<usize> {
@@ -366,18 +367,29 @@ impl ZonotopeTensor {
                 result_coeffs[[i + 1, d]] = c1_d * a2[i] + c2_d * a1[i];
             }
 
-            let same_symbol_error: f32 = 0.5
-                * a1.iter()
-                    .zip(a2.iter())
-                    .map(|(&x, &y)| (x * y).abs())
-                    .sum::<f32>();
+            // ENCLOSURE RADIUS: every summand is an `.abs()`, so a round-to-nearest
+            // chain drifts systematically DOWNWARD and makes the zonotope too TIGHT.
+            // `intersect_zonotope_ibp` keeps the tighter of zonotope and IBP, so the
+            // certified IBP sibling cannot recover it. Accumulate UP.
+            //
+            // PARTIAL: this charges the two magnitude accumulations. It does NOT yet
+            // charge the rounding of the CENTER (`c1*c2 + 0.5*same_symbol_sum`) or of
+            // the LINEAR COEFFICIENTS (`c1*a2[i] + c2*a1[i]`) above, which the radius
+            // must also cover. Completing that needs the relaxation's derivation, not
+            // a directed-rounding substitution.
+            let mut same_symbol_mag: f32 = 0.0;
+            for (&x, &y) in a1.iter().zip(a2.iter()) {
+                same_symbol_mag = add_up_f32(same_symbol_mag, (x * y).abs());
+            }
+            // 0.5 is a power of two: the halving is exact, so no step is needed.
+            let same_symbol_error: f32 = 0.5 * same_symbol_mag;
             let mut cross_error: f32 = 0.0;
             for i in 0..n_errors {
                 for j in (i + 1)..n_errors {
-                    cross_error += (a1[i] * a2[j] + a1[j] * a2[i]).abs();
+                    cross_error = add_up_f32(cross_error, (a1[i] * a2[j] + a1[j] * a2[i]).abs());
                 }
             }
-            result_coeffs[[n_errors + 1, d]] = same_symbol_error + cross_error;
+            result_coeffs[[n_errors + 1, d]] = add_up_f32(same_symbol_error, cross_error);
         }
 
         let flat = Self {

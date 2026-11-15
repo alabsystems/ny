@@ -666,6 +666,7 @@ fn patches_6d_bias_widen_includes_coeff_error_times_bias_error_cross_term() {
         bias_err: ArrayD::ones(IxDyn(&[1])),
         num_channels: 1,
         channel_axis_hint: None,
+        exact_affine: None,
     };
     let make_side = || PatchesData {
         coeff_err: Some(Array1::ones(1)),
@@ -714,7 +715,7 @@ fn test_new_with_epsilon() {
 }
 
 /// CROWN backward with zero-valued spatial dimension should error, not panic
-/// with division-by-zero. (#2806)
+/// with division-by-zero.
 #[test]
 fn test_crown_backward_zero_spatial_dimension_returns_error() {
     // Shape [1, 2, 0]: batch=1, channels=2, spatial=0
@@ -745,7 +746,7 @@ fn test_crown_backward_zero_spatial_dimension_returns_error() {
 }
 
 /// Regression test: negative variance produces NaN scale, poisoning the
-/// entire CROWN backward chain. `new()` must reject this. (#2814)
+/// entire CROWN backward chain. `new()` must reject this.
 #[test]
 fn test_new_rejects_negative_variance() {
     let ny = ArrayD::from_shape_vec(IxDyn(&[2]), vec![1.0, 1.0]).unwrap();
@@ -804,7 +805,7 @@ fn test_new_accepts_zero_variance_with_epsilon() {
     );
 }
 
-// --- Rank-0 regression tests (#2868) ---
+// --- Rank-0 regression tests ---
 
 /// Rank-0 BoundedTensor must return Err, not panic, from BatchNorm IBP.
 #[test]
@@ -850,7 +851,7 @@ fn test_crown_rank0_returns_error_not_panic() {
     );
 }
 
-// --- from_scale_bias validation tests (#3339) ---
+// --- from_scale_bias validation tests ---
 
 #[test]
 fn test_from_scale_bias_rejects_shape_mismatch() {
@@ -947,6 +948,7 @@ fn test_bn_patches_6d_coeff_err_byte_identical_regression() {
         bias_err: ArrayD::from_shape_vec(IxDyn(&[2]), vec![2.0e-4_f32, 7.0e-6]).unwrap(),
         num_channels: 2,
         channel_axis_hint: None,
+        exact_affine: None,
     };
 
     // 6D patches [oc=2, oh=1, ow=2, ic=2, kh=2, kw=1]; out-neuron count 4.
@@ -1105,6 +1107,7 @@ fn public_literal_with_nonfinite_affine_is_refused_by_propagation() {
         bias_err: ArrayD::zeros(IxDyn(&[1])),
         num_channels: 1,
         channel_axis_hint: None,
+        exact_affine: None,
     };
     let point = ArrayD::zeros(IxDyn(&[1]));
     let input = BoundedTensor::new(point.clone(), point).unwrap();
@@ -1152,6 +1155,7 @@ fn make_bn_7d_fixture(
         bias_err: ArrayD::from_shape_vec(IxDyn(&[3]), vec![2.0e-4_f32, 7.0e-6, 4.5e-5]).unwrap(),
         num_channels: 3,
         channel_axis_hint: None,
+        exact_affine: None,
     };
     let shape = [2usize, 2, 2, 2, 3, 2, 2];
     let n: usize = shape.iter().product();
@@ -1286,6 +1290,7 @@ fn test_bn_anchored_charges_both_subnormal_center_flushes() {
         bias_err: ArrayD::from_shape_vec(IxDyn(&[1]), vec![0.0]).unwrap(),
         num_channels: 1,
         channel_axis_hint: None,
+        exact_affine: None,
     };
     let min_subnormal = f32::from_bits(1);
     let geometry = PatchGeometry::anchored(vec![0], vec![0]).unwrap();
@@ -1364,6 +1369,7 @@ fn test_bn_anchored_rejects_6d_row_count_mismatch_and_overflow_atomically() {
         bias_err: ArrayD::from_shape_vec(IxDyn(&[1]), vec![0.0]).unwrap(),
         num_channels: 1,
         channel_axis_hint: None,
+        exact_affine: None,
     };
     let geometry = PatchGeometry::anchored(vec![0], vec![0]).unwrap();
     let make_side = |geometry: PatchGeometry, output_shape| PatchesData {
@@ -1604,6 +1610,7 @@ fn test_bn_patches_7d_nonfinite_err_poisons_row_no_nan() {
         bias_err: ArrayD::from_shape_vec(IxDyn(&[3]), vec![0.0_f32, 0.0, 0.0]).unwrap(),
         num_channels: 3,
         channel_axis_hint: None,
+        exact_affine: None,
     };
 
     let run = |bounds: &PatchesLinearBounds| {
@@ -1690,6 +1697,7 @@ fn test_bn_patches_7d_err_channel_does_not_perturb_values() {
         bias_err: ArrayD::from_shape_vec(IxDyn(&[3]), vec![0.0_f32, 0.0, 0.0]).unwrap(),
         num_channels: 3,
         channel_axis_hint: None,
+        exact_affine: None,
     };
 
     let run = |layer: &BatchNormLayer, bounds| match layer.propagate_patches(bounds) {
@@ -1807,6 +1815,7 @@ fn test_propagate_linear_vectorized_matches_scalar_reference() {
                     bias_err: ArrayD::from_shape_vec(IxDyn(&[num_channels]), bias_err_v).unwrap(),
                     num_channels,
                     channel_axis_hint: None,
+                    exact_affine: None,
                 };
 
                 // Incoming linear bounds: finite A (with ~20% exact zeros to

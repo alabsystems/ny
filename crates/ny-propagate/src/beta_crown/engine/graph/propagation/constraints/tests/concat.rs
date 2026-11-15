@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Concat metadata and n-ary routing regressions (#1994, #2398).
+//! Concat metadata and n-ary routing regressions.
 
 use ndarray::{arr1, arr2};
 
@@ -48,7 +48,7 @@ fn build_concat_missing_shape_graph() -> GraphNetwork {
     graph
 }
 
-/// Regression test #1994: constrained backward Concat must fail fast when shape
+/// Regression test: constrained backward Concat must fail fast when shape
 /// metadata is unavailable, not synthesize a fake one-dimensional shape.
 #[test]
 fn test_constrained_backward_concat_missing_shape_metadata_errors_1994() {
@@ -105,10 +105,10 @@ fn test_constrained_backward_concat_missing_shape_metadata_errors_1994() {
 }
 
 // =========================================================================
-// Regression test for #2014: expect → Result for missing intermediates
+// Regression test: expect → Result for missing intermediates
 // =========================================================================
 
-/// Regression test #2014: `propagate_crown_with_graph_constraints_storing_intermediates`
+/// Regression test: `propagate_crown_with_graph_constraints_storing_intermediates`
 /// must return `Result` (not panic) when the backward pass fails to produce intermediates.
 ///
 /// The invariant (StoringIntermediates always produces Some) is maintained by
@@ -149,8 +149,8 @@ fn test_storing_intermediates_returns_result_not_panic_2014() {
     );
 }
 
-/// Regression test #2099/#2991: empty-input ReLU is now caught at construction
-/// time by GraphNode::try_new() arity validation (#2481, #2686).
+/// Regression test: empty-input ReLU is now caught at construction
+/// time by GraphNode::try_new() arity validation.
 #[ntest::timeout(5000)]
 #[test]
 fn test_constrained_backward_empty_inputs_relu_returns_invalid_spec_2099() {
@@ -168,7 +168,7 @@ fn test_constrained_backward_empty_inputs_relu_returns_invalid_spec_2099() {
 }
 
 // =========================================================================
-// Regression test for #2398: 3-input Concat routes through n-ary handler
+// Regression test: 3-input Concat routes through n-ary handler
 // =========================================================================
 
 /// Build a graph with three parallel Linear branches feeding into a single Concat.
@@ -211,7 +211,7 @@ fn build_three_input_concat_graph() -> GraphNetwork {
     graph
 }
 
-/// Regression test #2398: constraint forward pass must route 3-input Concat through
+/// Regression test: constraint forward pass must route 3-input Concat through
 /// the n-ary handler (propagate_ibp_nary), not the binary handler which only uses
 /// the first 2 inputs. Before the fix, the Concat check at line 250 was dead code
 /// because is_binary() (which includes Concat) matched first at line 229.

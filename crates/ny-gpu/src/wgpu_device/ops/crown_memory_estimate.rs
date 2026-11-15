@@ -2,13 +2,11 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Upfront memory estimation for GPU CROWN backward (#3515).
+//! Upfront memory estimation for GPU CROWN backward.
 //!
 //! Computes a conservative memory footprint estimate before allocating any
 //! GPU buffers, enabling the memory budget gate in `crown_backward_gpu()` to
 //! reject oversized workloads and fall back to CPU CROWN backward.
-//!
-//! Reference: designs/2026-03-10-issue-3515-gpu-memory-bounded-crown-backward.md
 
 use ny_core::GpuCrownLayer;
 
@@ -20,7 +18,7 @@ use super::crown_backward_types::{conv2d_buffer_sizes, layer_input_dim, layer_ou
 /// effective budget is `min(system_ram / 2, 8 GiB)` unless overridden.
 const DEFAULT_GPU_MEMORY_BUDGET_MB: usize = 8192;
 
-/// Upfront memory estimate for GPU CROWN backward (#3515).
+/// Upfront memory estimate for GPU CROWN backward.
 ///
 /// Aggregates A-matrix ping-pong buffers, conv intermediates, weight/bias
 /// uploads, and miscellaneous staging buffers. Includes the 1.2× growth factor
@@ -42,7 +40,7 @@ pub fn estimate_crown_backward_peak_bytes(layers: &[GpuCrownLayer], num_specs: u
     estimate_crown_backward_memory(layers, num_specs).total_bytes
 }
 
-/// Estimate GPU CROWN backward memory before allocating any buffers (#3515).
+/// Estimate GPU CROWN backward memory before allocating any buffers.
 ///
 /// This is the Tier 1 estimate from the design doc. It computes the total
 /// memory footprint based on layer topology and num_specs, then applies the
@@ -124,7 +122,7 @@ pub(crate) fn estimate_crown_backward_memory(
     }
 }
 
-/// Get the GPU CROWN memory budget in bytes (#3515).
+/// Get the GPU CROWN memory budget in bytes.
 ///
 /// Priority: `NY_GPU_MEMORY_BUDGET_MB` env var > `min(system_ram / 2, 8 GiB)`.
 pub fn gpu_memory_budget_bytes() -> usize {

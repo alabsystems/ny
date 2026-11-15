@@ -15,10 +15,5 @@ bab:
   branching:
     method: input
     candidates: 10
-    reduceop: max
     input_split:
       enable: true
-  beta_crown:
-    lr_alpha: 0.1
-    lr_beta: 0.15
-    iterations: 15

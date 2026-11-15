@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-// Only `tests/whisper/` uses this, and that module is external-whisper
+// Only `src/tests/whisper/` uses this, and that module is external-whisper
 // content; under `benchmarks` alone the import was present but unused.
 #[cfg(feature = "external-whisper")]
 use crate::MultiBlockConfig;

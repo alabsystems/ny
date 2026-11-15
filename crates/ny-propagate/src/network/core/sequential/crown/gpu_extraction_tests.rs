@@ -7,8 +7,6 @@
 //! These tests cover constant expansion, constant-arithmetic layer lowering,
 //! Conv1d -> height-1 Conv2d metadata translation, unsupported-layer fallback,
 //! and dynamic activation refresh through the extraction cache.
-//!
-//! Part of #4205.
 
 use super::*;
 use crate::layers::{
@@ -81,7 +79,7 @@ fn assert_activation_descriptor(
 }
 
 // Retained for dual-alpha cases (e.g. divergent lower/upper alpha); the
-// stable/no-mask tests now expect the compact `Activation` descriptor (#4313).
+// stable/no-mask tests now expect the compact `Activation` descriptor.
 #[allow(dead_code)]
 fn assert_dual_alpha_activation_descriptor(
     layer: &GpuCrownLayer,
@@ -493,14 +491,14 @@ fn test_extract_gpu_crown_layers_cached_refreshes_dynamic_maxpool_routing() -> R
     Ok(())
 }
 
-// --- Alpha-aware ReLU GPU extraction tests (#4312) ---
+// --- Alpha-aware ReLU GPU extraction tests ---
 
 #[test]
 fn test_extract_relu_gpu_layer_with_alpha_stable_positive_uses_identity() {
     // l >= 0: always-active neurons ignore alpha entirely.
     //
     // No neuron has diverging lower/upper alpha (all are stable), so the
-    // four-slice dual-alpha upgrade (#4313) is unnecessary and extraction emits
+    // four-slice dual-alpha upgrade is unnecessary and extraction emits
     // the compact single-slope `Activation` descriptor — which encodes the exact
     // same identity relaxation (slope 1, intercept 0).
     let layer = extract_relu_gpu_layer_with_alpha(
@@ -593,7 +591,7 @@ fn test_extract_relu_gpu_layer_with_alpha_crossing_without_mask_uses_heuristic()
     );
     // With no neuron in the unstable mask, no dual-alpha divergence exists, so
     // alpha extraction emits the compact single-slope `Activation` descriptor
-    // (#4313) — identical to the standalone heuristic extraction. Both must be
+    // — identical to the standalone heuristic extraction. Both must be
     // `Activation` with element-wise equal slopes/intercepts.
     match (&layer_alpha, &heuristic_layers[0]) {
         (

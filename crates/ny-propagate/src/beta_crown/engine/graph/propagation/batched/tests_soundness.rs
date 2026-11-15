@@ -159,7 +159,6 @@ fn test_propagate_crown_with_batched_domains_full_contains_samples_2769() {
 /// Dense-spec batched backward through `propagate_crown_batched_with_context_specs`.
 /// Exercises the full dense-spec pipeline: forward pass, spec-seeded backward,
 /// and concretize with `input_linear` preservation.
-/// Part of #4116 — resolves dead-code warnings for staging API.
 #[test]
 fn test_batched_specs_contains_samples_and_preserves_input_linear_4116() {
     let graph = build_single_relu_graph_for_batched_soundness_tests();
@@ -189,7 +188,6 @@ fn test_batched_specs_contains_samples_and_preserves_input_linear_4116() {
 
 /// Dense-spec batched backward with lA capture.
 /// Exercises `propagate_crown_batched_with_context_specs_capture_la`.
-/// Part of #4116 — resolves dead-code for `BatchedSpecBackwardResult`.
 #[test]
 fn test_batched_specs_capture_la_returns_result_4116() {
     let graph = build_single_relu_graph_for_batched_soundness_tests();
@@ -858,6 +856,700 @@ fn graft_composed_bound_encloses_true_forward_on_split_conv_chain_mo_graft() {
     }
 }
 
+/// #chain-wide S2 differential oracle (FC / pure Linear-ReLU chain, typed
+/// `bab.chain_wide` + `bab.beta_graft`).
+///
+/// Four properties, each load-bearing for the S2 ship:
+///
+/// 1. REACHABLE: with `bab_chain_wide` + `mo_beta_graft` armed, a GRAFT call
+///    (`graft_pure_chain = true`) on an FC graph must ENTER the wide GPU
+///    stacker (the historical `EntryGraphNotConv` decline lifts) and return a
+///    bound — the exact routing the 2026-08-30 probes measured as VOID.
+/// 2. NO REPLACEMENT PATH: a NON-graft call on the same FC graph must still
+///    decline even when armed — the wide-chain base relaxation is measured
+///    2.4-2.9x LOOSER than the dense backward, so on FC the wide bound may
+///    only be captured and composed elementwise-tightest, never returned.
+/// 3. TYPED KEY IS THE GATE: the same graft call with the DEFAULT config must
+///    decline (routing byte-identical unarmed).
+/// 4. NEVER-LOOSER + ENCLOSURE: through the full composed driver, the lane-on
+///    bound must be elementwise at least as tight as the lane-off dense
+///    bound, and BOTH must enclose the true network spec values at every
+///    premise-satisfying sample of each child subdomain.
+#[test]
+fn fc_chain_wide_graft_composed_never_looser_than_dense_and_encloses_samples() {
+    let _env = crate::tests::lock_env_shared();
+    use crate::beta_crown::branching::GraphNeuronConstraint;
+    use std::collections::HashMap;
+
+    // Env guards: any of these would silently change one leg's routing and
+    // void the differential (same rationale as the conv chain-wide oracle).
+    for (var, why) in [
+        ("NY_BAB_CHAIN_WIDE", "would arm the lane-off leg too"),
+        ("NY_MO_BETA_GRAFT", "would toggle the graft on both legs"),
+        (
+            "NY_RESNET_BETA_GPU",
+            "the wide lane could be force-disabled",
+        ),
+        (
+            "NY_INTERM_REFINE",
+            "the dense leg would consume refined caches",
+        ),
+        (
+            "NY_BAB_RESNET_BATCHED",
+            "forces one wide sub-path for both values",
+        ),
+    ] {
+        assert!(
+            std::env::var(var).is_err(),
+            "fc chain-wide oracle requires {var} to be unset ({why})"
+        );
+    }
+
+    let device = HermeticSoundGpuCrownEngine::default();
+    let engine: &dyn ny_core::GemmEngine = &device;
+    assert!(
+        engine
+            .as_gpu_crown_backward()
+            .is_some_and(|gpu| gpu.provides_sound_gpu_crown()),
+        "fc chain-wide oracle requires its injected sound CROWN backend"
+    );
+
+    // linear1 (2x2 identity) -> relu1 -> linear2 over x in [-1,1]^2:
+    // y = W2*relu(x) + b with W2 = [[0.5, 0.25], [-0.75, 1.0]], b = [0.1, -0.2].
+    let linear1 = LinearLayer::new(arr2(&[[1.0f32, 0.0], [0.0, 1.0]]), None).expect("linear1");
+    let linear2 = LinearLayer::new(
+        arr2(&[[0.5f32, 0.25], [-0.75, 1.0]]),
+        Some(arr1(&[0.1f32, -0.2])),
+    )
+    .expect("linear2");
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input("linear1", Layer::Linear(linear1)));
+    graph.add_node(GraphNode::new(
+        "relu1",
+        Layer::ReLU(ReLULayer),
+        vec!["linear1".to_string()],
+    ));
+    graph.add_node(GraphNode::new(
+        "linear2",
+        Layer::Linear(linear2),
+        vec!["relu1".to_string()],
+    ));
+    graph.set_output("linear2");
+    assert!(
+        !graph.has_conv_layers(),
+        "fixture must be a pure Linear/ReLU chain (FC)"
+    );
+    let output_dim = 2usize;
+
+    let input = BoundedTensor::new(
+        arr1(&[-1.0f32, -1.0]).into_dyn(),
+        arr1(&[1.0f32, 1.0]).into_dyn(),
+    )
+    .expect("input box");
+    let node_bounds = graph.collect_node_bounds(&input).expect("node bounds");
+    let root = GraphBabDomain::root(node_bounds, -10.0, 10.0, &input, false).expect("root");
+
+    // Production split machinery on relu1[0] (unstable over [-1,1]): the β
+    // entries correspond exactly to each child's premise.
+    let mk_child = |is_active: bool| {
+        root.with_constraint(
+            &graph,
+            GraphNeuronConstraint {
+                node_name: "relu1".to_string(),
+                neuron_idx: 0,
+                is_active,
+                score: 0.0,
+            },
+            false,
+        )
+        .expect("with_constraint")
+        .expect("feasible child")
+    };
+    let active = mk_child(true);
+    let inactive = mk_child(false);
+    assert!(
+        !active.beta_state.is_empty() && !inactive.beta_state.is_empty(),
+        "split children must carry β entries for their premises"
+    );
+    let doms = [&active, &inactive];
+    let n_domains = doms.len();
+
+    // Spec rows: [y0, y0 + y1].
+    let seed_rows: Vec<f32> = vec![1.0, 0.0, 1.0, 1.0];
+    let spec_matrix =
+        Array2::from_shape_vec((2, output_dim), seed_rows.clone()).expect("spec matrix");
+    let num_specs = 2usize;
+    let thresholds = [0.0f32, 0.0];
+    let row_verified = vec![vec![false, false], vec![false, false]];
+    let eligible = [true, true];
+    let depths = [1usize, 1];
+    let beta_opt = super::GpuBetaOptSpec {
+        thresholds: &thresholds,
+        row_verified: &row_verified,
+        eligible: &eligible,
+        depths: &depths,
+    };
+
+    let armed = BetaCrownVerifier::new(BetaCrownConfig {
+        bab_chain_wide: true,
+        mo_beta_graft: true,
+        ..Default::default()
+    });
+    let off = BetaCrownVerifier::new(BetaCrownConfig::default());
+
+    // --- Direct probes on the wide entry (engagement + gate closure) ---
+    let mut caches: Vec<HashMap<String, std::sync::Arc<BoundedTensor>>> =
+        Vec::with_capacity(n_domains);
+    let mut cinputs: Vec<BoundedTensor> = Vec::with_capacity(n_domains);
+    for d in doms {
+        let (cache, cin) = armed
+            .compute_constrained_forward_bounds(
+                &graph,
+                &d.input_bounds,
+                &d.history,
+                Some(&d.node_bounds),
+                None,
+            )
+            .expect("constrained forward");
+        caches.push(cache);
+        cinputs.push(cin);
+    }
+    let caches_ref: Vec<&HashMap<String, std::sync::Arc<BoundedTensor>>> = caches.iter().collect();
+    let beta_refs: Vec<Option<&crate::beta_crown::state::GraphBetaState>> =
+        doms.iter().map(|d| Some(&d.beta_state)).collect();
+    let alpha_refs: Vec<Option<&crate::beta_crown::state::GraphDomainAlphaState>> =
+        doms.iter().map(|d| Some(&d.alpha_state)).collect();
+    let probe = |v: &BetaCrownVerifier, opt: Option<&super::GpuBetaOptSpec<'_>>, graft: bool| {
+        v.try_gpu_beta_batched_resnet_opt(
+            &graph,
+            "linear2",
+            output_dim,
+            &seed_rows,
+            num_specs,
+            n_domains,
+            &caches_ref,
+            &cinputs,
+            &beta_refs,
+            &alpha_refs,
+            engine,
+            "fc-chain-wide-oracle",
+            opt,
+            graft,
+        )
+    };
+    // (1) armed + graft call: the FC wide stacker must be REACHABLE.
+    assert!(
+        probe(&armed, Some(&beta_opt), true).is_some(),
+        "armed graft call declined the FC pure chain — S2 lane unreachable. declines: {:?}",
+        ny_core::wide_lane_telemetry::wide_lane_decline_tally()
+            .into_iter()
+            .filter(|(_, n)| *n > 0)
+            .collect::<Vec<_>>()
+    );
+    // (2) armed + NON-graft call: must decline (no FC replacement path).
+    assert!(
+        probe(&armed, None, false).is_none(),
+        "armed NON-graft call took the wide FC bound — a 2.4-2.9x-looser \
+         REPLACEMENT path exists; the lane must be graft-composition only"
+    );
+    // (3) default config + graft call: must decline (typed key is the gate).
+    assert!(
+        probe(&off, Some(&beta_opt), true).is_none(),
+        "unarmed graft call entered the FC wide lane — bab.chain_wide is not \
+         the routing gate it claims to be"
+    );
+
+    // --- Full composed driver: lane-on vs lane-off ---
+    let domains: Vec<&GraphBabDomain> = vec![&active, &inactive];
+    let relu_names = vec!["relu1".to_string()];
+    let batched = BatchedDomains::from_graph_domains(&domains, &relu_names).expect("batched");
+    let run = |v: &BetaCrownVerifier| {
+        v.propagate_crown_with_batched_domains_full_specs_beta_opt(
+            &graph,
+            &domains,
+            &batched,
+            &spec_matrix,
+            engine,
+            Some(&beta_opt),
+        )
+        .expect("dense-spec propagation")
+    };
+    let baseline = run(&off);
+    let composed = run(&armed);
+    assert_eq!(baseline.results.len(), n_domains);
+    assert_eq!(composed.results.len(), n_domains);
+    assert!(
+        composed.optimized_betas.is_none(),
+        "graft must not return β* for child warm-starting"
+    );
+
+    // (4a) NEVER-LOOSER: composed = dense ∩ folded ∩ wide, elementwise.
+    for (dom_idx, (c, b)) in composed
+        .results
+        .iter()
+        .zip(baseline.results.iter())
+        .enumerate()
+    {
+        let cf = c.output_bounds.flatten();
+        let bf = b.output_bounds.flatten();
+        for row in 0..num_specs {
+            eprintln!(
+                "[fc-chain-wide-oracle] dom {dom_idx} row {row}: off=[{:.6}, {:.6}] \
+                 on=[{:.6}, {:.6}]",
+                bf.lower()[[row]],
+                bf.upper()[[row]],
+                cf.lower()[[row]],
+                cf.upper()[[row]],
+            );
+            assert!(
+                cf.lower()[[row]] >= bf.lower()[[row]] - 1e-5,
+                "dom {dom_idx} row {row}: lane-on lower {} LOOSER than lane-off {}",
+                cf.lower()[[row]],
+                bf.lower()[[row]],
+            );
+            assert!(
+                cf.upper()[[row]] <= bf.upper()[[row]] + 1e-5,
+                "dom {dom_idx} row {row}: lane-on upper {} LOOSER than lane-off {}",
+                cf.upper()[[row]],
+                bf.upper()[[row]],
+            );
+        }
+    }
+
+    // (4b) ENCLOSURE: true spec values at premise-satisfying grid samples must
+    // lie inside BOTH legs' bounds. relu1's pre-activation is x itself, so the
+    // active/inactive premise is the sign of x0.
+    let spec_vals = |x0: f32, x1: f32| {
+        let y0 = 0.5 * x0.max(0.0) + 0.25 * x1.max(0.0) + 0.1;
+        let y1 = -0.75 * x0.max(0.0) + x1.max(0.0) - 0.2;
+        [y0, y0 + y1]
+    };
+    let n = 8;
+    for (dom_idx, premise_active) in [(0usize, true), (1usize, false)] {
+        let on_bounds = composed.results[dom_idx].output_bounds.flatten();
+        let off_bounds = baseline.results[dom_idx].output_bounds.flatten();
+        let mut kept = 0usize;
+        for i0 in 0..=n {
+            for i1 in 0..=n {
+                let x0 = -1.0 + 2.0 * (i0 as f32) / (n as f32);
+                let x1 = -1.0 + 2.0 * (i1 as f32) / (n as f32);
+                if premise_active != (x0 >= 0.0) {
+                    continue;
+                }
+                kept += 1;
+                let vals = spec_vals(x0, x1);
+                for (row, &v) in vals.iter().enumerate() {
+                    for (leg, bounds) in [("lane-on", &on_bounds), ("lane-off", &off_bounds)] {
+                        let l = bounds.lower()[[row]];
+                        let u = bounds.upper()[[row]];
+                        assert!(
+                            l - 1e-4 <= v && v <= u + 1e-4,
+                            "dom {dom_idx} row {row}: value {v} at x=({x0}, {x1}) \
+                             escapes the {leg} bound [{l}, {u}]"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            kept >= 8,
+            "dom {dom_idx}: only {kept} premise-satisfying samples — oracle vacuous"
+        );
+    }
+}
+
+/// S3 oracle: per-disjunct-α children on the dense-spec batched adapter.
+///
+/// The S3 design map found a TEST GAP: nothing pinned the wave partition's
+/// per-disjunct-α term or the adapter's α provenance. These three tests pin
+/// the new law (docs/REGRESSION_FC_UNSAT_LOST_2026-08-14.md, S3 design map):
+///  (i)  children carrying `per_disjunct_alphas` ARE batchable — they enter
+///       the dense-spec set — while a genuinely disqualifying term (non-finite
+///       first objective) still excludes;
+///  (ii) on an FC fixture with production splits/β AND populated per-disjunct
+///       α, the dense adapter (which evaluates under the SHARED child α) is
+///       elementwise never looser than the exact per-child fallback (which
+///       uses the SAME shared α) beyond float-reorder tolerance, and both
+///       enclose sampled concrete objective values;
+///  (iii) an ascended-α install clears `per_disjunct_alphas` (coherence rule);
+///       an install that does NOT replace α preserves them (no blanket clear).
+mod s3_per_disjunct_alpha_dense_adapter_oracle {
+    use super::*;
+    use crate::beta_crown::branching::GraphNeuronConstraint;
+    use crate::beta_crown::domain::GraphCrownContext;
+    use crate::beta_crown::engine::graph::multi_objective::{
+        install_child_continuation_state, merge_pruned_objective_bounds,
+        multi_objective_child_batchable, prune_cached_las_for_targets,
+        prune_verified_multi_objective_targets, ChildContinuationStateProvenance,
+    };
+    use crate::beta_crown::state::GraphDomainAlphaState;
+    use crate::beta_crown::{
+        AlphaNeuronState, MultiObjectiveGraphBabDomain, MultiObjectiveTargets,
+    };
+
+    /// FC fixture (same network as the S2 FC chain-wide oracle above):
+    /// linear1 (2x2 identity) -> relu1 -> linear2 over x in [-1,1]^2 with
+    /// W2 = [[0.5, 0.25], [-0.75, 1.0]], b = [0.1, -0.2]. Objectives are the
+    /// two raw outputs; thresholds are unreachable so BOTH rows stay active
+    /// (an IBP-verified row would be pruned out of the differential).
+    fn fc_graph() -> GraphNetwork {
+        let linear1 = LinearLayer::new(arr2(&[[1.0f32, 0.0], [0.0, 1.0]]), None).expect("linear1");
+        let linear2 = LinearLayer::new(
+            arr2(&[[0.5f32, 0.25], [-0.75, 1.0]]),
+            Some(arr1(&[0.1f32, -0.2])),
+        )
+        .expect("linear2");
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input("linear1", Layer::Linear(linear1)));
+        graph.add_node(GraphNode::new(
+            "relu1",
+            Layer::ReLU(ReLULayer),
+            vec!["linear1".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "linear2",
+            Layer::Linear(linear2),
+            vec!["relu1".to_string()],
+        ));
+        graph.set_output("linear2");
+        graph
+    }
+
+    fn objectives() -> Vec<Vec<f32>> {
+        vec![vec![1.0f32, 0.0], vec![0.0f32, 1.0]]
+    }
+
+    const THRESHOLDS: [f32; 2] = [10.0, 10.0];
+
+    /// Concrete objective values (network outputs) at a sample point.
+    fn objective_vals(x0: f32, x1: f32) -> [f32; 2] {
+        let r0 = x0.max(0.0);
+        let r1 = x1.max(0.0);
+        [0.5 * r0 + 0.25 * r1 + 0.1, -0.75 * r0 + r1 - 0.2]
+    }
+
+    /// Root MO domain + a production split child (relu1[0] active) carrying a
+    /// populated shared α AND per-disjunct α that DIFFER from shared on
+    /// relu1[1] (the still-unstable neuron) — the non-vacuity shape the S3
+    /// oracle is about.
+    fn fixture() -> (
+        GraphNetwork,
+        BoundedTensor,
+        MultiObjectiveGraphBabDomain,
+        MultiObjectiveGraphBabDomain,
+    ) {
+        let graph = fc_graph();
+        let input = BoundedTensor::new(
+            arr1(&[-1.0f32, -1.0]).into_dyn(),
+            arr1(&[1.0f32, 1.0]).into_dyn(),
+        )
+        .expect("input box");
+        let node_bounds = graph.collect_node_bounds(&input).expect("node bounds");
+        let output = node_bounds
+            .get("linear2")
+            .expect("output bounds present")
+            .clone();
+        let objectives = objectives();
+        let obj_bounds = BetaCrownVerifier::objective_bounds_multi(&output, &objectives)
+            .expect("root objective bounds");
+        let root =
+            MultiObjectiveGraphBabDomain::root(node_bounds, obj_bounds, &input, &THRESHOLDS, false)
+                .expect("root MO domain");
+        assert!(
+            root.verified().iter().all(|&v| !v),
+            "fixture thresholds must keep every objective ACTIVE (else the \
+             differential is pruned vacuous)"
+        );
+
+        let mut child = root
+            .with_constraint(
+                &graph,
+                GraphNeuronConstraint {
+                    node_name: "relu1".to_string(),
+                    neuron_idx: 0,
+                    is_active: true,
+                    score: 1.0,
+                },
+                false,
+                &THRESHOLDS,
+            )
+            .expect("with_constraint")
+            .expect("feasible child");
+        assert!(
+            !child.beta_state().is_empty(),
+            "production split child must carry β entries for its premise"
+        );
+
+        // Shared α on the unstable neuron relu1[1].
+        child
+            .alpha_state
+            .insert("relu1".to_string(), 1, AlphaNeuronState::new(0.6));
+        // Per-disjunct α (one per absolute disjunct index) differing from
+        // shared on that neuron.
+        let mut pd0 = GraphDomainAlphaState::empty();
+        pd0.insert("relu1".to_string(), 1, AlphaNeuronState::new(0.2));
+        let mut pd1 = GraphDomainAlphaState::empty();
+        pd1.insert("relu1".to_string(), 1, AlphaNeuronState::new(0.9));
+        child.set_per_disjunct_alphas(vec![pd0, pd1]);
+
+        // Non-vacuity guard: the per-disjunct α actually differ from shared
+        // on >= 1 neuron.
+        let shared_alpha = child.alpha_state().alpha("relu1", 1);
+        let differing = child
+            .per_disjunct_alphas()
+            .expect("fixture carries per-disjunct α")
+            .iter()
+            .filter(|pd| (pd.alpha("relu1", 1) - shared_alpha).abs() > 1e-6)
+            .count();
+        assert!(
+            differing >= 1,
+            "fixture vacuous: no per-disjunct α differs from shared"
+        );
+
+        (graph, input, root, child)
+    }
+
+    /// (i) Partition law: per-disjunct-α children enter the dense-spec set;
+    /// a non-finite first objective still excludes.
+    #[test]
+    fn s3_partition_admits_per_disjunct_alpha_children_and_still_rejects_nonfinite() {
+        let _env = crate::tests::lock_env_shared();
+        let (_graph, _input, _root, child) = fixture();
+        let relu_nodes = vec!["relu1".to_string()];
+
+        assert!(child.per_disjunct_alphas().is_some());
+        let (relu_present, first_finite, batchable) =
+            multi_objective_child_batchable(true, true, &child, &relu_nodes);
+        assert!(relu_present && first_finite);
+        assert!(
+            batchable,
+            "#4355 S3: a child carrying per_disjunct_alphas must be BATCHABLE \
+             (the adapter evaluates it under the SHARED child α, exactly like \
+             the per-child fallback)"
+        );
+
+        // A genuinely disqualifying term still excludes.
+        let mut nonfinite = child.clone();
+        nonfinite.objective_bounds[0].0 = f32::NEG_INFINITY;
+        let (_, first_finite, batchable) =
+            multi_objective_child_batchable(true, true, &nonfinite, &relu_nodes);
+        assert!(
+            !first_finite && !batchable,
+            "non-finite first objective must still disqualify the child"
+        );
+        // And a missing relu node still excludes.
+        let (relu_present, _, batchable) = multi_objective_child_batchable(
+            true,
+            true,
+            &child,
+            &["relu_that_does_not_exist".to_string()],
+        );
+        assert!(!relu_present && !batchable);
+    }
+
+    /// (ii) Equivalence oracle: dense adapter vs the exact per-child fallback
+    /// on the per-disjunct-α child. Same shared α on both legs; never looser
+    /// beyond float-reorder tolerance; both enclose sampled concrete values.
+    #[test]
+    fn s3_dense_adapter_on_per_disjunct_alpha_child_never_looser_than_fallback_and_encloses() {
+        let _env = crate::tests::lock_env_shared();
+        // Env guards: any of these would change one leg's routing/merging and
+        // void the differential.
+        for (var, why) in [
+            ("NY_NOBRANCH_F64", "changes the adapter's merge policy"),
+            (
+                "NY_INTERM_REFINE",
+                "the adapter would consume refined caches",
+            ),
+            (
+                "NY_WIDE_ALPHA_UNSHARED",
+                "wide α ascent could persist ascended α",
+            ),
+            ("NY_MO_GPU_BATCH", "flips the single-pass lane routing"),
+        ] {
+            assert!(
+                std::env::var(var).is_err(),
+                "S3 equivalence oracle requires {var} to be unset ({why})"
+            );
+        }
+        let (graph, _input, root, child) = fixture();
+        let relu_nodes = vec!["relu1".to_string()];
+        let objectives = objectives();
+
+        let mut verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+        verifier.config.alpha_config.deadline = None;
+        // Pin the fallback to its skip-optimization branch (inherited β), the
+        // branch the dense adapter replaces 1:1 for non-β-opt depths.
+        verifier.config.beta_iterations = 0;
+
+        // Dense-spec adapter leg (the partition's batchable set).
+        let adapter_out = verifier
+            .batched_single_pass_multi_objective_children(
+                &graph,
+                &[&child],
+                &relu_nodes,
+                &objectives,
+                &THRESHOLDS,
+                &NaiveCpuGemmEngine,
+                false,
+            )
+            .expect("dense adapter must accept the per-disjunct-α child");
+        assert_eq!(adapter_out.len(), 1);
+        let (dense_bounds, _nodes, _beta, dense_alpha, _las, _pruned, _prov) = adapter_out[0]
+            .as_ref()
+            .unwrap_or_else(|e| panic!("dense adapter errored on the child: {e:?}"));
+        assert!(
+            dense_alpha.is_none(),
+            "CPU dense adapter must not fabricate an ascended α \
+             (optimized_alphas is dark unless NY_WIDE_ALPHA_UNSHARED=1)"
+        );
+
+        // Exact per-child fallback leg: replicate `eval_child`'s
+        // skip-optimization branch verbatim — SHARED child α, inherited β,
+        // parent node bounds.
+        let pruned =
+            prune_verified_multi_objective_targets(&objectives, &THRESHOLDS, child.verified());
+        assert_eq!(
+            pruned.active_indices.len(),
+            2,
+            "both objective rows must stay in the differential (kept-row floor)"
+        );
+        let targets = MultiObjectiveTargets::new(
+            &pruned.objectives,
+            &pruned.thresholds,
+            &pruned.verified_mask,
+        );
+        let pruned_las = prune_cached_las_for_targets(child.cached_las(), &pruned);
+        let context = GraphCrownContext::new_with_node_bounds_map(
+            &child.history,
+            None,
+            Some(&root.node_bounds),
+            Some(&NaiveCpuGemmEngine),
+        )
+        .with_alpha(child.alpha_state());
+        let (active_bounds, _node_cache, _cached) = verifier
+            .propagate_multi_objective_with_beta_and_cache(
+                &graph,
+                child.input_bounds.as_ref(),
+                &context,
+                child.beta_state(),
+                &targets,
+                &pruned_las,
+                true,
+            )
+            .expect("exact per-child fallback should propagate");
+        let fallback_bounds =
+            merge_pruned_objective_bounds(&child.objective_bounds, &pruned, active_bounds);
+        assert_eq!(dense_bounds.len(), fallback_bounds.len());
+
+        // Never looser beyond float-reorder tolerance (1e-4).
+        for (row, (d, f)) in dense_bounds.iter().zip(fallback_bounds.iter()).enumerate() {
+            eprintln!(
+                "[s3-pd-alpha-oracle] row {row}: fallback=[{:.6}, {:.6}] dense=[{:.6}, {:.6}]",
+                f.0, f.1, d.0, d.1
+            );
+            assert!(
+                d.0 >= f.0 - 1e-4,
+                "row {row}: dense lower {} LOOSER than exact fallback {}",
+                d.0,
+                f.0
+            );
+            assert!(
+                d.1 <= f.1 + 1e-4,
+                "row {row}: dense upper {} LOOSER than exact fallback {}",
+                d.1,
+                f.1
+            );
+        }
+
+        // Both legs enclose concrete objective values at premise-satisfying
+        // samples (relu1[0] active => x0 >= 0).
+        let n = 8;
+        let mut kept = 0usize;
+        for i0 in 0..=n {
+            for i1 in 0..=n {
+                let x0 = -1.0 + 2.0 * (i0 as f32) / (n as f32);
+                let x1 = -1.0 + 2.0 * (i1 as f32) / (n as f32);
+                if x0 < 0.0 {
+                    continue;
+                }
+                kept += 1;
+                let vals = objective_vals(x0, x1);
+                for (row, &v) in vals.iter().enumerate() {
+                    for (leg, bounds) in [("dense", dense_bounds), ("fallback", &fallback_bounds)] {
+                        let (l, u) = bounds[row];
+                        assert!(
+                            l - 1e-4 <= v && v <= u + 1e-4,
+                            "row {row}: value {v} at x=({x0}, {x1}) escapes the \
+                             {leg} bound [{l}, {u}]"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            kept >= 8,
+            "only {kept} premise-satisfying samples — oracle vacuous"
+        );
+    }
+
+    /// (iii) Coherence rule: an ascended-α install clears per-disjunct α; an
+    /// install that does NOT replace α preserves them.
+    #[test]
+    fn s3_ascended_alpha_install_clears_per_disjunct_alphas_plain_install_preserves() {
+        let _env = crate::tests::lock_env_shared();
+        let (_graph, _input, _root, child) = fixture();
+
+        // No-replacement install (alpha_state = None, Established): the
+        // ubiquitous inherited-α path must PRESERVE per-disjunct α (blanket
+        // clears are rejected by the S3 design map — they would degrade the
+        // sequential-lane per-disjunct evaluator's descendants).
+        let mut preserved = child.clone();
+        let nodes = preserved.node_bounds.to_shared_hash_map();
+        let beta = preserved.beta_state().clone();
+        install_child_continuation_state(
+            &mut preserved,
+            nodes,
+            beta,
+            None,
+            ChildContinuationStateProvenance::Established,
+        );
+        assert!(
+            preserved.per_disjunct_alphas().is_some(),
+            "install without α replacement must PRESERVE per_disjunct_alphas"
+        );
+
+        // Ascended-α install (alpha_state = Some, Established — the dense
+        // adapter's optimized_alphas shape, dark unless
+        // NY_WIDE_ALPHA_UNSHARED=1): must clear per-disjunct α so two
+        // inconsistent α families never coexist.
+        let mut ascended = child;
+        let mut new_alpha = ascended.alpha_state().clone();
+        new_alpha
+            .neuron_mut("relu1", 1)
+            .expect("unstable neuron carries α")
+            .set_alpha(0.37);
+        let nodes = ascended.node_bounds.to_shared_hash_map();
+        let beta = ascended.beta_state().clone();
+        install_child_continuation_state(
+            &mut ascended,
+            nodes,
+            beta,
+            Some(new_alpha),
+            ChildContinuationStateProvenance::Established,
+        );
+        assert!(
+            (ascended.alpha_state().alpha("relu1", 1) - 0.37).abs() < f32::EPSILON,
+            "the ascended α must actually replace the shared α"
+        );
+        assert!(
+            ascended.per_disjunct_alphas().is_none(),
+            "#4355 S3 coherence: an ascended-α install must clear \
+             per_disjunct_alphas"
+        );
+    }
+}
+
 /// #metaroom-chain-wide differential soundness oracle (`NY_BAB_CHAIN_WIDE`).
 ///
 /// The chain-wide lane routes PURE-CHAIN conv suffixes (`segments = [Chain(..)]`,
@@ -1011,11 +1703,7 @@ fn chain_wide_replacement_oracle_body() {
             prev = Some(cname.clone());
             if si + 1 < n_stages {
                 let rname = format!("relu{si}");
-                graph.add_node(GraphNode::new(
-                    &rname,
-                    Layer::ReLU(ReLULayer),
-                    vec![cname.clone()],
-                ));
+                graph.add_node(GraphNode::new(&rname, Layer::ReLU(ReLULayer), vec![cname]));
                 relu_names.push(rname.clone());
                 prev = Some(rname);
             }
@@ -1071,9 +1759,9 @@ fn chain_wide_replacement_oracle_body() {
         // Premise list per domain, for the sampling leg: (relu, neuron, is_active).
         type Premise = (String, usize, bool);
         let mut doms: Vec<(GraphBabDomain, Vec<Premise>)> = vec![
-            (root.clone(), vec![]),
+            (root, vec![]),
             (active.clone(), vec![(split_relu.clone(), j0, true)]),
-            (inactive.clone(), vec![(split_relu.clone(), j0, false)]),
+            (inactive, vec![(split_relu.clone(), j0, false)]),
         ];
         if fx.extra_splits > 0 {
             // Stack a second production split on the FIRST ReLU (deeper β state).
@@ -1083,16 +1771,13 @@ fn chain_wide_replacement_oracle_body() {
             let deep = mk_child(&active, &first_relu, j1, false);
             doms.push((
                 deep,
-                vec![
-                    (split_relu.clone(), j0, true),
-                    (first_relu.clone(), j1, false),
-                ],
+                vec![(split_relu.clone(), j0, true), (first_relu, j1, false)],
             ));
         }
         // α-state child: the active child with per-neuron α ∈ [0,1] on every ReLU
         // (both lanes consume the SAME GraphDomainAlphaState — the wide lane via
         // build_alpha_bridge, the dense lane via build_alpha_array).
-        let mut alpha_child = active.clone();
+        let mut alpha_child = active;
         for rname in &relu_names {
             let pre = graph
                 .nodes
@@ -1118,7 +1803,7 @@ fn chain_wide_replacement_oracle_body() {
                 .upper_neurons
                 .insert(rname.clone(), mk());
         }
-        doms.push((alpha_child, vec![(split_relu.clone(), j0, true)]));
+        doms.push((alpha_child, vec![(split_relu, j0, true)]));
 
         // --- Shared inputs for BOTH legs: the production constrained forward ---
         let n_domains = doms.len();
@@ -2557,4 +3242,86 @@ mod rebound_scratch_parity {
         // bit-identical on the lane the pool ALSO serves).
         parity_case(&[8, 120, 120, 8], "lsnc");
     }
+}
+
+/// #objective-tightening: the scalar-objective batched cores intersect the
+/// objective's CROWN interval with the output node's forward (IBP) box
+/// (#2904, `concretize_batched_results`). That box encloses `out`, not
+/// `c·out`, so it may only be intersected after the objective is applied.
+/// On this single-output net `out = relu(x)`, `x ∈ [-1, 1]`, the objective
+/// `[-1]` has true range `[-1, 0]` while the raw box is `[0, 1]`: intersecting
+/// the two gives `[0, 0]`, a lower bound above the true minimum `-1`
+/// (reached at `x = 1`). Both scalar-objective cores are checked, cold (no
+/// warm start), across objectives of either sign and a non-unit scale.
+#[test]
+fn batched_forward_tightening_applies_the_objective_2904() {
+    let graph = build_single_relu_graph_for_batched_soundness_tests();
+    let root = root_graph_domain_2769(&graph);
+    let domains = vec![&root];
+    let layer_names = vec!["relu1".to_string()];
+    let batched =
+        BatchedDomains::from_graph_domains(&domains, &layer_names).expect("batched domains");
+    let ctx = BatchedBackwardContext::from_domains(&domains, &batched).expect("valid context");
+    let objectives: [[f32; 1]; 3] = [[-1.0], [2.0], [1.0]];
+    let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+        enable_la_warm_start: false,
+        ..Default::default()
+    });
+    let mut violations = Vec::new();
+    let mut check = |site: &str, objective: f32, bounds: &BoundedTensor| {
+        let flat = bounds.flatten();
+        let (lower, upper) = (flat.lower()[[0]], flat.upper()[[0]]);
+        println!("[objective-tightening] site={site} c={objective} bounds=[{lower:e}, {upper:e}]");
+        for i in -10..=10 {
+            let x = f64::from(i) / 10.0;
+            let value = f64::from(objective) * x.max(0.0);
+            if f64::from(lower) > value || f64::from(upper) < value {
+                violations.push(format!(
+                    "{site} c={objective}: x={x} -> {value} outside [{lower:e}, {upper:e}]"
+                ));
+            }
+        }
+    };
+
+    for objective in &objectives {
+        let results = verifier
+            .propagate_crown_batched_with_context(&graph, &ctx, objective, &NaiveCpuGemmEngine)
+            .expect("scalar-objective batched pass");
+        check("scalar_core", objective[0], &results[0].0);
+    }
+
+    let input =
+        BoundedTensor::new(arr1(&[-1.0]).into_dyn(), arr1(&[1.0]).into_dyn()).expect("valid input");
+    let node_bounds: std::collections::HashMap<String, std::sync::Arc<BoundedTensor>> = graph
+        .collect_node_bounds(&input)
+        .expect("graph bounds should collect")
+        .into_iter()
+        .map(|(name, bounds)| (name, std::sync::Arc::new(bounds)))
+        .collect();
+    let plan = graph.dispatch_plan().expect("plan");
+    let n = objectives.len();
+    let result = verifier
+        .propagate_crown_batched_backward_core_per_domain_obj(
+            &graph,
+            n,
+            plan,
+            &vec![node_bounds; n],
+            &vec![input; n],
+            &vec![None; n],
+            &vec![None; n],
+            &objectives.iter().map(|o| o.to_vec()).collect::<Vec<_>>(),
+            &NaiveCpuGemmEngine,
+            false,
+            None,
+        )
+        .expect("per-domain-objective batched pass");
+    for (objective, (bounds, _)) in objectives.iter().zip(&result.results) {
+        check("per_domain_objective_core", objective[0], bounds);
+    }
+
+    assert!(
+        violations.is_empty(),
+        "a batched objective bound excludes a reachable objective value: {violations:#?}"
+    );
+    println!("[objective-tightening] TEST_COMPLETE name=batched_forward_tightening_applies_the_objective_2904");
 }

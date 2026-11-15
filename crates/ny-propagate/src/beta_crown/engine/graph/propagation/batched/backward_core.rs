@@ -10,7 +10,6 @@
 //!
 //! # Reference
 //! - alpha-beta-CROWN: `auto_LiRPA/bound_general.py` (backward pass)
-//! - Design: designs/2026-02-09-code-structure-wave2-graph-engine-split.md (Step 4.3)
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -129,7 +128,7 @@ pub(crate) fn force_batched_relu(mode: Option<bool>) {
 /// * `node_linear_bounds` - Indexed pending bounds carrier (updated in place)
 /// * `n_domains` - Batch size
 /// * `engine` - GPU compute engine
-/// * `deadline` - Per-node deadline for intra-kernel timeout (#3795)
+/// * `deadline` - Per-node deadline for intra-kernel timeout
 /// * `stack_domains` - Domain-stack conv/BN backwards into one dispatch call
 ///   (#cgan-batched-stack; `false` = historical per-domain loop, bit-identical)
 #[allow(clippy::too_many_arguments)]
@@ -158,7 +157,7 @@ pub(super) fn dispatch_node_backward(
         )));
     }
 
-    // Structural invariant: all parallel arrays must match n_domains. (#2824, #2637)
+    // Structural invariant: all parallel arrays must match n_domains.
     // Runtime check — debug_assert alone is compiled out in release builds,
     // leaving 15+ index sites unguarded against length mismatches.
     if constrained_inputs.len() != n_domains
@@ -302,7 +301,7 @@ pub(super) fn dispatch_node_backward(
                     bounds_caches[domain_idx],
                 )?;
                 // Same α source as the scalar arm: optimized α when present and
-                // non-empty (#1841), else `None` = heuristic (α = 1 if u > -l, else 0).
+                // non-empty, else `None` = heuristic (α = 1 if u > -l, else 0).
                 let alpha = match alpha_states[domain_idx] {
                     Some(alpha_state) if !alpha_state.is_empty() => {
                         let lower = alpha_state.build_alpha_array(node_name, pre_activation);
@@ -336,7 +335,7 @@ pub(super) fn dispatch_node_backward(
         }
 
         // Process ReLU for each domain (different pre-activation bounds).
-        // Uses optimized alpha values when available (#1841), falling back
+        // Uses optimized alpha values when available, falling back
         // to the heuristic (alpha = 1 if u > -l, else 0).
         for (domain_idx, lb_opt) in node_lbs.into_iter().enumerate() {
             let Some(lb) = lb_opt else { continue };
@@ -433,7 +432,7 @@ pub(super) fn dispatch_node_backward(
 }
 
 /// One domain of the scalar ReLU backward arm of [`dispatch_node_backward`]:
-/// optimized-α selection (#1841) or heuristic kernel, the eager per-row
+/// optimized-α selection or heuristic kernel, the eager per-row
 /// coefficient-error discharge over the per-domain pre-activation cut
 /// (#cgan-conv-err-compose), then the β contribution. Extracted verbatim so the
 /// SoA batched backward (#lsnc-batched-bwd, `batched_bwd.rs`) runs the
@@ -590,6 +589,17 @@ pub(super) fn generic_backward_domain(
         // Resolve the real predecessor when it is cached; degrade to the
         // historical network input otherwise (byte-identical fallback), since
         // this lookup is an accuracy aid, never a soundness precondition.
+        //
+        // #acasxu-addconst: the SAME wrong-operand bug class hit AddConstant
+        // when 06614908d bound its CROWN constants to proven broadcast layouts.
+        // acasxu's FC biases (`[50]` against a post-MatMul `[1,50]`) are in the
+        // proven set, but this lane handed the layer the NETWORK INPUT
+        // (`[1,1,1,5]`), so `backward_constant_columns_from_shape` refused with
+        // `ShapeMismatch`, dispatch escalated it as a hard error, and the whole
+        // batched-CROWN BaB lane aborted on its first batch — four banked unsat
+        // rows (walls 28.5-106.7 s) became deterministic full-window `unknown`.
+        // Passing the cached predecessor re-enters the already-proven arm; the
+        // layer's own fail-closed refusals for unproven layouts are untouched.
         resolve_pre_activation(&node.inputs, constrained_input, bounds_cache)
             .unwrap_or(constrained_input)
     } else {
@@ -646,9 +656,9 @@ pub(super) fn generic_backward_domain(
             } => {
                 require_inputs(2)?;
                 let (input_a_name, input_b_name) = require_binary_input_names()?;
-                // Accumulate bias exactly once (#2617)
+                // Accumulate bias exactly once
                 // Migrated from from_parts_unchecked: bias from dispatch
-                // could carry NaN. Zero A-matrices are always safe. See #3438.
+                // could carry NaN. Zero A-matrices are always safe.
                 // Match the flat-path helper and alpha-beta-CROWN's network-input
                 // carrier width: the bias channel targets NETWORK_INPUT, not the
                 // current branch-local intermediate width.
@@ -675,9 +685,9 @@ pub(super) fn generic_backward_domain(
                 bias_lower,
                 bias_upper,
             } => {
-                // Accumulate bias exactly once (#2617)
+                // Accumulate bias exactly once
                 // Migrated from from_parts_unchecked: bias from dispatch
-                // could carry NaN. Zero A-matrices are always safe. See #3438.
+                // could carry NaN. Zero A-matrices are always safe.
                 // Concat/split-path bias still lands on NETWORK_INPUT, so use the
                 // full network-input width instead of the first branch width.
                 let bias_lb = LinearBounds::new_or_conservative(
@@ -752,8 +762,8 @@ fn contextualize_generic_backward_error(
     error: NyError,
 ) -> NyError {
     match error {
-        // #3166: Catch UnsupportedOp and UnsupportedConfiguration.
-        // #2888: NumericalInstability also triggers fallback for consistency,
+        // Catch UnsupportedOp and UnsupportedConfiguration.
+        // NumericalInstability also triggers fallback for consistency,
         // though dispatch_backward_layer already converts it to Unsupported.
         NyError::UnsupportedOp(msg)
         | NyError::UnsupportedConfiguration(msg)
@@ -818,10 +828,10 @@ fn layer_needs_pre_activation_lookup(layer: &Layer) -> bool {
 ///
 /// Distinct from [`layer_needs_pre_activation_lookup`], whose layers hard-require
 /// the tensor: these resolve it opportunistically and fall back to the network
-/// input when the predecessor is not cached. See the `#lsnc-subconst` note at the
-/// call site.
+/// input when the predecessor is not cached. See the `#lsnc-subconst` and
+/// `#acasxu-addconst` notes at the call site.
 fn layer_prefers_pre_activation_lookup(layer: &Layer) -> bool {
-    matches!(layer, Layer::SubConstant(_))
+    matches!(layer, Layer::SubConstant(_) | Layer::AddConstant(_))
 }
 
 /// Resolve pre-activation bounds for a node's first input.
@@ -867,14 +877,14 @@ fn apply_beta_contribution(
     let Some(beta_state) = beta_state else {
         return;
     };
-    // Part of #2936: use indexed per-node iteration instead of O(B) full scan.
+    // Use indexed per-node iteration instead of O(B) full scan.
     for entry in beta_state.entries_for_node(node_name) {
         let j = entry.neuron_idx;
         if j >= new_lb.num_inputs() {
             continue;
         }
         let signed_beta = entry.signed_value();
-        // #2415/#2826: non-finite beta must be rejected before abs-threshold filtering.
+        // Non-finite beta must be rejected before abs-threshold filtering.
         if !signed_beta.is_finite() {
             tracing::warn!(
                 node_name,
@@ -946,7 +956,7 @@ mod tests {
     use ny_core::{GemmEngine, NaiveCpuGemmEngine, NyError, Result};
     use ny_test_utils::CountingGemmEngine;
 
-    use crate::layers::{Conv2dLayer, ConvTranspose2dLayer, Layer, LinearLayer};
+    use crate::layers::{AddConstantLayer, Conv2dLayer, ConvTranspose2dLayer, Layer, LinearLayer};
 
     use super::super::indexed_pending::IndexedPendingLinearBounds;
     use super::{apply_beta_contribution, resolve_pre_activation};
@@ -1051,6 +1061,128 @@ mod tests {
             .expect_err("bounded memory refusal must remain structured");
             assert!(error.is_cpu_memory_exceeded(), "wrong error: {error}");
         });
+    }
+
+    /// #acasxu-addconst: the batched graph-BaB lane must hand AddConstant the
+    /// CACHED PREDECESSOR bounds, not the network input. acasxu's FC biases are
+    /// rank-1 `[50]` constants whose true operand is the post-MatMul `[1,50]` —
+    /// a layout the proven from-shape arm certifies exactly — but with the
+    /// network input (`[1,1,1,5]`) as the operand the layer refuses with
+    /// `ShapeMismatch`, dispatch escalates it as a hard error, and the whole
+    /// batched-CROWN BaB lane aborts on its first batch (four banked unsat rows
+    /// became deterministic full-window `unknown`). Same bug class and same fix
+    /// shape as `#lsnc-subconst`.
+    #[test]
+    fn generic_backward_add_constant_resolves_the_cached_predecessor_shape() {
+        let d = 50usize;
+        let c: Vec<f32> = (0..d).map(|i| 0.5 * i as f32 - 10.0).collect();
+        let constant = ArrayD::from_shape_vec(IxDyn(&[d]), c.clone()).expect("constant tensor");
+        let node = GraphNode {
+            name: "Operation_6_Add".to_string(),
+            layer: Layer::AddConstant(AddConstantLayer::new(constant)),
+            inputs: vec!["Operation_6_MatMul".to_string()],
+        };
+        // The lane's `constrained_input` is the NETWORK INPUT — acasxu's is
+        // [1,1,1,5]. Handing it to AddConstant as the operand was the bug.
+        let network_input = BoundedTensor::new(
+            ArrayD::zeros(IxDyn(&[1, 1, 1, 5])),
+            ArrayD::ones(IxDyn(&[1, 1, 1, 5])),
+        )
+        .expect("network input box");
+        let mut bounds_cache: HashMap<String, Arc<BoundedTensor>> = HashMap::new();
+        bounds_cache.insert(
+            "Operation_6_MatMul".to_string(),
+            Arc::new(
+                BoundedTensor::new(ArrayD::zeros(IxDyn(&[1, d])), ArrayD::ones(IxDyn(&[1, d])))
+                    .expect("predecessor box"),
+            ),
+        );
+        let mut published: Vec<(String, LinearBounds)> = Vec::new();
+        let mut sink = |name: &str, lb: LinearBounds| -> Result<()> {
+            published.push((name.to_string(), lb));
+            Ok(())
+        };
+
+        super::generic_backward_domain(
+            "Operation_6_Add",
+            &node,
+            LinearBounds::identity(d),
+            &network_input,
+            &bounds_cache,
+            5,
+            &NaiveCpuGemmEngine,
+            None,
+            None,
+            &mut sink,
+        )
+        .expect("cached predecessor shape must admit the proven FC-bias CROWN arm");
+
+        assert_eq!(published.len(), 1, "exactly one predecessor publication");
+        assert_eq!(published[0].0, "Operation_6_MatMul");
+        let lb = &published[0].1;
+        // Identity coefficients and zero incoming bias: the substituted bias IS
+        // the constant (up to one directed-rounding ulp per endpoint).
+        for (j, cj) in c.iter().enumerate() {
+            assert!(
+                (lb.lower_b[j] - cj).abs() < 1e-4 && (lb.upper_b[j] - cj).abs() < 1e-4,
+                "bias[{j}]: expected {cj}, got [{}, {}]",
+                lb.lower_b[j],
+                lb.upper_b[j],
+            );
+        }
+    }
+
+    /// Companion control for #acasxu-addconst: when the predecessor is NOT
+    /// cached, the lookup falls back to the historical network input and the
+    /// layer's fail-closed refusal is preserved verbatim — the fix never
+    /// invents a shape and never loosens the binding.
+    #[test]
+    fn generic_backward_add_constant_without_cached_predecessor_stays_fail_closed() {
+        let d = 50usize;
+        let constant = ArrayD::from_elem(IxDyn(&[d]), 1.0_f32);
+        let node = GraphNode {
+            name: "Operation_6_Add".to_string(),
+            layer: Layer::AddConstant(AddConstantLayer::new(constant)),
+            inputs: vec!["Operation_6_MatMul".to_string()],
+        };
+        let network_input = BoundedTensor::new(
+            ArrayD::zeros(IxDyn(&[1, 1, 1, 5])),
+            ArrayD::ones(IxDyn(&[1, 1, 1, 5])),
+        )
+        .expect("network input box");
+        let bounds_cache: HashMap<String, Arc<BoundedTensor>> = HashMap::new();
+        let mut sink_calls = 0usize;
+        let mut sink = |_name: &str, _lb: LinearBounds| -> Result<()> {
+            sink_calls += 1;
+            Ok(())
+        };
+
+        let error = super::generic_backward_domain(
+            "Operation_6_Add",
+            &node,
+            LinearBounds::identity(d),
+            &network_input,
+            &bounds_cache,
+            5,
+            &NaiveCpuGemmEngine,
+            None,
+            None,
+            &mut sink,
+        )
+        .expect_err("an uncached predecessor must keep the historical fail-closed refusal");
+
+        let NyError::InvalidSpec(message) = error else {
+            panic!("wrong-shape refusal should contextualize as InvalidSpec, got another variant");
+        };
+        assert!(
+            message.contains("Batched CROWN failed at node 'Operation_6_Add' (AddConstant)"),
+            "missing batched node/layer context: {message}"
+        );
+        assert!(
+            message.contains("Shape mismatch"),
+            "missing original refusal diagnostic: {message}"
+        );
+        assert_eq!(sink_calls, 0, "a refused dispatch must publish nothing");
     }
 
     #[test]
@@ -1406,7 +1538,7 @@ mod tests {
     }
 
     /// Regression test: dispatch_node_backward returns Err on parallel array
-    /// length mismatch instead of panicking at unchecked indexing sites (#2824).
+    /// length mismatch instead of panicking at unchecked indexing sites.
     #[test]
     fn test_dispatch_node_backward_rejects_length_mismatch_2824() {
         use crate::{GraphNode, Layer, ReLULayer};

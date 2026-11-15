@@ -38,7 +38,7 @@ pub type ConstraintTuple = (String, usize, bool, Option<f32>);
 pub use builder::BatchedDomainsBuilder;
 pub use domain_list::{
     CachedLinearBounds, DomainList, DomainListConfig, DomainMetadata, PickedDomains,
-    ProcessedDomains,
+    ProcessedDomains, WarmFrontier,
 };
 pub(crate) use domain_list::{
     EvaluatedGroupedChild, EvaluatedGroupedRoots, GroupedBatchCompletion, GroupedBoundSummary,
@@ -46,6 +46,7 @@ pub(crate) use domain_list::{
     GroupedParentResolution, GroupedQueueStatus, GroupedRootEvaluationToken,
     GroupedSpecFingerprint, PickedGroupedDomains,
 };
+pub(crate) use domain_list::{FrontierBlock, FrontierCapture};
 pub use options::BatchedDomainOptions;
 #[cfg(test)]
 pub use sparse_bounds::SparseIntermediateBounds;

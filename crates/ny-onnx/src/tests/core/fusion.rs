@@ -222,10 +222,6 @@ fn assert_ibp_bounds_match_with_epsilon(a: &BoundedTensor, b: &BoundedTensor, ep
     }
 }
 
-fn assert_ibp_bounds_match(a: &BoundedTensor, b: &BoundedTensor) {
-    assert_ibp_bounds_match_with_epsilon(a, b, 1e-6);
-}
-
 /// The unauthenticated affine composition must remain dark: preserve the raw
 /// Conv → BN → ReLU topology and every authored coefficient.
 #[ntest::timeout(10000)]
@@ -387,6 +383,133 @@ fn bn_policy_selects_raw_or_folded() {
     );
 }
 
+/// #soundness-spine M2e: the certified-lowering load configuration keeps the
+/// authored BatchNormalization and its parameters bit-identical, while the
+/// DEFAULT fold stores a composed binary32 coefficient that is NOT the exact
+/// real `w·γ/sqrt(var+ε)` — the uncharged gap a certified `GraphNetwork`
+/// lowering must never inherit. The parameters are chosen so the composition
+/// is irrational; the stored point sits `3.8e-8` relative from it (measured
+/// offline in exact decimal arithmetic), inside the documented two binary32
+/// roundings and far above the `1e-15` error of the f64 reference used here.
+#[ntest::timeout(10000)]
+#[test]
+fn certified_graph_lowering_preserves_batch_norm_the_default_fold_rounds() {
+    let (w, gamma, beta, mean, var) = (0.1f32, 1.3f32, 0.25f32, 0.5f32, 3.0f32);
+    let bytes = conv_bn_relu_model_bytes_with_params(
+        &[1, 1, 2, 2],
+        &[1, 1, 2, 2],
+        &[1, 1, 1, 1],
+        &[w],
+        &[gamma],
+        &[beta],
+        &[mean],
+        &[var],
+    );
+    let base = OnnxLoadConfig::default().with_shape_inference_policy(ShapeInferencePolicy::Skip);
+    assert!(!base.admits_certified_graph_lowering());
+    let certified = base.clone().certified_graph_lowering();
+    assert!(certified.admits_certified_graph_lowering());
+    assert_eq!(
+        certified.batch_norm_folding_policy(),
+        BatchNormFoldingPolicy::PreserveRaw
+    );
+
+    let raw = load_onnx_bytes_with_config("m2e_certified.onnx", &bytes, &certified)
+        .expect("certified-lowering load");
+    assert!(raw
+        .network
+        .layers
+        .iter()
+        .any(|layer| layer.layer_type == LayerType::BatchNorm));
+    let raw_w = raw.weights.get("conv_w").expect("authored conv weight")[[0, 0, 0, 0]];
+    assert_eq!(
+        raw_w.to_bits(),
+        w.to_bits(),
+        "authored weight bit-identical"
+    );
+
+    let folded = load_onnx_bytes_with_config("m2e_default.onnx", &bytes, &base)
+        .expect("default-policy load");
+    assert!(folded
+        .network
+        .layers
+        .iter()
+        .all(|layer| layer.layer_type != LayerType::BatchNorm));
+    let stored = f64::from(folded.weights.get("conv_w").expect("fused weight")[[0, 0, 0, 0]]);
+    let epsilon = f64::from(1.0e-3f32);
+    let exact = f64::from(w) * f64::from(gamma) / (f64::from(var) + epsilon).sqrt();
+    let rel = ((stored - exact) / exact).abs();
+    assert!(
+        rel > 1e-12,
+        "the default fold's stored coefficient is a rounded point (rel {rel:e}), not the \
+         exact composition"
+    );
+    assert!(
+        rel <= f64::from(2.0f32.powi(-22)),
+        "the fold's rounding exceeded two binary32 roundings (rel {rel:e})"
+    );
+}
+
+/// #spine-legacy-lanes M2e: the containment test on a BatchNormalization
+/// graph. Loaded through the certified lowering, a Conv -> BatchNormalization
+/// -> ReLU model's IBP box ENCLOSES the authored model evaluated in exact real
+/// arithmetic (the truth model `batch_norm_fold.rs` names) at every sampled
+/// point — the same parameters on which the default fold stores a rounded
+/// coefficient (`certified_graph_lowering_preserves_batch_norm_the_default_fold_rounds`)
+/// — and the box is tight enough that the check is not vacuous.
+#[ntest::timeout(10000)]
+#[test]
+fn certified_lowering_encloses_the_exact_real_conv_bn_relu_at_points() {
+    let (w, gamma, beta, mean, var) = (0.1f32, 1.3f32, 0.25f32, 0.5f32, 3.0f32);
+    let bytes = conv_bn_relu_model_bytes_with_params(
+        &[1, 1, 2, 2],
+        &[1, 1, 2, 2],
+        &[1, 1, 1, 1],
+        &[w],
+        &[gamma],
+        &[beta],
+        &[mean],
+        &[var],
+    );
+    let certified = OnnxLoadConfig::default()
+        .with_shape_inference_policy(ShapeInferencePolicy::Skip)
+        .certified_graph_lowering();
+    let model = load_onnx_bytes_with_config("m2e_containment.onnx", &bytes, &certified)
+        .expect("certified-lowering load");
+    assert!(model
+        .network
+        .layers
+        .iter()
+        .any(|layer| layer.layer_type == LayerType::BatchNorm));
+    let network = model.to_propagate_network().expect("certified network");
+    let epsilon = f64::from(1.0e-3f32);
+    let scale = f64::from(gamma) / (f64::from(var) + epsilon).sqrt();
+    for x in [-7.5f32, -1.0, 0.0, 0.625, 3.0, 11.0, 123.25] {
+        let point = ArrayD::from_elem(IxDyn(&[1, 1, 2, 2]), x);
+        let input = BoundedTensor::new(point.clone(), point).expect("point box");
+        let output = network.propagate_ibp(&input).expect("certified IBP");
+        // `w * x - mean` is exact in binary64 for these values; the division,
+        // square root, product and sum carry a few ulps, which `slack`
+        // over-covers by three orders of magnitude.
+        let shifted = f64::from(w) * f64::from(x) - f64::from(mean);
+        let y = shifted * scale + f64::from(beta);
+        let slack = 1e-12 * (shifted.abs() * scale + f64::from(beta).abs());
+        let (exact_lo, exact_hi) = ((y - slack).max(0.0), (y + slack).max(0.0));
+        for (lo, hi) in output.lower().iter().zip(output.upper().iter()) {
+            let (lo, hi) = (f64::from(*lo), f64::from(*hi));
+            assert!(
+                lo <= exact_lo && exact_hi <= hi,
+                "x={x}: certified [{lo}, {hi}] must enclose the exact real output \
+                 [{exact_lo}, {exact_hi}]"
+            );
+            assert!(
+                hi - lo <= 1e-5 * (1.0 + y.abs()),
+                "x={x}: certified box [{lo}, {hi}] is too wide to be evidence"
+            );
+        }
+    }
+}
+
 #[ntest::timeout(10000)]
 #[test]
 fn call_local_policy_reaches_file_loader_without_ambient_state() {
@@ -500,10 +623,47 @@ fn test_conv_bn_relu_raw_ibp_equivalence() {
 
     let loaded_output = loaded_network.propagate_ibp(&input).expect("loaded IBP");
     let unfused_output = unfused_network.propagate_ibp(&input).expect("unfused IBP");
-    assert_ibp_bounds_match(&loaded_output, &unfused_output);
+
+    // The two topologies no longer agree to 1e-6, and the residual gap is a REAL
+    // FINDING rather than noise. `BatchNormLayer`'s IBP now carries a certified
+    // outward radius (see batch_norm/ibp.rs `batch_norm_ibp_endpoint_radius`), so
+    // the UNFUSED Conv -> BatchNorm -> ReLU path pays that charge. The FUSED path
+    // folds BN into the conv weights and never constructs a `BatchNormLayer`, so it
+    // pays nothing — every BatchNorm fold stores its composed weights and biases as
+    // exact f32 points with no error channel (`ny-onnx/src/loader/fusion/
+    // batch_norm_fold.rs`). The fused bound is therefore TIGHTER than the arithmetic
+    // justifies, and this test measures exactly that deficit: 3.6245782 (fused) vs
+    // 3.6245797 (unfused), ~6 f32 ULP at this magnitude.
+    //
+    // So assert the SOUND relationship instead of bit-agreement: the certified
+    // (unfused) box must ENCLOSE the uncertified (fused) one, and the two must still
+    // agree to within a tolerance that admits the certificate. When the BN fold is
+    // itself certified, the fused box will widen to meet this one and the enclosure
+    // assertion will still hold.
+    for (fused, unfused) in loaded_output
+        .lower()
+        .iter()
+        .zip(unfused_output.lower().iter())
+    {
+        assert!(
+            unfused <= fused,
+            "certified unfused lower {unfused} must not exceed uncertified fused lower {fused}"
+        );
+    }
+    for (fused, unfused) in loaded_output
+        .upper()
+        .iter()
+        .zip(unfused_output.upper().iter())
+    {
+        assert!(
+            unfused >= fused,
+            "certified unfused upper {unfused} must not fall below uncertified fused upper {fused}"
+        );
+    }
+    assert_ibp_bounds_match_with_epsilon(&loaded_output, &unfused_output, 1e-5);
 }
 
-/// #2318: use distinct output/input channel counts so BN scaling-axis mistakes
+/// Use distinct output/input channel counts so BN scaling-axis mistakes
 /// cannot hide behind the old degenerate 1-channel fixture.
 #[ntest::timeout(10000)]
 #[test]

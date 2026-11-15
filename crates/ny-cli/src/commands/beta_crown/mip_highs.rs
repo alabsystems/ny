@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 //
-// MIP verification path for FC+ReLU networks. Part of #1763.
+// MIP verification path for FC+ReLU networks.
 // The historical module name is retained for API/source stability; the solver
 // policy now uses the linked AY backend by default, with ay-proc explicit.
 
@@ -15,7 +15,7 @@ use ny_mip::{
     MipFeasibilityIngress, MipResult, MipSolver, OneSidedSatProbe, SplitUnsatCache,
 };
 use ny_onnx::vnnlib::{OutputConstraint, VnnLibSpec};
-use ny_propagate::layers::{AddConstantLayer, LinearLayer};
+use ny_propagate::layers::LinearLayer;
 use ny_propagate::{Layer, Network, PhaseBudgetConfig};
 use ny_tensor::BoundedTensor;
 use std::path::Path;
@@ -43,7 +43,9 @@ use warm_start::build_warm_start_vector;
 /// execution: ONNX MatMul+Add commonly reloads as separate
 /// `Linear -> AddConstant` layers, so inspecting the raw sequential network
 /// would reject a model that this pipeline soundly folds and encodes.
-fn canonicalize_mip_feedforward_network(
+/// `single_hidden_hull.rs` (#hull-root) reuses it for the same reason, so the
+/// hull lane and the MIP encoder always agree on what the network IS.
+pub(super) fn canonicalize_mip_feedforward_network(
     network: &Network,
     input_shape: &[usize],
 ) -> Result<FoldedMipNetwork> {
@@ -60,156 +62,6 @@ fn canonicalize_mip_feedforward_network(
     let mip_network = fold_constant_layers(&mip_network)?;
     validate_mip_feedforward_topology(&mip_network)?;
     Ok(mip_network)
-}
-
-const SAFENLP_DIRECT_MIP_FIRST_MAX_INPUT_DIM: usize = 128;
-const SAFENLP_DIRECT_MIP_FIRST_MAX_HIDDEN_DIM: usize = 128;
-const SAFENLP_DIRECT_MIP_FIRST_MAX_OUTPUT_DIM: usize = 128;
-const SAFENLP_DIRECT_MIP_FIRST_MAX_SOURCE_ELEMENTS: usize = SAFENLP_DIRECT_MIP_FIRST_MAX_INPUT_DIM
-    * SAFENLP_DIRECT_MIP_FIRST_MAX_HIDDEN_DIM
-    + SAFENLP_DIRECT_MIP_FIRST_MAX_HIDDEN_DIM * SAFENLP_DIRECT_MIP_FIRST_MAX_OUTPUT_DIM
-    + 2 * (SAFENLP_DIRECT_MIP_FIRST_MAX_HIDDEN_DIM + SAFENLP_DIRECT_MIP_FIRST_MAX_OUTPUT_DIM);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SafeNlpRawAdmissionSize {
-    input_dim: usize,
-    hidden_dim: usize,
-    last_input_dim: usize,
-    output_dim: usize,
-    source_elements: Option<usize>,
-}
-
-/// Pure no-allocation size gate applied before the canonicalization clone.
-fn safenlp_raw_size_within_guard(
-    size: SafeNlpRawAdmissionSize,
-    observed_input_dim: usize,
-    spec_input_dim: usize,
-    spec_output_dim: usize,
-) -> bool {
-    size.input_dim > 0
-        && size.input_dim <= SAFENLP_DIRECT_MIP_FIRST_MAX_INPUT_DIM
-        && size.hidden_dim > 0
-        && size.hidden_dim <= SAFENLP_DIRECT_MIP_FIRST_MAX_HIDDEN_DIM
-        && size.output_dim > 0
-        && size.output_dim <= SAFENLP_DIRECT_MIP_FIRST_MAX_OUTPUT_DIM
-        && size.last_input_dim == size.hidden_dim
-        && size.input_dim == observed_input_dim
-        && size.input_dim == spec_input_dim
-        && size.output_dim == spec_output_dim
-        && size
-            .source_elements
-            .is_some_and(|count| count <= SAFENLP_DIRECT_MIP_FIRST_MAX_SOURCE_ELEMENTS)
-}
-
-/// Cheap allocation guard for the deliberately narrow SafeNLP route.
-///
-/// The official ONNX loader leaves either affine bias independently optional,
-/// yielding two Linears, one ReLU, and zero to two post-Linear AddConstant
-/// layers. Refuse every wider raw topology before the general MIP Conv2d
-/// unfolding code can allocate; canonical preprocessing below remains the
-/// final topology and dimension authority.
-fn safenlp_raw_affine_bias_candidate(
-    network: &Network,
-    input: &BoundedTensor,
-    spec: &VnnLibSpec,
-) -> bool {
-    let (first, first_bias, last, last_bias): (
-        &LinearLayer,
-        Option<&AddConstantLayer>,
-        &LinearLayer,
-        Option<&AddConstantLayer>,
-    ) = match network.layers() {
-        [Layer::Linear(first), Layer::ReLU(_), Layer::Linear(last)] => (first, None, last, None),
-        [Layer::Linear(first), Layer::AddConstant(first_bias), Layer::ReLU(_), Layer::Linear(last)] => {
-            (first, Some(first_bias), last, None)
-        }
-        [Layer::Linear(first), Layer::ReLU(_), Layer::Linear(last), Layer::AddConstant(last_bias)] => {
-            (first, None, last, Some(last_bias))
-        }
-        [Layer::Linear(first), Layer::AddConstant(first_bias), Layer::ReLU(_), Layer::Linear(last), Layer::AddConstant(last_bias)] => {
-            (first, Some(first_bias), last, Some(last_bias))
-        }
-        _ => return false,
-    };
-
-    let (hidden_dim, input_dim) = first.weight().dim();
-    let (output_dim, last_input_dim) = last.weight().dim();
-    let bias_shape_matches = |bias: Option<&AddConstantLayer>, feature_dim: usize| {
-        bias.is_none_or(|bias| {
-            let constant = bias.constant();
-            constant.len() == 1
-                || (constant.len() == feature_dim
-                    && constant.shape().last().copied() == Some(feature_dim)
-                    && constant.shape()[..constant.ndim().saturating_sub(1)]
-                        .iter()
-                        .all(|&dim| dim == 1))
-        })
-    };
-    let source_elements = [
-        first.weight().len(),
-        first.bias().map_or(0, |bias| bias.len()),
-        first_bias.map_or(0, |bias| bias.constant().len()),
-        last.weight().len(),
-        last.bias().map_or(0, |bias| bias.len()),
-        last_bias.map_or(0, |bias| bias.constant().len()),
-    ]
-    .into_iter()
-    .try_fold(0usize, |count, elements| count.checked_add(elements));
-    let size = SafeNlpRawAdmissionSize {
-        input_dim,
-        hidden_dim,
-        last_input_dim,
-        output_dim,
-        source_elements,
-    };
-
-    safenlp_raw_size_within_guard(size, input.lower().len(), spec.num_inputs, spec.num_outputs)
-        && first.bias().is_none_or(|bias| bias.len() == hidden_dim)
-        && last.bias().is_none_or(|bias| bias.len() == output_dim)
-        && bias_shape_matches(first_bias, hidden_dim)
-        && bias_shape_matches(last_bias, output_dim)
-}
-
-/// Return the hidden width when the authoritative MIP preprocessing pipeline
-/// canonicalizes this model to the narrow SafeNLP direct-first topology.
-///
-/// An error or `None` is a pre-route decline. The caller still passes the
-/// original reloaded model to [`verify_with_mip_inner`], which repeats this
-/// authoritative preprocessing and retains the exact folded-bias sidecar for
-/// the certified solve.
-pub(super) fn safenlp_canonical_single_hidden_shape(
-    model_net: &BetaCrownModel,
-    input: &BoundedTensor,
-    spec: &VnnLibSpec,
-) -> Result<Option<usize>> {
-    let BetaCrownModel::Sequential(network) = model_net else {
-        return Ok(None);
-    };
-    if !safenlp_raw_affine_bias_candidate(network, input, spec) {
-        return Ok(None);
-    }
-    let mip_network = canonicalize_mip_feedforward_network(network, input.shape())?;
-    if !is_single_hidden_linear_relu_linear(&mip_network) {
-        return Ok(None);
-    }
-
-    let (_weights, _structural_biases, layer_dims) = extract_linear_relu_params(&mip_network)?;
-    let [input_dim, hidden_dim, output_dim] = layer_dims.as_slice() else {
-        return Ok(None);
-    };
-    let [Layer::Linear(_first), Layer::ReLU(_), Layer::Linear(last)] = mip_network.layers() else {
-        return Ok(None);
-    };
-    let last_input_dim = last.weight().ncols();
-    Ok((*input_dim > 0
-        && *hidden_dim > 0
-        && *hidden_dim <= 128
-        && *output_dim > 0
-        && last_input_dim == *hidden_dim
-        && *input_dim == input.lower().len()
-        && *input_dim == spec.num_inputs
-        && *output_dim == spec.num_outputs)
-        .then_some(*hidden_dim))
 }
 
 /// Human-readable solver name for a MIP backend (verdict output/diagnostics).
@@ -238,33 +90,6 @@ fn ay_margin_reframe_enabled() -> bool {
         // with original-model proof replay (the only handoff shape whose dual
         // bound MOVES on this class, docs/SAFENLP_AY_ARC_2026-08-20.md §5.1).
         || super::dispatch::safenlp_mip_cycle_enabled()
-}
-
-/// Select the typed direct-first shared-prefix ingress from the third gate.
-///
-/// Dispatch has already required exact direct-first and shared-prefix intent.
-/// Only the existing exact margin value `1` composes those gates with AY's
-/// marked-margin API; every other spelling retains required plain feasibility.
-#[cfg(test)]
-fn required_safenlp_shared_prefix_ingress_from_margin_value(
-    value: Option<&str>,
-) -> MipFeasibilityIngress {
-    if ay_margin_reframe_enabled_from_value(value) {
-        MipFeasibilityIngress::RequireSafeNlpMarkedMarginSharedBinaryPrefix
-    } else {
-        MipFeasibilityIngress::RequireSafeNlpSharedBinaryPrefix
-    }
-}
-
-fn required_safenlp_shared_prefix_ingress() -> MipFeasibilityIngress {
-    // #safenlp-cycle: the composed reframe resolver (env OR the one cycle
-    // gate) decides the ingress, so the shared-prefix route and the direct FC
-    // route always agree on whether the unsafe row is marked.
-    if ay_margin_reframe_enabled() {
-        MipFeasibilityIngress::RequireSafeNlpMarkedMarginSharedBinaryPrefix
-    } else {
-        MipFeasibilityIngress::RequireSafeNlpSharedBinaryPrefix
-    }
 }
 
 /// Preserve terminal ownership across the in-process competition capture seam.
@@ -702,7 +527,6 @@ fn unconfirmed_sat_retry_allowed(
 ///
 /// This is the VNN-COMP `mip` path: encode the network with tight Big-M ReLUs
 /// and solve it exactly (sat_relu, safenlp, malbeware).
-/// Reference: designs/2026-03-04-highs-mip-solver-integration.md (historical)
 #[allow(clippy::too_many_arguments)]
 pub(super) fn verify_with_mip(
     model_net: &BetaCrownModel,
@@ -734,16 +558,48 @@ pub(super) fn verify_with_mip(
         effective_treatment,
         json,
         MipFeasibilityIngress::Historical,
+        false,
     )
+    .map(|_| ())
 }
 
-/// Typed ingress for the narrowly admitted SafeNLP direct-first experiment.
-///
-/// This differs from [`verify_with_mip`] only in final feasibility routing:
-/// the in-process AY shared-binary-prefix session must be admitted, or the
-/// attempt fails closed without launching another MIP solver route.
+#[cfg(test)]
+pub(crate) fn test_mip_publication_receipt(captured_json: &str) -> MipUnsatPublication {
+    MipUnsatPublication {
+        captured_json: captured_json.to_owned(),
+    }
+}
+
+/// Opaque evidence that THIS whole-root MIP invocation published its own
+/// typed, certificate-gated Verified result successfully. This is not an
+/// Instance token and cannot authorize a Source partition. The payload binds
+/// the exact captured output; a later writer invalidates the caller's match.
+pub(crate) struct MipUnsatPublication {
+    captured_json: String,
+}
+
+impl MipUnsatPublication {
+    pub(crate) fn into_captured_json(self) -> String {
+        self.captured_json
+    }
+}
+
+fn bridge_unsat_publication(
+    result: &VerificationResult,
+    publication_refused: bool,
+    json: bool,
+) -> Option<MipUnsatPublication> {
+    if !json || publication_refused || !matches!(result, VerificationResult::Verified { .. }) {
+        return None;
+    }
+    // Called only immediately after print_result emitted this invocation's
+    // complete new JSON. No status/method/log parsing can mint the receipt.
+    super::output::snapshot_captured_json()
+        .map(|captured_json| MipUnsatPublication { captured_json })
+}
+
 #[allow(clippy::too_many_arguments)]
-pub(super) fn verify_with_mip_requiring_safenlp_shared_prefix(
+pub(super) fn verify_with_mip_for_bridge(
     model_net: &BetaCrownModel,
     input: &BoundedTensor,
     vnnlib: Option<&VnnLibSpec>,
@@ -757,11 +613,8 @@ pub(super) fn verify_with_mip_requiring_safenlp_shared_prefix(
     reporting_start: std::time::Instant,
     effective_treatment: &EffectiveTreatmentProjection,
     json: bool,
-) -> Result<()> {
-    // Snapshot the third exact gate into typed caller-local state before any
-    // preprocessing or detached backend work. No later environment read can
-    // change this admitted session's solver entry.
-    let feasibility_ingress = required_safenlp_shared_prefix_ingress();
+    retain_publication: bool,
+) -> Result<Option<MipUnsatPublication>> {
     verify_with_mip_inner(
         model_net,
         input,
@@ -776,7 +629,8 @@ pub(super) fn verify_with_mip_requiring_safenlp_shared_prefix(
         reporting_start,
         effective_treatment,
         json,
-        feasibility_ingress,
+        MipFeasibilityIngress::Historical,
+        retain_publication,
     )
 }
 
@@ -796,7 +650,8 @@ fn verify_with_mip_inner(
     effective_treatment: &EffectiveTreatmentProjection,
     json: bool,
     feasibility_ingress: MipFeasibilityIngress,
-) -> Result<()> {
+    capture_bridge_publication: bool,
+) -> Result<Option<MipUnsatPublication>> {
     let backend = mip_solver.mip_backend();
     let requires_safenlp_marked_margin_shared_prefix =
         feasibility_ingress == MipFeasibilityIngress::RequireSafeNlpMarkedMarginSharedBinaryPrefix;
@@ -863,8 +718,11 @@ fn verify_with_mip_inner(
     let mip_network = canonicalize_mip_feedforward_network(network, input.shape())?;
     let use_exact_single_hidden_fast_path = is_single_hidden_linear_relu_linear(&mip_network);
 
-    // Keep original layer indices for `convert_intermediate_bounds()`. #3864
-    // uses plain IBP only for the exact single-hidden fast path.
+    // Keep original layer indices for `convert_intermediate_bounds()`. The
+    // exact single-hidden fast path skips CROWN/LP. Both arms return the
+    // TYPE-ENFORCED `SoundIntermediateBounds` (#mip-conv-sound-enclosure): the
+    // certified collector is the only constructor and the converter below
+    // accepts nothing else, so the plain collector cannot reach the encoder.
     let intermediate_bounds = if use_exact_single_hidden_fast_path {
         collect_exact_single_hidden_intermediate_bounds(network, input)?
     } else {
@@ -979,6 +837,8 @@ fn verify_with_mip_inner(
             "required SafeNLP shared-prefix ingress needs one conjunctive relational unsafe row"
         );
     }
+    let mut native_hull_publication = None;
+    let mut aggregate_hull_publication = None;
     let result = if mip_timeout_secs <= 0.0 {
         timeout_verification_result(num_outputs)
     } else if let Some(spec) = vnnlib {
@@ -1000,7 +860,7 @@ fn verify_with_mip_inner(
                 json,
             )?
         } else {
-            // Conjunctive property: single solve, optionally warm-started from PGD (#3865).
+            // Conjunctive property: single solve, optionally warm-started from PGD.
             let mut encoder = encode_feedforward(
                 &weights,
                 &biases,
@@ -1032,6 +892,202 @@ fn verify_with_mip_inner(
                 shared_tree_preclone_eligible.then(|| encoder.clone().into_parts());
             let unsafe_rows = add_vnnlib_constraints(&mut encoder, spec)?;
             let mut parts = encoder.into_parts();
+            // A single signed margin needs exact ReLU phases only for its
+            // concave heads. Retain the existing rows/bounds and relax only
+            // the other indicators, then certify THIS larger unsafe model.
+            // SAT still follows original-network concrete replay below.
+            if backend == MipBackend::Ay {
+                if let Some(report) = convex_binary::relax(
+                    &mut parts,
+                    use_exact_single_hidden_fast_path,
+                    &weights,
+                    &biases,
+                    &layer_dims,
+                    &intermediate_bounds_vec,
+                    spec,
+                    &unsafe_rows,
+                    deadline,
+                ) {
+                    eprintln!(
+                        "[mip-convex-binaries] unstable={} relaxed_nonnegative={} negative_binaries={} rows_retained=1",
+                        report.unstable_before,
+                        report.relaxed_nonnegative,
+                        report.negative_binaries,
+                    );
+                }
+            }
+            let mut short_hull_proof = None;
+            let mut aggregate_hull_proof = None;
+            // Keep the stronger checked coordinate hull in the same exact
+            // complete-MIP model. A separate short native cover can close it
+            // only after that model binding; cut metadata grants no verdict.
+            if backend == MipBackend::Ay && use_exact_single_hidden_fast_path {
+                let began = std::time::Instant::now();
+                match ideal_cuts::strengthen_with_signed_refinement(
+                    &mut parts, use_exact_single_hidden_fast_path, &weights, &biases,
+                    &layer_dims, &intermediate_bounds_vec, &input_bounds, spec,
+                    &unsafe_rows, deadline,
+                    ideal_cuts::short_proof_allowed(
+                        requires_safenlp_shared_prefix, shared_tree_preclone_eligible,
+                        capture_bridge_publication,
+                    ),
+                ) {
+                    Some(outcome) => {
+                        let report = &outcome.cuts;
+                        eprintln!(
+                        "[mip-ideal-cuts] admitted=1 cuts={} input_terms={} checked_lower_bits={:016x} proposal_lp_calls={} t_ms={}",
+                        report.cuts, report.input_terms, report.checked_hull_lower.to_bits(),
+                        report.proposal_lp_calls, outcome.cuts_elapsed.as_millis(),
+                        );
+                        eprintln!(
+                            "[mip-joint-cuts] individual={} joint={} pairs_attempted={} pairs_completed={}",
+                            report.individual_cuts, report.joint_cuts,
+                            report.joint_pairs_attempted, report.joint_pairs_completed,
+                        );
+                        eprintln!(
+                            "[mip-compact-cuts] rows={} pairs={} root_lower_bits={} root_verified={}",
+                            report.compact_cuts, report.compact_pairs,
+                            report.compact_root_lower.map_or_else(||"na".to_owned(), |v|format!("{:016x}",v.to_bits())),
+                            u8::from(outcome.aggregate.as_ref().is_some_and(|proof|proof.route()=="compact" && proof.verified())),
+                        );
+                        eprintln!(
+                            "[mip-group-cuts] ledger=at-append groups={} attempts={} search_masks={} replay_masks={} work_units={} peak_bytes={}",
+                            report.compact_groups,report.group_attempts,report.group_search_masks,
+                            report.group_replay_masks,report.group_work,report.group_peak_bytes,
+                        );
+                        if let Some(sdp) = &report.global_sdp {
+                            eprintln!(
+                                "[mip-global-sdp] ledger=at-append rows=1 dimension={} active_dimension={} optimizer_iterations={} factorizations={} checked_candidates={} source_replays={} work_units={} admitted_bytes={} correction_bits={:016x} lower_bits={:016x} root_selected={}",
+                                sdp.dimension,sdp.active_dimension,sdp.optimizer_iterations,
+                                sdp.factorizations,sdp.checked_candidates,sdp.source_replays,
+                                sdp.work_units,sdp.admitted_bytes,sdp.correction.to_bits(),sdp.lower.to_bits(),
+                                u8::from(outcome.aggregate.as_ref().is_some_and(|proof|proof.route()=="global-sdp" && proof.verified())),
+                            );
+                        } else {
+                            eprintln!("[mip-global-sdp] ledger=at-append rows=0");
+                        }
+                        if let Some(signed) = &report.signed {
+                            eprintln!(
+                                "[mip-signed-root] ledger=at-append attempted={} rows={} components={} refined_components={} assigned_positive_heads={} negative_heads={} coordinate_proposals={} completed_masks={} checked_masks={} source_replays={} work_units={} admitted_bytes={} lower_bits={} stop={} root_selected={}",
+                                u8::from(signed.attempted), u8::from(signed.admitted), signed.components,
+                                signed.refined_components, signed.assigned_positive_heads, signed.negative_heads,
+                                signed.coordinate_proposals, signed.completed_masks, signed.checked_masks,
+                                signed.source_replays, signed.work_units, signed.admitted_bytes,
+                                signed.lower.map_or_else(|| "na".to_owned(), |v|format!("{:016x}", v.to_bits())),
+                                signed.stop_reason,
+                                u8::from(outcome.aggregate.as_ref().is_some_and(|proof|proof.route()=="signed-coordinate" && proof.verified())),
+                            );
+                            let m=&signed.mass;
+                            let root=&signed.root_coupling;
+                            eprintln!("[mip-root-coupling] requested={} admitted={} producer_attempts={} checker_slots={} support_attempts={} completed_supports={} selected={} work_units={} used_work_units={} admitted_bytes={} left={:?} right={:?} parent_count={} parent_indices={:?} selected_negatives={} tail_negatives={} positive_heads={} recipient_positive_heads={} funded_coordinates={} optimized_coordinates={} line_mask_attempts={} line_masks_completed={} line_masks_improved={} coordinate_visits={} metadata_work={} quoted_search_work={} quoted_check_work={} actual_check_work={} old_masks={} new_masks={} baseline_lower={:?} before_global_lower={:?} proposed_lower={:?} after_global_lower={:?} stop={}",
+                                u8::from(root.requested),u8::from(root.admitted),root.producer_attempts,root.checker_slots,root.support_attempts,root.completed_supports,u8::from(root.selected),root.work_units,root.used_work_units,root.admitted_bytes,root.left,root.right,root.parent_count,root.parent_indices,root.selected_negatives,root.tail_negatives,root.positive_heads,root.recipient_positive_heads,root.funded_coordinates,root.optimized_coordinates,root.line_mask_attempts,root.line_masks_completed,root.line_masks_improved,root.coordinate_visits,root.metadata_work,root.quoted_search_work,root.quoted_check_work,root.actual_check_work,root.old_masks,root.new_masks,root.baseline_lower,root.before_global_lower,root.proposed_lower,root.after_global_lower,root.stop_reason);
+                            eprintln!("[mip-signed-mass] ledger=at-append attempted={} constructed_appearances={} constructed_split_heads={} baseline_checks={} final_checks={} funded_visits={} completed_visits={} selected={} banked_lower_bits={} optional_lower_bits={} selected_positive_heads={} selected_positive_appearances={} selected_split_heads={} stop={}",
+                                u8::from(m.attempted),m.positive_appearances,m.split_positive_heads,
+                                m.baseline_checks,m.final_checks,m.funded_visits,m.completed_visits,u8::from(m.selected),
+                                m.banked_lower.map_or_else(||"na".to_owned(),|v|format!("{:016x}",v.to_bits())),
+                                m.lower.map_or_else(||"na".to_owned(),|v|format!("{:016x}",v.to_bits())),
+                                signed.assigned_positive_heads,signed.positive_appearances,signed.split_positive_heads,m.stop_reason);
+                            let cr=&signed.component_rows;
+                            eprintln!("[mip-signed-component-rows] ledger=after-append attempted={} admitted={} quoted_components={} quoted_terms={} reserved_work_units={} work_units={} admitted_bytes={} collection_attempts={} collected_components={} prepared_rows={} prepared_terms={} appended_rows={} appended_terms={} stop={}",
+                                u8::from(cr.attempted),u8::from(cr.admitted),cr.quoted_components,cr.quoted_terms,
+                                cr.reserved_work_units,cr.work_units,cr.admitted_bytes,cr.collection_attempts,cr.collected_components,
+                                cr.prepared_rows,cr.prepared_terms,cr.appended_rows,cr.appended_terms,cr.stop_reason);
+                            let phase = &cr.phase;
+                            eprintln!("[mip-signed-phase-rows] ledger=after-append attempted={} admitted={} all_selector_mode={} original_ir_row_limit={} work_units={} admitted_bytes={} collection_attempts={} collected_components={} prepared_rows={} appended_rows={} appended_terms={} stop={}",
+                                u8::from(phase.attempted),u8::from(phase.admitted),u8::from(phase.all_selector_mode),phase.original_ir_row_limit,phase.work_units,phase.admitted_bytes,
+                                phase.collection_attempts,phase.collected_components,phase.prepared_rows,
+                                phase.appended_rows,phase.appended_terms,phase.stop_reason);
+                            let cube = &phase.cube;
+                            eprintln!("[mip-signed-phase-cube] ledger=after-append attempted={} admitted={} capture_total_work={} capture_activity_work={:?} capture_activity_bytes={:?} activity_transfer_attempts={} transferred_activity_values={} activity_values={} quoted_masks={} quoted_rows={} quoted_terms={} setup_work={} work_units={} reserved_work_units={} admitted_bytes={} collection_attempts={} collected_masks={} completed_tables={} prepare_attempts={} activity_components={} projected_components={} prepared_rows={} prepared_terms={} appended_rows={} appended_terms={} appended_selector_terms={} stop={}",
+                                u8::from(cube.attempted),u8::from(cube.admitted),cube.capture_total_work,cube.capture_activity_work,cube.capture_activity_bytes,cube.activity_transfer_attempts,cube.transferred_activity_values,cube.activity_values,
+                                cube.quoted_masks,cube.quoted_rows,cube.quoted_terms,cube.setup_work,cube.work_units,cube.reserved_work_units,cube.admitted_bytes,
+                                cube.collection_attempts,cube.collected_masks,cube.completed_tables,cube.prepare_attempts,cube.activity_components,cube.projected_components,
+                                cube.prepared_rows,cube.prepared_terms,cube.appended_rows,cube.appended_terms,cube.appended_selector_terms,cube.stop_reason);
+                            let dom = &cr.domination;
+                            let cell = &cube.cell;
+                            eprintln!("[mip-signed-phase-cell] attempted={} admitted={} work_units={} admitted_bytes={} component={:?} masks={} improved_masks={} joint_improved_masks={} prepared_rows={} prepared_terms={} prepared_selectors={} appended_rows={}",
+                                u8::from(cell.attempted),u8::from(cell.admitted),cell.work_units,cell.admitted_bytes,cell.component,
+                                cell.collected_masks,cell.improved_masks,cell.joint_improved_masks,cell.prepared_rows,cell.prepared_terms,
+                                cell.prepared_selectors,cell.appended_rows);
+                            let ray = &cell.ray;
+                            eprintln!("[mip-signed-phase-ray] admitted={} work_units={} admitted_bytes={} masks={} improved_masks={} prepared_rows={} prepared_terms={} prepared_selectors={} appended_rows={}",
+                                u8::from(ray.admitted),ray.work_units,ray.admitted_bytes,ray.masks,ray.improved_masks,
+                                ray.prepared_rows,ray.prepared_terms,ray.prepared_selectors,ray.appended_rows);
+                            let joint = &cell.joint;
+                            eprintln!("[mip-signed-phase-joint] admitted={} work_units={} admitted_bytes={} masks={} improved_masks={} prepared_rows={} prepared_terms={} prepared_selectors={} appended_rows={}",
+                                u8::from(joint.admitted),joint.work_units,joint.admitted_bytes,joint.masks,joint.improved_masks,
+                                joint.prepared_rows,joint.prepared_terms,joint.prepared_selectors,joint.appended_rows);
+                            let input_phase = &cell.input_phase;
+                            eprintln!("[mip-signed-input-phase] admitted={} work_units={} admitted_bytes={} masks={} candidates={} selected_candidate={:?} stop={}",
+                                u8::from(input_phase.admitted),input_phase.work_units,input_phase.admitted_bytes,
+                                input_phase.masks,input_phase.candidates,input_phase.selected_candidate,input_phase.stop_reason);
+                            let table_lp = &cell.lp;
+                            eprintln!("[mip-signed-table-lp] admitted={} activity_from_root={} work_units={} admitted_bytes={} calls={} pivots={} pivot_limit={} stop={} checked_masks={} score_lower={:?} envelope_upper={:?} gap_upper={:?} prepared_rows={} prepared_terms={} prepared_selectors={} appended_rows={}",
+                                u8::from(table_lp.admitted),u8::from(table_lp.activity_from_root),table_lp.work_units,table_lp.admitted_bytes,table_lp.calls,table_lp.pivots,table_lp.pivot_limit,
+                                table_lp.stop_reason,table_lp.checked_masks,table_lp.score_lower,table_lp.envelope_upper,table_lp.gap_upper,
+                                table_lp.prepared_rows,table_lp.prepared_terms,table_lp.prepared_selectors,table_lp.appended_rows);
+                            eprintln!("[mip-signed-domination] ledger=after-append attempted={} admitted={} producer_attempts={} advice_attempts={} export_attempts={} free_work_before={} checks_before={} checker_slots={} funded_targets={} funded_sparse={} sparse_fits={} nominal_scores={} support_attempts={} completed_supports={} work_units={} admitted_bytes={} appended_rows={} appended_terms={} joint_skipped_unfunded={} dense={} funded_positive_limit={} pool_heads={} capture_work_units={} total_optional_work_units={} funded_alias_heads={} checked_alias_rows={} appended_alias_rows={} alias_work_units={} alias_bytes={} priced_step_work_units={} priced_sort_work_units={} priced_step_bytes={} priced_step_attempted={} priced_step_completed={} priced_step_accepted={} group_allocation={} group_nominal_attempts={} group_nominal_masks={} group_checked_masks={} group_nominal_work={} group_checker_tail={} group_anchor={:?} group_partner={:?} group_nominal_lhs={:?} group_nominal_bound={:?} branch_tau_mode={} exclusive_seed_useful={:?} gradient_skipped={} tail_single_work={} tail_branch_work={} branch_tau_attempts={} branch_tau_completed={} branch_tau_selected={} branch_tau_checked_masks={} branch_tau_optimizer_work={} branch_tau0={:?} branch_tau1={:?} branch_tau2={:?} branch_tau3={:?} branch_bound0={:?} branch_bound1={:?} branch_bound2={:?} branch_bound3={:?} stop={}",
+                                u8::from(dom.attempted),u8::from(dom.admitted),dom.producer_attempts,dom.advice_attempts,dom.export_attempts,
+                                dom.free_work_before,dom.checks_before,dom.checker_slots,dom.funded_targets,
+                                dom.funded_sparse_fits,dom.sparse_fits,dom.nominal_scores,dom.support_attempts,
+                                dom.completed_supports,dom.work_units,dom.admitted_bytes,dom.appended_rows,
+                                dom.appended_terms,u8::from(dom.joint_skipped_unfunded),u8::from(dom.dense),dom.funded_positive_limit,
+                                dom.pool_heads,dom.capture_work_units,dom.total_optional_work_units,dom.funded_alias_heads,
+                                dom.checked_alias_rows,dom.appended_alias_rows,dom.alias_work_units,dom.alias_bytes,dom.priced_step_work_units,dom.priced_sort_work_units,dom.priced_step_bytes,u8::from(dom.priced_step_attempted),u8::from(dom.priced_step_completed),u8::from(dom.priced_step_accepted),u8::from(dom.group_allocation),dom.group_nominal_attempts,dom.group_nominal_masks,dom.group_checked_masks,dom.group_nominal_work,dom.group_checker_tail,dom.group_anchor,dom.group_partner,dom.group_nominal_lhs,dom.group_nominal_bound,
+                                u8::from(dom.branch_tau_mode),dom.exclusive_seed_useful,u8::from(dom.gradient_skipped),dom.tail_single_work,dom.tail_branch_work,
+                                dom.branch_tau_attempts,dom.branch_tau_completed,u8::from(dom.branch_tau_selected),dom.branch_tau_checked_masks,dom.branch_tau_optimizer_work,
+                                dom.branch_tau_values.map(|a|a[0]),dom.branch_tau_values.map(|a|a[1]),dom.branch_tau_values.map(|a|a[2]),dom.branch_tau_values.map(|a|a[3]),
+                                dom.branch_tau_mask_prices.map(|a|a[0]),dom.branch_tau_mask_prices.map(|a|a[1]),dom.branch_tau_mask_prices.map(|a|a[2]),dom.branch_tau_mask_prices.map(|a|a[3]),dom.stop_reason);
+                            let joint = &cr.joint;
+                            eprintln!("[mip-signed-joint-rows] ledger=after-append attempted={} prepaid_requested={} prepaid_admitted={} prepaid_work_units={} prepaid_bytes={} prepaid_used_work_units={} prepaid_checker_slots={} producer_attempts={} checks_before={} remaining_checks_before={} checker_slots={} free_work_before={} eligible_pairs={} partial_eligible={} partial_paid={} partial_completed={} partial_selected={} partial_tail={} partial_checked_masks={} partial_tail_rechecks={} partial_work={} partial_rows={} paid_pairs={} completed_pairs={} quoted_masks={} checked_masks={} coordinates={} work_units={} admitted_bytes={} appended_rows={} appended_terms={} stop={}",
+                                u8::from(joint.attempted),u8::from(joint.prepaid_requested),u8::from(joint.prepaid_admitted),
+                                joint.prepaid_work_units,joint.prepaid_bytes,joint.prepaid_used_work_units,joint.prepaid_checker_slots,
+                                joint.producer_attempts,joint.checks_before,joint.remaining_checks_before,
+                                joint.checker_slots,joint.free_work_before,joint.eligible_pairs,
+                                joint.partial_eligible_pairs,joint.partial_paid_pairs,joint.partial_completed_pairs,
+                                joint.partial_selected_heads,joint.partial_tail_heads,joint.partial_checked_masks,
+                                joint.partial_tail_rechecks,joint.partial_work_units,joint.partial_appended_rows,
+                                joint.paid_pairs,joint.completed_pairs,
+                                joint.quoted_masks,joint.checked_masks,joint.coordinates,joint.work_units,joint.admitted_bytes,
+                                joint.appended_rows,joint.appended_terms,joint.stop_reason);
+                            let d = &signed.direction;
+                            eprintln!("[mip-signed-direction] ledger=at-append attempts={} complete_sweeps={} coordinates={} cached_masks={} checked_candidates={} accepted_candidates={} work_units={} cache_bytes={} stop={}",
+                                d.attempts,d.completed_sweeps,d.coordinates,d.cached_masks,
+                                d.checked_candidates,d.accepted_candidates,d.work_units,d.cache_bytes,d.stop_reason);
+
+                        }
+                        aggregate_hull_proof = outcome.aggregate;
+                        if let Some(proof) = &outcome.continuation {
+                            let stats = proof.report();
+                            if let Some(c) = proof.signed_child_report() {
+                                eprintln!("[mip-signed-child] ledger=after-continuation collection_attempts={} cached_masks={} cache_bytes={} bind_attempts={} calls={} completed={} work_units={} total_work_units={} source_replays={} positive={} lp_skips={} corner_axes={} corner_price_attempts={} corner_root_lower={:?} corner_ray_axes={} corner_base_root_lower={:?} corner_ray_root_lower={:?} corner_cover_admitted={} corner_cover_leaves={} corner_cover_root_lower={:?} stop={}",
+                                    c.collection_attempts,c.cached_masks,c.cache_bytes,c.bind_attempts,
+                                    c.attempted_calls,c.completed_calls,c.work_units,c.total_work_units,c.source_replays,c.positive_calls,c.lp_skips,c.corner_axes,c.corner_price_attempts,c.corner_root_lower,c.corner_ray_axes,c.corner_base_root_lower,c.corner_ray_root_lower,c.corner_cover_admitted,c.corner_cover_leaves,c.corner_cover_root_lower,c.stop_reason);
+                            }
+                            eprintln!(
+                                "[mip-hull-portfolio] root_reused=1 shared_root_lp_calls={} continuation_root_lp_calls={} continuation_lp_calls={} stop={} nodes={} closed={} open={} verified={} t_ms={}",
+                                report.proposal_lp_calls, stats.root_lp_calls, stats.proposal_lp_calls,
+                                stats.stop.label(), stats.nodes, stats.closed, stats.open, u8::from(proof.verified()),
+                                outcome.continuation_elapsed.as_millis(),
+                            );
+                        } else if aggregate_hull_proof.as_ref().is_some_and(|proof|proof.verified()) {
+                            let stop = match aggregate_hull_proof.as_ref().unwrap().route() {
+                                "signed-coordinate" => "signed-coordinate-proved",
+                                "global-sdp" => "global-sdp-proved",
+                                _ => "aggregate-proved",
+                            };
+                            eprintln!("[mip-hull-portfolio] root_reused=0 stop={stop} tree_skipped=1 verified=0");
+                        } else {
+                            eprintln!("[mip-hull-portfolio] root_reused=0 stop=declined verified=0");
+                        }
+                        short_hull_proof = outcome.continuation;
+                    }
+                    None => eprintln!(
+                        "[mip-ideal-cuts] admitted=0 cuts=0 input_terms=0 checked_lower_bits=na proposal_lp_calls=na t_ms={}",
+                        began.elapsed().as_millis(),
+                    ),
+                }
+            }
             let marked_margin = maybe_mark_unique_ay_margin(
                 margin_reframe_enabled,
                 backend,
@@ -1057,7 +1113,39 @@ fn verify_with_mip_inner(
                 let plan = certified_shared_tree_plan(shared_tree_preclone_eligible, spec, base)?;
                 try_certified_shared_tree(base, &plan, deadline)
             });
-            if let Some(certified) = certified_shared_tree {
+            if aggregate_hull_proof
+                .as_ref()
+                .is_some_and(|proof| proof.verified())
+            {
+                // A checked real-arithmetic full-q root proof, not an AY
+                // status or typed OriginalReplay/Source E1 receipt.
+                aggregate_hull_publication = aggregate_hull_proof.take();
+                VerificationResult::Verified {
+                    provenance: Default::default(),
+                    output_bounds: vec![
+                        Bound::new_allow_infinite(f32::NEG_INFINITY, f32::INFINITY);
+                        num_outputs
+                    ],
+                    proof: None,
+                    actual_method: Some(ny_core::MethodUsed::BetaCrown),
+                }
+            } else if short_hull_proof
+                .as_ref()
+                .is_some_and(|proof| proof.verified())
+            {
+                // A native checked complete phase cover, not an AY status or
+                // an inferred consequence of how many cuts were appended.
+                native_hull_publication = short_hull_proof.take();
+                VerificationResult::Verified {
+                    provenance: Default::default(),
+                    output_bounds: vec![
+                        Bound::new_allow_infinite(f32::NEG_INFINITY, f32::INFINITY);
+                        num_outputs
+                    ],
+                    proof: None,
+                    actual_method: Some(ny_core::MethodUsed::BetaCrown),
+                }
+            } else if let Some(certified) = certified_shared_tree {
                 tracing::info!(
                     proof_route = ?certified.proof_route,
                     ay_tree_leaves = certified.ay_tree_leaves,
@@ -1071,7 +1159,7 @@ fn verify_with_mip_inner(
                         num_outputs
                     ],
                     proof: None,
-                    actual_method: Some(ny_core::MethodUsed::MipHiGHS),
+                    actual_method: Some(mip_unsat_method_tag()),
                 }
             } else if std::time::Instant::now() >= deadline {
                 // The proof attempt consumed the original caller-owned
@@ -1252,11 +1340,29 @@ fn verify_with_mip_inner(
     // This is the MIP ingress's terminal publication check. It never marks
     // deadline causality: the solver must eventually expose a typed source for
     // that, rather than relying on the result observed after synchronous work.
-    let result = gate_mip_result_at_deadline(result, num_outputs, deadline);
     let elapsed = reporting_start.elapsed();
+    // Keep the opaque completed cover until the existing terminal publisher.
+    // Do not reduce its current FP/stage/original authority to a legacy bool.
+    let result = if native_hull_publication
+        .as_ref()
+        .is_some_and(|proof| !proof.verified())
+        || aggregate_hull_publication
+            .as_ref()
+            .is_some_and(|proof| !proof.verified())
+    {
+        VerificationResult::Unknown {
+            provenance: Default::default(),
+            bounds: vec![Bound::new_allow_infinite(f32::NEG_INFINITY, f32::INFINITY); num_outputs],
+            reason: "native hull publication authority expired or FP qualification refused".into(),
+            actual_method: Some(ny_core::MethodUsed::BetaCrown),
+        }
+    } else {
+        result
+    };
+    let result = gate_mip_result_at_deadline(result, num_outputs, deadline);
 
     // Output results
-    let publication_refused = print_result(
+    let publication_refused = print_result_with_native_hull(
         &result,
         property,
         model,
@@ -1264,6 +1370,7 @@ fn verify_with_mip_inner(
         threshold,
         elapsed,
         backend,
+        native_hull_publication.is_some() || aggregate_hull_publication.is_some(),
         Some(effective_treatment),
         json,
     )?;
@@ -1278,7 +1385,11 @@ fn verify_with_mip_inner(
         std::process::exit(exit_code);
     }
 
-    Ok(())
+    Ok(if capture_bridge_publication {
+        bridge_unsat_publication(&result, publication_refused, json)
+    } else {
+        None
+    })
 }
 
 /// Owned copy of the conjunctive constraint list fed to `add_vnnlib_constraints`.
@@ -1320,6 +1431,182 @@ fn add_vnnlib_constraints(
         rows.push(encode_output_constraint(encoder, constraint)?);
     }
     Ok(rows)
+}
+
+/// #metaroom-mip-governor — the CERTIFIED-CLAUSE PRESCREEN for the disjunctive
+/// MIP escalation.
+///
+/// # The defect
+///
+/// `solve_disjunctive` seeds its pending set with EVERY clause and then hands
+/// each one `remaining / pending` seconds. On metaroom_2023 4cnn_ry_57_9
+/// spec_idx_28 that is 19 clauses over a 50 s escalation — 2.279 s each — and
+/// the measured run abandoned all nineteen at their slice with
+/// `certified_unsat=0`. Eighteen of those clauses had already been refuted at
+/// the ROOT, in 1.1 s, by an ordinary CROWN pass. The one genuinely open clause
+/// therefore received one nineteenth of a budget it needed all of.
+///
+/// # The certificate
+///
+/// Every VNN-LIB output constraint is a linear row over the outputs, and a
+/// clause is the CONJUNCTION of its constraints, so the clause's unsafe region
+/// is empty as soon as ONE of its rows is unsatisfiable. Appending those rows
+/// to the network as a final `LinearLayer` and running the same sound CROWN-IBP
+/// collection the encoder already uses gives a certified upper bound on each
+/// row; `sup(a.y) < b` refutes the row over the WHOLE input box.
+///
+/// # Soundness
+///
+/// A disjunctive `Unsat` requires every clause to be infeasible. A clause
+/// refuted here carries exactly the certificate ny publishes `unsat` on
+/// everywhere else, so omitting it from the solver's pending set is equivalent
+/// to solving it and receiving `Unsat { certified: true }` — and in particular
+/// it is NOT booked as a timeout, so it can never mask an undecided clause.
+///
+/// FAIL CLOSED at every step. `None` means "no certified set could be
+/// established", and the caller must then use ALL clauses:
+///
+/// * a clause carrying its own per-clause input box is never certified (the
+///   bound here is taken over the global box, and the parser's union widening
+///   is not re-verified here);
+/// * a constraint naming an out-of-range output index, or a non-finite
+///   constant, abandons the whole prescreen;
+/// * a bound-collection failure, a shape the spec layer cannot be appended to,
+///   or a non-finite bound abandons the whole prescreen;
+/// * an expired deadline degrades the collection to plain IBP, which is still
+///   sound — looser, so it certifies fewer clauses, never more.
+///
+/// Strict comparisons (`<`, `>`) are treated as their non-strict counterparts,
+/// which requires MORE of the bound than refuting the strict form does.
+fn certified_infeasible_clauses(
+    network: &Network,
+    input: &BoundedTensor,
+    spec: &VnnLibSpec,
+    num_outputs: usize,
+    deadline: std::time::Instant,
+) -> Option<Vec<bool>> {
+    let clauses = &spec.output_constraint_clauses;
+    if clauses.is_empty() || num_outputs == 0 {
+        return None;
+    }
+
+    // One row per constraint, in clause order, as `a . y >= b` over the
+    // outputs. `row_owner[r]` is the clause that row belongs to.
+    let mut weights: Vec<f32> = Vec::new();
+    let mut rhs: Vec<f64> = Vec::new();
+    let mut row_owner: Vec<usize> = Vec::new();
+    for (clause_idx, clause) in clauses.iter().enumerate() {
+        // A clause with its own input box is bounded over a box this pass does
+        // not use; leave it to the solver.
+        if spec
+            .per_clause_input_bounds
+            .get(clause_idx)
+            .is_some_and(|overrides| !overrides.is_empty())
+        {
+            continue;
+        }
+        for constraint in clause {
+            let mut a = vec![0.0f32; num_outputs];
+            let b = match constraint {
+                // UNSAFE: Y_i <= Y_j  <=>  Y_j - Y_i >= 0
+                OutputConstraint::LessEq(i, j) | OutputConstraint::LessThan(i, j) => {
+                    if *i >= num_outputs || *j >= num_outputs {
+                        return None;
+                    }
+                    a[*j] += 1.0;
+                    a[*i] -= 1.0;
+                    0.0
+                }
+                // UNSAFE: Y_i >= Y_j  <=>  Y_i - Y_j >= 0
+                OutputConstraint::GreaterEq(i, j) | OutputConstraint::GreaterThan(i, j) => {
+                    if *i >= num_outputs || *j >= num_outputs {
+                        return None;
+                    }
+                    a[*i] += 1.0;
+                    a[*j] -= 1.0;
+                    0.0
+                }
+                // UNSAFE: Y_i <= c  <=>  -Y_i >= -c
+                OutputConstraint::LessEqConst(i, c) | OutputConstraint::LessThanConst(i, c) => {
+                    if *i >= num_outputs || !c.is_finite() {
+                        return None;
+                    }
+                    a[*i] = -1.0;
+                    -*c
+                }
+                // UNSAFE: Y_i >= c
+                OutputConstraint::GreaterEqConst(i, c)
+                | OutputConstraint::GreaterThanConst(i, c) => {
+                    if *i >= num_outputs || !c.is_finite() {
+                        return None;
+                    }
+                    a[*i] = 1.0;
+                    *c
+                }
+                // `OutputConstraint` is `#[non_exhaustive]`: an unmapped
+                // variant must abandon the prescreen, never be skipped.
+                _ => return None,
+            };
+            weights.extend_from_slice(&a);
+            rhs.push(b);
+            row_owner.push(clause_idx);
+        }
+    }
+    if row_owner.is_empty() {
+        return None;
+    }
+
+    let num_rows = rhs.len();
+    // The spec layer is dense (`num_rows x num_outputs`); a spec with tens of
+    // thousands of literals is not what this prescreen is for, and building the
+    // layer would cost more than the escalation it is trying to protect.
+    const MAX_PRESCREEN_ROWS: usize = 8192;
+    if num_rows > MAX_PRESCREEN_ROWS {
+        return None;
+    }
+    let spec_weight = ndarray::Array2::from_shape_vec((num_rows, num_outputs), weights).ok()?;
+    let spec_layer = LinearLayer::new(spec_weight, None).ok()?;
+    let mut augmented = network.clone();
+    augmented.add_layer(Layer::Linear(spec_layer));
+
+    let bounds =
+        collect_mip_intermediate_bounds_with_deadline(&augmented, input, Some(deadline)).ok()?;
+    // `SoundIntermediateBounds` deliberately exposes no Vec API — its field is
+    // private so a plain (uncertified) vector cannot be substituted for a
+    // certified one. Read through its own view rather than reaching past it.
+    let tail = bounds.as_slice().last()?;
+    let upper: Vec<f32> = tail.upper().iter().copied().collect();
+    if upper.len() != num_rows {
+        return None;
+    }
+
+    let mut certified = vec![false; clauses.len()];
+    for (row, (&clause_idx, &b)) in row_owner.iter().zip(rhs.iter()).enumerate() {
+        let sup = f64::from(upper[row]);
+        if sup.is_finite() && sup < b {
+            certified[clause_idx] = true;
+        }
+    }
+    Some(certified)
+}
+
+/// #metaroom-mip-governor — seed the disjunctive escalation's pending set.
+///
+/// FAIL CLOSED: `None`, or a flag vector whose length disagrees with the clause
+/// count, falls back to ALL clauses and reports `all-fallback`. The returned
+/// tag is the observable's `source=` field, so "ran and skipped nothing" is
+/// always distinguishable from "could not establish the certified set".
+fn seed_escalation_pending(
+    num_clauses: usize,
+    certified: Option<&[bool]>,
+) -> (Vec<usize>, &'static str) {
+    match certified {
+        Some(flags) if flags.len() == num_clauses => (
+            (0..num_clauses).filter(|idx| !flags[*idx]).collect(),
+            "certified",
+        ),
+        _ => ((0..num_clauses).collect(), "all-fallback"),
+    }
 }
 
 /// Solve disjunctive VNNLIB property by solving each clause independently.
@@ -1394,7 +1681,46 @@ fn solve_disjunctive(
     )
     .map_err(|e| anyhow::anyhow!("MIP encoding failed: {}", e))?;
 
-    let mut pending: Vec<usize> = (0..num_clauses).collect();
+    // #metaroom-mip-governor — seed the pending set from the UNCERTIFIED
+    // clauses only when the typed lever is armed. FAIL CLOSED: any failure to
+    // establish the certified set (including the lever being disarmed) falls
+    // back to the historical all-clauses seed, and the observable says which.
+    //
+    // The prescreen gets a bounded slice of the escalation budget so a slow
+    // collection cannot eat the solve it exists to protect; an expired slice
+    // degrades the collection to plain IBP, which is sound and merely looser.
+    let skip_certified = crate::preset_gates::mip_escalate_skip_certified_armed();
+    let escalation_start = std::time::Instant::now();
+    let escalation_remaining = deadline
+        .saturating_duration_since(escalation_start)
+        .as_secs_f64();
+    let certified: Option<Vec<bool>> = if skip_certified {
+        let slice = (escalation_remaining * 0.2).clamp(0.0, 10.0);
+        let prescreen_deadline = escalation_start
+            .checked_add(std::time::Duration::from_secs_f64(slice))
+            .unwrap_or(deadline)
+            .min(deadline);
+        certified_infeasible_clauses(network, input, spec, num_outputs, prescreen_deadline)
+    } else {
+        None
+    };
+    let (mut pending, pending_source) = seed_escalation_pending(num_clauses, certified.as_deref());
+    // Every clause must still be accounted for: an empty pending set means
+    // every clause carried a certificate, which is a proof, not a vacuum.
+    let clauses_certified = num_clauses - pending.len();
+    let post_prescreen_remaining = deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .as_secs_f64();
+    eprintln!(
+        "[mip-escalate] clauses_total={num_clauses} clauses_certified={clauses_certified} \
+clauses_pending={} slice_s={:.3} source={pending_source}",
+        pending.len(),
+        if pending.is_empty() {
+            0.0
+        } else {
+            post_prescreen_remaining / pending.len() as f64
+        },
+    );
     // One certified-UNSAT phase-split memo per clause, living ACROSS retry
     // rounds: a clause abandoned at 15-of-16 certified-Unsat subproblems
     // re-races only the open one instead of starting from zero. The memo is
@@ -1682,7 +2008,7 @@ fn solve_disjunctive(
             provenance: Default::default(),
             output_bounds,
             proof: None,
-            actual_method: Some(ny_core::MethodUsed::MipHiGHS),
+            actual_method: Some(mip_unsat_method_tag()),
         }),
     }
 }
@@ -1745,10 +2071,43 @@ pub(super) fn print_result(
     effective_treatment: Option<&EffectiveTreatmentProjection>,
     json: bool,
 ) -> Result<bool> {
+    print_result_with_native_hull(
+        result,
+        property,
+        model,
+        epsilon,
+        threshold,
+        elapsed,
+        backend,
+        false,
+        effective_treatment,
+        json,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn print_result_with_native_hull(
+    result: &VerificationResult,
+    property: Option<&Path>,
+    model: Option<&Path>,
+    epsilon: f32,
+    threshold: f32,
+    elapsed: std::time::Duration,
+    backend: MipBackend,
+    native_hull_publication: bool,
+    effective_treatment: Option<&EffectiveTreatmentProjection>,
+    json: bool,
+) -> Result<bool> {
+    // This rendering-only choice comes from the retained opaque proof owner.
+    // It grants no authority and must not relabel a native proof as AY UNSAT.
     if json {
-        let method = match backend {
-            MipBackend::Ay => "mip-ay",
-            MipBackend::AyProc => "mip-ay-proc",
+        let method = if native_hull_publication {
+            "native-hull"
+        } else {
+            match backend {
+                MipBackend::Ay => "mip-ay",
+                MipBackend::AyProc => "mip-ay-proc",
+            }
         };
         let (rendered, publication_refused) = format_verification_result_json_for_publication(
             result,
@@ -1771,7 +2130,10 @@ pub(super) fn print_result(
             ..
         } => {
             println!("Status: VIOLATED (unsafe)");
-            println!("Counterexample input: {:?}", counterexample);
+            println!(
+                "Counterexample input: {}",
+                crate::commands::verify::preview_f32s(counterexample)
+            );
             let applied_terminal_peel = effective_treatment
                 .map(EffectiveTreatmentProjection::terminal_peel_activation)
                 .unwrap_or_default();
@@ -1786,7 +2148,11 @@ pub(super) fn print_result(
             println!("Reason: {}", reason);
         }
     }
-    println!("Method: MIP ({} solver)", backend_name(backend));
+    if native_hull_publication {
+        println!("Method: Native checked hull proof");
+    } else {
+        println!("Method: MIP ({} solver)", backend_name(backend));
+    }
     println!("Time elapsed: {:.2}s", elapsed.as_secs_f64());
     Ok(false)
 }
@@ -1796,6 +2162,50 @@ pub(super) fn print_result(
 /// The SAT arm is handled separately by [`revalidate_mip_witness`], which clamps
 /// the witness into the VNN-LIB box and re-checks the spec with an independent
 /// forward pass before claiming `Violated`. `result` MUST NOT be `Sat` here.
+/// Method tag for a MIP-admitted `Unsat { certified: true }` verdict, carrying
+/// the certificate lane's PROVENANCE.
+///
+/// `ny_mip::strict_side_artifact_unsat_admissions()` counted, per process, the
+/// admissions taken by the former `(None, None) if
+/// strict_infeasibility_evidence` arm of
+/// `ay_lib::map_outcome_with_sat_relu_certificate`, the one lane where
+/// "certified" rested on AY's in-session replay of a typed side artifact with
+/// NO NY-side re-check against `to_ay_model` (review of bbe9e9657,
+/// 2026-09-12, finding "certificate seam arm without NY-side re-check").
+/// When that arm had fired in this process the verdict was tagged
+/// [`ny_core::MethodUsed::MipAyStrictSideArtifact`] and a flight note was
+/// written, so a banked unsat that may rest on it is identifiable from the
+/// bank's metadata alone. The counter is process-wide, so the tag is
+/// conservative — a row whose earlier clause took that arm is tagged even if
+/// the final clause carried a Farkas certificate — which is the correct
+/// direction for a provenance mark.
+///
+/// That arm no longer exists: the bare-`Infeasible` branch now replays every
+/// side artifact with a public model-bound verifier against NY's own model
+/// (`SideArtifactReplays`, `[ay-cert] lane=<l> ny_replay=verified`) and
+/// leaves the rest `certified: false`, which admission refuses, so the counter
+/// stays 0 and this returns [`ny_core::MethodUsed::MipHiGHS`] for every new
+/// verdict. The branch is kept so a reintroduced trust-the-bool arm (a
+/// regression of the seam) would be tagged again, and so the tag's meaning in
+/// banks written before the change stays documented.
+pub(super) fn mip_unsat_method_tag() -> ny_core::MethodUsed {
+    let admissions = ny_mip::strict_side_artifact_unsat_admissions();
+    if admissions > 0 {
+        crate::flight::note(
+            "mip_unsat_provenance",
+            crate::flight::FlightStatus::Ran,
+            Some(format!(
+                "ay-strict-side-artifact admissions={admissions}: a certified UNSAT in this \
+                 process rests on AY's in-session replay of a typed side artifact with no \
+                 NY-side re-check (ay_lib.rs strict_infeasibility_evidence arm)"
+            )),
+        );
+        ny_core::MethodUsed::MipAyStrictSideArtifact
+    } else {
+        ny_core::MethodUsed::MipHiGHS
+    }
+}
+
 fn map_mip_nonsat_result(result: MipResult, num_outputs: usize) -> VerificationResult {
     let bounds = || vec![Bound::new_allow_infinite(f32::NEG_INFINITY, f32::INFINITY); num_outputs];
     match result {
@@ -1807,7 +2217,7 @@ fn map_mip_nonsat_result(result: MipResult, num_outputs: usize) -> VerificationR
                 provenance: Default::default(),
                 output_bounds: bounds(),
                 proof: None,
-                actual_method: Some(ny_core::MethodUsed::MipHiGHS),
+                actual_method: Some(mip_unsat_method_tag()),
             }
         }
         MipResult::Unsat { certified: false } => VerificationResult::Unknown {
@@ -2101,7 +2511,7 @@ fn f64_forward_confirms(
             OC::LessThanConst(i, k) => value_at(*i).is_some_and(|a| a < *k),
             OC::GreaterEqConst(i, k) => value_at(*i).is_some_and(|a| a >= *k),
             OC::GreaterThanConst(i, k) => value_at(*i).is_some_and(|a| a > *k),
-            // Fail closed on any future constraint variant (#4375 pattern).
+            // Fail closed on any future constraint variant.
             _ => false,
         }
     }))
@@ -2350,7 +2760,7 @@ fn revalidate_objective_first_sat_probe(
     }
 }
 
-// #3865: Warm-start vector builder for the sequential PGD→MIP path.
+// Warm-start vector builder for the sequential PGD→MIP path.
 #[path = "mip_highs_warm_start.rs"]
 pub(super) mod warm_start;
 
@@ -2360,3 +2770,25 @@ mod intermediate_bounds;
 #[cfg(test)]
 #[path = "mip_highs_tests.rs"]
 mod tests;
+
+// #mip-conv-sound-enclosure: the Big-M collectors must hand the encoder the
+// certified IBP box; these tests bite on the conv cancellation shape.
+#[cfg(test)]
+#[path = "mip_conv_sound_enclosure_tests.rs"]
+mod conv_sound_enclosure_tests;
+
+// #mip-conv-sound-enclosure ratchet: every layer the sequential and graph MIP
+// encoders admit must have a certified or directed IBP arm, BY NAME.
+#[cfg(test)]
+#[path = "mip_admitted_layer_ratchet_tests.rs"]
+mod admitted_layer_ratchet_tests;
+
+#[cfg(test)]
+#[path = "mip_original_input_bridge_tests.rs"]
+mod original_input_bridge_tests;
+
+#[path = "mip_convex_binary.rs"]
+mod convex_binary;
+
+#[path = "mip_ideal_cuts.rs"]
+mod ideal_cuts;

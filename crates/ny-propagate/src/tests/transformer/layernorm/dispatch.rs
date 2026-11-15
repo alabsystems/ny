@@ -9,7 +9,6 @@ use super::super::prelude::*;
 fn test_unsupported_op_still_falls_back_to_ibp() {
     // Regression test: UnsupportedOp errors should still trigger the network-level
     // fallback to IBP. Only SoundnessRefusal should propagate as an error.
-    // Reference: designs/2026-02-08-crown-fallback-error-semantics.md
     use crate::layers::FloorLayer;
 
     let mut network = Network::new();
@@ -103,6 +102,13 @@ fn test_constant_arithmetic_layer_dispatch_batched_matches_unbatched() {
         vec![linear_bounds.num_outputs()],
     );
 
+    let operand_len = linear_bounds.num_inputs();
+    let pre_activation = BoundedTensor::new(
+        ArrayD::from_elem(IxDyn(&[operand_len]), -1.0_f32),
+        ArrayD::from_elem(IxDyn(&[operand_len]), 1.0_f32),
+    )
+    .expect("operand-shaped pre-activation box");
+
     let layers = [
         Layer::AddConstant(AddConstantLayer::new(ArrayD::from_elem(IxDyn(&[]), 0.25))),
         Layer::SubConstant(SubConstantLayer::scalar(0.10)),
@@ -120,8 +126,15 @@ fn test_constant_arithmetic_layer_dispatch_batched_matches_unbatched() {
         let expected = layer
             .propagate_crown_backward(&linear_bounds, None)
             .unwrap_or_else(|e| panic!("{name} unbatched CROWN backward failed: {e:?}"));
+        // AddConstant's batched arm REQUIRES the pre-activation, and not for bounds:
+        // it reads only `pre.shape()`, to prove neither side was expanded and to
+        // resolve the constant's broadcast axis (`layer_enum/dispatch.rs`, the
+        // AddConstant arm). The unbatched arm gets the same from its own shape
+        // contract, which is why it still accepts `None` above. Supply a box of the
+        // operand shape so the two paths are compared under the same contract rather
+        // than one of them refusing.
         let actual = layer
-            .propagate_crown_backward_batched(&batched_bounds, None, None)
+            .propagate_crown_backward_batched(&batched_bounds, Some(&pre_activation), None)
             .unwrap_or_else(|e| panic!("{name} batched CROWN backward failed: {e:?}"));
 
         tests::assert_all_close(
@@ -155,7 +168,7 @@ fn test_constant_arithmetic_layer_dispatch_batched_matches_unbatched() {
 #[test]
 fn test_constant_arithmetic_network_batched_crown_soundness() {
     // Network-level soundness test for the 4 constant arithmetic layers wired
-    // into batched CROWN dispatch (W1 commit e4cbc87, #1708).
+    // into batched CROWN dispatch.
     // Verify that batched CROWN bounds contain the true output at concrete points.
 
     let dim = 4;

@@ -451,6 +451,8 @@ pub(super) fn optimize_tail_alpha_bespoke(
     _engine: Option<&dyn GemmEngine>,
     deadline: Instant,
 ) -> Option<(GraphAlphaState, f32)> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::AlphaOpt);
     let exec = match tail.exec_order() {
         Ok(e) => e.to_vec(),
         Err(e) => {

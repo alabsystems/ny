@@ -94,16 +94,16 @@ impl PgdAttacker<'_> {
         direction: DisjunctiveDirection,
     ) -> Result<RestartResult> {
         let mut rng = self.seeded_rng(seed);
-        let mut x = self.initialize_restart(network, input_bounds, &mut rng)?;
+        let mut x = self.initialize_restart_for_seed(network, input_bounds, &mut rng, seed)?;
         let mut evals = 0;
         let mut consecutive_nan_skips: u32 = 0;
         const MAX_CONSECUTIVE_NAN_SKIPS: u32 = 5;
 
-        // Create step state for this restart (#4277: AdamClipping optimizer).
+        // Create step state for this restart (AdamClipping optimizer).
         // Gradient ascent (sign=+1): maximize disjunctive objective.
         let mut step_state = self.config().create_step_state(input_bounds);
 
-        // #1449 GAMA: reference softmax `P` captured at this restart's first
+        // GAMA: reference softmax `P` captured at this restart's first
         // forward; λ anneals linearly from λ₀ to 0 over the early steps. The
         // violation ACCEPT check below stays on the raw margin — GAMA only
         // changes the ascent direction, never what counts as a witness.
@@ -157,7 +157,7 @@ impl PgdAttacker<'_> {
                 });
             }
 
-            // #1449 GAMA branch: one SPSA of the scalar GAMA objective
+            // GAMA branch: one SPSA of the scalar GAMA objective
             // (2 forwards) replaces the two per-output SPSA calls (4
             // forwards) — cheaper per step AND guidance-aware.
             let gradient_diff =
@@ -213,11 +213,11 @@ impl PgdAttacker<'_> {
             }
             consecutive_nan_skips = 0;
 
-            // Apply the step using the configured optimizer (#4277).
+            // Apply the step using the configured optimizer.
             // Ascent: sign=+1.
             let projected = step_state.step(&gradient_diff, &x, input_bounds, true);
 
-            // Restart-when-stuck (#4278): resample a fresh point when the
+            // Restart-when-stuck: resample a fresh point when the
             // optimizer+projection update is a no-op.
             if self.config().restart_when_stuck && restart::projected_step_is_stuck(&x, &projected)
             {
@@ -255,7 +255,7 @@ impl PgdAttacker<'_> {
         })
     }
 
-    /// Scalar GAMA objective for a disjunctive `(target, j)` pair (#1449):
+    /// Scalar GAMA objective for a disjunctive `(target, j)` pair:
     /// direction-signed softmax margin + `λ·Σ_c (P_c − q_c)²`. The softmax
     /// margin is order-preserving in the raw logits, so it shares the raw
     /// margin's zero crossing; the accept gate stays on the raw margin.
@@ -280,7 +280,7 @@ impl PgdAttacker<'_> {
         Ok(margin + lambda * gama_guidance(&q, p_ref))
     }
 
-    /// SPSA estimate of the GAMA objective gradient (#1449): one Rademacher
+    /// SPSA estimate of the GAMA objective gradient: one Rademacher
     /// perturbation, two box-projected forwards. Mirrors the graph lane's
     /// `spsa_gama_gradient`; returns a zero gradient on a NaN objective so the
     /// NaN-skip / restart-when-stuck logic in the caller handles it.
@@ -588,7 +588,7 @@ mod tests {
         .unwrap()
     }
 
-    /// #1449: the GAMA-guided disjunctive attack still lands a raw-margin
+    /// The GAMA-guided disjunctive attack still lands a raw-margin
     /// witness (the accept gate is unchanged; only the ascent objective is).
     #[ntest::timeout(10000)]
     #[test]
@@ -607,7 +607,7 @@ mod tests {
         );
     }
 
-    /// #1449: the GAMA objective matches margin + λ·guidance and errors loudly
+    /// The GAMA objective matches margin + λ·guidance and errors loudly
     /// on an out-of-bounds output index instead of mis-indexing.
     #[test]
     fn test_gama_disjunctive_objective_value_and_bounds() {

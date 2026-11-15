@@ -5,7 +5,7 @@
 //! Base IBP non-delegating methods and domain clipping helpers.
 //!
 //! Delegation methods (`propagate_ibp`, `propagate_ibp_sound`) moved to
-//! `network/dispatch/graph_ibp.rs` (#2380). This file retains only methods
+//! `network/dispatch/graph_ibp.rs`. This file retains only methods
 //! that are self-contained (no sibling imports).
 
 use crate::domain_clip::DomainClipper;
@@ -62,7 +62,7 @@ impl GraphNetwork {
                 .get(node_name)
                 .ok_or_else(|| NyError::InvalidSpec(format!("Node not found: {}", node_name)))?;
 
-            // Resolve concrete values via unified dispatch (#2405).
+            // Resolve concrete values via unified dispatch.
             // Wraps get_concrete_value → BoundedTensor::concrete, then
             // extracts lower bound (center value) from the propagation result.
             let output_bounds = dispatch_ibp_for_node(node, node_name, &mut |name| {
@@ -122,6 +122,7 @@ impl GraphNetwork {
         input: &BoundedTensor,
         clipper: &mut DomainClipper,
     ) -> Result<BoundedTensor> {
+        self.ensure_proof_eligible()?;
         if self.nodes.is_empty() {
             return Ok(input.clone());
         }
@@ -143,12 +144,12 @@ impl GraphNetwork {
                 .get(node_name)
                 .ok_or_else(|| NyError::InvalidSpec(format!("Node not found: {}", node_name)))?;
 
-            // Compute output bounds using unified dispatch (#2405).
+            // Compute output bounds using unified dispatch.
             let output_bounds = dispatch_ibp_for_node(node, node_name, &mut |name| {
                 Ok(self.bounds_ref(name, input, &bounds_cache)?.clone())
             })?;
 
-            // NaN firewall (#2812 Slice 2, #2706).
+            // NaN firewall.
             check_nan_firewall(
                 &output_bounds,
                 "IBP with clipper",

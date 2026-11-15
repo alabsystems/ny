@@ -101,6 +101,33 @@ fn record_cgan_atomic_collection_entry() {
     });
 }
 
+// Test-only collection census across cache hits and fresh collections.
+#[cfg(test)]
+thread_local! {
+    static ROOT_FIXED_REFERENCE_COLLECTIONS: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) struct RootFixedReferenceCollectionCounter(Option<usize>);
+
+#[cfg(test)]
+impl RootFixedReferenceCollectionCounter {
+    pub(super) fn start() -> Self {
+        Self(ROOT_FIXED_REFERENCE_COLLECTIONS.with(|slot| slot.replace(Some(0))))
+    }
+    pub(super) fn entries(&self) -> usize {
+        ROOT_FIXED_REFERENCE_COLLECTIONS.with(|slot| slot.get().expect("active counter"))
+    }
+}
+
+#[cfg(test)]
+impl Drop for RootFixedReferenceCollectionCounter {
+    fn drop(&mut self) {
+        ROOT_FIXED_REFERENCE_COLLECTIONS.with(|slot| slot.set(self.0));
+    }
+}
+
 /// Default-dark cGAN lane: permit a deadline-truncated collection to satisfy a
 /// later, exactly matching collection request.
 ///
@@ -181,14 +208,12 @@ fn truncated_scope_can_serve(
 /// width threshold) into a single struct. This replaces the combinatorial
 /// explosion of 10+ convenience wrapper methods with a single options-based
 /// entry point ([`GraphNetwork::collect_crown_ibp_bounds_dag_with_options`]).
-///
-/// Part of #3812 (API explosion cleanup).
 #[derive(Default)]
 pub(crate) struct CrownIbpCollectOptions<'a> {
-    /// GPU/accelerated GEMM engine for per-node CROWN backward passes (#3549).
+    /// GPU/accelerated GEMM engine for per-node CROWN backward passes.
     pub engine: Option<&'a dyn GemmEngine>,
     /// Deadline for the CROWN-IBP collection. Remaining nodes fall back to IBP
-    /// bounds when exceeded (#3109).
+    /// bounds when exceeded.
     pub deadline: Option<Instant>,
     /// Apply `deadline` to the mandatory foundational IBP pass as well as the
     /// CROWN tightening sweep. The historical public collectors leave this
@@ -196,7 +221,7 @@ pub(crate) struct CrownIbpCollectOptions<'a> {
     /// plain-IBP-backed map. Full-phase verifier callers set it when returning
     /// a timely Timeout verdict is more important than completing that map.
     pub deadline_includes_ibp: bool,
-    /// Pre-computed IBP bounds (#3596). When provided, skips the internal IBP
+    /// Pre-computed IBP bounds. When provided, skips the internal IBP
     /// forward pass, allowing the full deadline budget for CROWN tightening.
     /// On deep graphs (e.g., ECAPA-TDNN ~188 nodes), the IBP forward pass can
     /// consume the entire deadline budget.
@@ -231,6 +256,22 @@ pub(crate) struct CrownIbpCollectOptions<'a> {
     /// Like `min_width_to_tighten` this changes WHICH nodes are tightened, so
     /// it suppresses complete-map caching for the same reason.
     pub cgan_narrow_target_max_rows: Option<usize>,
+    /// `#cgan-collector-dense` (E5): run every conv backward walk of this
+    /// collection in dense (matrix) mode. See
+    /// `AlphaCrownConfig::cgan_collector_dense`. Part of cache identity.
+    pub cgan_collector_dense: bool,
+    /// `#cgan-unstable-rows`: seed every demanded ReLU-preactivation target of
+    /// a SHRINK-ONLY typed cGAN collection with only its baseline-unstable
+    /// rows. See `AlphaCrownConfig::cgan_unstable_rows`. Part of cache
+    /// identity. Ignored by `CrownIbpCollectionMode::Standard`.
+    pub cgan_unstable_rows: bool,
+    /// Companion ceiling for `cgan_unstable_rows`, as a fraction of a target's
+    /// rows (abc `minimum_sparsity`, default 0.9). Clamped to `[0, 1]` and
+    /// quantised to per mille at the collection entry.
+    pub cgan_unstable_rows_max_frac: Option<f32>,
+    /// Original fixed-reference root only: one early selected-head transaction.
+    /// Other collectors leave this absent; enabled collections bypass map caches.
+    pub original_root_head_rows: Option<head_rows::OriginalRootHeadRows>,
 }
 
 impl GraphNetwork {
@@ -269,6 +310,13 @@ impl GraphNetwork {
         input: &BoundedTensor,
         options: CrownIbpCollectOptions<'_>,
     ) -> Result<GraphCrownIbpBoundsResult> {
+        self.ensure_proof_eligible()?;
+        #[cfg(test)]
+        ROOT_FIXED_REFERENCE_COLLECTIONS.with(|slot| {
+            if let Some(count) = slot.get() {
+                slot.set(Some(count + 1));
+            }
+        });
         #[cfg(test)]
         if options.collection_mode == CrownIbpCollectionMode::CganSparseTargetComplete {
             record_cgan_atomic_collection_entry();
@@ -287,7 +335,26 @@ impl GraphNetwork {
         let deadline_salvage_policy =
             target_backward::PartialCrownDeadlineSalvagePolicy::from_environment();
         let prefix_cost_admission_enabled = budget_policy::prefix_cost_admission_enabled();
-        let runtime_policy = self.crown_ibp_runtime_policy();
+        let mut runtime_policy = self.crown_ibp_runtime_policy();
+        // #cgan-collector-dense (E5): the request-scoped dense override rides
+        // the runtime policy so cache identity, the sequential-shortcut gate,
+        // the upfront walk admission and every target walk see ONE answer.
+        runtime_policy.collector_dense_override = options.cgan_collector_dense;
+        // #cgan-unstable-rows: same request-scoped contract as the dense
+        // override — ONE answer for the cache fingerprint, the plan build and
+        // every target walk. Masked here (not at the read sites) so a Standard
+        // collection is byte-identical with the key set.
+        runtime_policy.collector_unstable_rows = options.cgan_unstable_rows
+            && options.collection_mode.requires_shrink_only_publication();
+        runtime_policy.collector_unstable_rows_max_permille = options
+            .cgan_unstable_rows_max_frac
+            .map_or(DEFAULT_SPARSE_RELU_MAX_PERMILLE, |frac| {
+                if frac.is_finite() {
+                    (frac.clamp(0.0, 1.0) * 1000.0).round() as u16
+                } else {
+                    DEFAULT_SPARSE_RELU_MAX_PERMILLE
+                }
+            });
         let cut_segment = target_backward::crown_cut_segment_from_env();
         let published_margin_indices = crate::output_margin_seed::published_margin_indices();
         let tightening_cap = options.tightening_cap;
@@ -329,7 +396,8 @@ impl GraphNetwork {
         // the caller's own precomputed IBP map (#cgan-precomputed-ibp-cache).
         let cache_disabled = std::env::var_os("NY_DISABLE_CROWN_COLLECTION_CACHE")
             .is_some_and(|v| v == "1")
-            || sparse_relu_rows_enabled();
+            || sparse_relu_rows_enabled()
+            || options.original_root_head_rows.is_some();
         // #cgan-precomputed-ibp-cache (2026-08-03): `precomputed_ibp` used to
         // force a cache BYPASS (lookup and store). MEASURED on cgan_2023: the
         // root box is collected 7 times, 1 necessary — 403s of an 851s budget
@@ -425,8 +493,7 @@ impl GraphNetwork {
             );
         }
         if let Some((key, ref fp)) = cache_key {
-            // #cgan-engine-agnostic-serve (2026-08-03; removed unannounced by
-            // 12ef71f6c and RESTORED 2026-08-27). The fingerprint embeds
+            // #cgan-engine-agnostic-serve (2026-08-03). The fingerprint embeds
             // `engine_present` and the wrappers split on it —
             // `..._with_precomputed_ibp` threads no engine while `..._and_engine`
             // does — so two callers collecting the SAME box on the SAME network
@@ -606,15 +673,15 @@ impl GraphNetwork {
                         let std_fp_hash = |engine_present: bool| {
                             let fp = self
                                 .crown_ibp_collection_cache_fingerprint_with_runtime_policy(
-                                input,
-                                engine_present,
-                                downstream_resweep,
-                                deadline_salvage_policy,
-                                CrownIbpCollectionMode::Standard,
-                                runtime_policy,
-                                cut_segment,
-                                published_margin_indices.as_deref(),
-                            );
+                                    input,
+                                    engine_present,
+                                    downstream_resweep,
+                                    deadline_salvage_policy,
+                                    CrownIbpCollectionMode::Standard,
+                                    runtime_policy,
+                                    cut_segment,
+                                    published_margin_indices.as_deref(),
+                                );
                             let mut hasher = std::collections::hash_map::DefaultHasher::new();
                             hasher.write(&fp);
                             (hasher.finish(), fp)
@@ -701,7 +768,7 @@ impl GraphNetwork {
                 cap.as_secs(),
             );
         }
-        let fresh = self.collect_crown_ibp_bounds_core_inner_with_mode(
+        let fresh = self.collect_crown_ibp_bounds_core_inner_with_head_rows(
             input,
             ibp_bounds,
             tightening_deadline,
@@ -716,6 +783,7 @@ impl GraphNetwork {
             options.cgan_narrow_target_max_rows,
             prefix_cost_admission_enabled,
             runtime_policy,
+            options.original_root_head_rows,
         )?;
         // #cgan-restart-root-collection-cache: typed cGAN producers always run
         // capped (`complete_cache_lookup_only`), so the historical guard meant
@@ -727,8 +795,9 @@ impl GraphNetwork {
         // entry is only ever served under the exact truncated-reuse scope (or
         // not at all when unscoped). Standard capped callers keep the
         // historical no-store contract unchanged.
-        let store_allowed = !complete_cache_lookup_only
-            || options.collection_mode.requires_shrink_only_publication();
+        let store_allowed = options.original_root_head_rows.is_none()
+            && (!complete_cache_lookup_only
+                || options.collection_mode.requires_shrink_only_publication());
         match cache_key {
             Some((key, fp)) if store_allowed => {
                 // Capture the exact producer policy even when the collection
@@ -834,15 +903,25 @@ impl GraphNetwork {
         // drives the fresh collection, so environment drift after entry cannot
         // relabel or reuse work under a different chunk/Patches/provenance arm.
         fp.extend_from_slice(&(runtime_policy.objective_chunk_rows as u64).to_le_bytes());
-        fp.push(u8::from(
-            runtime_policy.chunk_projection_abort_enabled,
-        ));
+        fp.push(u8::from(runtime_policy.chunk_projection_abort_enabled));
         fp.push(u8::from(runtime_policy.chunk_adaptive_growth_enabled));
         fp.push(u8::from(runtime_policy.chunk_wave_parallel_enabled));
-        fp.push(u8::from(
-            runtime_policy.patches_deadline_flat_bias_enabled,
-        ));
+        fp.push(u8::from(runtime_policy.patches_deadline_flat_bias_enabled));
         fp.push(u8::from(runtime_policy.honest_provenance_enabled));
+        // A dense-collected map and a Patches-collected map for the same box
+        // are both sound and generally differ; they must never serve each
+        // other (#cgan-collector-dense).
+        fp.push(u8::from(runtime_policy.collector_dense_override));
+        // A sparse-seeded map and a full-width map for the same box are both
+        // sound and generally differ; they must never serve each other
+        // (#cgan-unstable-rows). The ceiling rides along because it decides
+        // WHICH targets were walked sparsely.
+        fp.push(u8::from(runtime_policy.collector_unstable_rows));
+        fp.extend_from_slice(
+            &runtime_policy
+                .collector_unstable_rows_max_permille
+                .to_le_bytes(),
+        );
         // The collection mode decides target selection and publication policy
         // (#cgan-restart-root-collection-cache); entries never serve across
         // modes.
@@ -1101,8 +1180,12 @@ impl GraphNetwork {
                 conv_patches_collect_enabled: patches_budget.conv_patches_collect_enabled,
                 crown_mem_cap_env: std::env::var_os("NY_CROWN_MEM_CAP_MB"),
                 patches_gpu_env: std::env::var_os("NY_PATCHES_GPU"),
-                conv_skip_dead_f32_env: std::env::var_os("NY_CONV_SKIP_DEAD_F32"),
-                convtranspose_sound_f64_gpu_env: std::env::var_os("NY_CONVTRANSPOSE_SOUND_F64_GPU"),
+                conv_skip_dead_f32_env: ny_levers::read_raw_os(
+                    &ny_levers::decls::kernel_inputs::CONV_SKIP_DEAD_F32,
+                ),
+                convtranspose_sound_f64_gpu_env: ny_levers::read_raw_os(
+                    &ny_levers::decls::kernel_inputs::CONVTRANSPOSE_SOUND_F64_GPU,
+                ),
                 patches_reentry_min_rows_env: std::env::var_os("NY_PATCHES_REENTRY_MIN_ROWS"),
                 fast_f32_gemm_installed: crate::fast_f32_gemm::is_installed(),
                 sound_f64_gemm_installed: crate::sound_f64_gemm::is_installed(),
@@ -1344,6 +1427,21 @@ impl GraphNetwork {
         fresh: GraphCrownIbpBoundsResult,
         mut truncated_reuse_scope: Option<crate::network::core::graph::CrownIbpTruncatedReuseScope>,
     ) -> GraphCrownIbpBoundsResult {
+        // Defensive authority boundary in addition to the typed lookup/store
+        // bypass: neither a provenance-only nor event-only selected transaction
+        // can be promoted by an older complete cache entry.
+        if fresh.provenance.values().any(|value| {
+            matches!(
+                value,
+                BoundsProvenance::ForwardFallback(CrownIbpFallbackReason::SelectedHeadRows)
+            )
+        }) || fresh
+            .fallback_events
+            .iter()
+            .any(|event| event.reason == CrownIbpFallbackReason::SelectedHeadRows)
+        {
+            return fresh;
+        }
         let fresh_complete = Self::crown_ibp_result_is_complete(&fresh);
         let Ok(mut guard) = self.cached_crown_ibp_collection.slots.write() else {
             return fresh; // poisoned lock: skip caching, never block the result
@@ -1538,7 +1636,7 @@ impl GraphNetwork {
             .bounds)
     }
 
-    /// Collect CROWN-IBP bounds with optional GPU/accelerated GEMM engine (#3549).
+    /// Collect CROWN-IBP bounds with optional GPU/accelerated GEMM engine.
     pub fn collect_crown_ibp_bounds_dag_with_engine(
         &self,
         input: &BoundedTensor,
@@ -1555,7 +1653,7 @@ impl GraphNetwork {
             .bounds)
     }
 
-    /// Collect CROWN-IBP bounds with a deadline (#3109).
+    /// Collect CROWN-IBP bounds with a deadline.
     pub fn collect_crown_ibp_bounds_dag_with_deadline(
         &self,
         input: &BoundedTensor,
@@ -1572,7 +1670,7 @@ impl GraphNetwork {
             .bounds)
     }
 
-    /// Collect CROWN-IBP bounds with deadline and optional GPU GEMM engine (#3549).
+    /// Collect CROWN-IBP bounds with deadline and optional GPU GEMM engine.
     pub fn collect_crown_ibp_bounds_dag_with_deadline_and_engine(
         &self,
         input: &BoundedTensor,
@@ -1625,7 +1723,7 @@ impl GraphNetwork {
         self.collect_crown_ibp_bounds_dag_with_options(input, CrownIbpCollectOptions::default())
     }
 
-    /// Collect CROWN-IBP bounds with per-node provenance and optional GPU engine (#3549).
+    /// Collect CROWN-IBP bounds with per-node provenance and optional GPU engine.
     pub fn collect_crown_ibp_bounds_dag_with_status_and_engine(
         &self,
         input: &BoundedTensor,
@@ -1640,7 +1738,7 @@ impl GraphNetwork {
         )
     }
 
-    /// Collect CROWN-IBP bounds using pre-computed IBP bounds (#3596).
+    /// Collect CROWN-IBP bounds using pre-computed IBP bounds.
     pub fn collect_crown_ibp_bounds_dag_with_precomputed_ibp(
         &self,
         input: &BoundedTensor,
@@ -1657,7 +1755,7 @@ impl GraphNetwork {
         )
     }
 
-    /// Collect CROWN-IBP bounds with pre-computed IBP and width skip (#3499).
+    /// Collect CROWN-IBP bounds with pre-computed IBP and width skip.
     pub fn collect_crown_ibp_bounds_dag_with_precomputed_ibp_and_width_threshold(
         &self,
         input: &BoundedTensor,
@@ -1676,7 +1774,7 @@ impl GraphNetwork {
         )
     }
 
-    /// Collect CROWN-IBP bounds with pre-computed IBP and GPU engine (#3549).
+    /// Collect CROWN-IBP bounds with pre-computed IBP and GPU engine.
     pub fn collect_crown_ibp_bounds_dag_with_precomputed_ibp_and_engine(
         &self,
         input: &BoundedTensor,
@@ -1716,7 +1814,7 @@ impl GraphNetwork {
         )
     }
 
-    /// Core CROWN-IBP collection with optional deadline (#3109) and engine (#3549).
+    /// Core CROWN-IBP collection with optional deadline and engine.
     ///
     /// When deadline is exceeded mid-collection, remaining nodes use IBP fallback
     /// with `DeadlineExceeded` provenance. This is sound (IBP bounds are valid,
@@ -1780,7 +1878,7 @@ impl GraphNetwork {
     /// 2. Running backward CROWN through this subgraph
     /// 3. Concretizing at the input
     ///
-    /// `per_node_deadline` is an optional per-node time budget (#3499). When
+    /// `per_node_deadline` is an optional per-node time budget. When
     /// set, the backward layer loop bails out early if the budget is exhausted,
     /// returning `UnsupportedConfiguration` so the tightening loop can fall
     /// back to IBP and move on to other nodes.
@@ -1822,7 +1920,7 @@ impl GraphNetwork {
     }
 
     /// Collector-specific backward CROWN that uses patches mode for spatial
-    /// Conv2d targets even when the global conv_mode is matrix (#3813).
+    /// Conv2d targets even when the global conv_mode is matrix.
     ///
     /// The CROWN-IBP intermediate bounds collector doesn't use cutting planes,
     /// so the matrix-mode constraint (required for BaB cuts) doesn't apply.
@@ -1939,14 +2037,41 @@ impl GraphNetwork {
         )
     }
 
+    /// Borrow the ancestor nodes of a target (nodes that can reach target),
+    /// in topological order (dependencies before dependents).
+    ///
+    /// Same names in the same order as [`Self::ancestors`], but the slice
+    /// points into the `all_ancestors` cache itself, so a call is a hash
+    /// lookup rather than one heap allocation per ancestor name. Prefer this
+    /// form wherever the caller only reads the list; the borrow lasts as long
+    /// as the slice is held, so a caller that must keep the names past a
+    /// reborrow of `self` still wants the owning form.
+    ///
+    /// This is name bookkeeping: no bound coefficient is read, produced, or
+    /// reordered here, so the borrowing and owning forms are interchangeable
+    /// for every float downstream.
+    ///
+    /// A target with no cache entry borrows the empty slice, matching the
+    /// owning form's `unwrap_or_default()` — callers read empty as "this node
+    /// has no backward ancestry".
+    pub(super) fn ancestors_ref(&self, target: &str) -> Result<&[String]> {
+        let empty: &[String] = &[];
+        let all = self.all_ancestors()?;
+        Ok(all.get(target).map_or(empty, Vec::as_slice))
+    }
+
     /// All ancestor nodes of a target (nodes that can reach target).
     /// Returns nodes in topological order (dependencies before dependents).
     ///
-    /// Uses the cached all-ancestors map (#2220 Packet A) so repeated calls
+    /// Uses the cached all-ancestors map so repeated calls
     /// during CROWN-IBP collection are O(1) lookups instead of O(N+E) BFS each.
+    ///
+    /// The copy out of that cache is what remains of the per-call cost (one
+    /// allocation per ancestor name, every call, every domain). Callers that
+    /// only read the list should take [`Self::ancestors_ref`]; this form is for
+    /// callers that genuinely need to own the names.
     pub(super) fn ancestors(&self, target: &str) -> Result<Vec<String>> {
-        let all = self.all_ancestors()?;
-        Ok(all.get(target).cloned().unwrap_or_default())
+        Ok(self.ancestors_ref(target)?.to_vec())
     }
 
     /// NaN-safe element-wise addition of all 4 coefficient fields (lower_a,
@@ -1986,6 +2111,89 @@ impl GraphNetwork {
         } else {
             node_linear_bounds.insert(input_name.to_string(), new_bounds);
         }
+    }
+}
+
+#[cfg(test)]
+mod ancestor_borrow_tests {
+    use super::*;
+    use crate::layers::{LinearLayer, ReLULayer};
+    use crate::network::core::GraphNode;
+    use ndarray::{arr1, arr2};
+
+    fn chain_graph() -> GraphNetwork {
+        let mut graph = GraphNetwork::new();
+        let l1 = LinearLayer::new(
+            arr2(&[[1.0_f32, 0.5], [-0.5, 1.0]]),
+            Some(arr1(&[0.1_f32, -0.1])),
+        )
+        .unwrap();
+        graph.add_node(GraphNode::from_input("l1", Layer::Linear(l1)));
+        graph.add_node(GraphNode::new(
+            "relu",
+            Layer::ReLU(ReLULayer),
+            vec!["l1".into()],
+        ));
+        graph.set_output("relu");
+        graph
+    }
+
+    /// Fails closed on the accessor quietly reverting to a copy: the slice must
+    /// alias the cache's own buffer. Comparing contents alone would pass just as
+    /// happily against a fresh `Vec`, which is the cost this form exists to
+    /// remove, so the pointer identity is the assertion that carries the claim.
+    #[test]
+    fn ancestors_ref_aliases_the_cache_rather_than_copying_it() {
+        let graph = chain_graph();
+        let cached = graph
+            .all_ancestors()
+            .expect("ancestor cache builds")
+            .get("relu")
+            .expect("relu has a cache entry");
+        let expected = ["l1".to_string(), "relu".to_string()];
+        assert_eq!(
+            cached.as_slice(),
+            expected.as_slice(),
+            "cached ancestry is the chain in topological order, target included"
+        );
+
+        let borrowed = graph.ancestors_ref("relu").expect("borrowed ancestry");
+        assert_eq!(
+            borrowed.as_ptr(),
+            cached.as_ptr(),
+            "ancestors_ref must hand back the cache's buffer, not a copy of it"
+        );
+    }
+
+    /// The owning form keeps its contract: same names, same order, and a buffer
+    /// of its own. The `assert_ne!` is the fail-closed half — if it ever aliased
+    /// the cache, callers holding the `Vec` would be holding a borrow of `self`.
+    #[test]
+    fn ancestors_matches_the_borrow_and_still_owns_its_names() {
+        let graph = chain_graph();
+        let owned = graph.ancestors("relu").expect("owned ancestry");
+        let borrowed = graph.ancestors_ref("relu").expect("borrowed ancestry");
+        assert_eq!(owned.as_slice(), borrowed);
+        assert!(
+            !owned.is_empty(),
+            "the pointer comparison below is only meaningful for a nonempty ancestry"
+        );
+        assert_ne!(
+            owned.as_ptr(),
+            borrowed.as_ptr(),
+            "the owning form must still copy out of the cache"
+        );
+    }
+
+    /// An unknown target is an empty ancestry in both forms, never an error:
+    /// callers branch on `is_empty()` to reject a target with no backward path.
+    #[test]
+    fn unknown_target_is_empty_in_both_forms() {
+        let graph = chain_graph();
+        let borrowed = graph.ancestors_ref("absent").expect("borrowed ancestry");
+        let owned = graph.ancestors("absent").expect("owned ancestry");
+        assert_eq!((borrowed).len(), 0);
+        assert_eq!((owned).len(), 0);
     }
 }
 
@@ -2111,6 +2319,95 @@ mod collection_cache_key_tests {
         assert_ne!(
             guarded, unguarded,
             "a guard-off complete entry must never serve guard-on provenance"
+        );
+    }
+
+    /// #cgan-collector-dense (E5): the dense-mode override is cache identity —
+    /// a Patches-collected entry and a dense-collected entry for the SAME box
+    /// carry different (sound) maps and must never serve each other. It is
+    /// request-scoped: the lever-derived policy never arms it.
+    #[test]
+    fn collector_dense_override_is_part_of_complete_cache_identity() {
+        let graph = small_graph();
+        let input = unit_box();
+        let disabled = target_backward::PartialCrownDeadlineSalvagePolicy::Disabled;
+        let patches_policy = graph.crown_ibp_runtime_policy();
+        assert!(
+            !patches_policy.collector_dense_override,
+            "the lever-derived policy must leave the dense override dark"
+        );
+        let mut dense_policy = patches_policy;
+        dense_policy.collector_dense_override = true;
+        let patches = graph.crown_ibp_collection_cache_fingerprint_with_runtime_policy(
+            &input,
+            false,
+            false,
+            disabled,
+            CrownIbpCollectionMode::CganComplete,
+            patches_policy,
+            0,
+            None,
+        );
+        let dense = graph.crown_ibp_collection_cache_fingerprint_with_runtime_policy(
+            &input,
+            false,
+            false,
+            disabled,
+            CrownIbpCollectionMode::CganComplete,
+            dense_policy,
+            0,
+            None,
+        );
+        assert_ne!(
+            patches, dense,
+            "a Patches-mode entry must never serve a dense-mode request"
+        );
+    }
+
+    /// #cgan-unstable-rows: the sparse-row override and its ceiling are cache
+    /// identity for the same reason the dense override is — a map whose wide
+    /// targets were walked over k rows and a map walked full-width are both
+    /// sound and generally differ, so they must never serve each other. It is
+    /// request-scoped: the lever-derived policy never arms it.
+    #[test]
+    fn collector_unstable_rows_is_part_of_complete_cache_identity() {
+        let graph = small_graph();
+        let input = unit_box();
+        let disabled = target_backward::PartialCrownDeadlineSalvagePolicy::Disabled;
+        let base_policy = graph.crown_ibp_runtime_policy();
+        assert!(
+            !base_policy.collector_unstable_rows,
+            "the lever-derived policy must leave the sparse-row override dark"
+        );
+        assert_eq!(
+            base_policy.collector_unstable_rows_max_permille,
+            DEFAULT_SPARSE_RELU_MAX_PERMILLE,
+        );
+        let fingerprint = |policy| {
+            graph.crown_ibp_collection_cache_fingerprint_with_runtime_policy(
+                &input,
+                false,
+                false,
+                disabled,
+                CrownIbpCollectionMode::CganComplete,
+                policy,
+                0,
+                None,
+            )
+        };
+        let mut armed_policy = base_policy;
+        armed_policy.collector_unstable_rows = true;
+        let mut narrower_policy = armed_policy;
+        narrower_policy.collector_unstable_rows_max_permille = 500;
+        assert_ne!(
+            fingerprint(base_policy),
+            fingerprint(armed_policy),
+            "a full-width entry must never serve a sparse-row consumer"
+        );
+        assert_ne!(
+            fingerprint(armed_policy),
+            fingerprint(narrower_policy),
+            "the minimum_sparsity ceiling decides WHICH targets were walked sparsely"
         );
     }
 
@@ -2249,6 +2546,9 @@ mod collection_cache_key_tests {
                 chunk_wave_parallel_enabled: false,
                 patches_deadline_flat_bias_enabled: false,
                 honest_provenance_enabled: true,
+                collector_dense_override: false,
+                collector_unstable_rows: false,
+                collector_unstable_rows_max_permille: DEFAULT_SPARSE_RELU_MAX_PERMILLE,
             }
         );
         assert!(
@@ -2268,6 +2568,9 @@ mod collection_cache_key_tests {
                 chunk_wave_parallel_enabled: true,
                 patches_deadline_flat_bias_enabled: true,
                 honest_provenance_enabled: false,
+                collector_dense_override: false,
+                collector_unstable_rows: false,
+                collector_unstable_rows_max_permille: DEFAULT_SPARSE_RELU_MAX_PERMILLE,
             }
         );
         assert!(
@@ -3314,8 +3617,9 @@ mod collection_cache_key_tests {
             graph.set_crown_ibp_per_node_time_budget(CrownIbpPerNodeTimeBudget {
                 floor_secs: Some(0.25),
                 cap_secs: Some(99.0),
-            prefix_cost_weighted: false,
+                prefix_cost_weighted: false,
                 max_target_share_frac: None,
+                floor_dim_scaled: false,
             });
             assert!(
                 graph
@@ -3538,9 +3842,13 @@ mod narrow_target_budget_tests {
         // or under it this pre-layer would itself be demanded, and refining it
         // would tighten what flows into `wide`, so `wide` would come back
         // tighter than baseline while genuinely being declined.
-        let w0 = Array2::from_shape_fn((6, 2), |(r, c)| 0.9 - 0.35 * (r as f32) + 0.55 * (c as f32));
-        let l0 = LinearLayer::new(w0, Some(Array1::from_shape_fn(6, |r| 0.1 - 0.08 * r as f32)))
-            .unwrap();
+        let w0 =
+            Array2::from_shape_fn((6, 2), |(r, c)| 0.9 - 0.35 * (r as f32) + 0.55 * (c as f32));
+        let l0 = LinearLayer::new(
+            w0,
+            Some(Array1::from_shape_fn(6, |r| 0.1 - 0.08 * r as f32)),
+        )
+        .unwrap();
         graph.add_node(GraphNode::from_input("pre", Layer::Linear(l0)));
         graph.add_node(GraphNode::new(
             "pre_relu",
@@ -3550,8 +3858,11 @@ mod narrow_target_budget_tests {
         let w1 = Array2::from_shape_fn((8, 6), |(r, c)| {
             0.6 - 0.17 * (r as f32) + 0.43 * (c as f32) - 0.09 * ((r * c) as f32)
         });
-        let l1 = LinearLayer::new(w1, Some(Array1::from_shape_fn(8, |r| 0.05 * r as f32 - 0.2)))
-            .unwrap();
+        let l1 = LinearLayer::new(
+            w1,
+            Some(Array1::from_shape_fn(8, |r| 0.05 * r as f32 - 0.2)),
+        )
+        .unwrap();
         graph.add_node(GraphNode::new(
             "wide",
             Layer::Linear(l1),
@@ -3565,8 +3876,11 @@ mod narrow_target_budget_tests {
         let w2 = Array2::from_shape_fn((3, 8), |(r, c)| {
             0.31 - 0.11 * (r as f32) + 0.07 * (c as f32) - 0.05 * ((r + c) as f32)
         });
-        let l2 =
-            LinearLayer::new(w2, Some(Array1::from_shape_fn(3, |r| 0.1 - 0.04 * r as f32))).unwrap();
+        let l2 = LinearLayer::new(
+            w2,
+            Some(Array1::from_shape_fn(3, |r| 0.1 - 0.04 * r as f32)),
+        )
+        .unwrap();
         graph.add_node(GraphNode::new(
             "narrow",
             Layer::Linear(l2),
@@ -3635,18 +3949,14 @@ mod narrow_target_budget_tests {
             for j in 0..steps {
                 let t0 = i as f32 / (steps - 1) as f32;
                 let t1 = j as f32 / (steps - 1) as f32;
-                let pt = arr1(&[
-                    lo[0] + t0 * (hi[0] - lo[0]),
-                    lo[1] + t1 * (hi[1] - lo[1]),
-                ])
-                .into_dyn();
+                let pt =
+                    arr1(&[lo[0] + t0 * (hi[0] - lo[0]), lo[1] + t1 * (hi[1] - lo[1])]).into_dyn();
                 let point = BoundedTensor::new(pt.clone(), pt).unwrap();
                 let acts = graph
                     .collect_node_activations_pointwise(&point, None)
                     .expect("pointwise activations");
                 for (name, value) in acts {
-                    let v: Array1<f32> =
-                        value.center().iter().copied().collect::<Vec<_>>().into();
+                    let v: Array1<f32> = value.center().iter().copied().collect::<Vec<_>>().into();
                     match env.get_mut(&name) {
                         Some((mn, mx)) => {
                             for (k, x) in v.iter().enumerate() {
@@ -3790,6 +4100,69 @@ mod narrow_target_budget_tests {
                          seeded baseline {b}; the published map must stay shrink-only"
                     );
                 }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod selected_head_cache_tests {
+    use super::*;
+    use crate::layers::{Layer, LinearLayer, ReLULayer};
+    use crate::network::GraphNode;
+    use ndarray::{arr1, arr2};
+
+    #[test]
+    fn selected_head_cache_store_refuses_provenance_or_event_without_promoting_complete_side() {
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input(
+            "pre",
+            Layer::Linear(LinearLayer::new(arr2(&[[1f32]]), None).unwrap()),
+        ));
+        graph.add_node(GraphNode::new(
+            "act",
+            Layer::ReLU(ReLULayer),
+            vec!["pre".into()],
+        ));
+        graph.set_output("act");
+        let input =
+            BoundedTensor::new(arr1(&[-1f32]).into_dyn(), arr1(&[1f32]).into_dyn()).unwrap();
+        let complete = graph
+            .collect_crown_ibp_bounds_dag_with_status(&input)
+            .unwrap();
+        let key = graph.crown_ibp_collection_cache_key(&input, false);
+        let fp = graph.crown_ibp_collection_cache_fingerprint(&input, false);
+        graph.crown_ibp_collection_store(key, fp.clone(), complete.clone(), None);
+        let reason = CrownIbpFallbackReason::SelectedHeadRows;
+        for event_only in [false, true] {
+            let mut partial = complete.clone();
+            if event_only {
+                partial
+                    .fallback_events
+                    .push(crate::types::CrownIbpFallbackEvent {
+                        layer_index: 0,
+                        layer_type: "Linear".into(),
+                        reason,
+                        details: "selected=1 total=2".into(),
+                    });
+            } else {
+                partial
+                    .provenance
+                    .insert("pre".into(), BoundsProvenance::ForwardFallback(reason));
+            }
+            assert!(!GraphNetwork::crown_ibp_result_is_complete(&partial));
+            assert!(graph
+                .crown_ibp_truncated_reuse_scope(&partial, Some(Duration::from_secs(2)))
+                .is_none());
+            let returned = graph.crown_ibp_collection_store(key, fp.clone(), partial, None);
+            assert!(!GraphNetwork::crown_ibp_result_is_complete(&returned));
+            if event_only {
+                assert!(returned.fallback_events.iter().any(|e| e.reason == reason));
+            } else {
+                assert_eq!(
+                    returned.provenance["pre"],
+                    BoundsProvenance::ForwardFallback(reason)
+                );
             }
         }
     }

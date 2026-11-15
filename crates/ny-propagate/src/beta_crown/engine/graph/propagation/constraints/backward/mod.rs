@@ -10,9 +10,6 @@
 //!
 //! Both share ~90% of their match arms. This module unifies them behind a single
 //! traversal function parameterized by `BackwardMode`, eliminating drift risk.
-//!
-//! Part of #1813 (wave 2 dedup).
-//! Split into directory module by #4293.
 
 mod dispatch;
 mod finalize;
@@ -60,7 +57,7 @@ pub(in crate::beta_crown::engine::graph::propagation) struct BackwardParams<'a> 
     pub(in crate::beta_crown::engine::graph::propagation) beta_state:
         Option<&'a crate::beta_crown::state::GraphBetaState>,
     pub(in crate::beta_crown::engine::graph::propagation) objective: Option<&'a [f32]>,
-    /// Multi-row spec matrix for batched spec-guided CROWN (#4306).
+    /// Multi-row spec matrix for batched spec-guided CROWN.
     /// When set, seeds the backward pass with an (N, D) matrix instead of
     /// identity or a single-row objective. Takes precedence over `objective`.
     pub(in crate::beta_crown::engine::graph::propagation) spec_matrix:
@@ -68,7 +65,7 @@ pub(in crate::beta_crown::engine::graph::propagation) struct BackwardParams<'a> 
     pub(in crate::beta_crown::engine::graph::propagation) seed_cache:
         Option<&'a CachedLinearBounds>,
     pub(in crate::beta_crown::engine::graph::propagation) capture_linear_bounds: bool,
-    /// Per-node deadline for intra-kernel timeout enforcement (#3795).
+    /// Per-node deadline for intra-kernel timeout enforcement.
     /// When set, the DispatchContext carries this deadline so expensive
     /// backward kernels (e.g., Conv2d) can bail early.
     pub(in crate::beta_crown::engine::graph::propagation) deadline: Option<std::time::Instant>,
@@ -90,6 +87,10 @@ struct ConstrainedBackwardState {
     node_crown_bounds: CrownMergeAccumulator,
     intermediate: Option<GraphAlphaCrownIntermediate>,
     captured_linear_bounds: Option<HashMap<String, LinearBounds>>,
+    /// #la-warm-frontier: per captured split-site node, the rest of this
+    /// pass's backward state when it popped that node. `Some` only when the
+    /// pass captures lA AND `bab.la_warm_frontier` is armed.
+    captured_frontiers: Option<HashMap<String, crate::batched_domain::WarmFrontier>>,
     input_accumulated: bool,
 }
 
@@ -291,7 +292,7 @@ fn run_deadline_bounded_beta_stream_with_clock(
                     budget_bytes: MAX_GPU_BETA_SEED_ELEMENTS.saturating_mul(size_of::<f32>()),
                     site: "deadline-bounded beta duplicate staging",
                 })?;
-            for physical_row in range.clone() {
+            for physical_row in range {
                 let logical_row = physical_row.min(num_specs - 1);
                 let start = logical_row * output_dim;
                 duplicated.extend_from_slice(&seed_rows[start..start + output_dim]);

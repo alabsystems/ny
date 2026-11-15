@@ -27,7 +27,7 @@
 //! `PASSTHROUGH_SHADERS` path, and the same probe kernel may stop flushing.
 //!
 //! This executable is a REPORTING probe, not a libtest gate: run it explicitly
-//! with `cargo run -p ny-gpu --features gpu-tests --example
+//! with `targo --unverified run -p ny-gpu --features gpu-tests --example
 //! denorm-preserve-probe`. It prints what it finds and
 //! asserts only its own internal consistency. Whatever it reports, the live
 //! authority ladder's narrower rung 3 remains the sole authority input. This
@@ -434,14 +434,19 @@ fn main() {
     };
     let features = adapter.features();
     let has_passthrough = features.contains(wgpu::Features::PASSTHROUGH_SHADERS);
+    // The injected arm is SPIR-V, which wgpu loads through passthrough only on
+    // Vulkan; Metal advertises PASSTHROUGH_SHADERS for MSL and rejects it.
+    let spirv_passthrough =
+        ny_gpu_passthrough::spirv_passthrough_supported(features, adapter.get_info().backend);
     println!(
-        "denorm-chase: adapter = {} / {:?}; PASSTHROUGH_SHADERS = {has_passthrough}",
+        "denorm-chase: adapter = {} / {:?}; PASSTHROUGH_SHADERS = {has_passthrough}; \
+         SPIR-V passthrough = {spirv_passthrough}",
         adapter.get_info().name,
         adapter.get_info().backend
     );
 
     let mut requested = wgpu::Features::empty();
-    if has_passthrough {
+    if spirv_passthrough {
         requested |= wgpu::Features::PASSTHROUGH_SHADERS;
     }
     let (device, queue) =
@@ -478,10 +483,12 @@ fn main() {
         }
 
     // Arm 2: naga SPIR-V + DenormPreserve injection via passthrough.
-    if !has_passthrough {
+    if !spirv_passthrough {
         eprintln!(
-            "denorm-chase: PASSTHROUGH_SHADERS unavailable; injected arm = \
-                 unknown (refused). The chase needs a different loading path."
+            "denorm-chase: SPIR-V passthrough unavailable (PASSTHROUGH_SHADERS = \
+             {has_passthrough} on {:?}; wgpu reads the SPIR-V payload only on Vulkan); \
+             injected arm = unknown (refused). The chase needs a different loading path.",
+            adapter.get_info().backend
         );
         std::process::exit(2);
     }

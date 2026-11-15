@@ -8,8 +8,6 @@
 //! The scalar structural `Sampling` coverage remains in crown_normalization.rs.
 //! These containment tests use `LayerNormCrownMode::IbpValidated`, the sound
 //! normalization CROWN mode.
-//!
-//! Part of #2426.
 
 use crate::layers::normalization::{LayerNormCrownMode, LayerNormLayer, LayerNormMode};
 use crate::{BatchedLinearBounds, LinearBounds};
@@ -53,8 +51,6 @@ fn concretize_batched_crown(
 // The batched path (propagate_linear_batched_with_bounds) delegates to the
 // scalar path per batch position. These tests verify the batched wrapper
 // itself doesn't break soundness during reshape/reassembly.
-//
-// Part of #2426.
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(300) })]
@@ -62,7 +58,6 @@ proptest! {
     /// LayerNorm batched CROWN soundness with identity incoming, tight perturbation.
     /// Verifies that for sampled concrete inputs within bounds, the true LayerNorm
     /// output falls within the CROWN-computed bounds for a 2-batch input.
-    /// Part of #2426.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_layernorm_batched_crown_identity_tight(
@@ -169,8 +164,6 @@ proptest! {
 // Prover P1#914 finding: batched soundness coverage only used identity incoming.
 // This test uses non-trivial (mixed-sign) incoming coefficients to exercise
 // the batched CROWN backward path with coefficient composition.
-//
-// Part of #2426.
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(300) })]
@@ -178,7 +171,6 @@ proptest! {
     /// LayerNorm batched CROWN soundness with non-trivial incoming coefficients.
     /// Uses a single output row with mixed-sign coefficients per batch position,
     /// verifying that the composed CROWN bounds contain the true output.
-    /// Part of #2426.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_layernorm_batched_crown_negcoeff(
@@ -289,8 +281,6 @@ proptest! {
 // This is an affine function of x (linear in each x_i), so the CROWN
 // linearization should be exact (no sampling needed). Test both scalar
 // and batched paths.
-//
-// Part of #2426.
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(500) })]
@@ -298,7 +288,6 @@ proptest! {
     /// LayerNorm MeanOnly CROWN scalar soundness with identity incoming.
     /// Since mean-only is affine, the CROWN bounds should tightly contain
     /// all evaluations.
-    /// Part of #2426.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_layernorm_mean_only_crown_identity(
@@ -378,7 +367,6 @@ proptest! {
     }
 
     /// LayerNorm MeanOnly CROWN soundness with negative-coefficient incoming.
-    /// Part of #2426.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_layernorm_mean_only_crown_negcoeff(
@@ -462,14 +450,11 @@ proptest! {
 // =============================================================================
 // LAYERNORM MEAN-ONLY BATCHED CROWN BACKWARD SOUNDNESS
 // =============================================================================
-//
-// Part of #2426.
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(300) })]
 
     /// LayerNorm MeanOnly batched CROWN soundness with identity incoming.
-    /// Part of #2426.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_layernorm_mean_only_batched_crown_identity(
@@ -574,8 +559,6 @@ proptest! {
 // MeanOnly CROWN has identity and negcoeff (symmetric la==ua) scalar tests,
 // plus a batched identity test. These two tests fill the remaining gaps:
 // asymmetric incoming (la != ua) and batched with non-trivial coefficients.
-//
-// Part of #3333.
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(300) })]
@@ -585,7 +568,6 @@ proptest! {
     /// In multi-layer CROWN backward propagation, lower and upper incoming
     /// coefficients diverge. MeanOnly is affine so the bounds should be tight,
     /// but the coefficient split path must be exercised.
-    /// Part of #3333.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_layernorm_mean_only_crown_asymmetric(
@@ -682,7 +664,6 @@ proptest! {
     ///
     /// The existing batched MeanOnly test only uses identity incoming.
     /// This tests mixed-sign coefficients to exercise the batched composition path.
-    /// Part of #3333.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_layernorm_mean_only_batched_crown_negcoeff(
@@ -786,14 +767,11 @@ proptest! {
 // (lower_a != upper_a). In real CROWN backward propagation, after composing
 // through several layers, lower_a and upper_a diverge. This exercises the
 // coefficient split path in the batched wrapper.
-//
-// Part of #3174.
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(200) })]
 
     /// LayerNorm batched CROWN soundness with asymmetric incoming (la != ua).
-    /// Part of #3174.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_layernorm_batched_crown_asymmetric(

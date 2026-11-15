@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! GenBaB constraint integration regressions (#2399).
+//! GenBaB constraint integration regressions.
 
 use ndarray::arr1;
 use std::collections::HashMap;
@@ -14,7 +14,7 @@ use super::operator_dispatch::build_sigmoid_graph;
 use super::support::scalar_interval;
 use super::TOL;
 // =========================================================================
-// #2399: GenBaB constraint integration in forward pass
+// GenBaB constraint integration in forward pass
 // =========================================================================
 
 /// Test that `apply_genbab_pre_constraints` correctly tightens bounds at

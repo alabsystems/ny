@@ -228,7 +228,7 @@ mod tests {
             bias_err: 0.0,
         };
         assert!(f.is_empty());
-        assert!(f.post_terms().is_empty());
-        assert!(f.pre_terms().is_empty());
+        assert_eq!(f.post_terms().len(), 0);
+        assert_eq!(f.pre_terms().len(), 0);
     }
 }

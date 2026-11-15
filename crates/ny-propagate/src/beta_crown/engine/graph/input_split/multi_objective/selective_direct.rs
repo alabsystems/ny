@@ -248,7 +248,7 @@ mod tests {
         let second = [candidate(8, -1.0, 1.0, 0.0), candidate(7, 1.0, 1.0, 0.0)];
         let mut quota = SelectiveDirectQuota::new(SELECTIVE_DIRECT_STRIDE);
 
-        assert!(quota.select(&first).is_empty());
+        assert_eq!((quota.select(&first)).len(), 0);
         assert_eq!(quota.candidates_seen(), 7);
         assert_eq!(quota.selected(), 0);
         assert_eq!(quota.select(&second), vec![7]);
@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn zero_stride_is_disabled_without_accounting() {
         let mut quota = SelectiveDirectQuota::new(0);
-        assert!(quota.select(&[candidate(0, 1.0, 1.0, 1.0)]).is_empty());
+        assert_eq!((quota.select(&[candidate(0, 1.0, 1.0, 1.0)])).len(), 0);
         assert_eq!(quota.candidates_seen(), 0);
         assert_eq!(quota.selected(), 0);
     }

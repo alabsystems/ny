@@ -13,10 +13,22 @@ use std::path::Path;
 use std::process::{Command, ExitCode};
 
 fn main() -> ExitCode {
-    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    // `$CARGO` is the build tool running this (targo in the Trust toolchain);
+    // targo otherwise. targo builds only in a named lane, so it is handed
+    // `--unverified`; a stock cargo has no lanes.
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| "targo".into());
+    let lane: &[&str] = if Path::new(&cargo)
+        .file_stem()
+        .is_some_and(|stem| stem == "targo")
+    {
+        &["--unverified"]
+    } else {
+        &[]
+    };
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
 
     let status = Command::new(cargo)
+        .args(lane)
         .arg("test")
         .arg("--release")
         .arg("--manifest-path")

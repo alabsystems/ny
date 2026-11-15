@@ -52,6 +52,15 @@ pub use producer::{
 // surface.
 #[allow(dead_code)]
 mod certified_cut_authority;
+pub(crate) use certified_cut_authority::{
+    evaluate_raw_local_l1_root_cut, evaluate_raw_root_cut, evaluate_raw_triplet_root_cut,
+    evaluate_raw_two_local_l1_root_cut, evaluate_raw_two_pair_root_cut,
+    quote_raw_local_l1_root_cut, quote_raw_root_cut, quote_raw_triplet_root_cut,
+    quote_raw_two_local_l1_root_cut, quote_raw_two_pair_root_cut, CompletedRawLocalL1RootCut,
+    CompletedRawRootCut, CompletedRawTripletRootCut, CompletedRawTwoLocalL1RootCut,
+    CompletedRawTwoPairRootCut, RawLocalL1RootCutQuote, RawRootCutLimits, RawRootCutQuote,
+    RawTripletRootCutQuote, RawTwoLocalL1RootCutQuote, RawTwoPairRootCutQuote,
+};
 #[allow(dead_code)]
 mod certified_cut_m2_shadow;
 #[allow(dead_code)]
@@ -1078,3 +1087,9 @@ impl MultiNeuronPool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use certified_cut_authority::{
+    local_l1_test_support, test_support, triplet_test_support, two_local_l1_test_support,
+    two_pair_test_support,
+};

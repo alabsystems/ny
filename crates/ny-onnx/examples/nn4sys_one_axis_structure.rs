@@ -12,7 +12,7 @@
 //! Example:
 //!
 //! ```text
-//! cargo run -p ny-onnx --example nn4sys_one_axis_structure -- \
+//! targo --unverified run -p ny-onnx --example nn4sys_one_axis_structure -- \
 //!   /absolute/path/mscn_2048d.onnx 54,68,82
 //! ```
 //!

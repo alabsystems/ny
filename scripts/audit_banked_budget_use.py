@@ -127,12 +127,22 @@ def load_budgets(corpus="2026"):
 
 
 def parse_bank_row(row):
-    """(verdict, seconds) from a measured-5 / -6 / -7 row, or None."""
+    """(verdict, seconds) from a measured-5 / -6 / -7 row, or None.
+
+    The verdict token is validated on EVERY branch, not only measured-5. Two
+    bank files (`measured/lsnc_relu.csv`, `measured/relusplitter.csv`) open
+    with a `cat,onnx,vnnlib,prepared,verdict,secs,run_id` header line, and the
+    previously-unvalidated measured-6/7 branch parsed that header as a banked
+    row keyed `('onnx', 'vnnlib')` with verdict `'verdict'` -- which then
+    surfaced as one phantom UN-AUDITED row each under lsnc_relu and
+    relusplitter (census 2026-08-31)."""
     if len(row) < 5:
         return None
     if row[3].strip() in VERDICT_TOKENS:      # measured-5: no prepare_status
         return row[3].strip(), row[4]
     if len(row) < 6:
+        return None
+    if row[4].strip() not in VERDICT_TOKENS:  # header or malformed line
         return None
     return row[4].strip(), row[5]
 
@@ -174,13 +184,13 @@ def audit(threshold, overrun=1.0, corpus="2026"):
     budgets = load_budgets(corpus)
     hits = []
     over = []
-    unmatched = defaultdict(int)
+    unmatched = []
     for (bench, onnx, vnnlib), (verdict, seconds) in load_banked_rows().items():
         if verdict in SOLVED:
             continue
         budget = budgets.get((bench, onnx, vnnlib))
         if budget is None:
-            unmatched[bench] += 1
+            unmatched.append((bench, onnx, vnnlib, verdict, seconds))
             continue
         try:
             wall = float(seconds)
@@ -191,7 +201,64 @@ def audit(threshold, overrun=1.0, corpus="2026"):
             hits.append(rec)
         elif wall > overrun * budget:
             over.append(rec)
-    return hits, over, unmatched, len(budgets)
+    return hits, over, classify_unmatched(unmatched, budgets), len(budgets)
+
+
+def classify_unmatched(unmatched, budgets):
+    """Say WHY each un-audited row has no 2026 corpus identity.
+
+    667 banked non-solved rows used to fall through here as a bare count --
+    a blind spot that read as a clean bill. The 2026-08-31 census classified
+    every one; this function keeps that classification live so a NEW unmatched
+    row lands in a named bucket (or in ORPHAN, which demands a human) instead
+    of disappearing into a total.
+
+      STALE-2025-RESAMPLED  the model (onnx basename) IS in the 2026 corpus but
+                            the property is not: the family was resampled for
+                            2026 and the row names a 2025-only instance. It is
+                            a 2025 bank row; 2026 budget statements do not
+                            apply to it, and it must not be scored as 2026.
+                            Proven exhaustively for cifar100_2024, the one
+                            family whose 2025 corpus is on disk: all 200 bank
+                            identities are in the 2025 instances.csv, of which
+                            the 2026 resample kept exactly 18.
+      2025-FAMILY-DROPPED   the benchmark name itself is not in the 2026
+                            corpus. relusplitter -> relusplitter_2026 and
+                            cgan_2023 -> cgan2026 share ZERO instance
+                            identities with their successors (see the
+                            no-aliasing note above), so these rows have no
+                            2026 meaning at all.
+      WARMUP-UNSCORED       the test_nano warmup pair, absent from every
+                            instances.csv by design (the dist_shift copy even
+                            carries run_id
+                            `unscored-warmup-absent-from-instances-csv`).
+      ORPHAN                none of the above. Investigate before trusting
+                            anything about the row.
+
+    Class names are worded for the DEFAULT corpus (2026). Under `--corpus
+    2025` the same buckets fire but the "2025-" prefixes read backwards; that
+    mode exists only for the cifar100 cross-check (the sole family whose 2025
+    corpus is on disk), where it confirms the 111 stale non-solved rows all
+    consumed their 2025 budgets: 0 under, 0 over.
+    """
+    benches = {b for b, _o, _v in budgets}
+    corp_onnx = defaultdict(set)
+    corp_vnn = defaultdict(set)
+    for b, o, v in budgets:
+        corp_onnx[b].add(o)
+        corp_vnn[b].add(v)
+    out = []
+    for bench, onnx, vnnlib, verdict, seconds in unmatched:
+        if onnx == "test_nano.onnx" and vnnlib == "test_nano.vnnlib":
+            cls = "WARMUP-UNSCORED"
+        elif bench not in benches:
+            cls = "2025-FAMILY-DROPPED"
+        elif onnx in corp_onnx[bench] and vnnlib not in corp_vnn[bench]:
+            cls = "STALE-2025-RESAMPLED"
+        else:
+            cls = "ORPHAN"
+        out.append((bench, onnx, vnnlib, verdict, seconds, cls))
+    return out
 
 
 def print_cap_verdict(hits):
@@ -252,6 +319,8 @@ def main():
                     help="flag rows whose wall exceeds this multiple of budget")
     ap.add_argument("--corpus", choices=sorted(CORPORA), default="2026",
                     help="which corpus supplies the official budgets (default: 2026)")
+    ap.add_argument("--dump-unmatched", metavar="PATH",
+                    help="write every un-audited row with its class to PATH as csv")
     args = ap.parse_args()
 
     hits, over, unmatched, nbud = audit(args.threshold, args.overrun, args.corpus)
@@ -266,12 +335,36 @@ def main():
         print("  Nothing was audited; this is NOT an all-clear. Fix the corpus "
               "path or download the corpus, then re-run.", file=sys.stderr)
         return 2
-    n_unmatched = sum(unmatched.values())
+    n_unmatched = len(unmatched)
     print(f"corpus: {args.corpus}   official budgets loaded: {nbud}   "
           f"banked non-solved rows with NO corpus identity (UN-AUDITED): {n_unmatched}")
     if n_unmatched:
-        worst = sorted(unmatched.items(), key=lambda kv: -kv[1])[:8]
-        print("  un-audited by benchmark: " + ", ".join(f"{b}={n}" for b, n in worst))
+        # EVERY benchmark, not a top-8: the truncated print hid four families
+        # (vggnet16_2022=4, traffic_signs=2, dist_shift=2, lsnc_relu=1) for a
+        # month. Classes per classify_unmatched(); ORPHAN rows are listed
+        # individually because they are the only bucket without an explanation.
+        by_bench = defaultdict(lambda: defaultdict(int))
+        orphans = []
+        for bench, onnx, vnnlib, verdict, _secs, cls in unmatched:
+            by_bench[bench][cls] += 1
+            if cls == "ORPHAN":
+                orphans.append((bench, onnx, vnnlib, verdict))
+        print("  un-audited by benchmark (ALL), classified:")
+        for bench in sorted(by_bench, key=lambda b: -sum(by_bench[b].values())):
+            parts = ", ".join(f"{c}={n}" for c, n in sorted(by_bench[bench].items(), key=lambda kv: -kv[1]))
+            print(f"    {bench:34s} {sum(by_bench[bench].values()):4d}  {parts}")
+        for bench, onnx, vnnlib, verdict in orphans:
+            print(f"    ORPHAN row: {bench} {onnx} {vnnlib} verdict={verdict}")
+        print("  STALE-2025-RESAMPLED / 2025-FAMILY-DROPPED rows are 2025 bank rows: out of"
+              " 2026 scope, must not be scored as 2026, and are audited (if at all)"
+              " against 2025 budgets via --corpus 2025.")
+    if args.dump_unmatched:
+        with open(args.dump_unmatched, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["bench", "onnx", "vnnlib", "verdict", "seconds", "class"])
+            for rec in sorted(unmatched):
+                w.writerow(rec)
+        print(f"  full un-audited census written to {args.dump_unmatched}")
     print(f"\nbanked NON-SOLVED rows using <{args.threshold:.0%} of official budget: {len(hits)}\n")
 
     agg = defaultdict(lambda: [0, 0.0])

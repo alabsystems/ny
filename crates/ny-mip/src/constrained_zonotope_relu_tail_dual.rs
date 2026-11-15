@@ -11468,7 +11468,7 @@ mod tests {
             )
             .unwrap();
         assert!(independently_replayed_m20.supplied_multipliers_used);
-        assert!(!independently_replayed_m20.multipliers.is_empty());
+        assert_ne!(independently_replayed_m20.multipliers, [] as [f64; 0]);
         assert!(!independently_replayed_m20.exact_constant.is_zero());
 
         let m20_replay_admissions = Cell::new(0_usize);
@@ -12087,8 +12087,8 @@ mod tests {
             ReluTailBoxCutOptimizerStatus::Deadline
         );
         assert_eq!(search.budget_error, None);
-        assert!(search.search.variables.is_empty());
-        assert!(search.search.candidates.is_empty());
+        assert_eq!(search.search.variables, [] as [BoxSearchVariable; 0]);
+        assert_eq!(search.search.candidates, [] as [Vec<f64>; 0]);
         assert!(outer_gate.report().deadline_polls() >= 2);
     }
 
@@ -12782,7 +12782,7 @@ mod tests {
             preallocation.status,
             ReluTailBoxCutOptimizerStatus::Deadline
         );
-        assert!(preallocation.candidates.is_empty());
+        assert_eq!(preallocation.candidates, [] as [Vec<f64>; 0]);
         assert_eq!(preallocation.candidates_scored, 0);
 
         let clock_calls = Cell::new(0_usize);

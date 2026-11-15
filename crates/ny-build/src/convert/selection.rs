@@ -128,6 +128,7 @@ fn resolve_unbatched_axis(
         data_name,
         raw_axis,
         super::LegacyBatchAxisPolicy::RejectZero,
+        super::legacy_axis_authority(spec)?,
     )
 }
 

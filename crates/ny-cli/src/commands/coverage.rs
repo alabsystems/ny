@@ -4,21 +4,10 @@
 
 //! `ny coverage`: surface the trace-bridge soundness-coverage manifest.
 //!
-//! The trace bridge (`ny_trace_bridge::coverage`) classifies every one of the
-//! 123 `TraceOp` variants NY can ingest into a bound-propagation soundness
-//! taxonomy — `exact` / `sound` / `sound_but_loose` / `unsupported` — with a
-//! wildcard-free exhaustive `match`, so the catalogue cannot silently drift from
-//! the op set (a new variant fails to compile until it is classified). This
-//! command prints that manifest as a first-class artifact: a complete,
-//! drift-proof statement of exactly which operators NY lowers soundly and where
-//! it deliberately over-approximates or refuses — the catalogue the VNN-COMP
-//! "provable soundness" thesis wants.
-//!
-//! IMPORTANT: this is the soundness *taxonomy* (which ops admit a sound lowering
-//! in principle), not the current `translate()` implementation status.
-//! `translate()` refuses any classified-but-not-yet-ported op with an explicit
-//! `UnsupportedOp` error (fail-closed), so a `translatable` classification here
-//! never implies the lowering is wired up today.
+//! An exhaustive match classifies each `TraceOp` as `exact`, `sound`,
+//! `sound_but_loose` or `unsupported`. These describe possible relaxations,
+//! not current `translate()` coverage or the numeric soundness of a run.
+//! Classified but unimplemented operators still fail with `UnsupportedOp`.
 
 use std::fmt::Write as _;
 
@@ -192,8 +181,8 @@ mod tests {
             + counts["unsupported"].as_u64().unwrap();
         assert_eq!(sum, EXPECTED_TRACE_OP_VARIANTS as u64);
         // The op-name arrays are present and non-empty for the populated buckets.
-        assert!(!v["ops"]["exact"].as_array().unwrap().is_empty());
-        assert!(!v["ops"]["unsupported"].as_array().unwrap().is_empty());
+        assert_ne!((v["ops"]["exact"].as_array().unwrap()).len(), 0);
+        assert_ne!((v["ops"]["unsupported"].as_array().unwrap()).len(), 0);
         // The taxonomy caveat travels with the machine-readable payload.
         let note = v["note"].as_str().expect("note field present");
         assert!(note.contains("TAXONOMY") && note.contains("UnsupportedOp"));
@@ -218,12 +207,14 @@ mod tests {
         //     under interval separation, [0, n-1] hull otherwise) and `Sort`
         //     Exact (monotone, tie-agnostic order statistics).
         //   - `WhereCond` is now sound_but_loose (union-hull select).
-        //   - `Topk` STAYS unsupported, but for the missing largest/sorted
-        //     flags — not for a data-dependent output shape.
+        //   - `Topk` left the list at e4abe1110: the bridge lowers it now that
+        //     nn serializes the largest/sorted flags (SoundButLoose for
+        //     `sorted: false`), so pinning it here misreported coverage — this
+        //     stale pin held every stream's `--bin ny` gate red for a day.
         //   - `Custom` moved to sound_but_loose at INC-FINAL: the explicit
         //     opaque escape hatch lowers to the vacuous-but-sound ±inf
         //     OpaqueSkip.
-        for op in ["Topk", "Scatter", "MoeGating", "GridSample"] {
+        for op in ["Scatter", "MoeGating", "GridSample"] {
             assert!(
                 unsupported.iter().any(|o| o == op),
                 "{op} must be listed as unsupported in the manifest"

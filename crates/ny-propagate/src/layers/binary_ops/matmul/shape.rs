@@ -35,7 +35,7 @@ impl MatMulDims {
     /// Flattened output size per batch (m * n).
     ///
     /// Uses checked multiplication to prevent silent overflow from adversarial
-    /// shapes (#3012).
+    /// shapes.
     pub fn c_size_per_batch(&self) -> Result<usize> {
         self.m.checked_mul(self.n).ok_or_else(|| {
             NyError::InvalidSpec(format!(
@@ -48,7 +48,7 @@ impl MatMulDims {
     /// Flattened A size per batch (m * k).
     ///
     /// Uses checked multiplication to prevent silent overflow from adversarial
-    /// shapes (#3012).
+    /// shapes.
     pub fn a_size_per_batch(&self) -> Result<usize> {
         self.m.checked_mul(self.k).ok_or_else(|| {
             NyError::InvalidSpec(format!(
@@ -127,7 +127,7 @@ pub(in crate::layers::binary_ops) fn parse_matmul_dims(
 /// For batch_dims = [2, 3], flat index 4 -> [1, 1].
 ///
 /// Returns an error if any batch dimension is zero (prevents division-by-zero
-/// panic from degenerate ONNX models with zero-valued tensor dimensions). (#2806)
+/// panic from degenerate ONNX models with zero-valued tensor dimensions).
 pub(in crate::layers::binary_ops) fn decode_batch_index_into(
     batch_idx: usize,
     batch_dims: &[usize],
@@ -156,7 +156,7 @@ pub(in crate::layers::binary_ops) fn decode_batch_index_into(
 /// The caller must ensure `buf.len() >= batch_dims.len()`. Only the first
 /// `batch_dims.len()` elements are written; remaining elements are untouched.
 ///
-/// Part of #2237 Finding 4 — eliminates per-call Vec heap allocations in
+/// Eliminates per-call Vec heap allocations in
 /// bilinear CROWN hot paths.
 pub(in crate::layers::binary_ops) fn decode_batch_index_into_buf(
     batch_idx: usize,

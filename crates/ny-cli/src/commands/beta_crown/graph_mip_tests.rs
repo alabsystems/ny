@@ -1130,6 +1130,7 @@ fn graph_batchnorm_row_outwardly_covers_certified_fold_error() {
         bias_err: ArrayD::from_shape_vec(IxDyn(&[1]), vec![0.5]).unwrap(),
         num_channels: 1,
         channel_axis_hint: None,
+        exact_affine: None,
     };
     let mut graph = GraphNetwork::new();
     graph.add_node(GraphNode::new(
@@ -4401,7 +4402,7 @@ fn graph_mip_escalation_noop_when_gate_off() {
 /// marker ONLY if BOTH clauses came back `Unsat { certified: true }`.
 ///
 /// This lives in the explicit external-corpus lane. Run manually:
-///   cargo test --release -p ny-cli --features 'mip external-vnncomp' \
+///   targo --unverified test --release -p ny-cli --features 'mip external-vnncomp' \
 ///     mscn_escalation_certifies_real_instance -- --nocapture
 #[cfg(feature = "external-vnncomp")]
 #[test]
@@ -4464,7 +4465,7 @@ fn mscn_escalation_certifies_real_instance() {
 /// mscn_2048d model + its smallest-clause-count instance
 /// (cardinality_0_1_2048, 2 clauses, official budget 20s). It lives in the
 /// explicit external-corpus lane; run manually:
-///   cargo test --release -p ny-cli --features 'mip external-vnncomp' \
+///   targo --unverified test --release -p ny-cli --features 'mip external-vnncomp' \
 ///     mscn_escalation_2048d_probe -- --nocapture
 #[cfg(feature = "external-vnncomp")]
 #[test]

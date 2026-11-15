@@ -129,13 +129,22 @@ fn parse_lrat(text: &str, n_original: usize) -> Result<Vec<Step>, String> {
     // input-derived, so a bulk collect raises an unbounded-alloc obligation;
     // identical map.
     let mut id_to_idx: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    // Ids are checked (`u64` cannot overflow for any in-memory clause count,
+    // but a wrap would silently alias two clauses, so it is an error).
     for i in 0..n_original {
-        id_to_idx.insert(i as u64 + 1, i);
+        let id = u64::try_from(i)
+            .ok()
+            .and_then(|i| i.checked_add(1))
+            .ok_or_else(|| format!("CNF clause count {n_original} overflows LRAT ids"))?;
+        id_to_idx.insert(id, i);
     }
     let mut db_len = n_original;
     let mut steps: Vec<Step> = Vec::new();
     let mut saw_empty = false;
     for (lineno, line) in text.lines().enumerate() {
+        // 1-based line number for diagnostics, computed once (saturating: a
+        // display number, and `usize::MAX` lines cannot be in memory).
+        let lineno = lineno.saturating_add(1);
         let line = line.trim();
         if line.is_empty() || line.starts_with('c') {
             continue;
@@ -151,30 +160,31 @@ fn parse_lrat(text: &str, n_original: usize) -> Result<Vec<Step>, String> {
             toks.push(tok);
         }
         if toks.len() < 2 {
-            return Err(format!("LRAT line {}: too short: {line}", lineno + 1));
+            return Err(format!("LRAT line {}: too short: {line}", lineno));
         }
         // total: `first`/`get(1)` (not `toks[0]`/`toks[1]`): `toks.len() >= 2`
         // was just checked, so both are `Some`; the fallback fails closed.
         let id_tok = *toks
             .first()
-            .ok_or_else(|| format!("LRAT line {}: too short: {line}", lineno + 1))?;
+            .ok_or_else(|| format!("LRAT line {}: too short: {line}", lineno))?;
         let id: u64 = id_tok
             .parse()
-            .map_err(|e| format!("LRAT line {}: bad id {id_tok:?}: {e}", lineno + 1))?;
+            .map_err(|e| format!("LRAT line {}: bad id {id_tok:?}: {e}", lineno))?;
         if toks.get(1) == Some(&"d") {
             continue; // deletion — keep clauses in the database (sound)
         }
         // literals up to the first 0
+        // Walk the tokens after the id with an iterator (not a `pos` index):
+        // no index arithmetic, same token sequence.
+        let mut rest = toks.iter().skip(1);
         let mut clause: Clause = Vec::new();
-        let mut pos = 1;
         loop {
-            let tok = toks
-                .get(pos)
-                .ok_or_else(|| format!("LRAT line {}: missing literal terminator", lineno + 1))?;
+            let tok = rest
+                .next()
+                .ok_or_else(|| format!("LRAT line {}: missing literal terminator", lineno))?;
             let lit: i64 = tok
                 .parse()
-                .map_err(|e| format!("LRAT line {}: bad literal {tok:?}: {e}", lineno + 1))?;
-            pos += 1;
+                .map_err(|e| format!("LRAT line {}: bad literal {tok:?}: {e}", lineno))?;
             if lit == 0 {
                 break;
             }
@@ -183,13 +193,12 @@ fn parse_lrat(text: &str, n_original: usize) -> Result<Vec<Step>, String> {
         // hints up to the second 0
         let mut hints: Vec<usize> = Vec::new();
         loop {
-            let tok = toks
-                .get(pos)
-                .ok_or_else(|| format!("LRAT line {}: missing hint terminator", lineno + 1))?;
+            let tok = rest
+                .next()
+                .ok_or_else(|| format!("LRAT line {}: missing hint terminator", lineno))?;
             let hint: i64 = tok
                 .parse()
-                .map_err(|e| format!("LRAT line {}: bad hint {tok:?}: {e}", lineno + 1))?;
-            pos += 1;
+                .map_err(|e| format!("LRAT line {}: bad hint {tok:?}: {e}", lineno))?;
             if hint == 0 {
                 break;
             }
@@ -198,27 +207,29 @@ fn parse_lrat(text: &str, n_original: usize) -> Result<Vec<Step>, String> {
                     "LRAT line {}: negative hint {hint} — RAT step, not RUP; \
                      this importer fails closed on RAT (CDCL DRUP-style proofs \
                      from `ay` are RUP-only)",
-                    lineno + 1
+                    lineno
                 ));
             }
             let idx = *id_to_idx.get(&(hint as u64)).ok_or_else(|| {
                 format!(
                     "LRAT line {}: hint id {hint} not in the live clause database",
-                    lineno + 1
+                    lineno
                 )
             })?;
             hints.push(idx);
         }
-        if pos != toks.len() {
+        if rest.next().is_some() {
             return Err(format!(
                 "LRAT line {}: trailing tokens after hint terminator",
-                lineno + 1
+                lineno
             ));
         }
         saw_empty = clause.is_empty();
         steps.push(Step { clause, hints });
         id_to_idx.insert(id, db_len);
-        db_len += 1;
+        db_len = db_len
+            .checked_add(1)
+            .ok_or_else(|| "LRAT clause database size overflows usize".to_string())?;
     }
     if !saw_empty {
         return Err("LRAT proof never derives the empty clause".to_string());
@@ -472,6 +483,16 @@ mod tests {
     fn rejects_rat_hints_and_missing_empty_clause() {
         assert!(parse_lrat("3 -2 0 -1 2 0\n", 2).is_err());
         assert!(parse_lrat("3 -2 0 1 2 0\n", 2).is_err());
+    }
+
+    #[test]
+    fn token_walk_rejects_missing_terminators_and_trailing_tokens() {
+        let err = |text: &str| parse_lrat(text, 2).err().unwrap_or_default();
+        assert!(err("3 -2\n").contains("missing literal terminator"));
+        assert!(err("3 -2 0 1 2\n").contains("missing hint terminator"));
+        assert!(err("3 0 1 2 0 7\n").contains("trailing tokens"));
+        // The exact-length line (both terminators, nothing after) is accepted.
+        assert_eq!(parse_lrat("3 0 1 2 0\n", 2).expect("parse").len(), 1);
     }
 
     #[test]

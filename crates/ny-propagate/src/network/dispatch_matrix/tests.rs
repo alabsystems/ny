@@ -63,6 +63,8 @@ fn interval(n: usize, lo: f32, hi: f32) -> BoundedTensor {
 /// What the batched per-layer dispatcher did with a sample.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BatchedProbe {
+    /// A diagnostic-only representation refused proof authority explicitly.
+    Refused,
     /// The explicit unsupported arm fired: this variant has NO batched arm.
     NoArm,
     /// An arm ran (whether or not it then declined for the sample's shape).
@@ -74,6 +76,11 @@ fn probe_batched(layer: &Layer) -> BatchedProbe {
     let bounds = BatchedLinearBounds::identity(&[n]).expect("identity batched bounds");
     let pre = interval(n, -1.0, 1.0);
     match layer.propagate_crown_backward_batched(&bounds, Some(&pre), None) {
+        Err(ny_core::NyError::UnsupportedOp(message))
+            if message.contains("PointLinear") && message.contains("point-only") =>
+        {
+            BatchedProbe::Refused
+        }
         Err(err) if err.to_string().contains(BATCHED_NO_ARM) => BatchedProbe::NoArm,
         _ => BatchedProbe::ArmExists,
     }
@@ -86,6 +93,8 @@ enum DenseProbe {
     /// `BackwardDispatchResult::Unsupported` — the caller IBP-falls-back. The
     /// weakest outcome, and the one a missing arm produces.
     Unsupported,
+    /// The representation has no permitted proof fallback.
+    Refused,
     /// The arm ran and errored on the probe's shape. Evidence that an arm
     /// exists; not evidence that it produces bounds.
     Errored,
@@ -123,6 +132,11 @@ fn probe_dense_over_box(layer: &Layer, lo: f32, hi: f32) -> DenseProbe {
     match dispatch_backward_layer(&ctx, &LinearBounds::identity(n)) {
         Ok(BackwardDispatchResult::Unsupported(_)) => DenseProbe::Unsupported,
         Ok(_) => DenseProbe::Handled,
+        Err(ny_core::NyError::UnsupportedOp(message))
+            if message.contains("PointLinear") && message.contains("point-only") =>
+        {
+            DenseProbe::Refused
+        }
         Err(_) => DenseProbe::Errored,
     }
 }
@@ -147,7 +161,7 @@ fn probe_dense(layer: &Layer) -> DenseProbe {
 /// ends up describing an aspiration.
 ///
 /// ```sh
-/// cargo test -p ny-propagate --features diagnostics --lib dispatch_matrix -- --nocapture
+/// targo --unverified test -p ny-propagate --features diagnostics --lib dispatch_matrix -- --nocapture
 /// ```
 ///
 /// Behind the off-by-default `diagnostics` feature rather than `#[ignore]`: it
@@ -314,6 +328,14 @@ fn batched_matrix_matches_the_real_dispatchers() {
             continue;
         }
 
+        if matches!(declared, DispatchVerdict::Refused(_)) {
+            assert_eq!(
+                observed,
+                BatchedProbe::Refused,
+                "{name}: proof refusal must reach the real dispatcher"
+            );
+            continue;
+        }
         match (declared.is_supported(), observed) {
             (true, BatchedProbe::NoArm) => mismatches.push(format!(
                 "{name}: declared SUPPORTED on the batched path but the dispatcher's explicit \
@@ -397,6 +419,15 @@ fn dense_matrix_matches_the_real_dispatcher() {
             .iter()
             .any(|(pinned, _)| *pinned == name);
 
+        if matches!(declared, DispatchVerdict::Refused(_)) {
+            assert_eq!(
+                observed,
+                DenseProbe::Refused,
+                "{name}: proof refusal must reach the real dispatcher"
+            );
+            continue;
+        }
+
         match (declared.is_supported(), observed, sample_declines) {
             // Declared supported, arm ran: agreement.
             (true, DenseProbe::Handled | DenseProbe::Errored, false) => {}
@@ -408,6 +439,9 @@ fn dense_matrix_matches_the_real_dispatcher() {
                 "{name}: declared SUPPORTED on the dense path but `dispatch_backward_layer` \
                  returned Unsupported for BOTH probe boxes — the caller IBP-concretizes every \
                  node of this kind"
+            )),
+            (true, DenseProbe::Refused, false) => mismatches.push(format!(
+                "{name}: declared SUPPORTED but diagnostic-only proof authority was refused"
             )),
             (true, _, true) => mismatches.push(format!(
                 "{name}: pinned in DENSE_PROBE_SAMPLE_DECLINES but the probe now reaches its \
@@ -617,15 +651,9 @@ fn dense_only_census_is_pinned() {
     );
 }
 
-/// The seed's honest state: nothing on these four paths is currently REFUSED.
-///
-/// Every gap degrades to a sound, looser bound rather than failing closed, so
-/// the `Refused` bucket is empty today. It is kept in the taxonomy because a
-/// future variant may genuinely have no sound lowering on some path, and
-/// because a `Refused` row must never be quietly downgraded to `FallsBack` —
-/// that would turn a fail-closed refusal into a silently-published bound.
+/// PointLinear is explicitly diagnostic-only on every proof dispatcher.
 #[test]
-fn no_variant_is_currently_refused_on_any_dispatcher() {
+fn diagnostic_point_only_is_refused_on_every_dispatcher() {
     let mut refusals = Vec::new();
     for (name, layer) in canonical_layers() {
         for dispatcher in Dispatcher::ALL {
@@ -633,16 +661,14 @@ fn no_variant_is_currently_refused_on_any_dispatcher() {
                 super::verdict(dispatcher, &layer),
                 DispatchVerdict::Refused(_)
             ) {
+                assert_eq!(name, "PointLinear", "unexpected new proof refusal");
                 refusals.push(format!("{name} on {}", dispatcher.as_str()));
             }
         }
     }
     assert!(
-        refusals.is_empty(),
-        "new REFUSED classification(s): {refusals:?}. A refusal means the dispatcher fails \
-         CLOSED for this variant — no bound at all, not a looser one. If that is really the \
-         behaviour, update this test; if the dispatcher actually degrades to IBP, the verdict \
-         is FallsBack."
+        refusals.len() == Dispatcher::ALL.len(),
+        "PointLinear must refuse every dispatcher, with no bound fallback: {refusals:?}"
     );
 }
 
@@ -941,10 +967,11 @@ fn propagate_layer_names_parse_back_to_a_known_layer_type() {
     // ny-core layer inventory. `SkipMerge` is the identity ny-build emits for
     // ONNX's `noop_with_empty_axes` reduction, which likewise has no
     // ny-core spelling. `OpaqueSkip` and `QdqPerturbation` are DELIBERATE:
-    // `OpaqueSkip` is the vacuous `[-inf, +inf]` carrier and `QdqPerturbation`
-    // fails closed in its only constructor, so both SHOULD read as unsupported
-    // to anything classifying a graph — parsing them would hide exactly the
-    // thing a consumer needs to see.
+    // `OpaqueSkip` is the vacuous `[-inf, +inf]` carrier, and
+    // `QdqPerturbation` is the internal certified-envelope layer ny-build
+    // synthesizes for a fused activation Q->DQ pair — neither has an
+    // authored-operator spelling in a ny-core layer inventory, so both read
+    // as `Unknown` to anything classifying a graph by authored op name.
     const NO_LAYER_TYPE_COUNTERPART: &[&str] = &[
         "AddConstant",
         "SubConstant",
@@ -954,6 +981,10 @@ fn propagate_layer_names_parse_back_to_a_known_layer_type() {
         "SkipMerge",
         "OpaqueSkip",
         "QdqPerturbation",
+        // Diagnostic original-weight storage is not an authored Linear
+        // proof operator. Aliasing this name to Linear would bypass its
+        // explicit point-only admission boundary in source classifiers.
+        "PointLinear",
         // The interval carriers must NOT be aliased to `Linear` / an offset:
         // their whole reason for being a separate `Layer` variant is that a
         // reader who sees "Linear" computes with the MIDPOINT and silently

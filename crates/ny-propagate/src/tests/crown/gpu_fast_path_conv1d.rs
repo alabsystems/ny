@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Conv1d-specific coverage for the sequential GPU CROWN fast-path (#3549).
+//! Conv1d-specific coverage for the sequential GPU CROWN fast-path.
 
 use super::helpers::{assert_bounded_tensor_close, assert_bounds_finite, MockGpuCrownEngine};
 use super::*;

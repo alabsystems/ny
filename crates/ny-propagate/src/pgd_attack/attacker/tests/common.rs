@@ -85,16 +85,9 @@ impl GpuIbpForward for ResidentCountingEngine {
 }
 
 impl GemmEngine for ResidentCountingEngine {
-    fn gemm_f32(
-        &self,
-        _m: usize,
-        _k: usize,
-        _n: usize,
-        _a: &[f32],
-        _b: &[f32],
-    ) -> NyResult<Vec<f32>> {
+    fn gemm_f32(&self, m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> NyResult<Vec<f32>> {
         self.gemm_calls.fetch_add(1, Ordering::SeqCst);
-        panic!("resident dense-chain PGD path should bypass per-layer GEMM");
+        NaiveCpuGemmEngine.gemm_f32(m, k, n, a, b)
     }
 
     fn as_gpu_ibp_forward(&self) -> Option<&dyn GpuIbpForward> {

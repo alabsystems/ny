@@ -4,7 +4,7 @@
 
 //! Streaming chunk boundary verification for audio vocoder models.
 //!
-//! Implements the CROWN verification approach for avoice streaming TTS (#3500):
+//! Implements the CROWN verification approach for avoice streaming TTS:
 //! - Bound vocoder output at chunk boundaries (first/last N samples)
 //! - Prove crossfade overlap-add energy stays in [0.5, 1.5] of steady-state
 //! - Verify phase alignment of overlapping regions
@@ -14,9 +14,6 @@
 //! remain the fast proof harness for overlap-add, energy, and phase continuity
 //! while the real-weight runtime lane is still too expensive for CPU-only unit
 //! tests (`T=6` IBP exceeded the 600s measurement budget on 2026-03-11).
-//!
-//! Design: `designs/2026-03-11-issue-3500-kokoro-vocoder-boundary-surface.md`
-//! Follow-up: `designs/2026-03-11-issue-3500-kokoro-runtime-floor-followup.md`
 
 use super::*;
 use ndarray::{Array1, Array2, ArrayD};
@@ -141,8 +138,6 @@ pub(super) fn extract_boundary_bounds(
 ///   upper[i] = fade_out[i] * u_A + fade_in[i] * u_B
 ///
 /// This is sound because the crossfade weights are non-negative constants.
-///
-/// Reference: designs/2026-03-10-avoice-crown-capability-triage.md, Step 5
 pub(super) fn crossfade_overlap_add_bounds(
     chunk_a_last_lower: &[f32],
     chunk_a_last_upper: &[f32],

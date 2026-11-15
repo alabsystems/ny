@@ -52,10 +52,7 @@ use super::super::batched_clip::{
 use super::super::grouped_semantics::disjunctive_domain_verified;
 use super::super::ibp_prescreen_flat::batched_ibp_prescreen_from_stacked;
 use super::super::shared::{build_child_input_owned, MultiObjInputDomain};
-use super::process_batch::{
-    edge_domain_rows, graph_ibp_prescreen_error_should_skip, try_edge_alpha_pass,
-    try_edge_milp_escalation,
-};
+use super::process_batch::{escalate_edge_domain, graph_ibp_prescreen_error_should_skip};
 use super::push_survivors::concretize_postclip_lower_bounds;
 use super::BabWall;
 
@@ -199,19 +196,28 @@ pub(super) fn process_reorder_prescreen_child_batch(
     let mut x_dim = 0usize;
     // #relational-bab option B: per-wave α edge-pass budget.
     let mut edge_alpha_budget = verifier.config.input_split_edge_alpha_top;
+    // #iso-edge-cap: this wave's edge governor (unarmed = the historical path).
+    let mut edge_governor =
+        super::edge_cap::EdgeWaveGovernor::for_wave(bab_wall, lifecycle.start_time);
 
     for mut domain in domains {
         if bab_wall.expired(lifecycle.start_time) {
             return Ok(Some(lifecycle.timeout_result()));
         }
-        if lifecycle.domains_explored >= verifier.config.max_domains {
+        // #cap-extend: with `batch_size > 1` the cap trip happens HERE far more
+        // often than at the loop head, so this site both consults the extended
+        // cap and is allowed to GRANT it. Reading `config.max_domains` and
+        // stopping unconditionally is what made the armed canary produce no
+        // marker at all on cgan2026 row 7.
+        if lifecycle.domains_explored >= lifecycle.domain_cap(verifier.config.max_domains)
+            && !super::try_grant_cap_extend(lifecycle, &verifier.config, queue.len())
+        {
+            let domain_cap = lifecycle.domain_cap(verifier.config.max_domains);
             return Ok(Some(lifecycle.build_result(
                 BabVerificationStatus::Unknown {
                     reason: format!(
                         "Domain limit {}: {}/{} verified",
-                        verifier.config.max_domains,
-                        lifecycle.domains_verified,
-                        lifecycle.domains_explored
+                        domain_cap, lifecycle.domains_verified, lifecycle.domains_explored
                     ),
                 },
             )));
@@ -236,46 +242,21 @@ pub(super) fn process_reorder_prescreen_child_batch(
             lifecycle.domains_verified += 1;
             continue;
         }
-        // #relational-bab option B (config-gated, default inert): identical to
-        // the reference loop — see `process_reorder_prescreen_batch`.
-        if verifier.config.input_split_edge_alpha && edge_alpha_budget > 0 {
-            if let Some(row_indices) = edge_domain_rows(
-                &domain,
-                thresholds,
-                clause_sizes,
-                verifier.config.input_split_edge_milp_gap,
-                verifier.config.input_split_edge_milp_depth,
-                spec_matrix.nrows(),
-            ) {
-                edge_alpha_budget -= 1;
-                if let Some(fresh) = try_edge_alpha_pass(
-                    verifier,
-                    graph,
-                    &domain,
-                    spec_matrix,
-                    &row_indices,
-                    engine,
-                    lifecycle.deadline(bab_wall.horizon()),
-                ) {
-                    domain.obj_bounds =
-                        super::super::batching::tighten_obj_lower_bounds(&domain.obj_bounds, fresh);
-                    if disjunctive_domain_verified(&domain.obj_bounds, thresholds, clause_sizes) {
-                        lifecycle.domains_verified += 1;
-                        continue;
-                    }
-                }
-            }
-        }
-        // #relational-bab EDGE-DOMAIN ESCALATION: identical to the reference.
-        if try_edge_milp_escalation(
+        // #relational-bab option B + EDGE-DOMAIN ESCALATION (config-gated,
+        // default inert): identical to the reference loop — the one shared
+        // seam `escalate_edge_domain` (#iso-edge-cap), which unarmed is the
+        // historical sequence statement for statement.
+        if escalate_edge_domain(
             verifier,
             graph,
-            &domain,
+            &mut domain,
             spec_matrix,
             thresholds,
             clause_sizes,
             engine,
             lifecycle.deadline(bab_wall.horizon()),
+            &mut edge_alpha_budget,
+            &mut edge_governor,
         ) {
             lifecycle.domains_verified += 1;
             continue;
@@ -386,13 +367,17 @@ pub(super) fn process_reorder_prescreen_child_batch(
         false,
         engine,
     ) {
-        Ok(mask) => mask,
+        Ok(mask) => {
+            prescreen_note(n, mask.iter().filter(|v| **v).count(), true);
+            mask
+        }
         Err(err) if graph_ibp_prescreen_error_should_skip(&err) => {
             tracing::debug!(
                 "disjunctive reorder prescreen: skipping enhancement-only IBP pass for {} children after {}",
                 n,
                 err
             );
+            prescreen_note(n, 0, false);
             vec![false; n]
         }
         Err(err) => return Err(err),
@@ -890,3 +875,40 @@ fn try_push_child_batch_clip_survivors_planes(
 
 #[cfg(test)]
 mod tests;
+
+/// Engagement observable for the batched IBP prescreen.
+///
+/// `tracing::debug!` is invisible on the scored path (the vnncomp entry point
+/// swallows it and `RUST_LOG` is not honoured), so before this line a run could
+/// not distinguish "the prescreen ran and verified nothing" from "the prescreen
+/// was refused and never ran at all". Those are a NEGATIVE and a VOID
+/// respectively, and the whole rank-3 BatchNorm discharge is measured against
+/// that distinction.
+///
+/// Rate-limited like the batch-trajectory line, but every printed line carries
+/// the RUNNING TOTALS, because a capped counter read as a total has produced
+/// four wrong conclusions in this campaign.
+fn prescreen_note(children: usize, verified: usize, admitted: bool) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    static ADMITTED: AtomicUsize = AtomicUsize::new(0);
+    static CHILDREN: AtomicUsize = AtomicUsize::new(0);
+    static VERIFIED: AtomicUsize = AtomicUsize::new(0);
+    let n = CALLS.fetch_add(1, Ordering::Relaxed);
+    if admitted {
+        ADMITTED.fetch_add(1, Ordering::Relaxed);
+    }
+    CHILDREN.fetch_add(children, Ordering::Relaxed);
+    let total_verified = VERIFIED.fetch_add(verified, Ordering::Relaxed) + verified;
+    if n < 8 || n.is_multiple_of(256) {
+        eprintln!(
+            "[prescreen] {} children={children} verified={verified} \
+             calls_total={} admitted_total={} children_total={} verified_total={}",
+            if admitted { "admitted" } else { "REFUSED" },
+            n + 1,
+            ADMITTED.load(Ordering::Relaxed),
+            CHILDREN.load(Ordering::Relaxed),
+            total_verified,
+        );
+    }
+}

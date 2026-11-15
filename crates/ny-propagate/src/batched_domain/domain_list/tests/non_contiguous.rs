@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Regression tests for #1924: non-contiguous tensor silent fallback
+//! Regression tests: non-contiguous tensor silent fallback
 //! in `find_unstable_neurons_batched` and `select_branch_batched`.
 
 use super::*;
@@ -22,7 +22,7 @@ fn metadata(lower_bound: f32, upper_bound: f32) -> DomainMetadata {
 
 /// Create a non-contiguous ArrayD with the given logical values.
 /// Uses Fortran (column-major) memory order so `as_slice()` returns `None`,
-/// which is exactly the condition that triggered the #1924 bug.
+/// which is exactly the condition that triggered the silent-fallback bug.
 fn make_non_contiguous(data: &[f32], shape: &[usize]) -> ArrayD<f32> {
     use ndarray::ShapeBuilder;
     let total: usize = shape.iter().product();

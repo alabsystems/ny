@@ -34,6 +34,7 @@ impl GraphNetwork {
         engine: Option<&dyn GemmEngine>,
         carry_forward_reference_bounds: bool,
     ) -> Result<SequentialAlphaOptimizationResult> {
+        self.ensure_proof_eligible()?;
         // Disable the L2/Cauchy–Schwarz lever for the entire alpha-CROWN scope.
         // This is the chokepoint for both sequential and DAG graph alpha-CROWN
         // (the DAG branch below delegates from here), so the many CROWN-internal
@@ -191,7 +192,7 @@ impl GraphNetwork {
                     | Layer::Transpose(_)
                     | Layer::GELU(_)
                     | Layer::Tile(_) => {}
-                    // Unknown/unrecognized layer: fall back to DAG α-CROWN (#2235).
+                    // Unknown/unrecognized layer: fall back to DAG α-CROWN.
                     // The backward pass catch-all can handle arbitrary layers via
                     // propagate_crown_backward, but DAG α-CROWN has better layer
                     // support than sequential for non-standard layer types.
@@ -212,9 +213,9 @@ impl GraphNetwork {
         // With fix_interm_bounds=true (default), use cheap IBP bounds (O(N)).
         // With fix_interm_bounds=false, use expensive CROWN-IBP (O(N^2)) for
         // tighter pre-activation bounds. This matches collect_alpha_crown_bounds_dag
-        // in bounds/alpha.rs which also respects this flag. #3218
+        // in bounds/alpha.rs which also respects this flag.
         //
-        // Deep-sequential auto-override (#3628): when fix_interm_bounds=true but
+        // Deep-sequential auto-override: when fix_interm_bounds=true but
         // the graph has 3+ non-linear activation layers, IBP intermediate bounds
         // compound relaxation error at each layer. After 3+ activations the CROWN
         // backward pass produces bounds wider than forward IBP on every element,
@@ -249,7 +250,7 @@ impl GraphNetwork {
         #[cfg(test)]
         SEQUENTIAL_ROOT_COLLECTION_EPISODES.with(|slot| slot.set(slot.get() + 1));
         let mut node_bounds = if use_crown_ibp {
-            // #3795: thread deadline into CROWN-IBP intermediate collection so
+            // Thread deadline into CROWN-IBP intermediate collection so
             // expensive Conv2d backward passes can bail early during initial bounds.
             self.collect_crown_ibp_bounds_dag_with_deadline_and_engine(
                 input,

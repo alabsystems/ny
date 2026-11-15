@@ -467,7 +467,7 @@ mod tests {
         let mut rewritten = original;
         let report = rewritten.rewrite_vgg_maxpool2x2(mode).unwrap();
         assert_eq!(report.rewritten, vec!["pool"]);
-        assert!(report.skipped.is_empty());
+        assert_eq!((report.skipped).len(), 0);
         let actual = rewritten.propagate_ibp(&input).unwrap();
         assert_eq!(actual.lower(), expected.lower());
         assert_eq!(actual.upper(), expected.upper());
@@ -570,7 +570,7 @@ mod tests {
         let report = graph
             .rewrite_vgg_maxpool2x2(VggMaxPoolRewriteMode::Residual)
             .unwrap();
-        assert!(report.rewritten.is_empty());
+        assert_eq!((report.rewritten).len(), 0);
         assert_eq!(report.skipped.len(), 1);
         assert_eq!(graph.node_names(), before_order.as_slice());
         assert!(matches!(

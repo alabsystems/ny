@@ -20,7 +20,7 @@ use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
 use super::super::BetaCrownVerifier;
 
 /// Recorded lower-bound ReLU relaxation for gradient computation.
-/// Legacy: only used by test code (compute_beta_gradients in tests/gradients.rs).
+/// Legacy: only used by test code (compute_beta_gradients in optimization/gradients/beta_only.rs).
 #[derive(Debug, Clone)]
 pub(in crate::beta_crown::engine) struct ReluLowerRelaxation {
     pub slopes: Vec<f32>,
@@ -56,7 +56,7 @@ impl BetaCrownVerifier {
 
         let mut new_lower_a = Array2::<f32>::zeros((num_outputs, num_neurons));
         let mut new_upper_a = Array2::<f32>::zeros((num_outputs, num_neurons));
-        // f64 bias accumulators to prevent catastrophic cancellation (#2336, #1745).
+        // f64 bias accumulators to prevent catastrophic cancellation.
         // Pattern matches common/mod.rs and compute_joint_gradients.
         let mut new_lower_b_f64 = output_bounds.lower_b().mapv(|x| x as f64);
         let mut new_upper_b_f64 = output_bounds.upper_b().mapv(|x| x as f64);
@@ -91,15 +91,15 @@ impl BetaCrownVerifier {
                     (0.0, 0.0, 0.0, 0.0)
                 } else if l.is_infinite() && u.is_infinite() {
                     // Both -Inf and +Inf: no finite affine upper envelope.
-                    // Match relu_linear_relaxation() at relu/mod.rs:37-39. #2805
+                    // Match relu_linear_relaxation() in relu/mod.rs.
                     (0.0, 0.0, 0.0, f32::INFINITY)
                 } else if u.is_infinite() {
                     // Finite l < 0 < +Inf: chord limit → slope=1, intercept=-l.
-                    // Match relu_linear_relaxation() at relu/mod.rs:41-43. #2805
+                    // Match relu_linear_relaxation() in relu/mod.rs.
                     (1.0, 0.0, 1.0, -l)
                 } else if l.is_infinite() {
                     // -Inf < 0 < finite u: tight upper envelope is constant y <= u.
-                    // Match relu_linear_relaxation() at relu/mod.rs:45-47. #2805
+                    // Match relu_linear_relaxation() in relu/mod.rs.
                     (0.0, 0.0, 0.0, u)
                 } else {
                     // Unstable: use CROWN relaxation
@@ -112,7 +112,7 @@ impl BetaCrownVerifier {
                     (lower_slope, lower_intercept, upper_slope, upper_intercept)
                 };
 
-            // Apply relaxation to each output (f64 bias accumulation, #2336)
+            // Apply relaxation to each output (f64 bias accumulation)
             for i in 0..num_outputs {
                 let la_ij = output_bounds.lower_a()[[i, j]];
                 let ua_ij = output_bounds.upper_a()[[i, j]];
@@ -144,7 +144,7 @@ impl BetaCrownVerifier {
 
             // Add beta contribution for constrained neurons (Lagrangian term)
             if let Some(signed_beta) = beta_state.signed_beta(layer_idx, j) {
-                // #2415: Skip non-finite beta to avoid poisoning the entire A-matrix.
+                // Skip non-finite beta to avoid poisoning the entire A-matrix.
                 // Non-finite beta means the Lagrangian multiplier optimization produced
                 // invalid output; skipping preserves valid pre-beta bounds (sound).
                 if signed_beta.is_finite() {
@@ -163,7 +163,7 @@ impl BetaCrownVerifier {
             }
         }
 
-        // Convert f64 bias accumulators back to f32 with conservative rounding (#2336).
+        // Convert f64 bias accumulators back to f32 with conservative rounding.
         let new_lower_b = new_lower_b_f64.mapv(|x| next_down_f32(x as f32));
         let new_upper_b = new_upper_b_f64.mapv(|x| next_up_f32(x as f32));
 
@@ -186,12 +186,15 @@ impl BetaCrownVerifier {
         engine: Option<&dyn GemmEngine>,
     ) -> Result<LinearBounds> {
         match layer {
+            Layer::PointLinear(_) => {
+                Err(crate::network::proof_eligibility::diagnostic_only())
+            }
             Layer::Linear(linear) => {
                 let weight = linear.weight();
                 let new_lower_a = output_bounds.lower_a().dot(weight);
                 let new_upper_a = output_bounds.upper_a().dot(weight);
 
-                // #2423: Bias accumulation in f64 with directed rounding to prevent
+                // Bias accumulation in f64 with directed rounding to prevent
                 // catastrophic cancellation. Matches crown_single.rs pattern.
                 // Reference: layers/linear/bias.rs accumulate_bias_f64.
                 let (new_lower_b, new_upper_b) = if let Some(bias) = linear.bias() {
@@ -259,7 +262,7 @@ impl BetaCrownVerifier {
             }
             Layer::Tile(t) => {
                 // Tile needs input_shape before dispatch (same pattern as Transpose).
-                // Reference: ibp.rs Tile arm, dispatch.rs Tile arm (#3114).
+                // Reference: ibp.rs Tile arm, dispatch.rs Tile arm.
                 let mut tile_with_shape = t.clone();
                 tile_with_shape.set_input_shape(pre_bounds.shape().to_vec());
                 match tile_with_shape.propagate_linear(output_bounds) {
@@ -329,7 +332,7 @@ impl BetaCrownVerifier {
                     Err(e) => Err(e),
                 }
             }
-            // === All other layers: exhaustive trait dispatch (#3424) ===
+            // === All other layers: exhaustive trait dispatch ===
             // Every variant listed — no catch-all. Compiler catches new variants.
             //
             // Conv3d belongs here rather than beside Conv1d/Conv2d above: it
@@ -463,7 +466,7 @@ impl BetaCrownVerifier {
 
         let mut new_lower_a = Array2::<f32>::zeros((num_outputs, num_neurons));
         let mut new_upper_a = Array2::<f32>::zeros((num_outputs, num_neurons));
-        // f64 bias accumulators to prevent catastrophic cancellation (#2336, #1745).
+        // f64 bias accumulators to prevent catastrophic cancellation.
         let mut new_lower_b_f64 = output_bounds.lower_b().mapv(|x| x as f64);
         let mut new_upper_b_f64 = output_bounds.upper_b().mapv(|x| x as f64);
 
@@ -492,15 +495,15 @@ impl BetaCrownVerifier {
                     (0.0, 0.0, 0.0, 0.0)
                 } else if l.is_infinite() && u.is_infinite() {
                     // Both -Inf and +Inf: no finite affine upper envelope.
-                    // Match relu_linear_relaxation() at relu/mod.rs:37-39. #2805
+                    // Match relu_linear_relaxation() in relu/mod.rs.
                     (0.0, 0.0, 0.0, f32::INFINITY)
                 } else if u.is_infinite() {
                     // Finite l < 0 < +Inf: chord limit → slope=1, intercept=-l.
-                    // Match relu_linear_relaxation() at relu/mod.rs:41-43. #2805
+                    // Match relu_linear_relaxation() in relu/mod.rs.
                     (1.0, 0.0, 1.0, -l)
                 } else if l.is_infinite() {
                     // -Inf < 0 < finite u: tight upper envelope is constant y <= u.
-                    // Match relu_linear_relaxation() at relu/mod.rs:45-47. #2805
+                    // Match relu_linear_relaxation() in relu/mod.rs.
                     (0.0, 0.0, 0.0, u)
                 } else {
                     // Clamp width to avoid division by zero when u ≈ l
@@ -548,7 +551,7 @@ impl BetaCrownVerifier {
             }
 
             if let Some(signed_beta) = beta_state.signed_beta(layer_idx, j) {
-                // #2415: Skip non-finite beta to avoid poisoning the entire A-matrix.
+                // Skip non-finite beta to avoid poisoning the entire A-matrix.
                 // Non-finite beta means the Lagrangian multiplier optimization produced
                 // invalid output; skipping preserves valid pre-beta bounds (sound).
                 if signed_beta.is_finite() {
@@ -567,7 +570,7 @@ impl BetaCrownVerifier {
             }
         }
 
-        // Convert f64 bias accumulators back to f32 with conservative rounding (#2336).
+        // Convert f64 bias accumulators back to f32 with conservative rounding.
         let new_lower_b = new_lower_b_f64.mapv(|x| next_down_f32(x as f32));
         let new_upper_b = new_upper_b_f64.mapv(|x| next_up_f32(x as f32));
 

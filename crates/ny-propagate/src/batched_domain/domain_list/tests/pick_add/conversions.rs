@@ -65,7 +65,7 @@ fn test_from_picked_domains_basic() {
     assert_eq!(relu0_lower.as_array()[[1, 2]], -1.0);
 
     // Verify constraints preserved
-    assert!(batched.constraints()[0].is_empty());
+    assert_eq!((batched.constraints()[0]).len(), 0);
     assert_eq!(
         batched.constraints()[1],
         vec![("relu0".to_string(), 1, true, None)]
@@ -123,7 +123,7 @@ fn make_two_domain_picked() -> PickedDomains {
 #[test]
 fn test_from_picked_domains_with_interm_transfer() {
     // Verify that from_picked_domains_with_options populates static bounds
-    // and unstable masks when enable_interm_transfer=true. Fixes #1655.
+    // and unstable masks when enable_interm_transfer=true.
     let picked = make_two_domain_picked();
     let options = BatchedDomainOptions {
         enable_interm_transfer: true,
@@ -305,7 +305,7 @@ fn test_processed_domains_from_batched_results() {
     assert_eq!(processed.metadata[0].lower_bound, -0.4);
     assert_eq!(processed.metadata[0].upper_bound, 0.4);
     assert_eq!(processed.metadata[0].depth, 0);
-    assert!(processed.metadata[0].constraints.is_empty());
+    assert_eq!((processed.metadata[0].constraints).len(), 0);
 
     assert_eq!(processed.metadata[1].lower_bound, -0.2);
     assert_eq!(processed.metadata[1].upper_bound, 0.6);

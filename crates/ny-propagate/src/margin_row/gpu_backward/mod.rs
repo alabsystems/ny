@@ -1545,9 +1545,7 @@ pub(crate) fn shadow_compare_site(
     ARMED.call_once(|| {
         // Deliberately does NOT quote SWEEP_POST_SUBMIT_KILL_LINE verbatim:
         // the M2/M3 protocol greps every run log for that literal, and a
-        // banner containing it is a guaranteed false KILL hit (caught on the
-        // first real-row shadow run, 2026-08-20 — the only match in the log
-        // was this banner's own quotation).
+        // banner containing it is a guaranteed false KILL hit.
         eprintln!(
             "[gpu-backward] SHADOW armed ({PROVENANCE_MARKER}) sites={}: device passes are \
              computed, compared against the CPU pass, and DISCARDED (M2; grep run logs for the \

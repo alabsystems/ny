@@ -659,7 +659,7 @@ fn graph_pgd_batched_handles_fixed_flatten_graphs_4093() {
     );
 }
 
-/// #4094: Prove ONNX-style batch-preserving transpose (perm=[0,2,1]) produces
+/// Prove ONNX-style batch-preserving transpose (perm=[0,2,1]) produces
 /// identical batched-vs-sequential IBP output via preserve_leading_axis.
 #[test]
 fn graph_pgd_preserve_leading_axis_matches_sequential_batch_preserving_transpose_4094() {
@@ -675,7 +675,7 @@ fn graph_pgd_preserve_leading_axis_matches_sequential_batch_preserving_transpose
     assert_preserve_leading_axis_matches_sequential(&graph, &samples, Some(&engine));
 }
 
-/// #4094: Prove batch-preserving transpose graphs now take the batched restart
+/// Prove batch-preserving transpose graphs now take the batched restart
 /// PGD lane (low GEMM dispatch count), joining reshape/flatten.
 #[test]
 fn graph_pgd_batched_handles_batch_preserving_transpose_graphs_4094() {
@@ -710,7 +710,7 @@ fn graph_pgd_batched_handles_batch_preserving_transpose_graphs_4094() {
     );
 }
 
-/// #4094: Manual unbatched transpose (perm=[1,0]) enters the batched path
+/// Manual unbatched transpose (perm=[1,0]) enters the batched path
 /// (Transpose is now whitelisted) but the runtime resolve_perm raises
 /// ShapeMismatch on rank-3 batched input, triggering FallbackToSequential.
 /// Sequential fallback produces >10 GEMM calls.
@@ -834,9 +834,8 @@ fn graph_pgd_whitelist_rejects_concat_graphs_4096() {
     );
 }
 
-// --- #4096 equivalence tests: whitelisted families ---
+// --- Equivalence tests: whitelisted families ---
 // Each test proves batched preserve-leading-axis output matches sequential per-sample output.
-// Acceptance criteria #2: "Each allowed family has a direct batched-vs-sequential regression."
 
 fn make_linear_graph() -> GraphNetwork {
     let mut network = Network::new();
@@ -930,8 +929,8 @@ fn graph_pgd_preserve_leading_axis_matches_sequential_maxpool2d_4096() {
     assert_preserve_leading_axis_matches_sequential(&graph, &samples, Some(&engine));
 }
 
-// --- #4096 rejection tests: axis-sensitive blocked families ---
-// Acceptance criteria #3: "Each disallowed family is explicitly blocked by the guard."
+// --- Rejection tests: axis-sensitive blocked families ---
+// Each disallowed family is explicitly blocked by the guard.
 
 fn make_softmax_linear_graph() -> GraphNetwork {
     let mut network = Network::new();
@@ -945,7 +944,7 @@ fn make_softmax_linear_graph() -> GraphNetwork {
     GraphNetwork::from_sequential(&network).expect("softmax+linear network should convert to graph")
 }
 
-// --- #4096 equivalence tests: softmax/logsoftmax whitelisted families ---
+// --- Equivalence tests: softmax/logsoftmax whitelisted families ---
 
 fn make_logsoftmax_linear_graph() -> GraphNetwork {
     let mut network = Network::new();

@@ -447,8 +447,8 @@ mod tests {
         let auxiliary = CertifiedAuxiliaryBounds64::try_from_certified_box(&source).unwrap();
 
         assert_eq!(auxiliary.value_dim(), 0);
-        assert!(auxiliary.lower().is_empty());
-        assert!(auxiliary.upper().is_empty());
+        assert_eq!(auxiliary.lower(), &[] as &[f64]);
+        assert_eq!(auxiliary.upper(), &[] as &[f64]);
     }
 
     #[test]
@@ -626,6 +626,6 @@ mod tests {
                 resource: "test endpoints"
             })
         );
-        assert!(values.is_empty());
+        assert_eq!(values, [] as [f64; 0]);
     }
 }

@@ -54,23 +54,35 @@ impl BenchYear {
 /// The single raw environment read behind every corpus-backed `ny-onnx` test.
 /// Adding another one anywhere in `crates/` trips the ratchet; route new callers
 /// through here (or add a `BenchYear` variant) instead.
+#[allow(dead_code)] // Each integration-test crate uses one of the two faces.
 pub fn benchmark_root(year: BenchYear) -> PathBuf {
+    try_benchmark_root(year).unwrap_or_else(|reason| panic!("{reason}"))
+}
+
+/// [`benchmark_root`] without the panic: the same single read and the same
+/// resolution policy, returning the reason instead. Only for a test registered
+/// in the DEFAULT suite that must SKIP LOUDLY (a named banner, never a silent
+/// pass) when the corpus is absent — a git worktree outside the primary
+/// checkout has no `benchmarks/` ancestor. Corpus tests registered under
+/// `external-vnncomp` keep the hard failure.
+#[allow(dead_code)] // Each integration-test crate uses one of the two faces.
+pub fn try_benchmark_root(year: BenchYear) -> Result<PathBuf, String> {
     let inputs = ny_levers::RawLeverInputs::capture(ny_levers::all());
     if let Some(root) = inputs.get(year.override_decl()) {
-        return PathBuf::from(root);
+        return Ok(PathBuf::from(root));
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     for ancestor in manifest.ancestors() {
         let candidate = ancestor.join(year.relative_path());
         if candidate.is_dir() {
-            return candidate;
+            return Ok(candidate);
         }
     }
-    panic!(
+    Err(format!(
         "Benchmark tree missing: no `{}` in any ancestor of {}. \
          Run benchmarks/download_benchmarks.sh first, or set {}.",
         year.relative_path(),
         manifest.display(),
         year.override_decl().name,
-    );
+    ))
 }

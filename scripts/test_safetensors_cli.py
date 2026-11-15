@@ -28,7 +28,7 @@ except ImportError:
 def run_ny(args: list[str]) -> tuple[int, str, str]:
     """Run ny CLI command and return (returncode, stdout, stderr)."""
     result = subprocess.run(
-        ["cargo", "run", "-p", "ny-cli", "--"] + args,
+        ["targo", "--unverified", "run", "-p", "ny-cli", "--"] + args,
         capture_output=True,
         text=True,
         cwd=REPO_ROOT,

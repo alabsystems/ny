@@ -62,13 +62,16 @@ enum AttentionCompositionStrategy {
     #[default]
     PartialFallback,
     /// Accumulate the attention-identity retry result and continue backward
-    /// through the graph (experimental full-composition path for #318).
+    /// through the graph (experimental full-composition path).
     FullComposition,
 }
 
 pub(super) struct AttentionCompositionRuntime<'a> {
     strategy: AttentionCompositionStrategy,
     full_composition_used: Option<&'a mut bool>,
+    pub(super) regions: Option<crate::network::graph_crown::attention_region::AttentionRegionQuery>,
+    region_receipt:
+        Option<&'a mut crate::network::graph_crown::attention_region::AttentionRegionReceipt>,
 }
 
 impl AttentionCompositionRuntime<'_> {
@@ -76,6 +79,8 @@ impl AttentionCompositionRuntime<'_> {
         Self {
             strategy: AttentionCompositionStrategy::default(),
             full_composition_used: None,
+            regions: None,
+            region_receipt: None,
         }
     }
 
@@ -83,11 +88,48 @@ impl AttentionCompositionRuntime<'_> {
         Self {
             strategy: AttentionCompositionStrategy::FullComposition,
             full_composition_used: None,
+            regions: None,
+            region_receipt: None,
         }
     }
 
     fn should_retry_attention_identity(&self) -> bool {
         self.strategy == AttentionCompositionStrategy::FullComposition
+    }
+
+    pub(super) fn begin_query(
+        &mut self,
+        graph: &GraphNetwork,
+        deadline: Option<std::time::Instant>,
+    ) {
+        if self.regions.is_none() {
+            self.regions = Some(
+                crate::network::graph_crown::attention_region::AttentionRegionQuery::new_for_graph(
+                    graph, deadline,
+                ),
+            );
+        }
+    }
+}
+
+impl Drop for AttentionCompositionRuntime<'_> {
+    fn drop(&mut self) {
+        if let (Some(query), Some(receipt)) = (&self.regions, &mut self.region_receipt) {
+            **receipt = query.receipt();
+        }
+    }
+}
+
+impl<'a> AttentionCompositionRuntime<'a> {
+    pub(super) fn production_with_region_receipt(
+        receipt: &'a mut crate::network::graph_crown::attention_region::AttentionRegionReceipt,
+    ) -> Self {
+        Self {
+            strategy: AttentionCompositionStrategy::default(),
+            full_composition_used: None,
+            regions: None,
+            region_receipt: Some(receipt),
+        }
     }
 }
 
@@ -97,6 +139,8 @@ impl<'a> AttentionCompositionRuntime<'a> {
         Self {
             strategy: AttentionCompositionStrategy::FullComposition,
             full_composition_used: Some(full_composition_used),
+            regions: None,
+            region_receipt: None,
         }
     }
 }
@@ -211,7 +255,7 @@ impl GraphNetwork {
                         input_b_bounds,
                     ) {
                         Ok((lb_a_attn, lb_b_attn)) => {
-                            // Experimental (#318): accumulate attention-identity
+                            // Experimental: accumulate attention-identity
                             // bounds and continue backward. This gives CROWN
                             // propagation through the attention MatMul instead
                             // of concretizing with IBP at this boundary.

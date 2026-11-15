@@ -105,7 +105,33 @@ fn completed_crown_provenance(
     (provenance, Some(gain))
 }
 
-/// Core CROWN-IBP collection with optional pre-computed IBP bounds (#3397).
+/// #crown-partial-sound-forward — the sequential CROWN-IBP collector's own
+/// engagement observable, printed ONCE per process on the first collection.
+///
+/// Every consumer of this collector (the sequential β-CROWN root and
+/// per-domain boxes, `propagate_crown_core`'s incumbent, the DAG linear-chain
+/// fast path, the MIP Big-M feed) publishes what it returns into a verdict, and
+/// before this change nothing on stderr said the collector had run at all: the
+/// only summary is `info!`-level and gated on `collection_secs > 0.1`, so a
+/// fast conv row could be decided through this walk with no line to grep. A
+/// replay that finds A=unsat/B!=unsat on a row needs to know the row ENTERED
+/// this collector before it may attribute the flip to the certified forward
+/// ("demand the lever's own observable" — a null without it is VOID).
+/// `certified_forward=1` names the arm this binary carries; a binary without
+/// the string is the plain-forward lineage.
+fn announce_sequential_collector_engaged(layers: usize, precomputed: bool, deadline: bool) {
+    static ANNOUNCED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ANNOUNCED.get_or_init(|| {
+        eprintln!(
+            "[crown-ibp-seq] sequential CROWN-IBP collector ENGAGED: layers={layers} \
+             precomputed_incumbent={} deadline={} certified_forward=1",
+            u8::from(precomputed),
+            u8::from(deadline),
+        );
+    });
+}
+
+/// Core CROWN-IBP collection with optional pre-computed IBP bounds.
 ///
 /// When `precomputed_ibp` is `Some`, skips the internal `collect_ibp_bounds`
 /// call, saving the entire IBP forward pass (~59s for soundnessbench).
@@ -119,6 +145,7 @@ pub(super) fn collect_core(
     honest_provenance_enabled: bool,
     patches_deadline_flat_bias_enabled: Option<bool>,
 ) -> Result<CrownIbpBoundsResult> {
+    network.ensure_proof_eligible()?;
     let n = network.layers.len();
     if n == 0 {
         return Ok(CrownIbpBoundsResult {
@@ -141,6 +168,7 @@ pub(super) fn collect_core(
         ));
     }
 
+    let precomputed = precomputed_ibp.is_some();
     let ibp_bounds = match precomputed_ibp {
         Some(bounds) => {
             if bounds.len() != n {
@@ -158,6 +186,7 @@ pub(super) fn collect_core(
         }
         None => super::forward::collect_ibp_bounds_with_deadline(network, input, deadline)?,
     };
+    announce_sequential_collector_engaged(n, precomputed, deadline.is_some());
     let mut crown_ibp_bounds = Vec::with_capacity(n);
     let mut provenance = Vec::with_capacity(n);
     let mut fallback_events = Vec::new();
@@ -214,7 +243,7 @@ pub(super) fn collect_core(
             }
         })
         .collect();
-    // Per-node timing for CROWN-IBP collection (#3599).
+    // Per-node timing for CROWN-IBP collection.
     let collection_start = Instant::now();
     let mut crown_node_count = 0usize;
     let mut shortcut_node_count = 0usize;
@@ -225,7 +254,7 @@ pub(super) fn collect_core(
     for (k, ibp_bound) in ibp_bounds.iter().enumerate() {
         // Once the global authority expires, this status-bearing API cannot
         // clone the remaining owned IBP tensors and allocate their per-layer
-        // provenance. Preserve the typed deadline instead (#3328).
+        // provenance. Preserve the typed deadline instead.
         // #cgan-reclaim (default dark ⇒ byte-identical): armed, retain the
         // completed per-node tightenings instead — see `commit_partial_on_expiry`.
         if deadline.is_some_and(|d| Instant::now() >= d) {
@@ -247,11 +276,23 @@ pub(super) fn collect_core(
         let node_start = Instant::now();
         let needs_crown = layer_output_needs_partial_crown(&network.layers, k);
 
-        // ReLU-stable skip (#3599): if the successor is ReLU and every neuron
+        // ReLU-stable skip: if the successor is ReLU and every neuron
         // at this layer's output is stable (lower >= 0 or upper <= 0), CROWN
         // tightening cannot improve on IBP because the ReLU relaxation is
         // already exact. Keep this narrow: other nonlinear successors still
         // need tighter pre-activation bounds on one-sign intervals.
+        //
+        // Deliberately NO first-affine skip (target 0 = one Conv/Gemm reading
+        // the input, where alpha-beta-CROWN uses IBP). Over a box, CROWN and IBP
+        // of one affine layer agree only in REAL arithmetic. Here the certified
+        // IBP forward charges the f32 Higham term `γ_{K+2}·S + 2u·|y|`
+        // (`conv2d/bound.rs` `propagate_ibp_sound_with_engine`, `linear/ibp.rs`
+        // abssum certificate), while the walk concretizes the same coefficients
+        // in f64 with directed rounding (`concretize_row_directed`). The
+        // published value is `ibp ∩ crown`, so publishing `ibp` alone could only
+        // be equal or LOOSER — never provably identical-or-tighter. After
+        // #crown-partial-pnc the walk also costs only ~taps-per-row terms per
+        // side (27 on cnn7's first conv), so there is little time to buy back.
         let relu_stable_successor = needs_crown
             && matches!(network.layers.get(k + 1), Some(Layer::ReLU(_)))
             && is_all_relu_stable(ibp_bound);
@@ -287,7 +328,7 @@ pub(super) fn collect_core(
                     count_remaining_budget_candidates(&global_budget_candidate_mask, k);
                 // Use per-node budget share when the floor is met; otherwise
                 // fall back to full remaining time. Avoids preemptive IBP
-                // fallback for small networks where backward is fast (#4413).
+                // fallback for small networks where backward is fast.
                 // crown_partial's per-layer deadline handles actual timeouts.
                 let per_node_secs = if seq_weighted_budget {
                     let remaining_weight_sum: f64 = global_budget_candidate_weights[k..]
@@ -342,7 +383,7 @@ pub(super) fn collect_core(
                 match crown_bounds {
                     Ok(PartialCrownPropagationResult::Crown(cb)) => {
                         let cb = *cb;
-                        // #3300: Shape-tolerant intersection. Reshape CROWN bounds to
+                        // Shape-tolerant intersection. Reshape CROWN bounds to
                         // match IBP shape when element counts match but shapes differ
                         // (e.g., Reshape([-1]) produces [N] vs FlattenLayer(0) [1, N]).
                         let cb = if cb.shape() != ibp_bound.shape() && cb.len() == ibp_bound.len() {
@@ -372,7 +413,7 @@ pub(super) fn collect_core(
                                 honest_provenance_enabled,
                             );
                             match ibp_bound.intersection_per_element(&cb) {
-                                // Per-element intersection succeeded (#2935).
+                                // Per-element intersection succeeded.
                                 Some((tightened, disjoint)) => {
                                     if disjoint > 0 {
                                         debug!(
@@ -481,8 +522,8 @@ pub(super) fn collect_core(
                         BoundsProvenance::ForwardFallback(fallback.reason),
                         Some((fallback.reason, fallback.details)),
                     ),
-                    // #3131, #3499: UnsupportedOp/Configuration/NumericalInstability →
-                    // IBP fallback is correct. Other errors must propagate (#3106).
+                    // UnsupportedOp/Configuration/NumericalInstability →
+                    // IBP fallback is correct. Other errors must propagate.
                     Err(
                         NyError::UnsupportedOp(msg)
                         | NyError::UnsupportedConfiguration(msg)
@@ -534,7 +575,7 @@ pub(super) fn collect_core(
                             Some((reason, msg)),
                         )
                     }
-                    // #3813: ShapeMismatch triggers IBP fallback. RSPLITTER models
+                    // ShapeMismatch triggers IBP fallback. RSPLITTER models
                     // change intermediate dimensions, causing shape mismatches in
                     // partial CROWN backward. IBP fallback is always sound.
                     Err(NyError::ShapeMismatch {
@@ -598,7 +639,7 @@ pub(super) fn collect_core(
             network.layers[k].layer_type(),
         )?;
 
-        // Per-node timing (#3599): track CROWN vs shortcut time distribution.
+        // Per-node timing: track CROWN vs shortcut time distribution.
         let node_secs = node_start.elapsed().as_secs_f64();
         if needs_crown
             && ny_levers::read(&ny_levers::decls::diagnostics::DUMP_NODE_BOUNDS)
@@ -676,7 +717,7 @@ pub(super) fn collect_core(
         ));
     }
 
-    // CROWN-IBP collection timing summary (#3599).
+    // CROWN-IBP collection timing summary.
     let collection_secs = collection_start.elapsed().as_secs_f64();
     if collection_secs > 0.1 {
         info!(

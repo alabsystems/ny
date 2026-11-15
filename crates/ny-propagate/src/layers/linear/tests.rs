@@ -373,7 +373,7 @@ fn test_ibp_1d_soundness() -> Result<()> {
 #[ntest::timeout(10000)]
 #[test]
 fn test_ibp_1d_preserves_large_finite_bounds_above_fallback_2549() -> Result<()> {
-    // #2549: finite values above FALLBACK_BOUND must be preserved (no narrowing clamp).
+    // Finite values above FALLBACK_BOUND must be preserved (no narrowing clamp).
     let weight = array![[2.0e10_f32]];
     let layer = LinearLayer::new(weight, None)?;
     let input = BoundedTensor::new(array![-1.0_f32].into_dyn(), array![1.0_f32].into_dyn())?;
@@ -669,7 +669,7 @@ fn test_crown_shape_mismatch() {
     );
 }
 
-// ===== #2709: GEMM-engine and sequence-dimension linear CROWN coverage =====
+// ===== GEMM-engine and sequence-dimension linear CROWN coverage =====
 
 #[ntest::timeout(10000)]
 #[test]
@@ -1235,7 +1235,7 @@ fn test_crown_multi_domain_engine_nonfinite_fallback_matches_cpu_2709() -> Resul
     Ok(())
 }
 
-/// Post-#2977: from_parts_unchecked now has debug_assert rejecting NaN in
+/// from_parts_unchecked has a debug_assert rejecting NaN in
 /// A-matrices. The sanitization behavior tested here (zeroing non-finite rows,
 /// ±inf bias fallback) is now only reachable in release mode where debug_assert
 /// is elided. In debug mode, constructing BatchedLinearBounds with NaN panics.
@@ -1244,7 +1244,7 @@ fn test_crown_multi_domain_engine_nonfinite_fallback_matches_cpu_2709() -> Resul
 #[cfg(debug_assertions)]
 #[test]
 fn test_batched_crown_sanitizes_non_finite_faer_output() -> Result<()> {
-    // #2977 from_parts_unchecked debug_assert blocks NaN injection in debug builds.
+    // The from_parts_unchecked debug_assert blocks NaN injection in debug builds.
     // This test verifies the guard fires.
     let result = std::panic::catch_unwind(|| {
         BatchedLinearBounds::from_parts_unchecked(
@@ -1672,14 +1672,14 @@ fn test_batched_crown_rectangular() -> Result<()> {
     Ok(())
 }
 
-// ===== NaN weight injection test (#2432) =====
+// ===== NaN weight injection test =====
 
 /// Verify that a NaN weight in a linear layer produces non-finite (conservative) IBP bounds
 /// instead of silently absorbing the NaN via f32::max(NaN, 0.0) = 0.0.
 ///
-/// Before #2432, the weight split `w.max(0.0)` / `w.min(0.0)` would convert NaN → 0.0,
+/// Previously, the weight split `w.max(0.0)` / `w.min(0.0)` would convert NaN → 0.0,
 /// causing that weight's contribution to vanish and producing unsound bounds.
-/// After #2432, `nan_propagating_max_zero` / `nan_propagating_min_zero` preserve NaN,
+/// Now `nan_propagating_max_zero` / `nan_propagating_min_zero` preserve NaN,
 /// which propagates through matmul and produces non-finite bounds.
 #[ntest::timeout(10000)]
 #[test]
@@ -1705,7 +1705,7 @@ fn test_ibp_nan_weight_produces_non_finite_bounds() {
     // The output bound for row 0 (which uses the NaN weight) must be conservative.
     // NaN propagates through matmul, then new_repaired widens it to ±inf: a NaN
     // output proves nothing in either direction, and any finite substitute would
-    // be an unsound tightening. See: #2467 and #3423.
+    // be an unsound tightening.
     let lo = result.lower()[[0]];
     let hi = result.upper()[[0]];
     assert_eq!(
@@ -1726,14 +1726,14 @@ fn test_ibp_nan_weight_produces_non_finite_bounds() {
     // NaN does NOT silently vanish into zero in the weight split.
 }
 
-// ===== #2681: Non-finite A-matrix row fallback to ±inf bias =====
+// ===== Non-finite A-matrix row fallback to ±inf bias =====
 
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_nonfinite_row_fallback_2681() -> Result<()> {
-    // #2681: When A @ W overflows f32 and produces non-finite coefficients in a row,
+    // When A @ W overflows f32 and produces non-finite coefficients in a row,
     // the entire row's A-coefficients are zeroed and bias is set to ±inf.
-    // This replaces the old per-coefficient zero-substitution (#2409) which was
+    // This replaces the old per-coefficient zero-substitution which was
     // unsound because dropping individual coefficients can inflate or deflate bounds
     // depending on the sign of the coefficient and input bounds.
     //
@@ -1811,7 +1811,7 @@ fn test_crown_nonfinite_row_fallback_2681() -> Result<()> {
     Ok(())
 }
 
-/// Verify that the #2681 fix is sound: for any input in the domain, the concretized
+/// Verify that the ±inf row fallback is sound: for any input in the domain, the concretized
 /// CROWN bounds (after non-finite row fallback) must contain the true output.
 ///
 /// The old per-coefficient zero-substitution was unsound because it could inflate
@@ -1898,7 +1898,7 @@ fn test_crown_nonfinite_row_fallback_soundness_2681() -> Result<()> {
     Ok(())
 }
 
-/// Regression test for #2789: rounding_ulps must not truncate usize to u32.
+/// Regression test: rounding_ulps must not truncate usize to u32.
 ///
 /// The pattern `u32::try_from(in_features).unwrap_or(u32::MAX).saturating_add(2)`
 /// must saturate at u32::MAX for oversized in_features, never wrapping via `as u32`.
@@ -1938,7 +1938,7 @@ fn test_rounding_ulps_no_truncation_on_large_in_features() {
     }
 }
 
-// --- Rank-0 regression tests (#2868) ---
+// --- Rank-0 regression tests ---
 
 /// Rank-0 BoundedTensor must return Err, not panic, from Linear IBP.
 #[test]
@@ -1959,7 +1959,7 @@ fn test_ibp_rank0_returns_error_not_panic() {
     );
 }
 
-/// Regression test for #4221: ndarray 0.17 clone() preserves F-layout (column-major)
+/// Regression test: ndarray 0.17 clone() preserves F-layout (column-major)
 /// arrays, so weights from const-fold or from_dynamic can arrive non-contiguous.
 /// `LinearLayer::new()` must normalize to standard layout so `as_slice()` succeeds
 /// on all downstream GEMM paths.
@@ -2042,7 +2042,7 @@ fn parameter_replacement_rebuilds_all_cached_weight_views_atomically() {
     assert_eq!(layer.bias(), snapshot_bias.as_ref());
 }
 
-// ===== #4321: deadline-authoritative Linear CROWN backward =====
+// ===== Deadline-authoritative Linear CROWN backward =====
 
 /// Build a wide LinearLayer (`in_features` -> `out_features`) and a many-row
 /// CROWN frontier representative of a root spec-matrix backward.
@@ -2858,7 +2858,7 @@ fn pollable_faer_gate_preserves_legacy_truthy_parser() {
 }
 
 /// Timing probe for the production block quantum (informational; run with
-/// `cargo test --release -p ny-propagate pollable_faer_block_timing_probe -- \
+/// `targo --unverified test --release -p ny-propagate pollable_faer_block_timing_probe -- \
 /// --nocapture`). The release-only configuration keeps this measurement out
 /// of ordinary debug unit runs without hiding it behind an ignored test. Pins
 /// the 10-50ms-per-block sizing claim with a

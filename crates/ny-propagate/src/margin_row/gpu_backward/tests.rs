@@ -660,7 +660,7 @@ fn consumer_kernels_rely_on_the_shared_primitives() {
 
 #[test]
 fn gate_transform_selects_the_intercept_side_per_element() {
-    // Re-derivation against engine.rs:653-735 (adversarial review, 2026-08-19):
+    // Re-derivation against engine.rs:653-735:
     // the intercept side is SIGN-OF-V dependent and differs between lanes
     // (lower: v.min(0)*c, engine.rs:667; upper: v.max(0)*c), so the host
     // cannot bake it into one slot — the gate must carry an intercept PAIR
@@ -860,7 +860,7 @@ fn gate_fixture_exercises_the_intercept_pair_and_matches_the_spec() {
 
 // ---------------------------------------------------------------------------
 // Device-gated M1 parity harness (the REAL self-check on the live adapter).
-// `cargo test -p ny-propagate --features gpu-tests gpu_backward`
+// `targo --unverified test -p ny-propagate --features gpu-tests gpu_backward`
 // ---------------------------------------------------------------------------
 
 /// The on-device M1 bit-parity measurement: dispatch the ds-primitive probe
@@ -874,7 +874,7 @@ fn gate_fixture_exercises_the_intercept_pair_and_matches_the_spec() {
 /// this file (`parity_mismatch_latches_the_channel_dead` trips the latch on
 /// purpose), and this test must stay order-independent.
 #[test]
-#[cfg(feature = "gpu-tests")]
+#[cfg(feature = "gpu-tests-uncharged")]
 fn m1_device_parity_is_bit_identical_on_this_adapter() {
     use super::authority::{DeviceParityProof, VerdictAuthority, PARITY_MIN_LANES};
     use super::probe::self_check_streams;
@@ -928,19 +928,21 @@ fn m1_device_parity_is_bit_identical_on_this_adapter() {
 // L-lane transaction: program assembly (host-only)
 // ---------------------------------------------------------------------------
 
-/// The M3 authority switch is ON as of 2026-08-21, and this pin still exists:
-/// it now guards against an accidental flip BACK, and against the root site
-/// being authorized without the rest of the chain that makes it safe.
+/// The M3 authority switch is OFF (reverted 2026-08-22; the constant's own docs
+/// give the reasons), and this pin keeps it so: it guards against an accidental
+/// flip, and against the root site being authorized without the rest of the
+/// chain that makes it safe.
 ///
-/// It was flipped by the M2 x15 moat protocol (docs/BIG3_CORE_CAMPAIGN
-/// "M2 x15 PASS"): 15/15 verdicts identical to the bank, zero SHADOW TRIPs,
-/// 16/16 free of the sweep post-submit kill line (the criterion that failed
-/// 1/6 pre-fix, with the exact poisoning row now clean 3/3), max median_radius
-/// 1.029e-6 = 6.8x under the R1 bar, expansion fingerprints exact with zero
-/// variance. Re-confirmed bit-identical on the scored `mip,cuda` tier.
+/// It had been flipped on the M2 x15 moat protocol
+/// (docs/BIG3_CORE_CAMPAIGN_2026-08-19.md "M2 x15 PASS"): 15/15 verdicts
+/// identical to the bank, zero SHADOW TRIPs, 16/16 free of the sweep
+/// post-submit kill line (the criterion that failed 1/6 pre-fix, with the exact
+/// poisoning row now clean 3/3), max median_radius 1.029e-6 = 6.8x under the
+/// R1 bar, expansion fingerprints exact with zero variance. That protocol cannot
+/// detect a wrongly tight device bound, which is why the flip was reverted.
 ///
-/// Reverting is equally deliberate: change the constant AND this pin together,
-/// and say which measurement justified it.
+/// Flipping it again is equally deliberate: change the constant AND this pin
+/// together, and say which measurement justified it.
 #[test]
 fn verdict_authority_is_m3_gated_off() {
     // `const {}` makes this a build-time ratchet instead of a test-time one:
@@ -1676,7 +1678,7 @@ fn head_twin_value_is_enclosed_by_gamma_ds() {
 
 // ---------------------------------------------------------------------------
 // Device-gated L-lane tests (real dispatches on the live adapter).
-// `cargo test -p ny-propagate --features gpu-tests --lib gpu_backward`
+// `targo --unverified test -p ny-propagate --features gpu-tests --lib gpu_backward`
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "gpu-tests")]
@@ -1755,7 +1757,7 @@ mod lane_device_helpers {
 /// bias reduce incl. cross-dispatch running accumulation, residual merge,
 /// conv gather) against the host ds twins, on the live adapter.
 #[test]
-#[cfg(feature = "gpu-tests")]
+#[cfg(feature = "gpu-tests-uncharged")]
 fn l_lane_kernels_are_bit_identical_on_this_adapter() {
     use super::ds::Ds;
     use super::probe::{pairs_from_bytes, scalars_from_bytes};
@@ -2262,7 +2264,7 @@ fn l_lane_kernels_are_bit_identical_on_this_adapter() {
 /// directions, root gates AND a piece-fixed domain, identity AND margin-style
 /// seeds.
 #[test]
-#[cfg(feature = "gpu-tests")]
+#[cfg(feature = "gpu-tests-uncharged")]
 fn l_lane_transaction_encloses_the_cpu_pass_on_the_fixtures() {
     use super::super::gpu_seam::tests as seam_tests;
     use super::authority::{DeviceParityProof, VerdictAuthority};
@@ -3718,7 +3720,7 @@ fn new_kernels_are_bit_identical_on_this_adapter() {
 /// arm's shape and values (to ds precision — it is a ranker input, not a
 /// bound).
 #[test]
-#[cfg(feature = "gpu-tests")]
+#[cfg(feature = "gpu-tests-uncharged")]
 fn b4_b5_transactions_enclose_the_cpu_pass_on_the_fixtures() {
     use super::super::gpu_seam::tests as seam_tests;
     use super::authority::{DeviceParityProof, VerdictAuthority};

@@ -194,7 +194,7 @@ fn extract_single_input_subgraph(
     Ok(subgraph)
 }
 
-/// Packet C for #318: make the `softmax @ V` fallback seam explicit.
+/// Packet C: make the `softmax @ V` fallback seam explicit.
 ///
 /// The context node itself is computed by IBP fallback on the zonotope path, so
 /// converting that interval back into a zonotope must preserve the context

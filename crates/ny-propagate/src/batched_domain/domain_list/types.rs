@@ -30,7 +30,6 @@ use std::sync::Arc;
 ///
 /// # Reference
 /// alpha-beta-CROWN: `complete_verifier/tensor_storage.py` (all_lAs storage)
-/// Design: `designs/2026-02-07-gpu-bab-la-reuse-closure.md` (Direction 2b)
 #[derive(Debug, Clone, Default)]
 pub struct CachedLinearBounds {
     /// Lower bound coefficient matrices per node: node_name -> [output_dim, input_dim].
@@ -41,6 +40,13 @@ pub struct CachedLinearBounds {
     pub(crate) lower_b: HashMap<String, ndarray::Array1<f32>>,
     /// Upper bound bias vectors per node: node_name -> [output_dim].
     pub(crate) upper_b: HashMap<String, ndarray::Array1<f32>>,
+    /// #la-warm-frontier: per popped node, the rest of the backward state the
+    /// capturing pass held at that moment (pending skip-path blocks and the
+    /// network-input channel), error-folded. Empty unless the capturing pass
+    /// ran with `BetaCrownConfig::la_warm_frontier`; a frontier is kept only
+    /// next to its node's own block with the same rows
+    /// ([`Self::attach_frontiers`]). See `domain_list/warm_frontier.rs`.
+    pub(crate) frontiers: HashMap<String, super::warm_frontier::WarmFrontier>,
 }
 
 impl CachedLinearBounds {
@@ -79,7 +85,22 @@ impl CachedLinearBounds {
                     })
                     .sum::<usize>(),
             );
-        size_of::<Self>().saturating_add(arrays)
+        // #la-warm-frontier (review): the `frontiers` field's own inline size
+        // is charged only while the cache carries a frontier. A dark cache
+        // (no frontier, every shipped yaml) is then charged exactly the
+        // historical four-map census: this figure feeds queue eviction AND
+        // adaptive microbatch sizing (`domain_list/memory.rs`), so the 48 extra
+        // inline bytes per resident row would otherwise move dark batch
+        // boundaries.
+        let inline = if self.frontiers.is_empty() {
+            size_of::<Self>()
+                .saturating_sub(size_of::<HashMap<String, super::warm_frontier::WarmFrontier>>())
+        } else {
+            size_of::<Self>()
+        };
+        inline
+            .saturating_add(arrays)
+            .saturating_add(self.frontier_owned_bytes())
     }
 
     /// Reconstruct full `LinearBounds` at a given node from cached data.
@@ -109,12 +130,17 @@ impl CachedLinearBounds {
     /// This extracts the full linear bounds (A matrices + bias vectors) from each
     /// `LinearBounds` and stores them by node name.
     ///
+    /// # Soundness (#warm-cache-err)
+    /// The cache keeps no coefficient-error matrices, so a block that still
+    /// carries certified coefficient error is NOT published: its bare `(A, b)`
+    /// is tighter than the certified bound, and there is no box here to fold
+    /// the error over. Capture sites fold it first over the node's certified
+    /// box with [`Self::fold_capture_coeff_err`]; an entry that reaches this
+    /// point unfolded is left out (the child then runs the cold pass there).
+    ///
     /// # Arguments
     /// * `linear_bounds_map` - Map from node name to LinearBounds (as produced by
     ///   the backward pass)
-    ///
-    /// # Reference
-    /// Issue: #1564 (lA matrix caching), #1669 (warm-start requires bias)
     pub fn from_linear_bounds_map(linear_bounds_map: HashMap<String, crate::LinearBounds>) -> Self {
         let mut lower_a = HashMap::new();
         let mut upper_a = HashMap::new();
@@ -122,6 +148,13 @@ impl CachedLinearBounds {
         let mut upper_b = HashMap::new();
 
         for (node_name, lb) in linear_bounds_map {
+            if lb.has_coeff_err() {
+                tracing::debug!(
+                    node = node_name.as_str(),
+                    "CachedLinearBounds: refusing an unfolded coefficient-error block (#warm-cache-err)"
+                );
+                continue;
+            }
             let (la, lbias, ua, ubias) = lb.into_parts();
             lower_a.insert(node_name.clone(), la);
             upper_a.insert(node_name.clone(), ua);
@@ -134,6 +167,7 @@ impl CachedLinearBounds {
             upper_a,
             lower_b,
             upper_b,
+            frontiers: HashMap::new(),
         }
     }
 
@@ -145,13 +179,26 @@ impl CachedLinearBounds {
     /// residual split pre-activations. The replacement is a valid enclosure of
     /// the SAME node over the SAME input box, so downstream constraint building
     /// and tightening stay sound.
-    pub fn override_node(&mut self, node_name: &str, bounds: crate::LinearBounds) {
+    ///
+    /// #warm-cache-err: a replacement that still carries certified coefficient
+    /// error is refused (the existing entry stays) because its bare `(A, b)`
+    /// would be tighter than certified; fold it with
+    /// [`Self::fold_capture_coeff_err`] first. Returns whether the entry was
+    /// replaced.
+    pub fn override_node(&mut self, node_name: &str, bounds: crate::LinearBounds) -> bool {
+        if bounds.has_coeff_err() {
+            return false;
+        }
         // `into_parts()` yields `(lower_a, lower_b, upper_a, upper_b)`.
         let (la, lbias, ua, ubias) = bounds.into_parts();
+        // #la-warm-frontier: a frontier is valid only next to the block it
+        // was captured with.
+        self.frontiers.remove(node_name);
         self.lower_a.insert(node_name.to_string(), la);
         self.upper_a.insert(node_name.to_string(), ua);
         self.lower_b.insert(node_name.to_string(), lbias);
         self.upper_b.insert(node_name.to_string(), ubias);
+        true
     }
 
     /// Split a multi-row cache into per-row single-objective caches.
@@ -162,10 +209,6 @@ impl CachedLinearBounds {
     ///
     /// Returns `None` if the cache is empty or any matrix has fewer rows than
     /// `num_objectives`.
-    ///
-    /// # Reference
-    /// Design: `designs/2026-03-15-issue-3813-multi-objective-la-warm-start.md`
-    /// Issue: #3813
     pub fn split_multi_row(&self, num_objectives: usize) -> Option<Vec<CachedLinearBounds>> {
         if self.is_empty() || num_objectives == 0 {
             return None;
@@ -213,7 +256,14 @@ impl CachedLinearBounds {
                 upper_a: ua,
                 lower_b: lb,
                 upper_b: ub,
+                frontiers: HashMap::new(),
             });
+            // #la-warm-frontier: row `row_idx` of every paired frontier,
+            // re-paired with row `row_idx` of its node's block.
+            if !self.frontiers.is_empty() {
+                let row_cache = result.last_mut().expect("just pushed");
+                row_cache.frontiers = self.frontiers_for_row(row_idx, row_cache);
+            }
         }
 
         Some(result)
@@ -222,7 +272,7 @@ impl CachedLinearBounds {
 
 /// Metadata for a single domain (non-tensor fields).
 ///
-/// Fields are `pub(crate)` to enforce construction through validated methods (#3125, #2982).
+/// Fields are `pub(crate)` to enforce construction through validated methods.
 #[derive(Debug, Clone)]
 pub struct DomainMetadata {
     /// Lower bound on objective.
@@ -242,7 +292,7 @@ pub struct DomainMetadata {
     /// reuse it as a starting point for the backward pass, avoiding O(n)
     /// recomputation at layers before the branch point.
     ///
-    /// Wrapped in `Arc` for O(1) cloning during child domain creation (#2326).
+    /// Wrapped in `Arc` for O(1) cloning during child domain creation.
     /// The cached bounds are read-only after creation.
     ///
     /// `None` indicates this is a new domain with no cached bounds.
@@ -267,20 +317,16 @@ pub struct DomainMetadata {
     /// graph-local DomainList. Packed state is never a cross-graph cache.
     ///
     /// `None` for non-graph-BaB domains or when alpha optimization is disabled.
-    /// Issue: #1845
     pub(crate) alpha_state: Option<QueuedGraphAlphaState>,
 }
 
 impl DomainMetadata {
-    // --- Validated constructors (#3125, #2982) ---
+    // --- Validated constructors ---
 
     /// Create a new DomainMetadata with NaN validation on bounds.
     ///
     /// Returns `Err(NumericalInstability)` if `lower_bound` or `upper_bound` is NaN.
     /// This prevents zombie domains from entering the BaB search.
-    ///
-    /// # Reference
-    /// designs/2026-02-25-validated-bab-domain-types.md Phase 4
     pub(crate) fn new(
         lower_bound: f32,
         upper_bound: f32,
@@ -329,7 +375,7 @@ impl DomainMetadata {
         Ok(())
     }
 
-    // --- Accessor methods (#3125) ---
+    // --- Accessor methods ---
 
     /// Lower bound on objective.
     pub fn lower_bound(&self) -> f32 {
@@ -351,7 +397,7 @@ impl DomainMetadata {
         &self.constraints
     }
 
-    /// Cached linear bound coefficients (Arc-wrapped for O(1) cloning, #2326).
+    /// Cached linear bound coefficients (Arc-wrapped for O(1) cloning).
     pub fn cached_la(&self) -> &Option<Arc<CachedLinearBounds>> {
         &self.cached_la
     }
@@ -520,8 +566,6 @@ pub struct DomainListConfig {
     /// unbounded memory growth.
     ///
     /// Set to 0 to disable the cap (unbounded queue, original behavior).
-    ///
-    /// Reference: Issue #2326 Finding 1
     pub max_queue_size: usize,
 }
 

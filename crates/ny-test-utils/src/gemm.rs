@@ -6,7 +6,6 @@
 //!
 //! Consolidates ~25 near-identical `CountingGemmEngine` definitions scattered
 //! across test modules in ny-propagate, ny-cli, ny-onnx, and ny-api.
-//! See issue #4141 for the deduplication tracker.
 
 use ny_core::{GemmEngine, NaiveCpuGemmEngine};
 use std::sync::{

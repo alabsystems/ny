@@ -44,7 +44,7 @@ fn test_div_layer_ibp_positive_divisor() {
     }
 }
 
-/// Regression test for issue #1606: DivLayer should reject non-positive divisor.
+/// Regression test: DivLayer should reject non-positive divisor.
 #[ntest::timeout(10000)]
 #[test]
 fn test_div_layer_ibp_rejects_zero_divisor_1606() {
@@ -76,7 +76,7 @@ fn test_div_layer_ibp_rejects_zero_divisor_1606() {
     );
 }
 
-/// Regression test for issue #1606: DivLayer should reject negative divisor.
+/// Regression test: DivLayer should reject negative divisor.
 #[ntest::timeout(10000)]
 #[test]
 fn test_div_layer_ibp_rejects_negative_divisor_1606() {
@@ -177,7 +177,7 @@ fn test_div_layer_ibp_small_positive_divisor() {
     );
 }
 
-/// Regression test for issue #1643: negative numerator with positive divisor.
+/// Regression test: negative numerator with positive divisor.
 /// f(b) = a/b is increasing in b when a < 0, so the old formula that assumed
 /// decreasing monotonicity produced bounds that were too tight.
 #[ntest::timeout(10000)]
@@ -211,7 +211,7 @@ fn test_div_layer_ibp_negative_numerator_1643() {
     );
 }
 
-/// Regression test for issue #1643: mixed-sign numerator with positive divisor.
+/// Regression test: mixed-sign numerator with positive divisor.
 #[ntest::timeout(10000)]
 #[test]
 fn test_div_layer_ibp_mixed_sign_numerator_1643() {
@@ -243,7 +243,7 @@ fn test_div_layer_ibp_mixed_sign_numerator_1643() {
     );
 }
 
-/// Regression test for issue #1643: zero-crossing numerator [-1, 1].
+/// Regression test: zero-crossing numerator [-1, 1].
 #[ntest::timeout(10000)]
 #[test]
 fn test_div_layer_ibp_zero_crossing_numerator_1643() {
@@ -275,7 +275,7 @@ fn test_div_layer_ibp_zero_crossing_numerator_1643() {
     );
 }
 
-/// Regression test for #1689: divisor bounds spanning zero should be rejected.
+/// Regression test: divisor bounds spanning zero should be rejected.
 /// B ∈ [-1, 2] — the interval contains zero, so division is undefined.
 #[ntest::timeout(10000)]
 #[test]
@@ -307,7 +307,7 @@ fn test_div_layer_ibp_rejects_divisor_spanning_zero_1689() {
     );
 }
 
-/// Regression test for #1689: divisor with b_lower = 0 exactly should be rejected.
+/// Regression test: divisor with b_lower = 0 exactly should be rejected.
 /// B ∈ [0, 5] — lower bound touches zero, not strictly positive.
 #[ntest::timeout(10000)]
 #[test]
@@ -337,7 +337,7 @@ fn test_div_layer_ibp_rejects_divisor_touching_zero_1689() {
     );
 }
 
-/// Regression test for #1689: relying only on b_lower > 0 is unsound when
+/// Regression test: relying only on b_lower > 0 is unsound when
 /// divisor intervals are malformed (lower > upper).
 #[ntest::timeout(10000)]
 #[test]
@@ -367,7 +367,7 @@ fn test_div_layer_ibp_rejects_inverted_positive_divisor_bounds_1689() {
     );
 }
 
-/// Regression test for #1689: non-finite divisor bounds must be rejected
+/// Regression test: non-finite divisor bounds must be rejected
 /// before division to avoid NaN propagation.
 #[ntest::timeout(10000)]
 #[test]

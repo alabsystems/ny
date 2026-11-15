@@ -210,7 +210,7 @@ pub(super) fn update_all_alphas(
         // Without this gate, NaN/Inf gradients from numerical instability
         // in the backward pass silently enter the optimizer state (m/v for
         // Adam, velocity for SGD). Skipping preserves the current alpha
-        // (a better heuristic than silent reset). (#2809, #2835)
+        // (a better heuristic than silent reset).
         if grad.iter().any(|v| !v.is_finite()) {
             warn!(
                 "DAG α-CROWN iter {}: skipping ReLU {} gradient update — non-finite values detected (#2835)",
@@ -220,7 +220,7 @@ pub(super) fn update_all_alphas(
             continue;
         }
         let neg_grad = grad.mapv(|v: f32| -v);
-        // Upper gradient: separate from lower (#3393).
+        // Upper gradient: separate from lower.
         let neg_grad_upper = if grad_upper.iter().any(|v| !v.is_finite()) {
             neg_grad.clone()
         } else {
@@ -234,7 +234,7 @@ pub(super) fn update_all_alphas(
                 ))
             })?
             .to_string();
-        // Channel-only alpha reduction (#4404): when full_conv_alpha is False,
+        // Channel-only alpha reduction: when full_conv_alpha is False,
         // gradients are per-neuron [C*H*W] but alpha is per-channel [C].
         // Reduce gradients to match alpha shape before optimizer update.
         let raw_len = neg_grad.len();
@@ -356,7 +356,7 @@ pub(super) fn update_all_alphas(
         }
     }
 
-    // Reciprocal alpha update (#4399 Slice 2)
+    // Reciprocal alpha update
     for (node_name, grad) in reciprocal_grads {
         if grad.any_non_finite() {
             warn!(
@@ -382,7 +382,7 @@ pub(super) fn update_all_alphas(
         }
     }
 
-    // Bilinear Adam update (#3287). Always uses Adam (matching batched path
+    // Bilinear Adam update. Always uses Adam (matching batched path
     // in alpha_crown_batched/spsa.rs). Gradient ascent: negate gradients.
     if has_bilinear {
         adam_update_alpha_map(
@@ -401,7 +401,7 @@ pub(super) fn update_all_alphas(
         }
     }
 
-    // MulBinary Adam update (#3439 Phase 3). Same pattern as bilinear.
+    // MulBinary Adam update. Same pattern as bilinear.
     if has_mul_binary {
         adam_update_alpha_map(
             mul_binary_alphas,

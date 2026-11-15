@@ -23,6 +23,10 @@ name = "cctsdb_cast_admission_loads"
 required-features = ["external-vnncomp"]
 
 [[test]]
+name = "cctsdb_readout_continuity"
+required-features = ["external-vnncomp"]
+
+[[test]]
 name = "cgan_int64_shape_arithmetic_admission"
 required-features = ["external-vnncomp"]
 
@@ -31,8 +35,30 @@ name = "ml4acopf_literal_cone_loads"
 required-features = ["external-vnncomp"]
 
 [[test]]
+name = "ml4acopf_attack_point_gradient"
+required-features = ["external-vnncomp"]
+
+[[test]]
 name = "lsnc_interval_carrier"
 required-features = ["external-vnncomp"]
+
+[[test]]
+name = "lsnc_attack_twin"
+required-features = ["external-vnncomp"]
+
+# #lsnc-lane stage 3: the lane's domains/s on the real lsnc net (row 2 clause
+# 0) — a wall-clock measurement on the competition corpus, so it needs BOTH
+# lanes: absent from the default suite, hard failure without the corpus.
+[[test]]
+name = "lsnc_lane_bench"
+required-features = ["external-vnncomp", "benchmarks"]
+
+# #iso-edge-cap step 5: the #lowdim lane's domains/s and closure on the
+# stitched isomorphic_acasxu_2026 difference net (the phase-2 gate) plus its
+# soundness controls — corpus-backed and wall-clock, so both lanes again.
+[[test]]
+name = "iso_lane_bench"
+required-features = ["external-vnncomp", "benchmarks"]
 
 [lints]
 workspace = true
@@ -51,6 +77,7 @@ wgpu = ["ny-gpu/wgpu"]
 external-avoice = []
 external-whisper = []
 external-vnncomp = []
+external-decoders = []
 external-wgpu = ["wgpu"]
 external-conformance = [
     "external-avoice",

@@ -33,7 +33,7 @@ use super::shared::alpha_state_from_metadata_or_graph;
 /// * `picked` - The picked batch from DomainList
 /// * `layer_names` - Ordered list of layer names
 /// * `verify_upper` - Whether verifying upper bound (affects priority calculation)
-/// * `graph` - Optional graph for alpha state initialization. Issue: #1841
+/// * `graph` - Optional graph for alpha state initialization.
 pub fn graph_domain_from_picked(
     idx: usize,
     picked: &PickedDomains,

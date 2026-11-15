@@ -15,11 +15,6 @@
 //! IBP (CROWN/IBP = 1.000) because normalization's dense Jacobian destroys the
 //! correlation structure CROWN maintains through activation linearization.
 //! Per-block CROWN captures within-block correlations where CROWN/IBP ≈ 0.04.
-//!
-//! # Design
-//!
-//! See `designs/2026-03-03-per-block-crown-transformer-verification.md`.
-//! Part of #3221, #287.
 
 use std::collections::{HashMap, HashSet};
 
@@ -41,8 +36,6 @@ mod ibp;
 /// `layer{N}` convention to supply block boundaries directly, preserving
 /// consumer-chosen block indices and block names through to the
 /// `BlockWiseCrownResult`.
-///
-/// Part of #4024.
 #[derive(Debug, Clone)]
 pub struct BlockSpec {
     /// Ordered list of block entries (must be in topological order).
@@ -133,8 +126,6 @@ impl BlockSpec {
 /// Stores per-neuron alpha parameters (tangent point control) for each GELU
 /// layer within a block. Alpha in [0, 1] controls where the tangent line is
 /// drawn for the lower bound in the convex region.
-///
-/// Part of #3221 Phase 4.
 #[derive(Debug, Clone)]
 pub struct BlockAlphaState {
     /// Map from GELU node name to per-neuron alpha array.
@@ -189,7 +180,7 @@ pub struct BlockCrownComparison {
 ///
 /// Used to surface `fallback_rows/total_rows` per LayerNorm/RmsNorm/
 /// InstanceNorm1d site through the Whisper measurement path. The type name is
-/// retained for API stability. Part of #318, #3892.
+/// retained for API stability.
 #[derive(Debug, Clone)]
 pub struct LayerNormValidationStats {
     pub node_name: String,
@@ -372,8 +363,8 @@ mod tests {
         let bounds =
             GraphNetwork::bias_only_bounds_from_interval(&interval, &[], &[]).expect("valid");
 
-        assert!(bounds.input_shape().is_empty());
-        assert!(bounds.output_shape().is_empty());
+        assert_eq!((bounds.input_shape()).len(), 0);
+        assert_eq!((bounds.output_shape()).len(), 0);
         assert_eq!(bounds.lower_a().shape(), &[1, 1]);
         assert_eq!(bounds.upper_a().shape(), &[1, 1]);
         assert_eq!(bounds.lower_b().shape(), &[1]);

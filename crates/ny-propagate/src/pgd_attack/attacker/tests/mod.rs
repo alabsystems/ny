@@ -5,6 +5,8 @@
 //! Attacker-local regression tests, split from monolithic `attacker.rs` inline tests.
 
 mod common;
+mod corner_seed;
+pub(super) mod deadline;
 mod dense_sweep;
 mod nan_abort;
 mod osi_init;

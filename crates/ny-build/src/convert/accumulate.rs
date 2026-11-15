@@ -158,6 +158,7 @@ impl ConvertContext<'_> {
             &spec.inputs[0],
             onnx_axis,
             LegacyBatchAxisPolicy::RejectZero,
+            super::legacy_axis_authority(spec)?,
         )?;
 
         let data = self.constant_value(&spec.inputs[0]);

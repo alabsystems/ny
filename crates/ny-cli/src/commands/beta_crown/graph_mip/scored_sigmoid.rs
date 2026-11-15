@@ -540,8 +540,10 @@ mod tests {
             );
             let boundary = evaluator.evaluate(proof.boundary_input).unwrap();
             let outside = evaluator.evaluate(proof.outside_neighbor).unwrap();
-            let input_midpoint =
-                (f64::from(proof.boundary_input) + f64::from(proof.outside_neighbor)) * 0.5;
+            let input_midpoint = f64::midpoint(
+                f64::from(proof.boundary_input),
+                f64::from(proof.outside_neighbor),
+            );
             match sense {
                 ScoredF32SigmoidPreimageSense::AtLeast => {
                     assert!(f64::from(outside) < threshold);

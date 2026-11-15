@@ -37,6 +37,8 @@ impl GraphNetwork {
         &self,
         context: SequentialAlphaOptimizationContext<'_>,
     ) -> Result<BoundedTensor> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::AlphaOpt);
         let SequentialAlphaOptimizationContext {
             input,
             config,

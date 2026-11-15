@@ -100,7 +100,7 @@ fn test_strengthened_cut_handles_non_finite_drop_ratio() {
     assert_eq!(strengthened.cut.terms.len(), 2);
 }
 
-/// Regression test for #2998 Slice B: from_verified_domain returns Result<Option<_>>
+/// Regression test Slice B: from_verified_domain returns Result<Option<_>>
 /// and propagates Ok(Some(...)) for valid histories.
 #[ntest::timeout(5000)]
 #[test]
@@ -128,7 +128,7 @@ fn test_from_verified_domain_returns_result_ok_some_2998() {
     assert_eq!(cut.bias, 0.0); // 1 active - 1
 }
 
-/// Regression test for #2998 Slice B: from_verified_domain returns Ok(None)
+/// Regression test Slice B: from_verified_domain returns Ok(None)
 /// for empty histories.
 #[ntest::timeout(5000)]
 #[test]
@@ -142,7 +142,7 @@ fn test_from_verified_domain_returns_result_ok_none_for_empty_2998() {
     );
 }
 
-/// Regression test for #2998 Slice B: from_verified_domain_strengthened returns
+/// Regression test Slice B: from_verified_domain_strengthened returns
 /// Result<Option<_>> and propagates Ok(Some(...)) for valid histories.
 #[ntest::timeout(5000)]
 #[test]
@@ -170,7 +170,7 @@ fn test_from_verified_domain_strengthened_returns_result_2998() {
     );
 }
 
-/// Regression test for #2998 Slice B: non-finite bias must surface as
+/// Regression test Slice B: non-finite bias must surface as
 /// `NyError::NumericalInstability` instead of a panic.
 #[ntest::timeout(5000)]
 #[test]
@@ -202,7 +202,7 @@ fn test_cutting_plane_new_rejects_non_finite_bias_2998() {
     }
 }
 
-/// Regression test for #2998 Slice B: non-finite lambda must surface as
+/// Regression test Slice B: non-finite lambda must surface as
 /// `NyError::NumericalInstability` instead of a panic.
 #[ntest::timeout(5000)]
 #[test]
@@ -234,7 +234,7 @@ fn test_cutting_plane_new_rejects_non_finite_lambda_2998() {
     }
 }
 
-/// Regression test for #3076: CuttingPlane::new must reject NaN term coefficients.
+/// Regression test: CuttingPlane::new must reject NaN term coefficients.
 #[ntest::timeout(5000)]
 #[test]
 fn test_cutting_plane_new_rejects_nan_coefficient_3076() {
@@ -254,7 +254,7 @@ fn test_cutting_plane_new_rejects_nan_coefficient_3076() {
     assert!(result.is_err(), "NaN coefficient should be rejected");
 }
 
-/// Regression test for #3076: CuttingPlane::new must reject Inf term coefficients.
+/// Regression test: CuttingPlane::new must reject Inf term coefficients.
 #[ntest::timeout(5000)]
 #[test]
 fn test_cutting_plane_new_rejects_inf_coefficient_3076() {
@@ -267,7 +267,7 @@ fn test_cutting_plane_new_rejects_inf_coefficient_3076() {
     assert!(result.is_err(), "Inf coefficient should be rejected");
 }
 
-/// Regression test for #3076: set_lambda_grad sanitizes NaN to 0.0.
+/// Regression test: set_lambda_grad sanitizes NaN to 0.0.
 #[ntest::timeout(5000)]
 #[test]
 fn test_set_lambda_grad_sanitizes_nan_3076() {
@@ -302,7 +302,7 @@ fn test_set_lambda_grad_sanitizes_nan_3076() {
     assert_eq!(cut.lambda_grad(), 1.5, "Finite grad should be preserved");
 }
 
-/// Regression test for #3076: Adam NaN guard catches lambda NaN even when m/v are finite.
+/// Regression test: Adam NaN guard catches lambda NaN even when m/v are finite.
 #[ntest::timeout(5000)]
 #[test]
 fn test_adam_catches_lambda_nan_3076() {
@@ -331,7 +331,7 @@ fn test_adam_catches_lambda_nan_3076() {
     assert_eq!(cut.lambda_grad(), 0.0, "Grad should be reset");
 }
 
-/// Regression test for #2860: evaluate must not panic when neuron_idx exceeds
+/// Regression test: evaluate must not panic when neuron_idx exceeds
 /// the pre_activations slice length.
 #[test]
 fn test_evaluate_oob_neuron_idx_no_panic_2860() {
@@ -358,7 +358,7 @@ fn test_evaluate_oob_neuron_idx_no_panic_2860() {
     // Only 2 elements — neuron_idx=999 is out of bounds
     let pre_activations = vec![(-1.0_f32, 2.0_f32), (-0.5, 1.5)];
     // Should not panic; OOB lookup returns (NEG_INFINITY, INFINITY),
-    // producing non-finite intermediate → NaN guard returns 0.0 (#2598).
+    // producing non-finite intermediate → NaN guard returns 0.0.
     let result = cut.evaluate(&pre_activations);
     assert_eq!(
         result, 0.0,

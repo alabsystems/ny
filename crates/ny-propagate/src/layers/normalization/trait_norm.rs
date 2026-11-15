@@ -8,8 +8,6 @@
 //! The generic CROWN infrastructure (sampling, batching, mode gating)
 //! is provided by free functions in [`super::crown_common`] that accept
 //! any `NormLayer`.
-//!
-//! Reference: designs/2026-02-27-normalization-trait-dedup.md
 
 use ndarray::{Array1, Array2};
 use ny_core::Result;

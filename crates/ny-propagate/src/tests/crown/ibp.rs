@@ -169,7 +169,7 @@ fn test_crown_ibp_collect_bounds() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_ibp_forward_tightens_exact_successor_outputs() {
-    // Regression for #3397: if a layer's output only feeds an exact backward step
+    // Regression: if a layer's output only feeds an exact backward step
     // (here ReLU -> Linear), CROWN-IBP should reuse the already-tightened previous
     // layer by forward-propagating it instead of running another full partial pass.
     let w1 = arr2(&[
@@ -230,7 +230,7 @@ fn test_crown_ibp_forward_tightens_exact_successor_outputs() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_ibp_collect_bounds_reports_fallback_events() {
-    // Regression for #2060: CROWN-IBP intermediate collection must expose when
+    // Regression: CROWN-IBP intermediate collection must expose when
     // a layer falls back to forward bounds due to CROWN failure.
     let mut network = Network::new();
     network.add_layer(Layer::NonZero(NonZeroLayer));
@@ -517,7 +517,7 @@ fn test_crown_ibp_memory_budget_fallback_3515() {
     });
 }
 
-/// Regression test for #3515: CROWN-IBP Dense materialization memory scaling.
+/// Regression test: CROWN-IBP Dense materialization memory scaling.
 ///
 /// Proves that CROWN-IBP partial passes through competition-shape CNNs create
 /// multi-GB Dense A-matrices at Reshape/Flatten boundaries. The benchmark

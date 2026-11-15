@@ -80,7 +80,7 @@ pub(super) fn find_graph_input_nodes(
                 // For other ops, filter out constant tensors only if their value was
                 // successfully evaluated (available in weights or evaluated_constants).
                 // If the value isn't available, the converter couldn't absorb it and the
-                // tensor must remain as an activation input (#411).
+                // tensor must remain as an activation input.
                 if is_concat {
                     true
                 } else if constant_tensors.contains(*name) {

@@ -18,7 +18,7 @@
 //! no-op for one of those variants means “not wired through the generic table,”
 //! not “its body has not been extracted.”
 //!
-//! ## Why only these ten
+//! ## Why only these eleven
 //!
 //! Not a preference — a consequence. Every phase here publishes through a
 //! **shrink-only** intersect (`intersect_interm_into_stored`,
@@ -44,6 +44,11 @@ pub(crate) enum RootTightenPhase {
     StabilizeAndFix,
     /// `NY_DD_ZONO_INTERM=1` — intersect the dd-zonotope intermediate map.
     DdZonoIntermIntersect,
+    /// `bab.mip_refine_intermediates` (#relusplitter-lp-refine, wave-6 C7) —
+    /// intersect the attached refiner's RIGOROUS LP pre-activation bounds.
+    /// Needs the verifier's runtime-attached refiner, so it runs through
+    /// [`RootTightenPhase::run_mip_refine_in_place`], never the generic table.
+    MipRefineInterm,
     /// `NY_FCHEAD_TIGHTEN=1` — dense-head pre-activation tighten.
     FcHeadTighten,
     /// `NY_ROOT_INTERM_ALPHA=1` — broad per-node α-CROWN re-bound.
@@ -76,6 +81,7 @@ pub(crate) enum RootTightenPhase {
 pub(crate) const ORDER: &[RootTightenPhase] = &[
     RootTightenPhase::StabilizeAndFix,
     RootTightenPhase::DdZonoIntermIntersect,
+    RootTightenPhase::MipRefineInterm,
     RootTightenPhase::FcHeadTighten,
     RootTightenPhase::RootIntermAlpha,
     RootTightenPhase::RootJointIntermAlpha,
@@ -92,6 +98,7 @@ impl RootTightenPhase {
         match self {
             Self::StabilizeAndFix => "stabilize_and_fix",
             Self::DdZonoIntermIntersect => "ddzono_interm_intersect",
+            Self::MipRefineInterm => "mip_refine_interm",
             Self::FcHeadTighten => "fchead_tighten",
             Self::RootIntermAlpha => "root_interm_alpha",
             Self::RootJointIntermAlpha => "root_joint_interm_alpha",
@@ -106,7 +113,7 @@ impl RootTightenPhase {
     /// Whether this phase is armed in the shipped cifar100 configuration.
     ///
     /// Recorded because it bounds what scheduling them can be worth: the
-    /// schedulable set is ten phases, but only the armed ones cost or buy
+    /// schedulable set is eleven phases, but only the armed ones cost or buy
     /// anything today. Documenting that here keeps the next reader from
     /// over-estimating the payoff, which the plan doc is explicit about.
     pub(crate) const fn armed_in_cifar100_preset(self) -> bool {
@@ -317,6 +324,28 @@ impl RootTightenPhase {
         outcome
     }
 
+    /// #relusplitter-lp-refine (wave-6 C7): run the verifier's attached root
+    /// intermediate-bound refiner through the same admission and
+    /// realized-value machinery as every other phase. A producer: its output
+    /// is folded into the root's stale-box summary by `evaluate_root`.
+    pub(crate) fn run_mip_refine_in_place(
+        self,
+        graph: &GraphNetwork,
+        input: &BoundedTensor,
+        deadline: Option<std::time::Instant>,
+        bootstrap: &mut crate::beta_crown::engine::graph::shared::init::GraphBabBootstrap,
+        refiner: &dyn crate::beta_crown::root_interm_refine::RootIntermRefiner,
+    ) -> PhaseOutput {
+        debug_assert_eq!(self, Self::MipRefineInterm);
+        if self != Self::MipRefineInterm || !self.admitted() {
+            return PhaseOutput::default();
+        }
+        let started = std::time::Instant::now();
+        let out = mip_refine_interm(graph, input, deadline, bootstrap, refiner);
+        self.report_value(out, started.elapsed());
+        out
+    }
+
     /// Run one phase. Byte-identical to the inline block it replaces: the gate,
     /// the argument order, and the telemetry are all preserved verbatim.
     ///
@@ -339,6 +368,9 @@ impl RootTightenPhase {
             | Self::WideDemandedIntermCrown
             | Self::SparseIntermCrown
             | Self::PhaseResidentCrown => PhaseOutput::default(),
+            // Needs the verifier's attached refiner, which the generic context
+            // does not carry: `run_mip_refine_in_place` is its only runner.
+            Self::MipRefineInterm => PhaseOutput::default(),
         }
     }
 
@@ -349,7 +381,8 @@ impl RootTightenPhase {
     pub(crate) const fn is_producer(self) -> bool {
         matches!(
             self,
-            Self::DenseHeadTighten
+            Self::MipRefineInterm
+                | Self::DenseHeadTighten
                 | Self::PhaseResidentCrown
                 | Self::ComprehensiveGpuIntermCrown
                 | Self::WideDemandedIntermCrown
@@ -368,6 +401,7 @@ impl RootTightenPhase {
             self,
             Self::StabilizeAndFix
                 | Self::DdZonoIntermIntersect
+                | Self::MipRefineInterm
                 | Self::FcHeadTighten
                 | Self::RootIntermAlpha
                 | Self::DenseHeadTighten
@@ -429,6 +463,49 @@ fn ddzono_interm_intersect(ctx: &mut RootTightenCtx<'_>) -> PhaseOutput {
     }
     // Not a producer: `tightened` is consumed by its own log.
     PhaseOutput::default()
+}
+
+/// #relusplitter-lp-refine (wave-6 C7): ask the attached refiner for certified
+/// pre-activation enclosures over the stored boxes, intersect them SHRINK-ONLY
+/// through the `#dd-zono-interm` primitive (per node all-or-nothing: arity,
+/// non-finite or crossed candidates are refused and the stored box is kept),
+/// and print the fixed-schema `[mip-refine] root ...` line on every call.
+///
+/// A producer: `tightened_targets` is the number of stored nodes that actually
+/// shrank, which `evaluate_root` folds into `root_intermediate_bounds_changed`
+/// so the root objective pass re-runs against the tightened boxes instead of
+/// reusing state built for the old ones.
+fn mip_refine_interm(
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    deadline: Option<std::time::Instant>,
+    bootstrap: &mut crate::beta_crown::engine::graph::shared::init::GraphBabBootstrap,
+    refiner: &dyn crate::beta_crown::root_interm_refine::RootIntermRefiner,
+) -> PhaseOutput {
+    use crate::beta_crown::root_interm_refine::{root_interm_refine_line, RootIntermRefineRequest};
+    let outcome = refiner.refine(&RootIntermRefineRequest {
+        graph,
+        input_bounds: input,
+        node_bounds: &bootstrap.initial_node_bounds,
+        deadline,
+    });
+    let nodes_intersected = if outcome.candidates.is_empty() {
+        0
+    } else {
+        super::root::intersect_interm_into_stored(
+            &mut bootstrap.initial_node_bounds,
+            &outcome.candidates,
+        )
+    };
+    eprintln!(
+        "{}",
+        root_interm_refine_line(refiner.name(), &outcome.telemetry, nodes_intersected)
+    );
+    PhaseOutput {
+        dense_head_stage_selected: false,
+        tightened_elements: 0,
+        tightened_targets: nodes_intersected,
+    }
 }
 
 /// Verbatim move of the `NY_FCHEAD_TIGHTEN` block. Non-producer.
@@ -1552,8 +1629,27 @@ impl RootTightenPhase {
     ///
     /// Fail-closed: with no published instance budget or no prediction, the
     /// answer is "run it", i.e. exactly today's behaviour.
+    ///
+    /// #router-r3 `rule.root_admission`: when the acting optimizer armed the
+    /// rule, the same predicate runs without the legacy gate, against the
+    /// window the phase would actually run in — the verifier's R2 deadline
+    /// cell when the router governs it, else the instance remaining — and
+    /// every consult logs its inputs, for every phase the router consults
+    /// ([`Self::router_consults`]). Unarmed, this is today's function.
     #[must_use]
     pub(crate) fn admitted(self) -> bool {
+        let authority = ny_core::stop_authority::global();
+        if authority.root_admission() {
+            let cell = ny_core::deadline_authority::global().remaining(
+                ny_core::deadline_authority::LaneSlot::Verifier,
+                std::time::Instant::now(),
+            );
+            if let Some(admitted) =
+                self.router_admission(authority, ny_core::instance_budget::remaining(), cell)
+            {
+                return admitted;
+            }
+        }
         if !root_phase_admission_enabled() {
             return true;
         }
@@ -1578,6 +1674,104 @@ impl RootTightenPhase {
         }
         admission.is_admitted()
     }
+}
+
+impl RootTightenPhase {
+    /// #router-r3 review: whether `rule.root_admission` consults this phase.
+    ///
+    /// NOT the two phases whose own run gate is a raw-environment read INSIDE
+    /// [`Self::dispatch`] (`fchead_tighten`: `NY_FCHEAD_TIGHTEN`,
+    /// `root_interm_alpha`: `NY_ROOT_INTERM_ALPHA`). No scored run sets that
+    /// environment, so on every scored row the phase is a no-op, and a router
+    /// consult there would book and print `admit=0` for a phase that was never
+    /// going to run — a phantom decline that makes the rule read as acting
+    /// when it changed nothing. Those two keep today's (legacy) admission.
+    /// Every other phase's run is decided by typed state at its call site
+    /// (`run_phase_resident_in_place` runs only with a resolved policy,
+    /// `run_mip_refine_in_place` only with an attached refiner), so a consult
+    /// there is a real decision. The extracted bodies `dispatch` no-ops
+    /// (`root_joint_interm_alpha`, the comprehensive / wide / sparse CROWN
+    /// sweeps) never call `admitted` at all.
+    pub(crate) const fn router_consults(self) -> bool {
+        !matches!(self, Self::FcHeadTighten | Self::RootIntermAlpha)
+    }
+
+    /// #router-r3 `rule.root_admission`: `phase_window::admit` against the
+    /// window this phase would run in (`instance` remaining, the verifier's
+    /// R2 `cell` when governed), with the predicate's inputs logged and
+    /// ledgered on `authority`. `None` — the caller keeps today's admission —
+    /// unless `authority` armed the rule and the router consults this phase
+    /// ([`Self::router_consults`]). A phase without a prediction, or a row
+    /// without any window, runs (today's answer).
+    pub(crate) fn router_admission(
+        self,
+        authority: &ny_core::stop_authority::StopAuthority,
+        instance: Option<std::time::Duration>,
+        cell: Option<std::time::Duration>,
+    ) -> Option<bool> {
+        if !authority.root_admission() || !self.router_consults() {
+            return None;
+        }
+        let Some(predicted) = self.predicted_cost() else {
+            return Some(true);
+        };
+        let Some(event) = route_admission(self.name(), predicted, instance, cell) else {
+            return Some(true);
+        };
+        eprintln!(
+            "[optimizer] root-admission rule=rule.root_admission phase={} predicted_ms={} \
+             padded_ms={} remaining_ms={} source={} affordable_ms={} admit={}",
+            event.phase,
+            event.predicted_ms,
+            event.padded_ms,
+            event.remaining_ms,
+            event.source,
+            event.affordable_ms,
+            u8::from(event.admitted)
+        );
+        let admitted = event.admitted;
+        authority.record_root_admission(event);
+        Some(admitted)
+    }
+}
+
+/// #router-r3 `rule.root_admission`, PURE: the admission of a phase that
+/// predicts `predicted` against the window it would run in — the verifier's
+/// R2 cell when the router governs it (`cell`), never more than the instance
+/// remaining (`instance`). `None` when there is no window at all (the phase
+/// runs: today's answer). The event carries every input of the predicate.
+fn route_admission(
+    phase: &str,
+    predicted: std::time::Duration,
+    instance: Option<std::time::Duration>,
+    cell: Option<std::time::Duration>,
+) -> Option<ny_core::stop_authority::RootAdmissionEvent> {
+    let (remaining, source) = match (cell, instance) {
+        (Some(cell), Some(instance)) => (cell.min(instance), "verifier_cell"),
+        (Some(cell), None) => (cell, "verifier_cell"),
+        (None, Some(instance)) => (instance, "instance"),
+        (None, None) => return None,
+    };
+    let policy = ny_core::phase_window::WindowPolicy::default();
+    let admitted = ny_core::phase_window::admit(predicted, remaining, policy).is_admitted();
+    let padded = predicted
+        .checked_mul(policy.margin_num)
+        .map_or(std::time::Duration::MAX, |d| d / policy.margin_den.max(1));
+    let affordable = remaining.mul_f64(if policy.max_frac.is_finite() {
+        policy.max_frac.clamp(0.0, 1.0)
+    } else {
+        0.0
+    });
+    let ms = |d: std::time::Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    Some(ny_core::stop_authority::RootAdmissionEvent {
+        phase: phase.to_owned(),
+        predicted_ms: ms(predicted),
+        padded_ms: ms(padded),
+        remaining_ms: ms(remaining),
+        source: source.to_owned(),
+        affordable_ms: ms(affordable),
+        admitted,
+    })
 }
 
 /// `NY_ROOT_PHASE_ADMISSION=1`, exact, default off => byte-identical.
@@ -1628,6 +1822,130 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    /// #router-r3 `rule.root_admission`: the predicate skips a phase whose
+    /// PADDED prediction does not fit the affordable half of its window, runs
+    /// one that does, reads the verifier's cell when it is tighter than the
+    /// instance remaining, logs every input, and runs the phase when there is
+    /// no window at all (today's answer).
+    #[test]
+    fn router_r3_root_admission_skips_a_phase_that_cannot_fit_and_logs_its_inputs() {
+        use std::time::Duration;
+        let secs = Duration::from_secs;
+        // 12 s padded to 15 s against half of 20 s: declined.
+        let declined =
+            route_admission("fchead_tighten", secs(12), Some(secs(20)), None).expect("window");
+        assert!(!declined.admitted);
+        assert_eq!(declined.predicted_ms, 12_000);
+        assert_eq!(declined.padded_ms, 15_000);
+        assert_eq!(declined.remaining_ms, 20_000);
+        assert_eq!(declined.affordable_ms, 10_000);
+        assert_eq!(declined.source, "instance");
+        // ... against half of 40 s: admitted.
+        let admitted =
+            route_admission("fchead_tighten", secs(12), Some(secs(40)), None).expect("window");
+        assert!(admitted.admitted);
+        // The verifier's cell, when tighter, is the window that counts.
+        let cell = route_admission(
+            "root_interm_alpha",
+            secs(12),
+            Some(secs(40)),
+            Some(secs(20)),
+        )
+        .expect("window");
+        assert!(!cell.admitted);
+        assert_eq!(cell.source, "verifier_cell");
+        assert_eq!(cell.remaining_ms, 20_000);
+        // A cell never widens the instance remaining.
+        let wide = route_admission(
+            "root_interm_alpha",
+            secs(12),
+            Some(secs(20)),
+            Some(secs(90)),
+        )
+        .expect("window");
+        assert_eq!(wide.remaining_ms, 20_000);
+        assert!(!wide.admitted);
+        // No window at all: the phase runs.
+        assert!(route_admission("x", secs(12), None, None).is_none());
+        // Extremes never panic.
+        let _ = route_admission(
+            "x",
+            Duration::MAX,
+            Some(Duration::MAX),
+            Some(Duration::ZERO),
+        );
+        let _ = route_admission("x", Duration::ZERO, Some(Duration::ZERO), None);
+        // Unarmed, the production entry is today's: the phase-level answer of
+        // every phase is unchanged (the legacy gate is off in tests).
+        assert!(!ny_core::stop_authority::global().root_admission());
+        for p in ORDER {
+            assert!(p.admitted(), "{} declined on an unarmed row", p.name());
+        }
+    }
+
+    /// #router-r3 review: `rule.root_admission` consults only phases whose run
+    /// is decided by typed state at their call site. The two env-gated phases
+    /// (a no-op on every scored row) are never consulted, so the rule cannot
+    /// book a phantom decline for them; a typed-reachable phase that cannot
+    /// fit is declined and ledgered; a phase without a prediction runs and
+    /// books nothing; an unarmed authority consults nothing (today's gate).
+    #[test]
+    fn router_r3_root_admission_consults_only_phases_that_would_run() {
+        use ny_core::stop_authority::{StopAuthority, StopDirectives};
+        use std::time::Duration;
+        let armed = StopAuthority::new();
+        armed
+            .arm(StopDirectives {
+                root_admission: true,
+                ..StopDirectives::NONE
+            })
+            .expect("arm");
+        let tight = Some(Duration::from_secs(10));
+        for phase in [
+            RootTightenPhase::FcHeadTighten,
+            RootTightenPhase::RootIntermAlpha,
+        ] {
+            assert!(phase.predicted_cost().is_some(), "{}", phase.name());
+            assert!(!phase.router_consults(), "{}", phase.name());
+            assert_eq!(
+                phase.router_admission(&armed, tight, None),
+                None,
+                "{}: env-gated inside dispatch, never consulted",
+                phase.name()
+            );
+        }
+        assert!(
+            armed.snapshot().root_admissions.is_empty(),
+            "no phantom decline is booked for a phase that would not run"
+        );
+        // Positive control: the phase-resident transaction (20 s, padded 25 s)
+        // cannot fit half of a 10 s window.
+        assert_eq!(
+            RootTightenPhase::PhaseResidentCrown.router_admission(&armed, tight, None),
+            Some(false)
+        );
+        let booked = armed.snapshot().root_admissions;
+        assert_eq!(booked.len(), 1);
+        assert_eq!(booked[0].phase, RootTightenPhase::PhaseResidentCrown.name());
+        assert!(!booked[0].admitted);
+        // No prediction: runs, nothing booked.
+        assert_eq!(
+            RootTightenPhase::StabilizeAndFix.router_admission(&armed, tight, None),
+            Some(true)
+        );
+        assert_eq!(armed.snapshot().root_admissions.len(), 1);
+        // Unarmed: the router consults nothing.
+        let unarmed = StopAuthority::new();
+        for phase in ORDER {
+            assert_eq!(
+                phase.router_admission(&unarmed, tight, None),
+                None,
+                "{}",
+                phase.name()
+            );
+        }
+    }
+
     #[test]
     fn order_contains_every_variant_exactly_once() {
         // If a variant is added without placing it in ORDER, the sequence data
@@ -1637,6 +1955,7 @@ mod tests {
         let all = [
             RootTightenPhase::StabilizeAndFix,
             RootTightenPhase::DdZonoIntermIntersect,
+            RootTightenPhase::MipRefineInterm,
             RootTightenPhase::FcHeadTighten,
             RootTightenPhase::RootIntermAlpha,
             RootTightenPhase::RootJointIntermAlpha,
@@ -1664,6 +1983,7 @@ mod tests {
             vec![
                 "stabilize_and_fix",
                 "ddzono_interm_intersect",
+                "mip_refine_interm",
                 "fchead_tighten",
                 "root_interm_alpha",
                 "root_joint_interm_alpha",
@@ -1706,6 +2026,7 @@ mod tests {
             vec![
                 "stabilize_and_fix",
                 "ddzono_interm_intersect",
+                "mip_refine_interm",
                 "fchead_tighten",
                 "root_interm_alpha",
                 "root_joint_interm_alpha",
@@ -1734,6 +2055,7 @@ mod tests {
         assert_eq!(
             producers,
             vec![
+                "mip_refine_interm",
                 "root_joint_interm_alpha",
                 "comprehensive_gpu_interm_crown",
                 "wide_demanded_interm_crown",
@@ -1837,6 +2159,237 @@ mod tests {
         for p in ORDER {
             assert!(p.admitted(), "{} declined with the gate off", p.name());
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #relusplitter-lp-refine (wave-6 C7): the refiner phase publishes only
+    // through the shrink-only primitive, and is reached by the real root.
+    // -----------------------------------------------------------------------
+
+    use crate::beta_crown::root_interm_refine::{
+        RootIntermRefineOutcome, RootIntermRefineRequest, RootIntermRefineTelemetry,
+        RootIntermRefiner,
+    };
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Returns fixed candidates and counts its calls.
+    struct MockRefiner {
+        candidates: HashMap<String, (Vec<f64>, Vec<f64>)>,
+        calls: AtomicUsize,
+    }
+
+    impl MockRefiner {
+        fn new(candidates: HashMap<String, (Vec<f64>, Vec<f64>)>) -> Self {
+            Self {
+                candidates,
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl RootIntermRefiner for MockRefiner {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+
+        fn refine(&self, req: &RootIntermRefineRequest<'_>) -> RootIntermRefineOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                req.deadline.is_some(),
+                "the root must hand the refiner a bounded window"
+            );
+            RootIntermRefineOutcome {
+                candidates: self.candidates.clone(),
+                telemetry: RootIntermRefineTelemetry {
+                    engaged: true,
+                    reason: "ok",
+                    ..RootIntermRefineTelemetry::default()
+                },
+            }
+        }
+    }
+
+    /// `x in [-1,1]^2 -> Linear(2->2) -> ReLU -> Linear(2->1)`.
+    fn tiny_relu_graph() -> (GraphNetwork, BoundedTensor) {
+        use crate::layers::{Layer, LinearLayer, ReLULayer};
+        use crate::network::Network;
+        let mut network = Network::new();
+        network.add_layer(Layer::Linear(
+            LinearLayer::new(
+                ndarray::arr2(&[[1.0_f32, 1.0], [1.0, -1.0]]),
+                Some(ndarray::arr1(&[0.25_f32, -0.25])),
+            )
+            .expect("first affine"),
+        ));
+        network.add_layer(Layer::ReLU(ReLULayer));
+        network.add_layer(Layer::Linear(
+            LinearLayer::new(
+                ndarray::arr2(&[[1.0_f32, -1.0]]),
+                Some(ndarray::arr1(&[0.0_f32])),
+            )
+            .expect("head affine"),
+        ));
+        let graph = GraphNetwork::from_sequential(&network).expect("tiny graph");
+        let input = BoundedTensor::new(
+            ndarray::arr1(&[-1.0_f32, -1.0]).into_dyn(),
+            ndarray::arr1(&[1.0_f32, 1.0]).into_dyn(),
+        )
+        .expect("input box");
+        (graph, input)
+    }
+
+    fn tiny_bootstrap(
+        graph: &GraphNetwork,
+        input: &BoundedTensor,
+    ) -> crate::beta_crown::engine::graph::shared::init::GraphBabBootstrap {
+        let config = crate::beta_crown::BetaCrownConfig {
+            use_alpha_crown: false,
+            ..crate::beta_crown::BetaCrownConfig::default()
+        };
+        crate::beta_crown::engine::graph::shared::init::compute_graph_bab_bootstrap(
+            graph, input, &config, None, None,
+        )
+        .expect("tiny bootstrap")
+    }
+
+    fn box_of(
+        bootstrap: &crate::beta_crown::engine::graph::shared::init::GraphBabBootstrap,
+        name: &str,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let stored = bootstrap
+            .initial_node_bounds
+            .get(name)
+            .unwrap_or_else(|| panic!("the root stores `{name}` (pre-activation key assumption)"));
+        (
+            stored.lower().iter().copied().collect(),
+            stored.upper().iter().copied().collect(),
+        )
+    }
+
+    fn run_mock(
+        graph: &GraphNetwork,
+        input: &BoundedTensor,
+        bootstrap: &mut crate::beta_crown::engine::graph::shared::init::GraphBabBootstrap,
+        refiner: &MockRefiner,
+    ) -> PhaseOutput {
+        RootTightenPhase::MipRefineInterm.run_mip_refine_in_place(
+            graph,
+            input,
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+            bootstrap,
+            refiner,
+        )
+    }
+
+    #[test]
+    fn mip_refine_phase_intersects_a_tighter_candidate_shrink_only() {
+        let (graph, input) = tiny_relu_graph();
+        let mut bootstrap = tiny_bootstrap(&graph, &input);
+        let (lo, hi) = box_of(&bootstrap, "layer_0");
+        // Mechanics only (the refiner owns soundness by contract): neuron 0
+        // gets a strictly tighter box, neuron 1 a strictly WIDER one.
+        let candidate_lo = vec![f64::from(lo[0]) + 0.5, f64::from(lo[1]) - 1.0];
+        let candidate_hi = vec![f64::from(hi[0]) - 0.5, f64::from(hi[1]) + 1.0];
+        let refiner = MockRefiner::new(HashMap::from([(
+            "layer_0".to_string(),
+            (candidate_lo.clone(), candidate_hi.clone()),
+        )]));
+        let out = run_mock(&graph, &input, &mut bootstrap, &refiner);
+        assert_eq!(refiner.calls.load(Ordering::SeqCst), 1);
+        let (new_lo, new_hi) = box_of(&bootstrap, "layer_0");
+        for i in 0..2 {
+            assert!(
+                new_lo[i] >= lo[i] && new_hi[i] <= hi[i],
+                "widened neuron {i}"
+            );
+        }
+        // Neuron 0 shrank to the candidate, rounded OUTWARD (never tighter).
+        assert!(f64::from(new_lo[0]) <= candidate_lo[0] && new_lo[0] > lo[0]);
+        assert!(f64::from(new_hi[0]) >= candidate_hi[0] && new_hi[0] < hi[0]);
+        // Neuron 1's candidate was wider: its stored box is untouched.
+        assert_eq!((new_lo[1], new_hi[1]), (lo[1], hi[1]));
+        assert_eq!(out.tightened_targets, 1);
+        assert!(out.bounds_changed());
+    }
+
+    #[test]
+    fn mip_refine_phase_refuses_crossed_and_malformed_candidates() {
+        let (graph, input) = tiny_relu_graph();
+        for candidate in [
+            // Disjoint from the stored box: the intersection would be empty.
+            (vec![1.0e6, 1.0e6], vec![2.0e6, 2.0e6]),
+            // Non-finite.
+            (vec![f64::NAN, 0.0], vec![1.0, 1.0]),
+            // Arity mismatch.
+            (vec![0.0], vec![1.0]),
+        ] {
+            let mut bootstrap = tiny_bootstrap(&graph, &input);
+            let before = box_of(&bootstrap, "layer_0");
+            let refiner = MockRefiner::new(HashMap::from([("layer_0".to_string(), candidate)]));
+            let out = run_mock(&graph, &input, &mut bootstrap, &refiner);
+            assert_eq!(box_of(&bootstrap, "layer_0"), before);
+            assert!(!out.bounds_changed());
+        }
+    }
+
+    #[test]
+    fn mip_refine_phase_with_no_candidates_changes_nothing() {
+        let (graph, input) = tiny_relu_graph();
+        let mut bootstrap = tiny_bootstrap(&graph, &input);
+        let before: Vec<(String, (Vec<f32>, Vec<f32>))> = {
+            let mut names: Vec<String> = bootstrap.initial_node_bounds.keys().cloned().collect();
+            names.sort();
+            names
+                .into_iter()
+                .map(|name| {
+                    let b = box_of(&bootstrap, &name);
+                    (name, b)
+                })
+                .collect()
+        };
+        let refiner = MockRefiner::new(HashMap::new());
+        let out = run_mock(&graph, &input, &mut bootstrap, &refiner);
+        assert_eq!(out, PhaseOutput::default());
+        for (name, b) in before {
+            assert_eq!(box_of(&bootstrap, &name), b, "{name} changed");
+        }
+    }
+
+    /// Arrival: the REAL multi-objective root consults an attached refiner
+    /// exactly once, and a verifier derived through `with_config_from` keeps
+    /// it; with nothing attached the getter is `None` (dark by default).
+    #[test]
+    #[ntest::timeout(60000)]
+    fn attached_refiner_reaches_the_multi_objective_root_once() {
+        let (graph, input) = tiny_relu_graph();
+        let dark = crate::beta_crown::BetaCrownVerifier::new(
+            crate::beta_crown::BetaCrownConfig::default(),
+        );
+        assert!(dark.root_interm_refiner().is_none());
+
+        let refiner = Arc::new(MockRefiner::new(HashMap::new()));
+        let config = crate::beta_crown::BetaCrownConfig {
+            timeout: std::time::Duration::from_secs(10),
+            ..crate::beta_crown::BetaCrownConfig::default()
+        };
+        let verifier = crate::beta_crown::BetaCrownVerifier::new(config.clone())
+            .with_root_interm_refiner(refiner.clone());
+        let derived = verifier.with_config_from(config);
+        assert!(derived.root_interm_refiner().is_some());
+
+        // y = relu(x0+x1+0.25) - relu(x0-x1-0.25) ranges over roughly
+        // [-1.5, 2.25], so `y > 0` is neither verified nor refuted by any box
+        // before the tightening window.
+        let _ = derived
+            .verify_graph_relu_split_multi_objective(&graph, &input, &[vec![1.0_f32]], &[0.0])
+            .expect("tiny multi-objective run");
+        assert_eq!(
+            refiner.calls.load(Ordering::SeqCst),
+            1,
+            "the root must consult the attached refiner exactly once"
+        );
     }
 
     #[test]

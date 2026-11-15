@@ -8,18 +8,12 @@
 //! These tests verify that Patches-mode backward through Conv2d + pooling
 //! produces identical bounds to Dense-mode backward after to_dense() conversion.
 //!
-//! Design: designs/2026-03-01-patches-phase3-pooling-termination.md
-//! Part of #2613
-//!
 //! WALL-CLOCK POLICY FOR THIS FILE: every `#[ntest::timeout(..)]` below is a
-//! HANG SENTINEL, not a performance assertion. Measured 2026-08-19, isolated
-//! and single-threaded, these properties cost 10-30s in a debug build, and the
-//! walls they used to carry (20-60s) were margins of 1.2-2.9x. That is not a
-//! sentinel, it is a coin flip that any concurrent load loses -- and they duly
-//! failed at both 4 and 8 test threads. They are now a uniform 300s, roughly
-//! 10-20x the measured isolated cost. The failure these exist to catch is an
-//! infinite loop, and no finite wall lets one of those through.
-//! MEASURE BEFORE LOWERING THEM.
+//! HANG SENTINEL, not a performance assertion, at a uniform 300s. The failure
+//! these exist to catch is an infinite loop, and no finite wall lets one of those
+//! through. The 2026-08-19 timings once cited for these walls (10-30s isolated)
+//! were inflated 5-7x by stray load on the measuring box; see the 2026-08-20
+//! correction in `crown_patches.rs`. MEASURE BEFORE LOWERING THEM.
 
 use crate::bounds::patches::{CrownBounds, PatchesLinearBounds};
 use crate::layers::common::{BoundPropagation, PatchesPropagation};
@@ -187,8 +181,6 @@ proptest! {
     /// Builds a Conv2d → AvgPool chain and verifies that the Patches path
     /// (Conv2d patches → AvgPool patches → to_dense) matches the Dense path
     /// (Conv2d dense backward → AvgPool dense backward).
-    ///
-    /// Reference: designs/2026-03-01-patches-phase3-pooling-termination.md
     #[ntest::timeout(300000)]
     #[test]
     fn proptest_conv2d_avgpool_patches_vs_dense(
@@ -279,8 +271,6 @@ proptest! {
     /// Builds a Conv2d → MaxPool chain and verifies that the Patches path
     /// produces identical bounds to the Dense path. MaxPool is nonlinear,
     /// so the relaxation slopes/biases must match between paths.
-    ///
-    /// Reference: designs/2026-03-01-patches-phase3-pooling-termination.md
     // Match the AvgPool differential budget above. This 200-case nonlinear
     // relaxation sweep legitimately exceeds 10 seconds on loaded shared hosts.
     #[ntest::timeout(300000)]

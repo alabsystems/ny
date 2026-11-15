@@ -10,13 +10,7 @@ use crate::{Bound, InformativeCounterexample, SoundnessProvenance, VerificationP
 
 /// Typed tag identifying which verification method produced a result.
 ///
-/// Replaces the previous `Option<String>` storage in `VerificationResult`.
-/// Known variants cover every current in-repo producer; `Other(String)` is
-/// the forward-compatible escape hatch for new executors or downstream
-/// integrations.
-///
-/// JSON serialization is a plain string (not a tagged enum object) so that
-/// existing CLI/Python consumers see no format change.
+/// Serialized as a plain string. `Other` preserves unknown downstream tags.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MethodUsed {
@@ -28,7 +22,14 @@ pub enum MethodUsed {
     SmtRefiner,
     LazySmtRefiner,
     Mip,
+    /// Historical wire name also used by the current AY MIP verdict path.
+    /// The tag does not imply that HiGHS is linked or executed.
     MipHiGHS,
+    /// Legacy UNSAT provenance for AY strict side artifacts admitted without
+    /// NY replay. That admission path was removed; retain the tag so older
+    /// result banks keep their meaning. Current builds replay supported
+    /// artifacts in NY and leave unsupported evidence uncertified.
+    MipAyStrictSideArtifact,
     MipVnnlib,
     IbpF64,
     CrownF64,
@@ -48,6 +49,7 @@ impl MethodUsed {
             MethodUsed::LazySmtRefiner => "LazySmtRefiner",
             MethodUsed::Mip => "Mip",
             MethodUsed::MipHiGHS => "MipHiGHS",
+            MethodUsed::MipAyStrictSideArtifact => "MipAyStrictSideArtifact",
             MethodUsed::MipVnnlib => "MipVnnlib",
             MethodUsed::IbpF64 => "Ibp_f64",
             MethodUsed::CrownF64 => "Crown_f64",
@@ -81,6 +83,7 @@ impl From<&str> for MethodUsed {
             "LazySmtRefiner" => MethodUsed::LazySmtRefiner,
             "Mip" => MethodUsed::Mip,
             "MipHiGHS" => MethodUsed::MipHiGHS,
+            "MipAyStrictSideArtifact" => MethodUsed::MipAyStrictSideArtifact,
             "MipVnnlib" => MethodUsed::MipVnnlib,
             "Ibp_f64" => MethodUsed::IbpF64,
             "Crown_f64" => MethodUsed::CrownF64,
@@ -93,10 +96,19 @@ impl From<String> for MethodUsed {
     fn from(s: String) -> Self {
         // Try known variants first before allocating for Other
         match s.as_str() {
-            "Ibp" | "Crown" | "AlphaCrown" | "SdpCrown" | "BetaCrown" | "SmtRefiner"
-            | "LazySmtRefiner" | "Mip" | "MipHiGHS" | "MipVnnlib" | "Ibp_f64" | "Crown_f64" => {
-                MethodUsed::from(s.as_str())
-            }
+            "Ibp"
+            | "Crown"
+            | "AlphaCrown"
+            | "SdpCrown"
+            | "BetaCrown"
+            | "SmtRefiner"
+            | "LazySmtRefiner"
+            | "Mip"
+            | "MipHiGHS"
+            | "MipAyStrictSideArtifact"
+            | "MipVnnlib"
+            | "Ibp_f64"
+            | "Crown_f64" => MethodUsed::from(s.as_str()),
             _ => MethodUsed::Other(s),
         }
     }

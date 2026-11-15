@@ -16,8 +16,6 @@
 //! Tan/Arctan/Reciprocal tests are in `crown_trig_reciprocal.rs`.
 //! SiLU/Sigmoid/Tanh/GELU tests are in `crown_s_shaped.rs`.
 //! ELU/CELU/SELU/Mish/Softplus tests are in `crown_elu_family.rs`.
-//!
-//! Part of #1705, #1793, #40.
 
 use crate::layers::arithmetic::{AbsLayer, PowConstantLayer};
 use crate::LinearBounds;
@@ -175,9 +173,9 @@ proptest! {
         )?;
     }
 
-    // SiLU identity-bounds test moved to crown_s_shaped.rs (#1793)
+    // SiLU identity-bounds test moved to crown_s_shaped.rs
 
-    // ELU/CELU/SELU/Mish/Softplus identity tests moved to crown_elu_family.rs (#1793)
+    // ELU/CELU/SELU/Mish/Softplus identity tests moved to crown_elu_family.rs
 }
 
 // =============================================================================
@@ -379,8 +377,8 @@ use super::assert_crown_negative_coeff_sound;
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(300) })]
 
-    // SiLU/Sigmoid/Tanh/GELU negative-coeff + asymmetric tests moved to crown_s_shaped.rs (#1793)
-    // ELU/CELU/SELU/Mish/Softplus negative-coeff + asymmetric tests moved to crown_elu_family.rs (#1793)
+    // SiLU/Sigmoid/Tanh/GELU negative-coeff + asymmetric tests moved to crown_s_shaped.rs
+    // ELU/CELU/SELU/Mish/Softplus negative-coeff + asymmetric tests moved to crown_elu_family.rs
 
     // =========================================================================
     // Abs CROWN backward with negative incoming coefficients
@@ -671,17 +669,17 @@ proptest! {
         )?;
     }
 
-    // Reciprocal negative-coeff + asymmetric tests moved to crown_trig_reciprocal.rs (#1793)
+    // Reciprocal negative-coeff + asymmetric tests moved to crown_trig_reciprocal.rs
 }
 
 // =============================================================================
-// CROWN BACKWARD NaN GUARD: DOMAIN GUARD REJECTION (#1736, #2836)
+// CROWN BACKWARD NaN GUARD: DOMAIN GUARD REJECTION
 // =============================================================================
-// Originally (#1736): verified that per-neuron maximally-loose relaxation
+// Originally: verified that per-neuron maximally-loose relaxation
 // (slope=0, intercept=±inf) did not produce NaN via 0.0 * ±inf in the
 // sign-switching loop.
 //
-// After #2836: non_finite_domain_guard rejects the entire tensor at entry
+// Now: non_finite_domain_guard rejects the entire tensor at entry
 // when ANY pre-activation bound is non-finite, returning NumericalInstability.
 // This is the correct behavior: the backward dispatch caller falls back to IBP.
 // The per-neuron NaN handling in the relaxation function is now defense-in-depth.
@@ -696,7 +694,7 @@ proptest! {
     /// Verify domain_guard rejects non-finite pre-activation bounds at entry.
     ///
     /// Setup: 3 neurons, one with ±inf pre-activation bounds.
-    /// The domain_guard (#2836) rejects the entire tensor, returning
+    /// The domain_guard rejects the entire tensor, returning
     /// NumericalInstability so the caller can fall back to IBP.
     #[ntest::timeout(10000)]
     #[test]
@@ -739,12 +737,12 @@ proptest! {
     }
 }
 
-// Reciprocal identity/direct + Tan identity/negative-coeff tests moved to crown_trig_reciprocal.rs (#1793)
+// Reciprocal identity/direct + Tan identity/negative-coeff tests moved to crown_trig_reciprocal.rs
 
-// Arctan, Tan asymmetric, Reciprocal identity + direct tests moved to crown_trig_reciprocal.rs (#1793)
+// Arctan, Tan asymmetric, Reciprocal identity + direct tests moved to crown_trig_reciprocal.rs
 
-// Floor, Ceil, Round, Sign tests moved to crown_piecewise_constant.rs (#1793)
-// Sin, Cos tests moved to crown_sincos.rs (#1793)
+// Floor, Ceil, Round, Sign tests moved to crown_piecewise_constant.rs
+// Sin, Cos tests moved to crown_sincos.rs
 
 // =============================================================================
 // POWCONSTANT (x^2) CROWN NEGATIVE-COEFF AND ASYMMETRIC
@@ -850,7 +848,7 @@ proptest! {
 }
 
 // =============================================================================
-// TIGHTNESS: CROWN relaxation gap converges to zero for small intervals (#2131)
+// TIGHTNESS: CROWN relaxation gap converges to zero for small intervals
 // =============================================================================
 //
 // For smooth activation functions f over a small epsilon-ball [x-eps, x+eps],
@@ -872,7 +870,7 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(500) })]
 
-    /// Exp CROWN tightness: small interval → small gap at center (#2131).
+    /// Exp CROWN tightness: small interval → small gap at center.
     #[ntest::timeout(10000)]
     #[test]
     fn tightness_exp_crown_small_interval(x0 in -5.0f32..5.0) {
@@ -910,7 +908,7 @@ proptest! {
         );
     }
 
-    /// Log CROWN tightness: small interval → small gap at center (#2131).
+    /// Log CROWN tightness: small interval → small gap at center.
     #[ntest::timeout(10000)]
     #[test]
     fn tightness_log_crown_small_interval(x0 in 0.1f32..50.0) {
@@ -944,7 +942,7 @@ proptest! {
         );
     }
 
-    /// Sqrt CROWN tightness: small interval → small gap at center (#2131).
+    /// Sqrt CROWN tightness: small interval → small gap at center.
     #[ntest::timeout(10000)]
     #[test]
     fn tightness_sqrt_crown_small_interval(x0 in 0.1f32..50.0) {
@@ -979,4 +977,4 @@ proptest! {
     }
 }
 
-// Domain guard rejection tests moved to crown_domain_guard.rs (#3070)
+// Domain guard rejection tests moved to crown_domain_guard.rs

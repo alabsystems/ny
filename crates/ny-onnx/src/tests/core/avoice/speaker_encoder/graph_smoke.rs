@@ -139,7 +139,6 @@ fn test_graph_ibp_avoice_speaker_encoder_rejects_t4_3873() {
 /// Expand lowering path. The exported speaker_encoder.onnx has dynamic T on the
 /// time axis; this test runs IBP at T=5 and T=16 to confirm the
 /// ExpandLikeLastAxisLayer correctly broadcasts `[C,1] -> [C,T]` for different T.
-/// Part of #3600.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
 #[cfg(feature = "external-avoice")]

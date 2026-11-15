@@ -39,33 +39,162 @@ const CONTEXT_RADIUS: usize = 12;
 /// would make newly introduced undeclared configuration look like accepted
 /// debt and defeats the source frontier's role as the forcing function for
 /// completing parameter governance.
-const BASELINE_LEGACY_LITERAL_SITES: usize = 1_807;
-const BASELINE_LEGACY_LITERAL_NAMES: usize = 768;
-const BASELINE_LEGACY_READER_SITES: usize = 979;
+// Baseline history. Every value was re-derived from this file's own failure
+// output, one per run, because the baselines are asserted sequentially.
+// 2026-09-12 #nn4sys-1d-cover (-13 sites / -2 names / -2 readers):
+// NY_NN4SYS_1D_COMPLETE_COVER and NY_NN4SYS_1D_COVER_DEPTH are DECLARED
+// (decls/nn4sys_1d_cover.rs) and their readers in verify/nn4sys_scalar_cover.rs
+// resolve through the typed preset gates. NY_NN4SYS_1D_COVER_SLICE is new and
+// adds only REGISTERED rows. NY_NN4SYS_1D_COVER_MAX_LEAVES re-anchored
+// one-for-one (same name, count 1 and semantics; the removed DEPTH read sat
+// inside CONTEXT_RADIUS of it); its manifest rows were re-anchored by hand
+// because the updater refuses to bless a new legacy identity.
+// 2026-09-15 #fl-f32-seam-key (-1 site / -1 reader): removed the duplicate
+// `NY_FORWARD_LINEAR_F32` reader in forward_linear/image.rs; the surviving
+// parent-module reader keeps the name.
+// 2026-09-28 #name-blind-routing (-1 site / -1 name / -1 reader): deleted the
+// env-dark cGAN input-leaf route with its `NY_CGAN_INPUT_LEAF` literal and raw
+// `var_os` reader in vnncomp.rs; the neighbouring
+// `NY_TRAFFIC_TERMINAL_SOFTMAX_PEEL` literal re-anchored one-for-one.
+// 2026-09-28 #name-blind-routing (-1 site / -1 name / -2 readers): deleted the
+// env-dark SafeNLP direct-MIP-first route (`NY_MIP_SAFENLP_DIRECT_FIRST` and
+// its `var_os` reader) plus dispatch.rs's private `phase_telemetry_enabled()`
+// raw `NY_PHASE_TELEMETRY` reader; that name stays registered and read
+// elsewhere. `NY_TRAFFIC_TERMINAL_SOFTMAX_PEEL` re-anchored one-for-one again.
+// 2026-09-28 #name-blind-routing (-1 site / -1 name / -1 reader): deleted the
+// env-dark traffic terminal-Softmax peel route
+// (`NY_TRAFFIC_TERMINAL_SOFTMAX_PEEL` and its `var_os` reader).
+// 2026-09-29 #fl-alpha-composition (-1 site): the four-name FL env scrub lives
+// once in ny-propagate's shared `tests::with_default_fl_reference_env` (+4
+// legacy rows in crates/ny-propagate/src/tests/mod.rs); graph_alpha/bounds/tests.rs
+// (3 sites) and forward_linear/tests_image.rs (2 sites) call it instead of
+// spelling the scrub by hand. Names and readers are unchanged.
+// 2026-10-01 #fl-alpha-composition root fix (-76 sites / -4 names; readers unchanged): the
+// 2026-09-29 entry was a one-for-one substitution -- the helper's 4 rows were
+// NEW legacy identities, which the updater refuses to bless when run from the
+// pre-re-land manifest. NY_NO_FORWARD_LINEAR_REF,
+// NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF, NY_FORWARD_LINEAR_SEQ_CONV_REF and
+// NY_FORWARD_LINEAR_F32 are now DECLARED (decls/forward_linear.rs) and the
+// helper names them through those declarations, so its 4 rows are gone and
+// every other executable spelling of the four names moved from `legacy` to
+// `registered`. Their raw readers remain counted reader debt. Manifest from
+// the updater (no legacy row added).
+// 2026-10-02 #fl-alpha-composition merge of origin/main a76267730, NOT new
+// debt: main's own sites, which main landed without manifest rows (its own
+// frontier test failed on them); keys verbatim from the updater's refusals.
+// - 4 test-only site(s) classified `permanent` (reviewed test surface, the
+//   ENG9B precedent for layer_norm/tests_radial.rs): margin-row's head-advice
+//   CLI tests (crates/ny-cli/tests/head_phase_advice_cli.rs and
+//   head_functional_advice_cli.rs) set `NY_DISABLE_CUDA` and `NY_WGPU_CROWN` to
+//   malformed values in the child process environment to prove the private AY
+//   advice helper never reads them.
+// Sites stay 1_699, names 755, readers 969; fingerprints from the ratchet's own
+// failure output.
+// 2026-10-02 #fl-alpha-composition review (reader drift), -4 readers: the four
+// declared forward-linear switches are now READ through their declarations
+// (`ny_levers::read`) in network/core/graph/forward_linear.rs (3 readers) and
+// graph_alpha/bounds/alpha.rs (the sequential-Conv2d gate), so their 4 raw `var`
+// reader sites leave the reader frontier (969 -> 965) and the 4 matching
+// `registered` literal rows go with them. Literal sites stay 1_699, names 755.
+// Manifests from the updater (no row added); values from the ratchet's output.
+// 2026-10-14 environment-reader cleanup: classify only identities printed by
+// the actual source-frontier characterization. resident_head_probe's five
+// env! expressions are compile-time build provenance, retained.rs's three
+// byte strings are hash-domain separators, and the two dense-budget fixture
+// writes plus concat's recursive-test child guard are deliberate test inputs.
+// No runtime selector was reclassified to hide debt. The four newly governed
+// names and six migrated reads are separately removed by the registry route.
+// Actual updater/ratchet output: legacy literals1692, names753, readers963;
+// all three counts fall, and all fingerprints below come from that output.
+// 2026-10-14 phase-cover fixture review: the actual updater refused three
+// new test-only child-environment writes. The V3 helper test deliberately sends
+// malformed NY_DISABLE_CUDA/NY_WGPU_CROWN values, as the V1/V2 tests already do.
+// The scored-entry functional test disables the unrelated external watchdog
+// while its own parent enforces a 45-second process watchdog. These three
+// literal identities are reviewed permanent test inputs, not runtime readers.
+// All remaining new literals are registered; debt counters/fingerprints do not move.
+// 2026-10-14 directional-default review, from levers-integration-v2 actual
+// failure: 13 new/re-anchored registered literal sites, seven stale registered
+// identities removed. The one NY_UNAUTHORIZED_DEFAULT literal is the explicit
+// negative provenance-admission test, classified permanent. The scored-entry
+// fixture's one vars_os/<all> reader only removes inherited NY overrides from
+// its child environment to prove default reachability; classify it reviewed.
+// No production selector or reader was reclassified; all six legacy debt
+// counters/fingerprints below remain unchanged.
+// 2026-11-07 kernel-input governance: three existing names become declared;
+// all ten direct readers move through their declarations. The actual
+// characterization reports the exact stale/current identities. Review only
+// one-for-one NO_CUDA_F32/CROWN_SERVE_TRUNCATED_CACHE literal reanchors,
+// three unchanged existing reader reanchors, and the one cfg(test) rate
+// unset fixture; keep every production reader classified as legacy debt.
+// Proposed fixture debt falls 1692/753/963 -> 1647/750/957. The unchanged
+// exact gate and no-new-legacy updater must confirm these reviewed fixtures.
+const BASELINE_LEGACY_LITERAL_SITES: usize = 1647;
+const BASELINE_LEGACY_LITERAL_NAMES: usize = 750;
+const BASELINE_LEGACY_READER_SITES: usize = 957;
 // FNV-1a over the sorted identity sets below. Counts alone would permit a new
 // raw master to replace an unrelated retired site one-for-one; exact identity
 // fingerprints make that substitution fail until review lowers the debt and
 // records the new, strictly smaller frontier in the same commit.
-// Re-anchored 2026-08-27, NOT a substitution: legacy sites stayed 1_807 and
-// legacy names stayed 768. One physical site
-// (target_backward.rs `NY_PATCHES_BUDGET_SECS`) changed structural anchor
-// because #frozen-crown-authority deleted the adjacent
-// `env.set("NY_CROWN_OBJ_CHUNK", ...)` inside CONTEXT_RADIUS of it, which
-// collapsed two token-identical scrub blocks onto one anchor with
-// collision ordinals 1 and 2. That deletion also RETIRED a registered
-// reader, so the frontier moved strictly in the intended direction.
-const BASELINE_LEGACY_LITERAL_SITE_FINGERPRINT: u64 = 0x0674_9915_b503_3cd9;
-const BASELINE_LEGACY_LITERAL_NAME_FINGERPRINT: u64 = 0x65b7_5585_8418_fa76;
+// Re-anchors below are NOT substitutions: same name, count and semantics.
+// 2026-08-27 #frozen-crown-authority: target_backward.rs
+// `NY_PATCHES_BUDGET_SECS` re-anchored when the adjacent
+// `env.set("NY_CROWN_OBJ_CHUNK", ...)` inside CONTEXT_RADIUS of it was deleted,
+// which also RETIRED a registered reader.
+// 2026-08-31 #mip-demand: `NY_GRAPH_MIP_MAX_NNZ` in graph_mip_escalate.rs
+// re-anchored when its read moved into the shared `graph_mip_max_nnz()`
+// accessor, so the pre-BaB static reserve probe and the admission decision
+// cannot disagree about the cap (manifest row re-anchored in
+// ny_literal_frontier.tsv).
+// 2026-09-01 #patches-engine-wiring: NY_PATCHES_GPU is DECLARED
+// (decls/crown_ibp_budget.rs), so its 7 literal sites and 1 name left the
+// legacy frontier; its raw READER sites remain counted debt.
+// 2026-09-29 #fl-alpha-composition: re-fingerprinted for the site set recorded
+// at BASELINE_LEGACY_LITERAL_SITES above (1776 -> 1775).
+// 2026-10-01 ENG9B (origin/main 44ec71fcf merged into int/eng9), NOT substitutions:
+// `NY_SOFTMAX_OBJECTIVE_ENVELOPE` in layers/softmax/linear/sound.rs re-anchored
+// (m7 rewrote the imports inside its CONTEXT_RADIUS window;
+// 9623b650ec208199 -> 0ded2d58fa771697) and `NY_MARGIN_ROW_CLASSWISE` in
+// margin_row/mod.rs re-anchored (the wide-patch admission block inserted
+// after its read; 1d5bfe133026875f -> 31f67d17a66b3e9b). The new test-only
+// `NY_ATTN_CROWN_TERNARY` site in layer_norm/tests_radial.rs is classified
+// `permanent` (reviewed test surface). Sites stay 1775, names 759.
+// Value from the ratchet's own failure output.
+// 2026-10-01 #fl-alpha-composition root fix: both literal fingerprints
+// re-derived for the strictly smaller site and name sets recorded above (a
+// pure removal: the four FL names leave the legacy frontier).
+const BASELINE_LEGACY_LITERAL_SITE_FINGERPRINT: u64 = 0xe16c94aee005336f;
+const BASELINE_LEGACY_LITERAL_NAME_FINGERPRINT: u64 = 0xfa7767d15c88bf9b;
 // 2026-08-26 #disj-demand: the NY_SKIP_DISJ_PGD reader in
-// verify/disjunctive.rs kept its name, count, and semantics but its structural
-// anchor changed (the binding it feeds was renamed `skip_disj_pgd` →
-// `skip_disj_pgd_env` when the demand-zeroed skip composed with it), so the
-// SAME site re-fingerprints. Debt count unchanged (979 after the upstream
-// removals this landed on top of); the manifest row was re-anchored in the
-// same commit (ny_reader_frontier.tsv). Value RE-DERIVED from the ratchet's
-// own failure output on the MERGED tree, per the collision rule — neither
-// pre-merge side's number described this tree.
-const BASELINE_LEGACY_READER_SITE_FINGERPRINT: u64 = 0x4663_d458_4d6e_1088;
+// verify/disjunctive.rs re-anchored when the binding it feeds was renamed
+// `skip_disj_pgd` → `skip_disj_pgd_env` (manifest row re-anchored in
+// ny_reader_frontier.tsv).
+// 2026-08-31 #mip-demand: the READER half of the NY_GRAPH_MIP_MAX_NNZ
+// re-anchor recorded above.
+// 2026-09-28 #disj-odi, NOT a substitution: the raw `var` reader of
+// `NY_PGD_DIAG` in graph_pgd_vjp_batched_disj.rs re-anchored because the
+// `odi_policy` / `DisjLaneEnv { .. }` block inserted directly above it changed
+// the one token at the far edge of its CONTEXT_RADIUS window (`)` -> `,`)
+// (reader anchor 9ccd59c2acaf6907 -> d7c37850194ee5c9; the literal anchor did
+// not move). Reader sites stay 969.
+// 2026-09-30 ENG7 (#graph-bab-cover-ledger), NOT a substitution: the raw
+// `var` reader of `NY_PHASE_LEDGER` in commands/vnncomp.rs `run_and_translate`
+// re-anchored because `let graph_cover_capture =
+// ny_propagate::certify::take_graph_cover_capture();` was inserted directly
+// above it, inside its CONTEXT_RADIUS window (reader anchor 96c0a687f0b9bb0e ->
+// e1ec7edc06725a89; the literal anchor did not move). Reader sites stay 969.
+// Value from the ratchet's own failure output.
+// 2026-10-02 #fl-alpha-composition review: re-fingerprinted for the strictly
+// smaller reader set recorded at BASELINE_LEGACY_READER_SITES above (a pure
+// removal of the four forward-linear raw reads). Value from the ratchet's own
+// failure output.
+// 2026-10-16 singleton reduction extraction: the existing NY_JOINT_MARGIN_LP
+// reader keeps the same name, var call, parser, default and downstream logic.
+// Only its context's first token changed from ')' to 'spec_weight' when the
+// preceding network construction became reduced_objective_networks(...).
+// Re-anchor 4cd0ccb8800e1ad3 -> bfc7d37bdba5bef2 one-for-one; legacy reader
+// count stays 963, with no literal/name debt or classification change.
+const BASELINE_LEGACY_READER_SITE_FINGERPRINT: u64 = 0x49ce3d4f06504ca9;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TokenKind {
@@ -580,7 +709,6 @@ fn collect_env_imports(file: &SourceFile) -> (BTreeSet<String>, BTreeMap<String,
         let statement = cursor + 1..end;
         let has_std = statement.clone().any(|index| ident(file, index, "std"));
         let env_positions: Vec<_> = statement
-            .clone()
             .filter(|index| ident(file, *index, "env"))
             .collect();
         if has_std {
@@ -1546,6 +1674,11 @@ fn legacy_parameter_debt_matches_the_shrinking_baseline_exactly() {
     );
     let readers = parse_manifest("ny_reader_frontier.tsv", READER_MANIFEST, READER_CATEGORIES);
     let debt = legacy_debt(&literals, &readers);
+    println!(
+        "legacy frontier actual: literal_sites={} literal_names={} reader_sites={} literal_site_fingerprint=0x{:016x} literal_name_fingerprint=0x{:016x} reader_site_fingerprint=0x{:016x}",
+        debt.literal_sites, debt.literal_names, debt.reader_sites,
+        debt.literal_site_fingerprint, debt.literal_name_fingerprint, debt.reader_site_fingerprint,
+    );
 
     assert_exact_shrinking_ratchet(
         "undeclared executable lever-literal sites",

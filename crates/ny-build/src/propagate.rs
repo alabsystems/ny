@@ -125,7 +125,7 @@ pub fn build_propagate_network_indexed(
         // Skip nodes whose inputs are all constants — these are shape-computation
         // chains (Shape→Gather→Unsqueeze→Concat) that produce constant outputs.
         // Their results are already in the weights store from const-folding.
-        // Consistent with GraphNetwork builder (builder.rs:200-226). Part of #3312.
+        // Consistent with GraphNetwork builder (builder.rs:200-226).
         let all_inputs_constant = !layer_spec.inputs.is_empty()
             && layer_spec.inputs.iter().all(|inp| ctx.is_constant(inp));
         if all_inputs_constant {

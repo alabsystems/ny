@@ -107,7 +107,6 @@ fn patches_par_state<'a>(
 /// same mathematical quantity as in Dense mode, just scattered across patches.
 ///
 /// Reference: alpha-beta-CROWN auto_LiRPA/operators/relu.py (Patches backward with alpha)
-/// Part of #3293
 pub(crate) fn crown_relu_backward_patches_with_alpha(
     bounds: &PatchesLinearBounds,
     pre_activation: &BoundedTensor,
@@ -241,7 +240,7 @@ fn crown_relu_backward_patches_with_alpha_impl(
     };
 
     // Materialize identity patches only when needed; otherwise borrow the
-    // existing patches tensor to avoid an O(patch_size) deep clone (perf #3293).
+    // existing patches tensor to avoid an O(patch_size) deep clone.
     // `Cow` keeps the owned materialized tensor alive when identity, and borrows
     // the input tensor directly otherwise. Geometry is validated up front and
     // cloned only into the returned carrier, so no tensor clone is needed.
@@ -285,7 +284,7 @@ fn crown_relu_backward_patches_with_alpha_impl(
     if bounds.lower_a.unstable_idx.is_some() {
         let dense_lb = bounds.to_dense()?;
         // Delegate to the Dense propagate_linear_with_alpha.
-        // NOTE(#3782): `alpha_upper` is `None` here because patches-mode ReLU
+        // NOTE: `alpha_upper` is `None` here because patches-mode ReLU
         // is fundamentally single-alpha — the helper models one optimizable lower
         // slope (`alpha[i]`) plus a fixed upper chord (`lambda`). A true
         // dual-alpha patches implementation requires a dedicated relaxation

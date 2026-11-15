@@ -121,3 +121,83 @@ fn singleton_disjunction_domain_list_opt_in_is_default_off_and_unique() {
         "the static census must cover cGAN presets"
     );
 }
+
+/// `bab.branching.input_split.lowdim_prover` is the typed opt-in for the
+/// `#lowdim-prover` lane at the DomainList input-split ENTRY. Pin three things:
+/// the engine default fails closed, the yaml key actually ARRIVES in the engine
+/// config (a key that parses but never reaches `BetaCrownConfig` is dead
+/// capability that passes every other test), and no shipped preset sets it
+/// together with `independent_singleton_disjunction` — that per-clause route
+/// already runs the lane, so both would try it twice per clause.
+#[test]
+fn lowdim_prover_key_arrives_defaults_off_and_never_doubles_the_singleton_route() {
+    assert!(
+        !BetaCrownConfig::default().input_split_lowdim_prover,
+        "the engine config must fail closed when the typed preset field is absent"
+    );
+
+    let mut preset = super::PresetConfig::default();
+    preset.bab.branching.input_split.enable = Some(true);
+    preset.bab.branching.input_split.lowdim_prover = Some(true);
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).unwrap();
+    assert!(
+        config.input_split_lowdim_prover,
+        "bab.branching.input_split.lowdim_prover must reach BetaCrownConfig"
+    );
+    assert_eq!(BetaCrownConfig::default().lowdim_prover_share(), 0.5);
+    let mut shared = super::PresetConfig::default();
+    shared.bab.branching.input_split.lowdim_prover_share = Some(0.9);
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &shared).unwrap();
+    assert!(
+        (config.lowdim_prover_share() - 0.9).abs() < 1e-6,
+        "share must arrive"
+    );
+    config.input_split_lowdim_prover_share = 7.0;
+    assert_eq!(config.lowdim_prover_share(), 0.95, "share must clamp high");
+    config.input_split_lowdim_prover_share = f32::NAN;
+    assert_eq!(
+        config.lowdim_prover_share(),
+        0.5,
+        "non-finite share reads as default"
+    );
+
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for year in ["configs/vnncomp25", "configs/vnncomp26"] {
+        let Ok(entries) = fs::read_dir(repo_root.join(year)) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("config entry").path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("yaml") {
+                continue;
+            }
+            let preset = load_preset(&path).unwrap_or_else(|error| {
+                panic!("{} must remain a typed preset: {error}", path.display())
+            });
+            let split = &preset.bab.branching.input_split;
+            assert!(
+                !(split.lowdim_prover.unwrap_or(false)
+                    && split.independent_singleton_disjunction.unwrap_or(false)),
+                "{} arms lowdim_prover AND the singleton route: the lane would run twice per clause",
+                path.display()
+            );
+        }
+    }
+}
+
+/// `bab.branching.input_split.lowdim_fold` arrives in `BetaCrownConfig` and
+/// defaults off (the nn4sys per-clause fold pre-pass).
+#[test]
+fn lowdim_fold_key_arrives_and_defaults_off() {
+    assert!(!BetaCrownConfig::default().input_split_lowdim_fold);
+    let mut preset = super::PresetConfig::default();
+    preset.bab.branching.input_split.lowdim_fold = Some(true);
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).unwrap();
+    assert!(
+        config.input_split_lowdim_fold,
+        "bab.branching.input_split.lowdim_fold must reach BetaCrownConfig"
+    );
+}

@@ -13,7 +13,6 @@ use super::*;
 //
 // The first real-weight slice freezes cos/sin/mask as concrete auxiliary
 // tensors and keeps hidden_states as the only bounded activation input.
-// Reference: designs/2026-03-11-issue-3497-talker-attention-softmax-surface.md
 // ---------------------------------------------------------------------------
 
 pub(super) const TALKER_ATTENTION_FILE: &str = "talker_attention_layer0.onnx";
@@ -32,7 +31,7 @@ pub(in super::super) const QWEN3_TTS_ROPE_BASE: f64 = 1_000_000.0;
 pub(super) const TALKER_AUX_INPUTS: &[&str] = &["cos", "sin", "mask"];
 
 // ---------------------------------------------------------------------------
-// Contract accessor boundary (#3917)
+// Contract accessor boundary
 //
 // Centralizes exporter-owned facts behind a cached, fallback-safe accessor.
 // When a `.contract.json` sidecar exists, the accessor validates and returns
@@ -115,7 +114,7 @@ pub(in super::super) fn avoice_talker_attention_raw() -> &'static OnnxModel {
 }
 
 // ---------------------------------------------------------------------------
-// Contract regression tests (#3917, #4180)
+// Contract regression tests
 // ---------------------------------------------------------------------------
 
 #[test]

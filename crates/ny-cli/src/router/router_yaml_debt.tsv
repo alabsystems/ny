@@ -1,0 +1,21 @@
+# ROUTER YAML DEBT (#router-r5, ROUTER_PROGRAM §2.5, §3.5, §10 R5) — every shipped category
+# file line (configs/vnncomp24|25|26/*.yaml) that sets the route key of a ROUTABLE capability
+# (a registry row in crates/ny-cli/src/router/registry.rs with routing data).
+#
+# Columns:  state <TAB> category file <TAB> typed key path as written <TAB> value <TAB> capability
+#   debt      the capability is SEALED (SR.seal: S7 + S8 done, envelope recorded): the router
+#             routes it per instance, name-blind, and this file line decides instead — PIN DEBT.
+#             The count MAY ONLY FALL (BASELINE_DEBT in `router_yaml_debt_matches_manifest`):
+#             retire the line, never raise the baseline.
+#   unsealed  the capability is not sealed yet: the router cannot route it, so the file line is
+#             today's only delivery (a measurement or a user-directed arming). Listed so the line
+#             becomes visible debt the moment the capability is sealed.
+#
+# An EXACT census: `router_yaml_debt_matches_manifest` (ny-cli, --bin ny) fails on any delta in
+# either direction and prints the whole derived body; take rows only from that output.
+# Authored with R5 on a tree where no shipped file sets a route key (the census was empty).
+# int/eng10: the two rows below arrived with #breakpoint-dual (a848a87c0, the user-directed
+# CIFAR100/TinyImageNet category presets arm margin_row.frozen_dual_bab); frozen-dual-bab is
+# not sealed, so they are today's delivery, not pin debt. Rows taken from the test's own output.
+unsealed	configs/vnncomp25/cifar100_2024.yaml	margin_row.frozen_dual_bab	true	frozen-dual-bab
+unsealed	configs/vnncomp25/tinyimagenet_2024.yaml	margin_row.frozen_dual_bab	true	frozen-dual-bab

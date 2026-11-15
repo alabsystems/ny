@@ -188,8 +188,8 @@ fn test_graph_cut_paths_skip_relu_with_empty_inputs_2098() {
 
     let mut graph = GraphNetwork::new();
     // Construct directly via struct literal to bypass the debug_assert! in
-    // GraphNode::new (#2481) — this test intentionally creates a malformed
-    // node with empty inputs to verify that cut computation skips it (#2098).
+    // GraphNode::new — this test intentionally creates a malformed
+    // node with empty inputs to verify that cut computation skips it.
     graph.add_node(GraphNode {
         name: "relu_bad".to_string(),
         layer: Layer::ReLU(ReLULayer),
@@ -631,7 +631,7 @@ fn test_proactive_cuts_generation() {
     // (may be 0 if only single-neuron cuts are generated due to max_cuts limit)
 }
 
-/// Regression test for #554: proactive cut generation must be deterministic
+/// Regression test: proactive cut generation must be deterministic
 /// across multiple invocations. Previously, HashMap iteration order caused
 /// nondeterministic pairwise cut selection.
 #[ntest::timeout(10000)]
@@ -671,7 +671,7 @@ fn test_proactive_cuts_deterministic_ordering_554() {
     }
 }
 
-/// Regression test for #554: pairwise cuts must use bias=1.0
+/// Regression test: pairwise cuts must use bias=1.0
 /// ("at least one active"), not 0.5.
 #[ntest::timeout(10000)]
 #[test]
@@ -866,7 +866,7 @@ fn test_graph_cut_authority_quarantine_with_objective() {
     }
 }
 
-/// Regression test for #2575: GraphCuttingPlane Adam must not produce NaN/Inf
+/// Regression test: GraphCuttingPlane Adam must not produce NaN/Inf
 /// when beta1=1.0.
 #[ntest::timeout(10000)]
 #[test]
@@ -896,7 +896,7 @@ fn test_graph_cutting_plane_adam_beta1_one_no_div_by_zero_2575() {
     );
 }
 
-/// Regression test for #2575: GraphCuttingPlane Adam must not produce NaN/Inf
+/// Regression test: GraphCuttingPlane Adam must not produce NaN/Inf
 /// when beta2=1.0.
 #[ntest::timeout(10000)]
 #[test]
@@ -926,7 +926,7 @@ fn test_graph_cutting_plane_adam_beta2_one_no_div_by_zero_2575() {
     );
 }
 
-/// Regression test for #2575: GraphCuttingPlane Adam must not produce NaN/Inf
+/// Regression test: GraphCuttingPlane Adam must not produce NaN/Inf
 /// when t=0 (missing t.max(1) guard).
 #[ntest::timeout(10000)]
 #[test]
@@ -956,7 +956,7 @@ fn test_graph_cutting_plane_adam_t_zero_no_div_by_zero_2575() {
     );
 }
 
-/// Regression test for #2598: GraphCuttingPlane Adam must reset state on NaN gradient.
+/// Regression test: GraphCuttingPlane Adam must reset state on NaN gradient.
 #[ntest::timeout(10000)]
 #[test]
 fn test_graph_cutting_plane_nan_lambda_guard_2598() {

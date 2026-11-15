@@ -857,8 +857,8 @@ mod tests {
         assert_eq!(proposal.bounds, zero);
         assert!(!proposal.lower_improved);
         assert!(!proposal.upper_improved);
-        assert!(proposal.lower_multipliers.is_empty());
-        assert!(proposal.upper_multipliers.is_empty());
+        assert_eq!(proposal.lower_multipliers, [] as [f64; 0]);
+        assert_eq!(proposal.upper_multipliers, [] as [f64; 0]);
     }
 
     #[test]

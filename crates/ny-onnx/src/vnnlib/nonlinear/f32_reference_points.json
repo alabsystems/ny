@@ -1,0 +1,1632 @@
+{
+  "status": "independent-pinned-organizer-predicate-goldens-not-network-proofs",
+  "source_commit": "eea564f5d0a8751d8321a409214db14d03f452b8",
+  "checker_sha256": "5ab7a4df717ed1c80ec0477372eb394a4a2a460a5060f0eebe030a76d219faab",
+  "numpy_version": "2.2.6",
+  "vnnlib_version": "1.0.2",
+  "point_count": 155,
+  "cases": [
+    {
+      "source": "(vnnlib-version <2.0>)\n(declare-network f (declare-input X float32 [2]) (declare-output Y float32 [1]))\n(assert (== (* X[0] X[1]) 0.0))\n",
+      "source_sha256": "febd60afc088af72e5c98db84a563fd3a77f3fe97afc6a429c0f047fa1a2f878",
+      "samples": [
+        {
+          "x_bits": [
+            0,
+            0
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            2147483648,
+            0
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1,
+            1
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            3,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            2147483649,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1065353216,
+            1065353216
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1266679808,
+            1266679808
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1266679808,
+            3414163456
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1036831949,
+            1045220557
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1065353217,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            226492416,
+            226492416
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            3225419776,
+            1073741824
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1233125376,
+            1048576000
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            8388608,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        }
+      ]
+    },
+    {
+      "source": "(vnnlib-version <2.0>)\n(declare-network f (declare-input X float32 [2]) (declare-output Y float32 [1]))\n(assert (> (* X[0] X[1]) 0.0))\n",
+      "source_sha256": "ea86ca8dc324efa1157b33e4dd742ce00a149bd6271c21b1d5efe1fd49ae33c3",
+      "samples": [
+        {
+          "x_bits": [
+            0,
+            0
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            2147483648,
+            0
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1,
+            1
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            3,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            2147483649,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1065353216,
+            1065353216
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1266679808,
+            1266679808
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1266679808,
+            3414163456
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1036831949,
+            1045220557
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1065353217,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            226492416,
+            226492416
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            3225419776,
+            1073741824
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1233125376,
+            1048576000
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            8388608,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        }
+      ]
+    },
+    {
+      "source": "(vnnlib-version <2.0>)\n(declare-network f (declare-input X float32 [2]) (declare-output Y float32 [1]))\n(assert (!= (* X[0] X[1]) 0.0))\n",
+      "source_sha256": "0f8df8535458b1317cc58d9fae2b7f50295ed28db76e9ae562d50af925a9aae1",
+      "samples": [
+        {
+          "x_bits": [
+            0,
+            0
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            2147483648,
+            0
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1,
+            1
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            3,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            2147483649,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1065353216,
+            1065353216
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1266679808,
+            1266679808
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1266679808,
+            3414163456
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1036831949,
+            1045220557
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1065353217,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            226492416,
+            226492416
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            3225419776,
+            1073741824
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1233125376,
+            1048576000
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            8388608,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        }
+      ]
+    },
+    {
+      "source": "(vnnlib-version <2.0>)\n(declare-network f (declare-input X float32 [2]) (declare-output Y float32 [1]))\n(assert (== (- X[0] X[1] 1.0) 0.0))\n",
+      "source_sha256": "5cacac860f718fc6d2309521da51cba4727f4fb3f5a225b3f81dc923f3577817",
+      "samples": [
+        {
+          "x_bits": [
+            0,
+            0
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            2147483648,
+            0
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1,
+            1
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            3,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            2147483649,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1065353216,
+            1065353216
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1266679808,
+            1266679808
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1266679808,
+            3414163456
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1036831949,
+            1045220557
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1065353217,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            226492416,
+            226492416
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            3225419776,
+            1073741824
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1233125376,
+            1048576000
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            8388608,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        }
+      ]
+    },
+    {
+      "source": "(vnnlib-version <2.0>)\n(declare-network f (declare-input X float32 [2]) (declare-output Y float32 [1]))\n(assert (== X[0] 16777217.0))\n",
+      "source_sha256": "d1377aff0d4f2c40f4b982ea50d96fabb5472f56e456e26ddd6181f2f5dd7467",
+      "samples": [
+        {
+          "x_bits": [
+            0,
+            0
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            2147483648,
+            0
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1,
+            1
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            3,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            2147483649,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1065353216,
+            1065353216
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1266679808,
+            1266679808
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1266679808,
+            3414163456
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1036831949,
+            1045220557
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1065353217,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            226492416,
+            226492416
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            3225419776,
+            1073741824
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1233125376,
+            1048576000
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            8388608,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        }
+      ]
+    },
+    {
+      "source": "(vnnlib-version <2.0>)\n(declare-network f (declare-input X float32 [2]) (declare-output Y float32 [1]))\n(assert (> (+ X[0] 0.1) X[1]))\n",
+      "source_sha256": "1e46b3ed91883c3c2d0423ab50ad59964c60245b5accd1d44a9ecf2f9bb5c43b",
+      "samples": [
+        {
+          "x_bits": [
+            0,
+            0
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            2147483648,
+            0
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1,
+            1
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            3,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            2147483649,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1065353216,
+            1065353216
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1266679808,
+            1266679808
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1266679808,
+            3414163456
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1036831949,
+            1045220557
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1065353217,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            226492416,
+            226492416
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            3225419776,
+            1073741824
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1233125376,
+            1048576000
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            8388608,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        }
+      ]
+    },
+    {
+      "source": "(vnnlib-version <2.0>)\n(declare-network f (declare-input X float32 [2]) (declare-output Y float32 [1]))\n(assert (<= (* 0.1 X[0]) (* 0.2 X[1])))\n",
+      "source_sha256": "eaba49205b75778e5819ec60cab82c65cdcf643db5dd5f0ab4c5797799c09891",
+      "samples": [
+        {
+          "x_bits": [
+            0,
+            0
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            2147483648,
+            0
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1,
+            1
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            3,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            2147483649,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1065353216,
+            1065353216
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1266679808,
+            1266679808
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1266679808,
+            3414163456
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1036831949,
+            1045220557
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1065353217,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            226492416,
+            226492416
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            3225419776,
+            1073741824
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1233125376,
+            1048576000
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            8388608,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        }
+      ]
+    },
+    {
+      "source": "(vnnlib-version <2.0>)\n(declare-network f (declare-input X float32 [2]) (declare-output Y float32 [1]))\n(assert (or (< X[0] 0.0) (>= (* X[0] X[1]) 0.0)))\n",
+      "source_sha256": "e0547862d7c9100bb7510fe7150b540044d320aa08fd40503fd42d501ecd7228",
+      "samples": [
+        {
+          "x_bits": [
+            0,
+            0
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            2147483648,
+            0
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1,
+            1
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            3,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            2147483649,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1065353216,
+            1065353216
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1266679808,
+            1266679808
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1266679808,
+            3414163456
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1036831949,
+            1045220557
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1065353217,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            226492416,
+            226492416
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            3225419776,
+            1073741824
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1233125376,
+            1048576000
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            8388608,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        }
+      ]
+    },
+    {
+      "source": "(vnnlib-version <2.0>)\n(declare-network f (declare-input X float32 [2]) (declare-output Y float32 [1]))\n(assert (and (> X[0] 0.0) (<= (* X[0] Y[0]) 0.0)))\n",
+      "source_sha256": "9f73924c8931274a592e38e5f3c7d4cb49b01c6c9f113cdf6e6b1449cee62089",
+      "samples": [
+        {
+          "x_bits": [
+            0,
+            0
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            2147483648,
+            0
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1,
+            1
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            3,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            2147483649,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1065353216,
+            1065353216
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1266679808,
+            1266679808
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1266679808,
+            3414163456
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1036831949,
+            1045220557
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1065353217,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            226492416,
+            226492416
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            3225419776,
+            1073741824
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1233125376,
+            1048576000
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            8388608,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        }
+      ]
+    },
+    {
+      "source": "(vnnlib-version <2.0>)\n(declare-network f (declare-input X float32 [2]) (declare-output Y float32 [1]))\n(assert (== (+ X[0] (+ 16777216.0 1.0 (- 16777216.0))) Y[0]))\n",
+      "source_sha256": "b65a7629d39f1001430e661d6c609468c8b8f0d4cb9ad5215577b97954991aef",
+      "samples": [
+        {
+          "x_bits": [
+            0,
+            0
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            2147483648,
+            0
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1,
+            1
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            3,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            2147483649,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1065353216,
+            1065353216
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1266679808,
+            1266679808
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1266679808,
+            3414163456
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1036831949,
+            1045220557
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1065353217,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            226492416,
+            226492416
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            3225419776,
+            1073741824
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1233125376,
+            1048576000
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            8388608,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        }
+      ]
+    },
+    {
+      "source": "(vnnlib-version <2.0>)\n(declare-network f (declare-input X float32 [2]) (declare-output Y float32 [1]))\n(assert (== (+ X[0] 16777216.0 1.0 (- 16777216.0)) Y[0]))\n",
+      "source_sha256": "6040965fa8ee0bd1acb1c38d08165cf5250001139b6ac99c40bf26dedd274927",
+      "samples": [
+        {
+          "x_bits": [
+            0,
+            0
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            2147483648,
+            0
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1,
+            1
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            3,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            2147483649,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1065353216,
+            1065353216
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1266679808,
+            1266679808
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1266679808,
+            3414163456
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1036831949,
+            1045220557
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            1065353217,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            226492416,
+            226492416
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        },
+        {
+          "x_bits": [
+            3225419776,
+            1073741824
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            1233125376,
+            1048576000
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": false
+        },
+        {
+          "x_bits": [
+            8388608,
+            1056964608
+          ],
+          "y_bits": [
+            0
+          ],
+          "expected": true
+        }
+      ]
+    },
+    {
+      "source": "(vnnlib-version <2.0>) (declare-network f (declare-input X float32 [2]) (declare-output Y float32 [1])) (assert (and (> X[0] 0.0) (== X[1] 0.0) (> Y[0] 0.0) (<= (* (* X[0] 2.0) Y[0]) (* X[1] X[1]))))",
+      "source_sha256": "09249bbe49e38c5ea8d33d21da8cdd2de1829fac3073dce971cae9fe808d309b",
+      "samples": [
+        {
+          "x_bits": [
+            1,
+            0
+          ],
+          "y_bits": [
+            1
+          ],
+          "expected": true
+        }
+      ]
+    }
+  ]
+}

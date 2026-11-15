@@ -190,7 +190,7 @@ fn f32_any_with_specials() -> impl Strategy<Value = f32> {
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(256) })]
 
-    /// #1836 acceptance: exercise HardSwish eval on ANY f32 plus explicit IEEE corner values.
+    /// Acceptance: exercise HardSwish eval on ANY f32 plus explicit IEEE corner values.
     #[test]
     fn proptest_hardswish_eval_handles_special_values(x in f32_any_with_specials()) {
         let layer = HardSwishLayer::new();
@@ -206,7 +206,7 @@ proptest! {
         }
     }
 
-    /// #1836 acceptance: finite-width IBP intervals must not produce NaN bounds.
+    /// Acceptance: finite-width IBP intervals must not produce NaN bounds.
     #[test]
     fn proptest_hardswish_ibp_no_nan_for_finite_intervals(a in prop::num::f32::ANY, b in prop::num::f32::ANY) {
         prop_assume!(a.is_finite() && b.is_finite());
@@ -365,7 +365,7 @@ fn test_propagate_linear_requires_preact() {
     assert!(layer.requires_pre_activation_bounds());
 }
 
-/// Regression test for #1836: HardSwish(-inf) must return 0, not NaN.
+/// Regression test: HardSwish(-inf) must return 0, not NaN.
 /// HardSwish(x) = x * clamp((x+3)/6, 0, 1); at x = -inf: (-inf)*0 = NaN
 /// without the guard. Correct: HardSwish(x) = 0 for x <= -3.
 #[test]
@@ -375,7 +375,7 @@ fn test_hardswish_eval_neg_infinity_returns_zero() {
     assert_eq!(result, 0.0, "HardSwish(-inf) should be 0.0, got {result}");
 }
 
-/// Regression test for #1836: HardSwish(+inf) must return +inf.
+/// Regression test: HardSwish(+inf) must return +inf.
 #[test]
 fn test_hardswish_eval_pos_infinity_returns_pos_infinity() {
     let layer = HardSwishLayer::new();
@@ -387,7 +387,7 @@ fn test_hardswish_eval_pos_infinity_returns_pos_infinity() {
     );
 }
 
-/// Regression test for #1836: HardSwish(NaN) must return NaN.
+/// Regression test: HardSwish(NaN) must return NaN.
 #[test]
 fn test_hardswish_eval_nan_returns_nan() {
     let layer = HardSwishLayer::new();
@@ -523,7 +523,7 @@ fn test_crown_backward_non_identity_bounds() -> Result<()> {
     Ok(())
 }
 
-/// Regression test for #1836: IBP with infinite input bounds must not produce NaN
+/// Regression test: IBP with infinite input bounds must not produce NaN
 /// in the computed values. The IBP output constructor (BoundedTensor::new) rejects
 /// infinite bounds, so we verify the error is NumericalInstability (not NaN corruption).
 #[test]
@@ -558,7 +558,7 @@ fn test_hardswish_ibp_infinite_bounds_no_nan() {
     }
 }
 
-// ── f64 chord precision proptest (#2846) ─────────────────────────────
+// ── f64 chord precision proptest ─────────────────────────────
 
 /// Reference HardSwish in f64, independent of the crate implementation.
 fn hardswish_f64_reference(x: f64) -> f64 {
@@ -590,7 +590,7 @@ fn ulp_distance(a: f32, b: f32) -> u64 {
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(1000) })]
 
-    /// #2846, #3146: Verify hardswish_chord produces f64-quality results with directed rounding.
+    /// Verify hardswish_chord produces f64-quality results with directed rounding.
     /// Analogous to proptest_silu_chord_f64_precision in silu/tests.rs.
     /// For intervals with width in [1e-8, 1e-4], the chord slope must match
     /// a pure f64 reference within 1 ULP, and directed rounding bounds must
@@ -655,12 +655,12 @@ fn hardswish_chord_deviation_includes_f32_endpoint_roundoff() {
     }
 }
 
-// ── CROWN relaxation soundness proptest (#3285) ─────────────────────────
+// ── CROWN relaxation soundness proptest ─────────────────────────
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(1000) })]
 
-    /// #3285: Verify hardswish_linear_relaxation produces strictly sound bounds.
+    /// Verify hardswish_linear_relaxation produces strictly sound bounds.
     /// For random intervals, the lower bound must satisfy
     ///   lower_slope * x + lower_intercept <= HardSwish(x)  for all x in [l, u]
     /// and the upper bound must satisfy

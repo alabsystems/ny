@@ -31,7 +31,7 @@ pub struct WhisperEncoderStructure {
 /// Per-LayerNorm site row-collapse stats from decomposed normalization CROWN.
 ///
 /// Reports how many rows collapsed to fused LayerNorm IBP because the decomposed
-/// CROWN result was looser than the fused baseline. Part of #318.
+/// CROWN result was looser than the fused baseline.
 #[derive(Debug, Clone)]
 pub struct NormalizationRowStats {
     /// ONNX node name of the LayerNorm site.

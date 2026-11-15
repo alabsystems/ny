@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Public GraphNetwork alpha-CROWN regressions for #3918.
+//! Public GraphNetwork alpha-CROWN regressions.
 
 use crate::bounds::AlphaCrownConfig;
 use crate::tests::crown::helpers::{assert_bounds_finite, CountingGemmEngine};

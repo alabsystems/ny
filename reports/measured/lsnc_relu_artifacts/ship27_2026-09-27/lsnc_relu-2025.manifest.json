@@ -1,0 +1,1731 @@
+{
+  "schema_version": 1,
+  "year": 2025,
+  "timeout_cap": null,
+  "configs": {
+    "canonical_path": "<home>/ny-wt-ship27/configs/vnncomp25",
+    "sha256": "8761a57e661d3d2150f65faa423ff9ac6c3eba0088ab5c31622792ee337e701c"
+  },
+  "executable": {
+    "canonical_path": "<home>/ny-pins/ny_wave6_cf376ec20",
+    "sha256": "4b1656c9978e31af5ae607190e92c28506853f2ada28ee88ae029c8596e55135"
+  },
+  "build_id": "NY_BUILD_ID_V1 version=0.5.6157 features=mip,cuda backend=cuda+wgpu markers=margin-row-gpu-eft-impl-v9 commit=cf376ec2054b365210906e8894cd28d082fbe4bc dirty=false revision=6157 source=clean profile=release target=aarch64-unknown-linux-gnu rustc=1.99.0-dev-1183ee6ed stamp=63913e1bc53fdd22c9ffdd3c321f44aaf028d3dc7860d93d97a1deb9381bd9a0 exe=4b1656c9978e31af5ae607190e92c28506853f2ada28ee88ae029c8596e55135 id=cb1fa286a839fa13e983d3ce473cfd68dd4f656a99c6d2db04e1a1ae36db9e14",
+  "build_provenance": "ny.vnncomp.unsealed.v1|status=unsealed|",
+  "target_os": "linux",
+  "target_arch": "aarch64",
+  "compute_backend": "cuda [cuda: compiled, NVIDIA kernel driver=present, 1 process-visible device(s), libcuda+libcublas=present, engine lazy/unconfirmed; wgpu adapter: Vulkan (NVIDIA GB10, IntegratedGpu); sound verdict path: CUDA f64 GEMM seams + CPU f64 CROWN (resident CUDA CROWN behind its gates)]",
+  "host": "spark-f904 | unknown-cpu | 20 cores | 121 GiB",
+  "arm": [],
+  "ambient_env_schema": "ny-cli/ambient-env/v3",
+  "ambient_env": {
+    "NY_BOX_QUIET_GRACE": "300",
+    "NY_BOX_WAIT_LOCK": "21600",
+    "NY_BOX_WAIT_QUIET": "21600"
+  },
+  "witness_dir": {
+    "canonical_path": "<home>/ny/reports/sweeps/ship27/lsnc_relu-2025.witnesses",
+    "sha256": "3f149485e2e450af5babcdd789752f751db7a910403d82ace76f69a7e62f53a3"
+  },
+  "instance_selection": {
+    "mode": "all"
+  },
+  "selected_rows": {
+    "lsnc_relu": {
+      "schema": "ny-search/measured-row-set/v1",
+      "count": 80,
+      "sha256": "7369b686baf4f473d51c1558dfcdc8df6edf662d445c62928d8c60a40ccd247d"
+    }
+  },
+  "selected_row_inputs_schema": "ny-cli/selected-row-inputs/v2",
+  "selected_row_inputs": {
+    "lsnc_relu": [
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_0.vnnlib",
+        "occurrence": 0,
+        "instance_index": 0,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_0.vnnlib",
+            "sha256": "4729491af536b9f5eac11602fedc152e0eba1f0176096ad1cb33fbd261a9f215"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_1.vnnlib",
+        "occurrence": 0,
+        "instance_index": 1,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_1.vnnlib",
+            "sha256": "923868cb56a5df20c16be8091a4981d460b3d7c9e66a75b337e48e57352deb09"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_2.vnnlib",
+        "occurrence": 0,
+        "instance_index": 2,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_2.vnnlib",
+            "sha256": "85e52a6f31da9cdf391d463eed8aa8d9b1a995f172cf53381a140605cc351c06"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_3.vnnlib",
+        "occurrence": 0,
+        "instance_index": 3,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_3.vnnlib",
+            "sha256": "36f538a774fced8c519d7e50e2ac9359ef53ac3d79bbb9091a1acec8d5fad361"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_4.vnnlib",
+        "occurrence": 0,
+        "instance_index": 4,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_4.vnnlib",
+            "sha256": "883dc3a98d324fd476950e7a1f74380972cf27cfa06b7ee018e7c098fa7fdc52"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_5.vnnlib",
+        "occurrence": 0,
+        "instance_index": 5,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_5.vnnlib",
+            "sha256": "e446b8e9549c6853b5d2d773265b29905de9230838c208a8d2c413cf0f6cf6b2"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_6.vnnlib",
+        "occurrence": 0,
+        "instance_index": 6,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_6.vnnlib",
+            "sha256": "f97263a36eaa76d2df5d9731ba44b1e58dc506732114fab80ca398fb67dd4ca8"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_7.vnnlib",
+        "occurrence": 0,
+        "instance_index": 7,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_7.vnnlib",
+            "sha256": "e4f4f7293c1eb101a098c908a99fcc99129d217315e9d369ad28e7779ebbaec4"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_8.vnnlib",
+        "occurrence": 0,
+        "instance_index": 8,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_8.vnnlib",
+            "sha256": "a0bb384491217cc8f7fee39a677386d1b1c0c4a7bbd2e822c6dc072ac790716e"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_9.vnnlib",
+        "occurrence": 0,
+        "instance_index": 9,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_9.vnnlib",
+            "sha256": "6a03aa7e28ee7963b33c3bbb46bda6b78e21669eaa4cbf3264725049f9ff17b9"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_10.vnnlib",
+        "occurrence": 0,
+        "instance_index": 10,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_10.vnnlib",
+            "sha256": "30cbcab226b9873efd72c34d96a3af407ca856d972ccd78b8b255a718b88a0b6"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_11.vnnlib",
+        "occurrence": 0,
+        "instance_index": 11,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_11.vnnlib",
+            "sha256": "d00c37bd08373d0a51c444b5127995b13f833a5f501698cb87b617f84d12c872"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_12.vnnlib",
+        "occurrence": 0,
+        "instance_index": 12,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_12.vnnlib",
+            "sha256": "eb898d25e3186047f7c5fe7081b47fb3042eae12560b60c56b0b8692496e8a74"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_13.vnnlib",
+        "occurrence": 0,
+        "instance_index": 13,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_13.vnnlib",
+            "sha256": "b9802d91cbf6679b92afdbc0328da050f518ed26000651f187a5fe7e74eee66c"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_14.vnnlib",
+        "occurrence": 0,
+        "instance_index": 14,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_14.vnnlib",
+            "sha256": "d8fefbd8053beaa96fa12e0b525a02858b2d4751b62e61d33dcfc00d404f2d3d"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_15.vnnlib",
+        "occurrence": 0,
+        "instance_index": 15,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_15.vnnlib",
+            "sha256": "340b86046a2fb98e117dc7b6b0ce01d0716a18c7676ef986e3dc43596c619d8d"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_16.vnnlib",
+        "occurrence": 0,
+        "instance_index": 16,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_16.vnnlib",
+            "sha256": "c4977d9a945c5031956cde59ce41b781bbbe7b41ac4939b61adf9efa21a96f41"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_17.vnnlib",
+        "occurrence": 0,
+        "instance_index": 17,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_17.vnnlib",
+            "sha256": "ffc1a6dd5806cfb61b6f9c878170a159f071c66669f72480304ee948fc0fee3a"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_18.vnnlib",
+        "occurrence": 0,
+        "instance_index": 18,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_18.vnnlib",
+            "sha256": "b9822e5d6eb65306194a8fc493d9dc4d047e6b1d83a6ec44e918c0cb0d4ac9e4"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_19.vnnlib",
+        "occurrence": 0,
+        "instance_index": 19,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_19.vnnlib",
+            "sha256": "e0e9fc8b9bb471159cecd0f44a1a62d27b9486e83b9306f70d78ead995011594"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_20.vnnlib",
+        "occurrence": 0,
+        "instance_index": 20,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_20.vnnlib",
+            "sha256": "d77ff32ba1dc26cd0113c98c11270952a83509fe0979ffbf058ede0e97e0618b"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_21.vnnlib",
+        "occurrence": 0,
+        "instance_index": 21,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_21.vnnlib",
+            "sha256": "eecdf8e0215319a1174e1f4ad88a521c1da323e2445ea60d88b4f5d7965bc885"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_22.vnnlib",
+        "occurrence": 0,
+        "instance_index": 22,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_22.vnnlib",
+            "sha256": "d8d2b218612b4d28190d8ac5e739670b605319527540f515422f947de482d13e"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_23.vnnlib",
+        "occurrence": 0,
+        "instance_index": 23,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_23.vnnlib",
+            "sha256": "6836ad8535fc038f6301b72180e462815487456b5e4d38767558bcb9d404016e"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_24.vnnlib",
+        "occurrence": 0,
+        "instance_index": 24,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_24.vnnlib",
+            "sha256": "f3975acde37c355cdc57b1012f4163b3c1f5f8f2d8577a757274f4666b7f4951"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_25.vnnlib",
+        "occurrence": 0,
+        "instance_index": 25,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_25.vnnlib",
+            "sha256": "73fb8318c52514af0785d642d135f7c0f5ff79d552f7e63553e2b48775d5bd91"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_26.vnnlib",
+        "occurrence": 0,
+        "instance_index": 26,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_26.vnnlib",
+            "sha256": "78f5f4c7ec61ea58ee9c9aa6b7dd5c587f9c8a357f0e10e82a657c089db1fdcf"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_27.vnnlib",
+        "occurrence": 0,
+        "instance_index": 27,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_27.vnnlib",
+            "sha256": "060541e7f9d53ad856436b7eea41b159a0c35c8244cbbda44505f4c942a74893"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_28.vnnlib",
+        "occurrence": 0,
+        "instance_index": 28,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_28.vnnlib",
+            "sha256": "06334f43890196d4d70e93329fb97b1e540fb982b3c155eb463cdaef2d54d96f"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_29.vnnlib",
+        "occurrence": 0,
+        "instance_index": 29,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_29.vnnlib",
+            "sha256": "867623f8d464db27c07e842b22ddbeba16cd2fed35dd971ebc311172f9b93006"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_30.vnnlib",
+        "occurrence": 0,
+        "instance_index": 30,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_30.vnnlib",
+            "sha256": "5ab9681fa64d873547d5a7db97ba6c0697e79c9c863ac2054194d9426a2bfd86"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_31.vnnlib",
+        "occurrence": 0,
+        "instance_index": 31,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_31.vnnlib",
+            "sha256": "c4b09c671a341a564d9b7bcd293f93a9a81060ef5059c0a69243e5a58c123e49"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_32.vnnlib",
+        "occurrence": 0,
+        "instance_index": 32,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_32.vnnlib",
+            "sha256": "cac2cbe44f3f9f546cbd333d0eefd579cb2a7bc4dda2d33a1d676d50f4daf335"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_33.vnnlib",
+        "occurrence": 0,
+        "instance_index": 33,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_33.vnnlib",
+            "sha256": "42b0d14e8f685ff8402130a97f9d8173ef1fc38654df58f36589d39dd377ebcd"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_34.vnnlib",
+        "occurrence": 0,
+        "instance_index": 34,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_34.vnnlib",
+            "sha256": "1ef98bcf91309f1d58e69baca5eaf005b2743ab2108403509b6134bbd0413412"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_35.vnnlib",
+        "occurrence": 0,
+        "instance_index": 35,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_35.vnnlib",
+            "sha256": "e006b1f613f70b51097d21bb6a923d2f3ba685ecac44258fa2d9aefc3a9c163b"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_36.vnnlib",
+        "occurrence": 0,
+        "instance_index": 36,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_36.vnnlib",
+            "sha256": "95f514770a168100899fbfc5cd74f2433e0c6b2f46891f9ba3d838e6ed9399d1"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_37.vnnlib",
+        "occurrence": 0,
+        "instance_index": 37,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_37.vnnlib",
+            "sha256": "22c819f8637c1b23d3a86c250a7644119afd3f1ce2d9e82ea1063a6f42ae021a"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_38.vnnlib",
+        "occurrence": 0,
+        "instance_index": 38,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_38.vnnlib",
+            "sha256": "f0ac5818c6672ef54cf548c67e811d16a8c4fcb1b40c83a64b9990471bff5471"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_39.vnnlib",
+        "occurrence": 0,
+        "instance_index": 39,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_39.vnnlib",
+            "sha256": "40dcdf9f7a5b9c3b85ca2c10c77ee20a1eb4ced233b2a42800fd0b2ce84b1248"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_40.vnnlib",
+        "occurrence": 0,
+        "instance_index": 40,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_40.vnnlib",
+            "sha256": "7b76af204d4d24009673dffa0628db33fabbb88950d4d062ab995c1aa430861e"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_41.vnnlib",
+        "occurrence": 0,
+        "instance_index": 41,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_41.vnnlib",
+            "sha256": "a0996df3ab41319d4f3fb2854c038dfeaf1bfeb6ef1b1d3f62a63bf5b26b46ee"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_42.vnnlib",
+        "occurrence": 0,
+        "instance_index": 42,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_42.vnnlib",
+            "sha256": "bda93d1c5836ba0a3981cc2dfe5f33c54ca02187b9c9e078e6700fff7f57daae"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_43.vnnlib",
+        "occurrence": 0,
+        "instance_index": 43,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_43.vnnlib",
+            "sha256": "36a783f4773ffcd2db801b2525f79bc6e17d442cc3ddc397714b679926846254"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_44.vnnlib",
+        "occurrence": 0,
+        "instance_index": 44,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_44.vnnlib",
+            "sha256": "9d02682570422ff803f56d54e3b66ba0def88daff3481c2a3f9f55337f97aa29"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_45.vnnlib",
+        "occurrence": 0,
+        "instance_index": 45,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_45.vnnlib",
+            "sha256": "e5910ebebc27ce1542930fec085df4cdbc85dc178089870e7ba622fff6f973f9"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_46.vnnlib",
+        "occurrence": 0,
+        "instance_index": 46,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_46.vnnlib",
+            "sha256": "b9e755d0f9aa77ed7a034788bba3a7a1973c8b2d5f2f56efe76cf55cdded860a"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_47.vnnlib",
+        "occurrence": 0,
+        "instance_index": 47,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_47.vnnlib",
+            "sha256": "c5800448a7efeef62329b9a631d59d2ae9e381af3b5f2b358800c31d3c7eb7d8"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_48.vnnlib",
+        "occurrence": 0,
+        "instance_index": 48,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_48.vnnlib",
+            "sha256": "73358943033c048fb1715cf1cecfa23a2efc5f2d2943b0c93fa7432d48721f4c"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_49.vnnlib",
+        "occurrence": 0,
+        "instance_index": 49,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_49.vnnlib",
+            "sha256": "247742b786d5d59d1cd90a9b37a0a7fde073444d07d7ed085eb0be7a163ba028"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_50.vnnlib",
+        "occurrence": 0,
+        "instance_index": 50,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_50.vnnlib",
+            "sha256": "7d52f688e9c5017c07b5ab8563994d45f15c03cab07f8d7362b0b086602e3196"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_51.vnnlib",
+        "occurrence": 0,
+        "instance_index": 51,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_51.vnnlib",
+            "sha256": "a4d6758d2b12836b0bbac50f62c53c550b6bd760e2edeccdbf1f65821a2dc09e"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_52.vnnlib",
+        "occurrence": 0,
+        "instance_index": 52,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_52.vnnlib",
+            "sha256": "91178594381bcd556f57fdc2fc0508456b5f42dbc6ce5f59a0972ea22b3b5450"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_53.vnnlib",
+        "occurrence": 0,
+        "instance_index": 53,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_53.vnnlib",
+            "sha256": "5b674aa2588e2a4fedee7dd5b658628c5024d729da9123ad6a55bc168e55604d"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_54.vnnlib",
+        "occurrence": 0,
+        "instance_index": 54,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_54.vnnlib",
+            "sha256": "00d0f3ff2798df5a17351d214ea79b9193745a6daa97532d110840fb99f70598"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_55.vnnlib",
+        "occurrence": 0,
+        "instance_index": 55,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_55.vnnlib",
+            "sha256": "6a861cef56f5fd91d6bfe985a7aa82e329fcae24321973f91848d18d8a542fce"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_56.vnnlib",
+        "occurrence": 0,
+        "instance_index": 56,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_56.vnnlib",
+            "sha256": "ad06b6b55e0c774e742e9ff573ea4e5443ca153c591c2a0b68ceb58ecfcd0162"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_57.vnnlib",
+        "occurrence": 0,
+        "instance_index": 57,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_57.vnnlib",
+            "sha256": "d6c82b6433227b74465f5e471f5eaf7c7e169101c34b905baae0f5d49fd951a9"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_58.vnnlib",
+        "occurrence": 0,
+        "instance_index": 58,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_58.vnnlib",
+            "sha256": "88a9b5c4534dace6ba20b2042c330bf136fe9b2f5f560ca13902d72a17693b85"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_59.vnnlib",
+        "occurrence": 0,
+        "instance_index": 59,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_59.vnnlib",
+            "sha256": "8b91014600da81c63566650f1a6f6ec14d4956e17f21077b0c8504bb947e60ea"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_60.vnnlib",
+        "occurrence": 0,
+        "instance_index": 60,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_60.vnnlib",
+            "sha256": "0e439f31563fbd5e144ce94d84521c5756b786e2c3601d04fa93b5b21e881eb2"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_61.vnnlib",
+        "occurrence": 0,
+        "instance_index": 61,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_61.vnnlib",
+            "sha256": "92a1912dcc336376240477f18b88968d9b810e6a802a516f88e075540daad937"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_62.vnnlib",
+        "occurrence": 0,
+        "instance_index": 62,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_62.vnnlib",
+            "sha256": "c6b1ca619b7a2e5e7690ab5c89e62b03067c63a7292cc9406c44a5e179842605"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_63.vnnlib",
+        "occurrence": 0,
+        "instance_index": 63,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_63.vnnlib",
+            "sha256": "f1b370c06a075935304bef0b189643b11f5b2e4a547f85bba773a8c2a189ccf7"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_64.vnnlib",
+        "occurrence": 0,
+        "instance_index": 64,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_64.vnnlib",
+            "sha256": "9a4efb7a3835dfa847421bcef1a369ea05cac52e07ec4fe36a5a1a77e322f236"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_65.vnnlib",
+        "occurrence": 0,
+        "instance_index": 65,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_65.vnnlib",
+            "sha256": "ebb675e1cb7e42b4b75a28cf1e9cfb25f5f69fae325791c2c3d465972e63e55f"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_66.vnnlib",
+        "occurrence": 0,
+        "instance_index": 66,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_66.vnnlib",
+            "sha256": "936d2d55d58c19771d48e8541ac3180f20e4198652250728f98fd07bdb00f597"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_67.vnnlib",
+        "occurrence": 0,
+        "instance_index": 67,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_67.vnnlib",
+            "sha256": "5934e8b56df5ec36077dc642e4e6746d2796b238b868d87379b8b6307418a587"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_68.vnnlib",
+        "occurrence": 0,
+        "instance_index": 68,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_68.vnnlib",
+            "sha256": "b375869aa2fa9193e885f8b31ab5f693fecd573d81d6e70c3e718a9e92c156e8"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_69.vnnlib",
+        "occurrence": 0,
+        "instance_index": 69,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_69.vnnlib",
+            "sha256": "9b4474f8978b163e469ac7fdecb10b33b7aa880aa3fd7addad4742b521c5485c"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_70.vnnlib",
+        "occurrence": 0,
+        "instance_index": 70,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_70.vnnlib",
+            "sha256": "5e741cbd0625f901d6bbb3dd121f974e7c310eeab387651c50ddfc6f79185c17"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_71.vnnlib",
+        "occurrence": 0,
+        "instance_index": 71,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_71.vnnlib",
+            "sha256": "acbc90ae4da6d94705a3c442eb12d7d953df45133d87293c8308d346685c3fc3"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_72.vnnlib",
+        "occurrence": 0,
+        "instance_index": 72,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_72.vnnlib",
+            "sha256": "0592eba079912dc8fa146544be384452e325bc21313a92247444f620238294fd"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_73.vnnlib",
+        "occurrence": 0,
+        "instance_index": 73,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_73.vnnlib",
+            "sha256": "fa956fc651d82f3d5fb046e11908a62c03212538249141f0157463664fd1d9e2"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_74.vnnlib",
+        "occurrence": 0,
+        "instance_index": 74,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_74.vnnlib",
+            "sha256": "241c874995ecfe0165ae8e41c39367db7ad64b6523681b817c415b03004817cf"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_75.vnnlib",
+        "occurrence": 0,
+        "instance_index": 75,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_75.vnnlib",
+            "sha256": "e01d9a6662a06becf6041ed4919d8b6e3fc92c42fc746e1ff86b4c0405283ac3"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_76.vnnlib",
+        "occurrence": 0,
+        "instance_index": 76,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_76.vnnlib",
+            "sha256": "e4cfcfa73507847f2cdbc09c89ae97a71dd548f6eddd72439ce5e2fc1875d4a7"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_77.vnnlib",
+        "occurrence": 0,
+        "instance_index": 77,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_77.vnnlib",
+            "sha256": "cf5ed7313d9d41db78f8f65d1d759cc7441cf8a790a1f5441fadd72592c67f05"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_78.vnnlib",
+        "occurrence": 0,
+        "instance_index": 78,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_78.vnnlib",
+            "sha256": "a9071d22f482d87e261dd0c1b01930bb536db5dfc3be34293a32fab2a93aa2db"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/relu_quadrotor2d_state.onnx",
+        "vnnlib": "vnnlib/quadrotor2d_state_79.vnnlib",
+        "occurrence": 0,
+        "instance_index": 79,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/onnx/relu_quadrotor2d_state.onnx",
+                "sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/vnnlib/quadrotor2d_state_79.vnnlib",
+            "sha256": "ca7d8439f8249d69da2d7a59609872ba9e9247e787a236d6618bff918f86195c"
+          }
+        }
+      }
+    ]
+  },
+  "instances_csv": {
+    "lsnc_relu": {
+      "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/lsnc_relu/instances.csv",
+      "sha256": "638d6a78f4783faa412c6bf265f6fe89b0ba89fc977956ebd16c94debcdef07d"
+    }
+  }
+}

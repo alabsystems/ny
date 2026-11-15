@@ -21,12 +21,11 @@ use std::time::Instant;
 use tracing::debug;
 
 use super::core::GraphNetwork;
+use super::graph_point_trace::{GraphPointArm, GraphPointTrace};
 
 /// Extension trait for IBP propagation on graph networks.
 ///
 /// Contains `propagate_ibp_impl` and `propagate_ibp_sound_impl`.
-/// Additional methods will be migrated incrementally per
-/// designs/2026-01-28-oversized-file-splits-remaining.md.
 pub(crate) trait GraphNetworkIbpExt {
     /// Propagate bounds through the graph using IBP.
     fn propagate_ibp_impl(&self, input: &BoundedTensor) -> Result<BoundedTensor>;
@@ -328,6 +327,8 @@ fn propagate_ibp_core(
         leading_axis_mode,
         deadline,
         false,
+        None,
+        None,
     )
 }
 
@@ -342,6 +343,87 @@ fn propagate_concrete_point_core(
     leading_axis_mode: LeadingAxisMode,
     deadline: Option<Instant>,
 ) -> Result<BoundedTensor> {
+    propagate_concrete_point_core_with_trace(
+        network,
+        input,
+        engine,
+        leading_axis_mode,
+        deadline,
+        None,
+        None,
+    )
+}
+
+fn point_deadline(deadline: Option<Instant>) -> Option<Instant> {
+    match (deadline, ny_core::instance_budget::deadline()) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+impl GraphNetwork {
+    /// Concrete diagnostic execution with actual completed software arms.
+    /// This does not provide an interval/certificate or hardware qualification.
+    /// Callers must include `point_trace_admission` in their existing ledger.
+    pub fn propagate_concrete_point_with_trace(
+        &self,
+        input: &BoundedTensor,
+        engine: Option<&dyn GemmEngine>,
+        deadline: Option<Instant>,
+    ) -> Result<(BoundedTensor, GraphPointTrace)> {
+        let deadline = point_deadline(deadline);
+        self.point_trace_admission(engine, deadline)?;
+        let mut trace = GraphPointTrace::new(self, deadline)?;
+        let point = propagate_concrete_point_core_with_trace(
+            self,
+            input,
+            engine,
+            LeadingAxisMode::Plain,
+            deadline,
+            Some(&mut trace),
+            None,
+        )?;
+        Ok((point, trace))
+    }
+
+    /// Observe completed intermediate points in one diagnostic traversal.
+    ///
+    /// `observer` sees the same post-center values that downstream nodes use.
+    /// Its copies and work must be admitted by the caller's original ledger.
+    /// This route does not produce a numerical certificate. An opaque resident
+    /// GPU plan is declined because it cannot expose these intermediate values.
+    pub fn propagate_concrete_point_with_observer(
+        &self,
+        input: &BoundedTensor,
+        deadline: Option<Instant>,
+        mut observer: impl FnMut(&str, &BoundedTensor) -> Result<()>,
+    ) -> Result<(BoundedTensor, GraphPointTrace)> {
+        let deadline = point_deadline(deadline);
+        self.point_trace_admission(None, deadline)?;
+        let mut trace = GraphPointTrace::new(self, deadline)?;
+        let point = propagate_concrete_point_core_with_trace(
+            self,
+            input,
+            None,
+            LeadingAxisMode::Plain,
+            deadline,
+            Some(&mut trace),
+            Some(&mut observer),
+        )?;
+        Ok((point, trace))
+    }
+}
+
+fn propagate_concrete_point_core_with_trace(
+    network: &GraphNetwork,
+    input: &BoundedTensor,
+    engine: Option<&dyn GemmEngine>,
+    leading_axis_mode: LeadingAxisMode,
+    deadline: Option<Instant>,
+    trace: Option<&mut GraphPointTrace>,
+    observer: Option<&mut dyn FnMut(&str, &BoundedTensor) -> Result<()>>,
+) -> Result<BoundedTensor> {
+    let deadline = point_deadline(deadline);
     // Start from the box center (callers pass a degenerate box; a point forward is
     // only defined at the center).
     let point = concrete_center_with_deadline(
@@ -351,41 +433,10 @@ fn propagate_concrete_point_core(
         "while centering the concrete input",
     )?;
 
-    // DAG-lowerable fast path — keep the cached-plan / GPU-resident hot path (#4276).
-    // `try_lower_graph_dag` accepts ONLY affine + ReLU ops (Linear, Conv2d, Add,
-    // Flatten, Reshape, AveragePool, ReLU) and fail-closes on every other op —
-    // crucially on the widening ops this routine exists to tame (BatchNorm, and the
-    // directed-rounding sound path). So a DAG-lowerable graph applies NO soundness
-    // widening in the non-sound forward: a point input stays degenerate
-    // (lower == upper) through every node, and the box forward's center IS the true
-    // network value (to ~ULP, matching ORT). We can therefore reuse the regular box
-    // forward — which dispatches to the GPU-resident DAG cached plan when the engine
-    // supports it (and the naive per-node CPU loop otherwise) — and take the
-    // (degenerate) center, instead of forcing the slower per-node center-collapse
-    // loop that bypasses the cached plan and regresses the adv_check / BaB hot path.
-    // Widening graphs (BatchNorm — the cgan_2023 generators) are NOT DAG-lowerable
-    // and fall through to the per-node collapse below, where re-centering after each
-    // node is genuinely required to stop the deep DAG from amplifying the widening
-    // (#cgan-eval).
-    if leading_axis_mode == LeadingAxisMode::Plain
-        && try_lower_graph_dag(network, point.shape()).is_some()
-    {
-        let out = propagate_ibp_core_inner(
-            network,
-            &point,
-            false,
-            engine,
-            leading_axis_mode,
-            deadline,
-            false,
-        )?;
-        return concrete_center_with_deadline(
-            &out,
-            deadline,
-            "<network output>",
-            "while centering the concrete output",
-        );
-    }
+    // A resident IBP plan exposes an enclosure, whose midpoint need not equal
+    // the point evaluation even for a degenerate input. Keep interval plans
+    // on their original interval routes; concrete Linear nodes still use the
+    // original-coefficient GEMM engine through the point dispatcher below.
 
     propagate_ibp_core_inner(
         network,
@@ -395,6 +446,8 @@ fn propagate_concrete_point_core(
         leading_axis_mode,
         deadline,
         true,
+        trace,
+        observer,
     )
 }
 
@@ -435,6 +488,8 @@ fn propagate_ibp_core_inner(
     leading_axis_mode: LeadingAxisMode,
     deadline: Option<Instant>,
     collapse_to_center: bool,
+    mut trace: Option<&mut GraphPointTrace>,
+    mut observer: Option<&mut dyn FnMut(&str, &BoundedTensor) -> Result<()>>,
 ) -> Result<BoundedTensor> {
     if network.nodes.is_empty() {
         return Ok(input.clone());
@@ -500,7 +555,7 @@ fn propagate_ibp_core_inner(
         }
     }
 
-    // Attempt GPU-resident DAG fast path (#4319).
+    // Attempt GPU-resident DAG fast path.
     // Only for non-sound, plain leading axis mode (the common hot path).
     // Falls back silently to the CPU graph loop on None or any error.
     // Skipped entirely when collapsing to center: the fast path returns a single
@@ -655,7 +710,7 @@ fn propagate_ibp_core_inner(
 
     // Process nodes in topological order
     for node_name in exec_order {
-        // Wall-clock deadline enforcement between nodes (#4321), supplemented by
+        // Wall-clock deadline enforcement between nodes, supplemented by
         // cooperative polling inside deadline-aware convolution nodes. Aborting
         // here lets the caller surface a graceful Timeout/Unknown. Sound: only
         // ever short-circuits to an error.
@@ -681,7 +736,7 @@ fn propagate_ibp_core_inner(
         if matches!(&node.layer, Layer::OpaqueSkip(_)) && node.inputs.len() > 1 {
             // This branch only runs for multi-input OpaqueSkip, so `require_unary_input`
             // (which rejects >1 input) would always error here. Use the first declared
-            // input directly for the diagnostic shape comparison (#2666 regression).
+            // input directly for the diagnostic shape comparison.
             let first_input_name = node.inputs[0].as_str();
             let first_shape = network
                 .bounds_ref(first_input_name, input, &bounds_cache)?
@@ -742,6 +797,13 @@ fn propagate_ibp_core_inner(
                     | Layer::NonZero(_)
             );
 
+        let mut completed_arm = GraphPointArm::IntervalCenter {
+            configured_backend: if trace.is_some() {
+                engine.map(|e| e.backend_provenance())
+            } else {
+                None
+            },
+        };
         let computed: Result<BoundedTensor> = if force_shape_value_degrade
             && network.declared_shape(node_name).is_some()
         {
@@ -763,12 +825,42 @@ fn propagate_ibp_core_inner(
             let computed = (|| -> Result<BoundedTensor> {
                 let output_bounds = match resolved {
                     ResolvedInputs::Unary(input_bounds) => match (&node.layer, leading_axis_mode) {
+                        // Only concrete diagnostic execution may use libm
+                        // probabilities. Interval/certificate routes retain
+                        // the checked causal coordinate-box implementation.
+                        (Layer::CausalSoftmax(softmax), _) if collapse_to_center && !sound => {
+                            let point = softmax
+                                .propagate_concrete_point_with_deadline(&input_bounds, deadline)?;
+                            completed_arm = GraphPointArm::CausalSoftmaxF64Libm;
+                            point
+                        }
+                        (Layer::Linear(linear), _) if collapse_to_center && !sound => {
+                            let (point, receipt) = linear.propagate_concrete_point_with_receipt(
+                                &input_bounds,
+                                engine,
+                                deadline,
+                            )?;
+                            completed_arm = GraphPointArm::Linear { receipt };
+                            point
+                        }
                         (Layer::Linear(linear), _) => linear
                             .propagate_ibp_with_engine_and_deadline(
                                 &input_bounds,
                                 engine,
                                 deadline,
                             )?,
+                        (Layer::PointLinear(linear), _) if collapse_to_center && !sound => {
+                            let (point, receipt) = linear.propagate_concrete_point_with_receipt(
+                                &input_bounds,
+                                engine,
+                                deadline,
+                            )?;
+                            completed_arm = GraphPointArm::PointLinear { receipt };
+                            point
+                        }
+                        (Layer::PointLinear(_), _) => return Err(NyError::UnsupportedOp(
+                            "PointLinear is point-only: interval graph propagation requires a priced qualified adapter".into(),
+                        )),
                         // Conv family sound path: the f32 window sum needs each
                         // layer's own certificate, NOT the generic 1-ULP
                         // widening below. The 1D variants use a directed-f64
@@ -884,7 +976,7 @@ fn propagate_ibp_core_inner(
                     },
                     ResolvedInputs::Binary(ref input_a, ref input_b) => {
                         // Zonotope tightening for attention MatMul and SwiGLU MulBinary.
-                        // Matches detailed.rs and graph_alpha/bounds/ibp.rs (#2706).
+                        // Matches detailed.rs and graph_alpha/bounds/ibp.rs.
                         match &node.layer {
                             Layer::MatMul(matmul) if matmul.transpose_b => {
                                 if let Some(tighter) = network
@@ -946,7 +1038,9 @@ fn propagate_ibp_core_inner(
                 // tightens — never widens — so this is sound; it is a no-op (`None`)
                 // whenever the producer/structure is not a constant-weighted softmax
                 // contraction. See `ibp::dfl_envelope`.
-                let output_bounds = if matches!(&node.layer, Layer::Linear(_) | Layer::MatMul(_)) {
+                let output_bounds = if !collapse_to_center
+                    && matches!(&node.layer, Layer::Linear(_) | Layer::MatMul(_))
+                {
                     if let Some(deadline) = deadline {
                         // The optional DFL recognizer/envelope currently scans,
                         // allocates, and (for the perturbed-MatMul case) sorts
@@ -979,6 +1073,27 @@ fn propagate_ibp_core_inner(
                 } else {
                     output_bounds
                 };
+                // #pwl-lookup (DARK, `bab.pwl_lookup_exact_range`): the exact
+                // 1-D range of a ReLU lookup table, intersected shrink-only
+                // into this node's box. This is the forward the verifier's
+                // authoritative IBP fast path reads (`dispatch.rs`
+                // `graph.propagate_ibp`), which decides the native-Sigmoid
+                // ml4acopf twins at ~4 s. Unarmed graphs, the leading-axis
+                // batched-PGD mode and the point-collapse forward all return
+                // `output_bounds` untouched.
+                let output_bounds =
+                    if leading_axis_mode == LeadingAxisMode::Plain && !collapse_to_center {
+                        network.pwl_lookup_tighten_node(
+                            node_name,
+                            node,
+                            output_bounds,
+                            input,
+                            &bounds_cache,
+                            deadline,
+                        )
+                    } else {
+                        output_bounds
+                    };
                 Ok(output_bounds)
             })();
             if force_shape_value_degrade {
@@ -1134,7 +1249,7 @@ fn propagate_ibp_core_inner(
             output_bounds
         };
 
-        // NaN firewall (#2563, #2706). summarize_bounds already detected NaN;
+        // NaN firewall. summarize_bounds already detected NaN;
         // use shared helper to enforce consistent error policy.
         let firewall_context = if sound {
             "GraphNetwork IBP (sound)"
@@ -1174,6 +1289,12 @@ fn propagate_ibp_core_inner(
 
         if let Some(deadline) = deadline {
             check_graph_ibp_deadline(deadline, node_name, "before caching the node output")?;
+        }
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.push(node_name, node.layer.layer_type(), completed_arm, deadline)?;
+        }
+        if let Some(observer) = observer.as_mut() {
+            observer(node_name, &output_bounds)?;
         }
         bounds_cache.insert(node_name.clone(), output_bounds);
     }
@@ -1217,6 +1338,15 @@ fn propagate_ibp_core_inner(
     }
     Ok(result)
 }
+
+#[cfg(test)]
+mod concrete_causal_tests;
+#[cfg(test)]
+mod concrete_linear_tests;
+#[cfg(test)]
+mod concrete_observer_tests;
+#[cfg(test)]
+mod concrete_trace_tests;
 
 #[cfg(test)]
 mod postprocessing_tests {

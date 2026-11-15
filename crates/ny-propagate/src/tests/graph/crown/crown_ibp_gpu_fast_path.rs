@@ -2,8 +2,8 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Regression coverage for the sequential-graph GPU CROWN-IBP fast path (#3599)
-//! and fork-join DAG per-node GPU engine threading (#4023).
+//! Regression coverage for the sequential-graph GPU CROWN-IBP fast path
+//! and fork-join DAG per-node GPU engine threading.
 
 use ny_test_utils::assert_bounded_tensor_close;
 use std::collections::VecDeque;
@@ -219,8 +219,9 @@ impl GemmEngine for ScriptedGraphGpuEngine {
     }
 }
 
-impl GpuCrownBackward for ScriptedGraphGpuEngine {
-    fn crown_backward_gpu(
+impl ScriptedGraphGpuEngine {
+    /// The scripted body shared by BOTH trait methods below.
+    fn scripted_dispatch(
         &self,
         layers: &[GpuCrownLayer],
         spec: &[f32],
@@ -275,6 +276,38 @@ impl GpuCrownBackward for ScriptedGraphGpuEngine {
     }
 }
 
+/// #crown-partial-sound-forward: the CROWN-IBP partial route now REFUSES the
+/// unsound `crown_backward_gpu` (`crown_partial_gpu.rs`, `use_sound == false`
+/// returns `Ok(None)`), so the only GPU dispatch that can reach a published
+/// intermediate bound is `crown_backward_gpu_sound` under an ENGAGED gate. The
+/// mock therefore advertises the sound contract and serves the SAME scripted
+/// expectations through both methods; each plumbing test engages the gate.
+impl GpuCrownBackward for ScriptedGraphGpuEngine {
+    fn crown_backward_gpu(
+        &self,
+        layers: &[GpuCrownLayer],
+        spec: &[f32],
+        num_specs: usize,
+        input_lower: &[f32],
+        input_upper: &[f32],
+    ) -> Result<GpuCrownResult> {
+        self.scripted_dispatch(layers, spec, num_specs, input_lower, input_upper)
+    }
+    fn crown_backward_gpu_sound(
+        &self,
+        layers: &[GpuCrownLayer],
+        spec: &[f32],
+        num_specs: usize,
+        input_lower: &[f32],
+        input_upper: &[f32],
+    ) -> Result<GpuCrownResult> {
+        self.scripted_dispatch(layers, spec, num_specs, input_lower, input_upper)
+    }
+    fn provides_sound_gpu_crown(&self) -> bool {
+        true
+    }
+}
+
 /// Verify structural soundness properties of GPU-returned bounds:
 /// (1) lower ≤ upper, (2) within IBP envelope, (3) distinguishable from CPU baseline.
 fn assert_gpu_bounds_sound(
@@ -320,12 +353,14 @@ fn assert_gpu_bounds_sound(
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_ibp_dag_sequential_graph_uses_gpu_partial_fast_path_3599() {
-    // This test exercises the FAST (unsound f32) GPU CROWN partial backward,
-    // which the process-global soundness gate masks by default — hold the
-    // shared gate lock (it sets the gate OFF) instead of depending on another
-    // gate test having leaked an OFF state (lock order: gate → env budget,
-    // same as gpu_partial_oracle).
+    // Hold the shared gate lock (lock order: gate → env budget, same as
+    // gpu_partial_oracle) and ENGAGE the gate: #crown-partial-sound-forward
+    // made the CROWN-IBP partial route refuse the fast unsound backward, so the
+    // GPU plumbing under test is reachable only through the SOUND resident
+    // method of a sound-advertising engine (the mock serves the same script
+    // through both).
     let _gate = sound_gpu_gate::test_lock::lock_gate();
+    set_sound_gpu_crown_required(true);
     tests::with_crown_dense_budget_mb("2048", || {
         let (graph, input) = build_two_linear_relu_graph();
         let baseline = graph
@@ -354,11 +389,54 @@ fn test_crown_ibp_dag_sequential_graph_uses_gpu_partial_fast_path_3599() {
         );
         scripted.assert_all_consumed();
 
+        // TOLERANCE 1e-6 -> 3e-6 (#linear-ibp-higham). NOT a re-baseline: the two
+        // sides are two DIFFERENT certified routes, and the abssum certificate made
+        // the (always present) route difference bigger than the old pin.
+        //
+        // `baseline` runs `engine = None`, so each Linear node bound comes from
+        // `propagate_ibp_1d` — the rank-1 route, which accumulates its dots in f64
+        // and charges the f64 twin `gamma^f64_{n+2}*S_safe + 2*u64*|y|`.
+        // `with_engine` threads a `GemmEngine`, so the same nodes come from
+        // `propagate_ibp_via_gemm` — f32 GEMMs charging
+        // `gamma^f32_{n+2}*S_safe + 2*u32*|y|` (`widen_linear_ibp_higham`) plus the
+        // historical `in_features + 2` ULP margin. BOTH ROUTES ARE CERTIFIED; they
+        // are certified at different PRECISIONS by construction, and
+        // `crown_single::gamma_n_f32`'s own docstring puts that ratio at ~2^29.
+        // This gap is therefore not GEMM summation order: the forward discrepancy
+        // alone is bounded by `gamma^f32_4*S + u32*|y| = 3.22e-7` (~2.7 ULPs).
+        //
+        // Derivation on this fixture (l1 row 1: |W| = [0.5, 1.0, 0.7] against
+        // xmax = 0.5 gives S = 1.1; y_upper = 1.0 and |y| <= 1.2; n = 3):
+        //   engine:   err = up(gamma^f32_5*S_safe + 2*u32*|y|)
+        //                 = 2.980e-7*1.1000009 + 2*5.9605e-8*1.2 = 4.709e-7,
+        //             then <=0.5 ulp for the round-to-nearest add, 1 ulp for
+        //             `next_up_f32`, and 5 ulp for the n+2 charge
+        //                 -> <= 4.709e-7 + 6.5*ulp(1.0) = 1.246e-6
+        //   baseline: gamma^f64_5*S + 2*u64*|y| ~ 9e-16, then the guarded
+        //             `next_up_f32(x as f32)` -> <= 1.5*ulp(1.0) = 1.789e-7
+        //   forward:  <= 3.22e-7 (above)
+        // Per-element ceiling 1.746e-6. OBSERVED max 1.0728836e-6, which is exactly
+        // 9*ulp(1.0) = 9*1.1920929e-7 (upper[1]: 1.0000012 against 1.0000001).
+        // 3e-6 is 1.7x the ceiling and 2.8x the observed gap; the headroom over
+        // "ceiling + a bit" covers the CROWN half of `intersection_per_element`
+        // (network/ibp/crown_ibp.rs) — these node bounds are min/max of the IBP and
+        // CROWN boxes, and only the IBP half is derived above.
+        //
+        // STILL CAUGHT: any route or plumbing change at these nodes above ~25 ULPs
+        // at unit scale, which is what this test guards (the scripted l2 GPU result
+        // must not leak backwards into l1/relu). NOT CAUGHT: dropping the abssum
+        // certificate from the f32 route — that moves the two boxes CLOSER (the gap
+        // falls to the bare n+2 = 5 ULP charge minus the baseline's 1 ULP cast,
+        // ~4*ulp(1.0) = 4.77e-7), so no |diff| <= tol assertion here can pin it in
+        // either direction. The certificate's own pins are the enclosure tests in
+        // `layers/linear/ibp.rs`
+        // (`engine_linear_ibp_encloses_true_value_under_catastrophic_cancellation`
+        // and its siblings).
         for name in ["l1", "relu"] {
             assert_bounded_tensor_close(
                 node_bounds(&with_engine.bounds, name),
                 node_bounds(&baseline.bounds, name),
-                1e-6,
+                3e-6,
                 "sequential graph GPU partial fast path non-output node",
             );
         }
@@ -393,7 +471,7 @@ fn test_crown_ibp_dag_sequential_graph_uses_gpu_partial_fast_path_3599() {
 }
 
 // ---------------------------------------------------------------------------
-// Fork-join DAG: per-node GPU engine threading (#4023 item 2)
+// Fork-join DAG: per-node GPU engine threading
 // ---------------------------------------------------------------------------
 
 /// Build a diamond DAG that is NOT a sequential chain:
@@ -470,7 +548,7 @@ fn build_diamond_dag() -> (GraphNetwork, BoundedTensor) {
     (graph, input)
 }
 
-/// #4023 item 2: verify that a fork-join (diamond) DAG threads the GemmEngine
+/// Verify that a fork-join (diamond) DAG threads the GemmEngine
 /// through per-node CROWN-IBP backward passes.
 ///
 /// Unlike the sequential-graph test above, this DAG cannot use the

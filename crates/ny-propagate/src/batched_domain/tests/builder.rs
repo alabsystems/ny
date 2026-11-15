@@ -104,7 +104,7 @@ fn test_batched_domains_builder_multiple() {
     assert_eq!(batched.input_lowers().as_array().shape(), &[3, 2]);
 
     // Check constraints (4-tuple format: name, idx, is_active, split_point)
-    assert!(batched.constraints()[0].is_empty());
+    assert_eq!((batched.constraints()[0]).len(), 0);
     assert_eq!(
         batched.constraints()[1],
         vec![("relu0".to_string(), 1, false, None)]
@@ -167,7 +167,7 @@ fn test_batched_domains_builder_missing_layer_bounds_errors() {
     assert!(result.is_err());
 }
 
-// --- Builder rejects non-finite layer/input tensors (#3115) ---
+// --- Builder rejects non-finite layer/input tensors ---
 
 #[ntest::timeout(5000)]
 #[test]

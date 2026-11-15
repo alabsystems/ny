@@ -1,0 +1,16 @@
+# search_kernels.manifest — WRITTEN by scripts/build_search_kernels.sh; do not
+# edit by hand. Checked by ny-cuda's manifest ratchet
+# (search_kernel_manifest_matches_the_committed_sources).
+format=2
+source=fd_search.cu
+source_sha256=3258d818fdb656f9dd0aa2fcce3c9794c040a67670f2c340775f42cbe3229167
+image=fd_search.fatbin
+image_sha256=08fe9aa0bab1604df67f9a78d96d028975b3a3e36b27a6c0017b521fdc606480
+kernels=fd_level_warm,fd_compact,fd_level_points,fd_level_finish,fd_math_kat
+wave_source=wave_search.cu
+wave_source_sha256=59364ac081a714b746c985cc9fdca2d6004bf09fe4370d23eb2c090e9cfad6eb
+wave_image=wave_search.fatbin
+wave_image_sha256=21a55beae32c06ee01b50048aefb086a00364eb3c5cd61e53145aaa4e40232e8
+wave_kernels=wave_init,wave_backward,wave_concretize,wave_forward,wave_adam,wave_babsr
+nvcc=Cuda compilation tools, release 13.0, V13.0.88
+flags=-std=c++17 --fatbin --fmad=false --ftz=false --prec-div=true --prec-sqrt=true -gencode arch=compute_86,code=sm_86 -gencode arch=compute_121,code=sm_121 -gencode arch=compute_80,code=compute_80

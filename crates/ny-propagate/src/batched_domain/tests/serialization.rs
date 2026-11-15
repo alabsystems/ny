@@ -651,7 +651,7 @@ fn test_constraint_serialization_range_splits_flatten() {
     );
 }
 
-/// Regression test for #2248: serialize_constraints must return an error when
+/// Regression test: serialize_constraints must return an error when
 /// split_count is too low and constraints would be silently dropped.
 #[ntest::timeout(5000)]
 #[test]

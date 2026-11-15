@@ -8,7 +8,7 @@
 //! tensor shape structure throughout propagation. Essential for transformer models
 //! where operations like attention have cross-position interactions.
 //!
-//! Phase 4 (#2613): Uses `BatchedCrownBounds` to support Patches mode for CNN DAGs.
+//! Phase 4: Uses `BatchedCrownBounds` to support Patches mode for CNN DAGs.
 //! Conv2d layers stay in sparse Patches representation; other layers ensure Dense.
 
 use std::borrow::Cow;
@@ -127,7 +127,7 @@ impl GraphNetwork {
     /// batched backward dispatch. Layers opt in incrementally; today the graph
     /// loop can use it for Linear and Conv2d batched CROWN paths.
     ///
-    /// Phase 3 (#4297): Uses `CrownDispatchPlan` for Vec-indexed node access
+    /// Phase 3: Uses `CrownDispatchPlan` for Vec-indexed node access
     /// and `BatchedCrownAccumulator` for Vec-indexed bounds storage, eliminating
     /// HashMap lookups from the hot backward loop.
     fn propagate_crown_batched_inner(
@@ -139,6 +139,8 @@ impl GraphNetwork {
         engine: Option<&dyn GemmEngine>,
         mut attention_runtime: AttentionCompositionRuntime<'_>,
     ) -> Result<CrownBackwardResult> {
+        self.ensure_proof_eligible()?;
+        attention_runtime.begin_query(self, deadline);
         if self.nodes.is_empty() {
             return Ok(CrownBackwardResult {
                 bounds: input.clone(),
@@ -146,7 +148,7 @@ impl GraphNetwork {
             });
         }
 
-        // Get dispatch plan for indexed access (#4297).
+        // Get dispatch plan for indexed access.
         let plan = self.dispatch_plan()?;
 
         if deadline.is_some_and(|d| Instant::now() >= d) {
@@ -212,7 +214,7 @@ impl GraphNetwork {
 
         let has_conv2d = plan.has_conv2d;
 
-        // Determine output node and shape via dispatch plan (#4297).
+        // Determine output node and shape via dispatch plan.
         let output_node_name = plan.name_of(plan.output_node_idx);
 
         let output_bounds = node_bounds.get(output_node_name).ok_or_else(|| {
@@ -246,9 +248,9 @@ impl GraphNetwork {
         );
 
         // Step 2: Initialize batched linear bounds per node.
-        // Phase 4 (#2613): Use BatchedCrownBounds to support Patches mode for CNN DAGs.
+        // Phase 4: Use BatchedCrownBounds to support Patches mode for CNN DAGs.
         // When the output is 3D spatial with Conv2d layers, start in Patches mode.
-        // Phase 3 (#4297): Use BatchedCrownAccumulator for Vec-indexed storage.
+        // Phase 3: Use BatchedCrownAccumulator for Vec-indexed storage.
         let mut node_linear_bounds = BatchedCrownAccumulator::new_with_deadline(plan, deadline);
 
         let initial_bounds = if output_shape.len() == 3 && has_conv2d {
@@ -278,7 +280,7 @@ impl GraphNetwork {
                 };
             BatchedCrownBounds::Patches(Box::new(seed))
         } else {
-            // Guard: check CPU dense budget before allocating batched identity (#3550).
+            // Guard: check CPU dense budget before allocating batched identity.
             check_batched_identity_budget(
                 "GraphNetwork::propagate_crown_batched",
                 &batched_output_shape,
@@ -288,10 +290,10 @@ impl GraphNetwork {
         let initial_bounds_mem = initial_bounds.memory_bytes();
         node_linear_bounds.insert(output_node_name, initial_bounds);
 
-        // Track peak memory across all live bounds for Patches diagnostics (#2613).
+        // Track peak memory across all live bounds for Patches diagnostics.
         let mut peak_memory_bytes: usize = initial_bounds_mem;
 
-        // Pre-build node lookup vector (#4297) — no HashMap access in hot loop.
+        // Pre-build node lookup vector — no HashMap access in hot loop.
         let nodes_by_idx: Vec<&_> = plan
             .exec_order
             .iter()
@@ -302,11 +304,11 @@ impl GraphNetwork {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        // Step 3: Propagate backward through nodes in reverse order (#4297: index-based).
+        // Step 3: Propagate backward through nodes in reverse order (index-based).
         for &idx in plan.reverse_order.iter() {
             let node_name = plan.name_of(idx);
 
-            // Deadline check at each node in the backward loop (#3398).
+            // Deadline check at each node in the backward loop.
             // If exceeded, fall back to IBP which is always sound.
             if let Some(d) = deadline {
                 if Instant::now() >= d {
@@ -323,7 +325,7 @@ impl GraphNetwork {
                 }
             }
 
-            // Direct Vec-indexed node lookup (#4297) — no HashMap access.
+            // Direct Vec-indexed node lookup — no HashMap access.
             let node = nodes_by_idx[idx];
 
             // Get this node's accumulated bounds via direct index (#4297).
@@ -344,9 +346,9 @@ impl GraphNetwork {
             // input is used for Patches dispatch and the shared core; multi-input
             // nodes skip Patches (guarded by node.inputs.len() == 1 in
             // try_conv2d_patches_or_dense) and their handlers resolve their own
-            // inputs. Fix: #4136 (regression from #4097 tightening
-            // require_unary_input to reject multi-input). Mirrors #4113 fix in
-            // DAG-CROWN (graph_crown/propagation.rs:360-385).
+            // inputs. This fixes a regression from tightening require_unary_input
+            // to reject multi-input, and mirrors the same fix in DAG-CROWN
+            // (graph_crown/propagation.rs:360-385).
             let first_input_idx = plan.first_input_idx(idx);
             let first_input = plan.name_of(first_input_idx);
             let pre_activation = if plan.is_network_input(first_input_idx) {
@@ -360,7 +362,7 @@ impl GraphNetwork {
                 })?
             };
 
-            // Phase 4 Conv2d Patches fast-path (#2613) or Dense conversion.
+            // Phase 4 Conv2d Patches fast-path or Dense conversion.
             let node_lb = match Self::try_conv2d_patches_or_dense(
                 node_bcb,
                 &node.layer,
@@ -379,6 +381,12 @@ impl GraphNetwork {
                 PatchesDispatchResult::PartialFallback(result) => return Ok(*result),
                 PatchesDispatchResult::DenseBounds(lb) => *lb,
             };
+
+            // A global authored Flatten changes only storage metadata. Remove
+            // singleton carrier prefixes so grouped nonlinear operators retain
+            // their ORIGINAL groups instead of treating all cells as one row.
+            let node_lb =
+                dispatch::remap_global_flatten_batched(&node.layer, node_lb, pre_activation)?;
 
             // Keep binary/special graph operators local; delegate all unary dispatch to Layer.
             let special_dispatch = self.dispatch_special_batched_operator(
@@ -408,10 +416,13 @@ impl GraphNetwork {
             }
 
             // All non-binary layers: delegate to dispatch_batched_unary for
-            // unary trait dispatch. Exhaustive — no catch-all (#3424).
+            // unary trait dispatch. Exhaustive — no catch-all.
             //
             // Elementwise activations:
             match &node.layer {
+                Layer::PointLinear(_) => {
+                    return Err(crate::network::proof_eligibility::diagnostic_only());
+                }
                 Layer::ReLU(_) | Layer::GELU(_) | Layer::SiLU(_) | Layer::Tanh(_)
                 | Layer::Sigmoid(_) | Layer::Erf(_) | Layer::Exp(_) | Layer::Log(_) | Layer::Sqrt(_)
                 | Layer::Reciprocal(_) | Layer::Softplus(_) | Layer::HardSwish(_)
@@ -461,7 +472,7 @@ impl GraphNetwork {
                 | Layer::RoPE(_)
                 // Binary ops without explicit batched handler (dispatch_batched_unary
                 // handles via propagate_crown_backward_batched → partial CROWN fallback):
-                | Layer::Sub(_) | Layer::Div(_) | Layer::Atan2(_) | Layer::Concat(_)
+                | Layer::Add(_) | Layer::Sub(_) | Layer::Div(_) | Layer::Atan2(_) | Layer::Concat(_)
                 | Layer::MinBinary(_)
                 | Layer::MaxBinary(_) | Layer::Where(_)
                 // Comparison:
@@ -489,7 +500,6 @@ impl GraphNetwork {
                     }
                 }
                 Layer::ExpandLikeLastAxis(_)
-                | Layer::Add(_)
                 | Layer::MatMul(_)
                 | Layer::MulBinary(_)
                 | Layer::BilinearCrown(_) => unreachable!(
@@ -555,7 +565,7 @@ impl GraphNetwork {
         // endpoint publication, and final scans under the same authority.
         let crown_output =
             final_bounds.concretize_sound_with_deadline(input_for_concretize.as_ref(), deadline)?;
-        // Post-concretization tightening with provenance — matches graph CROWN (#4240, #4242).
+        // Post-concretization tightening with provenance — matches graph CROWN.
         let (tightened_output, provenance) = tighten_crown_output_with_provenance_and_deadline(
             crown_output,
             output_bounds,

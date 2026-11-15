@@ -673,13 +673,13 @@ fn retargeting_moves_only_the_gates_and_shares_the_weight_arcs() {
 /// every slot here. That is a property of the lane, not a gap in the test — and
 /// the coefficient egress ignores the box entirely by contract, because the
 /// LANE concretizes.
-#[cfg(feature = "gpu-tests")]
+#[cfg(feature = "gpu-tests-uncharged")]
 #[test]
 fn gpu_batched_domains_match_the_one_at_a_time_seam_on_device() {
     use crate::margin_row::gpu_seam::run_pass_armed;
 
     let device = ny_gpu::WgpuDevice::new_for_verdict(ny_gpu::WgpuVerdictRequest::new())
-        .expect("gpu-tests requires a WGPU device passing all five authority rungs");
+        .expect("gpu-tests-uncharged requires an adapter passing the UNCHARGED five-rung ladder (subnormal-preserving, EFT-exact: measured on Vulkan+DenormPreserve); a pure-flush adapter (Apple/Metal) refuses by hardware");
     crate::sound_gpu_gate::set_sound_gpu_crown_required(true);
     let shared: Arc<dyn ny_core::GemmEngine> = Arc::new(device);
     crate::sound_gpu_gate::set_sound_gpu_crown_factory(move || Some(shared.clone()));

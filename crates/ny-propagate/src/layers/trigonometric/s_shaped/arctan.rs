@@ -33,10 +33,10 @@ impl ArctanLayer {
     }
 }
 
-/// Directed rounding: compute in f64, apply next_down/next_up. (#3245)
+/// Directed rounding: compute in f64, apply next_down/next_up.
 fn arctan_bound_interval(l: f32, u: f32) -> (f32, f32) {
     // Range clamp: -π/2 < arctan(x) < π/2 for all finite x. Directed rounding can
-    // push past ±π/2 for extreme inputs. (#3316)
+    // push past ±π/2 for extreme inputs.
     (
         next_down_f32((l as f64).atan() as f32).max(-std::f32::consts::FRAC_PI_2),
         next_up_f32((u as f64).atan() as f32).min(std::f32::consts::FRAC_PI_2),
@@ -130,7 +130,6 @@ impl ArctanLayer {
     }
 
     /// Patches CROWN backward propagation with pre-activation bounds.
-    /// Part of #2613 Phase 2: generic activation Patches support.
     pub(crate) fn propagate_patches_with_bounds(
         &self,
         bounds: &crate::bounds::patches::PatchesLinearBounds,

@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! The SafeNLP full-cycle measurement master arm (#safenlp-cycle).
+//! SafeNLP cycle policy: global false, category-selected true (#safenlp-cycle).
 
 use crate::{
     declare_levers, Bucket, DefaultSpec, LeverDecl, LeverKind, MoatRisk, Provenance, ReaderSite,
@@ -27,8 +27,8 @@ const SAFENLP_CYCLE_READERS: &[ReaderSite] = &[ReaderSite {
 declare_levers! {
     registry SAFENLP_CYCLE_LEVERS;
 
-    /// `NY_SAFENLP_MIP_CYCLE` — exact-`"1"` master arm for the SafeNLP
-    /// full-cycle A/B (docs/SAFENLP_CYCLE_2026-08-20.md). Ships DARK.
+    /// `NY_SAFENLP_MIP_CYCLE` — global-off SafeNLP cycle policy.
+    /// The SafeNLP2024 category selects true through its typed preset key.
     pub SAFENLP_MIP_CYCLE = LeverDecl {
         name: "NY_SAFENLP_MIP_CYCLE",
         kind: LeverKind::Bool,
@@ -36,33 +36,29 @@ declare_levers! {
         bucket: Bucket::Debug,
         moat: MoatRisk::High,
         doc: "\
-Arms the SafeNLP FULL-CYCLE set (docs/SAFENLP_CYCLE_2026-08-20.md) as one \
-composed measurement lever over four existing pieces, none of which fires on \
-its own default: (1) the MIP-handoff budget treatment arms (the same schedule \
-the shared-prefix experiment variable arms), so the sequential reduced- \
-verification lane receives a real BaB deadline and the planned MIP handoff is \
-actually made; (2) the handoff is CONDITIONAL — the phase ledger keeps BaB's \
-historical half-total floor instead of the enforce_mip_handoff floor-drop that \
-cut BaB to ~4.5 s on every row, and the MIP fires only in the remaining \
-reserved wall where the historical schedule ran nothing; (3) the AY margin \
-reframe arms (the unique unsafe row is marked, so the pinned ay-milp solves \
-the margin objective whose threshold-stop banks UNSAT on a strict bound \
-crossing with original-model proof replay — the only handoff shape whose dual \
-bound moves on this class, docs/SAFENLP_AY_ARC_2026-08-20.md section 5.1); \
-(4) the sequential MIP defaults to the SERIAL one-model solve.
+Selects the retained SafeNLP cycle policies through the typed \
+`bab.safenlp_mip_cycle` key or the existing exact-one environment override. \
+The declaration remains false globally; the owner-authorized SafeNLP2024 \
+category selects true and separately selects `general.complete_verifier:mip`. \
+The cycle flag alone is not a complete-verifier selector.
 
-Verdict authority is unchanged on every arm: the reframe maps back to the \
-original feasibility model and passes the existing witness/Farkas replay \
-gate, and the budget arms only move deadlines inside the scored wall. High \
-risk because converting safenlp timeouts is its stated purpose and the \
-handoff changes how every safenlp row's wall clock is spent.",
+The retained pieces are (1) MIP-handoff budget arming where a BaB phase is \
+used; (2) its conditional historical BaB floor; (3) marked-margin AY reframing \
+with original-model witness/certificate replay; and (4) the serial one-model \
+sequential MIP default. The August design history remains in \
+docs/SAFENLP_CYCLE_2026-08-20.md. Direct MIP and independently checked native \
+root proofs retain their distinct verdict ownership and original-model gates.
+
+All budgets remain inside the original instance clock. The category policy \
+is owner-authorized, not evidence of matched performance, broad nonregression \
+or points. High risk because changing the selected prover and schedule can \
+change which rows finish within their budget.",
         provenance: Provenance::Unmeasured {
-            why_ok: "default-dark exact-one gate; the pre-registered A/B \
-                     (docs/SAFENLP_CYCLE_2026-08-20.md: 3 failing rows x 20 s official, \
-                     3 runs/arm, moat 6 banked unsats + 3 sats) has not run yet. \
-                     Engagement observables are pre-declared: the [safenlp-cycle] \
-                     armed line, safenlp_mip_cycle= in [budget] telemetry, and the \
-                     marked-margin session markers",
+            why_ok: "global false with a scoped owner-authorized SafeNLP2024 true \
+                     preset; every verdict still requires its unchanged original \
+                     witness/certificate or native-proof publication guard. Route \
+                     markers record engagement, not matched benefit or authority. \
+                     No performance or broad nonregression claim is made here",
         },
         owner: SAFENLP_CYCLE_SCOPE,
         readers: SAFENLP_CYCLE_READERS,

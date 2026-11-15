@@ -78,6 +78,7 @@ pub(crate) fn delta_pre_nodes_unknown() -> Vec<String> {
 // Re-export all public types to preserve `crate::beta_crown::domain::*` paths.
 pub use context::{
     DomainProcessingConfig, GraphCrownContext, GraphPrecomputedBounds, MultiObjectiveTargets,
+    SharedGraphBootstrap,
 };
 pub use graph::GraphBabDomain;
 pub use multi_objective::{MultiObjectiveGraphBabDomain, ObjectiveAggregation};

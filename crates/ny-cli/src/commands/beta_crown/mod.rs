@@ -17,6 +17,9 @@
 #[cfg(feature = "mip")]
 mod affine_invprop;
 pub(crate) mod attack_arming;
+/// #attack-concurrent: the verifier's upfront PGD raced against the proof
+/// (typed `attack.concurrent`, dark by default).
+pub(crate) mod attack_concurrent;
 #[cfg(feature = "mip")]
 mod ay_tail_authority;
 pub(crate) mod best_margin_export;
@@ -24,8 +27,6 @@ pub(crate) mod branching;
 mod build_batch_size;
 mod cell_enum;
 mod cert_adapter;
-#[cfg(feature = "mip")]
-mod cgan_input_leaf;
 mod cnf_route;
 pub(crate) mod constraint_eval;
 pub(crate) mod constraint_plan;
@@ -45,6 +46,7 @@ mod graph_mip_fold;
 mod graph_mip_joint_relu_cuts;
 #[cfg(feature = "mip")]
 mod graph_mip_leaf;
+pub(crate) mod qdq_probe;
 #[cfg(feature = "mip")]
 pub(crate) use graph_mip_leaf::relational_edge_milp_oracle;
 #[cfg(feature = "mip")]
@@ -59,11 +61,31 @@ mod mip_highs;
 mod mip_preprocess;
 #[cfg(feature = "mip")]
 mod mip_single_hidden;
+#[cfg(feature = "mip")]
+mod mip_sound_intermediate_bounds;
 mod model_load;
 mod output;
+/// #admission-precision: THE extractor of a property's routing shape (the
+/// lanes' route checks and the router's start-time read call the same one).
+pub(crate) mod spec_shape;
+// #vit-margin-alpha-complex (P8): the ONNX Runtime forward that adjudicates a
+// root-terminal multi-objective `Verified`. Attached only when
+// `bab.mo_root_ort_adjudication` is armed; downgrade-only.
+mod root_ort_adjudication;
 mod routing;
 #[cfg(feature = "mip")]
 pub(crate) mod sign_space_falsify;
+// #hull-root / #hull-bab (wave-6 C4): certified single-hidden-layer
+// per-neuron hull root bound, and the ReLU-split tree over it, for the
+// sequential relational lane. Inert unless `bab.single_hidden_hull: root|bab`
+// is armed.
+#[cfg(feature = "mip")]
+mod single_hidden_hull;
+// #relusplitter-lp-refine (wave-6 C7): the rigorous LP root intermediate
+// refiner attached by `dispatch.rs`. Inert unless
+// `bab.mip_refine_intermediates` is armed.
+#[cfg(feature = "mip")]
+mod lp_refine_interm;
 // Reachable from dispatch only through `star_candidate::run_dark_star_probe`, which is
 // inert unless an operator arms `NY_STAR_DARK_SECONDS` and cannot emit a verdict.
 #[cfg(feature = "mip")]
@@ -96,15 +118,64 @@ mod mip_highs {
         );
     }
 }
+#[cfg(feature = "mip")]
+pub(crate) mod hull_publication;
+mod verification_outcome;
 mod verify;
+
+/// #attack-open-disjuncts entry hook for `vnncomp::run_and_translate`: arm the
+/// margin-row lane's certified-root publication (before any lane can start)
+/// and print the stage's `phase=entry` receipt. A dark policy
+/// (`restrict: false`) does nothing.
+pub(crate) fn arm_open_disjunct_attack(policy: ny_propagate::OpenDisjunctAttackConfig) {
+    verify::attack_open_disjuncts::arm_open_disjunct_attack(policy);
+}
 
 // Re-export the in-process verdict-capture API so the native `vnncomp` subcommand
 // can drive `handle_beta_crown_command` and read the rendered competition JSON
 // without shelling out to a second `ny` process.
+#[cfg(all(test, feature = "mip"))]
+pub(crate) use mip_highs::test_mip_publication_receipt;
+#[cfg(feature = "mip")]
+pub(crate) use mip_highs::MipUnsatPublication;
+
 pub(crate) use output::{
-    begin_capture, end_capture, take_captured_deadline_plan, take_captured_json,
-    take_captured_terminal_ingress, CapturedDeadlinePlan, CapturedTerminalIngress,
+    begin_capture, end_capture, take_captured_deadline_plan, take_captured_terminal_ingress,
+    take_captured_verification, CapturedDeadlinePlan, CapturedTerminalIngress,
+    CapturedVerification,
 };
+
+/// Run the cell-enumeration driver over an explicitly supplied graph and
+/// input box (#cctsdb-subbox).
+///
+/// The ordinary caller is `dispatch`, which reaches the driver only once a
+/// model has loaded through the normal pipeline. The sub-box disjunction has
+/// neither — it holds a graph it built itself from an authenticated proto
+/// rewrite, and a TIGHTENED CLONE of the spec's input bounds standing for one
+/// sub-box (`cell_enum::detect` reads `vnnlib.input_bounds` directly and
+/// refuses any per-clause box, so a clone is the only way to express one).
+/// Behaviour is otherwise identical, `NY_NO_CELL_ENUM=1` included.
+pub(crate) fn cell_enumeration_verdict(
+    graph: &ny_propagate::GraphNetwork,
+    input_shape: &[usize],
+    vnnlib: &ny_onnx::vnnlib::VnnLibSpec,
+    deadline: Option<std::time::Instant>,
+) -> Option<BetaCrownResult> {
+    let model = BetaCrownModel::Graph(Box::new(graph.clone()));
+    cell_enum::try_cell_enumeration(&model, input_shape, vnnlib, deadline)
+}
+
+/// Sound f64 safety decision for one fully pinned input point
+/// (#cctsdb-subbox). Delegates to the cell driver's own per-cell step so both
+/// paths share one definition of "definitely safe".
+pub(crate) fn f64_point_definitely_safe(
+    graph: &ny_propagate::GraphNetwork,
+    input_shape: &[usize],
+    values: &[f64],
+    vnnlib: &ny_onnx::vnnlib::VnnLibSpec,
+) -> Option<bool> {
+    cell_enum::f64_point_definitely_safe(graph, input_shape, values, vnnlib)
+}
 
 /// Run the explicit-path Pensieve fractional-head diagnostic.
 pub(crate) fn run_pensieve_fastpath_gap_research(
@@ -240,6 +311,7 @@ pub(crate) fn run_graph_mip_research(
 }
 
 use anyhow::Result;
+use ny_core::proof_profile::ResolvedProofProfile;
 use ny_core::GemmEngine;
 use ny_propagate::{
     BabVerificationStatus, BetaCrownConfig, BetaCrownResult, BranchingHeuristic,
@@ -252,6 +324,7 @@ use tracing::{info, warn};
 use crate::preset;
 
 use self::attack_arming::{shared_wgpu_attack_steering, AttackEngineSource, AttackSteering};
+pub(crate) use self::attack_concurrent::{ConcurrentSatPublication, ConcurrentSatReport};
 use self::dispatch::{run_bab_with_fallback, run_mip_only, DispatchContext};
 use self::inputs::{check_needs_squeeze, create_input_bounds};
 use self::invprop::{maybe_enable_invprop, maybe_set_alpha_output_constraints};
@@ -729,22 +802,34 @@ fn peek_property_input_summary(property: Option<&std::path::Path>) -> Option<Pro
 /// the (already very large) positional argument list of
 /// [`handle_beta_crown_command`] grows by one parameter, not three.
 ///
+/// #soundness-spine M2a: the old `competition_mode: bool` is replaced by the
+/// frozen [`ResolvedProofProfile`] the ENTRY POINT resolved (`ny vnncomp v1` →
+/// Competition, every other subcommand → Proof, `--proof-profile` overrides).
+/// The profile selects ONLY sinks (whether a certificate sidecar is written)
+/// and audit rates; it never reaches certification.
+///
 /// SOUNDNESS: requesting certificate emission can conservatively withhold a
 /// `Verified` verdict from an optimization whose proof is not representable by
-/// the current external certificate format. It can never create or strengthen
-/// a verdict. The float-soundness posture (f64 intermediates, directed rounding,
-/// conservative verdict translation) is baseline and is NEVER gated by these
-/// options.
+/// the current external certificate format — but ONLY under an explicit
+/// `--require-certificate`. Without it, both profiles publish every verdict
+/// the lanes certified at runtime and record `artifact=none` when no sidecar
+/// can be written (before M2 the Proof default REFUSED those verdicts, which
+/// made proof mode weaker, not only slower). Nothing here can create or
+/// strengthen a verdict. The float-soundness posture (f64 intermediates,
+/// directed rounding, conservative verdict translation) is baseline and is
+/// NEVER gated by these options.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ProofOpts {
-    /// Competition mode: maximise verify-rate within the wall-clock budget by
-    /// turning OFF certificate emission and internal self-checks. Default
-    /// `false` (proof features ON). The VNN-COMP scored entry point sets this
-    /// `true`; interactive `ny beta-crown` keeps it `false`.
-    pub competition_mode: bool,
+    /// The entry point's frozen proof profile (sinks and audit rates only).
+    pub profile: ResolvedProofProfile,
+    /// `--require-certificate`: refuse (`unknown`) any verdict whose proof
+    /// the external certificate format cannot represent. The ONLY switch that
+    /// makes certificate authority verdict-bearing; off by default in both
+    /// profiles.
+    pub require_certificate: bool,
     /// Explicit certificate-emission override. `None` means "auto" — emit a
-    /// certificate iff NOT in competition mode. `Some(true)` / `Some(false)`
-    /// force emission on / off regardless of `competition_mode`.
+    /// certificate iff the profile writes artifacts (Proof). `Some(true)` /
+    /// `Some(false)` force emission on / off regardless of the profile.
     pub emit_certificate: Option<bool>,
     /// Destination for the certificate sidecar. `None` uses the default path
     /// (`<model-stem>.cert.json` alongside the model).
@@ -766,19 +851,24 @@ impl ProofOpts {
     }
 
     /// Whether a proof-carrying certificate should be emitted for a `Verified`
-    /// verdict, resolving the `emit_certificate` override against
-    /// `competition_mode`.
+    /// verdict: a required certificate always is; otherwise the explicit
+    /// override, else the profile's sink choice.
     pub(crate) fn should_emit_certificate(&self) -> bool {
-        self.emit_certificate.unwrap_or(!self.competition_mode)
+        self.require_certificate
+            || self
+                .emit_certificate
+                .unwrap_or(self.profile.mode.writes_artifacts())
     }
 
-    /// Resolve the frontend artifact policy into the verifier's typed authority.
+    /// Resolve the verifier's typed artifact authority.
     ///
-    /// The mapping is exact: every request that can reach certificate emission
-    /// carries `CertificateExport`; competition/explicit no-certificate runs
-    /// carry `VerdictOnly`.
+    /// #soundness-spine M2a: `CertificateExport` (which makes lanes whose
+    /// proof the exporter cannot represent REFUSE their verdict) is selected
+    /// ONLY by `--require-certificate`. The profile does not reach it: both
+    /// profiles run the identical verdict path, and a Proof run that cannot
+    /// export records `artifact=none` instead of refusing.
     pub(crate) fn verification_artifact_authority(&self) -> VerificationArtifactAuthority {
-        if self.should_emit_certificate() {
+        if self.require_certificate {
             VerificationArtifactAuthority::CertificateExport
         } else {
             VerificationArtifactAuthority::VerdictOnly
@@ -859,9 +949,22 @@ impl BetaCrownPresetSnapshot {
 /// has already been resolved.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BetaCrownInstanceOverrides {
+    /// Private original-model/singleton adapter carrier. A generic numerical
+    /// result cannot publish through the legacy door after consuming it.
+    pub(crate) input_head_continuation:
+        Option<Arc<super::safenlp_input_head::BoundInputHeadContinuation>>,
+    /// Optional already-started participating resource owner. Concurrent and
+    /// nested callers clone this exact owner, never its allowance. Loaded
+    /// models and legacy engine work remain outside the current census.
+    #[cfg(feature = "mip")]
+    pub(crate) verification_resources: Option<hull_publication::CallerVerificationResources>,
     /// Exact receipt-owning authority for this scored run. Interactive calls
     /// retain `None` and use the compatibility freeze boundary.
     pub(crate) frozen_levers: Option<Arc<ny_levers::LeverSet>>,
+    /// One instance-owned attempt, shared across all graph/config clones.
+    pub(crate) certified_root_cut_enabled: Option<bool>,
+    pub(crate) certified_root_cut_owner:
+        Option<Arc<ny_propagate::beta_crown::certified_root_cut::QueryOwner>>,
     /// Exact-VJP PGD policy resolved from VNN-COMP's entry-time frozen
     /// [`ny_levers::LeverSet`]. `None` identifies the interactive/compatibility
     /// route, which preserves the historical process-environment overlay at
@@ -893,34 +996,12 @@ pub(crate) struct BetaCrownInstanceOverrides {
     /// VNN-COMP's shared post-BaB/β-CROWN preset read. `None` keeps the
     /// interactive handler's historical path-based load.
     pub(crate) preset_snapshot: Option<BetaCrownPresetSnapshot>,
-    /// The in-process VNN-COMP router observed the exact direct-MIP-first gate
-    /// on a positive, short `safenlp_2024` scored budget. This is intent only:
-    /// dispatch still requires the exact model/property shape, AUTO policy, a
-    /// live bounded deadline, and the independent shared-prefix gate.
-    pub(crate) safenlp_direct_mip_first: bool,
-    /// The VNN-COMP router admitted the exact default-dark traffic-category
-    /// terminal-Softmax peel treatment. The loader still applies its existing
-    /// fail-closed all-constraints rewrite and records whether it actually
-    /// peeled a layer.
-    pub(crate) traffic_terminal_softmax_peel: bool,
-    /// Exact VNN-COMP category route for the default-dark imgSz32 cGAN input
-    /// leaf proof.  The typed variant can only be minted by the in-process
-    /// category router; the oracle independently authenticates the model,
-    /// property, normalized graph, and every requested objective row.
-    pub(crate) cgan_input_leaf_route: Option<CganInputLeafRoute>,
+    /// #attack-concurrent: the wrapper-only facts the concurrent attack lane's
+    /// admission needs (is the concurrent margin-row worker live?). `None`
+    /// (interactive calls) refuses every race as `publisher_unarmed`. Read
+    /// only by a race site whose `attack.concurrent` is armed.
+    pub(crate) attack_concurrent_wrapper: Option<attack_concurrent::ConcurrentAttackWrapperFacts>,
 }
-
-/// Category authority carried into the imgSz32 cGAN input-leaf attachment.
-///
-/// This intentionally has no string-bearing or generic variant. The router may
-/// map only an explicitly reviewed, byte-identical category allowlist onto this
-/// audited payload route; unrelated future cGAN categories cannot inherit it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CganInputLeafRoute {
-    Cgan2023,
-}
-
-pub(crate) use super::cgan_status::CGAN_DEPTH_TWO_PRODUCTION_MODE;
 
 fn resolve_preset_config(
     preset_path: Option<&std::path::Path>,
@@ -944,7 +1025,7 @@ fn resolve_preset_config(
 /// deliberately shorter inner timeout (for example, a reserved post-BaB
 /// attack slice). `None` plus a zero timeout preserves the interactive
 /// unbounded contract.
-fn resolve_overall_deadline(
+pub(super) fn resolve_overall_deadline(
     verification_start: std::time::Instant,
     configured_timeout: std::time::Duration,
     authoritative_deadline: Option<std::time::Instant>,
@@ -1014,6 +1095,66 @@ fn resolve_pgd_exact_vjp(
     }
 }
 
+fn select_certified_root_load_policy(
+    config: ny_onnx::OnnxLoadConfig,
+    enabled: bool,
+    explicit: bool,
+    backend_possible: bool,
+) -> ny_onnx::OnnxLoadConfig {
+    if enabled && !explicit && backend_possible {
+        config.with_batch_norm_folding_policy(
+            ny_onnx::BatchNormFoldingPolicy::StructuralCertifiedRoot,
+        )
+    } else {
+        config
+    }
+}
+
+#[cfg(test)]
+mod certified_root_policy_tests {
+    use super::*;
+    #[test]
+    fn frozen_default_rollback_and_explicit_loader_policy_have_one_precedence() {
+        use ny_onnx::BatchNormFoldingPolicy as P;
+        let default = ny_onnx::OnnxLoadConfig::default();
+        assert_eq!(
+            select_certified_root_load_policy(default.clone(), true, false, true)
+                .batch_norm_folding_policy(),
+            P::StructuralCertifiedRoot
+        );
+        assert_eq!(
+            select_certified_root_load_policy(default.clone(), false, false, true)
+                .batch_norm_folding_policy(),
+            P::LegacyEnvironment
+        );
+        assert_eq!(
+            select_certified_root_load_policy(default.clone(), true, true, true)
+                .batch_norm_folding_policy(),
+            P::LegacyEnvironment
+        );
+        let raw = ny_onnx::OnnxLoadConfig::default().certified_graph_lowering();
+        assert_eq!(
+            select_certified_root_load_policy(raw, false, true, false).batch_norm_folding_policy(),
+            P::PreserveRaw
+        );
+        assert_eq!(
+            select_certified_root_load_policy(default, true, false, false)
+                .batch_norm_folding_policy(),
+            P::LegacyEnvironment
+        );
+        assert!(resolve_certified_root_cut_policy(Some(true)));
+        assert!(!resolve_certified_root_cut_policy(Some(false)));
+    }
+}
+
+fn resolve_certified_root_cut_policy(frozen: Option<bool>) -> bool {
+    frozen.unwrap_or_else(|| {
+        ny_levers::read(&ny_levers::decls::certified_root_cut::ROOT_CERTIFIED_CUT)
+            .value
+            .as_bool()
+    })
+}
+
 fn resolve_chunk_wave_parallel_enabled(frozen: Option<bool>) -> bool {
     frozen.unwrap_or_else(|| {
         !ny_levers::read(&ny_levers::decls::crown_ibp_budget::NO_CHUNK_WAVE_PAR)
@@ -1027,6 +1168,7 @@ fn apply_instance_overrides(
     instance_overrides: &BetaCrownInstanceOverrides,
 ) -> Result<()> {
     config.frozen_levers = instance_overrides.frozen_levers.clone();
+    config.certified_root_cut_owner = instance_overrides.certified_root_cut_owner.clone();
     config.pgd_exact_vjp = resolve_pgd_exact_vjp(
         config.pgd_exact_vjp,
         instance_overrides.pgd_exact_vjp,
@@ -1041,27 +1183,18 @@ fn apply_instance_overrides(
         // switch and can still disable this typed-on config.
         config.root_sparse_interm_crown = true;
     }
-    if instance_overrides.cgan_input_leaf_route == Some(CganInputLeafRoute::Cgan2023) {
-        // The engine seam is independently default-dark. Only the exact typed
-        // VNN-COMP route may ask it to consult; construction still declines on
-        // every model/property/profile/provenance mismatch.
-        config.input_split_input_leaf_oracle = true;
-    }
     Ok(())
 }
 
 /// Frontend policy for terminal-activation peeling.
 ///
-/// The historical interactive flag retains its broader legacy behavior.  The
-/// typed traffic route is deliberately distinct and stricter: it may peel only
-/// an authenticated, single-group terminal Softmax.  Keeping the source typed
-/// prevents a competition-only request from silently inheriting the legacy
-/// LogSoftmax/Sigmoid surface.
+/// The interactive flag keeps its legacy behavior. (A stricter typed
+/// single-group-Softmax policy existed for one category-keyed, env-dark
+/// VNN-COMP route; it was removed with that route by #name-blind-routing.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TerminalPeelPolicy {
     Off,
     InteractiveLegacy,
-    TrafficSoftmaxSingleGroup,
 }
 
 impl TerminalPeelPolicy {
@@ -1070,18 +1203,449 @@ impl TerminalPeelPolicy {
     }
 }
 
-fn terminal_peel_policy(
-    cli_requested: bool,
-    instance_overrides: &BetaCrownInstanceOverrides,
-) -> TerminalPeelPolicy {
-    // A typed competition route always keeps its narrow soundness fence, even
-    // if a future caller accidentally also forwards the legacy CLI bit.
-    if instance_overrides.traffic_terminal_softmax_peel {
-        TerminalPeelPolicy::TrafficSoftmaxSingleGroup
-    } else if cli_requested {
+fn terminal_peel_policy(cli_requested: bool) -> TerminalPeelPolicy {
+    if cli_requested {
         TerminalPeelPolicy::InteractiveLegacy
     } else {
         TerminalPeelPolicy::Off
+    }
+}
+
+/// #lsnc-lane: resolve `bab.branching.input_split.lowdim_interval_twin`
+/// (`NY_LOWDIM_INTERVAL_TWIN`). A scored run reads the SAME frozen LeverSet as
+/// its flight receipt; an interactive run layers the environment over the typed
+/// preset key. A lever missing from a frozen set, or an inadmissible value,
+/// resolves dark. `pub(crate)` only for the scored-projection reachability
+/// test (`commands::vnncomp::lsnc_lane_tests`).
+pub(crate) fn resolve_lowdim_interval_twin(
+    frozen: Option<&ny_levers::LeverSet>,
+    preset_config: Option<&preset::PresetConfig>,
+) -> (bool, ny_levers::Source) {
+    let decl = &ny_levers::decls::lowdim_lane::LOWDIM_INTERVAL_TWIN;
+    if let Some(levers) = frozen {
+        return levers
+            .resolved(decl)
+            .map_or((false, ny_levers::Source::Default), |resolved| {
+                (resolved.value.as_bool(), resolved.source)
+            });
+    }
+    let typed = preset_config
+        .and_then(|preset| preset.bab.branching.input_split.lowdim_interval_twin)
+        .map(ny_levers::LeverValue::Bool);
+    ny_levers::read_over_config(decl, typed)
+        .map_or((false, ny_levers::Source::Default), |resolved| {
+            (resolved.value.as_bool(), resolved.source)
+        })
+}
+
+/// #fl-f32-seam-key: resolve `model.forward_linear_f32_seam`
+/// (`NY_FORWARD_LINEAR_F32`) into the value the CLI installs as
+/// ny-propagate's process-global seam override, or `None` to leave it unset.
+///
+/// A scored run installs the SAME frozen LeverSet value as its flight receipt
+/// (environment over the projected preset key over the declaration default).
+/// An interactive run layers the environment over the typed key with
+/// [`ny_levers::read_over_config`], the same rule, and absent the key leaves
+/// the override unset so the seam's own declared environment read decides,
+/// exactly as with no preset. Installing the RAW key instead (the original
+/// bridge) let a preset beat an admissible `NY_FORWARD_LINEAR_F32`, the
+/// reverse of the receipt's layering, so the receipt could record one seam
+/// mode while the run used the other (#fl-alpha-composition review). A lever
+/// missing from a frozen set, or an inadmissible value, resolves dark (the
+/// shipped f64 path). `pub(crate)` only for the scored-projection test
+/// (`commands::vnncomp::fl_f32_seam_receipt_tests`).
+pub(crate) fn resolve_forward_linear_f32_seam(
+    frozen: Option<&ny_levers::LeverSet>,
+    preset_config: Option<&preset::PresetConfig>,
+) -> Option<bool> {
+    let decl = &ny_levers::decls::forward_linear::FORWARD_LINEAR_F32;
+    if let Some(levers) = frozen {
+        return Some(
+            levers
+                .resolved(decl)
+                .is_some_and(|resolved| resolved.value.as_bool()),
+        );
+    }
+    let typed = preset_config.and_then(|preset| preset.model.forward_linear_f32_seam)?;
+    Some(
+        ny_levers::read_over_config(decl, Some(ny_levers::LeverValue::Bool(typed)))
+            .is_ok_and(|resolved| resolved.value.as_bool()),
+    )
+}
+
+/// #lsnc-lane stage 2: resolve `bab.branching.input_split.lowdim_joint_quadratic`
+/// (`NY_LOWDIM_JOINT_QUADRATIC`) exactly as the interval twin is resolved: a
+/// scored run reads the SAME frozen LeverSet as its flight receipt; an
+/// interactive run layers the environment over the typed preset key. A lever
+/// missing from a frozen set, or an inadmissible value, resolves dark. The
+/// lever's own observable is one `[lowdim-joint] armed=1` line whenever it
+/// resolves on; the lane then prints `[lowdim] joint sites=.. armed=1 ..`.
+pub(crate) fn resolve_lowdim_joint_quadratic(
+    frozen: Option<&ny_levers::LeverSet>,
+    preset_config: Option<&preset::PresetConfig>,
+) -> bool {
+    let decl = &ny_levers::decls::lowdim_lane::LOWDIM_JOINT_QUADRATIC;
+    let (armed, source) = if let Some(levers) = frozen {
+        levers
+            .resolved(decl)
+            .map_or((false, ny_levers::Source::Default), |resolved| {
+                (resolved.value.as_bool(), resolved.source)
+            })
+    } else {
+        let typed = preset_config
+            .and_then(|preset| preset.bab.branching.input_split.lowdim_joint_quadratic)
+            .map(ny_levers::LeverValue::Bool);
+        ny_levers::read_over_config(decl, typed)
+            .map_or((false, ny_levers::Source::Default), |resolved| {
+                (resolved.value.as_bool(), resolved.source)
+            })
+    };
+    if armed {
+        eprintln!("[lowdim-joint] armed=1 source={source:?}");
+    }
+    armed
+}
+
+/// #lsnc-lane stage 3: resolve one of the lane's Boolean search keys exactly
+/// as the joint quadratic bound is resolved (frozen LeverSet in a scored run,
+/// the typed key over the environment interactively; missing or inadmissible
+/// resolves dark), printing `[<tag>] armed=1 source=..` when it resolves on.
+fn resolve_lowdim_lane_bool(
+    decl: &'static ny_levers::LeverDecl,
+    frozen: Option<&ny_levers::LeverSet>,
+    typed: Option<bool>,
+    tag: &str,
+) -> bool {
+    let (armed, source) = if let Some(levers) = frozen {
+        levers
+            .resolved(decl)
+            .map_or((false, ny_levers::Source::Default), |resolved| {
+                (resolved.value.as_bool(), resolved.source)
+            })
+    } else {
+        ny_levers::read_over_config(decl, typed.map(ny_levers::LeverValue::Bool))
+            .map_or((false, ny_levers::Source::Default), |resolved| {
+                (resolved.value.as_bool(), resolved.source)
+            })
+    };
+    if armed {
+        eprintln!("[{tag}] armed=1 source={source:?}");
+    }
+    armed
+}
+
+/// #lsnc-lane stage 3: resolve `bab.branching.input_split.lowdim_clip`
+/// (`NY_LOWDIM_CLIP`). Observable: `[lowdim-clip] armed=1 source=..`, then the
+/// lane's `[lowdim] lane-config .. clip=1 ..` and per-clause `clip_closed=` /
+/// `clip_shrunk=`.
+pub(crate) fn resolve_lowdim_clip(
+    frozen: Option<&ny_levers::LeverSet>,
+    preset_config: Option<&preset::PresetConfig>,
+) -> bool {
+    resolve_lowdim_lane_bool(
+        &ny_levers::decls::lowdim_lane::LOWDIM_CLIP,
+        frozen,
+        preset_config.and_then(|preset| preset.bab.branching.input_split.lowdim_clip),
+        "lowdim-clip",
+    )
+}
+
+/// #lsnc-lane stage 3: resolve `bab.branching.input_split.lowdim_parallel`
+/// (`NY_LOWDIM_PARALLEL`). Observable: `[lowdim-parallel] armed=1 source=..`,
+/// then the lane's `[lowdim] lane-config .. parallel=full threads=..`.
+pub(crate) fn resolve_lowdim_parallel(
+    frozen: Option<&ny_levers::LeverSet>,
+    preset_config: Option<&preset::PresetConfig>,
+) -> bool {
+    resolve_lowdim_lane_bool(
+        &ny_levers::decls::lowdim_lane::LOWDIM_PARALLEL,
+        frozen,
+        preset_config.and_then(|preset| preset.bab.branching.input_split.lowdim_parallel),
+        "lowdim-parallel",
+    )
+}
+
+/// #lsnc-lane stage 3: resolve `bab.branching.input_split.lowdim_split`
+/// (`NY_LOWDIM_SPLIT`, an enum lever over `widest|gradient|sb|sbwr`) the same
+/// way. A missing, unset or unknown token resolves to the historical
+/// `widest`. Observable: `[lowdim-split] armed=1 value=.. source=..` whenever
+/// it resolves to anything else, then the lane's `[lowdim] lane-config
+/// split=..`.
+pub(crate) fn resolve_lowdim_split(
+    frozen: Option<&ny_levers::LeverSet>,
+    preset_config: Option<&preset::PresetConfig>,
+) -> ny_propagate::lowdim::LowDimSplit {
+    use ny_propagate::lowdim::LowDimSplit;
+    let decl = &ny_levers::decls::lowdim_lane::LOWDIM_SPLIT;
+    let resolved: Option<(Option<String>, ny_levers::Source)> = if let Some(levers) = frozen {
+        levers
+            .resolved(decl)
+            .map(|r| (r.value.as_str().map(str::to_owned), r.source))
+    } else {
+        let typed = preset_config
+            .and_then(|preset| preset.bab.branching.input_split.lowdim_split)
+            .map(|split| ny_levers::LeverValue::Text(split.token().to_owned()));
+        ny_levers::read_over_config(decl, typed)
+            .ok()
+            .map(|r| (r.value.as_str().map(str::to_owned), r.source))
+    };
+    let (token, source) = resolved.unwrap_or((None, ny_levers::Source::Default));
+    let split = token
+        .as_deref()
+        .and_then(LowDimSplit::from_token)
+        .unwrap_or_default();
+    if split != LowDimSplit::default() {
+        eprintln!(
+            "[lowdim-split] armed=1 value={} source={source:?}",
+            split.token()
+        );
+    }
+    split
+}
+
+/// #lowdim-bundle: resolve one of the lane's COUNT keys exactly as the
+/// Boolean search keys are resolved (frozen LeverSet in a scored run, the
+/// typed key over the environment interactively; missing or inadmissible
+/// resolves to 0 = off), printing `[<tag>] armed=1 value=.. source=..` when it
+/// resolves to a positive count.
+fn resolve_lowdim_lane_count(
+    decl: &'static ny_levers::LeverDecl,
+    frozen: Option<&ny_levers::LeverSet>,
+    typed: Option<usize>,
+    tag: &str,
+) -> usize {
+    let (value, source) = if let Some(levers) = frozen {
+        levers
+            .resolved(decl)
+            .map_or((0, ny_levers::Source::Default), |resolved| {
+                (resolved.value.as_u64().unwrap_or(0), resolved.source)
+            })
+    } else {
+        let typed = typed
+            .and_then(|v| u64::try_from(v).ok())
+            .map(ny_levers::LeverValue::U64);
+        ny_levers::read_over_config(decl, typed)
+            .map_or((0, ny_levers::Source::Default), |resolved| {
+                (resolved.value.as_u64().unwrap_or(0), resolved.source)
+            })
+    };
+    let value = usize::try_from(value).unwrap_or(usize::MAX);
+    if value > 0 {
+        eprintln!("[{tag}] armed=1 value={value} source={source:?}");
+    }
+    value
+}
+
+/// #lowdim-bundle (1): resolve `bab.branching.input_split.lowdim_varying_dims`
+/// (`NY_LOWDIM_VARYING_DIMS`). Observable: `[lowdim-varying-dims] armed=1
+/// source=..`, then every lane entry's `[lowdim-varying] armed=1 status=..`.
+pub(crate) fn resolve_lowdim_varying_dims(
+    frozen: Option<&ny_levers::LeverSet>,
+    preset_config: Option<&preset::PresetConfig>,
+) -> bool {
+    resolve_lowdim_lane_bool(
+        &ny_levers::decls::lowdim_lane::LOWDIM_VARYING_DIMS,
+        frozen,
+        preset_config.and_then(|preset| preset.bab.branching.input_split.lowdim_varying_dims),
+        "lowdim-varying-dims",
+    )
+}
+
+/// #lowdim-bundle (2): resolve `bab.branching.input_split.lowdim_alpha_iters`
+/// (`NY_LOWDIM_ALPHA_ITERS`). Observable: `[lowdim-alpha-iters] armed=1
+/// value=.. source=..`, then each lane run's `[lowdim-alpha] done ..`.
+pub(crate) fn resolve_lowdim_alpha_iters(
+    frozen: Option<&ny_levers::LeverSet>,
+    preset_config: Option<&preset::PresetConfig>,
+) -> usize {
+    resolve_lowdim_lane_count(
+        &ny_levers::decls::lowdim_lane::LOWDIM_ALPHA_ITERS,
+        frozen,
+        preset_config.and_then(|preset| preset.bab.branching.input_split.lowdim_alpha_iters),
+        "lowdim-alpha-iters",
+    )
+}
+
+/// #lowdim-bundle (3): resolve
+/// `bab.branching.input_split.lowdim_leaf_attack_every`
+/// (`NY_LOWDIM_LEAF_ATTACK_EVERY`). Observable: `[lowdim-leaf-attack-every]
+/// armed=1 value=.. source=..`, then each lane run's `[lowdim-leaf-attack]
+/// done ..`.
+pub(crate) fn resolve_lowdim_leaf_attack_every(
+    frozen: Option<&ny_levers::LeverSet>,
+    preset_config: Option<&preset::PresetConfig>,
+) -> usize {
+    resolve_lowdim_lane_count(
+        &ny_levers::decls::lowdim_lane::LOWDIM_LEAF_ATTACK_EVERY,
+        frozen,
+        preset_config.and_then(|preset| preset.bab.branching.input_split.lowdim_leaf_attack_every),
+        "lowdim-leaf-attack-every",
+    )
+}
+
+/// #lowdim-bundle (4): resolve
+/// `bab.branching.input_split.lowdim_shared_worklist`
+/// (`NY_LOWDIM_SHARED_WORKLIST`). Observable: `[lowdim-shared-worklist]
+/// armed=1 source=..`, then the fold's `[lowdim-shared] done ..`.
+pub(crate) fn resolve_lowdim_shared_worklist(
+    frozen: Option<&ny_levers::LeverSet>,
+    preset_config: Option<&preset::PresetConfig>,
+) -> bool {
+    resolve_lowdim_lane_bool(
+        &ny_levers::decls::lowdim_lane::LOWDIM_SHARED_WORKLIST,
+        frozen,
+        preset_config.and_then(|preset| preset.bab.branching.input_split.lowdim_shared_worklist),
+        "lowdim-shared-worklist",
+    )
+}
+
+/// M8a (`#m8-input-split-batch`): resolve
+/// `bab.branching.input_split.lowdim_batch_engine` (the lane's wave bounder,
+/// `legacy|bbe`; a clone of [`resolve_lowdim_split`]). A missing, unset or
+/// unknown token resolves to `legacy`. Observable: `[lowdim-batch-engine] armed=1 value=bbe source=..` whenever
+/// it resolves to anything else, then the lane's `[lowdim] lane-config ..
+/// batch_engine=bbe` and each armed run's `[bbe] phase=input_split ...`.
+pub(crate) fn resolve_lowdim_batch_engine(
+    frozen: Option<&ny_levers::LeverSet>,
+    preset_config: Option<&preset::PresetConfig>,
+) -> ny_propagate::lowdim::LowDimBatchEngine {
+    use ny_propagate::lowdim::LowDimBatchEngine;
+    let decl = &ny_levers::decls::lowdim_lane::LOWDIM_BATCH_ENGINE;
+    let resolved: Option<(Option<String>, ny_levers::Source)> = if let Some(levers) = frozen {
+        levers
+            .resolved(decl)
+            .map(|r| (r.value.as_str().map(str::to_owned), r.source))
+    } else {
+        let typed = preset_config
+            .and_then(|preset| preset.bab.branching.input_split.lowdim_batch_engine)
+            .map(|engine| ny_levers::LeverValue::Text(engine.token().to_owned()));
+        ny_levers::read_over_config(decl, typed)
+            .ok()
+            .map(|r| (r.value.as_str().map(str::to_owned), r.source))
+    };
+    let (token, source) = resolved.unwrap_or((None, ny_levers::Source::Default));
+    let engine = token
+        .as_deref()
+        .and_then(LowDimBatchEngine::from_token)
+        .unwrap_or_default();
+    if engine != LowDimBatchEngine::default() {
+        eprintln!(
+            "[lowdim-batch-engine] armed=1 value={} source={source:?}",
+            engine.token()
+        );
+    }
+    engine
+}
+
+/// M8a (`#m8-input-split-batch`): resolve `bab.branching.input_split.engine`
+/// (the lane's multi-clause scheduler, `legacy|bbe`) the same way (a clone of
+/// [`resolve_lowdim_split`]). The fold
+/// takes the shared worklist iff `engine == bbe || shared_worklist`
+/// (`ny_propagate::lowdim::fold_shared`); the observable says which:
+/// `[input-split-engine] armed=1 value=bbe fold_shared=<implied|explicit>
+/// source=..` (`explicit` when `lowdim_shared_worklist` is also on).
+pub(crate) fn resolve_input_split_engine(
+    frozen: Option<&ny_levers::LeverSet>,
+    preset_config: Option<&preset::PresetConfig>,
+    shared_worklist: bool,
+) -> ny_propagate::lowdim::InputSplitEngine {
+    use ny_propagate::lowdim::InputSplitEngine;
+    let decl = &ny_levers::decls::lowdim_lane::INPUT_SPLIT_ENGINE;
+    let resolved: Option<(Option<String>, ny_levers::Source)> = if let Some(levers) = frozen {
+        levers
+            .resolved(decl)
+            .map(|r| (r.value.as_str().map(str::to_owned), r.source))
+    } else {
+        let typed = preset_config
+            .and_then(|preset| preset.bab.branching.input_split.engine)
+            .map(|engine| ny_levers::LeverValue::Text(engine.token().to_owned()));
+        ny_levers::read_over_config(decl, typed)
+            .ok()
+            .map(|r| (r.value.as_str().map(str::to_owned), r.source))
+    };
+    let (token, source) = resolved.unwrap_or((None, ny_levers::Source::Default));
+    let engine = token
+        .as_deref()
+        .and_then(InputSplitEngine::from_token)
+        .unwrap_or_default();
+    if engine != InputSplitEngine::default() {
+        eprintln!(
+            "[input-split-engine] armed=1 value={} fold_shared={} source={source:?}",
+            engine.token(),
+            if shared_worklist {
+                "explicit"
+            } else {
+                "implied"
+            }
+        );
+    }
+    engine
+}
+
+/// #lsnc-lane: build the `#lowdim-prover` lane's LANE-PRIVATE interval twin
+/// (`ny_onnx::lowdim_twin`) and attach it to the freshly loaded graph.
+///
+/// Armed only by the resolved `lowdim_interval_twin` policy, and only when the
+/// twin is provably the SAME FUNCTION as the graph the property is about: a
+/// Graph model that is still exactly what was loaded (`unmodified`: no terminal
+/// peel applied, not the authenticated-bytes Softmax route, no load-time VGG
+/// rewrite) and whose exact load left at least one `OpaqueSkip` (otherwise the
+/// twin buys nothing and the lane lowers the graph itself). Any later structural
+/// mutation of the graph invalidates the binding (`GraphNetwork::lowdim_twin`).
+/// Every refusal leaves the graph untouched. The lever's own observable is one
+/// `[lowdim-twin]` line whenever it is armed.
+fn attach_lowdim_interval_twin(
+    model_net: &mut BetaCrownModel,
+    model_path: &std::path::Path,
+    onnx_load_config: &ny_onnx::OnnxLoadConfig,
+    unmodified: bool,
+    (armed, source): (bool, ny_levers::Source),
+) {
+    if !armed {
+        return;
+    }
+    let BetaCrownModel::Graph(graph) = model_net else {
+        eprintln!("[lowdim-twin] armed=1 source={source:?} attached=0 reason=sequential-model");
+        return;
+    };
+    let opaque = graph
+        .node_names()
+        .iter()
+        .filter(|name| {
+            graph
+                .node(name.as_str())
+                .is_some_and(|node| matches!(node.layer(), ny_propagate::Layer::OpaqueSkip(_)))
+        })
+        .count();
+    if opaque == 0 {
+        eprintln!("[lowdim-twin] armed=1 source={source:?} attached=0 reason=no-opaque-skip");
+        return;
+    }
+    if !unmodified {
+        eprintln!(
+            "[lowdim-twin] armed=1 source={source:?} attached=0 opaque_skips={opaque} \
+             reason=graph-rewritten-at-load"
+        );
+        return;
+    }
+    let options = ny_onnx::GraphNetworkOptions {
+        compound_node_policy: ny_onnx::CompoundNodePolicy::DecomposeNormalization,
+        ..ny_onnx::GraphNetworkOptions::default()
+    };
+    match ny_onnx::lowdim_twin::build_lane_twin(model_path, onnx_load_config, options) {
+        Ok(twin) => {
+            let (weights, nodes) = (twin.interval_weights(), twin.node_count());
+            graph.attach_lowdim_twin(twin);
+            eprintln!(
+                "[lowdim-twin] armed=1 source={source:?} attached=1 opaque_skips={opaque} \
+                 interval_weights={weights} twin_nodes={nodes} state={}",
+                graph.lowdim_twin_state()
+            );
+        }
+        Err(reason) => eprintln!(
+            "[lowdim-twin] armed=1 source={source:?} attached=0 opaque_skips={opaque} \
+             reason={reason}"
+        ),
     }
 }
 
@@ -1192,7 +1756,7 @@ pub(crate) fn handle_beta_crown_command(
     // early return clears any prior solve's observations.
     let _execution_telemetry_run = ny_propagate::execution_telemetry::begin_run();
     proof_opts.validate()?;
-    let terminal_peel_policy = terminal_peel_policy(peel_last_softmax_layer, &instance_overrides);
+    let terminal_peel_policy = terminal_peel_policy(peel_last_softmax_layer);
     let peel_last_softmax_layer = terminal_peel_policy.requested();
 
     #[cfg(feature = "mip")]
@@ -1244,7 +1808,14 @@ pub(crate) fn handle_beta_crown_command(
             .as_ref()
             .and_then(|preset| preset.solver.joint_bilinear_quad),
     );
-    let onnx_load_config = preset_config
+    // One resolved policy feeds loading and QueryOwner, never a later env reread.
+    let certified_root_cut_enabled =
+        resolve_certified_root_cut_policy(instance_overrides.certified_root_cut_enabled);
+    let explicit_folding = preset_config
+        .as_ref()
+        .and_then(|p| p.model.batch_norm_folding)
+        .is_some();
+    let mut onnx_load_config = preset_config
         .as_ref()
         .map(preset::build_onnx_load_config)
         .transpose()?
@@ -1361,6 +1932,25 @@ pub(crate) fn handle_beta_crown_command(
         );
     }
 
+    // Freeze backend opportunity AFTER the existing resolver/registration,
+    // without initializing a new accelerator. The startup CUDA registration
+    // bit admits cold-but-possible CUDA; live execution still requires both
+    // checked capabilities on an already-materialized engine.
+    let certified_root_backend_possible =
+        ny_propagate::beta_crown::certified_root_cut::checked_backend_possible_for_raw_load(
+            compute_device.as_deref().map(|e| e as &dyn GemmEngine),
+        );
+    onnx_load_config = select_certified_root_load_policy(
+        onnx_load_config,
+        certified_root_cut_enabled,
+        explicit_folding,
+        certified_root_backend_possible,
+    );
+    eprintln!(
+        "[certified-root-policy] enabled={} backend_opportunity={} explicit_folding={}",
+        certified_root_cut_enabled, certified_root_backend_possible, explicit_folding
+    );
+
     // These A/B levers only suppress the optional CPU engine-presence handle.
     // They may never discard a successfully qualified WGPU proof device.
     if !qualified_wgpu_proof_active
@@ -1448,20 +2038,18 @@ pub(crate) fn handle_beta_crown_command(
         // measured size threshold and the seam gate decide per call. The rate
         // probe measures THROUGH this chain, so FL admission re-prices
         // automatically wherever this tier is faster.
-        // RESTORED 2026-08-02 now that `ca4740cb` re-landed the producer. The
-        // refusing stub my build hotfix put here had to go: installation is
-        // first-install-wins (`FACTORY.set` on a `OnceLock`), and `main.rs`
+        // Install the real producer here, never a refusing stub: installation
+        // is first-install-wins (`FACTORY.set` on a `OnceLock`), and `main.rs`
         // only registers behind `if !compute_backend::detect().wgpu_probe_skipped`
-        // — so on any host that skips the probe the stub would have won the
-        // race and silently suppressed the re-landed tier.
+        // — so on any host that skips the probe a stub here would win the race
+        // and silently suppress this tier.
         ny_propagate::fl_value_gemm::set_fl_value_gemm_factory(|| {
             match ny_gpu::FlValueGemmDevice::new_wgpu() {
                 Ok(device) => Some(Arc::new(device) as Arc<dyn GemmEngine>),
                 Err(error) => {
                     warn!(
                         %error,
-                        "FL-value wgpu f32 engine unavailable; forward-linear \
-                         value GEMMs keep the tiled CPU tiers (#fl-value-gpu-tier)"
+                        "wgpu unavailable for forward-linear value GEMMs; using the CPU"
                     );
                     None
                 }
@@ -1639,6 +2227,7 @@ pub(crate) fn handle_beta_crown_command(
         .as_ref()
         .and_then(|preset| preset.general.conv_mode);
     let LoadedModel {
+        certified_root_raw_source,
         model: mut model_net,
         param_count,
         input_dim,
@@ -1667,6 +2256,27 @@ pub(crate) fn handle_beta_crown_command(
         use_relu_split = routed_relu_split;
         loaded_model
     };
+    // #lsnc-lane: the lowdim lane's LANE-PRIVATE interval twin, attached while
+    // the graph is still exactly the model that was loaded (the identity token
+    // it binds to is refreshed by any later structural mutation).
+    attach_lowdim_interval_twin(
+        &mut model_net,
+        &model,
+        &onnx_load_config,
+        matches!(applied_terminal_peel, AppliedTerminalPeel::None)
+            && vgg_abcrown_decision.is_none(),
+        resolve_lowdim_interval_twin(
+            instance_overrides.frozen_levers.as_deref(),
+            preset_config.as_ref(),
+        ),
+    );
+    // #smart-turn-qdq dark probe, armed half: latch the report-only flag and
+    // print the relaxation count as soon as the graph exists, BEFORE the
+    // input-bounds construction that a multi-input spec still refuses.
+    if onnx_load_config.qdq_activation_relaxation_enabled() {
+        qdq_probe::emit_qdq_relaxation_armed(&model_net);
+    }
+
     // Legacy engine seams need only the Sigmoid distinction; the full typed
     // receipt remains attached to effective treatment for witness publication.
     let sigmoid_peeled = applied_terminal_peel.is_sigmoid();
@@ -1691,6 +2301,67 @@ pub(crate) fn handle_beta_crown_command(
             );
         }
         BetaCrownModel::Sequential(_) => {}
+    }
+
+    // #fl-seq-no-transpose: admit the sequential forward-linear reference on a
+    // Conv2d graph with no ConvTranspose2d. Graph-local and default off; absent
+    // reproduces the historical admission byte-identically. Refused on a
+    // Sequential model for the same reason as the key above — an enabled but
+    // structurally unreachable lane is worse than an absent one.
+    let fl_seq_no_transpose = preset_config.as_ref().is_some_and(|preset| {
+        preset
+            .model
+            .forward_linear_sequential_without_conv_transpose
+            == Some(true)
+    });
+    match &mut model_net {
+        BetaCrownModel::Graph(graph) => {
+            graph.set_forward_linear_sequential_without_conv_transpose(fl_seq_no_transpose);
+        }
+        BetaCrownModel::Sequential(_) if fl_seq_no_transpose => {
+            anyhow::bail!(
+                "model.forward_linear_sequential_without_conv_transpose requires GraphNetwork \
+                 routing; refusing an enabled but unreachable proof lane"
+            );
+        }
+        BetaCrownModel::Sequential(_) => {}
+    }
+
+    // #fl-s-shaped-untyped: admit Tanh/Sigmoid on the ORDINARY forward-linear
+    // surface. Graph-local, default off; absent reproduces the shipped admission
+    // byte-identically. Refused on a Sequential model for the same reason as the
+    // key above. This is a MEASUREMENT key: the path it replaces is per-node
+    // CROWN-IBP and neither enclosure dominates, so it can loosen as easily as
+    // tighten, and it can evict the single-slot root forward-linear map.
+    let fl_s_shaped_untyped = preset_config
+        .as_ref()
+        .is_some_and(|preset| preset.model.forward_linear_s_shaped_untyped == Some(true));
+    match &mut model_net {
+        BetaCrownModel::Graph(graph) => {
+            graph.set_forward_linear_s_shaped_untyped(fl_s_shaped_untyped);
+        }
+        BetaCrownModel::Sequential(_) if fl_s_shaped_untyped => {
+            anyhow::bail!(
+                "model.forward_linear_s_shaped_untyped requires GraphNetwork routing; \
+                 refusing an enabled but unreachable proof lane"
+            );
+        }
+        BetaCrownModel::Sequential(_) => {}
+    }
+
+    // #fl-f32-seam-key: promote the env-only f32 value-GEMM seam to a preset
+    // key. Process-global (the seam is read deep inside the composition where
+    // no `&self` is in scope), and applied for BOTH model lanes because the
+    // seam is not GraphNetwork-specific. The installed value is the LAYERED
+    // one (`resolve_forward_linear_f32_seam`): a scored run's frozen LeverSet,
+    // which is its flight receipt, or interactively the environment over the
+    // key; an interactive run without the key leaves the declared env read in
+    // force, so an unset preset is byte-identical to today.
+    if let Some(seam) = resolve_forward_linear_f32_seam(
+        instance_overrides.frozen_levers.as_deref(),
+        preset_config.as_ref(),
+    ) {
+        ny_propagate::set_forward_linear_f32_seam(seam);
     }
 
     // Consume the model-class-aware auto-branching decision (if `auto` was
@@ -1766,6 +2437,12 @@ pub(crate) fn handle_beta_crown_command(
             json,
         )?;
 
+    // #smart-turn-qdq dark probe, bounds half: with the input box in hand,
+    // print every relaxed quantizer's pre-activation IBP interval.
+    if onnx_load_config.qdq_activation_relaxation_enabled() {
+        qdq_probe::emit_qdq_relaxation_bounds(&model_net, &input, gemm_engine);
+    }
+
     // Softmax "complex" rewrite (W2 Phase B, vit_2023): decompose Softmax
     // nodes into the alpha-optimizable Exp/ReduceSum/Reciprocal/MulBinary
     // subgraph at graph-construction level, gated by the preset field
@@ -1776,9 +2453,19 @@ pub(crate) fn handle_beta_crown_command(
     // subsequent propagation uses, so the frozen constants are consistent.
     // Ineligible nodes are skipped inside the rewrite (kept on the direct-LSE
     // path); an error leaves the graph unchanged — never a new failure mode.
+    //
+    // #softmax-fixed-index: `softmax: complex_fixed_index` selects the
+    // fixed-index shift (`x - x_{j*}`, j* = per-row argmax at the box centre)
+    // instead of the constant one; it prints its own unconditional
+    // `[softmax-complex] stage=rewrite …` line.
     if resolve_preset_softmax_complex(preset_config.as_ref()) {
         if let BetaCrownModel::Graph(ref mut graph) = model_net {
-            match graph.decompose_softmax_complex(&input) {
+            let rewrite = if resolve_preset_softmax_fixed_index(preset_config.as_ref()) {
+                graph.decompose_softmax_complex_fixed_index(&input)
+            } else {
+                graph.decompose_softmax_complex(&input)
+            };
+            match rewrite {
                 Ok(report) => {
                     if !report.decomposed.is_empty() || !report.skipped.is_empty() {
                         info!(
@@ -1811,22 +2498,16 @@ pub(crate) fn handle_beta_crown_command(
     let (use_alpha_effective, crown_ibp_effective, cuts_supported) =
         if is_graph_model && is_input_split_for_graph {
             // Input splitting: α-CROWN supported (tighter initial bounds via CROWN-IBP
-            // intermediates in collect_alpha_crown_bounds_dag, #3357); crown_ibp and cuts
+            // intermediates in collect_alpha_crown_bounds_dag); crown_ibp and cuts
             // still not supported for input splitting.
             if crown_ibp && !json {
-                eprintln!(
-                    "Note: Graph model with input splitting - disabling unsupported \
-                 CROWN-IBP (crown_ibp={crown_ibp})"
-                );
+                info!("Graph model with input splitting: CROWN-IBP is not supported, disabling it");
             }
             (use_alpha, false, false)
         } else if is_graph_model && use_relu_split {
             // ReLU splitting: α-CROWN and cuts supported; crown_ibp still not supported
             if crown_ibp && !json {
-                eprintln!(
-                    "Note: Graph model with ReLU splitting - disabling CROWN-IBP (crown_ibp={})",
-                    crown_ibp
-                );
+                info!("Graph model with ReLU splitting: CROWN-IBP is not supported, disabling it");
             }
             (use_alpha, false, true) // α-CROWN and cuts supported for graph ReLU splitting
         } else {
@@ -1847,8 +2528,12 @@ pub(crate) fn handle_beta_crown_command(
             println!("Property: {}", prop_path.display());
             if let Some(ref spec) = vnnlib_spec {
                 println!("Input region: {} dimensions", spec.num_inputs);
-                for (i, (l, u)) in spec.input_bounds.iter().enumerate() {
+                let shown = crate::commands::verify::TEXT_PREVIEW_LEN;
+                for (i, (l, u)) in spec.input_bounds.iter().enumerate().take(shown) {
                     println!("  X_{}: [{:.6}, {:.6}] (width: {:.6})", i, l, u, u - l);
+                }
+                if spec.input_bounds.len() > shown {
+                    println!("  ... {} more", spec.input_bounds.len() - shown);
                 }
             }
         } else {
@@ -1897,7 +2582,7 @@ pub(crate) fn handle_beta_crown_command(
 
         // Display effective values (from CLI, preset, or defaults)
         let branching_str = branching.as_deref().unwrap_or("(preset/default)");
-        println!(
+        info!(
             "Config: max_domains={}, max_queue_bytes={}, timeout={}s, max_depth={}, branching={}, fsb_candidates={}, use_alpha={}, alpha_iter={}, alpha_grad={}, alpha_opt={}, alpha_lr={}, crown_ibp_interm={}, beta_iter={}, lr_beta={}, crown_ibp={}, batch_size={}, parallel={}, enable_cuts={}, max_cuts={}, min_cut_depth={}, biccos_strengthen={}, biccos_drop_ratio={}, relaxed_clip={}, relaxed_clip_iters={}, clip_interm_domain={}, clip_interm_topk={}, clip_in_alpha_crown={}, clip_interm_prune={}, clip_interm_final_layer={}, interm_transfer={}, pgd_attack={}",
             max_domains.map(|v| v.to_string()).unwrap_or_else(|| "(preset/default)".to_string()),
             eff_max_queue_bytes,
@@ -1944,7 +2629,70 @@ pub(crate) fn handle_beta_crown_command(
     }
     apply_vgg_abcrown_bound_mode(&mut config, vgg_abcrown_decision);
     apply_instance_overrides(&mut config, &instance_overrides)?;
+    // #router-r2 CR-K / CR-H: the acting router's derived caps and the root
+    // warmup hand-on, applied only where this row's own configuration did not
+    // pin the key and never below the value in force. A no-op unless the
+    // router acts (`router.mode: on`), so every other run is byte-identical.
+    crate::router::acting::apply_verifier_directives(
+        &mut config,
+        crate::router::acting::VerifierPins::of(preset_config.as_ref()),
+    );
+    // #router-r5 CR-RS: the capabilities the acting router ROUTED on this row
+    // (only at SR.seal, never over a pinned key) are configured here, at the
+    // same boundary. A no-op (one atomic load) unless one was routed — every
+    // row today: no capability is sealed.
+    crate::router::route::apply_to_verifier_config(&mut config);
     apply_root_post_c_survivor_env(&mut config);
+    // #lsnc-lane stage 2: the lowdim lane's joint quadratic bound, from the
+    // same frozen LeverSet a scored run's flight receipt carries.
+    config.input_split_lowdim_joint_quadratic = resolve_lowdim_joint_quadratic(
+        instance_overrides.frozen_levers.as_deref(),
+        preset_config.as_ref(),
+    );
+    // #lsnc-lane stage 3: the lane's split rule, relaxed clip and parallel
+    // waves, from the same frozen LeverSet.
+    config.input_split_lowdim_split = resolve_lowdim_split(
+        instance_overrides.frozen_levers.as_deref(),
+        preset_config.as_ref(),
+    );
+    config.input_split_lowdim_clip = resolve_lowdim_clip(
+        instance_overrides.frozen_levers.as_deref(),
+        preset_config.as_ref(),
+    );
+    config.input_split_lowdim_parallel = resolve_lowdim_parallel(
+        instance_overrides.frozen_levers.as_deref(),
+        preset_config.as_ref(),
+    );
+    // #lowdim-bundle: varying-dims admission + Sigmoid, boundary alpha, the
+    // in-lane leaf attack and the fold's shared worklist, from the same
+    // frozen LeverSet.
+    config.input_split_lowdim_varying_dims = resolve_lowdim_varying_dims(
+        instance_overrides.frozen_levers.as_deref(),
+        preset_config.as_ref(),
+    );
+    config.input_split_lowdim_alpha_iters = resolve_lowdim_alpha_iters(
+        instance_overrides.frozen_levers.as_deref(),
+        preset_config.as_ref(),
+    );
+    config.input_split_lowdim_leaf_attack_every = resolve_lowdim_leaf_attack_every(
+        instance_overrides.frozen_levers.as_deref(),
+        preset_config.as_ref(),
+    );
+    config.input_split_lowdim_shared_worklist = resolve_lowdim_shared_worklist(
+        instance_overrides.frozen_levers.as_deref(),
+        preset_config.as_ref(),
+    );
+    // M8a (#m8-input-split-batch): the lane's wave bounder and multi-clause
+    // scheduler, from the same frozen LeverSet.
+    config.input_split_lowdim_batch_engine = resolve_lowdim_batch_engine(
+        instance_overrides.frozen_levers.as_deref(),
+        preset_config.as_ref(),
+    );
+    config.input_split_engine = resolve_input_split_engine(
+        instance_overrides.frozen_levers.as_deref(),
+        preset_config.as_ref(),
+        config.input_split_lowdim_shared_worklist,
+    );
 
     // CLI flags override preset values ONLY when explicitly provided.
     // For Option<T> fields: only override when Some (CLI explicitly set).
@@ -2150,14 +2898,17 @@ pub(crate) fn handle_beta_crown_command(
 
     // Validate optimizer config after CLI flags and preset application.
     // Catches negative learning rates, NaN, and invalid Adam hyperparameters
-    // before they silently corrupt bound optimization (#2942).
+    // before they silently corrupt bound optimization.
     config.verification_artifact_authority = proof_opts.verification_artifact_authority();
+    // This records the policy that actually loaded the current graph. A later
+    // numerical result cannot repair an earlier dropped BatchNorm enclosure.
+    config.certified_root_cut_raw_source = certified_root_raw_source;
     config.validate()?;
     if complete_verifier == CompleteVerifierArg::Mip && config.timeout.is_zero() {
         anyhow::bail!("unbounded MIP verification is unsupported; pass a positive --timeout");
     }
 
-    // Preset-scoped per-node CROWN-IBP time budget (#4413, #cgan-bn11-budget):
+    // Preset-scoped per-node CROWN-IBP time budget (#cgan-bn11-budget):
     // stamp the loaded graph so every downstream clone (dispatch, disjunctive
     // per-disjunct graphs, engine-configured copies) inherits the policy.
     // Sequential verifiers instead pass the same config directly into each
@@ -2167,12 +2918,79 @@ pub(crate) fn handle_beta_crown_command(
         graph.set_crown_ibp_per_node_time_budget(config.crown_ibp_per_node_time_budget());
         graph.set_chunk_wave_parallel_enabled(config.chunk_wave_parallel_enabled);
         graph.set_frozen_levers(config.frozen_levers.clone());
+        // #pwl-lookup (DARK, `bab.pwl_lookup_exact_range`): stamp the exact
+        // lookup-table range onto the graph BEFORE dispatch, so the IBP
+        // fast path, the disjunctive precheck and every node-bound collection
+        // on this graph and its clones read the same decision. Stamped on
+        // every run (false included) so no earlier in-process state leaks.
+        graph.set_pwl_lookup_exact_range(config.pwl_lookup_exact_range);
+        // #vit-zono-root (DARK, `bab.vit_zono_root`): stamp the certified
+        // forward-zonotope root-map plan BEFORE dispatch (after any softmax
+        // rewrite above), so every reference collection on this graph and its
+        // clones reads the same decision. Stamped on every run (`None`
+        // included) so no earlier in-process state leaks.
+        graph.set_vit_zono_root_plan(ny_propagate::zono_core::vit_zono_root_plan(&config));
+    }
+    // #vit-zono-root observable, part 1: an armed run ALWAYS prints its stamp
+    // line (and a flight note, which survives `ny benchmarks run`'s discarded
+    // stderr), so "armed but never consumed" (no later `[vit-zono-root]
+    // admitted=` line) is distinguishable from "consumed". Unarmed runs print
+    // nothing (byte-identical).
+    if let Some(plan) = ny_propagate::zono_core::vit_zono_root_plan(&config) {
+        let model_kind = match &model_net {
+            BetaCrownModel::Graph(_) => "graph",
+            BetaCrownModel::Sequential(_) => "sequential",
+        };
+        eprintln!(
+            "[vit-zono-root] armed=1 stage=stamp model={model_kind} max_mb={} max_secs={} \
+             source=config key=bab.vit_zono_root",
+            plan.max_bytes >> 20,
+            plan.max_secs,
+        );
+        crate::flight::note(
+            "vit_zono_root",
+            crate::flight::FlightStatus::Ran,
+            Some(format!(
+                "armed=1 stage=stamp model={model_kind} max_mb={} max_secs={}",
+                plan.max_bytes >> 20,
+                plan.max_secs
+            )),
+        );
+    }
+    // #pwl-lookup observable, part 1: an armed run ALWAYS prints its census,
+    // so "armed but the motif is absent" (tables=0), "armed and present but
+    // never engaged" (census>0, no `calls=` line) and "engaged" are three
+    // distinguishable outcomes. Unarmed runs print nothing (byte-identical).
+    if config.pwl_lookup_exact_range {
+        let (census, model_kind) = match &model_net {
+            BetaCrownModel::Graph(graph) => (graph.pwl_lookup_census(), "graph"),
+            BetaCrownModel::Sequential(_) => (Vec::new(), "sequential"),
+        };
+        let hinges = census
+            .iter()
+            .map(|(_, hinges)| hinges.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        eprintln!(
+            "[pwl-lookup] armed=1 census tables={} hinges={hinges} model={model_kind}",
+            census.len()
+        );
+        // The same census on the flight sidecar: `ny benchmarks run` discards
+        // stderr, so a verdict-only sweep can still prove the key arrived.
+        crate::flight::note(
+            "pwl_lookup_census",
+            crate::flight::FlightStatus::Ran,
+            Some(format!(
+                "armed=1 tables={} hinges={hinges} model={model_kind}",
+                census.len()
+            )),
+        );
     }
 
     // Auto-promote gpu_bab for graph models with supported heuristics on
     // single-objective specs. The DomainList frontier is non-regressing and
-    // faster than the heap path for these lanes (#4406). Generic disjunctive
-    // multi-clause specs remain excluded (#4409); the canonical two-singleton
+    // faster than the heap path for these lanes. Generic disjunctive
+    // multi-clause specs remain excluded; the canonical two-singleton
     // InputSplit shape is promoted for its explicit sequential scheduler only
     // when the preset opts in (currently LinearizeNN 2024).
     let gpu_bab = should_auto_promote_gpu_bab(
@@ -2270,6 +3088,47 @@ pub(crate) fn handle_beta_crown_command(
         outer_wrapper_owns_deferred_pgd,
         instance_overrides.outer_deferred_internal_deadline,
     )?;
+    // Interactive calls also get one finite owner at this invocation boundary.
+    // Scored calls inherited theirs before routing; never replace even a disabled
+    // owner. This flag is read once here, never from a child/worker.
+    if config.certified_root_cut_owner.is_none() && instance_overrides.frozen_levers.is_none() {
+        config.certified_root_cut_owner =
+            ny_propagate::beta_crown::certified_root_cut::QueryOwner::new(
+                pre_dispatch_internal_deadline,
+                certified_root_cut_enabled,
+            );
+    }
+    // One caller-created participating owner. Models/setup and older engines
+    // are outside this incremental census; no leaf renews its allowance.
+    #[cfg(feature = "mip")]
+    let verification_resources = if config.single_hidden_hull
+        == ny_propagate::SingleHiddenHullMode::Root
+    {
+        match &instance_overrides.verification_resources {
+            Some(hull_publication::CallerVerificationResources::Ready(owner)) => {
+                Some(owner.clone())
+            }
+            Some(hull_publication::CallerVerificationResources::Refused(reason)) => {
+                eprintln!("[hull-resource] inherited_owner_refusal reason={reason} legacy_fallback=unqualified");
+                None
+            }
+            None => {
+                match hull_publication::InstanceVerificationResources::start(
+                    pre_dispatch_internal_deadline,
+                ) {
+                    Ok(owner) => Some(owner),
+                    Err(reason) => {
+                        eprintln!(
+                        "[hull-resource] owner_refused reason={reason} legacy_fallback=unqualified"
+                    );
+                        None
+                    }
+                }
+            }
+        }
+    } else {
+        None
+    };
     let configured_deadline = (!config.timeout.is_zero())
         .then(|| verification_start.checked_add(config.timeout))
         .flatten();
@@ -2362,6 +3221,7 @@ pub(crate) fn handle_beta_crown_command(
     }
 
     let mut dispatch_context = DispatchContext {
+        input_head_continuation: instance_overrides.input_head_continuation.as_deref(),
         model_path: &model,
         onnx_load_config: &onnx_load_config,
         model_net: &mut model_net,
@@ -2381,8 +3241,6 @@ pub(crate) fn handle_beta_crown_command(
         run_upfront_pgd,
         engine_owns_deferred_pgd,
         outer_wrapper_owns_deferred_pgd,
-        safenlp_direct_mip_first: instance_overrides.safenlp_direct_mip_first,
-        cgan_input_leaf_route: instance_overrides.cgan_input_leaf_route,
         gemm_engine,
         attack_engine_source,
         compute_device: compute_device.clone(),
@@ -2392,7 +3250,10 @@ pub(crate) fn handle_beta_crown_command(
         domain_batch_metrics_jsonl: domain_batch_metrics_jsonl.as_deref(),
         verification_start,
         overall_deadline: pre_dispatch_internal_deadline,
+        #[cfg(feature = "mip")]
+        verification_resources,
         post_bab_wrapper_attack_enabled: instance_overrides.post_bab_wrapper_attack_enabled,
+        attack_concurrent_wrapper: instance_overrides.attack_concurrent_wrapper,
         json,
         sigmoid_peeled,
         proof_opts: &proof_opts,
@@ -2477,8 +3338,8 @@ pub(in crate::commands::beta_crown) fn supports_independent_singleton_domain_lis
 ///   opt-in enabled. The opt-in defaults to false and is currently armed only
 ///   by the LinearizeNN 2024 competition preset.
 ///
-/// Part of #4406: DomainList dispatch promotion for single-objective lanes.
-/// Re: #2326 — promotion does not resolve queue/cache hardening.
+/// Part of the DomainList dispatch promotion for single-objective lanes; it does
+/// not resolve queue/cache hardening.
 pub(crate) fn should_auto_promote_gpu_bab(
     cli_gpu_bab: bool,
     is_graph_model: bool,
@@ -2499,7 +3360,7 @@ pub(crate) fn should_auto_promote_gpu_bab(
     if !supported_heuristic {
         return false;
     }
-    // Guard: generic multi-clause disjunctive specs regress on gpu_bab (#4409).
+    // Guard: generic multi-clause disjunctive specs regress on gpu_bab.
     // The sole opt-in exception is decomposed explicitly by the prechecked
     // verifier: two singleton clauses over one canonical input box,
     // InputSplit only. The typed config default is false so unrelated
@@ -2515,19 +3376,39 @@ pub(crate) fn should_auto_promote_gpu_bab(
         && vnnlib_spec.is_some_and(supports_independent_singleton_domain_list_spec)
 }
 
-/// Whether the preset opts into the softmax "complex" decomposition
-/// (`solver.alpha-crown.softmax: complex`, also accepted under
-/// `bab.alpha-crown`), honoring the `NY_NO_SOFTMAX_COMPLEX=1` kill-switch
-/// (disable-flag principle: the preset field is the opt-in, the env var the
-/// emergency opt-out). Unknown values warn and keep the default direct-LSE
-/// softmax relaxation.
-fn resolve_preset_softmax_complex(preset_config: Option<&preset::PresetConfig>) -> bool {
-    let requested = preset_config.and_then(|p| {
+/// The `softmax` value selecting the fixed-index shift (#softmax-fixed-index).
+/// One spelling for the resolver and the preset-load validation.
+const SOFTMAX_COMPLEX_FIXED_INDEX: &str = preset::SOFTMAX_MODE_COMPLEX_FIXED_INDEX;
+
+/// The requested `softmax` preset value (`solver.alpha-crown` first, then
+/// `bab.alpha-crown`).
+fn requested_preset_softmax(preset_config: Option<&preset::PresetConfig>) -> Option<&str> {
+    preset_config.and_then(|p| {
         p.solver
             .alpha_crown
             .softmax
             .as_deref()
             .or(p.bab.alpha_crown.softmax.as_deref())
+    })
+}
+
+/// Whether the preset opts into the softmax "complex" decomposition
+/// (`solver.alpha-crown.softmax: complex` or `complex_fixed_index`, also
+/// accepted under `bab.alpha-crown`), honoring the `NY_NO_SOFTMAX_COMPLEX=1`
+/// kill-switch for BOTH values (disable-flag principle: the preset field is the
+/// opt-in, the env var the emergency opt-out). Unknown values warn and keep the
+/// default direct-LSE softmax relaxation (a loaded preset never carries one:
+/// `validate_alpha_preset` refuses it). Which shift runs is
+/// [`resolve_preset_softmax_fixed_index`].
+fn resolve_preset_softmax_complex(preset_config: Option<&preset::PresetConfig>) -> bool {
+    // #softmax-fixed-index: the fixed-index value is a member of the complex
+    // family, so it goes through the one kill-switch arm below unchanged.
+    let requested = requested_preset_softmax(preset_config).map(|value| {
+        if value.eq_ignore_ascii_case(SOFTMAX_COMPLEX_FIXED_INDEX) {
+            "complex"
+        } else {
+            value
+        }
     });
     match requested {
         None => false,
@@ -2541,12 +3422,21 @@ fn resolve_preset_softmax_complex(preset_config: Option<&preset::PresetConfig>) 
         }
         Some(other) => {
             warn!(
-                "preset field solver.alpha-crown.softmax '{}' is not supported (expected 'complex') — using the default direct-LSE softmax relaxation",
+                "preset field solver.alpha-crown.softmax '{}' is not supported (expected 'complex' or 'complex_fixed_index') — using the default direct-LSE softmax relaxation",
                 other
             );
             false
         }
     }
+}
+
+/// Whether the requested softmax decomposition shifts by the FIXED per-row
+/// index `x_{j*}` (`softmax: complex_fixed_index`) rather than a constant.
+/// Consulted only after [`resolve_preset_softmax_complex`] returned true,
+/// which is where the kill switch lives.
+fn resolve_preset_softmax_fixed_index(preset_config: Option<&preset::PresetConfig>) -> bool {
+    requested_preset_softmax(preset_config)
+        .is_some_and(|value| value.eq_ignore_ascii_case(SOFTMAX_COMPLEX_FIXED_INDEX))
 }
 
 /// Parse a preset's MIP solver into the first-party solver policy.
@@ -2626,5 +3516,10 @@ fn resolve_enable_cuts(
     cli_enable || preset_value
 }
 
+/// #admission-precision: the routing-shape extractor's goldens and the
+/// refactored lane checks' bit-identity.
+#[cfg(test)]
+#[path = "spec_shape_tests.rs"]
+mod spec_shape_tests;
 #[cfg(test)]
 mod tests;

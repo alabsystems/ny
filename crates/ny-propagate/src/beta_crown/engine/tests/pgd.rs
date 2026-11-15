@@ -2,14 +2,14 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for PGD counterexample re-validation (#2679, #2711).
+//! Tests for PGD counterexample re-validation.
 //!
 //! Verifies that `try_pgd_attack` independently re-evaluates counterexamples
 //! via a clean forward pass and validates input bounds before promoting
 //! to `Violated` status. Matches alpha-beta-CROWN's
 //! `default_adv_example_finalizer` + `test_conditions` pattern.
 //!
-//! The re-validation rejection tests (#2711) exercise the boolean gate at
+//! The re-validation rejection tests exercise the boolean gate at
 //! `pgd.rs` directly via `PgdAttacker::evaluate()`, which keeps the assertions
 //! deterministic and focused on the threshold predicate itself.
 
@@ -195,7 +195,7 @@ fn test_pgd_disabled_returns_original() {
 }
 
 /// A terminal PGD fallback may promote the exact overall deadline only when
-/// the attack loop actually polls that deadline as expired.
+/// an attacker checkpoint actually polls that deadline as expired.
 #[ntest::timeout(5000)]
 #[test]
 fn terminal_pgd_timeout_records_the_exact_observed_deadline() {
@@ -239,9 +239,8 @@ fn terminal_pgd_timeout_records_the_exact_observed_deadline() {
     );
 }
 
-/// Merely returning after a deadline is not enough: a zero-step batched attack
-/// performs its final evaluation without polling the deadline and must not
-/// manufacture terminal-timeout provenance.
+/// A live zero-step batched attack still performs its final evaluation, but
+/// an incoming Timeout alone must not manufacture observed-expiry provenance.
 #[ntest::timeout(5000)]
 #[test]
 fn zero_step_batched_pgd_does_not_claim_an_unobserved_deadline() {
@@ -251,6 +250,7 @@ fn zero_step_batched_pgd_does_not_claim_an_unobserved_deadline() {
         arr1(&[1.0_f32, 1.0]).into_dyn(),
     )
     .unwrap();
+    let engine = Arc::new(CountingGemmEngine::new());
     let verifier = BetaCrownVerifier::new_with_engine(
         BetaCrownConfig {
             enable_pgd_attack: true,
@@ -259,17 +259,130 @@ fn zero_step_batched_pgd_does_not_claim_an_unobserved_deadline() {
             verify_upper_bound: true,
             ..BetaCrownConfig::default()
         },
-        Arc::new(CountingGemmEngine::new()),
+        engine.clone(),
     );
     let original_result = crate::beta_crown::result::BetaCrownResult {
         result: BabVerificationStatus::Timeout,
-        domains_explored: 1,
+        domains_explored: 7,
         time_elapsed: Duration::from_millis(10),
-        max_depth_reached: 0,
-        output_bounds: None,
-        cuts_generated: 0,
-        domains_verified: 0,
+        max_depth_reached: 3,
+        output_bounds: Some(
+            BoundedTensor::new(arr1(&[-1.0_f32]).into_dyn(), arr1(&[4.0_f32]).into_dyn()).unwrap(),
+        ),
+        cuts_generated: 2,
+        domains_verified: 5,
     };
+    let expected = original_result.clone();
+    let live = Instant::now()
+        .checked_add(Duration::from_secs(30))
+        .expect("thirty seconds after now is representable");
+
+    crate::beta_crown::result::reset_global_timeout_deadline_source();
+    crate::beta_crown::result::note_global_timeout_engine_invocation();
+    let result = verifier
+        .try_pgd_attack_with_deadline(&network, &input, 10.0, original_result, Some(live))
+        .expect("live zero-step PGD should return the original timeout");
+
+    assert_unchanged_zero_step_timeout(&result, &expected);
+    assert_eq!(
+        crate::beta_crown::result::take_global_timeout_deadline_source(),
+        None,
+        "a live zero-step return must not manufacture an observed expiry"
+    );
+
+    // A finite named Linear evaluator contracts through bounded CPU loops,
+    // bypassing gemm_f32. Observe actual completed point work and its entire
+    // independently authored output instead of counting the bypassed engine.
+    let point = arr1(&[0.25_f32, 0.5]).into_dyn();
+    let point_bounds = BoundedTensor::concrete(point.clone()).unwrap();
+    let attacker = PgdAttacker::new(PgdConfig {
+        num_restarts: 2,
+        num_steps: 0,
+        deadline: Some(live),
+        ..PgdConfig::default()
+    })
+    .with_engine(engine.as_ref());
+    let observed = attacker
+        .attack(&network, &point_bounds, 0, 0.0, true)
+        .expect("live zero-step point attack must complete both restarts");
+    assert!(observed.found_counterexample);
+    assert_eq!(observed.restarts_completed, 2);
+    assert_eq!(observed.failed_restarts, 0);
+    assert_eq!(observed.total_evaluations, 2);
+    assert_eq!(observed.counterexample.as_ref().unwrap(), &point);
+    assert_eq!(
+        observed.output.as_ref().unwrap(),
+        &arr1(&[1.25_f32]).into_dyn()
+    );
+    assert_eq!(observed.best_output_value, 1.25);
+    assert!(!attacker.deadline_exhausted());
+
+    // The ordinary wrapper independently confirms y=.25+2*.5=1.25 and
+    // checks containment before replacing the incoming Timeout with Violated.
+    crate::beta_crown::result::reset_global_timeout_deadline_source();
+    crate::beta_crown::result::note_global_timeout_engine_invocation();
+    let witness = verifier
+        .try_pgd_attack_with_deadline(&network, &point_bounds, 0.0, expected.clone(), Some(live))
+        .expect("the live known point must pass independent confirmation and containment");
+    let BabVerificationStatus::Violated {
+        counterexample,
+        output,
+    } = &witness.result
+    else {
+        panic!(
+            "expected the independently confirmed known witness, got {:?}",
+            witness.result
+        );
+    };
+    assert_eq!(counterexample.as_slice(), &[0.25_f32, 0.5]);
+    assert_eq!(output.as_slice(), &[1.25_f32]);
+    assert_unchanged_zero_step_metadata(&witness, &expected);
+    assert_eq!(
+        crate::beta_crown::result::take_global_timeout_deadline_source(),
+        None,
+        "a live independently confirmed witness must not manufacture expiry provenance"
+    );
+    assert_eq!(
+        engine.gemm_calls(),
+        0,
+        "finite named Linear point work must retain its bounded CPU route"
+    );
+}
+
+/// An expired zero-step attack observes admission expiry before allocating or
+/// evaluating its batch, and must retain that exact source and incoming result.
+#[ntest::timeout(5000)]
+#[test]
+fn zero_step_batched_pgd_records_expired_admission_without_evaluation() {
+    let network = linear_2_to_1();
+    let input = BoundedTensor::new(
+        arr1(&[0.0_f32, 0.0]).into_dyn(),
+        arr1(&[1.0_f32, 1.0]).into_dyn(),
+    )
+    .unwrap();
+    let engine = Arc::new(CountingGemmEngine::new());
+    let verifier = BetaCrownVerifier::new_with_engine(
+        BetaCrownConfig {
+            enable_pgd_attack: true,
+            pgd_restarts: 2,
+            pgd_steps: 0,
+            verify_upper_bound: true,
+            ..BetaCrownConfig::default()
+        },
+        engine.clone(),
+    );
+    let original_result = crate::beta_crown::result::BetaCrownResult {
+        result: BabVerificationStatus::Timeout,
+        domains_explored: 7,
+        time_elapsed: Duration::from_millis(10),
+        max_depth_reached: 3,
+        output_bounds: Some(
+            BoundedTensor::new(arr1(&[-1.0_f32]).into_dyn(), arr1(&[4.0_f32]).into_dyn()).unwrap(),
+        ),
+        cuts_generated: 2,
+        domains_verified: 5,
+    };
+    let expected = original_result.clone();
     let expired = Instant::now()
         .checked_sub(Duration::from_millis(1))
         .expect("one millisecond before now is representable");
@@ -278,13 +391,46 @@ fn zero_step_batched_pgd_does_not_claim_an_unobserved_deadline() {
     crate::beta_crown::result::note_global_timeout_engine_invocation();
     let result = verifier
         .try_pgd_attack_with_deadline(&network, &input, 10.0, original_result, Some(expired))
-        .expect("zero-step PGD should return the original timeout");
+        .expect("expired zero-step PGD should retain the incoming timeout");
 
-    assert!(matches!(result.result, BabVerificationStatus::Timeout));
+    assert_unchanged_zero_step_timeout(&result, &expected);
+    assert_eq!(
+        engine.gemm_calls(),
+        0,
+        "expired admission must refuse before any batch evaluation"
+    );
     assert_eq!(
         crate::beta_crown::result::take_global_timeout_deadline_source(),
-        None,
-        "a natural zero-step return must fail closed without an expiry poll"
+        Some(expired),
+        "observed admission expiry must retain the caller's exact Instant"
+    );
+}
+
+fn assert_unchanged_zero_step_timeout(
+    actual: &crate::beta_crown::result::BetaCrownResult,
+    expected: &crate::beta_crown::result::BetaCrownResult,
+) {
+    assert!(matches!(actual.result, BabVerificationStatus::Timeout));
+    assert!(matches!(expected.result, BabVerificationStatus::Timeout));
+    assert_unchanged_zero_step_metadata(actual, expected);
+}
+
+fn assert_unchanged_zero_step_metadata(
+    actual: &crate::beta_crown::result::BetaCrownResult,
+    expected: &crate::beta_crown::result::BetaCrownResult,
+) {
+    assert_eq!(actual.domains_explored, expected.domains_explored);
+    assert_eq!(actual.time_elapsed, expected.time_elapsed);
+    assert_eq!(actual.max_depth_reached, expected.max_depth_reached);
+    assert_eq!(actual.cuts_generated, expected.cuts_generated);
+    assert_eq!(actual.domains_verified, expected.domains_verified);
+    let actual_bounds = actual.output_bounds.as_ref().unwrap();
+    let expected_bounds = expected.output_bounds.as_ref().unwrap();
+    assert_eq!(actual_bounds.lower(), expected_bounds.lower());
+    assert_eq!(actual_bounds.upper(), expected_bounds.upper());
+    assert_eq!(
+        actual_bounds.l2_constraint(),
+        expected_bounds.l2_constraint()
     );
 }
 
@@ -344,7 +490,7 @@ fn test_pgd_revalidation_lower_bound_mode() {
 }
 
 // ---------------------------------------------------------------------------
-// Re-validation rejection path tests (#2711)
+// Re-validation rejection path tests
 // ---------------------------------------------------------------------------
 
 /// Simple 2→1 ReLU network: output = ReLU(x0 + 2*x1 - 1.5).
@@ -380,8 +526,6 @@ fn assert_pgd_source_contains_2711(snippet: &str, context: &str) {
 ///
 /// Extends the existing linear-network tests to cover a nonlinear network,
 /// ensuring re-validation works correctly through ReLU discontinuities.
-///
-/// Part of #2711.
 #[ntest::timeout(10000)]
 #[test]
 fn test_pgd_revalidation_relu_genuine_counterexample_2711() {
@@ -493,8 +637,6 @@ fn test_pgd_revalidation_uses_independent_cpu_forward_4419() {
 /// `found_counterexample=true` with an incorrect `best_output_value` would
 /// promote a non-violating point to `Violated`. This test verifies the
 /// gate logic that prevents such promotion.
-///
-/// Part of #2711.
 #[ntest::timeout(5000)]
 #[test]
 fn test_pgd_revalidation_value_gate_rejects_below_threshold_2711() {
@@ -579,8 +721,6 @@ fn test_pgd_revalidation_value_gate_source_guard_2711() {
 /// Exercises the `input_within_bounds` check at pgd.rs:114-117 by verifying
 /// that an out-of-bounds candidate that would otherwise be a genuine violation
 /// is correctly rejected by the bounds check.
-///
-/// Part of #2711.
 #[ntest::timeout(5000)]
 #[test]
 fn test_pgd_revalidation_bounds_gate_rejects_out_of_bounds_2711() {

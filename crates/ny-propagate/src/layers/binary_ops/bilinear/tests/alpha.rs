@@ -51,7 +51,7 @@ fn make_bilinear_test_bounds() -> (BoundedTensor, BoundedTensor) {
     (q, kk)
 }
 
-/// Alpha path produces sound, NaN-free bounds (#286 Approach A+B).
+/// Alpha path produces sound, NaN-free bounds.
 #[ntest::timeout(10000)]
 #[test]
 fn test_alpha_path_broadcast_soundness() {
@@ -74,7 +74,7 @@ fn test_alpha_path_broadcast_soundness() {
     assert_bounds_no_nan_ordered("K_alpha", &bk);
 }
 
-/// Alpha broadcast composition is at least as tight as interval-mul (#286).
+/// Alpha broadcast composition is at least as tight as interval-mul.
 #[ntest::timeout(10000)]
 #[test]
 fn test_alpha_broadcast_tighter_than_interval_mul() {
@@ -110,7 +110,7 @@ fn test_alpha_broadcast_tighter_than_interval_mul() {
 }
 
 /// Direction-dependent alpha: with uniform alphas (all ones), bidirectional
-/// composition produces identical results to single-direction (#286 Phase 2).
+/// composition produces identical results to single-direction.
 #[ntest::timeout(10000)]
 #[test]
 fn test_bidirectional_matches_single_when_uniform() {
@@ -157,7 +157,7 @@ fn test_bidirectional_matches_single_when_uniform() {
 }
 
 /// Direction-dependent alpha: different r_l/r_u for lower vs upper directions
-/// still produces sound (NaN-free, lower <= upper) bounds (#286 Phase 2).
+/// still produces sound (NaN-free, lower <= upper) bounds.
 #[ntest::timeout(10000)]
 #[test]
 fn test_bidirectional_different_alphas_sound() {
@@ -189,7 +189,7 @@ fn test_bidirectional_different_alphas_sound() {
 }
 
 /// Direction-dependent alpha via full propagate path matches direct bidirectional
-/// compose when using the same alpha slices (#286 Phase 2).
+/// compose when using the same alpha slices.
 #[ntest::timeout(10000)]
 #[test]
 fn test_propagate_alpha_matches_direct_bidirectional() {

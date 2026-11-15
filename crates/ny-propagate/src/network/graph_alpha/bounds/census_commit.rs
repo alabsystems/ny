@@ -81,7 +81,7 @@ pub(in crate::network::graph_alpha) struct CensusCommitStats {
     /// Nodes present in both maps with matching shapes.
     pub(in crate::network::graph_alpha) nodes_compared: usize,
     /// Incumbent nodes skipped: absent from the published map or shape drift
-    /// (pre- vs post-concat views, #4384). Skipping keeps the published entry
+    /// (pre- vs post-concat views). Skipping keeps the published entry
     /// — sound, merely un-tightened.
     pub(in crate::network::graph_alpha) nodes_skipped: usize,
     /// Elements where the published candidate is strictly tighter than the

@@ -145,7 +145,7 @@ fn forward_masks_match_graph_forward_signs_and_outputs() {
     for (k, point) in points.iter().enumerate() {
         let x = ArrayD::from_shape_vec(IxDyn(&[1, 4, 4]), point.clone()).expect("shape");
         let node_bounds = g
-            .collect_node_bounds(&BoundedTensor::concrete(x.clone()).expect("concrete"))
+            .collect_node_bounds(&BoundedTensor::concrete(x).expect("concrete"))
             .expect("node bounds");
         // Graph point forward output vs template forward output.
         let out = node_bounds.get("lin2").expect("output node").center();

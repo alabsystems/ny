@@ -119,7 +119,7 @@ def parse_ny_result(result, method, elapsed):
 def run_ny_verify(model_path, property_path, method, verbose=False):
     """Run ny verify command and parse results."""
     cmd = [
-        "cargo", "run", "--release", "-p", "ny-cli", "--",
+        "targo", "--unverified", "run", "--release", "-p", "ny-cli", "--",
         "verify", model_path,
         "--property", property_path,
         "--method", method,

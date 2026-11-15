@@ -265,11 +265,11 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(spec.output_constraints().is_empty());
+        assert_eq!(spec.output_constraints().len(), 0);
 
         let spec2 =
             VerificationSpec::new(vec![Bound::new(-1.0, 1.0)], vec![Bound::new(0.0, 1.0)]).unwrap();
-        assert!(spec2.output_constraints().is_empty());
+        assert_eq!(spec2.output_constraints().len(), 0);
     }
 
     #[test]

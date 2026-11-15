@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! End-to-end CNN verification tests for Patches mode gate (#2613).
+//! End-to-end CNN verification tests for Patches mode gate.
 //!
 //! Tests load ONNX CNN models, run CROWN propagation through the full
 //! ONNX → GraphNetwork → propagate_crown pipeline, and verify soundness.
@@ -117,7 +117,7 @@ fn verify_cnn_instance(model: &OnnxModel, center: &ArrayD<f32>, eps: f32, id: us
 /// regions with different centers and epsilon, verifies CROWN propagation
 /// produces sound bounds that are tighter than IBP.
 ///
-/// Primary gate criterion for #2613 Patches Mode.
+/// Primary gate criterion for Patches Mode.
 #[ntest::timeout(60000)]
 #[test]
 fn test_mnist_conv_crown_5_instances_2613() {
@@ -229,7 +229,7 @@ fn require_external_benchmark_model(relative_path: &str) -> String {
     path.display().to_string()
 }
 
-/// Gate test (#2613): CIFAR-10 ResNet 2-block loads and IBP verifies correctly.
+/// Gate test: CIFAR-10 ResNet 2-block loads and IBP verifies correctly.
 ///
 /// Loads the VNN-COMP 2021 `resnet_2b.onnx` model (17 nodes, 2 residual
 /// blocks with skip connections) and runs IBP with 3 input centers.
@@ -279,7 +279,7 @@ fn test_cifar10_resnet_2b_ibp_gate_2613() {
     }
 }
 
-/// Gate test (#2613): CIFAR-10 ResNet CROWN produces sound bounds.
+/// Gate test: CIFAR-10 ResNet CROWN produces sound bounds.
 ///
 /// Runs full CROWN backward on resnet_2b.onnx with a single input center.
 /// This exercises the graph engine's Patches→Dense transitions at residual

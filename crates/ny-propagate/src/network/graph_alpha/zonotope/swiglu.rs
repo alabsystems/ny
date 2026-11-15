@@ -120,7 +120,7 @@ impl GraphNetwork {
         // The zonotope multiplication (up * silu(gate)) is quadratic, so large
         // post-linear coefficients cause cross-term explosion.
         //
-        // SOUNDNESS FIX (#2386): We no longer normalize the input to the SiLU.
+        // SOUNDNESS FIX: We no longer normalize the input to the SiLU.
         // SiLU is nonlinear: silu(x/s) ≠ silu(x)/s, so normalizing before SiLU
         // then scaling back by s² was unsound. Instead:
         //   1. Compute gate, silu, up at full scale (correct values)
@@ -170,7 +170,7 @@ impl GraphNetwork {
         // (a/s) * (b/s) * s² = a * b.
         let result = if zonotope_scale > 1.0 {
             let scale_sq = (zonotope_scale as f64) * (zonotope_scale as f64);
-            // Directed rounding: lower → next_down, upper → next_up (#2225).
+            // Directed rounding: lower → next_down, upper → next_up.
             BoundedTensor::new(
                 result
                     .lower()
@@ -291,7 +291,7 @@ impl GraphNetwork {
         let base_width = base_bounds.max_width();
 
         // Compute normalization scale for the quadratic mul_elementwise step.
-        // SOUNDNESS FIX (#2386): normalize AFTER silu, not before.
+        // SOUNDNESS FIX: normalize AFTER silu, not before.
         // See try_ffn_swiglu_bounds_zonotope_block for detailed explanation.
         let max_spectral = gate_linear.spectral_norm().max(up_linear.spectral_norm());
         let zonotope_scale = if base_width > 1.0 || max_spectral > 1.0 {
@@ -333,7 +333,7 @@ impl GraphNetwork {
         // Scale back by s² — exact because (a/s)*(b/s)*s² = a*b.
         let result = if zonotope_scale > 1.0 {
             let scale_sq = (zonotope_scale as f64) * (zonotope_scale as f64);
-            // Directed rounding: lower → next_down, upper → next_up (#2225).
+            // Directed rounding: lower → next_down, upper → next_up.
             BoundedTensor::new(
                 result
                     .lower()
@@ -486,7 +486,7 @@ impl GraphNetwork {
         let base_width = base_bounds.max_width();
 
         // Compute normalization scale for the quadratic mul_elementwise step.
-        // SOUNDNESS FIX (#2386): normalize AFTER silu, not before.
+        // SOUNDNESS FIX: normalize AFTER silu, not before.
         // Include down spectral norm for numerical safety (conservative).
         let max_spectral = gate_linear
             .spectral_norm()

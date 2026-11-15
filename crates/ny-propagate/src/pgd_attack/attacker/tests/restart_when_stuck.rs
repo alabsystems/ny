@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Regression tests for PGD restart-when-stuck (#4278).
+//! Regression tests for PGD restart-when-stuck.
 //!
 //! Reference: alpha-beta-CROWN `general_spec_attack.py:409-427`.
 

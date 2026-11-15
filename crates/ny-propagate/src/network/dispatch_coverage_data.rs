@@ -8,11 +8,10 @@
 //! used by [`super::dispatch_coverage_tests`]. Separated to keep each file
 //! under the 500-line limit.
 //!
-//! After the canonical dispatch sites were made exhaustive (commit 6b872d2,
-//! #3424), the coverage test tracks each site's *explicit* Layer variant
-//! references rather than the missing-from-canonical delta. This keeps
-//! arrays small (10-20 items per site) and directly documents what each
-//! dispatch site handles.
+//! Since the canonical dispatch sites were made exhaustive, the coverage test
+//! tracks each site's *explicit* Layer variant references rather than the
+//! missing-from-canonical delta. This keeps arrays small (10-20 items per
+//! site) and directly documents what each dispatch site handles.
 
 use std::{fs, path::Path, sync::OnceLock};
 
@@ -193,7 +192,7 @@ pub(super) const MATCH_BASED_SITES: &[DispatchSiteExpectation] = &[
     // with pre-filters for ReLU, multi-input ops, and SkipMerge (commit 920096df1).
     // Tracked in DELEGATING_SITES instead.
     //
-    // Patches-aware wrapper: exhaustive — no catch-all since #3424.
+    // Patches-aware wrapper: exhaustive — no catch-all.
     //
     // The marker points at `crown_backward_step_patches_impl`, not at
     // `crown_backward_step_patches`. The latter is now a thin wrapper that
@@ -237,7 +236,7 @@ pub(super) const MATCH_BASED_SITES: &[DispatchSiteExpectation] = &[
     // propagate_crown_fast/propagate_crown_with_linear delegate to
     // crown_backward_step_patches (tracked above). Removed after dispatch dedup.
     //
-    // backward_pass_core: exhaustive — no catch-all since #3424.
+    // backward_pass_core: exhaustive — no catch-all.
     DispatchSiteExpectation {
         name: "network::alpha_crown::backward_pass_core",
         source: SourceText::Static(ALPHA_CROWN_BACKWARD_SRC),
@@ -267,7 +266,7 @@ pub(super) const MATCH_BASED_SITES: &[DispatchSiteExpectation] = &[
         expected_explicit: &[],
         exhaustive: true,
     },
-    // Graph batched CROWN inner loop: exhaustive — no catch-all since #3424.
+    // Graph batched CROWN inner loop: exhaustive — no catch-all.
     DispatchSiteExpectation {
         name: "network::graph_crown_batched::propagate_crown_batched_inner",
         source: SourceText::Static(GRAPH_CROWN_BATCHED_SRC),
@@ -356,7 +355,7 @@ pub(super) const DELEGATING_SITES: &[DelegatingSiteExpectation] = &[
             "Where",
         ],
     },
-    // graph_crown shared helper after #3935/#3960 dedup. Coordinator-specific
+    // graph_crown shared helper after the dispatch dedup. Coordinator-specific
     // overrides stay in SITE_SPECIFIC_ONLY_SITES below.
     DelegatingSiteExpectation {
         name: "graph_crown::dispatch_shared_core",
@@ -375,8 +374,8 @@ pub(super) const DELEGATING_SITES: &[DelegatingSiteExpectation] = &[
         fn_marker: "fn process_shared_dispatch_node(",
         expected_site_specific: &[],
     },
-    // After #4186 nonlinear extraction, dag_alpha_backward_pass_core only keeps
-    // the Conv2d Patches-mode init check (#3293). ReLU/Sigmoid/Sqrt/Tanh handling
+    // After the nonlinear extraction, dag_alpha_backward_pass_core only keeps
+    // the Conv2d Patches-mode init check. ReLU/Sigmoid/Sqrt/Tanh handling
     // was moved to handle_nonlinear_node in nonlinear.rs and is tracked below.
     DelegatingSiteExpectation {
         name: "graph_alpha::dag_alpha_backward_pass_core",
@@ -385,7 +384,7 @@ pub(super) const DELEGATING_SITES: &[DelegatingSiteExpectation] = &[
         expected_site_specific: &["Conv2d"],
     },
     // graph_alpha/bounds keeps alpha/non-alpha ReLU logic, MulBinary relaxation
-    // site-specific (#2094, #3396), deterministic/mixed Where handling (#3676),
+    // site-specific, deterministic/mixed Where handling,
     // and Sigmoid/Sqrt/Tanh alpha path overrides. The backward loop carrying
     // these site-specific `Layer::*` arms were extracted from
     // `propagate_crown_to_node_core` into the shared per-seed helper
@@ -442,7 +441,7 @@ pub(super) const SITE_SPECIFIC_ONLY_SITES: &[SiteSpecificOnlyExpectation] = &[
     // `Layer::Conv2d` directly — it is driven by the precomputed `plan.has_conv2d`
     // flag, and per-node Conv2d Patches backward is handled by the exhaustive
     // crown_backward_step_patches site. Linear handling was extracted to
-    // backward_node_dispatch (#3935). The short-name truncation entry is now a
+    // backward_node_dispatch. The short-name truncation entry is now a
     // thin delegate; track the real implementation that owns the Layer:: refs
     // (#dedup-root-collections Fix B).
     SiteSpecificOnlyExpectation {
@@ -452,7 +451,7 @@ pub(super) const SITE_SPECIFIC_ONLY_SITES: &[SiteSpecificOnlyExpectation] = &[
             "fn crown_backward_with_relaxation_and_deadline_and_truncation_with_node_bounds(",
         expected_layer_refs: ExpectedLayerRefs::Static(&["Div", "MulBinary", "ReLU", "Where"]),
     },
-    // After #3960 split, the short-name wrapper in mod.rs is a thin delegate.
+    // After the module split, the short-name wrapper in mod.rs is a thin delegate.
     // Track the real implementation in core.rs which owns the Layer:: refs.
     SiteSpecificOnlyExpectation {
         name: "graph_crown::spec_propagation::coordinator",
@@ -460,7 +459,7 @@ pub(super) const SITE_SPECIFIC_ONLY_SITES: &[SiteSpecificOnlyExpectation] = &[
         fn_marker: "pub(crate) fn propagate_crown_with_specs_and_engine_with_linear_and_reference_bounds_and_deadline_and_truncation(",
         expected_layer_refs: ExpectedLayerRefs::Loader(graph_crown_spec_expected_layer_refs),
     },
-    // #4186 extracted nonlinear alpha-CROWN handling into nonlinear.rs. Keep
+    // Nonlinear alpha-CROWN handling was extracted into nonlinear.rs. Keep
     // the explicit ReLU/Reciprocal/Sigmoid/Sqrt/Tanh site-specific split covered
     // even though dag_alpha_backward_pass_core now only retains the dispatch call.
     SiteSpecificOnlyExpectation {

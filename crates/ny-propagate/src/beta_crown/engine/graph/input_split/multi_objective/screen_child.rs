@@ -39,7 +39,7 @@ pub(super) type WarmMultiObjComputeBoundsFn<'a> = dyn Fn(
     ) -> Result<WarmMultiObjBoundsResult>
     + 'a;
 
-/// Screen a multi-objective child domain through clipping and bounding. Part of #3882.
+/// Screen a multi-objective child domain through clipping and bounding.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn screen_multi_obj_child(
     verifier: &BetaCrownVerifier,
@@ -179,8 +179,8 @@ pub(super) fn screen_multi_obj_child(
         return Ok(());
     }
 
-    // Relaxed mode keeps the single-pass clip-and-bound optimization
-    // (#1579 Phase 4). Complete mode recomputes once after clipping so the
+    // Relaxed mode keeps the single-pass clip-and-bound optimization.
+    // Complete mode recomputes once after clipping so the
     // spec pass can consume the tightened child-local node cache.
     if verifier.config.enable_relaxed_clip {
         if let Some(ref linear_bounds) = linear {

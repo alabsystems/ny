@@ -6,7 +6,7 @@
 """Check GPU CROWN benchmark CSVs against checked-in regression thresholds.
 
 Consumes the CSV emitted by:
-`cargo run -p ny-gpu --release --example measure_crown_backward_workloads`
+`targo --unverified run -p ny-gpu --release --example measure_crown_backward_workloads`
 
 The default policy covers one small CPU sanity path, the oversized
 soundnessbench CPU skip guard, and both the graph-collection plus direct warm

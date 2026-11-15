@@ -173,7 +173,7 @@ impl BatchedDomainsBuilder {
             return Ok(BatchedDomains::with_capacity(0, &self.layer_names));
         }
 
-        // Reject non-finite global bounds early (#2246).
+        // Reject non-finite global bounds early.
         super::utils::validate_global_bounds_finite(
             &self.lower_bounds,
             &self.upper_bounds,
@@ -197,7 +197,7 @@ impl BatchedDomainsBuilder {
             )));
         }
 
-        // Reject non-finite layer/input tensors before stacking (#3115).
+        // Reject non-finite layer/input tensors before stacking.
         // Builder stores individual domain arrays (not batched), so validate
         // elements directly rather than using the batched helper.
         for name in &self.layer_names {

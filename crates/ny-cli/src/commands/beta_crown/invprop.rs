@@ -230,7 +230,7 @@ mod tests {
 "#;
 
         let spec = ny_onnx::vnnlib::parse_vnnlib(content).unwrap();
-        assert!(spec.output_constraints.is_empty());
+        assert_eq!((spec.output_constraints).len(), 0);
 
         let mut alpha_config = AlphaCrownConfig::default();
         maybe_set_alpha_output_constraints(&mut alpha_config, Some(&spec)).unwrap();
@@ -265,7 +265,7 @@ mod tests {
         let mut spec = ny_onnx::vnnlib::VnnLibSpec::new();
         spec.num_outputs = 2;
         spec.output_constraint_clauses = vec![vec![OutputConstraint::LessEq(0, 1)]];
-        assert!(spec.output_constraints.is_empty());
+        assert_eq!((spec.output_constraints).len(), 0);
         assert!(!spec.is_disjunction);
 
         let mut alpha_config = AlphaCrownConfig::default();

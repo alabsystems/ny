@@ -8,7 +8,7 @@ use super::shared::update_alphas_adam;
 use super::AdamParams;
 use ndarray::Array1;
 
-/// Regression: beta1=1.0 caused bias_correction1=0, division by zero (#2315).
+/// Regression: beta1=1.0 caused bias_correction1=0, division by zero.
 #[test]
 fn test_adam_beta1_one_no_div_by_zero() {
     let mut alpha = Array1::from_vec(vec![0.5]);
@@ -28,7 +28,7 @@ fn test_adam_beta1_one_no_div_by_zero() {
     assert!((0.0..=1.0).contains(&alpha[0]), "alpha must be in [0, 1]");
 }
 
-/// Regression: beta2=1.0 caused bias_correction2=0, division by zero (#2315).
+/// Regression: beta2=1.0 caused bias_correction2=0, division by zero.
 #[test]
 fn test_adam_beta2_one_no_div_by_zero() {
     let mut alpha = Array1::from_vec(vec![0.5]);

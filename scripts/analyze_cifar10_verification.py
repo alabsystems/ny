@@ -12,7 +12,7 @@ import subprocess
 def run_verify(model_path, property_path, method="crown"):
     """Run ny verify and return parsed JSON output."""
     cmd = [
-        "cargo", "run", "--release", "--",
+        "targo", "--unverified", "run", "--release", "--",
         "verify", model_path,
         "--property", property_path,
         "--method", method,

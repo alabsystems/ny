@@ -9,6 +9,8 @@
 //! - `ibp_standard`: standard interval arithmetic IBP
 //! - `ibp_economic`: memory-efficient economic IBP
 //! - `crown_dense`: non-batched CROWN backward propagation
+//! - `crown_gemm`: the GEMM-shaped, bit-identical twin of `crown_dense`'s
+//!   McCormick nest (#vit-batched-bilinear, typed `bab.bilinear_gemm_kernel`)
 //! - `crown_batched`: batched CROWN backward propagation
 //! - `eval`: concrete evaluation / Jacobian
 //! - `helpers`: utility functions (scale, non-finite repair, finite checks)
@@ -23,11 +25,20 @@ use super::mul::{select_mccormick_plane, BoundDir};
 use crate::layers::activations::validate::validate_finite;
 use crate::{BatchedLinearBounds, LinearBounds};
 
-// Re-export shape helpers for sibling modules (BilinearCrownLayer alpha support, #3287).
+// Re-export shape helpers for sibling modules (BilinearCrownLayer alpha support).
 pub(super) use shape::{decode_batch_index_into_buf, parse_matmul_dims};
+// #vit-collector-throughput P2 step 1: the row-parallel McCormick machinery the
+// `BilinearCrown` alpha arm shares with the dense MatMul arm.
+pub(super) use crown_dense::{McCormickRowChunk, McCormickRowparBuffers, McCormickRowparShape};
+// #vit-batched-bilinear (ENGINE_PROGRAM V1): the GEMM-shaped McCormick
+// machinery the `BilinearCrown` alpha arm shares with the dense MatMul arm.
+pub(super) use crown_gemm::{
+    mccormick_gemm_backward, GemmSchedule, McCormickOperands, McCormickPlaneTable,
+};
 
 mod crown_batched;
 mod crown_dense;
+mod crown_gemm;
 mod eval;
 mod helpers;
 mod ibp_economic;
@@ -64,7 +75,7 @@ pub struct MatMulLayer {
     /// Used for Q @ K^T attention pattern.
     pub(crate) transpose_b: bool,
     /// Optional scaling factor (e.g., 1/sqrt(d_k) for attention).
-    /// `pub(crate)` to prevent bypassing `try_new` finite validation (#4307).
+    /// `pub(crate)` to prevent bypassing `try_new` finite validation.
     pub(crate) scale: Option<f32>,
     /// IBP mode selection for MatMul when both operands are perturbed.
     pub(crate) ibp_mode: MatMulIbpMode,

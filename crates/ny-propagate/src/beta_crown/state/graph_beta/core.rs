@@ -37,7 +37,7 @@ impl GraphBetaState {
     /// Reference: α,β-CROWN paper (Xu et al. 2021), Section 3.2: β initialized
     /// at 0 and optimized via projected gradient ascent.
     ///
-    /// Fix for #1817: Previously 0.1, which caused GPU BaB to produce wider
+    /// Previously 0.1, which caused GPU BaB to produce wider
     /// bounds than unconstrained CROWN when beta_iterations=0 (default).
     pub const DEFAULT_BETA_INIT: f32 = 0.0;
 

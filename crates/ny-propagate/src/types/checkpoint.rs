@@ -220,7 +220,7 @@ impl VerificationCheckpoint {
     /// `next_block_index` (resume pointer) and `completed_blocks.len()` (actual
     /// count) to guard against out-of-order `update()` calls that could advance
     /// `next_block_index` past `total_blocks` without processing all
-    /// intermediate blocks. (#2808)
+    /// intermediate blocks.
     pub fn into_result(self) -> Result<BlockWiseResult> {
         if !self.is_complete() {
             return Err(NyError::InvalidSpec(format!(

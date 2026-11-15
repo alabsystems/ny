@@ -19,6 +19,9 @@ mod sparse_merge;
 mod tests;
 
 pub(crate) use forward::try_lower_dense_chain;
+pub(crate) use forward::{
+    propagate_concrete_point_until, try_lower_dense_chain_until, LeadingAxisMode,
+};
 
 use crate::types::CrownIbpBoundsResult;
 use ny_core::{GemmEngine, Result};
@@ -104,7 +107,7 @@ pub(crate) trait NetworkIbpExt {
         engine: Option<&dyn GemmEngine>,
     ) -> Result<CrownIbpBoundsResult>;
 
-    /// Run CROWN-IBP with deadline enforcement (#3328).
+    /// Run CROWN-IBP with deadline enforcement.
     fn collect_crown_ibp_bounds_with_engine_deadline_and_status_impl(
         &self,
         input: &BoundedTensor,
@@ -125,7 +128,7 @@ pub(crate) trait NetworkIbpExt {
         patches_deadline_flat_bias_enabled: bool,
     ) -> Result<CrownIbpBoundsResult>;
 
-    /// Run CROWN-IBP with pre-computed IBP bounds (#3397).
+    /// Run CROWN-IBP with pre-computed IBP bounds.
     ///
     /// When `precomputed_ibp` is `Some`, the internal IBP forward pass is skipped
     /// and the provided per-layer bounds are used directly. This avoids redundant
@@ -154,7 +157,7 @@ pub(crate) trait NetworkIbpExt {
         patches_deadline_flat_bias_enabled: bool,
     ) -> Result<CrownIbpBoundsResult>;
 
-    /// Core CROWN-IBP collection that accepts optional pre-computed IBP (#3397).
+    /// Core CROWN-IBP collection that accepts optional pre-computed IBP.
     fn collect_crown_ibp_bounds_core(
         &self,
         input: &BoundedTensor,
@@ -163,7 +166,7 @@ pub(crate) trait NetworkIbpExt {
         deadline: Option<Instant>,
     ) -> Result<CrownIbpBoundsResult>;
 
-    /// Run IBP forward pass with deadline enforcement (#3328).
+    /// Run IBP forward pass with deadline enforcement.
     fn collect_ibp_bounds_with_deadline_impl(
         &self,
         input: &BoundedTensor,
@@ -174,6 +177,7 @@ pub(crate) trait NetworkIbpExt {
 impl NetworkIbpExt for Network {
     #[inline]
     fn propagate_ibp_impl(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
+        self.ensure_proof_eligible()?;
         forward::propagate_ibp(self, input)
     }
 
@@ -183,6 +187,7 @@ impl NetworkIbpExt for Network {
         input: &BoundedTensor,
         engine: Option<&dyn GemmEngine>,
     ) -> Result<BoundedTensor> {
+        self.ensure_proof_eligible()?;
         forward::propagate_ibp_with_engine(self, input, engine)
     }
 
@@ -192,6 +197,7 @@ impl NetworkIbpExt for Network {
         input: &BoundedTensor,
         engine: Option<&dyn GemmEngine>,
     ) -> Result<BoundedTensor> {
+        self.ensure_proof_eligible()?;
         forward::propagate_ibp_with_engine_preserve_leading_axis(self, input, engine)
     }
 
@@ -215,6 +221,7 @@ impl NetworkIbpExt for Network {
 
     #[inline]
     fn propagate_ibp_sound_impl(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
+        self.ensure_proof_eligible()?;
         forward::propagate_ibp_sound(self, input)
     }
 
@@ -224,16 +231,19 @@ impl NetworkIbpExt for Network {
         input: &BoundedTensor,
         engine: Option<&dyn GemmEngine>,
     ) -> Result<BoundedTensor> {
+        self.ensure_proof_eligible()?;
         forward::propagate_ibp_sound_with_engine(self, input, engine)
     }
 
     #[inline]
     fn collect_ibp_bounds_impl(&self, input: &BoundedTensor) -> Result<Vec<BoundedTensor>> {
+        self.ensure_proof_eligible()?;
         forward::collect_ibp_bounds(self, input)
     }
 
     #[inline]
     fn collect_ibp_bounds_sound_impl(&self, input: &BoundedTensor) -> Result<Vec<BoundedTensor>> {
+        self.ensure_proof_eligible()?;
         forward::collect_ibp_bounds_sound(self, input)
     }
 
@@ -364,6 +374,7 @@ impl NetworkIbpExt for Network {
         input: &BoundedTensor,
         deadline: Option<Instant>,
     ) -> Result<Vec<BoundedTensor>> {
+        self.ensure_proof_eligible()?;
         forward::collect_ibp_bounds_with_deadline(self, input, deadline)
     }
 }

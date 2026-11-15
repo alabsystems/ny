@@ -238,7 +238,7 @@ fn test_sensitivity_result_layers_by_sensitivity() {
     assert_eq!(sorted[2].name, "low"); // sensitivity=0.5
 }
 
-/// Regression test for #2601: NaN sensitivities must sort last, not corrupt rankings.
+/// Regression test: NaN sensitivities must sort last, not corrupt rankings.
 #[ntest::timeout(10000)]
 #[test]
 fn test_layers_by_sensitivity_nan_last_2601() {

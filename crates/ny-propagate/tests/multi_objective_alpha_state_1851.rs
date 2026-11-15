@@ -47,12 +47,17 @@ fn test_multi_objective_child_inherits_parent_alpha_state_1851() -> Result<()> {
         &input,
     ));
 
-    // Force a non-heuristic value to verify parent->child warm-start.
+    // Force a non-heuristic value: under the child-birth #alpha-split-refresh
+    // law this ancestor-box value must NOT survive into the child store.
     let parent_alpha = root
         .alpha_state_mut()
         .neuron_mut("relu0", 0)
         .expect("root alpha state should contain neuron 0");
     parent_alpha.set_alpha(0.37);
+    assert!(
+        !root.alpha_state().split_refresh(),
+        "root (no split constraints) must keep absolute stored alpha"
+    );
 
     // Split a different neuron so neuron 0 remains unconstrained in child.
     let child = root
@@ -64,15 +69,32 @@ fn test_multi_objective_child_inherits_parent_alpha_state_1851() -> Result<()> {
         )?
         .expect("active branch should be feasible");
 
+    // #alpha-split-refresh at child birth: the stored state is delta-form
+    // (split_refresh=true) with every value neutralized to the zero offset
+    // 0.5, so the composed slope is the CURRENT-box heuristic — the receipted
+    // law is that stale inherited alpha (the 0.37 above, optimized under
+    // ancestor boxes) measurably loses to that heuristic.
+    assert!(
+        child.alpha_state().split_refresh(),
+        "split child stored alpha must be delta-form (split_refresh=true)"
+    );
     let child_alpha = child
         .alpha_state()
         .neuron("relu0", 0)
-        .expect("child should inherit alpha for unconstrained neuron 0")
+        .expect("child should keep an optimizable entry for unconstrained neuron 0")
         .alpha();
     assert!(
-        (child_alpha - 0.37).abs() < 1e-6,
-        "expected inherited alpha=0.37, got {}",
+        (child_alpha - 0.5).abs() < 1e-6,
+        "expected neutralized delta 0.5 (NOT inherited 0.37), got {}",
         child_alpha
+    );
+    // Composed slope = current-box heuristic (neuron 0: l=-1, u=1 => u > -l
+    // is false => 0.0), independent of the parent's stored 0.37.
+    let composed = child.alpha_state().build_alpha_array("relu0", &input);
+    assert!(
+        composed[0].abs() < 1e-6,
+        "composed slope must equal the current-box heuristic 0.0, got {}",
+        composed[0]
     );
 
     // The split neuron is constrained in the child and should not be optimizable.
@@ -91,14 +113,18 @@ fn test_multi_objective_child_inherits_parent_alpha_state_1851() -> Result<()> {
         )?
         .expect("inactive branch should be feasible");
 
+    assert!(
+        inactive_child.alpha_state().split_refresh(),
+        "inactive split child stored alpha must be delta-form"
+    );
     let inactive_alpha = inactive_child
         .alpha_state()
         .neuron("relu0", 0)
-        .expect("inactive child should inherit alpha for unconstrained neuron 0")
+        .expect("inactive child should keep an optimizable entry for unconstrained neuron 0")
         .alpha();
     assert!(
-        (inactive_alpha - 0.37).abs() < 1e-6,
-        "expected inherited alpha=0.37 in inactive child, got {}",
+        (inactive_alpha - 0.5).abs() < 1e-6,
+        "expected neutralized delta 0.5 in inactive child, got {}",
         inactive_alpha
     );
     assert!(
@@ -301,15 +327,20 @@ fn test_multi_objective_optimized_root_alpha_vs_heuristic_benchmark_1851() {
     );
 }
 
-/// Algorithm audit: verify alpha propagation through depth-2 BaB tree.
+/// Algorithm audit: alpha state through a depth-2 BaB tree under the
+/// child-birth #alpha-split-refresh law.
 ///
 /// Graph: _input(3 neurons) -> ReLU(3) with 3 unstable neurons.
 /// Split neuron 0 at depth 0 -> child. Split neuron 1 at depth 1 -> grandchild.
-/// Neuron 2 (never split) should retain the root's custom alpha at depth 2.
 ///
-/// This tests the invariant that `from_parent` warm-start correctly chains
-/// through multiple generations: root alpha -> child alpha -> grandchild alpha
-/// for unconstrained neurons.
+/// Pins the structural staleness rule: every split descendant stores
+/// delta-form alpha (split_refresh=true, values neutralized to 0.5) instead
+/// of the ancestor-box absolute values — stale inherited alpha measurably
+/// loses to the current-box heuristic (REGRESSION doc receipts, incl.
+/// cora_2024 img398 channel-A discrimination, 2026-08-30). Entry PRESENCE
+/// still chains through generations (constrained neurons drop out), and the
+/// flag must survive into grandchildren (each birth re-applies it after
+/// `inherit_parent_values` rebuilds a fresh absolute state).
 #[ntest::timeout(10000)]
 #[test]
 fn test_multi_objective_alpha_depth_2_chain() -> Result<()> {
@@ -369,14 +400,18 @@ fn test_multi_objective_alpha_depth_2_chain() -> Result<()> {
         child.alpha_state().neuron("relu0", 0).is_none(),
         "neuron 0 is constrained at depth 1, should not be in alpha state"
     );
+    assert!(
+        child.alpha_state().split_refresh(),
+        "depth-1 child stored alpha must be delta-form (split_refresh=true)"
+    );
     let child_alpha_1 = child
         .alpha_state()
         .neuron("relu0", 1)
         .expect("neuron 1 should be in child alpha state")
         .alpha();
     assert!(
-        (child_alpha_1 - 0.60).abs() < 1e-6,
-        "child neuron 1 alpha should be 0.60 from parent, got {child_alpha_1}"
+        (child_alpha_1 - 0.5).abs() < 1e-6,
+        "child neuron 1 must be neutralized to 0.5 (NOT parent's 0.60), got {child_alpha_1}"
     );
     let child_alpha_2 = child
         .alpha_state()
@@ -384,8 +419,8 @@ fn test_multi_objective_alpha_depth_2_chain() -> Result<()> {
         .expect("neuron 2 should be in child alpha state")
         .alpha();
     assert!(
-        (child_alpha_2 - 0.88).abs() < 1e-6,
-        "child neuron 2 alpha should be 0.88 from parent, got {child_alpha_2}"
+        (child_alpha_2 - 0.5).abs() < 1e-6,
+        "child neuron 2 must be neutralized to 0.5 (NOT parent's 0.88), got {child_alpha_2}"
     );
 
     // Depth 2: split neuron 1 (inactive branch)
@@ -407,14 +442,21 @@ fn test_multi_objective_alpha_depth_2_chain() -> Result<()> {
         grandchild.alpha_state().neuron("relu0", 1).is_none(),
         "neuron 1 constrained at depth 2, must not be in grandchild alpha state"
     );
+    // The delta-form flag must survive the second birth: inherit_parent_values
+    // rebuilds a fresh absolute state, so losing the re-application here would
+    // silently re-interpret 0.5 deltas as absolute mid slopes.
+    assert!(
+        grandchild.alpha_state().split_refresh(),
+        "grandchild stored alpha must stay delta-form (split_refresh=true)"
+    );
     let grandchild_alpha_2 = grandchild
         .alpha_state()
         .neuron("relu0", 2)
         .expect("neuron 2 should be in grandchild alpha state")
         .alpha();
     assert!(
-        (grandchild_alpha_2 - 0.88).abs() < 1e-6,
-        "grandchild neuron 2 alpha should be 0.88 from root (through 2 generations), got {grandchild_alpha_2}"
+        (grandchild_alpha_2 - 0.5).abs() < 1e-6,
+        "grandchild neuron 2 must be neutralized to 0.5 through both generations, got {grandchild_alpha_2}"
     );
     assert_eq!(grandchild.depth(), 2, "grandchild should be at depth 2");
 

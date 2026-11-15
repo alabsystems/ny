@@ -9,8 +9,6 @@
 //!
 //! GroupNorm generalizes InstanceNorm (num_groups = C) and approaches LayerNorm
 //! (num_groups = 1). Tests cover conservative IBP and forward-mode IBP.
-//!
-//! Part of #3258.
 
 use crate::layers::common::BoundPropagation;
 use crate::layers::normalization::GroupNormLayer;
@@ -242,7 +240,6 @@ proptest! {
     /// Exercises the `g < 0` branch where ny sign flips lower/upper bounds.
     /// All other normalization layers have negative ny IBP proptests in
     /// `normalization_ibp_extended.rs`, but GroupNorm was missing.
-    /// Part of #3333.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_groupnorm_ibp_negative_gamma(

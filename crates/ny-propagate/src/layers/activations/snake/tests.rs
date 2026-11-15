@@ -259,7 +259,7 @@ fn test_per_channel_ibp_matches_elementwise_eval() {
     }
 }
 
-/// Regression test for #4117: per-channel IBP with spatial dims [C, T].
+/// Regression test: per-channel IBP with spatial dims [C, T].
 ///
 /// The modulo-based alpha_at(idx % C) gives the wrong channel when T > 1
 /// because flat index i corresponds to channel i/T, not i%C. The stride-based
@@ -316,7 +316,7 @@ fn test_per_channel_ibp_with_spatial_dims_4117() {
     }
 }
 
-/// Regression test for #4117: per-channel CROWN with spatial dims [C, T].
+/// Regression test: per-channel CROWN with spatial dims [C, T].
 ///
 /// Verifies that CROWN backward correctly maps flat neuron index to channel
 /// when the input has spatial dimensions beyond the channel axis.
@@ -406,7 +406,7 @@ fn test_relaxation_soundness() {
     }
 }
 
-/// Verify CROWN relaxation for multi-period inputs (the #3051 scenario).
+/// Verify CROWN relaxation for multi-period inputs.
 #[test]
 fn test_relaxation_multi_period_soundness() {
     let r = snake_linear_relaxation(-10.0, 10.0, 0.01);
@@ -486,7 +486,7 @@ fn test_narrow_nonpoint_interval_does_not_use_tangent() {
     }
 }
 
-/// Regression test for #3083: infinite upper bound relaxation had slope/intercept swapped.
+/// Regression test: infinite upper bound relaxation had slope/intercept swapped.
 /// The lower bound was f(l)*x instead of constant f(l), which is unsound for large x.
 #[test]
 fn test_relaxation_infinite_upper_soundness_regression_3083() {
@@ -526,7 +526,7 @@ fn test_relaxation_infinite_upper_soundness_regression_3083() {
     }
 }
 
-/// Regression test for #3083: verify infinite lower bound case is also sound.
+/// Regression test: verify infinite lower bound case is also sound.
 #[test]
 fn test_relaxation_infinite_lower_soundness() {
     let a = 1.0;
@@ -758,7 +758,7 @@ fn test_crown_backward_no_pre_activation_errors() {
     assert!(layer.propagate_crown_backward(&bounds, None).is_err());
 }
 
-/// Regression test for #3090: large a*width should not silently skip critical
+/// Regression test: large a*width should not silently skip critical
 /// points. The fix falls back to conservative sin² envelope bounds (±1/a) when
 /// the critical point count exceeds MAX_PERIODIC_POINTS.
 #[test]
@@ -790,9 +790,9 @@ fn test_relaxation_large_a_width_soundness_regression_3090() {
     }
 }
 
-/// Successor of the #3095 gate test: the constructor gate NARROWED from
+/// Successor of the original gate test: the constructor gate NARROWED from
 /// `a <= 0` to `a == 0 || !finite`. Negative finite non-zero alpha is now
-/// accepted — the envelope transfers by point reflection, and the #3095
+/// accepted — the envelope transfers by point reflection, and the known
 /// chord-path defects stay unreachable because the chord path only ever
 /// executes with `a > 0`. Zero (both signs) and non-finite alpha stay
 /// refused, fail-closed.
@@ -843,7 +843,7 @@ fn test_new_gate_is_zero_or_nonfinite_3095() {
     );
 }
 
-// ── Spatial per-channel IBP soundness proptest (#4117) ───────────────────
+// ── Spatial per-channel IBP soundness proptest ───────────────────
 //
 // Snake is monotonic (f'(x) = 1 + sin(2ax) >= 0), so IBP is exact:
 // output = [snake(l, alpha_c), snake(u, alpha_c)]. The proptest verifies
@@ -853,7 +853,7 @@ fn test_new_gate_is_zero_or_nonfinite_3095() {
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(128) })]
 
-    /// Property regression for #4117: per-channel alpha must stay constant
+    /// Property regression: per-channel alpha must stay constant
     /// across spatial positions within a channel for multi-element `[C, T]`
     /// inputs. The old modulo lookup (`idx % C`) violated this when `T > 1`.
     #[test]
@@ -918,9 +918,9 @@ proptest! {
     }
 }
 
-// ── Strict zero-tolerance CROWN relaxation proptest (#3292) ──────────────
+// ── Strict zero-tolerance CROWN relaxation proptest ──────────────
 //
-// Pattern from #3285: f64-evaluated reference with zero tolerance catches
+// Pattern: f64-evaluated reference with zero tolerance catches
 // f32 cancellation bugs invisible to magnitude-scaled tolerance tests.
 // Uses snake_eval_f64 from the parent module as independent f64 reference.
 
@@ -929,7 +929,7 @@ proptest! {
 
     /// Strict soundness proptest for Snake CROWN relaxation (a=1.0).
     /// Uses f64 reference (snake_eval_f64) with zero tolerance on 200-point grid.
-    /// Ref: Ziyin et al. 2020 Snake activation, #3292.
+    /// Ref: Ziyin et al. 2020 Snake activation.
     #[test]
     fn proptest_snake_relaxation_strict_soundness(
         l in -10.0f32..10.0,
@@ -1099,7 +1099,7 @@ fn test_relaxation_point_interval_negative_alpha() {
     );
 }
 
-/// Mirror of the #3083 infinite-endpoint tests. For a < 0 with u = +inf the
+/// Mirror of the infinite-endpoint tests. For a < 0 with u = +inf the
 /// LOWER side must still be a sound constant and the upper side +inf; the
 /// reflection maps this onto the certified l = -inf positive case.
 #[test]
@@ -1241,7 +1241,7 @@ fn test_tiny_negative_alpha_relaxation_retains_global_residual() {
     }
 }
 
-/// Negative twin of the #3090 regression: large |a|*width falls back to the
+/// Negative twin of the large-width regression: large |a|*width falls back to the
 /// conservative band, which after reflection must stay outward on both sides.
 #[test]
 fn test_relaxation_large_a_width_soundness_negative_3090() {
@@ -1733,7 +1733,7 @@ proptest! {
     /// Mixed-sign twin of `proptest_snake_ibp_spatial_per_channel_sound_4117`:
     /// alpha signs ALTERNATE per channel (the Kokoro checkpoint mixes signs
     /// within one alpha tensor), exercising the per-element reflection through
-    /// the #4117 stride mapping.
+    /// the per-channel stride mapping.
     #[test]
     fn proptest_snake_ibp_spatial_mixed_sign_per_channel_sound(
         channels in 2usize..=8,

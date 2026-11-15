@@ -155,8 +155,10 @@ fn probe_kfsb_cert_authority(
 /// `completed_at < authority_deadline` is deliberately strict. The simulator
 /// checks the deadline before a chunk, but a backend call may finish after it;
 /// such a result remains usable by the historical advisory ranker and carries
-/// no certificate authority. Only lower-bound mode is supported because a
-/// split carried by beta certifies the lower endpoint, not the returned upper.
+/// no certificate authority. Only lower-bound mode is supported (a policy
+/// scope, not a β limitation: the β fold is a sound Lagrangian relaxation of
+/// both endpoints; the historical #violdrop upper-bound evidence was the lA
+/// warm-start seed defect fixed by `propagation/warm_start_guard.rs`).
 fn admit_kfsb_sim_lower_certificate(
     authority: Option<KfsbCertAuthority>,
     verify_upper: bool,
@@ -1895,6 +1897,17 @@ fn take_complete_candidate_cover<T>(
             children.push((simulations[*index].take()?, is_active));
         }
     }
+    // #vit-margin-alpha-complex (P8 review): an omitted `Infeasible` side is a
+    // half-space closed WITHOUT a bound — an emptiness claim exactly like the
+    // batched construction-time skip — so the fenced run's emptiness gate must
+    // see it (bookkeeping only; the cover is returned unchanged).
+    for side in sides {
+        if matches!(side, SideSlot::Infeasible) {
+            super::super::containment_fence_lane::note_emptiness_claim(
+                super::super::containment_fence_lane::EmptinessClaim::Construct,
+            );
+        }
+    }
     Some(children)
 }
 
@@ -2188,6 +2201,24 @@ fn apply_kfsb_reusable_lower_certificate(
         return KfsbCertEffect::None;
     }
     debug_assert!(child.verified()[prep.straggler]);
+
+    // #vit-margin-alpha-complex (P8 review): a PARENT-cover certificate may
+    // rest on a construction-proved EMPTY side (`simulated_parent_pair_lower`
+    // lets the surviving side alone certify the parent) — an emptiness claim
+    // no fence can sample. Which pair won is not carried, so count
+    // conservatively whenever any candidate pair holds an `Infeasible` side
+    // (over-counting can only downgrade a fenced run). Bookkeeping only.
+    if matches!(certificate.scope, KfsbCertScope::ParentCover)
+        && prep
+            .sides
+            .iter()
+            .flatten()
+            .any(|side| matches!(side, SideSlot::Infeasible))
+    {
+        super::super::containment_fence_lane::note_emptiness_claim(
+            super::super::containment_fence_lane::EmptinessClaim::Construct,
+        );
+    }
 
     // The verified row is excluded from later bound targets, but Complete-Clip
     // still averages the full spec set when this child becomes a next-wave
@@ -3566,8 +3597,8 @@ mod attribution_portfolio_diag_tests {
             .as_ref()
             .expect("incomplete telemetry");
         assert_eq!(diag.coverage, AttributionDiagCoverage::RowMissing);
-        assert!(diag.historical_candidates.is_empty());
-        assert!(diag.attribution_candidates.is_empty());
+        assert_eq!((diag.historical_candidates).len(), 0);
+        assert_eq!((diag.attribution_candidates).len(), 0);
 
         let mut counters = AttributionDiagWaveCounters::default();
         record_incomplete_attribution_diag_coverage(&mut counters, diag.coverage);
@@ -4413,6 +4444,13 @@ impl BetaCrownVerifier {
         thresholds: &[f32],
         engine: &dyn GemmEngine,
     ) -> HashMap<usize, KfsbMultiChildren> {
+        // #phase-cost: the whole kFSB wave is branching selection (prescore +
+        // child simulation + commit); its stages are timed below.
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BranchSelect);
+        ny_core::phase_cost::add_units(
+            ny_core::phase_cost::CostPhase::BranchSelect,
+            domains_with_unstable.len() as u64,
+        );
         // A/B isolation overrides (measurement-only): NY_MO_KFSB_K trims the
         // candidate count (simulation cost scales with it) and NY_MO_KFSB_REDUCE
         // (`min`|`max`) overrides the configured reduce op (see
@@ -4521,6 +4559,23 @@ impl BetaCrownVerifier {
         // ~11 s of a ~42 s BaB window; the rest is here and in stages 3b/5.
         let __prepare_t =
             crate::phase_telemetry::phase_telemetry_enabled().then(std::time::Instant::now);
+        // #phase-cost: per-domain pre-score + shortlist + child construction.
+        let prescore_phase_cost =
+            ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BranchPrescore);
+        {
+            let scored: usize = domains_with_unstable
+                .iter()
+                .map(|(_, _, unstable)| unstable.len())
+                .sum();
+            ny_core::phase_cost::add_units(
+                ny_core::phase_cost::CostPhase::BranchPrescore,
+                scored as u64,
+            );
+            ny_core::phase_cost::count(
+                ny_core::phase_cost::CostCounter::CandidatesScored,
+                scored as u64,
+            );
+        }
         let mut sims: Vec<Option<MultiObjectiveGraphBabDomain>> = Vec::new();
         let mut sim_owner: Vec<(usize, usize)> = Vec::new(); // (prep index, straggler row)
         let preps_raw: Vec<
@@ -4595,6 +4650,7 @@ impl BetaCrownVerifier {
                 t.elapsed().as_secs_f64(),
             );
         }
+        drop(prescore_phase_cost);
         if preps.is_empty() {
             if attr_diag_round_eligible {
                 let target_slot = attr_diag_target_slot
@@ -4905,6 +4961,8 @@ impl BetaCrownVerifier {
         // build + backward + result folding); `fwd/bwd/mat` is the primitive's
         // own `DenseSpecStageTiming`, so `secs - (fwd+bwd+mat)` IS the
         // per-chunk assembly overhead this lane pays on top of the backward.
+        // #phase-cost: the kFSB child simulation (advisory candidate bounding).
+        let sim_phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BranchSim);
         let __sim_t =
             crate::phase_telemetry::phase_telemetry_enabled().then(std::time::Instant::now);
         let mut __sim_children = 0usize;
@@ -5309,6 +5367,18 @@ impl BetaCrownVerifier {
                 t.elapsed().as_secs_f64(),
             );
         }
+        // Counted AFTER the stage from its own results (`__sim_children` is
+        // telemetry-gated, and nothing may be added before the stage's
+        // `simulation_completed_at` clock sample).
+        {
+            let simulated = sim_values.iter().filter(|value| value.is_some()).count() as u64;
+            ny_core::phase_cost::add_units(ny_core::phase_cost::CostPhase::BranchSim, simulated);
+            ny_core::phase_cost::count(
+                ny_core::phase_cost::CostCounter::CandidatesSimulated,
+                simulated,
+            );
+        }
+        drop(sim_phase_cost);
 
         // Typed July-2026 path: price exactly the configured total root
         // portfolio from independently refreshed first-child BaBSR scores.

@@ -33,7 +33,7 @@ impl MaxBinaryLayer {
         input_a: &BoundedTensor,
         input_b: &BoundedTensor,
     ) -> Result<BoundedTensor> {
-        // Use NaN-propagating max so NaN bounds poison rather than silently vanish (#2577).
+        // Use NaN-propagating max so NaN bounds poison rather than silently vanish.
         elementwise_binary_ibp(input_a, input_b, nan_propagating_max, "MaxBinary")
     }
 

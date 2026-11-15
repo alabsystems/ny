@@ -106,6 +106,9 @@ impl BetaCrownVerifier {
             };
 
             match layer {
+                Layer::PointLinear(_) => {
+                    return Err(crate::network::proof_eligibility::diagnostic_only());
+                }
                 Layer::Linear(linear) => {
                     let weight = linear.weight();
                     let mut new_lower_a = lin_bounds.lower_a().dot(weight);
@@ -123,7 +126,7 @@ impl BetaCrownVerifier {
                         lin_bounds.upper_b().clone()
                     };
 
-                    // #2977: Non-finite row fallback — zero row + ±Inf bias (crown_single.rs #2681).
+                    // Non-finite row fallback — zero row + ±Inf bias (as in crown_single.rs).
                     let num_outputs = new_lower_a.nrows();
                     let num_inputs = new_lower_a.ncols();
                     for i in 0..num_outputs {
@@ -162,7 +165,7 @@ impl BetaCrownVerifier {
 
                     let mut new_lower_a = Array2::<f32>::zeros((num_outputs, num_neurons));
                     let mut new_upper_a = Array2::<f32>::zeros((num_outputs, num_neurons));
-                    // f64 bias accumulators to prevent catastrophic cancellation (#2336, #1745).
+                    // f64 bias accumulators to prevent catastrophic cancellation.
                     let mut new_lower_b_f64 = lin_bounds.lower_b().mapv(|x| x as f64);
                     let mut new_upper_b_f64 = lin_bounds.upper_b().mapv(|x| x as f64);
 
@@ -191,11 +194,11 @@ impl BetaCrownVerifier {
                             } else if !l.is_finite() || !u.is_finite() {
                                 // NaN/Inf bounds from upstream instability — treat as
                                 // inactive (slope=0) to avoid NaN propagation through
-                                // the u/(u-l) division. Ref: #2902.
+                                // the u/(u-l) division.
                                 (0.0, 0.0, 0.0, 0.0)
                             } else {
                                 // Unstable: use α if available
-                                // Clamp width to avoid division by zero when u ≈ l (#2697).
+                                // Clamp width to avoid division by zero when u ≈ l.
                                 // Matches the production backward pass guard in relu_backward.rs.
                                 let width = (u - l).max(RELU_RELAX_MIN_WIDTH);
                                 let upper_slope_val = u / width;
@@ -208,13 +211,13 @@ impl BetaCrownVerifier {
                         upper_slopes[j] = upper_slope;
                         upper_intercepts[j] = upper_intercept;
 
-                        // Apply relaxation (f64 bias accumulation, #2336)
+                        // Apply relaxation (f64 bias accumulation)
                         for i in 0..num_outputs {
                             let la_ij = lin_bounds.lower_a()[[i, j]];
                             let ua_ij = lin_bounds.upper_a()[[i, j]];
 
                             // Guard: skip zero coefficients to avoid IEEE 754 NaN
-                            // from 0.0 * ±inf (#1736, #3066).
+                            // from 0.0 * ±inf.
                             if la_ij > 0.0 {
                                 new_lower_a[[i, j]] = la_ij * lower_slope;
                                 new_lower_b_f64[i] += la_ij as f64 * lower_intercept;
@@ -236,7 +239,7 @@ impl BetaCrownVerifier {
 
                         // Add beta contribution
                         if let Some(signed_beta) = beta_state.signed_beta(layer_idx, j) {
-                            // #2415: Skip non-finite beta to avoid poisoning the entire A-matrix.
+                            // Skip non-finite beta to avoid poisoning the entire A-matrix.
                             if signed_beta.is_finite() {
                                 for i in 0..num_outputs {
                                     new_lower_a[[i, j]] -= signed_beta;
@@ -257,7 +260,7 @@ impl BetaCrownVerifier {
                     relu_upper_slopes[layer_idx] = Some(upper_slopes);
                     relu_upper_intercepts[layer_idx] = Some(upper_intercepts);
 
-                    // f64→f32 with directed rounding (#2336): lower toward -∞, upper toward +∞.
+                    // f64→f32 with directed rounding: lower toward -∞, upper toward +∞.
                     let new_lower_b = new_lower_b_f64.mapv(|x| next_down_f32(x as f32));
                     let new_upper_b = new_upper_b_f64.mapv(|x| next_up_f32(x as f32));
 
@@ -339,7 +342,7 @@ impl BetaCrownVerifier {
                     c.set_input_length(in_len);
                     propagate_linear_or_err(&c, &mut lin_bounds)?;
                 }
-                // === All other layers: exhaustive IBP concretization (#3424) ===
+                // === All other layers: exhaustive IBP concretization ===
                 // Every variant listed — no catch-all. Compiler catches new variants.
                 // Interval-valued frozen constant: this joint-gradient backward
                 // builds `A*W` open-coded from `linear.weight()`, which has no
@@ -484,6 +487,9 @@ impl BetaCrownVerifier {
             };
 
             match layer {
+                Layer::PointLinear(_) => {
+                    return Err(crate::network::proof_eligibility::diagnostic_only());
+                }
                 Layer::Linear(linear) => {
                     let weight = &linear.weight;
                     let dim_out = weight.nrows();
@@ -533,7 +539,7 @@ impl BetaCrownVerifier {
                                 let constraint =
                                     layer_constraints.and_then(|c| c.get(&neuron_idx).copied());
                                 if constraint.is_none() && l < 0.0 && u > 0.0 {
-                                    // NaN-safe: propagate NaN instead of silently zeroing (#2643)
+                                    // NaN-safe: propagate NaN instead of silently zeroing
                                     let grad = nan_propagating_max(back_coeff[neuron_idx], 0.0)
                                         * w[neuron_idx];
                                     alpha_state.accumulate_grad(layer_idx, neuron_idx, grad);
@@ -579,7 +585,7 @@ impl BetaCrownVerifier {
                         w.push(w_const);
                     }
                 }
-                // === All other layers: exhaustive zero-sensitivity (#3424) ===
+                // === All other layers: exhaustive zero-sensitivity ===
                 // A=0 → no upstream dependence; disables optimization for prior parameters.
                 Layer::Conv1d(_)
                 | Layer::Conv2d(_)

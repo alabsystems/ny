@@ -2,16 +2,16 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Regression tests for #2099: empty-input and malformed-arity nodes must return
+//! Regression tests: empty-input and malformed-arity nodes must return
 //! `InvalidSpec` errors instead of index-out-of-bounds panics.
 //!
-//! Updated for #2991: `GraphNode::new()` now asserts arity at construction time
-//! (#2481, #2686). These tests use `GraphNode::try_new()` to verify the
-//! construction-time validation returns `InvalidSpec` without panicking.
+//! `GraphNode::new()` asserts arity at construction time, so these tests use
+//! `GraphNode::try_new()` to verify the construction-time validation returns
+//! `InvalidSpec` without panicking.
 
 use crate::*;
 
-/// Regression test #2099/#2991: empty-input ReLU is rejected at construction time
+/// Regression test: empty-input ReLU is rejected at construction time
 /// with InvalidSpec, not a panic.
 #[test]
 fn test_graph_crown_empty_inputs_relu_returns_invalid_spec_2099() {
@@ -28,7 +28,7 @@ fn test_graph_crown_empty_inputs_relu_returns_invalid_spec_2099() {
     );
 }
 
-/// Regression test #2099/#2991: spec-guided CROWN path also catches empty-input
+/// Regression test: spec-guided CROWN path also catches empty-input
 /// ReLU — validated at construction before propagation is reached.
 #[test]
 fn test_spec_guided_crown_empty_inputs_relu_returns_invalid_spec_2099() {
@@ -40,7 +40,7 @@ fn test_spec_guided_crown_empty_inputs_relu_returns_invalid_spec_2099() {
     );
 }
 
-/// Regression test #2099: Where with wrong arity (1 input instead of 3)
+/// Regression test: Where with wrong arity (1 input instead of 3)
 /// is caught at propagation time by `require_ternary_inputs()`.
 ///
 /// Note: Where's `min_inputs()` returns 1 (embedded-constants variant), so
@@ -79,7 +79,7 @@ fn test_graph_crown_where_wrong_arity_returns_invalid_spec_2099() {
     );
 }
 
-/// Regression test #2099/#2991: empty-input Add is rejected at construction.
+/// Regression test: empty-input Add is rejected at construction.
 #[test]
 fn test_batched_crown_empty_inputs_add_returns_invalid_spec_2099() {
     use crate::layers::AddLayer;
@@ -91,7 +91,7 @@ fn test_batched_crown_empty_inputs_add_returns_invalid_spec_2099() {
     );
 }
 
-/// Regression test #2099/#2991: single-input Add (binary op needing 2) is
+/// Regression test: single-input Add (binary op needing 2) is
 /// rejected at construction with InvalidSpec containing diagnostic info.
 #[test]
 fn test_batched_crown_single_input_add_returns_invalid_spec_2099() {

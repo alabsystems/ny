@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Source-level contract tests for the GPU CROWN plan cache key (#3397).
+//! Source-level contract tests for the GPU CROWN plan cache key.
 //!
 //! `crown_plan_key(...)` is the aliasing boundary for cached GPU CROWN plans.
 //! These tests pin the exact static/dynamic split in `ops/crown_plan_key.rs`

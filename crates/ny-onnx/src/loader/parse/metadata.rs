@@ -426,7 +426,7 @@ pub(super) fn merge_tensor_shape(name: &str, existing: &mut Vec<i64>, inferred: 
             // Defense-in-depth: ORT "lenient merge" can produce shapes that
             // conflict with proto-declared shapes. Log the conflict so
             // validate_matmul_shapes (which has weight ground truth) can
-            // correct it. See #3277.
+            // correct it.
             warn!(
                 "Shape dimension conflict on '{}': proto declares {} but ORT inferred {}. \
                  Keeping proto value; validate_matmul_shapes will verify against weights.",
@@ -456,7 +456,7 @@ fn tensor_shape_conflicts(existing: &[i64], inferred: &[i64]) -> bool {
 /// cross-checks each MatMul/Gemm node's output shape against its weight
 /// tensor and corrects mismatches.
 ///
-/// Fix for #3277: sat_relu models where ORT lenient merge corrupts hidden
+/// Fixes sat_relu models where ORT lenient merge corrupts hidden
 /// layer dimensions, causing PGD to report false counterexamples.
 pub(super) fn validate_matmul_shapes(
     nodes: &[onnx_proto::NodeProto],

@@ -6,7 +6,7 @@
 //!
 //! Graph construction and scalar-nonnegative assertions for the speaker
 //! verifier smokes. Test functions live in the root
-//! `avoice/verifier_smoke.rs` entrypoint (#3950).
+//! `avoice/verifier_smoke.rs` entrypoint.
 
 use super::super::common;
 use ny_core::VerificationResult;

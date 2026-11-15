@@ -16,7 +16,7 @@ fn lsnc_relu_gpu_bab_sidecar_stays_on_cpu_and_keeps_input_split_3870() {
 
     assert_eq!(main.general.device.as_deref(), None);
     // device: wgpu intentionally NOT set — WGPU kernel dispatch overhead dominates
-    // sub-millisecond CPU CROWN backward for small models like lsnc_relu (#3870)
+    // sub-millisecond CPU CROWN backward for small models like lsnc_relu
     assert_eq!(sidecar.general.device.as_deref(), None);
     assert_eq!(sidecar.attack.pgd_order.as_deref(), Some("before"));
     assert_eq!(sidecar.attack.pgd_restarts, Some(100));
@@ -46,7 +46,7 @@ fn cersyve_gpu_bab_sidecar_stays_on_cpu_and_keeps_complete_clip_3870() {
 
     assert_eq!(main.general.device.as_deref(), None);
     // device: wgpu intentionally NOT set — WGPU dispatch overhead dominates for
-    // small input-split models (#3870)
+    // small input-split models
     assert_eq!(sidecar.general.device.as_deref(), None);
     assert_eq!(sidecar.attack.pgd_order.as_deref(), Some("before"));
     assert_eq!(sidecar.attack.pgd_restarts, Some(100));

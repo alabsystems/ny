@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Schema types for weak-region mining and training signal export (#3520).
+//! Schema types for weak-region mining and training signal export.
 
 use ndarray::{Array1, Array2, ArrayD};
 use ny_propagate::types::BoundsProvenance;
@@ -23,7 +23,7 @@ pub struct SweepModelSource {
     pub model_digest: Option<String>,
 }
 
-/// Objective function for weak-region mining (#3520 Packet C).
+/// Objective function for weak-region mining (Packet C).
 ///
 /// `OutputWidth` preserves Packet A/B/D behavior: rank regions by output-bound
 /// width (widest = weakest). `Linear` runs spec-guided CROWN with a caller-
@@ -47,7 +47,7 @@ pub enum SweepObjective {
 pub struct RegionSweepConfig {
     /// Name of the primary bounded input tensor.
     pub primary_input: String,
-    /// Objective function controlling ranking and scoring (#3520 Packet C).
+    /// Objective function controlling ranking and scoring.
     pub objective: SweepObjective,
     /// Regions to score.
     pub regions: Vec<RegionSpec>,
@@ -93,13 +93,13 @@ pub struct WeakRegionRecord {
     pub output_width_max: f32,
     pub output_width_mean: f32,
     /// Minimum certified slack across all properties: min(lower_i - tau_i).
-    /// Present only when objective is `Linear` (#3520 Packet C).
+    /// Present only when objective is `Linear`.
     pub certified_slack_min: Option<f32>,
     /// Max property-bound width across all properties: max(upper_i - lower_i).
-    /// Present only when objective is `Linear` (#3520 Packet C).
+    /// Present only when objective is `Linear`.
     pub objective_width_max: Option<f32>,
     /// Mean property-bound width across all properties.
-    /// Present only when objective is `Linear` (#3520 Packet C).
+    /// Present only when objective is `Linear`.
     pub objective_width_mean: Option<f32>,
     pub top_hotspots: Vec<WeakRegionHotspot>,
     pub bounds_file: Option<String>,

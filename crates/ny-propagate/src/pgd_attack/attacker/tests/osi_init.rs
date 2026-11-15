@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for OSI (Output Specification Initialization) (#1449).
+//! Tests for OSI (Output Specification Initialization).
 //!
 //! Reference: alpha-beta-CROWN `attack_utils.py:328-362` (`OSI_init_C`).
 
@@ -92,7 +92,7 @@ fn test_osi_initialization_changes_seed_point_1449() {
     };
     let osi_config = PgdConfig {
         initialization: PgdInitialization::Osi,
-        ..uniform_config
+        ..uniform_config.clone()
     };
 
     let uniform_attacker = PgdAttacker::new(uniform_config);
@@ -115,7 +115,7 @@ fn test_osi_initialization_changes_seed_point_1449() {
     );
 }
 
-/// Uniform initialization matches pre-#1449 behavior (regression guard).
+/// Uniform initialization keeps its original behavior (regression guard).
 ///
 /// Two PgdAttacker instances with identical Uniform config and seed must
 /// produce the exact same result.

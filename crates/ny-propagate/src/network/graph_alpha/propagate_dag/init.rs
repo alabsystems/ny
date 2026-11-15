@@ -99,9 +99,29 @@ impl GraphNetwork {
         engine: Option<&dyn GemmEngine>,
         precomputed_reference: Option<crate::network::graph_alpha::PrecomputedAlphaReferenceBounds>,
     ) -> Result<DagAlphaInitResult> {
+        self.init_dag_alpha_state_with_root_reference_policy(
+            input,
+            config,
+            engine,
+            precomputed_reference,
+            false,
+        )
+    }
+
+    /// The explicit root policy must not enter a second collector when no
+    /// optimizer is needed. Its caller publishes these branches as ReferenceOnly.
+    pub(super) fn init_dag_alpha_state_with_root_reference_policy(
+        &self,
+        input: &BoundedTensor,
+        config: &AlphaCrownConfig,
+        engine: Option<&dyn GemmEngine>,
+        precomputed_reference: Option<crate::network::graph_alpha::PrecomputedAlphaReferenceBounds>,
+        root_fixed_reference: bool,
+    ) -> Result<DagAlphaInitResult> {
+        self.ensure_proof_eligible()?;
         // Step 1: Collect the shared alpha reference bounds. With
         // `fix_interm_bounds=true`, DAG warmup now follows the same IBP contract
-        // as the root bootstrap instead of forcing CROWN-IBP (#4404).
+        // as the root bootstrap instead of forcing CROWN-IBP.
         let exec_order = self.exec_order()?;
         let (mut node_bounds, node_bounds_source) = match precomputed_reference {
             Some(reference) => (reference.bounds, reference.source),
@@ -177,7 +197,6 @@ impl GraphNetwork {
         // never admit a graph the optimizer would find nothing to move on.
         //
         // Element-wise mul z = x*y: shape [2, n] (r_l, r_u per element).
-        // Reference: designs/2026-03-06-mulbinary-crown-backward-dispatch.md Phase 3.
         let mut mul_binary_alphas: HashMap<String, Array2<f32>> = HashMap::new();
         let mut mul_binary_adam_m: HashMap<String, Array2<f32>> = HashMap::new();
         let mut mul_binary_adam_v: HashMap<String, Array2<f32>> = HashMap::new();
@@ -211,11 +230,25 @@ impl GraphNetwork {
             && sqrt_nodes.is_empty()
             && !gamma_only_invprop
         {
+            if root_fixed_reference {
+                let bounds = output_bounds.clone();
+                return Ok(DagAlphaInitResult::EarlyReturn {
+                    bounds: bounds.clone(),
+                    collection_artifact: Some(super::DagAlphaCollectionArtifact {
+                        output_bounds: bounds,
+                        alpha_state: GraphAlphaState::new(),
+                        reference_bounds: node_bounds,
+                        reference_bounds_source: node_bounds_source,
+                        completed_iterations: 0,
+                        optimizer_updates_completed: 0,
+                    }),
+                });
+            }
             // No optimizable activation nodes — optimize BilinearCrown alphas if present,
             // else fall back to the existing CROWN/Batched alpha dispatch.
             // Pure attention graphs (no ReLUs) benefit from McCormick face selection
             // optimization via the batched alpha-CROWN path.
-            // #3588: thread the caller's engine into the batched alpha optimizer
+            // Thread the caller's engine into the batched alpha optimizer
             // instead of dropping it.
             let has_bilinear = self
                 .nodes
@@ -381,10 +414,9 @@ impl GraphNetwork {
         }
         let has_reciprocal = graph_alpha_state.reciprocal_alpha_names().next().is_some();
 
-        // Step 2b: Collect BilinearCrown nodes and initialize alpha parameters (#3287).
+        // Step 2b: Collect BilinearCrown nodes and initialize alpha parameters.
         // This enables joint ReLU + bilinear alpha optimization in graphs with both
         // activation nodes and attention matmul operations (e.g., full transformers).
-        // Reference: designs/2026-03-04-286-attention-bilinear-alternative.md Approach B.
         let mut bilinear_alphas: HashMap<String, Array4<f32>> = HashMap::new();
         let mut bilinear_adam_m: HashMap<String, Array4<f32>> = HashMap::new();
         let mut bilinear_adam_v: HashMap<String, Array4<f32>> = HashMap::new();
@@ -412,7 +444,7 @@ impl GraphNetwork {
             );
         }
 
-        // Step 2c: MulBinary alpha parameters (#3439 Phase 3) are collected
+        // Step 2c: MulBinary alpha parameters are collected
         // ABOVE, before the no-optimizable-node gate, because their presence is
         // now part of that routing decision (#mulbinary-alpha-router).
 
@@ -518,6 +550,22 @@ impl GraphNetwork {
             && !has_reciprocal
             && !gamma_only_invprop
         {
+            if root_fixed_reference {
+                let bounds = node_bounds.get(output_node_name).cloned().ok_or_else(|| {
+                    NyError::InvalidSpec("root fixed-reference alpha lost its output bounds".into())
+                })?;
+                return Ok(DagAlphaInitResult::EarlyReturn {
+                    bounds: bounds.clone(),
+                    collection_artifact: Some(super::DagAlphaCollectionArtifact {
+                        output_bounds: bounds,
+                        alpha_state: runtime.into_graph_alpha_state(),
+                        reference_bounds: node_bounds,
+                        reference_bounds_source: node_bounds_source,
+                        completed_iterations: 0,
+                        optimizer_updates_completed: 0,
+                    }),
+                });
+            }
             debug!("DAG α-CROWN: No optimizable activation state, using CROWN");
             #[cfg(test)]
             route_probe::record(route_probe::DagAlphaRoute::CrownEarlyReturn);

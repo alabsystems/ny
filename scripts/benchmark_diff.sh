@@ -51,7 +51,7 @@ echo ""
 # Build ny-cli in release mode for accurate benchmarks
 echo "Building ny-cli in release mode..."
 BUILD_LOG="$TEMP_DIR/cargo-build.log"
-if ! cargo build -p ny-cli --release >"$BUILD_LOG" 2>&1; then
+if ! targo --unverified build -p ny-cli --release >"$BUILD_LOG" 2>&1; then
     cat "$BUILD_LOG" >&2
     exit 1
 fi
@@ -65,7 +65,7 @@ fi
 
 if [ ! -d "$TEST_MODELS" ]; then
     echo "ERROR: Test models directory not found: $TEST_MODELS"
-    echo "Build models first: cargo test --no-run"
+    echo "Build models first: targo --unverified test --no-run"
     exit 1
 fi
 

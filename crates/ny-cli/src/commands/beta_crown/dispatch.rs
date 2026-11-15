@@ -13,8 +13,6 @@ use ny_core::GemmEngine;
 use ny_gpu::ComputeDevice;
 #[cfg(feature = "mip")]
 use ny_onnx::load_onnx_with_config;
-#[cfg(feature = "mip")]
-use ny_onnx::vnnlib::OutputConstraint;
 use ny_onnx::{vnnlib::VnnLibSpec, OnnxLoadConfig};
 use ny_propagate::{BabVerificationStatus, BetaCrownConfig, BetaCrownResult, BetaCrownVerifier};
 use ny_tensor::BoundedTensor;
@@ -135,6 +133,49 @@ pub(super) fn graph_mip_statically_ineligible(model: &BetaCrownModel) -> bool {
     }
 }
 
+/// #mip-demand — is the whole-net Graph-MIP escalation STATICALLY refused by
+/// its own encode-nnz cap on this model?
+///
+/// The SECOND static predicate in the escalation gate, and the one that
+/// actually binds on the measured families. `#deadlane` above answers the
+/// LAYER-SET predicate; this one answers `estimate_encode_nnz(..) > cap`, which
+/// the gate reaches ~2 ms after BaB has already surrendered a fifth to a third
+/// of its own search to fund it (`reports/measured-2026/stop_census_2026-08-30/`:
+/// `challenging_certified` idx1031 `nnz 150936750`, `metaroom_2023` idx125
+/// `nnz 50355927`, both against a 5,000,000 cap; the MIP slice alone is 28 s of
+/// challenging's 114 s solver deadline, so BaB goes 74.6 s -> 102.6 s).
+///
+/// `true` requires a PROOF, never a guess: `static_encode_nnz_floor` is a lower
+/// bound on the runtime estimate for ANY bounds map, so `floor > cap` implies
+/// the runtime comparison the gate will make also exceeds the cap. `None` (no
+/// static claim) and a floor at or under the cap both return `false`, i.e.
+/// "reserve exactly as before".
+///
+/// Sequential models are left alone: the nnz estimator is defined on the graph
+/// form, and the sequential lane has its own parameter cap.
+#[cfg_attr(not(feature = "mip"), allow(unused_variables))]
+pub(super) fn graph_mip_statically_over_nnz_cap(
+    model: &BetaCrownModel,
+    input_shape: &[usize],
+) -> bool {
+    #[cfg(feature = "mip")]
+    {
+        match model {
+            BetaCrownModel::Graph(graph) => {
+                match super::graph_mip_leaf::static_encode_nnz_floor(graph, input_shape) {
+                    Some(floor) => floor > super::graph_mip_escalate::graph_mip_max_nnz(),
+                    None => false,
+                }
+            }
+            BetaCrownModel::Sequential(_) => false,
+        }
+    }
+    #[cfg(not(feature = "mip"))]
+    {
+        false
+    }
+}
+
 /// #reserve-demand — the purely STATIC half of the post-BaB falsification
 /// lane's admission test: can this net take a gradient step at all?
 ///
@@ -222,352 +263,6 @@ fn safenlp_shared_prefix_budget_repair_enabled() -> bool {
     }
 }
 
-/// The direct-MIP-first experiment must preserve the shared-prefix backend's
-/// cold-start admission. Historical MIP-only callers retain their configured
-/// PGD precheck and optional warm seed; only the typed direct-first ingress is
-/// cold by construction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MipOnlySeedPolicy {
-    HistoricalConfigured,
-    #[cfg(feature = "mip")]
-    ColdNoWarmStart,
-}
-
-impl MipOnlySeedPolicy {
-    fn run_internal_pgd(self, configured: bool) -> bool {
-        matches!(self, Self::HistoricalConfigured) && configured
-    }
-
-    #[cfg(feature = "mip")]
-    fn permits_warm_start(self) -> bool {
-        matches!(self, Self::HistoricalConfigured)
-    }
-}
-
-#[cfg(feature = "mip")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MipOnlySolverRoute {
-    SharedBinaryPrefix,
-}
-
-/// Fully admitted direct-first routing decision.
-///
-/// The caller-owned absolute deadline is copied only as immutable evidence for
-/// tests/telemetry. Execution still reads the identical `ctx.overall_deadline`
-/// in `run_mip_only_with_seed_policy`; no relative timeout is reconstructed.
-#[cfg(feature = "mip")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SafeNlpDirectMipFirstPlan {
-    deadline: Instant,
-    hidden_dim: usize,
-    seed_policy: MipOnlySeedPolicy,
-    solver_route: MipOnlySolverRoute,
-}
-
-#[cfg(feature = "mip")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SafeNlpDirectMipModelSource {
-    Sequential,
-    Graph,
-}
-
-#[cfg(feature = "mip")]
-impl SafeNlpDirectMipModelSource {
-    fn from_model(model: &BetaCrownModel) -> Self {
-        match model {
-            BetaCrownModel::Sequential(_) => Self::Sequential,
-            BetaCrownModel::Graph(_) => Self::Graph,
-        }
-    }
-
-    fn telemetry_name(self) -> &'static str {
-        match self {
-            Self::Sequential => "sequential",
-            Self::Graph => "graph",
-        }
-    }
-}
-
-/// A pre-route decline is deliberately verdict-neutral. Every variant occurs
-/// before `route-start`, so production keeps the untouched historical BaB
-/// path and may later use its existing post-BaB escalation reload.
-#[cfg(feature = "mip")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum SafeNlpDirectMipFirstDecline {
-    NotRequested,
-    SharedPrefixDisabled,
-    NonAutoPolicy,
-    NonAyBackend,
-    MissingDeadline,
-    ExpiredDeadline,
-    MissingSpec,
-    UnsupportedPropertyShape,
-    ReloadFailed(String),
-    UnsupportedReloadedModelShape,
-}
-
-#[cfg(feature = "mip")]
-impl SafeNlpDirectMipFirstDecline {
-    fn telemetry(&self) -> (&'static str, &'static str) {
-        match self {
-            Self::NotRequested => ("preflight", "not-requested"),
-            Self::SharedPrefixDisabled => ("preflight", "shared-prefix-disabled"),
-            Self::NonAutoPolicy => ("preflight", "non-auto-policy"),
-            Self::NonAyBackend => ("preflight", "non-ay-backend"),
-            Self::MissingDeadline => ("preflight", "missing-deadline"),
-            Self::ExpiredDeadline => ("deadline", "expired"),
-            Self::MissingSpec => ("preflight", "missing-spec"),
-            Self::UnsupportedPropertyShape => ("admission", "property-shape"),
-            Self::ReloadFailed(_) => ("reload", "load-error"),
-            Self::UnsupportedReloadedModelShape => ("admission", "reloaded-model-shape"),
-        }
-    }
-}
-
-#[cfg(feature = "mip")]
-enum SafeNlpDirectMipFirstAttempt<T> {
-    Declined(SafeNlpDirectMipFirstDecline),
-    Executed(T),
-}
-
-/// Return the unique relational row encoded by the direct conjunctive MIP
-/// path, rejecting every richer VNN-LIB shape.
-#[cfg(feature = "mip")]
-fn safenlp_single_relational_unsafe_row(spec: &VnnLibSpec) -> Option<&OutputConstraint> {
-    if spec.is_disjunction || spec.dual_network.is_some() {
-        return None;
-    }
-
-    let constraints: &[OutputConstraint] = if spec.output_constraint_clauses.is_empty() {
-        &spec.output_constraints
-    } else {
-        let [clause] = spec.output_constraint_clauses.as_slice() else {
-            return None;
-        };
-        if !spec.output_constraints.is_empty()
-            && spec.output_constraints.as_slice() != clause.as_slice()
-        {
-            return None;
-        }
-        clause
-    };
-    let [constraint] = constraints else {
-        return None;
-    };
-    let (left, right) = match constraint {
-        OutputConstraint::LessEq(left, right)
-        | OutputConstraint::GreaterEq(left, right)
-        | OutputConstraint::LessThan(left, right)
-        | OutputConstraint::GreaterThan(left, right) => (*left, *right),
-        _ => return None,
-    };
-    (left != right && left < spec.num_outputs && right < spec.num_outputs).then_some(constraint)
-}
-
-#[cfg(feature = "mip")]
-fn safenlp_direct_mip_first_preflight(
-    requested_by_vnncomp: bool,
-    shared_prefix_enabled: bool,
-    complete_verifier: CompleteVerifierArg,
-    mip_solver: MipSolverArg,
-    spec: Option<&VnnLibSpec>,
-    deadline: Option<Instant>,
-    now: Instant,
-) -> std::result::Result<(Instant, &VnnLibSpec), SafeNlpDirectMipFirstDecline> {
-    if !requested_by_vnncomp {
-        return Err(SafeNlpDirectMipFirstDecline::NotRequested);
-    }
-    if !shared_prefix_enabled {
-        return Err(SafeNlpDirectMipFirstDecline::SharedPrefixDisabled);
-    }
-    if complete_verifier != CompleteVerifierArg::Auto {
-        return Err(SafeNlpDirectMipFirstDecline::NonAutoPolicy);
-    }
-    if mip_solver.mip_backend() != ny_mip::MipBackend::Ay {
-        return Err(SafeNlpDirectMipFirstDecline::NonAyBackend);
-    }
-    let deadline = deadline.ok_or(SafeNlpDirectMipFirstDecline::MissingDeadline)?;
-    if now >= deadline {
-        return Err(SafeNlpDirectMipFirstDecline::ExpiredDeadline);
-    }
-    let spec = spec.ok_or(SafeNlpDirectMipFirstDecline::MissingSpec)?;
-    safenlp_single_relational_unsafe_row(spec)
-        .ok_or(SafeNlpDirectMipFirstDecline::UnsupportedPropertyShape)?;
-    Ok((deadline, spec))
-}
-
-#[cfg(feature = "mip")]
-fn safenlp_direct_mip_first_plan_for_reloaded_model(
-    model: &BetaCrownModel,
-    input: &BoundedTensor,
-    spec: &VnnLibSpec,
-    deadline: Instant,
-    now: Instant,
-) -> std::result::Result<SafeNlpDirectMipFirstPlan, SafeNlpDirectMipFirstDecline> {
-    if now >= deadline {
-        return Err(SafeNlpDirectMipFirstDecline::ExpiredDeadline);
-    }
-    let hidden_dim = mip_highs::safenlp_canonical_single_hidden_shape(model, input, spec)
-        .ok()
-        .flatten()
-        .ok_or(SafeNlpDirectMipFirstDecline::UnsupportedReloadedModelShape)?;
-    Ok(SafeNlpDirectMipFirstPlan {
-        deadline,
-        hidden_dim,
-        seed_policy: MipOnlySeedPolicy::ColdNoWarmStart,
-        solver_route: MipOnlySolverRoute::SharedBinaryPrefix,
-    })
-}
-
-/// Run the pre-route reload and, only after every gate succeeds, invoke one
-/// caller-owned route executor.
-///
-/// The injected closures make the one-reload/one-execution contract directly
-/// testable without touching the filesystem or starting AY. `now_after_reload`
-/// is sampled both after loading and after structural admission so `route-start`
-/// can never be emitted for work that consumed the immutable deadline.
-#[cfg(feature = "mip")]
-#[allow(clippy::too_many_arguments)]
-fn safenlp_direct_mip_first_attempt_with_reload<T, Reload, Now, Execute>(
-    requested_by_vnncomp: bool,
-    shared_prefix_enabled: bool,
-    complete_verifier: CompleteVerifierArg,
-    mip_solver: MipSolverArg,
-    source: SafeNlpDirectMipModelSource,
-    input: &BoundedTensor,
-    spec: Option<&VnnLibSpec>,
-    deadline: Option<Instant>,
-    now_before_reload: Instant,
-    reload: Reload,
-    mut now_after_reload: Now,
-    execute: Execute,
-) -> SafeNlpDirectMipFirstAttempt<T>
-where
-    Reload: FnOnce() -> Result<BetaCrownModel>,
-    Now: FnMut() -> Instant,
-    Execute: FnOnce(BetaCrownModel, SafeNlpDirectMipFirstPlan, SafeNlpDirectMipModelSource) -> T,
-{
-    let (deadline, spec) = match safenlp_direct_mip_first_preflight(
-        requested_by_vnncomp,
-        shared_prefix_enabled,
-        complete_verifier,
-        mip_solver,
-        spec,
-        deadline,
-        now_before_reload,
-    ) {
-        Ok(preflight) => preflight,
-        Err(reason) => return SafeNlpDirectMipFirstAttempt::Declined(reason),
-    };
-    let model = match reload() {
-        Ok(model) => model,
-        Err(error) => {
-            return SafeNlpDirectMipFirstAttempt::Declined(
-                SafeNlpDirectMipFirstDecline::ReloadFailed(format!("{error:#}")),
-            )
-        }
-    };
-    let plan = match safenlp_direct_mip_first_plan_for_reloaded_model(
-        &model,
-        input,
-        spec,
-        deadline,
-        now_after_reload(),
-    ) {
-        Ok(plan) => plan,
-        Err(reason) => return SafeNlpDirectMipFirstAttempt::Declined(reason),
-    };
-    if now_after_reload() >= deadline {
-        return SafeNlpDirectMipFirstAttempt::Declined(
-            SafeNlpDirectMipFirstDecline::ExpiredDeadline,
-        );
-    }
-    SafeNlpDirectMipFirstAttempt::Executed(execute(model, plan, source))
-}
-
-/// Exact fresh sequential seam shared in shape with historical post-BaB MIP
-/// escalation. One ONNX load produces one `Network`, it is wrapped once as a
-/// sequential β-CROWN model, and the existing heuristic sound-mode policy is
-/// applied once before structural admission.
-#[cfg(feature = "mip")]
-fn reload_safenlp_direct_mip_model(
-    model_path: &Path,
-    onnx_load_config: &OnnxLoadConfig,
-    allow_heuristic_logsoftmax: bool,
-    allow_heuristic_softmax: bool,
-    json: bool,
-) -> Result<BetaCrownModel> {
-    let seq_net = load_onnx_with_config(model_path, onnx_load_config)
-        .map_err(anyhow::Error::from)
-        .and_then(|onnx_reload| {
-            onnx_reload
-                .to_propagate_network()
-                .map_err(anyhow::Error::from)
-        })?;
-    let mut model = BetaCrownModel::Sequential(Box::new(seq_net));
-    apply_heuristic_sound_modes(
-        &mut model,
-        allow_heuristic_logsoftmax,
-        allow_heuristic_softmax,
-        json,
-    );
-    Ok(model)
-}
-
-#[cfg(feature = "mip")]
-fn phase_telemetry_enabled_from_value(value: Option<&std::ffi::OsStr>) -> bool {
-    value == Some(std::ffi::OsStr::new("1"))
-}
-
-#[cfg(feature = "mip")]
-fn phase_telemetry_enabled() -> bool {
-    phase_telemetry_enabled_from_value(std::env::var_os("NY_PHASE_TELEMETRY").as_deref())
-}
-
-#[cfg(feature = "mip")]
-fn safenlp_direct_first_marker_if(enabled: bool, event: &str) -> Option<String> {
-    enabled.then(|| {
-        format!(
-            "NY_MIP_SAFENLP_DIRECT_FIRST_V1 event={event} route=direct-mip-first \
-             shared_prefix=required internal_pgd=false warm_start=false \
-             deadline=caller-absolute"
-        )
-    })
-}
-
-#[cfg(feature = "mip")]
-fn safenlp_direct_first_decline_marker_if(
-    enabled: bool,
-    reason: &SafeNlpDirectMipFirstDecline,
-) -> Option<String> {
-    if !enabled || matches!(reason, SafeNlpDirectMipFirstDecline::NotRequested) {
-        return None;
-    }
-    let (stage, code) = reason.telemetry();
-    Some(format!(
-        "NY_MIP_SAFENLP_DIRECT_FIRST_V1 event=route-decline \
-         stage={stage} reason={code} historical_fallback=bab"
-    ))
-}
-
-#[cfg(feature = "mip")]
-fn emit_safenlp_direct_first_decline(reason: &SafeNlpDirectMipFirstDecline) {
-    if matches!(reason, SafeNlpDirectMipFirstDecline::NotRequested) {
-        return;
-    }
-    let (stage, code) = reason.telemetry();
-    tracing::info!(
-        stage,
-        reason = code,
-        detail = ?reason,
-        "SafeNLP direct-MIP-first route declined before start; preserving historical BaB"
-    );
-    if let Some(marker) = safenlp_direct_first_decline_marker_if(phase_telemetry_enabled(), reason)
-    {
-        eprintln!("{marker}");
-    }
-}
-
 /// Apply the exact policy chain used by the production BaB -> MIP dispatch.
 ///
 /// The SafeNLP treatment is inserted before static graph ineligibility so an
@@ -579,12 +274,42 @@ fn apply_bab_mip_budget_policy(
     graph_mip_statically_ineligible: bool,
     safenlp_shared_prefix_budget_repair: bool,
     postbab_attack_statically_ineligible: bool,
+    graph_mip_statically_over_nnz_cap: bool,
+    graph_mip_min_slice_secs: Option<u64>,
 ) -> PhaseBudgetLedger {
     ledger
         .with_mip_escalation_allowed(!matches!(complete_verifier, CompleteVerifierArg::Bab))
         .with_safenlp_shared_prefix_budget_repair(safenlp_shared_prefix_budget_repair)
         .with_static_mip_ineligibility(graph_mip_statically_ineligible)
+        // #mip-demand: the two predicates below sit AFTER the SafeNLP
+        // treatment for the same reason the layer-set one does — an armed
+        // shared-prefix ledger keeps its slice for the later SEQUENTIAL reload,
+        // which neither the graph nnz probe nor the graph slice floor describes.
+        .with_static_mip_nnz_ineligibility(graph_mip_statically_over_nnz_cap)
+        .with_graph_mip_min_slice_secs(graph_mip_min_slice_secs)
         .with_static_postbab_attack_ineligibility(postbab_attack_statically_ineligible)
+}
+
+/// #mip-demand — the whole-net Graph-MIP encode's minimum slice, but ONLY for a
+/// model whose escalation would actually be that lane.
+///
+/// `graph_mip_slice_admitted` lives in the GRAPH escalation driver. The
+/// sequential MIP lane has no such floor (safenlp's 15 s internal tier really
+/// does hand a 5 s reserve to a solver that uses it), so a sequential model
+/// must return `None` and keep the historical reservation.
+fn graph_mip_whole_net_min_slice_secs(model: &BetaCrownModel) -> Option<u64> {
+    #[cfg(feature = "mip")]
+    {
+        match model {
+            BetaCrownModel::Graph(_) => Some(super::graph_mip_escalate::graph_mip_min_slice_secs()),
+            BetaCrownModel::Sequential(_) => None,
+        }
+    }
+    #[cfg(not(feature = "mip"))]
+    {
+        let _ = model;
+        None
+    }
 }
 
 /// Graph-level form of [`graph_mip_statically_ineligible`]. `false` in a non-mip
@@ -735,6 +460,8 @@ fn affine_root_farkas_policy_allows(
 // the mip feature is off so the non-mip build stays warning-free.
 #[cfg_attr(not(feature = "mip"), allow(dead_code))]
 pub(super) struct DispatchContext<'a> {
+    pub(super) input_head_continuation:
+        Option<&'a crate::commands::safenlp_input_head::BoundInputHeadContinuation>,
     pub(super) model_path: &'a Path,
     pub(super) onnx_load_config: &'a OnnxLoadConfig,
     pub(super) model_net: &'a mut BetaCrownModel,
@@ -762,14 +489,6 @@ pub(super) struct DispatchContext<'a> {
     /// verifier must neither execute PGD nor reserve a second copy of its
     /// fraction.
     pub(super) outer_wrapper_owns_deferred_pgd: bool,
-    /// Typed category/budget intent from the in-process VNN-COMP router.
-    /// Dispatch must still satisfy every structural/deadline/shared-prefix
-    /// prerequisite before this may bypass BaB.
-    pub(super) safenlp_direct_mip_first: bool,
-    /// Typed, exact-category intent for the default-dark imgSz32 cGAN
-    /// input-leaf oracle. Model/property/row authentication remains local to
-    /// the attachment seam.
-    pub(super) cgan_input_leaf_route: Option<super::CganInputLeafRoute>,
     pub(super) gemm_engine: Option<&'a dyn GemmEngine>,
     /// #attack-steering-unquarantine: live accelerator for falsification
     /// STEERING only (batched / exact-VJP PGD lanes). Never handed to
@@ -787,9 +506,16 @@ pub(super) struct DispatchContext<'a> {
     /// One authoritative wall-clock deadline shared with pre-dispatch routes.
     /// `None` means unbounded.
     pub(super) overall_deadline: Option<Instant>,
+    #[cfg(feature = "mip")]
+    pub(super) verification_resources:
+        Option<Arc<super::hull_publication::InstanceVerificationResources>>,
     /// VNN-COMP's independently resolved outer post-BaB attack route.
     /// `None` preserves the historical interactive small-budget reserve.
     pub(super) post_bab_wrapper_attack_enabled: Option<bool>,
+    /// #attack-concurrent: the wrapper's admission facts for the concurrent
+    /// attack lane (`None` on interactive calls: every race refuses).
+    pub(super) attack_concurrent_wrapper:
+        Option<super::attack_concurrent::ConcurrentAttackWrapperFacts>,
     pub(super) json: bool,
     /// Loader auto-peeled a terminal Sigmoid (#cgan-sigmoid-peel): witness
     /// outputs are pre-sigmoid logits and must be mapped y = sigmoid(z) at
@@ -805,14 +531,22 @@ pub(super) struct DispatchContext<'a> {
 /// than `verify_standard`. Keep admission checks at the CLI boundary on this
 /// exact predicate: only `verify_standard` owns the engine's internal deferred
 /// PGD fallback.
+///
+/// #admission-precision: the check is the router's
+/// `ny_core::router::admission::relational_verifier` on the property's routing
+/// shape (`spec_shape::shape_of`, the one extractor the router reads at start
+/// too). `has_relational` is the caller's `classify_constraints` answer for
+/// the same property, which is the shape's own `relational_atoms`.
 pub(super) fn routes_to_relational_verifier(
     vnnlib_spec: Option<&VnnLibSpec>,
     has_relational: bool,
 ) -> bool {
     vnnlib_spec.is_some_and(|vnnlib| {
-        vnnlib.output_constraints.len() > 1
-            || has_relational
-            || vnnlib.has_boxed_clause_disjunction()
+        let shape = super::spec_shape::shape_of(vnnlib);
+        ny_core::router::admission::relational_verifier(&ny_core::router::spec::SpecShape {
+            relational_atoms: has_relational,
+            ..shape
+        })
     })
 }
 
@@ -931,20 +665,9 @@ fn timeout_result_from_deadline_error(
 
 /// Run the sequential MIP-only path, including the PGD warm-start precheck.
 pub(super) fn run_mip_only(ctx: &DispatchContext<'_>, mip_solver: MipSolverArg) -> Result<()> {
-    run_mip_only_with_seed_policy(
-        ctx,
-        &*ctx.model_net,
-        mip_solver,
-        MipOnlySeedPolicy::HistoricalConfigured,
-    )
-}
-
-fn run_mip_only_with_seed_policy(
-    ctx: &DispatchContext<'_>,
-    model_net: &BetaCrownModel,
-    mip_solver: MipSolverArg,
-    seed_policy: MipOnlySeedPolicy,
-) -> Result<()> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Mip);
+    let model_net: &BetaCrownModel = &*ctx.model_net;
     if ctx.overall_deadline.is_none() {
         anyhow::bail!("unbounded MIP verification is unsupported; pass a positive --timeout");
     }
@@ -959,7 +682,7 @@ fn run_mip_only_with_seed_policy(
     .with_post_bab_wrapper_attack(ctx.post_bab_wrapper_attack_enabled);
     let internal_authority_deadline = mip_ledger.overall_deadline();
 
-    let warm_start_candidate = if seed_policy.run_internal_pgd(ctx.run_upfront_pgd) {
+    let warm_start_candidate = if ctx.run_upfront_pgd {
         match model_net {
             BetaCrownModel::Sequential(network) => {
                 if let Some(vnnlib) = ctx.vnnlib_spec {
@@ -1056,81 +779,22 @@ fn run_mip_only_with_seed_policy(
     }
 
     // Every solver arg routes through the same encoder and witness/proof
-    // gates. The typed direct-first ingress additionally requires the AY
-    // shared-binary-prefix session; an internal admission decline is an
-    // error/unknown under this clock and may not launch another MIP route.
-    match seed_policy {
-        MipOnlySeedPolicy::HistoricalConfigured => mip_highs::verify_with_mip(
-            model_net,
-            ctx.input,
-            ctx.vnnlib_spec,
-            ctx.property.as_deref(),
-            Some(ctx.model_path),
-            ctx.epsilon,
-            ctx.effective_threshold,
-            internal_authority_deadline,
-            warm_start_candidate.as_ref(),
-            mip_solver,
-            ctx.verification_start,
-            ctx.effective_treatment,
-            ctx.json,
-        ),
-        #[cfg(feature = "mip")]
-        MipOnlySeedPolicy::ColdNoWarmStart => {
-            debug_assert!(warm_start_candidate.is_none());
-            mip_highs::verify_with_mip_requiring_safenlp_shared_prefix(
-                model_net,
-                ctx.input,
-                ctx.vnnlib_spec,
-                ctx.property.as_deref(),
-                Some(ctx.model_path),
-                ctx.epsilon,
-                ctx.effective_threshold,
-                internal_authority_deadline,
-                None,
-                mip_solver,
-                ctx.verification_start,
-                ctx.effective_treatment,
-                ctx.json,
-            )
-        }
-    }
-}
-
-#[cfg(feature = "mip")]
-fn run_safenlp_direct_mip_first(
-    ctx: &DispatchContext<'_>,
-    reloaded_model: &BetaCrownModel,
-    mip_solver: MipSolverArg,
-    plan: SafeNlpDirectMipFirstPlan,
-    source: SafeNlpDirectMipModelSource,
-) -> Result<()> {
-    debug_assert_eq!(
-        ctx.overall_deadline,
-        Some(plan.deadline),
-        "direct-first must consume the caller's immutable absolute deadline"
-    );
-    debug_assert_eq!(plan.seed_policy, MipOnlySeedPolicy::ColdNoWarmStart);
-    debug_assert!(!plan.seed_policy.permits_warm_start());
-    debug_assert_eq!(plan.solver_route, MipOnlySolverRoute::SharedBinaryPrefix);
-    if let Some(marker) = safenlp_direct_first_marker_if(phase_telemetry_enabled(), "route-start") {
-        eprintln!("{marker}");
-    }
-    tracing::info!(
-        hidden_dim = plan.hidden_dim,
-        source_model = source.telemetry_name(),
-        reloaded_model = "sequential",
-        internal_pgd = false,
-        warm_start = false,
-        shared_prefix = "required",
-        "SafeNLP direct-MIP-first route admitted"
-    );
-    let result = run_mip_only_with_seed_policy(ctx, reloaded_model, mip_solver, plan.seed_policy);
-    if let Some(marker) = safenlp_direct_first_marker_if(phase_telemetry_enabled(), "route-return")
-    {
-        eprintln!("{marker}");
-    }
-    result
+    // gates.
+    mip_highs::verify_with_mip(
+        model_net,
+        ctx.input,
+        ctx.vnnlib_spec,
+        ctx.property.as_deref(),
+        Some(ctx.model_path),
+        ctx.epsilon,
+        ctx.effective_threshold,
+        internal_authority_deadline,
+        warm_start_candidate.as_ref(),
+        mip_solver,
+        ctx.verification_start,
+        ctx.effective_treatment,
+        ctx.json,
+    )
 }
 
 /// Run the BaB path, then optionally fall back to MIP if the result is inconclusive.
@@ -1179,8 +843,38 @@ pub(super) fn run_bab_with_fallback(
         graph_mip_statically_ineligible(&*ctx.model_net),
         safenlp_shared_prefix_budget_repair_enabled(),
         postbab_attack_statically_ineligible(&*ctx.model_net),
+        // #mip-demand: the escalation gate's own encode-nnz cap, answered from
+        // the model and the input SHAPE before BaB starts instead of ~2 ms
+        // after BaB has surrendered a quarter to a third of the scored clock.
+        graph_mip_statically_over_nnz_cap(&*ctx.model_net, ctx.input.shape()),
+        graph_mip_whole_net_min_slice_secs(&*ctx.model_net),
     );
+    #[cfg(feature = "mip")]
+    let bab_ledger = bab_ledger.with_verification_resources(ctx.verification_resources.clone());
     bab_ledger.emit_telemetry("bab-dispatch");
+    // #mip-demand: the lever's OWN observable, on a channel that survives into
+    // the banked sidecar with no `NY_*` set — the `[budget]` line above is dark
+    // behind `NY_PHASE_TELEMETRY=1` and `ny benchmarks run` forces `RUST_LOG=error`,
+    // so a flight note is the only proof a future bank can carry that this
+    // fired. Recorded on EVERY row, both dispositions, so a silent note is
+    // distinguishable from an absent one.
+    {
+        let finding = bab_ledger.mip_statically_ineligible();
+        crate::flight::note(
+            "mip_reserve_demand",
+            if finding == "none" {
+                crate::flight::FlightStatus::Ran
+            } else {
+                crate::flight::FlightStatus::Skipped
+            },
+            Some(format!(
+                "mip_statically_ineligible={finding} mip_reserve_fraction={:.3} \
+                 demand_sized_mip_reserve={}",
+                bab_ledger.mip_reserve_fraction(),
+                bab_ledger.policy().demand_sized_mip_reserve,
+            )),
+        );
+    }
     let internal_authority_deadline = bab_ledger.overall_deadline();
     if let Some(vnnlib) = ctx.vnnlib_spec {
         let ibp_result = match &*ctx.model_net {
@@ -1289,53 +983,6 @@ pub(super) fn run_bab_with_fallback(
         }
     }
 
-    // Preserve the existing authoritative IBP win before admitting the
-    // category-wide direct-first experiment. The BaB model may intentionally
-    // be Graph-shaped even when the exact ONNX has a canonical sequential
-    // Linear-ReLU-Linear form, so an armed row uses the same fresh sequential
-    // reload seam as historical post-BaB MIP escalation. Reload and admission
-    // consume the original absolute deadline; every pre-route decline falls
-    // through without emitting `route-start`.
-    #[cfg(feature = "mip")]
-    if ctx.safenlp_direct_mip_first {
-        let source = SafeNlpDirectMipModelSource::from_model(&*ctx.model_net);
-        let model_path = ctx.model_path;
-        let onnx_load_config = ctx.onnx_load_config;
-        let allow_heuristic_logsoftmax = ctx.allow_heuristic_logsoftmax;
-        let allow_heuristic_softmax = ctx.allow_heuristic_softmax;
-        let json = ctx.json;
-        let attempt = safenlp_direct_mip_first_attempt_with_reload(
-            true,
-            safenlp_shared_prefix_budget_repair_enabled(),
-            complete_verifier,
-            mip_solver,
-            source,
-            ctx.input,
-            ctx.vnnlib_spec,
-            internal_authority_deadline,
-            Instant::now(),
-            || {
-                reload_safenlp_direct_mip_model(
-                    model_path,
-                    onnx_load_config,
-                    allow_heuristic_logsoftmax,
-                    allow_heuristic_softmax,
-                    json,
-                )
-            },
-            Instant::now,
-            |reloaded_model, plan, source| {
-                run_safenlp_direct_mip_first(ctx, &reloaded_model, mip_solver, plan, source)
-            },
-        );
-        match attempt {
-            SafeNlpDirectMipFirstAttempt::Declined(reason) => {
-                emit_safenlp_direct_first_decline(&reason);
-            }
-            SafeNlpDirectMipFirstAttempt::Executed(result) => return result,
-        }
-    }
-
     // Cell-enumeration driver (#cctsdb Phase C): piecewise-constant models
     // whose free inputs are Trunc-gated (cctsdb_yolo_2023) are decided by
     // enumerating integer cells with a sound f64 per-cell forward — BEFORE
@@ -1414,6 +1061,25 @@ pub(super) fn run_bab_with_fallback(
         Some(device) => BetaCrownVerifier::new_with_engine(execution_config.clone(), device),
         None => BetaCrownVerifier::new(execution_config.clone()),
     };
+    // Only the actual lower-bound sequential input-split lane can consume this
+    // carrier. The original property/root binding is checked here; the private
+    // producer also checks the complete numeric network/reduction on every
+    // worker call. Graph, upper-bound, transformed and standard scalar routes
+    // receive no substitute proof authority.
+    if matches!(&*ctx.model_net, BetaCrownModel::Sequential(_))
+        && !execution_config.verify_upper_bound
+        && matches!(
+            execution_config.branching_heuristic,
+            ny_propagate::BranchingHeuristic::InputSplit
+        )
+        && !ctx.sigmoid_peeled
+    {
+        if let (Some(owned), Some(spec)) = (ctx.input_head_continuation, ctx.vnnlib_spec) {
+            if let Some(source) = owned.admitted_source(spec, ctx.input) {
+                verifier = verifier.with_input_head_continuation(source);
+            }
+        }
+    }
     if let Some(path) = ctx.input_split_metrics_jsonl {
         verifier =
             verifier.with_input_split_metrics_sink(JsonlInputSplitMetricsSink::create(path)?);
@@ -1422,17 +1088,49 @@ pub(super) fn run_bab_with_fallback(
         verifier = verifier
             .with_graph_domain_batch_metrics_sink(JsonlGraphDomainBatchMetricsSink::create(path)?);
     }
+    // #vit-margin-alpha-complex (P8): attach the ONNX Runtime forward of the
+    // ORIGINAL model file that adjudicates a root-terminal multi-objective
+    // `Verified`. Only when the typed key is armed (no shipped preset sets it;
+    // only vit_2023 may); the fence consults it only when
+    // `bab.mo_containment_fence` is armed too, and it can only downgrade.
+    if execution_config.mo_root_ort_adjudication {
+        verifier = verifier.with_root_adjudication_oracle(Arc::new(
+            super::root_ort_adjudication::OrtRootAdjudicationOracle::new(ctx.model_path),
+        ));
+    }
+    // #relusplitter-lp-refine (wave-6 C7): attach the rigorous LP root
+    // intermediate refiner only when `bab.mip_refine_intermediates` is armed
+    // (no shipped preset sets it). The multi-objective graph root consults it
+    // once and intersects its certified boxes shrink-only; it prints its own
+    // `[mip-refine] root ...` line. This attach-time line is unconditional on
+    // every armed run, so an armed key that never reached a refiner (no `mip`
+    // feature) reads as `attached=0`, never as a missing line.
+    if let Some(refine) = execution_config.mip_refine_intermediates {
+        #[cfg(feature = "mip")]
+        {
+            verifier = verifier.with_root_interm_refiner(Arc::new(
+                super::lp_refine_interm::LpRootIntermRefiner::new(refine),
+            ));
+        }
+        eprintln!(
+            "{}",
+            ny_propagate::beta_crown::root_interm_refine::mip_refine_armed_line(
+                &refine,
+                cfg!(feature = "mip"),
+                if cfg!(feature = "mip") {
+                    "ok"
+                } else {
+                    "mip_feature_off"
+                },
+            )
+        );
+    }
 
     if let BetaCrownModel::Graph(graph) = &mut *ctx.model_net {
         graph.set_use_patches_mode(execution_config.use_patches());
         graph.set_chunk_wave_parallel_enabled(execution_config.chunk_wave_parallel_enabled);
         graph.set_frozen_levers(execution_config.frozen_levers.clone());
     }
-
-    #[cfg(feature = "mip")]
-    let mut cgan_input_leaf_attachment: Option<
-        super::cgan_input_leaf::CganInputLeafAttachment,
-    > = None;
 
     // Graph-MIP LEAF oracle (increment 6, `docs/GRAPH_MIP_LEAF_SOLVER.md`):
     // the graph ReLU-split BaB decides stuck deep subdomains exactly (split
@@ -1444,50 +1142,6 @@ pub(super) fn run_bab_with_fallback(
         let mut leaf_oracles: Vec<
             Arc<dyn ny_propagate::beta_crown::graph_mip_leaf::GraphMipLeafOracle>,
         > = Vec::new();
-        if let (
-            Some(route),
-            BetaCrownModel::Graph(graph),
-            Some(property),
-            Some(vnnlib),
-            Some(authority_deadline),
-        ) = (
-            ctx.cgan_input_leaf_route,
-            &*ctx.model_net,
-            ctx.property.as_deref(),
-            ctx.vnnlib_spec,
-            bab_ledger.bab_deadline(),
-        ) {
-            if let Some(attachment) = super::cgan_input_leaf::maybe_cgan_input_leaf_oracle(
-                route,
-                authority_deadline,
-                ctx.model_path,
-                property,
-                ctx.onnx_load_config,
-                graph,
-                ctx.input,
-                vnnlib,
-            ) {
-                crate::flight::note(
-                    "cgan_input_leaf_attachment",
-                    crate::flight::FlightStatus::Ran,
-                    Some(
-                        "exact category/model/property/profile/root authentication completed"
-                            .to_string(),
-                    ),
-                );
-                leaf_oracles.push(attachment.oracle());
-                cgan_input_leaf_attachment = Some(attachment);
-            } else {
-                crate::flight::note(
-                    "cgan_input_leaf_attachment",
-                    crate::flight::FlightStatus::Skipped,
-                    Some(
-                        "typed route reached dispatch but exact authentication declined"
-                            .to_string(),
-                    ),
-                );
-            }
-        }
         if let Some(oracle) = super::graph_mip_leaf::maybe_graph_mip_leaf_oracle(
             mip_solver.mip_backend(),
             ctx.vnnlib_spec,
@@ -1513,6 +1167,60 @@ pub(super) fn run_bab_with_fallback(
     let has_multi_constraints = routes_to_relational_verifier(ctx.vnnlib_spec, ctx.has_relational);
 
     ny_propagate::beta_crown::reset_global_timeout_deadline_source();
+    ny_propagate::beta_crown::reset_sequential_initial_schedule_receipt();
+    ny_propagate::zono_core::reset_cgan_child_zono_receipt();
+    // #attack-concurrent: the conjunctive upfront sites' race context, built
+    // only when the key is armed (`None` otherwise; the sites never read it).
+    // The publish hook is THIS dispatch's own Violated emission — the deadline
+    // gate and the captured-route JSON renderer `output_result` uses — run on
+    // the attack thread, which then ENTERS the attack door and hands the OWNED
+    // JSON to the scored publisher (it replays the wrapper's sat pipeline) as
+    // a job the race runs on a detached thread, so a slow gate cannot hold the
+    // race's join.
+    let attack_concurrent_property = ctx.property.as_deref();
+    let attack_concurrent_epsilon = ctx.epsilon;
+    let attack_concurrent_threshold = ctx.effective_threshold;
+    let attack_concurrent_treatment = ctx.effective_treatment;
+    let attack_concurrent_start = ctx.verification_start;
+    let attack_concurrent_publish = |result: &BetaCrownResult,
+                                     report: &super::attack_concurrent::ConcurrentSatReport|
+     -> super::attack_concurrent::PreparedSat {
+        use super::attack_concurrent::{ConcurrentSatPublication as Declined, PreparedSat};
+        let result = gate_result_at_deadline(
+            result.clone(),
+            attack_concurrent_start,
+            internal_authority_deadline,
+        );
+        if !matches!(result.result, BabVerificationStatus::Violated { .. }) {
+            return PreparedSat::Declined(Declined::SuppressedAtDeadline);
+        }
+        match super::output::render_captured_competition_json(
+            &result,
+            attack_concurrent_property,
+            attack_concurrent_epsilon,
+            attack_concurrent_threshold,
+            attack_concurrent_treatment,
+        ) {
+            // Enters the attack door HERE, on the attack thread inside the
+            // race scope, so the main thread's synchronized door sees the
+            // publication in flight however early the race stops waiting.
+            Ok(json) => crate::commands::vnncomp::prepare_concurrent_attack_sat(json, *report),
+            // Not adjudicated here: hand the candidate to the main thread,
+            // whose own emission then renders it exactly as today.
+            Err(error) => {
+                tracing::warn!("#attack-concurrent: candidate JSON render failed: {error:#}");
+                PreparedSat::Declined(Declined::NotArmed)
+            }
+        }
+    };
+    let attack_concurrent_ctx =
+        execution_config
+            .attack_concurrent
+            .then(|| super::attack_concurrent::ConcurrentAttackCtx {
+                wrapper: ctx.attack_concurrent_wrapper,
+                publisher_armed: crate::commands::vnncomp::concurrent_attack_publisher_armed(),
+                publish: &attack_concurrent_publish,
+            });
     let verification = if let (true, Some(vnnlib)) = (has_multi_constraints, ctx.vnnlib_spec) {
         verify_relational_constraints_with_ledger(
             &*ctx.model_net,
@@ -1530,6 +1238,7 @@ pub(super) fn run_bab_with_fallback(
             ctx.attack_engine_source,
             ctx.json,
             &bab_ledger,
+            attack_concurrent_ctx.as_ref(),
         )
     } else {
         if !ctx.json {
@@ -1553,11 +1262,54 @@ pub(super) fn run_bab_with_fallback(
             ctx.gemm_engine,
             bab_ledger.bab_deadline(),
         )
+        .map(super::verification_outcome::VerificationOutcome::ordinary)
     };
     let engine_timeout_source = ny_propagate::beta_crown::take_global_timeout_deadline_source();
-    #[cfg(feature = "mip")]
-    if let Some(attachment) = cgan_input_leaf_attachment.as_ref() {
-        attachment.emit_final_once("bab-return");
+    // #seq-single-reserve / #seq-early-attack: the levers' OWN observable, on
+    // the channel that survives into the banked sidecar with no `NY_*` set —
+    // the engine's `[seq-budget]` info line is dark under the RUST_LOG=error
+    // that `ny benchmarks run` forces, so this flight note is the only proof
+    // a future bank can carry. Recorded on EVERY row, both dispositions
+    // (`Skipped` marks a row whose verification never entered the sequential
+    // initial phase), so a silent note is distinguishable from an absent one.
+    {
+        use ny_propagate::SequentialEarlyQuitDisposition;
+        match ny_propagate::take_sequential_initial_schedule_receipt() {
+            Some(receipt) => crate::flight::note(
+                "seq_initial_schedule",
+                crate::flight::FlightStatus::Ran,
+                Some(format!(
+                    "effective_total_s={:.3} bab_timeout_s={:.3} warmup_cap_s={:.3} \
+                     warmup_single_reserve_applied={} caller_deadline={} early_quit={}",
+                    receipt.effective_total_secs,
+                    receipt.bab_timeout_secs,
+                    receipt.warmup_cap_secs,
+                    receipt.warmup_single_reserve_applied,
+                    receipt.caller_deadline,
+                    match receipt.early_quit {
+                        SequentialEarlyQuitDisposition::None => "none",
+                        SequentialEarlyQuitDisposition::Attacked => "attacked",
+                        SequentialEarlyQuitDisposition::ForfeitedByKillSwitch =>
+                            "forfeited-by-kill-switch",
+                    },
+                )),
+            ),
+            None => crate::flight::note(
+                "seq_initial_schedule",
+                crate::flight::FlightStatus::Skipped,
+                Some("lane=not-sequential-initial-phase".to_string()),
+            ),
+        }
+    }
+    // #cgan-child-zono: run totals of the per-child zonotope prepass, on the
+    // channel that survives into the banked sidecar. Only an ARMED run leaves
+    // a receipt, so a dark run adds no note (its sidecar is unchanged).
+    if let Some(receipt) = ny_propagate::zono_core::take_cgan_child_zono_receipt() {
+        crate::flight::note(
+            "cgan_child_zono",
+            crate::flight::FlightStatus::Ran,
+            Some(receipt.render()),
+        );
     }
     let result = match verification {
         Ok(result) => result,
@@ -1569,9 +1321,31 @@ pub(super) fn run_bab_with_fallback(
             ) else {
                 return Err(error);
             };
-            timeout
+            super::verification_outcome::VerificationOutcome::ordinary(timeout)
         }
     };
+    #[cfg(feature = "mip")]
+    let result = {
+        let (report, hull) = result.into_parts();
+        if let Some(proof) = hull {
+            let report = gate_result_at_deadline(
+                report,
+                ctx.verification_start,
+                internal_authority_deadline,
+            );
+            return super::output::output_hull_result(
+                report,
+                proof,
+                ctx.property.as_deref(),
+                ctx.effective_threshold,
+                ctx.json,
+                ctx.effective_treatment,
+            );
+        }
+        report
+    };
+    #[cfg(not(feature = "mip"))]
+    let result = result.into_ordinary()?;
     mark_captured_engine_timeout_source(&result, engine_timeout_source);
 
     let deadline = internal_authority_deadline;
@@ -1770,7 +1544,7 @@ pub(super) fn run_bab_with_fallback(
                             ctx.allow_heuristic_softmax,
                             ctx.json,
                         );
-                        let mip_result = mip_highs::verify_with_mip(
+                        let mip_result = mip_highs::verify_with_mip_for_bridge(
                             &seq_net,
                             ctx.input,
                             ctx.vnnlib_spec,
@@ -1784,9 +1558,33 @@ pub(super) fn run_bab_with_fallback(
                             ctx.verification_start,
                             ctx.effective_treatment,
                             ctx.json,
+                            ctx.input_head_continuation.is_some(),
                         );
                         match mip_result {
-                            Ok(()) => return Ok(()),
+                            Ok(publication) => {
+                                // Only an actual typed Verified + successful
+                                // MIP publication can preserve this independent
+                                // full-root route after dependent source use.
+                                if let (
+                                    Some(owned),
+                                    Some(spec),
+                                    BetaCrownModel::Sequential(original),
+                                    Some(publication),
+                                ) = (
+                                    ctx.input_head_continuation,
+                                    ctx.vnnlib_spec,
+                                    &seq_net,
+                                    publication,
+                                ) {
+                                    let _ = owned.note_independent_full_root_mip_publication(
+                                        original,
+                                        spec,
+                                        ctx.input,
+                                        publication,
+                                    );
+                                }
+                                return Ok(());
+                            }
                             Err(e) => {
                                 // The MIP complete verifier could not produce a
                                 // verdict (e.g. the Conv2d→Linear unfolding is too
@@ -2036,11 +1834,9 @@ mod deadline_error_tests {
 #[cfg(all(test, feature = "mip"))]
 mod tests {
     use super::*;
-    use ndarray::{arr1, arr2, Array1, Array2};
-    use ny_onnx::vnnlib::parse_vnnlib;
-    use ny_propagate::layers::{AddConstantLayer, LinearLayer, ReLULayer, SigmoidLayer};
-    use ny_propagate::{GraphNetwork, Layer, Network, PhaseBudgetConfig};
-    use std::cell::Cell;
+    use ndarray::arr2;
+    use ny_propagate::layers::{LinearLayer, ReLULayer, SigmoidLayer};
+    use ny_propagate::{Layer, Network, PhaseBudgetConfig};
     use std::ffi::OsStr;
     use std::time::Duration;
 
@@ -2095,608 +1891,6 @@ mod tests {
         net
     }
 
-    fn safenlp_direct_first_fixture(
-        hidden_dim: usize,
-    ) -> (BetaCrownModel, BoundedTensor, VnnLibSpec) {
-        let mut net = Network::new();
-        net.add_layer(Layer::Linear(
-            LinearLayer::new(Array2::zeros((hidden_dim, 2)), None).expect("input linear"),
-        ));
-        net.add_layer(Layer::ReLU(ReLULayer));
-        net.add_layer(Layer::Linear(
-            LinearLayer::new(Array2::zeros((2, hidden_dim)), None).expect("output linear"),
-        ));
-        let input = BoundedTensor::new(
-            arr1(&[-1.0_f32, -1.0]).into_dyn(),
-            arr1(&[1.0_f32, 1.0]).into_dyn(),
-        )
-        .expect("finite two-dimensional box");
-        let spec = parse_vnnlib(
-            r#"
-(declare-const X_0 Real)
-(declare-const X_1 Real)
-(declare-const Y_0 Real)
-(declare-const Y_1 Real)
-(assert (>= X_0 -1.0))
-(assert (<= X_0 1.0))
-(assert (>= X_1 -1.0))
-(assert (<= X_1 1.0))
-(assert (<= Y_0 Y_1))
-"#,
-        )
-        .expect("one relational SafeNLP-shaped row");
-        (BetaCrownModel::Sequential(Box::new(net)), input, spec)
-    }
-
-    /// Match the sequential representation produced by the ONNX loader for
-    /// SafeNLP MatMul+Add nodes: affine biases remain separate constant ops
-    /// until the authoritative MIP preprocessing pipeline folds them.
-    fn safenlp_direct_first_foldable_bias_fixture(
-        hidden_dim: usize,
-    ) -> (BetaCrownModel, BoundedTensor, VnnLibSpec) {
-        let (_, input, spec) = safenlp_direct_first_fixture(hidden_dim);
-        let mut net = Network::new();
-        net.add_layer(Layer::Linear(
-            LinearLayer::new(Array2::zeros((hidden_dim, 2)), None).expect("input MatMul"),
-        ));
-        net.add_layer(Layer::AddConstant(AddConstantLayer::new(
-            Array1::from_elem(hidden_dim, 0.25_f32).into_dyn(),
-        )));
-        net.add_layer(Layer::ReLU(ReLULayer));
-        net.add_layer(Layer::Linear(
-            LinearLayer::new(Array2::zeros((2, hidden_dim)), None).expect("output MatMul"),
-        ));
-        net.add_layer(Layer::AddConstant(AddConstantLayer::new(
-            arr1(&[0.125_f32, -0.25]).into_dyn(),
-        )));
-        (BetaCrownModel::Sequential(Box::new(net)), input, spec)
-    }
-
-    fn direct_first_plan_for_fixture(
-        model: &BetaCrownModel,
-        input: &BoundedTensor,
-        spec: &VnnLibSpec,
-        deadline: Option<Instant>,
-        now: Instant,
-    ) -> Option<SafeNlpDirectMipFirstPlan> {
-        let (deadline, spec) = safenlp_direct_mip_first_preflight(
-            true,
-            true,
-            CompleteVerifierArg::Auto,
-            MipSolverArg::AY,
-            Some(spec),
-            deadline,
-            now,
-        )
-        .ok()?;
-        safenlp_direct_mip_first_plan_for_reloaded_model(model, input, spec, deadline, now).ok()
-    }
-
-    #[test]
-    fn safenlp_direct_first_selects_cold_shared_prefix_on_one_absolute_deadline() {
-        let (model, input, spec) = safenlp_direct_first_fixture(128);
-        let now = Instant::now();
-        let deadline = now + Duration::from_secs(15);
-        let plan = direct_first_plan_for_fixture(&model, &input, &spec, Some(deadline), now)
-            .expect("exact SafeNLP shape must admit the treatment");
-
-        assert_eq!(plan.deadline, deadline);
-        assert_eq!(plan.hidden_dim, 128);
-        assert_eq!(plan.seed_policy, MipOnlySeedPolicy::ColdNoWarmStart);
-        assert_eq!(plan.solver_route, MipOnlySolverRoute::SharedBinaryPrefix);
-        assert!(
-            !plan.seed_policy.run_internal_pgd(true),
-            "the typed treatment must suppress even a configured direct-MIP PGD precheck"
-        );
-        assert!(
-            !plan.seed_policy.permits_warm_start(),
-            "the treatment must pass no warm seed, preserving shared-prefix admission"
-        );
-
-        assert!(
-            MipOnlySeedPolicy::HistoricalConfigured.run_internal_pgd(true),
-            "generic run_mip_only callers must retain their configured PGD behavior"
-        );
-        assert!(
-            MipOnlySeedPolicy::HistoricalConfigured.permits_warm_start(),
-            "generic run_mip_only callers must retain PGD-to-MIP warm starts"
-        );
-    }
-
-    #[test]
-    fn safenlp_matmul_add_reload_canonicalizes_before_admission() {
-        let (model, input, spec) = safenlp_direct_first_foldable_bias_fixture(128);
-        let BetaCrownModel::Sequential(network) = &model else {
-            panic!("fixture must be sequential")
-        };
-        assert!(matches!(
-            network.layers(),
-            [
-                Layer::Linear(_),
-                Layer::AddConstant(_),
-                Layer::ReLU(_),
-                Layer::Linear(_),
-                Layer::AddConstant(_)
-            ]
-        ));
-
-        let now = Instant::now();
-        let deadline = now + Duration::from_secs(15);
-        let plan =
-            safenlp_direct_mip_first_plan_for_reloaded_model(&model, &input, &spec, deadline, now)
-                .expect("the exact MIP fold/validate/extract pipeline must admit MatMul+Add");
-        assert_eq!(plan.hidden_dim, 128);
-        assert_eq!(plan.deadline, deadline);
-    }
-
-    #[test]
-    fn safenlp_oversized_raw_bias_declines_before_route_admission() {
-        let (_, input, spec) = safenlp_direct_first_fixture(2);
-        let mut net = Network::new();
-        net.add_layer(Layer::Linear(
-            LinearLayer::new(Array2::zeros((2, 2)), None).expect("input MatMul"),
-        ));
-        net.add_layer(Layer::AddConstant(AddConstantLayer::new(
-            arr1(&[0.0_f32, 0.0, 0.0]).into_dyn(),
-        )));
-        net.add_layer(Layer::ReLU(ReLULayer));
-        net.add_layer(Layer::Linear(
-            LinearLayer::new(Array2::zeros((2, 2)), None).expect("output MatMul"),
-        ));
-        let model = BetaCrownModel::Sequential(Box::new(net));
-        let now = Instant::now();
-        let deadline = now + Duration::from_secs(15);
-
-        assert!(matches!(
-            safenlp_direct_mip_first_plan_for_reloaded_model(&model, &input, &spec, deadline, now),
-            Err(SafeNlpDirectMipFirstDecline::UnsupportedReloadedModelShape)
-        ));
-    }
-
-    #[test]
-    fn safenlp_graph_context_admits_only_through_one_valid_sequential_reload() {
-        let graph_context = BetaCrownModel::Graph(Box::new(GraphNetwork::new()));
-        let source = SafeNlpDirectMipModelSource::from_model(&graph_context);
-        assert_eq!(source, SafeNlpDirectMipModelSource::Graph);
-
-        let (reloaded_model, input, spec) = safenlp_direct_first_foldable_bias_fixture(128);
-        let now = Instant::now();
-        let deadline = now + Duration::from_secs(15);
-        assert!(matches!(
-            safenlp_direct_mip_first_plan_for_reloaded_model(
-                &graph_context,
-                &input,
-                &spec,
-                deadline,
-                now
-            ),
-            Err(SafeNlpDirectMipFirstDecline::UnsupportedReloadedModelShape)
-        ));
-
-        let reloads = Cell::new(0);
-        let executions = Cell::new(0);
-        let attempt = safenlp_direct_mip_first_attempt_with_reload(
-            true,
-            true,
-            CompleteVerifierArg::Auto,
-            MipSolverArg::AY,
-            source,
-            &input,
-            Some(&spec),
-            Some(deadline),
-            now,
-            || {
-                reloads.set(reloads.get() + 1);
-                Ok(reloaded_model)
-            },
-            || now + Duration::from_millis(1),
-            |model, plan, observed_source| {
-                executions.set(executions.get() + 1);
-                assert!(matches!(model, BetaCrownModel::Sequential(_)));
-                assert_eq!(observed_source, SafeNlpDirectMipModelSource::Graph);
-                plan
-            },
-        );
-
-        let SafeNlpDirectMipFirstAttempt::Executed(plan) = attempt else {
-            panic!("valid sequential reload must admit the graph-shaped BaB context")
-        };
-        assert_eq!(plan.deadline, deadline);
-        assert_eq!(plan.hidden_dim, 128);
-        assert_eq!(
-            reloads.get(),
-            1,
-            "the direct route must reload exactly once"
-        );
-        assert_eq!(
-            executions.get(),
-            1,
-            "one admitted reload must start exactly one route/session owner"
-        );
-    }
-
-    #[test]
-    fn safenlp_reload_failure_wrong_shape_and_deadlines_decline_before_execution() {
-        let (_, input, spec) = safenlp_direct_first_fixture(2);
-        let now = Instant::now();
-        let deadline = now + Duration::from_secs(15);
-        let reloads = Cell::new(0);
-        let executions = Cell::new(0);
-        let load_failure = safenlp_direct_mip_first_attempt_with_reload(
-            true,
-            true,
-            CompleteVerifierArg::Auto,
-            MipSolverArg::AY,
-            SafeNlpDirectMipModelSource::Graph,
-            &input,
-            Some(&spec),
-            Some(deadline),
-            now,
-            || {
-                reloads.set(reloads.get() + 1);
-                anyhow::bail!("synthetic reload failure")
-            },
-            || now + Duration::from_millis(1),
-            |_, _, _| {
-                executions.set(executions.get() + 1);
-            },
-        );
-        assert!(matches!(
-            load_failure,
-            SafeNlpDirectMipFirstAttempt::Declined(
-                SafeNlpDirectMipFirstDecline::ReloadFailed(ref detail)
-            ) if detail.contains("synthetic reload failure")
-        ));
-        assert_eq!(reloads.get(), 1);
-        assert_eq!(executions.get(), 0);
-
-        let (wide_model, _, _) = safenlp_direct_first_fixture(129);
-        let wrong_shape = safenlp_direct_mip_first_attempt_with_reload(
-            true,
-            true,
-            CompleteVerifierArg::Auto,
-            MipSolverArg::AY,
-            SafeNlpDirectMipModelSource::Graph,
-            &input,
-            Some(&spec),
-            Some(deadline),
-            now,
-            || Ok(wide_model),
-            || now + Duration::from_millis(1),
-            |_, _, _| {
-                executions.set(executions.get() + 1);
-            },
-        );
-        assert!(matches!(
-            wrong_shape,
-            SafeNlpDirectMipFirstAttempt::Declined(
-                SafeNlpDirectMipFirstDecline::UnsupportedReloadedModelShape
-            )
-        ));
-        assert_eq!(executions.get(), 0);
-
-        let preflight_reloads = Cell::new(0);
-        let expired_before_reload = safenlp_direct_mip_first_attempt_with_reload(
-            true,
-            true,
-            CompleteVerifierArg::Auto,
-            MipSolverArg::AY,
-            SafeNlpDirectMipModelSource::Graph,
-            &input,
-            Some(&spec),
-            Some(now),
-            now,
-            || {
-                preflight_reloads.set(preflight_reloads.get() + 1);
-                let (model, _, _) = safenlp_direct_first_fixture(2);
-                Ok(model)
-            },
-            || now,
-            |_, _, _| {
-                executions.set(executions.get() + 1);
-            },
-        );
-        assert!(matches!(
-            expired_before_reload,
-            SafeNlpDirectMipFirstAttempt::Declined(SafeNlpDirectMipFirstDecline::ExpiredDeadline)
-        ));
-        assert_eq!(
-            preflight_reloads.get(),
-            0,
-            "expired preflight must not touch the loader"
-        );
-
-        let (model, _, _) = safenlp_direct_first_fixture(2);
-        let expired_after_reload = safenlp_direct_mip_first_attempt_with_reload(
-            true,
-            true,
-            CompleteVerifierArg::Auto,
-            MipSolverArg::AY,
-            SafeNlpDirectMipModelSource::Graph,
-            &input,
-            Some(&spec),
-            Some(deadline),
-            now,
-            || Ok(model),
-            || deadline,
-            |_, _, _| {
-                executions.set(executions.get() + 1);
-            },
-        );
-        assert!(matches!(
-            expired_after_reload,
-            SafeNlpDirectMipFirstAttempt::Declined(SafeNlpDirectMipFirstDecline::ExpiredDeadline)
-        ));
-        assert_eq!(executions.get(), 0);
-
-        let (model, _, _) = safenlp_direct_first_foldable_bias_fixture(2);
-        let deadline_samples = Cell::new(0);
-        let expired_after_canonicalization = safenlp_direct_mip_first_attempt_with_reload(
-            true,
-            true,
-            CompleteVerifierArg::Auto,
-            MipSolverArg::AY,
-            SafeNlpDirectMipModelSource::Graph,
-            &input,
-            Some(&spec),
-            Some(deadline),
-            now,
-            || Ok(model),
-            || {
-                let sample = deadline_samples.get();
-                deadline_samples.set(sample + 1);
-                if sample == 0 {
-                    now + Duration::from_millis(1)
-                } else {
-                    deadline
-                }
-            },
-            |_, _, _| {
-                executions.set(executions.get() + 1);
-            },
-        );
-        assert!(matches!(
-            expired_after_canonicalization,
-            SafeNlpDirectMipFirstAttempt::Declined(SafeNlpDirectMipFirstDecline::ExpiredDeadline)
-        ));
-        assert_eq!(
-            deadline_samples.get(),
-            2,
-            "canonicalization must be charged before route execution"
-        );
-        assert_eq!(executions.get(), 0);
-    }
-
-    #[test]
-    fn safenlp_default_and_preflight_declines_never_reload_or_execute() {
-        use crate::commands::beta_crown::output::{
-            begin_capture, end_capture, take_captured_terminal_ingress, CapturedTerminalIngress,
-        };
-
-        let (_, input, spec) = safenlp_direct_first_fixture(2);
-        let now = Instant::now();
-        let deadline = now + Duration::from_secs(15);
-
-        for (requested, shared, expected) in [
-            (false, true, SafeNlpDirectMipFirstDecline::NotRequested),
-            (
-                true,
-                false,
-                SafeNlpDirectMipFirstDecline::SharedPrefixDisabled,
-            ),
-        ] {
-            begin_capture();
-            let reloads = Cell::new(0);
-            let executions = Cell::new(0);
-            let attempt = safenlp_direct_mip_first_attempt_with_reload(
-                requested,
-                shared,
-                CompleteVerifierArg::Auto,
-                MipSolverArg::AY,
-                SafeNlpDirectMipModelSource::Graph,
-                &input,
-                Some(&spec),
-                Some(deadline),
-                now,
-                || {
-                    reloads.set(reloads.get() + 1);
-                    let (model, _, _) = safenlp_direct_first_fixture(2);
-                    Ok(model)
-                },
-                || now,
-                |_, _, _| {
-                    executions.set(executions.get() + 1);
-                },
-            );
-            assert!(matches!(
-                attempt,
-                SafeNlpDirectMipFirstAttempt::Declined(ref reason) if *reason == expected
-            ));
-            assert_eq!(reloads.get(), 0);
-            assert_eq!(executions.get(), 0);
-            assert_eq!(
-                take_captured_terminal_ingress(),
-                CapturedTerminalIngress::None,
-                "a pre-route decline must preserve historical post-BaB policy"
-            );
-            end_capture();
-        }
-    }
-
-    #[test]
-    fn safenlp_direct_first_declines_missing_scope_prefix_policy_or_live_deadline() {
-        let (_, _, spec) = safenlp_direct_first_fixture(2);
-        let now = Instant::now();
-        let deadline = Some(now + Duration::from_secs(15));
-        let decide = |requested, shared, policy, deadline| {
-            safenlp_direct_mip_first_preflight(
-                requested,
-                shared,
-                policy,
-                MipSolverArg::AY,
-                Some(&spec),
-                deadline,
-                now,
-            )
-        };
-
-        assert!(matches!(
-            decide(false, true, CompleteVerifierArg::Auto, deadline),
-            Err(SafeNlpDirectMipFirstDecline::NotRequested)
-        ));
-        assert!(matches!(
-            decide(true, false, CompleteVerifierArg::Auto, deadline),
-            Err(SafeNlpDirectMipFirstDecline::SharedPrefixDisabled)
-        ));
-        assert!(matches!(
-            decide(true, true, CompleteVerifierArg::Bab, deadline),
-            Err(SafeNlpDirectMipFirstDecline::NonAutoPolicy)
-        ));
-        assert!(matches!(
-            decide(true, true, CompleteVerifierArg::Mip, deadline),
-            Err(SafeNlpDirectMipFirstDecline::NonAutoPolicy)
-        ));
-        assert!(matches!(
-            decide(true, true, CompleteVerifierArg::Auto, None),
-            Err(SafeNlpDirectMipFirstDecline::MissingDeadline)
-        ));
-        assert!(matches!(
-            decide(true, true, CompleteVerifierArg::Auto, Some(now)),
-            Err(SafeNlpDirectMipFirstDecline::ExpiredDeadline)
-        ));
-        assert!(decide(
-            true,
-            true,
-            CompleteVerifierArg::Auto,
-            now.checked_sub(Duration::from_millis(1)),
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn safenlp_direct_first_declines_broad_network_and_property_shapes() {
-        let now = Instant::now();
-        let deadline = Some(now + Duration::from_secs(15));
-
-        let (wide_model, input, spec) = safenlp_direct_first_fixture(129);
-        assert!(direct_first_plan_for_fixture(&wide_model, &input, &spec, deadline, now).is_none());
-
-        let (mut extra_model, input, spec) = safenlp_direct_first_fixture(2);
-        let BetaCrownModel::Sequential(extra_net) = &mut extra_model else {
-            unreachable!()
-        };
-        extra_net.add_layer(Layer::ReLU(ReLULayer));
-        assert!(
-            direct_first_plan_for_fixture(&extra_model, &input, &spec, deadline, now).is_none()
-        );
-
-        let (model, input, _) = safenlp_direct_first_fixture(2);
-        let constant_spec = parse_vnnlib(
-            r#"
-(declare-const X_0 Real)
-(declare-const X_1 Real)
-(declare-const Y_0 Real)
-(declare-const Y_1 Real)
-(assert (>= X_0 -1.0))
-(assert (<= X_0 1.0))
-(assert (>= X_1 -1.0))
-(assert (<= X_1 1.0))
-(assert (<= Y_0 0.0))
-"#,
-        )
-        .expect("constant-row property");
-        assert!(
-            direct_first_plan_for_fixture(&model, &input, &constant_spec, deadline, now).is_none()
-        );
-
-        let mut multi_spec = spec;
-        multi_spec
-            .output_constraints
-            .push(OutputConstraint::LessEq(1, 0));
-        multi_spec.output_constraint_clauses = vec![multi_spec.output_constraints.clone()];
-        assert!(
-            direct_first_plan_for_fixture(&model, &input, &multi_spec, deadline, now).is_none()
-        );
-    }
-
-    #[test]
-    fn safenlp_direct_first_phase_marker_is_exact_and_default_dark() {
-        for raw in [None, Some(""), Some("0"), Some("true"), Some(" 1")] {
-            assert!(!phase_telemetry_enabled_from_value(raw.map(OsStr::new)));
-        }
-        assert!(phase_telemetry_enabled_from_value(Some(OsStr::new("1"))));
-        assert_eq!(safenlp_direct_first_marker_if(false, "route-start"), None);
-        assert_eq!(
-            safenlp_direct_first_marker_if(true, "route-start").as_deref(),
-            Some(
-                "NY_MIP_SAFENLP_DIRECT_FIRST_V1 event=route-start \
-                 route=direct-mip-first shared_prefix=required internal_pgd=false \
-                warm_start=false deadline=caller-absolute"
-            )
-        );
-        assert_eq!(
-            safenlp_direct_first_decline_marker_if(
-                true,
-                &SafeNlpDirectMipFirstDecline::NotRequested
-            ),
-            None,
-            "default/unset/malformed/zero intent must emit no direct-route telemetry"
-        );
-        assert_eq!(
-            safenlp_direct_first_decline_marker_if(
-                false,
-                &SafeNlpDirectMipFirstDecline::SharedPrefixDisabled
-            ),
-            None
-        );
-        assert_eq!(
-            safenlp_direct_first_decline_marker_if(
-                true,
-                &SafeNlpDirectMipFirstDecline::SharedPrefixDisabled
-            )
-            .as_deref(),
-            Some(
-                "NY_MIP_SAFENLP_DIRECT_FIRST_V1 event=route-decline \
-                 stage=preflight reason=shared-prefix-disabled historical_fallback=bab"
-            )
-        );
-    }
-
-    #[test]
-    fn safenlp_direct_first_is_structurally_after_ibp_and_before_bab() {
-        let source = include_str!("dispatch.rs");
-        let (_, body) = source
-            .split_once("pub(super) fn run_bab_with_fallback")
-            .expect("production dispatch function");
-        let ibp = body
-            .find("if ibp_check_vnnlib_safe")
-            .expect("authoritative IBP fast path");
-        let affine = body
-            .find("try_affine_root_farkas")
-            .expect("exact affine root-Farkas closure");
-        let direct = body
-            .find("safenlp_direct_mip_first_attempt_with_reload")
-            .expect("direct-first admission");
-        let reload = body
-            .find("reload_safenlp_direct_mip_model")
-            .expect("fresh sequential reload");
-        let bab = body
-            .find("let mut verifier = match")
-            .expect("BaB verifier construction");
-
-        assert!(
-            ibp < affine && affine < direct && direct < reload && reload < bab,
-            "exact affine/direct-first routes must preserve IBP and run before actual BaB"
-        );
-        assert_eq!(
-            body[..bab]
-                .matches("reload_safenlp_direct_mip_model")
-                .count(),
-            1,
-            "the pre-BaB direct path must own exactly one reload call"
-        );
-    }
-
     #[cfg(feature = "mip")]
     #[test]
     fn affine_root_farkas_preserves_explicit_bab_opt_out() {
@@ -2712,31 +1906,6 @@ mod tests {
             CompleteVerifierArg::Bab,
             MipSolverArg::AY
         ));
-    }
-
-    #[test]
-    fn safenlp_reload_seam_wraps_sequential_and_applies_sound_modes_once() {
-        let source = include_str!("dispatch.rs");
-        let (_, reload_body) = source
-            .split_once("fn reload_safenlp_direct_mip_model")
-            .expect("production reload helper");
-        let reload_body = reload_body
-            .split_once("fn phase_telemetry_enabled_from_value")
-            .expect("end of reload helper")
-            .0;
-
-        assert_eq!(reload_body.matches("load_onnx_with_config").count(), 1);
-        assert_eq!(reload_body.matches(".to_propagate_network()").count(), 1);
-        assert_eq!(
-            reload_body
-                .matches("BetaCrownModel::Sequential(Box::new(seq_net))")
-                .count(),
-            1
-        );
-        assert_eq!(
-            reload_body.matches("apply_heuristic_sound_modes").count(),
-            1
-        );
     }
 
     #[test]
@@ -2905,8 +2074,17 @@ mod tests {
             .clone()
             .with_mip_escalation_allowed(true)
             .with_static_mip_ineligibility(true);
-        let routed =
-            apply_bab_mip_budget_policy(base, CompleteVerifierArg::Auto, true, false, false);
+        // #mip-demand: this regression is about the layer-set route, so both
+        // new predicates stay at their fail-safe "no static claim" values.
+        let routed = apply_bab_mip_budget_policy(
+            base,
+            CompleteVerifierArg::Auto,
+            true,
+            false,
+            false,
+            false,
+            None,
+        );
 
         assert_eq!(routed.bab_deadline(), historical.bab_deadline());
         assert_eq!(
@@ -2933,6 +2111,10 @@ mod tests {
             // #reserve-demand: this regression is about the MIP reservation, so
             // the post-BaB demand finding stays at its fail-safe `false`.
             false,
+            // #mip-demand: and so do the two new static predicates — the
+            // SafeNLP shared-prefix treatment must survive all three.
+            false,
+            None,
         );
         assert!(
             repaired.mip_reservation_armed_for_test(),
@@ -2952,10 +2134,99 @@ mod tests {
             true,
             true,
             false,
+            false,
+            None,
         );
         assert!(
             !bab_only.mip_reservation_armed_for_test(),
             "explicit complete-verifier=bab must remain no-MIP under the gate"
+        );
+    }
+
+    /// #mip-demand — the production policy chain must carry the two NEW static
+    /// predicates, and the SafeNLP shared-prefix treatment must survive both.
+    ///
+    /// The exemption argument is the same one `#deadlane` already makes: that
+    /// treatment's later MIP runs on a RELOADED SEQUENTIAL net, which neither
+    /// the graph encode-nnz probe nor the graph whole-net slice floor describes.
+    #[test]
+    fn production_budget_dispatch_carries_the_mip_demand_predicates() {
+        // ENV-FREE by construction, unlike its two older siblings above: every
+        // ledger here forces `with_mip_reservation(true)`, so nothing depends on
+        // `graph_mip_enabled()` and the test needs no `NY_GRAPH_MIP` guard. That
+        // guard is a raw environment read, and the ny-levers ratchet counts it —
+        // adding a fourth one to buy a test precondition is exactly the debt the
+        // gate exists to refuse. Forcing the flag is also strictly more robust:
+        // the guard could only DETECT a hostile ambient value, not survive it.
+        let policy = PhaseBudgetConfig {
+            post_bab_pgd_fraction: 0.10,
+            ..PhaseBudgetConfig::default()
+        };
+
+        // Layer set fine, but the model is statically over the encode-nnz cap.
+        let over_cap = apply_bab_mip_budget_policy(
+            PhaseBudgetLedger::new(114, policy.clone()).with_mip_reservation(true),
+            CompleteVerifierArg::Auto,
+            false,
+            false,
+            false,
+            true,
+            Some(20),
+        );
+        assert_eq!(over_cap.mip_statically_ineligible(), "nnz-cap");
+        assert!(!over_cap.mip_reservation_armed_for_test());
+
+        // No static claim at all: the historical reservation survives intact.
+        let untouched = apply_bab_mip_budget_policy(
+            PhaseBudgetLedger::new(114, policy.clone()).with_mip_reservation(true),
+            CompleteVerifierArg::Auto,
+            false,
+            false,
+            false,
+            false,
+            Some(20),
+        );
+        assert_eq!(
+            untouched.mip_statically_ineligible(),
+            "none",
+            "the chain must be able to produce the OTHER answer"
+        );
+        assert!(untouched.mip_reservation_armed_for_test());
+        let no_floor = apply_bab_mip_budget_policy(
+            PhaseBudgetLedger::new(114, policy).with_mip_reservation(true),
+            CompleteVerifierArg::Auto,
+            false,
+            false,
+            false,
+            false,
+            None,
+        );
+        assert_eq!(
+            untouched.planned_mip_timeout_at_bab_deadline(),
+            no_floor.planned_mip_timeout_at_bab_deadline(),
+            "an ADMISSIBLE reserve (28 s >= the 20 s floor) must be byte-identical \
+             with and without the floor declared"
+        );
+
+        // SafeNLP shared-prefix: exempt from BOTH new predicates.
+        let repaired = apply_bab_mip_budget_policy(
+            PhaseBudgetLedger::new(15, safenlp_official_internal_policy())
+                .with_mip_reservation(true),
+            CompleteVerifierArg::Auto,
+            false,
+            true,
+            false,
+            true,
+            Some(20),
+        );
+        assert!(
+            repaired.mip_reservation_armed_for_test(),
+            "sequential reload reachability must survive the graph nnz probe"
+        );
+        assert_eq!(
+            repaired.mip_statically_ineligible(),
+            "none",
+            "an exempted ledger must record no static finding"
         );
     }
 

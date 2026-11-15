@@ -10,6 +10,29 @@ pub(crate) fn default_max_domains() -> usize {
     100_000
 }
 
+/// `bab.forward_root_screen_max_mb` default (#fwd-root-screen): a live-state
+/// ceiling for the certified forward root screen. F1 measured ~1.7 GB dense on
+/// the 300-bus nets (numpy); the admitted budget is further clamped to half the
+/// process memory headroom at run time. Never 0 (0 is never "unlimited").
+pub(crate) fn default_forward_root_screen_max_mb() -> u32 {
+    8192
+}
+
+/// `bab.vit_zono_root_max_mb` default (#vit-zono-root): a live-state ceiling
+/// for the certified vit forward-zonotope root map. The vit ibp model's
+/// largest node is ~1632 values x ~18k symbols (~240 MB in binary64); the
+/// admitted budget is further clamped to half the process memory headroom at
+/// run time. Never 0 (0 is never "unlimited").
+pub(crate) fn default_vit_zono_root_max_mb() -> u32 {
+    8192
+}
+
+/// `bab.vit_zono_root_max_secs` default (#vit-zono-root): the wall cap of one
+/// root-map computation (also bounded by the collection deadline).
+pub(crate) fn default_vit_zono_root_max_secs() -> f32 {
+    30.0
+}
+
 pub(crate) fn default_timeout() -> std::time::Duration {
     std::time::Duration::from_mins(5)
 }

@@ -4,8 +4,7 @@
 
 //! Contract tests: runtime ny module exports must match ny.pyi stub.
 //!
-//! Prevents stub/runtime drift that caused API breakage in #1828.
-//! Design: designs/2026-03-10-issue-1829-ny-python-stub-contract.md
+//! Prevents stub/runtime drift, which has caused API breakage before.
 
 use crate::verify::{HeuristicUsed, SoundnessProvenance, VerifyResult, VerifyStatus};
 use pyo3::prelude::*;
@@ -391,7 +390,7 @@ fn test_stub_runtime_top_level_parity() {
     });
 }
 
-/// Explicit soundness metadata surface guard for the #1828 regression area.
+/// Explicit soundness metadata surface guard against stub/runtime drift.
 ///
 /// These types and fields are the public contract users consume for
 /// verification soundness metadata. They must exist in both the runtime
@@ -418,7 +417,7 @@ fn test_soundness_metadata_surface() {
     });
 }
 
-/// Explicit backend kwarg/default parity guard for the #3674 drift class.
+/// Explicit backend kwarg/default parity guard.
 ///
 /// This stays intentionally narrow: selected public functions only, and only the
 /// `backend` kwarg/default contract between the runtime module and ny.pyi.
@@ -450,7 +449,7 @@ fn test_backend_signature_surface() {
     });
 }
 
-/// Explicit batch_size kwarg/default parity guard for the #2689 regression area.
+/// Explicit batch_size kwarg/default parity guard.
 #[test]
 fn test_verify_batch_size_signature_surface() {
     Python::initialize();

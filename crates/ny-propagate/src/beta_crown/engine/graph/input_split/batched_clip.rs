@@ -7,8 +7,6 @@
 //! Applies relaxed clip across N children simultaneously, iterating over
 //! threshold rows sequentially (preserving the per-threshold tightening
 //! semantics of `clip_with_precomputed_linear`).
-//!
-//! Part of #4366 Packet B.
 
 use ndarray::{Array2, Array3, ArrayD, IxDyn};
 use ny_core::{NyError, Result};
@@ -189,7 +187,7 @@ pub(super) fn batched_relaxed_clip_from_stacked(
 /// Sequential-threshold relaxed-clip core shared by the flat and stacked
 /// entries. `x_l`/`x_u` are the working `(N, x_dim)` boxes (initially equal to
 /// `orig_l`/`orig_u`); `orig_l`/`orig_u` are the PRE-CLIP originals consumed by
-/// the verified-child midpoint restore (#4367). Only the threshold rows in
+/// the verified-child midpoint restore. Only the threshold rows in
 /// `rows` are applied — SEQUENTIALLY (row k+1 sees row k's clipped box, I-A9) —
 /// and `verified` latches monotonically. Restricting `rows` to a single
 /// clause's span (`offset..offset+size`) is how the clause-aware grouped driver
@@ -223,7 +221,7 @@ fn batched_relaxed_clip_core(
         // `relaxed_clip_internal` creates a fresh `verified_by_clip` and would
         // error on the inverted bounds. Setting x_l = x_u for verified children
         // makes them zero-width (no further tightening possible) and avoids the
-        // inversion check. Part of #4367.
+        // inversion check.
         for i in 0..n {
             if verified_by_clip[i] {
                 for d in 0..x_dim {
@@ -418,7 +416,7 @@ pub(super) struct ParentClipPlane<'a> {
 /// per-child `LinearBounds` whose used-side biases equal `bias_used` and whose
 /// used-side coefficient rows equal the parent plane rows: same sequential
 /// threshold order (row k+1 sees row k's clipped box, I-A9), same verified
-/// midpoint collapse (#4367), same monotone latch. The per-threshold work is
+/// midpoint collapse, same monotone latch. The per-threshold work is
 /// restructured — coefficients are GATHERED from the shared parent planes via
 /// `child_plane` into reused scratch instead of rebuilding an `(N, 1, x_dim)`
 /// `Array3` per row, and the per-row clip runs through
@@ -982,8 +980,8 @@ mod tests {
     #[test]
     fn test_batched_clip_empty_input() {
         let result = batched_relaxed_clip_from_flat(&[], &[], &[], &[0.0], &[1], false, 1).unwrap();
-        assert!(result.clipped_lowers.is_empty());
-        assert!(result.verified.is_empty());
+        assert_eq!((result.clipped_lowers).len(), 0);
+        assert_eq!((result.verified).len(), 0);
     }
 
     // ---- #disj-cross-clause-clip-unsat: clause-aware clip ----

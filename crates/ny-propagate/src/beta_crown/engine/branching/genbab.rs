@@ -44,9 +44,6 @@ impl BetaCrownVerifier {
     /// For elementwise activations: checks first input's bounds for width.
     /// For BilinearCrown: checks BOTH inputs' bounds (Q and K), since splitting
     /// either input reduces McCormick overapproximation.
-    ///
-    /// See designs/2026-01-28-genbab-branching.md and
-    /// designs/2026-03-04-286-attention-bilinear-alternative.md Approach C.
     pub(in crate::beta_crown::engine) fn find_splittable_graph_nodes(
         &self,
         graph: &GraphNetwork,
@@ -135,7 +132,7 @@ impl BetaCrownVerifier {
             }
 
             // Elementwise activations: check first input's bounds.
-            // #2098: Skip nodes with empty inputs instead of fabricating NETWORK_INPUT.
+            // Skip nodes with empty inputs instead of fabricating NETWORK_INPUT.
             let pre_name = match node.inputs.first() {
                 Some(s) => s.as_str(),
                 None => {

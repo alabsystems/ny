@@ -13,7 +13,7 @@ pub enum MipError {
     #[error("invalid bounds: {0}")]
     InvalidBounds(String),
 
-    /// HiGHS solver returned an error status.
+    /// The solver backend returned an error.
     #[error("solver error: {0}")]
     Solver(String),
 }

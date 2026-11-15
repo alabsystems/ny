@@ -6,10 +6,6 @@
 //!
 //! Converts BaB split histories (ReLU, GenBaB, CROWN-based) into
 //! arena-stored linear constraints.
-//!
-//! # Sources
-//!
-//! - Design doc: `designs/2026-01-29-genbab-split-to-linear.md`
 
 use super::arena::ArenaConstraintStore;
 use super::types::{ConstraintOrigin, ConstraintSense};
@@ -62,14 +58,14 @@ impl ArenaConstraintStore {
     /// * `is_upper` - True for upper branch (z >= s), false for lower (z <= s)
     ///
     /// # Errors
-    /// Returns `NyError::NumericalInstability` if `split_point` is NaN or Inf (#2259).
+    /// Returns `NyError::NumericalInstability` if `split_point` is NaN or Inf.
     pub fn add_genbab_split(
         &mut self,
         var_idx: u32,
         split_point: f32,
         is_upper: bool,
     ) -> Result<()> {
-        // NaN/Inf validation (#2259): -NaN is NaN, and -Inf produces a
+        // NaN/Inf validation: -NaN is NaN, and -Inf produces a
         // meaningless bias. Catch at the entry point before negation.
         if !split_point.is_finite() {
             return Err(ny_core::NyError::NumericalInstability(format!(
@@ -184,9 +180,6 @@ impl ArenaConstraintStore {
     ///
     /// # Errors
     /// Returns `NyError::InvalidSpec` if crown bounds have more than u16::MAX terms.
-    ///
-    /// # Design Reference
-    /// See `designs/2026-01-29-genbab-split-to-linear.md` for derivation and soundness proof.
     pub fn add_split_with_crown_bounds(
         &mut self,
         split: &NeuronSplit,
@@ -198,7 +191,7 @@ impl ArenaConstraintStore {
 
         // Guard: CROWN coefficient row length must fit in u32 for arena index storage.
         // Saturating `i as u32` on rows wider than u32::MAX would silently produce
-        // wrong constraint indices. (#2911)
+        // wrong constraint indices.
         let ncols = crown_bounds.lower_a().ncols();
         if ncols > u32::MAX as usize {
             return Err(ny_core::NyError::InvalidSpec(format!(
@@ -212,7 +205,7 @@ impl ArenaConstraintStore {
             let la_row = crown_bounds.lower_a().row(neuron_row);
             let lb = crown_bounds.lower_b()[neuron_row];
 
-            // NaN/Inf validation (#2259): CROWN bounds can contain NaN from
+            // NaN/Inf validation: CROWN bounds can contain NaN from
             // upstream propagation bugs (e.g., Exp/Log near boundaries). Catch
             // before computing bias to give a diagnostic error.
             if !lb.is_finite() {
@@ -250,7 +243,7 @@ impl ArenaConstraintStore {
             } else if bias > 0.0 {
                 // All coefficients are near-zero, so the constraint reduces to
                 // `(s - lb) ≤ 0`. If bias > 0 this is infeasible: the domain is
-                // provably empty (#2260). Return a special error so the caller
+                // provably empty. Return a special error so the caller
                 // can prune this domain from the BaB tree.
                 return Err(ny_core::NyError::InvalidSpec(format!(
                     "CROWN lower bound constraint infeasible: all coefficients \
@@ -266,7 +259,7 @@ impl ArenaConstraintStore {
             let ua_row = crown_bounds.upper_a().row(neuron_row);
             let ub = crown_bounds.upper_b()[neuron_row];
 
-            // NaN/Inf validation (#2259): same as lower bound path above.
+            // NaN/Inf validation: same as lower bound path above.
             if !ub.is_finite() {
                 return Err(ny_core::NyError::NumericalInstability(format!(
                     "CROWN upper_b[{}] is {} — cannot form valid constraint (#2259)",

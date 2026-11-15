@@ -36,7 +36,7 @@ pub(super) fn validate_quantization_schemas(
     graph: &GraphProto,
     opset_imports: &HashMap<String, i64>,
 ) -> Result<()> {
-    validate_quantization_schemas_with_external(graph, opset_imports, None)
+    validate_quantization_schemas_with_external(graph, opset_imports, None, false)
 }
 
 /// File-backed models may keep exact integer control tensors in ONNX external
@@ -47,6 +47,7 @@ pub(super) fn validate_quantization_schemas_with_external(
     graph: &GraphProto,
     opset_imports: &HashMap<String, i64>,
     external_data: Option<&mut ExternalDataResolver>,
+    qdq_activation_relaxation: bool,
 ) -> Result<()> {
     let mut dtypes = RawDtypeResolver::new(graph);
     let mut shapes = RawShapeResolver::new(graph, opset_imports, external_data);
@@ -60,8 +61,15 @@ pub(super) fn validate_quantization_schemas_with_external(
 
         let opset = standard_opset(node, opset_imports)?;
         let attrs = validate_schema(node, opset)?;
-        validate_dtypes(node, opset, &attrs, &mut dtypes)?;
-        validate_parameter_shapes(node, opset, &mut shapes)?;
+        validate_dtypes(
+            node,
+            opset,
+            &attrs,
+            &mut dtypes,
+            graph,
+            qdq_activation_relaxation,
+        )?;
+        validate_parameter_shapes(node, opset, &mut shapes, qdq_activation_relaxation)?;
     }
 
     Ok(())
@@ -237,11 +245,29 @@ fn require_zero_block_size(node: &NodeProto, attr: &AttributeProto) -> Result<()
     Ok(())
 }
 
+/// Whether `name` is an in-file INT32 initializer whose every element is
+/// authored zero. External-data and non-initializer tensors return `false`
+/// (fail closed): this proof must come from the bytes in hand.
+fn authored_all_zero_int32_initializer(graph: &GraphProto, name: &str) -> bool {
+    graph.initializer.iter().any(|tensor| {
+        tensor.name == name
+            && tensor.data_type == INT32
+            && tensor.data_location == 0
+            && ((!tensor.int32_data.is_empty() && tensor.int32_data.iter().all(|&v| v == 0))
+                || (tensor.int32_data.is_empty()
+                    && !tensor.raw_data.is_empty()
+                    && tensor.raw_data.len() % 4 == 0
+                    && tensor.raw_data.iter().all(|&b| b == 0)))
+    })
+}
+
 fn validate_dtypes(
     node: &NodeProto,
     opset: i64,
     attrs: &QuantizationAttrs,
     dtypes: &mut RawDtypeResolver<'_>,
+    graph: &GraphProto,
+    qdq_activation_relaxation: bool,
 ) -> Result<()> {
     let x_dtype = require_dtype(node, dtypes, &node.input[0], "input")?;
     let scale_dtype = require_dtype(node, dtypes, &node.input[1], "scale")?;
@@ -295,7 +321,17 @@ fn validate_dtypes(
             ));
         }
         if let Some(name) = zero_point_name {
-            if x_dtype == INT32 {
+            // ONNX requires the INT32 (bias) dequantization zero point to be
+            // 0; exporters routinely still write an EXPLICIT all-zero INT32
+            // tensor for it (smart_turn carries 27 such nodes). Under the dark
+            // #smart-turn-qdq gate, admit exactly the case that is provably
+            // the omitted-zero-point semantics from the authored bytes alone;
+            // anything else — a nonzero value, external data this pass cannot
+            // read, or a non-initializer — keeps today's refusal. The dtype
+            // agreement check below still runs for the admitted case.
+            if x_dtype == INT32
+                && !(qdq_activation_relaxation && authored_all_zero_int32_initializer(graph, name))
+            {
                 return Err(node_error(
                     node,
                     "INT32 DequantizeLinear input must not specify a zero point".to_string(),
@@ -336,6 +372,7 @@ fn validate_parameter_shapes(
     node: &NodeProto,
     opset: i64,
     shapes: &mut RawShapeResolver<'_, '_>,
+    qdq_activation_relaxation: bool,
 ) -> Result<()> {
     let scale_shape = require_shape(node, shapes, &node.input[1], "scale")?;
     if opset < 13 {
@@ -385,7 +422,21 @@ fn validate_parameter_shapes(
             .iter()
             .find(|attribute| attribute.name == "axis")
             .map_or(1, |attribute| attribute.i_value());
-        let normalized_axis = if authored_axis < 0 {
+        // #smart-turn-qdq gate: exporters leave the DEFAULT axis 1 on the
+        // per-axis dequantization of a RANK-1 bias, where axis 0 is the only
+        // axis that exists and the only reading consistent with the parameter
+        // length (checked just below). Admit exactly that shape under the
+        // dark gate; every other out-of-range axis keeps today's refusal.
+        let bias_rank1_default_axis = qdq_activation_relaxation
+            && rank == 1
+            && authored_axis == 1
+            && node
+                .attribute
+                .iter()
+                .all(|attribute| attribute.name != "axis");
+        let normalized_axis = if bias_rank1_default_axis {
+            Some(0)
+        } else if authored_axis < 0 {
             authored_axis.checked_add(rank)
         } else {
             Some(authored_axis)
@@ -420,7 +471,13 @@ fn validate_parameter_shapes(
 
     if let Some(zero_point) = node.input.get(2).filter(|name| !name.is_empty()) {
         let zero_point_shape = require_shape(node, shapes, zero_point, "zero point")?;
-        if zero_point_shape != scale_shape {
+        // #smart-turn-qdq gate: a SCALAR zero point against a one-element
+        // rank-1 scale carries identical broadcast semantics (one parameter
+        // slot); smart_turn's classifier.6 bias authors exactly that pair.
+        let scalar_pair_equivalent = qdq_activation_relaxation
+            && zero_point_shape.is_empty()
+            && scale_shape.as_slice() == [1];
+        if zero_point_shape != scale_shape && !scalar_pair_equivalent {
             return Err(node_error(
                 node,
                 format!(
@@ -1199,10 +1256,10 @@ impl<'graph, 'external> RawShapeResolver<'graph, 'external> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct ExactIntegerTensor {
-    dtype: i32,
+pub(super) struct ExactIntegerTensor {
+    pub(super) dtype: i32,
     shape: Vec<i64>,
-    values: Vec<i64>,
+    pub(super) values: Vec<i64>,
 }
 
 /// Exact-value proof used only for Reshape/Squeeze/Unsqueeze control tensors.
@@ -1352,7 +1409,7 @@ impl<'graph, 'external> RawIntegerResolver<'graph, 'external> {
     }
 }
 
-fn exact_integer_initializer(
+pub(super) fn exact_integer_initializer(
     tensor: &onnx_proto::TensorProto,
     external_data: Option<&mut ExternalDataResolver>,
 ) -> Result<Option<ExactIntegerTensor>> {
@@ -1370,7 +1427,7 @@ fn exact_integer_initializer(
     }))
 }
 
-fn exact_integer_constant(
+pub(super) fn exact_integer_constant(
     node: &NodeProto,
     external_data: Option<&mut ExternalDataResolver>,
 ) -> Result<Option<ExactIntegerTensor>> {

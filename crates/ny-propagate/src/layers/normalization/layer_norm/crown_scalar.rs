@@ -13,9 +13,6 @@
 //!
 //! Keeps LayerNorm-specific logic: MeanOnly early-return and the analytical
 //! MeanOnly backward pass (no sampling needed since mean subtraction is linear).
-//!
-//! Reference: designs/2026-03-14-issue-2077-layernorm-shared-decomposed-crown.md
-//! Reference: designs/2026-03-17-issue-1957-layernorm-sampling-low-rank.md
 
 use ndarray::Array2;
 use ny_core::{checked_shape_product, NyError, Result};
@@ -29,6 +26,7 @@ use crate::layers::normalization::decomposed::{
     batched_bounds_to_scalar, batched_bounds_to_scalar_multi_dim, decomposed_norm_crown_backward,
     scalar_bounds_to_batched, scalar_bounds_to_batched_multi_dim,
 };
+use crate::layers::normalization::radial;
 use crate::LinearBounds;
 
 impl LayerNormLayer {
@@ -79,8 +77,22 @@ impl LayerNormLayer {
             pre_shape, batch_size, norm_size
         );
         let reshaped_pre = pre_activation.reshape(&[batch_size, norm_size])?;
-        let batched_bounds = scalar_bounds_to_batched_multi_dim(bounds, batch_size, norm_size)?;
+        let checked_route = self.crown_mode == LayerNormCrownMode::IbpValidated
+            && self.mode == LayerNormMode::Standard
+            && !self.forward_mode;
+        let batched_bounds = if checked_route {
+            radial::scalar_to_batched_multi(bounds, batch_size, norm_size)?
+        } else {
+            scalar_bounds_to_batched_multi_dim(bounds, batch_size, norm_size)?
+        };
         let result = self.propagate_linear_batched_with_bounds(&batched_bounds, &reshaped_pre)?;
+        if checked_route {
+            return Ok(Some(radial::batched_to_scalar_multi(
+                &result,
+                bounds.lower_b(),
+                bounds.upper_b(),
+            )?));
+        }
         Ok(Some(batched_bounds_to_scalar_multi_dim(
             &result,
             bounds.lower_b(),
@@ -156,7 +168,11 @@ impl LayerNormLayer {
 
         if self.crown_mode == LayerNormCrownMode::IbpValidated {
             let flattened_bounds = BoundedTensor::new(pre_lower.into_dyn(), pre_upper.into_dyn())?;
-            let batched_bounds = scalar_bounds_to_batched(bounds)?;
+            let batched_bounds = if !self.forward_mode {
+                radial::scalar_to_batched(bounds)?
+            } else {
+                scalar_bounds_to_batched(bounds)?
+            };
             let decomposed = decomposed_norm_crown_backward(
                 &batched_bounds,
                 &self.ny,
@@ -165,10 +181,75 @@ impl LayerNormLayer {
                 &flattened_bounds,
                 self.forward_mode,
             )?;
+            if !self.forward_mode {
+                let refined = radial::refine_batched(
+                    &batched_bounds,
+                    decomposed.bounds,
+                    &flattened_bounds,
+                    &self.ny,
+                    Some(&self.beta),
+                    self.eps,
+                    true,
+                )?;
+                return radial::batched_to_scalar(&refined);
+            }
             return batched_bounds_to_scalar(&decomposed.bounds);
         }
 
         sampling_crown_scalar_low_rank(self, bounds, &pre_lower, &pre_upper)
+    }
+
+    /// Direct checked direction-first Taylor carrier for the mathematical real
+    /// standard LayerNorm. Default CROWN keeps its existing carrier unless
+    /// this candidate dominates it pointwise. This API returns the candidate
+    /// itself for callers retaining several independently checked carriers.
+    pub fn propagate_radial_linear_with_bounds(
+        &self,
+        bounds: &LinearBounds,
+        pre_activation: &BoundedTensor,
+        budget: Option<&crate::certify::work::WorkBudget>,
+    ) -> Result<LinearBounds> {
+        if self.mode != LayerNormMode::Standard || self.forward_mode {
+            return Err(NyError::UnsupportedOp(
+                "radial LayerNorm requires the standard mathematical real contract".into(),
+            ));
+        }
+        let mut bridge_lease = radial::admit_bridge(bounds, budget)?;
+        let shape = pre_activation.shape();
+        let n = *shape.last().ok_or_else(|| {
+            NyError::InvalidSpec("radial LayerNorm needs a last dimension".into())
+        })?;
+        let groups = checked_shape_product(&shape[..shape.len() - 1])
+            .ok_or_else(|| NyError::InvalidSpec("radial LayerNorm batch overflow".into()))?;
+        let result = if groups == 1 {
+            let b = radial::scalar_to_batched(bounds)?;
+            radial::batched_to_scalar(&radial::candidate_batched(
+                &b,
+                pre_activation,
+                &self.ny,
+                Some(&self.beta),
+                self.eps,
+                true,
+                budget,
+            )?)
+        } else {
+            let b = radial::scalar_to_batched_multi(bounds, groups, n)?;
+            radial::batched_to_scalar_multi(
+                &radial::candidate_batched(
+                    &b,
+                    pre_activation,
+                    &self.ny,
+                    Some(&self.beta),
+                    self.eps,
+                    true,
+                    budget,
+                )?,
+                bounds.lower_b(),
+                bounds.upper_b(),
+            )
+        }?;
+        radial::complete_bridge(&mut bridge_lease)?;
+        Ok(result)
     }
 
     /// Analytical CROWN backward pass for MeanOnly LayerNorm.
@@ -209,7 +290,7 @@ impl LayerNormLayer {
 
         let num_outputs = bounds.num_outputs();
         if num_neurons > (1 << 24) {
-            // f32 precision guard (#2136)
+            // f32 precision guard
             return Err(NyError::InternalError(format!(
                 "LayerNorm dimension {num_neurons} exceeds f32 exact integer range"
             )));
@@ -222,7 +303,7 @@ impl LayerNormLayer {
         let mut new_upper_b_f64 = bounds.upper_b().mapv(|x| x as f64);
 
         for out_row in 0..num_outputs {
-            // Accumulate sums and bias in f64 to prevent catastrophic cancellation (#2175).
+            // Accumulate sums and bias in f64 to prevent catastrophic cancellation.
             let mut lower_sum = 0.0_f64;
             let mut upper_sum = 0.0_f64;
             let mut lower_bias = 0.0_f64;
@@ -240,12 +321,12 @@ impl LayerNormLayer {
             let upper_mean_term = upper_sum * inv_n;
 
             // Track whether any coefficient in this row becomes NaN from Inf-Inf
-            // cancellation (#3027). If so, the entire row must become conservative.
+            // cancellation. If so, the entire row must become conservative.
             let mut row_has_nan = false;
             for j in 0..num_neurons {
                 let g = self.ny[j] as f64;
                 // Standard f64→f32 rounding for A-matrix (round-to-nearest), matching
-                // alpha-beta-CROWN. Directed rounding on A is not unconditionally sound (#2208).
+                // alpha-beta-CROWN. Directed rounding on A is not unconditionally sound.
                 let la = bounds.lower_a()[[out_row, j]] as f64 * g - lower_mean_term;
                 let ua = bounds.upper_a()[[out_row, j]] as f64 * g - upper_mean_term;
                 if la.is_nan() || ua.is_nan() {
@@ -256,7 +337,7 @@ impl LayerNormLayer {
                 new_upper_a[[out_row, j]] = ua as f32;
             }
 
-            // NaN guard (#3027): when Inf coefficients from compose() NaN→Inf
+            // NaN guard: when Inf coefficients from compose() NaN→Inf
             // fallback produce Inf*ny - Inf*ny/N = Inf - Inf = NaN, widen
             // the entire row to conservative bounds. LinearBounds::new() rejects
             // non-finite A-coefficients, so we zero out coefficients and push

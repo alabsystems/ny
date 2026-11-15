@@ -23,7 +23,7 @@ use super::DomainProcessingResult;
 impl BetaCrownVerifier {
     /// Process a single domain sequentially, returning child domains and failure info.
     ///
-    /// #1865: Now returns `DomainProcessingResult` so the caller can detect when
+    /// Now returns `DomainProcessingResult` so the caller can detect when
     /// child creation fails and avoid falsely claiming Verified.
     // Justification: Domain processing requires network, input, domain, threshold,
     // cut pool, engine, and deadline as independent parameters. The sequential path
@@ -63,7 +63,7 @@ impl BetaCrownVerifier {
                     had_unsplittable: true,
                 },
                 Err(e) => {
-                    // #1865: input split failed — sub-region unexplored.
+                    // Input split failed — sub-region unexplored.
                     debug!("[#1865] input split failed: {e}");
                     DomainProcessingResult {
                         children: Vec::new(),
@@ -91,7 +91,7 @@ impl BetaCrownVerifier {
                 };
             }
             Err(e) => {
-                // #1865: neuron selection failed — sub-region unexplored.
+                // Neuron selection failed — sub-region unexplored.
                 debug!("[#1865] select_split_neuron failed: {e}");
                 return DomainProcessingResult {
                     children,
@@ -110,7 +110,7 @@ impl BetaCrownVerifier {
             Ok(Some(child)) => children.push(child),
             Ok(None) => { /* infeasible — correctly pruned */ }
             Err(e) => {
-                // #1865: active child creation failed — sub-region unexplored.
+                // Active child creation failed — sub-region unexplored.
                 debug!("[#1865] active child creation failed: {e}");
                 had_propagation_failure = true;
             }
@@ -124,7 +124,7 @@ impl BetaCrownVerifier {
             Ok(Some(child)) => children.push(child),
             Ok(None) => { /* infeasible — correctly pruned */ }
             Err(e) => {
-                // #1865: inactive child creation failed — sub-region unexplored.
+                // Inactive child creation failed — sub-region unexplored.
                 debug!("[#1865] inactive child creation failed: {e}");
                 had_propagation_failure = true;
             }
@@ -140,7 +140,7 @@ impl BetaCrownVerifier {
 
     /// Process a single domain with parallel child creation, returning child domains and failure info.
     ///
-    /// #1865: Now returns `DomainProcessingResult` so the caller can detect when
+    /// Now returns `DomainProcessingResult` so the caller can detect when
     /// child creation fails and avoid falsely claiming Verified.
     ///
     /// Note: When cuts are enabled, parallel child creation is disabled because
@@ -184,7 +184,7 @@ impl BetaCrownVerifier {
                     had_unsplittable: true,
                 },
                 Err(e) => {
-                    // #1865: input split failed — sub-region unexplored.
+                    // Input split failed — sub-region unexplored.
                     debug!("[#1865] input split failed (parallel): {e}");
                     DomainProcessingResult {
                         children: Vec::new(),
@@ -209,7 +209,7 @@ impl BetaCrownVerifier {
                 };
             }
             Err(e) => {
-                // #1865: neuron selection failed — sub-region unexplored.
+                // Neuron selection failed — sub-region unexplored.
                 debug!("[#1865] select_split_neuron failed (parallel): {e}");
                 return DomainProcessingResult {
                     children: Vec::new(),
@@ -228,7 +228,7 @@ impl BetaCrownVerifier {
         if config.use_parallel_children && !has_cuts {
             // Create both children in parallel using rayon (no cuts).
             // GemmEngine is Sync+Send, so GPU acceleration is safe to use here.
-            // #1865: Track propagation failures from parallel child creation.
+            // Track propagation failures from parallel child creation.
             let results: Vec<Result<Option<BabDomain>>> = [true, false]
                 .par_iter()
                 .map(|&is_active| {
@@ -256,7 +256,7 @@ impl BetaCrownVerifier {
                     Ok(Some(child)) => children.push(child),
                     Ok(None) => { /* infeasible — correctly pruned */ }
                     Err(e) => {
-                        // #1865: child creation failed — sub-region unexplored.
+                        // Child creation failed — sub-region unexplored.
                         debug!("[#1865] parallel child creation failed: {e}");
                         had_propagation_failure = true;
                     }

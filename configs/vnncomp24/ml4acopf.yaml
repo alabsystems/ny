@@ -41,7 +41,6 @@ bab:
     # via the GenBaB graph path when selected. The choice is SOUND either way:
     # branching only selects which sound sub-box to bound next, never a verdict.
     candidates: 100
-    reduceop: max
     nonlinear_split:
       filter: true
       filter_beta: true

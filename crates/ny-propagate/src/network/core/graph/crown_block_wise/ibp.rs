@@ -6,8 +6,6 @@
 //!
 //! Collects per-node bounds by running IBP forward through block nodes. Used
 //! to provide intermediate bounds for the subsequent CROWN backward pass.
-//!
-//! Part of #3221, #3447.
 
 use std::collections::{HashMap, HashSet};
 

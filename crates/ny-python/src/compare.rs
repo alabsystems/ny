@@ -456,7 +456,7 @@ pub fn compare(
             let upper_diff = (ru - tu).abs();
 
             // nan_propagating_max: unlike f32::max, propagates NaN to surface
-            // internal propagation failures instead of absorbing them (#2845).
+            // internal propagation failures instead of absorbing them.
             max_lower_diff = nan_propagating_max(max_lower_diff, lower_diff);
             max_upper_diff = nan_propagating_max(max_upper_diff, upper_diff);
 
@@ -721,7 +721,7 @@ pub fn compare_bytes(
             let upper_diff = (ru - tu).abs();
 
             // nan_propagating_max: unlike f32::max, propagates NaN to surface
-            // internal propagation failures instead of absorbing them (#2845).
+            // internal propagation failures instead of absorbing them.
             max_lower_diff = nan_propagating_max(max_lower_diff, lower_diff);
             max_upper_diff = nan_propagating_max(max_upper_diff, upper_diff);
 
@@ -868,7 +868,7 @@ mod tests {
         network
     }
 
-    // Regression tests for nan_propagating_max (#2845, #2898).
+    // Regression tests for nan_propagating_max.
     // This replaced unstable f32::maximum. If refactored to f32::max,
     // the NaN-absorption tests below will catch the regression.
 
@@ -979,7 +979,7 @@ mod tests {
         assert!(equivalent);
     }
 
-    // Regression tests for #3622: compare backend routing.
+    // Regression tests: compare backend routing.
     // Ensures parse_compare_method routes correctly and that
     // CROWN/alpha methods would receive an engine while IBP does not.
 

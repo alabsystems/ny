@@ -41,7 +41,7 @@
 //! module CALLS, and each one is named here so the audit trail is explicit.
 //!
 //! 1. Each layer's backward step rounds outward inside
-//!    `propagate_crown_backward` (`#2239` directed `f64`→`f32`) and accumulates a
+//!    `propagate_crown_backward` (directed `f64`→`f32`) and accumulates a
 //!    certified per-coefficient error envelope (`LinearBounds::lower_a_err` /
 //!    `upper_a_err`, populated by `crown_single::aw_f64_with_abssum`).
 //! 2. That envelope is discharged OUTWARD into the bias by

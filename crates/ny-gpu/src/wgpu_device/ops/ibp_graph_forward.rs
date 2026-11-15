@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! GPU-resident graph-DAG IBP forward pass (#4319).
+//! GPU-resident graph-DAG IBP forward pass.
 //!
 //! Implements [`GpuDagIbpForwardExt`] for [`WgpuDevice`], keeping lower/upper
 //! bound buffers on GPU across all supported DAG ops (Linear, Conv2d, ReLU,

@@ -335,7 +335,7 @@ fn cone_delta_lifecycle_byte_identity_conv_resnet() {
 
             // Bound: replace the map with the fixpoint, clear the delta —
             // the exact post-bounding replacement the production sites do.
-            child.node_bounds = full_map.clone();
+            child.node_bounds = full_map;
             child.delta_pre_nodes.clear();
             domain = child;
         }

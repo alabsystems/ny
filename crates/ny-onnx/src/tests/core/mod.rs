@@ -203,6 +203,7 @@ mod onnx_fixture;
 mod probabilistic_integration;
 mod propagate;
 mod reduce_batch_axis;
+mod relu_pair_collapse;
 mod reshape;
 #[cfg_attr(not(feature = "external-vnncomp"), allow(dead_code, unused_imports))]
 mod resize;

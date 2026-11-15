@@ -1048,7 +1048,7 @@ mod tests {
         );
         assert_eq!(model.network.layers.len(), 2);
         assert_eq!(model.network.outputs[0].name, "y");
-        assert!(spec.output_constraints.is_empty());
+        assert_eq!((spec.output_constraints).len(), 0);
         assert_eq!(
             spec.output_constraint_clauses,
             vec![

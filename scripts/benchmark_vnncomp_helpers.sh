@@ -282,7 +282,7 @@ benchmark_path_relative_to_category() {
     esac
 }
 
-# --- Binary provenance helpers (#4346) ---
+# --- Binary provenance helpers ---
 
 # Compute the ny binary provenance: source classification, version, sha256.
 # Sets globals: NY_SOURCE, NY_VERSION, NY_SHA256

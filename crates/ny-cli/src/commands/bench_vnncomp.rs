@@ -7,7 +7,6 @@
 //! Discovers VNN-COMP benchmark categories and probes whether each category's
 //! sample model and property load and convert to the verifier representations.
 //! No verification is run: the audit measures LOAD coverage, not verdicts.
-//! Part of #1475, #114.
 
 use anyhow::{Context, Result};
 use clap::ValueEnum;
@@ -1164,7 +1163,7 @@ mod tests {
             extract_missing_ops("Unsupported operator 'Conv'"),
             vec!["Conv"]
         );
-        assert!(extract_missing_ops("some random error").is_empty());
+        assert_eq!((extract_missing_ops("some random error")).len(), 0);
     }
 
     #[test]

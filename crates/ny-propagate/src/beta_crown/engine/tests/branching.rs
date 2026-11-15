@@ -436,7 +436,7 @@ fn test_graph_babsr_prefers_larger_affine_bias_2513() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_sequential_babsr_missing_coefficients_use_zero_fallback_1864() {
-    // Regression for #1864 parity: when CROWN coefficient extraction cannot produce
+    // Parity regression: when CROWN coefficient extraction cannot produce
     // all ReLU sensitivities (here due to unsupported ReduceSum backward in the
     // lightweight branching scorer), missing coefficients must be treated as 0.0
     // so those neurons are deprioritized.
@@ -488,9 +488,9 @@ fn test_sequential_babsr_missing_coefficients_use_zero_fallback_1864() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_network_bab_no_branch_returns_unknown_1865() {
-    // Regression test for #1865: Network BaB must return Unknown (not Verified)
+    // Regression test: Network BaB must return Unknown (not Verified)
     // when child domains have no unstable neurons left to branch on but bounds
-    // are too loose to verify. Before #1865 fix: the unresolved child domains
+    // are too loose to verify. Before the fix: the unresolved child domains
     // disappeared from the search tree and core.rs returned false Verified.
     //
     // Network: y = relu(x), single neuron.
@@ -548,7 +548,7 @@ fn test_network_bab_no_branch_returns_unknown_1865() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_network_bab_depth_limit_returns_unknown_1865() {
-    // Regression test for #1865: Network BaB (core.rs) was silently dropping
+    // Regression test: Network BaB (core.rs) was silently dropping
     // depth-limited domains and returning Verified when the queue emptied.
     //
     // Network: simple_network() = W2 * relu(W1 * x)
@@ -556,7 +556,7 @@ fn test_network_bab_depth_limit_returns_unknown_1865() {
     //   Input: [-1, 1]^2
     //
     // With max_depth=0 (no splitting allowed), the initial CROWN bounds are
-    // too loose to verify a tight threshold. Before #1865 fix: the domain
+    // too loose to verify a tight threshold. Before the fix: the domain
     // hit max depth, was silently dropped via bare `continue`, the queue
     // emptied, and core.rs returned Verified. After fix: returns Unknown.
     let network = simple_network();
@@ -596,7 +596,7 @@ fn test_network_bab_depth_limit_returns_unknown_1865() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_multi_objective_babsr_matches_single_objective_1857() {
-    // Regression test for #1857: multi-objective graph BaB must use BaBSR
+    // Regression test: multi-objective graph BaB must use BaBSR
     // (BoundImpact) branching when configured, not intercept-only.
     //
     // Graph: _input -> relu -> branch_a (W=[-5,-1]) \
@@ -607,7 +607,7 @@ fn test_multi_objective_babsr_matches_single_objective_1857() {
     // BaBSR scoring uses signed CROWN coefficients: merged output weights are [-1, -2],
     // so neuron 1 has higher sensitivity and BaBSR should pick neuron 1.
     //
-    // Before #1857 fix: multi-objective path always used intercept-only,
+    // Before the fix: multi-objective path always used intercept-only,
     // diverging from the single-objective BaBSR result.
     let input =
         BoundedTensor::new(arr1(&[-1.0, -1.0]).into_dyn(), arr1(&[1.0, 1.0]).into_dyn()).unwrap();
@@ -1095,7 +1095,7 @@ fn test_graph_babsr_two_relu_layers_hand_computed() {
 
     let mut node_bounds_plain = std::collections::HashMap::new();
     node_bounds_plain.insert("linear1".to_string(), relu1_pre_bounds);
-    // Output node bounds needed for CROWN backward initialization (#2159).
+    // Output node bounds needed for CROWN backward initialization.
     // linear2 W=[[-1,-4]] produces 1-dim output; actual values don't affect output_dim.
     node_bounds_plain.insert(
         "linear2".to_string(),
@@ -1139,7 +1139,7 @@ fn test_graph_babsr_two_relu_layers_hand_computed() {
 /// state (coefficients are computed for the full graph backward, but scoring only
 /// considers unconstrained unstable neurons).
 ///
-/// Re: #1817, verifies W1 BaBSR commit (4095006) with constrained-neuron branches.
+/// Verifies the W1 BaBSR commit (4095006) with constrained-neuron branches.
 #[ntest::timeout(10000)]
 #[test]
 fn test_graph_babsr_with_constrained_neuron_selects_next_best() {
@@ -1176,7 +1176,7 @@ fn test_graph_babsr_with_constrained_neuron_selects_next_best() {
         BoundedTensor::new(arr1(&[-1.0, -1.0]).into_dyn(), arr1(&[1.0, 1.0]).into_dyn()).unwrap();
     let mut node_bounds = std::collections::HashMap::new();
     node_bounds.insert("linear1".to_string(), relu1_pre_bounds);
-    // Output node bounds needed for CROWN backward initialization (#2159).
+    // Output node bounds needed for CROWN backward initialization.
     node_bounds.insert(
         "linear2".to_string(),
         BoundedTensor::new(arr1(&[-10.0]).into_dyn(), arr1(&[10.0]).into_dyn()).unwrap(),
@@ -1232,19 +1232,19 @@ fn test_graph_babsr_with_constrained_neuron_selects_next_best() {
     );
 }
 
-/// Regression test for #2098 + #2481: constructing a ReLU node with empty inputs
-/// panics in debug builds (debug_assert in GraphNode::new, added by #2481).
-/// This replaces the original #2098 test that relied on constructing malformed
+/// Regression test: constructing a ReLU node with empty inputs
+/// panics in debug builds (debug_assert in GraphNode::new).
+/// This replaces an original test that relied on constructing malformed
 /// nodes — constructor-level validation now prevents the scenario that the
 /// downstream defensive handling was designed for.
 #[test]
 #[should_panic(expected = "requires at least 1 input(s) but got 0")]
 fn test_graph_node_rejects_relu_with_empty_inputs_2098() {
-    // GraphNode::new debug_assert fires on arity violation (#2481).
+    // GraphNode::new debug_assert fires on arity violation.
     let _node = GraphNode::new("relu_bad", Layer::ReLU(ReLULayer), vec![]);
 }
 
-/// Regression test for #1915: select_graph_branch must return Err on empty unstable list.
+/// Regression test: select_graph_branch must return Err on empty unstable list.
 #[ntest::timeout(5000)]
 #[test]
 fn test_select_graph_branch_empty_unstable_returns_error_1915() {
@@ -1279,7 +1279,7 @@ fn test_select_graph_branch_empty_unstable_returns_error_1915() {
     );
 }
 
-/// Regression test for #1915: select_graph_branch_multi must return Err on empty unstable list.
+/// Regression test: select_graph_branch_multi must return Err on empty unstable list.
 #[ntest::timeout(5000)]
 #[test]
 fn test_select_graph_branch_multi_empty_unstable_returns_error_1915() {
@@ -1327,7 +1327,7 @@ fn test_select_graph_branch_multi_empty_unstable_returns_error_1915() {
     );
 }
 
-/// Regression test for #2095: empty sequential layer bounds must return Err
+/// Regression test: empty sequential layer bounds must return Err
 /// instead of fabricating output_dim=1 for CROWN coefficient initialization.
 #[ntest::timeout(5000)]
 #[test]
@@ -1348,7 +1348,7 @@ fn test_compute_crown_coefficients_empty_layer_bounds_returns_error_2095() {
     );
 }
 
-/// Regression test for #2095: missing graph output bounds must return Err
+/// Regression test: missing graph output bounds must return Err
 /// instead of fabricating output_dim=1 for graph BaBSR coefficients.
 #[ntest::timeout(5000)]
 #[test]
@@ -1385,7 +1385,7 @@ fn test_select_graph_branch_missing_output_bounds_returns_error_2095() {
     );
 }
 
-/// Regression test for #2271: unsupported layers in sequential CROWN coefficient
+/// Regression test: unsupported layers in sequential CROWN coefficient
 /// backward pass must stop propagation instead of silently passing through.
 #[ntest::timeout(10000)]
 #[test]
@@ -1472,7 +1472,7 @@ fn test_compute_crown_coefficients_stops_at_unsupported_layer_2271() {
     }
 }
 
-/// Regression test for #2539: kFSB intercept ranking must use ascending sort
+/// Regression test: kFSB intercept ranking must use ascending sort
 /// (smallest intercept first), matching alpha-beta-CROWN kfsb.py:92 `largest=False`.
 ///
 /// Strategy: construct a network with 4 unstable neurons having distinct intercept
@@ -1589,7 +1589,7 @@ fn test_kfsb_intercept_ranking_ascending_sort_2539() {
     );
 }
 
-/// Regression test for #2539: kFSB (non-intercept-only) branching smoke test.
+/// Regression test: kFSB (non-intercept-only) branching smoke test.
 /// Exercises the `Kfsb` heuristic through `verify()` to confirm end-to-end
 /// correctness after the sort direction fix.
 #[ntest::timeout(10000)]
@@ -1615,7 +1615,7 @@ fn test_kfsb_branching_heuristic_smoke_2539() {
     assert_eq!(result.result, BabVerificationStatus::Verified);
 }
 
-/// Regression test for #2539: KfsbInterceptOnly branching smoke test.
+/// Regression test: KfsbInterceptOnly branching smoke test.
 /// Exercises the `KfsbInterceptOnly` heuristic through `verify()`.
 #[ntest::timeout(10000)]
 #[test]
@@ -1640,7 +1640,7 @@ fn test_kfsb_intercept_only_branching_heuristic_smoke_2539() {
     assert_eq!(result.result, BabVerificationStatus::Verified);
 }
 
-/// Regression test for #2461: sequential BaBSR CROWN coefficient computation must
+/// Regression test: sequential BaBSR CROWN coefficient computation must
 /// produce finite slopes when ReLU pre-activation bounds have near-zero width.
 /// Without the RELU_RELAX_MIN_WIDTH guard at sequential.rs:697, `u / (u - l)`
 /// would overflow to Inf for pathologically narrow crossing intervals.
@@ -1698,7 +1698,7 @@ fn test_sequential_crown_coefficients_near_zero_width_2461() {
     }
 }
 
-/// Regression test for #2461: graph BaBSR CROWN coefficient computation must
+/// Regression test: graph BaBSR CROWN coefficient computation must
 /// produce finite slopes when ReLU pre-activation bounds have near-zero width.
 /// Without the RELU_RELAX_MIN_WIDTH guard at graph.rs:440, `u / (u - l)`
 /// would overflow to Inf for pathologically narrow crossing intervals.
@@ -1749,7 +1749,7 @@ fn test_graph_crown_coefficients_near_zero_width_2461() {
     );
 }
 
-// --- Sign BaB branching tests (Part of #3769) ---
+// --- Sign BaB branching tests ---
 
 /// Create a simple Sign-only network for BaB branching tests.
 ///
@@ -1783,7 +1783,7 @@ fn simple_sign_network() -> Network {
 #[ntest::timeout(10000)]
 #[test]
 fn test_sign_babsr_branches_3769() {
-    // Regression for #3769: BaB must branch on Sign neurons.
+    // Regression: BaB must branch on Sign neurons.
     // Before the fix, BaBSR only considered ReLU neurons as branching
     // candidates, returning None for Sign-only models and reporting
     // "No unstable ReLU neurons left in some domains."
@@ -1806,7 +1806,7 @@ fn test_sign_babsr_branches_3769() {
     let result = verifier.verify(&network, &input, 0.5).unwrap();
 
     // BaB must explore >1 domains (root + at least one child from Sign branching).
-    // Before #3769, this was 0 or 1 because Sign neurons were invisible to branching.
+    // Before the fix, this was 0 or 1 because Sign neurons were invisible to branching.
     assert!(
         result.domains_explored >= 2,
         "BaBSR must branch on Sign neurons; got domains_explored={} (reason: {:?})",
@@ -1818,7 +1818,7 @@ fn test_sign_babsr_branches_3769() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_sign_kfsb_branches_3769() {
-    // Regression for #3769: KFSB branching also handles Sign neurons.
+    // Regression: KFSB branching also handles Sign neurons.
     // KFSB uses forward/backward coefficient scoring. The Sign fixed-CROWN
     // proxy slope (`sign_fixed_crown_proxy_slope`) enables coefficient-based
     // scoring for Sign neurons: boundary cases [0,u] or [l,0] get non-zero

@@ -368,8 +368,6 @@ fn test_f16_decompression_error_propagation() {
     // Test that decompression errors from f16 checkpoints are properly propagated
     // (not silently ignored). This verifies the error path at streaming/checkpoint.rs.
     //
-    // Issue #163: Missing test for f16 checkpoint decompression error propagation.
-    //
     // The error wrapping in find_nearest_checkpoint_before() formats decompression
     // errors as: "Checkpoint decompression failed at layer {}: {}"
     //

@@ -29,11 +29,7 @@ pub(crate) use whisper_args::WhisperCommonArgs;
 #[derive(Parser)]
 #[command(name = "ny")]
 #[command(author = "ny Team")]
-// #binary-identity: the DERIVED version (`<major>.<minor>.<git rev-list count>`
-// plus an explicit `+dirty.<commit>.<diff digest>` suffix), never the frozen
-// `[workspace.package] version`, which did not move for the whole campaign
-// while the verifier changed underneath it many times. `ny --build-id` prints
-// the full identity this version is the primary key of.
+// #binary-identity: use the derived version; --build-id provides full provenance.
 #[command(version = crate::build_id::DISPLAY_VERSION)]
 #[command(about = "Neural network verification and analysis CLI", long_about = None)]
 pub(crate) struct Cli {
@@ -103,9 +99,10 @@ pub(crate) struct VerifyArgs {
     #[arg(short, long)]
     pub(crate) timeout: Option<u64>,
 
-    /// Compute backend request (cpu, wgpu). WGPU constructs one proof device and
-    /// admits it only after every live verdict-qualification rung passes; any
-    /// initialization or rung failure emits a backend-override receipt and uses CPU.
+    /// Compute backend: cpu or wgpu
+    ///
+    /// wgpu is used only if the adapter passes its qualification checks;
+    /// otherwise ny uses the CPU and reports why.
     #[arg(long, value_enum)]
     pub(crate) backend: Option<BackendArg>,
 
@@ -130,36 +127,30 @@ pub(crate) struct VerifyArgs {
     #[arg(long, value_enum, default_value_t = LayerNormNormModeArg::Standard)]
     pub(crate) layernorm_norm_mode: LayerNormNormModeArg,
 
-    /// Layer-by-layer verification mode: outputs bound statistics per node
-    /// Useful for large models where full verification may timeout
+    /// Report bound statistics for each node, for models where full
+    /// verification would time out
     #[arg(long, default_value_t = false, conflicts_with = "block_wise")]
     pub(crate) layer_by_layer: bool,
 
-    /// Block-wise verification mode: resets bounds at each transformer block
-    /// Prevents bound explosion and enables per-block zonotope tightening
+    /// Reset bounds at each transformer block, to keep them from blowing up
     #[arg(long, default_value_t = false, conflicts_with = "layer_by_layer")]
     pub(crate) block_wise: bool,
 
-    /// Show progress during verification (useful for large models)
-    /// Works with `--block-wise` and `--layer-by-layer`.
+    /// Show progress (with --block-wise or --layer-by-layer)
     #[arg(long, default_value_t = false)]
     pub(crate) progress: bool,
 
-    /// Output progress as JSON lines to stderr (for programmatic monitoring)
-    /// Each line is a complete JSON object with progress information.
-    /// Implies --progress. Works with `--block-wise` and `--layer-by-layer`.
+    /// Write progress to stderr as JSON lines (implies --progress)
     #[arg(long, default_value_t = false)]
     pub(crate) progress_json: bool,
 
-    /// Maximum number of blocks to verify (0 = all blocks)
-    /// Useful for partial verification of very large models
-    /// Requires --block-wise or --checkpoint
+    /// Verify at most this many blocks (0 = all; needs --block-wise or
+    /// --checkpoint)
     #[arg(long, default_value_t = 0)]
     pub(crate) max_blocks: usize,
 
-    /// Checkpoint file for save/resume (implies --block-wise)
-    /// If file exists and matches config, resume from checkpoint.
-    /// Saves progress after each block for crash recovery.
+    /// Save progress to this file after each block, and resume from it when it
+    /// matches the current run (implies --block-wise)
     #[arg(long)]
     pub(crate) checkpoint: Option<PathBuf>,
 
@@ -167,16 +158,16 @@ pub(crate) struct VerifyArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) json: bool,
 
-    /// Fail if verification method falls back (e.g., CROWN to IBP)
-    /// By default, fallback occurs silently with actual_method reported.
-    /// Use --strict to require the requested method succeeds or error.
+    /// Fail instead of falling back to a weaker method (for example CROWN to
+    /// IBP)
+    ///
+    /// Without --strict, a fallback is allowed and the method actually used is
+    /// reported.
     #[arg(long, default_value_t = false)]
     pub(crate) strict: bool,
 
-    /// Fail if verification used any heuristics (not provably sound).
-    /// Use this to ensure only sound verification results are accepted.
-    /// If heuristics are used (e.g., sampling-based relaxations, forward-mode LayerNorm),
-    /// the command exits non-zero with an error message.
+    /// Fail if the result relied on any heuristic (not provably sound) step,
+    /// such as a sampling-based relaxation or forward-mode LayerNorm
     #[arg(long, default_value_t = false)]
     pub(crate) require_sound: bool,
 
@@ -188,24 +179,18 @@ pub(crate) struct VerifyArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) allow_heuristic_softmax: bool,
 
-    /// Treat Unknown results as success (exit code 0).
-    /// By default, Unknown returns exit code 2. Timeout remains exit code 3.
-    /// Use this only for CI workflows that explicitly accept an unresolved
-    /// (but completed) verification result.
+    /// Exit 0 on an unknown result instead of 2 (a timeout still exits 3)
     #[arg(long, default_value_t = false)]
     pub(crate) allow_unknown: bool,
 
-    /// Use f64 (double precision) for bound propagation.
-    /// Required for soundnessbench/sat_relu. Only supports sequential Linear+Conv2D+ReLU.
-    /// Reference: alpha-beta-CROWN `double_fp: true`.
+    /// Use f64 bound propagation (sequential Linear, Conv2d, and ReLU models
+    /// only)
     #[arg(long, default_value_t = false)]
     pub(crate) double_fp: bool,
 
-    /// Shrink VNN-LIB input bounds inward by this epsilon.
-    /// Each dimension's lower bound increases by eps and upper bound decreases by eps.
-    /// WARNING: this verifies a smaller property domain, not the original VNN-LIB domain.
-    /// Required for soundnessbench (`shrink_eps: 1e-10`).
-    /// Reference: alpha-beta-CROWN `shrink_vnnlib` (`specifications.py:535-540`).
+    /// Shrink every VNN-LIB input interval inward by EPS on both sides
+    ///
+    /// This verifies a smaller region than the property states.
     #[arg(long, value_name = "EPS")]
     pub(crate) shrink_eps: Option<f64>,
 }
@@ -246,9 +231,10 @@ pub(crate) struct BenchArgs {
     #[arg(long)]
     pub(crate) property_filter: Option<String>,
 
-    /// Branching heuristic (for acasxu benchmark: width, impact, babsr, fsb, kfsb, kfsb-intercept-only, sequential, input).
-    /// Default "input" matches α,β-CROWN config and achieves 98%+ pass rate.
-    /// With `--gpu-bab`, only `impact`/`babsr` is currently supported.
+    /// Branching heuristic for the acasxu benchmark (default: input)
+    ///
+    /// Values: width, impact, babsr, fsb, kfsb, kfsb-intercept-only, sequential,
+    /// input. With --gpu-bab, only impact and babsr are supported.
     #[arg(long, default_value = "input")]
     pub(crate) branching: String,
 
@@ -256,9 +242,8 @@ pub(crate) struct BenchArgs {
     #[arg(long, default_value_t = 10000)]
     pub(crate) max_domains: usize,
 
-    /// Enable proactive cut generation (for acasxu benchmark, BICCOS-lite).
-    /// Generates cuts for unstable ReLUs BEFORE BaB starts.
-    /// Helps on hard instances where initial bounds are loose.
+    /// Generate cuts for unstable ReLUs before branch-and-bound starts (acasxu
+    /// benchmark)
     #[arg(long, default_value_t = false)]
     pub(crate) proactive_cuts: bool,
 
@@ -266,8 +251,8 @@ pub(crate) struct BenchArgs {
     #[arg(long)]
     pub(crate) max_proactive_cuts: Option<usize>,
 
-    /// Enable relaxed clipping for input splitting (for acasxu benchmark, Clip-and-Verify).
-    /// Critical for ACAS-Xu: enables input domain tightening using CROWN constraints.
+    /// Tighten input-split domains with CROWN constraints (Clip-and-Verify;
+    /// acasxu benchmark)
     #[arg(long, default_value_t = false)]
     pub(crate) relaxed_clip: bool,
 
@@ -288,9 +273,8 @@ pub(crate) struct BenchArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) gpu_bab: bool,
 
-    /// Disable lA warm-start in GPU BaB backward pass (for A/B benchmarking).
-    /// When set, each backward pass recomputes from scratch instead of reusing
-    /// cached linear bound coefficients from the parent domain.
+    /// Recompute every GPU BaB backward pass from scratch instead of reusing the
+    /// parent domain's linear bounds (for A/B benchmarking)
     #[arg(long, default_value_t = false)]
     pub(crate) no_la_warm_start: bool,
 
@@ -366,12 +350,12 @@ pub(crate) struct BetaCrownArgs {
     #[arg(long)]
     pub(crate) max_depth: Option<usize>,
 
-    /// Branching heuristic: auto (default), width, impact/babsr,
-    /// fsb/kfsb/kfsb-intercept-only, sequential, input, relu.
-    /// `auto` selects input-splitting vs ReLU/kFSB from the loaded model +
-    /// spec (low-dimensional input => input splitting; otherwise kFSB; MIP
-    /// complete-verifier categories use kFSB). An explicit value or a preset's
-    /// `bab.branching.method` overrides auto.
+    /// Branching heuristic (default: auto)
+    ///
+    /// Values: auto, width, impact (or babsr), fsb, kfsb, kfsb-intercept-only,
+    /// sequential, input, relu. `auto` picks input splitting for
+    /// low-dimensional inputs and ReLU splitting with kFSB otherwise. An
+    /// explicit value, or a preset's `bab.branching.method`, overrides it.
     #[arg(long, default_value = "auto")]
     pub(crate) branching: Option<String>,
 
@@ -379,82 +363,67 @@ pub(crate) struct BetaCrownArgs {
     #[arg(long)]
     pub(crate) fsb_candidates: Option<usize>,
 
-    /// Disable α-CROWN optimization (use CROWN-IBP only). Faster but looser bounds.
+    /// Disable α-CROWN optimization (plain CROWN: faster, looser bounds)
     #[arg(long, default_value_t = false)]
     pub(crate) no_alpha: bool,
 
-    /// Number of α-CROWN optimization iterations (higher = tighter bounds, slower)
-    /// For DAG models, each iteration = 1 + 2*spsa_samples CROWN passes.
-    /// Default: 20 iterations (matches α,β-CROWN's init_iteration default), or preset value.
+    /// α-CROWN optimization iterations (default: 100, or preset value)
+    ///
+    /// More iterations give tighter bounds and take longer.
     #[arg(long)]
     pub(crate) alpha_iterations: Option<usize>,
 
-    /// Per-sub-domain α refinement iterations in the input-split BaB loop
-    /// (default: 0 = off, or preset value).
+    /// α refinement iterations per input-split sub-domain (default: 0 = off, or
+    /// preset value)
     ///
-    /// When > 0 AND α-CROWN is enabled, each input-split sub-domain
-    /// warm-starts from its parent's optimized alphas and re-optimizes them
-    /// for this many SPSA iterations against the sub-domain's tighter box,
-    /// producing tighter per-domain bounds (fewer splits). Has no effect
-    /// under plain CROWN (`--no-alpha`).
-    /// Reference: alpha-beta-CROWN `solver.alpha-crown.input_split_alpha_iteration`.
+    /// When positive and α-CROWN is on, each sub-domain starts from its
+    /// parent's optimized α and re-optimizes it for this many SPSA iterations
+    /// on its smaller box, which tightens bounds and reduces splitting. No
+    /// effect with `--no-alpha`.
     #[arg(long)]
     pub(crate) input_split_alpha_iterations: Option<usize>,
 
-    /// Learning rate for per-sub-domain α refinement (default: 0.05, or
-    /// preset value). Only used when `--input-split-alpha-iterations > 0`.
-    /// Reference: alpha-beta-CROWN `solver.alpha-crown.input_split_lr_alpha`.
+    /// Learning rate for per-sub-domain α refinement (default: 0.05, or preset
+    /// value). Used only when --input-split-alpha-iterations is positive.
     #[arg(long)]
     pub(crate) input_split_lr_alpha: Option<f32>,
 
-    /// Disable adaptive α-CROWN skipping for deep networks.
-    /// By default, α-CROWN is automatically skipped for very deep networks (>25 ReLU layers)
-    /// where optimization doesn't help because bounds are fundamentally loose.
-    /// Use this flag to always run α-CROWN regardless of network depth.
+    /// Always run α-CROWN, even on deep networks
+    ///
+    /// By default α-CROWN is skipped on networks with more than
+    /// --alpha-skip-depth ReLU layers, where optimization rarely helps.
     #[arg(long, default_value_t = false)]
     pub(crate) no_adaptive_alpha_skip: bool,
 
-    /// Depth threshold for adaptive α-CROWN skipping (number of ReLU layers).
-    /// Networks with more than this many ReLU layers will skip α-CROWN if adaptive skip is enabled.
-    /// Default: 8 (ResNet-2b has 6 and benefits, ResNet-4b has 10 and doesn't benefit), or preset value.
+    /// ReLU-layer count above which α-CROWN is skipped (default: 20, or preset
+    /// value)
     #[arg(long)]
     pub(crate) alpha_skip_depth: Option<usize>,
 
-    /// Use CROWN-IBP bounds for intermediate nodes (O(N²) but tighter).
-    /// By default, uses IBP bounds (O(N), faster but looser - 3000x+ expansion).
-    /// This matches α,β-CROWN's fix_interm_bounds=False setting.
-    /// WARNING: Time and memory can be extreme on large graphs; a measured
-    /// ml4acopf case exceeded 100 GiB RSS. Use only on small graphs under
-    /// externally enforced resource limits.
+    /// Use CROWN-IBP instead of IBP for intermediate bounds
+    ///
+    /// Tighter, but time and memory can be extreme on large graphs (one case
+    /// exceeded 100 GiB). Use it only on small graphs, under an external
+    /// memory limit.
     #[arg(long, default_value_t = false)]
     pub(crate) crown_ibp_intermediates: bool,
 
-    /// Number of SPSA samples per α-CROWN iteration (default: 1, or preset value).
-    /// Higher values reduce gradient variance at the cost of more CROWN passes.
-    /// Each sample requires 2 CROWN passes (plus/minus perturbation).
-    /// Formula: total_passes = iterations * (1 + 2 * samples)
+    /// SPSA samples per α-CROWN iteration (default: 1, or preset value)
+    ///
+    /// Used only with --alpha-gradient-method spsa. More samples reduce
+    /// gradient noise; each costs two extra CROWN passes.
     #[arg(long)]
     pub(crate) alpha_spsa_samples: Option<usize>,
 
-    /// Learning rate for α-CROWN optimization.
-    /// Higher values converge faster but may overshoot. Lower values are more stable.
-    /// Default 0.1 matches α,β-CROWN for Adam optimizer, or use preset value.
+    /// Learning rate for α-CROWN optimization (default: 0.1, or preset value)
     #[arg(long)]
     pub(crate) alpha_lr: Option<f32>,
 
-    /// Gradient method for α-CROWN optimization (default: analytic-chain).
-    /// - analytic-chain: True chain-rule gradients (default; closest to
-    ///   reference α,β-CROWN's loss.backward())
-    /// - spsa: SPSA zero-order optimization (O(1) passes per iteration;
-    ///   noise-dominated for networks with many unstable neurons)
-    /// - fd: Finite differences (O(n) passes, accurate but slow)
-    /// - analytic: Experimental - local gradients from CROWN backward (incomplete)
+    /// Gradient method for α-CROWN optimization (default: analytic-chain)
     #[arg(long, value_enum)]
     pub(crate) alpha_gradient_method: Option<AlphaGradientMethodArg>,
 
-    /// Optimizer for α-CROWN parameter updates (default: adam, or preset value).
-    /// - adam: Adam optimizer (adaptive moment estimation - matches α,β-CROWN)
-    /// - sgd: SGD with momentum
+    /// Optimizer for α-CROWN (default: adam, or preset value)
     #[arg(long, value_enum)]
     pub(crate) alpha_optimizer: Option<AlphaOptimizerArg>,
 
@@ -480,24 +449,28 @@ pub(crate) struct BetaCrownArgs {
     #[arg(long, default_value_t = false, requires = "invprop")]
     pub(crate) invprop_share_gammas: bool,
 
-    /// Number of β-CROWN optimization iterations per domain (default: 0, or preset value).
-    /// Per-domain optimization is expensive; default 0 for throughput.
-    /// Use --beta-iterations 5 for single-objective verification where bound quality matters.
+    /// β-CROWN optimization iterations per domain (default: 15, or preset value)
+    ///
+    /// Per-domain optimization is expensive; 0 turns it off for throughput.
     #[arg(long)]
     pub(crate) beta_iterations: Option<usize>,
 
-    /// Maximum depth for per-domain β optimization (default: 3, or preset value).
-    /// Only applies when beta_iterations > 0. Domains deeper than this
-    /// skip optimization and rely on inherited β values from warmup.
+    /// Deepest domain that gets per-domain β optimization (default: 3, or preset
+    /// value)
+    ///
+    /// Deeper domains reuse the β values they inherit. Applies only when
+    /// --beta-iterations is positive.
     #[arg(long)]
     pub(crate) beta_max_depth: Option<usize>,
 
-    /// Learning rate for β optimization (default: 0.05, or preset value).
-    /// α,β-CROWN default is 0.05.
+    /// Learning rate for β optimization (default: 0.15, or preset value)
     #[arg(long)]
     pub(crate) lr_beta: Option<f32>,
 
-    /// Use CROWN-IBP for tighter intermediate bounds (~66% tighter than IBP). Enabled by default.
+    /// Use CROWN-IBP for intermediate bounds (default: on)
+    ///
+    /// Turned off automatically on graph models, for both input and ReLU
+    /// splitting.
     #[arg(
         long,
         default_value_t = true,
@@ -507,8 +480,8 @@ pub(crate) struct BetaCrownArgs {
     )]
     pub(crate) crown_ibp: bool,
 
-    /// Batch size for parallel domain processing (default: 64 GPU-optimized, or preset value).
-    /// 1 = sequential processing.
+    /// Domains processed per batch (default: 64, or preset value; 1 = one at a
+    /// time)
     #[arg(long)]
     pub(crate) batch_size: Option<usize>,
 
@@ -537,7 +510,7 @@ pub(crate) struct BetaCrownArgs {
     #[arg(long)]
     pub(crate) max_cuts: Option<usize>,
 
-    /// Minimum depth for cut generation (default: 2, or preset value)
+    /// Minimum domain depth for cut generation (default: 2, or preset value).
     /// Deeper domains produce more specific cuts.
     #[arg(long)]
     pub(crate) min_cut_depth: Option<usize>,
@@ -546,8 +519,8 @@ pub(crate) struct BetaCrownArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) enable_near_miss_cuts: bool,
 
-    /// Margin for near-miss cut generation (default: 0.1, or preset value)
-    /// Fraction of threshold or absolute if threshold=0.
+    /// Margin for near-miss cut generation (default: 0.1, or preset value). A
+    /// fraction of the threshold, or absolute when the threshold is 0.
     #[arg(long)]
     pub(crate) near_miss_margin: Option<f32>,
 
@@ -563,8 +536,8 @@ pub(crate) struct BetaCrownArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) biccos_constraint_strengthening: bool,
 
-    /// Drop ratio for BICCOS constraint strengthening (default: 0.5, or preset value)
-    /// Quantile over influence scores.
+    /// Drop ratio for BICCOS constraint strengthening (default: 0.5, or preset
+    /// value): a quantile over influence scores.
     #[arg(long)]
     pub(crate) biccos_drop_ratio: Option<f32>,
 
@@ -580,8 +553,8 @@ pub(crate) struct BetaCrownArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) clip_interm_domain: bool,
 
-    /// Number of objective neurons per layer to tighten (default: 3, or preset value)
-    /// Used with clip-interm-domain.
+    /// Objective neurons per layer to tighten with --clip-interm-domain
+    /// (default: 3, or preset value)
     #[arg(long)]
     pub(crate) clip_interm_topk: Option<usize>,
 
@@ -602,17 +575,12 @@ pub(crate) struct BetaCrownArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) interm_transfer: bool,
 
-    /// Enable PGD attack to find counterexamples (DEFAULT: on).
+    /// Search for counterexamples with a PGD attack (default: on)
     ///
-    /// PGD only FINDS counterexamples, which are independently re-validated
-    /// before a `sat` verdict is emitted, so it can never change a
-    /// verified/unsat verdict — disabling it never makes an unsound result
-    /// sound or vice-versa. Its time budget is capped (a fraction of the
-    /// timeout) so it cannot eat the whole BaB budget. Because the flag
-    /// defaults to on, a preset's `attack.pgd_order: skip` takes precedence
-    /// over it (the flag cannot signal an explicit enable). Pass
-    /// `--no-pgd-attack` (or `--pgd-attack=false`) to force PGD off for
-    /// reproducibility/determinism.
+    /// Every counterexample is re-checked before `sat` is reported, so PGD
+    /// cannot change a verified result. Its time is capped at a fraction of
+    /// the timeout. A preset's `attack.pgd_order: skip` overrides this flag;
+    /// use --no-pgd-attack to turn PGD off.
     #[arg(
         long = "pgd-attack",
         num_args = 0..=1,
@@ -623,8 +591,8 @@ pub(crate) struct BetaCrownArgs {
     )]
     pub(crate) pgd_attack: bool,
 
-    /// Disable PGD falsification (overrides --pgd-attack). For reproducibility
-    /// or deterministic A/B comparisons. Bounding/disabling PGD is sound.
+    /// Turn off the PGD attack (overrides --pgd-attack), for example for
+    /// reproducible A/B runs
     #[arg(long = "no-pgd-attack", default_value_t = false, action = clap::ArgAction::SetTrue)]
     pub(crate) no_pgd_attack: bool,
 
@@ -636,10 +604,11 @@ pub(crate) struct BetaCrownArgs {
     #[arg(long)]
     pub(crate) pgd_steps: Option<usize>,
 
-    /// Compute backend request (cpu, wgpu). Falls back to preset general.device,
-    /// then the size-aware automatic choice. A selected WGPU route retains the
-    /// exact device only after live proof qualification; refusal is reported and
-    /// falls back to CPU.
+    /// Compute backend: cpu or wgpu (default: the preset's general.device, else
+    /// chosen by problem size)
+    ///
+    /// wgpu is used only if the adapter passes its qualification checks;
+    /// otherwise ny uses the CPU and reports why.
     #[arg(long, value_enum)]
     pub(crate) backend: Option<BackendArg>,
 
@@ -659,59 +628,69 @@ pub(crate) struct BetaCrownArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) json: bool,
 
-    /// Use GPU-accelerated BaB with DomainList storage.
-    /// Routes graph verification through the batched DomainList engine;
-    /// input and ReLU splitting are both supported.
+    /// Use the batched GPU branch-and-bound engine (input and ReLU splitting)
     #[arg(long, default_value_t = false)]
     pub(crate) gpu_bab: bool,
 
-    /// Disable lA warm-start in GPU BaB backward pass (for A/B benchmarking).
-    /// When set, each backward pass recomputes from scratch instead of reusing
-    /// cached linear bound coefficients from the parent domain.
+    /// Recompute every GPU BaB backward pass from scratch instead of reusing the
+    /// parent domain's linear bounds (for A/B benchmarking)
     #[arg(long, default_value_t = false)]
     pub(crate) no_la_warm_start: bool,
 
-    /// Complete verifier method.
-    /// - auto (default): run BaB, then auto-escalate to the MIP (ay)
-    ///   complete verifier when BaB is inconclusive AND the network is
-    ///   MIP-encodable (sequential Linear+ReLU within a size cap). Escalation
-    ///   is sound: MIP can only turn unknown/timeout into a decided verdict.
-    ///   Requires a build with the MIP lane (the first-party ay solver).
-    ///   Without it, auto behaves like bab and mip falls back to
-    ///   branch-and-bound.
-    /// - bab: Branch-and-bound with β-CROWN bounds only (never escalates).
-    /// - mip: Exact Big-M encoding solved by ay (VNN-COMP compatibility).
-    ///   For small networks, "mip" may be faster than BaB.
+    /// Complete verifier: auto (default), bab, or mip
+    ///
+    /// `auto` runs branch-and-bound and escalates to an exact MIP solved by
+    /// ay when the result is inconclusive and the network is MIP-encodable
+    /// (sequential Linear+ReLU within a size cap). Escalation can only turn
+    /// unknown or timeout into a decided verdict. MIP needs a build with the
+    /// `mip` feature; without it, `auto` behaves like `bab` and `mip` falls
+    /// back to branch-and-bound.
     #[arg(long, value_enum, default_value_t = CompleteVerifierArg::Auto)]
     pub(crate) complete_verifier: CompleteVerifierArg,
 
-    /// MIP solver backend (when --complete-verifier mip).
-    /// - ay: the ay solver, exact QF_LRA Big-M encoding (the only
-    ///   backend — SOLVER POLICY: all solving in ny happens on ay)
+    /// MIP solver for --complete-verifier mip (only `ay` is available)
     ///
-    /// Requires a build with the MIP lane (the first-party ay solver).
-    /// Without it, auto behaves like bab and mip falls back to
-    /// branch-and-bound. Legacy preset values (highs/scip/gurobi)
-    /// resolve to ay with a warning.
+    /// Legacy preset values (highs, scip, gurobi) resolve to ay with a
+    /// warning.
     #[arg(long, value_enum)]
     pub(crate) mip_solver: Option<MipSolverArg>,
 
-    /// Competition mode: maximise verify-rate within the wall-clock budget
-    /// by turning OFF proof-carrying certificate emission and internal
-    /// self-checks (which are ON by default). SOUND: this never weakens the
-    /// soundness of the sat/unsat verdict — it only skips emitting the
-    /// extra machine-checkable certificate artifact. The VNN-COMP entry
-    /// point (`ny vnncomp`) sets this automatically.
-    #[arg(long, default_value_t = false)]
+    /// Proof profile: `proof` (this subcommand's default) or `competition`
+    ///
+    /// `proof` writes proof artifacts and runs the downgrade-only audits at
+    /// full rates; `competition` wires a null artifact sink and samples the
+    /// audits. Neither changes certification: every certificate, the cover
+    /// gate and the guards run identically in both. Printed as
+    /// `[proof-profile] mode=<m> source=<entry|cli>`.
+    #[arg(long, value_parser = parse_proof_profile)]
+    pub(crate) proof_profile: Option<ny_core::proof_profile::ProofProfile>,
+
+    /// Deprecated spelling of `--proof-profile competition` (kept so existing
+    /// scripts keep working; recorded as `source=cli`).
+    #[arg(
+        long,
+        default_value_t = false,
+        hide = true,
+        conflicts_with = "proof_profile"
+    )]
     pub(crate) competition_mode: bool,
+
+    /// Refuse (`unknown`) any verdict the external certificate format cannot
+    /// represent
+    ///
+    /// Also always attempts the certificate sidecar. Off by default in both
+    /// profiles: without it a verdict the lanes certified at runtime is
+    /// published, and a missing artifact is recorded as `artifact=none` rather
+    /// than refused.
+    #[arg(long, default_value_t = false)]
+    pub(crate) require_certificate: bool,
 
     /// Force-disable certificate emission even outside competition mode.
     #[arg(long, default_value_t = false, conflicts_with = "emit_certificate")]
     pub(crate) no_certificate: bool,
 
-    /// Emit the proof-carrying certificate sidecar to this path (forces
-    /// emission ON regardless of --competition-mode). When omitted and
-    /// certificates are enabled, the default path is `<model-stem>.cert.json`.
+    /// Write the proof certificate to this path, whatever the proof profile
+    /// (default path: `<model-stem>.cert.json`)
     #[arg(long)]
     pub(crate) emit_certificate: Option<PathBuf>,
 
@@ -721,13 +700,110 @@ pub(crate) struct BetaCrownArgs {
     pub(crate) allow_unsound_gpu_crown: bool,
 }
 
+/// `on` / `off` for `ny proof-check --refine`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OnOff {
+    /// Enabled.
+    On,
+    /// Disabled.
+    Off,
+}
+
+// `ny proof-check` arguments (ENGINE_PROGRAM §1.7 B2.1). A plain comment, not a
+// doc comment, so the `Commands::ProofCheck` doc is the command's only help text.
+#[derive(clap::Args, Debug, Clone)]
+pub(crate) struct ProofCheckArgs {
+    /// Proof bundle to check (`<RESULTS_FILE>.proof.jsonl`, format
+    /// ny-proof-bundle/v2)
+    pub(crate) bundle: PathBuf,
+
+    /// ONNX model (default: the path recorded in the bundle; its SHA-256 must
+    /// match the bundle's)
+    #[arg(long)]
+    pub(crate) onnx: Option<PathBuf>,
+
+    /// VNN-LIB property (default: the path recorded in the bundle; its SHA-256
+    /// must match the bundle's)
+    #[arg(long)]
+    pub(crate) vnnlib: Option<PathBuf>,
+
+    /// Where to write the JSON report (default: `<BUNDLE>.check.json`)
+    #[arg(long)]
+    pub(crate) report: Option<PathBuf>,
+
+    /// Worker threads (default: all cores)
+    #[arg(long)]
+    pub(crate) threads: Option<usize>,
+
+    /// Memory budget for back-substitution, in GiB
+    #[arg(long, default_value_t = 8.0)]
+    pub(crate) mem_gib: f64,
+
+    /// Time budget in seconds
+    ///
+    /// Anything not confirmed when the budget runs out is reported as
+    /// unconfirmed.
+    #[arg(long, default_value_t = 3600.0)]
+    pub(crate) budget_s: f64,
+
+    /// Tighten intermediate bounds by back-substitution
+    ///
+    /// Applies to the root bounds of every input region and, when a region's
+    /// recorded bounds do not confirm it, to bounds re-derived over that
+    /// region alone.
+    #[arg(long, value_enum, default_value_t = OnOff::On)]
+    pub(crate) refine: OnOff,
+
+    /// Points tried per unconfirmed region when searching for a
+    /// counterexample
+    #[arg(long, default_value_t = 16)]
+    pub(crate) refute_points: usize,
+
+    /// Print the full report as JSON on stdout
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
 // Boxing the largest argument groups bounds stack use in Clap's generated debug schema builder.
 #[derive(Subcommand)]
 pub(crate) enum Commands {
-    /// Verify a neural network property
+    /// Serve one bounded untrusted AY head-phase multiplier request
+    #[cfg(feature = "mip")]
+    #[command(name = "__head-phase-ay-advice", hide = true)]
+    InternalHeadPhaseAyAdvice,
+
+    /// Serve one bounded untrusted AY global head-functional request
+    #[cfg(feature = "mip")]
+    #[command(name = "__head-functional-ay-advice", hide = true)]
+    InternalHeadFunctionalAyAdvice,
+
+    /// Serve one bounded untrusted AY complete phase-cover batch
+    #[cfg(feature = "mip")]
+    #[command(name = "__head-phase-cover-ay-advice", hide = true)]
+    InternalHeadPhaseCoverAyAdvice,
+
+    /// Check a property using one bounding method (see --method)
     Verify(Box<VerifyArgs>),
 
-    /// Load and inspect a model
+    /// Certify a complete affine vocabulary head over a supplied hidden box
+    HeadVerify {
+        /// JSON request with original binary64 head paths, target and hidden box
+        request: PathBuf,
+        /// Independently replay a previously exported evidence file
+        #[arg(long)]
+        replay: Option<PathBuf>,
+        /// Export replayable evidence to a new file
+        #[arg(long)]
+        evidence: Option<PathBuf>,
+        /// Whole command deadline, including head loading and replay
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
+        /// Original head allocation limit in MiB
+        #[arg(long, default_value_t = 512)]
+        max_head_mb: usize,
+    },
+
+    /// Show a model's structure
     Inspect {
         /// Path to model (ONNX, PyTorch, SafeTensors, CoreML, or GGUF)
         model: PathBuf,
@@ -751,20 +827,22 @@ pub(crate) enum Commands {
         json: bool,
     },
 
-    /// Print the trace-bridge soundness-coverage manifest: an exhaustive
-    /// catalogue classifying all 123 ingestable ops as exact / sound /
-    /// sound_but_loose / unsupported (data-dependent, refused). Classification
-    /// is build-enforced: the classifier is a wildcard-free match, so a newly
-    /// added op fails to compile until it is deliberately classified.
+    /// Show the trace-bridge operator soundness taxonomy
+    ///
+    /// Each TraceOp is classified as exact, sound, sound_but_loose or unsupported.
+    /// This describes possible relaxations, not current importer coverage or the
+    /// numeric soundness of a run. New variants must be classified to compile.
     Coverage {
         /// Output as JSON
         #[arg(long, default_value_t = false)]
         json: bool,
     },
 
-    /// SOUND certified global Lipschitz upper bound (exact rational, fails
-    /// closed outside the Linear/Conv/ReLU fragment), shown next to the
-    /// optimistic spectral-norm estimate
+    /// Compute a certified global Lipschitz upper bound
+    ///
+    /// Uses exact rational arithmetic and fails closed outside the
+    /// Linear/Conv/ReLU fragment. An optimistic spectral-norm estimate is shown
+    /// alongside.
     Lipschitz {
         /// Path to ONNX model
         model: PathBuf,
@@ -774,7 +852,7 @@ pub(crate) enum Commands {
         json: bool,
     },
 
-    /// Compare two single-input ONNX models (for porting verification)
+    /// Compare the propagated output bounds of two single-input ONNX models
     Compare {
         /// Path to reference single-input ONNX model (e.g., PyTorch export)
         reference: PathBuf,
@@ -812,7 +890,7 @@ pub(crate) enum Commands {
         json: bool,
     },
 
-    /// Find where two ONNX models diverge (layer-by-layer diff for porting)
+    /// Find where two ONNX models diverge, layer by layer
     Diff {
         /// Path to first ONNX model (e.g., PyTorch export)
         model_a: PathBuf,
@@ -852,7 +930,7 @@ pub(crate) enum Commands {
         json: bool,
     },
 
-    /// Analyze layer sensitivity (which layers amplify input noise)
+    /// Find which layers amplify input noise
     Sensitivity {
         /// Path to ONNX model
         model: PathBuf,
@@ -880,7 +958,7 @@ pub(crate) enum Commands {
         json: bool,
     },
 
-    /// Check if ONNX layers can be safely quantized to float16/int8
+    /// Check whether ONNX layers can be safely quantized to float16 or int8
     QuantizeCheck {
         /// Path to ONNX model
         model: PathBuf,
@@ -912,7 +990,7 @@ pub(crate) enum Commands {
         json: bool,
     },
 
-    /// Profile bound width growth through the network
+    /// Show how bound width grows through the network
     ProfileBounds {
         /// Path to model (ONNX, PyTorch, SafeTensors, CoreML, or GGUF)
         model: PathBuf,
@@ -949,7 +1027,7 @@ pub(crate) enum Commands {
         center_zeros: bool,
     },
 
-    /// Unavailable Whisper verification compatibility command (fails closed)
+    /// Whisper verification (not available; always fails closed)
     Whisper {
         /// Retained model path argument; the unavailable command does not open it
         model: PathBuf,
@@ -1060,7 +1138,7 @@ pub(crate) enum Commands {
         verbose_search: bool,
     },
 
-    /// Generate a Whisper encoder export script for loading and block analysis
+    /// Generate a Python script that exports a Whisper encoder to ONNX
     Export {
         /// Model type
         #[arg(short, long, default_value = "whisper", value_parser = ["whisper"])]
@@ -1080,7 +1158,7 @@ pub(crate) enum Commands {
         output: Option<PathBuf>,
     },
 
-    /// Run benchmarks
+    /// Run built-in performance benchmarks (layer, attention, full, acasxu)
     Bench(Box<BenchArgs>),
 
     /// Audit VNN-COMP benchmark category coverage
@@ -1107,7 +1185,7 @@ pub(crate) enum Commands {
         category: Option<String>,
     },
 
-    /// Acquire, inspect, run, score, and metamorphically check benchmarks.
+    /// Download, inventory, sweep, and score VNN-COMP corpora
     Benchmarks {
         #[command(subcommand)]
         action: commands::vnncomp_benchmarks::BenchmarkAssetsAction,
@@ -1196,10 +1274,10 @@ pub(crate) enum Commands {
         json: bool,
     },
 
-    /// Run β-CROWN branch-and-bound complete verification
+    /// Prove or falsify a property with β-CROWN branch-and-bound
     BetaCrown(Box<BetaCrownArgs>),
 
-    /// VNN-COMP competition entry point (`v1`) and its explicit-plan printer (`plan`).
+    /// Run one VNN-COMP instance (v1) or print its run plan (plan)
     Vnncomp {
         #[command(subcommand)]
         action: VnncompAction,
@@ -1218,26 +1296,31 @@ pub(crate) enum Commands {
         action: commands::weights::WeightsAction,
     },
 
-    /// Geometric ground-truth utilities: evaluate .gt.json specs and verify
-    /// networks against analytic geometry (docs/GEOMETRIC_GROUND_TRUTH_PLAN.md)
+    /// Verify networks against geometric ground-truth specs (.gt.json)
     Gt {
         #[command(subcommand)]
         action: commands::gt::GtAction,
     },
 
-    /// Re-derive every recorded empirical claim from the artifacts it was made
-    /// from, and print TRUE / FALSE / STALE / VACUOUS / UNGROUNDED.
+    /// Check the proof bundle behind an `unsat` result, independently of the
+    /// verifier
     ///
-    /// The ledger lives in `claims/`. A claim carries the artifacts it was
-    /// derived from (content-pinned), an extractor that re-derives its number
-    /// today, the ENGAGEMENT OBSERVABLES that prove the measurement observed
-    /// its own subject, and the provenance dimensions its truth depends on.
+    /// Re-derives every bound the bundle claims with the checker's own ONNX
+    /// and VNN-LIB readers and outward-rounded arithmetic, checks that the
+    /// proved regions cover the whole input region for every disjunct, and
+    /// writes a JSON report. It can only confirm or reject a proof, never
+    /// produce or upgrade a result. Exit codes: 0 verified, 10 unconfirmed,
+    /// 20 invalid, 21 refuted, 30 malformed, 31 unsupported, 40 checker fault,
+    /// 4 usage or I/O error.
+    ProofCheck(ProofCheckArgs),
+
+    /// Re-check recorded empirical claims against their pinned artifacts
     ///
-    /// The subcommand exists here for people who already have `ny` in hand;
-    /// the identical check is in the leaf `ny-claims` binary, which builds in
-    /// seconds rather than relinking this one. Hosted in `ny`, the current
-    /// verifier's identity comes from THIS RUNNING PROCESS rather than from
-    /// re-invoking a file by path, which is strictly better evidence.
+    /// Prints TRUE, FALSE, STALE, VACUOUS, or UNGROUNDED for each claim in the
+    /// ledger (default: `claims/`). Each claim records the content-pinned
+    /// artifacts it was derived from, how to re-derive its value, and the
+    /// observables that show the measurement engaged. The same check ships as
+    /// the standalone `ny-claims` binary, which builds much faster.
     Claims(ny_claims::cli::ClaimsArgs),
 
     /// Learn to verify neural networks, interactively (start with no argument)
@@ -1254,19 +1337,11 @@ pub(crate) enum Commands {
 /// pre-subcommand CLI (the wrapper and sweep invocations never change).
 #[derive(Subcommand)]
 pub(crate) enum VnncompAction {
-    /// Run a single VNN-COMP benchmark instance end-to-end (competition entry point).
+    /// Run one VNN-COMP instance exactly as the competition harness does
     ///
-    /// This is the native implementation of the `run_instance.sh` protocol: it
-    /// auto-loads the category preset, computes the internal timeout tier, runs the
-    /// β-CROWN verification with the AUTO defaults (branching/backend/complete-verifier/
-    /// PGD are all self-selected — no strategy flags), translates the verdict to the
-    /// VNN-COMP result string (unsat/sat/timeout/unknown/error), and writes RESULTS_FILE
-    /// (first line = result; for `sat`, the SMT-LIB counterexample witness is appended).
-    ///
-    /// Experimental cGAN note: `NY_CGAN_INPUT_LEAF=1` requires an `mip` build and
-    /// only arms the authenticated `cgan_2023` input-leaf route. Its depth-two
-    /// replay is production-disabled and reported as `disabled_not_requested`;
-    /// dormant APIs do not run.
+    /// Loads the category preset, verifies with automatically chosen settings,
+    /// and writes RESULTS_FILE: the first line is `unsat`, `sat`, `timeout`,
+    /// `unknown`, or `error`, and for `sat` the counterexample follows.
     ///
     /// Protocol: `ny vnncomp v1 CATEGORY ONNX VNNLIB RESULTS_FILE TIMEOUT`.
     V1 {
@@ -1279,54 +1354,138 @@ pub(crate) enum VnncompAction {
         /// Path to the VNN-LIB property file for this instance.
         vnnlib: PathBuf,
 
-        /// File to write the one-line VNN-COMP result (+ witness body for `sat`).
+        /// File to write the result to (plus the counterexample for `sat`).
         results_file: PathBuf,
 
-        /// Scored competition budget, in seconds. Accepts fractional values
-        /// (VNN-COMP instance CSVs carry budgets like `210.0`; metaroom_2023's
-        /// whole column is fractional) — floored to whole seconds internally.
+        /// Time budget in seconds (fractional values such as `210.0` are floored).
         #[arg(value_parser = parse_budget_secs)]
         timeout_secs: u64,
 
-        /// Directory containing the `vnncomp*/{category}.yaml` presets.
-        /// Defaults to auto-derivation from the binary/ONNX path (nearest ancestor
-        /// `configs/` directory).
+        /// Directory holding the `vnncomp*/<CATEGORY>.yaml` presets (default:
+        /// $NY_CONFIGS_DIR, else the nearest `configs/` above the binary, the ONNX
+        /// file, or the working directory).
         #[arg(long)]
         configs_dir: Option<PathBuf>,
+
+        /// Override the scored entry point's `competition` proof profile
+        /// (#soundness-spine M2a) — `proof` for banking and moat runs. It
+        /// selects artifact sinks and audit rates only; certification is
+        /// identical in both profiles.
+        #[arg(long, value_parser = parse_proof_profile)]
+        proof_profile: Option<ny_core::proof_profile::ProofProfile>,
+
+        /// Detail level of the per-phase cost census written to
+        /// `<RESULTS_FILE>.flight.json` (`phase_cost`): `off`, `coarse`
+        /// (default) or `detail`. Observability only; it never changes a
+        /// verdict.
+        #[arg(long, value_name = "LEVEL", value_parser = parse_phase_cost_level)]
+        phase_cost: Option<ny_core::phase_cost::DetailLevel>,
     },
 
-    /// Print the resolved run plan for one instance WITHOUT running it (I2).
+    /// Print the resolved run plan for one instance without running it
     ///
-    /// Shows the detected backend/host, the loaded-model facts, every resolved
-    /// setting as `name = value  [source]` (default / preset override /
-    /// measured rule with its evidence citation / backend detect), and the
-    /// budget-ledger snapshot (scored budget, internal tier, attack slice,
-    /// alpha cap). See docs/PLAN_RESOLVER_V1_2026-08-01.md.
+    /// Shows the detected host and backend, facts about the loaded model, each
+    /// resolved setting with where it came from, and how the time budget is
+    /// split.
     Plan {
         /// Benchmark category (e.g. `cifar100_2024`). Drives preset auto-loading.
-        category: String,
+        /// Required unless `--replay`.
+        #[arg(required_unless_present = "replay")]
+        category: Option<String>,
 
-        /// Path to the ONNX model for this instance (model facts are derived
-        /// from the LOADED model, never from the filename).
-        onnx: PathBuf,
+        /// Path to the ONNX model for this instance (facts come from the loaded
+        /// model, never from its filename).
+        #[arg(required_unless_present = "replay")]
+        onnx: Option<PathBuf>,
 
         /// Path to the VNN-LIB property file for this instance.
-        vnnlib: PathBuf,
+        #[arg(required_unless_present = "replay")]
+        vnnlib: Option<PathBuf>,
 
-        /// Scored competition budget, in seconds (fractional accepted, floored).
-        #[arg(value_parser = parse_budget_secs)]
-        budget_secs: u64,
+        /// Time budget in seconds (fractional values are floored).
+        #[arg(value_parser = parse_budget_secs, required_unless_present = "replay")]
+        budget_secs: Option<u64>,
 
-        /// Directory containing the `vnncomp*/{category}.yaml` presets.
-        /// Defaults to auto-derivation from the binary/ONNX path (nearest ancestor
-        /// `configs/` directory).
+        /// Directory holding the `vnncomp*/<CATEGORY>.yaml` presets (default:
+        /// $NY_CONFIGS_DIR, else the nearest `configs/` above the binary, the ONNX
+        /// file, or the working directory).
         #[arg(long)]
         configs_dir: Option<PathBuf>,
 
         /// Output as JSON.
         #[arg(long, default_value_t = false)]
         json: bool,
+
+        /// Also print the router's plan for this instance
+        ///
+        /// This is the plan a scored run logs when its preset sets
+        /// `router.mode: shadow`.
+        #[arg(long, default_value_t = false)]
+        router: bool,
+
+        /// Plan the router for another host: gb10, g5, m5, or other
+        ///
+        /// For measurement only. It changes the plan's values, never which lane
+        /// runs.
+        #[arg(long, value_name = "HOST")]
+        router_target_host: Option<String>,
+
+        /// Replay a logged router plan from a `<result>.flight.json` file
+        ///
+        /// Re-runs the router's plan and checkpoints on the inputs the flight
+        /// file recorded, and exits non-zero on any divergence. Takes no
+        /// instance arguments.
+        #[arg(long, value_name = "FLIGHT_JSON")]
+        replay: Option<PathBuf>,
     },
+
+    /// Write the router's admission census over a corpus of instances
+    ///
+    /// For each corpus row, extracts the facts a scored run's router extracts
+    /// and records, for every routable capability, whether the router would
+    /// route it if it were sealed: the rows a seal must cover. Runs no
+    /// verification. Prints one `CENSUS_DONE rc=0 ...` line.
+    Census {
+        /// The corpus manifest: a `# ny-admission-census-corpus/v1` line, then
+        /// one `ROW_ID<TAB>ONNX<TAB>VNNLIB<TAB>BUDGET` line per row.
+        #[arg(long, value_name = "CORPUS_TSV")]
+        manifest: PathBuf,
+
+        /// The census table to write (refused if it exists).
+        #[arg(long, value_name = "CENSUS_TSV")]
+        out: PathBuf,
+
+        /// The seal envelope to assume: `widest` (every operator kind but
+        /// `other`, every specification archetype) or `OPS/SPECS` with
+        /// `+`-joined tokens (`conv+relu+linear/robustness`).
+        #[arg(long, default_value = "widest")]
+        envelope: String,
+
+        /// Plan for another host: gb10, g5, m5, or other (default: this host)
+        #[arg(long, value_name = "HOST")]
+        router_target_host: Option<String>,
+
+        /// Deadline of each parent-lane admission probe, in seconds
+        #[arg(long, default_value_t = 60)]
+        row_deadline_secs: u64,
+
+        /// Where decompressed (competition-form) models and properties go
+        /// (default: `<CENSUS_TSV>.work`)
+        #[arg(long, value_name = "DIR")]
+        work_dir: Option<PathBuf>,
+    },
+}
+
+/// Parse a `--phase-cost` value: exactly `off`, `coarse` or `detail` (#phase-cost).
+fn parse_phase_cost_level(raw: &str) -> Result<ny_core::phase_cost::DetailLevel, String> {
+    ny_core::phase_cost::DetailLevel::parse(raw)
+}
+
+/// Parse a `--proof-profile` value: exactly `proof` or `competition`. A typo is
+/// an error at the flag, never a silent fallback to the other profile.
+fn parse_proof_profile(raw: &str) -> Result<ny_core::proof_profile::ProofProfile, String> {
+    ny_core::proof_profile::ProofProfile::parse(raw)
+        .ok_or_else(|| format!("expected `proof` or `competition`, got `{raw}`"))
 }
 
 /// Parse a VNN-COMP scored budget that may be fractional (`210.0`) into whole

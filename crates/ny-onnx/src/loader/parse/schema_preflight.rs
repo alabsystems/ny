@@ -14,6 +14,7 @@ use crate::onnx_proto::{self, GraphProto, NodeProto};
 use ny_core::{NyError, Result};
 use std::collections::{HashMap, HashSet};
 
+use super::expand_identity::ExpandIdentityCones;
 use super::literal_cone::{LiteralCone, LiteralExemptions};
 use super::quantization_preflight::RawDtypeResolver;
 
@@ -29,9 +30,14 @@ const INT64: i32 = 7;
 pub(super) fn validate_standard_schemas(
     graph: &GraphProto,
     opset_imports: &HashMap<String, i64>,
+    qdq_activation_relaxation: bool,
 ) -> Result<LiteralExemptions> {
     let literals = LiteralCone::new(graph);
     let mut exemptions = LiteralExemptions::default();
+    // #cctsdb-expand-identity: certify the constant-false `Equal(Shape, <neg>)`
+    // / pass-through `Where` cones once, on the authored graph, for every gate
+    // that consults them.
+    let expand_identity = ExpandIdentityCones::certify(graph);
     let standard_opset = opset_imports
         .get("")
         .copied()
@@ -54,14 +60,21 @@ pub(super) fn validate_standard_schemas(
         opset_imports,
         &literals,
         &mut exemptions,
+        &expand_identity,
     )?;
     let authenticated = super::structural_schema::validate_structural_schemas(
         graph,
         opset_imports,
         &literals,
         &mut exemptions,
+        qdq_activation_relaxation,
+        &expand_identity,
     )?;
-    super::linear_schema::validate_linear_convolution_schemas(graph, opset_imports)?;
+    super::linear_schema::validate_linear_convolution_schemas(
+        graph,
+        opset_imports,
+        qdq_activation_relaxation,
+    )?;
     super::transform_schema::validate_transform_schemas(graph, opset_imports)?;
 
     let mut raw_dtypes = RawDtypeResolver::new(graph);
@@ -101,6 +114,7 @@ pub(super) fn validate_standard_schemas(
                 &literals,
                 &mut exemptions,
                 &authenticated,
+                &expand_identity,
             )?;
             continue;
         }
@@ -204,7 +218,8 @@ pub(super) fn validate_standard_schemas_unfolded(
     graph: &GraphProto,
     opset_imports: &HashMap<String, i64>,
 ) -> Result<()> {
-    validate_standard_schemas(graph, opset_imports)?.require_all_folded(&crate::WeightStore::new())
+    validate_standard_schemas(graph, opset_imports, false)?
+        .require_all_folded(&crate::WeightStore::new(), graph)
 }
 
 /// Do not reinterpret the standard ONNX Attention function as ny's much

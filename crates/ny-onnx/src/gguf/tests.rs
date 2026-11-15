@@ -993,14 +993,14 @@ fn test_k_quant_multiple_blocks() {
 }
 
 // ==========================================================================
-// Overflow regression tests (#3280)
+// Overflow regression tests
 //
 // Verify that checked arithmetic in load_tensor_data rejects crafted inputs
 // that would overflow usize. Without these guards, integer overflow in
 // untrusted file parsers could bypass bounds checks.
 // ==========================================================================
 
-/// Regression test (#3280): data_section_offset + tensor.offset overflows usize.
+/// Regression test: data_section_offset + tensor.offset overflows usize.
 ///
 /// Crafts a GGUFTensorInfo with offset near usize::MAX so that
 /// `data_section_offset.checked_add(tensor.offset)` returns None.
@@ -1022,7 +1022,7 @@ fn test_gguf_offset_overflow_rejected_3280() {
     );
 }
 
-/// Regression test (#3280): elements * 4 overflows usize for F32 tensors.
+/// Regression test: elements * 4 overflows usize for F32 tensors.
 ///
 /// Passes element count near usize::MAX/4 so that `elements.checked_mul(4)`
 /// returns None.
@@ -1048,7 +1048,7 @@ fn test_gguf_f32_byte_size_overflow_rejected_3280() {
     );
 }
 
-/// Regression test (#3280): checked_shape_product rejects overflowing tensor dimensions.
+/// Regression test: checked_shape_product rejects overflowing tensor dimensions.
 ///
 /// Verifies that `checked_shape_product` returns None for shapes whose
 /// product exceeds usize::MAX, which the GGUF loader maps to NyError.
@@ -1075,7 +1075,7 @@ fn test_gguf_shape_product_overflow_rejected_3280() {
     assert_eq!(checked_shape_product(&shape3), Some(512));
 }
 
-/// Regression test (#3280): elements * 2 overflows usize for F16 tensors.
+/// Regression test: elements * 2 overflows usize for F16 tensors.
 ///
 /// Passes element count near usize::MAX/2 so that `elements.checked_mul(2)`
 /// returns None in the F16 branch of load_tensor_data.
@@ -1101,7 +1101,7 @@ fn test_gguf_f16_byte_size_overflow_rejected_3280() {
     );
 }
 
-/// Regression test (#3280): num_blocks * block_size overflows usize for quantized tensors.
+/// Regression test: num_blocks * block_size overflows usize for quantized tensors.
 ///
 /// For Q8_0: block_elements=32, block_size=34. Constructs an element count
 /// that is divisible by 32 but whose (elements/32)*34 overflows usize.

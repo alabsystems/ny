@@ -5,7 +5,7 @@
 #
 # CNN benchmark runner for VNN-COMP CIFAR-10 ResNet category.
 # Measures verification rate with alpha-CROWN (Patches mode) and beta-CROWN (BaB).
-# Part of #3290: First CNN benchmark measurement.
+# First CNN benchmark measurement.
 
 set -euo pipefail
 

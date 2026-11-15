@@ -8,10 +8,17 @@ use super::{for_each_elementwise_activation, Layer};
 use crate::layers::common::BoundPropagation;
 
 impl Layer {
+    /// Diagnostic-only storage cannot enter any proof or precomputed-bound
+    /// fallback, even when that fallback would bypass the layer dispatcher.
+    pub fn is_diagnostic_point_only(&self) -> bool {
+        matches!(self, Layer::PointLinear(_))
+    }
+
     /// Get a string describing the layer type.
     pub fn layer_type(&self) -> &'static str {
         match self {
             Layer::Linear(_) => "Linear",
+            Layer::PointLinear(_) => "PointLinear",
             Layer::IntervalConst(ic) => ic.kind_name(),
             Layer::Conv1d(_) => "Conv1d",
             Layer::Conv2d(_) => "Conv2d",
@@ -148,7 +155,7 @@ impl Layer {
     /// Minimum number of graph-edge inputs this layer requires.
     ///
     /// Used by `GraphNode::new()` to catch arity mismatches at construction time
-    /// instead of deferring to propagation-time `require_*_inputs()` checks (#2481).
+    /// instead of deferring to propagation-time `require_*_inputs()` checks.
     ///
     /// Special cases:
     /// - `Where`: returns 1 because the embedded-constants variant needs only the
@@ -182,7 +189,7 @@ impl Layer {
             // Concat with embedded constants can have fewer graph inputs
             // (e.g., ViT CLS token concatenated with patch embeddings).
             // Fully-constant Concat (all ONNX inputs embedded) has zero
-            // graph-level inputs — valid after ONNX lowering (#4112).
+            // graph-level inputs — valid after ONNX lowering.
             if c.constant_inputs
                 .as_ref()
                 .is_some_and(|ci| !ci.is_empty() && ci.iter().all(|x| x.is_some()))
@@ -287,6 +294,33 @@ impl Layer {
                     // Pad: Reflect mode duplicate-fan-in scatter-add (gamma_k*S) + Constant
                     // mode directed bias fold both emit fresh err — must NOT stay a carrier.
                     | Layer::Pad(_)
+                    // AddConstant (#vnncomp-aw-soundness, acasxu prop_1 recovery): its
+                    // CROWN backward passes `A` through UNTOUCHED (so an incoming
+                    // certificate `|A_stored − A_true| ≤ e` holds verbatim on the
+                    // result) and charges the `A→bias` fold's error by MAGNITUDE — the
+                    // bias is widened OUTWARD by `Σ_j e_j·|c_j|`, Pad's certified
+                    // constant-fold idiom (see add_constant/crown.rs). That directed
+                    // charge DOMINATES the signed carrier fold `|Σ_j e_j·c_j|` on every
+                    // constant (equal exactly when the constant is sign-uniform), so
+                    // the mixed-sign carrier eviction below stays CLOSED while the
+                    // sequential lane keeps a FINITE row instead of the
+                    // `discharge_coeff_err_to_conservative` vacuous-row degrade —
+                    // which cost acasxu's single-output prop_1 family its sub-second
+                    // unsat, because every acasxu FC bias is mixed-sign. Scalar
+                    // dispatchers check THIS predicate first, so the sign-uniform
+                    // carrier admission below now serves only the BATCHED lane (whose
+                    // carrier ADDs the carried err instead of overwriting — see
+                    // layers/layer_enum/dispatch.rs).
+                    //
+                    // SubConstant deliberately does NOT join it here: its scalar
+                    // backward's broadcast column-REDUCTION path
+                    // (`propagate_linear_broadcast_backward`) DOES propagate the
+                    // incoming err (the p-term, sub_constant.rs:146-166) — but that
+                    // path never charges the bias fold with the magnitude term
+                    // Σ_j e_j·|c_j|, so declaring SubConstant a direct propagator
+                    // would UNDER-CHARGE the folded bias on that path. It keeps the
+                    // carrier/discharge policy (sound, at worst looser).
+                    | Layer::AddConstant(_)
                     // NOTE: AveragePool is DELIBERATELY NOT here. It is a SCATTER-type
                     // linear op (each input column sums several output-coeff errors), so
                     // propagating its incoming err incurs a triangle-inequality loss:
@@ -323,7 +357,65 @@ impl Layer {
     /// EXCLUDES nonlinear / relaxation-producing layers (ReLU, activations handled
     /// by `propagates_coeff_err`, MatMul/Mul/Bilinear McCormick, Where, Div, etc.)
     /// whose backward is not a fixed linear transform of the coefficient matrix.
+    ///
+    /// It ALSO excludes an `A→bias` fold whose constant can CANCEL under the
+    /// carrier — see `constant_fold_cannot_cancel` below, and the note in the
+    /// body. That admission is per-INSTANCE, not per-variant.
     pub fn is_exact_linear_coeff_err_carrier(&self) -> bool {
+        // `A→bias` FOLD OPS ARE ADMITTED ONLY WHEN THE FOLD CANNOT CANCEL
+        // (#vnncomp-aw-soundness).
+        //
+        // AddConstant/SubConstant are the only members of this set whose backward
+        // moves coefficients INTO THE BIAS (`b' = b ± A @ c`; see
+        // `AddConstantLayer::crown_backward_with_operand_shape` and
+        // `SubConstantLayer::propagate_linear` /
+        // `propagate_linear_broadcast_backward`, all of which reach the fold
+        // through `arithmetic::common::dot_bias_f64` with the SIGNED `c`).
+        //
+        // Run on `LinearBounds::coeff_err_carrier` — whose coefficients are the
+        // non-negative `e = |err|` and whose bias is zero — that fold produces
+        // `Σ_j e_j·c_j`, and `LinearBounds::attach_err_from_carried` then takes
+        // `max(|B_lo|, |B_up|)` as the bias widening. The charge an error term
+        // requires is `Σ_j e_j·|c_j|`: an error accumulates MAGNITUDES, because
+        // cancellation in the VALUE does not cancel the ERROR. The two differ
+        // without limit on a mixed-sign `c` — the ordinary CNN channel bias. With
+        // `e = [1, 1]` and `c = [+1, -1]` the required charge is 2 and the carrier
+        // publishes `|1·(+1) + 1·(-1)| = 0`: a bound TIGHTER than the arithmetic
+        // justifies, i.e. a false `unsat`, not a loose one.
+        //
+        // The sibling that gets this right is Pad's constant fold
+        // (`layers/transform/pad.rs`):
+        //
+        //     const_lo_err[row] += (e[[row, out_flat]] as f64).abs() * v.abs();
+        //
+        // — MAGNITUDE on both factors, applied outward (`-` into the lower bias,
+        // `+` into the upper) — and Pad was moved OUT of this set into
+        // `propagates_coeff_err()` precisely so the carrier could not clobber that
+        // charge.
+        //
+        // The VALUE fold is untouched: these layers still shift the bias by the
+        // signed `A @ c`, so the certified function is unchanged. Only the ERROR
+        // policy moves. Where the constant is SIGN-UNIFORM the carrier's charge is
+        // already the magnitude charge (`e ≥ 0`, so every term of `Σ_j e_j·c_j`
+        // shares one sign and `|Σ_j e_j·c_j| = Σ_j e_j·|c_j|` identically), and
+        // the tight carrier path is kept. Every other case leaves the set and
+        // takes the dispatchers' PRECISE discharge instead —
+        // `fold_coeff_err_into_bias` over the node's own output box in
+        // `network/backward_dispatch/dispatch.rs` and
+        // `layers/layer_enum/dispatch.rs`, `discharge_coeff_err_to_conservative`
+        // in `network/core/sequential/crown/patches_step.rs`. Looser, never wrong.
+        if let Layer::AddConstant(l) = self {
+            return constant_fold_cannot_cancel(l.constant());
+        }
+        if let Layer::SubConstant(l) = self {
+            // `reverse` (`y = c - x`) negates the coefficient matrix wholesale and
+            // leaves the fold's summands untouched, so the same test applies.
+            return constant_fold_cannot_cancel(l.constant());
+        }
+        // Gather AND Pad moved to `propagates_coeff_err`: their backends emit a
+        // fresh coefficient error (Gather/Pad-Reflect duplicate scatter-add
+        // gamma_k*S; Pad-Constant directed bias fold) that the carrier path would
+        // clobber. (#vnncomp-aw-soundness)
         matches!(
             self,
             Layer::Add(_)
@@ -331,12 +423,6 @@ impl Layer {
                 | Layer::Concat(_)
                 | Layer::Slice(_)
                 | Layer::Transpose(_)
-                // Gather AND Pad moved to `propagates_coeff_err`: their backends emit a fresh
-                // coefficient error (Gather/Pad-Reflect duplicate scatter-add gamma_k*S;
-                // Pad-Constant directed bias fold) that the carrier path would clobber.
-                // (#vnncomp-aw-soundness)
-                | Layer::AddConstant(_)
-                | Layer::SubConstant(_)
         )
     }
 
@@ -345,7 +431,7 @@ impl Layer {
     /// Used by `Network::propagate_crown_batched` and `StreamingVerifier` gate functions
     /// to decide whether to use batched CROWN or fall back to regular CROWN.
     /// This is the single source of truth for the batched CROWN allow-list, replacing
-    /// duplicated `matches!` blocks across 4 gate functions (#1753).
+    /// duplicated `matches!` blocks across 4 gate functions.
     pub fn supports_batched_crown(&self) -> bool {
         self.is_elementwise_activation()
             || matches!(
@@ -423,6 +509,9 @@ impl Layer {
     /// Source: `alpha-beta-CROWN (github.com/Verified-Intelligence/alpha-beta-CROWN) auto_LiRPA/auto_LiRPA/operators/base.py:143`
     pub fn required_input_bound_indices(&self) -> &'static [usize] {
         match self {
+            // Point-only has no backward adapter. Empty demand does not grant
+            // exact-linear authority; every proof dispatcher refuses it.
+            Layer::PointLinear(_) => &[],
             // Binary relaxation layers: both inputs may need tightening
             // when both sides are perturbed.
             Layer::MatMul(_) | Layer::BilinearCrown(_) | Layer::MulBinary(_) => &[0, 1],
@@ -464,6 +553,47 @@ impl Layer {
                     | Layer::AdaIN1d(_)
             )
     }
+}
+
+/// Whether a constant-shift layer's `A→bias` fold is free of SIGN CANCELLATION
+/// under the non-negative coefficient-error carrier (#vnncomp-aw-soundness).
+///
+/// `LinearBounds::coeff_err_carrier` hands the op a coefficient matrix of
+/// `e = |err| ≥ 0` and a zero bias, so `AddConstant`/`SubConstant` fold
+/// `Σ_j e_j·c_j` into the carried bias while the certified charge the caller
+/// needs is `Σ_j e_j·|c_j|`. The two are EQUAL exactly when `c` never changes
+/// sign — every summand then shares one sign, so the sum's magnitude is the sum
+/// of the magnitudes. `0.0` and `-0.0` contribute nothing either way and count
+/// as neutral, so a constant of mixed positives-and-zeros (or
+/// negatives-and-zeros) still qualifies.
+///
+/// Testing the AUTHORED constant is sufficient for every layout the backwards
+/// build: `AddConstantLayer::backward_constant_columns` and
+/// `SubConstantLayer::propagate_linear` only ever RESHAPE, BROADCAST, or TILE
+/// the constant's own entries into `c_flat` — replication cannot introduce a
+/// sign that is not already present — and `SubConstant`'s `y = x - c` /
+/// `y = c - x` sign is applied to the whole fold, outside the sum.
+///
+/// Answers `false` for a non-finite entry and for an empty constant, so those
+/// leave the carrier set and take the dispatchers' discharge path (looser, never
+/// wrong) rather than reaching a fold whose charge cannot be trusted.
+fn constant_fold_cannot_cancel(constant: &ndarray::ArrayD<f32>) -> bool {
+    if constant.is_empty() {
+        return false;
+    }
+    let mut seen_positive = false;
+    let mut seen_negative = false;
+    for &v in constant.iter() {
+        if !v.is_finite() {
+            return false;
+        }
+        seen_positive |= v > 0.0;
+        seen_negative |= v < 0.0;
+        if seen_positive && seen_negative {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -516,5 +646,356 @@ mod query_batched_gate_tests {
         assert_eq!(out.lower_a()[[2, 1]], 1.0);
         assert_eq!(out.lower_a()[[2, 2]], 1.0);
         assert_eq!(out.lower_a()[[0, 1]], 0.0);
+    }
+}
+
+#[cfg(test)]
+mod constant_fold_carrier_tests {
+    //! The `A→bias` fold half of the coefficient-error carrier contract
+    //! (#vnncomp-aw-soundness).
+    //!
+    //! These tests drive the PRODUCTION composition, not a kernel in isolation:
+    //! the gate `Layer::is_exact_linear_coeff_err_carrier`, then
+    //! `LinearBounds::coeff_err_carrier` → the layer's own
+    //! `propagate_crown_backward` → `LinearBounds::attach_err_from_carried`,
+    //! exactly as `dispatch_exact_linear_with_err`
+    //! (`network/backward_dispatch/dispatch.rs`) and the batched carrier arm
+    //! (`layers/layer_enum/dispatch.rs`) compose them.
+
+    use ndarray::{Array1, Array2, ArrayD, IxDyn};
+    use ny_tensor::BoundedTensor;
+
+    use super::Layer;
+    use crate::bounds::LinearBounds;
+    use crate::layers::arithmetic::{AddConstantLayer, SubConstantLayer};
+    use crate::layers::common::BoundPropagation;
+
+    fn constant(values: [f32; 2]) -> ArrayD<f32> {
+        ArrayD::from_shape_vec(IxDyn(&[2]), values.to_vec()).expect("constant tensor")
+    }
+
+    /// One row of incoming CROWN bounds over a 2-position layer OUTPUT, carrying
+    /// a certified coefficient error of `e` on both relaxations.
+    fn bounds_with_err(a: [f32; 2], e: [f32; 2]) -> LinearBounds {
+        let mut bounds = LinearBounds::new(
+            Array2::from_shape_vec((1, 2), a.to_vec()).expect("lower_a"),
+            Array1::zeros(1),
+            Array2::from_shape_vec((1, 2), a.to_vec()).expect("upper_a"),
+            Array1::zeros(1),
+        )
+        .expect("incoming bounds");
+        bounds.set_coeff_err(
+            Array2::from_shape_vec((1, 2), e.to_vec()).expect("lower err"),
+            Array2::from_shape_vec((1, 2), e.to_vec()).expect("upper err"),
+        );
+        assert!(bounds.has_coeff_err(), "the fixture must carry an error");
+        bounds
+    }
+
+    /// The carrier branch, mirroring `dispatch_exact_linear_with_err`: the real
+    /// run on error-free coefficients, the carrier run on `|err|`, then attach.
+    fn carrier_path(layer: &Layer, bounds: &LinearBounds, pre: &BoundedTensor) -> LinearBounds {
+        let carrier = bounds
+            .coeff_err_carrier()
+            .expect("bounds carry an error, so a carrier exists");
+        let mut plain = bounds.clone();
+        plain.lower_a_err = None;
+        plain.upper_a_err = None;
+        let mut real = layer
+            .propagate_crown_backward(&plain, Some(pre))
+            .expect("real backward");
+        let carried = layer
+            .propagate_crown_backward(&carrier, Some(pre))
+            .expect("carrier backward");
+        real.attach_err_from_carried(&carried);
+        real
+    }
+
+    /// THE GATE. For every constant-shift instance this predicate ADMITS to the
+    /// carrier set, the carrier's own bias fold must publish a widening of at
+    /// least the MAGNITUDE charge `Σ_j e_j·|c_j|` on each side.
+    ///
+    /// Both layers pass `A` through (`SubConstant` may negate it) and shift the
+    /// bias by `±A @ c`, so the real run leaves `lower_b == upper_b` and the
+    /// published width is exactly twice the charge `attach_err_from_carried`
+    /// folded in — a layer-agnostic, sign-agnostic observable.
+    ///
+    /// FAILS on the pre-fix tree: `c = [+1, -1]` with `e = [1, 1]` needs a charge
+    /// of 2 (width 4) and the signed carrier fold publishes `|1·(+1) + 1·(-1)| =
+    /// 0` (width 0).
+    #[test]
+    fn admitted_constant_shift_carriers_cover_the_magnitude_charge() {
+        let pre = BoundedTensor::new(
+            ArrayD::from_shape_vec(IxDyn(&[2]), vec![0.0_f32, 0.0]).expect("pre lower"),
+            ArrayD::from_shape_vec(IxDyn(&[2]), vec![1.0_f32, 1.0]).expect("pre upper"),
+        )
+        .expect("pre-activation box");
+        let e = [1.0_f32, 1.0];
+        let mut admitted = 0_usize;
+        for c in [
+            [1.0_f32, -1.0],  // mixed sign: the defect's own instance
+            [-1.0_f32, 1.0],  // mixed sign, other order
+            [3.0_f32, -0.25], // mixed sign, unequal magnitudes
+            [1.0_f32, 2.0],   // sign-uniform positive
+            [-1.0_f32, -2.0], // sign-uniform negative
+            [0.0_f32, -3.0],  // zero is sign-neutral
+        ] {
+            let required =
+                f64::from(e[0]) * f64::from(c[0]).abs() + f64::from(e[1]) * f64::from(c[1]).abs();
+            for layer in [
+                Layer::AddConstant(AddConstantLayer::new(constant(c))),
+                Layer::SubConstant(SubConstantLayer::new(constant(c))),
+                Layer::SubConstant(SubConstantLayer::new_reverse(constant(c))),
+            ] {
+                if !layer.is_exact_linear_coeff_err_carrier() {
+                    // Refused: the dispatchers discharge the error over the node's
+                    // own box instead, which never under-charges. Nothing to prove.
+                    continue;
+                }
+                admitted += 1;
+                let out = carrier_path(&layer, &bounds_with_err([1.0, 1.0], e), &pre);
+                let width = f64::from(out.upper_b()[0]) - f64::from(out.lower_b()[0]);
+                assert!(
+                    width >= 2.0 * required - 1e-4,
+                    "{} admitted to the coeff-err carrier set with c = {:?}, but its carried \
+                     bias charge is {:.6} where the magnitude charge SUM_j e_j*|c_j| = {:.6} \
+                     is required — a bound tighter than the arithmetic justifies",
+                    layer.layer_type(),
+                    c,
+                    width / 2.0,
+                    required
+                );
+            }
+        }
+        assert!(
+            admitted >= 6,
+            "the sign-uniform constants must STAY in the carrier set (admitted = {admitted}); \
+             a blanket refusal would make this gate vacuous"
+        );
+    }
+
+    /// The defect's own instance, named: a mixed-sign constant must NOT be in the
+    /// carrier set, while its sign-uniform siblings must stay in it.
+    #[test]
+    fn mixed_sign_constant_shift_is_refused_from_the_carrier_set() {
+        for layer in [
+            Layer::AddConstant(AddConstantLayer::new(constant([1.0, -1.0]))),
+            Layer::SubConstant(SubConstantLayer::new(constant([1.0, -1.0]))),
+            Layer::SubConstant(SubConstantLayer::new_reverse(constant([1.0, -1.0]))),
+        ] {
+            assert!(
+                !layer.is_exact_linear_coeff_err_carrier(),
+                "{}: the carrier's bias fold SUM_j e_j*c_j CANCELS on a mixed-sign constant, \
+                 so it must take the dispatchers' discharge path instead",
+                layer.layer_type()
+            );
+        }
+        for layer in [
+            Layer::AddConstant(AddConstantLayer::new(constant([1.0, 2.0]))),
+            Layer::AddConstant(AddConstantLayer::new(constant([-1.0, -2.0]))),
+            Layer::AddConstant(AddConstantLayer::new(constant([0.0, 2.0]))),
+            Layer::SubConstant(SubConstantLayer::new(constant([1.0, 2.0]))),
+            Layer::SubConstant(SubConstantLayer::scalar(-0.5)),
+        ] {
+            assert!(
+                layer.is_exact_linear_coeff_err_carrier(),
+                "{}: a sign-uniform constant cannot cancel, so the tight carrier path must be \
+                 kept — refusing it would be an unnecessary loss of precision",
+                layer.layer_type()
+            );
+        }
+    }
+
+    /// `constant_fold_cannot_cancel` fails closed on the degenerate inputs.
+    #[test]
+    fn constant_fold_cancellation_test_fails_closed() {
+        use super::constant_fold_cannot_cancel;
+        assert!(constant_fold_cannot_cancel(&constant([2.0, 0.0])));
+        assert!(constant_fold_cannot_cancel(&constant([-0.0, -2.0])));
+        assert!(!constant_fold_cannot_cancel(&constant([f32::NAN, 1.0])));
+        assert!(!constant_fold_cannot_cancel(&constant([
+            f32::INFINITY,
+            1.0
+        ])));
+        assert!(!constant_fold_cannot_cancel(&ArrayD::<f32>::zeros(IxDyn(
+            &[0]
+        ))));
+    }
+}
+
+#[cfg(test)]
+mod constant_fold_direct_propagation_tests {
+    //! The DIRECT err-propagation half of the constant-shift contract
+    //! (#vnncomp-aw-soundness, acasxu prop_1 recovery).
+    //!
+    //! `constant_fold_carrier_tests` above proves the carrier set refuses the
+    //! mixed-sign `A→bias` fold, whose signed carrier charge `|Σ_j e_j·c_j|`
+    //! CANCELS. These tests prove the replacement fast path: `AddConstant` is a
+    //! `propagates_coeff_err()` DIRECT propagator whose own CROWN backward
+    //! passes the err planes through untouched (`A` is untouched, so the
+    //! certificate transfers verbatim) and charges the fold by MAGNITUDE
+    //! `Σ_j e_j·|c_j|` — dominating the signed fold on every constant, equal to
+    //! it exactly on the sign-uniform ones. The original eviction stays closed:
+    //! mixed-sign instances remain OUT of the carrier set, and the row stays
+    //! FINITE instead of taking the sequential lane's
+    //! `discharge_coeff_err_to_conservative` vacuous-row degrade.
+
+    use ndarray::{Array1, Array2, ArrayD, IxDyn};
+    use ny_tensor::BoundedTensor;
+
+    use super::Layer;
+    use crate::bounds::LinearBounds;
+    use crate::layers::arithmetic::AddConstantLayer;
+    use crate::layers::common::BoundPropagation;
+
+    fn constant(values: [f32; 2]) -> ArrayD<f32> {
+        ArrayD::from_shape_vec(IxDyn(&[2]), values.to_vec()).expect("constant tensor")
+    }
+
+    /// One row of incoming CROWN bounds over a 2-position layer OUTPUT, carrying
+    /// a certified coefficient error of `e` on both relaxations.
+    fn bounds_with_err(a: [f32; 2], e: [f32; 2]) -> LinearBounds {
+        let mut bounds = LinearBounds::new(
+            Array2::from_shape_vec((1, 2), a.to_vec()).expect("lower_a"),
+            Array1::zeros(1),
+            Array2::from_shape_vec((1, 2), a.to_vec()).expect("upper_a"),
+            Array1::zeros(1),
+        )
+        .expect("incoming bounds");
+        bounds.set_coeff_err(
+            Array2::from_shape_vec((1, 2), e.to_vec()).expect("lower err"),
+            Array2::from_shape_vec((1, 2), e.to_vec()).expect("upper err"),
+        );
+        assert!(bounds.has_coeff_err(), "the fixture must carry an error");
+        bounds
+    }
+
+    fn pre() -> BoundedTensor {
+        BoundedTensor::new(
+            ArrayD::from_shape_vec(IxDyn(&[2]), vec![0.0_f32, 0.0]).expect("pre lower"),
+            ArrayD::from_shape_vec(IxDyn(&[2]), vec![1.0_f32, 1.0]).expect("pre upper"),
+        )
+        .expect("pre-activation box")
+    }
+
+    /// THE RECOVERED FAST PATH. For EVERY constant sign pattern — including the
+    /// mixed-sign instances the carrier set refuses (every acasxu FC bias) — the
+    /// direct backward keeps the row FINITE, widens the bias OUTWARD by at least
+    /// the magnitude charge `Σ_j e_j·|c_j|`, and passes the err planes through
+    /// unchanged.
+    #[test]
+    fn add_constant_backward_propagates_incoming_err_with_the_magnitude_charge() {
+        let e = [1.0_f32, 0.5];
+        for c in [
+            [1.0_f32, -1.0],  // mixed sign: the refused-carrier instance
+            [-3.0_f32, 0.25], // mixed sign, unequal magnitudes
+            [1.0_f32, 2.0],   // sign-uniform positive (parity with the carrier)
+            [-1.0_f32, -2.0], // sign-uniform negative
+        ] {
+            let layer = Layer::AddConstant(AddConstantLayer::new(constant(c)));
+            assert!(
+                layer.propagates_coeff_err(),
+                "AddConstant must be a DIRECT err propagator so the sequential \
+                 lane never discharges its rows to [-inf, +inf]"
+            );
+            let with_err = bounds_with_err([1.0, 1.0], e);
+            let mut plain = with_err.clone();
+            plain.lower_a_err = None;
+            plain.upper_a_err = None;
+            let real = layer
+                .propagate_crown_backward(&plain, Some(&pre()))
+                .expect("plain backward");
+            let out = layer
+                .propagate_crown_backward(&with_err, Some(&pre()))
+                .expect("err-carrying backward");
+            let required =
+                f64::from(e[0]) * f64::from(c[0]).abs() + f64::from(e[1]) * f64::from(c[1]).abs();
+            assert!(
+                out.lower_b()[0].is_finite() && out.upper_b()[0].is_finite(),
+                "c = {c:?}: the direct path must publish a FINITE row — a \
+                 vacuous [-inf, +inf] here is exactly the acasxu prop_1 loss"
+            );
+            assert!(
+                f64::from(out.lower_b()[0]) <= f64::from(real.lower_b()[0]) - required + 1e-4,
+                "c = {c:?}: lower bias must be widened DOWN by the magnitude \
+                 charge {required} (got {} vs plain {})",
+                out.lower_b()[0],
+                real.lower_b()[0]
+            );
+            assert!(
+                f64::from(out.upper_b()[0]) >= f64::from(real.upper_b()[0]) + required - 1e-4,
+                "c = {c:?}: upper bias must be widened UP by the magnitude \
+                 charge {required} (got {} vs plain {})",
+                out.upper_b()[0],
+                real.upper_b()[0]
+            );
+            let le = out.lower_a_err().expect("lower err plane must survive");
+            let ue = out.upper_a_err().expect("upper err plane must survive");
+            for j in 0..2 {
+                assert_eq!(
+                    le[[0, j]],
+                    e[j],
+                    "c = {c:?}: A passes through untouched, so the lower err \
+                     plane must transfer verbatim"
+                );
+                assert_eq!(
+                    ue[[0, j]],
+                    e[j],
+                    "c = {c:?}: A passes through untouched, so the upper err \
+                     plane must transfer verbatim"
+                );
+            }
+        }
+    }
+
+    /// NEGATIVE — the ORIGINAL asymmetry stays closed. On the defect's own
+    /// instance `c = [+1, −1]`, `e = [1, 1]` the signed fold `Σ_j e_j·c_j`
+    /// publishes a charge of ZERO; the direct path must publish the magnitude
+    /// charge 2 on EACH side (width ≥ 4). This test fails on any reintroduction
+    /// of the signed fold into the direct path — and the mixed-sign instance
+    /// must remain evicted from the carrier set, so no dispatcher can reach the
+    /// cancelling carrier fold either.
+    #[test]
+    fn mixed_sign_direct_charge_is_by_magnitude_and_the_carrier_eviction_stays() {
+        let layer = Layer::AddConstant(AddConstantLayer::new(constant([1.0, -1.0])));
+        assert!(
+            !layer.is_exact_linear_coeff_err_carrier(),
+            "the mixed-sign carrier eviction (a5ffc1bcc) must stay closed"
+        );
+        let out = layer
+            .propagate_crown_backward(&bounds_with_err([1.0, 1.0], [1.0, 1.0]), Some(&pre()))
+            .expect("backward");
+        let width = f64::from(out.upper_b()[0]) - f64::from(out.lower_b()[0]);
+        assert!(
+            width >= 4.0 - 1e-4,
+            "mixed-sign fold must charge magnitudes (SUM_j e_j*|c_j| = 2 per \
+             side, width 4); the signed fold cancels to 0 — got width {width}"
+        );
+    }
+
+    /// No incoming certificate → byte-identical previous behavior: no err
+    /// planes materialize and the fold is the plain directed `A @ c`.
+    #[test]
+    fn add_constant_backward_without_incoming_err_is_unchanged() {
+        let layer = Layer::AddConstant(AddConstantLayer::new(constant([1.0, -1.0])));
+        let plain = LinearBounds::new(
+            Array2::from_shape_vec((1, 2), vec![1.0, 1.0]).expect("lower_a"),
+            Array1::zeros(1),
+            Array2::from_shape_vec((1, 2), vec![1.0, 1.0]).expect("upper_a"),
+            Array1::zeros(1),
+        )
+        .expect("plain bounds");
+        let out = layer
+            .propagate_crown_backward(&plain, Some(&pre()))
+            .expect("backward");
+        assert!(
+            !out.has_coeff_err(),
+            "an error-free input must not grow error planes"
+        );
+        assert!(
+            (f64::from(out.lower_b()[0])).abs() < 1e-4
+                && (f64::from(out.upper_b()[0])).abs() < 1e-4,
+            "plain fold is A @ c = 1*(+1) + 1*(-1) = 0 up to directed rounding"
+        );
     }
 }

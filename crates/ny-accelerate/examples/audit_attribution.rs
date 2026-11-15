@@ -5,7 +5,7 @@
 //! Explicit OFF/FAER/Accelerate end-to-end attribution measurement.
 //!
 //! ```text
-//! cargo run --release -p ny-accelerate --example audit_attribution
+//! targo --unverified run --release -p ny-accelerate --example audit_attribution
 //! ```
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

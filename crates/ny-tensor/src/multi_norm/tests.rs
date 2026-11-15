@@ -203,7 +203,7 @@ fn test_dot_product_dim_in_one_matches_interval_product() {
     let b = MultiNormBounds::new(2.0, 1.0, 1, lw_b, lb_b, uw_b, ub_b).unwrap();
 
     let out = a.dot_product(&b).unwrap();
-    // dot_product() uses concretize_sound() internally (#2239), which widens
+    // dot_product() uses concretize_sound() internally, which widens
     // intermediate bounds by 1 ULP via directed rounding. The resulting bias
     // bounds must *contain* the true interval product [1,2]×[3,4] = [3,8]
     // but may be slightly wider than exact.
@@ -249,7 +249,7 @@ fn test_mul_elementwise_concrete_matches_product() {
     assert_eq!(out.ub[[0, 0, 0]], 6.0);
 }
 
-/// Regression #3116: NaN weights must propagate through matmul, not silently become zero.
+/// Regression: NaN weights must propagate through matmul, not silently become zero.
 ///
 /// Prior to this fix, `v.max(0.0)` / `v.min(0.0)` followed IEEE 754-2008 and
 /// returned 0.0 for NaN inputs, silently dropping the weight's contribution and
@@ -299,7 +299,7 @@ fn test_matmul_nan_weight_propagates_not_silently_zeroed_3116() {
     );
 }
 
-/// Regression #3116: NaN weights must propagate through matmul_batched.
+/// Regression: NaN weights must propagate through matmul_batched.
 #[test]
 fn test_matmul_batched_nan_weight_propagates_3116() {
     let lw = Array4::from_shape_vec((1, 1, 1, 2), vec![1.0, 1.0])
@@ -331,7 +331,7 @@ fn test_matmul_batched_nan_weight_propagates_3116() {
     );
 }
 
-/// concretize_sound() must widen bounds by at least 1 ULP vs concretize() (#2287).
+/// concretize_sound() must widen bounds by at least 1 ULP vs concretize().
 #[test]
 fn test_concretize_sound_widens_bounds_by_directed_rounding_2287() {
     // Set up non-trivial norm: lw != uw so bounds differ.
@@ -371,7 +371,7 @@ fn test_concretize_sound_widens_bounds_by_directed_rounding_2287() {
 }
 
 /// concretize_sound() must produce finite, non-inverted bounds even with
-/// extreme epsilon values that stress the dual-norm computation (#2353).
+/// extreme epsilon values that stress the dual-norm computation.
 #[test]
 fn test_concretize_sound_extreme_eps_produces_valid_bounds_2353() {
     // Large eps * large norm can push lower below upper. new_repaired(Widen)
@@ -399,7 +399,7 @@ fn test_concretize_sound_extreme_eps_produces_valid_bounds_2353() {
 }
 
 // concretize_sound() with f64 accumulators must produce bounds that contain
-// the f64-precision concretization result for high-dimensional inputs (#2364).
+// the f64-precision concretization result for high-dimensional inputs.
 //
 // The old f32-accumulator norm had O(dim_in * eps_f32) error which for
 // dim_in=768 could be ~4.6e-5 relative — thousands of ULPs, far exceeding

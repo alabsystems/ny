@@ -8,8 +8,6 @@
 //! This module deduplicates the inner loop that was previously copy-pasted
 //! across `crown_elementwise_backward_indexed`, `crown_elementwise_backward_batched_indexed`,
 //! and `crown_elementwise_backward_patches` in `common/mod.rs`.
-//!
-//! Reference: designs/2026-03-01-common-mod-crown-backward-dedup-and-split.md
 
 use ny_tensor::{next_down_f32, next_up_f32};
 
@@ -68,12 +66,12 @@ impl ComposeResult {
 /// For the lower bound:
 /// - Positive coefficient `a > 0`: use *lower* relaxation (preserves direction)
 /// - Negative coefficient `a < 0`: use *upper* relaxation (flips direction)
-/// - Zero coefficient: skip to avoid IEEE 754 NaN from `0.0 * ±Inf` (#1736)
+/// - Zero coefficient: skip to avoid IEEE 754 NaN from `0.0 * ±Inf`
 ///
-/// Directed rounding (#2786): `next_down_f32` moves the product away from the
+/// Directed rounding: `next_down_f32` moves the product away from the
 /// true value toward -∞, making the lower bound sound (conservative).
 ///
-/// Non-finite detection (#3009): when `coeff × slope` overflows to ±Inf,
+/// Non-finite detection: when `coeff × slope` overflows to ±Inf,
 /// the coefficient is zeroed and the nonfinite flag is set for row fallback.
 #[inline(always)]
 pub(crate) fn compose_lower(coeff: f32, relax: &LinearRelaxation) -> ComposeResult {
@@ -138,12 +136,12 @@ fn directed_coeff(
 /// For the upper bound:
 /// - Positive coefficient `a > 0`: use *upper* relaxation (preserves direction)
 /// - Negative coefficient `a < 0`: use *lower* relaxation (flips direction)
-/// - Zero coefficient: skip to avoid IEEE 754 NaN from `0.0 * ±Inf` (#1736)
+/// - Zero coefficient: skip to avoid IEEE 754 NaN from `0.0 * ±Inf`
 ///
-/// Directed rounding (#2786): `next_up_f32` moves the product away from the
+/// Directed rounding: `next_up_f32` moves the product away from the
 /// true value toward +∞, making the upper bound sound (conservative).
 ///
-/// Non-finite detection (#3009): same as [`compose_lower`].
+/// Non-finite detection: same as [`compose_lower`].
 #[inline(always)]
 pub(crate) fn compose_upper(coeff: f32, relax: &LinearRelaxation) -> ComposeResult {
     compose_upper_with_policy(coeff, relax, exact_zero_slope_enabled())
@@ -202,7 +200,7 @@ where
 /// products were detected. The affected rows will get maximally loose but
 /// sound bounds: lower = -Inf, upper = +Inf.
 ///
-/// #3009: Pattern shared across Dense, Batched, and Patches paths.
+/// Pattern shared across Dense, Batched, and Patches paths.
 pub(crate) fn log_nonfinite_fallback(
     label: &str,
     lower_affected: usize,
@@ -396,7 +394,7 @@ mod tests {
 
     #[test]
     fn test_compose_lower_inf_slope_with_zero_coeff_safe() {
-        // Zero coefficient must NOT be multiplied with Inf slope (#1736)
+        // Zero coefficient must NOT be multiplied with Inf slope
         let relax = LinearRelaxation::new(f32::INFINITY, 0.0, f32::INFINITY, 0.0);
         let r = compose_lower(0.0, &relax);
         assert_eq!(r.new_coeff, 0.0);

@@ -7,8 +7,6 @@
 // Replays the MIP encoder's column creation order and forward-propagates a PGD
 // candidate through the stripped feedforward network to produce a full primal
 // column vector for the backend warm-start API.
-//
-// Part of #3865.
 
 use ndarray::ArrayD;
 use ny_core::Bound;

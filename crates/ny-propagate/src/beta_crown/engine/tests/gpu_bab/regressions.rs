@@ -17,7 +17,13 @@ fn x0_only_input_split_graph() -> GraphNetwork {
 }
 
 /// Test GPU BaB with GenBaB heuristic for GeLU nonlinearity.
-/// Part of #1534: Verify GenBaB path in verify_graph_gpu_domain_list.
+/// Verifies the GenBaB path in verify_graph_gpu_domain_list.
+///
+/// What it pins: the root verdict of the GeLU graph under the GenBaB
+/// configuration, reached through both nodes' CROWN walks (counted below).
+/// The threshold verifies at the root, so the search never branches
+/// (`domains_explored` is 1) and the branching heuristic's own choices are
+/// not exercised here.
 #[ntest::timeout(60000)]
 #[test]
 fn test_gpu_bab_genbab_heuristic() {
@@ -50,6 +56,41 @@ fn test_gpu_bab_genbab_heuristic() {
     };
     let verifier = BetaCrownVerifier::new(config);
 
+    // The verifier's root warmup is capped at `initial_bounds_fraction` (0.2)
+    // of the 27 s BaB slice = 5.4 s, and the first verification in a process
+    // pays two process-global, build-once costs inside that cap that are not
+    // this network's work:
+    //   * the sound erf-GeLU tangent tables (`GeluPrecomputeTables::new`: four
+    //     tables of 100,005 points, 100 f64 bisection steps each): 3.3-4.0 s
+    //     of CPU in a debug build, 1.6 s in release;
+    //   * in an optimized build, the forward-linear MAC-rate probe the
+    //     collector's walk admission reads (`forward_linear_measured_rate`, a
+    //     4.84 G-MAC conv build, each rep bounded at 5 s): ~0.2 s on a quiet
+    //     host by the fixture's own estimate, ~4 s of the warmup at load ~58.
+    //     (An unoptimized unit-test build no longer probes,
+    //     `#fl-calib-debug-tests`; it used to lose a flat 5 s here.)
+    // With both inside the cap the test failed alone with "Initial-bound
+    // warmup exceeded its deadline cap" (3/3 at load ~55-58 in both builds on
+    // 2026-10-04; 2/5 in debug at load ~55 on 2026-10-08), and when it passed
+    // the collector had refused both nodes for lack of window and the verdict
+    // came from the IBP fallback, not from the nodes' CROWN walks. The
+    // property here is the CROWN verdict on a two-neuron network, so pay both
+    // before the verifier's clock starts (the CLI's plan resolver pre-pays the
+    // probe the same way for medium conv models, #fl-phase-budget); the warmup
+    // cap then covers only this network's own passes (the whole verification
+    // measured 6-140 ms in a debug build at load 20-65, 1-52 ms in release at
+    // load ~58).
+    let _ = crate::layers::gelu_sound_linear_relaxation(-0.5, 0.5);
+    let _ = crate::network::forward_linear_measured_rate();
+
+    // Collector walks admitted in this process so far. The record is
+    // process-wide and only counts up, so this verification's share is a
+    // difference (a test running beside it under an explicit `--test-threads`
+    // can only add to it).
+    let admitted_walks =
+        || crate::network::collector_walk_admission_record().map_or(0, |record| record.admitted);
+    let admitted_before = admitted_walks();
+
     let result = verifier
         .verify_graph_gpu_domain_list(&graph, &input, &objective, threshold, None, None)
         .expect("GPU BaB with GenBaB should succeed");
@@ -59,6 +100,21 @@ fn test_gpu_bab_genbab_heuristic() {
         result.result,
         BabVerificationStatus::Verified,
         "GeLU network with GenBaB should verify when output < threshold"
+    );
+    // ...and by the route this test is for. The IBP fallback verifies the
+    // same threshold and satisfies every other assertion here: main's body
+    // passed that way with `admitted=0` whenever the tables fit the cap. The
+    // count of admitted walks is what tells the two apart, without a clock:
+    // both nodes' walks on the CROWN route, none on the fallback. The verifier
+    // refuses a node whose share of the warmup window has fallen under its 2 s
+    // floor, so a stall of about 3.4 s inside this millisecond verification
+    // also fails here, by name, where it used to fall back silently.
+    let admitted = admitted_walks() - admitted_before;
+    assert!(
+        admitted >= 2,
+        "the root collection must admit both nodes' CROWN walks, it admitted {admitted}: the \
+         collector refused for lack of window, so a build-once cost is back inside the warmup cap \
+         (or the host stalled for seconds inside the verification)"
     );
     // GenBaB path should have been taken.
     assert!(
@@ -75,7 +131,7 @@ fn test_gpu_bab_genbab_heuristic() {
 /// Test GPU BaB with Conv2d graph exercises the lA-capture backward variant
 /// for Conv2d, ReLU, Flatten, and Linear layers.
 ///
-/// Regression test for #1811: Before the fix, Conv2d and Flatten were handled
+/// Regression test: Before the fix, Conv2d and Flatten were handled
 /// by an identity pass-through in the lA-capture backward variant, producing
 /// degraded bounds. After the fix, the correct backward transformations are
 /// applied.
@@ -118,7 +174,7 @@ fn test_gpu_bab_conv2d_graph_network() {
 
 /// Test GPU BaB with Conv2d graph forces branching via tight threshold.
 ///
-/// Regression test for #1811: Exercises the full BaB loop with Conv2d/Flatten
+/// Regression test: Exercises the full BaB loop with Conv2d/Flatten
 /// in the lA-capture backward variant, including child domain creation and
 /// warm-start with cached lA. Uses a threshold tight enough to prevent
 /// immediate verification, forcing the BaB loop to actually run.
@@ -148,6 +204,19 @@ fn test_gpu_bab_conv2d_graph_branching() {
         ..Default::default()
     };
     let verifier = BetaCrownVerifier::new(config);
+
+    // The same pre-payment as `test_gpu_bab_genbab_heuristic` (see there), for
+    // the same 5.4 s root-warmup cap. No GeLU here, so no tangent tables: the
+    // build-once cost is the forward-linear rate probe, which an optimized
+    // build runs at the first deadline-carrying walk admission of a process.
+    // Measured 2026-10-09 (release, alone, load ~58, three fresh processes):
+    // 2.3-4.3 s of the cap went to the probe and the BaB finished at
+    // 2.3-4.7 s; past 5.4 s the loop never branches and the
+    // `domains_explored >= 2` assertion below fails for a reason that is not
+    // this network's. (An unoptimized unit-test build takes the shipped rate
+    // without probing, `#fl-calib-debug-tests`, so this line is free there;
+    // before that, gate [d]'s conv2d slice lost this test to the same 5 s.)
+    let _ = crate::network::forward_linear_measured_rate();
 
     let result = verifier
         .verify_graph_gpu_domain_list(&graph, &input, &objective, threshold, None, None)
@@ -181,10 +250,10 @@ fn test_gpu_bab_conv2d_graph_branching() {
             panic!("Unexpected GPU BaB result for Conv2d graph: {:?}", other);
         }
     }
-    // The test succeeding without panic is the key assertion for #1811.
+    // The test succeeding without panic is the key assertion.
 }
 
-/// Regression for #1891: InputSplit GPU BaB should not require per-layer
+/// Regression: InputSplit GPU BaB should not require per-layer
 /// DomainList storage because input-split children carry only input bounds.
 ///
 /// This test runs enough input-split iterations to exercise the periodic
@@ -229,7 +298,7 @@ fn test_gpu_bab_input_split_layerless_domain_list_regression_1891() {
     );
 }
 
-/// Regression for #3870: GPU input split must use the existing SB scorer when
+/// Regression: GPU input split must use the existing SB scorer when
 /// a spec-guided linear form is available, rather than falling back to width-only.
 ///
 /// The crafted graph depends only on `x0`, while `x1` has a much larger width.
@@ -275,7 +344,7 @@ fn test_gpu_bab_input_split_uses_sb_linear_scoring_3870() {
     );
 }
 
-/// Regression for #3870: reordered GPU input split must preserve the same
+/// Regression: reordered GPU input split must preserve the same
 /// verification result as the bound-now path on the same single-objective lane.
 #[ntest::timeout(10000)]
 #[test]
@@ -335,7 +404,7 @@ fn test_gpu_bab_input_split_reorder_bab_preserves_status_3870() {
     );
 }
 
-/// Regression for #1817: with `beta_iterations = 0`, default beta initialization
+/// Regression: with `beta_iterations = 0`, default beta initialization
 /// from history must match beta=0 behavior (and avoid the old beta=0.1 widening).
 #[ntest::timeout(10000)]
 #[test]
@@ -482,7 +551,7 @@ fn test_graph_constrained_crown_tightening() {
     );
 }
 
-/// #1817 diagnostic: Three-way BaB comparison to isolate where bounds diverge.
+/// Diagnostic: Three-way BaB comparison to isolate where bounds diverge.
 ///
 /// Compares:
 /// 1. `verify()` (sequential Network BaB)
@@ -721,7 +790,7 @@ fn make_domain_meta(lower: f32, upper: f32, depth: usize) -> crate::batched_doma
     }
 }
 
-/// Regression for #2933: NaN-bounded domains must be dropped by the prefilter,
+/// Regression: NaN-bounded domains must be dropped by the prefilter,
 /// not passed through to the branching pipeline.
 ///
 /// Before the fix, NaN domains fell through `check_domain_bounds` to `Undecided`
@@ -764,7 +833,7 @@ fn test_prefilter_drops_nan_domains_regression_2933() {
     );
 }
 
-/// Regression test for #1817: ensure GPU BaB (DomainList) and CPU BaB (sequential)
+/// Regression test: ensure GPU BaB (DomainList) and CPU BaB (sequential)
 /// produce consistent verification outcomes on a network where both paths converge.
 ///
 /// Uses a simple 2-hidden-layer network with a loose threshold that both paths can

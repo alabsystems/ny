@@ -3,11 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Regressions for graph input-split unsplittable-domain guards.
-//! Part of #2660.
 //!
-//! NaN handling divergence tests added for #1860 (R1/1776 finding):
-//! Graph input_split hard-errors on non-finite CROWN output, unlike the GPU
-//! path which gracefully degrades to Unknown.
+//! NaN handling divergence tests (R1/1776 finding): graph input_split once
+//! hard-errored on non-finite CROWN output, unlike the GPU path which
+//! gracefully degraded to Unknown. Both paths now degrade gracefully.
 
 use super::prelude::*;
 
@@ -217,7 +216,7 @@ fn test_multi_objective_graph_input_split_margin_weight_changes_split_1074() {
 }
 
 // ---------------------------------------------------------------------------
-// NaN handling regression: #1860 (R1/1776 finding)
+// NaN handling regression (R1/1776 finding)
 // ---------------------------------------------------------------------------
 //
 // Original divergence (R1/1776): The graph path hard-errored on non-finite
@@ -232,7 +231,7 @@ fn test_multi_objective_graph_input_split_margin_weight_changes_split_1074() {
 ///
 /// **Current behavior**: Returns `Ok(Unknown { ... })` — graceful degradation
 /// matching the GPU path. The BaB loop exhausts the domain limit without
-/// verifying any domains. The original #1860 divergence (graph hard-errored
+/// verifying any domains. The original divergence (graph hard-errored
 /// while GPU degraded) has been resolved.
 fn extreme_weight_overflow_graph() -> GraphNetwork {
     // Two linear layers with weights near f32 overflow: 1e20 × 1e20 = 1e40 > f32::MAX.
@@ -261,9 +260,9 @@ fn extreme_weight_overflow_graph() -> GraphNetwork {
 #[ntest::timeout(10000)]
 #[test]
 fn test_graph_input_split_extreme_weights_degrades_gracefully_1860() {
-    // Regression test for #1860: extreme weights that overflow f32 during
+    // Regression test: extreme weights that overflow f32 during
     // IBP propagation. The graph path now gracefully degrades to Unknown
-    // (matching GPU path behavior), resolving the original #1860 divergence
+    // (matching GPU path behavior), resolving the original divergence
     // where graph hard-errored while GPU returned Unknown.
     let graph = extreme_weight_overflow_graph();
     let input = BoundedTensor::new(
@@ -276,7 +275,7 @@ fn test_graph_input_split_extreme_weights_degrades_gracefully_1860() {
     let result = verifier.verify_graph_input_split(&graph, &input, &[1.0], 0.0);
 
     // Current behavior: graph path gracefully degrades to Unknown (matching GPU path).
-    // The original #1860 divergence was that graph hard-errored while GPU returned Unknown.
+    // The original divergence was that graph hard-errored while GPU returned Unknown.
     // That divergence has been resolved — the graph path now also degrades gracefully.
     let bab_result = result
         .expect("graph input_split should gracefully degrade on extreme weights, not hard-error");
@@ -363,7 +362,7 @@ fn test_graph_input_split_near_overflow_does_not_panic_1860() {
 }
 
 // ---------------------------------------------------------------------------
-// NaN threshold guard regression: #3646 (P1/1262 finding)
+// NaN threshold guard regression (P1/1262 finding)
 // ---------------------------------------------------------------------------
 //
 // The multi-objective path lacked NaN/Inf threshold guards that the
@@ -372,7 +371,7 @@ fn test_graph_input_split_near_overflow_does_not_panic_1860() {
 // to exhaustion without concluding.
 
 /// Multi-objective with NaN threshold must return NumericalInstability error,
-/// not silently run BaB to exhaustion. Part of #3646.
+/// not silently run BaB to exhaustion.
 #[ntest::timeout(10000)]
 #[test]
 fn test_multi_objective_nan_threshold_returns_error_3646() {
@@ -409,7 +408,6 @@ fn test_multi_objective_nan_threshold_returns_error_3646() {
 }
 
 /// Multi-objective with +Inf threshold must also return NumericalInstability.
-/// Part of #3646.
 #[ntest::timeout(10000)]
 #[test]
 fn test_multi_objective_inf_threshold_returns_error_3646() {
@@ -446,7 +444,7 @@ fn test_multi_objective_inf_threshold_returns_error_3646() {
 }
 
 /// Multi-objective with one finite and one NaN threshold: the NaN threshold
-/// should be caught even when mixed with valid thresholds. Part of #3646.
+/// should be caught even when mixed with valid thresholds.
 #[ntest::timeout(10000)]
 #[test]
 fn test_multi_objective_mixed_nan_threshold_returns_error_3646() {
@@ -488,10 +486,10 @@ fn test_multi_objective_mixed_nan_threshold_returns_error_3646() {
 }
 
 // ---------------------------------------------------------------------------
-// reorder_bab=true parity test: #3870
+// reorder_bab=true parity test
 // ---------------------------------------------------------------------------
 //
-// W2 implemented reorder_bab in commit e670585b4 (#3870). The feature defers
+// W2 implemented reorder_bab in commit e670585b4. The feature defers
 // CROWN bounding to domain pop time, using parent bounds as priority estimates.
 // P1 verified reorder_bab=false is unchanged via static analysis (commit 7bee17ac5),
 // but no unit test exercises the reorder_bab=true code path.
@@ -706,7 +704,7 @@ fn test_reorder_bab_identity_graph_verifies_at_root_3870() {
 }
 
 // ---------------------------------------------------------------------------
-// adv_check PGD probe during BaB: #3870
+// adv_check PGD probe during BaB
 // ---------------------------------------------------------------------------
 //
 // adv_check runs a lightweight PGD probe on the current domain during BaB

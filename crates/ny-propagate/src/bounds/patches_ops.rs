@@ -5,9 +5,6 @@
 //! Operations on Patches-mode tensors for CNN-optimized CROWN backward.
 //!
 //! Shared helpers for AvgPool and MaxPool PatchesPropagation.
-//!
-//! Reference: designs/2026-03-01-patches-phase3-pooling-termination.md
-//! Part of #2613
 
 use ndarray::{ArrayD, IxDyn};
 use ny_core::{NyError, Result};
@@ -33,8 +30,6 @@ use ny_core::{NyError, Result};
 /// sparse layout must keep failing HERE, early, so pooling
 /// PatchesPropagation rejects it cleanly instead of panicking (caller falls
 /// back to the sound dense path). No bound math changes.
-///
-/// Reference: designs/2026-03-01-patches-phase3-pooling-termination.md Section 1
 pub(crate) fn nearest_neighbor_upsample_last2(
     patches: &ArrayD<f32>,
     scale_h: usize,

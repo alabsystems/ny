@@ -33,6 +33,5 @@ pub enum BranchingHeuristic {
     InputSplit,
     /// GenBaB: branch-and-bound for general nonlinearities (GeLU, Sigmoid, Tanh, etc.).
     /// Uses BBPS heuristic with uniform or optimized branching points.
-    /// See `designs/2026-01-28-genbab-branching.md` for details.
     GenBaB(crate::beta_crown::nonlinear_branching::NonlinearBranchingConfig),
 }

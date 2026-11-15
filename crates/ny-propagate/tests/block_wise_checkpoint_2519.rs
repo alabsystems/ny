@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for block-wise checkpoint resume and callback paths (#2519).
+//! Tests for block-wise checkpoint resume and callback paths.
 //!
 //! Covers:
 //! - Resume-from-checkpoint skipping completed blocks (block_wise.rs:141-151)
@@ -35,7 +35,7 @@ fn make_two_block_graph() -> GraphNetwork {
     graph
 }
 
-/// #2519: Resume-from-checkpoint skips already-completed blocks.
+/// Resume-from-checkpoint skips already-completed blocks.
 ///
 /// Verifies the code path at block_wise.rs:141-151 where `resume_from`
 /// populates `(blocks, max_sensitivity, degraded_blocks, skip_blocks)`.
@@ -114,7 +114,7 @@ fn test_block_wise_resume_from_checkpoint_skips_completed_blocks_2519() {
     );
 }
 
-/// #2519: Checkpoint callback is invoked with correct BlockBoundsInfo and elapsed_ms.
+/// Checkpoint callback is invoked with correct BlockBoundsInfo and elapsed_ms.
 ///
 /// Verifies the code path at block_wise.rs:246-249 where the checkpoint_callback
 /// receives (block_info, elapsed_ms, total_blocks) after each block.

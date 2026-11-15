@@ -4,7 +4,7 @@
 
 //! Comparison utilities for NaN-safe sorting.
 //!
-//! # Problem (#2981 Slice 3)
+//! # Problem
 //!
 //! 16+ sorting sites used `partial_cmp(...).unwrap_or(Ordering::Equal)`,
 //! which treats NaN as equal to any value. In BaB branching, this corrupts
@@ -15,7 +15,7 @@
 //!
 //! - [`nan_propagating_cmp`] — ascending sort / `min_by` with NaN last.
 //! - [`nan_least_cmp`] — `max_by` with NaN deprioritized (NaN < everything).
-//! - [`nan_last_descending_cmp`] — descending sort with NaN last (#2995).
+//! - [`nan_last_descending_cmp`] — descending sort with NaN last.
 //!
 //! Together these ensure NaN-scored items are deprioritized regardless of
 //! sort direction or selection method. Do NOT reverse arguments to
@@ -40,8 +40,6 @@ use std::cmp::Ordering;
 /// - `finite.cmp(NaN)` → Less (finite before NaN)
 /// - `NaN.cmp(finite)` → Greater (NaN after finite)
 /// - `NaN.cmp(NaN)` → Equal
-///
-/// Source: `designs/2026-02-25-error-swallowing-classification.md` Slice 3
 pub(crate) fn nan_propagating_cmp(a: &f32, b: &f32) -> Ordering {
     a.partial_cmp(b).unwrap_or_else(|| {
         // At least one is NaN — NaN sorts last
@@ -81,7 +79,7 @@ pub(crate) fn nan_least_cmp(a: &f32, b: &f32) -> Ordering {
 /// reversing `nan_propagating_cmp` which places NaN first.
 ///
 /// Uses `f32::total_cmp` for the non-NaN branch to avoid any
-/// `partial_cmp().unwrap_or(Equal)` pattern (#2588).
+/// `partial_cmp().unwrap_or(Equal)` pattern.
 pub(crate) fn nan_last_descending_cmp(a: &f32, b: &f32) -> Ordering {
     match (a.is_nan(), b.is_nan()) {
         (true, true) => Ordering::Equal,
@@ -162,8 +160,8 @@ mod tests {
         assert!(values[4].is_nan());
     }
 
-    /// Acceptance criterion for #2588: BaBSR-style scored tuples with NaN scores
-    /// produce deterministic sort order where NaN-scored neurons sort to the end.
+    /// BaBSR-style scored tuples with NaN scores produce deterministic sort order
+    /// where NaN-scored neurons sort to the end.
     #[test]
     fn test_babsr_scored_tuples_nan_sorts_last_descending() {
         // Simulate BaBSR scored tuples: (layer_idx, neuron_idx, score)
@@ -186,8 +184,8 @@ mod tests {
         assert!(scored[4].2.is_nan());
     }
 
-    /// Acceptance criterion for #2588: ascending sort with NaN intercept scores
-    /// places NaN at the end so k-smallest selection picks valid neurons.
+    /// Ascending sort with NaN intercept scores places NaN at the end so
+    /// k-smallest selection picks valid neurons.
     #[test]
     fn test_intercept_scored_tuples_nan_sorts_last_ascending() {
         // Simulate intercept-only scores: (layer_idx, neuron_idx, score)
@@ -206,8 +204,8 @@ mod tests {
         assert!(scored[3].2.is_nan());
     }
 
-    /// Acceptance criterion for #2588: BaBSR max-finding with NaN in first
-    /// candidate must still select a valid neuron (not stick on NaN).
+    /// BaBSR max-finding with NaN in first candidate must still select a valid
+    /// neuron (not stick on NaN).
     #[test]
     fn test_max_finding_nan_first_candidate_selects_valid() {
         // Simulate the max-finding loop pattern from select_babsr_neuron

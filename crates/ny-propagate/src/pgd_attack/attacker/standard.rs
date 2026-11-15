@@ -31,20 +31,23 @@ impl PgdAttacker<'_> {
         verify_upper_bound: bool,
         seed: u64,
     ) -> Result<RestartResult> {
+        self.checkpoint("before single restart preparation")?;
         let mut rng = StdRng::seed_from_u64(seed);
-        let mut x = self.initialize_restart(network, input_bounds, &mut rng)?;
+        let mut x = self.initialize_restart_for_seed(network, input_bounds, &mut rng, seed)?;
         let mut evals = 0;
         let mut consecutive_nan_skips: u32 = 0;
         // Maximum consecutive NaN gradient steps before aborting a restart.
         // If the network consistently produces NaN gradients from a given
-        // starting point, continuing wastes the entire step budget. (#2968)
+        // starting point, continuing wastes the entire step budget.
         const MAX_CONSECUTIVE_NAN_SKIPS: u32 = 5;
 
-        // Create step state for this restart (#4277: AdamClipping optimizer).
+        // Create step state for this restart (AdamClipping optimizer).
+        self.checkpoint("before single optimizer allocation")?;
         let mut step_state = self.config.create_step_state(input_bounds);
 
         // Run gradient descent steps
         for _step in 0..self.config.num_steps {
+            self.checkpoint("before single gradient step")?;
             let (gradient, step_evals) = self.estimate_gradient_spsa_with_bounds(
                 network,
                 &x,
@@ -54,7 +57,7 @@ impl PgdAttacker<'_> {
             )?;
             evals += step_evals;
 
-            // NaN guard (#2721): If the network forward pass produces NaN
+            // NaN guard: If the network forward pass produces NaN
             // (e.g., Exp overflow, unstable LayerNorm), the SPSA gradient
             // estimate becomes NaN. Applying a NaN gradient corrupts x,
             // which then panics in BoundedTensor::concrete on the next
@@ -73,14 +76,15 @@ impl PgdAttacker<'_> {
             }
             consecutive_nan_skips = 0;
 
-            // Apply the step using the configured optimizer (#4277).
+            // Apply the step using the configured optimizer.
             // Reference: alpha-beta-CROWN attack_pgd.py:342-350
+            self.checkpoint("before single optimizer update")?;
             let projected = step_state.step(&gradient, &x, input_bounds, verify_upper_bound);
 
-            // Restart-when-stuck (#4278): if the projected step is a no-op,
+            // Restart-when-stuck: if the projected step is a no-op,
             // resample a fresh point instead of wasting remaining steps.
             if self.config.restart_when_stuck && restart::projected_step_is_stuck(&x, &projected) {
-                x = restart::resample_uniform_point(self, input_bounds, &mut rng);
+                x = self.sample_uniform_until(input_bounds, &mut rng)?;
                 step_state.reset();
                 trace!("PGD: projected step is stuck, resampled restart point");
                 continue;
@@ -89,6 +93,7 @@ impl PgdAttacker<'_> {
         }
 
         // Evaluate final point
+        self.checkpoint("before final single evaluation")?;
         let output = self.evaluate(network, &x)?;
         evals += 1;
         let value = output_value(&output, output_idx)?;
@@ -126,9 +131,10 @@ impl PgdAttacker<'_> {
         };
         let mut total_evaluations = 0;
         let mut failed_restarts = 0usize;
+        let mut expiry_error = None;
 
         for restart in 0..self.config.num_restarts {
-            // Deadline check (#3109): bail early if verification timeout budget
+            // Deadline check: bail early if verification timeout budget
             // is exhausted. Return best counterexample found so far.
             if self.past_deadline() {
                 info!(
@@ -148,6 +154,10 @@ impl PgdAttacker<'_> {
                 seed,
             ) {
                 Ok(r) => r,
+                Err(e) if Self::has_deadline_source(&e) => {
+                    expiry_error = Some(e);
+                    break;
+                }
                 Err(e) => {
                     failed_restarts += 1;
                     debug!("PGD restart {} failed: {}", restart, e);
@@ -198,8 +208,15 @@ impl PgdAttacker<'_> {
             );
         }
 
+        // Preserve any completed incumbent; expiry cannot supply a new point.
+        if best_counterexample.is_none() {
+            if let Some(error) = expiry_error {
+                return Err(error);
+            }
+        }
+
         // All restarts failed — surface as error so callers don't interpret
-        // empty results as "no counterexample found" (#3096).
+        // empty results as "no counterexample found".
         if best_counterexample.is_none() && failed_restarts > 0 {
             return Err(NyError::InternalError(format!(
                 "PGD attack: all {} restarts failed ({} errors). \
@@ -235,6 +252,7 @@ impl PgdAttacker<'_> {
     ) -> Result<PgdResult> {
         let found = AtomicBool::new(false);
         let error_count = AtomicUsize::new(0);
+        let expiry_error = std::sync::Mutex::new(None);
 
         // Run restarts in parallel, with early termination when counterexample found
         let results: Vec<_> = (0..self.config.num_restarts)
@@ -245,7 +263,7 @@ impl PgdAttacker<'_> {
                     return None;
                 }
 
-                // Deadline check (#3109): skip remaining restarts if deadline exceeded.
+                // Deadline check: skip remaining restarts if deadline exceeded.
                 if self.past_deadline() {
                     return None;
                 }
@@ -266,6 +284,12 @@ impl PgdAttacker<'_> {
                         }
                         Some((restart, result))
                     }
+                    Err(e) if Self::has_deadline_source(&e) => {
+                        if let Ok(mut first) = expiry_error.lock() {
+                            first.get_or_insert(e);
+                        }
+                        None
+                    }
                     Err(e) => {
                         error_count.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!("PGD restart {} failed: {}", restart, e);
@@ -277,8 +301,16 @@ impl PgdAttacker<'_> {
 
         // If all restarts errored and none succeeded, surface the error instead
         // of returning "no counterexample found" which callers may interpret as
-        // verification passing. (#2981 Slice 1: PGD false-verified fix)
+        // verification passing.
         let num_errors = error_count.load(Ordering::Relaxed);
+        if results.is_empty() {
+            if let Some(error) = expiry_error
+                .into_inner()
+                .map_err(|_| NyError::InternalError("PGD expiry-result mutex poisoned".into()))?
+            {
+                return Err(error);
+            }
+        }
         if results.is_empty() && num_errors > 0 {
             return Err(NyError::InternalError(format!(
                 "PGD attack: all {} restarts failed ({} errors). \

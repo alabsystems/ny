@@ -86,7 +86,9 @@ pub(super) fn try_cell_enumeration(
     vnnlib: &VnnLibSpec,
     deadline: Option<Instant>,
 ) -> Option<BetaCrownResult> {
-    if std::env::var_os("NY_NO_CELL_ENUM").is_some_and(|v| v == "1") {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Exact);
+    if crate::preset_gates::no_cell_enum() {
         return None;
     }
     let BetaCrownModel::Graph(graph) = model_net else {
@@ -202,6 +204,51 @@ pub(super) fn try_cell_enumeration(
         time_elapsed: elapsed,
         output_bounds: None,
     })
+}
+
+/// Sound f64 decision for ONE fully pinned input point (#cctsdb-subbox).
+///
+/// The sub-box driver re-applies a patch mask as a change to the spec's
+/// DECLARED point bounds, which leaves every input coordinate a point — there
+/// is no lattice left to enumerate, so [`try_cell_enumeration`] does not
+/// apply. What is still wanted is exactly this driver's per-cell step: the
+/// sound f64 interval forward plus the SAME safety predicate, so the two paths
+/// cannot drift apart on what "definitely safe" means.
+///
+/// `Some(true)`  every output box is definitely safe;
+/// `Some(false)` the enclosure does not establish safety (it may be a genuine
+///               violation or merely loose — the caller must not read it as
+///               either);
+/// `None`        the forward refused, so nothing is established.
+///
+/// Honours `NY_NO_CELL_ENUM=1` for the same reason [`try_cell_enumeration`]
+/// does: one switch turns the whole cell-evaluation authority off.
+pub(super) fn f64_point_definitely_safe(
+    graph: &GraphNetwork,
+    input_shape: &[usize],
+    values: &[f64],
+    vnnlib: &VnnLibSpec,
+) -> Option<bool> {
+    if crate::preset_gates::no_cell_enum() {
+        return None;
+    }
+    if values.len() != input_shape.iter().product::<usize>() {
+        return None;
+    }
+    let arr = ArrayD::from_shape_vec(IxDyn(input_shape), values.to_vec()).ok()?;
+    let out = match graph.propagate_ibp_f64_cell(&Interval64::point(arr)) {
+        Ok(out) => out,
+        Err(e) => {
+            debug!("f64 point eval undecided: {e}");
+            return None;
+        }
+    };
+    let lower: Vec<f64> = out.lower.iter().copied().collect();
+    let upper: Vec<f64> = out.upper.iter().copied().collect();
+    if lower.len() != vnnlib.num_outputs {
+        return None;
+    }
+    Some(box_definitely_safe(&lower, &upper, vnnlib))
 }
 
 /// Everything needed to run the enumeration.

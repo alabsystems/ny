@@ -132,7 +132,7 @@ impl BoundPropagation for MulConstantLayer {
 
             if c_val == 0.0 {
                 // Zero constant: x * 0 = 0 for all x.
-                // Avoids Inf * 0.0 = NaN for upstream Inf bounds (#3273, #3034).
+                // Avoids Inf * 0.0 = NaN for upstream Inf bounds.
                 out_lower[idx.clone()] = 0.0;
                 out_upper[idx] = 0.0;
             } else if c_val > 0.0 {
@@ -149,7 +149,7 @@ impl BoundPropagation for MulConstantLayer {
             }
         }
 
-        // Centralized NaN/Inf repair at constructor (#3423, replaces ad-hoc #3273/#2549).
+        // Centralized NaN/Inf repair at constructor (replaces ad-hoc per-site repair).
         BoundedTensor::new_repaired(out_lower, out_upper, RepairStrategy::Conservative)
     }
 
@@ -200,7 +200,6 @@ impl MulConstantLayer {
         // No swap for c < 0: CROWN backward composes by substitution, not IBP.
         // Negative c just flips coefficient sign; downstream nonlinear relaxations
         // already branch on coefficient sign (see crown_elementwise_backward).
-        // Reference: designs/2026-01-29-crown-affine-negative-scale.md
         let mut lower_a = bounds.lower_a().clone();
         let mut upper_a = bounds.upper_a().clone();
 
@@ -224,7 +223,7 @@ impl MulConstantLayer {
             if c_j == 0.0 {
                 // Zero column: set coefficients to zero directly. Both the fresh
                 // product error (0) and the propagated error (|c_j|·e_in = 0) vanish.
-                // Avoids Inf * 0.0 = NaN for upstream Inf coefficients (#3034).
+                // Avoids Inf * 0.0 = NaN for upstream Inf coefficients.
                 for i in 0..bounds.num_outputs() {
                     lower_a[[i, j]] = 0.0;
                     upper_a[[i, j]] = 0.0;
@@ -389,7 +388,6 @@ impl MulConstantLayer {
     /// A @ (x * c) + b = (A * c) @ x + b (scaling coefficients)
     ///
     /// No swap for c < 0: CROWN composes by substitution (not IBP).
-    /// Reference: designs/2026-01-29-crown-affine-negative-scale.md
     #[inline]
     pub fn propagate_linear_batched(
         &self,
@@ -404,7 +402,7 @@ impl MulConstantLayer {
             debug!("MulConstant batched CROWN: scalar c = {}", c_val);
 
             // Short-circuit when c == 0: all coefficients become zero, bias unchanged.
-            // Avoids Inf * 0.0 = NaN for upstream Inf coefficients (#3034).
+            // Avoids Inf * 0.0 = NaN for upstream Inf coefficients.
             if c_val == 0.0 {
                 return BatchedLinearBounds::new_or_conservative(
                     ArrayD::zeros(bounds.lower_a.raw_dim()),

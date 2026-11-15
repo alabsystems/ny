@@ -304,7 +304,7 @@ fn test_to_graph_network_skipped_identities_map_outputs_to_input() {
     );
 }
 
-/// Regression test for #3186: binary op with one constant-tensor input
+/// Regression test: binary op with one constant-tensor input
 /// (produced by a chain the pre-evaluator can't handle) and one activation
 /// input should load and produce a graph network, not error.
 #[ntest::timeout(10000)]

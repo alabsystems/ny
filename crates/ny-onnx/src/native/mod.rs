@@ -21,6 +21,7 @@
 
 mod builders;
 mod config;
+pub mod decoder_contract;
 mod detect;
 mod helpers;
 mod hf_config;

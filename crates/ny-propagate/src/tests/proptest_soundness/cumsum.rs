@@ -10,7 +10,6 @@
 //! - CROWN backward with identity incoming should match IBP exactly
 //!
 //! Tests cover all 4 variants: {forward, reverse} × {inclusive, exclusive}.
-//! Part of #3919.
 
 use crate::layers::common::BoundPropagation;
 use crate::layers::{CumsumLayer, Layer};

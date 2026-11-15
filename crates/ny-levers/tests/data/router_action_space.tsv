@@ -1,0 +1,37 @@
+# ROUTER ACTION SPACE (#router-r1, ROUTER_PROGRAM §5.4) — the only typed keys a router- or
+# optimizer-EMITTED value may ever name.
+#
+# Columns:  preset-key <TAB> NY_* lever <TAB> registry class <TAB> declaration moat risk
+#
+# DERIVED, never written by hand: every `space::axes()` entry with `Deliver::PresetKey`, class
+# not Unsafe, whose declaration's moat is None or Low, minus `router_action_space::DENY_KEYS`
+# and `DENY_PATTERNS`. `tests/router_action_space_ratchet.rs` compares this file with the
+# derivation and fails on ANY delta in either direction, printing the complete derived body.
+#
+# REGENERATE ONLY FROM THAT TEST'S OWN FAILURE OUTPUT: copy the printed rows below this header.
+# An out-of-band parse of space.rs is a second implementation (the preset_arrival_ratchet trap).
+#
+# R1 emits NOTHING (Plan::emitted is always empty); this file is the fence R6's values must
+# stay inside. The body is EMPTY in the R1 commit because the builder could not run cargo: the
+# integrator regenerates it from the first failing run of router_action_space_matches_manifest.
+attack.bnn_sign_space_minimal_move	NY_BNN_SIGN_SPACE_MINIMAL_MOVE	safe-to-search	low
+attack.bnn_sign_space_trust_region	NY_BNN_SIGN_SPACE_TRUST_REGION	safe-to-search	low
+attack.falsify_portfolio_secs	NY_FALSIFY_PORTFOLIO_SECONDS	verdict-affecting	low
+attack.flat_surrogate_max_blocks	NY_FLAT_SURROGATE_MAX_BLOCKS	verdict-affecting	low
+attack.flat_surrogate_transfer	NY_FLAT_SURROGATE_TRANSFER	verdict-affecting	low
+bab.conv_ibp_blocked	NY_CONV_IBP_BLOCKED	safe-to-search	none
+bab.kfsb_sim_share	NY_KFSB_SIM_SHARE	verdict-affecting	low
+bab.mip.escalation_skips_certified_clauses	NY_MIP_ESCALATE_SKIP_CERTIFIED	verdict-affecting	low
+bab.mip.leaf_undecided_streak_cap	NY_MIP_LEAF_UNDECIDED_STREAK_CAP	verdict-affecting	low
+bab.pollable_faer	NY_POLLABLE_FAER	safe-to-search	low
+margin_row.branch_reduce_max	NY_MARGIN_ROW_BRANCH_REDUCE_MAX	verdict-affecting	low
+margin_row.clip_rows	NY_MARGIN_ROW_CLIP_ROWS	safe-to-search	low
+margin_row.concurrent	NY_MARGIN_ROW_CONCURRENT	verdict-affecting	low
+margin_row.epoch_retain	NY_EPOCH_RETAIN	safe-to-search	low
+margin_row.epoch_tier0	NY_EPOCH_TIER0	safe-to-search	low
+margin_row.epoch_universe	NY_EPOCH_UNIVERSE	safe-to-search	low
+margin_row.k_head	NY_MARGIN_ROW_K_HEAD	verdict-affecting	low
+margin_row.k_trunk	NY_MARGIN_ROW_K_TRUNK	verdict-affecting	low
+margin_row.lru	NY_MARGIN_ROW_LRU	safe-to-search	low
+margin_row.parallel	NY_MARGIN_ROW_PARALLEL	safe-to-search	low
+margin_row.parallel_prebuild	NY_MARGIN_ROW_PARALLEL_PREBUILD	safe-to-search	low

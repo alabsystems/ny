@@ -93,8 +93,8 @@ pub const PROD_UNDERFLOW_FLOOR_F32: f32 = f32::MIN_POSITIVE; // 2^-126
 /// If `e_a + e_b ≤ −104` then `|a·b| < 4·2^-104 = 2^-102`, so requiring
 /// `|p| ≥ 2^-101` implies the theorem's hypothesis with a full binade to spare.
 /// In the band `|p| ∈ [2^-126, 2^-101)` the residual is itself rounded (often
-/// all the way to `0`) — using `f32::MIN_POSITIVE` as the guard, as this module
-/// did before 2026-08-02, therefore published a radius that does NOT enclose.
+/// all the way to `0`) — using `f32::MIN_POSITIVE` as the guard would therefore
+/// publish a radius that does NOT enclose.
 /// Minimal witness (from the exact-rational oracle in
 /// `tests/eft_certified_error_exact_rational_oracle.rs`): `a = 1 + 2^-23`,
 /// `b = 2^-126·(1 + 2^-23)` gives `e = 0` and `err = 0` while the exact product
@@ -199,8 +199,8 @@ pub fn eft_dot_f32(a: &[f32], b: &[f32]) -> Option<EftDot> {
         //
         // The guard is [`TWO_PROD_EXACT_FLOOR_F32`] (2^-101), NOT the charged
         // floor 2^-126: in the band between them the residual is itself
-        // rounded and the published radius did not enclose (fixed 2026-08-02;
-        // witness pinned in the exact-rational oracle test).
+        // rounded and the published radius would not enclose (witness pinned
+        // in the exact-rational oracle test).
         if x != 0.0 && y != 0.0 && p.abs() < TWO_PROD_EXACT_FLOOR_F32 {
             resid = add_nonnegative_f64_up(resid, PROD_UNDERFLOW_FLOOR_F32 as f64);
         } else {
@@ -279,11 +279,10 @@ fn publish_err_up_f32(term: f64) -> Option<f32> {
 /// underflow. Under gradual underflow each of the `≤ 2n` roundings contributes
 /// an ABSOLUTE `|η| ≤ 2^-150` that no relative multiple of a subnormal-scale
 /// `Σ|ab|` can cover, so the bare relative form is NOT enclosing there — caught
-/// by the exact-rational oracle (`higham_arm_encloses_under_underflow`, which
-/// was a *characterization of the defect* before this floor landed on
-/// 2026-08-02 and is its regression gate now). This matters
-/// for [`combine_downgrade_only`], which preferentially publishes the SMALLER of
-/// the two arms and would therefore publish the broken one.
+/// by the exact-rational oracle (`higham_arm_encloses_under_underflow`, now this
+/// floor's regression gate). This matters for [`combine_downgrade_only`], which
+/// preferentially publishes the SMALLER of the two arms and would therefore
+/// publish the broken one.
 ///
 /// The charge is `4n·2^-149`: `2n` roundings (n products, n accumulating adds),
 /// each `≤ 2^-150 = ½·2^-149`, times the `1/(1 − γ) ≤ 2` amplification the

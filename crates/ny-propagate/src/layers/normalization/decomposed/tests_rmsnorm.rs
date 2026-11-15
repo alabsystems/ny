@@ -6,8 +6,6 @@
 //!
 //! Verifies `decomposed_rms_norm_crown_backward` from `rmsnorm.rs` produces
 //! sound linear bounds that always contain the true RmsNorm output.
-//!
-//! Part of #4209.
 
 use super::rmsnorm::decomposed_rms_norm_crown_backward;
 use super::tests_support::{constant_batched_bounds, interpolate};
@@ -123,7 +121,7 @@ fn test_rmsnorm_soundness_at_corners() -> Result<()> {
             let true_output = true_rmsnorm(&x, ny_slice, eps);
             let point = BoundedTensor::new(
                 Array1::from_vec(x.clone()).into_dyn(),
-                Array1::from_vec(x.clone()).into_dyn(),
+                Array1::from_vec(x).into_dyn(),
             )?;
             let result_ibp = bounds.concretize_sound(&point)?;
 

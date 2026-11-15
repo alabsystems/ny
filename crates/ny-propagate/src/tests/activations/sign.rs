@@ -24,7 +24,7 @@ fn test_sign_crown_constant_bounds() {
 
     // CROWN for Sign: slopes are 0 everywhere except for boundary cases
     // [0, u] and [l, 0] which have non-zero slopes on the diagonal.
-    // Reference: sign_crown_relaxation in piecewise_constant.rs, Part of #3769.
+    // Reference: sign_crown_relaxation in piecewise_constant.rs,
     //
     // Test elements:
     //   0: [1.0, 2.0] → positive → slopes 0

@@ -235,7 +235,7 @@ impl MidpointAffine {
             }
             // Midpoint affine, and the half-gap affine whose maximum over the
             // box is the residual radius.
-            let mut mid_value = 0.5 * (bl + bu);
+            let mut mid_value = f64::midpoint(bl, bu);
             let mut mid_dev = 0.0f64;
             let mut gap_value = 0.5 * (bu - bl);
             let mut gap_dev = 0.0f64;
@@ -245,7 +245,7 @@ impl MidpointAffine {
                 if !al.is_finite() || !au.is_finite() {
                     return None;
                 }
-                let m = 0.5 * (al + au);
+                let m = f64::midpoint(al, au);
                 let g = 0.5 * (au - al);
                 coeff[i * cols + j] = m;
                 mid_value += m * mid[j];
@@ -253,7 +253,7 @@ impl MidpointAffine {
                 gap_value += g * mid[j];
                 gap_dev += g.abs() * half[j];
             }
-            offset[i] = 0.5 * (bl + bu);
+            offset[i] = f64::midpoint(bl, bu);
             magnitude[i] = mid_value.abs() + mid_dev;
             radius[i] = (gap_value + gap_dev).max(0.0);
             if !magnitude[i].is_finite() || !radius[i].is_finite() {
@@ -398,7 +398,7 @@ fn joint_sum_bound(
             let bij = b.coeff[i * d + j];
             g[j] += a.offset[i] * bij + b.offset[i] * aij;
             for l in 0..d {
-                h[j * d + l] += 0.5 * (aij * b.coeff[i * d + l] + bij * a.coeff[i * d + l]);
+                h[j * d + l] += f64::midpoint(aij * b.coeff[i * d + l], bij * a.coeff[i * d + l]);
             }
         }
     }
@@ -563,7 +563,7 @@ pub(crate) fn joint_bilinear_spec_bounds(
         if !low.is_finite() || !high.is_finite() || low > high {
             return Ok(None);
         }
-        mid[index] = 0.5 * (low + high);
+        mid[index] = f64::midpoint(low, high);
         half[index] = 0.5 * (high - low);
     }
 

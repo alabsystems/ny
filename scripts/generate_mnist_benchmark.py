@@ -41,7 +41,7 @@ def create_mnist_mlp():
     # Use fixed seed for reproducibility
     np.random.seed(42)
 
-    # Initialize weights (Xavier-like). np.float32() prevents type promotion (#2179).
+    # Initialize weights (Xavier-like). np.float32() prevents type promotion.
     w1 = np.random.randn(50, 784).astype(np.float32) * np.float32(np.sqrt(2.0 / 784))
     b1 = np.zeros(50, dtype=np.float32)
 

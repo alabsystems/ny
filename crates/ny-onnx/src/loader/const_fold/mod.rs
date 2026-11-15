@@ -91,16 +91,69 @@ fn graph_model_is_unbatched(graph: &onnx_proto::GraphProto, weights: &WeightStor
     saw_real_input
 }
 
+thread_local! {
+    /// #lsnc-lane: set only while a [`LanePrivateIntervalScope`] is alive on
+    /// THIS thread. See that type.
+    static LANE_PRIVATE_INTERVAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// #lsnc-lane — the ONE place the interval fallback runs without the global
+/// lever: a load performed while this guard is alive, on this thread.
+///
+/// The owner decision (2026-09-24) is a LANE-PRIVATE enclosure of the
+/// constant-only `MatMul` cones for the `#lowdim-prover` lane. The only caller
+/// is `crate::lowdim_twin::build_lane_twin`, which loads a SECOND copy of the
+/// model under this guard and moves the resulting graph straight into
+/// `ny_propagate::lowdim::LaneTwin` — a type whose graph no bound path other
+/// than the lowdim lane can reach, and whose lowering discharges every radius
+/// itself. The global carrier is untouched: [`interval_carrier_armed`] still
+/// reads only `NY_CONST_MATMUL_INTERVAL` (dark, EnvOnly), the typed preset
+/// still cannot arm it (`the_typed_preset_cannot_arm_the_carrier`), and every
+/// load outside the guard — the real graph every other lane bounds on
+/// included — creates no interval constant.
+///
+/// Thread-scoped and `!Send`, so a concurrent load on another thread never
+/// sees it, and restored on drop (panic included), so it cannot outlive the
+/// one load it was taken for.
+pub(crate) struct LanePrivateIntervalScope {
+    previous: bool,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl LanePrivateIntervalScope {
+    /// Enable the interval fallback for loads on this thread until drop.
+    pub(crate) fn enter() -> Self {
+        let previous = LANE_PRIVATE_INTERVAL.with(|cell| cell.replace(true));
+        Self {
+            previous,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for LanePrivateIntervalScope {
+    fn drop(&mut self) {
+        let previous = self.previous;
+        LANE_PRIVATE_INTERVAL.with(|cell| cell.set(previous));
+    }
+}
+
+fn lane_private_interval_active() -> bool {
+    LANE_PRIVATE_INTERVAL.with(std::cell::Cell::get)
+}
+
 pub(super) fn fold_constant_nodes(
     graph: &onnx_proto::GraphProto,
     weights: &mut WeightStore,
     inferred_shapes: &mut HashMap<String, Vec<i64>>,
+    qdq_activation_relaxation: bool,
 ) {
     let model_unbatched = graph_model_is_unbatched(graph, weights);
     // Read ONCE, before any fold is attempted. Disarmed, `fold_constant_nodes_once`
     // never enters the interval fallback at all, so no carrier is allocated and the
-    // weight store's interval map stays empty.
-    let interval_carrier = interval_carrier_armed();
+    // weight store's interval map stays empty. #lsnc-lane: the lane-private
+    // twin load (and only it) enters the fallback under its thread-scoped guard.
+    let interval_carrier = interval_carrier_armed() || lane_private_interval_active();
     // Variable-start affine Slice extents are intentionally not promoted to
     // static shapes here. ONNX clamps starts/ends to the data dimension, so
     // `ends = starts + width` does not imply a constant runtime extent near an
@@ -113,6 +166,7 @@ pub(super) fn fold_constant_nodes(
         inferred_shapes,
         model_unbatched,
         interval_carrier,
+        qdq_activation_relaxation,
     );
 }
 
@@ -228,15 +282,21 @@ fn fold_constant_nodes_once(
     inferred_shapes: &HashMap<String, Vec<i64>>,
     model_unbatched: bool,
     interval_carrier: bool,
+    qdq_activation_relaxation: bool,
 ) {
     let lookups = ConstFoldLookups::new(graph, inferred_shapes, model_unbatched);
     let mut changed = true;
     while changed {
         changed = false;
         for node in &graph.node {
-            if let Some((output_name, output_tensor)) =
-                try_fold_node(node, graph, &lookups, weights, model_unbatched)
-            {
+            if let Some((output_name, output_tensor)) = try_fold_node(
+                node,
+                graph,
+                &lookups,
+                weights,
+                model_unbatched,
+                qdq_activation_relaxation,
+            ) {
                 debug!(
                     "Constant folded {}: {} shape {:?}",
                     node.op_type,
@@ -286,6 +346,7 @@ fn try_fold_node(
     lookups: &ConstFoldLookups,
     weights: &WeightStore,
     model_unbatched: bool,
+    qdq_activation_relaxation: bool,
 ) -> Option<(String, FoldedTensor)> {
     if !is_standard_onnx_domain(&node.domain) {
         return None;
@@ -294,7 +355,7 @@ fn try_fold_node(
     let output_tensor = if node.op_type == "Shape" {
         ops::try_fold_shape_node(node, graph, lookups, weights)
     } else if all_inputs_constant(node, weights) {
-        ops::try_fold_all_const_node(node, weights, model_unbatched)
+        ops::try_fold_all_const_node(node, weights, model_unbatched, qdq_activation_relaxation)
     } else {
         None
     }?;
@@ -868,6 +929,42 @@ mod carrier_delivery_tests {
         assert!(
             !interval_carrier_armed(),
             "absent preset and absent environment must resolve DARK"
+        );
+    }
+
+    /// #lsnc-lane: the lane-private scope enables the fallback for loads on
+    /// THIS thread only, while it is alive, and never arms the GLOBAL carrier
+    /// gate (so `the_typed_preset_cannot_arm_the_carrier` keeps its meaning).
+    #[test]
+    fn the_lane_private_scope_is_thread_scoped_restored_and_not_the_global_gate() {
+        set_interval_carrier_preset(None);
+        assert!(!lane_private_interval_active(), "precondition: inactive");
+        {
+            let _scope = LanePrivateIntervalScope::enter();
+            assert!(lane_private_interval_active());
+            assert!(
+                !interval_carrier_armed(),
+                "the lane-private scope must not arm the global carrier gate"
+            );
+            let other_thread = std::thread::spawn(lane_private_interval_active)
+                .join()
+                .expect("probe thread");
+            assert!(
+                !other_thread,
+                "another thread must never see this thread's lane-private scope"
+            );
+            {
+                let _nested = LanePrivateIntervalScope::enter();
+                assert!(lane_private_interval_active());
+            }
+            assert!(
+                lane_private_interval_active(),
+                "a nested scope restores the outer state, not `false`"
+            );
+        }
+        assert!(
+            !lane_private_interval_active(),
+            "the scope must be released on drop"
         );
     }
 }

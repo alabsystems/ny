@@ -26,8 +26,7 @@ use ny_onnx::vnnlib::{
     load_vnnlib_with_certified_affine_property, CertifiedRelationalOutputAtom, VnnLibSpec,
 };
 use ny_onnx::{
-    load_onnx_with_config, AttributeValue, BatchNormFoldingPolicy, DataType, OnnxLoadConfig,
-    OnnxOptimizationFlag,
+    load_onnx_with_config, AttributeValue, DataType, OnnxLoadConfig, OnnxOptimizationFlag,
 };
 use ny_propagate::{Layer, Network, VerificationArtifactAuthority};
 use ny_tensor::BoundedTensor;
@@ -97,6 +96,8 @@ pub(super) fn try_affine_root_farkas(
     overall_deadline: Option<Instant>,
     sigmoid_peeled: bool,
 ) -> AffineRootFarkasAttempt {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Mip);
     if authority != VerificationArtifactAuthority::VerdictOnly {
         return AffineRootFarkasAttempt::declined(AffineRootFarkasDecline::ArtifactAuthority);
     }
@@ -263,7 +264,7 @@ fn strict_reload_affine_network(
     // make any custom converter an ordinary load failure under provenance.
     let config = caller_config
         .clone()
-        .with_batch_norm_folding_policy(BatchNormFoldingPolicy::PreserveRaw)
+        .certified_graph_lowering()
         .with_require_authored_float32_initializers(true);
     let model = load_onnx_with_config(model_path, &config).map_err(|error| {
         debug!(%error, path = %model_path.display(), "strict affine ONNX reload declined");

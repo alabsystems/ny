@@ -214,7 +214,7 @@ fn test_lr_scheduler_edge_cases() {
         lr
     );
 
-    // Regression: StepDecay with step_size=0 should return 1.0, not panic (#2840)
+    // Regression: StepDecay with step_size=0 should return 1.0, not panic
     let scheduler3 = LRScheduler::StepDecay {
         ny: 0.5,
         step_size: 0,
@@ -228,7 +228,7 @@ fn test_lr_scheduler_edge_cases() {
         "StepDecay with step_size=0 should return base_lr at any t"
     );
 
-    // Regression: ExponentialDecay with large t should not wrap i32 (#2840)
+    // Regression: ExponentialDecay with large t should not wrap i32
     let scheduler4 = LRScheduler::ExponentialDecay { ny: 0.999 };
     let lr_large_t = scheduler4.lr_factor(usize::MAX, 1.0);
     assert!(
@@ -237,7 +237,7 @@ fn test_lr_scheduler_edge_cases() {
         lr_large_t
     );
 
-    // Regression: StepDecay with large t should not wrap i32 (#2840)
+    // Regression: StepDecay with large t should not wrap i32
     let scheduler5 = LRScheduler::StepDecay {
         ny: 0.5,
         step_size: 1,
@@ -784,7 +784,7 @@ fn test_adamw_basic() {
     // Use high weight decay and zero gradient to see decay in isolation.
     // Pin a constant LR scheduler: the expected math below assumes the LR
     // stays at beta_lr each step. The default scheduler is ExponentialDecay,
-    // which would shrink the effective decay over time (#4307 triage).
+    // which would shrink the effective decay over time.
     let config = AdaptiveOptConfig {
         weight_decay: 0.1,
         beta_lr: 0.1,

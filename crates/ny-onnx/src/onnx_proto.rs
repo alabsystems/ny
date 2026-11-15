@@ -69,7 +69,7 @@ impl GraphProto {
 }
 
 /// Deprecated: use GraphProto::value_info instead.
-#[deprecated(note = "Use GraphProto::value_info")]
+#[deprecated(since = "0.1.0", note = "Use GraphProto::value_info")]
 pub fn graph_value_info(graph: &GraphProto) -> &[ValueInfoProto] {
     graph.value_info()
 }

@@ -14,7 +14,7 @@
 // width IS the defect.
 //
 // Run with:
-//   cargo run -p ny-onnx --release --features external-vnncomp \
+//   targo --unverified run -p ny-onnx --release --features external-vnncomp \
 //       --example vit-zero-width-node-bisect -- scan
 
 use ny_core::Bound;
@@ -24,7 +24,12 @@ use ny_propagate::Verifier;
 const BENCH_DEFAULT: &str = "../../benchmarks/vnncomp2025/benchmarks/vit_2023";
 
 fn bench_dir() -> String {
-    std::env::var("NY_VIT_BENCH").unwrap_or_else(|_| BENCH_DEFAULT.to_string())
+    let inputs = ny_levers::RawLeverInputs::capture(ny_levers::all());
+    inputs
+        .get(&ny_levers::decls::onnx::VIT_BENCH)
+        .and_then(std::ffi::OsStr::to_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| BENCH_DEFAULT.to_string())
 }
 
 fn read_vnnlib_box(path: &str) -> (Vec<f32>, Vec<f32>) {
@@ -96,7 +101,7 @@ fn scan(model_file: &str, vnnlib_file: &str, scale: f32) {
     let n = l.len();
     let degenerate: Vec<Bound> = (0..n)
         .map(|i| {
-            let c = 0.5 * (l[i] + u[i]);
+            let c = f32::midpoint(l[i], u[i]);
             let r = 0.5 * (u[i] - l[i]) * scale;
             Bound::new(c - r, c + r)
         })
@@ -182,7 +187,7 @@ fn compare(model_file: &str, vnnlib_file: &str, s_lo: f32, s_hi: f32) {
     let run = |scale: f32| {
         let degenerate: Vec<Bound> = (0..n)
             .map(|i| {
-                let c = 0.5 * (l[i] + u[i]);
+                let c = f32::midpoint(l[i], u[i]);
                 let r = 0.5 * (u[i] - l[i]) * scale;
                 Bound::new(c - r, c + r)
             })
@@ -234,7 +239,7 @@ fn vit_crown_prefix_bisect() {
         .unwrap_or(0.0);
     let degenerate: Vec<Bound> = (0..n)
         .map(|i| {
-            let c = 0.5 * (l[i] + u[i]);
+            let c = f32::midpoint(l[i], u[i]);
             let r = 0.5 * (u[i] - l[i]) * scale;
             Bound::new(c - r, c + r)
         })
@@ -337,7 +342,7 @@ fn vit_crown_oracle_intermediate_ablation() {
         .expect("convert");
     let degenerate: Vec<Bound> = (0..n)
         .map(|i| {
-            let c = 0.5 * (l[i] + u[i]);
+            let c = f32::midpoint(l[i], u[i]);
             Bound::new(c, c)
         })
         .collect();
@@ -417,7 +422,7 @@ fn vit_ibp_vs_crown_floor() {
     for scale in [0.0f32, 1e-3, 1e-2, 1e-1, 1.0] {
         let degenerate: Vec<Bound> = (0..n)
             .map(|i| {
-                let c = 0.5 * (l[i] + u[i]);
+                let c = f32::midpoint(l[i], u[i]);
                 let r = 0.5 * (u[i] - l[i]) * scale;
                 Bound::new(c - r, c + r)
             })

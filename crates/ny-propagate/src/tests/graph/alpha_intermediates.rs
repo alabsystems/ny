@@ -5,12 +5,6 @@
 //! Tests for `dag_alpha_backward_pass_with_intermediates` and
 //! `compute_graph_chain_rule_gradients` — exercised via the public
 //! `propagate_alpha_crown_with_config` API with `GradientMethod::AnalyticChain`.
-//!
-//! Covers #1959 acceptance criteria:
-//! - Direct tests exist for `dag_alpha_backward_pass_with_intermediates`
-//! - Direct tests exist for `compute_graph_chain_rule_gradients`
-//!
-//! Reference: designs/2026-02-10-network-beta-crown-coverage-wave-plan.md Step 1
 
 use crate::*;
 use ndarray::{arr1, arr2};
@@ -884,7 +878,7 @@ fn build_4layer_relu_graph() -> GraphNetwork {
     graph
 }
 
-/// #3628: the deep-sequential auto-override should activate at the 3-activation
+/// The deep-sequential auto-override should activate at the 3-activation
 /// threshold and match the explicit CROWN-IBP path on the primary API output.
 /// The collector API returns looser per-node bounds for the auto path because
 /// fix_interm_bounds=true skips the extra collect_crown_bounds_with_alpha pass;
@@ -943,7 +937,7 @@ fn test_deep_sequential_override_matches_explicit_crown_ibp_at_threshold_3628() 
     assert_bounds_do_not_loosen(expl_out, auto_out, 1e-4, "#3628 explicit vs auto collector");
 }
 
-/// #3628: Deep sequential alpha-CROWN with fix_interm_bounds=true and 4 ReLU layers.
+/// Deep sequential alpha-CROWN with fix_interm_bounds=true and 4 ReLU layers.
 ///
 /// Without the deep-sequential auto-override, IBP intermediates cause CROWN
 /// relaxation error to compound through depth, collapsing output bounds to
@@ -964,7 +958,7 @@ fn test_deep_sequential_alpha_crown_does_not_collapse_to_ibp_3628() {
     let ibp_width = total_width(&ibp_bounds);
 
     // Run alpha-CROWN with fix_interm_bounds=true (default). The deep-sequential
-    // auto-override (#3628) should fire because 4 activations >= threshold 3,
+    // auto-override should fire because 4 activations >= threshold 3,
     // upgrading to CROWN-IBP intermediates internally.
     let config = AlphaCrownConfig {
         iterations: 30,

@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Constrained-backward Patches helpers for #3813.
+//! Constrained-backward Patches helpers.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -151,7 +151,7 @@ pub(super) fn maybe_reenter_dense_to_patches(
         return;
     }
 
-    // #3813: Skip re-entry when the Dense carrier has few objective rows.
+    // Skip re-entry when the Dense carrier has few objective rows.
     // Patches mode iterates over (rows × spatial_positions) doing per-position
     // conv2d_transpose composition. With few rows (typical BaB constrained
     // backward has ≤10 objectives), Dense backward (small matrix × transposed

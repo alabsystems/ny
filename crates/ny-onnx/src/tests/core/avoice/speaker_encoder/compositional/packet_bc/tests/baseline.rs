@@ -91,7 +91,7 @@ fn test_ecapa_compositional_cosine_bounds_3499() {
     )
     .expect("compositional cosine pipeline should succeed");
 
-    // Concrete-point containment (#3683): evaluate full encoder at center
+    // Concrete-point containment: evaluate full encoder at center
     // and check the concrete output is within the full-graph IBP bounds.
     {
         let concrete = evaluate_graph_at_center(graph, &input, "compositional cosine encoder");

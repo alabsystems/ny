@@ -44,6 +44,8 @@ impl BetaCrownVerifier {
         engine: Option<&dyn GemmEngine>,
         deadline: Option<Instant>,
     ) -> BranchBatchOutcome {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::ChildBound);
         let has_cuts = !cut_pool.is_empty() && self.config.enable_cuts;
         let domain_config = DomainProcessingConfig::for_deadline(
             threshold,

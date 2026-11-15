@@ -28,10 +28,13 @@ pub mod dsp;
 /// Double-precision (f64) network propagation for soundnessbench/sat_relu.
 pub mod f64_propagate;
 mod graph_alpha;
+pub(crate) mod raw_root_cut;
+pub(crate) use raw_root_cut::{evaluate_raw_root_cut, quote_raw_root_cut, RawRootCutLimits};
 #[cfg(test)]
 mod graph_builder;
 // CROWN extension trait (extracted from graph.rs) - do not remove
 mod graph_crown;
+pub use graph_crown::attention_region::AttentionRegionReceipt;
 /// Certified scalar f64 CROWN backward for tiny graph nets — the lsnc "f64
 /// tail pass" (docs/LSNC_F64_TAIL_DESIGN.md; gate `NY_F64_TAIL=1`, default
 /// OFF; band `NY_F64_TAIL_BAND`). Fail-closed: only certified `Verified`
@@ -52,8 +55,22 @@ mod graph_ibp_f64_gemm;
 /// forward-mode derivatives (#f64-mvf) — quadratic-convergence enclosures for
 /// the nn4sys mscn multi-axis band-plateau clauses.
 pub mod graph_ibp_f64_mvf;
+mod graph_point_trace;
+/// #vit-root-alpha (ENGINE_PROGRAM V2): the injected untrusted search backend
+/// of the graph lane's root α search (`margin_alpha_search: joint_f32`),
+/// registered by ny-cli; this crate sees it only as `&dyn SearchBackend`.
+pub mod graph_root_search;
+/// #graph-lane-search (ENGINE_PROGRAM M7): V2's plain-data `GraphSearchNet`
+/// lowering of a `GraphNetwork` and its G1 self-check, shared by the graph
+/// β-CROWN lane's batched domain search. Nothing certified reads its output.
+pub(crate) use graph_alpha::search_lowering as graph_search_lowering;
 pub(crate) mod ibp;
-mod relu_relax;
+/// Sealed local original affine/ReLU chains; generic PointLinear remains quarantined.
+pub mod original_affine_chain;
+/// Priced local exact-real proof views of immutable original affine owners.
+/// This does not relax diagnostic PointLinear whole-network eligibility.
+pub mod original_affine_proof;
+pub(crate) mod proof_eligibility;
 
 #[cfg(test)]
 mod dispatch_coverage_data;
@@ -68,11 +85,11 @@ pub(crate) use alpha_crown::NetworkAlphaCrownExt;
 pub(crate) use core::extract_relu_gpu_layer_with_alpha;
 pub use core::graph::crown_block_wise::LayerNormValidationStats;
 pub use core::graph::crown_block_wise::{BlockSpec, BlockSpecEntry, BlockWiseCrownResult};
-pub(crate) use core::graph::dispatch_plan::CrownDispatchPlan;
+pub(crate) use core::graph::dispatch_plan::{CrownDispatchPlan, SharedNameIndex};
 pub(crate) use core::graph::merge_accumulator::{CrownMergeAccumulator, SoleCarrierWitness};
 pub use core::graph::{
-    forward_linear_admission_record, forward_linear_measured_rate, ForwardLinearAdmissionRecord,
-    ForwardLinearRateObservation,
+    forward_linear_admission_record, forward_linear_measured_rate, set_forward_linear_f32_seam,
+    ForwardLinearAdmissionRecord, ForwardLinearRateObservation,
 };
 pub(crate) use core::graph::{
     TrackedStringMap, TrackedStringMapAllocationFactV1, TRACKED_STRING_MAP_ALLOCATION_MODEL_V1,
@@ -110,6 +127,22 @@ pub(crate) use graph_alpha::merge_reference_bound_maps;
 /// nodes need tightened bounds), consumed by the armed root-joint interm-α
 /// target ranking so both lanes agree on what "DEMANDED" means.
 pub(crate) use graph_alpha::nodes_requiring_crown_tightening;
+/// #fwd-root-screen (V4): C1's exact lookup-table helpers, reused (not forked)
+/// by the certified zonotope core's piecewise-linear band.
+pub(crate) use graph_alpha::{check_lookup_shapes, pwl_point_enclosure, pwl_range_f64};
+/// #inert-ascent-exit telemetry: which rule retired the DAG alpha ascent
+/// (`converged` / `patience` / `inert`) and at which iteration. Read by the
+/// dark key's regression test; the module itself stays private, matching
+/// every other item this file lifts out of `graph_alpha`.
+// #inert-ascent-exit: both targets are `#[cfg(test)]` in `graph_alpha.rs`
+// ("Test-only route evidence"), so the re-export must carry the same gate. It
+// did not, and the plain `--lib` build had nothing to import (E0432). The
+// branch that added this was validated under `cargo test`, where the cfg is on
+// and it compiles — the mirror of CLAUDE.md's "cargo check does not build test
+// targets": here a test-only item was re-exported unconditionally, so the TEST
+// build was the green one and the LIB build was broken.
+#[cfg(test)]
+pub(crate) use graph_alpha::{clear_last_alpha_ascent_exit, last_alpha_ascent_exit};
 // #attr-branch: the branching selector reads the root gap-attribution prior.
 pub(crate) use graph_alpha::gap_attribution;
 /// #metaroom-chain-wide: chain-permitting extraction + its opt-in gate for the BaB
@@ -163,24 +196,32 @@ pub use graph_crown::{
     point_vjp_forward_masks, point_vjp_resnet_forward_masks, PointVjpBatchPlan, PointVjpResnetPlan,
     PointVjpWavePlan,
 };
+/// Exact-f64 twin of the chain / side-branch point-VJP plans for the float64
+/// target-margin repair (#sbench-f64-attack). Attack-only; never verdict-feeding.
+pub use graph_crown::{PointVjpF64Plan, PointVjpF64Tape};
 pub use graph_ibp_f64_mvf::{
     centered_seed_axis_indices_f32, PointPhaseEventDiagnostics, ReluPhaseEventCandidate,
 };
+pub use graph_point_trace::{
+    GraphPointArm, GraphPointStep, GraphPointTrace, GraphPointTraceAdmission,
+};
 
-// Re-export forward-bound tightening — lives in core/ as a shared utility (#2380)
+// Completed diagnostic Linear arms are shared by graph and point-only fronts.
+pub use crate::layers::linear::{LinearPointArm, LinearPointReceipt};
+
+// Re-export forward-bound tightening — lives in core/ as a shared utility
 pub(crate) use core::tighten_crown_with_forward_bounds;
-// Re-export post-concretization tightening for fast.rs and streaming (#3043).
-// Subsumes the separate has_degraded_bounds re-export (#3082).
+// Re-export post-concretization tightening for fast.rs and streaming.
+// Subsumes the separate has_degraded_bounds re-export.
 pub(crate) use core::tighten_crown_output;
 pub(crate) use core::tighten_crown_output_with_deadline;
-// Re-export provenance-tracking variant for graph_crown (#3043).
+// Re-export provenance-tracking variant for graph_crown.
 pub(crate) use core::tighten_crown_output_with_provenance_and_deadline;
 // Compatibility re-export: ny-build imports ny_propagate::network::broadcast_shapes.
 // Canonical location is now crate::shape::broadcast_shapes.
 pub use crate::shape::broadcast_shapes;
 pub use graph_crown_f64_tail::f64_tail_unsupported_census;
-pub use relu_relax::relu_crown_relaxation;
-// Test-only: decomposed normalization CROWN for proptest (#318, #3387).
+// Test-only: decomposed normalization CROWN for proptest.
 #[cfg(test)]
 pub(crate) use crate::layers::normalization::decomposed::decomposed_norm_crown_backward;
 #[cfg(test)]

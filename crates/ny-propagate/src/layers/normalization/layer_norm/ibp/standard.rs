@@ -10,7 +10,9 @@
 
 use ndarray::Axis;
 use ny_core::{NyError, Result};
-use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor, RepairStrategy};
+use ny_tensor::{
+    div_down_f32, div_up_f32, next_down_f32, next_up_f32, BoundedTensor, RepairStrategy,
+};
 
 use super::super::super::math_common::square_interval_bounds;
 use super::super::types::LayerNormLayer;
@@ -32,7 +34,6 @@ pub(super) fn propagate_interval(
     let norm_size = ctx.norm_size;
 
     // Compute bounds on mean using f64 accumulation with directed rounding.
-    // Part of #2423.
     let mean_lower = mean_axis_f64_lower(input.lower(), Axis(ndim - 1)).ok_or_else(|| {
         NyError::InvalidSpec(format!(
             "LayerNorm: mean_axis failed for axis {} on {}D input",
@@ -102,7 +103,7 @@ pub(super) fn propagate_interval(
                 slices::collect_last_axis_slice(input.upper(), &full_idx[..prefix_len], norm_size);
 
             // Capture prefix snapshot for the emit closure since full_idx is
-            // reused across iterations. Part of #2237.
+            // reused across iterations.
             let prefix_snapshot: [usize; 8] = full_idx;
 
             standard_ibp_1d_slice(
@@ -133,7 +134,7 @@ pub(super) fn propagate_interval(
         ));
     }
 
-    // Repair non-finite endpoints only; keep valid finite bounds unchanged (#2549).
+    // Repair non-finite endpoints only; keep valid finite bounds unchanged.
     BoundedTensor::new_repaired(out_lower, out_upper, RepairStrategy::Conservative)
 }
 
@@ -147,7 +148,7 @@ pub(super) fn propagate_interval(
 ///
 /// Calls `emit(i, lower_i, upper_i)` for each output coordinate.
 ///
-/// Extracted in #3043 / #2535: the 1D and multi-D paths previously inlined
+/// Shared by the 1D and multi-D paths, which previously inlined
 /// identical variance/std/corners logic, differing only in array indexing.
 fn standard_ibp_1d_slice(
     layer: &LayerNormLayer,
@@ -164,13 +165,13 @@ fn standard_ibp_1d_slice(
     // Uses shared square_interval_bounds for consistency with InstanceNorm/RmsNorm.
     // f64 accumulation for variance sum to prevent precision loss for large
     // norm_size (768+). Catastrophic cancellation in (xi - mean)^2 when
-    // xi ~ mean is the primary concern. Part of #2423.
+    // xi ~ mean is the primary concern.
     let mut var_lower_f64 = 0.0_f64;
     let mut var_upper_f64 = 0.0_f64;
 
     for i in 0..norm_size {
         // Directed rounding on intermediate deviation: feeds variance via
-        // square_interval_bounds -- too-narrow domain -> unsound. Part of #3344.
+        // square_interval_bounds -- too-narrow domain -> unsound.
         let diff_l = next_down_f32(input_lower[i] - mean_u);
         let diff_u = next_up_f32(input_upper[i] - mean_l);
         let (sq_l, sq_u) = square_interval_bounds(diff_l, diff_u);
@@ -178,13 +179,13 @@ fn standard_ibp_1d_slice(
         var_upper_f64 += sq_u as f64;
     }
     // Directed rounding: var_lower is denominator bound -> round down,
-    // var_upper is range bound -> round up (#3270).
+    // var_upper is range bound -> round up.
     let var_lower = next_down_f32((var_lower_f64 / nf as f64) as f32);
     let var_upper = next_up_f32((var_upper_f64 / nf as f64) as f32);
 
     // Directed rounding on sqrt: std_lower is denominator -> round DOWN,
     // std_upper is range bound -> round UP (wider interval = sound).
-    // f64 intermediate for precision. Pattern from GroupNorm #3327, fix for #3332.
+    // f64 intermediate for precision. Pattern from GroupNorm.
     let std_lower = next_down_f32(((var_lower as f64 + layer.eps as f64).sqrt()) as f32);
     let std_upper = next_up_f32(((var_upper as f64 + layer.eps as f64).sqrt()) as f32);
 
@@ -202,7 +203,7 @@ fn standard_ibp_1d_slice(
     // degree of freedom (the extremum is one outlier against n-1 equal others).
     // The interval-arithmetic over-approximation (treating x_i, mean, std as
     // independent) can exceed this, so clamping the corner ratios to
-    // [-sqrt(n-1), sqrt(n-1)] tightens the bound (#3196).
+    // [-sqrt(n-1), sqrt(n-1)] tightens the bound.
     //
     // SOUNDNESS OF THE FLOAT MARGIN (the verifier must cover the *f32* inference
     // program, whose z deviates from the exact z, so the bare next_up(sqrt(n-1))
@@ -235,7 +236,7 @@ fn standard_ibp_1d_slice(
     // Therefore max_norm >= the true f32 ceiling, so clamping to
     // [-max_norm, max_norm] cannot exclude any reachable output => SOUND. It is
     // still strictly tighter than the unclamped 4-corner interval in the
-    // high-|x| / low-variance regime, retaining the #3196 tightening benefit.
+    // high-|x| / low-variance regime, retaining the clamp's tightening benefit.
     //
     // Non-finite guard: if max_abs_x is Inf/NaN (Inf inputs), skip clamping by
     // setting max_norm = +INF so the unclamped interval is kept and handed to
@@ -271,24 +272,37 @@ fn standard_ibp_1d_slice(
     // 4 redundant interior points of the numerator interval.
     for i in 0..norm_size {
         // Directed rounding on intermediate deviation: if centered_lower
-        // rounds UP, the 4-corner domain is too narrow -> unsound. Part of #3344.
+        // rounds UP, the 4-corner domain is too narrow -> unsound.
         let centered_lower = next_down_f32(input_lower[i] - mean_u);
         let centered_upper = next_up_f32(input_upper[i] - mean_l);
 
-        let corners = [
-            centered_lower / std_upper,
-            centered_lower / std_lower,
-            centered_upper / std_upper,
-            centered_upper / std_lower,
+        // The corner divisions were the ONE bare (round-to-nearest) step in an
+        // otherwise fully directed chain. A corner that rounds inward narrows the
+        // ratio interval, and the directed step on the final `g*norm + b` is at the
+        // scale of that SUM -- it collapses whenever beta cancels the product.
+        // Compute each corner TWICE (down for the min-fold, up for the max-fold),
+        // mirroring `BoundedTensor::mul`. div_down/div_up_f32 are exact-remainder
+        // (fma) certified and pass NaN through to the folds unchanged.
+        let corners_down = [
+            div_down_f32(centered_lower, std_upper),
+            div_down_f32(centered_lower, std_lower),
+            div_down_f32(centered_upper, std_upper),
+            div_down_f32(centered_upper, std_lower),
+        ];
+        let corners_up = [
+            div_up_f32(centered_lower, std_upper),
+            div_up_f32(centered_lower, std_lower),
+            div_up_f32(centered_upper, std_upper),
+            div_up_f32(centered_upper, std_lower),
         ];
 
         // NaN-propagating fold: if any corner is NaN (e.g., from 0/0 or Inf-Inf),
         // the bound must be NaN so downstream guards produce conservative bounds.
-        // IEEE 754 f32::min/max silently absorb NaN -- see #2577.
-        let norm_l = corners
+        // IEEE 754 f32::min/max silently absorb NaN.
+        let norm_l = corners_down
             .iter()
             .fold(f32::INFINITY, |a, &b| nan_propagating_min(a, b));
-        let norm_u = corners
+        let norm_u = corners_up
             .iter()
             .fold(f32::NEG_INFINITY, |a, &b| nan_propagating_max(a, b));
 
@@ -302,7 +316,7 @@ fn standard_ibp_1d_slice(
         let b = layer.beta[i];
 
         // Directed rounding on final bounds: bare f32 mul+add from
-        // corner division results. Part of #3344.
+        // corner division results.
         if g >= 0.0 {
             emit(
                 i,

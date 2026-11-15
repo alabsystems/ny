@@ -42,25 +42,22 @@
 //!
 //! `docs/MACOS_ACCELERATION_RESEARCH_2026-08-01.md` flagged this header's former
 //! claim ("WGPU remains unconditionally quarantined; all `provides_sound_gpu_*`
-//! return `false`") as contradicted by a "live sound-resident dispatch" at
-//! `ny-propagate .../network/ibp/crown_partial_gpu.rs:150-160`. Traced
-//! 2026-08-04: **both statements were true and there was no contradiction.**
-//! That dispatch is `if use_sound { crown_backward_gpu_sound(..) } else {
-//! crown_backward_gpu(..) }`, and `use_sound` is not a local decision — it is the
-//! second element of the tuple returned by `gpu_crown_backward_route_with_deadline`,
-//! which grants `true` only after `.filter(|g| g.provides_sound_gpu_crown())`.
-//! At that checkpoint the sound-resident dispatch was reachable **on CUDA** and
-//! statically unreachable on wgpu, so there was no quarantine leak. Since the
-//! 2026-08-11 B0 review, a `WgpuDevice` can pass the same filter only after its
+//! return `false`") as contradicted by a "live sound-resident dispatch" in
+//! `ny-propagate .../network/ibp/crown_partial_gpu.rs`. There is no contradiction:
+//! that site dispatches `crown_backward_gpu_sound(..)` only when `use_sound` is
+//! `true`, and `use_sound` is not a local decision — it is the second element of
+//! the tuple returned by `gpu_crown_backward_route_with_deadline`, which grants
+//! `true` only after `.filter(|g| g.provides_sound_gpu_crown())`. Since the
+//! 2026-08-11 B0 review, a `WgpuDevice` can pass that filter only after its
 //! typed explicit constructor records a complete passing live ladder. The
 //! `ComputeDevice` proof constructor delegates only that qualified CROWN
 //! accessor. No unfiltered sound dispatch exists.
 //!
 //! # "WGSL has no f64" is NOT an authority blocker
 //!
-//! Struck across the tree 2026-08-04. The literal fact is true, but the sound
-//! lane's certified error term has never needed f64: it is Higham `γ_k·S` in
-//! pure f32 with host-side outward-rounded uniforms (`sound_consts.rs:13` —
+//! The literal fact is true, but the sound lane's certified error term has never
+//! needed f64: it is Higham `γ_k·S` in pure f32 with host-side outward-rounded
+//! uniforms (`sound_consts.rs:13` —
 //! "no f64 ever enters a WGSL body"), and the EFT channel adds an f64-grade
 //! compensated residual, whose two primitives measured bit-exact on an Apple
 //! M5 Max / Metal adapter on 2026-08-04 (fma TwoProduct 509/509 lanes,
@@ -431,11 +428,8 @@ impl WgpuDevice {
         }
         // Probe 3: FMA / a*b + c within a generous within-model bound of the true value.
         let d = f32::from_bits(out[OUT_ROUND_BASE as usize + N_ROUND as usize]);
-        if !d.is_finite() || (f64::from(d) - fma_real).abs() > FMA_TOL {
-            return Ok(false);
-        }
-
-        Ok(true)
+        let fma_mismatch = !d.is_finite() || (f64::from(d) - fma_real).abs() > FMA_TOL;
+        Ok(!fma_mismatch)
     }
 }
 

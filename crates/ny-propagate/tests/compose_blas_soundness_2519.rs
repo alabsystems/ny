@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! BLAS compose concrete soundness tests for #2519.
+//! BLAS compose concrete soundness tests.
 //!
 //! Verifies that the composed bounds (BLAS path) enclose the true two-layer
 //! evaluation at concrete input points. The BLAS compose uses pos/neg coefficient

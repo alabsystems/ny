@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::layers::BoundPropagation;
+use super::verifier::streaming_forward_step;
 use crate::network::Network;
 use ny_core::{NyError, Result};
 use ny_tensor::{BoundedTensor, CompressedBounds};
@@ -83,8 +83,23 @@ impl CheckpointedBounds {
     }
 
     /// Bounds at layer_idx by finding nearest checkpoint and recomputing if needed.
-    /// Returns None if layer_idx is invalid.
+    ///
+    /// Checks the current network's proof eligibility before returning even an
+    /// exact stored checkpoint. A checkpoint does not qualify a diagnostic-only
+    /// layer, including one added after the checkpoint was collected.
     pub fn bounds_at(&self, layer_idx: usize, network: &Network) -> Result<BoundedTensor> {
+        network.ensure_proof_eligible()?;
+        self.bounds_at_proof_eligible(layer_idx, network)
+    }
+
+    /// Internal lookup after the immutable verifier call has checked the current
+    /// network during collection. Keeping this narrower than the public API
+    /// avoids rescanning every layer for each backward checkpoint lookup.
+    pub(super) fn bounds_at_proof_eligible(
+        &self,
+        layer_idx: usize,
+        network: &Network,
+    ) -> Result<BoundedTensor> {
         if self.num_layers == 0 || layer_idx >= self.num_layers {
             return Err(NyError::InvalidSpec(format!(
                 "Layer index {} out of range (num_layers={})",
@@ -178,13 +193,7 @@ impl CheckpointedBounds {
                 .get(i)
                 .ok_or_else(|| NyError::InvalidSpec(format!("Layer {} not found", i)))?;
 
-            current = layer
-                .propagate_ibp(&current)
-                .map_err(|e| NyError::LayerError {
-                    layer_index: i,
-                    layer_type: layer.layer_type().to_string(),
-                    source: Box::new(e),
-                })?;
+            current = streaming_forward_step(layer, &current, i)?;
         }
 
         Ok(current)
@@ -239,6 +248,10 @@ impl CheckpointedBounds {
     /// Get the last checkpoint's bounds (output bounds).
     /// Returns `Ok(None)` if no checkpoints exist, `Ok(Some(bounds))` if found,
     /// or `Err(...)` if f16 decompression fails.
+    ///
+    /// This is a storage accessor without a network binding. Its result does
+    /// not establish current-network proof eligibility or qualify supplied
+    /// checkpoints. Network-aware callers must check eligibility separately.
     pub fn last_checkpoint(&self) -> Result<Option<BoundedTensor>> {
         match &self.checkpoints {
             CheckpointStorage::F32(checkpoints) => Ok(checkpoints.last().map(|(_, b)| b.clone())),

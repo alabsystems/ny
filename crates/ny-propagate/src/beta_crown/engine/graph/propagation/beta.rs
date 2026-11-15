@@ -90,7 +90,7 @@ impl BetaCrownVerifier {
         )
     }
 
-    /// Batched spec-guided CROWN backward with β constraints (#4306).
+    /// Batched spec-guided CROWN backward with β constraints.
     ///
     /// Like `propagate_crown_with_graph_beta_and_cache` but seeds the backward
     /// pass with a multi-row spec matrix instead of a single objective row.
@@ -159,6 +159,8 @@ impl BetaCrownVerifier {
         f32,
         std::collections::HashMap<String, Arc<BoundedTensor>>,
     )> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BetaOpt);
         use rand::RngExt;
 
         // Skip if no beta parameters or iterations disabled
@@ -187,7 +189,7 @@ impl BetaCrownVerifier {
         let mut current_betas: Vec<f32> = beta_state.entries.iter().map(|e| e.value).collect();
 
         for iter in 0..self.config.beta_iterations {
-            // Deadline check (#3109): bail early if verification timeout budget
+            // Deadline check: bail early if verification timeout budget
             // is exhausted. Return current best bounds instead of running all iterations.
             if self.past_effective_graph_bab_deadline() {
                 info!(
@@ -212,11 +214,11 @@ impl BetaCrownVerifier {
             let ub = output.upper_scalar();
 
             // Track best bounds (highest finite lower bound).
-            // Non-finite values (NaN/+Inf/-Inf) must not become best_lower (#2695).
+            // Non-finite values (NaN/+Inf/-Inf) must not become best_lower.
             if lb.is_finite() && lb > best_lower {
                 best_lower = lb;
                 best_upper = ub;
-                best_node_bounds = node_bounds.clone();
+                best_node_bounds = node_bounds;
             } else if !lb.is_finite() {
                 trace!(
                     "Graph β-SPSA: skipping non-finite lower bound at iteration {}: {}",
@@ -307,7 +309,7 @@ impl BetaCrownVerifier {
         let ub = output.upper_scalar();
 
         // Return the better of final vs best-seen bounds.
-        // Reject non-finite final lb to prevent +Inf from winning (#2695).
+        // Reject non-finite final lb to prevent +Inf from winning.
         if lb.is_finite() && lb >= best_lower {
             Ok((lb, ub, node_bounds))
         } else {
@@ -330,7 +332,6 @@ impl BetaCrownVerifier {
     /// optimized alongside β using Adam.
     ///
     /// Returns the optimized bounds and updated beta_state (alpha_state is updated in place).
-    /// Issue: #1841
     pub(crate) fn optimize_graph_beta_analytical(
         &self,
         graph: &GraphNetwork,
@@ -344,6 +345,8 @@ impl BetaCrownVerifier {
         f32,
         std::collections::HashMap<String, Arc<BoundedTensor>>,
     )> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BetaOpt);
         let has_alpha = !alpha_state.is_empty();
 
         // Skip if no beta parameters or iterations disabled
@@ -377,7 +380,7 @@ impl BetaCrownVerifier {
         let mut best_node_bounds = std::collections::HashMap::new();
 
         for iter in 0..self.config.beta_iterations {
-            // Deadline check (#3109): bail early if verification timeout budget
+            // Deadline check: bail early if verification timeout budget
             // is exhausted. Return current best bounds instead of running all iterations.
             if self.past_effective_graph_bab_deadline() {
                 info!(
@@ -422,11 +425,11 @@ impl BetaCrownVerifier {
             let ub = output.upper_scalar();
 
             // Track best bounds (highest finite lower bound).
-            // Non-finite values (NaN/+Inf/-Inf) must not become best_lower (#2695).
+            // Non-finite values (NaN/+Inf/-Inf) must not become best_lower.
             if lb.is_finite() && lb > best_lower {
                 best_lower = lb;
                 best_upper = ub;
-                best_node_bounds = node_bounds.clone();
+                best_node_bounds = node_bounds;
             } else if !lb.is_finite() {
                 trace!(
                     "Graph αβ-analytical: skipping non-finite lower bound at iteration {}: {}",
@@ -500,7 +503,7 @@ impl BetaCrownVerifier {
         let ub = output.upper_scalar();
 
         // Return the better of final vs best-seen bounds.
-        // Reject non-finite final lb to prevent +Inf from winning (#2695).
+        // Reject non-finite final lb to prevent +Inf from winning.
         if lb.is_finite() && lb >= best_lower {
             Ok((lb, ub, node_bounds))
         } else {
@@ -517,7 +520,7 @@ impl BetaCrownVerifier {
     /// constraints, the upper bound of the objective can fall below the threshold
     /// while the lower bound moves the other way, so the optimizer's
     /// best-lower-paired upper bound is *looser* than the upper bound actually
-    /// achieved mid-optimization (#1896). This routine runs the same analytical
+    /// achieved mid-optimization. This routine runs the same analytical
     /// β/α gradient loop but keeps the tightest bound in the direction that
     /// decides verification:
     /// - `verify_upper_bound == true`: keep the minimum sound upper bound.
@@ -526,14 +529,24 @@ impl BetaCrownVerifier {
     /// # Soundness
     /// Every per-iteration `(lb, ub)` is an independently sound CROWN-β(-α) bound
     /// for this subproblem. Returning the tightest one in a single direction is
-    /// sound — the tighter side of a valid interval is still valid. Non-finite
+    /// sound — the tighter side of a valid interval is still valid. Why the
+    /// UPPER end is valid too (re-derived 2026-09-30, #warm-dag): a split is the
+    /// constraint `s·z_j >= 0` with `s = +1` active / `-1` inactive
+    /// (`state/graph_beta/entry.rs`) and `β >= 0` on every write; the fold
+    /// subtracts `s·β` from the lower coefficient of `z_j` and adds it to the
+    /// upper one (`bounds/linear.rs` `apply_beta_split_to_column`). On the leaf
+    /// `s·z_j >= 0`, so `f >= L(z) >= L(z) - β·s·z_j` and
+    /// `f <= U(z) <= U(z) + β·s·z_j` for ANY `β >= 0` (weak duality); upper mode
+    /// is computed directly, not by negating the objective, so no sign flip is
+    /// needed. Each pass here seeds at the OUTPUT (no lA warm start; a warm
+    /// started pass is sound only under
+    /// `propagation/warm_start_guard.rs::la_warm_start_seed_is_complete`). Non-finite
     /// iterates are ignored so NaN/Inf can never win. `iterations` and the Adam
     /// gradient steps only *move* β/α; they never relax the reported bound below
     /// what a sound CROWN pass produced.
     ///
     /// Returns `(best_lower, best_upper)` where the non-decision direction carries
     /// the value paired with the chosen best-direction iterate (a sound bound).
-    /// Issue: #1896
     pub(crate) fn optimize_graph_leaf_beta_directional(
         &self,
         graph: &GraphNetwork,
@@ -545,6 +558,8 @@ impl BetaCrownVerifier {
         iterations: usize,
         verify_upper_bound: bool,
     ) -> Result<(f32, f32)> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BetaOpt);
         let has_alpha = !alpha_state.is_empty();
 
         // Single-pass baseline (also the answer when there is nothing to optimize).
@@ -704,10 +719,7 @@ impl BetaCrownVerifier {
     /// Updates `child.{lower_bound, upper_bound, priority, node_bounds}` in place.
     /// Returns `Ok(true)` if bounds were computed, `Err` if propagation failed.
     /// Callers MUST treat `Err` as an unresolved domain — the sub-region of
-    /// input space covered by `child` was not explored (#1861).
-    ///
-    /// Design: designs/2026-02-09-gpu-bab-beta-optimization-parity.md
-    /// Issue: #1817
+    /// input space covered by `child` was not explored.
     pub(crate) fn evaluate_graph_child_bounds(
         &self,
         graph: &GraphNetwork,
@@ -717,10 +729,12 @@ impl BetaCrownVerifier {
         cut_pool: Option<&GraphCutPool>,
         engine: Option<&dyn GemmEngine>,
     ) -> Result<bool> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::ChildBound);
         // Lazy alpha initialization: if alpha_state is empty (e.g., domain came
         // from GPU BaB's branch_relu_from_picked or graph_domain_from_picked which
         // don't have access to the graph for initialization), initialize it now
-        // from the child's node bounds and history.  Issue: #1841
+        // from the child's node bounds and history.
         if child.alpha_state.is_empty() {
             child.alpha_state = GraphDomainAlphaState::from_graph_bounds(
                 graph,
@@ -822,7 +836,7 @@ impl BetaCrownVerifier {
                 // Guard: non-finite bounds from lower_scalar/upper_scalar indicate
                 // NaN/Inf propagation through CROWN backward. Reject early to prevent
                 // zombie domains from entering the BaB queue. Matches GPU BaB guard
-                // in batched_gpu.rs and sequential BaB guard in core.rs. (#2986)
+                // in batched_gpu.rs and sequential BaB guard in core.rs.
                 if !l.is_finite() || !u.is_finite() {
                     warn!(
                         "evaluate_graph_child_bounds: rejected — non-finite bounds \
@@ -851,7 +865,7 @@ impl BetaCrownVerifier {
                 Ok(true)
             }
             Err(e) => {
-                // #1861: Propagate the error instead of swallowing it as Ok(false).
+                // Propagate the error instead of swallowing it as Ok(false).
                 // Callers must track this as an unresolved domain so the verifier
                 // never claims Verified when part of the input space is unexplored.
                 debug!("[#1817/#1861] child propagation failed: {e}");
@@ -872,7 +886,10 @@ impl BetaCrownVerifier {
     /// bound is sound regardless of the β values; default ON (opt out
     /// `NY_RESNET_BETA_GPU=0`) and any miss/Err falls back to CPU — the 0-wrong moat is
     /// preserved.
-    fn try_gpu_beta_perdomain_bound(
+    ///
+    /// #kfsb-production: also the single-shot kFSB scorer's device route for its
+    /// candidate simulations, where the result only RANKS a candidate.
+    pub(in crate::beta_crown::engine) fn try_gpu_beta_perdomain_bound(
         &self,
         graph: &GraphNetwork,
         child: &GraphBabDomain,

@@ -25,7 +25,7 @@ impl OnnxModel {
     /// [`NyError::UnsupportedOp`] for unrecognized layer types.
     ///
     /// Kept as a compatibility delegate while callers migrate to
-    /// [`ConvertContext::convert_layer`] (#1752).
+    /// [`ConvertContext::convert_layer`].
     pub fn convert_layer(&self, spec: &LayerSpec) -> Result<Layer> {
         self.convert_context().convert_layer(spec)
     }

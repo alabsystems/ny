@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Unit tests for reduction op conversion: the opset 13+/18+
-//! axes-as-input-tensor path (Part of #3499) and the TRAILING-RELATIVE
+//! axes-as-input-tensor path and the TRAILING-RELATIVE
 //! batch-squeeze axis remap (#pensieve ReduceSum no-op miscompile).
 //!
 //! ny's internal runtime tensor for an ONNX tensor of rank `r` either kept
@@ -12,8 +12,8 @@
 //! (from-the-end): `onnx_axis - r`, resolved against the actual runtime rank
 //! at propagation time — correct under both layouts. Out-of-range axes and
 //! the batch axis 0 of a rank>1 tensor REFUSE conversion (fail-closed);
-//! unknown recorded ranks keep the legacy `axis - 1` adjustment
-//! (ny-synthesized-subgraph compatibility).
+//! unknown recorded ranks refuse unless a trusted internal lowering carries
+//! explicit source provenance.
 
 use super::{AttributeValue, ConvertContext, LayerSpec};
 use crate::WeightStore;
@@ -225,23 +225,17 @@ fn convert_reduce_sum_axis_one_on_rank2_is_trailing() {
 // Fail-closed refusals
 // ---------------------------------------------------------------------------
 
-/// A positive axis with no recorded ONNX shape keeps the LEGACY `axis - 1`
-/// adjustment: unrecorded tensors come from ny-synthesized internal
-/// subgraphs (LSTM unrolling, ReduceL2 lowering) that were authored against
-/// the stripped-batch convention — for them legacy is correct by
-/// construction. Real ONNX models get recorded shapes from load-time shape
-/// inference and take the trailing-relative path.
+/// A positive axis with no recorded ONNX shape must not guess a runtime layout.
 #[test]
-fn convert_reduce_sum_positive_axis_unknown_rank_keeps_legacy() {
+fn convert_reduce_sum_positive_axis_unknown_rank_refuses() {
     let weights = WeightStore::new();
     let ctx = test_ctx(&weights);
     let spec = reduce_sum_spec_with_attr_axes(vec![2]);
 
-    let layer = ctx.convert_reduce_sum(&spec).unwrap();
-    let Layer::ReduceSum(reduce) = layer else {
-        panic!("expected ReduceSum, got {layer:?}");
-    };
-    assert_eq!(reduce.axes, vec![1i64]);
+    let error = ctx
+        .convert_reduce_sum(&spec)
+        .expect_err("unknown rank must not authorize an axis-minus-one guess");
+    assert!(matches!(error, NyError::UnsupportedOp(_)));
 }
 
 /// ONNX axis 0 of a rank>1 tensor is the (possibly stripped) batch axis —
@@ -751,7 +745,7 @@ fn convert_reduce_sum_keepdims_false() {
     assert!(!reduce.keepdims, "keepdims=0 should produce false");
 }
 
-// ---- #2360 regression: NaN/Inf/non-integer axis rejection ----
+// ---- Regression: NaN/Inf/non-integer axis rejection ----
 
 #[test]
 fn reduce_sum_nan_axis_rejected_2360() {

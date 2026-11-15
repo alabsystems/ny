@@ -1,0 +1,94 @@
+# FAR fixtures for the router's FrontierBinary projection (ny-core router tests 8 and 9).
+#
+# Source: the `[closure] obs=` lines of the margin-row wave logs under the main tree's
+# gitignored scratchpad (w7b/v2, w10b/v2), extracted verbatim 2026-09-29 with
+#   grep -o '\[closure\] obs=[0-9]* exp=[0-9]* open=[0-9]* created+[0-9]* closed+[0-9]*'
+# One `record <source> <published verdict>` header per log, then one
+# `obs <exp> <open> <created+> <closed+>` row per closure observation. The test rebuilds
+# cumulative counters from a root sample (exp 0, created 1, closed 0, open 1).
+#
+# The 8 unsat records are the judge's whole unsat set (judge_ig_far_rule.out: 0/8 flagged at
+# T in [0.10, 0.30]). The timeouts are the positive controls. FDB_c3494_ctl_r1 is kept as a
+# MEASURED NON-FIRING timeout: its trailing windows read 0.105, 0.333, 0.100 closes/expansion,
+# so two consecutive windows never sit at or below T_FAR = 0.10. CCT_1440_w_r1 stops at obs 9
+# because its obs 10 is a ROLLBACK line that carries no created+/closed+ counters.
+record w7b/v2/CCT_448_w_r1 unsat
+obs 37 21 75 17
+obs 57 15 40 26
+record w7b/v2/CCT_448_w_r2 unsat
+obs 37 21 75 17
+obs 57 15 40 26
+record w7b/v2/CCT_448_wj_r1 unsat
+obs 33 8 67 26
+obs 49 4 32 20
+record w7b/v2/CCT_448_wj_r2 unsat
+obs 33 8 67 26
+obs 49 4 32 20
+record w7b/v2/MRG_c1590_ctl_r1 unsat
+obs 31 8 63 24
+obs 47 7 32 17
+record w7b/v2/MRG_c1590_ctl_r2 unsat
+obs 31 8 63 24
+obs 47 7 32 17
+record w7b/v2/MRG_c2050_ctl_r1 unsat
+obs 27 18 55 10
+obs 44 24 34 11
+obs 65 16 42 29
+obs 92 29 54 14
+obs 109 34 34 12
+obs 126 39 34 12
+obs 155 35 58 33
+obs 176 21 42 35
+obs 192 6 32 31
+record w7b/v2/MRG_c2050_ctl_r2 unsat
+obs 27 18 55 10
+obs 44 24 34 11
+obs 65 16 42 29
+obs 92 29 54 14
+obs 109 34 34 12
+obs 126 39 34 12
+obs 155 35 58 33
+obs 176 21 42 35
+obs 192 6 32 31
+record w7b/v2/MRG_c8330_ctl_r1 timeout
+obs 29 13 59 17
+obs 46 5 34 25
+obs 66 14 40 11
+obs 82 8 32 22
+obs 101 22 38 5
+obs 117 34 32 4
+obs 137 50 40 4
+obs 157 70 40 0
+obs 177 90 40 0
+obs 196 108 38 1
+obs 216 128 40 0
+record w7b/v2/MRG_c8330_ctl_r2 timeout
+obs 29 13 59 17
+obs 46 5 34 25
+obs 66 14 40 11
+obs 82 8 32 22
+obs 101 22 38 5
+obs 117 34 32 4
+obs 137 50 40 4
+obs 157 70 40 0
+obs 177 90 40 0
+obs 196 108 38 1
+record w7b/v2/CCT_1440_w_r1 timeout
+obs 31 32 63 0
+obs 51 52 40 0
+obs 68 66 34 3
+obs 88 86 40 0
+obs 107 104 38 1
+obs 127 124 40 0
+obs 147 144 40 0
+obs 166 162 38 1
+obs 185 180 38 1
+record w10b/v2/FDB_c3494_ctl_r1 timeout
+obs 25 15 51 11
+obs 44 13 38 21
+obs 65 15 42 19
+obs 88 20 46 18
+obs 106 28 36 10
+obs 125 45 38 2
+obs 143 57 36 6
+obs 163 75 40 2

@@ -5,7 +5,6 @@
 //! Multi-depth ReLU splitting configuration methods for `BetaCrownConfig`.
 //!
 //! Separated from `beta_config.rs` to keep that file within size limits.
-//! Part of #2767.
 
 use super::beta_config::AUTO_ENLARGE_BATCH_CAP;
 use super::BetaCrownConfig;

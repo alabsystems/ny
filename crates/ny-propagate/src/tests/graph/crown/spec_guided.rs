@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Spec-guided CROWN tests (#593): classification specifications via C @ output.
+//! Spec-guided CROWN tests: classification specifications via C @ output.
 
 use crate::*;
 use ndarray::{arr1, arr2, Array1};
@@ -353,7 +353,7 @@ fn test_spec_guided_crown_three_input_concat_matches_scalar_crown_3870() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_spec_guided_crown_with_node_bounds_matches_with_linear_for_silu_graph() {
-    // Regression for #1942: both APIs should produce sound bounds for SiLU.
+    // Regression: both APIs should produce sound bounds for SiLU.
     // The with_node_bounds path may be more conservative (IBP intermediate
     // bounds) vs with_linear (tighter bounds during backward pass).
     let mut graph = GraphNetwork::new();
@@ -430,7 +430,7 @@ fn test_spec_guided_crown_with_node_bounds_matches_with_linear_for_silu_graph() 
 #[ntest::timeout(10000)]
 #[test]
 fn test_spec_guided_crown_empty_graph_applies_spec_matrix() {
-    // Regression for #1942: empty graph should still evaluate the spec matrix
+    // Regression: empty graph should still evaluate the spec matrix
     // over the input bounds, not silently return input bounds unchanged.
     let graph = GraphNetwork::new();
     let input = BoundedTensor::new(
@@ -467,7 +467,7 @@ fn test_spec_guided_crown_empty_graph_applies_spec_matrix() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_spec_guided_crown_degraded_non_finite_falls_back_to_ibp() {
-    // Regression for #2566: if spec-guided CROWN concretization degrades to
+    // Regression: if spec-guided CROWN concretization degrades to
     // non-finite bounds, the path must fallback to IBP-derived spec bounds.
     let mut graph = GraphNetwork::new();
 
@@ -523,7 +523,7 @@ fn test_spec_guided_crown_degraded_non_finite_falls_back_to_ibp() {
 }
 
 // ============================================================
-// SPEC-GUIDED CROWN MUST BE TIGHTER THAN IBP (#3037, same class as #2990)
+// SPEC-GUIDED CROWN MUST BE TIGHTER THAN IBP
 // ============================================================
 //
 // The spec-guided CROWN path was the last remaining CROWN variant missing
@@ -586,9 +586,9 @@ fn assert_spec_guided_tighter_than_ibp(
     }
 }
 
-/// Regression test for #3037: spec-guided CROWN must not be looser than IBP.
+/// Regression test: spec-guided CROWN must not be looser than IBP.
 ///
-/// Uses the exact #2990 minimized weights (Linear(2->2) -> ReLU -> Linear(2->1))
+/// Uses the exact minimized weights (Linear(2->2) -> ReLU -> Linear(2->1))
 /// through the spec-guided GraphNetwork path with identity spec matrix.
 /// Before the fix, CROWN upper was ~0.34 while IBP upper was exactly 0.0.
 #[ntest::timeout(10000)]
@@ -616,8 +616,8 @@ fn test_spec_guided_crown_tighter_than_ibp_regression_3037() {
 }
 
 /// Same regression as above, but with a non-trivial spec matrix (Y_0 - Y_1).
-/// Verifies spec-guided CROWN is tighter than spec-applied IBP for the #2990
-/// weights on a 2-output variant.
+/// Verifies spec-guided CROWN is tighter than spec-applied IBP for the same
+/// minimized weights on a 2-output variant.
 #[ntest::timeout(10000)]
 #[test]
 fn test_spec_guided_crown_tighter_than_ibp_with_spec_matrix_3037() {
@@ -704,7 +704,7 @@ proptest! {
     ///
     /// This is the graph-network, spec-guided variant of the sequential
     /// `crown_tighter_than_ibp_linear_relu_linear` proptest in network.rs.
-    /// Catches #3037: spec-guided CROWN missing IBP intersection.
+    /// Catches spec-guided CROWN missing the IBP intersection.
     #[ntest::timeout(10000)]
     #[test]
     fn spec_guided_crown_tighter_than_ibp(

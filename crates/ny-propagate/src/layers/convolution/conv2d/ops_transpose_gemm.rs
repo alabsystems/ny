@@ -1175,7 +1175,7 @@ fn faer_mat_to_row_major(mat: &Mat<f32>, rows: usize, cols: usize) -> Vec<f32> {
     // Build the row-major buffer with `with_capacity` + `push` rather than
     // `vec![0.0; rows*cols]` + overwrite. Every slot is written exactly once,
     // so the zero-init memset (`_platform_memset`) was pure overhead; pushing
-    // produces bit-identical values without it. (#3795 alloc/copy reduction)
+    // produces bit-identical values without it.
     let mut flat = Vec::with_capacity(rows * cols);
     for row in 0..rows {
         for col in 0..cols {
@@ -1191,7 +1191,7 @@ fn faer_mat_to_row_major(mat: &Mat<f32>, rows: usize, cols: usize) -> Vec<f32> {
 /// the GEMM rows are processed in bounded batches so graph-CROWN can abort inside
 /// a single expensive Conv2d node instead of overshooting the global verifier
 /// timeout. Returns `DeadlineExceeded("...per-node deadline exceeded")`
-/// so higher layers can degrade to sound IBP fallback. Part of #3795.
+/// so higher layers can degrade to sound IBP fallback.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn conv2d_transpose_batched_gemm_grouped_with_deadline(
     a_coefficients: &Array2<f32>,
@@ -1366,7 +1366,7 @@ pub(crate) fn conv2d_transpose_batched_gemm_grouped_with_deadline(
                     ))
                 })?;
                 // `with_capacity` + `push`: every slot is written once below,
-                // so the zero-init memset is wasted work. (#3795)
+                // so the zero-init memset is wasted work.
                 let mut af = Vec::with_capacity(a_flat_len);
                 for row in 0..total_spatial {
                     for col in 0..out_c_per_group {
@@ -1393,7 +1393,7 @@ pub(crate) fn conv2d_transpose_batched_gemm_grouped_with_deadline(
             };
 
             // Try fused GPU conv_transpose_2d (GEMM + col2im in one GPU dispatch).
-            // This eliminates the CPU col2im bottleneck. Part of #3813.
+            // This eliminates the CPU col2im bottleneck.
             if let Some(eng) = engine {
                 let ct_params = ConvTranspose2dParams {
                     num_specs: num_objectives,
@@ -1576,7 +1576,7 @@ pub(crate) fn conv2d_transpose_batched_gemm_grouped_with_deadline(
 
         // Try fused GPU path: GEMM + col2im in one dispatch, skipping the entire
         // chunked CPU col2im loop. GPU dispatch is fast enough that per-group
-        // deadline granularity suffices. Part of #3813.
+        // deadline granularity suffices.
         if let Some(eng) = engine {
             let a_flat_len = total_spatial.checked_mul(out_c_per_group).ok_or_else(|| {
                 NyError::InvalidSpec(format!(
@@ -2217,6 +2217,7 @@ pub(crate) fn conv2d_transpose_backward_coeff_f64_with_engine_and_deadline(
         // (a `&dyn GemmEngine`, not required to be `Sync`), and it is the bounded
         // executor's authority path rather than a throughput path.
         if conv_in_size > 0 && bounded_engine.is_none() {
+            note_conv_f64_scatter_lane(CONV_F64_SCATTER_LANE_PARALLEL);
             result_flat
                 .par_chunks_mut(conv_in_size)
                 .enumerate()
@@ -2227,27 +2228,38 @@ pub(crate) fn conv2d_transpose_backward_coeff_f64_with_engine_and_deadline(
                     if deadline.is_some_and(|limit| Instant::now() >= limit) {
                         return Err(per_node_deadline_exceeded());
                     }
+                    // #f64-scatter-hoist: `ih` depends only on `(gy, ki)` and the
+                    // two flat bases only on `(gy, gx, ic_local, ki)`, so the
+                    // original nest re-derived all of them once per MAC —
+                    // `in_c_per_group * kw` times more often than they change.
+                    // Hoisting them leaves the (destination index, addend) pair
+                    // sequence and its order untouched: no float is read, written,
+                    // or rounded differently, so the scatter is bit-identical by
+                    // construction. Skipping the `kj` loop when `ih` is out of
+                    // range drops only iterations whose `if` was already false.
                     for gy in 0..grad_h {
+                        let anchor_h = gy * sh;
                         for gx in 0..grad_w {
+                            let anchor_w = gx * sw;
                             let spatial_offset = gy * grad_w + gx;
                             let col_row = obj * spatial_per_obj + spatial_offset;
+                            let col_base = col_row * kernel_cols_per_group;
                             for ic_local in 0..in_c_per_group {
                                 let ic = ic_start + ic_local;
+                                let out_channel_base = ic * input_spatial;
+                                let col_channel_base = col_base + ic_local * kernel_spatial;
                                 for ki in 0..kh {
+                                    let ih = (anchor_h + ki * dh) as isize - ph as isize;
+                                    if ih < 0 || ih >= in_h as isize {
+                                        continue;
+                                    }
+                                    let out_row_base = out_channel_base + ih as usize * in_w;
+                                    let col_row_base = col_channel_base + ki * kw;
                                     for kj in 0..kw {
-                                        let ih = (gy * sh + ki * dh) as isize - ph as isize;
-                                        let iw = (gx * sw + kj * dw) as isize - pw as isize;
-                                        if ih >= 0
-                                            && ih < in_h as isize
-                                            && iw >= 0
-                                            && iw < in_w as isize
-                                        {
-                                            let col_idx = ic_local * kernel_spatial + ki * kw + kj;
-                                            let out_idx = ic * input_spatial
-                                                + ih as usize * in_w
-                                                + iw as usize;
-                                            obj_out[out_idx] +=
-                                                col_flat[col_row * kernel_cols_per_group + col_idx];
+                                        let iw = (anchor_w + kj * dw) as isize - pw as isize;
+                                        if iw >= 0 && iw < in_w as isize {
+                                            obj_out[out_row_base + iw as usize] +=
+                                                col_flat[col_row_base + kj];
                                         }
                                     }
                                 }
@@ -2257,33 +2269,47 @@ pub(crate) fn conv2d_transpose_backward_coeff_f64_with_engine_and_deadline(
                     Ok(())
                 })?;
         } else if conv_in_size > 0 {
+            note_conv_f64_scatter_lane(CONV_F64_SCATTER_LANE_SERIAL);
             let mut scatter_ops = 0usize;
             for (obj, obj_out) in result_flat.chunks_mut(conv_in_size).enumerate() {
                 poll_authority()?;
+                // Same hoist as the parallel arm above. This arm keeps the
+                // per-MAC `scatter_ops` bookkeeping EXACTLY as it was — the
+                // counter still advances once per `(gy, gx, ic_local, ki, kj)`
+                // tuple and `poll_authority` is still called at the same tuple
+                // boundaries — so the bounded-executor poll cadence is unchanged
+                // as well as the arithmetic. `out_row_base` is computed only when
+                // `ih` is in range, so an out-of-range row cannot overflow the
+                // `usize` address arithmetic it never uses.
                 for gy in 0..grad_h {
+                    let anchor_h = gy * sh;
                     for gx in 0..grad_w {
+                        let anchor_w = gx * sw;
                         let spatial_offset = gy * grad_w + gx;
                         let col_row = obj * spatial_per_obj + spatial_offset;
+                        let col_base = col_row * kernel_cols_per_group;
                         for ic_local in 0..in_c_per_group {
                             let ic = ic_start + ic_local;
+                            let out_channel_base = ic * input_spatial;
+                            let col_channel_base = col_base + ic_local * kernel_spatial;
                             for ki in 0..kh {
+                                let ih = (anchor_h + ki * dh) as isize - ph as isize;
+                                let ih_in_range = ih >= 0 && ih < in_h as isize;
+                                let out_row_base = if ih_in_range {
+                                    out_channel_base + ih as usize * in_w
+                                } else {
+                                    0
+                                };
+                                let col_row_base = col_channel_base + ki * kw;
                                 for kj in 0..kw {
                                     if scatter_ops.is_multiple_of(DEADLINE_F64_CPU_POLL_OPS) {
                                         poll_authority()?;
                                     }
                                     scatter_ops = scatter_ops.wrapping_add(1);
-                                    let ih = (gy * sh + ki * dh) as isize - ph as isize;
-                                    let iw = (gx * sw + kj * dw) as isize - pw as isize;
-                                    if ih >= 0
-                                        && ih < in_h as isize
-                                        && iw >= 0
-                                        && iw < in_w as isize
-                                    {
-                                        let col_idx = ic_local * kernel_spatial + ki * kw + kj;
-                                        let out_idx =
-                                            ic * input_spatial + ih as usize * in_w + iw as usize;
-                                        obj_out[out_idx] +=
-                                            col_flat[col_row * kernel_cols_per_group + col_idx];
+                                    let iw = (anchor_w + kj * dw) as isize - pw as isize;
+                                    if ih_in_range && iw >= 0 && iw < in_w as isize {
+                                        obj_out[out_row_base + iw as usize] +=
+                                            col_flat[col_row_base + kj];
                                     }
                                 }
                             }
@@ -3086,6 +3112,105 @@ pub(super) const CONV_SOUND_F64_GEMM_MIN_MACS: usize = 1 << 24;
 /// engine may impose a smaller cap, but must retain the complete contraction.
 const CONV_DEADLINE_F64_ACCELERATOR_MAX_DISPATCH_MACS: usize = 1 << 24;
 
+/// Fill-lane identifiers for [`note_conv_fill_lane`]. Live in every build: the
+/// lane selections in [`conv_group_col_flat_f64`] and
+/// [`conv_group_col_flat_with_engine`] name them unconditionally.
+const CONV_FILL_LANE_A_HOISTED: usize = 0;
+const CONV_FILL_LANE_A_LEGACY: usize = 1;
+const CONV_FILL_LANE_W_HOISTED: usize = 2;
+const CONV_FILL_LANE_W_LEGACY: usize = 3;
+
+// Test-only record of which `#conv-fill-hoist` fill lane each of the two
+// no-deadline seams took, so `conv_fill_hoist_lanes_match_legacy_loops_bitwise`
+// can prove it compared the HOISTED lane against the legacy loops rather than
+// the legacy loops against themselves.
+//
+// The lanes are selected by five conditions that the parity test satisfies only
+// BY CONSTRUCTION: `Array2::as_slice` returning `Some`, `total_spatial %
+// spatial_per_obj == 0`, and the three kernel shape equalities. A later edit
+// that tightened any of them would send BOTH arms of that test down the
+// fallback, where it would still pass while comparing the fallback with itself
+// — an absence read as evidence. Counting the lane makes that a FAILURE,
+// because the test asserts the exact lane vector for every call.
+//
+// Thread-local, and every counter is bumped on the CALLING thread (never inside
+// the `par_chunks_mut` closure), so tests running concurrently in one process
+// cannot pollute each other's counts.
+#[cfg(test)]
+thread_local! {
+    /// Per-lane entry counts for this thread, indexed by the
+    /// `CONV_FILL_LANE_*` constants above.
+    static CONV_FILL_LANE_HITS: std::cell::Cell<[u32; 4]> =
+        const { std::cell::Cell::new([0u32; 4]) };
+}
+
+/// Record that `lane` was entered on this thread. Outside `cfg(test)` this is
+/// an empty function with no counter behind it, so the shipped fills pay
+/// nothing for it.
+#[cfg(test)]
+#[inline]
+fn note_conv_fill_lane(lane: usize) {
+    CONV_FILL_LANE_HITS.with(|hits| {
+        let mut taken = hits.get();
+        taken[lane] += 1;
+        hits.set(taken);
+    });
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn note_conv_fill_lane(_lane: usize) {}
+
+/// Read and clear this thread's fill-lane counters, indexed by the
+/// `CONV_FILL_LANE_*` constants.
+#[cfg(test)]
+fn take_conv_fill_lane_hits() -> [u32; 4] {
+    CONV_FILL_LANE_HITS.with(|hits| hits.replace([0u32; 4]))
+}
+
+/// Scatter-lane identifiers for [`note_conv_f64_scatter_lane`]: which of the two
+/// col2im arms of `conv2d_transpose_backward_coeff_f64_with_engine_and_deadline`
+/// a group actually ran. Live in every build so the call sites keep naming them.
+const CONV_F64_SCATTER_LANE_PARALLEL: usize = 0;
+const CONV_F64_SCATTER_LANE_SERIAL: usize = 1;
+
+// Deliberately a SEPARATE counter from `CONV_FILL_LANE_HITS`: that one pins the
+// operand fills and is asserted as an exact four-element vector, so widening it
+// would rewrite unrelated pins. Bumped on the CALLING thread — on the parallel
+// arm before `par_chunks_mut`, never inside the closure — so a test reads its
+// own counts even though the scatter body runs on rayon workers. (A plain
+// comment: a `///` on a macro invocation documents nothing.)
+#[cfg(test)]
+thread_local! {
+    /// Per-lane entry counts for this thread, indexed by the
+    /// `CONV_F64_SCATTER_LANE_*` constants above.
+    static CONV_F64_SCATTER_LANE_HITS: std::cell::Cell<[u32; 2]> =
+        const { std::cell::Cell::new([0u32; 2]) };
+}
+
+/// Record that `lane` was entered on this thread. Outside `cfg(test)` this is an
+/// empty function with no counter behind it, so the shipped scatter pays nothing.
+#[cfg(test)]
+#[inline]
+fn note_conv_f64_scatter_lane(lane: usize) {
+    CONV_F64_SCATTER_LANE_HITS.with(|hits| {
+        let mut taken = hits.get();
+        taken[lane] += 1;
+        hits.set(taken);
+    });
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn note_conv_f64_scatter_lane(_lane: usize) {}
+
+/// Read and clear this thread's f64 scatter-lane counters, indexed by the
+/// `CONV_F64_SCATTER_LANE_*` constants.
+#[cfg(test)]
+fn take_conv_f64_scatter_lane_hits() -> [u32; 2] {
+    CONV_F64_SCATTER_LANE_HITS.with(|hits| hits.replace([0u32; 2]))
+}
+
 /// Per-group conv-transpose `col_flat = A·W` in f64, routing the single f64 GEMM
 /// to the process-global sound engine (cuBLAS Dgemm) for large products, else the
 /// CPU triple-loop. The conv twin of [`crate::layers::linear::crown_single`]'s
@@ -3132,31 +3257,185 @@ fn conv_group_col_flat_f64(
     // independent, so faer's blocked f64 accumulation is covered by the same
     // certificate as the scalar loop (identical argument to the cuBLAS route).
     let fill_t = Instant::now();
-    let a64 = Mat::<f64>::from_fn(total_spatial, out_c_per_group, |row, oc_local| {
-        let obj = row / spatial_per_obj;
-        let spatial = row % spatial_per_obj;
-        let oc = oc_start + oc_local;
-        f64::from(a_coefficients[[obj, oc * spatial_per_obj + spatial]])
-    });
-    let w64 = Mat::<f64>::from_fn(out_c_per_group, kernel_cols_per_group, |oc_local, col| {
-        let oc = oc_start + oc_local;
-        let ic = col / kernel_spatial;
-        let rem = col % kernel_spatial;
-        let ki = rem / kw;
-        let kj = rem % kw;
-        f64::from(kernel[[oc, ic, ki, kj]])
-    });
+    // Fast lane (#conv-fill-hoist), ported from the deadline twin
+    // `conv_group_col_flat_f64_try_deadline_engine` — but the two sides do NOT
+    // have the twin's shape here, because this arm's destination is a faer
+    // `Mat` (column-major, `row_capacity`-padded) rather than the twin's
+    // row-major `Vec`. `Mat::from_fn` fills column-by-column (faer 0.24.0
+    // `mat/matown.rs::init_with`: outer loop over `Cols::indices`, inner over
+    // rows), so for a fixed `oc_local` the closure already walks the source in
+    // ascending `obj`, ascending `spatial` — runs of `spatial_per_obj`
+    // consecutive f32 — while writing a contiguous destination column. There
+    // is no transpose left to block on this side; what the closure pays per
+    // element is the `row / spatial_per_obj` div/rem pair and the
+    // bounds-checked 2-D `Array2` index, and that is what the run-copy below
+    // removes. It is not free: `Mat::zeros` writes the whole buffer once
+    // before the fill overwrites it, a pass `from_fn` does not pay. NOT
+    // measured — there is no benchmark data on the host this was written on.
+    //
+    // BIT-IDENTICAL: `Mat::zeros` IS `Mat::from_fn(|_, _| 0.0)` on the same
+    // `RawMat::try_with_capacity(nrows, ncols)`, so the operand handed to faer
+    // has the same dims, the same `row_capacity` and the same strides — which
+    // matters because faer selects kernels by operand layout — and every
+    // in-bounds cell is then overwritten with the f64 the closure would have
+    // produced for it. Only the fill order and the index arithmetic change.
+    // The source is re-sliced per objective ROW before being indexed, so a
+    // read that would have left row `obj` still panics exactly where the 2-D
+    // index did instead of silently reading a neighbouring row.
+    let a_flat = if a_coefficients.is_standard_layout() {
+        a_coefficients.as_slice()
+    } else {
+        None
+    };
+    // `.max(1)` is load-bearing, not defensive noise: every element of a tuple
+    // expression is evaluated before the pattern is matched, so the remainder
+    // is computed even on the calls where the `spatial_per_obj > 0` guard
+    // sitting beside it is false.
+    let a64 = if let (Some(a_flat), true, 0) = (
+        a_flat,
+        spatial_per_obj > 0 && out_c_per_group > 0 && total_spatial > 0,
+        total_spatial % spatial_per_obj.max(1),
+    ) {
+        note_conv_fill_lane(CONV_FILL_LANE_A_HOISTED);
+        let a_cols = a_coefficients.ncols();
+        let mut a64 = Mat::<f64>::zeros(total_spatial, out_c_per_group);
+        for oc_local in 0..out_c_per_group {
+            let src_base = (oc_start + oc_local) * spatial_per_obj;
+            // Destination column `oc_local` is contiguous (row stride 1) and
+            // the divisibility guard makes `total_spatial` an exact multiple
+            // of `spatial_per_obj`, so its chunks are whole objectives in
+            // ascending `obj` order — the same (obj, spatial) -> row map the
+            // closure computed with div/rem.
+            let column = a64.col_as_slice_mut(oc_local);
+            for (obj, dst_run) in column.chunks_mut(spatial_per_obj).enumerate() {
+                let row_slice = &a_flat[obj * a_cols..(obj + 1) * a_cols];
+                let src = &row_slice[src_base..src_base + spatial_per_obj];
+                for (dst, &value) in dst_run.iter_mut().zip(src) {
+                    *dst = f64::from(value);
+                }
+            }
+        }
+        a64
+    } else {
+        note_conv_fill_lane(CONV_FILL_LANE_A_LEGACY);
+        Mat::<f64>::from_fn(total_spatial, out_c_per_group, |row, oc_local| {
+            let obj = row / spatial_per_obj;
+            let spatial = row % spatial_per_obj;
+            let oc = oc_start + oc_local;
+            f64::from(a_coefficients[[obj, oc * spatial_per_obj + spatial]])
+        })
+    };
+    // W side (#conv-fill-hoist, same structural kernel guards as the twin).
+    // For a standard-layout `[OC, ic_g, kh, kw]` kernel the flat offset of
+    // `[oc, ic, ki, kj]` is `oc*(s1*s2*s3) + ic*(s2*s3) + ki*s3 + kj`; under
+    // the three shape equalities below that is exactly
+    // `oc * kernel_cols_per_group + col`, so both div/rem pairs and the 4-axis
+    // bounds-checked `ArrayD` index collapse to one flat read. The traversal
+    // stays `from_fn`'s, so the operand is filled cell for cell in the
+    // identical order and only the address computation changes.
+    //
+    // What is NOT fixed here, deliberately: because the destination is
+    // column-major, `from_fn` runs `oc_local` innermost, so this flat read
+    // still strides by `kernel_cols_per_group`. Blocking it would need several
+    // destination columns live at once, which faer's owned `Mat` exposes only
+    // one `&mut` column slice at a time; and this operand is the kernel group
+    // itself (`out_c_per_group x kernel_cols_per_group`) — A is the operand
+    // that grows with `total_spatial`. The twin gets a straight contiguous row
+    // copy on this side only because its destination is row-major.
+    let kernel_flat = if kernel.ndim() == 4
+        && kernel.is_standard_layout()
+        && kernel.shape()[1] * kernel.shape()[2] * kernel.shape()[3] == kernel_cols_per_group
+        && kernel.shape()[2] * kernel.shape()[3] == kernel_spatial
+        && kernel.shape()[3] == kw
+    {
+        kernel.as_slice_memory_order()
+    } else {
+        None
+    };
+    let w64 = if let Some(kernel_flat) = kernel_flat {
+        note_conv_fill_lane(CONV_FILL_LANE_W_HOISTED);
+        Mat::<f64>::from_fn(out_c_per_group, kernel_cols_per_group, |oc_local, col| {
+            let oc = oc_start + oc_local;
+            f64::from(kernel_flat[oc * kernel_cols_per_group + col])
+        })
+    } else {
+        note_conv_fill_lane(CONV_FILL_LANE_W_LEGACY);
+        Mat::<f64>::from_fn(out_c_per_group, kernel_cols_per_group, |oc_local, col| {
+            let oc = oc_start + oc_local;
+            let ic = col / kernel_spatial;
+            let rem = col % kernel_spatial;
+            let ki = rem / kw;
+            let kj = rem % kw;
+            f64::from(kernel[[oc, ic, ki, kj]])
+        })
+    };
     CONV_GROUP_FILL_NANOS.fetch_add(
         u64::try_from(fill_t.elapsed().as_nanos()).unwrap_or(u64::MAX),
         std::sync::atomic::Ordering::Relaxed,
     );
     let prod = crate::faer_parallelism::mat_mul_f64(&a64, &w64);
     let mut col_flat = vec![0.0f64; total_spatial * kernel_cols_per_group];
-    for row in 0..total_spatial {
-        let col_base = row * kernel_cols_per_group;
-        for col in 0..kernel_cols_per_group {
-            col_flat[col_base + col] = prod[(row, col)];
+    // Copy-out (#conv-fill-hoist, transpose side). `prod` is a column-major
+    // faer `Mat` and `col_flat` is row-major, so the former row-major sweep
+    // read `prod[(row, col)]` down a column stride, holding one open cache
+    // line per column, and paid a bounds check per cell. That is the same
+    // defect `faer_parallelism.rs` records against the deadline-GEMM tile loop
+    // ("the per-element bounds-checked 2D `dst[(i, j)]` copy"). Only the
+    // SOURCE stream becomes sequential: per column the tile reads `r1 - r0`
+    // consecutive f64s out of `prod`. The destination is NOT written in runs —
+    // each store lands at `dst_row[col]`, `kernel_cols_per_group` apart, one
+    // element per column pass. What the tiling buys on that side is residency,
+    // not sequentiality: a 64x64 f64 tile touches 512 B in each of 64
+    // destination rows (32 KiB), so every destination line it opens is filled
+    // to completion across the tile's 64 column passes before it is evicted.
+    //
+    // WHICH SIDE THE WIN COMES FROM — and it is workload-dependent and NOT
+    // MEASURED. The pre-existing sweep already had a perfectly sequential
+    // destination; its defect was the SOURCE, `prod[(row, col)]` strided by
+    // `prod`'s column stride (>= `total_spatial`), so the inner sweep over
+    // `col` held `kernel_cols_per_group` distinct cache lines open at once.
+    // That only hurts once they stop fitting: at `kernel_cols_per_group = 72`
+    // (parity case 1 in this file's own tests) it is 72 lines = 4.5 KiB,
+    // trivially L1-resident and reused by 8 consecutive rows, and the tiling is
+    // then pure loop overhead. At cGAN-class widths (`ic_g * kh * kw` in the
+    // thousands) it is hundreds of KiB and each load pulls a line used once.
+    // What the rewrite buys unconditionally is the bounds check: the source is
+    // now read through a slice iterator instead of `prod[(row, col)]`.
+    //
+    // The closest measured evidence in the tree is not this loop but its
+    // cousin: `faer_parallelism.rs`'s 2026-08-21 "Receipts for this choice"
+    // acceptance row timed the same column-major-to-row-major copy over the
+    // deadline GEMM's tiles at 21.5 s per-element against 16.7 s L1-blocked
+    // (tile_mm 7.8 + copy 7.2). Different loop, different shapes — a
+    // direction, not a number for this seam.
+    //
+    // This moves NO float through an arithmetic operation — every value is the
+    // same `prod` cell stored at the same `col_flat` offset, a pure reordering
+    // of stores — so it is bit-identical by construction. Deliberately NOT
+    // taken: making `mat_mul_f64` write `col_flat` directly through a
+    // row-major `MatMut`. That eliminates the copy entirely, but
+    // `faer_parallelism.rs` records in its own words that faer's dot order
+    // tracks destination layout and that exactly this rewrite cost 1 ULP, so
+    // it is a measured change, not a free one.
+    const COPY_OUT_TILE: usize = 64;
+    let mut r0 = 0usize;
+    while r0 < total_spatial {
+        let r1 = (r0 + COPY_OUT_TILE).min(total_spatial);
+        let mut c0 = 0usize;
+        while c0 < kernel_cols_per_group {
+            let c1 = (c0 + COPY_OUT_TILE).min(kernel_cols_per_group);
+            // `kernel_cols_per_group > 0` inside this loop, so the row chunking
+            // below is well defined and every chunk is one whole output row.
+            let dst_tile = &mut col_flat[r0 * kernel_cols_per_group..r1 * kernel_cols_per_group];
+            for col in c0..c1 {
+                let src = &prod.col_as_slice(col)[r0..r1];
+                for (dst_row, &value) in dst_tile.chunks_mut(kernel_cols_per_group).zip(src) {
+                    dst_row[col] = value;
+                }
+            }
+            c0 = c1;
         }
+        r0 = r1;
     }
     col_flat
 }
@@ -3210,25 +3489,142 @@ fn conv_group_col_flat_with_engine(
 ) -> Option<Vec<f64>> {
     // A: (total_spatial × out_c_per_group) row-major; exact f32→f64 widening.
     let mut a64 = vec![0.0f64; total_spatial * out_c_per_group];
-    for row in 0..total_spatial {
-        let obj = row / spatial_per_obj;
-        let spatial = row % spatial_per_obj;
-        for oc_local in 0..out_c_per_group {
-            let oc = oc_start + oc_local;
-            a64[row * out_c_per_group + oc_local] =
-                f64::from(a_coefficients[[obj, oc * spatial_per_obj + spatial]]);
+    // Fast lane (#conv-fill-hoist), ported from the deadline twin
+    // `conv_group_col_flat_f64_try_deadline_engine`. Both arms had the same
+    // two pre-hoist fills; only the deadline one was repaired, and this is the
+    // arm the BATCHED beta-CROWN/BaB verdict path reaches (no deadline is in
+    // scope there), via `conv_group_col_flat_via_engine`. Same operand values,
+    // same row-major destination layout, same buffer: only the fill's scan
+    // order and its index arithmetic change.
+    let a_flat = if a_coefficients.is_standard_layout() {
+        a_coefficients.as_slice()
+    } else {
+        None
+    };
+    // The guard is written to read identically to the one in
+    // `conv_group_col_flat_f64`, `total_spatial > 0` included. That term is
+    // redundant on both sides — `par_chunks_mut` on an empty slice yields no
+    // chunks, and `Mat::zeros(0, _)` has no cells — but two ports of one
+    // optimisation whose guards differ invite the next reader to hunt for a
+    // reason that does not exist.
+    //
+    // `.max(1)` is load-bearing, not defensive noise: every element of a tuple
+    // expression is evaluated before the pattern is matched, so the remainder
+    // is computed even on the calls where the `spatial_per_obj > 0` guard
+    // sitting beside it is false.
+    if let (Some(a_flat), true, 0) = (
+        a_flat,
+        spatial_per_obj > 0 && out_c_per_group > 0 && total_spatial > 0,
+        total_spatial % spatial_per_obj.max(1),
+    ) {
+        // Cache-blocked per-objective transpose. The legacy loop below walks
+        // `oc_local` innermost against a source that strides by
+        // `spatial_per_obj` f32, so once that stride covers a line it reads one
+        // element per cache line — the shape the twin repaired. Per `obj`
+        // the source block is (out_c × spatial) row-major and the destination
+        // wants its transpose, so tiling `spatial` to keep a destination tile
+        // of `s_tile * out_c_per_group` f64s L2-resident makes every source
+        // read sequential and finishes each destination line while it is still
+        // resident.
+        //
+        // Objectives own disjoint destination chunks, and the divisibility
+        // guard makes the chunk count exactly `total_spatial / spatial_per_obj`
+        // (every chunk one whole objective), so the `par_chunks_mut` split
+        // writes the same f64 to the same offset as the serial loop — there is
+        // no cross-chunk read and no accumulation. Unlike the twin this lane
+        // has no deadline and no non-finite early return to reproduce, so the
+        // closure carries no flags. `out_c_per_group > 0` joins the guard
+        // because `par_chunks_mut` panics on a zero chunk size; the twin
+        // reaches its copy only past an early return this arm has no place for.
+        //
+        // Nesting is safe here even though this seam is normally reached from
+        // inside an outer BaB `par_iter`: a `par_chunks_mut` scope is
+        // work-stealing, so it finds no idle worker when the batch already
+        // saturates the pool and fans out when it does not (the self-balancing
+        // argument `faer_parallelism.rs`'s `NestedFaerParGuard` records). It
+        // spawns no threads, and it holds no lock: `with_engine`
+        // (`sound_f64_gemm.rs`) invokes this closure AFTER its
+        // `OnceLock::get_or_init` has returned, not while the slot is being
+        // initialized.
+        //
+        // Reads are taken through a per-objective ROW slice, so an index that
+        // would have left row `obj` panics exactly where the 2-D `Array2`
+        // index did rather than silently reading the next row.
+        note_conv_fill_lane(CONV_FILL_LANE_A_HOISTED);
+        let a_cols = a_coefficients.ncols();
+        let s_tile = (32_768 / out_c_per_group.max(1)).max(64);
+        a64.par_chunks_mut(spatial_per_obj * out_c_per_group)
+            .enumerate()
+            .for_each(|(obj, obj_out)| {
+                let row_slice = &a_flat[obj * a_cols..(obj + 1) * a_cols];
+                let mut s0 = 0usize;
+                while s0 < spatial_per_obj {
+                    let s1 = (s0 + s_tile).min(spatial_per_obj);
+                    for oc_local in 0..out_c_per_group {
+                        let src_base = (oc_start + oc_local) * spatial_per_obj;
+                        let src = &row_slice[src_base + s0..src_base + s1];
+                        for (ds, &value) in src.iter().enumerate() {
+                            obj_out[(s0 + ds) * out_c_per_group + oc_local] = f64::from(value);
+                        }
+                    }
+                    s0 = s1;
+                }
+            });
+    } else {
+        note_conv_fill_lane(CONV_FILL_LANE_A_LEGACY);
+        for row in 0..total_spatial {
+            let obj = row / spatial_per_obj;
+            let spatial = row % spatial_per_obj;
+            for oc_local in 0..out_c_per_group {
+                let oc = oc_start + oc_local;
+                a64[row * out_c_per_group + oc_local] =
+                    f64::from(a_coefficients[[obj, oc * spatial_per_obj + spatial]]);
+            }
         }
     }
     // W: (out_c_per_group × kernel_cols_per_group) row-major.
     let mut w64 = vec![0.0f64; out_c_per_group * kernel_cols_per_group];
-    for oc_local in 0..out_c_per_group {
-        let oc = oc_start + oc_local;
-        for col in 0..kernel_cols_per_group {
-            let ic = col / kernel_spatial;
-            let rem = col % kernel_spatial;
-            let ki = rem / kw;
-            let kj = rem % kw;
-            w64[oc_local * kernel_cols_per_group + col] = f64::from(kernel[[oc, ic, ki, kj]]);
+    // Fast lane (#conv-fill-hoist, W side), same structural guards as the
+    // twin: for a standard-layout `[OC, ic_g, kh, kw]` kernel the flat offset
+    // of `[oc, ic, ki, kj]` is `oc*(s1*s2*s3) + ic*(s2*s3) + ki*s3 + kj`, and
+    // under the three shape equalities below that is exactly
+    // `oc * kernel_cols_per_group + col`. Because the destination row here is
+    // also contiguous, each `oc` becomes one contiguous-to-contiguous widening
+    // copy and the whole `/kernel_spatial; %; /kw; %kw` chain plus the 4-axis
+    // bounds-checked `ArrayD` index disappear. Any shape mismatch keeps the
+    // legacy loop.
+    let kernel_flat = if kernel.ndim() == 4
+        && kernel.is_standard_layout()
+        && kernel.shape()[1] * kernel.shape()[2] * kernel.shape()[3] == kernel_cols_per_group
+        && kernel.shape()[2] * kernel.shape()[3] == kernel_spatial
+        && kernel.shape()[3] == kw
+    {
+        kernel.as_slice_memory_order()
+    } else {
+        None
+    };
+    if let Some(kernel_flat) = kernel_flat {
+        note_conv_fill_lane(CONV_FILL_LANE_W_HOISTED);
+        for oc_local in 0..out_c_per_group {
+            let oc = oc_start + oc_local;
+            let src = &kernel_flat[oc * kernel_cols_per_group..(oc + 1) * kernel_cols_per_group];
+            let dst_base = oc_local * kernel_cols_per_group;
+            let dst_row = &mut w64[dst_base..dst_base + kernel_cols_per_group];
+            for (dst, &value) in dst_row.iter_mut().zip(src) {
+                *dst = f64::from(value);
+            }
+        }
+    } else {
+        note_conv_fill_lane(CONV_FILL_LANE_W_LEGACY);
+        for oc_local in 0..out_c_per_group {
+            let oc = oc_start + oc_local;
+            for col in 0..kernel_cols_per_group {
+                let ic = col / kernel_spatial;
+                let rem = col % kernel_spatial;
+                let ki = rem / kw;
+                let kj = rem % kw;
+                w64[oc_local * kernel_cols_per_group + col] = f64::from(kernel[[oc, ic, ki, kj]]);
+            }
         }
     }
     match eng.gemm_f64(
@@ -4273,6 +4669,243 @@ mod tests {
         }
     }
 
+    /// #conv-fill-hoist parity for BOTH no-deadline arms: the hoisted fills
+    /// must reproduce the legacy loops BIT-FOR-BIT, not to a tolerance. The
+    /// hoists are a pure reordering plus cheaper address arithmetic — same f32
+    /// widened to the same f64, written to the same offset of the same operand
+    /// layout — so any drift at all means an index or a layout changed, and a
+    /// changed operand layout is exactly what makes faer pick a different
+    /// kernel (`faer_parallelism.rs` records that costing 1 ULP).
+    ///
+    /// LAYOUT is the only thing varied. A C-order `Array2` and a C-order
+    /// `[OC, ic_g, kh, kw]` kernel satisfy the structural guards and take the
+    /// hoisted lanes; the same values in an F-order `Array2` and an
+    /// axis-permuted kernel fail them and take the legacy loops. The two cases
+    /// are sized so both new tile loops cross a boundary: case 1 makes the
+    /// copy-out tile partial in BOTH dimensions (75 rows x 72 cols against a
+    /// 64x64 tile), and case 2 makes `out_c_per_group` large enough that the A
+    /// lane's `s_tile` is 64 against `spatial_per_obj = 100`, so it runs one
+    /// full tile and one partial one. No kernel axis is length 1 in either
+    /// case: `is_standard_layout` SKIPS unit axes, so a permuted `[N,1,1,1]`
+    /// kernel still reports C-order and would silently take the fast lane the
+    /// case exists to avoid.
+    ///
+    /// IT FAILS CLOSED, which is the whole point of the lane counters. Two
+    /// calls agreeing is evidence only while the first of them actually ENTERS
+    /// the hoisted lane. Those lanes are gated by five conditions this test
+    /// satisfies by construction and never observed before — `as_slice` being
+    /// `Some`, the `total_spatial % spatial_per_obj` divisibility, and three
+    /// kernel shape equalities — so an edit tightening any one of them would
+    /// have sent both arms down the fallback and left a green test comparing
+    /// the fallback with itself. Every call below is therefore bracketed by
+    /// `take_conv_fill_lane_hits` and asserted to have entered its two lanes
+    /// exactly once and the other two not at all, and every guard condition is
+    /// asserted on the fixture as well. The lane vector also pins the routing:
+    /// both cases keep MACs under `CONV_SOUND_F64_GEMM_MIN_MACS` (asserted),
+    /// so `conv_group_col_flat_f64` stays on its faer CPU path instead of
+    /// re-entering `conv_group_col_flat_with_engine` — which would double the
+    /// counts — and the test never touches the process-global engine slot.
+    #[test]
+    fn conv_fill_hoist_lanes_match_legacy_loops_bitwise() {
+        use super::{
+            conv_group_col_flat_f64, conv_group_col_flat_with_engine, take_conv_fill_lane_hits,
+            CONV_FILL_LANE_A_HOISTED, CONV_FILL_LANE_A_LEGACY, CONV_FILL_LANE_W_HOISTED,
+            CONV_FILL_LANE_W_LEGACY, CONV_SOUND_F64_GEMM_MIN_MACS,
+        };
+        use ndarray::{Array2, ArrayD, IxDyn};
+        use ny_core::NaiveCpuGemmEngine;
+
+        // The lane vectors below are written positionally, so pin the indices:
+        // renumbering the constants must break this test, not silently rotate
+        // what it asserts.
+        assert_eq!(
+            [
+                CONV_FILL_LANE_A_HOISTED,
+                CONV_FILL_LANE_A_LEGACY,
+                CONV_FILL_LANE_W_HOISTED,
+                CONV_FILL_LANE_W_LEGACY,
+            ],
+            [0usize, 1, 2, 3],
+            "lane vectors are [A hoisted, A legacy, W hoisted, W legacy]"
+        );
+        const BOTH_HOISTED: [u32; 4] = [1, 0, 1, 0];
+        const BOTH_LEGACY: [u32; 4] = [0, 1, 0, 1];
+
+        // (num_obj, spatial_per_obj, oc, icpg, kh, kw)
+        const CASES: [(usize, usize, usize, usize, usize, usize); 2] =
+            [(3, 25, 4, 8, 3, 3), (2, 100, 512, 2, 2, 2)];
+
+        for &(num_obj, spatial_per_obj, oc, icpg, kh, kw) in &CASES {
+            let total_spatial = num_obj * spatial_per_obj;
+            let kernel_spatial = kh * kw;
+            let kcpg = icpg * kernel_spatial;
+            let a_value = |obj: usize, j: usize| ((obj * 31 + j * 17) % 97) as f32 * 0.03 - 1.4;
+            let k_value = |o: usize, i: usize, r: usize, c: usize| {
+                ((o * 13 + i * 7 + r * 3 + c) % 89) as f32 * 0.05 - 2.1
+            };
+
+            let a_c =
+                Array2::from_shape_fn((num_obj, oc * spatial_per_obj), |(obj, j)| a_value(obj, j));
+            let k_c = ArrayD::from_shape_fn(IxDyn(&[oc, icpg, kh, kw]), |d| {
+                k_value(d[0], d[1], d[2], d[3])
+            });
+
+            // Every condition the hoisted lanes gate on, observed on the
+            // fixture rather than assumed. `is_standard_layout` is one of five.
+            assert!(a_c.is_standard_layout(), "C-order A must report C order");
+            assert!(
+                a_c.as_slice().is_some(),
+                "the A hoist reads through `as_slice`, which must be `Some`"
+            );
+            assert_eq!(
+                a_c.ncols(),
+                oc * spatial_per_obj,
+                "the A hoist slices each objective row by `ncols()`"
+            );
+            assert!(spatial_per_obj > 0 && oc > 0 && total_spatial > 0);
+            assert_eq!(
+                total_spatial % spatial_per_obj,
+                0,
+                "the A hoist needs exact divisibility"
+            );
+            assert_eq!(k_c.ndim(), 4, "the W hoist requires a 4-axis kernel");
+            assert!(
+                k_c.is_standard_layout(),
+                "C-order kernel must report C order"
+            );
+            assert!(
+                k_c.as_slice_memory_order().is_some(),
+                "the W hoist reads through `as_slice_memory_order`"
+            );
+            assert_eq!(k_c.shape()[1] * k_c.shape()[2] * k_c.shape()[3], kcpg);
+            assert_eq!(k_c.shape()[2] * k_c.shape()[3], kernel_spatial);
+            assert_eq!(k_c.shape()[3], kw);
+            assert!(
+                total_spatial * oc * kcpg < CONV_SOUND_F64_GEMM_MIN_MACS,
+                "the case must stay under the engine-routing threshold, or \
+                 `conv_group_col_flat_f64` re-enters the engine seam and every \
+                 lane count below doubles"
+            );
+
+            // Same values, layouts the guards reject.
+            let a_f =
+                Array2::from_shape_fn((oc * spatial_per_obj, num_obj), |(j, obj)| a_value(obj, j))
+                    .reversed_axes();
+            let k_p = ArrayD::from_shape_fn(IxDyn(&[kw, kh, icpg, oc]), |d| {
+                k_value(d[3], d[2], d[1], d[0])
+            })
+            .permuted_axes(IxDyn(&[3, 2, 1, 0]));
+            assert!(
+                !a_f.is_standard_layout(),
+                "F-order A must take the fallback"
+            );
+            assert!(
+                a_f.as_slice().is_none(),
+                "F-order A must not expose a C-order flat slice"
+            );
+            assert!(
+                !k_p.is_standard_layout(),
+                "permuted kernel must take the fallback"
+            );
+            assert!(a_f == a_c, "the two A layouts must hold the same values");
+            assert!(
+                k_p == k_c,
+                "the two kernel layouts must hold the same values"
+            );
+
+            // Discard any residue so each call is measured in isolation.
+            let _ = take_conv_fill_lane_hits();
+
+            let hoisted = conv_group_col_flat_with_engine(
+                &NaiveCpuGemmEngine,
+                &a_c,
+                &k_c,
+                0,
+                oc,
+                kcpg,
+                total_spatial,
+                spatial_per_obj,
+                kernel_spatial,
+                kw,
+            )
+            .expect("engine seam, hoisted fills");
+            assert_eq!(
+                take_conv_fill_lane_hits(),
+                BOTH_HOISTED,
+                "engine seam on C-order operands must enter BOTH hoisted lanes exactly once"
+            );
+            let legacy = conv_group_col_flat_with_engine(
+                &NaiveCpuGemmEngine,
+                &a_f,
+                &k_p,
+                0,
+                oc,
+                kcpg,
+                total_spatial,
+                spatial_per_obj,
+                kernel_spatial,
+                kw,
+            )
+            .expect("engine seam, legacy fills");
+            assert_eq!(
+                take_conv_fill_lane_hits(),
+                BOTH_LEGACY,
+                "engine seam on rejected layouts must fall to BOTH legacy loops"
+            );
+            assert_eq!(hoisted.len(), total_spatial * kcpg);
+            assert_eq!(hoisted.len(), legacy.len());
+            for (i, (fast, slow)) in hoisted.iter().zip(&legacy).enumerate() {
+                assert_eq!(
+                    fast.to_bits(),
+                    slow.to_bits(),
+                    "engine-seam bit drift at {i}: {fast:e} vs {slow:e}"
+                );
+            }
+
+            let hoisted_cpu = conv_group_col_flat_f64(
+                &a_c,
+                &k_c,
+                0,
+                oc,
+                kcpg,
+                total_spatial,
+                spatial_per_obj,
+                kernel_spatial,
+                kw,
+            );
+            assert_eq!(
+                take_conv_fill_lane_hits(),
+                BOTH_HOISTED,
+                "faer CPU lane on C-order operands must enter BOTH hoisted lanes exactly once"
+            );
+            let legacy_cpu = conv_group_col_flat_f64(
+                &a_f,
+                &k_p,
+                0,
+                oc,
+                kcpg,
+                total_spatial,
+                spatial_per_obj,
+                kernel_spatial,
+                kw,
+            );
+            assert_eq!(
+                take_conv_fill_lane_hits(),
+                BOTH_LEGACY,
+                "faer CPU lane on rejected layouts must fall to BOTH legacy loops"
+            );
+            assert_eq!(hoisted_cpu.len(), total_spatial * kcpg);
+            assert_eq!(hoisted_cpu.len(), legacy_cpu.len());
+            for (i, (fast, slow)) in hoisted_cpu.iter().zip(&legacy_cpu).enumerate() {
+                assert_eq!(
+                    fast.to_bits(),
+                    slow.to_bits(),
+                    "faer CPU lane bit drift at {i}: {fast:e} vs {slow:e}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn deadline_conv_engine_uses_one_full_k_bounded_product_for_nonzero_group() {
         let fixture = deadline_conv_fixture();
@@ -5037,7 +5670,7 @@ mod tests {
 
     /// `faer_mat_to_row_major` was changed from `vec![0.0; n]` + indexed
     /// overwrite to `Vec::with_capacity` + `push` to drop the wasted zero-init
-    /// memset (#3795). This asserts the row-major layout and values are
+    /// memset. This asserts the row-major layout and values are
     /// bit-identical to the explicit reference, i.e. the alloc change did not
     /// alter any numerics. (col-major faer Mat -> row-major flat)
     #[test]
@@ -5065,5 +5698,236 @@ mod tests {
                 assert_eq!(got[row * cols + col], mat[(row, col)]);
             }
         }
+    }
+
+    /// Independent naive model of the f64 conv-transpose col2im scatter, walked
+    /// in the mathematical order `(obj, oc, gy, gx, ic_local, ki, kj)` — a
+    /// DIFFERENT nesting from the shipped `GEMM over oc, then scatter` split.
+    /// The caller feeds it only small integers, so every product and every
+    /// partial sum is an exact f64 and no accumulation order can separate the
+    /// two; that is what licenses asserting equality on BITS instead of a
+    /// tolerance.
+    #[allow(clippy::too_many_arguments)]
+    fn naive_f64_transpose_backward(
+        a_coefficients: &Array2<f32>,
+        kernel: &ArrayD<f32>,
+        stride: (usize, usize),
+        padding: (usize, usize),
+        dilation: (usize, usize),
+        output_size: (usize, usize),
+        grad_size: (usize, usize),
+        groups: usize,
+    ) -> Array2<f64> {
+        let (in_h, in_w) = output_size;
+        let (grad_h, grad_w) = grad_size;
+        let (sh, sw) = stride;
+        let (ph, pw) = padding;
+        let (dh, dw) = dilation;
+        let out_c = kernel.shape()[0];
+        let in_c_per_group = kernel.shape()[1];
+        let kh = kernel.shape()[2];
+        let kw = kernel.shape()[3];
+        let out_c_per_group = out_c / groups;
+        let spatial_per_obj = grad_h * grad_w;
+        let input_spatial = in_h * in_w;
+        let num_objectives = a_coefficients.nrows();
+        let mut out =
+            Array2::<f64>::zeros((num_objectives, in_c_per_group * groups * input_spatial));
+        for obj in 0..num_objectives {
+            for oc in 0..out_c {
+                let ic_start = (oc / out_c_per_group) * in_c_per_group;
+                for gy in 0..grad_h {
+                    for gx in 0..grad_w {
+                        let av = f64::from(
+                            a_coefficients[[obj, oc * spatial_per_obj + gy * grad_w + gx]],
+                        );
+                        for ic_local in 0..in_c_per_group {
+                            for ki in 0..kh {
+                                let ih = (gy * sh + ki * dh) as isize - ph as isize;
+                                for kj in 0..kw {
+                                    let iw = (gx * sw + kj * dw) as isize - pw as isize;
+                                    if ih >= 0
+                                        && ih < in_h as isize
+                                        && iw >= 0
+                                        && iw < in_w as isize
+                                    {
+                                        let col = (ic_start + ic_local) * input_spatial
+                                            + ih as usize * in_w
+                                            + iw as usize;
+                                        out[[obj, col]] +=
+                                            av * f64::from(kernel[[oc, ic_local, ki, kj]]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// #f64-scatter-hoist pin. The hoist lifted `ih`, both flat bases and an
+    /// out-of-range row skip out of the innermost loop; it must not have moved a
+    /// single float. The geometry exercises every part that moved: `ph = 1` with
+    /// `sh = dh = 2` drives `ih` NEGATIVE at `gy = ki = 0` and PAST `in_h` at
+    /// `gy = 2, ki = 1`, so the new `continue` fires in both directions (only
+    /// input rows 1 and 3 can receive anything at all, asserted below);
+    /// `pw = 2` drives `iw` negative; `groups = 2` makes `ic_start` nonzero; and
+    /// no two of `sh/sw`, `dh/dw`, `kh/kw`, `grad_h/grad_w`, `in_h/in_w` are
+    /// equal, so a transposed index cannot pass by symmetry.
+    ///
+    /// IT FAILS CLOSED ON LANE COVERAGE. Two calls agreeing is evidence only
+    /// while each one enters the arm it is supposed to, so both arms are
+    /// counted and each is asserted to have run once PER GROUP with the other at
+    /// zero: a reroute that quietly sends both calls down one arm breaks this
+    /// test instead of comparing an arm with itself. The bounded call
+    /// additionally pins `ordinary_calls`, which only the serial bounded-host
+    /// seam can bump.
+    #[test]
+    fn f64_col2im_scatter_hoist_matches_naive_reference_on_both_arms() {
+        use super::{
+            take_conv_f64_scatter_lane_hits, CONV_F64_SCATTER_LANE_PARALLEL,
+            CONV_F64_SCATTER_LANE_SERIAL,
+        };
+
+        // The lane vectors below are written positionally, so pin the indices:
+        // renumbering the constants must break this test, not rotate what it
+        // asserts.
+        assert_eq!(
+            [CONV_F64_SCATTER_LANE_PARALLEL, CONV_F64_SCATTER_LANE_SERIAL],
+            [0usize, 1],
+            "lane vectors are [parallel, serial]"
+        );
+
+        let out_c = 4usize;
+        let groups = 2usize;
+        let in_c_per_group = 3usize;
+        let in_c = in_c_per_group * groups;
+        let (kh, kw) = (2usize, 3usize);
+        let stride = (2usize, 1usize);
+        let padding = (1usize, 2usize);
+        let dilation = (2usize, 1usize);
+        let grad_size = (3usize, 4usize);
+        let output_size = (5usize, 4usize);
+        let num_objectives = 3usize;
+        let spatial_per_obj = grad_size.0 * grad_size.1;
+        let input_spatial = output_size.0 * output_size.1;
+
+        let a = Array2::from_shape_fn((num_objectives, out_c * spatial_per_obj), |(i, j)| {
+            ((i * 7 + j * 5) % 9) as f32 - 4.0
+        });
+        let kernel = ArrayD::from_shape_fn(IxDyn(&[out_c, in_c_per_group, kh, kw]), |d| {
+            ((d[0] * 3 + d[1] * 5 + d[2] * 7 + d[3]) % 7) as f32 - 3.0
+        });
+        assert!(
+            a.iter().chain(kernel.iter()).all(|v| v.fract() == 0.0),
+            "fixture must be integer-valued: that is what licenses the bit assert"
+        );
+
+        let expected = naive_f64_transpose_backward(
+            &a,
+            &kernel,
+            stride,
+            padding,
+            dilation,
+            output_size,
+            grad_size,
+            groups,
+        );
+        // An all-zero or fully dense expectation would prove nothing about the
+        // guard: demand both a written cell and a skipped one.
+        assert!(
+            expected.iter().any(|v| *v != 0.0),
+            "fixture must actually write something"
+        );
+        assert!(
+            expected.iter().any(|v| *v == 0.0),
+            "fixture must leave out-of-range cells untouched"
+        );
+
+        // Input rows 0, 2 and 4 are unreachable for this geometry, so they pin
+        // the skip directly: a mis-hoisted `ih` would deposit into them.
+        let assert_unreachable_rows_empty = |label: &str, got: &Array2<f64>| {
+            for obj in 0..num_objectives {
+                for ic in 0..in_c {
+                    for ih in [0usize, 2, 4] {
+                        for iw in 0..output_size.1 {
+                            let col = ic * input_spatial + ih * output_size.1 + iw;
+                            assert_eq!(
+                                got[[obj, col]],
+                                0.0,
+                                "{label}: row {ih} is out of reach yet obj {obj} ic {ic} \
+                                 iw {iw} received a contribution"
+                            );
+                        }
+                    }
+                }
+            }
+        };
+
+        let _ = take_conv_f64_scatter_lane_hits();
+        let parallel = conv2d_transpose_backward_coeff_f64(
+            &a,
+            &kernel,
+            stride,
+            padding,
+            dilation,
+            output_size,
+            grad_size,
+            out_c,
+            groups,
+            1,
+        )
+        .expect("engine-free f64 backward");
+        assert_eq!(
+            take_conv_f64_scatter_lane_hits(),
+            [2, 0],
+            "engine-free call must take the parallel scatter once per group"
+        );
+        assert_eq!(parallel.dim(), expected.dim());
+        for (got, want) in parallel.iter().zip(expected.iter()) {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "parallel scatter drifted: {got:?} vs {want:?}"
+            );
+        }
+        assert_unreachable_rows_empty("parallel", &parallel);
+
+        let engine = PollableBoundedHostConvEngine::default();
+        let serial = conv2d_transpose_backward_coeff_f64_with_engine_and_deadline(
+            &a,
+            &kernel,
+            stride,
+            padding,
+            dilation,
+            output_size,
+            grad_size,
+            out_c,
+            groups,
+            1,
+            Some(&engine),
+            None,
+        )
+        .expect("bounded-host f64 backward");
+        assert_eq!(
+            take_conv_f64_scatter_lane_hits(),
+            [0, 2],
+            "bounded-host call must take the serial scatter once per group"
+        );
+        assert!(
+            engine.ordinary_calls.load(Ordering::SeqCst) >= 1,
+            "bounded-host seam must be what produced col_flat"
+        );
+        assert_eq!(serial.dim(), expected.dim());
+        for (got, want) in serial.iter().zip(expected.iter()) {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "serial scatter drifted: {got:?} vs {want:?}"
+            );
+        }
+        assert_unreachable_rows_empty("serial", &serial);
     }
 }

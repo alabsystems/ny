@@ -357,7 +357,7 @@ fn test_nan_lambda_cut_evicted_as_hard_stale_2598() {
     );
 }
 
-/// Regression test for #3148: the create_parent_cut guard must reject
+/// Regression test: the create_parent_cut guard must reject
 /// non-finite parent biases. We inject -Inf bias via direct struct push
 /// (bypassing CuttingPlane::new validation) to verify the guard fires.
 /// Without the guard, merge would propagate -Inf into the parent cut.

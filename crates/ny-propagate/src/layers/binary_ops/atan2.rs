@@ -33,8 +33,7 @@ fn full_angle_range() -> (f32, f32) {
 #[inline]
 fn atan2_bounds_scalar(y_lower: f32, y_upper: f32, x_lower: f32, x_upper: f32) -> (f32, f32) {
     let contains_origin = y_lower <= 0.0 && y_upper >= 0.0 && x_lower <= 0.0 && x_upper >= 0.0;
-    // Soundness note: the branch-cut/origin handling follows the quadrant analysis in
-    // designs/2026-03-20-issue-4223-atan2-phase-kokoro-stft.md.
+    // Soundness note: the branch-cut/origin handling follows a quadrant analysis.
     // y_upper >= 0.0 (not strict >): when y_upper = 0 and x < 0 the rectangle
     // touches the branch cut; interior points y → 0⁻ drive atan2 toward -π,
     // which corners miss because atan2(0, x_neg) = +π (the other side of the cut).

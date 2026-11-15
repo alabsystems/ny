@@ -233,7 +233,7 @@ fn test_reduce_sum_linear_without_shape_fails_fast() {
     assert!(matches!(err, NyError::UnsupportedOp(_)));
 }
 
-/// Regression test #2816: ReduceSum CROWN backward with zero-sized dimension
+/// Regression test: ReduceSum CROWN backward with zero-sized dimension
 /// in pre-activation shape must return error, not panic on divide-by-zero stride.
 #[test]
 fn test_reduce_sum_crown_zero_dimension_returns_error_2816() {
@@ -257,7 +257,7 @@ fn test_reduce_sum_crown_zero_dimension_returns_error_2816() {
 }
 
 /// Duplicate axes must be rejected — double-reduction produces wrong bounds
-/// or panics when `output_shape.remove(axis)` shifts indices. (#2946)
+/// or panics when `output_shape.remove(axis)` shifts indices.
 #[ntest::timeout(10000)]
 #[test]
 fn test_reduce_sum_duplicate_axes_returns_error_2946() {

@@ -35,11 +35,11 @@ pub(super) use super::graph_pgd_init::{
     evaluate_graph, initialize_graph_point, revalidate_graph_counterexample, sample_center_point,
     sample_uniform_point, SimpleRng,
 };
-use super::pgd_sampling::spsa_step_deadline_exceeded;
+use super::pgd_sampling::{pgd_step_must_stop, spsa_step_deadline_exceeded};
 #[cfg(test)]
 use ny_propagate::{PgdAlphaMode, PgdInitialization, PgdOptimizer};
 
-/// PGD target: which output margin to optimize (renamed from SpsaTarget for #4274).
+/// PGD target: which output margin to optimize (renamed from SpsaTarget).
 #[derive(Clone, Copy)]
 pub(super) enum GraphPgdTarget {
     Relational(usize, usize),
@@ -105,13 +105,21 @@ pub(super) use super::graph_pgd_exact::{
 // ---------------------------------------------------------------------------
 
 fn layer_supports_restart_batching(layer: &Layer) -> bool {
+    // Global-3d AveragePool refuses any input that is not exactly rank-4
+    // (C, D, H, W), so a prepended restart axis cannot pass through it.
+    // Exclude it here so such graphs keep the sequential fallback instead of
+    // erroring mid-attack (the refusal is InvalidSpec, which the
+    // FallbackToSequential ShapeMismatch net does not catch).
+    if let Layer::AveragePool(pool) = layer {
+        return !pool.global_3d;
+    }
     matches!(
         layer,
         // Keep this whitelist in lockstep with the direct
         // `graph_pgd_preserve_leading_axis_matches_sequential_*` regressions.
         // Untested families stay on the sequential fallback path.
         //
-        // Transpose is tentatively admitted (#4094): ONNX-style batch-preserving
+        // Transpose is tentatively admitted: ONNX-style batch-preserving
         // perms (e.g. [0,2,1]) resolve correctly under a prepended restart axis.
         // Incompatible manual perms (e.g. [1,0] on rank-3) produce ShapeMismatch
         // at runtime and fall back to sequential via FallbackToSequential.
@@ -119,7 +127,6 @@ fn layer_supports_restart_batching(layer: &Layer) -> bool {
             | Layer::Conv1d(_)
             | Layer::Conv2d(_)
             | Layer::ConvTranspose1d(_)
-            | Layer::AveragePool(_)
             | Layer::MaxPool2d(_)
             | Layer::ReLU(_)
             | Layer::LeakyReLU(_)
@@ -227,6 +234,8 @@ pub(super) fn try_graph_pgd_upfront_with_config(
     gemm_engine: Option<&dyn GemmEngine>,
     json: bool,
 ) -> Result<Option<(ArrayD<f32>, ArrayD<f32>)>> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Attack);
     let pgd_start = Instant::now();
     let engine_label = if gemm_engine.is_some() { "GPU" } else { "CPU" };
     let exact_grad_eligible = graph_supports_exact_gradients(graph);
@@ -406,7 +415,9 @@ pub(super) fn try_graph_pgd_upfront_with_config(
     const MIN_SLICE_STEPS: usize = 12;
 
     for restart in 0..pgd_config.num_restarts {
-        if pgd_config.deadline.is_some_and(|d| Instant::now() >= d) {
+        // #attack-concurrent: `past_deadline` is this exact deadline test, OR
+        // the concurrent lane's cancellation token (`None` everywhere else).
+        if pgd_config.past_deadline() {
             if !json {
                 println!(
                     "  Graph PGD: deadline at restart {}/{} ({:.2}s, engine={})",
@@ -468,7 +479,7 @@ pub(super) fn try_graph_pgd_upfront_with_config(
         let mut spsa_used = 0_usize;
 
         for step in 0..pgd_config.num_steps {
-            if spsa_step_deadline_exceeded(step, pgd_config.deadline) {
+            if pgd_step_must_stop(step, &pgd_config) {
                 if !json {
                     println!(
                         "  Graph PGD: deadline at restart {}, step {}/{} ({:.2}s, engine={})",
@@ -514,7 +525,7 @@ pub(super) fn try_graph_pgd_upfront_with_config(
                 raw_spec_row
             };
 
-            // Try exact gradient first, fall back to SPSA (#4274). The joint
+            // Try exact gradient first, fall back to SPSA. The joint
             // objective's gradient is one backward pass on the summed spec row.
             let grad = if exact_grad_eligible {
                 match exact_graph_spec_gradient(
@@ -570,7 +581,7 @@ pub(super) fn try_graph_pgd_upfront_with_config(
             x = step_state.step(&grad, &x, input, true);
             gama_step = gama_step.saturating_add(1);
 
-            // Restart-when-stuck (#4278): if projection maps back to the same point,
+            // Restart-when-stuck: if projection maps back to the same point,
             // resample and re-evaluate instead of continuing with a dead restart.
             if let Some(ref prev) = previous_x {
                 if prev.iter().zip(x.iter()).all(|(&a, &b)| a == b) {
@@ -1005,6 +1016,8 @@ pub(super) fn try_graph_disjunctive_pgd_attack(
     json: bool,
     stall: AttackStallPolicy,
 ) -> Result<GraphDisjunctiveAttackOutcome> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Attack);
     let mut outcome = GraphDisjunctiveAttackOutcome::empty();
     if clauses.is_empty() {
         let evidence = ExactVjpExecution::disjunctive(
@@ -1058,7 +1071,7 @@ pub(super) fn try_graph_disjunctive_pgd_attack(
     // sequential-lane levers bypass it so they keep working unchanged. On any
     // capability miss the sequential loop below runs byte-identically.
     //
-    // GAMA (#1449) does NOT bypass this driver: the batched raw-margin lane
+    // GAMA does NOT bypass this driver: the batched raw-margin lane
     // runs FIRST, unchanged — it is the measured winner of the easy `sat`
     // pool (cifar100 26/29, tinyimagenet 33/38) and must never regress. When
     // it completes WITHOUT a candidate and GAMA is enabled, the sequential
@@ -1512,7 +1525,7 @@ fn graph_pgd_targeted_enabled() -> bool {
     std::env::var("NY_PGD_TARGETED").ok().as_deref() == Some("1")
 }
 
-/// Resolve the GAMA guidance weight λ₀ (#1449): config-first, env override.
+/// Resolve the GAMA guidance weight λ₀: config-first, env override.
 ///
 /// - `NY_PGD_GAMA=0` — force OFF (even when the preset enabled it);
 /// - `NY_PGD_GAMA=1` — force ON, λ₀ from `NY_PGD_GAMA_LAMBDA`
@@ -1763,7 +1776,7 @@ mod gama_cotangent_tests {
         );
     }
 
-    // #1449: λ₀ resolution is config-first with env override. All three
+    // λ₀ resolution is config-first with env override. All three
     // precedence cases live in ONE test so the env mutation window stays
     // sequential (no parallel test observes a half-set NY_PGD_GAMA).
     #[test]

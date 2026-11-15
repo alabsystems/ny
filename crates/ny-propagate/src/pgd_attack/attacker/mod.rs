@@ -3,9 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! PGD (Projected Gradient Descent) attacker: core utilities and single-output attack.
-//!
-//! Split from monolithic `attacker.rs` (1813 LOC) into a directory module
-//! per design `designs/2026-03-19-issue-1948-pgd-attacker-directory-module-refresh.md`.
 
 mod batched;
 mod dense_sweep;
@@ -25,12 +22,14 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use super::config::PgdConfig;
 use super::result::PgdResult;
 use crate::Network;
 
 pub(in crate::pgd_attack) use eval::output_value;
+pub use init::{corner_seed_kind, corner_seed_point};
 
 // Cache resident plans against the layer backing store rather than the outer
 // Network allocation so reused attacker instances do not alias stale weights.
@@ -53,6 +52,7 @@ impl CachedGpuIbpPlanKey {
 
 struct CachedGpuIbpPlanEntry {
     key: CachedGpuIbpPlanKey,
+    deadline_aware: bool,
     plan: Option<Box<dyn GpuIbpModelPlan>>,
 }
 
@@ -146,7 +146,7 @@ pub struct PgdAttacker<'a> {
     /// `engine` wrapped in [`FastMathEngine`]; what the eval paths actually use.
     fast_engine: Option<FastMathEngine<'a>>,
     model_plan: Mutex<Option<CachedGpuIbpPlanEntry>>,
-    /// Latched only when an attack loop itself polls an expired deadline.
+    /// Latched only when attack preparation, evaluation or a loop observes expiry.
     /// Callers use this as strict timeout provenance; merely returning after a
     /// deadline without observing it does not set the latch.
     deadline_exhausted: AtomicBool,
@@ -197,13 +197,52 @@ impl<'a> PgdAttacker<'a> {
         &self.config
     }
 
-    /// Poll the configured deadline and latch an exact observation of expiry.
-    pub(super) fn past_deadline(&self) -> bool {
-        let exhausted = self.config.past_deadline();
+    /// Poll the earlier phase/instance deadline and latch observed expiry.
+    /// #attack-concurrent: a cancelled `PgdConfig::cancel` token stops the
+    /// attack exactly like an expired deadline (the eng15 merge re-applies
+    /// this onto the effective-deadline refactor, which had replaced the
+    /// delegation to `PgdConfig::past_deadline`, the poll that carried the
+    /// token). With `cancel: None` this is exactly the deadline test.
+    pub(crate) fn past_deadline(&self) -> bool {
+        let exhausted = self.config.cancelled()
+            || self
+                .effective_deadline()
+                .is_some_and(|d| Instant::now() >= d);
         if exhausted {
             self.deadline_exhausted.store(true, Ordering::Relaxed);
         }
         exhausted
+    }
+
+    /// Keep an earlier attack phase inside the original scored instance.
+    /// Neither missing authority restarts or enlarges the other one's grant.
+    pub(super) fn effective_deadline(&self) -> Option<Instant> {
+        match (self.config.deadline, ny_core::instance_budget::deadline()) {
+            (Some(phase), Some(instance)) => Some(phase.min(instance)),
+            (phase, instance) => phase.or(instance),
+        }
+    }
+
+    /// Keep a propagation layer's typed source visible to the caller. The
+    /// core convenience predicate recognizes only a top-level variant.
+    pub(crate) fn has_deadline_source(error: &NyError) -> bool {
+        match error {
+            NyError::DeadlineExceeded(_) => true,
+            NyError::LayerError { source, .. } => Self::has_deadline_source(source),
+            _ => false,
+        }
+    }
+
+    pub(super) fn checkpoint(&self, stage: &str) -> Result<()> {
+        #[cfg(test)]
+        let forced = tests::deadline::force_expiry_at(stage);
+        #[cfg(not(test))]
+        let forced = false;
+        if forced || self.past_deadline() {
+            self.deadline_exhausted.store(true, Ordering::Relaxed);
+            return Err(NyError::DeadlineExceeded(format!("PGD {stage}")));
+        }
+        Ok(())
     }
 
     /// Whether this attacker actually observed its deadline as expired.
@@ -228,6 +267,7 @@ impl<'a> PgdAttacker<'a> {
         threshold: f32,
         verify_upper_bound: bool,
     ) -> Result<PgdResult> {
+        self.checkpoint("before attack preparation")?;
         // Dense low-effective-dimension sweep pre-phase (#dense-sweep,
         // config-gated): when at most `dense_sweep_max_dims` input dims have
         // nonzero width, a deterministic grid + top-k refinement covers the
@@ -270,8 +310,13 @@ impl<'a> PgdAttacker<'a> {
                 verify_upper_bound,
             )
             .map_err(|e| {
+                // Preserve expiry through LayerError as a typed source. CLI
+                // timeout classification must never depend on this display.
+                if Self::has_deadline_source(&e) {
+                    return e;
+                }
                 // Restarts advance in lockstep, so a terminal batched error IS
-                // an all-restarts failure; surface the same #3096 contract the
+                // an all-restarts failure; surface the same error contract the
                 // sequential/parallel paths use (callers and tests match on it).
                 NyError::InternalError(format!(
                     "PGD attack: all {} restarts failed (batched lockstep). Last error: {e}",

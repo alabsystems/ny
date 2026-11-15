@@ -353,7 +353,9 @@ impl MoatRisk {
 /// This is the moat rule in type form: an armed default must be
 /// [`Provenance::ValueNeutral`], [`Provenance::Measured`] or
 /// [`Provenance::Guard`]. [`Provenance::Unmeasured`] can never be
-/// [`Bucket::DefaultOn`].
+/// [`Bucket::DefaultOn`]. An explicit user-directed default is separately
+/// represented by [`Provenance::OwnerDirected`], with an exact registry-tested
+/// scope; it is not measured evidence or a soundness argument.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provenance {
     /// Value-neutral by construction: the OFF arm is bit-identical, or the ON
@@ -379,6 +381,15 @@ pub enum Provenance {
         /// Why shipping it in its current bucket is nonetheless safe.
         why_ok: &'static str,
     },
+    /// Explicit user instruction to enable a default before measured benefit.
+    /// Admission is pinned to exact named declarations by the registry tests.
+    /// This records the policy choice without asserting a measured win.
+    OwnerDirected {
+        /// The explicit user instruction that authorizes this default.
+        directive: &'static str,
+        /// Missing evidence and required soundness or deadline constraints.
+        limitations: &'static str,
+    },
     /// A safety guard whose OFF arm removes a check. Cannot be
     /// [`Bucket::Auto`] — a policy may never disarm a guard.
     Guard {
@@ -394,6 +405,7 @@ impl Provenance {
             Self::ValueNeutral { .. } => "value_neutral",
             Self::Measured { .. } => "measured",
             Self::Unmeasured { .. } => "unmeasured",
+            Self::OwnerDirected { .. } => "owner_directed",
             Self::Guard { .. } => "guard",
         }
     }

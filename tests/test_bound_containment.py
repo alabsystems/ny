@@ -34,6 +34,11 @@ SPEC.loader.exec_module(bc)
 
 N_IN, N_HIDDEN, N_OUT = 4, 5, 3
 INTERMEDIATES = ("mm1", "pre1", "act1", "mm2")
+# requirements.txt supports onnxruntime 1.16.3, whose reader accepts ONNX IR 9.
+# Newer `onnx` releases default newly constructed fixtures to a newer IR than
+# that baseline runtime can read.  The operators below need opset 13, but none
+# needs a newer container IR, so make the fixture authority explicit.
+FIXTURE_IR_VERSION = 9
 
 
 def _build_model(path: Path) -> None:
@@ -61,6 +66,7 @@ def _build_model(path: Path) -> None:
         [numpy_helper.from_array(value, name) for name, value in weights.items()],
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = FIXTURE_IR_VERSION
     onnx.checker.check_model(model)
     onnx.save(model, path)
 
@@ -245,7 +251,10 @@ def _fusion_model(path: Path) -> None:
         [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 2])],
         initializers,
     )
-    onnx.save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]), path)
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = FIXTURE_IR_VERSION
+    onnx.checker.check_model(model)
+    onnx.save(model, path)
 
 
 def test_folded_batchnorm_resolves_to_the_post_fold_tensor(tmp_path: Path) -> None:

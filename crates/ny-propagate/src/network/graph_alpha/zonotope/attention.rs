@@ -84,7 +84,7 @@ impl GraphNetwork {
         // axes patterns (last-two-axes swap) BEFORE computing expensive linear projections.
         // Without this check, we waste O(n²d) zonotope matmuls only to bail out later
         // when encountering unsupported transposes (e.g. Whisper's [0,2,1,3] permutation).
-        // This was the root cause of test_encoder_layer_graph_network_ibp timing out (#1662).
+        // This was the root cause of test_encoder_layer_graph_network_ibp timing out.
         for ops in [&q_ops, &k_ops] {
             for op_name in ops.iter() {
                 if let Some(op_node) = self.nodes.get(op_name) {
@@ -285,7 +285,7 @@ impl GraphNetwork {
         // IMPORTANT: Check for NaN/Inf BEFORE creating BoundedTensor to avoid panic.
         let result = if needs_rescale {
             let scale_sq = (zonotope_scale as f64) * (zonotope_scale as f64);
-            // Directed rounding: lower → next_down, upper → next_up (#2225).
+            // Directed rounding: lower → next_down, upper → next_up.
             let scaled_lower = result
                 .lower()
                 .mapv(|v| next_down_f32((v as f64 * scale_sq) as f32));

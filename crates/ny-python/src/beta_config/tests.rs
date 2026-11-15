@@ -125,7 +125,7 @@ fn test_beta_crown_config_rejects_quarantined_complete_clip_pruning() {
     });
 }
 
-/// validate_inner() rejects NaN in each float field without needing pyo3. (#2899, #3305)
+/// validate_inner() rejects NaN in each float field without needing pyo3.
 #[test]
 fn test_beta_crown_config_validate_rejects_nan() {
     #[allow(clippy::type_complexity)] // Table-driven test: complex type is clearer than type alias
@@ -158,7 +158,7 @@ fn test_beta_crown_config_validate_rejects_nan() {
     }
 }
 
-/// validate() rejects Inf in float fields. (#2899)
+/// validate() rejects Inf in float fields.
 #[test]
 fn test_beta_crown_config_validate_rejects_inf() {
     let mut config = BetaCrownConfig::new();
@@ -174,7 +174,7 @@ fn test_beta_crown_config_validate_rejects_inf() {
         .expect_err("NEG_INFINITY alpha_lr should be rejected");
 }
 
-/// validate() rejects negative values in float fields. (#2899)
+/// validate() rejects negative values in float fields.
 #[test]
 fn test_beta_crown_config_validate_rejects_negative() {
     let mut config = BetaCrownConfig::new();
@@ -190,7 +190,7 @@ fn test_beta_crown_config_validate_rejects_negative() {
         .expect_err("negative biccos_drop_ratio should be rejected");
 }
 
-/// to_rust() returns Err for invalid configs. (#2899)
+/// to_rust() returns Err for invalid configs.
 #[test]
 fn test_beta_crown_config_to_rust_rejects_invalid() {
     let mut config = BetaCrownConfig::new();
@@ -200,7 +200,7 @@ fn test_beta_crown_config_to_rust_rejects_invalid() {
         .expect_err("to_rust should reject NaN beta_lr");
 }
 
-/// Default config passes validation. (#2899)
+/// Default config passes validation.
 #[test]
 fn test_beta_crown_config_default_validates() {
     let config = BetaCrownConfig::new();

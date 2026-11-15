@@ -2,22 +2,21 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! GPU CROWN backward pass orchestration (#3397).
+//! GPU CROWN backward pass orchestration.
 //!
 //! Keeps A-matrices on GPU across the entire backward loop, dispatching
 //! activation backward, bias accumulation, GEMM, and concretization shaders.
 //! Only the final concretized bounds are read back to the host.
 //!
-//! **Batched command encoding (#3397):** All dispatch passes are encoded into
+//! **Batched command encoding:** All dispatch passes are encoded into
 //! a single `CommandEncoder` and submitted with one `queue.submit` call. Static
 //! params/weights/biases now live in a cached device staging buffer keyed by
 //! layer topology + static data; each invocation only refreshes activation
 //! relaxations before the encoder copies staged data into the working buffers.
 //!
-//! Conv2d support (#3397): Conv2d layers are handled via reshape + GEMM + col2im
+//! Conv2d support: Conv2d layers are handled via reshape + GEMM + col2im
 //! gather, all on GPU. No host roundtrip for Conv2d layers.
 //!
-//! Reference: designs/2026-03-06-gpu-crown-backward.md
 //! Reference: alpha-beta-CROWN `auto_LiRPA/backward_bound.py`
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2485,8 +2484,7 @@ impl WgpuDevice {
         // Use the adapter's OWN reported limits (authoritative — this is exactly what
         // wgpu validates the dispatch against), falling back to the known wgpu
         // defaults only if a field reports 0. Backend-agnostic and adapts
-        // automatically. (The note here used to say "Metal reports 128 MiB" —
-        // that is wgpu's DEFAULT, not Metal's capability. With
+        // automatically. (128 MiB is wgpu's DEFAULT, not Metal's capability. With
         // `NY_GPU_BIG_BINDINGS` requesting adapter limits, an Apple M4 Pro
         // reports 4095 MiB; measured 2026-08-06.)
         let max_bind = match limits.max_storage_buffer_binding_size as usize {
@@ -3118,7 +3116,7 @@ impl WgpuDevice {
         self.store_crown_host_timing_profile(None)?;
         self.store_crown_timestamp_profile(None)?;
 
-        // Memory budget gate (#3515): intersect the existing binding-size batch
+        // Memory budget gate: intersect the existing binding-size batch
         // cap with the total-working-set budget so oversized workloads are
         // reduced to safe spec batches before any GPU allocations occur.
         let estimate = estimate_crown_backward_memory(layers, num_specs);
@@ -3188,7 +3186,7 @@ impl WgpuDevice {
         };
         let w = &plan.working;
 
-        // Upload initial data to plan's dedicated working buffers (#3397 Step 4).
+        // Upload initial data to plan's dedicated working buffers.
         // No pool lock needed — buffers are owned by the plan and stable.
         record_host_phase(&mut host_profile, "write_initial_state", || {
             self.queue
@@ -3216,7 +3214,7 @@ impl WgpuDevice {
             self.refresh_crown_plan_dynamic_layers(&plan, layers)
         })?;
 
-        // Encode all dispatch steps using pre-built bind groups (#3397 Step 4).
+        // Encode all dispatch steps using pre-built bind groups.
         let mut encoder = record_host_phase(&mut host_profile, "create_encoder", || {
             self.device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -3243,7 +3241,7 @@ impl WgpuDevice {
             self.queue.submit(std::iter::once(encoder.finish()))
         });
 
-        // Concurrent readback: map both buffers with a single device.poll (#3397).
+        // Concurrent readback: map both buffers with a single device.poll.
         let readback_start = Instant::now();
         let (mut lower_bounds, mut upper_bounds, readback_timing) =
             Self::read_two_buffers_profiled(

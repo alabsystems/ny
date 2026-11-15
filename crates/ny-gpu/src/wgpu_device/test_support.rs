@@ -4,10 +4,13 @@
 
 //! Shared GPU test helpers for wgpu-backed integration tests.
 
-use super::{WgpuDevice, WgpuVerdictRequest};
+use super::WgpuDevice;
+#[cfg(feature = "gpu-tests-uncharged")]
+use super::WgpuVerdictRequest;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 static GPU_DEVICE: OnceLock<Result<Arc<WgpuDevice>, String>> = OnceLock::new();
+#[cfg(feature = "gpu-tests-uncharged")]
 static GPU_VERDICT_DEVICE: OnceLock<Result<Arc<WgpuDevice>, String>> = OnceLock::new();
 static GPU_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -27,8 +30,12 @@ pub(crate) fn require_device() -> Arc<WgpuDevice> {
     }
 }
 
-/// Get the shared explicitly qualified verdict device. A rejected ladder is a
-/// hard test failure with the typed report preserved in the message.
+/// Get the shared explicitly qualified verdict device (UNCHARGED authority:
+/// all five rungs pass). A rejected ladder is a hard test failure with the
+/// typed report preserved in the message. Only the `gpu-tests-uncharged` lane
+/// compiles callers: a pure-flush adapter (Apple/Metal) refuses rungs 2 and 3
+/// by hardware, so these tests are not part of the plain `gpu-tests` lane.
+#[cfg(feature = "gpu-tests-uncharged")]
 pub(crate) fn require_verdict_device() -> Arc<WgpuDevice> {
     match GPU_VERDICT_DEVICE.get_or_init(|| {
         WgpuDevice::new_for_verdict(WgpuVerdictRequest::new())
@@ -38,7 +45,10 @@ pub(crate) fn require_verdict_device() -> Arc<WgpuDevice> {
         Ok(device) => Arc::clone(device),
         Err(error) => panic!(
             "verdict-qualified GPU required but qualification failed: {error}. \
-             Run with --features gpu-tests only on a conformant GPU host."
+             The gpu-tests-uncharged lane needs an adapter that passes the UNCHARGED \
+             five-rung ladder (subnormal-preserving, EFT-exact; measured on Vulkan with \
+             the SPIR-V DenormPreserve injection); a pure-flush adapter (Apple/Metal) \
+             refuses by hardware."
         ),
     }
 }

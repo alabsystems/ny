@@ -189,7 +189,7 @@ pub(super) const fn release_budget_ms(release_ms: u64) -> u64 {
 /// constraints. Shared across all avoice verifier-smoke tests.
 ///
 /// Consolidates the previously duplicated `verifier_spec_from_bounded_input`
-/// in talker_attention, speaker_encoder, and duration_predictor (#3950).
+/// in talker_attention, speaker_encoder, and duration_predictor.
 pub(super) fn verifier_spec_from_bounded_input(
     input: &BoundedTensor,
     output_bounds: Vec<Bound>,
@@ -219,7 +219,7 @@ pub(super) fn verifier_spec_from_bounded_input(
 /// propagation, inverted bounds, and broken propagation engines.
 ///
 /// Consolidates the previously duplicated `assert_unknown_bounds_sound`
-/// in talker_attention and duration_predictor (#3950).
+/// in talker_attention and duration_predictor.
 pub(super) fn assert_unknown_verifier_bounds_sound(
     bounds: &[Bound],
     expected_len: usize,

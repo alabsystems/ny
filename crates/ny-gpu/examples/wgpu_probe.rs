@@ -1,5 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
+
+#![recursion_limit = "256"]
+
 //! WGPU proof diagnostic: enumerate an adapter, show that an ordinary device is
 //! unarmed, then make one explicit typed qualification request and print its
 //! five-rung result. No environment variable can grant authority.

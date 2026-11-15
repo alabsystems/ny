@@ -52,6 +52,11 @@ fn write_archive_source_marker(temp_repo: &Path) {
 }
 
 // `${...}` below is intentional shell parameter expansion in a raw fixture.
+//
+// The fake is installed under both names the build script can use: `targo`
+// (the private tree builds with the Trust toolchain, which must be handed its
+// lane) and `cargo` (the public snapshot's stock pin, which has none). Either
+// way it records the build arguments without the lane flag.
 #[allow(clippy::literal_string_with_formatting_args)]
 fn write_fake_cargo(temp_repo: &Path) -> PathBuf {
     let fake_cargo = temp_repo.join("bin/cargo");
@@ -62,6 +67,10 @@ fn write_fake_cargo(temp_repo: &Path) -> PathBuf {
         r#"#!/bin/bash
 set -euo pipefail
 
+if [ "$(basename "$0")" = targo ]; then
+    [ "${1:-}" = --unverified ] || { echo "fake targo: build without a lane: $*" >&2; exit 97; }
+    shift
+fi
 printf '%s\n' "$@" > "$PWD/cargo-args.txt"
 {
     printf 'OPENSSL_DIR=%s\n' "${OPENSSL_DIR:-}"
@@ -148,6 +157,9 @@ esac
     )
     .expect("failed to write fake cargo");
     make_executable(&fake_cargo);
+    let fake_targo = temp_repo.join("bin/targo");
+    fs::copy(&fake_cargo, &fake_targo).expect("failed to write fake targo");
+    make_executable(&fake_targo);
     fake_cargo
 }
 
@@ -192,35 +204,37 @@ fn fake_repo() -> (TempDir, PathBuf) {
     (temp_repo, script)
 }
 
-/// The repo's own Trust opt-out, delivered the way `.cargo/config.toml` delivers
-/// it: a PER-TARGET section, not env `RUSTFLAGS`.
-///
-/// The real-Cargo fixtures synthesize a workspace in a temp dir and build it
-/// with the inherited toolchain — which, because cargo exports RUSTUP_TOOLCHAIN
-/// into the test process, is this repo's pinned `trust`. They did NOT inherit
-/// `.cargo/config.toml`, so the fail-closed verifier saw a bare
-/// `fn main() { println!(..) }` and refused it:
-///   "unsupported MIR rvalue CastKind::Transmute: transmute to
-///    NonNull<core::fmt::rt::Argument>" -> "Trust Level 0 safety verification
-///    incomplete for `ny::main`: 5 obligation(s) were not proved".
-/// Three real-Cargo tests were therefore permanently red on this host for a
-/// reason having nothing to do with the code under test.
-///
-/// Delivered as `[target.<triple>]` rather than as env `RUSTFLAGS` on purpose:
-/// an env RUSTFLAGS clobbers BOTH `build.rustflags` and
-/// `target.<triple>.rustflags`, so it would mask a target that the real
-/// `.cargo/config.toml` fails to cover. Mirroring the repo's own mechanism
-/// keeps the fixture honest — it stays red exactly where production would be.
-///
-/// `extra_build` is any additional `[build]` keys the caller needs (the two
-/// tests that pin a target write `target = "..."` here); the opt-out COMPOSES
-/// with them instead of overwriting, because cargo's rustflags precedence is
-/// first-match-wins on the WHOLE list, not a merge.
-fn trust_optout_cargo_config(extra_build: &str) -> String {
-    format!(
-        "[build]\n{extra_build}\n[target.{host}]\nrustflags = []\n",
-        host = rust_host()
-    )
+/// The real-Cargo fixtures' `.cargo/config.toml`: a `[build]` table carrying
+/// whatever keys the caller needs (the tests that pin a target write
+/// `target = "..."` here). It carries no Trust verification flag: the build
+/// script runs targo in its unverified lane, which scopes that itself.
+fn fixture_cargo_config(extra_build: &str) -> String {
+    format!("[build]\n{extra_build}\n")
+}
+
+/// The build tool running this test (`$CARGO`: targo in the private tree,
+/// cargo under the public snapshot's stock pin), else `targo`.
+fn cargo_program() -> PathBuf {
+    env::var_os("CARGO").map_or_else(|| PathBuf::from("targo"), PathBuf::from)
+}
+
+/// The compiler shipped beside that build tool: `trustc` in the Trust
+/// toolchain, `rustc` in a stock one. `$RUSTC` is not exported to test
+/// processes, and a bare PATH lookup could name a different toolchain.
+fn compiler_program() -> PathBuf {
+    let cargo = cargo_program();
+    if cargo
+        .parent()
+        .is_some_and(|dir| !dir.as_os_str().is_empty())
+    {
+        for name in ["trustc", "rustc"] {
+            let candidate = cargo.with_file_name(name);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from("trustc")
 }
 
 fn real_cargo_repo() -> (TempDir, PathBuf) {
@@ -255,25 +269,22 @@ fn real_cargo_repo() -> (TempDir, PathBuf) {
         "fn main() { println!(\"fresh-json-artifact\"); }\n",
     )
     .expect("failed to write tiny ny binary");
-    let lock = Command::new("cargo")
+    let lock = Command::new(cargo_program())
         .args(["generate-lockfile", "--quiet"])
         .current_dir(temp_repo.path())
         .output()
         .expect("failed to generate tiny Cargo.lock");
     assert_success(&lock, "tiny cargo generate-lockfile");
-    // Deliver the Trust opt-out the way the repo does. Without it the pinned
-    // `trust` toolchain refuses this fixture's `println!` and the build dies
-    // before the harness can assert anything about artifact placement.
     let cargo_dir = temp_repo.path().join(".cargo");
     fs::create_dir_all(&cargo_dir).expect("failed to create fixture Cargo config directory");
-    fs::write(cargo_dir.join("config.toml"), trust_optout_cargo_config(""))
-        .expect("failed to write fixture Trust opt-out");
+    fs::write(cargo_dir.join("config.toml"), fixture_cargo_config(""))
+        .expect("failed to write fixture Cargo config");
     write_archive_source_marker(temp_repo.path());
     (temp_repo, script)
 }
 
 fn rust_host() -> String {
-    let output = Command::new("rustc")
+    let output = Command::new(compiler_program())
         .arg("-vV")
         .output()
         .expect("failed to query rustc host");
@@ -305,7 +316,7 @@ fn native_fp16_injection_expected() -> bool {
     {
         return false;
     }
-    let cfg = Command::new("rustc")
+    let cfg = Command::new(compiler_program())
         .args(["--print", "cfg"])
         .output()
         .expect("failed to query rustc target features");
@@ -1080,7 +1091,7 @@ fn test_real_cargo_configured_native_target_replaces_stale_alias() {
     fs::create_dir_all(&cargo_dir).expect("failed to create real Cargo config directory");
     fs::write(
         cargo_dir.join("config.toml"),
-        trust_optout_cargo_config(&format!("target = \"{host}\"\n")),
+        fixture_cargo_config(&format!("target = \"{host}\"\n")),
     )
     .expect("failed to write explicit native Cargo target");
     let alias = write_stale_alias(temp_repo.path());
@@ -1133,7 +1144,7 @@ fn test_real_cargo_host_tuple_uses_targeted_artifact() {
     fs::create_dir_all(&cargo_dir).expect("failed to create host-tuple Cargo directory");
     fs::write(
         cargo_dir.join("config.toml"),
-        trust_optout_cargo_config("target = \"host-tuple\"\n").as_str(),
+        fixture_cargo_config("target = \"host-tuple\"\n").as_str(),
     )
     .expect("failed to write real Cargo host-tuple target");
     let alias = write_stale_alias(temp_repo.path());

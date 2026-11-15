@@ -1356,9 +1356,9 @@ mod tests {
     fn widen_bounds_for_precision_empty_slice_is_fine() {
         let mut empty: Vec<Bound> = vec![];
         widen_bounds_for_precision(&mut empty, FloatPrecision::F16);
-        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
         let owned = widen_bounds_for_precision_owned(&[], FloatPrecision::Bf16);
-        assert!(owned.is_empty());
+        assert_eq!(owned.len(), 0);
     }
 
     #[test]

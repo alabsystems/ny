@@ -30,7 +30,6 @@ bab:
   branching:
     method: kfsb
     candidates: 10
-    reduceop: max
     # Exact wave-selector mirrors for governed search; runtime is unchanged.
     kfsb_multi_candidates: 10
     kfsb_multi_reduceop: max
@@ -47,6 +46,4 @@ bab:
     lr_alpha: 0.2
     iterations: 20
   beta_crown:
-    lr_alpha: 0.1
     lr_beta: 0.01
-    iterations: 15

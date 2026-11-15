@@ -352,13 +352,16 @@ fn attack_point_gradient_matches_finite_differences() {
 
 #[test]
 fn attack_point_gradient_rejects_unsupported_fragment() {
-    // A graph containing a non-whitelist layer (Sigmoid) must return Ok(None).
+    // A graph containing a non-whitelist layer must return Ok(None). This used
+    // Sigmoid until #ml4acopf-vjp admitted it with an exact analytic derivative;
+    // Tanh is deliberately NOT admitted (no benchmark needs it yet), so it keeps
+    // exercising the refusal path.
     let mut graph = GraphNetwork::new();
     graph.add_node(GraphNode::from_input(
-        "sig",
-        Layer::Sigmoid(crate::layers::SigmoidLayer),
+        "tanh",
+        Layer::Tanh(crate::layers::TanhLayer),
     ));
-    graph.set_output("sig");
+    graph.set_output("tanh");
 
     let x = ArrayD::from_shape_vec(IxDyn(&[3]), vec![0.1f32, -0.2, 0.3]).unwrap();
     let spec_row = Array2::from_shape_vec((1, 3), vec![1.0f32, 0.0, 0.0]).unwrap();

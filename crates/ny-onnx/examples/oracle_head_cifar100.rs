@@ -18,7 +18,7 @@
 //! UNSOUND BY DESIGN (sampled bounds underestimate the true range) — a
 //! measurement of the achievable ceiling only, never a verdict.
 //!
-//! Run: `cargo run -p ny-onnx --release --example oracle_head_cifar100`
+//! Run: `targo --unverified run -p ny-onnx --release --example oracle_head_cifar100`
 
 use ndarray::{Array2, ArrayD, IxDyn};
 use ny_onnx::vnnlib::load_vnnlib;

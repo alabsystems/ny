@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Thin delegate to `ny_build::graph` — graph construction logic lives
-//! in `ny-build` as of #1752.
+//! in `ny-build`.
 
 use ny_build::GraphBuildInputs;
 use ny_core::Result;
@@ -40,6 +40,8 @@ impl OnnxModel {
         &self,
         options: GraphNetworkOptions,
     ) -> Result<GraphNetwork> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Load);
         let data = GraphBuildInputs {
             layers: &self.network.layers,
             inputs: &self.network.inputs,

@@ -497,10 +497,9 @@ fn test_batched_linear_bounds_compose_avoids_nan_from_0_times_inf() {
     // the bound only ever widens.
     //
     // This test originally asserted the pre-hardening semantics (0 * inf -> ~0),
-    // which `1ede1d30` ("Harden verification correctness and fail-closed APIs",
-    // 2026-07-26) deliberately superseded. Its actual purpose — that compose
-    // never manufactures a NaN from `0 * inf` — is asserted above and still
-    // holds; what follows now pins the taint contract instead.
+    // which the fail-closed hardening deliberately superseded. Its actual purpose —
+    // that compose never manufactures a NaN from `0 * inf` — is asserted above and
+    // still holds; what follows now pins the taint contract instead.
     for v in composed.lower_a.iter() {
         assert!(
             *v == f32::NEG_INFINITY,

@@ -175,11 +175,9 @@ use ny_levers::space::{Class, Deliver};
 ///                 WHAT IS LEFT IS EXACTLY ONE THING: the 20 `margin_row` axes.
 ///                 Every one needs an edit inside
 ///                 `crates/ny-propagate/src/margin_row/**`, which two other
-///                 worktrees owned throughout this session (worktree -2 held
-///                 `bab.rs`/`clip.rs`/`engine.rs`/`root.rs`, worktree -3 held
-///                 `alpha_opt.rs`/`mod.rs`). All 20 are PROMOTIONS on the
-///                 evidence available: none is a diagnostic, and none is
-///                 unsafe to ship behind a default-off key.
+///                 worktrees owned throughout this session. All 20 are
+///                 PROMOTIONS on the evidence available: none is a diagnostic,
+///                 and none is unsafe to ship behind a default-off key.
 ///
 /// 2026-08-24  0   #parameter-governance margin-row completion. All remaining
 ///                 verdict-affecting axes gained typed `margin_row.*` keys,
@@ -250,11 +248,9 @@ fn verdict_affecting_levers_reachable_in_competition_only_ever_grows() {
 #[test]
 fn the_reachability_baseline_is_not_stale() {
     let n = unreachable_verdict_affecting().len();
-    // WAS VACUOUS. `n >= BASELINE_UNREACHABLE` on a `usize` with the baseline at
-    // 0 is ALWAYS TRUE, so this floor test could not fail — it stopped checking
-    // anything the moment the debt reached zero on 2026-08-24, which is exactly
-    // when the ledger above declared the "permanent zero invariant". Nothing
-    // reported that, because the lint sweep this lives under had never run.
+    // Not `n >= BASELINE_UNREACHABLE`: on a `usize` with the baseline at 0 that
+    // is ALWAYS TRUE, so the floor test could not fail once the debt reached
+    // zero on 2026-08-24.
     //
     // Equality carries the intent in both directions and cannot go vacuous: it
     // fails if the debt FELL below the recorded baseline (lower the constant),

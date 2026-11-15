@@ -33,33 +33,25 @@
 //! stride 1 uses the same cooperative, budgeted Anchored planners as stride>1.
 //!
 //! WALL-CLOCK POLICY FOR THIS FILE: every `#[ntest::timeout(..)]` below is a
-//! HANG SENTINEL, not a performance assertion. Measured 2026-08-19, isolated
-//! and single-threaded, these properties cost 10-30s in a debug build, and the
-//! walls they used to carry (20-60s) were margins of 1.2-2.9x. That is not a
-//! sentinel, it is a coin flip that any concurrent load loses -- and they duly
-//! failed at both 4 and 8 test threads. They are now a uniform 300s, roughly
-//! 10-20x the measured isolated cost. The failure these exist to catch is an
-//! infinite loop, and no finite wall lets one of those through.
-//! MEASURE BEFORE LOWERING THEM.
+//! HANG SENTINEL, not a performance assertion, at a uniform 300s. The failure
+//! these exist to catch is an infinite loop, and no finite wall lets one of those
+//! through. MEASURE BEFORE LOWERING THEM.
 //!
 //! !! MEASUREMENT CORRECTION, 2026-08-20 !!
-//! Several wall-clock justifications in this file and its siblings were derived
-//! from timings taken while 14 stray busy-loop processes -- left running by my
-//! own earlier load experiment -- were saturating this 14-core box for 15+
-//! hours. Every "isolated" cost measured in that window is inflated, typically
-//! 5-7x. Re-measured on a clean box:
+//! The walls were raised from 20-60s on timings taken 2026-08-19 (10-30s
+//! isolated, read as "coin flips with no margin"). Those timings were taken while
+//! 14 stray busy-loop processes saturated this 14-core box, and every "isolated"
+//! cost from that window is inflated, typically 5-7x. Re-measured on a clean box:
 //!
 //!   obj_chunk_equivalence_and_containment   29.57s -> 4.15s   (wall margin 7.2x, NOT 1.01x)
 //!   convtranspose2d_relu_chain_soundness    16.44s -> 2.74s   (margin 7.3x, NOT 1.22x)
 //!   conv2d_relu_patches_vs_dense            12.59s -> 2.36s
 //!   cosine_distance_crown_bounds_noninvert  15.05s -> 2.60s  (at 16 cases)
 //!
-//! So the claim that these walls were "coin flips with no margin" was WRONG:
-//! they had 5-7x headroom and were tripping because of my contamination, not
-//! because they were mis-sized. The enlarged walls are retained -- a hang
-//! sentinel loses nothing by being generous, and CI hosts are shared -- but the
-//! reasoning that produced them does not stand, and no future change should
-//! cite those numbers.
+//! So the old walls had 5-7x headroom and tripped because of that contamination,
+//! not because they were mis-sized. The 300s walls are retained -- a hang sentinel
+//! loses nothing by being generous, and CI hosts are shared -- but no future change
+//! should cite the 2026-08-19 numbers.
 //!
 //! What is NOT affected: the env-leak findings. `budget_bytes: 0` and
 //! `crown=-inf` against a finite IBP are causal evidence of a leaked

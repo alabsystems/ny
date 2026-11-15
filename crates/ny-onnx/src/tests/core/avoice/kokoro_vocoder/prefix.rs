@@ -17,12 +17,11 @@ use super::model::{
 use super::*;
 
 // ---------------------------------------------------------------------------
-// Packet 2: IBP on prefix subgraph (#3500)
+// Packet 2: IBP on prefix subgraph
 //
 // Extracts a prefix subgraph up to the first ConvTranspose1d node and runs
 // IBP on it. This verifies that the shallowest upsampling stage produces
 // finite, ordered bounds within a reasonable CPU timeout.
-// Reference: designs/2026-03-11-issue-3500-shallow-vocoder-subpath.md §Packet 2
 // ---------------------------------------------------------------------------
 
 // Budget: ~90-120s for graph conversion const-fold (har=[22,61] through
@@ -76,7 +75,7 @@ fn test_graph_ibp_kokoro_vocoder_prefix_subgraph_3500() {
     // Boundary extraction: first/last 240 samples (10ms at 24kHz).
     // On the prefix subgraph (15360 elements), this exercises the real
     // extraction machinery that will be used with GPU-accelerated full-graph
-    // bounds with GPU-accelerated IBP (#3397).
+    // bounds with GPU-accelerated IBP.
     let (first_lower, first_upper, last_lower, last_upper) =
         extract_waveform_boundary_bounds(&output, KOKORO_BOUNDARY_SAMPLES);
     let effective_n = KOKORO_BOUNDARY_SAMPLES.min(flat_len);
@@ -93,10 +92,10 @@ fn test_graph_ibp_kokoro_vocoder_prefix_subgraph_3500() {
 }
 
 // ---------------------------------------------------------------------------
-// Packet 2b: IBP through fused InstanceNorm prefix (#3591)
+// Packet 2b: IBP through fused InstanceNorm prefix
 //
 // Extends the prefix past the first ConvTranspose to include the first fused
-// InstanceNorm1d node. Validates acceptance criterion 3 of #3591: IBP flows
+// InstanceNorm1d node. Validates that IBP flows
 // through the monolithic InstanceNorm layer that replaces the decomposed
 // ReduceMean→Sub→Pow→...→Div pattern.
 //
@@ -162,7 +161,7 @@ fn test_graph_ibp_through_fused_instance_norm_prefix_3591() {
 }
 
 // ---------------------------------------------------------------------------
-// Packet 5: IBP on deeper prefix (#3500)
+// Packet 5: IBP on deeper prefix
 //
 // Progressive deepening to find the deepest CPU-viable cut point.
 // At T=6, the unfused normalization path inflates the graph: "resblocks.0"
@@ -257,7 +256,7 @@ fn test_graph_ibp_kokoro_vocoder_first_conv1d_prefix_3500() {
 }
 
 // ---------------------------------------------------------------------------
-// Runtime measurements (#3500, Packets 3+4)
+// Runtime measurements (Packets 3+4)
 //
 // Measured 2026-03-11 iter 1392:
 //
@@ -277,9 +276,9 @@ fn test_graph_ibp_kokoro_vocoder_first_conv1d_prefix_3500() {
 //   - Boundary-only spec-guided CROWN with GPU engine threaded through
 //     `propagate_crown_with_specs_and_engine_with_node_bounds_and_deadline`
 //     also timed out at 180s on the same harness
-//   - Historical note: those "GPU" retries were measured before #3598 landed,
-//     when the 1D-convolution backward path still ignored `GemmEngine` and
-//     remained CPU-bound at `Conv1d` / `ConvTranspose1d`
+//   - Historical note: those "GPU" retries were measured before the Conv1d
+//     engine threading landed, when the 1D-convolution backward path still
+//     ignored `GemmEngine` and remained CPU-bound at `Conv1d` / `ConvTranspose1d`
 //
 // Packet 4 (progressive deepening):
 //   - 2nd ConvTranspose prefix (177 nodes, /ups.1/ConvTranspose): IBP
@@ -305,13 +304,13 @@ fn test_graph_ibp_kokoro_vocoder_first_conv1d_prefix_3500() {
 //     samples on the deep prefix. This is the first evidence that CROWN
 //     backward propagation through the ResBlock (Conv1d + InstanceNorm +
 //     SnakeActivation) produces strictly tighter bounds than IBP.
-//   - Implication: GPU-accelerated full-graph CROWN (#3622) should deliver
+//   - Implication: GPU-accelerated full-graph CROWN should deliver
 //     meaningful tightening across the full vocoder, not just match IBP.
 //
 // Conclusion: CPU-viable IBP cut points are 2 nodes (45s) and 12 nodes (79-139s).
 // The 2-node prefix gives tight bounds (CROWN == IBP, no tightening room).
 // The 12-node prefix gives wide bounds but CROWN tightens ALL 8 tested specs.
-// Prefix CROWN is green on HEAD after #3598 (Conv1d engine threading).
-// Full-graph waveform output requires GPU acceleration via #3622 (remaining
-// GemmEngine threading). #3619 and #3597 are now closed.
+// Prefix CROWN is green after the Conv1d engine threading.
+// Full-graph waveform output requires GPU acceleration (the remaining
+// GemmEngine threading).
 // ---------------------------------------------------------------------------

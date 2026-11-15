@@ -5,7 +5,7 @@
 //! Envelope follower verification: gain reduction, one-pole smoother,
 //! and conservative combined verification.
 //!
-//! Part of #3252 — avoice DSP kernel verification.
+//! Part of the avoice DSP kernel verification.
 
 use ndarray::{arr2, ArrayD, IxDyn};
 use ny_core::Result;
@@ -65,7 +65,6 @@ pub struct GainReductionParams {
 ///
 /// Giannoulis et al., "Digital Dynamic Range Compressor Design" (JAES, 2012).
 /// avoice `crates/avoice-mixer/src/ducking.rs:58-86`.
-/// Design: `designs/2026-03-04-envelope-follower-verification.md` Task 1.
 pub fn build_gain_reduction_graph(params: &GainReductionParams) -> Result<GraphNetwork> {
     let GainReductionParams {
         threshold,
@@ -185,7 +184,6 @@ pub struct EnvelopeFollowerParams {
 ///
 /// Smith, "Introduction to Digital Filters with Audio Applications"
 /// (CCRMA, 2007), Section 1.1.2.
-/// Design: `designs/2026-03-04-envelope-follower-verification.md` Task 2.
 pub fn build_one_pole_step_graph(coefficient: f32) -> Result<GraphNetwork> {
     let weight = arr2(&[[coefficient, 1.0 - coefficient]]);
     let linear = LinearLayer::new(weight, None)?;
@@ -227,7 +225,6 @@ pub fn build_one_pole_step_graph(coefficient: f32) -> Result<GraphNetwork> {
 /// # Reference
 ///
 /// Giannoulis et al., "Digital Dynamic Range Compressor Design" (JAES, 2012).
-/// Design: `designs/2026-03-04-envelope-follower-verification.md` Task 3.
 pub fn build_envelope_follower_step_graph(
     coefficient: f32,
     gain_params: &GainReductionParams,

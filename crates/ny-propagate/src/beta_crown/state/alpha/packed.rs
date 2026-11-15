@@ -353,6 +353,11 @@ pub(crate) struct PackedGraphDomainAlphaState {
     format_version: u32,
     queue_identity: u64,
     queue_layout_fingerprint: [u8; 32],
+    /// Delta-form marker (#alpha-split-refresh) carried verbatim: dropping it
+    /// across a queue round-trip would silently re-interpret neutral deltas
+    /// (0.5) as absolute mid slopes. A value, not layout — excluded from the
+    /// queue/layout fingerprint like the alpha values themselves.
+    split_refresh: bool,
     lower: PackedGraphAlphaSide,
     upper: PackedGraphAlphaSide,
 }
@@ -366,6 +371,7 @@ impl PackedGraphDomainAlphaState {
             format_version: PACKED_GRAPH_ALPHA_FORMAT_VERSION,
             queue_identity,
             queue_layout_fingerprint: [0; 32],
+            split_refresh: runtime.split_refresh,
             lower,
             upper,
         };
@@ -403,7 +409,7 @@ impl PackedGraphDomainAlphaState {
     pub(crate) fn unpack(&self, expected_queue_identity: u64) -> Result<GraphDomainAlphaState> {
         self.validate(expected_queue_identity)?;
         Ok(GraphDomainAlphaState {
-            split_refresh: false,
+            split_refresh: self.split_refresh,
             neurons: self.lower.unpack(),
             upper_neurons: self.upper.unpack(),
         })

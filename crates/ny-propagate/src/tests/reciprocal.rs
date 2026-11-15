@@ -182,7 +182,7 @@ fn test_reciprocal_ibp_zero_crossing_conservative() {
 
     // Zero crossing: 1/x is unbounded on both sides, so [-inf, +inf] is the
     // only sound enclosure; new_repaired preserves the ±Inf endpoints rather
-    // than substituting a finite clamp (#3423).
+    // than substituting a finite clamp.
     assert_eq!(
         out.lower()[[0]],
         f32::NEG_INFINITY,

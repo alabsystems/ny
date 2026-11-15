@@ -11,7 +11,7 @@
 //! independently replays that record.
 //!
 //! ```text
-//! cargo run -p ny-onnx --example nn4sys_one_axis_phase -- \
+//! targo --unverified run -p ny-onnx --example nn4sys_one_axis_phase -- \
 //!   MODEL.onnx PROPERTY.vnnlib CLAUSE_INDEX
 //! ```
 

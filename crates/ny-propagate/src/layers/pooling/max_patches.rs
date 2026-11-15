@@ -15,8 +15,6 @@
 //! 4. Applies winner slopes with positive/negative coefficient dispatch
 //!
 //! Reference: alpha-beta-CROWN auto_LiRPA/operators/pooling.py:78-337
-//! Reference: designs/2026-03-01-patches-phase3-pooling-termination.md Section 2
-//! Part of #2613
 
 use ndarray::{ArrayD, IxDyn};
 use ny_core::{NyError, Result};
@@ -26,6 +24,7 @@ use crate::bounds::nan_propagating_max;
 use crate::bounds::patches::{CrownBounds, PatchGeometry, PatchesData, PatchesLinearBounds};
 use crate::bounds::patches_ops::nearest_neighbor_upsample_last2;
 use crate::layers::common::PatchesPropagation;
+use crate::layers::linear::bias::{add_f64_down, add_f64_up};
 
 use super::max::MaxPool2dLayer;
 
@@ -320,20 +319,19 @@ impl PatchesPropagation for MaxPool2dLayer {
                 // nest mirrors the BatchNorm 7D fold; fully serial in the fixed
                 // tap order row -> oc -> oh -> ow -> (ic, ki, kj) (spec I8).
                 //
-                // spec §14 E3/F3: the f64 fold rounding is dominated by the
-                // directed casts only while the per-row addend count stays well
-                // under 2^28 (cifar-scale rows are ~4e6, 60x under the bound).
-                debug_assert!(
-                    (oc as u128)
-                        * (oh_p as u128)
-                        * (ow_p as u128)
-                        * (ic as u128)
-                        * (kh as u128)
-                        * (kw as u128)
-                        < (1u128 << 28),
-                    "MaxPool 7D bias fold: row addend count breaches the documented \
-                     n < 2^28 rounding-dominance bound"
-                );
+                // ROUNDING (was spec §14 E3/F3, WITHDRAWN — it was false): the old
+                // claim was that "the f64 fold rounding is dominated by the directed
+                // casts while the per-row addend count stays under 2^28". It is not.
+                // The publication cast buys ~1 ulp OF THE RESULT (≈2^-23·|b|); the
+                // f64 `+=` residual of an n-term MIXED-SIGN chain is bounded only by
+                // ≈n·2^-53·Σ|addend|, and the two are unrelated once the taps cancel
+                // (Σ|addend|/|b| > 2^30/n makes the residual the LARGER of the two).
+                // Charging a magnitude-sum error against |Σ terms| is exactly the
+                // conflation that produces bounds tighter than truth. So the chain
+                // now takes a DIRECTED f64 step after every addition (`add_f64_down`
+                // on the lower bias, `add_f64_up` on the upper and on the discharge),
+                // which ENCLOSES the exact real sum for ANY addend count — no
+                // n-regime precondition survives, and none is asserted.
                 for row in 0..spec_rows {
                     // Sanitize the carried err once per row (spec I5): non-finite
                     // or negative maps to +INF (degrade poison), NEVER to 0.
@@ -404,43 +402,65 @@ impl PatchesPropagation for MaxPool2dLayer {
                                             // max(|lb|,|ub|) may be +INF and
                                             // 0·INF = NaN (spec I5).
                                             if row_oe > 0.0 {
-                                                row_discharge += row_oe * lb.abs().max(ub.abs());
+                                                // The discharge is SUBTRACTED from the
+                                                // lower bias / ADDED to the upper, so it
+                                                // must never be UNDER-stated: round its
+                                                // own chain UP on both sides.
+                                                row_discharge = add_f64_up(
+                                                    row_discharge,
+                                                    row_oe * lb.abs().max(ub.abs()),
+                                                );
                                             }
                                             // Interval-arithmetic constant rule per
-                                            // tap (identical to the 6D arm).
-                                            if is_lower {
-                                                row_acc += if coeff > 0.0 {
+                                            // tap (identical to the 6D arm). The
+                                            // product is exact in f64 (f32×f32 ≤ 48
+                                            // significand bits); only the running sum
+                                            // rounds, so take a DIRECTED step per tap.
+                                            let tap = if is_lower {
+                                                if coeff > 0.0 {
                                                     coeff * lb
                                                 } else {
                                                     coeff * ub
-                                                };
+                                                }
+                                            } else if coeff > 0.0 {
+                                                coeff * ub
                                             } else {
-                                                row_acc += if coeff > 0.0 {
-                                                    coeff * ub
-                                                } else {
-                                                    coeff * lb
-                                                };
-                                            }
+                                                coeff * lb
+                                            };
+                                            row_acc = if is_lower {
+                                                add_f64_down(row_acc, tap)
+                                            } else {
+                                                add_f64_up(row_acc, tap)
+                                            };
                                         }
                                     }
                                 }
-                                new_bias[row] += row_acc;
-                                // Apply the discharge OUTWARD (row_discharge ≥ 0,
-                                // possibly +INF ⇒ vacuous row, NaN-free): lower
-                                // bias down, upper bias up.
+                                // Fold this position into the row's ONE bias slot
+                                // with a DIRECTED step, then apply the discharge
+                                // OUTWARD (row_discharge ≥ 0, possibly +INF ⇒
+                                // vacuous row; NaN fails closed to ∓INF inside the
+                                // helpers): lower bias down, upper bias up.
                                 if is_lower {
-                                    new_bias[row] -= row_discharge;
+                                    new_bias[row] = add_f64_down(new_bias[row], row_acc);
+                                    new_bias[row] = add_f64_down(new_bias[row], -row_discharge);
                                 } else {
-                                    new_bias[row] += row_discharge;
+                                    new_bias[row] = add_f64_up(new_bias[row], row_acc);
+                                    new_bias[row] = add_f64_up(new_bias[row], row_discharge);
                                 }
                             }
                         }
                     }
                 }
             } else {
-                // (The 6D nest below is deliberately kept textually verbatim —
-                // including its original indentation — for the byte-identity pin,
-                // spec I2 / `pooling_6d_bitwise_regression_max`.)
+                // (The 6D nest below was previously kept textually verbatim for the
+                // byte-identity pin, spec I2 / `pooling_6d_bitwise_regression_max`.
+                // It no longer is: the same missing accumulation certificate had to
+                // be closed on BOTH arms, so its three f64 `+=` chains now take the
+                // same directed steps as the 7D arm above. The pin still holds —
+                // re-derived and unchanged — because on that fixture the directed
+                // f64 steps move each bias by ≲4 f64 ulps, far under one f32 ulp of
+                // the published value; the pin therefore keeps protecting the
+                // geometry/skip logic it was written for.)
                 for o_c in 0..oc {
                     for o_h in 0..oh_p {
                         for o_w in 0..ow_p {
@@ -501,29 +521,49 @@ impl PatchesPropagation for MaxPool2dLayer {
                                         // since |min/max Σ − Σ min/max| ≤ Σ per-tap, sum the
                                         // per-tap bounds (counted even when the stored coeff is
                                         // 0) and apply outward after the loops.
-                                        row_discharge += row_oe * lb.abs().max(ub.abs());
+                                        // Round the discharge chain UP on BOTH sides: it
+                                        // is subtracted from the lower bias and added to
+                                        // the upper, so it must never be under-stated.
+                                        row_discharge = add_f64_up(
+                                            row_discharge,
+                                            row_oe * lb.abs().max(ub.abs()),
+                                        );
                                         // Interval-arithmetic constant rule per tap:
                                         //   Lower: pos*lb + neg*ub
                                         //   Upper: pos*ub + neg*lb
                                         // (pos minimized at lb / maximized at ub; neg vice versa.)
-                                        if is_lower {
-                                            row_acc +=
-                                                if coeff > 0.0 { coeff * lb } else { coeff * ub };
+                                        // Products are exact in f64; the running sum is not,
+                                        // so take a DIRECTED step per tap.
+                                        let tap = if is_lower {
+                                            if coeff > 0.0 {
+                                                coeff * lb
+                                            } else {
+                                                coeff * ub
+                                            }
+                                        } else if coeff > 0.0 {
+                                            coeff * ub
                                         } else {
-                                            row_acc +=
-                                                if coeff > 0.0 { coeff * ub } else { coeff * lb };
-                                        }
+                                            coeff * lb
+                                        };
+                                        row_acc = if is_lower {
+                                            add_f64_down(row_acc, tap)
+                                        } else {
+                                            add_f64_up(row_acc, tap)
+                                        };
                                     }
                                 }
                             }
-                            new_bias[spec_idx] += row_acc;
-                            // Apply the coefficient-error discharge OUTWARD (row_discharge ≥
-                            // 0): lower bias down, upper bias up. The final directed f32 cast
+                            // Fold into the bias slot with a DIRECTED step, then apply
+                            // the coefficient-error discharge OUTWARD (row_discharge ≥ 0):
+                            // lower bias down, upper bias up. The final directed f32 cast
                             // (next_down/next_up) then rounds further outward.
                             if is_lower {
-                                new_bias[spec_idx] -= row_discharge;
+                                new_bias[spec_idx] = add_f64_down(new_bias[spec_idx], row_acc);
+                                new_bias[spec_idx] =
+                                    add_f64_down(new_bias[spec_idx], -row_discharge);
                             } else {
-                                new_bias[spec_idx] += row_discharge;
+                                new_bias[spec_idx] = add_f64_up(new_bias[spec_idx], row_acc);
+                                new_bias[spec_idx] = add_f64_up(new_bias[spec_idx], row_discharge);
                             }
                         }
                     }
@@ -668,7 +708,7 @@ impl PatchesPropagation for MaxPool2dLayer {
                 unstable_idx: None,
             };
 
-            // Directed rounding (#1745)
+            // Directed rounding
             let new_bias_f32 = if is_lower {
                 new_bias.mapv(|x| next_down_f32(x as f32))
             } else {
@@ -705,10 +745,18 @@ mod coeff_err_7d_tests {
     use crate::bounds::patches::UnstableIdx;
     use ndarray::Array1;
 
-    // Oracle-noise note (spec §9.4): the f64 oracle computations below carry
-    // ~2^-53 relative rounding, while the implementation's biases take a
-    // directed outward f32 cast (>= 2^-25 relative slack) after an f64
-    // discharge — so the outwardness comparisons cannot flip on oracle noise.
+    // Oracle-noise note (spec §9.4), CORRECTED. The original wording read:
+    // "the implementation's biases take a directed outward f32 cast (>= 2^-25
+    // relative slack) after an f64 discharge — so the outwardness comparisons
+    // cannot flip on oracle noise". That slack is relative to the RESULT, and
+    // it was being used to excuse the implementation's own f64 `+=` residual,
+    // which is relative to Σ|addend| — an unrelated quantity once the mixed-sign
+    // taps cancel. It excused nothing, and the fold is now directed per addition
+    // instead (`add_f64_down`/`add_f64_up`).
+    // What the f32 cast DOES cover, and all it is claimed for here, is the
+    // ORACLE's ~2^-53 relative noise in the few-term f64 truths computed below:
+    // those are O(1) magnitudes with no cancellation, so a 2^-25 relative step of
+    // the published bias cannot be crossed by oracle rounding.
 
     /// maxpool (2,2)/(2,2) over input (1,2,8) -> output (1,1,4).
     /// Window 0: definite winner at input (0,0,0) (l=5 >= all other u);
@@ -796,7 +844,8 @@ mod coeff_err_7d_tests {
 
     /// Independent bitwise replica of the 7D bias fold + discharge for one spec
     /// row of the fixture (4 positions, 1 tap each), mirroring the
-    /// implementation's per-position f64 apply order and skips exactly.
+    /// implementation's per-position f64 apply order, its DIRECTED f64 steps,
+    /// and its skips exactly.
     fn expected_bias_7d(b0: f32, stored_row: &[f32], row_oe: f64, is_lower: bool) -> f32 {
         let win = fixture_window_bounds();
         let mut b = f64::from(b0);
@@ -807,9 +856,9 @@ mod coeff_err_7d_tests {
             let mut disch = 0.0_f64;
             if !(c == 0.0 && row_oe == 0.0 || lb == 0.0 && ub == 0.0) {
                 if row_oe > 0.0 {
-                    disch += row_oe * lb.abs().max(ub.abs());
+                    disch = add_f64_up(disch, row_oe * lb.abs().max(ub.abs()));
                 }
-                acc += if is_lower {
+                let tap = if is_lower {
                     if c > 0.0 {
                         c * lb
                     } else {
@@ -820,12 +869,18 @@ mod coeff_err_7d_tests {
                 } else {
                     c * lb
                 };
+                acc = if is_lower {
+                    add_f64_down(acc, tap)
+                } else {
+                    add_f64_up(acc, tap)
+                };
             }
-            b += acc;
             if is_lower {
-                b -= disch;
+                b = add_f64_down(b, acc);
+                b = add_f64_down(b, -disch);
             } else {
-                b += disch;
+                b = add_f64_up(b, acc);
+                b = add_f64_up(b, disch);
             }
         }
         if is_lower {
@@ -1239,6 +1294,16 @@ mod bitwise_regression_pins {
     /// bit literals captured from that tree. Must pass unmodified after the
     /// closure lands.
     ///
+    /// RE-DERIVED (#maxpool-patches-bias-accum): the 6D bias arm is no longer
+    /// byte-frozen — its three f64 `+=` chains now take directed steps. The
+    /// pinned `EXP_LOWER_B`/`EXP_UPPER_B` are UNCHANGED, and that is a computed
+    /// result, not an assumption: on this fixture each bias slot takes at most
+    /// two directed f64 steps (≈2 ulp ≈ 4e-16 on values of magnitude 0.1–5.4),
+    /// three orders of magnitude under the ~2.4e-7 f32 step the publication
+    /// already rounds by, so the published f32 cannot move. The pin therefore
+    /// still guards exactly what it was written for — the tap geometry, the
+    /// definite-winner (0,0) skip, and the coeff_err carry.
+    ///
     /// Fixture: pool (2,2)/(2,2) over input (1,2,8) -> output (1,1,4); windows
     /// 0 and 2 have definite winners (carry path, coeff·winner_d), windows 1
     /// and 3 are non-winner with DISTINCT (lb,ub) constant bounds (bias fold +
@@ -1379,5 +1444,110 @@ mod bitwise_regression_pins {
             ("EXP_LOWER_ERR", &lower_err, &EXP_LOWER_ERR),
             ("EXP_UPPER_ERR", &upper_err, &EXP_UPPER_ERR),
         ]);
+    }
+}
+
+// --- Patches bias-fold accumulation certificate (#maxpool-patches-bias-accum) ---
+#[cfg(test)]
+mod patches_bias_accumulation_tests {
+    use super::*;
+    use ndarray::Array1;
+
+    /// COUNTEREXAMPLE for the uncertified mixed-sign f64 bias fold — the
+    /// patches twin of
+    /// `max::dense_bias_accumulation_tests::maxpool_dense_bias_chain_encloses_exact_constant_under_cancellation`.
+    ///
+    /// Three no-winner MaxPool outputs, one tap each, whose constant folds are
+    /// exactly `+2^40`, `-2^-14`, `-2^40` on the lower row (mirrored on the
+    /// upper). Every product is exact in binary64 (f32×f32 ≤ 48 significand
+    /// bits), so the exact real bias is `-2^-14 = -6.1e-5`. The pre-fix
+    /// round-to-nearest chain swallows the middle term (`2^40 - 2^-14` is
+    /// 0.25 ulp below `2^40`) and publishes `next_down_f32(0.0) = -1.4e-45`,
+    /// **6.1e-5 ABOVE** the constant it must under-approximate.
+    ///
+    /// This is precisely what the withdrawn "the directed outward f32 cast
+    /// (>= 2^-25 relative slack) covers the f64 fold" comment claimed could not
+    /// happen: that slack is relative to the RESULT (here `0.0`), while the
+    /// residual is relative to `Σ|addend| = 2^41`.
+    ///
+    /// WIRING, not kernel: the addends come from the layer's own per-tap
+    /// interval rule inside `propagate_patches_with_bounds`.
+    #[test]
+    fn maxpool_patches_bias_fold_encloses_exact_constant_under_cancellation() {
+        const P20: f32 = 1_048_576.0; // 2^20, exact
+        const PM14: f32 = 6.103_515_6e-5; // 2^-14, exact
+
+        // (1,1,6) → (1,1,3), kernel == stride == (1,2), no padding. Each window
+        // holds two identical intervals ⇒ no definite winner ⇒ every output
+        // carries the constant pair (max_lower, max_upper):
+        //   w0 = (-3·2^20, -2^20),  w1 = (-1, +1),  w2 = (-2^20, +2^20).
+        let maxpool = MaxPool2dLayer::new((1, 2), (1, 2), (0, 0));
+        let pre = BoundedTensor::new(
+            ArrayD::from_shape_vec(
+                IxDyn(&[1, 1, 6]),
+                vec![-3.0 * P20, -3.0 * P20, -1.0, -1.0, -P20, -P20],
+            )
+            .unwrap(),
+            ArrayD::from_shape_vec(IxDyn(&[1, 1, 6]), vec![-P20, -P20, 1.0, 1.0, P20, P20])
+                .unwrap(),
+        )
+        .unwrap();
+
+        // 7D explicit-rows side [rows=1, oc=1, oh=1, ow=3, ic=1, kh=1, kw=1]:
+        // position `ow` taps MaxPool output window `ow`.
+        // lower coeffs all < 0 ⇒ fold = coeff·ub = +2^40, -2^-14, -2^40.
+        // upper coeffs all > 0 ⇒ fold = coeff·ub = -2^40, +2^-14, +2^40.
+        let side = |vals: Vec<f32>| PatchesData {
+            coeff_err: None,
+            patches: Some(ArrayD::from_shape_vec(IxDyn(&[1, 1, 1, 3, 1, 1, 1]), vals).unwrap()),
+            geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
+            identity: false,
+            output_shape: (1, 1, 3),
+            input_shape: (1, 1, 3),
+            unstable_idx: None,
+        };
+        let bounds = PatchesLinearBounds {
+            row_count: 1,
+            lower_a: side(vec![-P20, -PM14, -P20]),
+            lower_b: Array1::zeros(1),
+            upper_a: side(vec![P20, PM14, P20]),
+            upper_b: Array1::zeros(1),
+        };
+
+        let result = maxpool
+            .propagate_patches_with_bounds(&bounds, &pre)
+            .expect("MaxPool2d patches backward must succeed on this fixture");
+        let (lower_b, upper_b) = match result {
+            CrownBounds::Patches(pb) => (pb.lower_b[0], pb.upper_b[0]),
+            CrownBounds::Dense(lb) => (lb.lower_b()[0], lb.upper_b()[0]),
+        };
+
+        let true_lower = -f64::from(PM14);
+        let true_upper = f64::from(PM14);
+
+        assert!(
+            f64::from(lower_b) <= true_lower,
+            "MaxPool patches lower bias {lower_b} is ABOVE the exact constant \
+             {true_lower}: the mixed-sign f64 fold residual is uncertified"
+        );
+        assert!(
+            f64::from(upper_b) >= true_upper,
+            "MaxPool patches upper bias {upper_b} is BELOW the exact constant \
+             {true_upper}: the mixed-sign f64 fold residual is uncertified"
+        );
+
+        // Liveness: a nearest-rounding chain really does land on 0.0 here.
+        let mut nearest = 0.0_f64;
+        for term in [
+            f64::from(-P20) * f64::from(-P20),
+            f64::from(-PM14),
+            f64::from(-P20) * f64::from(P20),
+        ] {
+            nearest += term;
+        }
+        assert_eq!(
+            nearest, 0.0,
+            "fixture no longer exercises the swallowed-term cancellation"
+        );
     }
 }

@@ -13,8 +13,6 @@
 //! `check_and_save_cex(...)` on `unsafe_bab` in `complete_verifier_func.py:232-244`.
 //! The reference also uses a fallback confirmation budget of 5 restarts / 5 steps
 //! (`arguments.py:1029-1044`).
-//!
-//! Part of #3678.
 
 use anyhow::Result;
 use ndarray::{ArrayD, IxDyn};

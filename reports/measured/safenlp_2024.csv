@@ -1078,4 +1078,3 @@ safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_7
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_6678.vnnlib,prepared,sat,0.39,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_6534.vnnlib,prepared,unsat,2.05,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_1103.vnnlib,prepared,sat,0.36,l1audit-20260804-d1282d23
-safenlp_2024,onnx/test_nano.onnx,vnnlib/test_nano.vnnlib,0,unsat,0

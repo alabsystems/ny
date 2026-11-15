@@ -9,8 +9,6 @@
 //! similar inflection structure). The identity-bounds tests verify the
 //! relaxation envelope directly. The negative-coeff and asymmetric tests
 //! exercise sign-switching in crown_elementwise_backward.
-//!
-//! Part of #40, #1793.
 
 use crate::layers::{SiLULayer, SigmoidLayer, TanhLayer};
 use crate::{GELULayer, GeluApproximation, LinearBounds};
@@ -38,7 +36,6 @@ proptest! {
     /// Uses chord + tangent bounds based on convexity regions.
     ///
     /// Range [-10, 10]: SiLU is well-behaved everywhere, bounded by [-0.28, +inf).
-    /// Reference: designs/2026-02-08-silu-crown-relaxation.md
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_silu_crown(l in -10.0f32..10.0, delta in 0.0f32..20.0) {

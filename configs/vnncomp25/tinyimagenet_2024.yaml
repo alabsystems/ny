@@ -79,6 +79,50 @@ attack:
 # the verifier twice (it loses the slice AND contends), the combination
 # 31949bcc refused for want of evidence.
 margin_row:
+  # #breakpoint-dual: user-directed default activation for this category in
+  # both the 2025 and 2026 routes. Four untrusted search steps feed the existing
+  # certified node evaluator. The automatic tier uses at most 4 s / 5% of
+  # remaining time, 8192 nodes per objective and 256 MiB of state. Dense row
+  # estimates >=64 MiB select one objective, otherwise at most two.
+  # Competition benefit and a full both-year regression comparison remain unmeasured.
+  frozen_dual_bab: true
+  frozen_dual_refine_steps: 4
+  # #mr-stack + #mr-errlane (throughput plan B5 + B3) ARMED 2026-09-26 on the scratchpad/mrab A/B (pin ny_wave5_b44d1404b,
+  # official 100 s, 3 reps x {ctl, stack, stack+envelope}): cifar100 idx_2050 and idx_4921 timeout 3/3 -> UNSAT 3/3; idx_1298
+  # 91 -> 68 s, idx_3894 93 -> 71 s, idx_7258 61 -> 47 s; tiny idx_2146/7943 +54-106% tree expansions (no verdict change).
+  # Stacking ALONE loses rows (3894 unknown 3/3) — only the pair ships. The envelope dominates the per-column penalty
+  # (worst max_pen_env 6.0e-9); stacking is bit-identical.
+  domain_stack: true
+  err_envelope: envelope
+  # #k-trunk-narrow ARMED 2026-09-16 — the branch shortlist was scoring seven
+  # trunk candidates per expansion that essentially never win.
+  #
+  # EVIDENCE. The first tinyimagenet margin-row phase profile (obtainable only
+  # after fixing a profiler blind on this category's exit path) shows
+  # `score_candidates` is the LARGEST phase here — 50.4% / 52.2% of the lane at
+  # 4852-9417 ms/call, against 21.8% on cifar100 — and it builds ONE wide seed
+  # over both candidate kinds, `total = (2*n_t + 2*n_h)*nf`. Across the two
+  # profiled rows, `trunk_split=0` over 214 splits: every split was a HEAD split.
+  # k_trunk 8 -> 1 cuts that seed 32*nf -> 18*nf.
+  #
+  # MEASURED, one pinned binary, official 100 s, zero NY_*:
+  #   THROUGHPUT  +49% expansions over 5 paired rows (399 -> 595); per-call cost
+  #     1.33-1.57x cheaper against 1.78x predicted from the seed width.
+  #   CONVERSION  idx_2045_sidx_7367 timeout -> unsat, CONTROL-VERIFIED:
+  #     ctl 2/2 timeout@100s (cands=16), arm 2/2 unsat@95-96s (cands=9).
+  #     The bank was `inherited-unverified`, so the controls rule out a stale
+  #     bank. SOUND: the official corpus has 6 unsat / 6 timeout / 4 unknown and
+  #     ZERO sat for this instance.
+  #   MOAT  18 banked unsats clean (15 wide + 3 paired), 0 lost, 0 sat. Three of
+  #     them expansion-IDENTICAL, including idx_4871 — the knife-edge row that
+  #     k16 previously LOST.
+  #   RARITY  1 conversion in 25 candidate rows. Worth ONE row (+0.571), not a
+  #     front.
+  #
+  # Narrowing does NOT suppress trunk branching: on rows that use it, splits went
+  # 12 -> 10 and 22 -> 24 (more, because the arm affords more expansions). The
+  # top-ranked trunk candidate is usually the one that would have won anyway.
+  k_trunk: 1
   # #backward-interm — shipped on TINY'S OWN evidence (alloc-trio rule: never
   # a blind cifar transfer). MEASURED 2026-08-19, official 100s, this preset:
   #   idx_4330 timeout -> UNSAT 3/3 (~37s, ledger); in-band roots tighten
@@ -269,6 +313,17 @@ margin_row:
   #   that is false on the current binary is exactly the shape that was worth
   #   +12.9 normalized points on collins when it was finally re-measured.
   #
+  #   ANSWERED 2026-09-16 — that A/B has now been run, and k_trunk IS armed
+  #   above (`k_trunk: 1`). 5 paired rows (+49% expansions), 25 candidate rows
+  #   (1 control-verified conversion), 18 banked unsats clean. See the note on
+  #   the key itself. k_head remains untouched and unmeasured.
+  #
+  #   ⚠ AND ONE FIGURE IN THE BLOCK ABOVE IS STALE: "root build 48.9 s of
+  #   93.2 s" is not what the current binary does. The first tinyimagenet
+  #   margin-row phase profile (2026-09-15) measures root_gate_build at
+  #   22.3 s and 23.1 s on two rows — 2.7% and 4.1% of tracked lane time.
+  #   The root is NOT half this category's wall; score_candidates is ~50%.
+  #
   # * adaptive_reserve: true — NOT transferred, and it is NOT interchangeable
   #   with the `reserve_secs: 0` above even though both hand the internal
   #   verifier the whole budget. `margin_row_reserve_decision` short-circuits on
@@ -282,11 +337,44 @@ margin_row:
   #   pass would spend host time competing with the lane that does. Also already
   #   pinned absent by `tinyimagenet_2024_rejects_the_regressive_cifar100_allocation_trio`.
   #
-  # * verifier_threads — unset, i.e. no cap, on both presets. This is the
-  #   #verifier-thread-cap seam from the closure program's Front B and it is the
-  #   most promising unmeasured scheduling lever for this category precisely
-  #   because the lane is root-bound and CPU-bound while the verifier that proves
-  #   nothing shares the same unbounded rayon pool. Ship only after an A/B.
+  # * verifier_threads — unset, i.e. no cap, and now MEASURED NEGATIVE: keep it
+  #   unset. This was "the most promising unmeasured scheduling lever for this
+  #   category", to ship only after an A/B. THE A/B HAS BEEN RUN and it says no.
+  #
+  #   The premise is half right. The concurrent lane really is the only prover
+  #   here: across this campaign's own logs, 142 of 142 cifar100 and 4 of 4
+  #   tinyimagenet `unsat` runs came from the lane and ZERO from the internal
+  #   alpha/beta verifier. What does NOT follow is that the lane is starved by it.
+  #
+  #   MEASURED 2026-09-17, pinned 074a3f25f68bd51f, official 100 s, zero NY_*,
+  #   row idx_4330_sidx_3504, 3 arms x 3 reps, arm order ROTATED per rep, strict
+  #   quiescence, load_before recorded per run (2.36-2.90, no ordering bias):
+  #
+  #       arm  lane pool    lane times (s)      mean    vs ctl   exp
+  #       ctl  20 shared    34.9, 35.0, 34.7    34.87    ---      22
+  #       2    18 private   34.9, 35.5, 35.6    35.33   +1.3%     22
+  #       4    16 private   37.6, 37.9, 37.2    37.57   +7.7%     22
+  #
+  #   `exp=22` on all nine runs — identical trees, so this is a pure timing
+  #   endpoint with sd 0.12 s on the control. Engagement 9/9
+  #   (global_pool_route=applied, lane_pool_threads = 20-N, concurrent_spawned=
+  #   true); the field doc warns an already-initialized pool VOIDS the A/B, and
+  #   that never occurred.
+  #
+  #   => lane time is monotone in LANE width, not in verifier contention. 18
+  #   threads is indistinguishable from the shared 20; 16 costs 7.7%. There is no
+  #   starvation to relieve, because partitioning 20 into N + (20-N) only takes
+  #   threads off the lane. The `vnncomp.rs` note that "the wall presets run the
+  #   verifier on device: wgpu, so the two lanes are on different hardware and
+  #   barely contend" is the one that holds: vt2 matching the shared pool bounds
+  #   the verifier's host-CPU appetite at under two threads' worth. The
+  #   margin_row_bab.rs note that the lane "runs ~2.4x slower concurrently than
+  #   standalone" is not refuted but SCOPED — it is not true of these wgpu wall
+  #   presets, whatever configuration it measured.
+  #
+  #   Worth keeping from it: -20% lane threads costs only 7.7% wall, so the lane
+  #   is far from linearly parallel and a future lever can take ~2 host threads
+  #   back for free.
   #
   # * concurrent_threads — unset on both presets. Without a positive verifier
   #   request this preserves the shared global pool; with one it derives only
@@ -300,6 +388,31 @@ margin_row:
   # * reserve_max_frac / release_frac — unset by design: with `reserve_secs: 0`
   #   the reserve arithmetic is never reached, so a value here would be inert.
 
+  # #tiny-alpha-aligned ARMED 2026-09-22 — the root ascent, which this category
+  # has never shipped, with the gradient fixed and its cost cap unpinned.
+  #
+  # WHY IT WAS OFF: the 2026-08-30 attempt bought bound with SEARCH TIME and lost
+  # 3 of 6 rows. Two causes, both now fixed: (1) the direction was a MEAN over 8
+  # columns for an objective that is a MIN — `alpha_cols: 1` aligns them; (2)
+  # `alpha_secs` was unset, resolving to the global default 20.0, a CAP the
+  # ascent saturates rather than a spend it chooses.
+  #
+  # MEASURED, pin ny_specalpha_0301, official 100 s, order rotated, 0 VOID in 36
+  # runs. Screen of the 8 NEAREST timeout rows (frontier census): the published
+  # root improves on 8/8 (+0.008..+0.157), and the two conversions are ranks 1
+  # and 2 by root gain. Replication, 5 reps/arm:
+  #   idx_2045_sidx_7367   ctl 1/5 (95.8 s)   arm 5/5 (median 86.7 s)   p=0.024
+  #   idx_5683_sidx_1212   ctl 0/5            arm 2/5                   p=0.222
+  #   POOLED               ctl 1/10           arm 7/10                  p=0.0099
+  # Root BIT-IDENTICAL every rep; the verdict nondeterminism is search/wall.
+  #
+  # ⚠ Neither row is a deterministic banked conversion: idx_2045's control
+  # proves it 1/5 (the lever buys RELIABILITY + ~9 s of headroom there), and
+  # idx_5683 is 2/5. Armed because it converts marginal rows 7x more often, and
+  # 61 banked unsats here publish within 10 s of the wall (34.9 pts at risk).
+  alpha_opt: true
+  alpha_cols: 1
+  alpha_secs: 35.0
 bab:
   batch_size: 128
   auto_enlarge_batch_size: true
@@ -308,17 +421,12 @@ bab:
     # graph engine) for this high-dim conv net (9408-element input) — input-splitting
     # is hopeless. candidates/reduceop still tune kFSB. See branching.rs.
     candidates: 10
-    reduceop: max
     # Exact wave-selector mirrors for governed search; runtime is unchanged.
     kfsb_multi_candidates: 10
     kfsb_multi_reduceop: max
   alpha_crown:
     lr_alpha: 0.2
     iterations: 20
-  beta_crown:
-    lr_alpha: 0.1
-    lr_beta: 0.15
-    iterations: 15
   # Phase budget overrides (#2206 Packet E).
   # Cap warmup at 15% to prevent alpha-CROWN from consuming the entire budget
   # on large ResNet models. Reserve 10% for post-BaB PGD fallback.

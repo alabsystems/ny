@@ -1,0 +1,4251 @@
+{
+  "schema_version": 1,
+  "year": 2025,
+  "timeout_cap": null,
+  "configs": {
+    "canonical_path": "<home>/ny-wt-ship27/configs/vnncomp25",
+    "sha256": "8761a57e661d3d2150f65faa423ff9ac6c3eba0088ab5c31622792ee337e701c"
+  },
+  "executable": {
+    "canonical_path": "<home>/ny-pins/ny_wave6_cf376ec20",
+    "sha256": "4b1656c9978e31af5ae607190e92c28506853f2ada28ee88ae029c8596e55135"
+  },
+  "build_id": "NY_BUILD_ID_V1 version=0.5.6157 features=mip,cuda backend=cuda+wgpu markers=margin-row-gpu-eft-impl-v9 commit=cf376ec2054b365210906e8894cd28d082fbe4bc dirty=false revision=6157 source=clean profile=release target=aarch64-unknown-linux-gnu rustc=1.99.0-dev-1183ee6ed stamp=63913e1bc53fdd22c9ffdd3c321f44aaf028d3dc7860d93d97a1deb9381bd9a0 exe=4b1656c9978e31af5ae607190e92c28506853f2ada28ee88ae029c8596e55135 id=cb1fa286a839fa13e983d3ce473cfd68dd4f656a99c6d2db04e1a1ae36db9e14",
+  "build_provenance": "ny.vnncomp.unsealed.v1|status=unsealed|",
+  "target_os": "linux",
+  "target_arch": "aarch64",
+  "compute_backend": "cuda [cuda: compiled, NVIDIA kernel driver=present, 1 process-visible device(s), libcuda+libcublas=present, engine lazy/unconfirmed; wgpu adapter: Vulkan (NVIDIA GB10, IntegratedGpu); sound verdict path: CUDA f64 GEMM seams + CPU f64 CROWN (resident CUDA CROWN behind its gates)]",
+  "host": "spark-f904 | unknown-cpu | 20 cores | 121 GiB",
+  "arm": [],
+  "ambient_env_schema": "ny-cli/ambient-env/v3",
+  "ambient_env": {
+    "NY_BOX_QUIET_GRACE": "300",
+    "NY_BOX_WAIT_LOCK": "21600",
+    "NY_BOX_WAIT_QUIET": "21600"
+  },
+  "witness_dir": {
+    "canonical_path": "<home>/ny/reports/sweeps/ship27/tinyimagenet_2024-2025.witnesses",
+    "sha256": "26b06c51cf57839842e4d05b3c164779aa1ace433441fe44bf4cd91be37ad4f0"
+  },
+  "instance_selection": {
+    "mode": "all"
+  },
+  "selected_rows": {
+    "tinyimagenet_2024": {
+      "schema": "ny-search/measured-row-set/v1",
+      "count": 200,
+      "sha256": "9560748b5ad603f7539b44ca8adb98a38748c40284cc6a9de64a3e1ef2c09c1b"
+    }
+  },
+  "selected_row_inputs_schema": "ny-cli/selected-row-inputs/v2",
+  "selected_row_inputs": {
+    "tinyimagenet_2024": [
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_1126_sidx_4974_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 0,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_1126_sidx_4974_eps_0.0039.vnnlib",
+            "sha256": "9497c3bdd8ade3804cfd9fe8d415941a18049753e31eede0adbf4260cdc280c1"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_6827_sidx_2613_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 1,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_6827_sidx_2613_eps_0.0039.vnnlib",
+            "sha256": "96809936f26c5a4ac7bef4ec604d6abebc2c44af1a3fc8b50ed19748cc3bc665"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_7943_sidx_6299_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 2,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_7943_sidx_6299_eps_0.0039.vnnlib",
+            "sha256": "27992347f22d80750a97dd4b5c3d602732d0977c7681a70d2109e0a27c9ee466"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_9558_sidx_6082_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 3,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_9558_sidx_6082_eps_0.0039.vnnlib",
+            "sha256": "68bdb44519fadb8ce53fde23222814540b0d16dafdffe5b043d9e1bb2a97ca97"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_2341_sidx_4149_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 4,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_2341_sidx_4149_eps_0.0039.vnnlib",
+            "sha256": "91f0444c0918d15f2e22966aa426f80ff24127834301b0119225dbf3a6c20a4a"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_5478_sidx_174_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 5,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_5478_sidx_174_eps_0.0039.vnnlib",
+            "sha256": "c2ad4b8151dcc588295f28d742dc5b7c9ed6bbd670da905591bd158f77c578ba"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_9262_sidx_880_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 6,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_9262_sidx_880_eps_0.0039.vnnlib",
+            "sha256": "e43da462a4b9758587532cd311a7e51b6dcb9ede5c656df0a5fbde2a76e7e2f4"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_6252_sidx_9972_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 7,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_6252_sidx_9972_eps_0.0039.vnnlib",
+            "sha256": "1feb7397c0cc8c0a44231523518b82c1f2a35c11f6d17f3d73d16b42f4c55b7b"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_2146_sidx_298_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 8,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_2146_sidx_298_eps_0.0039.vnnlib",
+            "sha256": "30f261bf88da38f1865a2c6585a4c8a1c0293fb22bc6aa275b20528e742baf4e"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_538_sidx_2467_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 9,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_538_sidx_2467_eps_0.0039.vnnlib",
+            "sha256": "17105dda046b27e5cd9eff31e4e97a32eed0e5b3656b81cb790ff5d0b5a41238"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_5134_sidx_3767_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 10,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_5134_sidx_3767_eps_0.0039.vnnlib",
+            "sha256": "051a135bb0b6e8edb2b431530a1f527ecc150c9ce94a4cbdcec979a394c9c46a"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_9535_sidx_6151_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 11,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_9535_sidx_6151_eps_0.0039.vnnlib",
+            "sha256": "2776bcc85812e9bd663af2d0483407029a5d2999b421e25caedc0b7f291fcde9"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_253_sidx_4834_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 12,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_253_sidx_4834_eps_0.0039.vnnlib",
+            "sha256": "10cf3940413993eb5e1865088e98d590c86baccb54bc1e4ea8cdbd8414ab6dd6"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_5673_sidx_6615_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 13,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_5673_sidx_6615_eps_0.0039.vnnlib",
+            "sha256": "999ebbf96d368a1c677e61621b6535ee3dd274ab112d5a628887cab6ef37cc16"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_1459_sidx_443_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 14,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_1459_sidx_443_eps_0.0039.vnnlib",
+            "sha256": "db7f0f056b3f5e41d4cd27a265b5c66ab314bd1b3fddfd2abbe3d5ac0200c0b7"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_551_sidx_6748_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 15,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_551_sidx_6748_eps_0.0039.vnnlib",
+            "sha256": "9bf1d5d61e703522ac8d3bd615af2a9b9c7785bc5b71a0cd9fb14e243959b5c2"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_4526_sidx_9254_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 16,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_4526_sidx_9254_eps_0.0039.vnnlib",
+            "sha256": "a1324fbbd9614857fe05882af0d78460832d85dbf047e5549bf2511f48115138"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_2063_sidx_8156_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 17,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_2063_sidx_8156_eps_0.0039.vnnlib",
+            "sha256": "0089ecbe47c9f4322ea8391c358e8a1dc7645e5832f6a35920434f84a07c0f8c"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_879_sidx_6242_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 18,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_879_sidx_6242_eps_0.0039.vnnlib",
+            "sha256": "19cda34e1dbb739a01618392a6ccdc83ac8b2cb33677886b2f988c547451d965"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_247_sidx_1124_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 19,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_247_sidx_1124_eps_0.0039.vnnlib",
+            "sha256": "c5444cc5c6fc5ca158d284e0cb19e7440fe95e6b6ec55adf7943482f916d9763"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_2582_sidx_5386_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 20,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_2582_sidx_5386_eps_0.0039.vnnlib",
+            "sha256": "96d3a324e8a8ce50261dd49ad6de1d912f8bf3386b1d89cc78f7147975add56f"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_2936_sidx_7810_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 21,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_2936_sidx_7810_eps_0.0039.vnnlib",
+            "sha256": "c61b469858f7a9bdb06ae291ef7c6f9c4132da6e370fbcf765582570d23fe5e9"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_1175_sidx_7775_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 22,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_1175_sidx_7775_eps_0.0039.vnnlib",
+            "sha256": "49184bcd36b42f7eff4ebfcaa2708e0343a5f9cac6507af047553f6ae9f5d376"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_7365_sidx_3284_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 23,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_7365_sidx_3284_eps_0.0039.vnnlib",
+            "sha256": "32da6f67af400d9d914c9ff435adbe1cc436238d7ff52c09b7ecd585ff6904d4"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_8684_sidx_9001_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 24,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_8684_sidx_9001_eps_0.0039.vnnlib",
+            "sha256": "41eb67b6f563a49648213f56fbf4b244e40bf52217d63e6c7b48aad75e9fa8d4"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_1706_sidx_4932_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 25,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_1706_sidx_4932_eps_0.0039.vnnlib",
+            "sha256": "02a02cc7ace2182e2200459ece74c60c64444e060f8c635e2069e59ce8068508"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_2755_sidx_193_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 26,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_2755_sidx_193_eps_0.0039.vnnlib",
+            "sha256": "ae8083a9aec472e15d34186ebdcfb7a44d25a7a85f562a0b23d3319cf6a10dd7"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_9584_sidx_3691_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 27,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_9584_sidx_3691_eps_0.0039.vnnlib",
+            "sha256": "bb835261a15097d201b80b799afea484d7f980de5bdfa390176282208a6cef54"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_9079_sidx_5823_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 28,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_9079_sidx_5823_eps_0.0039.vnnlib",
+            "sha256": "234e82fe2a1cff942bafdecbef1db9bd10f8905beb94a19883f3324c204c8a52"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_1135_sidx_1928_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 29,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_1135_sidx_1928_eps_0.0039.vnnlib",
+            "sha256": "370f1c6d715590ce676e9427abe714221c5a7f7b100ee41ba50bf86c969ed0ed"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_1359_sidx_7221_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 30,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_1359_sidx_7221_eps_0.0039.vnnlib",
+            "sha256": "4c1caaf8bdadccf24da6061f58f396e2cc7c7cbd72750a7500e83893b8bfc18f"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_5683_sidx_1212_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 31,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_5683_sidx_1212_eps_0.0039.vnnlib",
+            "sha256": "5363986ddaf8c0c83aa07d82521990ee69f4e607bd8e6d9fb2b4f6e10f892407"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_1615_sidx_1065_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 32,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_1615_sidx_1065_eps_0.0039.vnnlib",
+            "sha256": "02dd4eacfaae5aeb5bfe8a64fb07118f0cb2e2c3222eb565ef531e525bb95efd"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_288_sidx_5531_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 33,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_288_sidx_5531_eps_0.0039.vnnlib",
+            "sha256": "3bbefdfef74675b5ad33345798f7c832c7ba20889d08209fd456403ce0b84d25"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_6546_sidx_3168_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 34,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_6546_sidx_3168_eps_0.0039.vnnlib",
+            "sha256": "d2c659d01991674cacc88aea43c7820ad31c63cc490aae9602e00809402797c3"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_2475_sidx_523_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 35,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_2475_sidx_523_eps_0.0039.vnnlib",
+            "sha256": "03218744c0e299d70cf4357e13681bca681807ff1af5befe317ab78e8fdad091"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_9476_sidx_5602_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 36,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_9476_sidx_5602_eps_0.0039.vnnlib",
+            "sha256": "ebb8eac0c3635b6e81d0a21cda6d3101e1455c566e3e867d433a375a78cc9b5a"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_3782_sidx_1103_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 37,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_3782_sidx_1103_eps_0.0039.vnnlib",
+            "sha256": "e8f997d96dcd301bb0e51cdceb1161db9244b3800e1ecc6a25bb525bb4d8ec26"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_4463_sidx_4146_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 38,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_4463_sidx_4146_eps_0.0039.vnnlib",
+            "sha256": "04573ee6d05e9f85227e7985223c6d037deb3dcbd03f049e05050c0f4ea650f7"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_8257_sidx_5574_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 39,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_8257_sidx_5574_eps_0.0039.vnnlib",
+            "sha256": "a9995c0bb1c820b256749a12c4fe6f5137d53c366dcaf94aff27b10d49dd3593"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_4438_sidx_6486_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 40,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_4438_sidx_6486_eps_0.0039.vnnlib",
+            "sha256": "d0ffaedd14404ed0a63e07a068e34cdbe064043d0c4d770bc6736dceef4c1899"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_484_sidx_161_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 41,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_484_sidx_161_eps_0.0039.vnnlib",
+            "sha256": "db1a954db6c31d1e19b89111b7212ecb23b708f5eee529cf011cb61749cce93b"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_9611_sidx_7725_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 42,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_9611_sidx_7725_eps_0.0039.vnnlib",
+            "sha256": "cd2ef3161553c29ce5c5bad59607629d2b9ce32d01fdf2bca9726b435e330c16"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_3429_sidx_4578_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 43,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_3429_sidx_4578_eps_0.0039.vnnlib",
+            "sha256": "d079b233dda22330b2f74e521578d1b6b370822eeb841190f8bae2f42ee06cb6"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_5685_sidx_8755_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 44,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_5685_sidx_8755_eps_0.0039.vnnlib",
+            "sha256": "49c95daaca631bd6da637418e3d185bffd3a831a51a8bd21af64340c9a8843e1"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_5257_sidx_5727_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 45,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_5257_sidx_5727_eps_0.0039.vnnlib",
+            "sha256": "04a5739c5150cae5416be2ac3368cca3284ae12c28ebf4ea2d23882da5299cdf"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_9437_sidx_5480_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 46,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_9437_sidx_5480_eps_0.0039.vnnlib",
+            "sha256": "a6dfae496c91bcdce1815d62971dc3c99ff2391163e88e2fcffb8d087d56115b"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_4500_sidx_6717_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 47,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_4500_sidx_6717_eps_0.0039.vnnlib",
+            "sha256": "076ff892546a945f78a51576d8ec9d3e090961bb467f373acef7aa2915056bc2"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_4871_sidx_7562_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 48,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_4871_sidx_7562_eps_0.0039.vnnlib",
+            "sha256": "1a72ad12a9e559226a3ab547c609b7d3babc1cb419c6139cdede8775f1021491"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_2210_sidx_992_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 49,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_2210_sidx_992_eps_0.0039.vnnlib",
+            "sha256": "c01f2c0fd7f2d735455420a369cd741032c6618b4b833d71fde2db891b9c8dbd"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_1651_sidx_3548_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 50,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_1651_sidx_3548_eps_0.0039.vnnlib",
+            "sha256": "e0734035e24b909067c6b4676529349ec85ef3c690383ef79b2f43f7acde6ba0"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_7183_sidx_4731_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 51,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_7183_sidx_4731_eps_0.0039.vnnlib",
+            "sha256": "bef8d16889c91546ed5f052dc08a491d2cc17026598ce3f55038697e28c7bd32"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_647_sidx_9608_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 52,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_647_sidx_9608_eps_0.0039.vnnlib",
+            "sha256": "496d6c021a5da1645a76d5f6d73eaee45d10eb74fea5376d4acff209a1559b2c"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_9992_sidx_5063_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 53,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_9992_sidx_5063_eps_0.0039.vnnlib",
+            "sha256": "b164a4df75545fc58acc6d82f8f1f5a92d09424c8366aa4a07a9e03809bd5da4"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_3543_sidx_5527_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 54,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_3543_sidx_5527_eps_0.0039.vnnlib",
+            "sha256": "2782027994a8e856ec734cbefc0ee433ed1c2a7502f299c5647f1e0f1370c256"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_2045_sidx_7367_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 55,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_2045_sidx_7367_eps_0.0039.vnnlib",
+            "sha256": "ab05432e1ad69852f652d83629e69d3797760165967c4906e5b05d95f9aef0bb"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_7542_sidx_9873_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 56,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_7542_sidx_9873_eps_0.0039.vnnlib",
+            "sha256": "e75479c48bc5d25c189209e2fb563ea6845fb0aa0896bfd0c434f6dd84d810be"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_5743_sidx_6569_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 57,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_5743_sidx_6569_eps_0.0039.vnnlib",
+            "sha256": "013b2708443dad60cbd4ffbc74094e8eabfcc435357a81f6df711e085a89361e"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_5427_sidx_8226_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 58,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_5427_sidx_8226_eps_0.0039.vnnlib",
+            "sha256": "b6dfa33102333de2645d7520b06bfb4294398d9deff2f3147d3e75ecfa3ddebe"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_1496_sidx_9465_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 59,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_1496_sidx_9465_eps_0.0039.vnnlib",
+            "sha256": "9febb49778d1216179ede92e625f45689bdd40558e1e668ad8b50f7fb53cecae"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_600_sidx_4087_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 60,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_600_sidx_4087_eps_0.0039.vnnlib",
+            "sha256": "53726ea3c5849c1c27f71ad4307dd7b9fe9fa85ddad83b97390c9202832800f1"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_6618_sidx_5022_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 61,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_6618_sidx_5022_eps_0.0039.vnnlib",
+            "sha256": "043f546825d31edf76598d67981f661cd895a020b0664a7a08c4c09a7c295109"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_6036_sidx_4672_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 62,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_6036_sidx_4672_eps_0.0039.vnnlib",
+            "sha256": "0137ec3554f2ef4bef5a5807294fccfd5c1dae81235ff3321ee357294db2ca23"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_3375_sidx_5824_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 63,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_3375_sidx_5824_eps_0.0039.vnnlib",
+            "sha256": "7051c1225815691638aec00082a197e33fd2b07ce0251098b23f3836aa8cc685"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_4327_sidx_7050_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 64,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_4327_sidx_7050_eps_0.0039.vnnlib",
+            "sha256": "6b376a6a052f5d1efbeb7a43585d084a98ebca221eb79274861bd09eac1b620f"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_4171_sidx_705_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 65,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_4171_sidx_705_eps_0.0039.vnnlib",
+            "sha256": "2ff44375bf9e00fe52b647e22510c621f70bafb856e03787d1c296ee64844e88"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_3677_sidx_3123_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 66,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_3677_sidx_3123_eps_0.0039.vnnlib",
+            "sha256": "60b28a196b426d49437c957ad9b589821ceb2e7a795ea0428cc7b488d34bdbfc"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_1093_sidx_4490_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 67,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_1093_sidx_4490_eps_0.0039.vnnlib",
+            "sha256": "47505acbb9bfbbda40da47f104399208493e6c18e7fb46bce6a69b2d46532a90"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_7473_sidx_6046_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 68,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_7473_sidx_6046_eps_0.0039.vnnlib",
+            "sha256": "3003953f85142fe74b5a81acdccec2873a959953398db3867b215212bb11bc44"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_6049_sidx_4719_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 69,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_6049_sidx_4719_eps_0.0039.vnnlib",
+            "sha256": "b421fd9df918793105bc0d933d0e3fe4d53a30bf476b15ba46752e865e8425c1"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_7525_sidx_3725_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 70,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_7525_sidx_3725_eps_0.0039.vnnlib",
+            "sha256": "25fc387e8e5bfe8010944eb7e0e22ff6e6ac4a440770a6def225f223a4a5198a"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_9729_sidx_1662_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 71,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_9729_sidx_1662_eps_0.0039.vnnlib",
+            "sha256": "2d611e5b49d0f856e0aeee5bdabf5cbe542a8e7b576d153fd25e0018b9f873f2"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_6412_sidx_6140_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 72,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_6412_sidx_6140_eps_0.0039.vnnlib",
+            "sha256": "f8ece662c0629cb363d72e16bec36e0435991ea97406efb2716171f30ec5ead8"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_1024_sidx_5112_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 73,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_1024_sidx_5112_eps_0.0039.vnnlib",
+            "sha256": "7c15df34bfe932619a1b043938cb1defe4086b57a348ff974fbd16027d7a8043"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_5634_sidx_9441_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 74,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_5634_sidx_9441_eps_0.0039.vnnlib",
+            "sha256": "65ccd49a335290490ce8c1e022d1499d008b34a8365e154b0ac967c181d4f5fb"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_4004_sidx_9594_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 75,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_4004_sidx_9594_eps_0.0039.vnnlib",
+            "sha256": "9e91129b8e130e3d4d758b61a8c1c84793ff5775587c7bd69d265d60c1321782"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_6628_sidx_8822_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 76,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_6628_sidx_8822_eps_0.0039.vnnlib",
+            "sha256": "69d0e355847fbefc855d797cc0fddb427c5a9ecfeda18174f64e1a019d5d906f"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_9025_sidx_9203_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 77,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_9025_sidx_9203_eps_0.0039.vnnlib",
+            "sha256": "a0a5f60dedeeca4835767a18fd60346657df871a868ca771d866eb125dd0342c"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_2798_sidx_4910_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 78,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_2798_sidx_4910_eps_0.0039.vnnlib",
+            "sha256": "b36c354a970a3dd9a313d539ba7601f8ba4e72120d8b46d2b1b3a9e69354e392"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_4776_sidx_19_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 79,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_4776_sidx_19_eps_0.0039.vnnlib",
+            "sha256": "c6c7a52959b1dd92b667a0d08b10a4a08ea83a0d0909310c828a7c6c5b6db7d2"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_7152_sidx_4185_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 80,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_7152_sidx_4185_eps_0.0039.vnnlib",
+            "sha256": "523e1dbaa64852e9b1d88da3ffa7e89da23502f6ccd3a0698b8d790193bc6cf0"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_9656_sidx_451_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 81,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_9656_sidx_451_eps_0.0039.vnnlib",
+            "sha256": "b20625a29d998f03f638f8011511c86b0be90fc73265b6802197e9ac75f23ae9"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_4244_sidx_8624_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 82,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_4244_sidx_8624_eps_0.0039.vnnlib",
+            "sha256": "a4734f49d72bd8a05416d390e268e9bff1d950347e6b9a3bee356298a247fe8b"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_4599_sidx_738_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 83,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_4599_sidx_738_eps_0.0039.vnnlib",
+            "sha256": "437aa9e7ffc5e8f6fc001f6569c5b302dfcbfc628c9771c1188205f775a38733"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_7749_sidx_8253_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 84,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_7749_sidx_8253_eps_0.0039.vnnlib",
+            "sha256": "e6f828fc83a80f626c7cc7adb1e954437468a2224b32c29c527749732c66339c"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_8310_sidx_4525_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 85,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_8310_sidx_4525_eps_0.0039.vnnlib",
+            "sha256": "7b4c7544f5a940efdfa993ff165bb214e3219836313f310bb09464bc3530c3bf"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_3328_sidx_278_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 86,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_3328_sidx_278_eps_0.0039.vnnlib",
+            "sha256": "db6df0df3e546fe1d95e298f028d8d486044bc74cd616b5c1e8956fc5f8ccac5"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_6228_sidx_7979_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 87,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_6228_sidx_7979_eps_0.0039.vnnlib",
+            "sha256": "f3ddfc5140231d50592631a5599e2b8e700508b06ae346d4f430f7a442c633bc"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_7847_sidx_9927_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 88,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_7847_sidx_9927_eps_0.0039.vnnlib",
+            "sha256": "34f6f6446ec56ad92be04b69cb4161abe5c929197de61ffb045948bbf5394df9"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_8756_sidx_3958_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 89,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_8756_sidx_3958_eps_0.0039.vnnlib",
+            "sha256": "5b4498b154ee0c6ffa7f4607646ed06b11787147d4b6d108017e6b782758c63c"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_2511_sidx_5059_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 90,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_2511_sidx_5059_eps_0.0039.vnnlib",
+            "sha256": "4cda46f0e04af9706598c3182bffbf84655d72d76976487b68ebe43481de58c7"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_2575_sidx_1066_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 91,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_2575_sidx_1066_eps_0.0039.vnnlib",
+            "sha256": "43d9484c85764b6a5d6849d4520403f3e9b323f1c07c4b6f0ba699998625052f"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_3574_sidx_9710_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 92,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_3574_sidx_9710_eps_0.0039.vnnlib",
+            "sha256": "16dcbca9f77cf3831fcc5ecd168c3374af897d8ae8f9622ed05a46cf8f306895"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_3437_sidx_2708_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 93,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_3437_sidx_2708_eps_0.0039.vnnlib",
+            "sha256": "17428c1298247c3d94956164ca8784dec126b8a59bdfacd1f16556c080752651"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_4024_sidx_4810_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 94,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_4024_sidx_4810_eps_0.0039.vnnlib",
+            "sha256": "e0bc91fdf5fbadced24c50ed19082cfa8cc45d90720b00f488c98f12f2db3535"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_8698_sidx_4012_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 95,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_8698_sidx_4012_eps_0.0039.vnnlib",
+            "sha256": "e346310dc29dbb148d4ccaa23be2df18b3f76d29b32fc2bf19a710a4249e39d9"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_4674_sidx_6718_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 96,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_4674_sidx_6718_eps_0.0039.vnnlib",
+            "sha256": "2f398605d2209cb13bfcb312706dd6df7b8e01a131642684cb85f3f723abae85"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_9569_sidx_8561_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 97,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_9569_sidx_8561_eps_0.0039.vnnlib",
+            "sha256": "56b00167c77e8a2e371ad4eb6b285a2412c53f258b283e0cec86446eaf64daa5"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_3533_sidx_4891_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 98,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_3533_sidx_4891_eps_0.0039.vnnlib",
+            "sha256": "04cfcb822ceff003ee6259edd0f862aed24b3264547b2177862d51cfaa732d8f"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_5129_sidx_3656_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 99,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_5129_sidx_3656_eps_0.0039.vnnlib",
+            "sha256": "b6427800f883031c08c04df293349cc44e31724652c15210c529c70ad663d6e1"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_4686_sidx_8792_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 100,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_4686_sidx_8792_eps_0.0039.vnnlib",
+            "sha256": "c4b78601da01b5291b58a042edc5bd0eb75f97383b7ec1f9df6ce894fd2d0f2c"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_4869_sidx_6523_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 101,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_4869_sidx_6523_eps_0.0039.vnnlib",
+            "sha256": "828c9d7ffd7e35aaa585601faec9831e8eb73e79daa20b16ed50a5f1437c7714"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_8651_sidx_6574_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 102,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_8651_sidx_6574_eps_0.0039.vnnlib",
+            "sha256": "38af93c3c080694d2cea8f6dccc4c80607c354d34f4729ccfccaa3fd24b82f26"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_4225_sidx_3038_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 103,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_4225_sidx_3038_eps_0.0039.vnnlib",
+            "sha256": "0f3ba5b0a4e1f4a1dddc8fa3ab375da8ccf49b3ad0f31891f05ca2f9f575fc3c"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_1718_sidx_4924_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 104,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_1718_sidx_4924_eps_0.0039.vnnlib",
+            "sha256": "7c895cfdebe9e8ec04108be3dccd38170f3761b1aeec5e721720d77b6191831c"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_6957_sidx_1178_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 105,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_6957_sidx_1178_eps_0.0039.vnnlib",
+            "sha256": "6e093b0d74933c8139836eb1a854f0d1da297530f07b92277bacd92ee4ff273b"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_7209_sidx_9753_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 106,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_7209_sidx_9753_eps_0.0039.vnnlib",
+            "sha256": "db8f0d5ecb4b8e67ada175c9a06454ec9f8db64afbe8369bdc7cacf78aedfc23"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_4867_sidx_5259_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 107,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_4867_sidx_5259_eps_0.0039.vnnlib",
+            "sha256": "6013b89333c2c6d5a0c477fb91d32e6bd32b149c92e0af8dbc8b47b47326ed63"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_140_sidx_7259_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 108,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_140_sidx_7259_eps_0.0039.vnnlib",
+            "sha256": "722e4d2190751752f5bc58dff4873b239801c654323a259480785e729f037226"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_8042_sidx_9227_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 109,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_8042_sidx_9227_eps_0.0039.vnnlib",
+            "sha256": "24e9401313095a0a7ae5fd67bd6b712a4ac42006946bbc0ad8dcc97607a63a09"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_216_sidx_6006_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 110,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_216_sidx_6006_eps_0.0039.vnnlib",
+            "sha256": "d3730e1c8f06a7a0a582d8e52a19d2d01ecc3a54b0700437bd38bcdc005e0f89"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_580_sidx_8894_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 111,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_580_sidx_8894_eps_0.0039.vnnlib",
+            "sha256": "816219b31a770678f2bef6cd55eab83926efdf425b7abb274fa00e1ccc803a30"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_6458_sidx_4978_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 112,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_6458_sidx_4978_eps_0.0039.vnnlib",
+            "sha256": "933ea2102cb6c110b902f179845ed6fa0a3bf264116a03f27f20aa4853bb26aa"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_291_sidx_2370_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 113,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_291_sidx_2370_eps_0.0039.vnnlib",
+            "sha256": "9b0b02d88fa19be08d24026ce4531a8e798003c8d1fb162c9285169d3c1bbc15"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_62_sidx_313_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 114,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_62_sidx_313_eps_0.0039.vnnlib",
+            "sha256": "395ee04395aed1e658387808d3914d7b8cd3353118d9ce6e21c1c867fcc7bedc"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_9875_sidx_1510_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 115,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_9875_sidx_1510_eps_0.0039.vnnlib",
+            "sha256": "2f28e1e8291c36b4e6b317bdffe6137db671e0e6367df3089c97208beffa6fea"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_4944_sidx_932_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 116,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_4944_sidx_932_eps_0.0039.vnnlib",
+            "sha256": "4c4ab35b06ee22f721279a504aa0e50be3ba17fbf15b2bead3990f334d52d548"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_4528_sidx_911_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 117,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_4528_sidx_911_eps_0.0039.vnnlib",
+            "sha256": "b49040baab6ab86d58535a14bdf7802572b4336975e0574d5c08984815617abc"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_7689_sidx_3205_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 118,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_7689_sidx_3205_eps_0.0039.vnnlib",
+            "sha256": "7df037c6d54f596c162e2a8f8bb7f956807ed6caa147ebbe41f0f769b47669aa"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_3558_sidx_7280_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 119,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_3558_sidx_7280_eps_0.0039.vnnlib",
+            "sha256": "492e083a74ce762f1efaf407e624e590dcc2aba34edb8a5fe5528e946eacab3c"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_7277_sidx_8835_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 120,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_7277_sidx_8835_eps_0.0039.vnnlib",
+            "sha256": "78e5a107af5884d34bece706209c2c0cce882abfc042e92365f02c7bfcab6ca4"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_7946_sidx_1068_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 121,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_7946_sidx_1068_eps_0.0039.vnnlib",
+            "sha256": "8741fc347a752f36a4e16150829770469669a6ec5ce903cc0944f3de7226ab10"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_7889_sidx_4249_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 122,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_7889_sidx_4249_eps_0.0039.vnnlib",
+            "sha256": "b4c3ecc71091cc63215e064756f993859eb2c3959460ff5385034f6803d0b5ff"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_7600_sidx_1132_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 123,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_7600_sidx_1132_eps_0.0039.vnnlib",
+            "sha256": "bd5bb4dea857e679baa8e22531a2ab3e2580a7e94318039dbafab581a4a7f68f"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_259_sidx_1412_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 124,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_259_sidx_1412_eps_0.0039.vnnlib",
+            "sha256": "16b07fb2fa9f5bbdc387660478d0a787f5843e706408211e03a9a62b72115769"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_683_sidx_2348_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 125,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_683_sidx_2348_eps_0.0039.vnnlib",
+            "sha256": "fa6729162718dccb2b312f2e5e0277ce821659c9fb52469f485665c5fd953825"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_9940_sidx_5174_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 126,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_9940_sidx_5174_eps_0.0039.vnnlib",
+            "sha256": "0f09f5b9459b388ee37456892419ed97250bfc476dd122db2bbf8e92fdfe9898"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_164_sidx_1090_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 127,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_164_sidx_1090_eps_0.0039.vnnlib",
+            "sha256": "085b4a1e4d009e1927117944defe10f7e9eb595713ab87a1bc6f02a6267e87f5"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_8372_sidx_8419_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 128,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_8372_sidx_8419_eps_0.0039.vnnlib",
+            "sha256": "886c08e417702872c7d2625e447c522b69a23ba62e291478ae7439200bc5269a"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_7403_sidx_8686_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 129,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_7403_sidx_8686_eps_0.0039.vnnlib",
+            "sha256": "b706f863be5df8c0c3722834c0b9ace8958b7c8c7fb3cabed54dcfd8dd965938"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_9600_sidx_3536_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 130,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_9600_sidx_3536_eps_0.0039.vnnlib",
+            "sha256": "d2aff1d2c60f7b77888c7348ce7ed31446a9fbe4c3d13b7d4d6626498137705c"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_7390_sidx_2694_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 131,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_7390_sidx_2694_eps_0.0039.vnnlib",
+            "sha256": "b677a0ba34d769c523ffd82aeaf0075bc99675b6f80356a9cac0dcb0bedf49b8"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_3115_sidx_671_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 132,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_3115_sidx_671_eps_0.0039.vnnlib",
+            "sha256": "3fa3d07ecc57e11b4175929d719fbc1e8334209991d05b5f10814bcaf41bbbce"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_4472_sidx_9477_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 133,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_4472_sidx_9477_eps_0.0039.vnnlib",
+            "sha256": "dab3e1a3c9e8448266f1b6572ba468113aaae3bb3272ecab9dd08e25c7b3a1ee"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_7575_sidx_6502_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 134,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_7575_sidx_6502_eps_0.0039.vnnlib",
+            "sha256": "ef855f823e0ee216fbc21bec969c388f8933270a369fff4280ccde36a1c47154"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_8472_sidx_7499_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 135,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_8472_sidx_7499_eps_0.0039.vnnlib",
+            "sha256": "46e3bf5e7d899ad9ceafc463bfc80b095b9809ea173f43074a1513d4ea8d4796"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_7883_sidx_4184_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 136,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_7883_sidx_4184_eps_0.0039.vnnlib",
+            "sha256": "4c2e7b8724fbadd02a0f1500d4eff131abb1e4b096390f224852e14af6953139"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_6679_sidx_8279_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 137,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_6679_sidx_8279_eps_0.0039.vnnlib",
+            "sha256": "fa229b000631a9e3ec1be7764ccd0dd23fe3fefd41e8cb8983bf5cff798c5e7c"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_7762_sidx_3616_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 138,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_7762_sidx_3616_eps_0.0039.vnnlib",
+            "sha256": "dd7ba73aed370dad688f362446e3e9655a4a791ebe947ff4124697cb7ee89175"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_7538_sidx_5076_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 139,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_7538_sidx_5076_eps_0.0039.vnnlib",
+            "sha256": "71ec4a4e46869d3a8156be9b6038c98a833c5af846463a8ba39f3e47e34c3051"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_4513_sidx_5588_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 140,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_4513_sidx_5588_eps_0.0039.vnnlib",
+            "sha256": "ac9ccc35196bce664c7f1a18df15b7c5666abd3f45a368e10b51eb5e9aab6882"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_3110_sidx_1017_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 141,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_3110_sidx_1017_eps_0.0039.vnnlib",
+            "sha256": "51249f6a7f7dada440fa24ca2190a28b139cf9dc9bacd1153fd4dd4e3307d56c"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_6863_sidx_8059_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 142,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_6863_sidx_8059_eps_0.0039.vnnlib",
+            "sha256": "ab38e990c2e0e06d18a0c2c44483bbe98d194290077b29a28b92c6f8490caf39"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_3553_sidx_3392_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 143,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_3553_sidx_3392_eps_0.0039.vnnlib",
+            "sha256": "812bec2c0362d92d123380df161e1da6d5addbc84a27304d0a079090e814f5c7"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_5232_sidx_8001_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 144,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_5232_sidx_8001_eps_0.0039.vnnlib",
+            "sha256": "05e20d89bb5871e80b5854088689a49e1fc7a6e2d084ad21e2fc03cb0f4d190e"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_9840_sidx_3444_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 145,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_9840_sidx_3444_eps_0.0039.vnnlib",
+            "sha256": "89b6baed4b8668af05a38aa4655aebc90c1cfcf10f6cf594870ba016860584b3"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_8887_sidx_8800_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 146,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_8887_sidx_8800_eps_0.0039.vnnlib",
+            "sha256": "e85f677093bf19dc5bd298650e3d051b589faa904e22d21a077e5b631d4e5ae5"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_4260_sidx_5004_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 147,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_4260_sidx_5004_eps_0.0039.vnnlib",
+            "sha256": "8152c92e7efa29df5b54354a5ecabae1dfc7e345e5d87b704f35b12f063010c6"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_3416_sidx_7951_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 148,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_3416_sidx_7951_eps_0.0039.vnnlib",
+            "sha256": "320892f1f073f63dd2ef0ce6d342551fefe5e4ac6f77776e899a22634e4e5f0c"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_3098_sidx_9528_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 149,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_3098_sidx_9528_eps_0.0039.vnnlib",
+            "sha256": "8ad606ed6937dd310633387137aa79336aa82fdadcb59412f9fa420031c99f74"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_9271_sidx_575_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 150,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_9271_sidx_575_eps_0.0039.vnnlib",
+            "sha256": "43082973ba9b99455e3256c2ea6fa66dfd29a62c83ef65c6ffb757d35f8ff822"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_4330_sidx_3504_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 151,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_4330_sidx_3504_eps_0.0039.vnnlib",
+            "sha256": "0914664e451666b9e41f917894aa6e9cecd90e09f9e0bd414bbc0cc4fdfc7a69"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_9215_sidx_4878_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 152,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_9215_sidx_4878_eps_0.0039.vnnlib",
+            "sha256": "3e5ac3280ec2378885f26c314ff57ca72771b29a4357ae07cbed923c93eaca6e"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_2493_sidx_4209_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 153,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_2493_sidx_4209_eps_0.0039.vnnlib",
+            "sha256": "f9c50760f284590d36366ffff8c9d4f628e554c11bc78d7e5d443b473dda8a17"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_5701_sidx_7560_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 154,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_5701_sidx_7560_eps_0.0039.vnnlib",
+            "sha256": "9f0bf817fa9126409ddae064d9322377cac2a53ddf2287c89bff2a37e8ceb0cb"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_6773_sidx_7001_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 155,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_6773_sidx_7001_eps_0.0039.vnnlib",
+            "sha256": "fc972e08d93ead640a97aef1c092be0c7b08bb11993fa25535e57064d21de3ec"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_670_sidx_7171_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 156,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_670_sidx_7171_eps_0.0039.vnnlib",
+            "sha256": "c8619f248f50571ee6add2c34f0c46ccf679af06e4847ac0cb0d331b350bb7f3"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_9419_sidx_9984_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 157,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_9419_sidx_9984_eps_0.0039.vnnlib",
+            "sha256": "285a77a6ec7dd64219b1b25af37a15bdf32c81a1ff4b2854bae6b21025b6b061"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_5442_sidx_6087_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 158,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_5442_sidx_6087_eps_0.0039.vnnlib",
+            "sha256": "1a4c6b3617109e227f5086c9f9161919bb877e96e0a0b951f07f499a1917f968"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_9825_sidx_6883_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 159,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_9825_sidx_6883_eps_0.0039.vnnlib",
+            "sha256": "d8491f029cab63899953e6588c0a4587554c1acc7649e10370e395a9f83271d5"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_5676_sidx_9851_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 160,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_5676_sidx_9851_eps_0.0039.vnnlib",
+            "sha256": "adcb526c9582566a9247bb375b7dbd7f77b009fba3ce5afe13a3c231d4fdca04"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_3452_sidx_862_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 161,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_3452_sidx_862_eps_0.0039.vnnlib",
+            "sha256": "142be5a5ba4728625777164c234d46b4f61eed3c648d90fd04b906353e570d5a"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_1142_sidx_9106_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 162,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_1142_sidx_9106_eps_0.0039.vnnlib",
+            "sha256": "e553304a8d89511ed2f8dd140aeac7cba721cb68de77c34d61949f18f750e081"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_526_sidx_7843_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 163,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_526_sidx_7843_eps_0.0039.vnnlib",
+            "sha256": "5017011f65b07e388f57e246c2605e69a9bb90c645c31ee20e6467553670a830"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_2310_sidx_1923_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 164,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_2310_sidx_1923_eps_0.0039.vnnlib",
+            "sha256": "1ea434821168dfde1ed1c5ce50f65c52554cacf5b44a4150a62f2d9d3f4315e6"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_9586_sidx_1970_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 165,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_9586_sidx_1970_eps_0.0039.vnnlib",
+            "sha256": "c45bc04217290efb92efc09e00d3e4564187c71c772200faa75cca71a63f2b07"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_1759_sidx_3135_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 166,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_1759_sidx_3135_eps_0.0039.vnnlib",
+            "sha256": "8ad1567f3625bc27bac8f4a8a966b8bbd9a5f38e4ff8606e11c73020814006f8"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_974_sidx_2976_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 167,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_974_sidx_2976_eps_0.0039.vnnlib",
+            "sha256": "402c868016e0a7c24ce771be240ada8dbad02923c7d6eb67d0c531cfcb0b58dc"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_3891_sidx_62_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 168,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_3891_sidx_62_eps_0.0039.vnnlib",
+            "sha256": "1146e072b71069ccdb7835a467955198d21679790ef693591748798e05ecafab"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_5185_sidx_142_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 169,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_5185_sidx_142_eps_0.0039.vnnlib",
+            "sha256": "ce4327cf209d0c0f8bfbc86190551e33a4b3fa6a0c87c8bd7c87400ed562e079"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_6996_sidx_1363_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 170,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_6996_sidx_1363_eps_0.0039.vnnlib",
+            "sha256": "83fe693bd6a9e74a4086075c6c89d75e7332177fdb51144f05abdbf38fb0b656"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_1821_sidx_9700_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 171,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_1821_sidx_9700_eps_0.0039.vnnlib",
+            "sha256": "9079cf18edeee66f3babab878a91c8d2c2aa21e6d1f8abde5bb2c317a78fedc2"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_4709_sidx_8110_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 172,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_4709_sidx_8110_eps_0.0039.vnnlib",
+            "sha256": "301c792a0ea3a61aa2289bc129d32fe8154215506a7a8cb5221a9a84db2a9f3f"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_8444_sidx_2478_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 173,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_8444_sidx_2478_eps_0.0039.vnnlib",
+            "sha256": "825a80c6622e501b61fe36eee0cf9c5a459c852e49b2e40ad7cb815119b344f0"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_5451_sidx_5891_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 174,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_5451_sidx_5891_eps_0.0039.vnnlib",
+            "sha256": "9f19ea44ecab3f5436429ad704d14f07baae604a67e007c4b80933ef8f416254"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_5382_sidx_4518_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 175,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_5382_sidx_4518_eps_0.0039.vnnlib",
+            "sha256": "f18bcb4b6e3b944d2529c00686165e5a6b525da07f6105e81c2fa2e3bad01cd8"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_3139_sidx_2973_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 176,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_3139_sidx_2973_eps_0.0039.vnnlib",
+            "sha256": "50645c50e0a7dd906feb411451e71a734b4bd2913837f24b006f47ee768afea7"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_8101_sidx_2821_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 177,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_8101_sidx_2821_eps_0.0039.vnnlib",
+            "sha256": "c8710edfa0127526d8bc3824b189be8da8ccb2952ef9e5477160c89f716b3b07"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_1806_sidx_3542_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 178,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_1806_sidx_3542_eps_0.0039.vnnlib",
+            "sha256": "685cdf1095d37193128a7e4591a057faf41ffb58563cbb1165fb73062d2794fe"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_233_sidx_127_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 179,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_233_sidx_127_eps_0.0039.vnnlib",
+            "sha256": "76bea8370487394b949fd6a8eecb2d810d4cca30e0b22a2dcd02e78f8b1da511"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_8176_sidx_2705_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 180,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_8176_sidx_2705_eps_0.0039.vnnlib",
+            "sha256": "7985e2ca92d96e2f6da28791dddb217de406b114fc0a0b7e1da4a574fc476856"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_6311_sidx_8892_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 181,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_6311_sidx_8892_eps_0.0039.vnnlib",
+            "sha256": "e2653aa633f906e0186b113ecc8cad21179818230816ad92ec10dabb852cb20d"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_5443_sidx_7316_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 182,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_5443_sidx_7316_eps_0.0039.vnnlib",
+            "sha256": "9b9fa69b7007938eee6f8009e186a3095424efaada88b36cfb8d8507dd45df04"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_8173_sidx_1641_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 183,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_8173_sidx_1641_eps_0.0039.vnnlib",
+            "sha256": "4d066344bf04b17c47013990f06c66b7597db92ffb7514529e14630098092341"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_2594_sidx_7029_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 184,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_2594_sidx_7029_eps_0.0039.vnnlib",
+            "sha256": "d40993d01d21c75334883edc5dd41878f788162137dbe25edc0ba866babb12cb"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_7231_sidx_415_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 185,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_7231_sidx_415_eps_0.0039.vnnlib",
+            "sha256": "83a83d829d46b2251a2108b6f69766e2fdc3363dd419becefa573cb1ecda8211"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_1435_sidx_655_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 186,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_1435_sidx_655_eps_0.0039.vnnlib",
+            "sha256": "faa381bb1290f8583520630828f69ee92e703e297ff7891cfe217cfc3cd0fd8a"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_8005_sidx_2582_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 187,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_8005_sidx_2582_eps_0.0039.vnnlib",
+            "sha256": "4b5c779b3de3441642033ac696c4930425910c5b6eaa7d9946b74464c9debc69"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_4057_sidx_8514_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 188,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_4057_sidx_8514_eps_0.0039.vnnlib",
+            "sha256": "a2451da98d3d9e8b966187b76be807930b045631a0d57ba5c549db3878d6c0b3"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_8288_sidx_307_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 189,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_8288_sidx_307_eps_0.0039.vnnlib",
+            "sha256": "a3fb200f225ea116109197d3125d7aa3c54f2303e638c2e9f39f653700baeb35"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_6362_sidx_7345_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 190,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_6362_sidx_7345_eps_0.0039.vnnlib",
+            "sha256": "448900e9b894dde7c09ce46e18c0fb64ab97c4394adca14177a4729643416c41"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_6700_sidx_2455_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 191,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_6700_sidx_2455_eps_0.0039.vnnlib",
+            "sha256": "910af18ae07ebfaa618dd3f02568e72eb185ab3405fd358d887a81c99560dbc7"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_3054_sidx_7502_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 192,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_3054_sidx_7502_eps_0.0039.vnnlib",
+            "sha256": "707e4be0a14be38c21381d95fc2937b7737cbd1d9ef1d81cc1a3b344e768f375"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_5922_sidx_1989_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 193,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_5922_sidx_1989_eps_0.0039.vnnlib",
+            "sha256": "452cdf1c04b6a7ecb1c610f06751baf0e4b696c40ad67188f426a7de1279c7ac"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_9330_sidx_2275_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 194,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_9330_sidx_2275_eps_0.0039.vnnlib",
+            "sha256": "8f828e19fe4c59d17775a48e30e50b4a930e3c7f12c2e2c92efd2f2affc680ae"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_723_sidx_7730_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 195,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_723_sidx_7730_eps_0.0039.vnnlib",
+            "sha256": "77968ab75bd344b59787a10eef932da49175edbc53cb15eda3f3af63438ed953"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_2647_sidx_2518_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 196,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_2647_sidx_2518_eps_0.0039.vnnlib",
+            "sha256": "51b05307bc99f496fa9e8bb7fa0e7c666ec36d0c8ed6a540063a469628c41f20"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_3015_sidx_2719_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 197,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_3015_sidx_2719_eps_0.0039.vnnlib",
+            "sha256": "fc050453f382665f723d032aba879f60461913a1e5222baafbd25876b588f587"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_6564_sidx_5832_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 198,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_6564_sidx_5832_eps_0.0039.vnnlib",
+            "sha256": "3e63fc1c1d8d3837c7f74b3e804e2578778bc73c91ffaa5e1aa1a373fbb3aad6"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/TinyImageNet_resnet_medium.onnx",
+        "vnnlib": "vnnlib/TinyImageNet_resnet_medium_prop_idx_9458_sidx_2592_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 199,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/onnx/TinyImageNet_resnet_medium.onnx",
+                "sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/vnnlib/TinyImageNet_resnet_medium_prop_idx_9458_sidx_2592_eps_0.0039.vnnlib",
+            "sha256": "f8b90e0582b4fd6cd97d1012fe88b298e5e3b1757f46b90a202b994f041b60d8"
+          }
+        }
+      }
+    ]
+  },
+  "instances_csv": {
+    "tinyimagenet_2024": {
+      "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024/instances.csv",
+      "sha256": "188058624df1122f32295f99d83380485a7d736212555a5e8214204459c22b7e"
+    }
+  }
+}

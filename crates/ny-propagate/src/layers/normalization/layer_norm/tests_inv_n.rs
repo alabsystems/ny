@@ -10,7 +10,7 @@ use ny_tensor::BoundedTensor;
 
 const MAX_RESIDUAL_ABS: f32 = 1024.0;
 
-/// Regression test for #2277: mean-only CROWN must compute 1/n in f64.
+/// Regression test: mean-only CROWN must compute 1/n in f64.
 ///
 /// With `inv_n` in f32 for n=3, `1/3` rounds up, and for large coefficients this
 /// creates a residual around 3e7 instead of ~0. The f64 path keeps this residual tiny.
@@ -47,7 +47,7 @@ fn test_crown_mean_only_f64_inv_n_scalar_regression() -> Result<()> {
     Ok(())
 }
 
-/// Batched counterpart to #2277 scalar regression.
+/// Batched counterpart to the scalar regression above.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_mean_only_f64_inv_n_batched_regression() -> Result<()> {

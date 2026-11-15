@@ -80,7 +80,7 @@ fn test_take_best_bounds_shape_mismatch_returns_original() {
     assert_eq!(best.upper(), bounds_oc.upper());
 }
 
-/// Regression test for #1938 + #2655: merge of non-overlapping intervals should widen
+/// Regression test: merge of non-overlapping intervals should widen
 /// to [-inf, +inf] rather than clamping to a degenerate point interval.
 /// Element 1 here has oc=[0.6, 0.8] and no_oc=[0.4, 0.5], so merge produces
 /// lower=0.6, upper=0.5 (inverted). `clamp_inverted_best_bounds` widens to [-inf, +inf].
@@ -110,7 +110,7 @@ fn test_take_best_bounds_crossing_intervals_widened_2655() {
     assert_eq!(best.upper()[[1]], f32::INFINITY);
 }
 
-/// Regression test for #3093: NaN in `bounds_with_oc` should not be sticky.
+/// Regression test: NaN in `bounds_with_oc` should not be sticky.
 /// IEEE 754 makes `other > NaN` false, so without explicit NaN guards the
 /// NaN would persist even when `bounds_without_oc` has a finite value.
 #[ntest::timeout(10000)]

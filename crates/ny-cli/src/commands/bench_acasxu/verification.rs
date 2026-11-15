@@ -36,8 +36,6 @@ use super::{AcasxuBenchmarkArgs, AcasxuProblem, GpuBabEngineRuntime};
 /// GPU BaB supports BaBSR (`impact`/`babsr`) and input splitting (`input`).
 /// Both are valid for `--gpu-bab`. Unsupported heuristics (width, fsb, sequential)
 /// produce errors.
-///
-/// Part of #1891: InputSplit is now supported for GPU BaB DomainList path.
 pub(super) fn resolve_branching_heuristic(
     branching: &str,
     gpu_bab: bool,
@@ -124,7 +122,7 @@ pub(super) fn run_verification(
         // PGD attack: find counterexamples
         enable_pgd_attack,
         pgd_restarts,
-        // lA warm-start: reuse cached linear bounds from parent domain (#1669)
+        // lA warm-start: reuse cached linear bounds from parent domain
         enable_la_warm_start: !args.no_la_warm_start,
         // Use ACAS-Xu preset for other settings (batch_size: 16384, etc.)
         ..BetaCrownConfig::acas_xu()
@@ -135,7 +133,7 @@ pub(super) fn run_verification(
         None => BetaCrownVerifier::new(config),
     };
 
-    // Classify constraints via shared planning module (#1881)
+    // Classify constraints via shared planning module
     let classification = classify_constraints(&vnnlib);
 
     if classification.aggregation == AggregationMode::Disjunctive {
@@ -151,7 +149,7 @@ pub(super) fn run_verification(
     // Route multi-constraint specs (relational, mixed, or multi-constant) through
     // the per-constraint loop which handles all constraint types via
     // build_constraint_objective. Single-constant specs use the faster dedicated path.
-    // Matches verify.rs routing: `output_constraints.len() > 1 || has_relational` (#1885).
+    // Matches verify.rs routing: `output_constraints.len() > 1 || has_relational`.
     let needs_per_constraint = classification.has_relational || vnnlib.output_constraints.len() > 1;
 
     // Per-constraint decomposition is sound for conjunctive unsafe regions:
@@ -164,13 +162,10 @@ pub(super) fn run_verification(
     // multi-obj explored 100K domains / 0 verified / 3.8s, while per-constraint sequential
     // verified 4_2 in 12.56s. The per-constraint path lets each constraint benefit from
     // focused single-objective alpha-CROWN optimization via input splitting.
-    //
-    // Ref: #1923 — the multi-objective shortcut was added in W2 1273 (Part of #3218) but
-    // regressed ACAS-Xu 4_x which previously verified via per-constraint at eb333968.
 
     if args.gpu_bab {
         // GPU BaB path: use GraphNetwork + dispatch_graph_constraint.
-        // The verifier stores the engine from root construction (#3643).
+        // The verifier stores the engine from root construction.
         let graph = onnx_model.to_graph_network()?;
         if needs_per_constraint {
             verify_relational_gpu_bab(&graph, &input, &vnnlib, &verifier)
@@ -271,7 +266,7 @@ fn aggregate_disjunctive_clause_results(
 /// and delegates to `verify_objective` for backend-specific verification.
 /// Aggregation via `aggregate_conjunctive`: Verified/Timeout cause early exit.
 ///
-/// Part of #2215: eliminates duplicated iteration in verify_relational/verify_relational_gpu_bab.
+/// Eliminates duplicated iteration in verify_relational/verify_relational_gpu_bab.
 fn verify_per_constraint(
     vnnlib: &VnnLibSpec,
     mut verify_objective: impl FnMut(
@@ -303,7 +298,7 @@ fn verify_per_constraint(
 /// and aggregates via `aggregate_disjunctive_clause_results`: concrete
 /// violation causes early exit (counterexample found for any clause).
 ///
-/// Part of #2215: eliminates duplicated iteration in verify_disjunctive/verify_disjunctive_gpu_bab.
+/// Eliminates duplicated iteration in verify_disjunctive/verify_disjunctive_gpu_bab.
 fn verify_disjunctive_clauses(
     vnnlib: &VnnLibSpec,
     mut verify_clause: impl FnMut(&VnnLibSpec) -> Result<(BabVerificationStatus, usize, usize)>,
@@ -361,7 +356,7 @@ fn verify_disjunctive_gpu_bab(
 
 /// Verify property with constant constraints (e.g., Y_0 >= 3.99).
 ///
-/// Uses shared evaluation helpers from constraint_eval.rs (#1881 Step 4).
+/// Uses shared evaluation helpers from constraint_eval.rs.
 fn verify_constant(
     network: &ny_propagate::Network,
     input: &BoundedTensor,
@@ -372,7 +367,7 @@ fn verify_constant(
         vnnlib.output_constraints.len() == 1,
         "constant verification requires exactly one scalar output constraint"
     );
-    // Extract threshold and output index via shared planning module (#1881)
+    // Extract threshold and output index via shared planning module
     let params = extract_constant_params(vnnlib).ok_or_else(|| {
         anyhow::anyhow!(
             "constant verification requires exactly one supported scalar output constraint"
@@ -385,14 +380,14 @@ fn verify_constant(
         vnnlib.num_outputs
     );
 
-    // Build augmented network via shared eval helper (#1881 Step 4)
+    // Build augmented network via shared eval helper
     let spec_coeffs = build_constant_spec_coeffs(&params, vnnlib.num_outputs);
     let augmented = augment_network_with_spec(network, spec_coeffs)?;
 
-    // Compute effective threshold via shared eval helper (#1881 Step 4)
+    // Compute effective threshold via shared eval helper
     let effective_threshold = compute_effective_threshold(&params);
 
-    // Preserve the root verifier's stored engine via with_config_from (#3643).
+    // Preserve the root verifier's stored engine via with_config_from.
     let adjusted_verifier = verifier.with_config_from(BetaCrownConfig {
         verify_upper_bound: params.verify_upper,
         ..verifier.config.clone()
@@ -409,8 +404,8 @@ fn verify_constant(
 /// Verify property with relational constraints (e.g., Y_1 <= Y_0).
 ///
 /// Uses shared `build_constraint_objective` to handle BOTH relational and constant
-/// constraints uniformly (#1881 Step 4, #1888). Iteration and aggregation via
-/// `verify_per_constraint` (#2215).
+/// constraints uniformly. Iteration and aggregation via
+/// `verify_per_constraint`.
 fn verify_relational(
     network: &ny_propagate::Network,
     input: &BoundedTensor,
@@ -430,7 +425,7 @@ fn verify_relational(
 
 /// Verify property with constant constraints using GPU BaB (DomainList storage).
 ///
-/// Uses shared evaluation + dispatch helpers for consistent engine wiring (#1881 Step 4).
+/// Uses shared evaluation + dispatch helpers for consistent engine wiring.
 fn verify_constant_gpu_bab(
     graph: &GraphNetwork,
     input: &BoundedTensor,
@@ -441,7 +436,7 @@ fn verify_constant_gpu_bab(
         vnnlib.output_constraints.len() == 1,
         "constant GPU-BaB verification requires exactly one scalar output constraint"
     );
-    // Extract constant params via shared planning module (#1881)
+    // Extract constant params via shared planning module
     let params = extract_constant_params(vnnlib).ok_or_else(|| {
         anyhow::anyhow!(
             "constant GPU-BaB verification requires exactly one supported scalar output constraint"
@@ -454,19 +449,19 @@ fn verify_constant_gpu_bab(
         vnnlib.num_outputs
     );
 
-    // Build objective and threshold via shared eval helpers (#1881 Step 4)
+    // Build objective and threshold via shared eval helpers
     let objective = build_constant_objective(&params, vnnlib.num_outputs);
     let effective_threshold = compute_effective_threshold(&params);
 
-    // Preserve the root verifier's stored engine via with_config_from (#3643).
+    // Preserve the root verifier's stored engine via with_config_from.
     let adjusted_verifier = verifier.with_config_from(BetaCrownConfig {
         verify_upper_bound: params.verify_upper,
         ..verifier.config.clone()
     });
 
-    // Dispatch via shared engine adapter (#1881).
+    // Dispatch via shared engine adapter.
     // Pass None for gemm_engine — the stored engine in adjusted_verifier
-    // is resolved internally by dispatch_graph_constraint (#3643).
+    // is resolved internally by dispatch_graph_constraint.
     let result = dispatch_graph_constraint(
         &adjusted_verifier,
         graph,
@@ -489,8 +484,8 @@ fn verify_constant_gpu_bab(
 /// Verify property with relational constraints using GPU BaB (DomainList storage).
 ///
 /// Uses shared `build_constraint_objective` for uniform constraint handling
-/// and shared engine dispatch (#1881 Step 4, #1888). Iteration and aggregation
-/// via `verify_per_constraint` (#2215).
+/// and shared engine dispatch. Iteration and aggregation
+/// via `verify_per_constraint`.
 fn verify_relational_gpu_bab(
     graph: &GraphNetwork,
     input: &BoundedTensor,
@@ -745,7 +740,7 @@ mod tests {
         assert_eq!(verified, 0);
     }
 
-    /// #1885 regression: Multi-constant specs must route through per-constraint loop.
+    /// Regression: multi-constant specs must route through per-constraint loop.
     ///
     /// Before fix: specs with only constant constraints (no relational) always routed
     /// to verify_constant/verify_constant_gpu_bab, which uses extract_constant_params
@@ -887,7 +882,7 @@ mod tests {
         }
     }
 
-    /// #1891: `bench -b acasxu --gpu-bab` with default `--branching=input`
+    /// `bench -b acasxu --gpu-bab` with default `--branching=input`
     /// now passes through InputSplit directly (no auto-rewrite).
     #[test]
     fn test_resolve_branching_heuristic_gpu_bab_accepts_input_split() {
@@ -912,10 +907,9 @@ mod tests {
     #[test]
     #[allow(clippy::type_complexity)] // Intentional: compile-time signature assertion
     fn test_gpu_bab_dispatch_functions_require_concrete_engine_signature_2343() {
-        // Compile-time guard for #2343: both GPU dispatch helpers must accept a
-        // concrete engine reference (not Option), preventing silent `None` wiring.
-        // Post-#3643: GPU BaB helpers use the verifier's stored engine
-        // instead of accepting a separate `&dyn GemmEngine` parameter.
+        // Compile-time guard: both GPU dispatch helpers take the verifier and use
+        // its stored engine instead of accepting a separate `&dyn GemmEngine`
+        // parameter (or an Option), preventing silent `None` wiring.
         let _: fn(
             &GraphNetwork,
             &BoundedTensor,

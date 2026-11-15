@@ -20,19 +20,17 @@
 //! - Shi et al., "Neural Network Verification with Branch-and-Bound for General
 //!   Nonlinearities" (TACAS 2025)
 //! - alpha-beta-CROWN: `complete_verifier/heuristics/nonlinear/bbps.py`
-//!
-//! # Design
-//!
-//! See `designs/2026-01-28-genbab-branching.md` for full design details.
 
 mod bilinear;
 mod config;
 mod decision;
 mod scoring;
 mod selector;
+mod telemetry;
 
 pub use config::{BranchingPointMethod, NonlinearBranchingConfig, NonlinearHeuristicMethod};
-pub use decision::BranchingDecision;
+pub use decision::{points_strictly_partition, BranchingDecision};
+pub(crate) use telemetry::{genbab_select_summary_line, record_genbab_empty_child};
 
 /// Nonlinear branching heuristic for GenBaB.
 ///
@@ -49,7 +47,7 @@ impl NonlinearBranching {
     }
 
     /// Create with default configuration.
-    #[deprecated(note = "use NonlinearBranching::default() instead")]
+    #[deprecated(since = "0.1.0", note = "use NonlinearBranching::default() instead")]
     pub fn with_defaults() -> Self {
         Self::new(NonlinearBranchingConfig::default())
     }

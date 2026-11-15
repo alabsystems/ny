@@ -2,16 +2,14 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Low-rank sampling-based CROWN backward for LayerNorm (#1957).
+//! Low-rank sampling-based CROWN backward for LayerNorm.
 //!
 //! Exploits `J[i,j] = ny_i/std * [δ_ij - 1/n - z_i*z_j/n]` for O(n)
 //! Jacobian-vector products instead of materializing the full n×n matrix.
 //! Replaces the generic O(n²) `sampling_crown_scalar()` for LayerNorm `Sampling`.
 //!
-//! Preserves all dense-path error semantics: non-finite guard (#3259),
-//! ny/std overflow (#2901), per-row fallback (#3128), directed rounding.
-//!
-//! Reference: designs/2026-03-17-issue-1957-layernorm-sampling-low-rank.md
+//! Preserves all dense-path error semantics: non-finite guard,
+//! ny/std overflow, per-row fallback, directed rounding.
 
 use ndarray::{Array1, Array2};
 use ny_core::{is_crown_coeff_safe_f64, NyError, Result};
@@ -39,13 +37,13 @@ impl LayerNormSamplingLinearization {
     /// Build the linearization from layer parameters and a center point.
     ///
     /// Returns `NumericalInstability` if `ny/std` or eval output overflows
-    /// (#2901), matching the dense path's Jacobian non-finite guard.
+    ///matching the dense path's Jacobian non-finite guard.
     fn new(layer: &LayerNormLayer, x_center: &Array1<f32>) -> Result<Self> {
         let n = x_center.len();
         let nf = n as f64;
         let inv_n = 1.0 / nf;
 
-        // f64 accumulation for mean/var to avoid catastrophic cancellation (#3325)
+        // f64 accumulation for mean/var to avoid catastrophic cancellation
         let mean = x_center.iter().map(|&xi| xi as f64).sum::<f64>() * inv_n;
         let var = x_center
             .iter()
@@ -63,7 +61,7 @@ impl LayerNormSamplingLinearization {
             .collect();
         let scale: Array1<f64> = layer.ny.iter().map(|&g| g as f64 / std).collect();
 
-        // Scale overflow guard (#2901): ny/std overflow when std is tiny.
+        // Scale overflow guard: ny/std overflow when std is tiny.
         // The dense path materializes the Jacobian in f32, where ny/std > f32::MAX
         // overflows to Inf. Our f64 scale avoids the overflow, but the sampling
         // results become unreliable at extreme scales. Match the dense behavior:
@@ -169,7 +167,7 @@ pub(crate) fn sampling_crown_scalar_low_rank(
     let num_neurons = pre_lower.len();
     let num_outputs = bounds.num_outputs();
 
-    // Non-finite pre-activation guard (#3259): when any dimension has infinite
+    // Non-finite pre-activation guard: when any dimension has infinite
     // or NaN bounds, center-point construction fails. Return trivially sound
     // constant bounds: A = 0, bias = [-inf, +inf].
     let has_non_finite =
@@ -191,7 +189,7 @@ pub(crate) fn sampling_crown_scalar_low_rank(
         .collect();
 
     // Build low-rank linearization. Returns NumericalInstability on ny/std
-    // overflow (#2901), matching the dense Jacobian non-finite guard.
+    // overflow, matching the dense Jacobian non-finite guard.
     let lin = LayerNormSamplingLinearization::new(layer, &x_center)?;
 
     // Sampling-based error estimation using low-rank apply.
@@ -326,8 +324,8 @@ fn apply_safety_margin(
 /// Backward propagation using low-rank `backprop_row` for A-coefficients
 /// and per-neuron sign-gated bias accumulation.
 ///
-/// Per-row non-finite guard (#3128, #3027) widens affected rows to
-/// conservative bounds. Directed rounding on final f32 bias cast (#1992, #2164).
+/// Per-row non-finite guard widens affected rows to
+/// conservative bounds. Directed rounding on final f32 bias cast.
 fn backward_propagate_low_rank(
     num_outputs: usize,
     num_neurons: usize,
@@ -343,7 +341,7 @@ fn backward_propagate_low_rank(
 
     for j in 0..num_outputs {
         // Bias accumulation: sign-dependent error adjustment per neuron.
-        // Skip zero coefficients to avoid 0*inf NaN (#1739).
+        // Skip zero coefficients to avoid 0*inf NaN.
         for i in 0..num_neurons {
             let la = bounds.lower_a()[[j, i]];
             let ua = bounds.upper_a()[[j, i]];
@@ -382,7 +380,7 @@ fn backward_propagate_low_rank(
             new_upper_a_f64[[j, k]] = new_upper_row[k];
         }
 
-        // Per-row unsafe coefficient guard (#3128, #3027, #3228): when Inf
+        // Per-row unsafe coefficient guard: when Inf
         // coefficients from compose() produce non-finite accumulation, widen
         // the affected row to conservative bounds. Uses
         // is_crown_coeff_safe_f64() (finite + magnitude ≤ CROWN_COEFF_MAX).
@@ -407,7 +405,7 @@ fn backward_propagate_low_rank(
     // A-matrix: standard f64→f32 rounding (round-to-nearest), matching
     // alpha-beta-CROWN. Directed rounding on A is not unconditionally sound
     // because the sign of the coefficient determines which direction is
-    // conservative during concretization (#2208).
+    // conservative during concretization.
     LinearBounds::new_or_conservative(
         new_lower_a_f64.mapv(|x| x as f32),
         new_lower_b_f64.mapv(|x| next_down_f32(x as f32)),

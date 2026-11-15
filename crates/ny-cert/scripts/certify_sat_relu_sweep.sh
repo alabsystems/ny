@@ -91,7 +91,7 @@ echo "   $(grep -c '' "$WORK/$INST.lrat") LRAT lines, self-verified by ay"
 # -- 3. lrat_to_lean: syntax-only transcription (fails closed) ----------------
 echo "== [3/4] lrat_to_lean --fast -> NyProof/SatReluSweep/$NAME.lean"
 mkdir -p "$LEAN_DIR/NyProof/SatReluSweep"
-cargo run --quiet --release -p ny-cert --bin lrat_to_lean -- \
+targo --unverified run --quiet --release -p ny-cert --bin lrat_to_lean -- \
     "$WORK/$INST.cnf" "$WORK/$INST.lrat" \
     "$LEAN_DIR/NyProof/SatReluSweep/$NAME.lean" "$MOD" --fast
 

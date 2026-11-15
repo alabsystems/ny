@@ -235,7 +235,12 @@ impl FoldedExactDomainPlanes {
 }
 
 /// Clip one exact domain using planes computed synchronously on that same
-/// domain.  No shipped verifier preset enables its default-dark dispatcher.
+/// domain.  The dispatcher is default-dark, and ARMED by the shipped cgan
+/// presets (`configs/vnncomp25/cgan_2023.yaml`, `configs/vnncomp26/cgan2026.yaml`
+/// and their canaries, all `input_split_fresh_domain_clip: true`); measured
+/// 2026-09-10 on cgan_2023 it fires on every pop (attempts=1086 applied=1085).
+/// Every other shipped preset leaves it off.  (This line used to say no shipped
+/// preset enabled it; that was stale.)
 ///
 /// `compute_full_spec_crown_on_exact_domain` is called exactly once. See the
 /// module-level soundness contract; in particular, it may not domain-stack or

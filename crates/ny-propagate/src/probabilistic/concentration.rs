@@ -16,8 +16,6 @@
 //! References:
 //! - Hoeffding, "Probability Inequalities for Sums of Bounded Random Variables", JASA 1963.
 //! - McDiarmid, "On the method of bounded differences", Surveys in Combinatorics 1989.
-//!
-//! Part of #3921 Phase 2.
 
 use ndarray::ArrayD;
 use ny_core::{NyError, Result};
@@ -67,7 +65,6 @@ pub struct McDiarmidBound {
     /// Whether the underlying Lipschitz estimate is a sound upper bound.
     /// When `false`, the bound was computed with an optimistic estimate for
     /// unhandled layers and should not be trusted for formal verification.
-    /// Part of #4145.
     pub is_sound: bool,
 }
 
@@ -94,7 +91,6 @@ pub struct ConcentrationCertificate {
     /// Whether all components of this certificate are sound.
     /// `false` when any underlying estimate (e.g., Lipschitz constant) is optimistic.
     /// Callers MUST check this before using the certificate for formal verification.
-    /// Part of #4145.
     pub is_sound: bool,
 }
 
@@ -143,8 +139,6 @@ impl ConcentrationCertificate {
     /// Returns an error if `lipschitz_estimate.is_sound` is `false`. Callers
     /// that accept optimistic estimates should use
     /// [`Self::compute_with_mcdiarmid_optimistic`].
-    ///
-    /// Part of #4145: enforced contract replaces warning-only fallback.
     pub fn compute_with_mcdiarmid(
         empirical_mean: &ArrayD<f32>,
         crown_bounds: &BoundedTensor,
@@ -182,7 +176,7 @@ impl ConcentrationCertificate {
     /// Use this when the caller explicitly acknowledges that the McDiarmid
     /// component may not be a valid upper bound.
     ///
-    /// Part of #4145: explicit opt-in for unsound path.
+    /// Explicit opt-in for the unsound path.
     pub fn compute_with_mcdiarmid_optimistic(
         empirical_mean: &ArrayD<f32>,
         crown_bounds: &BoundedTensor,
@@ -295,8 +289,6 @@ pub fn hoeffding_bound(
 /// radii delta_j, the bounded difference for output i is c_{ij} = L * delta_j.
 ///
 /// P(|f_i(X) - E[f_i(X)]| >= epsilon) <= 2 * exp(-2*epsilon^2 / sum_j(c_{ij}^2))
-///
-/// Part of #4145: enforced contract replaces warning-only fallback.
 pub fn mcdiarmid_bound(
     empirical_output: &ArrayD<f32>,
     input_bounds: &BoundedTensor,
@@ -328,7 +320,7 @@ pub fn mcdiarmid_bound(
 /// returns bounds with `is_sound: false`. The caller is responsible for
 /// communicating the reduced trustworthiness of the resulting certificate.
 ///
-/// Part of #4145: explicit opt-in for unsound path.
+/// Explicit opt-in for the unsound path.
 pub fn mcdiarmid_bound_optimistic(
     empirical_output: &ArrayD<f32>,
     input_bounds: &BoundedTensor,

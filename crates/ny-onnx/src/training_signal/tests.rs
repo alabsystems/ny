@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Packet-local unit tests for training_signal (#3520).
+//! Packet-local unit tests for training_signal.
 //!
 //! These tests use synthetic data and do NOT require the real avoice fixture.
 

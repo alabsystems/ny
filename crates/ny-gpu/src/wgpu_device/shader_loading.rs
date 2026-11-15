@@ -6,7 +6,10 @@
 //! created (#rung3-denorm-chase, production arm).
 //!
 //! Default (env unset or `auto`): use the DenormPreserve passthrough on a device
-//! that granted `PASSTHROUGH_SHADERS`, otherwise use plain
+//! that can load the injected SPIR-V module through passthrough
+//! (`PASSTHROUGH_SHADERS` on the Vulkan backend, the only wgpu backend that
+//! reads the SPIR-V payload; see
+//! `ny_gpu_passthrough::spirv_passthrough_supported`), otherwise use plain
 //! `create_shader_module`. `NY_GPU_DENORM_PRESERVE=0|1` supplies exact A/B
 //! overrides; forced `1` refuses device construction when the capability is
 //! absent. On the passthrough route the module is compiled WGSL -> naga SPIR-V,
@@ -101,7 +104,8 @@ pub(crate) fn resolve_denorm_preserve(
         DenormPreservePolicy::Disabled => Ok((policy, false)),
         DenormPreservePolicy::Required if passthrough_supported => Ok((policy, true)),
         DenormPreservePolicy::Required => Err(NyError::UnsupportedConfiguration(format!(
-            "{DENORM_PRESERVE_ENV}=1 requires WGPU PASSTHROUGH_SHADERS support"
+            "{DENORM_PRESERVE_ENV}=1 requires WGPU SPIR-V passthrough \
+             (PASSTHROUGH_SHADERS on the Vulkan backend)"
         ))),
         // The parser never produces the programmatic policy; fail closed
         // rather than silently treating it as an env resolution.
@@ -228,7 +232,7 @@ pub(crate) fn create_compute_module(
                     // entirely — no log level, no `--json` mode and no `-q`
                     // could silence it, which is what put three lines of
                     // chatter on stderr and broke the empty-stderr contract
-                    // (#395). The FAILURE arm below keeps its `eprintln!` on
+                    //The FAILURE arm below keeps its `eprintln!` on
                     // purpose: that one must be visible even where no
                     // subscriber is installed, as its comment records.
                     tracing::debug!(

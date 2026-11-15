@@ -79,7 +79,7 @@ impl ZonotopeTensor {
         }
 
         fn silu_second_derivative(x: f32) -> f32 {
-            // Guard for #2474 (same pattern as silu() and silu_derivative() guards).
+            // Same guard pattern as the silu() and silu_derivative() guards.
             // Avoid NaN from inf*0 and inf-inf in the closed form.
             // lim x->-inf SiLU''(x) = 0, lim x->+inf SiLU''(x) = 0.
             if !x.is_finite() {
@@ -133,7 +133,7 @@ impl ZonotopeTensor {
         /// 0.038 whenever the interval can contain it. (A sampled maximum
         /// would only be a lower bound on max|f''| and could under-estimate
         /// the Taylor remainder.) Uses nan_propagating_max so a NaN endpoint
-        /// surfaces as NaN (#2850).
+        /// surfaces as NaN.
         fn max_silu_second_deriv(lo: f32, hi: f32) -> f32 {
             let mut max_val = nan_propagating_max(
                 silu_second_derivative(lo).abs(),
@@ -161,7 +161,7 @@ impl ZonotopeTensor {
                 let dim = self.element_shape[0];
                 // Each element gets its own approximation-error symbol to prevent
                 // false cancellation across coordinates after downstream linear ops.
-                // Same fix as GELU (gelu.rs gelu_affine_1d, #2470).
+                // Same fix as GELU (gelu.rs gelu_affine_1d).
                 let n_new_error_terms = dim;
                 let n_rows = 1 + self.n_error_terms + n_new_error_terms;
                 let mut result_coeffs = ndarray::Array2::<f32>::zeros((n_rows, dim));
@@ -207,7 +207,7 @@ impl ZonotopeTensor {
                 // 2D case: (seq, dim)
                 // Each element gets its own approximation-error symbol to prevent
                 // false cancellation across coordinates after downstream linear ops.
-                // Same fix as GELU (gelu.rs gelu_affine_2d, #2470).
+                // Same fix as GELU (gelu.rs gelu_affine_2d).
                 let seq_len = self.element_shape[0];
                 let dim = self.element_shape[1];
                 let n_new_error_terms = seq_len * dim;

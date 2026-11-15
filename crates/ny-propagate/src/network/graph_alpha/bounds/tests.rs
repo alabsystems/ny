@@ -524,7 +524,7 @@ fn test_alpha_vs_crown_parity_slice() {
     assert_bounded_tensor_close(&crown_ibp, &alpha_crown, 1e-4, "Slice parity");
 }
 
-// ========================= Soundness grid helper (#2543) =========================
+// ========================= Soundness grid helper =========================
 
 /// Sample an 11×11 grid over a 2D input domain and verify that every true
 /// network output lies within both CROWN-IBP and alpha-CROWN bounds.
@@ -571,7 +571,7 @@ fn assert_grid_soundness(
     );
 }
 
-// ========================= Sigmoid soundness (#2543) =========================
+// ========================= Sigmoid soundness =========================
 
 #[ntest::timeout(10000)]
 #[test]
@@ -622,7 +622,7 @@ fn test_graph_crown_sigmoid_soundness_2543() {
     );
 }
 
-// ========================= Slice soundness (#2543) =========================
+// ========================= Slice soundness =========================
 
 #[ntest::timeout(10000)]
 #[test]
@@ -1504,7 +1504,7 @@ fn test_graph_crown_max_binary_sound_1929() {
     }
 }
 
-// ========================= NaN-safe accumulation (#2093) =========================
+// ========================= NaN-safe accumulation =========================
 
 #[ntest::timeout(10000)]
 #[test]
@@ -1656,7 +1656,7 @@ fn test_accumulate_crown_ibp_bounds_nan_input_preserved_2093() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_graph_crown_conv2d_low_dim_input_errors_2027() {
-    // Regression #2027: Conv2d with < 3D input must error, not silently skip.
+    // Regression test: Conv2d with < 3D input must error, not silently skip.
     // Graph: Linear(2→4) → Conv2d(1,1,3,3). Linear produces [4] (< 3D).
     // Manual ibp_bounds bypass IBP forward to test CROWN backward directly.
     let w1 = arr2(&[[1.0, 0.5], [-0.3, 0.7], [0.2, -0.9], [0.8, 0.1]]);
@@ -1736,10 +1736,10 @@ fn test_graph_crown_conv2d_low_dim_input_errors_2027() {
     );
 }
 
-// ========================= #2094 regression tests =========================
+// ========================= Arity and dispatch regression tests =========================
 
-/// Regression test for #2094 Step 4: empty-inputs node must be rejected.
-/// Since #2481/#2686, GraphNode::new() asserts minimum arity at construction
+/// Regression test Step 4: empty-inputs node must be rejected.
+/// GraphNode::new() asserts minimum arity at construction
 /// time, so this is caught as a panic rather than a CROWN-time error.
 #[ntest::timeout(10000)]
 #[test]
@@ -1753,8 +1753,8 @@ fn test_graph_crown_empty_inputs_errors_2094() {
     ));
 }
 
-/// Regression test for #2094: Add with insufficient arity must be rejected.
-/// Since #2481/#2686, GraphNode::new() asserts minimum arity at construction
+/// Regression test: Add with insufficient arity must be rejected.
+/// GraphNode::new() asserts minimum arity at construction
 /// time, so this is caught as a panic rather than a CROWN-time error.
 #[ntest::timeout(10000)]
 #[test]
@@ -1765,7 +1765,7 @@ fn test_graph_crown_add_arity_error_2094() {
         "lin1",
         Layer::Linear(LinearLayer::new(arr2(&[[1.0_f32]]), Some(arr1(&[0.0_f32]))).unwrap()),
     ));
-    // Add node with only 1 input — panics at construction (#2481)
+    // Add node with only 1 input — panics at construction
     graph.add_node(GraphNode::new(
         "bad_add",
         Layer::Add(AddLayer),
@@ -1773,14 +1773,14 @@ fn test_graph_crown_add_arity_error_2094() {
     ));
 }
 
-/// Regression test for #2094: Sub binary dispatch works through shared dispatch.
+/// Regression test: Sub binary dispatch works through shared dispatch.
 /// Post-migration, Sub should still produce correct bounds through
 /// dispatch_backward_layer → Binary result handling.
 #[ntest::timeout(10000)]
 #[test]
 fn test_graph_crown_sub_via_shared_dispatch_2094() {
     // Same graph as test_graph_crown_sub_binary_parity_1929 but specifically
-    // verifies the post-#2094 shared dispatch path produces sound bounds.
+    // verifies the shared dispatch path produces sound bounds.
     let mut graph = GraphNetwork::new();
     graph.add_node(GraphNode::from_input("relu", Layer::ReLU(ReLULayer)));
     let w_a = arr2(&[[1.5_f32]]);
@@ -1829,9 +1829,9 @@ fn test_graph_crown_sub_via_shared_dispatch_2094() {
     }
 }
 
-// ========================= UnsupportedOp preserved (not wrapped into InvalidSpec) #2135 =========================
+// ========================= UnsupportedOp preserved (not wrapped into InvalidSpec) =========================
 
-/// Regression test for #2135: When a unary layer returns UnsupportedOp from
+/// Regression test: When a unary layer returns UnsupportedOp from
 /// CROWN backward (e.g., NonZero), the error must propagate as UnsupportedOp
 /// — not be wrapped into InvalidSpec by the catch-all arm.
 ///
@@ -1880,7 +1880,7 @@ fn test_graph_crown_unsupported_unary_returns_unsupported_op_2135() {
     );
 
     // Key assertion: the error must be UnsupportedOp, NOT InvalidSpec.
-    // Before the fix (#2135), this was InvalidSpec due to blanket .map_err().
+    // Before the fix, this was InvalidSpec due to blanket.map_err().
     match &result {
         Err(NyError::UnsupportedOp(_)) => {
             // Correct: UnsupportedOp preserved through dispatch
@@ -1903,7 +1903,7 @@ fn test_graph_crown_unsupported_unary_returns_unsupported_op_2135() {
     }
 }
 
-/// Regression test for #2135: CROWN-IBP DAG pass gracefully falls back to IBP
+/// Regression test: CROWN-IBP DAG pass gracefully falls back to IBP
 /// when a node returns UnsupportedOp from CROWN backward.
 #[ntest::timeout(10000)]
 #[test]
@@ -1952,7 +1952,7 @@ fn test_graph_crown_ibp_dag_fallback_for_unsupported_op_2135() {
     );
 }
 
-/// Regression for #4112: target-backward CROWN must handle Concat nodes whose
+/// Regression test: target-backward CROWN must handle Concat nodes whose
 /// inputs were fully embedded as constants during ONNX lowering.
 /// Before the fix, `require_unary_input()` rejected zero-input constant-only
 /// Concat with "node has no inputs" before layer dispatch could run.
@@ -2001,7 +2001,7 @@ fn test_constant_only_concat_target_backward_preserves_constant_bounds_4112() {
     );
 }
 
-/// #4112 prover hardening: constant-only Concat with a downstream Linear that
+/// Prover hardening: constant-only Concat with a downstream Linear that
 /// introduces negative backward weights, exercising all four sign combinations
 /// of (lA sign) × (constant sign) in the bias contribution `lA * c → bias`.
 ///
@@ -2074,7 +2074,7 @@ fn test_constant_only_concat_negative_weights_all_sign_combos_4112() {
     );
 }
 
-// ========================= MulBinary parity + soundness (#3396) =========================
+// ========================= MulBinary parity + soundness =========================
 
 type AffineParams<'a> = (&'a ndarray::Array2<f32>, &'a Array1<f32>);
 
@@ -2116,7 +2116,7 @@ fn assert_mulbinary_soundness_grid(
     }
 }
 
-/// Regression test for #3396: MulBinary in DAG alpha-CROWN backward must not
+/// Regression test: MulBinary in DAG alpha-CROWN backward must not
 /// return a fatal error. Before this fix, `dispatch_backward_layer` returned
 /// `Unsupported` for MulBinary (it requires a relaxation mode), and
 /// `propagate_crown_to_node_core` treated that as a fatal error instead of
@@ -2190,7 +2190,7 @@ fn test_alpha_vs_crown_parity_mulbinary_3396() {
     );
 }
 
-/// Regression test for #3396: MulBinary CROWN-IBP DAG path must succeed
+/// Regression test: MulBinary CROWN-IBP DAG path must succeed
 /// (propagate_crown_to_node falls back to IBP on UnsupportedOp if needed,
 /// but with the site-specific handler it should produce CROWN-tightened bounds).
 #[ntest::timeout(10000)]
@@ -2256,9 +2256,9 @@ fn test_mulbinary_crown_ibp_dag_succeeds_3396() {
     }
 }
 
-// ========================= Alpha optimization loop UnsupportedOp fallback (#3218) =========================
+// ========================= Alpha optimization loop UnsupportedOp fallback =========================
 
-/// Regression test for #3218: DAG alpha-CROWN (collect_alpha_crown_bounds_dag)
+/// Regression test: DAG alpha-CROWN (collect_alpha_crown_bounds_dag)
 /// must handle Gather layers gracefully. Gather returns UnsupportedOp from CROWN
 /// backward; the alpha optimization loop at bounds/alpha.rs catches this and
 /// breaks out (returning IBP bounds). This unblocks VNN-COMP lsnc_relu category.
@@ -2344,7 +2344,7 @@ fn test_dag_alpha_crown_gather_unsupported_op_fallback_3218() {
     }
 }
 
-// ========================= MulBinary SPSA supplement convergence (#3439 Phase 3) =========================
+// ========================= MulBinary SPSA supplement convergence =========================
 
 /// Build a SwiGLU-like graph with ReLU on the "up" path:
 /// input → Linear("up") → ReLU("relu") + Linear("gate") → MulBinary("mul") → Linear("out")
@@ -2945,8 +2945,6 @@ fn assert_monotone_projection_result(
 
 /// Verify that the SPSA supplement for MulBinary alphas produces sound bounds
 /// and monotonic convergence on a ReLU+MulBinary SwiGLU-like DAG.
-///
-/// Part of #3439.
 #[ntest::timeout(60000)]
 #[test]
 fn test_mulbinary_spsa_supplement_convergence_3439() {
@@ -2986,7 +2984,7 @@ fn test_mulbinary_spsa_supplement_convergence_3439() {
     );
 }
 
-/// Regression for #3453: per-domain alpha-CROWN warm-start must remain sound
+/// Regression test: per-domain alpha-CROWN warm-start must remain sound
 /// after the SPSA refinement loop and the CROWN-IBP intersection step.
 ///
 /// This exercises the graph input-split building blocks end-to-end on a small
@@ -3049,7 +3047,7 @@ fn test_alpha_crown_warm_start_child_bounds_sound_and_no_looser_3453() {
     assert_child_domain_soundness(&warm_output);
 }
 
-/// Regression for #3232: spec-guided graph CROWN must honor a supplied
+/// Regression test: spec-guided graph CROWN must honor a supplied
 /// `GraphAlphaState` instead of falling back to the `u > -l` heuristic when
 /// input-split code reuses root alpha-CROWN slopes.
 ///
@@ -3150,7 +3148,7 @@ fn test_monotone_shape_mismatch_retry_matches_fixed_crown_and_stays_sound_4118()
     // rather than `propagate_crown_fixed_slope` (the flat single-pass engine): on a
     // residual DAG the flat engine accumulates linear bounds through the Add merge in one
     // pass and is therefore tighter, whereas the per-target core re-concretizes each node
-    // against the IBP intermediates. Both are sound; the #4118 retry must reproduce the
+    // against the IBP intermediates. Both are sound; the fixed-slope retry must reproduce the
     // core's own fixed-slope result, which is the meaningful invariant for the local seam.
     let empty_alpha_state = GraphAlphaState::new();
     let fixed_bounds = graph
@@ -3166,7 +3164,7 @@ fn test_monotone_shape_mismatch_retry_matches_fixed_crown_and_stays_sound_4118()
         .expect("#4118 fixed-slope monotone DAG baseline should succeed");
 
     // Force both monotone alpha branches down the retry seam by supplying
-    // tangent-point bundles with the wrong width. Before #4118 this surfaced as
+    // tangent-point bundles with the wrong width. Without the retry this surfaced as
     // ShapeMismatch from DAG alpha backward, which the caller treated as a
     // graph-wide fallback trigger. The fixed-slope retry should now keep the
     // graph on the local CROWN path, so a monotone-only DAG must match the
@@ -3311,7 +3309,7 @@ fn test_monotone_warm_start_projects_parent_tangent_points_into_child_domain_361
     assert_monotone_projection_result(child, &child_default);
 }
 
-/// Regression for #3549: DAG α-CROWN bound collection must keep the caller's
+/// Regression test: DAG α-CROWN bound collection must keep the caller's
 /// GemmEngine alive during the optimization loop, not only during initial
 /// CROWN-IBP collection.
 #[ntest::timeout(60000)]
@@ -3487,7 +3485,7 @@ fn collector_cap_reaches_fix_interm_conv_dag_preloop_crown_step1() {
     });
 }
 
-/// Regression for the warm-start half of #4404: the per-child helper must
+/// Regression test for the warm-start path: the per-child helper must
 /// honor `fix_interm_bounds=true` instead of unconditionally rebuilding a
 /// CROWN-IBP map. This fixture's unsupported forward-linear tail deliberately
 /// falls back to plain IBP, while the oracle above proves that IBP and
@@ -3551,7 +3549,7 @@ fn test_collect_alpha_crown_bounds_dag_warm_fix_interm_bounds_true_uses_ibp_on_d
     );
 }
 
-/// Regression for #3549: warm-started DAG α-CROWN refinement must also keep
+/// Regression test: warm-started DAG α-CROWN refinement must also keep
 /// using the caller's GemmEngine during its SPSA/output passes.
 #[ntest::timeout(60000)]
 #[test]
@@ -3796,8 +3794,9 @@ fn test_crown_ibp_precomputed_short_deadline_falls_back_to_exact_ibp_3499() {
     graph.set_crown_ibp_per_node_time_budget(crate::types::CrownIbpPerNodeTimeBudget {
         floor_secs: Some(120.0),
         cap_secs: None,
-    prefix_cost_weighted: false,
+        prefix_cost_weighted: false,
         max_target_share_frac: None,
+        floor_dim_scaled: false,
     });
     let linear = LinearLayer::new(arr2(&[[1.5_f32, -0.25]]), Some(arr1(&[0.75_f32])))
         .expect("valid linear layer");
@@ -3814,7 +3813,7 @@ fn test_crown_ibp_precomputed_short_deadline_falls_back_to_exact_ibp_3499() {
         .expect("IBP bounds should succeed");
 
     // A Linear-only graph now legitimately takes the CPU sequential fast path,
-    // where this tiny backward finishes well inside a short deadline (#4413).
+    // where this tiny backward finishes well inside a short deadline.
     // Force the graph-native policy with a no-op width threshold so this test
     // exercises its configured per-node floor. The 60-second deadline is far
     // from wall-clock expiry but deterministically below the 120-second floor,
@@ -4032,7 +4031,7 @@ fn test_crown_ibp_precomputed_exact_output_keeps_crown_provenance_3775() {
     );
 }
 
-// ========================= SE-block broadcast alpha-CROWN (#3499) =========================
+// ========================= SE-block broadcast alpha-CROWN =========================
 
 /// Build a squeeze-excitation-like DAG with broadcasting MulBinary.
 ///
@@ -4051,8 +4050,7 @@ fn test_crown_ibp_precomputed_exact_output_keeps_crown_provenance_3775() {
 /// This exercises the MulBinary broadcast path in alpha-CROWN DAG optimization:
 /// - ReLU provides unstable neurons for alpha optimization
 /// - Sigmoid provides monotone alpha state
-/// - MulBinary with [2,4] * [2,1] forces the broadcast coefficient accumulation
-///   path added in #3499 (iters 1406-1407)
+/// - MulBinary with [2,4] * [2,1] forces the broadcast coefficient accumulation path
 ///
 /// Reference: ECAPA-TDNN SE blocks multiply features [C,T] by SE weights [C,1].
 fn build_se_block_broadcast_dag() -> (GraphNetwork, BoundedTensor) {
@@ -4159,8 +4157,7 @@ fn assert_scalar_bounds_sound_by_sampling(
 /// Alpha-CROWN DAG optimization on an SE-block graph with broadcasting MulBinary
 /// must succeed and produce sound, non-loosening bounds.
 ///
-/// Graph-level regression test for the MulBinary alpha broadcast fix (#3499,
-/// iters 1406-1407). Layer-level test:
+/// Graph-level regression test for the MulBinary alpha broadcast fix. Layer-level test:
 /// `test_crown_alpha_broadcast_soundness_se_block_pattern_3499` in
 /// `layers/binary_ops/mul/tests.rs`.
 ///
@@ -4285,7 +4282,7 @@ fn test_crown_ibp_spatial_targets_use_patches_under_dense_budget_3813() {
     });
 }
 
-/// #3813 Step 7a: Complementary matrix-mode test for CROWN-IBP collector.
+/// Complementary matrix-mode test for CROWN-IBP collector.
 ///
 /// The no-cuts test above verifies Patches tightening works. This test verifies
 /// the Dense-only path (matrix mode, `use_patches_mode=false`) also produces
@@ -4333,12 +4330,12 @@ fn test_crown_ibp_spatial_targets_stay_dense_in_matrix_mode_3813() {
     );
 }
 
-/// #3839 Slice 3a: Verify the budget policy split helpers return correct values.
+/// Verify the budget policy split helpers return correct values.
 ///
 /// The fast-path gate (`counts_toward_sequential_skip_fraction`) must count
 /// spatial Conv2d targets as over-budget (conservative), while the graph-native
 /// guard (`graph_native_target_exceeds_budget`) must return `false` for those
-/// same targets because they can start in Patches mode (#3813).
+/// same targets because they can start in Patches mode.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_ibp_budget_policy_split_3839() {
@@ -4370,7 +4367,7 @@ fn test_crown_ibp_budget_policy_split_3839() {
         );
 
         // Graph-native guard: both spatial targets should NOT exceed budget because
-        // they can start in Patches mode (#3813 contract).
+        // they can start in Patches mode.
         assert!(
             graph.crown_ibp_target_can_start_in_patches("conv", &conv_bounds),
             "#3839: conv should be patches-startable (3D spatial, has Conv2d ancestor)"
@@ -4390,7 +4387,7 @@ fn test_crown_ibp_budget_policy_split_3839() {
     });
 }
 
-/// #3839 Slice 3b: Engine-presence regression for the graph-native collector.
+/// Engine-presence regression for the graph-native collector.
 ///
 /// When `engine.is_some()`, the sequential fast-path gate may fire and route
 /// collection through the sequential collector. This test verifies that under a
@@ -4440,7 +4437,7 @@ fn test_crown_ibp_spatial_targets_use_patches_under_dense_budget_with_engine_383
     });
 }
 
-/// #3839 Slice 4: Exhaust the aggregate patches budget and verify later
+/// Exhaust the aggregate patches budget and verify later
 /// patches-startable nodes fall back with `PatchesBudgetExceeded`.
 #[ntest::timeout(10000)]
 #[test]
@@ -5115,10 +5112,7 @@ fn sequential_conv_transpose_alpha_reference_honors_both_kill_switches() {
         ..AlphaCrownConfig::default()
     };
 
-    ny_test_utils::env::with_env_edits(|env| {
-        env.remove("NY_NO_FORWARD_LINEAR_REF");
-        env.remove("NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF");
-        env.remove("NY_FORWARD_LINEAR_SEQ_CONV_REF");
+    crate::tests::with_default_fl_reference_env(|env| {
         assert!(
             graph.should_collect_forward_linear_image_reference(),
             "default shared image policy must admit the sequential cGAN fixture"

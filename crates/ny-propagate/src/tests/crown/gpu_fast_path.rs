@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Integration coverage for the sequential GPU CROWN fast-path (#3397).
+//! Integration coverage for the sequential GPU CROWN fast-path.
 
 use super::helpers::{assert_bounded_tensor_close, assert_bounds_finite, MockGpuCrownEngine};
 use super::*;
@@ -12,7 +12,7 @@ use ny_core::{NaiveCpuGemmEngine, Result};
 /// Build an ACAS-Xu-like network: SubConst → Linear(no bias) → AddConst → ReLU → Linear → AddConst
 ///
 /// This pattern emerges from ONNX MatMul+Add where MatMul→Linear(w, None) and Add→AddConstant.
-/// Part of #3460: GPU CROWN must handle AddConstant/SubConstant.
+/// GPU CROWN must handle AddConstant/SubConstant.
 fn build_acasxu_like_network() -> Result<(Network, BoundedTensor)> {
     use crate::layers::arithmetic::{AddConstantLayer, SubConstantLayer};
 
@@ -176,7 +176,7 @@ fn test_propagate_crown_falls_back_to_cpu_when_gpu_fast_path_errors() -> Result<
 
 /// Verify GPU extraction succeeds for ACAS-Xu-like networks with AddConstant/SubConstant.
 ///
-/// Part of #3460: constant-arithmetic layers expressed as Activation(slopes, intercepts).
+/// The constant-arithmetic layers are expressed as Activation(slopes, intercepts).
 #[test]
 fn test_gpu_fast_path_extracts_add_sub_constant_layers() -> Result<()> {
     // Fast-GPU-path routing test: hold the shared gate lock (sets the
@@ -213,7 +213,7 @@ fn test_gpu_fast_path_extracts_add_sub_constant_layers() -> Result<()> {
 
 /// Verify GPU extraction succeeds for Linear → Sigmoid → Linear network.
 ///
-/// Part of #3460: Sigmoid extraction produces per-neuron linear relaxation
+/// Sigmoid extraction produces per-neuron linear relaxation
 /// slopes/intercepts using the same sigmoid_linear_relaxation function as
 /// CPU CROWN backward. The GPU activation shader applies these generically.
 ///
@@ -262,7 +262,7 @@ fn test_gpu_fast_path_extracts_sigmoid_layers() -> Result<()> {
 
 /// Verify GPU extraction succeeds for Linear → Tanh → Linear network.
 ///
-/// Part of #3460: Tanh extraction uses tanh_linear_relaxation (same function
+/// Tanh extraction uses tanh_linear_relaxation (same function
 /// as CPU CROWN backward) to compute per-neuron slopes/intercepts.
 #[test]
 fn test_gpu_fast_path_extracts_tanh_layers() -> Result<()> {
@@ -304,7 +304,7 @@ fn test_gpu_fast_path_extracts_tanh_layers() -> Result<()> {
 
 /// Verify GPU extraction succeeds for MulConstant and DivConstant layers.
 ///
-/// Part of #3460: MulConstant(c) → Activation(slopes=c, intercepts=0),
+/// MulConstant(c) → Activation(slopes=c, intercepts=0),
 /// DivConstant(c) → Activation(slopes=1/c, intercepts=0).
 #[test]
 fn test_gpu_fast_path_extracts_mul_div_constant_layers() -> Result<()> {

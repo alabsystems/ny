@@ -462,7 +462,7 @@ fn assert_ibp_soundness_against(output: &BoundedTensor, test_points: &[Vec<f32>]
     }
 }
 
-/// Regression test for #2242: SoftmaxLayer handles -inf (exp(-inf)=0).
+/// Regression test: SoftmaxLayer handles -inf (exp(-inf)=0).
 /// Masked positions get near-[0, 0] bounds, unmasked get tight bounds.
 #[test]
 fn softmax_ibp_neg_inf_causal_mask_produces_tight_bounds() {
@@ -587,12 +587,12 @@ fn softmax_ibp_mixed_neg_inf_lower_finite_upper() {
     );
 }
 
-// ========== NaN integration tests (#2627) ==========
+// ========== NaN integration tests ==========
 // Softmax IBP has NaN guards at lines 37-48 of ibp/mod.rs: if any input element
 // is NaN, ok=false and fallback to [0, 1]. These tests verify the fold site
 // integration, not just the nan_propagating_max primitive.
 
-/// NaN in lower bound triggers [0, 1] fallback (#2627).
+/// NaN in lower bound triggers [0, 1] fallback.
 #[test]
 fn softmax_ibp_nan_in_lower_falls_back_to_unit_2627() {
     let layer = SoftmaxLayer::new(-1);
@@ -612,7 +612,7 @@ fn softmax_ibp_nan_in_lower_falls_back_to_unit_2627() {
     }
 }
 
-/// NaN in upper bound triggers [0, 1] fallback (#2627).
+/// NaN in upper bound triggers [0, 1] fallback.
 #[test]
 fn softmax_ibp_nan_in_upper_falls_back_to_unit_2627() {
     let layer = SoftmaxLayer::new(-1);
@@ -630,7 +630,7 @@ fn softmax_ibp_nan_in_upper_falls_back_to_unit_2627() {
     }
 }
 
-/// All-NaN input triggers [0, 1] fallback (#2627).
+/// All-NaN input triggers [0, 1] fallback.
 #[test]
 fn softmax_ibp_all_nan_falls_back_to_unit_2627() {
     let layer = SoftmaxLayer::new(-1);
@@ -657,7 +657,7 @@ fn softmax_ibp_all_nan_falls_back_to_unit_2627() {
     );
 }
 
-/// 2D batched input with NaN in one row: NaN row falls back, clean row computes normally (#2627).
+/// 2D batched input with NaN in one row: NaN row falls back, clean row computes normally.
 #[test]
 fn softmax_ibp_2d_nan_in_one_row_per_lane_fallback_2627() {
     let layer = SoftmaxLayer::new(-1);
@@ -713,10 +713,10 @@ fn softmax_ibp_monotonicity_tighter_input_tighter_output() {
     }
 }
 
-// ========== Preserve-leading-axis tests (#4096) ==========
+// ========== Preserve-leading-axis tests ==========
 
 /// Positive stored axis under preserve-leading-axis mode should shift right
-/// by one, matching the sequential result. Part of #4096.
+/// by one, matching the sequential result.
 #[test]
 fn softmax_preserve_leading_axis_restores_positive_axis_4096() {
     // Simulate: ONNX Softmax(axis=2) on [seq, hidden, vocab] stored as axis=1.
@@ -795,7 +795,7 @@ fn softmax_preserve_leading_axis_negative_axis_unchanged_4096() {
     }
 }
 
-// ========== #4231: underflow / large-score-gap false-proof regression ==========
+// ========== underflow / large-score-gap false-proof regression ==========
 //
 // A SHARED max-shift plus a fixed `+ SOFTMAX_EPSILON` in the denominator
 // UNDER-approximated p_hi for a REACHABLE key whose own scores sat far below the

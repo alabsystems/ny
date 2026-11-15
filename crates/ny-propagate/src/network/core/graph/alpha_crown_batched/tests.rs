@@ -147,7 +147,7 @@ fn test_alpha_crown_batched_not_worse_than_crown() {
     );
 }
 
-/// Regression test for #3588: the no-ReLU DAG alpha path must thread the
+/// Regression test: the no-ReLU DAG alpha path must thread the
 /// GemmEngine into the batched bilinear alpha optimizer, not drop it.
 ///
 /// Uses a CountingGemmEngine to verify the no-ReLU alpha-CROWN path performs
@@ -160,7 +160,7 @@ fn test_alpha_crown_batched_threads_engine_3588() {
     let input = make_small_2d_input();
 
     // Verify the batched alpha-CROWN optimizer accepts a non-None engine.
-    // Before #3588, propagate_alpha_crown_batched had no engine parameter.
+    // Previously, propagate_alpha_crown_batched had no engine parameter.
     let engine = CountingGemmEngine::new();
     let config = AlphaCrownConfig {
         iterations: 2,
@@ -202,7 +202,7 @@ fn test_alpha_crown_batched_threads_engine_3588() {
     );
 }
 
-/// Regression test for #3588: the full DAG alpha-CROWN entrypoint must
+/// Regression test: the full DAG alpha-CROWN entrypoint must
 /// thread the engine through the no-ReLU bilinear branch.
 ///
 /// This graph has no ReLU nodes, so the DAG dispatcher enters the
@@ -223,9 +223,9 @@ fn test_dag_alpha_crown_no_relu_threads_engine_3588() {
         ..AlphaCrownConfig::default()
     };
 
-    // Before #3588, the no-ReLU branch called
+    // Previously, the no-ReLU branch called
     // propagate_alpha_crown_batched(input, config) — dropping the engine.
-    // After #3588, engine is threaded all the way through.
+    // Now the engine is threaded all the way through.
     // This routes to DAG alpha-CROWN because the bilinear graph is
     // non-sequential.
     let result = graph

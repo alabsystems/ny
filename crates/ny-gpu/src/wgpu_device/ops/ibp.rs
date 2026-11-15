@@ -24,9 +24,9 @@ impl WgpuDevice {
         let shape = input.shape();
 
         // Pre-compute positive and negative weight matrices.
-        // NaN-propagating variants (#2642): Rust's f32::max(NaN, 0.0) = 0.0 (IEEE 754-2008),
+        // NaN-propagating variants: Rust's f32::max(NaN, 0.0) = 0.0 (IEEE 754-2008),
         // silently dropping NaN weights. Use nan_propagating_max_zero/min_zero so NaN weights
-        // poison the accumulator and trigger downstream NaN guards, matching the CPU path (#2415).
+        // poison the accumulator and trigger downstream NaN guards, matching the CPU path.
         let weight_pos: Vec<f32> = weight
             .iter()
             .map(|&w| nan_propagating_max_zero(w))
@@ -147,7 +147,7 @@ impl WgpuDevice {
             wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         );
 
-        // Hold pool lock through readback to prevent staging-buffer race (#3877).
+        // Hold pool lock through readback to prevent staging-buffer race.
         let _pool_guard = pool;
 
         // Write data to buffers using queue.write_buffer (avoids buffer creation)
@@ -251,7 +251,7 @@ impl WgpuDevice {
         let mut result_lower = Self::read_buffer(&self.device, &staging_lower, output_size)?;
         let mut result_upper = Self::read_buffer(&self.device, &staging_upper, output_size)?;
 
-        // Defense-in-depth: sanitize NaN/Inf from GPU readback (#2785).
+        // Defense-in-depth: sanitize NaN/Inf from GPU readback.
         super::sanitize_readback(&mut result_lower, &mut result_upper);
 
         // Reshape to output shape [..., out_features]
@@ -382,7 +382,7 @@ impl WgpuDevice {
             wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         );
 
-        // Hold pool lock through readback to prevent staging-buffer race (#3877).
+        // Hold pool lock through readback to prevent staging-buffer race.
         let _pool_guard = pool;
 
         // Write data to buffers
@@ -478,7 +478,7 @@ impl WgpuDevice {
         let mut result_lower = Self::read_buffer(&self.device, &staging_lower, output_size)?;
         let mut result_upper = Self::read_buffer(&self.device, &staging_upper, output_size)?;
 
-        // Defense-in-depth: sanitize NaN/Inf from GPU readback (#2785).
+        // Defense-in-depth: sanitize NaN/Inf from GPU readback.
         super::sanitize_readback(&mut result_lower, &mut result_upper);
 
         // Build output shape: [...batch_dims, m, n]

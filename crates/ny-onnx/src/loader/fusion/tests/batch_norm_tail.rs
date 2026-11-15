@@ -362,7 +362,7 @@ fn cgan_bn_reshape_gemm_fold_is_killable_and_fail_closed() {
     with_extended_folds(Some("0"), || {
         let (mut nodes, mut weights) = tail_fixture(true, &[-1, 4]);
         assert!(fold_tail(&mut nodes, &mut weights).is_empty());
-        assert!(!nodes[0].output.is_empty());
+        assert_ne!((nodes[0].output).len(), 0);
     });
 
     with_extended_folds(None, || {

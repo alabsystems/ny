@@ -9,7 +9,7 @@
 //! 1. **Per-layer IBP concretization** (catch-all in `crown_backward_step`):
 //!    When the unary catch-all encounters `UnsupportedOp`, it concretizes the
 //!    accumulated CROWN bounds through the failing layer's IBP and continues
-//!    backward. This preserves CROWN tightness from layers above. (#3437)
+//!    backward. This preserves CROWN tightness from layers above.
 //!
 //! 2. **Whole-network IBP fallback** (layer-specific arms like Gather):
 //!    When a layer-specific arm returns `IbpFallback`, the CROWN engine falls
@@ -45,8 +45,30 @@ fn network_with_unsupported_gather() -> (Network, BoundedTensor) {
 /// Assert that bounds contain the expected corner outputs and match IBP.
 fn assert_fallback_sound(result: &BoundedTensor, ibp: &BoundedTensor) {
     assert_eq!(result.shape(), ibp.shape());
-    assert_eq!(result.lower(), ibp.lower());
-    assert_eq!(result.upper(), ibp.upper());
+    // ENCLOSURE, not bit-equality. This used to assert `result == ibp` element
+    // for element, which pinned the fallback to the PLAIN per-layer forward:
+    // once the fallback takes the certified arm (#crown-partial-sound-forward)
+    // its box is up to a few ULP WIDER, and the equality assertion failed on a
+    // strictly sound change (measured: lower 1.9999998 vs the plain
+    // 1.9999999). A soundness test must assert the direction that matters --
+    // the fallback's box contains the IBP box -- and let a certified widening
+    // through.
+    let got = result.flatten();
+    let want = ibp.flatten();
+    for i in 0..got.lower().len() {
+        assert!(
+            got.lower()[[i]] <= want.lower()[[i]],
+            "fallback lower[{i}]={} must enclose the IBP lower {}",
+            got.lower()[[i]],
+            want.lower()[[i]]
+        );
+        assert!(
+            got.upper()[[i]] >= want.upper()[[i]],
+            "fallback upper[{i}]={} must enclose the IBP upper {}",
+            got.upper()[[i]],
+            want.upper()[[i]]
+        );
+    }
 
     // Soundness: output[0] = x[0]+1, output[1] = 3*x[2]+3.
     // At x=[1,2,3]: [2, 12].  At x=[4,5,6]: [5, 21].
@@ -90,7 +112,7 @@ fn propagate_crown_fast_unsupported_op_falls_back_to_ibp() {
 ///
 /// ReduceMax with fixed_max_index=false goes through the catch-all arm and
 /// returns UnsupportedOp from propagate_linear_with_bounds. This tests the
-/// per-layer IBP concretization path (#3437).
+/// per-layer IBP concretization path.
 fn network_with_unsupported_reduce_max() -> (Network, BoundedTensor) {
     use crate::layers::ReduceMaxLayer;
 
@@ -116,7 +138,7 @@ fn network_with_unsupported_reduce_max() -> (Network, BoundedTensor) {
 /// Per-layer IBP concretization: ReduceMax(fixed=false) in catch-all produces
 /// sound bounds via per-layer concretization instead of whole-network IBP fallback.
 ///
-/// Part of #3437: crown_backward_step now concretizes accumulated CROWN bounds
+/// crown_backward_step now concretizes accumulated CROWN bounds
 /// through the failing layer's IBP, preserving CROWN tightness from layers
 /// between the output and the failing layer.
 #[ntest::timeout(10000)]
@@ -253,7 +275,7 @@ fn propagate_crown_per_layer_concretization_with_layers_after() {
 /// Input: [-inf, 1]
 ///
 /// ReLU's CROWN backward rejects the non-finite pre-activation, but its IBP
-/// image is finite ([0, 1]). The fix in #3437 should concretize the accumulated
+/// image is finite ([0, 1]). The catch-all should concretize the accumulated
 /// Sigmoid CROWN bounds through that finite IBP layer result and continue.
 #[ntest::timeout(10000)]
 #[test]

@@ -54,7 +54,7 @@ enum StableOutcome {
 impl From<MarginRowOutcome> for StableOutcome {
     fn from(outcome: MarginRowOutcome) -> Self {
         match outcome {
-            MarginRowOutcome::Unsat(stats) => Self::Unsat(stats.into()),
+            MarginRowOutcome::Unsat(stats, _) => Self::Unsat(stats.into()),
             MarginRowOutcome::Unknown { reason, stats } => Self::Unknown {
                 reason,
                 stats: stats.map(Into::into),
@@ -85,6 +85,8 @@ fn structurally_valid_tiny_spec() -> TwinSpec {
                 input: 3,
                 weight: vec![1.0],
                 bias: vec![0.0],
+                bias_err: Vec::new(),
+                weight_rel_err: 0.0,
                 shape: (1, 1),
             },
             TwinOpSpec::Relu { input: 4 },
@@ -92,6 +94,8 @@ fn structurally_valid_tiny_spec() -> TwinSpec {
                 input: 5,
                 weight: vec![1.0, -1.0],
                 bias: vec![1.0, 0.0],
+                bias_err: Vec::new(),
+                weight_rel_err: 0.0,
                 shape: (2, 1),
             },
         ],
@@ -100,7 +104,7 @@ fn structurally_valid_tiny_spec() -> TwinSpec {
 
 #[test]
 fn production_entrypoint_runs_certified_lane() {
-    // Quarantine lifted 2026-07-18: the production entrypoint now runs the certified
+    // Quarantine lifted: the production entrypoint now runs the certified
     // algorithm. It only ever returns Unsat or Unknown (never Sat), and never the old
     // "authority quarantine" stub.
     assert!(ny_propagate::margin_row::margin_row_bab_enabled());
@@ -121,7 +125,7 @@ fn production_entrypoint_runs_certified_lane() {
             );
         }
         // A certified `unsat` is a legitimate production outcome now.
-        MarginRowOutcome::Unsat(_) => {}
+        MarginRowOutcome::Unsat(..) => {}
     }
 }
 
@@ -177,7 +181,7 @@ fn production_entrypoint_fails_closed_on_structural_mismatch() {
         100,
     ) {
         MarginRowOutcome::Unknown { .. } => {}
-        MarginRowOutcome::Unsat(_) => {
+        MarginRowOutcome::Unsat(..) => {
             panic!("MOAT VIOLATION: decided an instance outside the supported class")
         }
     }

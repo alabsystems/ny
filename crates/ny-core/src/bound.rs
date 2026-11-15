@@ -21,7 +21,7 @@ pub struct Bound {
     pub(crate) upper: f32,
 }
 
-/// Custom deserialization for `Bound` that validates invariants (#2367).
+/// Custom deserialization for `Bound` that validates invariants.
 ///
 /// Serde's derived `Deserialize` bypasses the constructor, allowing NaN and
 /// inverted bounds to silently enter the system. This custom impl rejects
@@ -281,7 +281,7 @@ impl Bound {
     #[inline]
     #[must_use]
     pub fn intersect(&self, other: &Bound) -> Option<Bound> {
-        // NaN in any endpoint → None (soundness: #2640)
+        // NaN in any endpoint → None (soundness)
         if self.lower.is_nan()
             || self.upper.is_nan()
             || other.lower.is_nan()

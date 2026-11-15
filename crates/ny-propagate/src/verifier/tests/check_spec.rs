@@ -141,9 +141,9 @@ fn test_check_spec_with_infinities() {
     assert!(matches!(result, VerificationResult::Verified { .. }));
 }
 
-/// Regression test for #2238: empty output spec must be rejected, not trivially verified.
+/// Regression test: empty output spec must be rejected, not trivially verified.
 ///
-/// Before #2238, an empty spec would iterate zero times in check_spec and report
+/// Previously, an empty spec would iterate zero times in check_spec and report
 /// `Verified` — a false positive (the most dangerous verification bug class).
 #[ntest::timeout(5000)]
 #[test]
@@ -220,7 +220,7 @@ fn test_check_spec_partial_match() {
     }
 }
 
-/// Regression test for #2230: zip truncation silently skips spec requirements
+/// Regression test: zip truncation silently skips spec requirements
 /// when the network produces fewer outputs than the spec requires.
 #[ntest::timeout(5000)]
 #[test]

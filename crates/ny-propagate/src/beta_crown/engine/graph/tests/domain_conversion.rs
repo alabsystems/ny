@@ -5,7 +5,6 @@
 //! Tests for graph domain conversion utilities.
 //!
 //! Extracted from `domain_conversion.rs` inline `#[cfg(test)]` block.
-//! Part of #1876.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -85,6 +84,7 @@ fn make_cached_la(seed: f32) -> CachedLinearBounds {
         upper_a,
         lower_b,
         upper_b,
+        frontiers: HashMap::new(),
     }
 }
 
@@ -332,8 +332,6 @@ fn test_processed_from_graph_domains_direct_missing_layer_bounds() {
 
 /// Verify that `branch_relu_from_picked` produces identical children to the old path:
 /// `graph_domain_from_picked` → `with_constraint` (active) + `with_constraint` (inactive).
-///
-/// This is the parity test for Direction 2 of #1668.
 #[ntest::timeout(10000)]
 #[test]
 fn test_branch_relu_from_picked_matches_legacy_path() -> Result<()> {
@@ -643,7 +641,7 @@ fn test_branch_relu_from_picked_infeasible() -> Result<()> {
     Ok(())
 }
 
-/// Regression for #2784: parent input bound materialization failures (for example
+/// Regression: parent input bound materialization failures (for example
 /// NaN-contaminated picked input bounds) must report propagation failure instead
 /// of aborting the whole GPU batch.
 #[ntest::timeout(5000)]
@@ -693,7 +691,7 @@ fn test_branch_relu_from_picked_parent_input_nan_marks_propagation_failure_2784(
     Ok(())
 }
 
-/// Regression for #2784: layer bound materialization failures must report
+/// Regression: layer bound materialization failures must report
 /// propagation failure (Unknown), not bubble as hard errors from fast-path
 /// branching.
 #[ntest::timeout(5000)]
@@ -760,7 +758,7 @@ fn test_branch_relu_from_picked_layer_bounds_nan_marks_propagation_failure_2784(
     Ok(())
 }
 
-/// Regression for #2934: when BOTH neuron_lower and neuron_upper are NaN,
+/// Regression: when BOTH neuron_lower and neuron_upper are NaN,
 /// IEEE 754 makes both `neuron_upper >= 0.0` and `neuron_lower <= 0.0` return
 /// false. Before the fix, this triggered the `!active && !inactive` path
 /// returning `(None, None, false)` — silently dropping the domain without
@@ -784,7 +782,7 @@ fn test_branch_relu_from_picked_nan_neuron_bounds_marks_propagation_failure_2934
     let layer_names = vec!["linear".to_string()];
 
     // Neuron 0 has NaN bounds (both lower and upper), neuron 1 is valid.
-    // This is the exact scenario from #2934: NaN neuron bounds cause both
+    // This is the exact regression scenario: NaN neuron bounds cause both
     // feasibility checks to fail via IEEE 754 comparison semantics.
     let mut layer_lowers = HashMap::new();
     let mut layer_uppers = HashMap::new();
@@ -885,7 +883,7 @@ fn test_branch_relu_from_picked_nan_neuron_bounds_marks_propagation_failure_2934
 /// Verify that cached lA survives the full DomainList round-trip:
 /// add (with cached_la) → pick_out → graph_domain_from_picked → verify cached_la present.
 ///
-/// This is Direction 4 of #1669: ensure the lA reuse pipeline is wired end-to-end.
+/// Ensures the lA reuse pipeline is wired end-to-end.
 #[test]
 fn test_cached_la_round_trip_through_domain_list() {
     use crate::batched_domain::{
@@ -915,6 +913,7 @@ fn test_cached_la_round_trip_through_domain_list() {
         upper_a,
         lower_b,
         upper_b,
+        frontiers: HashMap::new(),
     };
 
     // Build ProcessedDomains with the cached lA
@@ -1012,7 +1011,7 @@ fn test_cached_la_round_trip_through_domain_list() {
     );
 }
 
-/// Regression for #1845: `graph_domain_from_picked` must initialize non-empty
+/// Regression: `graph_domain_from_picked` must initialize non-empty
 /// alpha state when graph context is available.
 #[test]
 fn test_graph_domain_from_picked_initializes_alpha_from_graph_1845() {
@@ -1060,7 +1059,7 @@ fn test_graph_domain_from_picked_initializes_alpha_from_graph_1845() {
     );
 }
 
-/// Regression for #1845: `branch_relu_from_picked` must warm-start child alpha
+/// Regression: `branch_relu_from_picked` must warm-start child alpha
 /// from parent metadata so optimized alpha survives across BaB iterations.
 #[test]
 fn test_branch_relu_from_picked_warm_starts_alpha_1845() -> Result<()> {
@@ -1138,7 +1137,7 @@ fn test_branch_relu_from_picked_warm_starts_alpha_1845() -> Result<()> {
     Ok(())
 }
 
-/// Regression for #1845: alpha state must survive the DomainList
+/// Regression: alpha state must survive the DomainList
 /// pick_out/add round-trip.
 #[test]
 fn test_alpha_state_round_trip_through_domain_list_1845() {
@@ -1216,7 +1215,7 @@ fn test_alpha_state_round_trip_through_domain_list_1845() {
 }
 
 // =============================================================================
-// Input-split tests (Part of #1891)
+// Input-split tests
 // =============================================================================
 
 /// Verify that `select_input_split_dimension` picks the widest input dimension.
@@ -1646,7 +1645,6 @@ fn test_branch_input_split_children_partition_parent() -> Result<()> {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Tests for processed_from_backward_results
-// Part of #3463: last uncovered function in the domain_conversion module.
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Helper: build a node cache (backward results) for a single domain.
@@ -1882,9 +1880,9 @@ fn test_backward_results_all_filtered_returns_empty() -> Result<()> {
         None,
     )?;
 
-    assert!(result.keep_mask.is_empty());
-    assert!(result.global_lbs.is_empty());
-    assert!(result.global_ubs.is_empty());
+    assert_eq!((result.keep_mask).len(), 0);
+    assert_eq!((result.global_lbs).len(), 0);
+    assert_eq!((result.global_ubs).len(), 0);
     assert!(result.metadata.is_empty());
     assert!(result.layer_lowers.is_empty());
     assert!(result.layer_uppers.is_empty());

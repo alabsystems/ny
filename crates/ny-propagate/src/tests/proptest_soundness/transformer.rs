@@ -268,8 +268,6 @@ proptest! {
     /// includes x = [0, 0] where var = 0, but center std = 100. Using center std
     /// gives second-order = 0.14, total radius = 0.14, bounds [0.86, 1.14].
     /// But y([0, 0]) = 0, which is outside [0.86, 1.14]. UNSOUND.
-    ///
-    /// Part of #3142.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_layernorm_forward_mode_large_perturbation(
@@ -403,8 +401,6 @@ proptest! {
     /// All other forward-mode proptests use ny=1, so |γ_i|=1 and any
     /// misplacement of g_i.abs() (e.g. dividing instead of multiplying)
     /// would be masked. This test uses ny in [0.5, 3.0].
-    ///
-    /// Part of #3142.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_layernorm_forward_mode_4d_with_gamma(

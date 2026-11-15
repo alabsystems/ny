@@ -150,6 +150,8 @@ pub(super) fn try_graph_pgd_vjp_batched(
     gemm_engine: Option<&dyn GemmEngine>,
     json: bool,
 ) -> Result<VjpBatchedOutcome> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Attack);
     use VjpBatchedOutcome::{Completed, FallbackToSequential};
 
     let evidence = ExactVjpExecution::conjunctive(
@@ -198,7 +200,9 @@ pub(super) fn try_graph_pgd_vjp_batched(
 
     let diag = std::env::var("NY_PGD_DIAG").ok().as_deref() == Some("1");
     let attack_start = Instant::now();
-    let deadline_hit = || pgd_config.deadline.is_some_and(|d| Instant::now() >= d);
+    // #attack-concurrent: `past_deadline` is this exact deadline test, OR the
+    // concurrent lane's cancellation token (`None` everywhere else).
+    let deadline_hit = || pgd_config.past_deadline();
     let total_restarts = pgd_config.num_restarts.max(1);
     let mut width = pgd_config.exact_vjp.conjunctive_batch_width();
 

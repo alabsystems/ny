@@ -662,7 +662,7 @@ def main():
     # Check ny binary exists
     if not NY_BIN.exists():
         print(f"ERROR: ny binary not found at {NY_BIN}")
-        print("Run: cargo build --release")
+        print("Run: targo --unverified build --release")
         return 1
 
     required_models = (

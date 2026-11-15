@@ -17,7 +17,7 @@ use crate::bounds::{GraphAlphaState, LinearBounds};
 pub(super) type MultiObjBounds = (Vec<(f32, f32)>, Option<LinearBounds>);
 
 /// Shared queue carrier for conjunctive and disjunctive multi-objective
-/// input splitting. Part of #4116 Packet B0.
+/// input splitting.
 #[derive(Debug, Clone)]
 pub(super) struct MultiObjInputDomain {
     pub(super) input_bounds: Arc<BoundedTensor>,
@@ -25,15 +25,14 @@ pub(super) struct MultiObjInputDomain {
     /// CROWN linear bounds for sensitivity-based split dimension selection.
     /// Shape: lower_a/upper_a are (num_specs, input_dim). The split scorer
     /// applies the SB heuristic across spec rows, including per-spec margin
-    /// weighting when objective bounds are available (#1074).
+    /// weighting when objective bounds are available.
     pub(super) linear_bounds: Option<LinearBounds>,
     pub(super) depth: usize,
     pub(super) priority: f32,
     /// When true, this domain still needs CROWN/IBP bounding (deferred from
-    /// batch creation). Part of #4116 Packet B0; consumed in Packet B1.
+    /// batch creation).
     pub(super) needs_bounding: bool,
     /// Optional child-local node bounds override for complete-clip recompute.
-    /// Part of #4116 Packet B0; consumed in Packet B1.
     pub(super) node_bounds_override: Option<Arc<HashMap<String, BoundedTensor>>>,
     /// Parent-refined α slopes used to warm-start per-sub-domain α refinement
     /// (`input_split_alpha_iteration > 0`). `None` (the default) keeps the
@@ -55,7 +54,7 @@ impl PartialOrd for MultiObjInputDomain {
 impl Ord for MultiObjInputDomain {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // NaN-priority domains surface first via cmp_input_domain_priority.
-        // Fixes #3442: was partial_cmp().unwrap_or(Equal), hiding NaN domains.
+        // Not partial_cmp().unwrap_or(Equal), which would hide NaN domains.
         cmp_input_domain_priority(self.priority, other.priority)
     }
 }

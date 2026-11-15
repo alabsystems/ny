@@ -16,9 +16,7 @@ use tracing::debug;
 
 use crate::{BatchedLinearBounds, LinearBounds};
 
-use super::super::bounds::batched_constant_bounds_from_output;
 use super::super::layer::SoftmaxLayer;
-use crate::layers::common::BoundPropagation;
 
 impl SoftmaxLayer {
     /// Batched CROWN backward propagation through Softmax with pre-activation bounds.
@@ -57,8 +55,8 @@ impl SoftmaxLayer {
                 || pre_activation.upper().iter().any(|&v| !v.is_finite());
             if has_non_finite {
                 debug!("Softmax sound mode: non-finite pre-activation bounds; falling back to IBP constant bounds (batched)");
-                let output_bounds = self.propagate_ibp(pre_activation)?;
-                return batched_constant_bounds_from_output(bounds, &output_bounds);
+                // The per-group sound route retains and charges coefficient
+                // error even when its logit box is non-finite.
             }
             debug!("Softmax sound mode: using LSE-based affine bounds (batched)");
             return self.propagate_linear_batched_with_bounds_sound(bounds, pre_activation);
@@ -204,8 +202,8 @@ impl SoftmaxLayer {
             .collect();
         let out_b_shape: Vec<usize> = batch_dims.iter().cloned().chain([out_dim]).collect();
 
-        // CROWN backward NaN firewall (#2812): conservative fallback instead of hard error.
-        // Reassembled from per-batch heuristic results (#3033).
+        // CROWN backward NaN firewall: conservative fallback instead of hard error.
+        // Reassembled from per-batch heuristic results.
         BatchedLinearBounds::new_or_conservative(
             ArrayD::from_shape_vec(IxDyn(&out_a_shape), new_lower_a_vec)
                 .map_err(|_| NyError::InvalidSpec("Cannot reshape new_lower_a".to_string()))?,
@@ -301,6 +299,24 @@ impl SoftmaxLayer {
             .into_shape_with_order((total_batch, out_dim))
             .map_err(|_| NyError::InvalidSpec("Cannot reshape upper_b for softmax".to_string()))?;
 
+        let lower_error = bounds
+            .lower_a_err
+            .as_ref()
+            .map(|e| {
+                e.view()
+                    .into_shape_with_order((total_batch, out_dim, softmax_size))
+                    .map_err(|_| NyError::InvalidSpec("batched softmax error shape".into()))
+            })
+            .transpose()?;
+        let upper_error = bounds
+            .upper_a_err
+            .as_ref()
+            .map(|e| {
+                e.view()
+                    .into_shape_with_order((total_batch, out_dim, softmax_size))
+                    .map_err(|_| NyError::InvalidSpec("batched softmax error shape".into()))
+            })
+            .transpose()?;
         let mut new_lower_a = Array3::<f32>::zeros((total_batch, out_dim, softmax_size));
         let mut new_upper_a = Array3::<f32>::zeros((total_batch, out_dim, softmax_size));
         let mut new_lower_b = Array2::<f32>::zeros((total_batch, out_dim));
@@ -309,15 +325,22 @@ impl SoftmaxLayer {
         for b in 0..total_batch {
             let pre_lower = pre_lower_flat.row(b).to_owned();
             let pre_upper = pre_upper_flat.row(b).to_owned();
-            let group_bounds = LinearBounds::new_or_conservative(
+            let mut group_bounds = LinearBounds::new_or_conservative(
                 lower_a.slice(s![b, .., ..]).to_owned(),
                 lower_b.row(b).to_owned(),
                 upper_a.slice(s![b, .., ..]).to_owned(),
                 upper_b.row(b).to_owned(),
             )?;
 
-            let result =
+            group_bounds.lower_a_err = lower_error
+                .as_ref()
+                .map(|e| e.slice(s![b, .., ..]).to_owned());
+            group_bounds.upper_a_err = upper_error
+                .as_ref()
+                .map(|e| e.slice(s![b, .., ..]).to_owned());
+            let mut result =
                 self.propagate_linear_with_bounds_1d_sound(&group_bounds, &pre_lower, &pre_upper)?;
+            super::grouped_sound::fold_group_coeff_err(&mut result, pre_lower, pre_upper)?;
 
             new_lower_a
                 .slice_mut(s![b, .., ..])
@@ -342,7 +365,7 @@ impl SoftmaxLayer {
         let (upper_b_vec, _) = new_upper_b.into_raw_vec_and_offset();
 
         // Validated construction: reassembled from per-batch sound results,
-        // NaN firewall catches corruption during reassembly (#3033).
+        // NaN firewall catches corruption during reassembly.
         BatchedLinearBounds::new_or_conservative(
             ArrayD::from_shape_vec(IxDyn(&out_a_shape), lower_a_vec)
                 .map_err(|_| NyError::InvalidSpec("Cannot reshape new_lower_a".to_string()))?,
@@ -447,7 +470,7 @@ impl SoftmaxLayer {
         let group_lower_b = lower_b_1d.mapv(|v| next_down_f32(v * inv_groups));
         let group_upper_b = upper_b_1d.mapv(|v| next_up_f32(v * inv_groups));
 
-        // f64 bias accumulators to prevent catastrophic cancellation (#2336, #1745).
+        // f64 bias accumulators to prevent catastrophic cancellation.
         // Pattern matches non-batched softmax backward at mod.rs:217-272.
         let mut new_lower_b_f64 = Array1::<f64>::zeros(out_dim);
         let mut new_upper_b_f64 = Array1::<f64>::zeros(out_dim);
@@ -484,7 +507,7 @@ impl SoftmaxLayer {
             }
         }
 
-        // Directed rounding on f64→f32 downcast (#2489, #2336):
+        // Directed rounding on f64→f32 downcast:
         let new_lower_b = new_lower_b_f64.mapv(|v| next_down_f32(v as f32));
         let new_upper_b = new_upper_b_f64.mapv(|v| next_up_f32(v as f32));
 
@@ -504,130 +527,55 @@ impl SoftmaxLayer {
         bounds: &BatchedLinearBounds,
         pre_activation: &BoundedTensor,
     ) -> Result<BatchedLinearBounds> {
-        let pre_shape = pre_activation.shape();
-        let a_shape = bounds.lower_a.shape();
-
-        let out_dim = a_shape[0];
-        let total_in = a_shape[1];
-        let softmax_size = *pre_shape.last().unwrap_or(&0);
-        let num_groups = total_in / softmax_size;
-
-        debug!(
-            "Softmax flat-grouped sound: out_dim={}, total_in={}, softmax_size={}, num_groups={}",
-            out_dim, total_in, softmax_size, num_groups
-        );
-
-        let pre_lower_2d = pre_activation
-            .lower()
-            .view()
-            .into_shape_with_order((num_groups, softmax_size))
-            .map_err(|e| {
-                NyError::InvalidSpec(format!(
-                    "Softmax flat-grouped sound: reshape pre_lower failed: {e}"
-                ))
-            })?
-            .to_owned();
-        let pre_upper_2d = pre_activation
-            .upper()
-            .view()
-            .into_shape_with_order((num_groups, softmax_size))
-            .map_err(|e| {
-                NyError::InvalidSpec(format!(
-                    "Softmax flat-grouped sound: reshape pre_upper failed: {e}"
-                ))
-            })?
-            .to_owned();
-
-        let lower_a_2d = bounds
+        let la = bounds
             .lower_a
-            .view()
-            .into_shape_with_order((out_dim, total_in))
-            .map_err(|e| {
-                NyError::InvalidSpec(format!(
-                    "Softmax flat-grouped sound: reshape lower_a failed: {e}"
-                ))
-            })?;
-        let upper_a_2d = bounds
+            .clone()
+            .into_dimensionality::<ndarray::Ix2>()
+            .map_err(|_| NyError::InvalidSpec("flat softmax coefficients must be 2-D".into()))?;
+        let ua = bounds
             .upper_a
-            .view()
-            .into_shape_with_order((out_dim, total_in))
-            .map_err(|e| {
-                NyError::InvalidSpec(format!(
-                    "Softmax flat-grouped sound: reshape upper_a failed: {e}"
-                ))
-            })?;
-
-        let lower_b_1d = bounds
+            .clone()
+            .into_dimensionality::<ndarray::Ix2>()
+            .map_err(|_| NyError::InvalidSpec("flat softmax coefficients must be 2-D".into()))?;
+        let lb = bounds
             .lower_b
-            .view()
-            .into_shape_with_order(out_dim)
-            .map_err(|e| {
-                NyError::InvalidSpec(format!(
-                    "Softmax flat-grouped sound: reshape lower_b failed: {e}"
-                ))
-            })?
-            .to_owned();
-        let upper_b_1d = bounds
+            .clone()
+            .into_dimensionality::<ndarray::Ix1>()
+            .map_err(|_| NyError::InvalidSpec("flat softmax bias must be 1-D".into()))?;
+        let ub = bounds
             .upper_b
-            .view()
-            .into_shape_with_order(out_dim)
-            .map_err(|e| {
-                NyError::InvalidSpec(format!(
-                    "Softmax flat-grouped sound: reshape upper_b failed: {e}"
-                ))
-            })?
-            .to_owned();
-
-        let inv_groups = 1.0 / num_groups as f32;
-        let group_lower_b = lower_b_1d.mapv(|v| next_down_f32(v * inv_groups));
-        let group_upper_b = upper_b_1d.mapv(|v| next_up_f32(v * inv_groups));
-
-        let mut new_lower_a = Array2::<f32>::zeros((out_dim, total_in));
-        let mut new_upper_a = Array2::<f32>::zeros((out_dim, total_in));
-        // f64 bias accumulators to prevent catastrophic cancellation (#2336, #1745).
-        // Pattern matches non-batched softmax backward at mod.rs:217-272.
-        let mut new_lower_b_f64 = Array1::<f64>::zeros(out_dim);
-        let mut new_upper_b_f64 = Array1::<f64>::zeros(out_dim);
-
-        for g in 0..num_groups {
-            let col_start = g * softmax_size;
-            let col_end = col_start + softmax_size;
-
-            let group_la = lower_a_2d.slice(s![.., col_start..col_end]).to_owned();
-            let group_ua = upper_a_2d.slice(s![.., col_start..col_end]).to_owned();
-
-            let group_bounds = LinearBounds::new_or_conservative(
-                group_la,
-                group_lower_b.clone(),
-                group_ua,
-                group_upper_b.clone(),
-            )?;
-
-            let result = self.propagate_linear_with_bounds_1d_sound(
-                &group_bounds,
-                &pre_lower_2d.row(g).to_owned(),
-                &pre_upper_2d.row(g).to_owned(),
-            )?;
-
-            for j in 0..out_dim {
-                for k in 0..softmax_size {
-                    new_lower_a[[j, col_start + k]] = result.lower_a()[[j, k]];
-                    new_upper_a[[j, col_start + k]] = result.upper_a()[[j, k]];
-                }
-                new_lower_b_f64[j] += result.lower_b()[j] as f64;
-                new_upper_b_f64[j] += result.upper_b()[j] as f64;
-            }
-        }
-
-        // Directed rounding on f64→f32 downcast (#2489, #2336):
-        let new_lower_b = new_lower_b_f64.mapv(|v| next_down_f32(v as f32));
-        let new_upper_b = new_upper_b_f64.mapv(|v| next_up_f32(v as f32));
-
+            .clone()
+            .into_dimensionality::<ndarray::Ix1>()
+            .map_err(|_| NyError::InvalidSpec("flat softmax bias must be 1-D".into()))?;
+        let mut linear = LinearBounds::new_or_conservative(la, lb, ua, ub)?;
+        linear.lower_a_err = bounds
+            .lower_a_err
+            .as_ref()
+            .map(|e| {
+                e.clone()
+                    .into_dimensionality::<ndarray::Ix2>()
+                    .map_err(|_| NyError::InvalidSpec("flat softmax error shape".into()))
+            })
+            .transpose()?;
+        linear.upper_a_err = bounds
+            .upper_a_err
+            .as_ref()
+            .map(|e| {
+                e.clone()
+                    .into_dimensionality::<ndarray::Ix2>()
+                    .map_err(|_| NyError::InvalidSpec("flat softmax error shape".into()))
+            })
+            .transpose()?;
+        let result = self.propagate_grouped_sound(
+            &linear,
+            pre_activation,
+            pre_activation.shape().len() - 1,
+        )?;
         BatchedLinearBounds::new_or_conservative(
-            new_lower_a.into_dyn(),
-            new_lower_b.into_dyn(),
-            new_upper_a.into_dyn(),
-            new_upper_b.into_dyn(),
+            result.lower_a.into_dyn(),
+            result.lower_b.into_dyn(),
+            result.upper_a.into_dyn(),
+            result.upper_b.into_dyn(),
             bounds.input_shape.clone(),
             bounds.output_shape.clone(),
         )

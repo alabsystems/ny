@@ -10,8 +10,8 @@ use ny_core::{nan_propagating_max, NyError, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::pgd_attack::{
-    AdamClippingParams, ExactVjpPgdConfig, PgdAlphaMode, PgdConfig, PgdInitialization,
-    PgdOptimizer, GAMA_LAMBDA_DEFAULT,
+    AdamClippingParams, ExactVjpPgdConfig, OpenDisjunctAttackConfig, PgdAlphaMode, PgdConfig,
+    PgdInitialization, PgdOptimizer, GAMA_LAMBDA_DEFAULT,
 };
 use crate::AlphaCrownConfig;
 
@@ -23,10 +23,17 @@ use crate::beta_crown::branching::BranchingHeuristic;
 
 /// Authority requested from a verification run.
 ///
-/// `CertificateExport` is the fail-closed default: a proof lane that cannot be
-/// represented by the current external certificate format must decline verdict
-/// authority. `VerdictOnly` is an explicit request to produce only the runtime
-/// verdict, as used by the scored VNN-COMP entry point.
+/// `CertificateExport` is the fail-closed LIBRARY default: a proof lane that
+/// cannot be represented by the current external certificate format must
+/// decline verdict authority. `VerdictOnly` is an explicit request to produce
+/// only the runtime verdict.
+///
+/// #soundness-spine M2a: the CLI frontends no longer derive this from a
+/// "competition mode". It is the engine-side switch of `--require-certificate`
+/// alone (`ProofOpts::verification_artifact_authority`): both proof profiles
+/// run `VerdictOnly` unless that flag is given, so a Proof-profile run no
+/// longer refuses verdicts the lanes certified at runtime. The proof profile
+/// never reaches this value.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationArtifactAuthority {
@@ -66,6 +73,14 @@ pub struct BetaCrownConfig {
     /// freeze boundary.
     #[serde(skip)]
     pub frozen_levers: Option<std::sync::Arc<ny_levers::LeverSet>>,
+    /// Shared original-query optional-work owner; clones never renew its attempt.
+    #[serde(skip)]
+    pub certified_root_cut_owner:
+        Option<std::sync::Arc<super::super::certified_root_cut::QueryOwner>>,
+    /// Set only by the frontend that loaded this graph with PreserveRaw.
+    /// Deserialization cannot authorize a default-folded graph.
+    #[serde(skip)]
+    pub certified_root_cut_raw_source: bool,
     /// Maximum number of domains to explore before giving up.
     #[serde(default = "default_max_domains")]
     pub max_domains: usize,
@@ -74,8 +89,6 @@ pub struct BetaCrownConfig {
     /// When the queue exceeds this limit, the lowest-priority domains are evicted
     /// to prevent unbounded memory growth during BaB on hard verification instances.
     /// Set to 0 to disable the cap (unbounded queue, original behavior).
-    ///
-    /// Reference: Issue #2326 Finding 1
     #[serde(default = "default_max_queue_size")]
     pub max_queue_size: usize,
     /// Estimated payload cap in bytes for supported graph BaB frontiers.
@@ -110,6 +123,153 @@ pub struct BetaCrownConfig {
     /// Maximum depth of the search tree (max number of splits).
     #[serde(default = "default_max_depth")]
     pub max_depth: usize,
+
+    /// #budget-abandonment FIX A. When the ITERATIVE root α-CROWN warmup blows
+    /// its `phase_budget.initial_bounds_fraction` cap while the global BaB
+    /// deadline is still live, fall back to a root enclosure the mandatory
+    /// bootstrap sweep ALREADY produced instead of returning `Unknown` and
+    /// abandoning the remaining budget.
+    ///
+    /// Measured at HEAD on 14_ieee_ml4acopf: the bootstrap ran 0 -> 121.0 s
+    /// against a 114 s warmup cap and the row returned `Unknown` with 449 s of
+    /// its 600 s budget unspent, BaB never started. The work was already in
+    /// hand when it was thrown away: `compute_relu_split_initial_bounds`
+    /// completes `compute_graph_bab_bootstrap` FIRST and only then calls
+    /// `compute_graph_root_output_bounds`, whose `?` discarded
+    /// `bootstrap.initial_node_bounds` along with the error.
+    ///
+    /// SOUND BY MONOTONICITY: the fallback enclosure is WIDER than the
+    /// optimized one, and both `domain_is_verified_for_mode` and
+    /// `domain_is_violation_for_mode` are harder to satisfy on a wider
+    /// interval, so a looser root can mint neither an `unsat` nor a spurious
+    /// violation — only more search.
+    ///
+    /// `false` (the shipped default, and the state of every yaml) is
+    /// byte-identical to the behaviour before the key existed.
+    #[serde(default)]
+    pub initial_bounds_warmup_fallback: bool,
+
+    /// #budget-abandonment FIX B. Number of EXTRA passes the disjunctive
+    /// multi-clause loop may make over the clauses it failed to decide.
+    ///
+    /// The per-clause budget allocator is one pass and back-loads the budget
+    /// (`verify/disjunctive.rs`: `remaining / remaining_bab`), so the FIRST
+    /// clauses get the SMALLEST slice and the failures concentrate exactly
+    /// there. Measured on 14_ieee_ml4acopf prop1 (56 OR-clauses): clause 1
+    /// received 10 s and died; clause 56 received 442 s and used 2.1 s; the
+    /// row ended with 470 s of 600 unspent.
+    ///
+    /// `0` (the shipped default) is today's single pass, byte-identical.
+    #[serde(default)]
+    pub disjunctive_clause_retry_passes: usize,
+
+    /// #disjunctive-shared-bootstrap. Compute the graph BaB bootstrap
+    /// (intermediate node bounds, root alpha state, identity-spec root output
+    /// box) ONCE per serial multi-clause disjunction and hand every clause an
+    /// immutable `Arc` of it instead of re-running it per clause.
+    ///
+    /// The serial disjunctive loop (`verify/disjunctive.rs`) calls the graph
+    /// ReLU-split engine once per OR-clause, and every call re-runs
+    /// `compute_graph_bab_bootstrap` + `compute_graph_root_output_bounds`
+    /// from scratch. Measured 2026-09-12 on 14_ieee_ml4acopf prop4 (28
+    /// clauses, 600 s): `Computing alpha-CROWN initial bounds (200
+    /// iterations)` printed once PER CLAUSE and `[warmup-fallback]` fired on
+    /// every clause at 6.3-7.5 s against a 5.0 s cap, so the row spent ~7 s x
+    /// 28 recomputing the SAME intermediate bounds. The clauses differ only in
+    /// their output constraint; the network's intermediate enclosures over the
+    /// property's input box do not depend on it.
+    ///
+    /// SOUND BY CONSTRUCTION: the shared node bounds, root alpha and identity
+    /// output box are valid enclosures of the same network over the same input
+    /// box for every clause -- exactly what each per-clause bootstrap computed
+    /// before. What is NEVER shared: a clause's own per-clause input box
+    /// (`per_clause_input_bounds` non-empty => that clause re-bootstraps on its
+    /// own box), INVPROP-conditioned node bounds (the cache is refused outright
+    /// when `alpha_config.invprop.enabled`), and any state a clause's BaB
+    /// mutates (split constraints, beta, cuts, the domain queue) -- those are
+    /// built per clause from a clone of the shared map, as the existing
+    /// precomputed lane already does. Each clause's root objective bound is
+    /// the projection of the shared identity output box (what the per-clause
+    /// path computes) INTERSECTED with one spec-guided CROWN pass run with the
+    /// shared root alpha slopes -- two certified enclosures of one scalar --
+    /// and its BaB children warm-start from those slopes, as the per-clause
+    /// lane's do. What is NOT reproduced is the per-clause warmup's
+    /// spec-guided early exit, which only ever stopped a warmup SOONER.
+    ///
+    /// Refusals are named in the `[shared-bootstrap]` line: `dark`,
+    /// `sequential`, `route` (only ReLU-split without gpu_bab reads the
+    /// precomputed slot), `invprop`, `single`, `expired`, `declined` (the
+    /// shared root pass blew its cap and FIX A is not armed), `error`. Every
+    /// refusal runs the per-clause bootstrap exactly as before.
+    ///
+    /// `false` (the shipped default, and the state of every yaml) is
+    /// byte-identical to the per-clause bootstrap.
+    #[serde(default)]
+    pub disjunctive_shared_bootstrap: bool,
+
+    /// #genbab-precomputed-lane. Let the PRECOMPUTED-BOUNDS BaB lane
+    /// (`verify_graph_relu_split_with_bounds`) honour a configured GenBaB
+    /// nonlinear branching heuristic, as every other BaB lane already does.
+    ///
+    /// THE DEFECT THIS EXISTS FOR. `relu_split_bounds.rs` is the only BaB lane
+    /// that never reads `branching_heuristic`. It goes straight to
+    /// `find_unstable_graph_neurons`, which scores ReLU nodes only. The
+    /// sequential lane's `process_sequential_domains` instead checks
+    /// `BranchingHeuristic::GenBaB(_)` FIRST and routes to
+    /// `process_graph_domain_parallel`, which can split a nonlinear node.
+    ///
+    /// On a benchmark whose branching is `method: nonlinear` and whose ReLUs
+    /// are all stable -- ml4acopf, whose real branching targets `MulBinary`
+    /// power-flow products -- the precomputed lane therefore finds NOTHING to
+    /// split, sets `unresolved_due_to_no_branch`, and returns. Measured on
+    /// `14_ieee_ml4acopf prop1` clause 39: the lane printed
+    /// `Found 3 ReLU nodes for branching`, performed ZERO splits, and returned
+    /// in ~48 MICROSECONDS while holding a 562 s allowance; the row published
+    /// `unknown` with 98.0 % of its 600 s budget unspent. The sequential lane's
+    /// same clause split to the 10000 depth cap using 192 s.
+    ///
+    /// SOUND EITHER WAY: branching only decides which sound sub-box to bound
+    /// next, never a verdict -- the same argument `configs/vnncomp26/
+    /// ml4acopf_2024.yaml` already makes for `method: nonlinear` itself. The
+    /// enqueue/verify/violation fold is not reimplemented here; this routes
+    /// through the SAME `aggregate_bab_results` the sequential lane uses, so
+    /// the two cannot disagree about what a domain result means.
+    ///
+    /// SCOPE OF A NEARBY DIVERGENCE — stated precisely, because a first pass
+    /// got it wrong in the cautious direction and an overstated warning is its
+    /// own kind of false claim. This lane has a SECOND divergence from the
+    /// others: **its own inline child bounding never optimises beta or
+    /// alpha.** Every other BaB lane bounds children through
+    /// `evaluate_graph_child_bounds` (`graph/propagation/beta.rs`), whose gate
+    /// is `beta_iterations > 0 && child.depth <= beta_max_depth` and which then
+    /// runs the analytical or SPSA optimiser — `relu_split/child_eval.rs`,
+    /// `gpu_bab/batched_gpu.rs`, `gpu_bab/kfsb.rs`,
+    /// `multi_objective/domain_process.rs`, `batched/batched_single.rs`. This
+    /// lane instead calls `propagate_crown_with_graph_beta`, which is a pure
+    /// forward to `propagate_crown_with_graph_constraints`: ONE pass, zero
+    /// optimiser iterations, carrying only the parent's inherited multipliers.
+    /// It never reads `beta_max_depth` at all, and consumes `beta_iterations`
+    /// once at the root as a bool.
+    ///
+    /// BUT IT DOES NOT APPLY TO THIS ROUTE. The GenBaB arm added here ends in
+    /// `continue`, so the lane's inline child bounding is never reached on it.
+    /// `process_graph_domain_parallel` bounds ITS children through
+    /// `evaluate_graph_child_bounds` — the optimising evaluator, gated
+    /// `beta_iterations > 0 && depth <= beta_max_depth` — and additionally
+    /// optimises a no-unstable LEAF regardless of those knobs, using
+    /// `max(beta_iterations, root_beta_iterations)` as the leaf budget
+    /// (`multi_objective/domain_process.rs`). So with
+    /// `configs/vnncomp25/ml4acopf_2024.yaml`'s `iterations: 50`, children on
+    /// THIS route are optimised.
+    ///
+    /// The divergence still bites the lane's ReLU-split path, which is what a
+    /// reader arming this key on some OTHER benchmark should know: there,
+    /// fifty beta iterations per child really are discarded. Fixing that is a
+    /// separate change to lines that this key does not touch.
+    ///
+    /// `false` (the shipped default) keeps the lane byte-identical.
+    #[serde(default)]
+    pub genbab_on_precomputed_lane: bool,
     /// Use α-CROWN optimization within each domain.
     #[serde(default = "default_use_alpha_crown")]
     pub use_alpha_crown: bool,
@@ -186,13 +346,277 @@ pub struct BetaCrownConfig {
     #[serde(default)]
     pub max_crown_ibp_nodes: Option<usize>,
     /// Floor (seconds) for CROWN-IBP collectors' per-node time budget
-    /// (#4413, #cgan-bn11-budget). A node whose share
+    /// (#cgan-bn11-budget). A node whose share
     /// falls below the floor is skipped to sound IBP. `None` (default) keeps
     /// the built-in 2.0 s constant — behavior is unchanged when unset.
     #[serde(default)]
     pub crown_ibp_per_node_floor_secs: Option<f64>,
+    /// #per-node-floor-dim-scale: scale the CROWN-IBP per-node floor by
+    /// `min(1, raw_node_dims / 28,800)` before the below-floor comparison, so
+    /// the constant calibrated for 28,800-row conv targets stops refusing
+    /// 20/118/128-wide dense nodes whose whole backward costs milliseconds.
+    /// Composes with `crown_ibp_per_node_floor_secs` (whatever floor resolves
+    /// is scaled). `false` (default) keeps the constant floor EXACTLY.
+    /// Scheduling only: an admitted target publishes CROWN-IBP instead of
+    /// IBP, both sound, the former tighter-or-equal.
+    #[serde(default)]
+    pub crown_ibp_per_node_floor_dim_scaled: bool,
+    /// #pwl-lookup (preset `bab.pwl_lookup_exact_range`): intersect the IBP
+    /// box of every ReLU LOOKUP TABLE output — `SubConstant(b) → ReLU →
+    /// Linear(W ∈ R^{1×K})` (ONNX `MatMul(relu, w[K])`) or `→ MulConstant(w)
+    /// → ReduceSum(-1)` — with the table's EXACT 1-D range, evaluated at the
+    /// interval endpoints and interior breakpoints in outward-rounded f64. The
+    /// verifier stamps it onto the loaded graph
+    /// (`GraphNetwork::set_pwl_lookup_exact_range`), where both the IBP
+    /// fast-path forward and the node-bound collector read it.
+    ///
+    /// SOUND: a shrink-only intersection of two enclosures of the same value;
+    /// an empty intersection keeps the plain box (fail closed). It can only
+    /// tighten a bound, so `unknown -> unsat` is reachable and `unsat -> sat`
+    /// is not. `false` (default) is byte-identical. MEASUREMENT target:
+    /// ml4acopf_2024 prop3/prop4 on the six `-linear-*` nets (12 rows/year).
+    #[serde(default)]
+    pub pwl_lookup_exact_range: bool,
+    /// #fwd-root-screen (V4, preset `bab.forward_root_screen`): before the
+    /// disjunctive CROWN precheck, run ONE certified correlation-preserving
+    /// zonotope forward pass over the root input box (`zono_core::dag`:
+    /// explicit symbol IDs, ID-aligned products, rigorous Sigmoid/Sin/Cos/Floor
+    /// and lookup-table bands, one fresh symbol per unstable ReLU, every
+    /// relaxation interval intersected with ny's IBP box and C1's exact range,
+    /// binary64 with explicit Higham charges and outward endpoints) and refute
+    /// every clause its certified output box rules out.
+    ///
+    /// SOUND: the verdict is the UNION with the existing precheck — the screen
+    /// only adds individually certified refutations and never replaces
+    /// IBP/C1. Any unsupported op, NaN/Inf, byte cap or deadline declines (no
+    /// clause refuted by it). `false` (default) is byte-identical: no work, no
+    /// output. MEASUREMENT target: the four ml4acopf rows F1 verified with the
+    /// ZONO replica (14 base p1, 118 lin-res p5, 300 lin-nonres/lin-res p105).
+    #[serde(default)]
+    pub forward_root_screen: bool,
+    /// #fwd-root-screen live-state ceiling in MiB (preset
+    /// `bab.forward_root_screen_max_mb`, default 8192, admissible
+    /// `64..=1048576`; 0 is refused, never "unlimited"). The admitted budget is
+    /// additionally clamped to half the process memory headroom.
+    #[serde(default = "default_forward_root_screen_max_mb")]
+    pub forward_root_screen_max_mb: u32,
+    /// #vit-zono-root (VIBECHECK I1, preset `bab.vit_zono_root`): compute ONE
+    /// certified forward-zonotope ROOT map over the input box
+    /// (`zono_core::vit_root`, the `zono_core::dag` program with the vit op set:
+    /// live-live MatMul with a certified remainder symbol, Exp / Reciprocal /
+    /// Clip bands, ReduceSum / ReduceMean, the direct-Softmax pairwise box,
+    /// BatchNorm with certified radii, Conv2d, the probed data movement) and
+    /// intersect its per-node boxes SHRINK-ONLY into the alpha reference map
+    /// the root CROWN / alpha-margin pass reads (also the CROWN-IBP collector's
+    /// baseline on the `fix_interm_bounds: false` route).
+    ///
+    /// SOUND: every node box is a certified enclosure (binary64, explicit
+    /// Higham charges, outward endpoints, explicit symbol IDs) intersected with
+    /// ny's IBP box; a runtime self-check (program point semantics vs ny's
+    /// pointwise forward, sampled containment) must pass before anything is
+    /// published; merges are shrink-only and a disjoint element keeps the
+    /// current value. Any refusal publishes nothing. `false` (default) is
+    /// byte-identical: no plan is stamped, no work, no output. MEASUREMENT
+    /// target: vit_2023 (27 ibp root rows, 44 pgd root rows abc proves).
+    #[serde(default)]
+    pub vit_zono_root: bool,
+    /// #vit-zono-root live-state ceiling in MiB (preset
+    /// `bab.vit_zono_root_max_mb`, default 8192, admissible `64..=1048576`; 0
+    /// is refused, never "unlimited"). The admitted budget is additionally
+    /// clamped to half the process memory headroom (no cgroup governor in
+    /// competition).
+    #[serde(default = "default_vit_zono_root_max_mb")]
+    pub vit_zono_root_max_mb: u32,
+    /// #vit-zono-root wall cap of one root-map computation in seconds (preset
+    /// `bab.vit_zono_root_max_secs`, default 30, admissible `(0, 3600]`),
+    /// additionally bounded by the collection deadline.
+    #[serde(default = "default_vit_zono_root_max_secs")]
+    pub vit_zono_root_max_secs: f32,
+    /// #vit-collector-throughput P2 step 1 (typed `bab.bilinear_rowpar_kernel`):
+    /// run the var×var `MatMul` / `BilinearCrown` McCormick backward (both the
+    /// midpoint arm and the interpolated α arm) row-parallel, with each
+    /// element's McCormick planes computed once per chunk of rows instead of
+    /// once per row. BIT-IDENTICAL to the serial nest (rows are independent and
+    /// every row keeps its exact operation sequence;
+    /// `bilinear_rowpar_bit_identical_to_serial`). Throughput only. `false`
+    /// (default) keeps the serial nest. Delivered to the kernels through
+    /// `layers::collector_kernels::arm` when a `BetaCrownVerifier` is built.
+    #[serde(default)]
+    pub bilinear_rowpar_kernel: bool,
+    /// #vit-collector-throughput P3 (typed `bab.linear_position_stack`): run a
+    /// sequence Linear's certified f64 `A·W` as ONE product over every token
+    /// position instead of one per position. Bit-identical on the CPU reducer;
+    /// a stacked product large enough for the sound f64 engine is sound through
+    /// the same summation-order-independent `gamma_n * S` certificate but not
+    /// bit-identical. `false` (default) keeps the per-position loop.
+    #[serde(default)]
+    pub linear_position_stack: bool,
+    /// #vit-collector-throughput P4 (typed `bab.reciprocal_unbounded_upper`):
+    /// relax `1/x` on `[l, +inf)` (`l > 0` finite) by `0 <= y <= next_up(1/l)`
+    /// instead of refusing, and refuse every remaining out-of-domain
+    /// pre-activation with `UnsupportedOp` (a per-target IBP fallback in every
+    /// collector) instead of `InvalidSpec` (which aborted vit_2023's pgd rows).
+    /// `false` (default) keeps the historical guard and error class exactly.
+    #[serde(default)]
+    pub reciprocal_unbounded_upper: bool,
+    /// #vit-batched-bilinear (ENGINE_PROGRAM V1; typed
+    /// `bab.bilinear_gemm_kernel`): run the var×var `MatMul` / `BilinearCrown`
+    /// McCormick backward (midpoint and α arms) as the batched, GEMM-shaped
+    /// kernel (`layers/binary_ops/matmul/crown_gemm.rs`): every element's
+    /// planes computed once per call, rows in parallel chunks and tiles,
+    /// sign-selected rank-1 panel updates. BIT-IDENTICAL to the serial nest
+    /// (every accumulator keeps the nest's operation sequence;
+    /// `bilinear_gemm_bit_identical_to_serial`), so throughput only. Tried
+    /// before `bilinear_rowpar_kernel` when both are set. `false` (default)
+    /// keeps the historical choice. Delivered to the kernels through
+    /// `layers::collector_kernels::arm` when a `BetaCrownVerifier` is built.
+    #[serde(default)]
+    pub bilinear_gemm_kernel: bool,
+    /// #hull-root / #hull-bab (wave-6 C4): the certified single-hidden-layer
+    /// per-neuron hull bound in the sequential relational lane, run after the
+    /// upfront attack and before the same-LHS reduction. `Off` (default,
+    /// every shipped yaml) is byte-identical to the pre-key tree. `Root`
+    /// certifies the ideal per-neuron hull at the root with a closed form
+    /// whose soundness does not depend on the LP that proposes its
+    /// multipliers; `Bab` adds a ReLU-split tree over the concave neurons,
+    /// certified per node the same way. Either can only turn a timeout into
+    /// `unsat`, never flip a verdict. Observables: `[hull-root] armed ...`
+    /// (`root`) and `[hull-bab] armed ...` (`bab`) on every armed run.
+    #[serde(default)]
+    pub single_hidden_hull: SingleHiddenHullMode,
+    /// #graph-lane-search (ENGINE_PROGRAM §2 M7, preset `bab.graph_search`):
+    /// which UNTRUSTED batched α/β search the graph β-CROWN multi-objective
+    /// lane consults. `off` (default, every shipped yaml) never consults a
+    /// backend and is byte-identical to the pre-key tree. `cpu_f32` sends the
+    /// root (after the lane's own root objective pass) and each shared-executor
+    /// wave's open children (at most a fixed count per wave) to the injected
+    /// backend over the lane's self-checked `GraphSearchNet` copy, with the
+    /// lane's certified boxes frozen; the lane then ingests each hint through a
+    /// clamp gate (finite slopes in `[0, 1]` on neurons unstable in the
+    /// domain's CERTIFIED boxes, finite multipliers `>= 0` on the domain's own
+    /// split literals), certifies each domain ONCE with its existing evaluator
+    /// (`SpecCrownRequest` at the root, the β-CROWN multi-objective pass on a
+    /// child) and raises a row's LOWER bound only when the certified candidate
+    /// is strictly better. The device never certifies; a refusal or a search
+    /// bug leaves the lane's own bounds. Observables: `[bbe] phase=graph_bab
+    /// stage=root …` / `stage=wave …` and, on a disjoint root row, the
+    /// unconditional `[bbe-alarm] phase=graph_bab DISJOINT_SOUNDNESS_ALARM`.
+    #[serde(default)]
+    pub graph_search: GraphLaneSearch,
+    /// #la-warm-frontier (preset `bab.la_warm_frontier`): the FRONTIER-COMPLETE
+    /// lA warm start on DAG graphs. Armed, a capturing backward pass records,
+    /// at every node a split can name, the rest of its backward state at that
+    /// instant (every other pending block and the network-input channel, each
+    /// with its certified coefficient error folded outward), and a child whose
+    /// single-block seed the #warm-dag guard refuses RESUMES its backward pass
+    /// from its branch node's block plus that whole frontier (validated against
+    /// the child's rows and widths) instead of from the output. Residual /
+    /// multi-consumer nets (yolo, vit, soundnessbench residual models) regain
+    /// the warm start the guard took away. `false` (default, every shipped
+    /// yaml) is BIT-IDENTICAL to the guard-only tree: nothing is captured and
+    /// no seed site consults a frontier. Requires `enable_la_warm_start`.
+    /// SOUND for either value: the resumed bound is a bound on the objective
+    /// over the child's region (proof in
+    /// `engine/graph/propagation/warm_frontier.rs`); a missing or invalid
+    /// frontier takes the cold pass. Observable: one
+    /// `[la-warm-frontier] lane=… armed=1 captured=… resumed=…` line per armed
+    /// multi-objective / DomainList run.
+    #[serde(default)]
+    pub la_warm_frontier: bool,
+    /// #kfsb-single-shot (preset `bab.kfsb_single_shot`): the graph kFSB
+    /// selector (`gpu_bab/kfsb.rs::select_graph_branch_kfsb_in_gpu_batched`,
+    /// shared by the DomainList ReLU-split lane and the conjunctive
+    /// multi-objective sequential lane's aggregation-critical route) scores its
+    /// candidates the way αβ-CROWN's kFSB and this crate's own wave-batched
+    /// `kfsb_multi` selector do, instead of with two costly stand-ins:
+    ///
+    /// * PRESCORE: BaBSR seeded with the selector's OBJECTIVE row and stopped
+    ///   once every unstable ReLU node is scored, instead of the legacy
+    ///   identity seed over the WHOLE graph output (a 21125 x 21125 coefficient
+    ///   walk per decision on TinyYOLO);
+    /// * CHILD SIMULATION: ONE constrained CROWN pass per candidate child with
+    ///   the parent's inherited α/β, instead of the full β(+α) optimizer
+    ///   (`beta_iterations` + 1 passes per child at depth <= `beta_max_depth`).
+    ///
+    /// ADVISORY-ONLY either way: the selector only chooses WHICH ReLU to
+    /// partition; the committed children are bounded by the unchanged pipeline,
+    /// so the key cannot change the soundness of any published bound. `false`
+    /// (default, every shipped yaml) is BIT-IDENTICAL to the historical scorer.
+    /// Observable: one `[kfsb-single-shot] armed=1 …` line per armed decision.
+    #[serde(default)]
+    pub kfsb_single_shot: bool,
+    /// #attack-concurrent (preset `attack.concurrent`): run the verifier's
+    /// conjunctive / single-clause UPFRONT PGD (the graph and sequential
+    /// relational lanes' `upfront_pgd_deadline` slice) on a sibling thread,
+    /// in a private Rayon pool, CONCURRENTLY with the proof instead of before
+    /// it. The proof decides -> the attack is cancelled through its
+    /// `PgdConfig::cancel` token; the attack finds a counterexample -> the
+    /// candidate goes through the scored path's unchanged sat pipeline
+    /// (trusted-ORT gate, VNN-LIB 2.0 normalization) and, upheld, is published
+    /// first-verdict-wins under the #sat-precedence lock, ending the process.
+    ///
+    /// The attack's window is stretched so it receives at least the
+    /// CPU-seconds the serial slice gave it (`W = slice * (N + k_a) / k_a`),
+    /// and the lane stands down — today's serial code verbatim — whenever its
+    /// admission refuses (no scored publication target, the concurrent
+    /// margin-row lane owns concurrency, a shared accelerator, a Sign net, the
+    /// QDQ report-only latch, a stretched window that does not fit, a denied
+    /// memory lease). `false` (default, every shipped yaml) is BIT-IDENTICAL:
+    /// the site reads this one bool and runs the historical serial code.
+    /// SOUNDNESS: scheduling only — the proof is the unchanged code on the
+    /// unchanged deadlines, and a `sat` still passes the unchanged gate.
+    /// Observable: `[attack-concurrent] admit site=... route=...` and
+    /// `[attack-concurrent] done site=... outcome=...` on every armed site.
+    #[serde(default)]
+    pub attack_concurrent: bool,
+    /// Opt-in original-tower CPU point/VJP advice for shared-input relational
+    /// falsification. The CLI's early relational route projects this policy
+    /// from its frozen preset through the same applicator as ordinary configs.
+    /// Every proposal retains the original dual-source witness acceptance.
+    #[serde(default)]
+    pub relational_point_vjp: bool,
+    /// #relusplitter-lp-refine (wave-6 C7, preset
+    /// `bab.mip_refine_intermediates: {layers, budget_frac}`): at the
+    /// multi-objective graph BaB root, after the bootstrap and before the root
+    /// objective pass, refine the hidden pre-activation layers `1..=layers` of
+    /// a pure Linear/ReLU chain with RIGOROUS per-neuron triangle-LP bounds
+    /// (ny-mip `LpTightener`, Neumaier–Shcherbina or exact rational — never a
+    /// float LP optimum), layer-progressively, loosest triangle first, inside
+    /// `budget_frac` of the remaining root window; then intersect them
+    /// SHRINK-ONLY into the stored boxes that the root bound and every BaB
+    /// domain inherit. Vibecheck's recipe is `layers: 3` (its MILP is replaced
+    /// by the certified LP). Layer 0 is affine in the input box and already
+    /// exact, so it is never re-solved.
+    ///
+    /// SOUND: every published bound is a rigorous outer bound of an LP whose
+    /// feasible set contains the true ReLU graph over sound boxes, and the
+    /// publication is an intersection, so `unknown -> unsat` is reachable and
+    /// `unsat -> sat` is not. `None` (default, every shipped yaml) attaches no
+    /// refiner: byte-identical. Observables: `[mip-refine] armed ...` when the
+    /// CLI attaches it and `[mip-refine] root ...` whenever the root runs it.
+    #[serde(default)]
+    pub mip_refine_intermediates: Option<MipRefineIntermediates>,
+    /// #vgg-gpu-crown (preset `bab.gpu_patches_crown: {chunk_rows, max_mb,
+    /// headroom_frac, gpu_tile_mb, precision, depth, screen, budget_frac,
+    /// max_secs, min_perturbed}`): before the graph BaB, run a certified
+    /// patches-mode CROWN root pass — CROWN intermediates for every ReLU
+    /// layer, intersected shrink-only into certified one-step screen boxes,
+    /// then the spec rows — whose coefficient products run on the sound GPU
+    /// GEMM engine (cuBLAS f64 or f32 with the a-posteriori `gamma * |A||B|`
+    /// certificate charged against the multiplied value's box), chunked
+    /// under host AND device memory admission, every refusal a bit-identical
+    /// CPU product. Built for `vggnet16_2022` spec15-17 (all 150528 pixels
+    /// perturbed).
+    ///
+    /// SOUND for any value: it can only return "every objective certified"
+    /// (`unknown -> unsat`), never `sat`; a refusal changes nothing. `None`
+    /// (default, every shipped yaml) runs nothing and prints nothing.
+    /// Observable: `[gpu-patches-crown] armed=1 layers= gpu_passes=
+    /// cpu_fallback= secs= peak_mb= ...` on every armed run.
+    #[serde(default)]
+    pub gpu_patches_crown: Option<crate::gpu_patches_crown::GpuPatchesCrownConfig>,
     /// Explicit base cap (seconds) on CROWN-IBP collectors' per-node time
-    /// budget (#4413, #cgan-bn11-budget). `None` derives an adaptive cap from
+    /// budget (#cgan-bn11-budget). `None` derives an adaptive cap from
     /// the remaining collection budget (25%, clamped to 12–600 seconds).
     /// Explicit caps are dimension-scaled above 28,800 rows. Purely a
     /// time-vs-tightness policy knob: any value is sound.
@@ -528,13 +952,13 @@ pub struct BetaCrownConfig {
     /// Number of gradient steps per restart.
     #[serde(default = "default_pgd_steps")]
     pub pgd_steps: usize,
-    /// Restart PGD when a projected step leaves the point unchanged (#4278).
+    /// Restart PGD when a projected step leaves the point unchanged.
     ///
     /// Reference: alpha-beta-CROWN `pgd_restart_when_stuck` in
     /// `abcrown_all_params.yaml:279` and `acasxu.yaml:20`.
     #[serde(default)]
     pub pgd_restart_when_stuck: bool,
-    /// PGD initialization strategy (#1449).
+    /// PGD initialization strategy.
     ///
     /// `Uniform` (default): standard random sampling.
     /// `Osi`: Output Specification Initialization for diverse restarts.
@@ -542,10 +966,10 @@ pub struct BetaCrownConfig {
     /// `initialization = "osi"` in `attack_interface.py:29-35`.
     #[serde(default)]
     pub pgd_initialization: PgdInitialization,
-    /// Number of OSI initialization steps (#1449). Default: 20.
+    /// Number of OSI initialization steps. Default: 20.
     #[serde(default = "default_pgd_osi_steps")]
     pub pgd_osi_steps: usize,
-    /// Enable the GAMA guidance loss for PGD attack steps (#1449).
+    /// Enable the GAMA guidance loss for PGD attack steps.
     ///
     /// Set by `attack_mode: diversed_GAMA_PGD` (together with OSI
     /// initialization). Relational-target attack steps then ascend
@@ -558,10 +982,10 @@ pub struct BetaCrownConfig {
     /// `GAMA_loss=True` in `attack_interface.py:29-35`.
     #[serde(default)]
     pub pgd_gama: bool,
-    /// PGD optimizer strategy (#4277).
+    /// PGD optimizer strategy.
     #[serde(default)]
     pub pgd_optimizer: PgdOptimizer,
-    /// PGD alpha/step-size policy (#4277).
+    /// PGD alpha/step-size policy.
     #[serde(default)]
     pub pgd_alpha_mode: PgdAlphaMode,
     /// Per-step exponential decay for the PGD/Adam learning rate.
@@ -596,6 +1020,23 @@ pub struct BetaCrownConfig {
     /// Default: 32768 (a 128×128 initial grid plus refinement for 2 dims).
     #[serde(default = "default_pgd_dense_sweep_points")]
     pub pgd_dense_sweep_points: usize,
+    /// Number of PGD restarts seeded at box corners (#attack-vertex-geometry,
+    /// preset key `attack.corner_seed_restarts`): restart 0 at the lower
+    /// corner, restart 1 at the upper corner, restarts `2..N` at random box
+    /// vertices. Maps to `PgdConfig::corner_seed_restarts`. Default 0 keeps
+    /// the historical seeding byte-for-byte. Attack-only: candidates are
+    /// re-validated before any `sat`, so this cannot affect soundness.
+    #[serde(default)]
+    pub pgd_corner_seed_restarts: usize,
+    /// Root-pruned, per-disjunct, many-restart attack stage
+    /// (#attack-open-disjuncts, preset keys `attack.open_disjunct_*`). Read
+    /// by the multi-clause disjunction route after its disjunctive attack
+    /// phase. Default `restrict: false`: the stage does not exist and the
+    /// route is byte-identical. Attack-only: every candidate passes the
+    /// unchanged confirmation funnel and the trusted-ORT gate, so this cannot
+    /// affect soundness.
+    #[serde(default)]
+    pub open_disjunct_attack: OpenDisjunctAttackConfig,
     /// Per-run exact-VJP graph attack policy.
     ///
     /// Runtime-only: scored VNN-COMP supplies it from the frozen entry-time
@@ -649,8 +1090,7 @@ pub struct BetaCrownConfig {
     /// Neuron selection ratio for complete clipping.
     ///
     /// **UNIMPLEMENTED**: Config is parsed and stored for preset compatibility
-    /// but no engine code reads this field yet. See design doc Step 7
-    /// (`designs/2026-03-10-issue-523-complete-clipping.md`).
+    /// but no engine code reads this field yet.
     ///
     /// When `input_clip_type == Complete`, intended to control what fraction of
     /// unstable neurons receive constrained concretization (LP-optimal bounds).
@@ -746,6 +1186,66 @@ pub struct BetaCrownConfig {
     /// value disables.
     #[serde(default)]
     pub mo_cuda_bounded_shared_executor: bool,
+    // --- Multi-objective containment fence (#vit-bank-gate) ---
+    /// Arm the downgrade-only containment fence on the multi-objective graph
+    /// BaB (`beta_crown::engine::graph::multi_objective::containment_fence_lane`).
+    ///
+    /// When true, the root's node and objective bounds are compared against a
+    /// sound f64 point walk at deterministic samples of the root box, and every
+    /// child a shared-executor wave returns is compared, on its certified
+    /// objective LOWER bounds, at every sample proved inside it. Any
+    /// separation returns `Unknown` instead of letting the run publish; the
+    /// fence never tightens, closes, or proves anything. It refuses to arm
+    /// (and prints why) under cuts, conflict clauses, interm-domain or relaxed
+    /// clipping, and on conjunctive runs, whose bounds are property-conditioned.
+    ///
+    /// Default false: every shipped preset is byte-identical. The vit_2023
+    /// bank gate is the intended first consumer (preset key
+    /// `bab.mo_containment_fence`).
+    ///
+    /// #vit-margin-alpha-complex (P8): when armed the fence also (a) checks a
+    /// ROOT-terminal `Verified` on the certified objective LOWER bounds it
+    /// rests on — not only the output enclosure — and FAILS CLOSED (returns
+    /// `Unknown`) when that authority could not be checked at all, and (b)
+    /// refuses a `Verified` whose BaB rested on any emptiness claim (an
+    /// infeasible child pair, sibling or NoUnstable domain, a construction-time
+    /// empty half-space), since an emptiness claim carries no bound to fence.
+    #[serde(default)]
+    pub mo_containment_fence: bool,
+    /// #vit-margin-alpha-complex (P8): adjudicate a ROOT-terminal
+    /// multi-objective `Verified` against an INDEPENDENT forward of the
+    /// original model (ONNX Runtime; ny-cli attaches the oracle only when this
+    /// key is set): at the fence's deterministic samples, every certified
+    /// objective lower bound must sit at or below the ORT objective value.
+    /// A separation, or an armed adjudication that could evaluate no sample,
+    /// returns `Unknown`. Inert unless `mo_containment_fence` is also armed.
+    /// Downgrade-only. Default false: byte-identical (preset key
+    /// `bab.mo_root_ort_adjudication`).
+    #[serde(default)]
+    pub mo_root_ort_adjudication: bool,
+    /// #vit-v3-bankable: the multi-objective COVER CERTIFICATION system on the
+    /// disjunctive graph multi-objective BaB (the lane vit_2023 takes; preset
+    /// key `bab.mo_cover_certify`, governed by `NY_MO_COVER_CERTIFY`):
+    ///
+    /// * `off` (default, every shipped yaml): byte-identical to the historical
+    ///   lane — no frame, no replay, no line; its `Verified` publishes through
+    ///   the counted `BetaCrownVerdict` legacy door;
+    /// * `ledger`: a per-ROW path completeness ledger (`certify::graph`)
+    ///   records every close with the region it closes (bound closes per
+    ///   row, emptiness closes only with a certified slack). A `Verified` whose
+    ///   rows' leaves do not cover the root is WITHDRAWN (`Unknown`); a proved
+    ///   frame deposits one cover per row, so the instance door can mint an
+    ///   `UnsatToken`; an unbuildable frame keeps the legacy door;
+    /// * `replay`: `ledger` plus a CERTIFY-ONCE replay of every witness leaf
+    ///   below the root with no reused lane state (no lA warm start, no
+    ///   inherited node bounds, no parent flooring, no device batch; the
+    ///   lane's final β only as a hint). `Verified` stands only when the cover
+    ///   is proved AND every witness re-certifies; anything else is withdrawn.
+    ///
+    /// Downgrade-only in both armed modes: the system never tightens a bound,
+    /// closes a domain, or creates a verdict.
+    #[serde(default)]
+    pub mo_cover_certify: MoCoverCertify,
     // --- Root dense-head intermediate CROWN (#cifar-head-crown) ---
     /// Run one bounded heuristic-slope CROWN backward for each dense-fed ReLU
     /// pre-activation at the graph root and shrink-intersect the certified box
@@ -877,6 +1377,25 @@ pub struct BetaCrownConfig {
     /// `NY_MO_BETA_GRAFT=0` forces off (A/B).
     #[serde(default)]
     pub mo_beta_graft: bool,
+    /// Admit pure Linear/ReLU chains (FC networks) to the wide GPU stacker
+    /// ROUTING (#chain-wide, S2 of the GPU/batched child-eval design): lifts
+    /// the conv-only gates — the multi-objective GPU single-pass admission
+    /// (`has_conv_layers`) and the wide entry's `EntryGraphNotConv` decline —
+    /// so the #mo-beta-graft composition can reach the wide seam on FC graphs.
+    ///
+    /// SOUNDNESS SHAPE: the wide-chain BASE relaxation is measured 2.4-2.9x
+    /// LOOSER than the dense node-by-node backward, so on FC graphs the wide
+    /// bound is only ever CAPTURED by a graft call and composed
+    /// elementwise-tightest with the dense bound — never returned as a bound
+    /// replacement (the `EntryGraphNotConv` lift requires the per-call
+    /// `graft_pure_chain` marker). Arm together with `mo_beta_graft`
+    /// (`bab.beta_graft`); armed alone this key changes no FC bound.
+    ///
+    /// Default: false (routing byte-identical). Preset key: `bab.chain_wide`.
+    /// The historical dark env lever `NY_BAB_CHAIN_WIDE=1` additionally arms
+    /// the extractor's pure-chain admission (conv-chain replacement mode).
+    #[serde(default)]
+    pub bab_chain_wide: bool,
     /// Arm the multi-objective wave-batched kFSB selector by default (env
     /// NY_MO_KFSB overrides either way). Set true only for benchmarks measured
     /// Pareto (CIFAR-100).
@@ -914,7 +1433,7 @@ pub struct BetaCrownConfig {
     /// disjunctive lane.
     #[serde(default)]
     pub use_multi_objective_critical_kfsb: bool,
-    // --- Multi-Depth ReLU Splitting (#2767) ---
+    // --- Multi-Depth ReLU Splitting ---
     /// Max ReLU neurons to split per domain. Default: 1 (single-neuron).
     /// NY-only defensive expansion cap; it is not alpha-beta-CROWN's
     /// `max_split_depth` semantic.
@@ -937,10 +1456,9 @@ pub struct BetaCrownConfig {
     ///
     /// # Reference
     /// alpha-beta-CROWN: `complete_verifier/tensor_storage.py` (all_lAs)
-    /// Issue: #1564, #1669
     #[serde(default = "default_enable_la_warm_start")]
     pub enable_la_warm_start: bool,
-    // --- IBP Enhancement for Input Split (#3813) ---
+    // --- IBP Enhancement for Input Split ---
     /// Enable IBP-enhanced CROWN in the input-split BaB loop.
     ///
     /// When enabled, each domain (root and children) is first evaluated with IBP.
@@ -988,6 +1506,126 @@ pub struct BetaCrownConfig {
     #[serde(default)]
     pub input_split_independent_singleton_disjunction: bool,
 
+    /// `#lowdim-prover` at the DomainList input-split entry: on a graph whose
+    /// input dimension is at most `lowdim::MAX_INPUT_DIM`, try the sound
+    /// forward-linear lane first with half of this call's BaB slice. It only
+    /// ever returns a proof of `lower(objective · y) > threshold`; anything
+    /// else falls through to the unchanged driver with the time that remains.
+    ///
+    /// Default false: a category opts in by its typed preset key
+    /// (`bab.branching.input_split.lowdim_prover`) after its own measurement.
+    /// The linearizenn per-clause route arms the lane independently of this
+    /// key, so it must NOT also set it (that would try the lane twice).
+    #[serde(default)]
+    pub input_split_lowdim_prover: bool,
+
+    /// Fraction of the call's budget the `#lowdim-prover` lane may spend before
+    /// falling through (read through [`Self::lowdim_prover_share`], which
+    /// clamps it to [0.05, 0.95]; non-finite reads as 0.5). Default 0.5. A
+    /// category whose fallback lane never proves the rows the lane is armed for
+    /// (tllverifybench: every open row is a fallback timeout) can give it more;
+    /// on sat rows the lane stops on a candidate within a second, so the share
+    /// only matters where the lane is making progress.
+    #[serde(default = "default_lowdim_prover_share")]
+    pub input_split_lowdim_prover_share: f32,
+
+    /// `#lowdim-prover` backward-CROWN refinement of pre-activation layers no
+    /// wider than this (0 = off, the default). See `lowdim::refine_node`.
+    #[serde(default)]
+    pub input_split_lowdim_prover_refine_width: usize,
+
+    /// #lsnc-lane stage 2: the `#lowdim-prover` lane's JOINT QUADRATIC BOUND
+    /// at `ReduceSum(Mul(a, b))` sites (`lowdim::LowDimConfig::joint_quadratic`).
+    /// Default false. NOT delivered by `preset::apply`: the CLI resolves
+    /// `bab.branching.input_split.lowdim_joint_quadratic`
+    /// (`NY_LOWDIM_JOINT_QUADRATIC`) from the scored run's frozen LeverSet, or
+    /// the typed preset over the environment interactively, and writes it
+    /// here (`commands::beta_crown::resolve_lowdim_joint_quadratic`).
+    #[serde(default)]
+    pub input_split_lowdim_joint_quadratic: bool,
+
+    /// #lsnc-lane stage 3: the `#lowdim-prover` lane's split rule
+    /// (`lowdim::LowDimConfig::split`; default `Widest`, the historical rule).
+    /// NOT delivered by `preset::apply`: the CLI resolves
+    /// `bab.branching.input_split.lowdim_split` (`NY_LOWDIM_SPLIT`) from the
+    /// scored run's frozen LeverSet, or the typed preset over the environment
+    /// interactively (`commands::beta_crown::resolve_lowdim_split`).
+    #[serde(default)]
+    pub input_split_lowdim_split: crate::lowdim::LowDimSplit,
+
+    /// #lsnc-lane stage 3: the lane's RELAXED CLIP-AND-VERIFY
+    /// (`lowdim::LowDimConfig::clip`). Default false. Resolved by the CLI
+    /// from `bab.branching.input_split.lowdim_clip` (`NY_LOWDIM_CLIP`).
+    #[serde(default)]
+    pub input_split_lowdim_clip: bool,
+
+    /// #lsnc-lane stage 3: decide each domain inside its rayon chunk task
+    /// (`lowdim::LowDimParallel::Full`) instead of serially after the bound
+    /// (`Bound`, the historical lane). Outcome-identical by construction.
+    /// Default false. Resolved by the CLI from
+    /// `bab.branching.input_split.lowdim_parallel` (`NY_LOWDIM_PARALLEL`).
+    #[serde(default)]
+    pub input_split_lowdim_parallel: bool,
+
+    /// #lowdim-bundle (1): admit the lane by VARYING input dimensions (a box
+    /// wider than `lowdim::MAX_INPUT_DIM` whose other coordinates are pinned
+    /// is re-expressed over its free ones) and lower `Sigmoid` to the lane's
+    /// rigorous sigmoid planes (`lowdim::LowDimConfig::varying_dims`).
+    /// Default false. NOT delivered by `preset::apply`: the CLI resolves
+    /// `bab.branching.input_split.lowdim_varying_dims` from the scored run's
+    /// frozen LeverSet, or the typed preset over the environment
+    /// interactively (`commands::beta_crown::resolve_lowdim_varying_dims`).
+    #[serde(default)]
+    pub input_split_lowdim_varying_dims: bool,
+
+    /// #lowdim-bundle (2): boundary-alpha iterations of the lane's objective
+    /// pass (`lowdim::LowDimConfig::alpha_iters`; 0 = off, the default).
+    /// Resolved by the CLI from `bab.branching.input_split.lowdim_alpha_iters`.
+    #[serde(default)]
+    pub input_split_lowdim_alpha_iters: usize,
+
+    /// #lowdim-bundle (3): in-lane worst-leaf PGD every this many waves
+    /// (`lowdim::LowDimConfig::leaf_attack_every`; 0 = off, the default).
+    /// Attack-only. Resolved by the CLI from
+    /// `bab.branching.input_split.lowdim_leaf_attack_every`.
+    #[serde(default)]
+    pub input_split_lowdim_leaf_attack_every: usize,
+
+    /// #lowdim-bundle (4): prove the lowdim fold's families on one shared
+    /// worklist (`lowdim::LowDimConfig::shared_worklist`). Default false.
+    /// Resolved by the CLI from
+    /// `bab.branching.input_split.lowdim_shared_worklist`.
+    #[serde(default)]
+    pub input_split_lowdim_shared_worklist: bool,
+
+    /// M8a (`#m8-input-split-batch`): the lowdim lane's wave BOUNDER
+    /// (`lowdim::LowDimConfig::batch_engine`; default `Legacy`, the lane's own
+    /// f64 bounder on every domain). `Bbe` hands each wave to the injected
+    /// UNTRUSTED forward-linear search, whose claims the lane re-bounds with
+    /// its own f64 forms. NOT delivered by `preset::apply`: the CLI resolves
+    /// `bab.branching.input_split.lowdim_batch_engine`
+    /// (`NY_LOWDIM_BATCH_ENGINE`) from the scored run's frozen LeverSet, or
+    /// the typed preset over the environment interactively
+    /// (`commands::beta_crown::resolve_lowdim_batch_engine`).
+    #[serde(default)]
+    pub input_split_lowdim_batch_engine: crate::lowdim::LowDimBatchEngine,
+
+    /// M8a (`#m8-input-split-batch`): the lowdim lane's MULTI-CLAUSE scheduler
+    /// (`lowdim::LowDimConfig::engine`; default `Legacy`). `Bbe` proves
+    /// same-box clauses on one disjunction tree and runs the fold on the
+    /// shared worklist. Resolved by the CLI from
+    /// `bab.branching.input_split.engine` (`NY_INPUT_SPLIT_ENGINE`,
+    /// `commands::beta_crown::resolve_input_split_engine`).
+    #[serde(default)]
+    pub input_split_engine: crate::lowdim::InputSplitEngine,
+
+    /// `#lowdim-fold`: before the per-clause box screen of a graph model with
+    /// per-clause input boxes (nn4sys mscn), run the lowdim lane on each
+    /// clause over its FREE coordinates, folding the fixed ones (see
+    /// `lowdim::prove_clause_folded`). Proofs only; default off.
+    #[serde(default)]
+    pub input_split_lowdim_fold: bool,
+
     // --- Domain-stacked batched rebound for Input Split (#cgan-batched-stack) ---
     /// Enable the domain-stacked dense-spec batched rebound in the input-split
     /// BaB loop.
@@ -1007,8 +1645,8 @@ pub struct BetaCrownConfig {
     ///    intermediate-bounds cache with fresh per-subdomain IBP intersected
     ///    with the shared warmup reference bounds (the intersection of two
     ///    sound enclosures — sound, and matching the rayon per-domain
-    ///    `ibp_enhancement` path that the batched kernel previously omitted per
-    ///    #4210). Without this, all empty-history domains share bit-identical
+    ///    `ibp_enhancement` path that the batched kernel previously omitted).
+    ///    Without this, all empty-history domains share bit-identical
     ///    backward relaxations and only the final concretization varies.
     ///
     /// Default: false (per-domain backward loop, verbatim shared cache — the
@@ -1154,6 +1792,62 @@ pub struct BetaCrownConfig {
     /// Preset surface: `bab.branching.input_split.child_bound_calibration`.
     #[serde(default)]
     pub input_split_child_bound_calibration: Option<ChildBoundCalibrationConfig>,
+
+    /// #cap-extend (DEFER-dont-DROP): when the input-split disjunctive BaB
+    /// loop trips `max_domains` with the frontier NEARLY CLOSED, extend the
+    /// search (retain the open queue and keep exploring, bounded by
+    /// `CAP_EXTEND_FACTOR` and the wall) instead of discarding the frontier.
+    ///
+    /// THE SHIPPED DEFAULT IS `false` = the domain-limit stop is byte-for-byte
+    /// identical to today. Naming the key changes SCHEDULE only, never bound
+    /// math: a granted extension permits MORE search before Unknown/Timeout,
+    /// and a Verified verdict still requires every clause refuted on every
+    /// open domain by the unchanged bounding code.
+    ///
+    /// THE DEFECT IT ADDRESSES (cgan2026 row 7, cGAN_imgSz32_nCh_3 prop_3,
+    /// published truth unsat, official 900 s): the multi-seed restart plan
+    /// caps probe restarts at 2,500 domains. The probe reached
+    /// `best_gap=-0.0000` with ~40% of explored domains verified, tripped the
+    /// cap at t=464 s, and the committing restart RE-TRACED the identical
+    /// trajectory from `explored=1` — burning the remaining ~430 s re-deriving
+    /// bounds the probe already held, publishing timeout at 895 s. The
+    /// near-closure gate (see `cap_extend_decision` in
+    /// `disjunctive_multi_clause.rs`) grants extension only when the frontier
+    /// has demonstrably approached closure; a cap that trips far from closure
+    /// stops exactly as today (the FC cap-lift hazard,
+    /// docs/REGRESSION_FC_UNSAT_LOST_2026-08-14.md, is why this is
+    /// cap-CONDITIONAL, not a cap lift).
+    ///
+    /// Config-only (no env override: a new raw env read would raise the
+    /// ny-levers ratchet).
+    ///
+    /// Preset surface: `bab.branching.input_split.cap_extend_near_closure`.
+    #[serde(default)]
+    pub input_split_cap_extend_near_closure: bool,
+
+    /// #sb-plane: keep the popped domain's rebound plane available to the SB
+    /// split-dimension scorer while the fresh current-domain clip is armed.
+    ///
+    /// The fresh clip route (`input_split_fresh_domain_clip`) exists because a
+    /// batch-stack-unsafe graph's domain-stacked rebound planes are not
+    /// trusted as clip/verdict AUTHORITY, so `process_batch` drops
+    /// `domain.linear_bounds` on every pop before any helper can consume it —
+    /// and the SB scorer, which is a HEURISTIC that cannot touch soundness,
+    /// loses its coefficients with it and falls back to width-only scoring
+    /// (`input_split_scores`' `width_only` arm). With this key on, the plane
+    /// is moved OUT of the domain into a split-decision-only local: the fresh
+    /// clip still computes its own plane on the exact box, no clip or verified
+    /// check can reach the moved plane, and children are still born with
+    /// `linear_bounds: None`.
+    ///
+    /// Inert unless the fresh clip is actually armed on the lane (announced by
+    /// `[sb-plane] armed=`). Config-only (no env override: a new raw env read
+    /// would raise the ny-levers ratchet). Ships dark; `cgan_2023.yaml` is the
+    /// measurement target (canary copy, not the production yaml).
+    ///
+    /// Preset surface: `bab.branching.input_split.sb_keep_plane_under_fresh_clip`.
+    #[serde(default)]
+    pub input_split_sb_keep_plane_under_fresh_clip: bool,
 
     /// Run eligible per-domain warm-alpha refinements concurrently during the
     /// deferred reordered input-split rebound.
@@ -1319,8 +2013,34 @@ pub struct BetaCrownConfig {
     /// α iterations per edge pass (modest; deadline-guarded).
     #[serde(default = "default_edge_alpha_iters")]
     pub input_split_edge_alpha_iters: usize,
+    /// #iso-edge-cap (default `None` = DARK, byte-identical): bound the SERIAL
+    /// edge work above — the α edge pass and the edge-MILP escalation — by the
+    /// scored stop (`input_split_scored_wall`, when the frontend supplies one)
+    /// and by a per-wave wall allowance: `max_secs`, or `rebound_share` times
+    /// the batched rebound that precedes the wave, whichever is smaller.
+    ///
+    /// MEASURED defect (Mac, `624477367`, isomorphic_acasxu_2026 08-30
+    /// resweep): single batches of 15-63 s against a ~1.6 s norm on 6 of 18
+    /// gap rows, each starting exactly when the tree reaches the edge gate's
+    /// depth, one running the process to 100.96 s of a 100 s budget. Both edge
+    /// helpers took the INFLATED effort horizon as their deadline and nothing
+    /// bounded their share of a wave.
+    ///
+    /// SOUNDNESS: it can only REMOVE edge work, which turns a would-be verify
+    /// into a split; bound-shaping deadlines are unchanged, an α optimisation
+    /// cut short still yields a sound (looser) bound, and the edge-MILP still
+    /// counts a domain only on the certified `VerifiedAllRows`.
+    ///
+    /// Config-only (no env override: a new raw env read would raise the
+    /// ny-levers ratchet). The relational lane builds its config inline, so its
+    /// frontend projects this key from the category preset itself
+    /// (`RelationalPresetKeys` in ny-cli `vnncomp.rs`).
+    ///
+    /// Preset surface: `bab.branching.input_split.edge_wave_cap`.
+    #[serde(default)]
+    pub input_split_edge_wave_cap: Option<EdgeWaveCapConfig>,
 
-    // --- Reorder BaB for Input Split (#3870) ---
+    // --- Reorder BaB for Input Split ---
     /// Use the reordered BaB loop for input splitting.
     ///
     /// In regular mode, the loop order is: pop → split → clip → bound children → enqueue.
@@ -1353,7 +2073,7 @@ pub struct BetaCrownConfig {
     #[serde(default = "default_adv_check")]
     pub adv_check: i32,
 
-    // --- Adaptive Batch Sizing (#4303) ---
+    // --- Adaptive Batch Sizing ---
     /// Enable opt-in adaptive BaB microbatch sizing.
     ///
     /// By itself this retains the legacy full-batch enlargement policy. When
@@ -1407,7 +2127,7 @@ pub struct BetaCrownConfig {
     #[serde(default)]
     pub dd_zonotope_collect_interm: Option<bool>,
 
-    // --- Phase Budget Policy (#2206) ---
+    // --- Phase Budget Policy ---
     /// Phase-level time budget fractions for β-CROWN verification.
     ///
     /// Centralizes the timeout policy that was previously scattered across
@@ -1415,12 +2135,11 @@ pub struct BetaCrownConfig {
     /// and `mod.rs` as hardcoded magic constants.
     ///
     /// Default values preserve today's behavior exactly.
-    /// Design: `designs/2026-03-16-issue-2206-adaptive-phase-budgeting.md`
     #[serde(default)]
     pub phase_budget: PhaseBudgetConfig,
 }
 
-/// Maximum batch size for auto-enlargement (#4303).
+/// Maximum batch size for auto-enlargement.
 /// Matches alpha-beta-CROWN's practical cap for GPU memory safety.
 pub const AUTO_ENLARGE_BATCH_CAP: usize = 8192;
 
@@ -1433,6 +2152,8 @@ impl Default for BetaCrownConfig {
         Self {
             verification_artifact_authority: VerificationArtifactAuthority::CertificateExport,
             frozen_levers: None,
+            certified_root_cut_owner: None,
+            certified_root_cut_raw_source: false,
             max_domains: 100_000,
             max_queue_size: default_max_queue_size(),
             // #ml4acopf-bab-queue-mem: 0 = unlimited. Opt-in per preset so
@@ -1440,6 +2161,10 @@ impl Default for BetaCrownConfig {
             max_queue_bytes: 0,
             timeout: Duration::from_mins(5),
             max_depth: 100,
+            initial_bounds_warmup_fallback: false,
+            disjunctive_clause_retry_passes: 0,
+            disjunctive_shared_bootstrap: false,
+            genbab_on_precomputed_lane: false,
             use_alpha_crown: true,
             use_forward_bounds: false,
             optimize_disjuncts_separately: false,
@@ -1450,6 +2175,25 @@ impl Default for BetaCrownConfig {
             chunk_wave_parallel_enabled: false,
             max_crown_ibp_nodes: None,
             crown_ibp_per_node_floor_secs: None,
+            crown_ibp_per_node_floor_dim_scaled: false,
+            pwl_lookup_exact_range: false,
+            forward_root_screen: false,
+            forward_root_screen_max_mb: default_forward_root_screen_max_mb(),
+            vit_zono_root: false,
+            vit_zono_root_max_mb: default_vit_zono_root_max_mb(),
+            vit_zono_root_max_secs: default_vit_zono_root_max_secs(),
+            bilinear_rowpar_kernel: false,
+            linear_position_stack: false,
+            reciprocal_unbounded_upper: false,
+            bilinear_gemm_kernel: false,
+            single_hidden_hull: SingleHiddenHullMode::Off,
+            graph_search: GraphLaneSearch::Off,
+            la_warm_frontier: false,
+            kfsb_single_shot: false,
+            attack_concurrent: false,
+            relational_point_vjp: false,
+            mip_refine_intermediates: None,
+            gpu_patches_crown: None,
             crown_ibp_per_node_cap_secs: None,
             crown_ibp_prefix_cost_weighted: false,
             crown_ibp_max_target_share_frac: None,
@@ -1465,20 +2209,32 @@ impl Default for BetaCrownConfig {
             input_split_sb_sum: false,
             input_split_sb_primary_spec: None,
             fsb_candidates: default_fsb_candidates(),
-            kfsb_reduce_op: KfsbReduceOp::default(), // Min (conservative)
+            // #general-defaults 2026-08-31: was KfsbReduceOp::default() (Min). ALL 13
+            // scored configs that set reduceop set `max` -- unanimous, so Min governed
+            // nothing except untuned benchmarks.
+            kfsb_reduce_op: KfsbReduceOp::Max,
             kfsb_multi_candidates: None,
             kfsb_multi_reduce_op: None,
             depth_two_branch_lookahead: DepthTwoBranchLookaheadConfig::default(),
-            beta_lr: 0.05,      // α,β-CROWN default: 0.05
-            beta_iterations: 0, // Per-domain iterations disabled by default for throughput
+            // #general-defaults 2026-08-31: was 0.05 (abc's arguments.py value).
+            // 11 of the 14 scored configs that set lr_beta set 0.15; none ship 0.05.
+            // A default that every serious config overrides is a wrong default, and an
+            // UNTUNED benchmark (the 2026 set) is the only thing it actually governs.
+            beta_lr: 0.15,
+            // #general-defaults 2026-08-31: was 0, i.e. per-domain beta ascent shipped
+            // OFF. All 14 scored configs that set this set it > 0 (modal 15); NOTHING
+            // ships 0. An untuned benchmark got a verifier with beta ascent disabled.
+            beta_iterations: 15,
             beta_tolerance: 1e-5,
             early_stop_patience: default_early_stop_patience(),
             root_beta_iterations: default_root_beta_iterations(), // Root-level optimization
             beta_max_depth: default_beta_max_depth(), // Limit per-domain optimization depth
             use_analytical_beta_gradients: true, // Use analytical gradients for ~3x faster optimization
-            alpha_lr: 0.01,                      // α,β-CROWN default: 0.01 (much lower than init!)
-            alpha_momentum: true,                // Use momentum for α updates
-            batch_size: 64,                      // Process 64 domains in parallel (GPU-optimized)
+            // #general-defaults 2026-08-31: was 0.01. 13 of the 14 scored configs that
+            // set beta_crown.lr_alpha set 0.1 (cora is the lone 0.03 and keeps its key).
+            alpha_lr: 0.1,
+            alpha_momentum: true, // Use momentum for α updates
+            batch_size: 64,       // Process 64 domains in parallel (GPU-optimized)
             build_batch_size: None,
             parallel_children: true, // Enable parallel child creation by default
             use_adaptive: false,     // Disabled by default for backward compatibility
@@ -1528,6 +2284,8 @@ impl Default for BetaCrownConfig {
             pgd_dense_low_dim_sweep: false,
             pgd_dense_sweep_max_dims: default_pgd_dense_sweep_max_dims(),
             pgd_dense_sweep_points: default_pgd_dense_sweep_points(),
+            pgd_corner_seed_restarts: 0,
+            open_disjunct_attack: OpenDisjunctAttackConfig::default(),
             pgd_exact_vjp: ExactVjpPgdConfig::default(),
             enable_relaxed_clip: false,
             relaxed_clip_iterations: default_relaxed_clip_iterations(),
@@ -1543,6 +2301,9 @@ impl Default for BetaCrownConfig {
             root_interm_cuda_factory: false,
             mo_cuda_factory_engine_handoff: false,
             mo_cuda_bounded_shared_executor: false,
+            mo_containment_fence: false, // #vit-bank-gate: default-off fence
+            mo_root_ort_adjudication: false, // #vit-margin-alpha-complex (P8)
+            mo_cover_certify: MoCoverCertify::Off, // #vit-v3-bankable: dark
             root_crown_interm_dense_head: false,
             root_crown_interm_max_secs: default_root_crown_interm_max_secs(),
             root_crown_interm_max_dim: default_root_crown_interm_max_dim(),
@@ -1562,6 +2323,7 @@ impl Default for BetaCrownConfig {
             root_comprehensive_gpu_interm_chunks: default_root_comprehensive_gpu_interm_chunks(),
             root_post_c_survivor: false,
             mo_beta_graft: false, // #mo-beta-graft (env NY_MO_BETA_GRAFT overrides)
+            bab_chain_wide: false, // #chain-wide (preset bab.chain_wide; graft-composed FC routing)
             use_kfsb_multi_branching: false, // #kfsb-multi: CIFAR-100 preset opt-in (env NY_MO_KFSB overrides)
             kfsb_cert_reuse: false, // proof-carrying kFSB simulation reuse; preset-scoped opt-in
             kfsb_cert_reuse_runtime: None, // scored frontend freezes the governed effective value
@@ -1574,6 +2336,20 @@ impl Default for BetaCrownConfig {
             input_split_conic_queue_refresh_batch_size:
                 default_input_split_conic_queue_refresh_batch_size(),
             input_split_independent_singleton_disjunction: false,
+            input_split_lowdim_prover: false,
+            input_split_lowdim_prover_share: default_lowdim_prover_share(),
+            input_split_lowdim_prover_refine_width: 0,
+            input_split_lowdim_joint_quadratic: false,
+            input_split_lowdim_split: crate::lowdim::LowDimSplit::Widest,
+            input_split_lowdim_clip: false,
+            input_split_lowdim_parallel: false,
+            input_split_lowdim_varying_dims: false,
+            input_split_lowdim_alpha_iters: 0,
+            input_split_lowdim_leaf_attack_every: 0,
+            input_split_lowdim_shared_worklist: false,
+            input_split_lowdim_batch_engine: crate::lowdim::LowDimBatchEngine::Legacy,
+            input_split_engine: crate::lowdim::InputSplitEngine::Legacy,
+            input_split_lowdim_fold: false,
             input_split_stacked_rebound: false, // #cgan-batched-stack
             input_split_nested_deadline: None,  // #dist-shift-5291 nested-deadline authority (keep)
             input_split_f64_tail_enabled: None, // #cgan-f64-tail: dark until the measured gate
@@ -1581,7 +2357,9 @@ impl Default for BetaCrownConfig {
             input_split_f64_tail_max_escalations: None, // #cgan-f64-tail: unlimited (legacy lsnc)
             input_split_child_bound_max_secs: None, // #cgan-dark-tail FIX-1: NO CAP (ships dark)
             input_split_child_bound_calibration: None, // #cost-observer: constant governs (dark)
-            input_split_warm_parallel: false,   // #cgan-warm-par (preset-scoped opt-in)
+            input_split_cap_extend_near_closure: false, // #cap-extend: DEFER-dont-DROP (ships dark)
+            input_split_sb_keep_plane_under_fresh_clip: false, // #sb-plane: SB keeps the rebound plane (ships dark)
+            input_split_warm_parallel: false, // #cgan-warm-par (preset-scoped opt-in)
             input_split_override_parallel: false, // bounded complete-clip rebound fan-out
             sat_escape_branch: false, // #nn4sys-seb-dark: nn4sys preset opt-in (env NY_SAT_ESCAPE_BRANCH overrides)
             input_split_batched_ibp_refresh: false, // #cgan-batched-stack
@@ -1595,6 +2373,7 @@ impl Default for BetaCrownConfig {
             input_split_edge_alpha: false, // #relational-bab option B
             input_split_edge_alpha_top: default_edge_alpha_top(),
             input_split_edge_alpha_iters: default_edge_alpha_iters(),
+            input_split_edge_wave_cap: None, // #iso-edge-cap: edge work ungoverned (ships dark)
             reorder_bab: false,
             adv_check: -1,                              // #3870
             auto_enlarge_batch_size: false,             // #4303
@@ -1608,6 +2387,37 @@ impl Default for BetaCrownConfig {
 }
 
 impl BetaCrownConfig {
+    /// Smallest admissible `forward_root_screen_max_mb` (#fwd-root-screen).
+    pub const FORWARD_ROOT_SCREEN_MIN_MAX_MB: u32 = 64;
+    /// Largest admissible `forward_root_screen_max_mb` (1 TiB).
+    pub const FORWARD_ROOT_SCREEN_MAX_MAX_MB: u32 = 1 << 20;
+
+    /// Whether `mb` is an admissible #fwd-root-screen ceiling (0 never is).
+    #[must_use]
+    pub const fn forward_root_screen_max_mb_is_valid(mb: u32) -> bool {
+        mb >= Self::FORWARD_ROOT_SCREEN_MIN_MAX_MB && mb <= Self::FORWARD_ROOT_SCREEN_MAX_MAX_MB
+    }
+
+    /// Smallest admissible `vit_zono_root_max_mb` (#vit-zono-root).
+    pub const VIT_ZONO_ROOT_MIN_MAX_MB: u32 = 64;
+    /// Largest admissible `vit_zono_root_max_mb` (1 TiB).
+    pub const VIT_ZONO_ROOT_MAX_MAX_MB: u32 = 1 << 20;
+    /// Largest admissible `vit_zono_root_max_secs` (one hour).
+    pub const VIT_ZONO_ROOT_MAX_MAX_SECS: f32 = 3600.0;
+
+    /// Whether `mb` is an admissible #vit-zono-root ceiling (0 never is).
+    #[must_use]
+    pub const fn vit_zono_root_max_mb_is_valid(mb: u32) -> bool {
+        mb >= Self::VIT_ZONO_ROOT_MIN_MAX_MB && mb <= Self::VIT_ZONO_ROOT_MAX_MAX_MB
+    }
+
+    /// Whether `secs` is an admissible #vit-zono-root wall cap (finite, > 0,
+    /// at most an hour).
+    #[must_use]
+    pub fn vit_zono_root_max_secs_is_valid(secs: f32) -> bool {
+        secs.is_finite() && secs > 0.0 && secs <= Self::VIT_ZONO_ROOT_MAX_MAX_SECS
+    }
+
     /// Whether derived conjunctive input-split objectives have runtime verdict
     /// authority under this resolved configuration.
     ///
@@ -1676,7 +2486,7 @@ impl BetaCrownConfig {
     }
 
     /// Per-node CROWN-IBP time-budget overrides as the collector-facing type
-    /// (#4413, #cgan-bn11-budget). All-`None` keeps the 2-second floor and
+    /// (#cgan-bn11-budget). All-`None` keeps the 2-second floor and
     /// selects the adaptive remaining-budget cap.
     #[inline]
     pub fn crown_ibp_per_node_time_budget(&self) -> crate::types::CrownIbpPerNodeTimeBudget {
@@ -1685,6 +2495,7 @@ impl BetaCrownConfig {
             cap_secs: self.crown_ibp_per_node_cap_secs,
             prefix_cost_weighted: self.crown_ibp_prefix_cost_weighted,
             max_target_share_frac: self.crown_ibp_max_target_share_frac,
+            floor_dim_scaled: self.crown_ibp_per_node_floor_dim_scaled,
         }
     }
 
@@ -1702,7 +2513,7 @@ impl BetaCrownConfig {
     /// Reference: VNN-COMP 2024 winning configuration.
     ///
     /// Disables alpha-CROWN: the reference uses plain CROWN (`bound_prop_method:
-    /// crown`) for ACAS-Xu. With frozen root alpha reuse (#3453), alpha-CROWN
+    /// crown`) for ACAS-Xu. With frozen root alpha reuse, alpha-CROWN
     /// intermediate bounds are computed once on the full root domain and reused
     /// for all sub-domains. For ACAS-Xu's tight 5-dim input space, these root
     /// bounds are too loose to help sub-domains, producing 0% verification.
@@ -1715,7 +2526,7 @@ impl BetaCrownConfig {
         Self {
             branching_heuristic: BranchingHeuristic::InputSplit,
             // Plain CROWN, not alpha-CROWN. Reference uses `bound_prop_method: crown`.
-            // Frozen root alpha (#3453) regresses ACAS-Xu from 99.8% to 0% verified
+            // Frozen root alpha regresses ACAS-Xu from 99.8% to 0% verified
             // because root intermediate bounds don't tighten for sub-domains.
             use_alpha_crown: false,
             use_forward_bounds: false,
@@ -1766,12 +2577,48 @@ impl BetaCrownConfig {
             dense_low_dim_sweep: self.pgd_dense_low_dim_sweep,
             dense_sweep_max_dims: self.pgd_dense_sweep_max_dims,
             dense_sweep_points: self.pgd_dense_sweep_points,
+            corner_seed_restarts: self.pgd_corner_seed_restarts,
             exact_vjp: self.pgd_exact_vjp,
+            cancel: None,
+            setup_regrant: None,
         }
     }
 
     /// Returns true when the domain bounds are sufficient to prove the property.
     #[inline]
+    /// The `#lowdim-prover` lane's budget share, clamped to [0.05, 0.95];
+    /// a non-finite configured value reads as the 0.5 default.
+    /// The `#lowdim-prover` lane config this BaB config asks for.
+    pub fn lowdim_config(&self) -> crate::lowdim::LowDimConfig {
+        crate::lowdim::LowDimConfig {
+            refine_max_width: self.input_split_lowdim_prover_refine_width,
+            joint_quadratic: self.input_split_lowdim_joint_quadratic,
+            split: self.input_split_lowdim_split,
+            clip: self.input_split_lowdim_clip,
+            parallel: if self.input_split_lowdim_parallel {
+                crate::lowdim::LowDimParallel::Full
+            } else {
+                crate::lowdim::LowDimParallel::Bound
+            },
+            varying_dims: self.input_split_lowdim_varying_dims,
+            alpha_iters: self.input_split_lowdim_alpha_iters,
+            leaf_attack_every: self.input_split_lowdim_leaf_attack_every,
+            shared_worklist: self.input_split_lowdim_shared_worklist,
+            batch_engine: self.input_split_lowdim_batch_engine,
+            engine: self.input_split_engine,
+            ..crate::lowdim::LowDimConfig::default()
+        }
+    }
+
+    pub fn lowdim_prover_share(&self) -> f32 {
+        let share = self.input_split_lowdim_prover_share;
+        if share.is_finite() {
+            share.clamp(0.05, 0.95)
+        } else {
+            0.5
+        }
+    }
+
     pub(crate) fn domain_is_verified(&self, lower: f32, upper: f32, threshold: f32) -> bool {
         Self::domain_is_verified_for_mode(self.verify_upper_bound, lower, upper, threshold)
     }
@@ -1787,7 +2634,7 @@ impl BetaCrownConfig {
     /// Returns `false` when any input is non-finite (NaN or Inf). NaN bounds
     /// must never produce a Verified result. Inf bounds indicate propagation
     /// failure (e.g., reciprocal zero-crossing), not genuine verification.
-    /// Inf threshold would trivially verify/reject all domains (#2993).
+    /// Inf threshold would trivially verify/reject all domains.
     /// A single `is_finite()` check covers both NaN and Inf per IEEE 754.
     #[inline]
     pub(crate) fn domain_is_verified_for_mode(
@@ -1798,7 +2645,7 @@ impl BetaCrownConfig {
     ) -> bool {
         // Reject all non-finite inputs: NaN (propagation corruption) and Inf
         // (propagation failure, e.g., reciprocal zero-crossing). Inf threshold
-        // would make every domain trivially verified or never verified (#2993).
+        // would make every domain trivially verified or never verified.
         if !lower.is_finite() || !upper.is_finite() || !threshold.is_finite() || lower > upper {
             return false;
         }
@@ -1814,7 +2661,7 @@ impl BetaCrownConfig {
     /// Returns `false` when any input is non-finite (NaN or Inf). NaN bounds
     /// must never produce a Violation result. Inf bounds indicate propagation
     /// failure, not a genuine violation. Inf threshold would make every domain
-    /// trivially violated or never violated (#2993).
+    /// trivially violated or never violated.
     ///
     /// Also returns `false` for an INVERTED interval (`lower > upper`, #violdrop).
     /// This predicate is a PROOF — the decision-relevant bound is being asserted
@@ -1834,7 +2681,7 @@ impl BetaCrownConfig {
         upper: f32,
         threshold: f32,
     ) -> bool {
-        // Reject all non-finite inputs (#2993).
+        // Reject all non-finite inputs.
         if !lower.is_finite() || !upper.is_finite() || !threshold.is_finite() {
             return false;
         }
@@ -1862,7 +2709,7 @@ impl BetaCrownConfig {
     /// Mode-parametrized BaB queue priority.
     ///
     /// Returns `Err(NumericalInstability)` if either bound is non-finite, preventing
-    /// zombie domains from entering the BaB queue (#2982, #3125).
+    /// zombie domains from entering the BaB queue.
     #[inline]
     pub(crate) fn domain_priority_for_mode(
         verify_upper_bound: bool,
@@ -1907,7 +2754,7 @@ impl BetaCrownConfig {
         child_lower: f32,
         child_upper: f32,
     ) -> f32 {
-        // NaN-safe: propagate NaN instead of silently reporting 0.0 gain (#2643)
+        // NaN-safe: propagate NaN instead of silently reporting 0.0 gain
         if self.verify_upper_bound {
             nan_propagating_max(parent_upper - child_upper, 0.0)
         } else {
@@ -1943,7 +2790,7 @@ impl BetaCrownConfig {
 
     /// Compatibility alias for BaB queue priority used by legacy call sites.
     ///
-    /// #2682 requires queue ordering to respect the active verification mode:
+    /// Queue ordering must respect the active verification mode:
     /// - `verify_upper_bound=true`: prioritize larger upper bounds
     /// - `verify_upper_bound=false`: prioritize smaller lower bounds
     ///
@@ -2046,6 +2893,35 @@ impl BetaCrownConfig {
         self.pgd_exact_vjp
             .validate()
             .map_err(NyError::InvalidConfig)?;
+        if let Some(refine) = self.mip_refine_intermediates {
+            refine.validate().map_err(NyError::InvalidConfig)?;
+        }
+        if let Some(pass) = self.gpu_patches_crown {
+            pass.validate().map_err(NyError::InvalidConfig)?;
+        }
+        if !Self::forward_root_screen_max_mb_is_valid(self.forward_root_screen_max_mb) {
+            return Err(NyError::InvalidConfig(format!(
+                "forward_root_screen_max_mb must be in {}..={} (0 is never \"unlimited\"), got {}",
+                Self::FORWARD_ROOT_SCREEN_MIN_MAX_MB,
+                Self::FORWARD_ROOT_SCREEN_MAX_MAX_MB,
+                self.forward_root_screen_max_mb
+            )));
+        }
+        if !Self::vit_zono_root_max_mb_is_valid(self.vit_zono_root_max_mb) {
+            return Err(NyError::InvalidConfig(format!(
+                "vit_zono_root_max_mb must be in {}..={} (0 is never \"unlimited\"), got {}",
+                Self::VIT_ZONO_ROOT_MIN_MAX_MB,
+                Self::VIT_ZONO_ROOT_MAX_MAX_MB,
+                self.vit_zono_root_max_mb
+            )));
+        }
+        if !Self::vit_zono_root_max_secs_is_valid(self.vit_zono_root_max_secs) {
+            return Err(NyError::InvalidConfig(format!(
+                "vit_zono_root_max_secs must be finite and in (0, {}], got {}",
+                Self::VIT_ZONO_ROOT_MAX_MAX_SECS,
+                self.vit_zono_root_max_secs
+            )));
+        }
         if Instant::now().checked_add(self.timeout).is_none() {
             return Err(NyError::InvalidConfig(format!(
                 "timeout {:?} is too large for the platform monotonic clock",
@@ -2196,6 +3072,29 @@ impl ChildBoundCalibrationConfig {
     }
 }
 
+/// #iso-edge-cap: the per-wave edge-work allowance,
+/// `bab.branching.input_split.edge_wave_cap`
+/// ([`BetaCrownConfig::input_split_edge_wave_cap`]).
+///
+/// The block's PRESENCE is the arming switch; absent (the shipped state) the
+/// edge work is ungoverned, exactly as before. Every field is optional: an
+/// omitted field takes the WAVE6_PLAN §7.C6 default, resolved (and sanitized —
+/// a non-finite or negative value fails open to the dark state) by the
+/// grouped-disjunctive lane itself, so this type carries only what the preset
+/// named.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeWaveCapConfig {
+    /// Hard ceiling on one wave's edge wall, in seconds. Omitted = 2.0. Zero
+    /// is honoured and means "no edge work at all".
+    #[serde(default)]
+    pub max_secs: Option<f64>,
+    /// Share of the batched rebound that precedes the wave, dimensionless.
+    /// Omitted = 0.25.
+    #[serde(default)]
+    pub rebound_share: Option<f64>,
+}
+
 /// Hard resource cap for exact full-`C` root margin iterations.
 pub const ATOMIC_ROOT_C_MARGIN_MAX_ITERATIONS: usize = 8;
 
@@ -2340,4 +3239,210 @@ impl ConvMode {
             Self::Auto => !cuts_enabled,
         }
     }
+}
+
+/// #hull-root / #hull-bab (wave-6 C4): how far the certified
+/// single-hidden-layer per-neuron hull runs in the sequential relational lane.
+///
+/// The enum is CLOSED: `off | root | bab`, snake_case; anything else fails to
+/// parse, so a misspelled arming can never silently resolve to `off`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SingleHiddenHullMode {
+    /// Historical behavior, byte-identical: the lane never runs.
+    #[default]
+    Off,
+    /// One certified hull bound at the root; `unsat` iff it is `> 0`.
+    Root,
+    /// Phase 2 (#hull-bab): the root bound, then a deadline-bounded,
+    /// best-first ReLU-split branch-and-bound over the unstable concave
+    /// (`c_j < 0`) neurons, every node certified by the closed form plus one
+    /// weak-duality term per split halfspace. `unsat` iff EVERY leaf is
+    /// certified `> 0`; it never publishes `sat`. Undecided rows fall through
+    /// to the historical lane with the wall the tree did not spend.
+    /// Observable: `[hull-bab] armed mode=bab ...` on every armed run.
+    Bab,
+}
+
+impl SingleHiddenHullMode {
+    /// Whether the hull lane is armed at all.
+    #[must_use]
+    pub const fn is_armed(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// Stable lowercase label for observables.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Root => "root",
+            Self::Bab => "bab",
+        }
+    }
+}
+
+/// #vit-v3-bankable: the typed `bab.mo_cover_certify` policy (see
+/// `BetaCrownConfig::mo_cover_certify`).
+///
+/// The enum is CLOSED: `off | ledger | replay`, snake_case; anything else
+/// fails to parse, so a misspelled arming can never silently resolve to `off`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MoCoverCertify {
+    /// Historical behavior, byte-identical: no frame, no replay.
+    #[default]
+    Off,
+    /// The per-row completeness ledger (refuse on a cover gap; token when
+    /// proved; legacy door when unbuildable).
+    Ledger,
+    /// The ledger plus the certify-once replay of every witness leaf; a
+    /// `Verified` stands only when both pass.
+    Replay,
+}
+
+impl MoCoverCertify {
+    /// The preset vocabulary, in declaration order.
+    pub const TOKENS: [&'static str; 3] = ["off", "ledger", "replay"];
+
+    /// Whether the ledger is armed (both `ledger` and `replay`).
+    #[must_use]
+    pub const fn is_armed(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// Whether the certify-once replay gates the verdict.
+    #[must_use]
+    pub const fn replays(self) -> bool {
+        matches!(self, Self::Replay)
+    }
+
+    /// Stable lowercase label (the preset token).
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Ledger => "ledger",
+            Self::Replay => "replay",
+        }
+    }
+
+    /// Parse an exact preset token.
+    #[must_use]
+    pub fn parse(token: &str) -> Option<Self> {
+        match token {
+            "off" => Some(Self::Off),
+            "ledger" => Some(Self::Ledger),
+            "replay" => Some(Self::Replay),
+            _ => None,
+        }
+    }
+}
+
+/// #graph-lane-search (ENGINE_PROGRAM §2 M7): the typed `bab.graph_search`
+/// arming — which untrusted batched α/β search backend the graph β-CROWN lane
+/// consults (see `BetaCrownConfig::graph_search`).
+///
+/// The enum is CLOSED: `off | cpu_f32`, snake_case; anything else fails to
+/// parse, so a misspelled arming can never silently resolve to `off`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphLaneSearch {
+    /// Historical behavior, byte-identical: no backend is consulted.
+    #[default]
+    Off,
+    /// The injected CPU f32 backend (`ny_bbe::CpuF32Backend::graph_bab_batch`,
+    /// registered by ny-cli), certified per domain by the lane.
+    CpuF32,
+}
+
+impl GraphLaneSearch {
+    /// The preset vocabulary, in declaration order.
+    pub const TOKENS: [&'static str; 2] = ["off", "cpu_f32"];
+
+    /// Whether any search is armed.
+    #[must_use]
+    pub const fn is_armed(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// Stable lowercase label for observables (the preset token).
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::CpuF32 => "cpu_f32",
+        }
+    }
+}
+
+/// #relusplitter-lp-refine (wave-6 C7): the typed
+/// `bab.mip_refine_intermediates` arming. Presence arms it; both fields have
+/// Vibecheck-recipe defaults. Unknown fields are refused, so a misspelled
+/// sub-key can never silently resolve to a default.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MipRefineIntermediates {
+    /// Deepest hidden pre-activation layer (0-based) the LP refines; layers
+    /// `1..=layers` are refined (layer 0 is exact already). Default 3.
+    #[serde(default = "default_mip_refine_layers")]
+    pub layers: usize,
+    /// Share of the remaining root tightening window the refiner may spend,
+    /// in `(0, MAX_BUDGET_FRAC]`. Default 0.3.
+    #[serde(default = "default_mip_refine_budget_frac")]
+    pub budget_frac: f64,
+}
+
+impl Default for MipRefineIntermediates {
+    fn default() -> Self {
+        Self {
+            layers: default_mip_refine_layers(),
+            budget_frac: default_mip_refine_budget_frac(),
+        }
+    }
+}
+
+impl MipRefineIntermediates {
+    /// Largest admissible `layers` (a deeper request is refused, not clamped).
+    pub const MAX_LAYERS: usize = 64;
+    /// Largest admissible `budget_frac`: the BaB always keeps a share.
+    pub const MAX_BUDGET_FRAC: f64 = 0.9;
+
+    /// Refuse an out-of-range arming instead of clamping it.
+    ///
+    /// # Errors
+    /// `layers` outside `1..=MAX_LAYERS`, or `budget_frac` not a finite value
+    /// in `(0, MAX_BUDGET_FRAC]`.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.layers == 0 || self.layers > Self::MAX_LAYERS {
+            return Err(format!(
+                "mip_refine_intermediates.layers must be in 1..={}, got {}",
+                Self::MAX_LAYERS,
+                self.layers
+            ));
+        }
+        if !(self.budget_frac.is_finite()
+            && self.budget_frac > 0.0
+            && self.budget_frac <= Self::MAX_BUDGET_FRAC)
+        {
+            return Err(format!(
+                "mip_refine_intermediates.budget_frac must be finite in (0, {}], got {}",
+                Self::MAX_BUDGET_FRAC,
+                self.budget_frac
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn default_mip_refine_layers() -> usize {
+    3
+}
+
+fn default_mip_refine_budget_frac() -> f64 {
+    0.3
+}
+
+fn default_lowdim_prover_share() -> f32 {
+    0.5
 }

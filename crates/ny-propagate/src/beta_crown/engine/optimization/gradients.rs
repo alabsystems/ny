@@ -60,7 +60,7 @@ fn infer_spatial_2d(
             )));
         }
         let spatial = total / in_channels;
-        // Use integer sqrt to avoid float-to-usize cast (Part of #2983).
+        // Exact integer sqrt: the float-to-usize cast is only a seed, corrected below.
         // Manual integer sqrt for MSRV 1.75 compat (isqrt stabilized in 1.84).
         let side = {
             let mut s = (spatial as f64).sqrt() as usize;

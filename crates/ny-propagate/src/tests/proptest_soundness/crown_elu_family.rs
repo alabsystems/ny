@@ -9,8 +9,6 @@
 //! for x > 0 and have exponential-based negative tails. The identity-bounds
 //! tests verify the relaxation envelope directly. The negative-coeff and
 //! asymmetric tests exercise sign-switching in crown_elementwise_backward.
-//!
-//! Part of #40, #1793.
 
 use crate::layers::{CeluLayer, EluLayer, MishLayer};
 use crate::LinearBounds;
@@ -188,11 +186,11 @@ proptest! {
     }
 }
 
-/// Regression for #1803 self-audit: Mish [l, +inf) must use a globally sound
+/// Regression: Mish [l, +inf) must use a globally sound
 /// lower envelope. Tangent-at-l is unsound for non-convex Mish.
 #[test]
 fn regression_mish_infinite_upper_lower_bound_sound() {
-    // Updated for #2977: domain_guard rejects non-finite pre-activation.
+    // domain_guard rejects non-finite pre-activation.
     let mish_layer = MishLayer::new();
     let identity = LinearBounds::identity(1);
     let pre_activation =
@@ -207,7 +205,7 @@ fn regression_mish_infinite_upper_lower_bound_sound() {
     );
 }
 
-/// Regression for #1803/#2977: ELU with infinite upper now rejected by domain_guard.
+/// Regression: ELU with infinite upper now rejected by domain_guard.
 #[test]
 fn regression_elu_infinite_upper_alpha_gt_one_lower_bound_sound() {
     let alpha = 2.0_f32;
@@ -225,7 +223,7 @@ fn regression_elu_infinite_upper_alpha_gt_one_lower_bound_sound() {
     );
 }
 
-/// Regression for #1803/#2977: SELU with infinite upper now rejected by domain_guard.
+/// Regression: SELU with infinite upper now rejected by domain_guard.
 #[test]
 fn regression_selu_infinite_upper_lower_bound_sound() {
     let selu_layer = crate::layers::SeluLayer::new();
@@ -476,8 +474,6 @@ proptest! {
 // matrices differ (lower_a != upper_a), which stresses sign-switching logic
 // more than symmetric bounds. Completes the 3-test coverage pattern for
 // ELU, CELU, SELU, Mish, and Softplus.
-//
-// Part of #40, #1793.
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(300) })]

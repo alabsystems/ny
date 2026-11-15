@@ -43,6 +43,7 @@ impl BetaCrownVerifier {
         engine: Option<&dyn GemmEngine>,
     ) -> Result<LinearBounds> {
         match layer {
+            Layer::PointLinear(_) => Err(crate::network::proof_eligibility::diagnostic_only()),
             Layer::Linear(linear) => linear
                 .propagate_linear_with_engine(output_bounds, engine)
                 .map(|cow| cow.into_owned()),
@@ -78,7 +79,7 @@ impl BetaCrownVerifier {
             }
             Layer::Tile(t) => {
                 // Tile needs input_shape before dispatch (same pattern as Transpose).
-                // Reference: ibp.rs Tile arm, dispatch.rs Tile arm (#3114).
+                // Reference: ibp.rs Tile arm, dispatch.rs Tile arm.
                 let mut tile_with_shape = t.clone();
                 tile_with_shape.set_input_shape(pre_bounds.shape().to_vec());
                 match tile_with_shape.propagate_linear(output_bounds) {
@@ -98,8 +99,8 @@ impl BetaCrownVerifier {
 
                 let mut conv_with_shape = conv.clone();
                 conv_with_shape.set_input_shape(in_h, in_w);
-                // #3399: Thread engine through Conv2d backward for GPU acceleration.
-                // #3813: ShapeMismatch triggers IBP concretization fallback.
+                // Thread engine through Conv2d backward for GPU acceleration.
+                // ShapeMismatch triggers IBP concretization fallback.
                 match conv_with_shape.propagate_linear_with_engine(output_bounds, engine) {
                     Ok(std::borrow::Cow::Owned(new_bounds)) => Ok(new_bounds),
                     Ok(std::borrow::Cow::Borrowed(_)) => Ok(output_bounds.clone()),
@@ -117,7 +118,7 @@ impl BetaCrownVerifier {
 
                 let mut conv_with_shape = conv.clone();
                 conv_with_shape.set_input_shape(in_h, in_w);
-                // #3813: ShapeMismatch triggers IBP concretization fallback.
+                // ShapeMismatch triggers IBP concretization fallback.
                 match conv_with_shape.propagate_linear_with_engine(output_bounds, engine) {
                     Ok(std::borrow::Cow::Owned(new_bounds)) => Ok(new_bounds),
                     Ok(std::borrow::Cow::Borrowed(_)) => Ok(output_bounds.clone()),
@@ -134,8 +135,8 @@ impl BetaCrownVerifier {
 
                 let mut conv_with_shape = conv.clone();
                 conv_with_shape.set_input_length(in_len);
-                // #3598: Thread engine through Conv1d backward for GPU acceleration.
-                // #3813: ShapeMismatch triggers IBP concretization fallback.
+                // Thread engine through Conv1d backward for GPU acceleration.
+                // ShapeMismatch triggers IBP concretization fallback.
                 match conv_with_shape.propagate_linear_with_engine(output_bounds, engine) {
                     Ok(std::borrow::Cow::Owned(new_bounds)) => Ok(new_bounds),
                     Ok(std::borrow::Cow::Borrowed(_)) => Ok(output_bounds.clone()),
@@ -152,8 +153,8 @@ impl BetaCrownVerifier {
 
                 let mut conv_with_shape = conv.clone();
                 conv_with_shape.set_input_length(in_len);
-                // #3598: Thread engine through ConvTranspose1d backward for GPU acceleration.
-                // #3813: ShapeMismatch triggers IBP concretization fallback.
+                // Thread engine through ConvTranspose1d backward for GPU acceleration.
+                // ShapeMismatch triggers IBP concretization fallback.
                 match conv_with_shape.propagate_linear_with_engine(output_bounds, engine) {
                     Ok(std::borrow::Cow::Owned(new_bounds)) => Ok(new_bounds),
                     Ok(std::borrow::Cow::Borrowed(_)) => Ok(output_bounds.clone()),
@@ -163,7 +164,7 @@ impl BetaCrownVerifier {
                     Err(e) => Err(e),
                 }
             }
-            // === All other layers: exhaustive trait dispatch (#3424) ===
+            // === All other layers: exhaustive trait dispatch ===
             // Every variant listed — no catch-all. Compiler catches new variants.
             //
             // Conv3d belongs HERE, not beside Conv1d/Conv2d above: it has no
@@ -275,8 +276,8 @@ pub(super) fn beta_crown_ibp_fallback(
 ) -> Result<LinearBounds> {
     match layer.propagate_crown_backward(output_bounds, Some(pre_bounds)) {
         Ok(new_bounds) => Ok(new_bounds),
-        // #3166: Catch UnsupportedOp and UnsupportedConfiguration.
-        // #2888: NumericalInstability also triggers IBP fallback — non-finite
+        // Catch UnsupportedOp and UnsupportedConfiguration.
+        // NumericalInstability also triggers IBP fallback — non-finite
         // pre-activation bounds should degrade gracefully, not abort the BaB pass.
         Err(
             NyError::UnsupportedOp(ref msg)
@@ -292,7 +293,7 @@ pub(super) fn beta_crown_ibp_fallback(
             );
             beta_crown_ibp_concretize(layer, output_bounds, pre_bounds, layer_idx)
         }
-        // #3813: ShapeMismatch triggers IBP fallback (RSPLITTER dimension changes).
+        // ShapeMismatch triggers IBP fallback (RSPLITTER dimension changes).
         // IBP concretization is always sound.
         Err(NyError::ShapeMismatch {
             ref expected,
@@ -321,7 +322,7 @@ fn beta_crown_ibp_concretize(
     _layer_idx: usize,
 ) -> Result<LinearBounds> {
     let post_bounds = layer.propagate_ibp(pre_bounds)?;
-    // #2239: directed rounding on f64→f32 for soundness.
+    // Directed rounding on f64→f32 for soundness.
     let concretized = output_bounds.concretize_sound(&post_bounds);
     let concretized_flat = concretized.flatten();
     let num_outputs = concretized_flat.len();

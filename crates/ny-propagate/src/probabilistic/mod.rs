@@ -14,8 +14,6 @@
 //!
 //! Phase 3: Distributional propagation (Boetius et al., ICML 2025)
 //! for distribution-aware bound propagation through CROWN linear relaxations.
-//!
-//! Part of #3921.
 
 use ndarray::ArrayD;
 use ny_core::{NyError, Result};

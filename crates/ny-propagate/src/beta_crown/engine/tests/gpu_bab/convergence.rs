@@ -8,7 +8,7 @@ use super::*;
 
 /// Diagnostic: Compare GPU BaB (GraphNetwork) vs sequential BaB (Network) on same model.
 ///
-/// This test exposes the root cause of #1817 by running both paths on an identical
+/// This test isolates GPU vs sequential divergence by running both paths on an identical
 /// 2-layer ReLU network and comparing whether both can verify the same property.
 ///
 /// The simple_graph_network is: Linear(2→2) -> ReLU -> Linear(2→1)
@@ -132,7 +132,7 @@ fn test_gpu_bab_vs_sequential_convergence() {
     );
 }
 
-/// Diagnostic #1817: Deep network (3 hidden layers) — sequential vs GPU BaB.
+/// Diagnostic: Deep network (3 hidden layers) — sequential vs GPU BaB.
 ///
 /// Uses a deeper network where BaB branching is required and compares the
 /// sequential Network path vs the GraphNetwork GPU BaB path. If bounds
@@ -148,10 +148,23 @@ fn test_gpu_bab_deep_network_convergence() {
     let input =
         BoundedTensor::new(arr1(&[-1.0, -1.0]).into_dyn(), arr1(&[1.0, 1.0]).into_dyn()).unwrap();
 
-    // First: compute both path's root bounds to find a good threshold
+    // First: compute both path's root bounds to find a good threshold.
+    //
+    // This step measures bounds, not time, so it runs under the same 30 s
+    // budget as the BaB step below and therefore under the same root-warmup
+    // cap (`initial_bounds_fraction` 0.2 of the 27 s BaB slice, 5.4 s). It
+    // used to state 5 s, a 0.9 s cap, and this network's root pass sits inside
+    // that in a debug build on a loaded host. Measured 2026-10-09 (M5 Max,
+    // debug lib test binary): 0.085-0.146 s alone on a quiet host (3 runs),
+    // 0.09-0.72 s alone at load 28-35 (110 runs), and past 0.9 s once in a
+    // module run at load ~40, where the root came back `Unknown { "Initial-bound
+    // warmup exceeded its deadline cap before branching" }` and failed the
+    // `Verified` assertion below for a reason that is not this network's.
+    // The budget changes no bound: every run printed the same root output
+    // bounds and threshold, before and after.
     let root_config = BetaCrownConfig {
         verify_upper_bound: true,
-        timeout: Duration::from_secs(5),
+        timeout: Duration::from_secs(30),
         ..Default::default()
     };
 
@@ -176,8 +189,13 @@ fn test_gpu_bab_deep_network_convergence() {
         graph_root.domains_explored, graph_root.domains_verified, graph_root.result
     );
 
-    // Both should verify immediately with high threshold
+    // Both should verify immediately with high threshold: "immediately" as a
+    // count, not a clock. The root domain is the only one explored.
     assert_eq!(graph_root.result, BabVerificationStatus::Verified);
+    assert_eq!(
+        graph_root.domains_explored, 1,
+        "a threshold of 1000 verifies at the root, with no branching"
+    );
 
     // Now use a tight threshold that forces BaB branching
     // Pick a threshold between the root lower and upper bounds
@@ -246,7 +264,7 @@ fn test_gpu_bab_deep_network_convergence() {
     }
 }
 
-/// Diagnostic test for #1817: GPU BaB with a deeper MLP that forces BaB branching.
+/// Diagnostic test: GPU BaB with a deeper MLP that forces BaB branching.
 ///
 /// This test creates a 3-hidden-layer ReLU network where CROWN alone cannot
 /// verify the property, forcing the BaB loop to branch and tighten bounds.
@@ -388,7 +406,7 @@ fn test_gpu_bab_vs_sequential_deeper_mlp_1817() {
     );
 
     // --- Graph BaB (DomainList) ---
-    // #1817 diagnostics use tracing::debug! in multi_objective; no logger setup
+    // Diagnostics use tracing::debug! in multi_objective; no logger setup
     // is required for this regression assertion.
     let objective = vec![1.0]; // Single output
     let graph_verifier = BetaCrownVerifier::new(config);
@@ -428,7 +446,7 @@ fn test_gpu_bab_vs_sequential_deeper_mlp_1817() {
     );
 }
 
-/// #1817 diagnostic: Compare Network CROWN vs GraphNetwork CROWN initial bounds.
+/// Diagnostic: Compare Network CROWN vs GraphNetwork CROWN initial bounds.
 ///
 /// If GraphNetwork CROWN produces systematically wider bounds than sequential
 /// Network CROWN for the same architecture, the GPU BaB path will need more

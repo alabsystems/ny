@@ -75,15 +75,18 @@ mod traits;
 mod crown_backward_tests;
 // Standalone MAKE-OR-BREAK experiment (wired into NO verdict path): does the live
 // Metal/wgpu compiler preserve the error-free transforms double-single depends on?
-// Only compiles under the gpu-tests build, so a plain build/verdict run never sees it.
-#[cfg(all(test, feature = "gpu-tests"))]
+// Only compiles under the gpu-tests-uncharged build (it needs an UNCHARGED
+// verdict device), so a plain build/verdict run never sees it.
+#[cfg(all(test, feature = "gpu-tests-uncharged"))]
 mod double_single_probe;
 // `#u1` settling test for the PRODUCTION tiled `#eft-err` twin GEMM (per-element
 // bit-compare of (V,R) against a CPU twin executing the identical sequence).
-// Wired into NO verdict path; compiles only under the gpu-tests build.
+// Wired into NO verdict path; compiles only under the gpu-tests-uncharged build
+// (its device half needs an UNCHARGED verdict device, and its CPU-twin pin is
+// the reference those device comparisons read).
 #[cfg(test)]
 mod tests;
-#[cfg(all(test, feature = "gpu-tests"))]
+#[cfg(all(test, feature = "gpu-tests-uncharged"))]
 mod twin_composition_probe;
 
 use ny_tensor::{repair_inverted_bounds, InversionRepair};
@@ -94,8 +97,6 @@ use ny_tensor::{repair_inverted_bounds, InversionRepair};
 /// register spill) could bypass text-pattern–verified WGSL guards. This CPU-side
 /// post-sanitization matches the pattern in the CPU acceleration kernels
 /// (`accelerated/kernels.rs:94-107`).
-///
-/// Reference: #2785, #2642 (CPU kernel sanitization)
 pub(super) fn sanitize_readback(lower: &mut [f32], upper: &mut [f32]) {
     use crate::FALLBACK_BOUND;
     let len = lower.len().min(upper.len());

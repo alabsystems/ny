@@ -4,7 +4,7 @@
 
 //! Multi-objective alpha-state regression tests.
 //!
-//! Regression for #1851: when a multi-objective graph domain branches on a
+//! Regression: when a multi-objective graph domain branches on a
 //! neuron, child domains must keep optimized alpha for unconstrained neurons
 //! and drop the newly constrained neuron from alpha optimization state.
 
@@ -194,9 +194,17 @@ fn test_multi_objective_child_active_preserves_unconstrained_alpha_1851() -> Res
         )?
         .expect("active branch should be feasible");
 
+    // #alpha-split-refresh at child birth: the parent's 0.79 (ancestor-box
+    // value) must NOT survive — the child stores the neutral delta 0.5 with
+    // split_refresh=true, composing to the current-box heuristic (stale
+    // inherited alpha measurably loses to it; REGRESSION doc receipts).
     assert!(
-        (child.alpha_state.alpha("relu", 1) - 0.79).abs() < 1e-6,
-        "unconstrained neuron alpha should be warm-started from parent"
+        child.alpha_state.split_refresh(),
+        "split child stored alpha must be delta-form"
+    );
+    assert!(
+        (child.alpha_state.alpha("relu", 1) - 0.5).abs() < 1e-6,
+        "unconstrained neuron alpha must be neutralized at child birth"
     );
     assert!(
         child.alpha_state.neuron("relu", 0).is_none(),
@@ -231,9 +239,14 @@ fn test_multi_objective_child_inactive_preserves_unconstrained_alpha_1851() -> R
         )?
         .expect("inactive branch should be feasible");
 
+    // #alpha-split-refresh at child birth (see the active-branch twin above).
     assert!(
-        (child.alpha_state.alpha("relu", 1) - 0.79).abs() < 1e-6,
-        "unconstrained neuron alpha should be warm-started from parent"
+        child.alpha_state.split_refresh(),
+        "split child stored alpha must be delta-form"
+    );
+    assert!(
+        (child.alpha_state.alpha("relu", 1) - 0.5).abs() < 1e-6,
+        "unconstrained neuron alpha must be neutralized at child birth"
     );
     assert!(
         child.alpha_state.neuron("relu", 0).is_none(),
@@ -308,7 +321,7 @@ fn test_multi_objective_root_alpha_ab_benchmark_1851() -> Result<()> {
         heuristic.domains_explored
     );
 
-    // Regression for #1975: alpha-optimized intermediate bounds must be
+    // Regression: alpha-optimized intermediate bounds must be
     // forwarded to the spec-guided CROWN step (via `bootstrap.initial_node_bounds`
     // in compute_root_objective_bounds), not discarded. With the forwarding in
     // place the optimized path obtains the same intermediate bounds as the
@@ -332,7 +345,7 @@ fn test_multi_objective_root_alpha_ab_benchmark_1851() -> Result<()> {
     //    an over-strong, non-invariant claim and was removed (classification C).
     //
     // 2. The optimized path must still flow the forwarded bounds into the
-    //    spec-guided CROWN leaves and verify at least one subdomain (the #1975
+    //    spec-guided CROWN leaves and verify at least one subdomain (the
     //    bug previously starved it of bounds and collapsed it toward zero).
     assert!(
         !matches!(optimized.result, BabVerificationStatus::Verified)

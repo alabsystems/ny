@@ -11,7 +11,7 @@
 //!
 //! This is an explicit external-corpus measurement lane, not a test. Run one
 //! probe (or all of them, sequentially) with:
-//! `cargo run -p ny-cli --release --example spec_fastpath_gap_probe -- <name>`.
+//! `targo --unverified run -p ny-cli --release --example spec_fastpath_gap_probe -- <name>`.
 
 use ndarray::Array2;
 use ny_onnx::vnnlib::{load_vnnlib, OutputConstraint};

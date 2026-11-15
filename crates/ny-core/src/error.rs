@@ -140,7 +140,7 @@ pub enum NyError {
     #[error("Internal error: {0}")]
     InternalError(String),
 
-    /// GPU memory budget exceeded (#3515).
+    /// GPU memory budget exceeded.
     ///
     /// Returned when the estimated GPU memory footprint for CROWN backward
     /// exceeds the configured budget. The caller should fall back to CPU
@@ -174,7 +174,7 @@ pub enum NyError {
         site: &'static str,
     },
 
-    /// CPU dense-materialization budget exceeded (#3550).
+    /// CPU dense-materialization budget exceeded.
     ///
     /// Returned when the estimated CPU memory for a batched dense identity or
     /// Patches-to-Dense conversion exceeds `NY_DENSE_BUDGET_MB`.
@@ -195,7 +195,7 @@ pub enum NyError {
         site: &'static str,
     },
 
-    /// Per-node deadline exceeded during CROWN backward propagation (#3795).
+    /// Per-node deadline exceeded during CROWN backward propagation.
     ///
     /// Returned when a single-node backward step (e.g., Conv2d transpose GEMM)
     /// exceeds the per-node time budget. The caller should fall back to IBP
@@ -222,7 +222,7 @@ pub enum NyError {
     ///
     /// # Handling
     /// - BaB loop: prune the domain (don't add to queue, don't mark as failure)
-    /// - Callers MUST NOT count this as a propagation failure (#2926)
+    /// - Callers MUST NOT count this as a propagation failure
     #[error("Infeasible domain: {0}")]
     InfeasibleDomain(String),
 
@@ -251,7 +251,7 @@ impl NyError {
         NyError::ShapeMismatch { expected, got }
     }
 
-    /// Returns true if this error represents a per-node deadline exceeded (#3795).
+    /// Returns true if this error represents a per-node deadline exceeded.
     ///
     /// Used by fallback classification to structurally identify deadline
     /// timeouts without fragile string matching.
@@ -280,7 +280,7 @@ impl NyError {
     /// Returns true if this error represents an infeasible domain.
     ///
     /// Used by the BaB loop to distinguish infeasible domains (trivially
-    /// verified — empty set) from genuine propagation failures (#2926).
+    /// verified — empty set) from genuine propagation failures.
     pub fn is_infeasible_domain(&self) -> bool {
         matches!(self, NyError::InfeasibleDomain(_))
     }

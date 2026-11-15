@@ -1,10 +1,14 @@
 #!/bin/bash
 # Resumable NY scorecard measurement: runs the REAL competition entry point
 # (`ny vnncomp v1`) over each regular-track benchmark's instances.csv at
-# min(the row's official timeout, NY_MEASURE_CAP). The cap defaults to 120
-# seconds, so rows with larger official budgets are deliberately lower-bound
-# measurements rather than claims about the full competition budget. The exact
-# cap is sealed in the run manifest. Results go to an isolated per-run evidence
+# min(the row's official timeout, NY_MEASURE_CAP). THE CAP DEFAULTS TO 0,
+# MEANING NO CAP: every row gets the official budget, the only budget the
+# competition awards points for. (This header said "defaults to 120 seconds"
+# for long after `866e21946` changed it, contradicting the code ~850 lines
+# below and outliving the defect by months.) Set NY_MEASURE_CAP=<secs>
+# deliberately for a fast LOWER-BOUND sweep, and then read every resulting
+# `timeout` as "not measured", never as "cannot solve". The exact cap is
+# sealed in the run manifest. Results go to an isolated per-run evidence
 # directory (reports/measured-runs/<run-id> by default) in the official
 # results.csv format plus a trailing provenance field
 # (category,onnx,vnnlib,prep,RESULT,time,run_id). Legacy six-column rows remain
@@ -1320,7 +1324,7 @@ if [ "${NY_ALLOW_NONCUDA_MEASURE:-0}" != 1 ]; then
     *)
       echo "ERROR: solver binary was not built with the cuda+mip competition features" >&2
       echo "  --build-info reported: ${BUILD_INFO:-<unavailable>}" >&2
-      echo "  Rebuild with: cargo build --release -p ny-cli --features cuda,mip" >&2
+      echo "  Rebuild with: targo --unverified build --release -p ny-cli --features cuda,mip" >&2
       echo "  (set NY_ALLOW_NONCUDA_MEASURE=1 only for CPU-track debugging)" >&2
       exit 2
       ;;
@@ -1358,7 +1362,7 @@ case "$SCORECARD_BUILD_ID" in
     echo "  $BIN does not support --build-id, so no row it measures could name" >&2
     echo "  the verifier that produced it — the 2026-08-21 failure mode." >&2
     echo "  Rebuild, then re-run:" >&2
-    echo "    cargo build --release -p ny-cli --features mip,cuda --bin ny" >&2
+    echo "    targo --unverified build --release -p ny-cli --features mip,cuda --bin ny" >&2
     echo "    scripts/ny_binary_identity.sh --expect-scored" >&2
     exit 2
     ;;

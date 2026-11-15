@@ -5,11 +5,417 @@
 use super::super::layer::SoftmaxLayer;
 use super::super::utils;
 use super::sound::{softmax_objective_envelope_gate, with_softmax_objective_envelope_for_test};
-use crate::layers::softmax::bounds::constant_bounds_from_output;
 use crate::{BatchedLinearBounds, LinearBounds};
 use ndarray::{Array1, Array2, ArrayD, IxDyn};
 use ny_core::VerificationSoundnessMode;
 use ny_tensor::BoundedTensor;
+
+#[test]
+fn automatic_weighted_support_handles_vocabulary_width_without_quadratic_relaxation() {
+    let width = 4096;
+    let pre = BoundedTensor::new(
+        Array1::zeros(width).into_dyn(),
+        Array1::zeros(width).into_dyn(),
+    )
+    .unwrap();
+    let incoming = LinearBounds::new(
+        Array2::ones((1, width)),
+        Array1::from_vec(vec![-1.0]),
+        Array2::ones((1, width)),
+        Array1::from_vec(vec![-1.0]),
+    )
+    .unwrap();
+    let result = with_softmax_objective_envelope_for_test(false, || {
+        SoftmaxLayer::new(-1).propagate_linear_with_bounds(
+            &incoming,
+            &pre,
+            VerificationSoundnessMode::Sound,
+        )
+    })
+    .unwrap();
+    assert!(result
+        .lower_a()
+        .iter()
+        .chain(result.upper_a().iter())
+        .all(|&a| a == 0.0));
+    assert!(result.lower_b()[0] <= 0.0 && result.lower_b()[0] > -1e-6);
+    assert!(result.upper_b()[0] >= 0.0 && result.upper_b()[0] < 1e-6);
+}
+
+#[test]
+fn automatic_weighted_support_charges_original_coefficient_uncertainty() {
+    let pre = BoundedTensor::new(Array1::zeros(2).into_dyn(), Array1::zeros(2).into_dyn()).unwrap();
+    let incoming = LinearBounds::new_or_conservative_with_err(
+        Array2::ones((1, 2)),
+        Array1::zeros(1),
+        Array2::ones((1, 2)),
+        Array1::zeros(1),
+        Array2::from_elem((1, 2), 0.25),
+        Array2::from_elem((1, 2), 0.25),
+    )
+    .unwrap();
+    let result = SoftmaxLayer::new(-1)
+        .propagate_linear_with_bounds(&incoming, &pre, VerificationSoundnessMode::Sound)
+        .unwrap();
+    let concrete = result.concretize_sound(&pre);
+    assert!(concrete.lower()[[0]] <= 0.75 && concrete.upper()[[0]] >= 1.25);
+    assert!(concrete.lower()[[0]] > 0.7499 && concrete.upper()[[0]] < 1.2501);
+}
+
+#[test]
+fn grouped_automatic_softmax_preserves_coefficient_error_and_single_bias_seed() {
+    let pre =
+        BoundedTensor::new(ArrayD::zeros(IxDyn(&[2, 2])), ArrayD::zeros(IxDyn(&[2, 2]))).unwrap();
+    let incoming = LinearBounds::new_or_conservative_with_err(
+        Array2::ones((1, 4)),
+        Array1::from_vec(vec![0.5]),
+        Array2::ones((1, 4)),
+        Array1::from_vec(vec![0.5]),
+        Array2::from_elem((1, 4), 0.25),
+        Array2::from_elem((1, 4), 0.25),
+    )
+    .unwrap();
+    let result = SoftmaxLayer::new(1)
+        .propagate_linear_with_bounds(&incoming, &pre, VerificationSoundnessMode::Sound)
+        .unwrap();
+    // Each group's exact nominal value is one; its original coefficient
+    // uncertainty is +/-1/4. The original 1/2 bias occurs exactly once.
+    let concrete = result.concretize_sound(&pre);
+    assert!(concrete.lower()[[0]] <= 2.0 && concrete.lower()[[0]] > 1.9999);
+    assert!(concrete.upper()[[0]] >= 3.0 && concrete.upper()[[0]] < 3.0001);
+}
+
+#[test]
+fn batched_automatic_softmax_preserves_original_error_carriers() {
+    let pre =
+        BoundedTensor::new(ArrayD::zeros(IxDyn(&[2, 2])), ArrayD::zeros(IxDyn(&[2, 2]))).unwrap();
+    let mut incoming = BatchedLinearBounds::from_parts_unchecked(
+        ArrayD::ones(IxDyn(&[2, 1, 2])),
+        ArrayD::zeros(IxDyn(&[2, 1])),
+        ArrayD::ones(IxDyn(&[2, 1, 2])),
+        ArrayD::zeros(IxDyn(&[2, 1])),
+        vec![2, 2],
+        vec![2, 1],
+    );
+    incoming.lower_a_err = Some(ArrayD::from_elem(IxDyn(&[2, 1, 2]), 0.25));
+    incoming.upper_a_err = Some(ArrayD::from_elem(IxDyn(&[2, 1, 2]), 0.25));
+    let result = SoftmaxLayer::new(-1)
+        .propagate_linear_batched_with_bounds(&incoming, &pre, VerificationSoundnessMode::Sound)
+        .unwrap();
+    let concrete = result.concretize_sound(&pre).unwrap();
+    for batch in 0..2 {
+        assert!(concrete.lower()[[batch, 0]] <= 0.75 && concrete.lower()[[batch, 0]] > 0.7499);
+        assert!(concrete.upper()[[batch, 0]] >= 1.25 && concrete.upper()[[batch, 0]] < 1.2501);
+    }
+}
+
+#[test]
+fn group_fold_admits_infinite_logits_and_discharges_unfoldable_error() {
+    // Row 0 carries error only on the finite column (the infinite column's
+    // zero error contributes 0 by the 0*inf=0 convention), so it folds. Row 1
+    // carries error on the infinite column: its penalty is not finite, so the
+    // row must be discharged to the conservative row, not dropped by the
+    // grouped assembly that copies coefficients and biases only.
+    let coefficients = Array2::from_shape_vec((2, 2), vec![1.0, 0.5, 2.0, -1.0]).unwrap();
+    let error = Array2::from_shape_vec((2, 2), vec![0.125, 0.0, 0.0, 0.125]).unwrap();
+    let mut bounds = LinearBounds::new_or_conservative_with_err(
+        coefficients.clone(),
+        Array1::from_vec(vec![0.25, -0.5]),
+        coefficients,
+        Array1::from_vec(vec![0.75, 0.5]),
+        error.clone(),
+        error,
+    )
+    .unwrap();
+    super::grouped_sound::fold_group_coeff_err(
+        &mut bounds,
+        Array1::from_vec(vec![-2.0, 0.0]),
+        Array1::from_vec(vec![1.0, f32::INFINITY]),
+    )
+    .expect("an infinite logit endpoint is a legal group domain");
+    assert!(!bounds.has_coeff_err());
+    // Row 0: penalty 0.125 * max(|-2|, |1|) = 0.25, applied outward.
+    assert_eq!(bounds.lower_a().row(0).to_vec(), [1.0, 0.5]);
+    assert_eq!(bounds.upper_a().row(0).to_vec(), [1.0, 0.5]);
+    assert!(bounds.lower_b()[0] <= 0.0 && bounds.lower_b()[0] > -1e-6);
+    assert!(bounds.upper_b()[0] >= 1.0 && bounds.upper_b()[0] < 1.0 + 1e-6);
+    // Row 1: discharged on both sides.
+    assert!(bounds.lower_a().row(1).iter().all(|&a| a == 0.0));
+    assert!(bounds.upper_a().row(1).iter().all(|&a| a == 0.0));
+    assert_eq!(bounds.lower_b()[1], f32::NEG_INFINITY);
+    assert_eq!(bounds.upper_b()[1], f32::INFINITY);
+}
+
+#[test]
+fn batched_sound_softmax_answers_a_non_finite_group_with_its_constant_carrier() {
+    // Batch 0 is a finite point; batch 1 has an infinite logit endpoint. The
+    // objective is the sum of each batch's probabilities, exactly 1 at every
+    // input. The per-batch fold domain used to be a strict BoundedTensor and
+    // refused batch 1 outright.
+    let pre = BoundedTensor::new_unchecked(
+        ArrayD::from_shape_vec(IxDyn(&[2, 2]), vec![0.0, 0.0, 0.0, 0.0]).unwrap(),
+        ArrayD::from_shape_vec(IxDyn(&[2, 2]), vec![0.0, 0.0, 0.0, f32::INFINITY]).unwrap(),
+    )
+    .unwrap();
+    let mut incoming = BatchedLinearBounds::from_parts_unchecked(
+        ArrayD::ones(IxDyn(&[2, 1, 2])),
+        ArrayD::zeros(IxDyn(&[2, 1])),
+        ArrayD::ones(IxDyn(&[2, 1, 2])),
+        ArrayD::zeros(IxDyn(&[2, 1])),
+        vec![2, 2],
+        vec![2, 1],
+    );
+    incoming.lower_a_err = Some(ArrayD::from_elem(IxDyn(&[2, 1, 2]), 0.25));
+    incoming.upper_a_err = Some(ArrayD::from_elem(IxDyn(&[2, 1, 2]), 0.25));
+    let result = SoftmaxLayer::new(-1)
+        .propagate_linear_batched_with_bounds(&incoming, &pre, VerificationSoundnessMode::Sound)
+        .expect("a non-finite logit group is answered, not refused");
+    assert!(result.lower_a_err.is_none() && result.upper_a_err.is_none());
+    // Batch 0 is the point x = 0, so its bounds are its biases: the nominal
+    // sum 1 widened by the carried coefficient uncertainty 1/4.
+    assert!(result.lower_b[[0, 0]] <= 0.75 && result.lower_b[[0, 0]] > 0.7499);
+    assert!(result.upper_b[[0, 0]] >= 1.25 && result.upper_b[[0, 0]] < 1.2501);
+    // Batch 1: zero slopes and a finite constant carrier that contains every
+    // reachable value (1 +/- 1/4).
+    for j in 0..2 {
+        assert_eq!(result.lower_a[[1, 0, j]], 0.0);
+        assert_eq!(result.upper_a[[1, 0, j]], 0.0);
+    }
+    let (lower, upper) = (result.lower_b[[1, 0]], result.upper_b[[1, 0]]);
+    assert!(lower.is_finite() && upper.is_finite());
+    assert!(lower <= 0.75 && upper >= 1.25, "carrier [{lower}, {upper}]");
+}
+
+/// A logit box that the validating constructors would refuse.
+fn unchecked_logit_box(shape: &[usize], lower: Vec<f32>, upper: Vec<f32>) -> BoundedTensor {
+    BoundedTensor::new_unchecked(
+        ArrayD::from_shape_vec(IxDyn(shape), lower).unwrap(),
+        ArrayD::from_shape_vec(IxDyn(shape), upper).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Zero nominal coefficients with a 1/4 error plane on every column. One
+/// softmax group's objective is then `sum_j a_j p_j` with every `a_j` free in
+/// `[-1/4, 1/4]` and `p` on the simplex: it reaches every value of
+/// `[-1/4, 1/4]` and no other.
+fn zero_coefficients_with_quarter_error(outputs: usize, inputs: usize) -> LinearBounds {
+    let zero = Array2::<f32>::zeros((outputs, inputs));
+    let error = Array2::from_elem((outputs, inputs), 0.25_f32);
+    LinearBounds::new_or_conservative_with_err(
+        zero.clone(),
+        Array1::zeros(outputs),
+        zero,
+        Array1::zeros(outputs),
+        error.clone(),
+        error,
+    )
+    .unwrap()
+}
+
+#[test]
+fn non_finite_softmax_group_pays_the_incoming_coefficient_error_on_every_sound_route() {
+    // The probability box of a non-finite group is [0, 1]^n, so with zero
+    // coefficients its checked constant carrier is the point 0, and the charge
+    // for the incoming coefficient error is all that makes it reach -1/4 and
+    // 1/4. With all-ones coefficients the carrier [0, 2] contains 1 +/- 1/4
+    // whether or not the charge is paid, so that scenario cannot see a dropped
+    // charge.
+    let charged = |lower: f32, upper: f32, reach: f32, route: &str| {
+        assert!(
+            lower <= -reach && upper >= reach,
+            "{route}: carrier [{lower}, {upper}] misses reachable values of [-{reach}, {reach}]"
+        );
+        assert!(
+            lower > -reach - 1e-4 && upper < reach + 1e-4,
+            "{route}: carrier [{lower}, {upper}] is not the charged constant"
+        );
+    };
+
+    // The 1-D route itself.
+    let pre = unchecked_logit_box(&[3], vec![0.0; 3], vec![0.0, f32::INFINITY, 0.0]);
+    let result = SoftmaxLayer::new(-1)
+        .propagate_linear_with_bounds(
+            &zero_coefficients_with_quarter_error(1, 3),
+            &pre,
+            VerificationSoundnessMode::Sound,
+        )
+        .expect("the 1-D route answers a non-finite group");
+    assert!(!result.has_coeff_err());
+    assert!(result
+        .lower_a()
+        .iter()
+        .chain(result.upper_a().iter())
+        .all(|&a| a == 0.0));
+    charged(result.lower_b()[0], result.upper_b()[0], 0.25, "1-D");
+
+    // The grouped assembly: group 0 is the point (0, 0), group 1 has an
+    // infinite upper endpoint, and each group contributes [-1/4, 1/4]. Group 0
+    // is a point at the origin, so the whole bound is the bias.
+    let pre = unchecked_logit_box(&[2, 2], vec![0.0; 4], vec![0.0, 0.0, 0.0, f32::INFINITY]);
+    let result = SoftmaxLayer::new(-1)
+        .propagate_linear_with_bounds(
+            &zero_coefficients_with_quarter_error(1, 4),
+            &pre,
+            VerificationSoundnessMode::Sound,
+        )
+        .expect("the grouped route answers a non-finite group");
+    assert!(!result.has_coeff_err());
+    for j in 2..4 {
+        assert_eq!(result.lower_a()[[0, j]], 0.0);
+        assert_eq!(result.upper_a()[[0, j]], 0.0);
+    }
+    charged(result.lower_b()[0], result.upper_b()[0], 0.5, "grouped");
+
+    // The per-batch route: batch 1 is the non-finite group.
+    let mut incoming = BatchedLinearBounds::from_parts_unchecked(
+        ArrayD::zeros(IxDyn(&[2, 1, 2])),
+        ArrayD::zeros(IxDyn(&[2, 1])),
+        ArrayD::zeros(IxDyn(&[2, 1, 2])),
+        ArrayD::zeros(IxDyn(&[2, 1])),
+        vec![2, 2],
+        vec![2, 1],
+    );
+    incoming.lower_a_err = Some(ArrayD::from_elem(IxDyn(&[2, 1, 2]), 0.25));
+    incoming.upper_a_err = Some(ArrayD::from_elem(IxDyn(&[2, 1, 2]), 0.25));
+    let result = SoftmaxLayer::new(-1)
+        .propagate_linear_batched_with_bounds(&incoming, &pre, VerificationSoundnessMode::Sound)
+        .expect("the per-batch route answers a non-finite group");
+    assert!(result.lower_a_err.is_none() && result.upper_a_err.is_none());
+    for j in 0..2 {
+        assert_eq!(result.lower_a[[1, 0, j]], 0.0);
+        assert_eq!(result.upper_a[[1, 0, j]], 0.0);
+    }
+    for batch in 0..2 {
+        charged(
+            result.lower_b[[batch, 0]],
+            result.upper_b[[batch, 0]],
+            0.25,
+            "batched",
+        );
+    }
+}
+
+#[test]
+fn n_d_sound_softmax_refuses_nan_and_inverted_non_finite_groups_as_numerical_instability() {
+    // Group 1 of a [2, 2] softmax; group 0 is the point (0, 0). Before the
+    // non-finite repair the N-D sound assemblies refused every non-finite
+    // group with NumericalInstability, the kind the backward dispatch degrades
+    // to IBP. Only an ordered box with an infinite endpoint is answered now: a
+    // NaN or an inverted pair beside a non-finite endpoint keeps that refusal
+    // and its kind, with or without a coefficient-error plane (an InvalidSpec
+    // here would abort the pass instead of degrading it).
+    let inf = f32::INFINITY;
+    let nan = f32::NAN;
+    let outcomes = |lower: [f32; 2], upper: [f32; 2]| {
+        let pre = unchecked_logit_box(
+            &[2, 2],
+            vec![0.0, 0.0, lower[0], lower[1]],
+            vec![0.0, 0.0, upper[0], upper[1]],
+        );
+        let softmax = SoftmaxLayer::new(-1);
+        let grouped = softmax
+            .propagate_linear_with_bounds(
+                &LinearBounds::identity(4),
+                &pre,
+                VerificationSoundnessMode::Sound,
+            )
+            .map(|_| ());
+        let grouped_with_error = softmax
+            .propagate_linear_with_bounds(
+                &zero_coefficients_with_quarter_error(1, 4),
+                &pre,
+                VerificationSoundnessMode::Sound,
+            )
+            .map(|_| ());
+        let incoming = BatchedLinearBounds::from_parts_unchecked(
+            ArrayD::ones(IxDyn(&[2, 1, 2])),
+            ArrayD::zeros(IxDyn(&[2, 1])),
+            ArrayD::ones(IxDyn(&[2, 1, 2])),
+            ArrayD::zeros(IxDyn(&[2, 1])),
+            vec![2, 2],
+            vec![2, 1],
+        );
+        let batched = softmax
+            .propagate_linear_batched_with_bounds(&incoming, &pre, VerificationSoundnessMode::Sound)
+            .map(|_| ());
+        [
+            ("grouped", grouped),
+            ("grouped with an error plane", grouped_with_error),
+            ("batched", batched),
+        ]
+    };
+
+    let refused = [
+        ([0.0, 0.0], [0.0, nan]),
+        ([0.0, nan], [0.0, 0.0]),
+        ([0.0, nan], [0.0, nan]),
+        ([0.0, inf], [0.0, -inf]),
+        ([0.0, inf], [0.0, 0.0]),
+        ([0.0, 0.0], [0.0, -inf]),
+        // A finite inverted pair beside an ordered infinite endpoint.
+        ([1.0, 0.0], [0.0, inf]),
+    ];
+    for (lower, upper) in refused {
+        for (route, outcome) in outcomes(lower, upper) {
+            assert!(
+                matches!(outcome, Err(ny_core::NyError::NumericalInstability(_))),
+                "{route} on [{lower:?}, {upper:?}] must stay refused as NumericalInstability, got {outcome:?}"
+            );
+        }
+    }
+
+    let answered = [
+        ([0.0, 0.0], [0.0, inf]),
+        ([0.0, -inf], [0.0, 0.0]),
+        ([-inf, -inf], [inf, inf]),
+    ];
+    for (lower, upper) in answered {
+        for (route, outcome) in outcomes(lower, upper) {
+            assert!(
+                outcome.is_ok(),
+                "{route} on [{lower:?}, {upper:?}] is an ordered box and must be answered, got {outcome:?}"
+            );
+        }
+    }
+
+    // An all-finite inverted group never reaches the fold: the 1-D route
+    // refuses its score box first, as it did before.
+    for (route, outcome) in outcomes([1.0, 0.0], [0.0, 0.0]) {
+        assert!(
+            outcome.is_err(),
+            "{route}: a finite inverted group was answered"
+        );
+    }
+}
+
+#[test]
+fn checked_lse_stored_slopes_enclose_uniform_large_shift_without_tolerance() {
+    let point = Array1::from_vec(vec![1e8_f32; 3]);
+    let (la, lb, ua, ub) = SoftmaxLayer::new(-1)
+        .softmax_lse_affine_bounds(&point, &point)
+        .unwrap();
+    for i in 0..3 {
+        let lower = la
+            .row(i)
+            .iter()
+            .zip(&point)
+            .map(|(&a, &x)| a as f64 * x as f64)
+            .sum::<f64>()
+            + lb[i] as f64;
+        let upper = ua
+            .row(i)
+            .iter()
+            .zip(&point)
+            .map(|(&a, &x)| a as f64 * x as f64)
+            .sum::<f64>()
+            + ub[i] as f64;
+        assert!(
+            lower <= 1.0 / 3.0 && upper >= 1.0 / 3.0,
+            "row={i}: [{lower},{upper}]"
+        );
+    }
+}
 
 /// Helper: check that LSE affine bounds contain softmax at all vertex samples.
 fn assert_lse_bounds_enclose_vertices(
@@ -120,33 +526,20 @@ fn objective_envelope_candidates(
         .clone()
         .into_dimensionality::<ndarray::Ix1>()
         .expect("1-D upper");
-    let lse = with_softmax_objective_envelope_for_test(false, || {
-        layer.propagate_linear_with_bounds_1d_sound(bounds, &pre_lower, &pre_upper)
-    })
-    .expect("LSE candidate");
-    let softmax_box = SoftmaxLayer::propagate_ibp_with_axis(pre, 0).expect("exact 1-D IBP");
-    let constant = constant_bounds_from_output(bounds, &softmax_box).expect("constant candidate");
+    let (la, lb, ua, ub) = layer
+        .softmax_lse_affine_bounds(&pre_lower, &pre_upper)
+        .expect("checked LSE relaxation");
+    let lse = layer
+        .apply_affine_bounds(bounds, &la, &lb, &ua, &ub)
+        .expect("checked LSE composition");
+    let constant = layer
+        .weighted_objective_bounds(bounds, &pre_lower, &pre_upper)
+        .expect("checked weighted support");
     let envelope = with_softmax_objective_envelope_for_test(true, || {
         layer.propagate_linear_with_bounds_1d_sound(bounds, &pre_lower, &pre_upper)
     })
     .expect("objective envelope");
     (lse, constant, envelope)
-}
-
-fn assert_lower_row_exact(actual: &LinearBounds, expected: &LinearBounds, row: usize) {
-    assert_eq!(actual.lower_a.row(row), expected.lower_a.row(row));
-    assert_eq!(
-        actual.lower_b[row].to_bits(),
-        expected.lower_b[row].to_bits()
-    );
-}
-
-fn assert_upper_row_exact(actual: &LinearBounds, expected: &LinearBounds, row: usize) {
-    assert_eq!(actual.upper_a.row(row), expected.upper_a.row(row));
-    assert_eq!(
-        actual.upper_b[row].to_bits(),
-        expected.upper_b[row].to_bits()
-    );
 }
 
 fn grouped_objective_envelope_fixture(shape: &[usize]) -> (BoundedTensor, LinearBounds) {
@@ -198,10 +591,10 @@ fn assert_grouped_envelope_dominates_and_is_sound(
         );
         strict |= envelope_lower > baseline_lower + 1e-5 || envelope_upper + 1e-5 < baseline_upper;
     }
-    assert!(
-        strict,
-        "grouped envelope did not make any strict improvement"
-    );
+    let groups = pre.len() / 5;
+    assert!(envelope_concrete.lower()[[2]] > groups as f32 - 1e-4);
+    assert!(envelope_concrete.upper()[[2]] < groups as f32 + 1e-4);
+    let _ = strict; // Legacy extra-candidate improvement is no longer required.
 
     let lower: Vec<f32> = pre.lower().iter().copied().collect();
     let upper: Vec<f32> = pre.upper().iter().copied().collect();
@@ -339,27 +732,35 @@ fn objective_envelope_gate_is_exact_string_and_default_dark() {
 }
 
 #[test]
-fn objective_envelope_audit_fixture_exercises_all_four_row_choices() {
+fn automatic_weighted_support_preserves_whole_carriers_and_simplex_identity() {
     let (layer, pre, bounds) = objective_envelope_fixture();
     let (lse, constant, envelope) = objective_envelope_candidates(&layer, &pre, &bounds);
-
-    // Row 0 is the audited constant-lower / affine-upper witness.
-    assert_lower_row_exact(&envelope, &constant, 0);
-    assert_upper_row_exact(&envelope, &lse, 0);
-    // Row 1 is the audited affine-lower / constant-upper witness.
-    assert_lower_row_exact(&envelope, &lse, 1);
-    assert_upper_row_exact(&envelope, &constant, 1);
-    // Equal positive weights exploit sum(softmax)=1 and retain LSE on both
-    // sides for this fixture; row 3 is independently constant on both sides.
-    assert_lower_row_exact(&envelope, &lse, 2);
-    assert_upper_row_exact(&envelope, &lse, 2);
-    assert_lower_row_exact(&envelope, &constant, 3);
-    assert_upper_row_exact(&envelope, &constant, 3);
-
-    // Non-vacuity: every direction above genuinely distinguishes candidates.
+    // Equal weights have the exact mathematical value one at EVERY point.
+    // The automatic route must engage even with the historical extra gate off.
+    let default = with_softmax_objective_envelope_for_test(false, || {
+        layer.propagate_linear_with_bounds(&bounds, &pre, VerificationSoundnessMode::Sound)
+    })
+    .unwrap();
+    assert!(default.lower_a.row(2).iter().all(|&a| a == 0.0));
+    assert!(default.upper_a.row(2).iter().all(|&a| a == 0.0));
+    assert!(default.lower_b[2] <= 1.0 && default.lower_b[2] > 0.99999);
+    assert!(default.upper_b[2] >= 1.0 && default.upper_b[2] < 1.00001);
+    let legacy = lse.concretize_sound(&pre);
+    assert!(
+        legacy.upper()[[2]] - legacy.lower()[[2]] > 1e-4,
+        "checked reference must distinguish the stronger default"
+    );
     for row in 0..4 {
-        assert_ne!(lse.lower_a.row(row), constant.lower_a.row(row));
-        assert_ne!(lse.upper_a.row(row), constant.upper_a.row(row));
+        // A constant selection copies its complete zero coefficient row;
+        // an affine selection keeps the complete checked reference row.
+        assert!(
+            envelope.lower_a.row(row) == lse.lower_a.row(row)
+                || envelope.lower_a.row(row) == constant.lower_a.row(row)
+        );
+        assert!(
+            envelope.upper_a.row(row) == lse.upper_a.row(row)
+                || envelope.upper_a.row(row) == constant.upper_a.row(row)
+        );
     }
 
     let lse_concrete = lse.concretize_sound(&pre);
@@ -380,7 +781,7 @@ fn objective_envelope_audit_fixture_exercises_all_four_row_choices() {
 }
 
 #[test]
-fn objective_envelope_default_off_is_bit_identical_to_lse_composition() {
+fn automatic_weighted_support_strictly_improves_checked_lse_composition() {
     let (layer, pre, bounds) = objective_envelope_fixture();
     let pre_lower = pre
         .lower()
@@ -403,15 +804,18 @@ fn objective_envelope_default_off_is_bit_identical_to_lse_composition() {
     })
     .expect("default-off composition");
 
-    assert_eq!(gated_off.lower_a, historical.lower_a);
-    assert_eq!(gated_off.upper_a, historical.upper_a);
-    assert_eq!(
-        gated_off.lower_b.mapv(f32::to_bits),
-        historical.lower_b.mapv(f32::to_bits)
-    );
-    assert_eq!(
-        gated_off.upper_b.mapv(f32::to_bits),
-        historical.upper_b.mapv(f32::to_bits)
+    let baseline = historical.concretize_sound(&pre);
+    let improved = gated_off.concretize_sound(&pre);
+    let mut strict = false;
+    for row in 0..bounds.num_outputs() {
+        assert!(improved.lower()[[row]] >= baseline.lower()[[row]]);
+        assert!(improved.upper()[[row]] <= baseline.upper()[[row]]);
+        strict |= improved.lower()[[row]] > baseline.lower()[[row]] + 1e-5
+            || improved.upper()[[row]] + 1e-5 < baseline.upper()[[row]];
+    }
+    assert!(
+        strict,
+        "automatic support must make a certified improvement"
     );
 }
 
@@ -1361,7 +1765,11 @@ fn objective_envelope_routes_through_batched_sound_path() {
             }
         }
     }
-    assert!(strict, "batched envelope made no strict improvement");
+    for batch in 0..2 {
+        assert!(baseline_concrete.lower()[[batch, 2]] > 0.9999);
+        assert!(baseline_concrete.upper()[[batch, 2]] < 1.0001);
+    }
+    let _ = strict;
 }
 
 #[test]
@@ -1668,12 +2076,12 @@ fn batched_crown_non_finite_sound_falls_back() {
 }
 
 // =========================================================================
-// Cross-group f64 bias accumulation (#2489)
+// Cross-group f64 bias accumulation
 // =========================================================================
 
 #[test]
 fn crown_2d_many_groups_f64_bias_accumulation_2489() {
-    // Regression test for #2489: verify that cross-group bias accumulation
+    // Regression test: verify that cross-group bias accumulation
     // uses f64 intermediates. With 8 row-wise groups, f32 accumulation can
     // lose precision from alternating-sign cancellation. The f64 path
     // preserves precision and applies directed rounding.
@@ -1855,7 +2263,9 @@ fn objective_envelope_routes_through_flat_grouped_sound_path() {
         assert!(envelope_upper <= baseline_upper + 1e-6);
         strict |= envelope_lower > baseline_lower + 1e-5 || envelope_upper + 1e-5 < baseline_upper;
     }
-    assert!(strict, "flat-grouped envelope made no strict improvement");
+    assert!(baseline_concrete.lower()[[2]] > 1.9999);
+    assert!(baseline_concrete.upper()[[2]] < 2.0001);
+    let _ = strict;
 
     assert_flat_grouped_vertex_soundness(
         &envelope,
@@ -1871,9 +2281,6 @@ fn objective_envelope_routes_through_flat_grouped_sound_path() {
 }
 
 /// Test 3: Flat-grouped heuristic basic — lower <= upper, finite, correct shape.
-///
-/// Design: designs/2026-03-03-flat-grouped-softmax-crown-testing.md Test 3.
-/// Part of #3247.
 #[test]
 fn flat_grouped_heuristic_lower_le_upper() {
     let layer = SoftmaxLayer::new(-1).with_heuristic_sampling(true);
@@ -1953,9 +2360,6 @@ fn flat_grouped_heuristic_lower_le_upper() {
 /// The flat-grouped path decomposes `A @ softmax_all(x) = Σ_g A[:, g*s:(g+1)*s] @ softmax_g(x_g)`
 /// which is valid because softmax is applied independently per group. The bounds may be
 /// wider (less tight) than optimal for non-block-diagonal A, but are always sound.
-///
-/// Design: designs/2026-03-03-flat-grouped-softmax-crown-testing.md Test 4.
-/// Part of #3247.
 #[test]
 fn flat_grouped_detection_false_positive_sound() {
     let layer = SoftmaxLayer::new(-1);
@@ -2016,9 +2420,6 @@ fn flat_grouped_detection_false_positive_sound() {
 /// BilinearCrown creates 3D batched bounds, flattens to block-diagonal 2D, then
 /// softmax receives the flat bounds and triggers the flat-grouped path.
 /// Verifies this end-to-end flow produces sound results at all vertices.
-///
-/// Design: designs/2026-03-03-flat-grouped-softmax-crown-testing.md Test 5.
-/// Part of #3247.
 #[test]
 fn flat_grouped_round_trip_via_flatten() {
     let layer = SoftmaxLayer::new(-1);

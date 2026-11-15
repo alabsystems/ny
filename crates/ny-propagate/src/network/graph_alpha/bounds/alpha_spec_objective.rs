@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Per-disjunct spec-objective alpha optimizer (#4355).
+//! Per-disjunct spec-objective alpha optimizer.
 //!
 //! Extracted from `alpha.rs` to keep file sizes under 500 lines.
 
@@ -65,7 +65,7 @@ impl GpuSpecObjectiveEvaluation {
 }
 
 impl GraphNetwork {
-    /// Optimize alpha for a single spec-row objective (#4355).
+    /// Optimize alpha for a single spec-row objective.
     ///
     /// Takes pre-computed IBP bounds and an initial `GraphAlphaState`, runs the
     /// SPSA optimization loop targeting the lower bound of `spec_row^T output`,
@@ -85,6 +85,8 @@ impl GraphNetwork {
         spec_row: &[f32],
         engine: Option<&dyn ny_core::GemmEngine>,
     ) -> Result<GraphAlphaState> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::AlphaOpt);
         use crate::network::graph_alpha::spsa::spec_guided_lower;
 
         let output_node = if self.output_node.is_empty() {
@@ -272,7 +274,7 @@ impl GraphNetwork {
                         continue;
                     }
                     let neg_grad = -grad;
-                    // Channel-only alpha reduction (#4404)
+                    // Channel-only alpha reduction
                     let neg_grad = alpha_state.reduce_gradient(relu_name, &neg_grad);
                     match config.optimizer {
                         Optimizer::Adam => {
@@ -370,7 +372,7 @@ impl GraphNetwork {
             return None;
         }
         // Masked pre-activation lower per ReLU in FOLD order (mirrors the warmup-gradient
-        // path: zero where the neuron is not unstable, incl. #4404 channel→spatial expand).
+        // path: zero where the neuron is not unstable, incl. the channel→spatial expand).
         let mut pre_lowers: Vec<Vec<f32>> = Vec::with_capacity(relu_names.len());
         for name in &relu_names {
             let node = self.nodes.get(name)?;
@@ -833,7 +835,7 @@ mod direct_objective_tests {
             );
             assert!(expired.is_none());
             assert_eq!(expired_engine.calls(), 0);
-            assert!(expired_engine.deadline_writes().is_empty());
+            assert_eq!((expired_engine.deadline_writes()).len(), 0);
 
             let noncoop_engine = ScriptedDirectEngine::new(vec![7.25], 3.5);
             let noncoop = graph.try_gpu_spec_objective_evaluation(

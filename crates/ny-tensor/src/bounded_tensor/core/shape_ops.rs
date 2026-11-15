@@ -146,7 +146,7 @@ impl BoundedTensor {
     ///
     /// Use this instead of manual `flatten() → .lower().clone() →
     /// into_dimensionality::<Ix1>()` chains to avoid silent zero substitution
-    /// patterns (#1926, #1931).
+    /// patterns.
     pub fn flatten_to_ix1(
         &self,
         context: &str,

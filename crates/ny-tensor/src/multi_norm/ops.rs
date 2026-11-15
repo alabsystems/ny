@@ -21,7 +21,7 @@ impl MultiNormBounds {
         }
         let out_features = weight.shape()[1];
         // NaN-propagating split: IEEE 754 v.max(0.0) silently zeroes NaN weights,
-        // producing unsound (too-tight) bounds. See ny-core::nan_math, #2415, #3116.
+        // producing unsound (too-tight) bounds. See ny-core::nan_math.
         let w_pos = weight.mapv(nan_propagating_max_zero);
         let w_neg = weight.mapv(nan_propagating_min_zero);
 
@@ -93,13 +93,13 @@ impl MultiNormBounds {
 
         for b in 0..batch {
             let w = weight.slice(s![b, .., ..]);
-            // NaN-propagating split: see matmul() comment, #3116.
+            // NaN-propagating split: see matmul() comment.
             let w_pos = w.mapv(nan_propagating_max_zero);
             let w_neg = w.mapv(nan_propagating_min_zero);
 
             // Use as_standard_layout() to borrow when data is contiguous
             // (the common case), avoiding heap allocation per batch iteration.
-            // Ref: #3330 Finding 1 — eliminates ~577MB/batch of unnecessary churn.
+            // This eliminates ~577MB/batch of unnecessary churn.
             let lw_view = self.lw.slice(s![b, .., .., ..]);
             let lw_flat = lw_view
                 .as_standard_layout()
@@ -169,7 +169,7 @@ impl MultiNormBounds {
             ));
         }
 
-        // Sound concretization for dot product intermediate bounds (#2239).
+        // Sound concretization for dot product intermediate bounds.
         let concretized_a = self.concretize_sound()?;
         let concretized_b = other.concretize_sound()?;
         let (l_a, u_a) = concretized_a.into_parts();
@@ -301,7 +301,7 @@ impl MultiNormBounds {
     /// Uses DeepT's get_bounds_xy coefficients (alpha_l=l_y, beta_l=l_x, alpha_u=u_y, beta_u=l_x).
     pub fn mul_elementwise(&self, other: &Self) -> Result<Self> {
         self.ensure_compatible(other)?;
-        // Sound concretization for elementwise mul intermediate bounds (#2239).
+        // Sound concretization for elementwise mul intermediate bounds.
         let concretized_a = self.concretize_sound()?;
         let concretized_b = other.concretize_sound()?;
         let (l_a, _u_a) = concretized_a.into_parts();

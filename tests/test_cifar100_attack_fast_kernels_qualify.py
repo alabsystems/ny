@@ -123,6 +123,32 @@ def test_lever_receipt_v3_ignored_evidence_and_v2_compatibility() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "name", ["NY_MARGIN_ROW_HEAD_GROUPS", "NY_MARGIN_ROW_HEAD_DIRECTIONAL_CUTS"]
+)
+@pytest.mark.parametrize("enabled", [False, True])
+def test_owner_directed_default_provenance_has_exact_scope(
+    name: str, enabled: bool
+) -> None:
+    state = _v3_lever_state()
+    entry = state["receipt"]["levers"][0]
+    entry.update(
+        name=name, value=enabled, bucket="default_on", moat="high",
+        provenance="owner_directed",
+    )
+    ambient = {"NY_PHASE_TELEMETRY": "1"}
+    assert qualify._valid_v3_lever_state(state, require_resolved=True, ambient_env=ambient)
+    for field, value in [
+        ("name", "NY_UNAUTHORIZED_DEFAULT"), ("bucket", "debug"),
+        ("moat", "low"), ("value", 1), ("provenance", "unmeasured"),
+    ]:
+        invalid = json.loads(json.dumps(state))
+        invalid["receipt"]["levers"][0][field] = value
+        assert not qualify._valid_v3_lever_state(
+            invalid, require_resolved=True, ambient_env=ambient
+        )
+
+
 def _targets() -> list[qualify.Target]:
     targets = [
         qualify.Target(

@@ -25,7 +25,6 @@ impl GraphNetwork {
     /// Reference: Xu et al., "Fast and Complete: Enabling Complete Neural Network
     /// Verification with Rapid and Massively Parallel Bound Propagation" (ICLR 2021),
     /// Section 3.2.
-    /// Part of #3453, #3439.
     pub fn collect_alpha_crown_bounds_dag_warm(
         &self,
         input: &BoundedTensor,
@@ -95,12 +94,8 @@ impl GraphNetwork {
             let node = self.nodes.get(node_name).ok_or_else(|| {
                 NyError::InvalidSpec(format!("S-shaped node {} not found", node_name))
             })?;
-            let pre_activation = reference_bounds.get(node_name).ok_or_else(|| {
-                NyError::InvalidSpec(format!(
-                    "Pre-activation bounds for monotone node '{}' not found",
-                    node_name
-                ))
-            })?;
+            let pre_activation =
+                s_shaped_preactivation::resolve(node, node_name, input, &reference_bounds)?;
             match &node.layer {
                 Layer::Sigmoid(_) => alpha_state.add_sigmoid_node(node_name, pre_activation)?,
                 Layer::Tanh(_) => alpha_state.add_tanh_node(node_name, pre_activation)?,
@@ -196,7 +191,7 @@ impl GraphNetwork {
                     }
                 }
             }
-            // Upper alphas (#3393 dual alpha)
+            // Upper alphas (dual alpha)
             if let Some(warm_upper) = warm_start.alphas_upper.get(relu_name) {
                 if let (Some(new_upper), Some(mask)) = (
                     alpha_state.alphas_upper.get_mut(relu_name),
@@ -255,7 +250,7 @@ impl GraphNetwork {
         //
         // The loop structure mirrors collect_alpha_crown_bounds_dag (alpha.rs)
         // but starts from warm-started slopes instead of the default 0.5.
-        // Output node + element-wise best output bounds across iterations (#2251) — parity
+        // Output node + element-wise best output bounds across iterations — parity
         // with the main alpha-CROWN path (alpha.rs:285-307 + merge 497-543). The scalar
         // `best_output_lower` tracked in the loop is only a sum for logging; per-dimension
         // best recovers tightness the scalar comparison discards. Hoisted to function scope
@@ -414,7 +409,7 @@ impl GraphNetwork {
                         } else {
                             -grad
                         };
-                        // Channel-only alpha reduction (#4404)
+                        // Channel-only alpha reduction
                         let neg_grad = alpha_state.reduce_gradient(relu_name, &neg_grad);
                         match config.optimizer {
                             Optimizer::Adam => {
@@ -521,7 +516,7 @@ impl GraphNetwork {
         }
 
         // Merge the element-wise best output bounds (across optimization iterations) into the
-        // output node's bounds (#2251), mirroring alpha.rs:497-543. Intersect-only with the
+        // output node's bounds, mirroring alpha.rs:497-543. Intersect-only with the
         // existing reference∩CROWN bound, so the result stays a sound over-approximation; inversions
         // and disjoint elements fall back safely (clamp to ±inf / union). Without this the
         // scalar-sum comparison can discard per-dimension improvements the warm-start found.

@@ -549,7 +549,7 @@ fn test_grouped_safe_clip_empty_rows_returns_unchanged() {
         .unwrap();
 
     assert!(!outcome.infeasible_after_clip);
-    assert!(outcome.postclip_lower_bounds.is_empty());
+    assert_eq!((outcome.postclip_lower_bounds).len(), 0);
 }
 
 // Complete Clipping Dispatch Tests

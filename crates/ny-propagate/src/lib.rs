@@ -2,9 +2,8 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-// Under tRustc contract verification (`--cfg trust_verify`) the first-class
-// `core::contracts` attributes are unstable and need this gate; stable rustc
-// takes the no-op `trust` facade instead and never sees it. Same as ny-cert.
+// Enable compiler contracts in the verified lane; the unverified lane uses
+// NY's compatibility macros.
 #![cfg_attr(trust_verify, feature(contracts))]
 #![deny(unsafe_code)]
 #![allow(clippy::too_many_arguments)]
@@ -36,14 +35,16 @@
 //!
 //! # Parallel Verification
 //!
-//! For sequence models, use [`parallel::ParallelVerifier`] to parallelize
-//! verification across positions for near-linear speedup with cores.
+//! [`parallel::ParallelVerifier`] verifies sequence positions in parallel.
 
-// Link macOS Accelerate BLAS for ndarray::dot() acceleration (#4259).
+// Link macOS Accelerate BLAS for ndarray::dot() acceleration.
 #[cfg(target_os = "macos")]
 extern crate blas_src;
 
-// --- Internal modules (pub(crate) — use root re-exports instead) ---
+// --- Bound types and internal propagation support ---
+/// #poll-amortise: the shared amortiser for deadline polls in inner loops.
+/// Its counters are the unconditional observable for the amortisation.
+pub mod amortise;
 pub(crate) mod batched_constraint_store;
 /// Linear and interval bound types, α-CROWN configuration, and soundness arithmetic.
 ///
@@ -60,20 +61,25 @@ pub(crate) mod cgan_reclaim;
 /// only production admission path for the set.
 pub use cgan_reclaim::set_cgan_reclaim_preset;
 pub(crate) mod clip_interm_domain;
-/// NaN-safe comparison utilities for f32 sorting (#2981 Slice 3).
+/// NaN-safe comparison utilities for f32 sorting.
 pub(crate) mod cmp_utils;
 pub(crate) mod complete_clip;
-/// Multi-network bound composition for system-level verification (#3517).
+/// Multi-network bound composition for system-level verification.
 pub mod composition;
+/// Runtime containment fence for unsat-emitting paths (`#containment-fence`).
+/// Downgrade-only: it can refuse a non-containing bound, never create a proof.
+pub mod containment_fence;
 pub(crate) mod crown_backward_cap;
-/// Domain clipping strategies and configuration for tightening input bounds.
 /// Certified sparse-input double-double zonotope forward pass (`#dd-zonotope`).
 pub mod dd_zonotope;
+/// Domain clipping strategies for tightening input bounds.
 pub mod domain_clip;
 pub mod faer_parallelism;
 pub(crate) mod invprop;
 pub(crate) mod joint_bilinear;
 pub use joint_bilinear::set_joint_bilinear_preset;
+pub(crate) mod qdq_staircase;
+pub use qdq_staircase::set_qdq_staircase_ibp;
 pub(crate) mod l2_lever_gate;
 pub(crate) mod relaxed_clip;
 pub(crate) mod sdp_crown;
@@ -94,6 +100,12 @@ pub(crate) mod batched_domain;
 pub mod bench_batched;
 /// β-CROWN verifier: branch-and-bound with CROWN bounds for complete verification.
 pub mod beta_crown;
+/// #soundness-spine M2b/M2c: the trusted verdict facade — `Certified<f64>`, the
+/// mode-free strict `closed`, the path-based cover gate, and `UnsatToken`
+/// (the only thing a published `unsat` is built from).
+pub mod certify;
+/// Complete-vocabulary certificates over an independently supplied hidden box.
+pub mod decoder;
 pub mod elimination;
 pub mod equivalence;
 /// Run-scoped observations of optional verification treatments.
@@ -107,6 +119,10 @@ pub mod fast_f32_gemm;
 /// deadline (#fl-value-gpu-tier) — the deadline-capable sibling of
 /// `fast_f32_gemm`; the call site charges `γ^f32·S` + FTZ for its results.
 pub mod fl_value_gemm;
+/// `#vgg-gpu-crown`: certified patches-mode CROWN root pass whose coefficient
+/// products run on the sound GPU GEMM engine (typed `bab.gpu_patches_crown`,
+/// dark by default).
+pub mod gpu_patches_crown;
 /// Input-Manifold Bound (IMB) root floor — seam-cut affine tail + prefix-BaB
 /// certified floor (`NY_IMB=1`, default-OFF; STAGE 1 is log-only).
 pub mod imb;
@@ -117,6 +133,9 @@ pub mod imb;
 pub(crate) mod iter0_parity_trace;
 /// Layer implementations for IBP and CROWN bound propagation.
 pub mod layers;
+/// `#lowdim-prover`: sound input-split BaB for small-input-dimension graphs
+/// (forward-linear intermediates + backward objective). See the module docs.
+pub mod lowdim;
 /// Margin-row twin-wall BaB lane (#twinwall): certified-outward sparse CROWN
 /// margin rows over frozen gates for the cifar100/tinyimagenet resnet family.
 pub mod margin_row;
@@ -128,6 +147,11 @@ pub mod network;
 /// OUTPUT-node CROWN backwards can seed only the k referenced identity rows
 /// and scatter them over sound IBP bounds (#margin-subset-seed).
 pub(crate) mod output_margin_seed;
+/// Certified signed-strip transport for two nearby ReLU towers.
+pub mod paired_difference;
+pub(crate) mod paired_relu_hull;
+/// Checked original-coordinate affine proof reuse; nonlinear adapters are separate.
+pub mod region_atlas;
 pub use output_margin_seed::SpecOutputSeedScope;
 /// Parallel verification across sequence positions for near-linear speedup.
 pub mod parallel;
@@ -150,7 +174,7 @@ pub mod prelude;
 /// half of one promoted lever. Empty cells resolve exactly as before, so a
 /// build that ships no preset key is byte-identical.
 pub mod preset_gates;
-/// Probabilistic bounds via Monte Carlo sampling with CROWN certificates (#3921).
+/// Probabilistic bounds via Monte Carlo sampling with CROWN certificates.
 pub mod probabilistic;
 mod random;
 /// Thread-local scratch-buffer pool that recycles the per-domain / per-layer
@@ -171,6 +195,9 @@ pub(crate) mod spec_influence_cone;
 pub use random::{
     set_restart_offset as set_rng_restart_offset, RestartOffsetGuard as RngRestartGuard,
 };
+/// #soundness-spine M2d: downgrade-only guards (G2 containment, G3 spec
+/// agreement, G5 minimum margin + histogram), identical in both proof profiles.
+pub mod guards;
 /// Process-global optional sound f64 GEMM accelerator (e.g. CUDA cuBLAS) for the
 /// CPU CROWN backward's `A·W` / `|A|·|W|` products. Sound (order-independent
 /// `γ_n·S` bound) and works even under `sound_gpu_gate`.
@@ -182,28 +209,45 @@ pub mod sound_gpu_gate;
 pub mod soundness;
 /// Streaming verification for memory-efficient processing of large networks.
 pub mod streaming;
+/// #router-r6 O-TRIAL: the lanes' side of the optimizer's trial rules (the
+/// sites' pure machines, built only when the acting optimizer armed them).
+pub(crate) mod trial_sites;
 /// Shared types: propagation config, verification checkpoints, layer progress tracking.
 pub mod types;
 /// Verifier trait: common interface for all verification strategies.
 pub mod verifier;
+/// Shared certified binary64 zonotope core with explicit symbol IDs
+/// (`#cgan-child-zono` is its first user; V4 / vit extend it).
+pub mod zono_core;
 
 /// Batched constraint buffer for β-CROWN domain splitting.
 pub use batched_constraint_store::BatchedConstraintBuffer;
+/// #graph-lane-search (ENGINE_PROGRAM M7): the typed `bab.graph_search` arming.
+pub use beta_crown::GraphLaneSearch;
+/// #relusplitter-lp-refine (wave-6 C7): the typed `bab.mip_refine_intermediates` arming.
+pub use beta_crown::MipRefineIntermediates;
+/// #vit-v3-bankable: the typed `bab.mo_cover_certify` policy.
+pub use beta_crown::MoCoverCertify;
+/// #hull-root (wave-6 C4): the typed `bab.single_hidden_hull` mode.
+pub use beta_crown::SingleHiddenHullMode;
 /// β-CROWN verifier API: configuration, results, branching heuristics, and solver settings.
 pub use beta_crown::{
-    reset_bab_frontier_export, take_bab_frontier_seeds, BabFrontierSeed, BabVerificationStatus,
+    reset_bab_frontier_export, reset_sequential_initial_schedule_receipt, take_bab_frontier_seeds,
+    take_sequential_initial_schedule_receipt, BabFrontierSeed, BabVerificationStatus,
     BatchedSpecBackwardResult, BetaCrownConfig, BetaCrownResult, BetaCrownVerifier,
     BranchingHeuristic, ChildBoundCalibrationConfig, ConjunctiveProofObjectiveProvenance,
-    ConjunctiveProofObjectives, ConvMode,
-    DenseSpecReboundMode, DenseSpecStageTiming, DepthTwoBranchLookaheadConfig,
-    DepthTwoBranchLookaheadMode, DomainSpecCrownResult, GraphDomainBatchCallerLane,
-    GraphDomainBatchMetricsSink, GraphDomainBatchRecord, GraphPrecomputedBounds, InputClipType,
-    InputSplitBatchRecord, InputSplitMetricsSink, JointMarginCloser, KfsbReduceOp,
-    OwnedSignNormalizedObjectiveSet, PhaseBudgetConfig, ResidentObjectiveInvalidV1,
-    ResidentObjectiveObservationV1, ResidentObjectiveReceiptV1, ResidentObjectiveUnsupportedV1,
-    VerificationArtifactAuthority, ViolationWitness, ATOMIC_ROOT_C_MARGIN_MAX_ITERATIONS,
-    BAB_FRONTIER_CORNER_BOXES,
+    ConjunctiveProofObjectives, ConvMode, DenseSpecReboundMode, DenseSpecStageTiming,
+    DepthTwoBranchLookaheadConfig, DepthTwoBranchLookaheadMode, DomainSpecCrownResult,
+    GraphDomainBatchCallerLane, GraphDomainBatchMetricsSink, GraphDomainBatchRecord,
+    GraphPrecomputedBounds, InputClipType, InputSplitBatchRecord, InputSplitMetricsSink,
+    JointMarginCloser, KfsbReduceOp, OwnedSignNormalizedObjectiveSet, PhaseBudgetConfig,
+    ResidentObjectiveInvalidV1, ResidentObjectiveObservationV1, ResidentObjectiveReceiptV1,
+    ResidentObjectiveUnsupportedV1, SequentialEarlyQuitDisposition, SequentialInitialSchedule,
+    SequentialInitialScheduleReceipt, SharedGraphBootstrap, VerificationArtifactAuthority,
+    ViolationWitness, ATOMIC_ROOT_C_MARGIN_MAX_ITERATIONS, BAB_FRONTIER_CORNER_BOXES,
 };
+/// #vgg-gpu-crown: the typed `bab.gpu_patches_crown` arming and its outcome.
+pub use gpu_patches_crown::{GpuPatchesCrownConfig, GpuPatchesCrownOutcome, GpuPatchesPrecision};
 
 /// Propagation configuration, verification checkpoints, and layer progress tracking.
 pub use types::{
@@ -227,8 +271,8 @@ pub use bounds::{
 /// I7): the CLI flight recorder mirrors the last admit/refuse decision with
 /// its calibrated rate into the sidecar.
 pub use network::{
-    forward_linear_admission_record, forward_linear_measured_rate, ForwardLinearAdmissionRecord,
-    ForwardLinearRateObservation,
+    forward_linear_admission_record, forward_linear_measured_rate, set_forward_linear_f32_seam,
+    ForwardLinearAdmissionRecord, ForwardLinearRateObservation,
 };
 
 /// Collector walk-admission telemetry (#cprime-admission, I7): estimate-then-
@@ -238,7 +282,6 @@ pub use network::{collector_walk_admission_record, CollectorWalkAdmissionRecord}
 
 /// Network representations (sequential and graph) with bound propagation engines.
 ///
-/// `relu_crown_relaxation` is pub for Kani proof access but not called from production runtime.
 /// `relu_ibp` has been moved to `layers::activations::relu::ibp`.
 pub use network::{
     compose_one_axis_dnf_observations, point_vjp_forward_masks, point_vjp_resnet_forward_masks,
@@ -278,6 +321,11 @@ pub use network::f64_propagate::{
 /// Sound f64 interval graph forward for (near-)point cell inputs (#cctsdb Phase C).
 pub use network::graph_ibp_f64_cell::Interval64;
 
+/// Exact-f64 twin of the batched point-VJP plans (#sbench-f64-attack).
+/// ATTACK-only: steers the wrapper's float64 target-margin repair; every
+/// candidate still passes the trusted ORT + true-f64 gate.
+pub use network::{PointVjpF64Plan, PointVjpF64Tape};
+
 /// Seed-axis count for the f64 first-order centered form (#f64-mvf): callers
 /// gating the centered pass on box shape MUST use this so the gate matches
 /// the walk's seeding rule.
@@ -296,18 +344,18 @@ pub use network::graph_ibp_f64_batch::batch_boxes_enabled;
 /// `GraphNetwork::build_f64_weight_cache`, pass to the `_cached` entries.
 pub use network::graph_ibp_f64_batch::F64WeightCache;
 
-/// Dead-neuron analysis: classify each neuron as live / dead / constant (#4505).
+/// Dead-neuron analysis: classify each neuron as live / dead / constant.
 pub use analysis::{
     analyze_neurons, analyze_neurons_with_epsilon, AnalysisResult, NeuronAnalysis, NeuronStatus,
 };
 
-/// Dead-neuron elimination: construct optimized network from analysis (#4505).
+/// Dead-neuron elimination: construct optimized network from analysis.
 pub use elimination::{
     eliminate_and_verify, eliminate_dead_neurons, EliminationAction, EliminationCertificate,
     EliminationEntry, EliminationVerification,
 };
 
-/// Equivalence verification: prove ||f(x) - g(x)|| < eps via difference network (#4484).
+/// Equivalence verification: prove ||f(x) - g(x)|| < eps via difference network.
 pub use equivalence::{build_difference_network, verify_equivalence, EquivalenceResult};
 
 /// Common verifier trait for all verification strategies.
@@ -328,7 +376,7 @@ pub use streaming::{
 // NOTE: ny-core types (Bound, NyError, Result, VerificationResult, VerificationSpec)
 // and ny-tensor types (BoundedTensor) are NOT publicly re-exported here.
 // Import them from their defining crates: ny_core and ny_tensor.
-// See #2229 for rationale: re-exports create ambiguous import paths.
+// Rationale: re-exports create ambiguous import paths.
 //
 // Internal crate code that previously used `crate::BoundedTensor` etc. is supported
 // via pub(crate) re-exports below.
@@ -339,10 +387,10 @@ pub(crate) use ny_tensor::BoundedTensor;
 pub(crate) use util::{contiguous_flat_slice, contiguous_flat_slice_mut};
 
 // --- Internal re-exports for crate-internal use (tests, beta_crown, etc.) ---
-// These items were removed from the public API (#2217) but are still needed
+// These items were removed from the public API but are still needed
 // by internal modules. `pub(crate)` keeps them accessible within the crate
 // without leaking to external consumers.
-// #2217: allow(unused_imports) needed because staged-index clippy in multi-worker
+// allow(unused_imports) needed because staged-index clippy in multi-worker
 // mode doesn't see the crate-internal consumers of these pub(crate) re-exports.
 // Waiver in .code_quality_waivers.toml tracks this.
 #[allow(unused_imports)]
@@ -373,8 +421,17 @@ pub(crate) use network::AttentionGraphBuilder;
 pub use pgd_attack::gama;
 pub use pgd_attack::{
     auto_alpha, project_to_bounds, project_to_bounds_in_place, AdamClippingParams,
-    ExactVjpPgdConfig, PgdAlphaMode, PgdAttacker, PgdConfig, PgdInitialization, PgdOptimizer,
-    PgdResult, PgdStepState, GAMA_LAMBDA_DEFAULT,
+    ExactVjpPgdConfig, PgdAlphaMode, PgdAttacker, PgdCancelToken, PgdConfig, PgdInitialization,
+    PgdOptimizer, PgdResult, PgdSetupRegrant, PgdStepState, GAMA_LAMBDA_DEFAULT,
+};
+/// #attack-vertex-geometry: the box-corner restart seed shared by the engine's
+/// PGD restart schedules and the VNN-COMP wrapper's upfront lane.
+pub use pgd_attack::{corner_seed_kind, corner_seed_point};
+/// #attack-open-disjuncts: the typed policy of the root-pruned per-disjunct
+/// attack stage (`BetaCrownConfig::open_disjunct_attack`).
+pub use pgd_attack::{
+    OpenDisjunctAttackConfig, OPEN_DISJUNCT_DEFAULT_MAX_FRAC, OPEN_DISJUNCT_DEFAULT_MAX_SECS,
+    OPEN_DISJUNCT_DEFAULT_MIN_SECS, OPEN_DISJUNCT_DEFAULT_RESTARTS,
 };
 pub use sound_gpu_gate::{is_sound_gpu_crown_required, set_sound_gpu_crown_required};
 #[allow(unused_imports)]
@@ -391,7 +448,7 @@ pub(crate) use types::{
 /// Block-wise verification result types.
 pub use types::{BlockBoundsInfo, BlockWiseResult};
 
-/// Multi-model pipeline composition for system-level verification (#3920).
+/// Multi-model pipeline composition for system-level verification.
 pub use composition::certificate::{BoundCertificate, BoundCertificationResult, BoundProvenance};
 pub use composition::mixer::{compose_linear_mix, MixerSpec};
 pub use composition::pipeline::{PipelineCertificate, PipelineStage, PipelineVerifier};

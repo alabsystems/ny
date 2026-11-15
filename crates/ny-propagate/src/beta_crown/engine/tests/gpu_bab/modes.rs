@@ -76,8 +76,6 @@ fn test_gpu_bab_ibp_mode() {
 /// Domain counts may differ between modes because warm-start can produce
 /// slightly different numerical bounds at the branch point (seeding from
 /// cached lA vs recomputing from output), which can affect branching decisions.
-///
-/// Part of #1669: acceptance criteria 3 — benchmark showing lA reuse effect.
 #[ntest::timeout(60000)]
 #[test]
 fn test_gpu_bab_la_warm_start_ab_comparison() {
@@ -169,10 +167,10 @@ fn test_gpu_bab_la_warm_start_ab_comparison() {
     );
 }
 
-/// Regression test for #1484: GPU BaB DomainList with beta optimization enabled
+/// Regression test: GPU BaB DomainList with beta optimization enabled
 /// should verify more domains than with beta optimization disabled.
 ///
-/// This tests the post-batched refinement pass added in #1484, where shallow
+/// This tests the post-batched refinement pass, where shallow
 /// children (depth <= beta_max_depth) get per-child beta optimization after
 /// the initial batched backward pass.
 ///
@@ -180,9 +178,6 @@ fn test_gpu_bab_la_warm_start_ab_comparison() {
 /// branching. With beta_iterations=0, the DomainList path uses single-pass
 /// CROWN (inherited beta). With beta_iterations>0, shallow children get
 /// iterative optimization to tighten bounds.
-///
-/// Issue: #1484
-/// Design: designs/2026-02-09-gpu-bab-beta-optimization-parity.md
 #[ntest::timeout(60000)]
 #[test]
 fn test_gpu_bab_beta_optimization_tightens_bounds_1484() {

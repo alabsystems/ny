@@ -4,7 +4,7 @@
 
 //! Builder for constructing attention-like graph patterns.
 //!
-//! Part of #145 - extracted from network/core.rs.
+//! Extracted from network/core.rs.
 
 use crate::layers::{
     AddLayer, BilinearCrownLayer, GELULayer, Layer, LinearLayer, ReLULayer, SoftmaxLayer,
@@ -88,10 +88,10 @@ impl AttentionGraphBuilder {
 
     /// Add a bounded matrix multiplication (Q @ K^T or probs @ V pattern).
     ///
-    /// Uses BilinearCrownLayer for all bilinear MatMuls. Broadcast McCormick (#286)
+    /// Uses BilinearCrownLayer for all bilinear MatMuls. Broadcast McCormick
     /// handles any seq length without O(seq^4) memory.
     ///
-    /// Returns the auto-generated node name, or an error on name collision. (#2686)
+    /// Returns the auto-generated node name, or an error on name collision.
     pub(crate) fn add_matmul(
         &mut self,
         input_a: &str,
@@ -108,7 +108,7 @@ impl AttentionGraphBuilder {
 
     /// Add a softmax operation.
     ///
-    /// Returns the auto-generated node name, or an error on name collision. (#2686)
+    /// Returns the auto-generated node name, or an error on name collision.
     pub(crate) fn add_softmax(&mut self, input: &str, axis: i32) -> Result<String> {
         let name = self.next_name("softmax");
         let layer = Layer::Softmax(SoftmaxLayer::new(axis));
@@ -119,7 +119,7 @@ impl AttentionGraphBuilder {
 
     /// Add element-wise addition (residual connection).
     ///
-    /// Returns the auto-generated node name, or an error on name collision. (#2686)
+    /// Returns the auto-generated node name, or an error on name collision.
     pub(crate) fn add_residual(&mut self, input_a: &str, input_b: &str) -> Result<String> {
         let name = self.next_name("add");
         let layer = Layer::Add(AddLayer);
@@ -130,7 +130,7 @@ impl AttentionGraphBuilder {
 
     /// Add a ReLU activation.
     ///
-    /// Returns the auto-generated node name, or an error on name collision. (#2686)
+    /// Returns the auto-generated node name, or an error on name collision.
     pub(crate) fn add_relu(&mut self, input: &str) -> Result<String> {
         let name = self.next_name("relu");
         let layer = Layer::ReLU(ReLULayer);
@@ -141,7 +141,7 @@ impl AttentionGraphBuilder {
 
     /// Add a GELU activation.
     ///
-    /// Returns the auto-generated node name, or an error on name collision. (#2686)
+    /// Returns the auto-generated node name, or an error on name collision.
     pub(crate) fn add_gelu(&mut self, input: &str) -> Result<String> {
         let name = self.next_name("gelu");
         let layer = Layer::GELU(GELULayer::default());
@@ -173,7 +173,7 @@ mod tests {
     use super::*;
     use crate::layers::ReLULayer;
 
-    // Part of #170 - AttentionGraphBuilder unit tests moved from core.rs
+    // AttentionGraphBuilder unit tests moved from core.rs
 
     #[ntest::timeout(10000)]
     #[test]
@@ -192,7 +192,7 @@ mod tests {
     #[ntest::timeout(10000)]
     #[test]
     fn test_attention_graph_builder_add_input() {
-        // Part of #171 - Test new add_input API
+        // Test the add_input API
         let mut builder = AttentionGraphBuilder::new();
         let name = builder.add_input("input", Layer::ReLU(ReLULayer)).unwrap();
         assert_eq!(name, "input");
@@ -319,7 +319,7 @@ mod tests {
         assert_eq!(builder.graph().num_nodes(), 4); // input + 3 relus
     }
 
-    // Part of #172 - Test collision detection
+    // Test collision detection
 
     #[ntest::timeout(10000)]
     #[test]

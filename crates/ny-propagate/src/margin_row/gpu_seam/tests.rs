@@ -78,6 +78,8 @@ pub(crate) fn chain_spec() -> TwinSpec {
                 input: 5,
                 weight: wh,
                 bias: vec![0.1, -0.1, 0.05, -0.05, 0.0, 0.2],
+                bias_err: Vec::new(),
+                weight_rel_err: 0.0,
                 shape: (6, 64),
             }, // t6 = y
             TwinOpSpec::Relu { input: 6 }, // t7, head relu
@@ -85,6 +87,8 @@ pub(crate) fn chain_spec() -> TwinSpec {
                 input: 7,
                 weight: wo,
                 bias: vec![0.0, 0.1, -0.1],
+                bias_err: Vec::new(),
+                weight_rel_err: 0.0,
                 shape: (3, 6),
             }, // t8
         ],
@@ -913,13 +917,13 @@ fn coefficient_conversion_is_exact_and_transposed() {
 ///
 /// Runs both the root gates and a piece-fixed domain; only the root sweep is a
 /// valid global falsifier, because a piece-fixed domain restricts the region.
-#[cfg(feature = "gpu-tests")]
+#[cfg(feature = "gpu-tests-uncharged")]
 #[test]
 fn gpu_seamed_pass_encloses_cpu_and_sampled_realizations_on_device() {
     use ndarray::Array2;
 
     let device = ny_gpu::WgpuDevice::new_for_verdict(ny_gpu::WgpuVerdictRequest::new())
-        .expect("gpu-tests requires a WGPU device passing all five authority rungs");
+        .expect("gpu-tests-uncharged requires an adapter passing the UNCHARGED five-rung ladder (subnormal-preserving, EFT-exact: measured on Vulkan+DenormPreserve); a pure-flush adapter (Apple/Metal) refuses by hardware");
     crate::sound_gpu_gate::set_sound_gpu_crown_required(true);
     let shared: Arc<dyn ny_core::GemmEngine> = Arc::new(device);
     crate::sound_gpu_gate::set_sound_gpu_crown_factory(move || Some(shared.clone()));
@@ -1001,13 +1005,13 @@ fn gpu_seamed_pass_encloses_cpu_and_sampled_realizations_on_device() {
 /// residual `Add`, and then re-runs the same two falsifiers as the chain test:
 /// the published bound must not exceed the CPU lane's bound, and it must not
 /// exceed any of 64 sampled forward realizations of the seeded functional.
-#[cfg(feature = "gpu-tests")]
+#[cfg(feature = "gpu-tests-uncharged")]
 #[test]
 fn gpu_seamed_residual_pass_runs_and_encloses_cpu_and_realizations_on_device() {
     use ndarray::Array2;
 
     let device = ny_gpu::WgpuDevice::new_for_verdict(ny_gpu::WgpuVerdictRequest::new())
-        .expect("gpu-tests requires a WGPU device passing all five authority rungs");
+        .expect("gpu-tests-uncharged requires an adapter passing the UNCHARGED five-rung ladder (subnormal-preserving, EFT-exact: measured on Vulkan+DenormPreserve); a pure-flush adapter (Apple/Metal) refuses by hardware");
     crate::sound_gpu_gate::set_sound_gpu_crown_required(true);
     let shared: Arc<dyn ny_core::GemmEngine> = Arc::new(device);
     crate::sound_gpu_gate::set_sound_gpu_crown_factory(move || Some(shared.clone()));
@@ -1083,4 +1087,43 @@ fn gpu_seamed_residual_pass_runs_and_encloses_cpu_and_realizations_on_device() {
         "a healthy device must never trip a soundness guard on the residual path"
     );
     crate::margin_row::prof::force_active_for_test(false);
+}
+
+/// #cct-margin-row-admission: a BN-folded head's certified fold error reaches
+/// the device plan's head `Linear` through the SAME `weight_error` composition
+/// the conv layers use — never silently dropped by the (default-dark) seam —
+/// while an unfolded head keeps its historical charge bit-for-bit.
+#[test]
+fn folded_head_fold_error_reaches_the_plan_head_charge() {
+    let head_cert = |spec: &TwinSpec| {
+        let (net, root, _, _) = compile(spec);
+        let eng = BackwardEngine::new(&net, &root);
+        let (layers, _) = build_layers(&eng, None).expect("chain plan");
+        let GpuCrownLayer::Linear { cert_err, .. } = &layers[0] else {
+            panic!("head Gemm must be the first backward layer")
+        };
+        *cert_err
+    };
+    let plain = head_cert(&chain_spec());
+    let mut folded_spec = chain_spec();
+    let TwinOpSpec::Gemm {
+        bias_err,
+        weight_rel_err,
+        ..
+    } = &mut folded_spec.ops[5]
+    else {
+        unreachable!("op 5 is the head gemm of the chain fixture")
+    };
+    // Inflated so the f32-rounded charge cannot absorb it.
+    *bias_err = vec![1e-3, 0.0, 2e-3, 0.0, 0.0, 5e-4];
+    *weight_rel_err = 1e-3;
+    let folded = head_cert(&folded_spec);
+
+    let unfolded_reference =
+        weight_error(0.0, &[0.1, -0.1, 0.05, -0.05, 0.0, 0.2], &[]).expect("composes");
+    assert_eq!(plain.weight_rel_err, unfolded_reference.weight_rel_err);
+    assert_eq!(plain.bias_abs_err, unfolded_reference.bias_abs_err);
+    assert!(f64::from(folded.weight_rel_err) >= 1e-3);
+    assert!(folded.weight_rel_err > plain.weight_rel_err);
+    assert!(f64::from(folded.bias_abs_err) >= 2e-3);
 }

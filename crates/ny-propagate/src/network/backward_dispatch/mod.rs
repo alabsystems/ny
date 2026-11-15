@@ -8,18 +8,13 @@
 //! strict entry point for finite Patches-to-Dense boundaries. All dispatch sites
 //! (graph_crown::propagation, graph_alpha::backward, graph_alpha::bounds,
 //! constraints::backward, spec_propagation, batched::backward_core) should route their layer match
-//! through this module to eliminate the drift risk documented in #1949.
+//! through this module so the per-site copies of that match cannot drift apart.
 //!
 //! The dispatch function handles the per-layer logic (shape setup, trait
 //! dispatch, error mapping) and returns a [`BackwardDispatchResult`] that
 //! tells the caller what to do with the resulting linear bounds. The caller
 //! retains control over accumulation strategy, fallback behavior (IBP vs
 //! error propagation), and mode-specific hooks (alpha/beta for ReLU).
-//!
-//! # Design
-//!
-//! Step B of the #1949 local-maximum unblock plan:
-//! `designs/archive/2026-02-11-backward-dispatch-local-maximum-unblock.md`
 
 mod concat;
 mod dispatch;
@@ -30,8 +25,12 @@ mod tests;
 mod tests_dispatch_arms;
 #[cfg(test)]
 mod tests_engine;
+#[cfg(test)]
+mod tests_target_view;
 mod types;
 
 // Re-export public API items at the module level for unchanged import paths.
-pub(crate) use dispatch::{dispatch_backward_layer, dispatch_backward_layer_finite_boundary};
-pub(crate) use types::{BackwardDispatchResult, DispatchContext};
+pub(crate) use dispatch::{
+    attn_crown_ternary_enabled, dispatch_backward_layer, dispatch_backward_layer_finite_boundary,
+};
+pub(crate) use types::{BackwardDispatchResult, DispatchContext, NodeBoundsView};

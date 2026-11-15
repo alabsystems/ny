@@ -19,3 +19,7 @@ mod tests;
 
 #[cfg(test)]
 pub(super) use batched_dense_specs::graph_bab_domain_shim;
+// The dense-spec partition predicate, re-exported for the oracle
+// tests in `propagation/batched/tests_soundness.rs` (partition law pin).
+#[cfg(test)]
+pub(in crate::beta_crown::engine::graph) use batched_multi::multi_objective_child_batchable;

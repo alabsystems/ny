@@ -1,0 +1,15 @@
+# Release-candidate smoke rows (scripts/release/smoke_submission.sh).
+# Small, fast CPU instances whose verdicts are banked (or stated by the official README for
+# the `test` category). Every row has its expected verdict re-derived from its source by the
+# runner before anything runs; a row whose source disagrees with this file is a step-0 failure.
+# Columns (TAB-separated): id benchdir(relative to --bench-root) category onnx vnnlib expected source
+r01	vnncomp2025/benchmarks/test	test	onnx/test_unsat.onnx	vnnlib/test_prop.vnnlib	unsat	readme:1-6 (unsat)
+r02	vnncomp2025/benchmarks/test	test	onnx/test_sat.onnx	vnnlib/test_prop.vnnlib	sat	readme:1-7 (sat)
+r03	vnncomp2025/benchmarks/acasxu_2023	acasxu_2023	onnx/ACASXU_run2a_1_9_batch_2000.onnx	vnnlib/prop_1.vnnlib	unsat	reports/measured/acasxu_2023.csv
+r04	vnncomp2025/benchmarks/acasxu_2023	acasxu_2023	onnx/ACASXU_run2a_5_3_batch_2000.onnx	vnnlib/prop_2.vnnlib	sat	reports/measured/acasxu_2023.csv
+r05	vnncomp2025/benchmarks/safenlp_2024	safenlp_2024	onnx/medical/perturbations_0.onnx	vnnlib/medical/hyperrectangle_1063.vnnlib	unsat	reports/measured/safenlp_2024.csv
+r06	vnncomp2025/benchmarks/safenlp_2024	safenlp_2024	onnx/medical/perturbations_0.onnx	vnnlib/medical/hyperrectangle_2882.vnnlib	sat	reports/measured/safenlp_2024.csv
+r07	vnncomp2025/benchmarks/tllverifybench_2023	tllverifybench_2023	onnx/tllBench_n=2_N=M=8_m=1_instance_0_0.onnx	vnnlib/property_N=8_0.vnnlib	unsat	reports/measured/tllverifybench_2023.csv
+r08	vnncomp2025/benchmarks/tllverifybench_2023	tllverifybench_2023	onnx/tllBench_n=2_N=M=8_m=1_instance_0_3.onnx	vnnlib/property_N=8_3.vnnlib	sat	reports/measured/tllverifybench_2023.csv
+r09	vnncomp2026/benchmarks/acasxu_2023/2.0	acasxu_2023	onnx/ACASXU_run2a_1_8_batch_2000.onnx	vnnlib/prop_1.vnnlib	unsat	reports/measured-2026/acasxu_2023.csv
+r10	vnncomp2026/benchmarks/acasxu_2023/2.0	acasxu_2023	onnx/ACASXU_run2a_2_4_batch_2000.onnx	vnnlib/prop_2.vnnlib	sat	reports/measured-2026/acasxu_2023.csv

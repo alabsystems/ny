@@ -413,7 +413,7 @@ impl BetaCrownConfig {
     }
 
     /// Validate all float config fields are finite and non-negative.
-    /// Returns a plain `String` error (no pyo3 dependency) for testability. (#3305)
+    /// Returns a plain `String` error (no pyo3 dependency) for testability.
     pub(crate) fn validate_inner(&self) -> Result<(), String> {
         let check = |name: &str, val: f32| -> Result<(), String> {
             if !val.is_finite() || val < 0.0 {
@@ -439,7 +439,7 @@ impl BetaCrownConfig {
     /// Validate all float config fields, returning `PyValueError` on failure.
     ///
     /// Called at the `to_rust()` boundary to prevent NaN/Inf/negative values
-    /// from flowing into the Rust verification engine. (#2899)
+    /// from flowing into the Rust verification engine.
     pub(crate) fn validate(&self) -> PyResult<()> {
         self.validate_inner().map_err(PyValueError::new_err)
     }

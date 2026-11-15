@@ -25,7 +25,7 @@ use super::{
     resolve_overall_deadline, resolve_pgd_attack, resolve_pgd_exact_vjp, resolve_preset_config,
     resolve_vgg_abcrown_decision, root_post_c_survivor_enabled_from_value, terminal_peel_policy,
     AppliedTerminalPeel, AttackSteeringRoute, BetaCrownInstanceOverrides, BetaCrownPresetSnapshot,
-    CganInputLeafRoute, DeferredPgdOwner, SharedAttackGemmOnly, TerminalPeelPolicy,
+    DeferredPgdOwner, SharedAttackGemmOnly, TerminalPeelPolicy,
 };
 use crate::commands::backend::BackendRequestSource;
 use crate::preset::{apply_preset, load_preset, PresetConfig};
@@ -176,10 +176,10 @@ fn frozen_kfsb_certificate_receipt_value_remains_runtime_authority() {
 #[test]
 fn frozen_chunk_wave_guard_remains_runtime_authority() {
     let decl = &ny_levers::decls::crown_ibp_budget::NO_CHUNK_WAVE_PAR;
-    let wave_levers = std::sync::Arc::new(ny_levers::LeverSet::freeze_with(
-        ny_levers::all(),
-        |name| (name == decl.name).then(|| "0".to_owned()),
-    ));
+    let wave_levers =
+        std::sync::Arc::new(ny_levers::LeverSet::freeze_with(ny_levers::all(), |name| {
+            (name == decl.name).then(|| "0".to_owned())
+        }));
     let frozen_wave =
         crate::commands::vnncomp::chunk_wave_parallel_enabled_from_levers(&wave_levers);
     assert!(frozen_wave, "exact zero must admit the experimental wave");
@@ -274,30 +274,6 @@ fn postbab_reserve_configured_deadline_must_strictly_win_every_authority() {
 }
 
 #[test]
-fn typed_cgan_route_arms_only_the_input_leaf_consult() {
-    let mut config = BetaCrownConfig::default();
-    let baseline = config.clone();
-    let exact_vjp = config.pgd_exact_vjp;
-    apply_instance_overrides(
-        &mut config,
-        &BetaCrownInstanceOverrides {
-            pgd_exact_vjp: Some(exact_vjp),
-            cgan_input_leaf_route: Some(CganInputLeafRoute::Cgan2023),
-            ..BetaCrownInstanceOverrides::default()
-        },
-    )
-    .unwrap();
-    assert!(config.input_split_input_leaf_oracle);
-    let mut expected = baseline;
-    expected.input_split_input_leaf_oracle = true;
-    assert_eq!(
-        serde_json::to_value(&config).unwrap(),
-        serde_json::to_value(&expected).unwrap(),
-        "the typed category route must not change any other verifier policy"
-    );
-}
-
-#[test]
 fn exact_vjp_instance_override_separates_compat_resolver_from_frozen_scored_policy() {
     let current = ny_propagate::ExactVjpPgdConfig::default();
     let frozen = ny_propagate::ExactVjpPgdConfig {
@@ -325,29 +301,11 @@ fn exact_vjp_instance_override_separates_compat_resolver_from_frozen_scored_poli
 }
 
 #[test]
-fn typed_traffic_terminal_softmax_peel_request_reaches_loader_precedence() {
-    let default_overrides = BetaCrownInstanceOverrides::default();
+fn terminal_peel_policy_follows_only_the_cli_request() {
+    assert_eq!(terminal_peel_policy(false), TerminalPeelPolicy::Off);
     assert_eq!(
-        terminal_peel_policy(false, &default_overrides),
-        TerminalPeelPolicy::Off
-    );
-    assert_eq!(
-        terminal_peel_policy(true, &default_overrides),
+        terminal_peel_policy(true),
         TerminalPeelPolicy::InteractiveLegacy
-    );
-
-    let traffic_overrides = BetaCrownInstanceOverrides {
-        traffic_terminal_softmax_peel: true,
-        ..BetaCrownInstanceOverrides::default()
-    };
-    assert_eq!(
-        terminal_peel_policy(false, &traffic_overrides),
-        TerminalPeelPolicy::TrafficSoftmaxSingleGroup
-    );
-    assert_eq!(
-        terminal_peel_policy(true, &traffic_overrides),
-        TerminalPeelPolicy::TrafficSoftmaxSingleGroup,
-        "typed traffic policy must not broaden to the legacy activation surface"
     );
 }
 
@@ -1240,6 +1198,7 @@ fn test_run_bab_with_fallback_writes_input_split_metrics_jsonl_4357() {
         Some(vnnlib.is_disjunction),
     );
     let mut ctx = DispatchContext {
+        input_head_continuation: None,
         model_path: Path::new("unused.onnx"),
         onnx_load_config: &onnx_load_config,
         model_net: &mut model_net,
@@ -1259,8 +1218,6 @@ fn test_run_bab_with_fallback_writes_input_split_metrics_jsonl_4357() {
         run_upfront_pgd: false,
         engine_owns_deferred_pgd: false,
         outer_wrapper_owns_deferred_pgd: false,
-        safenlp_direct_mip_first: false,
-        cgan_input_leaf_route: None,
         gemm_engine: None,
         attack_engine_source: super::attack_arming::AttackEngineSource::disarmed(),
         compute_device: None,
@@ -1270,7 +1227,10 @@ fn test_run_bab_with_fallback_writes_input_split_metrics_jsonl_4357() {
         domain_batch_metrics_jsonl: None,
         verification_start: Instant::now(),
         overall_deadline: None,
+        #[cfg(feature = "mip")]
+        verification_resources: None,
         post_bab_wrapper_attack_enabled: None,
+        attack_concurrent_wrapper: None,
         proof_opts: &proof_opts,
         json: true,
         sigmoid_peeled: false,
@@ -1319,6 +1279,7 @@ fn test_run_bab_with_fallback_writes_domain_batch_metrics_jsonl_4398() {
         Some(vnnlib.is_disjunction),
     );
     let mut ctx = DispatchContext {
+        input_head_continuation: None,
         model_path: Path::new("unused.onnx"),
         onnx_load_config: &onnx_load_config,
         model_net: &mut model_net,
@@ -1338,8 +1299,6 @@ fn test_run_bab_with_fallback_writes_domain_batch_metrics_jsonl_4398() {
         run_upfront_pgd: false,
         engine_owns_deferred_pgd: false,
         outer_wrapper_owns_deferred_pgd: false,
-        safenlp_direct_mip_first: false,
-        cgan_input_leaf_route: None,
         gemm_engine: None,
         attack_engine_source: super::attack_arming::AttackEngineSource::disarmed(),
         compute_device: None,
@@ -1349,7 +1308,10 @@ fn test_run_bab_with_fallback_writes_domain_batch_metrics_jsonl_4398() {
         domain_batch_metrics_jsonl: Some(metrics_path.as_path()),
         verification_start: Instant::now(),
         overall_deadline: None,
+        #[cfg(feature = "mip")]
+        verification_resources: None,
         post_bab_wrapper_attack_enabled: None,
+        attack_concurrent_wrapper: None,
         proof_opts: &proof_opts,
         json: true,
         sigmoid_peeled: false,
@@ -1737,7 +1699,7 @@ fn test_effective_interm_transfer_preserves_explicit_false_preset_4358() {
     );
 }
 
-/// Legacy helper superseded by `PhaseBudgetLedger::remaining()` (#2206 Packet B).
+/// Legacy helper superseded by `PhaseBudgetLedger::remaining()`.
 fn remaining_timeout_after_pgd(total_timeout: Duration, pgd_elapsed: Duration) -> Option<u64> {
     total_timeout
         .checked_sub(pgd_elapsed)
@@ -1895,7 +1857,7 @@ fn test_ibp_check_compares_thresholds_in_exact_f64() {
     assert!(ibp_check_vnnlib_safe(lower, upper, &greater));
 }
 
-// --- gpu_bab auto-promotion tests (#4406) ---
+// --- gpu_bab auto-promotion tests ---
 
 fn canonical_two_singleton_disjunction() -> VnnLibSpec {
     let clauses = vec![
@@ -2154,7 +2116,7 @@ fn resolve_enable_cuts_cli_flags_win() {
 #[test]
 fn resolve_enable_cuts_unsupported_model_class_forces_off() {
     use super::{resolve_enable_cuts, validate_cut_request};
-    // Graph input splitting does not support cuts (#3813): effective preset
+    // Graph input splitting does not support cuts: effective preset
     // and CLI requests are rejected before this defensive resolver forces off
     // unsupported authority.
     assert!(!resolve_enable_cuts(true, false, false, false));
@@ -2218,4 +2180,83 @@ fn resolve_preset_softmax_complex_parses_and_falls_back() {
     p.solver.alpha_crown.softmax = None;
     p.bab.alpha_crown.softmax = Some("complex".into());
     assert!(resolve_preset_softmax_complex(Some(&p)));
+}
+
+/// #softmax-fixed-index: `complex_fixed_index` is a member of the complex
+/// family (so the one kill switch covers it) and is the ONLY value that
+/// selects the fixed-index shift; plain `complex` keeps the constant shift.
+#[test]
+fn resolve_preset_softmax_fixed_index_selects_only_its_own_value() {
+    use super::{resolve_preset_softmax_complex, resolve_preset_softmax_fixed_index};
+
+    let mut p = PresetConfig::default();
+    assert!(!resolve_preset_softmax_fixed_index(None));
+    assert!(!resolve_preset_softmax_fixed_index(Some(&p)));
+
+    p.solver.alpha_crown.softmax = Some("complex_fixed_index".into());
+    assert!(resolve_preset_softmax_complex(Some(&p)));
+    assert!(resolve_preset_softmax_fixed_index(Some(&p)));
+
+    p.solver.alpha_crown.softmax = Some("Complex_Fixed_Index".into());
+    assert!(resolve_preset_softmax_complex(Some(&p)));
+    assert!(resolve_preset_softmax_fixed_index(Some(&p)));
+
+    p.solver.alpha_crown.softmax = Some("complex".into());
+    assert!(resolve_preset_softmax_complex(Some(&p)));
+    assert!(!resolve_preset_softmax_fixed_index(Some(&p)));
+
+    p.solver.alpha_crown.softmax = Some("fixed_index".into());
+    assert!(!resolve_preset_softmax_complex(Some(&p)));
+    assert!(!resolve_preset_softmax_fixed_index(Some(&p)));
+
+    p.solver.alpha_crown.softmax = None;
+    p.bab.alpha_crown.softmax = Some("complex_fixed_index".into());
+    assert!(resolve_preset_softmax_complex(Some(&p)));
+    assert!(resolve_preset_softmax_fixed_index(Some(&p)));
+}
+
+/// #multi-input-propagation, gate-off pin: with `model.multi_input_concat`
+/// unarmed (the shipped default), a multi-input model still sizes its input
+/// box from the FIRST input only, so a vnnlib covering all inputs is refused
+/// by the coordinate-count validation with EXACTLY this message — the same
+/// refusal smart_turn's 1,268,224-coordinate spec hits against the
+/// 64,000-element first input. Turning that refusal into a sound bound is the
+/// armed mechanism's job; the default path must keep refusing verbatim.
+#[test]
+fn multi_input_gate_off_keeps_first_input_box_refusal_verbatim() {
+    let dir = tempdir().expect("tempdir");
+    let prop_path = dir.path().join("two_input.vnnlib");
+    let mut spec = String::new();
+    for i in 0..5 {
+        spec.push_str(&format!("(declare-const X_{i} Real)\n"));
+    }
+    spec.push_str("(declare-const Y_0 Real)\n");
+    for i in 0..5 {
+        spec.push_str(&format!(
+            "(assert (>= X_{i} 0.0))\n(assert (<= X_{i} 1.0))\n"
+        ));
+    }
+    spec.push_str("(assert (>= Y_0 1.0))\n");
+    std::fs::write(&prop_path, spec).expect("write vnnlib");
+
+    // Model side: first input has 2 elements (the legacy sizing), while the
+    // spec covers the concatenated 5 = 2 + 3 of a two-input model.
+    let error = super::inputs::create_input_bounds(
+        &Some(prop_path),
+        None,
+        2,
+        1,
+        &[2],
+        false,
+        true,
+        0.0,
+        0.0,
+        false,
+    )
+    .expect_err("gate off: multi-input spec must refuse against first-input sizing");
+    assert_eq!(
+        error.to_string(),
+        "VNNLIB specifies 5 inputs but model expects 2 (shape [2])",
+        "the fail-closed refusal message is pinned verbatim"
+    );
 }

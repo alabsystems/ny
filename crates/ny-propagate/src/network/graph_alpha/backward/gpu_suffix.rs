@@ -39,7 +39,7 @@ impl GraphNetwork {
     ///
     /// Starting from `node_name`, walks backward through single-input nodes
     /// toward `NETWORK_INPUT`, extracting GPU layers. ReLU nodes with active
-    /// alpha use alpha-aware extraction (#4312); only S-shaped/Sqrt alpha
+    /// alpha use alpha-aware extraction; only S-shaped/Sqrt alpha
     /// forces CPU fallback.
     ///
     /// Returns `Some(concrete_bounds)` on success, `None` if fallback to CPU
@@ -252,7 +252,7 @@ impl GraphNetwork {
 
         loop {
             // Only bail for S-shaped/sqrt alpha (not yet supported on GPU).
-            // ReLU alpha is handled by alpha-aware extraction below (#4312).
+            // ReLU alpha is handled by alpha-aware extraction below.
             let has_non_relu_alpha = alpha_state.monotone_s_shaped_alpha(&current_name).is_some()
                 || alpha_state.sqrt_alpha(&current_name).is_some();
             if has_non_relu_alpha {
@@ -309,7 +309,7 @@ fn try_extract_relu_with_alpha(
                 pre_activation.lower().as_slice(),
                 pre_activation.upper().as_slice(),
             ) {
-                // #4404: expand channel-only alpha to full spatial for GPU extraction.
+                // Expand channel-only alpha to full spatial for GPU extraction.
                 let al_expanded = alpha_state.expand_alpha(node_name, al);
                 let au_expanded = alpha_state.expand_alpha(node_name, au);
                 let mask_expanded = if alpha_state.spatial_shape(node_name).is_some() {

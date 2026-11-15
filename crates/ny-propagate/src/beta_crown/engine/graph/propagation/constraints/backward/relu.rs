@@ -11,7 +11,7 @@
 //! - `try_process_constrained_relu_patches` — Patches-mode ReLU backward
 //! - `process_relu_override` — top-level ReLU dispatch for constrained backward
 //!
-//! Part of #4293 (directory-module split from former backward.rs monolith).
+//! Directory-module split from the former backward.rs monolith.
 
 use std::mem::{replace, size_of};
 
@@ -391,7 +391,7 @@ pub(super) fn apply_constrained_relu_beta_contribution(
         return Ok(());
     }
 
-    // Part of #2936: use indexed per-node iteration instead of O(B) full scan.
+    // Use indexed per-node iteration instead of an O(B) full scan.
     for entry in beta_state.entries_for_node(node_name) {
         super::super::ensure_constrained_propagation_deadline(
             deadline,
@@ -440,7 +440,7 @@ pub(super) fn has_constrained_relu_beta_entry(
     node_name: &str,
     beta_state: Option<&GraphBetaState>,
 ) -> bool {
-    // Part of #2936: O(1) via index instead of O(B) linear scan.
+    // O(1) via index instead of O(B) linear scan.
     beta_state.is_some_and(|beta_state| beta_state.has_node_entries(node_name))
 }
 

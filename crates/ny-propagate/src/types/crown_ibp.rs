@@ -17,27 +17,27 @@ pub enum CrownIbpFallbackReason {
     ShapeMismatch,
     /// CROWN/forward intersection was empty, so forward bounds were kept.
     EmptyIntersection,
-    /// Sequential CROWN Dense materialization exceeded the configured budget (#3515).
+    /// Sequential CROWN Dense materialization exceeded the configured budget.
     MemoryBudgetExceeded,
-    /// Aggregate time budget for patches-startable nodes exhausted (#3839).
+    /// Aggregate time budget for patches-startable nodes exhausted.
     ///
     /// The graph-native collector limits total wall-clock time spent on
     /// patches-startable targets to prevent expensive Conv2d backward passes
     /// from dominating collection time. This node was patches-eligible, but
     /// earlier patches nodes already consumed the available budget.
     PatchesBudgetExceeded,
-    /// Wall-clock deadline exceeded; used IBP bounds for this and remaining layers (#3328).
+    /// Wall-clock deadline exceeded; used IBP bounds for this and remaining layers.
     DeadlineExceeded,
-    /// Per-node time budget exceeded during backward CROWN pass (#3499).
+    /// Per-node time budget exceeded during backward CROWN pass.
     ///
     /// Unlike `DeadlineExceeded` (which skips all remaining nodes), this only
     /// affects the current target node. The tightening loop moves on to other
     /// nodes that may complete within their individual budgets.
     PerNodeDeadlineExceeded,
-    /// IBP interval width below the skip threshold; CROWN tightening skipped (#3499).
+    /// IBP interval width below the skip threshold; CROWN tightening skipped.
     WidthBelowThreshold,
     /// Node not in the demand-driven selection set; no downstream nonlinear consumer
-    /// requires tightened bounds at this producer (#3775).
+    /// requires tightened bounds at this producer.
     DemandDrivenSkip,
     /// Every demanded row consumed exclusively by ReLU successors is already
     /// stable under forward IBP, so backward CROWN has no unstable relaxation
@@ -135,10 +135,24 @@ pub enum CrownIbpFallbackReason {
     /// Kept at the end of this serialized enum so adding it does not renumber
     /// any pre-existing variant in non-self-describing serde formats.
     PerNodeBudgetBelowFloor,
+    /// A declared head-row opportunity retained only selected-row CROWN work,
+    /// or declined that opportunity while preserving its certified baseline.
+    ///
+    /// Successful selected intersections are committed before their original
+    /// deadline; unselected coordinates retain the applicable baseline bits.
+    /// The fallback event records stage, selected/target counts, and refusal
+    /// details. This tag alone does not assert a deadline was exceeded.
+    ///
+    /// This is partial collection provenance, never full-target `Crown` or a
+    /// structural omission. It must remain excluded from complete and reusable
+    /// truncated cache authority, including when the subset walk completed.
+    ///
+    /// Appended to preserve existing serialized variant indices.
+    SelectedHeadRows,
 }
 
 /// Preset-configurable overrides for CROWN-IBP collectors' per-node
-/// time-budget policy (#4413, #cgan-bn11-budget).
+/// time-budget policy (#cgan-bn11-budget).
 ///
 /// The collector assigns a remaining-deadline share to each tightening target
 /// and skips a node (sound IBP fallback) when its share falls below a floor.
@@ -182,6 +196,24 @@ pub struct CrownIbpPerNodeTimeBudget {
     /// rest of the window for nobody.
     #[serde(default)]
     pub max_target_share_frac: Option<f64>,
+    /// #per-node-floor-dim-scale (typed key
+    /// `bab.crown_ibp_per_node_floor_dim_scaled`): scale the resolved floor by
+    /// `min(1, raw_node_dims / PRESET_CAP_REFERENCE_DIMS)` before the
+    /// below-floor comparison, so a 128-wide dense target is held to a ~0.009 s
+    /// floor while a 28,800-row conv keeps the full 2.0 s.
+    ///
+    /// WHY: the share is cost-proportional and the floor is a constant, so the
+    /// constant refuses exactly the CHEAP targets — measured on 11/11 retained
+    /// ml4acopf early-quit logs, including the first two Gemm layers of the
+    /// 118-bus net, refused before any work while the whole cascade used 20 s
+    /// of 600. Composes with `floor_secs`: whatever floor resolves is scaled.
+    ///
+    /// SCHEDULING ONLY and moat-safe by construction: admitting a target that
+    /// was refused replaces its IBP-grade bound with a CROWN-IBP bound, both
+    /// sound, the latter tighter-or-equal. `false` (the default) keeps the
+    /// constant floor EXACTLY.
+    #[serde(default)]
+    pub floor_dim_scaled: bool,
 }
 
 /// Provenance tag for a bound returned by CROWN-IBP collection.
@@ -198,6 +230,8 @@ pub enum BoundsProvenance {
     /// `PartialCrownRowsDeadlineExceeded` case may retain fully completed CROWN
     /// rows after intersecting them with the forward bound, but it intentionally
     /// remains in this arm because the target collection did not complete.
+    /// `SelectedHeadRows` also remains here: completing its declared subset
+    /// never asserts that the whole target received CROWN tightening.
     ForwardFallback(CrownIbpFallbackReason),
 }
 

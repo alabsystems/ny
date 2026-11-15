@@ -29,7 +29,7 @@ impl EluLayer {
     /// mapping encloses exactly up to one outward ULP on the negative-branch
     /// upper endpoint. Negative alpha stays refused — it makes the negative
     /// branch decreasing, so ELU is no longer monotone and the pointwise
-    /// endpoint mapping would invert bounds (#2779).
+    /// endpoint mapping would invert bounds.
     pub fn try_new(alpha: f32) -> Result<Self> {
         Ok(Self {
             alpha: validate_nonnegative_finite(alpha, "EluLayer", "alpha")?,
@@ -59,7 +59,7 @@ impl BoundPropagation for EluLayer {
         let alpha = self.alpha;
         // Guard: ELU IBP requires alpha >= 0 for sound bound propagation.
         // - alpha < 0: f(x<0) = alpha*(exp(x)-1) is decreasing (non-monotone
-        //   overall), so pointwise IBP produces lower > upper. (#2779)
+        //   overall), so pointwise IBP produces lower > upper.
         // - alpha = 0 is ADMITTED: ELU degenerates to exactly ReLU (the
         //   negative branch is identically 0·(exp(x) − 1) = 0). The monotone
         //   endpoint mapping below stays sound and near-exact: the negative
@@ -87,7 +87,7 @@ impl BoundPropagation for EluLayer {
             ));
         }
         // Directed rounding: for x < 0, exp is a transcendental that can round
-        // either direction. Compute in f64, cast with next_down/next_up. (#1483)
+        // either direction. Compute in f64, cast with next_down/next_up.
         // For x >= 0, ELU(x) = x is exact (no rounding needed).
         let alpha64 = alpha as f64;
         let elu_lower = |x: f32| -> f32 {
@@ -95,8 +95,8 @@ impl BoundPropagation for EluLayer {
                 x
             } else {
                 // Range clamp: ELU(x) >= -alpha for all x. next_down_f32 can push
-                // past -alpha for extreme negative inputs (exp(-1000) → 0). (#3316)
-                // NaN-propagating: .max() swallows NaN (IEEE 754-2008). (#3316)
+                // past -alpha for extreme negative inputs (exp(-1000) → 0).
+                // NaN-propagating:.max() swallows NaN (IEEE 754-2008).
                 nan_propagating_max(
                     next_down_f32((alpha64 * ((x as f64).exp() - 1.0)) as f32),
                     -alpha,
@@ -135,12 +135,12 @@ impl BoundPropagation for EluLayer {
 /// for all x in [l, u].
 ///
 /// Delegates to the shared ELU-family relaxation (elu_family.rs) parameterized with
-/// ELU's mathematical expressions. Part of #2834.
+/// ELU's mathematical expressions.
 ///
 /// Ref: alpha-beta-CROWN auto_LiRPA/operators/nonlinear.py (ELU relaxation)
 pub(crate) fn elu_linear_relaxation(l: f32, u: f32, alpha: f32) -> LinearRelaxation {
     // Guard: alpha < 0 makes ELU non-monotone; non-finite alpha causes
-    // NaN/Inf. Return conservative (-inf, +inf). (#2779)
+    // NaN/Inf. Return conservative (-inf, +inf).
     //
     if !alpha.is_finite() || alpha < 0.0 {
         return LinearRelaxation::nan_fallback();
@@ -567,9 +567,9 @@ mod tests {
         assert!(layer.propagate_crown_backward(&bounds, None).is_err());
     }
 
-    // ========== Regression tests for #2779: negative/invalid alpha ==========
+    // ========== Regression tests: negative/invalid alpha ==========
 
-    /// Regression test for #2779: ELU IBP with negative alpha is unsound because
+    /// Regression test: ELU IBP with negative alpha is unsound because
     /// f(x) = alpha*(exp(x)-1) with alpha < 0 is not monotone. The guard must
     /// reject non-positive alpha at propagation time.
     #[test]
@@ -627,7 +627,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #2779: elu_linear_relaxation with bad alpha returns
+    /// Regression test: elu_linear_relaxation with bad alpha returns
     /// conservative (nan_fallback) bounds instead of unsound results.
     #[test]
     fn test_relaxation_negative_alpha_returns_conservative_2779() {
@@ -681,7 +681,7 @@ mod tests {
         }
     }
 
-    /// Regression test for #2779: verify that the specific example from the
+    /// Regression test: verify that the specific example from the
     /// issue (alpha=-1, l=-2, u=-0.5) is rejected rather than producing
     /// lower > upper.
     #[test]
@@ -704,7 +704,7 @@ mod tests {
         );
     }
 
-    /// Self-audit finding (#2779): CROWN backward with negative alpha must
+    /// Self-audit finding: CROWN backward with negative alpha must
     /// produce sound (±inf) bounds rather than unsound finite bounds. The
     /// domain_guard only checks pre-activation bounds, not alpha, so the
     /// guard in elu_linear_relaxation (nan_fallback) is the safety net.
@@ -743,7 +743,7 @@ mod tests {
         );
     }
 
-    // ── IBP guard regression tests (#3278) ────────────────────────────
+    // ── IBP guard regression tests ────────────────────────────
 
     #[test]
     fn test_ibp_nan_input_lower_rejected_3278() {
@@ -831,13 +831,13 @@ mod tests {
         );
     }
 
-    // ── NaN alpha absorption regression tests (#2714) ─────────────────
+    // ── NaN alpha absorption regression tests ─────────────────
 
     #[test]
     fn test_relaxation_nan_alpha_returns_nan_fallback_2714() {
         // NaN alpha triggers the non-finite alpha guard and returns
         // conservative (-inf, +inf) nan_fallback — not 0.0 from silently
-        // absorbed NaN via .max(0.0). (#2714 defense-in-depth)
+        // absorbed NaN via .max(0.0) (defense-in-depth).
         let r = elu_linear_relaxation(f32::NEG_INFINITY, 1.0, f32::NAN);
         assert_eq!(r.lower_intercept, f32::NEG_INFINITY);
         assert_eq!(r.upper_intercept, f32::INFINITY);
@@ -853,13 +853,13 @@ mod tests {
 
     #[test]
     fn test_relaxation_inf_alpha_returns_nan_fallback_2714() {
-        // Infinite alpha also triggers the guard (#2779).
+        // Infinite alpha also triggers the guard.
         let r = elu_linear_relaxation(-1.0, 1.0, f32::INFINITY);
         assert_eq!(r.lower_intercept, f32::NEG_INFINITY);
         assert_eq!(r.upper_intercept, f32::INFINITY);
     }
 
-    // ── CROWN relaxation soundness proptest (#3285) ─────────────────────
+    // ── CROWN relaxation soundness proptest ─────────────────────
 
     /// Reference ELU in f64, independent of the crate f32 implementation.
     fn elu_f64_reference(x: f64, alpha: f64) -> f64 {
@@ -984,7 +984,7 @@ mod tests {
     proptest::proptest! {
         #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(1000) })]
 
-        /// #3285: Verify elu_linear_relaxation produces strictly sound bounds.
+        /// Verify elu_linear_relaxation produces strictly sound bounds.
         /// For random intervals, the lower bound must satisfy
         ///   lower_slope * x + lower_intercept <= ELU(x)  for all x in [l, u]
         /// and the upper bound must satisfy

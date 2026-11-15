@@ -169,6 +169,12 @@ pub fn profile_bounds_model(
             cumulative_expansion,
             output_shape: output.shape().to_vec(),
             num_elements: output.lower().len(),
+            unstable_count: output
+                .lower()
+                .iter()
+                .zip(output.upper().iter())
+                .filter(|(l, u)| **l < 0.0 && **u > 0.0)
+                .count(),
             status,
         });
 

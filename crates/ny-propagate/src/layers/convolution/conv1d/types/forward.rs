@@ -262,7 +262,7 @@ impl Conv1dLayer {
         let mut new_lower_a = Array2::zeros((ctx.total_rows, conv_in_size));
         let mut new_upper_a = Array2::zeros((ctx.total_rows, conv_in_size));
 
-        // Track which output rows have non-finite coefficients (#3256, #2812).
+        // Track which output rows have non-finite coefficients.
         let mut lower_nonfinite_rows = vec![false; ctx.total_rows];
         let mut upper_nonfinite_rows = vec![false; ctx.total_rows];
 
@@ -501,7 +501,7 @@ impl Conv1dLayer {
             }
         }
 
-        // #3256: Zero rows with unsafe A-matrix coefficients.
+        // Zero rows with unsafe A-matrix coefficients.
         zero_nonfinite_rows(
             &mut new_lower_a,
             &mut new_upper_a,
@@ -552,7 +552,7 @@ impl Conv1dLayer {
 
         let new_input_shape = flattened_input_shape(bounds, conv_in_size);
 
-        // CROWN backward NaN firewall (#2812): conservative fallback instead of hard error.
+        // CROWN backward NaN firewall: conservative fallback instead of hard error.
         let mut out = BatchedLinearBounds::new_or_conservative(
             new_lower_a,
             new_lower_b,

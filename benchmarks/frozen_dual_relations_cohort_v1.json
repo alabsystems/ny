@@ -1,0 +1,105 @@
+{
+  "schema": "ny.frozen-dual-relations-cohort.v1",
+  "qualification": "internal original-data fixed-node correctness/discovery only; no official score, wall-time or speed qualification",
+  "model": {
+    "corpus_relative": "cora_2024/1.0/onnx/cifar10-set.onnx",
+    "sha256": "0fcc30f516cdb88f3f1f84056d38d05accc039996195e459865f409540faf9f1"
+  },
+  "baseline": {
+    "builder": "FrozenDualState::build original per-class slopes",
+    "search": "original certified scalar/block frozen-dual, refine_steps=0"
+  },
+  "candidate": {
+    "builder": "declaration-default original PerClass state; singleton M3 shared chart retained as independent composition control",
+    "search": "tier-local scoped phase multiplier proposals on admitted complete original charts, unchanged original FD eval_node authority",
+    "original_scalar_crosscheck_every": 1,
+    "tier_work_cap": 262144,
+    "max_pairs": 4,
+    "max_sample_rows": 16,
+    "sample_columns_per_row": 32,
+    "default_frontier": {
+      "state_selector": "per_class unchanged",
+      "search_selector": "f64 unchanged",
+      "eligible": "already materialized complete chart, original unstable<=512, complete-frame scope census plus bounded selection/replay admitted under262144 tier visits and256KiB optional cap",
+      "streamed_charts": "explicit skip; no claim of >512-row CNN arrival",
+      "changed_class_chart": "exact frame/global columns/common lambda+mu/selected original row binding; mismatch retires optional cache without allowance reset",
+      "no_new_model_pass": true,
+      "scope_census_reported": true,
+      "scope_census_is_not_measured_use": true
+    }
+  },
+  "comparison": {
+    "node_cap_positive": 5000,
+    "node_cap_negative": 256,
+    "internal_debug_tier_wall_seconds": 120,
+    "official_instance_budget_seconds": 30,
+    "timing_gate": false,
+    "performance_gain_required": false,
+    "gain_frontier": "real gates report complete scope census, refusals, discovery and actual proposal use separately; no real pruning/speed claim until measured eval_pruned>0 plus matched node reduction"
+  },
+  "gates": {
+    "positive": "frozen_dual_shared_relations_match_real_cora_charts_and_original_replay",
+    "negative": "frozen_dual_shared_relations_preserve_a_witnessed_real_cora_sat_chart",
+    "actual_relation_exact_dyadic": "fd_relations_record_actual_multipliers_and_replay_in_exact_rationals_all_evaluators",
+    "production_arrival": "fd_relations_default_shared_tier_arrives_and_keeps_every_witnessed_class_open",
+    "default_positive": "frozen_dual_default_per_class_relations_match_real_cora_and_original_replay",
+    "default_negative": "frozen_dual_default_per_class_relations_preserve_a_witnessed_real_cora_sat_chart",
+    "default_production_arrival": "fd_relations_default_per_class_tier_arrives_and_keeps_every_witnessed_class_open",
+    "streamed_skip": "fd_relations_default_streamed_chart_skips_without_changing_the_state_selector"
+  },
+  "cases": [
+    {
+      "tag": "img321",
+      "true_class": 0,
+      "adversarial_class": 4,
+      "property_corpus_relative": "cora_2024/1.0/vnnlib/cifar10-img321.vnnlib",
+      "property_sha256": "6919a87653040557a5452594e0fe2b77550a06bf69f6e7d82621480d1cc79573",
+      "arm_A_fixture": "crates/ny-cli/testdata/frozen_dual_p1/cifar10-set_img321_armA.txt",
+      "arm_A_sha256": "e5e6b93e93f90f89a73e9c2c15819c0978ab8b9750c591704ebf670ea2218d85",
+      "expected": "closed",
+      "same_root_bits_required": true,
+      "original_unstable": 172,
+      "original_generators": 3244,
+      "full_chart_row_frontier_qualified": true,
+      "complete_scope_and_use_qualification": "pending executable gate; read row counts alone does not imply scope admission or useful proposal arrival"
+    },
+    {
+      "tag": "img321",
+      "true_class": 0,
+      "adversarial_class": 2,
+      "property_corpus_relative": "cora_2024/1.0/vnnlib/cifar10-img321.vnnlib",
+      "property_sha256": "6919a87653040557a5452594e0fe2b77550a06bf69f6e7d82621480d1cc79573",
+      "arm_A_fixture": "crates/ny-cli/testdata/frozen_dual_p1/cifar10-set_img321_armA.txt",
+      "arm_A_sha256": "e5e6b93e93f90f89a73e9c2c15819c0978ab8b9750c591704ebf670ea2218d85",
+      "expected": "closed",
+      "same_root_bits_required": true,
+      "original_unstable": 172,
+      "original_generators": 3244,
+      "full_chart_row_frontier_qualified": true,
+      "complete_scope_and_use_qualification": "pending executable gate; read row counts alone does not imply scope admission or useful proposal arrival"
+    },
+    {
+      "tag": "img141",
+      "true_class": 4,
+      "adversarial_class": 0,
+      "property_corpus_relative": "cora_2024/1.0/vnnlib/cifar10-img141.vnnlib",
+      "property_sha256": "a2a08ae853a7940df237308075c5acda8be8c8aaa840ef1befc64784cfb71967",
+      "arm_A_fixture": "crates/ny-cli/testdata/frozen_dual_p1/cifar10-set_img141_armA.txt",
+      "arm_A_sha256": "e4478ba67944bcdb0c987f01d5f2b675b4c56759975aeb137f95c702c2f73b03",
+      "expected": "closed",
+      "same_root_bits_required": true,
+      "original_unstable": 280,
+      "original_generators": 3352,
+      "full_chart_row_frontier_qualified": true,
+      "complete_scope_and_use_qualification": "pending executable gate; read row counts alone does not imply scope admission or useful proposal arrival"
+    }
+  ],
+  "negative_control": {
+    "tag": "img141-swapped-target",
+    "original_property_sha256": "a2a08ae853a7940df237308075c5acda8be8c8aaa840ef1befc64784cfb71967",
+    "derivation": "original input box, original head; true class becomes original-network center runner-up; competitor is original center argmax",
+    "property_is_official_instance": false,
+    "expected": "open",
+    "original_double_double_center_margin_required": "strictly negative"
+  }
+}

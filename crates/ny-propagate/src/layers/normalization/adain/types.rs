@@ -14,7 +14,7 @@ use super::super::trait_norm::NormLayer;
 /// Style parameter source for AdaIN1d.
 ///
 /// - `Fixed`: style_gamma and style_beta are embedded constants (from ONNX initializers).
-///   This is the original `#3912` unary surface.
+///   This is the original unary surface.
 /// - `Variable`: style_gamma and style_beta come from preceding graph layers as bounded
 ///   intervals. The AdaIN node becomes ternary: `(x, style_gamma, style_beta)`.
 #[derive(Debug, Clone)]

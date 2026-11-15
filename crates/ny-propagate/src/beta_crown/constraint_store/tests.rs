@@ -211,7 +211,7 @@ fn test_header_size() {
 #[test]
 fn test_invalid_sense_byte_returns_error() {
     // A corrupted sense byte (e.g., from GPU buffer corruption) must be
-    // detected rather than silently reinterpreted (#2261).
+    // detected rather than silently reinterpreted.
     let mut header = ConstraintHeader::new(0, 0, 0.0, ConstraintSense::Le, ConstraintOrigin::Split);
     header.sense = 5; // Corrupt the sense byte
     let err = header.sense().unwrap_err();
@@ -239,7 +239,7 @@ fn test_invalid_origin_byte_returns_error() {
 #[test]
 fn test_get_returns_none_on_corrupted_data_range() {
     // A header with data_start/data_len pointing beyond the arena should
-    // return None rather than panicking on out-of-bounds slice (#2261).
+    // return None rather than panicking on out-of-bounds slice.
     let mut bad_store = ArenaConstraintStore::new();
     bad_store
         .add_constraint(
@@ -258,7 +258,7 @@ fn test_get_returns_none_on_corrupted_data_range() {
     );
 
     // Corrupt the existing header's data range to point beyond the arenas.
-    // Uses safe #[cfg(test)] helper instead of UB raw-pointer cast (#2754).
+    // Uses safe #[cfg(test)] helper instead of UB raw-pointer cast.
     bad_store.corrupt_header_data_range(0, 10, 5);
 
     // Corrupted header is rejected by indexed lookup.
@@ -318,7 +318,6 @@ fn test_iterator() {
 
 // =========================================================================
 // Tests for add_split_with_crown_bounds
-// Design doc: designs/2026-01-29-genbab-split-to-linear.md
 // =========================================================================
 
 #[ntest::timeout(5000)]
@@ -514,7 +513,7 @@ fn test_split_crown_both_bounds() {
 #[test]
 fn test_split_crown_all_zero_coeffs_infeasible_returns_error() {
     // When all CROWN coefficients are near-zero and the bias makes the
-    // constraint infeasible, the code should return an error (#2260).
+    // constraint infeasible, the code should return an error.
     // Example: CROWN says z >= 0*x - 1.0, split says z >= 0.0.
     // Constraint: 0*x + (0 - (-1)) <= 0 => 1 <= 0 (infeasible).
     let mut store = ArenaConstraintStore::new();
@@ -694,7 +693,7 @@ fn test_split_crown_multi_neuron() {
 }
 
 // =========================================================================
-// NaN/Inf rejection tests (#2259)
+// NaN/Inf rejection tests
 // ArenaConstraintStore must reject NaN/Inf in bias, coefficients, and
 // split points to prevent meaningless constraints from corrupting BaB.
 // =========================================================================
@@ -881,7 +880,7 @@ fn test_split_crown_rejects_inf_crown_coefficient() {
     );
 }
 
-/// Regression test for #2981 Slice 2: corrupted sense byte causes get() to
+/// Regression test Slice 2: corrupted sense byte causes get() to
 /// return None (constraint silently dropped). Before the fix, `.ok()?` silently
 /// converted the decode error to None. After the fix, a warn!() is emitted
 /// (not tested here since tracing subscriber setup is complex), but the
@@ -923,7 +922,7 @@ fn test_get_returns_none_on_corrupted_sense_byte() {
     );
 }
 
-/// Regression test for #2981 Slice 2: corrupted origin byte.
+/// Regression test Slice 2: corrupted origin byte.
 #[ntest::timeout(5000)]
 #[test]
 fn test_get_returns_none_on_corrupted_origin_byte() {
@@ -958,7 +957,7 @@ fn test_get_returns_none_on_corrupted_origin_byte() {
     );
 }
 
-/// Regression test for #2981 Slice 2: iter() correctly skips only corrupted
+/// Regression test Slice 2: iter() correctly skips only corrupted
 /// constraints while still returning valid ones.
 #[ntest::timeout(5000)]
 #[test]

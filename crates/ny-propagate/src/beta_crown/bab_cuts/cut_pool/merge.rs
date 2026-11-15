@@ -188,7 +188,7 @@ impl CutPool {
     }
 
     /// Create a parent cut by removing the term at the given index.
-    /// Returns `None` if the derived bias is non-finite (#3148).
+    /// Returns `None` if the derived bias is non-finite.
     fn create_parent_cut(cut: &CuttingPlane, remove_idx: usize) -> Option<CuttingPlane> {
         let terms: Vec<CutTerm> = cut
             .terms
@@ -202,7 +202,7 @@ impl CutPool {
         // This follows the BICCOS merging rule from alpha-beta-CROWN
         let bias = cut.bias - 1.0;
 
-        // Skip merge if bias arithmetic produced non-finite (#3148).
+        // Skip merge if bias arithmetic produced non-finite.
         // Extreme-bias cuts (near f32::MIN) can overflow to -Inf on subtraction.
         if !bias.is_finite() {
             return None;
@@ -248,7 +248,7 @@ impl CutPool {
     /// - Every term in P appears in C with the same coefficient sign
     /// - P has fewer terms (is more general)
     ///
-    /// Optimization (#2326 Finding 2): For each candidate cut, build a HashSet
+    /// Optimization: for each candidate cut, build a HashSet
     /// of its terms so that `is_parent_of` lookups are O(1) per parent term
     /// instead of O(T_child). Total complexity: O(n^2 * T_parent) instead of
     /// O(n^2 * T_parent * T_child).
@@ -290,8 +290,6 @@ impl CutPool {
     /// This is the optimized version of `is_parent_of` that avoids the O(T_child)
     /// linear scan per parent term. Total: O(T_parent) per check instead of
     /// O(T_parent * T_child).
-    ///
-    /// Reference: Issue #2326 Finding 2
     fn is_parent_of_with_set(
         parent: &CuttingPlane,
         child_term_set: &HashSet<(usize, usize, bool)>,

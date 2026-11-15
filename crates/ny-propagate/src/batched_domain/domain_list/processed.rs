@@ -47,10 +47,6 @@ impl ProcessedDomains {
     /// Used when the input domain list is empty or all domains have been
     /// filtered out (verified/infeasible). Replaces repeated struct literals
     /// across `domain_conversion/processed.rs`.
-    ///
-    /// Part of #1860's already-landed stale-body cleanup. The current
-    /// `#1860` EXECUTE design reserves Packet D for a separate frontier
-    /// remeasurement, not this constructor.
     pub fn empty() -> Self {
         Self {
             layer_lowers: HashMap::new(),
@@ -125,9 +121,6 @@ impl ProcessedDomains {
     /// * `new_input_lowers` - Updated input lower bounds: [batch, *input_shape]
     /// * `new_input_uppers` - Updated input upper bounds: [batch, *input_shape]
     /// * `keep_mask` - Which domains to keep (not verified/infeasible)
-    ///
-    /// # Reference
-    /// Design: `designs/2026-02-03-batched-domain-pickout-gpu-transfer.md`
     // Justification: Unbatching GPU results requires the batched source, per-domain output
     // bounds, per-layer bounds, updated input bounds, and keep mask — all from GPU kernel output.
     #[allow(clippy::too_many_arguments)]
@@ -169,10 +162,6 @@ impl ProcessedDomains {
     /// * `new_input_uppers` - Updated input upper bounds: [batch, *input_shape]
     /// * `keep_mask` - Which domains to keep (not verified/infeasible)
     /// * `cached_la_per_domain` - Optional cached lA per domain for reuse
-    ///
-    /// # Reference
-    /// Design: `designs/2026-02-03-batched-domain-pickout-gpu-transfer.md`
-    /// Issue: #1564 (lA matrix caching)
     // Justification: Same as from_batched_results plus optional cached lA matrices per domain
     // for reuse in child domain bound computation.
     #[allow(clippy::too_many_arguments)]
@@ -191,7 +180,7 @@ impl ProcessedDomains {
 
         // Invariant: batched vectors must be at least as long as batch_size.
         // Violation means the caller passed inconsistent data — silently defaulting
-        // would drop constraints or produce wrong bounds (#2226).
+        // would drop constraints or produce wrong bounds.
         assert!(
             new_lower_bounds.len() >= batch_size,
             "new_lower_bounds.len()={} < batch_size={}",
@@ -217,7 +206,7 @@ impl ProcessedDomains {
             batch_size,
         );
 
-        // Build updated metadata with new bounds from GPU — NaN-validated (#3125)
+        // Build updated metadata with new bounds from GPU — NaN-validated
         let metadata: Vec<DomainMetadata> = (0..batch_size)
             .map(|i| {
                 DomainMetadata::new(

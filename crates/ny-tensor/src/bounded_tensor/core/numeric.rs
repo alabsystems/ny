@@ -229,7 +229,7 @@ impl BoundedTensor {
     ///
     /// Handles symmetric infinite bounds `[-inf, +inf]` by returning 0.0 instead
     /// of NaN. Such bounds arise from `new_conservative()` and `new_repaired(Widen)`.
-    /// Reference: `new_repaired(Widen)` sets `[-inf, +inf]` for corrupt elements. (#3291 F3, #3423)
+    /// Reference: `new_repaired(Widen)` sets `[-inf, +inf]` for corrupt elements.
     // `f32::midpoint` would silently return a finite center for exploded bounds where
     // both |l|,|u| > f32::MAX/2; `(l + u) / 2.0` overflows to ±inf there, and downstream
     // consumers must keep seeing that ±inf rather than a fabricated finite center.
@@ -312,13 +312,13 @@ impl BoundedTensor {
     ///
     /// Same as [`intersection`]: returns `None` if any endpoint in either tensor
     /// is NaN. NaN indicates upstream numerical corruption and must not be silently
-    /// absorbed. (#2640)
+    /// absorbed.
     pub fn intersection_per_element(&self, other: &Self) -> Option<(Self, usize)> {
         if self.shape() != other.shape() {
             return None;
         }
 
-        // NaN in any endpoint → None (soundness: #2640, same as intersection())
+        // NaN in any endpoint → None (soundness).
         let has_nan = self.lower.iter().any(|v| v.is_nan())
             || self.upper.iter().any(|v| v.is_nan())
             || other.lower.iter().any(|v| v.is_nan())

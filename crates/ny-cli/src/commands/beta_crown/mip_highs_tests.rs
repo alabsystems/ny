@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 //
-// Tests for mip_highs.rs — Part of #3817.
+// Tests for mip_highs.rs —
 
 use super::super::mip_preprocess::{
     bounded_tensor_to_bounds, convert_intermediate_bounds, extract_linear_relu_params,
@@ -37,98 +37,7 @@ fn build_anti_correlated_fixture() -> (Network, BoundedTensor) {
     (network, input)
 }
 
-#[test]
-fn safenlp_raw_size_guard_is_bounded_before_canonicalization() {
-    let compact_fixture = SafeNlpRawAdmissionSize {
-        input_dim: 2,
-        hidden_dim: 128,
-        last_input_dim: 128,
-        output_dim: 2,
-        source_elements: Some(2 * 128 + 128 + 128 * 2 + 2),
-    };
-    assert!(safenlp_raw_size_within_guard(compact_fixture, 2, 2, 2));
-    let official_row45 = SafeNlpRawAdmissionSize {
-        input_dim: 30,
-        source_elements: Some(30 * 128 + 128 + 128 * 2 + 2),
-        ..compact_fixture
-    };
-    assert!(safenlp_raw_size_within_guard(official_row45, 30, 30, 2));
-
-    let boundary = SafeNlpRawAdmissionSize {
-        input_dim: SAFENLP_DIRECT_MIP_FIRST_MAX_INPUT_DIM,
-        hidden_dim: SAFENLP_DIRECT_MIP_FIRST_MAX_HIDDEN_DIM,
-        last_input_dim: SAFENLP_DIRECT_MIP_FIRST_MAX_HIDDEN_DIM,
-        output_dim: SAFENLP_DIRECT_MIP_FIRST_MAX_OUTPUT_DIM,
-        source_elements: Some(SAFENLP_DIRECT_MIP_FIRST_MAX_SOURCE_ELEMENTS),
-    };
-    assert!(safenlp_raw_size_within_guard(
-        boundary,
-        boundary.input_dim,
-        boundary.input_dim,
-        boundary.output_dim,
-    ));
-
-    for oversized in [
-        SafeNlpRawAdmissionSize {
-            input_dim: SAFENLP_DIRECT_MIP_FIRST_MAX_INPUT_DIM + 1,
-            ..boundary
-        },
-        SafeNlpRawAdmissionSize {
-            hidden_dim: SAFENLP_DIRECT_MIP_FIRST_MAX_HIDDEN_DIM + 1,
-            last_input_dim: SAFENLP_DIRECT_MIP_FIRST_MAX_HIDDEN_DIM + 1,
-            ..boundary
-        },
-        SafeNlpRawAdmissionSize {
-            output_dim: SAFENLP_DIRECT_MIP_FIRST_MAX_OUTPUT_DIM + 1,
-            ..boundary
-        },
-        SafeNlpRawAdmissionSize {
-            source_elements: Some(SAFENLP_DIRECT_MIP_FIRST_MAX_SOURCE_ELEMENTS + 1),
-            ..boundary
-        },
-        SafeNlpRawAdmissionSize {
-            source_elements: None,
-            ..boundary
-        },
-    ] {
-        assert!(!safenlp_raw_size_within_guard(
-            oversized,
-            oversized.input_dim,
-            oversized.input_dim,
-            oversized.output_dim,
-        ));
-    }
-
-    assert!(!safenlp_raw_size_within_guard(
-        SafeNlpRawAdmissionSize {
-            last_input_dim: boundary.hidden_dim - 1,
-            ..boundary
-        },
-        boundary.input_dim,
-        boundary.input_dim,
-        boundary.output_dim,
-    ));
-    assert!(!safenlp_raw_size_within_guard(
-        boundary,
-        boundary.input_dim - 1,
-        boundary.input_dim,
-        boundary.output_dim,
-    ));
-    assert!(!safenlp_raw_size_within_guard(
-        boundary,
-        boundary.input_dim,
-        boundary.input_dim - 1,
-        boundary.output_dim,
-    ));
-    assert!(!safenlp_raw_size_within_guard(
-        boundary,
-        boundary.input_dim,
-        boundary.input_dim,
-        boundary.output_dim - 1,
-    ));
-}
-
-/// Regression test for #3817: MIP intermediate bounds use CROWN-IBP, not IBP.
+/// Regression test: MIP intermediate bounds use CROWN-IBP, not IBP.
 ///
 /// Builds a Linear -> ReLU -> Linear network where CROWN-IBP is strictly
 /// tighter than IBP on the hidden layer. Verifies that
@@ -141,13 +50,22 @@ fn test_collect_mip_intermediate_bounds_uses_crown_ibp() {
     // The helper under test
     let mip_bounds = collect_mip_intermediate_bounds_with_deadline(&network, &input, None).unwrap();
 
-    // Ground truth: direct CROWN-IBP call
-    let crown_ibp_bounds = network.collect_crown_ibp_bounds(&input).unwrap();
+    // Ground truth: CROWN-IBP over the CERTIFIED IBP half. The helper must hand
+    // the intersection `collect_ibp_bounds_sound` (never the plain collector,
+    // whose Conv2d arm is inward-capable — #mip-conv-sound-enclosure), so the
+    // reference is built from the same sound vector rather than from
+    // `collect_crown_ibp_bounds`, which seeds itself with plain IBP.
+    let sound_ibp = network.collect_ibp_bounds_sound(&input).unwrap();
+    let crown_ibp_bounds = network
+        .collect_crown_ibp_bounds_with_precomputed_ibp(&input, sound_ibp, None, None)
+        .unwrap();
 
-    // Plain IBP for comparison
-    let ibp_bounds = network.collect_ibp_bounds(&input).unwrap();
+    // Sound IBP for the strictly-tighter comparison
+    let ibp_bounds = network.collect_ibp_bounds_sound(&input).unwrap();
 
-    // Assert: helper matches CROWN-IBP exactly
+    // Assert: helper matches CROWN-IBP exactly (the helper returns the typed
+    // seam `SoundIntermediateBounds`; compare its read-only view)
+    let mip_bounds = mip_bounds.as_slice();
     assert_eq!(mip_bounds.len(), crown_ibp_bounds.len());
     for (i, (mip, crown)) in mip_bounds.iter().zip(crown_ibp_bounds.iter()).enumerate() {
         assert_eq!(
@@ -197,8 +115,11 @@ fn test_collect_mip_intermediate_bounds_elapsed_deadline_falls_back_to_ibp() {
     let past_deadline = Some(Instant::now().checked_sub(Duration::from_secs(1)).unwrap());
     let mip_bounds =
         collect_mip_intermediate_bounds_with_deadline(&network, &input, past_deadline).unwrap();
-    let ibp_bounds = network.collect_ibp_bounds(&input).unwrap();
+    // The fallback is the CERTIFIED IBP vector (#mip-conv-sound-enclosure): a
+    // starved CROWN pass must never leave the encoder holding an inward box.
+    let ibp_bounds = network.collect_ibp_bounds_sound(&input).unwrap();
 
+    let mip_bounds = mip_bounds.as_slice();
     assert_eq!(mip_bounds.len(), ibp_bounds.len());
     for (i, (mip, ibp)) in mip_bounds.iter().zip(ibp_bounds.iter()).enumerate() {
         assert_eq!(
@@ -232,6 +153,23 @@ fn test_single_hidden_exact_affine_fast_path_preserves_big_m_bounds_3864() {
 
     assert_eq!(fast_path_intermediate.len(), 1);
     assert_eq!(current_intermediate.len(), 1);
+    // "Cannot tighten" is exact in real arithmetic. In f32 both paths now start
+    // from the CERTIFIED IBP box (#mip-conv-sound-enclosure): the fast path
+    // returns it as-is, the general path intersects it with a sound CROWN box
+    // whose own rounding charge may be a few ULPs smaller. So the contract is
+    // (i) the fast path ENCLOSES the general path (never tighter — the
+    // soundness direction), and (ii) the gap is at most the Linear sound
+    // arm's `in_features + 2` ULP charge (`LinearLayer::propagate_ibp_sound`).
+    let in_features = 2u32;
+    let max_ulps = in_features + 2;
+    let ulps_apart = |a: f32, b: f32| -> u32 {
+        assert_eq!(
+            a.signum(),
+            b.signum(),
+            "ULP distance across zero is undefined here"
+        );
+        a.to_bits().abs_diff(b.to_bits())
+    };
     for (layer_idx, (fast, current)) in fast_path_intermediate
         .iter()
         .zip(current_intermediate.iter())
@@ -245,19 +183,29 @@ fn test_single_hidden_exact_affine_fast_path_preserves_big_m_bounds_3864() {
         );
         for (neuron_idx, (fast_bound, current_bound)) in fast.iter().zip(current.iter()).enumerate()
         {
-            assert_eq!(
+            assert!(
+                fast_bound.lower() <= current_bound.lower()
+                    && current_bound.upper() <= fast_bound.upper(),
+                "layer {} neuron {}: fast path [{}, {}] must ENCLOSE the current path [{}, {}]",
+                layer_idx,
+                neuron_idx,
                 fast_bound.lower(),
-                current_bound.lower(),
-                "layer {} neuron {} lower mismatch between fast path and current path",
-                layer_idx,
-                neuron_idx
-            );
-            assert_eq!(
                 fast_bound.upper(),
-                current_bound.upper(),
-                "layer {} neuron {} upper mismatch between fast path and current path",
+                current_bound.lower(),
+                current_bound.upper()
+            );
+            let lower_gap = ulps_apart(fast_bound.lower(), current_bound.lower());
+            let upper_gap = ulps_apart(fast_bound.upper(), current_bound.upper());
+            assert!(
+                lower_gap <= max_ulps && upper_gap <= max_ulps,
+                "layer {} neuron {}: fast path differs from the current path by more than the \
+                 certified {} ULP charge (lower {} ULPs, upper {} ULPs) — CROWN/LP budget WOULD \
+                 tighten this encoding",
                 layer_idx,
-                neuron_idx
+                neuron_idx,
+                max_ulps,
+                lower_gap,
+                upper_gap
             );
         }
     }
@@ -583,25 +531,10 @@ fn margin_reframe_fixture(row_lb: f64, row_ub: f64) -> (ny_mip::MipParts, ny_mip
 fn direct_mip_margin_reframe_gate_is_exact_and_default_dark() {
     assert!(!ay_margin_reframe_enabled_from_value(None));
     assert!(ay_margin_reframe_enabled_from_value(Some("1")));
-    assert_eq!(
-        required_safenlp_shared_prefix_ingress_from_margin_value(Some("1")),
-        MipFeasibilityIngress::RequireSafeNlpMarkedMarginSharedBinaryPrefix,
-        "the exact third gate must select the typed marked-prefix entry"
-    );
-    assert_eq!(
-        required_safenlp_shared_prefix_ingress_from_margin_value(None),
-        MipFeasibilityIngress::RequireSafeNlpSharedBinaryPrefix,
-        "unset must retain the existing required plain-prefix entry"
-    );
     for malformed in ["", "0", "true", "01", " 1", "1 "] {
         assert!(
             !ay_margin_reframe_enabled_from_value(Some(malformed)),
             "{malformed:?} must not arm the margin reframe"
-        );
-        assert_eq!(
-            required_safenlp_shared_prefix_ingress_from_margin_value(Some(malformed)),
-            MipFeasibilityIngress::RequireSafeNlpSharedBinaryPrefix,
-            "{malformed:?} must retain required plain-prefix ingress"
         );
     }
 
@@ -626,9 +559,9 @@ fn marked_required_ingress_capture_is_terminal_and_plain_paths_stay_historical()
     };
 
     begin_capture();
-    capture_terminal_safenlp_ingress(required_safenlp_shared_prefix_ingress_from_margin_value(
-        Some("1"),
-    ));
+    capture_terminal_safenlp_ingress(
+        MipFeasibilityIngress::RequireSafeNlpMarkedMarginSharedBinaryPrefix,
+    );
     assert_eq!(
         take_captured_terminal_ingress(),
         CapturedTerminalIngress::RequireSafeNlpMarkedMarginSharedBinaryPrefix,
@@ -1392,4 +1325,49 @@ fn objective_first_sat_probe_still_requires_concrete_replay() {
         infeasible.is_none(),
         "even exact solver infeasibility has no verdict authority in this lane"
     );
+}
+
+/// #metaroom-mip-governor — the escalation's pending set excludes exactly the
+/// certified clauses.
+///
+/// MEASURED SHAPE: metaroom_2023 4cnn_ry_57_9 spec_idx_28 has 19 clauses and a
+/// 50 s escalation; 18 of them are refuted by the root, so the open clause goes
+/// from 2.279 s (50/19) to the whole slice.
+#[test]
+fn escalation_pending_excludes_certified_clauses() {
+    let mut certified = vec![true; 19];
+    certified[4] = false;
+    let (pending, source) = seed_escalation_pending(19, Some(&certified));
+    assert_eq!(
+        pending,
+        vec![4],
+        "only the uncertified clause may stay pending"
+    );
+    assert_eq!(source, "certified");
+}
+
+/// Every clause certified is a PROOF, not a vacuum: the pending set is empty
+/// and the caller's `had_timeout` therefore stays false.
+#[test]
+fn escalation_pending_is_empty_when_every_clause_is_certified() {
+    let (pending, source) = seed_escalation_pending(3, Some(&[true, true, true]));
+    assert!(pending.is_empty());
+    assert_eq!(source, "certified");
+}
+
+/// FAIL CLOSED: no certified set, or a length that disagrees with the clause
+/// count, must restore the historical all-clauses schedule AND say so.
+#[test]
+fn escalation_pending_falls_back_to_all_clauses_when_unavailable() {
+    let (pending, source) = seed_escalation_pending(4, None);
+    assert_eq!(pending, vec![0, 1, 2, 3]);
+    assert_eq!(source, "all-fallback");
+
+    let (pending, source) = seed_escalation_pending(4, Some(&[true, true]));
+    assert_eq!(
+        pending,
+        vec![0, 1, 2, 3],
+        "a length mismatch must not be interpreted as a partial certificate"
+    );
+    assert_eq!(source, "all-fallback");
 }

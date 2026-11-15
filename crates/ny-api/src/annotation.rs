@@ -218,7 +218,7 @@ mod tests {
         .expect("valid test spec");
         let annotated = AnnotatedSpec::new(spec.clone());
         assert!(annotated.name.is_none());
-        assert!(annotated.tags.is_empty());
+        assert_eq!((annotated.tags).len(), 0);
         assert_eq!(annotated.spec.input_bounds(), spec.input_bounds());
         assert_eq!(annotated.spec.output_bounds(), spec.output_bounds());
         assert_eq!(annotated.spec.timeout_ms(), spec.timeout_ms());

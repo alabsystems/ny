@@ -8,8 +8,6 @@
 //!
 //! These tests use CIFAR-10 ResNet benchmark files from `benchmarks/vnncomp2021`
 //! to ensure ny can load real CNN benchmark data through CLI entry points.
-//!
-//! Part of #2665.
 
 #[path = "common/vnncomp.rs"]
 mod vnncomp_support;
@@ -373,7 +371,7 @@ fn test_beta_crown_lsnc_relu_preset_honors_input_split() {
     );
 }
 
-/// Regression for #3870: the GPU-BaB lsnc sidecar must not abort during the
+/// Regression: the GPU-BaB lsnc sidecar must not abort during the
 /// opportunistic graph PGD phase with a batched shape mismatch.
 #[ntest::timeout(60000)]
 #[test]
@@ -551,8 +549,8 @@ fn test_beta_crown_nn4sys_parallel_preset_avoids_concat_shape_mismatch() {
     );
 }
 
-/// Regression for #4372: enabling input-split IBP enhancement on the real nn4sys
-/// parallel pensieve row must degrade to a normal verification result instead of
+/// Regression: enabling input-split IBP enhancement on the real nn4sys parallel
+/// pensieve row must degrade to a normal verification result instead of
 /// hard-failing with the enhancement-only shape-mismatch path.
 #[ntest::timeout(60000)]
 #[test]
@@ -594,7 +592,7 @@ fn test_beta_crown_nn4sys_parallel_ibp_enhancement_degrades_without_shape_error_
     );
 }
 
-/// Regression for #4372: the real nn4sys benchmark split path must not hard-fail
+/// Regression: the real nn4sys benchmark split path must not hard-fail
 /// the reorder-bab child prescreen when `ibp_enhancement=true`.
 #[ntest::timeout(60000)]
 #[test]
@@ -642,7 +640,7 @@ fn test_beta_crown_nn4sys_parallel_ibp_enhancement_split_path_degrades_without_s
     );
 }
 
-/// Regression for #4372: the real nn4sys disjunctive `mscn_128d` row must not
+/// Regression: the real nn4sys disjunctive `mscn_128d` row must not
 /// hard-fail the enhancement-only Slice/IBP path when `ibp_enhancement=true`.
 #[ntest::timeout(60000)]
 #[test]
@@ -683,7 +681,7 @@ fn test_beta_crown_nn4sys_disjunctive_ibp_enhancement_degrades_without_slice_err
     );
 }
 
-/// Regression for #4372: the real nn4sys disjunctive split path must not
+/// Regression: the real nn4sys disjunctive split path must not
 /// hard-fail the reorder-bab child prescreen when `ibp_enhancement=true`.
 #[ntest::timeout(60000)]
 #[test]
@@ -735,7 +733,7 @@ fn test_beta_crown_nn4sys_disjunctive_ibp_enhancement_split_path_degrades_withou
 /// and not be overwritten by CLI boolean defaults.
 ///
 /// Regression test for the bug where `#[arg(long, default_value_t = false)]` booleans
-/// unconditionally overwrote preset-enabled features. Part of #3218.
+/// unconditionally overwrote preset-enabled features.
 #[ntest::timeout(60000)]
 #[test]
 fn test_preset_boolean_flags_not_overwritten_by_cli_defaults() {

@@ -14,12 +14,12 @@
 use std::collections::BinaryHeap;
 use std::time::Instant;
 
-use ndarray::Array1;
+use ndarray::{Array1, Array2};
 use ny_core::{GemmEngine, Result};
 use ny_tensor::{BoundedTensor, RepairStrategy};
 use tracing::{debug, info, instrument, warn};
 
-use crate::beta_crown::branching::GraphNeuronConstraint;
+use crate::beta_crown::branching::{BranchingHeuristic, GraphNeuronConstraint};
 use crate::beta_crown::conflict_clauses_graph::GraphClauseStore;
 use crate::beta_crown::domain::{GraphBabDomain, GraphCrownContext, GraphPrecomputedBounds};
 use crate::beta_crown::engine::graph::shared::setup::{
@@ -27,6 +27,7 @@ use crate::beta_crown::engine::graph::shared::setup::{
 };
 use crate::beta_crown::engine::graph::shared::state::GraphBabLifecycle;
 use crate::beta_crown::result::{BabVerificationStatus, BetaCrownResult};
+use crate::network::SpecCrownRequest;
 use crate::GraphNetwork;
 
 use super::super::domain_results::GraphDomainResult;
@@ -34,6 +35,9 @@ use super::super::tensor_ext::BoundedTensorExt;
 use super::super::BetaCrownVerifier;
 use super::objectives::objective_bounds;
 use super::relu_split::queue_budget::{enforce_graph_queue_budget, GraphBabQueueBudget};
+
+/// The ledger lane name of the precomputed-bounds ReLU-split driver.
+const RELU_SPLIT_BOUNDS_LANE: &str = "graph_relu_split_with_bounds";
 
 fn drop_non_finite_domain_in_relu_split_bounds(
     domain: &GraphBabDomain,
@@ -128,7 +132,45 @@ impl BetaCrownVerifier {
         )
     }
 
+    /// #graph-bab-cover-ledger: like the direct ReLU-split driver, the search
+    /// runs under an armed completeness ledger (split-literal paths below
+    /// `input`); a `Verified` it returns is kept only if the ledger's
+    /// certified leaves cover the root (see `graph::cover_ledger`). This is the
+    /// lane the serial multi-clause disjunctive loop hands one clause at a
+    /// time; the instance door aggregates the clauses.
     pub(crate) fn verify_graph_relu_split_with_bounds_impl(
+        &self,
+        graph: &GraphNetwork,
+        input: &BoundedTensor,
+        objective: &[f32],
+        threshold: f32,
+        precomputed_bounds: &GraphPrecomputedBounds<'_>,
+        engine: Option<&dyn GemmEngine>,
+        deadline: Option<Instant>,
+    ) -> Result<BetaCrownResult> {
+        graph.ensure_proof_eligible()?;
+        let scope = self.graph_cover.arm_paths(
+            RELU_SPLIT_BOUNDS_LANE,
+            graph,
+            input,
+            objective,
+            threshold,
+            self.config.verify_upper_bound,
+        );
+        let result = self.verify_graph_relu_split_with_bounds_unledgered(
+            graph,
+            input,
+            objective,
+            threshold,
+            precomputed_bounds,
+            engine,
+            deadline,
+        )?;
+        Ok(self.settle_graph_cover(RELU_SPLIT_BOUNDS_LANE, scope, result, deadline))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_graph_relu_split_with_bounds_unledgered(
         &self,
         graph: &GraphNetwork,
         input: &BoundedTensor,
@@ -146,14 +188,79 @@ impl BetaCrownVerifier {
         let graph = &graph;
         let now = Instant::now();
         let mut lifecycle = GraphBabLifecycle::new(now);
-
+        // #budget-abandonment FIX C, this lane: the depth cap drops domains
+        // here too, so the counter must be armed or `dropped=0` would be read
+        // as "the cap is irrelevant" when it is only unobserved.
+        let _depth_drop = super::relu_split::depth_drop::DepthDropScope::new(self.config.max_depth);
         // Use pre-computed bounds (clone to owned HashMap)
         let initial_node_bounds: std::collections::HashMap<String, BoundedTensor> =
             precomputed_bounds.node_bounds.clone();
 
         // Use pre-computed output bounds - apply objective to get initial bounds
-        let (root_lower, root_upper) =
+        let (projected_lower, projected_upper) =
             objective_bounds(precomputed_bounds.output_bounds, objective)?;
+        // #disjunctive-shared-bootstrap: when the caller kept the bootstrap's
+        // optimised root alpha, run ONE spec-guided CROWN pass for this
+        // objective with those slopes (the DomainList lane's root, gpu_bab/
+        // init.rs) and INTERSECT it with the projection. Both are certified
+        // enclosures of the same scalar over the same box, so their
+        // intersection is one too; the projection alone is the historical
+        // lane. Any failure of the extra pass -- expiry, empty, non-finite,
+        // a reversed pair -- keeps the projection, so this can only tighten.
+        let (root_lower, root_upper, root_src) = match precomputed_bounds.root_alpha_state {
+            Some(alpha_state) => {
+                let spec_pass = Array2::from_shape_vec((1, objective.len()), objective.to_vec())
+                    .map_err(|error| {
+                        ny_core::NyError::InternalError(format!(
+                            "objective row matrix for the shared-alpha root pass: {error}"
+                        ))
+                    })
+                    .and_then(|spec_matrix| {
+                        SpecCrownRequest::new(graph, input, &spec_matrix, engine)
+                            .node_bounds(precomputed_bounds.node_bounds)
+                            .alpha_state_opt(Some(alpha_state))
+                            .deadline_opt(deadline)
+                            .truncate_after_opt(self.config.crown_backward_layers)
+                            .run()
+                    });
+                match spec_pass {
+                    Ok(output) if output.len() == 1 => {
+                        let spec_lower = output.lower()[[0]];
+                        let spec_upper = output.upper()[[0]];
+                        let lower = spec_lower.max(projected_lower);
+                        let upper = spec_upper.min(projected_upper);
+                        if spec_lower.is_finite() && spec_upper.is_finite() && lower <= upper {
+                            (lower, upper, "spec")
+                        } else {
+                            (projected_lower, projected_upper, "proj-nonfinite")
+                        }
+                    }
+                    Ok(_) => (projected_lower, projected_upper, "proj-shape"),
+                    Err(error) => {
+                        debug!(%error, "shared-alpha spec root pass declined; using projection");
+                        (projected_lower, projected_upper, "proj-err")
+                    }
+                }
+            }
+            None => (projected_lower, projected_upper, "proj"),
+        };
+
+        // #budget-abandonment FIX A does NOT apply on this lane -- the root
+        // bounds arrive ALREADY COMPUTED from the caller, so there is no
+        // warmup phase here to expire and nothing to fall back on. The line is
+        // emitted anyway, naming the lane, because an ABSENT line is
+        // indistinguishable from "the fallback was armed and not needed", and
+        // this is the lane the multi-constraint conjunctive rows take.
+        // `root_src=` names where the root came from: `proj` is the historical
+        // projection of the caller's output box, `spec` the shared-alpha
+        // spec-guided pass intersected with it (#disjunctive-shared-bootstrap).
+        eprintln!(
+            "[warmup-fallback] armed={} fired=0 tier=none lane=precomputed \
+cap_s=0.0 elapsed_s=0.0 remaining_s={:.1} root=[{root_lower},{root_upper}] thr={threshold} \
+root_src={root_src}",
+            u8::from(self.config.initial_bounds_warmup_fallback),
+            deadline.map_or(0.0, |dl| dl.saturating_duration_since(now).as_secs_f64()),
+        );
 
         info!(
             "Graph β-CROWN (ReLU split, pre-computed bounds) initial objective: [{}, {}], threshold: {}, verify_upper={}",
@@ -175,6 +282,16 @@ impl BetaCrownVerifier {
             None
         };
         if let Some((status, root_verified_count)) = root_status {
+            if matches!(status, BabVerificationStatus::Verified) {
+                self.cover_note_bound(
+                    objective,
+                    threshold,
+                    &crate::beta_crown::branching::GraphSplitHistory::new(),
+                    None,
+                    root_lower,
+                    root_upper,
+                );
+            }
             lifecycle.domains_explored = 1;
             lifecycle.domains_verified = root_verified_count;
             // Widen repair: a non-finite root bound (±Inf, e.g. an unbounded
@@ -207,7 +324,10 @@ impl BetaCrownVerifier {
             input,
             &root_domain.history,
             &setup.initial_node_bounds_arc,
-            None, // no root alpha optimization in pre-computed bounds path
+            // Historically `None` (no root alpha on this lane); the shared
+            // bootstrap supplies its optimised slopes here so children
+            // warm-start exactly as the per-objective lane's do.
+            precomputed_bounds.root_alpha_state,
             self.config.beta_iterations > 0,
         );
         if self.config.enable_clip_interm_domain {
@@ -225,6 +345,29 @@ impl BetaCrownVerifier {
         queue.push(root_domain);
 
         info!("Found {} ReLU nodes for branching", setup.relu_nodes.len());
+
+        // #genbab-precomputed-lane arming observable. Printed unconditionally
+        // and BEFORE the loop, so the three states are distinguishable without
+        // inference: `armed=0` is dark, `armed=1 genbab=0` is armed on a
+        // benchmark whose heuristic is not GenBaB (inert by design), and
+        // `armed=1 genbab=1` is the route actually available. What it DID is
+        // then read off `[bab-stop]`: a lane that used to return
+        // `explored=1 deepest=0 unresolved=no_branch` should now split.
+        let genbab_route = self.config.genbab_on_precomputed_lane
+            && matches!(
+                self.config.branching_heuristic,
+                BranchingHeuristic::GenBaB(_)
+            );
+        eprintln!(
+            "[genbab-lane] armed={} genbab={} route={} relu_nodes={}",
+            u8::from(self.config.genbab_on_precomputed_lane),
+            u8::from(matches!(
+                self.config.branching_heuristic,
+                BranchingHeuristic::GenBaB(_)
+            )),
+            if genbab_route { "genbab" } else { "relu_only" },
+            setup.relu_nodes.len(),
+        );
 
         // Shared cut pool initialization (#1860 Packet B)
         let mut cut_pool = build_graph_cut_pool(
@@ -354,6 +497,14 @@ impl BetaCrownVerifier {
                 .config
                 .domain_is_verified(domain.lower_bound, domain.upper_bound, threshold)
             {
+                self.cover_note_bound(
+                    objective,
+                    threshold,
+                    &domain.history,
+                    Some(&domain.beta_state),
+                    domain.lower_bound,
+                    domain.upper_bound,
+                );
                 lifecycle.domains_verified += 1;
                 // Verified close: record the literal set as a conflict clause
                 // (no-op unless gated on AND the history is pure ReLU-at-0).
@@ -419,6 +570,47 @@ impl BetaCrownVerifier {
                 continue;
             }
 
+            // #genbab-precomputed-lane: honour a configured GenBaB nonlinear
+            // heuristic, exactly as `process_sequential_domains` does, BEFORE
+            // falling through to the ReLU-only search below. Without this the
+            // lane scores ReLU nodes only, so a benchmark that branches
+            // `MulBinary` products finds nothing to split and returns holding
+            // its whole budget. The enqueue/verified/violation fold is NOT
+            // duplicated: this calls the same `aggregate_bab_results` the
+            // sequential lane uses, so the two lanes cannot disagree about
+            // what a domain result means.
+            if genbab_route {
+                let outcome = self.process_graph_domain_parallel(
+                    graph,
+                    &domain,
+                    &setup.relu_nodes,
+                    objective,
+                    threshold,
+                    engine,
+                    // This lane is single-depth (`lane=relu_split_single`): it
+                    // has never produced 2^k children per parent, and 1 keeps
+                    // that shape.
+                    1,
+                );
+                if let Some(result) = self.aggregate_bab_results(
+                    vec![outcome],
+                    threshold,
+                    &|lower: f32, upper: f32| self.config.domain_priority(lower, upper),
+                    &mut queue,
+                    &mut lifecycle,
+                    &mut cut_pool,
+                )? {
+                    return Ok(result);
+                }
+                enforce_graph_queue_budget(
+                    queue_budget,
+                    &mut queue,
+                    &mut lifecycle,
+                    "relu-split-precomputed",
+                );
+                continue;
+            }
+
             // Find unstable neurons to branch on
             let unstable = self.find_unstable_graph_neurons(graph, &domain, &setup.relu_nodes);
             if unstable.is_empty() {
@@ -443,6 +635,14 @@ impl BetaCrownVerifier {
                         let l = output.lower_scalar();
                         let u = output.upper_scalar();
                         if self.config.domain_is_verified(l, u, threshold) {
+                            self.cover_note_bound(
+                                objective,
+                                threshold,
+                                &domain.history,
+                                Some(&domain.beta_state),
+                                l,
+                                u,
+                            );
                             lifecycle.domains_verified += 1;
                             clause_store.record_verified_close(&domain.history);
                             continue;
@@ -461,6 +661,7 @@ impl BetaCrownVerifier {
                         // superset literal set yields a subset of the empty
                         // region — also empty, also trivially verified.
                         debug!("[#2926] no-unstable domain infeasible (empty), pruning: {e}");
+                        self.cover_note_infeasible(objective, threshold, &domain.history, None);
                         lifecycle.domains_verified += 1;
                         clause_store.record_verified_close(&domain.history);
                     }
@@ -516,9 +717,13 @@ impl BetaCrownVerifier {
                 is_active: true,
                 score,
             };
-            if let Some(mut active_child) =
-                domain.with_constraint(graph, active_constraint, self.config.verify_upper_bound)?
-            {
+            // #graph-bab-cover-ledger: `Ok(None)` is a genuinely empty
+            // half-space; the `else` below puts that close on the record.
+            if let Some(mut active_child) = domain.with_constraint(
+                graph,
+                active_constraint.clone(),
+                self.config.verify_upper_bound,
+            )? {
                 // Recompute bounds with constraint and apply cuts
                 // Use parent domain's node_bounds as base for efficiency
                 // β-CROWN adds Lagrangian contribution from split constraints
@@ -585,6 +790,14 @@ impl BetaCrownVerifier {
 
                             let child_verified = self.config.domain_is_verified(l, u, threshold);
                             if child_verified {
+                                self.cover_note_bound(
+                                    objective,
+                                    threshold,
+                                    &active_child.history,
+                                    Some(&active_child.beta_state),
+                                    l,
+                                    u,
+                                );
                                 lifecycle.domains_verified += 1;
                                 clause_store.record_verified_close(&active_child.history);
                                 // Generate cut from verified child
@@ -612,6 +825,12 @@ impl BetaCrownVerifier {
                         // #2926: Infeasible domain = empty = trivially verified.
                         // Recording is sound: see the no-unstable infeasible arm.
                         debug!("[#2926] active child infeasible (empty), pruning: {e}");
+                        self.cover_note_infeasible(
+                            objective,
+                            threshold,
+                            &active_child.history,
+                            None,
+                        );
                         lifecycle.domains_verified += 1;
                         clause_store.record_verified_close(&active_child.history);
                     }
@@ -621,18 +840,25 @@ impl BetaCrownVerifier {
                         lifecycle.unresolved_due_to_propagation_failure = true;
                     }
                 }
+            } else {
+                self.cover_note_infeasible(
+                    objective,
+                    threshold,
+                    &domain.history,
+                    Some(&active_constraint),
+                );
             }
 
             // Create inactive child (x < 0)
             let inactive_constraint = GraphNeuronConstraint {
-                node_name: node_name.clone(),
+                node_name,
                 neuron_idx,
                 is_active: false,
                 score,
             };
             if let Some(mut inactive_child) = domain.with_constraint(
                 graph,
-                inactive_constraint,
+                inactive_constraint.clone(),
                 self.config.verify_upper_bound,
             )? {
                 // Recompute bounds with constraint, β, and α (#1851)
@@ -678,6 +904,14 @@ impl BetaCrownVerifier {
 
                             let child_verified = self.config.domain_is_verified(l, u, threshold);
                             if child_verified {
+                                self.cover_note_bound(
+                                    objective,
+                                    threshold,
+                                    &inactive_child.history,
+                                    Some(&inactive_child.beta_state),
+                                    l,
+                                    u,
+                                );
                                 lifecycle.domains_verified += 1;
                                 clause_store.record_verified_close(&inactive_child.history);
                                 // Generate cut from verified child
@@ -705,6 +939,12 @@ impl BetaCrownVerifier {
                         // #2926: Infeasible domain = empty = trivially verified.
                         // Recording is sound: see the no-unstable infeasible arm.
                         debug!("[#2926] inactive child infeasible (empty), pruning: {e}");
+                        self.cover_note_infeasible(
+                            objective,
+                            threshold,
+                            &inactive_child.history,
+                            None,
+                        );
                         lifecycle.domains_verified += 1;
                         clause_store.record_verified_close(&inactive_child.history);
                     }
@@ -714,6 +954,13 @@ impl BetaCrownVerifier {
                         lifecycle.unresolved_due_to_propagation_failure = true;
                     }
                 }
+            } else {
+                self.cover_note_infeasible(
+                    objective,
+                    threshold,
+                    &domain.history,
+                    Some(&inactive_constraint),
+                );
             }
             enforce_graph_queue_budget(
                 queue_budget,

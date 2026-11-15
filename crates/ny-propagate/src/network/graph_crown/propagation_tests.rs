@@ -305,7 +305,7 @@ fn test_plain_convtranspose_live_deadline_continues_anchored_without_dense_retry
         bounds.upper_a.geometry,
         PatchGeometry::Anchored(_)
     ));
-    assert!(patches_to_dense_call_sites().is_empty());
+    assert_eq!((patches_to_dense_call_sites()).len(), 0);
 }
 
 fn graph_cgan_6_14_30_fixture() -> (GraphNetwork, BoundedTensor, ndarray::ArrayD<f32>) {

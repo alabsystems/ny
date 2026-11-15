@@ -377,7 +377,7 @@ proptest! {
 }
 
 // ============================================================================
-// Decomposed SelfAttention graph soundness (Part of #2072)
+// Decomposed SelfAttention graph soundness
 // ============================================================================
 //
 // These tests verify soundness through the decomposed attention graph:

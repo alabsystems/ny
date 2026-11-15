@@ -138,11 +138,11 @@ fn test_collect_alpha_crown_bounds_dag_tightens_kokoro_style_conv1d_residual_gra
         "#4400 output node 'out' should tighten through CROWN without forward fallback"
     );
     // The MulBinary/Reciprocal/Sqrt *inputs* feed nonlinear relaxations, so the
-    // demand-driven selector (#3775) must tighten them through CROWN. 'gated' and
+    // demand-driven selector must tighten them through CROWN. 'gated' and
     // 'residual' are intentionally NOT asserted here: their only consumers (Add,
     // ReduceSum) are exact linear ops that list no required input-bound indices,
     // so demand-driven correctly leaves them on the sound IBP path. Asserting CROWN
-    // on them would contradict the #3775 design.
+    // on them would contradict the demand-driven design.
     for node_name in [
         "reciprocal_hidden",
         "gate_conv",

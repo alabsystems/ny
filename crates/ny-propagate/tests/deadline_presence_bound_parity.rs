@@ -141,7 +141,7 @@ fn build_residual_graph(
         graph.add_node(GraphNode::new(
             &format!("relu_a_{block}"),
             Layer::ReLU(ReLULayer),
-            vec![a.clone()],
+            vec![a],
         ));
         graph.add_node(GraphNode::new(
             &b,
@@ -152,7 +152,7 @@ fn build_residual_graph(
         graph.add_node(GraphNode::new(
             &add,
             Layer::Add(ny_propagate::layers::AddLayer),
-            vec![b.clone(), skip],
+            vec![b, skip],
         ));
         graph.add_node(GraphNode::new(&out, Layer::ReLU(ReLULayer), vec![add]));
         prev = out;

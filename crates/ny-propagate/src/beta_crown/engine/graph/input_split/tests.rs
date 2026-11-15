@@ -519,7 +519,7 @@ fn build_reference_bounds_graph_3870() -> GraphNetwork {
 
 /// DAG graph with two branches merging via Concat. Used to exercise the
 /// shape-mismatch skip guard in `merge_reference_bound_maps` when
-/// `ibp_enhancement=true` (#4384).
+/// `ibp_enhancement=true`.
 ///
 /// Topology:
 ///   input → linear_a (2→2) → relu_a → ─┐
@@ -644,7 +644,7 @@ fn test_graph_input_domain_cmp_treats_nan_priority_as_high_priority() {
     );
 }
 
-// Regression test for #3442: MultiObjInputDomain NaN priority ordering.
+// Regression test: MultiObjInputDomain NaN priority ordering.
 // Before fix, partial_cmp().unwrap_or(Equal) treated NaN as Equal to everything,
 // letting NaN-priority domains sit arbitrarily in the BinaryHeap instead of
 // being surfaced first for investigation.
@@ -677,7 +677,7 @@ fn test_multi_obj_input_domain_nan_priority_surfaces_first() {
 }
 
 // Verifies Eq trait contract for NaN: reflexivity requires nan == nan.
-// Before #3442 fix, PartialEq used f32 == which gives NaN != NaN (IEEE 754),
+// Previously PartialEq used f32 == which gives NaN != NaN (IEEE 754),
 // violating the Eq trait contract. Now PartialEq delegates to
 // cmp_input_domain_priority which treats NaN-NaN as Equal.
 #[test]
@@ -1056,8 +1056,6 @@ fn test_multi_obj_conjunctive_closure_is_strict_any_row() {
 /// EVERY clause must be discharged, so the bottleneck is the hardest remaining
 /// clause. `min(clause_best)` correctly reflects this: the domain can only be
 /// verified once the worst clause is resolved.
-///
-/// Part of #3740 Packet B.
 #[test]
 fn test_disjunctive_domain_priority_tracks_worst_clause_margin_3740() {
     // Two clauses: clause 0 has 2 rows, clause 1 has 1 row.
@@ -1156,7 +1154,7 @@ fn assert_batched_contains_baseline_4284(
     }
 }
 
-/// Regression: batched dense-spec kernel accepts MulBinary alphas (#4284).
+/// Regression: batched dense-spec kernel accepts MulBinary alphas.
 #[test]
 fn test_batched_specs_accepts_mul_binary_alphas_4284() {
     let (graph, spec_matrix, mul_binary_alphas, child_a, child_b) =
@@ -2210,4 +2208,522 @@ mod edge_alpha_pass {
             "the α edge pass must close the floor"
         );
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// #cap-extend: DEFER-dont-DROP at the disjunctive domain cap (config-gated,
+// default OFF = byte-identical). The pure predicate's truth table lives next
+// to the implementation (`disjunctive_multi_clause::cap_extend_tests`); these
+// exercise the LOOP WIRING end-to-end on the miniature relational net.
+// ═════════════════════════════════════════════════════════════════════════════
+
+mod cap_extend_wiring {
+    use super::*;
+    use crate::beta_crown::config::BetaCrownConfig;
+    use crate::beta_crown::engine::BetaCrownVerifier;
+    use crate::beta_crown::result::BabVerificationStatus;
+    use crate::beta_crown::BranchingHeuristic;
+    use ndarray::{arr1, arr2};
+    use ny_tensor::BoundedTensor;
+    use std::time::Duration;
+
+    fn two_relu_2d_graph() -> GraphNetwork {
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input(
+            "lin1",
+            Layer::Linear(LinearLayer::new(arr2(&[[1.0_f32, 1.0], [1.0, -1.0]]), None).unwrap()),
+        ));
+        graph.add_node(GraphNode::new(
+            "relu1",
+            Layer::ReLU(ReLULayer),
+            vec!["lin1".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "out",
+            Layer::Linear(LinearLayer::new(arr2(&[[1.0_f32, -0.5]]), None).unwrap()),
+            vec!["relu1".to_string()],
+        ));
+        graph.set_output("out");
+        graph
+    }
+
+    fn band_input() -> BoundedTensor {
+        BoundedTensor::new(
+            arr1(&[-1.0_f32, -1.0]).into_dyn(),
+            arr1(&[1.0_f32, 1.0]).into_dyn(),
+        )
+        .unwrap()
+    }
+
+    fn verifier(armed: bool, max_domains: usize) -> BetaCrownVerifier {
+        BetaCrownVerifier::new(BetaCrownConfig {
+            branching_heuristic: BranchingHeuristic::InputSplit,
+            use_alpha_crown: false,
+            use_forward_bounds: true,
+            enable_relaxed_clip: false,
+            enable_pgd_attack: false,
+            beta_iterations: 0,
+            max_domains,
+            input_split_cap_extend_near_closure: armed,
+            timeout: Duration::from_secs(60),
+            ..BetaCrownConfig::default()
+        })
+    }
+
+    fn run(
+        armed: bool,
+        max_domains: usize,
+        threshold: f32,
+    ) -> crate::beta_crown::result::BetaCrownResult {
+        verifier(armed, max_domains)
+            .verify_graph_input_split_multi_clause_disjunctive(
+                &two_relu_2d_graph(),
+                &band_input(),
+                &[vec![1.0_f32]],
+                &[threshold],
+                &[1usize],
+                None,
+                None,
+            )
+            .expect("bab run")
+    }
+
+    /// Single-hidden-layer 6-neuron 2-input net with tilted hyperplanes (all
+    /// six unstable over the root box). True minimum (numpy PWL 2001^2 grid +
+    /// local refinement): -1.94965 at (0.62, -1).
+    ///
+    /// It reproduces the ROW-7 SHAPE — the head gap grazes zero and a large
+    /// fraction of explored domains verify, while the frontier keeps
+    /// producing new open domains — which is exactly the state
+    /// `cap_extend_decision` must recognise. Measured at threshold -1.98:
+    /// `closest_gap_seen` reaches -0.0000 by 24 explored with 17 verified
+    /// (71%).
+    ///
+    /// CALIBRATION FINDING (2026-08-29, `cap_extend_calibration_probe`): on
+    /// this lane there is NO threshold for which BaB both (a) fails at the
+    /// root and (b) terminates. Below about -2.5 the root CROWN bound proves
+    /// it outright (`explored=1`); above it the search never closes — at
+    /// -1.98/-2.25/-2.45 it runs 200,000 domains and verifies 437/307/88. The
+    /// narrow two-ReLU fixture is root-provable at EVERY threshold below its
+    /// minimum. So a "cap trip converts to Verified" assertion is not
+    /// constructible here, and the wiring test below asserts the CONTINUATION
+    /// PROPERTY instead — which is strictly sharper about the actual defect:
+    /// an extension that is granted but not honoured, or honoured by
+    /// re-tracing, both fail it.
+    fn wide_relu_2d_graph() -> GraphNetwork {
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input(
+            "lin1",
+            Layer::Linear(
+                LinearLayer::new(
+                    arr2(&[
+                        [1.0_f32, 0.73],
+                        [0.91, -1.12],
+                        [-0.58, 0.83],
+                        [0.35, -1.21],
+                        [-1.13, -0.42],
+                        [0.62, 0.29],
+                    ]),
+                    Some(arr1(&[0.11_f32, -0.23, 0.05, 0.17, -0.09, -0.31])),
+                )
+                .unwrap(),
+            ),
+        ));
+        graph.add_node(GraphNode::new(
+            "relu1",
+            Layer::ReLU(ReLULayer),
+            vec!["lin1".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "out",
+            Layer::Linear(
+                LinearLayer::new(arr2(&[[1.0_f32, -0.55, 0.8, -0.72, 0.63, -0.44]]), None).unwrap(),
+            ),
+            vec!["relu1".to_string()],
+        ));
+        graph.set_output("out");
+        graph
+    }
+
+    /// Batched variant: `reorder_bab` is what makes the loop pop
+    /// `batch_size` domains per iteration, and therefore what makes the cap
+    /// trip land INSIDE a batch instead of at the loop head. This is the
+    /// production shape (cgan2026 ships `reorder_bab: true`,
+    /// `batch_size: 64`).
+    fn run_deep_batched(
+        armed: bool,
+        max_domains: usize,
+        threshold: f32,
+        batch: usize,
+    ) -> crate::beta_crown::result::BetaCrownResult {
+        BetaCrownVerifier::new(BetaCrownConfig {
+            branching_heuristic: BranchingHeuristic::InputSplit,
+            use_alpha_crown: false,
+            use_forward_bounds: true,
+            enable_relaxed_clip: false,
+            enable_pgd_attack: false,
+            beta_iterations: 0,
+            max_domains,
+            batch_size: batch,
+            reorder_bab: true,
+            input_split_cap_extend_near_closure: armed,
+            timeout: Duration::from_secs(60),
+            ..BetaCrownConfig::default()
+        })
+        .verify_graph_input_split_multi_clause_disjunctive(
+            &wide_relu_2d_graph(),
+            &band_input(),
+            &[vec![1.0_f32]],
+            &[threshold],
+            &[1usize],
+            None,
+            None,
+        )
+        .expect("bab run")
+    }
+
+    fn run_deep(
+        armed: bool,
+        max_domains: usize,
+        threshold: f32,
+    ) -> crate::beta_crown::result::BetaCrownResult {
+        verifier(armed, max_domains)
+            .verify_graph_input_split_multi_clause_disjunctive(
+                &wide_relu_2d_graph(),
+                &band_input(),
+                &[vec![1.0_f32]],
+                &[threshold],
+                &[1usize],
+                None,
+                None,
+            )
+            .expect("bab run")
+    }
+
+    /// CALIBRATION HARNESS (`#[ignore]`d, not part of the suite): runs a
+    /// FIXED grid of (fixture, threshold, cap, armed) and prints each run's
+    /// terminal state, with the in-loop `[cap-extend]`/trajectory markers on
+    /// stderr alongside. Re-calibrating means editing the grid below — the
+    /// grid is deliberately hard-coded rather than read from the environment,
+    /// because env-driven test knobs are new unreviewed reader sites on the
+    /// ny-levers source frontier.
+    ///
+    /// `targo --unverified test -p ny-propagate --release --lib cap_extend_calibration_probe -- --ignored --nocapture`
+    ///
+    /// Two traps this harness has already sprung, recorded so the next run
+    /// does not repeat them:
+    /// 1. cargo prints `test <name> ... ` with NO trailing newline under
+    ///    `--nocapture`, so the first marker lands MID-LINE and a `grep
+    ///    '^\[cal\]'` returns nothing. Two sweeps were read as "the fixture
+    ///    never verifies" on that silence alone.
+    /// 2. `grep -E '[^\n]*'` does not mean "rest of line" — it excludes the
+    ///    literal characters `\` and `n`, which truncated every row at
+    ///    `ibp_e`. Grep whole lines.
+    // Behind the off-by-default `diagnostics` feature rather than `#[ignore]`: it
+    // calibrates fixture constants and asserts nothing, so it is a TOOL, not
+    // disabled coverage, and source_policy's `rust_tests_cannot_be_ignored`
+    // forbids the latter. Same treatment as `dump_observed_dispatcher_behaviour`
+    // in network/dispatch_matrix/tests.rs. Run it with:
+    //   targo --unverified test -p ny-propagate --features diagnostics --lib cap_extend_calibration_probe -- --nocapture
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn cap_extend_calibration_probe() {
+        #[derive(Default)]
+        struct NullSink;
+        impl crate::beta_crown::InputSplitMetricsSink for NullSink {
+            fn record_batch_summary(
+                &self,
+                _record: &crate::beta_crown::InputSplitBatchRecord,
+            ) -> ny_core::Result<()> {
+                Ok(())
+            }
+        }
+        // (fixture, threshold, cap, armed)
+        let grid: &[(&str, f32, usize, bool)] = &[
+            ("wide", CAP_EXTEND_WIRING_TRIP_THRESHOLD, 24, false),
+            ("wide", CAP_EXTEND_WIRING_TRIP_THRESHOLD, 24, true),
+            ("wide", CAP_EXTEND_WIRING_TRIP_THRESHOLD, 192, false),
+            ("wide", CAP_EXTEND_WIRING_TRIP_THRESHOLD, 200_000, false),
+            ("wide", -2.45, 200_000, false),
+            ("wide", -2.50, 200_000, false),
+            ("narrow", -1.02, 200_000, false),
+            ("narrow", 10.0, 5, false),
+            ("narrow", 10.0, 5, true),
+        ];
+        // Batched (reorder_bab) rows: (cap, armed, batch). These are the
+        // production shape — the cap trips MID-BATCH.
+        let batched: &[(usize, bool, usize)] = &[
+            (20, false, 8),
+            (20, true, 8),
+            (160, false, 8),
+            (164, false, 8),
+            (164, true, 8),
+            (1312, false, 8),
+        ];
+        for &(fixture, thresh, cap, armed) in grid {
+            let config = BetaCrownConfig {
+                branching_heuristic: BranchingHeuristic::InputSplit,
+                use_alpha_crown: false,
+                use_forward_bounds: true,
+                enable_relaxed_clip: false,
+                enable_pgd_attack: false,
+                beta_iterations: 0,
+                max_domains: cap,
+                input_split_cap_extend_near_closure: armed,
+                timeout: Duration::from_secs(60),
+                ..BetaCrownConfig::default()
+            };
+            let graph = if fixture == "narrow" {
+                two_relu_2d_graph()
+            } else {
+                wide_relu_2d_graph()
+            };
+            let r = BetaCrownVerifier::new(config)
+                .with_input_split_metrics_sink(Arc::new(NullSink))
+                .verify_graph_input_split_multi_clause_disjunctive(
+                    &graph,
+                    &band_input(),
+                    &[vec![1.0_f32]],
+                    &[thresh],
+                    &[1usize],
+                    None,
+                    None,
+                )
+                .expect("bab run");
+            eprintln!(
+                "\n[cal] fixture={fixture} armed={armed} cap={cap} thresh={thresh} result={:?} explored={} verified={}",
+                r.result, r.domains_explored, r.domains_verified
+            );
+        }
+        for &(cap, armed, batch) in batched {
+            let r = run_deep_batched(armed, cap, CAP_EXTEND_WIRING_TRIP_THRESHOLD, batch);
+            eprintln!(
+                "\n[cal] fixture=wide-batched armed={armed} cap={cap} batch={batch} result={:?} explored={} verified={}",
+                r.result, r.domains_explored, r.domains_verified
+            );
+        }
+    }
+
+    /// DEFER-dont-DROP, asserted as a CONTINUATION IDENTITY.
+    ///
+    /// Three runs on the near-closure fixture:
+    ///   * dark at the trip cap C — today's behaviour, stops at exactly C;
+    ///   * dark at 8C — the trajectory the extension is supposed to reproduce;
+    ///   * armed at C — trips C near closure, is granted its one extension.
+    ///
+    /// The armed run must land on the 8C run's EXACT counters and terminal
+    /// reason. That is the whole claim in one assertion:
+    ///   - if the grant is not honoured at every cap-enforcement site, the
+    ///     armed run stops at C (the live defect this test was written for:
+    ///     the loop head alone was patched, `[cap-extend] granted: cap 24 ->
+    ///     192` printed, and the run still returned `Domain limit 24` because
+    ///     `process_batch`/`child_batch` re-read `config.max_domains`);
+    ///   - if extension DROPPED the frontier and re-traced from scratch, the
+    ///     verified count at 8C would not match the uninterrupted 8C run;
+    ///   - `armed.verified > dark_at_C.verified` proves the extra domains did
+    ///     real work rather than merely being counted.
+    #[test]
+    fn granted_extension_continues_the_same_search_to_the_extended_cap() {
+        let threshold = CAP_EXTEND_WIRING_TRIP_THRESHOLD;
+        let cap = CAP_EXTEND_WIRING_TRIP_CAP;
+        let extended = cap * CAP_EXTEND_WIRING_FACTOR;
+
+        let dark_at_cap = run_deep(false, cap, threshold);
+        let dark_at_extended = run_deep(false, extended, threshold);
+        let armed = run_deep(true, cap, threshold);
+
+        // Dark is today's stop, at exactly the configured cap.
+        match &dark_at_cap.result {
+            BabVerificationStatus::Unknown { reason } => assert!(
+                reason.contains(&format!("Domain limit {cap}")),
+                "dark arm must stop at today's domain limit, got: {reason}"
+            ),
+            other => panic!("dark arm must hit the domain limit, got {other:?}"),
+        }
+        assert_eq!(dark_at_cap.domains_explored, cap);
+
+        // The armed run is the 8C run, reached by continuation.
+        assert_eq!(
+            armed.domains_explored, dark_at_extended.domains_explored,
+            "armed({cap}) must explore what an uninterrupted run at {extended} explores"
+        );
+        assert_eq!(
+            armed.domains_verified, dark_at_extended.domains_verified,
+            "armed({cap}) verified {} but the uninterrupted {extended} run verified {} — \
+             the extension did not CONTINUE the search, it re-traced or dropped the frontier",
+            armed.domains_verified, dark_at_extended.domains_verified
+        );
+        assert_eq!(
+            format!("{:?}", armed.result),
+            format!("{:?}", dark_at_extended.result),
+            "armed terminal state must be the extended-cap state"
+        );
+        assert!(
+            armed.domains_explored > cap,
+            "the extension must have been USED (explored {} <= cap {cap})",
+            armed.domains_explored
+        );
+        assert!(
+            armed.domains_verified > dark_at_cap.domains_verified,
+            "the extra domains must do real work: armed verified {} vs {} at the cap",
+            armed.domains_verified,
+            dark_at_cap.domains_verified
+        );
+    }
+
+    /// MID-BATCH cap trip — the PRODUCTION shape, and the one that made the
+    /// first armed field run a silent null.
+    ///
+    /// `loop_batch_size` is 1 unless `reorder_bab` is set
+    /// (`disjunctive_multi_clause.rs`), and cgan2026 ships `reorder_bab: true`
+    /// with `batch_size: 64`. So on the scored route the cap is reached
+    /// INSIDE `process_batch`/`child_batch`, which return the domain-limit
+    /// result directly — the loop head never runs. Measured on cgan2026 row 7
+    /// at the official 900 s with the grant wired only into the loop head:
+    /// the armed canary emitted NO `[cap-extend]` line, stopped at exactly
+    /// explored=2500 (t=464 s, 508 open, best_gap -0.0000), and timed out at
+    /// 895.01 s identically to production — a lever that was armed, reachable,
+    /// and unreachable at the same time.
+    ///
+    /// The cap (20) is deliberately NOT a multiple of the batch (8) so the
+    /// trip cannot land on a batch boundary.
+    #[test]
+    fn mid_batch_cap_trip_grants_and_continues_like_the_loop_head() {
+        let threshold = CAP_EXTEND_WIRING_TRIP_THRESHOLD;
+        let cap = CAP_EXTEND_WIRING_MIDBATCH_CAP;
+        let batch = CAP_EXTEND_WIRING_MIDBATCH_BATCH;
+        assert!(
+            !cap.is_multiple_of(batch),
+            "the fixture must trip mid-batch, not on a boundary"
+        );
+        let extended = cap * CAP_EXTEND_WIRING_FACTOR;
+
+        let dark_at_cap = run_deep_batched(false, cap, threshold, batch);
+        let dark_at_extended = run_deep_batched(false, extended, threshold, batch);
+        let armed = run_deep_batched(true, cap, threshold, batch);
+
+        match &dark_at_cap.result {
+            BabVerificationStatus::Unknown { reason } => assert!(
+                reason.contains(&format!("Domain limit {cap}")),
+                "dark arm must stop at today's domain limit, got: {reason}"
+            ),
+            other => panic!("dark arm must hit the domain limit, got {other:?}"),
+        }
+        assert!(
+            armed.domains_explored > dark_at_cap.domains_explored,
+            "a MID-BATCH trip must still grant: armed explored {} vs dark {}",
+            armed.domains_explored,
+            dark_at_cap.domains_explored
+        );
+        assert_eq!(
+            armed.domains_explored, dark_at_extended.domains_explored,
+            "armed({cap}) must explore what an uninterrupted run at {extended} explores"
+        );
+        assert_eq!(
+            armed.domains_verified, dark_at_extended.domains_verified,
+            "armed({cap}) verified {} but the uninterrupted {extended} run verified {} — \
+             the mid-batch extension re-traced or dropped the frontier",
+            armed.domains_verified, dark_at_extended.domains_verified
+        );
+    }
+
+    /// DEFAULT-DARK byte-identity: a config that never names the key at all
+    /// behaves exactly like one that names it `false`. Fails the moment the
+    /// shipped default flips.
+    #[test]
+    fn shipped_default_is_dark_and_byte_identical_at_the_cap() {
+        assert!(
+            !BetaCrownConfig::default().input_split_cap_extend_near_closure,
+            "#cap-extend must ship dark"
+        );
+        let threshold = CAP_EXTEND_WIRING_TRIP_THRESHOLD;
+        let cap = CAP_EXTEND_WIRING_TRIP_CAP;
+
+        // Identical to `verifier(..)` except the key is never mentioned.
+        let defaulted = BetaCrownVerifier::new(BetaCrownConfig {
+            branching_heuristic: BranchingHeuristic::InputSplit,
+            use_alpha_crown: false,
+            use_forward_bounds: true,
+            enable_relaxed_clip: false,
+            enable_pgd_attack: false,
+            beta_iterations: 0,
+            max_domains: cap,
+            timeout: Duration::from_secs(60),
+            ..BetaCrownConfig::default()
+        })
+        .verify_graph_input_split_multi_clause_disjunctive(
+            &wide_relu_2d_graph(),
+            &band_input(),
+            &[vec![1.0_f32]],
+            &[threshold],
+            &[1usize],
+            None,
+            None,
+        )
+        .expect("bab run");
+        let explicit_dark = run_deep(false, cap, threshold);
+
+        assert_eq!(defaulted.domains_explored, explicit_dark.domains_explored);
+        assert_eq!(defaulted.domains_verified, explicit_dark.domains_verified);
+        assert_eq!(
+            format!("{:?}", defaulted.result),
+            format!("{:?}", explicit_dark.result)
+        );
+        assert_eq!(defaulted.domains_explored, cap);
+    }
+
+    /// Cap trips FAR from closure (threshold unreachable, nothing ever
+    /// verifies): the ARMED arm must stop at the domain limit byte-identically
+    /// to the dark arm — the fix must not extend a hopeless search.
+    #[test]
+    fn far_from_closure_cap_trip_stops_exactly_as_dark() {
+        let threshold = 10.0_f32; // true max is 2 — hopeless by 8 output units
+        let cap = 5usize;
+
+        let dark = run(false, cap, threshold);
+        let armed = run(true, cap, threshold);
+
+        for (label, r) in [("dark", &dark), ("armed", &armed)] {
+            match &r.result {
+                BabVerificationStatus::Unknown { reason } => assert!(
+                    reason.contains(&format!("Domain limit {cap}")),
+                    "{label} arm must stop at the un-extended domain limit, got: {reason}"
+                ),
+                other => panic!("{label} arm must hit the domain limit, got {other:?}"),
+            }
+        }
+        assert_eq!(dark.domains_explored, armed.domains_explored);
+        assert_eq!(dark.domains_verified, armed.domains_verified);
+        assert_eq!(armed.domains_explored, cap);
+    }
+
+    /// Calibrated via `cap_extend_calibration_probe` (2026-08-29): small
+    /// enough that the dark arm trips it, large enough that the predicate
+    /// GRANTS there — measured at this cap, `closest_gap_seen=-0.0000` and
+    /// 17/24 domains verified (71%, against the 25% floor).
+    const CAP_EXTEND_WIRING_TRIP_CAP: usize = 24;
+    /// Mid-batch fixture: cap 164 with batch 8 — 164 is not a multiple of 8,
+    /// so the trip lands inside a batch, as it does on every scored cgan row.
+    /// Calibrated (2026-08-30): the batched route verifies far more slowly
+    /// early on than the unbatched one, so a small cap DENIES on the
+    /// predicate's own terms — at cap 20 the trip reports
+    /// `verified=3 open=12 closest_gap_seen=-0.2583`, failing both clauses.
+    /// By 160 explored it is at 47 verified (29%, over the 25% floor) with the
+    /// head gap at closure. Do not lower this to make the test faster: a cap
+    /// that denies proves nothing about the grant path.
+    const CAP_EXTEND_WIRING_MIDBATCH_CAP: usize = 164;
+    /// Small stand-in for the shipped `bab.batch_size: 64`; any value > 1
+    /// routes the pop through `loop_batch_size` and moves the trip off the
+    /// loop head.
+    const CAP_EXTEND_WIRING_MIDBATCH_BATCH: usize = 8;
+    /// Mirror of `CAP_EXTEND_FACTOR` in `disjunctive_multi_clause.rs`. Held
+    /// separately ON PURPOSE: if the production factor changes, the
+    /// continuation test's 8C reference run no longer matches the armed run
+    /// and the test goes red, forcing the constant to be re-read rather than
+    /// tracking it silently.
+    const CAP_EXTEND_WIRING_FACTOR: usize = 8;
+    /// Below the fixture's true minimum (-1.94965) but above the ~-2.5 root
+    /// proof cliff, so the run reaches BaB and keeps a live frontier at the
+    /// trip. See `wide_relu_2d_graph` for why no threshold TERMINATES here.
+    const CAP_EXTEND_WIRING_TRIP_THRESHOLD: f32 = -1.98;
 }

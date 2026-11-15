@@ -18,8 +18,6 @@
 //! For uniform inputs on [l, u]: mu = (l+u)/2, Sigma = diag((u-l)^2/12).
 //!
 //! Reference: Boetius et al., "Distributional Robustness Verification via CROWN", ICML 2025.
-//!
-//! Part of #3921 Phase 3.
 
 use ndarray::{Array1, ArrayD, IxDyn};
 use ny_core::{NyError, Result};
@@ -71,8 +69,6 @@ impl DistributionalBound {
     ///
     /// This reuses the stored mean bounds and variance upper bound — no CROWN
     /// recomputation needed.
-    ///
-    /// Part of #4248.
     pub fn output_quantile(&self, confidence: f64) -> Result<(ArrayD<f32>, ArrayD<f32>)> {
         if !(0.0..1.0).contains(&confidence) {
             return Err(NyError::InvalidSpec(format!(
@@ -101,8 +97,6 @@ impl DistributionalBound {
     /// Cantelli's inequality requires only bounded variance — no Gaussian assumption.
     ///
     /// Reference: Cantelli, "Sui confini della probabilità", 1928.
-    ///
-    /// Part of #4248.
     pub fn output_probability(&self, threshold: f32) -> Result<(ArrayD<f64>, ArrayD<f64>)> {
         let n = self.mean_lower.len();
         let mut prob_lower = Vec::with_capacity(n);

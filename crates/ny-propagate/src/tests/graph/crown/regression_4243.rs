@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Regression test for #4243 ViT-style attention context reshape bounds.
+//! Regression test ViT-style attention context reshape bounds.
 
 use crate::types::BoundsProvenance;
 use crate::*;
@@ -14,7 +14,7 @@ fn build_vit_context_reshape_graph_4243() -> GraphNetwork {
     // produces a square output [batch, heads, seq, seq].  identity_for_attention()
     // requires the last two dimensions to be equal; otherwise it returns None and
     // the full-composition retry never fires.  With heads=4, head_dim=4, seq=4 the
-    // final reshape still produces [1, 4, 16] as required by the #4243 contract.
+    // final reshape still produces [1, 4, 16] as the regression contract requires.
     let head_dim = 4_usize;
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
 

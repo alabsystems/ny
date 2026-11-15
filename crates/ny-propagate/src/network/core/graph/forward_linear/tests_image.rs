@@ -807,6 +807,7 @@ fn test_image_conv_transpose_batch_norm_dense_f64_enclosure() {
         bias_err: Array1::from_vec(vec![2.0e-4, 7.0e-6, 4.5e-5]).into_dyn(),
         num_channels: out_c,
         channel_axis_hint: None,
+        exact_affine: None,
     };
 
     let mut graph = GraphNetwork::new();
@@ -1071,9 +1072,7 @@ fn test_alpha_reference_bounds_use_forward_linear_for_sequential_conv_transpose_
         "fixture must be a sequential chain to cover the is_dag=false route"
     );
 
-    crate::tests::with_env_edits(|env| {
-        env.remove("NY_NO_FORWARD_LINEAR_REF");
-        env.remove("NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF");
+    crate::tests::with_default_fl_reference_env(|_| {
         let config = AlphaCrownConfig {
             fix_interm_bounds: true,
             ..AlphaCrownConfig::default()
@@ -2790,7 +2789,7 @@ fn build_conv_transpose_relu_chain(
         graph.add_node(GraphNode::new(
             relu_name.as_str(),
             Layer::ReLU(ReLULayer::new()),
-            vec![bn_name.clone()],
+            vec![bn_name],
         ));
         prev = Some(relu_name);
     }
@@ -3173,6 +3172,7 @@ fn test_image_cgan_dense_f64_fixture_is_ibp_indistinguishable() {
         bias_err: Array1::from_vec(vec![2.0e-4, 7.0e-6, 4.5e-5]).into_dyn(),
         num_channels: out_c,
         channel_axis_hint: None,
+        exact_affine: None,
     };
     let mut graph = GraphNetwork::new();
     graph.add_node(GraphNode::from_input("convt", Layer::ConvTranspose2d(conv)));

@@ -5,7 +5,7 @@
 //! Tests for the subprocess shape-inference protocol: server/parse round-trip,
 //! every client failure mode mapping to `Err` (never a panic), and the
 //! loader-level guarantee that a dead subprocess degrades to the graceful
-//! no-inferred-shapes fallback instead of failing the model load.
+//! ORT-free static shape fallback instead of failing the model load.
 
 use super::subprocess::{
     infer_tensor_shapes_via_subprocess, parse_shape_infer_response, serve_shape_infer_request,
@@ -208,7 +208,7 @@ fn subprocess_fake_server_round_trip() {
     let exe = write_script(
         &dir,
         "fake-server.sh",
-        "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"version\":1,\"shapes\":{\"x\":[1,3]}}'\n",
+        "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"version\":2,\"shapes\":{\"x\":[1,3]}}'\n",
     );
     let shapes = infer_tensor_shapes_via_subprocess(&exe, &build_relu_model_bytes())
         .expect("valid protocol answer accepted");
@@ -216,6 +216,10 @@ fn subprocess_fake_server_round_trip() {
     assert_eq!(shapes.len(), 1);
 }
 
+/// The mismatched version is 1 on purpose: a version-1 child is an older
+/// binary that recorded a tensor ORT could not type as the scalar `[]` (no
+/// rank probe), so its `[]` entries are not proofs and the whole answer must
+/// be refused — the loader then uses the static fallback instead.
 #[cfg(unix)]
 #[test]
 fn subprocess_version_mismatch_is_error() {
@@ -223,7 +227,7 @@ fn subprocess_version_mismatch_is_error() {
     let exe = write_script(
         &dir,
         "wrong-version.sh",
-        "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"version\":2,\"shapes\":{}}'\n",
+        "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"version\":1,\"shapes\":{\"y\":[]}}'\n",
     );
     let err = infer_tensor_shapes_via_subprocess(&exe, &build_relu_model_bytes())
         .expect_err("wrong protocol version must be rejected");
@@ -246,8 +250,8 @@ fn subprocess_zero_exit_with_garbage_stdout_is_error() {
 
 // ---------------------------------------------------------------------------
 // Loader-level fail-closed guarantee: a dead subprocess degrades exactly like
-// today's inference-unavailable path (model loads with no inferred shapes),
-// never an error and never a crash.
+// the inference-unavailable path (the model loads with the static fallback's
+// exact shapes only), never an error and never a crash.
 // ---------------------------------------------------------------------------
 
 #[test]

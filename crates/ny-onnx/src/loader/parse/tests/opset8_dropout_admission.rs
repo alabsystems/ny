@@ -115,6 +115,7 @@ fn load(bytes: &[u8]) -> ny_core::Result<Vec<crate::LayerSpec>> {
         false,
         BatchNormFoldingPolicy::LegacyEnvironment,
         false,
+        false,
     )?;
     Ok(layers)
 }

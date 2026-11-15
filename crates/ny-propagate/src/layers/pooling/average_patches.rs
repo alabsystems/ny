@@ -10,8 +10,6 @@
 //! replicating each coefficient across the pooling window positions.
 //!
 //! Reference: alpha-beta-CROWN auto_LiRPA/operators/pooling.py:584-601
-//! Reference: designs/2026-03-01-patches-phase3-pooling-termination.md Section 1
-//! Part of #2613
 
 use ndarray::{Array1, Axis};
 use ny_core::{NyError, Result};

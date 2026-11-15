@@ -6,6 +6,9 @@
 
 mod accumulate;
 mod arithmetic;
+mod axis;
+#[cfg(test)]
+mod axis_tests;
 mod concat;
 mod const_eval;
 mod conv;
@@ -20,6 +23,8 @@ mod linear;
 mod matmul;
 mod normalization;
 mod pad;
+#[cfg(test)]
+mod point_storage_tests;
 mod pooling;
 mod quantization;
 mod reductions;
@@ -38,6 +43,8 @@ use tracing::debug;
 use crate::{AttributeValue, LayerSpec, WeightStore};
 use ndarray::ArrayD;
 
+pub(crate) use axis::{legacy_axis_authority, LegacyBatchAxisPolicy};
+
 /// Largest integer magnitude that `f32` can represent exactly.
 const F32_INT_EXACT_LIMIT: i64 = 1 << 24;
 
@@ -53,9 +60,12 @@ pub(super) fn i64_to_f32_checked(value: i64, context: &str) -> Result<f32> {
 /// Minimal state needed for ONNX layer conversion and graph construction.
 ///
 /// This decouples conversion logic from the full `OnnxModel` and is the
-/// first boundary needed to move construction code out of `ny-onnx` (#1752).
+/// first boundary needed to move construction code out of `ny-onnx`.
 #[derive(Clone, Copy)]
 pub struct ConvertContext<'a> {
+    /// Explicit pre-construction storage authority; point storage borrows an
+    /// existing shared ledger and ordinary constructors retain eager storage.
+    pub linear_storage: crate::LinearStoragePolicy<'a>,
     /// Weight storage (shared borrow from the model).
     pub weights: &'a WeightStore,
     /// Known tensor shapes keyed by tensor name.
@@ -76,18 +86,6 @@ pub struct ConvertContext<'a> {
     /// convention (#cctsdb B5 / risk 3-4). Computed via
     /// [`model_is_unbatched`]; defaults to `false` in the constructors.
     pub model_unbatched: bool,
-}
-
-/// Legacy behavior for ONNX axis 0 when the recorded rank of the data tensor
-/// is UNKNOWN (ny-synthesized internal subgraphs; see
-/// [`ConvertContext::remap_axis_trailing`]). Preserves each op family's
-/// historic semantics exactly.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LegacyBatchAxisPolicy {
-    /// Keep axis 0 with a debug note (historic reductions / Concat behavior).
-    KeepZeroWarn,
-    /// Reject axis 0 as targeting the nonexistent batch dim (#2848 family).
-    RejectZero,
 }
 
 /// Whether a model is globally unbatched: it has at least one real graph
@@ -112,6 +110,7 @@ impl ConvertContext<'_> {
         static EMPTY_EVAL: std::sync::OnceLock<HashMap<String, ArrayD<f32>>> =
             std::sync::OnceLock::new();
         ConvertContext {
+            linear_storage: crate::LinearStoragePolicy::EagerBounds,
             weights,
             tensor_shapes,
             constant_tensors,
@@ -126,6 +125,24 @@ impl ConvertContext<'_> {
         self
     }
 
+    /// Select affine storage before conversion allocates derived matrices.
+    pub fn with_linear_storage<'a>(
+        self,
+        policy: crate::LinearStoragePolicy<'a>,
+    ) -> ConvertContext<'a>
+    where
+        Self: 'a,
+    {
+        ConvertContext {
+            weights: self.weights,
+            tensor_shapes: self.tensor_shapes,
+            constant_tensors: self.constant_tensors,
+            evaluated_constants: self.evaluated_constants,
+            model_unbatched: self.model_unbatched,
+            linear_storage: policy,
+        }
+    }
+
     /// Create a conversion context with pre-evaluated constant values.
     pub fn with_evaluated_constants<'a>(
         weights: &'a WeightStore,
@@ -134,6 +151,7 @@ impl ConvertContext<'_> {
         evaluated_constants: &'a HashMap<String, ArrayD<f32>>,
     ) -> ConvertContext<'a> {
         ConvertContext {
+            linear_storage: crate::LinearStoragePolicy::EagerBounds,
             weights,
             tensor_shapes,
             constant_tensors,
@@ -270,134 +288,8 @@ impl ConvertContext<'_> {
             })
     }
 
-    /// Remap an ONNX axis of the activation tensor `data_name` to the
-    /// TRAILING-RELATIVE (negative) internal axis encoding, which is correct
-    /// under BOTH internal runtime layouts of a batched model.
-    ///
-    /// Background (#pensieve ReduceSum no-op miscompile): ny's internal
-    /// (unbatched) convention is NOT rank-uniform. For an ONNX tensor of rank
-    /// `r`, the runtime tensor is either
-    ///   - the ONNX tensor with its leading batch dim stripped (rank `r-1`,
-    ///     e.g. Split/Slice outputs), or
-    ///   - the ONNX tensor verbatim (rank `r`, leading size-1 retained, e.g.
-    ///     Flatten and rank-2 Gemm outputs, weights/constants).
-    ///
-    /// The legacy blanket `axis >= 1 → axis - 1` guess is only correct for the
-    /// first layout; on the second it selects the WRONG dimension — on
-    /// pensieve `ReduceSum(axes=[1])` on a runtime `[1, n]` tensor became a
-    /// size-1-axis no-op, so the graph bounded a different function than the
-    /// ONNX semantics (w = p/p = 1).
-    ///
-    /// Both layouts share the ONNX tensor's TRAILING dims, so expressing the
-    /// axis from the end (`onnx_axis - r`, negative) selects the same semantic
-    /// dimension in either layout; layers resolve negative axes against the
-    /// actual runtime rank at propagation time.
-    ///
-    /// Fail-closed where information exists: with a KNOWN recorded rank, an
-    /// out-of-range axis or the (possibly stripped) batch axis 0 of a rank>1
-    /// tensor — where no single encoding is correct for both layouts — REFUSES
-    /// conversion with an error rather than guessing.
-    ///
-    /// UNKNOWN recorded rank keeps the LEGACY adjustment (`axis - 1`, warn):
-    /// real ONNX models get recorded shapes from load-time shape inference, so
-    /// this branch is reached (in practice) only by ny-SYNTHESIZED internal
-    /// subgraphs (LSTM unrolling, ReduceL2 lowering, test graphs) that were
-    /// authored directly against the legacy stripped-batch convention — for
-    /// them the legacy adjustment is correct BY CONSTRUCTION, not a guess.
-    /// `zero_policy` selects the per-op legacy behavior for ONNX axis 0 in
-    /// that branch (historic per-op semantics are preserved exactly).
-    ///
-    /// Unbatched models (#cctsdb B5) keep ONNX axes verbatim. Negative ONNX
-    /// axes are already trailing-relative and pass through (range-checked when
-    /// the rank is known).
-    pub(crate) fn remap_axis_trailing(
-        &self,
-        op: &str,
-        node_name: &str,
-        data_name: &str,
-        onnx_axis: i64,
-        zero_policy: LegacyBatchAxisPolicy,
-    ) -> Result<i64> {
-        if self.model_unbatched {
-            // Unbatched model: no tensor ever carried a batch axis; ONNX axes
-            // describe the internal tensors verbatim. They still must name a
-            // real dimension when the authored rank is known.
-            if let Some(rank) = self.recorded_onnx_rank(data_name) {
-                let rank_i = i64::try_from(rank).map_err(|_| {
-                    NyError::ModelLoad(format!(
-                        "{op} '{node_name}': recorded rank {rank} for input '{data_name}' does not fit i64"
-                    ))
-                })?;
-                if onnx_axis < -rank_i || onnx_axis >= rank_i {
-                    return Err(NyError::ModelLoad(format!(
-                        "{op} '{node_name}': ONNX axis {onnx_axis} out of range for input \
-                         '{data_name}' of recorded rank {rank}"
-                    )));
-                }
-            }
-            return Ok(onnx_axis);
-        }
-        let rank = self.recorded_onnx_rank(data_name);
-        if onnx_axis < 0 {
-            if let Some(rank) = rank {
-                if onnx_axis < -(rank as i64) {
-                    return Err(NyError::ModelLoad(format!(
-                        "{op} '{node_name}': ONNX axis {onnx_axis} out of range for input \
-                         '{data_name}' of recorded rank {rank}"
-                    )));
-                }
-            }
-            return Ok(onnx_axis);
-        }
-        let Some(rank) = rank else {
-            // Legacy-compatibility branch (see doc comment): synthesized
-            // internal subgraphs carry no recorded ONNX shapes and were
-            // written against the stripped-batch convention.
-            if onnx_axis == 0 {
-                return match zero_policy {
-                    LegacyBatchAxisPolicy::KeepZeroWarn => {
-                        debug!(
-                            "{op} '{node_name}': ONNX axis 0 (batch dim) kept as 0 in unbatched \
-                             mode (unknown recorded rank; legacy behavior)"
-                        );
-                        Ok(0)
-                    }
-                    LegacyBatchAxisPolicy::RejectZero => Err(NyError::ModelLoad(format!(
-                        "{op} '{node_name}': axis=0 targets batch dimension which does not exist \
-                         in unbatched mode"
-                    ))),
-                };
-            }
-            debug!(
-                "{op} '{node_name}': input '{data_name}' has no recorded ONNX shape; keeping \
-                 legacy batch-squeeze adjustment {} -> {} (synthesized-subgraph compatibility)",
-                onnx_axis,
-                onnx_axis - 1
-            );
-            return Ok(onnx_axis - 1);
-        };
-        let rank_i = rank as i64;
-        if onnx_axis >= rank_i {
-            return Err(NyError::ModelLoad(format!(
-                "{op} '{node_name}': ONNX axis {onnx_axis} out of range for input '{data_name}' \
-                 of recorded rank {rank}"
-            )));
-        }
-        if onnx_axis == 0 && rank > 1 {
-            // ONNX axis 0 of a rank>1 tensor is the (possibly stripped) batch
-            // axis: on a stripped runtime tensor the op is a batch no-op, on a
-            // retained one it targets the leading size-1 dim. No single axes
-            // encoding expresses both; refuse (consistent with Gather #2848).
-            return Err(NyError::UnsupportedOp(format!(
-                "{op} '{node_name}': ONNX axis 0 targets the batch dimension of rank-{rank} \
-                 input '{data_name}', which is ambiguous in unbatched mode; refusing conversion"
-            )));
-        }
-        Ok(onnx_axis - rank_i)
-    }
-
     /// Deprecated compatibility alias for [`constant_value`](Self::constant_value).
-    #[deprecated(note = "use constant_value")]
+    #[deprecated(since = "0.1.0", note = "use constant_value")]
     pub fn get_constant_value(&self, name: &str) -> Option<ArrayD<f32>> {
         self.constant_value(name)
     }

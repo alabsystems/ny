@@ -4,19 +4,9 @@
 //
 // In-process ay backend: `ir::MilpProblem` -> `ay_milp::Model` and back.
 //
-// R3 of the ay-as-library plan (ay repo,
-// designs/2026-07-12-ay-as-library-for-ny.md): replaces the P0 subprocess
-// call-out (~25 ms/solve of spawn + SMT-LIB text) with typed in-process
-// calls (µs). The subprocess lane survives as `MipBackend::AyProc`
-// (debug/bootstrap only, frozen P0 code).
-//
-// Soundness posture is unchanged from P0: any Sat is revalidated by the
-// concrete forward pass downstream; Unsat requires all phase-split
-// subproblems Unsat; anything inconclusive degrades to Timeout, never
-// Unsat. New over P0: ay-milp verdicts can carry exact model-level
-// certificates (Farkas / optimality); we verify them here when present and
-// surface them through verdict admission (LG3). An UNSAT whose exported
-// Farkas witness does not re-check is an error, never a verdict.
+// SAT points require downstream network/property replay. Exported exact
+// certificates are checked against NY's model before certified admission;
+// invalid certificates are errors. The external compatibility backend is AyProc.
 
 use ay_milp::{
     BabSession, EngineEconomics, Model, Outcome, Sense as AySense, SolveOpts, TargetFsbPrefixOpts,
@@ -28,46 +18,29 @@ use crate::ay::{ObjSense, ObjectiveSpec};
 use crate::error::MipError;
 use crate::ir::{Col, MilpProblem};
 use crate::solver::{MipResult, OneSidedSatDecline, OneSidedSatProbe, OneSidedSatWitness, Sense};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Legacy provenance counter for strict side-artifact UNSAT admissions without
+/// NY replay. No path increments it: supported artifacts are replayed against
+/// NY's model; unsupported evidence remains uncertified. A nonzero count is a
+/// regression. The accessor preserves compatibility with older result banks
+/// and never controls verdicts.
+static STRICT_SIDE_ARTIFACT_UNSAT_ADMISSIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many times this process admitted a bare `Outcome::Infeasible` on the
+/// strength of AY's strict certificate policy alone (see
+/// [`STRICT_SIDE_ARTIFACT_UNSAT_ADMISSIONS`]: no arm increments it any more,
+/// so this is always 0). Monotone; never reset.
+pub fn strict_side_artifact_unsat_admissions() -> usize {
+    STRICT_SIDE_ARTIFACT_UNSAT_ADMISSIONS.load(Ordering::Relaxed)
+}
 
 type Result<T> = std::result::Result<T, MipError>;
 
-// NY'S ENGINE ECONOMICS TRAVEL ON THE SOLVE, NOT IN THE PROCESS ENVIRONMENT.
-//
-// AY M1 (`e1c347ec9`, in the pinned rev) put every knob NY pins onto a typed
-// `EngineEconomics` carried by `SolveOpts::with_engine`, and resolves
-// `caller (SolveOpts) > environment > policy > compiled default` (ay
-// `tune.rs:794-802`). NY therefore configures AY by VALUE and writes no process
-// environment at all.
-//
-// WHY THIS REPLACED THE OLD `set_var` CHOKE POINT — two reasons, one of them a
-// live defect the pin bump introduced:
-//
-// 1. THE ENVIRONMENT IS NOW READ ONCE. The pinned rev added `ay-milp`'s
-//    `tune.rs`, whose release-build env layer is a `OnceLock<EnvSnapshot>`
-//    captured on the FIRST knob read (`tune.rs:700-706`), and
-//    `tune::on(Knob::NoCuts)` fires in `add_root_cuts` on essentially every
-//    MILP solve (`bab.rs:4181`). The old window recipe wrote its four knobs
-//    LAZILY — only when a window-class model first arrived — so in any process
-//    that solved a sub-gate model first (the 144-instance mip-diff corpus, a
-//    Graph-MIP leaf, an ACAS diff-leaf), the snapshot froze those variables as
-//    ABSENT and the measured cifar100 w5 recipe never reached AY again. Typed
-//    options are resolved per solve from the caller layer and cannot be beaten
-//    by ordering.
-// 2. THE WRITES RACED REAL SOLVES. NY runs solves on detached worker threads
-//    that keep running after abandonment (see `run_with_hard_deadline`), so a
-//    live AY solve genuinely raced NY's next `set_var`. Serializing NY's own
-//    writes behind a mutex never fixed that, because AY's reads were not behind
-//    it.
-//
-// What changes is that the posture is now GUARANTEED rather than
-// order-dependent, and an inherited `AY_MILP_*` can no longer beat what NY
-// configured.
-//
-// These knobs are NOT verdict-neutral in the unqualified sense NY used to claim
-// — see the correction on `window_recipe`, from AY `f36f19a5b`. They cannot
-// reach the certified-UNSAT or revalidated-SAT directions, but on an INTEGRAL
-// model a search-changing setting can move an `Optimal` value that no
-// certificate refuses. `map_outcome` gates that surface on `Outcome::trust`.
+// Configure EngineEconomics per solve: caller options override AY environment,
+// policy and defaults. Process-global writes would race detached workers and
+// cannot reliably affect AY's cached environment snapshot. Search settings
+// can affect uncertified integral optima; map_outcome checks Outcome::trust.
 
 /// Fraction of the remaining budget NY gives AY's flip-LNS incumbent walk.
 const NY_FLIP_SHARE: f64 = 0.75;
@@ -83,22 +56,10 @@ fn use_ay_tall_flip_cap(raw: Option<&str>) -> bool {
     matches!(raw.map(str::trim), Some("1"))
 }
 
-/// Fold NY's flip-LNS scheduling policy onto the typed engine carrier.
-///
-/// AY treats an explicit flip-LNS share as an opt-out from its tall absolute
-/// cap — `with_flip_lns_share` "also disables the absolute cap, restoring the
-/// pure fractional schedule" (ay `opts.rs:224-227`), exactly the coupling the
-/// environment variables always had. NY therefore pins the historical share by
-/// default and LEAVES THE FIELD UNSET only for the provenance-captured canary.
-/// Both arms pin the eta-lane cap to 18 s and explicitly disable AY's
-/// independently tunable warm-LU lane, so an inherited setting cannot silently
-/// turn the recorded canary into a custom or 12-second schedule.
-///
-/// This function MUTATES NOTHING. `NY_AY_MILP_TALL_FLIP_CAP` is still read here
-/// (it is NY's own knob, not one of AY's), but it is now an ordinary per-solve
-/// read: because the result lands on the solve's own options rather than on
-/// process state, the old "startup-only, never toggle concurrently with MIP
-/// solves" restriction no longer applies.
+/// Use the 75% fractional flip-LNS schedule by default, disabling AY's absolute
+/// cap. The canary leaves the share unset to use the 18 s absolute cap, but
+/// refuses an inherited AY_MILP_FLIP_SHARE that would override that arm.
+/// Both schedules disable warm-LU.
 fn flip_schedule(engine: &EngineEconomics) -> EngineEconomics {
     let raw = std::env::var("NY_AY_MILP_TALL_FLIP_CAP").ok();
     let inherited_share = std::env::var_os("AY_MILP_FLIP_SHARE").is_some();
@@ -114,17 +75,8 @@ fn flip_schedule_with(
 ) -> EngineEconomics {
     let engine = (*engine).with_flip_lns_cap(NY_FLIP_CAP).with_warm_lu(false);
     if use_ay_tall_flip_cap(tall_flip_cap_raw) {
-        // CANARY ARM: leave `flip_lns_share` unset so AY's own tall absolute
-        // cap governs. Under the old env lane NY could REMOVE an inherited
-        // `AY_MILP_FLIP_SHARE`; by value it can only decline to set one, and
-        // AY's environment layer still sits below the caller layer — so an
-        // inherited share would silently survive and mislabel the A/B.
-        //
-        // Fail closed on the MEASUREMENT: refuse to arm, and fall back to the
-        // pinned default arm. Declining to run a mislabelled canary loses a
-        // measurement arm, never a verdict (both arms are advice-lane
-        // scheduling), and a mislabelled arm would corrupt the provenance
-        // ledger `docs/SOLVER_POLICY.md` rests on.
+        // An inherited share survives an unset caller field and would mislabel
+        // the canary. Refuse that arm and retain the pinned default schedule.
         if !inherited_share {
             return engine;
         }
@@ -147,8 +99,21 @@ fn flip_schedule_with(
 /// `ColSpec::obj` is ignored, matching P0: feasibility solves have no
 /// objective, and optimization passes the objective separately.
 pub(crate) fn to_ay_model(problem: &MilpProblem) -> Result<Model> {
+    to_ay_model_with_poll(problem, || Ok(()))
+}
+
+/// Preserve the ordinary lowering while charging public cut intake's source
+/// reconstruction to its original deadline, including one wide source row.
+pub(crate) fn to_ay_model_with_poll(
+    problem: &MilpProblem,
+    mut poll: impl FnMut() -> Result<()>,
+) -> Result<Model> {
+    poll()?;
     let mut model = Model::new();
     for (i, spec) in problem.cols().iter().enumerate() {
+        if i & 0xff == 0 {
+            poll()?;
+        }
         if spec.integer {
             let col = model.add_binary_col();
             let pinned_zero = spec.lb == 0.0 && spec.ub == 0.0;
@@ -167,10 +132,15 @@ pub(crate) fn to_ay_model(problem: &MilpProblem) -> Result<Model> {
         }
     }
     for row in problem.rows() {
+        poll()?;
         let coeffs: Vec<(ay_milp::Col, f64)> = row
             .coeffs
             .iter()
-            .map(|&(c, a)| {
+            .enumerate()
+            .map(|(index, &(c, a))| {
+                if index & 0xff == 0 {
+                    poll()?;
+                }
                 model
                     .col_at(c)
                     .map(|col| (col, a))
@@ -178,6 +148,7 @@ pub(crate) fn to_ay_model(problem: &MilpProblem) -> Result<Model> {
             })
             .collect::<Result<_>>()?;
         model.add_row(row.lb, row.ub, &coeffs);
+        poll()?;
     }
     if let Some(row) = problem.margin_row() {
         let ay_row = model.row_at(row.0).ok_or_else(|| {
@@ -193,6 +164,7 @@ pub(crate) fn to_ay_model(problem: &MilpProblem) -> Result<Model> {
             ))
         })?;
     }
+    poll()?;
     Ok(model)
 }
 
@@ -386,6 +358,8 @@ where
     F: FnOnce() -> Result<T> + Send + 'static,
     N: FnOnce() -> std::time::Instant,
 {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Mip);
     let (tx, rx) = std::sync::mpsc::sync_channel::<Result<T>>(1);
     std::thread::Builder::new()
         .name(format!("ny-mip-ay-{label}"))
@@ -875,7 +849,8 @@ fn map_outcome_with_sat_relu_certificate(
     objective: Option<ObjectiveSpec>,
     sat_relu_certificate: Option<&ay_milp::SatReluInfeasibilityCertificate>,
     sat_relu_replay_deadline: Option<std::time::Instant>,
-    strict_infeasibility_evidence: bool,
+    side_artifacts: SideArtifactReplays<'_>,
+    strict_policy: bool,
 ) -> MipResult {
     // Seal pruning authority BEFORE the match consumes the outcome.  AY's
     // `EvidenceShape::FieldsPresent` is deliberately diagnostic only: public
@@ -995,17 +970,19 @@ fn map_outcome_with_sat_relu_certificate(
             //   a linear combination nor a B&B tree. NY reconstructs the exact
             //   SAT projection from THIS model and independently replays the
             //   proof under the caller's remaining absolute deadline.
-            // - `strict_infeasibility_evidence`: the session was constructed
-            //   with AY's `require_certificates` policy. Under that public
-            //   contract, a bare `Outcome::Infeasible` can survive only when an
-            //   exact-reduction side artifact (hybrid PB/LP, parity, PB-DP,
-            //   network design, or a later typed lane) was independently
-            //   rebuilt and replayed against THIS session's model before AY
-            //   returned it. This closes the cross-repo API gap without
-            //   duplicating every evolving side-certificate type in NY.
-            // A lane that verifies ⇒ certified; NO lane present ⇒ the verdict
-            // stands on ay's exact solving alone (`certified: false`), which
-            // ny's admission then refuses to mint.
+            // - `side_artifacts`: the typed exact-reduction artifacts AY
+            //   publishes on the SESSION (parity, network design, single-row
+            //   PB-DP, multi-row PB-BDD, hybrid PB/LP and integer lift, including
+            //   all four open-domain residual lanes) with a public model-bound
+            //   verifier. NY replays each against THIS model here, exactly as
+            //   it does the Farkas row and the tree. Affine aggregation must
+            //   additionally report checked reduced-frame infeasibility.
+            //   AY's admitted-evidence enum and `strict_policy` are diagnostic;
+            //   neither replaces a successful NY replay.
+            // A lane that verifies ⇒ certified; NO lane NY can replay ⇒ the
+            // verdict stands on ay's exact solving alone (`certified: false`),
+            // which ny's admission then refuses to mint — a lost verdict at
+            // worst, never a wrong one.
             //
             // A witness that does NOT re-check is a different state entirely,
             // and never a bare UNSAT: ay's own session already re-validates
@@ -1034,37 +1011,67 @@ fn map_outcome_with_sat_relu_certificate(
                         "ay-milp tree certificate FAILED verification: {e}"
                     )),
                 },
-                // A strict session already rebuilt and replayed whichever
-                // typed side artifact admitted this otherwise-bare outcome.
-                // Take that public contract before attempting NY's historical
-                // SAT/ReLU replay: AY may legitimately have spent nearly the
-                // whole shared deadline producing the proof, and a redundant
-                // second replay must not turn a proved result into a timeout.
-                (None, None) if strict_infeasibility_evidence => {
-                    tracing::debug!(
-                        "ay-milp strict certificate policy admitted a replayed typed \
-                         infeasibility side artifact"
-                    );
-                    MipResult::Unsat { certified: true }
-                }
-                (None, None) => match sat_relu_certificate {
-                    Some(certificate) => {
-                        match ay_milp::verify_sat_relu_infeasibility_certificate(
-                            model,
-                            certificate,
-                            sat_relu_replay_deadline,
-                        ) {
+                // The succinct exact-reduction artifacts first: each replay
+                // rebuilds the projection from THIS model and is cheap next to
+                // a CDCL replay. The first artifact decides — one independently
+                // verified proof is a proof, and a rejection is a hard failure
+                // of the certificate lane that is never shopped onward. All
+                // replays run inside the caller's `run_with_hard_deadline`
+                // envelope, so an overrun reads as a Timeout. Every exact
+                // reduction verifier also receives the original absolute deadline.
+                (None, None) => {
+                    let SideArtifactReplays {
+                        replayable,
+                        admitted_lane,
+                    } = side_artifacts;
+                    let admitted_lane = admitted_lane.unwrap_or("unknown");
+                    // Only the FIRST replayable artifact is consulted (see above).
+                    if let Some((lane, replay)) = replayable.into_iter().next() {
+                        match replay(model) {
                             Ok(()) => {
-                                tracing::debug!("ay-milp SAT/ReLU resolution certificate verified");
-                                MipResult::Unsat { certified: true }
+                                tracing::info!("[ay-cert] lane={admitted_lane} replay_lane={lane} ny_replay=verified");
+                                return MipResult::Unsat { certified: true };
                             }
-                            Err(error) => MipResult::Error(format!(
-                                "ay-milp SAT/ReLU certificate FAILED verification: {error}"
-                            )),
+                            Err(error) => {
+                                return MipResult::Error(format!(
+                                    "ay-milp {lane} side artifact FAILED NY replay: {error}"
+                                ));
+                            }
                         }
                     }
-                    None => MipResult::Unsat { certified: false },
-                },
+                    match sat_relu_certificate {
+                        Some(certificate) => {
+                            match ay_milp::verify_sat_relu_infeasibility_certificate(
+                                model,
+                                certificate,
+                                sat_relu_replay_deadline,
+                            ) {
+                                Ok(()) => {
+                                    tracing::info!("[ay-cert] lane={admitted_lane} replay_lane=sat_relu ny_replay=verified");
+                                    MipResult::Unsat { certified: true }
+                                }
+                                Err(error) => MipResult::Error(format!(
+                                    "ay-milp SAT/ReLU certificate FAILED verification: {error}"
+                                )),
+                            }
+                        }
+                        None => {
+                            // Keep absent proof authority observable even in library
+                            // callers that have not installed a tracing subscriber.
+                            // This reports the lane only and grants no authority.
+                            eprintln!(
+                                "[ay-cert] lane={} ny_replay=unavailable strict_policy={} verdict=uncertified",
+                                admitted_lane,
+                                strict_policy
+                            );
+                            tracing::warn!(
+                                "[ay-cert] lane={admitted_lane} ny_replay=unavailable \
+                                 (AY supplied no artifact NY can replay); verdict left uncertified"
+                            );
+                            MipResult::Unsat { certified: false }
+                        }
+                    }
+                }
             }
         }
         // Sound degrade, same as the P0 lane's Unknown -> Timeout.
@@ -1092,12 +1099,220 @@ fn map_outcome_with_sat_relu_certificate(
     }
 }
 
+/// Independently replayable session artifacts. AY's admitted-evidence kind is
+/// diagnostic attribution only; authority comes from replay against NY's model.
+/// Affine aggregation additionally requires an Infeasible claim and a checked
+/// reduced-frame infeasibility proof; an Unsupported inner proof has no authority.
+#[derive(Default)]
+struct SideArtifactReplays<'a> {
+    replayable: Vec<(
+        &'static str,
+        Box<dyn FnOnce(&Model) -> std::result::Result<(), String> + 'a>,
+    )>,
+    admitted_lane: Option<&'static str>,
+}
+
+fn admitted_lane_name(kind: ay_milp::InfeasibilityEvidenceKind) -> &'static str {
+    use ay_milp::InfeasibilityEvidenceKind as Kind;
+    match kind {
+        Kind::SatRelu => "sat_relu",
+        Kind::AffineAggregation => "affine_aggregation",
+        Kind::Parity => "parity",
+        Kind::NetworkDesign => "network_design",
+        Kind::SingleRowDp => "single_row_dp",
+        Kind::MultiRowBdd => "multi_row_bdd",
+        Kind::HybridPbLp => "hybrid_pb_lp",
+        Kind::HybridIntegerLift => "hybrid_integer_lift",
+        Kind::OpenDomainSingleRowDp => "open_domain_single_row_dp",
+        Kind::OpenDomainMultiRowBdd => "open_domain_multi_row_bdd",
+        Kind::OpenDomainHybridPbLp => "open_domain_hybrid_pb_lp",
+        Kind::OpenDomainHybridIntegerLift => "open_domain_hybrid_integer_lift",
+        _ => "unrecognized",
+    }
+}
+
+impl<'a> SideArtifactReplays<'a> {
+    fn none() -> Self {
+        Self::default()
+    }
+
+    #[cfg(test)]
+    fn from_session(session: &'a BabSession) -> Self {
+        Self::from_session_with_deadline(session, None)
+    }
+
+    /// All rebuilds and nested replays share the original absolute solve clock.
+    fn from_session_with_deadline(
+        session: &'a BabSession,
+        replay_deadline: Option<std::time::Instant>,
+    ) -> Self {
+        let mut out = Self {
+            admitted_lane: session
+                .admitted_infeasibility_evidence()
+                .map(admitted_lane_name),
+            ..Self::none()
+        };
+        if let Some(cert) = session.parity_infeasibility_certificate() {
+            out.replayable.push((
+                "parity",
+                Box::new(move |model: &Model| {
+                    ay_milp::verify_parity_infeasibility_certificate_with_deadline(
+                        model,
+                        cert,
+                        replay_deadline,
+                    )
+                }),
+            ));
+        }
+        if let Some(cert) = session.network_design_infeasibility_certificate() {
+            out.replayable.push((
+                "network_design",
+                Box::new(move |model: &Model| {
+                    ay_milp::verify_network_design_infeasibility_certificate_with_deadline(
+                        model,
+                        cert,
+                        replay_deadline,
+                    )
+                }),
+            ));
+        }
+        if let Some(cert) = session.single_row_dp_infeasibility_certificate() {
+            out.replayable.push((
+                "single_row_dp",
+                Box::new(move |model: &Model| {
+                    ay_milp::verify_single_row_dp_infeasibility_certificate_with_deadline(
+                        model,
+                        cert,
+                        replay_deadline,
+                    )
+                }),
+            ));
+        }
+        if let Some(cert) = session.multi_row_bdd_infeasibility_certificate() {
+            out.replayable.push((
+                "multi_row_bdd",
+                Box::new(move |model: &Model| {
+                    ay_milp::verify_multi_row_bdd_infeasibility_certificate_with_deadline(
+                        model,
+                        cert,
+                        replay_deadline,
+                    )
+                }),
+            ));
+        }
+        if let Some(cert) = session.hybrid_pb_lp_infeasibility_certificate() {
+            out.replayable.push((
+                "hybrid_pb_lp",
+                Box::new(move |model: &Model| {
+                    ay_milp::verify_hybrid_pb_lp_infeasibility_certificate_with_deadline(
+                        model,
+                        cert,
+                        replay_deadline,
+                    )
+                    .map_err(|error| error.to_string())
+                }),
+            ));
+        }
+        if let Some(cert) = session.hybrid_integer_lift_infeasibility_certificate() {
+            out.replayable.push((
+                "hybrid_integer_lift",
+                Box::new(move |model: &Model| {
+                    ay_milp::verify_hybrid_integer_lift_infeasibility_certificate_with_deadline(
+                        model,
+                        cert,
+                        replay_deadline,
+                    )
+                    .map_err(|error| error.to_string())
+                }),
+            ));
+        }
+        if let Some(cert) = session.open_domain_single_row_dp_infeasibility_certificate() {
+            out.replayable.push((
+                "open_domain_single_row_dp",
+                Box::new(move |model: &Model| {
+                    ay_milp::verify_open_domain_single_row_dp_infeasibility_certificate_with_deadline(
+                        model, cert, replay_deadline,
+                    ).then_some(()).ok_or_else(|| "source-bound residual replay rejected or exceeded its deadline".to_owned())
+                }),
+            ));
+        }
+        if let Some(cert) = session.open_domain_multi_row_bdd_infeasibility_certificate() {
+            out.replayable.push((
+                "open_domain_multi_row_bdd",
+                Box::new(move |model: &Model| {
+                    ay_milp::verify_open_domain_multi_row_bdd_infeasibility_certificate_with_deadline(
+                        model, cert, replay_deadline,
+                    ).then_some(()).ok_or_else(|| "source-bound residual replay rejected or exceeded its deadline".to_owned())
+                }),
+            ));
+        }
+        if let Some(cert) = session.open_domain_hybrid_pb_lp_infeasibility_certificate() {
+            out.replayable.push((
+                "open_domain_hybrid_pb_lp",
+                Box::new(move |model: &Model| {
+                    ay_milp::verify_open_domain_hybrid_pb_lp_infeasibility_certificate_with_deadline(
+                        model, cert, replay_deadline,
+                    ).then_some(()).ok_or_else(|| "source-bound residual replay rejected or exceeded its deadline".to_owned())
+                }),
+            ));
+        }
+        if let Some(cert) = session.open_domain_hybrid_integer_lift_infeasibility_certificate() {
+            out.replayable.push((
+                "open_domain_hybrid_integer_lift",
+                Box::new(move |model: &Model| {
+                    ay_milp::verify_open_domain_hybrid_integer_lift_infeasibility_certificate_with_deadline(
+                        model, cert, replay_deadline,
+                    ).then_some(()).ok_or_else(|| "source-bound residual replay rejected or exceeded its deadline".to_owned())
+                }),
+            ));
+        }
+        if let Some(cert) = session.affine_aggregation_certificate() {
+            out.replayable.push((
+                "affine_aggregation",
+                Box::new(move |model: &Model| {
+                    replay_affine_infeasibility(model, cert, replay_deadline)
+                }),
+            ));
+        }
+        out
+    }
+}
+
+/// The affine public checker has no cooperative deadline parameter. NY keeps
+/// it inside the existing hard-deadline worker, polls before and after replay,
+/// and never grants a new clock or admits a late/Unsupported proof.
+fn replay_affine_infeasibility(
+    model: &Model,
+    certificate: &ay_milp::AffineAggregationCertificate,
+    deadline: Option<std::time::Instant>,
+) -> std::result::Result<(), String> {
+    let expired = || deadline.is_some_and(|end| std::time::Instant::now() >= end);
+    if expired() {
+        return Err("affine replay resource envelope expired".to_owned());
+    }
+    if certificate.claim() != &ay_milp::AffineAggregationClaim::Infeasible {
+        return Err("affine artifact does not claim infeasibility".to_owned());
+    }
+    let verification = certificate
+        .verify(model)
+        .map_err(|error| error.to_string())?;
+    if expired() {
+        return Err("affine replay resource envelope expired".to_owned());
+    }
+    if !verification.infeasibility_verified {
+        return Err("affine inner proof does not verify infeasibility".to_owned());
+    }
+    Ok(())
+}
+
 /// Map an ordinary [`BabSession`] outcome together with its typed side evidence.
 ///
 /// SAT/ReLU refutations deliberately do not masquerade as a root Farkas row or
 /// a branch-and-bound tree, so their certificate lives on the session rather
 /// than in [`Outcome::Infeasible`].  Read it before the session is dropped and
 /// independently rebuild/replay it against the exact model NY handed to AY.
+/// The same holds for the exact-reduction artifacts gathered by
+/// [`SideArtifactReplays::from_session_with_deadline`].
 fn map_bab_outcome(
     outcome: Outcome,
     session: &BabSession,
@@ -1105,7 +1320,7 @@ fn map_bab_outcome(
     output_vars: &[Col],
     objective: Option<ObjectiveSpec>,
     sat_relu_replay_deadline: Option<std::time::Instant>,
-    strict_infeasibility_evidence: bool,
+    strict_policy: bool,
 ) -> MipResult {
     map_outcome_with_sat_relu_certificate(
         outcome,
@@ -1115,7 +1330,8 @@ fn map_bab_outcome(
         objective,
         session.sat_relu_infeasibility_certificate(),
         sat_relu_replay_deadline,
-        strict_infeasibility_evidence,
+        SideArtifactReplays::from_session_with_deadline(session, sat_relu_replay_deadline),
+        strict_policy,
     )
 }
 
@@ -1135,6 +1351,7 @@ fn map_outcome(
         objective,
         None,
         None,
+        SideArtifactReplays::none(),
         false,
     )
 }
@@ -1171,6 +1388,7 @@ mod pruning_authority_tests {
             objective_spec(),
             None,
             None,
+            SideArtifactReplays::none(),
             false,
         );
         let MipResult::Sat { dual_bound, .. } = mapped else {
@@ -1476,32 +1694,201 @@ mod sat_relu_certificate_tests {
         );
     }
 
-    #[test]
-    fn bare_infeasibility_needs_the_strict_session_contract() {
-        let model = Model::new();
-        let bare = || Outcome::Infeasible {
+    fn bare_infeasible() -> Outcome {
+        Outcome::Infeasible {
             cert: None,
             tree_cert: None,
-        };
-        let historical = map_outcome_with_sat_relu_certificate(
-            bare(),
+        }
+    }
+
+    /// The reviewer's line, pinned: AY's `require_certificates` policy is a
+    /// contract about what AY replayed inside ITS crate. NY's `certified:
+    /// true` means NY replayed it. With no artifact NY can replay, the bare
+    /// outcome is uncertified under BOTH policies — the strict bool that used
+    /// to mint `certified: true` here confers no authority any more.
+    #[test]
+    fn bare_infeasibility_is_uncertified_even_under_the_strict_session_policy() {
+        let model = Model::new();
+        for strict in [false, true] {
+            let mapped = map_outcome_with_sat_relu_certificate(
+                bare_infeasible(),
+                &model,
+                &[],
+                &[],
+                None,
+                None,
+                None,
+                SideArtifactReplays::none(),
+                strict,
+            );
+            assert!(
+                matches!(mapped, MipResult::Unsat { certified: false }),
+                "strict={strict}: a bare Infeasible with nothing NY can replay must stay \
+                 uncertified: {mapped:?}"
+            );
+        }
+    }
+
+    /// THE MOAT LINE for the side artifacts: a replay that does not hold is a
+    /// hard failure of the certificate lane, never a bare UNSAT and never
+    /// shopped to the next lane — the second artifact here would verify, and
+    /// must not be consulted.
+    #[test]
+    fn a_rejected_side_artifact_replay_is_an_error_never_an_unsat() {
+        let model = Model::new();
+        let mapped = map_outcome_with_sat_relu_certificate(
+            bare_infeasible(),
             &model,
             &[],
             &[],
             None,
             None,
             None,
+            SideArtifactReplays {
+                // Each `Box::new(closure)` has its own opaque closure type,
+                // so the first element would fix the vec's element type and the
+                // second could never coerce (E0308). Name the trait object.
+                replayable: vec![
+                    (
+                        "parity",
+                        Box::new(|_: &Model| {
+                            Err("claimed parity contradiction does not hold".to_owned())
+                        })
+                            as Box<dyn FnOnce(&Model) -> std::result::Result<(), String>>,
+                    ),
+                    (
+                        "single_row_dp",
+                        Box::new(|_: &Model| Ok(()))
+                            as Box<dyn FnOnce(&Model) -> std::result::Result<(), String>>,
+                    ),
+                ],
+                admitted_lane: Some("network_design"),
+            },
+            true,
+        );
+        let MipResult::Error(error) = mapped else {
+            panic!("a rejected side artifact must fail closed: {mapped:?}");
+        };
+        assert!(
+            error.contains("parity side artifact FAILED NY replay")
+                && error.contains("does not hold"),
+            "the failure must name the lane and keep the verifier's reason: {error}"
+        );
+    }
+
+    /// A side artifact that verifies against NY's model carries authority —
+    /// through the replay, not through the policy flag.
+    #[test]
+    fn a_verified_side_artifact_replay_certifies_without_the_strict_policy() {
+        let model = Model::new();
+        let mapped = map_outcome_with_sat_relu_certificate(
+            bare_infeasible(),
+            &model,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            SideArtifactReplays {
+                replayable: vec![("network_design", Box::new(|_: &Model| Ok(())))],
+                admitted_lane: None,
+            },
             false,
         );
-        assert!(matches!(historical, MipResult::Unsat { certified: false }));
+        assert!(
+            matches!(mapped, MipResult::Unsat { certified: true }),
+            "a replay NY ran and that held must certify: {mapped:?}"
+        );
+    }
 
-        // This boolean is valid only for an outcome returned by a session
-        // whose SolveOpts had `require_certificates=true`. AY's public policy
-        // degrades the same bare outcome to Unknown unless a typed side proof
-        // was independently replayed before return.
-        let strict =
-            map_outcome_with_sat_relu_certificate(bare(), &model, &[], &[], None, None, None, true);
-        assert!(matches!(strict, MipResult::Unsat { certified: true }));
+    /// The single-row PB-DP lane end to end on a NY-lowered model: `x, y`
+    /// ReLU binaries, `2x + 3y >= 4` and `2x + 3y <= 3`. AY publishes the
+    /// typed artifact on the session; NY reads it off, rebuilds the exact PB
+    /// projection from ITS model and replays the proof.
+    fn single_row_dp_problem(upper: f64) -> MilpProblem {
+        let mut problem = MilpProblem::new();
+        let x = problem.add_integer_col(0.0, 0.0, 1.0);
+        let y = problem.add_integer_col(0.0, 0.0, 1.0);
+        problem.add_row(4.0, f64::INFINITY, [(x, 2.0), (y, 3.0)]);
+        problem.add_row(f64::NEG_INFINITY, upper, [(x, 2.0), (y, 3.0)]);
+        problem
+    }
+
+    fn solved_single_row_dp_session() -> BabSession {
+        let model = to_ay_model(&single_row_dp_problem(3.0)).expect("PB-DP test model lowers");
+        let opts = SolveOpts::new()
+            .with_time_limit(std::time::Duration::from_secs(5))
+            .with_require_certificates(true);
+        let mut session = BabSession::new(model, &opts).expect("PB-DP test session");
+        let outcome = session.check().expect("PB-DP route decides");
+        assert!(
+            matches!(outcome, Outcome::Infeasible { .. }),
+            "the contradictory single row must be refuted: {outcome:?}"
+        );
+        assert!(
+            session.single_row_dp_infeasibility_certificate().is_some(),
+            "the PB route's verdict must carry its typed single-row artifact"
+        );
+        session
+    }
+
+    #[test]
+    fn single_row_dp_side_artifact_is_replayed_against_ny_model() {
+        let session = solved_single_row_dp_session();
+        let artifacts = SideArtifactReplays::from_session(&session);
+        assert_eq!(
+            artifacts
+                .replayable
+                .iter()
+                .map(|(lane, _)| *lane)
+                .collect::<Vec<_>>(),
+            vec!["single_row_dp"],
+            "exactly the published lane must be offered for replay"
+        );
+        let mapped = map_outcome_with_sat_relu_certificate(
+            bare_infeasible(),
+            session.model(),
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            artifacts,
+            true,
+        );
+        assert!(
+            matches!(mapped, MipResult::Unsat { certified: true }),
+            "a single-row DP artifact replayed by NY against its own model must certify: \
+             {mapped:?}"
+        );
+    }
+
+    /// The same artifact against a DIFFERENT model (`2x + 3y <= 5`, which
+    /// `x = y = 1` satisfies) must be rejected by the model-bound rebuild, and
+    /// that rejection must arrive as an error, never as an Unsat of either
+    /// flavour.
+    #[test]
+    fn single_row_dp_side_artifact_from_a_mutated_model_fails_closed() {
+        let session = solved_single_row_dp_session();
+        let mutated = to_ay_model(&single_row_dp_problem(5.0)).expect("mutated model lowers");
+        let mapped = map_outcome_with_sat_relu_certificate(
+            bare_infeasible(),
+            &mutated,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            SideArtifactReplays::from_session(&session),
+            true,
+        );
+        let MipResult::Error(error) = mapped else {
+            panic!("a proof about another model must fail closed: {mapped:?}");
+        };
+        assert!(
+            error.contains("single_row_dp side artifact FAILED NY replay"),
+            "the fail-closed result must name the lane: {error}"
+        );
     }
 
     #[test]
@@ -1533,6 +1920,7 @@ mod sat_relu_certificate_tests {
             None,
             Some(&certificate),
             replay_deadline,
+            SideArtifactReplays::none(),
             false,
         );
         let MipResult::Error(error) = result else {
@@ -1558,6 +1946,7 @@ mod sat_relu_certificate_tests {
             None,
             session.sat_relu_infeasibility_certificate(),
             std::time::Instant::now().checked_sub(std::time::Duration::from_millis(1)),
+            SideArtifactReplays::none(),
             false,
         );
         let MipResult::Error(error) = result else {
@@ -1569,26 +1958,46 @@ mod sat_relu_certificate_tests {
         );
     }
 
+    /// Inverted from its predecessor (`strict_session_does_not_replay_typed_
+    /// sidecar_after_shared_deadline`), which asserted that AY's strict policy
+    /// excused NY from replaying an out-of-budget sidecar and minted
+    /// `certified: true` on AY's word. It does not: the replay runs under the
+    /// same envelope regardless of policy, and an expired replay fails closed
+    /// exactly as it does for a non-strict session.
     #[test]
-    fn strict_session_does_not_replay_typed_sidecar_after_shared_deadline() {
+    fn strict_policy_does_not_excuse_an_expired_sidecar_replay() {
         let (session, _, _) = solved_sat_relu_session_with_policy(true);
         let result = map_outcome_with_sat_relu_certificate(
-            Outcome::Infeasible {
-                cert: None,
-                tree_cert: None,
-            },
+            bare_infeasible(),
             session.model(),
             &[],
             &[],
             None,
             session.sat_relu_infeasibility_certificate(),
             std::time::Instant::now().checked_sub(std::time::Duration::from_millis(1)),
+            SideArtifactReplays::from_session(&session),
             true,
         );
+        let MipResult::Error(error) = result else {
+            panic!(
+                "an out-of-budget replay must fail closed under the strict policy too: {result:?}"
+            );
+        };
+        assert!(
+            error.contains("resource envelope"),
+            "the fail-closed result must preserve the deadline rejection: {error}"
+        );
+    }
+
+    /// And the positive half: a strict session's sidecar, replayed by NY
+    /// inside its budget, certifies through the production mapping.
+    #[test]
+    fn strict_session_sidecar_is_replayed_by_ny_before_it_carries_authority() {
+        let (session, outcome, replay_deadline) = solved_sat_relu_session_with_policy(true);
+        let result = map_bab_outcome(outcome, &session, &[], &[], None, replay_deadline, true);
         assert!(
             matches!(result, MipResult::Unsat { certified: true }),
-            "AY's strict policy already replayed the side artifact inside the shared deadline: \
-             {result:?}"
+            "a strict session's sidecar that NY replayed must certify: {result:?}"
         );
     }
 }
@@ -2755,7 +3164,7 @@ impl MarginAutoProgress {
             .spawn(move || {
                 for _ in 0..Self::MAX_SAMPLES {
                     for _ in 0..ticks.max(1) {
-                        if worker_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        if worker_stop.load(Ordering::Relaxed) {
                             return;
                         }
                         std::thread::sleep(Self::TICK);
@@ -2771,7 +3180,7 @@ impl MarginAutoProgress {
     }
 
     fn finish(self) -> Vec<(f64, u64)> {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.stop.store(true, Ordering::Relaxed);
         self.samples
             .lock()
             .map(|samples| samples.clone())
@@ -3134,8 +3543,9 @@ mod margin_auto_tests {
             None,
             None,
             None,
-            // Even with the strict-policy door open: the artifact is present
-            // and it does not hold, which is a different state from absence.
+            SideArtifactReplays::none(),
+            // Even under the strict policy: the artifact is present and it
+            // does not hold, which is a different state from absence.
             true,
         );
         assert!(
@@ -3226,6 +3636,33 @@ pub(crate) fn check_feasibility(
     warm_start_cols: Option<&[f64]>,
     branch_hints: &[Col],
 ) -> Result<MipResult> {
+    check_feasibility_with_integer_cut_bank(
+        problem,
+        timeout_secs,
+        hard_deadline,
+        node_warm_time_limit,
+        input_vars,
+        output_vars,
+        warm_start_cols,
+        branch_hints,
+        None,
+    )
+    .map(|(result, _)| result)
+}
+
+/// Explicit MILP proof composition: source integer premises license every
+/// installed cut; outcome evidence is then replayed against the augmented model.
+pub(crate) fn check_feasibility_with_integer_cut_bank(
+    problem: &MilpProblem,
+    timeout_secs: f64,
+    hard_deadline: Option<std::time::Instant>,
+    node_warm_time_limit: Option<std::time::Duration>,
+    input_vars: &[Col],
+    output_vars: &[Col],
+    warm_start_cols: Option<&[f64]>,
+    branch_hints: &[Col],
+    cut_bank: Option<crate::IntegerCutBank>,
+) -> Result<(MipResult, Option<crate::IntegerCutBank>)> {
     // An absolute caller deadline means preliminary work has already consumed
     // part of this solve's historical envelope.  Never reapply the optional
     // window floor in that mode.  The relative slice remains an independent
@@ -3246,7 +3683,7 @@ pub(crate) fn check_feasibility(
                 .checked_duration_since(now)
                 .filter(|remaining| !remaining.is_zero())
             else {
-                return Ok(MipResult::Timeout);
+                return Ok((MipResult::Timeout, None));
             };
             (remaining.as_secs_f64(), Some(deadline))
         }
@@ -3262,14 +3699,19 @@ pub(crate) fn check_feasibility(
     let warm_start_cols = warm_start_cols.map(<[f64]>::to_vec);
     let branch_hints = branch_hints.to_vec();
     if hard_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-        return Ok(MipResult::Timeout);
+        return Ok((MipResult::Timeout, None));
     }
     // Opened after every pre-solve decline, so `elapsed_s` measures the solve
     // this call actually launched, against the `budget_s` it actually owns.
     // `None` on every unmarked model, which is the whole historical corpus.
     let margin_auto = MarginAutoSession::begin(&problem, timeout_secs);
     let solve = move || {
-        let model = to_ay_model(&problem)?;
+        let source = if cut_bank.is_some() {
+            crate::integer_cut_bank::source_model(&problem, hard_deadline)?
+        } else {
+            to_ay_model(&problem)?
+        };
+        let mut cut_bank = cut_bank;
         let opts = window_scoped_opts(
             graph_mip_solve_opts(timeout_secs, node_warm_time_limit),
             &problem,
@@ -3290,6 +3732,13 @@ pub(crate) fn check_feasibility(
             .effective_deadline(std::time::Instant::now())
             .map(|deadline| hard_deadline.map_or(deadline, |outer| deadline.min(outer)))
             .or(hard_deadline);
+        let (model, cut_source) = match &cut_bank {
+            Some(bank) => (
+                bank.augment(&source, sat_relu_replay_deadline)?,
+                Some(source),
+            ),
+            None => (source, None),
+        };
         let mut session =
             BabSession::new(model, &opts).map_err(|e| MipError::Solver(e.to_string()))?;
         if let Some(seed) = &warm_start_cols {
@@ -3305,7 +3754,7 @@ pub(crate) fn check_feasibility(
         let outcome = session
             .check()
             .map_err(|e| MipError::Solver(e.to_string()))?;
-        Ok(map_bab_outcome(
+        let result = map_bab_outcome(
             outcome,
             &session,
             &input_vars,
@@ -3313,20 +3762,26 @@ pub(crate) fn check_feasibility(
             None,
             sat_relu_replay_deadline,
             opts.require_certificates,
-        ))
+        );
+        if matches!(result, MipResult::Error(_) | MipResult::Timeout) {
+            cut_bank = None;
+        } else if let (Some(bank), Some(source)) = (&mut cut_bank, &cut_source) {
+            bank.collect(&mut session, source, sat_relu_replay_deadline)?;
+        }
+        Ok((result, cut_bank))
     };
     let outcome = match hard_deadline {
         Some(deadline) => run_with_hard_deadline_at(deadline, "check", solve),
         None => run_with_hard_deadline(timeout_secs, "check", solve),
     }
     // Slice expired with the solve still running: Timeout, never a verdict.
-    .map(|result| result.unwrap_or(MipResult::Timeout));
+    .map(|result| result.unwrap_or((MipResult::Timeout, None)));
     if let Some(margin_auto) = margin_auto {
         // A backend error is observed too — an errored margin session is
         // exactly as diagnostic as a timed-out one, and reporting it here
         // cannot change what the caller receives.
         let (outcome_tag, exported_dual_bound) = match &outcome {
-            Ok(result) => (
+            Ok((result, _)) => (
                 shared_prefix_outcome_tag(result),
                 match result {
                     // The ONE dual AY exports through this entry today: the
@@ -4104,12 +4559,12 @@ mod hard_deadline_tests {
             deadline,
             "test-post-spawn-delay",
             move || {
-                worker_flag.store(true, std::sync::atomic::Ordering::Release);
+                worker_flag.store(true, Ordering::Release);
                 Ok(42usize)
             },
             move || {
                 let wait_until = Instant::now() + Duration::from_secs(2);
-                while !clock_flag.load(std::sync::atomic::Ordering::Acquire) {
+                while !clock_flag.load(Ordering::Acquire) {
                     assert!(
                         Instant::now() < wait_until,
                         "deadline clock was sampled before the worker spawned"
@@ -4232,3 +4687,7 @@ pub fn prove_infeasible_with_row_farkas(
     })?;
     Ok(result.flatten())
 }
+
+#[cfg(test)]
+#[path = "ay_lib/replay_tests.rs"]
+mod public_replay_tests;

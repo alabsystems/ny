@@ -7,6 +7,8 @@
 // attest that exact AY + ny-cert replay has already succeeded. Keeping that
 // bridge in its own module makes the trust boundary mechanically auditable.
 #![deny(unsafe_code)]
+// Retained proof publications exceed the default auto-trait recursion budget.
+#![recursion_limit = "256"]
 
 //! ny command-line interface bootstrap.
 //!
@@ -20,17 +22,11 @@
 //! - `config.rs` resolves verify-time YAML config, CSV instance, and CLI override state
 //! - `preset/` applies competition and benchmark presets before command execution
 
-// Link macOS Accelerate BLAS for ndarray::dot() acceleration (#4259).
+// Use Accelerate for ndarray::dot() on macOS.
 #[cfg(target_os = "macos")]
 extern crate blas_src;
 
-// Global allocator: mimalloc's per-thread heaps eliminate the system-allocator
-// LOCK CONTENTION measured (macOS `sample`, 2026-07-21) in the per-domain CROWN
-// backward hot path of the relational input-split BaB — `_os_unfair_lock_lock_slow`
-// + per-domain matrix alloc/memset were ~10% of the wall on the iso holdouts,
-// caused by many rayon threads hammering the global malloc lock simultaneously.
-// Pure performance; zero correctness/soundness impact (same computation, different
-// memory manager). Benefits every allocation-heavy multi-threaded verify path.
+// Per-thread heaps reduce allocator contention during parallel bound propagation.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -40,6 +36,8 @@ mod commands;
 mod compute_backend;
 mod config;
 mod flight;
+#[cfg(feature = "mip")]
+mod head_phase_advice;
 mod plan_resolver;
 mod preset;
 // #lever-reachability: the typed preset ROUTE for env-gated verdict-affecting
@@ -47,6 +45,10 @@ mod preset;
 // starts. `run_instance.sh` exports no `NY_*`, so a gate without a
 // typed key is dead code on a scored run.
 mod preset_gates;
+// #router-r1 (ROUTER_PROGRAM R1): the shadow router's ny-cli glue — the one
+// reader of `router.mode` / `optimizer.mode`, the capability registry, facts,
+// telemetry and replay. It changes no verdict path.
+mod router;
 mod subcommands;
 
 pub(crate) use subcommands::{
@@ -273,19 +275,26 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run_with_platform_stack() -> Result<()> {
-    // Windows gives a process's main thread only a 1 MiB stack by default,
-    // where Linux and macOS give 8 MiB. ny's CROWN / β-CROWN branch-and-bound
-    // bound propagation recurses deep enough to overflow 1 MiB on real models
-    // (Windows aborts the process with STATUS_STACK_OVERFLOW, 0xC00000FD), so on
-    // Windows we run the whole CLI on a worker thread with a generous explicit
-    // stack. Unix/macOS keep the original direct call, so their behavior is
-    // byte-for-byte unchanged.
+    // Same-binary AY transport has no model, logger, device or ordinary solver
+    // bootstrap. Bypass the Windows main-worker stack reservation as well.
+    #[cfg(feature = "mip")]
+    if head_phase_advice::helper_requested(std::env::args_os().skip(1))? {
+        return head_phase_advice::run_helper();
+    }
+    #[cfg(feature = "mip")]
+    if head_phase_advice::functional_helper_requested(std::env::args_os().skip(1))? {
+        return head_phase_advice::run_functional_helper();
+    }
+    #[cfg(feature = "mip")]
+    if head_phase_advice::phase_cover_helper_requested(std::env::args_os().skip(1))? {
+        return head_phase_advice::run_phase_cover_helper();
+    }
+
+    // Recursive bound propagation can exhaust Windows' default main-thread
+    // stack, so run the CLI on a worker with an explicit stack reservation.
     #[cfg(windows)]
     {
-        // 256 MiB is a virtual reservation only — Windows commits stack pages on
-        // demand — chosen to match the deep-recursion headroom the Linux/macOS
-        // main thread already has. This does not mask runaway recursion: genuine
-        // unbounded recursion still overflows any finite stack and aborts.
+        // Windows commits reserved stack pages on demand.
         const NY_MAIN_STACK_BYTES: usize = 256 * 1024 * 1024;
         let worker = std::thread::Builder::new()
             .name("ny-main".to_owned())
@@ -316,18 +325,9 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    // Canonical binary identity (#binary-identity) — the one thing to compare
-    // before trusting any measurement: derived version, feature tier, backend
-    // class, impl markers, commit + dirty digest, and (for `--build-id`) the
-    // sha256 of these exact bytes. Intercepted before clap and logging so both
-    // stay side-effect free and derivable WITHOUT running a verification.
-    //
-    // Two forms, because their COSTS differ by three orders of magnitude:
-    //   --build-stamp  compiled fields only, no I/O. For per-instance use.
-    //   --build-id     also hashes the executable (~0.1 s on a 133 MB release
-    //                  binary, far more in a debug build). Pay it once per
-    //                  sweep, never once per scored row.
-    // See `crates/ny-cli/src/build_id.rs`.
+    // #binary-identity: answer before clap, logging or backend probing.
+    // --build-stamp uses compiled fields; --build-id also hashes the executable.
+    // Per-instance receipts use the stamp to avoid executable I/O in the budget.
     {
         let mut args = std::env::args_os().skip(1);
         match args.next() {
@@ -347,19 +347,8 @@ fn run() -> Result<()> {
         }
     }
 
-    // Machine-readable compiled-feature report (`ny --build-info`). A plain
-    // build (no cuda/mip) silently measures 0 on the GPU-dependent categories,
-    // so scripts/measure_ny_scorecard.sh probes this line and refuses to
-    // measure unless both features are compiled in. Intercepted before clap
-    // parsing and logging setup so the output stays a single stable, greppable
-    // stdout line with no side effects (no CUDA/adapter probing happens here).
-    //
-    // The version here is the DERIVED one
-    // (`<major>.<minor>.<rev-list count>[+dirty…]`), not the frozen
-    // `Cargo.toml` patch: every consumer that logged `ny 0.3.0` for the whole
-    // campaign now logs something that actually differs between builds. The
-    // second line is the free identity stamp, so
-    // a script that already captures `--build-info` gains it at no cost.
+    // --build-info emits the derived version/features line and compiled stamp.
+    // It performs no CUDA or adapter probe; runtime qualification is separate.
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--build-info")) {
         println!(
             "ny {} features: cuda={} mip={}",
@@ -537,6 +526,21 @@ fn run() -> Result<()> {
         }
     };
     let (verbose, log_format, command) = cli.into_parts();
+    // Global Clap options may precede this hidden command. Keep that route
+    // just as free of normal backend/factory/subscriber setup as the exact
+    // subprocess entry above.
+    #[cfg(feature = "mip")]
+    if matches!(&command, Commands::InternalHeadPhaseAyAdvice) {
+        return head_phase_advice::run_helper();
+    }
+    #[cfg(feature = "mip")]
+    if matches!(&command, Commands::InternalHeadFunctionalAyAdvice) {
+        return head_phase_advice::run_functional_helper();
+    }
+    #[cfg(feature = "mip")]
+    if matches!(&command, Commands::InternalHeadPhaseCoverAyAdvice) {
+        return head_phase_advice::run_phase_cover_helper();
+    }
     // Proof-capable commands decide WGPU ownership only after resolving their
     // CLI/config/preset request and running live qualification. Do not install
     // the independent lazy FL-value context before that decision: a plan-rate
@@ -693,6 +697,9 @@ fn run() -> Result<()> {
                 .map(|e| e as Arc<dyn ny_core::GemmEngine>)
         }
         ny_propagate::sound_f64_gemm::set_sound_f64_gemm_factory(shared_cuda_engine);
+        // Scheduling metadata for structural raw loading only; the original
+        // root later requires a ready engine with both checked capabilities.
+        ny_propagate::beta_crown::certified_root_cut::note_checked_root_cut_factory_registered();
         // Same shared engine drives the backend ComputeDevice's f32 GEMM seam
         // (IBP forward / PGD / BaB engine traffic): cuBLAS Sgemm is measured
         // 2-3.4x faster than the wgpu WGSL shader at every hotspot shape. IEEE
@@ -837,6 +844,106 @@ fn run() -> Result<()> {
         })
     });
 
+    // The head-group provider is optional advice. Register only a lazy factory
+    // here; its first live armed complete-cover call binds this executable.
+    #[cfg(feature = "mip")]
+    head_phase_advice::install_lazy_factory();
+
+    // #bbe-joint-root (ENGINE_PROGRAM M5a): register the UNTRUSTED root-search
+    // backend for `margin_row.root_search: joint_f32` (default `ascent`, which
+    // never consults it). Registration is unconditional and free: the closure
+    // runs at most once, on the first armed joint_f32 root or breakpoint-dual
+    // phase. Search outputs are hints: root slopes pass the certify-once gate,
+    // and dual multipliers pass the existing certified node evaluator.
+    ny_propagate::margin_row::set_root_search_backend_factory(|| {
+        Some(std::sync::Arc::new(ny_bbe::CpuF32Backend::new())
+            as std::sync::Arc<dyn ny_core::search::SearchBackend>)
+    });
+
+    // #vit-root-alpha (ENGINE_PROGRAM V2): register the UNTRUSTED graph
+    // root-search backend for `margin_alpha_search: joint_f32` (default
+    // `ascent`, which never consults it). Unconditional and free: the closure
+    // runs at most once, on the first ARMED phase. The backend's parameters
+    // reach the certified lane only through its clamp gate and ONE certified
+    // fold, kept only when strictly better.
+    ny_propagate::network::graph_root_search::set_graph_root_search_backend_factory(|| {
+        Some(std::sync::Arc::new(ny_bbe::CpuF32Backend::new())
+            as std::sync::Arc<dyn ny_core::search::SearchBackend>)
+    });
+
+    // #wide-fd-search (ENGINE_PROGRAM M4): register the UNTRUSTED level-search
+    // backends of `margin_row.frozen_dual_bab_search` (default `f64`, which
+    // never consults them). Registration is unconditional and free: each
+    // closure runs at most once, on the first ARMED class that asks for it.
+    // The device search builds its own CUDA context lazily, on its first
+    // upload, and refuses fail-soft (the class then runs `f64`); the tier
+    // certifies every prune in f64 whichever backend proposed it.
+    ny_propagate::margin_row::set_frozen_dual_search_backend_factory(
+        ny_propagate::margin_row::FdBackendKind::CpuF32,
+        || {
+            Some(std::sync::Arc::new(ny_bbe::CpuF32Backend::new())
+                as std::sync::Arc<dyn ny_core::search::SearchBackend>)
+        },
+    );
+    // The device search honours the operator's CUDA kill switch (NY_NO_CUDA,
+    // already read above) but deliberately NOT the cuBLAS-candidate admission
+    // behind `CudaStartupAction::RegisterFactories`: the search kernels need
+    // only libcuda (ENGINE_PROGRAM §1.9), so an image without libcublas must
+    // not lose them. Unregistered, `cuda` runs `f64` and `auto` runs `cpu_f32`.
+    //
+    // ONE device search backend serves both device searches (the level search
+    // here and the wave search below): one own context, one self-test, one
+    // fault latch (a fault in either search poisons the shared context, so
+    // both refuse after it). Construction touches no driver.
+    #[cfg(feature = "cuda")]
+    let device_search =
+        (!cuda_disabled).then(|| std::sync::Arc::new(ny_cuda::search::CudaSearchBackend::new()));
+    #[cfg(feature = "cuda")]
+    if let Some(device) = device_search.as_ref().map(std::sync::Arc::clone) {
+        ny_propagate::margin_row::set_frozen_dual_search_backend_factory(
+            ny_propagate::margin_row::FdBackendKind::Cuda,
+            move || {
+                Some(std::sync::Arc::clone(&device)
+                    as std::sync::Arc<dyn ny_core::search::SearchBackend>)
+            },
+        );
+    }
+
+    // #wave-beta-bab (ENGINE_PROGRAM M6): register the UNTRUSTED wave search of
+    // `margin_row.tree_mode` (default `legacy`, which never consults it). The
+    // closure runs at most once, on the first ARMED wave tree; the lane
+    // certifies every close with its own evaluator whichever backend searched,
+    // and runs its legacy tree when the backend refuses.
+    ny_propagate::margin_row::set_wave_search_backend_factory(|| {
+        Some(std::sync::Arc::new(ny_bbe::CpuF32Backend::new())
+            as std::sync::Arc<dyn ny_core::search::SearchBackend>)
+    });
+    // #wave-beta-bab (M6), DEVICE side: `margin_row.tree_mode: wave_cuda` asks
+    // this factory first — the SAME device backend as the level search above.
+    // Like it, it honours NY_NO_CUDA but not the cuBLAS admission (the wave
+    // kernels need only libcuda); the first wave upload opens the device if
+    // nothing has and loads and self-tests the wave kernels. Unregistered (or
+    // refused), `wave_cuda` runs the CPU search registered above, and only then
+    // the legacy tree.
+    #[cfg(feature = "cuda")]
+    if let Some(device) = device_search {
+        ny_propagate::margin_row::set_wave_cuda_search_backend_factory(move || {
+            Some(std::sync::Arc::clone(&device)
+                as std::sync::Arc<dyn ny_core::search::SearchBackend>)
+        });
+    }
+
+    // #m8-input-split-batch (ENGINE_PROGRAM M8a): register the UNTRUSTED
+    // forward-linear wave search of `bab.branching.input_split.lowdim_batch_engine`
+    // (default `legacy`, which never consults it). The closure runs at most
+    // once, on the first ARMED lowdim lane run; the lane re-bounds every claim
+    // with its own f64 forms and runs its legacy bounder when the backend
+    // refuses.
+    ny_propagate::lowdim::set_forward_linear_search_backend_factory(|| {
+        Some(std::sync::Arc::new(ny_bbe::CpuF32Backend::new())
+            as std::sync::Arc<dyn ny_core::search::SearchBackend>)
+    });
+
     match cuda_startup_action {
         CudaStartupAction::RegisterFactories => {}
         CudaStartupAction::Disabled { requested: true } => warn!(
@@ -957,8 +1064,7 @@ fn run() -> Result<()> {
                 Err(error) => {
                     tracing::warn!(
                         %error,
-                        "FL-value wgpu f32 engine unavailable; forward-linear \
-                         value GEMMs keep the tiled CPU tiers (#fl-value-gpu-tier)"
+                        "wgpu unavailable for forward-linear value GEMMs; using the CPU"
                     );
                     None
                 }
@@ -967,6 +1073,18 @@ fn run() -> Result<()> {
     }
 
     match command {
+        #[cfg(feature = "mip")]
+        Commands::InternalHeadPhaseAyAdvice => {
+            unreachable!("head-phase helper must return before normal startup")
+        }
+        #[cfg(feature = "mip")]
+        Commands::InternalHeadFunctionalAyAdvice => {
+            unreachable!("head-functional helper must return before normal startup")
+        }
+        #[cfg(feature = "mip")]
+        Commands::InternalHeadPhaseCoverAyAdvice => {
+            unreachable!("head-phase-cover helper must return before normal startup")
+        }
         Commands::Verify(args) => {
             let json_output = args.json;
             let handle_result = |result: Result<()>| -> Result<()> {
@@ -1186,6 +1304,21 @@ fn run() -> Result<()> {
             handle_result(verify_result)?;
         }
 
+        Commands::HeadVerify {
+            request,
+            replay,
+            evidence,
+            timeout,
+            max_head_mb,
+        } => {
+            commands::head_verify::run(
+                &request,
+                replay.as_deref(),
+                evidence.as_deref(),
+                timeout,
+                max_head_mb,
+            )?;
+        }
         Commands::Inspect {
             model,
             native,
@@ -1622,7 +1755,9 @@ fn run() -> Result<()> {
                 no_la_warm_start,
                 complete_verifier,
                 mip_solver,
+                proof_profile,
                 competition_mode,
+                require_certificate,
                 no_certificate,
                 emit_certificate,
                 allow_unsound_gpu_crown,
@@ -1645,8 +1780,22 @@ fn run() -> Result<()> {
             } else {
                 None
             };
+            // #soundness-spine M2a: this entry point resolves to `proof`;
+            // `--proof-profile` (or the deprecated `--competition-mode`)
+            // overrides it. Frozen once, printed once.
+            let profile_override = proof_profile.or_else(|| {
+                competition_mode.then_some(ny_core::proof_profile::ProofProfile::Competition)
+            });
+            let profile = ny_core::proof_profile::freeze(
+                ny_core::proof_profile::ResolvedProofProfile::resolve(
+                    ny_core::proof_profile::EntryPoint::Interactive,
+                    profile_override,
+                ),
+            );
+            let _ = ny_core::proof_profile::announce(profile);
             let proof_opts = commands::beta_crown::ProofOpts {
-                competition_mode,
+                profile,
+                require_certificate,
                 emit_certificate: emit_certificate_override,
                 certificate_path: emit_certificate,
                 allow_unsound_gpu_crown,
@@ -1750,7 +1899,25 @@ fn run() -> Result<()> {
                 results_file,
                 timeout_secs,
                 configs_dir,
+                proof_profile,
+                phase_cost,
             } => {
+                // #phase-cost: the cost census's detail level for this process
+                // (default coarse). Observability only — no verdict path reads it.
+                ny_core::phase_cost::set_level(
+                    phase_cost.unwrap_or(ny_core::phase_cost::DEFAULT_LEVEL),
+                );
+                // #soundness-spine M2a: the scored entry point resolves to
+                // `competition`; `--proof-profile` overrides it for banking and
+                // moat runs. Frozen here, before any lane can read the rates;
+                // printed and recorded inside the handler once the flight
+                // recorder is armed.
+                ny_core::proof_profile::freeze(
+                    ny_core::proof_profile::ResolvedProofProfile::resolve(
+                        ny_core::proof_profile::EntryPoint::VnncompV1,
+                        proof_profile,
+                    ),
+                );
                 // The handler keeps its own protocol-version check; the clap
                 // subcommand name IS the version string, so pass it verbatim.
                 commands::vnncomp::handle_vnncomp_command(
@@ -1786,15 +1953,69 @@ fn run() -> Result<()> {
                 budget_secs,
                 configs_dir,
                 json,
+                router,
+                router_target_host,
+                replay,
             } => {
-                commands::vnncomp_plan::handle_vnncomp_plan_command(
-                    &category,
-                    &onnx,
-                    &vnnlib,
-                    budget_secs,
-                    configs_dir,
-                    json,
-                )?;
+                if let Some(flight_json) = replay {
+                    // #router-r1: `--replay` re-runs the router's pure plan and
+                    // checkpoints on a flight record; no instance is resolved.
+                    commands::vnncomp_plan::handle_router_replay(&flight_json)?;
+                } else {
+                    let (Some(category), Some(onnx), Some(vnnlib), Some(budget_secs)) =
+                        (category, onnx, vnnlib, budget_secs)
+                    else {
+                        anyhow::bail!(
+                            "ny vnncomp plan needs CATEGORY ONNX VNNLIB BUDGET (or --replay FLIGHT_JSON)"
+                        );
+                    };
+                    commands::vnncomp_plan::handle_vnncomp_plan_command(
+                        &category,
+                        &onnx,
+                        &vnnlib,
+                        budget_secs,
+                        configs_dir,
+                        json,
+                        router,
+                        router_target_host.as_deref(),
+                    )?;
+                }
+            }
+            subcommands::VnncompAction::Census {
+                manifest,
+                out,
+                envelope,
+                router_target_host,
+                row_deadline_secs,
+                work_dir,
+            } => {
+                // #admission-census: CR-RS's admission per routable capability
+                // over a corpus, as if each were sealed. No verification runs.
+                let target_host = router_target_host
+                    .as_deref()
+                    .map(|token| {
+                        ny_core::router::facts::HostClass::from_token(token).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "--router-target-host must be one of gb10, g5, m5, other; got {token:?}"
+                            )
+                        })
+                    })
+                    .transpose()?;
+                let work_dir = work_dir.unwrap_or_else(|| {
+                    let mut name = out.clone().into_os_string();
+                    name.push(".work");
+                    std::path::PathBuf::from(name)
+                });
+                let options = router::census::CensusOptions {
+                    manifest,
+                    envelope: router::census::parse_envelope(&envelope)?,
+                    target_host,
+                    row_deadline: std::time::Duration::from_secs(row_deadline_secs.max(1)),
+                    work_dir,
+                    out,
+                };
+                let summary = router::census::handle_census_command(&options)?;
+                println!("{}", router::census::done_line(&summary, &options.out));
             }
         },
         Commands::VnncompResearch { action } => {
@@ -1813,6 +2034,15 @@ fn run() -> Result<()> {
         }
         Commands::Tutorial { topic } => {
             commands::tutorial::run(topic.as_ref())?;
+        }
+        Commands::ProofCheck(args) => {
+            // ENGINE_PROGRAM §1.7 B2.1: the report's verdict code IS the exit
+            // code (0 verified; 10/20/21/30/31/40 otherwise). An unreadable
+            // input propagates to the top-level operational code 4.
+            let code = commands::proof_check::handle_proof_check(&args)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
         Commands::Claims(args) => {
             // The running process already knows its own compiled stamp, so

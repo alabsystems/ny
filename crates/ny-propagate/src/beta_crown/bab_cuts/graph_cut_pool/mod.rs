@@ -449,10 +449,10 @@ impl GraphCutPool {
 
     fn score_cut(&self, cut: &GraphCuttingPlane, current_iter: usize) -> f32 {
         let weights = &self.cut_score_weights;
-        // NaN-safe: propagate NaN instead of silently clamping to 0.0 (#2643)
+        // NaN-safe: propagate NaN instead of silently clamping to 0.0
         let lambda_cap = nan_propagating_max(weights.lambda_cap, 0.0);
         let contrib_cap = nan_propagating_max(weights.contrib_cap, 0.0);
-        // NaN guard: clamp() propagates NaN; treat NaN lambda as 0.0 (#2598)
+        // NaN guard: clamp() propagates NaN; treat NaN lambda as 0.0
         let lambda = if cut.lambda.is_finite() {
             cut.lambda.clamp(0.0, lambda_cap)
         } else {

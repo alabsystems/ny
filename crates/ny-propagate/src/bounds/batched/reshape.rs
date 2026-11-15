@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Shape transforms for batched linear bounds (flatten, tile, dimension queries).
-//!
-//! Extracted from `mod.rs` as part of #4212.
 
 use super::BatchedLinearBounds;
 #[cfg(test)]
@@ -152,8 +150,8 @@ impl BatchedLinearBounds {
     /// each batch position. This enables composition with batched downstream
     /// bounds that carry `[batch, heads, ...]` dimensions.
     ///
-    /// Superseded in production by `BilinearRelaxation` (#286 Approach A), which
-    /// composes per-batch coefficients directly without tiling. Retained for tests.
+    /// Superseded in production by `BilinearRelaxation`, which composes per-batch
+    /// coefficients directly without tiling. Retained for tests.
     ///
     /// # Errors
     /// Returns an error if the source bounds are not 2D or if the batch product

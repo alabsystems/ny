@@ -222,9 +222,17 @@ fn mulbinary_only_graph_enters_the_alpha_optimizer() {
 }
 
 /// Same claim for the shape that motivated it.
-#[ntest::timeout(60000)]
+///
+/// Holds the shared env lock: alpha-CROWN admits through
+/// `cpu_crown_dense_budget_bytes`, which reads `NY_DENSE_BUDGET_MB`, and a
+/// sibling's temporary `0` reached this test once under `--test-threads=4`
+/// (`CpuMemoryExceeded { required_bytes: 240, budget_bytes: 0, .. }`,
+/// 2026-10-04; it passes alone 3/3 on the branch and on main). The wall is
+/// 300 s because a guarded reader also waits behind queued writers.
+#[ntest::timeout(300000)]
 #[test]
 fn mulbinary_swiglu_graph_enters_the_alpha_optimizer() {
+    let _env = crate::tests::lock_env_shared();
     let (graph, input) = swiglu_fixture();
     assert_eq!(
         route_of(&graph, &input, &config(20)),

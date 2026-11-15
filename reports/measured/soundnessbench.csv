@@ -48,4 +48,3 @@ soundnessbench,onnx/model.onnx,vnnlib/model_46.vnnlib,prepared,sat,59.47,l1audit
 soundnessbench,onnx/model.onnx,vnnlib/model_47.vnnlib,prepared,sat,15.38,l1audit-20260804-d1282d23
 soundnessbench,onnx/model.onnx,vnnlib/model_48.vnnlib,prepared,sat,21.17,l1audit-20260804-d1282d23
 soundnessbench,onnx/model.onnx,vnnlib/model_49.vnnlib,prepared,sat,37.95,l1audit-20260804-d1282d23
-soundnessbench,onnx/test_nano.onnx,vnnlib/test_nano.vnnlib,0,unsat,0

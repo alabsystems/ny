@@ -964,7 +964,7 @@ mod tests {
         assert_eq!(operands.abs, vec![4.0, 5.0, 3.0, 4.0]);
         assert_eq!(operands.box_lower, vec![-1.0, -2.0]);
         assert_eq!(operands.box_upper, vec![1.0, 2.0]);
-        assert!(operands.cached_la.is_empty());
+        assert_eq!((operands.cached_la).len(), 0);
         assert_eq!(operands.history_words.len(), 4);
         assert!(operands.adapter_host_peak_bytes > 64);
         assert!(operands.adapter_host_retained_bytes_after > 64);

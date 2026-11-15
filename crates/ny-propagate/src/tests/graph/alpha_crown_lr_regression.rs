@@ -7,7 +7,7 @@ use crate::layers::{Layer, LinearLayer, ReLULayer};
 use crate::{BoundedTensor, GraphNetwork, GraphNode};
 use ndarray::{arr1, arr2};
 
-/// Helper: build the 2-layer ReLU network used by the #3436 regression tests.
+/// Helper: build the 2-layer ReLU network used by the learning-rate regression tests.
 fn build_3436_graph() -> GraphNetwork {
     let mut graph = GraphNetwork::new();
 
@@ -38,7 +38,7 @@ fn build_3436_graph() -> GraphNetwork {
     graph
 }
 
-/// Helper: build the input bounds for #3436 tests.
+/// Helper: build the input bounds for these tests.
 fn build_3436_input() -> BoundedTensor {
     BoundedTensor::new(
         arr1(&[-0.5_f32, -0.5]).into_dyn(),
@@ -47,7 +47,7 @@ fn build_3436_input() -> BoundedTensor {
     .unwrap()
 }
 
-/// Regression for #3436: the new defaults (100 iterations, lr=0.1) produce
+/// Regression: the new defaults (100 iterations, lr=0.1) produce
 /// sound bounds on a shallow 2-layer ReLU network. The reference α,β-CROWN
 /// chose lr=0.1 for stability across deep networks (arguments.py:351); on
 /// shallow networks lr=0.5 converges faster per-iteration, so the new defaults
@@ -67,13 +67,13 @@ fn test_graph_network_alpha_crown_lr_01_not_looser_than_05_3436() {
     let graph = build_3436_graph();
     let input = build_3436_input();
 
-    // Old defaults before #3436: 20 iterations, lr=0.5
+    // Old defaults: 20 iterations, lr=0.5
     let old_default_config = AlphaCrownConfig {
         learning_rate: 0.5,
         iterations: 20,
         ..AlphaCrownConfig::default()
     };
-    // New defaults after #3436: 100 iterations, lr=0.1
+    // New defaults: 100 iterations, lr=0.1
     let new_default_config = AlphaCrownConfig::default();
 
     let old_bounds = graph

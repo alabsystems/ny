@@ -67,7 +67,7 @@ mod tests;
 /// The four exhaustive matches in [`classify`] are the primary gate; this
 /// constant is the second line of defence, catching a variant that was
 /// classified but never given a sample to probe with.
-pub const LAYER_VARIANT_COUNT: usize = 101;
+pub const LAYER_VARIANT_COUNT: usize = 102;
 
 /// What a dispatcher does with a given [`Layer`] variant.
 ///

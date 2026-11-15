@@ -2,9 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Packet C regression tests for property-guided centroid-monotonicity (#3520).
-//!
-//! Part of #4089 property lane decomposition.
+//! Packet C regression tests for property-guided centroid-monotonicity.
 
 use super::fixture::{
     build_talker_property_sweep_fixture, build_talker_property_sweep_fixture_with_deadline,
@@ -19,8 +17,6 @@ use super::*;
 ///
 /// Builds a centroid-monotonicity spec matrix and runs `mine_weak_regions_graph`
 /// with `SweepObjective::Linear` on the short-seq softmax subgraph.
-///
-/// Part of #3520 Packet C.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
 #[cfg(feature = "external-avoice")]

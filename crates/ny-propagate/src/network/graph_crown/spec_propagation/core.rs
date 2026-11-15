@@ -8,7 +8,7 @@
 //! `Layer::{Div, Linear, MulBinary, ReLU}` checks for dispatch-coverage
 //! tooling visibility. IBP fallback/finalization lives in [`super::fallback`],
 //! patches flow control in [`super::patches`]. Split from the original
-//! monolithic `spec_propagation.rs` as part of #3960.
+//! monolithic `spec_propagation.rs`.
 
 use crate::batched_domain::CachedLinearBounds;
 use crate::bounds::patches::{CrownBounds, PatchesMaterializationPurpose};
@@ -75,12 +75,23 @@ fn capture_node_linear_bounds(
     deadline: Option<Instant>,
 ) -> Result<()> {
     if deadline.is_none() {
-        let captured = match node_cb {
+        let mut captured = match node_cb {
             CrownBounds::Dense(bounds) => bounds.clone(),
             CrownBounds::Patches(bounds) => {
                 bounds.to_dense_for_purpose(PatchesMaterializationPurpose::Other)?
             }
         };
+        // #warm-cache-err: `CachedLinearBounds` keeps no coefficient error, so
+        // charge it over the node's certified output box exactly as the finite
+        // branch below does. An unfoldable block is left out of the cache
+        // (children seed at the output there) rather than published tight.
+        if !CachedLinearBounds::fold_capture_coeff_err(&mut captured, node_box, None)? {
+            debug!(
+                node = node_name,
+                "Spec-guided CROWN: refusing an unfoldable coefficient-error capture (#warm-cache-err)"
+            );
+            return Ok(());
+        }
         linear_bounds_map.insert(node_name.to_string(), captured);
         return Ok(());
     }
@@ -369,11 +380,16 @@ pub(crate) fn propagate_crown_with_specs_and_engine_with_linear_and_reference_bo
     crown_backward_layers: Option<usize>,
     wants_input_linear: bool,
     mn_pool: Option<&crate::multineuron::MultiNeuronPool>,
+    warm_frontier: Option<
+        &crate::beta_crown::engine::graph::propagation::warm_frontier::WarmFrontierCounters,
+    >,
 ) -> Result<(
     CrownBackwardResult,
     Option<LinearBounds>,
     Option<CachedLinearBounds>,
 )> {
+    graph.ensure_proof_eligible()?;
+    let mut attention_regions = super::super::attention_region::AttentionRegionQuery::new(deadline);
     if precomputed_node_bounds.is_some() && reference_node_bounds.is_some() {
         return Err(NyError::UnsupportedConfiguration(
             "spec-guided CROWN cannot combine fixed precomputed_node_bounds with reference_node_bounds"
@@ -464,7 +480,7 @@ pub(crate) fn propagate_crown_with_specs_and_engine_with_linear_and_reference_bo
     // ALSO skipped when the caller asked for the input `LinearBounds`
     // (`run_with_linear`, #w5-bab-throughput): the root-candidate early return
     // carries `None` linear, which silently defeats every linear-extraction
-    // caller — measured on cifar100: the PGD exact-gradient path (#4274) ran a
+    // caller — measured on cifar100: the PGD exact-gradient path ran a
     // full ~13-25s certified forward-linear walk at a CONCRETE point (single-use
     // cache key, polluting the root-box cache) only to receive `None` and fall
     // back to SPSA. Those callers need the CPU backward loop below, which is the
@@ -477,6 +493,27 @@ pub(crate) fn propagate_crown_with_specs_and_engine_with_linear_and_reference_bo
     // enclosure of the SAME margin; forcing the CPU loop only forgoes their speed
     // to gain the coupling-facet tightening.
     let has_mn_pool = mn_pool.is_some_and(|p| !p.is_empty());
+    // #deadline-expiry N1: these three root candidates are admitted only when there
+    // is no clock at all. Every scored run carries a deadline and no test sets one,
+    // so they run in testing and NEVER in competition — the deadline-PRESENCE
+    // degradation class catalogued in `docs/DEADLINE_PRESENCE_AUDIT_2026-08-24.md`,
+    // where this is site N1, classed "(c) both slower and less precise".
+    //
+    // An expiry gate (the pattern used for eight fixed sites in that audit,
+    // `deadline.is_some_and(|limit| Instant::now() >= limit)`) would be sound: all
+    // three candidates TAKE `deadline`, poll it, and surface
+    // `NyError::DeadlineExceeded`, which their call sites fail closed onto the CPU
+    // backward loop, and every candidate is an `intersect_sound` enclosure of the
+    // SAME spec values, so admitting more of them can only tighten. The trade is
+    // time, which is a MEASUREMENT question.
+    // Tried and REVERTED 2026-09-02, MEASURED: the expiry form cost 2 banked rows
+    // and converted 0. cifar100 moat with it live: rows=80 holds=78
+    // contradictions=0 flips=0 DROPS=2 (resnet_medium idx_5127 unsat->timeout,
+    // resnet_large idx_9883 unsat->unknown), against 0 conversions on the 5
+    // resnet_large rows it was built for. Net -20 points, so presence is the
+    // SHIPPED behaviour. The real blocker is one level below this gate: the cold
+    // forward-linear build cannot fit a 100 s window
+    // (`docs/SESSION_HANDOFF_2026-09-02.md` §6).
     if deadline.is_none() && crown_backward_layers.is_none() && !wants_input_linear && !has_mn_pool
     {
         let mut root_candidate: Option<BoundedTensor> = None;
@@ -747,8 +784,12 @@ pub(crate) fn propagate_crown_with_specs_and_engine_with_linear_and_reference_bo
     let cache_capture_allowed = capture_linear_cache && !has_mn_pool;
     let mut captured_linear_bounds = cache_capture_allowed.then(std::collections::HashMap::new);
     let mut cache_capture_valid = cache_capture_allowed;
+    // #la-warm-frontier: frontiers ride on the cache, so only when capturing.
+    let mut captured_frontiers: Option<
+        std::collections::HashMap<String, crate::batched_domain::WarmFrontier>,
+    > = (cache_capture_allowed && warm_frontier.is_some()).then(std::collections::HashMap::new);
 
-    // Per-node deadline budgeting (#3795): same policy as propagation.rs.
+    // Per-node deadline budgeting: same policy as propagation.rs.
     const SPEC_CROWN_MAX_BUDGET_FRACTION: f64 = 0.25;
     const SPEC_CROWN_MIN_NODE_BUDGET_SECS: f64 = 2.0;
     let total_backward_nodes = plan.node_count();
@@ -764,7 +805,7 @@ pub(crate) fn propagate_crown_with_specs_and_engine_with_linear_and_reference_bo
         // Deadline enforcement: check before each node's backward pass.
         // For deep models (e.g., malbeware 16-25: 16 layers x 24 specs),
         // the full backward pass can take 100-200s. Falling back to IBP
-        // when the deadline is exceeded ensures timeout compliance. #3218/#3328
+        // when the deadline is exceeded ensures timeout compliance.
         if deadline.is_some_and(|d| Instant::now() >= d) {
             info!(
                 "Spec-guided CROWN: deadline exceeded at node '{}', falling back to IBP",
@@ -784,7 +825,7 @@ pub(crate) fn propagate_crown_with_specs_and_engine_with_linear_and_reference_bo
 
         // If the overall deadline expires during budget calculation, bail to IBP for
         // the remaining backward pass. Sub-floor node shares keep the global deadline
-        // so CROWN LinearBounds are preserved on short-budget tiny graphs (#3881).
+        // so CROWN LinearBounds are preserved on short-budget tiny graphs.
         if deadline.is_some() && node_deadline.is_none() {
             info!(
                 "Spec-guided CROWN: deadline expired while budgeting '{}' ({}/{} nodes), falling back to IBP",
@@ -856,6 +897,40 @@ pub(crate) fn propagate_crown_with_specs_and_engine_with_linear_and_reference_bo
                 Err(error) => return Err(error),
             }
         }
+        // #la-warm-frontier: the rest of this pass's state at the pop, next to
+        // a captured block of a node a split can name (armed only).
+        if let (Some(counters), Some(frontiers)) = (warm_frontier, captured_frontiers.as_mut()) {
+            use crate::beta_crown::engine::graph::propagation::warm_frontier as wf;
+            let branch_block = captured_linear_bounds
+                .as_ref()
+                .and_then(|captured| captured.get(node_name));
+            if let (true, Some(branch_block)) =
+                (wf::is_frontier_capture_site(&node.layer), branch_block)
+            {
+                match wf::capture_accumulator_frontier(
+                    &node_crown_bounds,
+                    branch_block,
+                    |key| {
+                        if key == crate::NETWORK_INPUT {
+                            Some(input)
+                        } else {
+                            node_bounds.get(key)
+                        }
+                    },
+                    node_deadline,
+                ) {
+                    Ok(capture) => {
+                        if let Some(frontier) = counters.record_capture(capture) {
+                            frontiers.insert(node_name.to_string(), frontier);
+                        }
+                    }
+                    Err(NyError::DeadlineExceeded(_)) => {
+                        return ibp_fallback(CrownIbpFallbackReason::PerNodeDeadlineExceeded);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
 
         let first_input_idx = plan.first_input_idx(idx);
         let first_input = plan.name_of(first_input_idx);
@@ -867,7 +942,7 @@ pub(crate) fn propagate_crown_with_specs_and_engine_with_linear_and_reference_bo
             })?
         };
 
-        // #3813: Dense→Patches re-entry at unary Conv2d boundaries. A live
+        // Dense→Patches re-entry at unary Conv2d boundaries. A live
         // multi-neuron group anchored at a ReLU requires the dense pre/post
         // handshake below; the Patches ReLU fast path has no representation for
         // those extra terms. Preserve an incoming Patches relation through the
@@ -911,8 +986,8 @@ pub(crate) fn propagate_crown_with_specs_and_engine_with_linear_and_reference_bo
         }
 
         // Patches fast-path: dispatch in patches mode if applicable, with
-        // ensure_dense() downgrade on failure. Flow control extracted to
-        // patches.rs as part of #3960.
+        // ensure_dense() downgrade on failure. Flow control lives in
+        // patches.rs.
         if matches!(&node_cb, CrownBounds::Patches(_)) && node.inputs.len() == 1 {
             match super::patches::dispatch_patches_or_fallback(
                 &mut node_cb,
@@ -977,7 +1052,7 @@ pub(crate) fn propagate_crown_with_specs_and_engine_with_linear_and_reference_bo
             return ibp_fallback(CrownIbpFallbackReason::CrownPropagationError);
         }
 
-        // === Linear: pre-dispatch dimension check with IBP fallback (#2817, #3935) ===
+        // === Linear: pre-dispatch dimension check with IBP fallback ===
         // Explicit Layer::Linear guard kept for dispatch-coverage tooling visibility.
         if matches!(&node.layer, Layer::Linear(_))
             && super::super::backward_node_dispatch::linear_dimension_mismatch(node, &node_lb)
@@ -985,7 +1060,7 @@ pub(crate) fn propagate_crown_with_specs_and_engine_with_linear_and_reference_bo
             return ibp_fallback(CrownIbpFallbackReason::ShapeMismatch);
         }
 
-        // === ReLU: heuristic relaxation via shared dispatch (#3935) ===
+        // === ReLU: heuristic relaxation via shared dispatch ===
         if matches!(&node.layer, Layer::ReLU(_)) {
             use super::super::backward_node_dispatch::{
                 dispatch_relu_backward, NodeDispatchResult,
@@ -1069,7 +1144,7 @@ pub(crate) fn propagate_crown_with_specs_and_engine_with_linear_and_reference_bo
         // === MulBinary: site-specific (relaxation mode, IBP fallback) ===
         // Shared dispatch returns Unsupported for MulBinary because it requires
         // a relaxation mode parameter. Handle here to use the caller-provided
-        // mode instead of falling back to IBP. (#3389)
+        // mode instead of falling back to IBP.
         if matches!(&node.layer, Layer::MulBinary(_)) {
             use super::super::backward_node_dispatch::{
                 concretized_node_bias_with_deadline, dispatch_mul_binary_backward,
@@ -1141,7 +1216,7 @@ pub(crate) fn propagate_crown_with_specs_and_engine_with_linear_and_reference_bo
                 MulBinaryDispatchResult::SoftmaxNonFinite => {
                     return ibp_fallback(CrownIbpFallbackReason::CrownPropagationError);
                 }
-                // #3602/#3596: Per-node IBP concretization for unsupported/error cases.
+                // Per-node IBP concretization for unsupported/error cases.
                 // Concretize this MulBinary node's contribution using its IBP bounds
                 // instead of falling back the entire spec CROWN to pure IBP.
                 MulBinaryDispatchResult::RecoverableError(err) => {
@@ -1188,7 +1263,7 @@ pub(crate) fn propagate_crown_with_specs_and_engine_with_linear_and_reference_bo
             continue;
         }
 
-        // === Binary Div: numerator-only backward with reciprocal scaling (#3626, #3499) ===
+        // === Binary Div: numerator-only backward with reciprocal scaling ===
         // Math documented in backward_node_dispatch::backward_div_to_numerator.
         if matches!(&node.layer, Layer::Div(_)) {
             use super::super::backward_node_dispatch::{
@@ -1253,6 +1328,29 @@ pub(crate) fn propagate_crown_with_specs_and_engine_with_linear_and_reference_bo
         }
 
         // === All other layers: shared dispatch core (#1949 Step B, #3935) ===
+        match attention_regions.try_scalar(
+            graph,
+            node,
+            &node_lb,
+            input,
+            node_bounds,
+            &mut node_crown_bounds,
+            num_specs,
+            input_dim,
+            &mut input_accumulated,
+            node_deadline,
+        ) {
+            Ok(true) => {
+                cache_capture_valid = false;
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                if let Some(reason) = resource_ibp_fallback_reason(Err(error))? {
+                    return ibp_fallback(reason);
+                }
+            }
+        }
         use super::super::backward_node_dispatch::{
             concretized_node_bias_with_deadline, dispatch_shared_core, SharedDispatchCtx,
             SharedDispatchResult,
@@ -1295,7 +1393,7 @@ pub(crate) fn propagate_crown_with_specs_and_engine_with_linear_and_reference_bo
                 if reason == CrownIbpFallbackReason::PerNodeDeadlineExceeded {
                     return ibp_fallback(reason);
                 }
-                // Per-node IBP concretization for unsupported/error cases (#3596).
+                // Per-node IBP concretization for unsupported/error cases.
                 // Concretize this node's contribution using pre-computed IBP bounds
                 // instead of falling back the entire spec CROWN to pure IBP.
                 // Sound: concretize_sound computes min/max(A * x + b) for x ∈ [l, u].
@@ -1348,6 +1446,7 @@ pub(crate) fn propagate_crown_with_specs_and_engine_with_linear_and_reference_bo
         node_crown_bounds,
         captured_linear_bounds,
         cache_capture_valid,
+        captured_frontiers,
         num_specs,
         deadline,
     )

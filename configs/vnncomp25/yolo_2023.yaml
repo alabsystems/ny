@@ -23,13 +23,15 @@ attack:
 
 bab:
   batch_size: 128
-  # Pinned 2026 prop_000001 CPU measurement: the useful Conv_1, Conv_5, and
-  # Add_8 targets completed in 3.466s, 8.715s, and 6.448s, while the 10,816-
-  # and 5,408-row Conv_12/Conv_20 targets consumed 51.772s and 31.142s before
-  # reverting to their sound IBP bounds. Pin the base cap at 12s to stop those
-  # doomed targets from consuming the warmup slice. Wider targets retain the
-  # collector's dimension scaling; exceeding the effective cap selects IBP.
-  crown_ibp_per_node_cap_secs: 12
+  # NO per-node CROWN-IBP cap (2026-09-23). The 12 s cap that used to sit here was
+  # set when Conv_12/Conv_20 were "doomed" — but they were doomed by a deadline-
+  # PRESENCE regression (7b0140d09: the residual patches merge refused whenever a
+  # deadline merely existed, promoting to a 22-120 GB dense merge that the budget
+  # refused). With that fixed (#patches-merge-finite-expiry, audit N6) every root
+  # target keeps CROWN, and the cap was the only thing starving Conv_20/Conv_25.
+  # MEASURED on the GB10, prop_000001 at the official 300 s: with the cap, 5/7
+  # CROWN and a watchdog SIGKILL at 308 s; without it, all 7 targets CROWN and
+  # UNSAT at 76.3 s (verified at the root, explored=1).
   # Phase budget overrides (#4207).
   # Evidence: alpha-CROWN warmup (50 SPSA iterations on 31-node DAG)
   # consumed the entire timeout with 0 domains explored.
@@ -50,7 +52,6 @@ bab:
     # high-dim conv DAG — input-splitting an 8112-elem box is hopeless (0 domains),
     # ReLU-split explores ~191 domains. candidates/reduceop still tune kfsb.
     candidates: 10
-    reduceop: max
     # Exact wave-selector mirrors for governed search; runtime is unchanged.
     kfsb_multi_candidates: 10
     kfsb_multi_reduceop: max

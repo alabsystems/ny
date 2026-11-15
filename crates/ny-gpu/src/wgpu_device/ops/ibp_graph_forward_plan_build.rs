@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Plan construction for graph-DAG GPU-resident IBP (#4319).
+//! Plan construction for graph-DAG GPU-resident IBP.
 //!
 //! Builds execution steps and GPU buffers from a `GpuDagIbpPlanDesc`.
 

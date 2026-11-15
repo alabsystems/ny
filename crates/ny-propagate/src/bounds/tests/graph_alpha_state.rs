@@ -208,7 +208,7 @@ fn test_graph_alpha_state_relu_nodes_iterator() {
     assert_eq!(nodes, vec!["a_relu", "b_relu"]);
 }
 
-/// #4404: channel_only_alpha=true reduces [C,H,W] alpha to [C] by worst-case per channel.
+/// channel_only_alpha=true reduces [C,H,W] alpha to [C] by worst-case per channel.
 #[ntest::timeout(10000)]
 #[test]
 fn test_graph_alpha_state_channel_only_alpha_reduces_to_channels_4404() {
@@ -248,7 +248,7 @@ fn test_graph_alpha_state_channel_only_alpha_reduces_to_channels_4404() {
     );
 }
 
-/// #4404: channel_only_alpha=false (full_conv_alpha=true default) keeps per-neuron alpha.
+/// channel_only_alpha=false (full_conv_alpha=true default) keeps per-neuron alpha.
 #[ntest::timeout(10000)]
 #[test]
 fn test_graph_alpha_state_full_conv_alpha_identity_4404() {
@@ -279,7 +279,7 @@ fn test_graph_alpha_state_full_conv_alpha_identity_4404() {
     assert!(state_channel.spatial_shape("relu").is_some());
 }
 
-/// #4404: expand_alpha broadcasts [C] to [C*H*W] correctly.
+/// expand_alpha broadcasts [C] to [C*H*W] correctly.
 #[ntest::timeout(10000)]
 #[test]
 fn test_graph_alpha_state_expand_alpha_broadcast_4404() {
@@ -305,7 +305,7 @@ fn test_graph_alpha_state_expand_alpha_broadcast_4404() {
     assert_eq!(expanded[5], alpha[2]); // ch2, pos1
 }
 
-/// #4404: reduce_gradient sums spatial dims per channel.
+/// reduce_gradient sums spatial dims per channel.
 #[ntest::timeout(10000)]
 #[test]
 fn test_graph_alpha_state_reduce_gradient_sums_spatial_4404() {
@@ -326,7 +326,7 @@ fn test_graph_alpha_state_reduce_gradient_sums_spatial_4404() {
     assert!((reduced[1] - 15.0).abs() < 1e-6, "ch1: 4+5+6=15");
 }
 
-/// #4404: reduce_gradient is a no-op for already channel-sized gradients.
+/// reduce_gradient is a no-op for already channel-sized gradients.
 #[ntest::timeout(10000)]
 #[test]
 fn test_graph_alpha_state_reduce_gradient_channel_sized_noop_4404() {
@@ -343,7 +343,7 @@ fn test_graph_alpha_state_reduce_gradient_channel_sized_noop_4404() {
     assert_eq!(reduced, channel_grad);
 }
 
-/// #4404: reduce_gradient returns zeros when gradient length mismatches C*H*W.
+/// reduce_gradient returns zeros when gradient length mismatches C*H*W.
 /// This happens when AnalyticChain fails and returns a 0-length or wrong-length gradient.
 #[ntest::timeout(10000)]
 #[test]
@@ -375,7 +375,7 @@ fn test_graph_alpha_state_reduce_gradient_length_mismatch_returns_zeros_4404() {
     assert!((reduced[0]).abs() < 1e-10);
 }
 
-/// #4404: expand/reduce round-trip preserves gradient signal.
+/// Expand/reduce round-trip preserves gradient signal.
 #[ntest::timeout(10000)]
 #[test]
 fn test_graph_alpha_state_expand_reduce_roundtrip_4404() {
@@ -397,7 +397,7 @@ fn test_graph_alpha_state_expand_reduce_roundtrip_4404() {
     assert!((reduced[1] - alpha[1] * 4.0).abs() < 1e-6);
 }
 
-/// #4404: no-op expand/reduce for non-channel-only nodes.
+/// No-op expand/reduce for non-channel-only nodes.
 #[ntest::timeout(10000)]
 #[test]
 fn test_graph_alpha_state_expand_noop_for_full_alpha_4404() {
@@ -421,7 +421,7 @@ fn test_graph_alpha_state_expand_noop_for_full_alpha_4404() {
     assert_eq!(reduced, grad);
 }
 
-/// #4404: channel_only_alpha with ndim < 3 falls back to full alpha.
+/// channel_only_alpha with ndim < 3 falls back to full alpha.
 #[ntest::timeout(10000)]
 #[test]
 fn test_graph_alpha_state_channel_only_skipped_for_1d_4404() {
@@ -440,7 +440,7 @@ fn test_graph_alpha_state_channel_only_skipped_for_1d_4404() {
     assert!(state.spatial_shape("relu").is_none());
 }
 
-/// #4404: channel-only alpha + reduce_gradient + update_adam pipeline test.
+/// Channel-only alpha + reduce_gradient + update_adam pipeline test.
 /// Verifies that the optimizer actually updates channel-only alpha when gradients
 /// are per-neuron (the exact bug fixed in W3 iter 121 — previously update_adam
 /// silently skipped all conv alpha updates due to length mismatch).
@@ -477,7 +477,7 @@ fn test_graph_alpha_state_channel_only_optimizer_pipeline_4404() {
     );
 }
 
-/// Regression test for #1937: GraphAlphaState gradient-length mismatch must not panic.
+/// Regression test: GraphAlphaState gradient-length mismatch must not panic.
 #[ntest::timeout(10000)]
 #[test]
 fn test_graph_alpha_state_update_gradient_length_mismatch_no_panic_1937() {
@@ -497,7 +497,7 @@ fn test_graph_alpha_state_update_gradient_length_mismatch_no_panic_1937() {
     assert_eq!(state.alpha("relu1").unwrap().len(), 4);
     let alpha_before = state.alpha("relu1").unwrap().clone();
 
-    // Wrong length gradient (1 vs 4) — the #1937 bug scenario
+    // Wrong length gradient (1 vs 4) — the original bug scenario
     let wrong_gradient = array![0.5_f32];
     state.update("relu1", &wrong_gradient, 0.1, 0.0);
 

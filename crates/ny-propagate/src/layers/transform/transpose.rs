@@ -140,7 +140,11 @@ impl TransposeLayer {
     }
 
     /// Resolve the permutation given input dimensionality.
-    fn resolve_perm(&self, ndim: usize) -> Result<Vec<usize>> {
+    ///
+    /// `pub(crate)` so the independent f64 fence walk (`graph_ibp_f64_cell`) applies
+    /// EXACTLY the permutation the proof path applies, including a perm authored for
+    /// the batched rank arriving at an unbatched tensor.
+    pub(crate) fn resolve_perm(&self, ndim: usize) -> Result<Vec<usize>> {
         if self.axes.is_empty() {
             // Batched transpose: swap last two dimensions
             if ndim < 2 {
@@ -199,7 +203,7 @@ impl TransposeLayer {
 ///   entries removed, and the survivors are `d..perm.len()`). The rewrite drops
 ///   the entries labelled `< d` and subtracts `d` from the rest, yielding a
 ///   permutation of `0..rank`. This generalizes the established batch-strip
-///   convention (#3602, the `d == 1` case) to multiple dropped leading dims and
+///   convention (the `d == 1` case) to multiple dropped leading dims and
 ///   preserves the surviving axes' element ordering because the dropped leading
 ///   axes were pure passthroughs.
 /// - otherwise: `None`.
@@ -490,7 +494,7 @@ mod tests {
     #[test]
     fn test_batched_transpose_has_empty_axes() {
         let t = TransposeLayer::batched_transpose();
-        assert!(t.axes.is_empty());
+        assert_eq!((t.axes).len(), 0);
     }
 
     #[ntest::timeout(5000)]
@@ -775,7 +779,7 @@ mod tests {
         assert_eq!(normalize_transpose_perm_for_rank(&[0], 1), Some(vec![0]));
     }
 
-    /// Established batch-strip convention (#3602, one dropped leading dim).
+    /// Established batch-strip convention (one dropped leading dim).
     #[ntest::timeout(5000)]
     #[test]
     fn test_normalize_perm_drops_one_leading_dim() {
@@ -791,7 +795,7 @@ mod tests {
         );
     }
 
-    /// Multiple dropped leading dims (generalization beyond #3602).
+    /// Multiple dropped leading dims (generalization of the batch-strip convention).
     #[ntest::timeout(5000)]
     #[test]
     fn test_normalize_perm_drops_two_leading_dims() {

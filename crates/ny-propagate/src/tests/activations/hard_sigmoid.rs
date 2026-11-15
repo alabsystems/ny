@@ -260,7 +260,7 @@ fn test_hard_sigmoid_crown_soundness_non_crossing() {
 fn test_hard_sigmoid_crown_crossing_soundness() {
     // Previously UNSOUND: HardSigmoid CROWN used the same chord for both
     // upper and lower bounds when crossing region boundaries. Fixed by 6-case
-    // analytical relaxation. Reference: designs/2026-02-08-piecewise-crown-relaxation-fixes.md Part 2
+    // analytical relaxation.
     //
     // Interval [-4, 4] crosses all three regions of HardSigmoid (Case 4).
     let pre_lower = ArrayD::from_elem(IxDyn(&[1]), -4.0f32);
@@ -304,7 +304,7 @@ fn test_hard_sigmoid_crown_crossing_soundness() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_hard_sigmoid_crown_nan_inf_guard() {
-    // NaN/Inf pre-activation bounds are now rejected by domain_guard (#2836)
+    // NaN/Inf pre-activation bounds are now rejected by domain_guard
     // with NumericalInstability error, triggering CROWN→IBP fallback.
     let layer = HardSigmoidLayer::default();
     let linear_bounds = LinearBounds::identity(1);

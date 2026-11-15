@@ -15,7 +15,7 @@
 //!   model dilation natively, threaded through ny-build's
 //!   `convert/conv.rs`), and the 2-D case emits `output_padding`
 //!   (`ConvTranspose2dLayer` carries it as a field). The 1-D
-//!   `output_padding != 0` case keeps the NN #2558 decomposition
+//!   `output_padding != 0` case keeps NN's decomposition
 //!   (`ConvTranspose1d(output_padding=0)` + identity-matrix Linear
 //!   zero-pad, dilation-aware) because ny-build's 1-D converter refuses
 //!   the attribute. Fail-closed refusals that REMAIN: 2-D
@@ -376,7 +376,7 @@ fn translate_conv_transpose1d(
 
     // When output_padding != 0, decompose into ConvTranspose1d(output_padding=0)
     // followed by a right-side zero-pad via a Linear layer. NY's
-    // ConvTranspose1dLayer has no output_padding field (NN #2558).
+    // ConvTranspose1dLayer has no output_padding field.
     if output_padding != 0 {
         return translate_conv_transpose1d_with_output_padding(
             name,
@@ -417,7 +417,7 @@ fn translate_conv_transpose1d(
 /// 2. `Linear` zero-pad → `[B, C, T_out]` where `T_out = T_mid + output_padding`
 ///
 /// The Linear uses an identity matrix at rows `[0..T_mid]` and zero rows at
-/// `[T_mid..T_out]`, exactly mirroring NN's decomposition (NN #2558).
+/// `[T_mid..T_out]`, exactly mirroring NN's decomposition.
 #[allow(clippy::too_many_arguments)]
 fn translate_conv_transpose1d_with_output_padding(
     name: &str,
@@ -1265,7 +1265,7 @@ mod tests {
 
     /// ConvTranspose1d with output_padding decomposes into
     /// ConvTranspose1d(output_padding=0) + identity-matrix Linear zero-pad.
-    /// Mirrors NN #2558: input [1,1,4], k=3, stride=2 → T_mid=9, T_out=10.
+    /// Mirrors NN's decomposition: input [1,1,4], k=3, stride=2 → T_mid=9, T_out=10.
     #[test]
     fn conv_transpose1d_output_padding_decomposes() {
         let graph = ComputationGraph::from_nodes(vec![

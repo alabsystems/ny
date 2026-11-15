@@ -11,8 +11,8 @@ use ny_tensor::BoundedTensor;
 /// Assert two bound arrays match element-wise within an absolute tolerance.
 ///
 /// These regression tests compare two *mathematically equivalent* CROWN paths
-/// (graph dispatch vs. the direct decomposed helper for #3892; AdaIN decomposed
-/// path vs. its effective-InstanceNorm equivalent for #3912). The paths agree to
+/// (graph dispatch vs. the direct decomposed helper; AdaIN decomposed path vs.
+/// its effective-InstanceNorm equivalent). The paths agree to
 /// within f32 rounding but differ by a few ULP because they accumulate the same
 /// reductions in a different order, so bit-exact `assert_eq!` is too strict. A
 /// tight 1e-4 absolute tolerance still detects any genuine path divergence
@@ -42,7 +42,7 @@ use crate::layers::normalization::LayerNormCrownMode;
 use crate::layers::{AdaIN1dLayer, InstanceNorm1dLayer, RmsNormLayer};
 use crate::*;
 
-/// `#3892` regression: graph CROWN-with-stats must surface the row-validation
+/// Regression: graph CROWN-with-stats must surface the row-validation
 /// payload from the decomposed RmsNorm helper instead of silently dropping it.
 #[ntest::timeout(10000)]
 #[test]
@@ -144,7 +144,7 @@ fn adain_graph_input_3912() -> Result<BoundedTensor> {
     )
 }
 
-/// `#3912` regression: block-wise graph CROWN should route AdaIN through the
+/// Regression: block-wise graph CROWN should route AdaIN through the
 /// same decomposed validation path as its effective InstanceNorm equivalent
 /// instead of silently partial-falling back to plain IBP.
 #[ntest::timeout(10000)]

@@ -534,7 +534,7 @@ fn crown_backward_shape_mismatch_error() {
 
 #[test]
 fn crown_infinite_preact_returns_numerical_instability() {
-    // Since commit 6fe9d09 (Part of #2423 / #2591): non-finite pre-activation
+    // Non-finite pre-activation
     // bounds correctly return NumericalInstability instead of unsound identity
     // passthrough. CausalSoftmax is NOT the identity function, so returning
     // identity bounds for non-finite inputs was unsound.

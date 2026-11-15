@@ -17,7 +17,7 @@ fn metadata(lower_bound: f32, upper_bound: f32, depth: usize) -> DomainMetadata 
     }
 }
 
-/// Regression for #4406: upper-bound priority sorting must also tolerate
+/// Regression: upper-bound priority sorting must also tolerate
 /// wrapped queue storage. The production fix reads score scalars from
 /// DomainMetadata in both lower-bound and upper-bound modes.
 #[ntest::timeout(10000)]

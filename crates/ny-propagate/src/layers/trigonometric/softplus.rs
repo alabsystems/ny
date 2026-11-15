@@ -53,10 +53,9 @@ fn softplus(x: f32) -> f32 {
 /// Compute softplus bound interval for [l, u] with directed rounding.
 /// Since softplus is monotonically increasing: softplus(l) <= softplus(x) <= softplus(u).
 /// Computes in f64 and applies next_down/next_up to guarantee conservative f32 bounds.
-/// Part of #3245.
 fn softplus_bound_interval(l: f32, u: f32) -> (f32, f32) {
     // Range clamp: softplus(x) > 0 for all real x. Directed rounding can push
-    // past zero for extreme negative inputs (e.g., softplus(-1000) → 0 → -1e-45). (#3316)
+    // past zero for extreme negative inputs (e.g., softplus(-1000) → 0 → -1e-45).
     (
         next_down_f32(softplus_f64(l as f64) as f32).max(0.0),
         next_up_f32(softplus_f64(u as f64) as f32),
@@ -91,7 +90,7 @@ fn softplus_finalize(
     let lower_slope_f = lower_slope as f32;
     let upper_slope_f = upper_slope as f32;
     // next_up_f32 on the f64→f32 cast ensures the error bound is >= the true
-    // value, preventing intercept widening from underestimating rounding (#2636).
+    // value, preventing intercept widening from underestimating rounding.
     let lower_err = next_up_f32(((lower_slope - lower_slope_f as f64).abs() * max_abs_x) as f32);
     let upper_err = next_up_f32(((upper_slope - upper_slope_f as f64).abs() * max_abs_x) as f32);
 
@@ -252,7 +251,6 @@ impl SoftplusLayer {
     }
 
     /// Patches CROWN backward propagation with pre-activation bounds.
-    /// Part of #2613 Phase 2: generic activation Patches support.
     pub(crate) fn propagate_patches_with_bounds(
         &self,
         bounds: &crate::bounds::patches::PatchesLinearBounds,
@@ -271,7 +269,7 @@ mod tests {
     use ny_tensor::BoundedTensor;
     use proptest::prelude::*;
 
-    /// Independent f64 softplus reference for strict proptest. (#3292)
+    /// Independent f64 softplus reference for strict proptest.
     /// softplus(x) = ln(1 + exp(x)), numerically stable formulation.
     fn softplus_f64_reference(x: f64) -> f64 {
         if x > 0.0 {
@@ -346,7 +344,7 @@ mod tests {
 
     #[test]
     fn test_softplus_non_finite_fallback_returns_infinite_intercepts() {
-        // Regression for #2567: non-finite inputs must drive to [-inf, +inf]
+        // Regression: non-finite inputs must drive to [-inf, +inf]
         // instead of finite sentinels that can overflow in backward accumulation.
         let (_, li_finalize, _, ui_finalize) =
             softplus_finalize(f32::INFINITY, 1.0, 0.5, 0.0, 0.5, 0.0);
@@ -479,13 +477,13 @@ mod tests {
         }
     }
 
-    /// Regression test for #2567, updated for #3070: CROWN backward through
+    /// Regression test: CROWN backward through
     /// Softplus with non-finite pre-activation bounds must be rejected by
     /// `non_finite_domain_guard` with NumericalInstability error.
     ///
-    /// Original bug (#2567): softplus_finalize returned `f32::MAX` as upper
+    /// Original bug: softplus_finalize returned `f32::MAX` as upper
     /// intercept for non-finite inputs, causing NaN via `Inf + (-Inf)`.
-    /// Fix (#3070): `non_finite_domain_guard` now rejects non-finite bounds
+    /// Fix: `non_finite_domain_guard` now rejects non-finite bounds
     /// at the CROWN backward entry point, preventing any relaxation computation
     /// on corrupted inputs.
     #[test]
@@ -536,9 +534,9 @@ mod tests {
         assert!(layer.requires_pre_activation_bounds());
     }
 
-    // ── Strict zero-tolerance CROWN relaxation proptest (#3292) ──────────
+    // ── Strict zero-tolerance CROWN relaxation proptest ──────────
     //
-    // Pattern from #3285: f64-evaluated reference with zero tolerance catches
+    // An f64-evaluated reference with zero tolerance catches
     // f32 cancellation bugs invisible to magnitude-scaled tolerance tests.
 
     proptest! {
@@ -546,7 +544,7 @@ mod tests {
 
         /// Strict soundness proptest for softplus CROWN relaxation.
         /// Uses f64 reference (softplus_f64_reference) with zero tolerance on 200-point grid.
-        /// Ref: alpha-beta-CROWN auto_LiRPA softplus relaxation, #3292.
+        /// Ref: alpha-beta-CROWN auto_LiRPA softplus relaxation.
         #[test]
         fn proptest_softplus_relaxation_strict_soundness(
             l in -10.0f32..10.0,

@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! GAMA guidance-loss helpers (#1449), shared by the sequential disjunctive
+//! GAMA guidance-loss helpers, shared by the sequential disjunctive
 //! attacker (this crate) and ny-cli's graph PGD lane.
 //!
 //! GAMA (Guided Adversarial Margin Attack, Sriramanan et al., NeurIPS 2020)

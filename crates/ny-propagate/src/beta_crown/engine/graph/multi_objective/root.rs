@@ -29,8 +29,9 @@ use crate::{BetaCrownConfig, GraphNetwork, OwnedSignNormalizedObjectiveSet};
 
 use super::super::super::BetaCrownVerifier;
 use super::super::shared::init::{
-    compute_graph_bab_bootstrap, compute_graph_bab_bootstrap_with_phase_cap_checkpoint,
-    compute_graph_root_output_bounds, GraphBabBootstrap,
+    compute_graph_bab_bootstrap, compute_graph_bab_bootstrap_with_bounded_fixed_reference,
+    compute_graph_bab_bootstrap_with_phase_cap_checkpoint, compute_graph_root_output_bounds,
+    GraphBabBootstrap,
 };
 use super::super::shared::setup::{
     build_graph_bab_setup, build_graph_bab_setup_owned, build_graph_cut_pool,
@@ -52,6 +53,9 @@ use super::critical_gpu_alpha::{
 };
 use super::dd_zono_root::{intersect_objective_bounds, run_dd_zono_root};
 use super::output_conditioned_head::try_output_conditioned_root_refutation;
+
+#[path = "root_bounded_reference.rs"]
+mod bounded_reference;
 
 /// Intersect the certified zonotope's per-node enclosures into the stored bounds
 /// map (`#dd-zono-interm`). Returns how many nodes were tightened.
@@ -2119,6 +2123,13 @@ fn evaluate_root_borrowed(
                 );
                 lifecycle.domains_explored = 1;
                 lifecycle.domains_verified = 1;
+                // #vit-margin-alpha-complex (P8): record the exact outward-cast
+                // lowers this verdict rests on, for the default-off fence.
+                lifecycle.root_verified_objective_lowers = Some(
+                    (0..thresholds.len())
+                        .map(|i| next_down_f32(result.margin.lower_with_safety(i, safety) as f32))
+                        .collect(),
+                );
                 return Ok(MultiObjectiveRootOutcome::Finished(Box::new(
                     lifecycle.build_result_with_bounds(BabVerificationStatus::Verified, output),
                 )));
@@ -2247,8 +2258,37 @@ fn evaluate_root_borrowed(
         crate::output_margin_seed::MarginOutputSeedGuard::publish(referenced)
     };
 
+    let bounded_reference_plan = bounded_reference::plan(
+        &bootstrap_config,
+        graph,
+        input,
+        std::time::Instant::now(),
+        root_authority,
+    );
+    let deadline = match (deadline, bounded_reference_plan) {
+        (Some(prior), Some(plan)) => Some(prior.min(plan.tighten)),
+        (prior, _) => prior,
+    };
+    let root_spec_deadline = match (root_spec_deadline, bounded_reference_plan) {
+        (Some(prior), Some(plan)) => Some(prior.min(plan.spec)),
+        (prior, _) => prior,
+    };
     let checkpoint_enabled = root_alpha_phase_checkpoint_enabled(&bootstrap_config);
-    let bootstrap_result = if checkpoint_enabled {
+    let bootstrap_result = if let Some(plan) = bounded_reference_plan {
+        info!(reference_cap_s = plan.reference_cap.as_secs_f64(),
+            "Bounded raw-root bootstrap: reserve objective, cut, and search time; retain fixed reference");
+        compute_graph_bab_bootstrap_with_bounded_fixed_reference(
+            graph,
+            input,
+            &bootstrap_config,
+            engine,
+            initial_deadline
+                .map_or(plan.bootstrap, |prior| prior.min(plan.bootstrap))
+                .min(deadline.unwrap_or(plan.bootstrap)),
+            root_authority,
+            plan.reference_cap,
+        )
+    } else if checkpoint_enabled {
         compute_graph_bab_bootstrap_with_phase_cap_checkpoint(
             graph,
             input,
@@ -2268,7 +2308,22 @@ fn evaluate_root_borrowed(
     };
     let mut bootstrap = match bootstrap_result {
         Ok(bootstrap) => bootstrap,
-        Err(ny_core::NyError::DeadlineExceeded(_)) => {
+        Err(error @ ny_core::NyError::DeadlineExceeded(_)) => {
+            // This policy has already paid for exactly one reference. A failed
+            // first fold is not a checkpoint and cannot authorize a restart.
+            if bounded_reference_plan.is_some() {
+                return Ok(MultiObjectiveRootOutcome::Finished(Box::new(
+                    lifecycle.build_result(if std::time::Instant::now() >= bab_deadline {
+                        BabVerificationStatus::Timeout
+                    } else {
+                        BabVerificationStatus::Unknown {
+                            reason: format!(
+                                "bounded root bootstrap returned no completed artifact: {error}"
+                            ),
+                        }
+                    }),
+                )));
+            }
             // #root-cap-retry (DARK, NY_ROOT_CAP_RETRY=1).
             //
             // The bootstrap's deadline is the ROOT-ALPHA PHASE CAP
@@ -2508,6 +2563,23 @@ fn evaluate_root_borrowed(
         ),
     );
     crate::phase_telemetry::phase_marker("root-ddzono-interm-intersect end");
+    // #relusplitter-lp-refine (wave-6 C7; dark unless `bab.mip_refine_intermediates`
+    // is armed, which is the ONLY way the CLI attaches a refiner): rigorous LP
+    // bounds on the pre-activation layers the refiner owns, intersected
+    // SHRINK-ONLY into the stored boxes here — after the bootstrap produced
+    // them and BEFORE the root objective pass and `build_graph_bab_setup`
+    // consume them, so the root bound and every descendant domain inherit the
+    // tighter relaxation. Its node count joins the stale-box summary below.
+    // With no refiner attached this is a `None` match: nothing runs, nothing
+    // prints, no bound is touched.
+    crate::phase_telemetry::phase_marker("root-mip-refine-interm start");
+    let root_mip_refine_out = match verifier.root_interm_refiner() {
+        Some(refiner) => super::root_phases::RootTightenPhase::MipRefineInterm
+            .run_mip_refine_in_place(graph, input, deadline, &mut bootstrap, refiner),
+        None => super::root_phases::PhaseOutput::default(),
+    };
+    phase_out.merge(root_mip_refine_out);
+    crate::phase_telemetry::phase_marker("root-mip-refine-interm end");
 
     // FC-head pre-activation tightening (#cifar100-fchead): the α-CROWN warmup
     // returns the forward-linear / IBP reference intermediate bounds unchanged
@@ -2764,7 +2836,7 @@ fn evaluate_root_borrowed(
         root_wide_demanded_interm_tightened_targets,
         root_sparse_interm_tightened_targets,
         root_joint_interm_tightened_targets,
-    );
+    ) || root_mip_refine_out.bounds_changed();
     // Graph-MIP stash (FIX 1, `docs/GRAPH_MIP_LEAF_SOLVER.md`): the relational
     // multi-objective lane computes its per-property bounds HERE (not at the
     // ny-cli per-constraint precompute), so this is where the Graph-MIP
@@ -2884,6 +2956,33 @@ fn evaluate_root_borrowed(
                 initial_obj_bounds.len()
             );
         }
+    }
+
+    // #vit-margin-alpha CERTIFY-ONCE MERGE. When the certified C-row margin
+    // ascent ran inside the bootstrap, its root α state carries ONE fresh
+    // certified pass over every margin row under the committed optimizer
+    // state (per-spec α and the attention McCormick parameters that the
+    // shared state below cannot express). Both it and `initial_obj_bounds`
+    // are certified enclosures of the same objective values over the same
+    // box, so the per-row intersection is sound; the merge is refused unless
+    // the input box and every objective, threshold and direction match
+    // BIT-FOR-BIT, and it is all-or-nothing on a disjoint row (a soundness
+    // alarm, printed, never resolved by guessing). Prints
+    // `[alpha-margin-publish] …` whenever a publication reaches this point.
+    if let Some(publication) = bootstrap
+        .root_alpha_state
+        .as_ref()
+        .and_then(crate::bounds::GraphAlphaState::margin_alpha_publication)
+    {
+        // The outcome is fully reported by the observable; a refusal leaves
+        // `initial_obj_bounds` untouched.
+        let _ = publication.merge_into_root(
+            input,
+            objectives,
+            thresholds,
+            verifier.config.verify_upper_bound,
+            &mut initial_obj_bounds,
+        );
     }
 
     // Multi-neuron (k-ReLU) ROOT injection (increment 3, NY_MULTINEURON=1,
@@ -3664,6 +3763,42 @@ fn evaluate_root_borrowed(
         active_set_scalar_cascade_transport_tag = cascade_transport_tag;
     }
 
+    // #graph-lane-search (ENGINE_PROGRAM M7, typed `bab.graph_search`, dark):
+    // the injected UNTRUSTED batched α/β search over the root's unresolved rows
+    // (one unsplit domain), ingested through a clamp gate and certified ONCE by
+    // this lane's own spec-guided CROWN backward over the same certified boxes,
+    // on the CPU. A row's LOWER bound only moves up, by `max`, and only on a
+    // strictly better certified candidate. Both ends of both root intervals are
+    // certified, so a DISJOINT pair is a soundness alarm: nothing is published
+    // and the root downgrades to `unknown`. Skipped when the dark active-set
+    // cascade has pinned the published bounds' fingerprint. `off` never enters.
+    if verifier.config.graph_search.is_armed() && active_set_scalar_cascade_transport_tag.is_none()
+    {
+        let graph_search = super::graph_search::run_root_phase(
+            &super::graph_search::RootPhase {
+                verifier,
+                graph,
+                input,
+                objectives,
+                thresholds,
+                node_bounds: &bootstrap.initial_node_bounds,
+                incumbent_alpha: bootstrap.root_alpha_state.as_ref(),
+                deadline,
+            },
+            &mut initial_obj_bounds,
+        );
+        if let Some(row) = graph_search.alarm_row() {
+            return Ok(MultiObjectiveRootOutcome::Finished(Box::new(
+                lifecycle.build_result(BabVerificationStatus::Unknown {
+                    reason: format!(
+                        "graph-lane-search: disjoint certified root enclosures on objective \
+                         row {row} (soundness alarm; nothing published)"
+                    ),
+                }),
+            )));
+        }
+    }
+
     // A #row-conditional-invprop SECOND PASS was tried here on 2026-08-03 and
     // REMOVED: it is pure cost. Rationale for the attempt was sound (the first
     // pass runs where only 8 rows are open, while ~69/99 are open in the final
@@ -3677,6 +3812,29 @@ fn evaluate_root_borrowed(
     // overlaps existing capability rather than extending past it, so paying it
     // twice buys nothing. Do not re-add without evidence that the lane can
     // close a row no other phase closes.
+
+    // One original-query cut attempt after complete ordinary root evaluation.
+    // The private evaluator owns fresh support and full objective replay from
+    // this exact raw graph/domain; it can only raise one lower bound.
+    let _certified_root_cut_row =
+        crate::beta_crown::certified_root_cut::try_tighten_with_spatial_advice(
+            &verifier.config,
+            graph,
+            input,
+            objectives,
+            thresholds,
+            &mut initial_obj_bounds,
+            &bootstrap.initial_node_bounds,
+            bootstrap.root_alpha_state.as_ref(),
+            engine,
+            deadline,
+            root_spec_cache.as_ref().map(|cache| {
+                crate::beta_crown::certified_root_cut::SpatialAdvice {
+                    cache,
+                    active_indices: &root_spec_cache_active_indices,
+                }
+            }),
+        );
 
     // Root-only output-conditioned hidden treatment (exact dark gate
     // `NY_ROOT_OUTPUT_CONDITIONED_HEAD=1`). Admission requires one ordinary
@@ -3784,6 +3942,17 @@ fn evaluate_root_borrowed(
         conjunctive,
         verified_count,
     ) {
+        // #vit-margin-alpha-complex (P8 review): when the output-conditioned
+        // receipt supplied the closing row, that row's authority is a
+        // PROPERTY-CONDITIONED lower (valid only on the row's violation
+        // premise) that `initial_obj_bounds` does not carry — the recorded
+        // ordinary lower is below its threshold and would be "fenced" vacuously.
+        // Unrecord it so the default-off fence FAILS CLOSED
+        // (`objective-lowers-not-recorded`) instead of reporting a verdict it
+        // never checked as `objective_lowers=fenced`. Fence bookkeeping only.
+        if verified_count != ordinary_verified_count {
+            lifecycle.root_verified_objective_lowers = None;
+        }
         return Ok(MultiObjectiveRootOutcome::Finished(Box::new(result)));
     }
 
@@ -7189,14 +7358,22 @@ mod critical_gpu_alpha_tests {
             )
             .expect("child creation")
             .expect("feasible child");
+        // The transport tag is a ROOT-state contract (production compares it
+        // against `root_domain.alpha_state()` only). Under the child-birth
+        // #alpha-split-refresh law the child does NOT carry the tagged 0.75
+        // verbatim: its store is delta-form, neutralized to 0.5, and the shim
+        // inherits that refreshed state (stale inherited alpha measurably
+        // loses to the current-box heuristic; REGRESSION doc receipts).
+        assert!(child.alpha_state().split_refresh());
         assert_eq!(
             child.alpha_state().alpha("relu0", 1).to_bits(),
-            0.75_f32.to_bits()
+            0.5_f32.to_bits()
         );
         let shim = super::super::batched::graph_bab_domain_shim(&child);
+        assert!(shim.alpha_state.split_refresh());
         assert_eq!(
             shim.alpha_state.alpha("relu0", 1).to_bits(),
-            0.75_f32.to_bits()
+            0.5_f32.to_bits()
         );
     }
 
@@ -8330,7 +8507,7 @@ mod root_spec_prune_tests {
             build_root_spec_prune_plan(true, false, &output, &spec, &objectives, &thresholds)
                 .expect("all-pruned fixture should still produce its certified full result");
 
-        assert!(plan.active_indices.is_empty());
+        assert_eq!((plan.active_indices).len(), 0);
         assert!(plan.active_spec_matrix.is_none());
         assert_eq!(plan.pre_bounds.len(), objectives.len());
         for ((lower, _upper), threshold) in plan.pre_bounds.iter().zip(thresholds) {
@@ -8506,6 +8683,11 @@ pub(super) fn compute_root_objective_bounds(
             "multi-objective root authority expired before spec construction".to_string(),
         ));
     }
+    if bootstrap.retained_fixed_reference && global_deadline.is_none() {
+        return Err(ny_core::NyError::InvalidSpec(
+            "retained root reference requires finite objective authority".to_string(),
+        ));
+    }
     #[cfg(test)]
     ROOT_OBJECTIVE_SPEC_BUILD_COUNT.with(|count| count.set(count.get() + 1));
     let spec_matrix = match global_deadline {
@@ -8576,7 +8758,9 @@ pub(super) fn compute_root_objective_bounds(
     let now = std::time::Instant::now();
     let alpha_rebuild_pending =
         graph.has_conv_layers() && graph.forward_linear_spec_alpha_enabled();
-    let grace_slice = if alpha_rebuild_pending {
+    let grace_slice = if bootstrap.retained_fixed_reference {
+        global_deadline.unwrap().saturating_duration_since(now) / 2
+    } else if alpha_rebuild_pending {
         // 9/10 of the remaining global budget, cap 40s (measured at 95s with
         // the warmup cap above: remaining ≈ 35-43s at root; the optimizer +
         // rebuild need ~1.15x measured fixed cost + sweeps ≈ 30s+; the old
@@ -8605,17 +8789,50 @@ pub(super) fn compute_root_objective_bounds(
     } else {
         ROOT_SPEC_GRACE
     };
+    // THE LEVER'S OWN OBSERVABLE. Which of the three arms above a row takes
+    // decides whether the root pass gets ~40s, a declared #bab-floor share, or
+    // the bare 3s grace — and until 2026-09-02 NOTHING said which, so a row that
+    // died on "root objective pass exceeded its phase grace" could not be
+    // attributed without a debugger. Measured that day on cifar100_2024
+    // resnet_large: 5/5 rows ended `unknown` through exactly that handler, and
+    // the absence of any root-alpha marker in their logs was uninterpretable
+    // rather than informative — this repo's own rule is that a silent lever
+    // makes a result VOID, not negative. One line, always on, no env var.
+    eprintln!(
+        "[root-spec-grace] arm={} grace_s={:.2} alpha_rebuild_pending={} reserve_s={} \
+         has_conv={} spec_alpha_enabled={}",
+        if bootstrap.retained_fixed_reference {
+            "retained-reference-reserve"
+        } else if alpha_rebuild_pending {
+            "alpha-rebuild"
+        } else if root_spec_reserve.is_some() {
+            "bab-floor-reserve"
+        } else {
+            "bare-3s-floor"
+        },
+        grace_slice.as_secs_f64(),
+        alpha_rebuild_pending,
+        root_spec_reserve
+            .map(|r| format!("{:.2}", r.as_secs_f64()))
+            .unwrap_or_else(|| "none".to_string()),
+        graph.has_conv_layers(),
+        graph.forward_linear_spec_alpha_enabled(),
+    );
     // Live warmups keep their historical deadline unless the alpha rebuild
     // needs the bounded grace. Expired local phase checkpoints rebase only
     // while the GLOBAL wall-clock still has room; exhausted authority never
     // mints fresh time (#4260 regression contract).
-    let root_deadline = resolve_root_objective_deadline(
-        bootstrap.alpha_config.deadline,
-        now,
-        grace_slice,
-        global_deadline,
-        alpha_rebuild_pending,
-    );
+    let root_deadline = if bootstrap.retained_fixed_reference {
+        global_deadline.map(|authority| bounded_reference::objective_deadline(now, authority))
+    } else {
+        resolve_root_objective_deadline(
+            bootstrap.alpha_config.deadline,
+            now,
+            grace_slice,
+            global_deadline,
+            alpha_rebuild_pending,
+        )
+    };
 
     // NY_SLACK_PROBE: clear the per-row f32-slack accumulator so the report below
     // reflects only this root backward (dark; no-op when the gate is off).
@@ -8669,6 +8886,8 @@ pub(super) fn compute_root_objective_bounds(
                     .deadline_opt(root_deadline)
                     .truncate_after_opt(verifier.config.crown_backward_layers)
                     .capture_cache()
+                    // #la-warm-frontier: `None` unless armed (byte-identical).
+                    .warm_frontier_opt(verifier.la_warm_frontier_armed())
                     .run_with_cache();
                 // #root-adaptive-spec (NY_ROOT_ADAPTIVE_SPEC=1, default OFF):
                 // the SECOND (adaptive, fresh-slope) full coefficient backward
@@ -8700,10 +8919,13 @@ pub(super) fn compute_root_objective_bounds(
                             Ok((historical_bounds, _historical_cache)),
                             Ok((adaptive_bounds, cache)),
                         ) => {
-                            // The cache is itself a certified linear enclosure and
-                            // child consumers use it only as a same-row backward
-                            // seed. It stays sound even when the independent
-                            // historical candidate tightens the displayed root box.
+                            // The cache holds per-node coefficient blocks, NOT an
+                            // enclosure: a block is a valid child seed only when
+                            // the output reaches that node through a unary chain,
+                            // which every seed site checks
+                            // (`propagation/warm_start_guard.rs`, #warm-dag). It
+                            // is independent of which root candidate supplies the
+                            // displayed root box.
                             Ok((
                                 best_of_sound_root_spec_bounds(adaptive_bounds, &historical_bounds),
                                 cache,
@@ -8739,6 +8961,8 @@ pub(super) fn compute_root_objective_bounds(
                     .deadline_opt(root_deadline)
                     .truncate_after_opt(verifier.config.crown_backward_layers)
                     .capture_cache()
+                    // #la-warm-frontier: `None` unless armed (byte-identical).
+                    .warm_frontier_opt(verifier.la_warm_frontier_armed())
                     .run_with_cache()
             }
         };
@@ -9593,13 +9817,36 @@ pub(super) fn compute_root_objective_bounds(
                 // authenticated the bootstrap output as its independent reference,
                 // so reuse that certified enclosure instead of performing a second
                 // root transaction against the possibly exhausted local deadline.
-                let output = resolve_graph_root_output_after_atomic_stage_a(
-                    graph,
-                    bootstrap,
-                    atomic_stage_a_committed,
-                    || graph.propagate_ibp_with_engine_and_deadline(input, engine, root_deadline),
-                )?;
+                let output = if bootstrap.retained_fixed_reference {
+                    bootstrap_output_bounds(graph, bootstrap)
+                        .cloned()
+                        .ok_or_else(|| {
+                            ny_core::NyError::InvalidSpec(
+                                "retained root reference is missing the graph output".to_string(),
+                            )
+                        })?
+                } else {
+                    resolve_graph_root_output_after_atomic_stage_a(
+                        graph,
+                        bootstrap,
+                        atomic_stage_a_committed,
+                        || {
+                            graph.propagate_ibp_with_engine_and_deadline(
+                                input,
+                                engine,
+                                root_deadline,
+                            )
+                        },
+                    )?
+                };
                 (output, obj_bounds)
+            }
+            Err(e) if bootstrap.retained_fixed_reference => {
+                if !bounded_reference::may_reuse_after(&e) {
+                    return Err(e);
+                }
+                info!(error = %e, "Bounded root objective retained certified output; no recollection");
+                bounded_reference::project(graph, bootstrap, objectives, global_deadline)?
             }
             Err(e) => {
                 debug!(
@@ -9655,6 +9902,8 @@ pub(super) fn compute_root_objective_bounds(
                 (output, obj_bounds)
             }
         }
+    } else if bootstrap.retained_fixed_reference {
+        bounded_reference::project(graph, bootstrap, objectives, global_deadline)?
     } else {
         // The no-spec-matrix path is another root-objective evaluator and owns
         // the same globally capped grace as the spec request. This matters
@@ -9707,6 +9956,13 @@ pub(super) fn compute_root_objective_bounds(
         );
     }
 
+    if bootstrap.retained_fixed_reference
+        && global_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+    {
+        return Err(ny_core::NyError::DeadlineExceeded(
+            "retained root objective authority expired before publication".to_string(),
+        ));
+    }
     Ok(RootObjectiveEvaluation {
         initial_output,
         initial_obj_bounds,
@@ -9781,6 +10037,55 @@ mod root_objective_authority_tests {
             "only the finite, strictly greater row may feed root closure"
         );
     }
+
+    /// #vit-margin-alpha-complex (P8): a root-terminal `Verified` records the
+    /// EXACT objective lower bounds it rests on, so the containment fence can
+    /// check the verdict's authority; a root that does not close records
+    /// nothing (the fence then has nothing to vouch for).
+    #[test]
+    fn maybe_finish_at_root_records_the_objective_lowers_it_verified_on() {
+        use super::{maybe_finish_at_root, BabVerificationStatus, GraphBabLifecycle};
+        use ndarray::{ArrayD, IxDyn};
+        use ny_tensor::BoundedTensor;
+
+        let output = BoundedTensor::new(
+            ArrayD::from_shape_vec(IxDyn(&[2]), vec![0.0_f32, 0.0]).unwrap(),
+            ArrayD::from_shape_vec(IxDyn(&[2]), vec![1.0_f32, 1.0]).unwrap(),
+        )
+        .unwrap();
+        let mut lifecycle = GraphBabLifecycle::new(std::time::Instant::now());
+        assert!(lifecycle.root_verified_objective_lowers.is_none());
+        let closed = maybe_finish_at_root(
+            &mut lifecycle,
+            output.clone(),
+            &[(0.25_f32, 1.0_f32), (0.5, 2.0)],
+            &[0.0, 0.0],
+            false,
+            2,
+        )
+        .expect("every row verified closes the root");
+        assert!(matches!(closed.result, BabVerificationStatus::Verified));
+        assert_eq!(
+            lifecycle.root_verified_objective_lowers,
+            Some(vec![0.25_f32, 0.5]),
+            "the recorded authority must be the exact certified lowers, bit for bit"
+        );
+
+        let mut open = GraphBabLifecycle::new(std::time::Instant::now());
+        assert!(maybe_finish_at_root(
+            &mut open,
+            output,
+            &[(0.25_f32, 1.0_f32), (-0.5, 2.0)],
+            &[0.0, 0.0],
+            false,
+            1,
+        )
+        .is_none());
+        assert!(
+            open.root_verified_objective_lowers.is_none(),
+            "an open root must not record a verdict authority"
+        );
+    }
 }
 
 fn maybe_finish_at_root(
@@ -9795,6 +10100,13 @@ fn maybe_finish_at_root(
     let initially_verified_all = verified_count == num_objectives;
     let initially_verified_any = verified_count > 0;
 
+    // #vit-margin-alpha-complex (P8): a root-terminal `Verified` rests on
+    // exactly these certified objective LOWER bounds. Record them so the
+    // default-off containment fence can check the verdict's actual authority
+    // (the `Finished` result carries only the output enclosure). Print/check
+    // only: nothing here changes which verdict is returned.
+    let verified_lowers =
+        || -> Vec<f32> { initial_obj_bounds.iter().map(|(lower, _)| *lower).collect() };
     if conjunctive && initially_verified_any {
         info!(
             "Multi-objective conjunctive: {}/{} objectives verified at root — property safe",
@@ -9802,6 +10114,7 @@ fn maybe_finish_at_root(
         );
         lifecycle.domains_explored = 1;
         lifecycle.domains_verified = 1;
+        lifecycle.root_verified_objective_lowers = Some(verified_lowers());
         return Some(
             lifecycle.build_result_with_bounds(BabVerificationStatus::Verified, initial_output),
         );
@@ -9809,6 +10122,7 @@ fn maybe_finish_at_root(
     if !conjunctive && initially_verified_all {
         lifecycle.domains_explored = 1;
         lifecycle.domains_verified = 1;
+        lifecycle.root_verified_objective_lowers = Some(verified_lowers());
         return Some(
             lifecycle.build_result_with_bounds(BabVerificationStatus::Verified, initial_output),
         );
@@ -11649,9 +11963,10 @@ mod root_crown_interm_tests {
         // exactly why BOTH edges are required: a lever that declined in 0 ms
         // and a lever that ran for 6 s are otherwise indistinguishable in a
         // phase log, and only the pair proves which one happened.
-        const WINDOW_PHASES: [&str; 10] = [
+        const WINDOW_PHASES: [&str; 11] = [
             "root-stabilize-and-fix",
             "root-ddzono-interm-intersect",
+            "root-mip-refine-interm",
             "root-fchead-tighten",
             "root-interm-alpha",
             "root-joint-interm-alpha",

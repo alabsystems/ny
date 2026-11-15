@@ -190,7 +190,7 @@ impl BetaCrownVerifier {
             // Keep the batched dense-spec path aligned with SpecCrownRequest:
             // empty-history domains must reuse precomputed node bounds verbatim,
             // and when no bounds are supplied they must collect intermediates
-            // with the same CROWN-IBP-vs-IBP heuristic as the scalar path. #4403
+            // with the same CROWN-IBP-vs-IBP heuristic as the scalar path.
             if let Some(bounds) = base_bounds {
                 // #cone-delta increment 2: verbatim reuse of the inherited map
                 // is `Arc::clone` per entry — no tensor copies. Only the
@@ -204,7 +204,7 @@ impl BetaCrownVerifier {
                 // #cgan-batched-stack: fresh per-subdomain IBP intersected with
                 // the shared warmup reference bounds. This restores the
                 // per-domain re-anchoring the rayon `ibp_enhancement` path
-                // performs (previously omitted here per #4210): without it, all
+                // performs (previously omitted here): without it, all
                 // empty-history domains clone one shared map and every
                 // per-domain backward computes bit-identical relaxations whose
                 // bias gap never shrinks with splitting. SOUND: both maps are
@@ -280,8 +280,6 @@ impl BetaCrownVerifier {
     /// Like `propagate_crown_with_batched_domains_full` but accepts a multi-row
     /// `spec_matrix` and returns `DomainSpecCrownResult` preserving per-domain
     /// input `LinearBounds` for split scoring (SB heuristic).
-    ///
-    /// Part of #4116 Packet A.
     pub fn propagate_crown_with_batched_domains_full_specs(
         &self,
         graph: &GraphNetwork,
@@ -344,6 +342,7 @@ impl BetaCrownVerifier {
             return Ok(BatchedSpecBackwardResult {
                 results: Vec::new(),
                 intermediate_la: None,
+                intermediate_frontiers: None,
                 stage_timing: None,
                 optimized_betas: None,
                 optimized_alphas: None,
@@ -370,8 +369,6 @@ impl BetaCrownVerifier {
     /// Like `propagate_crown_with_batched_domains_full_specs` but also captures
     /// intermediate `LinearBounds` at each node for warm-starting subsequent
     /// backward passes on child domains.
-    ///
-    /// Part of #4116 Packet A.
     pub fn propagate_crown_with_batched_domains_full_specs_capture_la(
         &self,
         graph: &GraphNetwork,
@@ -384,6 +381,7 @@ impl BetaCrownVerifier {
             return Ok(BatchedSpecBackwardResult {
                 results: Vec::new(),
                 intermediate_la: None,
+                intermediate_frontiers: None,
                 stage_timing: None,
                 optimized_betas: None,
                 optimized_alphas: None,
@@ -399,8 +397,6 @@ impl BetaCrownVerifier {
     /// Like `propagate_crown_batched_with_context` but accepts a multi-row
     /// `spec_matrix` instead of a scalar `objective` vector. Returns
     /// `DomainSpecCrownResult` which preserves per-domain input `LinearBounds`.
-    ///
-    /// Part of #4116 Packet A Step 3.
     // Production callers use the `_timed` / `_capture_la` variants; this thin
     // adapter is exercised only by the parity/soundness test suites.
     #[cfg(test)]
@@ -443,8 +439,6 @@ impl BetaCrownVerifier {
     ///
     /// Like `propagate_crown_batched_with_context_specs` but also captures
     /// intermediate `LinearBounds` at each node.
-    ///
-    /// Part of #4116 Packet A Step 3.
     pub(in crate::beta_crown::engine::graph) fn propagate_crown_batched_with_context_specs_capture_la(
         &self,
         graph: &GraphNetwork,
@@ -488,6 +482,7 @@ impl BetaCrownVerifier {
         beta_opt: Option<&GpuBetaOptSpec<'_>>,
         skip_node_bounds: bool,
     ) -> Result<BatchedSpecBackwardResult> {
+        graph.ensure_proof_eligible()?;
         if ctx.is_empty() {
             return Ok(BatchedSpecBackwardResult {
                 results: Vec::new(),
@@ -496,6 +491,7 @@ impl BetaCrownVerifier {
                 } else {
                     None
                 },
+                intermediate_frontiers: None,
                 stage_timing: None,
                 optimized_betas: None,
                 optimized_alphas: None,

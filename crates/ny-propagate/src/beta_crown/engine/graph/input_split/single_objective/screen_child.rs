@@ -38,7 +38,7 @@ pub(super) type WarmComputeBoundsFn<'a> = dyn Fn(
     + 'a;
 
 /// Screen a single child domain through clipping, IBP pre-screen, and
-/// optional CROWN bounding. Part of #3882.
+/// optional CROWN bounding.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn screen_single_child(
     verifier: &BetaCrownVerifier,
@@ -62,7 +62,7 @@ pub(super) fn screen_single_child(
     let mut complete_clip_node_bounds: Option<HashMap<String, BoundedTensor>> = None;
 
     if verifier.config.enable_relaxed_clip {
-        // #3870 Gap B: prefer parent linear bounds for clipping. The child box
+        // Prefer parent linear bounds for clipping. The child box
         // is a subset of the parent, so the parent's CROWN linear coefficients
         // are valid over-approximations for clipping. This avoids a redundant
         // child CROWN backward pass just for clipping in reorder mode.
@@ -79,9 +79,11 @@ pub(super) fn screen_single_child(
                 engine,
             )?;
             if result.verified {
+                verifier.cover_note_box_clip_closed(objective, threshold, &child_input);
                 lifecycle.domains_verified += 1;
                 return Ok(None);
             }
+            verifier.cover_note_box_clip(objective, threshold, &child_input, &result.bounds);
             child_input = result.bounds;
             complete_clip_node_bounds = result.complete_clip_node_bounds;
         } else {
@@ -146,9 +148,11 @@ pub(super) fn screen_single_child(
                 }
             };
             if clip_outcome.verified {
+                verifier.cover_note_box_clip_closed(objective, threshold, &child_input);
                 lifecycle.domains_verified += 1;
                 return Ok(None);
             }
+            verifier.cover_note_box_clip(objective, threshold, &child_input, &clip_outcome.bounds);
             child_input = clip_outcome.bounds;
         }
     }
@@ -167,6 +171,13 @@ pub(super) fn screen_single_child(
                 ibp_bounds.upper_scalar(),
                 threshold,
             ) {
+                verifier.cover_note_box_bound(
+                    objective,
+                    threshold,
+                    &child_input,
+                    ibp_bounds.lower_scalar(),
+                    ibp_bounds.upper_scalar(),
+                );
                 *domains_verified_by_ibp += 1;
                 lifecycle.domains_verified += 1;
                 return Ok(None);
@@ -332,7 +343,7 @@ mod tests {
         );
     }
 
-    /// #3870 Gap B regression: when parent linear bounds are present, the
+    /// Regression: when parent linear bounds are present, the
     /// reorder clip path MUST reuse them via `clip_child_with_parent_linear`
     /// instead of running a fresh child CROWN pass. If `compute_bounds` is
     /// called, this test panics — proving the clip step consumed parent data.

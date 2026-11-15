@@ -154,7 +154,7 @@ fn test_elementwise_zero_coefficient_guard() {
         result.upper_a.iter().all(|&v| v == 0.0),
         "upper_a should be all zeros"
     );
-    // Bias: directed rounding (#1992) shifts 0.0 by 1 ULP:
+    // Bias: directed rounding shifts 0.0 by 1 ULP:
     // next_down_f32(0.0) = -1.4e-45, next_up_f32(0.0) = 1.4e-45.
     // This is sound (lower_b <= 0.0 <= upper_b) and no NaN.
     assert!(
@@ -168,12 +168,10 @@ fn test_elementwise_zero_coefficient_guard() {
 }
 
 /// Regression test: crown_elementwise_backward with large slopes exercises
-/// f64 bias accumulation (#1745) and verifies no overflow in coefficient output.
+/// f64 bias accumulation and verifies no overflow in coefficient output.
 ///
-/// The f64 accumulation fix (#1745) targets "slope~3000, intercept~-20000, 8x
+/// The f64 accumulation fix targets "slope~3000, intercept~-20000, 8x
 /// cancellation" but had no direct unit test with those magnitudes.
-///
-/// Part of #1932 (CROWN coefficient overflow class).
 #[test]
 fn test_elementwise_large_slope_f64_bias_accumulation_1745() {
     // Relaxation with large slopes/intercepts. Combined with a large incoming
@@ -477,7 +475,7 @@ fn test_trait_dispatch_nonlinear_missing_preact() {
     );
 }
 
-/// Regression test for #1992: f64→f32 bias cast must use directed rounding
+/// Regression test: f64→f32 bias cast must use directed rounding
 /// (next_down_f32 for lower_b, next_up_f32 for upper_b) to maintain soundness.
 ///
 /// This test constructs a case where the f64 accumulated bias is NOT exactly
@@ -532,7 +530,7 @@ fn test_bias_f64_to_f32_rounding_direction_1992() {
         gap,
     );
 
-    // With directed rounding (#1992 fix):
+    // With directed rounding:
     // lower_b uses next_down_f32: rounds toward -inf → sound for lower bound
     // upper_b uses next_up_f32: rounds toward +inf → sound for upper bound
     let expected_lower = next_down_f32(cast_f32);

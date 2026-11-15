@@ -24,11 +24,11 @@
 //!
 //! Their base implementations remain MAGNITUDE tests (the EFT one executes
 //! only when its optional arm is enabled), and numbers are destroyed by
-//! arithmetic. Since the 2026-08-11 UTC source review, the supported resident route
-//! carries a separate taint word by default, C1/C2 consult it, and any admitted
-//! route that cannot provide complete words refuses rather than silently
-//! falling back to these magnitude checks. This module measures both the
-//! historical defect and the selected word-channel remedy.
+//! arithmetic. The supported resident route therefore carries a separate taint
+//! word by default, C1/C2 consult it, and any admitted route that cannot
+//! provide complete words refuses rather than silently falling back to these
+//! magnitude checks. This module measures both the historical defect and the
+//! selected word-channel remedy.
 //!
 //! # The CPU analogue being ported
 //!
@@ -173,13 +173,13 @@
 //! `ops/taint_chain.rs` composes the three twins end to end). A fourth twin,
 //! `CROWN_EFT_MIN_COMBINE_TAINT_SHADER`, and its device probe implement the C2
 //! tightening refusal. The fail-closed C1 consult body and host taint-fold
-//! helpers are also built. Since the 2026-08-11 UTC arming review, AUTO mode runs
-//! the worded walk whenever the taint twins are available; `NY_GPU_TAINT_WORDS=0`
-//! explicitly opts out and `=1` requires the twins. The resident walk dispatches
-//! the applicable transport twins and, when optional Linear EFT min-tightening
-//! is active, C2; it invokes its host folds, ORs complete per-spec-row words,
-//! and supplies them to the armed C1 consult. ResNet segment composition carries
-//! words across its seam, while unsupported worded shapes/routes typed-refuse.
+//! helpers are also built. AUTO mode runs the worded walk whenever the taint
+//! twins are available; `NY_GPU_TAINT_WORDS=0` explicitly opts out and `=1`
+//! requires the twins. The resident walk dispatches the applicable transport
+//! twins and, when optional Linear EFT min-tightening is active, C2; it invokes
+//! its host folds, ORs complete per-spec-row words, and supplies them to the
+//! armed C1 consult. ResNet segment composition carries words across its seam,
+//! while unsupported worded shapes/routes typed-refuse.
 //! This older six-lane selfcheck runs the GEMM and activation twins beside the
 //! unchanged magnitude chain and deliberately host-models the combine
 //! transport:
@@ -275,9 +275,8 @@ const K: usize = 4;
 
 /// Hard gate: may the out-of-band TAINT WORD count toward the RUNG?
 ///
-/// ARMED 2026-08-11 UTC (source-review event, evidence in the arming commit and
-/// TAINT_GUARD_AUDIT.md §4). The preconditions the previous doc demanded are
-/// now facts:
+/// ARMED 2026-08-11 UTC (evidence in the arming commit and
+/// TAINT_GUARD_AUDIT.md §4). Its preconditions hold:
 /// * the resident walk dispatches the taint twins, transports words
 ///   on-device, and hands per-spec-row words to the C1 consult — BY DEFAULT
 ///   (AUTO gate: on whenever the twins are available; `NY_GPU_TAINT_WORDS=0`
@@ -739,13 +738,12 @@ impl WgpuDevice {
             ls[i] = lane.slope;
         }
 
-        // #u4 twin-chain seeds (2026-08-10): production will carry the words
-        // from op to op; the probe host-seeds them exactly where an operand IS
-        // a saturation artifact — `|x| >= FALLBACK_BOUND` — which is precisely
-        // the set an upstream taint-twin op would have self-seeded (its
-        // outputs saturate to exactly ±FALLBACK_BOUND, and the 1e30 degrade
-        // marker also clears the threshold). Weights are exact host data:
-        // never tainted.
+        // #u4 twin-chain seeds: production carries the words from op to op; the
+        // probe host-seeds them exactly where an operand IS a saturation artifact
+        // — `|x| >= FALLBACK_BOUND` — which is precisely the set an upstream
+        // taint-twin op would have self-seeded (its outputs saturate to exactly
+        // ±FALLBACK_BOUND, and the 1e30 degrade marker also clears the
+        // threshold). Weights are exact host data: never tainted.
         let taint_a_words: Vec<u32> = a.iter().map(|&x| u32::from(x.abs() >= FALLBACK)).collect();
         let taint_e_words: Vec<u32> = e.iter().map(|&x| u32::from(x.abs() >= FALLBACK)).collect();
 

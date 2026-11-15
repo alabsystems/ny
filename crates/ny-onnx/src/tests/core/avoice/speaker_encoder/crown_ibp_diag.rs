@@ -189,7 +189,7 @@ fn assert_complete_finite_no_looser_than_ibp(
 
 /// A deadline-bounded CROWN-IBP pass must preserve complete, finite, no-looser
 /// node bounds even when individual nodes fall back. Provenance and timing are
-/// logged to diagnose how much real CROWN work fit in the 60s budget. #3596
+/// logged to diagnose how much real CROWN work fit in the 60s budget.
 ///
 /// Uses the same deadline as the comparison test to diagnose the provenance
 /// distribution: how many nodes are CROWN-tightened, how many fall back to
@@ -227,7 +227,7 @@ fn test_speaker_crown_ibp_dag_deadline_fallback_is_complete_and_sound_3596() {
     );
 
     // Use pre-computed IBP bounds to avoid the redundant forward pass that
-    // previously consumed the entire deadline budget (#3596).
+    // previously consumed the entire deadline budget.
     let t0 = Instant::now();
     let deadline = t0 + Duration::from_secs(shared::SPEAKER_COMPONENT_CROWN_IBP_DEADLINE_SECS);
     eprintln!(

@@ -207,7 +207,7 @@ proptest! {
 }
 
 // ========================================================================
-// CROWN backward soundness tests (#2292)
+// CROWN backward soundness tests
 //
 // These test propagate_linear_with_bounds (the full CROWN backward path),
 // not just the per-element relaxation functions. They exercise:
@@ -224,7 +224,7 @@ proptest! {
 //        positive [0.2, 1.0]; all avoid asymptotes
 // ========================================================================
 
-// assert_crown_backward_sound extracted to crate::tests::assert_crown_backward_sound (#2307)
+// assert_crown_backward_sound extracted to crate::tests::assert_crown_backward_sound
 use crate::tests::assert_crown_backward_sound;
 
 #[ntest::timeout(10000)]
@@ -271,7 +271,7 @@ fn test_tan_crown_backward_soundness() {
     assert_crown_backward_sound(&layer, &intervals, f32::tan);
 }
 
-/// Regression for #2287: sound-mode Sin path uses constant bounds built from
+/// Regression: sound-mode Sin path uses constant bounds built from
 /// `concretize_sound()`, which now repairs non-finite/inverted elements internally.
 #[test]
 fn test_sin_sound_mode_constant_bounds_repairs_invalid_concretization() {

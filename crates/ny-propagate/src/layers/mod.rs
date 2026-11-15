@@ -34,6 +34,10 @@ pub(crate) mod arithmetic;
 pub(crate) mod attention;
 /// Binary operations (MatMul, Add, Mul, Sub, Div, Atan2, Concat, Min, Max).
 pub(crate) mod binary_ops;
+/// #vit-collector-throughput: typed arming latch + engagement census for the
+/// collector throughput kernels (row-parallel McCormick, position-stacked
+/// Linear, unbounded-upper Reciprocal). Dark by default.
+pub(crate) mod collector_kernels;
 /// Convolutional layers (Conv1d, Conv2d, Conv3d, ConvTranspose1d, ConvTranspose2d).
 pub(crate) mod convolution;
 /// Double-precision (f64) layer implementations for soundness-critical propagation.
@@ -46,6 +50,8 @@ pub(crate) mod linear;
 pub(crate) mod misc;
 /// Normalization layers (LayerNorm, BatchNorm).
 pub(crate) mod normalization;
+/// Original-coefficient storage for explicitly diagnostic point-only execution.
+pub(crate) mod point_linear;
 /// Pooling layers (AveragePool, MaxPool2d).
 pub(crate) mod pooling;
 /// Reduction operations (ReduceMean, ReduceSum).
@@ -110,8 +116,12 @@ pub use misc::{
 };
 /// Normalization layer types (BatchNorm, InstanceNorm1d, LayerNorm, RmsNorm) and CROWN mode configuration.
 pub use normalization::{
-    AdaIN1dLayer, BatchNormChannelAxisHint, BatchNormLayer, GroupNormLayer, InstanceNorm1dLayer,
-    LayerNormCrownMode, LayerNormLayer, LayerNormMode, RmsNormLayer, NORMALIZATION_MIN_EPS,
+    AdaIN1dLayer, BatchNormChannelAxisHint, BatchNormExactAffine, BatchNormLayer, GroupNormLayer,
+    InstanceNorm1dLayer, LayerNormCrownMode, LayerNormLayer, LayerNormMode, RmsNormLayer,
+    NORMALIZATION_MIN_EPS,
+};
+pub use point_linear::{
+    PointLinearArm, PointLinearBuildPolicy, PointLinearLayer, PointLinearReceipt,
 };
 /// Pooling layer types (AveragePool, MaxPool2d).
 pub use pooling::{AveragePoolLayer, MaxPool2dLayer};
@@ -138,14 +148,13 @@ pub use trigonometric::{
 /// Unified [`Layer`] enum for dynamic dispatch across all layer types.
 pub use layer_enum::Layer;
 
-// Re-exports for tests and Kani proofs: relaxation functions used by tests via
-// `crate::layers::*` (#3240) and by external Kani proof harnesses (#2305).
+// Re-exports for tests: relaxation functions used by tests via
+// `crate::layers::*`.
 pub use activations::{
     exp_linear_relaxation, log_linear_relaxation, silu_eval, silu_sound_linear_relaxation,
 };
 pub use arithmetic::{abs_linear_relaxation, pow2_linear_relaxation, sqrt_linear_relaxation};
 pub use softmax::{
-    adaptive_gelu_linear_relaxation, exp_interval_bounds, gelu_eval, gelu_linear_relaxation,
+    adaptive_gelu_linear_relaxation, gelu_eval, gelu_linear_relaxation,
     gelu_sound_linear_relaxation, gelu_tanh_inflection_point, gelu_tanh_sound_linear_relaxation,
-    logsoftmax_ibp_bounds, logsumexp_slice, softmax_ibp_element_bounds,
 };

@@ -10,14 +10,13 @@
 // neuron to get tighter pre-activation bounds.
 //
 // Reference: alpha-beta-CROWN complete_verifier/lp_mip_solver/bounds_core.py:37-92
-// Reference: designs/2026-03-04-highs-mip-solver-integration.md (Phase 2)
-// Part of #1763.
 
 use crate::ay::{ObjSense, ObjectiveSpec};
 use crate::config::MipConfig;
 use crate::error::MipError;
 use crate::ir::{Col, MilpProblem};
 use crate::solver::MipResult;
+use ny_core::dd::{next_down_f64, next_up_f64};
 use ny_core::{Bound, BoundTightener};
 use ny_tensor::{next_down_f32, next_up_f32};
 use tracing::debug;
@@ -360,6 +359,199 @@ impl LpTightener {
         Ok(newly_stable)
     }
 
+    /// #relusplitter-lp-refine (wave-6 C7): tighten one layer's UNSTABLE
+    /// pre-activations, largest triangle gap first, under the absolute
+    /// `ay_hard_deadline`, using ONLY rigorous LP bounds.
+    ///
+    /// Same triangle relaxation and same authority as the in-process
+    /// [`Self::tighten_layer`] path — one layer LP (outward-rounded triangle
+    /// rows on every earlier layer), one [`ay_milp::LpSession`], and a
+    /// rigorous bound per request (Neumaier–Shcherbina correction of the float
+    /// dual, else AY's exact rim; anything inconclusive is `None` and keeps
+    /// the incoming bound). What differs:
+    ///
+    /// * the LP is [`Self::build_layer_lp_boxed`]: every PRE-ACTIVATION column
+    ///   carries its own (sound) box instead of being free. With a free column
+    ///   the NS tier can never certify — its outward-rounded reduced-cost
+    ///   interval always straddles zero, and a free column then makes the
+    ///   weak-duality term unbounded — so every request fell to the exact
+    ///   rim, whose float-basis certificate declines above 600 rows and whose
+    ///   fallback materializes a full rational LP (review of `5a3a434a1`);
+    /// * bounds come from [`Self::session_rigorous_col`], whose NS tier also
+    ///   tries the dual with wrong-signed one-sided-row components zeroed;
+    /// * neurons are visited in [`triangle_gap_priority`] order, so a
+    ///   deadline-cut pass has spent its time on the loosest relaxations;
+    /// * the pass stops at the deadline (or `max_tighten_per_layer`) and
+    ///   returns what it has — every neuron it did not reach keeps its
+    ///   incoming bound bit for bit;
+    /// * a [`LayerTightenReport`] counts solves, rigorous answers and
+    ///   tightened neurons for the caller's observable.
+    ///
+    /// # Soundness
+    /// A returned lower is `max(incoming, next_down_f32(rigorous_min))` and a
+    /// returned upper is `min(incoming, next_up_f32(rigorous_max))`: never
+    /// wider than the incoming box, never tighter than a rigorous bound on the
+    /// LP optimum, and the LP's feasible set contains the true ReLU graph over
+    /// the incoming boxes (see [`Self::encode_relu_triangle`]; the column
+    /// boxes are the same sound boxes the triangle rows already trust). A
+    /// crossed or non-finite result keeps the incoming bound. A structurally
+    /// inconsistent tightener (short or mis-sized weights, biases, input box
+    /// or earlier-layer boxes, or any non-finite box) is REFUSED: the unboxed
+    /// builder would index the wrong weights or pass a ReLU through as the
+    /// identity. Only the in-process AY backend has the rigorous surface, so
+    /// any other backend is refused.
+    ///
+    /// # Errors
+    /// Shape errors, a non-in-process backend, and propagated AY errors.
+    pub fn tighten_layer_rigorous_prioritized(
+        &self,
+        target_layer: usize,
+        current_bounds: &[Bound],
+    ) -> Result<(Vec<Bound>, LayerTightenReport)> {
+        if target_layer >= self.weights.len() || self.layer_dims.len() < target_layer + 2 {
+            return Err(MipError::Encoding(format!(
+                "target_layer {} out of range (network has {} layers, {} dims)",
+                target_layer,
+                self.weights.len(),
+                self.layer_dims.len()
+            )));
+        }
+        let expected_dim = self.layer_dims[target_layer + 1];
+        if current_bounds.len() != expected_dim {
+            return Err(MipError::Encoding(format!(
+                "current_bounds length {} doesn't match layer {} dimension {}",
+                current_bounds.len(),
+                target_layer,
+                expected_dim
+            )));
+        }
+        if matches!(self.config.backend, crate::config::MipBackend::AyProc) {
+            return Err(MipError::Encoding(
+                "rigorous prioritized LP tightening needs the in-process ay backend".to_string(),
+            ));
+        }
+        self.check_boxed_prefix(target_layer, current_bounds)?;
+        let mut report = LayerTightenReport {
+            unstable_before: count_unstable(current_bounds),
+            ..LayerTightenReport::default()
+        };
+        let mut tightened = current_bounds.to_vec();
+        let order = triangle_gap_priority(current_bounds);
+        if order.is_empty() {
+            report.unstable_after = report.unstable_before;
+            return Ok((tightened, report));
+        }
+        if self.deadline_expired() {
+            report.unstable_after = report.unstable_before;
+            report.deadline_hit = true;
+            return Ok((tightened, report));
+        }
+        let (problem, targets) = self.build_layer_lp_boxed(target_layer, current_bounds)?;
+        if targets.len() != expected_dim {
+            return Err(MipError::Encoding(format!(
+                "layer LP produced {} target columns for a {}-neuron layer",
+                targets.len(),
+                expected_dim
+            )));
+        }
+        let model = crate::ay_lib::to_ay_model(&problem)?;
+        // Column order is preserved by the lowering (see `tighten_layer`).
+        let targets: Vec<ay_milp::Col> = targets
+            .iter()
+            .map(|c| {
+                model.col_at(c.0).ok_or_else(|| {
+                    MipError::Encoding(format!("target column {} out of range", c.0))
+                })
+            })
+            .collect::<Result<_>>()?;
+        let Some(per_neuron_timeout) = self.live_per_neuron_timeout_secs() else {
+            report.unstable_after = report.unstable_before;
+            report.deadline_hit = true;
+            return Ok((tightened, report));
+        };
+        let mut opts = ay_milp::SolveOpts::new()
+            .with_time_limit(std::time::Duration::from_secs_f64(per_neuron_timeout));
+        if let Some(deadline) = self.config.ay_hard_deadline {
+            opts = opts.with_deadline(deadline);
+        }
+        let mut session =
+            ay_milp::LpSession::new(&model, &opts).map_err(|e| MipError::Solver(e.to_string()))?;
+
+        let max_per_layer = self.config.max_tighten_per_layer;
+        for &i in &order {
+            if self.deadline_expired() {
+                report.deadline_hit = true;
+                break;
+            }
+            if max_per_layer > 0 && report.attempted >= max_per_layer {
+                break;
+            }
+            report.attempted += 1;
+            let lb = current_bounds[i].lower();
+            let ub = current_bounds[i].upper();
+
+            report.lp_solves += 1;
+            let new_lb = match Self::session_rigorous_col(
+                &mut session,
+                targets[i],
+                ay_milp::Sense::Minimize,
+            )? {
+                Some(value) if value.is_finite() => {
+                    report.rigorous += 1;
+                    // f64 -> f32 rounds DOWN for a lower bound; never widen.
+                    next_down_f32(value as f32).max(lb)
+                }
+                _ => lb,
+            };
+            let new_ub = if new_lb >= 0.0 {
+                // Proven always-active: the upper bound is not needed for the
+                // relaxation, keep the incoming one.
+                ub
+            } else if self.deadline_expired() {
+                report.deadline_hit = true;
+                ub
+            } else {
+                report.lp_solves += 1;
+                match Self::session_rigorous_col(
+                    &mut session,
+                    targets[i],
+                    ay_milp::Sense::Maximize,
+                )? {
+                    Some(value) if value.is_finite() => {
+                        report.rigorous += 1;
+                        // f64 -> f32 rounds UP for an upper bound; never widen.
+                        next_up_f32(value as f32).min(ub)
+                    }
+                    _ => ub,
+                }
+            };
+            // Fail closed on a crossed or non-finite pair: keep the incoming box.
+            if !new_lb.is_finite() || !new_ub.is_finite() || new_lb > new_ub {
+                continue;
+            }
+            if new_lb > lb || new_ub < ub {
+                report.tightened += 1;
+                tightened[i] = Bound::new(new_lb, new_ub);
+            }
+            if report.deadline_hit {
+                break;
+            }
+        }
+        report.unstable_after = count_unstable(&tightened);
+        debug!(
+            "LP rigorous prioritized tighten layer {target_layer}: attempted={} solves={} \
+             rigorous={} tightened={} unstable {}->{} deadline_hit={}",
+            report.attempted,
+            report.lp_solves,
+            report.rigorous,
+            report.tightened,
+            report.unstable_before,
+            report.unstable_after,
+            report.deadline_hit
+        );
+        Ok((tightened, report))
+    }
+
     /// One warm re-solve on the rigorous W2 surface: a float basis plus a
     /// Neumaier-Shcherbina directed-rounding correction — every returned
     /// value is a RIGOROUS bound on the true optimum (exact-certified
@@ -388,6 +580,165 @@ impl LpTightener {
             )),
             _ => Ok(None),
         }
+    }
+
+    /// #relusplitter-lp-refine: [`Self::session_optimum`] through
+    /// [`ay_milp::LpSession::rigorous_bound_expr`] on the one-column form
+    /// `1 * x_target`. Same two tiers and the same authority (NS off one float
+    /// dual, else the exact rim; the rim is literally the same
+    /// `optimize_linear` call `rigorous_bound` makes). The expression form's
+    /// NS tier additionally evaluates the dual with every wrong-signed
+    /// component on a ONE-SIDED row zeroed — sound for any multiplier vector
+    /// by weak duality (it drops that row from the dual) — so a float dual
+    /// with one stray sign on a triangle row still certifies instead of
+    /// falling to the exact rim. `None` for anything inconclusive.
+    fn session_rigorous_col(
+        session: &mut ay_milp::LpSession,
+        target: ay_milp::Col,
+        sense: ay_milp::Sense,
+    ) -> Result<Option<f64>> {
+        use num_traits::ToPrimitive;
+        match session
+            .rigorous_bound_expr(&[(target, 1.0)], sense)
+            .map_err(|e| MipError::Solver(e.to_string()))?
+        {
+            ay_milp::Outcome::Bound {
+                dual_bound,
+                rigorous: true,
+            } => Ok(dual_bound.to_f64()),
+            ay_milp::Outcome::Optimal { value, .. } => Ok(value.to_f64()),
+            _ => Ok(None),
+        }
+    }
+
+    /// #relusplitter-lp-refine: refuse a tightener whose prefix up to
+    /// `target_layer` is not self-consistent, BEFORE any LP is built.
+    ///
+    /// The layer LP reads `weights[k][i * fan_in + j]` with `fan_in` taken
+    /// from the previous layer's column count, so a mis-sized input box or
+    /// weight vector silently reads the WRONG weights; and the unboxed builder
+    /// passes an earlier ReLU through as the IDENTITY when its box is missing
+    /// (`layer_idx < intermediate_bounds.len()` guard). Either is an LP whose
+    /// feasible set need not contain the true graph. Every box must also be
+    /// finite: they become column bounds and triangle coefficients.
+    fn check_boxed_prefix(&self, target_layer: usize, current_bounds: &[Bound]) -> Result<()> {
+        let refuse = |what: String| {
+            Err(MipError::Encoding(format!(
+                "rigorous prioritized LP tightening refused: {what}"
+            )))
+        };
+        let finite = |bounds: &[Bound]| {
+            bounds
+                .iter()
+                .all(|b| b.lower().is_finite() && b.upper().is_finite())
+        };
+        if self.layer_dims.len() < target_layer + 2 || self.weights.len() <= target_layer {
+            return refuse(format!("no layer {target_layer}"));
+        }
+        if self.input_bounds.len() != self.layer_dims[0] || !finite(self.input_bounds.as_slice()) {
+            return refuse(format!(
+                "input box has {} entries for a {}-wide input or is not finite",
+                self.input_bounds.len(),
+                self.layer_dims[0]
+            ));
+        }
+        for k in 0..=target_layer {
+            let (fan_in, fan_out) = (self.layer_dims[k], self.layer_dims[k + 1]);
+            if self.weights[k].len() != fan_in.saturating_mul(fan_out) {
+                return refuse(format!("layer {k} weights are not {fan_out}x{fan_in}"));
+            }
+            if self.biases.get(k).map_or(true, |b| b.len() != fan_out) {
+                return refuse(format!("layer {k} bias is not {fan_out}-wide"));
+            }
+            let boxes = if k == target_layer {
+                Some(current_bounds)
+            } else {
+                self.intermediate_bounds.get(k).map(Vec::as_slice)
+            };
+            match boxes {
+                Some(b) if b.len() == fan_out && finite(b) => {}
+                _ => return refuse(format!("layer {k} has no finite {fan_out}-wide box")),
+            }
+        }
+        Ok(())
+    }
+
+    /// #relusplitter-lp-refine: the layer LP of [`Self::build_layer_lp`]
+    /// with every PRE-ACTIVATION column BOXED — earlier layers by
+    /// `intermediate_bounds[k]`, the target layer by `target_bounds`.
+    ///
+    /// SOUND: those are exactly the boxes the caller already certifies (the
+    /// triangle rows are built from them, and the result is intersected with
+    /// `target_bounds`), so the true graph still lies inside the feasible set;
+    /// the LP only gets tighter (a stable-active column now carries `[l, u]`,
+    /// which `y = x` alone did not). NECESSARY for the NS tier: with every
+    /// structural column finite, a weak-duality term can no longer be
+    /// unbounded, so a float dual always yields a finite rigorous bound.
+    /// Callers must run [`Self::check_boxed_prefix`] first (it guarantees
+    /// every index below is in range and every box finite). The unboxed
+    /// builder, and so the shipped [`Self::tighten_layer`], is unchanged.
+    fn build_layer_lp_boxed(
+        &self,
+        target_layer: usize,
+        target_bounds: &[Bound],
+    ) -> Result<(MilpProblem, Vec<Col>)> {
+        let mut problem = MilpProblem::new();
+
+        let mut current_vars = Vec::with_capacity(self.input_bounds.len());
+        for b in &self.input_bounds {
+            let col = problem.add_col(0.0, f64::from(b.lower()), f64::from(b.upper()));
+            current_vars.push(col);
+        }
+
+        let mut targets = Vec::new();
+        for layer_idx in 0..=target_layer {
+            let in_features = current_vars.len();
+            let is_target = layer_idx == target_layer;
+            let boxes: &[Bound] = if is_target {
+                target_bounds
+            } else {
+                self.intermediate_bounds
+                    .get(layer_idx)
+                    .map(Vec::as_slice)
+                    .ok_or_else(|| {
+                        MipError::Encoding(format!("layer {layer_idx} has no intermediate box"))
+                    })?
+            };
+            if boxes.len() != self.layer_dims[layer_idx + 1] {
+                return Err(MipError::Encoding(format!(
+                    "layer {layer_idx} box has {} entries for a {}-neuron layer",
+                    boxes.len(),
+                    self.layer_dims[layer_idx + 1]
+                )));
+            }
+
+            let mut linear_out = Vec::with_capacity(boxes.len());
+            for (i, bound) in boxes.iter().enumerate() {
+                let y_var =
+                    problem.add_col(0.0, f64::from(bound.lower()), f64::from(bound.upper()));
+
+                let mut coeffs: Vec<(Col, f64)> = Vec::with_capacity(in_features + 1);
+                for (j, &x_var) in current_vars.iter().enumerate() {
+                    let w = self.weights[layer_idx][i * in_features + j];
+                    if w != 0.0 {
+                        coeffs.push((x_var, w));
+                    }
+                }
+                coeffs.push((y_var, -1.0));
+                let neg_b = -self.biases[layer_idx][i];
+                problem.add_row(neg_b, neg_b, coeffs);
+
+                linear_out.push(y_var);
+            }
+
+            if is_target {
+                targets = linear_out;
+            } else {
+                current_vars = Self::encode_relu_triangle(&mut problem, &linear_out, boxes);
+            }
+        }
+
+        Ok((problem, targets))
     }
 
     /// Build the layer LP once: identical constraints for every neuron in
@@ -656,11 +1007,30 @@ impl LpTightener {
                 // Upper envelope: y <= u*(x - l)/(u - l)
                 // Let slope = u/(u-l). Then: y <= slope*(x - l) = slope*x - slope*l
                 // Rearranged: y - slope*x <= -slope*l
-                let slope = ub / (ub - lb);
+                //
+                // DIRECTED OUTWARD, because this row is EXACTLY TIGHT AT BOTH ENDS and
+                // the LP feasible set must CONTAIN the true ReLU graph. Writing the row
+                // as `y <= slope*x + rhs`, the slack `f(x) = slope*x + rhs - relu(x)` is
+                // zero at x = lb AND at x = ub in exact arithmetic:
+                //   x = lb: slope*lb + rhs = 0        (rhs = -slope*lb)
+                //   x = ub: slope*(ub - lb) - ub = 0  (slope = ub/(ub - lb))
+                // so a round-to-nearest slope or rhs that lands one ULP low makes f < 0
+                // at that vertex and CUTS OFF a reachable point. The LP optimum is then
+                // tighter than the true bound, and `LpTightener` publishes it as a
+                // proof — a false `unsat`.
+                //
+                // Round the denominator DOWN and the quotient UP so `slope_up >= exact`
+                // (fixing the x = ub vertex), then round `rhs` UP so
+                // `slope_up*lb + rhs_up >= slope_up*lb + slope_up*(-lb) = 0` (fixing the
+                // x = lb vertex). Both vertices are then feasible by construction, and
+                // the interior is slack because f is piecewise linear between them.
+                let denom_dn = next_down_f64(ub - lb);
+                let slope_up = next_up_f64(ub / denom_dn);
+                let rhs_up = next_up_f64(slope_up * (-lb));
                 problem.add_row(
                     f64::NEG_INFINITY,
-                    -slope * lb,
-                    [(y_var, 1.0), (x_var, -slope)],
+                    rhs_up,
+                    [(y_var, 1.0), (x_var, -slope_up)],
                 );
 
                 post_act_vars.push(y_var);
@@ -682,6 +1052,55 @@ impl BoundTightener for LpTightener {
         let (tightened, _newly_stable) = self.tighten_layer(layer_idx, current_bounds)?;
         Ok(tightened)
     }
+}
+
+/// Telemetry of one [`LpTightener::tighten_layer_rigorous_prioritized`] pass
+/// (#relusplitter-lp-refine, wave-6 C7). Counts only — nothing here is a bound.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LayerTightenReport {
+    /// Unstable neurons (`l < 0 < u`) in the incoming bounds.
+    pub unstable_before: usize,
+    /// Unstable neurons in the returned bounds.
+    pub unstable_after: usize,
+    /// Neurons whose LP pair was started (the rest were cut by the deadline
+    /// or `max_tighten_per_layer` and keep their incoming bounds).
+    pub attempted: usize,
+    /// Rigorous-bound requests issued (one or two per attempted neuron).
+    pub lp_solves: usize,
+    /// Requests that returned a RIGOROUS finite bound (the only kind used).
+    pub rigorous: usize,
+    /// Neurons whose box actually shrank.
+    pub tightened: usize,
+    /// The absolute deadline stopped the pass early.
+    pub deadline_hit: bool,
+}
+
+/// Number of unstable (`l < 0 < u`) entries.
+#[must_use]
+pub fn count_unstable(bounds: &[Bound]) -> usize {
+    bounds
+        .iter()
+        .filter(|b| b.lower() < 0.0 && b.upper() > 0.0)
+        .count()
+}
+
+/// Unstable neuron indices ranked by the triangle relaxation's maximum
+/// vertical gap `-l*u/(u-l)` (largest first; ties by ascending index).
+/// Stable neurons are excluded. SCHEDULE ONLY: which neuron is solved first
+/// never changes what a solved neuron's bound is.
+#[must_use]
+pub fn triangle_gap_priority(bounds: &[Bound]) -> Vec<usize> {
+    let mut ranked: Vec<(usize, f64)> = bounds
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| {
+            let l = f64::from(b.lower());
+            let u = f64::from(b.upper());
+            (l < 0.0 && u > 0.0).then(|| (i, -l * u / (u - l)))
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    ranked.into_iter().map(|(i, _)| i).collect()
 }
 
 /// Outcome of an OBBT pass over an LP relaxation ([`obbt_relaxation_bounds`]).
@@ -782,3 +1201,6 @@ pub fn obbt_relaxation_bounds(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod prioritized_tests;

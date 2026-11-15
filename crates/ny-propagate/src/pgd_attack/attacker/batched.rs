@@ -9,7 +9,7 @@ use ny_core::{NyError, Result};
 use ny_tensor::BoundedTensor;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::Network;
 
@@ -38,6 +38,7 @@ impl PgdAttacker<'_> {
         threshold: f32,
         verify_upper_bound: bool,
     ) -> Result<PgdResult> {
+        self.checkpoint("before batched preparation")?;
         let n = self.config.num_restarts;
         let input_shape = input_bounds.shape();
         const MAX_CONSECUTIVE_NAN_SKIPS: u32 = 5;
@@ -48,12 +49,25 @@ impl PgdAttacker<'_> {
         let mut x_batch = ArrayD::zeros(IxDyn(&batch_shape));
 
         // Per-restart RNGs (same seeding as sequential for comparable randomness)
-        let mut rngs: Vec<StdRng> = (0..n)
-            .map(|restart| StdRng::seed_from_u64(self.config.seed.wrapping_add(restart as u64)))
-            .collect();
+        self.checkpoint("before restart RNG allocation")?;
+        let mut rngs: Vec<StdRng> = Vec::with_capacity(n);
+        for restart in 0..n {
+            if restart.is_multiple_of(32) {
+                self.checkpoint("during restart RNG initialization")?;
+            }
+            rngs.push(StdRng::seed_from_u64(
+                self.config.seed.wrapping_add(restart as u64),
+            ));
+        }
 
         for (i, rng) in rngs.iter_mut().enumerate() {
-            let point = self.initialize_restart(network, input_bounds, rng)?;
+            if i.is_multiple_of(32) {
+                self.checkpoint("during batched seed initialization")?;
+            }
+            // Same seed the RNG above was built from, so the corner-seed slot
+            // (#attack-vertex-geometry, dark at the default 0) is restart `i`.
+            let seed = self.config.seed.wrapping_add(i as u64);
+            let point = self.initialize_restart_for_seed(network, input_bounds, rng, seed)?;
             x_batch.index_axis_mut(Axis(0), i).assign(&point);
         }
 
@@ -61,17 +75,19 @@ impl PgdAttacker<'_> {
         let mut aborted = vec![false; n];
         let mut total_evals = 0;
 
-        // Create per-restart step states (#4277: AdamClipping optimizer).
-        let mut step_states: Vec<_> = (0..n)
-            .map(|_| self.config.create_step_state(input_bounds))
-            .collect();
+        // Create per-restart step states (AdamClipping optimizer).
+        self.checkpoint("before batched optimizer allocation")?;
+        let mut step_states = Vec::with_capacity(n);
+        for restart in 0..n {
+            if restart.is_multiple_of(32) {
+                self.checkpoint("during batched optimizer initialization")?;
+            }
+            step_states.push(self.config.create_step_state(input_bounds));
+        }
 
         // Main PGD loop: all restarts advance in lockstep
         for _step in 0..self.config.num_steps {
-            if self.past_deadline() {
-                info!("PGD batched: deadline exceeded, stopping at step {}", _step);
-                break;
-            }
+            self.checkpoint("before batched gradient step")?;
 
             let (gradient_batch, step_evals) = self.estimate_gradient_spsa_batch_with_bounds(
                 network,
@@ -84,13 +100,16 @@ impl PgdAttacker<'_> {
 
             // Per-restart gradient computation and position update
             for i in 0..n {
+                if i.is_multiple_of(32) {
+                    self.checkpoint("during batched optimizer update")?;
+                }
                 if aborted[i] {
                     continue;
                 }
 
                 let gradient = gradient_batch.index_axis(Axis(0), i).to_owned();
 
-                // NaN guard (#2721/#2968): skip step if gradient is NaN
+                // NaN guard: skip step if gradient is NaN
                 if gradient.iter().any(|v| v.is_nan()) {
                     nan_skips[i] += 1;
                     if nan_skips[i] >= MAX_CONSECUTIVE_NAN_SKIPS {
@@ -104,16 +123,16 @@ impl PgdAttacker<'_> {
                 }
                 nan_skips[i] = 0;
 
-                // Apply the step using the configured optimizer (#4277).
+                // Apply the step using the configured optimizer.
                 let current_x = x_batch.index_axis(Axis(0), i).to_owned();
                 let projected =
                     step_states[i].step(&gradient, &current_x, input_bounds, verify_upper_bound);
 
-                // Restart-when-stuck (#4278): resample this restart if projected == previous.
+                // Restart-when-stuck: resample this restart if projected == previous.
                 if self.config.restart_when_stuck
                     && restart::projected_step_is_stuck(&current_x, &projected)
                 {
-                    let fresh = restart::resample_uniform_point(self, input_bounds, &mut rngs[i]);
+                    let fresh = self.sample_uniform_until(input_bounds, &mut rngs[i])?;
                     step_states[i].reset();
                     x_batch.index_axis_mut(Axis(0), i).assign(&fresh);
                 } else {
@@ -133,6 +152,7 @@ impl PgdAttacker<'_> {
         }
 
         // Final batched evaluation: [N, ...input_shape] -> [N, ...output_shape]
+        self.checkpoint("before final batched evaluation")?;
         let final_outputs = self.evaluate_batch(network, &x_batch)?;
         total_evals += n;
 
@@ -146,6 +166,9 @@ impl PgdAttacker<'_> {
         let mut found_violation = false;
 
         for (i, &is_aborted) in aborted.iter().enumerate() {
+            if i.is_multiple_of(32) {
+                self.checkpoint("during final batched result scan")?;
+            }
             if is_aborted {
                 continue;
             }

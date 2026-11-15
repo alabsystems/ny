@@ -7,8 +7,6 @@
 //! Extracts SPSA and finite-difference gradient estimators from the main
 //! optimization loop. The analytic and chain-rule methods remain inline
 //! because they are trivial (1 line and ~15 lines respectively).
-//!
-//! Reference: designs/2026-02-14-alpha-crown-backward-dedup.md (Phase 2)
 
 use ndarray::Array1;
 use ny_core::Result;
@@ -38,7 +36,7 @@ pub(super) fn compute_spsa_gradients(
         .map(|relu_idx| Array1::zeros(alpha_state.alphas[relu_idx].len()))
         .collect();
 
-    // Save original alpha values for restoration (both lower and upper paths, #3393)
+    // Save original alpha values for restoration (both lower and upper paths)
     let original_alphas: Vec<Array1<f32>> = alpha_state.alphas.clone();
     let original_alphas_upper: Vec<Array1<f32>> = alpha_state.alphas_upper.clone();
 
@@ -50,7 +48,7 @@ pub(super) fn compute_spsa_gradients(
 
     // Wrap loop body in closure so `?` returns to the closure, not the
     // outer function. This ensures alpha restoration runs unconditionally,
-    // even when CROWN propagation returns an error (#2554).
+    // even when CROWN propagation returns an error.
     let result = (|| -> Result<()> {
         // Average over multiple samples to reduce variance
         for _sample in 0..spsa_samples {
@@ -72,7 +70,7 @@ pub(super) fn compute_spsa_gradients(
                 })
                 .collect();
 
-            // Apply +eps perturbation from original (both lower and upper paths, #3393)
+            // Apply +eps perturbation from original (both lower and upper paths)
             for relu_idx in 0..num_relus {
                 for i in 0..alpha_state.alphas[relu_idx].len() {
                     let p = eps * perturbations[relu_idx][i];
@@ -82,11 +80,11 @@ pub(super) fn compute_spsa_gradients(
                         (original_alphas_upper[relu_idx][i] + p).clamp(0.0, 1.0);
                 }
             }
-            // Propagate CROWN errors instead of swallowing them (#1935, #1941).
+            // Propagate CROWN errors instead of swallowing them.
             let bounds_plus = single_pass_fn(alpha_state)?;
             let lower_plus: f32 = finite_lower_sum(bounds_plus.lower());
 
-            // Apply -eps perturbation from original (both lower and upper paths, #3393)
+            // Apply -eps perturbation from original (both lower and upper paths)
             for relu_idx in 0..num_relus {
                 for i in 0..alpha_state.alphas[relu_idx].len() {
                     let p = eps * perturbations[relu_idx][i];
@@ -96,7 +94,7 @@ pub(super) fn compute_spsa_gradients(
                         (original_alphas_upper[relu_idx][i] - p).clamp(0.0, 1.0);
                 }
             }
-            // Propagate CROWN errors instead of swallowing them (#1935, #1941).
+            // Propagate CROWN errors instead of swallowing them.
             let bounds_minus = single_pass_fn(alpha_state)?;
             let lower_minus: f32 = finite_lower_sum(bounds_minus.lower());
 
@@ -115,11 +113,11 @@ pub(super) fn compute_spsa_gradients(
         Ok(())
     })();
 
-    // Always restore alpha state, including early error returns from `?` (#2554).
+    // Always restore alpha state, including early error returns from `?`.
     restore_alpha_snapshot(alpha_state, &original_alphas, &original_alphas_upper);
     result?;
 
-    // Average the gradients (.max(1) prevents div-by-zero when spsa_samples=0, #2079)
+    // Average the gradients (.max(1) prevents div-by-zero when spsa_samples=0)
     let num_samples = spsa_samples.max(1) as f32;
     for grad in &mut avg_grads {
         *grad /= num_samples;
@@ -143,7 +141,7 @@ pub(super) fn compute_finite_difference_gradients(
     eps: f32,
     mut single_pass_fn: impl FnMut(&AlphaState) -> Result<BoundedTensor>,
 ) -> Result<Vec<Array1<f32>>> {
-    // Save original alpha values for unconditional restoration (#2554, #3393).
+    // Save original alpha values for unconditional restoration.
     let original_alphas: Vec<Array1<f32>> = alpha_state.alphas.clone();
     let original_alphas_upper: Vec<Array1<f32>> = alpha_state.alphas_upper.clone();
 
@@ -164,19 +162,19 @@ pub(super) fn compute_finite_difference_gradients(
                 let orig_alpha = alpha_state.alphas[relu_idx][neuron_idx];
                 let orig_alpha_upper = alpha_state.alphas_upper[relu_idx][neuron_idx];
 
-                // Compute f(alpha + eps) — perturb both paths together (#3393)
+                // Compute f(alpha + eps) — perturb both paths together
                 alpha_state.alphas[relu_idx][neuron_idx] = (orig_alpha + eps).clamp(0.0, 1.0);
                 alpha_state.alphas_upper[relu_idx][neuron_idx] =
                     (orig_alpha_upper + eps).clamp(0.0, 1.0);
-                // Propagate CROWN errors instead of swallowing them (#1935, #1941).
+                // Propagate CROWN errors instead of swallowing them.
                 let bounds_plus = single_pass_fn(alpha_state)?;
                 let lower_plus: f32 = finite_lower_sum(bounds_plus.lower());
 
-                // Compute f(alpha - eps) — perturb both paths together (#3393)
+                // Compute f(alpha - eps) — perturb both paths together
                 alpha_state.alphas[relu_idx][neuron_idx] = (orig_alpha - eps).clamp(0.0, 1.0);
                 alpha_state.alphas_upper[relu_idx][neuron_idx] =
                     (orig_alpha_upper - eps).clamp(0.0, 1.0);
-                // Propagate CROWN errors instead of swallowing them (#1935, #1941).
+                // Propagate CROWN errors instead of swallowing them.
                 let bounds_minus = single_pass_fn(alpha_state)?;
                 let lower_minus: f32 = finite_lower_sum(bounds_minus.lower());
 
@@ -193,7 +191,7 @@ pub(super) fn compute_finite_difference_gradients(
         Ok(grads)
     })();
 
-    // Always restore alpha state, including early error returns from `?` (#2554).
+    // Always restore alpha state, including early error returns from `?`.
     restore_alpha_snapshot(alpha_state, &original_alphas, &original_alphas_upper);
     result
 }
@@ -201,8 +199,8 @@ pub(super) fn compute_finite_difference_gradients(
 /// Unconditionally restore alpha values from a snapshot.
 ///
 /// Used after closure-wrapped gradient computation to ensure alpha state
-/// is restored even when CROWN propagation returns an error (#2554).
-/// Restores both lower and upper alpha paths (#3393).
+/// is restored even when CROWN propagation returns an error.
+/// Restores both lower and upper alpha paths.
 fn restore_alpha_snapshot(
     alpha_state: &mut AlphaState,
     original_alphas: &[Array1<f32>],

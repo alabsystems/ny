@@ -4,7 +4,7 @@
 
 //! IBP (interval bound propagation) forward pass for `GraphNetwork`.
 //!
-//! Extracted from `bounds/mod.rs` to keep files under 500 lines (#3396).
+//! Extracted from `bounds/mod.rs` to keep files under 500 lines.
 
 use crate::layers::{BoundPropagation, Layer};
 use crate::network::core::graph::ibp::dispatch::{
@@ -114,6 +114,13 @@ pub(super) fn propagate_node_ibp_with_engine_and_deadline(
         Layer::ConvTranspose2d(c) => {
             c.propagate_ibp_sound_with_engine_and_deadline(input, engine, deadline)
         }
+        // AveragePool's plain forward certifies only the final f64-to-f32
+        // store. Its window accumulation can lose a small term under severe
+        // cancellation, so node boxes consumed by later relaxations must use
+        // the proof-environment-gated Higham enclosure. The certified kernel
+        // takes neither engine nor deadline, keeping both authorities bitwise
+        // identical.
+        Layer::AveragePool(pool) => pool.propagate_ibp_sound(input),
         _ => layer.propagate_ibp(input),
     }
 }
@@ -152,7 +159,7 @@ impl GraphNetwork {
     ///
     /// When an engine is provided, Linear, Conv1d, Conv2d, ConvTranspose1d,
     /// and ConvTranspose2d layers dispatch through their engine-aware IBP paths
-    /// (potentially using GPU GEMM). All other layers fall back to CPU. (#4174)
+    /// (potentially using GPU GEMM). All other layers fall back to CPU.
     pub fn collect_node_bounds_with_engine(
         &self,
         input: &BoundedTensor,
@@ -262,6 +269,9 @@ impl GraphNetwork {
         layer_deadline: Option<Instant>,
         collapse_to_center: bool,
     ) -> Result<std::collections::HashMap<String, BoundedTensor>> {
+        if !collapse_to_center {
+            self.ensure_proof_eligible()?;
+        }
         // NOTE on the L2/Cauchy–Schwarz lever inside CROWN: an outer CROWN scope
         // has DISABLED the lever (see `crate::l2_lever_gate`), and this node-bound
         // collection intentionally inherits that. Enabling the (now-cheap) lever
@@ -298,7 +308,25 @@ impl GraphNetwork {
                 layer_deadline,
             )?;
 
-            // NaN firewall (#3768): guard the 5th IBP path like the other 4.
+            // #pwl-lookup (DARK, `bab.pwl_lookup_exact_range`): intersect a
+            // ReLU lookup-table output with its exact 1-D range (shrink-only;
+            // any decline or contradiction keeps this box byte-for-byte).
+            // Unarmed graphs return `output_bounds` untouched. Skipped for the
+            // point-collapse diagnostic, whose contract is a faithful forward.
+            let output_bounds = if collapse_to_center {
+                output_bounds
+            } else {
+                self.pwl_lookup_tighten_node(
+                    node_name,
+                    node,
+                    output_bounds,
+                    input,
+                    &bounds_cache,
+                    deadline,
+                )
+            };
+
+            // NaN firewall: guard the 5th IBP path like the other 4.
             if let Some(deadline) = deadline {
                 check_nan_firewall_with_poll(
                     &output_bounds,
@@ -358,7 +386,7 @@ impl GraphNetwork {
         engine: Option<&dyn GemmEngine>,
         deadline: Option<Instant>,
     ) -> Result<BoundedTensor> {
-        // Classify node arity via the shared accessor-based classifier (#2633).
+        // Classify node arity via the shared accessor-based classifier.
         // This replaces 15 direct `node.inputs[N]` indexing sites with safe
         // GraphNode accessors. Layer-specific dispatch (zonotope tightening,
         // sqrt lenient mode) is handled within each arity arm below.
@@ -374,7 +402,7 @@ impl GraphNetwork {
                     Layer::Sqrt(sqrt) if allow_negative_sqrt => {
                         sqrt.propagate_ibp_lenient(bounds)?
                     }
-                    // Route GEMM-heavy layers through engine-aware IBP (#4174).
+                    // Route GEMM-heavy layers through engine-aware IBP.
                     _ => propagate_node_ibp_with_engine_and_deadline(
                         &node.layer,
                         bounds,
@@ -401,20 +429,32 @@ impl GraphNetwork {
                         // Intersect with plain IBP: both sound, keep the tighter
                         // per element (no regression where the zonotope is looser).
                         let ibp = node.layer.propagate_ibp_binary(input_a, input_b)?;
-                        match self.try_ffn_swiglu_bounds_zonotope(node, input, bounds_cache)? {
-                            Some(zono) => {
-                                if let Some(deadline) = deadline {
-                                    intersect_zonotope_ibp_with_poll(zono, ibp, || {
-                                        check_graph_alpha_ibp_deadline(
-                                            deadline,
-                                            node_name,
-                                            "while intersecting zonotope bounds",
-                                        )
-                                    })?
-                                } else {
-                                    intersect_zonotope_ibp(zono, ibp)
+                        let ibp =
+                            match self.try_ffn_swiglu_bounds_zonotope(node, input, bounds_cache)? {
+                                Some(zono) => {
+                                    if let Some(deadline) = deadline {
+                                        intersect_zonotope_ibp_with_poll(zono, ibp, || {
+                                            check_graph_alpha_ibp_deadline(
+                                                deadline,
+                                                node_name,
+                                                "while intersecting zonotope bounds",
+                                            )
+                                        })?
+                                    } else {
+                                        intersect_zonotope_ibp(zono, ibp)
+                                    }
                                 }
-                            }
+                                None => ibp,
+                            };
+                        // #qdq-crown-followup (DARK, `model.qdq_activation_relaxation`):
+                        // shared-input tightening for the staircase products —
+                        // MulBinary(a, a) squares and the erf-GELU product. Both
+                        // are per-element intersections with the plain bound
+                        // (shrink-only, sound; see `crate::qdq_staircase`).
+                        match self
+                            .try_qdq_staircase_mul_tighten(name_a, name_b, input_a, input_b, &ibp)
+                        {
+                            Some(tighter) => tighter,
                             None => ibp,
                         }
                     }
@@ -505,6 +545,7 @@ impl GraphNetwork {
         deadline: Option<Instant>,
         bounds: &mut std::collections::HashMap<String, BoundedTensor>,
     ) -> Result<usize> {
+        self.ensure_proof_eligible()?;
         let exec_order = self.exec_order()?;
         let mut merged = 0usize;
         for node_name in exec_order {

@@ -8,8 +8,6 @@
 //! duplicated between `bench_acasxu` and `beta_crown verify`.  Each command
 //! layers its own policy on top (GPU-BaB gate, relu-split shorthand) via
 //! the helpers here.
-//!
-//! Part of #1893.
 
 use anyhow::Result;
 use ny_core::LayerType;

@@ -300,7 +300,7 @@ proptest! {
         );
     }
 
-    /// new_allow_infinite must accept all outputs of round_for_soundness_n_ulps (#2944).
+    /// new_allow_infinite must accept all outputs of round_for_soundness_n_ulps.
     ///
     /// round_for_soundness_n_ulps can produce ±inf via saturation at f32::MAX/MIN.
     /// new_allow_infinite must accept these as valid bounds. Uses
@@ -329,7 +329,7 @@ proptest! {
         );
     }
 
-    /// round_for_soundness_n_ulps must always produce valid bounds (lower <= upper) (#2944).
+    /// round_for_soundness_n_ulps must always produce valid bounds (lower <= upper).
     #[test]
     fn n_ulps_preserves_bound_ordering(
         (a, b) in valid_interval(),
@@ -348,7 +348,7 @@ proptest! {
         );
     }
 
-    /// round_for_soundness_n_ulps must always contain the original bounds (#2944).
+    /// round_for_soundness_n_ulps must always contain the original bounds.
     #[test]
     fn n_ulps_contains_original(
         (a, b) in valid_interval(),
@@ -372,7 +372,7 @@ proptest! {
         );
     }
 
-    /// Per-element intersection soundness (#2935):
+    /// Per-element intersection soundness:
     /// For overlapping elements, result is the intersection (subset of both).
     /// For disjoint elements, result is the union (superset of both).
     /// Result always has lower <= upper.

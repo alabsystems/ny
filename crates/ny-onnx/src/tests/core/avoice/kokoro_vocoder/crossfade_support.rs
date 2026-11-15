@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cached boundary fixtures shared by crossfade and seam test lanes (#3500).
+//! Cached boundary fixtures shared by crossfade and seam test lanes.
 
 use super::super::common::assert_finite_and_ordered;
 use super::boundary::{

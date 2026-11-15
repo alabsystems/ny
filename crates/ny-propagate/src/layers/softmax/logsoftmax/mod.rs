@@ -62,8 +62,6 @@ impl LogSoftmaxLayer {
     /// When restart batching adds a leading axis, positive stored axes (which
     /// used unbatched convention `axis - 1` at load time) must shift right by
     /// one to resolve against the correct sample-space dimension.
-    ///
-    /// Part of #4096.
     pub fn propagate_ibp_preserve_leading_axis(
         &self,
         input: &BoundedTensor,
@@ -101,7 +99,7 @@ impl Default for LogSoftmaxLayer {
 
 /// Compute logsumexp with directed rounding in f64 along the given axis.
 /// Returns (logsumexp_upper, logsumexp_lower) where upper is rounded UP and lower DOWN.
-/// Ref: #3245 — f64 pipeline prevents intermediate f32 truncation errors.
+/// The f64 pipeline prevents intermediate f32 truncation errors.
 fn logsumexp_directed(input: &BoundedTensor, axis: usize) -> (ArrayD<f32>, ArrayD<f32>) {
     let max_upper = input
         .upper()
@@ -135,7 +133,7 @@ fn logsumexp_directed(input: &BoundedTensor, axis: usize) -> (ArrayD<f32>, Array
 /// Shared IBP implementation parameterized by resolved axis.
 impl LogSoftmaxLayer {
     fn propagate_ibp_with_axis(input: &BoundedTensor, axis: usize) -> Result<BoundedTensor> {
-        // Compute logsumexp with f64 directed rounding (#3245).
+        // Compute logsumexp with f64 directed rounding.
         let (lse_upper, lse_lower) = logsumexp_directed(input, axis);
         let lse_upper_expanded = lse_upper.insert_axis(Axis(axis));
         let lse_lower_expanded = lse_lower.insert_axis(Axis(axis));
@@ -182,7 +180,7 @@ impl LogSoftmaxLayer {
 
         // Repair non-finite outputs: logsumexp subtraction can produce Inf/NaN
         // from large finite inputs. Clamp to FALLBACK_BOUND for consistency
-        // with the IBP overflow strategy (#3030, #3060).
+        // with the IBP overflow strategy.
         BoundedTensor::new_repaired(lower, upper, RepairStrategy::Conservative)
     }
 }

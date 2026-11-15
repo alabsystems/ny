@@ -16,10 +16,12 @@ use ny_onnx::vnnlib::{OutputConstraint, VnnLibSpec};
 use ny_propagate::{
     layers::{LinearLayer, MaxPool2dLayer, ReshapeLayer},
     BabVerificationStatus, BetaCrownConfig, BetaCrownResult, BetaCrownVerifier, Layer as PropLayer,
-    Network,
+    Network, PgdCancelToken, PgdConfig,
 };
 use ny_tensor::BoundedTensor;
 
+use super::super::attack_concurrent::{self, ConcurrentAttackCtx, RacePlan, RaceSite};
+use super::super::verification_outcome::VerificationOutcome;
 use super::constraint_iter::{iterate_constraints, ConstraintIterConfig};
 use super::disjunctive_pgd::beta_crown_pgd_config;
 use super::phase_budget::PhaseBudgetLedger;
@@ -152,7 +154,48 @@ pub(super) fn verify_sequential_relational(
     gemm_engine: Option<&dyn GemmEngine>,
     json: bool,
     ledger: &PhaseBudgetLedger,
+    // #attack-concurrent: the dispatch's race context (`None` on every
+    // nested / test caller). Consulted only when `config.attack_concurrent`.
+    concurrent: Option<&ConcurrentAttackCtx<'_>>,
 ) -> Result<BetaCrownResult> {
+    verify_sequential_relational_outcome(
+        network,
+        input,
+        vnnlib,
+        config,
+        verifier,
+        pgd_attack,
+        pgd_restarts,
+        pgd_steps,
+        timeout,
+        gemm_engine,
+        json,
+        ledger,
+        false,
+        concurrent,
+    )?
+    .into_ordinary()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn verify_sequential_relational_outcome(
+    network: &Network,
+    input: &BoundedTensor,
+    vnnlib: &VnnLibSpec,
+    config: &BetaCrownConfig,
+    verifier: &BetaCrownVerifier,
+    pgd_attack: bool,
+    pgd_restarts: usize,
+    pgd_steps: usize,
+    timeout: u64,
+    gemm_engine: Option<&dyn GemmEngine>,
+    json: bool,
+    ledger: &PhaseBudgetLedger,
+    allow_instance_hull: bool,
+    // #attack-concurrent: the dispatch's race context (`None` on every
+    // nested / test caller). Consulted only when `config.attack_concurrent`.
+    concurrent: Option<&ConcurrentAttackCtx<'_>>,
+) -> Result<VerificationOutcome> {
     let aggregation = classify_constraints(vnnlib).aggregation;
     let is_disjunction = aggregation == AggregationMode::Disjunctive;
     let start_time = std::time::Instant::now();
@@ -166,13 +209,114 @@ pub(super) fn verify_sequential_relational(
     //
     // Single-clause disjunctions (output_constraint_clauses.len() <= 1) are
     // semantically conjunctive — all constraints in the single clause must hold
-    // simultaneously. PGD on the conjunctive interpretation is correct. (#3309)
+    // simultaneously. PGD on the conjunctive interpretation is correct.
     //
-    // Match the graph path's #3781 budget split: reserve 80% of the total timeout
+    // Match the graph path's budget split: reserve 80% of the total timeout
     // for reduced verification + BaB so expensive sequential PGD cannot consume
     // the whole wall-clock budget before verification begins.
     let is_single_clause = vnnlib.output_constraint_clauses.len() <= 1;
     if pgd_attack && (!is_disjunction || is_single_clause) {
+        // #attack-concurrent (dark; typed `attack.concurrent`): race this
+        // IDENTICAL attack against the proof below instead of running it
+        // first. With the key off this reads one bool; any admission refusal
+        // falls through to the serial code unchanged.
+        if config.attack_concurrent {
+            let site_start = std::time::Instant::now();
+            if let Some(admitted) = attack_concurrent::admit_site(
+                RaceSite::SeqUpfront,
+                concurrent,
+                // The attack and the proof run on the SAME handle here.
+                attack_concurrent::shared_device(gemm_engine, gemm_engine, false),
+                attack_concurrent::network_has_sign(network),
+                site_start,
+                pgd_deadline,
+                ledger.overall_deadline(),
+            ) {
+                let base = beta_crown_pgd_config(config, pgd_restarts, pgd_steps, pgd_deadline);
+                let attack = |token: PgdCancelToken, deadline: std::time::Instant| {
+                    let pgd = PgdConfig {
+                        deadline: Some(deadline),
+                        cancel: Some(token),
+                        ..base.clone()
+                    };
+                    // The serial site's own engine: admission refused an
+                    // accelerator (it would be the proof's too), so it is a
+                    // CPU handle (or `None`).
+                    super::pgd::try_conjunctive_pgd_attack_upfront_with_config(
+                        network,
+                        input,
+                        vnnlib,
+                        pgd,
+                        gemm_engine,
+                        json,
+                    )
+                };
+                // The reduced lane's post-inconclusive PGD repeats THIS attack
+                // (same classified attacker, same seed) and is bounded by the
+                // same upfront deadline the serial order had already spent; the
+                // race's own attack covers it, so the proof skips it.
+                //
+                // The race carries the proof's REPORT; a retained original-hull
+                // proof (origin's VerificationOutcome) is held aside and rides
+                // with the report only when the race returned the proof's own
+                // `Verified` (an attack candidate returned instead drops it,
+                // exactly as the serial order never reaches the hull after a
+                // PGD hit).
+                #[cfg(feature = "mip")]
+                let hull = std::cell::RefCell::new(None);
+                let proof = || {
+                    let outcome = verify_sequential_relational_proof(
+                        network,
+                        input,
+                        vnnlib,
+                        config,
+                        verifier,
+                        aggregation,
+                        false,
+                        pgd_restarts,
+                        pgd_steps,
+                        pgd_deadline,
+                        timeout,
+                        gemm_engine,
+                        json,
+                        ledger,
+                        start_time,
+                        allow_instance_hull,
+                    )?;
+                    #[cfg(feature = "mip")]
+                    {
+                        let (report, proof) = outcome.into_parts();
+                        *hull.borrow_mut() = proof;
+                        Ok(report)
+                    }
+                    #[cfg(not(feature = "mip"))]
+                    outcome.into_ordinary()
+                };
+                let report = attack_concurrent::run_race(
+                    RacePlan {
+                        site: RaceSite::SeqUpfront,
+                        window: admitted.window,
+                        site_start,
+                        slice_deadline: pgd_deadline.unwrap_or(site_start),
+                        overall_deadline: ledger.overall_deadline(),
+                        lane_start: start_time,
+                        publish: concurrent
+                            .map(|ctx| ctx.publish)
+                            .unwrap_or(&attack_concurrent::unarmed_publish),
+                    },
+                    admitted.pool,
+                    attack,
+                    proof,
+                )?;
+                #[cfg(feature = "mip")]
+                if let Some(proof) = hull.into_inner() {
+                    if matches!(report.result, BabVerificationStatus::Verified) {
+                        return Ok(VerificationOutcome::hull(report, proof));
+                    }
+                }
+                return Ok(VerificationOutcome::ordinary(report));
+            }
+        }
         let early_pgd = super::pgd::try_conjunctive_pgd_attack_upfront_with_config(
             network,
             input,
@@ -182,7 +326,7 @@ pub(super) fn verify_sequential_relational(
             json,
         )?;
         if let Some((counterexample, output)) = early_pgd {
-            return Ok(BetaCrownResult {
+            return Ok(VerificationOutcome::ordinary(BetaCrownResult {
                 result: BabVerificationStatus::Violated {
                     counterexample: counterexample.iter().copied().collect(),
                     output: output.iter().copied().collect(),
@@ -193,7 +337,134 @@ pub(super) fn verify_sequential_relational(
                 max_depth_reached: 0,
                 time_elapsed: start_time.elapsed(),
                 output_bounds: None,
-            });
+            }));
+        }
+    }
+
+    verify_sequential_relational_proof(
+        network,
+        input,
+        vnnlib,
+        config,
+        verifier,
+        aggregation,
+        pgd_attack,
+        pgd_restarts,
+        pgd_steps,
+        pgd_deadline,
+        timeout,
+        gemm_engine,
+        json,
+        ledger,
+        start_time,
+        allow_instance_hull,
+    )
+}
+
+/// The proof half of [`verify_sequential_relational`]: everything after the
+/// upfront attack, unchanged. #attack-concurrent extracted it so the serial
+/// path (after the attack) and the concurrent race (alongside it) run the
+/// IDENTICAL code under the identical ledger deadlines. `pgd_attack` reaches
+/// only the reduced lane's post-inconclusive PGD (see the race site).
+// Justification: the proof consumes the same independent inputs as the lane.
+#[allow(clippy::too_many_arguments)]
+fn verify_sequential_relational_proof(
+    network: &Network,
+    input: &BoundedTensor,
+    vnnlib: &VnnLibSpec,
+    config: &BetaCrownConfig,
+    verifier: &BetaCrownVerifier,
+    aggregation: AggregationMode,
+    pgd_attack: bool,
+    pgd_restarts: usize,
+    pgd_steps: usize,
+    pgd_deadline: Option<std::time::Instant>,
+    timeout: u64,
+    gemm_engine: Option<&dyn GemmEngine>,
+    json: bool,
+    ledger: &PhaseBudgetLedger,
+    start_time: std::time::Instant,
+    allow_instance_hull: bool,
+) -> Result<VerificationOutcome> {
+    #[cfg(not(feature = "mip"))]
+    let _ = allow_instance_hull;
+    let is_disjunction = aggregation == AggregationMode::Disjunctive;
+
+    // #hull-root / #hull-bab (wave-6 C4; dark unless `bab.single_hidden_hull`
+    // is armed): the CERTIFIED per-neuron hull — one root bound (`root`) or a
+    // best-first ReLU-split tree over the concave neurons (`bab`) — after the
+    // upfront attack and BEFORE the same-LHS reduction, whose input-split BaB
+    // would otherwise own the whole deadline. `Verified` only on a strictly
+    // positive closed-form certificate (for `bab`: on EVERY leaf); a decline
+    // or an undecided run falls through with whatever wall it did not spend
+    // (the reduction below re-derives its budget from the ledger's absolute
+    // deadline). The lane prints `[hull-root] armed ...` / `[hull-bab] armed
+    // ...` on every armed run.
+    #[cfg(feature = "mip")]
+    if config.single_hidden_hull.is_armed() {
+        if config.single_hidden_hull == ny_propagate::SingleHiddenHullMode::Root
+            && allow_instance_hull
+        {
+            let now = std::time::Instant::now();
+            let deadline =
+                super::super::single_hidden_hull::hull_root_deadline(now, ledger.remaining());
+            let deadline = ledger
+                .overall_deadline()
+                .map_or(deadline, |d| d.min(deadline));
+            if let Some(resources) = ledger.verification_resources() {
+                let context = resources.context(deadline);
+                match super::super::single_hidden_hull::resource::try_single_hidden_hull_root_in(
+                    config.single_hidden_hull, network, input, vnnlib, context.query(), start_time,
+                ) {
+                    Ok(checked) => {
+                        match super::super::hull_publication::HullPublicationProof::from_checked(checked, context) {
+                            Ok((report, proof)) => return Ok(VerificationOutcome::hull(report, proof)),
+                            Err(reason) => eprintln!("[hull-resource] publication_owner_refused reason={reason} legacy_fallback=unqualified"),
+                        }
+                    }
+                    Err(reason) => {
+                        eprintln!("[hull-resource] declined reason={reason} census=participating-hull-only legacy_fallback=unqualified");
+                        crate::flight::note("hull_resource", crate::flight::FlightStatus::Ran,
+                            Some(format!("outcome=declined reason={reason} census=participating-hull-only legacy_fallback=unqualified")));
+                    }
+                }
+            }
+            if ledger
+                .verification_resources()
+                .is_some_and(|owner| owner.is_cancelled())
+            {
+                return Ok(VerificationOutcome::ordinary(BetaCrownResult {
+                    result: BabVerificationStatus::Unknown {
+                        reason: "instance resource owner cancelled".to_owned(),
+                    },
+                    domains_explored: 0,
+                    domains_verified: 0,
+                    cuts_generated: 0,
+                    max_depth_reached: 0,
+                    time_elapsed: start_time.elapsed(),
+                    output_bounds: None,
+                }));
+            }
+            // Preserve AY LP/canonicalization and the same original Root slice.
+            if let Some(result) = super::super::single_hidden_hull::try_single_hidden_hull_root(
+                config.single_hidden_hull,
+                network,
+                input,
+                vnnlib,
+                deadline,
+                start_time,
+            ) {
+                return Ok(VerificationOutcome::ordinary(result));
+            }
+        } else if let Some(result) = super::super::single_hidden_hull::try_single_hidden_hull(
+            config.single_hidden_hull,
+            network,
+            input,
+            vnnlib,
+            ledger.remaining(),
+            start_time,
+        ) {
+            return Ok(VerificationOutcome::ordinary(result));
         }
     }
 
@@ -262,7 +533,7 @@ pub(super) fn verify_sequential_relational(
         if let Some(result) = reduced_result {
             match &result.result {
                 BabVerificationStatus::Verified | BabVerificationStatus::Violated { .. } => {
-                    return Ok(result);
+                    return Ok(VerificationOutcome::ordinary(result));
                 }
                 BabVerificationStatus::Unknown { .. } | BabVerificationStatus::Timeout
                     if reduction_applies =>
@@ -282,7 +553,7 @@ pub(super) fn verify_sequential_relational(
                             "\nReduced (max-diff) verification inconclusive; skipping per-constraint fallback (subsumed by max-diff for same-LHS conjunctions)."
                         );
                     }
-                    return Ok(result);
+                    return Ok(VerificationOutcome::ordinary(result));
                 }
                 _ => {
                     // Reduced verification returned Unknown/PotentialViolation —
@@ -307,7 +578,7 @@ pub(super) fn verify_sequential_relational(
     // when sub-second time remains (e.g., 0.999s → as_secs()=0 → false exhaust).
     let remaining_duration = ledger.remaining().unwrap_or(std::time::Duration::ZERO);
     if timeout > 0 && remaining_duration.is_zero() {
-        return Ok(BetaCrownResult {
+        return Ok(VerificationOutcome::ordinary(BetaCrownResult {
             result: BabVerificationStatus::Timeout,
             domains_explored: 0,
             domains_verified: 0,
@@ -315,7 +586,7 @@ pub(super) fn verify_sequential_relational(
             max_depth_reached: 0,
             time_elapsed: start_time.elapsed(),
             output_bounds: None,
-        });
+        }));
     }
     let remaining_timeout = if timeout == 0 {
         0 // unbounded
@@ -338,6 +609,7 @@ pub(super) fn verify_sequential_relational(
         json,
         ledger.bab_deadline(),
     )
+    .map(VerificationOutcome::ordinary)
 }
 
 /// Preserve one absolute authority for the reduced same-LHS engine call.
@@ -356,6 +628,31 @@ fn reduced_verification_deadline(
     } else {
         treatment_deadline
     }
+}
+
+/// Preserve the signed objective exactly while avoiding a singleton MaxPool.
+/// A 1x1 MaxPool is an identity, but its presence selects the sequential
+/// alpha-CROWN unsupported-layer fallback. Multiple rows still need the
+/// historical pointwise maximum, including its exact reshape layout.
+fn reduced_objective_networks(
+    network: &Network,
+    spec_weight: Array2<f32>,
+) -> Result<(Network, Network)> {
+    let k = spec_weight.nrows();
+    anyhow::ensure!(k > 0, "reduced verification requires a nonempty objective");
+    let mut truncated = network.clone();
+    truncated.add_layer(PropLayer::Linear(LinearLayer::new(spec_weight, None)?));
+    let mut augmented = truncated.clone();
+    if k > 1 {
+        augmented.add_layer(PropLayer::Reshape(ReshapeLayer::new(vec![1, 1, k as i64])));
+        augmented.add_layer(PropLayer::MaxPool2d(MaxPool2dLayer::new(
+            (1, k),
+            (1, k),
+            (0, 0),
+        )));
+        augmented.add_layer(PropLayer::Reshape(ReshapeLayer::new(vec![1])));
+    }
+    Ok((truncated, augmented))
 }
 
 /// Try reduced verification for common targeted-robustness properties.
@@ -432,18 +729,7 @@ fn try_reduced_verification(
     // maxpool tail. Its k outputs ARE the per-conjunct signed diffs whose
     // pointwise max is the max-diff objective — the joint-margin closer runs one
     // CROWN-with-linear pass on it per domain (see JointMarginCloser).
-    let mut truncated = network.clone();
-    truncated.add_layer(PropLayer::Linear(LinearLayer::new(spec_weight, None)?));
-
-    // Full max-diff net = signed-diff sub-net + [Reshape, MaxPool(1,k), Reshape].
-    let mut augmented = truncated.clone();
-    augmented.add_layer(PropLayer::Reshape(ReshapeLayer::new(vec![1, 1, k as i64])));
-    augmented.add_layer(PropLayer::MaxPool2d(MaxPool2dLayer::new(
-        (1, k),
-        (1, k),
-        (0, 0),
-    )));
-    augmented.add_layer(PropLayer::Reshape(ReshapeLayer::new(vec![1])));
+    let (truncated, augmented) = reduced_objective_networks(network, spec_weight)?;
 
     // JOINT-MARGIN closer (task #40): this legacy scalar fallback routes the
     // MaxPool lower relaxation through a single conjunct. The closer certifies
@@ -463,7 +749,7 @@ fn try_reduced_verification(
     // per-conjunct AFFINE bounds to express the x-coupling; here only the IBP
     // CONSTANTS are tight, and constants cannot couple. So the bottleneck is
     // per-conjunct affine looseness, not the aggregation — closing it needs
-    // alpha / crown-ibp per-conjunct bounds (contraindicated for acasxu, #3453),
+    // alpha / crown-ibp per-conjunct bounds (contraindicated for acasxu),
     // not this lever. Default-OFF makes the pipeline byte-identical to baseline;
     // the sound machinery + `NY_JOINT_MARGIN_DIAG` accounting are kept for
     // reproducibility and a future tight-affine integration.
@@ -509,6 +795,10 @@ fn try_reduced_verification(
     Ok(Some(reduced_result))
 }
 
+#[cfg(test)]
+#[path = "sequential_singleton_tail_tests.rs"]
+mod singleton_tail_tests;
+
 /// Verify sequential model with per-constraint verification.
 // Justification: Per-constraint verification iterates each constraint with the full
 // verification context — grouping into a struct would duplicate BetaCrownConfig.
@@ -528,7 +818,7 @@ fn verify_sequential_per_constraint(
     json: bool,
     deadline: Option<std::time::Instant>,
 ) -> Result<BetaCrownResult> {
-    // Use total constraint count (not just relational) since constants are now included (#1888)
+    // Use total constraint count (not just relational) since constants are now included
     let total_constraint_count = vnnlib.output_constraints.len();
     let is_disjunction = aggregation == AggregationMode::Disjunctive;
 
@@ -574,7 +864,7 @@ fn verify_sequential_per_constraint(
     // Note: conjunctive PGD attack was already run in verify_sequential_relational
     // (line 52-75) before reduced verification. The upfront attack now includes
     // a generic sampling+SPSA phase that checks random start points and intermediate
-    // steps against ALL constraints (#3209). Running it again here would duplicate
+    // steps against ALL constraints. Running it again here would duplicate
     // work with the same seed, so we skip straight to per-constraint BaB.
 
     let iter_config = ConstraintIterConfig {
@@ -593,7 +883,7 @@ fn verify_sequential_per_constraint(
     // Cross-validation closure: evaluate original (un-augmented) network at a
     // concrete counterexample input. When per-constraint BaB finds a counterexample
     // for constraint i, this checks if that same input satisfies ALL constraints —
-    // making it a joint counterexample proving the property VIOLATED. Part of #3209.
+    // making it a joint counterexample proving the property VIOLATED.
     let eval_original = |cx_input: &[f32]| -> Result<ndarray::ArrayD<f32>> {
         let point = ndarray::ArrayD::from_shape_vec(
             ndarray::IxDyn(input.lower().shape()),

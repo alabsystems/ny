@@ -32,11 +32,11 @@ pub(super) fn extract_scalar_constant_for_batched(
 /// Epsilon guard for division-by-zero in DivConstant CROWN relaxation.
 pub(super) const DIV_CONSTANT_EPS: f32 = 1e-10;
 
-/// Compute A @ c with f64 accumulation for soundness (#3157).
+/// Compute A @ c with f64 accumulation for soundness.
 ///
 /// f32 dot products lose precision through catastrophic cancellation on
 /// high-dimensional constants. This function promotes each element to f64
-/// before multiply-accumulate, matching the pattern in linear/bias.rs (#1863).
+/// before multiply-accumulate, matching the pattern in linear/bias.rs.
 ///
 /// Returns `(lower_accum, upper_accum)` as f64 arrays.
 pub(super) fn dot_bias_f64(
@@ -57,7 +57,7 @@ pub(super) fn dot_bias_f64(
     (lower_f64, upper_f64)
 }
 
-/// Compute scalar * sum(A, axis=1) with f64 accumulation for soundness (#3157).
+/// Compute scalar * sum(A, axis=1) with f64 accumulation for soundness.
 ///
 /// For scalar constants, A @ c_broadcast = c * sum(A, axis=1).
 /// The row sum accumulation benefits from f64 precision.

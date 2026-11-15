@@ -302,11 +302,21 @@ fn test_insert_shape_if_informative_filters_empty_names() {
     assert!(shapes.is_empty());
 }
 
+/// This used to pin the OPPOSITE: a zero-dim ORT report was recorded as the
+/// scalar `[]`. That is unsound, because ORT's C API reports zero dims both
+/// for a proven rank-0 tensor and for a tensor it could not type at all (rank
+/// unknown) — cctsdb `patch-1` tensor `362` is rank 4 at runtime and was
+/// recorded `[]`. A zero-dim report is now never recorded directly; only the
+/// rank probe (`resolve_zero_dim_ranks`) may record `[]`, once ORT proves rank
+/// 0. `ort_rank_probe_tests` pins both halves end to end.
 #[test]
-fn test_insert_shape_if_informative_accepts_scalar_shapes() {
+fn test_insert_shape_if_informative_defers_zero_dim_reports() {
     let mut shapes = HashMap::new();
-    insert_shape_if_informative(&mut shapes, "scalar", &[]);
-    assert_eq!(shapes.get("scalar").map(Vec::as_slice), Some([].as_slice()));
+    insert_shape_if_informative(&mut shapes, "scalar_or_untyped", &[]);
+    assert!(
+        shapes.is_empty(),
+        "a zero-dim report must not be recorded before the rank probe decides it: {shapes:?}"
+    );
 }
 
 #[test]

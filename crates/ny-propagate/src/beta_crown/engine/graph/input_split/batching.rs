@@ -4,7 +4,7 @@
 
 //! Reordered-BaB batch helpers for graph input splitting.
 //!
-//! Phase 2 of #3870: `compute_crown_or_ibp_bounds_batched` now uses rayon to
+//! The batched CROWN bound computation uses rayon to
 //! parallelize individual CROWN backward passes across CPU cores. The batch size
 //! cap limits how many domains are picked per DomainList iteration to control
 //! termination-check granularity and scheduling overhead — not to throttle CROWN
@@ -429,6 +429,8 @@ pub(super) fn try_adv_check_on_batch(
     seed_offset: u64,
     engine: Option<&dyn GemmEngine>,
 ) -> Result<Option<ViolationWitness>> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Attack);
     try_adv_check_on_input_bounds_batch(
         graph,
         domains.iter().map(|domain| domain.input_bounds.as_ref()),
@@ -486,6 +488,8 @@ pub(super) fn bound_deferred_domains_batch_with_metrics(
     metrics_sink: Option<&dyn GraphDomainBatchMetricsSink>,
     batch_index: usize,
 ) -> Result<()> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::ChildBound);
     let deferred_indices: Vec<usize> = domains
         .iter()
         .enumerate()
@@ -499,6 +503,37 @@ pub(super) fn bound_deferred_domains_batch_with_metrics(
     // cgan step-2C: snapshot warm-α candidates BEFORE the frozen passes below
     // consume/clear `node_bounds_override`. Empty unless
     // `input_split_alpha_iteration > 0` (byte-identical gate).
+    // #cgan-child-interm-refine: give each child its OWN intermediate map before
+    // the partition below, so the refined map rides the existing
+    // `node_bounds_override` route that both rebound paths already consume.
+    // Dark — and free, no collector work at all — unless the typed per-child
+    // budget is set. See `shared::child_interm_refine_alpha_config` for the
+    // soundness argument and the three fail-closed guards.
+    // #cgan-child-seed: the same prepass, optionally seeded from the root map
+    // and run in memory-admitted parallel tranches (both default-dark; the
+    // serial unseeded schedule is the historical loop call for call).
+    if let Some((refine_config, schedule)) =
+        super::child_seed::child_refine_plan(config, deadline, alpha_node_bounds)
+    {
+        let prepass_start = Instant::now();
+        let tally = super::shared::install_child_interm_refine_overrides_scheduled(
+            &refine_config,
+            graph,
+            engine,
+            alpha_node_bounds,
+            schedule,
+            &deferred_indices,
+            domains,
+        );
+        super::child_seed::report_batch(config, &tally, &schedule, prepass_start.elapsed());
+        tracing::info!(
+            installed = tally.installed,
+            merged_into_existing_override = tally.merged_into_existing_override,
+            declined = tally.declined,
+            "cgan child intermediate refinement prepass"
+        );
+    }
+
     let warm_candidates = warm_refine_candidates(
         config,
         &deferred_indices,
@@ -766,6 +801,66 @@ where
     // cgan step-2C: snapshot warm-α candidates BEFORE the frozen passes below
     // consume/clear `node_bounds_override`. Empty unless
     // `input_split_alpha_iteration > 0` (byte-identical gate).
+    // #cgan-child-interm-refine: give each child its OWN intermediate map before
+    // the partition below, so the refined map rides the existing
+    // `node_bounds_override` route that both rebound paths already consume.
+    // Dark — and free, no collector work at all — unless the typed per-child
+    // budget is set. See `shared::child_interm_refine_alpha_config` for the
+    // soundness argument and the three fail-closed guards.
+    // #cgan-child-seed: the same prepass, optionally seeded from the root map
+    // and run in memory-admitted parallel tranches (both default-dark; the
+    // serial unseeded schedule is the historical loop call for call).
+    let child_refine_plan =
+        super::child_seed::child_refine_plan(config, deadline, alpha_node_bounds);
+    // #cgan-child-seed (fresh_clip_map): keep the child-local map the override
+    // rebound consumes on the domain, for the fresh clip to take at pop. Only
+    // when the prepass ran AND the key is set; otherwise cleared as before.
+    let retain_map_for_fresh_clip =
+        super::child_seed::retain_map_for_fresh_clip(config, child_refine_plan.is_some());
+    if let Some((refine_config, schedule)) = child_refine_plan {
+        let prepass_start = Instant::now();
+        let tally = super::shared::install_child_interm_refine_overrides_scheduled(
+            &refine_config,
+            graph,
+            engine,
+            alpha_node_bounds,
+            schedule,
+            &deferred_indices,
+            domains,
+        );
+        super::child_seed::report_batch(config, &tally, &schedule, prepass_start.elapsed());
+        tracing::info!(
+            installed = tally.installed,
+            merged_into_existing_override = tally.merged_into_existing_override,
+            declined = tally.declined,
+            "cgan child intermediate refinement prepass"
+        );
+    }
+    // #cgan-child-zono: certified per-child zonotope intermediates (see
+    // `child_zono`). Dark — no work and no output — unless
+    // `bab.alpha_crown.cgan_child_zono_refresh.enabled` is set. It runs after
+    // the #cgan-child-seed prepass, so a refined override is one of the maps
+    // it intersects with. Its entries are merged shrink-only into an existing
+    // override here; every other child hands them to the batched rebound
+    // below as its own replacements for the shared root entries.
+    let child_zono = super::child_zono::run_child_zono_prepass(
+        config,
+        graph,
+        alpha_node_bounds,
+        deadline,
+        &deferred_indices,
+        domains,
+    );
+    if let Some(batch) = child_zono.as_ref() {
+        tracing::debug!(
+            installed = batch.tally().installed,
+            refused = batch.tally().refused(),
+            "cgan child zonotope prepass"
+        );
+    }
+    // The refreshed map also feeds this iteration's fresh exact-domain clip.
+    let retain_map_for_fresh_clip = retain_map_for_fresh_clip || child_zono.is_some();
+
     let warm_candidates = warm_refine_candidates(
         config,
         &deferred_indices,
@@ -800,22 +895,37 @@ where
             .iter()
             .map(|&idx| domains[idx].input_bounds.as_ref())
             .collect();
-        let batched_bounds =
-            GraphDomainBatchExecutor::execute_dense_specs(DenseSpecBatchRequest {
-                graph,
-                input_bounds_batch: &deferred_inputs,
-                spec_matrix,
-                engine,
-                alpha_node_bounds,
-                alpha_state,
-                mul_binary_alphas,
-                deadline,
-                crown_backward_layers,
-                ibp_enhancement: config.input_split_ibp_enhancement,
-                stacked_rebound: config.input_split_stacked_rebound,
-                nested_deadline: config.input_split_nested_deadline,
-            })?;
+        let request = DenseSpecBatchRequest {
+            graph,
+            input_bounds_batch: &deferred_inputs,
+            spec_matrix,
+            engine,
+            alpha_node_bounds,
+            alpha_state,
+            mul_binary_alphas,
+            deadline,
+            crown_backward_layers,
+            ibp_enhancement: config.input_split_ibp_enhancement,
+            stacked_rebound: config.input_split_stacked_rebound,
+            nested_deadline: config.input_split_nested_deadline,
+        };
+        // #cgan-child-zono: `None` whenever the key is dark (or no child was
+        // installed), which is the historical shared-map call exactly.
+        let zono_overrides = child_zono
+            .as_ref()
+            .and_then(|batch| batch.domain_overrides_for(&batched_indices, alpha_node_bounds));
+        let batched_bounds = match zono_overrides.as_deref() {
+            Some(overrides) => GraphDomainBatchExecutor::execute_dense_specs_with_domain_overrides(
+                request, overrides,
+            )?,
+            None => GraphDomainBatchExecutor::execute_dense_specs(request)?,
+        };
         batched_timing = Some(batched_bounds.rebound_timing.clone());
+        let zono_retained: Vec<usize> = if child_zono.is_some() {
+            batched_indices.clone()
+        } else {
+            Vec::new()
+        };
 
         for (domain_idx, (bounds, linear_bounds)) in batched_indices.into_iter().zip(
             batched_bounds
@@ -832,6 +942,16 @@ where
             domain.needs_bounding = false;
             domain.node_bounds_override = None;
             domain.priority = priority_fn(&domain.obj_bounds);
+        }
+        // #cgan-child-zono: keep each refreshed child's entries on the domain
+        // for this iteration's fresh clip, which merges them with the root map
+        // and fresh IBP. Dark: `zono_retained` is empty.
+        if let Some(batch) = child_zono.as_ref() {
+            for domain_idx in zono_retained {
+                if let Some(entries) = batch.entries_for(domain_idx) {
+                    domains[domain_idx].node_bounds_override = Some(Arc::clone(entries));
+                }
+            }
         }
     }
 
@@ -884,7 +1004,9 @@ where
         domain.obj_bounds = tighten_obj_lower_bounds(&domain.obj_bounds, obj_bounds);
         domain.linear_bounds = linear_bounds;
         domain.needs_bounding = false;
-        domain.node_bounds_override = None;
+        if !retain_map_for_fresh_clip {
+            domain.node_bounds_override = None;
+        }
         domain.priority = priority_fn(&domain.obj_bounds);
     }
 
@@ -1007,6 +1129,8 @@ pub(super) fn bound_deferred_multi_obj_domains_batch(
     metrics_sink: Option<&dyn GraphDomainBatchMetricsSink>,
     batch_index: usize,
 ) -> Result<DenseSpecReboundTiming> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::ChildBound);
     bound_deferred_dense_spec_domains_batch(
         domains,
         graph,
@@ -1043,6 +1167,8 @@ pub(super) fn bound_deferred_disjunctive_domains_batch(
     batch_index: usize,
     f64_tail_budget: Option<&super::f64_tail::F64TailRunBudget>,
 ) -> Result<DenseSpecReboundTiming> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::ChildBound);
     // #relational-bab lever 1 (config-gated, default OFF => byte-identical):
     // the collection-verify shortcut applies only when the rebound would use
     // per-domain-collected intermediates anyway (no shared alpha reference,

@@ -17,8 +17,6 @@
 //! - Fourth central moment: mu4(Y_i) = sum_j a_ij^4 * mu4(X_j)
 //!   + 3 * [Var(Y_i)^2 - sum_j a_ij^4 * Var(X_j)^2]
 //! - Excess kurtosis: gamma2 = sum_j a_ij^4 * Var_j^2 * kappa_j / Var(Y_i)^2
-//!
-//! Part of #3921 / #4249.
 
 use ndarray::{Array1, ArrayD, IxDyn};
 use ny_core::{NyError, Result};

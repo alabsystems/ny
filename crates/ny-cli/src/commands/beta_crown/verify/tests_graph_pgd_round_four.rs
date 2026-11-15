@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Graph PGD exact-gradient regression tests (#4274).
+//! Graph PGD exact-gradient regression tests.
 
 use super::*;
 use ndarray::{arr1, arr2};

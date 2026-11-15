@@ -144,7 +144,7 @@ impl BoundPropagation for ShrinkLayer {
                     candidates.push(lambd - bias); // linear side of +lambd
                 }
 
-                // NaN-propagating folds — see #2577.
+                // NaN-propagating folds.
                 (
                     candidates
                         .iter()
@@ -228,7 +228,7 @@ impl ShrinkLayer {
             // Shrink has discontinuities at ±lambd when bias ≠ lambd: the function
             // approaches -lambd + bias from the left at -lambd, and lambd - bias
             // from the right at +lambd. These interior extrema are not captured by
-            // the endpoint values fl, fu alone. Part of #3322.
+            // the endpoint values fl, fu alone.
             if l < -lambd && u > -lambd {
                 let f_at_neg_break = -lambd + bias;
                 fmax = nan_propagating_max(fmax, f_at_neg_break);
@@ -288,8 +288,8 @@ impl ShrinkLayer {
             LinearRelaxation::new(1.0, -bias, 1.0, -bias)
         } else if spans_neg && !spans_pos {
             // Case 4: l < -lambd, u in dead zone.
-            // Lower chord from (l, fl) to (u, 0) in f64. Part of #3313.
-            // Compute fmax/fmin in f64 to avoid f32 rounding (#3321).
+            // Lower chord from (l, fl) to (u, 0) in f64.
+            // Compute fmax/fmin in f64 to avoid f32 rounding.
             let l_f64 = l as f64;
             let u_f64 = u as f64;
             let bias_f64 = bias as f64;
@@ -301,7 +301,7 @@ impl ShrinkLayer {
             let us = 0.0;
             let ui = next_up_f32(fmax_f64 as f32);
 
-            // Use f64 fl for chord to match f64 reference (#3321).
+            // Use f64 fl for chord to match f64 reference.
             let chord_s_f64 = -fl_f64 / (u_f64 - l_f64);
             let chord_s = chord_s_f64 as f32;
             let (ls, li) = if chord_s <= 1.0 + f32::EPSILON && fl_f64 <= f32::EPSILON as f64 {
@@ -317,8 +317,8 @@ impl ShrinkLayer {
             LinearRelaxation::new(ls, li, us, ui)
         } else if !spans_neg && spans_pos {
             // Case 5: l in dead zone, u > lambd.
-            // Lower chord from (l, 0) to (u, fu) in f64. Part of #3313.
-            // Compute fmax/fmin in f64 to avoid f32 rounding (#3321).
+            // Lower chord from (l, 0) to (u, fu) in f64.
+            // Compute fmax/fmin in f64 to avoid f32 rounding.
             let l_f64 = l as f64;
             let u_f64 = u as f64;
             let bias_f64 = bias as f64;
@@ -330,7 +330,7 @@ impl ShrinkLayer {
             let us = 0.0;
             let ui = next_up_f32(fmax_f64 as f32);
 
-            // Use f64 fu for chord to match f64 reference (#3321).
+            // Use f64 fu for chord to match f64 reference.
             let chord_s_f64 = fu_f64 / (u_f64 - l_f64);
             let chord_s = chord_s_f64 as f32;
             let (ls, li) = if chord_s <= 1.0 + f32::EPSILON && fu_f64 <= f32::EPSILON as f64 {
@@ -340,7 +340,7 @@ impl ShrinkLayer {
                 // Breakpoint validity: chord must stay below function at +lambd.
                 // Dead zone gives 0 at lambd; pos piece approaches lambd - bias.
                 // When bias > lambd, the function dips below the chord line at
-                // the breakpoint discontinuity. Part of #3322.
+                // the breakpoint discontinuity.
                 let chord_at_pos_break = chord_s * lambd + chord_t;
                 let f_pos_break_f32 = lambd - bias;
                 if chord_at_pos_break <= f32::EPSILON
@@ -363,8 +363,8 @@ impl ShrinkLayer {
         } else {
             // Case 6: Spans both breakpoints.
             // Chord from (l, fl) to (u, fu) in f64 with separate directed
-            // rounding for upper vs lower intercept. Part of #3313.
-            // Compute fmax/fmin in f64 to avoid f32 rounding (#3321).
+            // rounding for upper vs lower intercept.
+            // Compute fmax/fmin in f64 to avoid f32 rounding.
             let l_f64 = l as f64;
             let u_f64 = u as f64;
             let bias_f64 = bias as f64;
@@ -387,7 +387,7 @@ impl ShrinkLayer {
             let f_at_neg_break = -lambd + bias;
             let f_at_pos_break = lambd - bias;
 
-            // Use f64-computed fl/fu for chord to match f64 reference (#3321).
+            // Use f64-computed fl/fu for chord to match f64 reference.
             let chord_s = if (u - l).abs() > f32::EPSILON {
                 let s = (fu_f64 - fl_f64) / (u_f64 - l_f64);
                 s as f32

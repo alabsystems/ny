@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Behavioral tests for Phase 1b (#2613): Graph engine CrownBounds/Patches support.
+//! Behavioral tests for Phase 1b: Graph engine CrownBounds/Patches support.
 //!
 //! These tests verify that the graph CROWN engine correctly takes the Patches
 //! fast-path for CNN DAGs (Conv2d -> ReLU -> Conv2d chains) and produces sound
@@ -222,7 +222,7 @@ fn test_graph_crown_conv2d_residual_skip_patches_to_dense() {
     }
 }
 
-/// #3550 regression: the residual Conv2d graph forces a checked Patches-to-Dense
+/// Regression: the residual Conv2d graph forces a checked Patches-to-Dense
 /// merge under batched CROWN, and zero budget must route that failure into the
 /// existing graph-level fallback provenance instead of surfacing `CpuMemoryExceeded`.
 #[ntest::timeout(120000)]
@@ -257,7 +257,7 @@ fn test_graph_batched_crown_conv2d_residual_zero_budget_falls_back_3550() {
     });
 }
 
-/// #4382 regression: graph CROWN on a residual Conv2d DAG should NOT
+/// Regression: graph CROWN on a residual Conv2d DAG should NOT
 /// record `graph_crown/utils.rs` as a densification site. The patches-native
 /// merge path at the Add node should keep both branches in Patches form.
 #[ntest::timeout(120000)]
@@ -280,7 +280,7 @@ fn test_graph_crown_conv2d_residual_no_utils_densification_4382() {
     );
 
     // The merge point (Add node) should NOT force densification in utils.rs.
-    // Before #4382, accumulate_crown_bounds_to_input called into_dense() on the
+    // Before the fix, accumulate_crown_bounds_to_input called into_dense() on the
     // second contribution, which would record utils.rs as a call site.
     // Normalize separators: `file!()` records `graph_crown\utils.rs` on Windows,
     // so a POSIX-only match filtered to EMPTY there and this `is_empty()`
@@ -297,7 +297,7 @@ fn test_graph_crown_conv2d_residual_no_utils_densification_4382() {
     );
 }
 
-/// #4382 regression: final bounds from patches-native merge at residual Add
+/// Regression: final bounds from patches-native merge at residual Add
 /// must match bounds from the old dense-merge path within directed-rounding
 /// slack. This verifies numerical equivalence — the optimization preserves
 /// correctness.
@@ -413,7 +413,7 @@ fn build_sub_residual_graph() -> (Conv2dLayer, GraphNetwork, BoundedTensor) {
     (conv1, graph, input)
 }
 
-/// #4382 regression: Sub residual graph (output = input - relu(conv(input)))
+/// Regression: Sub residual graph (output = input - relu(conv(input)))
 /// should also use patches-native merge and produce sound bounds.
 #[ntest::timeout(120000)]
 #[test]

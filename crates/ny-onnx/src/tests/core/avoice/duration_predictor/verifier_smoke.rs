@@ -6,7 +6,7 @@
 //!
 //! Graph construction and duration-range assertions for the duration
 //! predictor verifier smokes. Test functions live in the root
-//! `avoice/verifier_smoke.rs` entrypoint (#3950).
+//! `avoice/verifier_smoke.rs` entrypoint.
 
 use super::super::common;
 use super::proof_head::KOKORO_DURATION_BUCKETS;

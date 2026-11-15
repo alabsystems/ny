@@ -7,14 +7,23 @@
 //! Port of the verified Python reference (`core.py::RootTableau`): a forward
 //! tableau `A_l = M - D`, `A_u = M + D` over augmented input rows, frozen
 //! DeepPoly gates per trunk relu chosen from the concretized boxes. In
-//! [`RoundMode::Outward`] the `D` lane additionally ABSORBS a certified bound
-//! on every rounding committed so far (Higham `gamma_n` per conv + elementwise
-//! widening), the boxes are concretized outward, and the upper gate lines are
+//! [`RoundMode::Outward`] every op charges a certified bound on its own
+//! rounding (Higham `gamma_n` per conv, per-site bounds elsewhere) into the
+//! `D` lane's BIAS column, where the sign is known, so the sandwich encloses
+//! the stored network for every input sign (#root-rounding); the boxes are
+//! concretized outward, and the upper gate lines are
 //! REPAIRED so `s*y + c >= relu(y)` holds in real arithmetic on the certified
 //! box (checked at the three kink points; `c` is bumped up on any deficit).
 //!
 //! The tableau stops after the LAST trunk relu: the backward engine owns
 //! everything from there to the margin.
+//!
+//! #root-box-source (ENGINE_PROGRAM M5b): `margin_row.root_box_source:
+//! patch_backward` replaces this tableau as the source of the trunk boxes with
+//! a certified IBP reference plus a certified patch-backward pass over the
+//! reference-unstable neurons (`root_box.rs`). The declaration default
+//! `tableau` is this module's walk, unchanged; the dispatch is the one enum
+//! compare at the top of `build_retaining_inner`.
 
 use ndarray::Array2;
 use ny_core::{NyError, Result};
@@ -29,6 +38,11 @@ use super::rounding::{
     certify_up, f32_store_slack, gamma_n, gamma_n_f32, next_down, next_up, RoundMode,
     F32_MIN_POSITIVE, SUBNORMAL_F32, UNIT, UNIT_F32,
 };
+
+/// Completion authority minted only after this original unsplit builder has
+/// successfully constructed its actual gates. Sibling producers may consume
+/// the type, but cannot certify an arbitrary supplied root with its constructor.
+pub(super) struct CompletedOriginalRootAuthority(());
 
 // --------------------------------------------------------------------------
 //  #tableau-support-mask: exact column-block occupancy of the (M, D) tableau
@@ -238,9 +252,16 @@ pub struct ClipRows {
 /// also why the closure-adaptive policy does NOT list clip among its rungs: a
 /// mechanism whose prerequisite cannot be escalated mid-search would have to be
 /// bought up front on every row, and the measured effect does not pay for it.
+///
+/// DELIVERABILITY. This was env-only, and `vnncomp_scripts/run_instance.sh`
+/// exports exactly ONE `NY_*`, so on a scored run the third gate could never be
+/// opened and the whole Clip-and-Verify family was unreachable BY CONSTRUCTION.
+/// `margin_row.clip_rows` is the typed route; env still wins in both directions.
+/// Read per call rather than latched: retention happens once per root build, and
+/// a `OnceLock` would freeze whatever the FIRST build in the process saw —
+/// before the vnncomp preset bridge had run, or before a unit test's env scope.
 fn clip_rows_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(crate::preset_gates::margin_row_clip_rows_enabled)
+    crate::preset_gates::margin_row_clip_rows_enabled()
 }
 
 /// Exact execution evidence for one completed root-tableau precision walk.
@@ -263,7 +284,10 @@ pub struct RootPrecisionExecutionEvidence {
 }
 
 impl RootPrecisionExecutionEvidence {
-    fn completed(
+    /// `pub(super)` for `#root-box-source` (`root_box.rs`), whose
+    /// patch-backward walk reports the tableau's precision work it did not run
+    /// (zero ops, policy honoured); visibility only.
+    pub(super) fn completed(
         policy: super::RootPrecisionRuntimePolicy,
         mode: RoundMode,
         actual_root_f32: bool,
@@ -318,6 +342,9 @@ mod root_precision_evidence_tests {
         let policy = super::super::RootPrecisionRuntimePolicy {
             root_f32: true,
             tableau_f32: true,
+            err_lane: super::super::ErrLane::PerCol,
+            ibp_seed: false,
+            box_source: super::super::RootBoxSource::Tableau,
         };
         let armed = RootPrecisionExecutionEvidence::completed(
             policy,
@@ -339,6 +366,9 @@ mod root_precision_evidence_tests {
             super::super::RootPrecisionRuntimePolicy {
                 root_f32: false,
                 tableau_f32: true,
+                err_lane: super::super::ErrLane::PerCol,
+                ibp_seed: false,
+                box_source: super::super::RootBoxSource::Tableau,
             },
             RoundMode::Outward,
             false,
@@ -401,10 +431,44 @@ pub struct RootGates {
     pub(crate) root_precision_policy: super::RootPrecisionRuntimePolicy,
     /// Frozen precision configuration and completed root-walk counters.
     pub(crate) root_precision_execution: RootPrecisionExecutionEvidence,
+    /// #spec-alpha: per-START-NODE (spec) alpha policy, read at EXACTLY one
+    /// site (`bab::root_eval_impl`) and installed at exactly one site
+    /// (`margin_row/mod.rs`, after `#rebake` has finished with the root).
+    ///
+    /// `None` is the shipped state and makes the whole mechanism one `Option`
+    /// discriminant test per instance. Deliberately NOT `Default`, so the
+    /// compiler enumerates every `RootGates` literal -- including the epoch
+    /// child root, which must carry `None` so the axis fires once per instance
+    /// rather than once per epoch.
+    pub spec_alpha_policy: Option<super::spec_alpha::SpecAlphaPolicy>,
+    /// #head-alpha: lower slopes for the HEAD relu (the relu on the first head
+    /// Gemm's output `y`), one per head neuron, installed by the root alpha
+    /// ascent (`alpha_opt`). `None` is the shipped state: the binary area
+    /// heuristic of `bounds::head_gates`, bit-identically.
+    ///
+    /// Consumed ONLY through `bounds::head_gates_with`, and only where the
+    /// neuron is unstable in the y-box being evaluated (`ly < 0 < uy`); stable
+    /// neurons keep their exact lines. Any slope in `[0, 1]` is a valid lower
+    /// line `alpha * y <= relu(y)` for an unstable relu, whatever the box, so
+    /// the same vector is sound at the root and on every tree domain.
+    ///
+    /// Deliberately NOT `Default`, like `spec_alpha_policy`: every literal must
+    /// decide whether it carries the parent's head alpha.
+    pub head_alpha: Option<Vec<f64>>,
+    /// #root-eval-reuse (margin-row throughput plan B1(c)): stored
+    /// `bab::root_eval` results for THIS root, keyed on a content fingerprint
+    /// of every field `root_eval` reads (the gates generation). Performance
+    /// only — a hit is bit-identical to recomputing, a miss recomputes. Every
+    /// literal starts it EMPTY: a derived root (epoch child, rebake
+    /// candidate, interm scratch) never inherits another root's evaluation.
+    pub(crate) root_eval_memo: super::bab::RootEvalMemo,
+    /// Native unsplit outward construction provenance for the optional head
+    /// pass. Scratch and split frames have no authority; never imported.
+    pub(super) head_group_source: Option<super::head_group_source::RootSource>,
 }
 
 /// Retention policy for the Tier-0 tableau rows (#epoch-bab).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetainCfg {
     /// Max retained unstable neurons per trunk relu layer (top by
     /// `c * (u - l)`, the relaxation-slack split-worthiness score).
@@ -688,6 +752,10 @@ impl RootGates {
             super::RootPrecisionRuntimePolicy {
                 root_f32: use_f32,
                 tableau_f32: false,
+                err_lane: super::ErrLane::PerCol,
+                ibp_seed: false,
+                // #root-box-source: the precision oracles compare TABLEAU lanes.
+                box_source: super::RootBoxSource::Tableau,
             },
             super::BackwardIntermRuntimePolicy::default(),
             None,
@@ -721,6 +789,10 @@ impl RootGates {
             super::RootPrecisionRuntimePolicy {
                 root_f32: use_f32,
                 tableau_f32: store_f32,
+                err_lane: super::ErrLane::PerCol,
+                ibp_seed: false,
+                // #root-box-source: the storage oracles compare TABLEAU lanes.
+                box_source: super::RootBoxSource::Tableau,
             },
             super::BackwardIntermRuntimePolicy::default(),
             None,
@@ -754,6 +826,10 @@ impl RootGates {
             super::RootPrecisionRuntimePolicy {
                 root_f32: use_f32,
                 tableau_f32: store_f32,
+                err_lane: super::ErrLane::PerCol,
+                ibp_seed: false,
+                // #root-box-source: the storage oracles compare TABLEAU lanes.
+                box_source: super::RootBoxSource::Tableau,
             },
             super::BackwardIntermRuntimePolicy::default(),
             None,
@@ -781,6 +857,65 @@ impl RootGates {
             None,
             &[],
             super::RootPrecisionRuntimePolicy::default(),
+            super::BackwardIntermRuntimePolicy::from_config(bi),
+            None,
+        )
+    }
+
+    /// #mr-ibp-seed: build with an EXPLICIT seed flag, bypassing the preset /
+    /// env gate (`margin_row.ibp_seed`), on the default f64 lane with no
+    /// backward-interm phase and no retention. The containment oracles' entry:
+    /// the unit tests here and the real-ONNX gates in ny-cli, which must arm
+    /// and disarm the seed deterministically inside one process. `ibp_seed:
+    /// false` is the dark lane, bit-identical to [`Self::build_prec`] with
+    /// `use_f32 = false`.
+    pub fn build_ibp_seeded(
+        net: &TwinNet,
+        lo: &[f64],
+        hi: &[f64],
+        mode: RoundMode,
+        deadline: Option<Instant>,
+        ibp_seed: bool,
+    ) -> Result<Self> {
+        Ok(Self::build_retaining_inner(
+            net,
+            lo,
+            hi,
+            mode,
+            deadline,
+            None,
+            &[],
+            super::RootPrecisionRuntimePolicy {
+                ibp_seed,
+                ..super::RootPrecisionRuntimePolicy::default()
+            },
+            super::BackwardIntermRuntimePolicy::default(),
+            None,
+        )?
+        .0)
+    }
+
+    /// Test entry with an EXPLICIT precision policy (the `#mr-ibp-seed` flag
+    /// included) and an EXPLICIT backward-interm config, bypassing every env
+    /// gate so unit tests are order-independent of process environment.
+    #[cfg(test)]
+    pub(crate) fn build_with_policy_for_test(
+        net: &TwinNet,
+        lo: &[f64],
+        hi: &[f64],
+        mode: RoundMode,
+        precision_policy: super::RootPrecisionRuntimePolicy,
+        bi: Option<super::backward_interm::BiCfg>,
+    ) -> Result<(Self, Option<RetainedRows>)> {
+        Self::build_retaining_inner(
+            net,
+            lo,
+            hi,
+            mode,
+            None,
+            None,
+            &[],
+            precision_policy,
             super::BackwardIntermRuntimePolicy::from_config(bi),
             None,
         )
@@ -836,6 +971,7 @@ impl RootGates {
         splits: &[(usize, usize, i8)],
         precision_policy: super::RootPrecisionRuntimePolicy,
         backward_interm_policy: super::BackwardIntermRuntimePolicy,
+        alpha_seed: Option<&[Vec<f64>]>,
     ) -> Result<(Self, Option<RetainedRows>)> {
         Self::build_retaining_inner(
             net,
@@ -847,7 +983,7 @@ impl RootGates {
             splits,
             precision_policy,
             backward_interm_policy,
-            None,
+            alpha_seed,
         )
     }
 
@@ -893,16 +1029,23 @@ impl RootGates {
         )
     }
 
-    /// Full build implementation with an EXPLICIT f32-fast-path flag
-    /// (`NY_MARGIN_ROW_ROOT_F32`) and an EXPLICIT `#tableau-f32` storage flag
-    /// (`NY_MARGIN_ROW_TABLEAU_F32`). `use_f32` only takes effect in
-    /// [`RoundMode::Outward`]; when off, every bound is bit-identical to the
-    /// pure-f64 lane (epoch-bab retention/splits included). When on, the two
-    /// bandwidth-bound forward-conv lanes (M and D) run in f32 and the
-    /// per-tensor certified error accumulator `g_err[j]` is threaded through
-    /// each op and consumed as a pure additive concretize slack. `store_f32`
-    /// additionally stores the walk state in f32 (`#tableau-f32` block above);
-    /// it is REFUSED — loudly — unless `use_f32` is effective.
+    /// Every root build's single entry: the box-source dispatch
+    /// (`#root-box-source`, ENGINE_PROGRAM M5b), then the tableau build.
+    ///
+    /// `precision_policy.box_source` is `Tableau` (the declaration default) on
+    /// every build no one armed: the branch below is then one enum compare and
+    /// the build IS [`Self::build_tableau`] with the same arguments, bit for
+    /// bit. Armed (`PatchBackward`), the certified patch-backward source
+    /// (`root_box.rs`) builds the root instead, with two fail-closed exits
+    /// that both run the unchanged tableau build with the same arguments:
+    ///
+    /// * a REFUSAL, before the source runs, when the build requests a tableau
+    ///   product the source cannot produce (`#clip-rows` retention, Tier-0
+    ///   retained rows, the `root_f32` / `tableau_f32` kernels —
+    ///   [`super::root_box::PatchBackwardConflicts`]); it prints `[root-box]
+    ///   refused reason=` instead of silently dropping the product;
+    /// * a DECLINE (Parity mode, a non-finite reference box, two certified
+    ///   enclosures that crossed), which prints why.
     #[allow(clippy::too_many_arguments)]
     fn build_retaining_inner(
         net: &TwinNet,
@@ -916,6 +1059,173 @@ impl RootGates {
         bi_policy: super::BackwardIntermRuntimePolicy,
         alpha_seed: Option<&[Vec<f64>]>,
     ) -> Result<(Self, Option<RetainedRows>)> {
+        // Qualification precedes either source backend and its worker
+        // arithmetic. Attach the private generation only after a completed
+        // successful build; the dark policy does no hashing or FP probing.
+        // Patch and envelope producers retain separate error arithmetic.
+        // They cannot supply the absolute-underflow-qualified source for the
+        // joint head functional. A declined source affects only that optional
+        // refinement and preserves the existing root build.
+        let source = if precision_policy.box_source == super::RootBoxSource::Tableau
+            && !matches!(
+                precision_policy.err_lane,
+                super::errlane::ErrLane::Envelope | super::errlane::ErrLane::PerChannel
+            )
+            && !(bi_policy.enabled && bi_policy.patch.cfg().is_some())
+        {
+            super::head_group_source::RootSource::begin(net, lo, hi, mode, splits)
+        } else {
+            None
+        };
+        let (mut root, retained) = Self::build_retaining_inner_body(
+            net,
+            lo,
+            hi,
+            mode,
+            deadline,
+            retain,
+            splits,
+            precision_policy,
+            bi_policy,
+            alpha_seed,
+        )?;
+        if let Some(source) = source.as_ref() {
+            // New input-row consumers require the successful original gate
+            // generation, not merely shape-valid subsequently supplied gates.
+            // A failed bounded snapshot leaves those consumers unauthenticated
+            // while preserving the existing optional head-source semantics.
+            source.complete_input_rows(&root, deadline, CompletedOriginalRootAuthority(()));
+        }
+        root.head_group_source = source;
+        Ok((root, retained))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_retaining_inner_body(
+        net: &TwinNet,
+        lo: &[f64],
+        hi: &[f64],
+        mode: RoundMode,
+        deadline: Option<Instant>,
+        retain: Option<&RetainCfg>,
+        splits: &[(usize, usize, i8)],
+        precision_policy: super::RootPrecisionRuntimePolicy,
+        bi_policy: super::BackwardIntermRuntimePolicy,
+        alpha_seed: Option<&[Vec<f64>]>,
+    ) -> Result<(Self, Option<RetainedRows>)> {
+        if precision_policy.box_source == super::RootBoxSource::PatchBackward {
+            // Read exactly what the tableau walk below would read: the same
+            // `#clip-rows` gate (per call, like the walk), the same `retain`,
+            // the same precision policy.
+            let conflicts = super::root_box::PatchBackwardConflicts {
+                clip_rows: clip_rows_enabled(),
+                retain: retain.is_some(),
+                root_f32: precision_policy.root_f32,
+                tableau_f32: precision_policy.tableau_f32,
+            };
+            if conflicts.any() {
+                let tableau_t0 = Instant::now();
+                let out = Self::build_tableau(
+                    net,
+                    lo,
+                    hi,
+                    mode,
+                    deadline,
+                    retain,
+                    splits,
+                    precision_policy,
+                    bi_policy,
+                    alpha_seed,
+                );
+                super::root_box::report_refused(
+                    conflicts,
+                    tableau_t0.elapsed().as_secs_f64(),
+                    out.is_ok(),
+                );
+                return out;
+            }
+            let declined = match super::root_box::try_build(
+                net,
+                lo,
+                hi,
+                mode,
+                deadline,
+                retain,
+                splits,
+                precision_policy,
+                bi_policy,
+                alpha_seed,
+            ) {
+                super::root_box::Attempt::Built(out) => return *out,
+                super::root_box::Attempt::Declined(declined) => declined,
+            };
+            let tableau_t0 = Instant::now();
+            let out = Self::build_tableau(
+                net,
+                lo,
+                hi,
+                mode,
+                deadline,
+                retain,
+                splits,
+                precision_policy,
+                bi_policy,
+                alpha_seed,
+            );
+            super::root_box::report_declined(
+                &declined,
+                tableau_t0.elapsed().as_secs_f64(),
+                out.is_ok(),
+            );
+            return out;
+        }
+        Self::build_tableau(
+            net,
+            lo,
+            hi,
+            mode,
+            deadline,
+            retain,
+            splits,
+            precision_policy,
+            bi_policy,
+            alpha_seed,
+        )
+    }
+
+    /// Full TABLEAU build implementation with an EXPLICIT f32-fast-path flag
+    /// (`NY_MARGIN_ROW_ROOT_F32`) and an EXPLICIT `#tableau-f32` storage flag
+    /// (`NY_MARGIN_ROW_TABLEAU_F32`). `use_f32` only takes effect in
+    /// [`RoundMode::Outward`]; when off, every bound is bit-identical to the
+    /// pure-f64 lane (epoch-bab retention/splits included). When on, the two
+    /// bandwidth-bound forward-conv lanes (M and D) run in f32 and the
+    /// per-tensor certified error accumulator `g_err[j]` is threaded through
+    /// each op and consumed as a pure additive concretize slack. `store_f32`
+    /// additionally stores the walk state in f32 (`#tableau-f32` block above);
+    /// it is REFUSED — loudly — unless `use_f32` is effective.
+    #[allow(clippy::too_many_arguments)]
+    fn build_tableau(
+        net: &TwinNet,
+        lo: &[f64],
+        hi: &[f64],
+        mode: RoundMode,
+        deadline: Option<Instant>,
+        retain: Option<&RetainCfg>,
+        splits: &[(usize, usize, i8)],
+        precision_policy: super::RootPrecisionRuntimePolicy,
+        bi_policy: super::BackwardIntermRuntimePolicy,
+        alpha_seed: Option<&[Vec<f64>]>,
+    ) -> Result<(Self, Option<RetainedRows>)> {
+        // Source-aware compilation may admit a wide patch-only net. Every
+        // parity/conflict/reference/crossing fallback still passes THIS guard
+        // before any full forward tableau allocation; refusal leaves the
+        // complete verifier fallback available with its remaining budget.
+        if !net.root_tableau_within_cap() {
+            return Err(NyError::InvalidSpec(
+                "margin_row: root tableau exceeds original entry cap; patch-only fallback refused"
+                    .into(),
+            ));
+        }
         // f32 lanes + the certified error slack are only meaningful in the
         // certified-outward verdict mode.
         let use_f32 = precision_policy.root_f32 && mode.outward();
@@ -1080,6 +1390,11 @@ impl RootGates {
         // columns, 1.0 on the bias column). Constant across the tableau; scales
         // the per-conv f32 FTZ/subnormal absolute floor in the g_err accumulator.
         let s_xabs: f64 = next_up(xabs.iter().sum::<f64>() + 1.0);
+        // #root-rounding: gradual-underflow floor of every sign-safe rounding
+        // charge, and the TEST-ONLY switch back to the historical
+        // coefficient-column charge (always `false` outside `cfg(test)`).
+        let round_floor = root_round_floor(&xabs_ext);
+        let legacy_round = legacy_rounding_forced();
 
         // Consumer counts over the processed prefix (up to last trunk relu).
         let last_relu = *net.trunk_relus.last().expect("validated: non-empty");
@@ -1101,6 +1416,25 @@ impl RootGates {
                 }
             }
         }
+        // #fold-ball: certified per-tensor magnitudes for the sign-safe relative
+        // fold charge — `Some` only in Outward mode on a walk that folds a
+        // nonzero `weight_rel_err` / `scale_rel_err` (see `FoldMag`); `None`
+        // keeps every historical expression and value.
+        let mut fold_mag = FoldMag::new(net, last_relu, mode, &consumers, &xabs);
+        // #mr-ibp-seed: the certified interval state carried beside the tableau
+        // (`ibp_seed.rs`). `None` unless `margin_row.ibp_seed` is armed on this
+        // root's frozen precision policy — the dark walk is byte-identical and
+        // silent. Armed but declined (residual trunk, Parity, RSS) it prints
+        // `declined=<reason>` per layer and intersects nothing.
+        let mut ibp = super::ibp_seed::IbpSeed::new(
+            net,
+            last_relu,
+            mode,
+            &consumers,
+            lo,
+            hi,
+            precision_policy.ibp_seed,
+        );
 
         // Identity tableau at the input (1.0/0.0 are exact in both widths).
         let mut m0 = Array2::<T>::from_elem((n_in, naug), T::ZERO);
@@ -1135,13 +1469,43 @@ impl RootGates {
         // concretizes a box and deliberately does not publish another tableau.
         let mut completed_conv_ops = 0usize;
         let mut completed_store_ops = 0usize;
-        // #backward-interm: only on the ROOT build (`splits.is_empty()`) —
-        // Tier-2 epoch rebuilds must not re-spend the budget mid-search — and
-        // only in outward mode. The state exists even while disabled so the
-        // terminal receipt can prove that a kill-switch suppressed an
-        // otherwise eligible phase without running a pass.
+        // #epoch-carry: BI runs on the ROOT build and, when the caller asks for
+        // it, inside a Tier-2 epoch rebuild too.
+        //
+        // The gate used to be `splits.is_empty()`, which excluded EVERY epoch
+        // rebuild by construction — and that is why arming `NY_EPOCH_DEPTH`
+        // measured as a bound REGRESSION: the epoch re-entered idx_4169 at
+        // -0.389998 against its own parent's -0.371373 on a strict SUBSET of the
+        // box, which is impossible for a sound tightening, because
+        // `build_retaining` discarded 584 `#backward-interm`-tightened columns.
+        //
+        // The caller now decides, by handing in a policy whose `enabled` it
+        // actually means. `try_epoch` passed `BackwardIntermRuntimePolicy::default()`
+        // (enabled: false), so lifting this gate alone would have changed nothing
+        // — and would have reported `enabled=true` with every counter at zero,
+        // which reads as armed while running nothing. Both had to move together.
+        // NOTE the disjunction. On the ROOT (`splits.is_empty()`) the state is
+        // created even when the policy is DISABLED, because the terminal receipt
+        // must be able to prove a kill-switch suppressed an otherwise eligible
+        // phase without running a pass — dropping that would destroy the
+        // evidence path. Inside an epoch the state is created only when the
+        // caller actually armed BI.
+        // MEASURED 2026-08-30 (docs/EPOCH_CARRY_2026-08-30.md): re-running BI
+        // inside an epoch is UNAFFORDABLE. At depth 4 — the only trigger depth
+        // these rows reach — one epoch attempt consumed the whole remaining wall
+        // and cost the outer tree ~160 expansions (271 -> 111), with closure
+        // still 0.000; at depth >= 8 the epoch never fires at all. The original
+        // guard ("Tier-2 epoch rebuilds must not re-spend the budget mid-search")
+        // was a COST decision, not an oversight, and it is restored here.
+        //
+        // The cheap half of #epoch-carry is KEPT: `try_epoch` still seeds the
+        // rebuild with the root's optimised alpha, so an epoch no longer
+        // re-derives the `gates_from_box` area heuristic.
         let mut bi_state = if splits.is_empty() && mode.outward() {
-            Some(super::backward_interm::BiState::new(bi_policy, deadline))
+            Some(
+                super::backward_interm::BiState::new(bi_policy, deadline)
+                    .with_err_lane(precision_policy.err_lane),
+            )
         } else {
             None
         };
@@ -1182,6 +1546,11 @@ impl RootGates {
                 }
             }
             let op_t0 = Instant::now();
+            // #mr-ibp-seed: advance the interval state over this op (a ReLU's
+            // output is set later, from its FINAL published box).
+            if let Some(seed) = ibp.as_mut() {
+                seed.forward(net, k, op);
+            }
             let take = |st: &mut Vec<Option<(Array2<T>, Array2<T>, Vec<f64>, Vec<u64>)>>,
                         cons: &mut Vec<usize>,
                         id: usize|
@@ -1229,16 +1598,71 @@ impl RootGates {
                     let mut do_ = Array2::<T>::from_elem((n_out, naug), T::ZERO);
                     // g_err accumulation for the f32 fast path (see conv_f32_gerr
                     // doc): g_err_out = conv_abs(g_err_in + gamma_f32 * B) + FTZ
-                    // floor, with B[t] = sum_i (|mi_ti| + din_ti) * xabs_ext_i.
-                    // Needs `din`, so compute it here and reuse for the D lane.
+                    // floor, with B[t] = sum_i (|mi_ti| + |din_ti|) * xabs_ext_i
+                    // (`din` is the D lane the conv consumes: `di` itself on the
+                    // #root-rounding path, the widened one on the legacy path).
                     let mut gerr_out: Vec<f64> = Vec::new();
-                    if mode.outward() {
+                    // #fold-ball: when the walk tracks certified magnitudes (some
+                    // op carries a RELATIVE fold error), this conv's
+                    // `weight_rel_err` is charged SIGN-SAFELY into the D BIAS
+                    // column (`FoldMag` docs) and `rel_d` below is 0; otherwise
+                    // every relative fold error is 0 (outside the TEST-ONLY
+                    // legacy switch, which runs the whole pre-repair walk).
+                    let conv_fold = match fold_mag.as_ref() {
+                        Some(fm) => Some(conv_fold_ball(c, fm.get(c.input)?, n_out)),
+                        None => None,
+                    };
+                    if mode.outward() && !legacy_round {
+                        // #root-rounding: NO coefficient-column widening. The M
+                        // and D lanes are the plain products `W M`, `|W| D`, and
+                        // their rounding is charged SIGN-SAFELY into the D bias
+                        // column (#root-rounding block comment):
+                        // `E_o = g sum_t |W_ot| sum_i (|M_ti| + |D_ti|) xabs_ext_i`.
+                        // On the f32 compute lane `conv_f32_gerr` already charges
+                        // both lanes' error against exact arithmetic into `g_err`
+                        // (the same sign-safe account), so `E` is added only on
+                        // the f64 lane — or if a relative fold error reached this
+                        // conv, which the walk's invariant forbids (`FoldMag` is
+                        // `Some` whenever one exists outside the legacy switch)
+                        // but which `g` would still charge soundly.
+                        let rel_d = if conv_fold.is_some() {
+                            0.0
+                        } else {
+                            c.weight_rel_err
+                        };
+                        let g =
+                            next_up(gamma_n(c.k_fwd + 2) + rel_d + gamma_n(c.k_fwd + 2) * rel_d);
+                        if use_f32 {
+                            gerr_out = conv_f32_gerr(
+                                c,
+                                &mi,
+                                &di,
+                                &gerr_in,
+                                &xabs,
+                                s_xabs,
+                                n_in,
+                                if use_mask { Some(&smask_in) } else { None },
+                                blk,
+                                T::F32_STORE,
+                            );
+                        }
+                        T::conv_forward_masked(c, &di, &mut do_, true, use_f32, cmask);
+                        if !use_f32 || rel_d != 0.0 {
+                            let e =
+                                conv_round_charge(c, &mi, &di, &xabs, n_in, n_out, g, round_floor);
+                            charge_bias_column(&mut do_, &e, n_in, &mut gerr_out);
+                        }
+                    } else if mode.outward() {
+                        // HISTORICAL coefficient-column charge (TEST-ONLY legacy
+                        // switch, `with_legacy_rounding_charge_for_test`).
                         // D input absorbs the M-product error: Din = D + g(|M| + D).
-                        let g = next_up(
-                            gamma_n(c.k_fwd + 2)
-                                + c.weight_rel_err
-                                + gamma_n(c.k_fwd + 2) * c.weight_rel_err,
-                        );
+                        let rel_d = if conv_fold.is_some() {
+                            0.0
+                        } else {
+                            c.weight_rel_err
+                        };
+                        let g =
+                            next_up(gamma_n(c.k_fwd + 2) + rel_d + gamma_n(c.k_fwd + 2) * rel_d);
                         let mut din = Array2::<T>::from_elem(mi.raw_dim(), T::ZERO);
                         // Masked-out columns have `m == d == 0.0`, so the exact
                         // result is `0.0` and the zeroed `din` already holds it.
@@ -1278,17 +1702,26 @@ impl RootGates {
                     // D bias widening (stored UP, class (b)) AND its storage
                     // dust into g_err (bias-column weight 1.0).
                     let p = c.oshape.1 * c.oshape.2;
+                    // #fold-ball: the sign-safe relative-fold charge rides in the
+                    // per-channel bias error (bias column, weight 1 > 0).
+                    let bias_err: &[f64] = conv_fold
+                        .as_ref()
+                        .map_or(c.bias_err.as_slice(), |f| f.bias_err.as_slice());
                     conv_bias_fold(
                         &mut mo,
                         &mut do_,
                         &c.bias,
-                        &c.bias_err,
+                        bias_err,
                         p,
                         n_in,
                         mode,
                         &mut gerr_out,
                     );
                     state[k + 1] = Some((mo, do_, gerr_out, smask_out));
+                    if let (Some(fm), Some(f)) = (fold_mag.as_mut(), conv_fold) {
+                        fm.set(k + 1, f.mag_out);
+                        fm.release(c.input);
+                    }
                     completed_conv_ops += 1;
                     completed_store_ops += 1;
                 }
@@ -1325,11 +1758,22 @@ impl RootGates {
                         Vec::new()
                     };
                     state[k + 1] = Some((mo, do_, gerr_out, smask_out));
+                    if let Some(fm) = fold_mag.as_mut() {
+                        let sum = fold_mag_add(fm.get(*lhs)?, fm.get(*rhs)?);
+                        fm.set(k + 1, sum);
+                        fm.release(*lhs);
+                        fm.release(*rhs);
+                    }
                     completed_store_ops += 1;
                 }
                 TwinOp::Flatten { input } => {
                     let (mi, di, gi, si, _) = take(&mut state, &mut consumers, *input)?;
                     state[k + 1] = Some((mi, di, gi, si));
+                    if let Some(fm) = fold_mag.as_mut() {
+                        let same = fm.get(*input)?.to_vec();
+                        fm.set(k + 1, same);
+                        fm.release(*input);
+                    }
                 }
                 TwinOp::ChannelAffine {
                     input,
@@ -1351,13 +1795,31 @@ impl RootGates {
                     } else {
                         Vec::new()
                     };
+                    // #fold-ball: with magnitudes tracked, the RELATIVE scale
+                    // error moves out of the coefficient charge into the
+                    // per-neuron shift error (bias column, sign-safe); without
+                    // them every `scale_rel_err` is 0 and nothing changes.
+                    let affine_fold = match fold_mag.as_ref() {
+                        Some(fm) => Some(affine_fold_ball(
+                            scale,
+                            shift,
+                            *scale_rel_err,
+                            shift_err,
+                            fm.get(*input)?,
+                        )?),
+                        None => None,
+                    };
+                    let (scale_rel_d, shift_err_d): (f64, &[f64]) = match affine_fold.as_ref() {
+                        Some(f) => (0.0, f.shift_err.as_slice()),
+                        None => (*scale_rel_err, shift_err.as_slice()),
+                    };
                     let gstore = chaffine_op(
                         &mut mi,
                         &mut di,
                         scale,
                         shift,
-                        *scale_rel_err,
-                        shift_err,
+                        scale_rel_d,
+                        shift_err_d,
                         n_in,
                         mode,
                         if use_mask { Some(&smask_in) } else { None },
@@ -1392,6 +1854,10 @@ impl RootGates {
                         Vec::new()
                     };
                     state[k + 1] = Some((mi, di, gerr_out, smask_out));
+                    if let (Some(fm), Some(f)) = (fold_mag.as_mut(), affine_fold) {
+                        fm.set(k + 1, f.mag_out);
+                        fm.release(*input);
+                    }
                     completed_store_ops += 1;
                 }
                 TwinOp::Relu { input, layer } => {
@@ -1428,10 +1894,44 @@ impl RootGates {
                     // under-recovers the line's certified slack (it can go
                     // negative and clamp to 0), and a halfspace paying too
                     // little slack cuts into the true subdomain — a
-                    // false-`unsat` generator. Cloned only when both the
-                    // tightener and retention are live.
-                    let bi_cal =
-                        (bi_policy.enabled && clip_rows_enabled()).then(|| (l.clone(), u.clone()));
+                    // false-`unsat` generator. Cloned only when a tightener
+                    // (#backward-interm or an ACTIVE #mr-ibp-seed) and retention
+                    // are both live; dark, the condition is the historical
+                    // `bi_policy.enabled && clip_rows_enabled()` verbatim.
+                    //
+                    // #mr-ibp-seed ORDERING (the reason this capture comes
+                    // FIRST): the IBP intersection below is a second shrink-only
+                    // tightener with exactly the trap described above, so it
+                    // must run AFTER this capture, never before it. The
+                    // TEST-ONLY mutation switch `with_bi_cal_after_seed_for_test`
+                    // moves the capture after the seed so
+                    // `ibp_seed_keeps_bi_cal_on_forward_only_lines` can prove it
+                    // detects that defect; it is a constant `false` outside
+                    // `cfg(test)`.
+                    let seed_live = ibp.as_ref().is_some_and(super::ibp_seed::IbpSeed::active);
+                    let cal_wanted = (bi_policy.enabled || seed_live) && clip_rows_enabled();
+                    let cal_late = bi_cal_after_seed_forced();
+                    let mut bi_cal = (cal_wanted && !cal_late).then(|| (l.clone(), u.clone()));
+                    // #mr-ibp-seed: shrink-only intersection with the layer's
+                    // certified IBP box (`ibp_seed.rs`), BEFORE #backward-interm.
+                    // Why before: `tighten_layer`'s contract is only that the
+                    // box handed in is a valid enclosure — it selects the
+                    // unstable neurons FROM that box and intersects its own
+                    // backward enclosure shrink-only — so seeding first is
+                    // sound and makes it walk fewer (IBP-stabilized) neurons,
+                    // the throughput miss on eps8 wide rows (3144w built no root
+                    // in 30 s). It also turns #backward-interm into a CROSS-CHECK
+                    // of the seed: an over-tight seeded box would cross its
+                    // certified backward box and show up in its `crossed=`
+                    // counter. The prefix gates it reads were re-certified on
+                    // the seeded (published) boxes of earlier layers, which are
+                    // valid enclosures, so its own enclosure stays valid.
+                    if let Some(seed) = ibp.as_mut() {
+                        seed.seed_layer(layers.len(), *input, &mut l, &mut u);
+                    }
+                    if cal_late && cal_wanted {
+                        bi_cal = Some((l.clone(), u.clone()));
+                    }
                     if let Some(bi) = bi_state.as_mut() {
                         // Shrink-only intersection with the lane's own
                         // backward enclosure over the frozen prefix gates
@@ -1449,6 +1949,21 @@ impl RootGates {
                             &mut l,
                             &mut u,
                         );
+                    }
+                    // #fold-ball: the relu output lies in `[0, max(u, 0)]` for
+                    // every member of the fold ball, because `u` is this
+                    // layer's final certified box (after any shrink-only
+                    // intersection above) and holds for the whole ball.
+                    if let Some(fm) = fold_mag.as_mut() {
+                        fm.set(k + 1, u.iter().map(|&v| v.max(0.0)).collect());
+                        fm.release(*input);
+                    }
+                    // #mr-ibp-seed: the relu output interval `[max(l, 0),
+                    // max(u, 0)]` from this layer's FINAL published box (after
+                    // both shrink-only intersections), so the next layer's IBP
+                    // starts from the tightest predecessor available.
+                    if let Some(seed) = ibp.as_mut() {
+                        seed.post_relu(k, &l, &u);
                     }
                     let mut gates = gates_from_box(&l, &u);
                     if mode.outward() {
@@ -1546,11 +2061,11 @@ impl RootGates {
                     // asserted later. Only `unst` rows are kept: a split can only
                     // constrain an unstable neuron, and keeping all of them would
                     // be (n x n_in) f64 per trunk layer.
-                    // Calibration frame (#backward-interm): the FORWARD-only
-                    // bounds when the tightener ran (see `bi_cal` above),
-                    // otherwise the published ones — which then ARE the
-                    // forward bounds, so the historical behavior is
-                    // bit-identical.
+                    // Calibration frame (#backward-interm, #mr-ibp-seed): the
+                    // FORWARD-only bounds when a tightener was live (see
+                    // `bi_cal` above), otherwise the published ones — which
+                    // then ARE the forward bounds, so the historical behavior
+                    // is bit-identical.
                     let clip_rows = clip_rows_enabled().then(|| {
                         let (l_cal, u_cal) = bi_cal
                             .as_ref()
@@ -1640,6 +2155,12 @@ impl RootGates {
         if timing {
             print_root_timing(&op_times, build_t0.elapsed().as_secs_f64(), true);
         }
+        // #mr-ibp-seed terminal line, `complete=1` (the per-layer lines are
+        // printed at each trunk relu). A walk that returns early — the deadline
+        // above, any `?` — prints it from `IbpSeed`'s `Drop` with `complete=0`.
+        if let Some(seed) = ibp.as_mut() {
+            seed.finish();
+        }
         if T::F32_STORE {
             // #tableau-f32 R9 observable: one line per root/rebake build. The
             // A/B's primary floor observable stays the pre-existing
@@ -1684,10 +2205,56 @@ impl RootGates {
                 backward_interm_execution,
                 root_precision_policy: precision_policy,
                 root_precision_execution,
+                // #spec-alpha is installed by the root driver AFTER `#rebake`
+                // returns, never by the builder.
+                spec_alpha_policy: None,
+                // #head-alpha is installed by the ascent, never by the builder.
+                head_alpha: None,
+                // #root-eval-reuse: a fresh build has evaluated nothing.
+                root_eval_memo: super::bab::RootEvalMemo::default(),
+                head_group_source: None,
             },
             retained,
         ))
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// TEST-ONLY #mr-ibp-seed ordering mutation (see
+    /// [`with_bi_cal_after_seed_for_test`]).
+    static BI_CAL_AFTER_SEED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Is the `bi_cal` capture forced AFTER the #mr-ibp-seed intersection on this
+/// thread? Always `false` outside `cfg(test)`, so no production build can
+/// reach the defective ordering.
+#[cfg(test)]
+fn bi_cal_after_seed_forced() -> bool {
+    BI_CAL_AFTER_SEED.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn bi_cal_after_seed_forced() -> bool {
+    false
+}
+
+/// TEST-ONLY mutation switch for `ibp_seed_keeps_bi_cal_on_forward_only_lines`:
+/// runs `f` with the `#backward-interm` / `#mr-ibp-seed` calibration capture
+/// taken AFTER the seed's shrink-only intersection (the defect the capture's
+/// position prevents), so the test can prove it tells the two apart.
+/// Thread-local and reset on exit (also on unwind).
+#[cfg(test)]
+pub(crate) fn with_bi_cal_after_seed_for_test<Out>(f: impl FnOnce() -> Out) -> Out {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            BI_CAL_AFTER_SEED.with(|c| c.set(false));
+        }
+    }
+    BI_CAL_AFTER_SEED.with(|c| c.set(true));
+    let _reset = Reset;
+    f()
 }
 
 /// #clip-rows retention body (extracted so the calibration frame is testable
@@ -1897,6 +2464,20 @@ pub(crate) fn chaffine_op<T: TabElem>(
     blk: usize,
     xabs_ext: &[f64],
 ) -> Vec<f64> {
+    if mode.outward() && !legacy_rounding_forced() {
+        return chaffine_op_signsafe(
+            mi,
+            di,
+            scale,
+            shift,
+            scale_rel_err,
+            shift_err,
+            n_in,
+            smask_in,
+            blk,
+            xabs_ext,
+        );
+    }
     let naug = n_in + 1;
     let g = next_up(scale_rel_err + 4.0 * UNIT);
     // Outward widening for the fused dust accumulation (see `add_op`).
@@ -1992,6 +2573,718 @@ pub(crate) fn chaffine_op<T: TabElem>(
     gstore
 }
 
+// --------------------------------------------------------------------------
+//  #root-rounding: the sign-safe charge of the tableau's own ROUNDING
+// --------------------------------------------------------------------------
+//
+// THE DEFECT THIS REPAIRS. The tableau is a SANDWICH, not a coefficient interval:
+// `(M - D) x~ <= v(x) <= (M + D) x~` for every `x` in the box, with
+// `x~ = (x, 1)`. Every Outward op used to charge its own rounding by widening
+// the COEFFICIENT columns of D — the conv's `din = d + gamma_{k+2}(|m| + d)`
+// plus the `certify_up` of the D lane, the gate's `6u(|mm| + dd)`, the channel
+// affine's `4u(|m2| + |s| d)`, the Add's `2u |mo|`. A coefficient widening
+// widens the walls only where `x_i >= 0`: at `x_i < 0` the lower wall
+// `(m - d) x_i` moves UP by `d |x_i|` (and the upper wall down), so the charge
+// TIGHTENS the enclosure on the negative side of the box. The concretize
+// envelope `gamma_{n_in + 16 + 8R} (tabs + |bl| + |bu|)` was supposed to
+// re-absorb that ("DEPTH-INDEPENDENT"), but it scales with the row's OWN
+// magnitudes, which a cancelling row with a near-zero bias makes tiny.
+// Exact-rational counterexample (no fold error at all): x in [-1, 0.01],
+// z1 = w x + 0.02 with w = (-1, -1 + 1e-6) (both relus stable-active),
+// z2 = relu(z1_0) - relu(z1_1) = -1e-6 x. The trunk-1 box's upper end was
+// 9.999999971380213e-07, 2.891e-15 BELOW the exact max 1.0000000000287557e-06
+// at x = -1 (`root_box_encloses_the_exact_minimal_rounding_leak`); 64 of 96
+// swept cancelling nets escaped by up to 3.6e-14.
+//
+// THE REPAIR. Each op now produces the EXACT products of its stored inputs in
+// round-to-nearest (no coefficient widening at all) and charges a certified
+// bound on its own rounding as an ADDITIVE term in the D BIAS column, where
+// the sign is known (`x~_bias = 1 > 0`). If a site's computed coefficients
+// deviate from its exact target by at most `e_i` per coefficient, the walls
+// move by at most `sum_i e_i |x~_i| <= sum_i e_i xabs_ext_i` for EVERY `x` in
+// the box whatever its sign (`|x_i| <= |mid_i| + rad_i`), so adding that sum
+// to `D[bias]` keeps both walls outside the exact ones pointwise. This is the
+// form the f32 lane's `g_err` and the #fold-ball charge already use. The
+// charged bound per site (`W` = the site's own coefficient magnitudes):
+//   * conv (f64 lane): `gamma_{k+2} sum_t |W_ot| (|M_ti| + |D_ti|)` — the
+//     Higham bound of the two length-`k` dot products, any order or FMA
+//     (`conv_round_charge`, one single-column `|W|` conv); on the f32 compute
+//     lane `conv_f32_gerr` charges both lanes against exact arithmetic into
+//     `g_err` instead, which is the same account;
+//   * gate: `4u (|lo_c| + |up_c| (+ |up0|) on the bias)` — a derivation over
+//     the <= 3 roundings of `lo_c`, `up0`, `up_c` and the two of `mm`/`dd`
+//     gives `<= 3.0000002u W`, for binary AND fractional alpha alike;
+//   * channel affine: `(srel + 4u)(|s m| + |s d|)` — covers both products
+//     (`<= 1.0000001u` each) and, soundly, any relative scale error that
+//     reaches the site (`|ds v| <= srel |s| |v|`, `|v| <= sum (|m|+|d|)|x~|`);
+//     the shift keeps its historical bias-column terms;
+//   * Add: `2u (|ma + mb| + |da + db|)` (needs `1.0000001u` per lane).
+// `root_round_charge` turns the fused accumulator into a certified upper bound
+// (`1 + 2 gamma_{naug+10}` covers the accumulation's own rounding and the
+// `(1 + u)` of `xabs`; a `4 MIN_POSITIVE sum(xabs_ext)` floor covers every
+// gradual-underflow absolute error, `>= 2^52` products' worth). The bias
+// column is processed LAST in every row so its stored value includes the
+// row's whole charge, which keeps the `#tableau-f32` per-site containment
+// rule `d32 - d64 >= |m32 - m64|` exact for every column
+// (`store_radius_charged`).
+//
+// WHAT THE ENVELOPE STILL DOES. `concretize_box`'s `gam` term now covers only
+// the concretization's own rounding (its sums and the `m -+ d` subtractions);
+// it is kept unchanged, so it is now a strict over-charge for that job.
+//
+// Bits: every Outward root box moves (sub-1e-12 relative; see the fix report
+// `scratchpad/vbs/diag10/fix_root_rounding.md`). Parity mode is untouched.
+// The historical expressions survive only behind the TEST-ONLY switch below.
+
+#[cfg(test)]
+thread_local! {
+    /// TEST-ONLY #root-rounding mutation switch (see
+    /// [`with_legacy_rounding_charge_for_test`]).
+    static ROOT_ROUNDING_LEGACY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Is the historical coefficient-column ROUNDING charge forced on this thread?
+/// Also forced by the #fold-ball switch, which reproduces the whole pre-repair
+/// walk (see [`with_legacy_fold_charge_for_test`]). Always `false` outside
+/// `cfg(test)`, so no production build can reach the legacy expressions. Read
+/// on the calling thread, never inside a rayon closure.
+#[cfg(test)]
+fn legacy_rounding_forced() -> bool {
+    ROOT_ROUNDING_LEGACY.with(std::cell::Cell::get) || legacy_fold_charge_forced()
+}
+
+#[cfg(not(test))]
+const fn legacy_rounding_forced() -> bool {
+    false
+}
+
+/// TEST-ONLY mutation switch for the #root-rounding pins
+/// (`root_box_encloses_the_exact_minimal_rounding_leak`,
+/// `root_box_encloses_the_exact_affine_hull_on_cancelling_stable_nets`,
+/// `f32_root_lanes_enclose_the_exact_hull_over_a_signed_d_lane`): runs `f`
+/// with every Outward op charging its rounding the HISTORICAL way, in the
+/// coefficient columns of D, and with `conv_f32_gerr`'s historical SIGNED
+/// D-lane functional (bit for bit the pre-repair expressions on the f64 AND
+/// the f32 lanes), so a test can prove its fixture tells the repair from the
+/// defect. Thread-local and reset on exit (also on unwind).
+#[cfg(test)]
+pub(crate) fn with_legacy_rounding_charge_for_test<Out>(f: impl FnOnce() -> Out) -> Out {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ROOT_ROUNDING_LEGACY.with(|c| c.set(false));
+        }
+    }
+    ROOT_ROUNDING_LEGACY.with(|c| c.set(true));
+    let _reset = Reset;
+    f()
+}
+
+/// Per-coefficient rounding factor of one gate site (#root-rounding block).
+const GATE_ROUND_REL: f64 = 4.0 * UNIT;
+/// Per-coefficient rounding factor of one residual-Add site (both lanes).
+const ADD_ROUND_REL: f64 = 2.0 * UNIT;
+
+/// Gradual-underflow floor of a #root-rounding charge: `4 MIN_POSITIVE` per
+/// unit of `sum(xabs_ext)`, i.e. `>= 2^52` subnormal-scale absolute errors per
+/// coefficient, all rounded up.
+fn root_round_floor(xabs_ext: &[f64]) -> f64 {
+    next_up(4.0 * f64::MIN_POSITIVE * next_up(xabs_ext.iter().sum::<f64>()))
+}
+
+/// Widening of a fused #root-rounding accumulator over `naug` columns.
+fn root_round_widen(naug: usize) -> f64 {
+    1.0 + 2.0 * gamma_n(naug + 10)
+}
+
+/// Certified #root-rounding charge `>= g * sum_i w_i |x~_i|` from the raw f64
+/// accumulator `acc = fl(sum_i w_i xabs_ext_i)` of non-negative terms: `acc`
+/// under-reports by at most a `1 - gamma` factor and `xabs` by `1 + u`, both
+/// inside `widen = 1 + 2 gamma_{naug+10}`; each later op is one correctly
+/// rounded op on non-negative upper bounds, dominated by its `next_up`; `floor`
+/// covers underflow.
+#[inline]
+fn root_round_charge(g: f64, acc: f64, widen: f64, floor: f64) -> f64 {
+    next_up(next_up(g * next_up(acc * widen)) + floor)
+}
+
+/// RADIUS store of a #root-rounding site value `v64` with the same-site
+/// CENTER-store `charge`: the f64 lane stores `v64` exactly (it IS the site
+/// value); the `#tableau-f32` lane stores `f64_to_f32_up(next_up(v64 +
+/// charge))`, which is `>= v64 + charge` exactly — so `d32 - d64 >= |m32 -
+/// m64|` holds with no reliance on the up-store adding slack.
+#[inline]
+fn store_radius_charged<T: TabElem>(v64: f64, charge: f64) -> T {
+    if T::F32_STORE {
+        T::store_radius_up(next_up(v64 + charge))
+    } else {
+        T::store_radius_up(v64)
+    }
+}
+
+/// Block iteration over the COEFFICIENT columns `0..n_in` of one row: masked
+/// => the `#tableau-support-mask` blocks, clamped to `n_in` so the bias column
+/// is never visited (every #root-rounding body handles it last, explicitly);
+/// dense => ONE block covering them all, whatever `blk` the caller passed.
+#[inline]
+const fn coef_blocks(masked: bool, n_in: usize, blk: usize) -> (usize, usize) {
+    if masked {
+        (SUPPORT_BLOCKS, blk)
+    } else {
+        (1, n_in)
+    }
+}
+
+/// #root-rounding conv charge (f64 compute lane): per output row `o`,
+/// `E_o >= g sum_t |W_ot| B_t` with `B_t = sum_i (|M_ti| + |D_ti|) xabs_ext_i`
+/// over the conv's SOURCE rows — one length-`naug` reduction per source row
+/// and one single-column `|W|` conv, like `conv_f32_gerr`. `g` is the conv's
+/// `gamma_{k+2}` (plus any relative fold error, `g = gamma + rel + gamma rel`),
+/// which bounds each lane's per-coefficient dot-product error by
+/// `g (|W| |M|)` resp. `g (|W| |D|)` in any summation order. Masked-out
+/// columns are exact zeros and contribute exactly nothing, so the reduction is
+/// dense.
+#[allow(clippy::too_many_arguments)]
+fn conv_round_charge<T: TabElem>(
+    c: &ConvOp,
+    mi: &Array2<T>,
+    di: &Array2<T>,
+    xabs: &[f64],
+    n_in: usize,
+    n_out: usize,
+    g: f64,
+    floor: f64,
+) -> Vec<f64> {
+    let naug = n_in + 1;
+    let n_src = mi.nrows();
+    let bwiden = root_round_widen(naug);
+    let mis = mi.as_slice().expect("standard layout");
+    let dis = di.as_slice().expect("standard layout");
+    let mut bcol = Array2::<f64>::zeros((n_src, 1));
+    bcol.as_slice_mut()
+        .expect("standard layout")
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(t, bt)| {
+            let mrow = &mis[t * naug..(t + 1) * naug];
+            let drow = &dis[t * naug..(t + 1) * naug];
+            let mut braw = 0.0f64;
+            for i in 0..n_in {
+                braw += (mrow[i].wide().abs() + drow[i].wide().abs()) * xabs[i];
+            }
+            // Bias column (index n_in): xabs_ext weight 1.
+            braw += mrow[n_in].wide().abs() + drow[n_in].wide().abs();
+            *bt = next_up(braw * bwiden);
+        });
+    let mut gcol = Array2::<f64>::zeros((n_out, 1));
+    conv_apply_forward(c, &bcol, &mut gcol, true);
+    // The single-column conv sums `k_fwd` non-negative products.
+    let gwiden = 1.0 + 2.0 * gamma_n(c.k_fwd + 2);
+    gcol.iter()
+        .map(|&v| next_up(next_up(g * next_up(v * gwiden)) + floor))
+        .collect()
+}
+
+/// Add a per-row #root-rounding charge `e[j]` to the D BIAS column, rounded
+/// up. On the `#tableau-f32` lane the up-store dust of that one store is
+/// charged into `gerr` (bias-column weight 1), like every other store site.
+fn charge_bias_column<T: TabElem>(d: &mut Array2<T>, e: &[f64], n_in: usize, gerr: &mut [f64]) {
+    for (j, &ej) in e.iter().enumerate() {
+        let v = next_up(d[[j, n_in]].wide() + ej);
+        d[[j, n_in]] = T::store_radius_up(v);
+        if T::F32_STORE && !gerr.is_empty() {
+            gerr[j] = next_up(gerr[j] + (d[[j, n_in]].wide() - v));
+        }
+    }
+}
+
+/// #root-rounding ChannelAffine body (Outward): `M' = s M`, `D' = |s| D` as
+/// plain products, the shift into the bias column with its historical
+/// `shift_err + 2u |b2|` terms, and the sign-safe charge
+/// `(scale_rel_err + 4u) sum_i (|s m_i| + |s d_i|) xabs_ext_i` added to the D
+/// bias column last. Storage classes as in `chaffine_op`.
+#[allow(clippy::too_many_arguments)]
+fn chaffine_op_signsafe<T: TabElem>(
+    mi: &mut Array2<T>,
+    di: &mut Array2<T>,
+    scale: &[f64],
+    shift: &[f64],
+    scale_rel_err: f64,
+    shift_err: &[f64],
+    n_in: usize,
+    smask_in: Option<&[u64]>,
+    blk: usize,
+    xabs_ext: &[f64],
+) -> Vec<f64> {
+    let naug = n_in + 1;
+    let g = next_up(scale_rel_err + 4.0 * UNIT);
+    let acc_widen = 1.0 + 2.0 * gamma_n(naug + 8);
+    let rwiden = root_round_widen(naug);
+    let floor = root_round_floor(xabs_ext);
+    let (nblk, bw) = coef_blocks(smask_in.is_some(), n_in, blk);
+    let msl = mi.as_slice_mut().expect("standard layout");
+    let dsl = di.as_slice_mut().expect("standard layout");
+    let mut gstore = vec![0.0f64; scale.len()];
+    for (j, (&sj, &tj)) in scale.iter().zip(shift.iter()).enumerate() {
+        let sa = sj.abs();
+        let mrow = &mut msl[j * naug..(j + 1) * naug];
+        let drow = &mut dsl[j * naug..(j + 1) * naug];
+        let mask = smask_in.map_or(u64::MAX, |sm| sm[j]);
+        let mut racc = 0.0f64;
+        let mut dust = 0.0f64;
+        for b in 0..nblk {
+            if !support_has(mask, b) {
+                continue;
+            }
+            let lo = (b * bw).min(n_in);
+            let hi = (lo + bw).min(n_in);
+            for i in lo..hi {
+                let m2 = sj * mrow[i].wide();
+                let d2 = sa * drow[i].wide();
+                racc += (m2.abs() + d2.abs()) * xabs_ext[i];
+                let (m2_stored, m2_charge) = T::store_center(m2);
+                mrow[i] = m2_stored;
+                drow[i] = store_radius_charged::<T>(d2, m2_charge);
+                if T::F32_STORE {
+                    dust +=
+                        ((m2_stored.wide() - m2).abs() + (drow[i].wide() - d2).abs()) * xabs_ext[i];
+                }
+            }
+        }
+        // Bias column, last: scale, shift, then the whole row's charge.
+        let m2b = sj * mrow[n_in].wide();
+        let d2b = sa * drow[n_in].wide();
+        racc += (m2b.abs() + d2b.abs()) * xabs_ext[n_in];
+        let b2 = m2b + tj;
+        let e = root_round_charge(g, racc, rwiden, floor);
+        let d64 = next_up(next_up(next_up(d2b + shift_err[j]) + 2.0 * UNIT * b2.abs()) + e);
+        let (b2_stored, b2_charge) = T::store_center(b2);
+        mrow[n_in] = b2_stored;
+        drow[n_in] = store_radius_charged::<T>(d64, b2_charge);
+        if T::F32_STORE {
+            dust +=
+                ((b2_stored.wide() - b2).abs() + (drow[n_in].wide() - d64).abs()) * xabs_ext[n_in];
+            gstore[j] = next_up(dust * acc_widen);
+        }
+    }
+    gstore
+}
+
+/// #root-rounding residual-Add body (Outward): `mo = ma + mb`, `do = da + db`
+/// as plain sums, and the sign-safe charge
+/// `2u sum_i (|ma_i + mb_i| + |da_i + db_i|) xabs_ext_i` added to the D bias
+/// column last. Storage classes as in `add_op`.
+fn add_op_signsafe<T: TabElem>(
+    mut ma: Array2<T>,
+    mb: &Array2<T>,
+    mut da: Array2<T>,
+    db: &Array2<T>,
+    smask_out: &[u64],
+    blk: usize,
+    xabs_ext: &[f64],
+) -> (Array2<T>, Array2<T>, Vec<f64>) {
+    let cols = ma.ncols();
+    let rows = ma.nrows();
+    let mut gstore = vec![0.0f64; rows];
+    if cols == 0 {
+        return (ma, da, gstore);
+    }
+    let n_in = cols - 1;
+    let acc_widen = 1.0 + 2.0 * gamma_n(cols + 8);
+    let rwiden = root_round_widen(cols);
+    let floor = root_round_floor(xabs_ext);
+    let (nblk, bw) = coef_blocks(!smask_out.is_empty(), n_in, blk);
+    {
+        let ms = ma.as_slice_mut().expect("standard layout");
+        let ds = da.as_slice_mut().expect("standard layout");
+        let mbs = mb.as_slice().expect("standard layout");
+        let dbs = db.as_slice().expect("standard layout");
+        ms.par_chunks_mut(cols)
+            .zip(ds.par_chunks_mut(cols))
+            .zip(mbs.par_chunks(cols).zip(dbs.par_chunks(cols)))
+            .zip(gstore.par_iter_mut())
+            .enumerate()
+            .for_each(|(j, (((mrow, drow), (mbr, dbr)), gs))| {
+                let mask = if smask_out.is_empty() {
+                    u64::MAX
+                } else {
+                    smask_out[j]
+                };
+                let mut racc = 0.0f64;
+                let mut dust = 0.0f64;
+                for b in 0..nblk {
+                    if !support_has(mask, b) {
+                        continue;
+                    }
+                    let lo = (b * bw).min(n_in);
+                    let hi = (lo + bw).min(n_in);
+                    for i in lo..hi {
+                        let sum = mrow[i].wide() + mbr[i].wide();
+                        let dsum = drow[i].wide() + dbr[i].wide();
+                        racc += (sum.abs() + dsum.abs()) * xabs_ext[i];
+                        let (m_stored, m_charge) = T::store_center(sum);
+                        mrow[i] = m_stored;
+                        drow[i] = store_radius_charged::<T>(dsum, m_charge);
+                        if T::F32_STORE {
+                            dust += ((m_stored.wide() - sum).abs() + (drow[i].wide() - dsum).abs())
+                                * xabs_ext[i];
+                        }
+                    }
+                }
+                // Bias column, last.
+                let sum = mrow[n_in].wide() + mbr[n_in].wide();
+                let dsum = drow[n_in].wide() + dbr[n_in].wide();
+                racc += (sum.abs() + dsum.abs()) * xabs_ext[n_in];
+                let d64 = next_up(dsum + root_round_charge(ADD_ROUND_REL, racc, rwiden, floor));
+                let (m_stored, m_charge) = T::store_center(sum);
+                mrow[n_in] = m_stored;
+                drow[n_in] = store_radius_charged::<T>(d64, m_charge);
+                if T::F32_STORE {
+                    dust += ((m_stored.wide() - sum).abs() + (drow[n_in].wide() - d64).abs())
+                        * xabs_ext[n_in];
+                    *gs = next_up(dust * acc_widen);
+                }
+            });
+    }
+    (ma, da, gstore)
+}
+
+/// #root-rounding gate body (Outward): `L = (M - D) alpha`,
+/// `U = (M + D) s (+ c on the bias)`, `M' = (L + U)/2`, `D' = (U - L)/2` as
+/// plain f64 results, and the sign-safe charge
+/// `4u sum_i (|lo_c| + |up_c| (+ |up0|)) xabs_ext_i` added to the D bias
+/// column last — ONE formula for binary and fractional alpha (see the
+/// #root-rounding block and `apply_gates`' header). Storage classes as in
+/// `apply_gates`.
+#[allow(clippy::too_many_arguments)]
+fn apply_gates_signsafe<T: TabElem>(
+    m: &Array2<T>,
+    d: &Array2<T>,
+    alpha: &[f64],
+    s: &[f64],
+    c: &[f64],
+    n_in: usize,
+    smask: Option<&[u64]>,
+    blk: usize,
+    xabs_ext: &[f64],
+) -> (Array2<T>, Array2<T>, Vec<f64>) {
+    let naug = n_in + 1;
+    let n = m.nrows();
+    let mut mo = Array2::<T>::from_elem((n, naug), T::ZERO);
+    let mut do_ = Array2::<T>::from_elem((n, naug), T::ZERO);
+    let mut gstore = vec![0.0f64; n];
+    let acc_widen = 1.0 + 2.0 * gamma_n(naug + 8);
+    let rwiden = root_round_widen(naug);
+    let floor = root_round_floor(xabs_ext);
+    let (nblk, bw) = coef_blocks(smask.is_some(), n_in, blk);
+    let msrc = m.as_slice().expect("standard layout");
+    let dsrc = d.as_slice().expect("standard layout");
+    let mdst = mo.as_slice_mut().expect("standard layout");
+    let ddst = do_.as_slice_mut().expect("standard layout");
+    mdst.par_chunks_mut(naug)
+        .zip(ddst.par_chunks_mut(naug))
+        .zip(gstore.par_iter_mut())
+        .enumerate()
+        .for_each(|(j, ((mrow, drow), gs))| {
+            let a_j = alpha[j];
+            let s_j = s[j];
+            let msr = &msrc[j * naug..(j + 1) * naug];
+            let dsr = &dsrc[j * naug..(j + 1) * naug];
+            // Outside the mask `m == d == 0.0`, so both outputs are EXACTLY
+            // zero, which the freshly zeroed `mo`/`do_` already hold.
+            let mask = smask.map_or(u64::MAX, |sm| sm[j]);
+            let mut racc = 0.0f64;
+            let mut dust = 0.0f64;
+            for b in 0..nblk {
+                if !support_has(mask, b) {
+                    continue;
+                }
+                let lo = (b * bw).min(n_in);
+                let hi = (lo + bw).min(n_in);
+                for i in lo..hi {
+                    let lo_c = (msr[i].wide() - dsr[i].wide()) * a_j;
+                    let up_c = (msr[i].wide() + dsr[i].wide()) * s_j;
+                    #[allow(clippy::manual_midpoint)]
+                    let mm = (lo_c + up_c) * 0.5;
+                    let dd = (up_c - lo_c) * 0.5;
+                    racc += (lo_c.abs() + up_c.abs()) * xabs_ext[i];
+                    let (mm_stored, mm_charge) = T::store_center(mm);
+                    mrow[i] = mm_stored;
+                    drow[i] = store_radius_charged::<T>(dd, mm_charge);
+                    if T::F32_STORE {
+                        dust += ((mm_stored.wide() - mm).abs() + (drow[i].wide() - dd).abs())
+                            * xabs_ext[i];
+                    }
+                }
+            }
+            // Bias column, last: the intercept, then the whole row's charge.
+            let lo_c = (msr[n_in].wide() - dsr[n_in].wide()) * a_j;
+            let up0 = (msr[n_in].wide() + dsr[n_in].wide()) * s_j;
+            let up_c = up0 + c[j];
+            #[allow(clippy::manual_midpoint)]
+            let mm = (lo_c + up_c) * 0.5;
+            let dd = (up_c - lo_c) * 0.5;
+            racc += (lo_c.abs() + up_c.abs() + up0.abs()) * xabs_ext[n_in];
+            let d64 = next_up(dd + root_round_charge(GATE_ROUND_REL, racc, rwiden, floor));
+            let (mm_stored, mm_charge) = T::store_center(mm);
+            mrow[n_in] = mm_stored;
+            drow[n_in] = store_radius_charged::<T>(d64, mm_charge);
+            if T::F32_STORE {
+                dust += ((mm_stored.wide() - mm).abs() + (drow[n_in].wide() - d64).abs())
+                    * xabs_ext[n_in];
+                *gs = next_up(dust * acc_widen);
+            }
+        });
+    (mo, do_, gstore)
+}
+
+// --------------------------------------------------------------------------
+//  #fold-ball: the sign-safe charge of a RELATIVE fold error
+// --------------------------------------------------------------------------
+//
+// THE DEFECT THIS REPAIRS. The tableau is a SANDWICH, not a coefficient
+// interval: `(M - D) x~ <= v(x) <= (M + D) x~` for every `x` in the box, with
+// `x~ = (x, 1)`. A folded op's true parameters lie anywhere in the certified
+// ball `|W - W'| <= rel |W'|` (`ConvOp::weight_rel_err`, likewise
+// `scale_rel_err`) around the stored `W'`, so the true output carries an extra
+// `E v` with `|E v| <= rel |W'| |v|`. That term is not linear in `x`, and
+// adding `rel |W'| |M|` to the COEFFICIENT columns of D (the historical
+// `g = gamma + rel + gamma rel` in `din = d + g(|m| + d)`) widens the walls
+// only where `x_i >= 0`: at `x_i < 0` the lower wall `(m - d) x_i` moves UP by
+// `d |x_i|`. Concretized, a positive lower coefficient `m - d` at `lo_i < 0`
+// gives `(m - d) lo_i = m lo_i + d |lo_i|`, i.e. a bigger D RAISES the lower
+// bound. The concretize headroom `gamma_{n_in + 16 + 8R} * tabs` re-absorbs
+// that only while `rel` stays far below it (production folds carry
+// `rel = 1e-15` against a headroom of `>= 3e-13` on a 3072-dim input). The
+// `conv_bn` fixture (`rel = 1e-13`, `n_in = 12`, headroom `4.9e-15`) escaped
+// its trunk-0 box by up to 1.6e-12 for members of its fold ball, and with
+// `bias_err = 0` even the STORED network escaped (the `#frozen-dual-state`
+// exact-rational containment gate, 2026-09-27; replica in the fix report).
+//
+// THE REPAIR. Charge the fold error where the sign is known: the bias column
+// (`x~_bias = 1 > 0`), as `rel * sum_taps |W'| mag_in`, where `mag_in` bounds
+// `|v_in|` over the box for EVERY member of the ball. On a walk with no
+// relative fold error [`FoldMag::new`] returns `None` and every relative fold
+// error is 0.
+//
+// CLOSED (#root-rounding): the remaining ROUNDING term `gamma_{k+2}` in the
+// coefficient columns had the
+// SAME sign structure and leaked (x in [-1, 0.01], z2 = -1e-6 x missed its
+// trunk-1 box by 2.9e-15). Every op's rounding is now charged sign-safely in
+// the bias column too — see the #root-rounding block.
+//
+// MAGNITUDES (each bounds `|v_t(x)|` for every `x` in the box and every member
+// of the ball; every float op rounds up):
+//   * input: `next_up(|mid| + rad)`;
+//   * relu output: `max(u, 0)` from the layer's final certified box;
+//   * conv: `(1 + rel) cert(sum |W'| mag_in) + |b| + bias_err`;
+//   * channel affine: `(1 + rel) |s| mag_in + |shift| + shift_err`;
+//   * add: `mag_a + mag_b`; flatten: unchanged.
+
+#[cfg(test)]
+thread_local! {
+    /// TEST-ONLY #fold-ball mutation switch (see
+    /// [`with_legacy_fold_charge_for_test`]).
+    static FOLD_BALL_LEGACY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Is the TEST-ONLY legacy-charge switch set on this thread? Always `false`
+/// outside `cfg(test)`, so no production build can reach the legacy charge.
+#[cfg(test)]
+fn legacy_fold_charge_forced() -> bool {
+    FOLD_BALL_LEGACY.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn legacy_fold_charge_forced() -> bool {
+    false
+}
+
+/// TEST-ONLY mutation switch for the #fold-ball pin
+/// (`root_box_encloses_the_exact_fold_ball_hull`): runs `f` with
+/// [`FoldMag::new`] forced to `None`, i.e. with the HISTORICAL
+/// (pre-#fold-ball) coefficient-column charge of `weight_rel_err` /
+/// `scale_rel_err`, so the test can prove its fixture tells the repaired
+/// charge from the defect it repairs. It also forces the historical
+/// coefficient-column ROUNDING charge ([`legacy_rounding_forced`]), so the
+/// walk is the whole pre-#fold-ball one bit for bit: the #root-rounding sites
+/// would otherwise charge a coefficient-free `rel` soundly themselves
+/// (`g = gamma + rel + gamma rel` is part of their sign-safe charge) and the
+/// pin could no longer see the defect. Thread-local and reset on exit (also on
+/// unwind): no other test thread and no production path can observe it.
+#[cfg(test)]
+pub(crate) fn with_legacy_fold_charge_for_test<Out>(f: impl FnOnce() -> Out) -> Out {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FOLD_BALL_LEGACY.with(|c| c.set(false));
+        }
+    }
+    FOLD_BALL_LEGACY.with(|c| c.set(true));
+    let _reset = Reset;
+    f()
+}
+
+/// Per-tensor certified magnitudes for the #fold-ball charge (see the block
+/// comment above). A tensor's vector is dropped after its last consumer.
+struct FoldMag {
+    mag: Vec<Option<Vec<f64>>>,
+    left: Vec<usize>,
+}
+
+impl FoldMag {
+    /// `Some` only in Outward mode on a walk (ops `..=last_relu`) that folds a
+    /// nonzero relative weight or scale error; `consumers` are the walk's own
+    /// per-tensor consumer counts, `xabs` its `|mid| + rad`.
+    fn new(
+        net: &TwinNet,
+        last_relu: usize,
+        mode: RoundMode,
+        consumers: &[usize],
+        xabs: &[f64],
+    ) -> Option<Self> {
+        let folds_rel = net.ops[..=last_relu].iter().any(|op| match op {
+            TwinOp::Conv(c) => c.weight_rel_err != 0.0,
+            TwinOp::ChannelAffine { scale_rel_err, .. } => *scale_rel_err != 0.0,
+            _ => false,
+        });
+        if !(mode.outward() && folds_rel) || legacy_fold_charge_forced() {
+            return None;
+        }
+        let mut mag = vec![None; net.ops.len() + 1];
+        // `mid +- rad` covers the box exactly, so `|x| <= |mid| + rad`; the
+        // `next_up` covers the rounding of that sum.
+        mag[0] = Some(xabs.iter().map(|&v| next_up(v)).collect());
+        Some(Self {
+            mag,
+            left: consumers.to_vec(),
+        })
+    }
+
+    fn get(&self, id: usize) -> Result<&[f64]> {
+        self.mag.get(id).and_then(|m| m.as_deref()).ok_or_else(|| {
+            NyError::InvalidSpec(format!(
+                "margin_row: fold-ball magnitude of tensor {id} is missing"
+            ))
+        })
+    }
+
+    fn set(&mut self, id: usize, v: Vec<f64>) {
+        self.mag[id] = Some(v);
+    }
+
+    fn release(&mut self, id: usize) {
+        if let Some(n) = self.left.get_mut(id) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.mag[id] = None;
+            }
+        }
+    }
+}
+
+/// #fold-ball charge and output magnitude of one conv.
+struct ConvFold {
+    /// Per-channel bias error with the sign-safe relative charge folded in;
+    /// exactly `c.bias_err` when `weight_rel_err == 0`.
+    bias_err: Vec<f64>,
+    /// Certified magnitude of the conv output (every member of the ball).
+    mag_out: Vec<f64>,
+}
+
+/// The #fold-ball charge of conv `c` given its input magnitude `mag_in`:
+/// `bias_err[ch] + max_{j in ch} rel * cert(sum_taps |W'| mag_in)` (the max
+/// over the channel's spatial positions keeps the charge per channel, as
+/// [`conv_bias_fold`] consumes it) and the output magnitude.
+///
+/// `cert(v) = next_up(v (1 + 2 gamma_{k+2}) + MIN_POSITIVE)`: the float sum of
+/// `k` non-negative products (any order) is `>= exact (1 - gamma_k)`, and
+/// `1 / (1 - gamma_k) <= 1 + 2 gamma_k`, with two roundings of the scaling
+/// covered by `gamma_{k+2} >= gamma_k + 2u`; `MIN_POSITIVE` covers gradual
+/// underflow of up to `2^52` products. Every other op is a single correctly
+/// rounded op on non-negative upper bounds, so its `next_up` dominates the
+/// exact result.
+fn conv_fold_ball(c: &ConvOp, mag_in: &[f64], n_out: usize) -> ConvFold {
+    let col = Array2::from_shape_vec((mag_in.len(), 1), mag_in.to_vec())
+        .expect("a single column always has a valid shape");
+    let mut dst = Array2::<f64>::zeros((n_out, 1));
+    conv_apply_forward(c, &col, &mut dst, true);
+    let g = gamma_n(c.k_fwd + 2);
+    let p = (c.oshape.1 * c.oshape.2).max(1);
+    let rel = c.weight_rel_err;
+    let grow = next_up(1.0 + rel);
+    let mut charge = vec![0.0f64; c.bias.len()];
+    let mut mag_out = Vec::with_capacity(n_out);
+    for (j, &v) in dst.iter().enumerate() {
+        let ch = j / p;
+        let wm = next_up(v * (1.0 + 2.0 * g) + f64::MIN_POSITIVE);
+        if rel > 0.0 {
+            charge[ch] = charge[ch].max(next_up(rel * wm));
+        }
+        mag_out.push(next_up(
+            next_up(wm * grow) + next_up(c.bias[ch].abs() + c.bias_err[ch]),
+        ));
+    }
+    let bias_err = if rel > 0.0 {
+        c.bias_err
+            .iter()
+            .zip(&charge)
+            .map(|(e, q)| next_up(e + q))
+            .collect()
+    } else {
+        c.bias_err.clone()
+    };
+    ConvFold { bias_err, mag_out }
+}
+
+/// #fold-ball charge and output magnitude of one channel affine.
+struct AffineFold {
+    /// Per-neuron shift error with the sign-safe relative charge folded in;
+    /// exactly `shift_err` when `scale_rel_err == 0`.
+    shift_err: Vec<f64>,
+    /// Certified magnitude of the affine output (every member of the ball).
+    mag_out: Vec<f64>,
+}
+
+/// The #fold-ball charge of a channel affine (per-NEURON `scale` / `shift` /
+/// `shift_err`, as [`TwinOp::ChannelAffine`] stores them):
+/// `shift_err[j] + rel |s_j| mag_in[j]`, and the output magnitude
+/// `(1 + rel) |s_j| mag_in[j] + |shift_j| + shift_err[j]`, all rounded up.
+fn affine_fold_ball(
+    scale: &[f64],
+    shift: &[f64],
+    rel: f64,
+    shift_err: &[f64],
+    mag_in: &[f64],
+) -> Result<AffineFold> {
+    if mag_in.len() != scale.len() || shift.len() != scale.len() || shift_err.len() != scale.len() {
+        return Err(NyError::InvalidSpec(
+            "margin_row: channel-affine fold-ball magnitude shape mismatch".into(),
+        ));
+    }
+    let grow = next_up(1.0 + rel);
+    let mut out_err = Vec::with_capacity(scale.len());
+    let mut mag_out = Vec::with_capacity(scale.len());
+    for (((&s, &t), &e), &m) in scale.iter().zip(shift).zip(shift_err).zip(mag_in) {
+        let sm = next_up(s.abs() * m);
+        out_err.push(if rel > 0.0 {
+            next_up(e + next_up(rel * sm))
+        } else {
+            e
+        });
+        mag_out.push(next_up(next_up(sm * grow) + next_up(t.abs() + e)));
+    }
+    Ok(AffineFold {
+        shift_err: out_err,
+        mag_out,
+    })
+}
+
+/// #fold-ball magnitude of an elementwise add.
+fn fold_mag_add(a: &[f64], b: &[f64]) -> Vec<f64> {
+    a.iter().zip(b).map(|(x, y)| next_up(x + y)).collect()
+}
+
 /// Conv bias fold: bias into the M bias column, certified bias error into the
 /// D bias column. Generic over the stored element (`#tableau-f32`: the folded
 /// bias is a CENTER-role nearest store, class (c), charged into the same-site
@@ -2066,6 +3359,9 @@ pub(crate) fn add_op<T: TabElem>(
     mode: RoundMode,
     xabs_ext: &[f64],
 ) -> (Array2<T>, Array2<T>, Vec<f64>) {
+    if mode.outward() && !legacy_rounding_forced() {
+        return add_op_signsafe(ma, mb, da, db, smask_out, blk, xabs_ext);
+    }
     let outward = mode.outward();
     let cols = ma.ncols();
     let rows = ma.nrows();
@@ -2177,6 +3473,17 @@ pub(crate) fn add_op<T: TabElem>(
 /// max(alpha_j, s_j) * g_err_in[j]`. The bound is ATTAINED (`dD = 0` makes it an
 /// equality), so `max` is the best uniform constant, not a convenient one.
 ///
+/// UNIFORMITY IS A CONVENIENCE OF THIS FORM, NOT A HYPOTHESIS OF THE BOUND.
+/// The per-coefficient step above never used it — it holds for each `i` with
+/// that `i`'s own slopes — and only the aggregation needs one common constant,
+/// for which `max_i max(a_ji, s_ji)` serves and stays in `[0, 1]`. Two call
+/// sites had hardened the sentence above into "a per-start-node alpha cannot be
+/// baked forward"; as a statement about the ERROR CARRY that is false. It says
+/// nothing about the relaxation: whether the enclosure stays valid under a
+/// non-uniform lower slope is OPEN, and a tableau column is an INPUT
+/// coordinate, not a start node. See [`gate_gerr_out_nonuniform`], which
+/// carries the generalized derivation, its tests and the corrected consequence.
+///
 /// The historical `(alpha_j + s_j)` came from bounding `|dM'|` and `|dD'|`
 /// separately and re-adding, an OVER-charge by the factor
 /// `1 + min(alpha_j, s_j)/max(alpha_j, s_j) in [1, 2]` per trunk relu. It is
@@ -2206,6 +3513,104 @@ pub(crate) fn gate_gerr_out(alpha_j: f64, s_j: f64, gerr_in_j: f64) -> f64 {
     next_up(alpha_j.max(s_j) * gerr_in_j)
 }
 
+/// #gate-gerr-max-nonuniform: the SAME gate carry when `alpha` and `s` VARY
+/// over the coefficient index `i` — the case [`gate_gerr_out`]'s header says it
+/// cannot cover.
+///
+/// ## What the old note claimed, and what is actually true
+///
+/// [`gate_gerr_out`]'s derivation ends "`alpha_j` and `s_j` are uniform over
+/// the coefficient index `i`, so the factor pulls straight out of the
+/// `sum_i (...) * xabs_ext_i` aggregate", and two call-site comments turned
+/// that into a prohibition: *"a per-start-node alpha cannot be baked forward"*
+/// (`margin_row/mod.rs`, `margin_row/spec_alpha.rs`). That prohibition is
+/// STRONGER THAN THE MATHEMATICS. Uniformity is what lets a single factor pull
+/// out; it is not what makes the bound true.
+///
+/// The per-coefficient step of that derivation never used uniformity:
+///
+/// ```text
+/// |dM'_ji| + |dD'_ji| = max(a_ji*|dM_ji - dD_ji|, s_ji*|dM_ji + dD_ji|)
+///                    <= max(a_ji, s_ji) * (|dM_ji| + |dD_ji|)
+/// ```
+///
+/// holds for EACH `i` on its own, with that `i`'s own slopes. Only the
+/// aggregation step needs a common constant, and any upper bound of the
+/// per-`i` factors serves:
+///
+/// ```text
+/// g_err_out[j] =  sum_i (|dM'_ji| + |dD'_ji|) * xabs_ext_i
+///              <= sum_i max(a_ji, s_ji) * (|dM_ji| + |dD_ji|) * xabs_ext_i
+///              <= A_j * sum_i (|dM_ji| + |dD_ji|) * xabs_ext_i
+///               = A_j * g_err_in[j],   A_j := max_i max(a_ji, s_ji)
+/// ```
+///
+/// `A_j` is still in `[0, 1]` because every slope is, so the functional still
+/// CANNOT GROW across a relu — the property the `max` form was adopted for.
+/// When the slopes happen to be uniform, `A_j` collapses to `max(alpha_j, s_j)`
+/// and this is [`gate_gerr_out`] exactly.
+///
+/// ## Consequence
+///
+/// This function's own result stands: the ERROR CARRY is valid with slopes that
+/// vary over `i`, with `A_j = max_i max(a_ji, s_ji)`. That is a real
+/// generalization of [`gate_gerr_out`] and it is what the derivation proves.
+///
+/// ⚠ **An earlier version of this note went on to claim that "the margin-row
+/// tableau carries the spec rows as coefficient COLUMNS", and therefore that
+/// varying alpha over `i` DELIVERS abc's per-start-node alpha. THAT CLAIM IS
+/// FALSE.** The tableau's columns are the network's INPUT coordinates plus a
+/// bias: `naug = net.n_in + 1`, and `build_retaining_inner` validates
+/// `lo.len() == n_in` against the input box. The spec/start-node axis is a
+/// different axis entirely — it indexes `RootEval::dj`, one entry per
+/// adversarial class, and it is produced on the BACKWARD side. So "alpha
+/// varying over `i`" is a per-INPUT-COORDINATE alpha, not a per-start-node one.
+///
+/// **Two separate questions were conflated, and only one is answered here.**
+/// This derivation bounds the floating-point error functional; it says nothing
+/// about whether the RELAXATION stays a valid enclosure when the lower slope
+/// differs per column. That second question is OPEN. A randomized probe of a
+/// simplified concretization found apparent violations at 1.56% under
+/// per-column alpha — but its negative control FAILED (the uniform, shipped,
+/// moat-clean case violated at 0.146% in the same harness), so the probe models
+/// the real bound badly and settles nothing in either direction.
+///
+/// ⛔ **Therefore: do NOT arm a non-uniform per-column alpha on the forward
+/// bake.** No production caller uses a non-uniform alpha; only
+/// `margin_row/tests.rs` exercises this function, and it must stay that way
+/// until the enclosure question is answered on the real concretization, error
+/// carry included. The sound route to abc's per-start-node alpha does not need
+/// non-uniformity at all: bake a SEPARATE tableau per blocking class, each with
+/// its own uniform alpha (not implemented).
+///
+/// ## What this function does NOT do
+///
+/// It changes no behaviour. Nothing calls it yet: the forward lane still bakes
+/// one slope per neuron, and `#spec-alpha` is still backward-only. This exists
+/// so the obstruction is retired with a proof and a test rather than by
+/// assertion, and so the forward adoption is a separate, measurable step.
+///
+/// `slopes_j` and `alphas_j` are neuron `j`'s per-column slopes. Empty input
+/// returns `gerr_in_j` unchanged (charge 1, the identity — never 0, which would
+/// admit everything).
+#[inline]
+#[cfg(test)]
+pub(crate) fn gate_gerr_out_nonuniform(alphas_j: &[f64], slopes_j: &[f64], gerr_in_j: f64) -> f64 {
+    debug_assert_eq!(
+        alphas_j.len(),
+        slopes_j.len(),
+        "per-column alpha and s must be the same width"
+    );
+    if alphas_j.is_empty() {
+        return gerr_in_j;
+    }
+    let a_max = alphas_j
+        .iter()
+        .zip(slopes_j.iter())
+        .fold(0.0_f64, |acc, (&a, &s)| acc.max(a.max(s)));
+    gate_gerr_out(a_max, a_max, gerr_in_j)
+}
+
 /// f32-fast-path g_err propagation across ONE forward conv (`NY_MARGIN_ROW_ROOT_F32`).
 ///
 /// Returns the per-output-neuron certified error functional
@@ -2217,12 +3622,17 @@ pub(crate) fn gate_gerr_out(alpha_j: f64, s_j: f64, gerr_in_j: f64) -> f64 {
 /// * f32 M-lane error at `(j,i)`: `<= gamma_f32 * (|W| @ |mi|)_ji` — the f32
 ///   rounding of an accumulation of `k_fwd` terms plus the input f64->f32 and
 ///   weight->f32 conversions (all folded into `gamma_n_f32(k_fwd+8)`).
-/// * f32 D-lane error at `(j,i)`: `<= gamma_f32 * (|W| @ din)_ji`.
+/// * f32 D-lane error at `(j,i)`: `<= gamma_f32 * (|W| @ |din|)_ji`. The D
+///   lane is SIGNED (every gate with `U < L` makes it negative), so the bound
+///   needs the MAGNITUDE `|din|`: the historical `B[t]` summed `|mi| + din`,
+///   which charges a coefficient with `din = -|mi|` NOTHING while both its
+///   f32 products are off by `~u32 |W| |mi|` (#root-rounding follow-up,
+///   `conv_f32_gerr_charges_a_signed_d_lane_by_magnitude`).
 /// * propagated input error: `<= (|W| @ g_err_in-as-coeffs)`.
 ///
 /// Summing `E_out_ji * xabs_ext_i` over `i` collapses the per-coefficient matrix
 /// into a per-neuron VECTOR conv (`|W|` gather, ONE column) over
-/// `g_err_in[t] + gamma_f32 * B[t]`, with `B[t] = sum_i (|mi_ti| + din_ti) *
+/// `g_err_in[t] + gamma_f32 * B[t]`, with `B[t] = sum_i (|mi_ti| + |din_ti|) *
 /// xabs_ext_i` (bias column weight 1). Cost: one length-`n` reduction + one
 /// single-column `conv_abs` — negligible beside the two full-width conv lanes.
 /// Everything is rounded outward (upper bound). A per-output additive floor
@@ -2233,7 +3643,7 @@ pub(crate) fn gate_gerr_out(alpha_j: f64, s_j: f64, gerr_in_j: f64) -> f64 {
 ///   per coefficient) and the D-output `certify_up` re-store
 ///   (`<= ~2*UNIT_F32*do32 + F32_MIN_POSITIVE`), both dominated by an extra
 ///   `8*UNIT_F32 * Bd[t]` inside the `|W|`-gather, with `Bd[t] =
-///   sum_i din_ti * xabs_ext_i` the D-LANE-ONLY functional (the din dust is
+///   sum_i |din_ti| * xabs_ext_i` the D-LANE-ONLY functional (the din dust is
 ///   `<= 2*UNIT_F32*Bd` outright, and the do-side functional is `<= (1+eps) *
 ///   (|W| @ [2*UNIT_F32*Bd])_j`) — 2x margin. Charging the full `B[t]`
 ///   (|M|+D envelope) here was sound but ~|M|/D-fold conservative — D runs
@@ -2272,6 +3682,20 @@ pub(crate) fn conv_f32_gerr<T: TabElem>(
     let bwiden = gamma_n(naug + 2);
     let mis = mi.as_slice().expect("standard layout");
     let dins = din.as_slice().expect("standard layout");
+    // D-lane magnitude in `B`/`Bd`: `|din|` (the D lane is SIGNED). The
+    // TEST-ONLY #root-rounding legacy switch restores the historical signed
+    // `din` so that switch replays the whole pre-repair walk on the f32 lanes
+    // too (`f32_root_lanes_enclose_the_exact_hull_over_a_signed_d_lane`);
+    // always the magnitude outside `cfg(test)`. Read here, on the calling
+    // thread, never inside the rayon closure below.
+    let signed_legacy = legacy_rounding_forced();
+    let dmag = move |v: f64| -> f64 {
+        if signed_legacy {
+            v
+        } else {
+            v.abs()
+        }
+    };
     // ginp[t] = g_err_in[t] + gamma_f32 * B[t]  (a per-input-neuron scalar).
     let mut ginp = Array2::<f64>::zeros((n_src, 1));
     ginp.as_slice_mut()
@@ -2282,7 +3706,7 @@ pub(crate) fn conv_f32_gerr<T: TabElem>(
             let mrow = &mis[t * naug..(t + 1) * naug];
             let drow = &dins[t * naug..(t + 1) * naug];
             let mut braw = 0.0;
-            // D-lane-only functional `Bd[t] = sum_i din_ti * xabs_ext_i`
+            // D-lane-only functional `Bd[t] = sum_i |din_ti| * xabs_ext_i`
             // (storage lane only): the din/do_ up-store dust is proportional
             // to the D LANE's own magnitudes, so it is budgeted against Bd,
             // not the full |M|+D envelope B (the old fused-B charge was the
@@ -2298,17 +3722,17 @@ pub(crate) fn conv_f32_gerr<T: TabElem>(
                 let lo = (b * blk).min(n_in);
                 let hi = (lo + blk).min(n_in);
                 for i in lo..hi {
-                    braw += (mrow[i].wide().abs() + drow[i].wide()) * xabs[i];
+                    braw += (mrow[i].wide().abs() + dmag(drow[i].wide())) * xabs[i];
                     if store_dust {
-                        braw_d += drow[i].wide() * xabs[i];
+                        braw_d += dmag(drow[i].wide()) * xabs[i];
                     }
                 }
             }
             // Bias column (index n_in): xabs_ext weight = 1.
-            braw += mrow[n_in].wide().abs() + drow[n_in].wide();
+            braw += mrow[n_in].wide().abs() + dmag(drow[n_in].wide());
             let b_up = next_up(braw * (1.0 + bwiden));
             *gt = if store_dust {
-                braw_d += drow[n_in].wide();
+                braw_d += dmag(drow[n_in].wide());
                 let bd_up = next_up(braw_d * (1.0 + bwiden));
                 next_up(
                     gerr_in[t] + gf32 * b_up + 8.0 * UNIT_F32 * bd_up + F32_MIN_POSITIVE * s_xabs,
@@ -2379,6 +3803,21 @@ fn concretize_box<T: TabElem>(
     // makes the soundness margin DEPTH-INDEPENDENT (root-tableau adversarial oracle +
     // formal analysis, wf_af482867). Pure widening: dj can only shrink -> never a
     // false-UNSAT (moat-safe).
+    //
+    // REFUTED AS STATED and REPAIRED (#root-rounding): the coefficient-column
+    // widenings were not re-absorbed by
+    // `rl` in general. A positive-coefficient row concretizes at `lo_i < 0` to
+    // `m lo_i + d |lo_i|`, so every coefficient widening RAISED the lower end
+    // there (and lowered the upper end at a negative-coefficient row), and this
+    // envelope covers that only in proportion to `tabs + |bl| + |bu|`, which a
+    // cancelling row with a near-zero bias makes tiny (a 1-input, 2-trunk-relu
+    // stable-active net missed its trunk-1 box by 2.9e-15 in exact rationals).
+    // Every op now charges its own rounding sign-safely in the D BIAS column
+    // (#root-rounding block), so the tableau arriving here is an exact
+    // sandwich of the stored network over the box, and `gam` only has to cover
+    // THIS function's rounding: the `m -+ d` subtractions and the `n_in`-term
+    // sums, `<= gamma_{n_in + 3} (tabs + |bl|)` per endpoint. The historical
+    // depth-scaled constant is kept, now a strict over-charge for that job.
     let gam = gamma_n(n_in + 16 + 8 * relu_depth);
     let ms = m.as_slice().expect("standard layout");
     let ds = d.as_slice().expect("standard layout");
@@ -2442,7 +3881,10 @@ fn concretize_box<T: TabElem>(
 /// DeepPoly gates from a box — exact Python-parity formulas
 /// (`core.py::gates_from_box`): active `l >= 0` => (1,1,0); inactive
 /// (else, `u <= 0`) => (0,0,0); unstable => `s = u/(u-l)`,
-/// `c = -u*l/(u-l)`, `alpha = [u >= -l]`.
+/// `c = -u*l/(u-l)`, `alpha = [u >= -l]`. If an intermediate makes the
+/// legacy slope/intercept nonfinite on finite endpoints, use an equivalent
+/// bounded-ratio slope and a certified endpoint intercept instead. Every
+/// finite legacy slope/intercept retains its original bits.
 pub fn gates_from_box(l: &[f64], u: &[f64]) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     let n = l.len();
     let mut alpha = vec![0.0; n];
@@ -2456,10 +3898,60 @@ pub fn gates_from_box(l: &[f64], u: &[f64]) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
             let (uu, ll) = (u[j], l[j]);
             s[j] = uu / (uu - ll);
             c[j] = -uu * ll / (uu - ll);
+            if !(s[j].is_finite() && c[j].is_finite()) {
+                if let Some((slope, intercept)) = finite_upper_line_from_endpoints(ll, uu, None) {
+                    s[j] = slope;
+                    c[j] = intercept;
+                }
+            }
             alpha[j] = if uu >= -ll { 1.0 } else { 0.0 };
         }
     }
     (alpha, s, c)
+}
+
+/// Exceptional arithmetic only: avoid both `u-l` and `-u*l` overflow. For
+/// any stored slope in [0,1], a certified intercept is
+/// `max(-s*l, u-s*u)`. Directed products/subtraction include gradual-underflow
+/// dust. The known endpoint bounds `-s*l <= -l` and `u-s*u <= u` cap excess
+/// outward nudges, so even MAX endpoints need no infinite intercept.
+fn finite_upper_line_from_endpoints(
+    l: f64,
+    u: f64,
+    preferred_slope: Option<f64>,
+) -> Option<(f64, f64)> {
+    if !(l.is_finite() && u.is_finite() && l < 0.0 && u > 0.0) {
+        return None;
+    }
+    let a = -l;
+    let slope = match preferred_slope {
+        Some(s) if s.is_finite() && (0.0..=1.0).contains(&s) => s,
+        _ if a >= u => {
+            let ratio = u / a;
+            ratio / (1.0 + ratio)
+        }
+        _ => {
+            let ratio = a / u;
+            1.0 / (1.0 + ratio)
+        }
+    };
+    let left = if slope == 0.0 {
+        0.0
+    } else {
+        next_up(slope * a).min(a)
+    };
+    let right = if slope == 1.0 {
+        0.0
+    } else {
+        let product_lower = if slope == 0.0 {
+            0.0
+        } else {
+            next_down(slope * u).max(0.0)
+        };
+        next_up(u - product_lower).min(u)
+    };
+    let intercept = left.max(right).max(0.0);
+    (slope.is_finite() && intercept.is_finite()).then_some((slope, intercept))
 }
 
 /// Certified upper-line repair (outward mode): the f64 chord `(s, c)` must
@@ -2471,10 +3963,10 @@ pub fn gates_from_box(l: &[f64], u: &[f64]) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
 /// relaxation (always sound).
 pub fn repair_upper_lines(l: &[f64], u: &[f64], s: &mut [f64], c: &mut [f64]) {
     for j in 0..l.len() {
-        if s[j] == 0.0 && c[j] == 0.0 {
+        if s[j] == 0.0 && c[j] == 0.0 && u[j] <= 0.0 {
             continue; // inactive: exact
         }
-        if s[j] == 1.0 && c[j] == 0.0 {
+        if s[j] == 1.0 && c[j] == 0.0 && l[j] >= 0.0 {
             continue; // active: exact (identity line dominates relu everywhere above l>=0)
         }
         if c[j] < 0.0 {
@@ -2486,17 +3978,56 @@ pub fn repair_upper_lines(l: &[f64], u: &[f64], s: &mut [f64], c: &mut [f64]) {
         let d1 = -(sl + c[j]) + head;
         let d2 = u[j] - (su + c[j]) + head;
         let bump = d1.max(d2).max(0.0);
-        if bump > 0.0 {
-            c[j] = next_up(next_up(c[j] + bump));
+        let repaired = if bump > 0.0 {
+            next_up(next_up(c[j] + bump))
+        } else {
+            c[j]
+        };
+        if s[j].is_finite() && repaired.is_finite() {
+            c[j] = repaired;
+        } else if let Some((slope, intercept)) =
+            finite_upper_line_from_endpoints(l[j], u[j], Some(s[j]))
+        {
+            s[j] = slope;
+            c[j] = intercept;
+        } else {
+            // Invalid/nonfinite endpoint domains remain visible to the
+            // existing numerical firewall; they cannot gain gate authority.
+            c[j] = repaired;
         }
     }
 }
 
+#[cfg(test)]
+#[path = "root_extreme_gate_tests.rs"]
+mod extreme_gate_tests;
+
 /// Gate application on the tableau (Python parity):
 /// `L = (M-D)*alpha; U = (M+D)*s; U_bias += c; M' = (L+U)/2; D' = (U-L)/2`.
-/// Outward: widen `D'` by the elementwise rounding envelope.
 ///
-/// TWO OUTWARD WIDENING FORMULAS (#rebake). The per-coefficient obligation is
+/// OUTWARD (#root-rounding, the shipped path, `apply_gates_signsafe`). The
+/// obligation is FUNCTIONAL, not per coefficient: for every `x~ = (x, 1)` with
+/// `|x_i| <= xabs_i`,
+///
+///   (‡)  `(M' - D') x~ <= L x~`  and  `(M' + D') x~ >= U x~`  in REAL arithmetic,
+///
+/// with `L = (m-d)*alpha`, `U = (m+d)*s (+ c on the bias)` the exact products
+/// of the STORED inputs. `M'`, `D'` are the plain f64 results; per coefficient
+/// they miss (‡)'s exact walls by at most `e_i`, where (u = 2^-53)
+/// `|lo_c - L| <= gamma_2/(1-gamma_2) |lo_c|` (the sub and, for fractional
+/// alpha, the mul), `|up0 - U0| <= gamma_2/(1-gamma_2) |up0|`, the bias add
+/// `<= u/(1-u) |up_c|`, and `mm -+ dd = lo_c|up_c + d6 Mh -+ d7 Dh` with
+/// `|d6 Mh| + |d7 Dh| <= u max(|lo_c|, |up_c|)`; together
+/// `e_i <= 3.0000002u W_i`, `W_i = |lo_c| + |up_c| (+ |up0| on the bias)`,
+/// for binary AND fractional alpha (no chord coupling is needed). The charge
+/// `4u sum_i W_i xabs_ext_i` (certified by `root_round_charge`) is added to
+/// `D'[bias]`, which moves both walls outward by it at EVERY `x`, so (‡) holds
+/// whatever the sign of the input box. Pinned in exact rationals by
+/// `fractional_alpha_apply_gates_widening_covers_the_extra_rounding`.
+///
+/// HISTORICAL coefficient-column widening (reachable only through the
+/// TEST-ONLY legacy switch `with_legacy_rounding_charge_for_test`; Parity
+/// stores `mm`/`dd` unwidened). The per-coefficient obligation was
 ///
 ///   (†)  `M' - D' <= L` and `M' + D' >= U`  in REAL arithmetic,
 ///
@@ -2548,9 +4079,10 @@ pub fn repair_upper_lines(l: &[f64], u: &[f64], s: &mut [f64], c: &mut [f64]) {
 ///   The movement `|drow - dd| <= ~9.5uW` stays first-order-in-u times the
 ///   row magnitudes — the same class as the historical ~7uB — so the
 ///   depth-scaled `gamma_n(n_in + 16 + 8*relu_depth)` concretize envelope
-///   absorbs its cross-layer second-order leak exactly as before (n_in >> 8R
-///   on every twin-wall net); the adversarial enclosure oracle is the
-///   empirical backstop.
+///   was supposed to absorb its cross-layer leak (n_in >> 8R on every
+///   twin-wall net). That argument was REFUTED (a coefficient widening moves a
+///   wall INWARD at negative inputs, and the envelope scales with the row's own
+///   magnitudes), which is what #root-rounding repairs.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_gates<T: TabElem>(
     m: &Array2<T>,
@@ -2564,6 +4096,9 @@ pub(crate) fn apply_gates<T: TabElem>(
     blk: usize,
     xabs_ext: &[f64],
 ) -> (Array2<T>, Array2<T>, Vec<f64>) {
+    if mode.outward() && !legacy_rounding_forced() {
+        return apply_gates_signsafe(m, d, alpha, s, c, n_in, smask, blk, xabs_ext);
+    }
     let naug = n_in + 1;
     let n = m.nrows();
     let mut mo = Array2::<T>::from_elem((n, naug), T::ZERO);

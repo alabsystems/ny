@@ -9,10 +9,10 @@ use super::crossfade_support::{
 use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
-// Real-weight crossfade verification on the vocoder prefix subgraph (#3500)
+// Real-weight crossfade verification on the vocoder prefix subgraph
 //
-// Bridges #3500 acceptance criteria 2 (crossfade energy ∈ [0.5, 1.5]) and
-// 3 (phase alignment) from the synthetic proofs in
+// Bridges the acceptance criteria for crossfade energy (∈ [0.5, 1.5]) and
+// phase alignment from the synthetic proofs in
 // `ny-propagate/src/tests/streaming_boundary/crossfade.rs` to real Kokoro
 // vocoder weights.
 //
@@ -20,13 +20,11 @@ use std::sync::OnceLock;
 // node, 15360 output elements, 240 boundary samples). The crossfade math is
 // identical to the synthetic version — only the bounds come from real weights.
 //
-// Full-graph waveform crossfade remains on the broader deep-graph lane: #3619
-// still keeps deep CROWN equal to IBP, and #3597 is still carrying the
-// graph-wide engine-threading handoff. This prefix crossfade proves the
-// overlap-add math on real intermediate features from the first upsampling
-// stage.
+// Full-graph waveform crossfade remains on the broader deep-graph lane (deep
+// CROWN tightening and graph-wide engine threading). This prefix crossfade
+// proves the overlap-add math on real intermediate features from the first
+// upsampling stage.
 //
-// Reference: designs/2026-03-11-issue-3500-kokoro-vocoder-boundary-surface.md
 // Reference: crates/ny-propagate/src/tests/streaming_boundary/crossfade.rs
 // ---------------------------------------------------------------------------
 
@@ -122,7 +120,7 @@ pub(super) fn prefix_ibp_boundary_fixtures() -> BoundaryFixture {
 #[cfg(feature = "external-avoice")]
 fn test_prefix_ibp_crossfade_energy_bounded_3500() {
     crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
-    // #3500 acceptance criterion 2: Prove crossfade energy stays in
+    // Acceptance criterion: prove crossfade energy stays in
     // [0.5, 1.5] of steady-state energy. Real Kokoro weights, prefix subgraph.
     //
     // The streaming architecture produces two adjacent chunks from the same
@@ -211,7 +209,7 @@ fn test_prefix_ibp_crossfade_energy_bounded_3500() {
 #[cfg(feature = "external-avoice")]
 fn test_prefix_ibp_crossfade_phase_alignment_3500() {
     crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
-    // #3500 acceptance criterion 3: Prove phase alignment of overlapping
+    // Acceptance criterion: prove phase alignment of overlapping
     // regions. Real Kokoro weights, prefix subgraph.
     //
     // Phase alignment means the crossfade interval width at each sample does
@@ -312,7 +310,7 @@ fn test_prefix_ibp_crossfade_convex_combination_3500() {
 }
 
 // ---------------------------------------------------------------------------
-// Two-chunk crossfade with different feature centers (#3500)
+// Two-chunk crossfade with different feature centers
 //
 // The tests above use the same perturbation model (center=0.0) for both chunks.
 // In real avoice streaming, adjacent chunks have different audio content:
@@ -338,7 +336,7 @@ fn test_prefix_ibp_crossfade_convex_combination_3500() {
 #[cfg(feature = "external-avoice")]
 fn test_two_chunk_crossfade_energy_bounded_3500() {
     crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
-    // #3500: Two-chunk crossfade energy with different feature centers.
+    // Two-chunk crossfade energy with different feature centers.
     //
     // chunk_A (center=0.0) represents the outgoing streaming chunk.
     // chunk_B (center=0.1) represents the incoming chunk with different
@@ -409,7 +407,7 @@ fn test_two_chunk_crossfade_energy_bounded_3500() {
 #[cfg(feature = "external-avoice")]
 fn test_two_chunk_crossfade_phase_alignment_3500() {
     crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
-    // #3500: Phase alignment with different feature centers.
+    // Phase alignment with different feature centers.
     //
     // The crossfade interval width at each sample must not exceed the max
     // interval width of the two contributing chunks, even when those chunks

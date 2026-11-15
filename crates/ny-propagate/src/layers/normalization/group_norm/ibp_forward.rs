@@ -5,12 +5,13 @@
 //! Forward-mode IBP for GroupNorm using Jacobian-based propagation.
 //!
 //! Split from ibp.rs to stay under the 500-line file limit.
-//! Part of #3205.
 
 use ny_core::{checked_dim_product, NyError, Result};
 use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor, RepairStrategy};
 
-use super::super::math_common::{compute_batch_prefix, outward_midpoint_radius};
+use super::super::math_common::{
+    compute_batch_prefix, outward_midpoint_radius, CENTERED_NORM_SECOND_ORDER_COEFF,
+};
 use super::types::GroupNormLayer;
 use crate::bounds::{nan_propagating_max, nan_propagating_min};
 
@@ -30,12 +31,12 @@ impl GroupNormLayer {
         let group_size = center_vals.len();
         let time_len = group_size / cpg;
         let nf = group_size as f32;
-        // f64 accumulation + directed rounding (#3327, pattern from #3324)
+        // f64 accumulation + directed rounding
         let nf_64 = group_size as f64;
         let eps_64 = self.eps as f64;
         let group_start_ch = group_idx * cpg;
 
-        // Group mean and std at center — fully in f64 to prevent cancellation (#3327)
+        // Group mean and std at center — fully in f64 to prevent cancellation
         let mean_c_f64: f64 = center_vals.iter().map(|&x| x as f64).sum::<f64>() / nf_64;
         let mean_c = mean_c_f64 as f32;
         let var_c_f64: f64 = center_vals
@@ -125,11 +126,11 @@ impl GroupNormLayer {
             let c = group_start_ch + (s / time_len);
             let ny_s = self.ny[c];
             let beta_s = self.beta[c];
-            // Center-point output in f64 for precision (#3327)
+            // Center-point output in f64 for precision
             let y_center = (ny_s as f64 * z_f64[s] + beta_s as f64) as f32;
 
             // First-order radius: sum of |J_sj| * radius_j
-            // Jacobian entries and sum in f64 to avoid cancellation (#3327)
+            // Jacobian entries and sum in f64 to avoid cancellation
             let g_f64 = ny_s as f64;
             let mut first_order_radius_f64 = 0.0_f64;
             for j in 0..group_size {
@@ -144,7 +145,7 @@ impl GroupNormLayer {
             // Second-order remainder bound
             let second_order_denom = nf.sqrt() * std_min * std_min;
             let second_order = if second_order_denom.is_finite() && second_order_denom > 0.0 {
-                3.5 * ny_s.abs() * radius_sq_sum / second_order_denom
+                CENTERED_NORM_SECOND_ORDER_COEFF * ny_s.abs() * radius_sq_sum / second_order_denom
             } else {
                 f32::INFINITY
             };
@@ -152,7 +153,7 @@ impl GroupNormLayer {
             let output_radius = first_order_radius + second_order;
             // Directed rounding on final emit: y_center has f64→f32 rounding
             // error up to 0.5 ULP, and f32 subtraction/addition adds another
-            // 0.5 ULP. next_down/next_up compensates both. Part of #3344.
+            // 0.5 ULP. next_down/next_up compensates both.
             let mut jac_lower = next_down_f32(y_center - output_radius);
             let mut jac_upper = next_up_f32(y_center + output_radius);
 
@@ -198,7 +199,7 @@ impl GroupNormLayer {
         mean_c: f32,
         mean_radius: f32,
     ) -> f32 {
-        // f64 accumulation for var_lower (#3327, pattern from #3324)
+        // f64 accumulation for var_lower
         let nf_64 = center_vals.len() as f64;
         let mut var_lower_f64: f64 = 0.0;
         for i in 0..center_vals.len() {
@@ -216,7 +217,7 @@ impl GroupNormLayer {
         }
         // next_down: var_lower feeds into std_min denominator → round DOWN for soundness
         let var_lower = next_down_f32((var_lower_f64 / nf_64) as f32);
-        // next_down: std_min is a denominator → smaller = larger R2 = sound. #3327.
+        // next_down: std_min is a denominator → smaller = larger R2 = sound.
         next_down_f32(((var_lower as f64 + self.eps as f64).sqrt()) as f32)
     }
 

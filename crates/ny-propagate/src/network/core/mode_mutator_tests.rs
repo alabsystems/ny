@@ -5,7 +5,7 @@
 //! Parity matrix tests for layer-mode mutators.
 //!
 //! Verifies that all 9 mode mutators produce identical effects on equivalent
-//! `Network` and `GraphNetwork` fixtures. Part of #2803.
+//! `Network` and `GraphNetwork` fixtures.
 
 use super::{GraphNetwork, GraphNode, Network};
 use crate::layers::{
@@ -256,7 +256,7 @@ fn test_mode_mutators_all_setters() {
     assert_eq!(ln.mode, LayerNormMode::MeanOnly);
     assert_eq!(ln.crown_mode, LayerNormCrownMode::Cut);
 
-    // Spot-check: GroupNorm on Network (Part of #3391)
+    // Spot-check: GroupNorm on Network
     let Layer::GroupNorm(gn) = &net.layers[2] else {
         unreachable!("expected GroupNorm at index 2");
     };
@@ -272,7 +272,7 @@ fn test_mode_mutators_all_setters() {
     assert_eq!(ln_g.mode, LayerNormMode::MeanOnly);
     assert_eq!(ln_g.crown_mode, LayerNormCrownMode::Cut);
 
-    // Spot-check: GroupNorm on GraphNetwork (Part of #3391)
+    // Spot-check: GroupNorm on GraphNetwork
     let gn_node = graph.node("gn").expect("gn node missing");
     let Layer::GroupNorm(gn_g) = &gn_node.layer else {
         unreachable!("expected GroupNorm node");
@@ -296,7 +296,7 @@ fn test_mode_mutators_all_setters() {
 /// Unary transformer ops (Softmax, CausalSoftmax, LayerNorm, RmsNorm, SiLU,
 /// GELU) now allow CROWN-IBP intermediates because they have direct CROWN
 /// backward support and the demand-driven selection limits tightening to
-/// needed producers (#3775). Binary relaxation ops and GroupNorm/AdaIN1d
+/// needed producers. Binary relaxation ops and GroupNorm/AdaIN1d
 /// remain blocked.
 #[ntest::timeout(10000)]
 #[test]
@@ -346,7 +346,7 @@ fn test_should_use_crown_ibp_intermediates_unary_transformer_allowed_3775() {
 
 /// GroupNorm, MatMul, and MulBinary remain blocked from CROWN-IBP
 /// intermediates. These are the conservative surfaces kept out of the first
-/// demand-driven packet (#3775).
+/// demand-driven packet.
 #[ntest::timeout(10000)]
 #[test]
 fn test_should_use_crown_ibp_intermediates_binary_and_groupnorm_blocked_3775() {
@@ -422,7 +422,7 @@ fn test_should_use_crown_ibp_intermediates_binary_and_groupnorm_blocked_3775() {
 /// InstanceNorm1d is a CNN-style normalization layer compatible with CROWN-IBP
 /// intermediate tightening. Unlike transformer-style norms (LayerNorm, RmsNorm),
 /// InstanceNorm operates per-channel on CNN feature maps and the CROWN backward
-/// path is fully supported via `propagate_linear_with_bounds`.  Part of #3596.
+/// path is fully supported via `propagate_linear_with_bounds`.
 #[ntest::timeout(10000)]
 #[test]
 fn test_should_use_crown_ibp_intermediates_instance_norm() {
@@ -459,7 +459,7 @@ fn test_should_use_crown_ibp_intermediates_instance_norm() {
 
 /// Deep CNN DAGs should skip the O(N²) per-node CROWN-IBP collection and use
 /// the reference-style IBP intermediates + final CROWN pass once they exceed
-/// the small-graph threshold. Part of #3596.
+/// the small-graph threshold.
 #[ntest::timeout(10000)]
 #[test]
 fn test_should_collect_per_node_crown_ibp_intermediates_threshold_3596() {
@@ -478,7 +478,7 @@ fn test_should_collect_per_node_crown_ibp_intermediates_threshold_3596() {
 }
 
 /// Verify mode mutations do not affect `should_use_crown_ibp_intermediates`
-/// (it checks layer presence, not mode settings). Part of #3391.
+/// (it checks layer presence, not mode settings).
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_ibp_intermediates_invariant_under_mode_mutation() {

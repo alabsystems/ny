@@ -213,7 +213,7 @@ fn assert_shared_prefix_topology(
 }
 
 /// Softmax-cut stage localization: keep the shared-source prefix cut from the
-/// prior #318 packet, then intentionally degrade the Softmax node to IBP so the
+/// prefix-cut test, then intentionally degrade the Softmax node to IBP so the
 /// next widening boundary can be measured downstream of Softmax.
 #[ntest::timeout(60000)]
 #[cfg(feature = "external-whisper")]
@@ -530,7 +530,7 @@ fn test_whisper_attention_stage_localization_real_weights_318() {
 /// sentinel names reachable from it. An external input is any node name that
 /// does not exist in the graph (typically `_input` via `NETWORK_INPUT`).
 ///
-/// Test-local helper for #318 prefix-cut topology assertion.
+/// Test-local helper for the prefix-cut topology assertion.
 fn reachable_external_inputs(graph: &GraphNetwork, start: &str) -> BTreeSet<String> {
     let mut result = BTreeSet::new();
     let mut stack = vec![start.to_string()];
@@ -555,9 +555,6 @@ fn reachable_external_inputs(graph: &GraphNetwork, start: &str) -> BTreeSet<Stri
 /// `ln_output` and verify that both `query` and `key` trace back to one shared
 /// `_input` sentinel. Then run IBP and zonotope through the suffix to measure
 /// per-stage widths.
-///
-/// Part of #318: shared-source prefix cut.
-/// Design: designs/2026-03-11-issue-318-whisper-shared-source-prefix-cut.md
 #[ntest::timeout(60000)]
 #[cfg(feature = "external-whisper")]
 #[test]

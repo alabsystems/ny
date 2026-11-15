@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! External public API smoke test for engine-aware parallel helpers (#3772).
+//! External public API smoke test for engine-aware parallel helpers.
 //!
 //! This test proves that `verify_parallel_with_engine` and
 //! `verify_parallel_with_method_and_engine` are reachable from both the crate

@@ -1,6 +1,6 @@
 # ny-cert proof-carrying soundness trust-base audit
 # Reproduce: lake exe cache get && lake build NyProof.AxiomAudit && lake env lean NyProof/AxiomAudit.lean
-# Clean dependency: 9a9b16e44b9233d0c387839ea205a22fb77ac4bb (crown-proofs/lean)
+# Clean dependency: e7ae5d418cbac2e1a029369a5b5eda690d471c5c (crown-proofs/lean)
 # Full certified sat_relu sweep: lake build NyProof.SatReluSweepAll
 # Toolchain: Lean (version 4.30.0, arm64-apple-darwin24.6.0, commit d024af099ca4bf2c86f649261ebf59565dc8c622, Release)
 # Generated against Mathlib v4.30.0. Expected: every theorem depends on AT MOST
@@ -23,6 +23,40 @@
 #   hs_stable_neg_int_unsound refuting the symmetric form ny currently ships); and integer
 #   interval arithmetic for +/- and +-1-weighted sums is exact, not merely sound — plus the
 #   margin lever (lattice_lower_forces_nonneg) and its sharpness.  164 theorems total.
+# 2026-10-08: regenerated ONLY from actual complete pinned Lean 4.30.0 audit stdout.
+# Audited source commit: cd23acfe5a44e77f770854d9d9fd159fa31386ac
+# Audited source tree: 29c8a7f1ad41cebb1f42f25fbce0d0fa8e1a458a
+# New PrefixCover source SHA256: 6d10274535c9f39f7f4441e0fded96e88e7da77327153747f267800e148ec708 (18,302 bytes; historical 81ef source unrecovered).
+# Required audit queries: 186 complete, including 18 new PrefixCover queries.
+# Whole-overlay commands: lake build NyProof NyProof.AxiomAudit; lake env lean NyProof/AxiomAudit.lean.
+# Both actual return codes: 0; planned 78 files / 72 Lean files unchanged.
+# Actual stdout SHA256: fa00c2bcf40bd9dcbc21eefec78e21350f9cc8dceda19ca307a4d78c72b068ca
+# All ten dependency Git revisions equal the pinned manifest and are tracked-clean.
+# Actual axioms: only propext / Classical.choice / Quot.sound or none; no sorryAx or missing queries.
+# Exact evidence: docs/engine_program/evidence/2026-10-08-prefix-formal/receipt-extended.json.
+# Official Lean overlay qualified; linked CIC REJECTED; compiled Rust, numeric pruning and resources unproved.
+# Current registered overlay: 201 exact axiom queries; official Lean 4.30.0.
+# New centered-normalization source SHA256 996ca943491d97b21e47c44c5c93b6444d12ba7c55e9668a955bad4c262f6c6b.
+# Exact source/state/build and failed predecessors are preserved in the centered-normalization formal evidence packet.
+# Linked CIC, compiled Rust, numeric and resource correspondence remain unqualified.
+'NyProof.PrefixCover.covers_original_parent' depends on axioms: [propext, Quot.sound]
+'NyProof.PrefixCover.member_contained_in_parent' depends on axioms: [propext, Quot.sound]
+'NyProof.PrefixCover.exact_descriptor_count' depends on axioms: [propext]
+'NyProof.PrefixCover.destination_first' depends on axioms: [propext]
+'NyProof.PrefixCover.canonical_member_order' depends on axioms: [propext]
+'NyProof.PrefixCover.sibling_descriptor_correspondence' depends on axioms: [propext]
+'NyProof.PrefixCover.sibling_final_opposite' depends on axioms: [propext, Quot.sound]
+'NyProof.PrefixCover.sibling_prefix_stops_at_first_opposite' depends on axioms: [propext]
+'NyProof.PrefixCover.sibling_has_no_later_phase' depends on axioms: [propext]
+'NyProof.PrefixCover.all_member_safety_transfer' depends on axioms: [propext, Quot.sound]
+'NyProof.PrefixCover.common_lower_bound' depends on axioms: [propext, Quot.sound]
+'NyProof.PrefixCover.strict_safety_of_all_member_bounds' depends on axioms: [propext, Quot.sound]
+'NyProof.PrefixCover.unique_binary_member' depends on axioms: [propext, Quot.sound]
+'NyProof.PrefixCover.exactly_one_binary_descriptor' depends on axioms: [propext, Quot.sound]
+'NyProof.PrefixCover.closed_zero_overlap_control' depends on axioms: [propext]
+'NyProof.PrefixCover.descriptor_multiplicity_control' depends on axioms: [propext, Quot.sound]
+'NyProof.PrefixCover.minimum_bound_control' does not depend on any axioms
+'NyProof.PrefixCover.maximum_member_bound_is_unsound_control' does not depend on any axioms
 'Crownproof.farkas_premise_combination' depends on axioms: [propext, Classical.choice, Quot.sound]
 'Crownproof.crown_bridge' depends on axioms: [propext, Classical.choice, Quot.sound]
 'Crownproof.crown_bridge_deepK' depends on axioms: [propext, Classical.choice, Quot.sound]
@@ -205,3 +239,26 @@
 'Crownproof.IntegerInterval.post_sign_layer_even' depends on axioms: [propext, Classical.choice, Quot.sound]
 'Crownproof.IntegerInterval.softmax_cmp_iff' depends on axioms: [propext, Classical.choice, Quot.sound]
 'Crownproof.IntegerInterval.straddling_bound_pins_zero' depends on axioms: [propext, Classical.choice, Quot.sound]
+'NyProof.CenteredNormalization.squaredNorm_nonneg' depends on axioms: [propext, Classical.choice, Quot.sound]
+'NyProof.CenteredNormalization.dot_sq_le' depends on axioms: [propext, Classical.choice, Quot.sound]
+'NyProof.CenteredNormalization.denominator_pos' depends on axioms: [propext, Classical.choice, Quot.sound]
+'NyProof.CenteredNormalization.divided_abs_bound_of_sq' depends on axioms: [propext, Classical.choice, Quot.sound]
+'NyProof.CenteredNormalization.normalized_direction_bound' depends on axioms: [propext, Classical.choice, Quot.sound]
+'NyProof.CenteredNormalization.normalized_direction_bound_card' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+'NyProof.CenteredNormalization.center_sum_zero' depends on axioms: [propext, Classical.choice, Quot.sound]
+'NyProof.CenteredNormalization.projected_dot_eq' depends on axioms: [propext, Classical.choice, Quot.sound]
+'NyProof.CenteredNormalization.dot_center_right_of_sum_zero' depends on axioms: [propext, Classical.choice, Quot.sound]
+'NyProof.CenteredNormalization.projected_normalized_direction_bound' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+'NyProof.CenteredNormalization.centered_coordinate_sq_bound' depends on axioms: [propext, Classical.choice, Quot.sound]
+'NyProof.CenteredNormalization.normalized_coordinate_bound' depends on axioms: [propext, Classical.choice, Quot.sound]
+'NyProof.CenteredNormalization.normalized_centered_coordinate_bound' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+'NyProof.CenteredNormalization.center_fin_one_zero' depends on axioms: [propext, Classical.choice, Quot.sound]
+'NyProof.CenteredNormalization.normalized_direction_with_constant' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]

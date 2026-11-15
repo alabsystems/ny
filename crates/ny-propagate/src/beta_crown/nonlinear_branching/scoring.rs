@@ -14,6 +14,10 @@ use crate::layers::Layer;
 
 impl NonlinearBranching {
     /// Score neurons in a node and return branching decisions.
+    ///
+    /// `bounds` MUST be the node's INPUT (pre-activation) interval, the one
+    /// `with_general_split` subdivides — never the node's own output bounds
+    /// (#genbab-selector-convention). Points are computed in that input space.
     pub(super) fn score_neurons(
         &self,
         node_name: &str,
@@ -28,7 +32,7 @@ impl NonlinearBranching {
         for (idx, (&l, &u)) in lower.iter().zip(upper.iter()).enumerate() {
             // Skip neurons with non-finite bounds (NaN or Inf from numerical instability).
             // NaN bounds produce NaN branching points and NaN scores, which propagate
-            // through the BaB tree creating unsound child domains. See #2882.
+            // through the BaB tree creating unsound child domains.
             if !l.is_finite() || !u.is_finite() {
                 continue;
             }
@@ -48,6 +52,15 @@ impl NonlinearBranching {
             // Compute branching points
             let points = self.branching_points(l, u, layer);
             if points.is_empty() {
+                continue;
+            }
+            // #genbab-selector-convention: never emit a split that cannot make
+            // progress. `bounds` is the node's INPUT interval — the one
+            // `with_general_split` clamps — so a point outside `(l, u)` would
+            // produce an empty child plus an unchanged one (see
+            // `points_strictly_partition`).
+            if !super::points_strictly_partition(l, u, &points) {
+                super::telemetry::record_rejected_non_partition();
                 continue;
             }
 

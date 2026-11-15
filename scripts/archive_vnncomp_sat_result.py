@@ -88,7 +88,11 @@ LEVER_SOURCES = frozenset(
 LEVER_BUCKETS = frozenset({"default_on", "auto", "cli", "debug"})
 LEVER_MOATS = frozenset({"none", "low", "high"})
 LEVER_PROVENANCE = frozenset(
-    {"value_neutral", "measured", "unmeasured", "guard"}
+    {"value_neutral", "measured", "unmeasured", "guard", "owner_directed"}
+)
+# Exact user-authorized defaults; this tag records policy, never measured value.
+OWNER_DIRECTED_DEFAULTS = frozenset(
+    {"NY_MARGIN_ROW_HEAD_GROUPS", "NY_MARGIN_ROW_HEAD_DIRECTIONAL_CUTS"}
 )
 LEVER_NAME = re.compile(r"^NY_[A-Z0-9_]+$")
 V1_INPUT_ASSIGNMENT = re.compile(
@@ -845,6 +849,13 @@ def _valid_v3_lever_state(
             and entry["bucket"] == "default_on"
         ) or (
             entry["provenance"] == "guard" and entry["bucket"] == "auto"
+        ):
+            return False
+        if entry["provenance"] == "owner_directed" and (
+            name not in OWNER_DIRECTED_DEFAULTS
+            or entry["bucket"] != "default_on"
+            or entry["moat"] != "high"
+            or not isinstance(entry["value"], bool)
         ):
             return False
         if not _valid_lever_value(entry["value"]):

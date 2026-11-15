@@ -599,6 +599,65 @@ fn an_infeasible_model_falls_open() {
 }
 
 #[test]
+fn mandatory_floors_use_available_rungs_without_changing_priors() {
+    // A floor in a ladder gap requires its next available rung, not the
+    // unavailable floor itself. 9 + 5 exceeds the 13-second pool for every
+    // prior, including the degenerate constant-zero objective.
+    for prior in [0.0, 0.5, 1.0] {
+        let lanes = vec![
+            LaneRequest::new(ladder(&[(3, 0.2), (9, 0.8)]))
+                .with_reach_prior(prior)
+                .no_worse_than(Duration::from_secs(4)),
+            LaneRequest::new(ladder(&[(5, 0.4), (11, 0.9)]))
+                .with_reach_prior(prior)
+                .no_worse_than(Duration::from_secs(5)),
+        ];
+        let request =
+            AllocationRequest::new(lanes, Duration::from_secs(17), Duration::from_secs(4))
+                .with_solve_cap(TEST_SOLVE_CAP);
+        assert_eq!(
+            allocate(&request),
+            AllocationOutcome::UseExistingPlan(FallOpen::Infeasible)
+        );
+    }
+}
+
+#[test]
+fn mandatory_floor_sum_cannot_wrap_the_whole_second_budget() {
+    let lanes = (0..2)
+        .map(|_| {
+            LaneRequest::new(ladder(&[(u64::MAX, 0.5)]))
+                .no_worse_than(Duration::from_secs(u64::MAX))
+        })
+        .collect();
+    let request = AllocationRequest::new(lanes, Duration::from_secs(u64::MAX), Duration::ZERO)
+        .with_solve_cap(TEST_SOLVE_CAP);
+    assert_eq!(
+        allocate(&request),
+        AllocationOutcome::UseExistingPlan(FallOpen::Infeasible)
+    );
+}
+
+#[test]
+fn readback_rejects_exact_spending_overflow_hidden_by_float_rounding() {
+    // The MILP's f64 budget row cannot distinguish 2^64 from u64::MAX.
+    // Exercise readback directly so a solver route cannot hide that boundary.
+    let cap = 1_u64 << 63;
+    let lanes = (0..2)
+        .map(|_| LaneRequest::new(ladder(&[(cap, 0.5)])))
+        .collect();
+    let request = AllocationRequest::new(lanes, Duration::from_secs(u64::MAX), Duration::ZERO);
+    assert_eq!(
+        finish(&request, &[1, 1]),
+        AllocationOutcome::UseExistingPlan(FallOpen::ConstraintViolatedInReadback)
+    );
+    let valid = plan_of(finish(&request, &[1, 0]));
+    assert_eq!(valid.committed(), Duration::from_secs(cap));
+    assert_eq!(valid.grants()[0].rung, 1);
+    assert_eq!(valid.grants()[1].rung, 0);
+}
+
+#[test]
 fn malformed_input_falls_open_and_never_panics() {
     // A non-finite prior.
     let request = AllocationRequest::new(
@@ -640,7 +699,7 @@ fn malformed_input_falls_open_and_never_panics() {
     // No lanes at all is an empty plan, not a fall-open and not a panic.
     let request = AllocationRequest::new(Vec::new(), Duration::from_mins(1), Duration::ZERO);
     let plan = plan_of(allocate(&request));
-    assert!(plan.grants().is_empty());
+    assert_eq!(plan.grants(), &[] as &[LaneGrant]);
     assert_eq!(plan.committed(), Duration::ZERO);
 }
 
@@ -786,7 +845,7 @@ fn every_cited_constant_still_reads_that_way_in_its_source() {
         let LadderProvenance::ReadFromSource { citations, .. } = ladder.provenance() else {
             panic!("{lane:?} must carry its citations");
         };
-        assert!(!citations.is_empty());
+        assert_ne!(*citations, &[] as &[SourceCitation]);
         for citation in *citations {
             let path = repo_root().join(citation.file);
             let text = std::fs::read_to_string(&path)
@@ -866,7 +925,7 @@ fn lanes_without_a_source_declared_ladder_say_so() {
         let unknown = declared_ladder(lane, Duration::from_mins(8))
             .expect_err("Layer A must not invent a ladder");
         assert_eq!(unknown.lane, lane);
-        assert!(!unknown.why.is_empty());
+        assert_ne!(unknown.why, "");
     }
 }
 

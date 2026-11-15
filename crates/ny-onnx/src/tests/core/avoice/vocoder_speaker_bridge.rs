@@ -10,9 +10,7 @@
 //! with real model weights without the slow `to_graph_network()` const-folding
 //! path.
 //!
-//! Bounded full-waveform IBP is out of scope here (tracked by #3500, #3622).
-//!
-//! Reference: designs/2026-03-15-issue-3719-ort-concrete-speaker-bridge.md
+//! Bounded full-waveform IBP is out of scope here.
 
 use super::common::assert_finite_and_ordered;
 use ny_propagate::network::dsp::build_qwen3_mel128_graph;

@@ -8,7 +8,7 @@
 //! - #87: Process 64+ domains per GPU call
 //! - #88: Measure 10x+ speedup vs serial CPU
 //!
-//! Run with: cargo run --release --example benchmark_gpu_batched -p ny-gpu
+//! Run with: targo --unverified run --release --example benchmark_gpu_batched -p ny-gpu
 
 use ndarray::{Array1, Array2};
 use ny_core::GemmEngine;

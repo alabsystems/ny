@@ -6,8 +6,8 @@
 
 //! Regression coverage for the real nn4sys parallel pensieve lane.
 //!
-//! This pins the `pensieve_big_parallel` path that regressed from running BaB
-//! to an immediate `error` during the March 2026 #4354 investigation.
+//! This pins the `pensieve_big_parallel` path that once regressed from running
+//! BaB to an immediate `error`.
 
 #[path = "common/vnncomp.rs"]
 mod vnncomp_support;

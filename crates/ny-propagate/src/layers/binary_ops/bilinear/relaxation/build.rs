@@ -102,7 +102,7 @@ fn build_relaxation(
     let mut bias_lower_f64 = ndarray::Array3::<f64>::zeros((batch_size, m, n));
     let mut bias_upper_f64 = ndarray::Array3::<f64>::zeros((batch_size, m, n));
     // Stack-allocated index buffers — batch_index_len + 2 is always small
-    // (batch dims 0-5 + m,k indices). Eliminates per-call heap allocations (#2237 F4).
+    // (batch dims 0-5 + m,k indices). Eliminates per-call heap allocations.
     assert!(
         batch_index_len + 2 <= 8,
         "BilinearRelaxation: batch_index_len + 2 exceeds stack buffer"

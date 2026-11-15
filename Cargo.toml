@@ -6,7 +6,6 @@ members = [
     "crates/ny-build",
     "crates/ny-core",
     "crates/ny-load",
-    "crates/ny-relaxation",
     "crates/ny-tensor",
     "crates/ny-propagate",
     "crates/ny-onnx",
@@ -25,9 +24,10 @@ members = [
     "crates/ny-levers",
     "crates/ny-claims",
     "crates/ny-falsify",
+    "crates/ny-bbe",
+    "crates/ny-proofcheck",
 ]
-# Kani proofs excluded: verified separately with `cargo kani`
-exclude = ["proofs/kani", "fuzz"]
+exclude = ["fuzz"]
 # Exclude Python extension from default builds (use maturin instead)
 default-members = [
     "crates/ny-build",
@@ -40,6 +40,9 @@ default-members = [
     "crates/ny-gpu",
     "crates/ny-mip",
     "crates/ny-groundtruth",
+    # Untrusted search (ENGINE_PROGRAM §1.3). A default member so a
+    # workspace-root `test` runs its crate-DAG ratchet (R2).
+    "crates/ny-bbe",
     # Macos/aarch64 Accelerate seam. Already compiled on Apple silicon as a
     # ny-cli target dependency; listed here so `cargo test` at the workspace
     # root runs its conformance + mutation + exact-rational suites (the probe
@@ -49,32 +52,28 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/ny"
-# MSRV floor, exercised by the PUBLIC snapshot's stock 1.95.0 pin
-# (publish/public-rust-toolchain.toml, gated by the export CHECK_CMD). The dev
-# pin (rust-toolchain.toml) is the Trust toolchain — rust-1.99-based, above
-# this floor — per the owner directive that the ALab stack carries no
-# upstream-Rust dependency. The source floor is set by the source
-# itself, not by the lockfile: bound propagation calls `f64::next_up`/`next_down`
-# for directed rounding (`float_next_up_down`, stable 1.86), well above anything
-# Cargo.lock requires (prost 0.14.4 → 1.85, half 2.7.1 → 1.81). Lowering this
-# below the pin means claiming support for a toolchain nothing exercises.
+# Source compatibility floor; the pinned Trust compiler is newer. This floor
+# is not exercised by a separate compiler gate.
 rust-version = "1.95"
 
 readme = "README.md"
 [workspace.lints.rust]
 dead_code = "warn"
-# Kani model checker sets the `kani` cfg flag for proof-only code.
 # tRustc sets the `trust_verify` cfg flag when contract verification is active
 # (`targo trust ... --contracts`), gating the first-class `core::contracts` import.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(trust_verify)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(trust_verify)'] }
 # unreachable_pub deferred — 119+ violations in ny-propagate alone.
 # Tracked for incremental tightening as remaining pub items are pruned.
 # unreachable_pub = "warn"
+# Deny, not warn: a doubled `#[test]` usually means an item was pasted between
+# an attribute and its target, silently un-testing the function below. A warning
+# let exactly that happen once.
+duplicate_macro_attributes = "deny"
 unsafe_op_in_unsafe_fn = "warn"
 unused_qualifications = "warn"
 trivial_numeric_casts = "warn"
@@ -197,15 +196,9 @@ unused_async = "allow"               # Async scaffolding for wgpu device methods
 
 [workspace.dependencies]
 # Core
-# Non-cryptographic hasher for INTERNAL maps only. SipHash's DoS resistance buys
-# nothing for keys ny generates itself (node names, neuron indices). Never use
-# this where a map is exposed to untrusted input.
-#
-# Scope honestly: on the 2026-08-08 oval21 `base_kw` profile the BaB alpha-state
-# maps were the largest *identifiable* ny cluster (hash_one 193 + insert 152 +
-# reserve_rehash 59 + rustc_entry 44) but only ~2.8% of thread samples, so the
-# ceiling here is ~2%. A 40-row A/B measured +0 solves. Kept because it is free
-# and semantics-preserving, NOT because it converts verdicts.
+# Non-cryptographic hasher for internal maps whose keys ny generates itself
+# (node names, neuron indices). Never use it for a map keyed by untrusted input.
+# A small, free speedup; it does not change any verdict.
 rustc-hash = "2.1"
 thiserror = "2"
 anyhow = "1"
@@ -315,33 +308,15 @@ cap-fs-ext = "4.0.2"
 half = { version = "2.4", features = ["num-traits", "serde"] }
 
 
-# Debug info was 139GB of a 159GB target/ — larger than every other artifact in
-# the tree combined, and it is also rustc memory, which is what OOM-killed this
-# host on 2026-08-01 (see .cargo/config.toml).
-#
-# `line-tables-only` keeps what is actually used day to day: backtraces still
-# carry file and line for every frame, so `RUST_BACKTRACE=1` on a panicking
-# solve reads exactly as before. What is given up is variable inspection under
-# a debugger. If you need to step through ny in lldb, set `debug = true` here
-# and rebuild that one crate — the setting is per-profile, not per-run, so
-# flipping it back costs a rebuild and nothing else.
-#
-# `[profile.dev.package."*"]` turns it off entirely for dependencies. Roughly
-# 500 upstream crates were carrying full DWARF that nobody steps through.
-#
-# `[profile.test]` inherits from `[profile.dev]`, so this covers the 9,115-test
-# ny-propagate binary too.
+# Keep backtrace locations without variable debug data; dependencies omit it.
+# Test builds inherit this profile.
 [profile.dev]
 debug = "line-tables-only"
 
 [profile.dev.package."*"]
 debug = false
 
-# #binary-identity: `ny --build-id` and the sweep's per-row swap check hash the
-# whole executable. Unoptimized, that is 23 s on a 667 MB debug binary — enough
-# to make a debug-binary sweep unusable and to tempt someone into disabling the
-# check, which is how the provenance hole reopens. Optimizing just this crate
-# brings it to well under a second and changes nothing about the digest.
+# #binary-identity: speed up whole-executable hashing in debug builds.
 [profile.dev.package.sha2]
 opt-level = 3
 
@@ -360,3 +335,13 @@ codegen-units = 1
 # Read by aterm-toolchain-index tooling (tools/atpkg-pack.sh). The `ny` command is the sole
 # public bin (crate ny-cli); every other src/bin/ target is an internal engine helper.
 expose = ["ny"]
+# Compile the shipped CLI only; workspace defaults also build internal tools.
+# Preserve its default PyTorch/CoreML/GGUF features and the committed lockfile.
+build-args = ["--locked", "-p", "ny-cli", "--bin", "ny"]
+
+# Trust: policy for `targo trust` over this workspace.
+[trust]
+# No budget keys: Trust retired `function_budget_ms` and `timeout_ms` (its
+# DECISION_QUEUE BUDGET-1a; a targo that carries the retirement refuses either
+# key here), so a `targo trust` run of this workspace uses the toolchain's
+# builtin clocks. The builtin per-query clock is the 5 s this table pinned.

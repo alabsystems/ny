@@ -7,7 +7,7 @@
 //! Graph-engine port of `conflict_clauses` (v1, sequential engine). When the
 //! graph BaB loop closes a domain as verified — its sound bound proves the
 //! property on the domain's whole region, or the domain is proven infeasible
-//! (empty region, #2926 "trivially verified") — its activation literal set
+//! (empty region, "trivially verified") — its activation literal set
 //! L(D) = {(relu node, neuron, phase)} is recorded as a conflict clause. A
 //! later domain D' in the SAME run whose literal set is a superset of a
 //! recorded clause covers a subregion of the already-certified region (more
@@ -51,7 +51,7 @@
 //! closed verified. (Disjunctive lane: close = ALL objectives cleared on the
 //! region; same argument a fortiori.)
 //!
-//! Infeasible closes. `#2926` infeasible = empty region = trivially verified:
+//! Infeasible closes. Infeasible = empty region = trivially verified:
 //! emptiness is a property of the region itself (derived from the pure literal
 //! set over the root box), and every superset literal set yields a subset of
 //! the empty region — also empty, also trivially verified. Recording from
@@ -377,7 +377,7 @@ impl GraphClauseStore {
 
     /// Record the literal set of a domain the engine just closed as VERIFIED
     /// (sound bound proves the property on its whole region, or the region is
-    /// proven empty — #2926 infeasible = trivially verified; see module doc).
+    /// proven empty — infeasible = trivially verified; see module doc).
     ///
     /// PURITY GUARD (fail closed): no-op unless the domain's ENTIRE history is
     /// pure ReLU-at-0 literals — any GenBaB / norm / unknown split entry means

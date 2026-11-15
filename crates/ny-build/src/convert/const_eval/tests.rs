@@ -543,6 +543,64 @@ fn evaluate_shape_declines_unresolved_dimensions() {
     assert!(ctx.evaluate_constant_layer(&spec, &evaluated).is_none());
 }
 
+/// `Shape` trusts a recorded `[]` as a proven rank 0. The loader's inferred
+/// table records `[]` only once ONNX Runtime proves rank 0 (ny-onnx's rank
+/// probe); a tensor ORT could not type is absent — see the next test.
+#[test]
+fn evaluate_shape_of_a_recorded_scalar_is_the_empty_vector() {
+    let weights = WeightStore::new();
+    let tensor_shapes: HashMap<String, Vec<i64>> =
+        HashMap::from([("scalar".to_string(), Vec::new())]);
+    let constant_tensors = HashSet::new();
+    let evaluated = HashMap::new();
+    let ctx = ConvertContext::with_evaluated_constants(
+        &weights,
+        &tensor_shapes,
+        &constant_tensors,
+        &evaluated,
+    );
+    let spec = LayerSpec {
+        name: "shape_of_scalar".to_string(),
+        layer_type: LayerType::Shape,
+        inputs: vec!["scalar".to_string()],
+        outputs: vec!["out".to_string()],
+        weights: None,
+        attributes: HashMap::new(),
+    };
+
+    let output = ctx
+        .evaluate_constant_layer(&spec, &evaluated)
+        .expect("Shape of a proven rank-0 tensor is the empty vector");
+    assert_eq!(output.shape(), &[0]);
+}
+
+/// The other half of that contract: a tensor whose rank nobody proved (for
+/// example cctsdb `patch-1` tensor `362`, which ORT cannot type) is absent
+/// from `tensor_shapes`, and `Shape` of it must not fold to anything.
+#[test]
+fn evaluate_shape_declines_an_unrecorded_rank() {
+    let weights = WeightStore::new();
+    let tensor_shapes: HashMap<String, Vec<i64>> = HashMap::new();
+    let constant_tensors = HashSet::new();
+    let evaluated = HashMap::new();
+    let ctx = ConvertContext::with_evaluated_constants(
+        &weights,
+        &tensor_shapes,
+        &constant_tensors,
+        &evaluated,
+    );
+    let spec = LayerSpec {
+        name: "shape_of_untyped".to_string(),
+        layer_type: LayerType::Shape,
+        inputs: vec!["untyped".to_string()],
+        outputs: vec!["out".to_string()],
+        weights: None,
+        attributes: HashMap::new(),
+    };
+
+    assert!(ctx.evaluate_constant_layer(&spec, &evaluated).is_none());
+}
+
 #[test]
 fn evaluate_squeeze_preserves_scalar_rank() {
     let tensor_shapes = HashMap::new();
@@ -571,6 +629,6 @@ fn evaluate_squeeze_preserves_scalar_rank() {
     let output = ctx
         .evaluate_constant_layer(&spec, &evaluated)
         .expect("squeezing the sole unit dimension should produce a scalar");
-    assert!(output.shape().is_empty());
+    assert_eq!((output.shape()).len(), 0);
     assert_eq!(output.first(), Some(&7.0));
 }

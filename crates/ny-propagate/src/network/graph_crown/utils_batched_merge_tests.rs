@@ -126,14 +126,17 @@ fn assert_reshape_compatible_merge_matches(
         .into_shape_with_order(IxDyn(merged.upper_b().shape()))
         .expect("upper_b reshape should succeed");
 
+    // Exact f32 coefficients are published bit-identical (a one-ulp outward
+    // nudge certifies nothing for a coefficient on a signed input); biases
+    // stay directed.
     for (actual, expected) in merged.lower_a().iter().zip(expected_lower_a.iter()) {
-        assert_eq!(*actual, next_down_f32(*expected));
+        assert_eq!(actual.to_bits(), expected.to_bits());
     }
     for (actual, expected) in merged.lower_b().iter().zip(expected_lower_b.iter()) {
         assert_eq!(*actual, next_down_f32(*expected));
     }
     for (actual, expected) in merged.upper_a().iter().zip(expected_upper_a.iter()) {
-        assert_eq!(*actual, next_up_f32(*expected));
+        assert_eq!(actual.to_bits(), expected.to_bits());
     }
     for (actual, expected) in merged.upper_b().iter().zip(expected_upper_b.iter()) {
         assert_eq!(*actual, next_up_f32(*expected));
@@ -189,10 +192,15 @@ fn test_accumulate_batched_crown_bounds_preserves_three_term_cancellation_3904()
         0.0,
         "serial f32 batched bias merge should lose the low-order term"
     );
-    assert_eq!(merged.lower_a()[[0, 0, 0]], next_down_f32(1.0));
+    // The f64 sum is exactly 1, an f32: published exactly, no error plane.
+    assert_eq!(merged.lower_a()[[0, 0, 0]], 1.0);
     assert_eq!(merged.lower_b()[[0, 0]], next_down_f32(1.0));
-    assert_eq!(merged.upper_a()[[0, 0, 0]], next_up_f32(1.0));
+    assert_eq!(merged.upper_a()[[0, 0, 0]], 1.0);
     assert_eq!(merged.upper_b()[[0, 0]], next_up_f32(1.0));
+    assert!(
+        !merged.has_coeff_err(),
+        "this exact f64 sum has zero coefficient uncertainty"
+    );
 }
 
 #[test]

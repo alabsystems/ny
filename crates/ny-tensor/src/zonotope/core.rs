@@ -6,6 +6,7 @@ use ndarray::{ArrayD, Axis, IxDyn};
 use ny_core::{checked_shape_product, nan_propagating_max, NyError, Result};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 
+use crate::rounding::{add_up_f32, sub_down_f32};
 use crate::BoundedTensor;
 
 /// A zonotope tensor: center + Σᵢ (coeffᵢ · eᵢ) where eᵢ ∈ [-1, 1]
@@ -130,8 +131,15 @@ impl ZonotopeTensor {
     pub fn radius(&self) -> ArrayD<f32> {
         let mut radius = ArrayD::zeros(IxDyn(&self.element_shape));
 
+        // Round the accumulation UP. These summands are all non-negative, so a
+        // round-to-nearest chain drifts systematically DOWNWARD, and a radius
+        // that rounds down shrinks the enclosure -- the one direction that is
+        // unsound. `c.abs()` is exact (a sign clear), so the add is the only
+        // error and directing it discharges the whole accumulation.
         for i in 1..=self.n_error_terms {
-            radius = radius + self.coeffs.index_axis(Axis(0), i).mapv(f32::abs);
+            ndarray::Zip::from(&mut radius)
+                .and(self.coeffs.index_axis(Axis(0), i))
+                .for_each(|r, &c| *r = add_up_f32(*r, c.abs()));
         }
 
         radius
@@ -146,7 +154,21 @@ impl ZonotopeTensor {
         let center = self.center();
         let radius = self.radius();
 
-        BoundedTensor::new_allow_infinite(&center - &radius, &center + &radius)
+        // Emit the endpoints OUTWARD. A bare `center - radius` / `center + radius`
+        // rounds to nearest and is free to move each endpoint inward, which would
+        // give back exactly what the directed radius above just paid for.
+        let mut lower = ArrayD::zeros(center.raw_dim());
+        let mut upper = ArrayD::zeros(center.raw_dim());
+        ndarray::Zip::from(&mut lower)
+            .and(&mut upper)
+            .and(&center)
+            .and(&radius)
+            .for_each(|l, u, &c, &r| {
+                *l = sub_down_f32(c, r);
+                *u = add_up_f32(c, r);
+            });
+
+        BoundedTensor::new_allow_infinite(lower, upper)
     }
 
     /// Get the shape of each element (excluding error term dimension).

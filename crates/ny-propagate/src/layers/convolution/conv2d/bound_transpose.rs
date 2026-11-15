@@ -21,7 +21,7 @@ const DEADLINE_CONV_TRANSPOSE_IBP_POLL_OPS: usize = 4_096;
 const DEADLINE_CONV_TRANSPOSE_IBP_MAX_OUTPUT_ELEMENTS: usize = 4 * 1024 * 1024;
 
 #[inline]
-fn contains_binary32_subnormal(values: &ArrayD<f32>) -> bool {
+pub(super) fn contains_binary32_subnormal(values: &ArrayD<f32>) -> bool {
     values.iter().any(|value| {
         let magnitude = value.to_bits() & 0x7fff_ffff;
         magnitude != 0 && magnitude < f32::MIN_POSITIVE.to_bits()
@@ -858,7 +858,7 @@ impl ConvTranspose2dLayer {
     /// CROWN backward through ConvTranspose2d with optional GemmEngine.
     ///
     /// Uses batched im2col+GEMM via `conv2d_forward_batched_gemm` for GPU
-    /// acceleration (#3598). Falls back to CPU faer GEMM when engine is None.
+    /// acceleration. Falls back to CPU faer GEMM when engine is None.
     pub fn propagate_linear_with_engine<'a>(
         &self,
         bounds: &'a LinearBounds,
@@ -1024,13 +1024,14 @@ impl ConvTranspose2dLayer {
             }
         };
         // Under the skip-dead-f32 recompute gate the two independent f64
-        // recomputes run concurrently. Independently, exact opt-in
-        // `NY_CONVTRANSPOSE_SOUND_F64_GPU=1` lets large internal GEMM blocks use
-        // a direct-row-major lower/upper pair through the process-global
-        // sound-f64 engine (not the caller's possibly f32-only `engine`).
-        // Unset/malformed values, unavailable engines, rejected geometry,
-        // allocation failure, or malformed pair output fall through to the
-        // exact prior rayon/faer route below. The IEEE-f64 reduction order is
+        // recomputes run concurrently. Large internal GEMM blocks may use a
+        // direct-row-major lower/upper pair through the process-global
+        // sound-f64 engine (not the caller's possibly f32-only `engine`). With
+        // a finite deadline this bounded route is enabled by default; literal
+        // `NY_CONVTRANSPOSE_SOUND_F64_GPU=0` disables it. The deadline-free
+        // route still requires literal `1`. Policy refusal, unavailable engines,
+        // rejected geometry, allocation failure, or malformed pair output
+        // selects the prior rayon/faer route below. The IEEE-f64 reduction order is
         // covered by the same summation-order-independent certified error
         // channel. Turning off the skip-dead-f32 recompute gate keeps the
         // shipped serial order untouched.

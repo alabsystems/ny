@@ -5,7 +5,6 @@
 //! Tests for β-CROWN verifier.
 //!
 //! Extracted from engine/tests.rs for maintainability.
-//! Part of #531.
 
 mod bab_core_loop;
 mod bab_frontier;
@@ -29,6 +28,7 @@ mod deadline_none_parity;
 mod domain_processing;
 mod from_sequential_multi_objective_4355;
 mod genbab;
+mod genbab_selector_convention;
 mod gpu_bab;
 mod gradients;
 mod graph_beta_gradients;
@@ -53,6 +53,7 @@ mod relaxed_clip_helpers;
 mod relaxed_clipping;
 mod relu_directed_rounding;
 mod relu_split_bounds;
+mod seq_initial_schedule;
 mod transpose_backward;
 mod transpose_backward_errors;
 

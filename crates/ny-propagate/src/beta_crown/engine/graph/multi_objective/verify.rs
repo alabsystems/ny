@@ -196,7 +196,7 @@ impl BetaCrownVerifier {
     /// for accelerated bound computation. Uses disjunctive semantics (ALL must verify).
     ///
     /// `deadline`: If `Some`, the BaB engine derives its phase budgets from
-    /// remaining wall-clock time instead of `self.config.timeout` (#4321).
+    /// remaining wall-clock time instead of `self.config.timeout`.
     #[instrument(skip(self, graph, input, objectives, engine, deadline), fields(num_objectives = objectives.len(), input_shape = ?input.shape()))]
     pub fn verify_graph_relu_split_multi_objective_with_engine(
         &self,
@@ -293,7 +293,7 @@ impl BetaCrownVerifier {
     /// `auto_LiRPA/utils.py:107-113`, `multi_spec_keep_func_all` in
     /// `auto_LiRPA/utils.py:143-144`.
     /// `deadline`: If `Some`, the BaB engine derives its phase budgets from
-    /// remaining wall-clock time instead of `self.config.timeout` (#4321).
+    /// remaining wall-clock time instead of `self.config.timeout`.
     #[instrument(skip(self, graph, input, objectives, engine, deadline), fields(num_objectives = objectives.len(), input_shape = ?input.shape()))]
     pub fn verify_graph_relu_split_multi_objective_conjunctive_with_engine(
         &self,
@@ -321,6 +321,14 @@ impl BetaCrownVerifier {
     ///   verified, dropped when ANY violated.
     /// - `conjunctive=true` (conjunctive): domain verified when ANY objective
     ///   verified, dropped when ALL violated.
+    ///
+    /// #vit-margin-alpha-complex (P8): with the containment fence armed
+    /// (`bab.mo_containment_fence`), the EMPTINESS gate wraps the whole call —
+    /// a `Verified` that rested on any emptiness claim made during it (an
+    /// infeasible child pair/sibling/NoUnstable domain, a construction-time
+    /// empty half-space) is returned as `Unknown`, and one
+    /// `[mo-containment-fence] emptiness-gate …` line is printed. Dark, this
+    /// is exactly the historical call (no snapshot, no line).
     fn verify_graph_relu_split_multi_objective_core(
         &self,
         graph: &GraphNetwork,
@@ -330,6 +338,207 @@ impl BetaCrownVerifier {
         conjunctive: bool,
         deadline: Option<Instant>,
     ) -> Result<BetaCrownResult> {
+        // #la-warm-frontier: one `[la-warm-frontier] lane=multi_objective …`
+        // line when this run ends, armed only (a dark run prints nothing).
+        let _la_warm_frontier_line =
+            super::super::propagation::warm_frontier::WarmFrontierLaneScope::enter(
+                self,
+                "multi_objective",
+            );
+        // #kfsb-production: one `[kfsb-single-shot] summary
+        // lane=multi_objective …` line when this run ends, and the lane's R4
+        // fan-out lease returned; armed only (a dark run prints nothing and
+        // asks nothing).
+        let _kfsb_single_shot_lane =
+            super::super::gpu_bab::kfsb_fanout::KfsbSingleShotLaneScope::enter(
+                self,
+                "multi_objective",
+            );
+        // B2.2: under the Proof profile (the lane proof capture armed) the
+        // driver keeps a write-only proof tape of its closes — every domain it
+        // builds carries it and records its own close — deposited when the
+        // driver returns `Verified`. Under Competition `for_graph` returns
+        // `None` and nothing is armed.
+        //
+        // The tape wraps the #vit-v3-bankable cover certification
+        // (`_certified` below), so it is deposited only for a `Verified` that
+        // survived both the containment fence and the per-row cover
+        // settlement: a withdrawn verdict deposits nothing, as a refused
+        // graph-ledger frame deposits nothing. The two mechanisms capture into
+        // different process slots (the tape into the lane-proof capture, a
+        // proved per-row cover into the graph-cover capture) and the rows
+        // frame carries no tape of its own, so one invocation deposits at most
+        // one tape.
+        //
+        // The tape belongs to THIS invocation (its objective indices are this
+        // call's): a nested multi-objective call builds its own.
+        let tape = {
+            let (objectives, thresholds) = property.views();
+            let objs: Vec<(&[f32], f32, bool)> = objectives
+                .iter()
+                .zip(thresholds)
+                .map(|(o, &t)| (o.as_slice(), t, false))
+                .collect();
+            crate::certify::lane_proof::TapeRecorder::for_graph(
+                if conjunctive {
+                    "graph_mo_conjunctive"
+                } else {
+                    "graph_mo_disjunctive"
+                },
+                graph,
+                input,
+                &objs,
+            )
+            .map(std::sync::Arc::new)
+        };
+        let result = self.verify_graph_relu_split_multi_objective_core_certified(
+            graph,
+            input,
+            property,
+            engine,
+            conjunctive,
+            deadline,
+            tape.clone(),
+        );
+        if let Some(tape) = tape {
+            if result.as_ref().is_ok_and(|r| {
+                matches!(
+                    r.result,
+                    crate::beta_crown::result::BabVerificationStatus::Verified
+                )
+            }) {
+                tape.deposit(false);
+            }
+        }
+        result
+    }
+
+    /// #vit-v3-bankable: the multi-objective cover-certification system
+    /// (`bab.mo_cover_certify`) around the fenced driver (see
+    /// [`Self::verify_graph_relu_split_multi_objective_core`], which owns the
+    /// B2.2 proof tape around this). Dark (`off`, every shipped yaml), this is
+    /// exactly the fenced call.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_graph_relu_split_multi_objective_core_certified(
+        &self,
+        graph: &GraphNetwork,
+        input: &BoundedTensor,
+        property: MultiObjectiveProperty<'_>,
+        engine: Option<&dyn GemmEngine>,
+        conjunctive: bool,
+        deadline: Option<Instant>,
+        tape: Option<std::sync::Arc<crate::certify::lane_proof::TapeRecorder>>,
+    ) -> Result<BetaCrownResult> {
+        let policy = super::super::mo_cover::resolve_mo_cover_policy(&self.config);
+        if !policy.mode.is_armed() {
+            return self.verify_graph_relu_split_multi_objective_core_fenced(
+                graph,
+                input,
+                property,
+                engine,
+                conjunctive,
+                deadline,
+                tape,
+            );
+        }
+        let (objectives, thresholds) = {
+            let (objectives, thresholds) = property.views();
+            (objectives.to_vec(), thresholds.to_vec())
+        };
+        let Some(scope) =
+            self.mo_cover_arm(policy, graph, input, &objectives, &thresholds, conjunctive)
+        else {
+            return self.verify_graph_relu_split_multi_objective_core_fenced(
+                graph,
+                input,
+                property,
+                engine,
+                conjunctive,
+                deadline,
+                tape,
+            );
+        };
+        match self.verify_graph_relu_split_multi_objective_core_fenced(
+            graph,
+            input,
+            property,
+            engine,
+            conjunctive,
+            deadline,
+            tape,
+        ) {
+            Ok(result) => {
+                Ok(self.mo_cover_settle(policy, scope, result, &objectives, &thresholds, deadline))
+            }
+            Err(error) => {
+                self.mo_cover_abort(scope);
+                Err(error)
+            }
+        }
+    }
+
+    /// The containment fence's emptiness gate around the BaB proper (see
+    /// [`Self::verify_graph_relu_split_multi_objective_core`]).
+    #[allow(clippy::too_many_arguments)]
+    fn verify_graph_relu_split_multi_objective_core_fenced(
+        &self,
+        graph: &GraphNetwork,
+        input: &BoundedTensor,
+        property: MultiObjectiveProperty<'_>,
+        engine: Option<&dyn GemmEngine>,
+        conjunctive: bool,
+        deadline: Option<Instant>,
+        tape: Option<std::sync::Arc<crate::certify::lane_proof::TapeRecorder>>,
+    ) -> Result<BetaCrownResult> {
+        if !self.config.mo_containment_fence {
+            return self.verify_graph_relu_split_multi_objective_core_unfenced(
+                graph,
+                input,
+                property,
+                engine,
+                conjunctive,
+                deadline,
+                tape,
+            );
+        }
+        let claims_before = super::containment_fence_lane::EmptinessClaimCounts::snapshot();
+        match self.verify_graph_relu_split_multi_objective_core_unfenced(
+            graph,
+            input,
+            property,
+            engine,
+            conjunctive,
+            deadline,
+            tape,
+        ) {
+            Ok(mut result) => {
+                super::containment_fence_lane::apply_emptiness_gate(&mut result, claims_before);
+                Ok(result)
+            }
+            Err(error) => {
+                // No verdict to gate, but the gate line is still printed, so
+                // its absence always means the gate never ran.
+                super::containment_fence_lane::emit_emptiness_gate_error_line(claims_before);
+                Err(error)
+            }
+        }
+    }
+
+    /// The multi-objective BaB proper (see
+    /// [`Self::verify_graph_relu_split_multi_objective_core`], which owns the
+    /// emptiness gate around it).
+    #[allow(clippy::too_many_arguments)]
+    fn verify_graph_relu_split_multi_objective_core_unfenced(
+        &self,
+        graph: &GraphNetwork,
+        input: &BoundedTensor,
+        property: MultiObjectiveProperty<'_>,
+        engine: Option<&dyn GemmEngine>,
+        conjunctive: bool,
+        deadline: Option<Instant>,
+        tape: Option<std::sync::Arc<crate::certify::lane_proof::TapeRecorder>>,
+    ) -> Result<BetaCrownResult> {
+        graph.ensure_proof_eligible()?;
         // Validate before any objective/root shortcut can acquire verdict
         // authority; the shared bootstrap remains a defense-in-depth check.
         self.config.validate()?;
@@ -382,6 +591,9 @@ impl BetaCrownVerifier {
         let _complete_clip_deadline = self.complete_clip_deadline_overrides.scoped(Some(
             GraphBabLifecycle::fail_closed_deadline(now, bab_timeout),
         ));
+        // #phase-cost: the root evaluation is this lane's root bounding.
+        let root_phase_cost =
+            ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::RootBounds);
         let MultiObjectiveRootEvaluation { outcome, property } = evaluate_root(
             MultiObjectiveRootRequest {
                 verifier: self,
@@ -394,10 +606,83 @@ impl BetaCrownVerifier {
             },
             &mut lifecycle,
         )?;
+        drop(root_phase_cost);
         let root = match outcome {
-            MultiObjectiveRootOutcome::Finished(result) => return Ok(*result),
+            MultiObjectiveRootOutcome::Finished(result) => {
+                let mut result = *result;
+                // B2.2: a root-terminal `Verified` is ONE leaf, the root: every
+                // objective certified (disjunctive), or some objective
+                // (conjunctive — the root outcome does not say which).
+                // #vit-v3-bankable: a root-terminal `Verified` rests on the
+                // objective LOWERS the closing root site recorded; record them
+                // at the root region (none recorded: the frame gives up).
+                if matches!(
+                    result.result,
+                    crate::beta_crown::result::BabVerificationStatus::Verified
+                ) {
+                    self.mo_cover_note_root_lowers(
+                        lifecycle.root_verified_objective_lowers.as_deref(),
+                    );
+                    if let Some(tape) = &tape {
+                        let n = u32::try_from(property.views().0.len()).unwrap_or(0);
+                        let groups: Vec<Vec<u32>> = if conjunctive {
+                            vec![(0..n).collect()]
+                        } else {
+                            (0..n).map(|i| vec![i]).collect()
+                        };
+                        tape.note_splits(
+                            &crate::beta_crown::branching::GraphSplitHistory::new(),
+                            None,
+                            None,
+                            crate::certify::lane_proof::TapeClose::Bound,
+                            groups,
+                            f64::NAN,
+                            false,
+                        );
+                    }
+                }
+                // #vit-bank-gate + #vit-margin-alpha-complex (P8): a
+                // root-terminal `Verified` never reaches the lane fence below,
+                // so fence it here — its output enclosure, the certified
+                // objective LOWER bounds it rests on (recorded by the closing
+                // root site), and, under `bab.mo_root_ort_adjudication`, those
+                // lowers against an independent ONNX Runtime forward. Fails
+                // closed. Default-off (`bab.mo_containment_fence`);
+                // downgrade-only.
+                if self.config.mo_containment_fence
+                    && matches!(
+                        result.result,
+                        crate::beta_crown::result::BabVerificationStatus::Verified
+                    )
+                {
+                    let (objectives, _) = property.views();
+                    let fence = super::containment_fence_lane::fence_root_terminal_verified(
+                        &configured_graph,
+                        input,
+                        result.output_bounds.as_ref(),
+                        objectives,
+                        lifecycle.root_verified_objective_lowers.as_deref(),
+                        self.config.mo_root_ort_adjudication,
+                        self.root_adjudication_oracle(),
+                        super::containment_fence_lane::mo_containment_fence_refusal(
+                            conjunctive,
+                            false,
+                            false,
+                            self.config.enable_clip_interm_domain,
+                            self.config.enable_relaxed_clip,
+                        ),
+                    );
+                    if let Some(reason) = fence.downgrade_reason() {
+                        result.result =
+                            crate::beta_crown::result::BabVerificationStatus::Unknown { reason };
+                    }
+                }
+                return Ok(result);
+            }
             MultiObjectiveRootOutcome::Continue(root) => *root,
         };
+        // #phase-cost: everything after a non-terminal root is the BaB loop.
+        let _bab_phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BabLoop);
         let (configured_graph, root, property) = match property {
             MultiObjectiveProperty::Owned(property) => {
                 let (configured_graph, root, property) =
@@ -422,6 +707,10 @@ impl BetaCrownVerifier {
             mut cut_pool,
             use_batched_gpu: root_use_batched_gpu,
         } = root;
+        // B2.2: every domain descended from the root carries the driver's
+        // proof tape (`None` under Competition) and records its own close.
+        root_domain.proof_tape = tape;
+        root_domain.note_close_on_tape();
         // The execution-dark handoff proved custody of the exact root output.
         // The unchanged CPU loop never consumed that enclosure, so restore its
         // historical lifetime before any post-root engine/admission decision.
@@ -507,7 +796,7 @@ impl BetaCrownVerifier {
         // BatchedDomains stacking, and union-spec construction) is part of the
         // same authority. Never pop more domains than the backend's audited
         // K<=8 transactional capacity when this facade selected the executor.
-        let batch_size = bounded_shared_capacity.map_or(configured_batch_size, |capacity| {
+        let mut batch_size = bounded_shared_capacity.map_or(configured_batch_size, |capacity| {
             configured_batch_size.min(capacity)
         });
         let engine: Option<&dyn GemmEngine> = post_root_engine.or_else(|| {
@@ -529,6 +818,41 @@ impl BetaCrownVerifier {
             !root_use_batched_gpu || use_batched_gpu,
             "post-root engine resolution must not discard the root's caller engine"
         );
+        // Auto-enlarge admission, decided ONCE here so that a pop width
+        // which grows during the run cannot re-route the lane underneath the
+        // decisions already taken above. `try_enlarge_batch_size`
+        // (config/relu_split.rs) is alpha-beta-CROWN's `AutoBatchSize` ramp;
+        // before this call site its only callers were the single-objective
+        // graph loop (relu_split/bab_loop.rs:695) and the DomainList loop
+        // (gpu_bab/mod.rs:675), so this loop popped `self.config.batch_size`
+        // forever and `auto_enlarge_batch_size` was inert here. Two invariants
+        // have to survive the ramp:
+        //
+        // 1. `bounded_shared_capacity` is an AUTHORITY, not a hint. The clamp
+        //    on `batch_size` above exists because the facade admitted this run
+        //    against the backend's audited transactional capacity, and the
+        //    lane's pre-GEMM host work is inside that authority. Doubling past
+        //    it would hand the executor a wave it never agreed to, so the ramp
+        //    stays out of that lane entirely rather than growing and
+        //    re-clamping — which would additionally log a growth that the
+        //    clamp then undid.
+        // 2. `use_batched_gpu` is computed once, immediately above, from the
+        //    width at entry, whereas `GraphDomainBatchPlan::for_multi_objective`
+        //    re-derives the execution mode from the LIVE width on every wave
+        //    (`domain_batch/plan.rs:205`: `engine_available && batch_size > 1
+        //    && !conjunctive`). A ramp that crossed 1 -> 2 would therefore
+        //    select `SharedExecutor` while `use_batched_gpu` was computed
+        //    `false`, tripping the "shared multi-objective batch plan drifted"
+        //    assert below. Starting strictly above 1 the mode depends only on
+        //    `engine.is_some()` and `conjunctive`, both fixed for the run, so
+        //    every doubling is mode-preserving.
+        //
+        // The ramp is gated a third time inside `try_enlarge_batch_size` on
+        // `self.config.auto_enlarge_batch_size`, which is `false` in
+        // `BetaCrownConfig`'s default (config/beta_config.rs:1567). A preset
+        // that leaves that key unset therefore pops exactly the widths it pops
+        // today, in the same order, with the same operand shapes.
+        let auto_enlarge_admitted = !bounded_shared_active && batch_size > 1;
         // Default-dark, measurement-only NeuralSAT-style stall observer. `None`
         // means the loop does not inspect the frontier for this canary. The
         // observer owns only fixed-size counters and cannot mutate the queue,
@@ -620,6 +944,38 @@ impl BetaCrownVerifier {
             );
         }
 
+        // #vit-bank-gate: the default-off, downgrade-only containment fence.
+        // Armed ONLY by the typed key `bab.mo_containment_fence`. The root is
+        // checked here, before it is queued; every shared-executor wave's
+        // children are checked below, before the queue fold. A contradiction
+        // returns `Unknown` — the fence never tightens, closes or proves.
+        let mut containment_fence = if self.config.mo_containment_fence {
+            super::containment_fence_lane::MoContainmentFence::arm(
+                graph,
+                &root_domain,
+                objectives,
+                super::containment_fence_lane::mo_containment_fence_refusal(
+                    conjunctive,
+                    cuts_enabled,
+                    clause_store.is_enabled(),
+                    self.config.enable_clip_interm_domain,
+                    self.config.enable_relaxed_clip,
+                ),
+            )
+        } else {
+            None
+        };
+        if let Some(reason) = containment_fence
+            .as_ref()
+            .and_then(|fence| fence.contradiction())
+            .map(|reason| format!("containment fence: {reason}"))
+        {
+            lifecycle.cuts_generated = cut_pool.total_generated;
+            return Ok(lifecycle.build_result(
+                crate::beta_crown::result::BabVerificationStatus::Unknown { reason },
+            ));
+        }
+
         // DIAGNOSTIC (NY_ACASXU_PROF): the multi-objective BaB explored/verified/queue
         // trajectory. The single-objective β-CROWN loop (engine/core.rs) already honors
         // this env, but the multi-objective graph loop (the cifar100/tinyimagenet resnet
@@ -708,6 +1064,44 @@ impl BetaCrownVerifier {
         let mut last_bab_trace: Option<Instant> = None;
         let mut waves_since_bab_trace = 0usize;
 
+        // #graph-lane-search (ENGINE_PROGRAM M7, typed `bab.graph_search`,
+        // dark): arm the batched domain search once per run, lowering the graph
+        // over the ROOT's certified boxes (supersets of every child's). `off`
+        // returns `None` without touching anything; an armed run the wave lane
+        // cannot serve prints why. Runs only on shared-executor waves.
+        let mut graph_search_wave = if self.config.graph_search.is_armed() {
+            let refusal = if conjunctive {
+                Some("conjunctive")
+            } else if bounded_shared_active {
+                Some("bounded_shared_executor")
+            } else if !use_batched_gpu {
+                Some("no_shared_executor")
+            } else {
+                None
+            };
+            super::graph_search::GraphSearchWave::arm(self, graph, &root_domain, refusal)
+        } else {
+            None
+        };
+
+        // #vit-v3-bankable: mechanisms whose closes the per-row frame cannot
+        // express (a bound valid only on a property-conditioned sub-region)
+        // leave it UNBUILT; the root's rows are recorded at the root region,
+        // and under `replay` the root is kept as the replay base.
+        if cuts_enabled {
+            self.mo_cover_unbuildable("cuts");
+        }
+        if clause_store.is_enabled() {
+            self.mo_cover_unbuildable("conflict_clauses");
+        }
+        if self.config.enable_clip_interm_domain {
+            self.mo_cover_unbuildable("clip_interm_domain");
+        }
+        if self.config.enable_relaxed_clip {
+            self.mo_cover_unbuildable("relaxed_clip");
+        }
+        self.mo_cover_note_root(graph, &root_domain);
+
         let mut queue = BinaryHeap::new();
         queue.push(root_domain);
         let mut batch_index = 0usize;
@@ -755,9 +1149,10 @@ impl BetaCrownVerifier {
                     })
                     .unwrap_or((f32::NAN, 0, String::new()));
                 eprintln!(
-                    "[NY_ACASXU_PROF] tick: batch={batch_index} explored={} verified={} queue={} max_depth={} elapsed={:.1}s frontier_lower={frontier_lower:.4} frontier_depth={frontier_depth} rows=[{frontier_rows}]",
+                    "[NY_ACASXU_PROF] tick: batch={batch_index} explored={} verified={} infeasible={} queue={} max_depth={} elapsed={:.1}s frontier_lower={frontier_lower:.4} frontier_depth={frontier_depth} rows=[{frontier_rows}]",
                     lifecycle.domains_explored,
                     lifecycle.domains_verified,
+                    lifecycle.domains_infeasible,
                     queue.len(),
                     lifecycle.max_depth_reached,
                     lifecycle.start_time.elapsed().as_secs_f64(),
@@ -809,18 +1204,20 @@ impl BetaCrownVerifier {
                 if prof {
                     if frontier_empty && !lifecycle.has_unresolved() {
                         eprintln!(
-                            "[NY_ACASXU_PROF] queue_drained: explored={} verified={} queue={} max_depth={} elapsed={:.2}s",
+                            "[NY_ACASXU_PROF] queue_drained: explored={} verified={} infeasible={} queue={} max_depth={} elapsed={:.2}s",
                             lifecycle.domains_explored,
                             lifecycle.domains_verified,
+                            lifecycle.domains_infeasible,
                             queue.len(),
                             lifecycle.max_depth_reached,
                             lifecycle.start_time.elapsed().as_secs_f64(),
                         );
                     } else {
                         eprintln!(
-                            "[NY_ACASXU_PROF] terminate(timeout/limit): explored={} verified={} queue={} max_depth={} elapsed={:.2}s",
+                            "[NY_ACASXU_PROF] terminate(timeout/limit): explored={} verified={} infeasible={} queue={} max_depth={} elapsed={:.2}s",
                             lifecycle.domains_explored,
                             lifecycle.domains_verified,
+                            lifecycle.domains_infeasible,
                             queue.len(),
                             lifecycle.max_depth_reached,
                             lifecycle.start_time.elapsed().as_secs_f64(),
@@ -1006,7 +1403,7 @@ impl BetaCrownVerifier {
                 // that says how much.
                 let wave_round_probe =
                     crate::phase_telemetry::phase_telemetry_enabled().then(Instant::now);
-                let results = GraphDomainBatchExecutor::execute_multi_objective(
+                let mut results = GraphDomainBatchExecutor::execute_multi_objective(
                     self,
                     MultiObjectiveBatchRequest {
                         bab_round: batch_index,
@@ -1031,6 +1428,51 @@ impl BetaCrownVerifier {
                         domain_refs.len(),
                         t.elapsed().as_secs_f64()
                     );
+                }
+
+                // #graph-lane-search (M7, dark): the wave's open children, closest
+                // to closing first, through the untrusted batched α/β search; each
+                // hint is clamped at ingest and certified ONCE by this lane's own
+                // β-CROWN pass, and only raises a child's certified LOWER bounds.
+                // BEFORE the fence, the replay tails and the fold, so every one of
+                // them sees the final bounds.
+                if let Some(wave) = graph_search_wave.as_mut() {
+                    wave.run(
+                        self,
+                        graph,
+                        &mut results,
+                        objectives,
+                        thresholds,
+                        bab_deadline,
+                        batch_index,
+                    );
+                }
+
+                // #vit-bank-gate: containment fence over this wave's children,
+                // BEFORE any of them is observed, folded, queued or counted
+                // verified. Default-off (`bab.mo_containment_fence`).
+                if let Some(fence) = containment_fence.as_mut() {
+                    for result in &results {
+                        if let crate::beta_crown::engine::domain_results::
+                            MultiObjectiveGraphDomainResult::Children(children)
+                        | crate::beta_crown::engine::domain_results::
+                            MultiObjectiveGraphDomainResult::ChildrenWithViolatedDrop(children) =
+                            result
+                        {
+                            for (child, _) in children {
+                                fence.check_child(child);
+                            }
+                        }
+                    }
+                    if let Some(reason) = fence
+                        .contradiction()
+                        .map(|reason| format!("containment fence: {reason}"))
+                    {
+                        lifecycle.cuts_generated = cut_pool.total_generated;
+                        return Ok(lifecycle.build_result(
+                            crate::beta_crown::result::BabVerificationStatus::Unknown { reason },
+                        ));
+                    }
                 }
 
                 let queue_update_start = Instant::now();
@@ -1170,6 +1612,10 @@ impl BetaCrownVerifier {
                 // length delta IS the children enqueued.
                 let queue_fold_probe = crate::phase_telemetry::phase_telemetry_enabled()
                     .then(|| (Instant::now(), queue.len()));
+                // #vit-v3-bankable: every child this wave returns, with the
+                // final bounds the fold will see, onto the per-row frame.
+                self.mo_cover_note_wave(&results);
+                let leaf_oracle_closes_before = lifecycle.domains_verified_by_leaf_oracle;
                 let (batch_apply_status, leaf_violation) = apply_batched_results(
                     results,
                     &mut queue,
@@ -1179,6 +1625,11 @@ impl BetaCrownVerifier {
                     leaf_ctx.as_ref(),
                     &mut clause_store,
                 )?;
+                self.mo_cover_note_leaf_oracle_closes(
+                    lifecycle
+                        .domains_verified_by_leaf_oracle
+                        .saturating_sub(leaf_oracle_closes_before),
+                );
                 if let Some((t, queued_before)) = queue_fold_probe {
                     eprintln!(
                         "[phase] mo-queue-fold round={} children_queued={} secs={:.2}",
@@ -1236,6 +1687,18 @@ impl BetaCrownVerifier {
                     return Ok(result);
                 }
                 batch_index += 1;
+                // Adaptive batch sizing: double when the queue supplied
+                // a full batch, at the same point in the iteration as
+                // relu_split/bab_loop.rs:695. `batch_width` was taken as
+                // `domains_to_process.len()` AFTER `prefilter_batch`, matching
+                // what that call site passes (its `domains_to_process` is
+                // likewise post-`pre_filter_batch`), so a wave whose prefilter
+                // closed or dropped domains does not count as full and does not
+                // ramp.
+                if auto_enlarge_admitted {
+                    self.config
+                        .try_enlarge_batch_size(&mut batch_size, batch_width, "MO BaB");
+                }
                 continue;
             }
 
@@ -1245,6 +1708,9 @@ impl BetaCrownVerifier {
             // the "violates every objective row" test the oracle's witness must
             // pass is exactly the property's own violation predicate.
             let mut sequential_leaf_violation = None;
+            // #vit-v3-bankable: the sequential lane folds its children without
+            // passing them to the per-row frame.
+            self.mo_cover_unbuildable("sequential_lane");
             let sequential_status =
                 self.process_multi_objective_domains_sequential(SequentialMultiObjectiveContext {
                     graph,
@@ -1286,6 +1752,12 @@ impl BetaCrownVerifier {
                 return Ok(lifecycle.timeout_result());
             }
             batch_index += 1;
+            // Adaptive batch sizing: twin of the batched lane's call
+            // above; this is the other end of the same BaB iteration.
+            if auto_enlarge_admitted {
+                self.config
+                    .try_enlarge_batch_size(&mut batch_size, batch_width, "MO BaB");
+            }
         }
 
         lifecycle.cuts_generated = cut_pool.total_generated;
@@ -1298,9 +1770,10 @@ impl BetaCrownVerifier {
         }
         if prof {
             eprintln!(
-                "[NY_ACASXU_PROF] queue_drained: explored={} verified={} queue={} max_depth={} elapsed={:.2}s",
+                "[NY_ACASXU_PROF] queue_drained: explored={} verified={} infeasible={} queue={} max_depth={} elapsed={:.2}s",
                 lifecycle.domains_explored,
                 lifecycle.domains_verified,
+                lifecycle.domains_infeasible,
                 queue.len(),
                 lifecycle.max_depth_reached,
                 lifecycle.start_time.elapsed().as_secs_f64(),

@@ -74,7 +74,7 @@ fn expand_constant(constant: &ArrayD<f32>, dim: usize) -> Option<Vec<f32>> {
 /// Return type for full GPU layer extraction with dynamic tracking.
 type GpuExtractionResult = (Vec<GpuCrownLayer>, Vec<(usize, usize)>);
 
-/// Cached static GPU CROWN layer data (#3397 plan cache Step 1).
+/// Cached static GPU CROWN layer data.
 ///
 /// Separates static model data (weights, topology) from dynamic activation
 /// relaxations so BaB iterations only rebuild the nonlinear activation parts.
@@ -88,7 +88,7 @@ pub(crate) struct GpuCrownStaticCache {
     dynamic_entries: Vec<(usize, usize)>,
 }
 
-/// Cached GPU CROWN layer extraction (#3397 plan cache Step 1).
+/// Cached GPU CROWN layer extraction.
 ///
 /// On first call, performs full extraction and populates the cache.
 /// On subsequent calls, clones the cached layer list (O(1) per Arc weight)
@@ -139,7 +139,7 @@ pub(super) fn extract_gpu_crown_layers_cached(
                 }
                 Layer::MaxPool2d(pool) => extract_maxpool_gpu_layer(pool, pre)?,
                 // Structurally unreachable: dynamic_entries only holds activation/pool indices.
-                // Return None defensively instead of panicking (#4205).
+                // Return None defensively instead of panicking.
                 _ => return None,
             };
             gpu_layers[gpu_idx] = new_layer;
@@ -213,12 +213,54 @@ pub(crate) fn try_extract_single_gpu_layer(
 ) -> Option<()> {
     match layer {
         Layer::Linear(linear) => {
+            // ONE copy per call instead of two (#gpu-descriptor-single-copy).
+            // An allocation cut, NOT weight sharing — see WHAT REMAINS below.
+            //
+            // `Arc::<[f32]>::from(&[f32])` makes one ref-counted allocation and
+            // fills it from the slice in a single pass (`ArcFromSlice` in
+            // `alloc::sync`; for a trivially-cloneable element such as `f32`
+            // that pass specializes to a `copy_nonoverlapping`). The
+            // `.to_vec().into()` it replaces copied the weight TWICE: `to_vec`
+            // allocated and filled a `Vec`, then std's
+            // `impl From<Vec<T>> for Arc<[T]>` allocated the `Arc`,
+            // `copy_nonoverlapping`d the whole `Vec` into it and freed the
+            // `Vec`'s buffer. Same bytes, same order, same length, so no
+            // descriptor float changes; what goes away is one full weight-sized
+            // copy plus the `Vec`'s allocate/free pair.
+            //
+            // WHAT REMAINS: the descriptor still gets a PRIVATE copy of the
+            // weight, rebuilt on every call of this function — the `Arc` is
+            // born with refcount 1 and shares nothing with the layer or with any
+            // earlier descriptor. Whether that copy is paid once or once per
+            // backward pass is the CALLER's property, not this function's: the
+            // sequential path memoizes the descriptor list in
+            // `GpuCrownStaticCache` above (cloning it copies the `Arc` handles,
+            // not the weights) and the graph resnet path has the
+            // `ResnetSegmentSkeleton` twin, while callers such as
+            // `network/ibp/crown_partial_gpu.rs` and
+            // `network/graph_alpha/backward/gpu_suffix.rs` build a fresh
+            // descriptor list — hence a fresh copy of every weight — on each of
+            // their own invocations.
+            //
+            // Removing the copy itself needs an edit OUTSIDE this file: an
+            // `Arc<[f32]>` handle over the row-major parameters held ON the
+            // immutable layer, which extraction would clone instead of copy —
+            // i.e. a new field on `LinearLayer` (`layers/linear/mod.rs`, over
+            // `weight` and `bias`), on `Conv2dLayer`
+            // (`layers/convolution/conv2d/types.rs`) and on `Conv1dLayer`
+            // (`layers/convolution/conv1d/types/forward.rs`, both over
+            // `kernel`). `LinearLayer` already caches derived arrays exactly
+            // that way (`weight_t_rm`, `weight_f64`, both `Arc<OnceLock<..>>`,
+            // resting on its documented invariant that `weight` is immutable
+            // after construction); the two conv types carry no cache field at
+            // all today. Not attempted here — those files are outside this
+            // change.
             gpu_layers.push(GpuCrownLayer::Linear {
-                weight: linear.weight.as_slice()?.to_vec().into(),
+                weight: Arc::<[f32]>::from(linear.weight.as_slice()?),
                 bias: linear
                     .bias
                     .as_ref()
-                    .and_then(|b| Some(b.as_slice()?.to_vec().into())),
+                    .and_then(|b| Some(Arc::<[f32]>::from(b.as_slice()?))),
                 out_features: linear.out_features(),
                 in_features: linear.in_features(),
                 cert_err: Default::default(),
@@ -245,13 +287,13 @@ pub(crate) fn try_extract_single_gpu_layer(
                 Layer::Exp(_) => extract_activation_gpu_layer(pre_l, pre_u, exp_linear_relaxation),
                 Layer::Log(_) => extract_activation_gpu_layer(pre_l, pre_u, log_linear_relaxation),
                 // Structurally unreachable: outer match restricts to ReLU/Sigmoid/Tanh/Exp/Log.
-                // Return None defensively instead of panicking (#4205).
+                // Return None defensively instead of panicking.
                 _ => return None,
             };
             gpu_layers.push(gpu_layer);
         }
         Layer::Conv2d(c) => {
-            // Soundness gate (#4205, depthwise-separable CROWN crash): the
+            // Soundness gate (depthwise-separable CROWN crash): the
             // `GpuCrownLayer::Conv2d` descriptor and its shader model a DENSE
             // convolution — `weight_col` is interpreted as `(out_c, in_c*kh*kw)`
             // with no `groups`/`dilation` representation. A grouped (e.g. depthwise)
@@ -288,20 +330,51 @@ pub(crate) fn try_extract_single_gpu_layer(
             let kernel_slice = c.kernel.as_slice()?;
             let kernel_cols = in_c * kh * kw;
             debug_assert_eq!(kernel_slice.len(), out_c * kernel_cols);
-            let weight_col: Arc<[f32]> = kernel_slice.to_vec().into();
+            // One copy instead of two, and the per-call copy of the kernel
+            // remains; see the `Layer::Linear` arm.
+            let weight_col: Arc<[f32]> = Arc::from(kernel_slice);
 
             // Expand per-channel bias to full spatial size (out_c * oh * ow).
             // GPU bias_accumulate shader expects element-wise bias matching
             // the A-matrix column dimension.
+            //
+            // Collected STRAIGHT into the `Arc<[f32]>` instead of through an
+            // intermediate `Vec` (#gpu-descriptor-single-copy). The source is a
+            // `Map` over a `Range<usize>`, hence `TrustedLen`, and std's
+            // `impl FromIterator<T> for Arc<[T]>` documents a single allocation
+            // for an exact-size `TrustedLen` iterator (`ToArcSlice` →
+            // `Arc::from_iter_exact` in `alloc::sync`, which writes the j-th
+            // yielded item at index j).
+            // The `Vec` this replaces was filled and then copied wholesale into
+            // the `Arc`, so one full `out_c * oh * ow` copy and one
+            // allocate/free pair go away. That specialization is a std internal
+            // rather than a stability guarantee, but nothing here depends on it:
+            // its fallback is `collect::<Vec<_>>().into()`, which is exactly the
+            // code this replaced.
+            //
+            // The expansion is still recomputed on every call, and unlike the
+            // kernel it cannot be hoisted onto the layer behind a plain handle:
+            // its length follows the OUTPUT geometry derived from the caller's
+            // `pre_activation` (`oh * ow`), so a layer-side cache for it would
+            // have to be keyed by that geometry.
+            //
+            // Element `i` still holds `b[i / spatial]`, exactly the
+            // channel-major order the nested loop emitted; the running
+            // `channel_end` boundary advances the channel without paying an
+            // integer division per element.
             let bias_expanded: Option<Arc<[f32]>> = c.bias.as_ref().map(|b| {
                 let spatial = oh * ow;
-                let mut expanded = Vec::with_capacity(out_c * spatial);
-                for ch in 0..out_c {
-                    for _ in 0..spatial {
-                        expanded.push(b[ch]);
-                    }
-                }
-                expanded.into()
+                let mut channel = 0usize;
+                let mut channel_end = spatial;
+                (0..out_c * spatial)
+                    .map(|i| {
+                        if i == channel_end {
+                            channel += 1;
+                            channel_end += spatial;
+                        }
+                        b[channel]
+                    })
+                    .collect()
             });
 
             gpu_layers.push(GpuCrownLayer::Conv2d {
@@ -325,7 +398,6 @@ pub(crate) fn try_extract_single_gpu_layer(
         Layer::Conv1d(c) => {
             // Reuse the Conv2d GPU path via the Conv1d(IC, OC, K) ≡
             // Conv2d(IC, OC, (1, K)) equivalence on height-1 inputs.
-            // Reference: designs/2026-03-13-conv1d-gpu-crown-backward.md
             if c.groups > 1 || c.dilation > 1 {
                 return None;
             }
@@ -344,16 +416,25 @@ pub(crate) fn try_extract_single_gpu_layer(
 
             let kernel_slice = c.kernel.as_slice()?;
             debug_assert_eq!(kernel_slice.len(), out_c * in_c * kernel_w);
-            let weight_col: Arc<[f32]> = kernel_slice.to_vec().into();
+            // One copy instead of two, and the per-call copy of the kernel
+            // remains; see the `Layer::Linear` arm.
+            let weight_col: Arc<[f32]> = Arc::from(kernel_slice);
 
+            // Same single-pass channel-major expansion as the Conv2d arm — same
+            // `Arc` collect, same per-call rebuild — with `out_len` as the
+            // per-channel run: element `i` holds `bias[i / out_len]`.
             let bias_expanded: Option<Arc<[f32]>> = c.bias.as_ref().map(|bias| {
-                let mut expanded = Vec::with_capacity(out_c * out_len);
-                for ch in 0..out_c {
-                    for _ in 0..out_len {
-                        expanded.push(bias[ch]);
-                    }
-                }
-                expanded.into()
+                let mut channel = 0usize;
+                let mut channel_end = out_len;
+                (0..out_c * out_len)
+                    .map(|i| {
+                        if i == channel_end {
+                            channel += 1;
+                            channel_end += out_len;
+                        }
+                        bias[channel]
+                    })
+                    .collect()
             });
 
             gpu_layers.push(GpuCrownLayer::Conv2d {
@@ -384,7 +465,6 @@ pub(crate) fn try_extract_single_gpu_layer(
         //   SubConstant(c, reverse): y = c - x -> slopes=-1, intercepts=c
         //   MulConstant(c): y = x * c -> slopes=c, intercepts=0
         //   DivConstant(c): y = x / c -> slopes=1/c, intercepts=0
-        // Reference: designs/2026-03-06-gpu-crown-backward.md, #3460
         Layer::AddConstant(layer) => {
             let num_neurons = pre_activation.len();
             let intercept = expand_constant(&layer.constant, num_neurons)?;
@@ -573,4 +653,171 @@ pub(crate) fn apply_bn_werr_to_host_relu(layer: &mut GpuCrownLayer, werr: &[f32]
         *ui = next_up_f32((f64::from(*ui) + f64::from(w)) as f32);
     }
     Some(())
+}
+
+/// Value pins for the descriptor buffers this module builds
+/// (#gpu-descriptor-single-copy).
+///
+/// They sit inline rather than in `gpu_extraction_tests.rs` so the module that
+/// owns the buffer arithmetic owns its pins.
+///
+/// WHAT THEY DO AND DO NOT COVER. They pin buffer CONTENT, which is what the
+/// bias-expansion rewrite can get wrong (a run length taken from the wrong
+/// dimension, a channel boundary off by one, a channel that never advances).
+/// They cannot distinguish `Arc::from(slice)` from the `to_vec().into()` it
+/// replaced: that swap is byte-identical by construction, so no value assertion
+/// can see it, and only an allocation-count or pointer assertion could — a claim
+/// about allocation strategy, not about behaviour. Read them as a pin on the
+/// contract the rewrite had to preserve, not as evidence for the rewrite.
+///
+/// The Conv2d arm's bias expansion had no VALUE pin before this one. The two
+/// `bias_expanded` value assertions in this crate —
+/// `gpu_extraction_tests.rs::assert_conv1d_height_one_conv2d_descriptor` and
+/// `crown_tests.rs::try_extract_single_gpu_layer_conv1d_maps_to_conv2d_descriptor`
+/// — both drive the CONV1D arm, whose per-channel run is `out_len`; neither
+/// reaches the Conv2d arm, whose run is `oh * ow`. The other in-crate readers of
+/// `bias_expanded` — `graph/propagation/batched/tests_skeleton.rs` (fold-vs-legacy
+/// fingerprints) and `margin_row/gpu_seam/batch/tests.rs` (`Arc::ptr_eq`) —
+/// compare two extraction paths or allocation identities rather than pinning
+/// values, so a consistently-wrong expansion passes them.
+#[cfg(test)]
+mod descriptor_buffer_tests {
+    use super::*;
+    use crate::layers::{Conv2dLayer, LinearLayer};
+    use ndarray::{arr1, arr2, IxDyn};
+    use ny_core::Result;
+
+    fn uniform_bounds(shape: &[usize]) -> BoundedTensor {
+        let len: usize = shape.iter().product();
+        BoundedTensor::new(
+            ArrayD::from_shape_vec(IxDyn(shape), vec![-1.0f32; len])
+                .expect("lower shape should be valid"),
+            ArrayD::from_shape_vec(IxDyn(shape), vec![1.0f32; len])
+                .expect("upper shape should be valid"),
+        )
+        .expect("valid bounds")
+    }
+
+    /// The Linear descriptor carries the weight row-major and the bias intact.
+    ///
+    /// Fails on a copy that truncates, transposes or reorders the buffer, and on
+    /// a bias arm that drops the bias. The Linear descriptor pins in the sibling
+    /// `gpu_extraction_tests.rs` are all 1x1 weights (`[1.0]`, `[2.0]`, `[3.0]`),
+    /// in which a transposition is invisible; this one is 2x3 with distinct
+    /// entries. It does NOT witness the `Arc::from(slice)` swap itself, which is
+    /// byte-identical to what it replaced — see the module comment.
+    #[test]
+    fn linear_descriptor_carries_row_major_weight_and_bias() -> Result<()> {
+        let linear = LinearLayer::new(
+            arr2(&[[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+            Some(arr1(&[-0.25f32, 0.75])),
+        )?;
+        let pre_activation = uniform_bounds(&[3]);
+        let mut gpu_layers = Vec::new();
+
+        assert_eq!(
+            try_extract_single_gpu_layer(&Layer::Linear(linear), &pre_activation, &mut gpu_layers),
+            Some(())
+        );
+        assert_eq!(gpu_layers.len(), 1);
+        let GpuCrownLayer::Linear {
+            weight,
+            bias,
+            out_features,
+            in_features,
+            ..
+        } = &gpu_layers[0]
+        else {
+            panic!("expected a Linear GPU descriptor");
+        };
+        assert_eq!((*out_features, *in_features), (2, 3));
+        assert_eq!(weight.as_ref(), &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(bias.as_deref(), Some(&[-0.25f32, 0.75][..]));
+        Ok(())
+    }
+
+    /// The Conv2d descriptor expands the bias channel-major with a run of
+    /// `oh * ow`, and carries the kernel verbatim as `weight_col`.
+    ///
+    /// Fails closed on the expansion arithmetic: the geometry is 3 output
+    /// channels over `oh = 2, ow = 3`, so a run length taken from the wrong
+    /// dimension (`out_c = 3`, `kh * kw = 4`, `in_h * in_w = 12` all differ from
+    /// 6), a channel boundary off by one, or a channel that fails to advance
+    /// each produce a different 18-element vector. It is deliberately blind to
+    /// which iteration form produced that vector: the nested-push loop and the
+    /// `(0..n).map(..).collect()` that replaced it are required to agree here.
+    #[test]
+    fn conv2d_descriptor_expands_bias_channel_major_over_output_spatial() -> Result<()> {
+        // kernel (out_c = 3, in_c = 1, kh = 2, kw = 2)
+        let kernel = ArrayD::from_shape_vec(
+            IxDyn(&[3, 1, 2, 2]),
+            vec![
+                1.0f32, 2.0, 3.0, 4.0, // out channel 0
+                5.0, 6.0, 7.0, 8.0, // out channel 1
+                9.0, 10.0, 11.0, 12.0, // out channel 2
+            ],
+        )
+        .expect("conv2d kernel shape should be valid");
+        let conv = Conv2dLayer::new(kernel, Some(arr1(&[0.5f32, -1.5, 2.25])), (1, 1), (0, 0))?;
+        // A 1x3x4 input under a 2x2 stride-1 pad-0 kernel gives oh = 2, ow = 3,
+        // so the per-channel run is 6 and the whole plane is 18 elements.
+        let pre_activation = uniform_bounds(&[1, 3, 4]);
+        let mut gpu_layers = Vec::new();
+
+        assert_eq!(
+            try_extract_single_gpu_layer(&Layer::Conv2d(conv), &pre_activation, &mut gpu_layers),
+            Some(())
+        );
+        assert_eq!(gpu_layers.len(), 1);
+        let GpuCrownLayer::Conv2d {
+            weight_col,
+            bias_expanded,
+            out_channels,
+            out_h,
+            out_w,
+            ..
+        } = &gpu_layers[0]
+        else {
+            panic!("expected a Conv2d GPU descriptor");
+        };
+        assert_eq!((*out_channels, *out_h, *out_w), (3, 2, 3));
+        assert_eq!(
+            weight_col.as_ref(),
+            &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+        );
+        let expected: Vec<f32> = [0.5f32, -1.5, 2.25]
+            .into_iter()
+            .flat_map(|b| std::iter::repeat_n(b, 6))
+            .collect();
+        assert_eq!(
+            bias_expanded.as_deref().expect("Conv2d bias should expand"),
+            expected.as_slice()
+        );
+        Ok(())
+    }
+
+    /// A Conv2d without a bias still produces `bias_expanded: None` — the
+    /// `Option` arm must survive the collect rewrite rather than becoming an
+    /// all-zero plane.
+    #[test]
+    fn conv2d_descriptor_without_bias_expands_nothing() -> Result<()> {
+        let kernel = ArrayD::from_shape_vec(IxDyn(&[2, 1, 2, 2]), vec![1.0f32; 8])
+            .expect("conv2d kernel shape should be valid");
+        let conv = Conv2dLayer::new(kernel, None, (1, 1), (0, 0))?;
+        let pre_activation = uniform_bounds(&[1, 3, 4]);
+        let mut gpu_layers = Vec::new();
+
+        assert_eq!(
+            try_extract_single_gpu_layer(&Layer::Conv2d(conv), &pre_activation, &mut gpu_layers),
+            Some(())
+        );
+        let GpuCrownLayer::Conv2d { bias_expanded, .. } = &gpu_layers[0] else {
+            panic!("expected a Conv2d GPU descriptor");
+        };
+        assert!(
+            bias_expanded.is_none(),
+            "biasless Conv2d must expand no bias"
+        );
+        Ok(())
+    }
 }

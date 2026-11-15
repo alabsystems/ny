@@ -20,6 +20,28 @@ const PRESET_CATEGORY: &str = "flight_receipt_preset_2026";
 const DEFAULT_CATEGORY: &str = "flight_receipt_default_2026";
 const INVALID_CATEGORY: &str = "flight_receipt_invalid_2026";
 const RELATIONAL_CATEGORY: &str = "isomorphic_acasxu_2026";
+/// A validated two-network `isomorphic-to` property whose unsafe region is a
+/// conjunction of contradictory deviation atoms (empty for every f and g) —
+/// the fixture of `vnncomp::tests::isomorphic_infeasible_unsafe_region_returns_unsat_with_passing_cert`.
+const RELATIONAL_PROPERTY: &str = "(vnnlib-version 2.0)
+(declare-network f
+  (declare-input X_f Float32 [2])
+  (declare-output Y_f Float32 [2])
+)
+(declare-network g
+  (isomorphic-to f)
+  (declare-input X_g Float32 [2])
+  (declare-output Y_g Float32 [2])
+)
+(assert (and (>= X_f[0] -1) (<= X_f[0] 1)))
+(assert (and (>= X_g[0] -1) (<= X_g[0] 1)))
+(assert (and (>= X_f[1] -1) (<= X_f[1] 1)))
+(assert (and (>= X_g[1] -1) (<= X_g[1] 1)))
+(assert (== X_f[0] X_g[0]))
+(assert (== X_f[1] X_g[1]))
+(assert (and (> Y_g[0] (+ Y_f[0] 0.05)) (< Y_g[0] (- Y_f[0] 0.05))))
+(assert (and (> Y_g[1] (+ Y_f[1] 0.05)) (< Y_g[1] (- Y_f[1] 0.05))))
+";
 
 fn write_fixture(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     let configs = root.join("configs");
@@ -178,14 +200,38 @@ fn scored_flight_receipts_typed_preset_and_explicit_env_kill() {
         .as_str()
         .is_some_and(|reason| reason.contains("alpha_zero_yield_frac")));
 
-    let missing_relational_property = temp.path().join("missing-relational.vnnlib");
+    // #name-blind-routing: the relational route is chosen by the property's
+    // own structure (two declared networks), not by the category name, so this
+    // case must hand the binary a real dual-network property. (It used to pass
+    // a MISSING file and rely on the name alone; that file now counts zero
+    // networks and takes the ordinary route, whose missing-input exit precedes
+    // lever materialization.) The property is a validated `isomorphic-to` pair
+    // whose unsafe region is empty, so the route finishes on its certified
+    // arithmetic shortcut without reading any ONNX.
+    let relational_property = temp.path().join("relational.vnnlib");
+    fs::write(&relational_property, RELATIONAL_PROPERTY).expect("write dual-network fixture");
     let relational = run_scored_case(
         temp.path(),
         &configs,
-        &missing_relational_property,
+        &relational_property,
         RELATIONAL_CATEGORY,
         "relational",
         None,
+    );
+    let routed = relational["events"]
+        .as_array()
+        .expect("flight events")
+        .iter()
+        .any(|event| {
+            event["method"] == "relational_route"
+                && event["status"] == "ran"
+                && event["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("declared_networks=2"))
+        });
+    assert!(
+        routed,
+        "the relational case must actually take the dual-network route: {relational}"
     );
     let relational_alpha = alpha_entry(&relational);
     assert!(relational_alpha["value"].is_null());

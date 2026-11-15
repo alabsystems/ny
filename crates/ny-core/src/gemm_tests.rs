@@ -520,7 +520,7 @@ fn test_conv_transpose_2d_zero_volume_skips_large_scatter_loop() {
     let result = engine
         .conv_transpose_2d(&[], &[], &params)
         .expect("zero-volume transpose convolution is empty");
-    assert!(result.is_empty());
+    assert_eq!(result.len(), 0);
 }
 
 #[test]

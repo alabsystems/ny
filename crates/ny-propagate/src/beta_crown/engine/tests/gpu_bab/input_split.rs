@@ -61,7 +61,7 @@ fn gpu_input_split_verifier(
     })
 }
 
-/// Regression for #3870: GPU DomainList input split must run adv_check before
+/// Regression: GPU DomainList input split must run adv_check before
 /// counting the root domain, matching the CPU single-objective path.
 #[ntest::timeout(10000)]
 #[test]
@@ -108,7 +108,7 @@ fn test_gpu_bab_input_split_adv_check_finds_root_counterexample_3870() {
     );
 }
 
-/// Regression for #3870: enabling adv_check on the GPU DomainList path must
+/// Regression: enabling adv_check on the GPU DomainList path must
 /// not change the final verification status.
 #[ntest::timeout(10000)]
 #[test]

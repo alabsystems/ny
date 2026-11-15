@@ -271,7 +271,7 @@ fn test_cos_sound_mode_uses_ibp_constant_bounds() {
     }
 }
 
-/// Regression test for #3316: sin IBP bounds must stay in [-1, 1] even when
+/// Regression test: sin IBP bounds must stay in [-1, 1] even when
 /// directed rounding pushes endpoint evaluations past the range boundary.
 /// sin(π/2 - ε) ≈ 1, next_up_f32(≈1.0) could exceed 1.0.
 #[ntest::timeout(10000)]
@@ -298,7 +298,7 @@ fn test_sin_ibp_near_extrema_range_clamp_3316() {
     );
 }
 
-/// Regression test for #3316: cos IBP bounds must stay in [-1, 1] even when
+/// Regression test: cos IBP bounds must stay in [-1, 1] even when
 /// directed rounding pushes endpoint evaluations past the range boundary.
 #[ntest::timeout(10000)]
 #[test]

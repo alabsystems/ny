@@ -6,8 +6,6 @@
 //!
 //! Contains post-processing steps (non-finite fallback, bias conversion,
 //! reshape) shared by decomposed normalization paths.
-//!
-//! Part of #2077, #318, #3447.
 
 use ndarray::{Array2, ArrayD, Axis, IxDyn};
 use ny_core::{NyError, Result};
@@ -36,8 +34,6 @@ pub(crate) struct DecomposedNormFinalizeMetadata<'a> {
 ///
 /// Both decomposed LayerNorm and RmsNorm produce intermediate Array2 results
 /// that need this identical post-processing before returning.
-///
-/// Part of #2077, #318, #3447.
 pub(crate) fn finalize_decomposed_norm_bounds(
     mut new_a_l: Array2<f32>,
     mut new_a_u: Array2<f32>,
@@ -152,7 +148,6 @@ pub(crate) fn finalize_decomposed_norm_bounds(
 /// IBP interval instead of discarding the entire decomposed bound.
 ///
 /// Returns the number of rows that fell back to fused IBP.
-/// Part of #2077, #318.
 pub(crate) fn validate_norm_against_fused_ibp(
     result: &mut BatchedLinearBounds,
     a_output: &BatchedLinearBounds,
@@ -244,8 +239,6 @@ pub(crate) fn validate_norm_against_fused_ibp(
 ///
 /// Shared bridge helper used by LayerNorm and RmsNorm scalar CROWN paths
 /// to route IbpValidated mode through the decomposed primitive-chain backward.
-///
-/// Part of #2077, #3821.
 pub(crate) fn scalar_bounds_to_batched(bounds: &LinearBounds) -> Result<BatchedLinearBounds> {
     BatchedLinearBounds::new(
         bounds.lower_a().clone().into_dyn(),
@@ -264,8 +257,6 @@ pub(crate) fn scalar_bounds_to_batched(bounds: &LinearBounds) -> Result<BatchedL
 /// columns are partitioned per normalization slice. The incoming scalar bias is
 /// intentionally dropped here and restored exactly once by
 /// [`batched_bounds_to_scalar_multi_dim`].
-///
-/// Part of #4148.
 pub(crate) fn scalar_bounds_to_batched_multi_dim(
     bounds: &LinearBounds,
     batch_size: usize,
@@ -331,8 +322,6 @@ pub(crate) fn scalar_bounds_to_batched_multi_dim(
 /// normalization backward.
 ///
 /// Shared bridge helper used by LayerNorm and RmsNorm scalar CROWN paths.
-///
-/// Part of #2077, #3821.
 pub(crate) fn batched_bounds_to_scalar(bounds: &BatchedLinearBounds) -> Result<LinearBounds> {
     let lower_a = bounds
         .lower_a()
@@ -380,8 +369,6 @@ pub(crate) fn batched_bounds_to_scalar(bounds: &BatchedLinearBounds) -> Result<L
 
 /// Merge `[batch_size, out_dim, norm_size]` batched bounds back into scalar
 /// `LinearBounds`, restoring the original incoming scalar bias exactly once.
-///
-/// Part of #4148.
 pub(crate) fn batched_bounds_to_scalar_multi_dim(
     bounds: &BatchedLinearBounds,
     original_bias_lower: &ndarray::Array1<f32>,

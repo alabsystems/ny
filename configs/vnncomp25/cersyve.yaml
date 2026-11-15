@@ -103,8 +103,15 @@ bab:
   branching:
     method: input
     candidates: 5
-    reduceop: max
     input_split:
+      # #lsnc-lane stage-3 search keys ARMED 2026-09-26 (scratchpad/w6q M2, pin ny_ship26_5d6ca4577, 100 s, 3 reps rotated):
+      # cart_pole_finetune_inv timeout 3/3 (ctl, 93.8 s) -> UNSAT 3/3 at 6.6-6.8 s; the dim-scaled floor alone does nothing.
+      lowdim_split: sbwr
+      lowdim_prover_refine_width: 32
+      lowdim_parallel: true
+      lowdim_clip: true
+      lowdim_prover_share: 0.9
+      lowdim_prover: true
       enable: true
       sb_coeff_thresh: 1.0e-2
       sb_sum: true
@@ -140,8 +147,5 @@ bab:
     vnncomp_post_bab_attack: false
   alpha_crown:
     lr_alpha: 0.2
-    iterations: 100
   beta_crown:
-    lr_alpha: 0.1
-    lr_beta: 0.15
     iterations: 25

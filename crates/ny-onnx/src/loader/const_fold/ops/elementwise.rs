@@ -13,6 +13,7 @@ use super::super::FoldedTensor;
 pub(super) fn try_fold(
     node: &onnx_proto::NodeProto,
     weights: &WeightStore,
+    qdq_activation_relaxation: bool,
 ) -> Option<FoldedTensor> {
     // Shape arithmetic is authored as INT64 in ONNX.  Keep that path exact:
     // evaluating it through WeightStore's compatibility f32 view first loses
@@ -26,7 +27,7 @@ pub(super) fn try_fold(
         return try_fold_typed_int64(node, weights);
     }
 
-    let float_data = try_fold_float(node, weights)?;
+    let float_data = try_fold_float(node, weights, qdq_activation_relaxation)?;
     // Some constant shape cones reach this evaluator before authored dtype
     // provenance has been attached to WeightStore.  Preserve a checked exact
     // Mul/Div sidecar when one is available, but keep the generic f32 result
@@ -136,7 +137,11 @@ fn folded_int64(integer_data: ArrayD<i64>, integer_range: (i64, i64)) -> FoldedT
     }
 }
 
-fn try_fold_float(node: &onnx_proto::NodeProto, weights: &WeightStore) -> Option<ArrayD<f32>> {
+fn try_fold_float(
+    node: &onnx_proto::NodeProto,
+    weights: &WeightStore,
+    qdq_activation_relaxation: bool,
+) -> Option<ArrayD<f32>> {
     match node.op_type.as_str() {
         "Pow" if node.input.len() == 2 => {
             let (base, exponent) = binary_inputs(node, weights)?;
@@ -147,7 +152,16 @@ fn try_fold_float(node: &onnx_proto::NodeProto, weights: &WeightStore) -> Option
                 return None;
             }
             let root = value.sqrt();
-            ((root as f64) * (root as f64) == value as f64).then_some(root)
+            if (root as f64) * (root as f64) == value as f64 {
+                return Some(root);
+            }
+            // #smart-turn-qdq gate: `f32::sqrt` is IEEE-754 correctly rounded,
+            // so `fl32(sqrt(c))` is BIT-IDENTICAL to what the runtime Sqrt
+            // kernel computes for the same constant — folding it bakes no
+            // rounding decision the model would not have made itself. Kept
+            // behind the gate so the default path's exact-only fold (and every
+            // load that fails on its absence) stays byte-identical.
+            qdq_activation_relaxation.then_some(root)
         }),
         "Div" if node.input.len() == 2 => {
             let (lhs, rhs) = binary_inputs(node, weights)?;

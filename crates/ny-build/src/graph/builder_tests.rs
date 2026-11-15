@@ -315,13 +315,13 @@ fn decompose_instance_norm_rank4_broadcasts_affines_by_channel() {
     }
 }
 
-/// #2685: Unresolvable tensor references must produce an error, not silently
+/// Unresolvable tensor references must produce an error, not silently
 /// fall back to the _input node.
 #[test]
 fn test_dangling_tensor_reference_returns_error() {
     // A ReLU layer references tensor "nonexistent" which is not a network input
-    // and not produced by any previous layer. Before the fix for #2685, this
-    // silently connected to _input. Now it should return an error.
+    // and not produced by any previous layer. Before the fix, this silently
+    // connected to _input. Now it should return an error.
     let weights = WeightStore::new();
     let layers = vec![layer_spec(
         "relu_0",
@@ -357,7 +357,7 @@ fn test_dangling_tensor_reference_returns_error() {
     );
 }
 
-/// #2685: Legitimate _input references (first layer referencing a declared
+/// Legitimate _input references (first layer referencing a declared
 /// network input) must still work correctly.
 #[test]
 fn test_legitimate_input_reference_succeeds() {
@@ -956,8 +956,8 @@ fn test_shape_with_prefolded_output_skips_instead_of_opaque_skip() {
     assert!(graph.node("post").is_some(), "live path must survive");
 }
 
-/// Regression test for the "LayerNorm constant-cascade" gap (NY #4350), as
-/// surfaced by RT-DETR's decoder query embedding.
+/// Regression test for the "LayerNorm constant-cascade" gap, as surfaced by
+/// RT-DETR's decoder query embedding.
 ///
 /// RT-DETR builds its decoder queries from a purely constant chain —
 /// `ConstantWeight -> Unsqueeze -> Expand -> LayerNorm`. `build_graph_network`
@@ -1041,7 +1041,7 @@ fn layernorm_over_const_folded_data_input_fails_closed_to_opaque_skip_4350() {
     );
 
     // 3. The bounds must ENCLOSE the concrete value. They are vacuous today
-    //    ([-inf, +inf]) because #4350 is unfixed, but the enclosure property is
+    //    ([-inf, +inf]) because the gap is unfixed, but the enclosure property is
     //    what soundness rests on and is what must survive any future fix.
     let point = arr1(&[0.0f32, 0.0, 0.0, 0.0]).into_dyn();
     let output = graph

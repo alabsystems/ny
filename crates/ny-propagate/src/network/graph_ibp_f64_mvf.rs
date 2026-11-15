@@ -795,6 +795,7 @@ impl GraphNetwork {
     /// Shared implementation of the centered walk, optionally extended with
     /// the monotonicity-corner refinement (#mono-corner).
     fn centered_walk_full(&self, input: &Interval64, want_mono: bool) -> Result<CenteredMono> {
+        self.ensure_proof_eligible()?;
         require_f64_interval_proof_environment()?;
 
         let lo_std = input.lower.as_standard_layout();
@@ -1118,6 +1119,7 @@ impl GraphNetwork {
         deadline: Option<Instant>,
         mut affine_budget: Option<&mut MvfAffineDiagnosticBudget>,
     ) -> Result<Vec<CenteredMono>> {
+        self.ensure_proof_eligible()?;
         let check_deadline = |stage: &str| -> Result<()> {
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 Err(NyError::DeadlineExceeded(format!(
@@ -2673,7 +2675,7 @@ mod tests {
             .expect("diagnostic");
         assert_eq!(diag.stationary, 1);
         assert_eq!(diag.slope_straddles_zero, 1);
-        assert!(diag.candidates.is_empty());
+        assert_eq!((diag.candidates).len(), 0);
 
         let nonpoint = Interval64 {
             lower: arr1(&[0.0]).into_dyn(),

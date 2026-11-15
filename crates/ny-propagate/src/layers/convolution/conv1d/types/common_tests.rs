@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Regression tests for #4204: NaN guard coverage in `finalize_bias_bounds`.
+//! Regression tests: NaN guard coverage in `finalize_bias_bounds`.
 
 use super::common::{finalize_bias_bounds, BackwardBatchContext};
 use crate::BatchedLinearBounds;
@@ -20,7 +20,7 @@ fn ctx_1x1(conv_in_size: usize) -> BackwardBatchContext {
     }
 }
 
-/// Regression test for #4204: finalize_bias_bounds NaN guard on inf + (-inf).
+/// Regression test: finalize_bias_bounds NaN guard on inf + (-inf).
 ///
 /// When input lower_b is +inf (from a previous layer's ±inf fallback) and
 /// the A-matrix contains inf values that produce -inf bias contribution,
@@ -75,7 +75,7 @@ fn test_finalize_bias_bounds_nan_guard_inf_plus_neg_inf_4204() {
     assert_eq!(ub, f32::INFINITY, "NaN upper_b → +inf");
 }
 
-/// Regression test for #4204: finalize_bias_bounds produces sound output
+/// Regression test: finalize_bias_bounds produces sound output
 /// for normal finite inputs (no NaN guard triggered).
 #[test]
 fn test_finalize_bias_bounds_finite_no_nan_4204() {

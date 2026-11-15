@@ -14,6 +14,272 @@ use ny_tensor::BoundedTensor;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
+fn affine_at_nary(result: &AttnTernaryResult, inputs: [&[f32]; 3]) -> (f64, f64) {
+    let mut lo = result.1[0] as f64;
+    let mut hi = result.2[0] as f64;
+    for (bound, input) in result.0.iter().zip(inputs) {
+        let bound = bound.as_ref().unwrap();
+        lo += bound
+            .lower_a()
+            .row(0)
+            .iter()
+            .zip(input)
+            .map(|(&a, &x)| a as f64 * x as f64)
+            .sum::<f64>();
+        hi += bound
+            .upper_a()
+            .row(0)
+            .iter()
+            .zip(input)
+            .map(|(&a, &x)| a as f64 * x as f64)
+            .sum::<f64>();
+    }
+    (lo, hi)
+}
+
+#[test]
+fn directional_cast_charge_encloses_large_cancellation_at_every_vertex() {
+    let layer = SelfAttentionLayer::new(AttentionMask::Standard, Some(1.0));
+    let q = box_from_lo_hi(&[1, 1], &[0.0], &[0.0]);
+    let k = box_from_lo_hi(&[3, 1], &[0.0; 3], &[0.0; 3]);
+    let center = [1e20_f32, 1e20_f32, -2e20_f32];
+    let lo = center.map(ny_tensor::next_down_f32);
+    let hi = center.map(ny_tensor::next_up_f32);
+    let v = box_from_lo_hi(&[3, 1], &lo, &hi);
+    let result = layer
+        .propagate_crown_ternary(&identity_node_lb(1), &q, &k, &v)
+        .unwrap();
+    for vertex in 0..8 {
+        let point: Vec<f32> = (0..3)
+            .map(|i| if vertex & (1 << i) == 0 { lo[i] } else { hi[i] })
+            .collect();
+        // Equal scores imply the exact rational average. The sum of these
+        // three binary32 values is exact in binary64, even after cancellation.
+        let truth = point.iter().map(|&x| x as f64).sum::<f64>() / 3.0;
+        let (lower, upper) = affine_at_nary(&result, [&[0.0], &[0.0; 3], &point]);
+        assert!(
+            lower <= truth && truth <= upper,
+            "vertex={vertex}: [{lower},{upper}] excludes {truth}"
+        );
+    }
+}
+
+#[test]
+fn directional_incoming_coefficient_error_is_not_dropped() {
+    let q = box_from_lo_hi(&[1, 1], &[-10.0], &[10.0]);
+    let k = q.clone();
+    let v = box_from_lo_hi(&[1, 1], &[3.0], &[4.0]);
+    let node = LinearBounds::new_or_conservative_with_err(
+        Array2::ones((1, 1)),
+        Array1::zeros(1),
+        Array2::ones((1, 1)),
+        Array1::zeros(1),
+        Array2::from_elem((1, 1), 0.25),
+        Array2::from_elem((1, 1), 0.25),
+    )
+    .unwrap();
+    let layer = SelfAttentionLayer::standard();
+    let result = layer.propagate_crown_ternary(&node, &q, &k, &v).unwrap();
+    let (lo, _) = affine_at_nary(&result, [&[0.0], &[0.0], &[3.0]]);
+    let (_, hi) = affine_at_nary(&result, [&[0.0], &[0.0], &[4.0]]);
+    assert!(
+        lo <= 2.25 && hi >= 5.0,
+        "incoming uncertainty was lost: [{lo},{hi}]"
+    );
+    assert!(result.0[0]
+        .as_ref()
+        .unwrap()
+        .lower_a()
+        .iter()
+        .all(|&x| x == 0.0));
+    assert!(result.0[1]
+        .as_ref()
+        .unwrap()
+        .lower_a()
+        .iter()
+        .all(|&x| x == 0.0));
+}
+
+#[test]
+fn directional_common_score_shift_cancels_before_bounding() {
+    let q = box_from_lo_hi(&[1, 1], &[-1e10], &[1e10]);
+    let k = box_from_lo_hi(&[2, 1], &[1e10; 2], &[1e10; 2]);
+    let v = box_from_lo_hi(&[2, 1], &[1.0, 3.0], &[1.0, 3.0]);
+    let result = SelfAttentionLayer::standard()
+        .propagate_crown_ternary(&identity_node_lb(1), &q, &k, &v)
+        .unwrap();
+    let (lower, upper) = concretize_nary(&result.0, &result.1, &result.2, &q, &k, &v);
+    assert!(lower[0] <= 2.0 && upper[0] >= 2.0);
+    assert!(
+        upper[0] - lower[0] < 1e-5,
+        "uniform scores should pin the average: {lower:?}/{upper:?}"
+    );
+}
+
+#[test]
+fn directional_variable_value_mixed_remainder_encloses_tanh_witness() {
+    let q = box_from_lo_hi(&[1, 1], &[-1.0], &[1.0]);
+    let k = box_from_lo_hi(&[2, 1], &[1.0, -1.0], &[1.0, -1.0]);
+    let v = box_from_lo_hi(&[2, 1], &[-1.0, -1.0], &[1.0, 1.0]);
+    let result = SelfAttentionLayer::standard()
+        .propagate_crown_ternary(&identity_node_lb(1), &q, &k, &v)
+        .unwrap();
+    for t in [-1.0_f64, -0.5, 0.0, 0.5, 1.0] {
+        let (lower, upper) = affine_at_nary(&result, [&[t as f32], &[1.0, -1.0], &[-1.0, 1.0]]);
+        let truth = -t.tanh();
+        assert!(
+            lower <= truth && truth <= upper,
+            "mixed witness t={t}: [{lower},{upper}] vs {truth}"
+        );
+    }
+}
+
+#[test]
+fn checked_mixed_cap_strictly_tightens_the_same_production_affine_carrier() {
+    let q = box_from_lo_hi(&[1, 1], &[-1.0], &[1.0]);
+    let k = box_from_lo_hi(&[2, 1], &[1.0, -1.0], &[1.0, -1.0]);
+    let v = box_from_lo_hi(&[2, 1], &[-1.0, -1.0], &[1.0, 1.0]);
+    let layer = SelfAttentionLayer::standard();
+    let node = identity_node_lb(1);
+    let checked = layer.propagate_crown_ternary(&node, &q, &k, &v).unwrap();
+    let linear = crate::layers::attention::directional::propagate_linear_mixed_for_test(
+        &layer, &node, &q, &k, &v,
+    )
+    .unwrap();
+    for i in 0..3 {
+        assert_eq!(
+            checked.0[i].as_ref().unwrap().lower_a(),
+            linear.0[i].as_ref().unwrap().lower_a()
+        );
+        assert_eq!(
+            checked.0[i].as_ref().unwrap().upper_a(),
+            linear.0[i].as_ref().unwrap().upper_a()
+        );
+    }
+    assert!(
+        checked.1[0] > linear.1[0] + 0.07,
+        "lower unchanged: checked={} linear={}",
+        checked.1[0],
+        linear.1[0]
+    );
+    assert!(
+        checked.2[0] < linear.2[0] - 0.07,
+        "upper unchanged: checked={} linear={}",
+        checked.2[0],
+        linear.2[0]
+    );
+    for query in [-1.0_f32, -0.5, 0.0, 0.5, 1.0] {
+        for values in [[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]] {
+            let truth = f64::midpoint(values[0] as f64, values[1] as f64)
+                + (values[0] as f64 - values[1] as f64) * 0.5 * (query as f64).tanh();
+            let (lo, hi) = affine_at_nary(&checked, [&[query], &[1.0, -1.0], &values]);
+            assert!(
+                lo <= truth && truth <= hi,
+                "q={query},v={values:?}: [{lo},{hi}] excludes {truth}"
+            );
+        }
+    }
+}
+
+#[test]
+fn tiny_variable_value_mixed_boxes_enclose_independent_two_key_controls() {
+    let q = box_from_lo_hi(&[1, 1], &[-1e-8], &[1e-8]);
+    let k = box_from_lo_hi(&[2, 1], &[1.0, -1.0], &[1.0, -1.0]);
+    let v = box_from_lo_hi(&[2, 1], &[-0.5, -0.25], &[0.5, 0.25]);
+    let result = SelfAttentionLayer::standard()
+        .propagate_crown_ternary(&identity_node_lb(1), &q, &k, &v)
+        .unwrap();
+    for query in [-1e-8_f32, 0.0, 1e-8] {
+        for values in [[-0.5, -0.25], [-0.5, 0.25], [0.5, -0.25], [0.5, 0.25]] {
+            let e = (2.0 * query as f64).exp();
+            let truth = (e * values[0] as f64 + values[1] as f64) / (1.0 + e);
+            let (lo, hi) = affine_at_nary(&result, [&[query], &[1.0, -1.0], &values]);
+            assert!(
+                lo <= truth && truth <= hi,
+                "q={query},v={values:?}: [{lo},{hi}] excludes {truth}"
+            );
+        }
+    }
+}
+
+#[test]
+fn directional_exact_two_key_vjp_matches_rational_derivatives() {
+    let q = box_from_lo_hi(&[1, 1], &[-0.01], &[0.01]);
+    let k = box_from_lo_hi(&[2, 1], &[1.0, -1.0], &[1.0, -1.0]);
+    let v = box_from_lo_hi(&[2, 1], &[2.0, 0.0], &[2.0, 0.0]);
+    let result = SelfAttentionLayer::standard()
+        .propagate_crown_ternary(&identity_node_lb(1), &q, &k, &v)
+        .unwrap();
+    // Y(q)=1+tanh(q), so Y'(0)=1; each value derivative is exactly 1/2.
+    assert_eq!(result.0[0].as_ref().unwrap().lower_a()[[0, 0]], 1.0);
+    assert_eq!(
+        result.0[2].as_ref().unwrap().lower_a().row(0).to_vec(),
+        vec![0.5, 0.5]
+    );
+}
+
+#[test]
+fn directional_shared_work_budget_refuses_before_allocation_and_records_completion() {
+    use crate::certify::work::WorkBudget;
+    use std::time::{Duration, Instant};
+    let q = box_from_lo_hi(&[1, 1], &[0.0], &[0.0]);
+    let layer = SelfAttentionLayer::standard();
+    let node = identity_node_lb(1);
+    let expired = WorkBudget::new(
+        Some(
+            Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .unwrap(),
+        ),
+        1 << 20,
+        0,
+        u64::MAX,
+        4,
+        Duration::ZERO,
+    )
+    .unwrap();
+    assert!(matches!(
+        layer.propagate_crown_ternary_with_budget(&node, &q, &q, &q, &expired),
+        Err(NyError::DeadlineExceeded(_))
+    ));
+    let small = WorkBudget::new(None, 1, 0, u64::MAX, 4, Duration::ZERO).unwrap();
+    assert!(layer
+        .propagate_crown_ternary_with_budget(&node, &q, &q, &q, &small)
+        .is_err());
+    assert_eq!(small.receipt().unwrap().refused, 1);
+    let no_work = WorkBudget::new(None, 1 << 20, 0, 0, 4, Duration::ZERO).unwrap();
+    assert!(layer
+        .propagate_crown_ternary_with_budget(&node, &q, &q, &q, &no_work)
+        .is_err());
+    assert_eq!(no_work.receipt().unwrap().work_reserved, 0);
+    let admitted = WorkBudget::new(None, 1 << 20, 0, u64::MAX, 4, Duration::ZERO).unwrap();
+    layer
+        .propagate_crown_ternary_with_budget(&node, &q, &q, &q, &admitted)
+        .unwrap();
+    let receipt = admitted.receipt().unwrap();
+    assert_eq!(receipt.completed, 2); // admitted demand scan and construction
+    assert_eq!(receipt.live_scratch_bytes, 0);
+    assert!(receipt.peak_leased_bytes > 0 && receipt.work_reserved > 0);
+}
+
+#[test]
+fn directional_empty_leading_batch_refuses_instead_of_indexing_a_fake_slice() {
+    let empty = BoundedTensor::new(
+        ArrayD::zeros(IxDyn(&[0, 1, 1])),
+        ArrayD::zeros(IxDyn(&[0, 1, 1])),
+    )
+    .unwrap();
+    assert!(matches!(
+        SelfAttentionLayer::standard().propagate_crown_ternary(
+            &identity_node_lb(1),
+            &empty,
+            &empty,
+            &empty
+        ),
+        Err(NyError::UnsupportedOp(_))
+    ));
+}
+
 /// Build a BoundedTensor box from center + radius, given shape.
 fn box_from_center(shape: &[usize], centers: &[f32], radii: &[f32]) -> BoundedTensor {
     let lo: Vec<f32> = centers

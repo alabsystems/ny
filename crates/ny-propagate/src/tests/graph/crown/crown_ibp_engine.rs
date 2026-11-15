@@ -5,7 +5,7 @@
 //! Regression tests verifying that `collect_crown_ibp_bounds_dag_with_*_engine`
 //! produces bounds equivalent to the baseline `engine=None` (faer CPU GEMM) path.
 //!
-//! These lock the contract from W3 commit 11ed52f (#3549, #3716):
+//! These lock the contract from W3 commit 11ed52f:
 //! three CROWN-IBP collection callers were changed from `engine=None` to
 //! `engine=Some(...)` — verify bounds don't diverge.
 
@@ -201,7 +201,7 @@ pub(super) fn assert_node_bounds_parity(
     }
 }
 
-/// #3549 regression: `collect_crown_ibp_bounds_dag_with_engine` with
+/// Regression: `collect_crown_ibp_bounds_dag_with_engine` with
 /// `NaiveCpuGemmEngine` must produce bounds approximately equal to `engine=None`.
 ///
 /// The `engine=None` path uses faer GEMM (SIMD/tiled); `NaiveCpuGemmEngine` uses
@@ -233,7 +233,7 @@ fn test_crown_ibp_dag_engine_parity_simple_3549() {
     });
 }
 
-/// #3549 regression: `collect_crown_ibp_bounds_dag_with_deadline_and_engine`
+/// Regression: `collect_crown_ibp_bounds_dag_with_deadline_and_engine`
 /// (the exact variant modified by W3 in init.rs, bab_loop.rs, crown_batched.rs)
 /// must produce bounds approximately equal to the deadline-only baseline.
 #[ntest::timeout(10000)]
@@ -270,7 +270,7 @@ fn test_crown_ibp_dag_deadline_engine_parity_simple_3549() {
     });
 }
 
-/// #3718/#3499 regression: the engine-aware precomputed-IBP collector used by the
+/// Regression: the engine-aware precomputed-IBP collector used by the
 /// ECAPA stage-local helper must preserve bounds and provenance on Conv1d DAGs.
 ///
 /// Generic `GemmEngine` implementations have no cooperative-deadline contract,
@@ -325,7 +325,7 @@ fn test_crown_ibp_dag_precomputed_engine_parity_conv1d_3718() {
     });
 }
 
-/// #3811 regression: width-threshold precomputed CROWN-IBP must still thread
+/// Regression: width-threshold precomputed CROWN-IBP must still thread
 /// the supplied engine instead of hardcoding the CPU-only collector path.
 ///
 /// Generic `GemmEngine` implementations have no cooperative-deadline contract,
@@ -382,7 +382,7 @@ fn test_crown_ibp_dag_precomputed_width_threshold_engine_parity_conv1d_3811() {
     });
 }
 
-/// #3549 regression: engine parity on a deeper graph (2-block FFN transformer).
+/// Regression: engine parity on a deeper graph (2-block FFN transformer).
 ///
 /// This exercises the O(N^2) CROWN-IBP collection loop across multiple
 /// Linear backward passes, matching the real VNN-COMP workload more closely.
@@ -418,7 +418,7 @@ fn test_crown_ibp_dag_engine_parity_two_block_ffn_3549() {
     });
 }
 
-/// #3549 regression: engine parity with provenance — verify that using an engine
+/// Regression: engine parity with provenance — verify that using an engine
 /// does not change which nodes get CROWN-tightened vs. fall back to IBP.
 #[ntest::timeout(10000)]
 #[test]

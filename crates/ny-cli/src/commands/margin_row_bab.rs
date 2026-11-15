@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use prost::Message;
 
 use ny_onnx::onnx_proto::{GraphProto, ModelProto, NodeProto, TensorProto};
+use ny_propagate::margin_row::dense_bn_fold::{fold_dense_batchnorm, DenseBnFold, DenseBnParams};
 use ny_propagate::margin_row::{
     run_margin_row_lane, run_margin_row_lane_with_policy, BabStats,
     BackwardIntermExecutionEvidence, EpochExecutionEvidence, FrontierExecutionEvidence,
@@ -31,6 +32,7 @@ use ny_propagate::margin_row::{
     WidthExecutionEvidence,
 };
 
+use super::unsat_receipt::UnsatReceipt;
 use super::vnncomp::VnncompResult;
 
 /// f64 unit roundoff.
@@ -54,11 +56,60 @@ const MARGIN_ROW_ROOT_PRECISION_EXECUTION_METHOD: &str = "margin_row_root_precis
 const MARGIN_ROW_ROOT_PRECISION_EXECUTION_SCHEMA: &str =
     "ny-cli/margin-row-root-precision-execution/v1";
 const MARGIN_ROW_ROOT_ALPHA_EXECUTION_METHOD: &str = "margin_row_root_alpha_execution";
-const MARGIN_ROW_ROOT_ALPHA_EXECUTION_SCHEMA: &str = "ny-cli/margin-row-root-alpha-execution/v1";
+const MARGIN_ROW_ROOT_ALPHA_EXECUTION_SCHEMA: &str = "ny-cli/margin-row-root-alpha-execution/v2";
 const MARGIN_ROW_CONCURRENT_OVERLAP_EXECUTION_METHOD: &str =
     "margin_row_concurrent_overlap_execution";
 const MARGIN_ROW_CONCURRENT_OVERLAP_EXECUTION_SCHEMA: &str =
     "ny-cli/margin-row-concurrent-overlap-execution/v1";
+const MARGIN_ROW_CLOSE_INTEGRITY_METHOD: &str = "margin_row_close_integrity";
+const MARGIN_ROW_CLOSE_INTEGRITY_SCHEMA: &str = "ny-cli/margin-row-close-integrity/v1";
+
+/// #mr-close-telemetry: the PROOF-INTEGRITY receipt — the certified value of
+/// every close the lane's verdict rests on (thinnest certificate as exact bits
+/// and decimal, split by kind, counts below 1e-6 / 1e-8 / 1e-10, the smallest
+/// root `dj`). Written into the FLIGHT RECORD because it is the one artifact
+/// that survives `ny benchmarks run` (stdout nulled, stderr reduced to an
+/// error tail). `phase=terminal` for a lane that returned (`source=stats`, or
+/// `source=no_stats` for a lane that stopped before owning stats — every
+/// field then reads empty); `phase=snapshot outcome=running` for a lane still
+/// running when the scored command records its verdict (`source=` is where
+/// the published tally came from: `live`, or `none` before the root closed
+/// anything). Telemetry only.
+fn render_margin_row_close_integrity(
+    phase: &str,
+    outcome: &str,
+    source: &str,
+    evidence: &ny_propagate::margin_row::close_integrity::CloseIntegrityEvidence,
+) -> String {
+    format!(
+        "schema={MARGIN_ROW_CLOSE_INTEGRITY_SCHEMA} phase={phase} outcome={outcome} \
+         source={source} {}",
+        evidence.fields()
+    )
+}
+
+/// #mr-close-telemetry: record a SNAPSHOT proof-integrity receipt when a
+/// margin-row lane is still running as the scored command records its verdict
+/// (the detached concurrent worker on a timeout row, an inline worker
+/// abandoned at its slice cap, or any lane still live when another route
+/// decided the row). A lane that returned has already recorded its terminal
+/// receipt from `note_margin_row_execution`, so this is silent then. Called
+/// once, from `flight::finish`, before the sidecar is written.
+pub(crate) fn note_margin_row_close_integrity_snapshot_if_live() {
+    if let Some((source, evidence)) = ny_propagate::margin_row::close_integrity::snapshot_if_live()
+    {
+        crate::flight::note(
+            MARGIN_ROW_CLOSE_INTEGRITY_METHOD,
+            crate::flight::FlightStatus::Ran,
+            Some(render_margin_row_close_integrity(
+                "snapshot",
+                "running",
+                source.token(),
+                &evidence,
+            )),
+        );
+    }
+}
 
 fn render_margin_row_concurrent_overlap_execution() -> String {
     format!(
@@ -370,7 +421,16 @@ fn render_margin_row_root_alpha_execution(
          rebake_rounds_scored={} rebake_rounds_accepted={} \
          rebake_fixed_point_stops={} rebake_affordability_refusals={} \
          rebake_aborts={} rebake_published_before_bits={} \
-         rebake_published_after_bits={} policy_mismatch={}",
+         rebake_published_after_bits={} spec_alpha_enabled={} spec_alpha_width={} \
+         spec_alpha_cands={} spec_alpha_rounds={} spec_alpha_entries={} \
+         spec_alpha_ran={} spec_alpha_rounds_run={} spec_alpha_passes={} \
+         spec_alpha_entries_committed={} spec_alpha_classes_selected={} \
+         spec_alpha_incumbent_grads_ok={} \
+         spec_alpha_classes_improved={} spec_alpha_distinct_winners={} \
+         spec_alpha_incumbent_grad_improvements={} spec_alpha_closed_extra={} \
+         spec_alpha_truncated={} spec_alpha_root_before_bits={} \
+         spec_alpha_root_after_bits={} spec_alpha_best_gain_bits={} \
+         policy_mismatch={}",
         evidence.alpha_enabled,
         evidence.alpha_iters,
         evidence.alpha_secs.to_bits(),
@@ -433,6 +493,25 @@ fn render_margin_row_root_alpha_execution(
         evidence.rebake_aborts,
         optional_bits(evidence.rebake_published_before_bits),
         optional_bits(evidence.rebake_published_after_bits),
+        evidence.spec_alpha_enabled,
+        evidence.spec_alpha_width,
+        evidence.spec_alpha_cands,
+        evidence.spec_alpha_rounds,
+        evidence.spec_alpha_entries,
+        evidence.spec_alpha_ran,
+        evidence.spec_alpha_rounds_run,
+        evidence.spec_alpha_passes,
+        evidence.spec_alpha_entries_committed,
+        evidence.spec_alpha_classes_selected,
+        evidence.spec_alpha_incumbent_grads_ok,
+        evidence.spec_alpha_classes_improved,
+        evidence.spec_alpha_distinct_winners,
+        evidence.spec_alpha_incumbent_grad_improvements,
+        evidence.spec_alpha_closed_extra,
+        evidence.spec_alpha_truncated,
+        optional_bits(evidence.spec_alpha_root_before_bits),
+        optional_bits(evidence.spec_alpha_root_after_bits),
+        optional_bits(evidence.spec_alpha_best_gain_bits),
         evidence.policy_mismatch,
     )
 }
@@ -442,9 +521,31 @@ fn render_margin_row_root_alpha_execution(
 /// earn no optimizer engagement credit.
 fn note_margin_row_execution(out: &MarginRowOutcome) {
     let (outcome, stats) = match out {
-        MarginRowOutcome::Unsat(stats) => ("unsat", Some(stats)),
+        MarginRowOutcome::Unsat(stats, _) => ("unsat", Some(stats)),
         MarginRowOutcome::Unknown { stats, .. } => ("unknown", stats.as_ref()),
     };
+    // #mr-close-telemetry: unlike the execution receipts below, EVERY returned
+    // lane leaves a proof-integrity receipt — a stats-less stop says so
+    // (`source=no_stats`) instead of leaving an absence a reader could mistake
+    // for a binary without the receipt.
+    crate::flight::note(
+        MARGIN_ROW_CLOSE_INTEGRITY_METHOD,
+        crate::flight::FlightStatus::Ran,
+        Some(match stats {
+            Some(stats) => render_margin_row_close_integrity(
+                "terminal",
+                outcome,
+                "stats",
+                &stats.close_integrity,
+            ),
+            None => render_margin_row_close_integrity(
+                "terminal",
+                outcome,
+                "no_stats",
+                &ny_propagate::margin_row::close_integrity::CloseIntegrityEvidence::EMPTY,
+            ),
+        }),
+    );
     if let Some(stats) = stats {
         crate::flight::note(
             MARGIN_ROW_FRONTIER_EXECUTION_METHOD,
@@ -511,6 +612,71 @@ fn note_margin_row_execution(out: &MarginRowOutcome) {
             )),
         );
     }
+}
+
+/// #mr-close-telemetry: the flight receipt is versioned, carries its phase /
+/// outcome / source, prints the thinnest certificate as exact bits AND a
+/// round-trip decimal, and keeps a fixed schema (every per-kind key present
+/// on an empty tally, so "zero" and "absent" stay distinguishable).
+#[cfg(test)]
+#[test]
+fn margin_row_close_integrity_receipt_is_exact_and_versioned() {
+    use ny_propagate::margin_row::close_integrity::{CertKind, CloseIntegrityEvidence};
+
+    let empty = render_margin_row_close_integrity(
+        "terminal",
+        "unknown",
+        "no_stats",
+        &CloseIntegrityEvidence::EMPTY,
+    );
+    assert!(
+        empty.starts_with(
+            "schema=ny-cli/margin-row-close-integrity/v1 phase=terminal outcome=unknown \
+             source=no_stats close_schema=1 closes=0 min_close_bits=none min_close=na \
+             min_close_kind=none closes_lt_1e-6=0 closes_lt_1e-8=0 closes_lt_1e-10=0 \
+             min_root_dj_bits=none min_root_dj=na root_closed=0 epoch_closes=0 \
+             frozen_dual_closes=0 nonpositive=0 root_n=0 "
+        ),
+        "{empty}"
+    );
+    assert!(
+        empty.ends_with(
+            " epoch_root_n=0 epoch_root_min_bits=none epoch_root_min=na \
+             epoch_root_lt_1e-6=0 epoch_root_lt_1e-8=0 epoch_root_lt_1e-10=0"
+        ),
+        "{empty}"
+    );
+    assert!(!empty.contains('\n'));
+
+    let thin = 3.0e-9_f64;
+    let mut evidence = CloseIntegrityEvidence::default();
+    evidence.note(CertKind::Root, 0.125);
+    evidence.note(CertKind::Lift, thin);
+    evidence.note(CertKind::Eval, 2.0e-4);
+    let rendered = render_margin_row_close_integrity("terminal", "unsat", "stats", &evidence);
+    assert!(
+        rendered.starts_with(&format!(
+            "schema=ny-cli/margin-row-close-integrity/v1 phase=terminal outcome=unsat \
+             source=stats close_schema=1 closes=3 min_close_bits={} min_close=3e-9 \
+             min_close_kind=lift closes_lt_1e-6=1 closes_lt_1e-8=1 closes_lt_1e-10=0 \
+             min_root_dj_bits={} min_root_dj=1.25e-1 root_closed=1 ",
+            thin.to_bits(),
+            0.125f64.to_bits(),
+        )),
+        "{rendered}"
+    );
+    assert!(rendered.contains(&format!(
+        " lift_n=1 lift_min_bits={} lift_min=3e-9 lift_lt_1e-6=1 lift_lt_1e-8=1 \
+         lift_lt_1e-10=0 ",
+        thin.to_bits()
+    )));
+    assert!(rendered.contains(" eval_n=1 "), "{rendered}");
+    assert!(rendered.contains(" eval_min=2e-4 "), "{rendered}");
+    let snapshot = render_margin_row_close_integrity("snapshot", "running", "live", &evidence);
+    assert!(snapshot.starts_with(
+        "schema=ny-cli/margin-row-close-integrity/v1 phase=snapshot outcome=running \
+         source=live close_schema=1 closes=3 "
+    ));
 }
 
 #[cfg(test)]
@@ -671,9 +837,14 @@ fn margin_row_domain_alpha_execution_receipt_is_exact_and_versioned() {
         beta_columns: 8,
         column_retire: false,
         parallel_prebuild: false,
+        clip_head: false,
         domain_alpha_enabled: true,
         domain_alpha_iters: 4,
         domain_alpha_eta_bits: 0.125f64.to_bits(),
+        clip_head_evals: 0,
+        clip_head_moved: 0,
+        clip_head_closes: 0,
+        clip_head_refused: 0,
         beta_per_column_evals: 0,
         beta_columns_binding_evals: 0,
         beta_columns_max_candidates: 0,
@@ -723,9 +894,14 @@ fn margin_row_policy_execution_receipt_is_exact_and_versioned() {
         beta_columns: 4,
         column_retire: true,
         parallel_prebuild: false,
+        clip_head: false,
         domain_alpha_enabled: false,
         domain_alpha_iters: 2,
         domain_alpha_eta_bits: 0.25f64.to_bits(),
+        clip_head_evals: 0,
+        clip_head_moved: 0,
+        clip_head_closes: 0,
+        clip_head_refused: 0,
         beta_per_column_evals: 3,
         beta_columns_binding_evals: 2,
         beta_columns_max_candidates: 7,
@@ -768,6 +944,11 @@ fn margin_row_policy_execution_receipt_is_exact_and_versioned() {
 fn margin_row_backward_interm_execution_receipt_is_exact_and_versioned() {
     let evidence = BackwardIntermExecutionEvidence {
         enabled: true,
+        // MEASURED phase work, distinct from the 20.0 s BUDGET below. This
+        // receipt test pins the two as different numbers deliberately: reading
+        // `configured_secs` as a cost is the mistake `#rebake`'s round-1 pricing
+        // made.
+        measured_work_secs: 12.5,
         configured_secs: 20.0,
         configured_chunk: 256,
         configured_chunk_secs: 2.0,
@@ -885,11 +1066,33 @@ fn margin_row_root_alpha_execution_receipt_is_exact_and_versioned() {
         rebake_affordability_refusals: 1,
         rebake_published_before_bits: Some((-1.0f64).to_bits()),
         rebake_published_after_bits: Some((-0.5f64).to_bits()),
+        // #spec-alpha: policy echo AND yield. Set explicitly so this exact
+        // receipt test bites if either half stops being rendered -- the yield
+        // is the half that makes an armed sweep interpretable.
+        spec_alpha_enabled: true,
+        spec_alpha_width: 4,
+        spec_alpha_cands: 5,
+        spec_alpha_rounds: 2,
+        spec_alpha_entries: 4_096,
+        spec_alpha_ran: true,
+        spec_alpha_rounds_run: 2,
+        spec_alpha_passes: 3,
+        spec_alpha_entries_committed: 1_234,
+        spec_alpha_classes_selected: 4,
+        spec_alpha_incumbent_grads_ok: 4,
+        spec_alpha_classes_improved: 3,
+        spec_alpha_distinct_winners: 2,
+        spec_alpha_incumbent_grad_improvements: 2,
+        spec_alpha_closed_extra: 1,
+        spec_alpha_truncated: 1,
+        spec_alpha_root_before_bits: Some((-0.25f64).to_bits()),
+        spec_alpha_root_after_bits: Some((-0.125f64).to_bits()),
+        spec_alpha_best_gain_bits: Some(0.125f64.to_bits()),
         ..RootAlphaExecutionEvidence::default()
     };
     assert_eq!(
         render_margin_row_root_alpha_execution("unknown", &evidence),
-        "schema=ny-cli/margin-row-root-alpha-execution/v1 phase=terminal outcome=unknown \
+        "schema=ny-cli/margin-row-root-alpha-execution/v2 phase=terminal outcome=unknown \
          alpha_enabled=true alpha_iters=16 alpha_secs_bits=4623226492472524800 \
          alpha_lr_bits=4587366580439587226 alpha_cols=4 alpha_guard=true \
          rebake_enabled=true rebake_rounds=3 rebake_secs_bits=4631530004285489152 \
@@ -920,7 +1123,17 @@ fn margin_row_root_alpha_execution_receipt_is_exact_and_versioned() {
          rebake_rounds_accepted=1 rebake_fixed_point_stops=0 \
          rebake_affordability_refusals=1 rebake_aborts=0 \
          rebake_published_before_bits=13830554455654793216 \
-         rebake_published_after_bits=13826050856027422720 policy_mismatch=false",
+         rebake_published_after_bits=13826050856027422720 \
+         spec_alpha_enabled=true spec_alpha_width=4 spec_alpha_cands=5 \
+         spec_alpha_rounds=2 spec_alpha_entries=4096 spec_alpha_ran=true \
+         spec_alpha_rounds_run=2 spec_alpha_passes=3 \
+         spec_alpha_entries_committed=1234 spec_alpha_classes_selected=4 \
+         spec_alpha_incumbent_grads_ok=4 \
+         spec_alpha_classes_improved=3 spec_alpha_distinct_winners=2 \
+         spec_alpha_incumbent_grad_improvements=2 spec_alpha_closed_extra=1 \
+         spec_alpha_truncated=1 spec_alpha_root_before_bits=13821547256400052224 \
+         spec_alpha_root_after_bits=13817043656772681728 spec_alpha_best_gain_bits=4593671619917905920 \
+         policy_mismatch=false",
     );
 }
 
@@ -1666,6 +1879,64 @@ fn reserve_policy(
 /// tensor id `k + 1`. Fail-closed: any deviation returns `false`, which returns
 /// the reserve to the internal verifier — never the other way round.
 fn twin_spec_compiles_to_margin_row_head(spec: &TwinSpec) -> bool {
+    twin_spec_has_margin_row_head(spec) && spec.root_tableau_within_cap()
+}
+
+fn twin_spec_compiles_with_root_policy(spec: &TwinSpec, policy: &MarginRowRuntimePolicy) -> bool {
+    use ny_propagate::margin_row::root_box;
+    if !twin_spec_has_margin_row_head(spec) {
+        return false;
+    }
+    let conflicts = root_box::policy_conflicts(policy);
+    let source = root_box::select_source(spec, policy.root_precision.box_source, conflicts);
+    if !spec.root_tableau_within_cap() && !root_box::wide_consumers_supported(policy) {
+        eprintln!("[root-source-admission] phase=cli_root requested={} effective={} status=refused reason=unpriced_wide_consumers working_set_bytes={}",
+            policy.root_precision.box_source.token(), source.token(), root_box::wide_working_set_bytes());
+        return false;
+    }
+    match root_box::source_admission(spec, source, conflicts) {
+        Ok(_) => true,
+        Err(error) => {
+            if !spec.root_tableau_within_cap() {
+                eprintln!("[root-source-admission] phase=cli_root requested={} effective={} status=refused working_set_bytes={} reason={error}",
+                    policy.root_precision.box_source.token(), source.token(), root_box::wide_working_set_bytes());
+            }
+            false
+        }
+    }
+}
+
+/// A concurrent whole-lane admission must reserve its worst-case tree, not
+/// merely hope that the new wide root closes before scoring allocates. Inline
+/// root closure still uses the actual-survivor guard inside the lane.
+fn twin_spec_compiles_with_tree_policy(
+    spec: &TwinSpec,
+    policy: &MarginRowRuntimePolicy,
+    objectives: usize,
+    frontier: usize,
+    lru_cap: usize,
+) -> bool {
+    use ny_propagate::margin_row::root_box;
+    if !twin_spec_compiles_with_root_policy(spec, policy) {
+        return false;
+    }
+    if spec.root_tableau_within_cap() {
+        return true; // preserve every established narrow admission
+    }
+    let Some(root) = root_box::source_census(spec) else {
+        return false;
+    };
+    let Some(tree) = root_box::consumer_census(root, policy, objectives, frontier, lru_cap) else {
+        return false;
+    };
+    let required = root.root_peak_bytes.max(tree.peak_bytes);
+    eprintln!("[root-source-admission] phase=concurrent_preflight requested={} effective=patch_backward working_set_bytes={} root_peak_bytes={} tree_columns={} objectives={} workers={} cache_bytes={} tree_peak_bytes={} cap={}",
+        policy.root_precision.box_source.token(), root_box::wide_working_set_bytes(), root.root_peak_bytes,
+        tree.columns, objectives, tree.workers, tree.cache_bytes, tree.peak_bytes, root_box::ROOT_SOURCE_BYTES_CAP);
+    required <= root_box::ROOT_SOURCE_BYTES_CAP && root_box::wide_memory_admission(required).is_ok()
+}
+
+fn twin_spec_has_margin_row_head(spec: &TwinSpec) -> bool {
     let gemms: Vec<usize> = spec
         .ops
         .iter()
@@ -1687,11 +1958,125 @@ fn twin_spec_compiles_to_margin_row_head(spec: &TwinSpec) -> bool {
             if *r_in == i_gemm1 + 1 && *g2_in == i_gemm1 + 2 => {}
         _ => return false,
     }
+    // #cct-margin-row-admission: the compiler refuses a BN fold on the FINAL
+    // Gemm (its consumers read it as exact) ...
+    if spec.ops[i_gemm2].is_folded_gemm() {
+        return false;
+    }
     // The compiler also requires at least one TRUNK ReLU (a ReLU seen before
     // the first Gemm); without one the lane has nothing to branch on.
     spec.ops[..i_gemm1]
         .iter()
         .any(|op| matches!(op, TwinOpSpec::Relu { .. }))
+}
+
+/// #admission-census: the margin-row lane's STRUCTURAL admission, for the
+/// admission census (`ny vnncomp census`) — the conjunction of checks that
+/// EVERY entry into the lane makes before any lane code runs, so a row this
+/// refuses is a row on which neither the inline lane
+/// (`try_margin_row_unsat`) nor the concurrent lane
+/// (`spawn_concurrent_lane_impl`) ever starts, and on which no consumer
+/// inside the lane (the frozen-dual tier, the wave tree, the
+/// `backward_interm` window) can engage, whatever the router routes:
+///
+/// * the lane switch ([`ny_propagate::margin_row::margin_row_bab_enabled`]);
+/// * the twin-family extraction ([`extract_twin_spec`]) — both entries;
+/// * the head the COMPILER requires (`twin_spec_has_margin_row_head`) —
+///   the concurrent entry checks it at admission and the inline lane's
+///   `TwinNet::compile` refuses without it before the tree starts;
+/// * the robustness property ([`parse_vnnlib_robustness`]) — both entries;
+/// * the input width (`lo.len() == spec.n_in`) — both entries.
+///
+/// It deliberately OMITS every policy-dependent check (the root-tableau cap,
+/// the wide-source admission, the device premise, the deadline): each of
+/// those can admit under some policy, so leaving them out keeps this a
+/// NECESSARY condition — it may admit a row the lane later declines (the
+/// census then moats it needlessly), never refuse a row the lane runs on.
+/// The same functions, not copies of them; a source ratchet
+/// (`census_margin_row_probe_is_the_lanes_own_admission`) pins that both
+/// entries still call each one. Split in a MODEL half (this function: the
+/// switch, the extraction and the head, returning the net's input width) and
+/// a PROPERTY half ([`lane_property_admission`]) so the census pays one
+/// extraction per model, not one per row; a row is admitted iff both halves
+/// admit it.
+pub(crate) fn lane_model_admission(onnx: &Path) -> Result<usize, &'static str> {
+    if !ny_propagate::margin_row::margin_row_bab_enabled() {
+        return Err("lane-disabled");
+    }
+    let Some(spec) = extract_twin_spec(onnx) else {
+        return Err("model-outside-twin-family");
+    };
+    if !twin_spec_has_margin_row_head(&spec) {
+        return Err("no-compiled-head");
+    }
+    Ok(spec.n_in)
+}
+
+/// #admission-census: the PROPERTY half of the margin-row lane's structural
+/// admission ([`lane_model_admission`]): the robustness parse and the input
+/// width against the model half's `n_in`.
+pub(crate) fn lane_property_admission(vnnlib: &Path, n_in: usize) -> Result<(), &'static str> {
+    let Some((lo, _, _, _)) = parse_vnnlib_robustness(vnnlib) else {
+        return Err("property-not-robustness");
+    };
+    if lo.len() != n_in {
+        return Err("input-width");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod source_admission_tests {
+    use super::*;
+
+    #[test]
+    fn wide_source_admission_reaches_policy_aware_cli_and_keeps_product_refusals() {
+        let _env = ny_test_utils::env::lock_env_shared();
+        let n = 40_000;
+        let spec = TwinSpec {
+            n_in: n,
+            ops: vec![
+                TwinOpSpec::Relu { input: 0 },
+                TwinOpSpec::Gemm {
+                    input: 1,
+                    weight: vec![0.0; n * 2],
+                    bias: vec![0.0; 2],
+                    bias_err: vec![],
+                    weight_rel_err: 0.0,
+                    shape: (2, n),
+                },
+                TwinOpSpec::Relu { input: 2 },
+                TwinOpSpec::Gemm {
+                    input: 3,
+                    weight: vec![0.0; 4],
+                    bias: vec![0.0; 2],
+                    bias_err: vec![],
+                    weight_rel_err: 0.0,
+                    shape: (2, 2),
+                },
+            ],
+        };
+        assert!(!twin_spec_compiles_to_margin_row_head(&spec));
+        let policy = MarginRowRuntimePolicy::default();
+        assert!(twin_spec_compiles_with_root_policy(&spec, &policy));
+        assert!(twin_spec_compiles_with_tree_policy(&spec, &policy, 1, 1, 1));
+        assert!(!twin_spec_compiles_with_tree_policy(
+            &spec, &policy, 200, 8, 64
+        ));
+        assert!(!twin_spec_compiles_with_tree_policy(
+            &spec,
+            &policy,
+            usize::MAX,
+            1,
+            1
+        ));
+        let mut f32 = policy;
+        f32.root_precision.root_f32 = true;
+        assert!(!twin_spec_compiles_with_root_policy(&spec, &f32));
+        let mut widened = policy;
+        widened.parallel_prebuild = true;
+        assert!(!twin_spec_compiles_with_root_policy(&spec, &widened));
+    }
 }
 
 /// Resolve the per-instance reserve after structural admission.
@@ -1875,6 +2260,21 @@ fn run_capped_detached<T: Send + 'static>(
                  the detached worker and returning in-budget (fail-closed, verdict-neutral)",
                 cap.as_secs_f64()
             );
+            // #mr-census: the abandoned worker's own `[mr-census]` line prints
+            // only if it returns before the process exits, which it may never
+            // do. Print a SNAPSHOT from the abandoning thread, unconditionally,
+            // so no stop path of the lane goes without a census line.
+            eprintln!(
+                "{}",
+                ny_propagate::margin_row::census::snapshot_line(&format!(
+                    "abandoned_at_slice_cap_{label}"
+                ))
+            );
+            // ...plus the per-mechanism stop receipts the worker's `Drop`
+            // would have printed (`[mr-errlane] done` carries the B3 audit).
+            for extra in ny_propagate::margin_row::census::stop_lines() {
+                eprintln!("{extra}");
+            }
             // #margin-row-profile-on-abandon: dump the phase profile HERE.
             //
             // `prof::dump()` normally runs at the end of `lane_impl`, but an
@@ -1904,6 +2304,187 @@ fn run_capped_detached<T: Send + 'static>(
     }
 }
 
+/// #soundness-spine M2d G3: the lane's hand-parsed objective rows `(t, adv)`
+/// against the SAT GATE's own spec evaluator (`property_violated_f64` over the
+/// full VNN-LIB parse). Evaluated at the spec box's own centre and at
+/// synthetic output vectors that put every margin clearly on each side of
+/// zero — adversarial classes above and below the true class, and every class
+/// the lane does NOT treat as adversarial lifted above it — so a misread
+/// class, a dropped disjunct or a flipped comparison disagrees in sign. No
+/// network evaluation is involved: this checks the TRANSLATION, which every
+/// forward self-check passes by construction. Microseconds.
+pub(crate) fn margin_row_spec_agreement(
+    vnnlib: &Path,
+    t: usize,
+    adv: &[usize],
+) -> (ny_propagate::certify::GuardReport, String) {
+    use ny_propagate::certify::GuardReport;
+    let spec = match ny_onnx::vnnlib::load_vnnlib(vnnlib) {
+        Ok(spec) => spec,
+        Err(_) => return (GuardReport::new(), "g3=skipped(parse)".to_string()),
+    };
+    margin_row_spec_agreement_owned(&spec, t, adv)
+}
+
+/// Same ordinary G3 audit over the immutable original parse captured by a
+/// source-authenticated producer; no filesystem reparse can replace it.
+pub(crate) fn margin_row_spec_agreement_owned(
+    spec: &ny_onnx::vnnlib::VnnLibSpec,
+    t: usize,
+    adv: &[usize],
+) -> (ny_propagate::certify::GuardReport, String) {
+    use ny_propagate::certify::{GuardId, GuardReport};
+    use ny_propagate::guards::spec_agreement::SpecAgreementAudit;
+    // Per-clause input boxes: the evaluator would gate each disjunct on its
+    // own box, which the lane never parses (it refuses such specs). Nothing
+    // to compare against here, so the guard is skipped, never tripped.
+    if !spec.per_clause_input_bounds.is_empty() {
+        return (
+            GuardReport::new(),
+            "g3=skipped(per_clause_boxes)".to_string(),
+        );
+    }
+    let n_out = spec.num_outputs;
+    if t >= n_out || adv.iter().any(|&j| j >= n_out || j == t) {
+        let mut report = GuardReport::new();
+        report.trip(
+            GuardId::SpecAgreement,
+            format!("lane classes (t={t}, adv={adv:?}) are not outputs of the spec (n={n_out})"),
+        );
+        return (report, "g3=ran g3_class_range=refused".to_string());
+    }
+    let x: Vec<f64> = spec
+        .input_bounds
+        .iter()
+        .map(|&(lo, hi)| f64::midpoint(lo, hi))
+        .collect();
+    let mut audit = SpecAgreementAudit::default();
+    let mut vectors: Vec<Vec<f64>> = Vec::new();
+    let base = {
+        let mut y = vec![0.0f64; n_out];
+        y[t] = 1.0;
+        y
+    };
+    vectors.push(base.clone());
+    for &j in adv {
+        for d in [0.5f64, -0.5] {
+            let mut y = base.clone();
+            y[j] = 1.0 + d;
+            vectors.push(y);
+        }
+    }
+    for c in (0..n_out).filter(|c| *c != t && !adv.contains(c)) {
+        let mut y = base.clone();
+        y[c] = 1.5;
+        vectors.push(y);
+    }
+    for (i, y) in vectors.iter().enumerate() {
+        let engine_min = adv
+            .iter()
+            .map(|&j| y[t] - y[j])
+            .fold(f64::INFINITY, f64::min);
+        let violated = super::vnncomp::property_violated_f64(spec, &x, y);
+        audit.note(i, engine_min, violated, 1.5);
+    }
+    let fragment = format!("g3=ran {}", audit.fragment());
+    (audit.report(), fragment)
+}
+
+/// #soundness-spine M2b: conversion from the TwinNet margin-row lane's `Unsat`
+/// to a published `VnncompResult::Unsat`. G3 ratifies the token (downgrade
+/// only); a refused or non-instance token yields `None`, and the caller then
+/// publishes nothing from the lane.
+pub(crate) fn margin_row_receipt(
+    token: ny_propagate::certify::UnsatToken,
+    vnnlib: &Path,
+    t: usize,
+    adv: &[usize],
+) -> Option<UnsatReceipt> {
+    let (report, fragment) = margin_row_spec_agreement(vnnlib, t, adv);
+    match ny_propagate::certify::ratify(token, &report) {
+        Ok(token) => {
+            let receipt = UnsatReceipt::from_token(token);
+            eprintln!(
+                "[g3] lane=margin_row {fragment} receipt={}",
+                if receipt.is_some() {
+                    "ok"
+                } else {
+                    "not_publishable"
+                }
+            );
+            receipt
+        }
+        Err(refusal) => {
+            eprintln!("[g3] lane=margin_row REFUSED {refusal} {fragment}");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod spec_agreement_tests {
+    use super::margin_row_spec_agreement;
+
+    /// A standard robustness property: true class 0, adversarial {1, 2}.
+    const ROBUSTNESS: &str = "\
+(declare-const X_0 Real)
+(declare-const X_1 Real)
+(declare-const Y_0 Real)
+(declare-const Y_1 Real)
+(declare-const Y_2 Real)
+(assert (>= X_0 0.0))
+(assert (<= X_0 1.0))
+(assert (>= X_1 0.0))
+(assert (<= X_1 1.0))
+(assert (or
+    (and (>= Y_1 Y_0))
+    (and (>= Y_2 Y_0))
+))
+";
+
+    fn spec_file() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("prop.vnnlib");
+        std::fs::write(&path, ROBUSTNESS).expect("write property");
+        (dir, path)
+    }
+
+    /// G3 agrees with the lane's own (correct) parse, at every probe vector.
+    #[test]
+    fn g3_margin_row_spec_agreement_accepts_the_lanes_own_parse() {
+        let (_dir, path) = spec_file();
+        let (report, fragment) = margin_row_spec_agreement(&path, 0, &[1, 2]);
+        assert!(report.is_clear(), "{fragment}");
+        assert!(fragment.starts_with("g3=ran"), "{fragment}");
+        assert!(fragment.contains("g3_disagree=0"), "{fragment}");
+    }
+
+    /// A dropped disjunct, a wrong true class and an out-of-range class all
+    /// trip G3 — the misreads a forward self-check cannot see.
+    #[test]
+    fn g3_margin_row_spec_agreement_trips_on_a_misread_objective() {
+        let (_dir, path) = spec_file();
+        for (t, adv) in [(0usize, vec![1usize]), (1, vec![0, 2]), (0, vec![1, 7])] {
+            let (report, fragment) = margin_row_spec_agreement(&path, t, &adv);
+            assert!(
+                !report.is_clear(),
+                "misread (t={t}, adv={adv:?}) passed: {fragment}"
+            );
+        }
+    }
+
+    /// A spec the evaluator cannot parse skips the guard (downgrade-only: a
+    /// guard that cannot run never trips).
+    #[test]
+    fn g3_margin_row_spec_agreement_skips_an_unreadable_spec() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (report, fragment) =
+            margin_row_spec_agreement(&dir.path().join("missing.vnnlib"), 0, &[1]);
+        assert!(report.is_clear());
+        assert_eq!(fragment, "g3=skipped(parse)");
+    }
+}
+
 pub(crate) enum MarginRowTry {
     Verdict(VnncompResult),
     FinishedWithoutVerdict,
@@ -1913,6 +2494,10 @@ pub(crate) enum MarginRowTry {
 /// Strictly-additive vnncomp hook: only ever turns unknown/timeout into
 /// `Unsat`. The caller can distinguish an abandoned worker so it never starts
 /// another graph-heavy optional tail while that worker remains live.
+#[expect(
+    clippy::large_types_passed_by_value,
+    reason = "the runtime policy is MOVED into the lane it configures; a reference here would only add a clone at the move"
+)]
 pub(crate) fn try_margin_row_unsat(
     onnx: &Path,
     vnnlib: &Path,
@@ -1951,6 +2536,10 @@ pub(crate) fn try_margin_row_unsat(
             return MarginRowTry::FinishedWithoutVerdict;
         }
     };
+    // Proof bundle v2 (Proof profile only; write-only): the sites and the
+    // clauses the lane's nodes will name.
+    super::proof_bundle::note_sites_of(onnx);
+    super::proof_bundle::note_clauses(t, &adv);
     if lo.len() != spec.n_in {
         if dbg {
             eprintln!(
@@ -1968,7 +2557,16 @@ pub(crate) fn try_margin_row_unsat(
             spec.ops.len()
         );
     }
+    // #router-r2 CR-1: the inline lane has no safe points; the authority
+    // records the deadline its own rule derived and hands it back UNCHANGED.
+    let deadline = crate::router::acting::claim_margin_row(
+        ny_core::deadline_authority::LaneSlot::MarginRowInline,
+        deadline,
+    );
     let t0 = Instant::now();
+    // #soundness-spine M2d: G3 needs the lane's own (t, adv) after the lane
+    // consumed them.
+    let (t_g3, adv_g3) = (t, adv.clone());
     // HARD SLICE ENFORCEMENT (banked 99ed4d42): the lane's cooperative
     // deadline checks are too coarse to trust with the caller's tail (they
     // overran a 45s slice to 113.1s on metaroom and once ran to the watchdog
@@ -1976,7 +2574,15 @@ pub(crate) fn try_margin_row_unsat(
     // distinct `StillRunning` state in-budget, and the caller suppresses its
     // post-BaB graph tail. The worker still gets `Some(deadline)` so it normally
     // stops cooperatively well before the external cap fires.
-    let cap = deadline.saturating_duration_since(t0);
+    // #router-r2 CR-R: with a publish grace armed, a COMPLETED certificate may
+    // publish up to `g` past the search deadline (`publish_grace`, read by the
+    // lane itself), so the external cap waits the same `g` plus the collect
+    // slack. Zero when unarmed: exactly today's cap.
+    let cap = (deadline
+        + crate::router::acting::collector_grace(
+            ny_core::deadline_authority::LaneSlot::MarginRowInline,
+        ))
+    .saturating_duration_since(t0);
     let out = match run_capped_detached(cap, "inline", move || {
         let out = run_margin_row_lane_with_policy(
             &spec,
@@ -1996,7 +2602,7 @@ pub(crate) fn try_margin_row_unsat(
         DetachedTake::Failed => return MarginRowTry::FinishedWithoutVerdict,
     };
     match out {
-        MarginRowOutcome::Unsat(stats) => {
+        MarginRowOutcome::Unsat(stats, token) => {
             eprintln!(
                 "margin-row BaB: UNSAT in {:.1}s (root_bound={:.4}, tree_classes={:?}, \
                  expansions={}, domains={}, maxDepth={}, dips={})",
@@ -2009,7 +2615,10 @@ pub(crate) fn try_margin_row_unsat(
                 stats.mono_raw_dips,
             );
             log_classwise_stats(&stats);
-            MarginRowTry::Verdict(VnncompResult::Unsat)
+            match margin_row_receipt(token, vnnlib, t_g3, &adv_g3) {
+                Some(receipt) => MarginRowTry::Verdict(VnncompResult::Unsat(receipt)),
+                None => MarginRowTry::FinishedWithoutVerdict,
+            }
         }
         MarginRowOutcome::Unknown { reason, stats } => {
             eprintln!(
@@ -2402,6 +3011,13 @@ pub(crate) fn backward_interm_from_preset(preset: Option<&Path>) -> Option<bool>
         .and_then(|c| c.margin_row.backward_interm)
 }
 
+/// Resolve the typed STATEFUL Clip-and-Verify key (#clip-stateful).
+pub(crate) fn clip_stateful_from_preset(preset: Option<&Path>) -> Option<bool> {
+    preset
+        .and_then(|p| crate::preset::load_preset(p).ok())
+        .and_then(|c| c.margin_row.clip_stateful)
+}
+
 /// Resolve the typed closure-adaptive tier ladder gate (#closure-adaptive).
 ///
 /// WITHOUT THIS READER AND ITS CALL SITE THE ENTIRE LADDER IS DEAD CODE IN
@@ -2423,6 +3039,13 @@ pub(crate) fn branch_reduce_max_from_preset(preset: Option<&Path>) -> Option<boo
     preset
         .and_then(|p| crate::preset::load_preset(p).ok())
         .and_then(|c| c.margin_row.branch_reduce_max)
+}
+
+/// Resolve the typed parent-lift route (#branch-parent-lift).
+pub(crate) fn parent_lift_from_preset(preset: Option<&Path>) -> Option<bool> {
+    preset
+        .and_then(|p| crate::preset::load_preset(p).ok())
+        .and_then(|c| c.margin_row.parent_lift)
 }
 
 /// Resolve the typed backward-interm SECONDS cap (#backward-interm budget).
@@ -2451,6 +3074,10 @@ pub(crate) fn bi_secs_from_preset(preset: Option<&Path>) -> Option<u64> {
 /// mismatch, or too little budget), in which case the caller falls back to
 /// the inline post-verifier attempt exactly as before.
 #[allow(dead_code)]
+#[expect(
+    clippy::large_types_passed_by_value,
+    reason = "the runtime policy is MOVED into the lane it configures; a reference here would only add a clone at the move"
+)]
 pub(crate) fn spawn_concurrent_lane(
     onnx: &Path,
     vnnlib: &Path,
@@ -2482,6 +3109,10 @@ pub(crate) fn spawn_concurrent_lane(
 /// Policy-aware concurrent admission for scored execution. Every refusal has
 /// a stable route, and the returned lane starts with early publication blocked
 /// until [`ConcurrentLane::mark_allocation_receipt_recorded`] is called.
+#[expect(
+    clippy::large_types_passed_by_value,
+    reason = "the runtime policy is MOVED into the lane it configures; a reference here would only add a clone at the move"
+)]
 pub(crate) fn spawn_concurrent_lane_with_schedule_policy(
     onnx: &Path,
     vnnlib: &Path,
@@ -2503,6 +3134,10 @@ pub(crate) fn spawn_concurrent_lane_with_schedule_policy(
     )
 }
 
+#[expect(
+    clippy::large_types_passed_by_value,
+    reason = "the runtime policy is MOVED into the lane it configures; a reference here would only add a clone at the move"
+)]
 fn spawn_concurrent_lane_impl(
     onnx: &Path,
     vnnlib: &Path,
@@ -2570,17 +3205,41 @@ fn spawn_concurrent_lane_impl(
     let Some(spec) = extract_twin_spec(onnx) else {
         return ConcurrentLaneAdmission::refused(ConcurrentLaneAdmissionRoute::Model);
     };
+    // #cct-margin-row-admission: refuse at ADMISSION what the compiler would
+    // refuse inside the worker — in particular a net whose root tableau is
+    // above the shared ceiling (the cct TinyImageNet CNN7 pair extracts
+    // cleanly once the FC-BN fold admits it, and would OOM an uncapped host).
+    // Every net the lane has banked evidence on satisfies this predicate.
+    if !twin_spec_compiles_with_root_policy(&spec, &runtime_policy) {
+        eprintln!(
+            "margin-row BaB: CONCURRENT lane not started — net outside the compiled head \
+             contract or above the root-tableau cap (entries={:?}, cap={})",
+            spec.root_tableau_entries(),
+            ny_propagate::margin_row::spec::MAX_ROOT_TABLEAU_ENTRIES,
+        );
+        return ConcurrentLaneAdmission::refused(ConcurrentLaneAdmissionRoute::Model);
+    }
     let Some((lo, hi, t, adv)) = parse_vnnlib_robustness(vnnlib) else {
         return ConcurrentLaneAdmission::refused(ConcurrentLaneAdmissionRoute::Property);
     };
     if lo.len() != spec.n_in {
         return ConcurrentLaneAdmission::refused(ConcurrentLaneAdmissionRoute::InputShape);
     }
+    // Proof bundle v2 (Proof profile only; write-only): the sites and the
+    // clauses the lane's nodes will name.
+    super::proof_bundle::note_sites_of(onnx);
+    super::proof_bundle::note_clauses(t, &adv);
     // Leave the tail to the caller's own wrap-up (result write, witness
     // gating) exactly as the inline lane does.
     let lane_deadline = deadline
         .checked_sub(Duration::from_secs(3))
         .unwrap_or(deadline);
+    // #router-r2 CR-1: the concurrent worker has no safe points after spawn;
+    // the authority records its deadline and hands it back UNCHANGED.
+    let lane_deadline = crate::router::acting::claim_margin_row(
+        ny_core::deadline_authority::LaneSlot::MarginRowConcurrent,
+        lane_deadline,
+    );
     // BOUND THE CONTENTION. The lane is rayon-parallel and would otherwise
     // take the global pool, competing with the verifier's host-side threads
     // (the GPU is what the verifier is bound on, but it still needs CPU to
@@ -2615,6 +3274,20 @@ fn spawn_concurrent_lane_impl(
     let lane_threads = resources
         .lane_threads
         .expect("an admitted lane pool plan has an exact width");
+    let available = if lane_threads == 0 {
+        rayon::current_num_threads().max(1)
+    } else {
+        lane_threads
+    };
+    let frontier = ny_propagate::preset_gates::margin_row_frontier(available);
+    let lru_cap = ny_propagate::preset_gates::margin_row_lru_cap();
+    if !twin_spec_compiles_with_tree_policy(&spec, &runtime_policy, adv.len(), frontier, lru_cap) {
+        eprintln!("margin-row BaB: CONCURRENT lane not started — wide root/tree/cache working set refused before worker allocation");
+        return ConcurrentLaneAdmission::refused_with_resources(
+            ConcurrentLaneAdmissionRoute::Model,
+            resources,
+        );
+    }
     let private_pool = if lane_threads == 0 {
         None
     } else {
@@ -2644,6 +3317,8 @@ fn spawn_concurrent_lane_impl(
         );
     }
     let early_exit = schedule_policy.early_exit_armed();
+    // #soundness-spine M2d: G3 inputs, owned by the worker.
+    let (vnnlib_g3, t_g3, adv_g3) = (vnnlib.to_path_buf(), t, adv.clone());
     let (tx, rx) = std::sync::mpsc::channel();
     let execution = std::sync::Arc::new(ConcurrentLaneExecutionState::new(
         allocation_receipt_recorded,
@@ -2681,39 +3356,49 @@ fn spawn_concurrent_lane_impl(
                 run()
             };
             let verdict = match out {
-                MarginRowOutcome::Unsat(stats) => {
+                MarginRowOutcome::Unsat(stats, token) => {
                     let lane_secs = t0.elapsed().as_secs_f64();
                     eprintln!(
                         "margin-row BaB (concurrent): UNSAT in {lane_secs:.1}s (root_bound={:.4}, \
                          expansions={}, maxDepth={}, ledger={:?})",
                         stats.root_bound, stats.expansions, stats.max_depth, stats.ledger_ok
                     );
-                    // #twinwall-early-exit. The row is certified; the internal
-                    // verifier's remaining budget can only re-derive the same
-                    // answer or nothing at all. Publish and end the instance.
-                    // Returns only if publication was declined (route not
-                    // armed, or the main thread already claimed it), in which
-                    // case the verdict goes down the channel as before.
-                    if early_exit
-                        && worker_execution
-                            .allocation_receipt_recorded
-                            .load(std::sync::atomic::Ordering::Acquire)
-                    {
-                        crate::commands::vnncomp::publish_lane_unsat_and_exit(lane_secs);
-                    } else if early_exit {
-                        eprintln!(
-                            "margin-row BaB: early exit DEFERRED — schedule allocation receipt \
-                             was not recorded when the proof completed; sending verdict through \
-                             the ordinary channel"
-                        );
-                    } else {
-                        eprintln!(
-                            "margin-row BaB: early exit DISARMED \
-                             (NY_MARGIN_ROW_EARLY_EXIT/margin_row.early_exit); the verdict waits \
-                             for the internal verifier to return"
-                        );
+                    // #soundness-spine M2b/M2d: only a G3-ratified,
+                    // instance-scoped token may become a published `unsat`.
+                    match margin_row_receipt(token, &vnnlib_g3, t_g3, &adv_g3) {
+                        None => None,
+                        Some(receipt) => {
+                            // #twinwall-early-exit. The row is certified; the internal
+                            // verifier's remaining budget can only re-derive the same
+                            // answer or nothing at all. Publish and end the instance.
+                            // Returns only if publication was declined (route not
+                            // armed, or the main thread already claimed it), in which
+                            // case the verdict goes down the channel as before.
+                            if early_exit
+                                && worker_execution
+                                    .allocation_receipt_recorded
+                                    .load(std::sync::atomic::Ordering::Acquire)
+                            {
+                                crate::commands::vnncomp::publish_lane_unsat_and_exit(
+                                    lane_secs,
+                                    receipt.clone(),
+                                );
+                            } else if early_exit {
+                                eprintln!(
+                                    "margin-row BaB: early exit DEFERRED — schedule allocation receipt \
+                                     was not recorded when the proof completed; sending verdict through \
+                                     the ordinary channel"
+                                );
+                            } else {
+                                eprintln!(
+                                    "margin-row BaB: early exit DISARMED \
+                                     (NY_MARGIN_ROW_EARLY_EXIT/margin_row.early_exit); the verdict waits \
+                                     for the internal verifier to return"
+                                );
+                            }
+                            Some(VnncompResult::Unsat(receipt))
+                        }
                     }
-                    Some(VnncompResult::Unsat)
                 }
                 MarginRowOutcome::Unknown { reason, .. } => {
                     eprintln!(
@@ -2762,11 +3447,16 @@ fn tensor_f32(t: &TensorProto) -> Option<Vec<f64>> {
                 .as_chunks::<4>()
                 .0
                 .iter()
-                .map(|c| f64::from(f32::from_le_bytes(*c)))
+                .map(|c| ny_core::f32_to_f64_exact(f32::from_le_bytes(*c)))
                 .collect(),
         )
     } else {
-        Some(t.float_data.iter().map(|&v| f64::from(v)).collect())
+        Some(
+            t.float_data
+                .iter()
+                .map(|&v| ny_core::f32_to_f64_exact(v))
+                .collect(),
+        )
     }
 }
 
@@ -2814,10 +3504,356 @@ fn attr_i(n: &NodeProto, name: &str, default: i64) -> i64 {
         .map_or(default, |a| a.i_value())
 }
 
+/// #cct-margin-row-admission: fold the inference-form `BatchNormalization`
+/// node `bn`, which must consume `gemm_out` as its DATA input, into the Gemm
+/// whose row-major `(n_out, n_in)` weights and bias are given. Returns the
+/// certified fold and the BN's output name (which the folded Gemm now
+/// publishes). `None` on anything outside the inference form or anything
+/// [`fold_dense_batchnorm`] cannot certify — the caller then declines the
+/// whole net.
+///
+/// The arithmetic is NOT abc's `merge_bn` (nearest-rounded fp32, no error
+/// term): it is the f64 Conv+BN fold's own operation order with a carried
+/// relative weight error and absolute bias error, charged downstream.
+fn fold_gemm_batchnorm<'g>(
+    bn: &'g NodeProto,
+    gemm_out: &str,
+    inits: &HashMap<&str, &TensorProto>,
+    weight: &[f64],
+    bias: &[f64],
+    shape: (usize, usize),
+) -> Option<(DenseBnFold, &'g str)> {
+    // Inference form only: exactly (X, scale, B, mean, var) in and ONE output
+    // out (training mode emits running statistics), X is this Gemm's output.
+    if bn.input.len() != 5 || bn.output.len() != 1 || bn.input[0] != gemm_out {
+        return None;
+    }
+    if attr_i(bn, "training_mode", 0) != 0 {
+        return None;
+    }
+    let n_out = shape.0;
+    let gamma = tensor_f32(inits.get(bn.input[1].as_str())?)?;
+    let beta = tensor_f32(inits.get(bn.input[2].as_str())?)?;
+    let mean = tensor_f32(inits.get(bn.input[3].as_str())?)?;
+    let var = tensor_f32(inits.get(bn.input[4].as_str())?)?;
+    if [&gamma, &beta, &mean, &var]
+        .iter()
+        .any(|v| v.len() != n_out)
+    {
+        return None;
+    }
+    // ONNX `epsilon` is a FLOAT attribute defaulting to 1e-5: an absent
+    // attribute means the f32 value, widened exactly (cnn7 states it
+    // explicitly as 9.999999747378752e-06).
+    let eps = attr_f(bn, "epsilon", f64::from(1e-5_f32));
+    let fold = fold_dense_batchnorm(
+        weight,
+        bias,
+        shape,
+        &DenseBnParams {
+            gamma: &gamma,
+            beta: &beta,
+            mean: &mean,
+            var: &var,
+            eps,
+        },
+    )?;
+    Some((fold, bn.output.first()?.as_str()))
+}
+
 /// Extract the twin-wall family net; `None` on ANY structural deviation.
 pub(crate) fn extract_twin_spec(onnx: &Path) -> Option<TwinSpec> {
+    extract_twin_spec_named(onnx).map(|(spec, _)| spec)
+}
+
+/// Proof bundle v2 (ENGINE_PROGRAM §1.7 B1): per Relu op of the extracted
+/// spec, `(op index, ONNX name of the Relu node's input[0], flat size)` —
+/// the ONNX-level identity an offline checker resolves literals against.
+pub(crate) type TwinSiteNames = Vec<(usize, String, usize)>;
+
+/// [`extract_twin_spec`] plus the Relu sites' ONNX names, recorded during
+/// the SAME walk (the returned spec is bit-identical to `extract_twin_spec`'s:
+/// it is that function's body).
+pub(crate) fn extract_twin_spec_named(onnx: &Path) -> Option<(TwinSpec, TwinSiteNames)> {
+    // Preserve the legacy early environmental refusal before source loading.
+    ny_core::require_f64_interval_proof_environment().ok()?;
     let bytes = std::fs::read(onnx).ok()?;
-    let model = ModelProto::decode(bytes.as_slice()).ok()?;
+    extract_twin_spec_named_bytes(&bytes)
+}
+
+/// The same original extraction walk over an immutable source snapshot.
+/// This entry does not reload a pathname between source authentication and
+/// extraction; callers retain and price the exact bytes themselves.
+pub(crate) fn extract_twin_spec_named_bytes(bytes: &[u8]) -> Option<(TwinSpec, TwinSiteNames)> {
+    // Certify the producer before decoding source constants or folding BN.
+    // Both the ordinary and proof-named entry points share this gate. Root
+    // qualification on a later worker cannot repair an earlier fold.
+    ny_core::require_f64_interval_proof_environment().ok()?;
+    let model = ModelProto::decode(bytes).ok()?;
+    extract_legacy_twin_spec_named_model(&model)
+}
+
+/// Original-source facade extraction. Its native matrix-row branch keeps the
+/// original MatMul/Add tensor trace and exact parameter bits; the old entry
+/// above remains rank-four-only for existing callers. One decode selects the
+/// branch, so the staged decoder census still covers three total decodes.
+pub(crate) fn extract_original_twin_spec_named_bytes(
+    bytes: &[u8],
+    budget: &ny_propagate::certify::work::WorkBudget,
+    at: Instant,
+) -> Option<(TwinSpec, TwinSiteNames)> {
+    super::prepared_root_source::checkpoint(budget, at).ok()?;
+    let model = ModelProto::decode(bytes).ok()?;
+    super::prepared_root_source::checkpoint(budget, at).ok()?;
+    let rank = model
+        .graph
+        .as_ref()?
+        .input
+        .first()?
+        .r#type
+        .as_ref()?
+        .tensor_type
+        .as_ref()?
+        .shape
+        .as_ref()?
+        .dim
+        .len();
+    let result = if rank == 2 {
+        extract_native_affine_twin_spec_named_model(&model, budget, at)
+    } else {
+        extract_legacy_twin_spec_named_model(&model)
+    };
+    super::prepared_root_source::checkpoint(budget, at).ok()?;
+    result
+}
+
+fn extract_native_affine_twin_spec_named_model(
+    model: &ModelProto,
+    budget: &ny_propagate::certify::work::WorkBudget,
+    at: Instant,
+) -> Option<(TwinSpec, TwinSiteNames)> {
+    use ny_onnx::onnx_proto::tensor_shape_proto::dimension::Value;
+    let g = model.graph.as_ref()?;
+    if g.input.len() != 1 || g.output.len() != 1 || !g.sparse_initializer.is_empty() {
+        return None;
+    }
+    let input = &g.input[0];
+    let input_type = input.r#type.as_ref()?.tensor_type.as_ref()?;
+    let dims = &input_type.shape.as_ref()?.dim;
+    if input.name.is_empty() || input_type.elem_type != 1 || dims.len() != 2 {
+        return None;
+    }
+    // A symbolic batch remains the original symbolic annotation. This
+    // source's batch-separable row map is evaluated on input[0,j]; authentic
+    // property admission later requires exactly n_in original X scalars.
+    match dims[0].value.as_ref()? {
+        Value::DimValue(1) => {}
+        Value::DimParam(name) if !name.is_empty() => {}
+        _ => return None,
+    }
+    let Value::DimValue(width) = dims[1].value.as_ref()? else {
+        return None;
+    };
+    let n_in = usize::try_from(*width).ok()?;
+    if n_in == 0 {
+        return None;
+    }
+    let mut inits: HashMap<&str, &TensorProto> = HashMap::new();
+    inits.try_reserve(g.initializer.len()).ok()?;
+    for (i, tensor) in g.initializer.iter().enumerate() {
+        super::prepared_root_source::poll(budget, at, i).ok()?;
+        if tensor.name.is_empty()
+            || tensor.name == input.name
+            || inits.insert(tensor.name.as_str(), tensor).is_some()
+        {
+            return None;
+        }
+    }
+    let mut ops = Vec::new();
+    ops.try_reserve_exact(g.node.len()).ok()?;
+    let mut sites = Vec::new();
+    sites.try_reserve_exact(g.node.len()).ok()?;
+    let mut current_name = input.name.as_str();
+    let mut current_id = 0usize;
+    let mut current_width = n_in;
+    let mut ni = 0usize;
+    while ni < g.node.len() {
+        super::prepared_root_source::checkpoint(budget, at).ok()?;
+        let n = &g.node[ni];
+        if !matches!(n.domain.as_str(), "" | "ai.onnx")
+            || !n.attribute.is_empty()
+            || n.output.len() != 1
+            || n.output[0].is_empty()
+        {
+            return None;
+        }
+        match n.op_type.as_str() {
+            "MatMul" => {
+                if n.input.len() != 2 || n.input[0] != current_name {
+                    return None;
+                }
+                let raw = inits.get(n.input[1].as_str())?;
+                if raw.dims.len() != 2 {
+                    return None;
+                }
+                let nin = usize::try_from(raw.dims[0]).ok()?;
+                let nout = usize::try_from(raw.dims[1]).ok()?;
+                let cells = nin.checked_mul(nout)?;
+                if nin != current_width || nout == 0 {
+                    return None;
+                }
+                let raw_weight = native_affine_tensor_f32(raw, budget, at)?;
+                if raw_weight.len() != cells {
+                    return None;
+                }
+                let add = g.node.get(ni.checked_add(1)?)?;
+                if add.op_type != "Add"
+                    || !matches!(add.domain.as_str(), "" | "ai.onnx")
+                    || !add.attribute.is_empty()
+                    || add.input.len() != 2
+                    || add.output.len() != 1
+                    || add.output[0].is_empty()
+                {
+                    return None;
+                }
+                let matmul_out = n.output[0].as_str();
+                let bias_name = match (add.input[0] == matmul_out, add.input[1] == matmul_out) {
+                    (true, false) => add.input[1].as_str(),
+                    (false, true) => add.input[0].as_str(),
+                    _ => return None,
+                };
+                // Folding a real bias must not erase an independently used
+                // intermediate MatMul, including an exported earlier output.
+                let mut uses = 0usize;
+                for (j, node) in g.node.iter().enumerate() {
+                    super::prepared_root_source::poll(budget, at, j).ok()?;
+                    for (k, name) in node.input.iter().enumerate() {
+                        super::prepared_root_source::poll(budget, at, k).ok()?;
+                        if name == matmul_out {
+                            uses = uses.checked_add(1)?;
+                        }
+                    }
+                }
+                if uses != 1 || g.output[0].name == matmul_out {
+                    return None;
+                }
+                let raw_bias = inits.get(bias_name)?;
+                if !matches!(raw_bias.dims.as_slice(), [rows] | [1,rows] if usize::try_from(*rows).ok()==Some(nout))
+                {
+                    return None;
+                }
+                let bias = native_affine_tensor_f32(raw_bias, budget, at)?;
+                if bias.len() != nout {
+                    return None;
+                }
+                // Authored B is [n_in,n_out], whereas TwinOpSpec stores W
+                // [n_out,n_in]. This is an exact permutation after exact bit
+                // widening, with no rounded parameter fold or dummy layer.
+                let mut weight = Vec::new();
+                weight.try_reserve_exact(cells).ok()?;
+                if weight.capacity() > cells {
+                    return None;
+                }
+                for i in 0..cells {
+                    super::prepared_root_source::poll(budget, at, i).ok()?;
+                    weight.push(0.0);
+                }
+                for input_row in 0..nin {
+                    for output_column in 0..nout {
+                        super::prepared_root_source::poll(
+                            budget,
+                            at,
+                            input_row * nout + output_column,
+                        )
+                        .ok()?;
+                        weight[output_column * nin + input_row] =
+                            raw_weight[input_row * nout + output_column];
+                    }
+                }
+                ops.push(TwinOpSpec::Gemm {
+                    input: current_id,
+                    weight,
+                    bias,
+                    bias_err: Vec::new(),
+                    weight_rel_err: 0.0,
+                    shape: (nout, nin),
+                });
+                current_id = ops.len();
+                current_name = add.output[0].as_str();
+                current_width = nout;
+                ni = ni.checked_add(2)?;
+            }
+            "Relu" => {
+                if n.input.len() != 1 || n.input[0] != current_name {
+                    return None;
+                }
+                sites.push((ops.len(), n.input[0].clone(), current_width));
+                ops.push(TwinOpSpec::Relu { input: current_id });
+                current_id = ops.len();
+                current_name = n.output[0].as_str();
+                ni = ni.checked_add(1)?;
+            }
+            _ => return None,
+        }
+    }
+    if current_name != g.output[0].name
+        || ops.len() != 3
+        || !matches!(
+            ops.as_slice(),
+            [
+                TwinOpSpec::Gemm { input: 0, .. },
+                TwinOpSpec::Relu { input: 1 },
+                TwinOpSpec::Gemm { input: 2, .. }
+            ]
+        )
+    {
+        return None;
+    }
+    Some((TwinSpec { n_in, ops }, sites))
+}
+
+fn native_affine_tensor_f32(
+    tensor: &TensorProto,
+    budget: &ny_propagate::certify::work::WorkBudget,
+    at: Instant,
+) -> Option<Vec<f64>> {
+    if tensor.data_type != 1 || tensor.data_location != 0 {
+        return None;
+    }
+    let raw = !tensor.raw_data.is_empty();
+    if raw && !tensor.raw_data.len().is_multiple_of(4) {
+        return None;
+    }
+    let len = if raw {
+        tensor.raw_data.len() / 4
+    } else {
+        tensor.float_data.len()
+    };
+    let mut values = Vec::new();
+    values.try_reserve_exact(len).ok()?;
+    if values.capacity() > len {
+        return None;
+    }
+    for i in 0..len {
+        super::prepared_root_source::poll(budget, at, i).ok()?;
+        let value = if raw {
+            f32::from_le_bytes(tensor.raw_data[i * 4..i * 4 + 4].try_into().ok()?)
+        } else {
+            tensor.float_data[i]
+        };
+        let value = ny_core::f32_to_f64_exact(value);
+        if !value.is_finite() {
+            return None;
+        }
+        values.push(value);
+    }
+    super::prepared_root_source::checkpoint(budget, at).ok()?;
+    Some(values)
+}
+
+// The historical decoded-model walk is preserved verbatim. Existing path
+// and bytes callers therefore retain its rank-four grammar and numerics.
+fn extract_legacy_twin_spec_named_model(model: &ModelProto) -> Option<(TwinSpec, TwinSiteNames)> {
     let g: &GraphProto = model.graph.as_ref()?;
     let inits: HashMap<&str, &TensorProto> =
         g.initializer.iter().map(|t| (t.name.as_str(), t)).collect();
@@ -2868,6 +3904,7 @@ pub(crate) fn extract_twin_spec(onnx: &Path) -> Option<TwinSpec> {
     let mut flat: Vec<usize> = vec![n_in];
     let mut ops: Vec<TwinOpSpec> = Vec::new();
     let mut skip_bn: HashSet<usize> = HashSet::new();
+    let mut site_names: TwinSiteNames = Vec::new();
     // Constant nodes referenced as Reshape shape inputs (name -> payload).
     let mut consts: HashMap<&str, &TensorProto> = HashMap::new();
 
@@ -3144,6 +4181,7 @@ pub(crate) fn extract_twin_spec(onnx: &Path) -> Option<TwinSpec> {
             }
             "Relu" => {
                 let in_id = *tid.get(n.input.first()?.as_str())?;
+                site_names.push((ops.len(), n.input.first()?.clone(), flat[in_id]));
                 ops.push(TwinOpSpec::Relu { input: in_id });
                 tid.insert(n.output.first()?.as_str(), out_id);
                 shape_chw.push(shape_chw[in_id]);
@@ -3284,13 +4322,52 @@ pub(crate) fn extract_twin_spec(onnx: &Path) -> Option<TwinSpec> {
                     }
                     None => vec![0.0; no],
                 };
+                // #cct-margin-row-admission: fold a unique-consumer
+                // BatchNormalization into this Gemm (CNN7's FC-BN head),
+                // WITH its certified error (`dense_bn_fold`), exactly as the
+                // Conv arm folds a conv BN. Anything the fold cannot certify
+                // declines the whole net (fail-closed: the lane does not run).
+                let gemm_out = n.output.first()?;
+                let bn_idx = consumers.get(gemm_out.as_str()).and_then(|c| {
+                    (c.len() == 1 && g.node[c[0]].op_type == "BatchNormalization").then(|| c[0])
+                });
+                let (weight, bias, bias_err, weight_rel_err, out_name) = match bn_idx {
+                    None => (weight, bias, Vec::new(), 0.0, gemm_out.as_str()),
+                    Some(bi) => {
+                        let (fold, bn_out) = fold_gemm_batchnorm(
+                            &g.node[bi],
+                            gemm_out.as_str(),
+                            &inits,
+                            &weight,
+                            &bias,
+                            (no, nin),
+                        )?;
+                        eprintln!(
+                            "[margin-row] fc-bn fold: Gemm node {ni} ({no}x{nin}) + \
+                             BatchNormalization node {bi} folded with certified error \
+                             (weight_rel_err={:.3e}, max bias_err={:.3e})",
+                            fold.weight_rel_err,
+                            fold.bias_err.iter().copied().fold(0.0_f64, f64::max),
+                        );
+                        skip_bn.insert(bi);
+                        (
+                            fold.weight,
+                            fold.bias,
+                            fold.bias_err,
+                            fold.weight_rel_err,
+                            bn_out,
+                        )
+                    }
+                };
                 ops.push(TwinOpSpec::Gemm {
                     input: in_id,
                     weight,
                     bias,
+                    bias_err,
+                    weight_rel_err,
                     shape: (no, nin),
                 });
-                tid.insert(n.output.first()?.as_str(), out_id);
+                tid.insert(out_name, out_id);
                 shape_chw.push(None);
                 flat.push(no);
             }
@@ -3306,7 +4383,7 @@ pub(crate) fn extract_twin_spec(onnx: &Path) -> Option<TwinSpec> {
             }
         }
     }
-    Some(TwinSpec { n_in, ops })
+    Some((TwinSpec { n_in, ops }, site_names))
 }
 
 // --------------------------------------------------------------------------
@@ -3355,6 +4432,52 @@ fn last_bracket_index(s: &str) -> Option<usize> {
     s.split(',').next_back()?.trim().parse().ok()
 }
 
+/// #cct-margin-row-admission: one output operand of a robustness disjunct —
+/// flat `Y_<j>` or VNNLIB-2.0 bracket `Y[0,<j>]` — and the rest of the line.
+/// Strict: the flat form needs at least one digit, the bracket form exactly
+/// two indices with a leading `0` (the `[1, n_out]` output declaration).
+fn parse_y_operand(s: &str) -> Option<(usize, &str)> {
+    let s = s.trim_start();
+    if let Some(rest) = s.strip_prefix("Y_") {
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if end == 0 {
+            return None;
+        }
+        Some((rest[..end].parse().ok()?, &rest[end..]))
+    } else if let Some(rest) = s.strip_prefix("Y[") {
+        let (idx, after) = rest.split_once(']')?;
+        let parts: Vec<&str> = idx.split(',').map(str::trim).collect();
+        if parts.len() != 2 || parts[0] != "0" {
+            return None;
+        }
+        Some((parts[1].parse().ok()?, after))
+    } else {
+        None
+    }
+}
+
+/// #cct-margin-row-admission: the `<=` spelling of a robustness disjunct,
+/// `(and (<= Y_t Y_j))` (VNNLIB 1.0) or `(and (<= Y[0,t] Y[0,j]))` (2.0) —
+/// the counterexample region "the TRUE class `t` does not beat class `j`",
+/// so the true class is the LEFT operand. Returns `(t, j)`.
+///
+/// `None` unless the line is EXACTLY one such comparison between two DISTINCT
+/// outputs: a conjunction of several comparisons, a constant operand, or any
+/// trailing content is a different property, and the caller fails closed on
+/// it (the trusted-parser cross-check would refuse it too).
+fn parse_le_robustness_disjunct(line: &str) -> Option<(usize, usize)> {
+    let rest = line.strip_prefix("(and (<=")?;
+    let (t, rest) = parse_y_operand(rest)?;
+    let (j, rest) = parse_y_operand(rest)?;
+    let tail: String = rest.chars().filter(|c| !c.is_whitespace()).collect();
+    if tail != "))" || t == j {
+        return None;
+    }
+    Some((t, j))
+}
+
 /// Parse the cifar100/tinyimagenet robustness form: per-pixel X bounds and a
 /// disjunction of `(and (>= Y_j Y_t))` clauses. Returns `(lo, hi, t, adv)`.
 ///
@@ -3363,6 +4486,15 @@ fn last_bracket_index(s: &str) -> Option<usize> {
 /// `Y[0,j]`). Bracket input indices are flattened row-major (NCHW) using the
 /// `declare-input` header, which is exactly the net's Flatten ordering, so the two
 /// encodings yield identical `(lo, hi, t, adv)`.
+///
+/// #cct-margin-row-admission: also accepts the `<=` spelling the
+/// challenging_certified_training corpora (and relusplitter's oval21 rows)
+/// use, `(and (<= Y_t Y_j))` / `(and (<= Y[0,t] Y[0,j]))`, where the TRUE class
+/// is the LEFT operand ([`parse_le_robustness_disjunct`]). The same
+/// counterexample region as `(and (>= Y_j Y_t))`, and it passes through the
+/// SAME trusted-parser cross-check below (which maps `LessEq(a, b)` to
+/// adversarial `b`, true `a`), so a mis-ordered operand pair can only ever
+/// fail closed.
 #[allow(clippy::type_complexity)]
 pub(crate) fn parse_vnnlib_robustness(
     path: &Path,
@@ -3373,6 +4505,7 @@ pub(crate) fn parse_vnnlib_robustness(
     let mut hi: HashMap<usize, f64> = HashMap::new();
     let mut adv: Vec<usize> = Vec::new();
     let mut true_c: HashSet<usize> = HashSet::new();
+    let mut le_disjuncts = 0usize;
     for line in text.lines() {
         let line = line.trim();
         if let Some(rest) = line
@@ -3430,6 +4563,15 @@ pub(crate) fn parse_vnnlib_robustness(
             let t = last_bracket_index(t_str)?;
             adv.push(j);
             true_c.insert(t);
+        } else if line.starts_with("(and (<= Y") {
+            // #cct-margin-row-admission: `(and (<= Y_t Y_j))` /
+            // `(and (<= Y[0,t] Y[0,j]))` — TRUE class on the LEFT. A line
+            // that starts like a `<=` output disjunct but is not exactly one
+            // clean comparison fails the whole parse closed.
+            let (t, j) = parse_le_robustness_disjunct(line)?;
+            adv.push(j);
+            true_c.insert(t);
+            le_disjuncts += 1;
         }
     }
     if lo.is_empty() || lo.len() != hi.len() || true_c.len() != 1 || adv.is_empty() {
@@ -3532,8 +4674,36 @@ pub(crate) fn parse_vnnlib_robustness(
         Err(_) => return None, // trusted parser could not read it — fail closed
     }
 
+    // #cct-margin-row-admission observable: the `<=` spelling was admitted,
+    // and only AFTER both cross-checks passed. Silent on the `>=` corpora
+    // (cifar100 / tinyimagenet), whose output is unchanged.
+    if le_disjuncts > 0 {
+        eprintln!(
+            "[margin-row] vnnlib robustness spec: form=le (true class LEFT of <=) \
+             disjuncts={le_disjuncts} true_class={t} adversarial={} — trusted-parser \
+             cross-check passed",
+            adv.len()
+        );
+    }
     Some((lov, hiv, t, adv))
 }
+
+/// #cct-margin-row-admission pins: the `<=` robustness spelling, the certified
+/// FC-BN fold, and the root-tableau admission ceiling.
+#[cfg(test)]
+mod cct_admission_tests;
+
+/// #mr-ibp-seed real-ONNX gates on the cct IBP-trained eps8 CNN7s: seeded-box
+/// containment of ORT-cross-checked samples (5323, 3144w) and the field-SAT
+/// negative controls (8090, 8397). They need the gitignored corpus, ORT and a
+/// release build, so they are in the explicit `external-vnncomp` lane (run it in
+/// release with the corpus symlinked); a missing prerequisite is VOID and fails.
+#[cfg(all(test, feature = "external-vnncomp"))]
+mod ibp_seed_real_tests;
+
+/// `col-scaling-v2`: the margin-row pass-cost probe v2 (throughput plan B1(b)).
+/// Research-only; reached solely through `ny vnncomp-research margin-row`.
+mod col_scaling_v2;
 
 // --------------------------------------------------------------------------
 //  Differential gates vs the verified Python reference (#twinwall INC2a/b/c).
@@ -3593,7 +4763,8 @@ pub(crate) mod research {
         let epilogue_finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_flag = std::sync::Arc::clone(&epilogue_finished);
         let handle = std::thread::spawn(move || {
-            tx.send(Some(VnncompResult::Unsat)).expect("receiver alive");
+            tx.send(Some(VnncompResult::test_unsat()))
+                .expect("receiver alive");
             std::thread::sleep(Duration::from_millis(20));
             worker_flag.store(true, std::sync::atomic::Ordering::Release);
         });
@@ -3604,7 +4775,7 @@ pub(crate) mod research {
         };
         assert!(matches!(
             lane.take(Duration::from_secs(1)),
-            ConcurrentLaneTake::Verdict(VnncompResult::Unsat)
+            ConcurrentLaneTake::Verdict(VnncompResult::Unsat(_))
         ));
         assert!(
             epilogue_finished.load(std::sync::atomic::Ordering::Acquire),
@@ -3681,11 +4852,15 @@ pub(crate) mod research {
     /// `None` (never a spec), because a certified `unsat` against fewer
     /// adversarial classes than the property forbids is a FALSE verdict.
     ///
-    /// The `(and (<= Y_5 Y_2))` disjunct below is semantically a real robustness
-    /// disjunct (Y_5 <= Y_2, i.e. class 2 beats true class 5), and the trusted
-    /// `load_vnnlib` parser records it — but the fast hand parser only matches
-    /// lines beginning `(and (>= Y_...`, so it silently DROPS it. The output-side
-    /// set-equality cross-check must catch the divergence and fail closed.
+    /// The `(and (< Y_5 Y_2))` disjunct below is semantically a real robustness
+    /// disjunct (Y_5 < Y_2, i.e. class 2 beats true class 5), and the trusted
+    /// `load_vnnlib` parser records it — but the fast hand parser matches only
+    /// the NON-strict spellings (`(and (>= Y_j Y_t))`, and since
+    /// #cct-margin-row-admission `(and (<= Y_t Y_j))`), so it silently DROPS a
+    /// strict one. The output-side set-equality cross-check must catch the
+    /// divergence and fail closed. (This test used the `<=` spelling as its
+    /// dropped disjunct until the parser learned it; the strict `<` keeps the
+    /// obligation exercised.)
     #[test]
     fn output_side_subset_disjunct_fails_closed() {
         let dir = std::env::temp_dir();
@@ -3731,14 +4906,15 @@ pub(crate) mod research {
         assert_eq!(t, 5, "true class");
         assert_eq!(adv, vec![0, 1, 2], "adversarial set");
 
-        // SUBSET CASE: the third disjunct is written `(<= Y_5 Y_2)` — a real
-        // disjunct load_vnnlib captures, but the hand parser (matching only
-        // `(and (>= Y_...`) drops, so its adv set is the strict subset {0,1}.
+        // SUBSET CASE: the third disjunct is written `(< Y_5 Y_2)` — a real
+        // disjunct load_vnnlib captures, but the hand parser (matching only the
+        // non-strict `>=` / `<=` spellings) drops, so its adv set is the strict
+        // subset {0,1}.
         let subset = format!(
             "{header}(assert (or\n\
              (and (>= Y_0 Y_5))\n\
              (and (>= Y_1 Y_5))\n\
-             (and (<= Y_5 Y_2))\n\
+             (and (< Y_5 Y_2))\n\
              ))\n"
         );
         let subset_path = dir.join(format!("mr_subset_{stamp}.vnnlib"));
@@ -3801,7 +4977,7 @@ pub(crate) mod research {
         let out = run_margin_row_lane(&spec, &lo, &hi, t, &adv, Some(deadline), 20_000);
         let el = t0.elapsed().as_secs_f64();
         match out {
-            MarginRowOutcome::Unsat(s) => eprintln!(
+            MarginRowOutcome::Unsat(s, _) => eprintln!(
                 "[probe] {vnnlib_base} -> UNSAT in {el:.1}s (root={:.4} exp={} domains={} closed={} maxD={} dips={} stop={})",
                 s.root_bound, s.expansions, s.domains_created, s.closed, s.max_depth, s.mono_raw_dips, s.stop
             ),
@@ -4121,7 +5297,11 @@ pub(crate) mod research {
             for (li, lg) in root.layers.iter().enumerate() {
                 let taken = splits.iter().filter(|s| s.0 == li).count();
                 if taken < lg.unst.len() {
-                    let sign = if splits.len().is_multiple_of(2) { 1i8 } else { -1i8 };
+                    let sign = if splits.len().is_multiple_of(2) {
+                        1i8
+                    } else {
+                        -1i8
+                    };
                     splits.push((li, taken, sign));
                     if splits.len() >= depth {
                         break 'outer;
@@ -4311,7 +5491,7 @@ pub(crate) mod research {
                 ..BabConfig::default()
             };
             match MarginRowBab::run(&net, &root, t, &adv, cfg) {
-                MarginRowOutcome::Unsat(s) => {
+                MarginRowOutcome::Unsat(s, _) => {
                     ("UNSAT".to_string(), s.root_bound, s.expansions, s.stop)
                 }
                 MarginRowOutcome::Unknown { reason, stats } => {
@@ -4648,7 +5828,7 @@ pub(crate) mod research {
         let (spec, lo, hi, t, adv) = instance(P6232_SAT);
         let deadline = Instant::now() + Duration::from_secs(100);
         match run_margin_row_lane(&spec, &lo, &hi, t, &adv, Some(deadline), 20_000) {
-            MarginRowOutcome::Unsat(stats) => panic!(
+            MarginRowOutcome::Unsat(stats, _) => panic!(
                 "MOAT VIOLATION: SAT instance verified (root_bound={}, stop={})",
                 stats.root_bound, stats.stop
             ),
@@ -4667,7 +5847,7 @@ pub(crate) mod research {
         let t0 = Instant::now();
         let deadline = t0 + Duration::from_secs(budget_secs);
         match run_margin_row_lane(&spec, &lo, &hi, t, &adv, Some(deadline), 20_000) {
-            MarginRowOutcome::Unsat(stats) => {
+            MarginRowOutcome::Unsat(stats, _) => {
                 eprintln!(
                     "[inc2c] {name}: UNSAT in {:.1}s (root={:.4}, exp={}, domains={}, \
                      closed={}, maxD={}, dips={}, stop={})",
@@ -4892,7 +6072,7 @@ pub(crate) mod research {
         let t0 = Instant::now();
         let deadline = t0 + Duration::from_secs(secs);
         match run_margin_row_lane(&spec, &lo, &hi, t, &adv, Some(deadline), 20_000) {
-            MarginRowOutcome::Unsat(s) => (
+            MarginRowOutcome::Unsat(s, _) => (
                 "UNSAT".into(),
                 s.root_bound,
                 s.stop,
@@ -5134,7 +6314,7 @@ pub(crate) mod research {
             let deadline = t0 + Duration::from_mins(1);
             let out = run_margin_row_lane(&spec, &lo, &hi, t, &adv, Some(deadline), 20_000);
             match out {
-                MarginRowOutcome::Unsat(s) => eprintln!(
+                MarginRowOutcome::Unsat(s, _) => eprintln!(
                     "[metaroom] {vnnlib_base} -> UNSAT in {:.1}s (exp={} ledger={:?})",
                     t0.elapsed().as_secs_f64(),
                     s.expansions,
@@ -5191,7 +6371,7 @@ pub(crate) mod research {
             };
             let deadline = Instant::now() + Duration::from_mins(1);
             match run_margin_row_lane(&spec, &lo, &hi, t, &adv, Some(deadline), 20_000) {
-                MarginRowOutcome::Unsat(s) => {
+                MarginRowOutcome::Unsat(s, _) => {
                     violations.push((*vnnlib_base, s.root_bound));
                 }
                 MarginRowOutcome::Unknown { reason, .. } => {
@@ -5609,6 +6789,8 @@ pub(crate) mod research {
             input,
             weight: vec![0.0; n_out * n_in],
             bias: vec![0.0; n_out],
+            bias_err: Vec::new(),
+            weight_rel_err: 0.0,
             shape: (n_out, n_in),
         }
     }
@@ -6114,75 +7296,102 @@ pub(crate) mod research {
     /// tiers.
     #[test]
     fn concurrent_presets_never_also_hold_a_reserve() {
-        // Official scored per-instance budget from each category's
-        // instances.csv (uniform within these categories).
-        const OFFICIAL_SCORED_SECS: &[(&str, u64)] =
-            &[("cifar100_2024", 100), ("tinyimagenet_2024", 100)];
+        // Official scored per-instance budgets from each category's
+        // instances.csv. #cct-margin-row-admission: cct has THREE tiers, and
+        // the adaptive release is budget-dependent, so every tier is checked.
+        const OFFICIAL_SCORED_SECS: &[(&str, &[u64])] = &[
+            ("cifar100_2024", &[100]),
+            ("tinyimagenet_2024", &[100]),
+            ("challenging_certified_training_2026", &[30, 120, 550]),
+        ];
 
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
             .expect("workspace root");
-        let dir = root.join("configs/vnncomp25");
-        let entries = std::fs::read_dir(&dir).unwrap_or_else(|error| {
-            panic!("read shipped preset directory {}: {error}", dir.display())
-        });
         let mut concurrent_presets_checked = 0usize;
-        for entry in entries {
-            let entry =
-                entry.unwrap_or_else(|error| panic!("read entry under {}: {error}", dir.display()));
-            let path = entry.path();
-            if path.extension().is_none_or(|e| e != "yaml") {
-                continue;
-            }
-            let cfg = crate::preset::load_preset(&path)
-                .unwrap_or_else(|error| panic!("load shipped preset {}: {error}", path.display()));
-            if cfg.margin_row.concurrent != Some(true) {
-                continue;
-            }
-            concurrent_presets_checked += 1;
-            let category = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .expect("preset file stem");
-            let scored = OFFICIAL_SCORED_SECS
-                .iter()
-                .find(|(name, _)| *name == category)
-                .map(|(_, secs)| *secs)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{} arms the concurrent lane but has no official scored budget \
-                         recorded here; the adaptive reserve release is budget-dependent, \
-                         so the budget the evidence was gathered at must be stated",
-                        path.display()
-                    )
+        // vnncomp26 SHADOWS vnncomp25; a concurrent preset in either year is a
+        // scored configuration.
+        for year in ["configs/vnncomp25", "configs/vnncomp26"] {
+            let dir = root.join(year);
+            let entries = std::fs::read_dir(&dir).unwrap_or_else(|error| {
+                panic!("read shipped preset directory {}: {error}", dir.display())
+            });
+            for entry in entries {
+                let entry = entry
+                    .unwrap_or_else(|error| panic!("read entry under {}: {error}", dir.display()));
+                let path = entry.path();
+                if path.extension().is_none_or(|e| e != "yaml") {
+                    continue;
+                }
+                // Only a preset with a `margin_row:` section can arm the lane;
+                // skip the rest before loading (their loadability is pinned by
+                // `every_shipped_vnncomp_preset_loads_with_no_unknown_keys`).
+                let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+                    panic!("read shipped preset {}: {error}", path.display())
                 });
-            // Bind to the PRODUCTION tier, not a local mirror. This test used to
-            // call a `#[cfg(test)] internal_timeout_tier` copy that main deleted;
-            // the copy was a drift hazard anyway (its own doc called it a "mirror
-            // of vnncomp::internal_timeout_secs"), and a stale mirror would let
-            // this reserve assertion pass against a rule production no longer uses.
-            let internal = crate::commands::vnncomp::internal_timeout_secs(scored);
-            let configured = cfg.margin_row.reserve_secs.unwrap_or(45);
-            let decision = reserve_policy(
-                configured,
-                cfg.margin_row.adaptive_reserve.unwrap_or(false),
-                adaptive_release_target(
-                    configured,
-                    internal,
-                    resolve_release_frac(None, cfg.margin_row.release_frac),
-                ),
-            );
-            assert_eq!(
-                decision.reserve_secs,
-                0,
-                "{} arms the concurrent lane but still holds {}s of the {internal}s \
-                 internal tier (scored {scored}s, route={:?}); the pair taxes the \
-                 internal verifier twice",
-                path.display(),
-                decision.reserve_secs,
-                decision.route,
-            );
+                if !text.lines().any(|l| l.starts_with("margin_row:")) {
+                    continue;
+                }
+                let cfg = crate::preset::load_preset(&path).unwrap_or_else(|error| {
+                    panic!("load shipped preset {}: {error}", path.display())
+                });
+                if cfg.margin_row.concurrent != Some(true) {
+                    continue;
+                }
+                let category = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .expect("preset file stem");
+                // A non-resolvable canary mirrors its production preset
+                // byte-for-byte outside its own keys; it is checked through the
+                // production row, not registered separately.
+                if category.ends_with("_canary") {
+                    continue;
+                }
+                concurrent_presets_checked += 1;
+                let tiers = OFFICIAL_SCORED_SECS
+                    .iter()
+                    .find(|(name, _)| *name == category)
+                    .map(|(_, secs)| *secs)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{} arms the concurrent lane but has no official scored budget \
+                             recorded here; the adaptive reserve release is budget-dependent, \
+                             so the budget the evidence was gathered at must be stated",
+                            path.display()
+                        )
+                    });
+                for &scored in tiers {
+                    // Bind to the PRODUCTION tier, not a local mirror. This test
+                    // used to call a `#[cfg(test)] internal_timeout_tier` copy that
+                    // main deleted; the copy was a drift hazard anyway (its own doc
+                    // called it a "mirror of vnncomp::internal_timeout_secs"), and a
+                    // stale mirror would let this reserve assertion pass against a
+                    // rule production no longer uses.
+                    let internal = crate::commands::vnncomp::internal_timeout_secs(scored);
+                    let configured = cfg.margin_row.reserve_secs.unwrap_or(45);
+                    let decision = reserve_policy(
+                        configured,
+                        cfg.margin_row.adaptive_reserve.unwrap_or(false),
+                        adaptive_release_target(
+                            configured,
+                            internal,
+                            resolve_release_frac(None, cfg.margin_row.release_frac),
+                        ),
+                    );
+                    assert_eq!(
+                        decision.reserve_secs,
+                        0,
+                        "{} arms the concurrent lane but still holds {}s of the {internal}s \
+                         internal tier (scored {scored}s, route={:?}); the pair taxes the \
+                         internal verifier twice",
+                        path.display(),
+                        decision.reserve_secs,
+                        decision.route,
+                    );
+                }
+            }
         }
         assert_eq!(
             concurrent_presets_checked,
@@ -6279,7 +7488,7 @@ pub(crate) mod research {
             let out = run_margin_row_lane(&spec, &lo, &hi, t, &adv, Some(deadline), 20_000);
             let el = t0.elapsed().as_secs_f64();
             match out {
-                MarginRowOutcome::Unsat(st) => {
+                MarginRowOutcome::Unsat(st, _) => {
                     unsat += 1;
                     eprintln!(
                         "[sweep {i}] {vb} -> UNSAT {el:.1}s root={:.4} exp={} ledger={:?}",
@@ -6332,6 +7541,13 @@ pub(crate) mod research {
 
     /// Execute one explicit, serial real-corpus margin-row measurement.
     pub(crate) fn run(probe: &str) -> anyhow::Result<()> {
+        // #col-scaling-v2 (plan B1(b)): arguments ride in the selector and the
+        // corpus is addressed by ABSOLUTE path, so it runs from a worktree
+        // build that has no in-tree `benchmarks/` — dispatched before that
+        // precondition below.
+        if let Some(args) = probe.strip_prefix("col-scaling-v2") {
+            return col_scaling_v2::run(args);
+        }
         anyhow::ensure!(
             Path::new(BENCH_ROOT).is_dir(),
             "missing VNN-COMP benchmark root {BENCH_ROOT}"

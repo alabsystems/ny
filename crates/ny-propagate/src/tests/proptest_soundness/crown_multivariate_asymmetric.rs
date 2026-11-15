@@ -12,8 +12,6 @@
 //! through several layers, lower_a and upper_a diverge. These tests verify
 //! soundness with lower_a != upper_a for Softmax, LogSoftmax, BatchNorm, and
 //! CausalSoftmax.
-//!
-//! Part of #40, #1793.
 
 use crate::layers::common::BoundPropagation;
 use crate::layers::softmax::{CausalSoftmaxLayer, LogSoftmaxLayer, SoftmaxLayer};

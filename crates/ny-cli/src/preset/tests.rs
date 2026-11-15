@@ -99,7 +99,7 @@ fn resolve_branching_keeps_fsb_and_kfsb_distinct_2370() {
         );
         // kFSB, FSB, and BoundImpact are ReLU-splitting strategies: they select
         // which ReLU neuron to pin active/inactive. They must route through the
-        // graph ReLU-split path. (#4300)
+        // graph ReLU-split path.
         assert!(
             branching.use_relu_split,
             "preset method '{method}' should set use_relu_split=true (ReLU-splitting strategy)"
@@ -267,6 +267,455 @@ fn apply_preset_propagates_max_queue_bytes_and_defaults_to_unlimited() {
         config.max_queue_bytes, 0,
         "presets that omit bab.max_queue_bytes must keep the unlimited queue"
     );
+}
+
+/// #budget-abandonment FIX A: the key must reach `BetaCrownConfig` FROM A
+/// YAML, not merely from a struct literal -- the yaml route is the one the
+/// scored run uses, and `BabPreset` is `deny_unknown_fields`, so a misspelt
+/// key fails loudly here rather than going dark in competition.
+#[test]
+fn apply_preset_propagates_initial_bounds_warmup_fallback_and_defaults_dark() {
+    let armed: PresetConfig =
+        serde_yaml::from_str("bab:\n  initial_bounds_warmup_fallback: true\n")
+            .expect("bab.initial_bounds_warmup_fallback should parse");
+    assert_eq!(armed.bab.initial_bounds_warmup_fallback, Some(true));
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &armed).expect("armed preset should apply cleanly");
+    assert!(config.initial_bounds_warmup_fallback);
+
+    let omitted = PresetConfig::default();
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &omitted).expect("omitted key should apply cleanly");
+    assert!(
+        !config.initial_bounds_warmup_fallback,
+        "a preset that omits the key must leave the warmup abandonment exactly as it was"
+    );
+}
+
+/// #per-node-floor-dim-scale: the key must reach `BetaCrownConfig` FROM A
+/// YAML (the scored route; `BabPreset` is `deny_unknown_fields` so a misspelt
+/// key fails loudly), and then the collector-facing budget type the lane
+/// actually reads (`crown_ibp_per_node_time_budget()`), composing with the
+/// existing floor key. Absent = dark = the constant floor.
+#[test]
+fn apply_preset_propagates_crown_ibp_per_node_floor_dim_scaled_and_defaults_dark() {
+    let armed: PresetConfig = serde_yaml::from_str(
+        "bab:\n  crown_ibp_per_node_floor_secs: 1.0\n  crown_ibp_per_node_floor_dim_scaled: true\n",
+    )
+    .expect("bab.crown_ibp_per_node_floor_dim_scaled should parse");
+    assert_eq!(armed.bab.crown_ibp_per_node_floor_dim_scaled, Some(true));
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &armed).expect("armed preset should apply cleanly");
+    assert!(config.crown_ibp_per_node_floor_dim_scaled);
+    let budget = config.crown_ibp_per_node_time_budget();
+    assert!(
+        budget.floor_dim_scaled,
+        "the flag must reach the collector-facing budget"
+    );
+    assert_eq!(
+        budget.floor_secs,
+        Some(1.0),
+        "the flag composes with the floor key"
+    );
+
+    let omitted = PresetConfig::default();
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &omitted).expect("omitted key should apply cleanly");
+    assert!(
+        !config.crown_ibp_per_node_floor_dim_scaled,
+        "a preset that omits the key must leave the constant floor exactly as it was"
+    );
+    assert!(!config.crown_ibp_per_node_time_budget().floor_dim_scaled);
+}
+
+/// #vit-collector-throughput: the three collector-kernel keys must reach
+/// `BetaCrownConfig` FROM A YAML (the scored route; `BabPreset` is
+/// `deny_unknown_fields`, so a misspelt key fails loudly here), each
+/// independently of the others, and a preset that omits them must leave all
+/// three dark — the state every shipped yaml is pinned to by
+/// `no_shipped_preset_arms_vit_collector_kernel_keys`.
+#[test]
+fn apply_preset_propagates_vit_collector_kernel_keys_and_defaults_dark() {
+    let armed: PresetConfig = serde_yaml::from_str(
+        "bab:\n  bilinear_rowpar_kernel: true\n  linear_position_stack: true\n  \
+         reciprocal_unbounded_upper: true\n",
+    )
+    .expect("the three vit collector-kernel keys should parse");
+    assert_eq!(armed.bab.bilinear_rowpar_kernel, Some(true));
+    assert_eq!(armed.bab.linear_position_stack, Some(true));
+    assert_eq!(armed.bab.reciprocal_unbounded_upper, Some(true));
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &armed).expect("armed preset should apply cleanly");
+    assert!(config.bilinear_rowpar_kernel);
+    assert!(config.linear_position_stack);
+    assert!(config.reciprocal_unbounded_upper);
+
+    // Each key is independent: arming one must not arm another.
+    let only_reciprocal: PresetConfig =
+        serde_yaml::from_str("bab:\n  reciprocal_unbounded_upper: true\n")
+            .expect("a single collector-kernel key should parse");
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &only_reciprocal).expect("single key should apply cleanly");
+    assert!(config.reciprocal_unbounded_upper);
+    assert!(!config.bilinear_rowpar_kernel);
+    assert!(!config.linear_position_stack);
+
+    // An explicit `false` is honoured (and is the same as absent).
+    let explicit_off: PresetConfig =
+        serde_yaml::from_str("bab:\n  bilinear_rowpar_kernel: false\n")
+            .expect("an explicit false should parse");
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &explicit_off).expect("explicit false should apply cleanly");
+    assert!(!config.bilinear_rowpar_kernel);
+
+    let omitted = PresetConfig::default();
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &omitted).expect("omitted keys should apply cleanly");
+    assert!(
+        !config.bilinear_rowpar_kernel
+            && !config.linear_position_stack
+            && !config.reciprocal_unbounded_upper,
+        "a preset that omits the keys must leave every collector kernel on its historical path"
+    );
+    let default = BetaCrownConfig::default();
+    assert!(
+        !default.bilinear_rowpar_kernel
+            && !default.linear_position_stack
+            && !default.reciprocal_unbounded_upper,
+        "BetaCrownConfig::default() must keep every collector kernel dark"
+    );
+}
+
+/// #vit-batched-bilinear: `bab.bilinear_gemm_kernel` must reach
+/// `BetaCrownConfig` FROM A YAML (the scored route; `BabPreset` is
+/// `deny_unknown_fields`, so a misspelt key fails loudly), independently of the
+/// row-parallel sibling it is tried before, and a preset that omits it must
+/// leave it dark — the state every shipped yaml is pinned to by
+/// `no_shipped_preset_arms_vit_collector_kernel_keys`.
+#[test]
+fn apply_preset_propagates_bilinear_gemm_kernel_key_and_defaults_dark() {
+    let armed: PresetConfig = serde_yaml::from_str("bab:\n  bilinear_gemm_kernel: true\n")
+        .expect("bab.bilinear_gemm_kernel should parse");
+    assert_eq!(armed.bab.bilinear_gemm_kernel, Some(true));
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &armed).expect("armed preset should apply cleanly");
+    assert!(config.bilinear_gemm_kernel);
+    // Independent of the siblings: arming it arms nothing else.
+    assert!(!config.bilinear_rowpar_kernel);
+    assert!(!config.linear_position_stack);
+    assert!(!config.reciprocal_unbounded_upper);
+
+    // Both bilinear keys together are admissible (gemm is tried first).
+    let both: PresetConfig = serde_yaml::from_str(
+        "bab:\n  bilinear_gemm_kernel: true\n  bilinear_rowpar_kernel: true\n",
+    )
+    .expect("both bilinear kernel keys should parse");
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &both).expect("both keys should apply cleanly");
+    assert!(config.bilinear_gemm_kernel && config.bilinear_rowpar_kernel);
+
+    // An explicit `false` is honoured (and is the same as absent).
+    let explicit_off: PresetConfig = serde_yaml::from_str("bab:\n  bilinear_gemm_kernel: false\n")
+        .expect("an explicit false should parse");
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &explicit_off).expect("explicit false should apply cleanly");
+    assert!(!config.bilinear_gemm_kernel);
+
+    let omitted = PresetConfig::default();
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &omitted).expect("omitted key should apply cleanly");
+    assert!(
+        !config.bilinear_gemm_kernel,
+        "a preset that omits the key must leave the bilinear backward on its historical path"
+    );
+    assert!(
+        !BetaCrownConfig::default().bilinear_gemm_kernel,
+        "BetaCrownConfig::default() must keep the GEMM-shaped bilinear kernel dark"
+    );
+}
+
+/// #hull-root / #hull-bab: `bab.single_hidden_hull` must reach
+/// `BetaCrownConfig` FROM A YAML (the scored route), accept exactly
+/// `off` | `root` | `bab` (`bab` was refused until #hull-bab built phase 2;
+/// it is accepted deliberately now), refuse misspellings (`BabPreset` is
+/// `deny_unknown_fields` and the enum is closed), and be dark when omitted.
+#[test]
+fn apply_preset_propagates_single_hidden_hull_and_defaults_off() {
+    use ny_propagate::SingleHiddenHullMode;
+
+    let armed: PresetConfig = serde_yaml::from_str("bab:\n  single_hidden_hull: root\n")
+        .expect("bab.single_hidden_hull: root should parse");
+    assert_eq!(
+        armed.bab.single_hidden_hull,
+        Some(SingleHiddenHullMode::Root)
+    );
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &armed).expect("armed preset should apply cleanly");
+    assert_eq!(config.single_hidden_hull, SingleHiddenHullMode::Root);
+
+    let explicit_off: PresetConfig = serde_yaml::from_str("bab:\n  single_hidden_hull: off\n")
+        .expect("bab.single_hidden_hull: off should parse");
+    assert_eq!(
+        explicit_off.bab.single_hidden_hull,
+        Some(SingleHiddenHullMode::Off)
+    );
+
+    let tree: PresetConfig = serde_yaml::from_str("bab:\n  single_hidden_hull: bab\n")
+        .expect("bab.single_hidden_hull: bab should parse");
+    assert_eq!(tree.bab.single_hidden_hull, Some(SingleHiddenHullMode::Bab));
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &tree).expect("bab preset should apply cleanly");
+    assert_eq!(config.single_hidden_hull, SingleHiddenHullMode::Bab);
+
+    for bad in [
+        "bab:\n  single_hidden_hull: Bab\n",
+        "bab:\n  single_hidden_hull: tree\n",
+        "bab:\n  single_hidden_hull: Root\n",
+        "bab:\n  single_hidden_hull: 1\n",
+        "bab:\n  single_hidden_hul: root\n",
+    ] {
+        assert!(
+            serde_yaml::from_str::<PresetConfig>(bad).is_err(),
+            "`{bad}` must not parse"
+        );
+    }
+
+    let omitted = PresetConfig::default();
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &omitted).expect("omitted key should apply cleanly");
+    assert_eq!(
+        config.single_hidden_hull,
+        SingleHiddenHullMode::Off,
+        "a preset that omits the key must leave the historical lane exactly as it was"
+    );
+}
+
+/// #hull-root DARK-BY-DEFAULT PIN: no shipped yaml arms
+/// `bab.single_hidden_hull`. Arming it is a measured decision that belongs in
+/// its own commit, and that commit must edit THIS test (naming the one
+/// category it arms) alongside the measurement that justifies it.
+#[test]
+fn no_shipped_yaml_arms_single_hidden_hull() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+    let mut read = 0usize;
+    let mut armed = Vec::new();
+    for year in ["vnncomp24", "vnncomp25", "vnncomp26"] {
+        let Ok(entries) = fs::read_dir(root.join(year)) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("preset directory entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).expect("readable shipped preset");
+            let preset: PresetConfig = serde_yaml::from_str(&text)
+                .unwrap_or_else(|error| panic!("preset {} must parse: {error}", path.display()));
+            read += 1;
+            if preset.bab.single_hidden_hull.is_some() {
+                armed.push(path.display().to_string());
+            }
+        }
+    }
+    assert!(
+        read >= 20,
+        "expected the shipped preset corpus, read {read} files — a silent read failure \
+         would make this pin vacuous"
+    );
+    assert!(
+        armed.is_empty(),
+        "bab.single_hidden_hull is SET in a shipped preset: {armed:?}. Arm it only in the \
+         commit that carries its measurement, and update this pin there."
+    );
+}
+
+/// #inert-ascent-exit: the key must reach `AlphaCrownConfig` FROM A YAML at
+/// BOTH locations `apply_preset` feeds through `apply_alpha_preset`
+/// (`bab.alpha_crown` and `solver.alpha_crown`); `0` is rejected at load;
+/// absent = dark = the ten-iteration patience.
+#[test]
+fn apply_preset_propagates_inert_ascent_exit_iters_and_defaults_dark() {
+    let armed: PresetConfig =
+        serde_yaml::from_str("bab:\n  alpha_crown:\n    inert_ascent_exit_iters: 3\n")
+            .expect("bab.alpha_crown.inert_ascent_exit_iters should parse");
+    assert_eq!(armed.bab.alpha_crown.inert_ascent_exit_iters, Some(3));
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &armed).expect("armed preset should apply cleanly");
+    assert_eq!(config.alpha_config.inert_ascent_exit_iters, Some(3));
+    assert_eq!(
+        config.alpha_config.early_stop_patience, 10,
+        "the historical patience is untouched by the new key"
+    );
+
+    let solver_armed: PresetConfig =
+        serde_yaml::from_str("solver:\n  alpha_crown:\n    inert_ascent_exit_iters: 2\n")
+            .expect("solver.alpha_crown.inert_ascent_exit_iters should parse");
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &solver_armed).expect("solver-located key should apply");
+    assert_eq!(config.alpha_config.inert_ascent_exit_iters, Some(2));
+
+    let zero: PresetConfig =
+        serde_yaml::from_str("bab:\n  alpha_crown:\n    inert_ascent_exit_iters: 0\n")
+            .expect("yaml parses; validation is apply's job");
+    let mut config = BetaCrownConfig::default();
+    let err = apply_preset(&mut config, &zero).expect_err("0 must be rejected at preset load");
+    assert!(
+        err.to_string()
+            .contains("inert_ascent_exit_iters must be >= 1"),
+        "unexpected rejection text: {err}"
+    );
+
+    let omitted = PresetConfig::default();
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &omitted).expect("omitted key should apply cleanly");
+    assert_eq!(
+        config.alpha_config.inert_ascent_exit_iters, None,
+        "a preset that omits the key must leave the ascent patience exactly as it was"
+    );
+}
+
+/// #budget-abandonment FIX B: same route, same darkness requirement.
+#[test]
+fn apply_preset_propagates_disjunctive_clause_retry_passes_and_defaults_to_one_pass() {
+    let armed: PresetConfig = serde_yaml::from_str("bab:\n  disjunctive_clause_retry_passes: 2\n")
+        .expect("bab.disjunctive_clause_retry_passes should parse");
+    assert_eq!(armed.bab.disjunctive_clause_retry_passes, Some(2));
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &armed).expect("armed preset should apply cleanly");
+    assert_eq!(config.disjunctive_clause_retry_passes, 2);
+
+    let omitted = PresetConfig::default();
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &omitted).expect("omitted key should apply cleanly");
+    assert_eq!(
+        config.disjunctive_clause_retry_passes, 0,
+        "a preset that omits the key must keep today's SINGLE pass"
+    );
+}
+
+/// #disjunctive-shared-bootstrap: same route, same darkness requirement.
+#[test]
+fn apply_preset_propagates_disjunctive_shared_bootstrap_and_defaults_dark() {
+    let armed: PresetConfig = serde_yaml::from_str("bab:\n  disjunctive_shared_bootstrap: true\n")
+        .expect("bab.disjunctive_shared_bootstrap should parse");
+    assert_eq!(armed.bab.disjunctive_shared_bootstrap, Some(true));
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &armed).expect("armed preset should apply cleanly");
+    assert!(config.disjunctive_shared_bootstrap);
+
+    let omitted = PresetConfig::default();
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &omitted).expect("omitted key should apply cleanly");
+    assert!(
+        !config.disjunctive_shared_bootstrap,
+        "a preset that omits the key must keep the per-clause bootstrap"
+    );
+}
+
+/// #genbab-precomputed-lane: same route, same darkness requirement.
+///
+/// The key exists because the precomputed-bounds BaB lane is the ONLY lane
+/// that never reads `branching_heuristic`, so on a `method: nonlinear`
+/// benchmark it finds nothing to split and returns holding its whole budget.
+/// Arming it is a behaviour change on those benchmarks, so it must be OFF
+/// until measured.
+#[test]
+fn apply_preset_propagates_genbab_on_precomputed_lane_and_defaults_dark() {
+    let armed: PresetConfig = serde_yaml::from_str("bab:\n  genbab_on_precomputed_lane: true\n")
+        .expect("bab.genbab_on_precomputed_lane should parse");
+    assert_eq!(armed.bab.genbab_on_precomputed_lane, Some(true));
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &armed).expect("armed preset should apply cleanly");
+    assert!(
+        config.genbab_on_precomputed_lane,
+        "an armed yaml must reach the engine cell"
+    );
+
+    let absent: PresetConfig =
+        serde_yaml::from_str("bab: {}\n").expect("an empty bab section should parse");
+    assert_eq!(absent.bab.genbab_on_precomputed_lane, None);
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &absent).expect("absent preset should apply cleanly");
+    assert!(
+        !config.genbab_on_precomputed_lane,
+        "a preset that omits the key must leave the lane byte-identical"
+    );
+    assert!(
+        !BetaCrownConfig::default().genbab_on_precomputed_lane,
+        "the engine default itself must be dark"
+    );
+}
+
+/// #genbab-candidates: the GenBaB selector's candidate budget must be settable.
+///
+/// It defaults to 1 (`NonlinearBranchingConfig::default`) and `selector.rs`
+/// ends `candidates.truncate(num_candidates)` after sorting by score, so GenBaB
+/// has always branched on a single candidate. Both construction sites took
+/// `::default()`, so no yaml could raise it — while ml4acopf's
+/// `branching.candidates: 100` goes to `fsb_candidates`, which only the
+/// sequential selector and the kFSB lanes read.
+#[test]
+fn nonlinear_split_num_candidates_reaches_the_genbab_heuristic() {
+    use ny_propagate::BranchingHeuristic;
+
+    let armed: PresetConfig = serde_yaml::from_str(
+        "bab:\n  branching:\n    method: nonlinear\n    nonlinear_split:\n      num_candidates: 100\n",
+    )
+    .expect("nonlinear_split.num_candidates should parse");
+    let resolved = resolve_branching(&armed)
+        .expect("armed preset should resolve")
+        .expect("a method is pinned, so branching resolves");
+    match resolved.heuristic {
+        BranchingHeuristic::GenBaB(config) => assert_eq!(
+            config.num_candidates, 100,
+            "the yaml's candidate budget must reach the selector"
+        ),
+        other => panic!("method: nonlinear must select GenBaB, got {other:?}"),
+    }
+
+    // Absent => the engine default, unchanged. This is the shipped state on
+    // every yaml except ml4acopf_2024 (see the next test).
+    let absent: PresetConfig = serde_yaml::from_str("bab:\n  branching:\n    method: nonlinear\n")
+        .expect("bare method should parse");
+    let resolved = resolve_branching(&absent)
+        .expect("absent preset should resolve")
+        .expect("a method is pinned");
+    match resolved.heuristic {
+        BranchingHeuristic::GenBaB(config) => assert_eq!(
+            config.num_candidates, 1,
+            "omitting the key must keep the engine default of 1"
+        ),
+        other => panic!("method: nonlinear must select GenBaB, got {other:?}"),
+    }
+}
+
+/// The shipped ml4acopf preset — the only `method: nonlinear` yaml — delivers
+/// abc's GenBaB candidate budget (100) through the TYPED key
+/// `nonlinear_split.num_candidates` (#genbab-selector-convention), not through
+/// `branching.candidates`, which still lands on `fsb_candidates`.
+///
+/// Value-neutral until a consumer reads past `decisions[0]`: see
+/// `nonlinear_branching::tests::convention::genbab_top_decision_is_independent_of_num_candidates`.
+#[test]
+fn shipped_ml4acopf_preset_delivers_the_genbab_candidate_budget() {
+    use ny_propagate::BranchingHeuristic;
+
+    let text = fs::read_to_string("../../configs/vnncomp25/ml4acopf_2024.yaml")
+        .or_else(|_| fs::read_to_string("configs/vnncomp25/ml4acopf_2024.yaml"))
+        .expect("the shipped ml4acopf preset must be readable");
+    let preset: PresetConfig =
+        serde_yaml::from_str(&text).expect("the shipped ml4acopf preset must parse");
+    let resolved = resolve_branching(&preset)
+        .expect("it resolves")
+        .expect("it pins method: nonlinear");
+    match resolved.heuristic {
+        BranchingHeuristic::GenBaB(config) => assert_eq!(
+            config.num_candidates, 100,
+            "ml4acopf sets `nonlinear_split.num_candidates: 100`; it must reach the \
+             GenBaB selector (`branching.candidates` lands on fsb_candidates instead)"
+        ),
+        other => panic!("ml4acopf must select GenBaB, got {other:?}"),
+    }
 }
 
 #[test]
@@ -486,7 +935,14 @@ fn shipped_wave_kfsb_presets_mirror_generic_policy_without_changing_it() {
             Some(candidates),
             "preset={name}"
         );
-        assert_eq!(branching.reduceop.as_deref(), Some("max"), "preset={name}");
+        // #general-defaults 2026-08-31: `kfsb_reduce_op` now defaults to Max --
+        // ALL 40 reduceop occurrences in the config tree said `max`, so Min governed
+        // nothing but untuned benchmarks. A preset may omit the key (taking the
+        // default) or state `max`, but must never disagree.
+        assert!(
+            branching.reduceop.as_deref().is_none_or(|v| v == "max"),
+            "preset={name}: reduceop must be max or absent (default max)"
+        );
         assert_eq!(
             branching.kfsb_multi_reduceop.as_deref(),
             Some("max"),
@@ -828,7 +1284,7 @@ fn relusplitter_rsplitter_gpu_bab_sidecar_stays_isolated_3862() {
         BranchingHeuristic::BoundImpact
     ));
     // BaBSR (BoundImpact) is a ReLU-splitting strategy and now correctly
-    // sets use_relu_split=true (#4300). With gpu_bab=true the dispatch
+    // sets use_relu_split=true. With gpu_bab=true the dispatch
     // short-circuits to verify_graph_gpu_domain_list regardless.
     assert!(
         resolved.use_relu_split,
@@ -836,7 +1292,7 @@ fn relusplitter_rsplitter_gpu_bab_sidecar_stays_isolated_3862() {
     );
 }
 
-/// Regression: the #3813 WGPU multi-objective sidecar must explicitly request a
+/// Regression: the WGPU multi-objective sidecar must explicitly request a
 /// wgpu device, keep kfsb branching, preserve matrix Conv2d, and keep
 /// quarantined cut authority disabled. Without the explicit device field the
 /// benchmark runner silently falls back to CPU.
@@ -850,7 +1306,7 @@ fn relusplitter_multiobjective_wgpu_sidecar_requests_wgpu_device_3813() {
     .unwrap();
 
     // Must explicitly request wgpu so the benchmark runner cannot silently fall
-    // back to CPU (the root cause of the ambiguous #3862 negative).
+    // back to CPU (the root cause of an earlier ambiguous negative).
     assert_eq!(
         sidecar.general.device.as_deref(),
         Some("wgpu"),
@@ -1241,6 +1697,154 @@ fn apply_preset_propagates_mo_cuda_bounded_shared_executor_policy() {
         serde_yaml::from_str("bab:\n  mo_cuda_bounded_shared_executor: true\n")
             .expect("bounded shared-executor preset key is accepted");
     assert_eq!(parsed.bab.mo_cuda_bounded_shared_executor, Some(true));
+}
+
+/// #vit-bank-gate: the typed fence key parses from yaml, reaches the resolved
+/// config in both directions, and an omitted key never overwrites.
+#[test]
+fn apply_preset_propagates_mo_containment_fence_policy() {
+    for (preset_value, expected) in [(true, true), (false, false)] {
+        let preset = PresetConfig {
+            bab: BabPreset {
+                mo_containment_fence: Some(preset_value),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut config = BetaCrownConfig {
+            mo_containment_fence: !preset_value,
+            ..Default::default()
+        };
+        apply_preset(&mut config, &preset).expect("typed containment-fence policy applies");
+        assert_eq!(config.mo_containment_fence, expected);
+    }
+
+    assert!(
+        !BetaCrownConfig::default().mo_containment_fence,
+        "the fence must be default-off so every shipped preset is byte-identical"
+    );
+    let mut omitted = BetaCrownConfig {
+        mo_containment_fence: true,
+        ..Default::default()
+    };
+    apply_preset(&mut omitted, &PresetConfig::default()).expect("omitted policy applies");
+    assert!(
+        omitted.mo_containment_fence,
+        "an omitted Option must not overwrite an existing typed value"
+    );
+
+    let parsed: PresetConfig = serde_yaml::from_str("bab:\n  mo_containment_fence: true\n")
+        .expect("containment-fence preset key is accepted");
+    assert_eq!(parsed.bab.mo_containment_fence, Some(true));
+}
+
+/// #vit-margin-alpha-complex (P8): the typed ORT-adjudication key parses from
+/// yaml, reaches the resolved config in both directions, defaults dark, and an
+/// omitted key never overwrites.
+#[test]
+fn apply_preset_propagates_mo_root_ort_adjudication_policy() {
+    for (preset_value, expected) in [(true, true), (false, false)] {
+        let preset = PresetConfig {
+            bab: BabPreset {
+                mo_root_ort_adjudication: Some(preset_value),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut config = BetaCrownConfig {
+            mo_root_ort_adjudication: !preset_value,
+            ..Default::default()
+        };
+        apply_preset(&mut config, &preset).expect("typed ORT-adjudication policy applies");
+        assert_eq!(config.mo_root_ort_adjudication, expected);
+    }
+
+    assert!(
+        !BetaCrownConfig::default().mo_root_ort_adjudication,
+        "the ORT adjudication must be default-off so every shipped preset is byte-identical"
+    );
+    let mut omitted = BetaCrownConfig {
+        mo_root_ort_adjudication: true,
+        ..Default::default()
+    };
+    apply_preset(&mut omitted, &PresetConfig::default()).expect("omitted policy applies");
+    assert!(
+        omitted.mo_root_ort_adjudication,
+        "an omitted Option must not overwrite an existing typed value"
+    );
+
+    let parsed: PresetConfig = serde_yaml::from_str(
+        "bab:\n  mo_containment_fence: true\n  mo_root_ort_adjudication: true\n",
+    )
+    .expect("ORT-adjudication preset key is accepted");
+    assert_eq!(parsed.bab.mo_root_ort_adjudication, Some(true));
+    assert_eq!(parsed.bab.mo_containment_fence, Some(true));
+}
+
+/// #vit-v3-bankable: the typed `bab.mo_cover_certify` key parses from yaml in
+/// its closed vocabulary (a misspelling is refused, never resolved to `off`),
+/// reaches the resolved config for every mode, defaults dark, and an omitted
+/// key never overwrites.
+#[test]
+fn apply_preset_propagates_mo_cover_certify_and_defaults_dark() {
+    use ny_propagate::MoCoverCertify;
+    for mode in [
+        MoCoverCertify::Off,
+        MoCoverCertify::Ledger,
+        MoCoverCertify::Replay,
+    ] {
+        let preset = PresetConfig {
+            bab: BabPreset {
+                mo_cover_certify: Some(mode),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut config = BetaCrownConfig {
+            mo_cover_certify: if mode == MoCoverCertify::Replay {
+                MoCoverCertify::Off
+            } else {
+                MoCoverCertify::Replay
+            },
+            ..Default::default()
+        };
+        apply_preset(&mut config, &preset).expect("typed cover-certify policy applies");
+        assert_eq!(config.mo_cover_certify, mode);
+    }
+
+    assert_eq!(
+        BetaCrownConfig::default().mo_cover_certify,
+        MoCoverCertify::Off,
+        "the cover certification must be default-off so every shipped preset is byte-identical"
+    );
+    let mut omitted = BetaCrownConfig {
+        mo_cover_certify: MoCoverCertify::Ledger,
+        ..Default::default()
+    };
+    apply_preset(&mut omitted, &PresetConfig::default()).expect("omitted policy applies");
+    assert_eq!(
+        omitted.mo_cover_certify,
+        MoCoverCertify::Ledger,
+        "an omitted Option must not overwrite an existing typed value"
+    );
+
+    for (token, mode) in [
+        ("off", MoCoverCertify::Off),
+        ("ledger", MoCoverCertify::Ledger),
+        ("replay", MoCoverCertify::Replay),
+    ] {
+        let parsed: PresetConfig =
+            serde_yaml::from_str(&format!("bab:\n  mo_cover_certify: {token}\n"))
+                .expect("cover-certify preset key is accepted");
+        assert_eq!(parsed.bab.mo_cover_certify, Some(mode));
+    }
+    for bad in ["Ledger", "on", "true", "ledgers"] {
+        assert!(
+            serde_yaml::from_str::<PresetConfig>(&format!("bab:\n  mo_cover_certify: {bad}\n"))
+                .is_err(),
+            "`{bad}` must be refused, never resolved to a mode"
+        );
+    }
 }
 
 #[test]
@@ -1697,7 +2301,11 @@ fn shipped_middle_after_presets_declare_upfront_compatibility() {
     }
 
     assert_eq!(
-        scheduled, 22,
+        scheduled, 23,
+        // 23rd = challenging_certified_training_2026_patcheswiring_canary.yaml
+        // (#patches-engine-wiring), a byte-clone of the production cct preset
+        // plus its two dark keys; it inherits the same middle->upfront
+        // compatibility declaration and was reviewed with this bump.
         "review every shipped middle/after preset when the compatibility set changes"
     );
 }
@@ -2164,9 +2772,9 @@ fn acasxu_2023_preset_matches_hardcoded_config() {
     );
 }
 
-// Phase budget preset tests moved to phase_budget_tests.rs (#2206 Packet E)
+// Phase budget preset tests live in phase_budget_tests.rs.
 
-/// #4303: auto_enlarge_batch_size from bab: preset flows to BetaCrownConfig.
+/// auto_enlarge_batch_size from bab: preset flows to BetaCrownConfig.
 #[test]
 fn apply_preset_propagates_auto_enlarge_batch_size_4303() {
     let preset = PresetConfig {
@@ -2184,7 +2792,7 @@ fn apply_preset_propagates_auto_enlarge_batch_size_4303() {
     );
 }
 
-/// #4303: auto_enlarge_batch_size from solver: preset also flows.
+/// auto_enlarge_batch_size from solver: preset also flows.
 #[test]
 fn apply_preset_propagates_auto_enlarge_from_solver_4303() {
     let preset = PresetConfig {
@@ -2202,7 +2810,7 @@ fn apply_preset_propagates_auto_enlarge_from_solver_4303() {
     );
 }
 
-/// #4303: bab overrides solver for auto_enlarge_batch_size.
+/// Bab overrides solver for auto_enlarge_batch_size.
 #[test]
 fn apply_preset_bab_overrides_solver_auto_enlarge_4303() {
     let preset = PresetConfig {
@@ -2224,9 +2832,9 @@ fn apply_preset_bab_overrides_solver_auto_enlarge_4303() {
     );
 }
 
-// #1449 attack_mode tests moved to attack_mode_tests.rs
+// The attack_mode tests live in attack_mode_tests.rs.
 
-/// #2517: early_stop_patience from bab preset flows to BetaCrownConfig.
+/// early_stop_patience from bab preset flows to BetaCrownConfig.
 #[test]
 fn apply_preset_propagates_early_stop_patience_2517() {
     let preset = PresetConfig {
@@ -2264,7 +2872,7 @@ fn apply_preset_ignores_unimplemented_pruning_in_iteration() {
     );
 }
 
-/// #2517: beta lr_decay from bab.beta-crown preset flows to AlphaCrownConfig.
+/// Beta lr_decay from bab.beta-crown preset flows to AlphaCrownConfig.
 #[test]
 fn apply_preset_propagates_beta_lr_decay_2517() {
     let preset = PresetConfig {
@@ -2285,7 +2893,7 @@ fn apply_preset_propagates_beta_lr_decay_2517() {
     );
 }
 
-/// #2517: beta lr_decay overrides alpha lr_decay when both are set.
+/// Beta lr_decay overrides alpha lr_decay when both are set.
 #[test]
 fn apply_preset_beta_lr_decay_overrides_alpha_2517() {
     let preset = PresetConfig {
@@ -2550,9 +3158,7 @@ fn input_split_child_bound_calibration_preset_maps_to_config() {
         bab: BabPreset {
             branching: BranchingPreset {
                 input_split: InputSplitPreset {
-                    child_bound_calibration: Some(
-                        InputSplitChildBoundCalibrationPreset::default(),
-                    ),
+                    child_bound_calibration: Some(InputSplitChildBoundCalibrationPreset::default()),
                     ..Default::default()
                 },
                 ..Default::default()

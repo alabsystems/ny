@@ -26,7 +26,7 @@ use tracing::info;
 /// Custom-operator extension traits and configuration for ONNX loading.
 pub use config::{
     BatchNormFoldingPolicy, CustomOpHandler, CustomOpRegistry, OnnxLoadConfig,
-    OnnxOptimizationFlag, ShapeInferBackend, ShapeInferencePolicy,
+    OnnxOptimizationFlag, RootCutLoadReceipt, ShapeInferBackend, ShapeInferencePolicy,
 };
 /// Subprocess shape-inference protocol: server entry + hidden subcommand name.
 pub use shape_infer::subprocess::{serve_shape_infer_request, SHAPE_INFER_SUBCOMMAND};
@@ -40,6 +40,21 @@ pub use shape_infer::subprocess::{serve_shape_infer_request, SHAPE_INFER_SUBCOMM
 pub fn set_const_matmul_interval_preset(value: Option<bool>) {
     const_fold::set_interval_carrier_preset(value);
 }
+
+/// Whether any ONNX load in this process folded a `BatchNormalization` into
+/// its Conv/Gemm/ConvTranspose neighbour with the composed coefficient
+/// enclosure DROPPED (`fusion/batch_norm_fold.rs`; the M2e gap). Sticky for
+/// the process. The graph lane's instance door reads it: a graph-lane `unsat`
+/// on a folded model rests on an uncharged fold error, so it publishes
+/// through the counted legacy door rather than from a certified token.
+#[must_use]
+pub fn bn_fold_enclosure_dropped() -> bool {
+    fusion::enclosure_dropping_fold_applied()
+}
+
+/// #lsnc-lane: the thread-scoped guard under which `crate::lowdim_twin` loads
+/// its lane-private interval twin (see the type's documentation).
+pub(crate) use const_fold::LanePrivateIntervalScope;
 
 /// Result of parsing an ONNX file, including loader-private raw-initializer
 /// provenance captured before graph rewrites.
@@ -85,6 +100,18 @@ pub fn load_onnx_with_config<P: AsRef<Path>>(
     path: P,
     config: &OnnxLoadConfig,
 ) -> Result<OnnxModel> {
+    load_onnx_with_config_and_root_policy(path, config).map(|(model, _)| model)
+}
+
+/// Load once and return the actual pre-fold root policy of that exact model.
+/// A selected raw load failure is propagated; no folded retry or map reuse.
+pub fn load_onnx_with_config_and_root_policy<P: AsRef<Path>>(
+    path: P,
+    config: &OnnxLoadConfig,
+) -> Result<(OnnxModel, RootCutLoadReceipt)> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Load);
+    ny_core::phase_cost::add_units(ny_core::phase_cost::CostPhase::Load, 1);
     let path = path.as_ref();
     info!("Loading ONNX model from: {}", path.display());
 
@@ -100,16 +127,19 @@ pub fn load_onnx_with_config<P: AsRef<Path>>(
     reject_custom_handlers_for_provenance(&registry, capture_provenance)?;
 
     let (
-        layers,
-        weights,
-        inputs,
-        outputs,
-        tensor_producer,
-        constant_tensors,
-        tensor_shapes,
-        opset_imports,
-        original_float32_initializers,
-    ) = parse::parse_onnx_file(
+        (
+            layers,
+            weights,
+            inputs,
+            outputs,
+            tensor_producer,
+            constant_tensors,
+            tensor_shapes,
+            opset_imports,
+            original_float32_initializers,
+        ),
+        root_policy,
+    ) = parse::parse_onnx_file_with_root_policy(
         path,
         &registry,
         config.shape_inference_policy(),
@@ -117,6 +147,7 @@ pub fn load_onnx_with_config<P: AsRef<Path>>(
         config.has_optimization_flag(OnnxOptimizationFlag::MergeLinear),
         config.batch_norm_folding_policy(),
         capture_provenance,
+        config.qdq_activation_relaxation_enabled(),
     )?;
 
     let param_count = weights.iter().map(|(_, w)| w.len()).sum();
@@ -155,7 +186,7 @@ pub fn load_onnx_with_config<P: AsRef<Path>>(
         opset_imports,
     };
     enforce_authored_float32_admission(&model, config)?;
-    Ok(model)
+    Ok((model, root_policy))
 }
 
 /// Read the logical ONNX protobuf bytes from a plain `.onnx` or gzip-wrapped
@@ -211,6 +242,7 @@ pub fn load_onnx_bytes_with_config(
         config.has_optimization_flag(OnnxOptimizationFlag::MergeLinear),
         config.batch_norm_folding_policy(),
         capture_provenance,
+        config.qdq_activation_relaxation_enabled(),
     )?;
 
     let param_count = weights.iter().map(|(_, w)| w.len()).sum();

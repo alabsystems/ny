@@ -7,11 +7,11 @@
 // fast.rs adds Network::propagate_crown_fast and Network::propagate_crown_with_linear.
 mod fast;
 
-// Bounds validation predicates (Packet 1 of crown.rs decomposition, #3868).
+// Bounds validation predicates.
 mod bounds_validation;
 pub(crate) use bounds_validation::has_degraded_bounds;
 
-// CROWN output tightening via forward-bound intersection (Packet 2, #3880).
+// CROWN output tightening via forward-bound intersection.
 mod tighten;
 pub(crate) use tighten::{
     tighten_crown_output, tighten_crown_output_with_deadline,
@@ -26,24 +26,23 @@ pub(crate) use gpu_extraction::{
     GpuReluAffineVariant,
 };
 
-// Dense backward-step dispatch and materialization budget helpers (Packet 4, #4162).
+// Dense backward-step dispatch and materialization budget helpers.
 pub(crate) mod backward_step;
 
-// Patches backward step dispatch (Packet 1 of crown.rs three-module extraction, #4005).
+// Patches backward step dispatch.
 pub(crate) mod patches_step;
 pub(crate) use patches_step::{
     crown_backward_step_patches, crown_backward_step_patches_spec_crown,
-    crown_backward_step_patches_with_deadline_authority_and_flat_bias_policy,
-    SpecPatchesStepError,
+    crown_backward_step_patches_with_deadline_authority_and_flat_bias_policy, SpecPatchesStepError,
 };
 
-// Public CROWN entry-point wrappers (Packet B of #4233 crown.rs decomposition).
+// Public CROWN entry-point wrappers.
 mod entry_points;
 
-// SDP-CROWN ℓ2 ball propagation (Packet C of #4233 crown.rs decomposition).
+// SDP-CROWN ℓ2 ball propagation.
 mod sdp;
 
-// Batched N-D CROWN propagation (Packet D of #4233 crown.rs decomposition).
+// Batched N-D CROWN propagation.
 mod batched;
 
 use crate::bounds::patches::{CrownBounds, PatchesLinearBounds, PatchesMaterializationPurpose};
@@ -173,7 +172,7 @@ fn try_gpu_identity_spec(output_dim: usize) -> Option<Vec<f32>> {
 }
 
 impl Network {
-    /// Core CROWN implementation with optional pre-computed IBP bounds (#3397).
+    /// Core CROWN implementation with optional pre-computed IBP bounds.
     #[instrument(skip(self, input, precomputed_ibp, engine, deadline), fields(num_layers = self.layers.len(), input_shape = ?input.shape()))]
     fn propagate_crown_core(
         &self,
@@ -183,6 +182,7 @@ impl Network {
         deadline: Option<Instant>,
         crown_backward_layers: Option<usize>,
     ) -> Result<BoundedTensor> {
+        self.ensure_proof_eligible()?;
         // Disable the L2/Cauchy–Schwarz lever for the sequential-Network
         // fixed-slope CROWN scope (chokepoint for all sequential CROWN entry
         // points). The CROWN-IBP intermediate collection and the deadline IBP
@@ -192,7 +192,7 @@ impl Network {
         if self.layers.is_empty() {
             return clone_crown_forward_fallback(input, deadline);
         }
-        // Deadline check before expensive CROWN-IBP collection (#3328). An
+        // Deadline check before expensive CROWN-IBP collection. An
         // owned precomputed IBP vector already contains the certified output,
         // so that result can be moved out in O(1) without doing any post-expiry
         // work. A fresh request has no such publishable artifact and remains a
@@ -228,7 +228,7 @@ impl Network {
 
         // Step 1: Collect CROWN-IBP intermediate bounds.
         // When pre-computed IBP bounds are available, skip internal IBP (~59s savings
-        // for soundnessbench). Otherwise, compute IBP internally as before (#3397).
+        // for soundnessbench). Otherwise, compute IBP internally as before.
         let layer_bounds = match precomputed_ibp {
             Some(ibp) => {
                 self.collect_crown_ibp_bounds_with_precomputed_ibp(input, ibp, engine, deadline)?
@@ -284,6 +284,7 @@ impl Network {
         deadline: Option<Instant>,
         crown_backward_layers: Option<usize>,
     ) -> Result<BoundedTensor> {
+        self.ensure_proof_eligible()?;
         if self.layers.is_empty() {
             return clone_crown_forward_fallback(input, deadline);
         }
@@ -332,7 +333,6 @@ impl Network {
         // (propagate_crown_partial_with_engine in ibp.rs), where each layer's
         // output IS 3D spatial and Patches mode activates automatically.
         //
-        // Reference: designs/2026-02-28-patches-mode-wrapper-enum-design.md
         // output >= 1 * output + 0, output <= 1 * output + 0
         let has_conv2d = self.layers.iter().any(|l| matches!(l, Layer::Conv2d(_)));
         // `crown_backward_layers` exists to escape the Conv2d backward cost; on a
@@ -382,7 +382,7 @@ impl Network {
             )?)
         };
 
-        // GPU fast-path (#3397): if the engine supports full GPU CROWN backward and all
+        // GPU fast-path: if the engine supports full GPU CROWN backward and all
         // layers are GPU-compatible (Linear + ReLU), run the entire backward + concretize
         // on GPU. Only the final bounds are read back (eliminates N-1 host roundtrips).
         // Soundness gate (#vnncomp-gpu-crown-soundness): when soundness is required
@@ -538,11 +538,11 @@ impl Network {
         }
 
         // Step 3: Propagate backward through each layer using Patches dispatch
-        // Track peak memory and mode transitions for Patches diagnostics (#2613).
+        // Track peak memory and mode transitions for Patches diagnostics.
         let mut peak_memory_bytes: usize = crown_bounds.memory_bytes();
         for (backward_steps, (i, layer)) in self.layers.iter().enumerate().rev().enumerate() {
-            // Deadline check before each layer backward pass (#3328).
-            // Reuse already-computed output_bounds instead of re-running IBP (#3397).
+            // Deadline check before each layer backward pass.
+            // Reuse already-computed output_bounds instead of re-running IBP.
             if let Some(d) = deadline {
                 if Instant::now() >= d {
                     info!(
@@ -631,7 +631,7 @@ impl Network {
             )? {
                 CrownStepResult::Continue => {}
                 CrownStepResult::IbpFallback(fallback) => {
-                    // Reuse already-computed output_bounds instead of re-running IBP (#3397).
+                    // Reuse already-computed output_bounds instead of re-running IBP.
                     info!(
                         "CROWN: {} — reusing CROWN-IBP output bounds",
                         fallback.details
@@ -669,7 +669,7 @@ impl Network {
         if let Some(estimate) =
             dense_materialization_budget_estimate(&crown_bounds, "final_concretization")?
         {
-            // Reuse already-computed output_bounds instead of re-running IBP (#3397).
+            // Reuse already-computed output_bounds instead of re-running IBP.
             log_dense_materialization_budget_fallback("CROWN", estimate, None, None);
             return clone_crown_forward_fallback(output_bounds, deadline);
         }
@@ -698,7 +698,7 @@ impl Network {
             Err(error) => return Err(error),
         };
 
-        // Step 5+6: Degrade check + forward-bound tightening (#3043 dedup).
+        // Step 5+6: Degrade check + forward-bound tightening.
         match tighten_crown_output_with_deadline(crown_output, output_bounds, "CROWN", deadline) {
             Ok(bounds) => Ok(bounds),
             Err(NyError::CpuMemoryExceeded { .. } | NyError::DeadlineExceeded(_)) => {

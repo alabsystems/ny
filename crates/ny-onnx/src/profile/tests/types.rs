@@ -133,6 +133,7 @@ fn test_layer_profile_is_choke_point() {
         cumulative_expansion: 50.0,
         output_shape: vec![10],
         num_elements: 10,
+        unstable_count: 0,
         status: BoundStatus::Moderate,
     };
 
@@ -157,6 +158,7 @@ fn test_profile_result_layers_by_growth() {
                 cumulative_expansion: 0.5,
                 output_shape: vec![10],
                 num_elements: 10,
+                unstable_count: 0,
                 status: BoundStatus::Tight,
             },
             LayerProfile {
@@ -170,6 +172,7 @@ fn test_profile_result_layers_by_growth() {
                 cumulative_expansion: 5.0,
                 output_shape: vec![10],
                 num_elements: 10,
+                unstable_count: 0,
                 status: BoundStatus::Moderate,
             },
             LayerProfile {
@@ -183,6 +186,7 @@ fn test_profile_result_layers_by_growth() {
                 cumulative_expansion: 15.0,
                 output_shape: vec![10],
                 num_elements: 10,
+                unstable_count: 0,
                 status: BoundStatus::Wide,
             },
         ],
@@ -219,6 +223,7 @@ fn test_profile_result_choke_points() {
                 cumulative_expansion: 0.5,
                 output_shape: vec![10],
                 num_elements: 10,
+                unstable_count: 0,
                 status: BoundStatus::Tight,
             },
             LayerProfile {
@@ -232,6 +237,7 @@ fn test_profile_result_choke_points() {
                 cumulative_expansion: 50.0,
                 output_shape: vec![10],
                 num_elements: 10,
+                unstable_count: 0,
                 status: BoundStatus::Wide,
             },
         ],
@@ -269,6 +275,7 @@ fn test_profile_result_problematic_layers() {
                 cumulative_expansion: 1.0,
                 output_shape: vec![10],
                 num_elements: 10,
+                unstable_count: 0,
                 status: BoundStatus::Tight,
             },
             LayerProfile {
@@ -282,6 +289,7 @@ fn test_profile_result_problematic_layers() {
                 cumulative_expansion: 50.0,
                 output_shape: vec![10],
                 num_elements: 10,
+                unstable_count: 0,
                 status: BoundStatus::Moderate,
             },
             LayerProfile {
@@ -295,6 +303,7 @@ fn test_profile_result_problematic_layers() {
                 cumulative_expansion: 10000.0,
                 output_shape: vec![10],
                 num_elements: 10,
+                unstable_count: 0,
                 status: BoundStatus::Wide,
             },
             LayerProfile {
@@ -308,6 +317,7 @@ fn test_profile_result_problematic_layers() {
                 cumulative_expansion: f32::INFINITY,
                 output_shape: vec![10],
                 num_elements: 10,
+                unstable_count: 0,
                 status: BoundStatus::Overflow,
             },
         ],
@@ -342,6 +352,7 @@ fn test_profile_result_summary_basic() {
             cumulative_expansion: 5.0,
             output_shape: vec![10],
             num_elements: 10,
+            unstable_count: 0,
             status: BoundStatus::Tight,
         }],
         input_epsilon: 0.01,
@@ -377,6 +388,7 @@ fn test_profile_result_summary_with_overflow() {
             cumulative_expansion: f32::INFINITY,
             output_shape: vec![10],
             num_elements: 10,
+            unstable_count: 0,
             status: BoundStatus::Overflow,
         }],
         input_epsilon: 0.01,

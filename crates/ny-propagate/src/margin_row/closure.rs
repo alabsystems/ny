@@ -362,6 +362,34 @@ const NO_ESCALATE_AFTER_FRAC: f64 = 0.75;
 /// each expansion this much dearer.
 const ESCALATION_COST_MULTIPLE: f64 = 3.0;
 
+/// #escalation-price-cap — ceiling, in seconds, on what one tier escalation may
+/// be quoted at.
+///
+/// # Why this exists
+///
+/// The affordability check prices an escalation at
+/// `ESCALATION_COST_MULTIPLE * 2 * window * secs_per_exp`, which ties the price
+/// to the OBSERVATION WINDOW. Those two want opposite values and the conflict is
+/// measured (2026-09-16, cifar100 resnet_large, official 100 s):
+///
+/// | `window` | quoted price | closure estimate |
+/// |---|---|---|
+/// | 16 (shipped) | `3*2*16*1.432` = **137.5 s** vs a 100 s budget — the ladder can NEVER escalate | stable |
+/// | 2 | 17.2 s — affordable | ~3 expansions — NOISE: both healthy rows escalated at `closure=0.333` then recovered to 0.62-0.67 |
+///
+/// So at the shipped value the ladder diagnosed a row as failing
+/// (`closure=0.130 < thresh 0.40`) and refused to act on its own finding:
+/// `HOLD: unaffordable: needs 137.5s at 1.432s/exp, 20.3s left`.
+///
+/// Capping the QUOTE decouples the two: the window can be large enough for a
+/// stable closure estimate while the price stays payable. The check keeps its
+/// teeth — an escalation with less than this much wall left is still refused.
+///
+/// `f64::INFINITY` disables the cap and is byte-identical to the historical
+/// pricing.
+// SHIPPED DEFAULT: inert. `the_default_cap_is_inert` enforces this.
+const ESCALATION_PRICE_CAP_SECS: f64 = f64::INFINITY;
+
 /// Rollback trigger: the escalation is reverted when the window after it both
 /// failed to raise closure and ran this many times slower per expansion.
 const ROLLBACK_SLOWDOWN: f64 = 4.0;
@@ -499,7 +527,11 @@ impl ClosureMonitor {
         // A fresh escalation must be able to afford at least two more windows
         // at ESCALATION_COST_MULTIPLE the current per-expansion cost, or it can
         // only pay a bill it will never collect on.
-        let need_secs = ESCALATION_COST_MULTIPLE * 2.0 * self.window as f64 * secs_per_exp;
+        // #escalation-price-cap: quote the window-based estimate, then cap it, so
+        // a window sized for a STABLE closure estimate cannot price the ladder
+        // out of ever escalating. See `ESCALATION_PRICE_CAP_SECS`.
+        let quoted = ESCALATION_COST_MULTIPLE * 2.0 * self.window as f64 * secs_per_exp;
+        let need_secs = quoted.min(ESCALATION_PRICE_CAP_SECS);
         let unaffordable = remaining.is_some_and(|r| r < need_secs);
 
         if healthy || at_top || self.frozen || late || unaffordable {
@@ -647,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_closure_row_climbs_the_whole_ladder_and_then_holds() {
+    fn a_low_closure_row_climbs_the_whole_ladder_and_then_holds() {
         let _g = LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -655,8 +687,18 @@ mod tests {
         let mut m = ClosureMonitor::with_params(24, 16, 0.40, TIER_TOP);
         let mut seen = Vec::new();
         for e in 0..400 {
-            // Zero closure, constant cost: the measured ny signature.
-            match m.observe(e, 2 * e, 0, e, 0.3 * e as f64, Some(1000.0)) {
+            // Window closure 0.25 (created 2 per expansion, closed 1 per 2
+            // expansions), constant cost. This loop was rewritten off 0.000 by
+            // 5d87b7152 while 756e2df14's escalation BAND was live; that band
+            // was reverted in 4260979e1 and `ESCALATION_CLOSURE_FLOOR` no longer
+            // exists, so 0.000 would work here again. Keeping 0.25 regardless:
+            // the subject HERE is the LADDER -- one tier per window, then the
+            // cap -- and stating that in the input rather than relying on a
+            // trigger's lower edge is what made this test survive the band's
+            // arrival AND its removal unchanged. A constant s/expansion keeps
+            // ROLLBACK_SLOWDOWN (4x) out of it even though each window repeats
+            // the previous escalation's closure.
+            match m.observe(e, 2 * e, e / 2, e, 0.3 * e as f64, Some(1000.0)) {
                 Decision::Escalate(t) => seen.push(t),
                 Decision::Rollback(t) => panic!("unexpected rollback to {t}"),
                 _ => {}
@@ -709,10 +751,17 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset();
         let mut m = ClosureMonitor::with_params(24, 16, 0.40, TIER_TOP);
-        // Zero closure, but only 1 s left and 1 s/expansion: the escalation
-        // needs 3 * 2 * 16 * 1 = 96 s it does not have.
+        // 90 s left at 1 s/expansion: the escalation needs
+        // ESCALATION_COST_MULTIPLE * 2 * 16 * 1 = 96 s it does not have.
+        //
+        // Closure is 0.25, inside the band 756e2df14 introduced, and 90 s left
+        // against at most 199 s spent never reaches NO_ESCALATE_AFTER_FRAC.
+        // Both matter: driven at the old `closed = 0` and `Some(1.0)` this test
+        // was refused by the floor AND by lateness as well as by affordability,
+        // and stayed green with `unaffordable` planted out. Affordability is now
+        // the ONLY thing holding this row.
         for e in 0..200 {
-            let d = m.observe(e, 2 * e, 0, e, e as f64, Some(1.0));
+            let d = m.observe(e, 2 * e, e / 2, e, e as f64, Some(90.0));
             assert!(matches!(d, Decision::Idle | Decision::Hold), "{d:?}");
         }
         assert_eq!(tier(), TIER_BASE);
@@ -726,10 +775,14 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset();
         let mut m = ClosureMonitor::with_params(24, 16, 0.40, TIER_TOP);
-        // 90 s spent, 10 s left: 90% of the lane, past NO_ESCALATE_AFTER_FRAC.
-        // Cheap expansions, so affordability is not what refuses this.
+        // ~90 s spent, 10 s left: 90% of the lane, past NO_ESCALATE_AFTER_FRAC.
+        // After the first window each expansion costs 0.01 s, so the escalation
+        // bill is ~0.96 s against 10 s left and affordability is NOT what
+        // refuses these. Closure is 0.25, inside the band 756e2df14 introduced:
+        // at the old `closed = 0` the floor refused every window, and this test
+        // stayed green with `late` planted out.
         for e in 0..200 {
-            let d = m.observe(e, 2 * e, 0, e, 90.0, Some(10.0));
+            let d = m.observe(e, 2 * e, e / 2, e, 90.0 + 0.01 * e as f64, Some(10.0));
             assert!(matches!(d, Decision::Idle | Decision::Hold), "{d:?}");
         }
         assert_eq!(tier(), TIER_BASE);
@@ -743,16 +796,24 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset();
         let mut m = ClosureMonitor::with_params(8, 8, 0.40, TIER_TOP);
-        // Window 1: zero closure at 0.1 s/expansion -> escalate to tier 1.
-        let d = m.observe(8, 16, 0, 16, 0.8, Some(1000.0));
+        // Every window here closes 0.25 of what it created, INSIDE the
+        // escalation band 756e2df14 introduced. Driven at the old 0.000 this
+        // test never gets its first escalation at all -- the floor refuses it --
+        // so it would pin the floor instead of the rollback and the freeze.
+        // Window 1: closure 0.25 at 0.1 s/expansion -> escalate to tier 1.
+        let d = m.observe(8, 16, 4, 16, 0.8, Some(1000.0));
         assert_eq!(d, Decision::Escalate(TIER_BETA));
-        // Window 2: still zero closure, and 10x dearer -> roll back and freeze.
-        let d = m.observe(16, 32, 0, 32, 0.8 + 8.0, Some(1000.0));
+        // Window 2: closure did not RISE (0.25 again) and each expansion is 10x
+        // dearer -> roll back and freeze. That is the rollback contract exactly:
+        // it reverts an escalation that failed to raise closure, at whatever
+        // level that closure sits.
+        let d = m.observe(16, 32, 8, 32, 0.8 + 8.0, Some(1000.0));
         assert_eq!(d, Decision::Rollback(TIER_BASE));
         assert_eq!(tier(), TIER_BASE);
-        // Frozen: no further escalation however bad closure gets.
+        // Frozen: no further escalation, with closure held inside the band so
+        // it is the FREEZE doing the refusing and not the floor.
         for e in 24..200 {
-            let d = m.observe(e, 2 * e, 0, e, 8.8 + 0.1 * e as f64, Some(1000.0));
+            let d = m.observe(e, 2 * e, e / 2, e, 8.8 + 0.1 * e as f64, Some(1000.0));
             assert!(matches!(d, Decision::Idle | Decision::Hold), "{d:?}");
         }
         assert_eq!(tier(), TIER_BASE);
@@ -767,11 +828,47 @@ mod tests {
         reset();
         let mut m = ClosureMonitor::with_params(8, 8, 0.40, TIER_BETA);
         for e in 0..200 {
-            let _ = m.observe(e, 2 * e, 0, e, 0.1 * e as f64, Some(1000.0));
+            // Window closure 0.25, inside the band 756e2df14 introduced, so what
+            // stops this climb is `max_tier` -- this test's subject -- and not
+            // the new escalation floor. At the old 0.000 the floor refuses every
+            // window and `tier() == TIER_BETA` would never be reached at all.
+            // Constant 0.1 s/expansion keeps ROLLBACK_SLOWDOWN out of it.
+            let _ = m.observe(e, 2 * e, e / 2, e, 0.1 * e as f64, Some(1000.0));
         }
         assert_eq!(tier(), TIER_BETA);
+        assert_eq!(
+            m.escalations(),
+            1,
+            "the cap must stop the ladder after exactly one tier, not merely \
+             leave it reading TIER_BETA"
+        );
         reset();
     }
+
+    // REMOVED: `a_zero_closure_row_is_refused_a_fresh_escalation_
+    // below_the_floor`, which pinned the LOWER edge of the escalation band
+    // (`ESCALATION_CLOSURE_FLOOR = 0.08`) added by 756e2df14. The band's code
+    // was reverted (4260979e1) and this test was left behind, failing.
+    //
+    // Deleting rather than restoring the band, on the revert's own reasoning
+    // (which stands and is not being re-litigated here): the floor blocked
+    // exactly the zero-closure condition the ladder exists to act on, and it had
+    // ZERO effect on any ARMED configuration — 0 refusals across all 80 banked
+    // cifar100 rows, with tinyimagenet unarmed (refused at net -20 in c3dd9237f).
+    // A test may not pin behaviour the codebase deliberately does not have.
+    //
+    // THE MEASUREMENT IS KEPT, per that revert's explicit intent, because it is
+    // the reason to revisit this if tinyimagenet is ever armed: closure at obs=1
+    // separated outcomes on tinyimagenet (losses 0.048/0.000/0.000; conversions
+    // and speedups 0.115-0.279), and the floor recovered idx_8756 and idx_6458
+    // 2/2 each. On all three losing rows closure ROSE after the escalation
+    // (0.000 -> 0.50-0.72) — the escalation worked and still lost the row,
+    // because a tier makes each expansion 1.8-2.3x dearer and a row with no
+    // drain to accelerate pays that throughput tax out of the budget it was
+    // going to recover on. That class is invisible to `ROLLBACK_SLOWDOWN`, which
+    // by construction only reverts escalations that failed to RAISE closure.
+    // Landing it again must come WITH a deliberate rewrite of the ladder's
+    // contract tests, not by silently reddening them.
 
     #[test]
     fn tier_names_cover_the_ladder() {
@@ -780,5 +877,86 @@ mod tests {
         assert_eq!(beta_iters_floor(), 0);
         assert_eq!(tier_name(TIER_BETA_DEEP), "beta_deep");
         assert_eq!(tier_name(TIER_EPOCH), "beta_deep+epoch");
+    }
+}
+
+#[cfg(test)]
+mod escalation_price_cap_tests {
+    use super::{ESCALATION_COST_MULTIPLE, ESCALATION_PRICE_CAP_SECS};
+
+    /// The quote, exactly as `decide` computes it.
+    fn quote(window: usize, secs_per_exp: f64) -> f64 {
+        ESCALATION_COST_MULTIPLE * 2.0 * window as f64 * secs_per_exp
+    }
+    fn priced(window: usize, secs_per_exp: f64, cap: f64) -> f64 {
+        quote(window, secs_per_exp).min(cap)
+    }
+
+    /// The MEASURED impossibility this cap exists to remove
+    /// (cifar100 resnet_large idx_8589_sidx_3105, 2026-09-16):
+    /// `HOLD: unaffordable: needs 137.5s at 1.432s/exp, 20.3s left`.
+    #[test]
+    fn the_shipped_window_prices_resnet_large_out_of_escalating() {
+        let q = quote(16, 1.432);
+        assert!(
+            (q - 137.5).abs() < 0.5,
+            "the quote should reproduce the measured 137.5s, got {q:.1}"
+        );
+        assert!(
+            q > 100.0,
+            "at window=16 one escalation costs {q:.1}s against a 100s BUDGET — the \
+             ladder cannot escalate on this family at any warmup, which is the defect"
+        );
+        // And it is unaffordable against the wall actually remaining at that point.
+        assert!(
+            q > 20.3,
+            "measured: only 20.3s remained when the quote was 137.5s"
+        );
+    }
+
+    /// Capping the quote makes the SAME situation affordable, without touching
+    /// the window — so the closure estimate keeps its stability.
+    #[test]
+    fn capping_the_quote_decouples_price_from_window_stability() {
+        let cap = 20.0;
+        let p = priced(16, 1.432, cap);
+        assert_eq!(p, cap, "the cap must bind at window=16");
+        assert!(
+            p < 20.3,
+            "capped at {p:.1}s the escalation is affordable against the 20.3s that \
+             remained, while window stays 16 for a stable closure estimate"
+        );
+        // The small window that WAS affordable stays unaffected by the cap: its
+        // quote is already below it, so this change cannot make the noisy
+        // configuration any noisier.
+        assert_eq!(priced(2, 1.432, cap), quote(2, 1.432));
+        assert!(quote(2, 1.432) < cap);
+    }
+
+    /// The check must keep its teeth: a cap is a ceiling on the QUOTE, not a
+    /// licence to escalate with no wall left.
+    #[test]
+    fn the_cap_does_not_make_escalation_unconditional() {
+        let cap = 20.0;
+        let need = priced(16, 1.432, cap);
+        // 5s left is still less than the capped price => still refused.
+        assert!(
+            5.0 < need,
+            "with only 5s left the escalation must still be refused"
+        );
+    }
+
+    /// Default ships INERT: the cap is infinity, so every quote is unchanged and
+    /// the pricing is byte-identical to the historical behaviour.
+    #[test]
+    fn the_default_cap_is_inert() {
+        assert!(ESCALATION_PRICE_CAP_SECS.is_infinite());
+        for &(w, spe) in &[(16usize, 1.432f64), (2, 1.432), (16, 0.4), (1, 10.0)] {
+            assert_eq!(
+                priced(w, spe, ESCALATION_PRICE_CAP_SECS),
+                quote(w, spe),
+                "default cap must not change the quote at window={w} secs_per_exp={spe}"
+            );
+        }
     }
 }

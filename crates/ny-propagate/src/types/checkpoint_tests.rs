@@ -137,7 +137,7 @@ fn test_verification_checkpoint_into_result() {
     assert!((result.max_sensitivity - 20.0).abs() < 1e-6);
 }
 
-/// Regression test for #2808: into_result() must return Err on incomplete checkpoints.
+/// Regression test: into_result() must return Err on incomplete checkpoints.
 /// Before fix, into_result() silently produced a BlockWiseResult with
 /// blocks.len() < total_blocks, giving callers inconsistent data.
 #[ntest::timeout(5000)]

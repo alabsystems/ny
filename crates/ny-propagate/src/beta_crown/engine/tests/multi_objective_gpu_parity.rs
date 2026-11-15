@@ -9,8 +9,7 @@
 //! These tests ensure the GPU batched path produces results consistent
 //! with the CPU sequential baseline (engine=None, batch_size=1).
 //!
-//! Part of #3397 (GPU CROWN backward).
-//! Part of #3872 (historical cuts-enabled GPU batched coverage, now quarantined).
+//! The historical cuts-enabled GPU batched coverage is now quarantined.
 
 use super::prelude::*;
 use ny_core::NaiveCpuGemmEngine;

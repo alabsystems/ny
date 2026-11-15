@@ -116,13 +116,13 @@ pub fn profile_bounds_graph(
         // Propagate bounds through this node.
         // Concat MUST be checked before is_binary() because Layer::is_binary()
         // returns true for Concat. Without this ordering, n-ary Concat (3+ inputs)
-        // would silently drop inputs beyond the first two. (#2405)
+        // would silently drop inputs beyond the first two.
         let mut propagation_failed = node
             .inputs()
             .iter()
             .any(|input_name| propagation_failed_nodes.contains(input_name));
         let output = if let Layer::Concat(concat) = node.layer() {
-            // Handle constant_inputs interleaving (same pattern as dispatch.rs). (#2405)
+            // Handle constant_inputs interleaving (same pattern as dispatch.rs).
             let owned_inputs: Vec<BoundedTensor> = if let Some(ref ci) = concat.constant_inputs {
                 let mut graph_idx = 0;
                 ci.iter()
@@ -259,6 +259,12 @@ pub fn profile_bounds_graph(
             cumulative_expansion,
             output_shape: output.shape().to_vec(),
             num_elements: output.lower().len(),
+            unstable_count: output
+                .lower()
+                .iter()
+                .zip(output.upper().iter())
+                .filter(|(l, u)| **l < 0.0 && **u > 0.0)
+                .count(),
             status,
         });
 

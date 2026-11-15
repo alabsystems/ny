@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! AC4 validation for #1764: End-to-end f64 verification on a soundnessbench-style instance.
+//! End-to-end f64 verification on a soundnessbench-style instance.
 //!
 //! soundnessbench is a VNN-COMP benchmark designed to detect f32 rounding errors.
 //! These tests construct small FC+ReLU networks (matching soundnessbench architecture)
@@ -13,7 +13,6 @@
 //!   4. Can verify properties that f32 alone cannot
 //!   5. Converts back to f32 with sound directed rounding
 //!
-//! Reference: designs/2026-03-04-f64-propagation-path.md (AC4)
 //! Reference: alpha-beta-CROWN `double_fp: true` (abcrown.py:81-82)
 
 use ndarray::{arr1, arr2, Array1, Array2};

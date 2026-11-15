@@ -235,7 +235,59 @@ pub(crate) struct FlightRecord {
     pub(crate) ambient_env: BTreeMap<String, String>,
     /// Two-stage declared-input evidence. See [`LeverReceiptState`].
     pub(crate) levers: LeverReceiptState,
+    /// #stop-accounting — the exact terminal `[stop]` line that [`FlightRecorder::finish`]
+    /// printed on stderr, duplicated into the artifact because the printed copy
+    /// does not survive the sweep: `ny benchmarks run` retains only a bounded
+    /// stderr tail and surfaces it solely on `Error`, so for every banked row
+    /// the line existed and was then discarded. Absent on a record whose run
+    /// was cut off before `finish` ran — the hard-stop path carries
+    /// [`RecordStatus::PartialHardStop`] instead, which is its own stop
+    /// evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) stop: Option<String>,
+    /// #soundness-spine M2a: the proof profile the entry point froze
+    /// (`{mode, source}`). Added WITHOUT a schema bump, like `build_id`: an
+    /// additive field read by key, absent on records written before the entry
+    /// point resolved one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) proof_profile: Option<ProofProfileRecord>,
+    /// #router-r1: the router's bounded record (policy input, plan,
+    /// retrospective checkpoints, optimizer rules, done summary), written by
+    /// [`FlightRecorder::note_router`] AFTER publication. Additive, read by
+    /// key, absent when the router is off — so an off run's sidecar is
+    /// unchanged byte for byte. `ny vnncomp plan --replay` reads it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) router: Option<serde_json::Value>,
+    /// #phase-cost: the run's per-phase COST CENSUS (`ny_core::phase_cost`,
+    /// schema `ny-core/phase-cost/v1`): per phase the occupied wall, thread
+    /// time, enters, work units and sampled RSS, plus run-level work counters.
+    /// Added WITHOUT a schema bump, like `build_id` and `router`: additive, read
+    /// by key, and present only on a record whose entry point attached the
+    /// census ([`FlightRecorder::attach_phase_cost`], the scored `ny vnncomp
+    /// v1` path) at a level other than `off` — every other recorder's sidecar
+    /// is unchanged byte for byte. Taken at serialization time, so a hard-stop
+    /// flush carries the phases that were still OPEN at the stop.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) phase_cost: Option<ny_core::phase_cost::PhaseCostSnapshot>,
     pub(crate) events: Vec<FlightEvent>,
+}
+
+/// #soundness-spine M2a: the flight record's copy of the frozen proof profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct ProofProfileRecord {
+    /// `proof` or `competition`.
+    pub(crate) mode: &'static str,
+    /// `entry` or `cli`.
+    pub(crate) source: &'static str,
+}
+
+impl From<ny_core::proof_profile::ResolvedProofProfile> for ProofProfileRecord {
+    fn from(profile: ny_core::proof_profile::ResolvedProofProfile) -> Self {
+        Self {
+            mode: profile.mode.token(),
+            source: profile.source.token(),
+        }
+    }
 }
 
 struct RecorderState {
@@ -266,6 +318,20 @@ struct RecorderState {
     /// a row that quit on a depth cap with 94% of its budget unspent was
     /// indistinguishable in the record from one that ran out of clock.
     stop_reason: Option<String>,
+    /// #phase-cost: whether this record carries the process cost census. Set
+    /// only by the scored entry point, so test and auxiliary recorders keep
+    /// their exact historical key set.
+    attach_phase_cost: bool,
+}
+
+/// #phase-cost: the census to serialize, or `None` when not attached or off.
+/// `read_proc` adds the process `VmHWM`; the hard-stop flush passes `false`.
+fn phase_cost_for_record(
+    attached: bool,
+    read_proc: bool,
+) -> Option<ny_core::phase_cost::PhaseCostSnapshot> {
+    (attached && ny_core::phase_cost::level() != ny_core::phase_cost::DetailLevel::Off)
+        .then(|| ny_core::phase_cost::snapshot(read_proc))
 }
 
 /// Filter an arbitrary `(name, value)` stream down to the ambient flags the
@@ -360,6 +426,10 @@ impl FlightRecorder {
                 ambient_env_schema: AMBIENT_ENV_SCHEMA,
                 ambient_env: ambient_env_snapshot(),
                 levers: LeverReceiptState::NotMaterialized,
+                stop: None,
+                proof_profile: None,
+                router: None,
+                phase_cost: None,
                 events: Vec::new(),
             },
             raw_levers,
@@ -367,7 +437,18 @@ impl FlightRecorder {
             started,
             verdict: None,
             stop_reason: None,
+            attach_phase_cost: false,
         });
+    }
+
+    /// #phase-cost: attach the process cost census (`ny_core::phase_cost`) to
+    /// this record and anchor its clock. A no-op before `begin`. Called only by
+    /// the scored entry point.
+    pub(crate) fn attach_phase_cost(&self) {
+        if let Some(state) = self.lock().as_mut() {
+            state.attach_phase_cost = true;
+            ny_core::phase_cost::begin();
+        }
     }
 
     /// Materialize the layered registry receipt after typed preset/config
@@ -443,6 +524,14 @@ impl FlightRecorder {
         }
     }
 
+    /// #soundness-spine M2a: record the frozen proof profile. A no-op before
+    /// `begin`; last writer wins (there is exactly one writer, the entry point).
+    pub(crate) fn note_proof_profile(&self, profile: ny_core::proof_profile::ResolvedProofProfile) {
+        if let Some(state) = self.lock().as_mut() {
+            state.record.proof_profile = Some(profile.into());
+        }
+    }
+
     /// #stop-accounting — record the engine's own stop reason for the terminal
     /// accounting line. Last writer wins: the reason that reaches the verdict
     /// seam is the one that decided the published verdict.
@@ -454,6 +543,32 @@ impl FlightRecorder {
         if let Some(state) = self.lock().as_mut() {
             state.stop_reason = Some(reason.to_string());
         }
+    }
+
+    /// #router-r1: record the router's bounded flight record. A no-op before
+    /// `begin`; last writer wins (the one writer is the router's
+    /// after-publication finish).
+    pub(crate) fn note_router(&self, record: serde_json::Value) {
+        if let Some(state) = self.lock().as_mut() {
+            state.record.router = Some(record);
+        }
+    }
+
+    /// #router-r1: the engine's own stop reason so far (for `[router] done`).
+    pub(crate) fn stop_reason(&self) -> Option<String> {
+        self.lock()
+            .as_ref()
+            .and_then(|state| state.stop_reason.clone())
+    }
+
+    /// #router-r1: the ENTRY-TIME environment layer alone, resolved over the
+    /// raw inputs `begin` captured (never a second environment read). Used
+    /// only when the typed preset was invalid, so no frozen authority exists,
+    /// to decide whether the router was asked for at all.
+    pub(crate) fn entry_env_levers(&self) -> Option<ny_levers::LeverSet> {
+        let guard = self.lock();
+        let state = guard.as_ref()?;
+        ny_levers::LeverSet::resolve_layered(ny_levers::all(), &state.raw_levers, |_| None).ok()
     }
 
     /// A copy of the current record, for tests and the final serialization.
@@ -468,22 +583,34 @@ impl FlightRecorder {
     /// keep the verdict that was actually published, not the latest caller's
     /// opinion of it.
     pub(crate) fn finish(&self, verdict: &str) {
-        let mut accounting = None;
+        let mut line = None;
+        let mut cost_line = None;
         if let Some(state) = self.lock().as_mut() {
             if state.verdict.is_none() {
+                // #phase-cost: the census's one-line stderr observable, printed
+                // beside the stop line (the sidecar holds the full record).
+                cost_line = phase_cost_for_record(state.attach_phase_cost, false)
+                    .map(|snapshot| snapshot.summary_line());
                 state.verdict = Some(verdict.to_string());
-                accounting = Some((
+                let rendered = stop_accounting_line(
+                    verdict,
                     state.started.elapsed().as_secs_f64(),
                     state.record.budget_secs,
-                    state.stop_reason.clone(),
-                ));
+                    state.stop_reason.as_deref(),
+                );
+                // Bank the SAME rendered line the operator is about to see on
+                // stderr (#stop-accounting): the sidecar is the only copy that
+                // survives a sweep, and rendering once means the two channels
+                // can never disagree.
+                state.record.stop = Some(rendered.clone());
+                line = Some(rendered);
             }
         }
-        if let Some((wall_s, budget_secs, stop_reason)) = accounting {
-            eprintln!(
-                "{}",
-                stop_accounting_line(verdict, wall_s, budget_secs, stop_reason.as_deref())
-            );
+        if let Some(line) = line {
+            eprintln!("{line}");
+        }
+        if let Some(line) = cost_line {
+            eprintln!("{line}");
         }
     }
 
@@ -499,12 +626,19 @@ impl FlightRecorder {
         let Some(mut record) = self.snapshot() else {
             return;
         };
-        let terminal = self.lock().as_ref().and_then(|state| {
-            state
-                .verdict
-                .clone()
-                .map(|verdict| (verdict, state.started.elapsed().as_secs_f64()))
-        });
+        let (terminal, attach_phase_cost) = self
+            .lock()
+            .as_ref()
+            .map(|state| {
+                (
+                    state
+                        .verdict
+                        .clone()
+                        .map(|verdict| (verdict, state.started.elapsed().as_secs_f64())),
+                    state.attach_phase_cost,
+                )
+            })
+            .unwrap_or((None, false));
         // Terminal disposition (lifecycle v0.5): appended to the serialized
         // copy, never the live record, so the sidecar carries exactly one
         // `run_complete` however many exit paths write it. `at_secs` here is
@@ -520,6 +654,7 @@ impl FlightRecorder {
         // Close the load bracket at write time — after the verdict, so the
         // sample covers the run it describes.
         record.load_avg_at_end = crate::compute_backend::load_average();
+        record.phase_cost = phase_cost_for_record(attach_phase_cost, true);
         let path = sidecar_path(results_file);
         let body = match serde_json::to_string_pretty(&record) {
             Ok(body) => body,
@@ -623,6 +758,8 @@ impl FlightRecorder {
             }
         }
         record.load_avg_at_end = crate::compute_backend::load_average();
+        // #phase-cost: atomics only (no /proc read, no stderr) on this path.
+        record.phase_cost = phase_cost_for_record(state.attach_phase_cost, false);
         // Release the lock before touching the filesystem: a note() racing the
         // stop should never queue behind a write.
         drop(guard);
@@ -676,7 +813,41 @@ pub(crate) fn note(method: &str, status: FlightStatus, reason: Option<String>) {
 /// Convenience for the command's exit paths: record the terminal verdict on
 /// the global recorder before the sidecar write.
 pub(crate) fn finish(verdict: &str) {
+    // #mr-close-telemetry: a margin-row lane still RUNNING at the verdict (the
+    // detached concurrent worker on a timeout row, an inline worker abandoned
+    // at its slice cap) never records its terminal proof-integrity receipt, so
+    // record a snapshot of its published tally now — before the terminal
+    // verdict, and before any sidecar write. Silent when no lane is live; at
+    // most once per process, like the verdict itself.
+    static CLOSE_SNAPSHOT: std::sync::Once = std::sync::Once::new();
+    CLOSE_SNAPSHOT.call_once(
+        crate::commands::margin_row_bab::note_margin_row_close_integrity_snapshot_if_live,
+    );
     global().finish(verdict);
+    // #router-r1: the router's retrospective checkpoints and `[router] done`
+    // run HERE, strictly after the verdict was published (every exit path
+    // publishes before it calls `finish`) and before the caller's sidecar
+    // write, so the flight record carries them. A no-op when the router is
+    // off; fail-open inside.
+    crate::router::finish_after_publication(verdict);
+    emit_poll_amortisation_observable();
+}
+
+/// Print the UNCONDITIONAL `#poll-amortise` observable exactly once per
+/// process, at the first terminal verdict.
+///
+/// This is the line that distinguishes a null measurement from a dark one: it
+/// is emitted with no feature gate, no env read and no preset key, on every
+/// exit path that records a verdict (all ten call `finish`). It goes to stderr
+/// so it can never be mistaken for the `Result:` token on stdout.
+pub(crate) fn emit_poll_amortisation_observable() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "{}",
+            ny_propagate::network::crown_memory::amortisation_line()
+        );
+    });
 }
 
 /// #stop-accounting — record the engine's own stop reason on the global
@@ -785,6 +956,54 @@ mod tests {
             .as_ref()
             .and_then(|state| state.stop_reason.clone());
         assert_eq!(after.as_deref(), Some("Max depth 100 reached"));
+    }
+
+    /// #stop-accounting — the terminal `[stop]` line must survive INTO THE
+    /// SIDECAR RECORD, not only onto stderr. The sweep keeps a bounded child
+    /// stderr tail and surfaces it solely on `Error`, so the embedded flight
+    /// record is the only channel through which a banked row can carry its own
+    /// stop evidence.
+    #[test]
+    fn finish_banks_the_stop_line_on_the_flight_record() {
+        let recorder = FlightRecorder::new();
+        recorder.begin("cpu-only", "cpu-only [test]", "tllverifybench_2023", 600);
+        assert_eq!(
+            recorder.snapshot().expect("armed record").stop,
+            None,
+            "no stop line may exist before the verdict seam runs"
+        );
+        recorder.note_stop_reason("Domain limit 100000 reached");
+        recorder.finish("unknown");
+        let stop = recorder
+            .snapshot()
+            .expect("finished record")
+            .stop
+            .expect("finish must bank the stop line on the record");
+        assert!(stop.starts_with("[stop] verdict=unknown "), "{stop}");
+        assert!(stop.contains("budget_s=600"), "{stop}");
+        assert!(
+            stop.contains("reason=Domain limit 100000 reached"),
+            "{stop}"
+        );
+
+        // First verdict wins: a late second finish must not rewrite the banked
+        // line any more than it may rewrite the verdict.
+        recorder.finish("timeout");
+        let unchanged = recorder
+            .snapshot()
+            .expect("record")
+            .stop
+            .expect("stop line still banked");
+        assert_eq!(unchanged, stop);
+
+        // And the serialized sidecar carries it under its own name, where the
+        // sweep's verbatim flight embed will pick it up.
+        let json =
+            serde_json::to_value(recorder.snapshot().expect("record")).expect("serialize record");
+        assert_eq!(
+            json.get("stop").and_then(serde_json::Value::as_str),
+            Some(stop.as_str())
+        );
     }
 
     #[test]
@@ -1327,9 +1546,88 @@ mod tests {
                 "load_avg_at_begin",
                 "load_avg_at_end",
                 "schema_version",
+                // #stop-accounting: the terminal `[stop]` line, banked on the
+                // record by `finish` because the sweep discards the stderr
+                // copy. A DELIBERATE addition to the completed-row schema
+                // (additive; consumers read keys by name), present on every
+                // record whose run reached its verdict seam.
+                "stop",
             ],
             "no new key may appear on a completed record"
         );
+    }
+
+    /// #soundness-spine M2a: the entry point's frozen proof profile lands on
+    /// the sidecar as `proof_profile: {mode, source}` — a DELIBERATE additive
+    /// key, present only once an entry point recorded one.
+    #[test]
+    fn a_noted_proof_profile_is_recorded_on_the_sidecar() {
+        use ny_core::proof_profile::{EntryPoint, ProofProfile, ResolvedProofProfile};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let results_file = tmp.path().join("result.txt");
+        let recorder = FlightRecorder::new();
+        // A no-op before `begin`.
+        recorder.note_proof_profile(ResolvedProofProfile::resolve(EntryPoint::VnncompV1, None));
+        assert!(recorder.snapshot().is_none());
+        recorder.begin("cpu-only", "cpu-only [test]", "acasxu_2023", 116);
+        recorder.note_proof_profile(ResolvedProofProfile::resolve(
+            EntryPoint::VnncompV1,
+            Some(ProofProfile::Proof),
+        ));
+        recorder.finish("unsat");
+        recorder.write_sidecar(&results_file);
+        let body = std::fs::read_to_string(sidecar_path(&results_file)).expect("sidecar written");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("sidecar is valid JSON");
+        assert_eq!(json["proof_profile"]["mode"], "proof");
+        assert_eq!(json["proof_profile"]["source"], "cli");
+    }
+
+    /// #phase-cost: a record whose entry point ATTACHED the cost census carries
+    /// it as `phase_cost` (schema-tagged, with the phases this process
+    /// entered); an unattached record does not (pinned by
+    /// `a_completed_record_is_unchanged_by_the_partial_marker_field`), and
+    /// `attach_phase_cost` before `begin` is a no-op.
+    #[test]
+    fn an_attached_record_carries_the_phase_cost_census() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let results_file = tmp.path().join("result.txt");
+        let recorder = FlightRecorder::new();
+        recorder.attach_phase_cost();
+        assert!(
+            recorder.snapshot().is_none(),
+            "attach before begin must be inert"
+        );
+        recorder.begin("cpu-only", "cpu-only [test]", "acasxu_2023", 116);
+        recorder.attach_phase_cost();
+        {
+            let _g = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Publish);
+        }
+        recorder.finish("unsat");
+        recorder.write_sidecar(&results_file);
+        let body = std::fs::read_to_string(sidecar_path(&results_file)).expect("sidecar written");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("sidecar is valid JSON");
+        let cost = &json["phase_cost"];
+        assert_eq!(cost["schema"], ny_core::phase_cost::SCHEMA);
+        assert_eq!(cost["level"], "coarse");
+        assert!(
+            cost["phases"]
+                .as_array()
+                .expect("phases array")
+                .iter()
+                .any(|row| row["phase"] == "publish" && row["enters"].as_u64() >= Some(1)),
+            "{cost}"
+        );
+        assert_eq!(json["schema_version"], SCHEMA_VERSION, "no schema bump");
+        // The hard-stop flush carries it too (atomics only).
+        let hard = tmp.path().join("hard.txt");
+        let partial = FlightRecorder::new();
+        partial.begin("cpu-only", "cpu-only [test]", "acasxu_2023", 116);
+        partial.attach_phase_cost();
+        partial.write_hard_stop_sidecar(&hard, "test stop");
+        let body = std::fs::read_to_string(sidecar_path(&hard)).expect("hard-stop sidecar");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(json["phase_cost"]["schema"], ny_core::phase_cost::SCHEMA);
+        assert!(json["phase_cost"].get("process_hwm_kb").is_none());
     }
 
     #[test]

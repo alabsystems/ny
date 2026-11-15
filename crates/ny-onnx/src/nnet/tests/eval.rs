@@ -647,7 +647,7 @@ fn compare_crown_ibp_intermediates(
     first_divergent
 }
 
-/// #1898 diagnostic: Compare Network vs GraphNetwork CROWN bounds on ACAS-Xu 1_1.
+/// Diagnostic: compare Network vs GraphNetwork CROWN bounds on ACAS-Xu 1_1.
 ///
 /// Loads the same model as both a sequential `Network` and a `GraphNetwork`
 /// (via `from_sequential`), runs IBP/CROWN/batched-CROWN, and compares bounds.

@@ -5,7 +5,7 @@
 use super::*;
 
 // ---------------------------------------------------------------------------
-// Phase 6: Sequence length scaling (#3497)
+// Phase 6: Sequence length scaling
 //
 // Phases 1-5 used seq_len=16 (the export default). The model has dynamic 'T'
 // dimensions, so we can measure how the critical epsilon scales with sequence
@@ -16,8 +16,6 @@ use super::*;
 // The scaling exponent (critical_epsilon ∝ T^α) is paper-critical data for
 // understanding the practical applicability of attention monotonicity
 // verification.
-//
-// Reference: designs/2026-03-11-issue-3497-centroid-monotonicity-verification-path.md
 // ---------------------------------------------------------------------------
 
 // Sweep re-anchored 2026-07-19 for the 2026-06-03 fixture re-export (Qwen3

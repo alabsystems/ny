@@ -346,7 +346,7 @@ fn split_axis_from_spec(
             return Err(NyError::ModelLoad(format!(
                 "Split '{}': invalid axis attribute {:?}",
                 spec.name, other
-            )))
+            )));
         }
     };
     // Recorded ONNX rank of the data input. Mirrors
@@ -373,24 +373,22 @@ fn split_axis_from_spec(
         return Ok(onnx_axis);
     }
     let Some(rank) = recorded_rank else {
-        // Legacy-compatibility branch (mirrors `remap_axis_trailing`): tensors
-        // without recorded ONNX shapes come from ny-synthesized internal
-        // subgraphs written against the stripped-batch convention, for which
-        // the legacy adjustment is correct by construction.
         if onnx_axis == 0 {
             return Err(NyError::ModelLoad(format!(
                 "Split '{}': axis=0 targets batch dimension which does not exist in unbatched mode",
                 spec.name
             )));
         }
-        debug!(
-            "Split '{}': input has no recorded ONNX shape; keeping legacy batch-squeeze \
-             adjustment {} -> {} (synthesized-subgraph compatibility)",
+        return Err(NyError::UnsupportedOp(format!(
+            "Split '{}': input '{}' has no recorded ONNX shape, so positive axis {} cannot be \
+             re-expressed trailing-relative without guessing the runtime layout",
             spec.name,
-            onnx_axis,
-            onnx_axis - 1
-        );
-        return Ok(onnx_axis - 1);
+            spec.inputs
+                .first()
+                .map(String::as_str)
+                .unwrap_or("<missing>"),
+            onnx_axis
+        )));
     };
     if onnx_axis as usize >= rank {
         return Err(NyError::ModelLoad(format!(
@@ -465,7 +463,10 @@ fn resolve_split_sizes(
                             spec.name,
                             split_input_name,
                             split_tensor.shape(),
-                            weights.get(split_input_name).map(|tensor| tensor.shape()).unwrap_or(&[])
+                            weights
+                                .get(split_input_name)
+                                .map(|tensor| tensor.shape())
+                                .unwrap_or(&[])
                         )));
                     }
                     return Ok(Some(parse_integer_constant_split_sizes(
@@ -597,18 +598,57 @@ pub(super) fn handle_split_layer(
     spec: &LayerSpec,
     split_ctx: &mut SplitBuildContext<'_>,
 ) -> Result<SplitGraphBuildOutcome> {
-    let axis = split_axis_from_spec(
-        spec,
-        split_ctx.weights,
-        split_ctx.evaluated_constants,
-        split_ctx.tensor_shapes,
-    )?;
+    // Hoisted above the axis resolution because the refusal branch below needs it.
     let activation_inputs = find_activation_inputs(
         &spec.inputs,
         split_ctx.weights,
         split_ctx.constant_tensors,
         split_ctx.evaluated_constants,
     );
+
+    let axis = match split_axis_from_spec(
+        spec,
+        split_ctx.weights,
+        split_ctx.evaluated_constants,
+        split_ctx.tensor_shapes,
+    ) {
+        Ok(axis) => axis,
+        // An UNRESOLVABLE AXIS is the same situation as an unresolvable split SIZE
+        // below — the op cannot be built — and this function already models that as
+        // `Skipped`, mapping the outputs to a conservative OpaqueSkip.
+        //
+        // Propagating instead fails the WHOLE graph load, because the builder calls
+        // this on a special multi-output-Split path (`graph/builder.rs:304`) that runs
+        // BEFORE the general converter's `UnsupportedOp -> OpaqueSkip` degradation
+        // (`builder.rs:448`) and therefore never reaches it. That is what made
+        // `split_missing_sizes_skips_when_shape_unknown` fail: its Split's input is a
+        // runtime tensor with no recorded shape, which is precisely the case the test
+        // says must SKIP.
+        //
+        // Only `UnsupportedOp` degrades. `split_axis_from_spec` raises `ModelLoad` for
+        // a genuinely malformed axis (axis=0 targeting the absent batch dim, or an axis
+        // out of range for a KNOWN rank); those stay fatal, because there the model is
+        // wrong rather than merely unresolvable.
+        Err(NyError::UnsupportedOp(msg)) => {
+            warn!(
+                "Split op '{}' could not resolve its axis; skipping: {}",
+                spec.name, msg
+            );
+            let declared_shape =
+                declared_output_shape(&spec.outputs, split_ctx.tensor_shapes, split_ctx.inputs);
+            map_skipped_outputs(
+                split_ctx.graph,
+                split_ctx.tensor_to_node,
+                &spec.outputs,
+                &activation_inputs,
+                &spec.name,
+                split_ctx.last_added_node,
+                declared_shape,
+            )?;
+            return Ok(SplitGraphBuildOutcome::Skipped);
+        }
+        Err(other) => return Err(other),
+    };
 
     let Some(split_sizes) = resolve_split_sizes(
         spec,
@@ -879,6 +919,24 @@ mod split_axis0_tests {
         let shapes = HashMap::from([("x".to_string(), vec![1, 1])]);
         let err = split_axis_from_spec(&spec, &weights, &evaluated, &shapes).unwrap_err();
         assert!(err.to_string().contains("i32 range"));
+    }
+
+    #[test]
+    fn split_unknown_rank_refuses_positive_axis_instead_of_guessing() {
+        let spec = split_spec(1, "x", vec![1], vec!["a"]);
+        let error =
+            split_axis_from_spec(&spec, &WeightStore::new(), &HashMap::new(), &HashMap::new())
+                .expect_err("unknown rank must not authorize the legacy axis-minus-one guess");
+        assert!(matches!(error, NyError::UnsupportedOp(_)));
+    }
+
+    #[test]
+    fn split_unknown_rank_keeps_negative_trailing_axis() {
+        let spec = split_spec(-1, "x", vec![1], vec!["a"]);
+        let axis =
+            split_axis_from_spec(&spec, &WeightStore::new(), &HashMap::new(), &HashMap::new())
+                .expect("negative axes are layout-independent at unknown rank");
+        assert_eq!(axis, -1);
     }
 
     #[test]

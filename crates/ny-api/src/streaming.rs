@@ -187,6 +187,9 @@ fn sequential_bridge_refusal(layer: &Layer) -> Option<String> {
 #[allow(clippy::match_same_arms)] // the arms document distinct refusal reasons
 fn bridge_refusal_reason(layer: &Layer) -> Option<&'static str> {
     match layer {
+        Layer::PointLinear(_) => Some(
+            "diagnostic point-only original-weight storage lacks a qualified interval or CROWN proof-bound adapter",
+        ),
         // ================= ALLOWED =================
         // Graph: `l.propagate_linear_with_engine_and_deadline(...)`.
         // Streaming: `l.propagate_linear_with_engine(...)`. Identical with no
@@ -1061,6 +1064,78 @@ mod tests {
                 "the {kind} refusal must name the layer: {refusal}"
             );
         }
+    }
+
+    #[test]
+    fn diagnostic_point_only_storage_refuses_streaming_bridge_and_public_proof_admission() {
+        use ny_propagate::certify::work::WorkBudget;
+        use ny_propagate::layers::{PointLinearBuildPolicy, PointLinearLayer};
+        use std::time::Duration;
+
+        fn refused<T>(result: Result<T>) {
+            match result {
+                Err(NyError::UnsupportedOp(message)) => {
+                    assert!(message.contains("PointLinear") && message.contains("point-only"));
+                }
+                Err(error) => panic!("diagnostic proof admission requires UnsupportedOp: {error}"),
+                Ok(_) => panic!("diagnostic storage must not acquire streaming proof authority"),
+            }
+        }
+        let budget = WorkBudget::new(None, 1 << 20, 1 << 20, 1 << 20, 16, Duration::ZERO)
+            .expect("compact fixture budget");
+        let weights = Array2::eye(2);
+        let compact = Layer::PointLinear(
+            PointLinearLayer::from_original_view(
+                weights.view(),
+                false,
+                None,
+                PointLinearBuildPolicy {
+                    budget: &budget,
+                    deadline: None,
+                    max_resident_bytes: 1 << 20,
+                    max_scratch_bytes: 1 << 20,
+                    max_work: 1 << 20,
+                },
+            )
+            .expect("original-weight diagnostic fixture"),
+        );
+        let reason = bridge_refusal_reason(&compact).expect("compact has no proof-bound adapter");
+        assert!(reason.contains("diagnostic point-only") && reason.contains("proof-bound adapter"));
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input("diagnostic", compact));
+        graph.set_output("diagnostic");
+        refused(graph.ensure_proof_eligible());
+        refused(chain_graph_to_sequential(&graph));
+        let verifier = StreamingVerifier::new(StreamingConfig {
+            checkpoint_interval: 1,
+            ..Default::default()
+        });
+        refused(propagate_crown_streaming_graph(
+            &verifier,
+            &graph,
+            &unit_input(),
+        ));
+
+        let ordinary = linear_layer(vec![1.0, 0.0, 0.0, 1.0], 2, 2, vec![0.0, 0.0]);
+        assert!(bridge_refusal_reason(&ordinary).is_none());
+        let mut control = GraphNetwork::new();
+        control.add_node(GraphNode::from_input("ordinary", ordinary));
+        control.set_output("ordinary");
+        assert!(control.ensure_proof_eligible().is_ok());
+        assert!(chain_graph_to_sequential(&control).is_ok());
+        let bounds = propagate_crown_streaming_graph(&verifier, &control, &unit_input())
+            .expect("ordinary Linear still streams");
+        let input = unit_input();
+        assert!(bounds
+            .lower()
+            .iter()
+            .zip(input.lower())
+            .all(|(&lo, &x)| lo <= x));
+        assert!(bounds
+            .upper()
+            .iter()
+            .zip(input.upper())
+            .all(|(&hi, &x)| hi >= x));
     }
 
     /// The positive half of the contract: a genuinely-supported chain still

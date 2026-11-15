@@ -1795,7 +1795,7 @@ fn randomised_bias_hunt_separates_shipped_from_charged() {
 //
 // Worst joint per-tap flushacc demand: (1)+(3) = 2μ·M ⇒
 // `CHARGED_ACT_BIAS_SLACK_FACTOR = 4 = 2 channels × 2 margin`, exactly the
-// §D bias-combine shape (as the 2026-08-12 adversarial review predicted).
+// §D bias-combine shape.
 
 /// #flush-charge §E hardware model: the legacy arm uses only core `*`, `+`
 /// and one `>=` compare (no FMA), so the policy is expressed per OPERATION

@@ -7,7 +7,7 @@
 use ndarray::Array1;
 use ny_core::{checked_shape_product, dd::next_up_f64, NyError, Result};
 
-use super::types::{BatchNormChannelAxisHint, BatchNormLayer};
+use super::types::{BatchNormChannelAxisHint, BatchNormExactChannels, BatchNormLayer};
 
 /// Add non-negative error radii with an outward binary64 rounding step.
 ///
@@ -227,6 +227,43 @@ impl BatchNormLayer {
         let (scale, bias) = self.expand_scale_bias(&layout);
         let (scale_err, bias_err) = self.expand_errs(&layout);
         Ok((scale, bias, scale_err, bias_err))
+    }
+
+    /// #zono-exact-bn: the certified zonotope core's counterpart of
+    /// [`Self::expanded_affine_parameters`] — the binary64 centres and radii
+    /// of the exact-real enclosure (`Self::exact_affine_channels`), expanded
+    /// to one entry per flattened input position by the SAME layout decoding.
+    ///
+    /// `Ok(None)` when the layer carries no intact exact enclosure; the caller
+    /// then uses [`Self::expanded_affine_parameters`] (the binary32 affine and
+    /// its radii). A layout the binary32 expansion would refuse is refused
+    /// here too.
+    pub(crate) fn expanded_exact_affine_parameters(
+        &self,
+        input_shape: &[usize],
+        expected_total_elements: usize,
+    ) -> Result<Option<BatchNormExactChannels>> {
+        self.validate_affine_parameters()?;
+        let layout = detect_input_layout(
+            input_shape,
+            self.num_channels,
+            Some(expected_total_elements),
+            self.channel_axis_hint,
+        )?;
+        let Some(channels) = self.exact_affine_channels() else {
+            return Ok(None);
+        };
+        let expand = |values: &[f64]| -> Vec<f64> {
+            (0..layout.total_elements)
+                .map(|flat_idx| values[layout.channel_for_flat_index(flat_idx)])
+                .collect()
+        };
+        Ok(Some(BatchNormExactChannels {
+            scale: expand(&channels.scale),
+            bias: expand(&channels.bias),
+            scale_err: expand(&channels.scale_err),
+            bias_err: expand(&channels.bias_err),
+        }))
     }
 
     /// #cgan-bn-gpu-extract: pub(crate) face of `detect_input_layout` for the GPU

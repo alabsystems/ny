@@ -63,7 +63,7 @@ pub(crate) fn conv2d_single_grouped(
     dilation: (usize, usize),
     groups: usize,
 ) -> Result<ArrayD<f32>> {
-    // Guard: ndim checks prevent panic on shape indexing (#2920 WP-B).
+    // Guard: ndim checks prevent panic on shape indexing.
     if input.ndim() != 3 {
         return Err(NyError::ShapeMismatch {
             expected: vec![3],
@@ -881,14 +881,156 @@ pub(crate) fn conv2d_transpose_grouped_batched_fast(
             return Some(res);
         }
     }
-    engine.map(|eng| eng.gemm_f32(num_positions, mk, mn, patches, &m))
+    match engine {
+        None => None,
+        Some(eng) => match eng.gemm_f32(num_positions, mk, mn, patches, &m) {
+            // #patches-engine-refusal-containment (dark, default OFF —
+            // bab.patches_engine_refusal_containment): a POLICY refusal (the
+            // WGPU proof-adapter GEMM quarantine, or the CPU arm below its
+            // MACs gate) is the engine contract's "caller uses its own
+            // implementation". Armed, treat the refusing engine exactly like
+            // an absent accelerator: return `None` so the caller falls
+            // through to its byte-identical per-position CPU scatter, IN
+            // PATCHES. Dark (the shipped default), the refusal keeps
+            // escaping as `Some(Err)` byte-identically — where the patches
+            // walk's consumer launders it into a dense retry that blows the
+            // memory budget and leaves the target IBP-grade
+            // (reports/measured-2026/cct_bound_gap_2026-08-31). Genuine
+            // failures (ShapeMismatch, InvalidSpec, DeadlineExceeded,
+            // numeric) always propagate.
+            Err(NyError::UnsupportedConfiguration(msg))
+                if crate::preset_gates::patches_engine_refusal_containment_armed() =>
+            {
+                static ARMED_ONCE: std::sync::Once = std::sync::Once::new();
+                ARMED_ONCE.call_once(|| {
+                    tracing::info!(
+                        "[patches_refusal_containment] armed: engine policy refusal contained \
+                         at the Conv2d Patches compose seam; CPU scatter stays in patches \
+                         (first refusal: {msg})"
+                    );
+                });
+                tracing::debug!(
+                    "[patches_refusal_containment] engine policy refusal contained \
+                     (positions={num_positions}, k={mk}, n={mn}): {msg}"
+                );
+                None
+            }
+            other => Some(other),
+        },
+    }
 }
 
 #[cfg(test)]
 mod batched_transpose_tests {
     use super::*;
     use ndarray::IxDyn;
-    use ny_core::NaiveCpuGemmEngine;
+    use ny_core::{GemmEngine, NaiveCpuGemmEngine};
+
+    /// Mock of the WGPU proof adapter's BY-DESIGN GEMM refusal
+    /// (`crates/ny-gpu/src/backend.rs`: "WGPU GEMM is quarantined…").
+    struct QuarantinedGemmEngine;
+
+    impl GemmEngine for QuarantinedGemmEngine {
+        fn gemm_f32(
+            &self,
+            _m: usize,
+            _k: usize,
+            _n: usize,
+            _a: &[f32],
+            _b: &[f32],
+        ) -> Result<Vec<f32>> {
+            Err(NyError::UnsupportedConfiguration(
+                "mock WGPU GEMM quarantine: only CROWN backward is exposed on an explicitly \
+                 qualified proof device"
+                    .into(),
+            ))
+        }
+    }
+
+    /// Mock of a GENUINE engine failure that containment must never swallow.
+    struct ShapeMismatchGemmEngine;
+
+    impl GemmEngine for ShapeMismatchGemmEngine {
+        fn gemm_f32(
+            &self,
+            m: usize,
+            k: usize,
+            n: usize,
+            _a: &[f32],
+            _b: &[f32],
+        ) -> Result<Vec<f32>> {
+            Err(NyError::ShapeMismatch {
+                expected: vec![m, k],
+                got: vec![k, n],
+            })
+        }
+    }
+
+    /// #patches-engine-refusal-containment: armed, an engine POLICY refusal
+    /// (`UnsupportedConfiguration`) resolves to `None` — the caller runs its
+    /// own byte-identical CPU scatter and STAYS IN PATCHES — while a REAL
+    /// error keeps propagating as `Some(Err)`. Dark (the shipped default),
+    /// the refusal escapes as `Some(Err)` exactly as it always did.
+    ///
+    /// Shown able to fail: with the containment arm's `None` planted as
+    /// unconditional (gate check removed), the dark arm's
+    /// `Some(Err(UnsupportedConfiguration))` assertion goes red; with the
+    /// pattern widened to swallow every error, the `ShapeMismatch` assertion
+    /// goes red.
+    #[test]
+    fn engine_policy_refusal_contained_only_when_armed_and_real_errors_propagate() {
+        crate::tests::with_env_edits(|env| {
+            let kernel = ArrayD::<f32>::ones(IxDyn(&[1, 1, 1, 1]));
+            let patches = [1.0f32];
+            let run = |engine: &dyn GemmEngine| {
+                conv2d_transpose_grouped_batched_fast(
+                    &patches,
+                    1,
+                    &kernel,
+                    (1, 1),
+                    (1, 1),
+                    (1, 1),
+                    1,
+                    1,
+                    Some(engine),
+                    None,
+                )
+            };
+
+            // DARK (shipped default): the policy refusal escapes byte-identically.
+            env.remove("NY_PATCHES_ENGINE_REFUSAL_CONTAINMENT");
+            match run(&QuarantinedGemmEngine) {
+                Some(Err(NyError::UnsupportedConfiguration(_))) => {}
+                other => panic!("dark gate must keep today's refusal escape, got {other:?}"),
+            }
+
+            // ARMED: the policy refusal is an ABSENT accelerator; the caller
+            // falls through to the per-position CPU scatter, in patches.
+            env.set("NY_PATCHES_ENGINE_REFUSAL_CONTAINMENT", "1");
+            assert!(
+                run(&QuarantinedGemmEngine).is_none(),
+                "armed containment must map the engine policy refusal to None \
+                 (CPU scatter, staying in patches)"
+            );
+
+            // ARMED: a genuine failure still propagates.
+            match run(&ShapeMismatchGemmEngine) {
+                Some(Err(NyError::ShapeMismatch { .. })) => {}
+                other => panic!(
+                    "armed containment must never swallow a real engine error, got {other:?}"
+                ),
+            }
+
+            // A malformed arming token is a fail-closed kill switch.
+            env.set("NY_PATCHES_ENGINE_REFUSAL_CONTAINMENT", "true");
+            match run(&QuarantinedGemmEngine) {
+                Some(Err(NyError::UnsupportedConfiguration(_))) => {}
+                other => {
+                    panic!("malformed token must fail closed to the dark behavior, got {other:?}")
+                }
+            }
+        });
+    }
 
     #[test]
     fn operator_matrix_rejects_malformed_and_overflowing_geometry() {

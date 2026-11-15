@@ -144,7 +144,7 @@ fn negative_axis_passes_through_the_batch_remap_unchanged() {
 
 /// Axis 0 on a recorded rank-2 tensor is the (possibly stripped) batch axis:
 /// no single encoding is right for both runtime layouts, so conversion refuses
-/// rather than guessing (the #2848 Gather rule).
+/// rather than guessing (the Gather rule).
 #[test]
 fn positive_axis_zero_on_rank2_data_is_refused() {
     let mut weights = WeightStore::new();

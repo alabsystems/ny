@@ -165,7 +165,7 @@ def parse_ny_result(result, method, elapsed, *, require_bounds):
 def run_ny_verify(model_path, property_path, method, verbose=False):
     """Run ny verify command and parse results."""
     cmd = [
-        "cargo", "run", "--release", "-p", "ny-cli", "--",
+        "targo", "--unverified", "run", "--release", "-p", "ny-cli", "--",
         "verify", model_path,
         "--property", property_path,
         "--method", method,
@@ -189,7 +189,7 @@ def run_ny_verify(model_path, property_path, method, verbose=False):
 def run_ny_beta_crown(model_path, epsilon, verbose=False):
     """Run ny beta-crown command and parse results."""
     cmd = [
-        "cargo", "run", "--release", "-p", "ny-cli", "--",
+        "targo", "--unverified", "run", "--release", "-p", "ny-cli", "--",
         "beta-crown", model_path,
         "--epsilon", str(epsilon),
         "--threshold", "0.0",

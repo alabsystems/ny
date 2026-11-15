@@ -158,7 +158,7 @@ def test_maxpool_verification(onnx_path: Path, output_dir: Path) -> bool:
 
     # Run ny verify
     result = subprocess.run(
-        ["cargo", "run", "--release", "-p", "ny-cli", "--",
+        ["targo", "--unverified", "run", "--release", "-p", "ny-cli", "--",
          "verify", onnx_path,
          "--property", vnnlib_path,
          "--method", "ibp",
@@ -207,7 +207,7 @@ def test_maxpool_ibp():
 
     # Build and run a simple test through the CLI
     result = subprocess.run(
-        ["cargo", "test", "-p", "ny-propagate", "--",
+        ["targo", "--unverified", "test", "-p", "ny-propagate", "--",
          "test_maxpool2d", "--nocapture"],
         capture_output=True,
         text=True,

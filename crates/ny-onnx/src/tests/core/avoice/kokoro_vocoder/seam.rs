@@ -2,18 +2,17 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Real-weight seam discontinuity bounds (#3500).
+//! Real-weight seam discontinuity bounds.
 //!
 //! Computes |chunk_A[end] - chunk_B[start]| bounds on real Kokoro vocoder
-//! prefix weights, directly measuring the "no click" property from #3500
-//! requirement 1: |sample[chunk_N, -1] - sample[chunk_N+1, 0]| < ε.
+//! prefix weights, directly measuring the "no click" property:
+//! |sample[chunk_N, -1] - sample[chunk_N+1, 0]| < ε.
 //!
 //! The crossfade tests in `crossfade.rs` verify that the overlap-add
 //! combination of two chunks produces bounded output. This module instead
 //! measures the RAW seam discontinuity BEFORE crossfade, giving avoice
 //! a quantitative bound on the maximum possible click magnitude.
 //!
-//! Reference: #3500 requirement 1
 //! Reference: ny-propagate/src/tests/streaming_boundary_seam.rs (synthetic version)
 
 use super::crossfade_support::two_chunk_boundary_fixtures;
@@ -70,7 +69,7 @@ fn absolute_difference_bounds(
 #[cfg(feature = "external-avoice")]
 fn test_two_chunk_seam_discontinuity_bounded_3500() {
     crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
-    // #3500 requirement 1: |sample[chunk_N, -1] - sample[chunk_N+1, 0]| < ε.
+    // Requirement: |sample[chunk_N, -1] - sample[chunk_N+1, 0]| < ε.
     //
     // Measures the raw seam discontinuity between two adjacent streaming
     // chunks with different audio content (center=0.0 vs center=0.1) on
@@ -81,9 +80,9 @@ fn test_two_chunk_seam_discontinuity_bounded_3500() {
     // or cosmetic (small jump).
     //
     // Uses IBP bounds on the prefix subgraph (first ConvTranspose1d node).
-    // Full-graph seam measurement is still waiting on the deeper vocoder lane:
-    // #3619 must recover non-trivial deep CROWN tightening, and #3597 must
-    // finish the graph-wide engine-threading path.
+    // Full-graph seam measurement is still waiting on the deeper vocoder lane
+    // (non-trivial deep CROWN tightening and the graph-wide engine-threading
+    // path).
     //
     // Baseline (2026-03-11, ε=1e-3, prefix subgraph, T=6):
     //   max_jump_upper = 1.761248e-1  (worst-case click magnitude)

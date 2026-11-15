@@ -614,7 +614,7 @@ fn graph_domain_alpha_adam_step_basic() {
     let config = AdaptiveOptConfig::default();
     let max_grad = state.gradient_step_adam(&config, 1);
 
-    // max_grad should reflect the larger raw gradient magnitude (#2416).
+    // max_grad should reflect the larger raw gradient magnitude.
     // grad for neuron 0 = 1.0, grad for neuron 1 = -0.5 (no clipping, grad_clip=0.0).
     // So max_grad = max(|1.0|, |-0.5|) = 1.0
     assert!(
@@ -749,7 +749,7 @@ fn graph_domain_alpha_adam_grad_clipping() {
         n_clipped.adam_m
     );
 
-    // max_grad (raw gradient, #2416) should also differ substantially
+    // max_grad (raw gradient) should also differ substantially
     assert!(
         max_grad_unclipped > max_grad_clipped * 500.0,
         "unclipped max_grad ({max_grad_unclipped}) should be ~1000x larger than clipped ({max_grad_clipped})"
@@ -912,7 +912,7 @@ fn graph_domain_alpha_adam_no_bias_correction() {
 
     let max_grad = state.gradient_step_adam(&config, 1);
 
-    // max_grad now returns raw gradient magnitude, not m_hat (#2416).
+    // max_grad now returns raw gradient magnitude, not m_hat.
     // Raw gradient = 1.0, so max_grad = 1.0 regardless of bias_correction.
     assert!(
         (max_grad - 1.0).abs() < 1e-5,
@@ -926,8 +926,8 @@ fn graph_domain_alpha_adam_no_bias_correction() {
     );
 }
 
-/// Regression: beta1=1.0 caused bias_correction1=0, division by zero in DomainAlphaState (#2556).
-/// Mirrors the fix in bounds/alpha.rs (#2315).
+/// Regression: beta1=1.0 caused bias_correction1=0, division by zero in DomainAlphaState.
+/// Mirrors the fix in bounds/alpha.rs.
 #[test]
 fn domain_alpha_adam_beta1_one_no_div_by_zero() {
     let mut state = DomainAlphaState::empty();
@@ -968,7 +968,7 @@ fn domain_alpha_adam_beta1_one_no_div_by_zero() {
     );
 }
 
-/// Regression: beta2=1.0 caused bias_correction2=0, division by zero in DomainAlphaState (#2556).
+/// Regression: beta2=1.0 caused bias_correction2=0, division by zero in DomainAlphaState.
 #[test]
 fn domain_alpha_adam_beta2_one_no_div_by_zero() {
     let mut state = DomainAlphaState::empty();
@@ -1009,7 +1009,7 @@ fn domain_alpha_adam_beta2_one_no_div_by_zero() {
     );
 }
 
-/// Regression: beta1=1.0 caused bias_correction1=0, division by zero in GraphDomainAlphaState (#2556).
+/// Regression: beta1=1.0 caused bias_correction1=0, division by zero in GraphDomainAlphaState.
 #[test]
 fn graph_domain_alpha_adam_beta1_one_no_div_by_zero() {
     let mut state = GraphDomainAlphaState::empty();
@@ -1051,7 +1051,7 @@ fn graph_domain_alpha_adam_beta1_one_no_div_by_zero() {
     );
 }
 
-/// Regression test for #2939: standard (non-Adam) gradient_step convergence
+/// Regression test: standard (non-Adam) gradient_step convergence
 /// tracking must use nan_propagating_max, not f32::max, to surface NaN gradients.
 ///
 /// Before the fix, `f32::max(0.0, NaN) = 0.0` silently dropped NaN, making the
@@ -1081,7 +1081,7 @@ fn domain_alpha_gradient_step_nan_convergence_tracking_2939() {
         "alpha must be finite after NaN gradient, got {alpha}"
     );
 
-    // Velocity must be reset to 0.0 (NaN guard from #2608)
+    // Velocity must be reset to 0.0 (NaN guard)
     let n = &state.neurons[&(1, 0)];
     assert_eq!(
         n.velocity, 0.0,
@@ -1090,7 +1090,7 @@ fn domain_alpha_gradient_step_nan_convergence_tracking_2939() {
     );
 }
 
-/// Regression test for #2939: after velocity NaN recovery, subsequent gradient
+/// Regression test: after velocity NaN recovery, subsequent gradient
 /// steps must work normally (corruption is not permanent).
 #[test]
 fn domain_alpha_gradient_step_nan_recovery_then_normal_2939() {
@@ -1129,7 +1129,7 @@ fn domain_alpha_gradient_step_nan_recovery_then_normal_2939() {
     );
 }
 
-/// Regression: beta2=1.0 caused bias_correction2=0, division by zero in GraphDomainAlphaState (#2556).
+/// Regression: beta2=1.0 caused bias_correction2=0, division by zero in GraphDomainAlphaState.
 #[test]
 fn graph_domain_alpha_adam_beta2_one_no_div_by_zero() {
     let mut state = GraphDomainAlphaState::empty();

@@ -2,11 +2,11 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Regression tests for CROWN coefficient overflow clamping (#1932).
+//! Regression tests for CROWN coefficient overflow clamping.
 //!
 //! CROWN backward propagation computes `A_new = A @ W` at each layer.
 //! For deep networks, A-matrix coefficients grow exponentially and can
-//! overflow f32. Issue #1932 adds proactive magnitude clamping: any
+//! overflow f32. Proactive magnitude clamping handles this: any
 //! coefficient exceeding `CROWN_COEFF_MAX` (1e10) triggers row-level
 //! degradation to `[-inf, +inf]`, which is sound but maximally loose.
 //! The `has_degraded_bounds` post-check then falls back to IBP.
@@ -18,7 +18,7 @@ use ndarray::{arr1, Array2};
 ///
 /// Each layer has `dim x dim` weights with spectral norm ~2.3, so after `depth`
 /// linear layers the A-matrix coefficients are O(2.3^depth). At depth=40 this
-/// exceeds CROWN_COEFF_MAX (1e10) by ~layer 30, exercising the #1932 clamping.
+/// exceeds CROWN_COEFF_MAX (1e10) by ~layer 30, exercising the proactive clamping.
 fn build_deep_overflow_network(dim: usize, depth: usize) -> (Network, BoundedTensor) {
     let mut network = Network::new();
     // Weight matrix: 2.0 on diagonal, 0.1 off-diagonal → spectral norm ~2.3.
@@ -39,12 +39,12 @@ fn build_deep_overflow_network(dim: usize, depth: usize) -> (Network, BoundedTen
     (network, input)
 }
 
-/// Regression test (#1932): deep network CROWN must not produce NaN.
+/// Regression test: deep network CROWN must not produce NaN.
 ///
 /// A 40-layer network with spectral norm ~2.3 per layer causes A-matrix
 /// coefficients to exceed CROWN_COEFF_MAX (1e10) by approximately layer 30.
-/// Before #1932, this could produce NaN in concretized bounds.
-/// After #1932, affected rows degrade to `[-inf, +inf]` (sound).
+/// Without proactive clamping, this could produce NaN in concretized bounds.
+/// With it, affected rows degrade to `[-inf, +inf]` (sound).
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_proactive_coeff_clamping_deep_network_1932() {

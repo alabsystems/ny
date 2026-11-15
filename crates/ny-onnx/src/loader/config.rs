@@ -30,8 +30,9 @@ pub enum ShapeInferencePolicy {
 /// contain native aborts or faults, so callers that must never crash (e.g.
 /// competition verify lanes) can delegate the call to a child process instead:
 /// the child dying is then observed as an ordinary inference failure and
-/// degrades to the same graceful no-inferred-shapes fallback as any other
-/// shape-inference error.
+/// degrades to the same ORT-free static shape fallback as any other
+/// shape-inference error (exact rules only; every tensor they cannot prove
+/// stays unknown, as it did before that fallback existed).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShapeInferBackend {
     /// Run ORT shape inference in this process (the default wherever the
@@ -43,8 +44,8 @@ pub enum ShapeInferBackend {
     /// from stdout (see `shape_infer::subprocess` for the wire protocol).
     /// Any subprocess failure — spawn error, crash/abort, timeout, or garbage
     /// output — is reported as an inference error, which loaders degrade to
-    /// the no-inferred-shapes fallback. It is never treated as fatal and
-    /// shapes are never fabricated.
+    /// the ORT-free static shape fallback. It is never treated as fatal, and
+    /// nothing from the failed exchange is ever used.
     Subprocess {
         /// Binary that serves the `__shape-infer` protocol (typically
         /// `std::env::current_exe()` of the `ny` CLI).
@@ -104,6 +105,32 @@ pub enum BatchNormFoldingPolicy {
     /// This is a call-local override. It dominates `NY_BN_FOLD_EXT` and the
     /// loader does not consult or mutate that variable for this decision.
     PreserveRaw,
+    /// Internal, call-local structural selection before authored graph rewrites.
+    /// Preset serialization cannot request this mode; the frozen query policy
+    /// selects it only when no explicit folding policy was supplied.
+    #[serde(skip)]
+    StructuralCertifiedRoot,
+}
+
+/// Actual policy used by the same synchronous model load, never a proposed flag.
+#[derive(Clone, Copy, Debug)]
+pub struct RootCutLoadReceipt {
+    policy: BatchNormFoldingPolicy,
+    structurally_admitted: bool,
+}
+impl RootCutLoadReceipt {
+    pub(crate) fn new(policy: BatchNormFoldingPolicy, structurally_admitted: bool) -> Self {
+        Self {
+            policy,
+            structurally_admitted,
+        }
+    }
+    pub fn batch_norm_folding(&self) -> BatchNormFoldingPolicy {
+        self.policy
+    }
+    pub fn certified_root_source(&self) -> bool {
+        self.policy == BatchNormFoldingPolicy::PreserveRaw && self.structurally_admitted
+    }
 }
 
 /// Configuration for ONNX model loading.
@@ -116,6 +143,8 @@ pub struct OnnxLoadConfig {
     batch_norm_folding: BatchNormFoldingPolicy,
     capture_raw_float32_initializer_provenance: bool,
     require_authored_float32_initializers: bool,
+    qdq_activation_relaxation: bool,
+    multi_input_concat: bool,
 }
 
 impl OnnxLoadConfig {
@@ -129,6 +158,8 @@ impl OnnxLoadConfig {
             batch_norm_folding: BatchNormFoldingPolicy::default(),
             capture_raw_float32_initializer_provenance: false,
             require_authored_float32_initializers: false,
+            qdq_activation_relaxation: false,
+            multi_input_concat: false,
         }
     }
 
@@ -196,6 +227,104 @@ impl OnnxLoadConfig {
     #[must_use]
     pub fn batch_norm_folding_policy(&self) -> BatchNormFoldingPolicy {
         self.batch_norm_folding
+    }
+
+    /// #soundness-spine M2e: the load configuration every CERTIFIED lowering of
+    /// a `GraphNetwork` (ENGINE_PROGRAM §1.6, the BN-fold row) must start from.
+    ///
+    /// The Conv/Gemm <- BatchNormalization fold stores a binary32 POINT for
+    /// each composed coefficient and DROPS the coefficient enclosure
+    /// (`fusion/batch_norm_fold.rs`: "Nothing downstream absorbs this"), about
+    /// `2^-24 · S` per folded layer. A certified lowering therefore keeps every
+    /// authored BatchNormalization node: `BatchNormLayer` encloses the exact
+    /// real affine in outward-rounded binary64 and its consumers charge
+    /// `scale_err`/`bias_err` outward. This stays the rule until the licensed
+    /// `kernel_err` channel carries the fold's enclosure into the conv/linear
+    /// certificates, at which point the fold may be re-admitted with its error
+    /// charged.
+    ///
+    /// WHO LOADS THROUGH IT (#spine-legacy-lanes). Every load that claims
+    /// proof authority over the AUTHORED model apart from the β-CROWN graph
+    /// lane's own preset load: the relational difference-network pair
+    /// (`ny-cli` `load_certified_graph_network`), the cctsdb sub-box model, the
+    /// non-linear interval branch-and-bound's f64 cell graph, the
+    /// affine-invprop strict reload, and — via the preset predicate
+    /// [`Self::admits_certified_graph_lowering`] — the forward-linear
+    /// spec-alpha surrogate (cGAN presets set `batch_norm_folding:
+    /// preserve_raw`). None of those lanes' models carries a
+    /// BatchNormalization today, so the switch is byte-identical on their
+    /// banks; it closes the fold for any future BN model.
+    ///
+    /// NOT applied to today's β-CROWN graph lane: refusing the fold there is
+    /// the measured −15 banked `unsat` intervention (#bn-fold-restore), so it
+    /// would DOWNGRADE banks. That live gap is reported, not closed, here. Its
+    /// exposure (census 2026-09-29, `BatchNormalization` bytes in every model
+    /// of `benchmarks/vnncomp2026`): BN models exist only in cgan (loaded
+    /// `preserve_raw`), cifar100 and tinyimagenet (banked `unsat` rows are
+    /// margin-row verdicts, whose extractor folds from the raw proto in
+    /// binary64 with a charged error), traffic_signs (no banked `unsat`),
+    /// vit_2023 (`unsat` unbanked) and challenging_certified_training_2026,
+    /// whose 3 banked `unsat` rows are graph-lane verdicts on folded CNN7s —
+    /// the only banked rows the uncharged fold can touch.
+    #[must_use]
+    pub fn certified_graph_lowering(self) -> Self {
+        self.with_batch_norm_folding_policy(BatchNormFoldingPolicy::PreserveRaw)
+    }
+
+    /// Whether a model loaded with this configuration may feed a CERTIFIED
+    /// `GraphNetwork` lowering (see [`Self::certified_graph_lowering`]): only
+    /// when no BatchNormalization was folded with its enclosure dropped.
+    #[must_use]
+    pub fn admits_certified_graph_lowering(&self) -> bool {
+        self.batch_norm_folding == BatchNormFoldingPolicy::PreserveRaw
+    }
+
+    /// Returns a copy of this config with the dark QDQ activation-relaxation
+    /// lane enabled (see `model.qdq_activation_relaxation`).
+    ///
+    /// Default OFF: the loader refuses static-INT64->FLOAT Cast plumbing and
+    /// activation QuantizeLinear exactly as before. ON arms BOTH halves of the
+    /// mechanism: (a) a `Cast(to=FLOAT)` whose data input is a PROVEN-STATIC
+    /// INT64 structural value is accepted as a deferred-fold obligation (the
+    /// original refusal re-raises unless constant folding erases the Cast into
+    /// a literal before propagation), and (b) an activation
+    /// `QuantizeLinear -> DequantizeLinear` pair with identical parameters is
+    /// fused into the certified `QdqPerturbationLayer` enclosure.
+    #[must_use]
+    pub fn with_qdq_activation_relaxation(mut self, enabled: bool) -> Self {
+        self.qdq_activation_relaxation = enabled;
+        self
+    }
+
+    /// Returns whether the dark QDQ activation-relaxation lane is enabled.
+    #[must_use]
+    pub fn qdq_activation_relaxation_enabled(&self) -> bool {
+        self.qdq_activation_relaxation
+    }
+
+    /// Returns a copy of this config with the dark multi-input concat-view
+    /// mechanism enabled (see `model.multi_input_concat`).
+    ///
+    /// Default OFF: a model with more than one declared graph input keeps
+    /// today's fail-closed refusal (the input box is sized from the FIRST
+    /// input only, and the VNN-LIB coordinate-count validation rejects the
+    /// spec). ON, the graph builder concatenates all declared inputs, in
+    /// declared order, into one flat network input and carves each input back
+    /// out with exact Slice(+Reshape) view nodes; the CLI sizes the joint
+    /// input box to the concatenated element count. Single-input models are
+    /// byte-identical in both states. This flag rides `OnnxLoadConfig` purely
+    /// as preset->loader transport (like the QDQ lane); the mechanism itself
+    /// lives in ny-build's graph builder.
+    #[must_use]
+    pub fn with_multi_input_concat(mut self, enabled: bool) -> Self {
+        self.multi_input_concat = enabled;
+        self
+    }
+
+    /// Returns whether the dark multi-input concat-view mechanism is enabled.
+    #[must_use]
+    pub fn multi_input_concat_enabled(&self) -> bool {
+        self.multi_input_concat
     }
 
     /// Returns a copy of this config with loader-sealed raw ONNX FLOAT

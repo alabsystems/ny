@@ -112,7 +112,7 @@ impl GraphBetaState {
 /// preserve original insertion order in O(k log k), where k is the number of
 /// entries for the node. Falls back to linear scan otherwise.
 ///
-/// Part of #2936: eliminates O(R*B) scans in backward CROWN passes.
+/// Eliminates O(R*B) scans in backward CROWN passes.
 enum NodeEntryIter<'a> {
     Indexed {
         /// Flattened entry indices for all neurons of the target node.

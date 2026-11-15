@@ -167,7 +167,7 @@ mod tests {
         let result = sort_out_constraints(&a, &b, &x_l, &x_u);
         assert!(!result.any_infeasible());
         assert!(result.all_fully_covered());
-        assert!(result.active_constraint_indices.is_empty());
+        assert_eq!((result.active_constraint_indices).len(), 0);
     }
 
     #[test]

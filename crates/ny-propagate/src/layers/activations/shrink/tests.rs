@@ -104,7 +104,7 @@ fn test_relaxation_infinite_interval_uses_infinite_intercepts() {
         "upper_intercept expected +inf, got {upper_intercept}"
     );
 
-    // Regression for #2337: non-finite interval must not collapse to (0, 0, 0, 0).
+    // Regression: non-finite interval must not collapse to (0, 0, 0, 0).
     for x in [-10.0_f32, -1.0, 0.0, 1.0, 10.0] {
         let y = shrink_scalar(x, layer.bias(), layer.lambd());
         let lower_bound = lower_slope * x + lower_intercept;
@@ -122,7 +122,7 @@ fn test_relaxation_infinite_interval_uses_infinite_intercepts() {
 
 #[test]
 fn test_inf_guard_bias_gt_lambd_includes_breakpoint_extrema() {
-    // Regression for #3322 audit finding: when bias > lambd, Shrink has
+    // Regression for an audit finding: when bias > lambd, Shrink has
     // discontinuities at ±lambd. The function approaches -lambd + bias > 0
     // from the left at -lambd, and lambd - bias < 0 from the right at +lambd.
     // The Inf guard must include these breakpoint approach values in fmax/fmin.
@@ -184,7 +184,7 @@ fn test_inf_guard_bias_gt_lambd_includes_breakpoint_extrema() {
 
 #[test]
 fn test_case5_chord_breakpoint_validity_bias_gt_lambd() {
-    // Regression for #3322: Case 5 chord from (l, 0) to (u, fu) was accepted
+    // Regression: Case 5 chord from (l, 0) to (u, fu) was accepted
     // without checking at the positive breakpoint +lambd. When bias > lambd,
     // the function dips to lambd - bias < 0 at the breakpoint, but the chord
     // passes above this dip, yielding an unsound lower bound.
@@ -606,14 +606,14 @@ fn test_crown_no_pre_activation_errors() {
     );
 }
 
-// ── Regression: Inf guard soundness (#2337) ─────────────────────
+// ── Regression: Inf guard soundness ─────────────────────
 //
 // When l=-inf and u=+inf, the Inf guard must produce sound bounds.
 // Without the fix, the is_finite() fallback returned 0.0 for both
 // intercepts, claiming Shrink(x) = 0 for all x — unsound for x
 // outside the dead zone.
 
-/// Post-#2977: domain_guard now rejects non-finite pre-activation bounds with
+/// The domain_guard now rejects non-finite pre-activation bounds with
 /// NumericalInstability error instead of passing to the internal relaxation
 /// Inf guard. This is the correct behavior — non-finite pre-activation bounds
 /// indicate upstream corruption, not a valid input configuration.
@@ -633,7 +633,7 @@ fn test_crown_both_infinite_bounds_regression_2337() -> Result<()> {
     Ok(())
 }
 
-/// Post-#2977: domain_guard rejects NaN pre-activation bounds.
+/// The domain_guard rejects NaN pre-activation bounds.
 #[test]
 fn test_crown_nan_bounds_regression_2337() -> Result<()> {
     let layer = ShrinkLayer::new(0.5, 0.5);
@@ -650,7 +650,7 @@ fn test_crown_nan_bounds_regression_2337() -> Result<()> {
     Ok(())
 }
 
-// ── IBP guard regression tests (#3278) ────────────────────────────
+// ── IBP guard regression tests ────────────────────────────
 
 /// NaN in lower bounds silently fell into dead-zone branch, returning
 /// unsound (0.0, 0.0). Guard now catches this.
@@ -678,7 +678,7 @@ fn test_ibp_nan_input_upper_rejected_3278() {
     assert!(matches!(err, NyError::NumericalInstability(_)));
 }
 
-/// #3278 originally rejected ±Inf here too. That was wrong: ±Inf is what an
+/// The NaN guard originally rejected ±Inf here too. That was wrong: ±Inf is what an
 /// upstream OpaqueSkip legitimately emits, and `NumericalInstability` is not
 /// degradable, so one tainted element aborted the whole graph-IBP pass. Shrink
 /// must now widen instead — `[-inf, +inf]` in, `[-inf, +inf]` out.
@@ -697,7 +697,7 @@ fn test_ibp_inf_input_propagates_widened_3278() {
     assert_eq!(out.upper()[[0]], f32::INFINITY);
 }
 
-// ── OpaqueSkip taint propagation (#3278 follow-up) ─────────────────────
+// ── OpaqueSkip taint propagation ───────────────────────────────────────
 
 /// Probe: a mixed tensor where one element carries an upstream OpaqueSkip's
 /// `[-inf, +inf]` and the other is a normal finite interval. The tainted
@@ -775,7 +775,7 @@ fn test_ibp_nan_still_rejected_after_inf_relaxation() {
     assert!(matches!(err, NyError::NumericalInstability(_)));
 }
 
-// ── CROWN relaxation soundness proptest (#3321) ─────────────────────
+// ── CROWN relaxation soundness proptest ─────────────────────
 
 /// Reference Shrink in f64, independent of the crate f32 implementation.
 fn shrink_f64_reference(x: f64, bias: f64, lambd: f64) -> f64 {
@@ -791,7 +791,7 @@ fn shrink_f64_reference(x: f64, bias: f64, lambd: f64) -> f64 {
 proptest::proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(1000) })]
 
-    /// #3321: Verify ShrinkLayer::relaxation produces strictly sound bounds.
+    /// Verify ShrinkLayer::relaxation produces strictly sound bounds.
     /// For random intervals, the lower bound must satisfy
     ///   lower_slope * x + lower_intercept <= Shrink(x)  for all x in [l, u]
     /// and the upper bound must satisfy

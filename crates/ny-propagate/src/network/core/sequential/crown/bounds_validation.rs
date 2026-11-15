@@ -12,15 +12,15 @@ use ny_tensor::BoundedTensor;
 
 /// Check if bounds contain non-finite values (NaN/Inf).
 ///
-/// Tightening heuristic: after `concretize_sound()` (#2287), NaN and inversions
+/// Tightening heuristic: after `concretize_sound()`, NaN and inversions
 /// are repaired internally, but repaired elements become `[-inf, +inf]` which is
 /// sound but maximally loose. When CROWN degrades to non-finite bounds, IBP with
 /// overflow clamping typically produces tighter results. This function detects
 /// that degradation so callers can fall back to IBP.
 ///
-/// Post-#2287: this function checks only for non-finite values (NaN, Inf).
+/// This function checks only for non-finite values (NaN, Inf).
 /// Inversion detection was removed since `concretize_sound()` repairs
-/// inversions internally via `new_repaired(Widen)` (#3423).
+/// inversions internally via `new_repaired(Widen)`.
 pub(crate) fn has_degraded_bounds(bounds: &BoundedTensor) -> bool {
     bounds
         .lower()
@@ -33,11 +33,11 @@ pub(crate) fn has_degraded_bounds(bounds: &BoundedTensor) -> bool {
 ///
 /// NaN indicates a computational error where per-element intersection cannot
 /// produce meaningful results. ±Inf indicates maximally-loose bounds (e.g.,
-/// from #2681 non-finite row fallback) that per-element intersection handles
+/// from the non-finite row fallback) that per-element intersection handles
 /// correctly: `max(-inf, ibp_lower) = ibp_lower`.
 ///
-/// Reference: #2681 — non-finite A-matrix row fallback produces ±inf bias,
-/// which concretizes to [-inf, +inf]. Per-element IBP intersection tightens
+/// The non-finite A-matrix row fallback produces ±inf bias, which
+/// concretizes to [-inf, +inf]. Per-element IBP intersection tightens
 /// only the affected rows while preserving CROWN tightness for healthy rows.
 pub(crate) fn has_nan_bounds(bounds: &BoundedTensor) -> bool {
     bounds
@@ -53,8 +53,6 @@ pub(crate) fn has_nan_bounds(bounds: &BoundedTensor) -> bool {
 /// relaxation produced impossible bounds. NaN comparisons always return false,
 /// so this function only detects numeric inversions — NaN is caught separately
 /// by [`has_nan_bounds`] or [`has_degraded_bounds`].
-///
-/// Reference: #3043 — graph_crown had this as a local `bounds_invalid_flags` fn.
 ///
 /// Retained as a diagnostic predicate: callers no longer use it to *block*
 /// CROWN-IBP intersection (inverted intervals are handled soundly per-element

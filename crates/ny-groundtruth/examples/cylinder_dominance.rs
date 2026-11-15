@@ -10,7 +10,7 @@
 //! surrogate (`gt verify`), falsifies a violating one with a concrete
 //! witness, and shows the §2.3 exact-constant rejection.
 //!
-//! Run with: `cargo run -p ny-groundtruth --example cylinder_dominance`
+//! Run with: `targo --unverified run -p ny-groundtruth --example cylinder_dominance`
 
 use ndarray::arr1;
 use ny_core::Bound;

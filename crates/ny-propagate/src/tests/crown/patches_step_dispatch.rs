@@ -8,8 +8,6 @@
 //! When a sequential network contains Conv2d, the CROWN backward loop uses
 //! `crown_backward_step_patches` internally. These tests exercise that path
 //! by constructing CNN networks and verifying CROWN soundness.
-//!
-//! Part of #3463
 
 use super::*;
 use crate::layers::convolution::conv2d::Conv2dLayer;

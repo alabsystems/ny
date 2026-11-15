@@ -10,7 +10,6 @@
 //!   f(x_a, x_b) lies within IBP output bounds.
 //!
 //! Split from crown_binary_ops.rs to keep file sizes under 1000 lines.
-//! Part of #3370.
 
 use crate::layers::binary_ops::{DivLayer, MaxBinaryLayer, MinBinaryLayer};
 use ndarray::{ArrayD, IxDyn};
@@ -43,8 +42,6 @@ const MINMAX_IBP_TOLERANCE: f32 = 1e-6;
 // DivLayer computes C = A / B where B > 0. IBP bounds use sign-dependent
 // monotonicity of f(b) = a/b with directed rounding (next_down_f32/next_up_f32).
 // No CROWN backward support exists for DivLayer.
-//
-// Part of #3370.
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(500) })]
@@ -180,8 +177,6 @@ proptest! {
 // MinBinaryLayer computes C = min(A, B) element-wise.
 // IBP: C_lower = min(A_l, B_l), C_upper = min(A_u, B_u).
 // No CROWN backward support.
-//
-// Part of #3370.
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(500) })]
@@ -299,8 +294,6 @@ proptest! {
 // MaxBinaryLayer computes C = max(A, B) element-wise.
 // IBP: C_lower = max(A_l, B_l), C_upper = max(A_u, B_u).
 // No CROWN backward support.
-//
-// Part of #3370.
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(500) })]

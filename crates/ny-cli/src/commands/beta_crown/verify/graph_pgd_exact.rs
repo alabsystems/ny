@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Exact graph PGD gradients via concrete CROWN linear extraction (#4274).
+//! Exact graph PGD gradients via concrete CROWN linear extraction.
 //!
 //! Provides an exact-gradient fast path for the sequential graph PGD attack
 //! on a narrow ResNet-style DAG whitelist. Falls back to SPSA when the
@@ -27,13 +27,18 @@ use super::graph_pgd_fast_gradient_evidence::PgdFastGradientExecution;
 /// pass produces an exact local Jacobian row (no relaxation gap at concrete
 /// activation points). Distinct from the broader restart-batching whitelist.
 fn layer_supports_exact_gradient(layer: &Layer) -> bool {
+    // Global-3d AveragePool is IBP-only (its CROWN backward refuses), so it
+    // cannot supply an exact point Jacobian. Keep in lockstep with
+    // `point_vjp_supported_fragment` in ny-propagate point_vjp.rs.
+    if let Layer::AveragePool(pool) = layer {
+        return !pool.global_3d;
+    }
     matches!(
         layer,
         Layer::Conv2d(_)
             | Layer::Linear(_)
             | Layer::ReLU(_)
             | Layer::Add(_)
-            | Layer::AveragePool(_)
             | Layer::Flatten(_)
             | Layer::Reshape(_)
             // GAN/deconv fragment (cgan etc.): ConvTranspose + BatchNorm are
@@ -82,7 +87,7 @@ const EXACT_GRAD_MARGIN_TOL: f32 = 1e-3;
 /// the graph doesn't support exact gradients or the relaxation is too loose, and
 /// `Err(...)` only on internal failures.
 ///
-/// Algorithm (design: `designs/2026-03-20-issue-4274-graph-pgd-exact-gradients.md`):
+/// Algorithm:
 /// 1. Build concrete input bounds from `x`.
 /// 2. Collect per-node IBP bounds at the concrete point.
 /// 3. Build a single-row spec matrix from the target.

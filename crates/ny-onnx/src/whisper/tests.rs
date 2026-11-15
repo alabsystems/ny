@@ -1039,7 +1039,7 @@ fn test_find_input_nodes_concat_keeps_constant_tensors() {
 fn test_find_input_nodes_concat_skips_evaluated_constants() {
     // Evaluated constants (pre-computed by evaluate_block_constants) should be
     // filtered from graph edges because they're embedded in ConcatLayer::constant_inputs
-    // by convert_concat_with_evaluated (#696).
+    // by convert_concat_with_evaluated.
     let whisper = minimal_whisper_with_constants(&[]);
     let spec = layer_spec(&["act_in", "eval_const"], LayerType::Concat);
     let layer = Layer::Concat(ConcatLayer::new(0));
@@ -1556,7 +1556,7 @@ fn test_find_input_nodes_binary_filters_constant_tensors() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_find_input_nodes_concat_skips_weight_inputs() {
-    // After #696: weights are embedded in ConcatLayer::constant_inputs by
+    // Weights are embedded in ConcatLayer::constant_inputs by
     // convert_concat_with_evaluated, so find_input_nodes skips them from graph
     // edges. Only activation inputs produce graph edges.
     let weight = ArrayD::from_shape_vec(IxDyn(&[1]), vec![1.0]).expect("weight shape");
@@ -1599,7 +1599,7 @@ fn test_find_activation_input_skips_constant_tensor() {
     assert_eq!(activation, "act_in");
 }
 
-/// Regression test for #697: find_activation_input must also skip evaluated_constants.
+/// Regression test: find_activation_input must also skip evaluated_constants.
 /// A tensor only present in evaluated_constants (not in weights or constant_tensors)
 /// must not be returned as an activation input.
 #[ntest::timeout(10000)]
@@ -1619,7 +1619,7 @@ fn test_find_activation_input_skips_evaluated_constants() {
     assert_eq!(activation, "act_in");
 }
 
-/// Regression test for #697: evaluated_constants must be filtered from activation
+/// Regression test: evaluated_constants must be filtered from activation
 /// inputs. A tensor in `evaluated_constants` (pre-evaluated constant chain) but NOT
 /// in `constant_tensors` or `weights` must be skipped by `find_input_nodes`, not
 /// treated as an activation input.

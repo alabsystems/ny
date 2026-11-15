@@ -7,16 +7,14 @@
 //! Validates that per-position CROWN scales linearly with sequence length,
 //! as claimed in examples/profile.rs.
 //!
-//! **Gated behind `benchmarks` feature (#2249):** These tests use wall-clock
+//! **Gated behind `benchmarks` feature:** These tests use wall-clock
 //! timing to detect O(n^2) regressions. They are inherently flaky under system
 //! load, cargo serialization contention, or debug builds. Run explicitly with:
-//!   `cargo test -p ny-propagate --features benchmarks --test scaling_regression`
+//!   `targo --unverified test -p ny-propagate --features benchmarks --test scaling_regression`
 //!
 //! Thresholds are wide (e.g. 12x for a 4x size increase, where O(n^2) = 16x)
 //! with median-of-3 sampling. But wall-clock assertions in a test suite remain
-//! fundamentally timing-dependent (#1692).
-//!
-//! Part of #1553: Perf proof for per-position CROWN scaling.
+//! fundamentally timing-dependent.
 
 #![cfg(feature = "benchmarks")]
 

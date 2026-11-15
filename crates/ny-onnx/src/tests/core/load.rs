@@ -150,7 +150,7 @@ fn test_value_info_dtype_mapping() {
 fn test_load_bytes_without_value_info_feature() {
     use prost::Message;
 
-    // Regression for #1216: parsing should succeed when GraphProto omits value_info.
+    // Regression: parsing should succeed when GraphProto omits value_info.
     let graph = onnx_proto::GraphProto {
         node: Vec::new(),
         name: "no_value_info_feature".to_string(),

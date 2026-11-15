@@ -64,6 +64,8 @@ pub mod invprop_cert;
 // written to the crate's provability discipline — see the module docs.
 pub mod json;
 pub mod proof_carrying;
+// Total protobuf wire reader shared by the ONNX-loading binaries.
+pub mod protobuf;
 pub mod rational;
 pub mod sbar;
 pub mod schema;

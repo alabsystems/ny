@@ -10,6 +10,7 @@ use super::types::{
     COEFF_EPS,
 };
 use crate::vnnlib::syntax::{parse_expressions, strip_vnnlib_comments, tokenize, Expr};
+use ny_core::dd::{next_down_f64, next_up_f64};
 use ny_core::{NyError, Result};
 use std::collections::BTreeMap;
 
@@ -150,20 +151,54 @@ fn extract_single_input_bound(constraint: &LinearConstraint) -> Option<(usize, b
     if coeff.abs() <= COEFF_EPS {
         return None;
     }
-    let bound = -constraint.expr.constant_term() / coeff;
+    // DIRECTED, because this quotient IS the admissible input box. A LOWER bound
+    // must round DOWN and an UPPER bound UP; a round-to-nearest quotient rounds the
+    // wrong way half the time and shrinks the box below what the spec authorises, so
+    // a counterexample sitting within one ULP of the authored boundary is never
+    // checked — a false `unsat`.
+    //
+    // `fma(-q, c, num)` is the EXACT remainder `num - q*c`, and `sign(r/c)` says which
+    // side of `q` the true quotient lies on, so the step is taken ONLY when the
+    // division actually rounded: an exactly representable bound (the common case, e.g.
+    // `X_0 >= 0`) stays bit-exact and the box does not drift.
+    let num = -constraint.expr.constant_term();
+    let c = *coeff;
+    let directed = |want_lower: bool| -> f64 {
+        let q = num / c;
+        if !q.is_finite() {
+            return q;
+        }
+        let r = f64::mul_add(-q, c, num);
+        if r == 0.0 {
+            return q; // exact
+        }
+        let true_is_above = (r < 0.0) == (c < 0.0);
+        if want_lower {
+            if true_is_above {
+                q // q <= true already
+            } else {
+                next_down_f64(q)
+            }
+        } else if true_is_above {
+            next_up_f64(q)
+        } else {
+            q // q >= true already
+        }
+    };
+
     match constraint.relation {
         Relation::LessEq => {
-            if *coeff > 0.0 {
-                Some((var.index, false, bound)) // X_i <= bound (upper)
+            if c > 0.0 {
+                Some((var.index, false, directed(false))) // X_i <= bound (upper)
             } else {
-                Some((var.index, true, bound)) // X_i >= bound (lower)
+                Some((var.index, true, directed(true))) // X_i >= bound (lower)
             }
         }
         Relation::GreaterEq => {
-            if *coeff > 0.0 {
-                Some((var.index, true, bound)) // X_i >= bound (lower)
+            if c > 0.0 {
+                Some((var.index, true, directed(true))) // X_i >= bound (lower)
             } else {
-                Some((var.index, false, bound)) // X_i <= bound (upper)
+                Some((var.index, false, directed(false))) // X_i <= bound (upper)
             }
         }
         Relation::Equal => None,

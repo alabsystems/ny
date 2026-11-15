@@ -5,7 +5,7 @@
 //! `#comprehensive-rows-probe`: the measurement overrides for the root
 //! comprehensive intermediate sweep.
 //!
-//! These four exist to answer ONE open design question, and they are grouped
+//! These exist to answer ONE open design question, and they are grouped
 //! because none of them means anything alone. The sweep is memory-bound in ROWS
 //! — 1.4 GB peak at 144 rows, which is 0.26% coverage of ~55,000 eligible
 //! neurons — and partial coverage is already known not to convert (top-3 = 69%
@@ -17,7 +17,9 @@
 //! [`SWEEP_CLASS_MIB`] and [`SWEEP_CLASS_ROWS`] widen one sweep;
 //! [`INTERM_ROW_CHUNKS`] and [`ROOT_COMP_GPU_INTERM_SECS`] buy coverage with
 //! repetition instead; [`ROOT_COMP_GPU_INTERM_ROWS`] raises the per-target cap
-//! that binds either way.
+//! that binds either way. [`SWEEP_CROSSING_TARGETS_ONLY`] asks the fourth
+//! question — not how many rows the budget holds but WHERE they go — by
+//! spending it only on targets that still have a crossing row.
 //!
 //! NONE OF THEM CAN MAKE A BOUND UNSOUND, and the reason is structural rather
 //! than a promise: every chunk is atomic over its own window, every window is
@@ -66,6 +68,13 @@ const ROOT_COMP_SECS_READERS: &[ReaderSite] = &[ReaderSite {
     scope: ROOT_SWEEP,
     role: "raise the phase's local authority slice, trading budget from elsewhere for coverage",
     site: "crates/ny-propagate/src/beta_crown/engine/graph/multi_objective/root.rs:root_comprehensive_gpu_interm_secs_override",
+}];
+
+const SWEEP_CROSSING_TARGETS_READERS: &[ReaderSite] = &[ReaderSite {
+    scope: ROOT_SWEEP,
+    role: "elide sweep targets whose frozen box has no crossing row, and give each surviving target its own window cursor",
+    site: "crates/ny-propagate/src/beta_crown/engine/graph/propagation/\
+           batched/intermediate_sweep.rs:root_comprehensive_gpu_intermediate_sweep",
 }];
 
 const SWEEP_CLASS_READERS: &[ReaderSite] = &[ReaderSite {
@@ -258,6 +267,58 @@ registry (the chokepoint deliberately refuses `true`/`false`/`yes` spellings).",
                    batched/root_phases.rs:objective_directed_rows_enabled",
         }],
     };
+
+    /// `NY_SWEEP_CROSSING_TARGETS_ONLY` — spend the chunk row budget only on
+    /// targets that still have a crossing row, with a per-target window cursor.
+    pub SWEEP_CROSSING_TARGETS_ONLY = LeverDecl {
+        name: "NY_SWEEP_CROSSING_TARGETS_ONLY",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(false),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Restricts the comprehensive root sweep's per-chunk row budget to targets whose \
+FROZEN box still contains a crossing row (`lower < 0 < upper`), and gives each \
+surviving target its own window cursor instead of one shared cursor. Exact `1` \
+arms; absent, exact `0`, malformed UTF-8 and non-UTF-8 values all leave it dark, \
+and dark is byte-for-byte the uniform allocation that ships today.
+
+WHAT IT CHANGES. Off, every eligible target gets `row_limit` rows in every \
+chunk from one shared cursor, and the FIRST target to run off the end of its \
+balanced ordering ends the whole accumulation. On, a target with zero crossing \
+rows is omitted from every chunk, and a target that exhausts its ordering is \
+dropped while the survivors keep going. Per-chunk `total_rows` therefore falls \
+from `n_targets * row_limit` to `n_live_targets * row_limit`; the request is \
+never larger than today, per target or in total, so the backend's \
+`max_device_bytes` preflight can only get easier.
+
+WHY IT IS DARK ANYWAY. Eliding a zero-crossing target also forfeits the STABLE \
+rows the balanced selector would have spent there, and a wide-but-stable neuron \
+narrowed today can indirectly tighten a downstream crossing row. That \
+contribution is unquantified, so this ships off until an armed-vs-unarmed \
+comparison exists.
+
+IT CANNOT MAKE A BOUND UNSOUND, structurally rather than by promise. It is a \
+row-SELECTION change of exactly the class `NY_ROOT_OBJECTIVE_DIRECTED_ROWS` \
+already occupies: admission still requires \
+`provides_sound_gpu_crown() && provides_sound_intermediate_sweep()`, every \
+selected row is bounded by the identical sound backend sweep, candidates are \
+still copied from the FROZEN box and overwritten only at selected positions, \
+and publication is still a shrink-only `intersection_per_element_with_poll` \
+against the live map. The crossing census is computed from the same frozen \
+transcript the windows are cut from, so an earlier chunk's tightening cannot \
+shift a later chunk's ordering. When the elision leaves no live target the \
+route declines with the live map untouched. It is High-risk for the reason the \
+sibling selector is: it changes WHICH intermediate bounds get published on the \
+authoritative route.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "the shipped default reproduces the uniform-allocation sweep byte for \
+                     byte; no armed-vs-unarmed scored-row comparison exists yet, and the \
+                     dead-target census is a structural observation, not a verdict conversion",
+        },
+        owner: ROOT_SWEEP,
+        readers: SWEEP_CROSSING_TARGETS_READERS,
+    };
 }
 
 #[cfg(test)]
@@ -305,6 +366,29 @@ mod tests {
     }
 
     #[test]
+    fn crossing_target_elision_is_dark_and_needs_the_exact_arming_token() {
+        let absent = read_with(&SWEEP_CROSSING_TARGETS_ONLY, |_| None);
+        assert_eq!(absent.value, LeverValue::Bool(false));
+        assert_eq!(absent.source, Source::Default);
+
+        let armed = read_with(&SWEEP_CROSSING_TARGETS_ONLY, |_| Some("1".to_owned()));
+        assert!(armed.value.as_bool());
+
+        let disarmed = read_with(&SWEEP_CROSSING_TARGETS_ONLY, |_| Some("0".to_owned()));
+        assert!(!disarmed.value.as_bool());
+        assert_eq!(disarmed.source, Source::LegacyEnv);
+
+        // The chokepoint deliberately refuses `true`/`yes` spellings: a typo'd
+        // arming token is a RECORDED rejection that leaves the sweep dark, not a
+        // half-armed authoritative route.
+        for spelling in ["true", "yes", "on", " 1 "] {
+            let rejected = read_with(&SWEEP_CROSSING_TARGETS_ONLY, |_| Some(spelling.to_owned()));
+            assert!(!rejected.value.as_bool(), "{spelling}");
+            assert_eq!(rejected.source, Source::LegacyEnvRejected, "{spelling}");
+        }
+    }
+
+    #[test]
     fn every_override_is_dark_and_high_risk() {
         for decl in [
             &INTERM_ROW_CHUNKS,
@@ -312,6 +396,7 @@ mod tests {
             &ROOT_COMP_GPU_INTERM_SECS,
             &SWEEP_CLASS_MIB,
             &SWEEP_CLASS_ROWS,
+            &SWEEP_CROSSING_TARGETS_ONLY,
         ] {
             assert_eq!(decl.bucket, Bucket::Debug, "{}", decl.name);
             assert_eq!(decl.moat, MoatRisk::High, "{}", decl.name);

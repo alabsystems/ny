@@ -173,7 +173,7 @@ impl ConvertContext<'_> {
         // Div in ONNX: C = A / B
         // If the divisor (B) is a constant with a retrievable value, treat as DivConstant.
         // Otherwise, use binary DivLayer (e.g., for LayerNorm normalization).
-        // See #3186 for constant-without-value fallback rationale.
+        // A constant without a retrievable value also takes the binary path.
 
         if spec.inputs.len() != 2 {
             return Err(NyError::ModelLoad(format!(
@@ -214,7 +214,7 @@ impl ConvertContext<'_> {
     pub(crate) fn convert_sub(&self, spec: &LayerSpec) -> Result<Layer> {
         // Sub in ONNX: C = A - B
         // If one input is a constant with a retrievable value, treat as SubConstant.
-        // Otherwise, use binary SubLayer. See #3186 for constant-without-value fallback.
+        // Otherwise (including a constant without a retrievable value), use binary SubLayer.
 
         if spec.inputs.len() != 2 {
             return Err(NyError::ModelLoad(format!(
@@ -650,9 +650,9 @@ impl ConvertContext<'_> {
     /// catch-all `UnsupportedOp`, which `graph::builder` then swallows into a
     /// conservative `OpaqueSkip` — so an Atan2 node silently produced
     /// `[-inf, +inf]` instead of `Atan2Layer`'s quadrant-aware enclosure, with
-    /// no error anywhere to say verification had gone vacuous. Found by the
-    /// 2026-08-26 wiring audit; the bridge test that "covered" it only asserted
-    /// the graph BUILT, which an OpaqueSkip substitution satisfies.
+    /// no error anywhere to say verification had gone vacuous. The bridge test
+    /// that "covered" it only asserted the graph BUILT, which an OpaqueSkip
+    /// substitution satisfies.
     pub(crate) fn convert_atan2(&self, spec: &LayerSpec) -> Result<Layer> {
         if spec.inputs.len() != 2 {
             return Err(NyError::ModelLoad(format!(
@@ -678,7 +678,7 @@ impl ConvertContext<'_> {
     ///
     /// Three operand shapes are handled, in this order:
     ///
-    /// * **both operands constant** — refused (#3021). Emitting a binary layer
+    /// * **both operands constant** — refused. Emitting a binary layer
     ///   would take the extremum of one constant against whatever activation
     ///   the graph builder wired in the other slot, silently ignoring the
     ///   second constant. Constant-folding is the ONNX optimizer's job.
@@ -966,15 +966,12 @@ mod tests {
         );
     }
 
-    /// Regression test for #2969: non-scalar heterogeneous exponent must return error.
+    /// Regression test: non-scalar heterogeneous exponent must return error.
     #[test]
     fn convert_pow_rejects_heterogeneous_exponent_2969() {
         let (mut weights, shapes, constants) = make_context();
         // Insert a non-scalar exponent with different values per element
-        weights.insert(
-            "exp".to_string(),
-            arr1(&[2.0f32, 3.0, 4.0]).into_dyn(),
-        );
+        weights.insert("exp".to_string(), arr1(&[2.0f32, 3.0, 4.0]).into_dyn());
         let context = ConvertContext::new(&weights, &shapes, &constants);
         let spec = make_spec(LayerType::Pow, &["input", "exp"]);
 
@@ -996,10 +993,7 @@ mod tests {
         let (mut weights, mut shapes, constants) = make_context();
         shapes.insert("input".to_string(), vec![3]);
         // Insert a non-scalar exponent where all values are the same
-        weights.insert(
-            "exp".to_string(),
-            arr1(&[2.0f32, 2.0, 2.0]).into_dyn(),
-        );
+        weights.insert("exp".to_string(), arr1(&[2.0f32, 2.0, 2.0]).into_dyn());
         let context = ConvertContext::new(&weights, &shapes, &constants);
         let spec = make_spec(LayerType::Pow, &["input", "exp"]);
 
@@ -1017,10 +1011,7 @@ mod tests {
     #[test]
     fn convert_pow_rejects_homogeneous_exponent_that_expands_base_shape() {
         let (mut weights, shapes, constants) = make_context();
-        weights.insert(
-            "exp".to_string(),
-            arr1(&[2.0f32, 2.0, 2.0]).into_dyn(),
-        );
+        weights.insert("exp".to_string(), arr1(&[2.0f32, 2.0, 2.0]).into_dyn());
         let context = ConvertContext::new(&weights, &shapes, &constants);
         let spec = make_spec(LayerType::Pow, &["input", "exp"]);
 
@@ -1038,7 +1029,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #2969: scalar exponent should work as before.
+    /// Regression test: scalar exponent should work as before.
     #[test]
     fn convert_pow_accepts_scalar_exponent() {
         let (mut weights, shapes, constants) = make_context();
@@ -1076,7 +1067,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #2956: Pow with both constant inputs must return error,
+    /// Regression test: Pow with both constant inputs must return error,
     /// not identity (which silently discards the computation).
     #[test]
     fn convert_pow_rejects_both_constant_inputs_2956() {
@@ -1098,7 +1089,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #3021: Add with both constant inputs must return error,
+    /// Regression test: Add with both constant inputs must return error,
     /// not AddLayer (which silently passes input through without adding).
     #[test]
     fn convert_add_rejects_both_constant_inputs_3021() {
@@ -1120,7 +1111,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #3021: Min with both constant inputs must return error,
+    /// Regression test: Min with both constant inputs must return error,
     /// not MinBinaryLayer (which ignores one constant).
     #[test]
     fn convert_min_rejects_both_constant_inputs_3021() {
@@ -1142,7 +1133,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #3021: Max with both constant inputs must return error,
+    /// Regression test: Max with both constant inputs must return error,
     /// not MaxBinaryLayer (which ignores one constant).
     #[test]
     fn convert_max_rejects_both_constant_inputs_3021() {
@@ -1166,7 +1157,7 @@ mod tests {
 
     /// Sample points spanning each element's interval, for enclosure checks.
     fn interval_samples(lower: f32, upper: f32) -> [f32; 3] {
-        [lower, 0.5 * (lower + upper), upper]
+        [lower, f32::midpoint(lower, upper), upper]
     }
 
     /// `max(x, eps)` with a scalar constant lowers to a one-sided clamp, and the
@@ -1379,7 +1370,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #3021: Div with both constant inputs must return error,
+    /// Regression test: Div with both constant inputs must return error,
     /// not DivConstantLayer (which ignores the constant numerator).
     #[test]
     fn convert_div_rejects_both_constant_inputs_3021() {
@@ -1404,10 +1395,7 @@ mod tests {
     #[test]
     fn convert_add_rejects_non_finite_constant_4307() {
         let (mut weights, shapes, constants) = make_context();
-        weights.insert(
-            "const".to_string(),
-            arr1(&[1.0f32, f32::NAN]).into_dyn(),
-        );
+        weights.insert("const".to_string(), arr1(&[1.0f32, f32::NAN]).into_dyn());
         let context = ConvertContext::new(&weights, &shapes, &constants);
         let spec = make_spec(LayerType::Add, &["input", "const"]);
 
@@ -1473,7 +1461,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #3186: Add with one constant tensor (no value) and one
+    /// Regression test: Add with one constant tensor (no value) and one
     /// activation should produce binary AddLayer, not error.
     #[test]
     fn convert_add_constant_tensor_without_value_falls_back_to_binary_3186() {
@@ -1492,7 +1480,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #3186: Sub with constant tensor (no value) as second
+    /// Regression test: Sub with constant tensor (no value) as second
     /// input should produce binary SubLayer.
     #[test]
     fn convert_sub_constant_tensor_without_value_falls_back_to_binary_3186() {
@@ -1510,7 +1498,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #3186: Div with constant-tensor divisor (no value)
+    /// Regression test: Div with constant-tensor divisor (no value)
     /// should produce binary DivLayer.
     #[test]
     fn convert_div_constant_tensor_without_value_falls_back_to_binary_3186() {
@@ -1528,7 +1516,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #3186: Mul with constant tensor (no value) should
+    /// Regression test: Mul with constant tensor (no value) should
     /// produce binary MulBinaryLayer.
     #[test]
     fn try_convert_mul_constant_tensor_without_value_falls_back_to_binary_3186() {
@@ -1653,7 +1641,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #3186: Add with one constant tensor (no value) and
+    /// Regression test: Add with one constant tensor (no value) and
     /// one weight (has value) should produce unary AddConstant using the weight.
     #[test]
     fn convert_add_mixed_constant_tensor_and_weight_uses_available_value_3186() {
@@ -1673,7 +1661,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #2666: Add with extra inputs must be rejected.
+    /// Regression test: Add with extra inputs must be rejected.
     #[test]
     fn convert_add_rejects_extra_inputs_2666() {
         let (weights, shapes, constants) = make_context();
@@ -1692,7 +1680,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #2666: Sub with extra inputs must be rejected.
+    /// Regression test: Sub with extra inputs must be rejected.
     #[test]
     fn convert_sub_rejects_extra_inputs_2666() {
         let (weights, shapes, constants) = make_context();
@@ -1711,7 +1699,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #2666: Div with extra inputs must be rejected.
+    /// Regression test: Div with extra inputs must be rejected.
     #[test]
     fn convert_div_rejects_extra_inputs_2666() {
         let (weights, shapes, constants) = make_context();
@@ -1730,7 +1718,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #2666: Pow with extra inputs must be rejected.
+    /// Regression test: Pow with extra inputs must be rejected.
     #[test]
     fn convert_pow_rejects_extra_inputs_2666() {
         let (weights, shapes, constants) = make_context();

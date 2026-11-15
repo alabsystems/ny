@@ -2,15 +2,13 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Graph-DAG GPU-resident IBP plan lowering (#4276, #4318).
+//! Graph-DAG GPU-resident IBP plan lowering.
 //!
 //! Lowers a `GraphNetwork` into a [`GpuDagIbpPlanDesc`] when every node uses a
 //! supported layer type. Returns `None` on any unsupported node (fail-closed).
 //!
 //! Supported subset: `Linear`, `Conv2d(groups=1)`, `ReLU`, `Add`, `Flatten`,
 //! `Reshape`. This is lowering-only — no WGPU execution in this module.
-//!
-//! Reference: designs/2026-03-21-issue-4276-dag-ibp-child-packets.md §Packet A
 
 use std::collections::HashMap;
 
@@ -162,6 +160,14 @@ pub(crate) fn try_lower_graph_dag(
                 (op, output_shape)
             }
             Layer::AveragePool(pool) => {
+                // FAIL CLOSED on the global-3d flag: the GPU DAG op below is
+                // 2-D-window-only and would read a batch-squeezed (C, D, H, W)
+                // input as (batch, C, H, W) — the wrong-axis pool the flag
+                // forbids. No plan → the graph driver keeps the certified CPU
+                // path, which implements the flag.
+                if pool.global_3d {
+                    return None;
+                }
                 let input_idx = resolve_input_idx(inputs.first()?, &name_to_idx)?;
                 let in_shape = resolve_shape(input_idx, input_shape, &op_shapes);
                 let (batch_size, channels, in_h, in_w) = match in_shape {

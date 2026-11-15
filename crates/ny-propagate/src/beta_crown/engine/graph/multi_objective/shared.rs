@@ -57,19 +57,31 @@ pub(in crate::beta_crown::engine::graph) fn multi_objective_gpu_beta_enabled() -
 /// records `unsat` for this instance. So the child `upper` is not a certified
 /// upper bound on the child's sub-region.
 ///
-/// Mechanism: [`MultiObjectiveGraphBabDomain::with_constraint`] does NOT narrow
-/// the child's `node_bounds` — a ReLU split is carried ONLY by the child's β
-/// (Lagrangian) state. The relaxation `min f − β·s` with `β >= 0` certifies the
-/// LOWER bound of the objective on the constrained sub-region; the UPPER element
-/// of the same interval carries no valid certificate there.
+/// Mechanism (CORRECTED 2026-09-30, #warm-dag): the β term is NOT the cause.
+/// [`MultiObjectiveGraphBabDomain::with_constraint`] carries a ReLU split only
+/// through the child's β state, and that is a sound Lagrangian relaxation in
+/// BOTH directions: the constraint is `s·z_j >= 0` with `s = ±1`
+/// (`state/graph_beta/entry.rs`), every β is clamped `>= 0`, and the fold
+/// subtracts `s·β` from the lower coefficients and adds it to the upper ones
+/// (`bounds/linear.rs` `apply_beta_split_to_column`), i.e.
+/// `f >= L(z) - β·s·z_j` and `f <= U(z) + β·s·z_j` on the leaf — weak duality
+/// for any `β >= 0`. What corrupted every child and never the root was the lA
+/// WARM START: children are seeded at their last branch node with the block
+/// the parent held there, and on vit (residual + Concat) that block omits the
+/// skip-path blocks and the Add/Concat bias still pending in the parent's pass
+/// (`propagation/warm_start_guard.rs`). Both ends of the interval were wrong,
+/// so the same defect could also publish a false `Verified`. The seed sites
+/// now refuse such seeds; the drop gate below stays as a conservative
+/// completeness-only policy.
 ///
 /// Corroboration at scale (same instance, all five drop sites gated): BaB now
 /// runs to its deadline and `2366` of the `2367` domains it explores read as
 /// `any_violated` — 99.96 %, every one of them a split child, while the ROOT
-/// (the one domain with no β term) does NOT. If those readings were genuine the
-/// property would be violated on essentially the whole partition of the input
-/// box. That "every child but never the root" signature is exactly what a
-/// split-carrying β term corrupting the upper bound looks like.
+/// (the one domain never warm-started) does NOT. If those readings were genuine
+/// the property would be violated on essentially the whole partition of the
+/// input box. That "every child but never the root" signature is what an
+/// incomplete warm-start seed looks like (the root cache seeds every depth-1
+/// child).
 ///
 /// Why refusing to drop cannot lose a verdict: the drop never produced `sat`.
 /// It set `unresolved_due_to_violated_drop`, which forces the entire BaB run to
@@ -103,10 +115,11 @@ fn parse_bab_violated_child_drop(raw: Option<&str>) -> bool {
 /// * `split_depth > 0` — any BaB CHILD. `depth` counts split constraints, and
 ///   [`MultiObjectiveGraphBabDomain::with_constraint`] enforces a split ONLY
 ///   through the child's β (Lagrangian) state — it never narrows `node_bounds`.
-///   That relaxation certifies the LOWER bound direction; the UPPER element
-///   carries no valid certificate for the child's sub-region. Answer: NO. See
-///   [`bab_violated_child_drop_enabled`] for the measurement and the
-///   GT-independent soundness argument.
+///   The β relaxation itself is sound in both directions; the measured bad
+///   readings came from the lA warm start (see
+///   [`bab_violated_child_drop_enabled`]). A child's `upper < threshold` is
+///   still not a counterexample (it needs a witness), so it is not dropped.
+///   Answer: NO (a completeness-only policy).
 ///
 /// Consulted at ALL FIVE drop sites (enumerated in [`violdrop_site_probe`]) —
 /// they read the same β-derived interval through the same predicate, and gating
@@ -205,7 +218,7 @@ pub(crate) fn prune_verified_multi_objective_targets(
 /// per-objective interval also encloses the child's reachable objective values;
 /// the per-objective intersection `[max(l), min(u)]` is a valid — and never
 /// looser — enclosure. NaN in a fresh entry is preserved verbatim so the
-/// existing NaN rejection in `update_bounds` (#2982) still fires. A numerically
+/// existing NaN rejection in `update_bounds` still fires. A numerically
 /// inverted intersection (possible only from f32 slop between two sound
 /// enclosures) keeps the fresh bound (sound; matches legacy behavior).
 ///
@@ -394,10 +407,11 @@ pub(crate) fn merge_pruned_cached_las(
         merged_cached_las[idx] = match (merged_cached_las[idx].take(), cache) {
             (Some(inherited), Some(fresh)) => {
                 let mut union = (*inherited).clone();
-                union.lower_a.extend(fresh.lower_a);
-                union.upper_a.extend(fresh.upper_a);
-                union.lower_b.extend(fresh.lower_b);
-                union.upper_b.extend(fresh.upper_b);
+                // #la-warm-frontier: the four-map extend, plus frontier
+                // hygiene — an inherited frontier whose partner block `fresh`
+                // overwrote is dropped, `fresh`'s own frontiers are adopted
+                // (identical to the plain extend when neither carries any).
+                union.union_with_fresh(fresh);
                 Some(Arc::new(union))
             }
             (inherited, None) => inherited,
@@ -659,7 +673,7 @@ mod monotone_merge_tests {
         assert_eq!(merged[2], (-1.0, 1.0));
     }
 
-    /// NaN in a fresh entry must survive verbatim so `update_bounds` (#2982)
+    /// NaN in a fresh entry must survive verbatim so `update_bounds`
     /// still rejects the child as numerically corrupted — silently masking a
     /// failed pass with the parent's bound would hide the corruption.
     #[test]

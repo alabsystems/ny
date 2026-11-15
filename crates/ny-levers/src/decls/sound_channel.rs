@@ -584,6 +584,230 @@ unless NY_MARGIN_ROW_ALPHA_OPT is armed.",
         ],
     };
 
+    /// `NY_MARGIN_ROW_SPEC_ALPHA` — the per-START-NODE (spec) alpha axis.
+    pub MARGIN_ROW_SPEC_ALPHA = LeverDecl {
+        name: "NY_MARGIN_ROW_SPEC_ALPHA",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(false),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+#spec-alpha. After the margin-row root DIRECT pass has produced `dj[k]` per \
+adversarial class, run additional certified backward passes whose COLUMNS are \
+`(hardest class k, candidate alpha e)` pairs and fold the result into `dj[k]` by \
+ELEMENT-WISE MAX. Default OFF; the typed preset key is \
+`margin_row.spec_alpha` and the environment wins over it in both directions.
+
+WHY IT EXISTS. alpha-beta-CROWN optimises `alpha[relu][start_node]` of shape \
+`[2, spec, batch, *relu_shape]` — a distinct lower-relaxation slope per OUTPUT \
+NEURON of every start node — and gains a median +0.163 at the root on the rows \
+ny fails. ny holds ONE shared `(layer, neuron)` alpha for every class, and its \
+stand-in for the axis (`#interm-alpha`) is a fixed 5-candidate ladder measured \
+at +0.0025. This key adds exactly the axis abc KEEPS when it discards the rest: \
+the FINAL start node's spec axis, i.e. the adversarial class. (abc's \
+`share_alphas` collapses the intermediate start nodes' spec axis to 1 but \
+exempts the final node; `alpha_drop_unused` discards the intermediates entirely \
+before BaB.)
+
+WHY IT CANNOT COST A PROOF. Nothing is mutated — not `alpha`, `ms`, `s`, `c`, \
+`l`, `u`, `clip_rows`, the y-pack, the head gates or the tree's domain gates. \
+The candidates ride the engine's existing per-`(row, neuron)` `Exceptions` path, \
+which re-derives `ms = max(alpha, s)` per entry in shipped code, so this adds \
+ZERO lines of certified arithmetic. The published `dj[k]` is an element-wise max \
+of independently certified lower bounds, so `dj_armed[k] >= dj_dark[k]` for \
+every k and every candidate; a garbage candidate costs wall and nothing else. \
+Its cost is the wall the extra passes spend, which is why the width, candidate \
+and round counts are separate keys.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "the per-START-NODE alpha axis has never been built on this lane, so no \
+                     retained A/B qualifies a value; the declaration default is dark and the \
+                     dark path is one Option discriminant, byte-identical to the shipped root",
+        },
+        owner: PROPAGATE,
+        readers: &[
+            ReaderSite {
+                scope: PROPAGATE,
+                role: "freeze the scored per-start-node alpha policy",
+                site: "crates/ny-propagate/src/margin_row/mod.rs:RootAlphaRuntimePolicy::from_levers",
+            },
+            ReaderSite {
+                scope: PROPAGATE,
+                role: "resolve the compatibility process policy",
+                site: "crates/ny-propagate/src/margin_row/mod.rs:RootAlphaRuntimePolicy::from_layered_process",
+            },
+        ],
+    };
+
+    /// `NY_MARGIN_ROW_SPEC_ALPHA_WIDTH` — hardest failing classes given candidates.
+    pub MARGIN_ROW_SPEC_ALPHA_WIDTH = LeverDecl {
+        name: "NY_MARGIN_ROW_SPEC_ALPHA_WIDTH",
+        kind: LeverKind::UsizeTrimmed,
+        default: DefaultSpec::U64(3),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+#spec-alpha `W`: how many of the HARDEST still-failing adversarial classes \
+receive their own alpha candidates, default 3. Trimmed; absent or malformed \
+leaves 3, and the reader clamps to 1..=64. Selection is hardest-`dj`-first with \
+class id ascending as the data-independent tie-break, so it is deterministic. \
+Typed preset key `margin_row.spec_alpha_width`; inert when \
+`NY_MARGIN_ROW_SPEC_ALPHA` is dark.
+
+The refine pass costs `W * E` COLUMNS, not `W * E` passes — candidates are pass \
+WIDTH, because `MarginBatch::new` builds every row independently from its class \
+id with no dedup, so a replicated class list yields bit-identical duplicate \
+columns. That is the property the measured `#interm-alpha` 5->9 dose regression \
+(more candidate PASSES, strictly worse frontier on 5/5 near-closure rows) says \
+a successor must have.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "the per-START-NODE alpha axis has never been built on this lane, so no \
+                     retained A/B qualifies a value; the declaration default is dark and the \
+                     dark path is one Option discriminant, byte-identical to the shipped root",
+        },
+        owner: PROPAGATE,
+        readers: &[
+            ReaderSite {
+                scope: PROPAGATE,
+                role: "freeze the scored per-start-node alpha policy",
+                site: "crates/ny-propagate/src/margin_row/mod.rs:RootAlphaRuntimePolicy::from_levers",
+            },
+            ReaderSite {
+                scope: PROPAGATE,
+                role: "resolve the compatibility process policy",
+                site: "crates/ny-propagate/src/margin_row/mod.rs:RootAlphaRuntimePolicy::from_layered_process",
+            },
+        ],
+    };
+
+    /// `NY_MARGIN_ROW_SPEC_ALPHA_CANDS` — candidates per selected class.
+    pub MARGIN_ROW_SPEC_ALPHA_CANDS = LeverDecl {
+        name: "NY_MARGIN_ROW_SPEC_ALPHA_CANDS",
+        kind: LeverKind::UsizeTrimmed,
+        default: DefaultSpec::U64(3),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+#spec-alpha `E`: candidate alphas per selected class, PER FAMILY, default 3 and \
+clamped to 1..=8 by the reader. There are two families and their caps DIFFER, \
+which is stated here rather than left to be discovered:
+
+* the GRADIENT family — `clamp(alpha_incumbent + eta*sign(g_k), 0, 1)`, the \
+  per-start-node axis itself — takes `min(E, 8)`, the cardinality of \
+  `SPEC_ALPHA_ETA` (`1, 0.5, 0.25, 0.75, 0.125, 0.375, 0.0625, 0.03125`, \
+  most-distinct-first). The table was three entries, so `E > 3` silently \
+  delivered three; it is now eight and `E` is honoured end to end.
+* the LADDER family takes `min(E, 5)`, the cardinality of the five closed forms \
+  `start_node_gates` already enumerates — the rejected area-heuristic vertex, \
+  chord-parallel `s`, `0.5`, `midpoint(s, 1)`, `s/2` — REORDERED \
+  most-distinct-first so a truncated `E` keeps the informative ones. Those are \
+  GLOBAL UNIFORM alphas, identical for every class, so the ladder's per-class \
+  content is SELECTION ONLY and it is the already-measured `#interm-alpha` \
+  family.
+
+So round 1 issues up to `W * (min(E,8) + min(E,5))` columns and `E = 8` is the \
+first value at which both families are fully expressed. Typed preset key \
+`margin_row.spec_alpha_cands`; inert when the parent is dark.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "the per-START-NODE alpha axis has never been built on this lane, so no \
+                     retained A/B qualifies a value; the declaration default is dark and the \
+                     dark path is one Option discriminant, byte-identical to the shipped root",
+        },
+        owner: PROPAGATE,
+        readers: &[
+            ReaderSite {
+                scope: PROPAGATE,
+                role: "freeze the scored per-start-node alpha policy",
+                site: "crates/ny-propagate/src/margin_row/mod.rs:RootAlphaRuntimePolicy::from_levers",
+            },
+            ReaderSite {
+                scope: PROPAGATE,
+                role: "resolve the compatibility process policy",
+                site: "crates/ny-propagate/src/margin_row/mod.rs:RootAlphaRuntimePolicy::from_layered_process",
+            },
+        ],
+    };
+
+    /// `NY_MARGIN_ROW_SPEC_ALPHA_ROUNDS` — gradient rounds after the ladder.
+    pub MARGIN_ROW_SPEC_ALPHA_ROUNDS = LeverDecl {
+        name: "NY_MARGIN_ROW_SPEC_ALPHA_ROUNDS",
+        kind: LeverKind::UsizeTrimmed,
+        default: DefaultSpec::U64(1),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+#spec-alpha rounds, default 1, clamped to 1..=3. `1` runs the closed-form \
+ladder only. `>= 2` takes each class's BEST candidate from the previous round \
+and steps it by THAT CLASS'S OWN supergradient — which is what makes the axis \
+OPTIMISED rather than enumerated. Typed preset key \
+`margin_row.spec_alpha_rounds`; inert when the parent is dark.
+
+The gradient is `alpha_opt::supergradient` reused UNCHANGED: it already returns \
+the per-`(neuron, column)` quantity `vp * U` for one specific column, and \
+`mean_supergradient` then destroys that resolution by averaging over the K worst \
+columns. This key is the consumer that never averages. Each round costs one more \
+certified pass, so it is the key that prices the mechanism against the wall.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "the per-START-NODE alpha axis has never been built on this lane, so no \
+                     retained A/B qualifies a value; the declaration default is dark and the \
+                     dark path is one Option discriminant, byte-identical to the shipped root",
+        },
+        owner: PROPAGATE,
+        readers: &[
+            ReaderSite {
+                scope: PROPAGATE,
+                role: "freeze the scored per-start-node alpha policy",
+                site: "crates/ny-propagate/src/margin_row/mod.rs:RootAlphaRuntimePolicy::from_levers",
+            },
+            ReaderSite {
+                scope: PROPAGATE,
+                role: "resolve the compatibility process policy",
+                site: "crates/ny-propagate/src/margin_row/mod.rs:RootAlphaRuntimePolicy::from_layered_process",
+            },
+        ],
+    };
+
+    /// `NY_MARGIN_ROW_SPEC_ALPHA_ENTRIES` — hard cap on committed exceptions.
+    pub MARGIN_ROW_SPEC_ALPHA_ENTRIES = LeverDecl {
+        name: "NY_MARGIN_ROW_SPEC_ALPHA_ENTRIES",
+        kind: LeverKind::UsizeTrimmed,
+        default: DefaultSpec::U64(65_536),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+#spec-alpha memory governor: hard cap on exception entries committed per refine \
+pass, default 65536, reader-capped at 4194304 and additionally by the module's \
+own absolute ceiling. `0` REFUSES and prints `[spec-alpha] refuse: \
+entries_cap=0` rather than silently running unbounded. Over the cap, WHOLE \
+candidates are dropped from the end of the ladder — never partial ones, because \
+a half-applied ladder value is a different and undocumented relaxation. Typed \
+preset key `margin_row.spec_alpha_entries`; inert when the parent is dark.
+
+WHY IT IS A KEY AND NOT A CONSTANT. The margin-row lane consults NO memory \
+governor — `crown_memory`'s adaptive dense budget has zero callers under \
+`margin_row/` — and competition invokes ny with no cgroup, so \
+`process_memory_headroom_bytes()` returns `None` and nothing clamps anything. \
+This cap and the module constant are the only bounds that exist on this \
+allocation.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "the per-START-NODE alpha axis has never been built on this lane, so no \
+                     retained A/B qualifies a value; the declaration default is dark and the \
+                     dark path is one Option discriminant, byte-identical to the shipped root",
+        },
+        owner: PROPAGATE,
+        readers: &[
+            ReaderSite {
+                scope: PROPAGATE,
+                role: "freeze the scored per-start-node alpha policy",
+                site: "crates/ny-propagate/src/margin_row/mod.rs:RootAlphaRuntimePolicy::from_levers",
+            },
+            ReaderSite {
+                scope: PROPAGATE,
+                role: "resolve the compatibility process policy",
+                site: "crates/ny-propagate/src/margin_row/mod.rs:RootAlphaRuntimePolicy::from_layered_process",
+            },
+        ],
+    };
+
     /// `NY_MARGIN_ROW_K_ADAPT` — override the preset's adaptive-k choice.
     pub MARGIN_ROW_K_ADAPT = LeverDecl {
         name: "NY_MARGIN_ROW_K_ADAPT",
@@ -636,6 +860,57 @@ it changes which bound the lane publishes. Latched once per process.",
         readers: &[ReaderSite {
             scope: PROPAGATE,
             role: "arm the Clip-Verify half of the margin-row lane",
+            site: "crates/ny-propagate/src/margin_row/bab.rs",
+        }],
+    };
+
+    /// `NY_MARGIN_ROW_CLIP_HEAD` — per-domain HEAD-split halfspaces in that half.
+    pub MARGIN_ROW_CLIP_HEAD = LeverDecl {
+        name: "NY_MARGIN_ROW_CLIP_HEAD",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(false),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Arms HEAD-split halfspaces in the margin-row Clip-Verify half. Exact `1` arms it; \
+absence and every other value leave it dark. Read PER CALL (never latched): the \
+1620640eb incident froze three clip gates at their dark value before the vnncomp \
+bridge ran, and they then read as armed while doing nothing. \
+\
+WHAT IT DOES. `halfspaces_for_splits` builds halfspaces only from \
+`LayerGates::clip_rows`, and `RootGates::layers` holds TRUNK relus only, so a \
+HEAD sign fix produces no constraint: it moves exactly one interval \
+(`YBox::clamp`) and nothing else in the domain tightens. On the traced \
+alpha-beta-CROWN rows the head layer is the DOMINANT clip term (10 of 12 splits \
+land there; `clip_interm_domain` then re-concretizes 13-17 OTHER head neurons per \
+domain). This key builds the missing halfspaces from the y-pack's own certified \
+head lines and re-concretizes the other head columns before `head_gates`. \
+\
+WHY MoatRisk::High, given every step is shrink-only. The halfspace is only a \
+NECESSARY condition of its split if the certified slack the lane already paid is \
+subtracted from the line: a halfspace without it cuts into the TRUE subdomain, \
+which is a false-`unsat` generator and is the class fixed five times in the trunk \
+port. The slack is RECOVERED from the pack's untightened forward concretization \
+(never from `ly0/uy0` after `clip_tighten_pack`, never from the inherited entry \
+box), a rounding pad is ADDED so an over-recovery can only loosen, and a NEGATIVE \
+recovered slack refuses the whole pack rather than clamping. Deltas come from the \
+untouched `ybox_deltas` dual (non-negative by construction, `None` on refusal) and \
+commit with `max`/`min` against the forward base; a crossed interval is counted \
+and refused rather than read as an emptiness certificate. \
+\
+It needs NO `clip_rows` retention and does not consult `clip::frame_ok` — the head \
+lines come from the pack the eval already holds — so it can arm on a category that \
+retains nothing. Engagement observable: `[clip-head] armed`, then \
+`[clip-head] call= ... hs= moved= closes=`; `hs=0` everywhere is VOID, not \
+negative.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "dark exact-one Debug opt-in; the OFF arm computes no slack and takes no \
+                     branch, so it is byte-identical to the pre-change lane",
+        },
+        owner: PROPAGATE,
+        readers: &[ReaderSite {
+            scope: PROPAGATE,
+            role: "arm head-split halfspaces in the Clip-Verify half",
             site: "crates/ny-propagate/src/margin_row/bab.rs",
         }],
     };

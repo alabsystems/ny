@@ -230,6 +230,7 @@ impl GraphNetwork {
         weights: Option<&F64WeightCache>,
         deadline: Option<Instant>,
     ) -> Result<Vec<Interval64>> {
+        self.ensure_proof_eligible()?;
         let check_deadline = |stage: &str| -> Result<()> {
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 Err(NyError::DeadlineExceeded(format!(

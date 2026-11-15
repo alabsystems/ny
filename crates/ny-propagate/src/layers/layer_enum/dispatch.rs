@@ -123,7 +123,39 @@ impl Layer {
         // absolute weight exactly like `Linear`, and the carrier re-run would
         // under-estimate the penalty for an `A*W` contraction.
         let batched_propagates_err_directly = self.is_elementwise_activation()
-            || matches!(self, Layer::Linear(_) | Layer::BatchNorm(_));
+            || matches!(
+                self,
+                Layer::Linear(_)
+                    | Layer::BatchNorm(_)
+                    // Pure 1:1 SHAPE REMAPS (#cgan-shape-err-compose). Their batched
+                    // backward is `Ok(bounds.clone())` — a literal IDENTITY on the
+                    // coefficient matrix (the reshape is metadata only; the flat
+                    // coefficient layout is unchanged). An incoming certificate
+                    // `|A_stored - A_true| <= e` therefore holds VERBATIM on the
+                    // result, so the clone already propagates `lower_a_err`/
+                    // `upper_a_err` exactly and they must route here.
+                    //
+                    // Without this they fell to the dispatcher's output-box
+                    // discharge below, which folds a u-scale RELATIVE coefficient
+                    // error into an ABSOLUTE width penalty at intermediate-box
+                    // magnitude — the same mechanism that made BatchNorm the
+                    // dominant cGAN CROWN looseness before eb651c59, and it is
+                    // reachable on EVERY cgan model (`Linear -> Reshape -> BN ->
+                    // ConvTranspose`; 12 Reshape each, and the transformer variant
+                    // adds 64 Unsqueeze + 4 Squeeze).
+                    //
+                    // They are NOT carriers: the carrier re-run would OVERWRITE the
+                    // cloned err via `attach_err_from_carried` rather than keep the
+                    // exact pass-through, and there is no fresh err to add (an index
+                    // remap performs no arithmetic). This mirrors the SCALAR lane,
+                    // where `propagates_coeff_err()` has always listed all four.
+                    // `Transpose` reaches the same place as a carrier only because
+                    // its backward permutes coefficients rather than cloning them.
+                    | Layer::Flatten(_)
+                    | Layer::Reshape(_)
+                    | Layer::Squeeze(_)
+                    | Layer::Unsqueeze(_)
+            );
         // BatchNorm (#cgan-conv-err-compose): its batched backward is an EXACT
         // per-column scaling that now PROPAGATES incoming coeff error as `e·|scale|`
         // (mirroring crown_scalar.rs — see crown_batched.rs). It must therefore route
@@ -292,7 +324,7 @@ impl Layer {
             Ok(())
         };
 
-        // Elementwise activations: macro-generated match arms (#1708, #1753).
+        // Elementwise activations: macro-generated match arms.
         // All share identical calling convention: reshape pre-activation, then delegate.
         macro_rules! elementwise_batched_arms {
             ($($Variant:ident),*) => {
@@ -369,6 +401,9 @@ impl Layer {
                     }
                     // Linear layers (no pre-activation needed)
                     Layer::Linear(l) => l.propagate_linear_batched_maybe_engine(bounds, engine),
+                    Layer::PointLinear(_) => Err(NyError::UnsupportedOp(
+                        "PointLinear is point-only: batched CROWN needs a separately priced qualified adapter".into(),
+                    )),
                     // RoPE: linear (block-diagonal rotation), no pre-activation needed
                     Layer::RoPE(rope) => rope.propagate_linear_batched(bounds),
                     Layer::Conv1d(c) => {
@@ -427,9 +462,14 @@ impl Layer {
                         validate_flatten_like(require_pre_activation()?, "Flatten")?;
                         Ok(bounds.clone())
                     }
-                    Layer::Reshape(_) => {
-                        validate_flatten_like(require_pre_activation()?, "Reshape")?;
-                        Ok(bounds.clone())
+                    Layer::Reshape(r) => {
+                        let pre = require_pre_activation()?;
+                        if let Some(remapped) = r.try_remap_global_batched(bounds, pre.shape())? {
+                            Ok(remapped)
+                        } else {
+                            validate_flatten_like(pre, "Reshape")?;
+                            Ok(bounds.clone())
+                        }
                     }
                     Layer::Pad(p) => {
                         let pre = require_pre_activation()?;
@@ -453,18 +493,24 @@ impl Layer {
                         transpose_with_shape.set_input_shape(pre.shape().to_vec());
                         transpose_with_shape.propagate_linear_batched(bounds)
                     }
-                    // Slice: expand coefficients back to original size (#3188)
+                    // Slice: expand coefficients back to original size
                     Layer::Slice(s) => {
                         let pre = require_pre_activation()?;
                         s.propagate_linear_batched(bounds, pre)
                     }
-                    // Tile: sum coefficients from replicated output positions (#287)
+                    // Tile: sum coefficients from replicated output positions
                     Layer::Tile(t) => {
                         let pre = require_pre_activation()?;
                         t.propagate_linear_batched(bounds, pre)
                     }
-                    // Constant arithmetic (linear, no pre-activation needed)
-                    Layer::AddConstant(ac) => ac.propagate_linear_batched(bounds),
+                    // AddConstant needs the operand shape to prove that neither
+                    // side was expanded and to resolve the constant's broadcast
+                    // axis. The other constant-arithmetic layers carry their
+                    // own shape contract.
+                    Layer::AddConstant(ac) => {
+                        let pre = require_pre_activation()?;
+                        ac.propagate_linear_batched_with_operand_shape(bounds, pre.shape())
+                    }
                     Layer::SubConstant(sc) => sc.propagate_linear_batched(bounds),
                     Layer::MulConstant(mc) => mc.propagate_linear_batched(bounds),
                     Layer::DivConstant(dc) => dc.propagate_linear_batched(bounds),
@@ -497,7 +543,7 @@ impl Layer {
                         let pre = require_pre_activation()?;
                         rm.propagate_linear_batched(bounds, pre)
                     }
-                    // === Unsupported in batched CROWN (#3424) ===
+                    // === Unsupported in batched CROWN ===
                     // Every variant listed explicitly — no catch-all.
                     // Adding a new Layer variant is a compile error until
                     // it's added to a supported arm above or here.
@@ -612,7 +658,7 @@ macro_rules! impl_layer_bound_propagation {
 impl_layer_bound_propagation! {
     unary {
         // Linear / convolution
-        Linear(l), IntervalConst(ic), Conv1d(c), Conv2d(c), Conv3d(c),
+        Linear(l), PointLinear(pl), IntervalConst(ic), Conv1d(c), Conv2d(c), Conv3d(c),
         ConvTranspose1d(c), ConvTranspose2d(c),
         // Pooling
         AveragePool(ap), MaxPool2d(mp),

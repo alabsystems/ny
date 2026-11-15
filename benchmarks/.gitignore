@@ -12,4 +12,5 @@ vnncomp2026_benchmarks
 # Test results
 *.json
 !abcrown_transfer_corpus_v1.json
+!llm/manifests/pretrained_decoders_v1.json
 results/

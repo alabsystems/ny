@@ -4,7 +4,7 @@
 
 //! Shared graph domain-batch execution surface.
 //!
-//! Packet A for #4398 extracts one internal API that current graph/input-split
+//! This module extracts one internal API that current graph/input-split
 //! batch callers can route through without changing behavior. The underlying
 //! single-objective, multi-objective, and dense-spec implementations stay in
 //! their existing modules for now; later packets can move more mechanics behind
@@ -26,7 +26,8 @@ use crate::beta_crown::engine::domain_results::{
     GraphDomainResult, MultiObjectiveGraphDomainResult,
 };
 use crate::beta_crown::engine::graph::input_split::shared_specs::{
-    compute_crown_or_ibp_bounds_batched_specs, BatchedSpecBounds,
+    compute_crown_or_ibp_bounds_batched_specs,
+    compute_crown_or_ibp_bounds_batched_specs_with_domain_overrides, BatchedSpecBounds,
 };
 use crate::beta_crown::engine::BetaCrownVerifier;
 use crate::bounds::GraphAlphaState;
@@ -148,6 +149,31 @@ impl GraphDomainBatchExecutor {
         compute_crown_or_ibp_bounds_batched_specs(
             request.graph,
             request.input_bounds_batch,
+            request.spec_matrix,
+            request.engine,
+            request.alpha_node_bounds,
+            request.alpha_state,
+            request.mul_binary_alphas,
+            request.deadline,
+            request.crown_backward_layers,
+            request.ibp_enhancement,
+            request.stacked_rebound,
+            request.nested_deadline,
+        )
+    }
+
+    /// `#cgan-child-zono`: [`Self::execute_dense_specs`] where some domains
+    /// carry per-domain replacements for shared reference-map entries (see
+    /// `compute_crown_or_ibp_bounds_batched_specs_with_domain_overrides`).
+    /// Only the armed zonotope prepass routes here.
+    pub(in crate::beta_crown::engine::graph) fn execute_dense_specs_with_domain_overrides(
+        request: DenseSpecBatchRequest<'_>,
+        domain_overrides: &[Option<HashMap<String, BoundedTensor>>],
+    ) -> Result<BatchedSpecBounds> {
+        compute_crown_or_ibp_bounds_batched_specs_with_domain_overrides(
+            request.graph,
+            request.input_bounds_batch,
+            domain_overrides,
             request.spec_matrix,
             request.engine,
             request.alpha_node_bounds,

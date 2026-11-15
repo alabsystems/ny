@@ -23,80 +23,10 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 // ---------------------------------------------------------------------------
-// Minimal protobuf reader (ONNX is protobuf-encoded).
+// Protobuf wire reader (ONNX is protobuf-encoded): the shared, total
+// `ny_cert::protobuf::Reader` — malformed input is a `WireError`, not a panic.
 // ---------------------------------------------------------------------------
-struct Pb<'a> {
-    buf: &'a [u8],
-    i: usize,
-}
-impl<'a> Pb<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        Pb { buf, i: 0 }
-    }
-    fn eof(&self) -> bool {
-        self.i >= self.buf.len()
-    }
-    fn varint(&mut self) -> u64 {
-        let mut shift = 0u32;
-        let mut result = 0u64;
-        loop {
-            let b = self.buf[self.i];
-            self.i += 1;
-            result |= ((b & 0x7f) as u64) << shift;
-            if b & 0x80 == 0 {
-                break;
-            }
-            shift += 7;
-        }
-        result
-    }
-    /// Returns (field_number, wire_type).
-    fn tag(&mut self) -> (u64, u8) {
-        let t = self.varint();
-        (t >> 3, (t & 7) as u8)
-    }
-    fn bytes(&mut self) -> &'a [u8] {
-        let len = self.varint() as usize;
-        let s = &self.buf[self.i..self.i + len];
-        self.i += len;
-        s
-    }
-    fn fixed32(&mut self) -> [u8; 4] {
-        let s = [
-            self.buf[self.i],
-            self.buf[self.i + 1],
-            self.buf[self.i + 2],
-            self.buf[self.i + 3],
-        ];
-        self.i += 4;
-        s
-    }
-    #[allow(dead_code)] // wire-type helper kept for completeness alongside fixed32/skip
-    fn fixed64(&mut self) -> [u8; 8] {
-        let mut s = [0u8; 8];
-        s.copy_from_slice(&self.buf[self.i..self.i + 8]);
-        self.i += 8;
-        s
-    }
-    /// Skip a field of the given wire type.
-    fn skip(&mut self, wt: u8) {
-        match wt {
-            0 => {
-                self.varint();
-            }
-            2 => {
-                let _ = self.bytes();
-            }
-            5 => {
-                self.i += 4;
-            }
-            1 => {
-                self.i += 8;
-            }
-            _ => panic!("unknown wire type {wt}"),
-        }
-    }
-}
+use ny_cert::protobuf::{Reader as Pb, WireError};
 
 // ---------------------------------------------------------------------------
 // ONNX structures we care about.
@@ -135,77 +65,77 @@ struct OnnxGraph {
 /// type=2(TypeProto). TypeProto: tensor_type=1. Tensor: elem_type=1, shape=2.
 /// TensorShapeProto: dim=1(Dimension). Dimension: dim_value=1(int64). Unknown
 /// (symbolic) dims parse as 0.
-fn parse_value_info(buf: &[u8]) -> Option<(String, Vec<i64>)> {
+fn parse_value_info(buf: &[u8]) -> Result<Option<(String, Vec<i64>)>, WireError> {
     let mut pb = Pb::new(buf);
     let mut name = String::new();
     let mut shape: Option<Vec<i64>> = None;
     while !pb.eof() {
-        let (fn_, wt) = pb.tag();
+        let (fn_, wt) = pb.tag()?;
         match (fn_, wt) {
-            (1, 2) => name = String::from_utf8_lossy(pb.bytes()).into_owned(),
-            (2, 2) => shape = parse_type_proto(pb.bytes()),
-            _ => pb.skip(wt),
+            (1, 2) => name = String::from_utf8_lossy(pb.bytes()?).into_owned(),
+            (2, 2) => shape = parse_type_proto(pb.bytes()?)?,
+            _ => pb.skip(wt)?,
         }
     }
     if name.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some((name, shape.unwrap_or_default()))
+    Ok(Some((name, shape.unwrap_or_default())))
 }
 
-fn parse_type_proto(buf: &[u8]) -> Option<Vec<i64>> {
+fn parse_type_proto(buf: &[u8]) -> Result<Option<Vec<i64>>, WireError> {
     let mut pb = Pb::new(buf);
     let mut shape = None;
     while !pb.eof() {
-        let (fn_, wt) = pb.tag();
+        let (fn_, wt) = pb.tag()?;
         match (fn_, wt) {
-            (1, 2) => shape = parse_tensor_type(pb.bytes()), // tensor_type
-            _ => pb.skip(wt),
+            (1, 2) => shape = parse_tensor_type(pb.bytes()?)?, // tensor_type
+            _ => pb.skip(wt)?,
         }
     }
-    shape
+    Ok(shape)
 }
 
-fn parse_tensor_type(buf: &[u8]) -> Option<Vec<i64>> {
+fn parse_tensor_type(buf: &[u8]) -> Result<Option<Vec<i64>>, WireError> {
     let mut pb = Pb::new(buf);
     let mut shape = None;
     while !pb.eof() {
-        let (fn_, wt) = pb.tag();
+        let (fn_, wt) = pb.tag()?;
         match (fn_, wt) {
-            (2, 2) => shape = Some(parse_tensor_shape(pb.bytes())), // shape
-            _ => pb.skip(wt),
+            (2, 2) => shape = Some(parse_tensor_shape(pb.bytes()?)?), // shape
+            _ => pb.skip(wt)?,
         }
     }
-    shape
+    Ok(shape)
 }
 
-fn parse_tensor_shape(buf: &[u8]) -> Vec<i64> {
+fn parse_tensor_shape(buf: &[u8]) -> Result<Vec<i64>, WireError> {
     let mut pb = Pb::new(buf);
     let mut dims = vec![];
     while !pb.eof() {
-        let (fn_, wt) = pb.tag();
+        let (fn_, wt) = pb.tag()?;
         match (fn_, wt) {
-            (1, 2) => dims.push(parse_dimension(pb.bytes())), // dim
-            _ => pb.skip(wt),
+            (1, 2) => dims.push(parse_dimension(pb.bytes()?)?), // dim
+            _ => pb.skip(wt)?,
         }
     }
-    dims
+    Ok(dims)
 }
 
-fn parse_dimension(buf: &[u8]) -> i64 {
+fn parse_dimension(buf: &[u8]) -> Result<i64, WireError> {
     let mut pb = Pb::new(buf);
     let mut v = 0i64; // 0 == unknown/symbolic
     while !pb.eof() {
-        let (fn_, wt) = pb.tag();
+        let (fn_, wt) = pb.tag()?;
         match (fn_, wt) {
-            (1, 0) => v = pb.varint() as i64, // dim_value
-            _ => pb.skip(wt),
+            (1, 0) => v = pb.varint()? as i64, // dim_value
+            _ => pb.skip(wt)?,
         }
     }
-    v
+    Ok(v)
 }
 
-fn parse_node(buf: &[u8]) -> OnnxNode {
+fn parse_node(buf: &[u8]) -> Result<OnnxNode, WireError> {
     // NodeProto: input=1(str), output=2(str), op_type=4(str), attribute=5(AttributeProto)
     let mut pb = Pb::new(buf);
     let mut n = OnnxNode {
@@ -215,24 +145,24 @@ fn parse_node(buf: &[u8]) -> OnnxNode {
         attr_ints: BTreeMap::new(),
     };
     while !pb.eof() {
-        let (fn_, wt) = pb.tag();
+        let (fn_, wt) = pb.tag()?;
         match (fn_, wt) {
             (1, 2) => n
                 .inputs
-                .push(String::from_utf8_lossy(pb.bytes()).into_owned()),
+                .push(String::from_utf8_lossy(pb.bytes()?).into_owned()),
             (2, 2) => n
                 .outputs
-                .push(String::from_utf8_lossy(pb.bytes()).into_owned()),
-            (4, 2) => n.op_type = String::from_utf8_lossy(pb.bytes()).into_owned(),
+                .push(String::from_utf8_lossy(pb.bytes()?).into_owned()),
+            (4, 2) => n.op_type = String::from_utf8_lossy(pb.bytes()?).into_owned(),
             (5, 2) => {
-                if let Some((name, ints)) = parse_attr_ints(pb.bytes()) {
+                if let Some((name, ints)) = parse_attr_ints(pb.bytes()?)? {
                     n.attr_ints.insert(name, ints);
                 }
             }
-            _ => pb.skip(wt),
+            _ => pb.skip(wt)?,
         }
     }
-    n
+    Ok(n)
 }
 
 /// Parse an AttributeProto, extracting the name and any integer payload.
@@ -240,39 +170,39 @@ fn parse_node(buf: &[u8]) -> OnnxNode {
 /// packed or unpacked). Returns `None` when the attribute carries no integer
 /// list we can use (e.g. a string/tensor attr) — those are irrelevant to the
 /// exact Conv->affine lowering.
-fn parse_attr_ints(buf: &[u8]) -> Option<(String, Vec<i64>)> {
+fn parse_attr_ints(buf: &[u8]) -> Result<Option<(String, Vec<i64>)>, WireError> {
     let mut pb = Pb::new(buf);
     let mut name = String::new();
     let mut single: Option<i64> = None;
     let mut list: Vec<i64> = vec![];
     while !pb.eof() {
-        let (fn_, wt) = pb.tag();
+        let (fn_, wt) = pb.tag()?;
         match (fn_, wt) {
-            (1, 2) => name = String::from_utf8_lossy(pb.bytes()).into_owned(),
-            (3, 0) => single = Some(pb.varint() as i64),
-            (8, 0) => list.push(pb.varint() as i64), // unpacked repeated int64
+            (1, 2) => name = String::from_utf8_lossy(pb.bytes()?).into_owned(),
+            (3, 0) => single = Some(pb.varint()? as i64),
+            (8, 0) => list.push(pb.varint()? as i64), // unpacked repeated int64
             (8, 2) => {
                 // packed repeated int64
-                let b = pb.bytes();
+                let b = pb.bytes()?;
                 let mut p2 = Pb::new(b);
                 while !p2.eof() {
-                    list.push(p2.varint() as i64);
+                    list.push(p2.varint()? as i64);
                 }
             }
-            _ => pb.skip(wt),
+            _ => pb.skip(wt)?,
         }
     }
     if name.is_empty() {
-        return None;
+        return Ok(None);
     }
     if !list.is_empty() {
-        Some((name, list))
+        Ok(Some((name, list)))
     } else {
-        single.map(|s| (name, vec![s]))
+        Ok(single.map(|s| (name, vec![s])))
     }
 }
 
-fn parse_tensor(buf: &[u8]) -> OnnxTensor {
+fn parse_tensor(buf: &[u8]) -> Result<OnnxTensor, WireError> {
     // TensorProto: dims=1(int64 repeated), data_type=2, float_data=4(repeated float),
     //              name=8(str), raw_data=9(bytes)
     let mut pb = Pb::new(buf);
@@ -284,29 +214,29 @@ fn parse_tensor(buf: &[u8]) -> OnnxTensor {
     let mut raw: Option<Vec<u8>> = None;
     let mut float_data: Vec<f32> = vec![];
     while !pb.eof() {
-        let (fn_, wt) = pb.tag();
+        let (fn_, wt) = pb.tag()?;
         match (fn_, wt) {
-            (1, 0) => t.dims.push(pb.varint() as i64),
+            (1, 0) => t.dims.push(pb.varint()? as i64),
             (1, 2) => {
                 // packed repeated int64 dims
-                let b = pb.bytes();
+                let b = pb.bytes()?;
                 let mut p2 = Pb::new(b);
                 while !p2.eof() {
-                    t.dims.push(p2.varint() as i64);
+                    t.dims.push(p2.varint()? as i64);
                 }
             }
-            (4, 5) => float_data.push(f32::from_le_bytes(pb.fixed32())),
+            (4, 5) => float_data.push(f32::from_le_bytes(pb.fixed32()?)),
             (4, 2) => {
                 // packed repeated float
-                let b = pb.bytes();
+                let b = pb.bytes()?;
                 let mut p2 = Pb::new(b);
                 while !p2.eof() {
-                    float_data.push(f32::from_le_bytes(p2.fixed32()));
+                    float_data.push(f32::from_le_bytes(p2.fixed32()?));
                 }
             }
-            (8, 2) => t.name = String::from_utf8_lossy(pb.bytes()).into_owned(),
-            (9, 2) => raw = Some(pb.bytes().to_vec()),
-            _ => pb.skip(wt),
+            (8, 2) => t.name = String::from_utf8_lossy(pb.bytes()?).into_owned(),
+            (9, 2) => raw = Some(pb.bytes()?.to_vec()),
+            _ => pb.skip(wt)?,
         }
     }
     if let Some(r) = raw {
@@ -317,49 +247,87 @@ fn parse_tensor(buf: &[u8]) -> OnnxTensor {
     } else {
         t.floats = float_data;
     }
-    t
+    Ok(t)
 }
 
-fn parse_onnx(data: &[u8]) -> OnnxGraph {
+fn parse_onnx(data: &[u8]) -> Result<OnnxGraph, OnnxError> {
     // ModelProto: graph=7 (GraphProto)
     let mut pb = Pb::new(data);
     let mut graph_bytes: Option<&[u8]> = None;
     while !pb.eof() {
-        let (fn_, wt) = pb.tag();
+        let (fn_, wt) = pb.tag()?;
         if fn_ == 7 && wt == 2 {
-            graph_bytes = Some(pb.bytes());
+            graph_bytes = Some(pb.bytes()?);
         } else {
-            pb.skip(wt);
+            pb.skip(wt)?;
         }
     }
-    let gb = graph_bytes.expect("no graph in ONNX");
+    let gb = graph_bytes.ok_or(OnnxError::NoGraph)?;
     // GraphProto: node=1(NodeProto), initializer=5(TensorProto)
     let mut pb = Pb::new(gb);
     let mut nodes = vec![];
     let mut inits = BTreeMap::new();
     let mut input_shapes = BTreeMap::new();
     while !pb.eof() {
-        let (fn_, wt) = pb.tag();
+        let (fn_, wt) = pb.tag()?;
         match (fn_, wt) {
-            (1, 2) => nodes.push(parse_node(pb.bytes())),
+            (1, 2) => nodes.push(parse_node(pb.bytes()?)?),
             (5, 2) => {
-                let t = parse_tensor(pb.bytes());
+                let t = parse_tensor(pb.bytes()?)?;
                 inits.insert(t.name.clone(), t);
             }
             (11, 2) => {
                 // GraphProto.input (ValueInfoProto)
-                if let Some((name, shape)) = parse_value_info(pb.bytes()) {
+                if let Some((name, shape)) = parse_value_info(pb.bytes()?)? {
                     input_shapes.insert(name, shape);
                 }
             }
-            _ => pb.skip(wt),
+            _ => pb.skip(wt)?,
         }
     }
-    OnnxGraph {
+    Ok(OnnxGraph {
         nodes,
         inits,
         input_shapes,
+    })
+}
+
+/// Why an `.onnx` model could not be decoded.
+#[derive(Debug)]
+enum OnnxError {
+    /// The protobuf encoding itself is malformed (truncated, overlong, ...).
+    Wire(WireError),
+    /// The ModelProto carries no `graph` field.
+    NoGraph,
+}
+
+impl From<WireError> for OnnxError {
+    fn from(e: WireError) -> Self {
+        Self::Wire(e)
     }
+}
+
+impl std::fmt::Display for OnnxError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Wire(e) => write!(f, "malformed ONNX protobuf: {e}"),
+            Self::NoGraph => f.write_str("no graph in ONNX"),
+        }
+    }
+}
+
+/// Read and decode an `.onnx` file, or report why not and exit with status 2
+/// (the usage/input-error status). A malformed model used to panic inside the
+/// protobuf reader; it is now a diagnostic.
+fn load_onnx_or_exit(path: &str) -> OnnxGraph {
+    let data = std::fs::read(path).unwrap_or_else(|e| {
+        eprintln!("certify_onnx_diff: cannot read {path}: {e}");
+        std::process::exit(2);
+    });
+    parse_onnx(&data).unwrap_or_else(|e| {
+        eprintln!("certify_onnx_diff: {path}: {e}");
+        std::process::exit(2);
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -380,53 +348,147 @@ struct AffineLayer {
     b: Vec<Rat>,      // [out]
 }
 
+/// A loaded network: hidden layers (each followed by ReLU) and a linear
+/// read-out. The read-out is its own field rather than the last element of one
+/// `Vec`, so "every loaded net has a read-out" is a fact of the type and no
+/// caller computes `layers.len() - 1`.
 struct LoadedNet {
-    layers: Vec<AffineLayer>, // each followed by ReLU except the last (linear read-out)
+    hidden: Vec<AffineLayer>,
+    readout: AffineLayer,
     input_dim: usize,
 }
 
+/// One affine layer `W·a + b` applied exactly (no activation). Rows of `W` and
+/// entries of `b` pair up; each dot product runs over `a` in increasing index.
+fn affine_exact(layer: &AffineLayer, a: &[Rat]) -> Vec<Rat> {
+    assert!(
+        layer.b.len() >= layer.w.len(),
+        "layer bias shorter than its width"
+    );
+    let mut z = Vec::new();
+    for (row, b) in layer.w.iter().zip(&layer.b) {
+        assert!(
+            row.len() <= a.len(),
+            "weight row wider than the layer input"
+        );
+        let mut acc = *b;
+        for (wi, ai) in row.iter().zip(a) {
+            acc = acc.add(wi.mul(*ai).unwrap()).unwrap();
+        }
+        z.push(acc);
+    }
+    z
+}
+
 impl LoadedNet {
+    /// Every affine layer in order: the hidden layers, then the read-out.
+    fn layers(&self) -> impl Iterator<Item = &AffineLayer> {
+        self.hidden.iter().chain(std::iter::once(&self.readout))
+    }
+
     /// Exact forward evaluation of the FULL network (all output logits) at input
     /// `x`. Every hidden layer is `relu(W·x + b)`; the last layer is the linear
     /// read-out. Used by the ONNX-equivalence self-check (compared against
     /// onnxruntime) to prove the Conv->affine lowering is exact.
     fn eval_full(&self, x: &[Rat]) -> Vec<Rat> {
         let mut a: Vec<Rat> = x.to_vec();
-        let last = self.layers.len() - 1;
-        for (li, layer) in self.layers.iter().enumerate() {
-            let mut z = vec![Rat::ZERO; layer.w.len()];
-            for (o, row) in layer.w.iter().enumerate() {
-                let mut acc = layer.b[o];
-                for (i, wi) in row.iter().enumerate() {
-                    acc = acc.add(wi.mul(a[i]).unwrap()).unwrap();
-                }
-                z[o] = acc;
-            }
-            if li < last {
-                for zi in z.iter_mut() {
-                    if zi.is_negative() {
-                        *zi = Rat::ZERO;
-                    }
+        for layer in &self.hidden {
+            let mut z = affine_exact(layer, &a);
+            for zi in z.iter_mut() {
+                if zi.is_negative() {
+                    *zi = Rat::ZERO;
                 }
             }
             a = z;
         }
-        a
+        affine_exact(&self.readout, &a)
     }
+}
+
+/// Longest vector this binary allocates for one layer, input box or output:
+/// 2^23 entries (32 MiB of `Rat` ids, 64 MiB of `f64`, 192 MiB for the row
+/// table of a 2^23-row matrix). Model dims are untrusted input; past this
+/// bound the loaders and the bound passes fail closed (`width_unsupported`)
+/// instead of asking the allocator for an input-chosen size. It sits as high
+/// as the verified lane's per-allocation bound (under 2^28 bytes) allows, far
+/// above the supported networks (ACAS Xu: 50 wide, cersyve: < 100) and above
+/// a 3x1024x1024 image input (3.1M), which an earlier 2^20 cap refused.
+const MAX_LAYER_WIDTH: usize = 1 << 23;
+
+/// Most entries in one matrix whose SHAPE the model chooses without backing
+/// it with data: identity read-outs, DAG basis identities and pass-through
+/// blocks, Gemm results over a basis. 2^26 entries (256 MiB of `Rat` ids,
+/// e.g. an 8192 x 8192 identity). A per-dimension bound alone is not enough:
+/// a 62-byte model declaring a `[2^20, 0]` Gemm asked for a 2^20 x 2^20
+/// identity (2^40 entries). Weight matrices (`rat_mat`) share the bound: a
+/// single layer of more than 2^26 weights (a 256 MiB f32 tensor) is refused.
+const MAX_MATRIX_ENTRIES: usize = 1 << 26;
+
+/// Fail closed on a width past [`MAX_LAYER_WIDTH`]: a diagnostic and exit
+/// status 2 (the same status as a malformed model), not an allocation of an
+/// input-chosen size.
+fn width_unsupported(n: usize) -> ! {
+    eprintln!("MODEL_UNSUPPORTED: vector width {n} exceeds MAX_LAYER_WIDTH ({MAX_LAYER_WIDTH})");
+    std::process::exit(2);
+}
+
+/// `n` exact zeros; fails closed past `MAX_LAYER_WIDTH`.
+fn zeros_rat(n: usize) -> Vec<Rat> {
+    if n > MAX_LAYER_WIDTH {
+        width_unsupported(n);
+    }
+    vec![Rat::ZERO; n]
+}
+
+/// Fail closed on a matrix shape past [`MAX_MATRIX_ENTRIES`]: a diagnostic
+/// and exit status 2, not an allocation of an input-chosen size.
+fn matrix_unsupported(rows: usize, cols: usize) -> ! {
+    eprintln!(
+        "MODEL_UNSUPPORTED: matrix {rows}x{cols} exceeds MAX_MATRIX_ENTRIES ({MAX_MATRIX_ENTRIES})"
+    );
+    std::process::exit(2);
+}
+
+/// A `rows x cols` exact zero matrix; fails closed when `rows * cols` is past
+/// `MAX_MATRIX_ENTRIES` (or `rows` past `MAX_LAYER_WIDTH`, for `cols == 0`).
+fn zero_rat_matrix(rows: usize, cols: usize) -> Vec<Vec<Rat>> {
+    let within = rows
+        .checked_mul(cols)
+        .is_some_and(|entries| entries <= MAX_MATRIX_ENTRIES);
+    if !within || rows > MAX_LAYER_WIDTH {
+        matrix_unsupported(rows, cols);
+    }
+    if rows == 0 {
+        return Vec::new();
+    }
+    vec![zeros_rat(cols); rows]
 }
 
 fn rat_mat(t: &OnnxTensor, rows: usize, cols: usize) -> Result<Vec<Vec<Rat>>, RatError> {
     // ONNX MatMul stores W as [in, out] row-major (in*out). We want [out][in].
+    // `rows`/`cols` come from the model's (untrusted) dims: an overflowing
+    // product is a size mismatch, not an arithmetic-overflow panic.
     assert_eq!(
-        t.floats.len(),
-        rows * cols,
+        Some(t.floats.len()),
+        rows.checked_mul(cols),
         "matrix size mismatch for {}",
         t.name
     );
-    let mut out = vec![vec![Rat::ZERO; rows]; cols]; // [out=cols][in=rows]
-    for r in 0..rows {
-        for c in 0..cols {
-            out[c][r] = f32_to_rat(t.floats[r * cols + c])?;
+    // Convert in the stored (row-major) order, so the first bad weight is the
+    // one reported, then transpose: column `c` of the stored matrix is every
+    // `cols`-th entry starting at `c`. No index arithmetic.
+    let flat: Vec<Rat> = t
+        .floats
+        .iter()
+        .map(|&f| f32_to_rat(f))
+        .collect::<Result<_, _>>()?;
+    if cols == 0 {
+        return Ok(Vec::new()); // [out=0][in=rows]: no columns
+    }
+    let mut out = zero_rat_matrix(cols, rows); // [out=cols][in=rows]
+    for (c, col) in out.iter_mut().enumerate() {
+        for (slot, v) in col.iter_mut().zip(flat.iter().skip(c).step_by(cols)) {
+            *slot = *v;
         }
     }
     Ok(out)
@@ -783,31 +845,38 @@ fn load_net(g: &OnnxGraph) -> LoadedNet {
             }
             "Relu" => {
                 let w = cur_w.take().expect("relu without matmul");
-                let b = cur_b.take().unwrap_or_else(|| vec![Rat::ZERO; w.len()]);
+                // A zero bias with one entry per output row of `w`.
+                let b = cur_b.take().unwrap_or_else(|| zeros_rat(w.len()));
                 layers.push(AffineLayer { w, b });
             }
             other => panic!("unsupported op {other}"),
         }
     }
     // Final linear read-out (the last MatMul+Add not followed by Relu).
-    if let Some(w) = cur_w.take() {
-        let b = cur_b.take().unwrap_or_else(|| vec![Rat::ZERO; w.len()]);
-        layers.push(AffineLayer { w, b });
+    let readout = if let Some(w) = cur_w.take() {
+        let b = cur_b.take().unwrap_or_else(|| zeros_rat(w.len()));
+        AffineLayer { w, b }
     } else {
         // The network ENDS in a ReLU (the last hidden layer is the output, e.g.
         // y = ReLU(W x)).  DeepReluProblem requires a linear read-out after the
         // last ReLU, so synthesize an identity read-out  y = a_last.
         let last_width = layers.last().expect("no layers at all").w.len();
-        let mut w = vec![vec![Rat::ZERO; last_width]; last_width];
-        for d in 0..last_width {
-            w[d][d] = Rat::ONE;
+        let mut w = zero_rat_matrix(last_width, last_width);
+        for (d, row) in w.iter_mut().enumerate() {
+            if let Some(diag) = row.get_mut(d) {
+                *diag = Rat::ONE; // square: `d < last_width` always
+            }
         }
-        layers.push(AffineLayer {
+        AffineLayer {
             w,
-            b: vec![Rat::ZERO; last_width],
-        });
+            b: zeros_rat(last_width),
+        }
+    };
+    LoadedNet {
+        hidden: layers,
+        readout,
+        input_dim,
     }
-    LoadedNet { layers, input_dim }
 }
 
 // ---------------------------------------------------------------------------
@@ -936,13 +1005,12 @@ fn main() {
         .expect("certify_onnx_diff needs idx_b");
 
     let t0 = Instant::now();
-    let data = std::fs::read(onnx_path).expect("read onnx");
-    let g = parse_onnx(&data);
+    let g = load_onnx_or_exit(onnx_path);
     let net = load_net(&g);
     let load_us = t0.elapsed().as_micros();
 
-    let n_hidden = net.layers.len() - 1;
-    let widths: Vec<usize> = net.layers.iter().map(|l| l.w.len()).collect();
+    let n_hidden = net.hidden.len();
+    let widths: Vec<usize> = net.layers().map(|l| l.w.len()).collect();
     eprintln!(
         "[load] input_dim={} hidden_layers={} layer_widths={:?} ({} us)",
         net.input_dim, n_hidden, widths, load_us
@@ -1030,9 +1098,9 @@ fn main() {
     }
 
     // Build DeepReluProblem with hidden layers and read-out.
-    let hidden_w: Vec<Vec<Vec<Rat>>> = net.layers[..n_hidden].iter().map(|l| l.w.clone()).collect();
-    let hidden_b: Vec<Vec<Rat>> = net.layers[..n_hidden].iter().map(|l| l.b.clone()).collect();
-    let readout = &net.layers[n_hidden];
+    let hidden_w: Vec<Vec<Vec<Rat>>> = net.hidden.iter().map(|l| l.w.clone()).collect();
+    let hidden_b: Vec<Vec<Rat>> = net.hidden.iter().map(|l| l.b.clone()).collect();
+    let readout = &net.readout;
     let out_dim = readout.w.len();
 
     // DIFFERENCE read-out: g = Y_a - Y_b = (w_a - w_b).a_last + (b_a - b_b).
@@ -1298,4 +1366,82 @@ fn fmt_rat(r: &Rat) -> String {
 /// diagnostics only. Never used in a certificate or a soundness decision.
 fn rat_to_f64(r: &Rat) -> f64 {
     r.to_f64_approx()
+}
+
+#[cfg(test)]
+mod onnx_wire_tests {
+    use super::*;
+
+    fn varint(mut v: u64, out: &mut Vec<u8>) {
+        while v >= 0x80 {
+            out.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        out.push(v as u8);
+    }
+
+    /// One length-delimited field (wire type 2).
+    fn ld(field: u64, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        varint((field << 3) | 2, &mut out);
+        varint(payload.len() as u64, &mut out);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// ModelProto{ graph: GraphProto{ node Conv(x)->y with kernel_shape=[3,3],
+    /// init w=[0.5], input x: [1, 4] } }.
+    fn model() -> Vec<u8> {
+        let mut attr = ld(1, b"kernel_shape");
+        attr.extend(ld(8, &[3, 3])); // packed ints
+        let mut node = ld(1, b"x");
+        node.extend(ld(2, b"y"));
+        node.extend(ld(4, b"Conv"));
+        node.extend(ld(5, &attr));
+        let mut tensor = vec![0x08, 0x01]; // unpacked dims [1]
+        tensor.extend(ld(8, b"w"));
+        tensor.extend(ld(9, &0.5f32.to_le_bytes()));
+        let mut shape = ld(1, &[0x08, 0x01]); // dim_value 1
+        shape.extend(ld(1, &[0x08, 0x04])); // dim_value 4
+        let tensor_type = ld(2, &shape);
+        let type_proto = ld(1, &tensor_type);
+        let mut vi = ld(1, b"x");
+        vi.extend(ld(2, &type_proto));
+        let mut graph = ld(1, &node);
+        graph.extend(ld(5, &tensor));
+        graph.extend(ld(11, &vi));
+        ld(7, &graph)
+    }
+
+    #[test]
+    fn well_formed_model_decodes() {
+        let g = parse_onnx(&model()).expect("well-formed model");
+        assert_eq!(g.nodes.len(), 1);
+        assert_eq!(g.nodes[0].op_type, "Conv");
+        assert_eq!(g.nodes[0].attr_ints.get("kernel_shape"), Some(&vec![3, 3]));
+        let w = g.inits.get("w").expect("initializer w");
+        assert_eq!(w.dims, vec![1]);
+        assert_eq!(w.floats, vec![0.5]);
+        assert_eq!(g.input_shapes.get("x"), Some(&vec![1, 4]));
+    }
+
+    #[test]
+    fn every_truncation_is_an_error_not_a_panic() {
+        // The old indexing reader panicked (index/slice out of range) on these.
+        let m = model();
+        for cut in 1..m.len() {
+            assert!(parse_onnx(&m[..cut]).is_err(), "prefix of {cut} bytes");
+        }
+    }
+
+    #[test]
+    fn missing_graph_and_bad_wire_type_are_errors() {
+        assert!(matches!(parse_onnx(&[]), Err(OnnxError::NoGraph)));
+        assert!(matches!(
+            parse_onnx(&[0x0c]),
+            Err(OnnxError::Wire(WireError::UnsupportedWireType {
+                wire_type: 4
+            }))
+        ));
+    }
 }

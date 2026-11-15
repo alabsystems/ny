@@ -252,7 +252,7 @@ mod tests {
             0,
             "an empty map describes no carrier, so nothing is installed"
         );
-        assert!(state.spec_slot_rows.is_empty());
+        assert_eq!((state.spec_slot_rows).len(), 0);
         assert!(state.spec_deltas.is_empty());
     }
 

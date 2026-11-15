@@ -30,7 +30,7 @@ pub fn history_from_constraints(constraints: &[ConstraintTuple]) -> Result<Graph
                 });
             }
             Some(pt) => {
-                // GenBaB constraint — validate split_point via constructor (#3011)
+                // GenBaB constraint — validate split_point via constructor
                 let constraint =
                     GenBabConstraint::new(node_name.clone(), *neuron_idx, *pt, *is_active, 0.0)?;
                 history.add_genbab_constraint(constraint);
@@ -49,7 +49,7 @@ pub fn history_from_constraints(constraints: &[ConstraintTuple]) -> Result<Graph
 ///
 /// # Errors
 /// Returns `NyError::InvalidSpec` if `split_count` under-consumes constraints,
-/// which would silently drop trailing entries and widen domains (#2248, #2313).
+/// which would silently drop trailing entries and widen domains.
 ///
 /// # Reference
 /// Same algorithm and guard as `batched_domain::types::serialize_constraints`.
@@ -103,7 +103,7 @@ pub(crate) fn constraints_from_history(
         }
     }
 
-    // Soundness guard (#2248/#2313): reject histories where split_count under-consumes constraints.
+    // Soundness guard: reject histories where split_count under-consumes constraints.
     if relu_idx != history.constraints.len() || genbab_idx != history.genbab_constraints.len() {
         return Err(NyError::InvalidSpec(format!(
             "constraints_from_history: not all constraints consumed \
@@ -123,7 +123,7 @@ pub(crate) fn constraints_from_history(
 mod tests {
     use super::*;
 
-    /// Regression test for #2313: constraints_from_history must return an error
+    /// Regression test: constraints_from_history must return an error
     /// when split_count is too low and ReLU constraints would be silently dropped.
     #[test]
     fn rejects_wrong_split_count_relu_2313() {
@@ -154,7 +154,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #2313: constraints_from_history must return an error
+    /// Regression test: constraints_from_history must return an error
     /// when split_count is too low and GenBaB constraints would be silently dropped.
     #[test]
     fn rejects_wrong_split_count_genbab_2313() {

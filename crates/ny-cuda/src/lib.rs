@@ -74,12 +74,18 @@ use ny_core::{
     GemmEngine, GpuCrownBackward, GpuCrownLayer, GpuCrownResult, GpuCrownSeed,
     GpuCrownTrajectoryResult, GpuResidentPatchesRootObservation, GpuResidentPatchesRootPlan,
     GpuResnetBatchedDomainRef, NyError, ResidentCutShadowObservation, ResidentCutShadowOutcome,
-    ResidentCutShadowPolicy, ResidentLowerCutCarrier, Result,
-    DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS,
+    ResidentCutShadowPolicy, ResidentLocalL1LowerCutCarrier, ResidentLowerCutCarrier,
+    ResidentTripletLowerCutCarrier, ResidentTwoLocalL1LowerCutCarrier,
+    ResidentTwoPairLowerCutCarrier, Result, DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS,
 };
 
 mod ieee_selfcheck;
 mod joint_alpha;
+/// #wide-fd-search (ENGINE_PROGRAM M4): the device level search for the
+/// frozen-dual tier, an UNTRUSTED `ny_core::search::SearchBackend` — the CPU
+/// f32 search's kernels, bit for bit, in a CUDA context of their own, lazily
+/// and fail-soft initialised (see its module docs).
+pub mod search;
 mod sound_authority;
 mod sound_crown;
 
@@ -120,6 +126,9 @@ const fn cuda_test_admission(
 /// important on memory-constrained development hosts.
 #[cfg(test)]
 static CUDA_HARDWARE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+mod low_arity_device_tests;
 
 /// Run `test` on a qualified CUDA device when this host advertises one.
 ///
@@ -964,9 +973,12 @@ pub fn cuda_runtime_identity() -> Result<CudaRuntimeIdentity> {
         Ok(CudaRuntimeIdentity {
             candidates: cuda_runtime_library_candidates(),
             objects,
-            // ny-cuda deliberately enables only cudarc's driver+cublas
-            // features. Do not infer optional NVRTC identity from unrelated
-            // basename-like mappings.
+            // ny-cuda never loads libnvrtc: cudarc's `nvrtc` feature is
+            // enabled only for `Ptx` / `load_module` (the search backend loads
+            // a committed fatbin; nothing is compiled at runtime). The status
+            // token is the schema's "no NVRTC in this process" value, which
+            // downstream provenance tooling keys on. Do not infer optional
+            // NVRTC identity from unrelated basename-like mappings.
             nvrtc_status: "not_loaded_feature_disabled".to_string(),
         })
     }
@@ -3941,6 +3953,195 @@ impl GpuCrownBackward for CudaGemmEngine {
             )?;
         cuda_deadline_gemm_check(deadline)?;
         Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn crown_backward_gpu_resnet_lower_cut_with_deadline(
+        &self,
+        segments: &[ny_core::GpuResnetSegment],
+        seed: &GpuCrownSeed,
+        input_lower: &[f32],
+        input_upper: &[f32],
+        carrier: &ResidentLowerCutCarrier,
+        deadline: Instant,
+    ) -> Result<f32> {
+        cuda_deadline_gemm_check(deadline)?;
+        let adapter = DeadlineCrownGemm {
+            inner: self,
+            deadline,
+        };
+        let lower = sound_crown::certified_lower_cut::run(
+            &adapter,
+            segments,
+            seed,
+            input_lower,
+            input_upper,
+            carrier,
+            deadline,
+        )?;
+        cuda_deadline_gemm_check(deadline)?;
+        Ok(lower)
+    }
+
+    fn provides_bounded_lower_cut(&self) -> bool {
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn crown_backward_gpu_resnet_two_pair_lower_cut_with_deadline(
+        &self,
+        segments: &[ny_core::GpuResnetSegment],
+        seed: &GpuCrownSeed,
+        input_lower: &[f32],
+        input_upper: &[f32],
+        carrier: &ResidentTwoPairLowerCutCarrier,
+        deadline: Instant,
+    ) -> Result<f32> {
+        cuda_deadline_gemm_check(deadline)?;
+        let adapter = DeadlineCrownGemm {
+            inner: self,
+            deadline,
+        };
+        let lower = sound_crown::certified_lower_cut::run_two_pair(
+            &adapter,
+            segments,
+            seed,
+            input_lower,
+            input_upper,
+            carrier,
+            deadline,
+        )?;
+        cuda_deadline_gemm_check(deadline)?;
+        Ok(lower)
+    }
+
+    fn provides_bounded_two_pair_lower_cut(&self) -> bool {
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn crown_backward_gpu_resnet_triplet_lower_cut_with_deadline(
+        &self,
+        segments: &[ny_core::GpuResnetSegment],
+        seed: &GpuCrownSeed,
+        input_lower: &[f32],
+        input_upper: &[f32],
+        carrier: &ResidentTripletLowerCutCarrier,
+        deadline: Instant,
+    ) -> Result<f32> {
+        cuda_deadline_gemm_check(deadline)?;
+        let adapter = DeadlineCrownGemm {
+            inner: self,
+            deadline,
+        };
+        let lower = sound_crown::certified_lower_cut::run_triplet(
+            &adapter,
+            segments,
+            seed,
+            input_lower,
+            input_upper,
+            carrier,
+            deadline,
+        )?;
+        cuda_deadline_gemm_check(deadline)?;
+        Ok(lower)
+    }
+
+    fn provides_bounded_triplet_lower_cut(&self) -> bool {
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn crown_backward_gpu_resnet_local_l1_lower_cut_with_deadline(
+        &self,
+        segments: &[ny_core::GpuResnetSegment],
+        seed: &GpuCrownSeed,
+        input_lower: &[f32],
+        input_upper: &[f32],
+        carrier: &ResidentLocalL1LowerCutCarrier,
+        deadline: Instant,
+    ) -> Result<f32> {
+        cuda_deadline_gemm_check(deadline)?;
+        let adapter = DeadlineCrownGemm {
+            inner: self,
+            deadline,
+        };
+        let lower = sound_crown::certified_lower_cut::run_local_l1(
+            &adapter,
+            segments,
+            seed,
+            input_lower,
+            input_upper,
+            carrier,
+            deadline,
+        )?;
+        cuda_deadline_gemm_check(deadline)?;
+        Ok(lower)
+    }
+
+    fn provides_bounded_local_l1_lower_cut(&self) -> bool {
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn crown_backward_gpu_resnet_two_local_l1_lower_cut_with_deadline(
+        &self,
+        segments: &[ny_core::GpuResnetSegment],
+        seed: &GpuCrownSeed,
+        input_lower: &[f32],
+        input_upper: &[f32],
+        carrier: &ResidentTwoLocalL1LowerCutCarrier,
+        deadline: Instant,
+    ) -> Result<f32> {
+        cuda_deadline_gemm_check(deadline)?;
+        let adapter = DeadlineCrownGemm {
+            inner: self,
+            deadline,
+        };
+        let lower = sound_crown::certified_lower_cut::run_two_local_l1(
+            &adapter,
+            segments,
+            seed,
+            input_lower,
+            input_upper,
+            carrier,
+            deadline,
+        )?;
+        cuda_deadline_gemm_check(deadline)?;
+        Ok(lower)
+    }
+
+    fn provides_bounded_two_local_l1_lower_cut(&self) -> bool {
+        true
+    }
+
+    fn crown_backward_gpu_resnet_support4_with_deadline(
+        &self,
+        segments: &[ny_core::GpuResnetSegment],
+        seed: &GpuCrownSeed,
+        input_lower: &[f32],
+        input_upper: &[f32],
+        deadline: Instant,
+    ) -> Result<GpuCrownResult> {
+        cuda_deadline_gemm_check(deadline)?;
+        let adapter = DeadlineCrownGemm {
+            inner: self,
+            deadline,
+        };
+        let result = sound_crown::certified_lower_cut::support4(
+            &adapter,
+            segments,
+            seed,
+            input_lower,
+            input_upper,
+            deadline,
+        )?;
+        cuda_deadline_gemm_check(deadline)?;
+        Ok(result)
+    }
+
+    fn provides_bounded_support4(&self) -> bool {
+        true
     }
 
     /// Observation-only, deadline-bounded Cut-CROWN fold on the actual CUDA f64

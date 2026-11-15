@@ -32,11 +32,6 @@
 //! - `@binding(1)`: coeffs array
 //! - `@binding(2)`: indices array
 //! - `@binding(3)`: domain_offsets array
-//!
-//! # Sources
-//!
-//! - Design doc: `designs/2026-01-29-gpu-constraint-buffer-layout.md`
-//! - Issue: #226, #256
 
 /// WGSL struct definition and helper functions for constraint buffer access.
 ///

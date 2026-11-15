@@ -624,10 +624,9 @@ fn test_propagate_linear_returns_error() {
     );
 }
 
-// ── NormLayer trait input validation tests (#3339) ───────────────────
+// ── NormLayer trait input validation tests ───────────────────
 
 /// Verify that eval() rejects input whose length is not divisible by num_channels.
-/// Part of #3339.
 #[test]
 fn test_normlayer_eval_rejects_indivisible_input() {
     use super::super::trait_norm::NormLayer;
@@ -641,7 +640,6 @@ fn test_normlayer_eval_rejects_indivisible_input() {
 }
 
 /// Verify that jacobian() rejects input whose length is not divisible by num_channels.
-/// Part of #3339.
 #[test]
 fn test_normlayer_jacobian_rejects_indivisible_input() {
     use super::super::trait_norm::NormLayer;
@@ -654,4 +652,4 @@ fn test_normlayer_jacobian_rejects_indivisible_input() {
     );
 }
 
-// CROWN NaN/Inf guard tests moved to tests_crown.rs (#3103) to keep file under 500-line limit.
+// CROWN NaN/Inf guard tests moved to tests_crown.rs to keep file under 500-line limit.

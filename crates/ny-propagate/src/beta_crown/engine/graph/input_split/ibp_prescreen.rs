@@ -19,7 +19,7 @@ use super::grouped_semantics::disjunctive_domain_verified;
 /// This stacks all child inputs along a fresh leading batch axis, performs one
 /// graph IBP pass, then applies the spec matrix independently to each batch row.
 /// The graph traversal is shared; only the final scalar/objective reduction is
-/// per-child. Part of #4353 Packet A.
+/// per-child.
 pub(crate) fn batched_ibp_prescreen(
     graph: &GraphNetwork,
     child_inputs: &[&BoundedTensor],
@@ -62,7 +62,11 @@ pub(super) fn run_ibp_forward(
     // treats `UnsupportedConfiguration` as a skippable enhancement and falls back to
     // per-domain bounding (which runs each domain unbatched and is unaffected). The
     // prescreen is a pure speed optimization, so skipping it never changes a verdict.
-    if !graph.is_input_split_batch_stack_safe() {
+    // Prescreen-scoped guard. BatchNorm is discharged PER NODE from its
+    // authored operand rank (see `is_input_split_batch_stack_safe_for_prescreen`);
+    // every other absolute-axis operator stays refused, and relaxed clipping
+    // deliberately keeps the blanket predicate.
+    if !graph.is_input_split_batch_stack_safe_for_prescreen() {
         return Err(NyError::UnsupportedConfiguration(
             "input-split batched IBP prescreen skipped: graph has absolute-axis operators that are not batch-stack safe".to_string(),
         ));
@@ -383,6 +387,95 @@ mod tests {
         graph.add_node(GraphNode::from_input("bn", Layer::BatchNorm(bn)));
         graph.set_output("bn");
         graph
+    }
+
+    /// Build the BatchNorm-only graph with an authored operand shape recorded.
+    fn batch_norm_graph_with_declared_rank(rank: usize) -> GraphNetwork {
+        let mut graph = batch_norm_only_graph();
+        // 2 channels to match `batch_norm_only_graph`'s scale/bias.
+        let shape = match rank {
+            1 => vec![2],
+            2 => vec![2, 3],
+            3 => vec![2, 2, 3],
+            4 => vec![1, 2, 2, 3],
+            _ => vec![1; rank],
+        };
+        graph.set_declared_shape("bn", shape);
+        graph
+    }
+
+    #[test]
+    fn authored_rank3_batchnorm_is_admitted_for_the_prescreen_only() {
+        // The CGAN shape: an authored [C,H,W] operand stacks to [N,C,H,W], and
+        // `batch_norm::math` resolves rank-4+ to channel axis 1 UNCONDITIONALLY
+        // (fail-closing on a channel-count mismatch), so domain n receives
+        // exactly the affine it would receive alone.
+        let graph = batch_norm_graph_with_declared_rank(3);
+        assert!(
+            graph.is_input_split_batch_stack_safe_for_prescreen(),
+            "authored rank-3 [C,H,W] BatchNorm must be admitted for the prescreen"
+        );
+        // The BLANKET predicate is what relaxed clipping consults and it must
+        // still refuse: relaxed clip carries additional parent-plane obligations
+        // and a measured false-unsat history (state_34/state_45, 2026-07-24).
+        assert!(
+            !graph.is_input_split_batch_stack_safe(),
+            "the blanket predicate must keep refusing BatchNorm; relaxed clip depends on it"
+        );
+    }
+
+    #[test]
+    fn ambiguous_authored_rank2_batchnorm_is_still_refused() {
+        // An authored rank-2 [C,L] operand stacks to rank-3 [N,C,L]. When
+        // N == C the squeezed-layout rule must choose axis 0, scaling every
+        // element of domain n by channel n's affine -- the exact mixing the
+        // oracle's own negative control falsifies.
+        for rank in [1_usize, 2, 4, 5] {
+            let graph = batch_norm_graph_with_declared_rank(rank);
+            assert!(
+                !graph.is_input_split_batch_stack_safe_for_prescreen(),
+                "BatchNorm with authored operand rank {rank} must stay refused; \
+                 only an authored rank of 3 stacks to the unambiguous rank 4"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_shape_provenance_fails_closed() {
+        // No declared shape recorded => the predicate cannot prove the operand
+        // rank, so it must refuse rather than assume. This is the case that
+        // makes the discharge safe on graphs the loader did not annotate.
+        let graph = batch_norm_only_graph();
+        assert!(
+            graph.declared_shape("bn").is_none(),
+            "fixture must have no shape provenance for this test to mean anything"
+        );
+        assert!(
+            !graph.is_input_split_batch_stack_safe_for_prescreen(),
+            "absent shape provenance must fail CLOSED"
+        );
+    }
+
+    #[test]
+    fn per_node_rank_does_not_admit_any_other_absolute_axis_operator() {
+        // The discharge is BatchNorm-specific. Every other deny-listed operator
+        // must stay refused even with a rank-3 authored shape, or this change
+        // widened the guard instead of splitting it.
+        let mut graph = GraphNetwork::new();
+        // Softmax, not Concat: `from_input` builds a ONE-input node and Concat
+        // requires >= 2, which panics in GraphNode rather than exercising the
+        // predicate (caught by this test failing on its own fixture).
+        graph.add_node(GraphNode::from_input(
+            "sm",
+            Layer::Softmax(crate::layers::SoftmaxLayer::new(-1)),
+        ));
+        graph.set_output("sm");
+        graph.set_declared_shape("sm", vec![2, 2, 3]);
+        assert!(
+            !graph.is_input_split_batch_stack_safe_for_prescreen(),
+            "a non-BatchNorm absolute-axis operator must stay refused at any rank"
+        );
+        assert!(!graph.is_input_split_batch_stack_safe());
     }
 
     #[test]

@@ -16,6 +16,7 @@ mod group_norm;
 mod instance_norm;
 pub(crate) mod layer_norm;
 pub(crate) mod math_common;
+pub(crate) mod radial;
 mod rms_norm;
 pub(crate) mod trait_norm;
 pub(crate) mod validate;
@@ -29,7 +30,7 @@ pub const NORMALIZATION_MIN_EPS: f32 = 1e-12;
 
 // Re-export all public types at module root for backward compatibility
 pub use adain::AdaIN1dLayer;
-pub use batch_norm::{BatchNormChannelAxisHint, BatchNormLayer};
+pub use batch_norm::{BatchNormChannelAxisHint, BatchNormExactAffine, BatchNormLayer};
 pub use group_norm::GroupNormLayer;
 pub use instance_norm::InstanceNorm1dLayer;
 pub use layer_norm::{LayerNormCrownMode, LayerNormLayer, LayerNormMode};

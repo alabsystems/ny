@@ -181,7 +181,12 @@ fn complete_clip_reorder_fixture_3870(
     let parent_linear = complete_clip_parent_linear_3870();
     let mut parent_meta = DomainMetadata::root(-1.0, 1.0)?;
     if with_parent_linear {
-        parent_meta.cached_la = Some(Arc::new(cache_input_split_linear_bounds(&parent_linear)));
+        let parent_input = ny_tensor::BoundedTensor::new(
+            arr1(&[-1.0_f32]).into_dyn(),
+            arr1(&[1.0_f32]).into_dyn(),
+        )?;
+        parent_meta.cached_la =
+            cache_input_split_linear_bounds(&parent_linear, &parent_input).map(Arc::new);
     }
     let picked = PickedDomains {
         batch_size: 1,
@@ -744,11 +749,50 @@ fn gpu_bab_ibp_prescreen_skipped_when_enhancement_off_3870() -> Result<()> {
         .as_ref()
         .expect("IBP pre-screen bounds");
     assert_scalar_bounds_close(pre_bounds, &reference.ibp_bounds, 1e-5, "pre-screen");
-    let pre_screen_gemms = pre_screen_engine.gemm_calls();
-    assert!(
-        pre_screen_gemms > 0,
-        "IBP pre-screen must execute the graph"
-    );
+    // ROUTE CHANGE, not a calibration (#linear-ibp-higham). This used to read
+    //     let pre_screen_gemms = pre_screen_engine.gemm_calls();
+    //     assert!(pre_screen_gemms > 0, "IBP pre-screen must execute the graph");
+    // i.e. the injected engine's GEMM count standing in as a proxy for "the
+    // pre-screen ran the graph". The count is now structurally ZERO on this
+    // fixture and the proxy no longer means what its message claims:
+    //
+    // `verify_graph_gpu_domain_list` always hands the pre-screen a finite
+    // `initial_deadline` (it is `Some(..)` unconditionally, derived from
+    // `bab_timeout`), the pre-screen forwards it through
+    // `input_split/bounds_eval.rs::graph_spec_ibp_root_screen_with_deadline` ->
+    // `collect_node_bounds_with_engine_and_deadline`, and the `Layer::Linear` arm
+    // of `network/graph_alpha/bounds/ibp.rs::propagate_node_ibp_with_engine_and_deadline`
+    // now FORWARDS that deadline (it previously dropped it) into
+    // `LinearLayer::propagate_ibp_with_engine_and_deadline`. That method refuses
+    // the engine helper outright under a finite authority -- "the opaque engine
+    // helper is refused: its surrounding host copies, lazy cache construction,
+    // bookkeeping, and allocations do not have a cooperative deadline contract"
+    // (`layers/linear/ibp.rs`) -- and runs `propagate_ibp_pollable_f64`, a
+    // directed-f64 CPU contraction that dispatches no GEMM at all. So zero engine
+    // calls is the CORRECT reading of a pre-screen that did run, and asserting
+    // `> 0` was asserting the engine route, not graph execution.
+    //
+    // That zero is the ESTABLISHED contract for this helper under a finite
+    // deadline, not a new accident:
+    // `network/graph_alpha/bounds/tests.rs::finite_deadline_graph_conv2d_node_bounds_are_engine_free_and_structured`
+    // already pins `assert_eq!(engine.gemm_calls(), 0, "finite graph Conv2d node
+    // collection must not enter the caller engine")` for the Conv2d arm of the
+    // very same `collect_node_bounds_with_engine_and_deadline`. The Linear arm was
+    // the outlier that dropped its deadline; it now matches its siblings, so this
+    // test was pinning the outlier.
+    //
+    // The `assert_scalar_bounds_close` above is the replacement proof of "the
+    // pre-screen ran", and it is strictly stronger than the counter was: it is
+    // route-independent, and it fails closed in both directions. `reference.ibp_bounds`
+    // is the interval box (~[-2, 2]: IBP loses the x-x correlation of
+    // `reference_gap_graph_3870`), whereas skipping or erroring out of the
+    // pre-screen falls through to `compute_initial_bounds`, whose CROWN box is
+    // ~[0, 0] (asserted below) -- a ~2.0 miss here, not a rounding-scale one.
+    //
+    // The engines stay injected so the `Some(engine)` plumbing through
+    // `resolve_engine` is still exercised end to end; only the *count* is no
+    // longer a verdict, and both counts are reported in the gap assertion below
+    // so a future route change is legible from the failure text.
 
     // With enhancement disabled, the entry must not return from the cheap IBP
     // pre-screen.  The engine-backed full bootstrap is deterministic for this
@@ -783,9 +827,36 @@ fn gpu_bab_ibp_prescreen_skipped_when_enhancement_off_3870() -> Result<()> {
         full_bounds.lower()[[0]],
         full_bounds.upper()[[0]]
     );
+    // FAIL-CLOSED GUARD, replacing the retired `full_engine.gemm_calls() >=
+    // pre_screen_gemms` comparison (vacuously true once the pre-screen count is
+    // pinned at 0 by the route above, and a vacuous assertion is worse than none).
+    //
+    // Both halves of this test are only meaningful while the fixture keeps a real
+    // IBP-vs-CROWN gap, so assert that gap directly rather than inferring it. Both
+    // endpoint assertions above are relative to values this test computes, so a
+    // fixture edit that made IBP and CROWN agree would leave BOTH of them passing
+    // and the whole test vacuous; this one catches that.
+    //
+    // Derived, not measured-and-baselined: for `reference_gap_graph_3870`
+    // (`W = [[1], [1]]`, no bias) with `x` in [-1, 1] and spec `[1, -1]`, the
+    // interval route treats the duplicated outputs as independent and publishes
+    // `upper = 1*1 + (-1)*(-1) = 2`, while the correlation-preserving route
+    // cancels the shared coefficient to `0`. The gap is 2.0. The 1.0 floor is half
+    // of that: far above every rounding certificate on this row (the widest term
+    // in play is the f32 abssum-Higham charge, `gamma_3*S + 2u*|y| ~= 3e-7` for
+    // `S = 1`, and the two routes differ by ~4e-7 at this output), and far below
+    // the real separation.
+    let route_gap = pre_bounds.upper()[[0]] - full_bounds.upper()[[0]];
     assert!(
-        full_engine.gemm_calls() >= pre_screen_gemms,
-        "full bootstrap unexpectedly performed less graph work than the IBP pre-screen"
+        route_gap >= 1.0,
+        "IBP pre-screen and full bootstrap are no longer distinguishable: \
+         pre-screen upper={}, bootstrap upper={}, gap={} (expected ~2.0); \
+         engine GEMM calls: pre-screen={}, bootstrap={}",
+        pre_bounds.upper()[[0]],
+        full_bounds.upper()[[0]],
+        route_gap,
+        pre_screen_engine.gemm_calls(),
+        full_engine.gemm_calls()
     );
 
     Ok(())

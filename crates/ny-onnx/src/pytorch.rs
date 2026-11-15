@@ -597,7 +597,7 @@ mod tests {
     fn test_parse_nested_pickle_keys_empty() {
         let data: &[u8] = &[];
         let keys = parse_nested_pickle_keys(data).unwrap();
-        assert!(keys.is_empty());
+        assert_eq!((keys).len(), 0);
     }
 
     #[ntest::timeout(10000)]
@@ -606,7 +606,7 @@ mod tests {
         // Some random bytes that don't contain model keys
         let data: &[u8] = &[0x00, 0x01, 0x02, 0x03, 0x04, 0x05];
         let keys = parse_nested_pickle_keys(data).unwrap();
-        assert!(keys.is_empty());
+        assert_eq!((keys).len(), 0);
     }
 
     #[ntest::timeout(10000)]
@@ -704,7 +704,7 @@ mod tests {
         data.extend_from_slice(b"short");
         // Should not crash, just skip this entry
         let keys = parse_nested_pickle_keys(&data).unwrap();
-        assert!(keys.is_empty());
+        assert_eq!((keys).len(), 0);
     }
 
     #[ntest::timeout(10000)]
@@ -714,7 +714,7 @@ mod tests {
         let mut data = vec![0x58, 20, 0, 0, 0];
         data.extend_from_slice(b"short");
         let keys = parse_nested_pickle_keys(&data).unwrap();
-        assert!(keys.is_empty());
+        assert_eq!((keys).len(), 0);
     }
 
     #[ntest::timeout(10000)]

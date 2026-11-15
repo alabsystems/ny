@@ -1498,7 +1498,7 @@ mod tests {
                 // Weight = small multiple of subnormal scale; input = 1 (exact).
                 // Products land in the subnormal region.
                 let wv: Vec<f32> = (0..n).map(|k| s * ((k % 5) as f32 + 1.0)).collect();
-                let weight = Array2::from_shape_vec((1, n), wv.clone()).unwrap();
+                let weight = Array2::from_shape_vec((1, n), wv).unwrap();
                 let input = vec![Bound::new(1.0, 1.0); n];
                 let bounds = sound_output_bounds(weight.clone(), None, input, &policy);
                 let x = vec![1.0_f32; n];

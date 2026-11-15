@@ -1,0 +1,30 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# smart_turn multi-input propagation CANARY (#multi-input-propagation) — NOT a
+# production preset. The `_multiinput_canary` suffix keeps it out of category
+# resolution: no scored run can pick it up. To arm the probe, copy this file
+# to `<dir>/vnncomp26/smart_turn_multimodal_2026.yaml` and pass
+# `--configs-dir <dir>` explicitly.
+#
+# What it arms, on top of the QDQ canary's dark gate:
+# `model.multi_input_concat` — the graph builder concatenates the model's two
+# declared inputs (audio 64,000 + pixel_values 1,204,224 = 1,268,224
+# coordinates, DECLARED order, matching the vnnlib X order) into one flat
+# network input and carves each back out with exact Slice(+Reshape) view
+# nodes; the CLI sizes the joint input box to the concatenated element count.
+# CONTAINMENT: the joint box is exactly the product of the per-input boxes
+# (partition-verified fail-closed; see crates/ny-build/src/graph/multi_input.rs).
+#
+# REPORT-ONLY: `model.qdq_activation_relaxation` stays armed here, so the
+# vnncomp funnel keeps withholding any internal `unsat`/`sat` on this family
+# (smart_turn adjudication policy: unsat is FORBIDDEN; the family is a
+# load/convert/bound test article). The probe target this canary unlocks: the
+# `[qdq_relax]` bounds half can finally run — per-quantizer pre-activation IBP
+# intervals plus the pre-quantizer `/classifier/classifier.6/Gemm_output_0`
+# bound vs s/2 = +0.004727089 (see
+# reports/measured-2026/smart_turn_bucket_bisect_2026-08-31/README.md).
+model:
+  qdq_activation_relaxation: true
+  multi_input_concat: true

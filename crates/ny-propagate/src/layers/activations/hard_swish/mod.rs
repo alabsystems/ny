@@ -46,7 +46,7 @@ impl HardSwishLayer {
         // Guard against 0 * inf = NaN when x = -inf.
         // A direct formula would compute (-inf)*0 at the negative limit.
         // The exact limiting values are 0 at -inf and +inf at +inf.
-        // Ref: SiLU guard pattern (silu.rs:100-105), fix for #1836.
+        // Ref: SiLU guard pattern (silu.rs:100-105).
         if !x.is_finite() {
             if x.is_nan() {
                 return f32::NAN;
@@ -141,7 +141,7 @@ impl BoundPropagation for HardSwishLayer {
 #[inline]
 #[cfg(test)]
 fn hardswish_eval(x: f32) -> f32 {
-    // Guard against 0 * inf = NaN at x = -inf (defense-in-depth, #1836).
+    // Guard against 0 * inf = NaN at x = -inf (defense-in-depth).
     if !x.is_finite() {
         if x.is_nan() {
             return f32::NAN;
@@ -154,7 +154,7 @@ fn hardswish_eval(x: f32) -> f32 {
 /// Evaluate HardSwish in f64 to avoid catastrophic cancellation in chord slope.
 /// HardSwish(x) = x * clamp(alpha*x + beta, 0, 1), where both
 /// coefficients are promoted exactly from their authored f32 values.
-/// Same pattern as silu_eval_f64 (silu/math.rs), exp_eval_f64 (#1745).
+/// Same pattern as silu_eval_f64 (silu/math.rs), exp_eval_f64.
 #[inline]
 fn hardswish_eval_f64(x: f64) -> f64 {
     if !x.is_finite() {
@@ -192,7 +192,7 @@ fn hardswish_critical_f64() -> f64 {
 /// - `upper_intercept`: guaranteed `slope*x + upper_intercept >= true_chord(x)` ∀x∈[l,u]
 ///
 /// Ref: Exp (exp.rs:119-125), SiLU (silu/math.rs:177-201) directed rounding pattern.
-/// Fixes: #3146 — HardSwish chord used raw `as f32` without directed rounding.
+/// Fixes: the HardSwish chord formerly used raw `as f32` without directed rounding.
 #[inline]
 fn hardswish_chord(l: f32, u: f32) -> (f32, f32, f32) {
     let (l64, u64) = (l as f64, u as f64);
@@ -271,7 +271,6 @@ fn hardswish_chord_deviation(l: f32, u: f32, chord_slope: f32, chord_intercept: 
 /// Analytical linear relaxation for HardSwish on interval [l, u].
 ///
 /// Uses the chord with analytically-computed exact max deviation offset.
-/// Reference: designs/2026-02-08-piecewise-crown-relaxation-fixes.md Part 4
 fn hardswish_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
     // Guard: NaN or Inf inputs → maximally loose bounds (always sound).
     if l.is_nan() || u.is_nan() || l.is_infinite() || u.is_infinite() {
@@ -337,7 +336,7 @@ impl HardSwishLayer {
     }
 
     /// Patches CROWN backward propagation with pre-activation bounds.
-    /// Part of #2613 Phase 2: generic activation Patches support.
+    /// Generic activation Patches support.
     pub(crate) fn propagate_patches_with_bounds(
         &self,
         bounds: &crate::bounds::patches::PatchesLinearBounds,

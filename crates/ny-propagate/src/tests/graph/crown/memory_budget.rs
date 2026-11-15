@@ -58,7 +58,7 @@ fn build_mlp_budget_test_graph() -> (GraphNetwork, BoundedTensor) {
     (graph, input)
 }
 
-/// #3550 regression: Sequential `Network::propagate_crown_batched()` with zero
+/// Regression: Sequential `Network::propagate_crown_batched()` with zero
 /// budget falls back gracefully (not error). With zero budget, the batched path
 /// falls back to sequential CROWN, which also hits the zero-budget guard and
 /// falls back to IBP. The key contract is no crash/error and sound bounds.
@@ -111,7 +111,7 @@ fn test_network_batched_crown_zero_budget_falls_back_to_unbatched_3550() {
     });
 }
 
-/// #3550 regression: Graph `propagate_crown_batched_with_provenance()` with
+/// Regression: Graph `propagate_crown_batched_with_provenance()` with
 /// zero budget falls back through the existing DAG-CROWN provenance path.
 #[ntest::timeout(10000)]
 #[test]
@@ -136,7 +136,7 @@ fn test_graph_batched_crown_zero_budget_falls_back_with_provenance_3550() {
     });
 }
 
-/// #3550 regression: `propagate_crown_batched()` remains a thin wrapper over
+/// Regression: `propagate_crown_batched()` remains a thin wrapper over
 /// the provenance-returning graph batched entrypoint.
 #[ntest::timeout(10000)]
 #[test]
@@ -153,7 +153,7 @@ fn test_graph_batched_crown_zero_budget_wrapper_returns_fallback_bounds_3550() {
     });
 }
 
-/// #3550 regression: `BatchedCrownBounds::into_batched_dense_checked()` rejects
+/// Regression: `BatchedCrownBounds::into_batched_dense_checked()` rejects
 /// Patches-to-Dense materialization under zero budget.
 #[ntest::timeout(10000)]
 #[test]
@@ -177,7 +177,7 @@ fn test_batched_crown_bounds_checked_densification_rejects_under_zero_budget_355
     });
 }
 
-/// #3550 regression: `BatchedCrownBounds::ensure_batched_dense_checked()` rejects
+/// Regression: `BatchedCrownBounds::ensure_batched_dense_checked()` rejects
 /// Patches-to-Dense in-place materialization under zero budget.
 #[ntest::timeout(10000)]
 #[test]
@@ -206,7 +206,7 @@ fn test_batched_crown_bounds_ensure_checked_rejects_under_zero_budget_3550() {
     });
 }
 
-/// #3550 regression: Checked densification passes through Dense variant
+/// Regression: Checked densification passes through Dense variant
 /// without a budget check (already materialized).
 #[ntest::timeout(10000)]
 #[test]

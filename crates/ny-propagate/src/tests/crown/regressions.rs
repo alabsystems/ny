@@ -8,7 +8,7 @@ use super::*;
 use ndarray::{arr1, arr2, Array1, Array2};
 
 // ============================================================
-// NEGATIVE AFFINE SCALE SOUNDNESS REGRESSION TESTS (#306, #307)
+// NEGATIVE AFFINE SCALE SOUNDNESS REGRESSION TESTS
 // ============================================================
 //
 // These tests verify that CROWN backward propagation correctly handles
@@ -19,10 +19,8 @@ use ndarray::{arr1, arr2, Array1, Array2};
 //   A_new = A * c  (just scale coefficients)
 // NOT swap lower/upper bounds like IBP does.
 //
-// The bug (#306) incorrectly swapped bounds for negative scale, which
+// The bug incorrectly swapped bounds for negative scale, which
 // could collapse upper bounds to 0 for networks like ReLU(-x).
-//
-// Reference: designs/2026-01-29-crown-affine-negative-scale.md
 
 /// Regression test: ReLU with lower=-inf now produces a SOUND infinite-domain
 /// relaxation instead of being rejected.
@@ -67,8 +65,6 @@ fn test_relu_crown_soundness_with_infinite_lower_bound() {
 /// The ReLU CROWN backward path uses a NaN-only guard, so all three infinite-bound
 /// cases run the proven infinite-case branches of `relu_linear_relaxation` and yield
 /// sound bounds instead of being rejected.
-///
-/// Originally Part of #1787 (W2]587 fix).
 #[ntest::timeout(10000)]
 #[test]
 fn test_relu_crown_canonical_infinite_bounds() {
@@ -157,7 +153,7 @@ fn test_leaky_relu_crown_negative_alpha_infinite_lower_bound() {
 
 /// Regression test: PReLU unbatched CROWN with negative slope and l=-inf.
 ///
-/// Updated for #2977: CROWN backward domain_guard rejects non-finite pre-activation.
+/// CROWN backward domain_guard rejects non-finite pre-activation.
 #[ntest::timeout(10000)]
 #[test]
 fn test_prelu_crown_negative_alpha_infinite_lower_bound() {
@@ -180,7 +176,7 @@ fn test_prelu_crown_negative_alpha_infinite_lower_bound() {
 
 /// Regression test: PReLU batched CROWN with negative slope and l=-inf.
 ///
-/// Updated for #2977: CROWN backward domain_guard rejects non-finite pre-activation.
+/// CROWN backward domain_guard rejects non-finite pre-activation.
 #[ntest::timeout(10000)]
 #[test]
 fn test_prelu_batched_crown_negative_alpha_infinite_lower_bound() {
@@ -201,7 +197,7 @@ fn test_prelu_batched_crown_negative_alpha_infinite_lower_bound() {
     );
 }
 
-/// Regression test for #306: MulConstant(-1) + ReLU should have correct upper bound.
+/// Regression test: MulConstant(-1) + ReLU should have correct upper bound.
 ///
 /// Network: x -> MulConstant(-1) -> ReLU -> output
 /// Input: x in [-1, 1]
@@ -284,7 +280,7 @@ fn test_negative_scale_crown_soundness_mulconstant_relu() {
     println!("Regression test for #306 PASSED: upper bound is correctly >= 1");
 }
 
-/// Regression test for #306: BatchNorm(ny < 0) + ReLU should have correct upper bound.
+/// Regression test: BatchNorm(ny < 0) + ReLU should have correct upper bound.
 ///
 /// Network: x -> BatchNorm(scale=-1, bias=0) -> ReLU -> Linear(sum) -> output
 /// Input: x in [-1, 1]^n (symmetric interval)
@@ -396,7 +392,7 @@ fn test_negative_scale_crown_soundness_batchnorm_relu() {
     println!("Regression test for #306 PASSED: negative scale handled correctly");
 }
 
-/// Regression test for #309: SubConstant reverse mode (c - x) + ReLU should have correct bounds.
+/// Regression test: SubConstant reverse mode (c - x) + ReLU should have correct bounds.
 ///
 /// Network: x -> SubConstant(c=1, reverse=true) -> ReLU -> output
 /// Input: x in [-1, 1]
@@ -481,7 +477,7 @@ fn test_subconstant_reverse_crown_soundness_relu() {
     println!("Regression test for #309 PASSED: SubConstant reverse handled correctly");
 }
 
-/// Regression test for #1932: CROWN coefficient overflow in deep networks.
+/// Regression test: CROWN coefficient overflow in deep networks.
 ///
 /// IBP clamps intermediate bounds to `f32::MAX / 2` after each layer (linear/mod.rs:289-293),
 /// but CROWN backward coefficients (`lower_a`, `upper_a`) accumulate across layers with
@@ -500,7 +496,7 @@ fn test_subconstant_reverse_crown_soundness_relu() {
 /// 3. IBP bounds are finite (IBP has per-layer clamping, so this should always pass)
 ///
 /// If this test fails with NaN/Inf in CROWN but not IBP, it confirms the asymmetry
-/// documented in #1932.
+/// described above.
 #[ntest::timeout(60000)]
 #[test]
 fn test_crown_coefficient_overflow_deep_network_1932() {
@@ -556,7 +552,7 @@ fn test_crown_coefficient_overflow_deep_network_1932() {
         ibp_upper
     );
 
-    // CROWN: this is the path that lacks overflow clamping (#1932)
+    // CROWN: this is the path that lacks overflow clamping
     let crown_result = network.propagate_crown(&input);
 
     // The test documents the current behavior. If CROWN coefficients overflow,
@@ -659,22 +655,20 @@ fn test_crown_coefficient_overflow_deep_network_1932() {
 }
 
 // ============================================================
-// ALPHA-CROWN ELEMENTWISE BEST-BOUND UPDATE REGRESSIONS (#2087)
+// ALPHA-CROWN ELEMENTWISE BEST-BOUND UPDATE REGRESSIONS
 // ============================================================
 //
 // These tests verify the flat `iter_mut().zip(iter())` pattern used in
-// alpha-CROWN for elementwise best-bound updates. Before #2087,
+// alpha-CROWN for elementwise best-bound updates. Before the fix,
 // `ndarray::Zip` was used, which panics when arrays have different ndim
 // but the same element count (e.g., Conv2d graphs: shape [1,1] vs [1]).
 //
 // The old test (`elementwise_best_bound_update_works_with_non_contiguous_arrays`
 // in alpha_crown.rs) passes trivially because `.to_owned()` makes the array
 // contiguous and `Zip` is not the production pattern. These replacement tests
-// exercise the actual #2087 scenario: different ndim, same element count.
-//
-// Reference: #2085 (test-quality finding), #2087 (the fix)
+// exercise the actual failing scenario: different ndim, same element count.
 
-/// Regression test for #2087: elementwise best-bound update across different ndim.
+/// Regression test: elementwise best-bound update across different ndim.
 ///
 /// Conv2d graph networks produce 2D [1,1] bounds from CROWN forward but
 /// 1D [1] bounds from the backward pass. The flat iterator zip must handle
@@ -732,7 +726,7 @@ fn test_alpha_crown_best_bound_update_different_ndim_2087() {
     );
 }
 
-/// Regression test for #2087: multi-element cross-ndim best-bound update.
+/// Regression test: multi-element cross-ndim best-bound update.
 ///
 /// Verifies that flat `iter_mut().zip(iter())` traverses elements in consistent
 /// row-major order across arrays with different ndim (e.g., [2,3] vs [6]).
@@ -777,18 +771,18 @@ fn test_alpha_crown_best_bound_update_multi_element_cross_ndim_2087() {
 }
 
 // ============================================================
-// CROWN OUTPUT MUST BE INTERSECTED WITH IBP (#2990)
+// CROWN OUTPUT MUST BE INTERSECTED WITH IBP
 // ============================================================
 //
 // CROWN's linear relaxation can be strictly looser than IBP for certain
 // weight/input configurations. A negative output weight amplifies the
 // ReLU lower relaxation error (alpha*x permits y < 0 when x < 0, but
 // ReLU(x) >= 0 always). The fix intersects CROWN output with IBP forward
-// bounds, matching the graph batched path (#2904).
+// bounds, matching the graph batched path.
 //
 // Reference: alpha-beta-CROWN optimized_bounds.py:937-947.
 
-/// Regression test for #2990: CROWN must not be looser than IBP.
+/// Regression test: CROWN must not be looser than IBP.
 ///
 /// Minimal failing input from proptest:
 ///   Linear(2->2) -> ReLU -> Linear(2->1)
@@ -797,11 +791,11 @@ fn test_alpha_crown_best_bound_update_multi_element_cross_ndim_2087() {
 ///   input = [[0, 0], [-0.78, 0.46]]
 ///
 /// IBP upper = 0.0 (exact), old CROWN upper = 0.34 (too loose).
-/// After #2990 fix, CROWN output is intersected with IBP so CROWN <= IBP.
+/// After the fix, CROWN output is intersected with IBP so CROWN <= IBP.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_tighter_than_ibp_linear_relu_linear_2990() {
-    // Exact weights from issue #2990 proptest minimal input.
+    // Exact weights from the proptest minimal input.
     let w1 = arr2(&[[0.71184605_f32, -0.8403961], [0.0, 0.0]]);
     let b1 = arr1(&[0.0_f32, 0.0]);
     let w2 = arr2(&[[-0.8830249_f32, 0.0]]);
@@ -873,7 +867,7 @@ fn test_crown_tighter_than_ibp_linear_relu_linear_2990() {
     }
 }
 
-/// Same test for propagate_crown_ibp path (#2990).
+/// Same test for propagate_crown_ibp path.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_ibp_tighter_than_ibp_linear_relu_linear_2990() {
@@ -915,7 +909,7 @@ fn test_crown_ibp_tighter_than_ibp_linear_relu_linear_2990() {
 }
 
 // ============================================================
-// DEADLINE ENFORCEMENT REGRESSION TESTS (#3328)
+// DEADLINE ENFORCEMENT REGRESSION TESTS
 // ============================================================
 
 /// An already-elapsed fresh CROWN request cannot start a new IBP sweep merely

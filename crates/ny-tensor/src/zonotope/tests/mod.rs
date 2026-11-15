@@ -15,7 +15,7 @@ mod mul;
 mod silu_affine_basic;
 mod silu_affine_mutation_1d;
 mod silu_affine_mutation_2d;
-// GELU affine tests (#2470).
+// GELU affine tests.
 mod gelu_affine;
 mod softmax;
 mod softmax_causal_validation_2519;

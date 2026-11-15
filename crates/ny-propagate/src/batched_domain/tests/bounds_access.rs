@@ -377,7 +377,7 @@ fn test_slice_batch_dim_scalar_input() {
 fn test_slice_batch_dim_batch_only() {
     let arr = ArrayD::from_shape_vec(IxDyn(&[3]), vec![10.0, 20.0, 30.0]).unwrap();
     let slice1 = slice_batch_dim(&arr, 1).unwrap();
-    assert!(slice1.shape().is_empty());
+    assert_eq!((slice1.shape()).len(), 0);
     assert_eq!(slice1.iter().cloned().collect::<Vec<_>>(), vec![20.0]);
 }
 
@@ -1047,7 +1047,7 @@ fn test_extract_updates_scales_linearly() {
     // - 2000/1000 would give 4x (clear failure with 3.5x threshold - primary detection)
     //
     // Using 5 iterations with median reduces variance and allows tighter thresholds.
-    // The 2000/1000 ratio is the primary O(n^2) detector per #164:
+    // The 2000/1000 ratio is the primary O(n^2) detector:
     // - O(n) gives ~2x
     // - O(n^2) gives 4x
     // - Threshold of 3.5x provides clear separation
@@ -1061,7 +1061,7 @@ fn test_extract_updates_scales_linearly() {
         "Scaling from 500->1000 domains should be linear (≤4.5x), got {:.1}x (O(n^2) would be ~4x)",
         ratio_1000_500
     );
-    // Primary O(n^2) detector: 2000/1000 ratio (Part of #164)
+    // Primary O(n^2) detector: 2000/1000 ratio
     // O(n): 2x, O(n^2): 4x, threshold: 3.5x (12.5% margin from quadratic)
     assert!(
         ratio_2000_1000 < 3.5,

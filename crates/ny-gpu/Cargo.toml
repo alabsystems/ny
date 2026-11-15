@@ -24,8 +24,16 @@ wgpu = [
     "dep:sha2",
 ]
 # Enable GPU integration tests. Without this feature, GPU tests are not compiled.
-# Run with: cargo test -p ny-gpu --features gpu-tests
+# Run with: targo --unverified test -p ny-gpu --features gpu-tests
 gpu-tests = ["wgpu"]
+# The real-adapter tests whose subject is UNCHARGED verdict authority: they need
+# an adapter that passes the full five-rung ladder, i.e. keeps f32 subnormals
+# and exact error-free transforms (DenormPreserve) — measured only on Vulkan with
+# the SPIR-V DenormPreserve injection (GB10). A pure-flush adapter (Apple/Metal,
+# measured: rungs 2 and 3 refuse) cannot satisfy them by hardware, so they are
+# this explicit lane rather than part of `gpu-tests`; selected there they still
+# FAIL, naming the refusal. See TEST_CONFORMANCE.md.
+gpu-tests-uncharged = ["gpu-tests"]
 
 [dependencies]
 ny-core = { path = "../ny-core" }
@@ -84,9 +92,20 @@ required-features = ["wgpu"]
 name = "measure_crown_backward_workloads"
 required-features = ["wgpu"]
 
+# Drives `WgpuDevice` and `WgpuVerdictRequest`, which exist only with `wgpu`.
+# Without this table `--no-default-features --all-targets` failed to compile
+# it (pinned by `tests::every_example_declares_the_wgpu_feature_it_drives`).
+[[example]]
+name = "wgpu_probe"
+required-features = ["wgpu"]
+
 [[test]]
 name = "graph_benchmark_behavior"
 required-features = ["wgpu"]
+
+[[example]]
+name = "fl_value_rate_probe"
+required-features = ["wgpu", "gpu-tests"]
 
 [[example]]
 name = "denorm-preserve-probe"
@@ -94,6 +113,20 @@ path = "tests/denorm_preserve_probe.rs"
 required-features = ["wgpu", "gpu-tests"]
 test = false
 
+# The #u1 settling probe is the compile-sequence evidence for UNCHARGED (EFT)
+# verdict authority. It runs on the plain device, and on Metal 9 of its 10
+# tests settle green, so the target is a gpu-tests target. The one test a
+# pure-flush adapter cannot satisfy (the ActBias legacy value chain executes
+# the contiguous-taps association on Metal) carries the gpu-tests-uncharged
+# cfg itself.
 [[test]]
 name = "u1_tree_settling"
+required-features = ["wgpu", "gpu-tests"]
+
+# #fl-value-gpu-tier adversarial verify, boundaries derived from the live
+# binding budget: real-adapter only (an unavailable adapter is a hard failure
+# under gpu-tests). It asks for no uncharged verdict authority, so it stays in
+# gpu-tests.
+[[test]]
+name = "fl_value_gemm_adversarial"
 required-features = ["wgpu", "gpu-tests"]

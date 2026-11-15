@@ -28,7 +28,7 @@ use super::types::{BackwardDispatchResult, DispatchContext, NaryInputBounds};
 /// adversarially-found false-proof holes (underflow visible key; windowed-causal
 /// mask mismatch) closed, a third adversarial audit round reached consensus-sound.
 /// Kill-switch: set `NY_ATTN_CROWN_TERNARY=0` to fall back to the prior IBP path.
-fn attn_crown_ternary_enabled() -> bool {
+pub(crate) fn attn_crown_ternary_enabled() -> bool {
     !matches!(
         std::env::var("NY_ATTN_CROWN_TERNARY").ok().as_deref(),
         Some("0")
@@ -59,6 +59,9 @@ pub(crate) fn dispatch_backward_layer(
     ctx: &DispatchContext<'_>,
     node_lb: &LinearBounds,
 ) -> Result<BackwardDispatchResult> {
+    if ctx.layer.is_diagnostic_point_only() {
+        return Err(crate::network::proof_eligibility::diagnostic_only());
+    }
     check_dispatch_deadline(ctx, "before")?;
     let result = dispatch_backward_layer_legacy(ctx, node_lb)?;
     // Ordinary Dense callers historically dispatched every supported layer.
@@ -81,6 +84,9 @@ pub(crate) fn dispatch_backward_layer_finite_boundary(
     ctx: &DispatchContext<'_>,
     node_lb: &LinearBounds,
 ) -> Result<BackwardDispatchResult> {
+    if ctx.layer.is_diagnostic_point_only() {
+        return Err(crate::network::proof_eligibility::diagnostic_only());
+    }
     check_dispatch_deadline(ctx, "before finite structured boundary")?;
     // Under the expiry-authority arm this must ask the same question the
     // patches family asks: has the deadline EXPIRED, not merely does one exist.
@@ -125,6 +131,12 @@ fn dispatch_backward_layer_legacy(
     ctx: &DispatchContext<'_>,
     node_lb: &LinearBounds,
 ) -> Result<BackwardDispatchResult> {
+    // This graph-scalar Concat arm maps all four planes natively and charges
+    // embedded constants by E*max|c|. The generic signed carrier would charge
+    // |sum(E*c)|, losing uncertainty under cancellation. Keep the shared Layer
+    // capability unchanged: other binary/batched Concat arms are separate.
+    let native_coeff_err =
+        ctx.layer.propagates_coeff_err() || matches!(ctx.layer, Layer::Concat(_));
     // SOUNDNESS SAFETY NET (#vnncomp-aw-soundness). When the incoming bounds
     // carry a certified coefficient-error interval, only layers taught to
     // propagate it (Linear, Conv2d, element-wise activations, pass-through
@@ -136,9 +148,7 @@ fn dispatch_backward_layer_legacy(
     // For any OTHER error-incompatible layer, soundly discharge the error by
     // degrading the affected rows to `[-inf, +inf]` BEFORE dispatch. Rows without
     // error stay precise either way.
-    if node_lb.has_coeff_err()
-        && !ctx.layer.propagates_coeff_err()
-        && ctx.layer.is_exact_linear_coeff_err_carrier()
+    if node_lb.has_coeff_err() && !native_coeff_err && ctx.layer.is_exact_linear_coeff_err_carrier()
     {
         return dispatch_exact_linear_with_err(ctx, node_lb);
     }
@@ -151,7 +161,7 @@ fn dispatch_backward_layer_legacy(
     // (now error-free) bounds. Falls back to the conservative row degrade only
     // when this node's output box is unavailable.
     let discharged;
-    let node_lb: &LinearBounds = if node_lb.has_coeff_err() && !ctx.layer.propagates_coeff_err() {
+    let node_lb: &LinearBounds = if node_lb.has_coeff_err() && !native_coeff_err {
         let mut tmp = node_lb.clone();
         if let Some(out_box) = ctx.node_bounds.get(ctx.node_name) {
             let flat = out_box.flatten();
@@ -421,8 +431,11 @@ fn dispatch_backward_layer_inner(
     node_lb: &LinearBounds,
 ) -> Result<BackwardDispatchResult> {
     match ctx.layer {
+        Layer::PointLinear(_) => {
+            Err(crate::network::proof_eligibility::diagnostic_only())
+        }
         // === Linear: uses engine for GEMM acceleration ===
-        // Thread the per-node deadline (#4321): a wide classifier-head GEMM with
+        // Thread the per-node deadline: a wide classifier-head GEMM with
         // many spec rows is the single longest uninterrupted op on the spec-matrix
         // root output-bound path. The deadline-aware variant chunks the GEMM over
         // output rows so an over-budget node aborts (DeadlineExceeded -> sound IBP
@@ -446,7 +459,7 @@ fn dispatch_backward_layer_inner(
         Layer::IntervalConst(ic) => {
             dispatch_propagate_linear(ic, node_lb, ctx.node_name, ic.kind_name())
         }
-        // === Transpose/Tile/Slice: need input_shape before dispatch (#3105) ===
+        // === Transpose/Tile/Slice: need input_shape before dispatch ===
         Layer::Transpose(t) => {
             let mut t = t.clone();
             t.set_input_shape(ctx.pre_activation.shape().to_vec());
@@ -462,13 +475,13 @@ fn dispatch_backward_layer_inner(
             s.set_input_shape(ctx.pre_activation.shape().to_vec());
             dispatch_propagate_linear(&s, node_lb, ctx.node_name, "Slice")
         }
-        // === Gather: need input_shape before dispatch (#3400) ===
+        // === Gather: need input_shape before dispatch ===
         Layer::Gather(g) => {
             let mut g = g.clone();
             g.set_input_shape(ctx.pre_activation.shape().to_vec());
             dispatch_propagate_linear(&g, node_lb, ctx.node_name, "Gather")
         }
-        // === Conv1d/ConvTranspose1d: 1D shape setup + GPU-accelerated propagation (#3598) ===
+        // === Conv1d/ConvTranspose1d: 1D shape setup + GPU-accelerated propagation ===
         Layer::Conv1d(c) => dispatch_conv_engine_aware(
             c,
             ctx,
@@ -491,7 +504,7 @@ fn dispatch_backward_layer_inner(
                 conv.propagate_linear_with_engine_and_deadline(lb, engine, deadline)
             },
         ),
-        // === Conv2d: use dispatch_conv_engine_aware for preserve_structured_error (#3720) ===
+        // === Conv2d: use dispatch_conv_engine_aware for preserve_structured_error ===
         Layer::Conv2d(c) => dispatch_conv_engine_aware(
             c,
             ctx,
@@ -521,7 +534,7 @@ fn dispatch_backward_layer_inner(
                 conv.propagate_linear_with_engine_and_deadline(lb, engine, deadline)
             },
         ),
-        // === Add: binary split with separate bias channel (#2617) ===
+        // === Add: binary split with separate bias channel ===
         Layer::Add(add) => {
             if ctx.inputs.len() != 2 {
                 return Err(NyError::InvalidSpec(format!(
@@ -530,7 +543,7 @@ fn dispatch_backward_layer_inner(
                     ctx.inputs.len()
                 )));
             }
-            // #2617/#2530: Add introduces no local relaxation bias. Carry incoming
+            // Add introduces no local relaxation bias. Carry incoming
             // bias directly via the separate channel and propagate zero-bias A-paths.
             let bias_lower = node_lb.lower_b().clone();
             let bias_upper = node_lb.upper_b().clone();
@@ -551,7 +564,7 @@ fn dispatch_backward_layer_inner(
                 bias_upper,
             })
         }
-        // === Sub: binary split with sign flip on B, separate bias channel (#2617) ===
+        // === Sub: binary split with sign flip on B, separate bias channel ===
         Layer::Sub(sub) => {
             if ctx.inputs.len() != 2 {
                 return Err(NyError::InvalidSpec(format!(
@@ -560,7 +573,7 @@ fn dispatch_backward_layer_inner(
                     ctx.inputs.len()
                 )));
             }
-            // #2617/#2530: Sub introduces no local relaxation bias. Carry incoming
+            // Sub introduces no local relaxation bias. Carry incoming
             // bias directly via the separate channel and propagate zero-bias A-paths.
             let bias_lower = node_lb.lower_b().clone();
             let bias_upper = node_lb.upper_b().clone();
@@ -619,9 +632,9 @@ fn dispatch_backward_layer_inner(
                 bias_upper,
             })
         }
-        // === Concat: N-ary split (extracted to concat.rs for file size, #3287) ===
+        // === Concat: N-ary split (extracted to concat.rs for file size) ===
         Layer::Concat(concat) => super::concat::dispatch_concat(concat, ctx, node_lb),
-        // === MatMul: binary with both input bounds, separate bias (#2617) ===
+        // === MatMul: binary with both input bounds, separate bias ===
         Layer::MatMul(matmul) => {
             if ctx.inputs.len() != 2 {
                 return Err(NyError::InvalidSpec(format!(
@@ -644,12 +657,25 @@ fn dispatch_backward_layer_inner(
                 ctx.node_name,
                 "MatMul input B",
             )?;
-            // #2617/#2530: MatMul is a relaxation-producing layer (McCormick). Pass full
+            // MatMul is a relaxation-producing layer (McCormick). Pass full
             // incoming bounds — the layer places all bias (incoming + McCormick) on
-            // bounds_a and zeros bounds_b (#2520). Extract total bias post-call via
+            // bounds_a and zeros bounds_b. Extract total bias post-call via
             // the separate bias channel.
+            //
+            // #vit-margin-alpha (B4): a var×var MatMul that carries interpolation
+            // parameters (only the certified margin ascent ever supplies them for a
+            // MatMul node) takes the SAME certified interpolated-McCormick arm as
+            // `BilinearCrown`: identical shape contract (`parse_matmul_dims`),
+            // identical coefficient and constant certificates. No entry => the
+            // historical midpoint arm, byte-identical.
+            let node_alpha = ctx.bilinear_alphas.and_then(|m| m.get(ctx.node_name));
             let (mut lb_a, mut lb_b) = matmul
-                .propagate_linear_binary(node_lb, input_a_bounds, input_b_bounds)
+                .propagate_linear_binary_with_interpolation(
+                    node_lb,
+                    input_a_bounds,
+                    input_b_bounds,
+                    node_alpha,
+                )
                 .map_err(|e| preserve_structured_error(e, ctx.node_name, "MatMul"))?;
             let bias_lower = lb_a.lower_b() + lb_b.lower_b();
             let bias_upper = lb_a.upper_b() + lb_b.upper_b();
@@ -664,7 +690,7 @@ fn dispatch_backward_layer_inner(
                 bias_upper,
             })
         }
-        // === BilinearCrown: binary with both input bounds, separate bias (#2617) ===
+        // === BilinearCrown: binary with both input bounds, separate bias ===
         Layer::BilinearCrown(bilinear) => {
             if ctx.inputs.len() != 2 {
                 return Err(NyError::InvalidSpec(format!(
@@ -769,7 +795,7 @@ fn dispatch_backward_layer_inner(
         Layer::ReLU(_) => Ok(BackwardDispatchResult::Unsupported(
             "ReLU must be handled by caller (requires alpha/beta state)".to_string(),
         )),
-        // === MulBinary: McCormick envelope CROWN backward (#3439) ===
+        // === MulBinary: McCormick envelope CROWN backward ===
         // Element-wise z = x * y with McCormick relaxation. Follows the same
         // binary split pattern as MatMul/BilinearCrown with separate bias channel.
         // Reference: auto_LiRPA operators/bivariate.py:40-75 (McCormick envelopes),
@@ -796,7 +822,7 @@ fn dispatch_backward_layer_inner(
                 ctx.node_name,
                 "MulBinary input B",
             )?;
-            // #3439 Phase 2: alpha-parameterized McCormick when available,
+            // Alpha-parameterized McCormick when available,
             // fixed relaxation mode when not.
             let node_alpha = ctx.mul_binary_alphas.and_then(|m| m.get(ctx.node_name));
             let (mut lb_a, mut lb_b) = if node_alpha.is_some() {
@@ -929,12 +955,11 @@ fn dispatch_backward_layer_inner(
         // POINTWISE-sound IBP-validated margin (mirrors the AdaIN ternary
         // surface). It un-blocks CROWN continuation past a fused attention node
         // (which otherwise returns `UnsupportedOp`, aborting the whole graph to
-        // IBP). STATUS (corrected 2026-07-05): this is now **enabled by default**
-        // — `attn_crown_ternary_enabled()` is `true` unless `NY_ATTN_CROWN_TERNARY=0`
-        // — because on the boxes verification actually uses it is *tighter* than
-        // the simplex-aware IBP (an earlier note claiming it merely ties IBP is
-        // stale; the default was flipped on). Set `NY_ATTN_CROWN_TERNARY=0` to
-        // force the byte-identical IBP fallback. Returns `Unsupported` on any
+        // IBP). It is **enabled by default** — `attn_crown_ternary_enabled()` is
+        // `true` unless `NY_ATTN_CROWN_TERNARY=0` — because on the boxes
+        // verification actually uses it is *tighter* than the simplex-aware
+        // IBP. Set `NY_ATTN_CROWN_TERNARY=0` to force the
+        // byte-identical IBP fallback. Returns `Unsupported` on any
         // unsupported shape / non-finite intermediate, so the caller always falls
         // back to the same sound IBP. (#attn-crown)
         Layer::SelfAttention(attn) => {
@@ -1011,7 +1036,7 @@ fn dispatch_backward_layer_inner(
                 ))),
             }
         }
-        // === Remaining unary layers: unified trait dispatch (#3424) ===
+        // === Remaining unary layers: unified trait dispatch ===
         // Every variant listed explicitly — no catch-all. Adding a new Layer
         // variant without a dispatch arm here is a compile error.
         //
@@ -1061,7 +1086,7 @@ fn dispatch_backward_layer_inner(
                 .propagate_crown_backward(node_lb, Some(ctx.pre_activation))
             {
                 Ok(new_lb) => Ok(BackwardDispatchResult::Single(Box::new(new_lb))),
-                // #3166, #2888, #3602: Unsupported/shape errors degrade to IBP fallback.
+                // Unsupported/shape errors degrade to IBP fallback.
                 Err(
                     NyError::UnsupportedOp(msg)
                     | NyError::UnsupportedConfiguration(msg)
@@ -1149,7 +1174,7 @@ fn dispatch_backward_layer_inner(
                 Err(err) => Err(preserve_structured_error(err, ctx.node_name, op_label)),
             }
         }
-        // === Div without explicit handler (#3424) ===
+        // === Div without explicit handler ===
         // Div has a site-specific reciprocal-scaling handler in the graph CROWN
         // coordinator; it reports Unsupported here so callers fall back to IBP
         // if they reach this arm. (Atan2 now has a linear-envelope handler in

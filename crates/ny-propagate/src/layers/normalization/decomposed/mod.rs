@@ -7,8 +7,6 @@
 //! This module hosts the reusable primitive-chain normalization backward paths
 //! that are shared between block-wise graph CROWN and the layer-level
 //! `LayerNormLayer` / `RmsNormLayer` surfaces.
-//!
-//! Part of #2077, #318, #3447, #3821, #3830.
 
 mod bilinear;
 mod common;
@@ -55,7 +53,7 @@ pub(crate) use rmsnorm::{
 /// Row-validation counts from decomposed normalization CROWN backward.
 ///
 /// Tracks how many rows collapsed to fused LayerNorm IBP because the decomposed
-/// CROWN result was looser than the fused baseline. Part of #318, #2077.
+/// CROWN result was looser than the fused baseline.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RowValidationCounts {
     pub fallback_rows: usize,

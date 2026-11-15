@@ -88,11 +88,11 @@ fn test_spec_guided_crown_kokoro_vocoder_prefix_boundary_3500() {
 }
 
 /// Regression test proving GemmEngine is actually dispatched through Conv1d
-/// CROWN backward on a real Kokoro vocoder prefix subgraph (#3598).
+/// CROWN backward on a real Kokoro vocoder prefix subgraph.
 ///
 /// Uses a CountingGemmEngine to verify that at least one GEMM call flows
 /// through the engine during spec-guided CROWN on a ConvTranspose1d-dominated
-/// prefix. This validates the dispatch wiring added in the #3598 fix.
+/// prefix. This validates the Conv1d engine dispatch wiring.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
 #[cfg(feature = "external-avoice")]
@@ -163,7 +163,7 @@ fn test_crown_engine_dispatched_conv1d_kokoro_prefix_3598() {
     });
 }
 
-/// Graph-level regression for #3598: engine-backed spec-guided CROWN must
+/// Graph-level regression: engine-backed spec-guided CROWN must
 /// preserve the baseline `engine=None` bounds on the real Kokoro prefix.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]

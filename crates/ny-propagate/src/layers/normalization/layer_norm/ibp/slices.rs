@@ -26,7 +26,7 @@ pub(super) fn batch_size(shape: &[usize]) -> Result<usize> {
 ///
 /// Writes the prefix indices into `buf[..ndim-1]`. The caller is responsible
 /// for ensuring `buf` has at least `shape.len() - 1` elements.
-/// Part of #2237: eliminates per-batch-element heap allocations.
+/// Avoids per-batch-element heap allocations.
 pub(super) fn decode_batch_prefix_into(shape: &[usize], batch_idx: usize, buf: &mut [usize]) {
     let prefix_len = shape.len() - 1;
     let mut remaining = batch_idx;
@@ -39,7 +39,6 @@ pub(super) fn decode_batch_prefix_into(shape: &[usize], batch_idx: usize, buf: &
 /// Collect a 1D slice along the last axis at the given batch prefix.
 ///
 /// Uses a stack-allocated index buffer to avoid per-element heap allocations.
-/// Part of #2237.
 pub(super) fn collect_last_axis_slice(
     arr: &ArrayD<f32>,
     prefix: &[usize],

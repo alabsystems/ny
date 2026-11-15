@@ -874,13 +874,13 @@ fn test_where_constant_fold() {
 }
 
 // ==========================================================================
-// Overflow regression tests (#3280)
+// Overflow regression tests
 //
 // Verify that broadcast_binop rejects output shapes exceeding the
 // MAX_BROADCAST_ELEMENTS cap (which relies on checked_shape_product).
 // ==========================================================================
 
-/// Regression test (#3280): broadcast_binop returns None when output
+/// Regression test: broadcast_binop returns None when output
 /// shape exceeds MAX_BROADCAST_ELEMENTS (10_000_000).
 ///
 /// Creates two small arrays whose broadcast output shape would be
@@ -901,7 +901,7 @@ fn test_broadcast_binop_overflow_cap_rejected_3280() {
     );
 }
 
-/// Regression test (#3280): broadcast_where returns None when output
+/// Regression test: broadcast_where returns None when output
 /// shape exceeds MAX_BROADCAST_ELEMENTS.
 #[ntest::timeout(5000)]
 #[test]
@@ -918,7 +918,7 @@ fn test_broadcast_where_overflow_cap_rejected_3280() {
     );
 }
 
-/// Regression test (#3280): checked_shape_product rejects overflowing products.
+/// Regression test: checked_shape_product rejects overflowing products.
 ///
 /// Direct test of the guard function used by all loader overflow paths.
 #[ntest::timeout(5000)]

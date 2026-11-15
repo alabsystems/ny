@@ -227,7 +227,7 @@ fn test_pow_square_crown_soundness() {
     }
 }
 
-/// Regression test for #1780: x^2 CROWN relaxation must remain sound on tiny intervals.
+/// Regression test: x^2 CROWN relaxation must remain sound on tiny intervals.
 #[ntest::timeout(10000)]
 #[test]
 fn test_pow_square_crown_subnormal_and_near_degenerate_soundness_1780() {
@@ -270,7 +270,7 @@ fn test_pow_square_crown_subnormal_and_near_degenerate_soundness_1780() {
     }
 }
 
-/// Regression test for #1795: Kani found Pow2 lower bound unsound at subnormal scale.
+/// Regression test: Kani found Pow2 lower bound unsound at subnormal scale.
 ///
 /// Concrete counterexample from Kani: l ≈ -3.74e-23, u = -MIN_POSITIVE.
 /// The tangent intercept rounds to -0.0, slope*x rounds up to MIN_POSITIVE_SUBNORMAL,
@@ -320,7 +320,7 @@ fn test_pow_square_crown_subnormal_lower_bound_regression_1795() {
     );
 }
 
-/// Regression test for issue #1644: fractional exponent with negative inputs must error.
+/// Regression test: fractional exponent with negative inputs must error.
 #[ntest::timeout(10000)]
 #[test]
 fn test_pow_fractional_rejects_negative_input_1644() {
@@ -345,7 +345,7 @@ fn test_pow_fractional_rejects_negative_input_1644() {
     );
 }
 
-/// Regression test for issue #1644: non-integer exponent > 1 with negative inputs must error.
+/// Regression test: non-integer exponent > 1 with negative inputs must error.
 #[ntest::timeout(10000)]
 #[test]
 fn test_pow_non_integer_gt1_rejects_negative_input_1644() {
@@ -370,7 +370,7 @@ fn test_pow_non_integer_gt1_rejects_negative_input_1644() {
     );
 }
 
-/// Regression test for issue #1653: x^4 with positive inputs.
+/// Regression test: x^4 with positive inputs.
 #[ntest::timeout(10000)]
 #[test]
 fn test_pow_fourth_positive_1653() {
@@ -398,7 +398,7 @@ fn test_pow_fourth_positive_1653() {
     }
 }
 
-/// Regression test for issue #1653: x^4 with negative inputs.
+/// Regression test: x^4 with negative inputs.
 #[ntest::timeout(10000)]
 #[test]
 fn test_pow_fourth_negative_1653() {
@@ -426,7 +426,7 @@ fn test_pow_fourth_negative_1653() {
     }
 }
 
-/// Regression test for issue #1653: x^4 straddling zero.
+/// Regression test: x^4 straddling zero.
 #[ntest::timeout(10000)]
 #[test]
 fn test_pow_fourth_straddles_zero_1653() {
@@ -454,7 +454,7 @@ fn test_pow_fourth_straddles_zero_1653() {
     }
 }
 
-/// Regression test for issue #1653: x^6 straddling zero.
+/// Regression test: x^6 straddling zero.
 #[ntest::timeout(10000)]
 #[test]
 fn test_pow_sixth_straddles_zero_1653() {
@@ -533,9 +533,9 @@ fn test_pow_fractional_positive_input_succeeds() {
     );
 }
 
-// ==================== Negative exponent tests (issue #1657) ====================
+// ==================== Negative exponent tests ====================
 
-/// Regression test for #1657: p=-1, all-positive interval.
+/// Regression test: p=-1, all-positive interval.
 /// x^{-1} is monotonically decreasing for x > 0: [2, 4]^{-1} = [0.25, 0.5]
 #[ntest::timeout(10000)]
 #[test]
@@ -563,7 +563,7 @@ fn test_pow_neg1_positive_1657() {
     }
 }
 
-/// Regression test for #1657: p=-1, all-negative interval.
+/// Regression test: p=-1, all-negative interval.
 /// x^{-1} is monotonically decreasing for x < 0: [-4, -2]^{-1} = [-0.5, -0.25]
 #[ntest::timeout(10000)]
 #[test]
@@ -589,7 +589,7 @@ fn test_pow_neg1_negative_1657() {
     );
 }
 
-/// Regression test for #1657: p=-1 with zero-crossing must error.
+/// Regression test: p=-1 with zero-crossing must error.
 #[ntest::timeout(10000)]
 #[test]
 fn test_pow_neg1_zero_crossing_rejects_1657() {
@@ -613,7 +613,7 @@ fn test_pow_neg1_zero_crossing_rejects_1657() {
     );
 }
 
-/// Regression test for #1657: p=-2, all-positive interval.
+/// Regression test: p=-2, all-positive interval.
 /// x^{-2} for x > 0 is monotonically decreasing: [2, 4]^{-2} = [1/16, 1/4]
 #[ntest::timeout(10000)]
 #[test]
@@ -640,7 +640,7 @@ fn test_pow_neg2_positive_1657() {
     );
 }
 
-/// Regression test for #1657: p=-2, all-negative interval.
+/// Regression test: p=-2, all-negative interval.
 /// x^{-2} for x < 0 is monotonically increasing: [-4, -2]^{-2} = [1/16, 1/4]
 #[ntest::timeout(10000)]
 #[test]
@@ -667,7 +667,7 @@ fn test_pow_neg2_negative_1657() {
     );
 }
 
-/// Regression test for #1657: p=-2 with zero-crossing must error.
+/// Regression test: p=-2 with zero-crossing must error.
 #[ntest::timeout(10000)]
 #[test]
 fn test_pow_neg2_zero_crossing_rejects_1657() {
@@ -691,7 +691,7 @@ fn test_pow_neg2_zero_crossing_rejects_1657() {
     );
 }
 
-/// Regression test for #1657: p=-0.5 with zero input must error.
+/// Regression test: p=-0.5 with zero input must error.
 #[ntest::timeout(10000)]
 #[test]
 fn test_pow_neg_half_zero_rejects_1657() {
@@ -715,7 +715,7 @@ fn test_pow_neg_half_zero_rejects_1657() {
     );
 }
 
-/// Regression test for #1657: p=-0.5 with all-positive input succeeds.
+/// Regression test: p=-0.5 with all-positive input succeeds.
 /// x^{-0.5} = 1/sqrt(x), monotonically decreasing for x > 0.
 #[ntest::timeout(10000)]
 #[test]
@@ -742,9 +742,9 @@ fn test_pow_neg_half_positive_1657() {
     );
 }
 
-// ==================== Per-element zero-crossing tests (issue #1699) ====================
+// ==================== Per-element zero-crossing tests ====================
 
-/// Regression test for #1699: multi-element tensor with mixed-sign elements
+/// Regression test: multi-element tensor with mixed-sign elements
 /// that individually don't cross zero should NOT be rejected.
 /// Element 0: [2, 4] (positive), Element 1: [-4, -2] (negative).
 /// The old global check would see min_lower=-4 and max_upper=4, falsely rejecting.
@@ -784,7 +784,7 @@ fn test_pow_neg1_multi_element_mixed_sign_no_crossing_1699() {
     );
 }
 
-/// Regression test for #1699: per-element check still rejects individual elements crossing zero.
+/// Regression test: per-element check still rejects individual elements crossing zero.
 #[ntest::timeout(10000)]
 #[test]
 fn test_pow_neg1_multi_element_one_crosses_zero_rejects_1699() {
@@ -807,7 +807,7 @@ fn test_pow_neg1_multi_element_one_crosses_zero_rejects_1699() {
     );
 }
 
-/// Regression test for #1699: p=-2 with 3-element mixed sign, no individual zero-crossing.
+/// Regression test: p=-2 with 3-element mixed sign, no individual zero-crossing.
 #[ntest::timeout(10000)]
 #[test]
 fn test_pow_neg2_multi_element_mixed_sign_1699() {
@@ -856,7 +856,7 @@ fn test_pow_neg2_multi_element_mixed_sign_1699() {
     );
 }
 
-/// Regression test for #2911: extreme exponent overflows i32 cast in parity check.
+/// Regression test: extreme exponent overflows i32 cast in parity check.
 /// Before fix: (1e30_f32.round() as i32) saturates to i32::MAX (odd), misclassifying
 /// an even exponent as odd. After fix: returns InvalidSpec error.
 #[ntest::timeout(10000)]
@@ -894,7 +894,7 @@ fn test_pow_extreme_exponent_returns_error_2911() {
     );
 }
 
-// Proptest for #1699: random multi-element tensors with negative exponents.
+// Proptest: random multi-element tensors with negative exponents.
 // Each element either positive-only or negative-only (no zero crossing).
 // Verifies IBP bounds contain the true output at sampled points.
 proptest! {

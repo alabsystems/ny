@@ -58,15 +58,11 @@ fn disarmed_every_lane_keeps_its_private_fraction() {
 fn the_allocator_is_admitted_only_when_it_alone_owns_the_caps() {
     // Disarmed dominates everything: nothing else is even consulted.
     for scheduler in [false, true] {
-        for peel in [false, true] {
-            assert!(!allocator_admitted(false, scheduler, peel));
-        }
+        assert!(!allocator_admitted(false, scheduler));
     }
     // Armed, but the in-flight scheduler already owns the two BNN lanes.
-    assert!(!allocator_admitted(true, true, false));
-    // Armed, but the traffic peel rewrites the objective the probe measures.
-    assert!(!allocator_admitted(true, false, true));
-    assert!(allocator_admitted(true, false, false));
+    assert!(!allocator_admitted(true, true));
+    assert!(allocator_admitted(true, false));
 }
 
 #[test]
@@ -890,20 +886,17 @@ fn the_frame_lever_is_dark_by_default() {
 fn the_frame_is_the_weakest_cap_authority() {
     for allocator in [false, true] {
         for scheduler in [false, true] {
-            for peel in [false, true] {
-                assert!(
-                    !frame_admitted(false, allocator, scheduler, peel),
-                    "disarmed must dominate"
-                );
-            }
+            assert!(
+                !frame_admitted(false, allocator, scheduler),
+                "disarmed must dominate"
+            );
         }
     }
-    // Armed, it stands down under either of the stronger authorities and under
-    // the traffic peel; exactly one mechanism holds a lane's cap at a time.
-    assert!(!frame_admitted(true, true, false, false));
-    assert!(!frame_admitted(true, false, true, false));
-    assert!(!frame_admitted(true, false, false, true));
-    assert!(frame_admitted(true, false, false, false));
+    // Armed, it stands down under either of the stronger authorities; exactly
+    // one mechanism holds a lane's cap at a time.
+    assert!(!frame_admitted(true, true, false));
+    assert!(!frame_admitted(true, false, true));
+    assert!(frame_admitted(true, false, false));
 }
 
 /// A skipped lane's receipt must name the authority that actually zeroed it.

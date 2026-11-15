@@ -50,7 +50,7 @@ impl BetaCrownVerifier {
                     if spatial == 0 {
                         return;
                     }
-                    // Use integer sqrt to avoid float-to-usize cast (Part of #2983).
+                    // Use integer sqrt to avoid float-to-usize cast.
                     // Manual implementation for MSRV 1.75 compat (isqrt stabilized in 1.84).
                     let side = {
                         let mut x = (spatial as f64).sqrt() as usize;

@@ -15,11 +15,13 @@ mod crown_profile;
 mod doc_imports;
 mod flatten;
 mod gelu_sound;
+mod genbab_split_soundness_stress;
 mod graph;
 mod invprop_coverage;
 mod matmul;
 mod proptest_soundness;
 mod reciprocal;
+mod relaxation_envelope;
 mod sdp_crown;
 mod soundness_audit_wave3;
 mod speaker_embedding_distance;
@@ -77,7 +79,7 @@ pub(crate) fn with_patches_tightening_budget_secs<T>(value: &str, f: impl FnOnce
 /// Assert two arrays are element-wise close within `tol`.
 ///
 /// Centralised from duplicate definitions in `bilinear.rs` and
-/// `activations/add_constant.rs` (issue #1716).
+/// `activations/add_constant.rs`.
 #[allow(dead_code)] // Shared test utility; not all test modules import it in every build.
 fn floats_close_or_equal(actual: f32, expected: f32, tol: f32) -> bool {
     actual == expected || (actual - expected).abs() <= tol
@@ -108,7 +110,7 @@ pub fn assert_all_close(
 /// Assert two scalar f32 values are close within `tol`.
 ///
 /// Consolidated from 5 duplicate `assert_close` definitions in layers/
-/// test modules (issue #2496). Each call site passes its own tolerance
+/// test modules. Each call site passes its own tolerance
 /// instead of hiding it inside the helper.
 #[allow(dead_code)] // Shared test utility; not all test modules import it in every build.
 pub fn assert_close(actual: f32, expected: f32, tol: f32) {
@@ -119,10 +121,146 @@ pub fn assert_close(actual: f32, expected: f32, tol: f32) {
     );
 }
 
+/// Run `f` with the forward-linear (FL) reference route's env pinned to its
+/// shipped defaults: references ON (`NY_NO_FORWARD_LINEAR_REF` and
+/// `NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF` unset), the f32 value-GEMM seam
+/// OFF (`NY_FORWARD_LINEAR_F32` unset) and no sequential-conv research gate
+/// (`NY_FORWARD_LINEAR_SEQ_CONV_REF` unset). The editor is handed on so a test
+/// can flip a kill switch after asserting the default route; every edit is
+/// restored on exit and serialized through the workspace env choke point.
+///
+/// Shared so the four switches are named once for every default-route test
+/// instead of once per test (#fl-alpha-composition), and named through their
+/// declarations (`ny_levers::decls::forward_linear`) rather than spelled, so
+/// the scrub adds no undeclared lever literal to the NY source frontier.
+pub(crate) fn with_default_fl_reference_env<T>(
+    f: impl FnOnce(&mut ny_test_utils::env::EnvEditor) -> T,
+) -> T {
+    with_env_edits(|env| {
+        scrub_fl_reference_env(env);
+        f(env)
+    })
+}
+
+/// The forward-linear reference switches [`with_default_fl_reference_env`]
+/// removes, by declaration.
+static FL_REFERENCE_SWITCHES: [&ny_levers::LeverDecl; 4] = [
+    &ny_levers::decls::forward_linear::NO_FORWARD_LINEAR_REF,
+    &ny_levers::decls::forward_linear::NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF,
+    &ny_levers::decls::forward_linear::FORWARD_LINEAR_F32,
+    &ny_levers::decls::forward_linear::FORWARD_LINEAR_SEQ_CONV_REF,
+];
+
+/// Remove every forward-linear reference switch for the rest of the current
+/// `with_env_edits` scope.
+fn scrub_fl_reference_env(env: &mut ny_test_utils::env::EnvEditor) {
+    for switch in FL_REFERENCE_SWITCHES {
+        env.remove(switch.name);
+    }
+}
+
+/// The declared names the shared scrub removes are the names the live readers
+/// consult, not merely the declarations' spellings: with every switch armed
+/// through its handle both reference gates are withdrawn, and the scrub
+/// restores the shipped default-ON policy every default-route test relies on.
+#[test]
+fn default_fl_reference_scrub_reaches_the_live_reference_gates() {
+    use crate::GraphNetwork;
+
+    let mut expected: Vec<&str> = ny_levers::decls::forward_linear::FORWARD_LINEAR_LEVERS
+        .decls()
+        .iter()
+        .map(|decl| decl.name)
+        .collect();
+    expected.sort_unstable();
+    let mut scrubbed: Vec<&str> = FL_REFERENCE_SWITCHES.iter().map(|decl| decl.name).collect();
+    scrubbed.sort_unstable();
+    assert_eq!(
+        scrubbed, expected,
+        "the scrub must cover exactly the declared forward-linear switches"
+    );
+
+    with_env_edits(|env| {
+        for switch in FL_REFERENCE_SWITCHES {
+            env.set(switch.name, "1");
+        }
+        assert!(!GraphNetwork::forward_linear_reference_enabled());
+        assert!(!GraphNetwork::forward_linear_conv_transpose_reference_enabled());
+
+        scrub_fl_reference_env(env);
+        assert!(GraphNetwork::forward_linear_reference_enabled());
+        assert!(GraphNetwork::forward_linear_conv_transpose_reference_enabled());
+    });
+}
+
+/// The LIVE reference gates agree with their declarations on every input, not
+/// just on the armed/scrubbed pair above: absent, the admissible `"0"`/`"1"`,
+/// and rejected tokens. Each gate is a kill switch, so it must answer the
+/// negation of what `ny_levers::read_with` resolves for its declaration, and
+/// that must be the historical exact-`"1"` predicate. A reader widened past
+/// exact `"1"`, or one that lost its negation, fails here even though the
+/// declaration's own tests still pass (#fl-alpha-composition review, plant
+/// PL5: those tests compare the declaration with a fixed model, never with
+/// the live reader).
+#[test]
+fn live_fl_reference_gates_agree_with_their_declarations() {
+    use crate::GraphNetwork;
+    use ny_levers::decls::forward_linear::{
+        NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF, NO_FORWARD_LINEAR_REF,
+    };
+
+    let gates: [(&'static ny_levers::LeverDecl, fn() -> bool); 2] = [
+        (
+            &NO_FORWARD_LINEAR_REF,
+            GraphNetwork::forward_linear_reference_enabled,
+        ),
+        (
+            &NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF,
+            GraphNetwork::forward_linear_conv_transpose_reference_enabled,
+        ),
+    ];
+    let inputs = [
+        None,
+        Some("0"),
+        Some("1"),
+        Some("true"),
+        Some(" 1"),
+        Some("1 "),
+        Some(""),
+        Some("yes"),
+    ];
+    with_default_fl_reference_env(|env| {
+        for (decl, gate_enabled) in gates {
+            for raw in inputs {
+                match raw {
+                    Some(value) => env.set(decl.name, value),
+                    None => env.remove(decl.name),
+                }
+                let declared_armed = ny_levers::read_with(decl, |_| raw.map(str::to_owned))
+                    .value
+                    .as_bool();
+                assert_eq!(
+                    gate_enabled(),
+                    !declared_armed,
+                    "{} {raw:?}: the live gate disagrees with its declaration",
+                    decl.name
+                );
+                assert_eq!(
+                    gate_enabled(),
+                    raw != Some("1"),
+                    "{} {raw:?}: the live gate left the exact-\"1\" kill-switch contract",
+                    decl.name
+                );
+            }
+            env.remove(decl.name);
+        }
+    });
+}
+
 /// Assert two `LinearBounds` match elementwise within `tol`.
 ///
 /// Consolidated from 4 duplicate definitions across beta_crown/engine/tests,
-/// layers/linear/tests, and tests/crown/ modules (issue #3685).
+/// layers/linear/tests, and tests/crown/ modules.
 #[allow(dead_code)] // Shared test utility; not all test modules import it in every build.
 pub fn assert_linear_bounds_close(
     actual: &LinearBounds,
@@ -211,7 +349,7 @@ pub fn assert_linear_bounds_close(
 /// Assert two `BatchedLinearBounds` match elementwise within `tol`.
 ///
 /// Consolidated from 3 duplicate definitions in layers/convolution/ and
-/// layers/binary_ops/bilinear/ test modules (issue #3685).
+/// layers/binary_ops/bilinear/ test modules.
 #[allow(dead_code)] // Shared test utility; not all test modules import it in every build.
 pub fn assert_batched_bounds_close(
     actual: &BatchedLinearBounds,
@@ -328,7 +466,7 @@ fn test_assert_batched_bounds_close_accepts_matching_infinities_3974() {
 /// verify the returned linear bounds enclose `f(x)` for all sampled `x`.
 ///
 /// Consolidated from identical copies in `periodic/tests.rs` and
-/// `s_shaped.rs` (#2307).
+/// `s_shaped.rs`.
 #[allow(dead_code)]
 pub fn assert_crown_backward_sound<F>(layer: &dyn BoundPropagation, intervals: &[(f32, f32)], f: F)
 where
@@ -372,7 +510,7 @@ where
 /// `lower(x) <= f(x) + tol` and `upper(x) >= f(x) - tol` everywhere.
 ///
 /// Consolidated from 5 duplicate definitions across trigonometric/ and
-/// softmax/gelu/ test modules (issue #2496).
+/// softmax/gelu/ test modules.
 #[allow(dead_code)]
 pub fn assert_relaxation_sound<F>(
     l: f32,

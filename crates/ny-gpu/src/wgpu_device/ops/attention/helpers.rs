@@ -10,7 +10,7 @@ pub(super) fn array_slice<'a>(name: &str, array: &'a ArrayD<f32>) -> Result<&'a 
     // GPU shaders index as row-major: a_offset + i * k + kk for A[i, kk].
     // as_slice_memory_order() accepts Fortran-layout arrays but returns data in
     // column-major order, which the shader misinterprets as row-major, producing
-    // silently wrong bounds. Part of #2257.
+    // silently wrong bounds.
     array.as_slice().ok_or_else(|| {
         NyError::InvalidSpec(format!(
             "attention_ibp_fused: {name} must be C-contiguous (standard layout)"
@@ -43,7 +43,7 @@ mod tests {
         assert_eq!(result.unwrap(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
 
-    /// Regression test for #2257: Fortran-layout arrays must be rejected.
+    /// Regression test: Fortran-layout arrays must be rejected.
     /// as_slice_memory_order() would accept these and return column-major data,
     /// which GPU shaders (expecting row-major) would silently misinterpret.
     #[test]

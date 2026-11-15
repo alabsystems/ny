@@ -32,7 +32,6 @@ pub(super) fn propagate_interval(
     // Compute bounds on mean using f64 accumulation with directed rounding.
     // mean_lower uses next_down_f32 so result <= true mean (sound for lower).
     // mean_upper uses next_up_f32 so result >= true mean (sound for upper).
-    // Part of #2423.
     let mean_lower = mean_axis_f64_lower(input.lower(), Axis(ndim - 1)).ok_or_else(|| {
         NyError::InvalidSpec(format!(
             "LayerNorm: mean_axis failed for axis {} on {}D input",
@@ -66,13 +65,13 @@ pub(super) fn propagate_interval(
         for i in 0..norm_size {
             let xl = input.lower()[[i]];
             let xu = input.upper()[[i]];
-            // Directed rounding on intermediate deviation. Part of #3344.
+            // Directed rounding on intermediate deviation.
             let diff_l = next_down_f32(xl - mean_u);
             let diff_u = next_up_f32(xu - mean_l);
             let g = layer.ny[i];
             let b = layer.beta[i];
 
-            // Directed rounding on final bounds. Part of #3344.
+            // Directed rounding on final bounds.
             if g >= 0.0 {
                 out_lower[[i]] = next_down_f32(g * diff_l + b);
                 out_upper[[i]] = next_up_f32(g * diff_u + b);
@@ -106,13 +105,13 @@ pub(super) fn propagate_interval(
 
                 let xl = input.lower()[idx];
                 let xu = input.upper()[idx];
-                // Directed rounding on intermediate deviation. Part of #3344.
+                // Directed rounding on intermediate deviation.
                 let diff_l = next_down_f32(xl - mean_u);
                 let diff_u = next_up_f32(xu - mean_l);
                 let g = layer.ny[i];
                 let b = layer.beta[i];
 
-                // Directed rounding on final bounds. Part of #3344.
+                // Directed rounding on final bounds.
                 if g >= 0.0 {
                     out_lower[idx] = next_down_f32(g * diff_l + b);
                     out_upper[idx] = next_up_f32(g * diff_u + b);
@@ -126,6 +125,6 @@ pub(super) fn propagate_interval(
 
     // Repair non-finite outputs: g * diff can produce Inf for large
     // ny or wide input intervals. Consistent with IBP overflow
-    // strategy (#3030, #3060).
+    // strategy.
     BoundedTensor::new_repaired(out_lower, out_upper, RepairStrategy::Conservative)
 }

@@ -71,9 +71,10 @@ def _run_with_fake_measurement_command(
     cargo_source: str,
     *,
     benchmark_source: str | None = None,
+    cargo_name: str = "fake cargo",
 ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
     command_dir = tmp_path / "measurement commands"
-    cargo = _write_executable(command_dir / "fake cargo", cargo_source)
+    cargo = _write_executable(command_dir / cargo_name, cargo_source)
     benchmark_called = tmp_path / "benchmark-called"
     benchmark = _write_executable(
         command_dir / "fake benchmark",
@@ -156,6 +157,46 @@ def test_orchestrator_writes_blocked_manifest_when_measurement_command_fails(
     assert not (
         output_dir / "issue-4359-nvidia-vulkan-crown-backward.csv"
     ).exists()
+    assert not benchmark_called.exists()
+
+
+@pytest.mark.parametrize(
+    ("cargo_name", "expected_prefix"),
+    [
+        # targo refuses a build that names no lane, so the default tool runs
+        # in its unverified lane.
+        ("targo", ["--unverified", "run"]),
+        # Any other CARGO_CMD (the public snapshot's stock cargo) takes none.
+        ("fake cargo", ["run"]),
+    ],
+)
+def test_orchestrator_names_the_targo_lane_only_for_targo(
+    tmp_path: Path, cargo_name: str, expected_prefix: list[str]
+) -> None:
+    argv_file = tmp_path / "measurement-argv"
+    result, _output_dir, benchmark_called = _run_with_fake_measurement_command(
+        tmp_path,
+        textwrap.dedent(
+            f"""\
+            #!/bin/bash
+            if [[ "${{1:-}}" == "-V" ]]; then
+                printf 'cargo 1.0-test\\n'
+                exit 0
+            fi
+            printf '%s\\n' "$@" > '{argv_file}'
+            exit 23
+            """
+        ),
+        cargo_name=cargo_name,
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    argv = argv_file.read_text(encoding="utf-8").splitlines()
+    assert argv[: len(expected_prefix) + 2] == [
+        *expected_prefix,
+        "-p",
+        "ny-gpu",
+    ]
     assert not benchmark_called.exists()
 
 

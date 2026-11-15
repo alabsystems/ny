@@ -212,6 +212,8 @@ fn parse_assignment_declaration(
 
 /// Parse VNN-LIB format from string content.
 pub fn parse_vnnlib(content: &str) -> Result<VnnLibSpec> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Load);
     let cleaned_content = strip_vnnlib_comments(content);
     let raw_content = cleaned_content.as_str();
     let mut spec = VnnLibSpec::new();
@@ -406,12 +408,12 @@ pub fn parse_vnnlib(content: &str) -> Result<VnnLibSpec> {
 
     // Validate that all output constraint indices are within [0, num_outputs).
     // This catches malformed VNN-LIB specs at the system boundary, preventing
-    // downstream panics or silently weakened objectives. (#1886)
+    // downstream panics or silently weakened objectives.
     spec.validate_output_indices()?;
 
     // Reject NaN / inverted input bounds at the VNN-LIB boundary so the error
     // names the offending `X_i` variable instead of a downstream numeric index
-    // (#2800). NaN literals in `assert` propagate into the stored bounds here.
+    //NaN literals in `assert` propagate into the stored bounds here.
     spec.validate_input_bounds()?;
 
     info!(
@@ -445,6 +447,20 @@ fn apply_normalized_output_constraints(spec: &mut VnnLibSpec, content: &str) -> 
     if has_per_clause {
         spec.per_clause_input_bounds = normalized.per_clause_input_bounds;
 
+        // A clause that does NOT mention an axis leaves that axis FREE (bounded
+        // only by the global declaration). The union over clauses is therefore
+        // UNBOUNDED on such an axis, and collapsing a globally-unbounded axis onto
+        // the union of merely the clauses that DO constrain it EXCLUDES admissible
+        // points — a false `unsat`, the -150 direction. Count first, then only
+        // narrow an unbounded axis when EVERY clause constrains it.
+        let n_clauses = spec.per_clause_input_bounds.len();
+        let mut constraining_clauses: HashMap<usize, usize> = HashMap::new();
+        for clause_bounds in &spec.per_clause_input_bounds {
+            for &idx in clause_bounds.keys() {
+                *constraining_clauses.entry(idx).or_insert(0) += 1;
+            }
+        }
+
         // Compute union of all per-clause bounds to set/tighten global bounds.
         for clause_bounds in &spec.per_clause_input_bounds {
             for (&idx, &(lower, upper)) in clause_bounds {
@@ -452,8 +468,12 @@ fn apply_normalized_output_constraints(spec: &mut VnnLibSpec, content: &str) -> 
                     let global = &mut spec.input_bounds[idx];
                     // Union: widen global bounds to include this clause's range
                     if global.0 == f64::NEG_INFINITY && global.1 == f64::INFINITY {
-                        // Global bounds are unbounded — set to first clause's bounds
-                        *global = (lower, upper);
+                        // Only safe when the axis is constrained by EVERY clause;
+                        // otherwise some clause admits the whole line and the union
+                        // must stay unbounded.
+                        if constraining_clauses.get(&idx) == Some(&n_clauses) {
+                            *global = (lower, upper);
+                        }
                     } else {
                         global.0 = global.0.min(lower);
                         global.1 = global.1.max(upper);
@@ -1791,7 +1811,7 @@ fn parse_assert(
                     match op {
                         "<=" => {
                             // X_i <= val means upper bound
-                            // NaN-propagating: IEEE 754 f64::min absorbs NaN (#2813)
+                            // NaN-propagating: IEEE 754 f64::min absorbs NaN
                             input_upper
                                 .entry(var_idx)
                                 .and_modify(|u| *u = nan_propagating_min_f64(*u, val))
@@ -1799,7 +1819,7 @@ fn parse_assert(
                         }
                         ">=" => {
                             // X_i >= val means lower bound
-                            // NaN-propagating: IEEE 754 f64::max absorbs NaN (#2813)
+                            // NaN-propagating: IEEE 754 f64::max absorbs NaN
                             input_lower
                                 .entry(var_idx)
                                 .and_modify(|l| *l = nan_propagating_max_f64(*l, val))
@@ -1916,7 +1936,7 @@ fn parse_assert(
                         return Ok(());
                     }
                     // constant op X_i
-                    // NaN-propagating min/max: IEEE 754 absorbs NaN (#2813)
+                    // NaN-propagating min/max: IEEE 754 absorbs NaN
                     match op {
                         "<=" => {
                             // val <= X_i means X_i >= val (lower bound)
@@ -2148,7 +2168,7 @@ fn try_apply_linear_input_constraint(
         ));
     }
 
-    // NaN-propagating min/max: IEEE 754 absorbs NaN in f64::min/max (#2813)
+    // NaN-propagating min/max: IEEE 754 absorbs NaN in f64::min/max
     let bound = -constraint.expr.constant_term() / coeff;
     match constraint.relation {
         normalize::Relation::LessEq => {

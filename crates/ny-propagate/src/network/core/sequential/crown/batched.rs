@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Batched N-D CROWN propagation for transformer-shaped networks.
-//!
-//! Extracted from `crown.rs` as part of #4233 Packet D.
 
 use crate::bounds::BatchedLinearBounds;
 use crate::layers::Layer;
@@ -29,7 +27,7 @@ impl Network {
     /// 2. Initialize batched linear bounds at output: A = I, b = 0 per position
     /// 3. Propagate backward through each layer using batched operations
     /// 4. Concretize final linear bounds using input bounds
-    /// 5. Intersect with IBP forward bounds to ensure output is at least as tight as IBP (#2990)
+    /// 5. Intersect with IBP forward bounds to ensure output is at least as tight as IBP
     ///
     /// Currently supports: Linear, ReLU, GELU, Softmax, LayerNorm, Conv1d/ConvTranspose1d,
     /// Conv2d/ConvTranspose2d, Flatten, Reshape, Squeeze, Unsqueeze, Transpose,
@@ -46,13 +44,14 @@ impl Network {
     /// Propagate bounds using batched CROWN with an optional GPU GEMM engine.
     ///
     /// Same as `propagate_crown_batched` but threads `engine` through Conv2d
-    /// layers for GPU-accelerated GEMM dispatch (#3399).
+    /// layers for GPU-accelerated GEMM dispatch.
     #[instrument(skip(self, input, engine), fields(num_layers = self.layers.len(), input_shape = ?input.shape()))]
     pub fn propagate_crown_batched_with_engine(
         &self,
         input: &BoundedTensor,
         engine: Option<&dyn GemmEngine>,
     ) -> Result<BoundedTensor> {
+        self.ensure_proof_eligible()?;
         if self.layers.is_empty() {
             return Ok(input.clone());
         }
@@ -63,7 +62,7 @@ impl Network {
             .any(|layer| matches!(layer, Layer::Conv2d(_) | Layer::ConvTranspose2d(_)));
 
         // Check if we can use batched CROWN. Delegates to Layer::supports_batched_crown()
-        // which is the single source of truth for the allow-list (#1753).
+        // which is the single source of truth for the allow-list.
         // Conv2d networks exclude Softmax/LayerNorm (spatial flattening incompatible).
         let can_use_batched = if has_conv2d {
             self.layers
@@ -114,7 +113,7 @@ impl Network {
 
         // Step 2: Initialize batched linear bounds at output
         // A = I (identity) for each position, b = 0
-        // Guard: check CPU dense budget before allocating (#3550).
+        // Guard: check CPU dense budget before allocating.
         if let Err(e) =
             check_batched_identity_budget("Network::propagate_crown_batched", &batched_output_shape)
         {
@@ -140,8 +139,8 @@ impl Network {
                 engine,
             ) {
                 Ok(next) => next,
-                // #3131: Catch both UnsupportedOp and UnsupportedConfiguration.
-                // #3795: DeadlineExceeded also falls back.
+                // Catch both UnsupportedOp and UnsupportedConfiguration.
+                // DeadlineExceeded also falls back.
                 Err(
                     NyError::UnsupportedOp(_)
                     | NyError::UnsupportedConfiguration(_)
@@ -171,7 +170,7 @@ impl Network {
             concrete
         };
 
-        // Step 5+6: Degrade check + forward-bound tightening (#3043 dedup).
+        // Step 5+6: Degrade check + forward-bound tightening.
         tighten_crown_output(final_output, output_bounds, "Batched CROWN")
     }
 }

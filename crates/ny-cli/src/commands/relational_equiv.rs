@@ -51,11 +51,12 @@ use ny_propagate::GraphNetwork;
 /// `NY_RELATIONAL_UNSAT=0` is an explicit kill-switch, `=1` is explicit-on,
 /// and unset defaults ON.
 ///
-/// Category-scoped by construction: every caller of this gate lives inside
+/// Relational-scoped by construction: every caller of this gate lives inside
 /// `run_relational_vnncomp`, which the vnncomp dispatch enters ONLY for a
-/// relational category (`is_relational_category`, vnncomp.rs). Non-relational
-/// categories never reach this code, so defaulting ON is byte-identical for
-/// every other benchmark.
+/// property that declares two or more networks (`RelationalRouteDecision`,
+/// vnncomp.rs — structural since #name-blind-routing; it was a category-name
+/// match before). Single-network properties never reach this code, so
+/// defaulting ON is byte-identical for every other benchmark.
 ///
 /// Sound by construction: this gate does NOT relax any bound — it only PERMITS
 /// the certified implication lane to authorize `unsat`, and
@@ -589,7 +590,7 @@ pub(super) fn spot_check_difference_net(
             .collect();
         let h = forward_point(diff, &x)?;
         let (xf, xg): (Vec<f32>, Vec<f32>) = match wiring {
-            DiffWiring::SharedInput => (x.clone(), x.clone()),
+            DiffWiring::SharedInput => (x.clone(), x),
             DiffWiring::MonotonicCoupled => {
                 if x.len() < 3 {
                     return None;
@@ -1319,14 +1320,9 @@ mod real_benchmark_e2e {
              benchmarks/vnncomp2026_benchmarks/setup.sh",
             vnnlib.display()
         );
-        let verdict = super::super::vnncomp::run_relational_vnncomp(
-            "isomorphic_acasxu_2026",
-            Path::new(onnx_field),
-            &vnnlib,
-            10,
-            None,
-        )
-        .expect("relational BaB run must not error");
+        let verdict =
+            super::super::vnncomp::run_relational_vnncomp(Path::new(onnx_field), &vnnlib, 10, None)
+                .expect("relational BaB run must not error");
         eprintln!("relational BaB smoke verdict: {verdict:?}");
         assert!(
             !matches!(verdict, super::super::vnncomp::VnncompResult::Error),
@@ -1337,7 +1333,7 @@ mod real_benchmark_e2e {
         // explicit `=0` kill-switch is `unsat` impossible; assert that there.
         if std::env::var("NY_RELATIONAL_UNSAT").ok().as_deref() == Some("0") {
             assert!(
-                !matches!(verdict, super::super::vnncomp::VnncompResult::Unsat),
+                !matches!(verdict, super::super::vnncomp::VnncompResult::Unsat(_)),
                 "kill-switch (=0) must forbid the unsat flip"
             );
         }
@@ -1380,9 +1376,7 @@ mod real_benchmark_e2e {
                         // or-of-ors with arithmetic rhs — the canonical shape
                         // gate must now accept it (the live 0/8 blocker), so
                         // every iso instance reaches the verify step.
-                        if let Err(reason) =
-                            dual_difference_soundness_gate("isomorphic_acasxu_2026", dual)
-                        {
+                        if let Err(reason) = dual_difference_soundness_gate(dual) {
                             failures.push(format!("{label}: shape gate declined: {reason}"));
                             continue;
                         }

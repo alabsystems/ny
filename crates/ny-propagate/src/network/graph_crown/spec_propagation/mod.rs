@@ -6,7 +6,7 @@
 //!
 //! This module provides the builder API (`SpecCrownRequest`) and the core
 //! backward coordinator loop. The combinatorial wrapper functions that
-//! previously lived here were replaced by the builder in #4220.
+//! previously lived here were replaced by the builder.
 
 mod core;
 mod fallback;

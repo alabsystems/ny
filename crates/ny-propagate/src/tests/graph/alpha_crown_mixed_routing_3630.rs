@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Mixed sequential alpha-CROWN routing regressions for #3630.
+//! Mixed sequential alpha-CROWN routing regressions.
 //!
 //! Verifies that `Linear -> ReLU -> Linear -> Sigmoid/Tanh -> Linear` graphs
 //! route to DAG alpha-CROWN rather than getting stranded on the sequential
@@ -35,7 +35,7 @@ impl MixedMonotoneKind {
     }
 }
 
-/// Mixed sequential graph for #3630:
+/// Mixed sequential graph:
 /// Linear -> ReLU -> Linear -> Sigmoid/Tanh -> Linear.
 ///
 /// The first linear keeps every ReLU pre-activation strictly positive across the

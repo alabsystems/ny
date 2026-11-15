@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Direct tests for `GraphNetwork::partial_crown_fallback` (#3265).
+//! Direct tests for `GraphNetwork::partial_crown_fallback`.
 //!
 //! This function is the last line of defense in graph CROWN backward
 //! propagation. When a layer's CROWN backward fails or produces non-finite
@@ -35,7 +35,7 @@ fn bounded_1d_allow_inf(lower: &[f32], upper: &[f32]) -> BoundedTensor {
     .expect("bounds valid")
 }
 
-/// #3265 acceptance criterion 1: Normal path — identity bounds + finite IBP.
+/// Normal path — identity bounds + finite IBP.
 ///
 /// With identity linear bounds (A=I, b=0), concretize_sound should return
 /// bounds equal to the IBP bounds (with 1-ULP directed rounding widening).
@@ -80,7 +80,7 @@ fn test_partial_crown_fallback_normal_path_identity_3265() {
     }
 }
 
-/// #3265 acceptance criterion 1 extended: non-identity linear bounds produce
+/// Normal path, extended: non-identity linear bounds produce
 /// tighter-than-IBP bounds when the linear relationship is well-conditioned.
 ///
 /// Linear bounds: y_0 = 2*x_0 + 1, y_1 = 3*x_1 - 1
@@ -131,7 +131,7 @@ fn test_partial_crown_fallback_normal_path_scaling_3265() {
     assert!(ub1.is_finite(), "y_1 upper should be finite, got {ub1}");
 }
 
-/// #3265 acceptance criterion 2: Sanitized path — IBP bounds with Inf.
+/// Sanitized path — IBP bounds with Inf.
 ///
 /// When IBP bounds contain Inf, partial_crown_fallback must sanitize
 /// (not concretize), and the result must be valid (no NaN, no inversions).
@@ -192,7 +192,7 @@ fn test_partial_crown_fallback_sanitized_ibp_inf_3265() {
     );
 }
 
-/// #3265 acceptance criterion 2 extended: node_lb with Inf coefficients,
+/// Sanitized path, extended: node_lb with Inf coefficients,
 /// output shape matches IBP shape.
 #[test]
 fn test_partial_crown_fallback_lb_inf_triggers_sanitized_path_3265() {
@@ -257,7 +257,7 @@ fn test_partial_crown_fallback_lb_inf_triggers_sanitized_path_3265() {
     }
 }
 
-/// #3265: Inf in bias of node_lb also triggers sanitized path.
+/// Inf in bias of node_lb also triggers sanitized path.
 #[test]
 fn test_partial_crown_fallback_lb_inf_bias_triggers_sanitized_3265() {
     let lower_a =
@@ -299,7 +299,7 @@ fn test_partial_crown_fallback_lb_inf_bias_triggers_sanitized_3265() {
     }
 }
 
-/// #3265 acceptance criterion 3: Reshape path — output shape differs from
+/// Reshape path — output shape differs from
 /// concretized shape.
 ///
 /// When the concretized result has a different shape than output_shape,
@@ -364,7 +364,7 @@ fn finite_2x2_bounds() -> BatchedLinearBounds {
     BatchedLinearBounds::from_parts_unchecked(a.clone(), b.clone(), a, b, vec![2], vec![2])
 }
 
-/// #3265: all-finite coefficients are not flagged.
+/// All-finite coefficients are not flagged.
 #[test]
 fn test_has_non_finite_coefficients_clean_3265() {
     assert!(
@@ -373,7 +373,7 @@ fn test_has_non_finite_coefficients_clean_3265() {
     );
 }
 
-/// #3265: Inf in lower_a is detected.
+/// Inf in lower_a is detected.
 #[test]
 fn test_has_non_finite_coefficients_inf_lower_a_3265() {
     let a =
@@ -387,7 +387,7 @@ fn test_has_non_finite_coefficients_inf_lower_a_3265() {
     );
 }
 
-/// #3265: Inf in upper_a is detected.
+/// Inf in upper_a is detected.
 #[test]
 fn test_has_non_finite_coefficients_inf_upper_a_3265() {
     let fa = ArrayD::from_shape_vec(IxDyn(&[2, 2]), vec![1.0, 0.0, 0.0, 1.0]).expect("shape");
@@ -401,7 +401,7 @@ fn test_has_non_finite_coefficients_inf_upper_a_3265() {
     );
 }
 
-/// #3265: Inf in lower_b is detected.
+/// Inf in lower_b is detected.
 #[test]
 fn test_has_non_finite_coefficients_inf_lower_b_3265() {
     let a = ArrayD::from_shape_vec(IxDyn(&[2, 2]), vec![1.0, 0.0, 0.0, 1.0]).expect("shape");
@@ -414,7 +414,7 @@ fn test_has_non_finite_coefficients_inf_lower_b_3265() {
     );
 }
 
-/// #3265: Inf in upper_b is detected.
+/// Inf in upper_b is detected.
 #[test]
 fn test_has_non_finite_coefficients_inf_upper_b_3265() {
     let a = ArrayD::from_shape_vec(IxDyn(&[2, 2]), vec![1.0, 0.0, 0.0, 1.0]).expect("shape");
@@ -427,9 +427,8 @@ fn test_has_non_finite_coefficients_inf_upper_b_3265() {
     );
 }
 
-/// #3265 acceptance criterion 4 (optional): partial CROWN with non-trivial
-/// linear bounds produces tighter bounds than pure IBP for the supported
-/// portion.
+/// Partial CROWN with non-trivial linear bounds produces tighter bounds than
+/// pure IBP for the supported portion.
 ///
 /// When linear bounds represent y = 0.5*x + 1 (slope 0.5, not identity),
 /// the concretized CROWN bounds should be tighter than just using IBP

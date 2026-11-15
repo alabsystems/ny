@@ -4,18 +4,13 @@
 //
 // Solver-neutral MILP intermediate representation — the backend seam.
 //
-// The encoder builds a `MilpProblem` (plain data: Send + Sync + Clone), and
-// backend lowerings translate it into the concrete solver's model right
-// before each solve: `ay::to_smtlib` in production, `to_highs` under the
-// mip-diff gate (docs/SOLVER_POLICY.md; HiGHS deleted at LG3). Keeping the IR
-// solver-free is what makes backend dispatch and parallel phase-split racing
-// (one model per thread, built from the shared IR) trivially thread-safe.
+// The encoder builds plain Send + Sync + Clone data. Each solve lowers it to
+// an in-process `ay_milp::Model` or external AY's SMT-LIB input. Parallel
+// phase-split workers build separate solver models from the shared IR.
 
 /// Column (variable) index into a [`MilpProblem`].
 ///
-/// Replaces `highs::Col` in the encoder/`MipParts` surface. The index is the
-/// insertion order of the column, which every lowering preserves, so `Col(i)`
-/// addresses the same variable in every backend.
+/// Insertion-order identity preserved by every backend lowering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Col(pub usize);
 
@@ -121,6 +116,31 @@ impl MilpProblem {
         }
     }
 
+    /// Relax selected, unpinned binary columns without changing any row or bound.
+    ///
+    /// This only enlarges the feasible set. A checked infeasibility certificate
+    /// against the modified IR therefore also excludes the original model.
+    /// A feasible relaxed point is not an original-model witness. Validation is
+    /// transactional: malformed, repeated or already-continuous handles refuse
+    /// before any integrality flag is changed.
+    pub fn relax_binary_integrality(&mut self, columns: &[Col]) -> bool {
+        let mut indices: Vec<usize> = columns.iter().map(|c| c.0).collect();
+        indices.sort_unstable();
+        if indices.windows(2).any(|pair| pair[0] == pair[1])
+            || indices.iter().any(|&index| {
+                self.cols
+                    .get(index)
+                    .is_none_or(|c| !c.integer || c.lb != 0.0 || c.ub != 1.0)
+            })
+        {
+            return false;
+        }
+        for index in indices {
+            self.cols[index].integer = false;
+        }
+        true
+    }
+
     /// Add an integer column with objective coefficient `obj` and bounds `[lb, ub]`.
     pub fn add_integer_col(&mut self, obj: f64, lb: f64, ub: f64) -> Col {
         self.push_col(ColSpec {
@@ -154,6 +174,12 @@ impl MilpProblem {
             coeffs: coeffs.into_iter().map(|(c, w)| (c.0, w)).collect(),
         });
         row
+    }
+
+    /// Reserve nominal row-header capacity for an already checked batch.
+    /// This changes no row, column, marker or model semantics.
+    pub(crate) fn reserve_rows_exact(&mut self, additional: usize) {
+        self.rows.reserve_exact(additional);
     }
 
     /// Atomically add and explicitly mark a decision-margin row.
@@ -354,3 +380,7 @@ mod tests {
         assert_eq!(p.margin_row(), None);
     }
 }
+
+#[cfg(test)]
+#[path = "ir_binary_relaxation_tests.rs"]
+mod binary_relaxation_tests;

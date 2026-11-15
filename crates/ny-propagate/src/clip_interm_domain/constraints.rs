@@ -100,7 +100,6 @@ fn validate_preprocess_allocation(rows: usize, x_dim: usize, copies: usize) -> R
 ///
 /// # References
 ///
-/// - `designs/2026-01-29-clip-interm-domain.md` Section "Soundness model"
 /// - `alpha-beta-CROWN/complete_verifier/domain_clipper.py:296`
 pub fn build_split_constraints<F>(
     split_history: &GraphSplitHistory,
@@ -209,7 +208,7 @@ where
 
         // #clip-resnet: on a deep resnet the split neuron's forward linear bound
         // bias can overflow to ±inf in f32 (20+ layers of accumulated relaxation
-        // bias). Such a constraint is meaningless (`#2259`). SKIP it — dropping a
+        // bias). Such a constraint is meaningless. SKIP it — dropping a
         // constraint only WEAKENS the clip's feasible-region shrink, never makes it
         // unsound (the resulting bound is still a valid enclosure). This lets the
         // clip proceed with whatever splits DO have finite linear bounds instead of
@@ -436,7 +435,6 @@ fn normalize_constraint(constraint: &LinearConstraintRef<'_>) -> (Vec<f32>, f32)
 ///
 /// # References
 ///
-/// - `designs/2026-01-29-clip-interm-domain.md` Section "Preprocess constraints"
 /// - `auto_LiRPA/concretize_func.py:sort_out_constr_batches`
 pub fn sort_out_constraints(
     constraints: &SplitConstraints,

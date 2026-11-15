@@ -64,7 +64,7 @@ fn test_merge_tensor_shape_ignores_empty_inferred() {
 fn test_merge_tensor_shape_allows_empty_scalar_shape() {
     let mut existing = Vec::new();
     merge_tensor_shape("t", &mut existing, &[]);
-    assert!(existing.is_empty());
+    assert_eq!((existing).len(), 0);
 }
 
 #[test]

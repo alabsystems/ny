@@ -13,8 +13,6 @@
 //! # Sources
 //!
 //! - ay ClauseDB: `crates/ay-sat/src/clause_db.rs`
-//! - Design doc: `designs/2026-01-29-linear-constraint-store.md`
-//! - Issue: #234
 
 use super::types::{ConstraintHeader, ConstraintOrigin, ConstraintSense, LinearConstraintRef};
 use ny_core::{NyError, Result};
@@ -122,8 +120,8 @@ impl ArenaConstraintStore {
     /// - `indices.len() > u16::MAX` (constraint too large)
     ///
     /// Returns `NyError::NumericalInstability` if:
-    /// - `bias` is NaN or infinite (#2259)
-    /// - Any coefficient is NaN or infinite (#2259)
+    /// - `bias` is NaN or infinite
+    /// - Any coefficient is NaN or infinite
     pub fn add_constraint(
         &mut self,
         indices: &[u32],
@@ -146,7 +144,7 @@ impl ArenaConstraintStore {
                 u16::MAX
             )));
         }
-        // NaN/Inf validation (#2259): NaN bias makes the constraint meaningless
+        // NaN/Inf validation: NaN bias makes the constraint meaningless
         // (IEEE 754: NaN comparisons are always false), and Inf coefficients make
         // constraints trivially satisfied or violated depending on sign.
         // Must follow length equality check so indices[pos] is safe.
@@ -213,8 +211,8 @@ impl ArenaConstraintStore {
     /// Get a constraint by index.
     ///
     /// Returns `None` if the index is out of bounds or the header's data range
-    /// exceeds the arena (possible GPU buffer corruption — see #2261).
-    /// Logs a warning when a constraint is dropped due to corruption (#2981).
+    /// exceeds the arena (possible GPU buffer corruption).
+    /// Logs a warning when a constraint is dropped due to corruption.
     pub fn get(&self, idx: usize) -> Option<LinearConstraintRef<'_>> {
         let header = self.headers.get(idx)?;
         let range = header.data_range();
@@ -231,7 +229,7 @@ impl ArenaConstraintStore {
             return None;
         }
 
-        // Decode sense/origin with warning on corruption (#2981 Slice 2).
+        // Decode sense/origin with warning on corruption.
         // Before this fix, `.ok()?` silently dropped constraints with corrupted
         // headers, weakening bounds without any diagnostic trace.
         let sense = match header.sense() {
@@ -267,8 +265,8 @@ impl ArenaConstraintStore {
     /// Iterate over all constraints.
     ///
     /// Skips constraints whose data range exceeds the arena or whose header
-    /// bytes are corrupted (possible GPU buffer corruption — see #2261).
-    /// Logs a warning for each skipped constraint (#2981).
+    /// bytes are corrupted (possible GPU buffer corruption).
+    /// Logs a warning for each skipped constraint.
     pub fn iter(&self) -> impl Iterator<Item = LinearConstraintRef<'_>> {
         let coeffs_len = self.coeffs.len();
         let indices_len = self.indices.len();
@@ -288,7 +286,7 @@ impl ArenaConstraintStore {
                     return None;
                 }
 
-                // Decode sense/origin with warning on corruption (#2981 Slice 2).
+                // Decode sense/origin with warning on corruption.
                 let sense = match header.sense() {
                     Ok(s) => s,
                     Err(e) => {
@@ -346,20 +344,20 @@ impl ArenaConstraintStore {
     /// Corrupt a header's data range for testing bounds-checking guards.
     ///
     /// This replaces the `unsafe` raw-pointer mutation that was previously used
-    /// in tests, eliminating UB from casting `*const` to `*mut` (#2754).
+    /// in tests, eliminating UB from casting `*const` to `*mut`.
     #[cfg(test)]
     pub(crate) fn corrupt_header_data_range(&mut self, idx: usize, data_start: u32, data_len: u16) {
         self.headers[idx].data_start = data_start;
         self.headers[idx].data_len = data_len;
     }
 
-    /// Corrupt a header's sense byte for testing decode-failure logging (#2981).
+    /// Corrupt a header's sense byte for testing decode-failure logging.
     #[cfg(test)]
     pub(crate) fn corrupt_header_sense(&mut self, idx: usize, sense: u8) {
         self.headers[idx].sense = sense;
     }
 
-    /// Corrupt a header's origin byte for testing decode-failure logging (#2981).
+    /// Corrupt a header's origin byte for testing decode-failure logging.
     #[cfg(test)]
     pub(crate) fn corrupt_header_origin(&mut self, idx: usize, origin: u8) {
         self.headers[idx].origin = origin;

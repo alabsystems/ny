@@ -1,0 +1,28 @@
+# Rule-existence LOGO (GENERALIZATION_DESIGN K4.1): which family-level leakage groups each acting router /
+# optimizer rule's CONSTANTS were selected on. In the fold that holds out family G, every rule whose evidence
+# is a subset of {G} is DISABLED by its ablation key. `structural` = no fitted constant (never disabled);
+# `multi` = evidence spans many families by construction (never disabled; the priors are REFIT per fold
+# instead, see `genboard.py logo --trainset`). Families use scripts/router_priors/priorslib.py FAMILY_MERGES.
+# Sources: docs/engine_program/router/ROUTER_PROGRAM.md sections 1.1, 5.2, 10.3-10.7 (as built; 10.7 = R6's
+# O-TRIAL rules, added at the ENG12 merge, evidence from the 5.2 evidence column).
+rule	ablation_key	evidence	note
+CR-1	router.rules.cap_authority	structural	monotone deadline cells; caps are today's reserves
+CR-A	router.rules.admission	structural	the lanes' own predicates and the ledger
+CR-C	router.rules.contracts	structural	the lane-budget-frame identity plan
+CR-T	router.rules.terminal	structural	the verifier takes the remainder
+CR-H	router.rules.hand_on	structural	unspent contract handed on; no constant
+CR-R	router.rules.publish_grace	resnet_ct	discarded proofs 2->0 measured on cifar100 only (the 1.5 s grace)
+CR-K	router.rules.derived_caps	ml4acopf_2024	the depth / clause-pass derivation answers ml4acopf's measured early quit
+CR-L	router.rules.lease	structural	16 GiB = the live gate's own measured boundary (const-asserted equal)
+CR-F	router.rules.far_hand_on	resnet_ct	T_far = 0.10 FITTED on cifar100 / tinyimagenet / cct records (one family)
+CR-RS	router.rules.route	structural	routes only at SR.seal; no fitted constant
+CR-G	router.rules.gap_contract	resnet_ct	FD tier evidence: FDB rows on cifar100 / tinyimagenet
+rule.governor	optimizer.rules.governor	resnet_ct	0.15 ratio selected on cifar100: detector(n=1)
+rule.ia_yield	optimizer.rules.ia_yield	resnet_ct	0.15 after 2 layers, the margin-row interm-alpha loop (cifar100)
+rule.attack_defer	optimizer.rules.attack_defer	resnet_ct	CR-ATK: tinyimagenet sat rows land at 12-20 s
+rule.root_admission	optimizer.rules.root_admission	structural	phase_window::admit against the lane's own cell
+rule.trial_width	optimizer.rules.trial_width	structural	AIMD x2 on a >=5% rise / /2 on a >=10% fall, lease 70%/85%, 16-unit windows: 5.2 design constants selected on no family (wave width never measured at a gate; 10.7: every effect UNMEASURED)
+rule.trial_lr_backoff	optimizer.rules.trial_lr_backoff	resnet_ct	3 rejected iterates => lr x0.5 read off the cifar100 root ascent (last 3 iterates rejected, 95.57% of alpha at the clamp; 5.2)
+rule.trial_split_restart	optimizer.rules.trial_split_restart	collins_rul_cnn_2022	zero-lift fraction > 0.9 selected on collins_rul_cnn (98% of splits zero-lift; 5.2)
+rule.trial_attack_halving	optimizer.rules.trial_attack_halving	structural	the step pool brackets today's 0.25 geometrically (0.5, 0.125, 0.0625); no step selected on a family (10.7: UNMEASURED)
+rule.priors	optimizer.priors	multi	every shipped cell spans >= 2 families (G2); refit per fold

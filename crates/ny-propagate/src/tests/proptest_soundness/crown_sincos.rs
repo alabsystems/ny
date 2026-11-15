@@ -8,8 +8,6 @@
 //! single-concavity regions. Intervals that span inflection points fall back
 //! to constant [-1, 1] bounds. The identity-bounds tests constrain intervals
 //! to stay within a single half-period to exercise the tangent/secant logic.
-//!
-//! Part of #40, #1708, #1793.
 
 use crate::layers::{CosLayer, SinLayer};
 use crate::LinearBounds;

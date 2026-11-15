@@ -13,10 +13,12 @@ use ny_core::{f64_to_f32_down, GemmEngine};
 use ny_onnx::vnnlib::{OutputConstraint, VnnLibSpec};
 use ny_propagate::{
     BabVerificationStatus, BetaCrownConfig, BetaCrownResult, BetaCrownVerifier,
-    ConjunctiveProofObjectives, GraphNetwork, GraphPrecomputedBounds,
+    ConjunctiveProofObjectives, GraphNetwork, GraphPrecomputedBounds, PgdCancelToken, PgdConfig,
+    SharedGraphBootstrap,
 };
 use ny_tensor::BoundedTensor;
 
+use super::super::attack_concurrent::{self, ConcurrentAttackCtx, RacePlan, RaceSite};
 use super::attack_budget::graph_upfront_pgd_budget;
 use super::constraint_iter::{iterate_constraints, ConstraintIterConfig};
 use super::disjunctive_pgd::beta_crown_pgd_config;
@@ -70,6 +72,21 @@ fn exact_cersyve_conjunctive_spec(vnnlib: &VnnLibSpec) -> bool {
         && vnnlib.dual_network.is_none()
 }
 
+/// #admission-precision: whether `verify_graph_relational` runs ONE
+/// multi-objective graph BaB over the property's atoms, and how it aggregates
+/// them (`Some(conjunctive)`): two or more atoms, conjunctive unless the
+/// clauses are a top-level OR, the disjunctive aggregation on the ReLU-split
+/// route only (input splitting falls back to per-constraint). The check is the
+/// router's `ny_core::router::admission::graph_multi_objective` on
+/// `spec_shape::shape_of` (`atoms` = `output_constraints.len()`,
+/// `disjunction` = the planner's aggregation).
+pub(crate) fn multi_objective_route(vnnlib: &VnnLibSpec, use_relu_split: bool) -> Option<bool> {
+    use ny_core::router::admission::MoAggregation;
+    ny_core::router::admission::graph_multi_objective(&super::super::spec_shape::shape_of(vnnlib))
+        .filter(|aggregation| use_relu_split || *aggregation == MoAggregation::Conjunctive)
+        .map(|aggregation| aggregation == MoAggregation::Conjunctive)
+}
+
 fn admits_graph_upfront_pgd(
     run_upfront_pgd: bool,
     is_disjunction: bool,
@@ -99,10 +116,17 @@ pub(super) fn verify_graph_relational(
     attack_engine_source: crate::commands::beta_crown::attack_arming::AttackEngineSource<'_>,
     json: bool,
     ledger: &PhaseBudgetLedger,
+    // #disjunctive-shared-bootstrap: a bootstrap the serial disjunctive loop
+    // computed once for this graph and input box. `Some` replaces the
+    // per-call bootstrap on the ReLU-split route; every other route ignores
+    // it (they never consulted the precomputed slot).
+    shared_bootstrap: Option<&SharedGraphBootstrap>,
+    // #attack-concurrent: the dispatch's race context (`None` on every
+    // nested / test caller). Consulted only when `config.attack_concurrent`.
+    concurrent: Option<&ConcurrentAttackCtx<'_>>,
 ) -> Result<BetaCrownResult> {
-    // Classify constraints via shared planning module (#1881)
+    // Classify constraints via shared planning module
     let classification = classify_constraints(vnnlib);
-    let total_constraint_count = vnnlib.output_constraints.len();
     let is_disjunction = classification.aggregation == AggregationMode::Disjunctive;
     // The caller has already applied static MIP eligibility to its
     // authoritative ledger. Keep that start time and reservation policy intact.
@@ -115,9 +139,9 @@ pub(super) fn verify_graph_relational(
     //
     // Single-clause disjunctions (output_constraint_clauses.len() <= 1) are
     // semantically conjunctive — all constraints in the single clause must hold
-    // simultaneously. PGD on the conjunctive interpretation is correct. (#3309)
+    // simultaneously. PGD on the conjunctive interpretation is correct.
     //
-    // Reserve (1 - upfront_pgd_fraction) of timeout for CROWN + BaB (#3781).
+    // Reserve (1 - upfront_pgd_fraction) of timeout for CROWN + BaB.
     // Graph PGD can be expensive on large models.
     if admits_graph_upfront_pgd(
         run_upfront_pgd,
@@ -154,6 +178,76 @@ pub(super) fn verify_graph_relational(
             .as_ref()
             .map(|taken| taken.as_gemm())
             .or(gemm_engine);
+        // #attack-concurrent (dark; typed `attack.concurrent`): race this
+        // IDENTICAL attack against the proof below instead of running it
+        // first. With the key off this reads one bool; any admission refusal
+        // falls through to the serial code unchanged.
+        if config.attack_concurrent {
+            let site_start = std::time::Instant::now();
+            if let Some(admitted) = attack_concurrent::admit_site(
+                RaceSite::GraphUpfront,
+                concurrent,
+                attack_concurrent::shared_device(attack_engine, gemm_engine, gpu_bab),
+                attack_concurrent::graph_has_sign(graph),
+                site_start,
+                pgd_deadline,
+                ledger.overall_deadline(),
+            ) {
+                let base = beta_crown_pgd_config(config, pgd_restarts, pgd_steps, pgd_deadline);
+                let attack = |token: PgdCancelToken, deadline: std::time::Instant| {
+                    let pgd = PgdConfig {
+                        deadline: Some(deadline),
+                        cancel: Some(token),
+                        ..base.clone()
+                    };
+                    // The serial site's own engine: a CPU handle, `None`, or
+                    // an accelerator the proof does not use (admission refused
+                    // a shared device).
+                    try_graph_pgd_upfront_with_config(
+                        graph,
+                        input,
+                        vnnlib,
+                        pgd,
+                        attack_engine,
+                        json,
+                    )
+                };
+                let proof = || {
+                    verify_graph_relational_proof(
+                        graph,
+                        input,
+                        vnnlib,
+                        config,
+                        verifier,
+                        use_relu_split,
+                        gpu_bab,
+                        timeout,
+                        gemm_engine,
+                        json,
+                        ledger,
+                        shared_bootstrap,
+                        classification.aggregation,
+                        start_time,
+                    )
+                };
+                return attack_concurrent::run_race(
+                    RacePlan {
+                        site: RaceSite::GraphUpfront,
+                        window: admitted.window,
+                        site_start,
+                        slice_deadline: pgd_deadline.unwrap_or(site_start),
+                        overall_deadline: ledger.overall_deadline(),
+                        lane_start: start_time,
+                        publish: concurrent
+                            .map(|ctx| ctx.publish)
+                            .unwrap_or(&attack_concurrent::unarmed_publish),
+                    },
+                    admitted.pool,
+                    attack,
+                    proof,
+                );
+            }
+        }
         if let Some((counterexample, output)) = try_graph_pgd_upfront_with_config(
             graph,
             input,
@@ -177,7 +271,50 @@ pub(super) fn verify_graph_relational(
         }
     }
 
-    // Per-constraint timeout derived from ledger remaining time (#2206 Packet B).
+    verify_graph_relational_proof(
+        graph,
+        input,
+        vnnlib,
+        config,
+        verifier,
+        use_relu_split,
+        gpu_bab,
+        timeout,
+        gemm_engine,
+        json,
+        ledger,
+        shared_bootstrap,
+        classification.aggregation,
+        start_time,
+    )
+}
+
+/// The proof half of [`verify_graph_relational`]: everything after the
+/// upfront attack, unchanged. #attack-concurrent extracted it so the serial
+/// path (after the attack) and the concurrent race (alongside it) run the
+/// IDENTICAL code under the identical ledger deadlines.
+// Justification: the proof consumes the same independent inputs as the lane.
+#[allow(clippy::too_many_arguments)]
+fn verify_graph_relational_proof(
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    vnnlib: &VnnLibSpec,
+    config: &BetaCrownConfig,
+    verifier: &BetaCrownVerifier,
+    use_relu_split: bool,
+    gpu_bab: bool,
+    timeout: u64,
+    gemm_engine: Option<&dyn GemmEngine>,
+    json: bool,
+    ledger: &PhaseBudgetLedger,
+    shared_bootstrap: Option<&SharedGraphBootstrap>,
+    aggregation: AggregationMode,
+    start_time: std::time::Instant,
+) -> Result<BetaCrownResult> {
+    let total_constraint_count = vnnlib.output_constraints.len();
+    let is_disjunction = aggregation == AggregationMode::Disjunctive;
+
+    // Per-constraint timeout derived from ledger remaining time.
     // Uses remaining wall-clock after PGD instead of the original raw timeout.
     // - Conjunctive: full remaining per constraint (early exit on first success).
     // - Disjunctive: splits remaining evenly, floored to min_clause_secs.
@@ -210,12 +347,31 @@ pub(super) fn verify_graph_relational(
         }
     }
 
+    // #vgg-gpu-crown (DARK; typed `bab.gpu_patches_crown`): the certified
+    // patches-mode CROWN root pass on the sound GPU GEMM engine. Same seam and
+    // same reasoning as `#dd-zonotope` above — `vggnet16_2022` specs carry ONE
+    // output constraint, so the multi-objective root hook is never reached —
+    // and the same contract: a pure ADDITION that can only return "every
+    // objective certified"; every refusal falls through unchanged. With the
+    // key absent this block reads one `Option` and does nothing else.
+    if let Some(pass) = config.gpu_patches_crown {
+        if let Some(result) =
+            try_gpu_patches_crown_root(graph, input, vnnlib, &pass, ledger, start_time)?
+        {
+            return Ok(result);
+        }
+    }
+
     // Multi-objective BaB for ≥2 constraints: conjunctive uses joint BaB (any_verified
     // semantics, strictly more powerful than per-constraint decomposition), disjunctive
     // uses all_verified semantics. Input splitting falls back to per-constraint for
-    // disjunctive. See designs/2026-03-05-joint-conjunctive-bab.md.
-    if total_constraint_count >= 2 && (use_relu_split || !is_disjunction) {
-        let conjunctive = !is_disjunction;
+    // disjunctive.
+    //
+    // #admission-precision: the route is `multi_objective_route`, the
+    // router's `admission::graph_multi_objective` on the one extractor's
+    // shape (the router reads the same check at start for the cover
+    // certification's site).
+    if let Some(conjunctive) = multi_objective_route(vnnlib, use_relu_split) {
         let (objectives, thresholds) = build_multi_objectives(vnnlib)?;
 
         if !json {
@@ -345,48 +501,70 @@ pub(super) fn verify_graph_relational(
         .remaining()
         .unwrap_or(std::time::Duration::from_secs(timeout));
 
+    // #disjunctive-shared-bootstrap: the ReLU-split route takes the lent
+    // bootstrap instead of computing its own. Only that route ever read the
+    // precomputed slot (`dispatch_graph_constraint`), so the gate here is the
+    // route's, not the clause count's: a single-atom clause -- the shape the
+    // serial disjunctive loop hands in -- is exactly the case that used to
+    // re-bootstrap per call.
+    let shared_bootstrap = shared_bootstrap.filter(|_| use_relu_split && !gpu_bab);
+    if let Some(shared) = shared_bootstrap {
+        // Same stash the owned path makes below, from the same kind of map.
+        #[cfg(feature = "mip")]
+        if total_constraint_count > 1 {
+            super::super::graph_mip_escalate::stash_graph_bounds_for_mip(
+                graph,
+                input,
+                &config.phase_budget,
+                shared.node_bounds(),
+            );
+        }
+        let _ = shared;
+    }
+
     // Pre-compute α-CROWN bounds once for all constraints (major optimization)
     // This avoids re-computing bounds for each constraint, providing ~Nx speedup
-    let precomputed_bounds = if use_relu_split && total_constraint_count > 1 {
-        if !json {
-            println!(
-                "\n  Pre-computing α-CROWN bounds (shared across {} constraints)...",
-                total_constraint_count
+    let precomputed_bounds =
+        if shared_bootstrap.is_none() && use_relu_split && total_constraint_count > 1 {
+            if !json {
+                println!(
+                    "\n  Pre-computing α-CROWN bounds (shared across {} constraints)...",
+                    total_constraint_count
+                );
+            }
+            let bounds_start = std::time::Instant::now();
+            let bounds_verifier = verifier.with_config_from(config.clone());
+            // Thread deadline from ledger so α-CROWN bails early if timeout budget
+            // exhausted. Uses ledger.overall_deadline() instead of manually
+            // computing overall_start + overall_timeout.
+            let deadline = ledger.overall_deadline();
+            let (node_bounds, output_bounds) =
+                bounds_verifier.compute_initial_graph_bounds(graph, input, deadline)?;
+            if !json {
+                println!(
+                    "    Bounds computed in {:.2}s",
+                    bounds_start.elapsed().as_secs_f64()
+                );
+            }
+            // Stash for a potential Graph-MIP escalation at BaB fall-through
+            // (increment 5): the escalation reuses THIS per-property α-CROWN map
+            // instead of recomputing it. The bounded stash is disabled when its
+            // whole-network Graph-MIP consumer is explicitly off or this category
+            // requests no MIP reservation.
+            #[cfg(feature = "mip")]
+            super::super::graph_mip_escalate::stash_graph_bounds_for_mip(
+                graph,
+                input,
+                &config.phase_budget,
+                &node_bounds,
             );
-        }
-        let bounds_start = std::time::Instant::now();
-        let bounds_verifier = verifier.with_config_from(config.clone());
-        // Thread deadline from ledger so α-CROWN bails early if timeout budget
-        // exhausted (#2698). Uses ledger.overall_deadline() instead of manually
-        // computing overall_start + overall_timeout.
-        let deadline = ledger.overall_deadline();
-        let (node_bounds, output_bounds) =
-            bounds_verifier.compute_initial_graph_bounds(graph, input, deadline)?;
-        if !json {
-            println!(
-                "    Bounds computed in {:.2}s",
-                bounds_start.elapsed().as_secs_f64()
-            );
-        }
-        // Stash for a potential Graph-MIP escalation at BaB fall-through
-        // (increment 5): the escalation reuses THIS per-property α-CROWN map
-        // instead of recomputing it. The bounded stash is disabled when its
-        // whole-network Graph-MIP consumer is explicitly off or this category
-        // requests no MIP reservation.
-        #[cfg(feature = "mip")]
-        super::super::graph_mip_escalate::stash_graph_bounds_for_mip(
-            graph,
-            input,
-            &config.phase_budget,
-            &node_bounds,
-        );
-        Some((node_bounds, output_bounds))
-    } else {
-        None
-    };
+            Some((node_bounds, output_bounds))
+        } else {
+            None
+        };
 
     let iter_config = ConstraintIterConfig {
-        aggregation: classification.aggregation,
+        aggregation,
         overall_timeout,
         per_constraint_timeout,
         min_timeout_ms: 100,
@@ -399,7 +577,7 @@ pub(super) fn verify_graph_relational(
     };
 
     // Cross-validation closure: evaluate original (un-augmented) graph network at a
-    // concrete counterexample input. Part of #3209.
+    // concrete counterexample input.
     let eval_original = |cx_input: &[f32]| -> Result<ArrayD<f32>> {
         let point = ArrayD::from_shape_vec(IxDyn(input.lower().shape()), cx_input.to_vec())?;
         evaluate_graph(graph, &point, gemm_engine)
@@ -410,9 +588,11 @@ pub(super) fn verify_graph_relational(
         &vnnlib.output_constraints,
         &iter_config,
         |dispatch| {
-            let bounds_ref = precomputed_bounds
-                .as_ref()
-                .map(|(nb, ob)| GraphPrecomputedBounds::new(nb, ob));
+            let bounds_ref = match (shared_bootstrap, precomputed_bounds.as_ref()) {
+                (Some(shared), _) => Some(shared.precomputed()),
+                (None, Some((nb, ob))) => Some(GraphPrecomputedBounds::new(nb, ob)),
+                (None, None) => None,
+            };
             dispatch_graph_constraint(
                 dispatch.verifier,
                 graph,
@@ -586,6 +766,75 @@ fn try_dd_zonotope_root(
         max_depth_reached: 0,
         time_elapsed: start_time.elapsed(),
         output_bounds,
+    }))
+}
+
+/// `#vgg-gpu-crown`: run the certified GPU patches-CROWN root pass and return
+/// `Verified` only when EVERY objective's certified lower bound, narrowed
+/// DOWNWARD to f32, clears its threshold (the `#dd-zonotope` rule). Prints the
+/// fixed-schema `[gpu-patches-crown] armed=1 ...` line on every call.
+fn try_gpu_patches_crown_root(
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    vnnlib: &VnnLibSpec,
+    pass: &ny_propagate::GpuPatchesCrownConfig,
+    ledger: &PhaseBudgetLedger,
+    start_time: std::time::Instant,
+) -> Result<Option<BetaCrownResult>> {
+    // Per-clause input boxes and dual-network specs are outside this pass's
+    // single-box contract: refuse them up front rather than certify the wrong
+    // region. An inadmissible config (only reachable by a hand-built config;
+    // the preset loader refuses it) refuses too, before any duration math.
+    let refused_up_front =
+        if !vnnlib.per_clause_input_bounds.is_empty() || vnnlib.dual_network.is_some() {
+            Some("spec_shape")
+        } else if pass.validate().is_err() {
+            Some("config")
+        } else {
+            None
+        };
+    let refuse = |why: &str| {
+        let outcome = ny_propagate::GpuPatchesCrownOutcome::refused_before_run(
+            vnnlib.output_constraints.len(),
+            why,
+            pass,
+        );
+        eprintln!("{}", outcome.observable_line(&[]));
+    };
+    if let Some(why) = refused_up_front {
+        refuse(why);
+        return Ok(None);
+    }
+    // Fail closed, never fail the instance: an objective the planner cannot
+    // build is a refusal of THIS pass (the standard pipeline below still
+    // reports it on its own terms), and an armed row is never silent.
+    let Ok((objectives, thresholds)) = build_multi_objectives(vnnlib) else {
+        refuse("objectives");
+        return Ok(None);
+    };
+    if objectives.is_empty() || objectives.len() != thresholds.len() {
+        refuse("objectives");
+        return Ok(None);
+    }
+    let now = std::time::Instant::now();
+    let cap = std::time::Duration::from_secs_f64(pass.max_secs);
+    let deadline = ledger.bab_deadline().map_or(now + cap, |d| {
+        now + cap.min(d.saturating_duration_since(now).mul_f64(pass.budget_frac))
+    });
+    let outcome =
+        ny_propagate::gpu_patches_crown::run_root(graph, input, &objectives, pass, deadline);
+    eprintln!("{}", outcome.observable_line(&thresholds));
+    if !outcome.certifies(&thresholds) {
+        return Ok(None);
+    }
+    Ok(Some(BetaCrownResult {
+        result: BabVerificationStatus::Verified,
+        domains_explored: 1,
+        domains_verified: 1,
+        cuts_generated: 0,
+        max_depth_reached: 0,
+        time_elapsed: start_time.elapsed(),
+        output_bounds: None,
     }))
 }
 

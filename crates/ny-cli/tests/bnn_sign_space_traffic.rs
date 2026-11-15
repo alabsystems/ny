@@ -37,7 +37,7 @@
 //
 // RUN IT IN RELEASE:
 //
-//   cargo test --release -p ny-cli --features mip,external-vnncomp \
+//   targo --unverified test --release -p ny-cli --features mip,external-vnncomp \
 //       --test bnn_sign_space_traffic -- --test-threads=1
 //
 // `ny_binary()` resolves `CARGO_BIN_EXE_ny`, which cargo points at the profile

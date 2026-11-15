@@ -2,10 +2,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Attention centroid monotonicity verification for TTS decoder (#3497).
+//! Attention centroid monotonicity verification for TTS decoder.
 //!
-//! Implements the centroid-monotonicity property from the batch design:
-//! `designs/2026-03-10-avoice-crown-capability-triage.md`
+//! Implements the centroid-monotonicity property.
 //!
 //! Key insight: argmax is discontinuous, but the **attention centroid** is a
 //! continuous linear function of softmax outputs:
@@ -31,8 +30,6 @@ use proptest::prelude::{prop_assert, proptest, ProptestConfig};
 ///
 /// Given attention probabilities A of shape [seq, seq] (or flattened),
 /// computes centroid(t) = Σ_j j * A[t, j] for each time step t.
-///
-/// Reference: designs/2026-03-10-avoice-crown-capability-triage.md, §Request 3
 fn compute_centroids(probs: &[f32], seq_len: usize) -> Vec<f32> {
     assert_eq!(
         probs.len(),
@@ -99,8 +96,6 @@ fn compute_centroid_bounds(
 ///
 /// In terms of the flattened attention output y[t*seq + j] = A[t, j]:
 ///   Σ_j j * y[(t-1)*seq + j] - Σ_j j * y[t*seq + j] <= 0
-///
-/// Reference: designs/2026-03-10-avoice-crown-capability-triage.md, §Request 3
 fn centroid_monotonicity_constraints(seq_len: usize) -> OutputConstraints {
     let output_dim = seq_len * seq_len; // flattened attention matrix
     let num_constraints = seq_len - 1; // one constraint per consecutive pair
@@ -185,7 +180,7 @@ fn build_attention_probs_graph(seq_len: usize, d_k: usize) -> (GraphNetwork, Bou
 /// Output shape: [1, 1, seq, 1] — one centroid per time step.
 ///
 /// This end-to-end graph enables CROWN backward propagation through the
-/// centroid computation, which is the key capability for #3497.
+/// centroid computation, which centroid-monotonicity verification requires.
 fn build_attention_centroid_graph(seq_len: usize, d_k: usize) -> (GraphNetwork, BoundedTensor) {
     let mut graph = GraphNetwork::new();
 

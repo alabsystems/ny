@@ -58,4 +58,3 @@ linearizenn_2024,onnx/AllInOne_120_120.onnx,vnnlib/prop_120_120_1.vnnlib,prepare
 linearizenn_2024,onnx/AllInOne_120_120.onnx,vnnlib/prop_120_120_2.vnnlib,prepared,unsat,380.49
 linearizenn_2024,onnx/AllInOne_120_120.onnx,vnnlib/prop_120_120_3.vnnlib,prepared,unsat,360.84
 linearizenn_2024,onnx/AllInOne_120_120.onnx,vnnlib/prop_120_120_4.vnnlib,prepared,unsat,359.42
-linearizenn_2024,onnx/test_nano.onnx,vnnlib/test_nano.vnnlib,0,unsat,1

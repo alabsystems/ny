@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! #4096 whitelist rejection tests: axis-sensitive blocked graph families.
+//! Whitelist rejection tests: axis-sensitive blocked graph families.
 //!
 //! Split from `tests_graph_pgd.rs` for file size compliance.
 

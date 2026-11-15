@@ -163,7 +163,7 @@ fn test_attention_graph_builder_with_residual() {
 }
 
 // =========================================================================
-// SelfAttention decomposition tests (Part of #2072)
+// SelfAttention decomposition tests
 // =========================================================================
 
 /// Helper: build a BoundedTensor from flat lower/upper vecs and shape.
@@ -381,7 +381,7 @@ fn test_self_attention_decomposition_ibp_soundness() {
 }
 
 // =========================================================================
-// Performance benchmark: decomposed attention (Part of #2072)
+// Performance benchmark: decomposed attention
 // =========================================================================
 
 /// Benchmark IBP performance for decomposed self-attention at multiple sizes.

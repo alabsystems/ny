@@ -10,8 +10,6 @@
 //! values flip upper/lower bound selection during CROWN backward composition —
 //! a common source of soundness bugs. These containment tests use
 //! `LayerNormCrownMode::IbpValidated`, the sound normalization CROWN mode.
-//!
-//! Part of #3175, #3820.
 
 use crate::layers::normalization::{
     AdaIN1dLayer, InstanceNorm1dLayer, LayerNormCrownMode, RmsNormLayer,
@@ -48,8 +46,6 @@ fn concretize_batched_crown(
 // Tests the batched CROWN backward path with mixed-sign incoming coefficients.
 // Negative coefficients flip upper/lower bound selection — a common source of
 // soundness bugs in CROWN backward composition.
-//
-// Part of #3175.
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(300) })]
@@ -57,7 +53,6 @@ proptest! {
     /// RmsNorm batched CROWN soundness with non-trivial incoming coefficients.
     /// Uses a single output row with mixed-sign coefficients per batch position,
     /// verifying that the composed CROWN bounds contain the true output.
-    /// Part of #3175.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_rmsnorm_batched_crown_negcoeff(
@@ -165,15 +160,12 @@ proptest! {
 // InstanceNorm1d operates on [C, T] per batch position. Uses 2 channels ×
 // 2 timesteps = in_dim=4. Non-trivial incoming coefficients are applied across
 // the full flattened dimension.
-//
-// Part of #3175.
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(300) })]
 
     /// InstanceNorm1d batched CROWN soundness with non-trivial incoming coefficients.
     /// Uses 2 channels, 2 timesteps per channel (in_dim=4), batch=2, out_dim=1.
-    /// Part of #3175.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_instancenorm_batched_crown_negcoeff(
@@ -296,15 +288,12 @@ proptest! {
 // AdaIN1d wraps InstanceNorm1d and applies style_gamma * norm(x) + style_beta.
 // Uses the same [C, T] layout: 2 channels, 2 timesteps, in_dim=4, batch=2.
 // Non-trivial incoming coefficients exercise the composed backward path.
-//
-// Part of #3175.
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(300) })]
 
     /// AdaIN1d batched CROWN soundness with non-trivial incoming coefficients.
     /// Uses 2 channels, 2 timesteps per channel (in_dim=4), batch=2, out_dim=1.
-    /// Part of #3175.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_adain_batched_crown_negcoeff(

@@ -744,7 +744,7 @@ fn test_propagate_ibp_with_engine_falls_back_for_grouped_conv2d_network_4275() {
     )
     .unwrap();
 
-    // #4275 (updated): grouped Conv2d IBP forward now ROUTES through the injected
+    // Grouped Conv2d IBP forward now ROUTES through the injected
     // GemmEngine via per-group 2D GEMMs (so --backend wgpu / Metal can accelerate
     // the dominant conv GEMMs). The old contract (gemm_calls()==0, CPU-only
     // fallback) is obsolete. SOUNDNESS: the engine-routed result must be
@@ -783,7 +783,7 @@ fn test_try_lower_dense_chain_empty_network() {
 ///
 /// This invariant is the safety guarantee that allows the GPU resident IBP path to
 /// fire for both Plain and PreserveLeadingAxis modes without an explicit mode guard
-/// (#4345). Without this rejection, the GPU path would apply regular Flatten
+///Without this rejection, the GPU path would apply regular Flatten
 /// semantics and produce incorrect bounds for PreserveLeadingAxis inputs.
 #[test]
 fn test_try_lower_dense_chain_rejects_flatten0_with_restart_batch_dim_4345() {
@@ -818,7 +818,7 @@ fn test_try_lower_dense_chain_rejects_flatten0_with_restart_batch_dim_4345() {
 
 /// End-to-end test: `propagate_ibp_with_engine_preserve_leading_axis` falls back
 /// to the per-layer loop (not the GPU resident path) when the network contains
-/// Flatten(0) and the input has a restart batch dim (#4345).
+/// Flatten(0) and the input has a restart batch dim.
 #[test]
 fn test_preserve_leading_axis_flatten0_falls_back_from_resident_4345() {
     // Network: Linear(2->3) -> ReLU -> Flatten(0) -> Linear(3->1)

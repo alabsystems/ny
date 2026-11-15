@@ -66,7 +66,7 @@ fn test_add_constant_batched_matches_non_batched_linear() {
     assert_all_close(&actual.upper_b, &expected_upper_b, 1e-6, "upper_b");
 }
 
-/// Regression test for #2818: empty constant must return `Err`, not `% 0` panic.
+/// Regression test: empty constant must return `Err`, not `% 0` panic.
 #[test]
 fn test_add_constant_crown_backward_empty_constant_returns_error_2818() {
     let layer = AddConstantLayer::new(

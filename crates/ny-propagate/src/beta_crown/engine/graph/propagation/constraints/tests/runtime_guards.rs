@@ -2,17 +2,17 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Storing-intermediates result guard and constructor arity regressions (#2014, #2099).
+//! Storing-intermediates result guard and constructor arity regressions.
 
 use crate::beta_crown::GraphCrownContext;
 use crate::{BetaCrownConfig, BetaCrownVerifier, GraphNode, Layer, ReLULayer};
 
 use super::support::{active_relu_history, build_input_bounds, build_single_relu_graph};
 // =========================================================================
-// Regression test for #2014: expect → Result for missing intermediates
+// Regression test: expect → Result for missing intermediates
 // =========================================================================
 
-/// Regression test #2014: `propagate_crown_with_graph_constraints_storing_intermediates`
+/// Regression test: `propagate_crown_with_graph_constraints_storing_intermediates`
 /// must return `Result` (not panic) when the backward pass fails to produce intermediates.
 ///
 /// The invariant (StoringIntermediates always produces Some) is maintained by
@@ -53,8 +53,8 @@ fn test_storing_intermediates_returns_result_not_panic_2014() {
     );
 }
 
-/// Regression test #2099/#2991: empty-input ReLU is now caught at construction
-/// time by GraphNode::try_new() arity validation (#2481, #2686).
+/// Regression test: empty-input ReLU is now caught at construction
+/// time by GraphNode::try_new() arity validation.
 #[ntest::timeout(5000)]
 #[test]
 fn test_constrained_backward_empty_inputs_relu_returns_invalid_spec_2099() {

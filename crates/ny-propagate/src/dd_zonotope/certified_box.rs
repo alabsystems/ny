@@ -7,8 +7,8 @@
 //!
 //! # Why this exists — it is the load-bearing constraint of the whole lane
 //!
-//! `VnnLibSpec::split_input_bounds_f32` (`ny-onnx/src/vnnlib/spec.rs:414`,
-//! issue #2658) rounds EVERY endpoint outward by one f32 ULP on the
+//! `VnnLibSpec::split_input_bounds_f32` (`ny-onnx/src/vnnlib/spec.rs:414`)
+//! rounds EVERY endpoint outward by one f32 ULP on the
 //! `f64 -> f32` narrowing, so the box the graph engine receives is a strict
 //! superset of the VNN-LIB region. That is exactly right for every existing ny
 //! path — and fatal for this one.

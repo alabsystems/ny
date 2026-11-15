@@ -297,14 +297,37 @@ class TestDiffResult:
         assert "max_divergence=" in repr_str
 
 
+def _workspace_version() -> str:
+    """`[workspace.package] version` in the root Cargo.toml, the single source."""
+    active_table = ""
+    manifest = Path(__file__).resolve().parents[3] / "Cargo.toml"
+    for raw_line in manifest.read_text(encoding="utf-8").splitlines():
+        line = raw_line.split("#", maxsplit=1)[0].strip()
+        if line.startswith("[") and line.endswith("]"):
+            active_table = line[1:-1].strip()
+            continue
+        key, separator, value = line.partition("=")
+        if active_table == "workspace.package" and separator and key.strip() == "version":
+            return value.strip().strip('"')
+    raise AssertionError(f"{manifest} has no [workspace.package] version")
+
+
 class TestVersion:
     """Test module version."""
 
     def test_version_exists(self):
-        """Module should have version."""
+        """The compiled module reports the workspace version.
+
+        `ny.__version__` is the ny-python crate's `CARGO_PKG_VERSION`, which
+        inherits `[workspace.package] version`. The expected value is read
+        from Cargo, never written here: this assertion carried the literal
+        "0.4.0" and went stale when the workspace moved to 0.5.0 (ac4cf1483).
+        crates/ny-test-utils/tests/python_package_version.rs keeps a literal
+        from coming back.
+        """
         assert hasattr(ny, "__version__")
         assert isinstance(ny.__version__, str)
-        assert ny.__version__ == "0.4.0"
+        assert ny.__version__ == _workspace_version()
 
 
 # ==============================================================================

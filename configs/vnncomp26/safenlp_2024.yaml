@@ -14,29 +14,25 @@
 #   on these). Previous ny gap: ~345 UNSAT instances scored `unknown` when the
 #   MIP escalation was not reached.
 #
-# CRITICAL SCHEMA NOTE — `complete_verifier: mip`:
-# - The reference alpha-beta-CROWN config
-#   (vnncomp24/safenlp.yaml) sets `general.complete_verifier: mip` to force the
-#   exact MIP backend; that is what recovers the UNSAT instances.
-# - ny's PresetConfig schema has NO `complete_verifier` key (it is not a tunable
-#   preset field). Instead, the scored VNN-COMP runner ALWAYS invokes the engine
-#   with `CompleteVerifierArg::Auto` + the default MIP solver — the ay backend,
-#   the ONLY solver in ny (docs/SOLVER_POLICY.md; HiGHS was deleted at LG3) —
-#   see crates/ny-cli/src/commands/vnncomp.rs `invoke_beta_crown`
-#   (`None::<MipSolverArg>` = default `AY`, the in-process ay-milp session).
-#   `Auto` runs BaB and then escalates to the ay exact-MIP complete verifier
-#   whenever BaB is inconclusive AND the net is MIP-encodable (sequential
-#   Linear+ReLU within a size cap) — which these 30->2 nets satisfy. So MIP
-#   escalation is ALREADY enabled for this category, equivalent to the
-#   reference's complete_verifier=mip, and there is intentionally nothing to
-#   set here for it. NOTE: the escalation exists only in `--features mip`
-#   builds; without the feature it is silently discarded (defect #4,
-#   docs/BANKING_SWEEP_2026-07-18.md) — competition builds must enable it.
+# CURRENT TYPED ROUTE (2026-10-16, scoped category policy):
+# - PresetConfig supports general.complete_verifier. The explicit `mip` below
+#   selects direct sequential MIP instead of the historical Auto BaB/escalation
+#   schedule. The default backend is AY; competition builds require `mip`.
+# - bab.safenlp_mip_cycle arms the retained serial/marked-margin policy. Its
+#   global declaration remains false; this category explicitly selects true.
+# - The trusted upfront SAT gate and authenticated Source input-head prepass
+#   still precede MIP. head_phase_cover:7 selects the bounded Source cover;
+#   all work and final publication stay inside the original instance clock.
+# - The route and cover are owner-authorized category defaults. Functional
+#   controls and original-row diagnostics have separately pinned artifacts;
+#   this YAML claims no matched performance, broad nonregression or points.
+# - The dated July/August observations below describe historical versions and
+#   configurations. They do not establish current route or performance facts.
 #
-# MEASURED (2026-07-18, ay backend, --features mip;
+# HISTORICAL MEASUREMENT (2026-07-18, ay backend, --features mip;
 # docs/BANKING_SWEEP_2026-07-18.md ruarobot arc):
 #   SAT instances   -> `sat` fast (up-front PGD finds the violation).
-#   UNSAT instances -> `unsat` is NOT currently reachable in the 20s budget:
+#   UNSAT instances -> `unsat` was not reached in that run's 20s budget:
 #     the 4 open safenlp ruarobot instances (PGD margin +1.05 = robustly safe,
 #     root -4.75, <=128 unstable ReLUs = trivially MIP-encodable) still time
 #     out locally even with defects #4 (non-mip build discards escalation) and
@@ -49,7 +45,7 @@
 #     (crates/ny-mip/src/ay_lib.rs `run_with_hard_deadline`), so budget
 #     exhaustion scores a clean in-budget `unknown`, never a watchdog kill.
 #   The 2026-06-15 "ZERO unknown / unsat in 7-8s" sample predates the HiGHS
-#   deletion and does not describe the current ay backend.
+#   deletion and did not describe the then-current ay backend.
 #
 # Tuning: keep the reference's strong PGD sweep for the SAT instances. NOTE:
 # NY does not implement the reference's after-BaB ordering. The explicit
@@ -82,6 +78,7 @@
 #   the attack phase never needs more than ~1.5s of a 15s internal budget.
 
 general:
+  complete_verifier: mip
   root_path: ../../benchmarks/vnncomp2026/benchmarks/safenlp_2024/2.0
   csv_name: instances.csv
 
@@ -96,8 +93,19 @@ attack:
   pgd_order: after
   ny_pgd_order_compat: upfront
   pgd_restarts: 10000
+  # #attack-vertex-geometry corner seeds (wave-6 C3), ARMED 2026-09-26: ruarobot/hyperrectangle_1800 (field sat; bank
+  # timeout) sat 3/3 at 0.13-0.15 s vs control timeout 2/2 (W6B, ny_wave6_cf376ec20, 20 s). Seeds only add PGD starts at box
+  # corners; every candidate is still ORT-gated. Moat: the safenlp confirming sweep, both years.
+  corner_seed_restarts: 2
+
+margin_row:
+  # Source-owned root refinement; both choices are frozen in the run receipt.
+  head_groups: true
+  head_directional_cuts: true
+  head_phase_cover: 7
 
 bab:
+  safenlp_mip_cycle: true
   # MEASURED 2026-07-20 (git-bisect + max_domains sweep, release mip binary):
   # the 4000 early-exit pin (8b151134) REGRESSED 9 banked unsat rows
   # (hyperrectangle 4785/11/328/3009/1154/5185/2900/469/2110, unsat@9-14s on
@@ -126,6 +134,27 @@ bab:
   # Zero regressions, two new solves.
   max_domains: 400000
   phase_budget:
+    # #flush-grace, armed 2026-09-13 on a 102-row A/B plus a 63-run
+    # confirm. `internal_timeout_secs` hands the verifier
+    # `budget - max(5, budget/20)`, which on a 20 s row is a 25% tax:
+    # every measured safenlp timeout stopped at wall 16.4-16.9 s of 20,
+    # while the publication it reserves for was measured at 9-18 ms with
+    # a post-stop tail of 0.00-0.19 s. FOUR banked unsats that current
+    # main TIMES OUT on prove again once the tax is lifted.
+    #
+    # THE VALUE IS 2, NOT 1, AND THAT IS MEASURED. Overhead (wall minus
+    # internal timeout) is 1.19-1.87 s, so grace=1 (internal 19 s) put
+    # THIRTY rows at 20.19-20.40 s against a 20 s budget -- every one an
+    # overrun. grace=2 (internal 18 s) tops out at 19.69 s across 63
+    # runs, zero overruns, and still proves hyperrectangle_11 (unsat 3/3
+    # @16.0-16.2 s) and hyperrectangle_5345 (unsat 3/3 @16.8 s).
+    # hyperrectangle_2912 and _5185 need 17.0-18.3 s and land only
+    # sometimes at 18 s internal -- marginal, not banked.
+    #
+    # Cannot mint a verdict: `write_results` only ever publishes what the
+    # verifier certified, and the in-process watchdog downgrades to
+    # `timeout` and never upgrades.
+    results_flush_grace_secs: 2
     # Guarantee MIP the dominant share of the 20s budget: floor at
     # max(0.65*total, 8s) (ceiling stays at the 30s default).
     mip_min_fraction: 0.65

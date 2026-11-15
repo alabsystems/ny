@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Regression tests for #2998 Slice A: batched-domain panic-to-Result conversions.
+//! Regression tests: batched-domain panic-to-Result conversions.
 //!
 //! Verifies that `extract_updates_with_layer_bounds`, `apply_permutation`, and
 //! checked bound lookups return structured `NyError` instead of panicking.

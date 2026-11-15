@@ -1,6 +1,7 @@
-# VNN-COMP Scripts
+# VNN-COMP scripts
 
-These scripts adapt `ny` to the VNN-COMP harness contract.
+These scripts adapt `ny` to the VNN-COMP harness contract. The competition
+calls the three entry points at the repository root:
 
 ```bash
 ./install_tool.sh v1
@@ -8,65 +9,82 @@ These scripts adapt `ny` to the VNN-COMP harness contract.
 ./run_instance.sh v1 <category> <onnx> <vnnlib> <results-file> <timeout-seconds>
 ```
 
-The native packaging command validates the harness and writes a tarball suitable
-for upload through the VNN-COMP evaluation website:
+## Packaging a submission
 
 ```bash
-cargo run -p ny-cli -- vnncomp-benchmarks --year 2026
-cargo run -p ny-cli -- vnncomp-submit --output dist/ny-vnncomp-submission.tar.gz
+targo --unverified run -p ny-cli -- vnncomp-submit
 ```
 
-The package always includes `rust-toolchain.toml` and `.cargo/config.toml`, but
-does not copy internal AY sources into NY. AY remains an exact Git dependency
-pinned by `Cargo.lock`. If a release builder has produced
-`dist/bin/ny-x86_64-linux.xz`, its `.sha256` sidecar, and the strict
-`ny-x86_64-linux.provenance.txt` gate manifest, that complete triplet is
-included and `install_tool.sh` uses the binary as the offline fast path. A
-partial, stale, unproven, wrong-architecture, or source-mismatched triplet is a
-hard packaging error, including under `--dry-run`.
-The provenance manifest is also a canonical Trust gate receipt: its NY, AY,
-Trust compiler, executed-builder, dependency-lock, gate-log, and static ONNX
-Runtime identities are bound into one sealed record inside the executable. The
-packager validates the exact record without running a foreign-architecture
-binary, snapshots the validated triplet, and verifies the bytes captured in the
-tarball. The fresh-machine builder quarantines an earlier public triplet before
-work and publishes provenance last, so an interrupted or failed rebuild cannot
-silently reuse an older complete result.
-The manifest's `ny_commit` names the source commit that produced the executable;
-it does not attempt to name a commit containing its own artifact bytes. A Git
-release may be a descendant of that source commit only when the complete tree
-delta is exactly the three prebuilt files. This artifact-only rule makes a
-clone-installable release possible without weakening source binding.
-The prebuilt is dynamically linked and requires Linux x86_64 with GNU glibc
-2.39 or newer (the official Ubuntu 24.04 target provides glibc 2.39). The
-installer's standard-library verifier checks the checksum, strict manifest and
-Trust receipt, Cargo/AY/builder identities, embedded binary seal, architecture,
-and (when installed from a Git clone) the artifact-only source relationship
-before checking host compatibility. It exclusively stages and sanity-runs the
-validated binary before replacing `target/release/ny`; a malformed present
-triplet is a hard error, while an incompatible host may use the source fallback.
-Do not publish an ordinary Ubuntu 26.04 local build: that host's glibc 2.43 can
-produce a binary importing `GLIBC_2.43`, which is not compatible with the
-Ubuntu 24.04/glibc 2.39 evaluator. Use the Ubuntu-24.04-locked Trust builder.
-Without a compatible artifact, installation performs a networked source build
-requiring authenticated read access to the pinned AY revision, crates.io and
-the ORT archive; native build prerequisites must also be available.
-Credential-free evaluation therefore requires the validated prebuilt triplet.
-Competition installation fails closed if the full `mip,cuda` tier cannot be
-built. `NY_ALLOW_DEGRADED_BUILD=1` is available only for an explicit
-non-competition development build.
+`vnncomp-submit` validates the harness scripts, runs
+`build_submission_binary.sh` (skip with `--no-build`), and writes
+`dist/ny-vnncomp-submission.tar.gz` (`--output` to change it; `--dry-run`
+validates without writing). Every packaged input must be committed. The
+tarball includes `rust-toolchain.toml` and `.cargo/config.toml`. `ay` stays a
+Git dependency pinned by `Cargo.lock`; its sources are never copied in.
 
-Every installed or locally published `target/release/ny` has a
-`target/release/ny.receipt` readiness sidecar. It binds the executable SHA-256,
-the exact NY commit and tracked checkout state, `Cargo.lock` and AY identities,
-the compiled feature tier, and the compiler identity. The validated prebuilt
-path additionally binds the complete sealed Trust provenance manifest and
-publishes the receipt last. `run_instance.sh` refuses automatic release/debug
-selection when that receipt is missing, stale, malformed, or source-mismatched.
-Submission tarballs inject `.ny-vnncomp-source.txt`, so the same exact-commit
-check works after extraction without `.git`, including source-build fallback.
+### Prebuilt binary
 
-For local helper-script work:
+If a release builder has produced the triplet `dist/bin/ny-x86_64-linux.xz`,
+its `.sha256` sidecar, and `ny-x86_64-linux.provenance.txt`, the tarball
+includes it and `install_tool.sh` installs that binary instead of building
+from source. A partial, stale, or mismatched triplet is a packaging error,
+even under `--dry-run`.
+
+- The provenance manifest records the sources, compiler, builder, lock file,
+  gate log, and ONNX Runtime that produced the binary, and the same record is
+  sealed inside the executable. It records identities only: the binary is
+  built with the Trust toolchain by `targo --unverified build`, so it is not
+  verified by Trust.
+- `ny_commit` names the source commit that produced the binary. A release
+  commit may differ from it only by the three prebuilt files.
+- The prebuilt needs Linux x86_64 with GNU glibc 2.39 or newer, which the
+  Ubuntu 24.04 evaluation image provides. Build it with
+  `scripts/vnncomp_trust_linux_build.sh`, which refuses any host but Ubuntu
+  24.04 x86_64: a binary built on Ubuntu 26.04 can require glibc 2.43.
+- `install_tool.sh` runs `verify_prebuilt.py` (checksum, manifest, embedded
+  seal, ELF architecture, source commit), then checks glibc and sanity-runs the
+  staged binary before it replaces `target/release/ny`. A missing sidecar or
+  failed verification is an error; an old or undetected glibc, or a failed
+  sanity run, falls back to a source build.
+
+A source build needs a rustup toolchain linked as `trust` (`targo` and
+`trustc`), network access to crates.io and the ONNX Runtime archive, read
+access to the pinned `ay` revision, and native build tools. It fails unless
+the full `mip,cuda` feature set builds. `NY_ALLOW_DEGRADED_BUILD=1` allows a
+reduced build, for development only.
+
+### Release artifact (`dist/bin/<target>/`)
+
+`scripts/release/make_submission.sh` builds the binary from a clean checkout at
+one commit, with the Trust toolchain in the unverified lane, and writes
+`dist/bin/<target>/{MANIFEST,ny.xz,ny.sha256}`. `MANIFEST` declares the build
+lane (`native` or `cross-build-std`) and binds the binary's bytes, its
+`ny --build-id` line, its ELF link record and the embedded CUDA images to the
+source commit. When the sealed triplet above is absent, `install_tool.sh`
+installs this artifact. It first runs `verify_release.py`, then requires the
+binary to report MANIFEST's exact `--build-id` and `--build-stamp`, then requires
+correct answers on both `selftest/` instances, and then binds a `release`
+receipt. Any failure refuses the install without a source-build fallback.
+`MANIFEST` also records `ny_commit`'s tree id and its raw commit object, which
+must hash to `ny_commit` and name that tree. The verifier and the receipt bind
+the checkout by content: `HEAD`'s tree, minus exactly the release files, must
+be that tree. So a shallow `git clone --depth 1` of the release commit
+installs, and so does a clone owned by another user, because git is run with
+`safe.directory` set to that checkout only. The runbook, the MANIFEST schema
+and the official-contract smoke (`scripts/release/smoke_submission.sh`) are in
+`docs/RELEASE.md`.
+
+### Readiness receipts
+
+Every installed `target/release/ny` has a `target/release/ny.receipt` sidecar
+that binds the executable's SHA-256, the source commit and checkout state, the
+`Cargo.lock` and `ay` identities, the feature set, and the compiler.
+`run_instance.sh` refuses a binary whose receipt is missing, stale, malformed,
+or does not match the source. Submission tarballs include
+`.ny-vnncomp-source.txt`, so the check also works in an extracted tarball
+without `.git`.
+
+## Local use
 
 ```bash
 ./vnncomp_scripts/build_submission_binary.sh
@@ -74,12 +92,21 @@ For local helper-script work:
 ./vnncomp_scripts/run_instance.sh v1 <category> <onnx> <vnnlib> <results-file> <timeout-seconds>
 ```
 
-The scripts prefer a receipted `target/release/ny` and fall back only to a
-receipted debug binary for local dry runs. An explicit `NY_BIN=/path/to/ny`
-remains a receipt-free developer override for mock binaries and controlled A/B
-runs; the wrapper logs that bypass and never silently falls back when the
-explicit path is invalid. The root `run_instance.sh` is the
-competition-hermetic entrypoint and removes `AY_MILP_SMT` and
-`AY_DUMP_QUERY_DIR` before starting NY. The shared
-`vnncomp_scripts/run_instance.sh` helper and direct `ny vnncomp` invocations
-preserve both variables for intentional developer A/B and query-capture runs.
+`prepare_instance.sh` validates its arguments and checks that a binary exists;
+it never analyzes the instance. `run_instance.sh` uses `target/release/ny`, or
+`target/debug/ny` when no release binary exists, and refuses either without a
+valid receipt. It execs `ny vnncomp` under an OS `timeout` of the budget plus
+10 s, with `OMP_NUM_THREADS=1`.
+
+- `NY_BIN=/path/to/ny` skips the receipt check, for mock binaries and A/B
+  runs; the wrapper logs the override and fails if the path is not an
+  executable file.
+- `NY_EXPECT_BUILD_ID=<ny --build-stamp line>` makes the wrapper refuse any
+  other binary, so a multi-row measurement cannot switch binaries mid-run.
+
+The root `run_instance.sh` is the hermetic competition entry point: it unsets
+every `AY_*`, `NY_*`, and `MIMALLOC_*` variable plus `RAYON_NUM_THREADS` and
+`RAYON_RS_NUM_CPUS`, re-exports only `NY_BIN` and `NY_EXPECT_BUILD_ID`, and
+`vnncomp_scripts/run_instance.sh` unsets those two before starting `ny`.
+`vnncomp_scripts/run_instance.sh` and direct `ny vnncomp` calls keep the
+caller's environment, for developer A/B and query-capture runs.

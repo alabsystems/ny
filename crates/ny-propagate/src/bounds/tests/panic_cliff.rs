@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Regression tests for #2907: CROWN backward panic cliff elimination.
+//! Regression tests for CROWN backward panic cliff elimination.
 //!
 //! These tests verify that malformed LinearBounds produce conservative
 //! fallbacks (±Inf) instead of panicking.
@@ -11,7 +11,7 @@ use crate::bounds::LinearBounds;
 use ndarray::{Array1, Array2};
 use ny_tensor::BoundedTensor;
 
-/// #2907 Site 1: concretize with mismatched bias length returns conservative
+/// Concretize with mismatched bias length returns conservative
 /// fallback instead of panicking.
 #[ntest::timeout(10000)]
 #[test]
@@ -45,7 +45,7 @@ fn test_concretize_malformed_bias_length_returns_conservative_2907() {
     );
 }
 
-/// #2907 Site 1: concretize_sound with mismatched A-matrix rows returns
+/// concretize_sound with mismatched A-matrix rows returns
 /// conservative fallback instead of panicking.
 #[ntest::timeout(10000)]
 #[test]

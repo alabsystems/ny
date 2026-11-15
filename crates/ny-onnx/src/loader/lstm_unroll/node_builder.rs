@@ -14,8 +14,15 @@ pub(super) fn make_node(
     outputs: &[&str],
     name: &str,
     domain: &str,
-    attribute: Vec<onnx_proto::AttributeProto>,
+    mut attribute: Vec<onnx_proto::AttributeProto>,
 ) -> onnx_proto::NodeProto {
+    // This helper is private to the LSTM lowering. Its nodes deliberately use
+    // ny's batch-stripped axis convention, so carry explicit provenance rather
+    // than asking the converter to infer authority from a forgeable node name.
+    attribute.push(make_int_attr(
+        ny_build::INTERNAL_LEGACY_AXIS_AUTHORITY_ATTR,
+        1,
+    ));
     onnx_proto::NodeProto {
         input: inputs.iter().map(|s| (*s).to_string()).collect(),
         output: outputs.iter().map(|s| (*s).to_string()).collect(),
@@ -34,14 +41,7 @@ pub(super) fn make_node_variadic(
     domain: &str,
     attribute: Vec<onnx_proto::AttributeProto>,
 ) -> onnx_proto::NodeProto {
-    onnx_proto::NodeProto {
-        input: inputs.iter().map(|s| (*s).to_string()).collect(),
-        output: outputs.iter().map(|s| (*s).to_string()).collect(),
-        name: name.to_string(),
-        op_type: op_type.to_string(),
-        domain: domain.to_string(),
-        attribute,
-    }
+    make_node(op_type, inputs, outputs, name, domain, attribute)
 }
 
 pub(super) fn make_int_attr(name: &str, value: i64) -> onnx_proto::AttributeProto {
@@ -110,4 +110,22 @@ pub(super) fn flatten_to_1d(arr: &ArrayD<f32>, expected_len: usize) -> Result<Ar
 
 pub(super) fn transpose_2d(arr: &Array2<f32>) -> Array2<f32> {
     arr.t().to_owned()
+}
+
+#[cfg(test)]
+mod authority_tests {
+    use super::*;
+
+    #[test]
+    fn synthesized_nodes_carry_exact_legacy_axis_authority() {
+        let node = make_node("Concat", &["x"], &["y"], "lstm_concat", "", vec![]);
+        let authority: Vec<_> = node
+            .attribute
+            .iter()
+            .filter(|attribute| attribute.name == ny_build::INTERNAL_LEGACY_AXIS_AUTHORITY_ATTR)
+            .collect();
+        assert_eq!(authority.len(), 1);
+        assert_eq!(authority[0].r#type, onnx_proto::attribute_type::INT);
+        assert_eq!(authority[0].i, Some(1));
+    }
 }

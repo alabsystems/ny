@@ -1,0 +1,303 @@
+{
+  "schema_version": 1,
+  "year": 2025,
+  "timeout_cap": null,
+  "configs": {
+    "canonical_path": "<home>/ny-wt-ship27/configs/vnncomp25",
+    "sha256": "8761a57e661d3d2150f65faa423ff9ac6c3eba0088ab5c31622792ee337e701c"
+  },
+  "executable": {
+    "canonical_path": "<home>/ny-pins/ny_wave6_cf376ec20",
+    "sha256": "4b1656c9978e31af5ae607190e92c28506853f2ada28ee88ae029c8596e55135"
+  },
+  "build_id": "NY_BUILD_ID_V1 version=0.5.6157 features=mip,cuda backend=cuda+wgpu markers=margin-row-gpu-eft-impl-v9 commit=cf376ec2054b365210906e8894cd28d082fbe4bc dirty=false revision=6157 source=clean profile=release target=aarch64-unknown-linux-gnu rustc=1.99.0-dev-1183ee6ed stamp=63913e1bc53fdd22c9ffdd3c321f44aaf028d3dc7860d93d97a1deb9381bd9a0 exe=4b1656c9978e31af5ae607190e92c28506853f2ada28ee88ae029c8596e55135 id=cb1fa286a839fa13e983d3ce473cfd68dd4f656a99c6d2db04e1a1ae36db9e14",
+  "build_provenance": "ny.vnncomp.unsealed.v1|status=unsealed|",
+  "target_os": "linux",
+  "target_arch": "aarch64",
+  "compute_backend": "cuda [cuda: compiled, NVIDIA kernel driver=present, 1 process-visible device(s), libcuda+libcublas=present, engine lazy/unconfirmed; wgpu adapter: Vulkan (NVIDIA GB10, IntegratedGpu); sound verdict path: CUDA f64 GEMM seams + CPU f64 CROWN (resident CUDA CROWN behind its gates)]",
+  "host": "spark-f904 | unknown-cpu | 20 cores | 121 GiB",
+  "arm": [],
+  "ambient_env_schema": "ny-cli/ambient-env/v3",
+  "ambient_env": {
+    "NY_BOX_QUIET_GRACE": "300",
+    "NY_BOX_WAIT_LOCK": "21600",
+    "NY_BOX_WAIT_QUIET": "21600"
+  },
+  "witness_dir": {
+    "canonical_path": "<home>/ny/reports/sweeps/ship27/cersyve-2025.witnesses",
+    "sha256": "e347ffa00b4c49bd7f17017493ed87a92909e94e62bddbc4f9fc065a6881cd3c"
+  },
+  "instance_selection": {
+    "mode": "all"
+  },
+  "selected_rows": {
+    "cersyve": {
+      "schema": "ny-search/measured-row-set/v1",
+      "count": 12,
+      "sha256": "dc297a545cc79da5863c176c84bd4762576a3ccf8a6b08dffc930db5fcad289e"
+    }
+  },
+  "selected_row_inputs_schema": "ny-cli/selected-row-inputs/v2",
+  "selected_row_inputs": {
+    "cersyve": [
+      {
+        "onnx": "onnx/lane_keep_pretrain_con.onnx",
+        "vnnlib": "vnnlib/prop_lane_keep.vnnlib",
+        "occurrence": 0,
+        "instance_index": 0,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cersyve/onnx/lane_keep_pretrain_con.onnx",
+                "sha256": "2779a2dbc867092adc70c41c9fd23d539edd4b689e208e626e4d2d05dea9ef15"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cersyve/vnnlib/prop_lane_keep.vnnlib",
+            "sha256": "f6800819bf324d74d6d67d360911f3cbd972011b5dc28ab2dd36ab4771410407"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/lane_keep_pretrain_inv.onnx",
+        "vnnlib": "vnnlib/prop_lane_keep.vnnlib",
+        "occurrence": 0,
+        "instance_index": 1,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cersyve/onnx/lane_keep_pretrain_inv.onnx",
+                "sha256": "4169a61ce6fbcfcd99894fdc8ff6d41bd6bd65d00576ff0cb7f4610ad0788d57"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cersyve/vnnlib/prop_lane_keep.vnnlib",
+            "sha256": "f6800819bf324d74d6d67d360911f3cbd972011b5dc28ab2dd36ab4771410407"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/lane_keep_finetune_con.onnx",
+        "vnnlib": "vnnlib/prop_lane_keep.vnnlib",
+        "occurrence": 0,
+        "instance_index": 2,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cersyve/onnx/lane_keep_finetune_con.onnx",
+                "sha256": "1f8372d6bbf503e5be29d93aeaf85c4e80dcf2cc825630933b32f2935ca6c07b"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cersyve/vnnlib/prop_lane_keep.vnnlib",
+            "sha256": "f6800819bf324d74d6d67d360911f3cbd972011b5dc28ab2dd36ab4771410407"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/lane_keep_finetune_inv.onnx",
+        "vnnlib": "vnnlib/prop_lane_keep.vnnlib",
+        "occurrence": 0,
+        "instance_index": 3,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cersyve/onnx/lane_keep_finetune_inv.onnx",
+                "sha256": "b86901d81172ef1403541b078e44c941b80b1f9d792f39920f1e5eae9dcb07d6"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cersyve/vnnlib/prop_lane_keep.vnnlib",
+            "sha256": "f6800819bf324d74d6d67d360911f3cbd972011b5dc28ab2dd36ab4771410407"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/pendulum_pretrain_con.onnx",
+        "vnnlib": "vnnlib/prop_pendulum.vnnlib",
+        "occurrence": 0,
+        "instance_index": 4,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cersyve/onnx/pendulum_pretrain_con.onnx",
+                "sha256": "838e831026762f6163fae57255dcf441707d0e02de25fc85f3fddb1915f3bb77"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cersyve/vnnlib/prop_pendulum.vnnlib",
+            "sha256": "9d5ad329c788628544e203aefe9eaeece6f321599cdd3601965312a9624b7be2"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/pendulum_pretrain_inv.onnx",
+        "vnnlib": "vnnlib/prop_pendulum.vnnlib",
+        "occurrence": 0,
+        "instance_index": 5,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cersyve/onnx/pendulum_pretrain_inv.onnx",
+                "sha256": "ee7d4c9d847a2634da37be2e2439e7c90bf971f586386f5c745f6adc8f6c1837"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cersyve/vnnlib/prop_pendulum.vnnlib",
+            "sha256": "9d5ad329c788628544e203aefe9eaeece6f321599cdd3601965312a9624b7be2"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/pendulum_finetune_con.onnx",
+        "vnnlib": "vnnlib/prop_pendulum.vnnlib",
+        "occurrence": 0,
+        "instance_index": 6,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cersyve/onnx/pendulum_finetune_con.onnx",
+                "sha256": "6cb46e1027828d70149a794875aa6a3b00f6412f7a1473ab945372fa9740c64d"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cersyve/vnnlib/prop_pendulum.vnnlib",
+            "sha256": "9d5ad329c788628544e203aefe9eaeece6f321599cdd3601965312a9624b7be2"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/pendulum_finetune_inv.onnx",
+        "vnnlib": "vnnlib/prop_pendulum.vnnlib",
+        "occurrence": 0,
+        "instance_index": 7,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cersyve/onnx/pendulum_finetune_inv.onnx",
+                "sha256": "d12f9ebc01e0056a74ca4f5dd546552421e6f1b607fb0095719a57ad4c1f9f9d"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cersyve/vnnlib/prop_pendulum.vnnlib",
+            "sha256": "9d5ad329c788628544e203aefe9eaeece6f321599cdd3601965312a9624b7be2"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/point_mass_pretrain_con.onnx",
+        "vnnlib": "vnnlib/prop_point_mass.vnnlib",
+        "occurrence": 0,
+        "instance_index": 8,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cersyve/onnx/point_mass_pretrain_con.onnx",
+                "sha256": "31f9c9632ad399a0533a6b4301243ab14ea4aae1e74465591fd65313c118f271"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cersyve/vnnlib/prop_point_mass.vnnlib",
+            "sha256": "5359f91e2d81efed36344746ada0b6ef636d3f4d9dafe7429bee2410b707f778"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/point_mass_pretrain_inv.onnx",
+        "vnnlib": "vnnlib/prop_point_mass.vnnlib",
+        "occurrence": 0,
+        "instance_index": 9,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cersyve/onnx/point_mass_pretrain_inv.onnx",
+                "sha256": "dca154acb16b6aaf373ee328e93b940b762bb2ea64190b1753b727fb7e5a7463"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cersyve/vnnlib/prop_point_mass.vnnlib",
+            "sha256": "5359f91e2d81efed36344746ada0b6ef636d3f4d9dafe7429bee2410b707f778"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/point_mass_finetune_con.onnx",
+        "vnnlib": "vnnlib/prop_point_mass.vnnlib",
+        "occurrence": 0,
+        "instance_index": 10,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cersyve/onnx/point_mass_finetune_con.onnx",
+                "sha256": "529719a4bbd34f405683461e2a096504a0b8ba2ea0a283fd9b9683b0d3e04e14"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cersyve/vnnlib/prop_point_mass.vnnlib",
+            "sha256": "5359f91e2d81efed36344746ada0b6ef636d3f4d9dafe7429bee2410b707f778"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/point_mass_finetune_inv.onnx",
+        "vnnlib": "vnnlib/prop_point_mass.vnnlib",
+        "occurrence": 0,
+        "instance_index": 11,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cersyve/onnx/point_mass_finetune_inv.onnx",
+                "sha256": "b38d357172fe31258f52cde68ab3ccdfa6f3a590976930ae031d622f0e059b98"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cersyve/vnnlib/prop_point_mass.vnnlib",
+            "sha256": "5359f91e2d81efed36344746ada0b6ef636d3f4d9dafe7429bee2410b707f778"
+          }
+        }
+      }
+    ]
+  },
+  "instances_csv": {
+    "cersyve": {
+      "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cersyve/instances.csv",
+      "sha256": "cfeec4f50ebdf30226b336d6e818b8378dd61914dd989d296f97e5355dc02c4f"
+    }
+  }
+}

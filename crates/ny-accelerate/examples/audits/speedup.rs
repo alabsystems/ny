@@ -428,7 +428,7 @@ fn per_dispatch_shadow_comparison() {
 pub(crate) fn run() {
     let command = std::env::args().nth(1).unwrap_or_else(|| {
         eprintln!(
-            "usage: cargo run --release -p ny-accelerate --example audit_speedup -- \
+            "usage: targo --unverified run --release -p ny-accelerate --example audit_speedup -- \
              <isolated|thin|end-to-end|dispatch-context|shadow|all>"
         );
         std::process::exit(2);

@@ -12485,7 +12485,7 @@ mod tests {
             )
             .unwrap();
         state.reserve_maintenance(&pending, None).unwrap();
-        assert!(state.commit_maintenance(&mut pending).is_empty());
+        assert_eq!(state.commit_maintenance(&mut pending).len(), 0);
         assert_eq!(state.live_counts(), (0, 0));
 
         let next_request = fresh_request_with_prefix(Vec::new());
@@ -12578,7 +12578,7 @@ mod tests {
             )
             .unwrap();
         state.reserve_maintenance(&release, None).unwrap();
-        assert!(state.commit_maintenance(&mut release).is_empty());
+        assert_eq!(state.commit_maintenance(&mut release).len(), 0);
         assert_eq!(state.live_counts(), (0, 0));
         assert!(matches!(
             state.slots[0],
@@ -13125,7 +13125,7 @@ mod tests {
             }
         };
         assert_eq!(returned.release().len(), slot_count);
-        assert!(returned.evict().is_empty());
+        assert_eq!(returned.evict().len(), 0);
         let returned_first = &returned.release()[0];
         let returned_last = &returned.release()[slot_count - 1];
         assert_eq!(
@@ -13612,7 +13612,7 @@ mod tests {
         assert_eq!(result.domain_outcomes().len(), 2);
         assert_eq!(result.rows().len(), 4);
         assert_eq!(result.destination_slots().len(), 2);
-        assert!(result.evicted_slots().is_empty());
+        assert_eq!(result.evicted_slots().len(), 0);
         for (slot_index, token) in result.destination_slots().iter().enumerate() {
             assert_eq!(
                 token.session_nonce_sha256(),

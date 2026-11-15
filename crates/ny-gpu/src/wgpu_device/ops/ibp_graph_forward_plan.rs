@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cached-plan support for graph-DAG GPU-resident IBP forward (#4319).
+//! Cached-plan support for graph-DAG GPU-resident IBP forward.
 //!
 //! Unlike the sequential plan (`ibp_forward_plan.rs`) which ping-pongs between
 //! two buffer pairs, the DAG plan allocates one buffer pair per op so that

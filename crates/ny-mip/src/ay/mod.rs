@@ -2,23 +2,19 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 //
-// ay SMT backend for the solver-neutral MILP IR (P0 baseline).
+// External AY compatibility backend for the solver-neutral MILP IR.
 //
 // Lowers a [`crate::ir::MilpProblem`] to SMT-LIB2 QF_LRA — ReLU indicator
 // binaries become 0/1 disjunctions over Real variables, which plays to ay's
 // DPLL(T) case-splitting instead of forcing a LIRA mix — and drives the
 // external `ay` binary (discovered via `$NY_AY`, else `ay` on `$PATH`, the
 // same convention as the gt/cnf routes). The lowering is EXACT: every f64
-// bound and coefficient is emitted as the precise rational it denotes, so an
-// ay `unsat` speaks about the same problem the float backends solve, and the
-// certificate lane (docs/AY_MIP_P0.md, gate G0) certifies the real thing.
+// bound and coefficient is emitted as the precise rational it denotes.
 //
-// Soundness contract (identical to the HiGHS/SCIP arms): a `Sat` witness is
-// only a candidate — callers revalidate it with a concrete forward pass;
+// A `Sat` witness is a candidate: callers revalidate it with a forward pass.
 // `Unsat` requires the solver's proven infeasibility; `unknown`, a timeout,
 // or any lowering/parse failure degrades to `Timeout`/`Error`, never `Unsat`.
-//
-// Reference: designs/2026-07-12-gurobi-class-milp-for-ny.md (ay repo), P0.
+// External UNSAT results remain uncertified; this backend exports no certificate.
 
 mod lower;
 mod parse;
@@ -35,8 +31,8 @@ type Result<T> = std::result::Result<T, MipError>;
 /// Feasibility check via the external ay solver.
 ///
 /// `input_vars` / `output_vars` select which columns are extracted into the
-/// witness on `sat` (matching the HiGHS/SCIP arms). The warm-start seed is
-/// accepted for signature parity but ignored — SMT-LIB has no primal seeding
+/// witness on `sat`. The warm-start seed is accepted but ignored:
+/// this SMT-LIB interface has no primal seeding
 /// surface; it is a performance hint, never a correctness requirement.
 pub(crate) fn check_feasibility(
     problem: &MilpProblem,
@@ -53,17 +49,11 @@ pub(crate) fn check_feasibility(
 
 /// Optimize a single column via ay's OMT surface.
 ///
-/// On `sat` the reported objective is the target column's value in the
-/// optimum model (parity with the HiGHS oracle arm, which reads the target
-/// column rather than the model objective).
+/// On `sat`, report the target column's value from the optimum model.
 ///
-/// Only ay's `(minimize)` lane is used: ay 0.11.0's maximize lane silently
-/// returns wrong optima for equality-defined variables in every spelling
-/// probed (repro in the ay design doc, P0 findings), while minimize is
-/// exact. Maximize therefore lowers to minimizing a fresh auxiliary column
-/// `neg` constrained by `target + neg = 0`; the target's model value is
-/// still read directly, and the caller's outward rounding absorbs the
-/// (sub-f32-ULP) binary-search epsilon of ay's iterative lane.
+/// Maximize lowers to minimizing an auxiliary `neg` with `target + neg = 0`.
+/// This preserves the compatibility workaround for the historical AY 0.11.0
+/// maximize defect; read the original target column from the returned model.
 pub(crate) fn optimize_col(
     problem: &MilpProblem,
     timeout_secs: f64,

@@ -332,11 +332,25 @@ fn read_reduce_axes(spec: &LayerSpec, context: &ConvertContext<'_>) -> Option<Ve
 fn infer_channel_count(source_tensor: &str, context: &ConvertContext<'_>) -> Option<usize> {
     let shape = context.tensor_shapes.get(source_tensor)?;
     // TensorSpec shapes still include the fixed ONNX batch dimension, while
-    // GraphNetwork strips it. InstanceNorm1d therefore needs at least one
-    // spatial dimension after the channel axis: authored rank must be >= 3.
+    // GraphNetwork strips it. InstanceNorm1d therefore needs exactly one
+    // spatial dimension after the channel axis: authored rank must be == 3.
     // A rank-2 [B,F] last-axis normalization becomes an internal [F] tensor
     // and must remain the primitive (LayerNorm-like) chain.
-    if shape.len() < 3 || shape[1] <= 0 {
+    //
+    // RANK > 3 IS REFUSED because IBP and CROWN would factor the SAME layer into
+    // DIFFERENT [C, T] groupings — not a rounding disagreement, a disagreement
+    // about what the layer IS:
+    //   authored [B,C,H,W] -> internal [C,H,W]
+    //     IBP   (instance_norm/ibp.rs:52-53) takes the LAST TWO dims:
+    //           num_channels = H, time_len = W
+    //     CROWN (instance_norm/crown_scalar.rs:53-56) uses the layer's declared
+    //           channel count: [C, total/C] = [C, H*W]
+    // When C != H the IBP shape check rejects the layer, which is fail-closed and
+    // harmless. When C == H both paths produce bounds, IBP normalizing over W and
+    // CROWN over H*W — and ONNX InstanceNorm normalizes over ALL spatial dims, so
+    // the IBP grouping is simply wrong. Refusing the fusion leaves the primitive
+    // chain, which is the unfused path and therefore sound at any rank.
+    if shape.len() != 3 || shape[1] <= 0 {
         return None;
     }
     usize::try_from(shape[1]).ok()

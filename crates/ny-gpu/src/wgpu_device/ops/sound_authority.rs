@@ -87,8 +87,7 @@
 //! Every entry was discharged before the 2026-08-11 UTC B0 source opening:
 //!
 //! * **U1 — composed-sequence integrity in the PRODUCTION kernels.**
-//!   DISCHARGED 2026-08-10 America/Los_Angeles (2026-08-11 UTC) for the tiled
-//!   GEMM (0-ULP bit-compare over
+//!   DISCHARGED 2026-08-11 UTC for the tiled GEMM (0-ULP bit-compare over
 //!   ~48M taps) and the tree kernels (`tests/u1_tree_settling.rs`, 10 device
 //!   tests: composed per-element bit-compare of Bias/ActBias/Concretize/
 //!   col2im `(V, R)` against a CPU twin at CROWN shapes, plus chain/pair/tail
@@ -212,39 +211,31 @@ pub(crate) const PRODUCTION_WGPU_VERDICT_AUTHORITY_ENABLED: bool = true;
 ///   any adapter whose annihilation domain leaks past the strictly-subnormal
 ///   refusal predicate.
 /// * end-to-end enclosure-parity acceptance run on the charged device —
-///   LANDED (Lane B harness 2026-08-13; row CLOSED by the 2026-08-13
-///   opening review):
+///   CLOSED by the 2026-08-13 opening review:
 ///   `wgpu_device/flush_charge_acceptance_gpu_tests.rs` runs the charged walk
 ///   on a TEST-SCOPED device (production admission minus only this gate;
 ///   compiled out of production builds) and asserts the charged GPU enclosure
 ///   CONTAINS the CPU f64 same-fold reference elementwise, tolerance zero —
 ///   measured green on the Apple M5 Max target (210 seeded random fixtures +
 ///   24 admitted-boundary fixtures, 610 spec rows, 0 breaches) under the
-///   DEFAULT env (re-measured 2026-08-13 after admission-config landed).
-///   ADMISSION-CONFIG (resolved 2026-08-13): the charged
-///   constructors now build their device with the DenormPreserve policy
-///   FORCED to the plain-WGSL (flushing) loading path — the configuration
-///   the oracle charges model — so the probes measure it and admission holds
-///   on Metal under the DEFAULT env, no `NY_GPU_DENORM_PRESERVE=0` required
-///   (the earlier finding that the AUTO passthrough fallback poisons the
-///   process no longer reaches the charged device: its loading path is
-///   threaded per-device and never requests passthrough). An explicit
-///   `NY_GPU_DENORM_PRESERVE=1` pin typed-refuses (env wins).
-///   The 2026-08-13 opening review closed this row on that evidence; any
-///   wall-clock claim stays HONESTLY LABELED (the REAL metaroom net is
-///   REFUSED by the v1 charge policy's subnormal-bias guard — only the
-///   admissible variant is measured).
+///   DEFAULT env on 2026-08-13. ADMISSION-CONFIG: the charged constructors
+///   build their device with the DenormPreserve policy FORCED to the plain-WGSL
+///   (flushing) loading path — the configuration the oracle charges model — so
+///   the probes measure it and admission holds on Metal under the DEFAULT env,
+///   no `NY_GPU_DENORM_PRESERVE=0` required (the AUTO passthrough fallback,
+///   which poisons the process, cannot reach the charged device: its loading
+///   path is threaded per-device and never requests passthrough). An explicit
+///   `NY_GPU_DENORM_PRESERVE=1` pin typed-refuses (env wins). Any wall-clock
+///   claim stays HONESTLY LABELED (the REAL metaroom net is REFUSED by the v1
+///   charge policy's subnormal-bias guard — only the admissible variant is
+///   measured).
 ///
-/// The 2026-08-13 source review OPENED the gate with the same discipline as
-/// [`PRODUCTION_WGPU_VERDICT_AUTHORITY_ENABLED`]: every ledger row above was
-/// discharged (§D/§F/§E LANDED, §H RESOLVED 2026-08-13, enclosure-parity
-/// acceptance CLOSED 2026-08-13), the const-block pin in `cpu_tests` was
-/// inverted by the review, and the flip was validated live on the Apple
-/// M5 Max target (charged admission: rungs 1/4/5 pass, rung 3 refused,
-/// PURE-FLUSH, §H clean, on the forced plain-WGSL device). Closing it again
-/// is itself a source-review event and must re-invert the pin. NO rung of
-/// the uncharged ladder moved with this opening: rung 3's refusal of
-/// UNcharged authority is byte-identical either way.
+/// The opening review inverted the const-block pin in `cpu_tests`, and the flip
+/// was validated live on the Apple M5 Max target (charged admission: rungs
+/// 1/4/5 pass, rung 3 refused, PURE-FLUSH, §H clean, on the forced plain-WGSL
+/// device). Closing it again is itself a source-review event and must re-invert
+/// the pin. NO rung of the uncharged ladder moved with this opening: rung 3's
+/// refusal of UNcharged authority is byte-identical either way.
 pub(crate) const PRODUCTION_WGPU_CHARGED_VERDICT_AUTHORITY_ENABLED: bool = true;
 
 /// #flush-charge: the per-op charge model a charged-flush device carries. Every
@@ -682,7 +673,7 @@ impl WgpuDevice {
 
         // INFO, not WARN: this is the SUCCESS arm — the refusal above is the
         // warning. Logging a pass at WARN put it on stderr at default verbosity,
-        // which broke `--json`'s empty-stderr contract (#395) on any machine
+        // which broke `--json`'s empty-stderr contract on any machine
         // with a qualifying GPU, and it erodes the signal that a real WARN from
         // this target means the device was refused.
         tracing::info!(
@@ -875,21 +866,20 @@ impl WgpuDevice {
     /// #flush-charge TEST-SCOPED ACCEPTANCE CONSTRUCTOR. Compiled out of every
     /// production build: `cfg(any(test, feature = "gpu-tests"))`, and the
     /// `gpu-tests` feature exists solely for real-adapter test invocations
-    /// (`cargo test -p ny-gpu --features gpu-tests`); no production crate in
+    /// (`targo --unverified test -p ny-gpu --features gpu-tests`); no production crate in
     /// the workspace enables it. There is deliberately NO production-reachable
     /// bypass of [`PRODUCTION_WGPU_CHARGED_VERDICT_AUTHORITY_ENABLED`] — this
     /// symbol does not exist in a production compilation, so no production
     /// caller can name it, link it, or reach it.
     ///
     /// Purpose: acceptance evidence for the enclosure-parity row on the
-    /// charged gate's audit ledger (supplied pre-flip; the row was CLOSED by
-    /// the 2026-08-13 opening review, and the harness remains the regression
-    /// oracle). It builds a device whose charged ARITHMETIC is byte-identical
-    /// to the production charged device — `FlushChargePolicy::production()`
-    /// armed, `charged_walk_guard` and every widened slack live — WITHOUT
-    /// consulting the reviewed source gate and WITHOUT granting any
-    /// production verdict authority (the CLI/proof router can only reach the
-    /// production constructor, which applies the full admission including
+    /// charged gate's audit ledger (the row was CLOSED by the 2026-08-13 opening
+    /// review; the harness remains the regression oracle). It builds a device whose
+    /// charged ARITHMETIC is byte-identical to the production charged device —
+    /// `FlushChargePolicy::production()` armed, `charged_walk_guard` and every
+    /// widened slack live — WITHOUT consulting the reviewed source gate and WITHOUT
+    /// granting any production verdict authority (the CLI/proof router can only
+    /// reach the production constructor, which applies the full admission including
     /// the reviewed gate).
     ///
     /// Admission is the production predicate MINUS ONLY the reviewed charged
@@ -1231,15 +1221,13 @@ mod cpu_tests {
         assert!(!report.qualified());
     }
 
-    /// #flush-charge Fix 3 STRUCTURAL PIN, revisited by the 2026-08-13
-    /// opening review (as the closed-gate pin's message demanded): with the
-    /// reviewed charged source gate OPEN, the only refusal the production
-    /// charged constructor takes BEFORE building a device is the explicit
-    /// `NY_GPU_DENORM_PRESERVE=1` pin (a process fact, checked first). Every
-    /// other path builds the forced plain-WGSL device and runs a GENUINE
-    /// admission measurement — not redundant work, so no gate skip applies
-    /// any more. This test stays CPU-only: the env-pin refusal shape is
-    /// pinned through the pure resolver, never by mutating process env or
+    /// #flush-charge Fix 3 STRUCTURAL PIN: with the reviewed charged source gate
+    /// OPEN, the only refusal the production charged constructor takes BEFORE
+    /// building a device is the explicit `NY_GPU_DENORM_PRESERVE=1` pin (a process
+    /// fact, checked first). Every other path builds the forced plain-WGSL device
+    /// and runs a GENUINE admission measurement — not redundant work, so no gate
+    /// skip applies any more. This test stays CPU-only: the env-pin refusal shape
+    /// is pinned through the pure resolver, never by mutating process env or
     /// constructing a device.
     #[test]
     fn open_gate_charged_pre_device_refusal_is_exactly_the_env_pin() {
@@ -1337,8 +1325,8 @@ mod gpu_tests {
             Err(error) => {
                 assert!(!error.report().qualified());
                 assert!(error.report().failed_rung().is_some());
-                assert!(!error.to_string().is_empty());
-                assert!(!error.source_error().to_string().is_empty());
+                assert_ne!(error.to_string(), "");
+                assert_ne!(error.source_error().to_string(), "");
             }
         }
     }
@@ -1508,7 +1496,7 @@ mod gpu_tests {
             }
             Err(error) => {
                 assert!(!error.report().qualified());
-                assert!(!error.to_string().is_empty());
+                assert_ne!(error.to_string(), "");
                 if !PRODUCTION_WGPU_CHARGED_VERDICT_AUTHORITY_ENABLED
                     && error.report().adapter().is_some()
                 {

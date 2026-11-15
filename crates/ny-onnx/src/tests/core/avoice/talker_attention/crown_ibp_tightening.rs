@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Phase 3: Intermediate-node tightening via CROWN-IBP (#3497)
+//! Phase 3: Intermediate-node tightening via CROWN-IBP
 //!
 //! Direct backward CROWN on the softmax-output graph does not expand the
 //! certified radius beyond the IBP baseline (measured in `crown_boundary.rs`).
@@ -11,8 +11,6 @@
 //! CROWN backward from each intermediate node in topological order.
 //! A deadline is used because the O(N²) cost of full CROWN-IBP on the
 //! transformer graph exceeds practical test budgets (~300s+).
-//!
-//! Reference: designs/2026-03-11-issue-3497-centroid-monotonicity-verification-path.md §Phase 3
 
 use super::centroid::{
     assert_centroid_bounds_no_looser, centroid_monotonicity_stats, CentroidMonotonicityStats,
@@ -176,8 +174,6 @@ fn crown_ibp_bisect(
 
 /// Phase 3 gate: does CROWN-IBP tightening improve softmax centroid bounds
 /// over pure IBP on the full talker attention graph?
-///
-/// Reference: designs/2026-03-11-issue-3497-centroid-monotonicity-verification-path.md §Phase 3
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
 #[cfg(feature = "external-avoice")]
@@ -243,8 +239,6 @@ fn test_crown_ibp_tightening_softmax_centroids_3497() {
 /// is that CROWN-IBP certifies at least the IBP-certified 2e-6 point
 /// (CROWN-IBP must not be looser than IBP), and the log reports whether it
 /// extends beyond 2.535e-6.
-///
-/// Reference: designs/2026-03-11-issue-3497-centroid-monotonicity-verification-path.md §Phase 3
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
 #[cfg(feature = "external-avoice")]

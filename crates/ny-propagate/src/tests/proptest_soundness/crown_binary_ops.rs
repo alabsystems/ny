@@ -593,7 +593,7 @@ proptest! {
 }
 
 // =============================================================================
-// MUL BINARY ALPHA-PARAMETERIZED CROWN BACKWARD SOUNDNESS (#3439 Phase 2)
+// MUL BINARY ALPHA-PARAMETERIZED CROWN BACKWARD SOUNDNESS
 // =============================================================================
 
 proptest! {
@@ -677,7 +677,7 @@ proptest! {
         }
     }
 
-    /// Random alpha in [0, 1] always produces sound bounds (#3439 Phase 2).
+    /// Random alpha in [0, 1] always produces sound bounds.
     ///
     /// For any r_l, r_u in [0, 1], the interpolated McCormick envelope is a valid
     /// (sound) relaxation of z = x * y. Verifies by sampling (x, y) in the input
@@ -759,7 +759,7 @@ proptest! {
 }
 
 // =============================================================================
-// MUL BINARY BROADCAST CROWN BACKWARD SOUNDNESS (#3499 proof coverage gap)
+// MUL BINARY BROADCAST CROWN BACKWARD SOUNDNESS
 // =============================================================================
 
 /// Helper to build broadcast BoundedTensors with shape [2, 3] (LHS) and [2, 1] (RHS).

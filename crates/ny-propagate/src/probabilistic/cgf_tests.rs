@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Tests for CGF propagation and Chernoff/saddlepoint bounds.
-//! Part of #3921 / #4249.
 
 use super::*;
 use ndarray::{Array1, Array2, ArrayD, IxDyn};
@@ -172,7 +171,7 @@ fn test_cgf_confidence_monotone() {
     );
 }
 
-/// Regression test for #4286: point-mass bounds (lower == upper) must not
+/// Regression test: point-mass bounds (lower == upper) must not
 /// produce NaN in psi() or psi_prime().
 #[test]
 fn test_cgf_psi_point_mass_does_not_nan_4286() {
@@ -204,7 +203,7 @@ fn test_cgf_psi_point_mass_does_not_nan_4286() {
     }
 }
 
-/// Regression test for #4286: end-to-end CGF propagation with point-mass
+/// Regression test: end-to-end CGF propagation with point-mass
 /// inputs should not produce NaN in CgfBound.
 #[test]
 fn test_cgf_propagate_point_mass_no_nan_4286() {

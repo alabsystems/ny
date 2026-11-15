@@ -65,9 +65,5 @@ pub(super) fn is_softmax_decomposition_mul(graph: &GraphNetwork, node: &GraphNod
         Some(node) => node,
         None => return false,
     };
-    if !matches!(exp_reduce_node.layer, Layer::Exp(_)) {
-        return false;
-    }
-
-    true
+    matches!(exp_reduce_node.layer, Layer::Exp(_))
 }

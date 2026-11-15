@@ -11,7 +11,7 @@
 //! precision errors. For strict mathematical soundness, use directed rounding
 //! via `propagate_ibp_sound()` which applies `next_down/next_up` to bounds.
 //!
-//! ## Proptest case counts (issue #1716)
+//! ## Proptest case counts
 //!
 //! Case counts are inversely proportional to per-case compute cost:
 //! - 1000: cheap elementwise activations (Exp, Log, Sigmoid, etc.)
@@ -20,7 +20,7 @@
 //! - 200: multi-layer (network, add_constant)
 //! - 100: directed rounding (exact arithmetic, few cases needed)
 //!
-//! ## Shrink time cap (issue #4141)
+//! ## Shrink time cap
 //!
 //! All proptest configs set `max_shrink_time: 5000` (5 seconds). Without this,
 //! proptest's default unlimited shrinking can spend minutes minimizing a

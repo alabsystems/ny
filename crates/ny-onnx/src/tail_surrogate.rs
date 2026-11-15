@@ -198,7 +198,9 @@ fn initializer_f32s(graph: &GraphProto, name: &str) -> Option<Vec<f32>> {
         return Some(
             tensor
                 .raw_data
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),
         );
@@ -547,6 +549,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn raw_float_initializer_decodes_exact_chunks_and_refuses_truncation() {
+        let values = [-1.5_f32, 0.0, 2.25];
+        let mut graph = GraphProto {
+            initializer: vec![TensorProto {
+                data_type: DATA_TYPE_FLOAT,
+                name: "scale".to_string(),
+                raw_data: values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect(),
+                ..TensorProto::default()
+            }],
+            ..GraphProto::default()
+        };
+
+        assert_eq!(
+            initializer_f32s(&graph, "scale").as_deref(),
+            Some(values.as_slice())
+        );
+        graph.initializer[0].raw_data.pop();
+        assert_eq!(initializer_f32s(&graph, "scale"), None);
+    }
+
     /// x -> Gemm(w) -> QuantizeLinear -> DequantizeLinear -> Sigmoid -> y,
     /// the exact smart_turn tail shape.
     fn qdq_sigmoid_tail_model(q_scale: f32) -> Vec<u8> {
@@ -666,7 +692,7 @@ mod tests {
         .expect("freeze");
         let model = ModelProto::decode(frozen.as_slice()).expect("decode");
         let graph = model.graph.expect("graph");
-        assert!(graph.input.is_empty());
+        assert_eq!((graph.input).len(), 0);
         let init = graph
             .initializer
             .iter()

@@ -20,8 +20,8 @@ use super::bounds::{
     MarginBatch, YBox,
 };
 use super::engine::{
-    domain_gates, BackwardEngine, DomainGates, Exc, Exceptions, LaneDir, RowDomainGateBlock,
-    Seed as DomainStackSeed,
+    domain_gates, domain_gates_acc, BackwardEngine, DomainGates, Exc, Exceptions, LaneDir,
+    RowDomainGateBlock, Seed as DomainStackSeed,
 };
 use super::net::TwinNet;
 use super::root::RootGates;
@@ -70,6 +70,8 @@ fn tiny_spec(rng: &mut StdRng, scale: f64) -> TwinSpec {
                 input: 6,
                 weight: w(5 * 36),
                 bias: w(5),
+                bias_err: Vec::new(),
+                weight_rel_err: 0.0,
                 shape: (5, 36),
             }, // t7 (y)
             TwinOpSpec::Relu { input: 7 },      // t8 (head relu)
@@ -77,6 +79,8 @@ fn tiny_spec(rng: &mut StdRng, scale: f64) -> TwinSpec {
                 input: 8,
                 weight: w(4 * 5),
                 bias: w(4),
+                bias_err: Vec::new(),
+                weight_rel_err: 0.0,
                 shape: (4, 5),
             }, // t9
         ],
@@ -238,6 +242,9 @@ fn root_precision_receipt_binds_real_dispatch_and_logical_store_sites() {
             super::RootPrecisionRuntimePolicy {
                 root_f32,
                 tableau_f32,
+                err_lane: super::ErrLane::PerCol,
+                ibp_seed: false,
+                box_source: super::RootBoxSource::Tableau,
             }
         );
         let evidence = root.root_precision_execution;
@@ -545,7 +552,7 @@ fn lane_verdicts_unsat_and_fail_closed() {
     let adv: Vec<usize> = (0..n_out).filter(|&o| o != t).collect();
     let root = RootGates::build(&net, &lo, &hi, RoundMode::Outward, None).expect("root");
     match MarginRowBab::run(&net, &root, t, &adv, BabConfig::default()) {
-        MarginRowOutcome::Unsat(stats) => {
+        MarginRowOutcome::Unsat(stats, _) => {
             assert_eq!(
                 stats.tree_classes.len() + stats.root_closed_classes,
                 adv.len()
@@ -558,9 +565,66 @@ fn lane_verdicts_unsat_and_fail_closed() {
     // MOAT: swap true/adv so the property is violated at the midpoint — the
     // lane must NOT return Unsat (margin t'-t is negative at mid).
     match MarginRowBab::run(&net, &root, worst, &[t], BabConfig::default()) {
-        MarginRowOutcome::Unsat(_) => panic!("MOAT VIOLATION: verified a falsified instance"),
+        MarginRowOutcome::Unsat(..) => panic!("MOAT VIOLATION: verified a falsified instance"),
         MarginRowOutcome::Unknown { .. } => {}
     }
+}
+
+/// #soundness-spine M2c MUTATION PIN: on a REAL lane tree (the first seeded
+/// fixture that closes through expansions), the cover gate authorizes the
+/// intact tree — so G2 does not false-trip on it either — and REFUSES the same
+/// deterministic run with one recorded leaf dropped. A fixture that closes at
+/// the root would make this vacuous, so the search fails loudly if no seed
+/// needs a tree.
+#[test]
+fn cover_gate_refuses_a_real_tree_missing_one_leaf() {
+    let cfg = || BabConfig {
+        frontier: 1,
+        frontier_contextual: 1,
+        lru_cap: 64,
+        max_expansions: 400,
+        ..BabConfig::default()
+    };
+    for seed in 0..64u64 {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let spec = tiny_spec(&mut rng, 0.35);
+        let Ok(net) = TwinNet::compile(&spec) else {
+            continue;
+        };
+        for width in [0.01, 0.02, 0.04] {
+            let lo = vec![0.01; 72];
+            let hi: Vec<f64> = lo.iter().map(|l| l + width).collect();
+            let (t, _worst, adv) = tiny_targets(&net, &lo, &hi);
+            let Ok(root) = RootGates::build(&net, &lo, &hi, RoundMode::Outward, None) else {
+                continue;
+            };
+            let MarginRowOutcome::Unsat(stats, token) =
+                MarginRowBab::run(&net, &root, t, &adv, cfg())
+            else {
+                continue;
+            };
+            if stats.expansions == 0 {
+                continue;
+            }
+            assert!(
+                token.publishable(),
+                "outer frame must speak for the instance"
+            );
+            assert_eq!(stats.ledger_ok, Some(true));
+            super::bab::inject_cover_fault_drop_next_leaf();
+            match MarginRowBab::run(&net, &root, t, &adv, cfg()) {
+                MarginRowOutcome::Unsat(..) => {
+                    panic!("MUTATION SURVIVED (seed {seed}): a tree missing a leaf was authorized")
+                }
+                MarginRowOutcome::Unknown { reason, stats } => {
+                    assert!(reason.contains("cover gate refused"), "{reason}");
+                    assert_eq!(stats.and_then(|s| s.ledger_ok), Some(false));
+                }
+            }
+            return;
+        }
+    }
+    panic!("no seeded fixture closed through a tree: the mutation pin is VOID");
 }
 
 #[test]
@@ -570,6 +634,8 @@ fn classwise_switch_and_schedule_are_bounded_and_fail_closed() {
     assert!(!super::margin_row_classwise_from_env(Some("invalid")));
     assert!(super::margin_row_classwise_from_env(Some("1")));
     assert!(super::margin_row_classwise_from_env(Some(" TRUE ")));
+    assert!(super::margin_row_classwise_from_env(Some(" YeS ")));
+    assert!(super::margin_row_classwise_from_env(Some("\tON\n")));
 
     // Non-contiguous class values catch an unsound `dj[class]` lookup. Class 7
     // closes; ties sort by class id. Strict zero remains scheduled.
@@ -583,6 +649,98 @@ fn classwise_switch_and_schedule_are_bounded_and_fail_closed() {
         assert!(classwise_schedule(1, &[2], &[nonfinite]).is_err());
     }
     assert!(classwise_schedule(1, &[2], &[]).is_err());
+}
+
+#[test]
+fn classwise_declaration_preserves_the_frozen_legacy_text_predicate() {
+    use ny_levers::{decls::margin_row::MARGIN_ROW_CLASSWISE, LeverSet, RawLeverInputs};
+    for (raw, expected) in [
+        (None, false),
+        (Some(""), false),
+        (Some("0"), false),
+        (Some("invalid"), false),
+        (Some("1x"), false),
+        (Some("1"), true),
+        (Some(" TRUE "), true),
+        (Some("YeS"), true),
+        (Some("\tON\n"), true),
+    ] {
+        let frozen = LeverSet::freeze_with(ny_levers::all(), |name| {
+            (name == MARGIN_ROW_CLASSWISE.name)
+                .then(|| raw.map(str::to_owned))
+                .flatten()
+        });
+        let value = frozen.resolved(&MARGIN_ROW_CLASSWISE).unwrap();
+        assert_eq!(
+            super::MarginRowRuntimePolicy::from_levers(&frozen)
+                .unwrap()
+                .classwise,
+            expected
+        );
+        assert_eq!(
+            super::margin_row_classwise_from_env(value.value.as_str()),
+            expected,
+            "{raw:?}"
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = RawLeverInputs::capture_with(ny_levers::all(), |name| {
+            (name == MARGIN_ROW_CLASSWISE.name)
+                .then(|| std::ffi::OsString::from_vec(vec![b'1', 255]))
+        });
+        let frozen = LeverSet::resolve(ny_levers::all(), &raw);
+        let value = frozen.resolved(&MARGIN_ROW_CLASSWISE).unwrap();
+        assert_eq!(value.env_utf8, Some(false));
+        assert!(!super::margin_row_classwise_from_env(value.value.as_str()));
+        assert!(
+            !super::MarginRowRuntimePolicy::from_levers(&frozen)
+                .unwrap()
+                .classwise
+        );
+    }
+}
+
+#[test]
+fn classwise_lane_dispatch_uses_the_receipt_snapshot_under_opposite_ambient_environment() {
+    let mut rng = StdRng::seed_from_u64(32);
+    let spec = tiny_spec(&mut rng, 0.35);
+    let net = TwinNet::compile(&spec).unwrap();
+    let lo = vec![0.01; 72];
+    let hi = vec![0.02; 72];
+    let (target, runner_up, _) = tiny_targets(&net, &lo, &hi);
+    let decl = &ny_levers::decls::margin_row::MARGIN_ROW_CLASSWISE;
+    for (frozen_value, ambient_value, requested) in [("0", " YeS ", false), (" YeS ", "0", true)] {
+        let levers = ny_levers::LeverSet::freeze_with(ny_levers::all(), |name| {
+            (name == decl.name).then(|| frozen_value.to_owned())
+        });
+        let policy = super::MarginRowRuntimePolicy::from_levers(&levers).unwrap();
+        assert_eq!(policy.classwise, requested);
+        ny_test_utils::env::with_env_edits(|env| {
+            env.set(decl.name, ambient_value);
+            let outcome = super::run_margin_row_lane_with_policy(
+                &spec,
+                &lo,
+                &hi,
+                runner_up,
+                &[target],
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(10)),
+                0,
+                policy,
+            );
+            let MarginRowOutcome::Unknown {
+                stats: Some(stats), ..
+            } = outcome
+            else {
+                panic!("unsafe zero-expansion fixture must remain open")
+            };
+            assert_eq!(
+                stats.frontier_execution.route.stable_token() == "classwise",
+                requested
+            );
+        });
+    }
 }
 
 #[test]
@@ -610,6 +768,7 @@ fn classwise_aggregation_requires_every_scheduled_certificate() {
         root_precision_execution: Default::default(),
         backward_interm_execution: Default::default(),
         root_alpha_execution: Default::default(),
+        close_integrity: Default::default(),
     };
     let record = |class, verified, expansions, domains_created, max_depth| {
         let mut frontier_execution = FrontierExecutionEvidence::classwise();
@@ -739,9 +898,9 @@ fn classwise_and_joint_both_certify_a_robust_box() {
     };
     assert!(matches!(
         MarginRowBab::run(&net, &root, t, &adv, cfg.clone()),
-        MarginRowOutcome::Unsat(_)
+        MarginRowOutcome::Unsat(..)
     ));
-    let MarginRowOutcome::Unsat(stats) = MarginRowBab::run_classwise(&net, &root, t, &adv, cfg)
+    let MarginRowOutcome::Unsat(stats, _) = MarginRowBab::run_classwise(&net, &root, t, &adv, cfg)
     else {
         panic!("classwise should certify the same robust box")
     };
@@ -1307,6 +1466,8 @@ fn single_conv_spec(rng: &mut StdRng, conv: TwinOpSpec) -> TwinSpec {
                 input: 3,
                 weight: w(3 * n_out_t),
                 bias: w(3),
+                bias_err: Vec::new(),
+                weight_rel_err: 0.0,
                 shape: (3, n_out_t),
             }, // t4 (y)
             TwinOpSpec::Relu { input: 4 },    // t5 (head relu)
@@ -1314,6 +1475,8 @@ fn single_conv_spec(rng: &mut StdRng, conv: TwinOpSpec) -> TwinSpec {
                 input: 5,
                 weight: w(2 * 3),
                 bias: w(2),
+                bias_err: Vec::new(),
+                weight_rel_err: 0.0,
                 shape: (2, 3),
             }, // t6
         ],
@@ -1712,7 +1875,9 @@ fn tiny_targets(net: &TwinNet, lo: &[f64], hi: &[f64]) -> (usize, usize, Vec<usi
 
 fn verdict_bits(o: &MarginRowOutcome) -> (bool, u64, usize, String) {
     match o {
-        MarginRowOutcome::Unsat(s) => (true, s.root_bound.to_bits(), s.expansions, s.stop.clone()),
+        MarginRowOutcome::Unsat(s, _) => {
+            (true, s.root_bound.to_bits(), s.expansions, s.stop.clone())
+        }
         MarginRowOutcome::Unknown { stats, reason } => {
             stats.as_ref().map_or((false, 0, 0, reason.clone()), |s| {
                 (false, s.root_bound.to_bits(), s.expansions, s.stop.clone())
@@ -1723,7 +1888,7 @@ fn verdict_bits(o: &MarginRowOutcome) -> (bool, u64, usize, String) {
 
 fn outcome_stats(out: &MarginRowOutcome) -> &BabStats {
     match out {
-        MarginRowOutcome::Unsat(stats) => stats,
+        MarginRowOutcome::Unsat(stats, _) => stats,
         MarginRowOutcome::Unknown { stats, .. } => stats.as_ref().expect("tree stats"),
     }
 }
@@ -2054,7 +2219,7 @@ fn parallel_frontier_matches_serial_and_moat_holds() {
     let adv_f: Vec<usize> = (0..4).filter(|&o| o != worst).collect();
     let moat = MarginRowBab::run(&net, &root, worst, &adv_f, moat_cfg);
     assert!(
-        !matches!(moat, MarginRowOutcome::Unsat(_)),
+        !matches!(moat, MarginRowOutcome::Unsat(..)),
         "MOAT VIOLATION: parallel lane certified a falsified instance UNSAT"
     );
     let moat_evidence = outcome_stats(&moat).frontier_execution;
@@ -2143,6 +2308,963 @@ fn domain_stacked_candidate_scores_match_independent_frontier_bit_exact() {
     assert_eq!(a.mono_raw_dips, b.mono_raw_dips);
     assert_eq!(a.mono_worst.to_bits(), b.mono_worst.to_bits());
     assert_eq!(a.ledger_ok, b.ledger_ok);
+}
+
+// ===================== #mr-stack (throughput plan B5) =====================
+// The domain-stacked frontier now runs a batch's MAIN eval passes as ONE
+// stacked pass (`bab/stack_eval.rs`). These tests pin that each domain's block
+// is bit-identical to its own pass — at the engine, at a finished domain
+// evaluation, and over a whole tree.
+
+/// The class with the LOWEST score at the box midpoint: with it as the target,
+/// every margin `f_target - f_j` is negative at a point of the root box, so no
+/// class can close at the root (the certified bound never exceeds a realised
+/// value) and the root eval width is exactly the adversarial count.
+fn tiny_argmin_target(net: &TwinNet, lo: &[f64], hi: &[f64]) -> usize {
+    let n_in = lo.len();
+    let mid = Array2::from_shape_fn((n_in, 1), |(i, _)| f64::midpoint(lo[i], hi[i]));
+    let (y, _) = net
+        .forward_points(&mid, &std::collections::BTreeMap::new())
+        .expect("forward");
+    let (w2, b2, (n_out, n_y)) = net.gemm2();
+    let scores: Vec<f64> = (0..n_out)
+        .map(|o| {
+            let mut sm = b2[o];
+            for k in 0..n_y {
+                sm += w2[o * n_y + k] * y[[k, 0]].max(0.0);
+            }
+            sm
+        })
+        .collect();
+    (0..n_out)
+        .min_by(|&a, &b| scores[a].total_cmp(&scores[b]))
+        .unwrap()
+}
+
+/// Bit-compare two engine passes (coefficients, error lane, bias, bias error,
+/// the `unst_abs` mass and the `unst_rows` capture).
+fn assert_pass_bits(tag: &str, a: &super::engine::PassOut, b: &super::engine::PassOut) {
+    assert_eq!(a.a.dim(), b.a.dim(), "{tag}: coefficient shape");
+    for ((i, j), x) in a.a.indexed_iter() {
+        assert_eq!(
+            x.to_bits(),
+            b.a[[i, j]].to_bits(),
+            "{tag}: coefficient moved at ({i}, {j})"
+        );
+    }
+    match (&a.e, &b.e) {
+        (Some(ea), Some(eb)) => {
+            assert_eq!(ea.dim(), eb.dim(), "{tag}: error-lane shape");
+            for ((i, j), x) in ea.indexed_iter() {
+                assert_eq!(
+                    x.to_bits(),
+                    eb[[i, j]].to_bits(),
+                    "{tag}: error coefficient moved at ({i}, {j})"
+                );
+            }
+        }
+        (None, None) => {}
+        _ => panic!("{tag}: error-lane presence differs"),
+    }
+    let bits = |v: &[f64]| -> Vec<u64> { v.iter().map(|x| x.to_bits()).collect() };
+    assert_eq!(bits(&a.b), bits(&b.b), "{tag}: bias moved");
+    assert_eq!(bits(&a.eb), bits(&b.eb), "{tag}: bias error moved");
+    let coll_bits = |c: &Option<std::collections::BTreeMap<usize, Vec<f64>>>| {
+        c.as_ref().map(|m| {
+            m.iter()
+                .map(|(&li, v)| (li, bits(v)))
+                .collect::<Vec<(usize, Vec<u64>)>>()
+        })
+    };
+    assert_eq!(
+        coll_bits(&a.coll),
+        coll_bits(&b.coll),
+        "{tag}: unst_abs branching mass moved"
+    );
+    let rows_bits = |c: &Option<std::collections::BTreeMap<usize, Array2<f64>>>| {
+        c.as_ref().map(|m| {
+            m.iter()
+                .map(|(&li, mat)| (li, mat.dim(), mat.iter().map(|x| x.to_bits()).collect()))
+                .collect::<Vec<(usize, (usize, usize), Vec<u64>)>>()
+        })
+    };
+    assert_eq!(
+        rows_bits(&a.unst_rows),
+        rows_bits(&b.unst_rows),
+        "{tag}: unst_rows capture moved"
+    );
+    assert_eq!(
+        rows_bits(&a.coll_rows),
+        rows_bits(&b.coll_rows),
+        "{tag}: Tier-0 capture moved"
+    );
+}
+
+/// #mr-stack ENGINE ORACLE: `run_domain_stacked_split` hands every block back
+/// the exact pass its domain runs alone with the same collection spec —
+/// coefficients, certified error lane, bias, bias error, the PER-BLOCK
+/// `unst_abs` branching mass (the one cross-column reduction a pass has) and
+/// the `unst_rows` gradient capture — across blocks of width 1 and 3, split
+/// and unsplit gates, and a block carrying a shared β term; and without
+/// `unst_abs` the blocks carry no `coll`, exactly like their own passes.
+#[test]
+fn domain_stacked_split_matches_independent_collect_passes() {
+    let mut rng = StdRng::seed_from_u64(0x00b5_5711);
+    let spec = tiny_spec(&mut rng, 0.45);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let lo = vec![-0.25; 72];
+    let hi = vec![0.30; 72];
+    let root = RootGates::build(&net, &lo, &hi, RoundMode::Outward, None).expect("root");
+    let eng = BackwardEngine::new(&net, &root);
+    let unstable: Vec<(usize, usize, usize)> = root
+        .layers
+        .iter()
+        .enumerate()
+        .filter_map(|(li, rec)| rec.unst.first().map(|&idx| (li, 0, idx)))
+        .collect();
+    assert!(
+        unstable.len() >= 2,
+        "fixture needs two unstable trunk layers"
+    );
+    let (li0, pos0, idx0) = unstable[0];
+    let (li1, pos1, _) = unstable[1];
+    let mut domains = [
+        domain_gates(&root, &[]),
+        domain_gates(&root, &[(li0, pos0, 1)]),
+        domain_gates(&root, &[(li0, pos0, -1), (li1, pos1, 1)]),
+        domain_gates(&root, &[(li1, pos1, -1)]),
+    ];
+    domains[2].beta.insert(
+        li0,
+        vec![super::engine::BetaSplit {
+            neuron: idx0,
+            sign: -1,
+            beta: 0.4,
+        }],
+    );
+    let widths = [1usize, 3, 3, 1];
+    let seed_for = |d: usize, width: usize| DomainStackSeed {
+        s: Array2::from_shape_fn((net.n_y, width), |(j, r)| {
+            let k = 1 + d * 97 + j * 17 + r * 7;
+            ((k as f64) * 0.173).sin() * (1.0 + d as f64 * 0.125)
+        }),
+        e: Some(Array2::from_shape_fn((net.n_y, width), |(j, r)| {
+            (1 + d + j + 3 * r) as f64 * 1e-16
+        })),
+    };
+    let seeds: Vec<DomainStackSeed> = widths
+        .iter()
+        .enumerate()
+        .map(|(d, &w)| seed_for(d, w))
+        .collect();
+    let total: usize = widths.iter().sum();
+    let mut stacked_s = Array2::<f64>::zeros((net.n_y, total));
+    let mut stacked_e = Array2::<f64>::zeros((net.n_y, total));
+    let mut offset = 0usize;
+    for (seed, &w) in seeds.iter().zip(&widths) {
+        stacked_s
+            .slice_mut(ndarray::s![.., offset..offset + w])
+            .assign(&seed.s);
+        stacked_e
+            .slice_mut(ndarray::s![.., offset..offset + w])
+            .assign(seed.e.as_ref().expect("outward seed"));
+        offset += w;
+    }
+    let stacked_seed = DomainStackSeed {
+        s: stacked_s,
+        e: Some(stacked_e),
+    };
+    let no_exc = Exceptions::default();
+    let mut offset = 0usize;
+    let blocks: Vec<RowDomainGateBlock<'_>> = domains
+        .iter()
+        .zip(&widths)
+        .map(|(gates, &w)| {
+            let start = offset;
+            offset += w;
+            RowDomainGateBlock {
+                columns: start..offset,
+                gates,
+                exceptions: &no_exc,
+            }
+        })
+        .collect();
+    for unst_rows in [false, true] {
+        let collect = super::engine::Collect {
+            unst_abs: true,
+            rows: None,
+            unst_rows,
+        };
+        let split = eng
+            .run_domain_stacked_split(&stacked_seed, &blocks, LaneDir::Lower, collect)
+            .expect("stacked split");
+        assert_eq!(split.len(), domains.len(), "one pass per block");
+        for (d, block_pass) in split.iter().enumerate() {
+            let own = eng
+                .run_collect(&seeds[d], Some(&domains[d]), LaneDir::Lower, None, collect)
+                .expect("own pass");
+            let tag = format!("unst_rows={unst_rows} domain={d} width={}", widths[d]);
+            assert!(
+                block_pass.coll.as_ref().is_some_and(|m| !m.is_empty()),
+                "{tag}: the per-block unst_abs mass must be populated (VOID otherwise)"
+            );
+            assert_eq!(
+                block_pass.unst_rows.is_some(),
+                unst_rows,
+                "{tag}: capture presence"
+            );
+            assert_pass_bits(&tag, block_pass, &own);
+            let lo_stk = eng.concretize_lower(block_pass);
+            let lo_own = eng.concretize_lower(&own);
+            assert_eq!(
+                lo_stk.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                lo_own.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "{tag}: concretized bound moved"
+            );
+        }
+    }
+    let plain = eng
+        .run_domain_stacked_split(
+            &stacked_seed,
+            &blocks,
+            LaneDir::Lower,
+            super::engine::Collect::default(),
+        )
+        .expect("plain split");
+    for (d, block_pass) in plain.iter().enumerate() {
+        let own = eng
+            .run_collect(
+                &seeds[d],
+                Some(&domains[d]),
+                LaneDir::Lower,
+                None,
+                super::engine::Collect::default(),
+            )
+            .expect("own plain pass");
+        assert!(block_pass.coll.is_none(), "no unst_abs requested, no coll");
+        assert_pass_bits(&format!("plain domain={d}"), block_pass, &own);
+    }
+}
+
+/// #mr-stack (B5) DOMAIN-EVAL DIFFERENTIAL — the load-bearing claim: a
+/// domain evaluated through its block of ONE stacked main pass is
+/// bit-identical to the same domain evaluated through its own pass, both at
+/// the pass (coefficients, error lane, bias, bias error, captures) and at the
+/// FINISHED evaluation (bound, per-column state, retirement, β / alpha state,
+/// node gates). Covers K in {2, 5, 8} stacked domains at mixed depths, nf in
+/// {1, 3}, β-carrying and β-free blocks in one stack, the domain-alpha arm
+/// on and off, capturing and non-capturing blocks in ONE stack (the fixture
+/// disarms the ascents on every third slot, so the stacked pass's per-block
+/// `unst_rows` DROP runs and is compared), and one more domain whose gates
+/// carry `beta_pc`, which must fall back to its own pass and still agree.
+#[test]
+fn stacked_main_eval_bit_identical_to_per_domain() {
+    let mut rng = StdRng::seed_from_u64(0x5c0e_cafe);
+    let spec = tiny_spec(&mut rng, 0.48);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let lo = vec![-0.25; 72];
+    let hi = vec![0.25; 72];
+    let (argmax, _, _) = tiny_targets(&net, &lo, &hi);
+    let target = tiny_argmin_target(&net, &lo, &hi);
+    let root = RootGates::build(&net, &lo, &hi, RoundMode::Outward, None).expect("root");
+    let adv_one = vec![argmax];
+    let adv_three: Vec<usize> = (0..4).filter(|&o| o != target).collect();
+    assert_ne!(argmax, target, "fixture needs distinct argmax / argmin");
+    for (adv, nf) in [(&adv_one, 1usize), (&adv_three, 3usize)] {
+        for (case, k) in [2usize, 5, 8].into_iter().enumerate() {
+            let alpha = case % 2 == 1;
+            let cfg = BabConfig {
+                lru_cap: 64,
+                frontier: 8,
+                domain_stack: true,
+                col_retire: true,
+                domain_alpha_policy: super::DomainAlphaRuntimePolicy {
+                    enabled: alpha,
+                    ..super::DomainAlphaRuntimePolicy::default()
+                },
+                ..BabConfig::default()
+            };
+            let diff = MarginRowBab::stacked_main_eval_differential(
+                &net, &root, target, adv, k, cfg, true, true,
+            );
+            let tag = format!("nf={nf} K={k} alpha={alpha}");
+            assert!(
+                diff.mismatches.is_empty(),
+                "{tag}: the stacked main eval moved bits:\n{}",
+                diff.mismatches.join("\n")
+            );
+            assert_eq!(
+                diff.compared,
+                k + 1,
+                "{tag}: fixture did not seed K+1 domains (depths {:?})",
+                diff.depths
+            );
+            assert_eq!(diff.widths[0], nf, "{tag}: root eval width");
+            let mut depths = diff.depths.clone();
+            depths.sort_unstable();
+            depths.dedup();
+            assert!(
+                depths.len() >= 2,
+                "{tag}: depths not mixed {:?}",
+                diff.depths
+            );
+            assert!(diff.beta_blocks >= 1, "{tag}: no β-carrying block");
+            if alpha {
+                // The mixed stack is the only thing that runs the per-block
+                // `unst_rows` DROP; without it that branch is untested (VOID).
+                assert!(
+                    diff.capture_blocks > 0 && diff.capture_blocks < k,
+                    "{tag}: capturing and non-capturing blocks must mix in one stack: \
+                     {} of {k} stacked domains capture",
+                    diff.capture_blocks
+                );
+            }
+            assert_eq!(diff.beta_pc_index, Some(k), "{tag}: beta_pc domain");
+            let r = diff.report;
+            assert_eq!(r.passes, 1, "{tag}: exactly one stacked pass: {r:?}");
+            assert_eq!(r.blocks, k as u64, "{tag}: {r:?}");
+            assert_eq!(r.k_max, k as u64, "{tag}: {r:?}");
+            assert_eq!(
+                r.cols,
+                diff.widths[..k].iter().sum::<usize>() as u64,
+                "{tag}: stacked width is the sum of the stacked domains' widths: {r:?}"
+            );
+            assert_eq!(
+                r.fallback_beta_pc, 1,
+                "{tag}: beta_pc must fall back: {r:?}"
+            );
+            assert_eq!(
+                (r.fallback_err, r.fallback_seam, r.solo),
+                (0, 0, 0),
+                "{tag}: {r:?}"
+            );
+        }
+    }
+}
+
+/// #mr-stack (B5) WHOLE-TREE DIFFERENTIAL: same fixture, frontier width, pop
+/// order and budget; three schedules — fully independent (`domain_stack`
+/// off), score-stacked only (the pre-B5 schedule), and score + main-eval
+/// stacked (B5). The tree trajectory hash — every merged decision, every
+/// pushed child's bound, splits, y-box, β and retirement state, as exact bits
+/// — must agree across all three, with the stacked main eval PROVABLY engaged
+/// (a null from a schedule that never stacked would be VOID, not a pass).
+/// Run with the domain-alpha arm off and on.
+#[test]
+fn expand_batch_trajectory_hash_unchanged() {
+    // First fixture (seed, half-width) whose B5 run actually stacks a main
+    // pass; fail closed if none does.
+    let fixtures = [
+        (0x5c0e_cafe_u64, 0.25f64),
+        (0x00b5_7a1e, 0.30),
+        (0x00b5_0bad, 0.40),
+    ];
+    let mut engaged_fixtures = 0usize;
+    for (seed, half) in fixtures {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let spec = tiny_spec(&mut rng, 0.48);
+        let net = TwinNet::compile(&spec).expect("compile");
+        let lo = vec![-half; 72];
+        let hi = vec![half; 72];
+        let target = tiny_argmin_target(&net, &lo, &hi);
+        let adv: Vec<usize> = (0..4).filter(|&o| o != target).collect();
+        let root = RootGates::build(&net, &lo, &hi, RoundMode::Outward, None).expect("root");
+        for alpha in [false, true] {
+            let cfg = |domain_stack: bool, main_eval: bool| BabConfig {
+                lru_cap: 64,
+                frontier: 8,
+                domain_stack,
+                domain_stack_main_eval: main_eval,
+                col_retire: true,
+                max_expansions: 60,
+                domain_alpha_policy: super::DomainAlphaRuntimePolicy {
+                    enabled: alpha,
+                    ..super::DomainAlphaRuntimePolicy::default()
+                },
+                ..BabConfig::default()
+            };
+            let mut arms = Vec::new();
+            for (name, stack, main) in [
+                ("independent", false, true),
+                ("score_stacked", true, false),
+                ("b5_stacked", true, true),
+            ] {
+                let _ = super::bab::take_last_trajectory();
+                let out = MarginRowBab::run(&net, &root, target, &adv, cfg(stack, main));
+                let (hash, steps, report) = super::bab::take_last_trajectory()
+                    .unwrap_or_else(|| panic!("{name}: the tree published no trajectory"));
+                arms.push((name, out, hash, steps, report));
+            }
+            let tag = format!("seed={seed:#x} half={half} alpha={alpha}");
+            let (_, ref_out, ref_hash, ref_steps, ref_report) = &arms[0];
+            assert!(*ref_steps > 0, "{tag}: empty trajectory");
+            assert_eq!(
+                (ref_report.batches, ref_report.passes, ref_report.blocks),
+                (0, 0, 0),
+                "{tag}: the independent schedule never enters the staged eval"
+            );
+            let ref_stats = outcome_stats(ref_out);
+            for (name, out, hash, steps, report) in &arms[1..] {
+                assert_eq!(
+                    verdict_bits(out),
+                    verdict_bits(ref_out),
+                    "{tag} {name}: verdict / root bound / expansions / stop moved"
+                );
+                assert_eq!(
+                    (*hash, *steps),
+                    (*ref_hash, *ref_steps),
+                    "{tag} {name}: TRAJECTORY HASH moved (a merged decision or a child's \
+                     bound/state bits differ)"
+                );
+                let stats = outcome_stats(out);
+                assert_eq!(
+                    stats.domains_created, ref_stats.domains_created,
+                    "{tag} {name}"
+                );
+                assert_eq!(stats.closed, ref_stats.closed, "{tag} {name}");
+                assert_eq!(stats.max_depth, ref_stats.max_depth, "{tag} {name}");
+                assert_eq!(stats.mono_raw_dips, ref_stats.mono_raw_dips, "{tag} {name}");
+                assert_eq!(
+                    stats.mono_worst.to_bits(),
+                    ref_stats.mono_worst.to_bits(),
+                    "{tag} {name}"
+                );
+                assert_eq!(
+                    stats.policy_execution, ref_stats.policy_execution,
+                    "{tag} {name}: execution evidence moved"
+                );
+                if *name == "score_stacked" {
+                    // The kill switch: every staged batch evaluated per domain.
+                    assert_eq!(report.passes, 0, "{tag}: kill switch leaked: {report:?}");
+                    assert_eq!(report.blocks, 0, "{tag}: kill switch leaked: {report:?}");
+                    assert!(
+                        report.batches == 0 || report.disabled > 0,
+                        "{tag}: {report:?}"
+                    );
+                }
+            }
+            let b5 = &arms[2].4;
+            assert_eq!(b5.disabled, 0, "{tag}: {b5:?}");
+            assert_eq!((b5.fallback_err, b5.fallback_seam), (0, 0), "{tag}: {b5:?}");
+            if b5.passes > 0 {
+                assert!(b5.blocks >= 2 * b5.passes, "{tag}: {b5:?}");
+                engaged_fixtures += 1;
+            }
+        }
+    }
+    assert!(
+        engaged_fixtures > 0,
+        "VOID: no fixture ever stacked a main pass — the differential proved nothing"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #mr-close-telemetry: the proof-integrity telemetry is PURE (a tree run with
+// and without it is bit-identical) and COMPLETE (it accounts for every leaf
+// the tree closed, every class the root closed, and never records a
+// certificate that is not strictly positive under outward rounding).
+// ---------------------------------------------------------------------------
+
+/// Every close that is a Kraft LEAF of the tree (root closes and retirements
+/// are proof ingredients but not tree leaves).
+const CLOSE_LEAF_KINDS: [super::close_integrity::CertKind; 8] = [
+    super::close_integrity::CertKind::Eval,
+    super::close_integrity::CertKind::Beta,
+    super::close_integrity::CertKind::DomainAlpha,
+    super::close_integrity::CertKind::Raw,
+    super::close_integrity::CertKind::Lift,
+    super::close_integrity::CertKind::Queued,
+    super::close_integrity::CertKind::Infeasible,
+    super::close_integrity::CertKind::HeadInfeasible,
+];
+
+fn close_leaf_count(ev: &super::close_integrity::CloseIntegrityEvidence) -> u64 {
+    CLOSE_LEAF_KINDS.iter().map(|&k| ev.kind(k).n).sum()
+}
+
+/// `(seed, weight scale, box lo, box hi, argmax target)`: the three trees the
+/// B5 differential uses (argmin target: a tree that can never verify), the
+/// Tier-2 epoch fixture's box (`epoch_nested_lane_closes_and_moat_holds`: "wide
+/// enough that the tree actually expands but still closable"), and
+/// argmax-target boxes of growing width, so some roots close outright, some
+/// trees close leaves, and some verify.
+const CLOSE_TELEMETRY_FIXTURES: [(u64, f64, f64, f64, bool); 10] = [
+    (0x5c0e_cafe, 0.48, -0.25, 0.25, false),
+    (0x00b5_7a1e, 0.48, -0.30, 0.30, false),
+    (0x00b5_0bad, 0.48, -0.40, 0.40, false),
+    (71, 0.5, -0.02, 0.06, true),
+    (29, 0.35, -0.04, 0.04, true),
+    (29, 0.35, -0.08, 0.08, true),
+    (30, 0.35, -0.06, 0.06, true),
+    (30, 0.35, -0.12, 0.12, true),
+    (32, 0.35, -0.05, 0.05, true),
+    (32, 0.35, -0.10, 0.10, true),
+];
+
+fn close_telemetry_fixture(
+    seed: u64,
+    scale: f64,
+    box_lo: f64,
+    box_hi: f64,
+    argmax: bool,
+) -> (TwinNet, RootGates, usize, Vec<usize>, usize) {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let spec = tiny_spec(&mut rng, scale);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let lo = vec![box_lo; 72];
+    let hi = vec![box_hi; 72];
+    let (best, runner_up, _) = tiny_targets(&net, &lo, &hi);
+    let target = if argmax {
+        best
+    } else {
+        tiny_argmin_target(&net, &lo, &hi)
+    };
+    let adv: Vec<usize> = (0..4).filter(|&o| o != target).collect();
+    let root = RootGates::build(&net, &lo, &hi, RoundMode::Outward, None).expect("root");
+    // `runner_up` is the MOAT swap partner for an argmax target: the margin
+    // `f_runner_up - f_best` is negative at the box midpoint.
+    (net, root, target, adv, runner_up)
+}
+
+/// `close_telemetry_trajectory_hash_unchanged`: the SAME tree run with the
+/// proof-integrity telemetry on and off (the test-only
+/// `BabConfig::close_telemetry_off`, which skips every recording site in the
+/// driver, its workers, its class trees and its nested epoch trees) must merge
+/// the same tree bit-for-bit: equal trajectory hash and merged-decision count
+/// on the parallel routes (per-domain and domain-stacked), equal verdict /
+/// root bound / expansions / stop, and equal statistics and execution evidence
+/// on every route (serial and classwise included). The OFF arm must record
+/// nothing (the switch really bites) and the ON arms must record tree leaves —
+/// a differential in which the telemetry never fired would be VOID.
+#[test]
+fn close_telemetry_trajectory_hash_unchanged() {
+    let mut compared_hashes = 0usize;
+    let mut recorded_leaves = 0u64;
+    for (seed, scale, box_lo, box_hi, argmax) in CLOSE_TELEMETRY_FIXTURES {
+        let (net, root, target, adv, _) =
+            close_telemetry_fixture(seed, scale, box_lo, box_hi, argmax);
+        for alpha in [false, true] {
+            for (route, frontier, stack, classwise) in [
+                ("parallel", 8usize, false, false),
+                ("stacked", 8, true, false),
+                ("serial", 1, false, false),
+                ("classwise", 1, false, true),
+            ] {
+                let cfg = |off: bool| BabConfig {
+                    lru_cap: 64,
+                    frontier,
+                    domain_stack: stack,
+                    col_retire: true,
+                    max_expansions: 60,
+                    domain_alpha_policy: super::DomainAlphaRuntimePolicy {
+                        enabled: alpha,
+                        ..super::DomainAlphaRuntimePolicy::default()
+                    },
+                    close_telemetry_off: off,
+                    ..BabConfig::default()
+                };
+                let run = |off: bool| {
+                    let _ = super::bab::take_last_trajectory();
+                    let out = if classwise {
+                        MarginRowBab::run_classwise(&net, &root, target, &adv, cfg(off))
+                    } else {
+                        MarginRowBab::run(&net, &root, target, &adv, cfg(off))
+                    };
+                    (out, super::bab::take_last_trajectory())
+                };
+                let (on, on_traj) = run(false);
+                let (off, off_traj) = run(true);
+                let tag = format!(
+                    "seed={seed:#x} box=[{box_lo},{box_hi}] argmax={argmax} alpha={alpha} {route}"
+                );
+                assert_eq!(
+                    verdict_bits(&on),
+                    verdict_bits(&off),
+                    "{tag}: verdict / root bound / expansions / stop moved"
+                );
+                assert_eq!(
+                    on_traj, off_traj,
+                    "{tag}: TRAJECTORY HASH moved (a merged decision or a child's bound/state \
+                     bits differ between telemetry on and off)"
+                );
+                if frontier > 1 {
+                    if let Some((_, steps, _)) = on_traj {
+                        if steps > 0 {
+                            compared_hashes += 1;
+                        }
+                    }
+                }
+                let stats_of = |o: &MarginRowOutcome| -> Option<BabStats> {
+                    match o {
+                        MarginRowOutcome::Unsat(s, _) => Some(s.clone()),
+                        MarginRowOutcome::Unknown { stats, .. } => stats.clone(),
+                    }
+                };
+                let (Some(s_on), Some(s_off)) = (stats_of(&on), stats_of(&off)) else {
+                    assert_eq!(
+                        stats_of(&on).is_some(),
+                        stats_of(&off).is_some(),
+                        "{tag}: one arm owns stats and the other does not"
+                    );
+                    continue;
+                };
+                assert_eq!(s_on.domains_created, s_off.domains_created, "{tag}");
+                assert_eq!(s_on.closed, s_off.closed, "{tag}");
+                assert_eq!(s_on.max_depth, s_off.max_depth, "{tag}");
+                assert_eq!(s_on.mono_raw_dips, s_off.mono_raw_dips, "{tag}");
+                assert_eq!(
+                    s_on.mono_worst.to_bits(),
+                    s_off.mono_worst.to_bits(),
+                    "{tag}"
+                );
+                assert_eq!(s_on.root_closed_classes, s_off.root_closed_classes, "{tag}");
+                assert_eq!(s_on.tree_classes, s_off.tree_classes, "{tag}");
+                assert_eq!(s_on.ledger_ok, s_off.ledger_ok, "{tag}");
+                assert_eq!(s_on.epochs_attempted, s_off.epochs_attempted, "{tag}");
+                assert_eq!(s_on.epochs_closed, s_off.epochs_closed, "{tag}");
+                assert_eq!(
+                    s_on.policy_execution, s_off.policy_execution,
+                    "{tag}: execution evidence moved"
+                );
+                assert_eq!(s_on.epoch_execution, s_off.epoch_execution, "{tag}");
+                assert_eq!(s_on.width_execution, s_off.width_execution, "{tag}");
+                let off_ev = &s_off.close_integrity;
+                assert_eq!(
+                    (
+                        off_ev.closes(),
+                        off_ev.epoch_closes,
+                        off_ev.frozen_dual_closes
+                    ),
+                    (0, 0, 0),
+                    "{tag}: the OFF arm recorded telemetry — the switch does not bite, so this \
+                     differential compares nothing"
+                );
+                recorded_leaves += close_leaf_count(&s_on.close_integrity);
+            }
+        }
+    }
+    assert!(
+        compared_hashes > 0,
+        "VOID: no parallel tree published a non-empty trajectory"
+    );
+    assert!(
+        recorded_leaves > 0,
+        "VOID: the ON arms never recorded a tree leaf — the differential proved nothing"
+    );
+}
+
+/// `close_telemetry_accounts_every_leaf_and_is_strictly_positive`: on every
+/// route (parallel, domain-stacked, serial, classwise), for every run that
+/// owns stats:
+///
+/// * the tree-leaf certificates number EXACTLY the tree's closed domains (no
+///   close site forgotten, none counted twice) whenever no epoch ran;
+/// * the root certificates number exactly the classes the root closed, and
+///   their minimum is bit-identical to the smallest closed `dj` of an
+///   independent `root_eval` of the same root;
+/// * no recorded certificate is non-positive, NaN, or below the kind's own
+///   closure rule (strict `> 0` under outward rounding) — a value that
+///   disagreed with its close decision would show here;
+/// * a verified run has a thinnest certificate, and it is strictly positive;
+///
+/// and the MOAT swap of every argmax fixture (a property violated at the box
+/// midpoint) still never verifies with the telemetry on. At least one run
+/// must record tree leaves and at least one must verify through the tree
+/// (fail closed: VOID otherwise).
+#[test]
+fn close_telemetry_accounts_every_leaf_and_is_strictly_positive() {
+    use super::close_integrity::{CertKind, ALL_KINDS};
+
+    let mut leaves_seen = 0u64;
+    let mut tree_verdicts = 0usize;
+    for (seed, scale, box_lo, box_hi, argmax) in CLOSE_TELEMETRY_FIXTURES {
+        let (net, root, target, adv, runner_up) =
+            close_telemetry_fixture(seed, scale, box_lo, box_hi, argmax);
+        let eng = BackwardEngine::new(&net, &root);
+        let re = super::bab::root_eval(&eng, &net, target, &adv).expect("root_eval");
+        let closed_dj: Vec<f64> = re
+            .dj
+            .iter()
+            .copied()
+            .filter(|&d| super::bab::closed(RoundMode::Outward, d))
+            .collect();
+        let expect_min_dj = closed_dj.iter().copied().fold(f64::INFINITY, f64::min);
+        for (route, frontier, stack, classwise) in [
+            ("parallel", 8usize, false, false),
+            ("stacked", 8, true, false),
+            ("serial", 1, false, false),
+            ("classwise", 1, false, true),
+        ] {
+            let cfg = BabConfig {
+                lru_cap: 64,
+                frontier,
+                domain_stack: stack,
+                col_retire: true,
+                max_expansions: 400,
+                ..BabConfig::default()
+            };
+            let out = if classwise {
+                MarginRowBab::run_classwise(&net, &root, target, &adv, cfg)
+            } else {
+                MarginRowBab::run(&net, &root, target, &adv, cfg)
+            };
+            let tag = format!("seed={seed:#x} box=[{box_lo},{box_hi}] argmax={argmax} {route}");
+            let (verified, stats) = match &out {
+                MarginRowOutcome::Unsat(s, _) => (true, s),
+                MarginRowOutcome::Unknown { stats: Some(s), .. } => (false, s),
+                MarginRowOutcome::Unknown { stats: None, .. } => continue,
+            };
+            let ev = &stats.close_integrity;
+            assert_eq!(
+                ev.nonpositive(),
+                0,
+                "{tag}: a non-positive certificate: {ev:?}"
+            );
+            for kind in ALL_KINDS {
+                if let Some(min) = ev.kind(kind).min_value() {
+                    assert!(
+                        super::bab::closed(RoundMode::Outward, min),
+                        "{tag}: kind {} recorded a certificate {min:e} its close rule rejects",
+                        kind.name()
+                    );
+                }
+            }
+            assert_eq!(
+                ev.frozen_dual_closes, 0,
+                "{tag}: frozen-dual tier is dark here"
+            );
+            assert_eq!(
+                ev.kind(CertKind::Root).n,
+                closed_dj.len() as u64,
+                "{tag}: root certificates vs classes the root closed"
+            );
+            assert_eq!(
+                ev.kind(CertKind::Root).n,
+                stats.root_closed_classes as u64,
+                "{tag}: root certificates vs BabStats::root_closed_classes"
+            );
+            assert_eq!(
+                ev.min_root_dj().map(f64::to_bits),
+                (!closed_dj.is_empty()).then_some(expect_min_dj.to_bits()),
+                "{tag}: smallest root dj differs from an independent root_eval"
+            );
+            if stats.epochs_attempted == 0 {
+                assert_eq!(
+                    close_leaf_count(ev),
+                    stats.closed as u64,
+                    "{tag}: tree-leaf certificates vs closed domains: {ev:?}"
+                );
+                assert_eq!(ev.kind(CertKind::EpochRoot).n, 0, "{tag}");
+                assert_eq!(ev.epoch_closes, 0, "{tag}");
+            }
+            if verified {
+                let min = ev.min_close().map(|(_, v)| v);
+                assert!(
+                    min.is_some_and(|v| v > 0.0),
+                    "{tag}: a verified run must carry a strictly positive thinnest certificate"
+                );
+                if stats.expansions > 0 {
+                    tree_verdicts += 1;
+                    assert!(
+                        close_leaf_count(ev) > 0,
+                        "{tag}: a tree verdict with no leaves"
+                    );
+                }
+            }
+            leaves_seen += close_leaf_count(ev);
+        }
+        if argmax {
+            // MOAT: violated at the box midpoint; the telemetry-carrying lane
+            // must still never verify it.
+            let cfg = BabConfig {
+                lru_cap: 64,
+                frontier: 8,
+                col_retire: true,
+                max_expansions: 200,
+                ..BabConfig::default()
+            };
+            assert!(
+                !matches!(
+                    MarginRowBab::run(&net, &root, runner_up, &[target], cfg),
+                    MarginRowOutcome::Unsat(..)
+                ),
+                "MOAT VIOLATION: seed={seed:#x} box=[{box_lo},{box_hi}] verified a falsified \
+                 instance"
+            );
+        }
+    }
+    assert!(leaves_seen > 0, "VOID: no run recorded a tree leaf");
+    assert!(
+        tree_verdicts > 0,
+        "VOID: no fixture verified through the tree, so the verified-run checks never ran"
+    );
+}
+
+/// `close_telemetry_is_pure_and_bounded_on_the_epoch_path`: the Tier-2 epoch
+/// route — nested `run_inner` subtrees whose CLOSED certificates are absorbed
+/// (`epoch_root` for their roots) and whose FAILED ones are not — on the
+/// fixture of `epoch_nested_lane_closes_and_moat_holds`. With the telemetry on
+/// and off the verdict, statistics and all execution evidence are identical;
+/// the recorded certificates are strictly positive; and the absorb is bounded
+/// by the tree's own counters: `leaves + epoch_closes <= closed` and
+/// `epoch_closes <= epochs_closed`, with EQUALITY of the first whenever no
+/// epoch attempt failed (a failed subtree's closes are counted in `closed`
+/// but are not proof and are never absorbed). VOID unless epochs ran.
+#[test]
+fn close_telemetry_is_pure_and_bounded_on_the_epoch_path() {
+    use super::close_integrity::CertKind;
+
+    let mut rng = StdRng::seed_from_u64(71);
+    let spec = tiny_spec(&mut rng, 0.5);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let lo = vec![-0.02; 72];
+    let hi = vec![0.06; 72];
+    let (t, _, adv) = tiny_targets(&net, &lo, &hi);
+    let retain = super::root::RetainCfg::default();
+    let (root, _) =
+        RootGates::build_retaining(&net, &lo, &hi, RoundMode::Outward, None, Some(&retain), &[])
+            .expect("root");
+    let mk_cfg = |off: bool| BabConfig {
+        k_head: 0,
+        epoch_policy: super::EpochRuntimePolicy {
+            depth: 1,
+            max_attempts: 8,
+            ..super::EpochRuntimePolicy::default()
+        },
+        epoch_trigger_depth: 1,
+        epoch_attempt_cap: 8,
+        retain_cfg: Some(retain),
+        close_telemetry_off: off,
+        ..BabConfig::default()
+    };
+    let on = MarginRowBab::run(&net, &root, t, &adv, mk_cfg(false));
+    let off = MarginRowBab::run(&net, &root, t, &adv, mk_cfg(true));
+    assert_eq!(
+        verdict_bits(&on),
+        verdict_bits(&off),
+        "epoch route: verdict / root bound / expansions / stop moved"
+    );
+    let (s_on, s_off) = (outcome_stats(&on), outcome_stats(&off));
+    assert_eq!(s_on.closed, s_off.closed);
+    assert_eq!(s_on.domains_created, s_off.domains_created);
+    assert_eq!(s_on.max_depth, s_off.max_depth);
+    assert_eq!(s_on.epochs_attempted, s_off.epochs_attempted);
+    assert_eq!(s_on.epochs_closed, s_off.epochs_closed);
+    assert_eq!(s_on.ledger_ok, s_off.ledger_ok);
+    assert_eq!(s_on.mono_worst.to_bits(), s_off.mono_worst.to_bits());
+    assert_eq!(s_on.policy_execution, s_off.policy_execution);
+    assert_eq!(s_on.epoch_execution, s_off.epoch_execution);
+    assert_eq!(s_on.width_execution, s_off.width_execution);
+    assert!(
+        s_on.epochs_attempted > 0,
+        "VOID: no Tier-2 epoch was attempted, so the nested absorb never ran"
+    );
+    let off_ev = &s_off.close_integrity;
+    assert_eq!((off_ev.closes(), off_ev.epoch_closes), (0, 0));
+    let ev = &s_on.close_integrity;
+    assert_eq!(ev.nonpositive(), 0, "a non-positive certificate: {ev:?}");
+    let leaves = close_leaf_count(ev);
+    let closed = s_on.closed as u64;
+    assert!(
+        leaves + ev.epoch_closes <= closed,
+        "absorbed more closes than the tree closed: leaves {leaves} + epochs {} > {closed}",
+        ev.epoch_closes
+    );
+    assert!(ev.epoch_closes <= s_on.epochs_closed as u64);
+    if s_on.epochs_attempted == s_on.epochs_closed {
+        assert_eq!(
+            leaves + ev.epoch_closes,
+            closed,
+            "no epoch failed, so every close must be accounted: {ev:?}"
+        );
+    }
+    if ev.epoch_closes == 0 {
+        assert_eq!(ev.kind(CertKind::EpochRoot).n, 0);
+    }
+    eprintln!(
+        "[test mr-close] epoch path: closed={closed} leaves={leaves} epoch_closes={} \
+         epoch_root={} epochs {}/{}",
+        ev.epoch_closes,
+        ev.kind(CertKind::EpochRoot).n,
+        s_on.epochs_closed,
+        s_on.epochs_attempted
+    );
+}
+
+/// `clip_crossing_variant_agrees_and_prices_every_crossing`: the
+/// `_crossing` variant returns EXACTLY the tightening and crossed count of
+/// `tighten_intermediate_acc` (the verify decision is untouched), and its
+/// slack is strictly positive exactly when a neuron crossed.
+#[test]
+fn clip_crossing_variant_agrees_and_prices_every_crossing() {
+    ny_test_utils::env::with_env_edits(|env| {
+        let Some((_net, root)) = clip_chain_fixture(env, "20") else {
+            panic!("fixture retained no clip rows — the assertion would be vacuous");
+        };
+        let l0 = &root.layers[0];
+        let n = l0.unst.len();
+        let mut chains: Vec<Vec<(usize, usize, i8)>> = Vec::new();
+        for pos in 0..n.min(6) {
+            for dir in [-1i8, 1] {
+                chains.push(vec![(0, pos, dir)]);
+                chains.push(vec![(0, pos, dir), (0, (pos + 1) % n, -dir)]);
+            }
+        }
+        let mut crossed_seen = 0usize;
+        let mut tightened_seen = 0usize;
+        for chain in &chains {
+            let hs = super::clip::halfspaces_for_splits(&root, chain);
+            for (li, layer) in root.layers.iter().enumerate() {
+                let (a, ca) = super::clip::tighten_intermediate_acc(
+                    layer,
+                    li,
+                    &hs,
+                    root.mid.as_slice(),
+                    root.rad.as_slice(),
+                    20,
+                    None,
+                );
+                let (b, cb, slack) = super::clip::tighten_intermediate_acc_crossing(
+                    layer,
+                    li,
+                    &hs,
+                    root.mid.as_slice(),
+                    root.rad.as_slice(),
+                    20,
+                    None,
+                );
+                assert_eq!(ca, cb, "crossed count moved");
+                assert_eq!(a.len(), b.len(), "tightening moved");
+                for (x, y) in a.iter().zip(&b) {
+                    assert_eq!((x.pos, x.idx), (y.pos, y.idx));
+                    assert_eq!(x.l.to_bits(), y.l.to_bits());
+                    assert_eq!(x.u.to_bits(), y.u.to_bits());
+                }
+                tightened_seen += b.len();
+                if cb > 0 {
+                    crossed_seen += 1;
+                    assert!(
+                        slack > 0.0,
+                        "a crossing must price a positive slack: {slack:e}"
+                    );
+                } else {
+                    assert!(
+                        slack.is_infinite() && slack.is_sign_negative(),
+                        "no crossing, no slack: {slack:e}"
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "[test mr-close] clip crossing chains={} tightened={tightened_seen} \
+             layers_with_crossings={crossed_seen}",
+            chains.len()
+        );
+        assert!(
+            tightened_seen + crossed_seen > 0,
+            "VOID: no chain tightened or crossed anything — the agreement compared nothing"
+        );
+    });
 }
 
 #[test]
@@ -2418,6 +3540,7 @@ fn dd_forward_scores(spec: &TwinSpec, x: &[f64]) -> Vec<f64> {
                 weight,
                 bias,
                 shape,
+                ..
             } => {
                 let src = tensors[*input].as_ref().expect("topo");
                 let (no, ni) = *shape;
@@ -2560,6 +3683,8 @@ fn adversarial_spec(cfg: &AdvCfg) -> TwinSpec {
         input: flat_out,
         weight: vec![cfg.gemm1_wscale; cfg.n_y * n_h],
         bias: vec![cfg.gemm1_bias; cfg.n_y],
+        bias_err: Vec::new(),
+        weight_rel_err: 0.0,
         shape: (cfg.n_y, n_h),
     });
     let gemm1_out = flat_out + 1;
@@ -2587,6 +3712,8 @@ fn adversarial_spec(cfg: &AdvCfg) -> TwinSpec {
         input: head_relu_out,
         weight: w2,
         bias: b2,
+        bias_err: Vec::new(),
+        weight_rel_err: 0.0,
         shape: (cfg.n_out, cfg.n_y),
     });
     TwinSpec { n_in, ops }
@@ -3031,6 +4158,7 @@ fn dd_forward_all(spec: &TwinSpec, x: &[f64]) -> Vec<Vec<Dd>> {
                 weight,
                 bias,
                 shape,
+                ..
             } => {
                 let src = &t[*input];
                 let (no, ni) = *shape;
@@ -3153,6 +4281,8 @@ fn tableau_spec(cfg: &TabCfg) -> TwinSpec {
         input: flat_out,
         weight: wgen(&mut rng, sc, s, cfg.n_y, cw),
         bias: bgen(&mut rng, bs, cfg.n_y),
+        bias_err: Vec::new(),
+        weight_rel_err: 0.0,
         shape: (cfg.n_y, cw),
     });
     let g1_out = flat_out + 1;
@@ -3162,6 +4292,8 @@ fn tableau_spec(cfg: &TabCfg) -> TwinSpec {
         input: hr_out,
         weight: wgen(&mut rng, sc, s, cfg.n_out, cfg.n_y),
         bias: bgen(&mut rng, bs, cfg.n_out),
+        bias_err: Vec::new(),
+        weight_rel_err: 0.0,
         shape: (cfg.n_out, cfg.n_y),
     });
     TwinSpec { n_in: cin, ops }
@@ -3756,6 +4888,8 @@ fn no_conv_chain_spec(n_in: usize, depth: usize, n_y: usize, n_out: usize, seed:
         input: flat_id,
         weight: wgen(&mut rng, WScheme::RandSigned, 0.7, n_y, n_in),
         bias: bgen(&mut rng, 0.5, n_y),
+        bias_err: Vec::new(),
+        weight_rel_err: 0.0,
         shape: (n_y, n_in),
     });
     let g1_id = ops.len();
@@ -3765,6 +4899,8 @@ fn no_conv_chain_spec(n_in: usize, depth: usize, n_y: usize, n_out: usize, seed:
         input: hr_id,
         weight: wgen(&mut rng, WScheme::ZeroRowSum, 0.7, n_out, n_y),
         bias: bgen(&mut rng, 0.5, n_out),
+        bias_err: Vec::new(),
+        weight_rel_err: 0.0,
         shape: (n_out, n_y),
     });
     TwinSpec { n_in, ops }
@@ -3890,6 +5026,8 @@ fn conv_bn_spec(
             input: 5,
             weight: wgen(&mut rng, WScheme::RandSigned, 0.3, n_y, flat),
             bias: bgen(&mut rng, 0.3, n_y),
+            bias_err: Vec::new(),
+            weight_rel_err: 0.0,
             shape: (n_y, flat),
         },
         TwinOpSpec::Relu { input: 6 },
@@ -3897,6 +5035,8 @@ fn conv_bn_spec(
             input: 7,
             weight: wgen(&mut rng, WScheme::ZeroRowSum, 0.3, n_out, n_y),
             bias: bgen(&mut rng, 0.3, n_out),
+            bias_err: Vec::new(),
+            weight_rel_err: 0.0,
             shape: (n_out, n_y),
         },
     ];
@@ -3967,6 +5107,696 @@ fn oracle_conv_bn_extreme_scale_enclosure() {
     );
 }
 
+// ---- #fold-ball: the root box encloses the EXACT fold-ball hull ------------
+
+/// One-trunk-relu net whose trunk-0 pre-activation is `[affine](conv1x1(x))`:
+/// Conv(1x1, `rel`, `berr`) [-> ChannelAffine(`srel`, `serr`), scales of both
+/// signs] -> Relu -> Flatten -> Gemm -> Relu -> Gemm.
+fn fold_ball_spec(rel: f64, berr: f64, affine: Option<(f64, f64)>, seed: u64) -> TwinSpec {
+    let (cin, h, w, cw, n_y, n_out) = (3usize, 2usize, 2usize, 8usize, 16usize, 6usize);
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut ops = vec![TwinOpSpec::Conv {
+        input: 0,
+        weight: wgen(&mut rng, WScheme::RandSigned, 5.0, cw, cin),
+        bias: bgen(&mut rng, 5.0, cw),
+        bias_err: vec![berr; cw],
+        weight_rel_err: rel,
+        kernel: (cw, cin, 1, 1),
+        stride: (1, 1),
+        pads: (0, 0, 0, 0),
+        ishape: (cin, h, w),
+        oshape: (cw, h, w),
+    }];
+    if let Some((srel, serr)) = affine {
+        let scale: Vec<f64> = (0..cw)
+            .map(|c| {
+                let v: f64 = rng.random_range(0.5..3.0);
+                if c % 2 == 0 {
+                    v
+                } else {
+                    -v
+                }
+            })
+            .collect();
+        ops.push(TwinOpSpec::ChannelAffine {
+            input: 1,
+            scale,
+            shift: bgen(&mut rng, 2.0, cw),
+            scale_rel_err: srel,
+            shift_err: vec![serr; cw],
+            shape: (cw, h, w),
+        });
+    }
+    // Tensor id of the trunk-0 pre-activation (op `k` writes tensor `k + 1`).
+    let pre = ops.len();
+    let flat = cw * h * w;
+    ops.push(TwinOpSpec::Relu { input: pre });
+    ops.push(TwinOpSpec::Flatten { input: pre + 1 });
+    ops.push(TwinOpSpec::Gemm {
+        input: pre + 2,
+        weight: wgen(&mut rng, WScheme::RandSigned, 0.3, n_y, flat),
+        bias: bgen(&mut rng, 0.3, n_y),
+        bias_err: Vec::new(),
+        weight_rel_err: 0.0,
+        shape: (n_y, flat),
+    });
+    ops.push(TwinOpSpec::Relu { input: pre + 3 });
+    ops.push(TwinOpSpec::Gemm {
+        input: pre + 4,
+        weight: wgen(&mut rng, WScheme::ZeroRowSum, 0.3, n_out, n_y),
+        bias: bgen(&mut rng, 0.3, n_out),
+        bias_err: Vec::new(),
+        weight_rel_err: 0.0,
+        shape: (n_out, n_y),
+    });
+    TwinSpec {
+        n_in: cin * h * w,
+        ops,
+    }
+}
+
+/// EXACT hull `[min, max]` of every trunk-0 pre-activation of
+/// [`fold_ball_spec`] over the input box `[lo, hi]` and — when `ball` — over
+/// every member of the certified fold ball (`|W - W'| <= rel |W'|`,
+/// `|b - b'| <= berr`, `|s - s'| <= srel |s'|`, `|t - t'| <= serr`); with
+/// `ball = false` the stored network alone. The pre-activation is a sum of
+/// per-input-coordinate terms `w~ x` (plus the bias), each BILINEAR on its own
+/// rectangle, so the extremes are the per-term vertex extremes, summed; the
+/// affine `s~ v + t~` is bilinear on `[s-, s+] x [v-, v+]`, again a vertex.
+/// No sampling: this is the whole box and the whole ball.
+fn fold_ball_hull(
+    spec: &TwinSpec,
+    lo: &[f64],
+    hi: &[f64],
+    ball: bool,
+) -> Vec<(num_rational::BigRational, num_rational::BigRational)> {
+    use num_rational::BigRational as Q;
+    use num_traits::{Signed, Zero};
+    let q = |v: f64| Q::from_float(v).expect("finite");
+    let TwinOpSpec::Conv {
+        weight,
+        bias,
+        bias_err,
+        weight_rel_err,
+        kernel: (cw, cin, _, _),
+        ishape: (_, h, w),
+        ..
+    } = &spec.ops[0]
+    else {
+        panic!("fold_ball_spec starts with a conv");
+    };
+    let p = h * w;
+    let rel = if ball { q(*weight_rel_err) } else { Q::zero() };
+    let vertex_range = |a: &Q, b: &Q, c: &Q, d: &Q| -> (Q, Q) {
+        // extremes of s * v over s in [a, b], v in [c, d]
+        let cands = [a * c, a * d, b * c, b * d];
+        let mn = cands.iter().min().expect("four").clone();
+        let mx = cands.iter().max().expect("four").clone();
+        (mn, mx)
+    };
+    let mut conv = Vec::with_capacity(cw * p);
+    for oc in 0..*cw {
+        let be = if ball { q(bias_err[oc]) } else { Q::zero() };
+        for sp in 0..p {
+            let mut mn = q(bias[oc]) - &be;
+            let mut mx = q(bias[oc]) + &be;
+            for c in 0..*cin {
+                let wv = q(weight[oc * cin + c]);
+                let dw = &rel * wv.abs();
+                let i = c * p + sp;
+                let (tmn, tmx) = vertex_range(&(&wv - &dw), &(&wv + &dw), &q(lo[i]), &q(hi[i]));
+                mn += tmn;
+                mx += tmx;
+            }
+            conv.push((mn, mx));
+        }
+    }
+    match spec.ops.get(1) {
+        Some(TwinOpSpec::ChannelAffine {
+            scale,
+            shift,
+            scale_rel_err,
+            shift_err,
+            ..
+        }) => conv
+            .iter()
+            .enumerate()
+            .map(|(j, (vmn, vmx))| {
+                let ch = j / p;
+                let s = q(scale[ch]);
+                let ds = if ball {
+                    q(*scale_rel_err) * s.abs()
+                } else {
+                    Q::zero()
+                };
+                let e = if ball { q(shift_err[ch]) } else { Q::zero() };
+                let (amn, amx) = vertex_range(&(&s - &ds), &(&s + &ds), vmn, vmx);
+                (amn + q(shift[ch]) - &e, amx + q(shift[ch]) + e)
+            })
+            .collect(),
+        _ => conv,
+    }
+}
+
+/// #fold-ball regression (the `#frozen-dual-state` exact-rational containment
+/// gate failed on it, 2026-09-27): the root tableau's trunk-0 box must enclose
+/// the pre-activation of EVERY member of the certified fold ball over the
+/// WHOLE input box, computed exactly by [`fold_ball_hull`].
+///
+/// The historical charge put the relative weight/scale error into the
+/// COEFFICIENT columns of the sandwich D lane, which moves the lower wall UP
+/// at negative inputs (`root.rs` #fold-ball block). On these fixtures (12-dim
+/// box straddling 0, one trunk relu, concretize headroom
+/// `gamma_36 ~ 4.0e-15`) the pre-fix root missed the hull on 156 of 160
+/// neurons by up to 4.3e-11 — including config 0, whose `bias_err = 0` makes
+/// the STORED network itself escape — and the fixed root on none
+/// (Fraction replicas in the fix report, two independent ones agreeing).
+///
+/// Non-vacuity: the ball must be LOAD-BEARING (on some neuron its excess over
+/// the stored hull exceeds the box's headroom over the ball, so a box that
+/// ignored the fold charge would fail); the HISTORICAL coefficient-column
+/// charge, forced by the test-only switch
+/// (`root::with_legacy_fold_charge_for_test`), must miss the hull on EVERY
+/// config (the code-mutation pin); and the checker must reject a box edge one
+/// ulp inside the exact hull.
+#[test]
+fn root_box_encloses_the_exact_fold_ball_hull() {
+    use num_rational::BigRational as Q;
+    use num_traits::ToPrimitive;
+    let q = |v: f64| Q::from_float(v).expect("finite");
+    // THE containment predicate (used for the real check AND the mutation).
+    let contains = |l: &Q, u: &Q, mn: &Q, mx: &Q| l <= mn && u >= mx;
+    let configs: &[(f64, f64, Option<(f64, f64)>)] = &[
+        (1e-13, 0.0, None),
+        (1e-13, 1e-6, None),
+        (1e-12, 1e-3, None),
+        (0.0, 0.0, Some((1e-12, 0.0))),
+        (1e-13, 1e-6, Some((1e-13, 1e-6))),
+    ];
+    let mut checked = 0usize;
+    let mut load_bearing = 0usize;
+    let mut straddles = 0usize;
+    let mut failures = Vec::new();
+    let mut legacy_blind: Vec<usize> = Vec::new();
+    for (ci, &(rel, berr, affine)) in configs.iter().enumerate() {
+        let seed = 0xF01D_BA11_u64 ^ ci as u64;
+        let spec = fold_ball_spec(rel, berr, affine, seed);
+        let net = TwinNet::compile(&spec).expect("compile");
+        let mut rng = StdRng::seed_from_u64(seed ^ 0xB0C5);
+        let mut lo = Vec::with_capacity(spec.n_in);
+        let mut hi = Vec::with_capacity(spec.n_in);
+        for _ in 0..spec.n_in {
+            let c: f64 = rng.random_range(-0.2..0.2);
+            lo.push(c - 1.0);
+            hi.push(c + 1.0);
+        }
+        straddles += lo
+            .iter()
+            .zip(&hi)
+            .filter(|(l, h)| **l < 0.0 && **h > 0.0)
+            .count();
+        let root = RootGates::build(&net, &lo, &hi, RoundMode::Outward, None).expect("root");
+        let (l, u) = (&root.layers[0].l, &root.layers[0].u);
+        let ball = fold_ball_hull(&spec, &lo, &hi, true);
+        let stored = fold_ball_hull(&spec, &lo, &hi, false);
+        assert_eq!(ball.len(), l.len(), "config {ci}: hull / box width");
+        // MUTATION PIN: the HISTORICAL coefficient-column charge (the
+        // pre-#fold-ball walk, forced by the test-only switch) must miss the
+        // same exact hull on this config, or the config cannot tell the
+        // repaired charge from the defect it repairs. Replicas: at least 28 of
+        // 32 neurons escape on every config.
+        let legacy = super::root::with_legacy_fold_charge_for_test(|| {
+            RootGates::build(&net, &lo, &hi, RoundMode::Outward, None)
+        })
+        .expect("legacy root");
+        assert_eq!(
+            legacy.layers[0].l.len(),
+            ball.len(),
+            "config {ci}: legacy box width"
+        );
+        let mut legacy_escapes = 0usize;
+        for (j, (bmn, bmx)) in ball.iter().enumerate() {
+            let (ll, lu) = (q(legacy.layers[0].l[j]), q(legacy.layers[0].u[j]));
+            if !contains(&ll, &lu, bmn, bmx) {
+                legacy_escapes += 1;
+            }
+        }
+        if legacy_escapes == 0 {
+            legacy_blind.push(ci);
+        }
+        for (j, ((bmn, bmx), (smn, smx))) in ball.iter().zip(&stored).enumerate() {
+            checked += 1;
+            let (lq, uq) = (q(l[j]), q(u[j]));
+            if !contains(&lq, &uq, bmn, bmx) {
+                failures.push(format!(
+                    "config {ci} (rel={rel:e} berr={berr:e} affine={affine:?}) neuron {j}: \
+                     box [{:e}, {:e}] vs exact ball hull [{:e}, {:e}]",
+                    l[j],
+                    u[j],
+                    bmn.to_f64().unwrap_or(f64::NAN),
+                    bmx.to_f64().unwrap_or(f64::NAN),
+                ));
+            }
+            if (bmx - smx) > (&uq - bmx) || (smn - bmn) > (bmn - &lq) {
+                load_bearing += 1;
+            }
+            // 1-ulp mutations of THIS box: its upper edge moved to the largest
+            // double strictly below the exact hull max, or its lower edge to
+            // the smallest double strictly above the hull min, must be
+            // rejected by the same predicate.
+            let mut up_edge = bmx.to_f64().expect("finite hull");
+            while q(up_edge) >= *bmx {
+                up_edge = super::rounding::next_down(up_edge);
+            }
+            let mut lo_edge = bmn.to_f64().expect("finite hull");
+            while q(lo_edge) <= *bmn {
+                lo_edge = super::rounding::next_up(lo_edge);
+            }
+            assert!(
+                !contains(&lq, &q(up_edge), bmn, bmx) && !contains(&q(lo_edge), &uq, bmn, bmx),
+                "config {ci} neuron {j}: the containment predicate accepted a box edge one \
+                 ulp inside the exact hull (mutation not caught)"
+            );
+        }
+    }
+    assert!(
+        checked > 0 && straddles > 0,
+        "VOID: no neuron checked or no input coordinate straddles 0"
+    );
+    assert!(
+        load_bearing > 0,
+        "VOID: the fold ball never exceeded the box's headroom, so a box that ignored \
+         the fold charge would pass too"
+    );
+    assert!(
+        legacy_blind.is_empty(),
+        "VOID: the historical coefficient-column fold charge passes on configs \
+         {legacy_blind:?}, so they cannot detect the defect #fold-ball repairs"
+    );
+    assert!(
+        failures.is_empty(),
+        "ROOT BOX MISSES THE FOLD-BALL HULL (a false-unsat generator): {failures:#?}"
+    );
+}
+
+// ---- #root-rounding: the root box encloses the EXACT stored-network hull ---
+
+/// `Flatten -> Gemm -> Relu -> Gemm` head on tensor `last` (flat size
+/// `flat`). The root walk stops at the last trunk relu, so the head never
+/// touches a trunk box; its weights come from their own RNG.
+fn rounding_leak_head(ops: &mut Vec<TwinOpSpec>, last: usize, flat: usize, seed: u64) {
+    let mut rng = StdRng::seed_from_u64(seed ^ 0x4EAD_5EED);
+    let (n_y, n_out) = (4usize, 3usize);
+    ops.push(TwinOpSpec::Flatten { input: last });
+    ops.push(TwinOpSpec::Gemm {
+        input: last + 1,
+        weight: wgen(&mut rng, WScheme::RandSigned, 0.3, n_y, flat),
+        bias: bgen(&mut rng, 0.3, n_y),
+        bias_err: Vec::new(),
+        weight_rel_err: 0.0,
+        shape: (n_y, flat),
+    });
+    ops.push(TwinOpSpec::Relu { input: last + 2 });
+    ops.push(TwinOpSpec::Gemm {
+        input: last + 3,
+        weight: wgen(&mut rng, WScheme::RandSigned, 0.3, n_out, n_y),
+        bias: bgen(&mut rng, 0.3, n_out),
+        bias_err: Vec::new(),
+        weight_rel_err: 0.0,
+        shape: (n_out, n_y),
+    });
+}
+
+/// #root-rounding regression, the reviewer's hand-checkable counterexample
+/// (`review/minimal_leak.py` of the #fold-ball fix report), no fold error at
+/// all: `x in [-1, 0.01]`, `z1 = w x + 0.02` with `w = (-1, -1 + 1e-6)` (both
+/// trunk-0 relus stable-active on the box), `z2 = relu(z1_0) - relu(z1_1) =
+/// -1e-6 x`, whose exact range is the affine hull `[-1e-8, 1e-6]` (+ rounding
+/// of the stored weights). The trunk-1 box must contain it.
+///
+/// The historical coefficient-column rounding charge (forced by the TEST-ONLY
+/// switch `root::with_legacy_rounding_charge_for_test`) widened the NEGATIVE
+/// upper coefficient of `z2`, which LOWERS the upper wall at the maximiser
+/// `x = -1`, and the concretize envelope scales with this cancelling,
+/// bias-free row's own ~1e-6 magnitudes: its box ended at
+/// 9.999999971380213e-07, 2.891e-15 below the exact max. That walk must still
+/// miss (the code-mutation pin), and the repaired one must contain the hull
+/// (replica headroom +3.4e-15 on both ends, `fix_root_rounding/validate.py`).
+#[test]
+fn root_box_encloses_the_exact_minimal_rounding_leak() {
+    use num_rational::BigRational as Q;
+    use num_traits::{ToPrimitive, Zero};
+    let q = |v: f64| Q::from_float(v).expect("finite");
+    let w1 = [-1.0f64, -1.0 + 1e-6];
+    let b1 = [0.02f64, 0.02];
+    let w2 = [1.0f64, -1.0];
+    let mut ops = vec![
+        TwinOpSpec::Conv {
+            input: 0,
+            weight: w1.to_vec(),
+            bias: b1.to_vec(),
+            bias_err: vec![0.0; 2],
+            weight_rel_err: 0.0,
+            kernel: (2, 1, 1, 1),
+            stride: (1, 1),
+            pads: (0, 0, 0, 0),
+            ishape: (1, 1, 1),
+            oshape: (2, 1, 1),
+        },
+        TwinOpSpec::Relu { input: 1 },
+        TwinOpSpec::Conv {
+            input: 2,
+            weight: w2.to_vec(),
+            bias: vec![0.0],
+            bias_err: vec![0.0],
+            weight_rel_err: 0.0,
+            kernel: (1, 2, 1, 1),
+            stride: (1, 1),
+            pads: (0, 0, 0, 0),
+            ishape: (2, 1, 1),
+            oshape: (1, 1, 1),
+        },
+        TwinOpSpec::Relu { input: 3 },
+    ];
+    rounding_leak_head(&mut ops, 4, 1, 0x0001_EA4F);
+    let spec = TwinSpec { n_in: 1, ops };
+    let net = TwinNet::compile(&spec).expect("compile");
+    let (lo, hi) = ([-1.0f64], [0.01f64]);
+    // Premise, exactly: both trunk-0 pre-activations are positive on the whole
+    // box (affine in x, so the vertices decide), hence z2 is affine there.
+    for c in 0..2 {
+        for x in [lo[0], hi[0]] {
+            assert!(
+                q(w1[c]) * q(x) + q(b1[c]) > Q::zero(),
+                "premise: trunk-0 relu {c} is not active at x = {x}"
+            );
+        }
+    }
+    let coef = q(w2[0]) * q(w1[0]) + q(w2[1]) * q(w1[1]);
+    let cst = q(w2[0]) * q(b1[0]) + q(w2[1]) * q(b1[1]);
+    let (va, vb) = (&coef * q(lo[0]) + &cst, &coef * q(hi[0]) + &cst);
+    let (mn, mx) = if va <= vb { (va, vb) } else { (vb, va) };
+    let build = || RootGates::build_prec(&net, &lo, &hi, RoundMode::Outward, None, false);
+    let fixed = build().expect("root");
+    let legacy = super::root::with_legacy_rounding_charge_for_test(build).expect("legacy root");
+    for (tag, root) in [("fixed", &fixed), ("legacy", &legacy)] {
+        assert_eq!(root.layers.len(), 2, "{tag}: two trunk relus");
+        assert!(
+            root.layers[0].l.iter().all(|&v| v > 0.0),
+            "{tag}: the root no longer sees both trunk-0 relus as stable-active: {:?}",
+            root.layers[0].l
+        );
+    }
+    let head = |root: &RootGates| -> (f64, f64) {
+        let (l, u) = (root.layers[1].l[0], root.layers[1].u[0]);
+        (
+            (&mn - q(l)).to_f64().expect("finite"),
+            (q(u) - &mx).to_f64().expect("finite"),
+        )
+    };
+    let (fl, fu) = head(&fixed);
+    let (ll, lu) = head(&legacy);
+    eprintln!(
+        "[root-rounding] minimal leak: exact [{:e}, {:e}]; fixed box [{:e}, {:e}] headroom \
+         lo {fl:+.3e} up {fu:+.3e}; legacy box [{:e}, {:e}] headroom lo {ll:+.3e} up {lu:+.3e}",
+        mn.to_f64().unwrap_or(f64::NAN),
+        mx.to_f64().unwrap_or(f64::NAN),
+        fixed.layers[1].l[0],
+        fixed.layers[1].u[0],
+        legacy.layers[1].l[0],
+        legacy.layers[1].u[0],
+    );
+    // MUTATION PIN: the historical charge misses the exact max (replica:
+    // -2.891e-15), or this fixture cannot see the defect it pins.
+    assert!(
+        q(legacy.layers[1].u[0]) < mx,
+        "VOID: the historical coefficient-column rounding charge contains the exact \
+         hull here, so this fixture no longer detects the #root-rounding defect"
+    );
+    assert!(
+        q(fixed.layers[1].l[0]) <= mn && q(fixed.layers[1].u[0]) >= mx,
+        "ROOT TRUNK-1 BOX MISSES THE EXACT STORED-NETWORK HULL (false-unsat generator): \
+         box [{:e}, {:e}] vs exact [{:e}, {:e}]",
+        fixed.layers[1].l[0],
+        fixed.layers[1].u[0],
+        mn.to_f64().unwrap_or(f64::NAN),
+        mx.to_f64().unwrap_or(f64::NAN),
+    );
+}
+
+/// Parameters of [`cancel_stable_spec`] the exact hull needs.
+struct CancelStable {
+    w1: Vec<f64>,
+    b1: Vec<f64>,
+    w2: Vec<f64>,
+    scale: Option<Vec<f64>>,
+    residual: bool,
+}
+
+/// #root-rounding sweep fixture (`cin = 3`, 2x2 spatial, `cw = 8`): Conv 1x1
+/// with NEGATIVE, near-constant columns (`w1[c][i] = a_i + U(-eps, eps)`,
+/// `a_i in -[0.5, 1.5)`) and small positive biases, so every trunk-0 relu is
+/// stable-active on `[-1, 0.01]^12`; Relu; a ZERO-ROW-SUM Conv 1x1 with zero
+/// bias (the composed row cancels to `~eps`); then per `family`: 0 = Relu,
+/// 1 = ChannelAffine (scales of both signs, zero shift) -> Relu, 2 = Add with
+/// the trunk-0 output (skip) -> Relu. The draw order is load-bearing: the
+/// Fraction replica (`fix_root_rounding/validate.py::sweep_net`) mirrors it.
+fn cancel_stable_spec(seed: u64, eps: f64, bscale: f64, family: u8) -> (TwinSpec, CancelStable) {
+    let (cin, h, w, cw) = (3usize, 2usize, 2usize, 8usize);
+    let mut rng = StdRng::seed_from_u64(seed);
+    let a: Vec<f64> = (0..cin).map(|_| -rng.random_range(0.5..1.5)).collect();
+    let mut w1 = Vec::with_capacity(cw * cin);
+    for _ in 0..cw {
+        for &ai in &a {
+            w1.push(ai + rng.random_range(-eps..eps));
+        }
+    }
+    let b1: Vec<f64> = (0..cw)
+        .map(|_| rng.random_range(bscale..1.2 * bscale))
+        .collect();
+    let mut w2 = Vec::with_capacity(cw * cw);
+    for _ in 0..cw {
+        let row: Vec<f64> = (0..cw).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let mut mean = 0.0f64;
+        for &v in &row {
+            mean += v;
+        }
+        mean /= cw as f64;
+        w2.extend(row.iter().map(|v| v - mean));
+    }
+    let conv = |input: usize, weight: Vec<f64>, bias: Vec<f64>, ci: usize| TwinOpSpec::Conv {
+        input,
+        weight,
+        bias,
+        bias_err: vec![0.0; cw],
+        weight_rel_err: 0.0,
+        kernel: (cw, ci, 1, 1),
+        stride: (1, 1),
+        pads: (0, 0, 0, 0),
+        ishape: (ci, h, w),
+        oshape: (cw, h, w),
+    };
+    let mut ops = vec![
+        conv(0, w1.clone(), b1.clone(), cin),
+        TwinOpSpec::Relu { input: 1 },
+        conv(2, w2.clone(), vec![0.0; cw], cw),
+    ];
+    let mut scale = None;
+    match family {
+        0 => ops.push(TwinOpSpec::Relu { input: 3 }),
+        1 => {
+            let sc: Vec<f64> = (0..cw)
+                .map(|c| {
+                    if c % 2 == 0 {
+                        rng.random_range(0.5..2.0)
+                    } else {
+                        -rng.random_range(0.5..2.0)
+                    }
+                })
+                .collect();
+            ops.push(TwinOpSpec::ChannelAffine {
+                input: 3,
+                scale: sc.clone(),
+                shift: vec![0.0; cw],
+                scale_rel_err: 0.0,
+                shift_err: vec![0.0; cw],
+                shape: (cw, h, w),
+            });
+            ops.push(TwinOpSpec::Relu { input: 4 });
+            scale = Some(sc);
+        }
+        _ => {
+            ops.push(TwinOpSpec::Add { lhs: 3, rhs: 2 });
+            ops.push(TwinOpSpec::Relu { input: 4 });
+        }
+    }
+    let last = ops.len();
+    rounding_leak_head(&mut ops, last, cw * h * w, seed);
+    (
+        TwinSpec {
+            n_in: cin * h * w,
+            ops,
+        },
+        CancelStable {
+            w1,
+            b1,
+            w2,
+            scale,
+            residual: family == 2,
+        },
+    )
+}
+
+/// #root-rounding randomized sweep: 96 nets (3 families x eps in {1e-1, 1e-2,
+/// 1e-3, 1e-4} x b1 scale in {0.05, 0.5} x 4 seeds) of [`cancel_stable_spec`]
+/// — CANCELLING weights, ALWAYS-ACTIVE trunk-0 relus, the ASYMMETRIC box
+/// `[-1, 0.01]^12`. With every trunk-0 relu active (proved exactly per net),
+/// the trunk-1 pre-activation is affine in `x`, so its exact hull over the
+/// whole box is a per-coordinate vertex sum in BigRational — no sampling. The
+/// root's trunk-1 box must contain it on every neuron of every net.
+///
+/// Mutation pin: the historical coefficient-column rounding charge
+/// (`root::with_legacy_rounding_charge_for_test`) must miss the hull on some
+/// net of EVERY family (Fraction replica: 32/32 plain, 32/32 affine, 20/32
+/// residual, worst -5.9e-14), so each family exercises the repaired site
+/// (conv + gate; + channel affine; + residual Add). Replica of the repair:
+/// 0/96 escape, min headroom +1.2e-14.
+#[test]
+fn root_box_encloses_the_exact_affine_hull_on_cancelling_stable_nets() {
+    use num_rational::BigRational as Q;
+    use num_traits::{ToPrimitive, Zero};
+    let q = |v: f64| Q::from_float(v).expect("finite");
+    let (cin, p, cw) = (3usize, 4usize, 8usize);
+    let (lo_v, hi_v) = (-1.0f64, 0.01f64);
+    let (qlo, qhi) = (q(lo_v), q(hi_v));
+    let lo = vec![lo_v; cin * p];
+    let hi = vec![hi_v; cin * p];
+    let mut nets = [0usize; 3];
+    let mut legacy_escapes = [0usize; 3];
+    let mut failures: Vec<String> = Vec::new();
+    let mut min_head = f64::INFINITY;
+    let mut checked = 0usize;
+    for family in 0u8..3 {
+        for eps in [1e-1f64, 1e-2, 1e-3, 1e-4] {
+            for bscale in [0.05f64, 0.5] {
+                for seed in 0u64..4 {
+                    let (spec, cs) = cancel_stable_spec(seed, eps, bscale, family);
+                    let net = TwinNet::compile(&spec).expect("compile");
+                    // Premise, exactly: every trunk-0 pre-activation is
+                    // positive on the whole box (affine => vertex minimum).
+                    for c in 0..cw {
+                        let mut mn = q(cs.b1[c]);
+                        for i in 0..cin {
+                            let wv = q(cs.w1[c * cin + i]);
+                            let (ta, tb) = (&wv * &qlo, &wv * &qhi);
+                            mn += if ta <= tb { ta } else { tb };
+                        }
+                        assert!(
+                            mn > Q::zero(),
+                            "premise: family {family} eps {eps:e} b1~{bscale} seed {seed}: \
+                             trunk-0 channel {c} is not active on the whole box"
+                        );
+                    }
+                    // Exact hull of every trunk-1 pre-activation.
+                    let mut hull: Vec<(Q, Q)> = Vec::with_capacity(cw * p);
+                    for n in 0..cw {
+                        let mut arow: Vec<Q> = (0..cw).map(|c| q(cs.w2[n * cw + c])).collect();
+                        if cs.residual {
+                            arow[n] += q(1.0);
+                        }
+                        let mut cst = Q::zero();
+                        let mut coef: Vec<Q> = vec![Q::zero(); cin];
+                        for (c, ac) in arow.iter().enumerate() {
+                            cst += ac * q(cs.b1[c]);
+                            for (i, co) in coef.iter_mut().enumerate() {
+                                *co += ac * q(cs.w1[c * cin + i]);
+                            }
+                        }
+                        if let Some(sc) = &cs.scale {
+                            let s = q(sc[n]);
+                            for co in coef.iter_mut() {
+                                *co = &*co * &s;
+                            }
+                            cst = &cst * &s;
+                        }
+                        let (mut mn, mut mx) = (cst.clone(), cst);
+                        for co in &coef {
+                            let (ta, tb) = (co * &qlo, co * &qhi);
+                            if ta <= tb {
+                                mn += ta;
+                                mx += tb;
+                            } else {
+                                mn += tb;
+                                mx += ta;
+                            }
+                        }
+                        for _ in 0..p {
+                            hull.push((mn.clone(), mx.clone()));
+                        }
+                    }
+                    let build =
+                        || RootGates::build_prec(&net, &lo, &hi, RoundMode::Outward, None, false);
+                    let fixed = build().expect("root");
+                    let legacy =
+                        super::root::with_legacy_rounding_charge_for_test(build).expect("legacy");
+                    let fi = usize::from(family);
+                    nets[fi] += 1;
+                    let mut legacy_missed = false;
+                    for (tag, root) in [("fixed", &fixed), ("legacy", &legacy)] {
+                        assert_eq!(root.layers.len(), 2, "{tag}: two trunk relus");
+                        assert!(
+                            root.layers[0].l.iter().all(|&v| v > 0.0),
+                            "{tag}: family {family} eps {eps:e} b1~{bscale} seed {seed}: the \
+                             root no longer sees every trunk-0 relu as stable-active"
+                        );
+                        assert_eq!(root.layers[1].l.len(), hull.len(), "{tag}: width");
+                    }
+                    for (j, (mn, mx)) in hull.iter().enumerate() {
+                        let (ll, lu) = (q(legacy.layers[1].l[j]), q(legacy.layers[1].u[j]));
+                        if !(ll <= *mn && lu >= *mx) {
+                            legacy_missed = true;
+                        }
+                        let (fl, fu) = (fixed.layers[1].l[j], fixed.layers[1].u[j]);
+                        let (flq, fuq) = (q(fl), q(fu));
+                        checked += 1;
+                        let hd = (mn - &flq).min(&fuq - mx);
+                        min_head = min_head.min(hd.to_f64().unwrap_or(f64::NEG_INFINITY));
+                        if !(flq <= *mn && fuq >= *mx) {
+                            failures.push(format!(
+                                "family {family} eps {eps:e} b1~{bscale} seed {seed} neuron {j}: \
+                                 box [{fl:e}, {fu:e}] vs exact [{:e}, {:e}]",
+                                mn.to_f64().unwrap_or(f64::NAN),
+                                mx.to_f64().unwrap_or(f64::NAN),
+                            ));
+                        }
+                    }
+                    if legacy_missed {
+                        legacy_escapes[fi] += 1;
+                    }
+                }
+            }
+        }
+    }
+    eprintln!(
+        "[root-rounding] cancelling stable-active sweep: nets {nets:?}, legacy nets escaping \
+         {legacy_escapes:?}, fixed neurons checked {checked}, failures {}, min headroom \
+         {min_head:+.3e}",
+        failures.len()
+    );
+    assert_eq!(nets, [32, 32, 32], "sweep did not run every net");
+    assert!(
+        legacy_escapes.iter().all(|&e| e > 0),
+        "VOID: the historical coefficient-column rounding charge contains the exact hull on \
+         every net of some family ({legacy_escapes:?} escaping of {nets:?}), so that family \
+         no longer detects the #root-rounding defect"
+    );
+    assert!(
+        failures.is_empty(),
+        "ROOT TRUNK-1 BOX MISSES THE EXACT STORED-NETWORK HULL (false-unsat generator): \
+         {failures:#?}"
+    );
+}
+
 // ---- Regime (3): Residual Add-heavy nets with cancellation -----------------
 
 /// Add-heavy residual net: a width-`cw` running tensor, then `nblocks` blocks
@@ -4034,6 +5864,8 @@ fn residual_add_spec(
         input: flat_id,
         weight: wgen(&mut rng, WScheme::RandSigned, 0.3, n_y, flat),
         bias: bgen(&mut rng, 0.3, n_y),
+        bias_err: Vec::new(),
+        weight_rel_err: 0.0,
         shape: (n_y, flat),
     });
     let g1 = ops.len();
@@ -4043,6 +5875,8 @@ fn residual_add_spec(
         input: hr,
         weight: wgen(&mut rng, WScheme::ZeroRowSum, 0.3, n_out, n_y),
         bias: bgen(&mut rng, 0.3, n_out),
+        bias_err: Vec::new(),
+        weight_rel_err: 0.0,
         shape: (n_out, n_y),
     });
     TwinSpec { n_in, ops }
@@ -4144,6 +5978,8 @@ fn large_head_spec(
             input: 3,
             weight: wgen(&mut rng, WScheme::RandSigned, 1.0, n_y, flat),
             bias: bgen(&mut rng, 1.0, n_y),
+            bias_err: Vec::new(),
+            weight_rel_err: 0.0,
             shape: (n_y, flat),
         },
         TwinOpSpec::Relu { input: 4 },
@@ -4152,6 +5988,8 @@ fn large_head_spec(
             input: 5,
             weight: wgen(&mut rng, WScheme::ZeroRowSum, 1.0, n_out, n_y),
             bias: bgen(&mut rng, 1.0, n_out),
+            bias_err: Vec::new(),
+            weight_rel_err: 0.0,
             shape: (n_out, n_y),
         },
     ];
@@ -4478,6 +6316,8 @@ fn firewall_subnormal_and_extreme_weights_never_unsound() {
                     input: 3,
                     weight: wgen(&mut rng, WScheme::RandSigned, scale, 12, flat),
                     bias: bgen(&mut rng, scale, 12),
+                    bias_err: Vec::new(),
+                    weight_rel_err: 0.0,
                     shape: (12, flat),
                 },
                 TwinOpSpec::Relu { input: 4 },
@@ -4485,6 +6325,8 @@ fn firewall_subnormal_and_extreme_weights_never_unsound() {
                     input: 5,
                     weight: wgen(&mut rng, WScheme::RandSigned, scale, n_out, 12),
                     bias: bgen(&mut rng, scale, n_out),
+                    bias_err: Vec::new(),
+                    weight_rel_err: 0.0,
                     shape: (n_out, 12),
                 },
             ],
@@ -4861,7 +6703,7 @@ fn run_entry_is_not_a_second_quarantine() {
     let adv: Vec<usize> = (0..n_out).filter(|&o| o != t).collect();
     let root = RootGates::build(&net, &lo, &hi, RoundMode::Outward, None).expect("root");
     match MarginRowBab::run(&net, &root, t, &adv, BabConfig::default()) {
-        MarginRowOutcome::Unsat(_) => {}
+        MarginRowOutcome::Unsat(..) => {}
         MarginRowOutcome::Unknown { reason, .. } => panic!(
             "MarginRowBab::run did not decide a provably-closable instance \
              ({reason}) — a second quarantine has been reintroduced"
@@ -5175,7 +7017,7 @@ fn epoch_tier0_lane_closes_and_moat_holds() {
         ..BabConfig::default()
     };
     match MarginRowBab::run(&net, &root, t, &adv, mk_cfg()) {
-        MarginRowOutcome::Unsat(stats) => {
+        MarginRowOutcome::Unsat(stats, _) => {
             assert_eq!(
                 stats.tree_classes.len() + stats.root_closed_classes,
                 adv.len()
@@ -5191,7 +7033,7 @@ fn epoch_tier0_lane_closes_and_moat_holds() {
         }
     }
     match MarginRowBab::run(&net, &root, worst, &[t], mk_cfg()) {
-        MarginRowOutcome::Unsat(_) => {
+        MarginRowOutcome::Unsat(..) => {
             panic!("MOAT VIOLATION: tier0 lane verified a falsified instance")
         }
         MarginRowOutcome::Unknown { .. } => {}
@@ -5580,7 +7422,7 @@ fn epoch_nested_lane_closes_and_moat_holds() {
         ..BabConfig::default()
     };
     match MarginRowBab::run(&net, &root, t, &adv, mk_cfg()) {
-        MarginRowOutcome::Unsat(stats) => {
+        MarginRowOutcome::Unsat(stats, _) => {
             eprintln!(
                 "[epoch-b] nested lane closed: expansions {} depth {} epochs {}/{} ledger {:?}",
                 stats.expansions,
@@ -5603,7 +7445,7 @@ fn epoch_nested_lane_closes_and_moat_holds() {
         }
     }
     match MarginRowBab::run(&net, &root, worst, &[t], mk_cfg()) {
-        MarginRowOutcome::Unsat(_) => {
+        MarginRowOutcome::Unsat(..) => {
             panic!("MOAT VIOLATION: epoch lane verified a falsified instance")
         }
         MarginRowOutcome::Unknown { .. } => {}
@@ -5667,6 +7509,8 @@ fn cgan_like_spec(rng: &mut StdRng, scale: f64) -> TwinSpec {
                 input: 6,
                 weight: w(6 * 27),
                 bias: w(6),
+                bias_err: Vec::new(),
+                weight_rel_err: 0.0,
                 shape: (6, 27),
             }, // t7 (y)
             TwinOpSpec::Relu { input: 7 },    // t8 (head relu)
@@ -5674,6 +7518,8 @@ fn cgan_like_spec(rng: &mut StdRng, scale: f64) -> TwinSpec {
                 input: 8,
                 weight: w(4 * 6),
                 bias: w(4),
+                bias_err: Vec::new(),
+                weight_rel_err: 0.0,
                 shape: (4, 6),
             }, // t9
         ],
@@ -5862,7 +7708,7 @@ fn epoch_cgan_like_enclosure_and_lane() {
     let advt: Vec<usize> = (0..n_out).filter(|&o| o != tt).collect();
     let root = RootGates::build(&net, &lo2, &hi2, RoundMode::Outward, None).expect("root");
     match MarginRowBab::run(&net, &root, tt, &advt, BabConfig::default()) {
-        MarginRowOutcome::Unsat(stats) => {
+        MarginRowOutcome::Unsat(stats, _) => {
             assert_eq!(stats.ledger_ok, Some(true), "ledger on cgan-like tree");
         }
         MarginRowOutcome::Unknown { reason, .. } => {
@@ -5870,7 +7716,7 @@ fn epoch_cgan_like_enclosure_and_lane() {
         }
     }
     match MarginRowBab::run(&net, &root, worst, &[tt], BabConfig::default()) {
-        MarginRowOutcome::Unsat(_) => panic!("MOAT VIOLATION on cgan-like fixture"),
+        MarginRowOutcome::Unsat(..) => panic!("MOAT VIOLATION on cgan-like fixture"),
         MarginRowOutcome::Unknown { .. } => {}
     }
 }
@@ -5982,6 +7828,7 @@ mod enclosure_oracle_dense {
                     weight,
                     bias,
                     shape,
+                    ..
                 } => {
                     let (no, ni) = *shape;
                     let src = &tensors[*input];
@@ -6094,6 +7941,8 @@ mod enclosure_oracle_dense {
             input: flat_id,
             weight: wv(n_y * flat, rng),
             bias: wv(n_y, rng),
+            bias_err: Vec::new(),
+            weight_rel_err: 0.0,
             shape: (n_y, flat),
         });
         let g1_id = ops.len();
@@ -6103,6 +7952,8 @@ mod enclosure_oracle_dense {
             input: hr_id,
             weight: wv(n_out * n_y, rng),
             bias: wv(n_out, rng),
+            bias_err: Vec::new(),
+            weight_rel_err: 0.0,
             shape: (n_out, n_y),
         });
         let n_in = c0 * hw * hw;
@@ -6186,8 +8037,8 @@ mod enclosure_oracle_dense {
 
                 // ---- Build the sample set ----
                 let mut samples: Vec<Vec<f64>> = Vec::new();
-                samples.push(mid.clone()); // center
-                                           // Uniform-in-box interior samples.
+                samples.push(mid); // center
+                                   // Uniform-in-box interior samples.
                 for _ in 0..300 {
                     let x: Vec<f64> = (0..n_in)
                         .map(|i| {
@@ -6382,6 +8233,7 @@ mod enclosure_oracle_near_cancel {
                     weight,
                     bias,
                     shape,
+                    ..
                 } => {
                     let (no, ni) = *shape;
                     let src = &tensors[*input];
@@ -6771,6 +8623,7 @@ mod enclosure_oracle_deep {
                     weight,
                     bias,
                     shape,
+                    ..
                 } => {
                     let (no, ni) = *shape;
                     let src = &tens[*input];
@@ -6899,6 +8752,8 @@ mod enclosure_oracle_deep {
             input: flat,
             weight: vecf(rng, cfg.n_y * n_in, cfg.scale),
             bias: vecf(rng, cfg.n_y, cfg.scale),
+            bias_err: Vec::new(),
+            weight_rel_err: 0.0,
             shape: (cfg.n_y, n_in),
         });
         let hr = ops.len() + 1;
@@ -6907,6 +8762,8 @@ mod enclosure_oracle_deep {
             input: hr,
             weight: vecf(rng, cfg.n_out * cfg.n_y, cfg.scale),
             bias: vecf(rng, cfg.n_out, cfg.scale),
+            bias_err: Vec::new(),
+            weight_rel_err: 0.0,
             shape: (cfg.n_out, cfg.n_y),
         });
         TwinSpec { n_in, ops }
@@ -7356,192 +9213,152 @@ fn domain_gates_split_overrides_stay_exact_under_fractional_alpha() {
 
 // ===================== #rebake: joint forward re-bake =======================
 
-/// Exact `x - y` as a double-double (both inputs plain f64).
-fn dd_sub_f64(x: f64, y: f64) -> Dd {
-    let (h, l) = two_sum(x, -y);
-    Dd { hi: h, lo: l }
-}
-
-/// `x * y` for a double-double `x` and plain f64 `y` (error ~1e-32 relative).
-fn dd_mul_f64(x: Dd, y: f64) -> Dd {
-    let (p, e) = two_prod(x.hi, y);
-    let e = e + x.lo * y;
-    let (h, l) = two_sum(p, e);
-    Dd { hi: h, lo: l }
-}
-
-/// #rebake obligation 1, the ONE re-derived constant: `apply_gates`' outward
-/// widening under a FRACTIONAL lower slope must satisfy, per coefficient and
-/// in real arithmetic over the stored inputs,
+/// #rebake obligation 1, re-derived for #root-rounding: `apply_gates`' Outward
+/// result must enclose the gate's exact transform FUNCTIONALLY — for every
+/// `x~ = (x, 1)` with `|x_i| <= xabs_i`, in real arithmetic over the stored
+/// inputs,
 ///
-///   `M' - D' <= (m - d)*alpha`  and  `M' + D' >= (m + d)*s (+ c on bias)`,
+///   `(M' - D') x~ <= (m - d)*alpha x~`  and  `(M' + D') x~ >= ((m + d)*s (+ c on bias)) x~`,
 ///
-/// across regimes the binary-era derivation never faced — in particular
-/// `alpha >> s` (the `gates_from_box` coupling `alpha=1 => s>=1/2` is gone
-/// once the optimizer owns alpha), inverted pairs (`U < L`), and bias-column
-/// cancellation. Reference is double-double (~1e-32); the derivation proves a
-/// surplus >= 5u*W, so ANY exceedance is a real bug, not tolerance noise.
+/// i.e. `sum_i |(M'-D')_i - L_i| xabs_i + ((M'-D')_b - L_b) <= 0` and the
+/// mirrored upper condition, checked EXACTLY in BigRational. This is the
+/// obligation the tableau's sandwich semantics actually needs; the historical
+/// per-coefficient one (`M' - D' <= L` coefficientwise) is not sufficient,
+/// because a coefficientwise-lower lower wall is HIGHER at a negative input —
+/// the #root-rounding defect. The grid covers binary AND fractional alpha
+/// (`alpha >> s`, where the old chord coupling is gone), SIGNED `d` (the
+/// tableau's D lane goes negative after any gate with `U < L`), bias-column
+/// cancellation, and a zero bias row (`c = 0`, `m_b = d_b = 0`), the shape of
+/// the counterexample.
 ///
-/// Also pinned here: (a) binary-alpha rows still take the HISTORICAL line
-/// bit-for-bit (disarmed builds cannot move), and (b) the historical line
-/// genuinely FAILS the obligation somewhere in the fractional grid — the
-/// discriminating half: this test would have caught shipping the old constant.
+/// Also pinned: (a) the TEST-ONLY legacy switch reproduces the historical
+/// binary line `next_up((dd + 6u(|mm| + dd))(1 + 1e-15))` and fractional line
+/// `next_up(dd + u(|mm| + |dd| + 8W))` bit for bit, and (b) those historical
+/// lines VIOLATE the functional obligation somewhere in the grid — the
+/// discriminating half: this test fails on the pre-repair gate.
 #[test]
 fn fractional_alpha_apply_gates_widening_covers_the_extra_rounding() {
     use super::rounding::{next_up, UNIT};
+    use num_rational::BigRational as Q;
+    use num_traits::{Signed, Zero};
+    let q = |v: f64| Q::from_float(v).expect("finite");
     let ms_grid = [0.0, 1e-3, -1e-3, 0.7, -0.7, 3.0, -3.0, 1e8, -1e8, 1e-300];
-    let d_grid = [0.0, 1e-12, 1e-3, 0.5, 2.0];
-    let a_frac = [1e-6, 0.1, 0.37, 0.75, 0.999];
+    let d_grid = [0.0, 1e-12, 1e-3, 0.5, 2.0, -0.5, -1e-3];
+    let a_grid = [0.0, 1.0, 1e-6, 0.1, 0.37, 0.75, 0.999];
     let s_grid = [0.0, 1e-9, 1e-3, 0.5, 0.999, 1.0];
     let c_grid = [0.0, 1e-9, 0.4, 5.0];
     let n_in = 1usize;
     let naug = n_in + 1;
     let blk = naug.div_ceil(64);
-    let xabs_ext = vec![1.0f64; naug];
-    let mut old_formula_violations = 0usize;
+    let mut legacy_violations = 0usize;
     let mut checked = 0usize;
-    for &m in &ms_grid {
-        for &d in &d_grid {
-            for &sv in &s_grid {
-                for &cv in &c_grid {
-                    // Same (m, d) on the regular and the bias column; the bias
-                    // column additionally absorbs `c` (the cancellation case
-                    // is m + d < 0 with s, c > 0).
-                    let mm_in = Array2::from_shape_vec((1, naug), vec![m, m]).expect("shape");
-                    let dd_in = Array2::from_shape_vec((1, naug), vec![d, d]).expect("shape");
-                    for &a in &a_frac {
-                        let (mo, do_, _) = super::root::apply_gates(
-                            &mm_in,
-                            &dd_in,
-                            &[a],
-                            &[sv],
-                            &[cv],
-                            n_in,
-                            RoundMode::Outward,
-                            None,
-                            blk,
-                            &xabs_ext,
-                        );
-                        for i in 0..naug {
-                            // Exact targets from the STORED inputs.
-                            let l_exact = dd_mul_f64(dd_sub_f64(m, d), a);
-                            let mut u_exact = dd_mul_f64(
-                                {
-                                    let (h, l) = two_sum(m, d);
-                                    Dd { hi: h, lo: l }
-                                },
-                                sv,
-                            );
-                            if i == n_in {
-                                u_exact = dd_add(u_exact, Dd::from(cv));
+    // Exact functional excess of a computed (mo, do) row over the exact walls
+    // (L, U): `<= 0` on both sides means the sandwich encloses them for every
+    // `|x| <= xabs`.
+    let excess = |mo: &Array2<f64>, do_: &Array2<f64>, l: &[Q; 2], u: &[Q; 2], xe0: &Q| {
+        let a_l0 = q(mo[[0, 0]]) - q(do_[[0, 0]]);
+        let a_u0 = q(mo[[0, 0]]) + q(do_[[0, 0]]);
+        let a_lb = q(mo[[0, 1]]) - q(do_[[0, 1]]);
+        let a_ub = q(mo[[0, 1]]) + q(do_[[0, 1]]);
+        let low = (&a_l0 - &l[0]).abs() * xe0 + (a_lb - &l[1]);
+        let upp = (&u[0] - &a_u0).abs() * xe0 + (&u[1] - a_ub);
+        (low, upp)
+    };
+    for xe0f in [1.0f64, 37.5] {
+        let xabs_ext = vec![xe0f, 1.0];
+        let xe0 = q(xe0f);
+        for &m in &ms_grid {
+            for &d in &d_grid {
+                // Bias column: the same (m, d), or an exact zero row.
+                for (mb, db) in [(m, d), (0.0, 0.0)] {
+                    let mm_in = Array2::from_shape_vec((1, naug), vec![m, mb]).expect("shape");
+                    let dd_in = Array2::from_shape_vec((1, naug), vec![d, db]).expect("shape");
+                    for &sv in &s_grid {
+                        for &cv in &c_grid {
+                            for &a in &a_grid {
+                                let l = [q(a) * (q(m) - q(d)), q(a) * (q(mb) - q(db))];
+                                let u = [q(sv) * (q(m) + q(d)), q(sv) * (q(mb) + q(db)) + q(cv)];
+                                let gate = || {
+                                    super::root::apply_gates(
+                                        &mm_in,
+                                        &dd_in,
+                                        &[a],
+                                        &[sv],
+                                        &[cv],
+                                        n_in,
+                                        RoundMode::Outward,
+                                        None,
+                                        blk,
+                                        &xabs_ext,
+                                    )
+                                };
+                                let (mo, do_, _) = gate();
+                                let (low, upp) = excess(&mo, &do_, &l, &u, &xe0);
+                                assert!(
+                                    low <= Q::zero() && upp <= Q::zero(),
+                                    "gate sandwich misses the exact transform: m={m} d={d} \
+mb={mb} db={db} alpha={a} s={sv} c={cv} xabs={xe0f}: lower excess {:e}, upper excess {:e}",
+                                    num_traits::ToPrimitive::to_f64(&low).unwrap_or(f64::NAN),
+                                    num_traits::ToPrimitive::to_f64(&upp).unwrap_or(f64::NAN),
+                                );
+                                checked += 1;
+                                // (a) the legacy switch IS the historical code.
+                                let (lmo, ldo, _) =
+                                    super::root::with_legacy_rounding_charge_for_test(gate);
+                                for (i, (mi, di)) in [(m, d), (mb, db)].into_iter().enumerate() {
+                                    let lo_c = (mi - di) * a;
+                                    let up0 = (mi + di) * sv;
+                                    let up_c = if i == n_in { up0 + cv } else { up0 };
+                                    #[allow(clippy::manual_midpoint)]
+                                    let mmv = (lo_c + up_c) * 0.5;
+                                    let ddv = (up_c - lo_c) * 0.5;
+                                    let drow_old = if a != 0.0 && a != 1.0 {
+                                        let w = lo_c.abs()
+                                            + up_c.abs()
+                                            + if i == n_in { up0.abs() } else { 0.0 };
+                                        next_up(ddv + UNIT * (mmv.abs() + ddv.abs() + 8.0 * w))
+                                    } else {
+                                        next_up(
+                                            (ddv + 6.0 * UNIT * (mmv.abs() + ddv)) * (1.0 + 1e-15),
+                                        )
+                                    };
+                                    assert_eq!(
+                                        lmo[[0, i]].to_bits(),
+                                        mmv.to_bits(),
+                                        "legacy M' moved: m={m} d={d} a={a} s={sv} c={cv} col={i}"
+                                    );
+                                    assert_eq!(
+                                        ldo[[0, i]].to_bits(),
+                                        drow_old.to_bits(),
+                                        "legacy D' moved: m={m} d={d} a={a} s={sv} c={cv} col={i}"
+                                    );
+                                }
+                                // (b) does the historical line meet the
+                                // functional obligation here?
+                                let (llow, lupp) = excess(&lmo, &ldo, &l, &u, &xe0);
+                                if llow > Q::zero() || lupp > Q::zero() {
+                                    legacy_violations += 1;
+                                }
                             }
-                            // (†) in exact arithmetic: A_l = mo - do <= L and
-                            // A_u = mo + do >= U.
-                            let a_l = dd_sub_f64(mo[[0, i]], do_[[0, i]]);
-                            let a_u = dd_add(Dd::from(mo[[0, i]]), Dd::from(do_[[0, i]]));
-                            let low_ok = dd_add(
-                                l_exact,
-                                Dd {
-                                    hi: -a_l.hi,
-                                    lo: -a_l.lo,
-                                },
-                            );
-                            let upp_ok = dd_add(
-                                a_u,
-                                Dd {
-                                    hi: -u_exact.hi,
-                                    lo: -u_exact.lo,
-                                },
-                            );
-                            assert!(
-                                low_ok.val() >= 0.0,
-                                "lower row overstates the exact product: m={m} d={d} \
-alpha={a} s={sv} c={cv} col={i}: A_l={} > L={}",
-                                a_l.val(),
-                                l_exact.val()
-                            );
-                            assert!(
-                                upp_ok.val() >= 0.0,
-                                "upper row understates the exact product: m={m} d={d} \
-alpha={a} s={sv} c={cv} col={i}: A_u={} < U={}",
-                                a_u.val(),
-                                u_exact.val()
-                            );
-                            checked += 1;
-                            // Discriminating half: would the HISTORICAL widening
-                            // have covered this point? Count its violations.
-                            let lo_c = (m - d) * a;
-                            let up0 = (m + d) * sv;
-                            let up_c = if i == n_in { up0 + cv } else { up0 };
-                            #[allow(clippy::manual_midpoint)]
-                            let mmv = (lo_c + up_c) * 0.5;
-                            let ddv = (up_c - lo_c) * 0.5;
-                            let drow_old =
-                                next_up((ddv + 6.0 * UNIT * (mmv.abs() + ddv)) * (1.0 + 1e-15));
-                            let a_l_old = dd_sub_f64(mmv, drow_old);
-                            if dd_add(
-                                l_exact,
-                                Dd {
-                                    hi: -a_l_old.hi,
-                                    lo: -a_l_old.lo,
-                                },
-                            )
-                            .val()
-                                < 0.0
-                            {
-                                old_formula_violations += 1;
-                            }
-                        }
-                    }
-                    // Binary alpha keeps the HISTORICAL formula bit-for-bit
-                    // (this is the disarmed-bit-identity half at the site).
-                    for a in [0.0, 1.0] {
-                        let (mo, do_, _) = super::root::apply_gates(
-                            &mm_in,
-                            &dd_in,
-                            &[a],
-                            &[sv],
-                            &[cv],
-                            n_in,
-                            RoundMode::Outward,
-                            None,
-                            blk,
-                            &xabs_ext,
-                        );
-                        for i in 0..naug {
-                            let lo_c = (m - d) * a;
-                            let up0 = (m + d) * sv;
-                            let up_c = if i == n_in { up0 + cv } else { up0 };
-                            #[allow(clippy::manual_midpoint)]
-                            let mmv = (lo_c + up_c) * 0.5;
-                            let ddv = (up_c - lo_c) * 0.5;
-                            let drow_old =
-                                next_up((ddv + 6.0 * UNIT * (mmv.abs() + ddv)) * (1.0 + 1e-15));
-                            assert_eq!(
-                                mo[[0, i]].to_bits(),
-                                mmv.to_bits(),
-                                "binary-alpha M' moved: m={m} d={d} a={a} s={sv} c={cv} col={i}"
-                            );
-                            assert_eq!(
-                                do_[[0, i]].to_bits(),
-                                drow_old.to_bits(),
-                                "binary-alpha D' moved: m={m} d={d} a={a} s={sv} c={cv} col={i}"
-                            );
                         }
                     }
                 }
             }
         }
     }
-    assert!(checked > 10_000, "grid unexpectedly small: {checked}");
-    // The obligation was REAL: the historical constant fails somewhere in the
-    // fractional grid (alpha >> s breaks its |lo_c| <= 2(|mm|+dd) premise).
-    // If this ever reads 0 the grid stopped exercising the regime and the
-    // test above is vacuous for the new branch — fix the grid, not the assert.
+    assert!(checked > 40_000, "grid unexpectedly small: {checked}");
+    // The obligation was REAL: the historical coefficient-column widening
+    // fails it somewhere (e.g. any nonzero coefficient over a zero bias row:
+    // its widening moves the wall INWARD at `x = -xabs`). If this ever reads
+    // 0 the grid stopped exercising the regime — fix the grid, not the assert.
+    eprintln!(
+        "[root-rounding] gate functional obligation: {checked} exact checks, historical-line \
+         violations {legacy_violations}"
+    );
     assert!(
-        old_formula_violations > 0,
-        "the historical widening covered every fractional grid point — the \
-grid no longer exercises the regime the re-derivation exists for"
+        legacy_violations > 0,
+        "the historical coefficient-column widening met the functional obligation on every \
+         grid point — the grid no longer exercises the #root-rounding defect"
     );
 }
 
@@ -7869,7 +9686,7 @@ fn unst_rows_capture_matches_retained_capture() {
 }
 
 // ===========================================================================
-// #margin-row-beta (BUILD 1) + #backward-interm (BUILD 2), 2026-08-19.
+// #margin-row-beta (BUILD 1) + #backward-interm (BUILD 2).
 //
 // Soundness contracts under test:
 //  * beta: ANY beta >= 0 yields a valid bound on the split region (weak
@@ -8270,25 +10087,34 @@ fn backward_interm_shrink_only_sound_and_chunk_invariant() {
     // assertion below is about; the sizer's own invariance is covered by
     // `backward_interm_pass_sizer_is_bit_identical_to_the_fixed_grain`.
     let cfg = |chunk: usize| super::backward_interm::BiCfg {
+        yield_window: 0,
+        yield_ratio: 0.0,
         secs: 60.0,
         chunk,
         topk: 512,
         chunk_secs: 0.0,
+        interm_alpha: 0,
     };
     let on1 = build(Some(cfg(1)));
     let on8 = build(Some(cfg(8)));
     let on256 = build(Some(cfg(256)));
     let top1 = build(Some(super::backward_interm::BiCfg {
+        yield_window: 0,
+        yield_ratio: 0.0,
         secs: 60.0,
         chunk: 8,
         topk: 1,
         chunk_secs: 0.0,
+        interm_alpha: 0,
     }));
     let zero = build(Some(super::backward_interm::BiCfg {
+        yield_window: 0,
+        yield_ratio: 0.0,
         secs: 0.0,
         chunk: 4,
         topk: 512,
         chunk_secs: 0.0,
+        interm_alpha: 0,
     }));
     let off_exec = off.backward_interm_execution;
     assert!(!off_exec.enabled);
@@ -8377,6 +10203,164 @@ fn backward_interm_shrink_only_sound_and_chunk_invariant() {
     }
 }
 
+/// #interm-alpha: the per-START-NODE prefix alpha candidates.
+///
+/// THREE OBLIGATIONS, and the third is what makes the test evidence-carrying
+/// rather than a tautology:
+///
+/// 1. **Shrink-only against the SHIPPED phase.** The dosed build's published
+///    box must be a SUBSET of the dose-0 build's, neuron by neuron. This is
+///    the moat property: the axis can only ever hand `gates_from_box` a
+///    tighter interval than the phase already handed it, so no banked proof
+///    can be lost to a looser relaxation. A regression here is a real defect,
+///    not a tuning question.
+/// 2. **The published box still encloses the true range.** Sampled forward
+///    points must lie inside the DOSED box. A shrink-only intersection of
+///    invalid enclosures would pass (1) and fail this — which is exactly the
+///    false-`unsat` shape the whole lane's soundness argument is about.
+/// 3. **The candidates actually MOVE something.** If the dose changed no
+///    neuron on this net, (1) and (2) would both pass vacuously and the test
+///    would be a no-op guarding nothing. Asserting movement means "the lever
+///    was armed but inert" fails here, in CI, instead of being discovered as
+///    a VOID measurement on the box.
+#[test]
+fn interm_alpha_per_start_node_shrinks_only_and_still_encloses() {
+    let mut rng = StdRng::seed_from_u64(0xB1_0001);
+    let spec = tiny_spec(&mut rng, 0.6);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let lo = vec![-0.4; 72];
+    let hi = vec![0.4; 72];
+    let build = |dose: usize| {
+        RootGates::build_retaining_bi(
+            &net,
+            &lo,
+            &hi,
+            RoundMode::Outward,
+            None,
+            Some(super::backward_interm::BiCfg {
+                yield_window: 0,
+                yield_ratio: 0.0,
+                secs: 600.0,
+                chunk: 8,
+                topk: 512,
+                chunk_secs: 0.0,
+                interm_alpha: dose,
+            }),
+        )
+        .expect("build")
+        .0
+    };
+    let base = build(0);
+    let dosed = build(super::backward_interm::INTERM_ALPHA_POLICIES);
+    assert_eq!(base.layers.len(), dosed.layers.len());
+
+    // (1) + (3)
+    let mut moved = 0usize;
+    let mut newly_stable = 0usize;
+    for (b, d) in base.layers.iter().zip(&dosed.layers) {
+        assert_eq!(b.n, d.n);
+        for j in 0..b.n {
+            assert!(
+                d.l[j] >= b.l[j],
+                "interm-alpha LOOSENED the lower bound at neuron {j}: {} -> {}",
+                b.l[j],
+                d.l[j]
+            );
+            assert!(
+                d.u[j] <= b.u[j],
+                "interm-alpha LOOSENED the upper bound at neuron {j}: {} -> {}",
+                b.u[j],
+                d.u[j]
+            );
+            if d.l[j] > b.l[j] || d.u[j] < b.u[j] {
+                moved += 1;
+                let was_unstable = b.l[j] < 0.0 && b.u[j] > 0.0;
+                if was_unstable && (d.l[j] >= 0.0 || d.u[j] <= 0.0) {
+                    newly_stable += 1;
+                }
+            }
+        }
+    }
+    eprintln!(
+        "[test interm-alpha] neurons tightened by the per-start-node candidates: \
+{moved} (newly stable: {newly_stable})"
+    );
+    assert!(
+        moved > 0,
+        "the per-start-node alpha candidates changed NOTHING — the lever is inert, \
+so obligations (1) and (2) above are vacuous"
+    );
+
+    // (2) The dosed box must still contain the true pre-activation range.
+    let mut rng2 = StdRng::seed_from_u64(9);
+    let x = sample_box(&mut rng2, &dosed, 400);
+    let mut pre_sel = std::collections::BTreeMap::new();
+    for l in &dosed.layers {
+        pre_sel.insert(l.op, (0..l.n).collect::<Vec<_>>());
+    }
+    let (_y, pre) = net.forward_points(&x, &pre_sel).expect("forward");
+    for l in &dosed.layers {
+        let z = &pre[&l.op];
+        for j in 0..l.n {
+            for b in 0..x.ncols() {
+                let zv = z[[j, b]];
+                assert!(
+                    l.l[j] <= zv + 1e-9 && l.u[j] >= zv - 1e-9,
+                    "interm-alpha published box [{}, {}] EXCLUDES sampled z {zv} \
+(neuron {j}) — this is the false-unsat shape",
+                    l.l[j],
+                    l.u[j]
+                );
+            }
+        }
+    }
+}
+
+/// #interm-alpha: dose 0 must be byte-identical to the pre-#interm-alpha
+/// phase. The default is 0, so this is the assertion that arming nothing
+/// changes nothing — the property every shipped preset depends on.
+#[test]
+fn interm_alpha_dose_zero_is_bit_identical_to_the_shipped_phase() {
+    let mut rng = StdRng::seed_from_u64(0xB1_0001);
+    let spec = tiny_spec(&mut rng, 0.6);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let lo = vec![-0.4; 72];
+    let hi = vec![0.4; 72];
+    let build = |dose: usize| {
+        RootGates::build_retaining_bi(
+            &net,
+            &lo,
+            &hi,
+            RoundMode::Outward,
+            None,
+            Some(super::backward_interm::BiCfg {
+                yield_window: 0,
+                yield_ratio: 0.0,
+                secs: 600.0,
+                chunk: 8,
+                topk: 512,
+                chunk_secs: 0.0,
+                interm_alpha: dose,
+            }),
+        )
+        .expect("build")
+        .0
+    };
+    let a = build(0);
+    let b = build(0);
+    for (x, y) in a.layers.iter().zip(&b.layers) {
+        for j in 0..x.n {
+            assert_eq!(x.l[j].to_bits(), y.l[j].to_bits(), "dose-0 l not stable");
+            assert_eq!(x.u[j].to_bits(), y.u[j].to_bits(), "dose-0 u not stable");
+            assert_eq!(
+                x.alpha[j].to_bits(),
+                y.alpha[j].to_bits(),
+                "dose-0 alpha not stable"
+            );
+        }
+    }
+}
+
 /// #bi-adaptive-chunk: sizing a pass from a MEASURED rate instead of a fixed
 /// grain changes only the partition of the selected columns, and a partition is
 /// not a mathematical object here — each column is its own independent prefix
@@ -8400,10 +10384,13 @@ fn backward_interm_pass_sizer_is_bit_identical_to_the_fixed_grain() {
             RoundMode::Outward,
             None,
             Some(super::backward_interm::BiCfg {
+                yield_window: 0,
+                yield_ratio: 0.0,
                 secs: 600.0,
                 chunk: 8,
                 topk: 512,
                 chunk_secs,
+                interm_alpha: 0,
             }),
         )
         .expect("build")
@@ -9225,6 +11212,250 @@ fn conv_f32_native_store_is_bitwise_the_widened_path() {
     assert!(tested >= 4, "too few conv ops exercised ({tested})");
 }
 
+/// #root-rounding follow-up (f32 compute lane): `conv_f32_gerr` must bound the
+/// f32 error of BOTH conv lanes against exact arithmetic, and the tableau's D
+/// lane is SIGNED (every gate with `U < L` makes it negative). The historical
+/// functional `B[t] = sum_i (|m| + d) xabs_ext_i` charged a source row whose
+/// coefficients have `d = -|m|` NOTHING beyond the FTZ floor, while both f32
+/// products of that row are off by `~u32 |W| |m|`. This pin drives the real
+/// f32 conv on exactly such rows (centers not f32-representable, `d = -|m|`
+/// exactly) and requires the charge to dominate a rigorous UPPER bound on the
+/// realized deviation functional `sum_i (|dM| + |dD|) xabs_ext_i`, and the
+/// historical charge to fall below a rigorous LOWER bound on it (teeth).
+#[test]
+fn conv_f32_gerr_charges_a_signed_d_lane_by_magnitude() {
+    use super::net::{conv_apply_forward_prec_masked, TwinOp};
+    use super::root::conv_f32_gerr;
+    use super::rounding::{gamma_n, next_up, SUBNORMAL_F32};
+    let mut rng = StdRng::seed_from_u64(0x5167_D1A6);
+    let spec = conv_bn_spec(3, 3, 3, 12, 4.0, 1e-13, 1e-4, 16, 6, 0xFEED);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let c = net
+        .ops
+        .iter()
+        .find_map(|op| match op {
+            TwinOp::Conv(c) => Some(c),
+            _ => None,
+        })
+        .expect("conv op");
+    let n_src = net.tsize[c.input];
+    let n_out = c.oshape.0 * c.oshape.1 * c.oshape.2;
+    let naug = 9usize;
+    let n_in = naug - 1;
+    let mi = Array2::from_shape_fn((n_src, naug), |_| {
+        rng.random_range(-2.0..2.0f64) * (1.0 + 1e-9)
+    });
+    // `|m| + d == 0` EXACTLY on every coefficient, bias column included.
+    let di = mi.mapv(|v| -v.abs());
+    let xabs: Vec<f64> = (0..n_in).map(|i| [0.5, 1.0, 2.0, 37.5][i % 4]).collect();
+    let xabs_ext: Vec<f64> = xabs.iter().copied().chain(std::iter::once(1.0)).collect();
+    let s_xabs = next_up(xabs.iter().sum::<f64>() + 1.0);
+    let zeros = vec![0.0f64; n_src];
+    let charge = conv_f32_gerr::<f64>(
+        c,
+        &mi,
+        &di,
+        &zeros,
+        &xabs,
+        s_xabs,
+        n_in,
+        None,
+        naug.div_ceil(64),
+        false,
+    );
+    assert_eq!(charge.len(), n_out, "one charge per output row");
+    let run = |src: &Array2<f64>, abs_w: bool, f32_lane: bool| {
+        let mut dst = Array2::<f64>::zeros((n_out, naug));
+        conv_apply_forward_prec_masked(c, src, &mut dst, abs_w, f32_lane, None);
+        dst
+    };
+    let (m32, d32) = (run(&mi, false, true), run(&di, true, true));
+    let (m64, d64) = (run(&mi, false, false), run(&di, true, false));
+    // `|W| |m|` (== `|W| |d|` here) in f64: each f64 reference is within
+    // `gamma_k |W| |.|` of exact, and `2 gamma_{k+2}` also covers the envelope's
+    // own rounding.
+    let env = run(&mi.mapv(f64::abs), true, false);
+    let g64 = 2.0 * gamma_n(c.k_fwd + 2);
+    // The historical charge on these rows: `B[t] = 0` exactly, so what reaches
+    // the output is the FTZ floor plus subnormal dust; `1e-290` dominates the
+    // dust with hundreds of orders to spare.
+    let ftz = next_up(2.0 * (c.k_fwd as f64 + 2.0) * SUBNORMAL_F32 * s_xabs);
+    let retired_ub = next_up(ftz + 1e-290);
+    let mut teeth = 0usize;
+    for o in 0..n_out {
+        let (mut lb, mut ub) = (0.0f64, 0.0f64);
+        for i in 0..naug {
+            let slack = g64 * env[[o, i]];
+            let dm = (m32[[o, i]] - m64[[o, i]]).abs();
+            let dd = (d32[[o, i]] - d64[[o, i]]).abs();
+            lb += ((dm - slack).max(0.0) + (dd - slack).max(0.0)) * xabs_ext[i];
+            ub += (dm + dd + 2.0 * slack) * xabs_ext[i];
+        }
+        // The f64 sum of non-negative terms under-reports by far less than 1e-12.
+        let ub = ub * (1.0 + 1e-12);
+        assert!(
+            charge[o] >= ub,
+            "row {o}: conv_f32_gerr charge {:.6e} < realized f32 deviation bound {ub:.6e} on a \
+             signed D lane (false-unsat risk on the f32 root lane)",
+            charge[o]
+        );
+        if lb > retired_ub {
+            teeth += 1;
+        }
+    }
+    eprintln!(
+        "[root-rounding] conv_f32_gerr signed-D pin: {teeth}/{n_out} rows beat the retired charge"
+    );
+    assert!(
+        teeth > 0,
+        "VOID: no row's realized f32 deviation exceeds the historical signed-D charge, so this \
+         fixture no longer tells |d| from d"
+    );
+}
+
+/// #root-rounding follow-up, END TO END on the shipped f32 root lanes
+/// (`root_f32`, and `tableau_f32` on top of it): the trunk-1 box must contain
+/// the EXACT stored-network hull when the conv consumes a SIGNED D lane.
+///
+/// Fixture: `x in [-3, -2]`; 256 identical trunk-0 neurons `z1 = w1 x + b1`
+/// (`w1 = -1.0000001`, `b1 = -2.6`), each unstable with `u < -l`, so
+/// `alpha = 0` and the upper line `U = s (m + d) + c` is NEGATIVE on every
+/// column (bias included, since 0 is outside the box). The gate output is
+/// then `M' = D' = U/2 < 0` on every coefficient: `|M'| + D' == 0` exactly
+/// (plus the bias-column rounding charge), which the historical signed
+/// functional `B[t] = sum_i (|m| + d) xabs_ext_i` charged NOTHING. The
+/// trunk-1 conv sums the 256 identical rows in f32, whose coherent rounding
+/// (plus `w2`'s f32 conversion) moves the walls by ~1e-7 relative with no
+/// incoming `g_err` large enough to cover it. The exact hull is
+/// `[0, 256 w2 (w1 lo + b1)]` (`w1 < 0`, so the relu is non-increasing in `x`
+/// and `z1(hi) < 0`).
+///
+/// Replica (`vbs/diag10/fix_root_rounding/review/`, exact rationals over an
+/// emulated `conv_f32_core`): the pre-repair f32 compute lane (the legacy
+/// switch, which also restores the signed functional) misses the exact max on
+/// all five `w2` below, by -3.1e-7 .. -8.6e-7 relative (-2.2e-5 .. -2.2e-4
+/// absolute); the repaired `root_f32` and `tableau_f32` lanes contain it with
+/// >= +7.6e-5 relative headroom, the f64 lane with +1.6e-13.
+#[test]
+fn f32_root_lanes_enclose_the_exact_hull_over_a_signed_d_lane() {
+    use num_rational::BigRational as Q;
+    use num_traits::{ToPrimitive, Zero};
+    let q = |v: f64| Q::from_float(v).expect("finite");
+    let (n1, w1, b1) = (256usize, -1.000_000_1f64, -2.6f64);
+    let (lo, hi) = ([-3.0f64], [-2.0f64]);
+    let z1 = |x: f64| q(w1) * q(x) + q(b1);
+    assert!(
+        z1(lo[0]) > Q::zero() && z1(hi[0]) < Q::zero(),
+        "premise: the trunk-0 pre-activation must straddle 0 on the box"
+    );
+    let w2s = [
+        0.7f64,
+        0.378_410_126_452_143_45,
+        0.553_420_884_290_434_2,
+        2.621_855_627_747_282_6,
+        2.733_854_135_551_005_5,
+    ];
+    let mut failures: Vec<String> = Vec::new();
+    let mut legacy_misses = 0usize;
+    let mut checked = 0usize;
+    for &w2 in &w2s {
+        let mut ops = vec![
+            TwinOpSpec::Conv {
+                input: 0,
+                weight: vec![w1; n1],
+                bias: vec![b1; n1],
+                bias_err: vec![0.0; n1],
+                weight_rel_err: 0.0,
+                kernel: (n1, 1, 1, 1),
+                stride: (1, 1),
+                pads: (0, 0, 0, 0),
+                ishape: (1, 1, 1),
+                oshape: (n1, 1, 1),
+            },
+            TwinOpSpec::Relu { input: 1 },
+            TwinOpSpec::Conv {
+                input: 2,
+                weight: vec![w2; n1],
+                bias: vec![0.0],
+                bias_err: vec![0.0],
+                weight_rel_err: 0.0,
+                kernel: (1, n1, 1, 1),
+                stride: (1, 1),
+                pads: (0, 0, 0, 0),
+                ishape: (n1, 1, 1),
+                oshape: (1, 1, 1),
+            },
+            TwinOpSpec::Relu { input: 3 },
+        ];
+        rounding_leak_head(&mut ops, 4, 1, 0x5167_E2E0);
+        let net = TwinNet::compile(&TwinSpec { n_in: 1, ops }).expect("compile");
+        let mx = q(n1 as f64) * q(w2) * z1(lo[0]);
+        let mn = Q::zero();
+        for (lane, use_f32, store) in [
+            ("f64", false, false),
+            ("root_f32", true, false),
+            ("tableau_f32", true, true),
+        ] {
+            let build = || {
+                RootGates::build_prec_store(
+                    &net,
+                    &lo,
+                    &hi,
+                    RoundMode::Outward,
+                    None,
+                    use_f32,
+                    store,
+                )
+            };
+            let fixed = build().expect("root");
+            assert_eq!(fixed.layers.len(), 2, "{lane} w2={w2}: two trunk relus");
+            let l0 = &fixed.layers[0];
+            assert!(
+                (0..l0.n).all(|j| l0.l[j] < 0.0 && l0.u[j] > 0.0 && l0.alpha[j] == 0.0),
+                "{lane} w2={w2}: premise lost — every trunk-0 relu must be unstable with \
+                 alpha = 0 (u < -l), or the gate rows are no longer |M| + D == 0"
+            );
+            let (l, u) = (fixed.layers[1].l[0], fixed.layers[1].u[0]);
+            checked += 1;
+            if !(q(l) <= mn && q(u) >= mx) {
+                failures.push(format!(
+                    "{lane} w2={w2}: box [{l:e}, {u:e}] vs exact [0, {:e}] (upper headroom {:+e})",
+                    mx.to_f64().unwrap_or(f64::NAN),
+                    (q(u) - &mx).to_f64().unwrap_or(f64::NAN),
+                ));
+            }
+            if lane == "root_f32" {
+                // MUTATION PIN: the pre-repair f32 compute lane (the legacy
+                // switch restores the signed `B` too) must miss somewhere.
+                let legacy =
+                    super::root::with_legacy_rounding_charge_for_test(build).expect("legacy root");
+                let (ll, lu) = (legacy.layers[1].l[0], legacy.layers[1].u[0]);
+                if !(q(ll) <= mn && q(lu) >= mx) {
+                    legacy_misses += 1;
+                }
+                eprintln!(
+                    "[root-rounding] f32 signed-D e2e w2={w2}: exact max {:e}; root_f32 up {u:e} \
+                     (headroom {:+.3e}); legacy up {lu:e} (headroom {:+.3e})",
+                    mx.to_f64().unwrap_or(f64::NAN),
+                    (q(u) - &mx).to_f64().unwrap_or(f64::NAN),
+                    (q(lu) - &mx).to_f64().unwrap_or(f64::NAN),
+                );
+            }
+        }
+    }
+    assert_eq!(checked, 3 * w2s.len(), "sweep did not run every lane");
+    assert!(
+        legacy_misses > 0,
+        "VOID: the pre-repair f32 compute lane contains the exact hull for every w2, so this \
+         fixture no longer detects the signed-D g_err under-count"
+    );
+    assert!(
+        failures.is_empty(),
+        "F32 ROOT LANE BOX MISSES THE EXACT STORED-NETWORK HULL (false-unsat generator): \
+         {failures:#?}"
+    );
+}
+
 /// #tableau-f32 interface gates for the ranker/clip consumers:
 /// (1) `retain_clip_rows` over f32-stored rows == over their EXACT f64
 ///     widenings, bitwise (retention happens once; rows STAY f64);
@@ -9366,7 +11597,7 @@ fn tableau_f32_store_floor_smoke() {
 /// Release-grade floor projection (#tableau-f32): a wider synthetic conv net
 /// whose tableau lanes leave cache, so the storage-width cut is visible.
 /// This is compiled only for release test builds; run it explicitly with:
-/// `cargo test --release -p ny-propagate tableau_f32_store_floor_smoke_big -- --nocapture`
+/// `targo --unverified test --release -p ny-propagate tableau_f32_store_floor_smoke_big -- --nocapture`
 #[cfg(not(debug_assertions))]
 #[test]
 fn tableau_f32_store_floor_smoke_big() {
@@ -9979,6 +12210,144 @@ fn gate_gerr_charge_is_bit_identical_where_either_slope_is_zero() {
     );
 }
 
+/// #gate-gerr-max-nonuniform: the uniformity hypothesis is NOT load-bearing.
+///
+/// `gate_gerr_out`'s header ends "alpha_j and s_j are uniform over the
+/// coefficient index i, so the factor pulls straight out of the aggregate", and
+/// two call sites turned that into "a per-start-node alpha cannot be baked
+/// forward". This simulates the gate EXACTLY on per-column errors with slopes
+/// that vary over the column index, and checks the generalized charge
+/// `A_j = max_i max(a_i, s_i)` still dominates.
+///
+/// Deterministic LCG, not a random source: a property test that cannot be
+/// replayed is not evidence.
+#[test]
+fn nonuniform_gate_charge_dominates_the_exact_per_column_carry() {
+    use super::root::gate_gerr_out_nonuniform;
+
+    let mut state: u64 = 0x2026_0913_5EED;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        ((state >> 11) as f64) / ((1u64 << 53) as f64)
+    };
+
+    let mut trials = 0usize;
+    let mut tightest_slack = f64::INFINITY;
+    for _ in 0..20_000 {
+        let n = 1 + (next() * 6.0) as usize;
+        let mut alphas = Vec::with_capacity(n);
+        let mut slopes = Vec::with_capacity(n);
+        let mut dm = Vec::with_capacity(n);
+        let mut dd = Vec::with_capacity(n);
+        let mut xabs = Vec::with_capacity(n);
+        for _ in 0..n {
+            alphas.push(next());
+            slopes.push(next());
+            dm.push(next() * 6.0 - 3.0);
+            dd.push(next() * 6.0 - 3.0);
+            xabs.push(next() * 4.0);
+        }
+
+        // g_err is the SUM-convention functional: sum_i (|dM_i| + |dD_i|) * xabs_i.
+        let g_in: f64 = (0..n).map(|i| (dm[i].abs() + dd[i].abs()) * xabs[i]).sum();
+        if g_in <= 0.0 {
+            continue;
+        }
+        // The EXACT carry, column by column, each with its OWN slopes.
+        let g_out: f64 = (0..n)
+            .map(|i| {
+                let dl = alphas[i] * (dm[i] - dd[i]);
+                let du = slopes[i] * (dm[i] + dd[i]);
+                (f64::midpoint(dl, du).abs() + ((du - dl) / 2.0).abs()) * xabs[i]
+            })
+            .sum();
+
+        let charged = gate_gerr_out_nonuniform(&alphas, &slopes, g_in);
+        assert!(
+            charged >= g_out - 1e-9,
+            "non-uniform charge {charged} under-charged the exact carry {g_out}"
+        );
+        // The contraction property the `max` form exists for must survive.
+        assert!(
+            charged <= g_in * (1.0 + 1e-12),
+            "charge {charged} exceeds g_in {g_in}: the functional GREW across a relu"
+        );
+        tightest_slack = tightest_slack.min(charged - g_out);
+        trials += 1;
+    }
+    assert!(trials > 15_000, "too few usable trials ({trials})");
+    // The bound must be ATTAINED somewhere, or it is not the best constant and
+    // this test would pass for a wildly loose charge too.
+    assert!(
+        tightest_slack < 1e-6,
+        "the charge is never tight (min slack {tightest_slack}); the test has no power"
+    );
+}
+
+/// NEGATIVE CONTROL for the test above: charging ONE column's slopes as if they
+/// were uniform is genuinely unsound, so the property being checked is not
+/// vacuous. If this ever stops finding a violation, the test above is asserting
+/// nothing.
+#[test]
+fn charging_a_single_columns_slopes_as_if_uniform_is_unsound() {
+    // Column 0 is nearly flat, column 1 is steep. Charging column 0's slopes
+    // for the whole aggregate under-charges column 1's carry.
+    let alphas = [0.0_f64, 1.0];
+    let slopes = [0.0_f64, 1.0];
+    let dm = [1.0_f64, 1.0];
+    let dd = [0.0_f64, 0.0];
+    let xabs = [1.0_f64, 1.0];
+
+    let g_in: f64 = (0..2).map(|i| (dm[i].abs() + dd[i].abs()) * xabs[i]).sum();
+    let g_out: f64 = (0..2)
+        .map(|i| {
+            let dl = alphas[i] * (dm[i] - dd[i]);
+            let du = slopes[i] * (dm[i] + dd[i]);
+            (f64::midpoint(dl, du).abs() + ((du - dl) / 2.0).abs()) * xabs[i]
+        })
+        .sum();
+
+    let unsound = super::root::gate_gerr_out(alphas[0], slopes[0], g_in);
+    assert!(
+        unsound < g_out,
+        "the negative control did not reproduce the under-charge it exists to show"
+    );
+
+    let sound = super::root::gate_gerr_out_nonuniform(&alphas, &slopes, g_in);
+    assert!(
+        sound >= g_out,
+        "the generalized charge must cover what the single-column charge misses"
+    );
+}
+
+/// Uniform slopes must collapse to exactly the shipped scalar charge, so
+/// adopting the general form can never move a bound that is uniform today.
+#[test]
+fn nonuniform_charge_collapses_to_the_scalar_charge_when_slopes_are_uniform() {
+    use super::root::{gate_gerr_out, gate_gerr_out_nonuniform};
+    for &(a, s) in &[
+        (0.0_f64, 0.0_f64),
+        (1.0, 1.0),
+        (1.0, 0.6),
+        (0.25, 0.75),
+        (0.5, 0.0),
+    ] {
+        for &g in &[0.0_f64, 1.0, 1e-9, 1e6] {
+            let uniform = gate_gerr_out(a, s, g);
+            let general = gate_gerr_out_nonuniform(&[a, a, a], &[s, s, s], g);
+            assert_eq!(
+                uniform, general,
+                "uniform ({a}, {s}) must be bit-identical, got {uniform} vs {general}"
+            );
+        }
+    }
+    // Empty must be the IDENTITY charge, never 0 — a zero factor would admit
+    // everything.
+    assert_eq!(gate_gerr_out_nonuniform(&[], &[], 3.5), 3.5);
+}
+
 /// #gate-gerr-max (A1) AGGREGATE REPORT — the honest measurement.
 ///
 /// Prints, over the zoo nets the f32 gates already use, (a) the gate CENSUS
@@ -10460,7 +12829,7 @@ fn domain_alpha_carry_is_capped_at_the_largest_deltas() {
     assert!(slots.len() > 4, "fixture: too few movable slots");
     let base = super::domain_alpha::read_alphas(&root, &dom, &slots);
     // Unchanged alphas are not carried at all.
-    assert!(super::domain_alpha::carry(&root, &slots, &base).is_empty());
+    assert_eq!((super::domain_alpha::carry(&root, &slots, &base)).len(), 0);
     // Give slot 0 the largest delta and slot 1 the second largest, everything
     // else a hair; then check a cap of that size would keep the right ones.
     let mut cur = base.clone();
@@ -10588,4 +12957,2843 @@ test's reasoning must be re-derived",
         compared > 20 && compared_unstable > 4,
         "vacuous comparison: compared={compared} unstable={compared_unstable}"
     );
+}
+
+// ===================== #clip-stateful (accumulate + inherit) =================
+//
+// D1 of the alpha-beta-CROWN 2024 -> 2025 cifar100 diff: abc intersects each
+// round's tightening against the PARENT's stored per-domain interval and writes
+// it back, so children inherit an object that compounds down the tree. ny's port
+// recomputed from the root frame and discarded the result, which is why its
+// dose-response measured FLAT. These tests pin the three things that can go
+// wrong with making it stateful: the dark arm must be byte-identical, the
+// accumulated intervals must still ENCLOSE the true activations over the child
+// region (the moat), and the accumulation must actually grow with depth
+// (otherwise the mechanism is unfalsifiable and its null vacuous — R9).
+
+/// Build a root with Clip-and-Verify row retention armed. Returns `None` when
+/// the fixture retains nothing, so the callers stay honest about vacuity.
+fn clip_chain_fixture(
+    env: &mut ny_test_utils::env::EnvEditor,
+    topk: &str,
+) -> Option<(TwinNet, RootGates)> {
+    env.set("NY_MARGIN_ROW_CLIP_ROWS", "1");
+    env.set("NY_MARGIN_ROW_CLIP_INTERM", "1");
+    env.set("NY_MARGIN_ROW_CLIP_TOPK", topk);
+    let mut rng = StdRng::seed_from_u64(0xC11B_5EED);
+    let spec = tiny_spec(&mut rng, 0.6);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let lo = vec![-0.35; 72];
+    let hi = vec![0.35; 72];
+    let root = RootGates::build(&net, &lo, &hi, RoundMode::Outward, None).expect("root");
+    let ok = root
+        .layers
+        .first()
+        .is_some_and(|l| l.clip_rows.is_some() && l.unst.len() >= 4);
+    ok.then_some((net, root))
+}
+
+#[test]
+fn stateful_clip_is_byte_identical_when_dark() {
+    // DEFAULT OFF, and "off" must mean the gate vectors come out bit-for-bit as
+    // they did before the accumulator existed.
+    ny_test_utils::env::with_env_edits(|env| {
+        let Some((_net, root)) = clip_chain_fixture(env, "20") else {
+            panic!("fixture retained no clip rows — the assertion would be vacuous");
+        };
+        env.remove("NY_MARGIN_ROW_CLIP_STATEFUL");
+        let l0 = &root.layers[0];
+        let splits = vec![(0usize, l0.unst.len() / 2, -1i8), (0usize, 0usize, 1i8)];
+        let base = domain_gates(&root, &splits);
+        let (got, acc) = domain_gates_acc(&root, &splits, None);
+        assert!(acc.is_none(), "dark arm must not produce an accumulator");
+        assert_eq!(base.layers.len(), got.layers.len());
+        for ((ka, a), (kb, b)) in base.layers.iter().zip(&got.layers) {
+            assert_eq!(ka, kb);
+            for j in 0..a.alpha.len() {
+                assert_eq!(a.alpha[j].to_bits(), b.alpha[j].to_bits(), "alpha at {j}");
+                assert_eq!(a.s[j].to_bits(), b.s[j].to_bits(), "s at {j}");
+                assert_eq!(a.c[j].to_bits(), b.c[j].to_bits(), "c at {j}");
+                assert_eq!(a.ms[j].to_bits(), b.ms[j].to_bits(), "ms at {j}");
+            }
+        }
+    });
+}
+
+#[test]
+fn accumulated_clip_intervals_enclose_the_true_child_region() {
+    // THE MOAT TEST. Every stored interval must enclose its neuron's true range
+    // over the region the domain's splits carve out — the induction that makes
+    // parent -> child inheritance sound. A violation is a false-`unsat`
+    // generator, so it is checked against SAMPLED forward activations filtered
+    // to the split region, not against another bound.
+    ny_test_utils::env::with_env_edits(|env| {
+        let Some((net, root)) = clip_chain_fixture(env, "3") else {
+            panic!("fixture retained no clip rows — the assertion would be vacuous");
+        };
+        env.set("NY_MARGIN_ROW_CLIP_STATEFUL", "1");
+        let nu = root.layers[0].unst.len();
+        let chain: Vec<(usize, usize, i8)> = vec![(0, nu / 2, -1), (0, 0, 1), (0, nu - 1, -1)];
+        let mut rng = StdRng::seed_from_u64(0x5AFE_5EED);
+        let x = sample_box(&mut rng, &root, 3000);
+        let mut pre_sel = std::collections::BTreeMap::new();
+        for l in &root.layers {
+            pre_sel.insert(l.op, (0..l.n).collect::<Vec<_>>());
+        }
+        let (_y, pre) = net.forward_points(&x, &pre_sel).expect("forward");
+
+        let mut acc: Option<std::sync::Arc<super::clip::ClipAcc>> = None;
+        let mut carried = Vec::new();
+        let mut checked = 0usize;
+        for depth in 1..=chain.len() {
+            let splits = &chain[..depth];
+            let (_dg, out) = domain_gates_acc(&root, splits, acc.as_deref());
+            let out = out.expect("armed arm must produce an accumulator");
+            carried.push(out.len());
+            assert_eq!(
+                out.refused(),
+                0,
+                "depth {depth}: a refused merge means an endpoint crossed — investigate \
+                 before trusting any measurement from this arm"
+            );
+            // Sampled points that lie in THIS domain's region.
+            let inside: Vec<usize> = (0..x.ncols())
+                .filter(|&b| {
+                    splits.iter().all(|&(li, pos, sign)| {
+                        let idx = root.layers[li].unst[pos];
+                        let z = pre[&root.layers[li].op][[idx, b]];
+                        if sign > 0 {
+                            z >= 0.0
+                        } else {
+                            z <= 0.0
+                        }
+                    })
+                })
+                .collect();
+            for (li, layer) in root.layers.iter().enumerate() {
+                for (idx, lo, hi) in out.layer_entries(li) {
+                    assert!(
+                        lo >= layer.l[idx] - 1e-12 && hi <= layer.u[idx] + 1e-12,
+                        "depth {depth}: accumulated [{lo}, {hi}] is not a SHRINK of the root \
+                         [{}, {}] at layer {li} neuron {idx}",
+                        layer.l[idx],
+                        layer.u[idx]
+                    );
+                    for &b in &inside {
+                        let z = pre[&layer.op][[idx, b]];
+                        assert!(
+                            lo <= z + 1e-9 && hi >= z - 1e-9,
+                            "depth {depth}: accumulated [{lo}, {hi}] EXCLUDES a true \
+                             activation {z} at layer {li} neuron {idx} — false-unsat generator"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+            acc = Some(out);
+        }
+        eprintln!("[test clip-stateful] carried per depth: {carried:?} checks: {checked}");
+        assert!(
+            carried.last().is_some_and(|&n| n > 0),
+            "nothing was ever accumulated — the moat check is vacuous: {carried:?}"
+        );
+        for w in carried.windows(2) {
+            assert!(w[1] >= w[0], "accumulation must be monotone: {carried:?}");
+        }
+    });
+}
+
+// ======================= #clip-head MOAT + FRAME TESTS =======================
+//
+// Every one of these exists because a halfspace built from a certified line is
+// a NECESSARY condition of its split ONLY IF the slack the lane already paid is
+// subtracted from it. Drop the slack and the constraint cuts into the TRUE
+// subdomain, the dual then reports a bound that is not a bound, and the lane
+// manufactures `unsat` — the class fixed five times in the trunk port. So the
+// tests do not merely check that the port is sound; two of them DEMONSTRATE the
+// defect on a fixture where it is visible, which is the only way to know the
+// check would notice.
+
+/// The head analogue of `clip_chain_fixture`: a net, its root gates, one
+/// trunk-split domain, that domain's y-pack rows, their UNTIGHTENED
+/// concretization, and the recovered head slack. `None` when the fixture would
+/// make an assertion vacuous, so every caller panics rather than passing
+/// silently.
+#[allow(clippy::type_complexity)]
+fn head_clip_fixture(
+    seed: u64,
+    trunk: &[(usize, usize, i8)],
+) -> Option<(
+    TwinNet,
+    RootGates,
+    super::engine::PassOut,
+    super::engine::PassOut,
+    Vec<f64>,
+    Vec<f64>,
+    super::clip::HeadSlack,
+)> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let spec = tiny_spec(&mut rng, 0.6);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let lo = vec![-0.35; 72];
+    let hi = vec![0.35; 72];
+    let root = RootGates::build(&net, &lo, &hi, RoundMode::Outward, None).expect("root");
+    let eng = BackwardEngine::new(&net, &root);
+    let dom = domain_gates(&root, trunk);
+    let (al, au) = eng
+        .y_rows(if trunk.is_empty() { None } else { Some(&dom) })
+        .expect("y_rows");
+    let ybox = YBox::from_rows(&eng, &al, &au);
+    let (ly_fwd, uy_fwd) = (ybox.ly.clone(), ybox.uy);
+    let slack = super::clip::head_slack(
+        &al, &au, &ly_fwd, &uy_fwd, &root.mid, &root.rad, &root.xabs, 0.5,
+    )?;
+    // Non-vacuity: at least one head neuron must actually be unstable, or a
+    // head fix has nothing to constrain and every downstream assertion is empty.
+    let unstable = (0..ly_fwd.len()).any(|i| ly_fwd[i] < 0.0 && uy_fwd[i] > 0.0);
+    unstable.then_some((net, root, al, au, ly_fwd, uy_fwd, slack))
+}
+
+#[test]
+fn head_slack_calibration_must_use_fresh_concretization() {
+    // THE ORDERING TRAP, for the head lines. `pack.ly0/uy0` are mutated in place
+    // by `clip_tighten_pack` whenever `margin_row.clip` is armed, and
+    // `entry.ly/uy` are ancestor-intersected. Calibrating against either
+    // under-recovers the slack, and an under-recovered slack makes the halfspace
+    // claim the line bounds `y_i` more tightly than certified. The port must
+    // REFUSE, not clamp — a clamped zero is indistinguishable from an exact line.
+    let (_net, root, al, au, ly_fwd, uy_fwd, slack) =
+        head_clip_fixture(0x11EA_D0C1, &[]).expect("fixture must produce a usable head pack");
+    let n_y = ly_fwd.len();
+    assert!(n_y > 0, "fixture has no head columns — assertions vacuous");
+
+    // Leg 1: the recovered slack IS the gap between the line's own box minimum
+    // and the bound the lane published from it, up to the rounding pad.
+    let mut nonzero = 0usize;
+    for i in 0..n_y {
+        let mut bmin = al.b[i];
+        for j in 0..root.mid.len() {
+            let c = al.a[[j, i]];
+            bmin += c.mul_add(root.mid[j], -(c.abs() * root.rad[j]));
+        }
+        let gap = bmin - ly_fwd[i];
+        assert!(
+            slack.sl_lo[i] >= gap - 1e-12,
+            "column {i}: recovered slack {} UNDER-recovers the published gap {gap}",
+            slack.sl_lo[i]
+        );
+        assert!(
+            slack.sl_lo[i] >= 0.0 && slack.sl_up[i] >= 0.0,
+            "column {i}: negative slack survived the frame gate"
+        );
+        if gap > 0.0 {
+            nonzero += 1;
+        }
+    }
+    assert!(
+        nonzero > 0,
+        "no column carried a certified slack — this fixture cannot distinguish the \
+         slacked halfspace from the unslacked one, so the moat legs would be vacuous"
+    );
+
+    // Leg 2: calibrate against a TIGHTENED bound (what reading a
+    // `clip_tighten_pack`-mutated `ly0`, or an ancestor-intersected `entry.ly`,
+    // would hand us) and the port must refuse the whole pack.
+    let ly_tight: Vec<f64> = ly_fwd.iter().map(|v| v + 0.3).collect();
+    assert!(
+        super::clip::head_slack(
+            &al, &au, &ly_tight, &uy_fwd, &root.mid, &root.rad, &root.xabs, 0.5
+        )
+        .is_none(),
+        "a tightened lower calibration must REFUSE (the trap), never clamp to zero"
+    );
+    let uy_tight: Vec<f64> = uy_fwd.iter().map(|v| v - 0.3).collect();
+    assert!(
+        super::clip::head_slack(
+            &al, &au, &ly_fwd, &uy_tight, &root.mid, &root.rad, &root.xabs, 0.5
+        )
+        .is_none(),
+        "a tightened upper calibration must REFUSE (the trap)"
+    );
+}
+
+#[test]
+fn head_frame_gate_refuses_a_transposed_or_shifted_pack() {
+    // A frame error is wrong by FACTORS, not by one slack term. Both shapes the
+    // trunk port was burned by are checked here: a transposed read (caught on
+    // shape, because `PassOut.a` is `(n_in, R)` while `ClipRows.m` is
+    // `(unst, n_in)` — reading one as the other is "wrong in both axes at
+    // once"), and a bias that does not belong to the published bound, which is
+    // what a dropped augmented-bias column looks like. The +/- shift is used
+    // rather than a literal `b = 0` so that both refusal legs — negative slack
+    // and slack larger than the interval — fire deterministically instead of
+    // depending on the fixture's random bias signs.
+    let (_net, root, al, au, ly_fwd, uy_fwd, _slack) =
+        head_clip_fixture(0x11EA_D0C2, &[]).expect("fixture");
+    let n_y = ly_fwd.len();
+
+    let mut t = super::engine::PassOut {
+        a: al.a.t().to_owned(),
+        e: None,
+        b: al.b.clone(),
+        eb: al.eb.clone(),
+        coll: None,
+        coll_rows: None,
+        unst_rows: None,
+    };
+    assert!(
+        super::clip::head_slack(&t, &au, &ly_fwd, &uy_fwd, &root.mid, &root.rad, &root.xabs, 0.5)
+            .is_none(),
+        "a transposed coefficient matrix must be refused on shape"
+    );
+
+    let width: Vec<f64> = (0..n_y)
+        .map(|i| (uy_fwd[i] - ly_fwd[i]).abs().max(1.0))
+        .collect();
+    t = super::engine::PassOut {
+        a: al.a.clone(),
+        e: al.e.clone(),
+        b: (0..n_y).map(|i| al.b[i] + 10.0 * width[i]).collect(),
+        eb: al.eb.clone(),
+        coll: None,
+        coll_rows: None,
+        unst_rows: None,
+    };
+    assert!(
+        super::clip::head_slack(&t, &au, &ly_fwd, &uy_fwd, &root.mid, &root.rad, &root.xabs, 0.5)
+            .is_none(),
+        "a bias that overstates the line must be refused (slack >> interval width)"
+    );
+
+    t = super::engine::PassOut {
+        a: al.a.clone(),
+        e: al.e.clone(),
+        b: (0..n_y).map(|i| al.b[i] - 10.0 * width[i]).collect(),
+        eb: al.eb,
+        coll: None,
+        coll_rows: None,
+        unst_rows: None,
+    };
+    assert!(
+        super::clip::head_slack(&t, &au, &ly_fwd, &uy_fwd, &root.mid, &root.rad, &root.xabs, 0.5)
+            .is_none(),
+        "a bias that understates the line yields a NEGATIVE slack and must be refused, \
+         never clamped to zero"
+    );
+}
+
+/// A fixture in which a head split's halfspace actually BITES, and in which
+/// there is something for it to bite ON.
+///
+/// THREE things have to hold at once, and on a random net they never do
+/// together. Each was measured failing before this builder existed:
+///
+///  * THE HALFSPACE MUST REMOVE PART OF THE BOX. For an INACTIVE fix it is
+///    `lower_line(x) - sl_lo <= 0`, whose range centre over the root box is
+///    `lower_line(mid) - sl_lo`; unless that is POSITIVE the whole box already
+///    satisfies it, the dual correctly returns `beta = 0`, and the step engages
+///    and tightens nothing. On the plain `tiny_spec` fixture the best of 60
+///    (neuron, direction) candidates across 12 seeds scored `-4.85` — satisfied
+///    with five box-widths to spare.
+///  * THE CHILD MUST BE NON-EMPTY under SAMPLING, not merely under the bounds.
+///    `lower_line(mid)` is measured against the line's L1 half-width `hw`, but a
+///    sampled `y_i` concentrates far inside that: for 72 inputs its standard
+///    deviation is about `hw / 15`. Offsetting by `0.35 * hw` — an unremarkable
+///    5 sigma — put ZERO of 40 000 samples in the child.
+///  * THERE MUST BE OTHER UNSTABLE HEAD COLUMNS. `head_columns` only offers
+///    neurons with `ly < 0 < uy`, and the split neuron is clamped stable by its
+///    own fix, so a fixture where one neuron straddles zero gives `cols = 0`.
+///
+/// So this builder shrinks the box until the trunk relaxation is nearly exact,
+/// then shifts EVERY head neuron's Gemm bias: the split neuron to `k` sampling
+/// sigmas above zero (biting, and reachable), every other neuron to zero (so it
+/// straddles and the dual has somewhere to put the constraint). The shifts are
+/// exact bookkeeping, not tuning: the head Gemm is linear, so adding `delta` to
+/// `bias[j]` adds exactly `delta` to `al.b[j]`, `au.b[j]`, `ly_fwd[j]`,
+/// `uy_fwd[j]` and to the true `y_j`, and changes nothing about the trunk, the
+/// gates or the certified error.
+#[allow(clippy::type_complexity)]
+fn head_clip_biting_fixture(
+    seed: u64,
+    radius: f64,
+    sigmas: f64,
+) -> Option<(
+    TwinNet,
+    RootGates,
+    super::engine::PassOut,
+    super::engine::PassOut,
+    Vec<f64>,
+    Vec<f64>,
+    super::clip::HeadSlack,
+    (usize, i8),
+)> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut spec = tiny_spec(&mut rng, 0.6);
+    let lo = vec![-radius; 72];
+    let hi = vec![radius; 72];
+    let net = TwinNet::compile(&spec).ok()?;
+    let root = RootGates::build(&net, &lo, &hi, RoundMode::Outward, None).ok()?;
+    let eng = BackwardEngine::new(&net, &root);
+    let (al, au) = eng.y_rows(None).ok()?;
+    let n_in = root.mid.len();
+    let n_y = al.a.ncols();
+    // Per column: the line's value at the box centre, its L1 half-width, and the
+    // standard deviation a uniform sample of the box actually produces.
+    let mut lower_mid = vec![0.0f64; n_y];
+    let mut rel = vec![f64::INFINITY; n_y];
+    let mut sd = vec![0.0f64; n_y];
+    for i in 0..n_y {
+        let (mut lm, mut um, mut hw, mut sq) = (al.b[i], au.b[i], 0.0f64, 0.0f64);
+        for j in 0..n_in {
+            lm += al.a[[j, i]] * root.mid[j];
+            um += au.a[[j, i]] * root.mid[j];
+            hw += al.a[[j, i]].abs() * root.rad[j];
+            sq += (al.a[[j, i]] * root.rad[j]).powi(2);
+        }
+        if !hw.is_finite() || hw <= 0.0 || !lm.is_finite() || !um.is_finite() {
+            return None;
+        }
+        lower_mid[i] = lm;
+        rel[i] = (um - lm) / hw;
+        sd[i] = (sq / 3.0).sqrt();
+    }
+    // The split neuron is the one whose lines are TIGHTEST relative to their own
+    // spread: a loose lower line can sit far below zero while the true `y_i`
+    // never crosses it, which is the empty-child failure above.
+    let (split, _) = rel
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.is_finite())
+        .min_by(|a, b| a.1.total_cmp(b.1))?;
+    if rel[split] >= 0.5 || sd[split] <= 0.0 {
+        return None;
+    }
+    let TwinOpSpec::Gemm { bias, .. } = &mut spec.ops[6] else {
+        return None;
+    };
+    for (i, b) in bias.iter_mut().enumerate().take(n_y) {
+        let want = if i == split { sigmas * sd[i] } else { 0.0 };
+        *b += want - lower_mid[i];
+    }
+    let net = TwinNet::compile(&spec).ok()?;
+    let root = RootGates::build(&net, &lo, &hi, RoundMode::Outward, None).ok()?;
+    let eng = BackwardEngine::new(&net, &root);
+    let (al, au) = eng.y_rows(None).ok()?;
+    let ybox = YBox::from_rows(&eng, &al, &au);
+    let (ly_fwd, uy_fwd) = (ybox.ly.clone(), ybox.uy);
+    // Non-vacuity: the split must be splittable, and at least two OTHER columns
+    // must be offerable to the dual or `cols` comes out 0.
+    if !(ly_fwd[split] < 0.0 && uy_fwd[split] > 0.0) {
+        return None;
+    }
+    if (0..n_y)
+        .filter(|&i| i != split && ly_fwd[i] < 0.0 && uy_fwd[i] > 0.0)
+        .count()
+        < 2
+    {
+        return None;
+    }
+    let slack = super::clip::head_slack(
+        &al, &au, &ly_fwd, &uy_fwd, &root.mid, &root.rad, &root.xabs, 0.5,
+    )?;
+    Some((net, root, al, au, ly_fwd, uy_fwd, slack, (split, -1)))
+}
+
+#[test]
+fn head_clip_encloses_the_true_subdomain() {
+    // THE MOAT TEST. Three legs, all against SAMPLED forward activations rather
+    // than against another bound:
+    //   * NECESSARY CONDITION — every sample in the true subdomain satisfies
+    //     every emitted halfspace. A violation means the constraint CUT the
+    //     region, which is the false-`unsat` generator this family exists for.
+    //   * ENCLOSURE — after the step, every head neuron's interval still
+    //     contains every in-region sample's true pre-activation.
+    //   * SHRINK-ONLY, against the forward box and against the incoming box.
+    // Plus the CHILD leg, the only coverage of the INDIRECT surface: a clipped
+    // box is inherited one level down, re-clamped, and clipped again, which also
+    // exercises the MULTI-halfspace path the parent leg does not.
+    //
+    // R9 is enforced by the step's OWN counter, not assumed: see
+    // `head_clip_biting_fixture` for why a fixture that engages but tightens
+    // nothing is the easy accident here, and what it takes to avoid one.
+    let mut diag: Vec<String> = Vec::new();
+    let mut ran = false;
+    'search: for seed in [0x11EA_D0C3u64, 0x11EA_D0D1, 0x11EA_D0D2, 0x11EA_D0D3] {
+        for radius in [0.02f64, 0.05, 0.1] {
+            for target in [1.0f64, 0.6, 1.5] {
+                let Some((net, root, al, au, ly_fwd, uy_fwd, slack, head_fix)) =
+                    head_clip_biting_fixture(seed, radius, target)
+                else {
+                    diag.push(format!("seed {seed:#x} r={radius} t={target}: no fixture"));
+                    continue;
+                };
+                let (mid, rad) = (root.mid.as_slice(), root.rad.as_slice());
+                let heads = vec![head_fix];
+                let (fi, fdir) = head_fix;
+                let hs = super::clip::halfspaces_for_heads(
+                    &al,
+                    &au,
+                    &slack,
+                    &heads,
+                    super::clip::HEAD_H_CAP,
+                )
+                .expect("halfspaces must build on a frame-checked pack");
+                let (rlo, rhi) = super::clip::halfspace_range(&hs[0], mid, rad);
+                let score = (rlo + rhi) / (rhi - rlo);
+
+                let mut pre_sel = std::collections::BTreeMap::new();
+                for l in &root.layers {
+                    pre_sel.insert(l.op, (0..l.n).collect::<Vec<_>>());
+                }
+                let mut rng = StdRng::seed_from_u64(seed ^ 0x5EED);
+                let x = sample_box(&mut rng, &root, 40_000);
+                let (y, _pre) = net.forward_points(&x, &pre_sel).expect("forward");
+                let inside: Vec<usize> = (0..x.ncols())
+                    .filter(|&b| {
+                        if fdir > 0 {
+                            y[[fi, b]] >= 0.0
+                        } else {
+                            y[[fi, b]] <= 0.0
+                        }
+                    })
+                    .collect();
+
+                let mut ybox = YBox {
+                    ly: ly_fwd.clone(),
+                    uy: uy_fwd.clone(),
+                };
+                ybox.clamp(&heads);
+                let before = ybox.clone();
+                let out = super::clip::tighten_head_box(
+                    &al,
+                    &au,
+                    &slack,
+                    &ly_fwd,
+                    &uy_fwd,
+                    &heads,
+                    mid,
+                    rad,
+                    &mut ybox.ly,
+                    &mut ybox.uy,
+                    super::clip::HEAD_H_CAP,
+                    super::clip::HEAD_C_CAP,
+                );
+                if out.moved == 0 || inside.len() < 20 {
+                    diag.push(format!(
+                        "seed {seed:#x} r={radius} t={target} fix={head_fix:?} score={score:.3}: \
+                         hs={} cols={} moved={} sum_delta={:.3e} inside={}",
+                        out.hs,
+                        out.cols,
+                        out.moved,
+                        out.sum_delta,
+                        inside.len()
+                    ));
+                    continue;
+                }
+                ran = true;
+                eprintln!(
+                    "[test clip-head] seed={seed:#x} r={radius} t={target} fix={head_fix:?} \
+                     score={score:.3} hs={} cols={} moved={} sum_delta={:.6e} closes={} \
+                     refused={} inside={}",
+                    out.hs,
+                    out.cols,
+                    out.moved,
+                    out.sum_delta,
+                    out.closes,
+                    out.refused_cross,
+                    inside.len()
+                );
+                assert_eq!(
+                    out.refused_cross, 0,
+                    "a refused crossing needs investigating before any measurement is believed"
+                );
+
+                // LEG 1: every halfspace is a NECESSARY condition of the domain.
+                for h in &hs {
+                    for &b in &inside {
+                        let mut v = h.d;
+                        for j in 0..h.a.len() {
+                            v += h.a[j] * x[[j, b]];
+                        }
+                        assert!(
+                            v <= 1e-9,
+                            "seed {seed:#x}: a head halfspace EXCLUDES a true-subdomain point \
+                             (a.x + d = {v}) — false-unsat generator"
+                        );
+                    }
+                }
+
+                // LEGS 2 + 3: shrink-only, and enclosure of every in-region sample.
+                for j in 0..ybox.ly.len() {
+                    assert!(
+                        ybox.ly[j] >= ly_fwd[j] - 1e-12 && ybox.uy[j] <= uy_fwd[j] + 1e-12,
+                        "column {j}: [{}, {}] is not a shrink of the forward [{}, {}]",
+                        ybox.ly[j],
+                        ybox.uy[j],
+                        ly_fwd[j],
+                        uy_fwd[j]
+                    );
+                    assert!(
+                        ybox.ly[j] >= before.ly[j] - 1e-12 && ybox.uy[j] <= before.uy[j] + 1e-12,
+                        "column {j}: the step WIDENED the incoming box"
+                    );
+                    for &b in &inside {
+                        let v = y[[j, b]];
+                        assert!(
+                            ybox.ly[j] <= v + 1e-9 && ybox.uy[j] >= v - 1e-9,
+                            "column {j}: clipped [{}, {}] EXCLUDES a true activation {v} — \
+                             false-unsat generator",
+                            ybox.ly[j],
+                            ybox.uy[j]
+                        );
+                    }
+                }
+
+                // CHILD LEG: inherit the clipped box, clamp the child's own fix
+                // on top, clip again against the same pack.
+                let child = (0..ly_fwd.len())
+                    .find(|&i| ybox.ly[i] < 0.0 && ybox.uy[i] > 0.0 && i != fi)
+                    .map(|child_i| {
+                        let pos = inside.iter().filter(|&&b| y[[child_i, b]] >= 0.0).count();
+                        (child_i, if pos * 2 >= inside.len() { 1i8 } else { -1i8 })
+                    });
+                if let Some((child_i, child_dir)) = child {
+                    let mut cheads = heads.clone();
+                    cheads.push((child_i, child_dir));
+                    let mut cbox = ybox.clone();
+                    cbox.clamp(&cheads);
+                    let cinside: Vec<usize> = inside
+                        .iter()
+                        .copied()
+                        .filter(|&b| {
+                            if child_dir > 0 {
+                                y[[child_i, b]] >= 0.0
+                            } else {
+                                y[[child_i, b]] <= 0.0
+                            }
+                        })
+                        .collect();
+                    let cout = super::clip::tighten_head_box(
+                        &al,
+                        &au,
+                        &slack,
+                        &ly_fwd,
+                        &uy_fwd,
+                        &cheads,
+                        mid,
+                        rad,
+                        &mut cbox.ly,
+                        &mut cbox.uy,
+                        super::clip::HEAD_H_CAP,
+                        super::clip::HEAD_C_CAP,
+                    );
+                    assert_eq!(cout.refused_cross, 0, "child step refused a crossing");
+                    assert_eq!(
+                        cout.hs, 2,
+                        "the child must fold BOTH head fixes into one dual"
+                    );
+                    for j in 0..cbox.ly.len() {
+                        for &b in &cinside {
+                            let v = y[[j, b]];
+                            assert!(
+                                cbox.ly[j] <= v + 1e-9 && cbox.uy[j] >= v - 1e-9,
+                                "CHILD column {j}: inherited+clipped [{}, {}] EXCLUDES a true \
+                                 activation {v}",
+                                cbox.ly[j],
+                                cbox.uy[j]
+                            );
+                        }
+                    }
+                    eprintln!(
+                        "[test clip-head] child: fix={child_i}/{child_dir} hs={} moved={} \
+                         cinside={}",
+                        cout.hs,
+                        cout.moved,
+                        cinside.len()
+                    );
+                }
+                break 'search;
+            }
+        }
+    }
+    assert!(
+        ran,
+        "no fixture produced a TIGHTENING head clip, so every enclosure assertion \
+         would have passed trivially (R9). Search log: {diag:#?}"
+    );
+}
+
+#[test]
+fn head_clip_is_byte_identical_when_dark() {
+    // DEFAULT OFF, and off must mean "the y-box, the head gates and the node's
+    // interval-exact path come out bit-for-bit as they did before this port".
+    // The gate is read PER CALL (never latched), so this also pins that the dark
+    // resolution costs nothing: `pack_from_rows` computes no slack at all.
+    ny_test_utils::env::with_env_edits(|env| {
+        env.remove("NY_MARGIN_ROW_CLIP_HEAD");
+        assert!(
+            !crate::preset_gates::margin_row_clip_head_enabled(),
+            "the head clip must default DARK"
+        );
+        let (_net, root, al, au, ly_fwd, uy_fwd, slack) =
+            head_clip_fixture(0x11EA_D0C4, &[]).expect("fixture");
+        // With no head fixes the step is a structural no-op: this is the shape
+        // the dark lane (and every root-domain eval) takes.
+        let mut ly = ly_fwd.clone();
+        let mut uy = uy_fwd.clone();
+        let out = super::clip::tighten_head_box(
+            &al,
+            &au,
+            &slack,
+            &ly_fwd,
+            &uy_fwd,
+            &[],
+            &root.mid,
+            &root.rad,
+            &mut ly,
+            &mut uy,
+            super::clip::HEAD_H_CAP,
+            super::clip::HEAD_C_CAP,
+        );
+        assert_eq!(out.hs, 0);
+        assert_eq!(out.moved, 0);
+        let ybox = YBox {
+            ly: ly.clone(),
+            uy: uy.clone(),
+        };
+        let base = YBox {
+            ly: ly_fwd.clone(),
+            uy: uy_fwd.clone(),
+        };
+        for j in 0..ly.len() {
+            assert_eq!(ly[j].to_bits(), ly_fwd[j].to_bits(), "ly at {j}");
+            assert_eq!(uy[j].to_bits(), uy_fwd[j].to_bits(), "uy at {j}");
+        }
+        for mode in [RoundMode::Parity, RoundMode::Outward] {
+            let a = head_gates(&ybox, mode);
+            let b = head_gates(&base, mode);
+            for j in 0..a.alpha.len() {
+                assert_eq!(a.alpha[j].to_bits(), b.alpha[j].to_bits(), "alpha at {j}");
+                assert_eq!(a.s[j].to_bits(), b.s[j].to_bits(), "s at {j}");
+                assert_eq!(a.c[j].to_bits(), b.c[j].to_bits(), "c at {j}");
+            }
+        }
+    });
+}
+
+#[test]
+fn head_clip_never_writes_the_shared_pack_and_is_order_independent() {
+    // The y-pack LRU is keyed by TRUNK splits alone, so every sibling with a
+    // different HEAD state holds the SAME `Arc<YPack>`. Writing a head-derived
+    // delta back would leak one child's constraints into all of them. The step
+    // takes the pack by shared reference and the box by `&mut`, so this is
+    // structural — the test pins it anyway, together with determinism across
+    // evaluation order (the parallel frontier's bit-identity contract).
+    let (_net, root, al, au, ly_fwd, uy_fwd, slack) =
+        head_clip_fixture(0x11EA_D0C5, &[]).expect("fixture");
+    let unst: Vec<usize> = (0..ly_fwd.len())
+        .filter(|&i| ly_fwd[i] < 0.0 && uy_fwd[i] > 0.0)
+        .collect();
+    assert!(
+        unst.len() >= 2,
+        "need two unstable head neurons for the sibling test"
+    );
+    let a_heads = vec![(unst[0], 1i8)];
+    let b_heads = vec![(unst[0], -1i8), (unst[1], 1i8)];
+    let al_bits: Vec<u64> = al.a.iter().map(|v| v.to_bits()).collect();
+    let fwd_bits: Vec<u64> = ly_fwd.iter().chain(&uy_fwd).map(|v| v.to_bits()).collect();
+
+    let run = |heads: &[(usize, i8)]| {
+        let mut ly = ly_fwd.clone();
+        let mut uy = uy_fwd.clone();
+        let mut bx = YBox {
+            ly: ly.clone(),
+            uy: uy.clone(),
+        };
+        bx.clamp(heads);
+        ly.clone_from(&bx.ly);
+        uy.clone_from(&bx.uy);
+        let out = super::clip::tighten_head_box(
+            &al,
+            &au,
+            &slack,
+            &ly_fwd,
+            &uy_fwd,
+            heads,
+            &root.mid,
+            &root.rad,
+            &mut ly,
+            &mut uy,
+            super::clip::HEAD_H_CAP,
+            super::clip::HEAD_C_CAP,
+        );
+        (ly, uy, out.moved, out.hs)
+    };
+    let first_a = run(&a_heads);
+    let first_b = run(&b_heads);
+    // Reversed order, and again from several rayon workers: pure function, so
+    // every result must be bit-identical.
+    let second_b = run(&b_heads);
+    let second_a = run(&a_heads);
+    assert_eq!(
+        first_a.0.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        second_a.0.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        first_b.0.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        second_b.0.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+    assert!(first_a.3 >= 1 && first_b.3 >= 1, "no halfspaces — vacuous");
+    let par: Vec<Vec<u64>> = {
+        use rayon::prelude::*;
+        (0..8)
+            .into_par_iter()
+            .map(|_| {
+                run(&b_heads)
+                    .0
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<u64>>()
+            })
+            .collect()
+    };
+    for p in &par {
+        assert_eq!(
+            p,
+            &first_b.0.iter().map(|v| v.to_bits()).collect::<Vec<u64>>(),
+            "a rayon worker produced a different clipped box"
+        );
+    }
+    // The pack and its forward calibration are untouched.
+    assert_eq!(
+        al_bits,
+        al.a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        "the shared pack's coefficients were mutated"
+    );
+    assert_eq!(
+        fwd_bits,
+        ly_fwd
+            .iter()
+            .chain(&uy_fwd)
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        "the forward calibration base was mutated"
+    );
+}
+
+#[test]
+fn accumulation_carries_more_neurons_than_one_visit_can() {
+    // R9: separates "ran and compounded" from "ran and re-derived the same
+    // numbers". With `topk = 1` a single visit touches at most one neuron per
+    // layer, so a carried set larger than that can only come from inheritance.
+    ny_test_utils::env::with_env_edits(|env| {
+        let Some((_net, root)) = clip_chain_fixture(env, "1") else {
+            panic!("fixture retained no clip rows — the assertion would be vacuous");
+        };
+        env.set("NY_MARGIN_ROW_CLIP_STATEFUL", "1");
+        let chain: Vec<(usize, usize, i8)> = vec![(0, 0, -1), (0, 1, 1), (0, 2, -1), (0, 3, 1)];
+        let mut acc: Option<std::sync::Arc<super::clip::ClipAcc>> = None;
+        let mut sizes = Vec::new();
+        for depth in 1..=chain.len() {
+            let (_dg, out) = domain_gates_acc(&root, &chain[..depth], acc.as_deref());
+            let out = out.expect("armed");
+            sizes.push(out.len());
+            acc = Some(out);
+        }
+        // A STATELESS visit of the DEEPEST domain, for contrast.
+        env.remove("NY_MARGIN_ROW_CLIP_STATEFUL");
+        let stateless = {
+            let (_dg, out) = domain_gates_acc(&root, &chain, None);
+            assert!(out.is_none(), "dark arm must not accumulate");
+            let mut n = 0usize;
+            let hs = super::clip::halfspaces_for_splits(&root, &chain);
+            for layer in &root.layers {
+                let (t, _) = super::clip::tighten_intermediate(
+                    layer,
+                    &hs,
+                    root.mid.as_slice(),
+                    root.rad.as_slice(),
+                    1,
+                );
+                n += t.len();
+            }
+            n
+        };
+        eprintln!(
+            "[test clip-stateful] topk=1 carried per depth: {sizes:?} vs one stateless visit: \
+             {stateless}"
+        );
+        for w in sizes.windows(2) {
+            assert!(w[1] >= w[0], "accumulation shrank: {sizes:?}");
+        }
+        assert!(
+            sizes.last().is_some_and(|&n| n >= stateless),
+            "accumulated {sizes:?} must dominate a single stateless visit ({stateless})"
+        );
+    });
+}
+
+// ============================================================================
+// #spec-alpha — the per-START-NODE (spec) alpha axis at the root direct pass.
+//
+// Reading the gates: T2 carries the column-separability argument, T3 carries
+// the enclosure, T4 carries the `ms = max(alpha, s)` obligation, and T7 is the
+// only one that asserts the MECHANISM rather than the plumbing. Assert those
+// four BY NAME; the rest are structure.
+// ============================================================================
+
+use super::spec_alpha::{
+    assign_columns, build_exceptions, gradient_moves, ladder_moves, refine, Cand, CandOrigin,
+    SpecAlphaPolicy, SPEC_ALPHA_ETA, SPEC_ALPHA_LADDER,
+};
+
+/// A fresh root + engine inputs for the #spec-alpha tests.
+struct SpecFix {
+    net: TwinNet,
+    lo: Vec<f64>,
+    hi: Vec<f64>,
+    t: usize,
+    adv: Vec<usize>,
+}
+
+fn spec_fixture(seed: u64, scale: f64, half: f64) -> SpecFix {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let spec = tiny_spec(&mut rng, scale);
+    let net = TwinNet::compile(&spec).expect("compile");
+    SpecFix {
+        net,
+        lo: vec![-half; 72],
+        hi: vec![half; 72],
+        t: 0,
+        adv: vec![1usize, 2, 3],
+    }
+}
+
+/// Every unstable neuron of every trunk layer, as `(layer, neuron)`.
+fn all_unstable(root: &RootGates) -> Vec<(usize, usize)> {
+    root.layers
+        .iter()
+        .enumerate()
+        .flat_map(|(li, l)| l.unst.iter().map(move |&j| (li, j)))
+        .collect()
+}
+
+/// Full gate override for a candidate's full-width alpha, with `ms` re-derived
+/// exactly the way the root build does. This is the RANK-1 REFERENCE T2
+/// compares the wide exception pass against.
+fn rank1_dom(root: &RootGates, alpha: &[Vec<f64>]) -> DomainGates {
+    let mut dg = DomainGates::default();
+    for (li, layer) in root.layers.iter().enumerate() {
+        if layer.unst.is_empty() {
+            continue;
+        }
+        let ms: Vec<f64> = alpha[li]
+            .iter()
+            .zip(&layer.s)
+            .map(|(a, s)| a.max(*s))
+            .collect();
+        dg.layers.insert(
+            li,
+            super::engine::GateVecs {
+                alpha: alpha[li].clone(),
+                s: layer.s.clone(),
+                c: layer.c.clone(),
+                ms,
+            },
+        );
+    }
+    dg
+}
+
+/// S1: the DARK path is byte-identical, and an armed-but-refusing policy is
+/// byte-identical too.
+///
+/// Bites during the `RootGates` field addition: a literal initialised to
+/// anything but `None` (the epoch child is the one that matters) fails here,
+/// and so does any accidental mutation of a gate by the refine path. The
+/// `entries: 0` arm is the negative control that proves the refusal is a
+/// refusal and not a silent run.
+#[test]
+fn spec_alpha_dark_root_eval_is_bitwise() {
+    for seed in 0..8u64 {
+        let f = spec_fixture(100 + seed, 0.6, 0.4);
+        let mut root =
+            RootGates::build(&f.net, &f.lo, &f.hi, RoundMode::Outward, None).expect("root");
+        assert!(
+            root.spec_alpha_policy.is_none(),
+            "seed {seed}: a freshly built root must carry NO #spec-alpha policy — \
+             the driver installs it after #rebake, never the builder"
+        );
+        let dark = {
+            let eng = BackwardEngine::new(&f.net, &root);
+            super::bab::root_eval(&eng, &f.net, f.t, &f.adv).expect("dark root_eval")
+        };
+        assert!(
+            dark.spec_alpha.is_none(),
+            "seed {seed}: a dark root_eval must report no #spec-alpha evidence"
+        );
+        let dark_bits: Vec<u64> = dark.dj.iter().map(|v| v.to_bits()).collect();
+
+        // Armed but refusing: `entries = 0` must refuse loudly and change nothing.
+        root.spec_alpha_policy = Some(SpecAlphaPolicy {
+            width: 3,
+            cands: 3,
+            rounds: 1,
+            entries: 0,
+            deadline: None,
+        });
+        let refused = {
+            let eng = BackwardEngine::new(&f.net, &root);
+            super::bab::root_eval(&eng, &f.net, f.t, &f.adv).expect("refusing root_eval")
+        };
+        let refused_bits: Vec<u64> = refused.dj.iter().map(|v| v.to_bits()).collect();
+        assert_eq!(
+            dark_bits, refused_bits,
+            "seed {seed}: entries_cap=0 must be BYTE-IDENTICAL to dark"
+        );
+        // And the gates themselves must be untouched by either evaluation.
+        for (li, layer) in root.layers.iter().enumerate() {
+            for &j in &layer.unst {
+                assert_eq!(
+                    layer.ms[j],
+                    layer.alpha[j].max(layer.s[j]),
+                    "seed {seed} layer {li} neuron {j}: ms drifted from max(alpha, s)"
+                );
+            }
+        }
+    }
+}
+
+/// T2: ONE wide pass whose columns carry per-column alpha through `Exceptions`
+/// reproduces, PER COLUMN, the separate rank-1 pass under that column's alpha —
+/// bitwise on the coefficient and coefficient-error lanes and on the bias, and
+/// `>=` (never `<`) on the bias-error lane.
+///
+/// This is the test that carries the whole soundness argument: it establishes
+/// column separability by EXECUTION rather than by reading the engine.
+///
+/// The `eb >= ` asymmetry is REAL and must not be asserted as equality: the
+/// exception path charges one extra `slack16` per entry on the bias-error lane
+/// (`engine.rs`, the `eb[x.row] = slack16(...)` line), which inflates the error
+/// and therefore LOWERS the certified bound. A correct implementation fails an
+/// equality assertion here.
+#[test]
+fn spec_alpha_replicated_pass_is_column_exact() {
+    let mut checked_cols = 0usize;
+    let mut saw_eb_slack = false;
+    for seed in 0..4u64 {
+        let f = spec_fixture(200 + seed, 0.7, 0.45);
+        let root = RootGates::build(&f.net, &f.lo, &f.hi, RoundMode::Outward, None).expect("root");
+        let unst = all_unstable(&root);
+        assert!(!unst.is_empty(), "seed {seed}: need unstable neurons");
+        let eng = BackwardEngine::new(&f.net, &root);
+        let (al, au) = eng.y_rows(None).expect("y_rows");
+        let ybox = YBox::from_rows(&eng, &al, &au);
+        let gates = head_gates(&ybox, RoundMode::Outward);
+
+        // Random per-column alpha, one candidate per column, all on ONE class
+        // so the columns are bit-identical replicas of each other apart from
+        // their exceptions.
+        let mut rng = StdRng::seed_from_u64(0xC0FFEE ^ seed);
+        let r = 5usize;
+        // Build the move sets first, drop the empty ones, and ONLY THEN assign
+        // columns -- filtering after assignment leaves a non-dense column set,
+        // which `build_exceptions` correctly refuses.
+        let mut move_sets: Vec<Vec<(usize, usize, f64)>> = Vec::new();
+        for _ in 0..r {
+            let mut moves = Vec::new();
+            for &(li, j) in &unst {
+                if rng.random_range(0.0..1.0) < 0.6 {
+                    moves.push((li, j, rng.random_range(0.0..1.0)));
+                }
+            }
+            if !moves.is_empty() {
+                move_sets.push(moves);
+            }
+        }
+        let cands: Vec<Cand> = move_sets
+            .into_iter()
+            .enumerate()
+            .map(|(col, moves)| Cand {
+                class_pos: 0,
+                col,
+                origin: CandOrigin::Ladder(col),
+                moves,
+            })
+            .collect();
+        assert!(
+            cands.len() >= 2,
+            "seed {seed}: need at least two candidates"
+        );
+        let r = cands.len();
+
+        let klass = f.adv[0];
+        let replicated: Vec<usize> = vec![klass; r];
+        let mbr = MarginBatch::new(&f.net, f.t, &replicated).expect("mb");
+        let msr = margin_seed(&mbr, &gates, &ybox, RoundMode::Outward);
+        let (exc, entries, _max_row) = build_exceptions(&root, &cands, r).expect("exception build");
+        assert!(entries > 0, "seed {seed}: no entries built");
+        let wide = eng
+            .run(&msr.seed, None, LaneDir::Lower, Some(&exc), false)
+            .expect("wide pass");
+
+        let mb1 = MarginBatch::new(&f.net, f.t, &[klass]).expect("mb1");
+        let ms1 = margin_seed(&mb1, &gates, &ybox, RoundMode::Outward);
+        for c in &cands {
+            let dom = rank1_dom(&root, &c.full_alpha(&root));
+            let sep = eng
+                .run(&ms1.seed, Some(&dom), LaneDir::Lower, None, false)
+                .expect("rank1 pass");
+            for i in 0..wide.a.nrows() {
+                assert_eq!(
+                    wide.a[[i, c.col]].to_bits(),
+                    sep.a[[i, 0]].to_bits(),
+                    "seed {seed} col {} input {i}: coefficient lane differs",
+                    c.col
+                );
+            }
+            if let (Some(ew), Some(es)) = (wide.e.as_ref(), sep.e.as_ref()) {
+                for i in 0..ew.nrows() {
+                    assert_eq!(
+                        ew[[i, c.col]].to_bits(),
+                        es[[i, 0]].to_bits(),
+                        "seed {seed} col {} input {i}: coefficient-ERROR lane differs",
+                        c.col
+                    );
+                }
+            }
+            assert_eq!(
+                wide.b[c.col].to_bits(),
+                sep.b[0].to_bits(),
+                "seed {seed} col {}: bias differs — s2/c2 must be the certified \
+                 chord VERBATIM so the exception's bias correction is exactly 0.0",
+                c.col
+            );
+            assert!(
+                wide.eb[c.col] >= sep.eb[0],
+                "seed {seed} col {}: exception bias-error {} sits BELOW the rank-1 \
+                 reference {} — the extra slack16 per entry must only ever inflate it",
+                c.col,
+                wide.eb[c.col],
+                sep.eb[0]
+            );
+            if wide.eb[c.col] > sep.eb[0] {
+                saw_eb_slack = true;
+            }
+            checked_cols += 1;
+        }
+    }
+    assert!(checked_cols >= 8, "only {checked_cols} columns checked");
+    assert!(
+        saw_eb_slack,
+        "the per-entry slack16 on the bias-error lane never showed — the test is \
+         not actually exercising the asymmetry it exists to pin"
+    );
+}
+
+/// T3: the published `dj` still lower-bounds the true margin when the axis is
+/// fed DELIBERATELY HOSTILE candidates — values pinned at both clamp vertices,
+/// values strictly worse than the heuristic, and a dense assignment over every
+/// unstable neuron.
+///
+/// Would fail if `ms` were not re-derived per entry from the REPLACEMENT
+/// slopes: that is the false-UNSAT generator this design exists to sidestep.
+#[test]
+fn spec_alpha_root_dj_lower_bounds_true_margin_under_hostile_candidates() {
+    const SLACK: f64 = 1e-9;
+    let mut checks = 0u64;
+    let mut worst_over = f64::NEG_INFINITY;
+    for seed in 0..24u64 {
+        let f = spec_fixture(
+            300 + seed,
+            0.35 + (seed % 5) as f64 * 0.18,
+            0.3 + (seed % 3) as f64 * 0.12,
+        );
+        let mut root =
+            RootGates::build(&f.net, &f.lo, &f.hi, RoundMode::Outward, None).expect("root");
+        if all_unstable(&root).is_empty() {
+            continue;
+        }
+        root.spec_alpha_policy = Some(SpecAlphaPolicy {
+            width: f.adv.len(),
+            cands: SPEC_ALPHA_LADDER.len(),
+            rounds: 3,
+            entries: 1 << 20,
+            deadline: None,
+        });
+        let re = {
+            let eng = BackwardEngine::new(&f.net, &root);
+            super::bab::root_eval(&eng, &f.net, f.t, &f.adv).expect("armed root_eval")
+        };
+        // Hostile: every clamp vertex and a "worse than heuristic" flip, dense
+        // over all unstable neurons, folded the same way `refine` folds.
+        let unst = all_unstable(&root);
+        let hostile: Vec<Cand> = [0.0f64, 1.0, 0.5]
+            .iter()
+            .enumerate()
+            .map(|(col, &v)| Cand {
+                class_pos: 0,
+                col,
+                origin: CandOrigin::Ladder(col),
+                moves: unst.iter().map(|&(li, j)| (li, j, v)).collect(),
+            })
+            .collect();
+        let eng = BackwardEngine::new(&f.net, &root);
+        let (al, au) = eng.y_rows(None).expect("y_rows");
+        let ybox = YBox::from_rows(&eng, &al, &au);
+        let gates = head_gates(&ybox, RoundMode::Outward);
+        let mut dj = re.dj;
+        for (ki, &k) in f.adv.iter().enumerate() {
+            let replicated: Vec<usize> = vec![k; hostile.len()];
+            let mbr = MarginBatch::new(&f.net, f.t, &replicated).expect("mb");
+            let msr = margin_seed(&mbr, &gates, &ybox, RoundMode::Outward);
+            let (exc, _e, _m) =
+                build_exceptions(&root, &hostile, hostile.len()).expect("hostile build");
+            let pass = eng
+                .run(&msr.seed, None, LaneDir::Lower, Some(&exc), false)
+                .expect("hostile pass");
+            let spec = per_class_direct(&eng, &pass, &msr, 0..hostile.len());
+            for v in spec {
+                if v.is_finite() {
+                    dj[ki] = dj[ki].max(v);
+                }
+            }
+        }
+        // Independent enclosure check against sampled forward margins.
+        let mut rng = StdRng::seed_from_u64(0xBADF00D ^ seed);
+        let mut x = sample_box(&mut rng, &root, 180);
+        // Corners and the centre, where a relaxation is tightest and an
+        // overstatement is most likely to be visible.
+        for i in 0..root.mid.len() {
+            x[[i, 0]] = root.mid[i] - root.rad[i];
+            x[[i, 1]] = root.mid[i] + root.rad[i];
+            x[[i, 2]] = root.mid[i];
+        }
+        let (y, _) = f
+            .net
+            .forward_points(&x, &std::collections::BTreeMap::new())
+            .expect("forward");
+        let margins = margins_at(&f.net, &y, f.t, &f.adv);
+        for (ki, mrow) in margins.iter().enumerate() {
+            for &m in mrow {
+                checks += 1;
+                worst_over = worst_over.max(dj[ki] - m);
+                assert!(
+                    dj[ki] <= m + SLACK,
+                    "seed {seed} class {ki}: #spec-alpha dj {} OVERSTATES the true \
+                     margin {m} — a hostile candidate produced an UNSOUND bound",
+                    dj[ki]
+                );
+            }
+        }
+    }
+    assert!(checks > 5_000, "only {checks} enclosure checks ran");
+    assert!(
+        worst_over > -1e3,
+        "closest approach {worst_over} suggests the oracle never came near the bound"
+    );
+}
+
+/// T4: every emitted exception carries `a2` in `[0,1]`, the UNTOUCHED certified
+/// chord (`s2`/`c2` bitwise equal to the layer's), and therefore an implied
+/// `m2 = |a2|.max(|s2|)` equal to `max(alpha, s)` — the one alpha-coupled
+/// certified quantity, asserted directly at the only site that writes it.
+#[test]
+fn spec_alpha_exceptions_carry_max_alpha_s_and_untouched_chord() {
+    let mut seen = 0usize;
+    for seed in 0..4u64 {
+        let f = spec_fixture(400 + seed, 0.65, 0.4);
+        let root = RootGates::build(&f.net, &f.lo, &f.hi, RoundMode::Outward, None).expect("root");
+        // Columns assigned AFTER dropping the empty ladder entries, so the set
+        // is dense; `build_exceptions` refuses a col >= cands.len().
+        let cands: Vec<Cand> = (0..SPEC_ALPHA_LADDER.len())
+            .map(|e| ladder_moves(&root, e))
+            .filter(|m| !m.is_empty())
+            .enumerate()
+            .map(|(col, moves)| Cand {
+                class_pos: 0,
+                col,
+                origin: CandOrigin::Ladder(col),
+                moves,
+            })
+            .collect();
+        if cands.is_empty() {
+            continue;
+        }
+        let cols = cands.len();
+        let (exc, _entries, _max_row) = build_exceptions(&root, &cands, cols).expect("build");
+        for (&li, list) in &exc.by_layer {
+            let layer = &root.layers[li];
+            for x in list {
+                seen += 1;
+                assert!(
+                    (0.0..=1.0).contains(&x.a2) && x.a2.is_finite(),
+                    "layer {li} neuron {}: a2 {} escaped [0, 1]",
+                    x.neuron,
+                    x.a2
+                );
+                assert_eq!(
+                    x.s2.to_bits(),
+                    layer.s[x.neuron].to_bits(),
+                    "layer {li} neuron {}: the certified UPPER chord slope was modified",
+                    x.neuron
+                );
+                assert_eq!(
+                    x.c2.to_bits(),
+                    layer.c[x.neuron].to_bits(),
+                    "layer {li} neuron {}: the certified upper INTERCEPT was modified",
+                    x.neuron
+                );
+                assert_eq!(
+                    x.a2.abs().max(x.s2.abs()).to_bits(),
+                    x.a2.max(layer.s[x.neuron]).to_bits(),
+                    "layer {li} neuron {}: the engine's per-entry Lipschitz constant \
+                     m2 = |a2|.max(|s2|) does not equal max(alpha, s)",
+                    x.neuron
+                );
+                assert!(
+                    layer.unst.contains(&x.neuron),
+                    "layer {li} neuron {}: a STABLE neuron was given a candidate",
+                    x.neuron
+                );
+            }
+        }
+    }
+    assert!(seen > 50, "only {seen} exceptions inspected");
+}
+
+/// T5a: an out-of-range column must REFUSE. The uniform exception arm indexes
+/// `cur.l[[x.neuron, x.row]]` with no validation, so this is a PANIC inside a
+/// verdict pass if the builder lets it through — not a wrong answer, a crash.
+#[test]
+fn spec_alpha_builder_refuses_out_of_range_row() {
+    let f = spec_fixture(501, 0.6, 0.4);
+    let root = RootGates::build(&f.net, &f.lo, &f.hi, RoundMode::Outward, None).expect("root");
+    let unst = all_unstable(&root);
+    assert_ne!((unst).len(), 0);
+    let cands = vec![Cand {
+        class_pos: 0,
+        col: 7,
+        origin: CandOrigin::Ladder(0),
+        moves: vec![(unst[0].0, unst[0].1, 0.5)],
+    }];
+    assert!(
+        build_exceptions(&root, &cands, 3).is_err(),
+        "a column beyond the pass width must refuse, not index out of bounds"
+    );
+}
+
+/// T5b: a STABLE (or split-baked) neuron must REFUSE — it keeps its exact fixed
+/// line and a fractional lower slope is not the relaxation its certificate
+/// describes.
+#[test]
+fn spec_alpha_builder_refuses_stable_neuron() {
+    // A STABLE neuron is a fixture requirement, not a given: at a wide enough box
+    // every trunk neuron is unstable and this test would have nothing to assert.
+    // Search a grid rather than assume one seed -- a NARROW box is what makes
+    // neurons stable -- and fail loudly if the whole grid has none, because a
+    // fixture that silently cannot bite is worse than no test.
+    let mut found = None;
+    'grid: for seed in 0..6u64 {
+        for half in [0.02f64, 0.05, 0.12, 0.3] {
+            let f = spec_fixture(502 + seed, 0.6, half);
+            let root =
+                RootGates::build(&f.net, &f.lo, &f.hi, RoundMode::Outward, None).expect("root");
+            // Need BOTH: a stable neuron to aim at, and at least one unstable
+            // one, so the refusal is about stability rather than about the
+            // layer being degenerate.
+            if root.layers.iter().all(|l| l.unst.is_empty()) {
+                continue;
+            }
+            for (li, layer) in root.layers.iter().enumerate() {
+                if let Some(j) = (0..layer.n).find(|j| !layer.unst.contains(j)) {
+                    found = Some((root, li, j, seed, half));
+                    break 'grid;
+                }
+            }
+        }
+    }
+    let (root, li, j, seed, half) =
+        found.expect("no net in the grid had a stable neuron — widen the fixture search");
+    assert!(
+        !root.layers[li].unst.contains(&j),
+        "seed {seed} half {half}: picked neuron is not stable"
+    );
+    let cands = vec![Cand {
+        class_pos: 0,
+        col: 0,
+        origin: CandOrigin::Ladder(0),
+        moves: vec![(li, j, 0.5)],
+    }];
+    assert!(
+        build_exceptions(&root, &cands, 1).is_err(),
+        "seed {seed} half {half}: a STABLE neuron must refuse a candidate alpha — it \
+         keeps its exact fixed line and a fractional lower slope is not the \
+         relaxation its certificate describes"
+    );
+}
+
+/// T5c: a duplicate `(row, neuron)` at one layer must REFUSE — it would
+/// double-apply the gate from a stale pre-transform snapshot and charge the
+/// bias-error lane twice.
+#[test]
+fn spec_alpha_builder_refuses_duplicate_row_neuron() {
+    let f = spec_fixture(503, 0.6, 0.4);
+    let root = RootGates::build(&f.net, &f.lo, &f.hi, RoundMode::Outward, None).expect("root");
+    let unst = all_unstable(&root);
+    assert_ne!((unst).len(), 0);
+    let (li, j) = unst[0];
+    let cands = vec![Cand {
+        class_pos: 0,
+        col: 0,
+        origin: CandOrigin::Ladder(0),
+        moves: vec![(li, j, 0.25), (li, j, 0.75)],
+    }];
+    assert!(
+        build_exceptions(&root, &cands, 1).is_err(),
+        "a duplicate (row, neuron) must refuse"
+    );
+}
+
+/// T5d: an alpha outside `[0, 1]` must REFUSE. `alpha*z <= relu(z)` is what
+/// makes every entry a valid DeepPoly lower line, and it holds ONLY on `[0,1]`.
+#[test]
+fn spec_alpha_builder_refuses_out_of_range_alpha() {
+    let f = spec_fixture(504, 0.6, 0.4);
+    let root = RootGates::build(&f.net, &f.lo, &f.hi, RoundMode::Outward, None).expect("root");
+    let unst = all_unstable(&root);
+    assert_ne!((unst).len(), 0);
+    for bad in [-0.001f64, 1.001, f64::NAN, f64::INFINITY] {
+        let cands = vec![Cand {
+            class_pos: 0,
+            col: 0,
+            origin: CandOrigin::Ladder(0),
+            moves: vec![(unst[0].0, unst[0].1, bad)],
+        }];
+        assert!(
+            build_exceptions(&root, &cands, 1).is_err(),
+            "alpha {bad} outside [0, 1] must refuse"
+        );
+    }
+}
+
+/// T6: the fold is an ELEMENT-WISE MAX, so the armed root is never below the
+/// dark one — for every class, for every candidate, however bad. Bites if
+/// anyone later "simplifies" the fold into an overwrite.
+#[test]
+fn spec_alpha_dj_never_below_dark() {
+    for seed in 0..10u64 {
+        let f = spec_fixture(600 + seed, 0.5 + (seed % 4) as f64 * 0.15, 0.38);
+        let mut root =
+            RootGates::build(&f.net, &f.lo, &f.hi, RoundMode::Outward, None).expect("root");
+        let dark = {
+            let eng = BackwardEngine::new(&f.net, &root);
+            super::bab::root_eval(&eng, &f.net, f.t, &f.adv)
+                .expect("dark")
+                .dj
+        };
+        for rounds in [1usize, 2, 3] {
+            root.spec_alpha_policy = Some(SpecAlphaPolicy {
+                width: 8,
+                cands: SPEC_ALPHA_LADDER.len(),
+                rounds,
+                entries: 1 << 20,
+                deadline: None,
+            });
+            let armed = {
+                let eng = BackwardEngine::new(&f.net, &root);
+                super::bab::root_eval(&eng, &f.net, f.t, &f.adv)
+                    .expect("armed")
+                    .dj
+            };
+            for (k, (&d, &a)) in dark.iter().zip(&armed).enumerate() {
+                assert!(
+                    a >= d,
+                    "seed {seed} rounds {rounds} class {k}: armed dj {a} is BELOW dark {d} — \
+                     the element-wise max fold is what makes this mechanism unable to \
+                     cost a banked proof"
+                );
+            }
+        }
+    }
+}
+
+/// T7: the axis EARNS its name — two adversarial classes prefer DIFFERENT
+/// candidates on the same net, so a single shared alpha cannot be optimal for
+/// both and the per-start-node index is doing real work.
+///
+/// Realizability is established rather than assumed: the test scans a fixed,
+/// deterministic seed list and requires that at least one net exhibits two
+/// classes whose argmax candidate index differs AND that both strictly improve.
+/// If no net does, the correct conclusion is that a rank-1 "best global
+/// candidate" would do just as well and the axis is unproven — so this test
+/// fails, which is exactly the bite it exists for.
+#[test]
+fn spec_alpha_beats_incumbent_on_a_conflicting_two_class_fixture() {
+    let mut conflicts = 0usize;
+    let mut both_improved = 0usize;
+    let mut nets_examined = 0usize;
+    let mut witness = String::new();
+    for seed in 0..40u64 {
+        let f = spec_fixture(
+            700 + seed,
+            0.45 + (seed % 7) as f64 * 0.12,
+            0.32 + (seed % 4) as f64 * 0.08,
+        );
+        let root = RootGates::build(&f.net, &f.lo, &f.hi, RoundMode::Outward, None).expect("root");
+        if all_unstable(&root).is_empty() {
+            continue;
+        }
+        nets_examined += 1;
+        let eng = BackwardEngine::new(&f.net, &root);
+        let (al, au) = eng.y_rows(None).expect("y_rows");
+        let ybox = YBox::from_rows(&eng, &al, &au);
+        let gates = head_gates(&ybox, RoundMode::Outward);
+        let e_max = SPEC_ALPHA_LADDER.len();
+        let ladders: Vec<Vec<(usize, usize, f64)>> =
+            (0..e_max).map(|e| ladder_moves(&root, e)).collect();
+        if ladders.iter().all(|m| m.is_empty()) {
+            continue;
+        }
+        // Per class: the incumbent direct bound, and the bound under each
+        // candidate. Same pass width for every class, so the comparison is
+        // apples to apples.
+        let mut best_e: Vec<Option<usize>> = Vec::new();
+        let mut gained: Vec<bool> = Vec::new();
+        for &k in &f.adv {
+            let mb1 = MarginBatch::new(&f.net, f.t, &[k]).expect("mb1");
+            let ms1 = margin_seed(&mb1, &gates, &ybox, RoundMode::Outward);
+            let base = eng
+                .run(&ms1.seed, None, LaneDir::Lower, None, false)
+                .expect("base");
+            let incumbent = per_class_direct(&eng, &base, &ms1, 0..1)[0];
+
+            let cands: Vec<Cand> = ladders
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| !m.is_empty())
+                .enumerate()
+                .map(|(col, (e, m))| Cand {
+                    class_pos: e,
+                    col,
+                    origin: CandOrigin::Ladder(e),
+                    moves: m.clone(),
+                })
+                .collect();
+            let cols = cands.len();
+            let replicated: Vec<usize> = vec![k; cols];
+            let mbr = MarginBatch::new(&f.net, f.t, &replicated).expect("mb");
+            let msr = margin_seed(&mbr, &gates, &ybox, RoundMode::Outward);
+            let (exc, _e, _m) = build_exceptions(&root, &cands, cols).expect("build");
+            let pass = eng
+                .run(&msr.seed, None, LaneDir::Lower, Some(&exc), false)
+                .expect("pass");
+            let spec = per_class_direct(&eng, &pass, &msr, 0..cols);
+            let mut best = (None::<usize>, incumbent);
+            for c in &cands {
+                let v = spec[c.col];
+                if v.is_finite() && v > best.1 {
+                    best = (Some(c.class_pos), v);
+                }
+            }
+            gained.push(best.0.is_some());
+            best_e.push(best.0);
+        }
+        for a in 0..best_e.len() {
+            for b in (a + 1)..best_e.len() {
+                if gained[a] && gained[b] {
+                    both_improved += 1;
+                    if best_e[a] != best_e[b] {
+                        conflicts += 1;
+                        if witness.is_empty() {
+                            witness = format!(
+                                "seed {seed}: class {} prefers candidate {:?} while class {} \
+                                 prefers {:?}",
+                                f.adv[a], best_e[a], f.adv[b], best_e[b]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(nets_examined >= 20, "only {nets_examined} usable nets");
+    assert!(
+        both_improved > 0,
+        "no class on any of {nets_examined} nets improved over its incumbent — \
+         the candidate ladder has no purchase at all and the mechanism is unproven"
+    );
+    assert!(
+        conflicts > 0,
+        "across {nets_examined} nets and {both_improved} improving class pairs, NO two \
+         classes ever preferred different candidates. That means a single shared \
+         candidate is as good as the per-start-node axis on this fixture family, and \
+         the axis is UNPROVEN — do not fund a measurement on the strength of the \
+         plumbing tests alone."
+    );
+    assert_ne!(witness, "");
+    eprintln!("[spec-alpha-test] conflict witness: {witness} ({conflicts} conflicting pairs)");
+}
+
+/// T8: IDENTITY exceptions (`a2 == alpha[j]`) leave the coefficient and bias
+/// lanes bitwise unchanged and can only INFLATE the bias error, i.e. lower the
+/// bound. Pins that dense exception use is strictly one-directional, which is
+/// why `ladder_moves` skips identity entries rather than emitting them.
+#[test]
+fn spec_alpha_identity_exceptions_only_loosen() {
+    let f = spec_fixture(800, 0.65, 0.4);
+    let root = RootGates::build(&f.net, &f.lo, &f.hi, RoundMode::Outward, None).expect("root");
+    let unst = all_unstable(&root);
+    assert_ne!((unst).len(), 0);
+    let eng = BackwardEngine::new(&f.net, &root);
+    let (al, au) = eng.y_rows(None).expect("y_rows");
+    let ybox = YBox::from_rows(&eng, &al, &au);
+    let gates = head_gates(&ybox, RoundMode::Outward);
+    let mb = MarginBatch::new(&f.net, f.t, &[f.adv[0]]).expect("mb");
+    let ms = margin_seed(&mb, &gates, &ybox, RoundMode::Outward);
+
+    let plain = eng
+        .run(&ms.seed, None, LaneDir::Lower, None, false)
+        .expect("plain");
+    let cands = vec![Cand {
+        class_pos: 0,
+        col: 0,
+        origin: CandOrigin::Ladder(0),
+        moves: unst
+            .iter()
+            .map(|&(li, j)| (li, j, root.layers[li].alpha[j]))
+            .collect(),
+    }];
+    let (exc, entries, _) = build_exceptions(&root, &cands, 1).expect("build");
+    assert!(entries > 0);
+    let ident = eng
+        .run(&ms.seed, None, LaneDir::Lower, Some(&exc), false)
+        .expect("identity");
+    for i in 0..plain.a.nrows() {
+        assert_eq!(
+            plain.a[[i, 0]].to_bits(),
+            ident.a[[i, 0]].to_bits(),
+            "input {i}: an identity exception moved the coefficient lane"
+        );
+    }
+    assert_eq!(
+        plain.b[0].to_bits(),
+        ident.b[0].to_bits(),
+        "an identity exception moved the bias"
+    );
+    assert!(
+        ident.eb[0] >= plain.eb[0],
+        "identity bias-error {} fell below plain {}",
+        ident.eb[0],
+        plain.eb[0]
+    );
+    let dj_plain = per_class_direct(&eng, &plain, &ms, 0..1)[0];
+    let dj_ident = per_class_direct(&eng, &ident, &ms, 0..1)[0];
+    assert!(
+        dj_ident <= dj_plain,
+        "identity exceptions RAISED the bound ({dj_ident} > {dj_plain}) — \
+         the slack16 charge must only ever loosen"
+    );
+}
+
+/// T9: a neuron with ZERO supergradient in this column must not move.
+///
+/// `f64::signum` is the trap: `0.0f64.signum() == 1.0`, so a signum-based step
+/// would move every neuron with no support in the column — precisely the
+/// neurons that must stay put.
+#[test]
+fn spec_alpha_zero_gradient_neuron_does_not_move() {
+    let f = spec_fixture(900, 0.6, 0.4);
+    let root = RootGates::build(&f.net, &f.lo, &f.hi, RoundMode::Outward, None).expect("root");
+    let unst = all_unstable(&root);
+    assert!(unst.len() >= 3, "need several unstable neurons");
+    let base: Vec<Vec<f64>> = root.layers.iter().map(|l| l.alpha.clone()).collect();
+
+    // All-zero gradient: nothing may move, at any step size.
+    let zero: Vec<Vec<f64>> = root.layers.iter().map(|l| vec![0.0; l.n]).collect();
+    for &eta in SPEC_ALPHA_ETA.iter() {
+        assert!(
+            gradient_moves(&root, &base, &zero, eta).is_empty(),
+            "an all-zero supergradient produced moves at eta {eta}"
+        );
+    }
+    // Mixed: only the supported neurons move.
+    let mut mixed = zero;
+    let (li0, j0) = unst[0];
+    let (li1, j1) = unst[1];
+    mixed[li0][j0] = 1.0;
+    mixed[li1][j1] = -1.0;
+    let moves = gradient_moves(&root, &base, &mixed, 0.5);
+    for &(li, j, _) in &moves {
+        assert!(
+            (li, j) == (li0, j0) || (li, j) == (li1, j1),
+            "layer {li} neuron {j} moved with a ZERO gradient"
+        );
+    }
+    assert!(!moves.is_empty(), "supported neurons failed to move at all");
+}
+
+/// T10: an EPOCH CHILD root must carry no #spec-alpha policy. The axis fires
+/// ONCE PER INSTANCE at the root direct pass; an epoch re-derives gates through
+/// `gates_from_box` and a second firing would re-pay the pass against a frame
+/// the axis was never measured on.
+#[test]
+fn spec_alpha_policy_is_none_for_epoch_child_roots() {
+    let f = spec_fixture(1000, 0.6, 0.4);
+    let mut root = RootGates::build(&f.net, &f.lo, &f.hi, RoundMode::Outward, None).expect("root");
+    root.spec_alpha_policy = Some(SpecAlphaPolicy {
+        width: 3,
+        cands: 3,
+        rounds: 1,
+        entries: 1 << 16,
+        deadline: None,
+    });
+    let unst = all_unstable(&root);
+    assert_ne!((unst).len(), 0);
+    let (li, j) = unst[0];
+    let pos = root.layers[li]
+        .unst
+        .iter()
+        .position(|&x| x == j)
+        .expect("position");
+    let refreshed = super::backward_interm::refresh_parent_frame(
+        &f.net,
+        &root,
+        &[(li, pos, 1i8)],
+        usize::MAX,
+        8,
+        None,
+    );
+    let (child, _stats) = refreshed.expect("parent-frame refresh");
+    assert!(
+        child.spec_alpha_policy.is_none(),
+        "the epoch child root INHERITED the #spec-alpha policy — it must not. The \
+         axis fires ONCE PER INSTANCE at the root direct pass; an epoch re-derives \
+         gates through gates_from_box and a second firing would re-pay the pass \
+         against a frame the axis was never measured on."
+    );
+}
+
+/// T11: nothing in the root BUILD or in the two root-ascent owners installs the
+/// policy. The driver installs it strictly AFTER `#rebake` returns, which is
+/// what keeps the axis out of the FORWARD lane: `gate_gerr_out`'s contraction
+/// requires alpha uniform over the coefficient index, so a per-start-node alpha
+/// cannot be baked forward. This test makes that ordering mechanical rather
+/// than a comment.
+#[test]
+fn spec_alpha_policy_is_set_after_rebake_not_before() {
+    let f = spec_fixture(1100, 0.6, 0.4);
+    let mut root = RootGates::build(&f.net, &f.lo, &f.hi, RoundMode::Outward, None).expect("root");
+    assert!(
+        root.spec_alpha_policy.is_none(),
+        "RootGates::build installed a #spec-alpha policy"
+    );
+    let policy = super::RootAlphaRuntimePolicy {
+        alpha_enabled: true,
+        spec_alpha_enabled: true,
+        ..Default::default()
+    };
+    let _ =
+        super::alpha_opt::maybe_optimize_root_alpha(&f.net, &mut root, f.t, &f.adv, None, policy);
+    assert!(
+        root.spec_alpha_policy.is_none(),
+        "#alpha-opt installed a #spec-alpha policy — the ascent's published-frame \
+         guard calls root_eval, and it MUST observe None"
+    );
+    // And the policy builder is the only thing that can turn it on.
+    assert!(SpecAlphaPolicy::from_policy(super::RootAlphaRuntimePolicy::default(), None).is_none());
+    assert!(SpecAlphaPolicy::from_policy(policy, None).is_some());
+}
+
+/// The candidate ladder and the column assigner: deterministic, cap-respecting,
+/// and it never emits a PARTIAL candidate (a half-applied ladder value is a
+/// different and undocumented relaxation).
+#[test]
+fn spec_alpha_entry_cap_drops_whole_candidates_only() {
+    let f = spec_fixture(1200, 0.65, 0.4);
+    let root = RootGates::build(&f.net, &f.lo, &f.hi, RoundMode::Outward, None).expect("root");
+    let raw: Vec<(usize, CandOrigin, Vec<(usize, usize, f64)>)> = (0..SPEC_ALPHA_LADDER.len())
+        .map(|e| (0usize, CandOrigin::Ladder(e), ladder_moves(&root, e)))
+        .filter(|(_, _, m)| !m.is_empty())
+        .collect();
+    assert!(raw.len() >= 2, "need at least two non-empty ladder entries");
+    let full: usize = raw.iter().map(|(_, _, m)| m.len()).sum();
+    let widths: Vec<usize> = raw.iter().map(|(_, _, m)| m.len()).collect();
+
+    let (all, entries, truncated) = assign_columns(raw.clone(), full);
+    assert_eq!(entries, full);
+    assert_eq!(truncated, 0);
+    assert_eq!(all.len(), widths.len());
+    for (i, c) in all.iter().enumerate() {
+        assert_eq!(c.col, i, "columns must be dense and ascending");
+        assert_eq!(c.moves.len(), widths[i], "a candidate was truncated");
+    }
+
+    let (some, entries, truncated) = assign_columns(raw.clone(), widths[0]);
+    assert!(truncated > 0, "a tight cap must drop candidates");
+    assert!(entries <= widths[0]);
+    for c in &some {
+        assert!(
+            widths.contains(&c.moves.len()),
+            "a PARTIAL candidate survived the cap"
+        );
+    }
+
+    let (none, entries, _truncated) = assign_columns(raw, 0);
+    assert!(
+        none.is_empty() && entries == 0,
+        "a zero cap must admit nothing"
+    );
+}
+
+/// F1: a PERMUTATION of the column set must refuse.
+///
+/// `run_round` builds the replicated seed as
+/// `replicated[i] = fail_classes[cands[i].class_pos]` but folds `spec[c.col]`
+/// into `dj[fail[c.class_pos]]`. Those agree only if `cands[i].col == i`. The
+/// range check (`col < cols`) and the duplicate check both PASS on a
+/// permutation, and a permutation folds one class's certified bound into
+/// another class's `dj` — which can close a class that was never proved. That
+/// is the only false-`unsat` this module could produce, so it is refused at the
+/// one site that builds the exception set.
+#[test]
+fn spec_alpha_builder_refuses_permuted_columns() {
+    let f = spec_fixture(1301, 0.6, 0.4);
+    let root = RootGates::build(&f.net, &f.lo, &f.hi, RoundMode::Outward, None).expect("root");
+    let unst = all_unstable(&root);
+    assert!(unst.len() >= 2, "need two unstable neurons");
+    let mk = |class_pos: usize, col: usize, which: usize| Cand {
+        class_pos,
+        col,
+        origin: CandOrigin::Ladder(0),
+        moves: vec![(unst[which].0, unst[which].1, 0.5)],
+    };
+    // Dense and ascending: accepted.
+    let ok = vec![mk(0, 0, 0), mk(1, 1, 1)];
+    assert!(
+        build_exceptions(&root, &ok, 2).is_ok(),
+        "a dense ascending column set must be accepted"
+    );
+    // The SAME two candidates with their columns swapped: every other check
+    // still passes (both columns are in range, no duplicate (layer, col,
+    // neuron)), so this is precisely the case the invariant exists for.
+    let permuted = vec![mk(0, 1, 0), mk(1, 0, 1)];
+    assert!(
+        build_exceptions(&root, &permuted, 2).is_err(),
+        "a PERMUTED column set must refuse: it folds one class's certified bound \
+         into another class's dj and can close a class that was never proved"
+    );
+}
+
+/// THE BEHAVIOURAL TEST: drive `refine` itself and assert the per-start-node
+/// axis actually delivers per-class relaxations.
+///
+/// Every other test in this block exercises a PIECE — the builder, the
+/// exception encoding, the enclosure, the fold. None of them calls `refine`, so
+/// a regression in its selection (`order.sort_by`), in its round-1 candidate
+/// construction, or in its round-2 base choice (`best_by_class`) would pass the
+/// entire suite. That regression has already happened once: round 1's ladder is
+/// class-INDEPENDENT, so a build whose only candidates are ladder values has
+/// per-class *selection* and no per-class *optimisation* at all, and its null
+/// would read as "the per-start-node alpha axis is a real negative".
+///
+/// Three properties, each of which is the thing a fix could silently lose:
+///
+/// 1. `classes_improved > 0` — the axis moves something at all.
+/// 2. `distinct_winners >= 2` — two classes end on DIFFERENT alphas. If every
+///    improving class ends on the same alpha, a rank-1 global candidate is as
+///    good and there is no per-start-node axis to measure.
+/// 3. `incumbent_grad_improvements > 0` — at least one class's winner came from
+///    `clamp(alpha_incumbent + eta*sign(g_k), 0, 1)`, i.e. from a step taken at
+///    the PUBLISHED point using that class's own supergradient. This is the
+///    property that dies if the incumbent collect pass is removed, or if
+///    `best_by_class` stops being seeded with the incumbent.
+///
+/// Aggregated across a seed grid because any single net may already sit at each
+/// class's optimum; the assertions name which property failed.
+#[test]
+fn spec_alpha_refine_ascends_per_class_from_the_incumbent() {
+    let mut nets_examined = 0usize;
+    let mut refines_run = 0usize;
+    let mut seeds_improved = 0usize;
+    let mut seeds_distinct = 0usize;
+    let mut seeds_incumbent_grad = 0usize;
+    let mut seeds_grads_ok = 0usize;
+    let mut best_distinct = 0usize;
+    let mut witness = String::new();
+    for seed in 0..32u64 {
+        let f = spec_fixture(
+            1400 + seed,
+            0.4 + (seed % 6) as f64 * 0.14,
+            0.3 + (seed % 4) as f64 * 0.09,
+        );
+        let root = RootGates::build(&f.net, &f.lo, &f.hi, RoundMode::Outward, None).expect("root");
+        if all_unstable(&root).is_empty() {
+            continue;
+        }
+        nets_examined += 1;
+        // The DARK published root: exactly what `refine` is handed in
+        // production, after `m1`/`m2v` and the direct pass have folded.
+        let re = {
+            let eng = BackwardEngine::new(&f.net, &root);
+            super::bab::root_eval(&eng, &f.net, f.t, &f.adv).expect("dark root_eval")
+        };
+        let fail: Vec<usize> = (0..f.adv.len())
+            .filter(|&k| !super::bab::closed(RoundMode::Outward, re.dj[k]))
+            .collect();
+        if fail.len() < 2 {
+            continue;
+        }
+        let fail_classes: Vec<usize> = fail.iter().map(|&k| f.adv[k]).collect();
+        let eng = BackwardEngine::new(&f.net, &root);
+        let (al, au) = eng.y_rows(None).expect("y_rows");
+        let ybox = YBox::from_rows(&eng, &al, &au);
+        let gates = head_gates(&ybox, RoundMode::Outward);
+        let before = re.dj.clone();
+        let mut dj = re.dj;
+        let pol = SpecAlphaPolicy {
+            width: f.adv.len(),
+            cands: 3,
+            rounds: 2,
+            entries: 1 << 20,
+            deadline: None,
+        };
+        let report = refine(
+            &eng,
+            &f.net,
+            f.t,
+            pol,
+            &gates,
+            &ybox,
+            &fail,
+            &fail_classes,
+            &mut dj,
+        );
+        refines_run += 1;
+        // The fold is element-wise max, so this can never fail — assert it
+        // anyway, because it is the property the whole soundness case rests on
+        // and it costs nothing to re-check at the only site that drives the
+        // real entry point.
+        for k in 0..dj.len() {
+            assert!(
+                dj[k] >= before[k],
+                "seed {seed} class {k}: refine LOWERED a published bound \
+                 ({} -> {})",
+                before[k],
+                dj[k]
+            );
+        }
+        assert!(
+            report.classes_improved <= fail.len(),
+            "seed {seed}: classes_improved {} exceeds the failing set {}",
+            report.classes_improved,
+            fail.len()
+        );
+        assert!(
+            report.distinct_winners <= report.classes_improved,
+            "seed {seed}: distinct_winners {} cannot exceed classes_improved {}",
+            report.distinct_winners,
+            report.classes_improved
+        );
+        assert!(
+            report.incumbent_grad_improvements <= report.classes_improved,
+            "seed {seed}: incumbent_grad_improvements {} cannot exceed \
+             classes_improved {}",
+            report.incumbent_grad_improvements,
+            report.classes_improved
+        );
+        if report.classes_improved > 0 {
+            seeds_improved += 1;
+        }
+        if report.distinct_winners >= 2 {
+            seeds_distinct += 1;
+            if witness.is_empty() {
+                witness = format!(
+                    "seed {seed}: {} classes improved onto {} DISTINCT alphas \
+                     ({} of them from the incumbent gradient), delta {:+.9}",
+                    report.classes_improved,
+                    report.distinct_winners,
+                    report.incumbent_grad_improvements,
+                    report.root_after - report.root_before
+                );
+            }
+        }
+        if report.incumbent_grad_improvements > 0 {
+            seeds_incumbent_grad += 1;
+        }
+        if report.incumbent_grads_ok > 0 {
+            seeds_grads_ok += 1;
+        }
+        best_distinct = best_distinct.max(report.distinct_winners);
+    }
+    assert!(
+        nets_examined >= 16 && refines_run >= 8,
+        "only {nets_examined} usable nets and {refines_run} refine calls — the \
+         fixture grid stopped exercising `refine` and this test is a no-op"
+    );
+    assert!(
+        seeds_improved > 0,
+        "across {refines_run} refine calls NO class ever improved. Either the \
+         mechanism is inert or the fixture family is already at its optimum; \
+         both make a measurement uninterpretable."
+    );
+    assert!(
+        seeds_distinct > 0,
+        "across {refines_run} refine calls the improving classes ALWAYS ended on \
+         the same alpha (best distinct_winners = {best_distinct}). A single \
+         shared candidate is then as good as the per-start-node axis, which is \
+         the `cols=8 delivers cols=1` shape — do not fund a measurement."
+    );
+    // Split the two ways the axis can be absent, because they need different
+    // fixes: the gradient never RESOLVED (the incumbent collect pass is gone,
+    // or `supergradient` refused this net family) versus it resolved and its
+    // candidates never WON.
+    assert!(
+        seeds_grads_ok > 0,
+        "across {refines_run} refine calls the INCUMBENT supergradient never \
+         resolved for a single selected class. The per-class starting point \
+         does not exist, so every candidate was a global-uniform ladder value \
+         and the axis was never exercised — VOID, not negative."
+    );
+    assert!(
+        seeds_incumbent_grad > 0,
+        "across {refines_run} refine calls NOT ONE class's winner came from the \
+         incumbent-gradient family. Round 1 has lost its per-class starting \
+         point and the mechanism has degraded to the global-uniform ladder — \
+         which is the already-measured `#interm-alpha` family, not this axis."
+    );
+    eprintln!("[spec-alpha-test] refine witness: {witness}");
+}
+
+// ============================================================================
+// #head-alpha: ascended HEAD relu slopes (`RootGates::head_alpha`).
+// ============================================================================
+
+use super::bounds::head_gates_with;
+
+/// The head slopes the published root bound reads are SOUND FOR ANY VALUE:
+/// every clamp vertex, the midpoint, random interior slopes, and hostile
+/// out-of-range / non-finite entries (clamped or ignored by `head_gates_with`).
+/// Independent oracle: the net's own forward margins at sampled points,
+/// corners and the centre.
+#[test]
+fn head_alpha_root_dj_lower_bounds_true_margin_for_any_head_slopes() {
+    const SLACK: f64 = 1e-9;
+    let mut checks = 0u64;
+    let mut head_unstable_seen = 0usize;
+    for seed in 0..16u64 {
+        let f = spec_fixture(
+            900 + seed,
+            0.35 + (seed % 5) as f64 * 0.18,
+            0.3 + (seed % 3) as f64 * 0.12,
+        );
+        let mut root =
+            RootGates::build(&f.net, &f.lo, &f.hi, RoundMode::Outward, None).expect("root");
+        let n_y = f.net.n_y;
+        let (ly, uy) = {
+            let eng = BackwardEngine::new(&f.net, &root);
+            let (al, au) = eng.y_rows(None).expect("y_rows");
+            let yb = YBox::from_rows(&eng, &al, &au);
+            (yb.ly, yb.uy)
+        };
+        head_unstable_seen += (0..n_y).filter(|&j| ly[j] < 0.0 && uy[j] > 0.0).count();
+        let mut rng = StdRng::seed_from_u64(0x4EAD ^ seed);
+        let mut slopes: Vec<Vec<f64>> = vec![vec![0.0; n_y], vec![1.0; n_y], vec![0.5; n_y]];
+        slopes.push((0..n_y).map(|_| rng.random_range(0.0..1.0)).collect());
+        slopes.push(
+            (0..n_y)
+                .map(|j| match j % 4 {
+                    0 => -0.3,
+                    1 => 1.7,
+                    2 => f64::NAN,
+                    _ => f64::INFINITY,
+                })
+                .collect(),
+        );
+        let mut x = sample_box(&mut rng, &root, 160);
+        for i in 0..root.mid.len() {
+            x[[i, 0]] = root.mid[i] - root.rad[i];
+            x[[i, 1]] = root.mid[i] + root.rad[i];
+            x[[i, 2]] = root.mid[i];
+        }
+        let (y, _) = f
+            .net
+            .forward_points(&x, &std::collections::BTreeMap::new())
+            .expect("forward");
+        let margins = margins_at(&f.net, &y, f.t, &f.adv);
+        for ha in slopes {
+            root.head_alpha = Some(ha);
+            let re = {
+                let eng = BackwardEngine::new(&f.net, &root);
+                super::bab::root_eval(&eng, &f.net, f.t, &f.adv).expect("root_eval")
+            };
+            for (ki, mrow) in margins.iter().enumerate() {
+                for &m in mrow {
+                    checks += 1;
+                    assert!(
+                        re.dj[ki] <= m + SLACK,
+                        "seed {seed} class {ki}: head-alpha dj {} OVERSTATES the true margin {m}",
+                        re.dj[ki]
+                    );
+                }
+            }
+        }
+    }
+    assert!(checks > 5_000, "only {checks} enclosure checks ran");
+    assert!(
+        head_unstable_seen > 0,
+        "no fixture had an unstable head neuron: the override was never exercised"
+    );
+}
+
+/// `None` and `Some(the heuristic's own slopes)` publish bit-identical bounds,
+/// and `head_gates_with(.., None)` IS `head_gates`: the disarmed path is the
+/// shipped path.
+#[test]
+fn head_alpha_none_and_the_heuristic_slopes_are_bitwise_the_shipped_root() {
+    for seed in 0..6u64 {
+        let f = spec_fixture(1200 + seed, 0.5 + (seed % 3) as f64 * 0.2, 0.4);
+        let mut root =
+            RootGates::build(&f.net, &f.lo, &f.hi, RoundMode::Outward, None).expect("root");
+        let (dj0, heur) = {
+            let eng = BackwardEngine::new(&f.net, &root);
+            let (al, au) = eng.y_rows(None).expect("y_rows");
+            let yb = YBox::from_rows(&eng, &al, &au);
+            let g0 = head_gates(&yb, RoundMode::Outward);
+            let g1 = head_gates_with(&yb, RoundMode::Outward, None);
+            assert_eq!(g0.alpha, g1.alpha);
+            assert_eq!(g0.s, g1.s);
+            assert_eq!(g0.c, g1.c);
+            let re = super::bab::root_eval(&eng, &f.net, f.t, &f.adv).expect("root_eval");
+            (re.dj, g0.alpha)
+        };
+        root.head_alpha = Some(heur);
+        let dj1 = {
+            let eng = BackwardEngine::new(&f.net, &root);
+            super::bab::root_eval(&eng, &f.net, f.t, &f.adv)
+                .expect("root_eval")
+                .dj
+        };
+        let b0: Vec<u64> = dj0.iter().map(|v| v.to_bits()).collect();
+        let b1: Vec<u64> = dj1.iter().map(|v| v.to_bits()).collect();
+        assert_eq!(
+            b0, b1,
+            "seed {seed}: heuristic slopes moved the published root"
+        );
+    }
+}
+
+/// Stable head neurons keep their exact lines whatever the override says; the
+/// upper chord is never touched.
+#[test]
+fn head_alpha_override_touches_only_unstable_slopes() {
+    let yb = YBox {
+        ly: vec![0.5, -2.0, -1.0, -0.5, -3.0],
+        uy: vec![1.5, -0.25, 3.0, 0.25, 1.0],
+    };
+    let ha = [0.3, 0.3, 0.3, 0.3, 7.0];
+    let base = head_gates(&yb, RoundMode::Outward);
+    let g = head_gates_with(&yb, RoundMode::Outward, Some(&ha));
+    assert_eq!(g.alpha, vec![1.0, 0.0, 0.3, 0.3, 1.0]);
+    assert_eq!(g.s, base.s);
+    assert_eq!(g.c, base.c);
+    // A length mismatch is refused wholesale (the heuristic stands).
+    let g2 = head_gates_with(&yb, RoundMode::Outward, Some(&ha[..3]));
+    assert_eq!(g2.alpha, base.alpha);
+}
+
+/// The ascent with head coordinates: monotone under the published guard,
+/// head slopes committed only inside `[0, 1]`, and the committed root still
+/// encloses the true margins. Engagement is asserted across the fixture sweep
+/// so a head ascent that never moves cannot pass silently.
+#[test]
+fn head_alpha_ascent_is_guarded_and_sound_and_engages() {
+    const SLACK: f64 = 1e-9;
+    let mut engaged = 0usize;
+    for seed in 0..12u64 {
+        let f = spec_fixture(
+            1500 + seed,
+            0.4 + (seed % 4) as f64 * 0.2,
+            0.35 + (seed % 3) as f64 * 0.1,
+        );
+        let mut root =
+            RootGates::build(&f.net, &f.lo, &f.hi, RoundMode::Outward, None).expect("root");
+        let report = super::alpha_opt::optimize_root_alpha(
+            &f.net,
+            &mut root,
+            f.t,
+            &f.adv,
+            None,
+            super::alpha_opt::AlphaOptCfg {
+                iters: 8,
+                secs: 60.0,
+                guard: true,
+                ..super::alpha_opt::AlphaOptCfg::default()
+            },
+        );
+        if let Some(ha) = root.head_alpha.as_ref() {
+            let r = report
+                .as_ref()
+                .expect("head alpha committed without a report");
+            assert!(
+                r.accepted,
+                "seed {seed}: head alpha committed by a rejected ascent"
+            );
+            let (before, after) = (
+                r.published_before.expect("guarded"),
+                r.published_after.expect("guarded"),
+            );
+            assert!(after > before, "seed {seed}: published {after} !> {before}");
+            assert!(ha.iter().all(|a| (0.0..=1.0).contains(a)));
+            engaged += 1;
+        }
+        let re = {
+            let eng = BackwardEngine::new(&f.net, &root);
+            super::bab::root_eval(&eng, &f.net, f.t, &f.adv).expect("root_eval")
+        };
+        let mut rng = StdRng::seed_from_u64(0xA5CE ^ seed);
+        let x = sample_box(&mut rng, &root, 200);
+        let (y, _) = f
+            .net
+            .forward_points(&x, &std::collections::BTreeMap::new())
+            .expect("forward");
+        for (ki, mrow) in margins_at(&f.net, &y, f.t, &f.adv).iter().enumerate() {
+            for &m in mrow {
+                assert!(
+                    re.dj[ki] <= m + SLACK,
+                    "seed {seed} class {ki}: {} > {m}",
+                    re.dj[ki]
+                );
+            }
+        }
+    }
+    assert!(
+        engaged > 0,
+        "the head ascent committed on no fixture: VOID, not a pass"
+    );
+}
+
+/// #router-r3 `rule.ia_yield` (ROUTER_PROGRAM §5.2): the ascent reads a
+/// CONTRACT. Its share is taken of the remaining window MINUS the interm
+/// credit, so the credit can only SHRINK the ascent (never extend it), and a
+/// zero credit is today's budget exactly.
+#[test]
+fn router_r3_ascent_contract_only_shrinks_the_ascent() {
+    let f = spec_fixture(3400, 0.6, 0.45);
+    let cfg = |credit_secs: u64| super::alpha_opt::AlphaOptCfg {
+        iters: 2,
+        secs: 600.0,
+        guard: false,
+        contract_credit: std::time::Duration::from_secs(credit_secs),
+        ..super::alpha_opt::AlphaOptCfg::default()
+    };
+    let run = |credit_secs: u64| {
+        let mut root =
+            RootGates::build(&f.net, &f.lo, &f.hi, RoundMode::Outward, None).expect("root");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(50);
+        super::alpha_opt::optimize_root_alpha(
+            &f.net,
+            &mut root,
+            f.t,
+            &f.adv,
+            Some(deadline),
+            cfg(credit_secs),
+        )
+        .expect("the ascent runs on this fixture")
+    };
+    let today = run(0);
+    let contracted = run(20);
+    // Today: 0.4 x ~50 s.
+    assert!(
+        (today.effective_secs - 20.0).abs() < 0.5,
+        "today's share is 0.4 x remaining: {}",
+        today.effective_secs
+    );
+    assert_eq!(today.contract_credit_secs, 0.0);
+    // Contract: 0.4 x (~50 - 20) s, strictly less than today's.
+    assert!(
+        (contracted.effective_secs - 12.0).abs() < 0.5,
+        "the contract excludes the credit: {}",
+        contracted.effective_secs
+    );
+    assert!(contracted.effective_secs < today.effective_secs);
+    assert_eq!(contracted.contract_credit_secs, 20.0);
+    // A credit past the window leaves no budget: the ascent refuses, never
+    // runs on a negative or wrapped window.
+    let mut root = RootGates::build(&f.net, &f.lo, &f.hi, RoundMode::Outward, None).expect("root");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(50);
+    assert!(super::alpha_opt::optimize_root_alpha(
+        &f.net,
+        &mut root,
+        f.t,
+        &f.adv,
+        Some(deadline),
+        cfg(500),
+    )
+    .is_none());
+}
+
+/// #router-r3 `rule.governor` (ROUTER_PROGRAM §5.2): the governed ascent
+/// stops no later than the ungoverned one on the SAME deterministic
+/// trajectory, keeps its BEST iterate, and certifies it exactly ONCE (one
+/// published-frame guard evaluation of the committed alphas); and the
+/// unarmed path (`governor: None` with an unarmed stop authority) is
+/// bit-identical run to run. Engagement is asserted across the sweep so a
+/// governor that never fires cannot pass silently.
+#[test]
+fn router_r3_governed_ascent_keeps_the_best_iterate_and_certifies_it_once() {
+    let alpha_bits = |root: &RootGates| -> Vec<u64> {
+        root.layers
+            .iter()
+            .flat_map(|l| l.alpha.iter().map(|a| a.to_bits()))
+            .chain(root.head_alpha.iter().flatten().map(|a| a.to_bits()))
+            .collect()
+    };
+    let mut engaged = 0usize;
+    for seed in 0..10u64 {
+        let f = spec_fixture(
+            3300 + seed,
+            0.4 + (seed % 4) as f64 * 0.2,
+            0.35 + (seed % 3) as f64 * 0.1,
+        );
+        let cfg = |governor: Option<f64>| super::alpha_opt::AlphaOptCfg {
+            iters: 30,
+            secs: 120.0,
+            guard: true,
+            governor,
+            ..super::alpha_opt::AlphaOptCfg::default()
+        };
+        let build =
+            || RootGates::build(&f.net, &f.lo, &f.hi, RoundMode::Outward, None).expect("root");
+        // Unarmed twice: today's ascent, bit for bit.
+        let mut plain_a = build();
+        let mut plain_b = build();
+        let ra = super::alpha_opt::optimize_root_alpha(
+            &f.net,
+            &mut plain_a,
+            f.t,
+            &f.adv,
+            None,
+            cfg(None),
+        );
+        let rb = super::alpha_opt::optimize_root_alpha(
+            &f.net,
+            &mut plain_b,
+            f.t,
+            &f.adv,
+            None,
+            cfg(None),
+        );
+        assert_eq!(alpha_bits(&plain_a), alpha_bits(&plain_b), "seed {seed}");
+        let (Some(ra), Some(rb)) = (ra, rb) else {
+            continue;
+        };
+        assert_eq!(
+            ra.iters, rb.iters,
+            "seed {seed}: the unarmed ascent is deterministic"
+        );
+        assert_eq!(
+            ra.governor_yield_iter, None,
+            "seed {seed}: unarmed never yields"
+        );
+        // Governed.
+        let mut governed = build();
+        let rg = super::alpha_opt::optimize_root_alpha(
+            &f.net,
+            &mut governed,
+            f.t,
+            &f.adv,
+            None,
+            cfg(Some(0.15)),
+        )
+        .expect("the governed ascent runs wherever the plain one did");
+        assert!(
+            rg.iters <= ra.iters,
+            "seed {seed}: a stop rule only stops EARLIER ({} > {})",
+            rg.iters,
+            ra.iters
+        );
+        assert!(rg.best >= rg.baseline, "seed {seed}: keep-best is monotone");
+        assert!(
+            rg.best <= ra.best,
+            "seed {seed}: the governed run is a prefix of the same trajectory"
+        );
+        assert!(
+            rg.guard_candidate_evals <= 1,
+            "seed {seed}: the chosen iterate is certified ONCE ({} evaluations)",
+            rg.guard_candidate_evals
+        );
+        if rg.accepted {
+            let (before, after) = (
+                rg.published_before.expect("guarded"),
+                rg.published_after.expect("guarded"),
+            );
+            assert!(after > before, "seed {seed}: published {after} !> {before}");
+        } else {
+            assert_eq!(
+                alpha_bits(&governed),
+                alpha_bits(&build()),
+                "seed {seed}: a rejected governed ascent leaves the heuristic alphas"
+            );
+        }
+        if let Some(at) = rg.governor_yield_iter {
+            assert_eq!(at, rg.iters, "seed {seed}: the yield ends the ascent");
+            assert!(rg.governor_freed_secs >= 0.0);
+            assert!(rg.governor_freed_secs <= rg.effective_secs + 1e-9);
+            engaged += 1;
+        }
+    }
+    assert!(
+        engaged > 0,
+        "the governor fired on no fixture: VOID, not a pass"
+    );
+}
+
+/// #mr-errlane (margin-row throughput plan B3): envelope error-lane
+/// dominance, exact-rational falsifier and off-is-bit-identical tests. A child
+/// of this module so it reuses the fixtures and oracles above.
+mod eel;
+
+/// #mr-gpu-eval: the certified conv-backward offload — dark default, exact-
+/// rational containment on random and real conv shapes, the routed-pass
+/// falsifier, the beta Lagrangian oracle and fail-closed bit identity. A child
+/// of this module so it reuses the fixtures above.
+mod gpu_conv_tests;
+
+/// #frozen-dual-state (V1 stage A): exact-rational and double-double
+/// containment of the frozen alpha-zonotope query state, the certified node
+/// bound (exact spot checks, the gamma mutation pin, sampled validity along
+/// every split path), refusals and the stage-A probe's verdict inertness. A
+/// child of this module so it reuses the fixtures above.
+mod zono_state_tests;
+
+/// #root-certify-once: the search-untrusted / certify-once root alpha — dark
+/// default, the published-root-is-the-certified-one contract, sampled and
+/// exact-rational containment, the falsified-property control, the certified
+/// joint-refresh path, the ingest gate and the untrusted entries' refusals. A
+/// child of this module so it reuses the fixtures above.
+mod root_certify_once_tests;
+
+/// #mr-ibp-seed: exact dyadic-rational containment of the IBP-seeded root boxes
+/// on CNN7-shaped chains with BN folds, asymmetric boxes and active relus (with
+/// the dropped-fold-charge mutation pin), the exact trunk-0 fold-ball hull,
+/// shrink-only / crossing refusal, the `bi_cal` ordering mutation, dark byte
+/// identity, the residual decline, never-verifies-a-false-bound and the typed
+/// key's reachability. A child of this module so it reuses the fixtures above.
+mod ibp_seed_tests;
+
+/// #wave-beta-bab (ENGINE_PROGRAM M6): the wave tree on injected test
+/// backends — default bit identity, containment of every certified leaf,
+/// garbage / panicking / refusing backends, the claim-as-close, clip-side,
+/// dropped-leaf and Err-as-close mutation pins, and thread-count
+/// independence. A child of this module so it reuses the fixtures above.
+mod wave_tests;
+
+/// ENGINE_PROGRAM §1.7 B1 (proof bundle v2): hint capture is WRITE-ONLY.
+/// The same instance, serial and parallel frontier, with capture off and on,
+/// reaches the same verdict with the same statistics and the same token
+/// margin bits; with capture on, an `unsat` streams nodes whose literals all
+/// name Relu sites of the net.
+#[test]
+fn margin_row_verdicts_are_bit_identical_with_hint_capture_on_and_off() {
+    use std::sync::{Arc, Mutex};
+
+    use crate::certify::{
+        force_hint_capture_for_test, with_thread_sink, AlphaRecord, LeafRecord, NodeRecord,
+        ProofSink, SitesRecord, VerdictRecord,
+    };
+
+    #[derive(Clone, Default)]
+    struct Shared(Arc<Mutex<Vec<NodeRecord>>>);
+    impl ProofSink for Shared {
+        fn leaf(&mut self, _leaf: &LeafRecord) {}
+        fn node(&mut self, node: &NodeRecord) {
+            if let Ok(mut v) = self.0.lock() {
+                v.push(node.clone());
+            }
+        }
+        fn alpha(&mut self, _alpha: &AlphaRecord) {}
+        fn sites(&mut self, _sites: &SitesRecord) {}
+        fn fd_state(&mut self, _state: &crate::certify::FdStateRecord) {}
+        fn finish(&mut self, _verdict: &VerdictRecord) {}
+    }
+
+    let mut rng = StdRng::seed_from_u64(202);
+    let spec = tiny_spec(&mut rng, 0.35);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let lo = vec![0.01; 72];
+    let hi = vec![0.02; 72];
+    let (t, _worst, adv) = tiny_targets(&net, &lo, &hi);
+    let root = RootGates::build(&net, &lo, &hi, RoundMode::Outward, None).expect("root");
+    let relu_ops: Vec<u32> = net
+        .ops
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| matches!(op, super::net::TwinOp::Relu { .. }))
+        .map(|(k, _)| k as u32)
+        .collect();
+    let mut streamed_any = false;
+    for frontier in [1usize, 8] {
+        let cfg = || BabConfig {
+            lru_cap: 64,
+            frontier,
+            ..BabConfig::default()
+        };
+        let run = |capture: bool| {
+            let sink = Shared::default();
+            force_hint_capture_for_test(Some(capture));
+            let (out, _) = with_thread_sink(Box::new(sink.clone()), || {
+                MarginRowBab::run(&net, &root, t, &adv, cfg())
+            });
+            force_hint_capture_for_test(None);
+            let nodes = sink.0.lock().expect("lock").clone();
+            (out, nodes)
+        };
+        let (off, off_nodes) = run(false);
+        let (on, on_nodes) = run(true);
+        assert!(off_nodes.is_empty(), "capture off streams no node");
+        assert_eq!(verdict_bits(&off), verdict_bits(&on), "frontier {frontier}");
+        let (so, sn) = (outcome_stats(&off), outcome_stats(&on));
+        assert_eq!(
+            (
+                so.expansions,
+                so.domains_created,
+                so.closed,
+                so.max_depth,
+                so.mono_raw_dips
+            ),
+            (
+                sn.expansions,
+                sn.domains_created,
+                sn.closed,
+                sn.max_depth,
+                sn.mono_raw_dips
+            ),
+            "frontier {frontier}: capture changed the search"
+        );
+        if let (MarginRowOutcome::Unsat(_, a), MarginRowOutcome::Unsat(_, b)) = (&off, &on) {
+            assert_eq!(a.min_margin().to_bits(), b.min_margin().to_bits());
+            assert!(
+                !on_nodes.is_empty(),
+                "an unsat under capture streams its nodes"
+            );
+            for n in &on_nodes {
+                assert!(n.lits.iter().all(|l| relu_ops.contains(&l.site.op)));
+                assert_eq!(n.beta.len(), n.lits.len());
+            }
+            streamed_any = true;
+        }
+    }
+    assert!(
+        streamed_any,
+        "the fixture never proved unsat: the test is VOID"
+    );
+}
+
+/// B2.3 (ENGINE_PROGRAM §1.7 B1): the Competition profile (hint capture OFF,
+/// `NullSink`) and the Proof profile (capture ON, a recording sink) reach the
+/// same verdict bits and the same search on EVERY margin-row route — the
+/// classwise class trees, nested epoch subtrees, the frozen-dual tier (armed
+/// by the harness field) and the joint tree — and Competition streams
+/// nothing. Proof streams the routes' nodes: class trees' leaves from the
+/// instance root (one class each), and a closed epoch subtree's nested nodes
+/// under its parent leaf's prefix.
+#[test]
+fn margin_row_routes_are_bit_identical_in_both_profiles() {
+    use std::sync::{Arc, Mutex};
+
+    use crate::certify::{
+        force_hint_capture_for_test, with_thread_sink, AlphaRecord, FdStateRecord, LeafRecord,
+        NodeClose, NodeRecord, NullSink, ProofSink, RecordingSink, SitesRecord, VerdictRecord,
+    };
+
+    #[derive(Clone, Default)]
+    struct Shared(Arc<Mutex<RecordingSink>>);
+    impl ProofSink for Shared {
+        fn leaf(&mut self, leaf: &LeafRecord) {
+            self.0.lock().expect("lock").leaf(leaf);
+        }
+        fn node(&mut self, node: &NodeRecord) {
+            self.0.lock().expect("lock").node(node);
+        }
+        fn alpha(&mut self, alpha: &AlphaRecord) {
+            self.0.lock().expect("lock").alpha(alpha);
+        }
+        fn sites(&mut self, sites: &SitesRecord) {
+            self.0.lock().expect("lock").sites(sites);
+        }
+        fn fd_state(&mut self, state: &FdStateRecord) {
+            self.0.lock().expect("lock").fd_state(state);
+        }
+        fn finish(&mut self, verdict: &VerdictRecord) {
+            self.0.lock().expect("lock").finish(verdict);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Route {
+        Joint,
+        Classwise,
+        Epoch,
+        Fd,
+    }
+    let all = [Route::Joint, Route::Classwise, Route::Epoch, Route::Fd];
+    let mut proved: Vec<Route> = Vec::new();
+    'sweep: for seed in 0..48u64 {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let spec = tiny_spec(&mut rng, 0.35);
+        let Ok(net) = TwinNet::compile(&spec) else {
+            continue;
+        };
+        for width in [0.01, 0.02, 0.04, 0.08, 0.16] {
+            if all.iter().all(|r| proved.contains(r)) {
+                break 'sweep;
+            }
+            let lo = vec![0.01; 72];
+            let hi: Vec<f64> = lo.iter().map(|l| l + width).collect();
+            let (t, _worst, adv) = tiny_targets(&net, &lo, &hi);
+            let Ok(root) = RootGates::build(&net, &lo, &hi, RoundMode::Outward, None) else {
+                continue;
+            };
+            for route in all {
+                let cfg = || BabConfig {
+                    lru_cap: 64,
+                    frontier: 1,
+                    max_expansions: 400,
+                    frozen_dual_tier: Some(route == Route::Fd),
+                    epoch_policy: if route == Route::Epoch {
+                        super::EpochRuntimePolicy {
+                            depth: 1,
+                            max_attempts: 16,
+                            ..super::EpochRuntimePolicy::default()
+                        }
+                    } else {
+                        super::EpochRuntimePolicy::default()
+                    },
+                    ..BabConfig::default()
+                };
+                let go = |capture: bool, sink: Box<dyn ProofSink>| {
+                    force_hint_capture_for_test(Some(capture));
+                    let (out, _) = with_thread_sink(sink, || {
+                        if route == Route::Classwise {
+                            MarginRowBab::run_classwise(&net, &root, t, &adv, cfg())
+                        } else {
+                            MarginRowBab::run(&net, &root, t, &adv, cfg())
+                        }
+                    });
+                    force_hint_capture_for_test(None);
+                    out
+                };
+                let competition = go(false, Box::new(NullSink));
+                let sink = Shared::default();
+                let proof = go(true, Box::new(sink.clone()));
+                let rec = sink.0.lock().expect("lock").clone();
+                assert_eq!(
+                    verdict_bits(&competition),
+                    verdict_bits(&proof),
+                    "{route:?} seed {seed} width {width}: the profile moved the verdict"
+                );
+                let key = |o: &MarginRowOutcome| {
+                    let s = match o {
+                        MarginRowOutcome::Unsat(s, _) => Some(s),
+                        MarginRowOutcome::Unknown { stats, .. } => stats.as_ref(),
+                    };
+                    s.map(|s| {
+                        (
+                            s.expansions,
+                            s.domains_created,
+                            s.closed,
+                            s.max_depth,
+                            s.epochs_closed,
+                            s.root_closed_classes,
+                        )
+                    })
+                };
+                assert_eq!(
+                    key(&competition),
+                    key(&proof),
+                    "{route:?}: the profile moved the search"
+                );
+                let MarginRowOutcome::Unsat(stats, _) = &proof else {
+                    continue;
+                };
+                assert!(
+                    !rec.nodes.is_empty(),
+                    "{route:?}: a Proof unsat streams nodes"
+                );
+                match route {
+                    Route::Classwise if stats.expansions > 0 => {
+                        assert!(rec
+                            .nodes
+                            .iter()
+                            .filter(|n| n.src == "tree" && n.close == NodeClose::Bound)
+                            .all(|n| n.dis.as_ref().is_some_and(|d| d.len() == 1)));
+                        proved.push(route);
+                    }
+                    Route::Epoch if stats.epochs_closed > 0 => {
+                        let subtrees: Vec<&NodeRecord> = rec
+                            .nodes
+                            .iter()
+                            .filter(|n| n.close == NodeClose::Subtree)
+                            .collect();
+                        assert!(!subtrees.is_empty(), "a closed epoch streams its leaf");
+                        for s in &subtrees {
+                            assert!(
+                                rec.nodes.iter().any(|n| n.close != NodeClose::Subtree
+                                    && n.lits.len() >= s.lits.len()
+                                    && n.lits[..s.lits.len()] == s.lits[..]),
+                                "a closed subtree streamed nothing under its prefix"
+                            );
+                        }
+                        proved.push(route);
+                    }
+                    Route::Fd if !rec.fd_states.is_empty() => {
+                        for st in &rec.fd_states {
+                            assert!(rec.nodes.iter().any(|n| n.src == "fd_prune"
+                                && n.dis.as_deref() == Some(&[st.class][..])));
+                        }
+                        proved.push(route);
+                    }
+                    Route::Joint if stats.expansions > 0 => proved.push(route),
+                    _ => {}
+                }
+            }
+        }
+    }
+    for route in all {
+        assert!(
+            proved.contains(&route),
+            "no fixture exercised the {route:?} route under Proof: VOID ({proved:?})"
+        );
+    }
+}
+
+// Parent refresh clocks also cover a valid split with no downstream work.
+fn parent_refresh_deadline_fixture() -> (TwinNet, RootGates) {
+    let spec = TwinSpec {
+        n_in: 1,
+        ops: vec![
+            TwinOpSpec::Conv {
+                input: 0,
+                weight: vec![1.0],
+                bias: vec![0.0],
+                bias_err: vec![0.0],
+                weight_rel_err: 0.0,
+                kernel: (1, 1, 1, 1),
+                stride: (1, 1),
+                pads: (0, 0, 0, 0),
+                ishape: (1, 1, 1),
+                oshape: (1, 1, 1),
+            },
+            TwinOpSpec::Relu { input: 1 },
+            TwinOpSpec::ChannelAffine {
+                input: 2,
+                scale: vec![1.0],
+                shift: vec![-0.25],
+                shift_err: vec![0.0],
+                scale_rel_err: 0.0,
+                shape: (1, 1, 1),
+            },
+            TwinOpSpec::Relu { input: 3 },
+            TwinOpSpec::Flatten { input: 4 },
+            TwinOpSpec::Gemm {
+                input: 5,
+                weight: vec![0.25],
+                bias: vec![0.5],
+                bias_err: vec![],
+                weight_rel_err: 0.0,
+                shape: (1, 1),
+            },
+            TwinOpSpec::Relu { input: 6 },
+            TwinOpSpec::Gemm {
+                input: 7,
+                weight: vec![0.5, -0.25],
+                bias: vec![0.0, 0.0],
+                bias_err: vec![],
+                weight_rel_err: 0.0,
+                shape: (2, 1),
+            },
+        ],
+    };
+    let net = TwinNet::compile(&spec).expect("original two-layer model");
+    let root = RootGates::build(&net, &[-1.0], &[1.0], RoundMode::Outward, None)
+        .expect("original outward root");
+    assert_eq!(root.layers.len(), 2);
+    assert_eq!(root.layers[0].unst, [0]);
+    assert_eq!(root.layers[1].unst, [0]);
+    (net, root)
+}
+
+#[test]
+fn epoch_parent_frame_refresh_expired_request_refuses_even_without_downstream_layers() {
+    let _env = crate::tests::lock_env_shared();
+    let (net, root) = parent_refresh_deadline_fixture();
+    let last = root.layers.len() - 1;
+    // Splitting the final trunk layer makes the downstream loop empty. This
+    // remains a genuine valid split rather than a malformed-input refusal.
+    assert_eq!(last + 1, root.layers.len());
+    for layer in [0, last] {
+        for direction in [-1i8, 1i8] {
+            let expired = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(1))
+                .expect("test clock supports an expired deadline");
+            let error = super::backward_interm::refresh_parent_frame(
+                &net,
+                &root,
+                &[(layer, 0, direction)],
+                1,
+                1,
+                Some(expired),
+            )
+            .err()
+            .expect("an expired original request cannot return a refreshed frame");
+            assert!(matches!(error, ny_core::NyError::DeadlineExceeded(_)));
+        }
+    }
+}
+
+#[test]
+fn epoch_parent_frame_refresh_live_empty_path_preserves_original_gate_bits() {
+    let _env = crate::tests::lock_env_shared();
+    let (net, root) = parent_refresh_deadline_fixture();
+    let last = root.layers.len() - 1;
+    for direction in [-1i8, 1i8] {
+        let split = [(last, 0, direction)];
+        let (plain, plain_stats) =
+            super::backward_interm::refresh_parent_frame(&net, &root, &split, 1, 1, None)
+                .expect("original no-deadline empty path");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let (timed, timed_stats) =
+            super::backward_interm::refresh_parent_frame(&net, &root, &split, 1, 1, Some(deadline))
+                .expect("live original deadline empty path");
+        assert_eq!(plain_stats.baked, 1);
+        assert_eq!(timed_stats.baked, 1);
+        assert_eq!(plain_stats.layers, 0);
+        assert_eq!(timed_stats.layers, 0);
+        assert_eq!(plain_stats.columns, 0);
+        assert_eq!(timed_stats.columns, 0);
+        assert_eq!(plain_stats.tightened, 0);
+        assert_eq!(timed_stats.tightened, 0);
+        assert_eq!(plain.layers.len(), timed.layers.len());
+        for (left, right) in plain.layers.iter().zip(&timed.layers) {
+            assert_eq!(left.op, right.op);
+            assert_eq!(left.n, right.n);
+            assert_eq!(left.unst, right.unst);
+            for (name, a, b) in [
+                ("l", &left.l, &right.l),
+                ("u", &left.u, &right.u),
+                ("alpha", &left.alpha, &right.alpha),
+                ("s", &left.s, &right.s),
+                ("c", &left.c, &right.c),
+                ("ms", &left.ms, &right.ms),
+            ] {
+                assert!(
+                    a.iter()
+                        .map(|v| v.to_bits())
+                        .eq(b.iter().map(|v| v.to_bits())),
+                    "a live deadline changed {name}"
+                );
+            }
+        }
+    }
 }

@@ -80,19 +80,19 @@ pub(crate) enum GtAction {
         #[arg(long)]
         input_bounds: Option<String>,
 
-        /// Also emit an exact-rational dominance certificate (.cert.json).
-        /// Dominance only; certifiable ground truths are the pure-Linear
-        /// (plane) builders and the single-level quadratic (SPHERE /
-        /// CYLINDER / CONE) builders — see ny-groundtruth::cert for the
-        /// remaining nested-square (TORUS) obstruction.
+        /// Also write an exact-rational dominance certificate (.cert.json)
+        ///
+        /// Supported for plane, sphere, cylinder, and cone ground truths; not
+        /// yet for torus.
         #[arg(long, value_name = "PATH")]
         emit_cert: Option<PathBuf>,
 
-        /// Escalate unknown verdicts to an exact engine: `smt` re-asks the
-        /// difference-network question as one exact AY query (unsat proves
-        /// the property with an Alethe certificate; sat witnesses are
-        /// validated in exact rational arithmetic). Needs `ay` (via $NY_AY,
-        /// PATH, or the Trust stage2 sysroot).
+        /// Escalate unknown results to an exact engine (`smt`)
+        ///
+        /// `smt` re-checks the question as one exact ay query: unsat comes with
+        /// an Alethe certificate, and sat witnesses are checked in exact
+        /// rational arithmetic. Finds `ay` through $NY_AY, then PATH, then the
+        /// linked `trust` toolchain.
         #[arg(long, value_name = "ENGINE")]
         escalate: Option<String>,
     },

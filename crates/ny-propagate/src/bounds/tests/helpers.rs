@@ -203,7 +203,7 @@ fn test_batched_matvec_single_batch() {
 #[test]
 fn test_gradient_method_default() {
     let method = GradientMethod::default();
-    // Default changed from SPSA to AnalyticChain (#2035): SPSA with 1 sample is
+    // Default changed from SPSA to AnalyticChain: SPSA with 1 sample is
     // noise-dominated for networks with many unstable neurons. AnalyticChain computes
     // true chain-rule gradients matching reference α,β-CROWN's loss.backward().
     assert_eq!(method, GradientMethod::AnalyticChain);
@@ -250,6 +250,19 @@ fn test_alpha_crown_config_default() {
     assert!(config.fix_interm_bounds);
     assert!(!config.cgan_sparse_target_complete_root);
     assert!(!config.cgan_complete_crown_ibp_root);
+    assert!(!config.cgan_crown_root_map);
+    assert!(!config.cgan_collector_dense);
+    assert!(!config.cgan_unstable_rows);
+    assert_eq!(config.cgan_unstable_rows_max_frac, 0.9);
+    assert_eq!(config.cgan_child_interm_refine_max_secs, None);
+    // #cgan-child-seed: all three child-cascade keys default-dark.
+    assert!(!config.cgan_child_interm_refine_seed_from_parent);
+    assert_eq!(config.cgan_child_interm_refine_parallel, 0);
+    assert!(!config.cgan_child_interm_refine_fresh_clip_map);
+    // #cgan-child-zono: default-dark with a non-binding generator budget.
+    assert!(!config.cgan_child_zono_refresh.enabled);
+    assert_eq!(config.cgan_child_zono_refresh.max_generators, 16_384);
+    assert_eq!(config.cgan_child_zono_refresh.max_secs, None);
     assert_eq!(config.sparse_ratio, 0.3);
     assert!(!config.adaptive_skip); // #3918: disabled — reference has no depth gate, uses early_stop_patience
     assert_eq!(config.adaptive_skip_depth_threshold, 20); // Retained for explicit opt-in
@@ -300,6 +313,19 @@ fn test_alpha_crown_config_custom() {
         fix_interm_bounds: false,
         cgan_sparse_target_complete_root: false,
         cgan_complete_crown_ibp_root: false,
+        cgan_crown_root_map: false,
+        cgan_collector_dense: false,
+        // #cgan-unstable-rows: false/0.9 = the shipped default these fixtures
+        // assume (abc's `minimum_sparsity`).
+        cgan_unstable_rows: false,
+        cgan_unstable_rows_max_frac: 0.9,
+        cgan_child_interm_refine_max_secs: None,
+        // #cgan-child-seed: the shipped dark defaults.
+        cgan_child_interm_refine_seed_from_parent: false,
+        cgan_child_interm_refine_parallel: 0,
+        cgan_child_interm_refine_fresh_clip_map: false,
+        // #cgan-child-zono: the shipped dark default.
+        cgan_child_zono_refresh: crate::bounds::CganChildZonoRefreshConfig::default(),
         sparse_ratio: 1.0,
         adaptive_skip: false,
         adaptive_skip_depth_threshold: 100,
@@ -326,6 +352,17 @@ fn test_alpha_crown_config_custom() {
         spec_ascent: None,
         root_alpha_margin: false,
         alpha_zero_yield_frac: None,
+        inert_ascent_exit_iters: None,
+        // #vit-crown-interm: None = the shipped uncapped reference route.
+        crown_ibp_reference_cap_secs: None,
+        // #vit-margin-alpha: the shipped defaults these fixtures assume.
+        root_alpha_margin_gradient: false,
+        matmul_alpha: false,
+        // #vit-margin-alpha-complex: the shipped default (lane refuses
+        // MulBinary/Reciprocal graphs).
+        margin_alpha_freeze_mul_reciprocal: false,
+        // #vit-root-alpha: the shipped default (the certified ascent).
+        margin_alpha_search: crate::bounds::MarginAlphaSearch::Ascent,
     };
 
     assert_eq!(config.iterations, 10);
@@ -366,4 +403,92 @@ fn test_alpha_crown_config_serialization() {
         legacy.alpha_zero_yield_frac.is_none(),
         "configs written before the typed delivery key must keep the legacy default"
     );
+
+    let mut legacy = serde_json::to_value(&config).unwrap();
+    legacy
+        .as_object_mut()
+        .expect("serialized config is an object")
+        .remove("inert_ascent_exit_iters");
+    let legacy: AlphaCrownConfig = serde_json::from_value(legacy).unwrap();
+    assert!(
+        legacy.inert_ascent_exit_iters.is_none(),
+        "configs written before #inert-ascent-exit must keep the ten-iteration patience"
+    );
+
+    // #vit-crown-interm + #vit-margin-alpha: configs written before these typed keys keep them
+    // at their historical defaults (uncapped reference route, both margin keys dark).
+    let mut legacy = serde_json::to_value(&config).unwrap();
+    let object = legacy
+        .as_object_mut()
+        .expect("serialized config is an object");
+    object.remove("crown_ibp_reference_cap_secs");
+    object.remove("root_alpha_margin_gradient");
+    object.remove("matmul_alpha");
+    object.remove("margin_alpha_freeze_mul_reciprocal");
+    object.remove("margin_alpha_search");
+    let legacy: AlphaCrownConfig = serde_json::from_value(legacy).unwrap();
+    assert!(
+        legacy.crown_ibp_reference_cap_secs.is_none(),
+        "configs written before #vit-crown-interm must keep the uncapped reference route"
+    );
+    assert!(
+        !legacy.root_alpha_margin_gradient && !legacy.matmul_alpha,
+        "configs written before #vit-margin-alpha must keep both keys dark"
+    );
+    assert!(
+        !legacy.margin_alpha_freeze_mul_reciprocal,
+        "configs written before #vit-margin-alpha-complex must keep the freeze key dark"
+    );
+    assert_eq!(
+        legacy.margin_alpha_search,
+        crate::bounds::MarginAlphaSearch::Ascent,
+        "configs written before #vit-root-alpha must keep the certified ascent"
+    );
+    // The typed tokens round-trip, and nothing else parses.
+    for token in crate::bounds::MarginAlphaSearch::TOKENS {
+        let parsed: crate::bounds::MarginAlphaSearch =
+            serde_json::from_value(serde_json::Value::String(token.to_string())).unwrap();
+        assert_eq!(parsed.token(), token);
+    }
+    assert!(
+        serde_json::from_value::<crate::bounds::MarginAlphaSearch>(serde_json::Value::String(
+            "joint".to_string()
+        ))
+        .is_err()
+    );
+}
+
+/// #vit-crown-interm: the reference cap resolves ONLY on the
+/// `fix_interm_bounds = false` route and only for admissible whole seconds;
+/// every other shape is the historical uncapped route.
+#[ntest::timeout(5000)]
+#[test]
+fn crown_ibp_reference_cap_resolves_only_on_the_typed_route() {
+    let fi = |cap: Option<u64>| AlphaCrownConfig {
+        fix_interm_bounds: false,
+        crown_ibp_reference_cap_secs: cap,
+        ..AlphaCrownConfig::default()
+    };
+    assert_eq!(AlphaCrownConfig::default().crown_ibp_reference_cap(), None);
+    assert_eq!(fi(None).crown_ibp_reference_cap(), None);
+    assert_eq!(
+        fi(Some(12)).crown_ibp_reference_cap(),
+        Some(std::time::Duration::from_secs(12))
+    );
+    assert_eq!(
+        fi(Some(3600)).crown_ibp_reference_cap(),
+        Some(std::time::Duration::from_secs(3600))
+    );
+    // Inadmissible values fail closed to the uncapped route.
+    assert_eq!(fi(Some(0)).crown_ibp_reference_cap(), None);
+    assert_eq!(fi(Some(3601)).crown_ibp_reference_cap(), None);
+    // A config carrying fix_interm_bounds = true (e.g. an input-split
+    // warm-start child) is inert whatever cap it inherits.
+    let child = AlphaCrownConfig {
+        fix_interm_bounds: true,
+        ..fi(Some(12))
+    };
+    assert_eq!(child.crown_ibp_reference_cap(), None);
+    assert!(AlphaCrownConfig::crown_ibp_reference_cap_secs_is_valid(1));
+    assert!(!AlphaCrownConfig::crown_ibp_reference_cap_secs_is_valid(0));
 }

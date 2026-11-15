@@ -64,6 +64,14 @@ impl NonlinearBranching {
             if points.is_empty() {
                 continue;
             }
+            // #genbab-selector-convention: `bounds` is already the operand's
+            // own interval (the one `with_general_split` clamps), so only the
+            // f32 corner can fail here — a ULP-wide interval whose midpoint
+            // rounds onto an endpoint. Such a split would be a no-op.
+            if !super::points_strictly_partition(l, u, &points) {
+                super::telemetry::record_rejected_non_partition();
+                continue;
+            }
 
             // McCormick product score: width * partner_avg_width.
             // The McCormick relaxation error is proportional to the product of both

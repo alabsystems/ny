@@ -5,7 +5,7 @@
 use super::super::super::boundary::EcapaCompositionBoundary;
 use super::*;
 
-/// Concrete-point containment check (#3683): evaluate the encoder at the
+/// Concrete-point containment check: evaluate the encoder at the
 /// center of the epsilon ball and verify each stage output falls within
 /// the tightened bounds.
 pub(super) fn assert_stage_outputs_contain_center(

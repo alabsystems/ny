@@ -18,8 +18,7 @@ pub(crate) use crown::CrownStepResult;
 pub(crate) use crown::{apply_bn_werr_to_host_relu, try_extract_batch_norm_conv1x1};
 pub(crate) use crown::{
     crown_backward_step_patches, crown_backward_step_patches_spec_crown,
-    crown_backward_step_patches_with_deadline_authority_and_flat_bias_policy,
-    SpecPatchesStepError,
+    crown_backward_step_patches_with_deadline_authority_and_flat_bias_policy, SpecPatchesStepError,
 };
 pub(crate) use crown::{gpu_relu_affine_cell, GpuReluAffineVariant};
 
@@ -29,7 +28,7 @@ use crown::GpuCrownStaticCache;
 /// A neural network represented as a sequence of layers.
 pub struct Network {
     pub(crate) layers: Vec<Layer>,
-    /// Cached static GPU CROWN layer data (#3397 plan cache Step 1).
+    /// Cached static GPU CROWN layer data (plan cache).
     /// Populated on first GPU CROWN extraction; subsequent calls reuse
     /// Arc-shared weight data and only refresh dynamic activation entries.
     pub(crate) gpu_crown_cache: std::sync::Mutex<Option<GpuCrownStaticCache>>,

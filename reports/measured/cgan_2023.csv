@@ -1,11 +1,10 @@
-cgan_2023,onnx/test_nano.onnx,vnnlib/test_nano.vnnlib,0,unsat,0
 cgan_2023,onnx/cGAN_imgSz32_nCh_1.onnx,vnnlib/cGAN_imgSz32_nCh_1_prop_0_input_eps_0.010_output_eps_0.015.vnnlib,0,sat,0.39,l1audit-20260804-d1282d23
-cgan_2023,onnx/cGAN_imgSz32_nCh_1.onnx,vnnlib/cGAN_imgSz32_nCh_1_prop_1_input_eps_0.010_output_eps_0.015.vnnlib,0,timeout,895
+cgan_2023,onnx/cGAN_imgSz32_nCh_1.onnx,vnnlib/cGAN_imgSz32_nCh_1_prop_1_input_eps_0.010_output_eps_0.015.vnnlib,0,unsat,153.0,denseroot-20260911-08d46b4b2-3of3
 cgan_2023,onnx/cGAN_imgSz32_nCh_1.onnx,vnnlib/cGAN_imgSz32_nCh_1_prop_2_input_eps_0.020_output_eps_0.025.vnnlib,0,sat,0.39,l1audit-20260804-d1282d23
-cgan_2023,onnx/cGAN_imgSz32_nCh_1.onnx,vnnlib/cGAN_imgSz32_nCh_1_prop_3_input_eps_0.010_output_eps_0.015.vnnlib,0,unsat,542.6,abcparity-20260827-d4a20ea99
-cgan_2023,onnx/cGAN_imgSz32_nCh_3.onnx,vnnlib/cGAN_imgSz32_nCh_3_prop_0_input_eps_0.015_output_eps_0.020.vnnlib,0,timeout,895.8,realbudget-20260811
-cgan_2023,onnx/cGAN_imgSz32_nCh_3.onnx,vnnlib/cGAN_imgSz32_nCh_3_prop_1_input_eps_0.015_output_eps_0.020.vnnlib,0,unsat,808.0,abcparity-20260828-af6e736f4
-cgan_2023,onnx/cGAN_imgSz32_nCh_3.onnx,vnnlib/cGAN_imgSz32_nCh_3_prop_2_input_eps_0.015_output_eps_0.020.vnnlib,0,timeout,895.8,realbudget-20260811
+cgan_2023,onnx/cGAN_imgSz32_nCh_1.onnx,vnnlib/cGAN_imgSz32_nCh_1_prop_3_input_eps_0.010_output_eps_0.015.vnnlib,0,unsat,153.3,denseroot-20260911-08d46b4b2
+cgan_2023,onnx/cGAN_imgSz32_nCh_3.onnx,vnnlib/cGAN_imgSz32_nCh_3_prop_0_input_eps_0.015_output_eps_0.020.vnnlib,0,unsat,307.0,denseroot-20260911-08d46b4b2-3of3
+cgan_2023,onnx/cGAN_imgSz32_nCh_3.onnx,vnnlib/cGAN_imgSz32_nCh_3_prop_1_input_eps_0.015_output_eps_0.020.vnnlib,0,unsat,155.0,denseroot-20260911-08d46b4b2
+cgan_2023,onnx/cGAN_imgSz32_nCh_3.onnx,vnnlib/cGAN_imgSz32_nCh_3_prop_2_input_eps_0.015_output_eps_0.020.vnnlib,0,unsat,585.5,denseroot-20260911-08d46b4b2-3of3
 cgan_2023,onnx/cGAN_imgSz32_nCh_3.onnx,vnnlib/cGAN_imgSz32_nCh_3_prop_3_input_eps_0.015_output_eps_0.020.vnnlib,0,sat,0.4,l1audit-20260804-d1282d23
 cgan_2023,onnx/cGAN_imgSz64_nCh_1.onnx,vnnlib/cGAN_imgSz64_nCh_1_prop_0_input_eps_0.010_output_eps_0.015.vnnlib,0,sat,0.39,l1audit-20260804-d1282d23
 cgan_2023,onnx/cGAN_imgSz64_nCh_1.onnx,vnnlib/cGAN_imgSz64_nCh_1_prop_1_input_eps_0.010_output_eps_0.015.vnnlib,0,sat,0.43,l1audit-20260804-d1282d23
@@ -14,8 +13,8 @@ cgan_2023,onnx/cGAN_imgSz64_nCh_1.onnx,vnnlib/cGAN_imgSz64_nCh_1_prop_3_input_ep
 cgan_2023,onnx/cGAN_imgSz64_nCh_3.onnx,vnnlib/cGAN_imgSz64_nCh_3_prop_0_input_eps_0.005_output_eps_0.010.vnnlib,0,sat,0.44,l1audit-20260804-d1282d23
 cgan_2023,onnx/cGAN_imgSz64_nCh_3.onnx,vnnlib/cGAN_imgSz64_nCh_3_prop_1_input_eps_0.010_output_eps_0.015.vnnlib,0,timeout,895.9,realbudget-20260811
 cgan_2023,onnx/cGAN_imgSz64_nCh_3.onnx,vnnlib/cGAN_imgSz64_nCh_3_prop_2_input_eps_0.005_output_eps_0.010.vnnlib,0,sat,0.43,l1audit-20260804-d1282d23
-cgan_2023,onnx/cGAN_imgSz64_nCh_3.onnx,vnnlib/cGAN_imgSz64_nCh_3_prop_3_input_eps_0.010_output_eps_0.015.vnnlib,0,timeout,895.8,realbudget-20260811
-cgan_2023,onnx/cGAN_imgSz32_nCh_3_nonlinear_activations.onnx,vnnlib/cGAN_imgSz32_nCh_3_nonlinear_activations_prop_0_input_eps_0.015_output_eps_0.020.vnnlib,0,timeout,1195.0,realbudget-20260825
+cgan_2023,onnx/cGAN_imgSz64_nCh_3.onnx,vnnlib/cGAN_imgSz64_nCh_3_prop_3_input_eps_0.010_output_eps_0.015.vnnlib,0,unsat,160.8,unstablerows-20260912-fa34dcc37-4of4
+cgan_2023,onnx/cGAN_imgSz32_nCh_3_nonlinear_activations.onnx,vnnlib/cGAN_imgSz32_nCh_3_nonlinear_activations_prop_0_input_eps_0.015_output_eps_0.020.vnnlib,0,unsat,83.1,sshaped-20260914-882ae9309-4of4
 cgan_2023,onnx/cGAN_imgSz32_nCh_1_transposedConvPadding_1.onnx,vnnlib/cGAN_imgSz32_nCh_1_transposedConvPadding_1_prop_0_input_eps_0.015_output_eps_0.020.vnnlib,0,sat,0.42,l1audit-20260804-d1282d23
 cgan_2023,onnx/cGAN_imgSz32_nCh_3_upsample.onnx,vnnlib/cGAN_imgSz32_nCh_3_upsample_prop_0_input_eps_0.015_output_eps_0.020.vnnlib,0,timeout,1195.1,realbudget-20260825
 cgan_2023,onnx/cGAN_imgSz32_nCh_3_small_transformer.onnx,vnnlib/cGAN_imgSz32_nCh_3_small_transformer_prop_0_input_eps_0.005_output_eps_0.010.vnnlib,0,sat,5.34,l1audit-20260804-d1282d23

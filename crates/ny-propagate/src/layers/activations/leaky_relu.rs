@@ -102,7 +102,7 @@ pub(super) fn leaky_relu_linear_relaxation(l: f32, u: f32, alpha: f32) -> Linear
         // Crossing: linear relaxation for l < 0 < u, both finite.
         // Compute chord connecting (l, alpha*l) to (u, u) in f64 to avoid
         // precision loss when alpha is large. Apply directed rounding so the
-        // chord remains a valid bound after f32 conversion. Part of #3313.
+        // chord remains a valid bound after f32 conversion.
         let l_f64 = l as f64;
         let u_f64 = u as f64;
         let alpha_f64 = alpha as f64;
@@ -138,7 +138,7 @@ impl LeakyReLULayer {
     /// Returns an error if `alpha` is NaN or infinite, since non-finite
     /// slopes cause NaN/Inf propagation in IBP (alpha * x = NaN for NaN alpha).
     /// Note: negative alpha is valid (creates a non-monotone piecewise linear
-    /// function); the relaxation code handles this case correctly. Part of #2551.
+    /// function); the relaxation code handles this case correctly.
     pub fn try_new(alpha: f32) -> Result<Self> {
         Ok(Self {
             alpha: validate_finite(alpha, "LeakyReLULayer", "alpha")?,
@@ -238,7 +238,7 @@ mod tests {
     use ndarray::{array, ArrayD, IxDyn};
     use proptest::prelude::ProptestConfig;
 
-    // ── Constructor validation tests (#2551) ────────────────────────────
+    // ── Constructor validation tests ────────────────────────────
 
     #[test]
     fn test_try_new_rejects_invalid_alpha_2551() {
@@ -511,7 +511,7 @@ mod tests {
     #[test]
     fn test_ibp_nan_alpha_falls_back_to_infinite_bounds() {
         // Bypass try_new validation to test defense-in-depth in IBP path.
-        // In production, NaN alpha is rejected at construction (#2551), but
+        // In production, NaN alpha is rejected at construction, but
         // pub(crate) field access can still create invalid layers.
         let layer = LeakyReLULayer { alpha: f32::NAN };
         let input = BoundedTensor::new(
@@ -601,7 +601,7 @@ mod tests {
         assert!(matches!(err, NyError::InvalidSpec(_)));
     }
 
-    // ── CROWN relaxation soundness proptest (#3321) ─────────────────────
+    // ── CROWN relaxation soundness proptest ─────────────────────
 
     /// Reference LeakyReLU in f64, independent of the crate f32 implementation.
     fn leaky_relu_f64_reference(x: f64, alpha: f64) -> f64 {
@@ -615,7 +615,7 @@ mod tests {
     proptest::proptest! {
         #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(1000) })]
 
-        /// #3321: Verify leaky_relu_linear_relaxation produces strictly sound bounds.
+        /// Verify leaky_relu_linear_relaxation produces strictly sound bounds.
         /// For random intervals, the lower bound must satisfy
         ///   lower_slope * x + lower_intercept <= LeakyReLU(x)  for all x in [l, u]
         /// and the upper bound must satisfy

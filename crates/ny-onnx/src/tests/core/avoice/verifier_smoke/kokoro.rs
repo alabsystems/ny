@@ -12,8 +12,6 @@ use super::shared::{
 ///
 /// Uses IBP on the shallowest prefix subgraph (up to first ConvTranspose1d)
 /// with a scalar PowConstant(2.0) -> ReduceSum energy head appended.
-///
-/// Part of #4029.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
 #[cfg(feature = "external-avoice")]

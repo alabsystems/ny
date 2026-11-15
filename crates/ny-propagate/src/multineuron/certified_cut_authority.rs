@@ -39,6 +39,20 @@
 //! error lane, and apply the bias as `stored_value - source_abs_error`. It must
 //! additionally charge the exact error of the resident f32 mutation itself.
 
+// Pure local arithmetic only; no root consumer is installed by this proposal.
+#[allow(dead_code)]
+mod local_box_l1;
+mod root_call;
+pub(crate) use root_call::{
+    evaluate_raw_local_l1_root_cut, evaluate_raw_root_cut, evaluate_raw_triplet_root_cut,
+    evaluate_raw_two_local_l1_root_cut, evaluate_raw_two_pair_root_cut,
+    quote_raw_local_l1_root_cut, quote_raw_root_cut, quote_raw_triplet_root_cut,
+    quote_raw_two_local_l1_root_cut, quote_raw_two_pair_root_cut, CompletedRawLocalL1RootCut,
+    CompletedRawRootCut, CompletedRawTripletRootCut, CompletedRawTwoLocalL1RootCut,
+    CompletedRawTwoPairRootCut, RawLocalL1RootCutQuote, RawRootCutLimits, RawRootCutQuote,
+    RawTripletRootCutQuote, RawTwoLocalL1RootCutQuote, RawTwoPairRootCutQuote,
+};
+
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::time::Instant;
@@ -370,6 +384,106 @@ pub(super) struct BoundResidentLowerCutCarrier<'context, 'data> {
     generations: ResidentCutSnapshotGenerations,
     proof: CertifiedLowerCutReplay<'data>,
     transport: ResidentLowerCutCarrier,
+}
+
+/// A completed scalar from the separately certified arithmetic capability.
+/// Construction is private and the value cannot be cloned, serialized, or
+/// detached from its exact call seal/generation. It is not a shadow observation.
+/// No production caller is enabled by this primitive-only patch.
+pub(super) struct BoundResidentLowerResult<'context> {
+    seal: &'context ResidentCutCallSeal,
+    generations: ResidentCutSnapshotGenerations,
+    lower: f32,
+}
+
+impl<'a> ResidentCutCallContext<'a> {
+    /// Consume the exact carrier once through a one-objective zero-beta fold.
+    /// Caller must use the original objective seed, not an uncertified rounded
+    /// suffix. The final root invocation/attempt and heap admission belong to
+    /// the future root callsite, not this context or the public transport type.
+    pub(super) fn run_backend_lower<'context>(
+        &'context self,
+        carrier: &BoundResidentLowerCutCarrier<'_, 'a>,
+        gpu: &dyn GpuCrownBackward,
+    ) -> Result<BoundResidentLowerResult<'context>> {
+        self.validate_bound_carrier(carrier)?;
+        if self.seed.num_specs != 1
+            || !gpu.provides_bounded_lower_cut()
+            || self.beta_signed.iter().flatten().any(|&x| x != 0.0)
+            || self
+                .seed
+                .lower_a
+                .iter()
+                .zip(self.seed.upper_a.iter())
+                .any(|(a, b)| a.to_bits() != b.to_bits())
+            || self
+                .seed
+                .lower_b
+                .iter()
+                .zip(self.seed.upper_b.iter())
+                .any(|(a, b)| a.to_bits() != b.to_bits())
+        {
+            return Err(NyError::SoundnessRefusal(
+                "certified lower result requires exact one-row seed and zero beta".into(),
+            ));
+        }
+        self.advance_frontier_generation()?;
+        let result = gpu.crown_backward_gpu_resnet_lower_cut_with_deadline(
+            self.segments,
+            self.seed,
+            self.resident_input_lower,
+            self.resident_input_upper,
+            &carrier.transport,
+            self.deadline,
+        );
+        // Even a failed numeric/deadline attempt consumes the original carrier.
+        self.advance_frontier_generation()?;
+        let lower = result?;
+        check_deadline(self.deadline, AuthorityDeadlineStage::BeforePublish)?;
+        if !ny_core::is_crown_coeff_safe(lower) {
+            return Err(NyError::SoundnessRefusal(
+                "unsafe completed lower-cut result".into(),
+            ));
+        }
+        Ok(BoundResidentLowerResult {
+            seal: &self.seal,
+            generations: self.generations.get(),
+            lower,
+        })
+    }
+
+    /// Consume a complete same-context scalar into a completed one-row bound.
+    /// The caller supplies the original same-objective baseline. This returns
+    /// a new pair only after every check; all failures leave that baseline
+    /// available to the caller, and its upper bits are never changed.
+    pub(super) fn merge_backend_lower(
+        &self,
+        result: BoundResidentLowerResult<'_>,
+        baseline: &ny_core::GpuCrownResult,
+    ) -> Result<ny_core::GpuCrownResult> {
+        check_deadline(self.deadline, AuthorityDeadlineStage::BeforePublish)?;
+        if !std::ptr::eq(
+            std::ptr::from_ref(result.seal),
+            std::ptr::from_ref(&self.seal),
+        ) || result.generations != self.generations.get()
+            || baseline.lower_bounds.len() != 1
+            || baseline.upper_bounds.len() != 1
+            || !ny_core::is_crown_coeff_safe(baseline.lower_bounds[0])
+            || !ny_core::is_crown_coeff_safe(baseline.upper_bounds[0])
+            || baseline.lower_bounds[0] > baseline.upper_bounds[0]
+            || result.lower > baseline.upper_bounds[0]
+        {
+            return Err(NyError::SoundnessRefusal(
+                "foreign/stale/incompatible completed lower result".into(),
+            ));
+        }
+        let mut merged = baseline.clone();
+        if result.lower > merged.lower_bounds[0] {
+            merged.lower_bounds[0] = result.lower;
+        }
+        check_deadline(self.deadline, AuthorityDeadlineStage::BeforePublish)?;
+        Ok(merged)
+    }
 }
 
 impl<'a> ResidentCutCallContext<'a> {
@@ -1165,6 +1279,12 @@ fn octahedron_bits_equal(left: &Octahedron2, right: &Octahedron2) -> bool {
     .into_iter()
     .all(|equal| equal)
 }
+
+#[cfg(test)]
+pub(crate) use root_call::{
+    local_l1_test_support, test_support, triplet_test_support, two_local_l1_test_support,
+    two_pair_test_support,
+};
 
 #[cfg(test)]
 mod tests {

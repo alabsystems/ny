@@ -4,7 +4,7 @@
 
 //! Proof coverage tests for MulBinary batched CROWN and McCormick edge cases.
 //!
-//! Added by Prover as part of #2519 proof_coverage audit.
+//! Added by Prover as part of the proof_coverage audit.
 //! Tests exercise:
 //! - `propagate_linear_batched_binary()` (253 lines, was zero test coverage)
 //! - McCormick CROWN with zero-crossing intervals (missing coverage)
@@ -17,7 +17,7 @@
 //!
 //! NOTE: `relu_intercept_score` is private to `branching/mod.rs`. Direct unit
 //! tests for its edge cases (NaN, Inf, near-zero width) must be added inline
-//! by a Worker. See #2519.
+//! by a Worker.
 
 use ndarray::{arr1, Array2, ArrayD, IxDyn};
 use ny_core::Result;

@@ -110,13 +110,13 @@ pub(super) fn noise_scaled_margin(output: &ArrayD<f32>) -> f32 {
     (1e-4_f32).max(1e-5 * max_abs)
 }
 
-/// Retrieve an output value by index, failing closed on OOB coordinates (#4375).
+/// Retrieve an output value by index, failing closed on OOB coordinates.
 fn output_at(output: &ArrayD<f32>, i: usize) -> Option<f32> {
     output.iter().nth(i).copied()
 }
 
 /// Compute a single-constraint satisfaction margin.
-/// OOB coordinates map to `f32::NEG_INFINITY` so invalid clauses fail closed (#4375).
+/// OOB coordinates map to `f32::NEG_INFINITY` so invalid clauses fail closed.
 fn constraint_margin(constraint: &OutputConstraint, output: &ArrayD<f32>) -> f32 {
     match constraint {
         OutputConstraint::GreaterEq(i, j) | OutputConstraint::GreaterThan(i, j) => {
@@ -242,13 +242,16 @@ pub(super) fn candidate_output_is_finite(output: &ArrayD<f32>) -> bool {
 /// re-check constraints with an epsilon margin guard, requiring the witness to lie
 /// inside the GLOBAL attack box AND in a satisfied clause's per-clause input box.
 /// Rejects borderline counterexamples (f32 accumulation-order sign flips),
-/// input-box-mismatched false CEs (#4375, nn4sys per-clause-box fix), and
+/// input-box-mismatched false CEs (the nn4sys per-clause-box fix), and
 /// wrong-buffer candidates whose input never went through this attack's box
 /// projection (#witness-box-audit). Wrong answers carry a VNN-COMP penalty;
 /// timeouts do not — so rejecting borderline/mismatched SAT claims is the safe
 /// choice. The confirmed tensor is returned BIT-IDENTICAL to the candidate: the
 /// stored witness is exactly the vector this check validated.
-fn re_evaluate_and_confirm(
+///
+/// `pub(super)`: the #attack-open-disjuncts stage hands its candidates to
+/// this same funnel rather than growing a second acceptance rule.
+pub(super) fn re_evaluate_and_confirm(
     model_net: &BetaCrownModel,
     counterexample: &ArrayD<f32>,
     clauses: &[Vec<OutputConstraint>],
@@ -342,7 +345,10 @@ impl DisjunctiveAttackFeedback {
     }
 }
 
-fn make_violated_result(counterexample: ArrayD<f32>, output: ArrayD<f32>) -> BetaCrownResult {
+pub(super) fn make_violated_result(
+    counterexample: ArrayD<f32>,
+    output: ArrayD<f32>,
+) -> BetaCrownResult {
     BetaCrownResult {
         result: BabVerificationStatus::Violated {
             counterexample: counterexample.iter().copied().collect(),
@@ -494,6 +500,8 @@ pub(super) fn try_disjunctive_sampling_attack_with_config(
     stall: AttackStallPolicy,
     mut feedback: Option<&mut DisjunctiveAttackFeedback>,
 ) -> Result<Option<BetaCrownResult>> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Attack);
     if clauses.is_empty() {
         return Ok(None);
     }
@@ -577,7 +585,7 @@ pub(super) fn try_disjunctive_sampling_attack_with_config(
             PgdConfig {
                 num_restarts: attack_restarts,
                 num_steps: attack_steps,
-                ..pgd_config
+                ..pgd_config.clone()
             },
             gemm_engine,
             json,

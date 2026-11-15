@@ -389,7 +389,7 @@ fn test_batched_linear_bounds_compose_invalid_ndim_is_error() {
 #[test]
 fn test_batched_linear_bounds_compose_nan_in_coeffs_widens_to_infinity() {
     // Kills mutants: replace || with && in compose::interval_mul_for_bounds NaN check.
-    // Note: from_parts_unchecked now debug_asserts against NaN (#2979), so we use
+    // Note: from_parts_unchecked now debug_asserts against NaN, so we use
     // direct struct construction to inject NaN for testing compose() NaN handling.
     let self_bounds = BatchedLinearBounds::from_parts_unchecked(
         arr2(&[[2.0]]).into_dyn(),
@@ -429,7 +429,7 @@ fn test_batched_linear_bounds_compose_nan_in_coeffs_widens_to_infinity() {
 #[test]
 fn test_batched_linear_bounds_compose_nan_in_self_upper_widens_to_infinity() {
     // Kills missed mutant: OR->AND for the b_u.is_nan() clause in interval_mul_for_bounds.
-    // Note: from_parts_unchecked now debug_asserts against NaN (#2979), so we use
+    // Note: from_parts_unchecked now debug_asserts against NaN, so we use
     // direct struct construction for the NaN-containing bounds.
     let self_bounds = BatchedLinearBounds {
         lower_a: arr2(&[[2.0]]).into_dyn(),
@@ -502,7 +502,6 @@ fn test_batched_linear_bounds_compose_all_inf_products_widens_to_infinity() {
 }
 
 // ========== Phase 4 proptest: NaN rejection ==========
-// Reference: designs/2026-02-25-validated-linear-bounds.md §Verification
 
 use ndarray::{Array1, Array2};
 

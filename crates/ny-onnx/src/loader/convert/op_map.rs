@@ -11,7 +11,7 @@ use tracing::debug;
 /// Returns `Ok((LayerType, true))` for supported data-path ops,
 /// `Ok((LayerType::Unknown, false))` for known shape/constant/utility ops that
 /// are safe to trace through, and `Err(UnsupportedOp)` for truly unknown ops
-/// that should not be silently dropped. (#2931)
+/// that should not be silently dropped.
 ///
 /// # NOT IN THIS TABLE: the vendor-domain family
 ///
@@ -164,7 +164,7 @@ pub(super) fn op_type_to_layer_type(op_type: &str, name: &str) -> Result<(LayerT
             Ok((LayerType::Unsqueeze, true))
         }
         // Slice: data-path op for extracting contiguous ranges along axes.
-        // Previously misclassified as a shape/constant op (#2931), but Slice
+        // Previously misclassified as a shape/constant op, but Slice
         // appears in data flow paths (ViT patch extraction, sequence slicing).
         // LayerType::Slice is fully supported by the converter.
         "Slice" => {
@@ -263,7 +263,7 @@ pub(super) fn op_type_to_layer_type(op_type: &str, name: &str) -> Result<(LayerT
         }
         // Truly unknown ops: return an error instead of silently dropping.
         // This prevents verification from proceeding on a structurally incomplete
-        // graph. If a new op needs to be skipped, add an explicit match arm above. (#2931)
+        // graph. If a new op needs to be skipped, add an explicit match arm above.
         _ => Err(NyError::UnsupportedOp(format!(
             "ONNX op '{}' (node '{}') is not supported and cannot be silently dropped",
             op_type, name
@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn test_silu_swish_mapping() {
         // Both "SiLU" and "Swish" ONNX op names must map to LayerType::SiLU.
-        // Regression test requested by Prover (Re: #1148).
+        // Regression test requested by Prover.
         let (ty, include) = op_type_to_layer_type("SiLU", "silu_0").unwrap();
         assert_eq!(ty, LayerType::SiLU);
         assert!(include);
@@ -291,7 +291,7 @@ mod tests {
 
     #[test]
     fn test_unknown_op_returns_error() {
-        // Truly unknown ops must return UnsupportedOp, not silently drop (#2931).
+        // Truly unknown ops must return UnsupportedOp, not silently drop.
         let result = op_type_to_layer_type("FakeOp", "fake_0");
         assert!(result.is_err());
     }

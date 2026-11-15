@@ -48,3 +48,27 @@ attack:
   pgd_order: after
   ny_pgd_order_compat: upfront
   pgd_restarts: 10000
+
+bab:
+  phase_budget:
+    # #flush-grace, armed 2026-09-13 on a 102-row A/B plus a 63-run
+    # confirm. `internal_timeout_secs` hands the verifier
+    # `budget - max(5, budget/20)`, which on a 20 s row is a 25% tax:
+    # every measured safenlp timeout stopped at wall 16.4-16.9 s of 20,
+    # while the publication it reserves for was measured at 9-18 ms with
+    # a post-stop tail of 0.00-0.19 s. FOUR banked unsats that current
+    # main TIMES OUT on prove again once the tax is lifted.
+    #
+    # THE VALUE IS 2, NOT 1, AND THAT IS MEASURED. Overhead (wall minus
+    # internal timeout) is 1.19-1.87 s, so grace=1 (internal 19 s) put
+    # THIRTY rows at 20.19-20.40 s against a 20 s budget -- every one an
+    # overrun. grace=2 (internal 18 s) tops out at 19.69 s across 63
+    # runs, zero overruns, and still proves hyperrectangle_11 (unsat 3/3
+    # @16.0-16.2 s) and hyperrectangle_5345 (unsat 3/3 @16.8 s).
+    # hyperrectangle_2912 and _5185 need 17.0-18.3 s and land only
+    # sometimes at 18 s internal -- marginal, not banked.
+    #
+    # Cannot mint a verdict: `write_results` only ever publishes what the
+    # verifier certified, and the in-process watchdog downgrades to
+    # `timeout` and never upgrades.
+    results_flush_grace_secs: 2

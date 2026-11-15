@@ -345,7 +345,7 @@ fn test_relu_backward_alpha_beta_constrained_neurons() {
 }
 
 // ============================================================================
-// Near-zero-width regression tests for RELU_RELAX_MIN_WIDTH (#1645)
+// Near-zero-width regression tests for RELU_RELAX_MIN_WIDTH
 //
 // These test that all backward.rs ReLU relaxation paths produce finite results
 // when the pre-activation interval width (u - l) is extremely small but the
@@ -487,7 +487,7 @@ fn assert_bounds_no_nan(bounds: &LinearBounds, label: &str) {
     }
 }
 
-/// #2826 regression: relu_backward_with_alpha_beta must skip non-finite β.
+/// Regression: relu_backward_with_alpha_beta must skip non-finite β.
 #[ntest::timeout(5000)]
 #[test]
 fn test_non_finite_beta_alpha_beta_2826() {
@@ -523,7 +523,7 @@ fn test_non_finite_beta_alpha_beta_2826() {
     }
 }
 
-/// #2826 regression: relu_backward_with_beta must skip non-finite β.
+/// Regression: relu_backward_with_beta must skip non-finite β.
 #[ntest::timeout(5000)]
 #[test]
 fn test_non_finite_beta_legacy_2826() {
@@ -545,7 +545,7 @@ fn test_non_finite_beta_legacy_2826() {
     }
 }
 
-/// #2826 regression: relu_backward_with_beta_record_relaxation must skip non-finite β.
+/// Regression: relu_backward_with_beta_record_relaxation must skip non-finite β.
 #[ntest::timeout(5000)]
 #[test]
 fn test_non_finite_beta_record_relaxation_2826() {
@@ -613,7 +613,7 @@ fn test_non_finite_beta_record_relaxation_2826() {
     }
 }
 
-/// #1645 regression: relu_backward_with_alpha_beta with near-zero-width interval.
+/// Regression: relu_backward_with_alpha_beta with near-zero-width interval.
 #[ntest::timeout(5000)]
 #[test]
 fn test_relu_backward_alpha_beta_near_zero_width_1645() {
@@ -637,7 +637,7 @@ fn test_relu_backward_alpha_beta_near_zero_width_1645() {
     assert_bounds_finite(&bounds, "relu_backward_with_alpha_beta");
 }
 
-/// #1645 regression: relu_backward_with_beta with near-zero-width interval.
+/// Regression: relu_backward_with_beta with near-zero-width interval.
 #[ntest::timeout(5000)]
 #[test]
 fn test_relu_backward_beta_near_zero_width_1645() {
@@ -654,7 +654,7 @@ fn test_relu_backward_beta_near_zero_width_1645() {
     assert_bounds_finite(&bounds, "relu_backward_with_beta");
 }
 
-/// #1645 regression: relu_backward_with_beta_record_relaxation with near-zero-width interval.
+/// Regression: relu_backward_with_beta_record_relaxation with near-zero-width interval.
 #[ntest::timeout(5000)]
 #[test]
 fn test_relu_backward_beta_record_near_zero_width_1645() {
@@ -696,7 +696,7 @@ fn test_relu_backward_beta_record_near_zero_width_1645() {
     }
 }
 
-/// #2805 regression: NaN pre-activation bounds must fail closed without NaN poisoning.
+/// Regression: NaN pre-activation bounds must fail closed without NaN poisoning.
 #[ntest::timeout(5000)]
 #[test]
 fn test_relu_backward_alpha_beta_nan_pre_bounds_2805() {
@@ -733,7 +733,7 @@ fn test_relu_backward_alpha_beta_nan_pre_bounds_2805() {
     }
 }
 
-/// #2805 regression: NaN pre-activation bounds must fail closed on the NEGATIVE
+/// Regression: NaN pre-activation bounds must fail closed on the NEGATIVE
 /// `la_ij` branch too. The sibling test above uses `LinearBounds::identity`, so
 /// it only drives `la_ij >= 0`; this one covers `la_ij < 0`, where the
 /// fail-closed `+inf` upper intercept has to flip the lower bias to `-inf`.
@@ -785,7 +785,7 @@ fn test_relu_backward_alpha_beta_nan_pre_bounds_negative_coeffs_2805() {
     }
 }
 
-/// #2805 regression: legacy relu_backward_with_beta must fail closed on NaN pre-bounds.
+/// Regression: legacy relu_backward_with_beta must fail closed on NaN pre-bounds.
 #[ntest::timeout(5000)]
 #[test]
 fn test_relu_backward_beta_nan_pre_bounds_2805() {
@@ -815,7 +815,7 @@ fn test_relu_backward_beta_nan_pre_bounds_2805() {
     }
 }
 
-/// #2805 regression: legacy relu_backward_with_beta_record_relaxation must fail closed on NaN.
+/// Regression: legacy relu_backward_with_beta_record_relaxation must fail closed on NaN.
 #[ntest::timeout(5000)]
 #[test]
 fn test_relu_backward_beta_record_nan_pre_bounds_2805() {
@@ -871,7 +871,7 @@ fn test_relu_backward_beta_record_nan_pre_bounds_2805() {
     }
 }
 
-/// Regression for #1840: wildcard dispatch in alpha-beta backward must delegate
+/// Regression: wildcard dispatch in alpha-beta backward must delegate
 /// to layer CROWN backward implementations (e.g., Sigmoid), not identity fallback.
 #[ntest::timeout(5000)]
 #[test]
@@ -912,7 +912,7 @@ fn test_propagate_layer_backward_alpha_beta_dispatches_sigmoid_1840() {
     assert_linear_bounds_close(&actual, &expected, 1e-5, "sigmoid_1840");
 }
 
-/// Regression for #1840: test-only beta backward helper should also route wildcard
+/// Regression: test-only beta backward helper should also route wildcard
 /// layers through unified CROWN dispatch before IBP fallback.
 #[ntest::timeout(5000)]
 #[test]
@@ -966,7 +966,7 @@ fn assert_relu_backward_no_nan(bounds: &LinearBounds, label: &str) {
     );
 }
 
-/// Regression test for #2805: Inf pre-activation bounds must not produce NaN in
+/// Regression test: Inf pre-activation bounds must not produce NaN in
 /// the beta-CROWN backward pass. Before this fix, Inf bounds fell through to the
 /// unstable branch where (u - l) = Inf and u/Inf = NaN or -l*u/Inf = NaN.
 ///
@@ -1021,7 +1021,7 @@ fn test_relu_backward_inf_pre_activation_no_nan_2805() {
 /// Verifies both soundness (lower/upper bounds bracket f64 reference) and
 /// directed rounding discrimination (f64 accumulation + next_down/next_up
 /// pushes bounds away from 1e7, which wouldn't happen with f32 accumulators
-/// because each sub-ULP term is lost). Reference: #2336, #1745, #3343.
+/// because each sub-ULP term is lost).
 fn assert_f64_bias_accumulation_bounds(bounds: &LinearBounds, n: usize) {
     let expected_lower = 1e7_f64 + (n as f64) * (-1e-4_f64) * 0.5_f64;
     let expected_upper = 1e7_f64 + (n as f64) * 1e-4_f64 * 0.5_f64;
@@ -1057,7 +1057,7 @@ fn assert_f64_bias_accumulation_bounds(bounds: &LinearBounds, n: usize) {
 }
 
 /// Regression test: f64 bias accumulation prevents catastrophic cancellation
-/// in relu_backward_with_alpha_beta (#2336, #1745).
+/// in relu_backward_with_alpha_beta.
 #[ntest::timeout(5000)]
 #[test]
 fn test_relu_backward_alpha_beta_f64_bias_accumulation_2336() {
@@ -1128,7 +1128,7 @@ fn setup_f64_bias_accumulation_scenario(n: usize) -> (BoundedTensor, LinearBound
     (pre_bounds, output_bounds, network)
 }
 
-/// Variant with n=512 (double the base test). Part of #3343.
+/// Variant with n=512 (double the base test).
 #[ntest::timeout(5000)]
 #[test]
 fn test_relu_backward_alpha_beta_f64_bias_accumulation_large_3343() {

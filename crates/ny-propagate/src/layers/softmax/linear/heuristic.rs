@@ -127,7 +127,7 @@ impl SoftmaxLayer {
         }
 
         // Weight and bias accumulation use f64 to prevent catastrophic cancellation
-        // (#1745, #2169). Softmax Jacobian has mixed signs (positive on diagonal,
+        //Softmax Jacobian has mixed signs (positive on diagonal,
         // negative off-diagonal, rows sum to 0), so O(num_neurons) terms with
         // cancellation make f32 accumulation unsound.
         let mut new_lower_a_f64 = Array2::<f64>::zeros((num_outputs, num_neurons));
@@ -140,7 +140,7 @@ impl SoftmaxLayer {
                 let la = bounds.lower_a()[[out_idx, i]];
                 let ua = bounds.upper_a()[[out_idx, i]];
 
-                // Guard: skip zero coefficients to avoid 0*inf NaN (#1739).
+                // Guard: skip zero coefficients to avoid 0*inf NaN.
                 if la > 0.0 {
                     let la_f64 = la as f64;
                     for k in 0..num_neurons {
@@ -172,7 +172,7 @@ impl SoftmaxLayer {
         }
 
         // A-matrix: standard f64→f32 rounding (round-to-nearest), matching
-        // alpha-beta-CROWN. Directed rounding on A is not unconditionally sound (#2208).
+        // alpha-beta-CROWN. Directed rounding on A is not unconditionally sound.
         LinearBounds::new_or_conservative(
             new_lower_a_f64.mapv(|x| x as f32),
             new_lower_b_f64.mapv(|x| next_down_f32(x as f32)),

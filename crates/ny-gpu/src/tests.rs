@@ -842,7 +842,7 @@ fn test_compute_device_crown_per_position() {
 }
 
 // ================= NaN Sanitization Tests =================
-// #2913: Verify that NaN/Inf in kernel output gets sanitized to
+// Verify that NaN/Inf in kernel output gets sanitized to
 // conservative FALLBACK_BOUND, widening (not tightening) bounds.
 
 #[test]
@@ -999,7 +999,7 @@ fn test_linear_ibp_inf_sanitization() {
 }
 
 // ================= Reference Comparison Tests =================
-// #2913: Verify parallel kernels match ny-propagate sequential IBP.
+// Verify parallel kernels match ny-propagate sequential IBP.
 
 #[test]
 fn test_linear_ibp_parallel_matches_sequential_reference() {
@@ -1074,7 +1074,7 @@ fn test_linear_ibp_parallel_matches_sequential_negative_weights() {
 }
 
 // ================= Attention Soundness Sampling Tests =================
-// #2913: Verify attention IBP bounds contain concrete point evaluations.
+// Verify attention IBP bounds contain concrete point evaluations.
 
 #[test]
 fn test_attention_ibp_soundness_sampling() {
@@ -1166,4 +1166,69 @@ fn test_attention_ibp_soundness_sampling() {
     let v_hi = BoundedTensor::new(upper_v.clone(), upper_v).unwrap();
     let hi_result = device.attention_ibp(&q_hi, &k_hi, &v_hi, scale).unwrap();
     check_containment(&hi_result, "upper-corner");
+}
+
+/// Every example of this crate drives the WGPU backend, which exists only
+/// with the `wgpu` feature, so each needs an explicit `[[example]]` table whose
+/// `required-features` names it. Without one Cargo auto-discovers the example
+/// and `targo ... -p ny-gpu --no-default-features --all-targets` fails to
+/// compile it: `examples/wgpu_probe.rs` broke that build with E0433 on
+/// `ny_gpu::WgpuDevice` / `ny_gpu::WgpuVerdictRequest`. An example that
+/// genuinely needs no backend should be listed here with its reason instead.
+#[test]
+fn every_example_declares_the_wgpu_feature_it_drives() {
+    const BACKEND_FREE_EXAMPLES: &[&str] = &[];
+    let manifest = include_str!("../Cargo.toml");
+    let mut declared: Vec<(String, bool)> = Vec::new();
+    for table in manifest.split("[[").skip(1) {
+        let Some(body) = table.strip_prefix("example]]") else {
+            continue;
+        };
+        let body = body.split("\n[").next().unwrap_or(body);
+        let field = |key: &str| {
+            body.lines()
+                .map(str::trim)
+                .find_map(|line| line.strip_prefix(key)?.trim_start().strip_prefix('='))
+                .map(str::trim)
+        };
+        let name = field("name")
+            .and_then(|value| value.strip_prefix('"')?.strip_suffix('"'))
+            .expect("every [[example]] table names its example")
+            .to_string();
+        let needs_wgpu = field("required-features").is_some_and(|features| {
+            features
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .split(',')
+                .any(|feature| feature.trim() == "\"wgpu\"")
+        });
+        declared.push((name, needs_wgpu));
+    }
+    let examples_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+    let mut found = 0usize;
+    for entry in std::fs::read_dir(&examples_dir).expect("ny-gpu has an examples/ directory") {
+        let path = entry.expect("readable examples/ entry").path();
+        let stem = if path.extension().is_some_and(|ext| ext == "rs") {
+            path.file_stem()
+        } else if path.join("main.rs").is_file() {
+            path.file_name()
+        } else {
+            None
+        };
+        let Some(stem) = stem.and_then(std::ffi::OsStr::to_str) else {
+            continue;
+        };
+        found += 1;
+        if BACKEND_FREE_EXAMPLES.contains(&stem) {
+            continue;
+        }
+        assert!(
+            declared
+                .iter()
+                .any(|(name, needs_wgpu)| name == stem && *needs_wgpu),
+            "examples/{stem} has no [[example]] table with required-features = [\"wgpu\", ...] \
+             in crates/ny-gpu/Cargo.toml; `--no-default-features --all-targets` cannot build it"
+        );
+    }
+    assert!(found > 0, "the examples/ scan matched nothing (VOID)");
 }

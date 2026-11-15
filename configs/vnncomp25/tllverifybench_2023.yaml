@@ -46,12 +46,74 @@ bab:
   branching:
     method: input
     candidates: 10
-    reduceop: max
     input_split:
       enable: true
       sb_coeff_thresh: 0.1
       reorder_bab: true
-  beta_crown:
-    lr_alpha: 0.1
-    lr_beta: 0.15
-    iterations: 15
+      # #lowdim-prover (2026-09-22) — ARMED FOR MEASUREMENT, evidence pending.
+      # Every row here is a 2-INPUT ReLU net with a single output constraint, the
+      # lane's ideal case: forward-linear intermediates cost d+1 = 3 columns per
+      # neuron, and it proved linearizenn 60/60 (44 timeouts -> unsat, 0 lost).
+      # It runs first with half the BaB slice and only ever returns a proof;
+      # anything else falls through to this preset's driver unchanged.
+      lowdim_prover: true
+      # Budget share before falling through. MEASURED (pin ny_tll3_8cc5ec246): at
+      # the default 0.5 the lane converted 5 of the first 8 open rows and ran OUT
+      # OF TIME on the rest (N=48_0 stopped with ~1.3k open leaves of a
+      # converging tree). The fallback has never proved any of these rows, and on
+      # sat rows the lane stops on a candidate within a second, so the share only
+      # binds where the lane is making progress.
+      lowdim_prover_share: 0.9
+      # Backward-CROWN refinement of pre-activation layers no wider than this
+      # (2026-09-23). MEASURED on the GB10 (pin ny_refine_a091543ee, armed through
+      # the yaml): N=56 instance_6_1 timeout -> unsat 436 s, 6_2 -> unsat 392 s, and
+      # it SPEEDS UP the N<=56 banked rows (N=48 instance_5_0 312.7 s -> 152.7 s).
+      # At width 64 the moat LOST both N=64 unsat rows it reached (instance_7_0
+      # 369.6 s -> timeout, 7_1 306.7 s -> timeout: ~450 s for ~1.3k domains —
+      # refinement is too costly per domain on the width-64 layers). 56 keeps every
+      # N<=56 net refined and leaves the N=64 nets' width-64 layers unrefined, i.e.
+      # exactly their banked behaviour. Re-measure N=64 + 6_1/6_2 on the ship pin.
+      lowdim_prover_refine_width: 56
+
+  # #tll-warmup-cap (2026-08-30). MEASURED, then shipped.
+  #
+  # WHAT WAS BROKEN. Every N=56 and N=64 row published `timeout` at 88.4-90.0 s
+  # of a 600 s budget with ~510 s unspent and BaB never started
+  # (domains_explored=0). Named by direct-drive measurement on a pinned binary
+  # (commit aee289fb, sha256 b5a5d12a…):
+  #   - the row runs the SEQUENTIAL beta-CROWN engine, not a graph input-split
+  #     lane (its `-v` log prints `β-CROWN initial bounds:` / `β-CROWN verified
+  #     after N domains`, engine/verify_phases/initial.rs:120 and
+  #     engine/core.rs:800, and prints no `Graph β-CROWN (input split)` line);
+  #   - `evaluate_initial_phase` caps the FOUNDATIONAL CROWN-IBP layer-bounds
+  #     collection at `initial_bounds_fraction` of the BaB slice
+  #     (verify_phases/initial.rs:73-88) and converts that PHASE-LOCAL expiry
+  #     into a whole-instance `BabVerificationStatus::Timeout`
+  #     (verify_phases/initial.rs:100-114). The two GRAPH lanes route the same
+  #     event through `ny_core::phase_yield::classify_expiry` and refuse to call
+  #     a warmup expiry a timeout (relu_split/bab_loop.rs:78-92,172-183;
+  #     gpu_bab/mod.rs:96-106,245-262) — the sequential engine never got that
+  #     treatment;
+  #   - the cap is 0.20 * 0.90 * 483 s = 86.9 s, and the walls are that plus
+  #     ~1.5 s of model load. Confirmed by BUDGET SCALING on N=56_0: the wall is
+  #     8.38 s at budget 60, 15.05 s at budget 120, 88.4 s at budget 600 — a
+  #     capability wall would be the SAME wall at all three.
+  #
+  # WHY 0.85 FIXES IT AND CANNOT COST ANYTHING HERE. `bound_prop_method:
+  # forward+crown` resolves to `use_alpha_crown = false` (preset/apply.rs:454),
+  # so the ITERATIVE root alpha ascent this fraction exists to bound never runs
+  # on this family. The only work under the cap is the ONE-SHOT foundational
+  # CROWN-IBP collection, which returns as soon as it is done. Measured cost on
+  # N=56 with the cap lifted: ~100 s (per-layer costs peak at layer 5-15 and
+  # decline monotonically after — 22.1, 8.3, 20.2, 6.5, 13.5, 3.9, 8.7, 2.3,
+  # 4.6, 1.2, 2.3, 0.7, 1.2, 0.7 s). So:
+  #   - every row whose collection already fits under the old 86.9 s cap
+  #     (N=8..N=48 — all 24 rows that reach BaB today, INCLUDING ALL 19 DECIDED
+  #     ROWS) sees a larger upper bound on work that already finishes early:
+  #     a NO-OP by construction, not a promise;
+  #   - N=56/N=64 get 369 s of cap against a ~100-150 s collection, and BaB
+  #     receives the remaining ~285-335 s it was previously denied entirely.
+  # 0.85 rather than 1.0 keeps a 15% floor so a pathological net still reaches
+  # BaB instead of spending the whole slice in the warmup.
+  phase_budget:
+    initial_bounds_fraction: 0.85

@@ -10,7 +10,6 @@
 //! O((out_c * out_h * out_w)^2).
 //!
 //! Reference: alpha-beta-CROWN `auto_LiRPA/patches.py` (Patches class)
-//! Design: designs/2026-02-28-patches-mode-wrapper-enum-design.md
 
 use ndarray::{Array1, Array2, ArrayD, IxDyn};
 use ny_core::{checked_shape_product, NyError, Result};
@@ -366,8 +365,8 @@ thread_local! {
     /// the test binary multi-threaded and `to_dense()` records on *every* call in
     /// `#[cfg(test)]` builds. Any other test that triggered a patches→dense
     /// conversion concurrently appended to the shared buffer and corrupted the
-    /// reset→propagate→read window of a test that observes the recorder (#4138:
-    /// passed in isolation, failed in the full parallel suite).
+    /// reset→propagate→read window of a test that observes the recorder (it
+    /// passed in isolation and failed in the full parallel suite).
     ///
     /// Each test runs on its own thread and the CROWN propagation it exercises is
     /// synchronous on that thread, so a thread-local buffer captures exactly the
@@ -414,8 +413,6 @@ impl PatchesLinearBounds {
     ///
     /// The A-matrices are identity (each output position maps to itself).
     /// This is the Patches equivalent of `LinearBounds::identity(out_dim)`.
-    ///
-    /// Reference: designs/2026-02-28-patches-mode-wrapper-enum-design.md
     pub(crate) fn identity(
         output_shape: (usize, usize, usize),
         input_shape: (usize, usize, usize),
@@ -555,7 +552,6 @@ impl PatchesLinearBounds {
     /// bounds for neurons that are actually unstable (lower < 0 < upper).
     ///
     /// Reference: alpha-beta-CROWN `backward_bound.py` `get_sparse_C` + `Patches(identity=1, unstable_idx=...)`
-    /// Part of #2613 Phase 4 step 19
     pub(crate) fn sparse_identity(
         output_shape: (usize, usize, usize),
         input_shape: (usize, usize, usize),
@@ -966,8 +962,7 @@ impl PatchesLinearBounds {
     /// **Precondition:** `self` must be in dense mode (no existing `unstable_idx`).
     ///
     /// Reference: alpha-beta-CROWN `backward_bound.py` `get_sparse_C`, `minimum_sparsity=0.9`
-    /// Part of #2613 Phase 4 step 19 — currently test-only; remove #[cfg(test)] when
-    /// wiring to CROWN backward engine.
+    /// Currently test-only; remove #[cfg(test)] when wiring to the CROWN backward engine.
     #[cfg(test)]
     pub(crate) fn filter_to_unstable(
         &self,

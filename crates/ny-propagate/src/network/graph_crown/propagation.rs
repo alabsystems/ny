@@ -392,7 +392,7 @@ pub(crate) trait GraphNetworkCrownExt {
         mul_binary_relaxation: MulBinaryRelaxationMode,
     ) -> Result<CrownBackwardResult>;
 
-    /// CROWN backward propagation with deadline enforcement (#3398).
+    /// CROWN backward propagation with deadline enforcement.
     ///
     /// A finite authority uses cooperative workers and publishes an
     /// already-collected sound forward enclosure when a live route declines.
@@ -538,6 +538,8 @@ impl GraphNetworkCrownExt for GraphNetwork {
         precollected_node_bounds: Option<&std::collections::HashMap<String, BoundedTensor>>,
         crown_ibp_tightening_cap: Option<Duration>,
     ) -> Result<CrownBackwardResult> {
+        self.ensure_proof_eligible()?;
+        let mut attention_regions = super::attention_region::AttentionRegionQuery::new(deadline);
         // Disable the L2/Cauchy–Schwarz lever for the entire fixed-slope CROWN
         // backward scope (this is the single chokepoint all the public
         // `crown_backward_with_relaxation*` variants funnel through, and the
@@ -581,7 +583,7 @@ impl GraphNetworkCrownExt for GraphNetwork {
         {
             bounds
         } else {
-            // Deadline check before expensive CROWN-IBP collection (#3398).
+            // Deadline check before expensive CROWN-IBP collection.
             if let Some(d) = deadline {
                 if Instant::now() >= d {
                     return Err(NyError::DeadlineExceeded(
@@ -640,7 +642,7 @@ impl GraphNetworkCrownExt for GraphNetwork {
                 // Pass deadline to CROWN-IBP collection so the O(N²) per-node backward
                 // passes respect the overall verification timeout. Without this, large
                 // CNN DAGs (e.g., metaroom 6cnn_ry_49_8, 49 layers) can spend 13+
-                // minutes in CROWN-IBP despite a 210s timeout. Fixed in #3397.
+                // minutes in CROWN-IBP despite a 210s timeout.
                 match crown_ibp_tightening_cap {
                     Some(cap) => {
                         self.collect_crown_ibp_bounds_dag_with_status_deadline_and_tightening_cap(
@@ -668,7 +670,7 @@ impl GraphNetworkCrownExt for GraphNetwork {
                 // engine, which accumulates in f32 instead of the scalar path's f64
                 // dot products (`layers/linear/ibp.rs`). That precision loss is enough
                 // to flip the short-seq talker CROWN canary from Verified to
-                // Unknown(BoundsTooLoose) (#4219).
+                // Unknown(BoundsTooLoose).
                 if deadline.is_some() {
                     self.collect_node_bounds_with_engine_and_deadline(input, None, deadline)?
                 } else {
@@ -729,7 +731,7 @@ impl GraphNetworkCrownExt for GraphNetwork {
 
         // Step 2: Initialize linear bounds per node
         // Each node tracks the accumulated linear bounds from all its consumers.
-        // Phase 1b (#2613): Use CrownBounds to support Patches mode for CNN DAGs.
+        // Phase 1b: Use CrownBounds to support Patches mode for CNN DAGs.
         // When the output is 3D spatial with Conv2d layers, start in Patches mode.
         // Accumulation at merge points converts to Dense via ensure_dense().
         let mut node_linear_bounds = CrownMergeAccumulator::new_indexed(exec_order);
@@ -801,14 +803,14 @@ impl GraphNetworkCrownExt for GraphNetwork {
         let mut input_accumulated = false;
 
         // Step 3: Propagate backward through nodes in reverse order.
-        // Phase 1b (#2613): CrownBounds-aware dispatch. Single-input nodes in Patches
+        // Phase 1b: CrownBounds-aware dispatch. Single-input nodes in Patches
         // mode use crown_backward_step_patches for Conv2d/BN/activation/pool Patches
         // dispatch. Compatible same-shape Add/Sub residuals duplicate the Patches
         // carrier across their branches; other multi-input or Patches-unsupported
         // layers convert to Dense. Compatible Patches contributions merge natively,
         // while mixed or incompatible carriers promote transactionally to Dense.
 
-        // Per-node deadline budgeting (#3795): give each backward step a fraction of
+        // Per-node deadline budgeting: give each backward step a fraction of
         // the remaining budget instead of the full global deadline. Without this, a
         // single large Conv2d backward can consume the entire timeout, leaving zero
         // time for BaB domain exploration.
@@ -833,7 +835,7 @@ impl GraphNetworkCrownExt for GraphNetwork {
 
         for (rev_pos, &idx) in plan.reverse_order.iter().enumerate() {
             let node_name = plan.name_of(idx);
-            // Deadline enforcement: check before each node's backward pass (#3398).
+            // Deadline enforcement: check before each node's backward pass.
             // For large models (e.g., relusplitter with 1094s+ overruns), a single
             // backward pass can exceed the entire verification budget. Checking at
             // each node gives O(node_count) granularity. Falls back to IBP which
@@ -865,7 +867,7 @@ impl GraphNetworkCrownExt for GraphNetwork {
 
             // If the overall deadline expires during budget calculation, bail to IBP for
             // the remaining backward pass. Sub-floor node shares keep the global deadline
-            // so CROWN LinearBounds are preserved on short-budget tiny graphs (#3881).
+            // so CROWN LinearBounds are preserved on short-budget tiny graphs.
             if deadline.is_some() && node_deadline.is_none() {
                 info!(
                     "GraphNetwork DAG-CROWN: deadline expired while budgeting '{}' ({}/{} nodes), falling back to IBP",
@@ -1016,7 +1018,7 @@ impl GraphNetworkCrownExt for GraphNetwork {
                 });
             }
 
-            // Direct Vec-indexed node lookup (#4296) — no HashMap access in hot loop.
+            // Direct Vec-indexed node lookup — no HashMap access in hot loop.
             let node = nodes_by_idx[idx];
 
             // Get this node's accumulated CrownBounds via direct index (#4296).
@@ -1070,7 +1072,7 @@ impl GraphNetworkCrownExt for GraphNetwork {
                 })?
             };
 
-            // #3813: Dense→Patches re-entry at unary Conv2d boundaries.
+            // Dense→Patches re-entry at unary Conv2d boundaries.
             super::backward_node_dispatch::try_patches_reentry(
                 &mut node_cb,
                 node,
@@ -1094,7 +1096,7 @@ impl GraphNetworkCrownExt for GraphNetwork {
                 if is_patches { "Patches" } else { "Dense" }
             );
 
-            // === Phase 1b Patches fast-path (#2613) ===
+            // === Phase 1b Patches fast-path ===
             // For single-input nodes in Patches mode, use the sequential Patches-aware
             // dispatch. This handles Conv2d, BatchNorm, activations (30 types), AvgPool,
             // MaxPool natively in Patches, and terminates to Dense at Linear/Flatten/Reshape.
@@ -1147,7 +1149,7 @@ impl GraphNetworkCrownExt for GraphNetwork {
                 }
             }
 
-            // === Patches residual passthrough for Add/Sub (#4382) ===
+            // === Patches residual passthrough for Add/Sub ===
             match crate::network::core::graph::backward_helpers::try_apply_patches_residual_passthrough_with_deadline(
                 self,
                 node,
@@ -1227,10 +1229,10 @@ impl GraphNetworkCrownExt for GraphNetwork {
             }
 
             // Handle site-specific layers first (MulBinary, Where, Linear dimension
-            // check), then route all other layers through the shared dispatch core
-            // (#1949 Step B). This eliminates ~400 LOC of duplicated match arms.
+            // check), then route all other layers through the shared dispatch core.
+            // This eliminates ~400 LOC of duplicated match arms.
 
-            // === Linear: pre-dispatch dimension check with IBP fallback (#2817) ===
+            // === Linear: pre-dispatch dimension check with IBP fallback ===
             if super::backward_node_dispatch::linear_dimension_mismatch(node, &node_lb) {
                 return plain_forward_fallback(
                     self,
@@ -1241,7 +1243,7 @@ impl GraphNetworkCrownExt for GraphNetwork {
                 );
             }
 
-            // === ReLU: heuristic relaxation via shared dispatch (#3935) ===
+            // === ReLU: heuristic relaxation via shared dispatch ===
             if matches!(&node.layer, Layer::ReLU(_)) {
                 use super::backward_node_dispatch::{dispatch_relu_backward, NodeDispatchResult};
                 match dispatch_relu_backward(
@@ -1684,6 +1686,30 @@ impl GraphNetworkCrownExt for GraphNetwork {
             }
 
             // === All other layers: shared dispatch core (#1949 Step B, #3935) ===
+            match attention_regions.try_scalar(
+                self,
+                node,
+                &node_lb,
+                input,
+                node_bounds,
+                &mut node_linear_bounds,
+                output_dim,
+                input_dim,
+                &mut input_accumulated,
+                node_deadline,
+            ) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    return plain_memory_fallback_or_error(
+                        self,
+                        input,
+                        output_bounds,
+                        deadline,
+                        error,
+                    );
+                }
+            }
             use super::backward_node_dispatch::{
                 dispatch_shared_core, SharedDispatchCtx, SharedDispatchResult,
             };
@@ -1825,7 +1851,7 @@ impl GraphNetworkCrownExt for GraphNetwork {
             }
         };
 
-        // Post-concretization tightening with provenance — shared with all CROWN paths (#3043).
+        // Post-concretization tightening with provenance — shared with all CROWN paths.
         let label = if use_crown_ibp {
             "GraphNetwork DAG-CROWN (CROWN-IBP)"
         } else {

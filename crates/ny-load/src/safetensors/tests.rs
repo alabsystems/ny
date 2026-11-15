@@ -260,7 +260,7 @@ fn test_load_f64_conversion() {
 }
 
 // ==========================================================================
-// Overflow regression tests (#3280)
+// Overflow regression tests
 //
 // Verify that checked_shape_product in safetensors_info rejects shapes
 // whose element count overflows usize. Without this guard, integer overflow
@@ -268,7 +268,7 @@ fn test_load_f64_conversion() {
 // bypass downstream allocation checks.
 // ==========================================================================
 
-/// Regression test (#3280): safetensors_info rejects overflowing shape product.
+/// Regression test: safetensors_info rejects overflowing shape product.
 ///
 /// Crafts raw safetensors bytes where the JSON header declares a shape of
 /// [4294967296, 4294967296] (2^32 × 2^32 = 2^64, overflows usize on 64-bit).

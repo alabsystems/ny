@@ -15,11 +15,11 @@ mod proptest_soundness;
 #[cfg(test)]
 mod tests;
 
-/// Shared inverted-bounds repair strategy for propagation and readback code. Part of #3307.
+/// Shared inverted-bounds repair strategy for propagation and readback code.
 pub use core::InversionRepair;
-/// Strategy for automatic NaN/Inf repair at the type boundary. Part of #3423.
+/// Strategy for automatic NaN/Inf repair at the type boundary.
 pub use core::RepairStrategy;
-/// Shared inverted-bounds repair helpers. Part of #3307.
+/// Shared inverted-bounds repair helpers.
 pub use core::{repair_inverted_bounds, repair_inverted_bounds_nd};
 /// Core interval-bounded tensor type used across bound propagation layers.
 pub use core::{

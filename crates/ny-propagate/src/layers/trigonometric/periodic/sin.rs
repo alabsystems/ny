@@ -65,11 +65,11 @@ pub(super) fn sin_bound_interval(l: f32, u: f32) -> (f32, f32) {
     }
 
     // Directed rounding: compute in f64, apply next_down/next_up for endpoint
-    // evaluations. Exact extrema (-1.0, 1.0) don't need rounding. (#3245)
+    // evaluations. Exact extrema (-1.0, 1.0) don't need rounding.
     let sl = (l as f64).sin() as f32;
     let su = (u as f64).sin() as f32;
     // Range clamp: sin(x) ∈ [-1, 1]. Directed rounding can push past ±1
-    // for inputs near extrema (e.g., sin(π/2 - ε) ≈ 1 → next_up > 1). (#3316)
+    // for inputs near extrema (e.g., sin(π/2 - ε) ≈ 1 → next_up > 1).
     let mut min_val = next_down_f32(sl.min(su)).max(-1.0);
     let mut max_val = next_up_f32(sl.max(su)).min(1.0);
 
@@ -128,7 +128,6 @@ pub(super) fn sin_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
 
     // Narrow-interval tangent with directed rounding.
     // Adds slope-error compensation matching trig_tangent_secant_relaxation (common.rs:64-70).
-    // Fixes: #3190 — slope truncation error was not compensated.
     if (u - l).abs() < 1e-8 {
         let sin_l = (l as f64).sin();
         let slope = (l as f64).cos();
@@ -208,7 +207,6 @@ impl SinLayer {
     }
 
     /// Patches CROWN backward propagation with pre-activation bounds.
-    /// Part of #2613 Phase 2: generic activation Patches support.
     pub(crate) fn propagate_patches_with_bounds(
         &self,
         bounds: &crate::bounds::patches::PatchesLinearBounds,

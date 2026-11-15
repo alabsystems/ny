@@ -84,7 +84,7 @@ class TestVnncompInfrastructure:
 
     def test_ny_binary_exists(self):
         """Verify ny binary is built."""
-        assert NY_BINARY.exists(), "Build ny first: cargo build --release"
+        assert NY_BINARY.exists(), "Build ny first: targo --unverified build --release"
 
     def test_vnncomp_2021_exists(self):
         """Verify VNN-COMP 2021 benchmarks exist."""

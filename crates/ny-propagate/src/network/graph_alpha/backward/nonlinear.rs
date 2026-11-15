@@ -22,19 +22,17 @@ use std::time::Instant;
 /// Graph-lane twin of `patches_step::hard_finite_authority_refuses_patches`
 /// (`4d0257ba9`), sharing its lever so the two lanes cannot drift apart.
 ///
-/// * lever OFF (default): returns `deadline.is_some()`, i.e. deadline PRESENCE
-///   refuses. Byte-identical to the historical `deadline.is_none()` guard.
-/// * lever ON: returns true only on actual EXPIRY, so a scored run with budget
-///   remaining keeps its optimized alpha instead of silently reverting to the
-///   heuristic slope.
+/// * lever OFF (`=0` kill switch): returns `deadline.is_some()`, i.e. deadline
+///   PRESENCE refuses. Byte-identical to the historical `deadline.is_none()` guard.
+/// * lever ON (the shipped default): returns true only on actual EXPIRY, so a
+///   scored run with budget remaining keeps its optimized alpha instead of
+///   silently reverting to the heuristic slope.
 ///
 /// The trade the original guard was protecting is real and is NOT resolved by
 /// arming this: those kernels still do not poll inside allocation/flatten/
-/// compose, so an armed run can overrun its deadline inside one. NOTE
-/// (2026-08-19): the shared predicate now SHIPS ARMED by default (`=0` kill
-/// switch), so this comment records the residual RISK, not the default. The
-/// durable fix is to thread the deadline through those phases; this exists to
-/// price whether that work is worth doing before doing it.
+/// compose, so an armed run can overrun its deadline inside one. That is the
+/// residual RISK of the armed default (shipped 2026-08-19). The durable fix is
+/// to thread the deadline through those phases.
 fn alpha_patches_finite_authority_refuses(deadline: Option<Instant>) -> bool {
     // Delegates to the ONE shared predicate. `deadline_is_hard` is deadline
     // presence at this site, which is what the historical guard tested.
@@ -400,12 +398,12 @@ fn handle_relu_node(
             if let Some(&relu_idx) = context.relu_name_to_idx.get(node_name) {
                 if let Some(alpha) = context.alpha_state.alpha(node_name) {
                     if let CrownBounds::Patches(ref pb) = node_cb {
-                        // NOTE(#3782): Only lower-path gradient is captured here.
+                        // NOTE: Only lower-path gradient is captured here.
                         // Patches-mode ReLU is single-alpha (one optimizable lower
                         // slope + fixed upper chord). A dual-alpha patches path
                         // would need `propagate_patches_with_alpha` to return a
                         // separate `grad_upper`, which requires a relaxation redesign.
-                        // #4404: expand channel-only alpha to full spatial before use.
+                        // Expand channel-only alpha to full spatial before use.
                         let alpha_expanded = context.alpha_state.expand_alpha(node_name, alpha);
                         let propagated = if context.track_gradients {
                             relu.propagate_patches_with_alpha(pb, pre_activation, &alpha_expanded)
@@ -420,7 +418,7 @@ fn handle_relu_node(
                         };
                         match propagated {
                             Ok((new_cb, grad)) => {
-                                // #4404: reduce gradient back to per-channel if channel-only.
+                                // Reduce gradient back to per-channel if channel-only.
                                 if let Some(grad) = grad {
                                     context.gradients[relu_idx] =
                                         context.alpha_state.reduce_gradient(node_name, &grad);
@@ -459,7 +457,7 @@ fn handle_relu_node(
 
         // Patches-native ReLU backward (heuristic slope, no alpha or alpha failed).
         //
-        // #1937: record Dense intermediates BEFORE the backward step mutates
+        // Record Dense intermediates BEFORE the backward step mutates
         // `node_cb` (the stored A matrix must be the coefficients at the ReLU
         // output, matching the dense/alpha branches). Without this, a ReLU that
         // takes the heuristic branch during the AnalyticChain intermediates
@@ -548,7 +546,7 @@ fn handle_relu_node(
     if let Some(&relu_idx) = context.relu_name_to_idx.get(node_name) {
         if let Some(alpha) = context.alpha_state.alpha(node_name) {
             let alpha_upper = context.alpha_state.alpha_upper(node_name);
-            // #4404: expand channel-only alpha to full spatial before backward.
+            // Expand channel-only alpha to full spatial before backward.
             let alpha_expanded = context.alpha_state.expand_alpha(node_name, alpha);
             let alpha_upper_expanded =
                 alpha_upper.map(|au| context.alpha_state.expand_alpha(node_name, au));
@@ -594,7 +592,7 @@ fn handle_relu_node(
                     }
                 }
             }
-            // #3813: Catch ShapeMismatch from ReLU alpha propagation
+            // Catch ShapeMismatch from ReLU alpha propagation
             // (RSPLITTER models change intermediate dimensions). Fall back
             // to plain CROWN, which is always sound.
             let propagated = if !slot_alphas.is_empty() {
@@ -638,7 +636,7 @@ fn handle_relu_node(
             };
             match propagated {
                 Ok((new_lb, grads)) => {
-                    // #4404: reduce per-neuron gradient to per-channel if channel-only.
+                    // Reduce per-neuron gradient to per-channel if channel-only.
                     if let Some((grad, grad_upper)) = grads {
                         context.gradients[relu_idx] =
                             context.alpha_state.reduce_gradient(node_name, &grad);
@@ -660,7 +658,7 @@ fn handle_relu_node(
     }
 
     // Fallback: propagate without alpha
-    // #3813: Catch ShapeMismatch instead of wrapping in InvalidSpec.
+    // Catch ShapeMismatch instead of wrapping in InvalidSpec.
     match relu.propagate_linear_with_bounds(&node_lb, pre_activation) {
         Ok(new_lb) => accumulate_dense_result(network, first_input, new_lb, context),
         Err(NyError::ShapeMismatch { .. }) => {
@@ -712,7 +710,7 @@ where
     let node_lb =
         GraphNetwork::apply_invprop_constraints(node_name, node_lb, context.invprop_state);
 
-    // #4118: Catch ShapeMismatch/UnsupportedConfiguration from both
+    // Catch ShapeMismatch/UnsupportedConfiguration from both
     // alpha AND fixed-slope retry, falling back to plain CROWN instead
     // of propagating the error up to graph-wide IBP fallback.
     match retry_monotone_shape_mismatch_with_fixed_slope(
@@ -768,13 +766,11 @@ pub(super) fn record_patches_relu_intermediate(
     context: &mut DagAlphaNodeContext<'_>,
 ) -> Result<()> {
     // Store Dense intermediate for chain-rule gradient
-    // computation (#3293). The Patches alpha-ReLU path
+    // computation. The Patches alpha-ReLU path
     // bypasses Dense intermediate storage. Convert
     // Patches->Dense only for A-matrix storage so
     // compute_graph_chain_rule_gradients gets non-zero
     // gradients for Patches-mode ReLUs.
-    // Reference: design doc 2026-03-04-alpha-gradient-
-    // patches-alternative.md Approach B.
     let deadline = context.deadline;
     let Some(inter) = context.intermediate.as_deref_mut() else {
         return Ok(());

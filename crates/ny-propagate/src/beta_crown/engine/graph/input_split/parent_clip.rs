@@ -5,7 +5,6 @@
 //! Single-objective child clipping with precomputed parent linear bounds.
 //!
 //! Extracted from `shared.rs` to keep file sizes under 500 lines.
-//! Part of #3870 Gap B.
 
 use std::collections::HashMap;
 
@@ -18,7 +17,6 @@ use crate::bounds::LinearBounds;
 use crate::GraphNetwork;
 
 /// Result of single-objective clipping with parent linear bounds.
-/// Part of #3870 Gap B.
 pub(crate) struct ParentLinearClipResult {
     pub(crate) bounds: BoundedTensor,
     pub(crate) verified: bool,
@@ -38,7 +36,6 @@ pub(crate) struct ParentLinearClipResult {
 /// via `apply_relaxed_clipping_graph` / `apply_complete_clipping_graph`.
 ///
 /// Source: `batch_branch_and_bound.py:151-169`, `clip.py:174-232`.
-/// Part of #3870 Gap B.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn clip_child_with_parent_linear(
     verifier: &BetaCrownVerifier,
@@ -94,7 +91,7 @@ pub(crate) fn clip_child_with_parent_linear(
                 None
             };
 
-        // #3870: When the Lagrangian path has no active constraints (the spec
+        // When the Lagrangian path has no active constraints (the spec
         // constraint is fully covered at the input level), fall back to IBP
         // bounds for the clipped child. These are at least as tight as what the
         // deferred CROWN pass would recompute and match the alpha-beta-CROWN
@@ -135,7 +132,7 @@ pub(crate) fn clip_child_with_parent_linear(
         )?,
     };
 
-    // #3870: carry IBP bounds for the clipped child input. When parent linear
+    // Carry IBP bounds for the clipped child input. When parent linear
     // bounds are absent and the fallback clip path runs, there's no Lagrangian
     // hidden-layer tightening, but the deferred CROWN pass still benefits from
     // receiving IBP bounds for the clipped domain.

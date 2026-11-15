@@ -25,7 +25,7 @@ impl GraphNetwork {
     ///
     /// Averages over `config.spsa_samples` samples to reduce variance.
     /// The `engine` parameter threads GPU GEMM acceleration into the
-    /// ±ε batched CROWN evaluations (#3588).
+    /// ±ε batched CROWN evaluations.
     pub(super) fn spsa_bilinear_gradients(
         &self,
         input: &BoundedTensor,

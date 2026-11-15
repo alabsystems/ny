@@ -218,6 +218,70 @@ fn apply_preset_values(config: &mut BetaCrownConfig, preset: &PresetConfig) -> R
     Ok(())
 }
 
+/// #root-box-source (ENGINE_PROGRAM M5b): `margin_row.root_box_source:
+/// patch_backward` builds no `#clip-rows` rows, no Tier-0 retained rows and runs
+/// no tableau kernel, so a preset that ALSO asks for any of those would get
+/// them silently switched off. Refuse the combination here — a yaml can never
+/// ship it — with the same predicate the root build refuses on at runtime
+/// (`PatchBackwardConflicts`, printed as `[root-box] refused reason=`), so the
+/// two checks cannot drift. The retention rule is the lane's own
+/// (`epoch_retention_requested`). `tableau` and absence are never refused.
+fn validate_root_box_source_composition(mr: &super::MarginRowPreset) -> Result<()> {
+    use ny_propagate::margin_row::{
+        epoch_retention_requested, PatchBackwardConflicts, RootBoxSource,
+    };
+    if mr.root_box_source != Some(RootBoxSource::PatchBackward) {
+        return Ok(());
+    }
+    let conflicts = PatchBackwardConflicts {
+        clip_rows: mr.clip_rows == Some(true),
+        retain: epoch_retention_requested(
+            mr.epoch_tier0.unwrap_or(0),
+            mr.epoch_depth.unwrap_or(0),
+            mr.epoch_parent_topk.unwrap_or(0),
+        ),
+        root_f32: mr.root_f32 == Some(true),
+        tableau_f32: mr.tableau_f32 == Some(true),
+    };
+    if conflicts.any() {
+        bail!(
+            "margin_row.root_box_source: patch_backward cannot compose with {} (the \
+             patch-backward source builds no clip rows, no Tier-0 retained rows and runs no \
+             f32 tableau kernel, so each would be silently switched off). Remove the \
+             conflicting key(s) or keep root_box_source: tableau; the root build refuses the \
+             same combination at runtime with `[root-box] refused reason=`",
+            conflicts.reason()
+        );
+    }
+    Ok(())
+}
+
+/// RETIRED typed keys (ENGINE_PROGRAM R1 kill line + R2, 2026-09-29). Both
+/// stay in the deserializer — like `solver.const_matmul_interval` — so an old
+/// yaml fails with the reason instead of an opaque unknown-key error, and ANY
+/// value is refused (`false` would claim a governed treatment that no longer
+/// exists). Neither has a `Deliver::PresetKey` axis any more; the lanes refuse
+/// an environment request too (`[mr-gpu-conv] refused`, `[bi-gpu] refused`).
+fn validate_retired_margin_row_keys(mr: &super::MarginRowPreset) -> Result<()> {
+    if mr.gpu_conv.is_some() {
+        bail!(
+            "margin_row.gpu_conv is RETIRED and cannot be delivered by a preset: per-op conv \
+             offload of the certified pass lost cifar100 c2050 and c1590 on the yaml route \
+             (ENGINE_PROGRAM R1 kill line) and its device products entered certified values \
+             (R2: the device never certifies). Remove the key"
+        );
+    }
+    if mr.bi_gpu.is_some() {
+        bail!(
+            "margin_row.bi_gpu is RETIRED and cannot be delivered by a preset: its cuBLAS \
+             products entered CERTIFIED intermediate boxes (ENGINE_PROGRAM R2: the device \
+             never certifies until the M9 preconditions hold) and it is the per-op offload \
+             shape R1 retired. Remove the key"
+        );
+    }
+    Ok(())
+}
+
 /// Validate the typed layer for every compiled `Deliver::PresetKey` axis.
 ///
 /// This is driven by `ny_levers::space`, the same delivery map used by search
@@ -226,6 +290,22 @@ fn apply_preset_values(config: &mut BetaCrownConfig, preset: &PresetConfig) -> R
 /// NaN and infinities as numbers, so the declaration can reject them instead of
 /// collapsing `Some(NaN)` into the same `null` representation as `None`.
 fn validate_delivered_lever_values(preset: &PresetConfig) -> Result<()> {
+    if let Some(options) = preset.solver.paired_difference {
+        if !options.max_seconds.is_finite()
+            || options.max_seconds <= 0.0
+            || options.max_seconds > 90.0
+            || options.max_domains == 0
+            || options.max_domains > 2_000_000
+            || !options.max_lp_seconds.is_finite()
+            || options.max_lp_seconds < 0.0
+            || options.max_lp_seconds > options.max_seconds
+            || !(16..=2_048).contains(&options.lp_memory_mib)
+            || !(1..=100_000).contains(&options.lp_steps)
+            || !(1..=16).contains(&options.workers)
+        {
+            bail!("solver.paired_difference requires finite max_seconds in (0,90], max_domains in [1,2000000], finite max_lp_seconds in [0,max_seconds], lp_memory_mib in [16,2048], lp_steps in [1,100000], and workers in [1,16]");
+        }
+    }
     // #interval-carrier-preset-quarantine. This field predates the typed-route
     // quarantine and is deliberately left in the deserializer so an old research YAML fails
     // with an explicit safety explanation instead of an opaque unknown-key
@@ -242,6 +322,74 @@ fn validate_delivered_lever_values(preset: &PresetConfig) -> Result<()> {
              the explicit environment gate so it cannot enter a scored preset."
         );
     }
+
+    // #cz-hybrid-budget. `cz_hybrid.max_budget_fraction` has no environment
+    // twin and therefore no search-space axis, so the generic axis loop below
+    // cannot see it. Refuse an out-of-range or non-finite share here rather
+    // than clamping silently: a preset that asks for a share it does not get
+    // is a treatment label that disagrees with the run.
+    if let Some(frac) = preset.cz_hybrid.max_budget_fraction {
+        if !frac.is_finite() || frac <= 0.0 || frac > 1.0 {
+            bail!("cz_hybrid.max_budget_fraction must be a finite share in (0.0, 1.0]; got {frac}");
+        }
+    }
+
+    // #sbench-f64-attack. `attack.active_set_repair_secs` and
+    // `attack.f64_target_margin_ulps` are read by the VNN-COMP wrapper's
+    // post-BaB tail straight from the frozen snapshot; neither has an
+    // environment twin or a search-space axis, so the axis loop below cannot
+    // see them. Same rule as the share above: refuse, never clamp.
+    if let Some(secs) = preset.attack.active_set_repair_secs {
+        if !secs.is_finite()
+            || !(super::ACTIVE_SET_REPAIR_SECS_MIN..=super::ACTIVE_SET_REPAIR_SECS_MAX)
+                .contains(&secs)
+        {
+            bail!(
+                "attack.active_set_repair_secs must be finite seconds in [{}, {}]; got {secs}",
+                super::ACTIVE_SET_REPAIR_SECS_MIN,
+                super::ACTIVE_SET_REPAIR_SECS_MAX
+            );
+        }
+    }
+    if let Some(ulps) = preset.attack.f64_target_margin_ulps {
+        if !(1..=super::F64_TARGET_MARGIN_ULPS_MAX).contains(&ulps) {
+            bail!(
+                "attack.f64_target_margin_ulps must be in [1, {}]; got {ulps}",
+                super::F64_TARGET_MARGIN_ULPS_MAX
+            );
+        }
+    }
+    // #sbench-f64-maximin. `attack.f64_lift_step` and `attack.f64_basin_hops`
+    // shape the f64 stage `attack.f64_target_margin_ulps` arms and are read from
+    // the same frozen snapshot (no environment twin, no axis). Without that
+    // stage they would configure nothing, and hops only exist for the
+    // LP-maximin step: refuse both mismatches, never ignore them.
+    if let Some(step) = preset.attack.f64_lift_step {
+        if preset.attack.f64_target_margin_ulps.is_none() {
+            bail!(
+                "attack.f64_lift_step: {} requires attack.f64_target_margin_ulps (it selects \
+                 the step of the f64 stage that key arms)",
+                step.stable_token()
+            );
+        }
+    }
+    if let Some(hops) = preset.attack.f64_basin_hops {
+        if hops > super::F64_BASIN_HOPS_MAX {
+            bail!(
+                "attack.f64_basin_hops must be in [0, {}]; got {hops}",
+                super::F64_BASIN_HOPS_MAX
+            );
+        }
+        if hops > 0 && preset.attack.f64_lift_step != Some(super::F64LiftStep::LpMaximin) {
+            bail!(
+                "attack.f64_basin_hops: {hops} requires attack.f64_lift_step: lp_maximin \
+                 (basin hops restart the LP-maximin lift)"
+            );
+        }
+    }
+
+    validate_root_box_source_composition(&preset.margin_row)?;
+    validate_retired_margin_row_keys(&preset.margin_row)?;
 
     let serialized = serde_yaml::to_value(preset)
         .context("serialize frozen preset for governed-lever validation")?;
@@ -497,6 +645,18 @@ fn apply_solver_and_bab_settings(
     if let Some(max_depth) = bab.max_depth {
         config.max_depth = max_depth;
     }
+    if let Some(enabled) = bab.initial_bounds_warmup_fallback {
+        config.initial_bounds_warmup_fallback = enabled; // #budget-abandonment FIX A
+    }
+    if let Some(passes) = bab.disjunctive_clause_retry_passes {
+        config.disjunctive_clause_retry_passes = passes; // #budget-abandonment FIX B
+    }
+    if let Some(enabled) = bab.disjunctive_shared_bootstrap {
+        config.disjunctive_shared_bootstrap = enabled; // #disjunctive-shared-bootstrap
+    }
+    if let Some(enabled) = bab.genbab_on_precomputed_lane {
+        config.genbab_on_precomputed_lane = enabled; // #genbab-precomputed-lane
+    }
     if let Some(interm_transfer) = bab.interm_transfer {
         config.enable_interm_transfer = interm_transfer;
     }
@@ -508,6 +668,15 @@ fn apply_solver_and_bab_settings(
     }
     if let Some(enabled) = bab.mo_cuda_bounded_shared_executor {
         config.mo_cuda_bounded_shared_executor = enabled;
+    }
+    if let Some(enabled) = bab.mo_containment_fence {
+        config.mo_containment_fence = enabled; // #vit-bank-gate
+    }
+    if let Some(enabled) = bab.mo_root_ort_adjudication {
+        config.mo_root_ort_adjudication = enabled; // #vit-margin-alpha-complex (P8)
+    }
+    if let Some(mode) = bab.mo_cover_certify {
+        config.mo_cover_certify = mode; // #vit-v3-bankable
     }
     if let Some(enabled) = bab.root_crown_interm_dense_head {
         config.root_crown_interm_dense_head = enabled;
@@ -554,6 +723,9 @@ fn apply_solver_and_bab_settings(
     if let Some(beta_graft) = bab.beta_graft {
         config.mo_beta_graft = beta_graft; // #mo-beta-graft
     }
+    if let Some(chain_wide) = bab.chain_wide {
+        config.bab_chain_wide = chain_wide; // #chain-wide (graft-composed FC wide routing)
+    }
     if let Some(ratio) = solver.min_batch_size_ratio {
         config.min_batch_fill_ratio = ratio;
     }
@@ -563,7 +735,7 @@ fn apply_solver_and_bab_settings(
     if let Some(depth) = bab.max_split_depth {
         config.max_relu_split_depth = depth;
     }
-    // auto_enlarge_batch_size: solver takes precedence, bab overrides (#4303).
+    // auto_enlarge_batch_size: solver takes precedence, bab overrides.
     if let Some(auto_enlarge) = solver.auto_enlarge_batch_size {
         config.auto_enlarge_batch_size = auto_enlarge;
     }
@@ -573,11 +745,132 @@ fn apply_solver_and_bab_settings(
     if let Some(patience) = bab.early_stop_patience {
         config.early_stop_patience = patience;
     }
-    // Per-node CROWN-IBP time-budget overrides (#4413, #cgan-bn11-budget).
+    // Per-node CROWN-IBP time-budget overrides (#cgan-bn11-budget).
     // Only explicitly-set preset values override; unset keeps the 2.0 s floor
     // and adaptive remaining-budget cap.
     if let Some(floor_secs) = bab.crown_ibp_per_node_floor_secs {
         config.crown_ibp_per_node_floor_secs = Some(floor_secs);
+    }
+    // #per-node-floor-dim-scale: typed delivery of the dim-scaled floor; the
+    // refusal site prints its own `[per-node-floor]` line either way.
+    if let Some(enabled) = bab.crown_ibp_per_node_floor_dim_scaled {
+        config.crown_ibp_per_node_floor_dim_scaled = enabled;
+    }
+    // #pwl-lookup: typed delivery of the exact lookup-table range. The verifier
+    // stamps it onto the loaded graph; the census line proves arrival.
+    if let Some(enabled) = bab.pwl_lookup_exact_range {
+        config.pwl_lookup_exact_range = enabled;
+    }
+    // #fwd-root-screen: typed delivery of the certified forward root screen
+    // and its live-state ceiling. The disjunctive lane prints `[fwd-root] …`
+    // on every armed run, so a key that reached the config but not the lane
+    // reads as a missing line (VOID), not a null.
+    if let Some(enabled) = bab.forward_root_screen {
+        config.forward_root_screen = enabled;
+    }
+    if let Some(max_mb) = bab.forward_root_screen_max_mb {
+        if !BetaCrownConfig::forward_root_screen_max_mb_is_valid(max_mb) {
+            bail!(
+                "bab.forward_root_screen_max_mb must be in {}..={} (0 is never \"unlimited\"), \
+                 got {max_mb}",
+                BetaCrownConfig::FORWARD_ROOT_SCREEN_MIN_MAX_MB,
+                BetaCrownConfig::FORWARD_ROOT_SCREEN_MAX_MAX_MB
+            );
+        }
+        config.forward_root_screen_max_mb = max_mb;
+    }
+    // #vit-zono-root: typed delivery of the certified forward-zonotope root
+    // map and its two ceilings. The CLI stamps the resolved plan onto the
+    // loaded graph and prints `[vit-zono-root] armed=1 stage=stamp …`, so a key
+    // that reached the config but not the lane reads as a missing line (VOID).
+    if let Some(enabled) = bab.vit_zono_root {
+        config.vit_zono_root = enabled;
+    }
+    if let Some(max_mb) = bab.vit_zono_root_max_mb {
+        if !BetaCrownConfig::vit_zono_root_max_mb_is_valid(max_mb) {
+            bail!(
+                "bab.vit_zono_root_max_mb must be in {}..={} (0 is never \"unlimited\"), got \
+                 {max_mb}",
+                BetaCrownConfig::VIT_ZONO_ROOT_MIN_MAX_MB,
+                BetaCrownConfig::VIT_ZONO_ROOT_MAX_MAX_MB
+            );
+        }
+        config.vit_zono_root_max_mb = max_mb;
+    }
+    if let Some(max_secs) = bab.vit_zono_root_max_secs {
+        if !BetaCrownConfig::vit_zono_root_max_secs_is_valid(max_secs) {
+            bail!(
+                "bab.vit_zono_root_max_secs must be finite and in (0, {}], got {max_secs}",
+                BetaCrownConfig::VIT_ZONO_ROOT_MAX_MAX_SECS
+            );
+        }
+        config.vit_zono_root_max_secs = max_secs;
+    }
+    // #vit-collector-throughput: typed delivery of the three collector
+    // throughput kernels. Each is dark unless set; the kernels print their own
+    // `[collector-kernels] armed …` / census lines when armed.
+    if let Some(enabled) = bab.bilinear_rowpar_kernel {
+        config.bilinear_rowpar_kernel = enabled;
+    }
+    if let Some(enabled) = bab.linear_position_stack {
+        config.linear_position_stack = enabled;
+    }
+    if let Some(enabled) = bab.reciprocal_unbounded_upper {
+        config.reciprocal_unbounded_upper = enabled;
+    }
+    // #vit-batched-bilinear: typed delivery of the GEMM-shaped McCormick
+    // backward (bit-identical to the serial nest); dark unless set, prints its
+    // own `[bilinear-kernel] … form=gemm …` census when armed.
+    if let Some(enabled) = bab.bilinear_gemm_kernel {
+        config.bilinear_gemm_kernel = enabled;
+    }
+    // #hull-root / #hull-bab: typed delivery of the certified
+    // single-hidden-layer hull (root bound, or the split tree). The
+    // sequential lane prints its own `[hull-root] armed` / `[hull-bab] armed`
+    // line whenever this resolves to anything but `off`.
+    if let Some(mode) = bab.single_hidden_hull {
+        config.single_hidden_hull = mode;
+    }
+    // #graph-lane-search (M7): typed delivery of the graph lane's batched α/β
+    // search (the token is validated by serde). The lane prints
+    // `[bbe] phase=graph_bab stage=root …` on every armed root, so a key that
+    // reached the config but not the lane reads as a missing line (VOID).
+    if let Some(mode) = bab.graph_search {
+        config.graph_search = mode;
+    }
+    // #la-warm-frontier: typed delivery of the frontier-complete lA warm start.
+    // The graph lanes print `[la-warm-frontier] lane=… armed=1 …` on every
+    // armed run, so a key that reached the config but not the lane reads as a
+    // missing line (VOID).
+    if let Some(enabled) = bab.la_warm_frontier {
+        config.la_warm_frontier = enabled;
+    }
+    // #kfsb-single-shot: typed delivery of the αβ-CROWN-style kFSB scorer.
+    // The graph kFSB selector prints `[kfsb-single-shot] armed=1 …` on every
+    // armed decision, so a key that reached the config but not the selector
+    // reads as a missing line (VOID).
+    if let Some(enabled) = bab.kfsb_single_shot {
+        config.kfsb_single_shot = enabled;
+    }
+    // #relusplitter-lp-refine: typed delivery of the rigorous LP root
+    // intermediate refiner. An inadmissible value is refused at load, never
+    // clamped. `dispatch.rs` attaches the refiner and prints
+    // `[mip-refine] armed ...` whenever this resolves to `Some`.
+    if let Some(refine) = bab.mip_refine_intermediates {
+        if let Err(reason) = refine.validate() {
+            bail!("bab.{reason}");
+        }
+        config.mip_refine_intermediates = Some(refine);
+    }
+    // #vgg-gpu-crown: typed delivery of the certified GPU patches-CROWN root
+    // pass. An inadmissible value is refused at load, never clamped;
+    // `verify/graph.rs` runs the pass and prints `[gpu-patches-crown]
+    // armed=1 ...` whenever this resolves to `Some`.
+    if let Some(pass) = bab.gpu_patches_crown {
+        if let Err(reason) = pass.validate() {
+            bail!("bab.{reason}");
+        }
+        config.gpu_patches_crown = Some(pass);
     }
     if let Some(cap_secs) = bab.root_alpha_cap_secs {
         config.root_alpha_cap_secs = Some(cap_secs);
@@ -669,6 +962,18 @@ fn apply_branching_preset(config: &mut BetaCrownConfig, preset: &PresetConfig) -
     if let Some(independent_singletons) = branching.input_split.independent_singleton_disjunction {
         config.input_split_independent_singleton_disjunction = independent_singletons;
     }
+    if let Some(lowdim) = branching.input_split.lowdim_prover {
+        config.input_split_lowdim_prover = lowdim;
+    }
+    if let Some(share) = branching.input_split.lowdim_prover_share {
+        config.input_split_lowdim_prover_share = share;
+    }
+    if let Some(width) = branching.input_split.lowdim_prover_refine_width {
+        config.input_split_lowdim_prover_refine_width = width;
+    }
+    if let Some(fold) = branching.input_split.lowdim_fold {
+        config.input_split_lowdim_fold = fold;
+    }
     if let Some(stacked_rebound) = branching.input_split.stacked_rebound {
         config.input_split_stacked_rebound = stacked_rebound;
     }
@@ -699,6 +1004,12 @@ fn apply_branching_preset(config: &mut BetaCrownConfig, preset: &PresetConfig) -
                 growth: calibration.growth,
             });
     }
+    if let Some(edge_wave_cap) = &branching.input_split.edge_wave_cap {
+        // #iso-edge-cap: typed per-wave edge-work allowance. Config-only (no
+        // env override — a new raw env read would raise the ny-levers
+        // ratchet). Absent leaves `None`, i.e. the edge work ungoverned.
+        config.input_split_edge_wave_cap = Some(edge_wave_cap.to_config());
+    }
     if let Some(f64_tail) = &branching.input_split.f64_tail {
         // #cgan-f64-tail: typed f64-tail escalation authority; the env levers
         // NY_F64_TAIL / NY_F64_TAIL_BAND still override at the ny-propagate
@@ -728,6 +1039,14 @@ fn apply_branching_preset(config: &mut BetaCrownConfig, preset: &PresetConfig) -
     if let Some(reorder_bab) = branching.input_split.reorder_bab {
         config.reorder_bab = reorder_bab;
     }
+    if let Some(cap_extend) = branching.input_split.cap_extend_near_closure {
+        // #cap-extend: DEFER-dont-DROP at the disjunctive domain cap.
+        config.input_split_cap_extend_near_closure = cap_extend;
+    }
+    if let Some(keep_plane) = branching.input_split.sb_keep_plane_under_fresh_clip {
+        // #sb-plane: SB scores from the rebound plane under the fresh clip.
+        config.input_split_sb_keep_plane_under_fresh_clip = keep_plane;
+    }
     if let Some(adv_check) = branching.input_split.adv_check {
         config.adv_check = adv_check;
     }
@@ -743,11 +1062,20 @@ fn apply_branching_preset(config: &mut BetaCrownConfig, preset: &PresetConfig) -
     Ok(())
 }
 
+/// Apply only the relational attack policy. The early dual-network route must
+/// not import model/solver shape settings through a full ordinary preset apply.
+pub(crate) fn apply_relational_point_vjp_policy(enabled: &mut bool, preset: &PresetConfig) {
+    if let Some(value) = preset.attack.relational_point_vjp {
+        *enabled = value;
+    }
+}
+
 fn apply_attack_preset(
     config: &mut BetaCrownConfig,
     preset: &PresetConfig,
     initial_pgd_schedule: Option<ResolvedInitialPgdSchedule>,
 ) -> Result<()> {
+    apply_relational_point_vjp_policy(&mut config.relational_point_vjp, preset);
     if let Some(pgd_restarts) = preset.attack.pgd_restarts {
         config.pgd_restarts = pgd_restarts;
     }
@@ -787,6 +1115,12 @@ fn apply_attack_preset(
     if let Some(value) = preset.attack.pgd_hinge_tau {
         config.pgd_exact_vjp.hinge_tau = value;
     }
+    if let Some(value) = preset.attack.pgd_disj_odi {
+        config.pgd_exact_vjp.disj_odi = value;
+    }
+    if let Some(value) = preset.attack.pgd_disj_focus_lanes {
+        config.pgd_exact_vjp.disj_focus_lanes = value;
+    }
     if let Some(schedule) = initial_pgd_schedule {
         config.enable_pgd_attack = !matches!(schedule, ResolvedInitialPgdSchedule::Disabled);
     }
@@ -802,7 +1136,7 @@ fn apply_attack_preset(
                 config.pgd_initialization = PgdInitialization::Osi;
             }
             "diversed_gama_pgd" => {
-                // OSI initialization + the GAMA guidance loss (#1449).
+                // OSI initialization + the GAMA guidance loss.
                 // Reference: alpha-beta-CROWN `attack_mode: diversed_GAMA_PGD`
                 // → `initialization="osi", GAMA_loss=True`
                 // (`attack_interface.py:29-35`). Attack-only: candidates are
@@ -842,6 +1176,25 @@ fn apply_attack_preset(
     }
     if let Some(dense_sweep_points) = preset.attack.dense_sweep_points {
         config.pgd_dense_sweep_points = dense_sweep_points;
+    }
+    // #attack-vertex-geometry: box-corner seeds for the first N restarts of
+    // the engine's PGD restart schedules. Attack-only; absent keeps 0, which
+    // is byte-identical to the historical uniform/OSI seeding. The wrapper's
+    // upfront lane reads the same key from the preset snapshot.
+    if let Some(corner_seed_restarts) = preset.attack.corner_seed_restarts {
+        config.pgd_corner_seed_restarts = corner_seed_restarts;
+    }
+    // #attack-concurrent: race the upfront PGD against the proof. Scheduling
+    // only; absent keeps `false`, under which both race sites run today's
+    // serial code byte-for-byte.
+    if let Some(concurrent) = preset.attack.concurrent {
+        config.attack_concurrent = concurrent;
+    }
+    // #attack-open-disjuncts: the root-pruned per-disjunct attack stage.
+    // Attack-only; absent keys keep the engine default (`restrict: false`),
+    // under which the stage does not exist. Out-of-range values fail the load.
+    if let Some(open_disjunct) = super::open_disjunct_attack_from_preset(preset)? {
+        config.open_disjunct_attack = open_disjunct;
     }
     if preset.attack.pgd_alpha_scale.unwrap_or(false) {
         let alpha = preset
@@ -920,6 +1273,62 @@ fn apply_alpha_preset(config: &mut AlphaCrownConfig, preset: &AlphaCrownPreset) 
     if let Some(enabled) = preset.cgan_complete_crown_ibp_root {
         config.cgan_complete_crown_ibp_root = enabled;
     }
+    // #crown-root-map: the typed key is how the cascade map reaches the
+    // `crown` input-split arm on a scored run at all (run_instance.sh exports
+    // no NY_* variables); the arm re-checks its own guards at runtime.
+    if let Some(enabled) = preset.cgan_crown_root_map {
+        config.cgan_crown_root_map = enabled;
+    }
+    // #cgan-collector-dense (E5): typed delivery of the dense-mode collector
+    // switch; the collector prints its own `[collector-mode]` line either way.
+    if let Some(enabled) = preset.cgan_collector_dense {
+        config.cgan_collector_dense = enabled;
+    }
+    // #cgan-unstable-rows: typed delivery of the sparse ReLU-row collector
+    // gate. The collector prints its own `[unstable-rows] root armed=… source=…`
+    // line either way, so a dark key is observable as `source=none`.
+    if let Some(enabled) = preset.cgan_unstable_rows {
+        config.cgan_unstable_rows = enabled;
+    }
+    if let Some(max_frac) = preset.cgan_unstable_rows_max_frac {
+        config.cgan_unstable_rows_max_frac = max_frac;
+    }
+    if let Some(max_secs) = preset.cgan_child_interm_refine_max_secs {
+        config.cgan_child_interm_refine_max_secs = Some(max_secs);
+    }
+    // #cgan-child-seed: typed delivery of the three child-cascade keys. Each
+    // is inert unless the per-child budget above is also armed; the prepass
+    // prints `[cgan-child-seed] armed …` whenever any of them is set, so a
+    // key that reached the config but not the lane is visible as `prepass=inert`.
+    // `validate_alpha_preset` has already rejected an out-of-range width.
+    if let Some(enabled) = preset.cgan_child_interm_refine_seed_from_parent {
+        config.cgan_child_interm_refine_seed_from_parent = enabled;
+    }
+    if let Some(width) = preset.cgan_child_interm_refine_parallel {
+        config.cgan_child_interm_refine_parallel = width;
+    }
+    if let Some(enabled) = preset.cgan_child_interm_refine_fresh_clip_map {
+        config.cgan_child_interm_refine_fresh_clip_map = enabled;
+    }
+    // #cgan-child-zono: typed delivery of the per-child certified zonotope
+    // refresh. Each present sub-key overrides the engine default and the whole
+    // value is written back in one assignment; `validate_alpha_preset` has
+    // already refused an inadmissible budget. Armed, the prepass prints
+    // `[cgan-child-zono] armed=1 …` on its first batch, so a key that reached
+    // the config but not the lane reads as a missing line (VOID), not a null.
+    if let Some(zono) = preset.cgan_child_zono_refresh.as_ref() {
+        let mut refresh = config.cgan_child_zono_refresh;
+        if let Some(enabled) = zono.enabled {
+            refresh.enabled = enabled;
+        }
+        if let Some(max_generators) = zono.max_generators {
+            refresh.max_generators = max_generators;
+        }
+        if let Some(max_secs) = zono.max_secs {
+            refresh.max_secs = Some(max_secs);
+        }
+        config.cgan_child_zono_refresh = refresh;
+    }
     // α early-stop patience. UNSET keeps the built-in reference default (10),
     // so a preset that never names the key is byte-identical. NOTE this is the
     // ALPHA knob (`AlphaCrownConfig::early_stop_patience`), distinct from
@@ -938,6 +1347,37 @@ fn apply_alpha_preset(config: &mut AlphaCrownConfig, preset: &AlphaCrownPreset) 
     if let Some(frac) = preset.alpha_zero_yield_frac {
         config.alpha_zero_yield_frac = Some(frac);
     }
+    // #inert-ascent-exit delivery: `validate_alpha_preset` has already rejected
+    // `0`, so this is a plain move; the loop prints `[alpha-ascent]` either way.
+    if let Some(iters) = preset.inert_ascent_exit_iters {
+        config.inert_ascent_exit_iters = Some(iters);
+    }
+    // #vit-crown-interm delivery: `validate_alpha_preset` has already rejected
+    // values outside `1..=3600`, so this is a plain move. The route prints its
+    // own `[ref-map] … cap_secs=` line whether or not the key is set.
+    if let Some(secs) = preset.crown_ibp_reference_cap_secs {
+        config.crown_ibp_reference_cap_secs = Some(secs);
+    }
+    // #vit-margin-alpha delivery: the typed keys are the only route to a scored
+    // run (run_instance.sh exports no NY_*). The legacy env token still wins at
+    // read time; the lane prints `[alpha-margin] armed=<0|1>` either way.
+    if let Some(enabled) = preset.root_alpha_margin_gradient {
+        config.root_alpha_margin_gradient = enabled;
+    }
+    if let Some(enabled) = preset.matmul_alpha {
+        config.matmul_alpha = enabled;
+    }
+    // #vit-margin-alpha-complex delivery: a plain typed move, like its two
+    // siblings above; the DAG loop prints `[alpha-margin-frozen] armed=1 …`
+    // whenever the resolved key reaches the lane's admission.
+    if let Some(enabled) = preset.margin_alpha_freeze_mul_reciprocal {
+        config.margin_alpha_freeze_mul_reciprocal = enabled;
+    }
+    // #vit-root-alpha delivery: a plain typed move (the token is validated by
+    // serde); the lane prints `[bbe] phase=vit_root …` on every armed root.
+    if let Some(search) = preset.margin_alpha_search {
+        config.margin_alpha_search = search;
+    }
 }
 
 fn validate_alpha_preset(preset: &AlphaCrownPreset, location: &str) -> Result<()> {
@@ -952,6 +1392,63 @@ fn validate_alpha_preset(preset: &AlphaCrownPreset, location: &str) -> Result<()
         if !AlphaCrownConfig::alpha_zero_yield_frac_is_valid(fraction) {
             bail!(
                 "{location}.alpha_zero_yield_frac must be finite and in (0.0, 0.9), got {fraction}"
+            );
+        }
+    }
+    if let Some(iters) = preset.inert_ascent_exit_iters {
+        if !AlphaCrownConfig::inert_ascent_exit_iters_is_valid(iters) {
+            bail!("{location}.inert_ascent_exit_iters must be >= 1, got {iters}");
+        }
+    }
+    if let Some(width) = preset.cgan_child_interm_refine_parallel {
+        if !AlphaCrownConfig::cgan_child_interm_refine_parallel_is_valid(width) {
+            bail!(
+                "{location}.cgan_child_interm_refine_parallel must be in 0..={}, got {width}",
+                AlphaCrownConfig::MAX_CGAN_CHILD_INTERM_REFINE_PARALLEL
+            );
+        }
+    }
+    if let Some(zono) = preset.cgan_child_zono_refresh.as_ref() {
+        use ny_propagate::bounds::CganChildZonoRefreshConfig as ZonoRefresh;
+        if let Some(max_generators) = zono.max_generators {
+            if !ZonoRefresh::max_generators_is_valid(max_generators) {
+                bail!(
+                    "{location}.cgan_child_zono_refresh.max_generators must be in {}..={} \
+                     (0 is never \"unlimited\"), got {max_generators}",
+                    ZonoRefresh::MIN_MAX_GENERATORS,
+                    ZonoRefresh::MAX_MAX_GENERATORS
+                );
+            }
+        }
+        if let Some(max_secs) = zono.max_secs {
+            if !ZonoRefresh::max_secs_is_valid(max_secs) {
+                bail!(
+                    "{location}.cgan_child_zono_refresh.max_secs must be finite and positive, \
+                     got {max_secs}"
+                );
+            }
+        }
+    }
+    if let Some(secs) = preset.crown_ibp_reference_cap_secs {
+        if !AlphaCrownConfig::crown_ibp_reference_cap_secs_is_valid(secs) {
+            bail!(
+                "{location}.crown_ibp_reference_cap_secs must be in 1..={} seconds, got {secs}",
+                AlphaCrownConfig::MAX_CROWN_IBP_REFERENCE_CAP_SECS
+            );
+        }
+    }
+    // #softmax-fixed-index: the mode is consumed at model load, where an
+    // unknown value only warns and keeps the direct-LSE relaxation. Refuse it
+    // here instead: a misspelled `complex_fixed_index` would otherwise measure
+    // the default relaxation and read as a null for the rewrite.
+    if let Some(mode) = preset.softmax.as_deref() {
+        if !super::SOFTMAX_PRESET_MODES
+            .iter()
+            .any(|known| mode.eq_ignore_ascii_case(known))
+        {
+            bail!(
+                "{location}.softmax must be one of {:?}, got '{mode}'",
+                super::SOFTMAX_PRESET_MODES
             );
         }
     }
@@ -1099,12 +1596,29 @@ fn apply_phase_budget_preset(pb: &mut PhaseBudgetConfig, preset: &PhaseBudgetPre
     if let Some(v) = preset.demand_sized_post_bab_reserve {
         pb.demand_sized_post_bab_reserve = v;
     }
+    // #seq-single-reserve / #seq-early-attack: the typed kill switches for
+    // the sequential initial-phase schedule fixes.
+    if let Some(v) = preset.sequential_warmup_single_reserve {
+        pb.sequential_warmup_single_reserve = v;
+    }
+    if let Some(v) = preset.sequential_early_quit_attack {
+        pb.sequential_early_quit_attack = v;
+    }
+    // #mip-demand: the typed kill switch for the Graph-MIP reserve sizing.
+    if let Some(v) = preset.demand_sized_mip_reserve {
+        pb.demand_sized_mip_reserve = v;
+    }
     if let Some(v) = preset.demand_sized_disjunctive_pgd {
         pb.demand_sized_disjunctive_pgd = v;
     }
-    // `vnncomp_post_bab_attack` and `post_bab_reserve_secs` belong to the outer
-    // competition wrapper, not the reusable engine schedule. The VNN-COMP
-    // router consumes them directly from its immutable PresetConfig snapshot.
+    // `vnncomp_post_bab_attack`, `post_bab_reserve_secs` and
+    // `results_flush_grace_secs` belong to the outer competition wrapper, not
+    // the reusable engine schedule. The VNN-COMP router consumes them directly
+    // from its immutable PresetConfig snapshot: the first two size the wrapper
+    // falsifier, and the third (#flush-grace) sizes the RESULTS_FILE
+    // publication reserve subtracted from the scored budget to form the
+    // internal `ny --timeout`. None of them names a `PhaseBudgetConfig` field,
+    // so writing one here would invent an engine knob that nothing reads.
     if let Some(v) = preset.attack_extension_fraction {
         pb.attack_extension_fraction = v;
     }
@@ -1134,5 +1648,81 @@ pub(crate) fn parse_reduce_op(op: &str) -> Result<KfsbReduceOp> {
         "max" => Ok(KfsbReduceOp::Max),
         "mean" => Ok(KfsbReduceOp::Mean),
         _ => anyhow::bail!("Unknown kFSB reduce operation: '{op}'. Use: min, max, or mean"),
+    }
+}
+
+#[cfg(test)]
+mod paired_difference_validation_tests {
+    use super::{validate_delivered_lever_values, PresetConfig};
+
+    fn parsed(backend: &str, memory_mib: &str, steps: usize) -> PresetConfig {
+        serde_yaml::from_str(&format!(
+            "solver:\n  paired_difference:\n    max_seconds: 10.0\n    max_domains: 20000\n    max_lp_seconds: 5.0\n    lp_backend: {backend}\n    lp_memory_mib: {memory_mib}\n    lp_steps: {steps}\n"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn missing_lp_provider_uses_valid_ay_defaults() {
+        // AY denotes the reduced numeric proposal path. Its typed choice and
+        // memory budget do not bypass the full-source checker in the router.
+        let preset: PresetConfig = serde_yaml::from_str(
+            "solver:\n  paired_difference:\n    max_seconds: 10.0\n    max_domains: 20000\n",
+        )
+        .unwrap();
+        let options = preset.solver.paired_difference.unwrap();
+        assert_eq!(options.lp_backend, crate::preset::PairedLpBackend::Ay);
+        assert_eq!(options.lp_memory_mib, 2_048);
+        assert_eq!(options.max_lp_seconds, 0.0);
+        validate_delivered_lever_values(&preset).unwrap();
+    }
+
+    #[test]
+    fn bounded_memory_is_accepted_for_both_providers() {
+        for backend in ["ay", "native"] {
+            for memory in ["16", "2048"] {
+                validate_delivered_lever_values(&parsed(backend, memory, 2_000)).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn out_of_range_memory_is_rejected_before_delivery() {
+        for backend in ["ay", "native"] {
+            for memory in ["0", "15", "2049"] {
+                let error = validate_delivered_lever_values(&parsed(backend, memory, 2_000))
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("lp_memory_mib"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_step_limits_remain_validated_for_both_providers() {
+        for backend in ["ay", "native"] {
+            for steps in [1, 100_000] {
+                validate_delivered_lever_values(&parsed(backend, "2048", steps)).unwrap();
+            }
+            for steps in [0, 100_001] {
+                assert!(validate_delivered_lever_values(&parsed(backend, "2048", steps)).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_lp_provider_is_a_preset_parse_error() {
+        for backend in [
+            "AY",
+            "highs",
+            "floating",
+            "reduced_float",
+            "ay_reduced_float",
+        ] {
+            let text = format!(
+                "solver:\n  paired_difference:\n    max_seconds: 10.0\n    max_domains: 20000\n    lp_backend: {backend}\n"
+            );
+            assert!(serde_yaml::from_str::<PresetConfig>(&text).is_err());
+        }
     }
 }

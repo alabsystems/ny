@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! GemmEngine-aware backward dispatch tests (#3959).
+//! GemmEngine-aware backward dispatch tests.
 
 use std::collections::HashMap;
 
@@ -159,8 +159,8 @@ fn dispatch_linear_with_engine_matches_none_baseline_3959() {
 #[test]
 fn dispatch_conv2d_with_engine_matches_none_baseline_3959() {
     // Serialized on the shared env lock: the dead-work skip bypasses the
-    // GemmEngine entirely, and since the 2026-07-20 default flip the skip is
-    // ON when `NY_CONV_SKIP_DEAD_F32` is unset — so this engine-vs-none
+    // GemmEngine entirely, and the skip is ON when `NY_CONV_SKIP_DEAD_F32`
+    // is unset — so this engine-vs-none
     // baseline test must PIN THE KILL-SWITCH ("0") to exercise the pair path
     // its `gemm_calls() > 0` assertion requires (#wall-deadwork).
     crate::tests::with_serialized_env_vars(&[("NY_CONV_SKIP_DEAD_F32", "0")], || {

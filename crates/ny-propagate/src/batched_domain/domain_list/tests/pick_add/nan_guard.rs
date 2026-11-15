@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Regression tests for NaN propagation through the batched domain pipeline (#2246).
+//! Regression tests for NaN propagation through the batched domain pipeline.
 //!
 //! Verifies that NaN values in global bounds, layer bounds, and sort ordering
 //! are handled safely rather than corrupting branch selection, sort transitivity,
@@ -122,7 +122,7 @@ fn test_add_rejects_inf_global_upper_bound_2246() {
     );
 }
 
-// --- DomainList::add rejects NaN/Inf in layer/input tensors (#3115) ---
+// --- DomainList::add rejects NaN/Inf in layer/input tensors ---
 
 #[ntest::timeout(10000)]
 #[test]
@@ -288,7 +288,7 @@ fn test_add_rejects_nan_input_lower_bound_3115() {
 }
 
 /// Non-finite values in dropped rows (keep_mask=false) must NOT trigger rejection.
-/// This locks the keep_mask semantics: only kept rows are validated (#3115).
+/// This locks the keep_mask semantics: only kept rows are validated.
 #[ntest::timeout(10000)]
 #[test]
 fn test_add_ignores_nonfinite_dropped_rows_3115() {
@@ -356,7 +356,7 @@ fn test_add_ignores_nonfinite_dropped_rows_3115() {
     assert_eq!(list.len(), 1, "only the kept domain should be stored");
 }
 
-// --- DomainList::pick_out rejects stored non-finite data (#3115) ---
+// --- DomainList::pick_out rejects stored non-finite data ---
 
 /// Append a raw domain row to all DomainList storages, bypassing `add()`.
 /// Used to simulate storage corruption for defense-in-depth testing.
@@ -604,9 +604,9 @@ fn test_unstable_mask_nan_bounds_classified_unstable_2246() {
     assert!(mask[[0]], "neuron 0 should be unstable");
     // neuron 1: l=0.5, not < 0 → stable
     assert!(!mask[[1]], "neuron 1 should be stable");
-    // neuron 2: l=NaN → conservatively unstable (#2246)
+    // neuron 2: l=NaN → conservatively unstable
     assert!(mask[[2]], "neuron 2 with NaN lower should be unstable");
-    // neuron 3: u=NaN → conservatively unstable (#2246)
+    // neuron 3: u=NaN → conservatively unstable
     assert!(mask[[3]], "neuron 3 with NaN upper should be unstable");
 }
 
@@ -657,7 +657,7 @@ fn test_find_unstable_nan_bounds_treated_unstable_2246() {
     let neuron_indices: Vec<usize> = unstable[0].iter().map(|(_, idx)| *idx).collect();
     // Neuron 0 (l=0.5, u=1.0): stable
     assert!(!neuron_indices.contains(&0), "neuron 0 should be stable");
-    // Neuron 1 (l=NaN, u=1.0): conservatively unstable (#2246)
+    // Neuron 1 (l=NaN, u=1.0): conservatively unstable
     assert!(
         neuron_indices.contains(&1),
         "neuron 1 with NaN lower should be unstable"

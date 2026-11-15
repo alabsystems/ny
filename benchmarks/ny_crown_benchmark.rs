@@ -1,7 +1,7 @@
 //! Benchmark comparing ny bounds against Auto-LiRPA reference.
 //!
 //! This is meant to be run as a standalone Rust file to compare bounds.
-//! Run with: cargo test --package ny-propagate -- benchmark --nocapture
+//! Run with: targo --unverified test --package ny-propagate -- benchmark --nocapture
 
 use ndarray::{arr1, arr2, Array1, Array2};
 use ny_propagate::{AlphaCrownConfig, Layer, LinearLayer, Network, ReLULayer};

@@ -19,7 +19,7 @@ use ny_propagate::GraphNetwork;
 /// input/output contract as the real Kokoro duration predictor:
 ///   `encoded_features [1, T, D]` → `duration_logits [1, T, 50]`
 ///
-/// The real model uses BiLSTM (supported after #3497 LSTM unrolling work).
+/// The real model uses BiLSTM (supported after the LSTM unrolling work).
 /// The feed-forward surrogate is retained for fast regression.
 pub(super) fn load_surrogate_graph() -> (OnnxModel, GraphNetwork) {
     let path = require_test_model("kokoro_duration_predictor_surrogate.onnx");
@@ -130,7 +130,7 @@ fn test_duration_predictor_surrogate_tighter_bounds_at_smaller_epsilon_3497() {
 // predictor graph and the external Bernoulli-sum proof head.
 //
 // Sources:
-// - crates/ny-onnx/src/tests/core/avoice/talker/crown_boundary.rs (pattern)
+// - crates/ny-onnx/src/tests/core/avoice/talker_attention/crown_boundary.rs (pattern)
 // - alpha-beta-CROWN (github.com/Verified-Intelligence/alpha-beta-CROWN) complete_verifier/abcrown.py (CROWN backward reference)
 // ---------------------------------------------------------------------------
 

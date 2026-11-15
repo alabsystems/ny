@@ -359,7 +359,7 @@ fn test_crown_crosses_upper_boundary_adaptive_flat() {
     );
 }
 
-/// Post-#2977: domain_guard rejects NaN pre-activation bounds with
+/// The domain_guard rejects NaN pre-activation bounds with
 /// NumericalInstability error. The old behavior (conservative [min,max]
 /// fallback) is now unreachable because the guard fires first.
 #[test]
@@ -515,7 +515,7 @@ fn test_batched_crown_clamped_region() {
     }
 }
 
-// ── IBP guard regression tests (#3278) ────────────────────────────
+// ── IBP guard regression tests ────────────────────────────
 
 #[test]
 fn test_ibp_nan_input_lower_rejected_3278() {
@@ -541,7 +541,7 @@ fn test_ibp_nan_input_upper_rejected_3278() {
     assert!(matches!(err, NyError::NumericalInstability(_)));
 }
 
-/// #3278 originally rejected ±Inf here too. That was wrong: ±Inf is what an
+/// The NaN guard originally rejected ±Inf here too. That was wrong: ±Inf is what an
 /// upstream OpaqueSkip legitimately emits, and `NumericalInstability` is not
 /// degradable, so one tainted element aborted the whole graph-IBP pass. Clip
 /// must now widen instead — and because it saturates, `[-inf, +inf]` in yields
@@ -561,7 +561,7 @@ fn test_ibp_inf_input_propagates_widened_3278() {
     assert_eq!(out.upper()[[0]], 6.0);
 }
 
-// ── OpaqueSkip taint propagation (#3278 follow-up) ─────────────────────
+// ── OpaqueSkip taint propagation ───────────────────────────────────────
 
 /// Probe: a mixed tensor where one element carries an upstream OpaqueSkip's
 /// `[-inf, +inf]` and the other is a normal finite interval. The tainted

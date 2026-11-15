@@ -57,11 +57,12 @@ use rayon::prelude::*;
 
 use crate::bounds::{safe_mul_for_bounds_f64, LinearBounds};
 use crate::layers::activations::relu::relu_linear_relaxation;
+use crate::layers::activations::LinearRelaxation;
 use crate::layers::convolution::crown_helpers::detect_and_fix_nonfinite_rows;
 use crate::layers::convolution::{Conv2dLayer, ConvTranspose2dLayer};
 use crate::layers::linear::crown_single_gamma_n_f32 as gamma_n_f32;
 use crate::layers::linear::crown_single_gamma_n_f64 as gamma_n_f64;
-use crate::layers::trigonometric::tanh_linear_relaxation;
+use crate::layers::trigonometric::{sigmoid_linear_relaxation, tanh_linear_relaxation};
 use crate::layers::BatchNormLayer;
 
 /// Blanket multiplicative inflation applied to every accumulated f64 penalty
@@ -220,10 +221,19 @@ fn forward_linear_f32_gemm_enabled() -> bool {
     // Uncached env read (matches `forward_linear_reference_enabled`); the
     // forward composition runs O(alpha-iters·layers) times per instance with
     // huge GEMMs, so a per-call env probe is negligible.
-    matches!(
-        std::env::var("NY_FORWARD_LINEAR_F32").ok().as_deref(),
-        Some("1")
-    )
+    // #fl-f32-seam-key: defer to the parent module's single source of truth so
+    // the preset override and the legacy env read can never disagree between
+    // the two historical read sites (they keyed the cache fingerprint AND the
+    // rate calibration, so a split view would have been a correctness hazard,
+    // not just a tidiness one).
+    super::forward_linear_f32_seam_armed()
+}
+
+/// Test-only view of the image module's seam gate, so the parent's tests can
+/// assert the two read sites never disagree (#fl-f32-seam-key).
+#[cfg(test)]
+pub(crate) fn forward_linear_f32_gemm_enabled_for_tests() -> bool {
+    forward_linear_f32_gemm_enabled()
 }
 
 /// FTZ-safe underflow addend for the f32 value GEMMs, discharged into the bias.
@@ -2206,16 +2216,106 @@ pub(super) fn compose_relu_diag_forward(
     LinearBounds::new_or_conservative(new_lower_a, new_lower_b, new_upper_a, new_upper_b)
 }
 
-/// Compose the upstream forward-linear bounds through a Tanh node using its
-/// certified per-neuron diagonal relaxation. This is the image-scale analogue
-/// of the generic forward-linear identity composition, without its O(N^2)
-/// identity materialization. Coefficient products are formed in f64 and every
-/// f32 cast gap is discharged into the outward-rounded bias.
-pub(super) fn compose_tanh_diag_forward(
+/// Compose upstream forward-linear bounds through a NEAREST-NEIGHBOUR Resize
+/// (ONNX `Resize` / the deprecated `Upsample`, integer scale, last two axes).
+///
+/// Nearest-neighbour upsampling is pure REPLICATION: output coordinate `j`
+/// reads input coordinate `out_to_in[j]` and nothing else. So the composed
+/// linear map is a ROW GATHER of the upstream one — each output row is a
+/// bit-identical copy of an upstream row.
+///
+/// **This is the only composer in this module that performs no arithmetic.**
+/// No products, no f32 casts, no outward rounding — and therefore no new
+/// coefficient-error term to discharge into the bias, which is what every
+/// other arm here spends most of its body doing. If upstream row
+/// `out_to_in[j]` certifiedly encloses its coordinate, then the copy encloses
+/// output coordinate `j` by the definition of the operator; there is no
+/// inequality to prove because nothing is recomputed.
+///
+/// It is the duplicate-fan-in twin of the exact
+/// `Flatten | Reshape | Squeeze | Unsqueeze` passthrough, which is the
+/// identity case of this same argument. The map itself is
+/// `ResizeLayer::build_output_to_input_map` — shared verbatim with the
+/// certified BACKWARD path (`resize.rs`, whose own scatter-add carries the
+/// `#vnncomp-aw-soundness` duplicate-fan-in contract) rather than re-derived,
+/// so the two directions cannot drift apart.
+pub(super) fn compose_resize_nearest_forward(
+    node_name: &str,
+    upstream: &LinearBounds,
+    out_to_in: &[usize],
+) -> Result<LinearBounds> {
+    let m = upstream.num_outputs();
+    let n = upstream.num_inputs();
+    let out = out_to_in.len();
+    if let Some(&bad) = out_to_in.iter().find(|&&src| src >= m) {
+        return Err(NyError::ShapeMismatch {
+            expected: vec![m],
+            got: vec![bad + 1],
+        });
+    }
+    let (uls, uus) = upstream_slices(upstream, node_name)?;
+    let (ulb, uub) = (upstream.lower_b(), upstream.upper_b());
+
+    let mut new_lower_a = Array2::<f32>::zeros((out, n));
+    let mut new_upper_a = Array2::<f32>::zeros((out, n));
+    let mut new_lower_b = Array1::<f32>::zeros(out);
+    let mut new_upper_b = Array1::<f32>::zeros(out);
+    {
+        let la = new_lower_a.as_slice_mut().expect("row-major lower_a");
+        let ua = new_upper_a.as_slice_mut().expect("row-major upper_a");
+        let lb = new_lower_b.as_slice_mut().expect("contiguous lower_b");
+        let ub = new_upper_b.as_slice_mut().expect("contiguous upper_b");
+        for (j, &src) in out_to_in.iter().enumerate() {
+            la[j * n..j * n + n].copy_from_slice(&uls[src * n..src * n + n]);
+            ua[j * n..j * n + n].copy_from_slice(&uus[src * n..src * n + n]);
+            lb[j] = ulb[src];
+            ub[j] = uub[src];
+        }
+    }
+
+    // Deliberately no `detect_and_fix_nonfinite_rows`: this arm introduces no
+    // value that was not already published by the upstream node, exactly as the
+    // shape-op passthrough introduces none. Running the repair here would be
+    // dead work and would blur which arm is responsible for a finite row.
+    LinearBounds::new_or_conservative(new_lower_a, new_lower_b, new_upper_a, new_upper_b)
+}
+
+/// Compose upstream forward-linear bounds through a MONOTONE S-SHAPED node
+/// (Tanh, Sigmoid) using that node's certified per-neuron diagonal relaxation.
+///
+/// This is the former `compose_tanh_diag_forward` body, made generic over the
+/// relaxation function and nothing else. Keeping ONE implementation is the
+/// point: the soundness argument for Sigmoid is then identical BY
+/// CONSTRUCTION to Tanh's rather than by inspection of a copy. The composition
+/// never assumes which S-shaped function it is — it consumes only
+/// `LinearRelaxation`'s four fields and is sign-general in both slopes.
+///
+/// The substitution is not novel here — it is the one the CROWN BACKWARD lane
+/// already ships. `tanh_linear_relaxation` and `sigmoid_linear_relaxation`
+/// (`layers/trigonometric/s_shaped/{tanh,sigmoid}.rs`) are both thin
+/// instantiations of ONE generic, `s_shaped_linear_relaxation`
+/// (`s_shaped/shared.rs:206`), differing only in the
+/// `(f, f', tangent tables, constant fallback)` tuple; `trigonometric/mod.rs`
+/// re-exports them as a `pub(crate)` PAIR; and `SigmoidLayer`/`TanhLayer`'s
+/// `propagate_linear_with_bounds` pass them as interchangeable `fn` pointers
+/// into the SAME `crown_elementwise_backward`. So this composer performs, on
+/// the forward-linear side, exactly the interchange the backward side has been
+/// performing in production.
+///
+/// Note what the generic does NOT have to know: the two functions have
+/// different RANGES (sigmoid `(0, 1)`, tanh `(-1, 1)`), and that difference is
+/// discharged inside each `constant_relaxation` fallback, never by the caller.
+/// A composer that consumes only the four returned fields is therefore
+/// range-agnostic by construction.
+///
+/// Coefficient products are formed in f64 and every f32 cast gap is discharged
+/// into the outward-rounded bias, exactly as before.
+fn compose_s_shaped_diag_forward(
     node_name: &str,
     upstream: &LinearBounds,
     pre_activation: &BoundedTensor,
     input_mag: &[f64],
+    relax_fn: fn(f32, f32) -> LinearRelaxation,
 ) -> Result<LinearBounds> {
     let m = upstream.num_outputs();
     let n = upstream.num_inputs();
@@ -2255,11 +2355,11 @@ pub(super) fn compose_tanh_diag_forward(
             .zip(lb_flat.par_iter_mut().zip(ub_flat.par_iter_mut()))
             .enumerate()
             .for_each(|(i, ((lrow, urow), (lb, ub)))| {
-                let relax = tanh_linear_relaxation(pre_l[i], pre_u[i]);
+                let relax = relax_fn(pre_l[i], pre_u[i]);
 
-                // Lower side: y_i >= d*h_i+c. Tanh's finite relaxation slopes
-                // are nonnegative, but retain sign-general substitution for
-                // conservative non-finite/future relaxation fallbacks.
+                // Lower side: y_i >= d*h_i+c. Both S-shaped relaxations have
+                // nonnegative finite slopes, but the substitution below stays
+                // SIGN-GENERAL for non-finite/future relaxation fallbacks.
                 let d = relax.lower_slope as f64;
                 let c = relax.lower_intercept as f64;
                 if !d.is_finite() || !c.is_finite() {
@@ -2315,6 +2415,52 @@ pub(super) fn compose_tanh_diag_forward(
         &format!("forward-linear Tanh '{node_name}'"),
     );
     LinearBounds::new_or_conservative(new_lower_a, new_lower_b, new_upper_a, new_upper_b)
+}
+
+/// Compose through a Tanh node. Thin wrapper: behaviour is bit-identical to the
+/// pre-refactor `compose_tanh_diag_forward` (same body, same relaxation fn).
+pub(super) fn compose_tanh_diag_forward(
+    node_name: &str,
+    upstream: &LinearBounds,
+    pre_activation: &BoundedTensor,
+    input_mag: &[f64],
+) -> Result<LinearBounds> {
+    compose_s_shaped_diag_forward(
+        node_name,
+        upstream,
+        pre_activation,
+        input_mag,
+        tanh_linear_relaxation,
+    )
+}
+
+/// #fl-sigmoid: compose through a Sigmoid node.
+///
+/// MEASURED 2026-09-14: `cGAN_imgSz32_nCh_3_nonlinear_activations` passes all
+/// five conjuncts of the typed cGAN root cascade's eligibility check and then
+/// dies at Step 1 with `forward-linear bounds do not support node 'Sigmoid_27'
+/// (Sigmoid): operator is outside the certified image forward-linear surface`
+/// (`alpha.rs:302`). Sigmoid is the ONLY op in that graph outside the image
+/// allowlist — a node census gives Conv/ConvTranspose/BatchNorm/Reshape/Relu/
+/// Gemm/Tanh/Sigmoid, and every one but Sigmoid is already admitted. With the
+/// cascade refused the dense collector, unstable rows and crown root map are
+/// all inert, so that row's 1196 s timeout is VOID, not a capability result.
+///
+/// `sigmoid_linear_relaxation` is the same certified per-neuron relaxation the
+/// CROWN path already uses, with a signature identical to Tanh's.
+pub(super) fn compose_sigmoid_diag_forward(
+    node_name: &str,
+    upstream: &LinearBounds,
+    pre_activation: &BoundedTensor,
+    input_mag: &[f64],
+) -> Result<LinearBounds> {
+    compose_s_shaped_diag_forward(
+        node_name,
+        upstream,
+        pre_activation,
+        input_mag,
+        sigmoid_linear_relaxation,
+    )
 }
 
 /// Compose a binary residual Add: `y = h_a + h_b`. The Jacobian is the
@@ -2878,5 +3024,91 @@ mod deadline_tests {
         let (rows, cols) = certified_f64_gemm_deadline_tile_shape(1_000, 1_024, 1_000, CAP);
         assert!(rows <= 64);
         assert!(rows * 1_024 * cols <= CAP);
+    }
+}
+
+#[cfg(test)]
+mod resize_forward_tests {
+    use super::*;
+
+    /// Every row distinguishable, so a gather that reads the WRONG row cannot
+    /// pass by coincidence.
+    fn upstream_with_distinct_rows(m: usize, n: usize) -> LinearBounds {
+        let la = Array2::from_shape_fn((m, n), |(i, j)| (i * 10 + j) as f32);
+        let ua = Array2::from_shape_fn((m, n), |(i, j)| (i * 10 + j) as f32 + 0.5);
+        let lb = Array1::from_shape_fn(m, |i| -(i as f32));
+        let ub = Array1::from_shape_fn(m, |i| i as f32);
+        LinearBounds::new_or_conservative(la, lb, ua, ub).expect("finite upstream")
+    }
+
+    /// #fl-resize: the arm's whole soundness claim is that it COPIES certified
+    /// rows rather than recomputing them. Assert that literally — bit-identical
+    /// f32, not approximate — because an arm that merely produced a *close* row
+    /// would have a rounding story to tell, and this one deliberately has none.
+    #[test]
+    fn compose_resize_nearest_forward_is_an_exact_row_gather() {
+        let (m, n) = (4usize, 3usize);
+        let up = upstream_with_distinct_rows(m, n);
+        // 2x nearest upsample of a 2x2 map: each input pixel feeds four outputs.
+        let map = vec![0, 0, 1, 1, 0, 0, 1, 1, 2, 2, 3, 3, 2, 2, 3, 3];
+        let out = compose_resize_nearest_forward("resize_test", &up, &map).expect("compose");
+
+        assert_eq!(
+            out.num_outputs(),
+            map.len(),
+            "one output row per output pixel"
+        );
+        assert_eq!(out.num_inputs(), n, "the graph-input axis is untouched");
+
+        let (ul, uu) = upstream_slices(&up, "up").expect("upstream slices");
+        let (ol, ou) = upstream_slices(&out, "out").expect("composed slices");
+        for (j, &src) in map.iter().enumerate() {
+            assert_eq!(
+                &ol[j * n..j * n + n],
+                &ul[src * n..src * n + n],
+                "lower row {j} must be a bit-identical copy of upstream row {src}"
+            );
+            assert_eq!(
+                &ou[j * n..j * n + n],
+                &uu[src * n..src * n + n],
+                "upper row {j} must be a bit-identical copy of upstream row {src}"
+            );
+            assert_eq!(out.lower_b()[j], up.lower_b()[src], "lower bias {j}");
+            assert_eq!(out.upper_b()[j], up.upper_b()[src], "upper bias {j}");
+        }
+    }
+
+    /// Fail CLOSED on a map that names a row the upstream does not have, rather
+    /// than reading out of bounds.
+    #[test]
+    fn compose_resize_nearest_forward_rejects_an_out_of_range_map() {
+        let up = upstream_with_distinct_rows(2, 3);
+        assert!(
+            compose_resize_nearest_forward("resize_test", &up, &[0, 2]).is_err(),
+            "a map naming row 2 of a 2-row upstream must fail closed"
+        );
+    }
+
+    /// Scale 1 is the identity case, which is exactly the existing
+    /// `Flatten | Reshape | Squeeze | Unsqueeze` passthrough — so the two arms
+    /// must agree where their domains overlap.
+    #[test]
+    fn compose_resize_nearest_forward_at_scale_one_is_the_passthrough() {
+        let (m, n) = (5usize, 4usize);
+        let up = upstream_with_distinct_rows(m, n);
+        let map: Vec<usize> = (0..m).collect();
+        let out = compose_resize_nearest_forward("resize_test", &up, &map).expect("compose");
+        let (ul, uu) = upstream_slices(&up, "up").expect("upstream slices");
+        let (ol, ou) = upstream_slices(&out, "out").expect("composed slices");
+        assert_eq!(
+            ol, ul,
+            "identity map must reproduce upstream lower_a exactly"
+        );
+        assert_eq!(
+            ou, uu,
+            "identity map must reproduce upstream upper_a exactly"
+        );
+        assert_eq!(out.lower_b(), up.lower_b());
+        assert_eq!(out.upper_b(), up.upper_b());
     }
 }

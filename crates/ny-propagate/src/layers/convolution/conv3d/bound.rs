@@ -126,7 +126,7 @@ impl Conv3dLayer {
             deadline,
         )?;
         // Repair non-finite outputs conservatively, matching every other IBP
-        // arm (#3030). `Conservative` only ever widens (NaN -> ±inf, inverted
+        // arm. `Conservative` only ever widens (NaN -> ±inf, inverted
         // pairs swapped), so it cannot erode the enclosure above.
         BoundedTensor::new_repaired(forward.lower, forward.upper, RepairStrategy::Conservative)
     }

@@ -10,8 +10,6 @@
 //!
 //! Soundness property: for any concrete x in [x_l, x_u], the true RmsNorm
 //! output must fall within the CROWN-concretized bounds.
-//!
-//! Part of #3387 (RmsNorm decomposed CROWN backward).
 
 use ndarray::{Array1, ArrayD, IxDyn};
 use ny_tensor::BoundedTensor;
@@ -142,8 +140,6 @@ proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(200) })]
 
     /// Decomposed RmsNorm CROWN soundness with tight perturbation (n=3).
-    ///
-    /// Part of #3387.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_decomposed_rmsnorm_crown_identity_tight_n3(
@@ -172,8 +168,6 @@ proptest! {
     }
 
     /// Decomposed RmsNorm CROWN with wider perturbation (n=3, hw up to 0.5).
-    ///
-    /// Part of #3387.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_decomposed_rmsnorm_crown_wide_perturbation_n3(
@@ -202,8 +196,6 @@ proptest! {
     }
 
     /// Decomposed RmsNorm CROWN with larger dimension (n=8).
-    ///
-    /// Part of #3387.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_decomposed_rmsnorm_crown_identity_tight_n8(
@@ -237,8 +229,6 @@ proptest! {
     /// Decomposed RmsNorm CROWN with asymmetric incoming A matrices.
     ///
     /// Tests McCormick plane selection when incoming coefficients are negative.
-    ///
-    /// Part of #3387.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_decomposed_rmsnorm_crown_negcoeff_n3(
@@ -364,8 +354,6 @@ proptest! {
     /// linear relaxations for lower vs upper bounds. The McCormick plane selection
     /// at lines 1918 and 1946 of crown_block_wise.rs uses w_l and w_u independently,
     /// so this test exercises paths where w_l and w_u have different signs.
-    ///
-    /// Part of #3387.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_decomposed_rmsnorm_crown_asymmetric_a_n3(

@@ -7,7 +7,7 @@
 //! This module handles the Patches-mode backward dispatch attempt and the
 //! deadline-aware `ensure_dense` downgrade when patches dispatch fails. It is pure flow
 //! control around the already-shared patches helper surface — no operator math
-//! belongs here. Split from `core.rs` as part of #3960.
+//! belongs here. Split from `core.rs`.
 
 use crate::bounds::patches::{CrownBounds, PatchesMaterializationPurpose};
 use crate::layers::Layer;
@@ -328,6 +328,14 @@ mod tests {
 
     #[test]
     fn live_convtranspose_deadline_continues_anchored_without_dense_retry() {
+        // The dispatch's planner admits through `cpu_crown_dense_budget_bytes`,
+        // which reads `NY_DENSE_BUDGET_MB`. The sibling
+        // `memory_limited_convtranspose_planner_keeps_patches_and_returns_typed_fallback`
+        // sets it to 0 under the env write lock; an unguarded read that
+        // overlaps it takes the typed MemoryBudgetExceeded fallback instead of
+        // AccumulateToInput (observed on main under --test-threads=4,
+        // 2026-10-04). Readers take the shared half.
+        let _env = crate::tests::lock_env_shared();
         let (layer, mut bounds, pre_activation) = stride_two_convtranspose_fixture();
 
         reset_patches_to_dense_call_count();

@@ -91,6 +91,16 @@ pub struct LayerProfile {
     pub output_shape: Vec<usize>,
     /// Number of elements in output.
     pub num_elements: usize,
+    /// Elements whose bounds STRADDLE zero (`lower < 0 < upper`).
+    ///
+    /// For a node feeding a ReLU this is the pre-activation UNSTABLE count --
+    /// the quantity alpha-beta-CROWN reports as "unstable size N" and refines
+    /// per node. It is the input to the dense-vs-patches admission arithmetic
+    /// (`dense_pair_bytes(target_dim, conv_in_size)` vs
+    /// `patches_cost_admission_threshold_bytes()`): seeding a backward on the
+    /// unstable set instead of the full width shrinks `target_dim` by exactly
+    /// this ratio.
+    pub unstable_count: usize,
     /// Bound status indicator.
     pub status: BoundStatus,
 }
@@ -192,7 +202,7 @@ impl ProfileResult {
 
     /// Get layers sorted by growth ratio (highest first, NaN last).
     ///
-    /// Uses NaN-safe descending ordering (#2601).
+    /// Uses NaN-safe descending ordering.
     pub fn layers_by_growth(&self) -> Vec<&LayerProfile> {
         let mut sorted: Vec<_> = self.layers.iter().collect();
         sorted.sort_by(|a, b| {
@@ -264,6 +274,7 @@ mod tests {
             input_width: 1.0,
             output_width: growth_ratio,
             mean_output_width: growth_ratio * 0.8,
+            unstable_count: 0,
             median_output_width: growth_ratio * 0.7,
             growth_ratio,
             cumulative_expansion: growth_ratio,
@@ -273,7 +284,7 @@ mod tests {
         }
     }
 
-    /// Regression test for #2601: NaN growth ratios must sort last.
+    /// Regression test: NaN growth ratios must sort last.
     #[test]
     fn test_layers_by_growth_nan_last_2601() {
         let result = ProfileResult {

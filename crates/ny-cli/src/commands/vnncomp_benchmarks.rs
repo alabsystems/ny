@@ -166,12 +166,10 @@ pub(crate) fn run_bounded_child(
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 pub(crate) enum BenchmarkAssetsAction {
-    /// Print the compiled lever-search space and interaction lattice.
+    /// Print the tunable-parameter search space (input to tuning scripts)
     ///
-    /// This is the authoritative input to `scripts/ny_search.py`. Reading it
-    /// from the binary prevents a search from measuring a source tree whose
-    /// axes, domains, or dependency edges differ from the executable that will
-    /// actually run the benchmark children.
+    /// Read from the binary, so a search always matches the executable that
+    /// will run the benchmarks.
     Space {
         /// Emit the complete machine-readable search contract.
         #[arg(long, default_value_t = false)]
@@ -188,14 +186,11 @@ pub(crate) enum BenchmarkAssetsAction {
         all: bool,
     },
 
-    /// Sweep a VNN-COMP category (or all of them) and write an official-format
-    /// `results.csv`.
+    /// Run VNN-COMP instances at their official budgets and write results.csv
     ///
-    /// Per-instance budgets come from the benchmark's own `instances.csv`.
-    /// This reproduces the budget policy, but not the organizers' hardware,
-    /// environment, or witness validation. Handles both the flat (2021-2025)
-    /// and versioned (2026) corpus layouts, and both single-model and
-    /// paired/relational instance rows.
+    /// Budgets come from each benchmark's `instances.csv`. This matches the
+    /// competition's budget policy, not its hardware, environment, or witness
+    /// validation.
     Run {
         /// VNN-COMP year to sweep.
         #[arg(long, default_value_t = 2026)]
@@ -211,17 +206,16 @@ pub(crate) enum BenchmarkAssetsAction {
         #[arg(long = "category")]
         categories: Vec<String>,
 
-        /// Official six-column results CSV to write. Because this runner has no
-        /// separate preparation phase, `prepare_time` is recorded as zero.
-        /// Authoritative row state is written as `<name>.metadata.jsonl`; pinned
-        /// provenance is written as `<name>.manifest.json`.
-        /// Defaults to `reports/sweeps/vnncomp<year>-results.csv`.
+        /// Results CSV to write (default: `reports/sweeps/vnncomp<YEAR>-results.csv`)
+        ///
+        /// The CSV uses the official six columns, with `prepare_time` always 0.
+        /// Row state goes to `<name>.metadata.jsonl` and provenance to
+        /// `<name>.manifest.json`.
         #[arg(long)]
         output: Option<PathBuf>,
 
-        /// LOWER the per-instance budget to at most this many seconds. Never
-        /// raises it. Any capped row is flagged, and the summary states that the
-        /// result is a lower bound rather than a competition-comparable score.
+        /// Lower each instance's budget to at most this many seconds (never
+        /// raises it); capped results are flagged as lower bounds
         #[arg(long)]
         timeout_cap: Option<u64>,
 
@@ -229,17 +223,11 @@ pub(crate) enum BenchmarkAssetsAction {
         #[arg(long)]
         limit: Option<usize>,
 
-        /// Run EXACTLY the rows named in this file: one `category,onnx,vnnlib`
-        /// per line, `#` comments and blank lines ignored.
+        /// Run exactly the rows in this file: one `category,onnx,vnnlib` per line
         ///
-        /// The three fields are the first three columns of the `results.csv`
-        /// this command emits and must match the category's `instances.csv`
-        /// verbatim. A named row the corpus does not contain is an ERROR, never
-        /// a skip: a gate set that quietly shrinks reports the same clean sweep
-        /// as one that ran in full.
-        ///
-        /// Refused together with `--limit` — a subset that then takes the first
-        /// N of itself depends on CSV order, which is not what either flag says.
+        /// Each line must match the category's `instances.csv` exactly; a row
+        /// the corpus does not contain is an error, not a skip. `#` comments
+        /// and blank lines are ignored. Cannot be combined with --limit.
         #[arg(long)]
         instances: Option<PathBuf>,
 
@@ -247,13 +235,13 @@ pub(crate) enum BenchmarkAssetsAction {
         #[arg(long)]
         configs_dir: Option<PathBuf>,
 
-        /// Continue a provenance-compatible authoritative metadata bank,
-        /// regenerating the CSV and retrying prior harness-error occurrences.
+        /// Continue an existing sweep from its metadata file; rows that errored
+        /// are retried
         #[arg(long, default_value_t = false)]
         resume: bool,
 
-        /// Replace an existing CSV/state/manifest bank. Refused together with
-        /// `--resume`; without either flag, pre-existing artifacts are protected.
+        /// Replace an existing sweep's files (without this or --resume, existing
+        /// files are never overwritten)
         #[arg(long, default_value_t = false)]
         overwrite: bool,
 
@@ -265,37 +253,22 @@ pub(crate) enum BenchmarkAssetsAction {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
 
-        /// Apply a lever assignment to every child of this sweep: `--lever
-        /// NAME=VALUE`, repeatable.
+        /// Set a tuning parameter for every instance: NAME=VALUE, repeatable
         ///
-        /// Use this instead of exporting a variable into the shell. A shell
-        /// export is invisible to the artifact, is inherited by every later
-        /// process, and silently mixes arms across a `--resume`. Passing the arm
-        /// here makes it data: applied per child, recorded on every row, and
-        /// sealed into the manifest so a resume under a different arm refuses.
-        ///
-        /// Each assignment is validated against `ny_levers::space` before
-        /// anything runs. An axis the interaction lattice proves INERT is
-        /// rejected rather than measured, because measuring it would spend a full
-        /// instance budget re-measuring the baseline and reporting it as a
-        /// treatment. `Class::Unsafe` axes are refused outright.
+        /// Prefer this to exporting an environment variable: the value is
+        /// validated before anything runs, recorded on every row, and sealed
+        /// into the manifest, so a --resume with different values refuses.
+        /// Unsafe parameters, and parameters that provably have no effect, are
+        /// rejected.
         #[arg(long = "lever", value_name = "NAME=VALUE")]
         levers: Vec<String>,
 
-        /// Verdict cache participation: `off` (default), `read`, `read-write`.
+        /// Verdict cache: off (default), read, or read-write
         ///
-        /// A cached verdict is only sound because the key carries everything it
-        /// depends on — binary, configuration, CATEGORY (it names the preset the
-        /// child loads), model, property, budget, arm, backend, host, and the
-        /// ambient lever set. Because the budget is in the key, a `timeout`
-        /// measured at a SMALLER budget cannot even be addressed by a larger
-        /// request; on top of the key, a row measured under heavy load is never
-        /// served and never stored. See `vnncomp_sweep/cache.rs` for the exact
-        /// scope of both admission rules.
-        ///
-        /// A served row is marked `from_cache` in the metadata bank: a replay
-        /// carries the flight record of a different process, and no gate may be
-        /// forced to read it as evidence that a child ran.
+        /// Entries are keyed on the binary, configuration, category, model,
+        /// property, budget, parameters, backend, host, and environment. Rows
+        /// measured under heavy load are never cached. Rows served from the
+        /// cache are marked `from_cache`.
         #[arg(
             long,
             default_value = "off",
@@ -309,14 +282,12 @@ pub(crate) enum BenchmarkAssetsAction {
         cache_dir: Option<PathBuf>,
     },
 
-    /// Report progress from a sweep's results: solved counts, NEW SOLVES,
-    /// REGRESSIONS, and (with `--official`) normalized per-benchmark scores.
+    /// Summarize sweep results: solve counts, changes against a baseline, and
+    /// modeled scores
     ///
-    /// With `--official`, raw CSVs are modeled under the +10/-150 rule and
-    /// benchmark scores are normalized winner-relative; the report states its
-    /// witness/timeout limitations. Without it, the command reports solve
-    /// counts and baseline deltas only. A sat<->unsat flip is a soundness
-    /// alarm, never progress.
+    /// With --official, rows are scored +10 correct / -150 incorrect and
+    /// normalized to each category's winner. A sat/unsat flip against the
+    /// baseline is reported as a soundness alarm.
     Score {
         /// Results CSV (or a directory of them, e.g. `reports/measured`).
         /// Repeatable.
@@ -328,15 +299,13 @@ pub(crate) enum BenchmarkAssetsAction {
         #[arg(long)]
         baseline: Option<PathBuf>,
 
-        /// Released results corpus supplying the comparison field for a modeled,
-        /// winner-relative category total. Without it, solve counts are reported
-        /// and NO normalized total is invented.
+        /// Released VNN-COMP results to score against (requires --year); without
+        /// it, only solve counts are reported
         #[arg(long, requires = "year")]
         official: Option<PathBuf>,
 
-        /// VNN-COMP edition whose released category split to use. Required with
-        /// `--official`; it is explicit because category membership changed
-        /// between 2025 and 2026.
+        /// VNN-COMP edition to score against (required with --official, because
+        /// category membership changed between 2025 and 2026)
         #[arg(long, value_enum)]
         year: Option<super::vnncomp_score::ScoreYear>,
 
@@ -354,38 +323,38 @@ pub(crate) enum BenchmarkAssetsAction {
         #[arg(long, default_value_t = 10)]
         show_rows: usize,
 
-        /// How SAT rows are treated when scoring, worth more than 100 points.
+        /// How sat claims are scored: adjudicated (default), assumed-valid, or
+        /// unvalidated
         ///
-        /// `assumed-valid` (default) treats every SAT as a strictly valid
-        /// counterexample, so an UNSAT it contradicts takes the real -150.
-        /// `unvalidated` opens no counterexample, so nothing convicts and every
-        /// claimed verdict earns +10 — this reproduces the PUBLISHED 2025 board's
-        /// totals numerically, and therefore rewards unsound tools. Use it to
-        /// answer "where would NY have placed", nothing else. (It does NOT mean
-        /// the organizers skipped validation: they checked 5,744 counterexamples
-        /// and applied 62 -150 penalties. See vnncomp_score::Witnesses.)
-        #[arg(long, value_enum, default_value = "assumed-valid")]
+        /// `adjudicated` uses the organizers' published adjudication where it
+        /// exists, and otherwise needs two independent sat claims before a
+        /// counterexample can convict an unsat; a lone contested sat scores
+        /// nobody. `assumed-valid` treats every sat as valid. `unvalidated`
+        /// credits every claimed verdict, which reproduces the published 2025
+        /// totals but rewards unsound tools.
+        #[arg(long, value_enum, default_value = "adjudicated")]
         witnesses: super::vnncomp_score::Witnesses,
 
-        /// Enforce official per-instance timeouts from this corpus year's
-        /// `instances.csv` files. Repeatable. VNN-COMP budgets are PER
-        /// INSTANCE (nn4sys spans 20s-800s), so a solved row recorded above
-        /// its own budget is a phantom point: it is reported and excluded from
-        /// the modeled score. Omit to leave runtimes unchecked, which the
-        /// report then states.
+        /// Organizer adjudication: a released results corpus, or the
+        /// `SCORING/results.txt` inside it
+        ///
+        /// Found automatically when --official points at an unsanitized
+        /// corpus. A sanitized copy usually lacks `SCORING/`; pass the raw
+        /// corpus here instead.
+        #[arg(long)]
+        ground_truth: Option<PathBuf>,
+
+        /// Check solved rows against this year's official per-instance timeouts
+        /// (repeatable); rows over budget are reported and not scored
         #[arg(long = "budget-year")]
         budget_years: Vec<u32>,
     },
 
-    /// Metamorphic overfitting check: re-run each instance under a
-    /// semantics-preserving rename and require a decided verdict to be unchanged.
+    /// Check that verdicts do not change when instance files are renamed
     ///
-    /// Competition instances are regenerated from a seed, so any behaviour keyed
-    /// to an instance's name or path is inert on the scored set and is
-    /// overfitting. A verdict that changes under rename is either that, or
-    /// nondeterminism — both invalidate progress measured from a sweep. Missing
-    /// assets, child errors, timeouts/unknowns, and a zero-valid-case run fail
-    /// the command instead of being reported as a pass.
+    /// A verdict that depends on a file name or path is overfitting or
+    /// nondeterminism. Missing assets, child errors, timeouts, unknowns, or no
+    /// valid pairs at all fail the command.
     Reseed {
         /// VNN-COMP year.
         #[arg(long, default_value_t = 2026)]
@@ -548,18 +517,10 @@ fn declaration_json(decl: &ny_levers::LeverDecl) -> serde_json::Value {
             ("F64ClosedTrimmed", Some(min), Some(max), None)
         }
         ny_levers::LeverKind::Secs => ("Secs", None, None, None),
-        ny_levers::LeverKind::Enum(members) => (
-            "Enum",
-            None,
-            None,
-            Some(members.to_vec()),
-        ),
-        ny_levers::LeverKind::LayeredEnum { env_members, .. } => (
-            "LayeredEnum",
-            None,
-            None,
-            Some(env_members.to_vec()),
-        ),
+        ny_levers::LeverKind::Enum(members) => ("Enum", None, None, Some(members.to_vec())),
+        ny_levers::LeverKind::LayeredEnum { env_members, .. } => {
+            ("LayeredEnum", None, None, Some(env_members.to_vec()))
+        }
         ny_levers::LeverKind::Text => ("Text", None, None, None),
     };
     json!({
@@ -804,6 +765,7 @@ pub(crate) fn handle_benchmark_assets_command(action: BenchmarkAssetsAction) -> 
             show_rows,
             budget_years,
             witnesses,
+            ground_truth,
         } => {
             let opts = super::vnncomp_score::ScoreOptions {
                 results,
@@ -815,6 +777,7 @@ pub(crate) fn handle_benchmark_assets_command(action: BenchmarkAssetsAction) -> 
                 show_rows,
                 budget_years,
                 witnesses,
+                ground_truth,
             };
             super::vnncomp_score::run_score(&opts).map(|_| ())
         }

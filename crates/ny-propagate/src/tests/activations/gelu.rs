@@ -431,7 +431,7 @@ fn test_sound_gelu_relaxation_degenerate() {
         "Point interval should have same intercept"
     );
 
-    // Infinite bounds should return maximally loose (NOT identity — identity is unsound, #1837).
+    // Infinite bounds should return maximally loose (NOT identity — identity is unsound).
     // GELU(x) = x·Φ(x), so GELU(x) ≥ x fails for 0 < x where Φ(x) < 1.
     let inf_case = gelu_sound_linear_relaxation(f32::NEG_INFINITY, f32::INFINITY);
     assert_eq!(
@@ -440,7 +440,7 @@ fn test_sound_gelu_relaxation_degenerate() {
         "Infinite bounds should return maximally loose (fix #1837)"
     );
 
-    // NaN bounds should return maximally loose (NOT identity — #1837).
+    // NaN bounds should return maximally loose (NOT identity).
     let nan_case = gelu_sound_linear_relaxation(f32::NAN, 1.0);
     assert_eq!(
         nan_case,
@@ -465,7 +465,7 @@ fn test_sound_gelu_layer_flag() {
     assert!(sound_tanh.sound, "sound flag should be true");
     assert_eq!(sound_tanh.approximation, GeluApproximation::Tanh);
 
-    // Default layer should be sound (changed from false to true per #1735)
+    // Default layer should be sound (changed from false to true)
     let default_layer = GELULayer::default();
     assert!(default_layer.is_sound(), "default should be sound (#1735)");
     assert!(

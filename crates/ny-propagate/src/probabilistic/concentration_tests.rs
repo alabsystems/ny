@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Tests for concentration inequality certificates.
-//! Part of #3921 Phase 2.
 
 use super::*;
 use ndarray::{Array2, ArrayD, IxDyn};
@@ -224,7 +223,7 @@ fn test_mcdiarmid_zero_lipschitz() {
     assert!((bounds[0].epsilon).abs() < 1e-12);
 }
 
-/// #4145: Default mcdiarmid_bound rejects unsound Lipschitz estimates.
+/// Default mcdiarmid_bound rejects unsound Lipschitz estimates.
 #[test]
 fn test_mcdiarmid_bound_rejects_unsound_lipschitz_4145() {
     let output = ArrayD::from_shape_vec(IxDyn(&[1]), vec![0.2]).unwrap();
@@ -251,7 +250,7 @@ fn test_mcdiarmid_bound_rejects_unsound_lipschitz_4145() {
     );
 }
 
-/// #4145: Optimistic variant warns but succeeds for unsound estimates.
+/// Optimistic variant warns but succeeds for unsound estimates.
 #[test]
 fn test_mcdiarmid_optimistic_warns_when_lipschitz_unsound() {
     let output = ArrayD::from_shape_vec(IxDyn(&[1]), vec![0.2]).unwrap();
@@ -290,7 +289,7 @@ fn test_mcdiarmid_optimistic_warns_when_lipschitz_unsound() {
     );
 }
 
-/// #4145: McDiarmid per-bound `is_sound` reflects the Lipschitz estimate.
+/// McDiarmid per-bound `is_sound` reflects the Lipschitz estimate.
 /// Sound path uses default API; unsound path requires explicit opt-in.
 #[test]
 fn test_mcdiarmid_bound_is_sound_reflects_lipschitz_4145() {
@@ -327,7 +326,7 @@ fn test_mcdiarmid_bound_is_sound_reflects_lipschitz_4145() {
     }
 }
 
-/// #4145: Certificate `is_sound` propagates from the Lipschitz estimate.
+/// Certificate `is_sound` propagates from the Lipschitz estimate.
 /// Default API rejects unsound; optimistic API marks certificate unsound.
 #[test]
 fn test_certificate_is_sound_propagates_lipschitz_4145() {
@@ -427,7 +426,7 @@ fn test_estimate_lipschitz_linear_network() {
     assert!(lip.value >= 2.0, "Lipschitz={} should be >= 2.0", lip.value);
     assert!(lip.value.is_finite());
     assert!(lip.is_sound);
-    assert!(lip.unhandled_layers.is_empty());
+    assert_eq!((lip.unhandled_layers).len(), 0);
 }
 
 #[test]
@@ -454,7 +453,7 @@ fn test_estimate_lipschitz_zero_linear_network_is_sound() {
 
     assert_eq!(lip.value, 0.0);
     assert!(lip.is_sound);
-    assert!(lip.unhandled_layers.is_empty());
+    assert_eq!((lip.unhandled_layers).len(), 0);
 }
 
 #[test]
@@ -510,7 +509,7 @@ fn test_hoeffding_invalid_inputs() {
     assert!(hoeffding_bound(&mean, &bounds, 100, -0.1).is_err());
 }
 
-/// #4331: Bonferroni correction divides per-dim failure probability by d.
+/// Bonferroni correction divides per-dim failure probability by d.
 #[test]
 fn test_bonferroni_correction_10dim_95pct() {
     let dim = 10;
@@ -552,7 +551,7 @@ fn test_bonferroni_correction_10dim_95pct() {
     }
 }
 
-/// #4331: Single-dim output → Bonferroni has no effect.
+/// Single-dim output → Bonferroni has no effect.
 #[test]
 fn test_bonferroni_no_effect_single_dim() {
     let mean = ArrayD::from_shape_vec(IxDyn(&[1]), vec![0.5]).unwrap();

@@ -480,6 +480,9 @@ pub enum PointVjpWavePlan {
     Chain(PointVjpBatchPlan),
     /// Chain + residual blocks (#batched-vjp-resnet).
     Resnet(PointVjpResnetPlan),
+    /// A chain/resnet main network plus additive input-fed side branches
+    /// (#vjp-side-branches).
+    SideBranched(Box<super::point_vjp_batched_side::PointVjpSideBranchPlan>),
 }
 
 impl PointVjpWavePlan {
@@ -490,7 +493,12 @@ impl PointVjpWavePlan {
         if let Some(p) = graph.build_point_vjp_batch_plan(input) {
             return Some(Self::Chain(p));
         }
-        graph.build_point_vjp_resnet_plan(input).map(Self::Resnet)
+        if let Some(p) = graph.build_point_vjp_resnet_plan(input) {
+            return Some(Self::Resnet(p));
+        }
+        graph
+            .build_point_vjp_side_branch_plan(input)
+            .map(|p| Self::SideBranched(Box::new(p)))
     }
 
     /// Flattened network output dimension.
@@ -498,6 +506,7 @@ impl PointVjpWavePlan {
         match self {
             Self::Chain(p) => p.output_dim,
             Self::Resnet(p) => p.output_dim,
+            Self::SideBranched(p) => p.output_dim(),
         }
     }
 
@@ -506,6 +515,7 @@ impl PointVjpWavePlan {
         match self {
             Self::Chain(p) => p.input_dim,
             Self::Resnet(p) => p.input_dim,
+            Self::SideBranched(p) => p.input_dim(),
         }
     }
 
@@ -518,6 +528,7 @@ impl PointVjpWavePlan {
         match self {
             Self::Chain(p) => point_vjp_forward_masks(p, points),
             Self::Resnet(p) => point_vjp_resnet_forward_masks(p, points),
+            Self::SideBranched(p) => p.forward_masks(points),
         }
     }
 
@@ -546,6 +557,7 @@ impl PointVjpWavePlan {
                 p.output_dim,
                 p.input_dim,
             ),
+            Self::SideBranched(p) => p.gpu_vjp(gpu, masks, spec_rows),
         }
     }
 }

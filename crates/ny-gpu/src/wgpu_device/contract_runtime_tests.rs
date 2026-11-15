@@ -92,7 +92,7 @@ fn test_wgpu_all_pipelines_create_successfully() {
         let (_p, _l) = super::super::WgpuDevice::create_transpose_ibp_pipeline(device, false);
         let (_p, _l) = super::super::WgpuDevice::create_scale_ibp_pipeline(device, false);
         let (_p, layout) = super::super::WgpuDevice::create_gemm_f32_pipeline(device, false);
-        // Small-K pipeline shares the GEMM bind group layout (#3599)
+        // Small-K pipeline shares the GEMM bind group layout
         let _p = super::super::WgpuDevice::create_gemm_f32_small_k_pipeline(device, false, &layout);
         let (_p, _l) = super::super::WgpuDevice::create_conv2d_ibp_pipeline(device, false);
         let (_p, _l) = super::super::WgpuDevice::create_conv_reshape_pipeline(device, false);
@@ -225,7 +225,7 @@ fn test_scale_shader_handles_negative_scale() {
 }
 
 // ============================================================================
-// GEMM M-batching binding limit invariant (#3397)
+// GEMM M-batching binding limit invariant
 // ============================================================================
 // The GEMM M-batching constants must agree: `MAX_BINDING_ELEMS` must equal
 // `WGPU_MAX_BINDING_BYTES * 5/6 / 4` (128 MB / 1.2 / sizeof(f32)).
@@ -248,7 +248,7 @@ fn test_gemm_binding_limit_constants_consistent() {
 }
 
 // ============================================================================
-// Small-K GEMM ROWS_PER_THREAD invariant (#3599)
+// Small-K GEMM ROWS_PER_THREAD invariant
 // ============================================================================
 // The small-K GEMM shader defines `const ROWS_PER_THREAD: u32 = 4u;`.
 // The Rust dispatch code uses SMALL_K_ROWS_PER_THREAD=4 to compute
@@ -264,7 +264,7 @@ fn test_small_k_shader_rows_per_thread_is_4() {
 }
 
 // ============================================================================
-// Add IBP shader NaN/Inf defense invariant (#4319)
+// Add IBP shader NaN/Inf defense invariant
 // ============================================================================
 // ADD_IBP_SHADER must contain FALLBACK_BOUND and NaN checks to prevent
 // Inf/NaN propagation through residual connections.
@@ -283,7 +283,7 @@ fn test_add_ibp_shader_nan_defense() {
 }
 
 // ============================================================================
-// ReLU IBP shader in-place invariant (#4319)
+// ReLU IBP shader in-place invariant
 // ============================================================================
 // RELU_IBP_SHADER operates in-place (read_write on lower/upper), not
 // separate src/dst. The DAG plan builder copies src→dst before dispatching.

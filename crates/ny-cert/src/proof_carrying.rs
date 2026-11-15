@@ -236,7 +236,6 @@ pub fn compose_from_surveys(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cite_check::clean_corpus_root;
     use crate::json::Map;
 
     const PROVED_CAPTURED: FunctionFacts = FunctionFacts {
@@ -244,6 +243,25 @@ mod tests {
         l1_postcond_captured: true,
         l1_postcond_discharged: false,
     };
+
+    /// A hermetic stand-in for the Clean corpus: one sorry-free declaration of
+    /// the theorem these tests cite. The classification logic under test only
+    /// asks whether a cited name resolves to a declared, sorry-free theorem
+    /// under `corpus_root`; whether the REAL pinned corpus grounds it is the
+    /// `external-lean` lane (`pinned_corpus` below and in `cite_check`). These
+    /// tests used to read the downloaded checkout directly, so without it they
+    /// failed (or, for the fail-closed ones, passed on a read error instead of
+    /// the `NotFound` they claim to test).
+    fn fixture_corpus() -> tempfile::TempDir {
+        let corpus = tempfile::tempdir().expect("create fixture corpus");
+        std::fs::write(
+            corpus.path().join("Bridge.lean"),
+            "/-- Fixture: the premise-combination lemma, proved. -/\n\
+             theorem farkas_premise_combination : True := by exact True.intro\n",
+        )
+        .expect("write fixture corpus");
+        corpus
+    }
 
     /// A `targo trust survey` value carrying exactly the given
     /// `(function, verdict)` rows — the shape [`function_verdicts`] reads:
@@ -265,10 +283,11 @@ mod tests {
 
     #[test]
     fn captured_postcondition_with_grounded_cite_is_modulo_cite() {
+        let corpus = fixture_corpus();
         let s = classify(
             PROVED_CAPTURED,
             Some("farkas_premise_combination"),
-            &clean_corpus_root(),
+            corpus.path(),
         );
         assert_eq!(
             s,
@@ -280,19 +299,17 @@ mod tests {
 
     #[test]
     fn fail_closed_on_missing_cite() {
+        let corpus = fixture_corpus();
         // No citation → never "certified", just honestly L0-only/L1-open.
-        let s = classify(PROVED_CAPTURED, None, &clean_corpus_root());
+        let s = classify(PROVED_CAPTURED, None, corpus.path());
         assert_eq!(s, ProofCarryingStatus::L0OnlyL1Open);
     }
 
     #[test]
     fn fail_closed_on_ungrounded_cite() {
+        let corpus = fixture_corpus();
         // A citation to a non-existent theorem must NOT yield certified-modulo.
-        let s = classify(
-            PROVED_CAPTURED,
-            Some("no_such_theorem_xyz"),
-            &clean_corpus_root(),
-        );
+        let s = classify(PROVED_CAPTURED, Some("no_such_theorem_xyz"), corpus.path());
         assert!(
             matches!(s, ProofCarryingStatus::Incomplete { .. }),
             "got {s:?}"
@@ -325,29 +342,27 @@ mod tests {
 
     #[test]
     fn solver_discharged_is_certified_to_axioms() {
+        let corpus = fixture_corpus();
         let facts = FunctionFacts {
             l1_postcond_discharged: true,
             ..PROVED_CAPTURED
         };
         assert_eq!(
-            classify(
-                facts,
-                Some("farkas_premise_combination"),
-                &clean_corpus_root()
-            ),
+            classify(facts, Some("farkas_premise_combination"), corpus.path()),
             ProofCarryingStatus::CertifiedToAxioms
         );
     }
 
     #[test]
     fn discharged_without_a_captured_postcondition_fails_closed() {
+        let corpus = fixture_corpus();
         let facts = FunctionFacts {
             l0_proved: true,
             l1_postcond_captured: false,
             l1_postcond_discharged: true,
         };
         assert!(matches!(
-            classify(facts, None, &clean_corpus_root()),
+            classify(facts, None, corpus.path()),
             ProofCarryingStatus::Incomplete { .. }
         ));
     }
@@ -368,10 +383,11 @@ mod tests {
 
     #[test]
     fn duplicate_contract_evidence_never_certifies() {
+        let corpus = fixture_corpus();
         let structural = survey_of(&[("f", "Verified")]);
         let contracts = survey_of(&[("f", "HasViolations"), ("f", "Verified")]);
         let cite_map = vec![("f".to_string(), "farkas_premise_combination".to_string())];
-        let cert = compose_from_surveys(&structural, &contracts, &cite_map, &clean_corpus_root());
+        let cert = compose_from_surveys(&structural, &contracts, &cite_map, corpus.path());
         assert_eq!(
             cert,
             vec![("f".to_string(), ProofCarryingStatus::L0OnlyL1Open)]
@@ -380,13 +396,13 @@ mod tests {
 
     #[test]
     fn unknown_contract_verdict_does_not_count_as_captured_evidence() {
+        let corpus = fixture_corpus();
         let structural = survey_of(&[("f", "Verified")]);
         for verdict in ["Error", "Skipped", "arbitrary"] {
             let contracts = survey_of(&[("f", verdict)]);
             assert!(!function_verdicts(&contracts).contains_key("f"));
             let cite_map = vec![("f".to_string(), "farkas_premise_combination".to_string())];
-            let cert =
-                compose_from_surveys(&structural, &contracts, &cite_map, &clean_corpus_root());
+            let cert = compose_from_surveys(&structural, &contracts, &cite_map, corpus.path());
             assert_eq!(
                 cert,
                 vec![("f".to_string(), ProofCarryingStatus::L0OnlyL1Open)],
@@ -397,22 +413,20 @@ mod tests {
 
     #[test]
     fn unproved_l0_is_incomplete_regardless_of_cite() {
+        let corpus = fixture_corpus();
         let facts = FunctionFacts {
             l0_proved: false,
             ..PROVED_CAPTURED
         };
         assert!(matches!(
-            classify(
-                facts,
-                Some("farkas_premise_combination"),
-                &clean_corpus_root()
-            ),
+            classify(facts, Some("farkas_premise_combination"), corpus.path()),
             ProofCarryingStatus::Incomplete { .. }
         ));
     }
 
     #[test]
     fn compose_from_two_surveys_yields_modulo_cite() {
+        let corpus = fixture_corpus();
         // Structural survey (L0 only): check_farkas L0-safe → Verified.
         let structural = survey_of(&[("selfcheck::check_farkas", "Verified")]);
         // Contracts survey (L0 + L1): the postcondition fails → HasViolations.
@@ -421,7 +435,7 @@ mod tests {
             "selfcheck::check_farkas".to_string(),
             "farkas_premise_combination".to_string(),
         )];
-        let cert = compose_from_surveys(&structural, &contracts, &cite_map, &clean_corpus_root());
+        let cert = compose_from_surveys(&structural, &contracts, &cite_map, corpus.path());
         assert_eq!(
             cert,
             vec![(
@@ -435,6 +449,7 @@ mod tests {
 
     #[test]
     fn compose_fail_closed_when_l0_unproved() {
+        let corpus = fixture_corpus();
         // If L0 safety is not Verified structurally, never certify — even with a cite.
         let structural = survey_of(&[("selfcheck::check_farkas", "HasViolations")]);
         let contracts = structural.clone();
@@ -442,7 +457,7 @@ mod tests {
             "selfcheck::check_farkas".to_string(),
             "farkas_premise_combination".to_string(),
         )];
-        let cert = compose_from_surveys(&structural, &contracts, &cite_map, &clean_corpus_root());
+        let cert = compose_from_surveys(&structural, &contracts, &cite_map, corpus.path());
         assert!(
             matches!(cert[0].1, ProofCarryingStatus::Incomplete { .. }),
             "got {:?}",
@@ -450,24 +465,34 @@ mod tests {
         );
     }
 
-    /// The current, honest proof-carrying status of `check_farkas`, composed from the
-    /// live-survey facts (L0 proved; L1 captured but ay-undischarged) and the verified
-    /// grounding: `CertifiedModuloCite(farkas_premise_combination)`.
-    #[test]
-    fn check_farkas_current_status_is_modulo_cite() {
-        // Facts as established by `targo trust survey ny-cert --contracts` (2026-06-27):
-        // L0 verified, the #[ensures] postcondition captured but not ay-discharged.
-        let s = classify(
-            PROVED_CAPTURED,
-            Some("farkas_premise_combination"),
-            &clean_corpus_root(),
-        );
-        assert_eq!(
-            s,
-            ProofCarryingStatus::CertifiedModuloCite {
-                theorem: "farkas_premise_combination".to_string()
-            },
-            "check_farkas should be sound modulo its cited, kernel-checked theorem",
-        );
+    /// The status pin against the REAL pinned corpus — the `external-lean`
+    /// lane (`--features external-lean --lib pinned_corpus`, gate lane [b]).
+    #[cfg(feature = "external-lean")]
+    mod pinned_corpus {
+        use super::*;
+        use crate::cite_check::clean_corpus_root;
+
+        /// The current, honest proof-carrying status of `check_farkas`, composed from the
+        /// live-survey facts (L0 proved; L1 captured but ay-undischarged) and the verified
+        /// grounding: `CertifiedModuloCite(farkas_premise_combination)`.
+        #[test]
+        fn check_farkas_current_status_is_modulo_cite() {
+            // Facts as established by `targo trust survey ny-cert --contracts` (2026-06-27):
+            // L0 verified, the #[ensures] postcondition captured but not ay-discharged.
+            let root = clean_corpus_root();
+            assert!(
+                root.is_dir(),
+                "Clean dependency corpus missing at {} (run `lake update` in crates/ny-cert/proofs/lean)",
+                root.display()
+            );
+            let s = classify(PROVED_CAPTURED, Some("farkas_premise_combination"), &root);
+            assert_eq!(
+                s,
+                ProofCarryingStatus::CertifiedModuloCite {
+                    theorem: "farkas_premise_combination".to_string()
+                },
+                "check_farkas should be sound modulo its cited, kernel-checked theorem",
+            );
+        }
     }
 }

@@ -46,12 +46,22 @@ impl BetaCrownVerifier {
         objective: &[f32],
         engine: Option<&dyn GemmEngine>,
     ) -> Result<(String, usize, f32)> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BranchSelect);
         if self.config.fsb_candidates == 0 {
             trace!(
                 unstable = unstable.len(),
                 "GPU graph kFSB has zero candidates configured; falling back to BaBSR ranking"
             );
             return self.select_graph_babsr_fallback_branch(graph, domain, unstable);
+        }
+
+        // #kfsb-single-shot (dark, typed `bab.kfsb_single_shot`): objective-
+        // seeded prescore + one CROWN pass per candidate child. Advisory-only
+        // like everything below; `false` never reaches this branch.
+        if self.config.kfsb_single_shot {
+            return self
+                .select_graph_branch_kfsb_single_shot(graph, domain, unstable, objective, engine);
         }
 
         let scored = self.score_graph_kfsb_candidates(graph, domain, unstable)?;
@@ -100,12 +110,23 @@ impl BetaCrownVerifier {
         Ok(self.finalize_graph_kfsb_fallback_selection(domain, &scored, best_prescore))
     }
 
-    fn score_graph_kfsb_candidates(
+    pub(super) fn score_graph_kfsb_candidates(
         &self,
         graph: &GraphNetwork,
         domain: &GraphBabDomain,
         unstable: &[(String, usize)],
     ) -> Result<Vec<GraphKfsbCandidate>> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost =
+            ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BranchPrescore);
+        ny_core::phase_cost::add_units(
+            ny_core::phase_cost::CostPhase::BranchPrescore,
+            unstable.len() as u64,
+        );
+        ny_core::phase_cost::count(
+            ny_core::phase_cost::CostCounter::CandidatesScored,
+            unstable.len() as u64,
+        );
         let mut scored = Vec::with_capacity(unstable.len());
 
         match self.config.branching_heuristic {
@@ -279,6 +300,16 @@ impl BetaCrownVerifier {
         engine: Option<&dyn GemmEngine>,
         eval_candidates: &[GraphKfsbCandidate],
     ) -> Result<Vec<(Option<(f32, f32)>, Option<(f32, f32)>)>> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BranchSim);
+        ny_core::phase_cost::add_units(
+            ny_core::phase_cost::CostPhase::BranchSim,
+            2 * eval_candidates.len() as u64,
+        );
+        ny_core::phase_cost::count(
+            ny_core::phase_cost::CostCounter::CandidatesSimulated,
+            2 * eval_candidates.len() as u64,
+        );
         // Gated OFF by default (`NY_KFSB_BATCH_EVAL=1` to enable). The batched
         // engine (`propagate_crown_with_batched_domains_full`) is faster than
         // the serial per-child loop AND produces a genuinely TIGHTER, sound,
@@ -521,7 +552,7 @@ impl BetaCrownVerifier {
     /// candidate. (The batched and serial paths feed it different bounds; see
     /// `collect_graph_kfsb_child_bounds_batched`.)
     /// Returns `(node_name, neuron_idx, kfsb_score, main_score)` for the winner.
-    fn reduce_graph_kfsb_scores(
+    pub(super) fn reduce_graph_kfsb_scores(
         &self,
         eval_candidates: &[GraphKfsbCandidate],
         child_bounds: &[(Option<(f32, f32)>, Option<(f32, f32)>)],
@@ -591,7 +622,7 @@ impl BetaCrownVerifier {
         scored[idx].clone()
     }
 
-    fn finalize_graph_kfsb_fallback_selection(
+    pub(super) fn finalize_graph_kfsb_fallback_selection(
         &self,
         domain: &GraphBabDomain,
         scored: &[GraphKfsbCandidate],

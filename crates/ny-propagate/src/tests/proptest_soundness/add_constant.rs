@@ -101,7 +101,6 @@ proptest! {
     ///
     /// For y = x + c, CROWN backward shifts bias: b_new = b + A@c.
     /// Tests CROWN-IBP equivalence and sampling soundness.
-    /// Part of #3157.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_addconstant_crown_identity(
@@ -182,7 +181,6 @@ proptest! {
     ///
     /// Tests that CROWN composition correctly handles the bias shift A@c
     /// when incoming coefficient matrix has mixed-sign entries.
-    /// Part of #3157.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_addconstant_crown_negative_coeffs(

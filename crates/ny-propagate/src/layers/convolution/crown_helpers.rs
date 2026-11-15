@@ -442,7 +442,7 @@ pub(crate) fn higham_widen_ibp(
     BoundedTensor::new_repaired(lower, upper, RepairStrategy::Conservative)
 }
 
-/// Guard: reject NaN weights at CROWN backward entry. (#2747)
+/// Guard: reject NaN weights at CROWN backward entry.
 pub(crate) fn guard_nan_weights(
     kernel: &ArrayD<f32>,
     bias: Option<&Array1<f32>>,
@@ -490,7 +490,7 @@ where
     poll()
 }
 
-/// Detect rows with unsafe coefficients and fall back to +/-inf bias. (#2812, #2681)
+/// Detect rows with unsafe coefficients and fall back to +/-inf bias.
 pub(crate) fn detect_and_fix_nonfinite_rows(
     lower_a: &mut Array2<f32>,
     upper_a: &mut Array2<f32>,
@@ -839,7 +839,7 @@ where
 }
 
 /// Compute broadcast convolution bias contribution and certified-error widening
-/// in f64 with directed rounding. (#2812, #1863)
+/// in f64 with directed rounding.
 pub(crate) fn compute_conv_bias_f64(
     bounds: &LinearBounds,
     bias: Option<&Array1<f32>>,
@@ -933,7 +933,8 @@ pub(crate) fn conv_should_f64_recompute(_n_contraction: usize) -> bool {
 /// sooner. Either case can affect fallback timing, never bound soundness.
 #[inline]
 pub(crate) fn conv_skip_dead_f32_enabled() -> bool {
-    std::env::var("NY_CONV_SKIP_DEAD_F32").ok().as_deref() != Some("0")
+    ny_levers::read_raw(&ny_levers::decls::kernel_inputs::CONV_SKIP_DEAD_F32).as_deref()
+        != Some("0")
 }
 
 /// Build the certified per-coefficient error matrix for a conv backward

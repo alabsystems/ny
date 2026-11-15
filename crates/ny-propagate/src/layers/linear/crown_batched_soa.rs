@@ -14,13 +14,14 @@
 //! certified f64 `A·W` contraction, published with a `γ_n^{f64}·S`
 //! coefficient-error certificate.
 //!
-//! This lane CALLS THAT SAME FUNCTION, per domain, in the same domain order.
-//! It owns only the SoA plumbing: reading each domain's pending coefficient
-//! block out of the contiguous `[B, R, W]` batch tensors, dispatching the
-//! shared kernel over coarse rayon chunks on the domain axis, and writing the
-//! results back into flat output planes. **No arithmetic lives in this file.**
-//! Bit-identity with the reference is therefore true by construction rather
-//! than by review.
+//! This lane CALLS THAT SAME FUNCTION. Flat Linear layouts can pack independent
+//! domain rows into one call per exact/error-marker group. Other layouts or
+//! declined staging budgets retain coarse per-domain rayon calls. It owns only
+//! SoA plumbing: copying pending coefficients, biases and error planes into
+//! the shared kernel and copying its results back. **No bound arithmetic lives
+//! in this file.** Coalescing must preserve the shared CPU reducer's row-count
+//! independence; the raw-bit controls compare against the actual per-domain
+//! reference, including nonfinite conservative rows and error-marker groups.
 //!
 //! # Why (the defect this shape exists to prevent)
 //!
@@ -46,7 +47,7 @@
 //! path here — if the Linear stacking is ever worth restoring for throughput,
 //! it belongs in the shared kernel where BOTH lanes get it.
 //!
-//! A [`NestedFaerParGuard`] is held inside each worker so the shared kernel's
+//! A [`NestedFaerParGuard`] is held inside each shared-call scope so the kernel's
 //! faer f64 products run under the SAME faer parallelism policy as the
 //! reference's driver-thread calls (`current_par()` would otherwise force
 //! `Par::Seq` inside a rayon worker). The pollable-CPU contraction is
@@ -66,6 +67,9 @@ use super::layout::resolve_backward_layout;
 use super::LinearLayer;
 use crate::faer_parallelism::NestedFaerParGuard;
 use crate::LinearBounds;
+
+#[path = "crown_batched_soa/coalesced.rs"]
+mod coalesced;
 
 /// Borrowed SoA view of the per-node pending linear bounds for a batch of
 /// domains. Planes are domain-major row-major: domain `d`'s coefficient block
@@ -111,15 +115,16 @@ pub(crate) struct SoaLinearBackwardOutput {
 
 /// The Linear arm of the #lsnc-batched-bwd SoA fast lane.
 ///
-/// Delegates EVERY domain to the shared reference kernel
+/// Delegates EVERY domain row to the shared reference kernel
 /// [`LinearLayer::propagate_linear_pollable_cpu`] — the same call the
 /// reference loop (`backward_core::dispatch_node_backward`) makes — so the
-/// published coefficients, biases and certified-error planes are bit-identical
-/// to the reference by construction. See the module docs for why this is a
-/// call and not a copy.
+/// published coefficients, biases and certified-error planes retain the
+/// reference's row-wise arithmetic. Flat-layout coalescing preserves separate
+/// exact-marker groups and has an explicit staging-budget decline. See the
+/// module docs and raw-bit controls for the reference contract.
 ///
-/// `min_chunk` is the minimum number of domains per rayon task (coarse
-/// chunking; NO per-domain fan-out). The fast lane only ever runs without a
+/// `min_chunk` is the minimum domains per rayon task on the declined-packing
+/// fallback. The fast lane only ever runs without a
 /// deadline (`batched_bwd::try_backward_soa` declines on any finite one), so
 /// `None` is passed through as the kernel's deadline — matching the reference,
 /// which is handed the same `None`.
@@ -159,28 +164,45 @@ pub(crate) fn propagate_linear_batched_soa(
         return Ok(out);
     }
 
-    // Phase 1 — run the SHARED per-domain reference kernel, coarse-chunked over
-    // the domain axis. Domains are independent (each reads only its own pending
-    // block and produces only its own result), so chunking changes scheduling
-    // and nothing else.
-    let per_domain: Vec<Option<Result<LinearBounds>>> = (0..n_domains)
-        .into_par_iter()
-        .with_min_len(min_chunk.max(1))
-        .map(|d| {
-            if !input.active[d] {
-                return None;
-            }
-            // Match the reference's faer parallelism policy (driver thread).
-            let _faer_par = NestedFaerParGuard::new();
-            Some(
-                domain_pending_bounds(input, d, num_outputs, bounds_inputs).and_then(|bounds| {
-                    layer
-                        .propagate_linear_pollable_cpu(&bounds, Some(engine), None)
-                        .map(std::borrow::Cow::into_owned)
-                }),
-            )
-        })
-        .collect();
+    // Phase 1 — run the shared reference kernel over independent domain rows.
+    // Prefer a packed flat-layout call; otherwise keep the coarse per-domain
+    // reference path. Packing never invents coefficient/error arithmetic.
+    let coalesced = coalesced::try_coalesced(
+        layer,
+        input,
+        engine,
+        None,
+        crate::network::crown_memory::cpu_crown_dense_budget_bytes(),
+    )?;
+    let per_domain: Vec<Option<Result<LinearBounds>>> = if let Some((results, work)) = coalesced {
+        static ANNOUNCED: std::sync::Once = std::sync::Once::new();
+        ANNOUNCED.call_once(|| eprintln!(
+            "[linear-domain-pack] shared_calls={} packed_domains={} shared_certified_cpu_kernel=1 original_deadline_unchanged=1",
+            work.shared_calls, work.packed_domains,
+        ));
+        results
+    } else {
+        (0..n_domains)
+            .into_par_iter()
+            .with_min_len(min_chunk.max(1))
+            .map(|d| {
+                if !input.active[d] {
+                    return None;
+                }
+                // Match the reference's faer parallelism policy (driver thread).
+                let _faer_par = NestedFaerParGuard::new();
+                Some(
+                    domain_pending_bounds(input, d, num_outputs, bounds_inputs).and_then(
+                        |bounds| {
+                            layer
+                                .propagate_linear_pollable_cpu(&bounds, Some(engine), None)
+                                .map(std::borrow::Cow::into_owned)
+                        },
+                    ),
+                )
+            })
+            .collect()
+    };
 
     // Phase 2 — scatter into the flat output planes (pure copy, no arithmetic).
     for (d, slot) in per_domain.into_iter().enumerate() {
@@ -226,7 +248,7 @@ fn copy_from<'a>(dst: &mut [f32], src: impl Iterator<Item = &'a f32>) {
 /// must hand the shared kernel EXACTLY what the reference loop hands it: the
 /// reference reads these objects straight out of `IndexedPendingLinearBounds`
 /// with no revalidation, and `new`'s NaN/Inf rejection would turn a row that
-/// the kernel degrades in place (zeroed coefficients + ±inf bias, #1932/#2681)
+/// the kernel degrades in place (zeroed coefficients + ±inf bias)
 /// into a hard error — a behaviour difference, i.e. the very class of drift
 /// this module was rebuilt to make impossible.
 fn domain_pending_bounds(

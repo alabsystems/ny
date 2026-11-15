@@ -3,13 +3,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Batched patches mode bounds for the CROWN graph engine.
-//!
-//! Phase 4 of #2613. Design: designs/2026-02-28-patches-mode-wrapper-enum-design.md
 
 use ndarray::ArrayD;
 #[cfg(test)]
 use ndarray::IxDyn;
-use ny_core::{checked_shape_product, NyError, Result};
+use ny_core::{
+    checked_shape_product,
+    dd::{next_down_f64, next_up_f64, two_sum},
+    NyError, Result,
+};
 use ny_tensor::{next_down_f32, next_up_f32};
 use std::mem::size_of;
 use std::time::Instant;
@@ -18,6 +20,9 @@ use super::patches::{
     CrownBounds, PatchesLinearBounds, PatchesMaterializationDeadline, PatchesMaterializationPurpose,
 };
 use super::{BatchedLinearBounds, BatchedLinearBounds64, LinearBounds};
+use crate::layers::linear::bias::{
+    f32_to_f64_exact, f64_to_f32_up_no_subnormal, nonnegative_f32_error_or_infinity,
+};
 use crate::network::crown_memory::BatchedDenseMaterializationEstimate;
 
 /// One total-live receipt for finite batched sidecar staging. Every Vec
@@ -84,6 +89,22 @@ impl BatchedSidecarAdmission {
     }
 }
 
+/// How a carried f64 coefficient certificate reads at downcast time.
+///
+/// `Exact` is the ONLY variant that reads as zero error: neither incoming
+/// coefficient uncertainty nor a `two_sum` residual has been banked, so the
+/// stored coefficients are the exact sum of their contributions. A certificate
+/// that is present but unreadable
+/// (non-contiguous, or the wrong length for the coefficient array) is
+/// `Unreadable` and charges `f64::INFINITY` — an unreadable certificate must
+/// never be mistaken for "no error".
+#[derive(Clone, Copy)]
+enum CarriedCertificate<'a> {
+    Exact,
+    Unreadable,
+    Values(&'a [f64]),
+}
+
 /// Cooperative f64 fan-in sidecar used only when an absolute deadline is
 /// present. The historical opaque sidecar remains the zero-overhead `None`
 /// path; finite requests never call its clone/mapv/accumulate/downcast loops.
@@ -93,17 +114,42 @@ pub(crate) struct FiniteBatchedLinearBounds64 {
     lower_b: ArrayD<f64>,
     upper_a: ArrayD<f64>,
     upper_b: ArrayD<f64>,
+    /// Certified absolute error on the stored `lower_a` coefficients, carried
+    /// across fan-in accumulation exactly as
+    /// [`BatchedLinearBounds64::lower_a_err`](super::BatchedLinearBounds64) does
+    /// on the no-deadline twin. `None` means every stored coefficient is the
+    /// EXACT sum of its contributions with zero incoming uncertainty (no
+    /// `two_sum` residual has been banked yet); it never means "the error is unknown".
+    ///
+    /// A coefficient may not be nudged outward the way a bias can:
+    /// `min(c*l, c*u)` is concave in `c`, so moving `c` in EITHER direction can
+    /// raise a lower bound. The exact residual is banked here instead and the
+    /// concretizer charges it against `max(|in_l|,|in_u|)`
+    /// (`bounds/concretize.rs`, `LinearBounds::concretize_scalar_f64`).
+    lower_a_err: Option<ArrayD<f64>>,
+    /// Upper-coefficient counterpart of [`Self::lower_a_err`].
+    upper_a_err: Option<ArrayD<f64>>,
     input_shape: Vec<usize>,
     output_shape: Vec<usize>,
 }
 
 impl FiniteBatchedLinearBounds64 {
+    fn require_environment() -> Result<()> {
+        ny_core::require_f64_interval_proof_environment().map_err(|error| {
+            NyError::UnsupportedConfiguration(format!(
+                "finite batched f64 certificate environment: {error}"
+            ))
+        })
+    }
+
     fn memory_bytes(&self) -> usize {
         self.lower_a
             .len()
             .saturating_add(self.lower_b.len())
             .saturating_add(self.upper_a.len())
             .saturating_add(self.upper_b.len())
+            .saturating_add(self.lower_a_err.as_ref().map_or(0, ArrayD::len))
+            .saturating_add(self.upper_a_err.as_ref().map_or(0, ArrayD::len))
             .saturating_mul(size_of::<f64>())
             .saturating_add(
                 self.input_shape
@@ -130,6 +176,7 @@ impl FiniteBatchedLinearBounds64 {
 
     fn coefficient_error_rows(
         error: Option<&ArrayD<f32>>,
+        shape: &[usize],
         rows: usize,
         columns: usize,
         expected_len: usize,
@@ -146,7 +193,7 @@ impl FiniteBatchedLinearBounds64 {
             deadline.checkpoint(stage)?;
             return Ok(affected);
         };
-        if error.len() != expected_len {
+        if error.len() != expected_len || error.shape() != shape {
             for value in &mut affected {
                 *value = 1;
                 deadline.work(1, stage)?;
@@ -159,7 +206,11 @@ impl FiniteBatchedLinearBounds64 {
             return Ok(affected);
         }
         for (index, &value) in error.iter().enumerate() {
-            if value != 0.0 {
+            // Finite nonnegative incoming errors are carried, rather than
+            // discarding every affected signed relation. Poison still makes
+            // the whole corresponding row vacuous. Decode bits before any
+            // binary32 comparison so a negative subnormal cannot read as zero.
+            if !nonnegative_f32_error_or_infinity(value).is_finite() {
                 affected[index / columns] = 1;
             }
             deadline.work(1, stage)?;
@@ -190,7 +241,7 @@ impl FiniteBatchedLinearBounds64 {
             values.push(if affected.get(row).copied().unwrap_or(1) != 0 {
                 conservative_value
             } else {
-                f64::from(value)
+                f32_to_f64_exact(value)
             });
             deadline.work(1, stage)?;
         }
@@ -208,6 +259,7 @@ impl FiniteBatchedLinearBounds64 {
         deadline: &mut PatchesMaterializationDeadline,
     ) -> Result<Self> {
         deadline.checkpoint("before finite batched f64 staging")?;
+        Self::require_environment()?;
         let columns = bounds.lower_a().shape().last().copied().unwrap_or(0);
         let rows = bounds.lower_b().len();
         let expected_coefficients = rows.checked_mul(columns).ok_or_else(|| {
@@ -225,6 +277,7 @@ impl FiniteBatchedLinearBounds64 {
         }
         let lower_affected = Self::coefficient_error_rows(
             bounds.lower_a_err.as_ref(),
+            bounds.lower_a().shape(),
             rows,
             columns,
             expected_coefficients,
@@ -234,6 +287,7 @@ impl FiniteBatchedLinearBounds64 {
         )?;
         let upper_affected = Self::coefficient_error_rows(
             bounds.upper_a_err.as_ref(),
+            bounds.upper_a().shape(),
             rows,
             columns,
             expected_coefficients,
@@ -293,12 +347,28 @@ impl FiniteBatchedLinearBounds64 {
             deadline,
             "during finite output-shape staging",
         )?;
+        let lower_a_err = Self::import_certificate(
+            bounds.lower_a_err.as_ref(),
+            &lower_a,
+            admission,
+            deadline,
+            "during finite lower certificate import",
+        )?;
+        let upper_a_err = Self::import_certificate(
+            bounds.upper_a_err.as_ref(),
+            &upper_a,
+            admission,
+            deadline,
+            "during finite upper certificate import",
+        )?;
         deadline.checkpoint("after finite batched f64 staging")?;
         Ok(Self {
             lower_a,
             lower_b,
             upper_a,
             upper_b,
+            lower_a_err,
+            upper_a_err,
             input_shape,
             output_shape,
         })
@@ -328,6 +398,7 @@ impl FiniteBatchedLinearBounds64 {
         admission: &mut BatchedSidecarAdmission,
         deadline: &mut PatchesMaterializationDeadline,
     ) -> Result<Self> {
+        Self::require_environment()?;
         let lower_a = Self::copy_f64_array(
             &self.lower_a,
             admission,
@@ -364,11 +435,33 @@ impl FiniteBatchedLinearBounds64 {
             deadline,
             "during finite sidecar output-shape copy",
         )?;
+        // The carried coefficient certificate is part of the accumulator state:
+        // dropping it here would silently republish an uncertified relation.
+        let lower_a_err = match &self.lower_a_err {
+            Some(error) => Some(Self::copy_f64_array(
+                error,
+                admission,
+                deadline,
+                "during finite lower certificate sidecar copy",
+            )?),
+            None => None,
+        };
+        let upper_a_err = match &self.upper_a_err {
+            Some(error) => Some(Self::copy_f64_array(
+                error,
+                admission,
+                deadline,
+                "during finite upper certificate sidecar copy",
+            )?),
+            None => None,
+        };
         Ok(Self {
             lower_a,
             lower_b,
             upper_a,
             upper_b,
+            lower_a_err,
+            upper_a_err,
             input_shape,
             output_shape,
         })
@@ -417,9 +510,36 @@ impl FiniteBatchedLinearBounds64 {
             *value = f64::INFINITY;
             deadline.work(1, "during finite upper-bias sidecar widening")?;
         }
+        // Every coefficient is now non-finite, so `to_f32` fails row validation
+        // and republishes each row as `[0 .. 0] + [-inf, +inf]` with an INFINITE
+        // certificate. A carried finite error would only understate that, so drop
+        // it rather than keep it (mirrors `BatchedLinearBounds64::widen_to_infinities`).
+        self.lower_a_err = None;
+        self.upper_a_err = None;
         deadline.checkpoint("after finite sidecar widening")
     }
 
+    /// One fan-in accumulation pass over a coefficient or bias array.
+    ///
+    /// SOUNDNESS: `fl64(a + b)` is NOT the exact sum, and this is a merge point
+    /// where later contributions can cancel the large operand that caused the
+    /// rounding — so the absolute error survives on a coefficient whose final
+    /// magnitude is tiny, orders of magnitude above the storage gap that
+    /// `to_f32` pays. `two_sum` exposes that error EXACTLY as `residual`, and
+    /// this function never discards it:
+    ///
+    /// * a BIAS is nudged one f64 ulp outward when the residual says the exact
+    ///   sum lies outside the rounded one (down for lower, up for upper) — a
+    ///   bias shift is monotone in the certified direction, so this is sound;
+    /// * a COEFFICIENT keeps the rounded sum and reports `residual.abs()`
+    ///   through `roundoff`, because `min(c*l, c*u)` is concave in `c` and a
+    ///   nudge in either direction can RAISE a lower bound. The caller banks it
+    ///   into `lower_a_err`/`upper_a_err`, which the concretizer charges against
+    ///   `max(|in_l|,|in_u|)`.
+    ///
+    /// This is the same arithmetic as the no-deadline twin
+    /// (`BatchedLinearBounds64::accumulate_coeff_array` / `::accumulate_array`);
+    /// the deadline changes only WHEN the pass stops, never what it certifies.
     #[allow(clippy::too_many_arguments)]
     fn accumulate_array(
         existing: &mut ArrayD<f64>,
@@ -427,11 +547,17 @@ impl FiniteBatchedLinearBounds64 {
         affected: &[u8],
         columns: usize,
         coefficient: bool,
+        lower: bool,
         conservative_value: f64,
-        nan_fallback: f64,
+        mut roundoff: Option<&mut [f64]>,
         deadline: &mut PatchesMaterializationDeadline,
         stage: &'static str,
     ) -> Result<()> {
+        let nan_fallback = if lower {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
         for (index, (existing_value, &incoming_value)) in
             existing.iter_mut().zip(incoming.iter()).enumerate()
         {
@@ -439,17 +565,260 @@ impl FiniteBatchedLinearBounds64 {
             let contribution = if affected.get(row).copied().unwrap_or(1) != 0 {
                 conservative_value
             } else {
-                f64::from(incoming_value)
+                f32_to_f64_exact(incoming_value)
             };
-            let sum = *existing_value + contribution;
-            *existing_value = if existing_value.is_nan() || contribution.is_nan() || sum.is_nan() {
-                nan_fallback
+            // The roundoff buffer arrives zero-filled and every element is
+            // visited exactly once, so a branch that records nothing leaves the
+            // certified `0.0` in place.
+            if existing_value.is_nan() || contribution.is_nan() {
+                *existing_value = nan_fallback;
+                deadline.work(1, stage)?;
+                continue;
+            }
+            let (sum, residual) = two_sum(*existing_value, contribution);
+            if sum.is_nan() {
+                *existing_value = nan_fallback;
+            } else if !sum.is_finite() {
+                *existing_value = sum;
+            } else if coefficient {
+                *existing_value = sum;
+                if residual != 0.0 {
+                    if let Some(slot) = roundoff.as_mut().and_then(|values| values.get_mut(index)) {
+                        *slot = residual.abs();
+                    } else {
+                        // No buffer for this element: the exact residual cannot
+                        // be banked, so degrade the coefficient instead of
+                        // publishing an uncertified one.
+                        *existing_value = nan_fallback;
+                    }
+                }
+            } else if lower && residual < 0.0 {
+                *existing_value = next_down_f64(sum);
+            } else if !lower && residual > 0.0 {
+                *existing_value = next_up_f64(sum);
             } else {
-                sum
-            };
+                *existing_value = sum;
+            }
             deadline.work(1, stage)?;
         }
         deadline.checkpoint(stage)
+    }
+
+    /// One zero-filled f64 scratch buffer admitted through the sidecar
+    /// transaction, used for a single accumulation pass's exact residuals.
+    fn zeroed_f64_workspace(
+        len: usize,
+        admission: &mut BatchedSidecarAdmission,
+        deadline: &mut PatchesMaterializationDeadline,
+        stage: &'static str,
+    ) -> Result<Vec<f64>> {
+        let mut values = admission.empty_vec(len, deadline, stage)?;
+        for _ in 0..len {
+            values.push(0.0);
+            deadline.work(1, stage)?;
+        }
+        deadline.checkpoint(stage)?;
+        Ok(values)
+    }
+
+    /// Exact bit widening of a valid incoming absolute certificate. Zero
+    /// planes stay absent; every potential nonzero plane was prepaid by the
+    /// sidecar transaction's unconditional certificate workspace.
+    fn import_certificate(
+        error: Option<&ArrayD<f32>>,
+        coefficients: &ArrayD<f64>,
+        admission: &mut BatchedSidecarAdmission,
+        deadline: &mut PatchesMaterializationDeadline,
+        stage: &'static str,
+    ) -> Result<Option<ArrayD<f64>>> {
+        let Some(error) = error else {
+            deadline.checkpoint(stage)?;
+            return Ok(None);
+        };
+        let valid_shape = error.shape() == coefficients.shape();
+        let mut source = error.iter();
+        let mut values: Option<Vec<f64>> = None;
+        for index in 0..coefficients.len() {
+            let value = if valid_shape {
+                source
+                    .next()
+                    .copied()
+                    .map(nonnegative_f32_error_or_infinity)
+                    .unwrap_or(f64::INFINITY)
+            } else {
+                f64::INFINITY
+            };
+            if value != 0.0 {
+                if values.is_none() {
+                    values = Some(Self::zeroed_f64_workspace(
+                        coefficients.len(),
+                        admission,
+                        deadline,
+                        stage,
+                    )?);
+                }
+                values.as_mut().expect("allocated certificate")[index] = value;
+            }
+            deadline.work(1, stage)?;
+        }
+        deadline.checkpoint(stage)?;
+        values
+            .map(|values| {
+                ArrayD::from_shape_vec(coefficients.raw_dim(), values).map_err(|error| {
+                    NyError::InternalError(format!(
+                        "finite batched sidecar {stage} shape construction failed: {error}"
+                    ))
+                })
+            })
+            .transpose()
+    }
+
+    /// Fold one accumulation pass's exact `two_sum` residuals into the carried
+    /// coefficient certificate, allocating it on first use through the same
+    /// admission/deadline transaction as every other sidecar buffer.
+    ///
+    /// Incoming f32 absolute errors and exact fan-in residuals add, outward,
+    /// to the existing certificate. Invalid error shapes/magnitudes are
+    /// infinite uncertainty, never an absent certificate.
+    fn accumulate_err(
+        existing_err: &mut Option<ArrayD<f64>>,
+        roundoff: &[f64],
+        incoming: Option<&ArrayD<f32>>,
+        coefficients: &ArrayD<f64>,
+        admission: &mut BatchedSidecarAdmission,
+        deadline: &mut PatchesMaterializationDeadline,
+        stage: &'static str,
+    ) -> Result<()> {
+        let mut roundoff_has = false;
+        for &value in roundoff {
+            roundoff_has |= value != 0.0;
+            deadline.work(1, stage)?;
+        }
+        // compatible_with permits an authenticated contiguous flattening.
+        // coefficient_error_rows already checked the incoming certificate's
+        // authored shape; here its matching logical order/length is sufficient.
+        let incoming_valid = incoming.is_none_or(|error| error.len() == coefficients.len());
+        let mut incoming_has = !incoming_valid;
+        if let Some(error) = incoming {
+            for &value in error {
+                incoming_has |= nonnegative_f32_error_or_infinity(value) != 0.0;
+                deadline.work(1, stage)?;
+            }
+        }
+        if existing_err.is_none() && !roundoff_has && !incoming_has {
+            // Every stored coefficient is still the exact sum of its
+            // contributions; a certificate of zeros would say the same thing.
+            return deadline.checkpoint(stage);
+        }
+        // A carried certificate that no longer lines up with the coefficient
+        // array cannot be paired with it; fail outward to an infinite error.
+        let degraded = existing_err
+            .as_ref()
+            .is_some_and(|error| error.shape() != coefficients.shape());
+        if existing_err.is_none() || degraded {
+            let fill = if degraded { f64::INFINITY } else { 0.0 };
+            let mut values = admission.empty_vec(roundoff.len(), deadline, stage)?;
+            for _ in 0..roundoff.len() {
+                values.push(fill);
+                deadline.work(1, stage)?;
+            }
+            let array =
+                ArrayD::from_shape_vec(coefficients.raw_dim(), values).map_err(|error| {
+                    NyError::InternalError(format!(
+                        "finite batched sidecar {stage} shape construction failed: {error}"
+                    ))
+                })?;
+            *existing_err = Some(array);
+        }
+        if degraded {
+            return deadline.checkpoint(stage);
+        }
+        let Some(accumulator) = existing_err.as_mut() else {
+            return Err(NyError::InternalError(format!(
+                "finite batched sidecar {stage} lost its certificate allocation"
+            )));
+        };
+        let mut incoming_values = incoming.map(|error| error.iter());
+        for (value, &roundoff_value) in accumulator.iter_mut().zip(roundoff.iter()) {
+            *value = Self::add_nonnegative_f64_up(*value, roundoff_value);
+            let incoming_value = if !incoming_valid {
+                f64::INFINITY
+            } else if let Some(values) = incoming_values.as_mut() {
+                values
+                    .next()
+                    .copied()
+                    .map(nonnegative_f32_error_or_infinity)
+                    .unwrap_or(f64::INFINITY)
+            } else {
+                0.0
+            };
+            *value = Self::add_nonnegative_f64_up(*value, incoming_value);
+            deadline.work(1, stage)?;
+        }
+        deadline.checkpoint(stage)
+    }
+
+    /// Add non-negative error magnitudes with a certified UPWARD result. The
+    /// `two_sum` residual is exact: a positive residual means the rounded sum
+    /// sits below the true sum and needs one step up.
+    #[inline]
+    fn add_nonnegative_f64_up(a: f64, b: f64) -> f64 {
+        if !a.is_finite() || !b.is_finite() || a < 0.0 || b < 0.0 {
+            return f64::INFINITY;
+        }
+        let (sum, residual) = two_sum(a, b);
+        if !sum.is_finite() {
+            f64::INFINITY
+        } else if residual > 0.0 {
+            next_up_f64(sum)
+        } else {
+            sum
+        }
+    }
+
+    /// Round a non-negative f64 error magnitude UP into f32. Understating an
+    /// error is the one direction that can produce a wrong verdict, so a
+    /// non-finite or negative input becomes `f32::INFINITY` and the affected
+    /// row degrades to `[-inf, +inf]` at concretize.
+    #[inline]
+    fn err_to_f32(error: f64) -> f32 {
+        if !error.is_finite() || error < 0.0 {
+            return f32::INFINITY;
+        }
+        // The TwoSum/storage gap and incoming/carried arithmetic errors are
+        // already charged upward. This directed cast encloses that complete
+        // bound without repeatedly stepping an exact binary32 certificate.
+        f64_to_f32_up_no_subnormal(error)
+    }
+
+    /// Classify a carried certificate for reading. A certificate that cannot
+    /// be read as a contiguous slice of the expected length is `Unreadable`,
+    /// never `Exact`.
+    fn read_certificate(
+        error: Option<&ArrayD<f64>>,
+        expected_coefficients: usize,
+    ) -> CarriedCertificate<'_> {
+        match error {
+            None => CarriedCertificate::Exact,
+            Some(error) => match error.as_slice() {
+                Some(values) if values.len() == expected_coefficients => {
+                    CarriedCertificate::Values(values)
+                }
+                _ => CarriedCertificate::Unreadable,
+            },
+        }
+    }
+
+    /// Read one element of a carried certificate.
+    #[inline]
+    fn carried_error(source: CarriedCertificate<'_>, index: usize) -> f64 {
+        match source {
+            CarriedCertificate::Exact => 0.0,
+            CarriedCertificate::Unreadable => f64::INFINITY,
+            CarriedCertificate::Values(values) => {
+                values.get(index).copied().unwrap_or(f64::INFINITY)
+            }
+        }
     }
 
     fn accumulate(
@@ -459,6 +828,7 @@ impl FiniteBatchedLinearBounds64 {
         deadline: &mut PatchesMaterializationDeadline,
     ) -> Result<()> {
         deadline.checkpoint("before finite batched f64 accumulation")?;
+        Self::require_environment()?;
         if !self.compatible_with(incoming) {
             return self.widen_in_place(deadline);
         }
@@ -467,6 +837,7 @@ impl FiniteBatchedLinearBounds64 {
         let expected_coefficients = rows.saturating_mul(columns);
         let lower_affected = Self::coefficient_error_rows(
             incoming.lower_a_err.as_ref(),
+            incoming.lower_a().shape(),
             rows,
             columns,
             expected_coefficients,
@@ -476,6 +847,7 @@ impl FiniteBatchedLinearBounds64 {
         )?;
         let upper_affected = Self::coefficient_error_rows(
             incoming.upper_a_err.as_ref(),
+            incoming.upper_a().shape(),
             rows,
             columns,
             expected_coefficients,
@@ -483,14 +855,30 @@ impl FiniteBatchedLinearBounds64 {
             deadline,
             "during finite incoming upper certificate scan",
         )?;
+        // One zero-filled residual buffer per coefficient side, sized from the
+        // ACCUMULATOR's own arrays (the ones `accumulate_array` iterates), so
+        // every visited element has a slot to bank its exact `two_sum` residual.
+        let mut lower_roundoff = Self::zeroed_f64_workspace(
+            self.lower_a.len(),
+            admission,
+            deadline,
+            "during finite lower roundoff workspace",
+        )?;
+        let mut upper_roundoff = Self::zeroed_f64_workspace(
+            self.upper_a.len(),
+            admission,
+            deadline,
+            "during finite upper roundoff workspace",
+        )?;
         Self::accumulate_array(
             &mut self.lower_a,
             incoming.lower_a(),
             &lower_affected,
             columns,
             true,
+            true,
             0.0,
-            f64::NEG_INFINITY,
+            Some(lower_roundoff.as_mut_slice()),
             deadline,
             "during finite lower coefficient accumulation",
         )?;
@@ -500,8 +888,9 @@ impl FiniteBatchedLinearBounds64 {
             &lower_affected,
             columns,
             false,
+            true,
             f64::NEG_INFINITY,
-            f64::NEG_INFINITY,
+            None,
             deadline,
             "during finite lower bias accumulation",
         )?;
@@ -511,8 +900,9 @@ impl FiniteBatchedLinearBounds64 {
             &upper_affected,
             columns,
             true,
+            false,
             0.0,
-            f64::INFINITY,
+            Some(upper_roundoff.as_mut_slice()),
             deadline,
             "during finite upper coefficient accumulation",
         )?;
@@ -522,16 +912,57 @@ impl FiniteBatchedLinearBounds64 {
             &upper_affected,
             columns,
             false,
+            false,
             f64::INFINITY,
-            f64::INFINITY,
+            None,
             deadline,
             "during finite upper bias accumulation",
+        )?;
+        // Bank the residuals BEFORE the accumulator can be published. Dropping
+        // them here is exactly the defect this path used to carry: the merged
+        // coefficient would be republished as if `fl64(a + b)` were exact.
+        Self::accumulate_err(
+            &mut self.lower_a_err,
+            &lower_roundoff,
+            incoming.lower_a_err.as_ref(),
+            &self.lower_a,
+            admission,
+            deadline,
+            "during finite lower certificate accumulation",
+        )?;
+        Self::accumulate_err(
+            &mut self.upper_a_err,
+            &upper_roundoff,
+            incoming.upper_a_err.as_ref(),
+            &self.upper_a,
+            admission,
+            deadline,
+            "during finite upper certificate accumulation",
         )?;
         deadline.checkpoint("after finite batched f64 accumulation")
     }
 
     #[inline]
-    fn downcast_coefficient(value: f64, lower: bool) -> Option<f32> {
+    fn downcast_coefficient(value: f64) -> Option<f32> {
+        if !value.is_finite() {
+            return None;
+        }
+        let cast = value as f32;
+        if !cast.is_finite() {
+            return None;
+        }
+        // A signed coefficient is a center, never a directed bound. Zero
+        // flushable centers and pay their full original gap in the error plane.
+        Some(
+            if cast.to_bits() & 0x7f80_0000 == 0 && cast.to_bits() & 0x007f_ffff != 0 {
+                0.0
+            } else {
+                cast
+            },
+        )
+    }
+
+    fn downcast_bias(value: f64, lower: bool) -> Option<f32> {
         if !value.is_finite() {
             return None;
         }
@@ -546,12 +977,42 @@ impl FiniteBatchedLinearBounds64 {
         })
     }
 
+    fn cast_error(source: f64, stored: f32, carried: f64) -> f32 {
+        let (gap, residual) = two_sum(f32_to_f64_exact(stored), -source);
+        let gap = Self::add_nonnegative_f64_up(gap.abs(), residual.abs());
+        Self::err_to_f32(Self::add_nonnegative_f64_up(carried, gap))
+    }
+
+    fn store_error(
+        errors: &mut Option<Vec<f32>>,
+        index: usize,
+        len: usize,
+        value: f32,
+        admission: &mut BatchedSidecarAdmission,
+        deadline: &mut PatchesMaterializationDeadline,
+        stage: &'static str,
+    ) -> Result<()> {
+        if value != 0.0 {
+            if errors.is_none() {
+                let mut values = admission.empty_vec(len, deadline, stage)?;
+                for _ in 0..len {
+                    values.push(0.0);
+                    deadline.work(1, stage)?;
+                }
+                *errors = Some(values);
+            }
+            errors.as_mut().expect("allocated stored certificate")[index] = value;
+        }
+        deadline.work(1, stage)
+    }
+
     fn to_f32(
         &self,
         admission: &mut BatchedSidecarAdmission,
         deadline: &mut PatchesMaterializationDeadline,
     ) -> Result<BatchedLinearBounds> {
         deadline.checkpoint("before finite batched f64 downcast")?;
+        Self::require_environment()?;
         let columns = self.lower_a.shape().last().copied().unwrap_or(0);
         let rows = self.lower_b.len();
         let expected_coefficients = rows.saturating_mul(columns);
@@ -595,6 +1056,15 @@ impl FiniteBatchedLinearBounds64 {
             deadline,
             "before finite upper-bias downcast allocation",
         )?;
+        // Both potential stored error planes are prepaid, independently lazy.
+        // Even an exact fan-in sum can incur a storage gap; absence of a
+        // carried certificate must never suppress that gap's publication.
+        let lower_err_source =
+            Self::read_certificate(self.lower_a_err.as_ref(), expected_coefficients);
+        let upper_err_source =
+            Self::read_certificate(self.upper_a_err.as_ref(), expected_coefficients);
+        let mut lower_err = None;
+        let mut upper_err = None;
         for row in 0..rows {
             let offset = row.saturating_mul(columns);
             let lower_bias = lower_b_source.get(row).copied();
@@ -604,14 +1074,14 @@ impl FiniteBatchedLinearBounds64 {
                     if value == f64::NEG_INFINITY {
                         Some(f32::NEG_INFINITY)
                     } else {
-                        Self::downcast_coefficient(value, true)
+                        Self::downcast_bias(value, true)
                     }
                 })
                 .zip(upper_bias.and_then(|value| {
                     if value == f64::INFINITY {
                         Some(f32::INFINITY)
                     } else {
-                        Self::downcast_coefficient(value, false)
+                        Self::downcast_bias(value, false)
                     }
                 }));
             let mut row_valid = biases.is_some();
@@ -621,12 +1091,12 @@ impl FiniteBatchedLinearBounds64 {
                     row_valid &= lower_a_source
                         .get(index)
                         .copied()
-                        .and_then(|value| Self::downcast_coefficient(value, true))
+                        .and_then(Self::downcast_coefficient)
                         .is_some();
                     row_valid &= upper_a_source
                         .get(index)
                         .copied()
-                        .and_then(|value| Self::downcast_coefficient(value, false))
+                        .and_then(Self::downcast_coefficient)
                         .is_some();
                     deadline.work(2, "during finite f64 row validation")?;
                 }
@@ -635,28 +1105,69 @@ impl FiniteBatchedLinearBounds64 {
                 let (lower_bias, upper_bias) = biases.expect("row validity checked biases");
                 for column in 0..columns {
                     let index = offset + column;
-                    lower_a.push(
-                        Self::downcast_coefficient(
-                            lower_a_source.get(index).copied().unwrap_or(f64::NAN),
-                            true,
-                        )
-                        .expect("row validation checked lower coefficient"),
-                    );
-                    upper_a.push(
-                        Self::downcast_coefficient(
-                            upper_a_source.get(index).copied().unwrap_or(f64::NAN),
-                            false,
-                        )
-                        .expect("row validation checked upper coefficient"),
-                    );
+                    let source_lower = lower_a_source.get(index).copied().unwrap_or(f64::NAN);
+                    let source_upper = upper_a_source.get(index).copied().unwrap_or(f64::NAN);
+                    let stored_lower = Self::downcast_coefficient(source_lower)
+                        .expect("row validation checked lower coefficient");
+                    let stored_upper = Self::downcast_coefficient(source_upper)
+                        .expect("row validation checked upper coefficient");
+                    lower_a.push(stored_lower);
+                    upper_a.push(stored_upper);
+                    Self::store_error(
+                        &mut lower_err,
+                        index,
+                        expected_coefficients,
+                        Self::cast_error(
+                            source_lower,
+                            stored_lower,
+                            Self::carried_error(lower_err_source, index),
+                        ),
+                        admission,
+                        deadline,
+                        "during finite lower certificate publication",
+                    )?;
+                    Self::store_error(
+                        &mut upper_err,
+                        index,
+                        expected_coefficients,
+                        Self::cast_error(
+                            source_upper,
+                            stored_upper,
+                            Self::carried_error(upper_err_source, index),
+                        ),
+                        admission,
+                        deadline,
+                        "during finite upper certificate publication",
+                    )?;
                     deadline.work(2, "during finite f64 row publication")?;
                 }
                 lower_b.push(lower_bias);
                 upper_b.push(upper_bias);
             } else {
-                for _ in 0..columns {
+                for column in 0..columns {
                     lower_a.push(0.0);
                     upper_a.push(0.0);
+                    // The row is already vacuous through its -inf/+inf bias;
+                    // an INFINITE certificate keeps it that way if a consumer
+                    // ever reads the coefficients without the bias.
+                    Self::store_error(
+                        &mut lower_err,
+                        offset + column,
+                        expected_coefficients,
+                        f32::INFINITY,
+                        admission,
+                        deadline,
+                        "during finite conservative lower certificate publication",
+                    )?;
+                    Self::store_error(
+                        &mut upper_err,
+                        offset + column,
+                        expected_coefficients,
+                        f32::INFINITY,
+                        admission,
+                        deadline,
+                        "during finite conservative upper certificate publication",
+                    )?;
                     deadline.work(2, "during finite conservative row publication")?;
                 }
                 lower_b.push(f32::NEG_INFINITY);
@@ -677,6 +1188,22 @@ impl FiniteBatchedLinearBounds64 {
         let upper_b = ArrayD::from_shape_vec(self.upper_b.raw_dim(), upper_b).map_err(|error| {
             NyError::InternalError(format!("finite upper-bias downcast shape failed: {error}"))
         })?;
+        let lower_a_err = lower_err
+            .map(|values| ArrayD::from_shape_vec(self.lower_a.raw_dim(), values))
+            .transpose()
+            .map_err(|error| {
+                NyError::InternalError(format!(
+                    "finite lower certificate downcast shape failed: {error}"
+                ))
+            })?;
+        let upper_a_err = upper_err
+            .map(|values| ArrayD::from_shape_vec(self.upper_a.raw_dim(), values))
+            .transpose()
+            .map_err(|error| {
+                NyError::InternalError(format!(
+                    "finite upper certificate downcast shape failed: {error}"
+                ))
+            })?;
         let input_shape = Self::copy_usize_slice(
             &self.input_shape,
             admission,
@@ -697,8 +1224,8 @@ impl FiniteBatchedLinearBounds64 {
             upper_b,
             input_shape,
             output_shape,
-            lower_a_err: None,
-            upper_a_err: None,
+            lower_a_err,
+            upper_a_err,
         })
     }
 }
@@ -776,6 +1303,15 @@ impl BatchedCrownBounds {
             .saturating_add(bounds.upper_a().len())
             .saturating_add(bounds.upper_b().len())
             .saturating_mul(size_of::<f64>())
+            // Incoming errors and new fan-in residuals may each require both
+            // coefficient certificate planes, regardless of current presence.
+            .saturating_add(
+                bounds
+                    .lower_a()
+                    .len()
+                    .saturating_add(bounds.upper_a().len())
+                    .saturating_mul(size_of::<f64>()),
+            )
             .saturating_add(
                 bounds
                     .input_shape()
@@ -792,6 +1328,24 @@ impl BatchedCrownBounds {
             .saturating_mul(element_bytes)
     }
 
+    /// Worst-case f64 scratch one fan-in accumulation holds live: a residual
+    /// buffer per coefficient side plus the certificate each of them may have
+    /// to allocate. Charged unconditionally — the no-deadline twin allocates
+    /// the same four arrays inside `accumulate_coeff_array`/`accumulate_err`.
+    fn finite_accumulation_workspace_bytes(coefficient_elements: usize) -> usize {
+        coefficient_elements
+            .saturating_mul(4)
+            .saturating_mul(size_of::<f64>())
+    }
+
+    /// Promotion already prepays both f64 certificate planes as sidecar
+    /// capacity. Its remaining simultaneous workspace is two residual buffers.
+    fn finite_promotion_residual_bytes(coefficient_elements: usize) -> usize {
+        coefficient_elements
+            .saturating_mul(2)
+            .saturating_mul(size_of::<f64>())
+    }
+
     /// Receipt for the Patches -> f32 Dense -> f64 sidecar transaction. The
     /// structured source remains live until publication, as do the incoming
     /// contribution and staged f32 relation. A shape-mismatch accumulation may
@@ -802,7 +1356,7 @@ impl BatchedCrownBounds {
         incoming: &BatchedLinearBounds,
         rows: usize,
         columns: usize,
-        preserve_certificate: bool,
+        _preserve_certificate: bool,
     ) -> Result<BatchedSidecarAdmission> {
         let shape_bytes = 2usize.saturating_mul(size_of::<usize>());
         let staged_dense = Self::dense_storage_bytes(rows, columns, size_of::<f32>())
@@ -816,12 +1370,10 @@ impl BatchedCrownBounds {
             .saturating_add(shape_bytes);
         let staged_sidecar = Self::dense_storage_bytes(rows, columns, size_of::<f64>())
             .saturating_add(shape_bytes)
-            .saturating_add(if preserve_certificate {
+            .saturating_add({
                 rows.saturating_mul(columns)
                     .saturating_mul(2)
                     .saturating_mul(size_of::<f64>())
-            } else {
-                0
             });
         let certificate_rows = rows.saturating_mul(2).saturating_mul(size_of::<u8>());
         let required_bytes = patches
@@ -829,7 +1381,10 @@ impl BatchedCrownBounds {
             .saturating_add(Self::batched_dense_retained_bytes(incoming))
             .saturating_add(staged_dense)
             .saturating_add(staged_sidecar)
-            .saturating_add(certificate_rows);
+            .saturating_add(certificate_rows)
+            .saturating_add(Self::finite_promotion_residual_bytes(
+                rows.saturating_mul(columns),
+            ));
         BatchedSidecarAdmission::new(
             required_bytes,
             "BatchedCrownBounds Patches f64 sidecar staging",
@@ -851,7 +1406,10 @@ impl BatchedCrownBounds {
             .saturating_add(Self::batched_dense_retained_bytes(incoming))
             .saturating_add(if clone_existing { existing_bytes } else { 0 })
             .saturating_add(Self::f64_sidecar_bytes_for_dense(existing))
-            .saturating_add(certificate_rows);
+            .saturating_add(certificate_rows)
+            .saturating_add(Self::finite_promotion_residual_bytes(
+                existing.lower_a().len(),
+            ));
         BatchedSidecarAdmission::new(
             required_bytes,
             "BatchedCrownBounds Dense f64 sidecar staging",
@@ -871,7 +1429,10 @@ impl BatchedCrownBounds {
             .memory_bytes()
             .saturating_mul(2)
             .saturating_add(Self::batched_dense_retained_bytes(incoming))
-            .saturating_add(certificate_rows);
+            .saturating_add(certificate_rows)
+            .saturating_add(Self::finite_accumulation_workspace_bytes(
+                existing.lower_a.len(),
+            ));
         BatchedSidecarAdmission::new(
             required_bytes,
             "BatchedCrownBounds existing f64 sidecar staging",
@@ -881,8 +1442,26 @@ impl BatchedCrownBounds {
     fn finite_sidecar_downcast_admission(
         existing: &FiniteBatchedLinearBounds64,
     ) -> Result<BatchedSidecarAdmission> {
+        // The original f64 sidecar remains live. Price all four possible f32
+        // coefficient planes (two centers plus two errors) before any output
+        // allocation, even when the carried f64 certificate is absent.
+        let output_bytes = existing
+            .lower_a
+            .len()
+            .saturating_add(existing.upper_a.len())
+            .saturating_mul(2)
+            .saturating_add(existing.lower_b.len())
+            .saturating_add(existing.upper_b.len())
+            .saturating_mul(size_of::<f32>())
+            .saturating_add(
+                existing
+                    .input_shape
+                    .len()
+                    .saturating_add(existing.output_shape.len())
+                    .saturating_mul(size_of::<usize>()),
+            );
         BatchedSidecarAdmission::new(
-            existing.memory_bytes().saturating_mul(2),
+            existing.memory_bytes().saturating_add(output_bytes),
             "BatchedCrownBounds finite f64 sidecar downcast",
         )
     }
@@ -982,7 +1561,7 @@ impl BatchedCrownBounds {
         }
     }
 
-    /// Budget-checked conversion to Dense (#3550). Returns `CpuMemoryExceeded` if
+    /// Budget-checked conversion to Dense. Returns `CpuMemoryExceeded` if
     /// the Patches-to-Dense materialization would exceed the CPU dense budget.
     ///
     /// Dense variant passes through without a budget check (already materialized).
@@ -1021,7 +1600,7 @@ impl BatchedCrownBounds {
         self.into_batched_dense_with_deadline(deadline)
     }
 
-    /// Budget-checked in-place conversion to Dense (#3550).
+    /// Budget-checked in-place conversion to Dense.
     ///
     /// If already Dense, returns the inner reference directly.
     /// If Patches, checks budget before materializing.
@@ -1385,6 +1964,10 @@ impl BatchedCrownBounds {
 }
 
 #[cfg(test)]
+#[path = "patches_batched/finite_certificate_tests.rs"]
+mod finite_certificate_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use ndarray::{array, Array1, Array2, ArrayD, IxDyn};
@@ -1692,10 +2275,14 @@ mod tests {
         );
 
         let merged = bcb.into_batched_dense()?;
-        assert_eq!(merged.lower_a()[[0, 0, 0]], next_down_f32(1.0));
+        assert_eq!(merged.lower_a()[[0, 0, 0]], 1.0);
         assert_eq!(merged.lower_b()[[0, 0]], next_down_f32(1.0));
-        assert_eq!(merged.upper_a()[[0, 0, 0]], next_up_f32(1.0));
+        assert_eq!(merged.upper_a()[[0, 0, 0]], 1.0);
         assert_eq!(merged.upper_b()[[0, 0]], next_up_f32(1.0));
+        assert!(
+            !merged.has_coeff_err(),
+            "an exact representable fan-in sum needs no error plane"
+        );
         Ok(())
     }
 
@@ -1722,6 +2309,111 @@ mod tests {
         Ok(())
     }
 
+    /// The deadline changes only WHEN a merge stops, never WHAT it certifies.
+    ///
+    /// Counterexample: the cancelling fan-in `{2^60, 1, -2^60}`. `fl64(2^60 + 1)`
+    /// is `2^60` with an exact residual of `1.0`; the third contribution then
+    /// cancels the large operand and leaves a slot whose true value is `1.0`
+    /// carrying an absolute error of `1.0` — twenty-nine binades above the
+    /// single f32 ulp that the downcast widens by. Before the fix the
+    /// deadline-bearing arm published `upper_b ≈ 1.4e-45` and no coefficient
+    /// certificate for a slot whose exact sum is `1.0`, i.e. a bound TIGHTER
+    /// than the truth. The `{2^40, 1, -2^40}` triple used by
+    /// `test_batched_crown_bounds_merge_promotes_dense64_until_materialization_3904`
+    /// cannot show this: `2^40 + 1` is EXACT in f64, so every residual is zero
+    /// and both arms agree trivially.
+    #[test]
+    fn deadline_arm_never_certifies_tighter_than_no_deadline_arm() -> Result<()> {
+        crate::tests::with_env_edits(|_env| {
+            let big = (2.0_f32).powi(60);
+            assert_eq!(
+                big.to_bits(),
+                0x5D80_0000,
+                "the counterexample needs 2^60 exactly representable in f32"
+            );
+            // Every array of `scalar_batched_linear_bounds` holds the same
+            // value, so the exact sum of the three contributions is 1.0 in
+            // every coefficient and bias slot.
+            let contributions = [big, 1.0_f32, -big];
+            let exact = 1.0_f64;
+
+            let site = "test:deadline_arm_never_certifies_tighter_than_no_deadline_arm";
+            let mut legacy =
+                BatchedCrownBounds::Dense(scalar_batched_linear_bounds(contributions[0]));
+            let mut finite =
+                BatchedCrownBounds::Dense(scalar_batched_linear_bounds(contributions[0]));
+            let deadline = Some(Instant::now() + Duration::from_secs(30));
+            for &value in &contributions[1..] {
+                legacy.merge_dense_checked(scalar_batched_linear_bounds(value), site)?;
+                finite.merge_dense_checked_with_deadline(
+                    scalar_batched_linear_bounds(value),
+                    site,
+                    deadline,
+                )?;
+            }
+            assert!(
+                matches!(&finite, BatchedCrownBounds::FiniteDense64(_)),
+                "the deadline arm must be the pollable finite carrier"
+            );
+            let legacy = legacy.into_batched_dense()?;
+            let finite = finite.into_batched_dense_checked_with_deadline(site, deadline)?;
+
+            fn certificate(bounds: &BatchedLinearBounds, lower: bool) -> f64 {
+                let error = if lower {
+                    bounds.lower_a_err.as_ref()
+                } else {
+                    bounds.upper_a_err.as_ref()
+                };
+                error.map_or(0.0, |values| f64::from(values[[0, 0, 0]]))
+            }
+
+            let finite_lower = f64::from(finite.lower_a()[[0, 0, 0]]) - certificate(&finite, true);
+            let finite_upper = f64::from(finite.upper_a()[[0, 0, 0]]) + certificate(&finite, false);
+            let legacy_lower = f64::from(legacy.lower_a()[[0, 0, 0]]) - certificate(&legacy, true);
+            let legacy_upper = f64::from(legacy.upper_a()[[0, 0, 0]]) + certificate(&legacy, false);
+
+            // 1. The deadline arm must ENCLOSE the exact fan-in sum.
+            assert!(
+                finite_lower <= exact,
+                "deadline-arm lower coefficient certificate excludes the exact sum: \
+                 {finite_lower} > {exact}"
+            );
+            assert!(
+                finite_upper >= exact,
+                "deadline-arm upper coefficient certificate excludes the exact sum: \
+                 {finite_upper} < {exact}"
+            );
+            assert!(
+                f64::from(finite.lower_b()[[0, 0]]) <= exact,
+                "deadline-arm lower bias is above the exact sum"
+            );
+            assert!(
+                f64::from(finite.upper_b()[[0, 0]]) >= exact,
+                "deadline-arm upper bias is below the exact sum: {} < {exact}",
+                finite.upper_b()[[0, 0]]
+            );
+
+            // 2. ...and it must never be TIGHTER than its no-deadline twin.
+            assert!(
+                finite_lower <= legacy_lower,
+                "deadline arm certifies a tighter lower coefficient than the no-deadline arm"
+            );
+            assert!(
+                finite_upper >= legacy_upper,
+                "deadline arm certifies a tighter upper coefficient than the no-deadline arm"
+            );
+            assert!(
+                finite.lower_b()[[0, 0]] <= legacy.lower_b()[[0, 0]],
+                "deadline arm certifies a tighter lower bias than the no-deadline arm"
+            );
+            assert!(
+                finite.upper_b()[[0, 0]] >= legacy.upper_b()[[0, 0]],
+                "deadline arm certifies a tighter upper bias than the no-deadline arm"
+            );
+            Ok(())
+        })
+    }
+
     #[test]
     fn finite_f64_merge_never_drops_coefficient_error() -> Result<()> {
         crate::tests::with_env_edits(|_env| {
@@ -1743,9 +2435,166 @@ mod tests {
                 deadline,
             )?;
 
-            assert_eq!(merged.lower_b()[[0, 0]], f32::NEG_INFINITY);
-            assert_eq!(merged.upper_b()[[0, 0]], f32::INFINITY);
-            assert!(!merged.has_coeff_err());
+            assert!(merged.lower_b()[[0, 0]].is_finite());
+            assert!(merged.upper_b()[[0, 0]].is_finite());
+            assert!(merged.has_coeff_err());
+            assert!(merged.lower_a_err.as_ref().unwrap()[[0, 0, 0]] >= 0.25);
+            assert!(merged.upper_a_err.as_ref().unwrap()[[0, 0, 0]] >= 0.5);
+            Ok(())
+        })
+    }
+
+    /// eng9b review: exact vertex enumeration of the fan-in accumulator's
+    /// published f32 carrier, on BOTH carriers (finite `Some(deadline)` and the
+    /// legacy `None` sidecar).
+    ///
+    /// Every case is an EXACT f64 sum with no `two_sum` residual, so the
+    /// fan-in itself banks no coefficient error:
+    /// - `0.5*x + 0.5*x = 1*x` on both sides: the sum is an f32. It must be
+    ///   published exactly, with no error plane.
+    /// - `1*x + 2^-30*x` on both sides: the sum is not an f32. Its nearest-f32
+    ///   cast gap must be paid through the error plane.
+    /// - one side exact and the other inexact, both ways round: the plane
+    ///   decision must scan BOTH sides. A scan of only one side publishes the
+    ///   other side's nearest-f32 coefficient with no plane (the eng9b
+    ///   review's plant PL1 removed the upper scan on all three carriers and
+    ///   passed every symmetric case). The biases (`-2^-31` per lower term,
+    ///   `+2^-31` per upper term) keep each relation a lower/upper pair on the
+    ///   box, and their directed step is far below the `2^-30` coefficient gap.
+    ///
+    /// Until 2026-10-03 both downcasts nudged every coefficient one f32 ulp
+    /// outward (lower `next_down`, upper `next_up`) and allocated an error
+    /// plane only when a fan-in residual had been banked. The struct docs
+    /// above say why a nudge is not a certificate: `min(c*l, c*u)` is concave
+    /// in `c`. On `x in [-1, 1]` the published lower bound of the first case
+    /// at `x = -1` was `-1 + 2^-24 - 2^-149 > -1`, above the exact merged
+    /// objective. A linear-versus-linear gap is extremal at a box vertex, so
+    /// enumerating both vertices in exact rational arithmetic is complete.
+    ///
+    /// The same defect sat in the non-batched `CrownMergeAccumulator`
+    /// downcast; its twin is
+    /// `test_crown_merge_accumulator_fan_in_downcast_vertex_enumeration`.
+    #[test]
+    fn eng9b_fan_in_downcast_charges_its_coefficient_nudge_vertex_enumeration() -> Result<()> {
+        crate::tests::with_env_edits(|_env| {
+            use num_rational::BigRational;
+            // One contribution's (coefficient, bias) on one side.
+            type Term = (f32, f32);
+            let scalar = |lower: Term, upper: Term| {
+                BatchedLinearBounds::from_parts_unchecked(
+                    ArrayD::from_elem(IxDyn(&[1, 1]), lower.0),
+                    ArrayD::from_elem(IxDyn(&[1]), lower.1),
+                    ArrayD::from_elem(IxDyn(&[1, 1]), upper.0),
+                    ArrayD::from_elem(IxDyn(&[1]), upper.1),
+                    vec![1],
+                    vec![1],
+                )
+            };
+            let q = |v: f32| BigRational::from_float(f64::from(v)).expect("finite f32");
+            let tiny = 2.0_f32.powi(-30);
+            let h = 2.0_f32.powi(-31);
+            // (case, lower terms, upper terms, lower representable, upper representable)
+            let cases: [(&str, [Term; 2], [Term; 2], bool, bool); 4] = [
+                ("exact", [(0.5, 0.0); 2], [(0.5, 0.0); 2], true, true),
+                (
+                    "inexact",
+                    [(1.0, 0.0), (tiny, 0.0)],
+                    [(1.0, 0.0), (tiny, 0.0)],
+                    false,
+                    false,
+                ),
+                (
+                    "lower-exact/upper-inexact",
+                    [(0.5, -h); 2],
+                    [(1.0, h), (tiny, h)],
+                    true,
+                    false,
+                ),
+                (
+                    "lower-inexact/upper-exact",
+                    [(1.0, -h), (tiny, -h)],
+                    [(0.5, h); 2],
+                    false,
+                    true,
+                ),
+            ];
+            let mut violations = Vec::new();
+            for (case, lower_terms, upper_terms, lower_repr, upper_repr) in cases {
+                // Exact merged objective of one side: (coefficient, bias).
+                let side = |terms: [Term; 2], repr: bool, name: &str| {
+                    let coefficient = q(terms[0].0) + q(terms[1].0);
+                    let sum64 = f64::from(terms[0].0) + f64::from(terms[1].0);
+                    assert!(
+                        BigRational::from_float(sum64).is_some_and(|sum| sum == coefficient),
+                        "fixture premise for {case}/{name}: the f64 fan-in sum is exact"
+                    );
+                    assert_eq!(
+                        repr,
+                        f64::from(sum64 as f32) == sum64,
+                        "fixture premise for {case}/{name}: f32 representability"
+                    );
+                    (coefficient, q(terms[0].1) + q(terms[1].1))
+                };
+                let (lower_c, lower_b) = side(lower_terms, lower_repr, "lower");
+                let (upper_c, upper_b) = side(upper_terms, upper_repr, "upper");
+                for (carrier_name, deadline) in [
+                    ("finite", Some(Instant::now() + Duration::from_secs(30))),
+                    ("legacy", None),
+                ] {
+                    let mut carrier =
+                        BatchedCrownBounds::Dense(scalar(lower_terms[0], upper_terms[0]));
+                    carrier.merge_dense_checked_with_deadline(
+                        scalar(lower_terms[1], upper_terms[1]),
+                        "test:eng9b_fan_in_downcast_vertex_enumeration",
+                        deadline,
+                    )?;
+                    let published = carrier.into_batched_dense_with_deadline(deadline)?;
+                    if lower_repr && upper_repr && published.has_coeff_err() {
+                        violations.push(format!(
+                            "{case}/{carrier_name}: an exact, representable sum allocated an error plane"
+                        ));
+                    }
+                    // Lower and upper uncertainty are independently lazy. An
+                    // exact side remains absent even when its opposite side needs
+                    // a cast certificate (PL1 and its mirror).
+                    assert_eq!(
+                        published.lower_a_err.is_some(),
+                        !lower_repr,
+                        "{case}/{carrier_name}: lower plane tracks its actual cast gap"
+                    );
+                    assert_eq!(
+                        published.upper_a_err.is_some(),
+                        !upper_repr,
+                        "{case}/{carrier_name}: upper plane tracks its actual cast gap"
+                    );
+                    let only = |a: &ArrayD<f32>| a.iter().copied().next().expect("one entry");
+                    let (c_lo, c_up) = (only(published.lower_a()), only(published.upper_a()));
+                    let (b_lo, b_up) = (only(published.lower_b()), only(published.upper_b()));
+                    let e_lo = published.lower_a_err.as_ref().map_or(0.0, only);
+                    let e_up = published.upper_a_err.as_ref().map_or(0.0, only);
+                    for x in [-1.0_f32, 1.0] {
+                        let exact_lower = lower_c.clone() * q(x) + lower_b.clone();
+                        let exact_upper = upper_c.clone() * q(x) + upper_b.clone();
+                        let abs_x = q(x.abs());
+                        let lower = q(c_lo) * q(x) + q(b_lo) - q(e_lo) * abs_x.clone();
+                        let upper = q(c_up) * q(x) + q(b_up) + q(e_up) * abs_x;
+                        if lower > exact_lower {
+                            violations.push(format!(
+                                "{case}/{carrier_name}: lower {c_lo:e}*x{b_lo:+e} (err {e_lo:e}) exceeds the exact sum at x={x}"
+                            ));
+                        }
+                        if upper < exact_upper {
+                            violations.push(format!(
+                                "{case}/{carrier_name}: upper {c_up:e}*x{b_up:+e} (err {e_up:e}) falls below the exact sum at x={x}"
+                            ));
+                        }
+                    }
+                }
+            }
+            assert!(
+                violations.is_empty(),
+                "fan-in carrier publishes an uncertified coefficient: {violations:?}"
+            );
             Ok(())
         })
     }

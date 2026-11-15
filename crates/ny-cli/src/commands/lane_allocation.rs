@@ -93,13 +93,21 @@
 //! `deferred_pgd_consumer_available && postbab_escalation_allowed(..)`. The
 //! verdict is `timeout` with no terminal ingress, so the second conjunct holds;
 //! the first is
-//! `route.attack_enabled() && margin_row_memory_allowed && !safenlp_direct_mip_first`,
-//! and `margin_row_memory_allowed` is `optional_heavy_memory_allowed_now()`.
-//! On a NON-LINUX host `ny_propagate::network::crown_memory::process_memory_envelope`
-//! returns `ProcessMemoryEnvelope::Unavailable` by construction, and
-//! `Unavailable` maps to `false`. So on the development host the post-BaB
-//! attack lane, the concurrent margin-row lane and BOTH their reserves are
-//! suppressed together, and the tail cannot be claimed by anything.
+//! `route.attack_enabled() && margin_row_memory_allowed` (the third conjunct
+//! it carried then, `!safenlp_direct_mip_first`, went with that env-dark,
+//! category-keyed route in #name-blind-routing), and
+//! `margin_row_memory_allowed` is `optional_heavy_memory_allowed_now()`.
+//! When this was measured (pre #darwin-memory-envelope),
+//! `ny_propagate::network::crown_memory::process_memory_envelope` returned
+//! `ProcessMemoryEnvelope::Unavailable` on every non-Linux host BY
+//! CONSTRUCTION, and `Unavailable` maps to `false`. So on the development host
+//! the post-BaB attack lane, the concurrent margin-row lane and BOTH their
+//! reserves were suppressed together, and the tail could not be claimed by
+//! anything. Since #darwin-memory-envelope, macOS derives a real `Bounded`
+//! envelope (`hw.memsize` − `phys_footprint`, narrowed by any finite
+//! `RLIMIT_AS`), so that suppression now occurs only where the gate's
+//! semantics genuinely demand it: an unobservable envelope, or live headroom
+//! under the 16 GiB admission boundary.
 //!
 //! That is a live-memory admission boundary for graph-heavy optional tails,
 //! reached identically at every cap this module could choose, so no allocation
@@ -154,23 +162,18 @@ pub(crate) fn lane_budget_allocator_armed_from(raw: Option<&str>) -> bool {
 
 /// Whether Layer A may plan this instance at all.
 ///
-/// Three conditions, all of which must hold, expressed as one pure predicate so
+/// Two conditions, both of which must hold, expressed as one pure predicate so
 /// the composition rule is testable rather than spread across an `if`:
 ///
 /// * `armed` — the lever. Dark by default, so this is `false` on every scored
-///   run and the other two are never even consulted.
+///   run and the other is never even consulted.
 /// * `!scheduler_armed` — `#lane-value-scheduler` owns the two BNN lanes in
 ///   flight when it is armed. Exactly one mechanism may hold a lane's cap.
-/// * `!traffic_terminal_softmax_peel` — that route REWRITES the objective the
-///   upfront lane steers on, so the in-box probe would be measuring a function
-///   that lane is not using, and a structural zero drawn from it would be a
-///   category error rather than a fact.
-pub(crate) const fn allocator_admitted(
-    armed: bool,
-    scheduler_armed: bool,
-    traffic_terminal_softmax_peel: bool,
-) -> bool {
-    armed && !scheduler_armed && !traffic_terminal_softmax_peel
+///
+/// (A third, `!traffic_terminal_softmax_peel`, went with that category-keyed,
+/// env-dark route in #name-blind-routing.)
+pub(crate) const fn allocator_admitted(armed: bool, scheduler_armed: bool) -> bool {
+    armed && !scheduler_armed
 }
 
 // ---------------------------------------------------------------------------
@@ -576,10 +579,10 @@ where
 ///   are different functions, and the surrogate is smooth exactly where the
 ///   probed one is piecewise constant. This module already refuses this
 ///   category error twice — the two BNN lanes are exempt because they steer on
-///   the pre-Softmax integer logit margin, and the whole allocator stands down
-///   under the traffic terminal-Softmax peel because that route rewrites the
-///   upfront lane's objective ([`allocator_admitted`]). A `Sign` net is the
-///   same error a third time, and it was the one being made.
+///   the pre-Softmax integer logit margin, and the whole allocator used to stand
+///   down under the (since removed) traffic terminal-Softmax peel because that
+///   route rewrote the upfront lane's objective. A `Sign` net is the same error
+///   a third time, and it was the one being made.
 ///
 /// * **And the FLAT verdict is refuted in the box it was taken in.** Measured,
 ///   `traffic_signs_recognition_2023 model_30_idx_6371_eps_{3,5,10,15}` and
@@ -875,17 +878,12 @@ pub(crate) const fn upfront_sign_net_rule(
 ///   which is a strict superset of what the frame does.
 /// * `!scheduler_armed` — `#lane-value-scheduler` owns the two BNN lanes in
 ///   flight.
-/// * `!traffic_terminal_softmax_peel` — that route rewrites the upfront lane's
-///   objective; the frame does not read the objective, but it does hand that
-///   lane a committed cap, and the peel route is where the existing wiring
-///   declines to touch it.
 pub(crate) const fn frame_admitted(
     armed: bool,
     allocator_armed: bool,
     scheduler_armed: bool,
-    traffic_terminal_softmax_peel: bool,
 ) -> bool {
-    armed && !allocator_armed && !scheduler_armed && !traffic_terminal_softmax_peel
+    armed && !allocator_armed && !scheduler_armed
 }
 
 /// Whether the fixed attack-slice frame is admitted.

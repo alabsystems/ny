@@ -546,7 +546,7 @@ def main() -> int:
 
     if not NY_BIN.is_file():
         print(f"FAIL: ny binary is missing: {NY_BIN}")
-        print("Build with: cargo build --release -p ny-cli")
+        print("Build with: targo --unverified build --release -p ny-cli")
         return 1
 
     for name, comparison in comparisons:

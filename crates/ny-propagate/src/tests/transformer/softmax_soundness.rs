@@ -7,16 +7,18 @@
 //! Covers: IBP numerical edge cases (overflow, underflow, NaN, near-uniform,
 //! extreme outlier, mixed sign), CROWN backward via `propagate_crown_backward`,
 //! batched soundness-mode dispatch, and bounds.rs non-finite sanitization.
-//!
-//! Part of #1950.
 
 use super::prelude::*;
 use ny_core::VerificationSoundnessMode;
 
 /// Verified bound-check tolerance for softmax CROWN vertex assertions.
 const SOFTMAX_CROWN_VERTEX_TOLERANCE: f32 = 5e-4;
-/// Minimum observed margin floor (si-lb and ub-si) on the 3-element audit case.
-const SOFTMAX_CROWN_MARGIN_FLOOR: f32 = 1e-3;
+/// Binary64 evaluation slack for the 3-element margin audit. The affine side
+/// is three exact binary32 products plus four binary64 additions of
+/// magnitudes below 8 (error < 4 * 8 * 2^-53 < 4e-15); the softmax side is
+/// three `exp`, a sum and a division of values in (0, 1] (error < 1e-15). A
+/// computed margin above this slack is a positive exact margin.
+const SOFTMAX_CROWN_EXACT_EVAL_SLACK: f64 = 1e-13;
 
 // ============================================================================
 // Helpers
@@ -265,7 +267,7 @@ fn test_softmax_batched_explicit_soundness_matches_layer_sound_mode() {
 }
 
 // ============================================================================
-// 2. Numerical edge cases for IBP — issue #1950 checklist
+// 2. Numerical edge cases for IBP
 // ============================================================================
 
 /// Near-uniform inputs: all elements close, bounds should be tight around 1/n.
@@ -574,7 +576,32 @@ fn test_softmax_crown_backward_sound_3elem() {
     }
 }
 
-/// Audit the minimum soundness margins on the 3-element CROWN backward case.
+/// Binary64 softmax.
+fn reference_softmax_f64(x: &[f64]) -> Vec<f64> {
+    let max = x.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let exps: Vec<f64> = x.iter().map(|&v| (v - max).exp()).collect();
+    let sum: f64 = exps.iter().sum();
+    exps.iter().map(|&e| e / sum).collect()
+}
+
+/// Audit the minimum soundness margins on the 3-element CROWN backward case,
+/// in binary64, at every vertex and on a 9x9x9 grid of the logit box.
+///
+/// Both rows (with their coefficient-error planes) must stay strictly on
+/// their side of softmax by more than the binary64 evaluation slack, i.e.
+/// with a positive exact margin.
+///
+/// This replaces a floor of 1e-3 on binary32-evaluated margins, which
+/// recorded how loose the relaxation of its day was, not a soundness
+/// property. The checked softmax of f99ca7c72 answers this box with output
+/// 0's exact minimum over the box, `1/(1+e^2+e^3) = 0.0351190269593...` at
+/// the vertex [0, 2, 3], rounded down to the binary32 0.0351190231740...: a
+/// margin of 3.785e-9. That is the second binary32 below the exact value
+/// (the first, 0.0351190268993..., leaves 6.0e-11), so no sound binary32
+/// row can be more than one ulp tighter, and a 1e-3 floor would demand a
+/// looser one. The binary32 audit read that margin as 3.7e-9 after rounding
+/// the softmax value itself to binary32, a rounding as large as the margin,
+/// so it could not have told a touching row from a violating one.
 #[ntest::timeout(10000)]
 #[test]
 fn test_softmax_crown_backward_margin_audit() {
@@ -590,41 +617,92 @@ fn test_softmax_crown_backward_margin_audit() {
 
     let lower = [0.0_f32, 1.0, 2.0];
     let upper = [1.0_f32, 2.0, 3.0];
-
-    let mut min_lower_margin = f32::INFINITY;
-    let mut min_upper_margin = f32::INFINITY;
+    let mut points: Vec<[f32; 3]> = Vec::new();
     for mask in 0..8u32 {
-        let x: Vec<f32> = (0..3)
-            .map(|i| {
-                if (mask >> i) & 1 == 0 {
-                    lower[i]
-                } else {
-                    upper[i]
-                }
-            })
-            .collect();
-        let s = reference_softmax(&x);
-        for (i, &si) in s.iter().enumerate() {
-            let lb: f32 =
-                (0..3).map(|j| result.lower_a[[i, j]] * x[j]).sum::<f32>() + result.lower_b[i];
-            let ub: f32 =
-                (0..3).map(|j| result.upper_a[[i, j]] * x[j]).sum::<f32>() + result.upper_b[i];
-            min_lower_margin = min_lower_margin.min(si - lb);
-            min_upper_margin = min_upper_margin.min(ub - si);
+        points.push(std::array::from_fn(|i| {
+            if (mask >> i) & 1 == 0 {
+                lower[i]
+            } else {
+                upper[i]
+            }
+        }));
+    }
+    const STEPS: u32 = 8;
+    for a in 0..=STEPS {
+        for b in 0..=STEPS {
+            for c in 0..=STEPS {
+                let t = [a, b, c];
+                points.push(std::array::from_fn(|i| {
+                    lower[i] + (upper[i] - lower[i]) * t[i] as f32 / STEPS as f32
+                }));
+            }
         }
     }
 
+    let mut min_lower_margin = f64::INFINITY;
+    let mut min_upper_margin = f64::INFINITY;
+    let mut min_lower_at = (0, [0.0_f32; 3]);
+    let mut min_upper_at = (0, [0.0_f32; 3]);
+    for x in &points {
+        let x64: Vec<f64> = x.iter().map(|&v| f64::from(v)).collect();
+        let s = reference_softmax_f64(&x64);
+        for (i, &si) in s.iter().enumerate() {
+            // A coefficient-error plane widens each row by sum_j err_j |x_j|.
+            let err = |plane: &Option<Array2<f32>>| {
+                plane.as_ref().map_or(0.0, |e| {
+                    (0..3)
+                        .map(|j| f64::from(e[[i, j]]) * x64[j].abs())
+                        .sum::<f64>()
+                })
+            };
+            let lb = (0..3)
+                .map(|j| f64::from(result.lower_a[[i, j]]) * x64[j])
+                .sum::<f64>()
+                + f64::from(result.lower_b[i])
+                - err(&result.lower_a_err);
+            let ub = (0..3)
+                .map(|j| f64::from(result.upper_a[[i, j]]) * x64[j])
+                .sum::<f64>()
+                + f64::from(result.upper_b[i])
+                + err(&result.upper_a_err);
+            if si - lb < min_lower_margin {
+                min_lower_margin = si - lb;
+                min_lower_at = (i, *x);
+            }
+            if ub - si < min_upper_margin {
+                min_upper_margin = ub - si;
+                min_upper_at = (i, *x);
+            }
+        }
+    }
+    eprintln!(
+        "softmax CROWN margin audit (binary64, {} points): min lower margin {min_lower_margin:e} \
+         at output {} x={:?}; min upper margin {min_upper_margin:e} at output {} x={:?}; \
+         lower_a={:?} lower_b={:?} upper_a={:?} upper_b={:?} error planes: lower {} upper {}",
+        points.len(),
+        min_lower_at.0,
+        min_lower_at.1,
+        min_upper_at.0,
+        min_upper_at.1,
+        result.lower_a.as_slice(),
+        result.lower_b.as_slice(),
+        result.upper_a.as_slice(),
+        result.upper_b.as_slice(),
+        result.lower_a_err.is_some(),
+        result.upper_a_err.is_some()
+    );
+
     assert!(
-        min_lower_margin > SOFTMAX_CROWN_MARGIN_FLOOR,
-        "Lower margin floor violated: min_lower_margin={} <= {}",
-        min_lower_margin,
-        SOFTMAX_CROWN_MARGIN_FLOOR
+        min_lower_margin > SOFTMAX_CROWN_EXACT_EVAL_SLACK,
+        "Lower margin not certified positive: min_lower_margin={min_lower_margin:e} at output {} x={:?}",
+        min_lower_at.0,
+        min_lower_at.1
     );
     assert!(
-        min_upper_margin > SOFTMAX_CROWN_MARGIN_FLOOR,
-        "Upper margin floor violated: min_upper_margin={} <= {}",
-        min_upper_margin,
-        SOFTMAX_CROWN_MARGIN_FLOOR
+        min_upper_margin > SOFTMAX_CROWN_EXACT_EVAL_SLACK,
+        "Upper margin not certified positive: min_upper_margin={min_upper_margin:e} at output {} x={:?}",
+        min_upper_at.0,
+        min_upper_at.1
     );
 }
 
@@ -737,7 +815,7 @@ fn test_softmax_crown_backward_large_a_matrix_stable() {
 // ============================================================================
 
 /// Check IBP tightness for reasonable input ranges.
-/// Issue #1950 requires: ratio of (IBP width) / (true range) ≤ 10x.
+/// Requirement: ratio of (IBP width) / (true range) ≤ 10x.
 #[ntest::timeout(10000)]
 #[test]
 fn test_softmax_ibp_tightness_ratio() {

@@ -11,6 +11,44 @@ use ny_core::{GemmEngine, NyError, Result};
 use ny_tensor::BoundedTensor;
 use tracing::debug;
 
+/// The interval forward step shared by collection and checkpoint recomputation.
+///
+/// Convolution and AveragePool need their own accumulation certificates: an
+/// extra ULP of a canceled result cannot replace the missing magnitude-based
+/// error charge. Linear already certifies its plain IBP result. Retain the
+/// streaming driver's additional outward margin on every route, including
+/// recomputation, so checkpoint spacing cannot change that numerical policy.
+/// This margin is additional slack, not an independent proof of the layer's
+/// enclosure or of all generic layer implementations.
+pub(super) fn streaming_forward_step(
+    layer: &Layer,
+    input: &BoundedTensor,
+    layer_index: usize,
+) -> Result<BoundedTensor> {
+    let result = match layer {
+        Layer::Conv1d(conv) => conv.propagate_ibp_sound_with_engine(input, None),
+        Layer::Conv2d(conv) => conv.propagate_ibp_sound_with_engine(input, None),
+        Layer::Conv3d(conv) => conv.propagate_ibp_sound_with_engine(input, None),
+        Layer::ConvTranspose1d(conv) => conv.propagate_ibp_sound_with_engine(input, None),
+        Layer::ConvTranspose2d(conv) => conv.propagate_ibp_sound_with_engine(input, None),
+        Layer::AveragePool(pool) => pool.propagate_ibp_sound(input),
+        _ => layer.propagate_ibp(input),
+    };
+    let mut output = result.map_err(|source| NyError::LayerError {
+        layer_index,
+        layer_type: layer.layer_type().to_string(),
+        source: Box::new(source),
+    })?;
+    let rounding_ulps = match layer {
+        Layer::Linear(linear) => u32::try_from(linear.in_features())
+            .unwrap_or(u32::MAX)
+            .saturating_add(2),
+        _ => 1,
+    };
+    output.round_for_soundness_n_ulps_inplace(rounding_ulps);
+    Ok(output)
+}
+
 /// Streaming verifier that uses gradient checkpointing for memory efficiency.
 pub struct StreamingVerifier {
     config: StreamingConfig,
@@ -29,6 +67,7 @@ impl StreamingVerifier {
         network: &Network,
         input: &BoundedTensor,
     ) -> Result<CheckpointedBounds> {
+        network.ensure_proof_eligible()?;
         let num_layers = network.layers.len();
 
         // Create checkpointed storage with appropriate storage mode
@@ -50,35 +89,7 @@ impl StreamingVerifier {
         let interval = self.config.checkpoint_interval.max(1);
 
         for (i, layer) in network.layers.iter().enumerate() {
-            current = layer
-                .propagate_ibp(&current)
-                .map_err(|e| NyError::LayerError {
-                    layer_index: i,
-                    layer_type: layer.layer_type().to_string(),
-                    source: Box::new(e),
-                })?;
-
-            // Certified per-node float-rounding widening, matching the graph
-            // IBP driver's sound path (`network/graph_ibp.rs`): Linear gets
-            // `in_features + 2` ULPs (Higham Thm 3.1 over the two matmuls, the
-            // combine and the bias), every other layer 1 ULP on top of its own
-            // enclosure.
-            //
-            // Applied UNCONDITIONALLY here, unlike the graph driver's `sound`
-            // flag, because a streamed box feeds `tighten_crown_output`: an
-            // un-widened forward box could tighten a sound CROWN result below
-            // the certified graph answer, i.e. the streamed bound would be
-            // narrower than the true enclosure. The cost is ULP-scale and the
-            // alternative is a silently weaker guarantee on the path whose
-            // whole purpose is verifying models too large for the graph
-            // driver.
-            let rounding_ulps = match layer {
-                Layer::Linear(linear) => u32::try_from(linear.in_features())
-                    .unwrap_or(u32::MAX)
-                    .saturating_add(2),
-                _ => 1,
-            };
-            current.round_for_soundness_n_ulps_inplace(rounding_ulps);
+            current = streaming_forward_step(layer, &current, i)?;
 
             // Store checkpoint at intervals and always at the last layer
             if (i + 1) % interval == 0 || i == num_layers - 1 {
@@ -123,7 +134,7 @@ impl StreamingVerifier {
     /// Memory: O(L/K * N) instead of O(L * N).
     /// Compute: O(L * K) instead of O(L).
     ///
-    /// Uses `concretize_sound()` for directed rounding (#2239).
+    /// Uses `concretize_sound()` for directed rounding.
     pub fn propagate_crown_streaming(
         &self,
         network: &Network,
@@ -132,7 +143,7 @@ impl StreamingVerifier {
         self.streaming_crown_backward(network, input, None)
     }
 
-    /// Propagate CROWN with gradient checkpointing and GPU engine (#3598).
+    /// Propagate CROWN with gradient checkpointing and GPU engine.
     pub fn propagate_crown_streaming_with_engine(
         &self,
         network: &Network,
@@ -144,7 +155,7 @@ impl StreamingVerifier {
 
     /// Core streaming CROWN implementation with sound directed rounding.
     ///
-    /// Always uses `concretize_sound()` for f64→f32 directed rounding (#2239).
+    /// Always uses `concretize_sound()` for f64→f32 directed rounding.
     fn streaming_crown_backward(
         &self,
         network: &Network,
@@ -184,7 +195,7 @@ impl StreamingVerifier {
             let pre_activation = if i == 0 {
                 input.clone()
             } else {
-                checkpointed.bounds_at(i - 1, network)?
+                checkpointed.bounds_at_proof_eligible(i - 1, network)?
             };
 
             linear_bounds = Self::propagate_layer_backward_with_engine(
@@ -196,18 +207,18 @@ impl StreamingVerifier {
             )?;
         }
 
-        // Step 4: Concretize using input bounds with directed rounding (#2239).
-        // concretize_sound() guarantees no NaN/inversion (#2287).
+        // Step 4: Concretize using input bounds with directed rounding.
+        // concretize_sound() guarantees no NaN/inversion.
         debug!("CROWN streaming: concretizing (sound)");
         let crown_output = linear_bounds
             .concretize_sound(input)
             .reshape(&output_shape)?;
 
-        // Step 5+6: Degrade check + forward-bound tightening (#3043 dedup).
+        // Step 5+6: Degrade check + forward-bound tightening.
         tighten_crown_output(crown_output, &output_bounds, "CROWN streaming")
     }
 
-    /// Propagate backward through a single layer with optional engine (#3598).
+    /// Propagate backward through a single layer with optional engine.
     ///
     /// For Linear/Conv layers, dispatches to engine-aware methods for GPU
     /// acceleration. All other layers use the standard trait method.
@@ -221,7 +232,7 @@ impl StreamingVerifier {
         use std::borrow::Cow;
 
         let result: Result<Cow<'_, LinearBounds>> = match layer {
-            // GPU-accelerated paths for GEMM-heavy layers (#3598)
+            // GPU-accelerated paths for GEMM-heavy layers
             Layer::Linear(l) => l.propagate_linear_with_engine(&linear_bounds, engine),
             Layer::Conv1d(c) => {
                 let mut conv = c.clone();
@@ -264,7 +275,7 @@ impl StreamingVerifier {
     /// Propagate batched CROWN with gradient checkpointing.
     ///
     /// Batched version that preserves N-D shape structure.
-    /// Uses `concretize_sound()` for directed rounding (#2239).
+    /// Uses `concretize_sound()` for directed rounding.
     pub fn propagate_crown_batched_streaming(
         &self,
         network: &Network,
@@ -273,7 +284,7 @@ impl StreamingVerifier {
         self.batched_streaming_crown_backward(network, input, None)
     }
 
-    /// Propagate batched CROWN with gradient checkpointing and GPU engine (#3598).
+    /// Propagate batched CROWN with gradient checkpointing and GPU engine.
     pub fn propagate_crown_batched_streaming_with_engine(
         &self,
         network: &Network,
@@ -285,7 +296,7 @@ impl StreamingVerifier {
 
     /// Core batched streaming CROWN implementation with sound directed rounding.
     ///
-    /// Always uses `concretize_sound()` for f64→f32 directed rounding (#2239).
+    /// Always uses `concretize_sound()` for f64→f32 directed rounding.
     fn batched_streaming_crown_backward(
         &self,
         network: &Network,
@@ -297,7 +308,7 @@ impl StreamingVerifier {
         }
 
         // Check if we can use batched CROWN. Delegates to Layer::supports_batched_crown()
-        // which is the single source of truth for the allow-list (#1753).
+        // which is the single source of truth for the allow-list.
         // Streaming verifier doesn't support Conv/shape-transform layers (no spatial handling).
         let can_use_batched = network
             .layers
@@ -323,7 +334,7 @@ impl StreamingVerifier {
         );
 
         // Step 2: Initialize batched linear bounds
-        // Guard: check CPU dense budget before allocating (#3550).
+        // Guard: check CPU dense budget before allocating.
         if let Err(e) = check_batched_identity_budget(
             "StreamingVerifier::batched_streaming_crown_backward",
             &output_shape,
@@ -349,11 +360,11 @@ impl StreamingVerifier {
             let pre_activation = if i == 0 {
                 input.clone()
             } else {
-                checkpointed.bounds_at(i - 1, network)?
+                checkpointed.bounds_at_proof_eligible(i - 1, network)?
             };
 
             batched_bounds = match layer
-                // #3598: Thread GemmEngine through streaming verifier.
+                // Thread GemmEngine through streaming verifier.
                 .propagate_crown_backward_batched(&batched_bounds, Some(&pre_activation), engine)
             {
                 Ok(next) => next,
@@ -383,8 +394,8 @@ impl StreamingVerifier {
             };
         }
 
-        // Step 4: Concretize with directed rounding (#2239).
-        // concretize_sound() guarantees no NaN/inversion (#2287).
+        // Step 4: Concretize with directed rounding.
+        // concretize_sound() guarantees no NaN/inversion.
         let crown_output = batched_bounds.concretize_sound(input)?;
         let crown_output = if crown_output.shape() != output_shape.as_slice() {
             crown_output.reshape(&output_shape)?
@@ -392,7 +403,7 @@ impl StreamingVerifier {
             crown_output
         };
 
-        // Step 5+6: Degrade check + forward-bound tightening (#3043 dedup).
+        // Step 5+6: Degrade check + forward-bound tightening.
         tighten_crown_output(crown_output, &output_bounds, "Batched CROWN streaming")
     }
 }

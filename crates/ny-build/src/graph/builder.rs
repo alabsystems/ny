@@ -63,6 +63,24 @@ pub fn build_graph_network(
     data: &GraphBuildInputs<'_>,
     options: GraphNetworkOptions,
 ) -> Result<GraphNetwork> {
+    build_graph_network_with_linear_storage(data, options, crate::LinearStoragePolicy::EagerBounds)
+}
+
+/// Build under a typed pre-construction affine storage policy. Original point
+/// coefficients acquire their own persistent leases before canonical copying.
+/// Caller admission still owns graph metadata and non-affine construction.
+pub fn build_graph_network_with_linear_storage(
+    data: &GraphBuildInputs<'_>,
+    options: GraphNetworkOptions,
+    linear_storage: crate::LinearStoragePolicy<'_>,
+) -> Result<GraphNetwork> {
+    if matches!(linear_storage, crate::LinearStoragePolicy::OriginalPoint(_))
+        && options.compound_node_policy != crate::CompoundNodePolicy::Preserve
+    {
+        return Err(NyError::UnsupportedConfiguration(
+            "original point storage requires the unchanged compound-node inventory".into(),
+        ));
+    }
     let mut graph = GraphNetwork::new();
     let rewritten = rewrite_compound_nodes(
         data.layers,
@@ -84,12 +102,30 @@ pub fn build_graph_network(
     // axes / reshape targets verbatim (#cctsdb B5).
     let model_unbatched = model_is_unbatched(data.inputs);
     let context = ConvertContext::new(weights, tensor_shapes, data.constant_tensors)
-        .with_model_unbatched(model_unbatched);
+        .with_model_unbatched(model_unbatched)
+        .with_linear_storage(linear_storage);
 
     // Track which tensor names are produced by which node names
     let mut tensor_to_node: HashMap<String, String> = HashMap::new();
-    for input in data.inputs {
-        tensor_to_node.insert(input.name.clone(), INPUT_NODE_NAME.to_string());
+    if options.multi_input_concat && data.inputs.len() > 1 {
+        // #multi-input-propagation (dark, preset `model.multi_input_concat`):
+        // the network input is the flat DECLARED-ORDER concatenation of every
+        // graph input; exact Slice(+Reshape) view nodes carve each input back
+        // out, so bounds route to the right coordinate slices. See
+        // `graph::multi_input` for the containment argument. Layout errors
+        // fail the load closed.
+        let layout = super::multi_input::concat_input_layout(data.inputs)?;
+        super::multi_input::insert_input_view_nodes(&mut graph, &mut tensor_to_node, &layout)?;
+        info!(
+            "[multi_input] armed: {} declared inputs concatenated into a {}-element \
+             network input (declared order)",
+            data.inputs.len(),
+            layout.total_len()
+        );
+    } else {
+        for input in data.inputs {
+            tensor_to_node.insert(input.name.clone(), INPUT_NODE_NAME.to_string());
+        }
     }
     let output_to_spec: HashMap<String, usize> = layers
         .iter()
@@ -166,7 +202,8 @@ pub fn build_graph_network(
                     data.constant_tensors,
                     &evaluated_constants,
                 )
-                .with_model_unbatched(model_unbatched);
+                .with_model_unbatched(model_unbatched)
+                .with_linear_storage(linear_storage);
                 eval_context.evaluate_constant_layer(spec, &evaluated_constants)
             };
             if let Some(result) = result {
@@ -188,7 +225,8 @@ pub fn build_graph_network(
         data.constant_tensors,
         &evaluated_constants,
     )
-    .with_model_unbatched(model_unbatched);
+    .with_model_unbatched(model_unbatched)
+    .with_linear_storage(linear_storage);
 
     // Track which layers were successfully converted
     let mut skipped_count = 0;
@@ -222,7 +260,7 @@ pub fn build_graph_network(
             // Only skip and mark outputs as constant if output values are actually
             // available (in evaluated_constants or weights). If values aren't available,
             // downstream layers can't use them and the converter will fail to create
-            // unary variants for binary ops that reference them (#411).
+            // unary variants for binary ops that reference them.
             let outputs_have_values = spec.outputs.iter().all(|output| {
                 evaluated_constants.contains_key(output)
                     || context.weights.get(output).is_some()
@@ -529,7 +567,7 @@ pub fn build_graph_network(
         };
 
         // Create and add the graph node
-        let node = GraphNode::new(spec.name.clone(), layer.clone(), input_nodes.clone());
+        let node = GraphNode::new(spec.name.clone(), layer, input_nodes);
         graph.try_add_node(node)?;
         last_added_node = Some(spec.name.clone());
 

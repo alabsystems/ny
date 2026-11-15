@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! External public API smoke test for block-wise CROWN result exports (#3961).
+//! External public API smoke test for block-wise CROWN result exports.
 //!
 //! This test compiles as a downstream consumer, proving the public
 //! `propagate_crown_block_wise()` return type is nameable from both the crate
@@ -83,7 +83,7 @@ fn test_block_wise_crown_result_is_publicly_nameable_3961() {
     );
 }
 
-/// #4024: `BlockSpec` and `BlockSpecEntry` are nameable from both the crate
+/// `BlockSpec` and `BlockSpecEntry` are nameable from both the crate
 /// root (`ny_propagate::BlockSpec`) and the network module
 /// (`ny_propagate::network::BlockSpec`), and the explicit-block API works
 /// from a downstream consumer.

@@ -13,7 +13,7 @@ fn test_batched_matvec_degenerate_a() {
     let a = ArrayD::zeros(ndarray::IxDyn(&[3])); // 1D array
     let x = ArrayD::from_elem(ndarray::IxDyn(&[3]), 1.0f32);
     let result = batched_matvec(&a, &x, false).unwrap();
-    assert!(result.shape().is_empty()); // 0-dimensional array
+    assert_eq!((result.shape()).len(), 0); // 0-dimensional array
 }
 
 #[ntest::timeout(10000)]
@@ -24,7 +24,7 @@ fn test_batched_matvec_degenerate_x() {
     let a = ArrayD::zeros(ndarray::IxDyn(&[2, 3]));
     let x: ArrayD<f32> = ArrayD::zeros(ndarray::IxDyn(&[])); // 0-dim
     let result = batched_matvec(&a, &x, false).unwrap();
-    assert!(result.shape().is_empty()); // 0-dimensional array
+    assert_eq!((result.shape()).len(), 0); // 0-dimensional array
 }
 
 #[ntest::timeout(10000)]

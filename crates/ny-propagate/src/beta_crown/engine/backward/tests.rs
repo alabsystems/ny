@@ -114,7 +114,7 @@ fn test_infer_conv1d_input_len_errors_when_invalid() {
     );
 }
 
-/// Regression test for #2827: zero in_channels must return NyError, not panic.
+/// Regression test: zero in_channels must return NyError, not panic.
 #[ntest::timeout(5000)]
 #[test]
 fn test_infer_conv2d_input_hw_zero_channels_returns_error() {
@@ -126,7 +126,7 @@ fn test_infer_conv2d_input_hw_zero_channels_returns_error() {
     );
 }
 
-/// Regression test for #2827: zero in_channels for conv1d must return error.
+/// Regression test: zero in_channels for conv1d must return error.
 #[ntest::timeout(5000)]
 #[test]
 fn test_infer_conv1d_input_len_zero_channels_returns_error() {
@@ -138,7 +138,7 @@ fn test_infer_conv1d_input_len_zero_channels_returns_error() {
     );
 }
 
-/// Regression test for #2827: zero in_channels with 2D shape also returns error.
+/// Regression test: zero in_channels with 2D shape also returns error.
 #[ntest::timeout(5000)]
 #[test]
 fn test_infer_conv2d_input_hw_zero_channels_2d_shape_returns_error() {
@@ -151,7 +151,7 @@ fn test_infer_conv2d_input_hw_zero_channels_2d_shape_returns_error() {
     );
 }
 
-/// Regression test for #2176: ReLU backward must return an error on dimension
+/// Regression test: ReLU backward must return an error on dimension
 /// mismatch instead of silently returning unsound identity bounds.
 #[ntest::timeout(5000)]
 #[test]
@@ -208,7 +208,7 @@ fn test_relu_backward_returns_error_on_dimension_mismatch() {
     }
 }
 
-/// Regression test for #2184: UnsupportedOp CROWN backward fallback must
+/// Regression test: UnsupportedOp CROWN backward fallback must
 /// return constant (A=0) bounds derived from IBP, not identity(dim).
 ///
 /// GatherLayer has IBP support but returns UnsupportedOp for CROWN backward.
@@ -253,7 +253,7 @@ fn test_unsupported_layer_backward_returns_constant_not_identity_2184() {
     );
 }
 
-/// Regression test for #2184: concretization in UnsupportedOp fallback must use
+/// Regression test: concretization in UnsupportedOp fallback must use
 /// signed interval arithmetic (negative coefficients take upper for lower bound
 /// and lower for upper bound).
 #[ntest::timeout(5000)]

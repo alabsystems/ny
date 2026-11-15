@@ -12,8 +12,6 @@
 //!
 //! Reference:
 //! `alpha-beta-CROWN (github.com/Verified-Intelligence/alpha-beta-CROWN) auto_LiRPA/auto_LiRPA/operators/resize.py:27-82`
-//!
-//! Part of #3919.
 
 use crate::layers::common::BoundPropagation;
 use crate::layers::transform::ResizeLayer;

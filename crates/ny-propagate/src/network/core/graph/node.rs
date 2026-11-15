@@ -66,8 +66,8 @@ impl GraphNode {
     ///
     /// Asserts that the input count meets the layer's minimum arity
     /// requirement (`Layer::min_inputs`). This catches construction errors early
-    /// instead of deferring to propagation-time `require_*_inputs()` checks (#2481).
-    /// Validated in both debug and release builds (#2686).
+    /// instead of deferring to propagation-time `require_*_inputs()` checks.
+    /// Validated in both debug and release builds.
     pub fn new(name: impl Into<String>, layer: Layer, inputs: Vec<String>) -> Self {
         let name = name.into();
         assert!(
@@ -88,7 +88,7 @@ impl GraphNode {
     /// the layer's minimum arity, instead of panicking.
     ///
     /// Use this in tests that intentionally construct malformed nodes to verify
-    /// that propagation returns structured errors (#2099, #2991).
+    /// that propagation returns structured errors.
     pub fn try_new(name: impl Into<String>, layer: Layer, inputs: Vec<String>) -> Result<Self> {
         let name = name.into();
         if inputs.len() < layer.min_inputs() {
@@ -124,7 +124,7 @@ impl GraphNode {
     /// Returns the first input name, or `InvalidSpec` unless the node has exactly 1 input.
     ///
     /// Use this instead of direct `node.inputs[0]` to avoid panics on malformed
-    /// graph nodes with empty input lists (#2099). Rejects extra inputs that
+    /// graph nodes with empty input lists. Rejects extra inputs that
     /// would otherwise be silently truncated by unary graph helpers.
     #[inline]
     pub fn require_unary_input(&self) -> Result<&str> {
@@ -142,8 +142,8 @@ impl GraphNode {
     /// Returns the first two input names, or `InvalidSpec` unless the node has exactly 2 inputs.
     ///
     /// Use this instead of direct `node.inputs[0]`/`node.inputs[1]` to avoid panics
-    /// on malformed graph nodes (#2099). Rejects extra inputs that would be silently
-    /// dropped by fixed-arity operators (#2666).
+    /// on malformed graph nodes. Rejects extra inputs that would be silently
+    /// dropped by fixed-arity operators.
     #[inline]
     pub fn require_binary_inputs(&self) -> Result<(&str, &str)> {
         if self.inputs.len() != 2 {
@@ -184,7 +184,7 @@ mod tests {
     use super::*;
     use crate::layers::{AddLayer, Layer};
 
-    /// Regression test for #2666: require_binary_inputs rejects extra inputs.
+    /// Regression test: require_binary_inputs rejects extra inputs.
     #[test]
     fn require_binary_inputs_rejects_extra_inputs_2666() {
         let node = GraphNode {
@@ -204,7 +204,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #2666: require_binary_inputs still works for correct arity.
+    /// Regression test: require_binary_inputs still works for correct arity.
     #[test]
     fn require_binary_inputs_accepts_exact_arity() {
         let node = GraphNode {
@@ -219,7 +219,7 @@ mod tests {
         assert_eq!(b, "b");
     }
 
-    /// Regression test for #2666: require_binary_inputs still rejects insufficient inputs.
+    /// Regression test: require_binary_inputs still rejects insufficient inputs.
     #[test]
     fn require_binary_inputs_rejects_insufficient_inputs() {
         let node = GraphNode {
@@ -239,7 +239,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #4097: unary helpers must reject malformed extra inputs
+    /// Regression test: unary helpers must reject malformed extra inputs
     /// instead of silently truncating to the first edge.
     #[test]
     fn require_unary_input_rejects_extra_inputs_4097() {

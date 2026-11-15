@@ -140,7 +140,7 @@ def run_ny_verify(
 ) -> tuple[bool, dict]:
     """Run ny verify on the model."""
     cmd = [
-        "cargo",
+        "targo", "--unverified",
         "run",
         "--release",
         "-p",

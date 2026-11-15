@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for LinearBounds NaN/Inf validation (#2977).
+//! Tests for LinearBounds NaN/Inf validation.
 //!
 //! Split from linear.rs to stay under the 1000-line file limit.
 //! Tests validate that `LinearBounds::new()` and factory methods reject
@@ -212,7 +212,7 @@ fn test_linear_bounds_from_coefficients_rejects_nan() {
 // =========================================================================
 // Property-based tests: NaN injection -> Err(NumericalInstability)
 //
-// These proptests verify the core invariant of #2977: LinearBounds::new()
+// These proptests verify the core invariant: LinearBounds::new()
 // structurally rejects NaN/Inf in coefficients and NaN in biases across
 // random shapes and injection positions.
 // =========================================================================

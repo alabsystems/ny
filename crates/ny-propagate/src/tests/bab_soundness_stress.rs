@@ -167,7 +167,7 @@ fn build_mlp(rng: &mut Rng) -> (GraphNetwork, BoundedTensor, usize) {
         graph.add_node(GraphNode::new(
             &lin,
             Layer::Linear(random_linear(rng, dim, out_w)),
-            vec![relu.clone()],
+            vec![relu],
         ));
         dim = out_w;
         prev = lin;

@@ -145,6 +145,13 @@ impl GraphNetwork {
 
         let exec_order = self.exec_order()?;
         let mut crown_bounds: HashMap<String, BoundedTensor> = HashMap::new();
+        // #vit-crown-interm: engagement census for the unconditional
+        // `[ref-map] stage=alpha-post` line. Print-only.
+        let pass_started = Instant::now();
+        let mut post_census = ref_map_telemetry::AlphaPostPassCensus {
+            nodes: exec_order.len(),
+            ..Default::default()
+        };
 
         // For each node, run backward CROWN with alpha values.
         for node_name in exec_order {
@@ -161,11 +168,18 @@ impl GraphNetwork {
                     );
                     for remaining in exec_order {
                         if !crown_bounds.contains_key(remaining) {
+                            post_census.deadline_hits += 1;
                             if let Some(ibp) = ibp_bounds.get(remaining) {
                                 crown_bounds.insert(remaining.clone(), ibp.clone());
                             }
                         }
                     }
+                    ref_map_telemetry::emit_alpha_post_pass(
+                        self,
+                        &post_census,
+                        true,
+                        pass_started.elapsed(),
+                    );
                     return Ok(crown_bounds);
                 }
             }
@@ -196,11 +210,13 @@ impl GraphNetwork {
                         _ => bounds,
                     };
                     crown_bounds.insert(node_name.clone(), cached);
+                    post_census.crown_done += 1;
+                    post_census.completed.insert(node_name.clone());
                 }
                 // Expected fallback: unsupported op or shape mismatch means this
                 // node can't use CROWN backward pass, so IBP is the correct fallback.
-                // #3166: Catch UnsupportedConfiguration alongside UnsupportedOp.
-                // #3602: Catch ShapeMismatch from complex DAG topologies (e.g., Concat
+                // Catch UnsupportedConfiguration alongside UnsupportedOp.
+                // Catch ShapeMismatch from complex DAG topologies (e.g., Concat
                 // of heterogeneous sub-graphs) where CROWN backward produces intermediate
                 // tensors with mismatched dimensions. IBP handles these correctly.
                 // CpuMemoryExceeded: Conv2d backward memory-cap backstop
@@ -225,11 +241,16 @@ impl GraphNetwork {
                         "α-CROWN: node '{}' CROWN backward fell back to IBP: {}",
                         node_name, e
                     );
+                    if matches!(e, NyError::DeadlineExceeded(_)) {
+                        post_census.deadline_hits += 1;
+                    } else {
+                        post_census.ibp_fallback += 1;
+                    }
                     if let Some(ibp) = ibp_bounds.get(node_name) {
                         crown_bounds.insert(node_name.clone(), ibp.clone());
                     }
                 }
-                // #3107: LayerError may wrap critical errors — inspect source before fallback.
+                // LayerError may wrap critical errors — inspect source before fallback.
                 Err(NyError::LayerError { source, .. })
                     if matches!(
                         source.as_ref(),
@@ -245,12 +266,13 @@ impl GraphNetwork {
                         "α-CROWN: node '{}' CROWN backward unsupported (wrapped), falling back to IBP",
                         node_name
                     );
+                    post_census.ibp_fallback += 1;
                     if let Some(ibp) = ibp_bounds.get(node_name) {
                         crown_bounds.insert(node_name.clone(), ibp.clone());
                     }
                 }
                 // Unexpected errors (internal error, soundness refusal, etc.)
-                // should not be silently swallowed — propagate them (#2032, #1941).
+                // should not be silently swallowed — propagate them.
                 Err(err) => return Err(err),
             }
         }
@@ -280,6 +302,12 @@ impl GraphNetwork {
             }
         }
 
+        ref_map_telemetry::emit_alpha_post_pass(
+            self,
+            &post_census,
+            deadline.is_some(),
+            pass_started.elapsed(),
+        );
         Ok(crown_bounds)
     }
 
@@ -709,7 +737,7 @@ impl GraphNetwork {
     /// Uses patches override: α-CROWN produces concretized scalar bounds and
     /// per-neuron alpha parameters — neither depends on whether the CROWN
     /// backward used patches or dense representation. Only BaB CROWN with
-    /// cutting planes needs dense A-matrices (#3813).
+    /// cutting planes needs dense A-matrices.
     ///
     /// `deadline` (#w4-refresh-deadline) is threaded into the per-target backward
     /// loop as the per-node deadline: a single wide-target spec-batch backward on
@@ -755,8 +783,8 @@ impl GraphNetwork {
     ///    (target_backward.rs), and `propagate_crown_to_node_chunked` opens with
     ///    a driver-entry refusal.
     ///
-    /// CORRECTED 2026-08-24 (stale-doc item, `DEADLINE_PRESENCE_AUDIT_2026-08-24.md`
-    /// §D1): that driver-entry refusal is NO LONGER unconditional on presence.
+    /// CORRECTED 2026-08-24 (`docs/DEADLINE_PRESENCE_AUDIT_2026-08-24.md` §D1):
+    /// that driver-entry refusal is NO LONGER unconditional on presence.
     /// `target_backward.rs` (the `finite objective-chunk target backward is not
     /// cooperatively bounded` guard, ~:3312) now refuses only when
     /// `expiry_authority_armed()` is false OR the deadline has actually

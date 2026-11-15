@@ -2,13 +2,13 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Regression tests for #2817: zero-row linear layer (`out_features == 0`) must
+//! Regression tests: zero-row linear layer (`out_features == 0`) must
 //! not panic via `% 0` in graph CROWN dimension checks.
 
 use crate::*;
 use ndarray::{arr1, arr2, Array2};
 
-/// Regression test #2817: DAG-CROWN with zero-row linear layer falls back to
+/// Regression test: DAG-CROWN with zero-row linear layer falls back to
 /// IBP instead of panicking on `% 0`.
 #[test]
 fn test_graph_crown_zero_row_linear_falls_back_to_ibp_2817() {
@@ -33,7 +33,7 @@ fn test_graph_crown_zero_row_linear_falls_back_to_ibp_2817() {
     let _result = graph.propagate_crown(&input);
 }
 
-/// Regression test #2817: spec-guided CROWN with zero-row linear layer falls
+/// Regression test: spec-guided CROWN with zero-row linear layer falls
 /// back to IBP instead of panicking on `% 0`.
 #[test]
 fn test_spec_guided_crown_zero_row_linear_falls_back_to_ibp_2817() {

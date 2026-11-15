@@ -11,8 +11,6 @@
 //!   equivalent bounds when both are converted to dense form.
 //! - Bias contribution: patches bias accumulation matches dense bias.
 //! - Stride/padding composition: composed stride and padding are correct.
-//!
-//! Part of #3463
 
 use crate::bounds::patches::{CrownBounds, PatchGeometry, PatchesLinearBounds};
 use crate::layers::common::PatchesPropagation;

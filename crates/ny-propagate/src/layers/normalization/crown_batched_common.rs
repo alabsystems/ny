@@ -16,8 +16,6 @@
 //! 2. Reshape pre-activation and bounds to `[batch, out_dim, in_dim]`
 //! 3. Loop over batch positions, delegating each to the 1D implementation
 //! 4. Reshape results back to original batch dimensions
-//!
-//! Reference: designs/2026-02-27-normalization-trait-dedup.md
 
 use ndarray::{Array1, Array2, Array3, ArrayD, IxDyn};
 use ny_core::{checked_shape_product, NyError, Result};
@@ -42,7 +40,7 @@ pub(crate) fn gate_crown_mode_batched<L: NormLayer>(
     match layer.crown_mode() {
         LayerNormCrownMode::IbpValidated => {
             // Every caller intercepts IbpValidated and routes it to its sound
-            // decomposed primitive-chain CROWN (#3775); only Sampling mode
+            // decomposed primitive-chain CROWN; only Sampling mode
             // reaches the shared batched sampling linearization below.
             Ok(None)
         }
@@ -164,7 +162,7 @@ pub(crate) fn sampling_crown_batched(
         let lower_b_slice = lower_b_2d.row(b).to_owned();
         let upper_b_slice = upper_b_2d.row(b).to_owned();
 
-        // CROWN backward NaN firewall (#2812): conservative fallback instead of hard error.
+        // CROWN backward NaN firewall: conservative fallback instead of hard error.
         let batch_bounds = LinearBounds::new_or_conservative(
             lower_a_slice,
             lower_b_slice,

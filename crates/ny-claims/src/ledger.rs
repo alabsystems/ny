@@ -244,7 +244,10 @@ mod tests {
             "{findings:?}"
         );
         // The identical record as an observational claim is fine.
-        assert!(lint_claim(&base(ClaimKind::Observational)).is_empty());
+        assert_eq!(
+            lint_claim(&base(ClaimKind::Observational)),
+            [] as [LintFinding; 0]
+        );
     }
 
     #[test]

@@ -2,11 +2,11 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! End-to-end GPU CROWN backward timing tests on real VNN-COMP models (#3397).
+//! End-to-end GPU CROWN backward timing tests on real VNN-COMP models.
 //!
 //! These tests load actual VNN-COMP ONNX models (not synthetic approximations)
 //! and run CROWN propagation with a real GPU engine. This provides the "real
-//! timing evidence" required before #3397 can be closed.
+//! timing evidence" for GPU CROWN backward.
 //!
 //! For large models (metaroom, soundnessbench), CPU CROWN takes >900s, so we
 //! validate GPU CROWN soundness via IBP comparison and concrete sampling rather
@@ -16,9 +16,6 @@
 //! conformance features. The `ny_onnx_conformance` runner selects those lanes;
 //! missing fixtures or GPU initialization fail actionably instead of being
 //! reported as passing coverage.
-//!
-//! Reference: designs/2026-03-06-gpu-crown-backward.md
-//! Reference: designs/2026-03-09-issue-3397-gpu-crown-plan-cache.md
 
 use super::*;
 use ndarray::{ArrayD, IxDyn};
@@ -82,7 +79,7 @@ fn log_network_layers(label: &str, network: &ny_propagate::Network, input_dim: u
 /// competition behavior: IBP + CROWN share the same per-instance timeout.
 /// This ensures CROWN-IBP partial passes are deadline-limited just as they
 /// would be in competition, preventing expensive CPU CROWN partial passes
-/// on large Conv2d layers (#3397).
+/// on large Conv2d layers.
 ///
 /// CPU CROWN is NOT run (it takes >900s on these models — that's the bug).
 /// Instead, soundness is verified by:
@@ -120,7 +117,7 @@ fn gpu_crown_timing_with_precomputed_ibp_soundness(
 
     // Collect per-layer IBP bounds once. The last element is the output bounds
     // (used for soundness comparison). Pre-computed bounds are passed into CROWN
-    // to skip redundant internal IBP collection (#3397).
+    // to skip redundant internal IBP collection.
     let ibp_layer_bounds = network
         .collect_ibp_bounds(&input)
         .unwrap_or_else(|e| panic!("{label}: collect_ibp_bounds failed: {e}"));
@@ -289,7 +286,7 @@ fn test_gpu_crown_metaroom_lowering_is_fast_path_eligible() {
 }
 
 // ───────────────────────────────────────────────────────────────────────
-// 1. Metaroom 6cnn_ry: the competition bottleneck (#3397)
+// 1. Metaroom 6cnn_ry: the competition bottleneck
 // ───────────────────────────────────────────────────────────────────────
 
 /// End-to-end GPU CROWN on a real metaroom 6cnn_ry ONNX model (#3397).
@@ -355,7 +352,7 @@ fn test_gpu_crown_real_metaroom_6cnn_ry_3397() {
 // 2. Soundnessbench: 384-output model (#3397)
 // ───────────────────────────────────────────────────────────────────────
 
-/// Run GPU CROWN with pre-computed per-layer IBP bounds (#3397).
+/// Run GPU CROWN with pre-computed per-layer IBP bounds.
 ///
 /// Passes pre-computed per-layer IBP bounds into the CROWN pipeline to skip
 /// the internal IBP forward pass. The `deadline` is an absolute Instant —
@@ -553,9 +550,9 @@ fn gpu_crown_small_model_matches_cpu(
 ///
 /// Uses a 180s competition-relative deadline. This test collects IBP once up
 /// front only for soundness comparison; that standalone IBP is diagnostic test
-/// overhead, not part of the `#3397` backward-phase acceptance budget.
+/// overhead, not part of the backward-phase acceptance budget.
 ///
-/// Acceptance for `#3397`: the GPU CROWN phase using pre-computed IBP must
+/// Acceptance: the GPU CROWN phase using pre-computed IBP must
 /// succeed and finish within 180s wall-clock.
 ///
 /// The 180s acceptance budget and the 300s watchdog are release-only
@@ -596,7 +593,7 @@ fn test_gpu_crown_real_soundnessbench_3397() {
 
     // Collect per-layer IBP bounds once. The final element is the output bounds
     // (for soundness validation). Pre-computed bounds are passed into CROWN to
-    // skip redundant internal IBP, saving ~59s (#3397).
+    // skip redundant internal IBP, saving ~59s.
     let ibp_start = Instant::now();
     let ibp_layer_bounds = network
         .collect_ibp_bounds(&input)
@@ -668,7 +665,7 @@ fn test_gpu_crown_mnist_conv_smoke() {
 }
 
 // ───────────────────────────────────────────────────────────────────────
-// 4. ACAS-Xu: AddConstant/SubConstant extraction (#3460)
+// 4. ACAS-Xu: AddConstant/SubConstant extraction
 // ───────────────────────────────────────────────────────────────────────
 
 /// GPU CROWN on ACAS-Xu model 1_1 — validates that AddConstant/SubConstant
@@ -677,7 +674,7 @@ fn test_gpu_crown_mnist_conv_smoke() {
 /// ACAS-Xu models use `MatMul + Add` (not Gemm), producing:
 ///   SubConstant → Flatten → [Linear(no bias) → AddConstant → ReLU] × 6 → Linear → AddConstant
 ///
-/// Before #3460 (constant-arithmetic extraction), GPU fast-path returned None
+/// Before constant-arithmetic extraction, the GPU fast-path returned None
 /// for these models, forcing CPU fallback. This test confirms the extraction works
 /// and bounds match.
 ///
@@ -720,7 +717,7 @@ fn test_gpu_crown_acasxu_addconstant_3460() {
     // CPU baseline.
     let cpu_crown = network.propagate_crown(&input).expect("CPU CROWN failed");
 
-    // GPU CROWN — this is the test subject. Before #3460, this would fall back
+    // GPU CROWN — this is the test subject. Previously this would fall back
     // to CPU because AddConstant/SubConstant were unsupported. GPU eligibility
     // (asserted above) plus real bounds here prove the AddConstant/SubConstant
     // layers run on the GPU fast-path rather than silently falling back to CPU.
@@ -889,7 +886,7 @@ pub(super) fn assert_crown_finite_within_ibp(
 }
 
 /// Regression: GPU CROWN and CPU CROWN each ENCLOSE the concrete ACAS-Xu output
-/// range over the input box (#3460).
+/// range over the input box.
 ///
 /// This is the correct soundness bar — and the reason the sibling parity test no
 /// longer asserts GPU==CPU to 0.01. CPU CROWN (proven-sound f64 `A·W` + a
@@ -930,9 +927,9 @@ fn test_gpu_crown_acasxu_encloses_concrete_samples() {
 }
 
 // ───────────────────────────────────────────────────────────────────────
-// 5. dist_shift: Sigmoid model requires graph-mode (#3460)
+// 5. dist_shift: Sigmoid model requires graph-mode
 // ───────────────────────────────────────────────────────────────────────
 // Note: dist_shift mnist_generator.onnx uses Concat (multi-input op) which
 // blocks both sequential CROWN and sequential IBP. GPU CROWN for Sigmoid is
 // validated via synthetic networks in ny-propagate gpu_fast_path tests.
-// Real-model Sigmoid GPU-vs-CPU comparison requires graph-mode CROWN (#3460).
+// Real-model Sigmoid GPU-vs-CPU comparison requires graph-mode CROWN.

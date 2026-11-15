@@ -85,6 +85,19 @@ use super::backward_core::{
 use super::build_nodes_by_idx;
 use super::indexed_pending::{merge_bias_elem, merged_err_elem};
 
+#[path = "batched_bwd/target.rs"]
+mod target;
+#[allow(unused_imports)] // Prepared collector primitive; no production caller yet.
+pub(super) use target::PreparedSoaTarget;
+
+#[path = "batched_bwd/bounded_storage.rs"]
+#[allow(dead_code)] // Finite collector storage; traversal admission remains closed.
+mod bounded_storage;
+
+#[path = "batched_bwd/retained_seed.rs"]
+#[allow(dead_code)] // Original seed custody only; no finite collector caller.
+mod retained_seed;
+
 /// Runtime gate for the #lsnc-batched-bwd SoA batched backward (slice S3).
 ///
 /// `-1` = uninitialized (read the env once, then cache); `1` = ON; `0` = OFF.
@@ -284,7 +297,7 @@ impl BatchSlot {
     /// Materialize domain `d` as the exact `LinearBounds` the reference
     /// pending storage would hold (bits AND err presence). Uses a struct
     /// literal because accumulated pending bounds legitimately carry ±Inf
-    /// coefficients (`safe_add`'s conservative degrade, #3032) that
+    /// coefficients (`safe_add`'s conservative degrade) that
     /// `LinearBounds::new` would reject.
     fn materialize(&self, d: usize) -> Option<LinearBounds> {
         if !self.active[d] {
@@ -643,6 +656,37 @@ pub(super) fn try_backward_soa(
     deadline: Option<std::time::Instant>,
     mul_binary_alphas: Option<&HashMap<String, Array2<f32>>>,
 ) -> Result<SoaBackwardOutcome> {
+    try_backward_soa_seeded(
+        graph,
+        plan,
+        plan.output_node_idx,
+        n_domains,
+        bounds_caches,
+        constrained_inputs,
+        alpha_states,
+        initial_lb,
+        engine,
+        deadline,
+        mul_binary_alphas,
+    )
+}
+
+/// Shared traversal for the graph-output entry and prepared intermediate targets.
+/// Only the seed slot varies; kernels, merge order and finite refusal are shared.
+#[allow(clippy::too_many_arguments)]
+fn try_backward_soa_seeded(
+    graph: &GraphNetwork,
+    plan: &CrownDispatchPlan,
+    seed_node_idx: usize,
+    n_domains: usize,
+    bounds_caches: &[&HashMap<String, Arc<BoundedTensor>>],
+    constrained_inputs: &[BoundedTensor],
+    alpha_states: &[Option<&GraphDomainAlphaState>],
+    initial_lb: &LinearBounds,
+    engine: &dyn GemmEngine,
+    deadline: Option<std::time::Instant>,
+    mul_binary_alphas: Option<&HashMap<String, Array2<f32>>>,
+) -> Result<SoaBackwardOutcome> {
     // The SoA Linear kernel is one stacked launch with no cooperative
     // cancellation seam. Decline the optional fast lane whenever wall-clock
     // authority is present; the caller restarts on the reference traversal,
@@ -661,7 +705,7 @@ pub(super) fn try_backward_soa(
     let min_chunk = par_min_chunk(n_domains);
 
     let mut pending = BatchPending::new(plan, n_domains);
-    pending.seed_broadcast(plan.output_node_idx, initial_lb)?;
+    pending.seed_broadcast(seed_node_idx, initial_lb)?;
 
     let resolve_target = |name: &str| -> Result<usize> {
         plan.name_to_idx.get(name).copied().ok_or_else(|| {

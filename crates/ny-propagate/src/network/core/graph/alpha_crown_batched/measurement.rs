@@ -2,13 +2,11 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Phase 3 measurement: McCormick CROWN vs IBP decision gate (#286).
+//! Phase 3 measurement: McCormick CROWN vs IBP decision gate.
 //!
 //! Compares IBP, CROWN, and alpha-CROWN bounds at multiple perturbation radii
 //! to determine whether broadcast McCormick architecture produces tighter bounds
 //! than IBP for attention BilinearCrown nodes.
-//!
-//! Reference: designs/2026-03-04-286-attention-bilinear-alternative.md Phase 3
 //!
 //! Split across two files:
 //! - `measurement.rs` — synthetic graph tests (Linear -> BilinearCrown, no ReLU)
@@ -194,7 +192,7 @@ const EPS_VALUES: [f32; 4] = [0.001, 0.01, 0.05, 0.1];
 
 /// Phase 3: 2x2 identity vs asymmetric weights.
 ///
-/// Decision gate from designs/2026-03-04-286-attention-bilinear-alternative.md.
+/// Decision gate: broadcast McCormick vs IBP.
 /// Reference: auto_LiRPA/operators/bivariate.py:39-75
 #[ntest::timeout(120000)]
 #[test]

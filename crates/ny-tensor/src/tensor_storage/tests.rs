@@ -142,7 +142,7 @@ fn test_create_tensor_storage_factory() {
     assert_eq!(queue.len(), 0);
 }
 
-// --- Error path regression tests for #2896 ---
+// --- Error path regression tests ---
 
 #[test]
 fn test_stack_new_empty_shape_returns_err() {
@@ -278,7 +278,7 @@ fn test_queue_reorder_index_out_of_bounds_returns_err() {
     );
 }
 
-/// Regression test for #2257: Fortran-layout arrays must round-trip correctly.
+/// Regression test: Fortran-layout arrays must round-trip correctly.
 /// Before the fix, `flatten_tensor_data` used `as_slice_memory_order()` which
 /// returned column-major data for Fortran-layout arrays. The storage buffer
 /// interpreted this as row-major, producing silently wrong results on pop.
@@ -305,7 +305,7 @@ fn test_stack_append_fortran_layout_roundtrip_2257() {
     assert_eq!(storage.len(), 2);
 
     // Pop and verify data matches LOGICAL order, not memory order.
-    // Before #2257 fix, this would return [[1, 4, 2], [5, 3, 6]] (column-major
+    // Before the fix, this would return [[1, 4, 2], [5, 3, 6]] (column-major
     // data misinterpreted as row-major).
     let popped = storage.pop(2).unwrap();
     assert_eq!(popped.shape(), &[2, 3]);

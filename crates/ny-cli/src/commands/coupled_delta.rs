@@ -1268,7 +1268,7 @@ mod tests {
                 let mut xlo = Array1::zeros(dim);
                 let mut xhi = Array1::zeros(dim);
                 for d in 0..dim {
-                    let c = 0.5 * (full_lo[d] + full_hi[d]);
+                    let c = f64::midpoint(full_lo[d], full_hi[d]);
                     let half = 0.5 * (full_hi[d] - full_lo[d]) / denom;
                     xlo[d] = c - half;
                     xhi[d] = c + half;

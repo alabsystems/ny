@@ -260,7 +260,7 @@ fn reshape_shape_from_float_tensor(
                     spec.name, v, idx
                 )));
             }
-            // #2360: Reject values beyond f32 exact-integer range. The value has
+            // Reject values beyond f32 exact-integer range. The value has
             // already been rounded by the f32 representation, so accepting it
             // means using the wrong dimension silently.
             if v.abs() > F32_INT_EXACT_LIMIT {
@@ -333,6 +333,7 @@ fn build_attribute_slice_layer(
         data_name,
         i64::from(axis),
         crate::convert::LegacyBatchAxisPolicy::RejectZero,
+        crate::convert::legacy_axis_authority(spec)?,
     )?;
     let adjusted_axis = i32::try_from(adjusted_axis).map_err(|_| {
         NyError::ModelLoad(format!(
@@ -400,7 +401,7 @@ impl ConvertContext<'_> {
             // Adjust for unbatched operation: ny-propagate strips the batch dimension.
             // ONNX Reshape target shapes include the batch dimension as the first element.
             // Drop it to match the unbatched tensor layout, consistent with how Slice,
-            // Gather, Flatten, and Squeeze adjust their axes for unbatched mode (#3198).
+            // Gather, Flatten, and Squeeze adjust their axes for unbatched mode.
             //
             // Example: ONNX target [-1, 6, 8] → unbatched [6, 8]
             //          ONNX target [1, -1]     → unbatched [-1]
@@ -431,7 +432,7 @@ impl ConvertContext<'_> {
         // ONNX Flatten: collapses dimensions according to axis attribute
         // Default axis is 1 (flatten all dimensions except batch)
         let onnx_axis = match spec.attributes.get("axis") {
-            // SAFETY(#3100): i64->i32 checked conversion; ONNX axis values are small
+            // SAFETY: i64->i32 checked conversion; ONNX axis values are small
             Some(AttributeValue::Int(a)) => i32::try_from(*a).map_err(|_| {
                 NyError::ModelLoad(format!(
                     "Flatten '{}': axis {} out of i32 range",
@@ -448,14 +449,14 @@ impl ConvertContext<'_> {
         // We use FlattenLayer(0) which produces 2D [1, C*H*W]. This preserves shape
         // compatibility with CROWN backward propagation, which produces 2D bounds from
         // downstream Linear layers. Using Reshape([-1]) would produce 1D [C*H*W],
-        // triggering CROWN-IBP shape mismatch fallback and losing CROWN tightening (#3300).
+        // triggering CROWN-IBP shape mismatch fallback and losing CROWN tightening.
         //
         // Linear layers handle both 1D and 2D inputs (propagate_ibp_1d vs propagate_ibp_nd),
         // so the 2D output from FlattenLayer(0) is compatible with downstream layers.
         //
         // ONNX axis 0 normally targets the batch dimension, which does not exist in
         // unbatched mode. Ref: alpha-beta-CROWN raises ValueError for axis==0 in
-        // Squeeze/Unsqueeze; same logic applies to Flatten. (#2310)
+        // Squeeze/Unsqueeze; same logic applies to Flatten.
         //
         // Exception (genuine rank-≤1 data axis): when the input's recorded ONNX shape is
         // rank ≤ 1 (`data_had_batch_axis == Some(false)`), there was no batch axis to
@@ -501,14 +502,14 @@ impl ConvertContext<'_> {
         // Tile layer: repeats tensor along specified axis
         // Attributes: "axis" (i64) - axis to repeat along, "reps" (i64) - repetition count
         let axis = match spec.attributes.get("axis") {
-            // SAFETY(#3100): i64->i32 checked conversion
+            // SAFETY: i64->i32 checked conversion
             Some(AttributeValue::Int(a)) => i32::try_from(*a).map_err(|_| {
                 NyError::ModelLoad(format!("Tile '{}': axis {} out of i32 range", spec.name, a))
             })?,
             _ => {
                 return Err(NyError::ModelLoad(
                     "Tile layer requires 'axis' attribute".to_string(),
-                ))
+                ));
             }
         };
 
@@ -518,12 +519,12 @@ impl ConvertContext<'_> {
                 return Err(NyError::ModelLoad(format!(
                     "Tile '{}': reps must be positive (got {})",
                     spec.name, r
-                )))
+                )));
             }
             _ => {
                 return Err(NyError::ModelLoad(
                     "Tile layer requires 'reps' attribute".to_string(),
-                ))
+                ));
             }
         };
 
@@ -552,7 +553,7 @@ impl ConvertContext<'_> {
                     return Err(NyError::ModelLoad(format!(
                         "Expand '{}' has unsupported or malformed attributes {:?}",
                         spec.name, spec.attributes
-                    )))
+                    )));
                 }
             }
         } else {
@@ -712,7 +713,7 @@ impl ConvertContext<'_> {
     ///
     /// 2. **Genuinely-unbatched real-axis slice**: when the sliced tensor is a
     ///    constant (a weight/evaluated constant never carried a batch dim — same
-    ///    reasoning as `resolve_gather_axis` for embedding tables, #3312), ONNX axis 0
+    ///    reasoning as `resolve_gather_axis` for embedding tables), ONNX axis 0
     ///    is a real data axis. We emit a `Slice` on internal axis 0.
     ///
     /// 2b. **1-D non-constant activation**: when the sliced tensor's recorded ONNX
@@ -761,7 +762,7 @@ impl ConvertContext<'_> {
         }
 
         // Case 2: constant data tensor never carried a batch dim → axis 0 is a real
-        // data axis; slice it directly (mirrors resolve_gather_axis, #3312).
+        // data axis; slice it directly (mirrors resolve_gather_axis).
         let data_is_constant = spec
             .inputs
             .first()
@@ -1128,6 +1129,7 @@ impl ConvertContext<'_> {
                 data_name,
                 i64::from(axis),
                 crate::convert::LegacyBatchAxisPolicy::RejectZero,
+                crate::convert::legacy_axis_authority(spec)?,
             )?;
             let adjusted_axis = i32::try_from(adjusted_axis).map_err(|_| {
                 NyError::ModelLoad(format!(
@@ -1186,7 +1188,7 @@ impl ConvertContext<'_> {
         // full default permutation from authenticated raw shape provenance.
         let axes = match spec.attributes.get("perm") {
             Some(AttributeValue::Ints(perm)) => {
-                // #2983: Guard negative permutation indices.
+                // Guard negative permutation indices.
                 perm.iter()
                     .map(|&v| {
                         usize::try_from(v).map_err(|_| {
@@ -1202,7 +1204,7 @@ impl ConvertContext<'_> {
                 return Err(NyError::ModelLoad(format!(
                     "Transpose '{}': perm must be an INTS attribute, got {:?}",
                     spec.name, other
-                )))
+                )));
             }
             None => {
                 let rank = authored_rank.ok_or_else(|| {
@@ -1247,7 +1249,7 @@ impl ConvertContext<'_> {
     /// tensor kept its ONNX rank or had its leading batch dim stripped; the
     /// legacy `axis - 1` guess was only correct for the stripped layout.
     /// `onnx_axis == 0` on a rank>1 input targets the (possibly stripped)
-    /// batch dimension and refuses conversion, as before (#2310); on a
+    /// batch dimension and refuses conversion, as before; on a
     /// rank-≤1 input it is a genuine data axis (Slice Case 2b convention).
     /// Load-time axis interpretation only — no bound math.
     fn adjust_squeeze_axis_for_unbatched(&self, onnx_axis: i32, spec: &LayerSpec) -> Result<i32> {
@@ -1260,6 +1262,7 @@ impl ConvertContext<'_> {
             data_name,
             i64::from(onnx_axis),
             crate::convert::LegacyBatchAxisPolicy::RejectZero,
+            crate::convert::legacy_axis_authority(spec)?,
         )?;
         i32::try_from(remapped).map_err(|_| {
             NyError::ModelLoad(format!(
@@ -1286,7 +1289,7 @@ impl ConvertContext<'_> {
                     axes.len()
                 )));
             }
-            // SAFETY(#3100): i64->i32 checked conversion
+            // SAFETY: i64->i32 checked conversion
             let onnx_axis = i32::try_from(axes[0]).map_err(|_| {
                 NyError::ModelLoad(format!(
                     "Squeeze '{}': axis {} out of i32 range",
@@ -1298,7 +1301,7 @@ impl ConvertContext<'_> {
             // ONNX axis=1 means dimension after batch, which is axis=0 unbatched
             // ONNX axis=0 targets the batch dimension, which does not exist in unbatched mode.
             // Ref: alpha-beta-CROWN raises ValueError("Squeezing with axes == 0 is not allowed")
-            // in BoundSqueeze.bound_backward (reshape.py:265). (#2310)
+            // in BoundSqueeze.bound_backward (reshape.py:265).
             let adjusted_axis = self.adjust_squeeze_axis_for_unbatched(onnx_axis, spec)?;
 
             debug!(
@@ -1331,7 +1334,7 @@ impl ConvertContext<'_> {
 
                 // Adjust for unbatched operation
                 // ONNX axis=0 targets the batch dimension — reject unless it is a genuine
-                // rank-≤1 data axis. (#2310)
+                // rank-≤1 data axis.
                 let adjusted_axis = self.adjust_squeeze_axis_for_unbatched(onnx_axis, spec)?;
 
                 debug!(
@@ -1400,6 +1403,7 @@ impl ConvertContext<'_> {
             output_name,
             i64::from(onnx_axis),
             crate::convert::LegacyBatchAxisPolicy::RejectZero,
+            crate::convert::legacy_axis_authority(spec)?,
         )?;
         i32::try_from(remapped).map_err(|_| {
             NyError::ModelLoad(format!(
@@ -1426,7 +1430,7 @@ impl ConvertContext<'_> {
                     axes.len()
                 )));
             }
-            // SAFETY(#3100): i64->i32 checked conversion
+            // SAFETY: i64->i32 checked conversion
             let onnx_axis = i32::try_from(axes[0]).map_err(|_| {
                 NyError::ModelLoad(format!(
                     "Unsqueeze '{}': axis {} out of i32 range",
@@ -1644,18 +1648,19 @@ mod tests {
     }
 
     #[test]
-    fn squeeze_attr_positive_axis_unknown_rank_keeps_legacy() {
-        // No recorded shape: legacy `axis - 1` (synthesized-subgraph compat).
+    fn squeeze_attr_positive_axis_unknown_rank_refuses() {
         let ws = WeightStore::new();
         let m = make_context(&ws);
         let spec = attr_spec("sq", LayerType::Squeeze, vec![1]);
-        let layer = m.convert_squeeze(&spec).unwrap();
-        assert_eq!(squeeze_axis(&layer), 0);
+        let error = m
+            .convert_squeeze(&spec)
+            .expect_err("unknown rank must not authorize an axis-minus-one guess");
+        assert!(matches!(error, NyError::UnsupportedOp(_)));
     }
 
     #[test]
     fn squeeze_attr_axis_0_rejected() {
-        // ONNX axis 0 targets the batch dimension — rejected in unbatched mode (#2310)
+        // ONNX axis 0 targets the batch dimension — rejected in unbatched mode
         // Ref: alpha-beta-CROWN raises ValueError("Squeezing with axes == 0 is not allowed")
         let ws = WeightStore::new();
         let shapes = HashMap::from([("data".to_string(), vec![1_i64, 6])]);
@@ -1767,7 +1772,7 @@ mod tests {
 
     #[test]
     fn squeeze_input_axis_0_rejected() {
-        // ONNX axis 0 targets the batch dimension — rejected in unbatched mode (#2310)
+        // ONNX axis 0 targets the batch dimension — rejected in unbatched mode
         let mut ws = WeightStore::new();
         ws.insert("axes_tensor".to_string(), arr1(&[0.0_f32]).into_dyn());
         let shapes = HashMap::from([("data".to_string(), vec![1_i64, 6])]);
@@ -1815,7 +1820,7 @@ mod tests {
         let m = make_context_with_shapes(&ws, &shapes);
         let spec = bare_spec("sq", LayerType::Squeeze);
         let layer = m.convert_squeeze(&spec).unwrap();
-        assert!(reshape_target(&layer).is_empty());
+        assert_eq!((reshape_target(&layer)).len(), 0);
     }
 
     #[test]
@@ -1856,13 +1861,14 @@ mod tests {
     }
 
     #[test]
-    fn unsqueeze_attr_positive_axis_unknown_rank_keeps_legacy() {
-        // No recorded OUTPUT shape: legacy `axis - 1` (synthesized-subgraph compat).
+    fn unsqueeze_attr_positive_axis_unknown_rank_refuses() {
         let ws = WeightStore::new();
         let m = make_context(&ws);
         let spec = attr_spec("usq", LayerType::Unsqueeze, vec![1]);
-        let layer = m.convert_unsqueeze(&spec).unwrap();
-        assert_eq!(unsqueeze_axis(&layer), 0);
+        let error = m
+            .convert_unsqueeze(&spec)
+            .expect_err("unknown output rank must not authorize an axis-minus-one guess");
+        assert!(matches!(error, NyError::UnsupportedOp(_)));
     }
 
     #[test]
@@ -1982,7 +1988,7 @@ mod tests {
         );
     }
 
-    // ---- Slice: NaN/Inf guard regression tests (#2756) ----
+    // ---- Slice: NaN/Inf guard regression tests ----
 
     /// Build a `LayerSpec` for input-based Slice (opset 10+).
     /// `axes_name` provides the axes input; when `None`, axis defaults to 0.
@@ -2416,7 +2422,7 @@ mod tests {
         }
     }
 
-    // ---- Reshape: NaN/Inf shape guard (#2848 self-audit) ----
+    // ---- Reshape: NaN/Inf shape guard ----
 
     /// Build a `LayerSpec` for Reshape (input-based, shape from weights).
     fn reshape_spec(name: &str, shape_name: &str) -> LayerSpec {
@@ -2561,7 +2567,7 @@ mod tests {
         );
     }
 
-    // ---- Reshape: batch dimension stripping (#3198) ----
+    // ---- Reshape: batch dimension stripping ----
 
     /// Extract the target_shape from a Layer::Reshape, panicking on mismatch.
     fn reshape_target(layer: &Layer) -> &[i64] {
@@ -2761,7 +2767,7 @@ mod tests {
         assert_eq!(reshape_target(&layer), &[-1]);
     }
 
-    // ---- #2360 regression: precision-loss shape rejection ----
+    // ---- Regression: precision-loss shape rejection ----
 
     #[test]
     fn reshape_precision_loss_shape_rejected_2360() {
@@ -2786,7 +2792,7 @@ mod tests {
         );
     }
 
-    // ---- Flatten: converter tests (#3198) ----
+    // ---- Flatten: converter tests ----
 
     /// Build a `LayerSpec` for Flatten with given axis attribute.
     fn flatten_spec(name: &str, axis: i64) -> LayerSpec {
@@ -2804,7 +2810,7 @@ mod tests {
     fn flatten_axis_1_produces_flatten_layer_0() {
         // ONNX axis=1 (default) → adjusted axis=0 → FlattenLayer(0) for 2D [1, total].
         // FlattenLayer(0) preserves 2D shape compatibility with CROWN backward
-        // propagation, which produces 2D bounds from downstream Linear layers (#3300).
+        // propagation, which produces 2D bounds from downstream Linear layers.
         let ws = WeightStore::new();
         let m = make_context(&ws);
         let spec = flatten_spec("f_default", 1);

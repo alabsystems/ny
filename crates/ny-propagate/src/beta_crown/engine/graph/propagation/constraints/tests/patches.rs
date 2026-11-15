@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Constrained patches regressions (#3813, #4138).
+//! Constrained patches regressions.
 
 use ndarray::{arr1, ArrayD, IxDyn};
 use ny_test_utils::{assert_bounded_tensor_close, CountingGemmEngine};
@@ -406,7 +406,7 @@ fn test_constrained_patches_ignore_unrelated_beta_entries_for_relu_densification
         ..GraphBetaState::empty()
     };
 
-    // The patches→dense call-site recorder is thread-local (#4138): each test
+    // The patches→dense call-site recorder is thread-local: each test
     // runs on its own thread and the CROWN propagation here is synchronous on
     // that thread, so concurrently running tests cannot contaminate these two
     // recording windows.
@@ -461,7 +461,7 @@ fn test_constrained_patches_reduce_gemm_calls_3813() {
         ConstrainedPatchesPolicy::selective_matrix_reentry(),
     );
 
-    // After #3813 row-count threshold: for small models (≤64 objective rows),
+    // With the row-count threshold: for small models (≤64 objective rows),
     // Patches re-entry is skipped because Dense BLAS backward is faster than
     // per-position Patches composition. Both policies now produce the same
     // GEMM call count. Patches re-entry activates for large-row carriers

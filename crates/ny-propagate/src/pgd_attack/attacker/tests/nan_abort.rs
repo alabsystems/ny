@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! NaN abort counter and bounded-evaluation regression tests (#2968).
+//! NaN abort counter and bounded-evaluation regression tests.
 
 use ndarray::{arr1, arr2};
 use ny_tensor::BoundedTensor;
@@ -17,7 +17,7 @@ use crate::Network;
 /// executed (not skipped) and the total step iterations consumed (including
 /// NaN-skipped steps).
 ///
-/// This isolates the NaN abort logic (#2968) for deterministic testing without
+/// This isolates the NaN abort logic for deterministic testing without
 /// needing a network that naturally produces NaN gradients.
 fn simulate_nan_abort_loop(
     num_steps: usize,
@@ -46,9 +46,9 @@ fn simulate_nan_abort_loop(
     (clean_steps, total_iterations)
 }
 
-// --- NaN abort counter regression tests (#2968) ---
+// --- NaN abort counter regression tests ---
 
-/// Regression test for #2968: 5 consecutive NaN gradients trigger abort.
+/// Regression test: 5 consecutive NaN gradients trigger abort.
 #[test]
 fn test_nan_abort_five_consecutive_nans_triggers_abort() {
     // All NaN gradients: should abort after exactly 5 steps.
@@ -57,7 +57,7 @@ fn test_nan_abort_five_consecutive_nans_triggers_abort() {
     assert_eq!(total, 5, "should abort after exactly 5 NaN steps");
 }
 
-/// Regression test for #2968: fewer than 5 consecutive NaNs does not abort.
+/// Regression test: fewer than 5 consecutive NaNs does not abort.
 #[test]
 fn test_nan_abort_four_nans_does_not_trigger() {
     // 4 NaN then all clean: should NOT abort, should complete all steps.
@@ -68,7 +68,7 @@ fn test_nan_abort_four_nans_does_not_trigger() {
     assert_eq!(total, 100, "all 100 steps consumed");
 }
 
-/// Regression test for #2968: counter resets on clean gradient.
+/// Regression test: counter resets on clean gradient.
 #[test]
 fn test_nan_abort_counter_resets_on_clean_step() {
     // Pattern: 4 NaN, 1 clean, 4 NaN, 1 clean, ... (never hits 5 consecutive)
@@ -80,7 +80,7 @@ fn test_nan_abort_counter_resets_on_clean_step() {
     assert_eq!(total, 100, "all 100 steps consumed — no abort");
 }
 
-/// Regression test for #2968: counter resets then hits 5 consecutive.
+/// Regression test: counter resets then hits 5 consecutive.
 #[test]
 fn test_nan_abort_reset_then_trigger() {
     // Pattern: 3 NaN, 1 clean, then 5+ NaN → abort
@@ -92,7 +92,7 @@ fn test_nan_abort_reset_then_trigger() {
     assert_eq!(total, 9, "3 NaN + 1 clean + 5 NaN abort = 9 iterations");
 }
 
-/// Regression test for #2968: integration test — attack with normal network
+/// Regression test: integration test — attack with normal network
 /// terminates with bounded evaluations (no infinite loop).
 #[ntest::timeout(10000)]
 #[test]
@@ -135,7 +135,7 @@ fn test_pgd_attack_terminates_with_bounded_evaluations() {
     assert_eq!(result.restarts_completed, 3, "all restarts should complete");
 }
 
-/// Regression test for #2968: run_single_restart with a normal network
+/// Regression test: run_single_restart with a normal network
 /// uses bounded evaluations per restart.
 #[ntest::timeout(10000)]
 #[test]

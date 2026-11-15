@@ -22,7 +22,7 @@
 //!     assert diff.is_equivalent
 //! ```
 
-// Link macOS Accelerate BLAS for ndarray::dot() acceleration (#4259).
+// Link macOS Accelerate BLAS for ndarray::dot() acceleration.
 #[cfg(target_os = "macos")]
 extern crate blas_src;
 

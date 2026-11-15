@@ -6,8 +6,8 @@
 
 use anyhow::Result;
 use ny_onnx::{
-    load_onnx_bytes_with_config, load_onnx_with_config, read_onnx_bytes_maybe_gzip,
-    vnnlib::VnnLibSpec, CompoundNodePolicy, GraphNetworkOptions, OnnxLoadConfig,
+    load_onnx_with_config_and_root_policy, vnnlib::VnnLibSpec, CompoundNodePolicy,
+    GraphNetworkOptions, OnnxLoadConfig,
 };
 use ny_propagate::{BranchingHeuristic, Layer, VggMaxPoolRewriteMode};
 use std::path::Path;
@@ -22,6 +22,7 @@ use super::{
 use crate::CompleteVerifierArg;
 
 pub(super) struct LoadedModel {
+    pub(super) certified_root_raw_source: bool,
     pub(super) model: BetaCrownModel,
     pub(super) param_count: usize,
     pub(super) input_dim: usize,
@@ -39,9 +40,48 @@ pub(super) struct LoadedModel {
     pub(super) auto_branching: Option<ResolvedAutoBranching>,
 }
 
+/// #admission-precision: whether `vnnlib` is a massive per-clause-box
+/// disjunction (at least `HUGE_BOXED_CLAUSE_DISJUNCTION_MIN` clauses with
+/// their own non-empty input box): the router's
+/// `ny_core::router::admission::huge_boxed_clause_disjunction` on
+/// `spec_shape::shape_of(..).boxed_clauses`.
+pub(super) fn huge_boxed_clause_spec(vnnlib: &VnnLibSpec) -> bool {
+    ny_core::router::admission::huge_boxed_clause_disjunction(
+        super::spec_shape::shape_of(vnnlib).boxed_clauses,
+    )
+}
+
+/// Only request an automatic raw Conv load when the existing route is
+/// guaranteed to reach Graph. Current model-aware auto branching returns
+/// only InputSplit or Kfsb, both Graph routes for Conv; explicit unsupported
+/// sequential/width branches still decline. Explicit PreserveRaw is unaffected.
+fn automatic_raw_graph_route(
+    complete: CompleteVerifierArg,
+    patches: bool,
+    auto_branching: bool,
+    relu: bool,
+    input: bool,
+    explicit_branching: bool,
+    alpha: bool,
+) -> bool {
+    if complete == CompleteVerifierArg::Mip || !patches || auto_branching {
+        return true;
+    }
+    route_conv_model_to_graph(
+        true,
+        complete,
+        relu,
+        input,
+        explicit_branching,
+        alpha,
+        patches,
+    )
+    .0
+}
+
 /// Load a model from NNet or ONNX and resolve the beta-crown execution path.
 // Justification: this helper keeps the independent CLI routing knobs explicit
-// until #4246 finishes the handler decomposition; wrapping them again here
+// until the handler decomposition is finished; wrapping them again here
 // would only mirror the top-level command surface without reducing complexity.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn load_model(
@@ -68,7 +108,7 @@ pub(super) fn load_model(
     let is_nnet = model_path.extension().and_then(|ext| ext.to_str()) == Some("nnet");
     if is_nnet {
         if onnx_load_config.batch_norm_folding_policy()
-            != ny_onnx::BatchNormFoldingPolicy::LegacyEnvironment
+            == ny_onnx::BatchNormFoldingPolicy::PreserveRaw
             || onnx_load_config.require_authored_float32_initializers()
         {
             anyhow::bail!(
@@ -104,8 +144,15 @@ pub(super) fn load_model(
             .as_ref()
             .map(|r| r.use_relu_split)
             .unwrap_or(use_relu_split);
+        // Lane observable; see the ONNX branch below (#seq-plain-collector-sound).
+        eprintln!(
+            "[model-lane] lane=sequential source=nnet needs_graph=false conv2d=false \
+             conv_family=0 relu_split={} input_split=n/a conv_graph_route=false huge_disj=false",
+            resolved_relu_split
+        );
         return Ok((
             LoadedModel {
+                certified_root_raw_source: false,
                 model: BetaCrownModel::Sequential(Box::new(network)),
                 param_count: nnet.param_count(),
                 input_dim: nnet.input_size(),
@@ -120,25 +167,34 @@ pub(super) fn load_model(
         ));
     }
 
-    // The traffic Softmax certificate authenticates the exact bytes parsed
-    // below. Loading from the same owned byte slice prevents a path swap from
-    // making the digest authorize a different graph. Other routes preserve
-    // path-based loading (including its external-data support).
-    let traffic_model_bytes =
-        if terminal_peel_policy == TerminalPeelPolicy::TrafficSoftmaxSingleGroup {
-            Some(read_onnx_bytes_maybe_gzip(model_path)?)
-        } else {
-            None
-        };
-    let mut onnx_model = if let Some(bytes) = traffic_model_bytes.as_deref() {
-        let name = model_path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("traffic-model");
-        load_onnx_bytes_with_config(name, bytes, onnx_load_config)?
-    } else {
-        load_onnx_with_config(model_path, onnx_load_config)?
-    };
+    let graph_route_guaranteed = automatic_raw_graph_route(
+        complete_verifier,
+        preset_conv_mode
+            .unwrap_or_default()
+            .use_patches(enable_cuts),
+        auto_request.is_some(),
+        use_relu_split,
+        effective_branching.is_some_and(|h| matches!(h, BranchingHeuristic::InputSplit)),
+        effective_branching.is_some(),
+        use_alpha,
+    );
+    let refused_auto_config = (onnx_load_config.batch_norm_folding_policy()
+        == ny_onnx::BatchNormFoldingPolicy::StructuralCertifiedRoot
+        && !graph_route_guaranteed)
+        .then(|| {
+            onnx_load_config
+                .clone()
+                .with_batch_norm_folding_policy(ny_onnx::BatchNormFoldingPolicy::LegacyEnvironment)
+        });
+    let actual_load_config = refused_auto_config.as_ref().unwrap_or(onnx_load_config);
+    let (mut onnx_model, root_policy) =
+        load_onnx_with_config_and_root_policy(model_path, actual_load_config)?;
+    let certified_root_raw_source = root_policy.certified_root_source();
+    eprintln!(
+        "[certified-root-source] folding={:?} authored_unary_raw={}",
+        root_policy.batch_norm_folding(),
+        certified_root_raw_source
+    );
     let (network_name, layer_count, param_count) = {
         let onnx_network = &onnx_model.network;
         (
@@ -173,35 +229,6 @@ pub(super) fn load_model(
                     );
                 }
             }
-            TerminalPeelPolicy::TrafficSoftmaxSingleGroup => {
-                let name = model_path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .unwrap_or("traffic-model");
-                let (qualified_model, report) =
-                    ny_onnx::load_and_peel_terminal_softmax_single_group(
-                        name,
-                        traffic_model_bytes
-                            .as_deref()
-                            .expect("traffic policy always owns the parsed model bytes"),
-                        onnx_load_config,
-                        &mut vnnlib,
-                    )?;
-                onnx_model = qualified_model;
-                applied_terminal_peel = AppliedTerminalPeel::from_report(&report)?;
-                if !json {
-                    if report.peeled {
-                        warn!(
-                            "Peeled authenticated single-group terminal Softmax using VNN-LIB constraints."
-                        );
-                    } else {
-                        warn!(
-                            "Traffic terminal-Softmax peel declined fail-closed: {}",
-                            report.reason.as_deref().unwrap_or("unspecified reason")
-                        );
-                    }
-                }
-            }
             TerminalPeelPolicy::Off => {
                 // #cgan-sigmoid-peel compatibility seam. Even when its old
                 // env gate is armed, the ny-onnx pass declines constant-
@@ -220,16 +247,49 @@ pub(super) fn load_model(
     // Flattened input element count, needed BEFORE the routing decision so that
     // model-class-aware auto-branching can be resolved here and feed routing in a
     // single load pass.
-    let input_shape = onnx_model
-        .network
-        .inputs
-        .first()
-        .map(|input| ny_onnx::resolve_dynamic_shape(&input.shape, 1))
-        .unwrap_or_else(|| vec![1]);
+    //
+    // #multi-input-propagation (dark, `model.multi_input_concat`): when armed
+    // on a model with more than one declared graph input, the network input is
+    // the flat DECLARED-ORDER concatenation of every input, so the input box
+    // must be sized to the concatenated element count — the same layout the
+    // graph builder's Slice(+Reshape) view nodes carve back up (single shared
+    // implementation: `ny_build::concat_input_layout`, re-exported through
+    // ny-onnx). Gate off (or single input), the legacy first-input sizing is
+    // byte-identical, and a multi-input spec keeps refusing at the VNN-LIB
+    // coordinate-count validation exactly as before.
+    let multi_input_concat_armed =
+        onnx_load_config.multi_input_concat_enabled() && onnx_model.network.inputs.len() > 1;
+    // #qdq-crown-followup (DARK): the shared-input staircase IBP tightening in
+    // ny-propagate is armed by the SAME dark loader gate that admits the QDQ
+    // relaxation layers. Called unconditionally with the resolved value so a
+    // later in-process load without the gate disarms it again (default-off:
+    // every load without `model.qdq_activation_relaxation` is bit-identical).
+    ny_propagate::set_qdq_staircase_ibp(onnx_load_config.qdq_activation_relaxation_enabled());
+    let input_shape = if multi_input_concat_armed {
+        let layout = ny_onnx::concat_input_layout(&onnx_model.network.inputs)?;
+        // The lever's OWN observable (eprintln, not tracing: the vnncomp lane
+        // does not surface info-level logs) — engagement proof for the yaml
+        // route, mirroring the [qdq_relax] marker.
+        eprintln!(
+            "[multi_input] armed: {} declared inputs concatenated into a {}-element \
+             joint input box (declared order)",
+            layout.slots().len(),
+            layout.total_len()
+        );
+        vec![layout.total_len()]
+    } else {
+        onnx_model
+            .network
+            .inputs
+            .first()
+            .map(|input| ny_onnx::resolve_dynamic_shape(&input.shape, 1))
+            .unwrap_or_else(|| vec![1])
+    };
     let input_dim: usize = input_shape.iter().product();
 
     let graph_options = GraphNetworkOptions {
         compound_node_policy: CompoundNodePolicy::DecomposeNormalization,
+        multi_input_concat: multi_input_concat_armed,
         ..GraphNetworkOptions::default()
     };
     let mut graph = onnx_model.to_graph_network_with_options(graph_options)?;
@@ -339,15 +399,16 @@ pub(super) fn load_model(
     // measured-better there. `NY_DISJ_GRAPH_ROUTE=0` restores the old
     // routing. SOUND: this changes which sound lane runs, never how a proof
     // is judged.
+    //
+    // #admission-precision: the clause-box count and its threshold are
+    // `huge_boxed_clause_spec`, the router's
+    // `admission::huge_boxed_clause_disjunction` on the one extractor's shape,
+    // so the router's graph-route bound reads the same term.
     let huge_clause_box_disjunction = !needs_graph
         && !use_graph_for_conv
-        && preloaded_vnnlib.as_ref().is_some_and(|v| {
-            v.per_clause_input_bounds
-                .iter()
-                .filter(|b| !b.is_empty())
-                .count()
-                >= 512
-        })
+        && preloaded_vnnlib
+            .as_ref()
+            .is_some_and(huge_boxed_clause_spec)
         && graph.supports_ibp_f64_cell()
         && !std::env::var("NY_DISJ_GRAPH_ROUTE").is_ok_and(|v| v == "0");
     if huge_clause_box_disjunction {
@@ -357,7 +418,59 @@ pub(super) fn load_model(
         );
     }
 
-    let use_graph = needs_graph || use_graph_for_conv || huge_clause_box_disjunction;
+    // #admission-precision: the decision is the router's
+    // `admission::graph_network` (monotone in every term; the router feeds it
+    // an upper bound of each from the scan and the shape).
+    let use_graph =
+        ny_core::router::admission::graph_network(ny_core::router::admission::GraphRouteTerms {
+            n_ary: needs_graph,
+            conv: use_graph_for_conv,
+            huge_boxed_disjunction: huge_clause_box_disjunction,
+        });
+    // Lane observable (eprintln, not tracing: the vnncomp lane does not surface
+    // info-level logs). Unconditional, once per load, so a replay can prove from
+    // the row's own stderr which bound-propagation lane decided it
+    // (#seq-plain-collector-sound: the sequential lane's plain collector now
+    // routes conv-family/AveragePool layers through their certified forwards;
+    // `conv_family` counts the layers that change under that repair).
+    let conv_family_nodes = graph
+        .node_names()
+        .iter()
+        .filter(|name| {
+            graph.node(name.as_str()).is_some_and(|node| {
+                matches!(
+                    node.layer(),
+                    Layer::Conv1d(_)
+                        | Layer::Conv2d(_)
+                        | Layer::ConvTranspose1d(_)
+                        | Layer::ConvTranspose2d(_)
+                        | Layer::AveragePool(_)
+                )
+            })
+        })
+        .count();
+    eprintln!(
+        "[model-lane] lane={} source=onnx needs_graph={} conv2d={} conv_family={} \
+         relu_split={} input_split={} conv_graph_route={} huge_disj={}",
+        if use_graph { "graph" } else { "sequential" },
+        needs_graph,
+        has_conv2d,
+        conv_family_nodes,
+        routed_relu_split,
+        is_input_split,
+        use_graph_for_conv,
+        huge_clause_box_disjunction,
+    );
+    if multi_input_concat_armed && !use_graph {
+        // The concat-view adapter exists only on the GraphNetwork path; the
+        // Sequential lowering has no notion of input view nodes and would
+        // silently mis-wire a multi-input model. Fail closed.
+        anyhow::bail!(
+            "model.multi_input_concat: model declares {} graph inputs but routed to the \
+             Sequential lane; multi-input propagation exists only on the GraphNetwork path",
+            onnx_model.network.inputs.len()
+        );
+    }
     let output_dim = onnx_model
         .network
         .outputs
@@ -377,6 +490,7 @@ pub(super) fn load_model(
 
     Ok((
         LoadedModel {
+            certified_root_raw_source,
             model,
             param_count,
             input_dim,
@@ -389,4 +503,57 @@ pub(super) fn load_model(
         },
         routed_relu_split,
     ))
+}
+
+#[cfg(test)]
+mod certified_root_route_tests {
+    use super::*;
+    #[test]
+    fn automatic_raw_load_requires_a_guaranteed_existing_graph_consumer() {
+        let ordinary = CompleteVerifierArg::Bab;
+        assert!(automatic_raw_graph_route(
+            CompleteVerifierArg::Mip,
+            true,
+            true,
+            false,
+            false,
+            true,
+            false
+        ));
+        assert!(automatic_raw_graph_route(
+            ordinary, false, true, false, false, true, false
+        ));
+        assert!(automatic_raw_graph_route(
+            ordinary, true, true, false, false, false, false
+        ));
+        // Bind the pre-load inference to the actual current auto resolver's
+        // low/high/MIP cases; both possible branch families reach Graph.
+        use crate::commands::beta_crown::branching::{auto_select_branching, ModelClassSignals};
+        for (input_element_count, mip_complete_verifier) in [(1, false), (3072, false), (1, true)] {
+            let (heuristic, _) = auto_select_branching(ModelClassSignals {
+                input_element_count,
+                mip_complete_verifier,
+                structure: None,
+            });
+            let relu = matches!(heuristic, BranchingHeuristic::Kfsb);
+            let input = matches!(heuristic, BranchingHeuristic::InputSplit);
+            assert!(relu || input);
+            assert!(route_conv_model_to_graph(true, ordinary, relu, input, true, false, true).0);
+        }
+        assert!(automatic_raw_graph_route(
+            ordinary, true, false, true, false, true, false
+        ));
+        assert!(automatic_raw_graph_route(
+            ordinary, true, false, false, true, true, false
+        ));
+        assert!(automatic_raw_graph_route(
+            ordinary, true, false, false, false, false, true
+        ));
+        assert!(!automatic_raw_graph_route(
+            ordinary, true, false, false, false, true, true
+        ));
+        assert!(!automatic_raw_graph_route(
+            ordinary, true, false, false, false, false, false
+        ));
+    }
 }

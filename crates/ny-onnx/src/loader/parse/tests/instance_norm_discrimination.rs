@@ -125,6 +125,7 @@ fn channel_affine_after_last_axis_normalization_is_not_fused_as_layer_norm() {
         false,
         BatchNormFoldingPolicy::LegacyEnvironment,
         false,
+        false,
     )
     .expect("parse onnx bytes");
 
@@ -161,6 +162,7 @@ fn one_dimensional_last_axis_affine_still_fuses_as_layer_norm() {
         &ShapeInferBackend::InProcess,
         false,
         BatchNormFoldingPolicy::LegacyEnvironment,
+        false,
         false,
     )
     .expect("parse onnx bytes");

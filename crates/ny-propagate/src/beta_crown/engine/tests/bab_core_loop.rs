@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Unit tests for the BaB engine core verification loop (#2568).
+//! Unit tests for the BaB engine core verification loop.
 //!
 //! Covers: BabLoopState transitions, pop_domain_batch queue behavior,
 //! domain priority ordering, prefilter_domain_batch status classification,

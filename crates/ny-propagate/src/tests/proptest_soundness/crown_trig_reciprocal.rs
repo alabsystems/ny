@@ -11,8 +11,6 @@
 //!
 //! Identity-bounds tests verify the relaxation envelope directly. Negative-coeff
 //! and asymmetric tests exercise sign-switching in crown_elementwise_backward.
-//!
-//! Part of #40, #1793.
 
 use crate::layers::{ArctanLayer, ReciprocalLayer, TanLayer};
 use crate::LinearBounds;
@@ -661,7 +659,7 @@ proptest! {
 #[ntest::timeout(10000)]
 #[test]
 fn regression_reciprocal_near_zero_positive_upper_endpoint_sound() {
-    // Counterexample family from #2225 prover audit: near-zero positive interval.
+    // Counterexample family from a prover audit: near-zero positive interval.
     let l = 2.333_718_9e-7_f32;
     let u = 2.339_029_7e-7_f32;
 
@@ -686,7 +684,7 @@ fn regression_reciprocal_near_zero_positive_upper_endpoint_sound() {
 #[ntest::timeout(10000)]
 #[test]
 fn regression_reciprocal_near_zero_negative_lower_endpoint_sound() {
-    // Counterexample family from #2225 prover audit: near-zero negative interval.
+    // Counterexample family from a prover audit: near-zero negative interval.
     let l = -1.632_887_7e-6_f32;
     let u = -1.630_305_7e-6_f32;
 

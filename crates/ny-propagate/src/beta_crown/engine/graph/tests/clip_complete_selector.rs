@@ -56,8 +56,6 @@ fn selector_test_config(input_clip_type: InputClipType) -> BetaCrownConfig {
     }
 }
 
-/// Behavioral seam for #3878.
-///
 /// If the multi-objective selector ever regresses to the relaxed single-row
 /// path while `input_clip_type == Complete`, this test flips from
 /// `Verified` to `Unknown`: the relaxed route cannot prove the contradictory

@@ -8,8 +8,6 @@
 //! CROWN backward are exact — no relaxation error. The soundness property:
 //! for any concrete x in the input bounds, the rotated output R(θ)·x must
 //! lie within the computed output bounds.
-//!
-//! Part of #3145.
 
 use crate::layers::common::BoundPropagation;
 use crate::layers::rope::RopeLayer;

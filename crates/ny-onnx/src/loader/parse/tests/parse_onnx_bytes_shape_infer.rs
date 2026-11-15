@@ -99,6 +99,7 @@ fn test_parse_onnx_bytes_includes_ort_inferred_shapes() {
         false,
         BatchNormFoldingPolicy::LegacyEnvironment,
         false,
+        false,
     )
     .expect("parse onnx bytes");
 
@@ -119,6 +120,7 @@ fn test_parse_onnx_bytes_skip_shape_inference_omits_intermediate_shapes() {
         &ShapeInferBackend::InProcess,
         false,
         BatchNormFoldingPolicy::LegacyEnvironment,
+        false,
         false,
     )
     .expect("parse onnx bytes");
@@ -166,6 +168,7 @@ fn test_parse_onnx_bytes_retains_scalar_output_shape() {
         &ShapeInferBackend::InProcess,
         false,
         BatchNormFoldingPolicy::LegacyEnvironment,
+        false,
         false,
     )
     .expect("parse onnx bytes");
@@ -241,6 +244,7 @@ fn test_parse_onnx_bytes_retains_inferred_gemm_shape() {
         &ShapeInferBackend::InProcess,
         false,
         BatchNormFoldingPolicy::LegacyEnvironment,
+        false,
         false,
     )
     .expect("parse onnx bytes");

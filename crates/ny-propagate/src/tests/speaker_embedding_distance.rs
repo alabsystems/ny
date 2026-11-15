@@ -2,10 +2,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Synthetic speaker embedding distance verification for avoice (#3499).
+//! Synthetic speaker embedding distance verification for avoice.
 //!
-//! This module executes the pre-ONNX slice from
-//! `designs/2026-03-10-avoice-crown-capability-triage.md`:
+//! This module executes the pre-ONNX slice:
 //! - speaker encoder alone
 //! - vocoder -> speaker encoder composition
 //! - cosine-distance head on the composed graph
@@ -606,29 +605,20 @@ fn test_speaker_encoder_crown_tighter_than_ibp_3499() {
 // Proptests: soundness sampling with randomised inputs
 // ---------------------------------------------------------------------------
 
-// CASE COUNTS ARE MATCHED TO MEASURED PER-CASE COST, which is why these three
-// tests sit in three blocks rather than one.
-//
-// !! MEASUREMENT CORRECTION, 2026-08-20 !! The original split cited 119.75s for
-// the noninverted property and claimed ~122s of savings. That measurement was
-// taken while 14 stray busy-loop processes from my own earlier load experiment
-// were saturating this 14-core box, and it was inflated roughly 4x. Clean-box
-// figures, all at 200 cases:
+// Clean-box per-case cost (2026-08-20), all at 200 cases:
 //
 //   proptest_cosine_distance_nonnegative_3499        0.45s  (IBP only)
 //   proptest_speaker_encoder_bounds_contain_concrete ~24s   (+ CROWN)
 //   proptest_cosine_distance_crown_bounds_noninvert  ~28s   (+ CROWN)
 //
-// ~52s for the two CROWN properties, not 146s. They are still the slowest tests
-// in the crate, but they are not the pathology the first version of this comment
-// described, and cutting soundness coverage on the strength of a bad number is
-// not a trade worth keeping. BOTH ARE RESTORED TO THEIR ORIGINAL 200 CASES.
+// ~52s for the two CROWN properties. They are the slowest tests in the crate, but
+// not slow enough to justify cutting soundness coverage, so all three keep 200
+// cases. (An earlier 119.75s figure for the noninverted property was taken on a
+// saturated box and was inflated roughly 4x.)
 //
-// The one thing that survives from the original analysis, because it was a
-// structural check rather than a timing: the setup is NOT the cost, so hoisting
-// it would buy nothing. The IBP test rebuilds the reference embedding and the
-// whole encoder graph 200 times too, and finishes in under half a second. The
-// cost is `propagate_crown` end to end.
+// The setup is NOT the cost, so hoisting it would buy nothing: the IBP test
+// rebuilds the reference embedding and the whole encoder graph 200 times too,
+// and finishes in under half a second. The cost is `propagate_crown` end to end.
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(200) })]
 

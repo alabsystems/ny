@@ -7,8 +7,6 @@
 //! Initializes and optimizes MulBinary alphas (McCormick facet interpolation
 //! parameters) using SPSA gradient estimation. The optimized alphas are
 //! frozen at the root domain and reused for all per-domain CROWN passes.
-//!
-//! Part of #3439 Phase 4.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -107,8 +105,6 @@ pub(crate) fn maybe_optimize_mul_binary_alphas(
 /// Returns a map from node name to `[2, n]` array where row 0 = r_l (lower facet
 /// interpolation) and row 1 = r_u (upper facet interpolation). Initialized to 0.5
 /// (equivalent to default McCormick Middle mode).
-///
-/// Part of #3439 Phase 4.
 fn init_mul_binary_alphas(
     graph: &GraphNetwork,
     node_bounds: &HashMap<String, BoundedTensor>,
@@ -134,7 +130,6 @@ fn init_mul_binary_alphas(
 ///
 /// Reference: Same SPSA approach as propagate_dag.rs MulBinary supplement
 /// (lines 1002-1120), adapted for spec-guided CROWN backward.
-/// Part of #3439 Phase 4.
 #[allow(clippy::too_many_arguments)]
 fn optimize_mul_binary_alphas_spsa(
     graph: &GraphNetwork,
@@ -147,6 +142,8 @@ fn optimize_mul_binary_alphas_spsa(
     iterations: usize,
     lr: f32,
 ) -> Result<bool> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::AlphaOpt);
     use rand::RngExt;
 
     if alphas.is_empty() || iterations == 0 {

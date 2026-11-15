@@ -23,7 +23,11 @@ impl BetaCrownVerifier {
     // Justification: Aggregation needs results, threshold, queue + priority fn,
     // lifecycle and cut pool - the full BaB iteration context.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn aggregate_bab_results(
+    /// #genbab-precomputed-lane widened this from `pub(super)`: the
+    /// precomputed-bounds lane (`graph::relu_split_bounds`) is a SIBLING
+    /// module, and it must fold a `GraphDomainResult` with exactly these
+    /// semantics rather than growing a second copy that can drift.
+    pub(in crate::beta_crown::engine::graph) fn aggregate_bab_results(
         &self,
         results: Vec<GraphDomainResult>,
         threshold: f32,
@@ -78,7 +82,7 @@ impl BetaCrownVerifier {
                     }
                 }
                 GraphDomainResult::PropagationFailure => {
-                    // #1861: child propagation failed, input sub-region unexplored
+                    // Child propagation failed, input sub-region unexplored
                     lifecycle.unresolved_due_to_propagation_failure = true;
                 }
             }

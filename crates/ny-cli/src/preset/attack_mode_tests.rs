@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for attack_mode preset parsing (#1449).
+//! Tests for attack_mode preset parsing.
 
 use super::apply::apply_preset;
 use super::*;
@@ -35,7 +35,7 @@ fn vnncomp_relational_exact_gradient_opt_in_is_typed_default_off_and_closed() {
     );
 }
 
-/// #1449: attack_mode 'diversed_PGD' maps to PgdInitialization::Osi.
+/// attack_mode 'diversed_PGD' maps to PgdInitialization::Osi.
 #[test]
 fn apply_preset_attack_mode_diversed_pgd_sets_osi_1449() {
     let preset = PresetConfig {
@@ -54,7 +54,7 @@ fn apply_preset_attack_mode_diversed_pgd_sets_osi_1449() {
     );
 }
 
-/// #1449: attack_mode 'PGD' maps to PgdInitialization::Uniform.
+/// attack_mode 'PGD' maps to PgdInitialization::Uniform.
 #[test]
 fn apply_preset_attack_mode_pgd_sets_uniform_1449() {
     let preset = PresetConfig {
@@ -73,7 +73,7 @@ fn apply_preset_attack_mode_pgd_sets_uniform_1449() {
     );
 }
 
-/// #1449: attack_mode 'diversed_GAMA_PGD' maps to OSI initialization + GAMA.
+/// attack_mode 'diversed_GAMA_PGD' maps to OSI initialization + GAMA.
 #[test]
 fn apply_preset_attack_mode_gama_sets_osi_and_gama_1449() {
     let preset = PresetConfig {
@@ -96,7 +96,7 @@ fn apply_preset_attack_mode_gama_sets_osi_and_gama_1449() {
     );
 }
 
-/// #1449: plain modes leave the GAMA guidance loss off.
+/// Plain modes leave the GAMA guidance loss off.
 #[test]
 fn apply_preset_attack_mode_diversed_pgd_leaves_gama_off_1449() {
     let preset = PresetConfig {
@@ -114,7 +114,7 @@ fn apply_preset_attack_mode_diversed_pgd_leaves_gama_off_1449() {
     );
 }
 
-/// #1449: pgd_gama resolves to Some(GAMA_LAMBDA_DEFAULT) in the runtime attack config.
+/// pgd_gama resolves to Some(GAMA_LAMBDA_DEFAULT) in the runtime attack config.
 #[test]
 fn pgd_gama_wires_to_pgd_attack_config_gama_lambda_1449() {
     let config = BetaCrownConfig {
@@ -134,7 +134,7 @@ fn pgd_gama_wires_to_pgd_attack_config_gama_lambda_1449() {
     );
 }
 
-/// #1449: unknown attack_mode is rejected with a helpful message.
+/// Unknown attack_mode is rejected with a helpful message.
 #[test]
 fn apply_preset_attack_mode_unknown_rejected_1449() {
     let preset = PresetConfig {
@@ -153,7 +153,7 @@ fn apply_preset_attack_mode_unknown_rejected_1449() {
     );
 }
 
-/// #1449: osi_steps preset field wires through to BetaCrownConfig.pgd_osi_steps.
+/// osi_steps preset field wires through to BetaCrownConfig.pgd_osi_steps.
 #[test]
 fn apply_preset_osi_steps_wires_to_config_1449() {
     let preset = PresetConfig {
@@ -227,7 +227,7 @@ fn traffic_signs_preset_arms_surrogate_sign_gradient() {
     );
 }
 
-/// #1449: dist_shift_2023.yaml has attack_mode: diversed_PGD (reference parity).
+/// dist_shift_2023.yaml has attack_mode: diversed_PGD (reference parity).
 #[test]
 fn dist_shift_preset_has_diversed_pgd_attack_mode_1449() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -248,7 +248,7 @@ fn dist_shift_preset_has_diversed_pgd_attack_mode_1449() {
     );
 }
 
-/// #1449: relusplitter.yaml has attack_mode: diversed_PGD that parses to Osi.
+/// relusplitter.yaml has attack_mode: diversed_PGD that parses to Osi.
 #[test]
 fn relusplitter_preset_has_diversed_pgd_attack_mode_1449() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

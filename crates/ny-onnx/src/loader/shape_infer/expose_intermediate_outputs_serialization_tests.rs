@@ -86,7 +86,7 @@ fn expose_outputs_skips_serialization_without_runtime_inputs() {
     let exposed = expose_intermediate_outputs(&bytes).expect("expose outputs");
 
     assert!(!exposed.has_runtime_inputs);
-    assert!(exposed.bytes.is_empty());
+    assert_eq!((exposed.bytes).len(), 0);
 }
 
 #[test]
@@ -113,7 +113,7 @@ fn expose_outputs_serializes_with_runtime_inputs() {
     let exposed = expose_intermediate_outputs(&bytes).expect("expose outputs");
 
     assert!(exposed.has_runtime_inputs);
-    assert!(!exposed.bytes.is_empty());
+    assert_ne!((exposed.bytes).len(), 0);
 }
 
 #[test]

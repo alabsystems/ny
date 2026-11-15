@@ -24,7 +24,7 @@ prepare_pinned_clean "$WORK/clean"
 # --- generate NY's certificates and check them with Clean's verifier ---
 echo "Generating NY certificates…"
 OUT="$WORK/certs"; mkdir -p "$OUT"
-( cd "$NY_DIR" && NY_CERT_OUT_DIR="$OUT" cargo test -q -p ny-cert --test relu_entailment_roundtrip json_matches >/dev/null )
+( cd "$NY_DIR" && NY_CERT_OUT_DIR="$OUT" targo --unverified test -q -p ny-cert --test relu_entailment_roundtrip json_matches >/dev/null )
 
 echo "=== Clean verifier verdicts on NY-emitted certificates ==="
 "$CLEAN_BIN" cert verify-external "$OUT/ny_relu1_entailment.json"

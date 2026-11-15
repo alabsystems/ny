@@ -76,7 +76,7 @@
 // Spec: docs/GRAPH_MIP_ENCODER_FOR_CIFAR100.md (increment 1).
 //
 // Increment 5b introduced the older direct escalation entry
-// ([`try_graph_mip_escalation`]). It remains for tests/reference, but dispatch
+// ([`try_graph_mip_escalation`]). It remains for tests and reference, but dispatch
 // no longer calls it after the strict planner declines: doing so would bypass
 // the strict path's pre-encode NNZ envelope. This legacy entry is UNSAT-ONLY BY
 // CONSTRUCTION: its success value ([`GraphMipCertifiedUnsat`]) cannot carry a
@@ -3092,8 +3092,10 @@ mod region_selector_tests {
         for (selector_bit, gate) in gates.iter().enumerate() {
             let latent_index = AY_TAIL_REGION_SELECTOR_K4_SPLIT_DIMS[selector_bit];
             let stored_boundary = regions[0].flatten().upper()[latent_index];
-            let midpoint =
-                (flat_root.lower()[latent_index] + flat_root.upper()[latent_index]) * 0.5;
+            let midpoint = f32::midpoint(
+                flat_root.lower()[latent_index],
+                flat_root.upper()[latent_index],
+            );
             assert_eq!(gate.selector_bit, selector_bit);
             assert_eq!(gate.latent_index, latent_index);
             assert_eq!(
@@ -8542,8 +8544,8 @@ fn alpha_output_bound(
         // Sound: a pure reference-bounds quality choice inside the collector.
         fix_interm_bounds: false,
         // SPSA gradients: the default AnalyticChain cannot build its A-matrix
-        // chain through the mscn Concat/MulBinary/Div topology (#1937 "missing
-        // both A matrix and pre-ReLU bounds" for every ReLU) so α never moves;
+        // chain through the mscn Concat/MulBinary/Div topology ("missing both
+        // A matrix and pre-ReLU bounds" for every ReLU) so α never moves;
         // SPSA only needs bound evaluations. Gradient choice is
         // non-soundness-critical — any α ∈ [0,1] yields a valid relaxation,
         // gradients only steer.
@@ -8707,8 +8709,10 @@ pub(crate) fn try_graph_mip_escalation(
     backend: MipBackend,
     mip_timeout_secs: u64,
 ) -> Option<GraphMipCertifiedUnsat> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Mip);
     // Gate: default-on, with an exact-zero kill switch. This legacy entry is
-    // retained for tests/reference; production dispatch uses the stricter
+    // retained for tests and reference; production dispatch uses the stricter
     // planner in `graph_mip_escalate` and never falls through to this encoder.
     if !graph_mip_enabled() {
         return None;
@@ -8792,8 +8796,9 @@ pub(crate) fn try_graph_mip_escalation(
     graph.set_crown_ibp_per_node_time_budget(ny_propagate::types::CrownIbpPerNodeTimeBudget {
         floor_secs: Some(GRAPH_MIP_CROWN_PER_NODE_FLOOR_SECS),
         cap_secs: None,
-    prefix_cost_weighted: false,
+        prefix_cost_weighted: false,
         max_target_share_frac: None,
+        floor_dim_scaled: false,
     });
     // inc5e — ONE private clone retargeted (`set_output`) to the node whose
     // columns are the encoding's `output_vars` (the peeled logit for a final
@@ -9126,22 +9131,21 @@ pub(crate) fn try_graph_mip_escalation(
         match MipSolver::new(parts, config).check_feasibility() {
             Ok(MipResult::Unsat { certified: true }) => {
                 // Clause certified impossible; continue with the next one.
-                // inc5d attribution: `certified: true` is minted ONLY for
-                // root-LP infeasibility with a verified Farkas witness
-                // (ny-mip/src/ay_lib.rs) — so this line distinguishes
-                // root-certified from branched-uncertified per clause.
+                // NY replays root, whole-tree and supplemental artifacts.
+                // This boolean establishes successful NY evidence replay;
+                // ay_lib separately reports the admitted supplemental kind.
                 info!(
-                    "graph-MIP escalation: clause {}/{n_clauses} ROOT-CERTIFIED infeasible \
-                     (verified Farkas) in {:.2}s (bounds: {bounds_source})",
+                    "graph-MIP escalation: clause {}/{n_clauses} CERTIFIED infeasible \
+                     (evidence replayed by NY) in {:.2}s (bounds: {bounds_source})",
                     clause_idx + 1,
                     clause_start.elapsed().as_secs_f64()
                 );
             }
             Ok(MipResult::Unsat { certified: false }) => {
                 info!(
-                    "graph-MIP escalation: clause {}/{n_clauses} infeasible only via BRANCHED \
-                     search (case-split, no root-LP Farkas certificate) after {:.2}s (bounds: \
-                     {bounds_source}); fail closed (certified evidence is required)",
+                    "graph-MIP escalation: clause {}/{n_clauses} infeasible without replayed \
+                     evidence after {:.2}s (bounds: {bounds_source}); fail closed \
+                     (certified evidence is required)",
                     clause_idx + 1,
                     clause_start.elapsed().as_secs_f64()
                 );
@@ -9267,7 +9271,7 @@ pub(super) fn run_mscn_per_clause_table_research(bench_dir: &Path) -> Result<()>
             "per-clause table: clause {}/{clause_count} -> {} in {:.2}s (budget {budget}s)",
             clause_index + 1,
             if outcome.is_some() {
-                "ROOT-CERTIFIED unsat"
+                "CERTIFIED unsat"
             } else {
                 "not certified (see info trail)"
             },

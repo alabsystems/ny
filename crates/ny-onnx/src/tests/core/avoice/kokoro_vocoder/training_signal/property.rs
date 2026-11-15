@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Kokoro vocoder deep-prefix property-lane canary (#3755).
+//! Kokoro vocoder deep-prefix property-lane canary.
 //!
 //! Moves Kokoro from the 2-node OutputWidth prefix smoke to the 12-node deep
 //! prefix (through first Conv1d after ConvTranspose1d) and exercises the
@@ -226,14 +226,12 @@ fn assert_kokoro_property_matches_oracle(
     );
 }
 
-/// Deep-prefix property-lane smoke test (#3755).
+/// Deep-prefix property-lane smoke test.
 ///
 /// Proves that the SweepObjective::Linear property lane works on the Kokoro
 /// vocoder's 12-node deep prefix (through first Conv1d after ConvTranspose1d).
 /// This exercises spec-guided CROWN through the ResBlock cycle with boundary-
 /// spec objectives and validates the recorded metrics match a direct oracle.
-///
-/// Part of #3755.
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
 #[cfg(feature = "external-avoice")]

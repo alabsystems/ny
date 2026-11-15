@@ -266,7 +266,7 @@ fn build_scatter_add_src_map(
     for (src_k, coord) in ndarray::indices(src_shape).into_iter().enumerate() {
         let coord_vec: Vec<usize> = (0..src_shape.len()).map(|d| coord[d]).collect();
         let scatter_idx = normalize_index(indices[IxDyn(&coord_vec)], axis_len, "ScatterAdd")?;
-        let mut out_coord = coord_vec.clone();
+        let mut out_coord = coord_vec;
         out_coord[axis] = scatter_idx;
         let out_flat: usize = out_coord
             .iter()
@@ -298,7 +298,7 @@ fn build_index_add_src_map(
         let coord_vec: Vec<usize> = (0..src_shape.len()).map(|d| coord[d]).collect();
         let scatter_idx =
             normalize_index(indices[IxDyn(&[coord_vec[axis]])], axis_len, "IndexAdd")?;
-        let mut out_coord = coord_vec.clone();
+        let mut out_coord = coord_vec;
         out_coord[axis] = scatter_idx;
         let out_flat: usize = out_coord
             .iter()

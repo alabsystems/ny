@@ -31,9 +31,12 @@ fn test_get_decisions_gelu_network() {
     .unwrap();
     let _output_bounds = graph.propagate_ibp(&input).unwrap();
 
+    // #genbab-selector-convention: the selector scores an activation on its
+    // INPUT's entry (`node_bounds[node.inputs[0]]`), so these pre-activation
+    // intervals live under `linear1`, not under `gelu`.
     let mut node_bounds = std::collections::HashMap::new();
     node_bounds.insert(
-        "gelu".to_string(),
+        "linear1".to_string(),
         BoundedTensor::new(
             arr1(&[-1.5_f32, -0.4]).into_dyn(),
             arr1(&[1.5_f32, 1.2]).into_dyn(),

@@ -4,9 +4,9 @@
 
 //! FULL kernel-checked branch-tree certificate for `tllverifybench` `instance_6_0`.
 //!
-//! Where `examples/tll_instance_6_0.rs` proof-carries the single BINDING cell
-//! (the slice that achieves the global min), THIS example certifies the WHOLE
-//! UNSAT verdict: `min_x y(x) > threshold` over the entire box `[-2,2]^2`.
+//! THIS example certifies the WHOLE UNSAT verdict, `min_x y(x) > threshold` over
+//! the entire box `[-2,2]^2`, not only the single BINDING cell (the slice that
+//! achieves the global min).
 //!
 //! `y(x) = max_j min_{i∈S_j} L_i(x)` is not bounded below by one flat Farkas
 //! combination — the verdict is a MIN over the `nx×nx` cell partition of the
@@ -31,7 +31,7 @@
 //! envelope. Exact rational end to end; `global_LB = min_C m_C =
 //! -39840843/16777216 ≈ -2.3747 > -3.0427` (threshold).
 //!
-//! Run: `cargo run -p ny-cert --example tll_instance_6_0_full -- [out_dir]`
+//! Run: `targo --unverified run -p ny-cert --example tll_instance_6_0_full -- [out_dir]`
 
 use ny_cert::{
     branch_tree_leaf_batch_json, branch_tree_to_json, check_branch_tree, AxisPartition, BranchLeaf,

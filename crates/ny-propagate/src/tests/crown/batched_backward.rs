@@ -7,10 +7,8 @@
 //!
 //! These tests cover the shared batched CROWN backward helper used by 18+
 //! elementwise activations. Coverage targets: coefficient × relaxation composition,
-//! directed rounding, f64 bias accumulation, non-finite row fallback (#3009),
-//! zero-coefficient handling (#1736), and neuron index forwarding.
-//!
-//! Part of #3463.
+//! directed rounding, f64 bias accumulation, non-finite row fallback,
+//! zero-coefficient handling, and neuron index forwarding.
 
 use crate::layers::activations::LinearRelaxation;
 use crate::layers::common::{
@@ -156,7 +154,7 @@ fn test_crown_elementwise_backward_batched_multi_batch() {
     assert_eq!(result.upper_b()[[1, 0]], next_up_f32(-3.5));
 }
 
-/// Non-finite coefficient overflow → row fallback (#3009).
+/// Non-finite coefficient overflow → row fallback.
 ///
 /// When coeff × slope overflows to ±Inf, the entire output row is zeroed
 /// and the bias is set to ±Inf (maximally conservative but sound).
@@ -200,7 +198,7 @@ fn test_crown_elementwise_backward_batched_nonfinite_row_fallback() {
     assert_eq!(result.upper_b()[[0]], f32::INFINITY);
 }
 
-/// Zero coefficients produce no contribution and no NaN (#1736).
+/// Zero coefficients produce no contribution and no NaN.
 ///
 /// When a coefficient is exactly 0.0, compose_lower/compose_upper returns
 /// ComposeResult::ZERO without touching the relaxation slopes (which could be

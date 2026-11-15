@@ -5,6 +5,9 @@ edition = "2021"
 license.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 # The ONE crate in the workspace allowed to touch wgpu's unsafe passthrough
 # API. ny-gpu carries `#![forbid(unsafe_code)]` — a soundness stance this crate
 # deliberately does not weaken: the single unsafe call here is wrapped in a

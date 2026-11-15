@@ -271,8 +271,26 @@ impl Json {
     /// Returns `None` when the value is of the wrong kind or the key/index is
     /// absent — never panics.
     #[must_use]
-    pub fn get<I: Index>(&self, index: I) -> Option<&Json> {
-        index.index_into(self)
+    pub fn get(&self, key: &str) -> Option<&Json> {
+        match *self {
+            Json::Obj(ref m) => m.get(key),
+            _ => None,
+        }
+    }
+
+    /// Array-element lookup by position.
+    ///
+    /// Returns `None` when the value is not an array or the index is out of
+    /// range — never panics. (R183: the former generic `get<I: Index>` entry
+    /// point charged an unresolvable `<I as Index>::index_into` absent-callee
+    /// obligation on every bundle containing it; the concrete pair is the same
+    /// API surface with monomorphic, provable bodies.)
+    #[must_use]
+    pub fn get_index(&self, index: usize) -> Option<&Json> {
+        match *self {
+            Json::Arr(ref v) => v.get(index),
+            _ => None,
+        }
     }
 
     /// Replace this value with `Null`, returning the old value.
@@ -362,55 +380,26 @@ impl fmt::Display for Json {
 // =============================================================================
 
 /// A type that can address a member of a [`Json`] value.
-///
-/// Implemented for `str`/`String` (object member) and `usize` (array element).
-pub trait Index {
-    /// Resolve `self` against `value`, or `None` if absent / wrong kind.
-    #[doc(hidden)]
-    fn index_into<'v>(&self, value: &'v Json) -> Option<&'v Json>;
-}
-
-impl Index for str {
-    fn index_into<'v>(&self, value: &'v Json) -> Option<&'v Json> {
-        match *value {
-            Json::Obj(ref m) => m.get(self),
-            _ => None,
-        }
-    }
-}
-
-impl Index for String {
-    fn index_into<'v>(&self, value: &'v Json) -> Option<&'v Json> {
-        self.as_str().index_into(value)
-    }
-}
-
-impl Index for usize {
-    fn index_into<'v>(&self, value: &'v Json) -> Option<&'v Json> {
-        match *value {
-            Json::Arr(ref v) => v.get(*self),
-            _ => None,
-        }
-    }
-}
-
-impl<T> Index for &T
-where
-    T: ?Sized + Index,
-{
-    fn index_into<'v>(&self, value: &'v Json) -> Option<&'v Json> {
-        (**self).index_into(value)
-    }
-}
-
-/// Total indexing: an absent key, an out-of-range position, or a wrong-kind
-/// value all yield `Null` instead of panicking — matching `serde_json`.
-impl<I: Index> std::ops::Index<I> for Json {
+/// Total indexing: an absent key or a wrong-kind value yields `Null` instead
+/// of panicking — matching `serde_json`. (R183: concrete impls; the former
+/// `Index` trait's generic dispatch charged unresolvable absent-callee
+/// obligations in every containing bundle.)
+impl std::ops::Index<&str> for Json {
     type Output = Json;
 
-    fn index(&self, index: I) -> &Json {
+    fn index(&self, key: &str) -> &Json {
         static NULL: Json = Json::Null;
-        index.index_into(self).unwrap_or(&NULL)
+        self.get(key).unwrap_or(&NULL)
+    }
+}
+
+/// Total array indexing: out-of-range or wrong-kind yields `Null`.
+impl std::ops::Index<usize> for Json {
+    type Output = Json;
+
+    fn index(&self, index: usize) -> &Json {
+        static NULL: Json = Json::Null;
+        self.get_index(index).unwrap_or(&NULL)
     }
 }
 
@@ -510,14 +499,6 @@ impl IntoIterator for Map {
     }
 }
 
-impl FromIterator<(String, Json)> for Map {
-    fn from_iter<T: IntoIterator<Item = (String, Json)>>(iter: T) -> Self {
-        Self {
-            entries: iter.into_iter().collect(),
-        }
-    }
-}
-
 impl From<BTreeMap<String, Json>> for Map {
     fn from(entries: BTreeMap<String, Json>) -> Self {
         Self { entries }
@@ -552,33 +533,34 @@ impl From<Map> for Json {
     }
 }
 
-impl<T: Into<Json>> From<Vec<T>> for Json {
-    fn from(v: Vec<T>) -> Self {
+// R183: the former generic `From<Vec<T>>`/`From<&[T]>`/`From<Option<T>>`
+// blanket impls each charged an unresolvable `<T as Into<Json>>::into`
+// absent-callee obligation. The concrete set below covers every in-crate
+// instantiation (measured: `Vec<String>` and `Option<&str>` via the `json!`
+// macro, plus the identity `Vec<Json>`), with monomorphic provable bodies.
+impl From<Vec<Json>> for Json {
+    fn from(v: Vec<Json>) -> Self {
+        Self::Arr(v)
+    }
+}
+
+impl From<Vec<String>> for Json {
+    fn from(v: Vec<String>) -> Self {
         // Explicit loop rather than `.into_iter().map(..).collect()`: identical
         // elements and order, but no closure bundle and no bulk-allocation
         // obligation for the verifier.
         let mut out: Vec<Json> = Vec::new();
         for item in v {
-            out.push(item.into());
+            out.push(Json::Str(item));
         }
         Self::Arr(out)
     }
 }
 
-impl<T: Clone + Into<Json>> From<&[T]> for Json {
-    fn from(v: &[T]) -> Self {
-        let mut out: Vec<Json> = Vec::new();
-        for item in v {
-            out.push(item.clone().into());
-        }
-        Self::Arr(out)
-    }
-}
-
-impl<T: Into<Json>> From<Option<T>> for Json {
-    fn from(v: Option<T>) -> Self {
+impl From<Option<&str>> for Json {
+    fn from(v: Option<&str>) -> Self {
         match v {
-            Some(inner) => inner.into(),
+            Some(inner) => Self::from(inner),
             None => Self::Null,
         }
     }
@@ -683,16 +665,6 @@ impl From<f64> for Json {
 impl From<f32> for Json {
     fn from(f: f32) -> Self {
         Self::from(f64::from(f))
-    }
-}
-
-impl<T: Into<Json>> FromIterator<T> for Json {
-    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        let mut out: Vec<Json> = Vec::new();
-        for item in iter {
-            out.push(item.into());
-        }
-        Self::Arr(out)
     }
 }
 

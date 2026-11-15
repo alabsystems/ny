@@ -271,7 +271,7 @@ impl WeightStore {
     /// NaN in weight matrices silently propagates through matrix
     /// multiplications and produces unsound verification results.
     /// Call at model-loading boundaries after all weights are loaded
-    /// (including batch-norm fold and constant fold). See #2791.
+    /// (including batch-norm fold and constant fold).
     ///
     /// Note: Inf values are permitted because ONNX Slice uses +Inf as a
     /// sentinel for "to end". Inf in actual weight matrices is caught

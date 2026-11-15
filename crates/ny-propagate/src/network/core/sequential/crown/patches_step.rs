@@ -4,7 +4,7 @@
 
 //! Patches-aware CROWN backward step dispatch.
 //!
-//! Extracted from `crown.rs` as Packet 1 of the three-module extraction (#4005).
+//! Extracted from `crown.rs` as Packet 1 of the three-module extraction.
 //! Contains [`crown_backward_step_patches`] and the shared
 //! [`try_patches_or_dense_fallback`] helper that deduplicates the
 //! BatchNorm/AveragePool/MaxPool2d dense-fallback arms.
@@ -231,9 +231,6 @@ fn try_patches_or_dense_fallback(
 /// Patches-aware layers (Phase 1: Conv2d, Phase 2: ReLU/activations) process
 /// Patches coefficients natively, preserving the sparse structure. All other
 /// layers call `ensure_dense()` first, then delegate to [`crown_backward_step`].
-///
-/// Design: designs/2026-02-28-patches-mode-wrapper-enum-design.md
-/// Part of #2613
 pub(crate) fn crown_backward_step_patches(
     layer: &Layer,
     crown_bounds: &mut CrownBounds,
@@ -264,9 +261,9 @@ pub(crate) fn crown_backward_step_patches(
 /// Whether hard finite authority must refuse the native Patches route and hand
 /// the carrier to the cooperative Dense materializer instead.
 ///
-/// SHIPPED: presence. `deadline_is_hard` alone refuses, exactly as before.
+/// Under the presence test (the lever disarmed), `deadline_is_hard` alone refuses.
 ///
-/// That default is worth stating plainly, because it is not obviously the right
+/// That path is worth stating plainly, because it is not obviously the right
 /// one. Every scored run carries a finite deadline, so the refusal fires on
 /// every conv row, and it is a DEAD END rather than a fallback: the Dense
 /// carrier it produces goes to `dispatch_backward_layer_finite_boundary`, which
@@ -277,14 +274,12 @@ pub(crate) fn crown_backward_step_patches(
 /// and then times out where `97fb4bd6a` proved it in 35.7 s.
 ///
 /// `NY_PATCHES_FINITE_EXPIRY=1` decides the same refusal by EXPIRY instead, so a
-/// live deadline keeps the native route. STALENESS NOTE (2026-08-19): the
-/// lever now SHIPS ARMED (default true, `=0` kill switch; Provenance::Measured
-/// 8c393486c) — the "dark because measured not to convert" record below is the
-/// original biasfield null kept for history, not the current state: 3 sat / 17
-/// timeout on the 20-row biasfield subset in both arms, identical row by row. Armed, the declines do disappear from the logs and
-/// tight work runs — the row then exhausts its budget inside
-/// `FaerCpuGemmEngine::gemm_f64_with_deadline` instead, which says the remaining
-/// gap is GPU routing for that backward, not this gate.
+/// live deadline keeps the native route. The lever SHIPS ARMED (default true,
+/// `=0` kill switch; Provenance::Measured 8c393486c). On the 20-row biasfield
+/// subset both arms give 3 sat / 17 timeout, identical row by row. Armed, the
+/// declines disappear from the logs and tight work runs — the row then exhausts
+/// its budget inside `FaerCpuGemmEngine::gemm_f64_with_deadline` instead, which
+/// says the remaining gap is GPU routing for that backward, not this gate.
 ///
 /// Note what expiry does NOT give up. For the sequential step an expired
 /// deadline is already refused at the step's own entry check, ahead of this
@@ -444,6 +439,9 @@ fn crown_backward_step_patches_impl(
     relu_deadline_request: ReluDeadlineRequest,
     flat_bias_enabled: bool,
 ) -> std::result::Result<CrownStepResult, SpecPatchesStepError> {
+    if layer.is_diagnostic_point_only() {
+        return Err(crate::network::proof_eligibility::diagnostic_only().into());
+    }
     if let Some(limit) = deadline {
         if Instant::now() >= limit {
             if relu_deadline_request == ReluDeadlineRequest::SpecCrown
@@ -491,7 +489,7 @@ fn crown_backward_step_patches_impl(
             }
         }
     }
-    // Sparse patches fallback (#2613 Phase 4): structural layers (Conv2d,
+    // Sparse patches fallback: structural layers (Conv2d,
     // BatchNorm, pooling, Linear, Flatten, Reshape) don't support sparse
     // patches natively yet. Convert sparse patches to dense before dispatch.
     // Element-wise activations handle sparse patches natively via
@@ -562,6 +560,7 @@ fn crown_backward_step_patches_impl(
     }
 
     match layer {
+        Layer::PointLinear(_) => Err(crate::network::proof_eligibility::diagnostic_only().into()),
         Layer::Conv2d(c) => {
             let input_shape = pre_activation.shape();
             let (in_h, in_w) = if input_shape.len() >= 3 {
@@ -609,7 +608,7 @@ fn crown_backward_step_patches_impl(
                 )
                 .map_err(Into::into);
             }
-            // #3813 / #hotpath: Pre-check — if patches backward would produce a
+            // #hotpath: Pre-check — if patches backward would produce a
             // composed kernel whose receptive-field AREA reaches the dense
             // A-matrix element count (the true memory crossover), convert to Dense
             // early. This avoids the expensive O(positions × channels × kernel²)
@@ -721,7 +720,7 @@ fn crown_backward_step_patches_impl(
                             ),
                         }));
                     }
-                    // Thread deadline to enable intra-GEMM deadline checking (#3795).
+                    // Thread deadline to enable intra-GEMM deadline checking.
                     let next = c.propagate_linear_with_engine_and_deadline_for_input_shape(
                         lb,
                         engine,
@@ -902,7 +901,6 @@ fn crown_backward_step_patches_impl(
         // Phase 2: BatchNorm per-channel scaling natively on Patches.
         // BatchNorm is linear (y = scale*x + bias), so no pre-activation bounds
         // needed for the relaxation (there is no relaxation — exact substitution).
-        // Part of #2613
         Layer::BatchNorm(bn) => {
             // Anchored carriers can be enormous, and their native BN path owns
             // a cooperative, operation-local allocation receipt. Thread the
@@ -1007,8 +1005,6 @@ fn crown_backward_step_patches_impl(
         // Phase 3: Pooling layers natively support Patches backward.
         // AvgPool upsamples patches by pool kernel and divides by pool_size.
         // MaxPool applies relaxation slopes (argmax-lower / definite-winner).
-        // Reference: designs/2026-03-01-patches-phase3-pooling-termination.md
-        // Part of #2613
         Layer::AveragePool(ap) => try_patches_or_dense_fallback(
             |pb| ap.propagate_patches_with_bounds(pb, pre_activation),
             crown_bounds,
@@ -1042,7 +1038,6 @@ fn crown_backward_step_patches_impl(
         // Phase 3: Linear/Flatten/Reshape terminate Patches mode — convert to Dense.
         // These layers flatten spatial structure, so Patches representation has no benefit.
         // Making this explicit rather than relying on the catch-all improves clarity.
-        // Part of #2613 Phase 3.
         // `IntervalConst` joins the Patches->Dense terminators for the same
         // reason `Linear` does: it contracts the feature axis, so the sparse
         // patches representation has nothing left to preserve. It then takes the
@@ -1094,7 +1089,7 @@ fn crown_backward_step_patches_impl(
             .map_err(Into::into)
         }
         // All remaining layers: try Patches activation dispatch, then Dense fallback.
-        // Exhaustive listing — adding a new Layer variant is a compile error (#3424).
+        // Exhaustive listing — adding a new Layer variant is a compile error.
         //
         // Elementwise activations:
         Layer::ReLU(_) | Layer::GELU(_) | Layer::SiLU(_) | Layer::Tanh(_)
@@ -1146,7 +1141,6 @@ fn crown_backward_step_patches_impl(
             // When in Patches mode, use propagate_patches_with_bounds to keep sparse
             // structure. When in Dense mode or for unsupported layers, fall through to
             // standard Dense dispatch. Generated via for_each_patches_capable_activation!
-            // Part of #2613 Phase 2 step 11.
             if let CrownBounds::Patches(pb) = crown_bounds {
                 // #patches-zero-pad-identity: a Pad whose every (before, after) is
                 // (0, 0) adds no elements, so its output tensor IS its input tensor

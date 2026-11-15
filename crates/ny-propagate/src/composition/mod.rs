@@ -6,8 +6,6 @@
 //!
 //! Composes per-model `BoundCertificate`s through pipeline chaining,
 //! linear audio mixers, and system-level property checks.
-//!
-//! Part of #3517.
 
 pub mod certificate;
 pub mod mixer;

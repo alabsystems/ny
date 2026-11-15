@@ -6,7 +6,7 @@
 //!
 //! Validates that finite-width intervals produce non-NaN, non-inverted
 //! output bounds. These tests verify the NaN guards and `nan_propagating_max`
-//! fixes from #3316.
+//! fixes.
 //!
 //! Pattern from softsign/tests.rs `proptest_softsign_ibp_no_nan_for_finite_intervals`.
 //! See also: mish, hardswish, gelu which have this test inline.
@@ -20,7 +20,7 @@ use proptest::prelude::*;
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(2000) })]
 
-    // #2435: finite-width IBP intervals must not produce NaN bounds.
+    // Finite-width IBP intervals must not produce NaN bounds.
     // Validates W3's NaN-propagating clamp fix (747d1c9) for CELU.
     #[test]
     fn proptest_celu_ibp_no_nan_for_finite_intervals(
@@ -41,7 +41,7 @@ proptest! {
         prop_assert!(lower <= upper, "CELU IBP bounds inverted for [{l}, {u}]: {lower} > {upper}");
     }
 
-    // #2435: finite-width IBP intervals must not produce NaN bounds.
+    // Finite-width IBP intervals must not produce NaN bounds.
     // Validates W3's NaN-propagating clamp fix (747d1c9) for ELU.
     #[test]
     fn proptest_elu_ibp_no_nan_for_finite_intervals(
@@ -62,7 +62,7 @@ proptest! {
         prop_assert!(lower <= upper, "ELU IBP bounds inverted for [{l}, {u}]: {lower} > {upper}");
     }
 
-    // #2435: finite-width IBP intervals must not produce NaN bounds.
+    // Finite-width IBP intervals must not produce NaN bounds.
     // Validates W3's NaN-propagating clamp fix (747d1c9) for SELU.
     #[test]
     fn proptest_selu_ibp_no_nan_for_finite_intervals(
@@ -83,7 +83,7 @@ proptest! {
         prop_assert!(lower <= upper, "SELU IBP bounds inverted for [{l}, {u}]: {lower} > {upper}");
     }
 
-    // #2435: finite-width IBP intervals must not produce NaN bounds.
+    // Finite-width IBP intervals must not produce NaN bounds.
     // Exp has an overflow threshold at 88.0 (exp(88) ≈ f32::MAX).
     // Range restricted to [-100, 88] to stay within valid Exp domain.
     #[test]
@@ -107,7 +107,7 @@ proptest! {
         prop_assert!(lower >= 0.0, "Exp IBP lower {lower} < 0 for [{l}, {u}]");
     }
 
-    // #2435, #3316: finite-width IBP intervals must not produce NaN bounds for Abs.
+    // Finite-width IBP intervals must not produce NaN bounds for Abs.
     // Validates the NaN guard and nan_propagating_max fix in abs.rs.
     #[test]
     fn proptest_abs_ibp_no_nan_for_finite_intervals(

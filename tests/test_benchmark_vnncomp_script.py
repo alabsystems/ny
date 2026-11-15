@@ -1108,3 +1108,33 @@ def test_benchmark_vnncomp_rejects_manifest_paths_outside_reference_dir(
     )
     assert "invalid output_path provenance" in result.stderr, result.stderr
     assert "potential soundness bug" not in result.stdout, result.stdout
+
+
+
+def test_benchmark_temp_cleanup_belongs_to_the_main_shell(tmp_path: Path) -> None:
+    # Exercise the actual handler directly: an immediately cancelled watchdog
+    # can inherit EXIT before its first command, so it must not own these files.
+    source = SCRIPT_PATH.read_text(encoding="utf-8")
+    handler = source[source.index("cleanup_benchmark_tmp() {"):].split("\n}", 1)[0] + "\n}"
+    temporary = tmp_path / "benchmark-tmp"
+    temporary.mkdir()
+    for name in ("ny.stdout", "vnncomp.results", "watchdog-marker"):
+        (temporary / name).write_text("retained\n", encoding="utf-8")
+    result = subprocess.run(
+        [
+            "bash", "-c",
+            handler + '\nBENCHMARK_TMP_DIR="$1"\n'
+            'TMPOUT="$1/ny.stdout"\n'
+            'VNNCOMP_RESULTS_FILE="$1/vnncomp.results"\n'
+            'WATCHDOG_MARKER="$1/watchdog-marker"\n'
+            '( cleanup_benchmark_tmp )\n'
+            '[[ -f "$TMPOUT" && -f "$VNNCOMP_RESULTS_FILE" && -f "$WATCHDOG_MARKER" ]] || exit 23\n'
+            'cleanup_benchmark_tmp\n'
+            '[[ ! -d "$BENCHMARK_TMP_DIR" ]]',
+            "cleanup-test", str(temporary),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

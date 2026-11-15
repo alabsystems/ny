@@ -21,11 +21,6 @@
 //! ```
 //!
 //! where `offsets[i]` gives the starting header index for domain `i`.
-//!
-//! # Sources
-//!
-//! - Design doc: `designs/2026-01-29-gpu-constraint-buffer-layout.md`
-//! - Issue: #226
 use crate::beta_crown::constraint_store::{ConstraintHeader, DomainConstraintStore};
 use ny_core::{NyError, Result};
 use std::mem::size_of;
@@ -542,7 +537,7 @@ mod tests {
         assert!(empty.domain_constraint_count(0).is_none());
     }
 
-    /// Regression guard for #274: keep overflow handling on the Result path.
+    /// Regression guard: keep overflow handling on the Result path.
     ///
     /// We cannot create 4GB of actual data in a unit test, but we verify:
     /// 1. The function returns Result (API contract)
@@ -576,7 +571,6 @@ mod tests {
     ///
     /// This test exercises the offset tracking paths; actual overflow testing
     /// requires mocking or dedicated integration tests with large allocations.
-    /// See designs/2026-01-29-gpu-constraint-buffer-layout.md for overflow scenarios.
     #[ntest::timeout(10000)]
     #[test]
     fn test_overflow_protection_code_paths_exist() {

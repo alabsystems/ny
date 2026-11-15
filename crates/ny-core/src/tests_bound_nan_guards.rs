@@ -27,7 +27,7 @@ fn union_rejects_nan_endpoints() {
     let _ = invalid.union(&valid);
 }
 
-// --- Intersect NaN guards (#2640) ---
+// --- Intersect NaN guards ---
 // Bound::intersect must return None when any endpoint is NaN,
 // preventing silent NaN absorption via IEEE 754 max/min semantics.
 
@@ -120,7 +120,7 @@ fn intersect_disjoint_still_returns_none() {
     );
 }
 
-// --- Fallible constructors (#2630) ---
+// --- Fallible constructors ---
 
 #[test]
 fn try_new_valid_returns_ok() {
@@ -242,7 +242,7 @@ fn try_concrete_neg_inf_returns_err() {
     assert!(msg.contains("not finite"), "got: {msg}");
 }
 
-// --- Serde deserialization validation tests (#2367) ---
+// --- Serde deserialization validation tests ---
 
 #[test]
 fn deserialize_bound_nan_lower_rejected() {
@@ -386,7 +386,7 @@ fn deserialize_verification_spec_roundtrip() {
 #[test]
 fn deserialize_verification_spec_shape_overflow_rejected() {
     use crate::VerificationSpec;
-    // input_shape product [usize::MAX, 2] overflows — must be rejected (#2371).
+    // input_shape product [usize::MAX, 2] overflows — must be rejected.
     let json = r#"{
         "input_bounds": [{"lower": 0.0, "upper": 1.0}],
         "output_bounds": [{"lower": 0.0, "upper": 1.0}],

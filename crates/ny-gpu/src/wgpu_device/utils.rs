@@ -129,6 +129,33 @@ impl WgpuDevice {
         })
     }
 
+    fn copy_readback_values<T: Copy>(values: &[T], label: &str) -> Result<Vec<T>> {
+        match Self::readback_wait() {
+            ReadbackWait::Unbounded => return Ok(values.to_vec()),
+            ReadbackWait::Expired => {
+                return Err(NyError::DeadlineExceeded(format!(
+                    "{label}: original deadline expired before copying readback"
+                )))
+            }
+            ReadbackWait::Bounded(_) => {}
+        }
+        let mut out = Vec::with_capacity(values.len());
+        for chunk in values.chunks(4096) {
+            if matches!(Self::readback_wait(), ReadbackWait::Expired) {
+                return Err(NyError::DeadlineExceeded(format!(
+                    "{label}: original deadline expired while copying readback"
+                )));
+            }
+            out.extend_from_slice(chunk);
+        }
+        if matches!(Self::readback_wait(), ReadbackWait::Expired) {
+            return Err(NyError::DeadlineExceeded(format!(
+                "{label}: original deadline expired after copying readback"
+            )));
+        }
+        Ok(out)
+    }
+
     fn read_buffer_typed<T: Pod>(
         device: &wgpu::Device,
         buffer: &wgpu::Buffer,
@@ -261,15 +288,13 @@ impl WgpuDevice {
                     "read_buffers_batched: invalid mapped byte layout: {err:?}"
                 ))
             })?;
-            let vec = typed
-                .get(..*count)
-                .ok_or_else(|| {
-                    NyError::InternalError(format!(
-                        "read_buffers_batched: requested {count} values, mapped buffer has {}",
-                        typed.len()
-                    ))
-                })?
-                .to_vec();
+            let values = typed.get(..*count).ok_or_else(|| {
+                NyError::InternalError(format!(
+                    "read_buffers_batched: requested {count} values, mapped buffer has {}",
+                    typed.len()
+                ))
+            })?;
+            let vec = Self::copy_readback_values(values, "read_buffers_batched")?;
             drop(data);
             results.push(vec);
         }
@@ -384,7 +409,7 @@ impl WgpuDevice {
         Ok((values, rows))
     }
 
-    /// Map two readback buffers concurrently with a single `device.poll` (#3397).
+    /// Map two readback buffers concurrently with a single `device.poll`.
     ///
     /// The standard `read_buffer` issues map_async + poll + read sequentially for
     /// each buffer. When both buffers were submitted in the same command encoder
@@ -498,6 +523,33 @@ impl WgpuDevice {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn bounded_host_readback_copy_preserves_bits_and_refuses_expiry() {
+        let values = [0.0_f32, -0.0, f32::from_bits(1), f32::MIN_POSITIVE, 1.25];
+        let expected: Vec<_> = values.iter().map(|v| v.to_bits()).collect();
+        let _live = crate::wgpu_device::CallLocalCrownDeadlineScope::arm(
+            Instant::now() + Duration::from_secs(10),
+        );
+        let got = WgpuDevice::copy_readback_values(&values, "scripted").unwrap();
+        assert_eq!(
+            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected
+        );
+        {
+            let _expired = crate::wgpu_device::CallLocalCrownDeadlineScope::arm(Instant::now());
+            assert!(matches!(
+                WgpuDevice::copy_readback_values(&values, "scripted"),
+                Err(NyError::DeadlineExceeded(_))
+            ));
+        }
+        assert_eq!(
+            WgpuDevice::copy_readback_values(&values, "scripted")
+                .unwrap()
+                .len(),
+            values.len()
+        );
+    }
 
     #[test]
     fn readback_wait_tracks_call_local_deadline_and_restores_scope() {

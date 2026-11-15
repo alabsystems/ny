@@ -404,10 +404,10 @@ fn test_chain_rule_gradients_a_present_but_bounds_missing() {
 
 /// Regression test: NaN pre-ReLU bounds must produce zero gradients, not NaN.
 ///
-/// Before the #2809 parity fix, IEEE-754 NaN comparisons caused NaN bounds
+/// Before the parity fix, IEEE-754 NaN comparisons caused NaN bounds
 /// to fall through the `l >= 0.0 || u <= 0.0` guard as "unstable", producing
 /// NaN gradient contributions that corrupt the Adam optimizer state.
-/// The sequential path (helpers.rs) was fixed in #2809 but the graph path
+/// The sequential path (helpers.rs) was fixed first but the graph path
 /// was not updated until this regression was caught.
 #[ntest::timeout(10000)]
 #[test]
@@ -479,7 +479,7 @@ fn test_chain_rule_gradients_nan_pre_relu_bounds_produce_zero_gradients_2809() {
 /// Regression test: NaN A matrix coefficients must not corrupt gradients.
 ///
 /// The A coefficient NaN case is accidentally safe via IEEE-754 (NaN > 0.0
-/// returns false), but the explicit guard from #2809 makes this behavior
+/// returns false), but the explicit guard makes this behavior
 /// documented and robust rather than relying on IEEE-754 subtleties.
 #[ntest::timeout(10000)]
 #[test]
@@ -583,7 +583,7 @@ fn test_monotone_shape_mismatch_retries_fixed_slope_4118() {
     assert_eq!(result.upper_b, expected.upper_b);
 }
 
-/// Regression test for #4118: when both alpha AND fixed-slope retry fail with
+/// Regression test: when both alpha AND fixed-slope retry fail with
 /// ShapeMismatch, the error must propagate out (so the outer backward-pass
 /// match can catch it and fall back to plain CROWN, rather than cascading to
 /// graph-wide IBP).
@@ -633,7 +633,7 @@ fn test_monotone_shape_mismatch_both_paths_fail_propagates_error_4118() {
     );
 }
 
-/// Regression test for #4118: UnsupportedConfiguration from fixed-slope retry
+/// Regression test: UnsupportedConfiguration from fixed-slope retry
 /// must also propagate so the backward-pass match catches it for CROWN fallback.
 #[ntest::timeout(10000)]
 #[test]
@@ -1371,9 +1371,26 @@ fn gpu_suffix_seed_refuses_a_relation_carrying_certified_coeff_err() {
 ///   REFUSES   — it fail-closes via `gpu_suffix_seed_is_err_free` (or an
 ///               equivalent `has_coeff_err` check) with a test that hits it; or
 ///   UNREACHED — it provably cannot receive an err-carrying relation.
+///
+/// The matcher counts struct literals only. A seed type in RETURN position
+/// (`-> GpuCrownSeed`, `-> &GpuCrownSeed`, optionally path-qualified) is
+/// followed by the function body's brace, not by fields, and builds nothing,
+/// so it is not counted.
 #[test]
 fn host_side_gpu_crown_seed_construction_sites_are_pinned() {
     use std::path::Path;
+
+    fn construction_count(text: &str) -> usize {
+        text.match_indices("GpuCrownSeed {")
+            .filter(|(at, _)| {
+                let line = text[..*at].rsplit('\n').next().unwrap_or_default();
+                let before = line.trim_end_matches(|c: char| {
+                    c.is_whitespace() || c.is_alphanumeric() || matches!(c, '_' | ':' | '&' | '\'')
+                });
+                !before.ends_with("->")
+            })
+            .count()
+    }
 
     fn walk(dir: &Path, out: &mut Vec<(String, usize)>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1387,7 +1404,7 @@ fn host_side_gpu_crown_seed_construction_sites_are_pinned() {
                 let Ok(text) = std::fs::read_to_string(&path) else {
                     continue;
                 };
-                let count = text.matches("GpuCrownSeed {").count();
+                let count = construction_count(&text);
                 if count > 0 {
                     let name = path
                         .strip_prefix(env!("CARGO_MANIFEST_DIR"))
@@ -1406,9 +1423,13 @@ fn host_side_gpu_crown_seed_construction_sites_are_pinned() {
     found.sort();
     let total: usize = found.iter().map(|(_, c)| *c).sum();
 
-    // Measured at the #gpu-suffix-frontier / #gpu-suffix-coeff-err audit.
-    // 26 production sites + the literal in this test's own matcher.
-    const PINNED_TOTAL: usize = 27;
+    // Measured at the #gpu-suffix-frontier / #gpu-suffix-coeff-err audit:
+    // 25 struct literals (the batch-seam test fixture among them) + the
+    // literal in this test's own matcher. Until 2026-10-03 the matcher also
+    // counted the return type of `ResidentCutCallContext::seed` (an accessor,
+    // not a construction) and pinned 27; the gpu-suffix test engine's
+    // `last_seed` accessor would have made it 28 without adding a site.
+    const PINNED_TOTAL: usize = 26;
     assert_eq!(
         total, PINNED_TOTAL,
         "host-side `GpuCrownSeed` construction count changed (pinned {PINNED_TOTAL}, found \

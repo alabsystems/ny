@@ -4,7 +4,7 @@
 
 //! Multi-ReLU alpha gradient tests.
 //!
-//! Tests for #2306: the forward sensitivity pass must use sign-dependent
+//! The forward sensitivity pass must use sign-dependent
 //! branch selection matching the backward pass. Single-ReLU networks cannot
 //! expose this bug because the forward sensitivity is consumed at the same
 //! layer before the ReLU transform is applied.
@@ -95,7 +95,7 @@ fn multi_relu_fixture() -> (
     )
 }
 
-/// Regression test for #2306: multi-ReLU alpha gradient numerical consistency.
+/// Regression test: multi-ReLU alpha gradient numerical consistency.
 ///
 /// The forward sensitivity pass must use sign-dependent branch selection
 /// matching the backward pass. With a single-ReLU network, the forward

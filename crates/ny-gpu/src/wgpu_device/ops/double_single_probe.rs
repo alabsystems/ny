@@ -7,7 +7,7 @@
 //!
 //! This module is a STANDALONE experiment. It is wired into NOTHING — no verdict
 //! path, no `provides_sound_gpu_*` predicate, no shipped code. The whole file only
-//! compiles under `cfg(all(test, feature = "gpu-tests"))` (see the gated `mod`
+//! compiles under `cfg(all(test, feature = "gpu-tests-uncharged"))` (see the gated `mod`
 //! declaration in `ops/mod.rs`), so a plain build/verdict run never sees it.
 //!
 //! # The question
@@ -38,7 +38,7 @@
 //! compensated `f64` Dot2 oracle corroborates: a working stack reaches ~`2^-46`
 //! relative; a broken one degrades to plain-`f32` ~`2^-24`.
 
-#![cfg(all(test, feature = "gpu-tests"))]
+#![cfg(all(test, feature = "gpu-tests-uncharged"))]
 
 use super::super::WgpuDevice;
 use super::ibp_forward::create_buffer;

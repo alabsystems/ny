@@ -22,7 +22,7 @@ use crate::commands::terminal_peel::AppliedTerminalPeel;
 ///
 /// JSON has no representation for Infinity or NaN. `serde_json::json!()` silently
 /// converts these to `null`, losing the distinction between "infinite bound" and
-/// "missing value". This function renders them as string values instead (#3133):
+/// "missing value". This function renders them as string values instead:
 /// - `f32::INFINITY` → `"Infinity"`
 /// - `f32::NEG_INFINITY` → `"-Infinity"`
 /// - `f32::NAN` → `"NaN"`
@@ -36,6 +36,82 @@ pub(crate) fn json_f32(v: f32) -> serde_json::Value {
         serde_json::Value::String("Infinity".to_string())
     } else {
         serde_json::Value::String("-Infinity".to_string())
+    }
+}
+
+/// How many values human-readable output prints before eliding the rest.
+/// `--json` output is never truncated.
+pub(crate) const TEXT_PREVIEW_LEN: usize = 8;
+
+/// Render values for a terminal. Up to [`TEXT_PREVIEW_LEN`] values print
+/// exactly as `{:?}` would; longer vectors are elided after that many.
+pub(crate) fn preview_f32s(values: &[f32]) -> String {
+    if values.len() <= TEXT_PREVIEW_LEN {
+        return format!("{values:?}");
+    }
+    let shown: Vec<String> = values[..TEXT_PREVIEW_LEN]
+        .iter()
+        .map(|value| format!("{value:?}"))
+        .collect();
+    format!(
+        "[{}, ... ({} values; use --json for all)]",
+        shown.join(", "),
+        values.len()
+    )
+}
+
+/// `header` followed by one `  i: [lower, upper]` line per bound, elided after
+/// [`TEXT_PREVIEW_LEN`] bounds.
+fn bounds_preview(header: &str, bounds: &[Bound]) -> String {
+    let mut text = header.to_string();
+    for (index, bound) in bounds.iter().take(TEXT_PREVIEW_LEN).enumerate() {
+        text.push_str(&format!(
+            "\n  {index}: [{:.6}, {:.6}]",
+            bound.lower(),
+            bound.upper()
+        ));
+    }
+    if bounds.len() > TEXT_PREVIEW_LEN {
+        text.push_str(&format!(
+            "\n  ... {} more (use --json for all)",
+            bounds.len() - TEXT_PREVIEW_LEN
+        ));
+    }
+    text
+}
+
+/// Human-readable summary of a result that needs no peel-specific handling.
+/// It never prints a `Debug` dump, and it prints a `Status:` line only for
+/// violated and timeout results: for verified and unknown bounds the verdict is
+/// the separately printed "Property Status".
+fn result_summary(result: &ny_core::VerificationResult) -> String {
+    match result {
+        ny_core::VerificationResult::Verified { output_bounds, .. } => format!(
+            "Bound computation: COMPLETE ({} sound output bounds).\n\
+             This is NOT the property verdict -- see \"Property Status\" below.\n{}",
+            output_bounds.len(),
+            bounds_preview("Output bounds:", output_bounds)
+        ),
+        ny_core::VerificationResult::Violated {
+            counterexample,
+            output,
+            ..
+        } => format!(
+            "Status: VIOLATED\nCounterexample input: {}\nCounterexample output: {}",
+            preview_f32s(counterexample),
+            preview_f32s(output)
+        ),
+        ny_core::VerificationResult::Unknown { bounds, reason, .. } => format!(
+            "Bound computation: INCOMPLETE ({reason}).\n{}",
+            bounds_preview("Best output bounds:", bounds)
+        ),
+        ny_core::VerificationResult::Timeout { partial_bounds, .. } => match partial_bounds {
+            Some(bounds) => format!(
+                "Status: TIMEOUT\n{}",
+                bounds_preview("Partial output bounds:", bounds)
+            ),
+            None => "Status: TIMEOUT".to_string(),
+        },
     }
 }
 
@@ -57,8 +133,6 @@ pub(super) fn backend_receipt_json(receipt: &ProofBackendReceipt) -> serde_json:
 }
 
 /// Exit codes for verification results.
-///
-/// Per design doc: designs/2026-02-03-smt-result-semantics.md
 pub(crate) mod exit_codes {
     /// Property holds - verification successful.
     pub(crate) const VERIFIED: i32 = 0;
@@ -537,7 +611,7 @@ fn verification_json_value(
         // VerificationResult::Verified means "bound propagation completed" — it does NOT
         // mean the property was proven safe. When property_status is "unknown", the bounds
         // are too loose to prove the property. Only "safe" means genuinely verified.
-        // This mirrors compute_exit_code() which already handles this correctly (#1456).
+        // This mirrors compute_exit_code() which already handles this correctly.
         if matches!(result, ny_core::VerificationResult::Verified { .. }) {
             match status {
                 "safe" => { /* status already "verified" — correct */ }
@@ -662,8 +736,9 @@ fn verification_result_text(
             let (label, published_output) = applied_terminal_peel.human_witness_output(output);
             (
                 format!(
-                    "Status: VIOLATED\nCounterexample input: {counterexample:?}\n\
-                     {label}: {published_output:?}"
+                    "Status: VIOLATED\nCounterexample input: {}\n{label}: {}",
+                    preview_f32s(counterexample),
+                    preview_f32s(&published_output)
                 ),
                 false,
             )
@@ -671,35 +746,23 @@ fn verification_result_text(
         _ if applied_terminal_peel.applied() => (
             format!(
                 "Output-coordinate note: result bounds are preactivations before the peeled {}; \
-                 they are not original-model Y bounds.\n{result:?}",
-                applied_terminal_peel.activation_name()
+                 they are not original-model Y bounds.\n{}",
+                applied_terminal_peel.activation_name(),
+                result_summary(result)
             ),
             false,
         ),
         // `VerificationResult::Verified` means BOUND COMPUTATION SUCCEEDED, not
-        // "the property holds" -- the verdict is the separately-computed
-        // `property_status`, printed below as "Property Status". Debug-printing the
-        // bare variant put the word "Verified" at the top of the output while the
-        // real verdict two lines down said UNKNOWN. That misreading has already
-        // caused a soundness bug to be reported against a run that was correct, so
-        // the variant is never allowed to speak for itself here.
-        ny_core::VerificationResult::Verified { output_bounds, .. } => (
-            format!(
-                "Bound computation: COMPLETE ({} sound output bounds).\n\
-                 This is NOT the property verdict -- see \"Property Status\" below.\n\
-                 {result:?}",
-                output_bounds.len()
-            ),
-            false,
-        ),
-        _ => (format!("{result:?}"), false),
+        // "the property holds": the verdict is the separately computed
+        // `property_status`, printed below as "Property Status". The summary
+        // therefore never prints the bare variant name (see `result_summary`).
+        _ => (result_summary(result), false),
     }
 }
 
 /// Compute the exit code based on verification result and property status.
 ///
-/// Per design doc: designs/2026-02-03-smt-result-semantics.md
-/// Fix for #1456: property_status overrides VerificationResult for exit code
+/// property_status overrides a Verified result for the exit code.
 pub(super) fn compute_exit_code(
     result: &ny_core::VerificationResult,
     property_status: Option<&str>,
@@ -959,7 +1022,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_property_status_oob_index_returns_error() {
-        // Regression test for #2878: out-of-bounds constraint index must not panic.
+        // Regression test: out-of-bounds constraint index must not panic.
         let bounds = vec![Bound::new(0.0, 1.0)]; // only 1 output
         let result = verified_with_bounds(bounds);
         // Constraint references index 5 — out of bounds
@@ -975,7 +1038,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_property_status_oob_relational_returns_error() {
-        // Regression test for #2878: relational constraint with OOB index j.
+        // Regression test: relational constraint with OOB index j.
         let bounds = vec![Bound::new(0.0, 1.0), Bound::new(2.0, 3.0)]; // 2 outputs
         let result = verified_with_bounds(bounds);
         // Y_0 >= Y_99: index 99 is out of bounds
@@ -1079,10 +1142,10 @@ mod tests {
         );
     }
 
-    // --- Regression tests for #3295: status override from property_status ---
+    // --- Regression tests: status override from property_status ---
 
     /// When VerificationResult is Verified but property is unknown, exit code must be UNKNOWN.
-    /// Regression test for #3295: verify command used to always report "verified" status.
+    /// Regression test: verify command used to always report "verified" status.
     #[test]
     fn test_exit_code_verified_result_but_unknown_property() {
         let bounds = vec![Bound::new(0.0, 1.0)];
@@ -1127,7 +1190,7 @@ mod tests {
         assert_eq!(code, exit_codes::VERIFIED);
     }
 
-    /// Regression test for #3133: json_f32 must render non-finite f32 as strings,
+    /// Regression test: json_f32 must render non-finite f32 as strings,
     /// not null.
     #[test]
     fn test_json_f32_non_finite_renders_as_string_3133() {

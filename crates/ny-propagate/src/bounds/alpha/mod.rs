@@ -9,15 +9,19 @@
 
 mod graph;
 mod graph_channel_only;
+mod margin_publication;
 mod sequential;
 mod shared;
 
 // Re-export config types so existing `crate::bounds::alpha::X` paths continue to work.
 pub use super::alpha_config::{
     AdamParams, AlphaCrownConfig, AlphaCrownIntermediate, AlphaSpecAscent, AlphaSpecEarlyExit,
-    GradientMethod, GraphAlphaCrownIntermediate, MultiSpecKeep, Optimizer,
+    CganChildZonoRefreshConfig, GradientMethod, GraphAlphaCrownIntermediate, MarginAlphaSearch,
+    MultiSpecKeep, Optimizer,
 };
 pub use graph::GraphAlphaState;
+// #vit-margin-alpha: the certify-once margin publication the root merges.
+pub use margin_publication::{MarginAlphaPublication, MarginMergeStats, MarginPublicationRefusal};
 pub use sequential::AlphaState;
 
 #[cfg(test)]

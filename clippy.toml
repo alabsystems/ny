@@ -1,7 +1,7 @@
 # Clippy configuration for alabsystems Rust projects
 #
 # Copy to project root as clippy.toml or .clippy.toml
-# Run: cargo clippy -- -D warnings
+# Run: targo tippy -- -D warnings
 #
 # Copyright 2026 Andrew Yates
 # Author: Andrew Yates <andrewyates.name@gmail.com>

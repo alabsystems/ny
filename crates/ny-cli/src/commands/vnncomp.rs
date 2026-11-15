@@ -41,11 +41,120 @@
 //! we write `unknown` (always sound). `error` is reserved for genuine failures
 //! (missing input file, model-load failure with no verdict produced).
 
+/// #attack-concurrent: the concurrent attack lane's publication protocol
+/// (first verdict wins, sat precedence, sat only through the gate, the main
+/// sat pipeline's order) on local precedence/claim state.
+#[cfg(test)]
+mod attack_concurrent_tests;
+/// #lsnc-attack-twin: exact-gradient PGD on a point-folded ATTACK twin in the
+/// post-BaB tail. A child module for the same reason as `falsify_portfolio`: it
+/// reuses this module's box, margin and property predicates and adds no new
+/// acceptance rule.
+mod attack_twin_lane;
+/// #attack-vertex-geometry: the typed step-geometry and corner-seed levers of
+/// the upfront exact-gradient lane, their pure schedule and their receipt. A
+/// child module so it reuses this module's box clamp and RNG; it adds no new
+/// acceptance rule.
+mod attack_vertex_geometry;
+/// #bbe-joint-root (ENGINE_PROGRAM M5a): `margin_row.root_search`'s dark
+/// default and scored projection into the lane policy, and the REAL ny-bbe CPU
+/// f32 backend (registered as `main.rs` does) through the lane's certify-once
+/// ingest gate — engaged, never looser than the incumbent, never above the
+/// sampled truth.
+#[cfg(test)]
+mod bbe_joint_root_tests;
+/// #wide-fd-search (M4), DEVICE side: the known-answer tests of ny-cuda's
+/// level-search kernels against the ny-bbe CPU f32 search they reproduce bit
+/// for bit (their reference), on synthetic levels. Gated on an advertised CUDA
+/// device: elsewhere each test prints SKIP=VOID and proves nothing. The lane
+/// tests on the real cora net are `frozen_dual_bab_tests::cuda_wide`.
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_fd_search_tests;
+/// #wave-beta-bab (M6), DEVICE side: ny-cuda's wave kernels against the ny-bbe
+/// CPU f32 wave search they reproduce bit for bit (their reference) on
+/// synthetic problems, and `margin_row.tree_mode: wave_cuda` through the
+/// registered device factory on the lane's twin-wall nets (the same tree as
+/// `wave`, the SAT moat). Gated on an advertised CUDA device: elsewhere each
+/// device test prints SKIP=VOID and proves nothing.
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_wave_search_tests;
+/// #sbench-f64-attack: the post-BaB float64 target-margin repair and the typed
+/// active-set caps. A child module for the same reason as `attack_twin_lane`:
+/// it reuses this module's margin, property and bounded-solve helpers and adds
+/// no new acceptance rule.
+mod f64_target_attack;
 /// The `ny-falsify` seam. A child module so it can reuse this module's already
 /// audited box construction, margin and property predicates rather than growing
 /// a second copy of any of them; it adds no new acceptance rule.
 mod falsify_portfolio;
+/// #fl-f32-seam-key: the seam mode the CLI installs equals the scored run's
+/// flight receipt (environment over `model.forward_linear_f32_seam`).
+#[cfg(test)]
+mod fl_f32_seam_receipt_tests;
 mod flat_objective;
+/// #frozen-dual-state (V1 stage A) + #frozen-dual-bab (V1 stage B): the typed
+/// key's and knobs' dark defaults and scored projection, the shipped-yaml
+/// darkness scan, the real-ONNX (CIFAR100 resnet_medium) containment pin of the
+/// frozen alpha-zonotope query state, the node-count agreement of the certified
+/// search with the P1 numpy replica on the real cora net, and a real-ONNX sat
+/// class the search must never close; #wide-fd-search (M4): the typed search
+/// selector and the REAL ny-bbe CPU f32 level search through the tier's
+/// certification on the real cora net, also over the #fd-shared-state (M3)
+/// shared-trunk states.
+#[cfg(test)]
+mod frozen_dual_bab_tests;
+/// #graph-free-candidates (#smart-turn-x86-harvest): the DIAGNOSTIC-ONLY side
+/// file of the graph-free lane's candidates and their gate outcomes, for
+/// offline replay on a checker-parity x86 configuration. A child module so it
+/// reuses this module's margin helper; it adds no acceptance rule and changes
+/// none.
+mod graph_free_sidefile;
+/// #graph-lane-search (ENGINE_PROGRAM M7): the REAL CPU f32 batched domain
+/// search composed with the graph β-CROWN lane (root + shared-executor waves)
+/// — never verifies a violated property, engaged by count, raises rows.
+#[cfg(test)]
+mod graph_lane_search_tests;
+#[cfg(all(test, feature = "mip"))]
+#[path = "hull_publication_routing_tests.rs"]
+mod hull_publication_routing_tests;
+#[cfg(test)]
+#[path = "vnncomp_instance_deadline_tests.rs"]
+mod instance_deadline_tests;
+/// #lsnc-lane: reachability of the lowdim lane's typed keys through the scored
+/// run's own preset projection (`preset_delivered_config_value`).
+#[cfg(test)]
+mod lsnc_lane_tests;
+/// #m8-input-split-batch (ENGINE_PROGRAM M8a): the lowdim lane's wave bounder
+/// and multi-clause scheduler keys, and the REAL ny-bbe CPU f32 forward-linear
+/// search through the armed lane.
+#[cfg(test)]
+mod m8_lowdim_tests;
+/// #acc-strict-intervals: the typed `nonlinear_vnnlib.case_split` key — its
+/// dark default, its delivery, the armed lane and its fp32-replay guard.
+#[cfg(test)]
+mod nonlinear_case_split_tests;
+/// Original-source Float32 execution and dual-predicate proof owner.
+mod nonlinear_float32;
+/// Shared-input dual-source adapter to the existing concurrent race lifecycle.
+mod relational_overlap;
+/// Original-tower CPU point/VJP templates for relational attack advice.
+mod relational_vjp;
+/// #root-box-source (ENGINE_PROGRAM M5b): `margin_row.root_box_source`'s dark
+/// default and its scored projection (NO environment) into the root-precision
+/// policy every root walk receives.
+#[cfg(test)]
+mod root_box_source_tests;
+/// #vit-root-alpha (ENGINE_PROGRAM V2): the REAL CPU f32 graph search composed
+/// with the graph lane's certify-once gate on random attention blocks —
+/// never looser than the certified incumbent, contained at sampled points.
+#[cfg(test)]
+mod vit_root_alpha_tests;
+/// #wave-beta-bab (ENGINE_PROGRAM M6): the typed tree-engine key's dark
+/// default and scored projection, and the REAL ny-bbe CPU f32 wave search
+/// through the margin-row lane's certify queue and cover gate on synthetic
+/// twin-wall nets (receipt, positive control, SAT moat, thread independence).
+#[cfg(test)]
+mod wave_bab_tests;
 
 use anyhow::{anyhow, Context, Result};
 use std::ffi::OsStr;
@@ -58,13 +167,12 @@ use crate::commands::beta_crown::{
     best_margin_export::{
         reset_best_margin_candidate, take_best_margin_candidates, BestMarginCandidate,
     },
-    end_capture, handle_beta_crown_command, take_captured_deadline_plan, take_captured_json,
-    take_captured_terminal_ingress, BetaCrownInstanceOverrides, BetaCrownPresetSnapshot,
-    CapturedDeadlinePlan, CapturedTerminalIngress, CganInputLeafRoute, ProofOpts,
-    CGAN_DEPTH_TWO_PRODUCTION_MODE,
+    end_capture, handle_beta_crown_command, take_captured_deadline_plan,
+    take_captured_terminal_ingress, take_captured_verification, BetaCrownInstanceOverrides,
+    BetaCrownPresetSnapshot, CapturedDeadlinePlan, CapturedTerminalIngress, ProofOpts,
 };
 use crate::commands::bnn_falsification_policy::BnnFalsificationPolicy;
-use crate::commands::terminal_peel::AppliedTerminalPeel;
+use crate::commands::unsat_receipt::UnsatReceipt;
 use crate::preset::{resolve_initial_pgd_schedule, ResolvedInitialPgdSchedule};
 use crate::subcommands::{BackendArg, CompleteVerifierArg, MipSolverArg};
 use ndarray::{arr1, Array2, ArrayD, IxDyn};
@@ -77,13 +185,14 @@ use ny_core::{
     f32_to_f64_exact, f64_to_f32_down, f64_to_f32_up, Bound, VerificationResult, VerificationSpec,
 };
 use ny_onnx::{
-    load_onnx_with_config, read_onnx_bytes_maybe_gzip,
+    load_onnx_with_config,
     vnnlib::{
         load_vnnlib_assignment_declarations, DualNetworkProperty, DualNetworkSpec,
         IsomorphicAtomRelation, IsomorphicOutputAtom, TensorDeclaration, TensorDeclarationKind,
     },
     CompoundNodePolicy, GraphNetworkOptions, OnnxLoadConfig,
 };
+use ny_propagate::certify::{LegacyUnsatAuthority, ScalarAtom, ScalarRel, UnsatToken};
 use ny_propagate::{
     build_difference_network,
     layers::{AddLayer, ConcatLayer, GatherLayer, SubLayer},
@@ -108,8 +217,10 @@ const VERSION_STRING: &str = "v1";
 /// A VNN-COMP result string. The competition checker accepts exactly these five.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum VnncompResult {
-    /// Property holds — verified safe.
-    Unsat,
+    /// Property holds — verified safe. Constructible ONLY from an
+    /// [`UnsatReceipt`], which is built from a certifier token or a ratcheted
+    /// legacy lane door (#soundness-spine M2b; see `unsat_receipt.rs`).
+    Unsat(UnsatReceipt),
     /// Property violated — a counterexample witness is included.
     Sat { witness: Option<String> },
     /// Verification timed out.
@@ -120,11 +231,19 @@ pub(crate) enum VnncompResult {
     Error,
 }
 
+#[cfg(test)]
+impl VnncompResult {
+    /// A test verdict (`UnsatReceipt::for_test`).
+    pub(crate) fn test_unsat() -> Self {
+        VnncompResult::Unsat(UnsatReceipt::for_test())
+    }
+}
+
 impl VnncompResult {
     /// The first-line result token written to RESULTS_FILE.
     fn token(&self) -> &'static str {
         match self {
-            VnncompResult::Unsat => "unsat",
+            VnncompResult::Unsat(_) => "unsat",
             VnncompResult::Sat { .. } => "sat",
             VnncompResult::Timeout => "timeout",
             VnncompResult::Unknown => "unknown",
@@ -167,9 +286,26 @@ pub(crate) fn configs_dir_from_env() -> Option<PathBuf> {
         .filter(|dir| dir.is_dir())
 }
 
+/// Test-only: the production paths call [`translate_status_with`] with their
+/// graph-lane decision.
+#[cfg(test)]
 fn translate_status(status: &str, witness: Option<String>) -> VnncompResult {
+    translate_status_with(status, witness, || {
+        Err("graph_ledger_not_consulted".to_string())
+    })
+}
+
+/// [`translate_status`] with the graph lane's instance decision
+/// (#graph-bab-cover-ledger): consulted only for a `verified` status.
+fn translate_status_with(
+    status: &str,
+    witness: Option<String>,
+    graph_unsat: impl FnOnce() -> Result<UnsatToken, String>,
+) -> VnncompResult {
     match status {
-        "Verified" | "verified" | "Safe" | "safe" => VnncompResult::Unsat,
+        "Verified" | "verified" | "Safe" | "safe" => {
+            VnncompResult::Unsat(beta_crown_verdict_receipt(graph_unsat()))
+        }
         "Violated" | "violated" | "Falsified" | "falsified" | "Unsafe" | "unsafe" => {
             VnncompResult::Sat { witness }
         }
@@ -188,14 +324,104 @@ fn translate_status(status: &str, witness: Option<String>) -> VnncompResult {
 /// Reads the `status` field and, for a violation, the `counterexample_vnnlib` SMT-LIB
 /// witness string. If the JSON cannot be parsed or has no `status`, returns `None`
 /// so the caller can fall back to the sound `unknown` (the run did not crash).
+/// Test-only: the production paths call [`parse_competition_json_with`].
+#[cfg(test)]
 fn parse_competition_json(json: &str) -> Option<VnncompResult> {
+    parse_competition_json_with(json, || Err("graph_ledger_not_consulted".to_string()))
+}
+
+/// [`parse_competition_json`] with the graph lane's instance decision
+/// (#graph-bab-cover-ledger).
+fn parse_competition_json_with(
+    json: &str,
+    graph_unsat: impl FnOnce() -> Result<UnsatToken, String>,
+) -> Option<VnncompResult> {
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
     let status = value.get("status")?.as_str()?;
     let witness = value
         .get("counterexample_vnnlib")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
-    Some(translate_status(status, witness))
+    Some(translate_status_with(status, witness, graph_unsat))
+}
+
+/// The only translation of a retained beta-crown capture. A sealed original
+/// proof authorizes independently of JSON; ordinary strings keep their legacy
+/// graph/token door. The immutable owner remains in the resulting receipt.
+fn translate_captured_verification(
+    captured: crate::commands::beta_crown::CapturedVerification,
+    graph_unsat: impl FnOnce() -> Result<UnsatToken, String>,
+) -> VnncompResult {
+    #[cfg(feature = "mip")]
+    {
+        let (json, hull) = captured.into_parts();
+        if let Some(authority) = hull {
+            UnsatReceipt::from_original_hull(authority)
+                .map(|receipt| {
+                    // B2 (ROUTER_PROGRAM 10.12): the ratified original-hull
+                    // `unsat` streams nothing of its own, so under the Proof
+                    // profile its bundle closed with no claim behind the
+                    // verdict. Claim exactly what was computed — the
+                    // receipt's classes (the property's one clause), as ONE
+                    // `opaque` `original_hull` node over the whole region —
+                    // with the property's canonical clauses record, after the
+                    // owner's ratification (`from_original_hull`). A refused
+                    // receipt returns `Unknown` and claims nothing. Write-only,
+                    // and skipped under Competition (hint capture is off).
+                    if ny_propagate::certify::hint_capture_enabled()
+                        && super::proof_bundle::note_instance_clauses()
+                    {
+                        let (classes, _, _) = receipt.published_summary();
+                        ny_propagate::certify::stream_opaque_claim(classes, "original_hull");
+                    }
+                    VnncompResult::Unsat(receipt)
+                })
+                .unwrap_or(VnncompResult::Unknown)
+        } else {
+            parse_competition_json_with(&json, graph_unsat).unwrap_or(VnncompResult::Unknown)
+        }
+    }
+    #[cfg(not(feature = "mip"))]
+    {
+        parse_competition_json_with(captured.json(), graph_unsat).unwrap_or(VnncompResult::Unknown)
+    }
+}
+
+/// The receipt for the in-process β-CROWN verifier's `verified`
+/// (#graph-bab-cover-ledger).
+///
+/// When the graph lane's instance door authorized a token — every clause of
+/// the instance entailed by a gate-checked cover a ledgered driver proved on a
+/// box containing the declared one — the verdict publishes FROM THAT TOKEN
+/// (`[cover-gate] authorized scope=instance lane=graph ...`). Otherwise
+/// (a route with no ledger, a frame the ledger could not build, a clause no
+/// captured cover entails) it publishes through the `BetaCrownVerdict`
+/// legacy-uncovered door, and `[cover-gate] graph-ledger outcome=legacy
+/// reason=...` says why, so the uncovered remainder is countable per reason.
+/// This is the ONE `BetaCrownVerdict` door (`unsat_receipt`'s census).
+fn beta_crown_verdict_receipt(graph_unsat: Result<UnsatToken, String>) -> UnsatReceipt {
+    let (classes, min_margin) = match &graph_unsat {
+        Ok(token) => (token.classes().len(), token.min_margin()),
+        Err(_) => (0, f64::NAN),
+    };
+    match graph_unsat {
+        Ok(token) => match UnsatReceipt::from_token(token) {
+            Some(receipt) => {
+                eprintln!(
+                    "[cover-gate] authorized scope=instance lane=graph clauses={classes} \
+                     min_margin={min_margin:e}"
+                );
+                receipt
+            }
+            None => beta_crown_verdict_legacy("token_not_instance_scoped"),
+        },
+        Err(reason) => beta_crown_verdict_legacy(&reason),
+    }
+}
+
+fn beta_crown_verdict_legacy(reason: &str) -> UnsatReceipt {
+    eprintln!("[cover-gate] graph-ledger outcome=legacy reason={reason}");
+    UnsatReceipt::legacy_uncovered(LegacyUnsatAuthority::BetaCrownVerdict)
 }
 
 /// Read the verifier's own wall duration from the same captured terminal JSON
@@ -1210,29 +1436,6 @@ const MIN_RESULTS_FLUSH_RESERVE_SECS: u64 = 5;
 const SAFENLP_SHORT_GRACE_ENV: &str = "NY_SAFENLP_SHORT_GRACE";
 const SAFENLP_SHORT_GRACE_MAX_BUDGET_SECS: u64 = 30;
 const SAFENLP_SHORT_GRACE_SECS: u64 = 1;
-/// Default-dark direct-MIP-first experiment for official short SafeNLP rows.
-///
-/// This gate only records category/budget intent in a typed instance override.
-/// The loaded network/spec shape, live absolute deadline, AUTO verifier policy,
-/// and the independent shared-prefix gate are all rechecked at the dispatch
-/// seam before BaB can be bypassed.
-const SAFENLP_DIRECT_MIP_FIRST_ENV: &str = "NY_MIP_SAFENLP_DIRECT_FIRST";
-const SAFENLP_DIRECT_MIP_FIRST_MAX_BUDGET_SECS: u64 = 30;
-/// Default-dark terminal-Softmax peel experiment for the 2023 traffic-sign
-/// benchmark. The exact category fence is intentional: terminal-Softmax
-/// classification constraints are order-preserving, but no other category is
-/// admitted until it has its own measured treatment.
-const TRAFFIC_TERMINAL_SOFTMAX_PEEL_ENV: &str = "NY_TRAFFIC_TERMINAL_SOFTMAX_PEEL";
-const TRAFFIC_TERMINAL_SOFTMAX_PEEL_CATEGORY: &str = "traffic_signs_recognition_2023";
-/// Default-dark certified imgSz32 cGAN input-leaf experiment.
-///
-/// Only the literal `cgan_2023` and `cgan2026` categories may mint the typed
-/// route. The latter reuses the audited imgSz32 route because its corresponding
-/// models are byte-identical; model, property, profile, graph, row, deadline,
-/// and memory evidence are still independently rechecked by the attached
-/// oracle.
-const CGAN_INPUT_LEAF_ENV: &str = "NY_CGAN_INPUT_LEAF";
-const CGAN_INPUT_LEAF_CATEGORIES: [&str; 2] = ["cgan_2023", "cgan2026"];
 /// Stop admitting final renames before the hard-stop boundary. Rendering and
 /// staging happen before admission, so this interval contains only one rename
 /// plus the explicit publication acknowledgement.
@@ -1312,216 +1515,6 @@ fn admit_pre_softmax_attack_objective(
     }
 }
 
-/// Typed VNN-COMP routing receipt for the traffic terminal-Softmax experiment.
-///
-/// `env_armed` and `category_matched` are kept separately so a flight record
-/// distinguishes a dark gate from an explicitly requested but category-fenced
-/// run. Only `effective` is forwarded to the model loader.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TrafficTerminalSoftmaxPeelDecision {
-    env_armed: bool,
-    category_matched: bool,
-    effective: bool,
-}
-
-/// Typed category-gate receipt for the cGAN input-leaf experiment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CganInputLeafDecision {
-    env_armed: bool,
-    category_matched: bool,
-    mip_compiled: bool,
-    route: Option<CganInputLeafRoute>,
-}
-
-/// What the verifier actually did with an admitted traffic peel request.
-///
-/// This is kept separate from the routing decision: an armed gate can be
-/// bypassed by an earlier wrapper verdict, declined by the joint model/property
-/// pass, or applied.  `ReceiptUnavailable` is fail-closed evidence that beta
-/// returned a captured verdict without the expected typed effective-config
-/// fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TrafficTerminalSoftmaxPeelExecution {
-    NotRequested,
-    NotReached,
-    Declined,
-    Applied,
-    ReceiptUnavailable,
-}
-
-/// What the default-dark traffic treatment did before the ordinary upfront
-/// attack schedule.
-///
-/// This receipt is deliberately separate from [`TrafficTerminalSoftmaxPeelExecution`]:
-/// the latter records the beta-CROWN loader, while this one records an additive
-/// attack-only logit-DLR micro-leg that can run (and find a witness) before beta
-/// is reached.  No state here carries verdict authority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TrafficUpfrontSoftmaxExecution {
-    NotRequested,
-    NotReached,
-    AttackDisabled,
-    AdmissionDeclined,
-    QualificationDeclined,
-    QualifiedNotRun,
-    Applied,
-    Invalidated,
-}
-
-impl TrafficUpfrontSoftmaxExecution {
-    fn before_run(requested: bool) -> Self {
-        if requested {
-            Self::NotReached
-        } else {
-            Self::NotRequested
-        }
-    }
-
-    fn flight_status(self) -> crate::flight::FlightStatus {
-        match self {
-            Self::Applied => crate::flight::FlightStatus::Ran,
-            Self::NotReached | Self::QualifiedNotRun => crate::flight::FlightStatus::NotReached,
-            Self::NotRequested
-            | Self::AttackDisabled
-            | Self::AdmissionDeclined
-            | Self::QualificationDeclined
-            | Self::Invalidated => crate::flight::FlightStatus::Skipped,
-        }
-    }
-
-    fn flight_reason(self) -> &'static str {
-        match self {
-            Self::NotRequested => "not requested",
-            Self::NotReached => "admitted traffic request did not reach the upfront attack",
-            Self::AttackDisabled => "the authoritative upfront-attack route was disabled",
-            Self::AdmissionDeclined => "the original property did not admit the upfront attack",
-            Self::QualificationDeclined => {
-                "the one-load exact terminal-Softmax qualification declined fail-closed"
-            }
-            Self::QualifiedNotRun => {
-                "authenticated logit objective was built but no logit-DLR step ran"
-            }
-            Self::Applied => {
-                "authenticated restart-0 logit-DLR micro-leg ran before the historical schedule"
-            }
-            Self::Invalidated => {
-                "a malformed or non-finite logit view invalidated the treatment; historical restart 0 was reset"
-            }
-        }
-    }
-}
-
-fn note_traffic_upfront_softmax_execution(execution: TrafficUpfrontSoftmaxExecution) {
-    crate::flight::note(
-        "traffic_upfront_softmax_objective",
-        execution.flight_status(),
-        Some(execution.flight_reason().to_string()),
-    );
-}
-
-impl TrafficTerminalSoftmaxPeelExecution {
-    fn before_run(requested: bool) -> Self {
-        if requested {
-            Self::NotReached
-        } else {
-            Self::NotRequested
-        }
-    }
-
-    fn from_beta_capture(requested: bool, captured: Option<&str>) -> Self {
-        if !requested {
-            return Self::NotRequested;
-        }
-        let Some(captured) = captured else {
-            return Self::ReceiptUnavailable;
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(captured) else {
-            return Self::ReceiptUnavailable;
-        };
-        let receipt = &value["effective_config"]["softmax"];
-        if receipt["terminal_peel_requested"].as_bool() != Some(true) {
-            return Self::ReceiptUnavailable;
-        }
-        match (
-            receipt["terminal_peel_applied"].as_bool(),
-            receipt["terminal_peel_activation"].as_str(),
-        ) {
-            (Some(true), Some("softmax")) => Self::Applied,
-            (Some(false), Some("none")) => Self::Declined,
-            _ => Self::ReceiptUnavailable,
-        }
-    }
-
-    fn applied(self) -> bool {
-        self == Self::Applied
-    }
-
-    fn flight_status(self) -> crate::flight::FlightStatus {
-        match self {
-            Self::Applied => crate::flight::FlightStatus::Ran,
-            Self::NotReached => crate::flight::FlightStatus::NotReached,
-            Self::NotRequested | Self::Declined | Self::ReceiptUnavailable => {
-                crate::flight::FlightStatus::Skipped
-            }
-        }
-    }
-
-    fn flight_reason(self) -> &'static str {
-        match self {
-            Self::NotRequested => "not requested",
-            Self::NotReached => "admitted gate was not reached because an earlier lane terminated",
-            Self::Declined => "joint model/property pass reached and declined fail-closed",
-            Self::Applied => {
-                "authenticated single-group terminal Softmax peeled and all atoms rewritten"
-            }
-            Self::ReceiptUnavailable => {
-                "beta was invoked but no valid terminal-peel execution receipt was captured"
-            }
-        }
-    }
-}
-
-fn traffic_terminal_softmax_peel_decision(
-    category: &str,
-    raw: Option<&OsStr>,
-) -> TrafficTerminalSoftmaxPeelDecision {
-    // Exact `OsStr` comparison makes unset, malformed, whitespace-padded, and
-    // non-Unicode values fail closed without a lossy conversion.
-    let env_armed = raw == Some(OsStr::new("1"));
-    let category_matched = category == TRAFFIC_TERMINAL_SOFTMAX_PEEL_CATEGORY;
-    TrafficTerminalSoftmaxPeelDecision {
-        env_armed,
-        category_matched,
-        effective: env_armed && category_matched,
-    }
-}
-
-fn cgan_input_leaf_decision(category: &str, raw: Option<&OsStr>) -> CganInputLeafDecision {
-    let env_armed = raw == Some(OsStr::new("1"));
-    // Preserve an exact allowlist: neither year-like aliases nor category
-    // prefixes inherit the authenticated imgSz32 route.
-    let category_matched = CGAN_INPUT_LEAF_CATEGORIES.contains(&category);
-    let mip_compiled = cfg!(feature = "mip");
-    CganInputLeafDecision {
-        env_armed,
-        category_matched,
-        mip_compiled,
-        route: (env_armed && category_matched && mip_compiled)
-            .then_some(CganInputLeafRoute::Cgan2023),
-    }
-}
-
-fn cgan_input_leaf_gate_receipt(decision: CganInputLeafDecision, category: &str) -> String {
-    format!(
-        "env_armed={} category_matched={} mip_compiled={} effective={} depth_two_production_mode={} category={category}",
-        decision.env_armed,
-        decision.category_matched,
-        decision.mip_compiled,
-        decision.route.is_some(),
-        CGAN_DEPTH_TWO_PRODUCTION_MODE,
-    )
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InternalTimeoutRoute {
     Historical,
@@ -1530,6 +1523,13 @@ enum InternalTimeoutRoute {
     /// the scalable historical tail to proof search, retaining only the fixed
     /// publication margin.
     PresetProofTail,
+    /// #flush-grace: a typed `bab.phase_budget.results_flush_grace_secs`
+    /// states the family's own publication reserve outright, replacing the
+    /// historical `max(5, budget/20)` rule. Outranks the proof-tail route
+    /// (both come from the same preset, and the explicit number is the more
+    /// specific statement) and never displaces the SafeNLP short-grace route,
+    /// which owns a separate hard-stop and single-writer publication lane.
+    PresetFlushGrace,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1578,9 +1578,8 @@ impl PostBabWrapperRoute {
 fn postbab_deferred_pgd_consumer_available(
     route: PostBabWrapperRoute,
     margin_row_memory_allowed: bool,
-    safenlp_direct_mip_first: bool,
 ) -> bool {
-    route.attack_enabled() && margin_row_memory_allowed && !safenlp_direct_mip_first
+    route.attack_enabled() && margin_row_memory_allowed
 }
 
 fn deferred_outer_pgd_has_priority(
@@ -1663,9 +1662,12 @@ enum UpfrontWrapperRoute {
     DisabledByInvalidPreset,
     ForcedByEnvironment,
     /// The typed `attack.upfront_attack: true` category key (#upfront-preset).
-    /// Identical arming to [`Self::ForcedByEnvironment`], but it travels with
+    /// Arms the lane like [`Self::ForcedByEnvironment`], but it travels with
     /// the preset, so `ny vnncomp`, `vnncomp_sweep`, and `ny benchmarks run`
-    /// all measure the same lane the submission wrapper arms.
+    /// all measure the same lane the submission wrapper arms. One deliberate
+    /// difference (#ml4acopf-upfront-single): a multi-clause disjunction keeps
+    /// its automatic admission and cap under this route, see
+    /// [`upfront_attack_admission`].
     ForcedByPreset,
 }
 
@@ -1705,6 +1707,18 @@ struct UpfrontAttackPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PostBabReservePolicy {
     configured_secs: u64,
+}
+
+/// Frozen diversified-restart count for the outer post-BaB falsifier
+/// (#postbab-restart-diversity).
+///
+/// Zero (the declaration default) preserves the historical convergent
+/// single-descent stack byte-for-byte; a positive count re-enters the stage-0
+/// alternation from deterministically seeded diversified basins after it
+/// self-terminates with attack window remaining.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PostBabRestartPolicy {
+    configured_restarts: u64,
 }
 
 /// Frozen source-sensitive admission for the outer post-BaB falsifier.
@@ -1811,6 +1825,22 @@ impl PostBabReservePolicy {
             other => Err(format!(
                 "{} resolved to non-u64 value {other:?}",
                 POSTBAB_RESERVE_SECS.name
+            )),
+        }
+    }
+}
+
+impl PostBabRestartPolicy {
+    fn from_levers(levers: &ny_levers::LeverSet) -> std::result::Result<Self, String> {
+        use ny_levers::decls::vnncomp_entry::POSTBAB_RESTARTS;
+
+        match levers.get(&POSTBAB_RESTARTS) {
+            ny_levers::LeverValue::U64(configured_restarts) => Ok(Self {
+                configured_restarts,
+            }),
+            other => Err(format!(
+                "{} resolved to non-u64 value {other:?}",
+                POSTBAB_RESTARTS.name
             )),
         }
     }
@@ -2069,6 +2099,99 @@ fn apply_postbab_wrapper_timeout_policy(
     }
 }
 
+/// Resolve the typed publication reserve from the wrapper's immutable preset
+/// snapshot (#flush-grace).
+///
+/// A missing or invalid snapshot, an absent `bab.phase_budget` section, or an
+/// absent key all yield `None` — the declaration default — which is today's
+/// `max(5, budget/20)` behaviour, byte for byte.
+fn results_flush_grace_from_snapshot(
+    preset_snapshot: Option<&BetaCrownPresetSnapshot>,
+) -> Option<u64> {
+    preset_snapshot
+        .and_then(BetaCrownPresetSnapshot::loaded)
+        .and_then(|preset| preset.bab.phase_budget.results_flush_grace_secs)
+}
+
+/// Replace the historical `max(5, budget/20)` publication grace with the value
+/// the category's own preset states (#flush-grace).
+///
+/// WHAT THIS REPLACES, AND WHY THAT IS THE GENERALISATION. The historical rule
+/// reserves `max(5, budget / 20)`: 5 s at every budget up to 100 s, then 5 % of
+/// it. On a 20 s row that is a 25 % tax on proof search, and the doc block on
+/// [`SCORED_WALL_STOP_RESERVE_SECS`] records what the reserve actually has to
+/// cover — 9-18 ms of publication plus the error in the branch-and-bound stop
+/// estimate, measured at 0.00-0.19 s across 70 armed runs on the one family
+/// that carries a `BabWall`. Substituting only the `5` and keeping the `max`
+/// would leave every budget at or above `20 * grace` untouched, i.e. it would
+/// change nothing on the long rows where the 5 % tail is largest. So an
+/// explicit value is stated absolutely, and it is a claim the family makes
+/// about its OWN tail.
+///
+/// PRECEDENCE. `SafeNlpShortGrace` is untouched: it is a separate dark
+/// experiment that also re-plumbs publication onto a single-writer coordinator
+/// with its own hard stop, and a typed key must not half-enter that lane. The
+/// proof-tail route IS superseded, because both are preset statements and an
+/// explicit number is the more specific one.
+///
+/// THE CLAMP IS THE SAME TOTAL ARITHMETIC THE OTHER TWO ROUTES USE: subtract,
+/// require at least one second, otherwise fall back to the whole budget. It
+/// cannot produce a zero, negative, or over-budget internal timeout, and it
+/// never touches the scored instance deadline, either watchdog tier, or the
+/// pre-written sound `unknown`.
+fn apply_results_flush_grace_policy(
+    decision: InternalTimeoutDecision,
+    timeout_secs: u64,
+    grace_secs: Option<u64>,
+) -> InternalTimeoutDecision {
+    let Some(grace_secs) = grace_secs else {
+        return decision;
+    };
+    if decision.route == InternalTimeoutRoute::SafeNlpShortGrace {
+        return decision;
+    }
+
+    let solver_timeout_secs = timeout_secs
+        .checked_sub(grace_secs)
+        .filter(|&timeout| timeout >= 1)
+        .unwrap_or(timeout_secs);
+    InternalTimeoutDecision {
+        solver_timeout_secs,
+        effective_flush_reserve_secs: timeout_secs.saturating_sub(solver_timeout_secs),
+        historical_solver_timeout_secs: decision.historical_solver_timeout_secs,
+        route: InternalTimeoutRoute::PresetFlushGrace,
+    }
+}
+
+/// UNCONDITIONAL publication-reserve receipt (#flush-grace).
+///
+/// `eprintln!`, not `println!`, deliberately: the sweep nulls the child's
+/// stdout and keeps only a bounded STDERR tail, which is the family
+/// `[budget]`/`[stop]` already belong to (see `vnncomp_sweep`'s stop-evidence
+/// filter). A stdout line would be discarded by exactly the tool most likely
+/// to be reading for it.
+///
+/// Emitted on EVERY scored run, including the default route, so that an ABSENT
+/// line means the binary predates this lever and any null measured through it
+/// is VOID rather than negative.
+fn flush_grace_receipt_line(timeout_secs: u64, decision: InternalTimeoutDecision) -> String {
+    let source = match decision.route {
+        InternalTimeoutRoute::PresetFlushGrace => "preset",
+        InternalTimeoutRoute::PresetProofTail => "preset-proof-tail",
+        InternalTimeoutRoute::SafeNlpShortGrace => "env-safenlp-short-grace",
+        InternalTimeoutRoute::Historical => "default",
+    };
+    format!(
+        "[flush-grace] budget_s={timeout_secs} grace_s={} source={source} \
+internal_timeout_s={}",
+        decision.effective_flush_reserve_secs, decision.solver_timeout_secs,
+    )
+}
+
+fn emit_flush_grace_receipt(timeout_secs: u64, decision: InternalTimeoutDecision) {
+    eprintln!("{}", flush_grace_receipt_line(timeout_secs, decision));
+}
+
 /// Absolute verifier deadline for routes that consume nearly all of the scored
 /// budget. The proof-tail route is anchored before model/runtime setup so setup
 /// time cannot slide a duration-based timeout past the publication margin.
@@ -2078,7 +2201,14 @@ fn beta_phase_deadline(
 ) -> Option<std::time::Instant> {
     match decision.route {
         InternalTimeoutRoute::SafeNlpShortGrace => Some(instance_deadline),
-        InternalTimeoutRoute::PresetProofTail => Some(
+        // #flush-grace shares the proof-tail anchoring for the reason stated
+        // on this function: a duration-based grant silently restarts the clock
+        // at lane construction, so setup seconds are charged twice in reality
+        // and once in the accounting. A SMALL grace makes that error decisive —
+        // a 1 s reserve on a 20 s budget is entirely consumed by a 1 s model
+        // load — so the explicit-grace route must be absolute or it is unsound
+        // against its own budget.
+        InternalTimeoutRoute::PresetProofTail | InternalTimeoutRoute::PresetFlushGrace => Some(
             instance_deadline
                 .checked_sub(std::time::Duration::from_secs(
                     decision.effective_flush_reserve_secs,
@@ -2091,8 +2221,8 @@ fn beta_phase_deadline(
 
 /// Absolute end of the internal solver grant, frozen from the scored instance
 /// clock before preset planning, model loading, wrapper attacks, or verifier
-/// setup. Unlike [`beta_phase_deadline`], this exists for the historical route
-/// too; it is scheduling authority only for an outer-owned deferred PGD handoff.
+/// setup. This also caps the historical verifier route, whose configured
+/// duration must not restart the original grant after model/setup work.
 fn solver_phase_deadline(
     decision: InternalTimeoutDecision,
     instance_deadline: std::time::Instant,
@@ -2104,9 +2234,33 @@ fn solver_phase_deadline(
         .unwrap_or(instance_deadline)
 }
 
+/// Preserve an explicit route's authority; otherwise charge the historical
+/// verifier's complete setup against its original absolute solver grant.
+/// This is separate from the proof-tail scheduling flag: giving Historical
+/// an authority must not suppress its post-verifier or concurrent consumers.
+fn beta_solver_authority_deadline(
+    route_deadline: Option<std::time::Instant>,
+    original_solver_deadline: Option<std::time::Instant>,
+) -> Option<std::time::Instant> {
+    route_deadline.or(original_solver_deadline)
+}
+
 /// Normalize only the harmless spelling differences accepted for the narrow
 /// SafeNLP timeout experiment. Paths, suffixes, and broader aliases stay out of
 /// scope so the dark lever cannot accidentally affect another category.
+///
+/// #name-blind-routing: this is the LAST category-name decision on the scored
+/// path, and it is env-dark (`NY_SAFENLP_SHORT_GRACE`, never exported by
+/// `run_instance.sh`). It was deliberately NOT deleted with the other three
+/// env-dark name-keyed routes: under the workspace's `-D warnings` gate,
+/// removing this selection makes the whole parent-anchored short-grace
+/// watchdog/publication protocol dead code, and that protocol shares its
+/// deadline/result-policy/control types and the `__vnncomp-watchdog` argv
+/// dispatcher with the historical external watchdog that runs on EVERY scored
+/// row. Deleting it is a watchdog refactor that must be compiled, unit-tested
+/// and timing-measured on its own, not a blind edit. The category-name ratchet
+/// (`crates/ny-levers/tests/category_name_ratchet.rs`) counts this literal, so
+/// the follow-up that removes it must lower that baseline.
 fn is_safenlp_2024_category(category: &str) -> bool {
     category.trim().to_ascii_lowercase().replace('-', "_") == "safenlp_2024"
 }
@@ -2118,22 +2272,6 @@ fn is_safenlp_2024_category(category: &str) -> bool {
 /// the experiment.
 fn safenlp_short_grace_gate_enabled(raw: Option<&OsStr>) -> bool {
     raw == Some(OsStr::new("1"))
-}
-
-/// Resolve only the VNN-COMP-owned half of the direct-MIP-first route.
-///
-/// `var_os`/`OsStr` equality gives this the same exact-literal semantics as the
-/// short-grace experiment: unset, malformed, whitespace-padded, truthy, and
-/// non-Unicode values all fail closed. A positive scored budget is required so
-/// the later dispatch can never manufacture an unbounded direct solve.
-fn safenlp_direct_mip_first_requested(
-    category: &str,
-    timeout_secs: u64,
-    gate_raw: Option<&OsStr>,
-) -> bool {
-    gate_raw == Some(OsStr::new("1"))
-        && is_safenlp_2024_category(category)
-        && (1..=SAFENLP_DIRECT_MIP_FIRST_MAX_BUDGET_SECS).contains(&timeout_secs)
 }
 
 /// Select the competition verifier's internal timeout.
@@ -2637,6 +2775,20 @@ fn commit_timeout_unless_verdict_published_with(
 #[allow(unsafe_code)]
 pub(crate) fn exit_scored_instance_without_teardown() -> ! {
     use std::io::Write;
+    // #mr-census: a margin-row lane still running here (the detached
+    // concurrent worker after its final join grace expired) never reaches its
+    // own census `Drop`, so print its snapshot now. Silent when no lane is live.
+    if let Some(line) =
+        ny_propagate::margin_row::census::snapshot_if_live("process_exit_with_live_lane")
+    {
+        eprintln!("{line}");
+        // ...and the per-mechanism stop receipts (`[root-eval-reuse]`,
+        // `[narrow-r]`, `[mr-errlane] done`), which the lane's own `Drop`
+        // would have printed: without them every timeout row lacks them.
+        for extra in ny_propagate::margin_row::census::stop_lines() {
+            eprintln!("{extra}");
+        }
+    }
     // Rust's stdout is line-buffered, so `Result:`/`Loading preset:` are
     // already on their way out; flush anyway so a redirected (block-buffered)
     // stdout is complete before the process disappears. stderr is unbuffered.
@@ -2686,10 +2838,22 @@ pub(crate) fn exit_scored_instance_without_teardown() -> ! {
 ///   beyond `normalize_vnnlib2_sat_result`, which only rewrites `Sat`.
 /// * The attack lanes can only ADD `sat`; they never turn an `unsat` into
 ///   anything else, and they are not consulted on a row the lane has proved.
-/// * The one ordering difference is that a verifier `sat` arriving LATER than
-///   the lane's proof no longer wins the race. Those two verdicts are
-///   contradictory: on a sound pair the case is empty, and the moat rows
-///   (three banked `sat`) are the standing check that it stays empty.
+/// * THIS BULLET WAS THE DEFECT, and it is corrected here rather than deleted,
+///   because the false justification is what let the race survive review. It
+///   used to read: "the one ordering difference is that a verifier `sat`
+///   arriving LATER than the lane's proof no longer wins the race. Those two
+///   verdicts are contradictory: on a sound pair the case is empty, and the
+///   moat rows (three banked `sat`) are the standing check that it stays
+///   empty." Both sentences are true and NEITHER supports the conclusion. A
+///   contradiction means one of the two lanes is unsound, which is exactly the
+///   case in which the protocol has to choose — and "whichever thread finished
+///   first" is not a choice, it is the absence of one. The `sat` at stake is
+///   not the verifier's raw claim either: by the time it exists ONNX Runtime
+///   has re-executed the model and reproduced the violation, so the race was
+///   between a CONSTRUCTIVE, organizer-checkable witness and a bound-based
+///   claim. Losing it publishes a wrong verdict (-150) on a row this process
+///   had already solved correctly. #sat-precedence now gives the constructive
+///   witness absolute priority; see [`SatPrecedence`].
 ///
 /// Armed target = the scored RESULTS_FILE, published only on the ordinary
 /// (non-short-grace) route. Absent target ⇒ the lane falls back to today's
@@ -2716,20 +2880,6 @@ fn claim_terminal_publication() -> bool {
     claim_terminal_publication_in(&TERMINAL_PUBLICATION_CLAIMED)
 }
 
-/// Give the claim back after a FAILED write, so the other writer can still
-/// publish (#twinwall-early-exit).
-///
-/// Without this the protocol has a hole: the lane claims, its write fails, and
-/// the main thread — which must respect the claim — then declines too, so
-/// RESULTS_FILE keeps the competition-safety `unknown` placeholder instead of
-/// the verdict the run actually reached. Both score zero, so this is not a
-/// soundness bug, but it silently downgrades a `timeout` to an `unknown` and
-/// there is no reason to accept that. Releasing is safe precisely because it
-/// only ever happens on a path where NOTHING was written.
-fn release_terminal_publication() {
-    release_terminal_publication_in(&TERMINAL_PUBLICATION_CLAIMED);
-}
-
 /// Seam for [`claim_terminal_publication`]: the flag is passed in so the
 /// exclusion rule is testable against a LOCAL atomic, without a process global
 /// whose value depends on which other test published first. Mirrors the shape
@@ -2738,15 +2888,277 @@ fn claim_terminal_publication_in(flag: &std::sync::atomic::AtomicBool) -> bool {
     !flag.swap(true, std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Seam for [`release_terminal_publication`].
+/// Give the claim back after a FAILED write, so the other writer can still
+/// publish (#twinwall-early-exit). Called from [`publish_lane_unsat_in`], which
+/// is the only writer that can take the claim and then fail to use it.
+///
+/// Without this the protocol has a hole: the lane claims, its write fails, and
+/// the main thread — which must respect the claim — then declines too, so
+/// RESULTS_FILE keeps the competition-safety `unknown` placeholder instead of
+/// the verdict the run actually reached. Both score zero, so this is not a
+/// soundness bug, but it silently downgrades a `timeout` to an `unknown` and
+/// there is no reason to accept that. Releasing is safe precisely because it
+/// only ever happens on a path where NOTHING was written.
 fn release_terminal_publication_in(flag: &std::sync::atomic::AtomicBool) {
     flag.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+// --------------------------------------------------------------------------
+//  #sat-precedence — a CONFIRMED counterexample outranks every `unsat`
+// --------------------------------------------------------------------------
+
+/// THE DEFECT. `#twinwall-early-exit` gave the two publishers a mutual-EXCLUSION
+/// protocol and nothing else, so the winner was decided purely by ARRIVAL ORDER.
+/// The margin-row lane runs on its own thread for the whole instance, while the
+/// main thread does not claim publication until `run_and_translate` has
+/// returned — long after the trusted-oracle gate accepted a counterexample. A
+/// row whose counterexample ONNX Runtime had ALREADY reconfirmed could therefore
+/// be published as `unsat` simply because the lane finished first: a wrong
+/// verdict (-150) on a row this process had already solved correctly.
+///
+/// The claim in the old rationale that made this look acceptable —
+/// "those two verdicts are contradictory: on a sound pair the case is empty" —
+/// is true and IRRELEVANT. Exactly when the case is non-empty, one of the two
+/// lanes is unsound, and the protocol has to say which one we publish. Arrival
+/// order is not an answer.
+///
+/// THE PRECEDENCE. The two claims are not symmetric:
+///
+/// * a confirmed `sat` is CONSTRUCTIVE — a concrete input, re-executed through
+///   the reference runtime, at which the property is violated. The organizer can
+///   check it without trusting any bound of ours;
+/// * an `unsat` is a BOUND-based claim, only as good as every certificate that
+///   fed it. One under-charged certificate anywhere makes it false.
+///
+/// So when they disagree the constructive witness wins, whichever thread
+/// finished first.
+///
+/// HOW THE RACE IS CLOSED RATHER THAN NARROWED. [`publish_lane_unsat_in`]
+/// performs the precedence read, the terminal-publication claim AND the
+/// RESULTS_FILE write inside ONE critical section of this mutex, and both
+/// [`note_confirmed_sat_in`] and [`SatAdjudicationGuard`] take the same mutex.
+/// No confirmation can slip between the lane's check and its write. The
+/// `adjudicating` counter then extends the exclusion over the whole
+/// trusted-oracle gate — the interval that CONTAINS the instant a counterexample
+/// becomes confirmed — so a lane proof landing while a candidate is under
+/// adjudication defers instead of publishing.
+///
+/// COST OF DEFERRING: no soundness cost and no verdict cost. A declined early
+/// exit hands the lane's `Unsat` to the channel exactly as before, and the main
+/// thread still publishes it at the post-BaB or final join if the adjudication
+/// ends in a downgrade. Only the early-exit LATENCY saving is lost, and only on
+/// a row where a candidate counterexample and a certified proof were in flight
+/// at the same instant.
+#[derive(Debug, Default)]
+struct SatPrecedence {
+    /// An ONNX-Runtime-reconfirmed counterexample exists for this instance.
+    /// LATCHED: a later candidate's downgrade cannot clear an earlier
+    /// confirmation, because the earlier witness is still a valid violation.
+    confirmed: bool,
+    /// Trusted-oracle adjudications currently in flight. A counter rather than a
+    /// flag so repeated / nested gate calls compose — the post-BaB attack lane
+    /// re-enters the gate after the first verdict.
+    adjudicating: usize,
+    /// #attack-concurrent: concurrent-attack publications in flight — inside
+    /// the ATTACK DOOR ([`AttackPublicationGuard`]): from before the trusted
+    /// gate to after the attack's own critical section. The main thread's
+    /// synchronized door ([`publish_main_verdict_in`]) waits on it.
+    attack_inflight: usize,
+    /// #attack-concurrent: the main thread CLOSED the attack door — its verdict
+    /// is being (or has been) written. No attack publication may start, and an
+    /// in-flight one may no longer write. Latched.
+    attack_door_closed: bool,
+}
+
+static SAT_PRECEDENCE: std::sync::Mutex<SatPrecedence> = std::sync::Mutex::new(SatPrecedence {
+    confirmed: false,
+    adjudicating: 0,
+    attack_inflight: 0,
+    attack_door_closed: false,
+});
+
+/// #attack-concurrent: signalled whenever a concurrent-attack publication
+/// leaves the attack door, so the main thread's synchronized door wakes as
+/// soon as the last in-flight adjudication ends. Paired with
+/// [`SAT_PRECEDENCE`].
+static ATTACK_DOOR_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// Lock the precedence record, ignoring poisoning.
+///
+/// A panic in some other thread must not turn this into a panic on the
+/// publication path. `into_inner` keeps the (plain-data) state, and the two
+/// fields only ever latch to `true` or increment-then-decrement, so the worst a
+/// poisoned state can carry is an adjudication that is never released — which
+/// REFUSES the lane's early exit. That is the safe direction.
+fn lock_sat_precedence(
+    precedence: &std::sync::Mutex<SatPrecedence>,
+) -> std::sync::MutexGuard<'_, SatPrecedence> {
+    precedence
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Record that the trusted oracle RECONFIRMED a counterexample for this
+/// instance. From this instant no lane may publish `unsat` (#sat-precedence).
+fn note_confirmed_sat_in(precedence: &std::sync::Mutex<SatPrecedence>) {
+    lock_sat_precedence(precedence).confirmed = true;
+}
+
+/// Process-global face of [`note_confirmed_sat_in`].
+fn note_confirmed_sat() {
+    note_confirmed_sat_in(&SAT_PRECEDENCE);
+}
+
+/// RAII marker for "a candidate counterexample is inside the trusted-oracle gate
+/// right now" (#sat-precedence). Held for the whole of
+/// [`gate_sat_with_trusted_oracle`], so the interval in which a counterexample
+/// becomes confirmed is strictly inside a period during which the lane is
+/// refused.
+struct SatAdjudicationGuard<'a> {
+    precedence: &'a std::sync::Mutex<SatPrecedence>,
+}
+
+impl<'a> SatAdjudicationGuard<'a> {
+    fn enter_in(precedence: &'a std::sync::Mutex<SatPrecedence>) -> Self {
+        lock_sat_precedence(precedence).adjudicating += 1;
+        Self { precedence }
+    }
+}
+
+impl Drop for SatAdjudicationGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = lock_sat_precedence(self.precedence);
+        state.adjudicating = state.adjudicating.saturating_sub(1);
+    }
+}
+
+/// Process-global face of [`SatAdjudicationGuard::enter_in`].
+fn enter_sat_adjudication() -> SatAdjudicationGuard<'static> {
+    SatAdjudicationGuard::enter_in(&SAT_PRECEDENCE)
+}
+
+/// #sat-precedence, MAIN-THREAD side. An `unsat` must not be published on an
+/// instance for which the trusted oracle already reconfirmed a counterexample.
+///
+/// This is not the lane race — that is closed inside [`publish_lane_unsat_in`] —
+/// it is the deterministic tail of it. A counterexample can be confirmed and
+/// still fail to reach RESULTS_FILE: the #witness-exec-match gate refuses a
+/// witness whose `Y_j` block it cannot validate the way the organizer will, and
+/// the resulting `unknown` then falls through to the post-BaB grace and the
+/// final twin-wall join, either of which can hand back the margin-row lane's
+/// `Unsat` (`ConcurrentLaneTake::Verdict(res) => return res`). Publishing that
+/// would state the exact opposite of a constructive result this process holds.
+/// The outward answer is the 0-point `unknown`.
+///
+/// Only `Unsat` is affected. `Sat`, `Unknown`, `Timeout` and `Error` pass
+/// through untouched, so on every instance that never latched a confirmation —
+/// which is every instance that never upheld a `sat` — this is two loads and a
+/// pattern match.
+fn refuse_unsat_against_confirmed_counterexample_in(
+    precedence: &std::sync::Mutex<SatPrecedence>,
+    result: VnncompResult,
+) -> VnncompResult {
+    if !matches!(result, VnncompResult::Unsat(_)) {
+        return result;
+    }
+    // Read and RELEASE before the logging below: the guard's scope is explicit
+    // here rather than resting on the temporary-lifetime rule for `if`
+    // conditions, and nothing else in this function needs the lock.
+    let confirmed = lock_sat_precedence(precedence).confirmed;
+    refuse_unsat_given_confirmation(confirmed, result)
+}
+
+/// The #sat-precedence filter on an already-read confirmation state, so the
+/// synchronized main door ([`publish_main_verdict_in`]) can apply it INSIDE
+/// its critical section. Identical decision and logging to
+/// [`refuse_unsat_against_confirmed_counterexample_in`].
+fn refuse_unsat_given_confirmation(confirmed: bool, result: VnncompResult) -> VnncompResult {
+    if !matches!(result, VnncompResult::Unsat(_)) || !confirmed {
+        return result;
+    }
+    eprintln!(
+        "vnncomp: REFUSING to publish `unsat` — this instance holds an \
+         ONNX-Runtime-reconfirmed counterexample whose witness could not be published \
+         (#sat-precedence); emitting the sound `unknown` instead"
+    );
+    crate::flight::note(
+        "sat_precedence",
+        crate::flight::FlightStatus::Ran,
+        Some("main-thread unsat REFUSED: a confirmed counterexample exists".to_string()),
+    );
+    VnncompResult::Unknown
+}
+
+/// Process-global face of [`refuse_unsat_against_confirmed_counterexample_in`].
+fn refuse_unsat_against_confirmed_counterexample(result: VnncompResult) -> VnncompResult {
+    refuse_unsat_against_confirmed_counterexample_in(&SAT_PRECEDENCE, result)
+}
+
+/// Outcome of the lane's terminal-publication attempt (#sat-precedence).
+#[derive(Debug, Eq, PartialEq)]
+enum LaneUnsatPublication {
+    /// The lane owns RESULTS_FILE and its `unsat` is on disk.
+    Published,
+    /// A counterexample has already been reconfirmed by ONNX Runtime; the
+    /// constructive witness outranks this bound-based proof.
+    RefusedConfirmedSat,
+    /// A candidate counterexample is inside the trusted-oracle gate right now.
+    RefusedAdjudicatingSat,
+    /// The main thread already took the single publication right.
+    RefusedClaimTaken,
+    /// The claim was taken and given back; nothing reached disk.
+    WriteFailed(String),
+}
+
+/// The lane's terminal publication as ONE critical section: precedence read,
+/// exclusive claim, and the write itself (#sat-precedence).
+///
+/// `write` deliberately runs while the precedence mutex is held. That is the
+/// whole point: it makes "a confirmed counterexample outranks this `unsat`" a
+/// fact about the FILE rather than about a check that happened some time before
+/// the file was written.
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "the guard is deliberately held ACROSS `write`"
+)]
+fn publish_lane_unsat_in<W>(
+    precedence: &std::sync::Mutex<SatPrecedence>,
+    claim: &std::sync::atomic::AtomicBool,
+    write: W,
+) -> LaneUnsatPublication
+where
+    W: FnOnce() -> Result<()>,
+{
+    let state = lock_sat_precedence(precedence);
+    if state.confirmed {
+        return LaneUnsatPublication::RefusedConfirmedSat;
+    }
+    if state.adjudicating > 0 {
+        return LaneUnsatPublication::RefusedAdjudicatingSat;
+    }
+    if !claim_terminal_publication_in(claim) {
+        return LaneUnsatPublication::RefusedClaimTaken;
+    }
+    match write() {
+        Ok(()) => LaneUnsatPublication::Published,
+        Err(error) => {
+            // Nothing reached disk, so hand the right back: the main thread must
+            // still be able to publish whatever the internal verifier decided.
+            release_terminal_publication_in(claim);
+            LaneUnsatPublication::WriteFailed(error.to_string())
+        }
+    }
 }
 
 /// Publish a certified concurrent-lane `unsat` from the LANE's own thread and
 /// end the instance (#twinwall-early-exit). Returns only when publication was
 /// declined — the caller then hands the verdict to the channel as before.
-pub(crate) fn publish_lane_unsat_and_exit(lane_secs: f64) {
+///
+/// #sat-precedence: the attempt goes through [`publish_lane_unsat_in`], so a
+/// counterexample this process has already had ONNX Runtime reconfirm — or is
+/// adjudicating right now — refuses this publication outright. See
+/// [`SatPrecedence`] for why the constructive witness outranks the proof.
+pub(crate) fn publish_lane_unsat_and_exit(lane_secs: f64, receipt: UnsatReceipt) {
     let Some(results_file) = LANE_EARLY_PUBLISH_TARGET
         .read()
         .ok()
@@ -2758,24 +3170,58 @@ pub(crate) fn publish_lane_unsat_and_exit(lane_secs: f64) {
         );
         return;
     };
-    if !claim_terminal_publication() {
-        eprintln!(
-            "margin-row BaB: EARLY EXIT declined — the main thread already claimed terminal \
-             publication; handing the verdict to the ordinary join"
-        );
-        return;
-    }
-    let result = VnncompResult::Unsat;
-    if let Err(error) = write_results(&results_file, &result) {
-        // Nothing reached disk, so hand the right back: the main thread must
-        // still be able to publish whatever the internal verifier decided.
-        release_terminal_publication();
-        eprintln!(
-            "margin-row BaB: EARLY EXIT declined — could not publish {}: {error}; released the \
-             publication claim so the ordinary join can still write",
-            results_file.display()
-        );
-        return;
+    let result = VnncompResult::Unsat(receipt);
+    match publish_lane_unsat_in(&SAT_PRECEDENCE, &TERMINAL_PUBLICATION_CLAIMED, || {
+        write_results(&results_file, &result)
+    }) {
+        LaneUnsatPublication::Published => {}
+        LaneUnsatPublication::RefusedConfirmedSat => {
+            eprintln!(
+                "margin-row BaB: EARLY EXIT REFUSED — this instance holds an ONNX-Runtime-\
+                 reconfirmed counterexample, and a constructive witness outranks a bound-based \
+                 proof (#sat-precedence); handing the verdict to the ordinary join"
+            );
+            crate::flight::note(
+                "sat_precedence",
+                crate::flight::FlightStatus::Ran,
+                Some(format!(
+                    "lane UNSAT at {lane_secs:.1}s REFUSED publication: a confirmed \
+                     counterexample already exists for this instance"
+                )),
+            );
+            return;
+        }
+        LaneUnsatPublication::RefusedAdjudicatingSat => {
+            eprintln!(
+                "margin-row BaB: EARLY EXIT DEFERRED — a candidate counterexample is inside the \
+                 trusted-oracle gate right now (#sat-precedence); handing the verdict to the \
+                 ordinary join, which still publishes it if the candidate is downgraded"
+            );
+            crate::flight::note(
+                "sat_precedence",
+                crate::flight::FlightStatus::Ran,
+                Some(format!(
+                    "lane UNSAT at {lane_secs:.1}s DEFERRED: a counterexample candidate was \
+                     under trusted-oracle adjudication"
+                )),
+            );
+            return;
+        }
+        LaneUnsatPublication::RefusedClaimTaken => {
+            eprintln!(
+                "margin-row BaB: EARLY EXIT declined — the main thread already claimed terminal \
+                 publication; handing the verdict to the ordinary join"
+            );
+            return;
+        }
+        LaneUnsatPublication::WriteFailed(error) => {
+            eprintln!(
+                "margin-row BaB: EARLY EXIT declined — could not publish {}: {error}; released \
+                 the publication claim so the ordinary join can still write",
+                results_file.display()
+            );
+            return;
+        }
     }
     crate::flight::note(
         "margin_row_early_exit",
@@ -2797,15 +3243,552 @@ pub(crate) fn publish_lane_unsat_and_exit(lane_secs: f64) {
         "margin-row BaB: EARLY EXIT — certified UNSAT published at {lane_secs:.1}s of lane time; \
          terminating instead of running out the internal verifier's remaining budget"
     );
+    close_proof_bundle(&result);
+    exit_scored_instance_without_teardown();
+}
+
+/// ENGINE_PROGRAM §1.7 B1, AFTER RESULTS_FILE is written: close the Proof
+/// profile's proof-hint bundle with the PUBLISHED verdict (a no-op under
+/// Competition, which wired `NullSink`). Post-publication by construction:
+/// every caller has already written RESULTS_FILE and the flight sidecar.
+fn close_proof_bundle(result: &VnncompResult) {
+    let unsat = match result {
+        VnncompResult::Unsat(receipt) => Some(receipt),
+        _ => None,
+    };
+    super::proof_bundle::after_publication_receipt(result.token(), unsat);
+}
+
+// --------------------------------------------------------------------------
+//  #attack-concurrent — publish the concurrent attack lane's `sat` from the
+//  attack thread, first-verdict-wins, through the main path's sat pipeline.
+// --------------------------------------------------------------------------
+
+/// Everything the attack thread needs to replay the main path's sat pipeline
+/// and publish: the scored RESULTS_FILE and the paths/deadline the trusted
+/// gate and the VNN-LIB 2.0 normalization read.
+#[derive(Clone, Debug)]
+struct ConcurrentAttackPublishTarget {
+    results_file: PathBuf,
+    onnx: PathBuf,
+    vnnlib: PathBuf,
+    instance_deadline: Option<std::time::Instant>,
+}
+
+/// Armed on the ORDINARY route only, beside [`arm_lane_early_publish`] (the
+/// short-grace route has a single authorized writer and keeps it). Silent and
+/// inert unless a race site with `attack.concurrent` armed reaches
+/// [`publish_concurrent_attack_sat`]; absent ⇒ every race site refuses as
+/// `publisher_unarmed` and runs today's serial code.
+static CONCURRENT_ATTACK_PUBLISH_TARGET: std::sync::RwLock<Option<ConcurrentAttackPublishTarget>> =
+    std::sync::RwLock::new(None);
+
+fn arm_concurrent_attack_publish(
+    results_file: &Path,
+    onnx: &Path,
+    vnnlib: &Path,
+    instance_deadline: Option<std::time::Instant>,
+) {
+    if let Ok(mut slot) = CONCURRENT_ATTACK_PUBLISH_TARGET.write() {
+        *slot = Some(ConcurrentAttackPublishTarget {
+            results_file: results_file.to_path_buf(),
+            onnx: onnx.to_path_buf(),
+            vnnlib: vnnlib.to_path_buf(),
+            instance_deadline,
+        });
+    }
+}
+
+/// Whether a scored publication target is armed for the concurrent attack.
+pub(crate) fn concurrent_attack_publisher_armed() -> bool {
+    CONCURRENT_ATTACK_PUBLISH_TARGET
+        .read()
+        .is_ok_and(|slot| slot.is_some())
+}
+
+/// The `[attack-concurrent] armed=1` line, printed once at the entry point
+/// when the frozen preset arms the key (and nothing at all otherwise).
+fn announce_attack_concurrent(preset_snapshot: Option<&BetaCrownPresetSnapshot>) {
+    let armed = preset_snapshot
+        .and_then(BetaCrownPresetSnapshot::loaded)
+        .and_then(|preset| preset.attack.concurrent)
+        .unwrap_or(false);
+    if armed {
+        eprintln!("[attack-concurrent] armed=1 source=preset key=attack.concurrent value=on");
+        crate::flight::note(
+            "attack_concurrent_armed",
+            crate::flight::FlightStatus::Ran,
+            Some("source=preset key=attack.concurrent value=on".to_string()),
+        );
+    }
+}
+
+/// Outcome of the concurrent attack's terminal-publication attempt.
+#[derive(Debug, Eq, PartialEq)]
+enum AttackSatPublication {
+    /// The attack owns RESULTS_FILE and its `sat` is on disk.
+    Published,
+    /// The trusted gate never latched a confirmation: a `sat` reaches
+    /// RESULTS_FILE only through the gate (defence in depth; the caller only
+    /// gets here after the gate upheld it).
+    RefusedUnconfirmed,
+    /// The single terminal-publication right was already taken.
+    RefusedClaimTaken,
+    /// The claim was taken and given back; nothing reached disk.
+    WriteFailed(String),
+    /// The main thread closed the attack door: its verdict is committed.
+    RefusedDoorClosed,
+}
+
+/// The attack's terminal publication as ONE critical section of the
+/// #sat-precedence lock: the confirmation check, the exclusive claim, and the
+/// write. Holding the lock across the write makes "first verdict wins" a fact
+/// about the FILE: a lane `unsat` (which takes the same lock and refuses on
+/// `confirmed`) cannot interleave, and the main thread's later claim fails.
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "the guard is deliberately held ACROSS `write`"
+)]
+fn publish_attack_sat_in<W>(
+    precedence: &std::sync::Mutex<SatPrecedence>,
+    claim: &std::sync::atomic::AtomicBool,
+    write: W,
+) -> AttackSatPublication
+where
+    W: FnOnce() -> Result<()>,
+{
+    let state = lock_sat_precedence(precedence);
+    if state.attack_door_closed {
+        return AttackSatPublication::RefusedDoorClosed;
+    }
+    if !state.confirmed {
+        return AttackSatPublication::RefusedUnconfirmed;
+    }
+    if !claim_terminal_publication_in(claim) {
+        return AttackSatPublication::RefusedClaimTaken;
+    }
+    match write() {
+        Ok(()) => AttackSatPublication::Published,
+        Err(error) => {
+            release_terminal_publication_in(claim);
+            AttackSatPublication::WriteFailed(error.to_string())
+        }
+    }
+}
+
+/// #attack-concurrent follow-up (b): one concurrent-attack publication inside
+/// the ATTACK DOOR — entered by [`prepare_concurrent_attack_sat`] on the
+/// attack thread (inside the race scope), moved into the adjudication job and
+/// held by [`publish_concurrent_attack_sat`] through the trusted gate until it
+/// returns (an upheld, published `sat` never returns: the process ends inside
+/// it); a job dropped unrun releases it. The main thread's synchronized door
+/// ([`publish_main_verdict_in`]) waits while any is held, and `enter_in`
+/// refuses (`None`) once that door has closed.
+struct AttackPublicationGuard<'a> {
+    precedence: &'a std::sync::Mutex<SatPrecedence>,
+    door: &'a std::sync::Condvar,
+}
+
+impl<'a> AttackPublicationGuard<'a> {
+    fn enter_in(
+        precedence: &'a std::sync::Mutex<SatPrecedence>,
+        door: &'a std::sync::Condvar,
+    ) -> Option<Self> {
+        let mut state = lock_sat_precedence(precedence);
+        if state.attack_door_closed {
+            return None;
+        }
+        state.attack_inflight += 1;
+        Some(Self { precedence, door })
+    }
+}
+
+impl Drop for AttackPublicationGuard<'_> {
+    fn drop(&mut self) {
+        {
+            let mut state = lock_sat_precedence(self.precedence);
+            state.attack_inflight = state.attack_inflight.saturating_sub(1);
+        }
+        self.door.notify_all();
+    }
+}
+
+/// Wall the main thread's synchronized door keeps before the instance's
+/// official deadline: it waits for an in-flight concurrent-attack
+/// adjudication no later than `instance_deadline - this`, then closes the
+/// attack door and publishes its own verdict regardless.
+const MAIN_DOOR_PUBLISH_RESERVE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What the main thread's synchronized door did.
+#[derive(Debug)]
+struct MainDoorReport {
+    /// The verdict after the #sat-precedence filter: what was (or, without
+    /// the claim, would have been) written.
+    result: VnncompResult,
+    /// The door took the single terminal-publication claim.
+    owns_publication: bool,
+    /// The write's own answer, when the door owned the claim.
+    written: Option<Result<bool>>,
+    /// Wall spent waiting for in-flight attack adjudications.
+    waited: std::time::Duration,
+    /// Attack adjudications still in flight when the door closed: abandoned
+    /// at the door's deadline (they can no longer write).
+    inflight_at_close: usize,
+}
+
+/// #attack-concurrent follow-up (b): the MAIN thread's terminal publication,
+/// SYNCHRONIZED with in-flight concurrent-attack adjudications. The
+/// counterpart of the margin-row lane's adjudication-aware door
+/// ([`publish_lane_unsat_in`]) for the publisher that cannot defer to a later
+/// join, because it IS the last join. Used only on a run where a race
+/// spawned; every other run keeps the dark door verbatim.
+///
+/// Needed because the race's join is bounded (follow-up (a)): an attack
+/// adjudication may outlive the race, so "the scope joined the attack thread
+/// before the lane returned" no longer orders it before this door.
+///
+/// 1. WAIT (the lock released while waiting) while a concurrent-attack
+///    publication is inside the attack door, until `wait_until`. An upheld
+///    attack `sat` publishes meanwhile (and ends the process); a downgrade
+///    wakes the door at once.
+/// 2. CLOSE the attack door (latched): an adjudication still in flight at the
+///    deadline is abandoned — it may finish its gate, but it can no longer
+///    write, and no new attack publication may start.
+/// 3. In the SAME critical section: the #sat-precedence filter (a
+///    confirmation latched before this point turns `unsat` into `unknown`),
+///    the single terminal claim, and the write.
+///
+/// Holding the lock from the close through the write makes the order a fact
+/// about the FILE, as on the other two doors: a confirmation latched before
+/// the close is honoured by the filter, and one latched after it cannot reach
+/// the file because the attack door is closed.
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "the guard is deliberately held from the door's close ACROSS `write`"
+)]
+fn publish_main_verdict_in<W>(
+    precedence: &std::sync::Mutex<SatPrecedence>,
+    door: &std::sync::Condvar,
+    claim: &std::sync::atomic::AtomicBool,
+    result: VnncompResult,
+    wait_until: Option<std::time::Instant>,
+    write: W,
+) -> MainDoorReport
+where
+    W: FnOnce(&VnncompResult) -> Result<bool>,
+{
+    let started = std::time::Instant::now();
+    let mut state = lock_sat_precedence(precedence);
+    while state.attack_inflight > 0 {
+        let Some(remaining) = wait_until
+            .and_then(|deadline| deadline.checked_duration_since(std::time::Instant::now()))
+            .filter(|remaining| !remaining.is_zero())
+        else {
+            break;
+        };
+        state = match door.wait_timeout(state, remaining) {
+            Ok((guard, _)) => guard,
+            Err(poisoned) => poisoned.into_inner().0,
+        };
+    }
+    let waited = started.elapsed();
+    let inflight_at_close = state.attack_inflight;
+    state.attack_door_closed = true;
+    let result = refuse_unsat_given_confirmation(state.confirmed, result);
+    if !claim_terminal_publication_in(claim) {
+        return MainDoorReport {
+            result,
+            owns_publication: false,
+            written: None,
+            waited,
+            inflight_at_close,
+        };
+    }
+    let written = write(&result);
+    drop(state);
+    MainDoorReport {
+        result,
+        owns_publication: true,
+        written: Some(written),
+        waited,
+        inflight_at_close,
+    }
+}
+
+/// The concurrent attack's sat pipeline, in the MAIN path's order, with every
+/// stage injected so the order itself is testable
+/// (`concurrent_publisher_replays_the_main_sat_pipeline_order`):
+///
+/// 1. parse the captured-route JSON (`parse_competition_json_with`, the graph
+///    ledger never consulted: only a `sat` witness is read);
+/// 2. the #smart-turn-qdq report-only latch (`run_and_translate`);
+/// 3. `gate_sat_with_trusted_oracle` (holds the adjudication marker, latches
+///    the confirmation);
+/// 4. `graph_free_sidefile::record_trusted_oracle_outcome`;
+/// 5. `normalize_vnnlib2_sat_result` (the entry point, after the gate);
+/// 6. the one-critical-section publication.
+fn concurrent_attack_sat_pipeline(
+    json: &str,
+    qdq_withholds: impl FnOnce() -> bool,
+    gate: impl FnOnce(Option<&str>) -> VnncompResult,
+    record: impl FnOnce(bool, bool),
+    normalize: impl FnOnce(VnncompResult) -> VnncompResult,
+    publish: impl FnOnce(&VnncompResult) -> AttackSatPublication,
+) -> std::result::Result<VnncompResult, crate::commands::beta_crown::ConcurrentSatPublication> {
+    use crate::commands::beta_crown::ConcurrentSatPublication as Declined;
+    let witness =
+        match parse_competition_json_with(json, || Err("graph_ledger_not_consulted".to_string())) {
+            Some(VnncompResult::Sat { witness }) => witness,
+            _ => return Err(Declined::Downgraded),
+        };
+    if qdq_withholds() {
+        eprintln!(
+            "[qdq_relax] report-only: withholding the concurrent attack's sat verdict — the \
+             dark QDQ relaxation lane may not publish verdicts this round"
+        );
+        return Err(Declined::Withheld);
+    }
+    let gated = gate(witness.as_deref());
+    let upheld = matches!(gated, VnncompResult::Sat { .. });
+    record(true, upheld);
+    if !upheld {
+        return Err(Declined::Downgraded);
+    }
+    let normalized = normalize(gated);
+    if !matches!(normalized, VnncompResult::Sat { .. }) {
+        return Err(Declined::Downgraded);
+    }
+    match publish(&normalized) {
+        AttackSatPublication::Published => Ok(normalized),
+        AttackSatPublication::RefusedUnconfirmed => Err(Declined::Unconfirmed),
+        AttackSatPublication::RefusedClaimTaken => Err(Declined::ClaimTaken),
+        AttackSatPublication::WriteFailed(error) => Err(Declined::WriteFailed(error)),
+        AttackSatPublication::RefusedDoorClosed => Err(Declined::DoorClosed),
+    }
+}
+
+/// #attack-concurrent: PREPARE a race candidate's adjudication on the ATTACK
+/// thread — the dispatch's publish hook calls this with the JSON it rendered
+/// for the candidate — by ENTERING THE ATTACK DOOR HERE and handing the entry
+/// to the owned job that later runs [`publish_concurrent_attack_sat`] on the
+/// detached `attack-concurrent-gate` thread.
+///
+/// review(attack-conc-followups): the entry used to happen INSIDE that job,
+/// i.e. on the detached thread, after the race had already been allowed to
+/// stop waiting for it. A join deadline that had already passed when the
+/// candidate was prepared (a proof decided within `JOIN_RESERVE` of the
+/// overall deadline, or a candidate arriving just before the bounded join's
+/// end) let the race return, the lane return, and the main thread's
+/// synchronized door find `attack_inflight == 0`, close, and publish — while
+/// the detached job had not yet registered, so the candidate was then
+/// refused at a closed door WITHOUT ever being adjudicated. That is ordering
+/// by thread-spawn timing, not by construction. Entered here, the in-flight
+/// count is raised on the attack thread, inside the race scope, before the
+/// race can join — so the door sees every prepared candidate.
+pub(crate) fn prepare_concurrent_attack_sat(
+    json: String,
+    report: crate::commands::beta_crown::ConcurrentSatReport,
+) -> crate::commands::beta_crown::attack_concurrent::PreparedSat {
+    prepare_concurrent_attack_sat_in(
+        &SAT_PRECEDENCE,
+        &ATTACK_DOOR_CHANGED,
+        json,
+        report,
+        publish_concurrent_attack_sat,
+    )
+}
+
+/// The adjudication a prepared candidate's job runs, holding its attack-door
+/// entry (seam for [`prepare_concurrent_attack_sat_in`]).
+type ConcurrentAttackAdjudicator = fn(
+    AttackPublicationGuard<'static>,
+    &str,
+    &crate::commands::beta_crown::ConcurrentSatReport,
+) -> crate::commands::beta_crown::ConcurrentSatPublication;
+
+/// Seam for [`prepare_concurrent_attack_sat`]: the door state and the
+/// adjudicator are passed in so the "entered at preparation, not in the job"
+/// rule is testable on local state.
+fn prepare_concurrent_attack_sat_in(
+    precedence: &'static std::sync::Mutex<SatPrecedence>,
+    door: &'static std::sync::Condvar,
+    json: String,
+    report: crate::commands::beta_crown::ConcurrentSatReport,
+    adjudicate: ConcurrentAttackAdjudicator,
+) -> crate::commands::beta_crown::attack_concurrent::PreparedSat {
+    use crate::commands::beta_crown::attack_concurrent::PreparedSat;
+    use crate::commands::beta_crown::ConcurrentSatPublication as Declined;
+    // Follow-up (b): the whole adjudication runs INSIDE the attack door, which
+    // the main thread's synchronized publication waits on (and closes at its
+    // deadline). A closed door means the main thread's verdict is committed.
+    let Some(entered) = AttackPublicationGuard::enter_in(precedence, door) else {
+        eprintln!(
+            "[attack-concurrent] candidate refused site={}: the main thread already closed the \
+             attack door (its verdict is committed)",
+            report.site.token()
+        );
+        return PreparedSat::Declined(Declined::DoorClosed);
+    };
+    PreparedSat::Adjudicate(Box::new(move || adjudicate(entered, &json, &report)))
+}
+
+/// Publish the concurrent attack lane's candidate from the detached gate
+/// thread and end the instance (#attack-concurrent). `json` is the
+/// captured-route JSON the dispatch rendered for the lane's `Violated` result
+/// (the same renderer the main path's capture uses); `_attack_door` is the
+/// attack-door entry [`prepare_concurrent_attack_sat`] took on the attack
+/// thread, held until this returns (an upheld, published `sat` never
+/// returns). Returns only when publication was declined; the race then leaves
+/// the proof's verdict in charge (or, for `NotArmed` / `WriteFailed`, hands
+/// the candidate to the main thread as the serial site would).
+fn publish_concurrent_attack_sat(
+    _attack_door: AttackPublicationGuard<'static>,
+    json: &str,
+    report: &crate::commands::beta_crown::ConcurrentSatReport,
+) -> crate::commands::beta_crown::ConcurrentSatPublication {
+    use crate::commands::beta_crown::ConcurrentSatPublication as Declined;
+    let Some(target) = CONCURRENT_ATTACK_PUBLISH_TARGET
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone())
+    else {
+        return Declined::NotArmed;
+    };
+    let outcome = concurrent_attack_sat_pipeline(
+        json,
+        crate::commands::beta_crown::qdq_probe::qdq_relaxation_engaged,
+        |witness| {
+            gate_sat_with_trusted_oracle(
+                &target.onnx,
+                &target.vnnlib,
+                witness,
+                target.instance_deadline,
+            )
+        },
+        graph_free_sidefile::record_trusted_oracle_outcome,
+        |gated| normalize_vnnlib2_sat_result(&target.onnx, &target.vnnlib, gated),
+        |result| {
+            publish_attack_sat_in(&SAT_PRECEDENCE, &TERMINAL_PUBLICATION_CLAIMED, || {
+                write_results(&target.results_file, result)
+            })
+        },
+    );
+    let result = match outcome {
+        Ok(result) => result,
+        Err(declined) => {
+            if declined == Declined::DoorClosed {
+                eprintln!(
+                    "[attack-concurrent] candidate refused site={}: the main thread closed the \
+                     attack door while it was under adjudication (abandoned at the door's \
+                     deadline; the committed verdict stands)",
+                    report.site.token()
+                );
+                crate::flight::note(
+                    "attack_concurrent_door_closed",
+                    crate::flight::FlightStatus::Ran,
+                    Some(format!(
+                        "site={} adjudication outlived the main door",
+                        report.site.token()
+                    )),
+                );
+            }
+            if declined == Declined::ClaimTaken {
+                // Unreachable by admission (the margin-row lane owns concurrency
+                // whenever it exists) and by the synchronized main door (it
+                // claims only with no attack publication in flight, or after
+                // CLOSING the attack door, which this publication checks
+                // first): a second publisher exists.
+                eprintln!(
+                    "[attack-concurrent] EMERGENCY CONFLICT site={} — an ORT-confirmed sat \
+                     found the terminal publication already claimed; NOT writing (the \
+                     claimant's verdict stands, #sat-precedence refuses any later unsat)",
+                    report.site.token()
+                );
+                crate::flight::note(
+                    "attack_concurrent_conflict",
+                    crate::flight::FlightStatus::Ran,
+                    Some(format!(
+                        "site={} confirmed sat found the terminal claim taken",
+                        report.site.token()
+                    )),
+                );
+            }
+            return declined;
+        }
+    };
+    let line = report.published_line();
+    crate::flight::note(
+        "attack_concurrent",
+        crate::flight::FlightStatus::Ran,
+        Some(line.trim_start_matches("[attack-concurrent] ").to_string()),
+    );
+    crate::flight::note(
+        "result_publish",
+        crate::flight::FlightStatus::Ran,
+        Some(result.token().to_string()),
+    );
+    crate::flight::finish(result.token());
+    crate::flight::global().write_sidecar(&target.results_file);
+    println!("Result: {}", result.token());
+    eprintln!("{line}");
+    close_proof_bundle(&result);
     exit_scored_instance_without_teardown();
 }
 
 static SHORT_GRACE_STAGE_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+#[cfg(test)]
+#[path = "vnncomp/prepared_root_writer_tests.rs"]
+mod prepared_root_writer_tests;
+
+/// Path, staging, channel and writer metadata remain paid on the genuine
+/// retained proof owner's original ledger until publication has finished.
+fn retained_publication_bytes(path: &Path) -> Result<usize> {
+    path.as_os_str()
+        .len()
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(8192))
+        .ok_or_else(|| anyhow!("retained proof publication capacity overflow"))
+}
+
+/// A failed write can leave a partial file before a queued request exists.
+/// This stack-only guard borrows the already paid path and closes that gap.
+struct UnpublishedResultCleanup<'a> {
+    path: Option<&'a Path>,
+}
+
+impl<'a> UnpublishedResultCleanup<'a> {
+    fn new(path: &'a Path) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for UnpublishedResultCleanup<'_> {
+    fn drop(&mut self) {
+        if let Some(path) = self.path {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 fn stage_short_grace_result(
     results_file: &Path,
     result: &VnncompResult,
+) -> std::io::Result<PathBuf> {
+    stage_short_grace_result_with_writer(results_file, result, |path, rendered| {
+        fs::write(path, rendered)
+    })
+}
+
+fn stage_short_grace_result_with_writer(
+    results_file: &Path,
+    result: &VnncompResult,
+    write: impl FnOnce(&Path, &str) -> std::io::Result<()>,
 ) -> std::io::Result<PathBuf> {
     use std::sync::atomic::Ordering;
 
@@ -2820,13 +3803,29 @@ fn stage_short_grace_result(
         std::process::id(),
         sequence
     ));
-    fs::write(&staged_path, rendered)?;
+    if let VnncompResult::Unsat(receipt) = result {
+        if receipt.has_retained_owner() {
+            let bytes = retained_publication_bytes(results_file)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            if staged_path.capacity() > bytes {
+                return Err(std::io::Error::other(
+                    "retained proof staged path capacity exceeds admission",
+                ));
+            }
+        }
+    }
+    let mut cleanup = UnpublishedResultCleanup::new(&staged_path);
+    write(&staged_path, &rendered)?;
+    cleanup.disarm();
+    drop(cleanup);
     Ok(staged_path)
 }
 
 struct ShortGracePublicationRequest {
     staged_path: PathBuf,
     acknowledgement: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
+    receipt: Option<UnsatReceipt>,
+    _publication_claim: Option<ny_propagate::certify::work::PersistentReservation>,
 }
 
 impl Drop for ShortGracePublicationRequest {
@@ -2851,13 +3850,36 @@ impl ShortGraceResultPublisher {
     /// closed and the pre-written `unknown` is immutable. No caller on this
     /// route writes RESULTS_FILE directly after the coordinator starts.
     fn publish_terminal(&self, result: VnncompResult) -> std::io::Result<bool> {
+        let receipt = match &result {
+            VnncompResult::Unsat(receipt) if receipt.has_retained_owner() => Some(receipt.clone()),
+            _ => None,
+        };
+        let publication_claim = receipt
+            .as_ref()
+            .map(|receipt| {
+                receipt.reserve_owner_publication(
+                    retained_publication_bytes(&self.results_file)?,
+                    None,
+                )
+            })
+            .transpose()
+            .map(Option::flatten)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
         let staged_path = stage_short_grace_result(&self.results_file, &result)?;
+        if let Some(receipt) = &receipt {
+            if let Err(error) = receipt.checkpoint_owner(None) {
+                let _ = fs::remove_file(&staged_path);
+                return Err(std::io::Error::other(error.to_string()));
+            }
+        }
         let (acknowledgement, result_rx) = std::sync::mpsc::sync_channel(1);
         if self
             .sender
             .send(ShortGracePublicationRequest {
                 staged_path,
                 acknowledgement,
+                receipt,
+                _publication_claim: publication_claim,
             })
             .is_err()
         {
@@ -2945,15 +3967,28 @@ where
     let request = match receiver.recv_timeout(remaining) {
         Ok(request) => request,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            return ShortGraceCoordinatorOutcome::Deadline
+            return ShortGraceCoordinatorOutcome::Deadline;
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            return ShortGraceCoordinatorOutcome::PublisherDropped
+            return ShortGraceCoordinatorOutcome::PublisherDropped;
         }
     };
 
     // `recv_timeout` may return a concurrently queued request at the boundary.
     // The absolute deadline, not channel scheduling order, is authoritative.
+    if std::time::Instant::now() >= publication_deadline {
+        return ShortGraceCoordinatorOutcome::Deadline;
+    }
+
+    if let Some(receipt) = &request.receipt {
+        if let Err(error) = receipt.checkpoint_owner(Some(publication_deadline)) {
+            let _ = request.acknowledgement.send(Err(error.to_string()));
+            return ShortGraceCoordinatorOutcome::PublicationFailed;
+        }
+    }
+
+    // Source validation itself may consume the final remaining interval.
+    // The coordinator cutoff applies immediately before the actual rename.
     if std::time::Instant::now() >= publication_deadline {
         return ShortGraceCoordinatorOutcome::Deadline;
     }
@@ -3208,7 +4243,7 @@ fn spawn_external_watchdog(
         _ => {
             return Err(std::io::Error::other(
                 "external watchdog deadline/result policy mismatch",
-            ))
+            ));
         }
     };
     command
@@ -3608,7 +4643,7 @@ where
                 Ok(read)
                     if request[..read].contains(&EXTERNAL_WATCHDOG_PRESERVE_FIRE_REQUEST[0]) =>
                 {
-                    break ExternalWatchdogControl::FirePreservingVerdict
+                    break ExternalWatchdogControl::FirePreservingVerdict;
                 }
                 Ok(_) => break ExternalWatchdogControl::FireNow,
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
@@ -3929,7 +4964,7 @@ where
         loop {
             match control_rx.try_recv() {
                 Ok(ExternalWatchdogControl::Retire) => {
-                    return retire_short_external_watchdog(&results_file, publication_state)
+                    return retire_short_external_watchdog(&results_file, publication_state);
                 }
                 Ok(ExternalWatchdogControl::FireNow) => break 'watch true,
                 Ok(event) => apply_short_watchdog_control(
@@ -3942,7 +4977,7 @@ where
                 ),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    return retire_short_external_watchdog(&results_file, publication_state)
+                    return retire_short_external_watchdog(&results_file, publication_state);
                 }
             }
         }
@@ -3958,7 +4993,7 @@ where
         // earlier C byte, violating control-pipe order at parent exit.
         match control_rx.recv_timeout(std::cmp::min(remaining, std::time::Duration::from_secs(1))) {
             Ok(ExternalWatchdogControl::Retire) => {
-                return retire_short_external_watchdog(&results_file, publication_state)
+                return retire_short_external_watchdog(&results_file, publication_state);
             }
             Ok(ExternalWatchdogControl::FireNow) => break 'watch true,
             Ok(event) => apply_short_watchdog_control(
@@ -3971,7 +5006,7 @@ where
             ),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
-                return retire_short_external_watchdog(&results_file, publication_state)
+                return retire_short_external_watchdog(&results_file, publication_state);
             }
         }
     };
@@ -4262,6 +5297,55 @@ fn solver_preset_gate_config_value(
     None
 }
 
+/// `#auto-alloc` — project the PER-INSTANCE root allocation into the frozen
+/// lever set, so the receipt records the values the lane actually ran.
+///
+/// WHY THIS LAYER AND NOT THE RESOLVED POLICY. Mutating
+/// `MarginRowRuntimePolicy` after `from_levers` reaches the lane correctly and
+/// leaves the RECEIPT wrong: `<results>.res.flight.json` records
+/// `NY_MARGIN_ROW_INTERM_ALPHA` with `"source": "config"` and the yaml's value,
+/// so a run would report `interm_alpha=2` while proving with `0`. In a campaign
+/// where attribution rests on receipts that is not cosmetic — it is the exact
+/// generator of a null nobody can tell apart from a VOID. Projecting here means
+/// one source of truth for the lane, the receipt and the ratchets alike.
+///
+/// Placed BEFORE `preset_delivered_config_value` in the closure so it outranks
+/// the yaml for the two decls it owns, and returns `None` for every other decl
+/// so nothing else changes. It can only ever narrow an already-authorised
+/// value (see `auto_alloc::decide`), so outranking the yaml cannot spend budget
+/// the category did not grant.
+#[expect(
+    clippy::option_option,
+    reason = "the lever projector protocol of `materialize_levers`: outer `None` = not this \
+              projector's declaration, `Some(None)` = its declaration with no value (the \
+              declaration default, never rediscovered by the generic projector), \
+              `Some(Some(v))` = the value; see `margin_row_schedule_preset_config_value`"
+)]
+fn auto_alloc_config_value(
+    decision: &ny_propagate::margin_row::auto_alloc::AutoAllocDecision,
+    decl: &'static ny_levers::LeverDecl,
+) -> Option<Option<ny_levers::LeverValue>> {
+    use ny_levers::decls::margin_row::{MARGIN_ROW_BI_TOPK, MARGIN_ROW_INTERM_ALPHA};
+    if !decision.applied {
+        return None;
+    }
+    if std::ptr::eq(decl, &raw const MARGIN_ROW_INTERM_ALPHA) {
+        return Some(
+            u64::try_from(decision.after.0)
+                .ok()
+                .map(ny_levers::LeverValue::U64),
+        );
+    }
+    if std::ptr::eq(decl, &raw const MARGIN_ROW_BI_TOPK) {
+        return Some(
+            u64::try_from(decision.after.1)
+                .ok()
+                .map(ny_levers::LeverValue::U64),
+        );
+    }
+    None
+}
+
 /// Project the coupled margin-row lane scheduler from the validated typed
 /// preset without round-tripping its `f32` fractions through JSON.
 ///
@@ -4275,7 +5359,10 @@ fn solver_preset_gate_config_value(
 // the generic projector); `Some(None)` = it IS one and the preset declines it,
 // which must reach the declaration default WITHOUT the generic projector
 // rediscovering some other value; `Some(Some(v))` = the preset supplies `v`.
-#[allow(clippy::option_option)]
+#[expect(
+    clippy::option_option,
+    reason = "three load-bearing states (above); a two-state type would lose one"
+)]
 fn margin_row_schedule_preset_config_value(
     loaded: &crate::preset::PresetConfig,
     decl: &'static ny_levers::LeverDecl,
@@ -4334,6 +5421,45 @@ fn margin_row_schedule_preset_config_value(
 /// Keep its receipt projection as narrow as its execution contract: projecting
 /// the preset wholesale would claim that model/BaB fields this route bypasses
 /// affected the run.
+/// #cz-hybrid-budget — the budget the fall-through pipeline is handed after the
+/// wired MetaRoom CZ lane has run.
+///
+/// # The defect
+///
+/// The lane was handed `instance_deadline - 5s` and the pipeline below was
+/// never told what it spent. MEASURED on metaroom_2023 6cnn_ry_39_6
+/// spec_idx_119 at its official 210 s budget: the lane consumed 188.7 s for
+/// `proved_unsat=false, strictly_positive=0/19`, the internal verifier then
+/// re-derived its own window from scratch (`[budget] graph-enter
+/// total_s=148.000 elapsed_s=0.000`) with ~21 s actually left, overran, and
+/// ny's own watchdog SIGKILLed it at 216 s — 6 s past the official budget, with
+/// `[ny-box] END rc=137` and NO `Result:` line printed at all.
+///
+/// # The contract
+///
+/// The answer is NEVER greater than the instance's live remaining seconds, and
+/// never greater than the original grant. An IDLE lane (every row the
+/// two-basename allowlist does not match) hands the original grant through
+/// untouched, which is what makes this byte-identical on every other row.
+/// The 1 s floor keeps downstream `Duration` arithmetic well-formed; the
+/// absolute `instance_deadline` still gates every phase below it.
+#[cfg_attr(not(feature = "mip"), allow(dead_code))]
+fn cz_hybrid_handoff_budget_secs(
+    ny_timeout: u64,
+    instance_remaining_s: f64,
+    lane_engaged: bool,
+) -> u64 {
+    if !lane_engaged {
+        return ny_timeout;
+    }
+    let remaining = if instance_remaining_s.is_finite() {
+        instance_remaining_s.max(0.0)
+    } else {
+        0.0
+    };
+    (ny_timeout as f64).min(remaining).floor().max(1.0) as u64
+}
+
 fn relational_scored_wall_clamp_config_value(
     loaded: &crate::preset::PresetConfig,
     decl: &'static ny_levers::LeverDecl,
@@ -4345,6 +5471,543 @@ fn relational_scored_wall_clamp_config_value(
     .then_some(loaded.solver.scored_wall_clamp)
     .flatten()
     .map(ny_levers::LeverValue::Bool)
+}
+
+/// #router-r1: the relational route's projection of the router's two typed
+/// modes (`router.mode`, `optimizer.mode`).
+///
+/// The relational route runs the router's own start site, so its
+/// receipt-owning authority must carry the modes from the SAME frozen preset.
+/// Without this projection the key parsed and validated and was then DROPPED
+/// on every dual-network row: the frozen set resolved `off` from the default
+/// layer, and that start site was reachable only through the Debug
+/// environment variable, which a competition harness never exports. No
+/// shipped yaml sets either key, so every shipped relational receipt is
+/// unchanged.
+fn relational_router_config_value(
+    loaded: &crate::preset::PresetConfig,
+    decl: &'static ny_levers::LeverDecl,
+) -> Option<ny_levers::LeverValue> {
+    let token = if std::ptr::eq(decl, &raw const ny_levers::decls::router::ROUTER_MODE) {
+        loaded.router.mode.map(ny_core::router::RouterMode::token)
+    } else if std::ptr::eq(decl, &raw const ny_levers::decls::router::OPTIMIZER_MODE) {
+        loaded
+            .optimizer
+            .mode
+            .map(ny_core::router::OptimizerMode::token)
+    } else {
+        None
+    };
+    token
+        .map(|token| ny_levers::LeverValue::Text(token.to_owned()))
+        .or_else(|| relational_router_rule_value(loaded, decl))
+        .or_else(|| relational_optimizer_rule_value(loaded, decl))
+}
+
+/// #router-r3: the relational route's projection of the `optimizer.rules.*`
+/// switches (R3's four O-STOP rules and, since #router-r6, the four O-TRIAL
+/// rules) and #router-r7's `optimizer.priors`, from the SAME frozen preset as
+/// the two modes. No shipped yaml sets any of them, so every shipped
+/// relational receipt is unchanged.
+fn relational_optimizer_rule_value(
+    loaded: &crate::preset::PresetConfig,
+    decl: &'static ny_levers::LeverDecl,
+) -> Option<ny_levers::LeverValue> {
+    use ny_levers::decls::router::{
+        OPTIMIZER_PRIORS, OPTIMIZER_RULE_ATTACK_DEFER, OPTIMIZER_RULE_GOVERNOR,
+        OPTIMIZER_RULE_IA_YIELD, OPTIMIZER_RULE_ROOT_ADMISSION,
+        OPTIMIZER_RULE_TRIAL_ATTACK_HALVING, OPTIMIZER_RULE_TRIAL_LR_BACKOFF,
+        OPTIMIZER_RULE_TRIAL_SPLIT_RESTART, OPTIMIZER_RULE_TRIAL_WIDTH,
+    };
+    let rules = &loaded.optimizer.rules;
+    [
+        (&OPTIMIZER_RULE_GOVERNOR, rules.governor),
+        (&OPTIMIZER_RULE_IA_YIELD, rules.ia_yield),
+        (&OPTIMIZER_RULE_ATTACK_DEFER, rules.attack_defer),
+        (&OPTIMIZER_RULE_ROOT_ADMISSION, rules.root_admission),
+        // #router-r6: the four O-TRIAL rules.
+        (&OPTIMIZER_RULE_TRIAL_WIDTH, rules.trial_width),
+        (&OPTIMIZER_RULE_TRIAL_LR_BACKOFF, rules.trial_lr_backoff),
+        (
+            &OPTIMIZER_RULE_TRIAL_SPLIT_RESTART,
+            rules.trial_split_restart,
+        ),
+        (
+            &OPTIMIZER_RULE_TRIAL_ATTACK_HALVING,
+            rules.trial_attack_halving,
+        ),
+        // #router-r7: the offline-prior switch rides the same projection.
+        (&OPTIMIZER_PRIORS, loaded.optimizer.priors),
+    ]
+    .into_iter()
+    .find(|(candidate, _)| std::ptr::eq(*candidate, decl))
+    .and_then(|(_, value)| value)
+    .map(ny_levers::LeverValue::Bool)
+}
+
+/// #router-r2: the relational route's projection of the seven
+/// `router.rules.*` switches, from the SAME frozen preset as the two modes.
+/// No shipped yaml sets any of them, so every shipped relational receipt is
+/// unchanged.
+fn relational_router_rule_value(
+    loaded: &crate::preset::PresetConfig,
+    decl: &'static ny_levers::LeverDecl,
+) -> Option<ny_levers::LeverValue> {
+    use ny_levers::decls::router::{
+        ROUTER_RULE_ADMISSION, ROUTER_RULE_CAP_AUTHORITY, ROUTER_RULE_CONTRACTS,
+        ROUTER_RULE_DERIVED_CAPS, ROUTER_RULE_FAR_HAND_ON, ROUTER_RULE_GAP_CONTRACT,
+        ROUTER_RULE_HAND_ON, ROUTER_RULE_LEASE, ROUTER_RULE_PUBLISH_GRACE, ROUTER_RULE_ROUTE,
+        ROUTER_RULE_TERMINAL,
+    };
+    let rules = &loaded.router.rules;
+    [
+        (&ROUTER_RULE_ADMISSION, rules.admission),
+        (&ROUTER_RULE_CONTRACTS, rules.contracts),
+        (&ROUTER_RULE_CAP_AUTHORITY, rules.cap_authority),
+        (&ROUTER_RULE_TERMINAL, rules.terminal),
+        (&ROUTER_RULE_HAND_ON, rules.hand_on),
+        (&ROUTER_RULE_PUBLISH_GRACE, rules.publish_grace),
+        (&ROUTER_RULE_DERIVED_CAPS, rules.derived_caps),
+        // #router-r4: acting set 3.
+        (&ROUTER_RULE_LEASE, rules.lease),
+        (&ROUTER_RULE_FAR_HAND_ON, rules.far_hand_on),
+        // #router-r5: acting set 4.
+        (&ROUTER_RULE_ROUTE, rules.route),
+        (&ROUTER_RULE_GAP_CONTRACT, rules.gap_contract),
+    ]
+    .into_iter()
+    .find(|(candidate, _)| std::ptr::eq(*candidate, decl))
+    .and_then(|(_, value)| value)
+    .map(ny_levers::LeverValue::Bool)
+}
+
+/// Everything the relational route freezes from its category preset: the
+/// scored-wall clamp it executes and the router modes it runs under. Nothing
+/// else rides along.
+fn relational_config_value(
+    loaded: &crate::preset::PresetConfig,
+    decl: &'static ny_levers::LeverDecl,
+) -> Option<ny_levers::LeverValue> {
+    relational_scored_wall_clamp_config_value(loaded, decl)
+        .or_else(|| relational_router_config_value(loaded, decl))
+}
+
+/// #iso-edge-cap: the typed preset values the RELATIONAL route projects from
+/// its category preset into the difference-network BaB, beside the one lever
+/// (`scored_wall_clamp`) it freezes into the receipt.
+///
+/// WHY A SEPARATE PROJECTION. Relational categories take an early return that
+/// never reaches `preset::apply`: `verify_difference_bounds` builds its
+/// `BetaCrownConfig` INLINE from `BetaCrownConfig::acas_xu()`. A typed key
+/// delivered only through `apply` would therefore parse, validate and do
+/// nothing on exactly the lane whose edge work it governs — the
+/// deliverable-but-not-delivered class. Each field here is read from the SAME
+/// frozen preset snapshot the scored-wall clamp is read from, through the SAME
+/// mapping `apply` uses, and lands in the inline config.
+///
+/// `Default` — no preset, an absent key, or the historical test entry
+/// `run_relational_vnncomp` — projects nothing, so the lane is byte-identical
+/// to the pre-key code.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct RelationalPresetKeys {
+    /// `attack.relational_point_vjp`: opt-in original-tower template advice.
+    relational_point_vjp: bool,
+    /// The existing typed `attack.concurrent` scheduling policy.
+    attack_concurrent: bool,
+    paired_difference: Option<crate::preset::PairedDifferencePreset>,
+    /// `bab.branching.input_split.edge_wave_cap` →
+    /// `BetaCrownConfig::input_split_edge_wave_cap`.
+    edge_wave_cap: Option<ny_propagate::beta_crown::EdgeWaveCapConfig>,
+}
+
+impl RelationalPresetKeys {
+    fn from_preset(loaded: &crate::preset::PresetConfig) -> Self {
+        let mut relational_point_vjp = false;
+        crate::preset::apply_relational_point_vjp_policy(&mut relational_point_vjp, loaded);
+        Self {
+            relational_point_vjp,
+            attack_concurrent: loaded.attack.concurrent.unwrap_or(false),
+            paired_difference: loaded.solver.paired_difference,
+            edge_wave_cap: loaded
+                .bab
+                .branching
+                .input_split
+                .edge_wave_cap
+                .as_ref()
+                .map(crate::preset::InputSplitEdgeWaveCapPreset::to_config),
+        }
+    }
+}
+
+/// Proposals never own a neural verdict. A miss, expired checker or unavailable
+/// provider leaves the complete input root for the following sound search.
+fn try_paired_lp_prepass(
+    chain: &ny_propagate::paired_difference::PairedChain,
+    domain: &ny_propagate::paired_difference::BoxDomain,
+    epsilon: f64,
+    options: crate::preset::PairedDifferencePreset,
+    deadline: std::time::Instant,
+    workers: ny_propagate::paired_difference::ParallelWorkers,
+) -> bool {
+    use std::time::Instant;
+
+    let start = Instant::now();
+    if start >= deadline {
+        return false;
+    }
+    eprintln!(
+        "[paired-difference-lp] armed backend={} source=preset memory_mib={} native_steps={} live_seconds={:.3}",
+        options.lp_backend.as_str(),
+        options.lp_memory_mib,
+        options.lp_steps,
+        deadline.saturating_duration_since(start).as_secs_f64()
+    );
+    match options.lp_backend {
+        crate::preset::PairedLpBackend::Native => {
+            match chain.prove_lp_until(domain, epsilon, deadline, options.lp_steps, workers) {
+                Some(report) => {
+                    let timely = Instant::now() < deadline;
+                    eprintln!(
+                        "[paired-difference-lp] done backend=native source=ny_checked proved={} timely={} iterations={} variables={} equalities={} inequalities={} elapsed_s={:.6}",
+                        report.proof.proved,
+                        timely,
+                        report.iterations,
+                        report.proof.variables,
+                        report.proof.equalities,
+                        report.proof.inequalities,
+                        start.elapsed().as_secs_f64()
+                    );
+                    report.proof.proved && Instant::now() < deadline
+                }
+                None => {
+                    eprintln!(
+                        "[paired-difference-lp] done backend=native source=ny_checked proved=false reason=declined_or_expired"
+                    );
+                    false
+                }
+            }
+        }
+        crate::preset::PairedLpBackend::Ay => {
+            #[cfg(not(feature = "mip"))]
+            {
+                eprintln!(
+                    "[paired-difference-lp] declined backend=ay proved=false reason=mip_feature_required"
+                );
+                false
+            }
+            #[cfg(feature = "mip")]
+            {
+                // Model construction, parsing and reduced numerical proposal
+                // construction consume this same LP slice. Reduction is only
+                // a preconditioner; the checker below uses full source rows.
+                // Reserve a bounded tail for replaying the prepared source rows and
+                // checking the entire multiplier portfolio independently.
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let checker_reserve = remaining
+                    .mul_f64(0.1)
+                    .min(std::time::Duration::from_secs(2));
+                let proposal_deadline = deadline.checked_sub(checker_reserve).unwrap_or(start);
+                let Some(memory_bytes) = options.lp_memory_mib.checked_mul(1024 * 1024) else {
+                    eprintln!(
+                        "[paired-difference-lp] declined backend=ay proved=false reason=memory_budget_overflow"
+                    );
+                    return false;
+                };
+                let Some(prepared) = chain.prepare_root_lp_until(domain, proposal_deadline) else {
+                    eprintln!(
+                        "[paired-difference-lp] declined backend=ay proved=false reason=source_build_declined_or_expired"
+                    );
+                    return false;
+                };
+                let Some(source_text) = prepared.dump_until(proposal_deadline) else {
+                    eprintln!(
+                        "[paired-difference-lp] declined backend=ay proved=false reason=source_dump_expired"
+                    );
+                    return false;
+                };
+                let source = match ny_mip::paired_difference_ay::SourceModel::parse(&source_text) {
+                    Ok(source) => source,
+                    Err(reason) => {
+                        eprintln!(
+                            "[paired-difference-lp] declined backend=ay proved=false reason=source_parse:{reason}"
+                        );
+                        return false;
+                    }
+                };
+                if Instant::now() >= proposal_deadline {
+                    eprintln!(
+                        "[paired-difference-lp] declined backend=ay proved=false reason=source_budget_expired"
+                    );
+                    return false;
+                }
+                let proposal = match ny_mip::paired_difference_ay::solve_reduced_float(
+                    &source,
+                    proposal_deadline,
+                    memory_bytes,
+                ) {
+                    Ok(proposal) => proposal,
+                    Err(reason) => {
+                        eprintln!(
+                            "[paired-difference-lp] declined backend=ay proved=false reason=proposal:{reason}"
+                        );
+                        return false;
+                    }
+                };
+                let mut texts = vec![proposal.dual_text.as_str()];
+                if let Some(alternate) = proposal.alternate_dual_text.as_deref() {
+                    texts.push(alternate);
+                }
+                eprintln!(
+                    "[paired-difference-lp] proposals backend=ay proposer=reduced_float source=ny_source_dump finished_objectives={} transcripts={} reduced_free_variables={:?} reduced_nonzeros={:?} within_lp_deadline={} elapsed_s={:.6}",
+                    proposal.finished_objectives,
+                    texts.len(),
+                    proposal.reduced_free_variables,
+                    proposal.reduced_nonzeros,
+                    Instant::now() < deadline,
+                    start.elapsed().as_secs_f64()
+                );
+                for diagnostic in &proposal.diagnostics {
+                    eprintln!(
+                        "[paired-difference-lp] objective backend=ay output={} sign={} status={} elapsed_s={:.6}",
+                        diagnostic.output, diagnostic.sign, diagnostic.status, diagnostic.elapsed_s
+                    );
+                }
+                // Only NY's checker reads the private prepared source and meets valid
+                // endpoints against the full original variable boxes and
+                // authored rows. Approximate elimination, AY status, objective
+                // values and ranking scores are not acceptance authority.
+                let replay_start = Instant::now();
+                match prepared.check_texts_until(epsilon, &texts, deadline) {
+                    Some(report) => {
+                        let timely = Instant::now() < deadline;
+                        eprintln!(
+                            "[paired-difference-lp] done backend=ay source=ny_checked source_model_constructions=1 source_model_reused_for_replay=true proved={} timely={} finished_objectives={} variables={} equalities={} inequalities={} replay_s={:.6} elapsed_s={:.6}",
+                            report.proved,
+                            timely,
+                            proposal.finished_objectives,
+                            report.variables,
+                            report.equalities,
+                            report.inequalities,
+                            replay_start.elapsed().as_secs_f64(),
+                            start.elapsed().as_secs_f64()
+                        );
+                        report.proved && Instant::now() < deadline
+                    }
+                    None => {
+                        eprintln!(
+                            "[paired-difference-lp] done backend=ay source=ny_checked source_model_constructions=1 source_model_reused_for_replay=true proved=false finished_objectives={} reason=checker_declined_or_expired replay_s={:.6} elapsed_s={:.6}",
+                            proposal.finished_objectives,
+                            replay_start.elapsed().as_secs_f64(),
+                            start.elapsed().as_secs_f64()
+                        );
+                        false
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "mip"))]
+mod paired_lp_prepass_tests {
+    use super::try_paired_lp_prepass;
+    use crate::preset::{PairedDifferencePreset, PairedLpBackend};
+    use ny_propagate::paired_difference::{BoxDomain, PairedChain, ParallelWorkers, Stage};
+    use std::time::{Duration, Instant};
+
+    fn affine_fixture() -> (PairedChain, BoxDomain, PairedDifferencePreset) {
+        // Exactly f(x)=9x/8+1/4, g(x)=x. The full source difference
+        // ranges over [1/8, 3/8] and yields a nonconstant AY objective.
+        let chain = PairedChain {
+            input_dim: 1,
+            output_dim: 1,
+            stages: vec![Stage::Affine {
+                rows: 1,
+                cols: 1,
+                wf: vec![1.125],
+                wg: vec![1.0],
+                bf: vec![0.25],
+                bg: vec![0.0],
+            }],
+        };
+        let domain = BoxDomain {
+            lo: vec![-1.0],
+            hi: vec![1.0],
+        };
+        let options = PairedDifferencePreset {
+            max_seconds: 20.0,
+            max_domains: 1,
+            max_lp_seconds: 20.0,
+            lp_backend: PairedLpBackend::Ay,
+            lp_memory_mib: 128,
+            lp_steps: 1,
+            workers: 1,
+        };
+        (chain, domain, options)
+    }
+
+    #[test]
+    fn paired_lp_prepass_ay_accepts_certified_affine_band() {
+        let (chain, domain, options) = affine_fixture();
+        assert!(try_paired_lp_prepass(
+            &chain,
+            &domain,
+            0.4,
+            options,
+            Instant::now() + Duration::from_secs(20),
+            ParallelWorkers::new(1).unwrap(),
+        ));
+    }
+
+    #[test]
+    fn paired_lp_prepass_ay_rejects_violating_affine_band() {
+        let (chain, domain, options) = affine_fixture();
+        // x=1 is in the source box and gives |f(1)-g(1)|=3/8>3/10.
+        assert!(domain.lo[0] <= 1.0 && domain.hi[0] >= 1.0);
+        let Stage::Affine { wf, wg, bf, bg, .. } = &chain.stages[0] else {
+            panic!("fixture must retain its affine source stage");
+        };
+        let x = 1.0;
+        let difference = (wf[0] * x + bf[0]) - (wg[0] * x + bg[0]);
+        assert!(difference.abs() > 0.3);
+        assert!(!try_paired_lp_prepass(
+            &chain,
+            &domain,
+            0.3,
+            options,
+            Instant::now() + Duration::from_secs(20),
+            ParallelWorkers::new(1).unwrap(),
+        ));
+    }
+
+    #[test]
+    fn paired_lp_prepass_ay_rejects_expired_deadline() {
+        let (chain, domain, options) = affine_fixture();
+        let expired = Instant::now();
+        assert!(!try_paired_lp_prepass(
+            &chain,
+            &domain,
+            0.4,
+            options,
+            expired,
+            ParallelWorkers::new(1).unwrap(),
+        ));
+    }
+}
+
+#[cfg(test)]
+mod relational_preset_keys_tests {
+    use super::RelationalPresetKeys;
+
+    fn keys_from(text: &str) -> RelationalPresetKeys {
+        let loaded: crate::preset::PresetConfig =
+            serde_yaml::from_str(text).expect("the yaml parses");
+        RelationalPresetKeys::from_preset(&loaded)
+    }
+
+    /// DARK BY DEFAULT: no preset, an empty preset and the scored-wall-only
+    /// preset all project nothing.
+    #[test]
+    fn relational_edge_wave_cap_projection_is_dark_by_default() {
+        assert_eq!(RelationalPresetKeys::default().edge_wave_cap, None);
+        assert_eq!(keys_from("{}\n"), RelationalPresetKeys::default());
+        assert_eq!(
+            keys_from("solver:\n  scored_wall_clamp: true\n"),
+            RelationalPresetKeys::default()
+        );
+    }
+
+    /// The typed AY choice selects the reduced numeric proposer, while Native
+    /// remains an explicit compatibility choice. Both use source replay.
+    #[test]
+    fn paired_difference_preset_projects_into_relational_authority() {
+        assert_eq!(keys_from("{}\n").paired_difference, None);
+        let keys = keys_from(
+            "solver:\n  paired_difference:\n    max_seconds: 10.0\n    max_domains: 20000\n",
+        );
+        assert_eq!(
+            keys.paired_difference,
+            Some(crate::preset::PairedDifferencePreset {
+                max_seconds: 10.0,
+                max_domains: 20000,
+                max_lp_seconds: 0.0,
+                lp_backend: crate::preset::PairedLpBackend::Ay,
+                lp_memory_mib: 2048,
+                lp_steps: 2000,
+                workers: 1
+            })
+        );
+        let explicit = keys_from(
+            "solver:\n  paired_difference:\n    max_seconds: 10.0\n    max_domains: 20000\n    max_lp_seconds: 5.0\n    lp_backend: native\n    lp_memory_mib: 16\n    lp_steps: 17\n    workers: 2\n",
+        );
+        assert_eq!(
+            explicit.paired_difference,
+            Some(crate::preset::PairedDifferencePreset {
+                max_seconds: 10.0,
+                max_domains: 20000,
+                max_lp_seconds: 5.0,
+                lp_backend: crate::preset::PairedLpBackend::Native,
+                lp_memory_mib: 16,
+                lp_steps: 17,
+                workers: 2,
+            })
+        );
+        let ay = keys_from(
+            "solver:\n  paired_difference:\n    max_seconds: 10.0\n    max_domains: 20000\n    lp_backend: ay\n    lp_memory_mib: 256\n",
+        )
+        .paired_difference
+        .unwrap();
+        assert_eq!(ay.lp_backend, crate::preset::PairedLpBackend::Ay);
+        assert_eq!(ay.lp_backend.as_str(), "ay");
+        assert_eq!(ay.lp_memory_mib, 256);
+    }
+
+    /// THE ROUTE: the typed block in a category preset reaches the relational
+    /// projection — the only way it can reach the inline relational config.
+    #[test]
+    fn relational_edge_wave_cap_projection_delivers_the_typed_block() {
+        let empty = keys_from("bab:\n  branching:\n    input_split:\n      edge_wave_cap: {}\n");
+        let cap = empty.edge_wave_cap.expect("presence arms");
+        assert_eq!(cap.max_secs, None);
+        assert_eq!(cap.rebound_share, None);
+
+        let named = keys_from(
+            "bab:\n  branching:\n    input_split:\n      edge_wave_cap:\n        \
+             max_secs: 1.5\n        rebound_share: 0.5\n",
+        );
+        let cap = named.edge_wave_cap.expect("named block arms");
+        assert_eq!(cap.max_secs, Some(1.5));
+        assert_eq!(cap.rebound_share, Some(0.5));
+    }
+
+    /// The shipped isomorphic and monotonic presets do NOT arm the cap:
+    /// arming lands only in the commit that carries its measurement.
+    #[test]
+    fn shipped_relational_presets_do_not_arm_the_edge_wave_cap() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for relative in [
+            "configs/vnncomp26/isomorphic_acasxu_2026.yaml",
+            "configs/vnncomp26/monotonic_acasxu_2026.yaml",
+            "configs/vnncomp25/isomorphic_acasxu_2026.yaml",
+            "configs/vnncomp25/monotonic_acasxu_2026.yaml",
+        ] {
+            let path = repo_root.join(relative);
+            if !path.is_file() {
+                continue;
+            }
+            let loaded = crate::preset::load_preset(&path).expect("shipped preset loads");
+            assert_eq!(
+                RelationalPresetKeys::from_preset(&loaded).edge_wave_cap,
+                None,
+                "{relative} must not arm #iso-edge-cap without a measured promotion"
+            );
+        }
+        // The one the category actually resolves to must exist, or the loop
+        // above proved nothing.
+        assert!(repo_root
+            .join("configs/vnncomp26/isomorphic_acasxu_2026.yaml")
+            .is_file());
+    }
 }
 
 /// Project the wave-batched kFSB treatment exactly as the runtime resolves it.
@@ -4489,37 +6152,39 @@ pub(crate) fn handle_vnncomp_command(
     {
         let backend = crate::compute_backend::detect();
         crate::flight::global().begin(backend.kind, &backend.summary, &category, timeout_secs);
+        // #phase-cost: this record carries the run's per-phase cost census.
+        crate::flight::global().attach_phase_cost();
     }
-
-    let traffic_terminal_softmax_peel = traffic_terminal_softmax_peel_decision(
-        &category,
-        std::env::var_os(TRAFFIC_TERMINAL_SOFTMAX_PEEL_ENV).as_deref(),
-    );
-    crate::flight::note(
-        "traffic_terminal_softmax_peel_gate",
-        if traffic_terminal_softmax_peel.effective {
-            crate::flight::FlightStatus::Ran
-        } else {
-            crate::flight::FlightStatus::Skipped
-        },
-        Some(format!(
-            "env_armed={} category_matched={} effective={} category={category}",
-            traffic_terminal_softmax_peel.env_armed,
-            traffic_terminal_softmax_peel.category_matched,
-            traffic_terminal_softmax_peel.effective,
-        )),
-    );
-    let cgan_input_leaf =
-        cgan_input_leaf_decision(&category, std::env::var_os(CGAN_INPUT_LEAF_ENV).as_deref());
-    crate::flight::note(
-        "cgan_input_leaf_gate",
-        if cgan_input_leaf.route.is_some() {
-            crate::flight::FlightStatus::Ran
-        } else {
-            crate::flight::FlightStatus::Skipped
-        },
-        Some(cgan_input_leaf_gate_receipt(cgan_input_leaf, &category)),
-    );
+    // #soundness-spine M2a: the proof profile `main.rs` froze for this entry
+    // point (`competition` unless `--proof-profile` overrode it). A caller
+    // that froze nothing gets the scored default. Printed once per process and
+    // recorded in the flight sidecar; it selects artifact sinks and audit
+    // rates only.
+    {
+        let profile =
+            ny_core::proof_profile::freeze(ny_core::proof_profile::ResolvedProofProfile::resolve(
+                ny_core::proof_profile::EntryPoint::VnncompV1,
+                None,
+            ));
+        let _ = ny_core::proof_profile::announce(profile);
+        crate::flight::global().note_proof_profile(profile);
+        // ENGINE_PROGRAM §1.7 B1: the ONE sink this process's lanes stream
+        // proof hints into, wired before any lane runs — `NullSink` under
+        // Competition (nothing written), the proof-hint bundle next to
+        // RESULTS_FILE under Proof (finalised after publication by
+        // `close_proof_bundle`). Write-only: no verdict path reads a sink.
+        let sink = super::proof_bundle::wire_scored_run(profile, &results_file, &onnx, &vnnlib);
+        crate::flight::note(
+            "proof_sink",
+            crate::flight::FlightStatus::Ran,
+            Some(format!("sink={sink} mode={}", profile.mode.token())),
+        );
+    }
+    // #graph-free-candidates: remember where RESULTS_FILE lives so an ARMED
+    // graph-free lane can write its diagnostic side file beside it. A plain
+    // path store — nothing reads it unless `attack.graph_free_candidate_sidefile`
+    // is armed, so a dark run is unaffected.
+    graph_free_sidefile::set_results_target(&results_file);
 
     // Local cooperative anchor for the scored budget. Everything downstream
     // that spends opportunistic time after the main verification run budgets
@@ -4544,11 +6209,6 @@ pub(crate) fn handle_vnncomp_command(
     let timeout_decision =
         internal_timeout_decision(&category, timeout_secs, short_grace_gate.as_deref());
     let short_grace_route = timeout_decision.route == InternalTimeoutRoute::SafeNlpShortGrace;
-    let safenlp_direct_mip_first = safenlp_direct_mip_first_requested(
-        &category,
-        timeout_secs,
-        std::env::var_os(SAFENLP_DIRECT_MIP_FIRST_ENV).as_deref(),
-    );
     crate::flight::note(
         "internal_timeout_route",
         crate::flight::FlightStatus::Ran,
@@ -4761,8 +6421,12 @@ pub(crate) fn handle_vnncomp_command(
     // up rather than being duplicated. Nothing about the non-relational path
     // changes: the value it binds is byte-identical, only computed earlier.
 
-    if is_relational_category(&category) {
-        // Relational categories bypass the YAML MODEL/SOLVER shape, but the
+    // #name-blind-routing: the relational route is chosen by the INSTANCE's
+    // own VNN-LIB (a property that declares two or more networks), never by the
+    // category name the harness passes. See `RelationalRouteDecision`.
+    let relational_route = RelationalRouteDecision::for_vnnlib(&vnnlib);
+    if relational_route.selected() {
+        // Relational properties bypass the YAML MODEL/SOLVER shape, but the
         // scored-wall deadline gate below is delivered by their category
         // preset. Freeze and validate that preset before the first (immutable)
         // receipt materialization, then project exactly the one typed value
@@ -4788,9 +6452,11 @@ pub(crate) fn handle_vnncomp_command(
                 Some(snapshot) => {
                     if let Some(loaded) = snapshot.loaded() {
                         let configured = loaded.solver.scored_wall_clamp;
-                        let frozen = crate::flight::global().materialize_levers(|decl| {
-                            relational_scored_wall_clamp_config_value(loaded, decl)
-                        });
+                        // #router-r1: this route also runs the shadow router
+                        // (its start site below), so the router's two typed
+                        // modes ride in the same frozen projection.
+                        let frozen = crate::flight::global()
+                            .materialize_levers(|decl| relational_config_value(loaded, decl));
                         (configured, frozen)
                     } else {
                         let reason = snapshot
@@ -4829,8 +6495,42 @@ pub(crate) fn handle_vnncomp_command(
         crate::flight::note(
             "relational_route",
             crate::flight::FlightStatus::Ran,
-            Some("dual-network category; standard lanes not applicable".to_string()),
+            Some(relational_route.receipt()),
         );
+        // #router-r1: the shadow router on the relational route (same
+        // contract as the ordinary route below; this route runs no model scan,
+        // so its facts are `Unknown("relational-route")`).
+        if crate::router::requested(&relational_frozen_levers) {
+            crate::router::start(&crate::router::StartContext {
+                levers: Some(&relational_frozen_levers),
+                authority: crate::router::Authority::Frozen,
+                model: None,
+                model_bytes: None,
+                facts_reason: Some("relational-route"),
+                declared_networks: u64::try_from(relational_route.declared_networks()).ok(),
+                relational_selected: Some(relational_route.selected()),
+                official_budget_secs: timeout_secs,
+                internal_secs: timeout_decision.solver_timeout_secs,
+                join_margin: CONCURRENT_LANE_JOIN_MARGIN,
+                anchor: command_start,
+                target_host: None,
+                pinned_keys: crate::router::route::pinned_keys(
+                    relational_preset_snapshot
+                        .as_ref()
+                        .and_then(BetaCrownPresetSnapshot::loaded),
+                    Some(&relational_frozen_levers),
+                ),
+                // #router-r6: the trial knobs this row pinned (frozen sites).
+                trial_pinned_keys: crate::router::otrial::pinned_keys(
+                    relational_preset_snapshot
+                        .as_ref()
+                        .and_then(BetaCrownPresetSnapshot::loaded),
+                    Some(&relational_frozen_levers),
+                ),
+                // #admission-precision: this route reads no property at start.
+                spec: super::beta_crown::spec_shape::SpecRead::Unknown("relational-route"),
+            });
+        }
         write_results(&results_file, &VnncompResult::Unknown)?;
         // #scored-wall-clamp: relational categories bypass the YAML preset
         // path for MODEL and SOLVER shape — they build a difference network,
@@ -4841,6 +6541,12 @@ pub(crate) fn handle_vnncomp_command(
         // can reach a scored run (a competition harness exports no `NY_*`).
         // Absent preset, absent section or absent key ⇒ `None` ⇒ the
         // declaration default ⇒ today's behaviour.
+        // #flush-grace: the relational lane returns before the preset-owned
+        // policy chain below, and derives its own tier from
+        // `internal_timeout_secs` directly, so emit the receipt for the route
+        // it actually takes. Without this an absent line would be ambiguous
+        // between "old binary" and "relational category".
+        emit_flush_grace_receipt(timeout_secs, timeout_decision);
         let scored_wall = scored_wall_clamp_armed_from_levers(&relational_frozen_levers)
             .then(|| scored_wall_from_budget(command_start, timeout_secs));
         crate::flight::note(
@@ -4858,19 +6564,69 @@ pub(crate) fn handle_vnncomp_command(
                 internal_timeout_secs(timeout_secs),
             )),
         );
+        // #iso-edge-cap: the route's typed preset projection for the
+        // difference-network BaB's inline config (see `RelationalPresetKeys`),
+        // read from the SAME frozen snapshot as the clamp above. Absent preset
+        // or absent key ⇒ `Default` ⇒ nothing projected ⇒ today's behaviour,
+        // and no flight event is added.
+        let relational_preset_keys = relational_preset_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.loaded())
+            .map(RelationalPresetKeys::from_preset)
+            .unwrap_or_default();
+        if let Some(cap) = relational_preset_keys.edge_wave_cap {
+            crate::flight::note(
+                "edge_wave_cap",
+                crate::flight::FlightStatus::Ran,
+                Some(format!(
+                    "preset_key=bab.branching.input_split.edge_wave_cap max_secs={:?} \
+                     rebound_share={:?} (None = the lane default)",
+                    cap.max_secs, cap.rebound_share,
+                )),
+            );
+        }
         let result = run_relational_vnncomp_with_frozen_levers(
-            &category,
             &onnx,
             &vnnlib,
             timeout_secs,
             scored_wall,
             Some(relational_frozen_levers),
+            relational_preset_keys,
+            relational_preset_keys
+                .attack_concurrent
+                .then(|| relational_overlap::PublishTarget {
+                    results_file: results_file.clone(),
+                    deadline: instance_deadline,
+                }),
         )
         .unwrap_or_else(|err| {
             eprintln!("Relational verification produced no verdict (sound unknown): {err}");
             VnncompResult::Unknown
         });
-        write_results(&results_file, &result)?;
+        let (result, wrote) = if let Some(live) =
+            crate::commands::beta_crown::attack_concurrent::live_threads_if_engaged()
+                .filter(|_| relational_preset_keys.attack_concurrent)
+        {
+            debug_assert_eq!(
+                live, 0,
+                "relational attack scope must join before publication"
+            );
+            let door = publish_main_verdict_in(
+                &SAT_PRECEDENCE,
+                &ATTACK_DOOR_CHANGED,
+                &TERMINAL_PUBLICATION_CLAIMED,
+                result,
+                instance_deadline.checked_sub(MAIN_DOOR_PUBLISH_RESERVE),
+                |result| write_results(&results_file, result).map(|()| true),
+            );
+            (door.result, door.written.transpose()?.unwrap_or(false))
+        } else {
+            write_results(&results_file, &result)?;
+            (result, true)
+        };
+        if !wrote {
+            return Ok(());
+        }
         // #batched-bab observability (dark, NY_BETA_GPU_PROBE=1): report
         // whether the wide domain-stacked GPU CROWN lane actually PUBLISHED a
         // result this run. The counter is production-armed but was previously
@@ -4878,7 +6634,14 @@ pub(crate) fn handle_vnncomp_command(
         // exact failure this campaign kept hitting: an armed device refused by
         // a capability, a request gate, or a shape predicate) looked identical
         // to one doing the work.
-        if beta_gpu_probe_armed() {
+        //
+        // #chain-wide (S2): additionally self-announce whenever the lane
+        // actually PUBLISHED (`wide_resnet_batched_taken_count() > 0`) — the
+        // typed `bab.chain_wide`/`bab.beta_graft` arming is preset-delivered
+        // with no env in competition, and repo law voids any lane measurement
+        // without the lane's own stderr observable. Print-only; runs where the
+        // lane never fires keep byte-identical stderr.
+        if beta_gpu_probe_armed() || ny_gpu::wide_resnet_batched_taken_count() > 0 {
             emit_wide_lane_readout();
         }
         println!("Result: {}", result.token());
@@ -4889,6 +6652,7 @@ pub(crate) fn handle_vnncomp_command(
         );
         crate::flight::finish(result.token());
         crate::flight::global().write_sidecar(&results_file);
+        close_proof_bundle(&result);
         return Ok(());
     }
 
@@ -5005,7 +6769,53 @@ pub(crate) fn handle_vnncomp_command(
                 // Same obligation for the STE-PGD lane, which is armed from the
                 // preset on the scored path too (#bnn-ste-pgd).
                 let bnn_ste_pgd = loaded.attack.bnn_ste_pgd;
+                // `#auto-alloc`: derive the root phase parameters from THIS model
+                // before the lever set freezes, so the receipt, the lane and the
+                // ratchets all see one value. Declines to `applied=false` (and
+                // projects nothing) whenever the spec or the proxy is
+                // unavailable, which is byte-identical to the preset.
+                let auto_alloc_decision = {
+                    let lane_budget_secs =
+                        (timeout_secs as f64) - CONCURRENT_LANE_JOIN_MARGIN.as_secs_f64();
+                    let spec = super::margin_row_bab::extract_twin_spec(&onnx);
+                    // #bi-patch: an ARMED preset prices the phase at the patch
+                    // MACs (the phase's own planner cost model); `None` is the
+                    // historical dense pricing, byte-identical.
+                    let patch_ratio = ny_propagate::margin_row::auto_alloc::patch_pricing_ratio(
+                        loaded.margin_row.bi_patch,
+                        loaded.margin_row.bi_patch_ratio,
+                    );
+                    let d = ny_propagate::margin_row::auto_alloc::decide_with_patch(
+                        spec.as_ref(),
+                        lane_budget_secs,
+                        loaded
+                            .margin_row
+                            .alpha_secs
+                            .unwrap_or(ny_propagate::margin_row::auto_alloc::DEFAULT_ALPHA_SECS),
+                        loaded.margin_row.interm_alpha.unwrap_or(0),
+                        loaded
+                            .margin_row
+                            .bi_topk
+                            .unwrap_or(ny_propagate::margin_row::auto_alloc::DEFAULT_TOPK),
+                        loaded
+                            .margin_row
+                            .bi_chunk
+                            .unwrap_or(ny_propagate::margin_row::auto_alloc::DEFAULT_CHUNK),
+                        patch_ratio,
+                    );
+                    eprintln!("{}", d.line());
+                    d
+                };
                 crate::flight::global().materialize_levers(|decl| {
+                    if let Some(value) = auto_alloc_config_value(&auto_alloc_decision, decl) {
+                        return value;
+                    }
+                    // #graph-free-candidates: an INSTRUMENT has no search axis,
+                    // so the generic projector below cannot see its typed key;
+                    // project it here so an armed run's receipt says so.
+                    if let Some(value) = graph_free_sidefile::preset_config_value(loaded, decl) {
+                        return value;
+                    }
                     if let Some(value) = kfsb_preset_config_value(loaded, decl) {
                         return Some(value);
                     }
@@ -5104,6 +6914,94 @@ pub(crate) fn handle_vnncomp_command(
         frozen_levers.is_some() && margin_row_schedule_policy.is_none();
     let timeout_decision =
         apply_postbab_wrapper_timeout_policy(timeout_decision, timeout_secs, postbab_wrapper_route);
+    // #flush-grace: applied LAST of the three so an explicit typed reserve
+    // outranks the proof-tail rule, and guarded inside the policy so it can
+    // never displace the SafeNLP short-grace lane.
+    let timeout_decision = apply_results_flush_grace_policy(
+        timeout_decision,
+        timeout_secs,
+        results_flush_grace_from_snapshot(preset_snapshot.as_ref()),
+    );
+    // Unconditional, and emitted HERE rather than beside the `Timeout:` line so
+    // that no early return between this point and that line can suppress it.
+    emit_flush_grace_receipt(timeout_secs, timeout_decision);
+    crate::flight::note(
+        "results_flush_grace",
+        if timeout_decision.route == InternalTimeoutRoute::PresetFlushGrace {
+            crate::flight::FlightStatus::Ran
+        } else {
+            crate::flight::FlightStatus::Skipped
+        },
+        Some(format!(
+            "route={:?} budget={timeout_secs}s grace={}s internal_timeout={}s \
+historical_internal_timeout={}s",
+            timeout_decision.route,
+            timeout_decision.effective_flush_reserve_secs,
+            timeout_decision.solver_timeout_secs,
+            timeout_decision.historical_solver_timeout_secs,
+        )),
+    );
+    // #router-r1 (ROUTER_PROGRAM R1): the SHADOW router starts here — after
+    // the lever freeze, before any lane. It reads its mode from the SAME
+    // frozen LeverSet the receipt serialises (from the entry-time environment
+    // layer alone only when the preset was invalid and no set exists), takes
+    // facts from the plan resolver's existing scan, and logs a pure plan. It
+    // returns nothing and moves nothing, and with the router off it does
+    // nothing at all (one lever lookup). Fail-open inside; the retrospective
+    // half runs from `crate::flight::finish`, after publication.
+    {
+        let entry_env_levers = if frozen_levers.is_none() {
+            crate::flight::global().entry_env_levers()
+        } else {
+            None
+        };
+        let (router_levers, router_authority) = match frozen_levers.as_deref() {
+            Some(levers) => (Some(levers), crate::router::Authority::Frozen),
+            None => (
+                entry_env_levers.as_ref(),
+                crate::router::Authority::EntryEnv,
+            ),
+        };
+        if router_levers.is_some_and(crate::router::requested) {
+            crate::router::start(&crate::router::StartContext {
+                levers: router_levers,
+                authority: router_authority,
+                model: resolved_plan.facts.as_ref(),
+                model_bytes: fs::metadata(&onnx).ok().map(|meta| meta.len()),
+                facts_reason: None,
+                declared_networks: u64::try_from(relational_route.declared_networks()).ok(),
+                relational_selected: Some(relational_route.selected()),
+                official_budget_secs: timeout_secs,
+                internal_secs: timeout_decision.solver_timeout_secs,
+                join_margin: CONCURRENT_LANE_JOIN_MARGIN,
+                anchor: command_start,
+                target_host: None,
+                // #router-r5: the typed keys this row's file (or a
+                // non-default lever source) pinned; a route never overrides
+                // them.
+                pinned_keys: crate::router::route::pinned_keys(
+                    preset_snapshot
+                        .as_ref()
+                        .and_then(BetaCrownPresetSnapshot::loaded),
+                    router_levers,
+                ),
+                // #router-r6: the trial knobs this row's file (or a
+                // non-default lever source) pinned; a pinned knob's trial
+                // site is frozen.
+                trial_pinned_keys: crate::router::otrial::pinned_keys(
+                    preset_snapshot
+                        .as_ref()
+                        .and_then(BetaCrownPresetSnapshot::loaded),
+                    router_levers,
+                ),
+                // #admission-precision: the property's archetype and routing
+                // shape — the lanes' parser and the one extractor the lanes
+                // route on. Read only here, when the router was requested: an
+                // `off` row parses nothing new.
+                spec: super::beta_crown::spec_shape::read_spec(&vnnlib),
+            });
+        }
+    }
     match (&configs_dir, preset) {
         (Some(dir), Some(path)) => {
             println!("Configs dir: {}", dir.display());
@@ -5175,6 +7073,15 @@ pub(crate) fn handle_vnncomp_command(
             timeout_decision.historical_solver_timeout_secs,
             SAFENLP_SHORT_HARD_STOP_MARGIN.as_millis(),
         );
+    } else if timeout_decision.route == InternalTimeoutRoute::PresetFlushGrace {
+        println!(
+            "Results-flush grace: typed bab.phase_budget.results_flush_grace_secs replaces the \
+historical max(5, budget/20) rule; budget={timeout_secs}s, \
+effective_flush_reserve={}s, solver_timeout={ny_timeout}s (absolute), \
+historical_solver_timeout={}s",
+            timeout_decision.effective_flush_reserve_secs,
+            timeout_decision.historical_solver_timeout_secs,
+        );
     } else if timeout_decision.route == InternalTimeoutRoute::PresetProofTail {
         println!(
             "Post-BaB proof-tail policy: explicit vnncomp_post_bab_attack=false and \
@@ -5203,7 +7110,13 @@ pub(crate) fn handle_vnncomp_command(
         // ordinary route only — the short-grace route has a single authorized
         // writer (its deadline coordinator) and must keep it.
         arm_lane_early_publish(&results_file);
+        // #attack-concurrent: the same target for the concurrent attack
+        // lane's `sat`, on the same route only. Silent and inert unless a race
+        // site with `attack.concurrent` armed publishes through it.
+        arm_concurrent_attack_publish(&results_file, &onnx, &vnnlib, Some(instance_deadline));
     }
+    // #attack-concurrent: the key's own observable, once, before any lane.
+    announce_attack_concurrent(preset_snapshot.as_ref());
 
     if margin_row_schedule_policy_invalid {
         let result = VnncompResult::Unknown;
@@ -5298,11 +7211,43 @@ pub(crate) fn handle_vnncomp_command(
     // replayed strictly positive); every other outcome — sealed-assert
     // mismatch, resource refusal, deadline, unproven margins — logs its
     // reason to the flight record and falls through unchanged.
+    //
+    // #cz-hybrid-budget. The lane used to be handed `instance_deadline - 5s`
+    // unconditionally, and the fall-through pipeline was never told how much of
+    // that it had actually spent. MEASURED on metaroom_2023 6cnn_ry_39_6
+    // spec_idx_119 at its official 210 s budget: 188.7 s consumed for
+    // `proved_unsat=false, strictly_positive=0/19`, then the internal verifier
+    // re-derived `total_s=148.000 elapsed_s=0.000` with ~21 s left, overran, and
+    // ny's own watchdog SIGKILLed it at 216 s with NO `Result:` line printed.
+    // Two halves of one fix: `cz_hybrid.max_budget_fraction` bounds the lane,
+    // and the handoff budget below is the LIVE remaining rather than the
+    // original static grant.
     #[cfg(feature = "mip")]
-    {
+    let ny_timeout = {
+        let cz_lane_start = std::time::Instant::now();
         let cz_deadline = instance_deadline
             .checked_sub(std::time::Duration::from_secs(5))
             .unwrap_or(instance_deadline);
+        // `None` (every shipped preset) keeps today's deadline exactly.
+        // Validation refuses anything outside `(0.0, 1.0]`, and this filter is
+        // the fail-closed second gate for a snapshot that bypassed it.
+        let cz_deadline = match preset_snapshot
+            .as_ref()
+            .and_then(BetaCrownPresetSnapshot::loaded)
+            .and_then(|loaded| loaded.cz_hybrid.max_budget_fraction)
+            .filter(|frac| frac.is_finite() && *frac > 0.0 && *frac <= 1.0)
+        {
+            Some(frac) => {
+                let window = instance_deadline
+                    .saturating_duration_since(cz_lane_start)
+                    .as_secs_f64()
+                    * frac;
+                cz_lane_start
+                    .checked_add(std::time::Duration::from_secs_f64(window.max(0.0)))
+                    .map_or(cz_deadline, |capped| capped.min(cz_deadline))
+            }
+            None => cz_deadline,
+        };
         let lane = super::cz_metaroom_wired::evaluate(
             preset_snapshot
                 .as_ref()
@@ -5321,7 +7266,9 @@ pub(crate) fn handle_vnncomp_command(
             Some(lane.receipt()),
         );
         if let super::cz_metaroom_wired::CzHybridLaneOutcome::ProvedUnsat { .. } = &lane {
-            let result = VnncompResult::Unsat;
+            let result = VnncompResult::Unsat(UnsatReceipt::legacy_uncovered(
+                LegacyUnsatAuthority::CzHybridLane,
+            ));
             let owns_publication = claim_terminal_publication();
             if owns_publication
                 && write_terminal_result(
@@ -5339,15 +7286,37 @@ pub(crate) fn handle_vnncomp_command(
             );
             crate::flight::finish(result.token());
             crate::flight::global().write_sidecar(&results_file);
+            close_proof_bundle(&result);
             return Ok(());
         }
-    }
+        // The handoff. UNCONDITIONAL observable: the lane runs on every row
+        // (two string compares when it is not allowlisted), so an absent line
+        // means the binary has no budget handoff, not that the lane was idle.
+        let lane_elapsed_s = cz_lane_start.elapsed().as_secs_f64();
+        let instance_remaining_s = instance_deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_secs_f64();
+        // Never GREATER than what the instance actually has left. The floor of
+        // 1 s keeps the downstream Duration arithmetic well-formed; the
+        // absolute `instance_deadline` still gates every phase below.
+        //
+        // SCOPED TO AN ENGAGED LANE, deliberately. On every row the two-basename
+        // allowlist does not match, the lane costs two string compares and this
+        // must be byte-identical to the pre-change tree — so an idle lane hands
+        // the ORIGINAL grant through untouched, and only a lane that actually
+        // spent instance wall re-sizes the handoff.
+        let handoff_budget_s =
+            cz_hybrid_handoff_budget_secs(ny_timeout, instance_remaining_s, lane.engaged());
+        eprintln!(
+            "[cz-hybrid] budget lane_elapsed_s={lane_elapsed_s:.3} \
+instance_remaining_s={instance_remaining_s:.3} handoff_budget_s={handoff_budget_s}"
+        );
+        handoff_budget_s
+    };
 
     // Run β-CROWN in-process with the AUTO defaults and capture the verdict JSON.
     let beta_phase_deadline = beta_phase_deadline(timeout_decision, instance_deadline);
     let solver_phase_deadline = solver_phase_deadline(timeout_decision, instance_deadline);
-    let mut traffic_terminal_softmax_execution =
-        TrafficTerminalSoftmaxPeelExecution::before_run(traffic_terminal_softmax_peel.effective);
     let result = run_and_translate(
         &onnx,
         &vnnlib,
@@ -5361,44 +7330,86 @@ pub(crate) fn handle_vnncomp_command(
         frozen_levers,
         margin_row_schedule_policy,
         global_rayon_outcome,
-        safenlp_direct_mip_first,
-        traffic_terminal_softmax_peel.effective,
-        cgan_input_leaf.route,
-        &mut traffic_terminal_softmax_execution,
-    );
-    crate::flight::note(
-        "traffic_terminal_softmax_peel_execution",
-        traffic_terminal_softmax_execution.flight_status(),
-        Some(
-            traffic_terminal_softmax_execution
-                .flight_reason()
-                .to_string(),
-        ),
     );
     let result = normalize_vnnlib2_sat_result(&onnx, &vnnlib, result);
-
-    // #twinwall-early-exit: the concurrent lane may already have claimed the
-    // single terminal publication right and be inside its `_exit(0)`. Losing
-    // the claim means RESULTS_FILE holds the lane's certified `unsat`; writing
-    // over it here would be the one way this feature could corrupt a verdict.
-    let owns_publication = claim_terminal_publication();
-    if !owns_publication {
-        eprintln!(
-            "vnncomp: terminal publication already claimed by the margin-row early exit; \
-             leaving its certified verdict in place"
+    // #sat-precedence (main-thread side): the post-BaB grace and the final
+    // twin-wall join both `return res` verbatim, so a lane `unsat` can arrive
+    // here on an instance whose counterexample the trusted oracle already
+    // reconfirmed. A constructive witness outranks a bound-based claim; when the
+    // witness itself could not be published, the outward answer is `unknown`,
+    // not the verdict we have positive evidence against.
+    // #attack-concurrent follow-up (b): on a run where a race SPAWNED, the
+    // terminal publication synchronizes with any concurrent-attack
+    // adjudication still in flight (the race's join is bounded, so one may
+    // have outlived it): wait for it until the door's own deadline, close the
+    // attack door, then filter + claim + write in ONE #sat-precedence
+    // critical section. Every other run — the dark default, the short-grace
+    // route (which never races) — takes the historical door below verbatim.
+    let synchronized_door =
+        crate::commands::beta_crown::attack_concurrent::live_threads_if_engaged()
+            .filter(|_| short_grace_publisher.is_none());
+    let (result, wrote) = if let Some(live) = synchronized_door {
+        // Every race joined its scoped attack thread before its lane returned.
+        debug_assert_eq!(
+            live, 0,
+            "a concurrent attack thread outlived its race scope"
         );
-    }
-    if owns_publication
-        && write_terminal_result(
-            &results_file,
-            short_grace_publisher.as_ref(),
-            result.clone(),
-        )?
-    {
+        let door = publish_main_verdict_in(
+            &SAT_PRECEDENCE,
+            &ATTACK_DOOR_CHANGED,
+            &TERMINAL_PUBLICATION_CLAIMED,
+            result,
+            instance_deadline.checked_sub(MAIN_DOOR_PUBLISH_RESERVE),
+            |result| write_terminal_result(&results_file, None, result.clone()),
+        );
+        let note = format!(
+            "attack_concurrent_live_at_publish={live} door=synchronized waited_ms={} \
+             inflight_at_close={} owns_publication={}",
+            door.waited.as_millis(),
+            door.inflight_at_close,
+            u8::from(door.owns_publication),
+        );
+        eprintln!("[attack-concurrent] main-door {note}");
+        crate::flight::note(
+            "attack_concurrent_publish",
+            crate::flight::FlightStatus::Ran,
+            Some(note),
+        );
+        if !door.owns_publication {
+            eprintln!(
+                "vnncomp: terminal publication already claimed by a concurrent lane; leaving \
+                 its verdict in place"
+            );
+        }
+        let wrote = door.written.transpose()?.unwrap_or(false);
+        (door.result, wrote)
+    } else {
+        let result = refuse_unsat_against_confirmed_counterexample(result);
+        // #twinwall-early-exit: the concurrent lane may already have claimed the
+        // single terminal publication right and be inside its `_exit(0)`. Losing
+        // the claim means RESULTS_FILE holds the lane's certified `unsat`; writing
+        // over it here would be the one way this feature could corrupt a verdict.
+        let owns_publication = claim_terminal_publication();
+        if !owns_publication {
+            eprintln!(
+                "vnncomp: terminal publication already claimed by the margin-row early exit; \
+                 leaving its certified verdict in place"
+            );
+        }
+        let wrote = owns_publication
+            && write_terminal_result(
+                &results_file,
+                short_grace_publisher.as_ref(),
+                result.clone(),
+            )?;
+        (result, wrote)
+    };
+    if wrote {
         // #batched-bab observability (see the sibling site): report whether
         // the wide domain-stacked GPU CROWN lane actually PUBLISHED here too —
         // this is the completion path a timing-out scored row takes.
-        if beta_gpu_probe_armed() {
+        // #chain-wide: self-announcing on published>0, as at the sibling site.
+        if beta_gpu_probe_armed() || ny_gpu::wide_resnet_batched_taken_count() > 0 {
             emit_wide_lane_readout();
         }
         println!("Result: {}", result.token());
@@ -5530,11 +7541,66 @@ pub(crate) fn handle_vnncomp_command(
     );
     crate::flight::finish(result.token());
     crate::flight::global().write_sidecar(&results_file);
+    close_proof_bundle(&result);
     Ok(())
 }
 
-fn is_relational_category(category: &str) -> bool {
-    matches!(category, "isomorphic_acasxu_2026" | "monotonic_acasxu_2026")
+/// #name-blind-routing: which verification route a row takes is decided by
+/// the INSTANCE's own VNN-LIB structure, never by its category name.
+///
+/// A property that declares two or more networks (`declare-network`, VNN-LIB
+/// 2.0) is relational: it constrains f and g jointly, and the single-network
+/// lanes parse `declare-network` wrappers while ignoring their metadata, so
+/// they must never see one. Such a property takes the dual-network route,
+/// whose own full parse (`VnnLibSpec::dual_network`) and soundness gates then
+/// validate the relation and fail closed to `unknown` on any shape they cannot
+/// certify. Every other property — VNN-LIB 1.0 (no declaration) and ordinary
+/// VNN-LIB 2.0 (one declaration) — takes the ordinary route.
+///
+/// This replaced `is_relational_category`, an exact match on
+/// `isomorphic_acasxu_2026` / `monotonic_acasxu_2026`. The census in
+/// `scratchpad/vbs/diag13/build_name-blind-routing.md` scans every scored
+/// 2025/2026 property: all 100 rows of those two categories declare exactly
+/// two networks, and no row of any other scored category declares more than
+/// one, so the selected route is identical on every scored row. A renamed or
+/// unseen relational benchmark now reaches the dual-network route instead of
+/// single-network lanes that cannot read it.
+///
+/// The probe reads only the declaration prelude (up to the first assertion),
+/// so it costs nothing measurable on the very large single-network properties
+/// that must not pay for a second full parse. An unreadable property counts
+/// zero networks and falls through to the ordinary route, which reports it.
+///
+/// #admission-census: `pub(crate)` so the census (`router::census`) asks the
+/// SAME probe the scored entry point asks, never a copy of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RelationalRouteDecision {
+    prelude: Option<ny_onnx::vnnlib::NetworkPrelude>,
+}
+
+impl RelationalRouteDecision {
+    pub(crate) fn for_vnnlib(vnnlib: &Path) -> Self {
+        Self {
+            prelude: ny_onnx::vnnlib::load_vnnlib_network_prelude(vnnlib).ok(),
+        }
+    }
+
+    pub(crate) fn declared_networks(self) -> usize {
+        self.prelude.map_or(0, |prelude| prelude.declared_networks)
+    }
+
+    pub(crate) fn selected(self) -> bool {
+        self.prelude
+            .is_some_and(|prelude| prelude.is_multi_network())
+    }
+
+    /// Flight receipt for the route taken: the structural fact that chose it.
+    fn receipt(self) -> String {
+        format!(
+            "dual-network property (declared_networks={}); standard lanes not applicable",
+            self.declared_networks()
+        )
+    }
 }
 
 /// Bind every graph participating in one relational proof to the exact
@@ -5574,7 +7640,6 @@ fn relational_bab_frozen_authority(
 // site instead of being laundered through a crate-level allow.
 #[allow(dead_code)]
 pub(crate) fn run_relational_vnncomp(
-    category: &str,
     onnx_arg: &Path,
     vnnlib: &Path,
     timeout_secs: u64,
@@ -5585,23 +7650,29 @@ pub(crate) fn run_relational_vnncomp(
     scored_wall: Option<std::time::Instant>,
 ) -> Result<VnncompResult> {
     run_relational_vnncomp_with_frozen_levers(
-        category,
         onnx_arg,
         vnnlib,
         timeout_secs,
         scored_wall,
         None,
+        RelationalPresetKeys::default(),
+        None,
     )
 }
 
 fn run_relational_vnncomp_with_frozen_levers(
-    category: &str,
     onnx_arg: &Path,
     vnnlib: &Path,
     timeout_secs: u64,
     scored_wall: Option<std::time::Instant>,
     frozen_levers: Option<std::sync::Arc<ny_levers::LeverSet>>,
+    // #iso-edge-cap: typed preset values for the inline BaB config;
+    // `Default` projects nothing.
+    preset_keys: RelationalPresetKeys,
+    overlap_publish: Option<relational_overlap::PublishTarget>,
 ) -> Result<VnncompResult> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Verify);
     if !vnnlib.is_file() {
         return Ok(VnncompResult::Error);
     }
@@ -5641,15 +7712,19 @@ fn run_relational_vnncomp_with_frozen_levers(
     // emptiness proof is independent of f and g entirely (zero wrong-unsat risk).
     //
     // We emit `unsat` ONLY after a freshly built, self-checked (`check_farkas`) exact
-    // Farkas contradiction. ANY failure (wrong category/property, output shape not
-    // the validated strict safe-complement, eps not exact-positive, cert does not
-    // self-check) falls through to today's exact behavior: the difference-network
-    // structural gate followed by `Verified => Unknown` (always sound).
-    match try_prove_empty_isomorphic_unsafe_region(category, dual, vnnlib) {
-        Ok(true) => {
-            return Ok(VnncompResult::Unsat);
+    // Farkas contradiction AND the certify facade's own re-check of the same
+    // atoms (`certify::authorize_scalar_emptiness`, #spine-legacy-lanes), which
+    // mints the instance token the verdict is published from. ANY failure
+    // (wrong property kind, output shape not the validated strict
+    // safe-complement, eps not exact-positive, cert does not self-check, the
+    // facade refuses) falls through to today's exact behavior: the
+    // difference-network structural gate followed by `Verified => Unknown`
+    // (always sound).
+    match try_prove_empty_isomorphic_unsafe_region(dual, vnnlib) {
+        Ok(Some(receipt)) => {
+            return Ok(VnncompResult::Unsat(receipt));
         }
-        Ok(false) => {
+        Ok(None) => {
             // Shortcut declined; continue to the sound difference-network path.
         }
         Err(reason) => {
@@ -5663,7 +7738,8 @@ fn run_relational_vnncomp_with_frozen_levers(
     // difference-network soundness gate's g-bound finiteness check, which today
     // rejects the X_g[0]=+inf upper the coupling leaves open and forces `unknown`).
     //
-    // For `monotonic_acasxu_2026` the property (output-3 monotone in input-0) can be
+    // For the `equal-to` monotonic property (e.g. `monotonic_acasxu_2026`'s
+    // output-3 monotone in input-0) it can be
     // FALSE: a coupled point with X_f[0] >= X_g[0], X_f[k]==X_g[k] for k>=1 and
     // Y_f[3] < Y_g[3] is a genuine counterexample. We search the coupled space for
     // such a point, then emit `sat` ONLY after an INDEPENDENT forward pass of BOTH
@@ -5673,7 +7749,7 @@ fn run_relational_vnncomp_with_frozen_levers(
     // THROUGH to today's exact behavior (the gate below, `Verified => unknown`),
     // which stays sound. The g-bound derivation only has to be finite-and-in-box for
     // the witness; soundness rides entirely on the dual forward-pass revalidation.
-    match try_monotonic_coupled_sat(category, dual, onnx_arg, vnnlib) {
+    match try_monotonic_coupled_sat(dual, onnx_arg, vnnlib) {
         Ok(Some(sat)) => return Ok(sat),
         Ok(None) => {
             // No revalidated counterexample found; continue to the sound gate path.
@@ -5685,7 +7761,7 @@ fn run_relational_vnncomp_with_frozen_levers(
         }
     }
 
-    let gate = match dual_difference_soundness_gate(category, dual) {
+    let gate = match dual_difference_soundness_gate(dual) {
         Ok(gate) => gate,
         Err(reason) => {
             // DEFENSE IN DEPTH (gate-flip hardening): the canonical SHAPE gate
@@ -5699,7 +7775,7 @@ fn run_relational_vnncomp_with_frozen_levers(
             // facts hold, proceed to build + verify under the implication
             // authority instead of hard-declining on an unrecognized spelling.
             // With the explicit kill-switch set, keep the conservative decline.
-            match implication_authority_gate_bypass(category, dual) {
+            match implication_authority_gate_bypass(dual) {
                 Some(gate) => {
                     eprintln!(
                         "Dual-network canonical shape gate declined ({reason}); proceeding under \
@@ -5718,7 +7794,7 @@ fn run_relational_vnncomp_with_frozen_levers(
     };
 
     let mut network_paths = resolve_relational_network_paths(onnx_arg, vnnlib)?;
-    if network_paths.len() == 1 && gate.allows_single_network_reuse(category) {
+    if network_paths.len() == 1 && gate.allows_single_network_reuse() {
         network_paths.push(network_paths[0].clone());
     }
     if network_paths.len() != 2 {
@@ -5736,11 +7812,11 @@ fn run_relational_vnncomp_with_frozen_levers(
 
     let result = match gate.kind {
         DualDifferenceKind::Isomorphic { epsilon } => {
-            let (mut graph_a, mut graph_b) =
-                match load_relational_graphs_or_unknown(&network_paths) {
-                    Ok(graphs) => graphs,
-                    Err(result) => return Ok(result),
-                };
+            let (mut graph_a, mut graph_b) = match load_relational_graphs_or_unknown(&network_paths)
+            {
+                Ok(graphs) => graphs,
+                Err(result) => return Ok(result),
+            };
             let mut diff = build_difference_network(&graph_a, &graph_b)?;
             attach_relational_frozen_authority(
                 &mut graph_a,
@@ -5777,80 +7853,209 @@ fn run_relational_vnncomp_with_frozen_levers(
             // giving the SAT search headroom on a slower machine.
             let falsifier_deadline = std::time::Instant::now()
                 + std::time::Duration::from_secs((ny_timeout / 3).clamp(6, 30));
-            if let Some(witness) = try_isomorphic_shared_sat(
-                &diff,
-                &graph_a,
-                &graph_b,
-                &network_paths[0],
-                &network_paths[1],
-                dual,
-                epsilon,
-                falsifier_deadline,
-            ) {
-                return Ok(VnncompResult::Sat {
-                    witness: Some(witness),
-                });
-            }
-            // Gate-flip authorization (default ON; NY_RELATIONAL_UNSAT=0 disables):
-            // prove `parsed formula ⇒ the literally-verified region` with
-            // self-checked Farkas certificates + a structural spot check of
-            // the difference net. `None` on any miss ⇒ the Verified→unknown
-            // gate below stays exactly as today.
-            let unsat_auth = super::relational_equiv::try_authorize_relational_unsat(
-                dual.formula_dnf.as_ref(),
-                super::relational_equiv::CheckedKind::Isomorphic {
-                    eps_hat: inward_nonnegative_f32(epsilon),
-                    output_dim,
-                },
-                &diff,
-                &graph_a,
-                &graph_b,
-                &input_bounds,
-            );
-            // BaB-`Violated` counterexamples (the shared 5-D point) go through
-            // the SAME independent dual-forward revalidation as the falsifier
-            // (internal pre-filter + trusted ORT confirmation).
-            let revalidate = |candidate: &[f32]| {
-                revalidate_isomorphic_witness(
+            let site_start = std::time::Instant::now();
+            let overall_deadline = scored_wall.map_or(arm_deadline, |wall| wall.min(arm_deadline));
+            let admitted = if preset_keys.attack_concurrent {
+                relational_overlap::admit(
+                    overlap_publish.as_ref(),
+                    &diff,
+                    site_start,
+                    falsifier_deadline,
+                    overall_deadline,
+                )
+            } else {
+                None
+            };
+            if admitted.is_none() {
+                if let Some(witness) = try_isomorphic_shared_sat_with_vjp(
+                    &diff,
                     &graph_a,
                     &graph_b,
                     &network_paths[0],
                     &network_paths[1],
-                    candidate,
                     dual,
                     epsilon,
+                    falsifier_deadline,
+                    preset_keys.relational_point_vjp,
+                ) {
+                    return Ok(VnncompResult::Sat {
+                        witness: Some(witness),
+                    });
+                }
+            }
+            let attack_diff = admitted.as_ref().map(|_| diff.clone());
+            let proof = || -> Result<VnncompResult> {
+                // Gate-flip authorization (default ON; NY_RELATIONAL_UNSAT=0 disables):
+                // prove `parsed formula ⇒ the literally-verified region` with
+                // self-checked Farkas certificates + a structural spot check of
+                // the difference net. `None` on any miss ⇒ the Verified→unknown
+                // gate below stays exactly as today.
+                let unsat_auth = super::relational_equiv::try_authorize_relational_unsat(
+                    dual.formula_dnf.as_ref(),
+                    super::relational_equiv::CheckedKind::Isomorphic {
+                        eps_hat: inward_nonnegative_f32(epsilon),
+                        output_dim,
+                    },
+                    &diff,
+                    &graph_a,
+                    &graph_b,
+                    &input_bounds,
+                );
+                // The native engine certifies the signed difference itself. Its
+                // exact source-chain admission and complete input cover are both
+                // necessary; the existing formula-implication authority remains
+                // necessary before a proof may become a protocol verdict.
+                if let Some(options) = preset_keys.paired_difference {
+                    if options.max_seconds.is_finite()
+                        && options.max_seconds > 0.0
+                        && options.max_seconds <= 90.0
+                        && options.max_domains > 0
+                        && options.max_domains <= 2_000_000
+                        && options.max_lp_seconds.is_finite()
+                        && options.max_lp_seconds >= 0.0
+                        && options.max_lp_seconds <= options.max_seconds
+                        && (16..=2_048).contains(&options.lp_memory_mib)
+                        && (1..=100_000).contains(&options.lp_steps)
+                        && (1..=16).contains(&options.workers)
+                        && ny_core::require_f64_interval_proof_environment().is_ok()
+                        && unsat_auth.is_some()
+                        && super::relational_equiv::relational_unsat_enabled()
+                    {
+                        match ny_propagate::paired_difference::PairedChain::from_graphs(
+                            &graph_a,
+                            &graph_b,
+                            input_bounds.len(),
+                        ) {
+                            Ok(chain) => {
+                                let domain = ny_propagate::paired_difference::BoxDomain {
+                                    lo: input_bounds.iter().map(|b| f64::from(b.lower())).collect(),
+                                    hi: input_bounds.iter().map(|b| f64::from(b.upper())).collect(),
+                                };
+                                let now = std::time::Instant::now();
+                                let mut deadline = (now
+                                    + std::time::Duration::from_secs_f64(options.max_seconds))
+                                .min(arm_deadline);
+                                if let Some(wall) = scored_wall {
+                                    deadline = deadline.min(wall);
+                                }
+                                eprintln!("[paired-difference] armed source=preset max_domains={} live_seconds={:.3}", options.max_domains, deadline.saturating_duration_since(now).as_secs_f64());
+                                let workers =
+                                    ny_propagate::paired_difference::ParallelWorkers::new(
+                                        options.workers,
+                                    )
+                                    .expect("worker count validated above");
+                                let band_epsilon = f64::from(inward_nonnegative_f32(epsilon));
+                                if options.max_lp_seconds > 0.0 {
+                                    let lp_now = std::time::Instant::now();
+                                    let lp_deadline = (lp_now
+                                        + std::time::Duration::from_secs_f64(
+                                            options.max_lp_seconds,
+                                        ))
+                                    .min(deadline);
+                                    if lp_now < lp_deadline {
+                                        if try_paired_lp_prepass(
+                                            &chain,
+                                            &domain,
+                                            band_epsilon,
+                                            options,
+                                            lp_deadline,
+                                            workers,
+                                        ) && std::time::Instant::now() < lp_deadline
+                                        {
+                                            return authorized_unsat_or_unknown(unsat_auth, vnnlib);
+                                        }
+                                    }
+                                }
+                                // An LP miss retains the same complete root. Input
+                                // splitting uses only the remaining paired budget.
+                                let proof = chain.prove_refined_parallel(
+                                    &domain,
+                                    band_epsilon,
+                                    deadline,
+                                    options.max_domains,
+                                    true,
+                                    workers,
+                                );
+                                eprintln!("[paired-difference] done proved={} evaluated={} closed={} open={} reason={} worst_closed_bound={:.17e} elapsed_s={:.6}", proof.proved, proof.evaluated, proof.closed, proof.open, proof.reason, proof.worst_closed_bound, proof.elapsed.as_secs_f64());
+                                if proof.proved && std::time::Instant::now() < deadline {
+                                    return authorized_unsat_or_unknown(unsat_auth, vnnlib);
+                                }
+                            }
+                            Err(reason) => {
+                                eprintln!("[paired-difference] declined reason={reason}")
+                            }
+                        }
+                    } else {
+                        eprintln!("[paired-difference] declined reason=invalid_budget_or_missing_formula_authority");
+                    }
+                }
+                // BaB-`Violated` counterexamples (the shared 5-D point) go through
+                // the SAME independent dual-forward revalidation as the falsifier
+                // (internal pre-filter + trusted ORT confirmation).
+                let revalidate = |candidate: &[f32]| {
+                    revalidate_isomorphic_witness(
+                        &graph_a,
+                        &graph_b,
+                        &network_paths[0],
+                        &network_paths[1],
+                        candidate,
+                        dual,
+                        epsilon,
+                    )
+                };
+                let remaining_secs = arm_deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_secs()
+                    .max(1);
+                // Arm the coupled-δ leaf oracle (default-off; NY_REL_COUPLED_DELTA=1)
+                // from the ISOMORPHIC source towers, before `input_bounds` is moved.
+                let coupled_oracle = super::coupled_delta::coupled_delta_oracle_from_env(
+                    &graph_a,
+                    &graph_b,
+                    &diff,
+                    &input_bounds,
+                );
+                verify_difference_bounds(
+                    diff,
+                    input_bounds,
+                    output_bounds,
+                    remaining_secs,
+                    scored_wall,
+                    unsat_auth,
+                    vnnlib,
+                    Some(&revalidate),
+                    coupled_oracle,
+                    preset_keys,
                 )
             };
-            let remaining_secs = arm_deadline
-                .saturating_duration_since(std::time::Instant::now())
-                .as_secs()
-                .max(1);
-            // Arm the coupled-δ leaf oracle (default-off; NY_REL_COUPLED_DELTA=1)
-            // from the ISOMORPHIC source towers, before `input_bounds` is moved.
-            let coupled_oracle = super::coupled_delta::coupled_delta_oracle_from_env(
-                &graph_a,
-                &graph_b,
-                &diff,
-                &input_bounds,
-            );
-            verify_difference_bounds(
-                diff,
-                input_bounds,
-                output_bounds,
-                remaining_secs,
-                scored_wall,
-                unsat_auth,
-                vnnlib,
-                Some(&revalidate),
-                coupled_oracle,
-            )
+            if let Some(admitted) = admitted {
+                let attack_diff = attack_diff.expect("admitted race has its source attack graph");
+                relational_overlap::run(
+                    admitted,
+                    overlap_publish.expect("admitted publisher"),
+                    &attack_diff,
+                    &graph_a,
+                    &graph_b,
+                    &network_paths[0],
+                    &network_paths[1],
+                    dual,
+                    epsilon,
+                    site_start,
+                    falsifier_deadline,
+                    overall_deadline,
+                    preset_keys.relational_point_vjp,
+                    proof,
+                )
+            } else {
+                proof()
+            }
         }
         DualDifferenceKind::Monotonic { varying_input, .. } => {
-            let (mut graph_a, mut graph_b) =
-                match load_relational_graphs_or_unknown(&network_paths) {
-                    Ok(graphs) => graphs,
-                    Err(result) => return Ok(result),
-                };
+            let (mut graph_a, mut graph_b) = match load_relational_graphs_or_unknown(&network_paths)
+            {
+                Ok(graphs) => graphs,
+                Err(result) => return Ok(result),
+            };
             let (mut diff, input_bounds) =
                 build_monotonic_difference_network(&graph_a, &graph_b, dual, varying_input)?;
             attach_relational_frozen_authority(
@@ -5927,6 +8132,7 @@ fn run_relational_vnncomp_with_frozen_levers(
                 // Monotonic lane: the coupled-δ oracle targets the isomorphic
                 // pair structure; not armed here.
                 None,
+                preset_keys,
             )
         }
     }?;
@@ -5952,14 +8158,17 @@ enum DualDifferenceKind {
 }
 
 impl DualDifferenceGate {
-    fn allows_single_network_reuse(&self, category: &str) -> bool {
-        matches!(
-            (category, self.kind),
-            (
-                "monotonic_acasxu_2026",
-                DualDifferenceKind::Monotonic { .. }
-            )
-        )
+    /// One ONNX may stand for both f and g exactly when the property itself
+    /// says g IS f: the monotonic gate is minted only from a
+    /// `(declare-network g (equal-to f) ...)` declaration
+    /// (`NetworkRelation::EqualTo` -> `DualNetworkProperty::MonotonicGreaterEq`),
+    /// so reusing the single supplied network is what the spec declares, not
+    /// an assumption. An `isomorphic-to` pair relates two DIFFERENT networks
+    /// and must supply both (#name-blind-routing: this used to additionally
+    /// require the literal category `monotonic_acasxu_2026`, which every
+    /// `equal-to` row in the scored corpus carries).
+    fn allows_single_network_reuse(&self) -> bool {
+        matches!(self.kind, DualDifferenceKind::Monotonic { .. })
     }
 
     fn output_bounds(&self, actual_output_dim: usize) -> std::result::Result<Vec<Bound>, String> {
@@ -6006,6 +8215,10 @@ impl DualDifferenceGate {
 /// Returns `Some(gate)` only when ALL of:
 ///   * the implication lane is enabled (default-on; `NY_RELATIONAL_UNSAT=0`
 ///     is the explicit kill-switch, which keeps the conservative decline);
+///   * the property is `isomorphic-to` epsilon-equivalence (below) — this is
+///     the whole scope; it used to also require the literal category
+///     `isomorphic_acasxu_2026` (#name-blind-routing), which every
+///     `isomorphic-to` row in the scored corpus carries;
 ///   * the FULL formula DNF extracted (`formula_dnf` present — the implication
 ///     proof's input; without it no `unsat` could ever be authorized anyway);
 ///   * the property parsed as epsilon-equivalence with a finite `eps >= 0`
@@ -6021,16 +8234,11 @@ impl DualDifferenceGate {
 /// would have caught makes the implication proof fail — gate stays down.
 /// The monotonic arm is NOT bypassed (its builder carries additional
 /// structural requirements and the live blocker is isomorphic-only).
-fn implication_authority_gate_bypass(
-    category: &str,
-    dual: &DualNetworkSpec,
-) -> Option<DualDifferenceGate> {
+fn implication_authority_gate_bypass(dual: &DualNetworkSpec) -> Option<DualDifferenceGate> {
     if !super::relational_equiv::relational_unsat_enabled() {
         return None;
     }
-    if category != "isomorphic_acasxu_2026" || dual.formula_dnf.is_none() {
-        return None;
-    }
+    dual.formula_dnf.as_ref()?;
     let DualNetworkProperty::EpsilonEquivalence { epsilon } = dual.property else {
         return None;
     };
@@ -6076,8 +8284,16 @@ fn implication_authority_gate_bypass(
 ///   canonical same-index monotonic unsafe comparison;
 /// * the returned gate is the only object allowed to build output bounds, so
 ///   actual network dimensions are checked before verification can emit `unsat`.
+///
+/// The arm is selected by the PARSED PROPERTY alone (#name-blind-routing). The
+/// property kind is itself structural: `isomorphic-to` mints
+/// `EpsilonEquivalence`, `equal-to` mints `MonotonicGreaterEq`
+/// (`parse_dual_network_spec`). The gate used to pair each arm with its literal
+/// category name as well; in the scored corpus every `isomorphic-to` row is an
+/// `isomorphic_acasxu_2026` row and every `equal-to` row a
+/// `monotonic_acasxu_2026` row, so dropping the name admits exactly the same
+/// rows, and every structural check below is unchanged.
 pub(crate) fn dual_difference_soundness_gate(
-    category: &str,
     dual: &DualNetworkSpec,
 ) -> std::result::Result<DualDifferenceGate, String> {
     let declared_input_dim = declared_dual_input_dim(dual)?;
@@ -6096,8 +8312,8 @@ pub(crate) fn dual_difference_soundness_gate(
     validate_dual_bounds(&dual.f_input_bounds, "f")?;
     validate_dual_bounds(&dual.g_input_bounds, "g")?;
 
-    match (&dual.property, category) {
-        (DualNetworkProperty::EpsilonEquivalence { epsilon }, "isomorphic_acasxu_2026") => {
+    match &dual.property {
+        DualNetworkProperty::EpsilonEquivalence { epsilon } => {
             if !epsilon.is_finite() || *epsilon < 0.0 {
                 return Err("isomorphic epsilon must be finite and non-negative".into());
             }
@@ -6127,14 +8343,11 @@ pub(crate) fn dual_difference_soundness_gate(
                 kind: DualDifferenceKind::Isomorphic { epsilon: *epsilon },
             })
         }
-        (
-            DualNetworkProperty::MonotonicGreaterEq {
-                output,
-                varying_input,
-                strict_unsafe,
-            },
-            "monotonic_acasxu_2026",
-        ) => {
+        DualNetworkProperty::MonotonicGreaterEq {
+            output,
+            varying_input,
+            strict_unsafe,
+        } => {
             if declared_input_dim != 5 || *varying_input != 0 {
                 return Err("only canonical ACAS monotonic input-0 specs are validated".into());
             }
@@ -6184,7 +8397,7 @@ pub(crate) fn dual_difference_soundness_gate(
                 },
             })
         }
-        _ => Err("category/property pair is not a validated dual-network shortcut".into()),
+        _ => Err("dual-network property is not a validated dual-network shortcut".into()),
     }
 }
 
@@ -6380,7 +8593,9 @@ fn load_relational_graphs_or_unknown(
 ) -> std::result::Result<(GraphNetwork, GraphNetwork), VnncompResult> {
     let mut graphs = Vec::with_capacity(2);
     for path in &network_paths[..2] {
-        match load_graph_network(path) {
+        // Proof authority for `RelationalImplication`: the certified lowering
+        // (every authored BatchNormalization kept; #spine-legacy-lanes M2e).
+        match load_certified_graph_network(path) {
             Ok(graph) => graphs.push(graph),
             Err(err) => {
                 eprintln!(
@@ -6429,6 +8644,31 @@ pub(crate) fn load_graph_network_retaining_model(
     };
     let graph = model.to_graph_network_with_options(options)?;
     Ok((graph, retain_model.then_some(model)))
+}
+
+/// #soundness-spine M2e / #spine-legacy-lanes: load a model whose
+/// `GraphNetwork` an `unsat` lane uses as PROOF AUTHORITY, through
+/// [`OnnxLoadConfig::certified_graph_lowering`]. That lowering keeps every
+/// authored BatchNormalization node as a certified `BatchNormLayer` (outward
+/// binary64 enclosure of the exact affine, `scale_err`/`bias_err` charged)
+/// instead of folding it into the preceding Conv/Gemm with the composed
+/// coefficient enclosure DROPPED (`fusion/batch_norm_fold.rs`).
+///
+/// Otherwise identical to [`load_graph_network`] (same shape-inference
+/// backend, same compound-node policy), so on a model with no
+/// BatchNormalization — every model its callers' benchmarks carry today — the
+/// graph is byte-identical.
+pub(crate) fn load_certified_graph_network(path: &Path) -> Result<GraphNetwork> {
+    let load_config = OnnxLoadConfig::default()
+        .with_shape_infer_backend(crate::commands::cli_shape_infer_backend())
+        .certified_graph_lowering();
+    debug_assert!(load_config.admits_certified_graph_lowering());
+    let model = load_onnx_with_config(path, &load_config)?;
+    let options = GraphNetworkOptions {
+        compound_node_policy: CompoundNodePolicy::DecomposeNormalization,
+        ..GraphNetworkOptions::default()
+    };
+    Ok(model.to_graph_network_with_options(options)?)
 }
 
 fn directed_lower_f32(v: f64) -> f32 {
@@ -6590,9 +8830,11 @@ fn build_isomorphic_index_cert(idx_atoms: &[&IsomorphicOutputAtom]) -> Option<Fa
 /// EMPTY, backing the decision with an exact, self-checked Farkas certificate
 /// built from the REAL parsed output atoms.
 ///
-/// Returns `Ok(true)` (=> caller emits `unsat`) ONLY when ALL of the following hold:
-///   * `category == "isomorphic_acasxu_2026"`;
-///   * `dual.property` is `EpsilonEquivalence`;
+/// Returns `Ok(Some(receipt))` (=> caller publishes `unsat`) ONLY when ALL of
+/// the following hold:
+///   * `dual.property` is `EpsilonEquivalence` (an `isomorphic-to` declaration;
+///     this replaced a literal `isomorphic_acasxu_2026` category test,
+///     #name-blind-routing);
 ///   * the top-level output structure is a CONJUNCTION
 ///     (`isomorphic_output_is_conjunction == true`) — a disjunctive `|t| > eps`
 ///     region is feasible and must NEVER be proved empty (BUG 2 guard);
@@ -6602,48 +8844,50 @@ fn build_isomorphic_index_cert(idx_atoms: &[&IsomorphicOutputAtom]) -> Option<Fa
 ///   * for EVERY output index, a Farkas certificate built from THAT index's REAL
 ///     signed atoms passes the in-tree `check_farkas` contradiction check. The
 ///     real signed constants drive the residual, so a feasible region (e.g.
-///     `t > -eps ∧ t < +eps`, BUG 1) fails the check and we DECLINE.
+///     `t > -eps ∧ t < +eps`, BUG 1) fails the check and we DECLINE;
+///   * #spine-legacy-lanes: the certify facade re-checks the SAME real atoms
+///     (`certify::authorize_scalar_emptiness`: per index, a lower and an upper
+///     atom that no value of `t` satisfies together, by exact comparison) and
+///     mints the instance-scoped token the receipt is built from. The replay
+///     above and the facade must AGREE; a facade refusal after a passing replay
+///     declines and prints `[cover-gate] REFUSED`.
 ///
-/// On `Ok(true)` the certificate sidecar JSON is written next to `vnnlib`.
+/// On `Ok(Some(_))` the certificate sidecar JSON is written next to `vnnlib`.
 ///
-/// Returns `Ok(false)` whenever any structural precondition is not met, an
+/// Returns `Ok(None)` whenever any structural precondition is not met, an
 /// atom's constant cannot enter the exact arena, or a built certificate does
 /// NOT prove a contradiction (the shortcut declines; caller falls through to
 /// the sound difference-network path => `unknown`). It NEVER returns `Err` for
 /// an unprovable region — only a genuine, self-checked contradiction yields
 /// `unsat`.
 fn try_prove_empty_isomorphic_unsafe_region(
-    category: &str,
     dual: &DualNetworkSpec,
     vnnlib: &Path,
-) -> std::result::Result<bool, String> {
-    if category != "isomorphic_acasxu_2026" {
-        return Ok(false);
-    }
+) -> std::result::Result<Option<UnsatReceipt>, String> {
     let DualNetworkProperty::EpsilonEquivalence { .. } = dual.property else {
-        return Ok(false);
+        return Ok(None);
     };
     let validation = &dual.validation;
     // BUG 2 GUARD: the unsafe region must be a CONJUNCTION. A disjunction
     // (`(or (t>eps) (t<-eps))`, i.e. `|t| > eps`) is feasible for distinct f/g,
     // so the property does NOT hold and `unsat` would be wrong. Decline.
     if !validation.isomorphic_output_is_conjunction {
-        return Ok(false);
+        return Ok(None);
     }
     // The OUTPUT atoms must be exactly the validated strict same-index epsilon
     // safe-complement for EVERY output index, with no unsupported output relation.
     if validation.unsupported_output_relation || !validation.isomorphic_output_safe_complement {
-        return Ok(false);
+        return Ok(None);
     }
     // We must have at least one real parsed atom to certify from; an empty atom
     // set could only ever vacuously "prove" emptiness, which we refuse.
     if validation.isomorphic_output_atoms.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
 
     let output_dim = declared_dual_output_dim(dual)?;
     if output_dim == 0 {
-        return Ok(false);
+        return Ok(None);
     }
 
     // Group the REAL parsed atoms by output index. Every declared output index
@@ -6652,6 +8896,7 @@ fn try_prove_empty_isomorphic_unsafe_region(
     // infeasible, but we require ALL indices' certs to self-check so the emitted
     // cert set is complete and there is no unindexed (uncovered) output.
     let mut certs = Vec::with_capacity(output_dim);
+    let mut groups: Vec<Vec<ScalarAtom>> = Vec::with_capacity(output_dim);
     for index in 0..output_dim {
         let idx_atoms: Vec<&IsomorphicOutputAtom> = validation
             .isomorphic_output_atoms
@@ -6662,7 +8907,7 @@ fn try_prove_empty_isomorphic_unsafe_region(
         // uncovered index means the parsed region is not the full per-index
         // safe complement we can certify — decline rather than guess.
         if idx_atoms.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
         // Build the certificate from the REAL signed atoms and verify it proves
         // a contradiction of the ACTUAL region. If construction fails
@@ -6670,16 +8915,49 @@ fn try_prove_empty_isomorphic_unsafe_region(
         // NOT hold (feasible / wrong-sign region, BUG 1), we DECLINE to
         // `unknown` — never `unsat`.
         let Some(cert) = build_isomorphic_index_cert(&idx_atoms) else {
-            return Ok(false);
+            return Ok(None);
         };
         if check_farkas(&cert).is_err() {
-            return Ok(false);
+            return Ok(None);
         }
         certs.push((index, cert));
+        groups.push(
+            idx_atoms
+                .iter()
+                .map(|&atom| isomorphic_scalar_atom(atom))
+                .collect(),
+        );
     }
     if certs.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
+    // The facade's own re-check of the same atoms mints the token; the lane's
+    // `check_farkas` replay above is kept, and both must agree.
+    let receipt = match ny_propagate::certify::authorize_scalar_emptiness(&groups) {
+        Ok(token) => {
+            let min_slack = token.min_margin();
+            let Some(receipt) = UnsatReceipt::from_token(token) else {
+                eprintln!(
+                    "[cover-gate] REFUSED scope=instance lane=isomorphic_emptiness \
+                     token_not_publishable"
+                );
+                return Ok(None);
+            };
+            eprintln!(
+                "[cover-gate] authorized scope=instance lane=isomorphic_emptiness groups={} \
+                 min_slack={min_slack:.6e}",
+                groups.len()
+            );
+            receipt
+        }
+        Err(refusal) => {
+            eprintln!(
+                "[cover-gate] REFUSED scope=instance lane=isomorphic_emptiness {refusal} \
+                 (the check_farkas replay passed: the two checks disagree; declining)"
+            );
+            return Ok(None);
+        }
+    };
 
     println!(
         "Isomorphic unsafe region proven EMPTY by exact Farkas certificate over the REAL parsed output atoms ({} output indices); returning unsat",
@@ -6692,7 +8970,22 @@ fn try_prove_empty_isomorphic_unsafe_region(
     if let Err(reason) = write_isomorphic_emptiness_cert(&certs, vnnlib) {
         eprintln!("warning: failed to write isomorphic emptiness certificate sidecar: {reason}");
     }
-    Ok(true)
+    Ok(Some(receipt))
+}
+
+/// One parsed isomorphic deviation atom `t ⋈ c` as the certify facade's
+/// scalar atom (same relation, same REAL signed constant, no conversion).
+fn isomorphic_scalar_atom(atom: &IsomorphicOutputAtom) -> ScalarAtom {
+    let rel = match atom.relation {
+        IsomorphicAtomRelation::Gt => ScalarRel::Gt,
+        IsomorphicAtomRelation::Lt => ScalarRel::Lt,
+        IsomorphicAtomRelation::Ge => ScalarRel::Ge,
+        IsomorphicAtomRelation::Le => ScalarRel::Le,
+    };
+    ScalarAtom {
+        rel,
+        constant: atom.constant,
+    }
 }
 
 /// Serialize the self-checked per-index Farkas certificates to a sidecar JSON next
@@ -6822,7 +9115,9 @@ fn authorized_unsat_or_unknown(
             ) {
                 eprintln!("warning: failed to write implication sidecar: {reason}");
             }
-            Ok(VnncompResult::Unsat)
+            Ok(VnncompResult::Unsat(UnsatReceipt::legacy_uncovered(
+                LegacyUnsatAuthority::RelationalImplication,
+            )))
         }
         None => Ok(VnncompResult::Unknown),
     }
@@ -7023,6 +9318,9 @@ fn verify_difference_bounds(
     coupled_oracle: Option<
         std::sync::Arc<dyn ny_propagate::beta_crown::graph_mip_leaf::GraphMipLeafOracle>,
     >,
+    // #iso-edge-cap: typed values projected from the category preset for the
+    // inline config below (`RelationalPresetKeys`); `Default` projects nothing.
+    preset_keys: RelationalPresetKeys,
 ) -> Result<VnncompResult> {
     // RELATIONAL BAB (default ON, `NY_RELATIONAL_BAB=0` opts out): run the
     // FULL input-split BaB machinery — the acasxu_2023-winning configuration
@@ -7179,6 +9477,10 @@ fn verify_difference_bounds(
                 input_split_edge_alpha: edge_alpha,
                 input_split_edge_alpha_top: edge_alpha_top,
                 input_split_edge_alpha_iters: edge_alpha_iters,
+                // #iso-edge-cap: bound the serial edge work above by the
+                // scored stop and a per-wave allowance. `None` (no preset key,
+                // the shipped state) leaves it ungoverned, exactly as before.
+                input_split_edge_wave_cap: preset_keys.edge_wave_cap,
                 phase_budget: ny_propagate::PhaseBudgetConfig {
                     post_bab_pgd_fraction: 0.0,
                     ..ny_propagate::PhaseBudgetConfig::default()
@@ -7332,7 +9634,9 @@ fn verify_difference_bounds(
                 ) {
                     eprintln!("warning: failed to write implication sidecar: {reason}");
                 }
-                Ok(VnncompResult::Unsat)
+                Ok(VnncompResult::Unsat(UnsatReceipt::legacy_uncovered(
+                    LegacyUnsatAuthority::RelationalImplication,
+                )))
             }
             None => Ok(VnncompResult::Unknown),
         },
@@ -7512,15 +9816,16 @@ fn coupled_g_input_bounds(
 /// counterexample is found (the caller falls through to the sound gate path); `Err`
 /// on a load/parse problem (also routed to the sound fall-through by the caller).
 /// NEVER emits `sat` from the difference-network value alone.
+///
+/// Scope is the parsed `equal-to` monotonic property (plus the canonical 5-input,
+/// input-0 shape checked below); it used to also require the literal category
+/// `monotonic_acasxu_2026` (#name-blind-routing), which every `equal-to` row in
+/// the scored corpus carries.
 fn try_monotonic_coupled_sat(
-    category: &str,
     dual: &DualNetworkSpec,
     onnx_arg: &Path,
     vnnlib: &Path,
 ) -> Result<Option<VnncompResult>> {
-    if category != "monotonic_acasxu_2026" {
-        return Ok(None);
-    }
     // Only the validated monotonic property shape is searched. We deliberately reuse
     // the SAME structural facts the soundness gate checks (output index, varying
     // input, equality coupling, X_f>=X_g) so the search runs only on instances the
@@ -7547,7 +9852,7 @@ fn try_monotonic_coupled_sat(
     };
     let mut coupled_dual = dual.clone();
     coupled_dual.g_input_bounds = coupled_g;
-    let gate = match dual_difference_soundness_gate(category, &coupled_dual) {
+    let gate = match dual_difference_soundness_gate(&coupled_dual) {
         Ok(gate) => gate,
         Err(_) => return Ok(None),
     };
@@ -7558,7 +9863,7 @@ fn try_monotonic_coupled_sat(
     // Resolve and load both original networks (g IS f for `equal-to`, but we load the
     // declared paths independently and revalidate through each).
     let mut network_paths = resolve_relational_network_paths(onnx_arg, vnnlib)?;
-    if network_paths.len() == 1 && gate.allows_single_network_reuse(category) {
+    if network_paths.len() == 1 && gate.allows_single_network_reuse() {
         network_paths.push(network_paths[0].clone());
     }
     if network_paths.len() != 2 || network_paths.iter().any(|p| !p.is_file()) {
@@ -8293,6 +10598,60 @@ fn search_isomorphic_deviation(
     epsilon: f64,
     deadline: std::time::Instant,
 ) -> Option<Vec<f32>> {
+    search_isomorphic_deviation_with_advice_and_cancel(
+        diff,
+        search_bounds,
+        epsilon,
+        deadline,
+        None,
+        None,
+    )
+}
+
+fn search_isomorphic_deviation_with_advice(
+    diff: &GraphNetwork,
+    search_bounds: &[Bound],
+    epsilon: f64,
+    deadline: std::time::Instant,
+    advice: Option<&relational_vjp::DenseTwinAdvice>,
+) -> Option<Vec<f32>> {
+    search_isomorphic_deviation_with_advice_and_cancel(
+        diff,
+        search_bounds,
+        epsilon,
+        deadline,
+        advice,
+        None,
+    )
+}
+
+fn search_isomorphic_deviation_cancellable(
+    diff: &GraphNetwork,
+    search_bounds: &[Bound],
+    epsilon: f64,
+    deadline: std::time::Instant,
+    cancel: Option<&ny_propagate::PgdCancelToken>,
+) -> Option<Vec<f32>> {
+    search_isomorphic_deviation_with_advice_and_cancel(
+        diff,
+        search_bounds,
+        epsilon,
+        deadline,
+        None,
+        cancel,
+    )
+}
+
+fn search_isomorphic_deviation_with_advice_and_cancel(
+    diff: &GraphNetwork,
+    search_bounds: &[Bound],
+    epsilon: f64,
+    deadline: std::time::Instant,
+    advice: Option<&relational_vjp::DenseTwinAdvice>,
+    cancel: Option<&ny_propagate::PgdCancelToken>,
+) -> Option<Vec<f32>> {
+    let cancelled = || cancel.is_some_and(ny_propagate::PgdCancelToken::is_cancelled);
+    let stopped = || cancelled() || std::time::Instant::now() >= deadline;
     let dim = search_bounds.len();
     if dim == 0 {
         return None;
@@ -8301,15 +10660,21 @@ fn search_isomorphic_deviation(
     let lo: Vec<f32> = search_bounds.iter().map(Bound::lower).collect();
     let hi: Vec<f32> = search_bounds.iter().map(Bound::upper).collect();
     let n_evals = std::cell::Cell::new(0usize);
+    let forward = |point: &[f32]| -> Result<Vec<f32>> {
+        if let Some(output) = advice.and_then(|advice| advice.forward(point)) {
+            return Ok(output);
+        }
+        forward_point_vec(diff, point)
+    };
 
     // Deadline-aware eval: the search is a bounded SLICE of the arm budget
     // (never the whole wall); expiry keeps the best-so-far incumbent.
     let eval = |x: &[f32]| -> Option<f32> {
-        if std::time::Instant::now() >= deadline {
+        if stopped() {
             return None;
         }
         n_evals.set(n_evals.get() + 1);
-        let out = forward_point_vec(diff, x).ok()?;
+        let out = forward(x).ok()?;
         let dev = out
             .iter()
             .map(|v| v.abs())
@@ -8352,6 +10717,14 @@ fn search_isomorphic_deviation(
             .is_some_and(|(_, v)| f32_to_f64_exact(*v) > threshold)
     };
     let finish = |best: &Option<(Vec<f32>, f32)>| -> Option<Vec<f32>> {
+        if cancelled() {
+            tracing::info!(
+                n_evals = n_evals.get(),
+                elapsed_s = started.elapsed().as_secs_f64(),
+                "iso falsifier: cooperatively cancelled"
+            );
+            return None;
+        }
         match best {
             Some((x, v)) => {
                 let over = f32_to_f64_exact(*v) > threshold;
@@ -8397,6 +10770,9 @@ fn search_isomorphic_deviation(
         };
         let total = ticks.pow(free.len().min(8) as u32);
         for flat in 0..total {
+            if cancelled() {
+                return finish(&best);
+            }
             let mut x = lo.clone();
             let mut rest = flat;
             for &k in &free {
@@ -8419,6 +10795,9 @@ fn search_isomorphic_deviation(
     const RANDOM_RESTARTS: usize = 200_000;
     let mut rng = SearchRng(0x9E37_79B9_7F4A_7C15);
     for _ in 0..RANDOM_RESTARTS {
+        if cancelled() {
+            return finish(&best);
+        }
         let x: Vec<f32> = (0..dim).map(|k| rng.uniform(lo[k], hi[k])).collect();
         if let Some(v) = eval(&x) {
             consider(&mut best, &mut pool, x, v);
@@ -8512,11 +10891,11 @@ fn search_isomorphic_deviation(
     // candidate generator: the dual-forward revalidation stays the gate.
     {
         let active = |x: &[f32]| -> Option<(usize, f32, f32)> {
-            if std::time::Instant::now() >= deadline {
+            if stopped() {
                 return None;
             }
             n_evals.set(n_evals.get() + 1);
-            let out = forward_point_vec(diff, x).ok()?;
+            let out = forward(x).ok()?;
             let (mut bi, mut bv) = (0usize, f32::NEG_INFINITY);
             for (i, o) in out.iter().enumerate() {
                 if o.abs() > bv {
@@ -8544,30 +10923,39 @@ fn search_isomorphic_deviation(
             consider(&mut best, &mut pool, x.clone(), v);
             let mut eta = 0.2f32;
             for _ in 0..48 {
-                // Central-difference gradient of the ACTIVE signed deviation.
+                if stopped() {
+                    break;
+                }
+                // The optional prepared template supplies an analytic search
+                // direction. The dark path keeps the original central differences.
+                let analytic = advice.and_then(|advice| advice.signed_gradient(&x, oi, os));
                 let mut grad = vec![0.0f32; dim];
                 let mut ok = true;
-                for k in 0..dim {
-                    if hi[k] <= lo[k] {
-                        continue;
+                if let Some(direction) = analytic {
+                    grad = direction;
+                    ok = !stopped();
+                } else {
+                    for k in 0..dim {
+                        if hi[k] <= lo[k] {
+                            continue;
+                        }
+                        let h = (hi[k] - lo[k]) * 1e-3;
+                        let mut xp = x.clone();
+                        xp[k] = (xp[k] + h).clamp(lo[k], hi[k]);
+                        let mut xm = x.clone();
+                        xm[k] = (xm[k] - h).clamp(lo[k], hi[k]);
+                        let (Ok(op), Ok(om)) = (forward(&xp), forward(&xm)) else {
+                            ok = false;
+                            break;
+                        };
+                        if stopped() {
+                            ok = false;
+                            break;
+                        }
+                        grad[k] = os
+                            * (op.get(oi).copied().unwrap_or(0.0)
+                                - om.get(oi).copied().unwrap_or(0.0));
                     }
-                    let h = (hi[k] - lo[k]) * 1e-3;
-                    let mut xp = x.clone();
-                    xp[k] = (xp[k] + h).clamp(lo[k], hi[k]);
-                    let mut xm = x.clone();
-                    xm[k] = (xm[k] - h).clamp(lo[k], hi[k]);
-                    let (Ok(op), Ok(om)) =
-                        (forward_point_vec(diff, &xp), forward_point_vec(diff, &xm))
-                    else {
-                        ok = false;
-                        break;
-                    };
-                    if std::time::Instant::now() >= deadline {
-                        ok = false;
-                        break;
-                    }
-                    grad[k] = os
-                        * (op.get(oi).copied().unwrap_or(0.0) - om.get(oi).copied().unwrap_or(0.0));
                 }
                 if !ok {
                     break;
@@ -8625,6 +11013,43 @@ fn try_isomorphic_shared_sat(
         .collect();
     let candidate = search_isomorphic_deviation(diff, &search_bounds, epsilon, deadline)?;
     revalidate_isomorphic_witness(graph_f, graph_g, onnx_f, onnx_g, &candidate, dual, epsilon)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_isomorphic_shared_sat_with_vjp(
+    diff: &GraphNetwork,
+    graph_f: &GraphNetwork,
+    graph_g: &GraphNetwork,
+    onnx_f: &Path,
+    onnx_g: &Path,
+    dual: &DualNetworkSpec,
+    epsilon: f64,
+    deadline: std::time::Instant,
+    enabled: bool,
+) -> Option<String> {
+    if !enabled {
+        return try_isomorphic_shared_sat(
+            diff, graph_f, graph_g, onnx_f, onnx_g, dual, epsilon, deadline,
+        );
+    }
+    let bounds: Vec<Bound> = dual
+        .f_input_bounds
+        .iter()
+        .map(|&bound| inward_bound(bound))
+        .collect();
+    eprintln!("[relational-vjp] requested source=preset original_deadline=1");
+    let Some(advice) = relational_vjp::DenseTwinAdvice::build(graph_f, graph_g, &bounds, deadline)
+    else {
+        eprintln!("[relational-vjp] declined reason=unsupported_original_tower_template");
+        return try_isomorphic_shared_sat(
+            diff, graph_f, graph_g, onnx_f, onnx_g, dual, epsilon, deadline,
+        );
+    };
+    eprintln!("[relational-vjp] armed source=preset device=cpu grid_random_coordinate_pgd_caps_unchanged=1 analytic_template_gradient=1");
+    let candidate =
+        search_isomorphic_deviation_with_advice(diff, &bounds, epsilon, deadline, Some(&advice));
+    advice.receipt();
+    revalidate_isomorphic_witness(graph_f, graph_g, onnx_f, onnx_g, &candidate?, dual, epsilon)
 }
 
 /// Format a VNN-COMP 2026 dual-network counterexample in the mandatory
@@ -8748,6 +11173,32 @@ pub(in crate::commands) fn chunk_wave_parallel_enabled_from_levers(
     !frozen_levers.is_armed(&ny_levers::decls::crown_ibp_budget::NO_CHUNK_WAVE_PAR)
 }
 
+/// #fast-f32-prewarm-all-hosts: when `bab.fast_f32_prewarm` (or its
+/// environment alias `NY_FAST_F32_PREWARM`) is armed, materialize the
+/// registered process-global fast-f32 GEMM factory NOW — before any lane can
+/// consult it under finite deadline authority, where resolution deliberately
+/// fails closed on a cold slot. Dark by default: the shipped state performs
+/// no call at all and is byte-identical to today. The CUDA build's own
+/// unconditional vnncomp prewarm is unaffected (a second materialization of
+/// an already-published slot is a no-op).
+/// Returns `None` when the gate is dark (no call was made at all — the
+/// shipped, byte-identical state) and `Some(ready)` when armed, where
+/// `ready` is [`ny_propagate::fast_f32_gemm::prewarm_fast_f32_gemm`]'s own
+/// answer — true exactly when `fast_f32_gemm::is_preinitialized()` now holds,
+/// which is what every finite-deadline consumer checks.
+pub(in crate::commands) fn prewarm_fast_f32_for_all_hosts_if_armed() -> Option<bool> {
+    if !ny_propagate::preset_gates::fast_f32_prewarm_armed() {
+        return None;
+    }
+    let ready = ny_propagate::fast_f32_gemm::prewarm_fast_f32_gemm();
+    let backend = ny_propagate::fast_f32_gemm::telemetry_snapshot().backend;
+    tracing::info!(
+        "[fast_f32_prewarm] armed: fast f32 GEMM materialized={ready} backend={backend:?} \
+         before any finite-deadline consumer"
+    );
+    Some(ready)
+}
+
 /// Invoke β-CROWN with the AUTO defaults, capture the rendered competition JSON, and
 /// translate it to a VNN-COMP result.
 ///
@@ -8770,15 +11221,7 @@ fn run_and_translate(
         super::margin_row_bab::MarginRowScheduleRuntimePolicy,
     >,
     global_rayon_outcome: super::margin_row_bab::GlobalRayonOutcome,
-    safenlp_direct_mip_first: bool,
-    traffic_terminal_softmax_peel: bool,
-    cgan_input_leaf_route: Option<CganInputLeafRoute>,
-    traffic_terminal_softmax_execution: &mut TrafficTerminalSoftmaxPeelExecution,
 ) -> VnncompResult {
-    *traffic_terminal_softmax_execution =
-        TrafficTerminalSoftmaxPeelExecution::before_run(traffic_terminal_softmax_peel);
-    let mut traffic_upfront_softmax_execution =
-        TrafficUpfrontSoftmaxExecution::before_run(traffic_terminal_softmax_peel);
     // PRESET AUTHORITY GATE: a YAML-valid preset can still be semantically
     // invalid (unsupported branching/attack/model-loader policy, invalid
     // numeric config, and so on). The immutable snapshot validates those
@@ -8796,7 +11239,6 @@ fn run_and_translate(
             "Invalid VNN-COMP preset; suppressing all wrapper fast paths and returning \
              sound unknown: {error}"
         );
-        note_traffic_upfront_softmax_execution(traffic_upfront_softmax_execution);
         return VnncompResult::Unknown;
     }
 
@@ -8809,7 +11251,6 @@ fn run_and_translate(
             "VNN-COMP run has no materialized LeverSet; suppressing wrapper fast paths and \
              returning sound unknown"
         );
-        note_traffic_upfront_softmax_execution(traffic_upfront_softmax_execution);
         return VnncompResult::Unknown;
     };
     let upfront_attack_policy = match UpfrontAttackPolicy::from_levers(&frozen_levers) {
@@ -8819,7 +11260,6 @@ fn run_and_translate(
                 "Invalid frozen VNN-COMP upfront policy; suppressing wrapper fast paths and \
                  returning sound unknown: {error}"
             );
-            note_traffic_upfront_softmax_execution(traffic_upfront_softmax_execution);
             return VnncompResult::Unknown;
         }
     };
@@ -8830,7 +11270,6 @@ fn run_and_translate(
                 "Invalid frozen VNN-COMP exact-VJP policy; suppressing wrapper fast paths and \
                  returning sound unknown: {error}"
             );
-            note_traffic_upfront_softmax_execution(traffic_upfront_softmax_execution);
             return VnncompResult::Unknown;
         }
     };
@@ -8843,10 +11282,32 @@ fn run_and_translate(
                 "Invalid frozen VNN-COMP post-BaB reserve policy; suppressing wrapper fast paths \
                  and returning sound unknown: {error}"
             );
-            note_traffic_upfront_softmax_execution(traffic_upfront_softmax_execution);
             return VnncompResult::Unknown;
         }
     };
+    let postbab_restart_policy = match PostBabRestartPolicy::from_levers(&frozen_levers) {
+        Ok(policy) => policy,
+        Err(error) => {
+            eprintln!(
+                "Invalid frozen VNN-COMP post-BaB restart policy; suppressing wrapper fast \
+                 paths and returning sound unknown: {error}"
+            );
+            return VnncompResult::Unknown;
+        }
+    };
+    // #lsnc-attack-twin: resolved from the SAME frozen LeverSet as the receipt.
+    let point_folded_twin_policy =
+        match attack_twin_lane::PointFoldedTwinPolicy::from_levers(&frozen_levers) {
+            Ok(policy) => policy,
+            Err(error) => {
+                eprintln!(
+                    "Invalid frozen VNN-COMP point-folded-twin policy; suppressing wrapper fast \
+                     paths and returning sound unknown: {error}"
+                );
+                return VnncompResult::Unknown;
+            }
+        };
+    point_folded_twin_policy.announce();
     let bnn_falsification_policy = match BnnFalsificationPolicy::from_levers(&frozen_levers) {
         Ok(policy) => policy,
         Err(error) => {
@@ -8854,11 +11315,10 @@ fn run_and_translate(
                 "Invalid frozen VNN-COMP BNN falsification policy; suppressing wrapper fast \
                  paths and returning sound unknown: {error}"
             );
-            note_traffic_upfront_softmax_execution(traffic_upfront_softmax_execution);
             return VnncompResult::Unknown;
         }
     };
-    let margin_row_runtime_policy =
+    let mut margin_row_runtime_policy =
         match ny_propagate::margin_row::MarginRowRuntimePolicy::from_levers(&frozen_levers) {
             Ok(policy) => policy,
             Err(error) => {
@@ -8866,16 +11326,21 @@ fn run_and_translate(
                     "Invalid frozen VNN-COMP margin-row policy; suppressing wrapper fast paths \
                      and returning sound unknown: {error}"
                 );
-                note_traffic_upfront_softmax_execution(traffic_upfront_softmax_execution);
                 return VnncompResult::Unknown;
             }
         };
+    // #router-r5 CR-RS: margin-row capabilities the acting router ROUTED on
+    // this row (only at SR.seal, never over a pinned key) are configured on
+    // the lane's frozen policy here, before any lane reads it. A no-op (one
+    // atomic load) unless one was routed — every row today.
+    crate::router::route::apply_to_margin_row(&mut margin_row_runtime_policy);
+    let prepared_classwise_requested = margin_row_runtime_policy.classwise;
+
     let Some(margin_row_schedule_policy) = frozen_margin_row_schedule_policy else {
         eprintln!(
             "VNN-COMP run has no frozen margin-row schedule policy; suppressing wrapper fast \
              paths and returning sound unknown"
         );
-        note_traffic_upfront_softmax_execution(traffic_upfront_softmax_execution);
         return VnncompResult::Unknown;
     };
 
@@ -8890,16 +11355,42 @@ fn run_and_translate(
     // before the attack slice, the root phases and the margin-row lane, which
     // is every consumer in the batch.
     //
-    // NO-OP ON EVERY SHIPPED CONFIG. No yaml sets any of these keys (pinned by
-    // `no_shipped_preset_arms_a_promoted_lever_delivery_key`), so every cell
-    // stays empty and every lever resolves exactly as it did before promotion.
-    // This makes the mechanisms DELIVERABLE; it does not arm them.
+    // Authored typed values arrive here; absent values retain each declaration's
+    // default. The CIFAR100/TinyImageNet presets enable the frozen-dual parent
+    // and four breakpoint refinement steps with bounded automatic admission.
+    // The unarmed-promotion pin covers only keys still absent from shipped
+    // presets; it does not suppress delivery for an explicitly armed family.
     if let Some(loaded) = preset_snapshot
         .as_ref()
         .and_then(BetaCrownPresetSnapshot::loaded)
     {
         crate::preset_gates::apply(loaded);
     }
+    // #graph-free-candidates: the armed line, printed once per ARMED run
+    // before any lane starts (after the bridge above, so a yaml arming is
+    // visible), so an armed run whose graph-free lane never engages is
+    // distinguishable from a dark one. Dark: nothing is printed.
+    if crate::preset_gates::graph_free_candidate_sidefile_armed() {
+        eprintln!(
+            "[graph-free-candidates] armed=1 source={} key={} schema={}",
+            crate::preset_gates::graph_free_candidate_sidefile_source(),
+            graph_free_sidefile::PRESET_KEY,
+            graph_free_sidefile::SCHEMA,
+        );
+    }
+
+    // #fast-f32-prewarm-all-hosts (dark, bab.fast_f32_prewarm /
+    // NY_FAST_F32_PREWARM): materialize the registered fast-f32 GEMM factory
+    // for EVERY build on the vnncomp route, not only CUDA. Finite-deadline
+    // consumers (`fast_f32_gemm::resolve_engine_for_deadline`) deliberately
+    // fail closed on a cold OnceLock, so on a non-CUDA host the factory
+    // installed by #cpu-gemm-engine is otherwise never materialized and the
+    // Conv2d Patches compose's GEMM of last resort becomes the quarantined
+    // WGPU proof adapter (reports/measured-2026/cct_bound_gap_2026-08-31).
+    // Must run AFTER the preset bridge above (the cell is written there) and
+    // BEFORE any lane consults the slot under finite authority. For the CPU
+    // faer engine the materialization is allocation-free.
+    prewarm_fast_f32_for_all_hosts_if_armed();
 
     // Reserve the sole WGPU-context slot before any wrapper falsification
     // wave can materialize its attack device. The later in-process β-CROWN
@@ -8948,7 +11439,6 @@ fn run_and_translate(
                     "TLL structural lane produced the verdict; later lanes not reached".to_string(),
                 ),
             );
-            note_traffic_upfront_softmax_execution(traffic_upfront_softmax_execution);
             return res;
         }
     }
@@ -9000,7 +11490,7 @@ fn run_and_translate(
     // `sat` only by passing the EXISTING, UNCHANGED `gate_sat_with_trusted_oracle`
     // (real ONNX Runtime forward on the ORIGINAL model + true-f64 recheck), and
     // it reaches that gate as an ORIGINAL-MODEL witness via the same
-    // `rehydrate_original_witness_outputs` the traffic peel uses. Every other
+    // `rehydrate_original_witness_outputs` every rehydrating lane uses. Every other
     // outcome — refused, exhausted, disarmed — is `None` here and falls through
     // to the normal verification path with no behaviour change; that rule is
     // `sign_space_lane_verdict`, which is unit-tested.
@@ -9031,7 +11521,6 @@ fn run_and_translate(
                 "Invalid lower VNN-COMP BNN falsification policy; suppressing wrapper fast \
                  paths and returning sound unknown: {error}"
             );
-            note_traffic_upfront_softmax_execution(traffic_upfront_softmax_execution);
             return VnncompResult::Unknown;
         }
     };
@@ -9040,6 +11529,15 @@ fn run_and_translate(
         crate::flight::FlightStatus::Ran,
         Some(bnn_falsification_policy.flight_reason(bnn_lower_policy, cfg!(feature = "mip"))),
     );
+    // #sbench-f64-attack: the post-BaB active-set caps and the float64
+    // target-margin stage (`attack.active_set_repair_secs`,
+    // `attack.f64_target_margin_ulps`), read once from the SAME frozen,
+    // validated snapshot. Both absent — every shipped preset — resolves to
+    // `PostBabActiveSetPolicy::HISTORICAL`: the historical constants, no f64
+    // stage, no line printed.
+    let postbab_active_set_policy =
+        f64_target_attack::PostBabActiveSetPolicy::from_preset(loaded_preset);
+    postbab_active_set_policy.announce();
     // The upfront lane's admission route is a pure function of the frozen
     // preset snapshot and the source-sensitive master in the entry-time
     // LeverSet. It is resolved HERE, before the attack slice starts, because
@@ -9085,6 +11583,28 @@ fn run_and_translate(
             upfront_lower_probe_first,
         )),
     );
+    // #attack-vertex-geometry: the upfront lane's typed step geometry and
+    // corner seeds, frozen from the same preset snapshot. Both are DARK by
+    // default (absent keys = the historical lane); there is no environment
+    // spelling. Every consultation below reports them through
+    // `UpfrontAttackShapeReceipt` whenever either is armed.
+    let upfront_attack_shape =
+        attack_vertex_geometry::UpfrontAttackShape::from_snapshot(preset_snapshot.as_ref());
+    // #attack-open-disjuncts: arm the margin-row lane's certified-root
+    // publication from the same frozen snapshot, BEFORE any lane can start
+    // (the concurrent lane spawns below) and before the upfront attack, so
+    // the `phase=entry` receipt prints on every armed run even when an earlier
+    // lane decides it. Dark (keys absent, or `restrict: false`) = no call, no
+    // line. An invalid value is rejected by the preset load itself.
+    if let Some(policy) = preset_snapshot
+        .as_ref()
+        .and_then(BetaCrownPresetSnapshot::loaded)
+        .and_then(|preset| crate::preset::open_disjunct_attack_from_preset(preset).ok())
+        .flatten()
+        .filter(|policy| policy.restrict)
+    {
+        crate::commands::beta_crown::arm_open_disjunct_attack(policy);
+    }
 
     // UPFRONT ATTACK PROBE-FIRST (#upfront-probe-first,
     // `NY_UPFRONT_ATTACK_PROBE_FIRST`, DARK BY DEFAULT).
@@ -9120,10 +11640,9 @@ fn run_and_translate(
             upfront_wrapper_route,
             &upfront_attack_policy,
             UpfrontAttackConsultation::ProbeFirst,
-            traffic_terminal_softmax_peel,
-            &mut traffic_upfront_softmax_execution,
             crate::commands::lane_allocation::LaneWindow::Cap(UPFRONT_ATTACK_PROBE_CAP),
             None,
+            upfront_attack_shape,
         );
         match probe_witness {
             Some(witness) => {
@@ -9139,7 +11658,6 @@ fn run_and_translate(
                                 .to_string(),
                         ),
                     );
-                    note_traffic_upfront_softmax_execution(traffic_upfront_softmax_execution);
                     return gated;
                 }
                 crate::flight::note(
@@ -9207,10 +11725,6 @@ fn run_and_translate(
     // only one may hold a lane's cap at a time, so the scheduler wins where
     // both are armed.
     //
-    // IT ALSO STANDS DOWN UNDER THE TRAFFIC TERMINAL-SOFTMAX PEEL, on purpose:
-    // that route rewrites the objective the upfront lane steers on, so the
-    // probe below would be measuring a function that lane is not using.
-    //
     // #lane-budget-frame (`NY_LANE_BUDGET_FRAME`, DARK BY DEFAULT) is the third
     // and WEAKEST cap authority, and it stands down under both of the others.
     // Armed alone, it commits every lane to exactly the window today's own
@@ -9221,39 +11735,43 @@ fn run_and_translate(
     // branch-and-bound residual claimant instead.
     let allocator_armed = crate::commands::lane_allocation::lane_budget_allocator_armed();
     let scheduler_armed = crate::commands::lane_schedule::lane_value_scheduler_armed();
-    let lane_allocation = if crate::commands::lane_allocation::allocator_admitted(
-        allocator_armed,
-        scheduler_armed,
-        traffic_terminal_softmax_peel,
-    ) {
-        plan_attack_slice_allocation(
-            onnx,
-            vnnlib,
-            post_beta_deadline,
-            bnn_falsification_policy,
-            upfront_wrapper_route,
-            &upfront_attack_policy,
-        )
-    } else if crate::commands::lane_allocation::frame_admitted(
-        crate::commands::lane_allocation::lane_budget_frame_armed(),
-        allocator_armed,
-        scheduler_armed,
-        traffic_terminal_softmax_peel,
-    ) {
-        frame_attack_slice_allocation(
-            onnx,
-            vnnlib,
-            post_beta_deadline,
-            bnn_falsification_policy,
-            upfront_wrapper_route,
-            &upfront_attack_policy,
-        )
-    } else {
-        None
-    };
+    let lane_allocation =
+        if crate::commands::lane_allocation::allocator_admitted(allocator_armed, scheduler_armed) {
+            plan_attack_slice_allocation(
+                onnx,
+                vnnlib,
+                post_beta_deadline,
+                bnn_falsification_policy,
+                upfront_wrapper_route,
+                &upfront_attack_policy,
+            )
+        } else if crate::commands::lane_allocation::frame_admitted(
+            // #router-r2 CR-C: the acting router admits the same identity
+            // frame without its lever; unarmed this is `lever || false`, i.e.
+            // exactly the lever: bit-identical.
+            crate::commands::lane_allocation::lane_budget_frame_armed()
+                || crate::router::acting::governs_attack_slice(),
+            allocator_armed,
+            scheduler_armed,
+        ) {
+            frame_attack_slice_allocation(
+                onnx,
+                vnnlib,
+                post_beta_deadline,
+                bnn_falsification_policy,
+                upfront_wrapper_route,
+                &upfront_attack_policy,
+            )
+        } else {
+            None
+        };
     let committed_allocation = lane_allocation
         .as_ref()
         .map(CommittedAttackSlice::allocation);
+    // #router-r2 CR-C: record the committed frame's windows as the attack
+    // lanes' contracts in the one deadline authority (a no-op unless the
+    // acting router governs the attack slice).
+    crate::router::acting::commit_attack_contracts(committed_allocation);
     let sign_space_window = crate::commands::lane_allocation::lane_window(
         committed_allocation,
         crate::commands::lane_allocation::AllocatedLane::SignSpace,
@@ -9315,7 +11833,12 @@ fn run_and_translate(
             vnnlib,
             post_beta_deadline,
             bnn_falsification_policy,
-            sign_space_window,
+            // #router-r2 CR-1/CR-C: the lane is handed its cell's window at
+            // its own start (`sign_space_window` unchanged when ungoverned).
+            crate::router::acting::claim_attack_window(
+                ny_core::deadline_authority::LaneSlot::AttackSignSpace,
+                sign_space_window,
+            ),
         ),
         |witness| gate_sat_with_trusted_oracle(onnx, vnnlib, Some(witness), instance_deadline),
     ) {
@@ -9326,6 +11849,12 @@ fn run_and_translate(
         );
         return sat;
     }
+    // #router-r2 CR-H: the sign-space lane returned without a sat; hand its
+    // unspent contract to the terminal (a no-op when it was not governed).
+    crate::router::acting::release_lane(
+        ny_core::deadline_authority::LaneSlot::AttackSignSpace,
+        false,
+    );
 
     // STE-PGD FALSIFICATION LANE (#bnn-ste-pgd, `attack.bnn_ste_pgd`, override
     // `NY_BNN_STE_PGD`).
@@ -9382,7 +11911,11 @@ fn run_and_translate(
                 vnnlib,
                 post_beta_deadline,
                 bnn_falsification_policy,
-                ste_pgd_window,
+                // #router-r2 CR-1/CR-C: the cell's window at the lane's start.
+                crate::router::acting::claim_attack_window(
+                    ny_core::deadline_authority::LaneSlot::AttackStePgd,
+                    ste_pgd_window,
+                ),
             ),
             |witness| gate_sat_with_trusted_oracle(onnx, vnnlib, Some(witness), instance_deadline),
         ) {
@@ -9393,6 +11926,11 @@ fn run_and_translate(
             );
             return sat;
         }
+        // #router-r2 CR-H: undecided; hand the unspent contract on.
+        crate::router::acting::release_lane(
+            ny_core::deadline_authority::LaneSlot::AttackStePgd,
+            false,
+        );
     }
 
     // FALSIFICATION PORTFOLIO LANE (`NY_FALSIFY_PORTFOLIO`, DARK BY DEFAULT).
@@ -9444,6 +11982,34 @@ fn run_and_translate(
         return sat;
     }
 
+    // #router-r3 CR-ATK (`rule.attack_defer`): the upfront lane may DEFER the
+    // unspent part of its slice to a late sat reserve when its best margin
+    // plateaus, but only where that reserve can be honoured: the
+    // post-verifier attack is enabled, no proof tail is reserved, no
+    // concurrent margin-row worker can hold the tail, and the memory envelope
+    // admits the graph-heavy tail. Unarmed (every run without
+    // `optimizer.mode: on`) this is `None` and the predicate is never even
+    // evaluated: the lane is today's, bit for bit.
+    let upfront_defer_scope = crate::router::ostop::enter_upfront_scope(|| {
+        postbab_wrapper_route.attack_enabled()
+            && !proof_tail_reserved
+            && !(super::margin_row_bab::concurrent_lane_armed_with_policy(
+                margin_row_schedule_policy,
+            ) && margin_row_concurrent_gpu_device_premise)
+            // #router-r4 CR-L: under an armed lease the late tail must also
+            // fit the lease (a peek: nothing is reserved for a time hold);
+            // unarmed this is today's live gate, evaluated once.
+            && crate::router::lease::peek(
+                ny_core::router::lease::LeaseHolder::PostVerifierTail,
+                optional_heavy_memory_allowed_now,
+            )
+    });
+    // #router-r2 CR-1/CR-C: the upfront lane is handed its cell's window at its
+    // own start (`upfront_window` unchanged when ungoverned).
+    let upfront_window = crate::router::acting::claim_attack_window(
+        ny_core::deadline_authority::LaneSlot::AttackUpfront,
+        upfront_window,
+    );
     // A lane the allocator granted ZERO seconds is SKIPPED, not run under a
     // small cap: it is not slow on this instance, it is structurally blind, and
     // its seconds are already committed to another lane's grant or to the
@@ -9488,6 +12054,13 @@ fn run_and_translate(
             inactive_reason,
         );
         eprintln!("Upfront attack: SKIPPED — {reason}");
+        // #attack-vertex-geometry: an armed lever still reports on a skipped
+        // lane (`engaged=0 reason=not_reached`), so the skip cannot read as
+        // a measured null.
+        attack_vertex_geometry::UpfrontAttackShapeReceipt::emit_unconsulted(
+            upfront_attack_shape,
+            "lane_skipped",
+        );
         None
     } else {
         try_upfront_falsify(
@@ -9497,15 +12070,21 @@ fn run_and_translate(
             upfront_wrapper_route,
             &upfront_attack_policy,
             UpfrontAttackConsultation::Ordinary,
-            traffic_terminal_softmax_peel,
-            &mut traffic_upfront_softmax_execution,
             upfront_window,
             lane_allocation
                 .as_ref()
                 .and_then(CommittedAttackSlice::upfront_decision),
+            upfront_attack_shape,
         )
     };
-    note_traffic_upfront_softmax_execution(traffic_upfront_softmax_execution);
+    // #router-r3 CR-ATK: CLOSE the defer scope the moment the upfront lane
+    // returns — BEFORE the trusted-oracle gate below. The gate's ORT repair
+    // (`refine_witness_with_ort` -> `gradient_guided_falsify`) runs an attack
+    // restart loop on this same thread; with the scope still open it would
+    // read as the upfront lane, could DEFER the repair (losing the sat it
+    // exists to recover) and would book a defer the lane never made. `None`
+    // scope (every unarmed row) is `false`.
+    let upfront_deferred = crate::router::ostop::UpfrontDeferScope::close(upfront_defer_scope);
     if let Some(witness) = upfront_witness {
         let gated = gate_sat_with_trusted_oracle(onnx, vnnlib, Some(&witness), instance_deadline);
         if matches!(gated, VnncompResult::Sat { .. }) {
@@ -9535,6 +12114,95 @@ fn run_and_translate(
             Some("consulted; no confirmed candidate".to_string()),
         );
     }
+    // #router-r3 CR-ATK: a lane that DEFERRED releases its unspent contract to
+    // the late sat reserve (held out of the verifier below), never to the
+    // terminal; `None` scope (every unarmed row) is the R2 release below.
+    if upfront_deferred {
+        crate::router::acting::release_lane_to_reserve(
+            ny_core::deadline_authority::LaneSlot::AttackUpfront,
+        );
+    } else {
+        // #router-r2 CR-H: the upfront lane returned without a sat; hand its
+        // unspent contract to the terminal, which reads the live clock below.
+        crate::router::acting::release_lane(
+            ny_core::deadline_authority::LaneSlot::AttackUpfront,
+            false,
+        );
+    }
+    // New separately sealed dense-head route, after trusted SAT admission and
+    // before any generic root. Its complete singleton cover uses ordinary
+    // G2/Instance authorization and a genuinely run G3 over the original parse.
+    // Preparation/proposal/replay are charged by the same attack_start elapsed
+    // subtraction below; failed attempts never restart the original deadline.
+    let input_head_attempt = super::safenlp_input_head::try_input_head_with_continuation(
+        onnx,
+        vnnlib,
+        post_beta_deadline,
+        &margin_row_runtime_policy,
+    );
+    if let Some(verdict) = input_head_attempt.verdict {
+        return verdict;
+    }
+    let input_head_continuation = input_head_attempt.continuation;
+    // The original-file prepared engine shares its completed root with real
+    // conditional search. Its sealed receipt retains all source, leaf and
+    // caller resource owners through the existing final writers. The legacy
+    // policies remain frozen; unsupported demands decline before source work.
+    // #prepared-root-route: whether it runs is THE admission
+    // (`prepared_root_route::admission`), the one predicate the router
+    // registry and the admission census ask too; the route only runs on its
+    // answer.
+    let prepared_root_admission = super::prepared_root_route::admission(
+        prepared_classwise_requested,
+        &margin_row_runtime_policy,
+        &frozen_levers,
+    );
+    let prepared_root_open = if prepared_root_admission.classwise_armed() {
+        crate::flight::note(
+            "prepared_root",
+            crate::flight::FlightStatus::Skipped,
+            Some("armed original classwise policy".to_string()),
+        );
+        None
+    } else {
+        use super::prepared_root_route::PreparedRouteOutcome;
+        match super::prepared_root_route::try_prepared_root_route(
+            onnx,
+            vnnlib,
+            &margin_row_runtime_policy,
+            prepared_root_admission,
+            instance_deadline,
+            post_beta_deadline,
+        ) {
+            PreparedRouteOutcome::Proven { receipt, report } => {
+                crate::flight::note(
+                    "prepared_root",
+                    crate::flight::FlightStatus::Ran,
+                    Some(format!("{report:?}")),
+                );
+                return VnncompResult::Unsat(receipt);
+            }
+            PreparedRouteOutcome::Open { owner, report } => {
+                crate::flight::note(
+                    "prepared_root",
+                    crate::flight::FlightStatus::Ran,
+                    Some(format!("{report:?}")),
+                );
+                Some(owner)
+            }
+            PreparedRouteOutcome::Refused { report } => {
+                crate::flight::note(
+                    "prepared_root",
+                    crate::flight::FlightStatus::Skipped,
+                    Some(format!("{report:?}")),
+                );
+                None
+            }
+        }
+    };
+    // The old producer is now selected. Release the actual unfinished owner
+    // before its allocations, while all spent time remains in attack_start.
+    drop(prepared_root_open);
     // Charge the time the attack already spent against the internal verifier budget
     // so BaB still completes inside the scored deadline / watchdog window.
     let ny_timeout = ny_timeout
@@ -9560,6 +12228,18 @@ fn run_and_translate(
     if let Some(on) = super::margin_row_bab::backward_interm_from_preset(preset) {
         ny_propagate::margin_row::set_backward_interm_preset(on);
     }
+    // #clip-and-verify / #clip-stateful: the Clip-and-Verify half's ONLY
+    // competition-reachable route. It shipped env-only, so on a scored run it
+    // was unreachable BY CONSTRUCTION — `run_instance.sh` exports ZERO `NY_*`
+    // (its only `export` is `OMP_NUM_THREADS=1`; the 27 `NY_` mentions there are
+    // local shell vars, and `NY_BIN` is a developer override READ FROM the
+    // caller's environment, not set by the script). The long-repeated "exactly
+    // one" was false, and the conclusion is STRONGER for it. No shipped preset
+    // sets this key, so the line is a NO-OP on every config and the lane stays
+    // byte-identical; it makes the mechanism DELIVERABLE, it does not arm it.
+    if let Some(on) = super::margin_row_bab::clip_stateful_from_preset(preset) {
+        ny_propagate::margin_row::set_clip_stateful_preset(on);
+    }
     // #closure-adaptive: the tier ladder's ONLY competition-reachable route.
     // It shipped without this line, so the whole ladder was dead code on a
     // scored run — `run_instance.sh` exports no `NY_*`, so the env
@@ -9574,6 +12254,12 @@ fn run_and_translate(
     // the lane stays byte-identical until an A/B says otherwise.
     if let Some(on) = super::margin_row_bab::branch_reduce_max_from_preset(preset) {
         ny_propagate::margin_row::set_branch_reduce_max_preset(on);
+    }
+    // #branch-parent-lift: recover the candidate scores the expansion already
+    // paid for. No preset sets this yet, so the lane stays byte-identical; this
+    // makes the key DELIVERABLE, it does not arm it.
+    if let Some(on) = super::margin_row_bab::parent_lift_from_preset(preset) {
+        ny_propagate::margin_row::set_parent_lift_preset(on);
     }
     // #cgan-reclaim: the set's ONLY competition-reachable route. It shipped
     // env-only (`NY_CGAN_RECLAIM`), and `run_instance.sh` exports no `NY_*`, so
@@ -9606,18 +12292,29 @@ fn run_and_translate(
     // their receiver stops publication but not CPU/Rayon work. Suppress them
     // entirely under proof-tail authority so no abandoned worker can contend
     // with the fixed publication reserve.
-    let margin_row_memory_allowed = optional_heavy_memory_allowed_now();
+    // #router-r4 CR-L: the concurrent margin-row worker is the first optional
+    // heavy lane of the row; under an armed lease it obtains its lease here
+    // (returned at once below when no worker is spawned). Unarmed: today's
+    // live gate, evaluated once, bit for bit.
+    let margin_row_memory_allowed = crate::router::lease::admit(
+        ny_core::router::lease::LeaseHolder::MarginRowConcurrent,
+        optional_heavy_memory_allowed_now,
+    );
     let frozen_pgd_schedule = preset_snapshot
         .as_ref()
         .and_then(BetaCrownPresetSnapshot::loaded)
         .and_then(|preset| resolve_initial_pgd_schedule(preset).ok())
         .flatten();
     let effective_deferred_pgd_fraction = effective_deferred_pgd_fraction(preset_snapshot.as_ref());
-    let deferred_pgd_consumer_available = postbab_deferred_pgd_consumer_available(
-        postbab_wrapper_route,
-        margin_row_memory_allowed,
-        safenlp_direct_mip_first,
-    );
+    // #acc-strict-intervals: resolve the typed key from the SAME frozen
+    // snapshot, before it moves into the β-CROWN overrides. The receipt is
+    // printed only when armed, so a dark run's stderr is unchanged.
+    let nonlinear_case_split = nonlinear_case_split_from_snapshot(preset_snapshot.as_ref());
+    if nonlinear_case_split {
+        eprintln!("[nonlinear-case-split] armed=1 source=preset key=nonlinear_vnnlib.case_split");
+    }
+    let deferred_pgd_consumer_available =
+        postbab_deferred_pgd_consumer_available(postbab_wrapper_route, margin_row_memory_allowed);
     let deferred_outer_pgd_priority =
         deferred_outer_pgd_has_priority(frozen_pgd_schedule, deferred_pgd_consumer_available);
     let margin_row_schedule_outer_route = if proof_tail_reserved {
@@ -9652,6 +12349,11 @@ fn run_and_translate(
                 None,
             )
         };
+    if concurrent_lane.is_none() {
+        // #router-r4 CR-L: no worker, no working set: return its lease (a
+        // no-op when no lease is armed or none was granted).
+        crate::router::lease::release(ny_core::router::lease::LeaseHolder::MarginRowConcurrent);
+    }
     if concurrent_lane.is_some() {
         crate::flight::note(
             "margin_row_concurrent",
@@ -9732,19 +12434,57 @@ fn run_and_translate(
             optional_f64_bits_token(margin_row_schedule_policy.configured_reserve_max_frac_bits),
         );
     }
+    #[cfg(feature = "mip")]
+    let verification_resources = match preset_snapshot.as_ref() {
+        Some(BetaCrownPresetSnapshot::Loaded(config))
+            if config.bab.single_hidden_hull == Some(ny_propagate::SingleHiddenHullMode::Root) =>
+        {
+            use super::beta_crown::hull_publication::{
+                CallerVerificationResources, InstanceVerificationResources,
+            };
+            let deadline = match (beta_phase_deadline, instance_deadline) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            Some(match InstanceVerificationResources::start(deadline) {
+                Ok(owner) => CallerVerificationResources::Ready(owner),
+                Err(reason) => CallerVerificationResources::Refused(reason.to_string()),
+            })
+        }
+        _ => None,
+    };
+    let certified_root_cut_enabled = frozen_levers
+        .get(&ny_levers::decls::certified_root_cut::ROOT_CERTIFIED_CUT)
+        .as_bool();
+    let certified_root_cut_owner = ny_propagate::beta_crown::certified_root_cut::QueryOwner::new(
+        beta_solver_authority_deadline(beta_phase_deadline, solver_phase_deadline),
+        certified_root_cut_enabled,
+    );
     let mut instance_overrides = BetaCrownInstanceOverrides {
+        certified_root_cut_enabled: Some(certified_root_cut_enabled),
+        certified_root_cut_owner,
+        input_head_continuation: input_head_continuation.clone(),
+        #[cfg(feature = "mip")]
+        verification_resources,
         frozen_levers: Some(std::sync::Arc::clone(&frozen_levers)),
         pgd_exact_vjp: Some(exact_vjp_policy),
         kfsb_cert_reuse_armed: Some(kfsb_cert_reuse_armed),
         chunk_wave_parallel_enabled: Some(chunk_wave_parallel_enabled),
         root_sparse_interm_crown: reserve.enables_scored_sparse_crown(),
-        authoritative_deadline: beta_phase_deadline,
+        authoritative_deadline: beta_solver_authority_deadline(
+            beta_phase_deadline,
+            solver_phase_deadline,
+        ),
         outer_deferred_internal_deadline: None,
         post_bab_wrapper_attack_enabled: Some(deferred_pgd_consumer_available),
         preset_snapshot,
-        safenlp_direct_mip_first,
-        traffic_terminal_softmax_peel,
-        cgan_input_leaf_route,
+        // #attack-concurrent: the concurrent margin-row worker owns the
+        // concurrency whenever it exists (CR-X); read only by an armed race.
+        attack_concurrent_wrapper: Some(
+            crate::commands::beta_crown::attack_concurrent::ConcurrentAttackWrapperFacts {
+                margin_row_lane_live: concurrent_lane.is_some(),
+            },
+        ),
     };
     if instance_overrides.root_sparse_interm_crown {
         eprintln!(
@@ -9844,6 +12584,25 @@ fn run_and_translate(
         verifier_before_postbab_reserve_secs,
         ny_timeout,
     );
+    // #router-r3 CR-ATK: hold a DEFERRED upfront slice out of the verifier as
+    // the late sat reserve, through the same never-extending window rule as
+    // the configured reserve above. The verifier started that much earlier,
+    // so it keeps today's window; the post-verifier attack (seeded by the
+    // tree) spends the reserve. Zero — every row without a defer — is the
+    // identity, so this changes nothing on any other run.
+    let deferred_reserve_secs = crate::router::ostop::deferred_reserve_secs(
+        deferred_pgd_consumer_available && concurrent_lane.is_none() && !proof_tail_reserved,
+    );
+    let (ny_timeout, held_deferred_secs) =
+        postbab_reserve_window(ny_timeout, deferred_reserve_secs);
+    if deferred_reserve_secs > 0 {
+        crate::router::ostop::note_defer_held(
+            deferred_reserve_secs,
+            held_deferred_secs,
+            ny_timeout,
+        );
+    }
+    let held_postbab_reserve_secs = held_postbab_reserve_secs.saturating_add(held_deferred_secs);
     instance_overrides.outer_deferred_internal_deadline = frozen_outer_deferred_internal_deadline(
         solver_phase_deadline,
         timeout_before_fixed_reserves_secs,
@@ -9868,11 +12627,26 @@ fn run_and_translate(
     // (docs/BAB_FRONTIER_SEEDING_DESIGN.md). Gate off => nothing is ever
     // recorded and the take below returns empty.
     reset_bab_frontier_export();
+    // #smart-turn-qdq: clear the dark-lane latch so a report-only downgrade
+    // below belongs to THIS instance.
+    crate::commands::beta_crown::qdq_probe::reset_qdq_relaxation_engaged();
+    // #graph-bab-cover-ledger: arm the process capture so every cover a
+    // ledgered graph driver proves during THIS run is kept for publication.
+    ny_propagate::certify::reset_graph_cover_capture();
+    // B2.2: arm the lane proof capture — ONLY when the Proof profile switched
+    // hint capture on (under Competition this arms nothing and no lane builds
+    // a tape).
+    ny_propagate::certify::reset_lane_proof_capture();
     begin_capture();
     let beta_started = std::time::Instant::now();
     if let Some(lane) = &concurrent_lane {
         lane.mark_verifier_started();
     }
+    // #router-r2 CR-T: the internal verifier is the terminal. It claims its
+    // cell with the timeout its own rule derived and keeps it UNCHANGED (the
+    // terminal takes the remainder, never shortened); the claim records
+    // whether every hand-on credit landed inside its window.
+    let ny_timeout = crate::router::acting::claim_terminal(ny_timeout);
     let outcome = invoke_beta_crown(
         onnx,
         vnnlib,
@@ -9885,10 +12659,14 @@ fn run_and_translate(
         lane.mark_verifier_finished();
     }
     let beta_elapsed = beta_started.elapsed();
-    let captured = take_captured_json();
+    let captured = take_captured_verification();
     let terminal_ingress = take_captured_terminal_ingress();
     let captured_deadline_plan = take_captured_deadline_plan();
     end_capture();
+    // B2.2: keep the lanes' proof tapes for the Proof bundle (a no-op unless
+    // one is wired); streamed by `after_publication_receipt`.
+    super::proof_bundle::stash_lane_proofs(ny_propagate::certify::take_lane_proof_capture());
+    let graph_cover_capture = ny_propagate::certify::take_graph_cover_capture();
 
     // #phase-ledger (dark, `NY_PHASE_LEDGER=1`): the internal verifier's own
     // verdict JSON plus the wall it actually consumed against the wall it was
@@ -9912,17 +12690,21 @@ fn run_and_translate(
         );
         eprintln!(
             "[phase-ledger] verifier JSON: {}",
-            captured.as_deref().unwrap_or("<none>")
+            captured
+                .as_ref()
+                .map(|value| value.json())
+                .unwrap_or("<none>")
         );
     }
-    note_root_joint_interm_alpha_execution(captured.as_deref());
-    note_mo_kfsb_execution(captured.as_deref());
-    note_mo_alpha_step_execution(captured.as_deref());
-    *traffic_terminal_softmax_execution = TrafficTerminalSoftmaxPeelExecution::from_beta_capture(
-        traffic_terminal_softmax_peel,
-        captured.as_deref(),
-    );
-    let captured_beta_verdict = captured.is_some();
+    // The hull payload is a paid typed publication, with its own observations.
+    // Do not allocate the legacy JSON parser's workspace for this new route.
+    let legacy_json = captured
+        .as_ref()
+        .filter(|value| !value.has_hull())
+        .map(|value| value.json());
+    note_root_joint_interm_alpha_execution(legacy_json);
+    note_mo_kfsb_execution(legacy_json);
+    note_mo_alpha_step_execution(legacy_json);
     // The closest-to-violation points the internal graph-PGD search found, even
     // when they never crossed the internal violation threshold (the resister
     // class: the search burns its tier without emitting a witness while
@@ -9937,11 +12719,24 @@ fn run_and_translate(
     // empty unless NY_POSTBAB_BAB_SEEDS is exact mode 1 or 2.
     let bab_frontier_seeds = take_bab_frontier_seeds();
 
-    let captured_verifier_elapsed = captured.as_deref().and_then(parse_competition_elapsed);
+    let captured_verifier_elapsed = captured
+        .as_ref()
+        .and_then(|value| value.hull_elapsed())
+        .or_else(|| legacy_json.and_then(parse_competition_elapsed));
+    // The separate original-hull publisher retains its own replay authority;
+    // it never consumes the input-head Source partition. Only ordinary JSON
+    // can match the bridge's opaque whole-root MIP publication receipt.
+    let original_hull_capture = captured.as_ref().is_some_and(|value| value.has_hull());
+    let original_mip_capture = input_head_continuation
+        .as_ref()
+        .and(legacy_json)
+        .map(str::to_owned);
     let translated = match (outcome, captured) {
         // The verifier produced a JSON verdict — translate it. This is the normal path
         // for verified/violated/timeout/unknown.
-        (_, Some(json)) => parse_competition_json(&json).unwrap_or(VnncompResult::Unknown),
+        (_, Some(captured)) => translate_captured_verification(captured, || {
+            crate::commands::graph_cover_publish::graph_instance_unsat(vnnlib, &graph_cover_capture)
+        }),
         // No JSON verdict but the call returned Ok (verified IBP fast-path writes JSON,
         // so this is unusual): stay sound.
         (Ok(()), None) => VnncompResult::Unknown,
@@ -10007,19 +12802,49 @@ fn run_and_translate(
                     VnncompResult::Sat {
                         witness: Some(witness),
                     }
-                } else if try_nonlinear_unsat(onnx, vnnlib, ny_timeout, post_beta_deadline)
-                    == Some(true)
-                {
-                    // No counterexample found, and the whole region is refuted by
-                    // sound interval branch-and-bound.
-                    eprintln!(
-                        "#nonlinear-vnnlib: region exhaustively refuted by sound interval \
-                         branch-and-bound over the declared box — no counterexample exists"
-                    );
-                    VnncompResult::Unsat
                 } else {
-                    VnncompResult::Unknown
+                    // #acc-strict-intervals: the receipt is emitted whatever
+                    // the unsat half returns (including every early refusal),
+                    // so an armed null is distinguishable from "never engaged".
+                    let mut case_split = NonlinearCaseSplitStats::new(nonlinear_case_split);
+                    let refuted = nonlinear_float32::try_source_first(
+                        onnx,
+                        vnnlib,
+                        ny_timeout,
+                        post_beta_deadline,
+                        &mut case_split,
+                    ) == Some(true);
+                    case_split.emit();
+                    if refuted {
+                        // No counterexample found, and the whole region is
+                        // refuted by sound interval branch-and-bound.
+                        eprintln!(
+                            "#nonlinear-vnnlib: region exhaustively refuted by sound interval \
+                             branch-and-bound over the declared box — no counterexample exists"
+                        );
+                        VnncompResult::Unsat(UnsatReceipt::legacy_uncovered(
+                            LegacyUnsatAuthority::NonlinearIntervalBab,
+                        ))
+                    } else {
+                        VnncompResult::Unknown
+                    }
                 }
+            } else if crate::commands::cctsdb_subbox::cctsdb_subbox_refutes(
+                onnx,
+                vnnlib,
+                cctsdb_subbox_deadline(post_beta_deadline),
+            ) {
+                // #cctsdb-subbox: ny has NO graph for this model as one unit,
+                // but the declared box splits into two sub-boxes that each DO
+                // build after an authenticated proto rewrite. `true` here means
+                // BOTH were refuted by cell enumeration — never partial
+                // coverage — after an exhaustive per-cell ONNX-Runtime
+                // equivalence check against the ORIGINAL model. Any other
+                // outcome returned `false` and fell through to the unchanged
+                // `#graph-free-sat` behaviour below.
+                VnncompResult::Unsat(UnsatReceipt::legacy_uncovered(
+                    LegacyUnsatAuthority::CctsdbSubbox,
+                ))
             } else if graph_free_falsification_applies(onnx) {
                 // #graph-free-sat: ny has NO graph for this model, so it has no
                 // bound and cannot prove anything — but the budget is still
@@ -10037,6 +12862,52 @@ fn run_and_translate(
             }
         }
     };
+    // Source-dependent generic closure has no legacy publication authority.
+    // A complete private original-input partition must produce its own
+    // Instance token, actual G2 and original singleton G3 after fresh file,
+    // consuming-thread FP and original-deadline checks. Independent SAT stays
+    // on the ordinary trusted-oracle path below.
+    let translated = match input_head_continuation
+        .as_ref()
+        .filter(|_| !original_hull_capture)
+    {
+        Some(source) => source.settle_result(translated, original_mip_capture.as_deref()),
+        None => translated,
+    };
+    // #smart-turn-qdq REPORT-ONLY latch: a verdict computed through the dark
+    // QDQ activation-relaxation lane is a FINDING this round, not a result.
+    // The bound was printed by the probe; the verdict is withheld until the
+    // mechanism survives review and the family adjudication policy is settled.
+    let translated = if crate::commands::beta_crown::qdq_probe::qdq_relaxation_engaged()
+        && matches!(
+            translated,
+            VnncompResult::Unsat(_) | VnncompResult::Sat { .. }
+        ) {
+        eprintln!(
+            "[qdq_relax] report-only: withholding the internal verifier's {} verdict — the \
+             dark QDQ relaxation lane may not publish verdicts this round",
+            match &translated {
+                VnncompResult::Unsat(_) => "unsat",
+                _ => "sat",
+            }
+        );
+        VnncompResult::Unknown
+    } else {
+        translated
+    };
+    // #router-r2 CR-H/CR-T: the terminal returned; record what it left. Its
+    // unspent time is returned to the pool that every post-verifier lane
+    // already reads from the live clock (a no-op when it was not governed).
+    crate::router::acting::release_lane(
+        ny_core::deadline_authority::LaneSlot::Verifier,
+        matches!(
+            translated,
+            VnncompResult::Unsat(_) | VnncompResult::Sat { .. }
+        ),
+    );
+    // #router-r4 CR-L: the verifier's working set is gone; its base lease
+    // returns to the envelope the post-verifier lanes lease from.
+    crate::router::lease::release(ny_core::router::lease::LeaseHolder::Terminal);
     let mut postbab_reserve_execution = postbab_reserve_allocation.and_then(|allocation| {
         allocation.observe_verifier_deadline(
             captured_deadline_plan,
@@ -10056,40 +12927,15 @@ fn run_and_translate(
     // for a correct one, so an UNCONFIRMED `sat` is never worth the risk: if ORT does
     // not confirm the violation — or cannot be consulted at all — we downgrade to the
     // sound `unknown`.
+    // #graph-free-candidates: whether a `sat` reaches the gate below at all
+    // (read before `translated` moves), for the side file's trusted-oracle
+    // record. Pure observation.
+    let translated_is_sat = matches!(translated, VnncompResult::Sat { .. });
     let (gated, internal_witness) = match translated {
         VnncompResult::Sat { witness } => {
             let internal_witness = witness.clone();
-            let gated = if traffic_terminal_softmax_execution.applied() {
-                match witness.as_deref() {
-                    Some(witness) => match rehydrate_original_witness_outputs(onnx, witness) {
-                        Ok(original_witness) => gate_sat_with_trusted_oracle(
-                            onnx,
-                            vnnlib,
-                            Some(&original_witness),
-                            instance_deadline,
-                        ),
-                        Err(error) => {
-                            eprintln!(
-                                "Traffic terminal-Softmax peel: could not restore original-model \
-                                 witness outputs ({error}); downgrading to sound unknown"
-                            );
-                            VnncompResult::Unknown
-                        }
-                    },
-                    None => gate_sat_with_trusted_oracle(onnx, vnnlib, None, instance_deadline),
-                }
-            } else if traffic_terminal_softmax_peel
-                && captured_beta_verdict
-                && *traffic_terminal_softmax_execution
-                    == TrafficTerminalSoftmaxPeelExecution::ReceiptUnavailable
-            {
-                eprintln!(
-                    "Traffic terminal-Softmax peel: captured sat lacked a trustworthy actual-application receipt; downgrading to sound unknown"
-                );
-                VnncompResult::Unknown
-            } else {
-                gate_sat_with_trusted_oracle(onnx, vnnlib, witness.as_deref(), instance_deadline)
-            };
+            let gated =
+                gate_sat_with_trusted_oracle(onnx, vnnlib, witness.as_deref(), instance_deadline);
             // Keep the internal witness even when the gate DOWNGRADES: on the
             // ORT-divergence class (soundnessbench model_5: ny's internal forward
             // says violated, real ORT says SAFE) it is a near-miss and the best
@@ -10098,6 +12944,13 @@ fn run_and_translate(
         }
         other => (other, None),
     };
+    // #graph-free-candidates: append the gate's ruling on the graph-free lane's
+    // accepted candidate to the ARMED side file. A no-op on every dark run (no
+    // candidate is ever parked) and it cannot change `gated`.
+    graph_free_sidefile::record_trusted_oracle_outcome(
+        translated_is_sat,
+        matches!(gated, VnncompResult::Sat { .. }),
+    );
     if let VnncompResult::Sat { .. } = &gated {
         return gated;
     }
@@ -10134,7 +12987,12 @@ fn run_and_translate(
                     concurrent_margin_row_grace(post_beta_deadline, std::time::Instant::now());
                 match lane.peek(grace) {
                     super::margin_row_bab::ConcurrentLaneTake::Verdict(res) => return res,
-                    super::margin_row_bab::ConcurrentLaneTake::FinishedWithoutVerdict => {}
+                    super::margin_row_bab::ConcurrentLaneTake::FinishedWithoutVerdict => {
+                        // #router-r4 CR-L: the worker ended; its lease returns.
+                        crate::router::lease::release(
+                            ny_core::router::lease::LeaseHolder::MarginRowConcurrent,
+                        );
+                    }
                     super::margin_row_bab::ConcurrentLaneTake::StillRunning => {
                         margin_worker_still_running = true;
                         eprintln!(
@@ -10143,7 +13001,12 @@ fn run_and_translate(
                         );
                     }
                 }
-            } else if !proof_tail_reserved && optional_heavy_memory_allowed_now() {
+            } else if !proof_tail_reserved
+                && crate::router::lease::admit(
+                    ny_core::router::lease::LeaseHolder::MarginRowInline,
+                    optional_heavy_memory_allowed_now,
+                )
+            {
                 match super::margin_row_bab::try_margin_row_unsat(
                     onnx,
                     vnnlib,
@@ -10157,7 +13020,13 @@ fn run_and_translate(
                     margin_row_runtime_policy,
                 ) {
                     super::margin_row_bab::MarginRowTry::Verdict(res) => return res,
-                    super::margin_row_bab::MarginRowTry::FinishedWithoutVerdict => {}
+                    super::margin_row_bab::MarginRowTry::FinishedWithoutVerdict => {
+                        // #router-r4 CR-L: the inline worker ended; its lease
+                        // returns.
+                        crate::router::lease::release(
+                            ny_core::router::lease::LeaseHolder::MarginRowInline,
+                        );
+                    }
                     super::margin_row_bab::MarginRowTry::StillRunning => {
                         margin_worker_still_running = true;
                         eprintln!(
@@ -10171,7 +13040,12 @@ fn run_and_translate(
         if deferred_pgd_consumer_available
             && postbab_after_margin_allowed(margin_worker_still_running)
         {
-            if held_postbab_reserve_secs > 0 && !optional_heavy_memory_allowed_now() {
+            if held_postbab_reserve_secs > 0
+                && !crate::router::lease::peek(
+                    ny_core::router::lease::LeaseHolder::PostVerifierTail,
+                    optional_heavy_memory_allowed_now,
+                )
+            {
                 eprintln!(
                     "post-BaB attack reserve: {}s was held at instance start but live \
                      cgroup/RLIMIT state became unavailable or fell below the graph-tail \
@@ -10187,7 +13061,13 @@ fn run_and_translate(
                 &bab_frontier_seeds,
                 instance_deadline,
                 postbab_reserve_execution.as_mut(),
+                postbab_restart_policy,
+                point_folded_twin_policy,
+                postbab_active_set_policy,
             );
+            // #router-r4 CR-L: the tail's graph loads are dropped; its lease
+            // returns (a no-op when none was armed or granted).
+            crate::router::lease::release(ny_core::router::lease::LeaseHolder::PostVerifierTail);
             if let Some(execution) = postbab_reserve_execution.take() {
                 execution.note_terminal();
             }
@@ -10232,10 +13112,16 @@ fn run_and_translate(
         // the lane's own deadline is already `instance_deadline - 3s`.
         if !deferred_outer_pgd_priority {
             if let Some(lane) = concurrent_lane {
+                // #router-r2 CR-R: with a publish grace armed, the join waits
+                // until the lane's own publish deadline (never less than
+                // today, always leaving the write reserve); unarmed this is
+                // exactly CONCURRENT_LANE_JOIN_MARGIN.
+                let join_margin =
+                    crate::router::acting::final_join_margin(CONCURRENT_LANE_JOIN_MARGIN);
                 let grace = instance_deadline
                     .map(|d| {
                         d.saturating_duration_since(std::time::Instant::now())
-                            .saturating_sub(CONCURRENT_LANE_JOIN_MARGIN)
+                            .saturating_sub(join_margin)
                     })
                     .unwrap_or_default();
                 if !grace.is_zero() {
@@ -10254,7 +13140,7 @@ fn run_and_translate(
                         "margin-row BaB: final concurrent-lane join — waiting up to {:.1}s \
                          for the detached worker (scored deadline - {}s)",
                         grace.as_secs_f64(),
-                        CONCURRENT_LANE_JOIN_MARGIN.as_secs()
+                        join_margin.as_secs()
                     );
                     let join_started = std::time::Instant::now();
                     match lane.take(grace) {
@@ -10292,7 +13178,8 @@ fn run_and_translate(
 /// Headroom kept below the scored deadline when joining the concurrent
 /// margin-row lane at the end of the post-BaB tail: enough for the results
 /// write, and short enough that the wait cannot itself cause an overrun.
-const CONCURRENT_LANE_JOIN_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
+pub(crate) const CONCURRENT_LANE_JOIN_MARGIN: std::time::Duration =
+    std::time::Duration::from_secs(2);
 
 /// Detect an expired verifier deadline authority through arbitrary `anyhow`
 /// context without relying on rendered error text.
@@ -10497,14 +13384,24 @@ fn net_supports_attack_gradients(onnx: &Path) -> bool {
     if let Some(&hit) = guard.get(onnx) {
         return hit;
     }
-    let supported = match load_graph_network(onnx) {
-        Ok(graph) => graph.supports_attack_point_gradient(),
-        Err(_) => true,
+    // The first refused node is carried into the log line so a dead lane names
+    // the op that killed it (#ml4acopf-vjp): without it the next person has to
+    // re-derive the op census by hand before knowing what to admit.
+    let (supported, first_refusal) = match load_graph_network(onnx) {
+        Ok(graph) => (
+            graph.supports_attack_point_gradient(),
+            graph.first_attack_point_gradient_refusal(),
+        ),
+        Err(_) => (true, None),
     };
     if !supported {
+        let refused = first_refusal.map_or_else(
+            || "empty graph".to_string(),
+            |(node, layer)| format!("node '{node}' ({layer})"),
+        );
         eprintln!(
-            "Attack lanes: {} is outside the exact-gradient fragment; gradient-driven \
-             falsification is STATICALLY unavailable on this net (probed once)",
+            "Attack lanes: {} is outside the exact-gradient fragment (first refused: {refused}); \
+             gradient-driven falsification is STATICALLY unavailable on this net (probed once)",
             onnx.display()
         );
     }
@@ -10555,6 +13452,12 @@ const OPTIONAL_HEAVY_MEMORY_OVERRIDE_ENV: &str = "NY_OPTIONAL_HEAVY_UNDER_MEMORY
 /// containment contract.
 const OPTIONAL_HEAVY_MIN_HEADROOM_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
+// #router-r4 CR-L: one optional heavy lane's lease IS this measured boundary,
+// so under a cgroup the lease's floor and today's gate ask for the same bytes.
+const _: () = assert!(
+    OPTIONAL_HEAVY_MIN_HEADROOM_BYTES == ny_core::router::lease::OPTIONAL_HEAVY_LEASE_BYTES
+);
+
 /// Graph-heavy optional tails currently have no aggregate peak reservation:
 /// margin-row can overlap the verifier, and post-BaB may retain an ORT session
 /// while loading several full GraphNetworks.  A 12 GiB measured run entered the
@@ -10580,7 +13483,7 @@ fn optional_heavy_memory_allowed(
     }
 }
 
-fn optional_heavy_memory_allowed_now() -> bool {
+pub(crate) fn optional_heavy_memory_allowed_now() -> bool {
     optional_heavy_memory_allowed(
         ny_propagate::network::crown_memory::process_memory_envelope(),
         std::env::var_os(OPTIONAL_HEAVY_MEMORY_OVERRIDE_ENV).as_deref(),
@@ -10613,7 +13516,13 @@ fn postbab_after_margin_allowed(margin_worker_still_running: bool) -> bool {
 }
 
 fn postbab_graph_stage_memory_allowed(stage: &str) -> bool {
-    let allowed = optional_heavy_memory_allowed_now();
+    // #router-r4 CR-L: under an armed lease every graph-heavy stage of the
+    // tail holds the ONE tail lease (acquired by the first stage, never
+    // debited twice); unarmed this is today's live gate, evaluated once.
+    let allowed = crate::router::lease::admit(
+        ny_core::router::lease::LeaseHolder::PostVerifierTail,
+        optional_heavy_memory_allowed_now,
+    );
     if !allowed {
         println!(
             "Post-BaB attack: DECLINED before {stage} — the live cgroup/RLIMIT envelope is \
@@ -10779,26 +13688,80 @@ const ORT_ACTIVE_SET_RESTART_ITERS: usize = 32;
 const ORT_ACTIVE_SET_MIN_RESTART_BUDGET: std::time::Duration =
     std::time::Duration::from_millis(100);
 
+/// #sbench-f64-attack: the active-set phase caps. [`Self::HISTORICAL`] is the
+/// constant triple every shipped preset runs with; `attack.active_set_repair_secs`
+/// replaces it through [`Self::from_total`] (read once, in
+/// `f64_target_attack::PostBabActiveSetPolicy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OrtActiveSetCaps {
+    /// Wall cap of one seed lineage's slice.
+    per_seed: std::time::Duration,
+    /// Wall cap of the whole phase.
+    total: std::time::Duration,
+    /// Multiplier on the Newton iteration caps.
+    iteration_scale: usize,
+}
+
+impl OrtActiveSetCaps {
+    const HISTORICAL: Self = Self {
+        per_seed: ORT_ACTIVE_SET_PER_SEED_BUDGET,
+        total: ORT_ACTIVE_SET_TOTAL_BUDGET,
+        iteration_scale: 1,
+    };
+
+    /// A configured phase total: half per lineage (the historical 3 s / 6 s
+    /// ratio, so a 6 s total reproduces [`Self::HISTORICAL`] exactly) and
+    /// iteration caps scaled by `ceil(total / 6 s)`, at most 64x.
+    fn from_total(total: std::time::Duration) -> Self {
+        let ratio = total.as_secs_f64() / ORT_ACTIVE_SET_TOTAL_BUDGET.as_secs_f64();
+        let iteration_scale = if ratio.is_finite() && ratio > 1.0 {
+            (ratio.ceil() as usize).min(64)
+        } else {
+            1
+        };
+        Self {
+            per_seed: total / 2,
+            total,
+            iteration_scale,
+        }
+    }
+}
+
 /// Budget the trusted-ORT repair without regressing the historical first seed.
 /// Its old three-second opportunity is retained.  Additional wall time is
 /// admitted only when it leaves [`POSTBAB_DOWNSTREAM_RESERVE`] for the older
 /// stage-0/final lanes, and the whole active-set phase remains capped at six
 /// seconds even when all three possible seed lineages are present.
+///
+/// The scored path calls [`ort_active_set_phase_budget_with_caps`]; this
+/// HISTORICAL-caps form is the pinned reference its tests compare against.
+#[cfg_attr(not(test), allow(dead_code))]
 fn ort_active_set_phase_budget(
     remaining: std::time::Duration,
     seed_count: usize,
 ) -> std::time::Duration {
+    ort_active_set_phase_budget_with_caps(remaining, seed_count, OrtActiveSetCaps::HISTORICAL)
+}
+
+/// [`ort_active_set_phase_budget`] under explicit caps (#sbench-f64-attack);
+/// the same rule with `caps.per_seed` / `caps.total` in place of the 3 s / 6 s
+/// constants, so [`OrtActiveSetCaps::HISTORICAL`] is bit-identical.
+fn ort_active_set_phase_budget_with_caps(
+    remaining: std::time::Duration,
+    seed_count: usize,
+    caps: OrtActiveSetCaps,
+) -> std::time::Duration {
     if seed_count == 0 {
         return std::time::Duration::ZERO;
     }
-    let historical = remaining.min(ORT_ACTIVE_SET_PER_SEED_BUDGET);
+    let historical = remaining.min(caps.per_seed);
     if seed_count == 1 {
         return historical;
     }
     let extra_capacity = remaining
         .saturating_sub(historical)
         .saturating_sub(POSTBAB_DOWNSTREAM_RESERVE);
-    let extra_cap = ORT_ACTIVE_SET_TOTAL_BUDGET.saturating_sub(historical);
+    let extra_cap = caps.total.saturating_sub(historical);
     historical.saturating_add(extra_capacity.min(extra_cap))
 }
 
@@ -10807,10 +13770,29 @@ fn ort_active_set_phase_budget(
 /// the number of lineages still waiting, so each gets a fair chance; when an
 /// earlier repair finishes before its slice, the next calculation reclaims
 /// that unused wall time. The fixed phase deadline still owns the total cap.
+///
+/// The scored path calls [`ort_active_set_seed_budget_with_caps`]; this
+/// HISTORICAL-caps form is the pinned reference its tests compare against.
+#[cfg_attr(not(test), allow(dead_code))]
 fn ort_active_set_seed_budget(
     phase_remaining: std::time::Duration,
     seed_index: usize,
     seed_count: usize,
+) -> std::time::Duration {
+    ort_active_set_seed_budget_with_caps(
+        phase_remaining,
+        seed_index,
+        seed_count,
+        OrtActiveSetCaps::HISTORICAL,
+    )
+}
+
+/// [`ort_active_set_seed_budget`] under explicit caps (#sbench-f64-attack).
+fn ort_active_set_seed_budget_with_caps(
+    phase_remaining: std::time::Duration,
+    seed_index: usize,
+    seed_count: usize,
+    caps: OrtActiveSetCaps,
 ) -> std::time::Duration {
     if seed_index >= seed_count {
         return std::time::Duration::ZERO;
@@ -10821,7 +13803,7 @@ fn ort_active_set_seed_budget(
         let waiting = u32::try_from(seed_count - seed_index).unwrap_or(u32::MAX);
         phase_remaining / waiting
     };
-    available.min(ORT_ACTIVE_SET_PER_SEED_BUDGET)
+    available.min(caps.per_seed)
 }
 
 /// Cap f64 polish to both its historical 40%-of-attack share and the absolute
@@ -10944,7 +13926,23 @@ fn try_postbab_falsify(
     bab_frontier_seeds: &[BabFrontierSeed],
     instance_deadline: Option<std::time::Instant>,
     reserve_execution: Option<&mut PostBabReserveExecution>,
+    restart_policy: PostBabRestartPolicy,
+    twin_policy: attack_twin_lane::PointFoldedTwinPolicy,
+    active_set_policy: f64_target_attack::PostBabActiveSetPolicy,
 ) -> Option<String> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Attack);
+    ny_core::phase_cost::count(ny_core::phase_cost::CostCounter::AttackRuns, 1);
+    // #sbench-f64-attack: the `[f64-attack] armed=1 ...` line prints when this
+    // value drops — on EVERY return below — whenever the f64 stage is armed;
+    // disarmed (every shipped preset) it prints nothing and does nothing.
+    let mut f64_attack = f64_target_attack::F64AttackTelemetry::new(active_set_policy);
+    // HISTORICAL (the constants) unless `attack.active_set_repair_secs` is set.
+    let active_set_caps = active_set_policy.caps();
+    // #sbench-f64-maximin: the ORT phase's caps — `active_set_caps` exactly,
+    // except under `attack.f64_lift_step: lp_maximin`, where the ORT phase
+    // keeps the historical caps and the configured total funds the f64 lift.
+    let ort_phase_caps = active_set_policy.ort_phase_caps();
     // No known scored deadline => no measurable leftover budget => skip (the
     // upfront/refine lanes already cover the interactive paths).
     let scored_deadline = instance_deadline?;
@@ -10966,6 +13964,19 @@ fn try_postbab_falsify(
     if !postbab_graph_stage_memory_allowed("tail setup") {
         return None;
     }
+    // #lsnc-attack-twin: a net the exact loader left STATICALLY outside the
+    // exact-gradient fragment gets exact-gradient PGD on its point-folded ATTACK
+    // twin before the tail declines. The lane returns only an ORT-confirmed
+    // witness, which the caller re-gates; a miss falls through to the
+    // historical tail unchanged (with at most half its window spent when that
+    // tail has seeded stages of its own).
+    if twin_policy.armed && !net_supports_attack_gradients(onnx) {
+        if let Some(witness) =
+            attack_twin_lane::try_point_folded_twin_falsify(onnx, vnnlib, scored_deadline, has_seed)
+        {
+            return Some(witness);
+        }
+    }
     let executable =
         postbab_lane_has_executable_stage(has_seed, || net_supports_attack_gradients(onnx));
     if std::env::var("NY_POSTBAB_DEADLANE").ok().as_deref() != Some("0") && !executable {
@@ -10984,6 +13995,10 @@ fn try_postbab_falsify(
     // construction consumes this window rather than shifting it later.
     let (attack_deadline, budget) =
         postbab_attack_window(scored_deadline, std::time::Instant::now())?;
+    // #router-r3 CR-ATK: a held deferred upfront slice is spent HERE; the
+    // ledger records whether this budget covers it (`realized=`). A no-op on
+    // every row without a held defer.
+    crate::router::ostop::note_late_attack_start(budget);
 
     let spec = ny_onnx::vnnlib::load_vnnlib(vnnlib).ok()?;
     let (box_lo, box_hi, emit_pin) = build_search_box(&spec)?;
@@ -11124,9 +14139,13 @@ fn try_postbab_falsify(
     // checkpoints when the net supports the exact-f64 cell (None ⇒ ORT-only).
     let f64_oracle_enabled = witness_deepen_target().is_some();
     let load_f64_oracle = || {
-        (f64_oracle_enabled && optional_heavy_memory_allowed_now())
-            .then(|| F64MarginOracle::load(onnx, box_lo.len()))
-            .flatten()
+        (f64_oracle_enabled
+            && crate::router::lease::admit(
+                ny_core::router::lease::LeaseHolder::PostVerifierTail,
+                optional_heavy_memory_allowed_now,
+            ))
+        .then(|| F64MarginOracle::load(onnx, box_lo.len()))
+        .flatten()
     };
     let mut f64_oracle = load_f64_oracle();
 
@@ -11140,6 +14159,37 @@ fn try_postbab_falsify(
             "box-center"
         }
     );
+
+    // #postbab-restart-diversity reserve: at the standard ~11 s soundnessbench
+    // window the seeded descent stack is OVERSUBSCRIBED (active-set + f64-polish
+    // + one alternation round already exceed it), so a restart lane that only
+    // consumed "time left after self-termination" would receive ~0 s and read
+    // VOID at exactly the window that competes. When armed, carve the restarts'
+    // share out of the DESCENT's deadline instead — two seconds per requested
+    // restart, at most half the window — leaving the attack window itself and
+    // every deadline outside this lane untouched. Zero restarts (the default)
+    // keeps `descent_deadline == attack_deadline` and the whole lane
+    // byte-identical.
+    let restart_reserve = if restart_policy.configured_restarts > 0 {
+        POSTBAB_RESTART_MIN_SLICE
+            .saturating_mul(u32::try_from(restart_policy.configured_restarts).unwrap_or(u32::MAX))
+            .min(budget / 2)
+    } else {
+        std::time::Duration::ZERO
+    };
+    let descent_deadline = attack_deadline
+        .checked_sub(restart_reserve)
+        .unwrap_or(attack_deadline);
+    let restart_row_seed = postbab_restart_row_seed(onnx, vnnlib);
+    if restart_policy.configured_restarts > 0 {
+        println!(
+            "Post-BaB attack: restart diversity armed ({} restarts requested, reserving {:.1}s \
+             of the {:.1}s window, row seed {restart_row_seed:016x})",
+            restart_policy.configured_restarts,
+            restart_reserve.as_secs_f64(),
+            budget.as_secs_f64()
+        );
+    }
 
     // Emit helper: reject only a DEFINITE local true-f64 miss so an ORT-only
     // boundary artifact cannot abort the remaining lineages. Missing f64
@@ -11190,8 +14240,12 @@ fn try_postbab_falsify(
             );
         }
         let phase_start = std::time::Instant::now();
-        let remaining = attack_deadline.saturating_duration_since(phase_start);
-        let phase_budget = ort_active_set_phase_budget(remaining, seeds.len());
+        // #postbab-restart-diversity: the descent deadline equals the attack
+        // deadline unless restarts are armed, in which case their reserve is
+        // carved out of this and every following descent stage.
+        let remaining = descent_deadline.saturating_duration_since(phase_start);
+        let phase_budget =
+            ort_active_set_phase_budget_with_caps(remaining, seeds.len(), ort_phase_caps);
         if phase_budget >= ORT_ACTIVE_SET_MIN_SEED_BUDGET {
             // `phase_budget <= remaining`, so this cannot exceed the frozen
             // absolute attack deadline. Fail closed to that deadline on an
@@ -11202,14 +14256,15 @@ fn try_postbab_falsify(
             println!(
                 "Post-BaB active-set repair: trusted-ORT bounded Newton ({:.1}s total, {:.1}s/seed cap)",
                 phase_budget.as_secs_f64(),
-                ORT_ACTIVE_SET_PER_SEED_BUDGET.as_secs_f64()
+                ort_phase_caps.per_seed.as_secs_f64()
             );
             for seed_idx in 0..seeds.len() {
                 let now = std::time::Instant::now();
-                let seed_budget = ort_active_set_seed_budget(
+                let seed_budget = ort_active_set_seed_budget_with_caps(
                     phase_deadline.saturating_duration_since(now),
                     seed_idx,
                     seeds.len(),
+                    ort_phase_caps,
                 );
                 if seed_budget < ORT_ACTIVE_SET_MIN_SEED_BUDGET {
                     break;
@@ -11230,7 +14285,7 @@ fn try_postbab_falsify(
                     &seeds[seed_idx],
                     seed_deadline,
                     OrtActiveSetFdMode::Central,
-                    ORT_ACTIVE_SET_PRIMARY_ITERS,
+                    ORT_ACTIVE_SET_PRIMARY_ITERS * ort_phase_caps.iteration_scale,
                 );
                 if let Some(found) = outcome.as_ref().and_then(|o| o.violation.as_ref()) {
                     emit_found!(found.clone());
@@ -11263,7 +14318,7 @@ fn try_postbab_falsify(
                         &restart_seed,
                         seed_deadline,
                         OrtActiveSetFdMode::OneSided,
-                        ORT_ACTIVE_SET_RESTART_ITERS,
+                        ORT_ACTIVE_SET_RESTART_ITERS * ort_phase_caps.iteration_scale,
                     ) {
                         if let Some(found) = restarted.violation.as_ref() {
                             emit_found!(found.clone());
@@ -11302,6 +14357,206 @@ fn try_postbab_falsify(
         seeds.remove(1);
     }
 
+    // #sbench-f64-attack: float64 TARGET-MARGIN repair (DARK unless
+    // `attack.f64_target_margin_ulps` is set; every shipped preset leaves it
+    // unset, so this block is skipped and the tail is byte-identical).
+    //
+    // The ORT repair above ranks points on the f32 surface; SoundnessBench's
+    // planted regions are thinner than that surface's rounding (property_054:
+    // ORT +6.8e-8, true-f64 -1.3e-6). This stage lifts every conjunct to an
+    // EXACT-f64 margin of `ulps` f32 ULPs using the f64 twin of the batched
+    // point-VJP plan (exact residual and exact Jacobian rows), starting from
+    // the lineages the ORT repair just improved, and consults the trusted ORT
+    // forward only where the exact margin is already non-negative.
+    //
+    // SOUNDNESS: a candidate is handed on only when ORT confirms it at zero
+    // tolerance AND its exact-f64 margin is >= 0; `emit_found!` then applies
+    // the same local true-f64 precheck as every lineage above, and the caller
+    // re-runs the unchanged `gate_sat_with_trusted_oracle`. No `unsat` can come
+    // from here. Budget: the same phase rule and caps as the ORT repair
+    // (`active_set_caps`), inside the frozen descent deadline.
+    if let Some(target_ulps) = active_set_policy.f64_target_ulps() {
+        f64_attack.reach(seeds.len());
+        if seeds.is_empty() {
+            f64_attack.decline("no_seeds");
+        } else if !postbab_graph_stage_memory_allowed("f64 target-margin plan build") {
+            f64_attack.decline("memory_not_admitted");
+        } else {
+            let phase_start = std::time::Instant::now();
+            let phase_budget = ort_active_set_phase_budget_with_caps(
+                descent_deadline.saturating_duration_since(phase_start),
+                seeds.len(),
+                active_set_caps,
+            );
+            // #sbench-f64-maximin: record where the lift's wall comes from
+            // (armed `lp_maximin` only; the min-norm stage records nothing
+            // new, so its flight record is byte-identical).
+            if active_set_policy.lift_step() == crate::preset::F64LiftStep::LpMaximin {
+                f64_attack.note_lift_budget(phase_budget);
+                crate::flight::note(
+                    "f64_lift_budget",
+                    if phase_budget < f64_target_attack::MIN_PHASE_BUDGET {
+                        crate::flight::FlightStatus::Skipped
+                    } else {
+                        crate::flight::FlightStatus::Ran
+                    },
+                    Some(format!(
+                        "step=lp_maximin post_bab_window_s={:.3} descent_left_s={:.3} \
+                         ort_phase=historical_caps f64_phase_budget_s={:.3} \
+                         f64_phase_total_cap_s={:.3} f64_per_seed_cap_s={:.3} source={} \
+                         basin_hops={} lineages={}",
+                        budget.as_secs_f64(),
+                        descent_deadline
+                            .saturating_duration_since(phase_start)
+                            .as_secs_f64(),
+                        phase_budget.as_secs_f64(),
+                        active_set_caps.total.as_secs_f64(),
+                        active_set_caps.per_seed.as_secs_f64(),
+                        active_set_policy.f64_budget_source(),
+                        active_set_policy.basin_hops(),
+                        seeds.len(),
+                    )),
+                );
+            }
+            if phase_budget < f64_target_attack::MIN_PHASE_BUDGET {
+                f64_attack.decline("insufficient_budget");
+            } else {
+                let phase_deadline = phase_start
+                    .checked_add(phase_budget)
+                    .unwrap_or(attack_deadline);
+                // Reuse the graph the f64 oracle already holds; load one only
+                // when deepening left none (dropped again right after the build:
+                // the twin owns its weights).
+                let build_started = std::time::Instant::now();
+                let owned_oracle = if f64_oracle.is_some() {
+                    None
+                } else {
+                    F64MarginOracle::load(onnx, box_lo.len())
+                };
+                let plan = f64_oracle
+                    .as_ref()
+                    .or(owned_oracle.as_ref())
+                    .and_then(|oracle| oracle.reusable_for(box_lo.len()))
+                    .and_then(|(graph, declared_shape)| {
+                        f64_target_attack::build_plan(
+                            graph,
+                            declared_shape,
+                            &box_lo,
+                            &box_hi,
+                            phase_deadline,
+                        )
+                    });
+                drop(owned_oracle);
+                match plan {
+                    None => f64_attack.decline("plan_unavailable"),
+                    Some(plan) => {
+                        f64_attack.note_plan(&plan);
+                        println!(
+                            "Post-BaB f64 target-margin repair: exact-f64 {} twin ({} side \
+                             branches, {} exact maps) built in {:.2}s, {:.1}s of phase left, {} \
+                             lineages, target {} f32 ULPs",
+                            plan.kind(),
+                            plan.branch_count(),
+                            plan.exact_branch_maps(),
+                            build_started.elapsed().as_secs_f64(),
+                            phase_deadline
+                                .saturating_duration_since(std::time::Instant::now())
+                                .as_secs_f64(),
+                            seeds.len(),
+                            target_ulps
+                        );
+                        if std::time::Instant::now() >= phase_deadline {
+                            f64_attack.decline("plan_build_consumed_phase");
+                        }
+                        for seed_idx in 0..seeds.len() {
+                            let now = std::time::Instant::now();
+                            let seed_budget = ort_active_set_seed_budget_with_caps(
+                                phase_deadline.saturating_duration_since(now),
+                                seed_idx,
+                                seeds.len(),
+                                active_set_caps,
+                            );
+                            if seed_budget < ORT_ACTIVE_SET_MIN_SEED_BUDGET {
+                                break;
+                            }
+                            let seed_deadline =
+                                now.checked_add(seed_budget).unwrap_or(phase_deadline);
+                            // `min_norm` (the default) is exactly C8's
+                            // `f64_target_margin_repair` call; `lp_maximin`
+                            // runs the LP-maximin lift (#sbench-f64-maximin).
+                            let Some((outcome, lift_stats)) = f64_target_attack::f64_lift_lineage(
+                                active_set_policy,
+                                &plan,
+                                |x: &[f32]| f64_target_attack::trusted_outputs(&mut forward, x),
+                                &spec,
+                                &box_lo,
+                                &box_hi,
+                                &emit_pin,
+                                &seeds[seed_idx],
+                                target_ulps,
+                                seed_deadline,
+                                f64_target_attack::BASE_ITERS * active_set_caps.iteration_scale,
+                            ) else {
+                                f64_attack.note_seed_declined();
+                                continue;
+                            };
+                            println!(
+                                "Post-BaB f64 target-margin repair: seed {}/{} ({:.1}s slice): \
+                                 exact-f64 margin {:.3e} -> {:.3e}, target {:.3e}, trusted margin \
+                                 {:.3e}, {} iterations, {} trusted evals, {} candidates; \
+                                 stopped: {}",
+                                seed_idx + 1,
+                                seeds.len(),
+                                seed_budget.as_secs_f64(),
+                                outcome.initial_margin_f64,
+                                outcome.best_margin_f64,
+                                outcome.target_delta,
+                                outcome.best_margin_ort,
+                                outcome.newton_iters,
+                                outcome.trusted_evals,
+                                outcome.candidates,
+                                outcome.stop
+                            );
+                            f64_attack.absorb(&outcome);
+                            if let Some(lift) = lift_stats.as_ref() {
+                                f64_attack.absorb_lift(lift);
+                                println!(
+                                    "Post-BaB f64 LP-maximin lift: seed {}/{}: {} SLP iterations \
+                                     ({} accepted, {} LP solves, {} LP failures), {} hops ({} \
+                                     improved), final trust radius {:.3e}; stopped: {}",
+                                    seed_idx + 1,
+                                    seeds.len(),
+                                    lift.slp_iters,
+                                    lift.accepted,
+                                    lift.lp_solves,
+                                    lift.lp_failures,
+                                    lift.hops,
+                                    lift.hops_improved,
+                                    lift.rho_final,
+                                    lift.stop
+                                );
+                            }
+                            if let Some(found) = outcome.violation {
+                                f64_attack.note_handoff();
+                                emit_found!(found);
+                            }
+                            if let Some((guidance, margin)) = outcome.guidance {
+                                // Same hand-off as the ORT repair: a strictly
+                                // better exact point feeds every later lane.
+                                seeds[seed_idx] = guidance;
+                                println!(
+                                    "Post-BaB f64 target-margin repair: seed {} retained improved \
+                                     exact-f64 guidance (margin {margin:.3e})",
+                                    seed_idx + 1
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // The active-set lane is guidance as well as a terminal falsifier. Its
     // strictly improved trusted-ORT point should feed the same later lanes as
     // the original internal seed; all of them keep their existing acceptance
@@ -11322,11 +14577,11 @@ fn try_postbab_falsify(
     if std::env::var("NY_F64_POLISH").ok().as_deref() != Some("0") && !seeds.is_empty() {
         let phase_start = std::time::Instant::now();
         let phase_budget = f64_polish_phase_budget(
-            attack_deadline.saturating_duration_since(phase_start),
+            descent_deadline.saturating_duration_since(phase_start),
             budget,
         );
         if phase_budget >= std::time::Duration::from_secs(2) {
-            let reserved_deadline = attack_deadline
+            let reserved_deadline = descent_deadline
                 .checked_sub(POSTBAB_DOWNSTREAM_RESERVE)
                 .unwrap_or(phase_start);
             let phase_deadline = phase_start
@@ -11388,7 +14643,7 @@ fn try_postbab_falsify(
     // Acceptance is unchanged twice over: `gradient_guided_falsify` requires a
     // trusted-ORT + zero-tolerance `property_violated_f64` hit, and the caller
     // still routes the rendered witness through `gate_sat_with_trusted_oracle`.
-    let fastlane_remaining = attack_deadline.saturating_duration_since(std::time::Instant::now());
+    let fastlane_remaining = descent_deadline.saturating_duration_since(std::time::Instant::now());
     if let Some(fastlane_budget) =
         postbab_frontier_fastlane_budget(fastlane_remaining).filter(|_| !priority_seeds.is_empty())
     {
@@ -11437,6 +14692,13 @@ fn try_postbab_falsify(
     // Alternate them from the best point so far until neither improves the
     // ORT margin or the leftover budget runs out. Every candidate still passes
     // the unchanged zero-tolerance gate; fruitless rounds spend dead budget.
+    //
+    // #postbab-restart-diversity bookkeeping (pure, output-free): remember the
+    // best converged (point, margin) across the seed descents so the armed
+    // restart block below can diversify AWAY from the measured fixed point.
+    // With `attack.post_bab_restarts` at its zero default this tracking is
+    // dead state and the lane stays byte-identical.
+    let mut restart_reference: Option<(Vec<f32>, f64)> = None;
     for (seed_idx, s0) in seeds.iter().enumerate() {
         // Seeds run SEQUENTIALLY, best margin first, each with the ORIGINAL
         // full-budget legs until its natural no-improvement stop — later seeds
@@ -11444,7 +14706,7 @@ fn try_postbab_falsify(
         // an even split halved the per-seed rounds and lost the model_0 flip
         // (its jitter crosses in round 2). With one seed this is byte-identical
         // to the previous single-seed behavior.
-        let seed_deadline = attack_deadline;
+        let seed_deadline = descent_deadline;
         if seed_deadline.saturating_duration_since(std::time::Instant::now())
             < std::time::Duration::from_secs(3)
         {
@@ -11543,11 +14805,18 @@ fn try_postbab_falsify(
                 break;
             }
         }
+        if cur_margin.is_finite()
+            && restart_reference
+                .as_ref()
+                .is_none_or(|(_, margin)| cur_margin > *margin)
+        {
+            restart_reference = Some((cur, cur_margin));
+        }
     }
     if seeds.is_empty() {
         // No seed: one equality-seek pass from the box center — its global
         // minimum is the planted point regardless of the start.
-        let remaining = attack_deadline.saturating_duration_since(std::time::Instant::now());
+        let remaining = descent_deadline.saturating_duration_since(std::time::Instant::now());
         let slice = (budget / 3).min(remaining);
         if slice >= std::time::Duration::from_secs(2) {
             let (violation, best) = run_graph_stage_without_retained_oracle(
@@ -11571,7 +14840,8 @@ fn try_postbab_falsify(
                 emit_found!(found);
             }
             if let Some(s) = best {
-                let jitter_deadline = (std::time::Instant::now() + budget / 6).min(attack_deadline);
+                let jitter_deadline =
+                    (std::time::Instant::now() + budget / 6).min(descent_deadline);
                 if let Some(found) = ulp_jitter_falsify(
                     &mut forward,
                     &spec,
@@ -11587,6 +14857,146 @@ fn try_postbab_falsify(
                     emit_found!(found);
                 }
             }
+        }
+    }
+
+    // #postbab-restart-diversity (default OFF, `attack.post_bab_restarts`):
+    // the 2026-08-31 soundnessbench window probe measured the stage-0 stack
+    // CONVERGENT — bit-identical fixed points (margins to all printed digits)
+    // at 11 s and at 49.6 s windows, self-terminating "no improvement;
+    // stopping" — so window length is not the binding constraint and the open
+    // axis is basin DIVERSITY (the reference tool runs 250 restarts on that
+    // family). When armed, re-enter the same alternation up to N times from
+    // deterministically seeded diversified basins (uniform / corner /
+    // orthogonal-jitter away from the converged point, cycled), keeping the
+    // best ORT margin across restarts. Seeding derives from the row's model
+    // and property file names — never Date/random ambient state — so the
+    // verdict stays a pure function of the instance. Each restart receives an
+    // equal share of the reserve this lane carved out of the descent's
+    // deadline above (two-second floor), so the attack window itself is
+    // unchanged and the verifier grant untouched. SOUNDNESS: acceptance inside every
+    // leg is the unchanged trusted-ORT zero-tolerance check, and the caller
+    // still routes any witness through the UNCHANGED
+    // `gate_sat_with_trusted_oracle`, so this lever can only ever ADD `sat`
+    // through the existing gate.
+    if restart_policy.configured_restarts > 0 {
+        let configured = restart_policy.configured_restarts;
+        let row_seed = restart_row_seed;
+        {
+            let mut used = 0u64;
+            let mut best_margin = restart_reference
+                .as_ref()
+                .map_or(f64::NEG_INFINITY, |(_, margin)| *margin);
+            for restart_index in 0..configured {
+                let restart_start = std::time::Instant::now();
+                let remaining = attack_deadline.saturating_duration_since(restart_start);
+                if remaining < POSTBAB_RESTART_MIN_SLICE {
+                    break;
+                }
+                let restarts_left = u32::try_from(configured - restart_index).unwrap_or(u32::MAX);
+                let slice = (remaining / restarts_left)
+                    .max(POSTBAB_RESTART_MIN_SLICE)
+                    .min(remaining);
+                let restart_deadline = restart_start
+                    .checked_add(slice)
+                    .unwrap_or(attack_deadline)
+                    .min(attack_deadline);
+                let basin = PostBabRestartBasin::from_index(restart_index);
+                let mut cur = postbab_restart_basin_start(
+                    basin,
+                    &box_lo,
+                    &box_hi,
+                    restart_reference
+                        .as_ref()
+                        .map(|(point, _)| point.as_slice()),
+                    row_seed,
+                    restart_index,
+                );
+                used += 1;
+                let mut cur_margin = f64::NEG_INFINITY;
+                loop {
+                    let leg_remaining =
+                        restart_deadline.saturating_duration_since(std::time::Instant::now());
+                    if leg_remaining < POSTBAB_RESTART_MIN_LEG {
+                        break;
+                    }
+                    let jitter_deadline =
+                        (std::time::Instant::now() + leg_remaining / 2).min(restart_deadline);
+                    let outcome = ulp_jitter_falsify(
+                        &mut forward,
+                        &spec,
+                        &box_lo,
+                        &box_hi,
+                        &emit_pin,
+                        &cur,
+                        jitter_deadline,
+                        f64_oracle.as_ref(),
+                    );
+                    if let Some(found) = outcome.violation {
+                        emit_found!(found);
+                    }
+                    let mut improved = false;
+                    if let Some((jx, jm)) = outcome.best {
+                        if jm > cur_margin {
+                            cur_margin = jm;
+                            cur = jx;
+                            improved = true;
+                        }
+                    }
+                    let leg_remaining =
+                        restart_deadline.saturating_duration_since(std::time::Instant::now());
+                    if leg_remaining >= POSTBAB_RESTART_MIN_LEG {
+                        let (violation, best) = run_graph_stage_without_retained_oracle(
+                            &mut f64_oracle,
+                            || postbab_graph_stage_memory_allowed("restart Newton graph load"),
+                            || {
+                                equality_seek_falsify(
+                                    onnx,
+                                    &mut forward,
+                                    &spec,
+                                    &box_lo,
+                                    &box_hi,
+                                    &emit_pin,
+                                    Some(&cur),
+                                    leg_remaining,
+                                )
+                            },
+                            load_f64_oracle,
+                        )?;
+                        if let Some(found) = violation {
+                            emit_found!(found);
+                        }
+                        if let Some(nx) = best {
+                            if let Ok(out) = forward.run(&nx) {
+                                let out64: Vec<f64> =
+                                    out.iter().map(|&v| f32_to_f64_exact(v)).collect();
+                                let nm = property_margin(&spec, &nx, &out64);
+                                if nm > cur_margin {
+                                    cur_margin = nm;
+                                    cur = nx;
+                                    improved = true;
+                                }
+                            }
+                        }
+                    }
+                    if !improved {
+                        break;
+                    }
+                }
+                println!(
+                    "Post-BaB attack: restart {}/{configured} basin={} settled ORT margin \
+                     {cur_margin:.6e}",
+                    restart_index + 1,
+                    basin.stable_token()
+                );
+                if cur_margin > best_margin {
+                    best_margin = cur_margin;
+                }
+            }
+            println!(
+                "Post-BaB attack: restart diversity done: {used}/{configured} restarts used, \
+                 best ORT margin {best_margin:.6e}"
+            );
         }
     }
 
@@ -11621,6 +15031,125 @@ fn try_postbab_falsify(
     let output = forward.run(&found).ok()?;
     let found64 = refine_emit_view(&found, &emit_pin);
     Some(format_smtlib_witness_f64(&found64, &output))
+}
+
+/// #postbab-restart-diversity: minimum per-restart share of the leftover
+/// window; below this a restart cannot run a useful jitter+Newton pair.
+const POSTBAB_RESTART_MIN_SLICE: std::time::Duration = std::time::Duration::from_secs(2);
+/// #postbab-restart-diversity: minimum time worth spending on one leg.
+const POSTBAB_RESTART_MIN_LEG: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// #postbab-restart-diversity: the basin family a restart starts from,
+/// cycled deterministically by restart index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostBabRestartBasin {
+    /// Uniform sample of the search box.
+    Uniform,
+    /// A random corner of the search box (extreme point per axis).
+    Corner,
+    /// A large per-axis displacement away from the converged reference point
+    /// (box center absent one), clamped into the box.
+    OrthogonalJitter,
+}
+
+impl PostBabRestartBasin {
+    const fn from_index(index: u64) -> Self {
+        match index % 3 {
+            0 => Self::Uniform,
+            1 => Self::Corner,
+            _ => Self::OrthogonalJitter,
+        }
+    }
+
+    const fn stable_token(self) -> &'static str {
+        match self {
+            Self::Uniform => "uniform",
+            Self::Corner => "corner",
+            Self::OrthogonalJitter => "orthogonal-jitter",
+        }
+    }
+}
+
+/// #postbab-restart-diversity: FNV-1a 64 over the row's model and property
+/// FILE NAMES (not absolute paths, which vary by host). Deterministic across
+/// builds and runs by construction — restart seeding must never depend on
+/// Date/random ambient state, or a verdict stops being a pure function of the
+/// instance.
+fn postbab_restart_row_seed(onnx: &Path, vnnlib: &Path) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    let name_bytes = |path: &Path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    for byte in name_bytes(onnx)
+        .bytes()
+        .chain(std::iter::once(0u8))
+        .chain(name_bytes(vnnlib).bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// #postbab-restart-diversity: the deterministic start point for one restart.
+///
+/// Pure in (basin, box, reference, row_seed, restart_index) so the schedule is
+/// reproducible and testable. Every returned coordinate is inside
+/// `[box_lo, box_hi]`; degenerate axes collapse to their single value.
+fn postbab_restart_basin_start(
+    basin: PostBabRestartBasin,
+    box_lo: &[f32],
+    box_hi: &[f32],
+    reference: Option<&[f32]>,
+    row_seed: u64,
+    restart_index: u64,
+) -> Vec<f32> {
+    // xorshift state must be nonzero; golden-ratio-mix the restart index so
+    // consecutive restarts land in unrelated streams.
+    let mixed = row_seed ^ (restart_index.wrapping_add(1)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut rng = SearchRng(if mixed == 0 { 1 } else { mixed });
+    match basin {
+        PostBabRestartBasin::Uniform => box_lo
+            .iter()
+            .zip(box_hi)
+            .map(|(&lo, &hi)| rng.uniform(lo, hi))
+            .collect(),
+        PostBabRestartBasin::Corner => box_lo
+            .iter()
+            .zip(box_hi)
+            .map(|(&lo, &hi)| if rng.next_u64() & 1 == 0 { lo } else { hi })
+            .collect(),
+        PostBabRestartBasin::OrthogonalJitter => box_lo
+            .iter()
+            .zip(box_hi)
+            .enumerate()
+            .map(|(d, (&lo, &hi))| {
+                let anchor = reference
+                    .and_then(|point| point.get(d).copied())
+                    .filter(|value| value.is_finite())
+                    .unwrap_or(lo + 0.5 * (hi - lo));
+                // Displace by 25--75% of the axis range, direction from the
+                // RNG; take the mirrored step when the first leaves the box,
+                // then clamp. Far from the converged point by construction.
+                let range = f32_to_f64_exact(hi) - f32_to_f64_exact(lo);
+                let magnitude = f32_to_f64_exact(rng.uniform(0.25, 0.75)) * range;
+                let sign = if rng.next_u64() & 1 == 0 { 1.0 } else { -1.0 };
+                let anchor64 = f32_to_f64_exact(anchor);
+                let candidate = anchor64 + sign * magnitude;
+                let candidate =
+                    if candidate < f32_to_f64_exact(lo) || candidate > f32_to_f64_exact(hi) {
+                        anchor64 - sign * magnitude
+                    } else {
+                        candidate
+                    };
+                clamp_to_box(candidate as f32, lo, hi)
+            })
+            .collect(),
+    }
 }
 
 /// #bab-frontier: the APGD priority-seed list from the exported BaB frontier.
@@ -11794,6 +15323,8 @@ fn frontier_fastlane_gradient_falsify(
     instance_deadline: Option<std::time::Instant>,
     budget: std::time::Duration,
 ) -> Option<Vec<f32>> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Attack);
     let (first, rest) = frontier_fastlane_seed_partition(priority_seeds)?;
     gradient_guided_falsify(
         onnx,
@@ -12139,6 +15670,8 @@ fn ort_active_set_repair_falsify(
     fd_mode: OrtActiveSetFdMode,
     max_iters: usize,
 ) -> Option<OrtActiveSetRepairOutcome> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Attack);
     use std::time::Instant;
 
     const MAX_DIM: usize = 512;
@@ -12560,6 +16093,8 @@ fn equality_seek_falsify(
     seed: Option<&[f32]>,
     budget: std::time::Duration,
 ) -> (Option<Vec<f32>>, Option<Vec<f32>>) {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Attack);
     use std::time::Instant;
     let deadline = Instant::now() + budget;
     let dim = box_lo.len();
@@ -12591,6 +16126,9 @@ fn equality_seek_falsify(
         Ok(v) => v,
         Err(_) => return (None, None),
     };
+    // #ml4acopf-vjp: `input_shape` only shapes the graph-side VJP point below;
+    // see `GraphNetwork::attack_point_gradient_input_shape`.
+    let input_shape = graph.attack_point_gradient_input_shape(&input_shape);
     let width: Vec<f32> = box_lo
         .iter()
         .zip(box_hi)
@@ -13244,14 +16782,49 @@ fn witness_deepen_target() -> Option<f64> {
 struct F64MarginOracle {
     net: GraphNetwork,
     input_shape: Vec<usize>,
+    /// The flat input length `input_shape` was resolved against — the
+    /// `expected_len` argument of [`ny_onnx::diff::read_input_shape_maybe_gzip`].
+    /// Recorded so [`Self::reusable_for`] can refuse a consumer holding a
+    /// DIFFERENT length: that resolver falls back to a flat `[expected_len]`
+    /// whenever the declared element count disagrees, so the same model can
+    /// legitimately produce two different shapes for two different lengths.
+    dim: usize,
 }
 
 impl F64MarginOracle {
     fn load(onnx: &Path, dim: usize) -> Option<Self> {
         let (_bytes, input_shape) = ny_onnx::diff::read_input_shape_maybe_gzip(onnx, dim).ok()?;
         let net = load_graph_network(onnx).ok()?;
-        net.supports_ibp_f64_cell()
-            .then_some(Self { net, input_shape })
+        net.supports_ibp_f64_cell().then_some(Self {
+            net,
+            input_shape,
+            dim,
+        })
+    }
+
+    /// The graph and declared input shape this oracle ALREADY loaded, offered
+    /// to a consumer that resolves the SAME model at the SAME flat input
+    /// length (#witness-deepen-gate-reuse).
+    ///
+    /// BIT-IDENTICAL to a second load, on three checked facts:
+    ///
+    /// * `load_graph_network` is a pure function of the model file (parse ->
+    ///   `to_graph_network_with_options` with fixed options), and this type has
+    ///   no `&mut self` method and no field assigned after construction, so the
+    ///   pair handed out is the pair `load` built;
+    /// * the only consumer of the pair is `propagate_ibp_f64_cell`, which takes
+    ///   `&self` and reads STRUCTURE alone — `output_ancestors` (a fresh DFS
+    ///   into a membership set), `exec_order`, and `node` — building its value
+    ///   cache per call. It never touches `GraphNetwork`'s bound caches;
+    /// * `exec_order`'s `OnceLock` memoizes `compute_topological_sort`, which
+    ///   sorts the node keys before its DFS precisely so the order does not
+    ///   depend on hash iteration, so a warmed graph and a cold one yield the
+    ///   same order and therefore the same walk.
+    ///
+    /// `None` on a length mismatch, so the caller re-derives both exactly as it
+    /// would have with no oracle in hand.
+    fn reusable_for(&self, dim: usize) -> Option<(&GraphNetwork, &[usize])> {
+        (self.dim == dim).then_some((&self.net, self.input_shape.as_slice()))
     }
 
     /// WORST-case (guaranteed) f64 property margin at the f32 point `x` — the
@@ -13318,6 +16891,8 @@ fn ulp_jitter_falsify(
     deadline: std::time::Instant,
     f64_oracle: Option<&F64MarginOracle>,
 ) -> JitterOutcome {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Attack);
     let dim = box_lo.len();
     if seed.len() != dim {
         return JitterOutcome::unavailable();
@@ -13647,6 +17222,41 @@ const WITNESS_DEEPEN_WALL_CAP: std::time::Duration = std::time::Duration::from_s
 
 /// Margin-measure + safety window reserved below the scored deadline before a
 /// deepening pass may start.
+///
+/// This covers everything [`deepen_accepted_witness`] still has to do AFTER
+/// [`ulp_jitter_falsify`] returns at its own deadline, and an answer produced
+/// after the scored budget does not score (the `run_instance.sh` OS backstop
+/// sits at budget + 10 s and is NOT usable headroom), so it is sized against
+/// the covered work rather than trimmed:
+///
+/// 1. one bundled-ORT forward at the deepened point — the session is already
+///    committed and warm;
+/// 2. rendering the witness text;
+/// 3. [`confirm_violation_with_ort`], which re-reads and re-decodes the model
+///    PROTOBUF on every call (`OrtForward::from_path` ->
+///    `read_input_shapes_maybe_gzip`; #ort-session-once caches the committed
+///    session, not the byte read), re-parses the property through the
+///    #vnnlib-parse-once memo, and runs ORT once;
+/// 4. the terminal true-f64 gate: one `propagate_ibp_f64_cell` walk, recorded
+///    at 50-200 ms on [`F64MarginOracle`];
+/// 5. #witness-exec-match: [`organizer_exec_matched_witness`], one more
+///    protobuf read plus one ORT forward on the text that is actually
+///    published — and, ONLY when the witness's `Y_j` block misses the
+///    reference run, a repair that costs a second
+///    [`confirm_violation_with_ort`] and a second true-f64 walk. This item was
+///    added after the reserve was sized, so the reserve now covers strictly
+///    more work than it was measured against. That is a SCORING risk (an
+///    upheld `sat` arriving past the watchdog scores 0 instead of +10), never a
+///    soundness one, and it is the direction the exec-match gate exists to buy:
+///    a witness the organizer re-runs and rejects is worth less than a witness
+///    that arrives a few hundred milliseconds later.
+///
+/// It no longer has to cover a `load_graph_network` — a full ONNX parse, shape
+/// inference and graph conversion of the SAME model this call already loaded
+/// for its f64 oracle (#witness-deepen-gate-reuse). The protobuf read in (3) is
+/// the remaining item with no bound in this file, which is why the window
+/// itself is unchanged: removing the redundant load buys margin inside the
+/// reserve, not a smaller reserve.
 const WITNESS_DEEPEN_SAFETY: std::time::Duration = std::time::Duration::from_millis(2500);
 
 /// #witness-deepen: strengthen an ACCEPTED `sat` witness before emission.
@@ -13718,8 +17328,14 @@ fn deepen_accepted_witness(
     }
     // The deepened witness must INDEPENDENTLY re-pass the identical gates the
     // accepted witness passed; anything less keeps the original.
+    //
+    // #witness-deepen-gate-reuse: the gate walks the SAME graph `f64_oracle`
+    // already holds for this `onnx`, so hand it over rather than let the gate
+    // load the model a second time inside `WITNESS_DEEPEN_SAFETY`. Bit-identical
+    // (see [`F64MarginOracle::reusable_for`]); a `None` oracle, or a witness
+    // whose flat length differs from the search box, keeps the loading path.
     (confirm_violation_with_ort(onnx, vnnlib, Some(&text)).unwrap_or(false)
-        && !f64_forward_rejects_witness(onnx, spec, &text))
+        && !f64_forward_rejects_witness_reusing(onnx, spec, &text, f64_oracle.as_ref()))
     .then(|| {
         println!(
             "Witness deepen: deepened witness re-passed ORT + true-f64 gates; emitting it \
@@ -13729,10 +17345,49 @@ fn deepen_accepted_witness(
     })
 }
 
+/// Engagement counters for #witness-deepen-gate-reuse, incremented by
+/// [`f64_forward_rejects_witness_reusing`]: how many times the terminal
+/// true-f64 gate walked a graph a caller had ALREADY loaded, and how many times
+/// it had to load one itself. Written on the shipped path; read only by the
+/// reuse pin below, which asserts the shipped call site takes the fast lane.
+static F64_GATE_GRAPH_REUSES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static F64_GATE_GRAPH_LOADS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// `(reuses, loads)` observed so far by the terminal true-f64 gate.
+#[cfg(test)]
+fn f64_gate_graph_counters() -> (usize, usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        F64_GATE_GRAPH_REUSES.load(Relaxed),
+        F64_GATE_GRAPH_LOADS.load(Relaxed),
+    )
+}
+
 fn f64_forward_rejects_witness(
     onnx: &Path,
     spec: &ny_onnx::vnnlib::VnnLibSpec,
     witness: &str,
+) -> bool {
+    f64_forward_rejects_witness_reusing(onnx, spec, witness, None)
+}
+
+/// As [`f64_forward_rejects_witness`], but able to walk a graph the caller has
+/// ALREADY loaded for the same `onnx` (#witness-deepen-gate-reuse).
+///
+/// The gate's decision is UNCHANGED: `loaded` only supplies the `GraphNetwork`
+/// and declared input shape that the `None` path would otherwise re-derive from
+/// the same file, and [`F64MarginOracle::reusable_for`] refuses the pair unless
+/// it was resolved at this witness's flat input length — the one input
+/// `read_input_shape_maybe_gzip` reads besides the file itself. Every
+/// subsequent step, including the `supports_ibp_f64_cell` check, is identical
+/// on both paths.
+fn f64_forward_rejects_witness_reusing(
+    onnx: &Path,
+    spec: &ny_onnx::vnnlib::VnnLibSpec,
+    witness: &str,
+    loaded: Option<&F64MarginOracle>,
 ) -> bool {
     let f64_says_not_violated = || -> Option<bool> {
         // #witness-f64-membership: parse the DECLARED decimals as f64 — the
@@ -13742,13 +17397,37 @@ fn f64_forward_rejects_witness(
         // inside `property_violation_possible_f64` wrongly rejected genuine
         // violations (collins_rul_cnn_2022).
         let input_f64 = parse_witness_inputs_f64(witness).ok()?;
-        let (_bytes, input_shape) =
-            ny_onnx::diff::read_input_shape_maybe_gzip(onnx, input_f64.len()).ok()?;
-        let net = load_graph_network(onnx).ok()?;
+        let reused = loaded.and_then(|oracle| oracle.reusable_for(input_f64.len()));
+        // Same order as the historical path (shape read, then graph build), and
+        // still owned for the whole walk, so the fallback's failure modes and
+        // memory profile are byte-for-byte what they were.
+        let mut owned: Option<(GraphNetwork, Vec<usize>)> = None;
+        if reused.is_none() {
+            let (_bytes, input_shape) =
+                ny_onnx::diff::read_input_shape_maybe_gzip(onnx, input_f64.len()).ok()?;
+            owned = Some((load_graph_network(onnx).ok()?, input_shape));
+        }
+        let (net, input_shape): (&GraphNetwork, &[usize]) = match (reused, owned.as_ref()) {
+            (Some(pair), _) => {
+                F64_GATE_GRAPH_REUSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                println!(
+                    "True-f64 gate: walking the graph this instance already loaded \
+                     (no second ONNX load inside the deepening reserve)"
+                );
+                pair
+            }
+            (None, Some((net, shape))) => {
+                F64_GATE_GRAPH_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                (net, shape.as_slice())
+            }
+            // `owned` is populated on exactly the branch where `reused` is None,
+            // and a failed load has already returned above.
+            (None, None) => return None,
+        };
         if !net.supports_ibp_f64_cell() {
             return None; // f64 cell unavailable for this net -> do not downgrade
         }
-        let input_arr = ArrayD::from_shape_vec(IxDyn(&input_shape), input_f64.clone()).ok()?;
+        let input_arr = ArrayD::from_shape_vec(IxDyn(input_shape), input_f64.clone()).ok()?;
         let point = ny_propagate::Interval64::point(input_arr);
         let out = net.propagate_ibp_f64_cell(&point).ok()?;
         // Point input => tight [lower, upper] ENCLOSURE of the true f64 output.
@@ -13788,6 +17467,112 @@ fn f64_forward_rejects_witness(
     f64_says_not_violated().unwrap_or(false)
 }
 
+/// The organizer's exec-match tolerance on a PUBLISHED counterexample's `Y_j`
+/// block: the witness is rejected when
+/// `max_j |Y_ort - Y_file| / max_j |Y_file| > 1e-3`
+/// (`SCORING-ZERO-TOL/counterexamples.py` plus `settings.py:68`).
+///
+/// Same constant and same shape as `beta_crown::output::ort_confirmed_output`,
+/// which is the in-tree implementation of this gate for the STANDALONE `--json`
+/// surface. This is deliberately a mirror, not a second scheme.
+const COUNTEREXAMPLE_EXEC_MATCH_RTOL: f64 = 1e-3;
+
+/// Outcome of running the organizer's exec-match gate over an ACCEPTED witness
+/// (#witness-exec-match).
+enum ExecMatchedWitness {
+    /// The witness's own `Y_j` block already reproduces the reference runtime
+    /// within the organizer's tolerance. Publish the text byte for byte.
+    AsWritten,
+    /// It does not. `text` re-renders the SAME input decimals with the reference
+    /// runtime's own outputs; `detail` says what was wrong. The caller must
+    /// re-pass both acceptance gates on `text` before publishing it.
+    Repaired { text: String, detail: String },
+}
+
+/// Run the organizer's exec-match (`Y`-vs-ONNX-Runtime) check on a witness that
+/// has already passed the trusted-oracle property gate (#witness-exec-match).
+///
+/// WHY THE PROPERTY GATE IS NOT ENOUGH. `confirm_violation_with_ort` evaluates
+/// the property at ORT's outputs and then DISCARDS them, emitting the witness
+/// text verbatim. On the ordinary competition path that text's `Y_j` lines are
+/// ny's INTERNAL forward (`beta_crown::output::counterexample_vnnlib` renders
+/// `output_in_original_coordinates` of ny's own evaluation). The organizer never
+/// reads our property verdict; it re-executes the model and compares its own
+/// outputs against the published ones first. So a row can hold a genuine
+/// violation and still have its counterexample thrown out for a `Y` we never
+/// checked. The internal-vs-ORT divergence this guards against is measured and
+/// real — see `log_internal_vs_ort_divergence`, which reports exactly this
+/// quantity but is explicitly informational and runs only on REJECTED witnesses.
+///
+/// TOLERANCE. The relative test is written as `diff <= RTOL * scale` with
+/// `scale = max_j |Y_file|`. When `scale` is zero that demands exact equality,
+/// which is STRICTER than the reference's `scale >= 1e-6` bypass. Being stricter
+/// is free here and nowhere else: the consequence of a mismatch is a repair
+/// rendered from ORT's own outputs, not a lost verdict, so erring toward
+/// "repair" costs one already-warm ORT forward and removes a class of witnesses
+/// whose acceptance would rest on a degenerate scale.
+///
+/// `Err` means the check could not be RUN (unparseable inputs, or a session /
+/// inference failure). It must never read as a match: the caller fails closed to
+/// the sound `unknown`.
+fn organizer_exec_matched_witness(onnx: &Path, witness: &str) -> Result<ExecMatchedWitness> {
+    let input_f64 = parse_witness_inputs_f64(witness)?;
+    // Same split as the organizer and as `confirm_violation_with_ort`: the f64
+    // decimals drive membership and the published text, the f32 cast drives the
+    // forward. The session comes from the process-global cache (#ort-session-once).
+    let input_f32: Vec<f32> = input_f64.iter().map(|&v| v as f32).collect();
+    let mut forward = ny_onnx::diff::OrtForward::from_path(onnx, input_f32.len()).map_err(|e| {
+        anyhow!(
+            "building the exec-match ONNX Runtime session from {}: {e}",
+            onnx.display()
+        )
+    })?;
+    let produced = forward
+        .run(&input_f32)
+        .map_err(|e| anyhow!("exec-match ONNX Runtime inference failed: {e}"))?;
+    if produced.is_empty() {
+        anyhow::bail!("exec-match ONNX Runtime forward returned no outputs");
+    }
+    // The repair re-emits `input_f64` UNCHANGED, so every input-only decision
+    // (box membership, `property_violated_f64`, the true-f64 enclosure gate)
+    // reads exactly the values it read before.
+    let repair = |detail: String| ExecMatchedWitness::Repaired {
+        text: format_smtlib_witness_f64(&input_f64, &produced),
+        detail,
+    };
+    let Some(claimed) = parse_witness_outputs(witness) else {
+        return Ok(repair(
+            "the witness carries no contiguous Y_j block".to_string(),
+        ));
+    };
+    if claimed.len() != produced.len() {
+        return Ok(repair(format!(
+            "the witness declares {} Y_j values, the model produces {}",
+            claimed.len(),
+            produced.len()
+        )));
+    }
+    let produced64: Vec<f64> = produced.iter().map(|&v| f32_to_f64_exact(v)).collect();
+    if !claimed.iter().all(|v| v.is_finite()) || !produced64.iter().all(|v| v.is_finite()) {
+        return Ok(repair(
+            "the witness or the reference-runtime output is not finite".to_string(),
+        ));
+    }
+    let scale = claimed.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let diff = produced64
+        .iter()
+        .zip(claimed.iter())
+        .fold(0.0_f64, |acc, (&p, &c)| acc.max((p - c).abs()));
+    if diff <= COUNTEREXAMPLE_EXEC_MATCH_RTOL * scale {
+        return Ok(ExecMatchedWitness::AsWritten);
+    }
+    let rtol = COUNTEREXAMPLE_EXEC_MATCH_RTOL;
+    Ok(repair(format!(
+        "max|Y_ort - Y_file| = {diff:.6e} against scale {scale:.6e}, over the organizer's \
+         {rtol:.0e} relative tolerance"
+    )))
+}
+
 /// Confirm an internal `sat` against the trusted ONNX-Runtime oracle.
 ///
 /// Returns the original `Sat` ONLY if a real ORT forward on the witness input
@@ -13806,6 +17591,14 @@ fn gate_sat_with_trusted_oracle(
     witness: Option<&str>,
     instance_deadline: Option<std::time::Instant>,
 ) -> VnncompResult {
+    // #sat-precedence: this whole function is the interval in which a candidate
+    // counterexample can become a CONFIRMED one, so hold the adjudication marker
+    // across all of it. While it is held the margin-row lane's early exit is
+    // refused, which removes the window in which a lane `unsat` could be
+    // published microseconds before this gate upholds a `sat` for the same row.
+    // Deferring costs the lane only its early-exit latency: its verdict still
+    // travels down the channel and is published at the ordinary join.
+    let _adjudication = enter_sat_adjudication();
     let downgrade = |reason: String| -> VnncompResult {
         eprintln!(
             "Trusted-oracle gate: internal sat NOT confirmed by ONNX Runtime ({reason}); \
@@ -13857,12 +17650,85 @@ fn gate_sat_with_trusted_oracle(
     // scored budget strengthening it; the deepened witness replaces the
     // accepted one ONLY after re-passing the identical gates, else the
     // accepted witness is emitted unchanged (a sat is never lost).
+    //
+    // #witness-exec-match — THE SECOND DEFECT THIS FUNNEL CLOSES. Every witness
+    // that arrives here has had its PROPERTY validated at ONNX Runtime's
+    // outputs by `confirm_violation_with_ort`. That is not the same as having
+    // validated the `Y_j` block the witness PUBLISHES: on the ordinary path
+    // those decimals are ny's own internal forward, straight out of
+    // `beta_crown::output::counterexample_vnnlib`. The organizer re-executes the
+    // model itself and REJECTS a counterexample whose published `Y` misses its
+    // own run by more than `COUNTEREXAMPLE_EXEC_MATCH_RTOL`, so an unvalidated
+    // `Y` is the one axis on which we are LOOSER than the organizer — and it is
+    // the axis that scores a rejection rather than +10.
+    //
+    // The standalone `--json` surface has enforced this since
+    // `beta_crown::output::ort_confirmed_output` landed, but it runs only under
+    // `if !is_capturing()`, and the scored `ny vnncomp v1` path is capturing by
+    // construction (`begin_capture` wraps `invoke_beta_crown`). So the gate was
+    // absent from exactly the path that is scored. It now runs here, on the
+    // witness text that is actually published, AFTER deepening.
+    //
+    // A mismatch is REPAIRED rather than refused: re-rendering `Y` from the same
+    // ORT forward the organizer will run costs nothing and cannot change the
+    // property decision, because the repair re-emits the identical input
+    // decimals (`f64` `Display` is the shortest round-tripping decimal, so
+    // `parse_witness_inputs_f64` recovers the same values bit for bit) and both
+    // acceptance gates read the inputs only. The repair is then re-run through
+    // BOTH gates anyway, and anything short of a clean pass FAILS CLOSED to the
+    // sound `unknown` — an unverifiable `sat` is never worth the risk.
     let uphold_sat = |w: String| -> VnncompResult {
+        // #sat-precedence: reaching here means ONNX Runtime reproduced the
+        // violation at this witness and the true-f64 enclosure re-check did not
+        // refute it — all four call sites of this closure sit behind exactly
+        // those two conditions. So this instance holds a constructive,
+        // reference-runtime-checked counterexample. Latch it BEFORE the
+        // publication work below, so that
+        // even a downgrade caused by an unverifiable `Y` block still bars every
+        // lane from publishing a contradicting `unsat`: the outward choice there
+        // is the 0-point `unknown`, not a bound-based verdict we have positive
+        // evidence against.
+        note_confirmed_sat();
         let witness =
             deepen_accepted_witness(onnx, vnnlib, spec_f64.as_ref(), &w, instance_deadline)
                 .unwrap_or(w);
+        // Bound to a `let` first: a `&witness` borrow written directly into a
+        // match scrutinee lives to the end of the match, which would forbid
+        // moving `witness` out in the `AsWritten` arm.
+        let exec_match = organizer_exec_matched_witness(onnx, &witness);
+        let publishable = match exec_match {
+            Ok(ExecMatchedWitness::AsWritten) => witness,
+            Ok(ExecMatchedWitness::Repaired { text, detail }) => {
+                eprintln!(
+                    "Exec-match gate: the accepted witness's Y_j block does NOT reproduce the \
+                     reference runtime ({detail}); re-rendering Y from the ORT forward and \
+                     re-running both acceptance gates on the result"
+                );
+                if !(confirm_violation_with_ort(onnx, vnnlib, Some(&text)).unwrap_or(false)
+                    && f64_keeps(&text))
+                {
+                    return downgrade(
+                        "the witness Y_j block would fail the organizer's exec-match check and \
+                         the ORT-rendered repair does not re-pass the acceptance gates"
+                            .into(),
+                    );
+                }
+                println!(
+                    "Exec-match gate: ORT-rendered witness re-passes ORT + true-f64 (sat upheld \
+                     with the reference runtime's own Y)"
+                );
+                text
+            }
+            Err(error) => {
+                return downgrade(format!(
+                    "the organizer's exec-match (Y-vs-ORT) check could not be RUN ({error}); \
+                     refusing to publish a counterexample we cannot validate the way the \
+                     organizer will"
+                ));
+            }
+        };
         VnncompResult::Sat {
-            witness: Some(witness),
+            witness: Some(publishable),
         }
     };
     match confirm_violation_with_ort(onnx, vnnlib, witness) {
@@ -13887,12 +17753,19 @@ fn gate_sat_with_trusted_oracle(
                 );
                 uphold_sat(w.to_string())
             }
-            None => {
-                println!(
-                    "Trusted-oracle gate: ONNX Runtime confirms the counterexample (sat upheld)"
-                );
-                VnncompResult::Sat { witness: None }
-            }
+            // UNREACHABLE, and now fails closed rather than relying on that.
+            // `confirm_violation_with_ort` opens with
+            // `witness.ok_or_else(...)?`, so `Ok(true)` implies `witness` was
+            // `Some`; there is exactly one definition of that function in the
+            // tree. A witness-less `sat` could not be exec-matched at all — the
+            // organizer has nothing to re-execute — so if this arm ever becomes
+            // reachable it must publish the sound `unknown`, not an
+            // uncheckable `sat`.
+            None => downgrade(
+                "ONNX Runtime reported a violation for a sat that carries no witness, so \
+                 there is no counterexample for the organizer to re-execute"
+                    .into(),
+            ),
         },
         // ny's own witness is a BOUNDARY point that ORT scores as SAFE at zero-tol. A
         // genuine violation often sits just inside the box near it; run a bounded
@@ -14205,6 +18078,19 @@ fn is_low_dim_common_rhs_relational_conjunction(spec: &ny_onnx::vnnlib::VnnLibSp
 /// Keeping the reason typed matters for scheduling: existing automatic
 /// multi-clause disjunctions retain their tighter wall cap even in a preset
 /// that also opts into relational conjunctions.
+///
+/// #ml4acopf-upfront-single: the same holds under the TYPED force
+/// (`attack.upfront_attack: true`). That key exists to WIDEN admission to the
+/// single-clause shapes the automatic rule skips (safenlp's `Y_0 <= Y_1`,
+/// ml4acopf's `Y_2382 >= 0.99` thermal-limit threshold); it must not also
+/// un-clamp the multi-clause disjunctions the automatic rule already admits,
+/// or arming a category for its single-clause rows silently moves every one
+/// of its multi-clause rows from the automatic cap to the ordinary cap. So a
+/// multi-clause disjunction under the preset force keeps
+/// [`UpfrontAttackAdmission::AutoDisjunction`] (same budget class, same loss
+/// ensemble, byte-identical to the unarmed category). The ENVIRONMENT force
+/// (`NY_UPFRONT_ATTACK=1`, a developer override no scored run exports) keeps
+/// its historical "force everything under the ordinary cap" meaning.
 fn upfront_attack_admission(
     spec: &ny_onnx::vnnlib::VnnLibSpec,
     wrapper_route: UpfrontWrapperRoute,
@@ -14212,15 +18098,90 @@ fn upfront_attack_admission(
     if !wrapper_route.attack_enabled() {
         return None;
     }
+    let multi_clause_disjunction = spec.is_disjunction && spec.output_constraint_clauses.len() > 1;
+    if multi_clause_disjunction && matches!(wrapper_route, UpfrontWrapperRoute::ForcedByPreset) {
+        return Some(UpfrontAttackAdmission::AutoDisjunction);
+    }
     if wrapper_route.forced() {
         return Some(UpfrontAttackAdmission::Forced);
     }
-    if spec.is_disjunction && spec.output_constraint_clauses.len() > 1 {
+    if multi_clause_disjunction {
         return Some(UpfrontAttackAdmission::AutoDisjunction);
     }
     (wrapper_route.preset_relational_conjunction()
         && is_low_dim_common_rhs_relational_conjunction(spec))
     .then_some(UpfrontAttackAdmission::PresetRelationalConjunction)
+}
+
+/// Whether the WHOLE property is one constant threshold on one output
+/// (`Y_i >= c`, `Y_i > c`, `Y_i <= c` or `Y_i < c`) — ml4acopf's prop2
+/// `(assert (>= Y_2382 0.99))` shape.
+///
+/// Exactly one constraint in total: a single clause holding a single constant
+/// comparison (or, for a programmatically built spec with no clause list, a
+/// flat list of one). Dual-network properties are excluded. This decides only
+/// the NON-certified ascent direction (see [`upfront_attack_loss_schedule`]);
+/// acceptance is the unchanged ORT + zero-tolerance predicate.
+fn is_single_output_threshold_objective(spec: &ny_onnx::vnnlib::VnnLibSpec) -> bool {
+    use ny_onnx::vnnlib::OutputConstraint as OC;
+
+    if spec.dual_network.is_some() {
+        return false;
+    }
+    let only = match spec.output_constraint_clauses.as_slice() {
+        [] => match spec.output_constraints.as_slice() {
+            [only] => only,
+            _ => return false,
+        },
+        [clause] => match clause.as_slice() {
+            [only] => only,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    matches!(
+        only,
+        OC::LessEqConst(..)
+            | OC::GreaterEqConst(..)
+            | OC::LessThanConst(..)
+            | OC::GreaterThanConst(..)
+    )
+}
+
+/// Loss schedule for the upfront lane's exact-gradient restarts
+/// (#ml4acopf-upfront-single).
+///
+/// DLR is ill-posed on a single-output constant threshold. Its denominator
+/// `D = z_π1 − z_π3` is the spread between the largest and 3rd-largest of ALL
+/// outputs (3804 of them on 300_ieee, none of which the property reads).
+/// [`dlr_grad_row`] is the EXACT gradient of `margin / D` (its correction uses
+/// `margin`, whose gradient is `m` whatever the constant offset), so the defect
+/// is the objective, not the arithmetic: with `margin < 0` the loss rises
+/// toward 0 just as well by WIDENING `D` as by moving the constrained output.
+/// The π1/π3 entries carry weight `|margin| / D²` against the constrained
+/// output's `1 / D`, a ratio of `|margin| / D`, so whenever `|margin|` is large
+/// against that spread — measured `margin ≈ −9.8e3` at the box centre of
+/// 300_ieee prop2 — the DLR restarts ascend `Y_π1 − Y_π3`, two outputs the
+/// property never mentions. alpha-beta-CROWN's ml4acopf attack (50 restarts,
+/// `pgd_order: before`) uses the hinge `C·y − rhs` instead, which below the
+/// threshold IS this lane's raw margin. A FORCED admission of that shape
+/// (the typed `attack.upfront_attack: true` force AND the developer
+/// `NY_UPFRONT_ATTACK=1` override alike) therefore ascends the margin on every
+/// restart; every other admission keeps the historical ensemble byte-for-byte
+/// (AutoDisjunction and the relational route never admit a single constant
+/// threshold, and `gradient_guided_falsify`'s other callers pass the ensemble
+/// explicitly).
+fn upfront_attack_loss_schedule(
+    spec: &ny_onnx::vnnlib::VnnLibSpec,
+    admission: UpfrontAttackAdmission,
+) -> AttackLossSchedule {
+    if matches!(admission, UpfrontAttackAdmission::Forced)
+        && is_single_output_threshold_objective(spec)
+    {
+        AttackLossSchedule::MarginOnly
+    } else {
+        AttackLossSchedule::MarginDlrEnsemble
+    }
 }
 
 /// The cap TODAY'S rules would give the upfront lane, computed WITHOUT running it.
@@ -14345,7 +18306,7 @@ fn probe_flat_objective_tier(onnx: &Path, vnnlib: &Path) -> bool {
 ///
 /// * `steers_on_a_surrogate_objective` — [`net_is_sign_network`], the exact
 ///   predicate `try_upfront_falsify` and
-///   `gradient_guided_falsify_with_traffic_objective` use to switch the ascent
+///   `gradient_guided_falsify_with_schedule` use to switch the ascent
 ///   direction to the smooth-`Sign`/STE surrogate, plus
 ///   [`pre_softmax_attack_objective_armed`], which rewrites the objective on the
 ///   general route.
@@ -15065,6 +19026,8 @@ fn low_dim_relational_face_grid_falsify(
     emit_pin: &[Option<f64>],
     deadline: std::time::Instant,
 ) -> Option<Vec<f32>> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Attack);
     if !is_low_dim_common_rhs_relational_conjunction(spec)
         || box_lo.len() != box_hi.len()
         || box_lo.len() != emit_pin.len()
@@ -15309,6 +19272,8 @@ fn low_dim_ort_corner_falsify(
     emit_pin: &[Option<f64>],
     deadline: std::time::Instant,
 ) -> Option<Vec<f32>> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Attack);
     for point in low_dim_corner_seeds(box_lo, box_hi) {
         if std::time::Instant::now() >= deadline {
             return None;
@@ -15325,131 +19290,6 @@ fn low_dim_ort_corner_falsify(
         }
     }
     None
-}
-
-/// A one-load receipt for the traffic upfront logit experiment.
-///
-/// The graph is intentionally the ORIGINAL, unpeeled graph: its attack VJP
-/// already treats terminal Softmax as an attack-only identity and its
-/// `attack_pre_softmax_logits` method exposes the corresponding logits.  The
-/// rewritten spec can exist only after the exact joint model/property peel
-/// succeeds on the same loaded [`ny_onnx::OnnxModel`].  This type is
-/// deliberately not `Clone`, avoiding accidental whole-object cloning; this
-/// path retains exactly one graph.
-struct QualifiedTrafficSoftmaxAttackObjective {
-    graph: GraphNetwork,
-    rewritten_spec: ny_onnx::vnnlib::VnnLibSpec,
-    receipt: AppliedTerminalPeel,
-}
-
-/// Build the one-graph traffic objective without retaining the source model.
-///
-/// Convert before peeling so the retained graph remains the original graph,
-/// then authenticate the rewritten clone using that SAME `OnnxModel`.  A
-/// second model load or graph conversion here would create both a provenance
-/// gap and an avoidable peak-memory hazard.
-fn qualify_traffic_upfront_softmax_objective(
-    onnx: &Path,
-    original_spec: &ny_onnx::vnnlib::VnnLibSpec,
-    deadline: Option<std::time::Instant>,
-) -> std::result::Result<QualifiedTrafficSoftmaxAttackObjective, String> {
-    let expired = || deadline.is_some_and(|limit| std::time::Instant::now() >= limit);
-    if expired() {
-        return Err("deadline expired before model load".to_string());
-    }
-
-    let load_config = OnnxLoadConfig::default()
-        .with_shape_infer_backend(crate::commands::cli_shape_infer_backend());
-    let model_bytes =
-        read_onnx_bytes_maybe_gzip(onnx).map_err(|error| format!("model read failed: {error}"))?;
-    let model_name = onnx
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("traffic-model");
-    let options = GraphNetworkOptions {
-        compound_node_policy: CompoundNodePolicy::DecomposeNormalization,
-        ..GraphNetworkOptions::default()
-    };
-    let mut rewritten_spec = original_spec.clone();
-    let (graph, report) = ny_onnx::load_and_peel_terminal_softmax_single_group_with_original_graph(
-        model_name,
-        &model_bytes,
-        &load_config,
-        options,
-        &mut rewritten_spec,
-    )
-    .map_err(|error| format!("model load/qualification failed: {error}"))?;
-    let receipt = AppliedTerminalPeel::from_report(&report)
-        .map_err(|error| format!("malformed terminal-peel receipt: {error}"))?;
-    if receipt != AppliedTerminalPeel::Softmax || report.reason.is_some() {
-        return Err(report
-            .reason
-            .unwrap_or_else(|| "exact terminal Softmax was not applied".to_string()));
-    }
-    if expired() {
-        return Err("deadline expired after exact terminal-Softmax qualification".to_string());
-    }
-
-    // Make the intended peak-live boundary explicit: ORT is constructed only
-    // after this helper returns, when the source model has been released.
-    Ok(QualifiedTrafficSoftmaxAttackObjective {
-        graph,
-        rewritten_spec,
-        receipt,
-    })
-}
-
-/// Lazy request gate for the heavyweight one-load qualification. Keeping the
-/// closure unevaluated on the dark arm is both the default-path compatibility
-/// contract and the memory contract.
-fn traffic_upfront_objective_if_requested<T>(
-    requested: bool,
-    qualify: impl FnOnce() -> std::result::Result<T, String>,
-) -> std::result::Result<Option<T>, String> {
-    if requested {
-        qualify().map(Some)
-    } else {
-        Ok(None)
-    }
-}
-
-const TRAFFIC_UPFRONT_LOGIT_DLR_STEPS: usize = 4;
-const TRAFFIC_UPFRONT_LOGIT_WIDTH: usize = 43;
-
-/// Exact-width finite logit-DLR row for the authenticated micro-leg.
-/// `None` invalidates the treatment; callers must reset to the historical
-/// center rather than mixing coordinate systems in one trajectory.
-fn traffic_upfront_logit_dlr_row(
-    rewritten_spec: &ny_onnx::vnnlib::VnnLibSpec,
-    input: &[f32],
-    logits: &[f64],
-) -> Option<Vec<f32>> {
-    if logits.len() != TRAFFIC_UPFRONT_LOGIT_WIDTH || logits.iter().any(|value| !value.is_finite())
-    {
-        return None;
-    }
-    let margin = property_margin(rewritten_spec, input, logits);
-    if !margin.is_finite() {
-        return None;
-    }
-    let raw = margin_subgradient_row(rewritten_spec, input, logits, None)?;
-    if raw.len() != TRAFFIC_UPFRONT_LOGIT_WIDTH || raw.iter().any(|value| !value.is_finite()) {
-        return None;
-    }
-    let row = dlr_grad_row(&raw, margin, logits);
-    (row.len() == TRAFFIC_UPFRONT_LOGIT_WIDTH && row.iter().all(|value| value.is_finite()))
-        .then_some(row)
-}
-
-/// The only candidate-acceptance predicate inside the traffic micro-leg.
-/// Callers supply outputs from the ORIGINAL ONNX Runtime session and the
-/// ORIGINAL parsed property; rewritten logits cannot enter this boundary.
-fn traffic_upfront_original_candidate_violates(
-    original_spec: &ny_onnx::vnnlib::VnnLibSpec,
-    input: &[f64],
-    original_outputs: &[f64],
-) -> bool {
-    property_violated_f64(original_spec, input, original_outputs)
 }
 
 // --- Dark sign-space falsification lane (#bnn-sign-space). ----------------
@@ -15631,6 +19471,8 @@ fn try_sign_space_falsify(
     bnn_policy: BnnFalsificationPolicy,
     window: crate::commands::lane_allocation::LaneWindow,
 ) -> Option<String> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Attack);
     use super::beta_crown::sign_space_falsify::{
         lp_lane_plan, run_sign_space_lane_granted_with_policy, run_sign_space_lane_with_policy,
         SignSpaceLaneOutcome,
@@ -16230,6 +20072,8 @@ fn try_ste_pgd_falsify(
     bnn_policy: BnnFalsificationPolicy,
     window: crate::commands::lane_allocation::LaneWindow,
 ) -> Option<String> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Attack);
     use super::beta_crown::sign_space_falsify::{
         run_ste_pgd_lane_granted, run_ste_pgd_lane_with_policy, ste_lane_plan, SignSpaceLaneOutcome,
     };
@@ -16487,14 +20331,24 @@ fn try_upfront_falsify(
     wrapper_route: UpfrontWrapperRoute,
     policy: &UpfrontAttackPolicy,
     consultation: UpfrontAttackConsultation,
-    traffic_terminal_softmax_peel: bool,
-    traffic_execution: &mut TrafficUpfrontSoftmaxExecution,
     window: crate::commands::lane_allocation::LaneWindow,
     committed_policy_decision: Option<UpfrontBudgetDecision>,
+    attack_shape: attack_vertex_geometry::UpfrontAttackShape,
 ) -> Option<String> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Attack);
+    ny_core::phase_cost::count(ny_core::phase_cost::CostCounter::AttackRuns, 1);
     // Freeze admission before any VNN-LIB/model/ORT setup. Every subsequent
     // stage is charged to this one slice instead of rebasing a fresh duration.
     let attack_start = std::time::Instant::now();
+    // #attack-vertex-geometry engagement receipt. Created before the first
+    // early return so that, when either lever is armed, EVERY exit of this
+    // consultation prints its fixed-schema line on drop (see the type). With
+    // both levers dark it prints nothing and the lane below is unchanged.
+    let mut attack_shape_receipt = attack_vertex_geometry::UpfrontAttackShapeReceipt::new(
+        attack_shape,
+        consultation.stable_token(),
+    );
     let remaining = instance_deadline.map(|d| d.saturating_duration_since(attack_start));
     let note_skipped = |inactive_reason: &str,
                         admission: Option<UpfrontAttackAdmission>,
@@ -16540,9 +20394,6 @@ fn try_upfront_falsify(
     //   NY_UPFRONT_ATTACK=0 → hard kill switch (never run).
     //   NY_UPFRONT_ATTACK=1 → force the lane on for ALL instances (the old opt-in).
     if !wrapper_route.attack_enabled() {
-        if traffic_terminal_softmax_peel {
-            *traffic_execution = TrafficUpfrontSoftmaxExecution::AttackDisabled;
-        }
         note_skipped(
             "wrapper_disabled",
             None,
@@ -16585,9 +20436,6 @@ fn try_upfront_falsify(
     let admission = match upfront_attack_admission(&spec, wrapper_route) {
         Some(admission) => admission,
         None => {
-            if traffic_terminal_softmax_peel {
-                *traffic_execution = TrafficUpfrontSoftmaxExecution::AdmissionDeclined;
-            }
             note_skipped(
                 "admission_declined",
                 None,
@@ -16600,26 +20448,6 @@ fn try_upfront_falsify(
             return None;
         }
     };
-    let traffic_objective =
-        match traffic_upfront_objective_if_requested(traffic_terminal_softmax_peel, || {
-            qualify_traffic_upfront_softmax_objective(onnx, &spec, instance_deadline)
-        }) {
-            Ok(Some(objective)) => {
-                *traffic_execution = TrafficUpfrontSoftmaxExecution::QualifiedNotRun;
-                Some(objective)
-            }
-            Ok(None) => None,
-            Err(reason) => {
-                if traffic_terminal_softmax_peel {
-                    *traffic_execution = TrafficUpfrontSoftmaxExecution::QualificationDeclined;
-                    eprintln!(
-                        "Traffic upfront logit objective declined fail-closed ({reason}); \
-                     continuing with the historical attack"
-                    );
-                }
-                None
-            }
-        };
     // Auto (disjunction) lane: cap the steal from BaB tighter than the force-on
     // and typed relational lanes. Gradient-findable robustness CEs land in <1s
     // (~6 exact steps from the clean image); an unsat multi-clause disjunction
@@ -16630,10 +20458,7 @@ fn try_upfront_falsify(
     // inverted — BaB cannot progress through a piecewise-constant activation, so
     // there is no BaB proof to protect and falsification is the only lane that can
     // score. Take the much larger BNN budget instead (see `bnn_attack_budget_*`).
-    let sign_net = traffic_objective
-        .as_ref()
-        .map(|objective| objective.graph.has_sign_layer())
-        .unwrap_or_else(|| net_is_sign_network(onnx));
+    let sign_net = net_is_sign_network(onnx);
     let (budget, budget_authority, binding, budget_competition) =
         if let crate::commands::lane_allocation::LaneWindow::Cap(cap) = window {
             // The allocator or probe-first route committed this lane to a cap.
@@ -16739,6 +20564,9 @@ fn try_upfront_falsify(
         );
         return None;
     };
+    // #router-r3 CR-ATK: the slice the slope window is a fraction of (a no-op
+    // unless this consultation runs inside an armed defer scope).
+    crate::router::ostop::upfront_slice(attack_start, attack_deadline);
     if std::time::Instant::now() >= attack_deadline {
         note_skipped(
             "effective_deadline_elapsed",
@@ -16814,6 +20642,30 @@ fn try_upfront_falsify(
         budget.as_secs_f64(),
         box_lo.len()
     );
+    // #ml4acopf-upfront-single ENGAGEMENT OBSERVABLE, printed on EVERY run of
+    // this lane (the banner above keeps its historical text for the parsers
+    // that key on it). `schedule=margin_only` proves the threshold objective
+    // took the well-posed loss; `admission=` proves which budget class the row
+    // was admitted under (a multi-clause row under the preset force must read
+    // `auto_disjunction`, i.e. unchanged).
+    let loss_schedule = upfront_attack_loss_schedule(&spec, admission);
+    let loss_receipt = format!(
+        "schedule={} single_output_threshold={} admission={} route={} budget_s={:.3} outputs={}",
+        loss_schedule.stable_token(),
+        u8::from(is_single_output_threshold_objective(&spec)),
+        admission.stable_token(),
+        wrapper_route.stable_token(),
+        budget.as_secs_f64(),
+        spec.num_outputs,
+    );
+    eprintln!("[upfront-loss] {loss_receipt}");
+    // The same receipt in the flight sidecar: `ny benchmarks run` discards
+    // stderr, so without it a sweep could not show which rows took which loss.
+    crate::flight::note(
+        "upfront_attack_loss",
+        crate::flight::FlightStatus::Ran,
+        Some(format!("schema=ny-cli/upfront-loss/v1 {loss_receipt}")),
+    );
     // A low-dimensional relational conjunction can attain its optimum on a
     // face interior: corners miss it, while full-box random/APGD restarts have
     // probability zero of starting on the exact face. The typed preset route
@@ -16877,7 +20729,7 @@ fn try_upfront_falsify(
     // hill-climb is hopeless on these high-dimensional boxes — see its own docs).
     // Seed is None: restart 0 starts at the box center (= the clean image for a
     // symmetric L-inf robustness box), exactly where a nearby CE is reachable.
-    let found = gradient_guided_falsify_with_traffic_objective(
+    let found = gradient_guided_falsify_with_schedule(
         onnx,
         &mut forward,
         &spec,
@@ -16889,8 +20741,11 @@ fn try_upfront_falsify(
         Some(attack_deadline),
         Some(remaining_budget),
         false, // bounded upfront lane keeps the restart cap
-        traffic_objective,
-        traffic_execution,
+        loss_schedule,
+        Some(&mut attack_shape_receipt),
+        // #router-r6 `rule.trial_attack_halving`: this lane is the step
+        // pool's site (a no-op unless the acting optimizer armed it).
+        true,
     )?;
 
     // Render the witness in the emit view (pinned dims verbatim), Y recomputed with
@@ -17605,6 +21460,8 @@ fn ort_guided_falsify(
     emit_pin: &[Option<f64>],
     seed_witness: Option<&[f32]>,
 ) -> Option<Vec<f32>> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Attack);
     let dim = box_lo.len();
     let start = std::time::Instant::now();
     let mut evals: usize = 0;
@@ -17970,6 +21827,61 @@ fn margin_subgradient_row_ranked(
         }
     };
     constraint_grad_row(binding.1, num_outputs)
+}
+
+/// Which scalar each exact-gradient restart ascends (#ml4acopf-upfront-single).
+///
+/// Guidance only: the restart's START point and every acceptance check are
+/// independent of it, so it can change which counterexample is found and when,
+/// never whether a published `sat` is genuine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttackLossSchedule {
+    /// The historical AutoAttack-style ensemble: even restarts ascend the raw
+    /// binding margin, odd restarts its DLR-normalized form.
+    MarginDlrEnsemble,
+    /// Every restart ascends the raw binding margin (the hinge below the
+    /// threshold). Selected by [`upfront_attack_loss_schedule`] only.
+    MarginOnly,
+}
+
+impl AttackLossSchedule {
+    const fn stable_token(self) -> &'static str {
+        match self {
+            Self::MarginDlrEnsemble => "margin_dlr_ensemble",
+            Self::MarginOnly => "margin_only",
+        }
+    }
+
+    /// Whether restart `restart_idx` ascends the DLR-normalized margin.
+    /// `MarginDlrEnsemble` is the historical `restart_idx % 2 == 1` exactly.
+    const fn uses_dlr(self, restart_idx: usize) -> bool {
+        match self {
+            Self::MarginDlrEnsemble => restart_idx % 2 == 1,
+            Self::MarginOnly => false,
+        }
+    }
+
+    /// Whether restart `restart_idx` would replay restart 0 step for step.
+    ///
+    /// With no seed witness, [`restart_seed`] starts BOTH restart 0 and
+    /// restart 1 at the box centre; the ensemble tells them apart only by the
+    /// loss (margin vs DLR). Under `MarginOnly` the loss is the same too, so on
+    /// a deterministic exact gradient restart 1 is a verbatim copy of restart 0
+    /// and is skipped instead of paid for. A Sign net is never a replay: its
+    /// surrogate sharpness ramps per restart (`sign_beta_schedule`). Restart 1
+    /// consumes no RNG draw, so skipping it leaves every later random restart
+    /// on exactly the point it would have had. Always `false` for the ensemble.
+    const fn replays_restart_zero(
+        self,
+        restart_idx: usize,
+        has_seed_witness: bool,
+        per_restart_surrogate: bool,
+    ) -> bool {
+        matches!(self, Self::MarginOnly)
+            && restart_idx == 1
+            && !has_seed_witness
+            && !per_restart_surrogate
+    }
 }
 
 /// DLR (Difference-of-Logits-Ratio) gradient row for the AutoAttack-style loss
@@ -18463,8 +22375,8 @@ fn vnncomp_beta_requests_wgpu(
     }
 }
 
-fn wrapper_vjp_prewave_allowed(traffic_softmax_qualified: bool) -> bool {
-    !traffic_softmax_qualified && !BETA_WGPU_CONTEXT_RESERVED.with(std::cell::Cell::get)
+fn wrapper_vjp_prewave_allowed() -> bool {
+    !BETA_WGPU_CONTEXT_RESERVED.with(std::cell::Cell::get)
 }
 
 fn ort_refine_vjp_budget(remaining: std::time::Duration) -> Option<std::time::Duration> {
@@ -18533,6 +22445,7 @@ fn try_ort_refine_vjp_wave(
     deadline: std::time::Instant,
     ort_evals: &mut usize,
     grad_steps: &mut usize,
+    loss_schedule: AttackLossSchedule,
 ) -> Option<Vec<f32>> {
     use std::time::Instant;
 
@@ -18556,7 +22469,17 @@ fn try_ort_refine_vjp_wave(
     if wgpu_opted_out {
         return decline(OrtRefineVjpDeclineReason::WgpuOptOut);
     }
-    if !ort_refine_vjp_memory_allowed_now() {
+    // #router-r4 CR-L: return the wave's lease on every exit path (a no-op
+    // when no lease is armed or none was granted).
+    let _wave_lease =
+        crate::router::lease::ReleaseOnDrop(ny_core::router::lease::LeaseHolder::OrtRefineWave);
+    // #router-r4 CR-L: the wave leases its own working set; today's gate for
+    // this lane (the live envelope or the isolated override) is the floor.
+    // Unarmed: today's gate, evaluated once.
+    if !crate::router::lease::admit(
+        ny_core::router::lease::LeaseHolder::OrtRefineWave,
+        ort_refine_vjp_memory_allowed_now,
+    ) {
         return decline(OrtRefineVjpDeclineReason::MemoryNotAdmitted);
     }
     let Some(wave_budget) = ort_refine_vjp_budget(deadline.saturating_duration_since(admitted_at))
@@ -18625,7 +22548,18 @@ fn try_ort_refine_vjp_wave(
     let k = ort_refine_vjp_width().min(GRAD_REFINE_MAX_RESTARTS);
     let mut rng = SimpleRng::new(0xA24B_AED4_963E_E407);
     let mut lanes = Vec::with_capacity(k);
-    for restart_idx in 0..k {
+    // #ml4acopf-upfront-single: under `MarginOnly` the seedless lane 1 would
+    // replay lane 0 exactly, so the K lanes are drawn from the restart indices
+    // that are not replays. Under the ensemble nothing is filtered and this is
+    // `0..k` exactly. Restart 1 draws no RNG, so later lanes keep their points.
+    let has_seed_witness = seed_witness.is_some();
+    let restart_surrogate_varies = graph.has_sign_layer();
+    for restart_idx in (0usize..)
+        .filter(|&idx| {
+            !loss_schedule.replays_restart_zero(idx, has_seed_witness, restart_surrogate_varies)
+        })
+        .take(k)
+    {
         let mut x = restart_seed(
             restart_idx,
             seed_witness,
@@ -18671,7 +22605,7 @@ fn try_ort_refine_vjp_wave(
             best_margin: f64::NEG_INFINITY,
             alpha: 0.25,
             stall: 0,
-            use_dlr: restart_idx % 2 == 1,
+            use_dlr: loss_schedule.uses_dlr(restart_idx),
             active: true,
         });
     }
@@ -18905,169 +22839,6 @@ fn try_ort_refine_vjp_wave(
     None
 }
 
-enum TrafficUpfrontMicroLegOutcome {
-    Found(Vec<f32>),
-    Finished { gradient_steps: usize },
-    Invalidated,
-}
-
-/// Run the authenticated traffic treatment as a strictly additive, bounded
-/// center-seeded leg.  It owns no RNG and none of its local optimizer state is
-/// returned, so the historical sequential restart loop below begins from a
-/// complete reset regardless of this outcome.
-#[allow(clippy::too_many_arguments)]
-fn run_traffic_upfront_logit_dlr_micro_leg(
-    graph: &GraphNetwork,
-    rewritten_spec: &ny_onnx::vnnlib::VnnLibSpec,
-    forward: &mut ny_onnx::diff::OrtForward,
-    original_spec: &ny_onnx::vnnlib::VnnLibSpec,
-    input_shape: &[usize],
-    box_lo: &[f32],
-    box_hi: &[f32],
-    width: &[f32],
-    emit_pin: &[Option<f64>],
-    center: &[f32],
-    sign_net: bool,
-    deadline: std::time::Instant,
-) -> TrafficUpfrontMicroLegOutcome {
-    use std::time::Instant;
-
-    let dim = box_lo.len();
-    let input_elements = input_shape
-        .iter()
-        .try_fold(1usize, |product, &dimension| product.checked_mul(dimension));
-    if center.len() != dim
-        || box_hi.len() != dim
-        || width.len() != dim
-        || input_elements != Some(dim)
-    {
-        return TrafficUpfrontMicroLegOutcome::Invalidated;
-    }
-
-    let mut x = center.to_vec();
-    let mut previous_x = x.clone();
-    let alpha = 0.25f32;
-    let mut lr_scale = 0.30f32;
-    let mut gradient_steps = 0usize;
-
-    // Five trusted evaluations cover the center and the points after each of
-    // at most four VJP steps. Every acceptance uses ORIGINAL outputs/spec.
-    for micro_step in 0..=TRAFFIC_UPFRONT_LOGIT_DLR_STEPS {
-        if Instant::now() >= deadline {
-            return TrafficUpfrontMicroLegOutcome::Finished { gradient_steps };
-        }
-        let output = match forward.run(&x) {
-            Ok(output) => output,
-            Err(_) => return TrafficUpfrontMicroLegOutcome::Finished { gradient_steps },
-        };
-        if Instant::now() >= deadline {
-            return TrafficUpfrontMicroLegOutcome::Finished { gradient_steps };
-        }
-        let output64: Vec<f64> = output
-            .iter()
-            .map(|&value| f32_to_f64_exact(value))
-            .collect();
-        if traffic_upfront_original_candidate_violates(
-            original_spec,
-            &refine_emit_view(&x, emit_pin),
-            &output64,
-        ) && Instant::now() < deadline
-        {
-            return match clamp_inside_box(&x, box_lo, box_hi) {
-                Some(found) => TrafficUpfrontMicroLegOutcome::Found(found),
-                None => TrafficUpfrontMicroLegOutcome::Invalidated,
-            };
-        }
-        if micro_step == TRAFFIC_UPFRONT_LOGIT_DLR_STEPS {
-            break;
-        }
-
-        let x_array = match ArrayD::from_shape_vec(IxDyn(input_shape), x.clone()) {
-            Ok(value) => value,
-            Err(_) => return TrafficUpfrontMicroLegOutcome::Invalidated,
-        };
-        if Instant::now() >= deadline {
-            return TrafficUpfrontMicroLegOutcome::Finished { gradient_steps };
-        }
-        let logits = graph.attack_pre_softmax_logits(&x_array, Some(deadline));
-        if Instant::now() >= deadline {
-            return TrafficUpfrontMicroLegOutcome::Finished { gradient_steps };
-        }
-        let Some(logits) = logits else {
-            return TrafficUpfrontMicroLegOutcome::Invalidated;
-        };
-        let Some(row) = traffic_upfront_logit_dlr_row(rewritten_spec, &x, &logits) else {
-            return TrafficUpfrontMicroLegOutcome::Invalidated;
-        };
-        let spec_row = match Array2::from_shape_vec((1, TRAFFIC_UPFRONT_LOGIT_WIDTH), row) {
-            Ok(row) => row,
-            Err(_) => return TrafficUpfrontMicroLegOutcome::Invalidated,
-        };
-
-        ny_propagate::set_attack_sign_beta(sign_beta_schedule(
-            0,
-            micro_step,
-            GRAD_REFINE_MAX_STEPS_PER_RESTART,
-            sign_net,
-        ));
-        if Instant::now() >= deadline {
-            return TrafficUpfrontMicroLegOutcome::Finished { gradient_steps };
-        }
-        let gradient = match graph.attack_point_gradient(&x_array, &spec_row, None, Some(deadline))
-        {
-            Ok(Some(gradient)) => gradient,
-            Ok(None) | Err(_) if Instant::now() >= deadline => {
-                return TrafficUpfrontMicroLegOutcome::Finished { gradient_steps };
-            }
-            Ok(None) | Err(_) => return TrafficUpfrontMicroLegOutcome::Invalidated,
-        };
-        if Instant::now() >= deadline {
-            return TrafficUpfrontMicroLegOutcome::Finished { gradient_steps };
-        }
-        if gradient.len() != dim || gradient.iter().any(|value| !value.is_finite()) {
-            return TrafficUpfrontMicroLegOutcome::Invalidated;
-        }
-        gradient_steps += 1;
-
-        let mut moved = false;
-        let mut next_x = x.clone();
-        for (dimension, &gradient) in gradient.iter().enumerate() {
-            if width[dimension] <= 0.0 {
-                continue;
-            }
-            let direction = gradient_direction_sign(gradient);
-            let next = if sign_net {
-                clamp_to_box(
-                    x[dimension] + lr_scale * width[dimension] * direction,
-                    box_lo[dimension],
-                    box_hi[dimension],
-                )
-            } else {
-                apgd_coord_step(
-                    x[dimension],
-                    previous_x[dimension],
-                    direction,
-                    alpha,
-                    width[dimension],
-                    box_lo[dimension],
-                    box_hi[dimension],
-                )
-            };
-            moved |= next != x[dimension];
-            next_x[dimension] = next;
-        }
-        previous_x = std::mem::replace(&mut x, next_x);
-        if sign_net {
-            lr_scale *= 0.99;
-        }
-        if !moved {
-            break;
-        }
-    }
-
-    TrafficUpfrontMicroLegOutcome::Finished { gradient_steps }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn gradient_guided_falsify(
     onnx: &Path,
@@ -19082,8 +22853,7 @@ fn gradient_guided_falsify(
     budget_override: Option<std::time::Duration>,
     exhaust_restarts: bool,
 ) -> Option<Vec<f32>> {
-    let mut traffic_execution = TrafficUpfrontSoftmaxExecution::NotRequested;
-    gradient_guided_falsify_with_traffic_objective(
+    gradient_guided_falsify_with_schedule(
         onnx,
         forward,
         spec,
@@ -19095,13 +22865,23 @@ fn gradient_guided_falsify(
         instance_deadline,
         budget_override,
         exhaust_restarts,
+        // Every non-upfront caller (ORT-refine escalation, post-BaB lane)
+        // keeps the historical ensemble byte-for-byte.
+        AttackLossSchedule::MarginDlrEnsemble,
+        // ...and the historical APGD geometry and centre seeds: the
+        // #attack-vertex-geometry levers belong to the upfront lane only.
         None,
-        &mut traffic_execution,
+        // #router-r6: and today's initial step on every restart (the step
+        // pool is the upfront lane's trial site only).
+        false,
     )
 }
 
+/// `loss_schedule` selects the scalar each restart ascends; see
+/// [`AttackLossSchedule`]. Only the upfront lane ever passes
+/// [`AttackLossSchedule::MarginOnly`].
 #[allow(clippy::too_many_arguments)]
-fn gradient_guided_falsify_with_traffic_objective(
+fn gradient_guided_falsify_with_schedule(
     onnx: &Path,
     forward: &mut ny_onnx::diff::OrtForward,
     spec: &ny_onnx::vnnlib::VnnLibSpec,
@@ -19113,9 +22893,12 @@ fn gradient_guided_falsify_with_traffic_objective(
     instance_deadline: Option<std::time::Instant>,
     budget_override: Option<std::time::Duration>,
     exhaust_restarts: bool,
-    traffic_objective: Option<QualifiedTrafficSoftmaxAttackObjective>,
-    traffic_execution: &mut TrafficUpfrontSoftmaxExecution,
+    loss_schedule: AttackLossSchedule,
+    mut shape_receipt: Option<&mut attack_vertex_geometry::UpfrontAttackShapeReceipt>,
+    step_pool_site: bool,
 ) -> Option<Vec<f32>> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Attack);
     use std::time::Instant;
 
     // The kill-switch disables the stage-2 refinement escalation; the upfront
@@ -19156,10 +22939,7 @@ fn gradient_guided_falsify_with_traffic_objective(
     // (memoized), so an ineligible net costs nothing and prints no misleading
     // "keeping derivative-free behavior" (this lane has no derivative-free
     // fallback — it returns `None`).
-    let attack_gradients_supported = traffic_objective
-        .as_ref()
-        .map(|objective| objective.graph.supports_attack_point_gradient())
-        .unwrap_or_else(|| net_supports_attack_gradients(onnx));
+    let attack_gradients_supported = net_supports_attack_gradients(onnx);
     if !attack_gradients_supported {
         return None;
     }
@@ -19173,11 +22953,7 @@ fn gradient_guided_falsify_with_traffic_objective(
     // ordinary APGD-on-hard-Sign recipe provably cannot crack the hard tail.
     // Every other net takes the historical path byte-for-byte. Memoized probe, so
     // this costs one ONNX load per process. ATTACK-DIRECTION ONLY.
-    let sign_net = traffic_objective
-        .as_ref()
-        .map(|objective| objective.graph.has_sign_layer())
-        .unwrap_or_else(|| net_is_sign_network(onnx))
-        && ny_propagate::smooth_sign_forward_enabled();
+    let sign_net = net_is_sign_network(onnx) && ny_propagate::smooth_sign_forward_enabled();
     if Instant::now() >= deadline {
         return None;
     }
@@ -19199,47 +22975,20 @@ fn gradient_guided_falsify_with_traffic_objective(
     // pure lever read, and `pre_softmax_requested == false` reproduces the
     // historical load exactly, including which objects are live across the
     // search.
-    //
-    // The lever deliberately does NOT engage on the traffic-pinned
-    // `traffic_objective` route. That route already runs its own authenticated
-    // logit micro-leg against a REWRITTEN spec on a PEELED graph; scoring the
-    // ordinary schedule in a third coordinate system on top of it is exactly
-    // the "two coordinate systems in one trajectory" hazard the micro-leg
-    // documents. The general route below is the one this capability is for.
     let pre_softmax_requested = pre_softmax_attack_objective_armed();
-    let (graph, traffic_rewritten_spec, mut pre_softmax_admission) = match traffic_objective {
-        Some(objective) => {
-            if objective.receipt != AppliedTerminalPeel::Softmax {
-                *traffic_execution = TrafficUpfrontSoftmaxExecution::Invalidated;
-                return None;
-            }
-            if pre_softmax_requested {
-                println!(
-                    "ORT-refine grad lane: pre-Softmax attack objective NOT APPLIED \
-                     (the authenticated traffic terminal-Softmax route owns this run's \
-                     logit coordinate system)"
-                );
-            }
-            (objective.graph, Some(objective.rewritten_spec), None)
-        }
-        None => {
-            let (graph, model) =
-                match load_graph_network_retaining_model(onnx, pre_softmax_requested) {
-                    Ok(loaded) => loaded,
-                    Err(err) => {
-                        eprintln!("ORT-refine grad lane: graph load failed ({err}); no escalation");
-                        return None;
-                    }
-                };
-            // Refusal is cheap and logged; the model is dropped either way
-            // before the search allocates its working set.
-            let admission = model
-                .as_ref()
-                .and_then(|model| admit_pre_softmax_attack_objective(model, spec));
-            drop(model);
-            (graph, None, admission)
+    let (graph, model) = match load_graph_network_retaining_model(onnx, pre_softmax_requested) {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            eprintln!("ORT-refine grad lane: graph load failed ({err}); no escalation");
+            return None;
         }
     };
+    // Refusal is cheap and logged; the model is dropped either way
+    // before the search allocates its working set.
+    let mut pre_softmax_admission = model
+        .as_ref()
+        .and_then(|model| admit_pre_softmax_attack_objective(model, spec));
+    drop(model);
     if Instant::now() >= deadline {
         return None;
     }
@@ -19257,6 +23006,12 @@ fn gradient_guided_falsify_with_traffic_objective(
             return None;
         }
     };
+    // #ml4acopf-vjp: every use of `input_shape` below is GRAPH-side (the trusted
+    // ORT forward takes the flat point), so hand the graph its own input
+    // convention. Verbatim on every net that could reach this lane before the
+    // ml4acopf layers were admitted; batch-stripped on the newly admitted nets,
+    // whose `Transpose -> constant-left MatMul` lowering only evaluates there.
+    let input_shape = graph.attack_point_gradient_input_shape(&input_shape);
     if Instant::now() >= deadline {
         return None;
     }
@@ -19336,68 +23091,12 @@ fn gradient_guided_falsify_with_traffic_objective(
     let historical_sign_beta = ny_propagate::attack_sign_beta();
     let _sign_beta_guard = ny_propagate::AttackSignBetaGuard::new(historical_sign_beta);
 
-    if let Some(rewritten_spec) = traffic_rewritten_spec.as_ref() {
-        crate::flight::note(
-            "traffic_upfront_softmax_objective_selection",
-            crate::flight::FlightStatus::Ran,
-            Some(
-                "authenticated original graph + exact rewritten spec selected before upfront search"
-                    .to_string(),
-            ),
-        );
-        let outcome = run_traffic_upfront_logit_dlr_micro_leg(
-            &graph,
-            rewritten_spec,
-            forward,
-            spec,
-            &input_shape,
-            box_lo,
-            box_hi,
-            &width,
-            emit_pin,
-            &center,
-            sign_net,
-            deadline,
-        );
-        // The micro-leg owns no historical optimizer state. Restore the sole
-        // thread-local it touched before restart 0 is reconstructed below.
-        ny_propagate::set_attack_sign_beta(historical_sign_beta);
-        match outcome {
-            TrafficUpfrontMicroLegOutcome::Found(found) => {
-                *traffic_execution = TrafficUpfrontSoftmaxExecution::Applied;
-                println!(
-                    "Traffic upfront logit-DLR: original-ORT-confirmed violation \
-                     within the {}-step micro-leg",
-                    TRAFFIC_UPFRONT_LOGIT_DLR_STEPS
-                );
-                return Some(found);
-            }
-            TrafficUpfrontMicroLegOutcome::Finished { gradient_steps } => {
-                if gradient_steps > 0 {
-                    *traffic_execution = TrafficUpfrontSoftmaxExecution::Applied;
-                }
-                println!(
-                    "Traffic upfront logit-DLR: additive micro-leg finished after \
-                     {gradient_steps}/{} gradient steps; resetting to the historical schedule",
-                    TRAFFIC_UPFRONT_LOGIT_DLR_STEPS
-                );
-            }
-            TrafficUpfrontMicroLegOutcome::Invalidated => {
-                *traffic_execution = TrafficUpfrontSoftmaxExecution::Invalidated;
-                eprintln!(
-                    "Traffic upfront logit-DLR: malformed/non-finite view or VJP; \
-                     treatment invalidated and historical restart 0 reset"
-                );
-            }
-        }
-    }
-
     // #wrapper-batched-vjp: spend the same frozen slice on a K-wide exact-VJP
     // wave when the graph/device/memory envelope support it. This is a proposal
     // accelerator only: `try_ort_refine_vjp_wave` returns a point exclusively
     // after the trusted ORT + zero-tolerance check, and any miss/failure drops
     // through to the historical sequential loop below.
-    if wrapper_vjp_prewave_allowed(traffic_rewritten_spec.is_some()) {
+    if wrapper_vjp_prewave_allowed() {
         if let Some(found) = try_ort_refine_vjp_wave(
             &graph,
             forward,
@@ -19413,7 +23112,11 @@ fn gradient_guided_falsify_with_traffic_objective(
             deadline,
             &mut ort_evals,
             &mut grad_steps,
+            loss_schedule,
         ) {
+            if let Some(receipt) = shape_receipt.as_deref_mut() {
+                receipt.note_prewave_hit();
+            }
             return Some(found);
         }
     }
@@ -19421,11 +23124,76 @@ fn gradient_guided_falsify_with_traffic_objective(
         return None;
     }
 
+    // #attack-vertex-geometry (attack-only, DARK by default). Two typed
+    // levers reshape the restart loop below, and only for the upfront lane
+    // (every other caller passes `None`):
+    //
+    // - `global_step`: `attack.upfront_step_geometry: global_max_eps` on a
+    //   raw-margin (`MarginOnly`) objective of a non-Sign net replaces the APGD
+    //   rule with alpha-beta-CROWN's global scalar sign step — uniform starts,
+    //   `alpha_t = 0.99^t * max_d(width_d) / 8` for EVERY dimension, no
+    //   momentum, no stall-halving, at most
+    //   `GLOBAL_MAX_EPS_STEPS_PER_RESTART` steps per restart.
+    // - `corner_seeds`: `attack.corner_seed_restarts: N` starts restarts
+    //   `1..=N` at the lower corner, the upper corner, then random vertices
+    //   (from a separate RNG stream); restart 0 keeps its witness/centre seed.
+    //
+    // Only the PROPOSAL changes: every iterate is still projected into the
+    // inward-rounded box and every candidate still passes the unchanged ORT +
+    // zero-tolerance acceptance at step (1). With both levers dark,
+    // `global_step` is false and `corner_seeds` is 0, and every branch below
+    // takes its historical arm.
+    let attack_shape = shape_receipt
+        .as_deref()
+        .map(attack_vertex_geometry::UpfrontAttackShapeReceipt::shape)
+        .unwrap_or_default();
+    let global_alpha0 = attack_vertex_geometry::global_max_eps_alpha0(&width);
+    let geometry_decision = attack_vertex_geometry::global_max_eps_decision(
+        attack_shape.geometry,
+        loss_schedule == AttackLossSchedule::MarginOnly,
+        sign_net,
+        global_alpha0,
+    );
+    let global_step = geometry_decision == attack_vertex_geometry::GeometryDecision::Engaged;
+    let global_alpha0 = global_alpha0.unwrap_or(0.0);
+    let corner_seeds = attack_shape.corner_seeds;
+    let mut corner_rng = SimpleRng::new(attack_vertex_geometry::UPFRONT_CORNER_VERTEX_SEED);
+    if let Some(receipt) = shape_receipt.as_deref_mut() {
+        receipt.record_decision(geometry_decision, global_step.then_some(global_alpha0));
+    }
+
     // Restart schedule: the bounded lanes stop at GRAD_REFINE_MAX_RESTARTS (their
     // wall budgets are small, so the cap is a safety net for very fast nets); the
     // post-BaB leftover-budget lane (`exhaust_restarts`) keeps drawing fresh random
     // restarts until the wall deadline — that budget is otherwise WASTED, so more
     // attack is free (the deadline check bounds it exactly as before).
+    //
+    // #ml4acopf-upfront-single: under `MarginOnly` a seedless restart 1 is a
+    // verbatim replay of restart 0 (see `AttackLossSchedule::replays_restart_zero`)
+    // and is skipped. The per-restart surrogate guard is conservative: any Sign
+    // layer (β ramps per restart) or an armed pre-Softmax objective (which can
+    // retire mid-restart) keeps restart 1. Under the ensemble nothing is skipped.
+    let restart_surrogate_varies = graph.has_sign_layer() || pre_softmax_requested;
+    // #router-r6 `rule.trial_attack_halving`: successive halving across the
+    // initial-step pool, on the APGD geometry of the upfront lane only (the
+    // sign-PGD and global-step geometries never read `alpha`). `None` unless
+    // the acting optimizer armed the site: every restart then starts at
+    // today's `0.25`, and restart 0 always does.
+    let mut step_pool = if step_pool_site && !sign_net && !global_step {
+        crate::router::otrial::upfront_step_pool()
+    } else {
+        None
+    };
+    let lane_span = deadline
+        .saturating_duration_since(admitted_at)
+        .as_secs_f64();
+    // #router-r3 CR-ATK: one TLS read. Armed ONLY for the upfront lane under
+    // `optimizer.mode: on` with an admissible late reserve; otherwise every
+    // branch below that reads these two locals is skipped and the loop is
+    // today's, bit for bit.
+    let defer_armed = crate::router::ostop::upfront_scope_armed();
+    let mut defer_best = f64::NEG_INFINITY;
+    let mut defer_out_abs = 0.0f64;
     let mut restart_idx = 0usize;
     loop {
         if !exhaust_restarts && restart_idx >= GRAD_REFINE_MAX_RESTARTS {
@@ -19434,20 +23202,46 @@ fn gradient_guided_falsify_with_traffic_objective(
         if Instant::now() >= deadline {
             break;
         }
+        // A corner-seeded or uniformly-seeded restart 1 is never a replay of
+        // restart 0, so the #attack-vertex-geometry levers keep it.
+        if !global_step
+            && corner_seeds == 0
+            && loss_schedule.replays_restart_zero(
+                restart_idx,
+                seed_witness.is_some(),
+                restart_surrogate_varies,
+            )
+        {
+            restart_idx += 1;
+            continue;
+        }
         // Restart seeds (see [`restart_seed`]): ny's clamped witness (closest
         // to a real violation), then the box center, then the #bab-frontier
         // priority seeds in margin order, then deterministic random box
         // points. Empty `priority_seeds` is byte-identical to the pre-frontier
-        // schedule.
-        let mut x: Vec<f32> = restart_seed(
-            restart_idx,
-            seed_witness,
-            priority_seeds,
-            &center,
-            box_lo,
-            box_hi,
-            &mut rng,
-        );
+        // schedule. #attack-vertex-geometry: an armed corner slot (restarts
+        // 1..=N; restart 0 keeps its witness/centre seed) starts at a box
+        // corner, and the global geometry starts every other restart uniformly
+        // (no centre restart); both are box members.
+        let corner_slot = attack_vertex_geometry::corner_restart_slot(restart_idx, corner_seeds);
+        let mut x: Vec<f32> = if let Some(slot) = corner_slot {
+            attack_vertex_geometry::upfront_corner_seed(slot, box_lo, box_hi, &mut corner_rng)
+        } else if global_step && (restart_idx > 0 || seed_witness.is_none()) {
+            attack_vertex_geometry::global_step_uniform_seed(box_lo, box_hi, &mut rng)
+        } else {
+            restart_seed(
+                restart_idx,
+                seed_witness,
+                priority_seeds,
+                &center,
+                box_lo,
+                box_hi,
+                &mut rng,
+            )
+        };
+        if let Some(receipt) = shape_receipt.as_deref_mut() {
+            receipt.note_restart(corner_slot);
+        }
         // Per-clause-box disjunctions: give the seed a clause whose box contains
         // it (cycling through clauses across restarts) so the margin is finite.
         if spec.is_disjunction && !spec.per_clause_input_bounds.is_empty() {
@@ -19510,8 +23304,20 @@ fn gradient_guided_falsify_with_traffic_objective(
         // the external prototype likewise fixes its target once, at the box centre.
         let mut logit_guide: Option<Vec<f64>> = None;
         let mut logit_guide_unavailable = false;
-        let use_dlr = restart_idx % 2 == 1;
-        let mut alpha = 0.25f32;
+        // Historical ensemble (odd restarts DLR) unless the upfront lane selected
+        // `MarginOnly` for a single-output threshold (#ml4acopf-upfront-single).
+        let use_dlr = loss_schedule.uses_dlr(restart_idx);
+        // #router-r6: the restart's arm of the step pool (today's 0.25 when
+        // no pool is armed; the pool's first arm is that same 0.25).
+        // Review fix (router-r6): fail open — a fault or a disarmed trial
+        // authority drops the pool (today's 0.25 from this restart on).
+        let (pool_arm, alpha0) = match crate::router::otrial::pool_next(&mut step_pool) {
+            Some((arm, step)) => (Some(arm), step as f32),
+            None => (None, 0.25f32),
+        };
+        let restart_started = pool_arm.map(|_| Instant::now());
+        let mut restart_first_margin: Option<f64> = None;
+        let mut alpha = alpha0;
         let mut lr_scale = 0.30f32; // pure sign-PGD step scale (smooth mode only)
         let mut best_margin = f64::NEG_INFINITY;
         let mut best_x = x.clone();
@@ -19546,6 +23352,13 @@ fn gradient_guided_falsify_with_traffic_objective(
             }
             ort_evals += 1;
             let out64: Vec<f64> = out.iter().map(|&v| f32_to_f64_exact(v)).collect();
+            if defer_armed {
+                // CR-ATK's noise floor tracks the trusted output's scale.
+                defer_out_abs = out64
+                    .iter()
+                    .filter(|v| v.is_finite())
+                    .fold(0.0f64, |m, v| m.max(v.abs()));
+            }
             if property_violated_f64(spec, &refine_emit_view(&x, emit_pin), &out64)
                 && Instant::now() < deadline
             {
@@ -19555,6 +23368,11 @@ fn gradient_guided_falsify_with_traffic_objective(
                      {grad_steps} gradient steps, {ort_evals} ORT evals)"
                 );
                 if Instant::now() < deadline {
+                    // Telemetry only (#attack-vertex-geometry receipt); the
+                    // acceptance decision above is unchanged.
+                    if let Some(receipt) = shape_receipt.as_deref_mut() {
+                        receipt.note_hit(restart_idx, step);
+                    }
                     return found;
                 }
                 break;
@@ -19619,11 +23437,14 @@ fn gradient_guided_falsify_with_traffic_objective(
                 break;
             }
             let margin = property_margin(spec, &x, scores);
+            if pool_arm.is_some() && restart_first_margin.is_none() && margin.is_finite() {
+                restart_first_margin = Some(margin);
+            }
             if margin > best_margin {
                 best_margin = margin;
                 best_x = x.clone();
                 stall = 0;
-            } else if !smooth_step {
+            } else if !smooth_step && !global_step {
                 // APGD stall-halving + re-center (default). DISABLED in smooth mode:
                 // the prototype's pure sign-PGD keeps taking large steps while β
                 // ramps, which is exactly what escapes the local max APGD halts at.
@@ -19641,6 +23462,12 @@ fn gradient_guided_falsify_with_traffic_objective(
                     prev_x = best_x.clone();
                     continue;
                 }
+            }
+            // #attack-vertex-geometry: the global geometry spends at most
+            // GLOBAL_MAX_EPS_STEPS_PER_RESTART steps per restart. The iterate
+            // reached by the last step was accepted-checked at (1) above.
+            if global_step && step >= attack_vertex_geometry::GLOBAL_MAX_EPS_STEPS_PER_RESTART {
+                break;
             }
 
             let x_arr = match ArrayD::from_shape_vec(IxDyn(&input_shape), x.clone()) {
@@ -19745,12 +23572,18 @@ fn gradient_guided_falsify_with_traffic_objective(
                 break;
             }
             grad_steps += 1;
+            if let Some(receipt) = shape_receipt.as_deref_mut() {
+                receipt.note_gradient_step();
+            }
 
             // (3) STEP — APGD: a signed, box-width-scaled gradient step to the
             // trial point `z`, then a Nesterov-momentum blend of the step and the
             // previous displacement, each stage projected back into the
             // inward-rounded box (every candidate stays f64-box-member by
             // construction, matching `property_violated`'s zero-tol check).
+            // #attack-vertex-geometry: under `global_step` the SAME scalar
+            // `alpha_t` moves every non-degenerate dimension instead.
+            let global_alpha = attack_vertex_geometry::global_max_eps_alpha(global_alpha0, step);
             let mut moved = false;
             let mut next_x = x.clone();
             for (d, g) in grad.iter().enumerate().take(dim) {
@@ -19758,7 +23591,17 @@ fn gradient_guided_falsify_with_traffic_objective(
                     continue;
                 }
                 let sign = gradient_direction_sign(*g);
-                let nx = if smooth_step {
+                let nx = if global_step {
+                    // abc's global scalar sign step, projected into the
+                    // inward-rounded box (see `global_sign_coord_step`).
+                    attack_vertex_geometry::global_sign_coord_step(
+                        x[d],
+                        sign,
+                        global_alpha,
+                        eff_lo[d],
+                        eff_hi[d],
+                    )
+                } else if smooth_step {
                     // PURE sign-PGD (prototype): x + lr·width·sign(g), projected into
                     // the inward-rounded box so every iterate stays f64-box-member.
                     clamp_to_box(x[d] + lr_scale * eff_width[d] * sign, eff_lo[d], eff_hi[d])
@@ -19787,6 +23630,54 @@ fn gradient_guided_falsify_with_traffic_objective(
             }
             if !moved {
                 break; // pinned on the boundary along every ascent coordinate
+            }
+        }
+        // #router-r6 `rule.trial_attack_halving`: the restart boundary is this
+        // lane's safe point. The arm's improvement is its best margin's rise
+        // over its own first margin; a round's end keeps the better half.
+        if let (Some(arm), Some(started)) = (pool_arm, restart_started) {
+            let improvement = match restart_first_margin {
+                Some(first) if best_margin.is_finite() => best_margin - first,
+                _ => 0.0,
+            };
+            let done_frac = if lane_span > 0.0 {
+                admitted_at.elapsed().as_secs_f64() / lane_span
+            } else {
+                1.0
+            };
+            crate::router::otrial::pool_done(
+                &mut step_pool,
+                arm,
+                improvement,
+                started.elapsed().as_secs_f64(),
+                done_frac,
+            );
+        }
+        // #router-r3 CR-ATK at the restart boundary (this lane's safe point):
+        // the RUNNING best margin over every restart so far, judged by its
+        // rise over the trailing half of the slice. Flat with >= 5 s left ⇒
+        // DEFER: stop here, propose nothing, and the unspent slice goes to the
+        // late sat reserve (never deleted). Every candidate this lane ever
+        // proposed already passed (or failed) the unchanged acceptance above.
+        if defer_armed {
+            defer_best = defer_best.max(best_margin);
+            // The restarts this bounded lane would still run today (`None`:
+            // the exhaustive lane runs to its deadline): the defer never
+            // holds more than that out of the verifier.
+            let restarts_left = (!exhaust_restarts)
+                .then(|| GRAD_REFINE_MAX_RESTARTS.saturating_sub(restart_idx.saturating_add(1)));
+            if crate::router::ostop::upfront_restart_boundary(
+                restart_idx,
+                restarts_left,
+                defer_best,
+                crate::router::ostop::noise_floor(defer_out_abs),
+            ) {
+                println!(
+                    "ORT-refine grad lane: best margin flat over half the slice; the rest of \
+                     the attack is DEFERRED to the late sat reserve ({grad_steps} gradient \
+                     steps, {ort_evals} ORT evals). This says nothing about the property."
+                );
+                return None;
             }
         }
         restart_idx += 1;
@@ -20067,7 +23958,7 @@ fn pin_f32_into_declared_bound(lo: f64, hi: f64, want: f64) -> Option<f32> {
     }
     let start = want.clamp(lo, hi) as f32;
     let candidates = if start.is_nan() {
-        [lo as f32, hi as f32, ((lo + hi) * 0.5) as f32]
+        [lo as f32, hi as f32, f64::midpoint(lo, hi) as f32]
     } else {
         [start, start.next_up(), start.next_down()]
     };
@@ -20075,6 +23966,27 @@ fn pin_f32_into_declared_bound(lo: f64, hi: f64, want: f64) -> Option<f32> {
         let exact = f32_to_f64_exact(c);
         exact >= lo && exact <= hi
     })
+}
+
+/// Wall-clock slice the #cctsdb-subbox driver may spend before it must give
+/// the budget back to the unchanged `#graph-free-sat` lane.
+///
+/// The driver is a DECIDER, not a searcher: on the measured instance each
+/// sub-box costs ~3.6 s of cell enumeration plus ~1 s of ONNX-Runtime
+/// equivalence replay, so a cap of one minute is many times the observed cost
+/// while making it impossible for a declining run to consume a 350 s budget
+/// that the falsification lane needs. `None` (no deadline at all) is passed
+/// through so a research invocation behaves as it does elsewhere.
+const CCTSDB_SUBBOX_MAX_SECS: u64 = 60;
+
+fn cctsdb_subbox_deadline(
+    post_beta_deadline: Option<std::time::Instant>,
+) -> Option<std::time::Instant> {
+    let cap = std::time::Instant::now() + std::time::Duration::from_secs(CCTSDB_SUBBOX_MAX_SECS);
+    match post_beta_deadline {
+        Some(deadline) => Some(deadline.min(cap)),
+        None => Some(cap),
+    }
 }
 
 /// Does the graph-free falsifier apply to this instance?
@@ -20159,7 +24071,11 @@ fn graph_free_search_box(
         if !lo.is_finite() || !hi.is_finite() || lo > hi {
             return None;
         }
-        match (pin(lo, hi, lo), pin(lo, hi, hi), pin(lo, hi, (lo + hi) * 0.5)) {
+        match (
+            pin(lo, hi, lo),
+            pin(lo, hi, hi),
+            pin(lo, hi, f64::midpoint(lo, hi)),
+        ) {
             (Some(l), Some(h), Some(c)) => {
                 lo32.push(l);
                 hi32.push(h);
@@ -20222,6 +24138,35 @@ fn try_graph_free_ort_falsify(
     vnnlib: &Path,
     deadline: Option<std::time::Instant>,
 ) -> Option<String> {
+    // #graph-free-candidates: resolved ONCE per lane entry. `None` — the
+    // shipped default (no yaml sets `attack.graph_free_candidate_sidefile`) —
+    // leaves the lane below byte-identical.
+    try_graph_free_ort_falsify_observed(
+        onnx,
+        vnnlib,
+        deadline,
+        graph_free_sidefile::CandidateSidefile::from_gates(),
+    )
+}
+
+/// [`try_graph_free_ort_falsify`] with an explicit DIAGNOSTIC-ONLY side-file
+/// recorder (#graph-free-candidates). Every hook below is an `if let Some(..)`
+/// on `sidefile`, reads only values the gates already computed, and returns
+/// nothing to the search: with `None` the lane is byte-identical, and with
+/// `Some` the candidates, gates, RNG draws and verdict are unchanged — only
+/// wall clock is spent writing the record.
+fn try_graph_free_ort_falsify_observed(
+    onnx: &Path,
+    vnnlib: &Path,
+    deadline: Option<std::time::Instant>,
+    sidefile: Option<graph_free_sidefile::CandidateSidefile>,
+) -> Option<String> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Attack);
+    // Declared FIRST so it is dropped LAST, after every closure that borrows
+    // it: its `Drop` writes the summary and prints the fixed-schema receipt
+    // on every exit below, each early `return None` and `?` included.
+    let sidefile = sidefile.map(std::cell::RefCell::new);
     let deadline = deadline?;
     let expired = || std::time::Instant::now() >= deadline;
     if expired() {
@@ -20275,6 +24220,9 @@ fn try_graph_free_ort_falsify(
              their in-box declared value and emitted as that f64 verbatim, which the \
              checker's own f64-parse-then-f32-cast replay reproduces exactly"
         );
+    }
+    if let Some(sidefile) = sidefile.as_ref() {
+        sidefile.borrow_mut().begin(onnx, vnnlib, n, &emit_pin);
     }
 
     // The free subspace: dims the search can actually move (a pinned dim has
@@ -20367,7 +24315,20 @@ fn try_graph_free_ort_falsify(
                           out: &[f32],
                           ev: &mut dyn FnMut(&[f32]) -> Option<(f64, Vec<f32>)>|
      -> Option<String> {
-        let witness = emit(x, out)?;
+        // #graph-free-candidates: every exit below reports its outcome to the
+        // side file through `note_candidate` — a no-op when `sidefile` is
+        // `None` (the shipped default), and report-only when armed.
+        let Some(witness) = emit(x, out) else {
+            graph_free_sidefile::note_candidate(
+                &sidefile,
+                &spec,
+                x,
+                out,
+                None,
+                graph_free_sidefile::Outcome::RejectedEmit,
+            );
+            return None;
+        };
         // Dual-optimization-level gate (see the state doc above): the candidate
         // must ALSO violate on a session with every graph optimization disabled.
         if disable_forward.is_none() && !disable_unavailable {
@@ -20383,15 +24344,45 @@ fn try_graph_free_ort_falsify(
                 }
             }
         }
-        let disable_fwd = disable_forward.as_mut()?;
+        let Some(disable_fwd) = disable_forward.as_mut() else {
+            graph_free_sidefile::note_candidate(
+                &sidefile,
+                &spec,
+                x,
+                out,
+                None,
+                graph_free_sidefile::Outcome::RejectedDualUnavailable,
+            );
+            return None;
+        };
         if std::time::Instant::now() >= deadline {
             eprintln!(
                 "#graph-free-sat: deadline reached before the dual-level re-forward; \
                  refusing to publish a single-level candidate"
             );
+            graph_free_sidefile::note_candidate(
+                &sidefile,
+                &spec,
+                x,
+                out,
+                None,
+                graph_free_sidefile::Outcome::RejectedDeadline {
+                    phase: "dual_level",
+                },
+            );
             return None;
         }
         let Ok(out_disable) = disable_fwd.run(x) else {
+            graph_free_sidefile::note_candidate(
+                &sidefile,
+                &spec,
+                x,
+                out,
+                None,
+                graph_free_sidefile::Outcome::RejectedForward {
+                    phase: "dual_level",
+                },
+            );
             return None;
         };
         let x64 = refine_emit_view(x, &emit_pin);
@@ -20403,6 +24394,14 @@ fn try_graph_free_ort_falsify(
                  (disable-level margin {:+.6e}). Two conforming fused graphs disagree at \
                  this point, so it is a knife-edge rounding artifact, not a counterexample.",
                 property_margin(&spec, x, &out_disable64)
+            );
+            graph_free_sidefile::note_candidate(
+                &sidefile,
+                &spec,
+                x,
+                out,
+                Some(out_disable.as_slice()),
+                graph_free_sidefile::Outcome::RejectedDualLevel,
             );
             return None;
         }
@@ -20424,11 +24423,7 @@ fn try_graph_free_ort_falsify(
         // axis is REJECTED outright: it sits on the violation boundary, which
         // is exactly the knife-edge class this gate exists to reject.
         // High-dimensional free boxes keep the historical spans byte-for-byte.
-        let mut corro_span: Vec<f64> = spec
-            .input_bounds
-            .iter()
-            .map(|&(lo, hi)| hi - lo)
-            .collect();
+        let mut corro_span: Vec<f64> = spec.input_bounds.iter().map(|&(lo, hi)| hi - lo).collect();
         if low_dim_free {
             for &i in &free_dims {
                 let (lo, hi) = spec.input_bounds[i];
@@ -20449,19 +24444,40 @@ fn try_graph_free_ort_falsify(
                     if room < base {
                         continue;
                     }
-                    while matches!(off.partial_cmp(&span), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)) {
+                    while matches!(
+                        off.partial_cmp(&span),
+                        Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+                    ) {
                         if std::time::Instant::now() >= deadline {
                             eprintln!(
                                 "#graph-free-sat: deadline reached while measuring the \
                                  violating extent; refusing to publish an un-corroborated \
                                  counterexample"
                             );
+                            graph_free_sidefile::note_candidate(
+                                &sidefile,
+                                &spec,
+                                x,
+                                out,
+                                Some(out_disable.as_slice()),
+                                graph_free_sidefile::Outcome::RejectedDeadline { phase: "extent" },
+                            );
                             return None;
                         }
                         let want = exact + dir * off;
                         let Some(p) = pin(lo, hi, want) else { break };
                         probe[i] = p;
-                        let (m, _) = ev(&probe)?;
+                        let Some((m, _)) = ev(&probe) else {
+                            graph_free_sidefile::note_candidate(
+                                &sidefile,
+                                &spec,
+                                x,
+                                out,
+                                Some(out_disable.as_slice()),
+                                graph_free_sidefile::Outcome::RejectedForward { phase: "extent" },
+                            );
+                            return None;
+                        };
                         if m <= 0.0 {
                             break;
                         }
@@ -20483,6 +24499,14 @@ fn try_graph_free_ort_falsify(
                          boundary point risks the checker's replay landing on the other \
                          side"
                     );
+                    graph_free_sidefile::note_candidate(
+                        &sidefile,
+                        &spec,
+                        x,
+                        out,
+                        Some(out_disable.as_slice()),
+                        graph_free_sidefile::Outcome::RejectedExtent { dim: i },
+                    );
                     return None;
                 }
                 if min_extent.is_finite() {
@@ -20498,6 +24522,16 @@ fn try_graph_free_ort_falsify(
                         "#graph-free-sat: deadline reached after {checked} corroboration \
                          forwards; refusing to publish an un-corroborated counterexample"
                     );
+                    graph_free_sidefile::note_candidate(
+                        &sidefile,
+                        &spec,
+                        x,
+                        out,
+                        Some(out_disable.as_slice()),
+                        graph_free_sidefile::Outcome::RejectedDeadline {
+                            phase: "corroboration",
+                        },
+                    );
                     return None;
                 }
                 for i in 0..x.len() {
@@ -20512,10 +24546,33 @@ fn try_graph_free_ort_falsify(
                         // neighbourhood resampling.
                         x[i]
                     } else {
-                        pin(lo, hi, want)?
+                        let Some(pinned) = pin(lo, hi, want) else {
+                            graph_free_sidefile::note_candidate(
+                                &sidefile,
+                                &spec,
+                                x,
+                                out,
+                                Some(out_disable.as_slice()),
+                                graph_free_sidefile::Outcome::RejectedPin,
+                            );
+                            return None;
+                        };
+                        pinned
                     };
                 }
-                let (margin, _) = ev(&jitter)?;
+                let Some((margin, _)) = ev(&jitter) else {
+                    graph_free_sidefile::note_candidate(
+                        &sidefile,
+                        &spec,
+                        x,
+                        out,
+                        Some(out_disable.as_slice()),
+                        graph_free_sidefile::Outcome::RejectedForward {
+                            phase: "corroboration",
+                        },
+                    );
+                    return None;
+                };
                 checked += 1;
                 if margin <= 0.0 {
                     eprintln!(
@@ -20524,6 +24581,18 @@ fn try_graph_free_ort_falsify(
                          Without a second, independent forward this lane cannot tell a \
                          knife-edge rounding artifact from a counterexample, so it publishes \
                          neither."
+                    );
+                    graph_free_sidefile::note_candidate(
+                        &sidefile,
+                        &spec,
+                        x,
+                        out,
+                        Some(out_disable.as_slice()),
+                        graph_free_sidefile::Outcome::RejectedCorroboration {
+                            radius,
+                            neighbour_margin: margin,
+                            checked,
+                        },
                     );
                     return None;
                 }
@@ -20534,12 +24603,23 @@ fn try_graph_free_ort_falsify(
              {:.2} of the corroboration span",
             CORROBORATION_RADII[CORROBORATION_RADII.len() - 1]
         );
+        graph_free_sidefile::note_candidate(
+            &sidefile,
+            &spec,
+            x,
+            out,
+            Some(out_disable.as_slice()),
+            graph_free_sidefile::Outcome::AcceptedByLane {
+                corroborated: checked,
+            },
+        );
         Some(witness)
     };
 
     // 1. The declared box CENTER, then its two corners. On a robustness spec the
     //    center is the unperturbed input, so a violation there is the strongest
     //    counterexample available and costs one forward.
+    graph_free_sidefile::set_stage(&sidefile, "center");
     let mut best: Vec<f32> = center.clone();
     let (mut best_margin, out) = evaluate(&best)?;
     let output_len = out.len();
@@ -20551,6 +24631,7 @@ fn try_graph_free_ort_falsify(
             return Some(witness);
         }
     }
+    graph_free_sidefile::set_stage(&sidefile, "corner");
     for corner in [&lo32, &hi32] {
         if expired() {
             return None;
@@ -20574,6 +24655,7 @@ fn try_graph_free_ort_falsify(
     //     two corners they answer the FLAT-OBJECTIVE question below with five
     //     structurally distinct points instead of three.
     let mut flat_rng = SimpleRng::new(0xF1A7_0BDE_u64 ^ (n as u64));
+    graph_free_sidefile::set_stage(&sidefile, "face");
     {
         let mut face_point = vec![0.0f32; n];
         for _ in 0..2 {
@@ -20620,6 +24702,7 @@ fn try_graph_free_ort_falsify(
     // and when it finds nothing every later stage runs unchanged — strictly
     // additive either way.
     if low_dim_free {
+        graph_free_sidefile::set_stage(&sidefile, "lattice");
         let d = free_dims.len();
         let mut point = center.clone();
         let mut lattice_forwards: u64 = 0;
@@ -20729,6 +24812,21 @@ fn try_graph_free_ort_falsify(
              quantizer-pinned there and the margin-guided search below is starved. Falling \
              back to a pre-saturation surrogate objective (#flat-objective-surrogate)."
         );
+        graph_free_sidefile::set_stage(&sidefile, "flat_surrogate");
+        // #graph-free-candidates: report-only observer of the surrogate's
+        // re-scored incumbents; a no-op when the side file is dark.
+        let mut observe_incumbent =
+            |x: &[f32], out: &[f32], real_margin: f64, surrogate_margin: f64, search_end: bool| {
+                graph_free_sidefile::observe_incumbent(
+                    &sidefile,
+                    &spec,
+                    x,
+                    out,
+                    real_margin,
+                    surrogate_margin,
+                    search_end,
+                );
+            };
         if let Some(witness) = flat_surrogate_hadamard_search(
             onnx,
             &spec,
@@ -20739,6 +24837,7 @@ fn try_graph_free_ort_falsify(
             deadline,
             &mut evaluate,
             &mut try_accept,
+            &mut observe_incumbent,
         ) {
             return Some(witness);
         }
@@ -20758,6 +24857,7 @@ fn try_graph_free_ort_falsify(
     //    because no differentiable graph exists here): pin a contiguous block of
     //    coordinates to one face of the box, keep the move only if the property
     //    margin improves, and halve the block when progress stalls.
+    graph_free_sidefile::set_stage(&sidefile, "block");
     let mut rng = SimpleRng::new(0x005E_ED51_CED0_u64 ^ (n as u64));
     let mut cand = best.clone();
     let mut frac = 0.5f64;
@@ -20853,9 +24953,15 @@ fn flat_surrogate_hadamard_search(
         &[f32],
         &mut dyn FnMut(&[f32]) -> Option<(f64, Vec<f32>)>,
     ) -> Option<String>,
+    // #graph-free-candidates: report-only observer of every incumbent this
+    // search re-scores on the ORIGINAL model, `(x, out, real margin, surrogate
+    // margin, search_end)`; `search_end = true` (empty slices) marks the end
+    // of an unsuccessful search. It returns nothing, so it cannot steer.
+    observe_incumbent: &mut dyn FnMut(&[f32], &[f32], f64, f64, bool),
 ) -> Option<String> {
     use flat_objective::{
-        hadamard_level_proposal, materialize_corner, split_all, ActiveInputLayout, TensorBlock,
+        hadamard_level_proposal, materialize_corner, retain_top_effect_blocks, split_all,
+        ActiveInputLayout, TensorBlock,
     };
     use ny_onnx::tail_surrogate::{
         freeze_activation_inputs, peel_saturating_monotone_tail, FrozenInput,
@@ -21177,14 +25283,92 @@ fn flat_surrogate_hadamard_search(
         }
     }
 
+    // #flat-ladder-depth: typed cap on the ACTIVE Hadamard block count
+    // (`attack.flat_surrogate_max_blocks`, env override
+    // `NY_FLAT_SURROGATE_MAX_BLOCKS`). 0 — the declaration default, set by no
+    // shipped yaml — keeps today's schedule: `split_all` doubles the block
+    // count every level, so a level's probe bill doubles too and the ladder
+    // stalls at the first level the remaining budget cannot finish (measured
+    // on smart_turn: stopping before level 13, whose ~8194 probes cost more
+    // than the whole preceding search). Armed with a cap >= 2, once a split
+    // would push past the cap only the top cap/2 blocks by recovered effect
+    // stay active — the rest freeze at their incumbent faces — so per-level
+    // cost stays ~cap probes and refinement continues to single coordinates
+    // inside the region the measurements say matters. Steering only: every
+    // candidate still crosses the ORIGINAL model and the unchanged acceptance
+    // stack, so a wrong cap costs probes, never a verdict.
+    let block_cap = crate::preset_gates::flat_surrogate_max_blocks_override().unwrap_or(0) as usize;
+    // #flat-surrogate-transfer: typed gate for the surrogate->real transfer
+    // stage (`attack.flat_surrogate_transfer`, env override
+    // `NY_FLAT_SURROGATE_TRANSFER`). False — the declaration default, set by
+    // no shipped yaml — keeps the whole search byte-identical: the ladder,
+    // the refinement and the final stderr line run exactly as before and the
+    // stage below is never entered. Armed, once the surrogate margin crosses
+    // zero the ladder hands over early (post-crossing levels measured
+    // no-change on row 11 while refinement gained +1.4), the refinement keeps
+    // half of the remaining search budget (a deeper surrogate optimum is a
+    // deeper seed), and the transfer stage takes the other half.
+    let transfer_armed = crate::preset_gates::flat_surrogate_transfer_armed();
+    if block_cap >= 2 {
+        eprintln!(
+            "#flat-ladder-depth: armed — active Hadamard block cap {block_cap} (beyond it, only \
+             the top {} blocks by recovered effect stay active; the rest freeze at their \
+             incumbent faces)",
+            (block_cap / 2).max(1)
+        );
+    }
+    let mut frozen_blocks: Vec<TensorBlock> = Vec::new();
+    let mut frozen_signs: Vec<i8> = Vec::new();
+    let mut last_effects: Option<Vec<f64>> = None;
+
     let mut best_real_margin = f64::NEG_INFINITY;
     let mut level = 0u32;
+    let mut stop_reason: &str = "search deadline";
     'ladder: loop {
         if expired_search() {
             break;
         }
+        if transfer_armed && incumbent_margin > 0.0 {
+            // #flat-surrogate-transfer: the surrogate has crossed zero, so
+            // ladder depth is no longer the binding constraint (measured:
+            // post-crossing levels were no-change while refinement kept
+            // climbing). Hand the remaining budget to refinement + transfer.
+            stop_reason =
+                "surrogate crossed zero (#flat-surrogate-transfer takes the remaining budget)";
+            break;
+        }
+        if block_cap >= 2 && blocks.len().saturating_mul(2) > block_cap {
+            if let Some(effects) = last_effects.take() {
+                let kept = retain_top_effect_blocks(
+                    &mut blocks,
+                    &mut signs,
+                    &effects,
+                    (block_cap / 2).max(1),
+                    &mut frozen_blocks,
+                    &mut frozen_signs,
+                );
+                // Frozen coordinates are written ONCE, here; every later
+                // materialize_corner call touches only active-block offsets,
+                // so they persist in `active_x` at their incumbent faces.
+                materialize_corner(
+                    &frozen_blocks,
+                    &frozen_signs,
+                    &layouts,
+                    &active_lo,
+                    &active_hi,
+                    &mut active_x,
+                );
+                eprintln!(
+                    "#flat-ladder-depth: cap {block_cap} bound at level {level} — refining the \
+                     top {kept} blocks by recovered effect ({} frozen at incumbent faces)",
+                    frozen_blocks.len()
+                );
+            }
+        }
         if !split_all(&mut blocks, &mut signs) {
-            break; // fully refined: every block is a single coordinate
+            // fully refined: every active block is a single coordinate
+            stop_reason = "fully refined (every active block is a single coordinate)";
+            break;
         }
         level += 1;
         // A PARTIAL Hadamard block has no orthogonality and recovers nothing:
@@ -21201,6 +25385,7 @@ fn flat_surrogate_hadamard_search(
                      ~{level_probes} probes): {remaining:.1}s left at {avg:.4}s/probe",
                     blocks.len()
                 );
+                stop_reason = "next full level unaffordable in the remaining budget";
                 break;
             }
         }
@@ -21226,7 +25411,10 @@ fn flat_surrogate_hadamard_search(
                 Some(margin)
             })
         };
-        let Some(proposal) = proposal else { break };
+        let Some(proposal) = proposal else {
+            stop_reason = "probe failed or deadline expired mid-level";
+            break;
+        };
         let mut improved = false;
         // Block 0 rides the Hadamard's constant column, so its orientation is
         // measured here, not inferred there: both are tried.
@@ -21234,7 +25422,7 @@ fn flat_surrogate_hadamard_search(
             if expired_search() {
                 break 'ladder;
             }
-            let mut candidate = proposal.clone();
+            let mut candidate = proposal.signs.clone();
             if flip_block0 {
                 candidate[0] = -candidate[0];
             }
@@ -21248,6 +25436,7 @@ fn flat_surrogate_hadamard_search(
             );
             let started = Instant::now();
             let Some(margin) = score(&mut probe_fwd, &active_x) else {
+                stop_reason = "surrogate probe failed";
                 break 'ladder;
             };
             probe_time += started.elapsed();
@@ -21262,6 +25451,7 @@ fn flat_surrogate_hadamard_search(
                 }
                 if let Some((real_margin, out)) = evaluate(&full_x) {
                     best_real_margin = best_real_margin.max(real_margin);
+                    observe_incumbent(&full_x, &out, real_margin, margin, false);
                     if real_margin > 0.0 {
                         if let Some(witness) = try_accept(&full_x, &out, &mut *evaluate) {
                             eprintln!(
@@ -21281,6 +25471,18 @@ fn flat_surrogate_hadamard_search(
             blocks.len(),
             if improved { "" } else { " (no improvement)" },
         );
+        last_effects = Some(proposal.effects);
+    }
+    // #flat-ladder-depth's own observable: the level reached and why the
+    // ladder stopped. Printed only when the cap is armed, so the default
+    // (cap 0) stderr stream is byte-identical to the pre-lever tree.
+    if block_cap >= 2 {
+        eprintln!(
+            "#flat-ladder-depth: ladder stopped after level {level} ({} active + {} frozen \
+             blocks): {stop_reason}",
+            blocks.len(),
+            frozen_blocks.len()
+        );
     }
 
     // --- 4. Remaining budget: the historical contiguous-block pinning search,
@@ -21297,7 +25499,17 @@ fn flat_surrogate_hadamard_search(
     let mut best_active = active_x.clone();
     let mut fraction = 0.25f64;
     let mut stalled = 0u32;
-    while !expired_search() {
+    // #flat-surrogate-transfer: disarmed, `refine_deadline == search_deadline`
+    // and the loop condition below is exactly the historical
+    // `!expired_search()`. Armed with the surrogate already positive, the
+    // refinement keeps only half of the remaining budget; the transfer stage
+    // below gets the rest.
+    let mut refine_deadline = search_deadline;
+    if transfer_armed && incumbent_margin > 0.0 {
+        let now = Instant::now();
+        refine_deadline = now + search_deadline.saturating_duration_since(now) / 2;
+    }
+    while Instant::now() < refine_deadline {
         let len = ((active_len as f64 * fraction).ceil() as usize).clamp(1, active_len);
         let start = (rng.next_u32() as usize) % active_len;
         let to_hi = rng.next_u32() & 1 == 0;
@@ -21314,11 +25526,18 @@ fn flat_surrogate_hadamard_search(
             incumbent_margin = margin;
             best_active.copy_from_slice(&active_x);
             stalled = 0;
+            if transfer_armed && incumbent_margin > 0.0 && refine_deadline == search_deadline {
+                // #flat-surrogate-transfer: first zero-crossing happened here
+                // in the refinement; reserve the transfer stage's half now.
+                let now = Instant::now();
+                refine_deadline = now + search_deadline.saturating_duration_since(now) / 2;
+            }
             for (a, &f) in active_to_full.iter().enumerate() {
                 full_x[f] = active_x[a];
             }
             if let Some((real_margin, out)) = evaluate(&full_x) {
                 best_real_margin = best_real_margin.max(real_margin);
+                observe_incumbent(&full_x, &out, real_margin, margin, false);
                 if real_margin > 0.0 {
                     if let Some(witness) = try_accept(&full_x, &out, &mut *evaluate) {
                         eprintln!(
@@ -21337,10 +25556,243 @@ fn flat_surrogate_hadamard_search(
             }
         }
     }
+    if transfer_armed {
+        if incumbent_margin > 0.0 {
+            // #flat-surrogate-transfer: seed at the surrogate optimum — the
+            // box centre with every ACTIVE coordinate (frozen-block faces
+            // included) taken from the refinement's incumbent — and hand the
+            // remaining budget to the real-output staircase walk. The
+            // surrogate-flat subspace is the frozen inputs: the coordinates
+            // whose surrogate influence was measurably negligible, which are
+            // exactly the ones still free to tip a boundary-pinned rounding
+            // without giving back the surrogate's crossing.
+            let mut seed = center.to_vec();
+            for (a, &f) in active_to_full.iter().enumerate() {
+                seed[f] = best_active[a];
+            }
+            let mut in_active = vec![false; n];
+            for &f in &active_to_full {
+                in_active[f] = true;
+            }
+            let flat_coords: Vec<usize> = (0..n).filter(|&i| !in_active[i]).collect();
+            if let Some(witness) = flat_surrogate_transfer_stage(
+                lo32,
+                hi32,
+                &seed,
+                incumbent_margin,
+                &flat_coords,
+                search_deadline,
+                evaluate,
+                try_accept,
+            ) {
+                return Some(witness);
+            }
+        } else {
+            eprintln!(
+                "#flat-surrogate-transfer: armed — the surrogate never crossed zero (best \
+                 surrogate margin {incumbent_margin:+.6e}); no seed to transfer"
+            );
+        }
+    }
+    // #graph-free-candidates: flush the final re-scored incumbent (report-only;
+    // no-op when dark). Before the lane's ACCEPT_RESERVE is spent, not after.
+    observe_incumbent(&[], &[], f64::NAN, incumbent_margin, true);
     eprintln!(
         "#flat-objective-surrogate: no counterexample after {probes} surrogate probes; best \
          surrogate margin {incumbent_margin:+.6e}, best real margin {best_real_margin:+.6e}. \
          Verdict stays the sound `unknown`."
+    );
+    None
+}
+
+/// SURROGATE->REAL TRANSFER STAGE (#flat-surrogate-transfer).
+///
+/// Entered by [`flat_surrogate_hadamard_search`] — only when the typed
+/// `attack.flat_surrogate_transfer` gate is armed — after the surrogate margin
+/// has crossed zero. At that point the lane holds a candidate the SURROGATE
+/// scores as violating while the REAL model scores it AT the decision boundary
+/// (measured on smart_turn row 11: surrogate +1.4373, real margin exactly
+/// +0.0 — the terminal activation is quantizer/saturation-pinned, so the real
+/// margin is a STAIRCASE and the point sits on a step edge). This stage walks
+/// that staircase directly:
+///
+/// 1. STRICT-INEQUALITY AWARENESS. A real margin of exactly 0.0 is a genuine
+///    violation iff every binding constraint is non-strict, and the decider is
+///    the unchanged zero-tolerance `property_violated_f64` inside the caller's
+///    acceptance stack — so the boundary seed is OFFERED to `try_accept` rather
+///    than pre-judged here. For a strict spec (smart_turn's `(> Y 0.5)`) that
+///    offer refuses instantly and the walk must find a point at least one
+///    quantizer bucket above the threshold.
+/// 2. FLAT-SUBSPACE MOVES. The coordinates the surrogate froze (measurably
+///    negligible surrogate influence) are exactly the ones that can still move
+///    the real pre-saturation tensor a sub-bucket amount WITHOUT giving back
+///    the surrogate's crossing — and a sub-bucket nudge is all a
+///    boundary-pinned rounding needs to tip. Whole-face first, then halving
+///    blocks, down to single coordinates.
+/// 3. WHOLE-BOX MOVES, interleaved, so rows without a frozen subspace (and
+///    steps the flat subspace cannot reach) are still searched.
+///
+/// Every probe is scored on the ORIGINAL model; every improvement to a
+/// non-negative margin is offered to the caller's UNCHANGED acceptance stack
+/// (zero-tolerance box membership, dual-optimization-level gate, neighbourhood
+/// corroboration, then the trusted-oracle gate downstream). The stage can only
+/// STEER; a wrong walk costs probes, never a verdict, and `unsat` remains
+/// structurally unreachable.
+#[allow(clippy::too_many_arguments)]
+fn flat_surrogate_transfer_stage(
+    lo32: &[f32],
+    hi32: &[f32],
+    seed: &[f32],
+    seed_surrogate_margin: f64,
+    flat_coords: &[usize],
+    search_deadline: std::time::Instant,
+    evaluate: &mut dyn FnMut(&[f32]) -> Option<(f64, Vec<f32>)>,
+    try_accept: &mut dyn FnMut(
+        &[f32],
+        &[f32],
+        &mut dyn FnMut(&[f32]) -> Option<(f64, Vec<f32>)>,
+    ) -> Option<String>,
+) -> Option<String> {
+    use std::time::Instant;
+
+    let n = seed.len();
+    let mut cur = seed.to_vec();
+    let Some((seed_real, seed_out)) = evaluate(&cur) else {
+        eprintln!("#flat-surrogate-transfer: seed re-forward failed; declining");
+        return None;
+    };
+    eprintln!(
+        "#flat-surrogate-transfer: armed — seeding at the surrogate optimum (surrogate margin \
+         {seed_surrogate_margin:+.6e}, real margin {seed_real:+.6e}); walking the real \
+         output's quantizer staircase over {} surrogate-flat + {} total coordinate(s)",
+        flat_coords.len(),
+        n
+    );
+    // Distinct real-margin levels observed (bit-exact), for the bucket-step
+    // telemetry in the terminal line. Bounded; a healthy staircase shows a
+    // handful of levels.
+    let mut levels: Vec<u64> = vec![seed_real.to_bits()];
+    let note_level = |m: f64, levels: &mut Vec<u64>| {
+        let bits = m.to_bits();
+        if levels.len() < 64 && !levels.contains(&bits) {
+            levels.push(bits);
+        }
+    };
+    // Strict-inequality awareness: offer the boundary seed to the unchanged
+    // acceptance stack. `property_violated_f64` (inside its emit gate, pure
+    // computation) admits margin exactly 0.0 iff every binding constraint is
+    // non-strict, so a strict spec refuses this instantly and cheaply.
+    if seed_real >= 0.0 {
+        if let Some(witness) = try_accept(&cur, &seed_out, &mut *evaluate) {
+            eprintln!(
+                "#flat-surrogate-transfer: the seed itself is a genuine counterexample (real \
+                 margin {seed_real:+.6e})"
+            );
+            return Some(witness);
+        }
+        if seed_real == 0.0 {
+            eprintln!(
+                "#flat-surrogate-transfer: real margin +0.0 sits ON the decision boundary and \
+                 the acceptance stack refuses it (strict inequality or gate failure); \
+                 searching for a point at least one quantizer bucket above"
+            );
+        }
+    }
+    let mut best_real = seed_real;
+    let mut best = cur.clone();
+    let mut probes = 1u64;
+    let mut improving_moves = 0u64;
+    let mut rng = SimpleRng::new(0x7A45_FE12_u64 ^ (n as u64));
+    // Flat-subspace blocks start at the WHOLE subspace: on the measured rows
+    // the frozen branch is the overwhelming majority of the box and its
+    // whole-face move is the largest available real-tensor nudge.
+    let mut frac_flat = 1.0f64;
+    let mut frac_all = 0.25f64;
+    let mut stalled = 0u32;
+    let mut stop_reason: &str = "search deadline";
+    while Instant::now() < search_deadline {
+        let use_flat = !flat_coords.is_empty() && probes % 2 == 1;
+        cur.copy_from_slice(&best);
+        if use_flat {
+            let m = flat_coords.len();
+            let len = ((m as f64 * frac_flat).ceil() as usize).clamp(1, m);
+            let start = (rng.next_u32() as usize) % m;
+            let to_hi = rng.next_u32() & 1 == 0;
+            for k in 0..len {
+                let i = flat_coords[(start + k) % m];
+                cur[i] = if to_hi { hi32[i] } else { lo32[i] };
+            }
+        } else {
+            let len = ((n as f64 * frac_all).ceil() as usize).clamp(1, n);
+            let start = (rng.next_u32() as usize) % n;
+            let to_hi = rng.next_u32() & 1 == 0;
+            for k in 0..len {
+                let i = (start + k) % n;
+                cur[i] = if to_hi { hi32[i] } else { lo32[i] };
+            }
+        }
+        let Some((margin, out)) = evaluate(&cur) else {
+            stop_reason = "real forward failed";
+            break;
+        };
+        probes += 1;
+        note_level(margin, &mut levels);
+        // Offer: any strictly positive margin, and the FIRST arrival at the
+        // boundary from below (repeat boundary offers on a strict spec would
+        // only re-run the same refusal).
+        if margin > 0.0 || (margin == 0.0 && best_real < 0.0) {
+            if let Some(witness) = try_accept(&cur, &out, &mut *evaluate) {
+                eprintln!(
+                    "#flat-surrogate-transfer: counterexample after {probes} real probes — the \
+                     staircase walk moved the real margin {seed_real:+.6e} -> {margin:+.6e}"
+                );
+                return Some(witness);
+            }
+        }
+        if margin > best_real {
+            best_real = margin;
+            best.copy_from_slice(&cur);
+            improving_moves += 1;
+            stalled = 0;
+        } else {
+            stalled += 1;
+            if stalled >= 8 {
+                frac_flat = (frac_flat * 0.5).max(1.0 / flat_coords.len().max(1) as f64);
+                frac_all = (frac_all * 0.5).max(1.0 / n as f64);
+                stalled = 0;
+            }
+        }
+    }
+    // Bucket telemetry: the smallest positive gap between observed distinct
+    // real-margin levels is (a lower bound on) the quantizer bucket step, and
+    // with a strict threshold at 0 the walk needs floor(|m|/step) + 1 upward
+    // steps from a non-positive margin m.
+    let mut vals: Vec<f64> = levels.iter().map(|&b| f64::from_bits(b)).collect();
+    vals.sort_by(f64::total_cmp);
+    vals.dedup();
+    let mut step = f64::INFINITY;
+    for w in vals.windows(2) {
+        let d = w[1] - w[0];
+        if d > 0.0 {
+            step = step.min(d);
+        }
+    }
+    let bucket_note = if vals.len() >= 2 && step.is_finite() && step > 0.0 {
+        let needed = if best_real > 0.0 {
+            0u64
+        } else {
+            ((-best_real) / step).floor() as u64 + 1
+        };
+        format!(", bucket step ~{step:.3e} ({needed} step(s) below the strict flip)")
+    } else {
+        ", bucket step unresolved (the real margin never moved)".to_string()
+    };
+    eprintln!(
+        "#flat-surrogate-transfer: no transfer — seed surrogate margin \
+         {seed_surrogate_margin:+.6e}, real margin {seed_real:+.6e} -> {best_real:+.6e} after \
+         {probes} real probes ({improving_moves} improving move(s), {} distinct real-margin \
+         level(s){bucket_note}); stopped: {stop_reason}",
+        vals.len()
     );
     None
 }
@@ -21476,11 +25928,12 @@ where
 /// implied by the box there, and on instance_11 the point (0,0) satisfies the
 /// parabola — a witness at (0,0) would be invalid. The non-linear lane honors
 /// the strict atom; the affine one cannot represent it.
+///
+/// #admission-precision: the one implementation lives beside the router's
+/// specification read (`beta_crown::spec_shape`), whose `nonlinear`
+/// archetype is exactly this refusal.
 fn affine_parser_refused_for_representability(msg: &str) -> bool {
-    msg.contains("Non-linear arithmetic")
-        || msg.contains("Strict input constraints are unsupported")
-        || msg.contains("Constraint mixes input and output variables")
-        || msg.contains("Unsupported list expression")
+    super::beta_crown::spec_shape::affine_parser_refused_for_representability(msg)
 }
 
 fn try_nonlinear_sat(
@@ -21489,6 +25942,8 @@ fn try_nonlinear_sat(
     timeout_secs: u64,
     work_deadline: Option<std::time::Instant>,
 ) -> Option<String> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Exact);
     // Freeze the slice before parsing or loading either execution backend so
     // setup is charged and a later fallback cannot rebase beyond the enclosing
     // proof/publication boundary.
@@ -21753,6 +26208,145 @@ fn nonlinear_centered_mono_or_ibp(
     refined.mono.unwrap_or(refined.centered)
 }
 
+/// Resolve the typed `nonlinear_vnnlib.case_split` key (#acc-strict-intervals)
+/// from the wrapper's immutable preset snapshot.
+///
+/// A missing or invalid snapshot, an absent section, or an absent key all
+/// yield `false` — today's lane, byte for byte. (An invalid snapshot never
+/// reaches the lane anyway: `run_and_translate` returns sound `unknown` first.)
+fn nonlinear_case_split_from_snapshot(preset_snapshot: Option<&BetaCrownPresetSnapshot>) -> bool {
+    preset_snapshot
+        .and_then(BetaCrownPresetSnapshot::loaded)
+        .and_then(|preset| preset.nonlinear_vnnlib.case_split)
+        .unwrap_or(false)
+}
+
+/// Engagement counters for the `#nonlinear-vnnlib` case split
+/// (#acc-strict-intervals). One receipt line per unsat-half invocation while
+/// armed, with a FIXED schema, whatever the half returns — so an armed null
+/// (`attempted=0`, or `refuted=0`) is distinguishable from a lane that never
+/// ran. Nothing is printed while dark.
+#[derive(Debug, Default)]
+struct NonlinearCaseSplitStats {
+    armed: bool,
+    /// Undecided cells handed to the split.
+    attempted: usize,
+    /// ... of which every piece was refuted (the cell was discharged).
+    refuted: usize,
+    /// ... of which some piece stayed undecided (the cell was bisected).
+    undecided: usize,
+    /// ... of which the split declined (piece cap) or refused.
+    declined: usize,
+    /// Piece combinations evaluated in total.
+    pieces: usize,
+    /// `NonLinearFormula::case_split_pivot_summary`, once the formula parsed.
+    pivots: Option<String>,
+}
+
+impl NonlinearCaseSplitStats {
+    fn new(armed: bool) -> Self {
+        Self {
+            armed,
+            ..Self::default()
+        }
+    }
+
+    fn render(&self) -> Option<String> {
+        self.armed.then(|| {
+            format!(
+                "#nonlinear-vnnlib: case-split refuted {} cell(s) (pivots {}) armed=1 \
+                 attempted={} undecided={} declined={} pieces={} fp32_guard=1",
+                self.refuted,
+                self.pivots.as_deref().unwrap_or("unparsed"),
+                self.attempted,
+                self.undecided,
+                self.declined,
+                self.pieces,
+            )
+        })
+    }
+
+    fn emit(&self) {
+        if let Some(line) = self.render() {
+            eprintln!("{line}");
+        }
+    }
+}
+
+/// Relative half-width of the armed lane's fp32-replay output band: `2^-16`.
+///
+/// WHY THIS VALUE (INFERRED from the ACC network constants; the 50-row moat
+/// is the measurement that must confirm it). The band has to be WIDER than
+/// the scored fp32 replay's deviation from the real network, and NARROWER
+/// than every output margin a genuine proof relies on:
+///
+/// * the replay's deviation: ny's 16 banked ACC witnesses sit 1-15 f32 ulps
+///   (<= 1.2e-4) above the real clamp 100.0009994506836; the analytic worst
+///   case in the saturated region (products up to ~2071 in the final Gemm)
+///   is ~5e-4. The band at |Y| = 100 is 100 * 2^-16 = 1.5e-3, 3x that.
+/// * the thinnest real margin the 14 proven ACC unsat rows can need: the
+///   negative clamp Y = -99.997 against the `-100` and `-100.001` atoms,
+///   i.e. 3e-3 — 2x the band.
+///
+/// The band is not a proof of fp32 soundness for an arbitrary network; it
+/// strictly SHRINKS the set of refutable cells, so it can cost a proof but can
+/// never create one.
+const NONLINEAR_FP32_REPLAY_MARGIN_REL: f64 = 1.0 / 65536.0;
+
+/// Armed-lane input guard (#acc-strict-intervals): the smallest f32-bounded
+/// box containing the cell, as f64. The checker feeds ONNX Runtime the f32
+/// cast of the witness decimals, and for `x` in `[lo, hi]` that cast lies in
+/// `[largest f32 <= lo, smallest f32 >= hi]`. `None` on a non-finite bound.
+fn nonlinear_fp32_replay_guard_input(lower: &[f64], upper: &[f64]) -> Option<(Vec<f64>, Vec<f64>)> {
+    let down = |value: f64| -> Option<f64> {
+        let nearest = value as f32;
+        let below = if f64::from(nearest) > value {
+            nearest.next_down()
+        } else {
+            nearest
+        };
+        below.is_finite().then(|| f64::from(below))
+    };
+    let up = |value: f64| -> Option<f64> {
+        let nearest = value as f32;
+        let above = if f64::from(nearest) < value {
+            nearest.next_up()
+        } else {
+            nearest
+        };
+        above.is_finite().then(|| f64::from(above))
+    };
+    let lower = lower
+        .iter()
+        .map(|&value| down(value))
+        .collect::<Option<Vec<_>>>()?;
+    let upper = upper
+        .iter()
+        .map(|&value| up(value))
+        .collect::<Option<Vec<_>>>()?;
+    Some((lower, upper))
+}
+
+/// Armed-lane output guard (#acc-strict-intervals): widen each output
+/// enclosure by `NONLINEAR_FP32_REPLAY_MARGIN_REL * max(1, |lo|, |hi|)` per
+/// side, rounded outward. Only ever WIDENS a sound enclosure, so every
+/// refutation made under it is still a refutation in real arithmetic.
+fn nonlinear_fp32_replay_guard_output(lower: &mut [f64], upper: &mut [f64]) -> Option<()> {
+    for (lo, hi) in lower.iter_mut().zip(upper.iter_mut()) {
+        if !lo.is_finite() || !hi.is_finite() {
+            return None;
+        }
+        let band = lo.abs().max(hi.abs()).max(1.0) * NONLINEAR_FP32_REPLAY_MARGIN_REL;
+        let (widened_lo, widened_hi) = ((*lo - band).next_down(), (*hi + band).next_up());
+        if !widened_lo.is_finite() || !widened_hi.is_finite() {
+            return None;
+        }
+        *lo = widened_lo;
+        *hi = widened_hi;
+    }
+    Some(())
+}
+
 /// `#nonlinear-vnnlib` UNSAT half: prove that NO point of the declared region
 /// satisfies a non-linear property, by input-space branch and bound.
 ///
@@ -21772,12 +26366,39 @@ fn nonlinear_centered_mono_or_ibp(
 ///
 /// Any refusal — unsupported op, budget exhausted, split limit — returns `None`
 /// and the caller keeps its sound `unknown`.
+///
+/// # `#acc-strict-intervals` (typed `nonlinear_vnnlib.case_split`, dark)
+///
+/// When `case_split.armed`, a cell that is still [`Tri::Unknown`] after the
+/// IBP screen and the centered/mono refinement gets one more chance:
+/// `NonLinearFormula::holds_over_box_split`, an EXACT case split of every
+/// pivot variable with open-endpoint interval logic. `Tri::False` from it
+/// discharges the cell exactly as a closed refutation would (see that
+/// function for the cover argument); anything else splits the cell as before.
+///
+/// The armed lane also applies the fp32-replay guard to EVERY cell — see
+/// [`nonlinear_fp32_replay_guard_input`] and
+/// [`nonlinear_fp32_replay_guard_output`]. This proof is in REAL arithmetic,
+/// while the scored semantics is the checker's fp32 ONNX Runtime replay. On
+/// ACC the two disagree on exactly the 16 field-SAT rows: the network clamps
+/// at f32(100.001) = 100.0009994506836, 5.5e-7 below the decimal threshold,
+/// so `Y > 100.001` is unsatisfiable in real arithmetic and those rows are sat
+/// only through fp32 rounding. Four of them (4, 16, 28, 39) also cross Y = 0,
+/// and the unrefutable zero straddle is the only thing that keeps today's lane
+/// from "proving" them unsat whenever the sat half misses its witness. The
+/// case split removes that straddle, so the armed lane must not be allowed to
+/// rest a refutation on an output margin thinner than the replay's error.
+///
+/// [`Tri::Unknown`]: ny_onnx::vnnlib::nonlinear::Tri::Unknown
 fn try_nonlinear_unsat(
     onnx: &Path,
     vnnlib: &Path,
     timeout_secs: u64,
     work_deadline: Option<std::time::Instant>,
+    case_split: &mut NonlinearCaseSplitStats,
 ) -> Option<bool> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Exact);
     // This is the second half of a sequential fallback. It shares the caller's
     // absolute work deadline instead of receiving a fresh full relative budget.
     let deadline = nonlinear_lane_deadline(timeout_secs, work_deadline)?;
@@ -21785,6 +26406,9 @@ fn try_nonlinear_unsat(
     let formula = ny_onnx::vnnlib::nonlinear::NonLinearFormula::parse(&content).ok()?;
     if !formula.is_nonlinear() {
         return None;
+    }
+    if case_split.armed {
+        case_split.pivots = Some(formula.case_split_pivot_summary());
     }
     let (lo, hi) = formula.input_box()?;
     let n = lo.len();
@@ -21797,7 +26421,10 @@ fn try_nonlinear_unsat(
     if std::time::Instant::now() >= deadline {
         return None;
     }
-    let model = load_onnx_with_config(onnx, &OnnxLoadConfig::default()).ok()?;
+    // Proof authority for `NonlinearIntervalBab`: the certified lowering
+    // (every authored BatchNormalization kept; #spine-legacy-lanes M2e).
+    let model =
+        load_onnx_with_config(onnx, &OnnxLoadConfig::default().certified_graph_lowering()).ok()?;
     let graph = model
         .to_graph_network_with_options(GraphNetworkOptions::default())
         .ok()?;
@@ -21855,8 +26482,17 @@ fn try_nonlinear_unsat(
         leaves += 1;
 
         let shape = IxDyn(&[1, bl.len()]);
-        let lower = ArrayD::from_shape_vec(shape.clone(), bl.clone()).ok()?;
-        let upper = ArrayD::from_shape_vec(shape, bu.clone()).ok()?;
+        // The armed guard encloses the network over the f32 hull of the cell,
+        // i.e. at every input the checker's f32 cast can produce from a point
+        // of the cell. The FORMULA is still evaluated on the cell itself: the
+        // checker reads input assertions off the witness decimals.
+        let (ibp_lower, ibp_upper) = if case_split.armed {
+            nonlinear_fp32_replay_guard_input(&bl, &bu)?
+        } else {
+            (bl.clone(), bu.clone())
+        };
+        let lower = ArrayD::from_shape_vec(shape.clone(), ibp_lower).ok()?;
+        let upper = ArrayD::from_shape_vec(shape, ibp_upper).ok()?;
         let input = ny_propagate::Interval64 { lower, upper };
         let mut out = graph.propagate_ibp_f64_cell(&input).ok()?;
         if std::time::Instant::now() >= deadline {
@@ -21864,6 +26500,9 @@ fn try_nonlinear_unsat(
         }
         let mut yl: Vec<f64> = out.lower.iter().copied().collect();
         let mut yu: Vec<f64> = out.upper.iter().copied().collect();
+        if case_split.armed {
+            nonlinear_fp32_replay_guard_output(&mut yl, &mut yu)?;
+        }
         let mut truth = formula.holds_over_box(&bl, &bu, &yl, &yu)?;
         // Formula evaluation is verdict-authorized work too. Do not admit the
         // optional multi-walk refinement after the absolute proof deadline.
@@ -21884,11 +26523,37 @@ fn try_nonlinear_unsat(
             }
             yl = out.lower.iter().copied().collect();
             yu = out.upper.iter().copied().collect();
+            if case_split.armed {
+                nonlinear_fp32_replay_guard_output(&mut yl, &mut yu)?;
+            }
             // The baseline evaluation succeeded, so a refinement-evaluator
             // refusal is unexpected. Fail open to its prior Unknown instead of
             // throwing away the existing complete-cover search.
             if let Some(refined_truth) = formula.holds_over_box(&bl, &bu, &yl, &yu) {
                 truth = refined_truth;
+            }
+        }
+
+        // #acc-strict-intervals: last resort for a still-undecided cell. The
+        // split only ever turns Unknown into False (never True), and only when
+        // every piece of an exact partition of the cell is refuted.
+        if truth == ny_onnx::vnnlib::nonlinear::Tri::Unknown && case_split.armed {
+            case_split.attempted += 1;
+            match formula.holds_over_box_split(&bl, &bu, &yl, &yu) {
+                Some(verdict) if verdict.truth == ny_onnx::vnnlib::nonlinear::Tri::False => {
+                    case_split.refuted += 1;
+                    case_split.pieces += verdict.pieces;
+                    truth = ny_onnx::vnnlib::nonlinear::Tri::False;
+                }
+                Some(verdict) if verdict.pieces == 0 => case_split.declined += 1,
+                Some(verdict) => {
+                    case_split.undecided += 1;
+                    case_split.pieces += verdict.pieces;
+                }
+                None => case_split.declined += 1,
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
             }
         }
 
@@ -22280,6 +26945,8 @@ fn invoke_beta_crown(
     deferred_pgd_consumer_available: bool,
     instance_overrides: BetaCrownInstanceOverrides,
 ) -> Result<()> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Verify);
     // GPU capability HINT for the AUTO size gate, not a backend force: the
     // per-instance decision still applies — LARGE conv-dominated inputs (>1000
     // elements) go to the GPU, while small input-split nets (acasxu = 5 inputs,
@@ -22297,7 +26964,7 @@ fn invoke_beta_crown(
     //
     // SOUNDNESS (#vnncomp-gpu-crown-soundness): unchanged. This only alters backend
     // SELECTION, and BOTH backends are sound (CPU and GPU yield the same verdict).
-    // `competition_mode: true` below still engages the process-global gate in
+    // The `ProofOpts` below still engage the process-global gate in
     // `handle_beta_crown_command` (`ny_propagate::set_sound_gpu_crown_required`) so
     // verdict-deciding CROWN runs on the proven-sound CPU path; GPU is used only for
     // GEMM, IBP forward, and PGD/attack, which cannot produce an unsound Verified.
@@ -22388,14 +27055,26 @@ fn invoke_beta_crown(
         // stub and DROP sound MIP verdicts as `unknown`.
         CompleteVerifierArg::Auto,
         None::<MipSolverArg>,
-        // The scored VNN-COMP path runs in competition mode: proof-carrying
-        // certificate emission and the in-tree self-checks are turned OFF so the
-        // exact-arithmetic pass never competes with the wall-clock budget. This
-        // does NOT weaken verdict soundness: it explicitly grants only runtime
-        // verdict authority, while interactive `ny beta-crown` requests external
-        // certificate authority by default.
+        // #soundness-spine M2a: the scored path runs under the profile the
+        // entry point froze (`competition` unless `--proof-profile proof` was
+        // given for a banking/moat run). Verdict authority is identical in
+        // both: runtime-certified verdicts publish, and only
+        // `--require-certificate` (never set here) makes certificate export
+        // verdict-bearing. The inline ny-cert sidecar stays OFF in BOTH
+        // profiles on this entry point (R5: proof artifacts are hints for an
+        // offline checker, never inline capture before publication — the
+        // sidecar pass runs before the scored flow publishes, and it has no
+        // post-publication hook yet), so a Proof-profile moat run cannot lose
+        // a verdict to artifact work. The profile still selects the audit
+        // rates.
         ProofOpts {
-            competition_mode: true,
+            profile: ny_core::proof_profile::frozen().unwrap_or(
+                ny_core::proof_profile::ResolvedProofProfile::resolve(
+                    ny_core::proof_profile::EntryPoint::VnncompV1,
+                    None,
+                ),
+            ),
+            emit_certificate: Some(false),
             ..ProofOpts::default()
         },
         // This is the frozen wrapper decision resolved before verifier setup,
@@ -22414,6 +27093,27 @@ fn invoke_beta_crown(
 /// bytes never landed, so the placeholder is still what a watchdog would be
 /// replacing.
 fn write_results(results_file: &Path, result: &VnncompResult) -> Result<()> {
+    // #phase-cost: publication (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Publish);
+    if let VnncompResult::Unsat(receipt) = result {
+        if receipt.has_retained_owner() {
+            let bytes = retained_publication_bytes(results_file)?;
+            let _claim = receipt.reserve_owner_publication(bytes, None)?;
+            let tmp = results_file.with_extension("result.tmp");
+            anyhow::ensure!(
+                tmp.capacity() <= bytes,
+                "retained proof result path capacity exceeds admission"
+            );
+            let mut cleanup = UnpublishedResultCleanup::new(&tmp);
+            receipt.checkpoint_owner(None)?;
+            fs::write(&tmp, "unsat\n")?;
+            receipt.checkpoint_owner(None)?;
+            fs::rename(&tmp, results_file)?;
+            cleanup.disarm();
+            note_published_verdict(result);
+            return Ok(());
+        }
+    }
     publish_result_atomically(results_file, &result.render_results_file(), "result.tmp")
         .map(|()| note_published_verdict(result))
         .map_err(|e| {
@@ -22452,6 +27152,42 @@ fn write_terminal_result(
 mod tests {
     use super::*;
     use flate2::write::GzEncoder;
+
+    /// #fast-f32-prewarm-all-hosts, spec test (b): after the vnncomp-route
+    /// prewarm, the fast-f32 slot is PREINITIALIZED on a CPU-only build —
+    /// i.e. a finite-deadline consumer resolves a real engine instead of
+    /// failing closed to the quarantined proof adapter.
+    ///
+    /// The helper's `Some(ready)` is `prewarm_fast_f32_gemm()`'s own answer,
+    /// which is true exactly when `fast_f32_gemm::is_preinitialized()` holds;
+    /// the telemetry backend goes `Some` only once an engine really exists.
+    ///
+    /// Shown able to fail: with the helper's `prewarm_fast_f32_gemm()` call
+    /// removed (armed path returning `Some(false)` without materializing),
+    /// both assertions go red on a fresh process.
+    #[test]
+    fn armed_fast_f32_prewarm_materializes_the_cpu_engine_for_finite_consumers() {
+        // Exactly what `main()` does on every host (#cpu-gemm-engine): the
+        // CPU floor factory is installed but NOT materialized.
+        ny_propagate::faer_parallelism::install_cpu_gemm_engine_if_absent();
+        // The yaml route's cell write (what `preset_gates::apply` performs
+        // for `bab.fast_f32_prewarm: true`).
+        ny_propagate::preset_gates::set_fast_f32_prewarm_preset(true);
+
+        let ready = prewarm_fast_f32_for_all_hosts_if_armed();
+        assert_eq!(
+            ready,
+            Some(true),
+            "armed prewarm must materialize the registered CPU factory \
+             (is_preinitialized() must hold afterwards)"
+        );
+        assert!(
+            ny_propagate::fast_f32_gemm::telemetry_snapshot()
+                .backend
+                .is_some(),
+            "a materialized engine must publish a truthful backend identity"
+        );
+    }
 
     fn frozen_upfront_set(
         raw: &[(&str, &str)],
@@ -22576,6 +27312,283 @@ mod tests {
     }
 
     #[test]
+    fn postbab_restart_policy_uses_the_frozen_layered_value() {
+        use ny_levers::decls::vnncomp_entry::POSTBAB_RESTARTS;
+
+        let default = frozen_upfront_set(&[], &[]);
+        assert_eq!(
+            PostBabRestartPolicy::from_levers(&default).unwrap(),
+            PostBabRestartPolicy {
+                configured_restarts: 0
+            },
+            "absence must keep the historical zero-restart stack"
+        );
+
+        let configured = frozen_upfront_set(
+            &[],
+            &[(POSTBAB_RESTARTS.name, ny_levers::LeverValue::U64(4))],
+        );
+        assert_eq!(
+            PostBabRestartPolicy::from_levers(&configured).unwrap(),
+            PostBabRestartPolicy {
+                configured_restarts: 4
+            }
+        );
+
+        let overridden = frozen_upfront_set(
+            &[(POSTBAB_RESTARTS.name, " 8 ")],
+            &[(POSTBAB_RESTARTS.name, ny_levers::LeverValue::U64(4))],
+        );
+        assert_eq!(
+            PostBabRestartPolicy::from_levers(&overridden).unwrap(),
+            PostBabRestartPolicy {
+                configured_restarts: 8
+            }
+        );
+        assert_eq!(
+            overridden.source(&POSTBAB_RESTARTS),
+            ny_levers::Source::LegacyEnv
+        );
+
+        let rejected = frozen_upfront_set(
+            &[(POSTBAB_RESTARTS.name, "not-a-count")],
+            &[(POSTBAB_RESTARTS.name, ny_levers::LeverValue::U64(4))],
+        );
+        assert_eq!(
+            PostBabRestartPolicy::from_levers(&rejected).unwrap(),
+            PostBabRestartPolicy {
+                configured_restarts: 0
+            },
+            "a rejected env token must fall back to the declaration default, not the preset"
+        );
+        assert_eq!(
+            rejected.source(&POSTBAB_RESTARTS),
+            ny_levers::Source::LegacyEnvRejected
+        );
+    }
+
+    #[test]
+    fn postbab_restart_row_seed_is_a_pure_function_of_row_identity() {
+        let onnx_a = Path::new("/somewhere/model_0.onnx");
+        let vnnlib_a = Path::new("/somewhere/property_040.vnnlib");
+        let seed_a = postbab_restart_row_seed(onnx_a, vnnlib_a);
+        // Same file names under a different root => same seed (host-portable).
+        assert_eq!(
+            seed_a,
+            postbab_restart_row_seed(
+                Path::new("/elsewhere/model_0.onnx"),
+                Path::new("/elsewhere/property_040.vnnlib"),
+            ),
+            "row seed must depend on file names, not absolute paths"
+        );
+        // A different property => a different stream.
+        assert_ne!(
+            seed_a,
+            postbab_restart_row_seed(onnx_a, Path::new("/somewhere/property_045.vnnlib")),
+            "row seed must separate rows"
+        );
+        // A different model => a different stream.
+        assert_ne!(
+            seed_a,
+            postbab_restart_row_seed(Path::new("/somewhere/model_1.onnx"), vnnlib_a),
+            "row seed must separate models"
+        );
+    }
+
+    #[test]
+    fn postbab_restart_basins_are_deterministic_in_box_and_diverse() {
+        let box_lo = [-1.0f32, 0.0, 2.0, 5.0];
+        let box_hi = [1.0f32, 4.0, 2.0, 6.0]; // axis 2 is degenerate
+        let reference = [0.9f32, 3.9, 2.0, 5.95];
+        let row_seed =
+            postbab_restart_row_seed(Path::new("model_0.onnx"), Path::new("property_040.vnnlib"));
+
+        let in_box = |point: &[f32]| {
+            point
+                .iter()
+                .zip(box_lo.iter().zip(&box_hi))
+                .all(|(&value, (&lo, &hi))| value >= lo && value <= hi)
+        };
+
+        // The basin family cycles deterministically by index.
+        assert_eq!(
+            PostBabRestartBasin::from_index(0),
+            PostBabRestartBasin::Uniform
+        );
+        assert_eq!(
+            PostBabRestartBasin::from_index(1),
+            PostBabRestartBasin::Corner
+        );
+        assert_eq!(
+            PostBabRestartBasin::from_index(2),
+            PostBabRestartBasin::OrthogonalJitter
+        );
+        assert_eq!(
+            PostBabRestartBasin::from_index(3),
+            PostBabRestartBasin::Uniform
+        );
+
+        let mut starts: Vec<Vec<f32>> = Vec::new();
+        for restart_index in 0..3u64 {
+            let basin = PostBabRestartBasin::from_index(restart_index);
+            let start = postbab_restart_basin_start(
+                basin,
+                &box_lo,
+                &box_hi,
+                Some(&reference),
+                row_seed,
+                restart_index,
+            );
+            // Deterministic: the same inputs reproduce the same start bit-for-bit.
+            assert_eq!(
+                start,
+                postbab_restart_basin_start(
+                    basin,
+                    &box_lo,
+                    &box_hi,
+                    Some(&reference),
+                    row_seed,
+                    restart_index,
+                ),
+                "restart {restart_index} must be reproducible"
+            );
+            assert!(
+                in_box(&start),
+                "restart {restart_index} start must stay in box"
+            );
+            assert_eq!(start[2], 2.0, "degenerate axis must collapse to its value");
+            assert_ne!(
+                start, reference,
+                "restart {restart_index} must leave the converged point"
+            );
+            assert!(
+                !starts.contains(&start),
+                "restart {restart_index} must differ from earlier basins"
+            );
+            starts.push(start);
+        }
+
+        // Corner basin is an actual extreme point on every non-degenerate axis.
+        let corner = &starts[1];
+        for (d, &value) in corner.iter().enumerate() {
+            assert!(
+                value == box_lo[d] || value == box_hi[d],
+                "corner axis {d} must sit on a box face"
+            );
+        }
+
+        // The jitter basin displaces every non-degenerate axis away from the
+        // reference by a macroscopic fraction of the axis range (not ULPs).
+        let jitter = &starts[2];
+        for (d, (&value, &anchor)) in jitter.iter().zip(&reference).enumerate() {
+            if box_lo[d] < box_hi[d] {
+                let range = f64::from(box_hi[d]) - f64::from(box_lo[d]);
+                let moved = (f64::from(value) - f64::from(anchor)).abs();
+                assert!(
+                    moved >= 0.05 * range,
+                    "jitter axis {d} moved only {moved:.3e} of range {range:.3e}"
+                );
+            }
+        }
+
+        // Missing reference falls back to the box center for the jitter basin
+        // and still lands in box.
+        let unreferenced = postbab_restart_basin_start(
+            PostBabRestartBasin::OrthogonalJitter,
+            &box_lo,
+            &box_hi,
+            None,
+            row_seed,
+            2,
+        );
+        assert!(in_box(&unreferenced));
+    }
+
+    #[test]
+    fn head_directional_cuts_shipped_preset_reaches_frozen_policy_without_environment() {
+        use ny_levers::decls::margin_row::{
+            MARGIN_ROW_HEAD_DIRECTIONAL_CUTS, MARGIN_ROW_HEAD_GROUPS,
+        };
+        use ny_propagate::margin_row::MarginRowRuntimePolicy;
+
+        let project = |preset: &crate::preset::PresetConfig, raw: &[(&str, &str)]| {
+            let serialized = serde_json::to_value(preset).unwrap();
+            let captured = ny_levers::RawLeverInputs::capture_with(ny_levers::all(), |name| {
+                raw.iter()
+                    .find_map(|(key, value)| (*key == name).then(|| (*value).into()))
+            });
+            let levers =
+                ny_levers::LeverSet::resolve_layered(ny_levers::all(), &captured, |decl| {
+                    preset_delivered_config_value(&serialized, decl)
+                })
+                .unwrap();
+            let policy = MarginRowRuntimePolicy::from_levers(&levers).unwrap();
+            (levers, policy)
+        };
+
+        let (defaults, default_policy) = project(&crate::preset::PresetConfig::default(), &[]);
+        assert_eq!(default_policy, MarginRowRuntimePolicy::default());
+        assert!(default_policy.head_groups.unwrap().directional_cuts());
+        for decl in [&MARGIN_ROW_HEAD_GROUPS, &MARGIN_ROW_HEAD_DIRECTIONAL_CUTS] {
+            assert_eq!(
+                defaults.resolved(decl).unwrap().source,
+                ny_levers::Source::Default
+            );
+        }
+
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/vnncomp26/safenlp_2024.yaml");
+        let mut preset = crate::preset::load_preset(&path).unwrap();
+        assert_eq!(preset.general.complete_verifier.as_deref(), Some("mip"));
+        assert_eq!(preset.bab.safenlp_mip_cycle, Some(true));
+        let (shipped, policy) = project(&preset, &[]);
+        let group = policy
+            .head_groups
+            .expect("the actual shipped preset reaches the parent route");
+        assert!(group.directional_cuts());
+        assert_eq!(
+            group.phase_cover().map(|cover| cover.max_heads()),
+            Some(7),
+            "the shipped SafeNLP policy retains its qualified seven-head cover"
+        );
+        for decl in [&MARGIN_ROW_HEAD_GROUPS, &MARGIN_ROW_HEAD_DIRECTIONAL_CUTS] {
+            let value = shipped.resolved(decl).unwrap();
+            assert_eq!(value.value, ny_levers::LeverValue::Bool(true));
+            assert_eq!(value.source, ny_levers::Source::Config);
+        }
+
+        preset.margin_row.head_directional_cuts = Some(false);
+        let (off_receipt, off_policy) = project(&preset, &[]);
+        let off = off_policy
+            .head_groups
+            .expect("directional OFF retains the old group methods");
+        assert!(!off.directional_cuts());
+        assert_eq!(off.with_directional_cuts(true), group);
+        assert_eq!(
+            off_receipt
+                .resolved(&MARGIN_ROW_HEAD_DIRECTIONAL_CUTS)
+                .unwrap()
+                .source,
+            ny_levers::Source::Config
+        );
+        let (_, env_on) = project(&preset, &[(MARGIN_ROW_HEAD_DIRECTIONAL_CUTS.name, "1")]);
+        assert!(env_on.head_groups.unwrap().directional_cuts());
+        preset.margin_row.head_directional_cuts = Some(true);
+        let (_, env_off) = project(&preset, &[(MARGIN_ROW_HEAD_DIRECTIONAL_CUTS.name, "0")]);
+        assert!(!env_off.head_groups.unwrap().directional_cuts());
+        preset.margin_row.head_groups = Some(false);
+        let (disabled_receipt, disabled) = project(&preset, &[]);
+        assert_eq!(disabled.head_groups, None);
+        assert_eq!(
+            disabled_receipt
+                .resolved(&MARGIN_ROW_HEAD_GROUPS)
+                .unwrap()
+                .source,
+            ny_levers::Source::Config
+        );
+    }
+
+    #[test]
     fn margin_row_policy_uses_the_frozen_layered_values() {
         use ny_levers::decls::margin_row::{
             EPOCH_ATTEMPTS, EPOCH_DEPTH, EPOCH_RETAIN, EPOCH_TIER0, EPOCH_UNIVERSE,
@@ -22591,6 +27604,8 @@ mod tests {
         use ny_levers::decls::sound_channel::{
             MARGIN_ROW_ALPHA_COLS, MARGIN_ROW_ALPHA_GUARD, MARGIN_ROW_ALPHA_ITERS,
             MARGIN_ROW_ALPHA_LR, MARGIN_ROW_ALPHA_OPT, MARGIN_ROW_ALPHA_SECS,
+            MARGIN_ROW_SPEC_ALPHA, MARGIN_ROW_SPEC_ALPHA_CANDS, MARGIN_ROW_SPEC_ALPHA_ENTRIES,
+            MARGIN_ROW_SPEC_ALPHA_ROUNDS, MARGIN_ROW_SPEC_ALPHA_WIDTH,
         };
         use ny_propagate::margin_row::{
             BackwardIntermRuntimePolicy, DomainAlphaRuntimePolicy, EpochRuntimePolicy,
@@ -22680,6 +27695,30 @@ mod tests {
                     MARGIN_ROW_EPOCH_PARENT_TOPK.name,
                     ny_levers::LeverValue::U64(16),
                 ),
+                // The five spec_alpha fields the expected policy asserts. They were
+                // asserted but never FED (the same defect 0f65b551d fixed in the
+                // ny-propagate copy of this test): only a non-default value proves
+                // the field resolved from the frozen LeverSet.
+                (
+                    MARGIN_ROW_SPEC_ALPHA.name,
+                    ny_levers::LeverValue::Bool(true),
+                ),
+                (
+                    MARGIN_ROW_SPEC_ALPHA_WIDTH.name,
+                    ny_levers::LeverValue::U64(4),
+                ),
+                (
+                    MARGIN_ROW_SPEC_ALPHA_CANDS.name,
+                    ny_levers::LeverValue::U64(5),
+                ),
+                (
+                    MARGIN_ROW_SPEC_ALPHA_ROUNDS.name,
+                    ny_levers::LeverValue::U64(2),
+                ),
+                (
+                    MARGIN_ROW_SPEC_ALPHA_ENTRIES.name,
+                    ny_levers::LeverValue::U64(4_096),
+                ),
             ],
         );
         assert_eq!(
@@ -22689,6 +27728,11 @@ mod tests {
                 root_precision: RootPrecisionRuntimePolicy {
                     root_f32: true,
                     tableau_f32: true,
+                    err_lane: ny_propagate::margin_row::ErrLane::PerCol,
+                    // #mr-ibp-seed: not fed by this fixture -> declaration false.
+                    ibp_seed: false,
+                    // #root-box-source: not fed by this fixture -> `tableau`.
+                    box_source: ny_propagate::margin_row::RootBoxSource::Tableau,
                 },
                 backward_interm: BackwardIntermRuntimePolicy {
                     enabled: true,
@@ -22696,6 +27740,13 @@ mod tests {
                     chunk: 64,
                     chunk_secs: 2.0,
                     topk: 256,
+                    interm_alpha: 0,
+                    // #bi-window: not fed by this fixture -> declaration false.
+                    window: false,
+                    // #bi-gpu: not fed by this fixture -> declaration false.
+                    gpu: false,
+                    // #bi-patch: not fed by this fixture -> declaration defaults.
+                    patch: ny_propagate::margin_row::BiPatchRuntimePolicy::default(),
                 },
                 root_alpha: RootAlphaRuntimePolicy {
                     alpha_enabled: true,
@@ -22707,7 +27758,18 @@ mod tests {
                     rebake_enabled: true,
                     rebake_rounds: 3,
                     rebake_secs: 45.0,
+                    spec_alpha_enabled: true,
+                    spec_alpha_width: 4,
+                    spec_alpha_cands: 5,
+                    spec_alpha_rounds: 2,
+                    spec_alpha_entries: 4_096,
                 },
+                // #joint-refresh: not fed by this fixture -> dark defaults.
+                joint_refresh: Default::default(),
+                // #root-certify-once: not fed by this fixture -> dark defaults.
+                root_certify_once: Default::default(),
+                head_groups: ny_propagate::margin_row::HeadGroupPolicy::new(5.0, 2, 4),
+                classwise: false,
                 domain_alpha: DomainAlphaRuntimePolicy {
                     enabled: true,
                     iters: 4,
@@ -22729,6 +27791,8 @@ mod tests {
                 beta_columns: 4,
                 column_retire: true,
                 parallel_prebuild: false,
+                // #wave-beta-bab: not fed by this fixture -> `legacy`.
+                wave: ny_propagate::margin_row::WavePolicy::default(),
             }
         );
         for decl in [
@@ -22782,6 +27846,14 @@ mod tests {
                 (EPOCH_UNIVERSE.name, "32"),
                 (EPOCH_RETAIN.name, "64"),
                 (MARGIN_ROW_EPOCH_PARENT_TOPK.name, " 32 "),
+                // The five spec_alpha fields this block asserts, fed as env strings so the
+                // layered env-over-config precedence is what the assertion proves (they
+                // were asserted but never fed — the twin of 0f65b551d).
+                (MARGIN_ROW_SPEC_ALPHA.name, "0"),
+                (MARGIN_ROW_SPEC_ALPHA_WIDTH.name, " 64 "),
+                (MARGIN_ROW_SPEC_ALPHA_CANDS.name, "8"),
+                (MARGIN_ROW_SPEC_ALPHA_ROUNDS.name, " 3 "),
+                (MARGIN_ROW_SPEC_ALPHA_ENTRIES.name, "4194304"),
             ],
             &[
                 (MARGIN_ROW_ROOT_F32.name, ny_levers::LeverValue::Bool(false)),
@@ -22864,6 +27936,26 @@ mod tests {
                     MARGIN_ROW_EPOCH_PARENT_TOPK.name,
                     ny_levers::LeverValue::U64(16),
                 ),
+                (
+                    MARGIN_ROW_SPEC_ALPHA.name,
+                    ny_levers::LeverValue::Bool(true),
+                ),
+                (
+                    MARGIN_ROW_SPEC_ALPHA_WIDTH.name,
+                    ny_levers::LeverValue::U64(4),
+                ),
+                (
+                    MARGIN_ROW_SPEC_ALPHA_CANDS.name,
+                    ny_levers::LeverValue::U64(5),
+                ),
+                (
+                    MARGIN_ROW_SPEC_ALPHA_ROUNDS.name,
+                    ny_levers::LeverValue::U64(2),
+                ),
+                (
+                    MARGIN_ROW_SPEC_ALPHA_ENTRIES.name,
+                    ny_levers::LeverValue::U64(4_096),
+                ),
             ],
         );
         assert_eq!(
@@ -22873,6 +27965,11 @@ mod tests {
                 root_precision: RootPrecisionRuntimePolicy {
                     root_f32: true,
                     tableau_f32: false,
+                    err_lane: ny_propagate::margin_row::ErrLane::PerCol,
+                    // #mr-ibp-seed: not fed by this fixture -> declaration false.
+                    ibp_seed: false,
+                    // #root-box-source: not fed by this fixture -> `tableau`.
+                    box_source: ny_propagate::margin_row::RootBoxSource::Tableau,
                 },
                 backward_interm: BackwardIntermRuntimePolicy {
                     enabled: false,
@@ -22880,6 +27977,13 @@ mod tests {
                     chunk: 4096,
                     chunk_secs: 5.0,
                     topk: 1,
+                    interm_alpha: 0,
+                    // #bi-window: not fed by this fixture -> declaration false.
+                    window: false,
+                    // #bi-gpu: not fed by this fixture -> declaration false.
+                    gpu: false,
+                    // #bi-patch: not fed by this fixture -> declaration defaults.
+                    patch: ny_propagate::margin_row::BiPatchRuntimePolicy::default(),
                 },
                 root_alpha: RootAlphaRuntimePolicy {
                     alpha_enabled: false,
@@ -22891,7 +27995,18 @@ mod tests {
                     rebake_enabled: false,
                     rebake_rounds: 8,
                     rebake_secs: 0.0,
+                    spec_alpha_enabled: false,
+                    spec_alpha_width: 64,
+                    spec_alpha_cands: 8,
+                    spec_alpha_rounds: 3,
+                    spec_alpha_entries: 4_194_304,
                 },
+                // #joint-refresh: not fed by this fixture -> dark defaults.
+                joint_refresh: Default::default(),
+                // #root-certify-once: not fed by this fixture -> dark defaults.
+                root_certify_once: Default::default(),
+                head_groups: ny_propagate::margin_row::HeadGroupPolicy::new(5.0, 2, 4),
+                classwise: false,
                 domain_alpha: DomainAlphaRuntimePolicy {
                     enabled: false,
                     iters: 8,
@@ -22913,6 +28028,8 @@ mod tests {
                 beta_columns: 32,
                 column_retire: false,
                 parallel_prebuild: true,
+                // #wave-beta-bab: not fed by this fixture -> `legacy`.
+                wave: ny_propagate::margin_row::WavePolicy::default(),
             }
         );
         for decl in [
@@ -23434,6 +28551,9 @@ mod tests {
         loaded.attack.pgd_lane_window = Some(50);
         loaded.attack.pgd_exploit = Some(false);
         loaded.attack.pgd_hinge_tau = Some(0.0001);
+        loaded.attack.pgd_disj_odi = Some(true);
+        loaded.attack.pgd_disj_focus_lanes = Some(32);
+        loaded.attack.post_bab_restarts = Some(6);
         loaded.bab.root_comprehensive_gpu_interm_chunks = Some(64);
         loaded.bab.phase_budget.post_bab_reserve_secs = Some(100);
         loaded.bab.phase_budget.vnncomp_post_bab_attack = Some(false);
@@ -23538,12 +28658,24 @@ mod tests {
                 ny_levers::LeverValue::F64(f64::from(0.0001_f32)),
             ),
             (
+                &ny_levers::decls::exact_vjp_pgd::DISJ_ODI,
+                ny_levers::LeverValue::Bool(true),
+            ),
+            (
+                &ny_levers::decls::exact_vjp_pgd::DISJ_FOCUS_LANES,
+                ny_levers::LeverValue::U64(32),
+            ),
+            (
                 &ny_levers::decls::comprehensive_rows::INTERM_ROW_CHUNKS,
                 ny_levers::LeverValue::U64(64),
             ),
             (
                 &ny_levers::decls::vnncomp_entry::POSTBAB_RESERVE_SECS,
                 ny_levers::LeverValue::U64(100),
+            ),
+            (
+                &ny_levers::decls::vnncomp_entry::POSTBAB_RESTARTS,
+                ny_levers::LeverValue::U64(6),
             ),
             (
                 &ny_levers::decls::vnncomp_entry::POSTBAB_ATTACK,
@@ -23697,6 +28829,61 @@ mod tests {
         .expect("serialized post-BaB wrapper delivery is admissible");
         assert_eq!(configured_attack.value, ny_levers::LeverValue::Bool(false));
         assert_eq!(configured_attack.source, ny_levers::Source::Config);
+    }
+
+    /// #disj-odi: the two keys reach the scored run's frozen exact-VJP policy
+    /// through the same preset projection the receipt is built from, with
+    /// `Source::Config` — never `Source::LegacyEnv` — and without them the
+    /// frozen policy is the historical one (`Source::Default`).
+    #[test]
+    fn disj_odi_preset_source_is_typed() {
+        use ny_levers::decls::exact_vjp_pgd::{DISJ_FOCUS_LANES, DISJ_ODI};
+
+        let project = |preset: &crate::preset::PresetConfig| {
+            let serialized = serde_json::to_value(preset).expect("preset serializes");
+            let captured = ny_levers::RawLeverInputs::capture_with(ny_levers::all(), |_| None);
+            ny_levers::LeverSet::resolve_layered(ny_levers::all(), &captured, |decl| {
+                preset_delivered_config_value(&serialized, decl)
+            })
+            .expect("the projected preset must match its declarations")
+        };
+
+        let dark = project(&crate::preset::PresetConfig::default());
+        for decl in [&DISJ_ODI, &DISJ_FOCUS_LANES] {
+            let resolved = dark.resolved(decl).expect("the lever is declared");
+            assert_eq!(resolved.source, ny_levers::Source::Default, "{}", decl.name);
+        }
+        let dark_policy = ExactVjpPgdConfig::from_levers(&dark).expect("dark policy resolves");
+        assert!(!dark_policy.disj_odi);
+        assert_eq!(dark_policy.disj_focus_lanes, 0);
+
+        let mut preset = crate::preset::PresetConfig::default();
+        preset.attack.pgd_disj_odi = Some(true);
+        preset.attack.pgd_disj_focus_lanes = Some(32);
+        let armed = project(&preset);
+        let odi = armed.resolved(&DISJ_ODI).expect("the lever is declared");
+        assert_eq!(odi.value, ny_levers::LeverValue::Bool(true));
+        assert_eq!(odi.source, ny_levers::Source::Config);
+        let lanes = armed
+            .resolved(&DISJ_FOCUS_LANES)
+            .expect("the lever is declared");
+        assert_eq!(lanes.value, ny_levers::LeverValue::U64(32));
+        assert_eq!(lanes.source, ny_levers::Source::Config);
+        for resolved in [odi, lanes] {
+            assert_ne!(resolved.source, ny_levers::Source::LegacyEnv);
+        }
+        let armed_policy = ExactVjpPgdConfig::from_levers(&armed).expect("armed policy resolves");
+        assert!(armed_policy.disj_odi);
+        assert_eq!(armed_policy.disj_focus_lanes, 32);
+        assert_eq!(
+            ExactVjpPgdConfig {
+                disj_odi: false,
+                disj_focus_lanes: 0,
+                ..armed_policy
+            },
+            dark_policy,
+            "the two keys change nothing else in the frozen policy"
+        );
     }
 
     #[test]
@@ -23903,9 +29090,29 @@ mod tests {
                 }
             };
 
+            // ALTERNATE which publisher is spawned first. Both are still spawned
+            // and still race for real — every safety assertion below runs under
+            // genuine concurrency — but which one tends to win is now driven by
+            // this loop instead of by the scheduler's mood.
+            //
+            // Spawning lane-then-main every time made the coverage assertion at
+            // the end of this function LOAD-DEPENDENT: the first-spawned thread
+            // usually claims the flag, so on a busy box (or simply with the full
+            // 1823-test suite running in parallel) the tally came out
+            // `lane won 300, main won 0` and the test failed, while passing in
+            // isolation. That is a scheduler artifact reported as a product
+            // defect — the exact ambient red that trains people to skim past a
+            // real failure. Making the ORDER deterministic while leaving the RACE
+            // real fixes the flake without weakening anything: the invariants are
+            // still checked 300 times against two genuinely concurrent writers.
             std::thread::scope(|scope| {
-                scope.spawn(|| publish(VnncompResult::Unsat, true));
-                scope.spawn(|| publish(VnncompResult::Timeout, false));
+                if iteration % 2 == 0 {
+                    scope.spawn(|| publish(VnncompResult::test_unsat(), true));
+                    scope.spawn(|| publish(VnncompResult::Timeout, false));
+                } else {
+                    scope.spawn(|| publish(VnncompResult::Timeout, false));
+                    scope.spawn(|| publish(VnncompResult::test_unsat(), true));
+                }
             });
 
             assert_eq!(
@@ -23931,10 +29138,15 @@ mod tests {
                 "iteration {iteration}: unexpected RESULTS_FILE content {on_disk:?}"
             );
         }
+        // Still asserted, and still meaningful — but now it is a claim about
+        // THIS LOOP rather than a bet on the scheduler, because the spawn order
+        // alternates above. If it ever fails now, one publisher genuinely cannot
+        // win, which is a real defect rather than a busy machine.
         assert!(
             lane_won > 0 && main_won > 0,
             "both interleavings must be exercised (lane won {lane_won}, main won {main_won}); \
-             a run that only ever sees one order is not testing the race"
+             the spawn order alternates, so a one-sided tally means a publisher \
+             cannot win at all"
         );
     }
 
@@ -23990,6 +29202,372 @@ mod tests {
             arm > guard && arm - guard < 600,
             "arming must happen inside the `!short_grace_route` block that follows the \
              competition-safety pre-write (guard at {guard}, arming at {arm})"
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    //  #sat-precedence — a CONFIRMED counterexample outranks every `unsat`
+    //
+    //  THE DEFECT THESE PIN. `#twinwall-early-exit` ordered the lane's `unsat`
+    //  and the main thread's `sat` by ARRIVAL alone, so a row whose
+    //  counterexample ONNX Runtime had already reconfirmed could still be
+    //  published as `unsat` because the detached lane finished first. A
+    //  constructive witness losing a race to a bound-based claim is a wrong
+    //  verdict (-150) on a row this process had already solved correctly.
+    // ----------------------------------------------------------------------
+
+    /// Precedence beats arrival order: with a counterexample confirmed, a lane
+    /// proof that arrives FIRST — nothing else has claimed publication — must
+    /// still not reach RESULTS_FILE.
+    #[test]
+    fn a_confirmed_counterexample_outranks_a_lane_unsat_that_arrives_first() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+
+        let precedence = std::sync::Mutex::new(SatPrecedence::default());
+        let claim = AtomicBool::new(false);
+        let writes = AtomicUsize::new(0);
+
+        note_confirmed_sat_in(&precedence);
+
+        let outcome = publish_lane_unsat_in(&precedence, &claim, || -> Result<()> {
+            writes.fetch_add(1, SeqCst);
+            Ok(())
+        });
+        assert_eq!(
+            outcome,
+            LaneUnsatPublication::RefusedConfirmedSat,
+            "a bound-based `unsat` must not outrank a reference-runtime-checked \
+             counterexample, whichever lane finished first"
+        );
+        assert_eq!(
+            writes.load(SeqCst),
+            0,
+            "the refusal must happen BEFORE the write, not after it"
+        );
+        assert!(
+            claim_terminal_publication_in(&claim),
+            "a refused lane must not consume the single publication right — the main \
+             thread still has to publish the sat"
+        );
+        // The bar is permanent for the life of the instance: a second lane
+        // attempt is refused for the same reason.
+        assert_eq!(
+            publish_lane_unsat_in(&precedence, &claim, || -> Result<()> { Ok(()) }),
+            LaneUnsatPublication::RefusedConfirmedSat
+        );
+    }
+
+    /// A candidate inside the trusted-oracle gate defers the lane; a candidate
+    /// that is then DOWNGRADED releases it again. Deferring may cost the
+    /// early-exit latency, never the verdict.
+    #[test]
+    fn an_in_flight_oracle_adjudication_defers_the_lane_and_a_downgrade_releases_it() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+
+        let precedence = std::sync::Mutex::new(SatPrecedence::default());
+        let claim = AtomicBool::new(false);
+        let writes = AtomicUsize::new(0);
+
+        {
+            let _adjudication = SatAdjudicationGuard::enter_in(&precedence);
+            assert_eq!(
+                publish_lane_unsat_in(&precedence, &claim, || -> Result<()> {
+                    writes.fetch_add(1, SeqCst);
+                    Ok(())
+                }),
+                LaneUnsatPublication::RefusedAdjudicatingSat,
+                "the interval in which a counterexample becomes CONFIRMED is inside the \
+                 gate, so the lane must defer for the whole of it"
+            );
+            // Nested / repeated gate calls compose: the counter, not a flag.
+            let _nested = SatAdjudicationGuard::enter_in(&precedence);
+            assert_eq!(
+                publish_lane_unsat_in(&precedence, &claim, || -> Result<()> { Ok(()) }),
+                LaneUnsatPublication::RefusedAdjudicatingSat
+            );
+        }
+        assert_eq!(writes.load(SeqCst), 0, "a deferred lane must not write");
+
+        assert_eq!(
+            publish_lane_unsat_in(&precedence, &claim, || -> Result<()> {
+                writes.fetch_add(1, SeqCst);
+                Ok(())
+            }),
+            LaneUnsatPublication::Published,
+            "a downgraded candidate leaves nothing to outrank the proof; parking the \
+             lane forever would convert a certified unsat into a lost verdict"
+        );
+        assert_eq!(writes.load(SeqCst), 1);
+    }
+
+    /// The property a check-then-act protocol CANNOT have: the lane's WRITE and
+    /// the counterexample confirmation are mutually exclusive, so no
+    /// confirmation can land between the lane's precedence check and its write.
+    ///
+    /// `confirmation_returned` is set only AFTER `note_confirmed_sat_in`
+    /// returns, i.e. only while the precedence mutex is free. A write that
+    /// observes it set is therefore a write that raced a confirmation — the
+    /// exact interleaving a narrowed-but-open window would still allow.
+    #[test]
+    fn the_lane_write_and_the_counterexample_confirmation_are_mutually_exclusive() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+
+        let mut published = 0_usize;
+        let mut refused = 0_usize;
+        for iteration in 0..1_000 {
+            let precedence = std::sync::Mutex::new(SatPrecedence::default());
+            let claim = AtomicBool::new(false);
+            let confirmation_returned = AtomicBool::new(false);
+            let violations = AtomicUsize::new(0);
+            let mut outcome = None;
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    note_confirmed_sat_in(&precedence);
+                    confirmation_returned.store(true, SeqCst);
+                });
+                outcome = Some(publish_lane_unsat_in(
+                    &precedence,
+                    &claim,
+                    || -> Result<()> {
+                        if confirmation_returned.load(SeqCst) {
+                            violations.fetch_add(1, SeqCst);
+                        }
+                        Ok(())
+                    },
+                ));
+            });
+            assert_eq!(
+                violations.load(SeqCst),
+                0,
+                "iteration {iteration}: an `unsat` was written after a counterexample \
+                 had already been confirmed"
+            );
+            match outcome.expect("the lane attempt ran") {
+                LaneUnsatPublication::Published => published += 1,
+                LaneUnsatPublication::RefusedConfirmedSat => refused += 1,
+                other => panic!("iteration {iteration}: unexpected lane outcome {other:?}"),
+            }
+        }
+        assert_eq!(
+            published + refused,
+            1_000,
+            "every iteration must end in one of the two legal outcomes \
+             (published {published}, refused {refused})"
+        );
+    }
+
+    /// The deterministic tail of the same rule. A lane `unsat` that reaches the
+    /// MAIN publication site on an instance already holding a confirmed
+    /// counterexample becomes the sound `unknown`; every other verdict passes
+    /// through untouched, in both states of the latch.
+    #[test]
+    fn a_main_thread_unsat_is_refused_once_a_counterexample_is_confirmed() {
+        let precedence = std::sync::Mutex::new(SatPrecedence::default());
+        let sat = VnncompResult::Sat {
+            witness: Some("((X_0 0)\n(Y_0 0))".to_string()),
+        };
+        let untouched = [
+            VnncompResult::Unknown,
+            VnncompResult::Timeout,
+            VnncompResult::Error,
+            sat,
+        ];
+
+        // Nothing confirmed yet: even `unsat` passes through, so an instance
+        // that never upheld a sat is bit-identical to before.
+        for verdict in untouched
+            .iter()
+            .cloned()
+            .chain([VnncompResult::test_unsat()])
+        {
+            assert_eq!(
+                refuse_unsat_against_confirmed_counterexample_in(&precedence, verdict.clone()),
+                verdict,
+                "no confirmation means no refusal"
+            );
+        }
+
+        note_confirmed_sat_in(&precedence);
+        assert_eq!(
+            refuse_unsat_against_confirmed_counterexample_in(
+                &precedence,
+                VnncompResult::test_unsat()
+            ),
+            VnncompResult::Unknown,
+            "publishing `unsat` against a reference-runtime-checked counterexample states \
+             the opposite of a constructive result this process holds; the outward answer \
+             is the 0-point `unknown`"
+        );
+        for verdict in untouched {
+            assert_eq!(
+                refuse_unsat_against_confirmed_counterexample_in(&precedence, verdict.clone()),
+                verdict,
+                "only `unsat` may be refused; downgrading anything else would lose verdicts"
+            );
+        }
+    }
+
+    /// Shipped-path pin for both fixes. Neither mechanism is visible in a
+    /// verdict, so a merge that drops a call site fails SILENTLY — the same
+    /// shape as the `margin_row` CLI bridge that went dark while its
+    /// reachability test stayed green. Needles are assembled at runtime so this
+    /// test's own source cannot satisfy them.
+    #[test]
+    fn the_sat_precedence_and_exec_match_wirings_are_on_the_shipped_paths() {
+        let source = include_str!("vnncomp.rs");
+
+        let lane_site = format!("{}(&SAT_PRECEDENCE", "publish_lane_unsat_in");
+        assert_eq!(
+            source.matches(lane_site.as_str()).count(),
+            1,
+            "the lane's terminal publication must go through the precedence-aware helper \
+             exactly once; a direct `write_results` there is the -150 defect"
+        );
+
+        let guard_site = format!("let _adjudication = {}();", "enter_sat_adjudication");
+        assert_eq!(
+            source.matches(guard_site.as_str()).count(),
+            1,
+            "the trusted-oracle gate must hold the adjudication marker for its whole body"
+        );
+
+        let latch_site = format!("{}();", "note_confirmed_sat");
+        assert_eq!(
+            source.matches(latch_site.as_str()).count(),
+            1,
+            "every upheld sat funnels through `uphold_sat`, which must latch the precedence"
+        );
+
+        let exec_site = format!("{}(onnx, &witness)", "organizer_exec_matched_witness");
+        assert_eq!(
+            source.matches(exec_site.as_str()).count(),
+            1,
+            "the organizer's exec-match gate must run on the SCORED publication path, not \
+             only inside the standalone `if !is_capturing()` seal"
+        );
+
+        let refusal_site = format!(
+            "let result = {}(result);",
+            "refuse_unsat_against_confirmed_counterexample"
+        );
+        assert_eq!(
+            source.matches(refusal_site.as_str()).count(),
+            1,
+            "the main publication site must also refuse an `unsat` that contradicts a \
+             confirmed counterexample; the twin-wall joins `return res` verbatim"
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    //  #witness-exec-match — the published `Y_j` must be the reference
+    //  runtime's, not ny's internal forward
+    // ----------------------------------------------------------------------
+
+    /// THE COUNTEREXAMPLE, with the campaign's own measured numbers. On
+    /// cgan_2023 ny's internal forward produced `Y_0 = 0.4286645` where real
+    /// ONNX Runtime gives `0.4342193` — a relative gap of 1.28e-2, i.e. 12.8x
+    /// the organizer's 1e-3 exec-match tolerance. The scored path published
+    /// exactly those internal decimals, so the organizer would re-run the model
+    /// and REJECT the counterexample.
+    #[test]
+    fn an_internal_forward_y_that_misses_ort_is_repaired_from_the_reference_run() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let onnx = tmp.path().join("exec_match_relu.onnx");
+        fs::write(&onnx, tiny_relu_onnx_bytes()).expect("write tiny ONNX");
+        // Fail loudly (not silently skip) if this build has no ORT runtime.
+        drop(generated_ort_forward(&onnx, 2));
+
+        let ort_x0 = 0.434_219_3_f64;
+        let internal_y0 = 0.428_664_5_f64;
+        let ort_y0 = f32_to_f64_exact(ort_x0 as f32);
+
+        // Relu is the identity on the positive coordinate, so the reference
+        // run's Y_0 is exactly `ort_x0` seen as f32 and its Y_1 is 0.
+        let truthful = format!("((X_0 {ort_x0})\n(X_1 -1)\n(Y_0 {ort_y0})\n(Y_1 0))");
+        assert!(
+            matches!(
+                organizer_exec_matched_witness(&onnx, &truthful).expect("exec-match runs"),
+                ExecMatchedWitness::AsWritten
+            ),
+            "a witness already carrying the reference runtime's Y must be published \
+             byte for byte"
+        );
+
+        let divergent = format!("((X_0 {ort_x0})\n(X_1 -1)\n(Y_0 {internal_y0})\n(Y_1 0))");
+        let ExecMatchedWitness::Repaired { text, .. } =
+            organizer_exec_matched_witness(&onnx, &divergent).expect("exec-match runs")
+        else {
+            panic!(
+                "a 1.28e-2 relative Y gap is 12.8x the organizer's 1e-3 exec-match \
+                 tolerance; publishing it risks the counterexample being rejected"
+            );
+        };
+
+        // The repair carries the reference runtime's OWN outputs ...
+        let repaired_y = parse_witness_outputs(&text).expect("the repair has a Y block");
+        assert_eq!(repaired_y, vec![ort_y0, 0.0]);
+        // ... and preserves the input decimals BIT for BIT, which is what makes
+        // it verdict-neutral for every input-only gate (box membership,
+        // `property_violated_f64`, the true-f64 enclosure re-check).
+        assert_eq!(
+            parse_witness_inputs_f64(&text).expect("the repair's inputs parse"),
+            vec![ort_x0, -1.0]
+        );
+        // ... and it now passes the gate it was repaired for.
+        assert!(matches!(
+            organizer_exec_matched_witness(&onnx, &text).expect("exec-match runs"),
+            ExecMatchedWitness::AsWritten
+        ));
+    }
+
+    /// The tolerance is the organizer's, transcribed: 9e-4 relative passes and
+    /// 2e-3 relative does not. A witness with NO `Y_j` block at all cannot be
+    /// exec-matched and must be repaired rather than waved through.
+    #[test]
+    fn the_exec_match_tolerance_is_the_organizers_and_a_missing_y_block_is_repaired() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let onnx = tmp.path().join("exec_match_tolerance.onnx");
+        fs::write(&onnx, tiny_relu_onnx_bytes()).expect("write tiny ONNX");
+        drop(generated_ort_forward(&onnx, 2));
+        let rtol = COUNTEREXAMPLE_EXEC_MATCH_RTOL;
+
+        // ORT gives Y = [1, 0] here, so the published Y_0 sets the gap.
+        let inside = format!("((X_0 1)\n(X_1 -1)\n(Y_0 {})\n(Y_1 0))", 1.0_f64 + 9e-4);
+        assert!(
+            matches!(
+                organizer_exec_matched_witness(&onnx, &inside).expect("exec-match runs"),
+                ExecMatchedWitness::AsWritten
+            ),
+            "9e-4 relative is inside the organizer's {rtol:e} tolerance and must not \
+             cost an extra re-render"
+        );
+
+        let outside = format!("((X_0 1)\n(X_1 -1)\n(Y_0 {})\n(Y_1 0))", 1.0_f64 + 2e-3);
+        assert!(
+            matches!(
+                organizer_exec_matched_witness(&onnx, &outside).expect("exec-match runs"),
+                ExecMatchedWitness::Repaired { .. }
+            ),
+            "2e-3 relative is outside the organizer's {rtol:e} tolerance, so the \
+             published witness would be rejected"
+        );
+
+        let no_outputs = "((X_0 1)\n(X_1 -1))";
+        assert!(
+            matches!(
+                organizer_exec_matched_witness(&onnx, no_outputs).expect("exec-match runs"),
+                ExecMatchedWitness::Repaired { .. }
+            ),
+            "a witness with no Y_j block has nothing for the organizer to match; it must \
+             be re-rendered from the reference run, never accepted as written"
+        );
+
+        // A model path that cannot be executed is UNRUNNABLE, not a match: the
+        // caller must fail closed to the sound `unknown`.
+        let missing = tmp.path().join("does_not_exist.onnx");
+        assert!(
+            organizer_exec_matched_witness(&missing, &inside).is_err(),
+            "an exec-match that could not be RUN must never read as a match"
         );
     }
 
@@ -24653,14 +30231,14 @@ mod tests {
         // watchdog thread matches on.
         let dir = tempfile::tempdir().expect("tempdir");
         let results = dir.path().join("out.txt");
-        write_results(&results, &VnncompResult::Unsat).expect("publish a decided verdict");
+        write_results(&results, &VnncompResult::test_unsat()).expect("publish a decided verdict");
         assert!(matches!(
             commit_timeout_unless_verdict_published(&results, "watchdog.tmp"),
             Ok(TimeoutCommit::DeclinedDecidedVerdict)
         ));
         assert_eq!(
             fs::read_to_string(&results).expect("read back").trim(),
-            VnncompResult::Unsat.token(),
+            VnncompResult::test_unsat().token(),
             "a verdict earned inside the budget must survive the hard stop"
         );
     }
@@ -24669,6 +30247,33 @@ mod tests {
     ///
     /// Neither environment nor preset ⇒ disarmed ⇒ no wall is built ⇒ the BaB
     /// keeps the single-deadline behaviour the banked sweep was measured on.
+    /// #cz-hybrid-budget: the handoff can never exceed what the instance has
+    /// left, and an IDLE lane changes nothing at all.
+    #[test]
+    fn cz_hybrid_handoff_never_exceeds_the_instance_remaining() {
+        // The measured Row B shape: a 148 s grant, 21.3 s actually left.
+        assert_eq!(
+            cz_hybrid_handoff_budget_secs(148, 21.3, true),
+            21,
+            "the fall-through must not be handed more time than the instance has"
+        );
+        // Plenty left: the original grant is the binding limit, not the clock.
+        assert_eq!(cz_hybrid_handoff_budget_secs(148, 200.0, true), 148);
+        // Exhausted / pathological clocks still produce a well-formed budget.
+        assert_eq!(cz_hybrid_handoff_budget_secs(148, 0.0, true), 1);
+        assert_eq!(cz_hybrid_handoff_budget_secs(148, -5.0, true), 1);
+        assert_eq!(cz_hybrid_handoff_budget_secs(148, f64::NAN, true), 1);
+        // DARK PROOF: an idle lane hands the grant through untouched, whatever
+        // the clock says — this is every row but the allowlisted one.
+        for remaining in [0.0, 1.0, 21.3, 1_000.0] {
+            assert_eq!(
+                cz_hybrid_handoff_budget_secs(148, remaining, false),
+                148,
+                "an idle lane must be byte-identical at remaining={remaining}"
+            );
+        }
+    }
+
     #[test]
     fn scored_wall_clamp_is_dark_by_default() {
         assert!(
@@ -24714,7 +30319,15 @@ mod tests {
     #[test]
     fn only_the_isomorphic_preset_arms_the_scored_wall_clamp() {
         let configs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
-        let armed_by_design = ["isomorphic_acasxu_2026.yaml"];
+        // The family is the scope, not the file: the `_paired_hull_canary`
+        // yaml (origin/main m7) is the SAME family's explicit research opt-in,
+        // which `resolve_preset_path` never selects for the scored category
+        // name (pinned by the reachability test below), and it keeps the
+        // family's measured clamp. A different FAMILY still fails here.
+        let armed_by_design = [
+            "isomorphic_acasxu_2026.yaml",
+            "isomorphic_acasxu_2026_paired_hull_canary.yaml",
+        ];
         let mut armed = Vec::new();
         for year in fs::read_dir(&configs).expect("list configs/") {
             let year = year.expect("configs entry").path();
@@ -24768,12 +30381,285 @@ mod tests {
         let configs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
         let path = resolve_preset_path(&configs, "isomorphic_acasxu_2026")
             .expect("isomorphic_acasxu_2026 must resolve a preset");
+        // The scored category name never selects a research-suffixed yaml
+        // (e.g. `_paired_hull_canary`): the clamp scope above relies on it.
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("isomorphic_acasxu_2026.yaml")
+        );
         let preset = crate::preset::load_preset(&path).expect("load isomorphic preset");
         assert_eq!(preset.solver.scored_wall_clamp, Some(true));
-        assert!(
-            is_relational_category("isomorphic_acasxu_2026"),
-            "the branch that reads this key only runs for relational categories"
+        // #name-blind-routing: the branch that reads this key is chosen by the
+        // property's structure, and the canonical isomorphic property selects it.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let vnnlib = write_name_blind_fixture(
+            tmp.path(),
+            "isomorphic_acasxu_2026",
+            NAME_BLIND_CANONICAL_ISOMORPHIC,
         );
+        assert!(
+            RelationalRouteDecision::for_vnnlib(&vnnlib).selected(),
+            "the branch that reads this key only runs for dual-network properties"
+        );
+    }
+
+    // ---- #name-blind-routing: the relational route is chosen by structure ----
+
+    /// `isomorphic_acasxu_2026/2.0/vnnlib/instance_0.vnnlib`, verbatim except
+    /// for the author header.
+    const NAME_BLIND_CANONICAL_ISOMORPHIC: &str = r"(vnnlib-version <2.0>)
+
+(declare-network f
+    (declare-input X_f real [1, 1, 1, 5])
+    (declare-output Y_f real [1, 5])
+)
+(declare-network g
+    (isomorphic-to f)
+    (declare-input X_g real [1, 1, 1, 5])
+    (declare-output Y_g real [1, 5])
+)
+
+; Input Constraints
+(assert (and (<= X_f[0,0,0,0] 0.679857769) (>= X_f[0,0,0,0] 0.6)))
+(assert (and (<= X_f[0,0,0,1] 0.5) (>= X_f[0,0,0,1] -0.5)))
+(assert (and (<= X_f[0,0,0,2] 0.5) (>= X_f[0,0,0,2] -0.5)))
+(assert (and (<= X_f[0,0,0,3] 0.5) (>= X_f[0,0,0,3] 0.45)))
+(assert (and (<= X_f[0,0,0,4] -0.45) (>= X_f[0,0,0,4] -0.5)))
+(assert (== X_f[0,0,0,0] X_g[0,0,0,0]))
+(assert (== X_f[0,0,0,1] X_g[0,0,0,1]))
+(assert (== X_f[0,0,0,2] X_g[0,0,0,2]))
+(assert (== X_f[0,0,0,3] X_g[0,0,0,3]))
+(assert (== X_f[0,0,0,4] X_g[0,0,0,4]))
+
+; Output Constraints
+(assert (or
+ (or (> Y_g[0,0] (+ Y_f[0,0] 0.05)) (< Y_g[0,0] (- Y_f[0,0] 0.05)))
+ (or (> Y_g[0,1] (+ Y_f[0,1] 0.05)) (< Y_g[0,1] (- Y_f[0,1] 0.05)))
+ (or (> Y_g[0,2] (+ Y_f[0,2] 0.05)) (< Y_g[0,2] (- Y_f[0,2] 0.05)))
+ (or (> Y_g[0,3] (+ Y_f[0,3] 0.05)) (< Y_g[0,3] (- Y_f[0,3] 0.05)))
+ (or (> Y_g[0,4] (+ Y_f[0,4] 0.05)) (< Y_g[0,4] (- Y_f[0,4] 0.05)))
+))
+";
+
+    /// `monotonic_acasxu_2026/2.0/vnnlib/instance_0.vnnlib`, verbatim except
+    /// for the author header.
+    const NAME_BLIND_CANONICAL_MONOTONIC: &str = r"(vnnlib-version <2.0>)
+
+(declare-network f
+    (declare-input X_f real [1, 1, 1, 5])
+    (declare-output Y_f real [1, 5])
+)
+(declare-network g
+    (equal-to f)
+    (declare-input X_g real [1, 1, 1, 5])
+    (declare-output Y_g real [1, 5])
+)
+
+; Input Constraints
+(assert (and (<= X_f[0,0,0,0] 0.667245963) (>= X_f[0,0,0,0] -0.16247807)))
+(assert (and (<= X_f[0,0,0,1] 0.0) (>= X_f[0,0,0,1] -0.25)))
+(assert (and (<= X_f[0,0,0,2] 0.5) (>= X_f[0,0,0,2] 0.25)))
+(assert (== X_f[0,0,0,3] 0.227272727))
+(assert (== X_f[0,0,0,4] 0.25 ))
+(assert (and (>= X_f[0,0,0,0] X_g[0,0,0,0]) (>= X_g[0,0,0,0] -0.16247807)))
+(assert (== X_f[0,0,0,1] X_g[0,0,0,1]))
+(assert (== X_f[0,0,0,2] X_g[0,0,0,2]))
+(assert (== X_f[0,0,0,3] X_g[0,0,0,3]))
+(assert (== X_f[0,0,0,4] X_g[0,0,0,4]))
+
+; Output Constraints
+(assert (< Y_f[0,3] Y_g[0,3]))
+";
+
+    /// The 2026 single-network VNN-LIB 2.0 shape (`acasxu_2023/2.0` prop_1).
+    const NAME_BLIND_SINGLE_NETWORK_V2: &str = r"(vnnlib-version <2.0>)
+
+(declare-network N
+    (declare-input  X float32 [1, 1, 1, 5])
+    (declare-output Y float32 [1, 5])
+)
+; ACAS Xu property 1.0
+(assert (<= X[0,0,0,0] 0.679857769))
+(assert (>= X[0,0,0,0] 0.6))
+(assert (<= X[0,0,0,1] 0.5))
+(assert (>= X[0,0,0,1] -0.5))
+(assert (<= X[0,0,0,2] 0.5))
+(assert (>= X[0,0,0,2] -0.5))
+(assert (<= X[0,0,0,3] 0.5))
+(assert (>= X[0,0,0,3] 0.45))
+(assert (<= X[0,0,0,4] -0.45))
+(assert (>= X[0,0,0,4] -0.5))
+(assert (>= Y[0,0] 3.991125645861615))
+";
+
+    /// Lay a property out the way a benchmark checkout does:
+    /// `<root>/<category>/2.0/vnnlib/instance_0.vnnlib`.
+    fn write_name_blind_fixture(root: &Path, category: &str, text: &str) -> PathBuf {
+        let vnnlib_dir = root.join(category).join("2.0").join("vnnlib");
+        fs::create_dir_all(&vnnlib_dir).expect("mkdir vnnlib");
+        let vnnlib = vnnlib_dir.join("instance_0.vnnlib");
+        fs::write(&vnnlib, text).expect("write vnnlib");
+        vnnlib
+    }
+
+    /// A relational property under a category name that no code has ever seen
+    /// takes the relational route, and every gate on that route admits it: the
+    /// decision reads the property, not the name.
+    #[test]
+    fn relational_route_is_selected_for_a_dual_network_spec_under_an_arbitrary_category_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for (text, isomorphic) in [
+            (NAME_BLIND_CANONICAL_ISOMORPHIC, true),
+            (NAME_BLIND_CANONICAL_MONOTONIC, false),
+        ] {
+            let vnnlib = write_name_blind_fixture(tmp.path(), "zzz_renamed", text);
+            let decision = RelationalRouteDecision::for_vnnlib(&vnnlib);
+            assert!(
+                decision.selected(),
+                "a two-network property must take the relational route under any name"
+            );
+            assert_eq!(decision.declared_networks(), 2);
+            assert!(decision.receipt().contains("declared_networks=2"));
+
+            let spec = ny_onnx::vnnlib::load_vnnlib(&vnnlib).expect("canonical property parses");
+            let dual = spec
+                .dual_network
+                .as_ref()
+                .expect("canonical property carries a validated dual-network relation");
+            // Mirror the route: the monotonic arm is gated on the finite
+            // coupled g-box `try_monotonic_coupled_sat` derives from the
+            // explicit `X_f >= X_g` coupling (the raw X_g[0] upper is open).
+            let mut gated = dual.clone();
+            if !isomorphic {
+                gated.g_input_bounds = coupled_g_input_bounds(dual, 0)
+                    .expect("the equal-to coupling licenses a finite g box");
+            }
+            let gate = dual_difference_soundness_gate(&gated)
+                .expect("the soundness gate is chosen by the parsed property alone");
+            match gate.kind {
+                DualDifferenceKind::Isomorphic { epsilon } => {
+                    assert!(isomorphic, "isomorphic-to must mint the isomorphic gate");
+                    assert!((epsilon - 0.05).abs() < 1e-12, "epsilon {epsilon}");
+                    assert!(
+                        !gate.allows_single_network_reuse(),
+                        "isomorphic-to relates two different networks"
+                    );
+                }
+                DualDifferenceKind::Monotonic {
+                    output,
+                    varying_input,
+                    ..
+                } => {
+                    assert!(!isomorphic, "equal-to must mint the monotonic gate");
+                    assert_eq!((output, varying_input), (3, 0));
+                    assert!(
+                        gate.allows_single_network_reuse(),
+                        "equal-to declares g IS f, so one ONNX serves both"
+                    );
+                }
+            }
+        }
+    }
+
+    /// End to end under the renamed category: the certified emptiness shortcut
+    /// proves a genuinely infeasible isomorphic region without ever reading a
+    /// category string.
+    #[test]
+    fn renamed_relational_category_still_reaches_the_certified_emptiness_proof() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let vnnlib = write_name_blind_fixture(
+            tmp.path(),
+            "zzz_renamed",
+            r"(vnnlib-version 2.0)
+(declare-network f
+  (declare-input X_f Float32 [2])
+  (declare-output Y_f Float32 [2])
+)
+(declare-network g
+  (isomorphic-to f)
+  (declare-input X_g Float32 [2])
+  (declare-output Y_g Float32 [2])
+)
+(assert (and (>= X_f[0] -1) (<= X_f[0] 1)))
+(assert (and (>= X_g[0] -1) (<= X_g[0] 1)))
+(assert (and (>= X_f[1] -1) (<= X_f[1] 1)))
+(assert (and (>= X_g[1] -1) (<= X_g[1] 1)))
+(assert (== X_f[0] X_g[0]))
+(assert (== X_f[1] X_g[1]))
+(assert (and (> Y_g[0] (+ Y_f[0] 0.05)) (< Y_g[0] (- Y_f[0] 0.05))))
+(assert (and (> Y_g[1] (+ Y_f[1] 0.05)) (< Y_g[1] (- Y_f[1] 0.05))))
+",
+        );
+        assert!(RelationalRouteDecision::for_vnnlib(&vnnlib).selected());
+        let result =
+            run_relational_vnncomp(Path::new("(onnx/a.onnx, onnx/b.onnx)"), &vnnlib, 10, None)
+                .expect("relational run");
+        assert_eq!(result, VnncompResult::test_unsat());
+    }
+
+    /// The name alone buys nothing: a single-network property filed under a
+    /// relational category's name stays on the ordinary route, whether it is
+    /// VNN-LIB 2.0 (one `declare-network`) or 1.0 (none).
+    #[test]
+    fn relational_route_is_not_selected_for_a_single_network_spec_named_isomorphic_acasxu_2026() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let v2 = write_name_blind_fixture(
+            tmp.path(),
+            "isomorphic_acasxu_2026",
+            NAME_BLIND_SINGLE_NETWORK_V2,
+        );
+        let decision = RelationalRouteDecision::for_vnnlib(&v2);
+        assert!(!decision.selected());
+        assert_eq!(decision.declared_networks(), 1);
+
+        let v1_dir = tmp.path().join("monotonic_acasxu_2026").join("vnnlib");
+        fs::create_dir_all(&v1_dir).expect("mkdir v1");
+        let v1 = v1_dir.join("prop_1.vnnlib");
+        fs::write(
+            &v1,
+            "(declare-const X_0 Real)\n(declare-const Y_0 Real)\n\
+             (assert (<= X_0 0.5))\n(assert (>= X_0 -0.5))\n(assert (<= Y_0 0.0))\n",
+        )
+        .expect("write v1");
+        let decision = RelationalRouteDecision::for_vnnlib(&v1);
+        assert!(!decision.selected());
+        assert_eq!(decision.declared_networks(), 0);
+
+        // An unreadable property selects nothing; the ordinary route reports it.
+        let missing = RelationalRouteDecision::for_vnnlib(&tmp.path().join("missing.vnnlib"));
+        assert!(!missing.selected());
+        assert_eq!(missing.declared_networks(), 0);
+    }
+
+    /// Conservative direction: a property that declares two networks but no
+    /// relation the parser can validate still leaves the single-network lanes
+    /// (which would ignore the network metadata) and fails closed to `unknown`
+    /// on the relational route.
+    #[test]
+    fn two_networks_without_a_validated_relation_still_leave_the_single_network_lanes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let vnnlib = write_name_blind_fixture(
+            tmp.path(),
+            "zzz_renamed",
+            r"(vnnlib-version 2.0)
+(declare-network f
+  (declare-input X_f Float32 [2])
+  (declare-output Y_f Float32 [2])
+)
+(declare-network g
+  (declare-input X_g Float32 [2])
+  (declare-output Y_g Float32 [2])
+)
+(assert (and (>= X_f[0] -1) (<= X_f[0] 1)))
+(assert (and (>= X_f[1] -1) (<= X_f[1] 1)))
+(assert (> Y_g[0] (+ Y_f[0] 0.05)))
+",
+        );
+        assert!(RelationalRouteDecision::for_vnnlib(&vnnlib).selected());
+        let result =
+            run_relational_vnncomp(Path::new("(onnx/a.onnx, onnx/b.onnx)"), &vnnlib, 10, None)
+                .expect("relational run");
+        assert_eq!(result, VnncompResult::Unknown);
     }
 
     #[test]
@@ -24789,12 +30675,11 @@ mod tests {
         ny_test_utils::env::with_env_edits(|env| {
             env.remove(decl.name);
             let captured = ny_levers::RawLeverInputs::capture(ny_levers::all());
-            let frozen = ny_levers::LeverSet::resolve_layered(
-                ny_levers::all(),
-                &captured,
-                |candidate| relational_scored_wall_clamp_config_value(&loaded, candidate),
-            )
-            .expect("typed scored-wall projection must satisfy its declaration");
+            let frozen =
+                ny_levers::LeverSet::resolve_layered(ny_levers::all(), &captured, |candidate| {
+                    relational_scored_wall_clamp_config_value(&loaded, candidate)
+                })
+                .expect("typed scored-wall projection must satisfy its declaration");
             assert_eq!(frozen.get(decl), ny_levers::LeverValue::Bool(true));
             assert_eq!(frozen.source(decl), ny_levers::Source::Config);
 
@@ -24820,23 +30705,96 @@ mod tests {
         );
     }
 
+    /// #router-r1: the relational route runs the shadow router, so its frozen
+    /// projection must carry `router.mode` / `optimizer.mode` from the typed
+    /// preset (the CONFIG layer), exactly as the ordinary route's generic
+    /// projector does — otherwise a relational yaml's `router: {mode: shadow}`
+    /// validates and then resolves `off`. Absent keys stay on the default
+    /// layer, so shipped relational receipts are unchanged.
+    #[test]
+    fn relational_receipt_projects_the_router_modes_it_runs_under() {
+        use ny_levers::decls::router::{OPTIMIZER_MODE, ROUTER_MODE};
+        let frozen_from = |loaded: &crate::preset::PresetConfig| {
+            let captured = ny_levers::RawLeverInputs::capture_with(ny_levers::all(), |_| None);
+            ny_levers::LeverSet::resolve_layered(ny_levers::all(), &captured, |candidate| {
+                relational_config_value(loaded, candidate)
+            })
+            .expect("the relational projection must satisfy every declaration")
+        };
+
+        let absent = frozen_from(&crate::preset::PresetConfig::default());
+        assert_eq!(absent.source(&ROUTER_MODE), ny_levers::Source::Default);
+        assert_eq!(absent.source(&OPTIMIZER_MODE), ny_levers::Source::Default);
+        assert!(
+            crate::router::RouterPolicy::from_levers(&absent)
+                .expect("dark policy resolves")
+                .is_off(),
+            "an absent key keeps the router dark"
+        );
+
+        let loaded: crate::preset::PresetConfig =
+            serde_yaml::from_str("router:\n  mode: shadow\noptimizer:\n  mode: shadow\n")
+                .expect("the router sections parse");
+        let armed = frozen_from(&loaded);
+        assert_eq!(
+            armed.get(&ROUTER_MODE),
+            ny_levers::LeverValue::Text("shadow".to_owned())
+        );
+        assert_eq!(armed.source(&ROUTER_MODE), ny_levers::Source::Config);
+        assert_eq!(armed.source(&OPTIMIZER_MODE), ny_levers::Source::Config);
+        let policy = crate::router::RouterPolicy::from_levers(&armed).expect("typed policy");
+        assert_eq!(policy.mode, ny_core::router::RouterMode::Shadow);
+        assert_eq!(policy.optimizer, ny_core::router::OptimizerMode::Shadow);
+        assert_eq!(
+            policy.rules,
+            ny_core::router::acting::RuleSwitches::ALL_ON,
+            "#router-r2: absent rule keys stay at the declaration default"
+        );
+
+        // #router-r2: the relational route projects the seven rule switches
+        // from the same frozen preset.
+        let ablated: crate::preset::PresetConfig =
+            serde_yaml::from_str("router:\n  mode: 'on'\n  rules:\n    hand_on: false\n")
+                .expect("the router rules parse");
+        let ablated = frozen_from(&ablated);
+        assert_eq!(
+            ablated.get(&ny_levers::decls::router::ROUTER_RULE_HAND_ON),
+            ny_levers::LeverValue::Bool(false)
+        );
+        assert_eq!(
+            ablated.source(&ny_levers::decls::router::ROUTER_RULE_HAND_ON),
+            ny_levers::Source::Config
+        );
+        let policy = crate::router::RouterPolicy::from_levers(&ablated).expect("typed policy");
+        assert_eq!(policy.mode, ny_core::router::RouterMode::On);
+        assert!(!policy.rules.hand_on && policy.rules.cap_authority);
+
+        // The router keys do not arm the scored-wall clamp, and nothing else
+        // rides along.
+        assert_eq!(
+            relational_config_value(&loaded, &ny_levers::decls::dark_probes::SCORED_WALL_CLAMP),
+            None
+        );
+        assert_eq!(
+            relational_config_value(
+                &loaded,
+                &ny_levers::decls::dark_probes::FALSIFY_PORTFOLIO_LANE,
+            ),
+            None,
+            "relational receipt must not project unrelated preset fields"
+        );
+    }
+
     #[test]
     fn relational_graph_triplet_and_bab_config_retain_the_receipt_arc() {
-        let frozen = std::sync::Arc::new(ny_levers::LeverSet::freeze_with(
-            ny_levers::all(),
-            |_| None,
-        ));
+        let frozen =
+            std::sync::Arc::new(ny_levers::LeverSet::freeze_with(ny_levers::all(), |_| None));
         let authority = Some(std::sync::Arc::clone(&frozen));
         let mut graph_a = GraphNetwork::new();
         let mut graph_b = GraphNetwork::new();
         let mut difference = GraphNetwork::new();
 
-        attach_relational_frozen_authority(
-            &mut graph_a,
-            &mut graph_b,
-            &mut difference,
-            &authority,
-        );
+        attach_relational_frozen_authority(&mut graph_a, &mut graph_b, &mut difference, &authority);
         for graph in [&graph_a, &graph_b, &difference] {
             assert!(std::sync::Arc::ptr_eq(
                 graph.frozen_levers().expect("relational graph authority"),
@@ -25470,6 +31428,342 @@ mod tests {
         }
     }
 
+    /// #ml4acopf-upfront-single ADMISSION. ml4acopf prop2 is ONE constant
+    /// threshold (`(assert (>= Y_2382 0.99))`); the automatic rule skips it, so
+    /// only an armed route may admit it. A multi-clause disjunction (prop5's
+    /// `(or (and (>= Y 0.01)) (and (<= Y -0.01)))`) must keep its automatic
+    /// admission AND its automatic budget under the preset force, i.e. run
+    /// exactly as in the unarmed category. The environment force keeps its
+    /// historical force-everything meaning.
+    #[test]
+    fn ml4acopf_upfront_single_clause_admitted_only_when_armed() {
+        let inputs = vec![(0.0, 1.0); 402];
+        let prop2 = spec_with(
+            3804,
+            vec![vec![OC::GreaterEqConst(2382, 0.99)]],
+            false,
+            inputs.clone(),
+        );
+        let prop5 = spec_with(
+            3804,
+            vec![
+                vec![OC::GreaterEqConst(1464, 0.01)],
+                vec![OC::LessEqConst(1464, -0.01)],
+            ],
+            true,
+            inputs,
+        );
+
+        for route in [
+            UpfrontWrapperRoute::AutoDisjunction,
+            UpfrontWrapperRoute::PresetRelationalConjunction,
+            UpfrontWrapperRoute::DisabledByPreset,
+            UpfrontWrapperRoute::DisabledByEnvironment,
+            UpfrontWrapperRoute::DisabledByInvalidPreset,
+        ] {
+            assert_eq!(
+                upfront_attack_admission(&prop2, route),
+                None,
+                "unarmed route {route:?} must not admit a single-clause threshold"
+            );
+        }
+        for route in [
+            UpfrontWrapperRoute::ForcedByPreset,
+            UpfrontWrapperRoute::ForcedByEnvironment,
+        ] {
+            assert_eq!(
+                upfront_attack_admission(&prop2, route),
+                Some(UpfrontAttackAdmission::Forced),
+                "armed route {route:?} must admit the single-clause threshold under the \
+                 ordinary cap"
+            );
+        }
+
+        assert_eq!(
+            upfront_attack_admission(&prop5, UpfrontWrapperRoute::AutoDisjunction),
+            Some(UpfrontAttackAdmission::AutoDisjunction),
+            "the automatic multi-clause admission is unchanged"
+        );
+        assert_eq!(
+            upfront_attack_admission(&prop5, UpfrontWrapperRoute::ForcedByPreset),
+            Some(UpfrontAttackAdmission::AutoDisjunction),
+            "the preset force must not move a multi-clause row out of its automatic \
+             budget class"
+        );
+        assert_eq!(
+            upfront_attack_admission(&prop5, UpfrontWrapperRoute::ForcedByEnvironment),
+            Some(UpfrontAttackAdmission::Forced),
+            "the environment force keeps its historical meaning"
+        );
+        for route in [
+            UpfrontWrapperRoute::DisabledByPreset,
+            UpfrontWrapperRoute::DisabledByEnvironment,
+            UpfrontWrapperRoute::DisabledByInvalidPreset,
+        ] {
+            assert_eq!(upfront_attack_admission(&prop5, route), None);
+        }
+
+        let (_, policy) = frozen_upfront_policy(&[], &[]);
+        let remaining = Some(std::time::Duration::from_secs(597));
+        let base = upfront_attack_base_budget(remaining, &policy).expect("usable base");
+        let decide = |route| {
+            let admission = upfront_attack_admission(&prop5, route).expect("admitted");
+            upfront_effective_budget_decision(base, remaining, &policy, admission, false)
+        };
+        let contextual = decide(UpfrontWrapperRoute::AutoDisjunction);
+        assert_eq!(contextual.budget, std::time::Duration::from_secs(4));
+        assert_eq!(
+            decide(UpfrontWrapperRoute::ForcedByPreset),
+            contextual,
+            "a multi-clause row under the preset force gets the identical budget decision"
+        );
+    }
+
+    /// #ml4acopf-upfront-single LOSS. Only a FORCED admission of a single-output
+    /// constant threshold takes `MarginOnly`; every other shape or admission keeps
+    /// the historical margin/DLR ensemble, whose restart parity is pinned here.
+    #[test]
+    fn ml4acopf_upfront_threshold_takes_margin_only_loss() {
+        let inputs = vec![(0.0, 1.0); 4];
+        let prop2 = spec_with(
+            3804,
+            vec![vec![OC::GreaterEqConst(2382, 0.99)]],
+            false,
+            inputs.clone(),
+        );
+        assert!(is_single_output_threshold_objective(&prop2));
+        assert_eq!(
+            upfront_attack_loss_schedule(&prop2, UpfrontAttackAdmission::Forced),
+            AttackLossSchedule::MarginOnly
+        );
+        for admission in [
+            UpfrontAttackAdmission::AutoDisjunction,
+            UpfrontAttackAdmission::PresetRelationalConjunction,
+        ] {
+            assert_eq!(
+                upfront_attack_loss_schedule(&prop2, admission),
+                AttackLossSchedule::MarginDlrEnsemble,
+                "{admission:?} keeps the ensemble"
+            );
+        }
+
+        let mut flat = spec_with(3, Vec::new(), false, inputs.clone());
+        flat.output_constraints = vec![OC::LessThanConst(1, 0.5)];
+        assert!(
+            is_single_output_threshold_objective(&flat),
+            "a flat one-constraint list is the same shape"
+        );
+
+        let safenlp = spec_with(2, vec![vec![OC::LessEq(0, 1)]], false, inputs.clone());
+        let band = spec_with(
+            3,
+            vec![vec![OC::GreaterEqConst(2, 0.1), OC::LessEqConst(2, 0.9)]],
+            false,
+            inputs.clone(),
+        );
+        let prop5 = spec_with(
+            3804,
+            vec![
+                vec![OC::GreaterEqConst(1464, 0.01)],
+                vec![OC::LessEqConst(1464, -0.01)],
+            ],
+            true,
+            inputs,
+        );
+        for spec in [&safenlp, &band, &prop5] {
+            assert!(!is_single_output_threshold_objective(spec));
+            assert_eq!(
+                upfront_attack_loss_schedule(spec, UpfrontAttackAdmission::Forced),
+                AttackLossSchedule::MarginDlrEnsemble,
+                "safenlp's relational spec, a two-sided band and a disjunction keep the ensemble"
+            );
+        }
+
+        for restart_idx in 0..(2 * GRAD_REFINE_MAX_RESTARTS) {
+            assert_eq!(
+                AttackLossSchedule::MarginDlrEnsemble.uses_dlr(restart_idx),
+                restart_idx % 2 == 1,
+                "the ensemble is the historical odd-restart DLR schedule exactly"
+            );
+            assert!(!AttackLossSchedule::MarginOnly.uses_dlr(restart_idx));
+            assert!(
+                !AttackLossSchedule::MarginDlrEnsemble.replays_restart_zero(
+                    restart_idx,
+                    false,
+                    false
+                ),
+                "the ensemble never skips a restart"
+            );
+            assert_eq!(
+                AttackLossSchedule::MarginOnly.replays_restart_zero(restart_idx, false, false),
+                restart_idx == 1,
+                "only the seedless centre restart 1 replays restart 0"
+            );
+            assert!(!AttackLossSchedule::MarginOnly.replays_restart_zero(restart_idx, true, false));
+            assert!(!AttackLossSchedule::MarginOnly.replays_restart_zero(restart_idx, false, true));
+        }
+    }
+
+    /// WHY the threshold shape takes `MarginOnly`: on one constant threshold the
+    /// DLR row's dominant entries sit on the largest and 3rd-largest outputs,
+    /// which the property never reads, while the margin row is exactly the
+    /// constrained output. The constrained output here is far below its
+    /// threshold, as 300_ieee prop2's is at the box centre (margin ~ -9.8e3).
+    #[test]
+    fn ml4acopf_threshold_dlr_row_steers_on_outputs_the_property_never_reads() {
+        let spec = spec_with(
+            4,
+            vec![vec![OC::GreaterEqConst(1, 0.99)]],
+            false,
+            vec![(0.0, 1.0)],
+        );
+        let input = [0.5f32];
+        let outputs = [5.0f64, -9800.0, 3.0, 1.0];
+        let margin = property_margin(&spec, &input, &outputs);
+        assert!(
+            (margin + 9800.99).abs() < 1e-9,
+            "margin = Y_1 - 0.99, got {margin}"
+        );
+        let margin_row =
+            margin_subgradient_row(&spec, &input, &outputs, None).expect("finite direction");
+        assert_eq!(margin_row, vec![0.0f32, 1.0, 0.0, 0.0]);
+        let dlr = dlr_grad_row(&margin_row, margin, &outputs);
+        assert_eq!(dlr[2], 0.0);
+        assert!(
+            dlr[0].abs() > 1000.0 * dlr[1].abs() && dlr[3].abs() > 1000.0 * dlr[1].abs(),
+            "DLR must be shown steering on pi1 = Y_0 and pi3 = Y_3, not on Y_1: {dlr:?}"
+        );
+    }
+
+    /// SOUNDNESS (#ml4acopf-upfront-single): `MarginOnly` changes only the ascent
+    /// direction. A candidate from the lane becomes a witness only through the
+    /// unchanged zero-tolerance predicate (and then `gate_sat_with_trusted_oracle`),
+    /// pinned here on the prop2 shape: exact threshold semantics, one-ulp
+    /// rejection below it, strictness honoured, and in-box membership enforced.
+    #[test]
+    fn ml4acopf_threshold_witness_acceptance_stays_zero_tolerance() {
+        let threshold = 0.99f64;
+        let below = f64::from_bits(threshold.to_bits() - 1);
+        let above = f64::from_bits(threshold.to_bits() + 1);
+        let spec = spec_with(
+            3,
+            vec![vec![OC::GreaterEqConst(2, threshold)]],
+            false,
+            vec![(0.0, 1.0)],
+        );
+        assert!(
+            property_violated_f64(&spec, &[0.5], &[0.0, 0.0, threshold]),
+            "`>=` is satisfied at exact equality"
+        );
+        assert!(
+            !property_violated_f64(&spec, &[0.5], &[0.0, 0.0, below]),
+            "one ulp below the threshold is not a violation"
+        );
+        assert!(
+            !property_violated_f64(&spec, &[1.0 + f64::EPSILON], &[0.0, 0.0, 2.0]),
+            "an out-of-box input is never a witness, however violating its output"
+        );
+        let strict = spec_with(
+            3,
+            vec![vec![OC::GreaterThanConst(2, threshold)]],
+            false,
+            vec![(0.0, 1.0)],
+        );
+        assert!(!property_violated_f64(
+            &strict,
+            &[0.5],
+            &[0.0, 0.0, threshold]
+        ));
+        assert!(property_violated_f64(&strict, &[0.5], &[0.0, 0.0, above]));
+    }
+
+    /// #ml4acopf-upfront-single DELIVERY: the shipped preset (no vnncomp26 shadow)
+    /// arms the lane through the typed key with its 45 s cap, admits and
+    /// margin-steers the parsed prop2 shape, and leaves the parsed prop5 shape's
+    /// admission and 4 s budget identical to the unarmed category.
+    #[test]
+    fn shipped_ml4acopf_preset_arms_the_single_clause_upfront_lane() {
+        let configs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+        assert!(
+            !configs.join("vnncomp26/ml4acopf_2024.yaml").exists(),
+            "a configs/vnncomp26/ml4acopf_2024.yaml would SHADOW the vnncomp25 arming"
+        );
+        // 2026-09-26: RE-ARMED with #attack-vertex-geometry (W6B: the three 300_ieee prop2 rows sat 3/3);
+        // the shipped preset forces the single-clause lane again, now with a 20 s cap.
+        let shipped_path = configs.join("vnncomp25/ml4acopf_2024.yaml");
+        let snapshot = BetaCrownPresetSnapshot::load(&shipped_path);
+        assert_eq!(
+            snapshot.invalid_error(),
+            None,
+            "the shipped preset must load"
+        );
+        let (_, policy) = frozen_upfront_policy_from_snapshot(&snapshot, &[]);
+        assert_eq!(policy.master, UpfrontAttackMaster::ForcedByPreset);
+        assert_eq!(policy.wall_cap, std::time::Duration::from_secs(20));
+        assert_eq!(
+            policy.auto_wall_cap,
+            std::time::Duration::from_secs(4),
+            "the multi-clause clamp stays at its default"
+        );
+        let route = upfront_wrapper_route_from_snapshot(Some(&snapshot), policy.master);
+        assert_eq!(route, UpfrontWrapperRoute::ForcedByPreset);
+
+        let header = "(declare-const X_0 Real)\n(declare-const X_1 Real)\n\
+                      (declare-const Y_0 Real)\n(declare-const Y_1 Real)\n\
+                      (declare-const Y_2 Real)\n\
+                      (assert (<= X_0 0.238613354))\n(assert (>= X_0 0.195229108))\n\
+                      (assert (<= X_1 0.055036989))\n(assert (>= X_1 0.045030264))\n";
+        let prop2 = ny_onnx::vnnlib::parse_vnnlib(&format!("{header}(assert (>= Y_2 0.99))\n"))
+            .expect("prop2-shaped property parses");
+        let prop5 = ny_onnx::vnnlib::parse_vnnlib(&format!(
+            "{header}(assert (or\n(and (>= Y_2 0.01))\n(and (<= Y_2 -0.01))\n))\n"
+        ))
+        .expect("prop5-shaped property parses");
+
+        assert_eq!(
+            upfront_attack_admission(&prop2, route),
+            Some(UpfrontAttackAdmission::Forced)
+        );
+        assert_eq!(
+            upfront_attack_loss_schedule(&prop2, UpfrontAttackAdmission::Forced),
+            AttackLossSchedule::MarginOnly
+        );
+        assert_eq!(
+            upfront_attack_admission(&prop5, route),
+            Some(UpfrontAttackAdmission::AutoDisjunction)
+        );
+
+        let remaining = Some(std::time::Duration::from_secs(597));
+        let base = upfront_attack_base_budget(remaining, &policy).expect("usable base");
+        let single = upfront_effective_budget_decision(
+            base,
+            remaining,
+            &policy,
+            UpfrontAttackAdmission::Forced,
+            false,
+        );
+        assert_eq!(single.budget, std::time::Duration::from_secs(20)); // the shipped cap: re-armed at 20 s by 271b1b77e (#attack-vertex-geometry, W6B 300_ieee prop2 sat 3/3)
+
+        let (_, unarmed) = frozen_upfront_policy(&[], &[]);
+        let unarmed_base = upfront_attack_base_budget(remaining, &unarmed).expect("usable base");
+        let multi_armed = upfront_effective_budget_decision(
+            base,
+            remaining,
+            &policy,
+            UpfrontAttackAdmission::AutoDisjunction,
+            false,
+        );
+        let multi_unarmed = upfront_effective_budget_decision(
+            unarmed_base,
+            remaining,
+            &unarmed,
+            UpfrontAttackAdmission::AutoDisjunction,
+            false,
+        );
+        assert_eq!(multi_armed, multi_unarmed);
+        assert_eq!(multi_armed.budget, std::time::Duration::from_secs(4));
+    }
+
     #[test]
     fn relational_upfront_slice_uses_one_frozen_absolute_deadline() {
         use std::time::{Duration, Instant};
@@ -25527,7 +31821,6 @@ mod tests {
             );
         }
 
-        let mut traffic_execution = TrafficTerminalSoftmaxPeelExecution::NotRequested;
         let result = run_and_translate(
             Path::new("/path/that/must/not/be/read/model.onnx"),
             Path::new("/path/that/must/not/be/read/property.vnnlib"),
@@ -25543,19 +31836,11 @@ mod tests {
             None,
             None,
             crate::commands::margin_row_bab::GlobalRayonOutcome::NOT_REQUESTED,
-            false,
-            false,
-            None,
-            &mut traffic_execution,
         );
         assert_eq!(
             result,
             VnncompResult::Unknown,
             "invalid snapshots must return before TLL/APGD/margin/verifier wrapper lanes"
-        );
-        assert_eq!(
-            traffic_execution,
-            TrafficTerminalSoftmaxPeelExecution::NotRequested
         );
     }
 
@@ -25718,13 +32003,13 @@ mod tests {
             (PostBabWrapperRoute::ProofTailByPreset, false),
         ] {
             assert_eq!(
-                postbab_deferred_pgd_consumer_available(route, true, false),
+                postbab_deferred_pgd_consumer_available(route, true),
                 expected,
                 "{route:?} must describe the exact outer consumer availability passed to \
                  beta-crown admission"
             );
             assert!(
-                !postbab_deferred_pgd_consumer_available(route, false, false),
+                !postbab_deferred_pgd_consumer_available(route, false),
                 "{route:?} must be unavailable when the frozen heavy-memory admission declines"
             );
         }
@@ -25732,21 +32017,11 @@ mod tests {
         assert!(postbab_deferred_pgd_consumer_available(
             postbab_wrapper_route(None, frozen_postbab_policy(None, None)),
             true,
-            false,
         ));
-        assert!(
-            !postbab_deferred_pgd_consumer_available(
-                PostBabWrapperRoute::AttackEnabled,
-                true,
-                true,
-            ),
-            "the terminal SafeNLP direct-MIP ingress suppresses every post-BaB lane"
-        );
         assert!(
             !postbab_deferred_pgd_consumer_available(
                 postbab_wrapper_route(None, frozen_postbab_policy(Some("0"), None)),
                 true,
-                false,
             ),
             "NY_POSTBAB_ATTACK=0 must disable deferred-PGD admission"
         );
@@ -25754,7 +32029,6 @@ mod tests {
             !postbab_deferred_pgd_consumer_available(
                 postbab_wrapper_route(Some(0.25), frozen_postbab_policy(None, Some(false)),),
                 true,
-                false,
             ),
             "the frozen typed wrapper opt-out must disable deferred-PGD admission"
         );
@@ -25984,7 +32258,11 @@ mod tests {
         // historical all-dims-must-pin loop declined the ENTIRE lane here —
         // `pin_f32_into_declared_bound` has no value to return...
         let v = 0.19607843_f64;
-        assert_ne!(f32_to_f64_exact(v as f32), v, "fixture must be non-f32-representable");
+        assert_ne!(
+            f32_to_f64_exact(v as f32),
+            v,
+            "fixture must be non-f32-representable"
+        );
         assert_eq!(pin_f32_into_declared_bound(v, v, v), None);
         // ...and 39 load-refused rows discarded 350 s budgets at ~0.1 s each.
 
@@ -26000,9 +32278,18 @@ mod tests {
         assert_eq!(emit_pin[0].unwrap() as f32, lo32[0]);
         // Free dim: byte-identical to the historical pin construction.
         assert_eq!(emit_pin[1], None);
-        assert_eq!(lo32[1], pin_f32_into_declared_bound(-1.0, 1.0, -1.0).unwrap());
-        assert_eq!(hi32[1], pin_f32_into_declared_bound(-1.0, 1.0, 1.0).unwrap());
-        assert_eq!(center[1], pin_f32_into_declared_bound(-1.0, 1.0, 0.0).unwrap());
+        assert_eq!(
+            lo32[1],
+            pin_f32_into_declared_bound(-1.0, 1.0, -1.0).unwrap()
+        );
+        assert_eq!(
+            hi32[1],
+            pin_f32_into_declared_bound(-1.0, 1.0, 1.0).unwrap()
+        );
+        assert_eq!(
+            center[1],
+            pin_f32_into_declared_bound(-1.0, 1.0, 0.0).unwrap()
+        );
 
         // A sub-ULP non-degenerate box pins at its f64 midpoint, inside [lo, hi].
         let a = f32_to_f64_exact(1.0_f32);
@@ -26052,14 +32339,15 @@ mod tests {
                 }),
             }),
         };
-        let node = |op: &str, inputs: &[&str], output: &str, attrs: Vec<AttributeProto>| NodeProto {
-            input: inputs.iter().map(|s| s.to_string()).collect(),
-            output: vec![output.to_string()],
-            name: format!("{op}_{output}"),
-            op_type: op.to_string(),
-            domain: String::new(),
-            attribute: attrs,
-        };
+        let node =
+            |op: &str, inputs: &[&str], output: &str, attrs: Vec<AttributeProto>| NodeProto {
+                input: inputs.iter().map(|s| s.to_string()).collect(),
+                output: vec![output.to_string()],
+                name: format!("{op}_{output}"),
+                op_type: op.to_string(),
+                domain: String::new(),
+                attribute: attrs,
+            };
         let cast_to = |to: i64| AttributeProto {
             name: "to".to_string(),
             r#type: 2, // INT
@@ -26219,14 +32507,15 @@ mod tests {
                 }),
             }),
         };
-        let node = |op: &str, inputs: &[&str], output: &str, attrs: Vec<AttributeProto>| NodeProto {
-            input: inputs.iter().map(|s| s.to_string()).collect(),
-            output: vec![output.to_string()],
-            name: format!("{op}_{output}"),
-            op_type: op.to_string(),
-            domain: String::new(),
-            attribute: attrs,
-        };
+        let node =
+            |op: &str, inputs: &[&str], output: &str, attrs: Vec<AttributeProto>| NodeProto {
+                input: inputs.iter().map(|s| s.to_string()).collect(),
+                output: vec![output.to_string()],
+                name: format!("{op}_{output}"),
+                op_type: op.to_string(),
+                domain: String::new(),
+                attribute: attrs,
+            };
         let cast_to = |to: i64| AttributeProto {
             name: "to".to_string(),
             r#type: 2, // INT
@@ -26317,10 +32606,17 @@ mod tests {
         // Sanity of the fixture's own geometry: centre and all four whole-box
         // corners of the free subspace must be SAFE, or the pocket is not
         // interior and the test proves nothing about the lattice stage.
-        let mut probe =
-            ny_onnx::diff::OrtForward::from_path(&onnx, 4).expect("ORT probe session");
-        for (a, b) in [(31.0f32, 31.0f32), (0.0, 0.0), (0.0, 62.0), (62.0, 0.0), (62.0, 62.0)] {
-            let out = probe.run(&[pinned32, pinned32, a, b]).expect("probe forward");
+        let mut probe = ny_onnx::diff::OrtForward::from_path(&onnx, 4).expect("ORT probe session");
+        for (a, b) in [
+            (31.0f32, 31.0f32),
+            (0.0, 0.0),
+            (0.0, 62.0),
+            (62.0, 0.0),
+            (62.0, 62.0),
+        ] {
+            let out = probe
+                .run(&[pinned32, pinned32, a, b])
+                .expect("probe forward");
             assert!(
                 f32_to_f64_exact(out[0]) < 0.6,
                 "fixture geometry broken: face/centre point ({a}, {b}) violates"
@@ -26328,9 +32624,8 @@ mod tests {
         }
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_mins(2);
-        let witness = try_graph_free_ort_falsify(&onnx, &vnnlib, Some(deadline)).expect(
-            "the interior lattice sweep must find the pocket no face-based stage can see",
-        );
+        let witness = try_graph_free_ort_falsify(&onnx, &vnnlib, Some(deadline))
+            .expect("the interior lattice sweep must find the pocket no face-based stage can see");
 
         let inputs = parse_witness_inputs_f64(&witness).expect("witness parses");
         assert_eq!(inputs.len(), 4);
@@ -26505,6 +32800,172 @@ mod tests {
                 "frozen video coordinate X_{i} must sit at the centre"
             );
         }
+    }
+
+    /// #flat-surrogate-transfer, the row-11 shape in miniature: the seed sits
+    /// at the surrogate optimum with the REAL margin a staircase pinned at
+    /// exactly 0.0 (strict spec — the acceptance closure refuses the boundary),
+    /// and only a move in the surrogate-FLAT subspace (coords 8..24, which the
+    /// active corner does not touch) pushes the pre-saturation value across
+    /// the bucket boundary that flips the real output. The stage must walk
+    /// there and return the acceptance stack's witness.
+    #[test]
+    fn transfer_stage_crosses_the_bucket_boundary_through_the_flat_subspace() {
+        use std::cell::Cell;
+
+        let n = 24usize;
+        let lo32 = vec![-1.0f32; n];
+        let hi32 = vec![1.0f32; n];
+        // Seed: the surrogate optimum — active coords 0..8 at their best
+        // faces (mixed signs, so any uniform whole-box block move DESTROYS
+        // the optimum), flat coords 8..24 at the (frozen) box centre.
+        let mut seed = vec![0.0f32; n];
+        for v in seed.iter_mut().take(4) {
+            *v = 1.0;
+        }
+        for v in seed.iter_mut().take(8).skip(4) {
+            *v = -1.0;
+        }
+        // Real model: pre-saturation value = Σ₀..₄ x − Σ₄..₈ x + 0.1·Σ flat;
+        // the real margin is a two-step staircase with the bucket boundary at
+        // 9.2. The seed scores pre = 8.0 → margin exactly 0.0 (ON the
+        // boundary). Only the whole flat subspace at its hi face (+1.6 → 9.6)
+        // crosses: the general block pool's fraction starts at 0.25 (6 coords,
+        // at most +0.6) and any block touching an active coordinate with a
+        // uniform face loses ≥ 2.0, so a pass PROVES the flat-subspace walk.
+        let pre = |x: &[f32]| -> f64 {
+            let a: f64 = x[..4].iter().map(|&v| f64::from(v)).sum::<f64>()
+                - x[4..8].iter().map(|&v| f64::from(v)).sum::<f64>();
+            let f: f64 = x[8..].iter().map(|&v| f64::from(v) * 0.1).sum::<f64>();
+            a + f
+        };
+        let staircase = |p: f64| -> f64 {
+            if p >= 9.2 {
+                0.5
+            } else {
+                0.0
+            }
+        };
+        let boundary_offers = Cell::new(0u32);
+        let mut evaluate =
+            |x: &[f32]| -> Option<(f64, Vec<f32>)> { Some((staircase(pre(x)), Vec::new())) };
+        // Strict acceptance: margin 0.0 is refused (counted), > 0.0 accepted.
+        let mut try_accept = |x: &[f32],
+                              _out: &[f32],
+                              _ev: &mut dyn FnMut(&[f32]) -> Option<(f64, Vec<f32>)>|
+         -> Option<String> {
+            if staircase(pre(x)) > 0.0 {
+                Some("witness".to_string())
+            } else {
+                boundary_offers.set(boundary_offers.get() + 1);
+                None
+            }
+        };
+        let flat_coords: Vec<usize> = (8..24).collect();
+        let witness = flat_surrogate_transfer_stage(
+            &lo32,
+            &hi32,
+            &seed,
+            0.8, // seed surrogate margin: positive, the stage's entry premise
+            &flat_coords,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            &mut evaluate,
+            &mut try_accept,
+        );
+        assert_eq!(
+            witness.as_deref(),
+            Some("witness"),
+            "the flat-subspace walk must cross the bucket boundary and convert"
+        );
+        assert_eq!(
+            boundary_offers.get(),
+            1,
+            "the boundary seed must be OFFERED exactly once (strict-inequality \
+             awareness without re-running the same refusal)"
+        );
+    }
+
+    /// #flat-surrogate-transfer strict-boundary throttle: on a spec whose real
+    /// margin NEVER leaves the boundary, the stage offers the seed once, walks
+    /// until its deadline, and reports no transfer — it must not spam the
+    /// acceptance stack with the same refused boundary point.
+    #[test]
+    fn transfer_stage_offers_a_boundary_seed_exactly_once() {
+        use std::cell::Cell;
+
+        let n = 8usize;
+        let lo32 = vec![-1.0f32; n];
+        let hi32 = vec![1.0f32; n];
+        let seed = vec![0.0f32; n];
+        let offers = Cell::new(0u32);
+        let probes = Cell::new(0u64);
+        let mut evaluate = |_x: &[f32]| -> Option<(f64, Vec<f32>)> {
+            probes.set(probes.get() + 1);
+            Some((0.0, Vec::new()))
+        };
+        let mut try_accept = |_x: &[f32],
+                              _out: &[f32],
+                              _ev: &mut dyn FnMut(&[f32]) -> Option<(f64, Vec<f32>)>|
+         -> Option<String> {
+            offers.set(offers.get() + 1);
+            None
+        };
+        let flat_coords: Vec<usize> = (0..4).collect();
+        let witness = flat_surrogate_transfer_stage(
+            &lo32,
+            &hi32,
+            &seed,
+            0.1,
+            &flat_coords,
+            std::time::Instant::now() + std::time::Duration::from_millis(50),
+            &mut evaluate,
+            &mut try_accept,
+        );
+        assert!(witness.is_none(), "a permanently pinned row cannot convert");
+        assert_eq!(offers.get(), 1, "exactly one boundary offer: the seed");
+        assert!(
+            probes.get() > 1,
+            "the stage must keep walking the staircase after the refusal"
+        );
+    }
+
+    /// #flat-surrogate-transfer non-strict path: when the acceptance stack
+    /// ADMITS the boundary point (every binding constraint non-strict —
+    /// `property_violated_f64`'s exact-equality rule), the stage returns the
+    /// seed's witness without spending any walk probes.
+    #[test]
+    fn transfer_stage_accepts_a_non_strict_boundary_seed_immediately() {
+        use std::cell::Cell;
+
+        let n = 8usize;
+        let lo32 = vec![-1.0f32; n];
+        let hi32 = vec![1.0f32; n];
+        let seed = vec![0.0f32; n];
+        let probes = Cell::new(0u64);
+        let mut evaluate = |_x: &[f32]| -> Option<(f64, Vec<f32>)> {
+            probes.set(probes.get() + 1);
+            Some((0.0, Vec::new()))
+        };
+        let mut try_accept = |_x: &[f32],
+                              _out: &[f32],
+                              _ev: &mut dyn FnMut(&[f32]) -> Option<(f64, Vec<f32>)>|
+         -> Option<String> { Some("boundary-witness".to_string()) };
+        let witness = flat_surrogate_transfer_stage(
+            &lo32,
+            &hi32,
+            &seed,
+            0.1,
+            &[],
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            &mut evaluate,
+            &mut try_accept,
+        );
+        assert_eq!(witness.as_deref(), Some("boundary-witness"));
+        assert_eq!(
+            probes.get(),
+            1,
+            "a non-strict boundary seed converts on the seed forward alone"
+        );
     }
 
     /// #graph-free-sat witness membership: whatever this returns must be inside
@@ -27182,7 +33643,7 @@ mod tests {
         assert_eq!(outcome, ShortGraceCoordinatorOutcome::Deadline);
         assert!(
             !publisher
-                .publish_terminal(VnncompResult::Unsat)
+                .publish_terminal(VnncompResult::test_unsat())
                 .expect("closed publication is not an I/O error"),
             "a verifier result offered after the deadline must be declined"
         );
@@ -27206,7 +33667,7 @@ mod tests {
         };
         let writer = std::thread::spawn(move || {
             publisher
-                .publish_terminal(VnncompResult::Unsat)
+                .publish_terminal(VnncompResult::test_unsat())
                 .expect("coordinator publication")
         });
 
@@ -27414,7 +33875,7 @@ mod tests {
         };
         let publisher = std::thread::spawn(move || {
             publisher
-                .publish_terminal(VnncompResult::Unsat)
+                .publish_terminal(VnncompResult::test_unsat())
                 .expect("faulted publication is a sound decline")
         });
         let publication_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -27519,7 +33980,7 @@ mod tests {
         };
         let writer = std::thread::spawn(move || {
             publisher
-                .publish_terminal(VnncompResult::Unsat)
+                .publish_terminal(VnncompResult::test_unsat())
                 .expect("missing ACK is a deadline decline, not an I/O error")
         });
 
@@ -27642,7 +34103,7 @@ mod tests {
         };
         let writer = std::thread::spawn(move || {
             publisher
-                .publish_terminal(VnncompResult::Unsat)
+                .publish_terminal(VnncompResult::test_unsat())
                 .expect("blocked publication is a deadline decline")
         });
 
@@ -28758,7 +35219,7 @@ mod tests {
         for status in ["Verified", "verified", "Safe", "safe"] {
             assert_eq!(
                 translate_status(status, None),
-                VnncompResult::Unsat,
+                VnncompResult::test_unsat(),
                 "status {status} must map to unsat"
             );
         }
@@ -29163,6 +35624,100 @@ mod tests {
             );
             env.set("NY_WITNESS_DEEPEN", "0");
             assert_eq!(witness_deepen_target(), None, "kill switch");
+        });
+    }
+
+    /// #witness-deepen-gate-reuse — SHIPPED-PATH pin. `deepen_accepted_witness`
+    /// already holds a `GraphNetwork` for `onnx` (the [`F64MarginOracle`] it
+    /// loads before the ascent), so the terminal true-f64 gate it runs AFTER the
+    /// ascent deadline must walk THAT graph instead of loading the same model a
+    /// second time inside `WITNESS_DEEPEN_SAFETY`.
+    ///
+    /// FAILS CLOSED three ways, so a revert of the shipped call site cannot pass
+    /// it: the `expect` below requires the real end-to-end path (ascent ->
+    /// trusted-ORT re-confirm -> true-f64 gate) to actually run to the gate; the
+    /// reuse counter must advance by exactly one across that ONE call; and the
+    /// load counter must not advance at all. Handing the gate `None` again —
+    /// which is precisely the pre-fix call — makes the second and third
+    /// assertions fail with (0, 1).
+    #[test]
+    fn witness_deepen_terminal_gate_walks_the_already_loaded_graph() {
+        // NOTE: env-var mutation — the deepening target must be the shipped
+        // default for the margin window asserted below (blessed choke point).
+        ny_test_utils::env::with_env_edits(|env| {
+            env.remove("NY_WITNESS_DEEPEN");
+            env.remove("NY_WITNESS_DEEPEN_TARGET");
+
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let onnx = tmp.path().join("witness_deepen_relu.onnx");
+            fs::write(&onnx, tiny_relu_onnx_bytes()).expect("write tiny ONNX");
+            let vnnlib = tmp.path().join("witness_deepen.vnnlib");
+            fs::write(
+                &vnnlib,
+                "(declare-const X_0 Real)\n\
+                 (declare-const X_1 Real)\n\
+                 (declare-const Y_0 Real)\n\
+                 (declare-const Y_1 Real)\n\
+                 (assert (>= X_0 0.0))\n\
+                 (assert (<= X_0 1.0))\n\
+                 (assert (>= X_1 0.0))\n\
+                 (assert (<= X_1 1.0))\n\
+                 (assert (>= Y_0 0.5))\n",
+            )
+            .expect("write vnnlib");
+            let spec = ny_onnx::vnnlib::load_vnnlib(&vnnlib).expect("parse the fixture property");
+
+            // An ACCEPTED sat parked one f32 ULP above the threshold. The net is
+            // y = relu(x) and the unsafe region is Y_0 >= 0.5, so the trusted-ORT
+            // margin is exactly X_0 - 0.5 == 2^-24: a genuine violation, and far
+            // below the 1e-5 deepening target, so the ascent runs.
+            let seed: Vec<f32> = vec![0.5_f32 + 6e-8, 0.25];
+            let mut forward = generated_ort_forward(&onnx, seed.len());
+            let output = forward.run(&seed).expect("trusted ORT seed forward");
+            let output64: Vec<f64> = output.iter().map(|&v| f32_to_f64_exact(v)).collect();
+            let accepted_margin = property_margin(&spec, &seed, &output64);
+            assert!(
+                accepted_margin > 0.0 && accepted_margin < 1e-5,
+                "fixture must be an accepted-but-below-target sat; got {accepted_margin:.6e}"
+            );
+            let seed64: Vec<f64> = seed.iter().map(|&v| f32_to_f64_exact(v)).collect();
+            let witness = format_smtlib_witness_f64(&seed64, &output);
+
+            let before = f64_gate_graph_counters();
+            let deepened = deepen_accepted_witness(
+                &onnx,
+                &vnnlib,
+                Some(&spec),
+                &witness,
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(20)),
+            )
+            .expect("the ULP ascent must clear 1e-5 and re-pass both acceptance gates");
+            let after = f64_gate_graph_counters();
+            assert_ne!(
+                deepened, witness,
+                "a deepened witness must replace the artifact-margin seed"
+            );
+
+            assert_eq!(
+                after.0 - before.0,
+                1,
+                "the terminal true-f64 gate must walk the oracle's already-loaded graph"
+            );
+            assert_eq!(
+                after.1 - before.1,
+                0,
+                "no second ONNX load may run inside the deepening reserve"
+            );
+
+            // The reuse is a pure work removal: both routes must return the same
+            // verdict on the same witness.
+            let oracle = F64MarginOracle::load(&onnx, seed.len())
+                .expect("the relu fixture supports the f64 cell");
+            assert_eq!(
+                f64_forward_rejects_witness_reusing(&onnx, &spec, &deepened, Some(&oracle)),
+                f64_forward_rejects_witness(&onnx, &spec, &deepened),
+                "reusing a loaded graph must not change the gate's verdict"
+            );
         });
     }
 
@@ -30050,7 +36605,7 @@ mod tests {
 
     #[test]
     fn render_results_file_formats() {
-        assert_eq!(VnncompResult::Unsat.render_results_file(), "unsat\n");
+        assert_eq!(VnncompResult::test_unsat().render_results_file(), "unsat\n");
         assert_eq!(VnncompResult::Timeout.render_results_file(), "timeout\n");
         assert_eq!(VnncompResult::Unknown.render_results_file(), "unknown\n");
         assert_eq!(VnncompResult::Error.render_results_file(), "error\n");
@@ -30179,14 +36734,9 @@ mod tests {
         )
         .expect("write vnnlib");
 
-        let result = run_relational_vnncomp(
-            "isomorphic_acasxu_2026",
-            Path::new("(onnx/a.onnx, onnx/b.onnx)"),
-            &vnnlib,
-            10,
-            None,
-        )
-        .expect("relational run");
+        let result =
+            run_relational_vnncomp(Path::new("(onnx/a.onnx, onnx/b.onnx)"), &vnnlib, 10, None)
+                .expect("relational run");
 
         assert_eq!(result, VnncompResult::Unknown);
     }
@@ -30234,14 +36784,9 @@ mod tests {
         )
         .expect("write vnnlib");
 
-        let result = run_relational_vnncomp(
-            "monotonic_acasxu_2026",
-            Path::new("(onnx/a.onnx, onnx/b.onnx)"),
-            &vnnlib,
-            10,
-            None,
-        )
-        .expect("relational run");
+        let result =
+            run_relational_vnncomp(Path::new("(onnx/a.onnx, onnx/b.onnx)"), &vnnlib, 10, None)
+                .expect("relational run");
 
         assert_eq!(result, VnncompResult::Unknown);
     }
@@ -30281,14 +36826,9 @@ mod tests {
         )
         .expect("write vnnlib");
 
-        let result = run_relational_vnncomp(
-            "isomorphic_acasxu_2026",
-            Path::new("(onnx/a.onnx, onnx/b.onnx)"),
-            &vnnlib,
-            10,
-            None,
-        )
-        .expect("relational run");
+        let result =
+            run_relational_vnncomp(Path::new("(onnx/a.onnx, onnx/b.onnx)"), &vnnlib, 10, None)
+                .expect("relational run");
 
         assert_eq!(result, VnncompResult::Unknown);
     }
@@ -30331,14 +36871,9 @@ mod tests {
         )
         .expect("write vnnlib");
 
-        let result = run_relational_vnncomp(
-            "isomorphic_acasxu_2026",
-            Path::new("(onnx/a.onnx, onnx/b.onnx)"),
-            &vnnlib,
-            10,
-            None,
-        )
-        .expect("relational run");
+        let result =
+            run_relational_vnncomp(Path::new("(onnx/a.onnx, onnx/b.onnx)"), &vnnlib, 10, None)
+                .expect("relational run");
 
         assert_eq!(result, VnncompResult::Unknown);
     }
@@ -30380,13 +36915,7 @@ mod tests {
         .expect("write vnnlib");
 
         let result = std::panic::catch_unwind(|| {
-            run_relational_vnncomp(
-                "isomorphic_acasxu_2026",
-                Path::new("(onnx/a.onnx, onnx/b.onnx)"),
-                &vnnlib,
-                10,
-                None,
-            )
+            run_relational_vnncomp(Path::new("(onnx/a.onnx, onnx/b.onnx)"), &vnnlib, 10, None)
         })
         .expect("relational path must not panic")
         .expect("relational run");
@@ -30504,16 +37033,21 @@ mod tests {
         )
         .expect("write vnnlib");
 
-        let result = run_relational_vnncomp(
-            "isomorphic_acasxu_2026",
-            Path::new("(onnx/a.onnx, onnx/b.onnx)"),
-            &vnnlib,
-            10,
-            None,
-        )
-        .expect("relational run");
+        let result =
+            run_relational_vnncomp(Path::new("(onnx/a.onnx, onnx/b.onnx)"), &vnnlib, 10, None)
+                .expect("relational run");
 
-        assert_eq!(result, VnncompResult::Unsat);
+        assert_eq!(result, VnncompResult::test_unsat());
+        // #spine-legacy-lanes: published from the certify facade's AUTHORIZED
+        // token (`certify::authorize_scalar_emptiness`), never a
+        // legacy-uncovered door.
+        match &result {
+            VnncompResult::Unsat(receipt) => assert_eq!(
+                receipt.source(),
+                ny_propagate::certify::UnsatSource::Authorized
+            ),
+            other => panic!("expected unsat, got {other:?}"),
+        }
 
         // The emitted sidecar exists and every per-index Farkas cert self-checks.
         let cert_path = sidecar_cert_path(&vnnlib);
@@ -30571,17 +37105,12 @@ mod tests {
         )
         .expect("write vnnlib");
 
-        let result = run_relational_vnncomp(
-            "isomorphic_acasxu_2026",
-            Path::new("(onnx/a.onnx, onnx/b.onnx)"),
-            &vnnlib,
-            10,
-            None,
-        )
-        .expect("relational run");
+        let result =
+            run_relational_vnncomp(Path::new("(onnx/a.onnx, onnx/b.onnx)"), &vnnlib, 10, None)
+                .expect("relational run");
 
         // MUST NOT be unsat — the unsafe region is satisfiable (e.g. Y_g-Y_f large).
-        assert_ne!(result, VnncompResult::Unsat);
+        assert_ne!(result, VnncompResult::test_unsat());
         assert_eq!(result, VnncompResult::Unknown);
         assert!(
             !sidecar_cert_path(&vnnlib).is_file(),
@@ -30632,18 +37161,13 @@ mod tests {
         )
         .expect("write vnnlib");
 
-        let result = run_relational_vnncomp(
-            "isomorphic_acasxu_2026",
-            Path::new("(onnx/a.onnx, onnx/b.onnx)"),
-            &vnnlib,
-            10,
-            None,
-        )
-        .expect("relational run");
+        let result =
+            run_relational_vnncomp(Path::new("(onnx/a.onnx, onnx/b.onnx)"), &vnnlib, 10, None)
+                .expect("relational run");
 
         assert_ne!(
             result,
-            VnncompResult::Unsat,
+            VnncompResult::test_unsat(),
             "feasible region must NOT be unsat"
         );
         assert_eq!(result, VnncompResult::Unknown);
@@ -30703,18 +37227,13 @@ mod tests {
         )
         .expect("write vnnlib");
 
-        let result = run_relational_vnncomp(
-            "isomorphic_acasxu_2026",
-            Path::new("(onnx/a.onnx, onnx/b.onnx)"),
-            &vnnlib,
-            10,
-            None,
-        );
+        let result =
+            run_relational_vnncomp(Path::new("(onnx/a.onnx, onnx/b.onnx)"), &vnnlib, 10, None);
 
         match result {
             Ok(verdict) => assert_ne!(
                 verdict,
-                VnncompResult::Unsat,
+                VnncompResult::test_unsat(),
                 "feasible disjunction region must NOT be unsat without a verified network band"
             ),
             Err(_) => {
@@ -30765,16 +37284,11 @@ mod tests {
         )
         .expect("write vnnlib");
 
-        let result = run_relational_vnncomp(
-            "isomorphic_acasxu_2026",
-            Path::new("(onnx/a.onnx, onnx/b.onnx)"),
-            &vnnlib,
-            10,
-            None,
-        )
-        .expect("relational run");
+        let result =
+            run_relational_vnncomp(Path::new("(onnx/a.onnx, onnx/b.onnx)"), &vnnlib, 10, None)
+                .expect("relational run");
 
-        assert_ne!(result, VnncompResult::Unsat);
+        assert_ne!(result, VnncompResult::test_unsat());
         assert!(!sidecar_cert_path(&vnnlib).is_file());
     }
 
@@ -30822,8 +37336,7 @@ mod tests {
         )
         .expect("write vnnlib");
 
-        let result =
-            run_relational_vnncomp("monotonic_acasxu_2026", &onnx, &vnnlib, 10, None).expect("run");
+        let result = run_relational_vnncomp(&onnx, &vnnlib, 10, None).expect("run");
 
         assert_ne!(result, VnncompResult::Error);
     }
@@ -31010,14 +37523,17 @@ mod tests {
             1usize << UPFRONT_CORNER_MAX_VARIABLE_DIMS,
             "the admitted frontier has an exact, small evaluation count"
         );
-        assert!(low_dim_corner_seeds(
-            &[0.0; UPFRONT_CORNER_MAX_VARIABLE_DIMS + 1],
-            &[1.0; UPFRONT_CORNER_MAX_VARIABLE_DIMS + 1],
-        )
-        .is_empty());
-        assert!(low_dim_corner_seeds(&[0.0], &[]).is_empty());
-        assert!(low_dim_corner_seeds(&[1.0], &[0.0]).is_empty());
-        assert!(low_dim_corner_seeds(&[f32::NAN], &[1.0]).is_empty());
+        assert_eq!(
+            (low_dim_corner_seeds(
+                &[0.0; UPFRONT_CORNER_MAX_VARIABLE_DIMS + 1],
+                &[1.0; UPFRONT_CORNER_MAX_VARIABLE_DIMS + 1],
+            ))
+            .len(),
+            0
+        );
+        assert_eq!((low_dim_corner_seeds(&[0.0], &[])).len(), 0);
+        assert_eq!((low_dim_corner_seeds(&[1.0], &[0.0])).len(), 0);
+        assert_eq!((low_dim_corner_seeds(&[f32::NAN], &[1.0])).len(), 0);
 
         let huge_pinned = vec![0.0; UPFRONT_CORNER_MAX_TOTAL_SCALARS + 1];
         assert!(
@@ -31089,6 +37605,45 @@ mod tests {
         .is_none());
     }
 
+    /// The ACAS row-84 model, or `None` when the OPTIONAL `vnncomp2023`
+    /// benchmark download is simply not present on this host.
+    ///
+    /// The two row-84 pins below used to assert `onnx.is_file()` with the
+    /// message "tracked ACAS model fixture is missing". That message was wrong:
+    /// `benchmarks/vnncomp2023` is GITIGNORED (`benchmarks/.gitignore:6`) with
+    /// zero tracked files, so the model is a download, not repo content. On any
+    /// host that has not run `benchmarks/download_benchmarks.sh` — a fresh
+    /// clone, a `git worktree`, the competition image — those two tests were the
+    /// only red in an otherwise green 1822-test suite, which is precisely the
+    /// ambient noise that trains people to skim past a REAL failure.
+    ///
+    /// The original intent is still served, and deliberately: a missing
+    /// download is a loud SKIP, but a benchmark tree that exists while THIS
+    /// model is missing is a broken checkout and still fails hard. The
+    /// distinction is the whole point — "absent because optional" and "absent
+    /// because damaged" are different facts and must not share an outcome.
+    fn acas_row84_model_or_skip() -> Option<PathBuf> {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let onnx = repo_root.join(
+            "benchmarks/vnncomp2023/benchmarks/acasxu/onnx/\
+             ACASXU_run2a_5_3_batch_2000.onnx",
+        );
+        if onnx.is_file() {
+            return Some(onnx);
+        }
+        assert!(
+            !repo_root.join("benchmarks/vnncomp2023").is_dir(),
+            "the vnncomp2023 benchmark tree EXISTS but {} is missing — that is a \
+             damaged checkout, not an absent optional download",
+            onnx.display()
+        );
+        eprintln!(
+            "skipping: optional vnncomp2023 benchmark download absent \
+             (run benchmarks/download_benchmarks.sh to exercise the ACAS row-84 pins)"
+        );
+        None
+    }
+
     /// Row 84 recovery pin using only tracked immutable fixtures. The published
     /// ACAS 5_3 / prop_2 witness sits a few f32 ULPs outside three decimal f64
     /// faces; clamping it to the shared inward search box must retain a strict
@@ -31096,12 +37651,12 @@ mod tests {
     #[test]
     fn acas_row84_inward_snapped_witness_has_strict_margin_and_passes_gate() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let onnx = repo_root.join(
-            "benchmarks/vnncomp2023/benchmarks/acasxu/onnx/\
-             ACASXU_run2a_5_3_batch_2000.onnx",
-        );
+        let Some(onnx) = acas_row84_model_or_skip() else {
+            return;
+        };
         let vnnlib = repo_root.join("tests/models/acasxu_prop2.vnnlib");
-        assert!(onnx.is_file(), "tracked ACAS model fixture is missing");
+        // This one IS tracked (`tests/models/`, not `benchmarks/`), so its
+        // absence stays a hard failure.
         assert!(vnnlib.is_file(), "tracked ACAS property fixture is missing");
 
         let spec = ny_onnx::vnnlib::load_vnnlib(&vnnlib).expect("load tracked prop_2");
@@ -31169,10 +37724,9 @@ mod tests {
     #[test]
     fn acas_row84_generic_relational_face_grid_finds_and_gates_witness() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let onnx = repo_root.join(
-            "benchmarks/vnncomp2023/benchmarks/acasxu/onnx/\
-             ACASXU_run2a_5_3_batch_2000.onnx",
-        );
+        let Some(onnx) = acas_row84_model_or_skip() else {
+            return;
+        };
         let vnnlib = repo_root.join("tests/models/acasxu_prop2.vnnlib");
         let spec = ny_onnx::vnnlib::load_vnnlib(&vnnlib).expect("load tracked prop_2");
         let (box_lo, box_hi, emit_pin) =
@@ -32216,7 +38770,10 @@ mod tests {
                 "batch": {"configured_size": 256}
             }
         }"#;
-        assert_eq!(parse_competition_json(json), Some(VnncompResult::Unsat));
+        assert_eq!(
+            parse_competition_json(json),
+            Some(VnncompResult::test_unsat())
+        );
     }
 
     #[test]
@@ -33042,60 +39599,6 @@ mod tests {
     }
 
     #[test]
-    fn safenlp_direct_mip_first_gate_category_and_budget_are_exact() {
-        for raw in [
-            None,
-            Some(""),
-            Some("0"),
-            Some("01"),
-            Some("true"),
-            Some(" 1"),
-            Some("1 "),
-        ] {
-            assert!(
-                !safenlp_direct_mip_first_requested("safenlp_2024", 20, raw.map(OsStr::new)),
-                "malformed/non-arming direct-first gate {raw:?} must preserve history"
-            );
-        }
-
-        let armed = Some(OsStr::new("1"));
-        for category in [
-            "safenlp",
-            "safenlp_2023",
-            "safenlp_2024_extra",
-            "other_safenlp_2024",
-            "path/safenlp_2024",
-            "cifar100_2024",
-        ] {
-            assert!(
-                !safenlp_direct_mip_first_requested(category, 20, armed),
-                "out-of-scope category {category:?} must preserve history"
-            );
-        }
-        assert!(!safenlp_direct_mip_first_requested(
-            "safenlp_2024",
-            0,
-            armed
-        ));
-        assert!(safenlp_direct_mip_first_requested("safenlp_2024", 1, armed));
-        assert!(safenlp_direct_mip_first_requested(
-            " SafeNLP-2024 ",
-            20,
-            armed
-        ));
-        assert!(safenlp_direct_mip_first_requested(
-            "safenlp_2024",
-            SAFENLP_DIRECT_MIP_FIRST_MAX_BUDGET_SECS,
-            armed
-        ));
-        assert!(!safenlp_direct_mip_first_requested(
-            "safenlp_2024",
-            SAFENLP_DIRECT_MIP_FIRST_MAX_BUDGET_SECS + 1,
-            armed
-        ));
-    }
-
-    #[test]
     fn marked_direct_timeout_is_terminal_before_every_postbab_lane() {
         let marked = CapturedTerminalIngress::RequireSafeNlpMarkedMarginSharedBinaryPrefix;
         for result in [VnncompResult::Timeout, VnncompResult::Unknown] {
@@ -33109,7 +39612,7 @@ mod tests {
             );
         }
         for result in [
-            VnncompResult::Unsat,
+            VnncompResult::test_unsat(),
             VnncompResult::Sat { witness: None },
             VnncompResult::Error,
         ] {
@@ -33156,50 +39659,16 @@ mod tests {
         ))));
     }
 
-    #[cfg(unix)]
     #[test]
-    fn safenlp_direct_mip_first_non_unicode_gate_fails_closed() {
-        use std::os::unix::ffi::OsStrExt;
-
-        assert!(!safenlp_direct_mip_first_requested(
-            "safenlp_2024",
-            20,
-            Some(OsStr::from_bytes(b"1\xff")),
-        ));
-    }
-
-    #[test]
-    fn traffic_upfront_dark_gate_does_not_invoke_qualification() {
-        let invoked = std::cell::Cell::new(false);
-        let result = traffic_upfront_objective_if_requested(false, || {
-            invoked.set(true);
-            Ok::<usize, String>(7)
-        })
-        .expect("dark gate is not an error");
-        assert_eq!(result, None);
-        assert!(!invoked.get(), "dark gate performed heavyweight model I/O");
-
-        let armed = traffic_upfront_objective_if_requested(true, || {
-            invoked.set(true);
-            Ok::<usize, String>(7)
-        })
-        .expect("armed synthetic qualification");
-        assert_eq!(armed, Some(7));
-        assert!(invoked.get());
-    }
-
-    #[test]
-    fn traffic_or_reserved_proof_context_suppresses_the_k_wide_prewave() {
-        assert!(wrapper_vjp_prewave_allowed(false));
-        assert!(!wrapper_vjp_prewave_allowed(true));
+    fn reserved_proof_context_suppresses_the_k_wide_prewave() {
+        assert!(wrapper_vjp_prewave_allowed());
 
         {
             let _reservation = BetaWgpuContextReservation::enter(true);
-            assert!(!wrapper_vjp_prewave_allowed(false));
-            assert!(!wrapper_vjp_prewave_allowed(true));
+            assert!(!wrapper_vjp_prewave_allowed());
         }
         assert!(
-            wrapper_vjp_prewave_allowed(false),
+            wrapper_vjp_prewave_allowed(),
             "the command-scoped reservation must restore prior thread state"
         );
     }
@@ -33212,329 +39681,6 @@ mod tests {
         assert!(!vnncomp_beta_requests_wgpu(None, Some(1000), true));
         assert!(!vnncomp_beta_requests_wgpu(None, Some(3072), false));
         assert!(!vnncomp_beta_requests_wgpu(None, None, true));
-    }
-
-    #[test]
-    fn traffic_upfront_logit_dlr_requires_exact_finite_width() {
-        let spec = spec_with(
-            TRAFFIC_UPFRONT_LOGIT_WIDTH,
-            vec![vec![OC::GreaterEq(0, 42)], vec![OC::GreaterEq(1, 42)]],
-            true,
-            vec![(0.0, 1.0)],
-        );
-        let mut logits = vec![0.0; TRAFFIC_UPFRONT_LOGIT_WIDTH];
-        logits[0] = 4.0;
-        logits[1] = 3.0;
-        logits[2] = 2.0;
-        logits[42] = 5.0;
-        let row = traffic_upfront_logit_dlr_row(&spec, &[0.5], &logits)
-            .expect("exact finite traffic logits must produce a DLR row");
-        assert_eq!(row.len(), TRAFFIC_UPFRONT_LOGIT_WIDTH);
-        assert!(row.iter().all(|value| value.is_finite()));
-
-        for malformed in [
-            vec![0.0; TRAFFIC_UPFRONT_LOGIT_WIDTH - 1],
-            vec![0.0; TRAFFIC_UPFRONT_LOGIT_WIDTH + 1],
-        ] {
-            assert!(traffic_upfront_logit_dlr_row(&spec, &[0.5], &malformed).is_none());
-        }
-        for non_finite in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let mut malformed = logits.clone();
-            malformed[7] = non_finite;
-            assert!(
-                traffic_upfront_logit_dlr_row(&spec, &[0.5], &malformed).is_none(),
-                "non-finite logit {non_finite:?} did not invalidate treatment"
-            );
-        }
-    }
-
-    #[test]
-    fn traffic_upfront_acceptance_ignores_a_logit_only_hit() {
-        let spec = spec_with(
-            TRAFFIC_UPFRONT_LOGIT_WIDTH,
-            vec![vec![OC::GreaterEq(0, 42)]],
-            true,
-            vec![(0.0, 1.0)],
-        );
-        let mut logits = vec![0.0; TRAFFIC_UPFRONT_LOGIT_WIDTH];
-        logits[0] = 2.0;
-        logits[42] = 1.0;
-        assert!(property_margin(&spec, &[0.5], &logits) > 0.0);
-
-        let mut original_outputs = vec![0.0; TRAFFIC_UPFRONT_LOGIT_WIDTH];
-        original_outputs[42] = 1.0;
-        assert!(
-            !traffic_upfront_original_candidate_violates(&spec, &[0.5], &original_outputs,),
-            "rewritten-logit guidance crossed the original-output acceptance boundary"
-        );
-    }
-
-    #[test]
-    fn traffic_upfront_execution_telemetry_is_exhaustive() {
-        assert_eq!(
-            TrafficUpfrontSoftmaxExecution::before_run(false),
-            TrafficUpfrontSoftmaxExecution::NotRequested
-        );
-        assert_eq!(
-            TrafficUpfrontSoftmaxExecution::before_run(true),
-            TrafficUpfrontSoftmaxExecution::NotReached
-        );
-
-        let states = [
-            TrafficUpfrontSoftmaxExecution::NotRequested,
-            TrafficUpfrontSoftmaxExecution::NotReached,
-            TrafficUpfrontSoftmaxExecution::AttackDisabled,
-            TrafficUpfrontSoftmaxExecution::AdmissionDeclined,
-            TrafficUpfrontSoftmaxExecution::QualificationDeclined,
-            TrafficUpfrontSoftmaxExecution::QualifiedNotRun,
-            TrafficUpfrontSoftmaxExecution::Applied,
-            TrafficUpfrontSoftmaxExecution::Invalidated,
-        ];
-        for state in states {
-            assert!(!state.flight_reason().is_empty());
-        }
-        assert_eq!(
-            TrafficUpfrontSoftmaxExecution::Applied.flight_status(),
-            crate::flight::FlightStatus::Ran
-        );
-        assert_eq!(
-            TrafficUpfrontSoftmaxExecution::QualifiedNotRun.flight_status(),
-            crate::flight::FlightStatus::NotReached
-        );
-        assert_eq!(
-            TrafficUpfrontSoftmaxExecution::Invalidated.flight_status(),
-            crate::flight::FlightStatus::Skipped
-        );
-    }
-
-    #[test]
-    fn traffic_terminal_softmax_peel_is_default_dark() {
-        assert_eq!(
-            traffic_terminal_softmax_peel_decision(TRAFFIC_TERMINAL_SOFTMAX_PEEL_CATEGORY, None,),
-            TrafficTerminalSoftmaxPeelDecision {
-                env_armed: false,
-                category_matched: true,
-                effective: false,
-            }
-        );
-    }
-
-    #[test]
-    fn traffic_terminal_softmax_peel_env_parsing_is_exact() {
-        for raw in ["", "0", "01", "true", "on", " 1", "1 "] {
-            let decision = traffic_terminal_softmax_peel_decision(
-                TRAFFIC_TERMINAL_SOFTMAX_PEEL_CATEGORY,
-                Some(OsStr::new(raw)),
-            );
-            assert!(!decision.env_armed, "near-miss spelling {raw:?} armed");
-            assert!(!decision.effective, "near-miss spelling {raw:?} forwarded");
-        }
-
-        let armed = traffic_terminal_softmax_peel_decision(
-            TRAFFIC_TERMINAL_SOFTMAX_PEEL_CATEGORY,
-            Some(OsStr::new("1")),
-        );
-        assert!(armed.env_armed);
-        assert!(armed.effective);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn traffic_terminal_softmax_peel_non_unicode_env_fails_closed() {
-        use std::os::unix::ffi::OsStrExt;
-
-        let decision = traffic_terminal_softmax_peel_decision(
-            TRAFFIC_TERMINAL_SOFTMAX_PEEL_CATEGORY,
-            Some(OsStr::from_bytes(b"1\xff")),
-        );
-        assert!(!decision.env_armed);
-        assert!(!decision.effective);
-    }
-
-    #[test]
-    fn traffic_terminal_softmax_peel_is_category_isolated() {
-        for category in [
-            "traffic_signs_recognition",
-            "traffic_signs_recognition_2024",
-            "Traffic_Signs_Recognition_2023",
-            " traffic_signs_recognition_2023",
-            "traffic_signs_recognition_2023 ",
-            "other_traffic_signs_recognition_2023",
-            "path/traffic_signs_recognition_2023",
-        ] {
-            let decision = traffic_terminal_softmax_peel_decision(category, Some(OsStr::new("1")));
-            assert!(decision.env_armed);
-            assert!(
-                !decision.category_matched,
-                "near-miss category {category:?}"
-            );
-            assert!(
-                !decision.effective,
-                "near-miss category {category:?} forwarded"
-            );
-        }
-    }
-
-    #[test]
-    fn traffic_terminal_softmax_peel_gate_on_forwards_typed_request() {
-        let decision = traffic_terminal_softmax_peel_decision(
-            TRAFFIC_TERMINAL_SOFTMAX_PEEL_CATEGORY,
-            Some(OsStr::new("1")),
-        );
-        let overrides = BetaCrownInstanceOverrides {
-            traffic_terminal_softmax_peel: decision.effective,
-            ..BetaCrownInstanceOverrides::default()
-        };
-        assert!(overrides.traffic_terminal_softmax_peel);
-    }
-
-    #[test]
-    fn cgan_input_leaf_gate_is_default_dark_and_exact() {
-        let expected_route = cfg!(feature = "mip").then_some(CganInputLeafRoute::Cgan2023);
-        for category in CGAN_INPUT_LEAF_CATEGORIES {
-            assert_eq!(
-                cgan_input_leaf_decision(category, None),
-                CganInputLeafDecision {
-                    env_armed: false,
-                    category_matched: true,
-                    mip_compiled: cfg!(feature = "mip"),
-                    route: None,
-                }
-            );
-            for raw in ["", "0", "01", "true", "on", " 1", "1 "] {
-                let decision = cgan_input_leaf_decision(category, Some(OsStr::new(raw)));
-                assert!(!decision.env_armed, "near-miss spelling {raw:?} armed");
-                assert_eq!(decision.route, None);
-            }
-            assert_eq!(
-                cgan_input_leaf_decision(category, Some(OsStr::new("1"))).route,
-                expected_route
-            );
-            let armed = cgan_input_leaf_decision(category, Some(OsStr::new("1")));
-            assert_eq!(
-                cgan_input_leaf_gate_receipt(armed, category),
-                format!(
-                    "env_armed=true category_matched=true mip_compiled={} effective={} \
-                     depth_two_production_mode=disabled_not_requested category={category}",
-                    cfg!(feature = "mip"),
-                    cfg!(feature = "mip"),
-                )
-            );
-        }
-    }
-
-    #[test]
-    fn cgan_input_leaf_route_is_exact_category_only() {
-        for category in [
-            "cgan2023",
-            "cgan_2024",
-            "cgan_2026",
-            "cgan2027",
-            "CGAN_2023",
-            " cgan_2023",
-            "cgan_2023 ",
-            "path/cgan_2023",
-            "CGAN2026",
-            " cgan2026",
-            "cgan2026 ",
-            "path/cgan2026",
-        ] {
-            let decision = cgan_input_leaf_decision(category, Some(OsStr::new("1")));
-            assert!(decision.env_armed);
-            assert!(
-                !decision.category_matched,
-                "near-miss category {category:?}"
-            );
-            assert_eq!(decision.route, None);
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn cgan_input_leaf_non_unicode_env_fails_closed() {
-        use std::os::unix::ffi::OsStrExt;
-
-        for category in CGAN_INPUT_LEAF_CATEGORIES {
-            let decision = cgan_input_leaf_decision(category, Some(OsStr::from_bytes(b"1\xff")));
-            assert!(!decision.env_armed);
-            assert_eq!(decision.route, None);
-        }
-    }
-
-    #[test]
-    fn traffic_terminal_softmax_execution_distinguishes_every_receipt_state() {
-        assert_eq!(
-            TrafficTerminalSoftmaxPeelExecution::before_run(false),
-            TrafficTerminalSoftmaxPeelExecution::NotRequested
-        );
-        assert_eq!(
-            TrafficTerminalSoftmaxPeelExecution::before_run(true),
-            TrafficTerminalSoftmaxPeelExecution::NotReached
-        );
-        assert_eq!(
-            TrafficTerminalSoftmaxPeelExecution::NotReached.flight_status(),
-            crate::flight::FlightStatus::NotReached
-        );
-        assert_eq!(
-            TrafficTerminalSoftmaxPeelExecution::from_beta_capture(true, None),
-            TrafficTerminalSoftmaxPeelExecution::ReceiptUnavailable
-        );
-
-        let captured = |requested, applied, activation| {
-            serde_json::json!({
-                "status": "unknown",
-                "effective_config": {
-                    "softmax": {
-                        "terminal_peel_requested": requested,
-                        "terminal_peel_applied": applied,
-                        "terminal_peel_activation": activation,
-                    }
-                }
-            })
-            .to_string()
-        };
-        let declined = captured(true, false, "none");
-        assert_eq!(
-            TrafficTerminalSoftmaxPeelExecution::from_beta_capture(true, Some(&declined)),
-            TrafficTerminalSoftmaxPeelExecution::Declined
-        );
-        assert_eq!(
-            TrafficTerminalSoftmaxPeelExecution::Declined.flight_status(),
-            crate::flight::FlightStatus::Skipped
-        );
-        let applied = captured(true, true, "softmax");
-        let applied_receipt =
-            TrafficTerminalSoftmaxPeelExecution::from_beta_capture(true, Some(&applied));
-        assert_eq!(
-            applied_receipt,
-            TrafficTerminalSoftmaxPeelExecution::Applied
-        );
-        assert!(applied_receipt.applied());
-        assert_eq!(
-            applied_receipt.flight_status(),
-            crate::flight::FlightStatus::Ran
-        );
-
-        let inconsistent = captured(false, true, "softmax");
-        assert_eq!(
-            TrafficTerminalSoftmaxPeelExecution::from_beta_capture(true, Some(&inconsistent)),
-            TrafficTerminalSoftmaxPeelExecution::ReceiptUnavailable
-        );
-
-        for inconsistent_activation in [
-            captured(true, true, "sigmoid"),
-            captured(true, true, "log_softmax"),
-            captured(true, false, "softmax"),
-        ] {
-            assert_eq!(
-                TrafficTerminalSoftmaxPeelExecution::from_beta_capture(
-                    true,
-                    Some(&inconsistent_activation),
-                ),
-                TrafficTerminalSoftmaxPeelExecution::ReceiptUnavailable,
-                "traffic receipt must authenticate the exact applied activation"
-            );
-        }
     }
 
     #[test]
@@ -33655,6 +39801,281 @@ mod tests {
             assert_eq!(decision.solver_timeout_secs, budget - 1);
             assert_eq!(decision.effective_flush_reserve_secs, 1);
             assert_eq!(decision.route, InternalTimeoutRoute::SafeNlpShortGrace);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // #flush-grace: the typed RESULTS_FILE publication reserve
+    // -----------------------------------------------------------------
+
+    /// UNSET IS BYTE-IDENTICAL. The pinned budgets are the official ones this
+    /// key is aimed at plus the long tail it must not disturb: safenlp/nn4sys
+    /// 20, nn4sys 30, cifar100/tinyimagenet 100, acasxu 116, metaroom 210,
+    /// nn4sys 600, cgan 1200.
+    #[test]
+    fn flush_grace_unset_pins_the_historical_arithmetic() {
+        for (budget, expected_internal, expected_grace) in [
+            (20u64, 15u64, 5u64),
+            (30, 25, 5),
+            (100, 95, 5),
+            (116, 111, 5),
+            (210, 200, 10),
+            (600, 570, 30),
+            (1200, 1140, 60),
+        ] {
+            assert_eq!(
+                internal_timeout_secs(budget),
+                expected_internal,
+                "historical tier drifted at budget={budget}"
+            );
+            let historical = internal_timeout_decision("safenlp_2024", budget, None);
+            let unset = apply_results_flush_grace_policy(historical, budget, None);
+            assert_eq!(unset, historical, "absent key must not touch the decision");
+            assert_eq!(unset.route, InternalTimeoutRoute::Historical);
+            assert_eq!(unset.solver_timeout_secs, expected_internal);
+            assert_eq!(unset.effective_flush_reserve_secs, expected_grace);
+        }
+    }
+
+    /// The lever's whole point: one second of grace on a 20 s row hands the
+    /// solver 19 s instead of 15 s — +4 s, about +27 % of proof search.
+    #[test]
+    fn flush_grace_one_second_recovers_the_short_budget_tax() {
+        for (category, budget) in [("safenlp_2024", 20u64), ("nn4sys", 20), ("nn4sys", 30)] {
+            let historical = internal_timeout_decision(category, budget, None);
+            let armed = apply_results_flush_grace_policy(historical, budget, Some(1));
+            assert_eq!(armed.route, InternalTimeoutRoute::PresetFlushGrace);
+            assert_eq!(armed.solver_timeout_secs, budget - 1, "category={category}");
+            assert_eq!(armed.effective_flush_reserve_secs, 1);
+            assert_eq!(
+                armed.historical_solver_timeout_secs,
+                internal_timeout_secs(budget),
+                "the historical tier must still be reported for comparison"
+            );
+            assert!(
+                armed.solver_timeout_secs > historical.solver_timeout_secs,
+                "category={category} budget={budget} must gain proof time"
+            );
+        }
+        // The generalisation: on a long budget the scalable 5 % tail is the
+        // part that is replaced, which a `max(grace, budget/20)` substitution
+        // could never reach.
+        let long = internal_timeout_decision("cgan_2023", 1200, None);
+        let armed = apply_results_flush_grace_policy(long, 1200, Some(5));
+        assert_eq!(armed.solver_timeout_secs, 1195);
+        assert_eq!(long.solver_timeout_secs, 1140);
+    }
+
+    /// THE CLAMP IS TOTAL. Over every budget and every grace in range, the
+    /// internal timeout is at least one second whenever the budget is, and
+    /// never exceeds the scored budget.
+    #[test]
+    fn flush_grace_clamp_never_leaves_the_budget() {
+        for budget in 0..=400u64 {
+            for grace in 0..=400u64 {
+                let historical = internal_timeout_decision("safenlp_2024", budget, None);
+                let armed = apply_results_flush_grace_policy(historical, budget, Some(grace));
+                assert!(
+                    armed.solver_timeout_secs <= budget,
+                    "budget={budget} grace={grace} produced an OVER-BUDGET internal timeout {}",
+                    armed.solver_timeout_secs
+                );
+                if budget >= 1 {
+                    assert!(
+                        armed.solver_timeout_secs >= 1,
+                        "budget={budget} grace={grace} produced a non-positive internal timeout"
+                    );
+                }
+                assert_eq!(
+                    armed.effective_flush_reserve_secs,
+                    budget - armed.solver_timeout_secs,
+                    "the reported reserve must be the real one (budget={budget} grace={grace})"
+                );
+            }
+        }
+    }
+
+    /// A grace at or above the budget cannot starve the solver to zero: the
+    /// established fallback hands it the whole budget rather than a
+    /// zero/negative grant, exactly as the other two routes do.
+    #[test]
+    fn flush_grace_oversized_grace_falls_back_to_the_whole_budget() {
+        for budget in [1u64, 5, 20, 100] {
+            for grace in [budget, budget + 1, budget * 4, u64::MAX] {
+                let historical = internal_timeout_decision("safenlp_2024", budget, None);
+                let armed = apply_results_flush_grace_policy(historical, budget, Some(grace));
+                assert_eq!(
+                    armed.solver_timeout_secs, budget,
+                    "budget={budget} grace={grace}"
+                );
+                assert_eq!(armed.effective_flush_reserve_secs, 0);
+            }
+        }
+    }
+
+    /// PRECEDENCE. The typed key outranks the proof-tail route and is refused
+    /// entry to the SafeNLP short-grace lane, which owns its own hard stop and
+    /// single-writer publication coordinator.
+    #[test]
+    fn flush_grace_outranks_proof_tail_and_never_displaces_short_grace() {
+        let proof = apply_postbab_wrapper_timeout_policy(
+            internal_timeout_decision("cgan_2023", 900, None),
+            900,
+            PostBabWrapperRoute::ProofTailByPreset,
+        );
+        assert_eq!(proof.route, InternalTimeoutRoute::PresetProofTail);
+        assert_eq!(proof.solver_timeout_secs, 895);
+        let armed = apply_results_flush_grace_policy(proof, 900, Some(2));
+        assert_eq!(armed.route, InternalTimeoutRoute::PresetFlushGrace);
+        assert_eq!(armed.solver_timeout_secs, 898);
+
+        let short = internal_timeout_decision("safenlp_2024", 20, Some(OsStr::new("1")));
+        assert_eq!(short.route, InternalTimeoutRoute::SafeNlpShortGrace);
+        for grace in [0u64, 1, 5, 19, 20, 99] {
+            assert_eq!(
+                apply_results_flush_grace_policy(short, 20, Some(grace)),
+                short,
+                "the typed key must not enter the short-grace lane (grace={grace})"
+            );
+        }
+    }
+
+    /// The explicit-grace route is anchored ABSOLUTELY, like the proof tail:
+    /// a one-second reserve cannot survive a duration-based grant that
+    /// restarts the clock after model load.
+    #[test]
+    fn flush_grace_route_anchors_the_verifier_deadline_absolutely() {
+        let start = std::time::Instant::now();
+        let instance_deadline = start + std::time::Duration::from_secs(20);
+        let historical = internal_timeout_decision("safenlp_2024", 20, None);
+        assert_eq!(beta_phase_deadline(historical, instance_deadline), None);
+
+        let armed = apply_results_flush_grace_policy(historical, 20, Some(1));
+        let deadline = beta_phase_deadline(armed, instance_deadline)
+            .expect("an explicit grace must publish an absolute verifier deadline");
+        assert_eq!(
+            deadline,
+            instance_deadline
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap()
+        );
+        assert_eq!(
+            solver_phase_deadline(armed, instance_deadline),
+            instance_deadline
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap()
+        );
+    }
+
+    /// END TO END FROM A YAML: the key resolves out of a preset file, through
+    /// the wrapper's immutable snapshot, into the internal timeout. An absent
+    /// key, an absent section, and an invalid preset all resolve to `None`.
+    #[test]
+    fn flush_grace_resolves_from_a_yaml_into_the_internal_timeout() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        let armed_path = tmp.path().join("armed.yaml");
+        fs::write(
+            &armed_path,
+            "bab:\n  phase_budget:\n    results_flush_grace_secs: 1\n",
+        )
+        .expect("write armed preset");
+        let armed_snapshot = BetaCrownPresetSnapshot::load(&armed_path);
+        assert_eq!(
+            results_flush_grace_from_snapshot(Some(&armed_snapshot)),
+            Some(1),
+            "the typed key must survive the yaml -> snapshot hop"
+        );
+        let historical = internal_timeout_decision("safenlp_2024", 20, None);
+        let armed = apply_results_flush_grace_policy(
+            historical,
+            20,
+            results_flush_grace_from_snapshot(Some(&armed_snapshot)),
+        );
+        assert_eq!(armed.route, InternalTimeoutRoute::PresetFlushGrace);
+        assert_eq!(armed.solver_timeout_secs, 19);
+
+        let bare_path = tmp.path().join("bare.yaml");
+        fs::write(&bare_path, "bab:\n  phase_budget:\n    mip_min_secs: 10\n")
+            .expect("write preset without the key");
+        let bare_snapshot = BetaCrownPresetSnapshot::load(&bare_path);
+        assert_eq!(
+            results_flush_grace_from_snapshot(Some(&bare_snapshot)),
+            None
+        );
+        assert_eq!(
+            apply_results_flush_grace_policy(historical, 20, None),
+            historical,
+            "a preset that omits the key must be byte-identical to today"
+        );
+
+        assert_eq!(results_flush_grace_from_snapshot(None), None);
+        assert_eq!(
+            results_flush_grace_from_snapshot(Some(&BetaCrownPresetSnapshot::Invalid(
+                "retained semantic error".to_string()
+            ))),
+            None,
+            "an invalid preset must never acquire a shorter publication reserve"
+        );
+    }
+
+    /// THE OBSERVABLE IS UNCONDITIONAL AND NAMES ITS OWN SOURCE. Every route
+    /// renders a line, so an ABSENT `[flush-grace]` line means the binary
+    /// predates this lever and a null measured through it is VOID, not
+    /// negative.
+    #[test]
+    fn flush_grace_receipt_is_rendered_for_every_route() {
+        let historical = internal_timeout_decision("safenlp_2024", 20, None);
+        assert_eq!(
+            flush_grace_receipt_line(20, historical),
+            "[flush-grace] budget_s=20 grace_s=5 source=default internal_timeout_s=15"
+        );
+
+        let armed = apply_results_flush_grace_policy(historical, 20, Some(1));
+        assert_eq!(
+            flush_grace_receipt_line(20, armed),
+            "[flush-grace] budget_s=20 grace_s=1 source=preset internal_timeout_s=19"
+        );
+
+        let short = internal_timeout_decision("safenlp_2024", 20, Some(OsStr::new("1")));
+        assert_eq!(
+            flush_grace_receipt_line(20, short),
+            "[flush-grace] budget_s=20 grace_s=1 source=env-safenlp-short-grace \
+internal_timeout_s=19"
+        );
+
+        let proof = apply_postbab_wrapper_timeout_policy(
+            internal_timeout_decision("cgan_2023", 900, None),
+            900,
+            PostBabWrapperRoute::ProofTailByPreset,
+        );
+        assert_eq!(
+            flush_grace_receipt_line(900, proof),
+            "[flush-grace] budget_s=900 grace_s=5 source=preset-proof-tail \
+internal_timeout_s=895"
+        );
+
+        // Every line is self-consistent: the three numbers must add up, on
+        // every route and every budget, or the receipt is worse than nothing.
+        for budget in [0u64, 1, 20, 30, 100, 116, 210, 600, 1200] {
+            for grace in [None, Some(0), Some(1), Some(5), Some(9_999)] {
+                let decision = apply_results_flush_grace_policy(
+                    internal_timeout_decision("safenlp_2024", budget, None),
+                    budget,
+                    grace,
+                );
+                let line = flush_grace_receipt_line(budget, decision);
+                assert!(
+                    line.starts_with("[flush-grace] budget_s="),
+                    "the marker must be the first token: {line}"
+                );
+                assert!(!line.contains('\n'), "the receipt must be ONE line: {line}");
+                assert_eq!(
+                    decision.effective_flush_reserve_secs + decision.solver_timeout_secs,
+                    budget,
+                    "receipt numbers must reconcile: {line}"
+                );
+            }
         }
     }
 
@@ -33901,10 +40322,13 @@ mod tests {
             benchmark_preset_search_dirs(&root.join("vnncomp25"), 2025),
             vec![root.join("vnncomp25")]
         );
-        assert!(benchmark_preset_search_dirs(&root.join("vnncomp26"), 2025).is_empty());
+        assert_eq!(
+            (benchmark_preset_search_dirs(&root.join("vnncomp26"), 2025)).len(),
+            0
+        );
         // A year with no directory at all resolves nothing; the sweep's own
         // exact-year existence check is what turns that into a refusal.
-        assert!(benchmark_preset_search_dirs(root, 2023).is_empty());
+        assert_eq!((benchmark_preset_search_dirs(root, 2023)).len(), 0);
     }
 
     /// #sweep-preset-parity: `ny benchmarks run` must measure what ships.
@@ -34236,14 +40660,8 @@ mod tests {
 
         let onnx_field =
             format!("[('f', 'onnx/original/{net_name}'), ('g', 'onnx/original/{net_name}')]");
-        let result = run_relational_vnncomp(
-            "monotonic_acasxu_2026",
-            Path::new(&onnx_field),
-            &vnnlib,
-            30,
-            None,
-        )
-        .expect("relational run");
+        let result = run_relational_vnncomp(Path::new(&onnx_field), &vnnlib, 30, None)
+            .expect("relational run");
 
         let VnncompResult::Sat {
             witness: Some(witness),
@@ -34318,14 +40736,9 @@ mod tests {
         )
         .expect("write vnnlib");
 
-        let result = run_relational_vnncomp(
-            "monotonic_acasxu_2026",
-            Path::new("(onnx/a.onnx, onnx/b.onnx)"),
-            &vnnlib,
-            10,
-            None,
-        )
-        .expect("relational run");
+        let result =
+            run_relational_vnncomp(Path::new("(onnx/a.onnx, onnx/b.onnx)"), &vnnlib, 10, None)
+                .expect("relational run");
 
         // No genuine counterexample exists => sound fall-through to unknown, NEVER sat.
         assert_eq!(

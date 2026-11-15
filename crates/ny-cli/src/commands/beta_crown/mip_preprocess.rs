@@ -4,8 +4,6 @@
 //
 // Network preprocessing utilities for feed-forward MIP verification.
 // Extracts parameters, folds constants, strips shape layers.
-//
-// Part of #1763.
 
 use anyhow::Result;
 use ndarray::{Array1, Array2, ArrayD};
@@ -16,6 +14,8 @@ use ny_propagate::layers::LinearLayer;
 use ny_propagate::{Layer, Network};
 use ny_tensor::BoundedTensor;
 use std::ops::Deref;
+
+use super::mip_sound_intermediate_bounds::SoundIntermediateBounds;
 
 /// Extracted network parameters: (weights, biases, layer_dims).
 pub(super) type NetworkParams = (Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<usize>);
@@ -219,7 +219,7 @@ pub(super) fn bounded_tensor_to_bounds(tensor: &BoundedTensor) -> Result<Vec<Bou
         .collect()
 }
 
-/// Convert IBP intermediate bounds for MIP encoding.
+/// Convert CERTIFIED IBP intermediate bounds for MIP encoding.
 ///
 /// Returns pre-activation bounds for each hidden layer's ReLU
 /// (used as tight Big-M values in the encoding).
@@ -228,17 +228,26 @@ pub(super) fn bounded_tensor_to_bounds(tensor: &BoundedTensor) -> Result<Vec<Bou
 /// Linear and ReLU, since `fold_constant_layers` merges these into
 /// the Linear's bias. Uses the output of the layer just before the
 /// ReLU as the pre-activation bounds (which includes any bias additions).
+///
+/// SOUNDNESS (#mip-conv-sound-enclosure): these boxes become the Big-M
+/// constants of `encode_relu` verbatim and the certificate is checked against
+/// the encoded model, so this function accepts ONLY
+/// [`SoundIntermediateBounds`] — a newtype whose sole constructors are the
+/// certified collector and CROWN-over-that-certified-vector
+/// (`mip_sound_intermediate_bounds.rs`). A plain `Vec<BoundedTensor>` from
+/// `Network::collect_ibp_bounds` is a compile error here by design.
 pub(super) fn convert_intermediate_bounds(
-    layer_outputs: &[BoundedTensor],
+    layer_outputs: &SoundIntermediateBounds,
     network: &Network,
 ) -> Result<Vec<Vec<Bound>>> {
+    let layer_outputs = layer_outputs.as_slice();
     let mut intermediate_bounds = Vec::new();
     let layers = network.layers();
 
     for (i, layer) in layers.iter().enumerate() {
         // Match both Linear and Conv2d as affine layers preceding ReLU.
         // Conv2d→ReLU pairs produce pre-activation bounds that the MIP encoder
-        // needs for Big-M encoding, just like Linear→ReLU pairs. (#3218)
+        // needs for Big-M encoding, just like Linear→ReLU pairs.
         if matches!(layer, Layer::Linear(_) | Layer::Conv2d(_)) {
             // Find the next ReLU, skipping constant-op layers that get folded
             // into the Linear's bias by fold_constant_layers.
@@ -611,8 +620,6 @@ fn fold_constant_before_linear(
 /// `model_input_shape` is the ONNX model input shape (e.g., `[1, 64, 64]` for
 /// 1-channel 64x64 images). Used to infer Conv2d spatial dimensions when the
 /// Conv2d layer's `input_shape` field is not set (sequential network path).
-///
-/// Part of #3218.
 pub(super) fn unfold_conv2d_to_linear(
     network: &Network,
     model_input_shape: &[usize],

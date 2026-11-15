@@ -79,7 +79,7 @@ impl WhereLayer {
         // Union of bounds: [min(x_lower, y_lower), max(x_upper, y_upper)]
         // Use NaN-propagating variants so upstream NaN is never silently absorbed.
         // IEEE 754 f32::min/max return the non-NaN operand, which would produce
-        // unsound (too-tight) bounds. See #2577 for the same fix in Max/MinBinaryLayer.
+        // unsound (too-tight) bounds. Max/MinBinaryLayer apply the same fix.
         let out_lower = ndarray::Zip::from(x.lower())
             .and(y.lower())
             .map_collect(|&xl, &yl| nan_propagating_min(xl, yl));
@@ -94,7 +94,7 @@ impl WhereLayer {
         // arise — and min/max of non-NaN operands is never NaN. Clean ±Inf
         // widens the union soundly; a NaN output implies a NaN INPUT (the
         // nan_propagating_min/max above preserve it) — a real bug — which
-        // `new_allow_infinite` still rejects as a hard error (#2853 tests).
+        // `new_allow_infinite` still rejects as a hard error.
         BoundedTensor::new_allow_infinite(out_lower, out_upper)
     }
 
@@ -181,13 +181,18 @@ impl WhereLayer {
     /// This method computes the bias bounds to fold in.
     ///
     /// Two regimes, both sound:
-    /// - **Constant condition** (`lower == upper` everywhere): the select is
-    ///   fully determined per element, so the output is an EXACT constant
+    /// - **Determined condition** (the whole interval `[lower, upper]` lies on
+    ///   one side of the `cond >= 0.5` rule): every realizable condition picks
+    ///   the same branch, so the output is an EXACT constant
     ///   `const_true[i] if cond[i] >= 0.5 else const_false[i]`. This is tighter
-    ///   than the IBP union below.
-    /// - **Data-dependent condition**: each element may take either branch, so we
-    ///   return the per-element interval `[min(t,f), max(t,f)]` — identical to the
-    ///   IBP union from [`propagate_ibp_with_condition`]. Sound, not tightened.
+    ///   than the IBP union below. A degenerate `lower == upper` interval is the
+    ///   special case the rule was first written for; an exactly-constant
+    ///   condition that reaches here through a certified (outward-rounded)
+    ///   forward arrives as `[1 - ulp, 1 + ulp]`, which is just as determined.
+    /// - **Data-dependent condition** (the interval straddles `0.5`): each
+    ///   element may take either branch, so we return the per-element interval
+    ///   `[min(t,f), max(t,f)]` — identical to the IBP union from
+    ///   [`propagate_ibp_with_condition`]. Sound, not tightened.
     ///
     /// Returns `Err` if the embedded constants are absent or fail to broadcast to
     /// the condition shape (the caller then keeps the existing sound fallback).
@@ -214,9 +219,10 @@ impl WhereLayer {
         let true_bounds = self.broadcast_to_shape(&true_bounds, condition.shape())?;
         let false_bounds = self.broadcast_to_shape(&false_bounds, condition.shape())?;
 
-        // Constant condition => exact per-element select; else => sound union.
-        // We process element-wise so a *partially* constant condition still gets
-        // exact selection on the determined positions and the union elsewhere.
+        // Determined condition => exact per-element select; else => sound union.
+        // We process element-wise so a *partially* determined condition still
+        // gets exact selection on the determined positions and the union
+        // elsewhere.
         let cond_lower = condition.lower();
         let cond_upper = condition.upper();
         let out_lower = ndarray::Zip::from(cond_lower)
@@ -224,34 +230,58 @@ impl WhereLayer {
             .and(true_bounds.lower())
             .and(false_bounds.lower())
             .map_collect(|&clo, &chi, &tl, &fl| {
-                if clo == chi && clo.is_finite() {
+                match determined_branch(clo, chi) {
                     // Determined select: pick the branch's lower (== value here).
-                    if clo >= 0.5 {
-                        tl
-                    } else {
-                        fl
-                    }
-                } else {
+                    Some(true) => tl,
+                    Some(false) => fl,
                     // Data-dependent: lower of the union over both branches.
-                    nan_propagating_min(tl, fl)
+                    None => nan_propagating_min(tl, fl),
                 }
             });
         let out_upper = ndarray::Zip::from(cond_lower)
             .and(cond_upper)
             .and(true_bounds.upper())
             .and(false_bounds.upper())
-            .map_collect(|&clo, &chi, &tu, &fu| {
-                if clo == chi && clo.is_finite() {
-                    if clo >= 0.5 {
-                        tu
-                    } else {
-                        fu
-                    }
-                } else {
-                    nan_propagating_max(tu, fu)
-                }
+            .map_collect(|&clo, &chi, &tu, &fu| match determined_branch(clo, chi) {
+                Some(true) => tu,
+                Some(false) => fu,
+                None => nan_propagating_max(tu, fu),
             });
         BoundedTensor::new(out_lower, out_upper)
+    }
+}
+
+/// The branch every condition in `[lower, upper]` selects under the layer's
+/// `cond >= 0.5` rule, or `None` when the interval straddles the threshold (or
+/// is not a finite, ordered interval).
+///
+/// #where-determined: this was `lower == upper`, which an exactly-constant
+/// condition no longer satisfies once its bound comes from a certified
+/// forward (the sequential CROWN-IBP collector, `certified_forward=1`, hands
+/// the embedded-constant Where `[1 - ulp, 1 + ulp]` for `0·x + 1`), so the
+/// exact select fell back to the union on every such mask. For a degenerate
+/// interval the answer is unchanged; for a boolean-valued condition (a
+/// Compare/Cast output, whose realizable values are only 0 and 1) it agrees
+/// with any `!= 0` reading too, because an interval on one side of 0.5 holds
+/// only one of them.
+///
+/// CONTRACT (#eng7d where-mask-semantics): the condition is ONNX BOOL, i.e.
+/// `{0, 1}`-valued. On any other value set the `>= 0.5` side and a `!= 0`
+/// reading disagree (`[0.1, 0.3]` is "false" here and nonzero there), so
+/// every frontend must deliver that meaning: the ONNX loader proves it (the
+/// condition is BOOL-typed; `Cast(to=BOOL)` is admitted only on a boolean
+/// producer), and ny-trace-bridge lowers nn's F32 `mask != 0` through an
+/// explicit `Compare(Ne, 0)` before a both-constant Where.
+fn determined_branch(lower: f32, upper: f32) -> Option<bool> {
+    if !lower.is_finite() || !upper.is_finite() || lower > upper {
+        return None;
+    }
+    if lower >= 0.5 {
+        Some(true)
+    } else if upper < 0.5 {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -330,6 +360,37 @@ mod tests {
         assert_eq!(out.upper()[[1]], -20.0);
     }
 
+    /// #where-determined: an exactly-constant condition that arrives through a
+    /// certified forward is `[1 - ulp, 1 + ulp]` / a tiny interval around 0;
+    /// both are determined by the `cond >= 0.5` rule and must select exactly.
+    /// An interval that straddles 0.5 stays the union.
+    #[test]
+    fn test_embedded_constant_select_exact_for_outward_rounded_constant_condition() {
+        let layer = WhereLayer::with_constants(
+            Some(ArrayD::from_shape_vec(IxDyn(&[4]), vec![10.0_f32, 20.0, 30.0, 40.0]).unwrap()),
+            Some(
+                ArrayD::from_shape_vec(IxDyn(&[4]), vec![-10.0_f32, -20.0, -30.0, -40.0]).unwrap(),
+            ),
+        );
+        let one_below = 1.0_f32 - f32::EPSILON / 2.0;
+        let one_above = 1.0_f32 + f32::EPSILON;
+        let cond = make_bounds(
+            &[one_below, -f32::MIN_POSITIVE, 0.4, 0.5],
+            &[one_above, f32::MIN_POSITIVE, 0.6, 0.9],
+        );
+        let out = layer.embedded_constant_select_output(&cond).unwrap();
+        // pos 0: determined true; pos 1: determined false; pos 2: straddles
+        // 0.5, union; pos 3: [0.5, 0.9] is entirely >= 0.5, determined true.
+        assert_eq!((out.lower()[[0]], out.upper()[[0]]), (10.0, 10.0));
+        assert_eq!((out.lower()[[1]], out.upper()[[1]]), (-20.0, -20.0));
+        assert_eq!((out.lower()[[2]], out.upper()[[2]]), (-30.0, 30.0));
+        assert_eq!((out.lower()[[3]], out.upper()[[3]]), (40.0, 40.0));
+        // Non-finite or inverted condition intervals are never determined.
+        for (lo, hi) in [(f32::NAN, 1.0), (0.9, f32::INFINITY), (0.9, 0.8)] {
+            assert_eq!(determined_branch(lo, hi), None, "[{lo}, {hi}]");
+        }
+    }
+
     /// Dense-sampling soundness for `embedded_constant_select_output`: for random
     /// constant 0/1 conditions and random branch constants, the returned interval
     /// must contain the true elementwise select at the (single, since cond is
@@ -385,7 +446,7 @@ mod tests {
         assert_eq!(result.upper()[[1]], 6.0); // max(5.0, 6.0)
     }
 
-    /// Regression test (#2853): NaN in x's lower bound must propagate through to
+    /// Regression test: NaN in x's lower bound must propagate through to
     /// output, causing BoundedTensor::new to reject the result. Before the fix,
     /// f32::min silently returned the non-NaN operand (IEEE 754), producing
     /// unsound (too-tight) bounds. nan_propagating_min preserves NaN so the
@@ -416,8 +477,8 @@ mod tests {
         );
     }
 
-    /// Regression test (#2853): NaN in y's upper bound must propagate.
-    /// Same mechanism as the x_lower test above. See #2577.
+    /// Regression test: NaN in y's upper bound must propagate.
+    /// Same mechanism as the x_lower test above.
     #[test]
     fn test_where_ibp_nan_propagates_from_y_upper() {
         let layer = WhereLayer::new();
@@ -463,7 +524,7 @@ mod tests {
     }
 
     /// NaN input (a real bug, not OpaqueSkip taint) must still hard-error:
-    /// `new_allow_infinite` rejects NaN. Complements the #2853 tests above.
+    /// `new_allow_infinite` rejects NaN. Complements the NaN tests above.
     #[test]
     fn test_where_ibp_nan_input_still_errors_after_inf_migration() {
         let layer = WhereLayer::new();

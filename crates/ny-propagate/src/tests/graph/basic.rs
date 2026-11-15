@@ -390,7 +390,7 @@ fn test_topological_sort_cycle_detection_still_works() {
     assert!(msg.contains("Cycle"), "Error should mention cycle");
 }
 
-/// Scalar input (ndim=0) must return Err, not panic at shape[ndim-1] (#2690).
+/// Scalar input (ndim=0) must return Err, not panic at shape[ndim-1].
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_per_position_scalar_input_returns_err_2690() {
@@ -411,7 +411,7 @@ fn test_crown_per_position_scalar_input_returns_err_2690() {
     );
 }
 
-/// Zero-batch input (shape=[0, H]) must return Err, not panic at row(0) (#2690).
+/// Zero-batch input (shape=[0, H]) must return Err, not panic at row(0).
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_per_position_zero_batch_returns_err_2690() {

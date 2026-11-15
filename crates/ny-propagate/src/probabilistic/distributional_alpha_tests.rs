@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Tests for DA-CROWN analytical tools.
-//! Part of #3921 / #4249.
 
 use super::*;
 use ndarray::{Array1, Array2, ArrayD, IxDyn};

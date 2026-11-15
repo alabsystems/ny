@@ -173,7 +173,7 @@ pub(super) fn route_conv_model_to_graph(
         if is_input_split || use_relu_split {
             return (true, use_relu_split);
         }
-        // #3813: sequential Conv2d β-CROWN ignores conv_mode, so matrix-mode
+        // Sequential Conv2d β-CROWN ignores conv_mode, so matrix-mode
         // presets must use the graph ReLU-split engine to honor the reference
         // cuts => matrix policy.
         return (true, true);

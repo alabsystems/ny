@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Packet C measurement: real talker-attention CROWN timing (#3588).
+//! Packet C measurement: real talker-attention CROWN timing.
 //!
 //! After Packet A threaded GemmEngine through the pure-attention DAG
 //! alpha-CROWN path, this module measures the real `talker_attention_layer0.onnx`
@@ -11,10 +11,8 @@
 //! **Result:** Alpha-CROWN (1 iteration, SPSA) exceeds 282s on this graph
 //! (3 SPSA samples × 2 perturbations = 6 CROWN evals + baseline + alpha eval).
 //! The bottleneck is CROWN evaluation count, not engine threading. GPU
-//! acceleration of the inner batched CROWN backward (#3597) is required
+//! acceleration of the inner batched CROWN backward is required
 //! before alpha-CROWN is feasible at this scale.
-//!
-//! Reference: designs/2026-03-11-issue-3588-pure-attention-alpha-crown-runtime-path.md
 
 use super::super::common;
 use super::fixtures::{
@@ -87,7 +85,7 @@ fn measure_crown_baseline(
 ///   MulConstant nodes)
 /// - Alpha-CROWN (1 iter, 3 SPSA samples): >282s (times out at 300s)
 /// - Bottleneck: 8 CROWN evaluations in SPSA loop at ~35s each
-/// - Conclusion: GPU acceleration (#3597) needed before alpha-CROWN is feasible
+/// - Conclusion: GPU acceleration needed before alpha-CROWN is feasible
 ///
 /// Re-measured 2026-07-19: with the MulConstant runtime-shape recovery the
 /// backward pass now completes end-to-end (provenance=Crown, mean output

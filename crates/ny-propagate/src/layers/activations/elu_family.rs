@@ -8,8 +8,6 @@
 //! expressions that differ between the three activations. Each activation
 //! creates its `EluFamilyParams` and delegates to `elu_family_linear_relaxation`.
 //!
-//! Part of #2834.
-//! Design: designs/archive/2026-02-18-code-structure-wave22-elu-family-alpha-loop-dedup.md
 //! Ref: alpha-beta-CROWN auto_LiRPA/operators/nonlinear.py (ELU/SELU/CELU relaxation)
 
 use ny_core::{nan_propagating_max_f64, nan_propagating_min_f64};
@@ -109,7 +107,7 @@ pub(crate) fn elu_family_linear_relaxation(
         } else {
             (params.eval_negative)(f64::from(u), params)
         };
-        // NaN-propagating: if fu is NaN, propagate instead of absorbing via IEEE min/max. (#2714)
+        // NaN-propagating: if fu is NaN, propagate instead of absorbing via IEEE min/max.
         // Both directed casts are NaN-preserving, so that path is unchanged.
         return LinearRelaxation::new(
             0.0,
@@ -142,7 +140,7 @@ pub(crate) fn elu_family_linear_relaxation(
         return LinearRelaxation::new(positive_slope_f32, params.saturation, 0.0, f32::INFINITY);
     }
 
-    // f64 intermediates to prevent catastrophic cancellation (#1745).
+    // f64 intermediates to prevent catastrophic cancellation.
     let l64 = l as f64;
     let u64 = u as f64;
 

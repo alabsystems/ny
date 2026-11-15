@@ -125,9 +125,13 @@ fn clip_input_box_signature(input: &BoundedTensor) -> u64 {
 /// fallback paths. In particular, an effective graph-BaB deadline can be
 /// earlier than the outer loop's nominal timeout, so collapsing it into a
 /// generic propagation failure can otherwise produce a pre-deadline `Unknown`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::beta_crown::engine::graph) enum MultiObjectiveChildEvalError {
-    Infeasible,
+    /// The constrained child domain is empty. Carries the producer's own
+    /// `InfeasibleDomain` text (or the dense-spec adapter's fixed description)
+    /// so the `[mo-fold] infeasible-pair` line can say WHY a split folded to
+    /// `Children([])`. Telemetry payload only: nothing branches on the text.
+    Infeasible(String),
     PropagationFailure,
     DeadlineExpired,
 }
@@ -769,7 +773,10 @@ impl BetaCrownVerifier {
                     // Refinement-proven infeasible subdomain (see above): empty
                     // constraint set ⇒ trivially verified, drop the child.
                     if infeasible_domains.get(dom_idx).copied().unwrap_or(false) {
-                        return Err(MultiObjectiveChildEvalError::Infeasible);
+                        return Err(MultiObjectiveChildEvalError::Infeasible(
+                            "dense-spec adapter: refinement-proven infeasible subdomain"
+                                .to_string(),
+                        ));
                     }
                     // Per-objective bounds for every spec row (length = union rows).
                     let full_bounds_i = spec_bounds_to_vec(&result.output_bounds);
@@ -1815,8 +1822,12 @@ impl BetaCrownVerifier {
                 )
             };
             if let Some(bwd) = bwd {
-                forward_bounds.override_node(pre, bwd);
-                backward_seeded += 1;
+                // `backward_input_relative_bounds_at_node` already folded its
+                // coefficient error over the child input box; an unfolded one
+                // is refused and the sound forward entry stays.
+                if forward_bounds.override_node(pre, bwd) {
+                    backward_seeded += 1;
+                }
             }
         }
         if probe {

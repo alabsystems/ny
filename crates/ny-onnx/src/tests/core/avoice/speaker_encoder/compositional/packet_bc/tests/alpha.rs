@@ -6,7 +6,7 @@ use super::super::super::boundary::discover_ecapa_composition_boundary;
 use super::support::assert_stage_outputs_contain_center;
 use super::*;
 
-/// Regression for #3499: stage-local alpha-CROWN must refresh each extracted
+/// Regression: stage-local alpha-CROWN must refresh each extracted
 /// stage's deadline budget instead of reusing one stale absolute `Instant`.
 #[test]
 fn test_ecapa_stage_local_alpha_crown_refreshes_per_stage_deadline_3499() {
@@ -58,8 +58,7 @@ fn alpha_smoke_config_for_stage() -> AlphaCrownConfig {
 /// `test_ecapa_stage_local_crown_ibp_preserves_or_tightens_stage_outputs_3499`;
 /// duplicating it here pushes the alpha lane over the 600s test budget. Use a
 /// small alpha smoke budget here; the long-budget quality measurements belong in
-/// manual `#3499` runs, not in the regression surface.
-/// Part of #3499 criterion 3.
+/// manual runs, not in the regression surface.
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
 #[cfg(feature = "external-avoice")]
@@ -114,8 +113,7 @@ fn test_ecapa_stage_local_alpha_crown_tightens_stage_outputs_3499() {
 /// scalar bounds; the heavier CROWN-IBP comparisons already live in separate
 /// tests and make this alpha lane time out. Use the same short alpha smoke
 /// budget as the stage-local test; detailed bound-quality comparisons remain
-/// manual `#3499` measurements.
-/// Part of #3499 criterion 3.
+/// manual measurements.
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
 #[cfg(feature = "external-avoice")]

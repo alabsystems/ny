@@ -8,7 +8,8 @@
 //! Only called from [`super::crown_ibp::collect_core`] when a layer does not
 //! need a full partial CROWN backward pass.
 
-use crate::layers::{BoundPropagation, Layer};
+use super::forward::propagate_ibp_certified;
+use crate::layers::Layer;
 use crate::types::{BoundsProvenance, CrownIbpFallbackReason};
 use ny_core::{NyError, Result};
 use ny_tensor::BoundedTensor;
@@ -41,13 +42,18 @@ pub(super) fn propagate_forward_tightened_bound(
         })?
     };
 
-    let tightened = layer
-        .propagate_ibp(tightened_input)
+    // #crown-partial-sound-forward: this was the PLAIN `Layer::propagate_ibp`,
+    // a second lever-independent plain injection into the published vector —
+    // the intersection below keeps whichever operand is tighter, so an inward
+    // plain box survives a certified incumbent. Certified forward instead
+    // (Linear-only networks are byte-identical, see `propagate_ibp_certified`).
+    let tightened = propagate_ibp_certified(layer, tightened_input)
         .map_err(|e| NyError::LayerError {
             layer_index,
             layer_type: layer.layer_type().to_string(),
             source: Box::new(e),
-        })?;
+        })?
+        .into_tensor();
 
     let tightened = if tightened.shape() != ibp_bound.shape() && tightened.len() == ibp_bound.len()
     {

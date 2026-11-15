@@ -305,7 +305,7 @@ fn test_avgpool_ibp_soundness() -> Result<()> {
 #[test]
 fn test_avgpool_ibp_4d_soundness() -> Result<()> {
     // Verify batched avg pool bounds are sound: for any x in [l, u], avg_pool(x) in [lower, upper]
-    // This is acceptance criteria 3 for #2497: lb <= true_output <= ub for batched inputs.
+    // Acceptance criterion: lb <= true_output <= ub for batched inputs.
     let layer = AveragePoolLayer::new((2, 2), (2, 2), (0, 0), false);
     // 2 batches, 1 channel, 4x4
     let lower_data: Vec<f32> = (0..32).map(|i| (i as f32) * 0.5 - 4.0).collect();
@@ -1272,7 +1272,7 @@ fn test_avgpool_carried_coeff_err_encloses_and_ab_width() -> Result<()> {
             a.clone(),
             b.clone(),
             a.clone(),
-            b.clone(),
+            b,
             e.clone(),
             e.clone(),
         )?;
@@ -1283,7 +1283,7 @@ fn test_avgpool_carried_coeff_err_encloses_and_ab_width() -> Result<()> {
 
         // DISCHARGE (dispatcher non-carrier baseline): fold E into bias over the
         // AvgPool OUTPUT box, then backward on err-free bounds.
-        let mut disc_in = bounds.clone();
+        let mut disc_in = bounds;
         let obf = out_box.flatten();
         let obl: Vec<f32> = obf.lower().iter().copied().collect();
         let obu: Vec<f32> = obf.upper().iter().copied().collect();
@@ -1348,5 +1348,539 @@ fn test_avgpool_carried_coeff_err_encloses_and_ab_width() -> Result<()> {
              query.rs::propagates_coeff_err before trusting a 'propagate is tighter' claim"
         );
     }
+    Ok(())
+}
+
+// ===== Global-3d AveragePool tests (#rank4-global-avgpool) =====
+//
+// GlobalAveragePool over ALL trailing spatial axes of an unbatched rank-4
+// (C, D, H, W) input — the 3D-CNN case (smart_turn video backbone). The
+// wrong-axis reading these tests forbid: treating (C, D, H, W) as
+// (batch, C, H, W), which pools only H,W and emits C·D elements where the
+// model declares C.
+
+/// Deterministic xorshift-style pseudo-random f32 in [-2, 2]; no external
+/// crate, fixed seed → reproducible on every host.
+fn det_rand_stream(seed: u64) -> impl FnMut() -> f32 {
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        // 24 mantissa-ish bits → [-2, 2]
+        ((state >> 40) as f32 / (1u64 << 24) as f32) * 4.0 - 2.0
+    }
+}
+
+/// The dense reference: per channel, the f64 endpoint sum over ALL of
+/// D·H·W, divided in f64, stored to f32 with the same directed rounding the
+/// layer documents (lower→-∞, upper→+∞). EXACT equality is asserted — the
+/// mean of an interval box is exactly the mean of its bounds, so the only
+/// float freedom is the rounding convention, which is pinned here.
+#[ntest::timeout(10000)]
+#[test]
+fn global_3d_ibp_matches_dense_reference_on_random_rank4() -> Result<()> {
+    let layer = AveragePoolLayer::new_global_3d();
+    assert!(layer.is_global(), "global-3d must keep the (0,0) sentinel");
+    for (seed, (c, d, h, w)) in [
+        (1u64, (3usize, 2usize, 4usize, 5usize)),
+        (2, (8, 4, 7, 7)), // smart_turn layer4 geometry, channel-scaled
+        (3, (1, 1, 1, 1)),
+        (4, (2, 3, 1, 2)),
+        (5, (5, 2, 2, 2)),
+    ] {
+        let mut rng = det_rand_stream(seed);
+        let n = c * d * h * w;
+        let lo_raw: Vec<f32> = (0..n).map(|_| rng()).collect();
+        let hi_raw: Vec<f32> = lo_raw.iter().map(|&v| v + rng().abs()).collect();
+        let lower = ArrayD::from_shape_vec(IxDyn(&[c, d, h, w]), lo_raw).unwrap();
+        let upper = ArrayD::from_shape_vec(IxDyn(&[c, d, h, w]), hi_raw).unwrap();
+        let input = BoundedTensor::new(lower.clone(), upper.clone())?;
+
+        let out = layer.propagate_ibp(&input)?;
+        assert_eq!(
+            out.lower().shape(),
+            &[c, 1, 1, 1],
+            "global-3d output must collapse ALL trailing spatial axes (seed {seed})"
+        );
+
+        let divisor = (d * h * w) as f64;
+        for ci in 0..c {
+            let mut sum_l = 0.0f64;
+            let mut sum_u = 0.0f64;
+            for di in 0..d {
+                for hi in 0..h {
+                    for wi in 0..w {
+                        sum_l += lower[[ci, di, hi, wi]] as f64;
+                        sum_u += upper[[ci, di, hi, wi]] as f64;
+                    }
+                }
+            }
+            let want_l = ny_tensor::next_down_f32((sum_l / divisor) as f32);
+            let want_u = ny_tensor::next_up_f32((sum_u / divisor) as f32);
+            let got_l = out.lower()[[ci, 0, 0, 0]];
+            let got_u = out.upper()[[ci, 0, 0, 0]];
+            assert_eq!(
+                got_l.to_bits(),
+                want_l.to_bits(),
+                "lower[{ci}] mismatch (seed {seed}): got {got_l}, want {want_l}"
+            );
+            assert_eq!(
+                got_u.to_bits(),
+                want_u.to_bits(),
+                "upper[{ci}] mismatch (seed {seed}): got {got_u}, want {want_u}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Wrong-axis trap: values vary along the TEMPORAL axis, so the correct
+/// full-volume mean provably differs from every per-(c, d) H,W-plane mean.
+/// Fails under both wrong-axis plants: pooling only H,W changes the SHAPE
+/// ([C, D, 1, 1]), and pooling H,W of any single temporal slice changes the
+/// VALUE (each plane is constant at a value ≠ the volume mean).
+#[ntest::timeout(10000)]
+#[test]
+fn global_3d_ibp_pools_the_temporal_axis_not_just_hw() -> Result<()> {
+    let (c, d, h, w) = (2usize, 4usize, 3usize, 3usize);
+    // x[c, di, ·, ·] = (c + 1) · di: constant per plane, varying along d.
+    let vals = ArrayD::from_shape_fn(IxDyn(&[c, d, h, w]), |idx| ((idx[0] + 1) * idx[1]) as f32);
+    let input = BoundedTensor::new(vals.clone(), vals)?;
+    let layer = AveragePoolLayer::new_global_3d();
+    let out = layer.propagate_ibp(&input)?;
+    assert_eq!(out.lower().shape(), &[c, 1, 1, 1]);
+    for ci in 0..c {
+        // Volume mean over d ∈ {0,1,2,3} of (ci+1)·d = (ci+1)·1.5.
+        let want = (ci + 1) as f32 * 1.5;
+        let got_l = out.lower()[[ci, 0, 0, 0]];
+        let got_u = out.upper()[[ci, 0, 0, 0]];
+        assert!(
+            (got_l - want).abs() < 1e-5 && (got_u - want).abs() < 1e-5,
+            "channel {ci}: got [{got_l}, {got_u}], want ≈ {want}"
+        );
+        // And the volume mean differs from EVERY single-plane H,W mean
+        // ((ci+1)·d for d = 0..4), so a value from a wrong-axis pool cannot
+        // sneak through this assertion.
+        for di in 0..d {
+            let plane_mean = ((ci + 1) * di) as f32;
+            assert!(
+                (want - plane_mean).abs() > 0.4,
+                "trap degenerate: plane mean {plane_mean} too close to volume mean {want}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Rank pin: the global-3d layer refuses everything that is not exactly an
+/// unbatched rank-4 input — including rank 5 (4 spatial dims / a batched
+/// rank-4), which remains UNSUPPORTED after this change. This is the
+/// "still-refused case" pin for the default-on capability argument.
+#[ntest::timeout(10000)]
+#[test]
+fn global_3d_refuses_rank5_input() {
+    let layer = AveragePoolLayer::new_global_3d();
+    for shape in [vec![2usize, 3, 2, 2, 2], vec![3, 4, 5], vec![6], vec![2, 2]] {
+        let n: usize = shape.iter().product();
+        let vals = ArrayD::from_shape_vec(IxDyn(&shape), vec![1.0f32; n]).unwrap();
+        let input = BoundedTensor::new(vals.clone(), vals).unwrap();
+        let err = layer
+            .propagate_ibp(&input)
+            .expect_err("global-3d must refuse non-rank-4 input");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("global-3d") && msg.contains("rank-4"),
+            "refusal must name the contract, got: {msg}"
+        );
+    }
+}
+
+/// The refusal pin MOVED (#qdq-crown-followup): CROWN backward is now
+/// implemented for the global-3d pool (the Jacobian is an exact uniform
+/// 1/(D·H·W) scatter per channel), so the still-refused surface is the RANK
+/// contract — any pre-activation that is not exactly unbatched rank-4,
+/// including rank 5 (a batched global-3d / 4-spatial-dim pool, ONNX rank 6),
+/// keeps refusing. This is the deliberate successor of the old
+/// `global_3d_crown_backward_refuses` pin.
+#[ntest::timeout(10000)]
+#[test]
+fn global_3d_crown_backward_refuses_non_rank4_pre_activation() {
+    let layer = AveragePoolLayer::new_global_3d();
+    for shape in [vec![2usize, 3, 2, 2, 2], vec![3, 4, 5], vec![6]] {
+        let n: usize = shape.iter().product();
+        let vals = ArrayD::from_shape_vec(IxDyn(&shape), vec![0.5f32; n]).unwrap();
+        let pre = BoundedTensor::new(vals.clone(), vals).unwrap();
+        let bounds = LinearBounds::identity(shape[0]);
+        let err = layer
+            .propagate_linear_with_bounds(&bounds, &pre)
+            .expect_err("global-3d CROWN backward must refuse non-rank-4 pre-activation");
+        let msg = format!("{err}");
+        assert!(
+            matches!(err, NyError::InvalidSpec(_))
+                && msg.contains("global-3d")
+                && msg.contains("rank-4"),
+            "refusal must name the rank contract, got: {msg}"
+        );
+    }
+}
+
+/// Coefficient-width mismatch fails closed: the incoming bounds must have
+/// exactly C columns (the (C, 1, 1, 1) flat output), mirroring the 2-D
+/// path's `num_inputs != output_size` ShapeMismatch.
+#[ntest::timeout(10000)]
+#[test]
+fn global_3d_crown_backward_refuses_coefficient_width_mismatch() {
+    let layer = AveragePoolLayer::new_global_3d();
+    let (c, d, h, w) = (3usize, 2usize, 2usize, 2usize);
+    let vals = ArrayD::from_shape_vec(IxDyn(&[c, d, h, w]), vec![0.5f32; c * d * h * w]).unwrap();
+    let pre = BoundedTensor::new(vals.clone(), vals).unwrap();
+    let bounds = LinearBounds::identity(c + 1);
+    let err = layer
+        .propagate_linear_with_bounds(&bounds, &pre)
+        .expect_err("global-3d CROWN backward must refuse a wrong-width A");
+    assert!(
+        matches!(err, NyError::ShapeMismatch { .. }),
+        "expected ShapeMismatch, got: {err:?}"
+    );
+}
+
+/// CROWN-through-pool equals the DENSE REFERENCE bit-for-bit on random
+/// rank-4 boxes, identity-seeded coefficients (#qdq-crown-followup).
+///
+/// The dense reference is the explicit Jacobian product: J is the
+/// (C, C·D·H·W) matrix with J[c, (c, d, h, w)] = 1/(D·H·W) (zero across
+/// channels), so (A·J)[i, x=(c,d,h,w)] = A[i, c] · (1/(D·H·W)) — exactly one
+/// f32 product, which the scatter must reproduce bit-identically. Every
+/// geometry has D ≥ 2 and the trap self-check below proves the WRONG-SCALE
+/// plant (1/(H·W)) is bit-distinguishable, so this test is the planted-red
+/// captor for the wrong-axis Jacobian.
+#[ntest::timeout(10000)]
+#[test]
+fn global_3d_crown_backward_matches_dense_reference_identity_seeded() -> Result<()> {
+    for (seed, (c, d, h, w)) in [
+        (11u64, (3usize, 2usize, 4usize, 5usize)),
+        (12, (8, 4, 7, 7)), // smart_turn layer4 geometry, channel-scaled
+        (13, (2, 3, 1, 2)),
+        (14, (5, 2, 2, 2)),
+    ] {
+        let layer = AveragePoolLayer::new_global_3d();
+        let mut rng = det_rand_stream(seed);
+        let n = c * d * h * w;
+        let lo_raw: Vec<f32> = (0..n).map(|_| rng()).collect();
+        let hi_raw: Vec<f32> = lo_raw.iter().map(|&v| v + rng().abs()).collect();
+        let lower = ArrayD::from_shape_vec(IxDyn(&[c, d, h, w]), lo_raw).unwrap();
+        let upper = ArrayD::from_shape_vec(IxDyn(&[c, d, h, w]), hi_raw).unwrap();
+        let pre = BoundedTensor::new(lower.clone(), upper.clone())?;
+
+        let bounds = LinearBounds::identity(c);
+        let crown = layer.propagate_linear_with_bounds(&bounds, &pre)?;
+        assert_eq!(crown.lower_a.nrows(), c);
+        assert_eq!(crown.lower_a.ncols(), n);
+
+        let weight = 1.0f32 / (d * h * w) as f32;
+        // Trap self-check: the wrong-scale plant (1/(H·W)) must be
+        // bit-distinguishable from the full-volume weight on this geometry.
+        assert_ne!(
+            weight.to_bits(),
+            (1.0f32 / (h * w) as f32).to_bits(),
+            "trap degenerate (seed {seed}): D >= 2 must separate the scales"
+        );
+        let volume = d * h * w;
+        for i in 0..c {
+            for x in 0..n {
+                let ch = x / volume;
+                // Dense reference: (I·J)[i, x] = J[i, x] = weight iff i == ch.
+                let want = if i == ch { weight } else { 0.0 };
+                assert_eq!(
+                    crown.lower_a[[i, x]].to_bits(),
+                    want.to_bits(),
+                    "lower_a[{i},{x}] (seed {seed}): got {}, want {want}",
+                    crown.lower_a[[i, x]]
+                );
+                assert_eq!(
+                    crown.upper_a[[i, x]].to_bits(),
+                    want.to_bits(),
+                    "upper_a[{i},{x}] (seed {seed}): got {}, want {want}",
+                    crown.upper_a[[i, x]]
+                );
+            }
+            assert_eq!(crown.lower_b[i], 0.0, "identity bias must pass through");
+        }
+
+        // Concretized CROWN must agree with the layer's own IBP forward (the
+        // pool is linear, so the two enclosures coincide up to rounding).
+        let ibp = layer.propagate_ibp(&pre)?;
+        let lo_flat: Vec<f32> = lower.iter().cloned().collect();
+        let hi_flat: Vec<f32> = upper.iter().cloned().collect();
+        for i in 0..c {
+            let mut clo = crown.lower_b[i] as f64;
+            let mut chi = crown.upper_b[i] as f64;
+            for x in 0..n {
+                let la = crown.lower_a[[i, x]] as f64;
+                let ua = crown.upper_a[[i, x]] as f64;
+                clo += la.max(0.0) * lo_flat[x] as f64 + la.min(0.0) * hi_flat[x] as f64;
+                chi += ua.max(0.0) * hi_flat[x] as f64 + ua.min(0.0) * lo_flat[x] as f64;
+            }
+            let il = ibp.lower()[[i, 0, 0, 0]] as f64;
+            let iu = ibp.upper()[[i, 0, 0, 0]] as f64;
+            assert!(
+                (clo - il).abs() < 1e-4 && (chi - iu).abs() < 1e-4,
+                "channel {i} (seed {seed}): concretized CROWN [{clo}, {chi}] vs IBP [{il}, {iu}]"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Same dense-reference bit-equality under IBP-SEEDED coefficients: the
+/// incoming A rows are built from the layer's own IBP output box (mixed
+/// signs, dense across channels — the shape a downstream backward hands this
+/// layer), plus a nonzero bias that must pass through untouched. Also checks
+/// enclosure at sampled concrete points, with the certified per-coefficient
+/// error term charged exactly as the implementation documents
+/// (γ³²_1 · row_max(A)).
+#[ntest::timeout(10000)]
+#[test]
+fn global_3d_crown_backward_matches_dense_reference_ibp_seeded() -> Result<()> {
+    for (seed, (c, d, h, w)) in [
+        (21u64, (3usize, 2usize, 3usize, 4usize)),
+        (22, (4, 4, 7, 7)),
+        (23, (2, 5, 2, 3)),
+    ] {
+        let layer = AveragePoolLayer::new_global_3d();
+        let mut rng = det_rand_stream(seed);
+        let n = c * d * h * w;
+        let lo_raw: Vec<f32> = (0..n).map(|_| rng()).collect();
+        let hi_raw: Vec<f32> = lo_raw.iter().map(|&v| v + rng().abs()).collect();
+        let lower = ArrayD::from_shape_vec(IxDyn(&[c, d, h, w]), lo_raw).unwrap();
+        let upper = ArrayD::from_shape_vec(IxDyn(&[c, d, h, w]), hi_raw).unwrap();
+        let pre = BoundedTensor::new(lower.clone(), upper.clone())?;
+
+        // IBP-seeded coefficients: dense rows derived from the pool's own IBP
+        // output endpoints, alternating sign so both concretization corners
+        // are exercised.
+        let ibp = layer.propagate_ibp(&pre)?;
+        let rows = 3usize;
+        let mut a = ndarray::Array2::<f32>::zeros((rows, c));
+        for i in 0..rows {
+            for ch in 0..c {
+                let v = if (i + ch) % 2 == 0 {
+                    ibp.upper()[[ch, 0, 0, 0]] + i as f32
+                } else {
+                    -(ibp.lower()[[ch, 0, 0, 0]].abs() + 0.5)
+                };
+                a[[i, ch]] = v;
+            }
+        }
+        let bias = ndarray::Array1::from_shape_fn(rows, |i| i as f32 * 0.25 - 0.125);
+        let seeded = LinearBounds::new(a.clone(), bias.clone(), a.clone(), bias.clone())?;
+        let crown = layer.propagate_linear_with_bounds(&seeded, &pre)?;
+
+        let weight = 1.0f32 / (d * h * w) as f32;
+        assert_ne!(
+            weight.to_bits(),
+            (1.0f32 / (h * w) as f32).to_bits(),
+            "trap degenerate (seed {seed}): D >= 2 must separate the scales"
+        );
+        let volume = d * h * w;
+        for i in 0..rows {
+            for x in 0..n {
+                let ch = x / volume;
+                // Dense reference: (A·J)[i, x] = A[i, ch] · weight — a single
+                // f32 product, reproduced bit-identically by the scatter.
+                let want = a[[i, ch]] * weight;
+                assert_eq!(
+                    crown.lower_a[[i, x]].to_bits(),
+                    want.to_bits(),
+                    "lower_a[{i},{x}] (seed {seed}): got {}, want {want}",
+                    crown.lower_a[[i, x]]
+                );
+                assert_eq!(
+                    crown.upper_a[[i, x]].to_bits(),
+                    want.to_bits(),
+                    "upper_a[{i},{x}] (seed {seed}): got {}, want {want}",
+                    crown.upper_a[[i, x]]
+                );
+            }
+            assert_eq!(crown.lower_b[i], bias[i], "bias must pass through");
+            assert_eq!(crown.upper_b[i], bias[i], "bias must pass through");
+        }
+
+        // Enclosure at sampled concrete points: for x ∈ {lower, upper, mid},
+        // A·pool(x) + b must sit inside the concretized relaxation, with the
+        // certified per-coefficient error charged against max(|l|, |u|).
+        let lo_flat: Vec<f32> = lower.iter().cloned().collect();
+        let hi_flat: Vec<f32> = upper.iter().cloned().collect();
+        let samples: Vec<Vec<f64>> = vec![
+            lo_flat.iter().map(|&v| v as f64).collect(),
+            hi_flat.iter().map(|&v| v as f64).collect(),
+            lo_flat
+                .iter()
+                .zip(&hi_flat)
+                .map(|(&l, &u)| f64::midpoint(l as f64, u as f64))
+                .collect(),
+        ];
+        let err_l = crown.lower_a_err().expect("scatter publishes an err term");
+        let err_u = crown.upper_a_err().expect("scatter publishes an err term");
+        for x_pt in &samples {
+            for i in 0..rows {
+                // True objective in f64.
+                let mut obj = bias[i] as f64;
+                for ch in 0..c {
+                    let mut sum = 0.0f64;
+                    for j in 0..volume {
+                        sum += x_pt[ch * volume + j];
+                    }
+                    obj += a[[i, ch]] as f64 * (sum / volume as f64);
+                }
+                // Concretized relaxation with the err penalty.
+                let mut clo = crown.lower_b[i] as f64;
+                let mut chi = crown.upper_b[i] as f64;
+                for x in 0..n {
+                    let la = crown.lower_a[[i, x]] as f64;
+                    let ua = crown.upper_a[[i, x]] as f64;
+                    let l = lo_flat[x] as f64;
+                    let u = hi_flat[x] as f64;
+                    let mag = l.abs().max(u.abs());
+                    clo += la.max(0.0) * l + la.min(0.0) * u - err_l[[i, x]] as f64 * mag;
+                    chi += ua.max(0.0) * u + ua.min(0.0) * l + err_u[[i, x]] as f64 * mag;
+                }
+                assert!(
+                    clo <= obj + 1e-6 && obj <= chi + 1e-6,
+                    "row {i} (seed {seed}): true {obj} outside concretized [{clo}, {chi}]"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 2-D output_size fails closed on the flag: answering (1, 1) for the
+/// trailing pair would let a geometry consumer keep the temporal axis.
+#[ntest::timeout(10000)]
+#[test]
+fn global_3d_output_size_refuses() {
+    let layer = AveragePoolLayer::new_global_3d();
+    let err = layer
+        .output_size(7, 7)
+        .expect_err("global-3d 2-D output_size must refuse");
+    assert!(
+        matches!(err, NyError::UnsupportedOp(ref msg) if msg.contains("global-3d")),
+        "expected UnsupportedOp naming global-3d, got: {err:?}"
+    );
+}
+
+/// The sound forward on the global-3d path: still an enclosure of the plain
+/// forward, residual charged at the FULL D·H·W window (charging only H·W
+/// would under-state γ — the planted-wrong-value protocol for this test
+/// plants exactly that and is captured red in the commit message).
+#[ntest::timeout(10000)]
+#[test]
+fn global_3d_sound_ibp_encloses_plain_with_full_window_gamma() -> Result<()> {
+    let layer = AveragePoolLayer::new_global_3d();
+    let (c, d, h, w) = (3usize, 4usize, 7usize, 7usize);
+    let mut rng = det_rand_stream(77);
+    let n = c * d * h * w;
+    // CANCELLATION input: alternating ±1e6 plus noise. The mean is tiny but
+    // Σ|x| is huge, so the γ·S/d residual DOMINATES the output ULP and the
+    // full-volume γ_{D·H·W+1} fold is bit-distinguishable from a wrong 2-D
+    // γ_{H·W+1} charge (with a plain random box both folds vanish below the
+    // mean's own ULP and the test cannot see the difference).
+    let lo: Vec<f32> = (0..n)
+        .map(|i| if i % 2 == 0 { 1.0e6 } else { -1.0e6 } + rng())
+        .collect();
+    let hi: Vec<f32> = lo.iter().map(|&v| v + 1.0).collect();
+    let lower = ArrayD::from_shape_vec(IxDyn(&[c, d, h, w]), lo).unwrap();
+    let upper = ArrayD::from_shape_vec(IxDyn(&[c, d, h, w]), hi).unwrap();
+    let input = BoundedTensor::new(lower, upper)?;
+
+    let plain = layer.propagate_ibp(&input)?;
+    let sound = layer.propagate_ibp_sound(&input)?;
+    assert_eq!(sound.lower().shape(), &[c, 1, 1, 1]);
+
+    // Reference residual with k = D·H·W (the true max window term count).
+    let k = d * h * w;
+    let gamma = crate::layers::linear::crown_single_gamma_n_f64(k + 1);
+    let gamma_k = crate::layers::linear::crown_single_gamma_n_f64(k);
+    let s_inflate = 1.0 / (1.0 - gamma_k);
+
+    // |x| box through the same forward (mirrors the implementation's S term).
+    let mut xmax = input.lower().mapv(f32::abs);
+    ndarray::Zip::from(&mut xmax)
+        .and(input.upper())
+        .for_each(|m, &u| *m = m.max(u.abs()));
+    let s_bt = layer.propagate_ibp(&BoundedTensor::concrete(xmax)?)?;
+
+    for ci in 0..c {
+        let pl = plain.lower()[[ci, 0, 0, 0]];
+        let pu = plain.upper()[[ci, 0, 0, 0]];
+        let sl = sound.lower()[[ci, 0, 0, 0]];
+        let su = sound.upper()[[ci, 0, 0, 0]];
+        // Enclosure of the plain forward.
+        assert!(
+            sl <= pl && su >= pu,
+            "channel {ci}: sound must enclose plain"
+        );
+        // Exact reproduction of the documented fold: k MUST be the full
+        // D·H·W volume. A 2-D H·W charge yields a strictly smaller err on
+        // this input and fails the bit-equality below.
+        let s_safe = s_bt.upper()[[ci, 0, 0, 0]] as f64 * s_inflate;
+        let err = ny_tensor::next_up_f32((gamma * s_safe) as f32);
+        let want_l = ny_tensor::next_down_f32(pl - err);
+        let want_u = ny_tensor::next_up_f32(pu + err);
+        // Trap self-check: the WRONG 2-D charge must produce a DIFFERENT
+        // fold on this input, or the bit-equality below proves nothing.
+        let gamma_2d = crate::layers::linear::crown_single_gamma_n_f64(h * w + 1);
+        let err_2d = ny_tensor::next_up_f32((gamma_2d * s_safe) as f32);
+        let want_l_2d = ny_tensor::next_down_f32(pl - err_2d);
+        assert_ne!(
+            want_l.to_bits(),
+            want_l_2d.to_bits(),
+            "channel {ci}: trap degenerate — full-volume and 2-D folds coincide"
+        );
+        assert_eq!(
+            sl.to_bits(),
+            want_l.to_bits(),
+            "channel {ci}: sound lower must fold the FULL-volume gamma residual"
+        );
+        assert_eq!(
+            su.to_bits(),
+            want_u.to_bits(),
+            "channel {ci}: sound upper must fold the FULL-volume gamma residual"
+        );
+    }
+    Ok(())
+}
+
+/// Default path must not move: `new` never sets the flag, and a flag-off
+/// global layer keeps today's rank-3 and batched rank-4 semantics (fixed
+/// values pinned so any drift in the untouched branch is caught).
+#[ntest::timeout(10000)]
+#[test]
+fn default_constructor_keeps_global_3d_off_and_rank3_semantics() -> Result<()> {
+    let layer = AveragePoolLayer::new((0, 0), (1, 1), (0, 0), false);
+    assert!(!layer.global_3d, "new() must never set global_3d");
+
+    // Rank-3 (C, H, W) global pool: unchanged 2-D semantics.
+    let vals = ArrayD::from_shape_fn(IxDyn(&[2, 2, 2]), |idx| {
+        (idx[0] * 4 + idx[1] * 2 + idx[2]) as f32
+    });
+    let out = layer.propagate_ibp(&BoundedTensor::new(vals.clone(), vals)?)?;
+    assert_eq!(out.lower().shape(), &[2, 1, 1]);
+    assert_eq!(out.lower()[[0, 0, 0]], ny_tensor::next_down_f32(1.5));
+    assert_eq!(out.lower()[[1, 0, 0]], ny_tensor::next_down_f32(5.5));
+
+    // Batched rank-4 (B, C, H, W) global pool: the batched-2D reading is the
+    // DOCUMENTED default semantics for rank 4 without the flag, and it must
+    // keep producing (B, C, 1, 1) — the flag exists precisely because this
+    // reading is ambiguous with (C, D, H, W) and must not be re-interpreted.
+    let vals4 = ArrayD::from_shape_fn(IxDyn(&[2, 3, 2, 2]), |idx| {
+        (idx[0] * 12 + idx[1] * 4 + idx[2] * 2 + idx[3]) as f32
+    });
+    let out4 = layer.propagate_ibp(&BoundedTensor::new(vals4.clone(), vals4)?)?;
+    assert_eq!(out4.lower().shape(), &[2, 3, 1, 1]);
+    assert_eq!(out4.lower()[[0, 0, 0, 0]], ny_tensor::next_down_f32(1.5));
+    assert_eq!(out4.lower()[[1, 2, 0, 0]], ny_tensor::next_down_f32(21.5));
     Ok(())
 }

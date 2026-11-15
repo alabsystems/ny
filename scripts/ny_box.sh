@@ -57,6 +57,19 @@ WAIT_QUIET="${NY_BOX_WAIT_QUIET:-900}"
 # Keeping it small is what stops a never-quiescent host from starving builds.
 QUIET_GRACE="${NY_BOX_QUIET_GRACE:-120}"
 LOAD_MAX="${NY_BOX_LOAD_MAX:-3}"
+# How "busy" is judged once no builder and no ny process is live. `cpu` (the
+# default on Linux) measures busy CPU-cores DIRECTLY over a short window from
+# /proc/stat deltas (user+nice+system+irq+softirq+steal+iowait, i.e. iowait counts
+# as busy); `loadavg` is the historical 1-minute average. The 1-minute average is
+# a LAGGING proxy: after any 20-thread ny row it stays above LOAD_MAX for 2-4
+# minutes while the CPU is ~98% idle. Measured 2026-09-28: W6B's 2-12 s rows
+# started 5 minutes apart with the box idle, so ~95% of its queue time was
+# waiting for a number to decay. The process checks above are the real guard
+# against contention; the busy-core window measures the same quantity loadavg
+# approximates, without the lag. Hosts without /proc/stat fall back to loadavg.
+QUIET_PROBE="${NY_BOX_QUIET_PROBE:-cpu}"
+QUIET_WINDOW="${NY_BOX_QUIET_WINDOW:-5}"
+PROC_STAT="${NY_BOX_PROC_STAT:-/proc/stat}"   # test hook: a file (or FIFO) standing in for /proc/stat
 
 log() { printf '[ny-box] %s\n' "$*" >&2; }
 
@@ -85,6 +98,27 @@ load1() {
   fi
 }
 load1_int() { load1 | cut -d. -f1; }
+
+# Busy CPU-cores x100 over QUIET_WINDOW seconds, from two /proc/stat samples.
+# Prints nothing (caller falls back to loadavg) when the aggregate line cannot be
+# read twice. iowait and steal count as busy: a box stalled on I/O is not quiet.
+cpu_stat_sample() { # -> "busy total" jiffies from the aggregate 'cpu ' line
+  awk '$1=="cpu" {b=$2+$3+$4+$6+$7+$8+$9; t=b+$5; print b, t; exit}' "$PROC_STAT" 2>/dev/null
+}
+busy_cores_x100() {
+  local a b n
+  a=$(cpu_stat_sample) || return 0
+  [ -n "$a" ] || return 0
+  sleep "$QUIET_WINDOW"
+  b=$(cpu_stat_sample) || return 0
+  [ -n "$b" ] || return 0
+  n=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)
+  awk -v a="$a" -v b="$b" -v n="$n" 'BEGIN {
+    split(a, x, " "); split(b, y, " ");
+    dt = y[2] - x[2]; db = y[1] - x[1];
+    if (dt <= 0) exit;
+    printf "%d\n", (db / dt) * n * 100 }'
+}
 
 timestamp() {
   date -Iseconds 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ'
@@ -132,18 +166,47 @@ ny_procs() { pgrep '^ny' 2>/dev/null | wc -l; }
 # stays locked and idle for 15 minutes and nothing is measured. That livelock
 # was observed 2026-08-24. The waiting agent cannot fix it without knowing WHICH
 # process to chase, so print pid + command line and let it escalate.
+# BUILDER PROCESS NAMES. `rust-toolchain.toml` pins `channel = "trust"`, and every
+# build in this repo is `rustup run trust targo --unverified ...`, which spawns
+# `targo` and `trustc` -- NEVER `cargo`, NEVER `rustc`. Checking only the latter
+# two made this gate blind to every build the campaign actually runs: measured
+# 2026-09-15 at loadavg 17.58 with 20 `trustc` live, `pgrep -x cargo` and
+# `pgrep -x rustc` BOTH returned 0. The only remaining guard was the 1-minute
+# LOAD_MAX average, which lags, so a `measure` could be admitted onto a box that
+# was about to be saturated -- and wall-clock IS the verdict on wall-limited
+# benchmarks (84% of banked tinyimagenet proofs finish in the last 10% of budget).
+# The verified-lane driver (`targo-trust`) and tippy's driver (`tippy-driver`)
+# are Trust build processes too; cargo/rustc stay for any other toolchain.
+# `-x` is an EXACT name match, so each name must be listed; never `-f` (the
+# self-match trap that cost three sessions, exit 144).
+BUILD_PROCS="targo targo-trust trustc tippy-driver cargo rustc"
+builder_pids() { local p; for p in $BUILD_PROCS; do pgrep -x "$p" 2>/dev/null; done; }
+builder_name() {
+  local p
+  for p in $BUILD_PROCS; do
+    pgrep -x "$p" >/dev/null 2>&1 && { echo "$p"; return; }
+  done
+}
+
 offenders() {
-  local pids; pids=$(pgrep -x cargo; pgrep -x rustc; pgrep '^ny')
+  local pids; pids=$(builder_pids; pgrep '^ny')
   [ -z "$pids" ] && return
   # shellcheck disable=SC2086
   ps -o pid=,ppid=,etime=,args= -p $pids 2>/dev/null | cut -c1-150 | sed 's/^/      /'
 }
 
 busy_reason() {
-  pgrep -x cargo >/dev/null 2>&1 && { echo "cargo running"; return; }
-  pgrep -x rustc >/dev/null 2>&1 && { echo "rustc running"; return; }
+  local b; b=$(builder_name)
+  [ -n "$b" ] && { echo "$b running"; return; }
   local n; n=$(ny_procs)
   [ "$n" -gt 0 ] && { echo "$n ny process(es) already live (incl. pinned copies)"; return; }
+  if [ "$QUIET_PROBE" = cpu ]; then
+    local c; c=$(busy_cores_x100)
+    if [ -n "$c" ]; then
+      [ "$c" -ge $(( LOAD_MAX * 100 )) ] && { echo "cpu busy $(( c / 100 )).$(printf '%02d' $(( c % 100 ))) cores >= $LOAD_MAX over ${QUIET_WINDOW}s (loadavg $(load1))"; return; }
+      echo ""; return
+    fi
+  fi
   local l; l=$(load1_int)
   [ "$l" -ge "$LOAD_MAX" ] && { echo "loadavg $(load1) >= $LOAD_MAX"; return; }
   echo ""
@@ -156,8 +219,9 @@ cmd_status() {
   # we do get it: reporting status must never be able to take the box.
   if lock_is_free; then echo "state: FREE"; else echo "state: BUSY"; fi
   echo "load:  $(load_snapshot)"
+  if [ "$QUIET_PROBE" = cpu ]; then echo "cpu:   $(busy_cores_x100 | awk '{printf "%.2f busy cores", $1/100}') over ${QUIET_WINDOW}s (probe=cpu, LOAD_MAX=$LOAD_MAX)"; fi
   echo "ny:    $(ny_procs) process(es) (matches pinned copies: ny, ny_pin, ...)"
-  echo "build: cargo=$(pgrep -x cargo 2>/dev/null | wc -l) rustc=$(pgrep -x rustc 2>/dev/null | wc -l)"
+  echo "build: $(builder_pids | wc -l) build process(es) ($BUILD_PROCS)"
 }
 
 original_args=("$@")

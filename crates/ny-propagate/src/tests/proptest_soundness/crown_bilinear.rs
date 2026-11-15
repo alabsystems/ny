@@ -16,8 +16,6 @@
 //! This covers `propagate_linear_binary` (fixed McCormick midpoint) and
 //! `propagate_linear_binary_with_alpha` (optimizable interpolation parameters).
 //!
-//! Part of #3104: Binary ops CROWN proptest coverage.
-//!
 //! Reference: McCormick (1976), "Computability of global solutions to factorable
 //! nonconvex programs". Implementation in bilinear.rs:interpolated_mccormick.
 
@@ -555,14 +553,13 @@ proptest! {
 //
 // Tests `propagate_linear_batched_binary_with_alpha` which uses the broadcast
 // McCormick architecture: BilinearRelaxation + compose_backward_broadcast_bidirectional.
-// This is the production path for attention verification (#286).
+// This is the production path for attention verification.
 //
 // The flat path proptests above test `propagate_linear_binary_with_alpha` (LinearBounds).
 // This section covers the batched path (BatchedLinearBounds) which was identified
 // as having ZERO direct proptests (P1 Prover finding, commit 521c153).
 //
 // Reference: auto_LiRPA operators/bivariate.py (element-wise McCormick coefficients)
-// Design: designs/2026-03-04-286-attention-bilinear-alternative.md Approach A+B
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(200) })]

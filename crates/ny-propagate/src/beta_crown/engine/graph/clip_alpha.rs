@@ -186,7 +186,7 @@ fn compose_linear_forward(
     // this output, regardless of how wide its bound is), so a saturating dot
     // that defines `0·∞ = 0` yields finite-where-possible / ±∞-where-genuine
     // bias values without the spurious NaN. This is sound: each output term is
-    // either a real finite/±∞ contribution or a genuine 0, never a NaN. (#3438)
+    // either a real finite/±∞ contribution or a genuine 0, never a NaN.
     let mut lower_b = saturating_matvec(&w_pos, pred.lower_b(), &w_neg, pred.upper_b());
     let mut upper_b = saturating_matvec(&w_pos, pred.upper_b(), &w_neg, pred.lower_b());
 
@@ -309,7 +309,7 @@ fn compose_relu_forward(
                 // upstream bias is ±∞ (an unsupported residual-Add predecessor
                 // got conservative bounds), IEEE `0·(±∞) = NaN` would poison the
                 // bias and trip the firewall for the whole node. α==0 means the
-                // lower bound is identically 0, so set it directly (#3438).
+                // lower bound is identically 0, so set it directly.
                 if alpha == 0.0 {
                     lower_b[i] = 0.0;
                 } else {
@@ -321,7 +321,7 @@ fn compose_relu_forward(
 
     // Migrated from from_parts_unchecked: ReLU forward composition can
     // propagate NaN/Inf from upstream compose_linear_forward accumulation.
-    // NaN firewall falls back to conservative bounds. See #3438.
+    // NaN firewall falls back to conservative bounds.
     LinearBounds::new_or_conservative(lower_a, lower_b, upper_a, upper_b)
 }
 
@@ -664,7 +664,7 @@ mod tests {
     //! Linear/ReLU; residual `Add` skip-connections fall through to conservative
     //! `±∞` biases, and a naive `w.dot(±∞)` evaluates `0·∞ = NaN` for every zero
     //! weight, poisoning the whole bias row and tripping the downstream firewall
-    //! (which then degrades the WHOLE node to `[-∞,+∞]`). The fix (#3438) is a
+    //! (which then degrades the WHOLE node to `[-∞,+∞]`). The fix is a
     //! `saturating_matvec` defining `0·∞ = 0` plus an `α==0` special-case in the
     //! ReLU lower relaxation. These tests pin the exact regression.
 

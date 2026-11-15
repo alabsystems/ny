@@ -132,7 +132,7 @@ fn f32_any_with_specials() -> impl Strategy<Value = f32> {
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(256) })]
 
-    /// #1836 acceptance: exercise Mish eval on ANY f32 plus explicit IEEE corner values.
+    /// Acceptance: exercise Mish eval on ANY f32 plus explicit IEEE corner values.
     #[test]
     fn proptest_mish_eval_handles_special_values(x in f32_any_with_specials()) {
         let y = mish_eval(x);
@@ -147,7 +147,7 @@ proptest! {
         }
     }
 
-    /// #1836 acceptance: finite-width IBP intervals must not produce NaN bounds.
+    /// Acceptance: finite-width IBP intervals must not produce NaN bounds.
     #[test]
     fn proptest_mish_ibp_no_nan_for_finite_intervals(a in prop::num::f32::ANY, b in prop::num::f32::ANY) {
         prop_assume!(a.is_finite() && b.is_finite());
@@ -164,7 +164,7 @@ proptest! {
     }
 }
 
-/// Regression test for #1836: mish_eval(-inf) must return 0, not NaN.
+/// Regression test: mish_eval(-inf) must return 0, not NaN.
 /// Mish(x) = x * tanh(softplus(x)); at x = -inf: (-inf)*tanh(0) = (-inf)*0 = NaN
 /// without the guard. Correct limit: Mish(-inf) = 0.
 #[test]
@@ -173,7 +173,7 @@ fn test_mish_eval_neg_infinity_returns_zero() {
     assert_eq!(result, 0.0, "mish_eval(-inf) should be 0.0, got {result}");
 }
 
-/// Regression test for #1836: mish_eval(+inf) must return +inf.
+/// Regression test: mish_eval(+inf) must return +inf.
 #[test]
 fn test_mish_eval_pos_infinity_returns_pos_infinity() {
     let result = mish_eval(f32::INFINITY);
@@ -184,7 +184,7 @@ fn test_mish_eval_pos_infinity_returns_pos_infinity() {
     );
 }
 
-/// Regression test for #1836: mish_eval(NaN) must return NaN.
+/// Regression test: mish_eval(NaN) must return NaN.
 #[test]
 fn test_mish_eval_nan_returns_nan() {
     let result = mish_eval(f32::NAN);
@@ -472,7 +472,7 @@ fn test_crown_backward_non_identity_bounds() -> Result<()> {
     Ok(())
 }
 
-// ── f64 chord precision proptest (#2624) ─────────────────────────────
+// ── f64 chord precision proptest ─────────────────────────────
 
 /// Reference Mish in f64, independent of the crate implementation.
 fn mish_f64_reference(x: f64) -> f64 {
@@ -605,7 +605,7 @@ fn ulp_distance(a: f32, b: f32) -> u64 {
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(1000) })]
 
-    /// #2624, #3146: Verify mish_chord_f64 produces f64-quality results with directed rounding.
+    /// Verify mish_chord_f64 produces f64-quality results with directed rounding.
     /// For intervals with width in [1e-8, 1e-4], the chord slope must match
     /// a pure f64 reference within 1 ULP, and directed rounding bounds must
     /// bracket the reference intercept: lower_intercept <= ref <= upper_intercept.
@@ -646,7 +646,7 @@ proptest! {
     }
 }
 
-/// Regression test for #1836: IBP with infinite input bounds must not produce NaN
+/// Regression test: IBP with infinite input bounds must not produce NaN
 /// in the computed values. The IBP output constructor (BoundedTensor::new) rejects
 /// infinite bounds, so we verify the error is NumericalInstability (not NaN corruption).
 /// The eval function fix ensures the intermediate values are correct (0, +inf) not NaN.
@@ -682,7 +682,7 @@ fn test_mish_ibp_infinite_bounds_no_nan() {
     }
 }
 
-// ── NaN propagation regression tests (#2714) ──────────────────────────
+// ── NaN propagation regression tests ──────────────────────────
 
 #[test]
 fn test_relaxation_nan_lower_returns_nan_fallback_2714() {
@@ -838,12 +838,12 @@ fn mish_crossing_tighter_than_band() {
     );
 }
 
-// ── CROWN relaxation soundness proptest (#3285) ─────────────────────────
+// ── CROWN relaxation soundness proptest ─────────────────────────
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(1000) })]
 
-    /// #3285: Verify mish_linear_relaxation produces strictly sound bounds.
+    /// Verify mish_linear_relaxation produces strictly sound bounds.
     /// For random intervals, the lower bound must satisfy
     ///   lower_slope * x + lower_intercept <= Mish(x)  for all x in [l, u]
     /// and the upper bound must satisfy

@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Regression test for #2489: verify that 2D softmax CROWN cross-group bias
+//! Regression test: verify that 2D softmax CROWN cross-group bias
 //! accumulation uses f64 intermediates with directed rounding.
 
 use ndarray::{Array1, Array2};

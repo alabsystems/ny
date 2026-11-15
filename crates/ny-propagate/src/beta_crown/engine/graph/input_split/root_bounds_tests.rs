@@ -908,3 +908,306 @@ fn unsupported_forward_image_configuration_falls_back_without_aborting() {
     assert!(bounds.is_none());
     assert!(alpha.is_none());
 }
+
+// ---------------------------------------------------------------------------
+// #crown-root-map: the `crown` arm publishing the complete cGAN cascade map
+// ---------------------------------------------------------------------------
+
+/// The shipped cgan_2023 shape on the `crown` arm: no alpha and no
+/// forward-linear authority, the complete cascade armed, and BOTH publication
+/// guards up — with the consumer key left at its dark default.
+fn crown_arm_typed_cgan_config() -> BetaCrownConfig {
+    let mut config = BetaCrownConfig {
+        use_alpha_crown: false,
+        use_forward_bounds: false,
+        input_split_ibp_enhancement: true,
+        input_split_stacked_rebound: true,
+        ..BetaCrownConfig::default()
+    };
+    config.alpha_config.fix_interm_bounds = true;
+    config.alpha_config.cgan_complete_crown_ibp_root = true;
+    config
+}
+
+fn assert_bounds_map_bits_eq(
+    left: &HashMap<String, BoundedTensor>,
+    right: &HashMap<String, BoundedTensor>,
+    label: &str,
+) {
+    let mut left_names: Vec<&String> = left.keys().collect();
+    left_names.sort();
+    let mut right_names: Vec<&String> = right.keys().collect();
+    right_names.sort();
+    assert_eq!(left_names, right_names, "{label}: node set");
+    for (name, left_bounds) in left {
+        let right_bounds = &right[name];
+        assert_eq!(
+            left_bounds
+                .lower()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            right_bounds
+                .lower()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            "{label}: {name} lower bits"
+        );
+        assert_eq!(
+            left_bounds
+                .upper()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            right_bounds
+                .upper()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            "{label}: {name} upper bits"
+        );
+    }
+}
+
+/// Byte-identical default: with the key unset the `crown` arm returns the
+/// historical `(None, None)` AND never enters the cascade, so an unarmed
+/// scored run pays nothing for the mechanism existing.
+#[ntest::timeout(10000)]
+#[test]
+fn crown_arm_without_crown_root_map_key_publishes_nothing_and_pays_nothing() {
+    use crate::network::CganCompleteCollectionEntryCounter;
+
+    // The typed cascade's routing reads NY_* runtime options. The harness
+    // environment carries none; holding the env lock keeps any concurrent
+    // editor from changing that mid-test.
+    let _env_lock = lock_env();
+    let (graph, input) = typed_cgan_restart_graph();
+    let config = crown_arm_typed_cgan_config();
+    assert!(
+        !config.alpha_config.cgan_crown_root_map,
+        "the consumer key must default dark"
+    );
+    let exec_order = graph.exec_order().expect("exec order");
+    assert!(
+        graph.cgan_complete_crown_ibp_root_eligible(&config.alpha_config, exec_order),
+        "fixture must be typed-eligible so the refusal is the key's, not the graph's"
+    );
+
+    let entries = CganCompleteCollectionEntryCounter::start();
+    let (bounds, alpha) = collect_input_split_root_node_bounds(
+        &graph,
+        &input,
+        &config,
+        None,
+        None,
+        None,
+        "crown arm dark",
+        None,
+    )
+    .expect("the crown arm never fails the run");
+    assert!(bounds.is_none(), "dark default must publish no root map");
+    assert!(alpha.is_none());
+    assert_eq!(
+        entries.entries(),
+        0,
+        "dark default must not enter the complete cascade"
+    );
+}
+
+/// Armed under both guards, the `crown` arm publishes exactly the map the
+/// alpha arm's lifted Step 1 produces (same collector, same L2 contract), bit
+/// for bit, with no alpha state, in one cascade transaction — and that map is
+/// shrink-only against plain IBP, which is what makes publishing it a
+/// tightening under the two guards.
+#[ntest::timeout(10000)]
+#[test]
+fn crown_arm_publishes_the_alpha_arms_step1_map_under_both_guards() {
+    use crate::network::CganCompleteCollectionEntryCounter;
+
+    // The typed cascade's routing reads NY_* runtime options. The harness
+    // environment carries none; holding the env lock keeps any concurrent
+    // editor from changing that mid-test.
+    let _env_lock = lock_env();
+    let (graph, input) = typed_cgan_restart_graph();
+    let mut config = crown_arm_typed_cgan_config();
+    config.alpha_config.cgan_crown_root_map = true;
+
+    let entries = CganCompleteCollectionEntryCounter::start();
+    let (bounds, alpha) = collect_input_split_root_node_bounds(
+        &graph,
+        &input,
+        &config,
+        None,
+        None,
+        None,
+        "crown arm armed",
+        None,
+    )
+    .expect("the crown arm never fails the run");
+    let bounds = bounds.expect("armed crown arm publishes the cascade map");
+    assert!(alpha.is_none(), "the crown arm carries no alpha authority");
+    assert!(!bounds.is_empty());
+    assert_eq!(
+        entries.entries(),
+        1,
+        "exactly one complete-cascade transaction"
+    );
+
+    let exec_order = graph.exec_order().expect("exec order");
+    let (expected, source) = {
+        let _l2_lever_off = crate::l2_lever_gate::L2LeverGuard::disabled();
+        graph
+            .collect_alpha_reference_bounds_with_engine_and_source(
+                &input,
+                &config.alpha_config,
+                None,
+                exec_order,
+            )
+            .expect("reference collection")
+    };
+    assert!(
+        source.is_cgan_complete_crown_ibp(),
+        "fixture must route through the typed cascade: {source:?}"
+    );
+    assert_eq!(entries.entries(), 2);
+    assert_bounds_map_bits_eq(&bounds, &expected, "crown arm vs alpha Step 1");
+
+    let ibp = graph
+        .collect_node_bounds_with_engine(&input, None)
+        .expect("reference IBP collection");
+    for (name, published) in &bounds {
+        let Some(reference) = ibp.get(name) else {
+            continue;
+        };
+        for ((&l, &u), (&ibp_l, &ibp_u)) in published
+            .lower()
+            .iter()
+            .zip(published.upper().iter())
+            .zip(reference.lower().iter().zip(reference.upper().iter()))
+        {
+            assert!(l >= ibp_l, "{name}: published lower widened past IBP");
+            assert!(u <= ibp_u, "{name}: published upper widened past IBP");
+        }
+    }
+}
+
+/// The two publication guards are NOT implied by each other (see
+/// `#root-map-two-guards`): with either down the armed key must refuse, and
+/// must refuse BEFORE paying the cascade.
+#[ntest::timeout(10000)]
+#[test]
+fn crown_arm_refuses_when_either_publication_guard_is_down() {
+    use crate::network::CganCompleteCollectionEntryCounter;
+
+    // The typed cascade's routing reads NY_* runtime options. The harness
+    // environment carries none; holding the env lock keeps any concurrent
+    // editor from changing that mid-test.
+    let _env_lock = lock_env();
+    let (graph, input) = typed_cgan_restart_graph();
+    for (label, ibp_enhancement, stacked_rebound) in [
+        ("stacked_rebound down", true, false),
+        ("ibp_enhancement down", false, true),
+        ("both guards down", false, false),
+    ] {
+        let mut config = crown_arm_typed_cgan_config();
+        config.alpha_config.cgan_crown_root_map = true;
+        config.input_split_ibp_enhancement = ibp_enhancement;
+        config.input_split_stacked_rebound = stacked_rebound;
+
+        let entries = CganCompleteCollectionEntryCounter::start();
+        let (bounds, alpha) = collect_input_split_root_node_bounds(
+            &graph, &input, &config, None, None, None, label, None,
+        )
+        .expect("a guard refusal never fails the run");
+        assert!(
+            bounds.is_none(),
+            "{label}: a guard refusal must publish nothing"
+        );
+        assert!(alpha.is_none(), "{label}");
+        assert_eq!(
+            entries.entries(),
+            0,
+            "{label}: a guard refusal must not pay the cascade"
+        );
+    }
+}
+
+/// A grouped restart reuses the crown arm's published map exactly — one
+/// cascade transaction, bit-identical maps. A no-alpha root is
+/// restart-deterministic, so the WHOLE-RESULT tier is the one consulted (it is
+/// keyed before the typed tier); the typed tier is still keyed for the armed
+/// crown arm, and for nothing the arm would refuse.
+#[ntest::timeout(10000)]
+#[test]
+fn crown_arm_second_restart_reuses_the_cascade_transaction() {
+    use crate::network::CganCompleteCollectionEntryCounter;
+
+    // The typed cascade's routing reads NY_* runtime options. The harness
+    // environment carries none; holding the env lock keeps any concurrent
+    // editor from changing that mid-test.
+    let _env_lock = lock_env();
+    let (graph, input) = typed_cgan_restart_graph();
+    let mut config = crown_arm_typed_cgan_config();
+    config.alpha_config.cgan_crown_root_map = true;
+
+    let cache = InputSplitRootBoundsCache::new(
+        disjunctive_spec_identity(&[vec![1.0; 9]], &[0.0], &[1]),
+        None,
+    );
+    assert!(
+        root_bounds_cache_key(&cache, &graph, &input, &config, None).is_some(),
+        "a no-alpha root is restart-deterministic, so the whole-result tier applies"
+    );
+    assert!(
+        typed_reference_map_cache_key(&cache, &graph, &input, &config, None).is_some(),
+        "the armed crown arm also keys the deterministic typed-map tier"
+    );
+    let mut dark = config.clone();
+    dark.alpha_config.cgan_crown_root_map = false;
+    assert!(
+        typed_reference_map_cache_key(&cache, &graph, &input, &dark, None).is_none(),
+        "the dark crown arm has nothing to cache"
+    );
+    let mut guard_down = config.clone();
+    guard_down.input_split_stacked_rebound = false;
+    assert!(
+        typed_reference_map_cache_key(&cache, &graph, &input, &guard_down, None).is_none(),
+        "a guard refusal publishes nothing, so nothing of it may be cached"
+    );
+
+    let entries = CganCompleteCollectionEntryCounter::start();
+    let first = collect_input_split_root_node_bounds(
+        &graph,
+        &input,
+        &config,
+        None,
+        None,
+        None,
+        "crown restart #1",
+        Some((&cache, None)),
+    )
+    .expect("first crown restart");
+    let second = collect_input_split_root_node_bounds(
+        &graph,
+        &input,
+        &config,
+        None,
+        None,
+        None,
+        "crown restart #2",
+        Some((&cache, None)),
+    )
+    .expect("second crown restart");
+
+    assert_eq!(
+        entries.entries(),
+        1,
+        "both restarts must share one complete cascade transaction"
+    );
+    assert_eq!(cache.collections(), 1, "restart #2 must skip collection");
+    assert_eq!(cache.hits(), 1, "restart #2 must hit the whole-result tier");
+    assert!(first.0.is_some(), "the armed crown arm publishes the map");
+    assert!(first.1.is_none(), "the crown arm carries no alpha state");
+    assert_root_value_bits_eq(&first, &second);
+}

@@ -1187,4 +1187,146 @@ mod tests {
         });
         assert_eq!(successes.load(Ordering::SeqCst), 2);
     }
+    struct LowerResultBackend {
+        value: f32,
+        calls: AtomicUsize,
+        fail: bool,
+    }
+    impl GpuCrownBackward for LowerResultBackend {
+        fn crown_backward_gpu(
+            &self,
+            _: &[GpuCrownLayer],
+            _: &[f32],
+            _: usize,
+            _: &[f32],
+            _: &[f32],
+        ) -> Result<GpuCrownResult> {
+            panic!("the lower-result context must not call an ordinary or shadow backend")
+        }
+        fn provides_bounded_lower_cut(&self) -> bool {
+            true
+        }
+        fn crown_backward_gpu_resnet_lower_cut_with_deadline(
+            &self,
+            _: &[GpuResnetSegment],
+            _: &GpuCrownSeed,
+            _: &[f32],
+            _: &[f32],
+            _: &ny_core::ResidentLowerCutCarrier,
+            _: Instant,
+        ) -> Result<f32> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                Err(NyError::DeadlineExceeded("typed refusal".into()))
+            } else {
+                Ok(self.value)
+            }
+        }
+    }
+    fn lower_backend(value: f32, fail: bool) -> LowerResultBackend {
+        LowerResultBackend {
+            value,
+            fail,
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    #[test]
+    fn certified_lower_result_same_call_max_preserves_upper_and_worse_baseline_bits() {
+        // This tests semantic transport with a genuine constructor/support;
+        // the CUDA module separately tests the numeric strict-diamond oracle.
+        for value in [-2., -4.] {
+            let fixture = DiamondFixture::new();
+            let context = fixture.context(Instant::now() + Duration::from_secs(30));
+            let carrier = context
+                .build_bound_carrier(&[fixture.certificate()], &[vec![1.]])
+                .unwrap()
+                .unwrap();
+            let backend = lower_backend(value, false);
+            let original = GpuCrownResult {
+                lower_bounds: vec![-3.],
+                upper_bounds: vec![-0.0],
+            };
+            let result = context.run_backend_lower(&carrier, &backend).unwrap();
+            assert!(context.validate_bound_carrier(&carrier).is_err());
+            let merged = context.merge_backend_lower(result, &original).unwrap();
+            assert_eq!(merged.lower_bounds[0].to_bits(), value.max(-3.).to_bits());
+            assert_eq!(
+                merged.upper_bounds[0].to_bits(),
+                original.upper_bounds[0].to_bits()
+            );
+            assert_eq!(original.lower_bounds[0], -3.);
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn certified_lower_result_rejects_foreign_stale_and_failed_attempts() {
+        let fixture = DiamondFixture::new();
+        let end = Instant::now() + Duration::from_secs(30);
+        let first = fixture.context(end);
+        let second = fixture.context(end);
+        let carrier = first
+            .build_bound_carrier(&[fixture.certificate()], &[vec![1.]])
+            .unwrap()
+            .unwrap();
+        let result = first
+            .run_backend_lower(&carrier, &lower_backend(-2., false))
+            .unwrap();
+        let baseline = GpuCrownResult {
+            lower_bounds: vec![-3.],
+            upper_bounds: vec![0.],
+        };
+        assert!(second.merge_backend_lower(result, &baseline).is_err());
+        let carrier = second
+            .build_bound_carrier(&[fixture.certificate()], &[vec![1.]])
+            .unwrap()
+            .unwrap();
+        let failed = lower_backend(-2., true);
+        assert!(second.run_backend_lower(&carrier, &failed).is_err());
+        assert!(second.run_backend_lower(&carrier, &failed).is_err());
+        assert_eq!(failed.calls.load(Ordering::SeqCst), 1);
+        let third = fixture.context(end);
+        let carrier = third
+            .build_bound_carrier(&[fixture.certificate()], &[vec![1.]])
+            .unwrap()
+            .unwrap();
+        let result = third
+            .run_backend_lower(&carrier, &lower_backend(-2., false))
+            .unwrap();
+        third.set_generations_for_test(ResidentCutSnapshotGenerations::initial());
+        assert!(third.merge_backend_lower(result, &baseline).is_err());
+    }
+
+    #[test]
+    fn certified_lower_result_refuses_nonzero_beta_and_incompatible_upper() {
+        let mut fixture = DiamondFixture::new();
+        fixture.beta_signed[0][0] = 0.25;
+        let context = fixture.context(Instant::now() + Duration::from_secs(30));
+        let carrier = context
+            .build_bound_carrier(&[fixture.certificate()], &[vec![1.]])
+            .unwrap()
+            .unwrap();
+        let backend = lower_backend(-2., false);
+        assert!(context.run_backend_lower(&carrier, &backend).is_err());
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        let fixture = DiamondFixture::new();
+        let context = fixture.context(Instant::now() + Duration::from_secs(30));
+        let carrier = context
+            .build_bound_carrier(&[fixture.certificate()], &[vec![1.]])
+            .unwrap()
+            .unwrap();
+        let result = context
+            .run_backend_lower(&carrier, &lower_backend(1., false))
+            .unwrap();
+        assert!(context
+            .merge_backend_lower(
+                result,
+                &GpuCrownResult {
+                    lower_bounds: vec![-3.],
+                    upper_bounds: vec![0.]
+                }
+            )
+            .is_err());
+    }
 }

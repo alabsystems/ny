@@ -5,7 +5,6 @@
 //! CROWN asymmetric-bound soundness tests for piecewise layers.
 //!
 //! Split from `crown_piecewise_negcoeff.rs` to keep files under 1000 lines.
-//! Part of #40, #1793.
 //!
 //! These tests exercise CROWN backward propagation with asymmetric incoming
 //! bounds (lower_a != upper_a), which stresses sign-switching logic more than

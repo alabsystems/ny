@@ -10,7 +10,7 @@ use crate::layers::{
 use crate::tests::assert_relaxation_sound_exact;
 use proptest::prelude::*;
 
-/// Independent f64 GELU (erf) reference for strict proptest. (#3292)
+/// Independent f64 GELU (erf) reference for strict proptest.
 /// GELU(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
 fn gelu_erf_f64_reference(x: f64) -> f64 {
     if !x.is_finite() {
@@ -23,7 +23,7 @@ fn gelu_erf_f64_reference(x: f64) -> f64 {
     0.5 * x * (1.0 + libm::erf(x * inv_sqrt2))
 }
 
-/// Independent f64 GELU (tanh approximation) reference for strict proptest. (#3292)
+/// Independent f64 GELU (tanh approximation) reference for strict proptest.
 /// GELU_tanh(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 fn gelu_tanh_f64_reference(x: f64) -> f64 {
     if !x.is_finite() {
@@ -63,14 +63,6 @@ fn gelu_tanh_f64_reference(x: f64) -> f64 {
 /// meaningful rather than vacuous, and they are the only cases in this file that
 /// exercise those two constants at all.
 ///
-/// The duplicate in `crates/ny-relaxation/src/gelu/eval.rs` has now had the same
-/// hunk applied, so the two crates no longer diverge on this soundness property.
-/// `ny-relaxation/tests/drift.rs` binds them: `drift_gelu_sound` compares the
-/// bands bit-for-bit, and
-/// `drift_gelu_infinite_lower_branch_is_exact_at_the_subnormal_endpoint` pins
-/// the real-arithmetic fact on the mirror side so the two cannot drift
-/// TOGETHER.
-///
 /// The witness that settled it needs no assumption about f32 `erff` at all:
 /// at `u = f32::from_bits(1) = 1.401298464324817e-45` the erff argument is
 /// subnormal, so `1.0f32 + erff(..) == 1.0f32` exactly under any
@@ -83,8 +75,7 @@ fn gelu_tanh_f64_reference(x: f64) -> f64 {
 /// `u = 5.877471754111438e-39`, `1.0 + erf(u/sqrt(2))` rounds to `1.0` in f64,
 /// so `gelu_eval_f64(u)` returns exactly `0.5 * u`, which is
 /// 1.3781331109198995e-77 BELOW the true GELU(u); the directed cast cannot
-/// recover an error already made in the witness. That residual is present in
-/// BOTH crates identically (so it is invisible to a drift test), is ~4.7e-39 in
+/// recover an error already made in the witness. That residual is ~4.7e-39 in
 /// relative terms, and is a separate finding from the one this test pins.
 #[test]
 fn gelu_saturating_branches_are_exact_in_f64() {
@@ -416,7 +407,7 @@ fn gelu_sound_relaxation_degenerate_and_nonfinite() {
     assert!((ls - us).abs() < 1e-6);
     assert!((li - ui).abs() < 1e-6);
 
-    // Infinite/NaN bounds return maximally loose (NOT identity — identity is unsound, #1837).
+    // Infinite/NaN bounds return maximally loose (NOT identity — identity is unsound).
     assert_eq!(
         gelu_sound_linear_relaxation(f32::NEG_INFINITY, f32::INFINITY),
         (0.0, f32::NEG_INFINITY, 0.0, f32::INFINITY)
@@ -434,7 +425,7 @@ fn gelu_tanh_sound_relaxation_degenerate_and_nonfinite() {
     assert!((ls - us).abs() < 1e-6);
     assert!((li - ui).abs() < 1e-6);
 
-    // Infinite/NaN bounds return maximally loose (NOT identity — #1837).
+    // Infinite/NaN bounds return maximally loose (NOT identity).
     assert_eq!(
         gelu_tanh_sound_linear_relaxation(f32::NEG_INFINITY, f32::INFINITY),
         (0.0, f32::NEG_INFINITY, 0.0, f32::INFINITY)
@@ -448,7 +439,7 @@ fn gelu_tanh_sound_relaxation_degenerate_and_nonfinite() {
 #[ntest::timeout(10000)]
 #[test]
 fn pow2_subnormal_kani_counterexample_regression_1795() {
-    // Values from issue #1795 Kani counterexample.
+    // Values from a Kani counterexample.
     let l = -3.743_392e-23f32;
     let u = -1.175_494e-38f32;
     let x = -1.871_839e-23f32;
@@ -489,9 +480,9 @@ fn pow2_subnormal_kani_counterexample_regression_1795() {
     );
 }
 
-// ── Strict zero-tolerance CROWN relaxation proptests (#3292) ─────────────
+// ── Strict zero-tolerance CROWN relaxation proptests ─────────────
 //
-// Pattern from #3285: f64-evaluated reference with zero tolerance catches
+// Pattern: f64-evaluated reference with zero tolerance catches
 // f32 cancellation bugs invisible to magnitude-scaled tolerance tests.
 // GELU (erf) reference: eval::gelu_erf_f64, GELU (tanh) reference: eval::gelu_tanh_f64.
 
@@ -500,7 +491,7 @@ proptest! {
 
     /// Strict soundness proptest for GELU (erf) CROWN relaxation.
     /// Uses f64 reference (gelu_erf_f64) with zero tolerance on 200-point grid.
-    /// Ref: alpha-beta-CROWN auto_LiRPA GELU relaxation, #3292.
+    /// Ref: alpha-beta-CROWN auto_LiRPA GELU relaxation.
     #[ntest::timeout(60000)]
     #[test]
     fn proptest_gelu_erf_relaxation_strict_soundness(
@@ -537,7 +528,7 @@ proptest! {
 
     /// Strict soundness proptest for GELU (tanh) CROWN relaxation.
     /// Uses f64 reference (gelu_tanh_f64) with zero tolerance on 200-point grid.
-    /// Ref: alpha-beta-CROWN auto_LiRPA GELU tanh approximation, #3292.
+    /// Ref: alpha-beta-CROWN auto_LiRPA GELU tanh approximation.
     #[ntest::timeout(60000)]
     #[test]
     fn proptest_gelu_tanh_relaxation_strict_soundness(

@@ -2,11 +2,11 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Proptest: GPU CROWN backward vs CPU reference implementation (#3397).
+//! Proptest: GPU CROWN backward vs CPU reference implementation.
 //!
 //! Verifies that `crown_backward_gpu` produces bounds matching a pure-CPU
 //! reference for small random networks. This catches GPU-specific bugs like
-//! slopes buffer aliasing (#3444) and ping buffer sizing (#3446).
+//! slopes buffer aliasing and ping buffer sizing.
 
 #[cfg(feature = "gpu-tests")]
 mod gpu_crown_backward {

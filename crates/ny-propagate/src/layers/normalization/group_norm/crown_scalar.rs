@@ -7,8 +7,6 @@
 //! `IbpValidated` routes through the grouped centered decomposed helper, while
 //! `Sampling` remains the explicit heuristic path via
 //! [`super::super::crown_common`].
-//!
-//! Reference: designs/2026-03-15-issue-3914-groupnorm-grouped-centered-crown.md
 
 use ny_core::{NyError, Result};
 use ny_tensor::BoundedTensor;
@@ -93,7 +91,7 @@ impl GroupNormLayer {
             return batched_bounds_to_scalar(&decomposed.bounds);
         }
 
-        // Sampling mode: delegate to shared sampling CROWN (no IBP validation, #3775).
+        // Sampling mode: delegate to shared sampling CROWN (no IBP validation).
         sampling_crown_scalar(self, bounds, &pre_lower, &pre_upper)
     }
 }

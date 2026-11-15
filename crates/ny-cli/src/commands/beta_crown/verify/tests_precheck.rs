@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for spec-guided CROWN precheck (#3384).
+//! Tests for spec-guided CROWN precheck.
 
 use super::attack_budget::upfront_pgd_deadline;
 use super::disjunctive_pgd::{
@@ -23,7 +23,7 @@ use ny_tensor::BoundedTensor;
 use ny_test_utils::CountingGemmEngine;
 use std::time::{Duration, Instant};
 
-/// #3384: SpecRowKind::DiffUpperNeg correctly identifies UNSAT when upper < 0.
+/// SpecRowKind::DiffUpperNeg correctly identifies UNSAT when upper < 0.
 #[test]
 fn spec_row_diff_upper_neg_unsat_when_upper_negative() {
     let kind = SpecRowKind::DiffUpperNeg;
@@ -87,7 +87,7 @@ fn interval_clause_prechecks_use_exact_f64_constants() {
     ));
 }
 
-/// #3384: build_spec_row for LessEq encodes Y_j - Y_i and returns DiffUpperNeg.
+/// build_spec_row for LessEq encodes Y_j - Y_i and returns DiffUpperNeg.
 #[test]
 fn build_spec_row_lesseq_encodes_yj_minus_yi() {
     let clause = vec![OutputConstraint::LessEq(0, 1)]; // Y_0 <= Y_1
@@ -101,7 +101,7 @@ fn build_spec_row_lesseq_encodes_yj_minus_yi() {
     assert!(matches!(kind, SpecRowKind::DiffUpperNeg));
 }
 
-/// #3384: build_spec_row for GreaterEq encodes Y_i - Y_j and returns DiffUpperNeg.
+/// build_spec_row for GreaterEq encodes Y_i - Y_j and returns DiffUpperNeg.
 #[test]
 fn build_spec_row_greatereq_encodes_yi_minus_yj() {
     let clause = vec![OutputConstraint::GreaterEq(0, 1)]; // Y_0 >= Y_1
@@ -240,7 +240,7 @@ fn pgd_before_mip_multi_clause_mixed_input_spec_skipped_3779() {
     );
 }
 
-/// #3865: PGD precheck keeps warm-start candidate when no counterexample exists.
+/// PGD precheck keeps warm-start candidate when no counterexample exists.
 ///
 /// Network: Y_0 = x + 2, Y_1 = x - 2 (gap of 4).
 /// Unsafe spec: Y_0 <= Y_1, i.e. x+2 <= x-2 → 4 <= 0 — impossible.
@@ -317,7 +317,7 @@ fn spsa_deadline_check_fires_every_step_2206() {
     );
     let future = Some(Instant::now() + Duration::from_secs(1));
 
-    // After #2206 Packet D: deadline is checked every step, not every 50th.
+    // The deadline is checked every step, not every 50th.
     // Graph SPSA steps are expensive (seconds per step on large models), so
     // coarse deadline polling caused PGD to overshoot its 20% budget by 100+s.
     assert!(spsa_step_deadline_exceeded(0, expired));
@@ -328,7 +328,7 @@ fn spsa_deadline_check_fires_every_step_2206() {
     assert!(!spsa_step_deadline_exceeded(0, None));
 }
 
-/// #3384 regression: LessEq constraint that is always UNSAT -> precheck returns true.
+/// Regression: LessEq constraint that is always UNSAT -> precheck returns true.
 ///
 /// Network: Y_0=5.0, Y_1=0.0 (constant). Clause: Y_0 <= Y_1.
 /// Y_0=5 > Y_1=0 always -> Y_0 <= Y_1 can never hold -> UNSAT.
@@ -353,12 +353,12 @@ fn spec_guided_precheck_lesseq_always_unsat_returns_true_3384() {
     );
 }
 
-/// #3384 regression: LessEq constraint that is always SAT -> precheck returns false.
+/// Regression: LessEq constraint that is always SAT -> precheck returns false.
 ///
 /// Network: Y_0=0.0, Y_1=5.0 (constant). Clause: Y_0 <= Y_1.
 /// Y_0=0 < Y_1=5 always -> Y_0 <= Y_1 always holds -> SAT -> precheck false.
 ///
-/// Before #3384 fix, the inverted check (lower > 0 on Y_1-Y_0) would
+/// Before the fix, the inverted check (lower > 0 on Y_1-Y_0) would
 /// incorrectly return true (declaring SAT as UNSAT -> false safety verdict).
 #[test]
 fn spec_guided_precheck_lesseq_always_sat_returns_false_3384() {
@@ -381,7 +381,7 @@ fn spec_guided_precheck_lesseq_always_sat_returns_false_3384() {
     );
 }
 
-/// #3384: GreaterEq constraint that is always UNSAT -> precheck returns true.
+/// GreaterEq constraint that is always UNSAT -> precheck returns true.
 ///
 /// Network: Y_0=0.0, Y_1=5.0 (constant). Clause: Y_0 >= Y_1.
 /// Y_0=0 < Y_1=5 -> Y_0 >= Y_1 can never hold -> UNSAT.
@@ -406,7 +406,7 @@ fn spec_guided_precheck_greatereq_unsat_returns_true_3384() {
     );
 }
 
-/// #3397 regression: disjunctive CROWN precheck must honor an expired deadline.
+/// Regression: disjunctive CROWN precheck must honor an expired deadline.
 ///
 /// Network:
 /// - hidden = [ReLU(x), ReLU(-x)]
@@ -469,7 +469,7 @@ fn crown_precheck_expired_deadline_disables_tight_relational_proof_3397() {
     );
 }
 
-/// #3218 sanity check: without a deadline, the disjunctive sampler should report
+/// Sanity check: without a deadline, the disjunctive sampler should report
 /// a trivially satisfied clause immediately.
 #[test]
 fn disjunctive_sampling_attack_finds_trivial_counterexample_without_deadline_3218() {
@@ -505,7 +505,7 @@ fn disjunctive_sampling_attack_finds_trivial_counterexample_without_deadline_321
     }
 }
 
-/// #3218 regression: an already-expired deadline must skip restart 0 instead of
+/// Regression: an already-expired deadline must skip restart 0 instead of
 /// evaluating even a trivially SAT clause.
 #[test]
 fn disjunctive_sampling_attack_expired_deadline_skips_restart_zero_3218() {
@@ -572,7 +572,7 @@ fn disjunctive_sampling_attack_threads_gemm_engine_for_sequential_pgd_3954() {
     );
 }
 
-/// #4375: generic disjunctive PGD must fail closed on out-of-range output indices.
+/// Generic disjunctive PGD must fail closed on out-of-range output indices.
 #[test]
 fn disjunctive_sampling_attack_generic_oob_const_index_rejected_4375() {
     let net = make_const_network(vec![1.0]);
@@ -600,7 +600,7 @@ fn disjunctive_sampling_attack_generic_oob_const_index_rejected_4375() {
     );
 }
 
-/// #4375: the generic disjunctive SAT path must re-confirm witnesses with the
+/// The generic disjunctive SAT path must re-confirm witnesses with the
 /// epsilon guard before returning `Violated`.
 #[test]
 fn disjunctive_sampling_attack_generic_borderline_margin_rejected_4375() {
@@ -629,7 +629,7 @@ fn disjunctive_sampling_attack_generic_borderline_margin_rejected_4375() {
     );
 }
 
-/// #4375: the sequential disjunctive PGD fast path must reject borderline
+/// The sequential disjunctive PGD fast path must reject borderline
 /// witnesses using the same epsilon guard.
 #[test]
 fn disjunctive_sampling_attack_sequential_borderline_margin_rejected_4375() {

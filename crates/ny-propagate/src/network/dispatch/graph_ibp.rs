@@ -4,7 +4,7 @@
 
 //! IBP delegation entry points for GraphNetwork.
 //!
-//! Moved from `core/graph/ibp/base.rs` to break bidirectional dependency (#2380).
+//! Moved from `core/graph/ibp/base.rs` to break bidirectional dependency.
 //! Only the delegation methods (that import from sibling `graph_ibp`) are here.
 //! Non-delegating methods (`collect_activation_statistics`, `propagate_ibp_with_clipper`)
 //! remain in `core/graph/ibp/base.rs` since they have no sibling imports.
@@ -25,6 +25,7 @@ impl GraphNetwork {
     #[inline]
     #[instrument(skip(self, input), fields(num_nodes = self.nodes.len(), input_shape = ?input.shape()))]
     pub fn propagate_ibp(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
+        self.ensure_proof_eligible()?;
         GraphNetworkIbpExt::propagate_ibp_impl(self, input)
     }
 
@@ -38,6 +39,7 @@ impl GraphNetwork {
         input: &BoundedTensor,
         engine: Option<&dyn GemmEngine>,
     ) -> Result<BoundedTensor> {
+        self.ensure_proof_eligible()?;
         GraphNetworkIbpExt::propagate_ibp_with_engine_impl(self, input, engine)
     }
 
@@ -77,7 +79,7 @@ impl GraphNetwork {
     /// Aborts with `DeadlineExceeded` between nodes and cooperatively within
     /// deadline-aware convolution nodes once `deadline` passes, so a single
     /// forward pass over a deep conv DAG cannot overrun the verifier's own timeout
-    /// (#4321). Passing `None` is equivalent to `propagate_ibp_with_engine`.
+    ///Passing `None` is equivalent to `propagate_ibp_with_engine`.
     #[inline]
     pub fn propagate_ibp_with_engine_and_deadline(
         &self,
@@ -85,6 +87,7 @@ impl GraphNetwork {
         engine: Option<&dyn GemmEngine>,
         deadline: Option<Instant>,
     ) -> Result<BoundedTensor> {
+        self.ensure_proof_eligible()?;
         GraphNetworkIbpExt::propagate_ibp_with_engine_and_deadline_impl(
             self, input, engine, deadline,
         )
@@ -101,6 +104,7 @@ impl GraphNetwork {
         input: &BoundedTensor,
         engine: Option<&dyn GemmEngine>,
     ) -> Result<BoundedTensor> {
+        self.ensure_proof_eligible()?;
         GraphNetworkIbpExt::propagate_ibp_with_engine_preserve_leading_axis_impl(
             self, input, engine,
         )
@@ -118,6 +122,7 @@ impl GraphNetwork {
     #[inline]
     #[instrument(skip(self, input), fields(num_nodes = self.nodes.len(), input_shape = ?input.shape()))]
     pub fn propagate_ibp_sound(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
+        self.ensure_proof_eligible()?;
         GraphNetworkIbpExt::propagate_ibp_sound_impl(self, input)
     }
 
@@ -134,6 +139,7 @@ impl GraphNetwork {
         input: &BoundedTensor,
         engine: Option<&dyn GemmEngine>,
     ) -> Result<BoundedTensor> {
+        self.ensure_proof_eligible()?;
         GraphNetworkIbpExt::propagate_ibp_sound_with_engine_impl(self, input, engine)
     }
 }

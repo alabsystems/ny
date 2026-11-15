@@ -18,7 +18,7 @@
 //! 2. **Batched evaluation**: Collect all child domains into `BatchedDomains`,
 //!    run a single batched backward pass, then process results per-child.
 //!
-//! 3. **Beta refinement** (#1484): For shallow children, run a per-child
+//! 3. **Beta refinement**: For shallow children, run a per-child
 //!    optimization pass to tighten bounds beyond the inherited beta values.
 //!
 //! Extracted from `verify_graph_gpu_domain_list` lines 253-729.
@@ -116,7 +116,7 @@ impl BetaCrownVerifier {
                     })?
             };
 
-            // ReLU fast path (Direction 2 of #1668): branch directly from PickedDomains
+            // ReLU fast path: branch directly from PickedDomains
             // without materializing an intermediate GraphBabDomain.
             if !ctx.is_genbab {
                 if unstable.is_empty() {
@@ -124,7 +124,7 @@ impl BetaCrownVerifier {
                     // is a fully-decided affine leaf. A single CROWN pass with
                     // inherited β leaves the split constraints loosely enforced
                     // and can return Undecided on a leaf that is in fact
-                    // verifiable (#1896). `process_graph_leaf_no_unstable`
+                    // verifiable. `process_graph_leaf_no_unstable`
                     // optimizes β/α on the leaf and reports the tightest *sound*
                     // bound, so verifiable leaves verify.
                     let domain = graph_domain_from_picked(
@@ -142,7 +142,7 @@ impl BetaCrownVerifier {
                         Some(ctx.eng),
                     ) {
                         GraphDomainResult::AlreadyVerified => {
-                            // #2926: Infeasible domain = empty = trivially verified.
+                            // Infeasible domain = empty = trivially verified.
                             state.domains_verified += 1;
                         }
                         GraphDomainResult::NoUnstable {
@@ -310,12 +310,17 @@ impl BetaCrownVerifier {
                     self.select_genbab_branch(ctx.graph, &domain, &splittable, genbab)?
                 {
                     for split in decision.to_splits()? {
-                        if let Some(child) = domain.with_general_split(
+                        match domain.with_general_split(
                             ctx.graph,
                             split,
                             self.config.verify_upper_bound,
                         )? {
-                            batched_children.push(child);
+                            Some(child) => batched_children.push(child),
+                            // Empty child: sound to drop, but a no-op split
+                            // (#genbab-selector-convention; must stay 0).
+                            None => {
+                                crate::beta_crown::nonlinear_branching::record_genbab_empty_child()
+                            }
                         }
                     }
                 } else {
@@ -342,9 +347,10 @@ impl BetaCrownVerifier {
 
         // Use lA-capturing variant for backward pass.
         #[allow(clippy::type_complexity)]
-        let (child_results, captured_la): (
+        let (child_results, captured_la, captured_frontiers): (
             Vec<Option<DomainCrownResult>>,
             Option<Vec<HashMap<String, crate::LinearBounds>>>,
+            Option<Vec<HashMap<String, crate::batched_domain::WarmFrontier>>>,
         ) = match self.propagate_crown_batched_with_context_capture_la(
             ctx.graph,
             &bctx,
@@ -354,14 +360,19 @@ impl BetaCrownVerifier {
             Ok(BatchedBackwardResult {
                 results,
                 intermediate_la,
+                intermediate_frontiers,
                 stage_timing: _, // Timing consumed by domain_batch metrics layer
-            }) => (results.into_iter().map(Some).collect(), intermediate_la),
+            }) => (
+                results.into_iter().map(Some).collect(),
+                intermediate_la,
+                intermediate_frontiers,
+            ),
             Err(err) => {
                 warn!(
                     "DomainList BaB batched backward failed ({}); falling back to sequential with beta optimization",
                     err
                 );
-                // Part of #1484: Use evaluate_graph_child_bounds for fallback
+                // Use evaluate_graph_child_bounds for fallback
                 let fallback_results: Vec<_> = batched_children
                     .iter_mut()
                     .enumerate()
@@ -420,7 +431,7 @@ impl BetaCrownVerifier {
                                 None
                             }
                             Err(ref err) if err.is_infeasible_domain() => {
-                                // #2926: Infeasible domain = empty = verified.
+                                // Infeasible domain = empty = verified.
                                 debug!(
                                     child_idx = fallback_child_idx,
                                     child_depth = child.depth,
@@ -440,7 +451,7 @@ impl BetaCrownVerifier {
                         }
                     })
                     .collect();
-                (fallback_results, None)
+                (fallback_results, None, None)
             }
         };
 
@@ -456,7 +467,7 @@ impl BetaCrownVerifier {
         let mut needs_refinement: Vec<usize> = Vec::new();
         // Per-child lA cache indexed by child_idx (not kept-domain order).
         // Compacted to kept-order after refinement to prevent misalignment
-        // when refinement flips keep_mask entries. Fix: #1916.
+        // when refinement flips keep_mask entries.
         let mut captured_la_per_child: Vec<Option<Arc<CachedLinearBounds>>> =
             vec![None; n_children];
 
@@ -474,7 +485,7 @@ impl BetaCrownVerifier {
             let lower = output.lower_scalar();
             let upper = output.upper_scalar();
 
-            // Guard: NaN/Inf from GPU backward pass → drop child (#2652).
+            // Guard: NaN/Inf from GPU backward pass → drop child.
             // Matches fallback path guard (line 338). Without this, NaN domains
             // fall through to Undecided and loop indefinitely.
             if !lower.is_finite() || !upper.is_finite() {
@@ -520,10 +531,18 @@ impl BetaCrownVerifier {
             // Capture lA for this surviving child if available.
             // Stored per-child (indexed by child_idx), not in kept-order,
             // so post-refinement keep_mask flips don't misalign entries.
-            // Compacted to kept-order after refinement. Fix: #1916.
+            // Compacted to kept-order after refinement.
             if let Some(ref la_vec) = captured_la {
                 if let Some(la_map) = la_vec.get(child_idx) {
-                    let cached = CachedLinearBounds::from_linear_bounds_map(la_map.clone());
+                    let mut cached = CachedLinearBounds::from_linear_bounds_map(la_map.clone());
+                    // #la-warm-frontier: `None` unless the pass ran armed.
+                    if let Some(frontiers) = captured_frontiers
+                        .as_ref()
+                        .and_then(|per_child| per_child.get(child_idx))
+                        .filter(|frontiers| !frontiers.is_empty())
+                    {
+                        cached.attach_frontiers(frontiers.clone());
+                    }
                     captured_la_per_child[child_idx] = Some(Arc::new(cached));
                 }
             }
@@ -531,14 +550,14 @@ impl BetaCrownVerifier {
             node_caches_vec.push(node_cache);
             keep_mask_vec.push(true);
 
-            // Part of #1484: Mark shallow unverified children for beta refinement
+            // Mark shallow unverified children for beta refinement
             if should_optimize_any && child.depth <= self.config.beta_max_depth {
                 needs_refinement.push(child_idx);
             }
         }
 
         // Structural invariant: parallel result arrays must match n_children.
-        // (#2671, #2920 WP-B: upgraded from debug_assert to runtime check)
+        // (upgraded from debug_assert to runtime check)
         if lower_bounds_vec.len() != n_children
             || upper_bounds_vec.len() != n_children
             || node_caches_vec.len() != n_children
@@ -555,7 +574,7 @@ impl BetaCrownVerifier {
             )));
         }
 
-        // Part of #1484: Post-batched beta optimization refinement
+        // Post-batched beta optimization refinement
         for &child_idx in &needs_refinement {
             let child = &mut batched_children[child_idx];
             let parent_bounds = child.node_bounds.clone();
@@ -568,7 +587,7 @@ impl BetaCrownVerifier {
                 Some(ctx.eng),
             ) {
                 Ok(true) => {
-                    // Guard: NaN/Inf from beta refinement → keep batched bounds (#2652).
+                    // Guard: NaN/Inf from beta refinement → keep batched bounds.
                     if !child.lower_bound.is_finite() || !child.upper_bound.is_finite() {
                         warn!(
                             child_idx,
@@ -613,7 +632,7 @@ impl BetaCrownVerifier {
                     );
                 }
                 Err(ref err) if err.is_infeasible_domain() => {
-                    // #2926: Constraint interaction revealed infeasible domain
+                    // Constraint interaction revealed infeasible domain
                     // during refinement. Drop this child — the domain is empty.
                     debug!(
                         child_idx,
@@ -635,7 +654,7 @@ impl BetaCrownVerifier {
         }
 
         // Compact per-child lA into final kept-domain order using the
-        // post-refinement keep_mask. Before this fix (#1916), lA entries
+        // post-refinement keep_mask. Before this fix, lA entries
         // were accumulated in Phase 3 (pre-refinement kept order), so
         // children verified during refinement left stale entries that
         // shifted lA assignments for subsequent kept children.
@@ -698,7 +717,7 @@ mod tests {
 
     use super::*;
 
-    /// Regression test for #2097: GPU batched branch-selection failure must set
+    /// Regression test: GPU batched branch-selection failure must set
     /// propagation-failure state and continue, not abort process_gpu_batched.
     #[ntest::timeout(5000)]
     #[test]
@@ -745,7 +764,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #2784: when `branch_relu_from_picked` cannot build a
+    /// Regression test: when `branch_relu_from_picked` cannot build a
     /// child due to invalid bounds (for example NaN contamination), DomainList BaB must
     /// mark propagation failure so final classification is Unknown, not Verified.
     #[ntest::timeout(5000)]
@@ -824,10 +843,11 @@ mod tests {
             upper_a,
             lower_b,
             upper_b,
+            frontiers: HashMap::new(),
         }
     }
 
-    /// Regression test for #1916: lA compaction must skip children that were
+    /// Regression test: lA compaction must skip children that were
     /// verified during refinement, preserving correct lA identity for later
     /// kept children.
     #[ntest::timeout(5000)]
@@ -852,7 +872,7 @@ mod tests {
         assert_eq!(compacted[1].lower_a["node"][[0, 0]], 3.0); // child C, not B
     }
 
-    /// Regression test for #1916 end-to-end: compacted lA flows correctly
+    /// Regression test end-to-end: compacted lA flows correctly
     /// through `processed_from_backward_results` into DomainMetadata.
     #[ntest::timeout(5000)]
     #[test]
@@ -889,7 +909,7 @@ mod tests {
 
         Ok(())
     }
-    /// Regression test for #1916 audit: when beta refinement keeps every child,
+    /// Regression test audit: when beta refinement keeps every child,
     /// compaction must be the identity and preserve lA order end-to-end.
     #[ntest::timeout(5000)]
     #[test]

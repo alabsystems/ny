@@ -11,11 +11,14 @@ use tracing::debug;
 
 use super::super::common::BoundPropagation;
 use super::bounds::constant_bounds_from_output;
-use super::utils::{sanitize_softmax_unit_bounds, SOFTMAX_EPSILON};
+use super::utils::SOFTMAX_EPSILON;
 use crate::bounds::nan_propagating_max;
 use crate::LinearBounds;
 
+mod admission;
 mod batched;
+mod checked_row;
+mod point;
 
 /// Causal softmax layer for decoder attention.
 ///
@@ -90,113 +93,75 @@ impl CausalSoftmaxLayer {
         row_idx: usize,
         seq_k: usize,
         mut get_bounds: F,
-    ) -> Vec<(usize, f32, f32)>
+        checked: bool,
+        budget: Option<&crate::certify::work::WorkBudget>,
+    ) -> Result<Vec<(usize, f32, f32)>>
     where
         F: FnMut(usize) -> (f32, f32),
     {
         let active = self.active_range(row_idx, seq_k);
-        if active.start == active.end {
-            return Vec::new();
+        admission::checkpoint(budget)?;
+        if active.is_empty() {
+            return Ok(Vec::new());
         }
-
-        let active_len = active.end - active.start;
-        let mut lower_vals = Vec::with_capacity(active_len);
-        let mut upper_vals = Vec::with_capacity(active_len);
-        let mut max_upper = f32::NEG_INFINITY;
-
+        if !checked {
+            let mut finite = true;
+            for j in active.clone() {
+                if j % 64 == 0 {
+                    admission::checkpoint(budget)?;
+                }
+                let (l, u) = get_bounds(j);
+                finite &= l.is_finite() && u.is_finite() && l <= u;
+            }
+            let exact = finite && active.len() == 1;
+            let mut result = Vec::with_capacity(active.len());
+            for j in active {
+                if j % 64 == 0 {
+                    admission::checkpoint(budget)?;
+                }
+                result.push((j, if exact { 1.0 } else { 0.0 }, 1.0));
+            }
+            return Ok(result);
+        }
+        let mut lower = Vec::with_capacity(active.len());
+        let mut upper = Vec::with_capacity(active.len());
         for j in active.clone() {
+            if j % 64 == 0 {
+                admission::checkpoint(budget)?;
+            }
             let (l, u) = get_bounds(j);
-            if !l.is_finite() || !u.is_finite() {
-                return active.map(|idx| (idx, 0.0, 1.0)).collect();
+            lower.push(ny_core::f32_to_f64_exact(l));
+            upper.push(ny_core::f32_to_f64_exact(u));
+        }
+        let row = checked_row::bounds(&lower, &upper, &mut || admission::checkpoint(budget))?;
+        let mut result = Vec::with_capacity(active.len());
+        for (j, (lo, hi)) in active.zip(row) {
+            if j % 64 == 0 {
+                admission::checkpoint(budget)?;
             }
-            lower_vals.push(l as f64);
-            upper_vals.push(u as f64);
-            max_upper = nan_propagating_max(max_upper, u);
+            result.push((j, lo, hi));
         }
-
-        if !max_upper.is_finite() {
-            return active.map(|idx| (idx, 0.0, 1.0)).collect();
-        }
-
-        // Sanity guard: every score must be finite after the max-upper shift
-        // (confirms no exp overflow); otherwise widen the active block to [0, 1].
-        let max_upper_f64 = max_upper as f64;
-        for offset in 0..active_len {
-            let el = (lower_vals[offset] - max_upper_f64).exp();
-            let eu = (upper_vals[offset] - max_upper_f64).exp();
-            if !el.is_finite() || !eu.is_finite() {
-                return active.map(|idx| (idx, 0.0, 1.0)).collect();
-            }
-        }
-
-        // Per-coordinate monotone optimum with a PER-RATIO shift (#4231).
-        //
-        //   p_hi[i] = exp(u_i) / (exp(u_i) + sum_{j!=i} exp(l_j))
-        //   p_lo[i] = exp(l_i) / (exp(l_i) + sum_{j!=i} exp(u_j))
-        //
-        // SOUNDNESS: a single shared max-upper shift plus SOFTMAX_EPSILON in the
-        // denominator under-approximates p_hi of a REACHABLE key in the underflow /
-        // large-score-gap regime (its numerator exp(u_i - M) collapses to ~0 and the
-        // epsilon swamps the surviving sub-1e-12 terms), yielding a FALSE certificate.
-        // Shifting each ratio by its OWN dominant term keeps the dominant exp at
-        // exp(0)=1 (no underflow), makes the denominator >= 1 (no epsilon needed), and
-        // leaves the NORMAL regime exact (the shift cancels in the ratio).
-        active
-            .enumerate()
-            .map(|(offset, j)| {
-                let li = lower_vals[offset];
-                let ui = upper_vals[offset];
-
-                // p_hi[i]: shift by max(u_i, max_{k!=i} l_k).
-                let mut ref_hi = ui;
-                for (k, &lk) in lower_vals.iter().enumerate() {
-                    if k != offset {
-                        ref_hi = ref_hi.max(lk);
-                    }
-                }
-                let num_hi = (ui - ref_hi).exp();
-                let mut denom_hi = num_hi;
-                for (k, &lk) in lower_vals.iter().enumerate() {
-                    if k != offset {
-                        denom_hi += (lk - ref_hi).exp();
-                    }
-                }
-
-                // p_lo[i]: shift by max(l_i, max_{k!=i} u_k).
-                let mut ref_lo = li;
-                for (k, &uk) in upper_vals.iter().enumerate() {
-                    if k != offset {
-                        ref_lo = ref_lo.max(uk);
-                    }
-                }
-                let num_lo = (li - ref_lo).exp();
-                let mut denom_lo = num_lo;
-                for (k, &uk) in upper_vals.iter().enumerate() {
-                    if k != offset {
-                        denom_lo += (uk - ref_lo).exp();
-                    }
-                }
-
-                let raw_lower = if denom_lo.is_finite() && denom_lo > 0.0 {
-                    next_down_f32((num_lo / denom_lo) as f32)
-                } else {
-                    f32::NAN
-                };
-                let raw_upper = if denom_hi.is_finite() && denom_hi > 0.0 {
-                    next_up_f32((num_hi / denom_hi) as f32)
-                } else {
-                    f32::NAN
-                };
-                let (lb, ub) = sanitize_softmax_unit_bounds(raw_lower, raw_upper);
-                (j, lb, ub)
-            })
-            .collect()
+        Ok(result)
     }
 }
 
-impl BoundPropagation for CausalSoftmaxLayer {
-    #[inline]
-    fn propagate_ibp(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
+impl CausalSoftmaxLayer {
+    /// Same checked mathematical-reference IBP route with an existing query
+    /// ledger. No independent deadline or new allowance is manufactured.
+    pub fn propagate_ibp_with_budget(
+        &self,
+        input: &BoundedTensor,
+        budget: &crate::certify::work::WorkBudget,
+    ) -> Result<BoundedTensor> {
+        self.propagate_ibp_inner(input, Some(budget))
+    }
+
+    fn propagate_ibp_inner(
+        &self,
+        input: &BoundedTensor,
+        budget: Option<&crate::certify::work::WorkBudget>,
+    ) -> Result<BoundedTensor> {
+        admission::checkpoint(budget)?;
         let shape = input.shape();
         let ndim = shape.len();
 
@@ -222,7 +187,15 @@ impl BoundPropagation for CausalSoftmaxLayer {
                 seq_q, seq_k
             )));
         }
+        if ndim > 4 {
+            return Err(NyError::InvalidSpec(format!(
+                "Causal softmax not implemented for {}D tensors",
+                ndim,
+            )));
+        }
 
+        let mut admission = admission::Admission::new(shape, self.window_size, budget)?;
+        admission::checkpoint(budget)?;
         let mut output_lower = ArrayD::<f32>::zeros(input.lower().raw_dim());
         let mut output_upper = ArrayD::<f32>::zeros(input.upper().raw_dim());
 
@@ -231,9 +204,13 @@ impl BoundPropagation for CausalSoftmaxLayer {
             2 => {
                 // 2D: [seq_q, seq_k]
                 for i in 0..seq_q {
-                    for (j, lb, ub) in self.ibp_row_bounds(i, seq_k, |j| {
-                        (input.lower()[[i, j]], input.upper()[[i, j]])
-                    }) {
+                    for (j, lb, ub) in self.ibp_row_bounds(
+                        i,
+                        seq_k,
+                        |j| (input.lower()[[i, j]], input.upper()[[i, j]]),
+                        admission.checked,
+                        budget,
+                    )? {
                         output_lower[[i, j]] = lb;
                         output_upper[[i, j]] = ub;
                     }
@@ -244,9 +221,13 @@ impl BoundPropagation for CausalSoftmaxLayer {
                 let batch = shape[0];
                 for b in 0..batch {
                     for i in 0..seq_q {
-                        for (j, lb, ub) in self.ibp_row_bounds(i, seq_k, |j| {
-                            (input.lower()[[b, i, j]], input.upper()[[b, i, j]])
-                        }) {
+                        for (j, lb, ub) in self.ibp_row_bounds(
+                            i,
+                            seq_k,
+                            |j| (input.lower()[[b, i, j]], input.upper()[[b, i, j]]),
+                            admission.checked,
+                            budget,
+                        )? {
                             output_lower[[b, i, j]] = lb;
                             output_upper[[b, i, j]] = ub;
                         }
@@ -260,9 +241,13 @@ impl BoundPropagation for CausalSoftmaxLayer {
                 for b in 0..batch {
                     for h in 0..heads {
                         for i in 0..seq_q {
-                            for (j, lb, ub) in self.ibp_row_bounds(i, seq_k, |j| {
-                                (input.lower()[[b, h, i, j]], input.upper()[[b, h, i, j]])
-                            }) {
+                            for (j, lb, ub) in self.ibp_row_bounds(
+                                i,
+                                seq_k,
+                                |j| (input.lower()[[b, h, i, j]], input.upper()[[b, h, i, j]]),
+                                admission.checked,
+                                budget,
+                            )? {
                                 output_lower[[b, h, i, j]] = lb;
                                 output_upper[[b, h, i, j]] = ub;
                             }
@@ -278,10 +263,22 @@ impl BoundPropagation for CausalSoftmaxLayer {
             }
         }
 
-        // CausalSoftmax per-element guards above clamp all outputs to [0,1] via
-        // sanitize_softmax_unit_bounds, so NaN repair is not needed here.
-        // See #3060 for analysis of why this path is safe without repair.
-        BoundedTensor::new(output_lower, output_upper)
+        // Checked endpoint publication and the admitted simplex fallback both
+        // retain [0,1]. Masked entries remain the initialized exact zeros.
+        admission::checkpoint(budget)?;
+        let result = BoundedTensor::new(output_lower, output_upper)?;
+        admission::checkpoint(budget)?;
+        if let Some(lease) = &mut admission.lease {
+            lease.complete().map_err(admission::refusal)?;
+        }
+        Ok(result)
+    }
+}
+
+impl BoundPropagation for CausalSoftmaxLayer {
+    #[inline]
+    fn propagate_ibp(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
+        self.propagate_ibp_inner(input, None)
     }
 
     #[inline]
@@ -419,7 +416,7 @@ impl CausalSoftmaxLayer {
             });
         }
 
-        // Reject non-finite pre-activation bounds (#2591).
+        // Reject non-finite pre-activation bounds.
         // Returning bounds.clone() (identity passthrough) was unsound because
         // CausalSoftmax is not the identity function. Return NumericalInstability
         // so the network propagation falls back to IBP/constant bounds.
@@ -488,7 +485,7 @@ impl CausalSoftmaxLayer {
                 // Each row helper already returns a conservative bias interval.
                 // Re-apply directed rounding while summing the independent row
                 // contributions so the scalar path stays conservative without
-                // re-materializing the dense Jacobian (#1954).
+                // re-materializing the dense Jacobian.
                 new_lower_b[out_idx] =
                     next_down_f32(new_lower_b[out_idx] + row_result.lower_b()[out_idx]);
                 new_upper_b[out_idx] =
@@ -500,6 +497,10 @@ impl CausalSoftmaxLayer {
     }
 }
 
+#[cfg(test)]
+mod batched_sound_tests;
+#[cfg(test)]
+mod checked_route_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

@@ -604,7 +604,7 @@ impl FromStr for LayerType {
 mod tests {
     use super::*;
 
-    /// #3176: Verify all cross-enum aliases resolve to the correct LayerType.
+    /// Verify all cross-enum aliases resolve to the correct LayerType.
     /// These aliases bridge the naming gap between Layer (ny-propagate) and
     /// LayerType (ny-core).
     #[test]

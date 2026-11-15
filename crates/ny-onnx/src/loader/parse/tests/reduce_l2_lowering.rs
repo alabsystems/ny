@@ -41,7 +41,7 @@ fn test_lower_reduce_l2_nodes_rewrites_to_supported_primitives() {
     assert_eq!(nodes.len(), 4);
 
     assert_eq!(nodes[0].op_type, "Constant");
-    assert!(nodes[0].input.is_empty());
+    assert_eq!((nodes[0].input).len(), 0);
     assert_eq!(
         nodes[0].output,
         vec!["reduce_l2__reduce_l2_exponent".to_string()]

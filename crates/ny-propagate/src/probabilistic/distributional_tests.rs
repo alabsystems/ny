@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Tests for distributional propagation through CROWN linear bounds.
-//! Part of #3921 Phase 3.
 
 use super::*;
 use ndarray::{Array1, Array2, ArrayD, IxDyn};

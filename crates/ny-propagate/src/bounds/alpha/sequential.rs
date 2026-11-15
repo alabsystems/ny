@@ -49,7 +49,7 @@ pub struct AlphaState {
     /// Alpha values per ReLU layer for the **upper bound path** (alpha[1] in reference).
     /// Used when `ua < 0` in the CROWN backward pass.
     /// Separate from `alphas` to allow independent optimization of lower and upper
-    /// bound relaxation slopes. (#3393)
+    /// bound relaxation slopes.
     /// Reference: auto_LiRPA/operators/relu.py:647-652 `selected_alpha[0]`/`[1]`
     pub(crate) alphas_upper: Vec<Array1<f32>>,
     /// Mask for unstable neurons (l < 0 < u). Only these neurons have optimizable alpha.
@@ -60,11 +60,11 @@ pub struct AlphaState {
     pub(crate) adam_m: Vec<Array1<f32>>,
     /// Second moment estimate (uncentered variance) for Adam optimizer.
     pub(crate) adam_v: Vec<Array1<f32>>,
-    /// Upper-path optimizer state for dual alpha (#3393).
+    /// Upper-path optimizer state for dual alpha.
     pub(crate) velocity_upper: Vec<Array1<f32>>,
-    /// Upper-path first moment estimate for Adam optimizer (#3393).
+    /// Upper-path first moment estimate for Adam optimizer.
     pub(crate) adam_m_upper: Vec<Array1<f32>>,
-    /// Upper-path second moment estimate for Adam optimizer (#3393).
+    /// Upper-path second moment estimate for Adam optimizer.
     pub(crate) adam_v_upper: Vec<Array1<f32>>,
     // Bilinear alpha parameters for BilinearCrown layers (attention Q@K^T)
     /// Bilinear alpha values per BilinearCrown layer. Key is layer index in network.
@@ -122,7 +122,7 @@ impl AlphaState {
             .map(|a| Array1::<f32>::zeros(a.len()))
             .collect();
 
-        // Dual alpha (#3393): upper path alphas initialized identically to lower path.
+        // Dual alpha: upper path alphas initialized identically to lower path.
         // Both paths start with the same heuristic (u > -l ? 1.0 : 0.0) and diverge
         // during optimization as they receive independent gradients.
         let alphas_upper = alphas.clone();
@@ -160,7 +160,7 @@ impl AlphaState {
     }
 
     /// Upper-path alpha values for a specific ReLU layer (by index in relu_layer_indices).
-    /// This is alpha[1] in the reference (used when uA < 0). (#3393)
+    /// This is alpha[1] in the reference (used when uA < 0).
     pub fn alpha_upper(&self, relu_idx: usize) -> Option<&Array1<f32>> {
         self.alphas_upper.get(relu_idx)
     }
@@ -333,7 +333,7 @@ impl AlphaState {
     /// Update ny parameters from a flat vector.
     ///
     /// Returns `Err` if params length doesn't match expected ny count.
-    /// No-op (returns `Ok`) if INVPROP state is not initialized. (#2712)
+    /// No-op (returns `Ok`) if INVPROP state is not initialized.
     pub fn update_ny_params(&mut self, params: &[f32]) -> Result<()> {
         if let Some(ref mut state) = self.invprop_state {
             state.update_ny_params(params)?;
@@ -363,7 +363,7 @@ impl AlphaState {
         let alpha = &mut self.alphas[relu_idx];
         let vel = &mut self.velocity[relu_idx];
 
-        // Guard against length mismatch from fallback gradients (#1937).
+        // Guard against length mismatch from fallback gradients.
         if gradient.len() != alpha.len() {
             tracing::warn!(
                 "AlphaState::update: gradient length {} != alpha length {} for relu_idx {} (#1937), skipping",
@@ -396,7 +396,7 @@ impl AlphaState {
         let m = &mut self.adam_m[relu_idx];
         let v = &mut self.adam_v[relu_idx];
 
-        // Guard against length mismatch from fallback gradients (#1937).
+        // Guard against length mismatch from fallback gradients.
         if gradient.len() != alpha.len() {
             tracing::warn!(
                 "AlphaState::update_adam: gradient length {} != alpha length {} for relu_idx {} (#1937), skipping",
@@ -408,7 +408,7 @@ impl AlphaState {
         update_alphas_adam(alpha, gradient, mask, m, v, params);
     }
 
-    /// Update upper-path alpha values using gradient descent with momentum (#3393).
+    /// Update upper-path alpha values using gradient descent with momentum.
     pub fn update_upper(
         &mut self,
         relu_idx: usize,
@@ -435,7 +435,7 @@ impl AlphaState {
         update_alphas_sgd(alpha, gradient, mask, vel, learning_rate, momentum);
     }
 
-    /// Update upper-path alpha values using Adam optimizer (#3393).
+    /// Update upper-path alpha values using Adam optimizer.
     pub fn update_adam_upper(
         &mut self,
         relu_idx: usize,

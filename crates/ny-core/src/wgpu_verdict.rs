@@ -350,11 +350,10 @@ pub fn corpus_stats() -> CorpusStats {
 ///    arm — naive nested scatters, no engine, no BLAS, no shared buffers, so no
 ///    kernel defect can appear in both arms and cancel. What remains is
 ///    observing the two agree on real hardware; that is the differential's job
-///    and it has not been run. Original text, for the record: the reference the
-///    differential compared against was ITSELF on the GPU — Because of the resolution above, the
-///    "reference" the differential compares a GPU bound against is ITSELF
-///    computed on the GPU: same fused conv_transpose kernel, and it also
-///    terminates in the same `concretize_sound_gpu`. A shared kernel defect
+///    and it has not been run. Original text, for the record: because of the
+///    resolution above, the "reference" the differential compares a GPU bound
+///    against is ITSELF computed on the GPU: same fused conv_transpose kernel,
+///    and it also terminates in the same `concretize_sound_gpu`. A shared kernel defect
 ///    therefore appears identically in both arms and CANCELS, so the gate would
 ///    certify agreement it has not earned. This is the gating blocker, and it is
 ///    statically fixable HERE — no GPU hardware and no CUDA target required: the

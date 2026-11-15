@@ -6389,8 +6389,9 @@ fn build_subgraph_to_node(graph: &GraphNetwork, target: &str) -> Option<GraphNet
         sub.set_crown_ibp_per_node_time_budget(crate::types::CrownIbpPerNodeTimeBudget {
             floor_secs: None,
             cap_secs: Some(cap),
-        prefix_cost_weighted: false,
+            prefix_cost_weighted: false,
             max_target_share_frac: None,
+            floor_dim_scaled: false,
         });
     }
     Some(sub)

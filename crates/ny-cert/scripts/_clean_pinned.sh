@@ -61,7 +61,7 @@ PY
   }
 
   echo "Using exact Clean revision ${clean_pin:0:12} from $clean_url at $clean_root"
-  cargo build --locked --release --manifest-path "$clean_root/Cargo.toml" -p clean
+  targo --unverified build --locked --release --manifest-path "$clean_root/Cargo.toml" -p clean
   CLEAN_ROOT="$clean_root"
   CLEAN_BIN="$clean_root/target/release/clean"
   [[ -x "$CLEAN_BIN" ]] || {

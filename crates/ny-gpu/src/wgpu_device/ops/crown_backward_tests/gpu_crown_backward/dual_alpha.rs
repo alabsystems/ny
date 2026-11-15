@@ -2,14 +2,14 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! GPU CROWN backward tests for `ActivationReluDualAlpha` (#4313).
+//! GPU CROWN backward tests for `ActivationReluDualAlpha`.
 //!
 //! Verifies the four-slice ABI (lower_pos_slope, cross_slope, upper_neg_slope,
 //! cross_intercept) matches the CPU reference for dual-alpha ReLU relaxation.
 
 use super::*;
 
-/// CPU reference dual-alpha activation backward (#4313).
+/// CPU reference dual-alpha activation backward.
 #[allow(clippy::too_many_arguments)] // test helper
 pub(super) fn cpu_dual_alpha_activation_backward(
     a_l: &mut Vec<f32>,

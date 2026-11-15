@@ -2,12 +2,13 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Multi-clause disjunctive (OR-of-AND) input-split BaB verifier (#3740 Packet B).
+//! Multi-clause disjunctive (OR-of-AND) input-split BaB verifier.
 //! Forked from `multi_objective.rs`. Uses `disjunctive_domain_verified()` (all
 //! clauses satisfied) and `disjunctive_domain_priority()` (worst clause's best row).
 //! Reference: `stop_criterion_general` (`auto_LiRPA/utils.py:115-137`).
 
 mod child_batch;
+mod edge_cap;
 mod process_batch;
 mod push_survivors;
 mod screen_child;
@@ -129,12 +130,31 @@ fn dump_open_frontier(
 /// inside the budget. `stop` is clamped to `horizon` on construction, so this
 /// can only ever SHORTEN a run: no wall can extend a search past the timeout
 /// its caller configured.
+///
+/// THE SERIAL EDGE WORK (#iso-edge-cap). The edge-α pass and the edge-MILP
+/// escalation in `process_batch.rs` historically took
+/// `lifecycle.deadline(horizon)` as BOTH their effort shape and their
+/// authority, and nothing bounded how much of one wave they could spend —
+/// MEASURED on `isomorphic_acasxu_2026` (Mac, `624477367`): single batches of
+/// 15-63 s against a ~1.6 s norm, starting exactly at the edge gate's depth,
+/// one of them running the process to 100.96 s of a 100 s budget. Armed by
+/// `bab.branching.input_split.edge_wave_cap`, the BaB loop attaches a per-wave
+/// [`edge_cap::EdgeWave`] allowance to the wall it hands each batch processor
+/// ([`Self::with_edge_wave`]); the processors' edge governor then refuses to
+/// START edge work past the stop or past the allowance, and bounds the
+/// iterative part of each step by `min(stop, now + remaining allowance)`.
+/// Dark (the shipped state), no wave is attached and the processors run the
+/// historical code path statement for statement. See `edge_cap.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct BabWall {
     /// Shapes bound effort. Every `lifecycle.deadline(..)` derives from this.
     horizon: Duration,
     /// Stops the loop. Every elapsed-time termination check derives from this.
     stop: Duration,
+    /// #iso-edge-cap: this wave's edge-work allowance. `None` — every wall
+    /// `clamped` builds, and every wave while the key is dark — is the
+    /// historical, ungoverned edge path.
+    edge_wave: Option<edge_cap::EdgeWave>,
 }
 
 impl BabWall {
@@ -154,7 +174,23 @@ impl BabWall {
             Some(wall) => horizon.min(wall.saturating_duration_since(now)),
             None => horizon,
         };
-        Self { horizon, stop }
+        Self {
+            horizon,
+            stop,
+            edge_wave: None,
+        }
+    }
+
+    /// #iso-edge-cap: the same wall carrying one wave's edge allowance.
+    /// `None` hands back a wall equal to one `clamped` built. Horizon and stop
+    /// are untouched, so no termination check or bound deadline moves.
+    fn with_edge_wave(self, edge_wave: Option<edge_cap::EdgeWave>) -> Self {
+        Self { edge_wave, ..self }
+    }
+
+    /// #iso-edge-cap: this wave's edge allowance, `None` when dark.
+    fn edge_wave(self) -> Option<edge_cap::EdgeWave> {
+        self.edge_wave
     }
 
     /// The effort-shaping horizon. Pair with `lifecycle.deadline(..)`.
@@ -333,6 +369,13 @@ static CHILD_BOUND_CAP_HITS: std::sync::atomic::AtomicUsize =
 /// — the absolute ceiling — directly. Arming any of those on this lane
 /// re-opens the same defect, so cap them at the same time.
 ///
+/// #iso-edge-cap: the first two of those — the edge-α pass and the edge-MILP
+/// escalation — now have a cap of their own,
+/// `bab.branching.input_split.edge_wave_cap` (`edge_cap.rs`): the scored stop
+/// as their authority plus a per-wave wall allowance. It ships DARK, so this
+/// paragraph still describes every shipped preset. The fresh-domain clip is
+/// untouched by it and remains uncapped.
+///
 /// `pub(super)` so the f64 seams in `f64_tail.rs` compose the identical law.
 #[inline]
 pub(super) fn child_bound_deadline(
@@ -456,10 +499,7 @@ impl ChildBoundSlicer {
             // degradation on this codebase (`#deadline-presence`, four root
             // causes, two of which discard optimized alpha). Leave it absent.
             Self::Calibrated { .. } if ceiling.is_none() => None,
-            Self::Calibrated {
-                observer,
-                fallback,
-            } => {
+            Self::Calibrated { observer, fallback } => {
                 // The LIVE remaining wall, measured now — not the budget the
                 // run started with. This is what makes the allowance tighten
                 // as the instance runs out, which a constant cannot express.
@@ -713,6 +753,222 @@ fn should_enable_fresh_domain_clip(config: &BetaCrownConfig, batch_stack_safe: b
         && !batch_stack_safe
 }
 
+/// Is this engine the verdict-grade sound GPU CROWN backward?
+///
+/// The same three clauses `multi_objective/verify.rs`'s
+/// `post_root_factory_engine_is_eligible` applies, restated here because that
+/// one is private to its module.
+#[inline]
+fn engine_is_sound_gpu_crown(engine: &dyn GemmEngine) -> bool {
+    engine.supports_deadline_safe_post_root_multi_objective_bab()
+        && engine.as_gpu_crown_backward().is_some_and(|gpu| {
+            gpu.provides_sound_gpu_crown() && gpu.honors_crown_backward_deadline()
+        })
+}
+
+/// One-shot, print-only census of the root intermediate-bound map handed to
+/// grouped disjunctive BaB (#cgan-root-census). Emitted UNCONDITIONALLY once
+/// per BaB start so the per-node width/unstable profile can be diffed against
+/// alpha-beta-CROWN's plain-CROWN root on the same input box. No behaviour
+/// change: reads the map and the root objective bounds, writes stderr.
+fn print_cgan_root_census(
+    graph: &GraphNetwork,
+    root_node_bounds: Option<&HashMap<String, BoundedTensor>>,
+    root_obj_bounds: &[(f32, f32)],
+    thresholds: &[f32],
+    clause_sizes: &[usize],
+) {
+    let Some(map) = root_node_bounds else {
+        eprintln!("[cgan-root-census] root_node_bounds=None (no intermediate map; spec backward runs on IBP/forward fallback)");
+        return;
+    };
+    // Graph order when the cached exec order resolves; insertion order otherwise.
+    let order: Vec<String> = match graph.exec_order() {
+        Ok(order) => order.to_vec(),
+        Err(_) => graph.node_names().to_vec(),
+    };
+    // Which map entries feed a ReLU / LeakyReLU consumer (pre-activation nodes).
+    let mut feeds_relu: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for name in graph.node_names() {
+        if let Some(node) = graph.node(name) {
+            if matches!(
+                node.layer(),
+                crate::Layer::ReLU(_) | crate::Layer::LeakyReLU(_)
+            ) {
+                for input in node.inputs() {
+                    feeds_relu.insert(input.as_str());
+                }
+            }
+        }
+    }
+    let emit = |name: &str, bt: &BoundedTensor| {
+        let (kind, inputs) = match graph.node(name) {
+            Some(node) => (node.layer().layer_type(), node.inputs().join(",")),
+            None => ("<no-graph-node>", String::new()),
+        };
+        let lower = bt.lower();
+        let upper = bt.upper();
+        let numel = lower.len();
+        let mut unstable = 0usize;
+        let mut neg = 0usize;
+        let mut pos = 0usize;
+        let mut width_sum = 0f64;
+        let mut max_width = f64::NEG_INFINITY;
+        let mut min_lb = f64::INFINITY;
+        let mut max_ub = f64::NEG_INFINITY;
+        let mut nonfinite = 0usize;
+        for (&l, &u) in lower.iter().zip(upper.iter()) {
+            let (l, u) = (l as f64, u as f64);
+            if !l.is_finite() || !u.is_finite() {
+                nonfinite += 1;
+            }
+            if l < 0.0 && u > 0.0 {
+                unstable += 1;
+            } else if u <= 0.0 {
+                neg += 1;
+            } else {
+                pos += 1;
+            }
+            let w = u - l;
+            width_sum += w;
+            if w > max_width {
+                max_width = w;
+            }
+            if l < min_lb {
+                min_lb = l;
+            }
+            if u > max_ub {
+                max_ub = u;
+            }
+        }
+        let mean_width = if numel > 0 {
+            width_sum / numel as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[cgan-root-census] node={name} kind={kind} numel={numel} unstable={unstable} neg={neg} pos={pos} mean_width={mean_width:.6e} max_width={max_width:.6e} min_lb={min_lb:.6e} max_ub={max_ub:.6e} nonfinite={nonfinite} feeds_relu={} shape={:?} inputs={inputs}",
+            feeds_relu.contains(name),
+            bt.shape(),
+        );
+    };
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut in_graph_order = 0usize;
+    for name in &order {
+        if let Some(bt) = map.get(name) {
+            emit(name, bt);
+            seen.insert(name.as_str());
+            in_graph_order += 1;
+        }
+    }
+    let mut rest: Vec<&String> = map.keys().filter(|k| !seen.contains(k.as_str())).collect();
+    rest.sort();
+    for name in &rest {
+        emit(name, &map[*name]);
+    }
+    let graph_nodes_missing: Vec<&String> =
+        order.iter().filter(|n| !map.contains_key(*n)).collect();
+    let margins = root_obj_bounds
+        .iter()
+        .zip(thresholds.iter())
+        .map(|((l, u), &t)| format!("[{l:.6},{u:.6}] thr={t:.6} margin(lb-thr)={:.6}", l - t))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    eprintln!(
+        "[cgan-root-census] summary map_entries={} in_graph_order={} off_graph={} graph_nodes={} graph_nodes_missing_from_map={} missing_names={:?} output_node={} provenance=none(HashMap<String,BoundedTensor> carries no provenance) clauses={} clause_sizes={:?} root_obj={}",
+        map.len(),
+        in_graph_order,
+        rest.len(),
+        order.len(),
+        graph_nodes_missing.len(),
+        graph_nodes_missing,
+        graph.output_name(),
+        clause_sizes.len(),
+        clause_sizes,
+        margins,
+    );
+}
+
+/// One-shot observable, printed on EVERY exit path with its reason.
+///
+/// Attempt 1 placed this AFTER three early returns, so `admitted=ABSENT` was
+/// consistent with four different causes and proved nothing. An observable
+/// behind an early return is not an observable.
+fn disjunctive_engine_note(why: &str) {
+    static ANNOUNCED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ANNOUNCED.get_or_init(|| eprintln!("[disjunctive-engine] {why}"));
+}
+
+impl BetaCrownVerifier {
+    /// PREFER the sound GPU CROWN engine over a caller-supplied engine that is
+    /// not one.
+    ///
+    /// WHY PREFER AND NOT FILL. Attempt 1 mirrored
+    /// `resolve_post_root_multi_objective_engine`, whose first line returns the
+    /// caller's engine when present. On this lane the caller ALWAYS supplies one
+    /// (`engine_dispatch.rs:88` -> `verify_graph_input_split_with_engine`), so
+    /// that mirror was dead by construction and never reached the GPU engine.
+    ///
+    /// WHY THIS IS WORTH DOING (measured 2026-09-01, `cGAN_imgSz32_nCh_3`
+    /// prop_0): ny PROVES the row in 2430.85 s but is given 900 s — a **2.7x**
+    /// wall shortfall at **3.42 domains/s**, with the queue draining 252 -> 32.
+    /// The in-tree figure for the dominant GEMM is 257.56 s CPU vs 12.97 s GPU
+    /// (~20x). The row is lost to WALL, not to convergence.
+    ///
+    /// CORRECTIONS (2026-09-10). (1) The 257.56 s / 12.97 s pair is NOT a cgan
+    /// figure: it is the March-15-2026 WGPU measurement of a graph CROWN-IBP
+    /// collection on a soundnessbench-shaped 6-Conv2d workload, recorded at
+    /// `configs/vnncomp25/relusplitter.yaml:36-38` (see also
+    /// `patches_target.rs`). No cgan GEMM has been timed CPU-vs-GPU. (2) The
+    /// 2430.85 s proving wall included a 2500-domain restart-probe replay, so
+    /// the proving TREE is ~1.9x the 900 s budget, not 2.7x. (3) The commit
+    /// carrying this PREFER handoff on HEAD is `2af1fd80e`; `3bf356483` is an
+    /// orphan of the same change.
+    ///
+    /// SOUNDNESS OF THE OVERRIDE. This replaces a caller's engine, which the
+    /// multi-objective mirror never does, so it needs its own argument: the
+    /// replacement happens ONLY when the incoming engine is not verdict-grade
+    /// (`engine_is_sound_gpu_crown` false) and the preinitialized one IS — the
+    /// same predicate `sound_gpu_gate` uses to authorize every verdict-carrying
+    /// GPU CROWN route. A non-verdict-grade engine is a SPEED choice; swapping
+    /// one for a verdict-grade engine cannot weaken a bound.
+    ///
+    /// Dark by default: `mo_cuda_factory_engine_handoff` is `false` and no
+    /// shipped yaml sets it, so every current config is byte-identical.
+    fn resolve_disjunctive_engine<'a>(
+        &'a self,
+        engine: Option<&'a dyn GemmEngine>,
+        deadline: Option<Instant>,
+    ) -> Option<&'a dyn GemmEngine> {
+        let caller = self.resolve_engine(engine);
+        if !self.config.mo_cuda_factory_engine_handoff {
+            disjunctive_engine_note("gate-off (bab.mo_cuda_factory_engine_handoff unset)");
+            return caller;
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            disjunctive_engine_note("deadline-passed");
+            return caller;
+        }
+        if caller.is_some_and(engine_is_sound_gpu_crown) {
+            disjunctive_engine_note("caller-engine-already-sound-gpu-crown");
+            return caller;
+        }
+        match crate::sound_f64_gemm::preinitialized_sound_gpu_engine() {
+            Some(gpu) => {
+                disjunctive_engine_note("ADMITTED: preferred sound GPU CROWN over caller engine");
+                Some(gpu)
+            }
+            None => {
+                disjunctive_engine_note(
+                    "preinit-none (sound-CROWN slot empty: nothing satisfied \
+                     provides_sound_gpu_crown)",
+                );
+                caller
+            }
+        }
+    }
+}
+
 /// Build the verifier configuration used after the run-local dispatcher has
 /// decided which clip route, if any, is authorized.
 ///
@@ -767,6 +1023,158 @@ fn should_eprint_batch_trajectory(force: bool, batch_index: usize) -> bool {
     LAST_EMIT_MS.store(now_ms.max(1), Ordering::Relaxed);
     EMITTED.fetch_add(1, Ordering::Relaxed);
     true
+}
+
+/// #cap-extend (DEFER-dont-DROP): near-closure gate for extending past the
+/// domain cap instead of discarding a nearly-closed frontier.
+///
+/// The head priority is the gap `lower - threshold` of the most promising
+/// unresolved domain (see `maybe_emit_batch_summary`); `closest_gap_seen` is
+/// the maximum such gap observed across the run — "how close to closing did
+/// the frontier ever get". The two conditions, BOTH required:
+///
+/// - the frontier reached within [`CAP_EXTEND_GAP_EPS`] of closure
+///   (measured cgan2026 row 7: `best_gap=-0.0000` from t=196 s onward;
+///   hopeless controls: row 10 base plateaued at `-1.61`, row 10 canary at
+///   `-63.5` — three orders of magnitude on the same benchmark), and
+/// - at least [`CAP_EXTEND_VERIFIED_NUM`]/[`CAP_EXTEND_VERIFIED_DEN`] of
+///   explored domains actually verified (row 7 at its 2,500 trip: ~40%
+///   verified; the row-10 stalls: 0%). This keeps a frontier that once
+///   grazed zero but never closes anything from extending.
+///
+/// SCHEDULE-ONLY: granting or denying extension never touches bound math. A
+/// wrong grant costs wall time already lost to the re-trace today; a wrong
+/// denial is exactly today's behavior.
+const CAP_EXTEND_GAP_EPS: f32 = 0.05;
+/// Numerator of the minimum verified/explored fraction (see above).
+const CAP_EXTEND_VERIFIED_NUM: usize = 1;
+/// Denominator of the minimum verified/explored fraction (see above).
+const CAP_EXTEND_VERIFIED_DEN: usize = 4;
+/// One-time extension multiple of `max_domains`: DEFER, bounded — not a cap
+/// lift. At row 7's measured ~6 domains/s the extended cap (2,500 → 20,000)
+/// exceeds what any official wall can explore, so the wall governs; the
+/// bound exists so a pathological fast-splitting frontier still terminates
+/// on domain count (the FC cap-lift hazard,
+/// docs/REGRESSION_FC_UNSAT_LOST_2026-08-14.md).
+const CAP_EXTEND_FACTOR: usize = 8;
+
+/// `#cap-extend-floor` — EXPERIMENT constant, `None` ships.
+///
+/// The productive test below demands `verified/explored >= 1/4`. Measured on
+/// cgan `upsample_prop_0`, that is what denies a frontier sitting essentially
+/// AT closure:
+///
+/// ```text
+/// [cap-extend] denied: explored=2500 verified=91 open=2194
+///                      closest_gap_seen=-0.0009 cap=2500
+/// ```
+///
+/// **The GAP half passes with 55x margin (-0.0009 vs -0.05); only the 25%
+/// verified test fails, at 3.6%.** So a tree with 2194 open domains, nine
+/// ten-thousandths from closing, is discarded and REPLAYED from scratch purely
+/// on a verification-rate heuristic — while the restart loop calls that same
+/// seed "productive" in the same run. Two contradictory definitions of
+/// productive, and the guard's own calibration (40% granted vs 0% denied)
+/// never tested the 3.6% middle regime.
+///
+/// A prior session measured `0.01` here: the grant fired on the IDENTICAL
+/// frontier it had denied, the whole-tree replay disappeared (restarts 2 -> 0),
+/// explored went 1560 -> 4359, deepest 30 -> 74, and the frontier went from
+/// verifying NOTHING per batch to 31-32 at `best_gap=-0.0000`. That change was
+/// never committed; this restores the knob so it can be re-measured.
+///
+/// SCHEDULE-ONLY, as the doc above states: granting or denying never touches
+/// bound math. A wrong grant costs wall already lost to the re-trace today.
+/// `None` keeps the exact integer comparison, so the disarmed path is
+/// bit-identical rather than merely equivalent.
+pub(crate) const CAP_EXTEND_MIN_VERIFIED_FRAC: Option<f64> = None;
+
+/// Decide whether a domain-cap trip may extend (true) or must stop exactly as
+/// today (false). Pure so its truth table is directly testable.
+fn cap_extend_decision(
+    armed: bool,
+    already_granted: bool,
+    domains_explored: usize,
+    domains_verified: usize,
+    closest_gap_seen: f32,
+) -> bool {
+    if !armed || already_granted || domains_explored == 0 {
+        return false;
+    }
+    // NaN closest_gap_seen fails the comparison and denies (fail-closed).
+    let near_zero = closest_gap_seen >= -CAP_EXTEND_GAP_EPS;
+    // #cap-extend-floor: `None` keeps the shipped exact integer comparison.
+    let productive = match CAP_EXTEND_MIN_VERIFIED_FRAC {
+        None => {
+            domains_verified.saturating_mul(CAP_EXTEND_VERIFIED_DEN)
+                >= domains_explored.saturating_mul(CAP_EXTEND_VERIFIED_NUM)
+        }
+        // A non-finite or negative floor would admit a stalled frontier, so it
+        // falls back to the shipped rule rather than opening the gate.
+        Some(frac) if frac.is_finite() && frac >= 0.0 => {
+            domains_verified as f64 >= frac * domains_explored as f64
+        }
+        Some(_) => {
+            domains_verified.saturating_mul(CAP_EXTEND_VERIFIED_DEN)
+                >= domains_explored.saturating_mul(CAP_EXTEND_VERIFIED_NUM)
+        }
+    };
+    near_zero && productive
+}
+
+/// #cap-extend: evaluate a domain-cap trip. Returns `true` when the one-time
+/// extension has just been granted (the caller must CONTINUE searching);
+/// `false` means stop exactly as today.
+///
+/// Every cap-enforcement site calls this, not just the loop head. With the
+/// shipped `bab.batch_size: 64` the trip is almost always MID-BATCH — the
+/// batch processors reach the cap and return before control returns to the
+/// loop head. Measured on cgan2026 row 7 at the official 900 s: with the
+/// grant wired only into the loop head, the armed canary produced NO
+/// `[cap-extend]` line at all and timed out identically to production. An
+/// extension that only the batch-size-1 unit fixture can reach is dead
+/// capability.
+fn try_grant_cap_extend(
+    lifecycle: &mut GraphBabLifecycle,
+    config: &BetaCrownConfig,
+    open_domains: usize,
+) -> bool {
+    let armed = config.input_split_cap_extend_near_closure;
+    let granted = cap_extend_decision(
+        armed,
+        lifecycle.cap_extend_effective_max_domains.is_some(),
+        lifecycle.domains_explored,
+        lifecycle.domains_verified,
+        lifecycle.cap_extend_closest_gap_seen,
+    );
+    if granted {
+        let extended = config.max_domains.saturating_mul(CAP_EXTEND_FACTOR);
+        lifecycle.cap_extend_effective_max_domains = Some(extended);
+        // The lever's own observable (armed-yaml reachability proof and A/B
+        // marker; stderr, like the trajectory lines).
+        eprintln!(
+            "[cap-extend] granted: explored={} verified={} open={} \
+             closest_gap_seen={:.4} cap {} -> {}",
+            lifecycle.domains_explored,
+            lifecycle.domains_verified,
+            open_domains,
+            lifecycle.cap_extend_closest_gap_seen,
+            config.max_domains,
+            extended,
+        );
+    } else if armed {
+        eprintln!(
+            "[cap-extend] denied: explored={} verified={} open={} \
+             closest_gap_seen={:.4} cap={} granted_before={}",
+            lifecycle.domains_explored,
+            lifecycle.domains_verified,
+            open_domains,
+            lifecycle.cap_extend_closest_gap_seen,
+            lifecycle.domain_cap(config.max_domains),
+            lifecycle.cap_extend_effective_max_domains.is_some(),
+        );
+    }
+    granted
 }
 
 fn maybe_emit_batch_summary(
@@ -953,10 +1361,10 @@ impl BetaCrownVerifier {
     /// Multi-clause disjunctive (OR-of-AND) input-split BaB.
     ///
     /// Spec rows packed clause-by-clause per `clause_sizes`. Verified when every
-    /// clause has `lower > threshold` for at least one row. Part of #3740 Packet B.
+    /// clause has `lower > threshold` for at least one row.
     /// Reference: `stop_criterion_general` (`auto_LiRPA/utils.py:115-137`).
     /// `deadline`: If `Some`, the BaB engine derives its phase budgets from
-    /// remaining wall-clock time instead of `self.config.timeout` (#4321).
+    /// remaining wall-clock time instead of `self.config.timeout`.
     pub fn verify_graph_input_split_multi_clause_disjunctive(
         &self,
         graph: &GraphNetwork,
@@ -967,8 +1375,11 @@ impl BetaCrownVerifier {
         engine: Option<&dyn GemmEngine>,
         deadline: Option<Instant>,
     ) -> Result<BetaCrownResult> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BabLoop);
+        graph.ensure_proof_eligible()?;
         self.config.validate()?;
-        let engine = self.resolve_engine(engine);
+        let engine = self.resolve_disjunctive_engine(engine, deadline);
 
         // Validate dimensions without allowing malformed packed layouts to
         // panic on overflow or introduce vacuous zero-width clauses.
@@ -1005,7 +1416,7 @@ impl BetaCrownVerifier {
             )));
         }
 
-        // Reject non-finite thresholds early. Part of #3646.
+        // Reject non-finite thresholds early.
         for (i, &t) in thresholds.iter().enumerate() {
             if !t.is_finite() {
                 return Err(NyError::NumericalInstability(format!(
@@ -1075,6 +1486,17 @@ impl BetaCrownVerifier {
             );
         }
         let fresh_domain_clip_telemetry = FreshDomainClipTelemetry::new(fresh_domain_clip_armed);
+        // #sb-plane: one unconditional line per lane start. `armed` is the
+        // EFFECTIVE state — the key only changes anything while the fresh clip
+        // is armed, because that is the only route that drops the plane. The
+        // raw key and the clip state are printed beside it so "key set but
+        // clip inactive" is readable rather than inferable.
+        eprintln!(
+            "[sb-plane] armed={} key={} fresh_clip_armed={}",
+            fresh_domain_clip_armed && self.config.input_split_sb_keep_plane_under_fresh_clip,
+            self.config.input_split_sb_keep_plane_under_fresh_clip,
+            fresh_domain_clip_armed,
+        );
         let clip_disabled_verifier;
         let bab: &BetaCrownVerifier = if disable_clip_unsound_class {
             let cfg = config_with_disjunctive_clip_routes_disabled(&self.config);
@@ -1209,6 +1631,13 @@ impl BetaCrownVerifier {
                  horizon, loop stops at the wall"
             );
         }
+        // #iso-edge-cap: the per-wave edge allowance policy. `None` — every
+        // shipped preset — attaches nothing to the wall below and prints
+        // nothing; armed, the report prints its ARMED line now and its `final`
+        // line on every exit path of this function.
+        let edge_wave_cap = edge_cap::resolve_edge_wave_cap(&self.config);
+        let _edge_escalation_report = edge_wave_cap
+            .map(|cap| edge_cap::EdgeEscalationReport::armed(cap, &self.config, bab_wall));
         let initial_deadline = {
             let frac = self
                 .config
@@ -1314,7 +1743,7 @@ impl BetaCrownVerifier {
             }
         }
 
-        // Phase 4 (#3439): MulBinary SPSA alpha optimization.
+        // Phase 4: MulBinary SPSA alpha optimization.
         let mul_binary_alphas_multi = maybe_optimize_mul_binary_alphas(
             graph,
             input,
@@ -1565,6 +1994,16 @@ impl BetaCrownVerifier {
             crown_bkwd,
             self.config.input_split_ibp_enhancement,
         )?;
+
+        // #split-hint: publish the ROOT plane's per-input influence vector once,
+        // so descendants that carry no plane of their own score by OUTPUT
+        // SENSITIVITY instead of falling back to pure width. Scoring only —
+        // `root_linear` itself still travels to `domain.linear_bounds` for the
+        // certified clip paths, untouched.
+        if let Some(plane) = root_linear.as_ref() {
+            self.install_root_split_hint(plane, self.config.verify_upper_bound);
+        }
+
         let root_obj_bounds = extract_obj_bounds(&root_bounds, num_specs)?;
 
         // Multi-neuron (k-ReLU) ROOT injection (#multineuron, NY_MULTINEURON=1;
@@ -1620,6 +2059,15 @@ impl BetaCrownVerifier {
         } else {
             root_obj_bounds
         };
+
+        // #cgan-root-census: unconditional, print-only, once per BaB start.
+        print_cgan_root_census(
+            graph,
+            root_node_bounds.as_ref(),
+            &root_obj_bounds,
+            thresholds,
+            clause_sizes,
+        );
 
         info!(
             "[disjunctive-multi-clause] {} clauses, {} total rows, root bounds (alpha={}, forward_bounds={}): {}",
@@ -1680,6 +2128,11 @@ impl BetaCrownVerifier {
             1
         };
         let mut batch_index = 0usize;
+        // #cap-extend: seed the closest-to-closure head gap with the root's own
+        // gap. Both this and the grant live on the LIFECYCLE, because the cap
+        // is enforced at three further per-domain sites inside the batch
+        // processors and those are where the trip actually happens.
+        lifecycle.cap_extend_closest_gap_seen = root_priority;
         // #scored-wall-clamp: the duration of the iteration just completed,
         // used to decline one that cannot finish inside the wall. `None` until
         // the first has completed; see `BabWall::cannot_finish`.
@@ -1718,7 +2171,14 @@ impl BetaCrownVerifier {
                 return Ok(lifecycle.timeout_result());
             }
             let iteration_start = Instant::now();
-            if lifecycle.domains_explored >= self.config.max_domains {
+            // #cap-extend: with the lever DARK no grant is ever recorded, the
+            // effective cap is exactly `max_domains`, and this arm is
+            // byte-for-byte today's stop.
+            let effective_max_domains = lifecycle.domain_cap(self.config.max_domains);
+            if lifecycle.domains_explored >= effective_max_domains {
+                if try_grant_cap_extend(&mut lifecycle, &self.config, queue.len()) {
+                    continue;
+                }
                 dump_open_frontier(
                     self,
                     &queue,
@@ -1731,7 +2191,7 @@ impl BetaCrownVerifier {
                 return Ok(lifecycle.build_result(BabVerificationStatus::Unknown {
                     reason: format!(
                         "Domain limit {}: {}/{} verified",
-                        self.config.max_domains,
+                        effective_max_domains,
                         lifecycle.domains_verified,
                         lifecycle.domains_explored
                     ),
@@ -1761,6 +2221,16 @@ impl BetaCrownVerifier {
                 Some(&f64_tail_budget),
             )?;
             let split_screen_start = Instant::now();
+            // #iso-edge-cap: this wave's edge allowance, derived from the
+            // rebound that just completed (the freshest measurement of what a
+            // wave of ordinary work costs on this row). Dark hands the batch
+            // processors `bab_wall` itself.
+            let wave_wall = match edge_wave_cap {
+                Some(cap) => {
+                    bab_wall.with_edge_wave(Some(cap.wave(batch_index, rebound.total_elapsed_s)))
+                }
+                None => bab_wall,
+            };
 
             let batch_result = process_disjunctive_domain_batch(
                 bab,
@@ -1777,7 +2247,7 @@ impl BetaCrownVerifier {
                 f64_tail_hook.as_ref(),
                 &fresh_domain_clip_telemetry,
                 mul_binary_alphas_multi.as_ref(),
-                bab_wall,
+                wave_wall,
                 &mut queue,
                 &mut lifecycle,
                 &mut domains_verified_by_clip,
@@ -1796,6 +2266,12 @@ impl BetaCrownVerifier {
             };
             let should_force_emit = batch_result.is_some();
             let queue_head = queue.peek().map(|d| (d.priority, d.depth));
+            // #cap-extend: NaN never advances the maximum (`>` is false).
+            if let Some((gap, _)) = queue_head {
+                if gap > lifecycle.cap_extend_closest_gap_seen {
+                    lifecycle.cap_extend_closest_gap_seen = gap;
+                }
+            }
             maybe_emit_batch_summary(
                 self,
                 &summary,
@@ -1819,6 +2295,65 @@ impl BetaCrownVerifier {
         }
 
         Ok(lifecycle.build_final_result())
+    }
+}
+
+#[cfg(test)]
+mod cap_extend_tests {
+    use super::*;
+
+    /// Row-7 shape at its measured 2,500 trip: gap grazed zero, ~40%
+    /// verified. Flipping either predicate constant or the conjunction to a
+    /// disjunction fails one of these.
+    #[test]
+    fn armed_near_closure_extends() {
+        assert!(cap_extend_decision(true, false, 2_500, 1_000, -0.0001));
+        // Boundary: exactly the verified fraction and exactly -eps still grant.
+        assert!(cap_extend_decision(
+            true,
+            false,
+            2_000,
+            500,
+            -CAP_EXTEND_GAP_EPS
+        ));
+    }
+
+    /// Cap trips FAR from closure (row-10 base shape: gap plateau -1.61,
+    /// verified 0) — must stop exactly as today even when armed.
+    #[test]
+    fn armed_far_from_closure_still_stops() {
+        assert!(!cap_extend_decision(true, false, 2_500, 0, -1.6093));
+        // Gap near zero but nothing ever verified: deny.
+        assert!(!cap_extend_decision(true, false, 2_500, 0, -0.0001));
+        // Productive but the frontier never approached closure: deny.
+        assert!(!cap_extend_decision(true, false, 2_500, 1_000, -0.5));
+        // Just under the verified-fraction floor: deny.
+        assert!(!cap_extend_decision(true, false, 2_001, 500, -0.0001));
+    }
+
+    /// Dark (default) never extends, whatever the frontier looks like.
+    #[test]
+    fn dark_never_extends() {
+        assert!(!cap_extend_decision(false, false, 2_500, 2_499, -0.0000001));
+    }
+
+    /// The grant is one-time: a second trip at the extended cap stops.
+    #[test]
+    fn extension_is_granted_at_most_once() {
+        assert!(!cap_extend_decision(true, true, 20_000, 19_000, -0.0001));
+    }
+
+    /// Non-finite gap tracking fails closed.
+    #[test]
+    fn nan_gap_denies() {
+        assert!(!cap_extend_decision(true, false, 2_500, 1_000, f32::NAN));
+        assert!(!cap_extend_decision(
+            true,
+            false,
+            2_500,
+            1_000,
+            f32::NEG_INFINITY
+        ));
     }
 }
 
@@ -1929,7 +2464,11 @@ mod deadline_budget_tests {
     fn a_wall_already_passed_yields_an_immediate_stop() {
         let now = Instant::now();
         let horizon = Duration::from_secs(72);
-        let wall = BabWall::clamped(horizon, Some(now.checked_sub(Duration::from_secs(5)).unwrap()), now);
+        let wall = BabWall::clamped(
+            horizon,
+            Some(now.checked_sub(Duration::from_secs(5)).unwrap()),
+            now,
+        );
 
         assert_eq!(wall.stop(), Duration::ZERO);
         assert!(
@@ -1960,8 +2499,8 @@ mod deadline_budget_tests {
             now,
         );
         let start = now.checked_sub(Duration::from_secs(7)).unwrap(); // ~3 s left of the 10 s stop
-                                                  // A 5 s iteration happened earlier and is now behind us; the iteration
-                                                  // just completed took 1 s. The guard must consult the latter.
+                                                                      // A 5 s iteration happened earlier and is now behind us; the iteration
+                                                                      // just completed took 1 s. The guard must consult the latter.
         assert!(
             !wall.cannot_finish(start, Some(Duration::from_secs(1))),
             "a slow batch in the past must not veto a fast one now"
@@ -2093,15 +2632,16 @@ mod child_bound_cap_tests {
         let ChildBoundSlicer::Calibrated { observer, fallback } = &bare else {
             panic!("expected the calibrated arm");
         };
-        assert_eq!(*fallback, None, "no constant named => no cap when uncalibrated");
+        assert_eq!(
+            *fallback, None,
+            "no constant named => no cap when uncalibrated"
+        );
         // Force the "nothing ever completes" state and confirm the pass-through.
         observer.observe(ny_core::cost_observer::Observation::Truncated(
             Duration::from_secs(1),
         ));
         let ceil = Instant::now() + Duration::from_mins(15);
-        let seen = bare
-            .measured(Some(ceil), Ok::<_, NyError>)
-            .unwrap();
+        let seen = bare.measured(Some(ceil), Ok::<_, NyError>).unwrap();
         assert_eq!(seen, Some(ceil), "uncalibrated + no constant == today");
 
         // Constant ALSO named: that is what the uncalibrated path uses.
@@ -2138,9 +2678,7 @@ mod child_bound_cap_tests {
     #[test]
     fn the_calibrated_arm_never_invents_a_deadline_where_there_was_none() {
         let slicer = ChildBoundSlicer::new(&cfg_calibrated());
-        let seen = slicer
-            .measured(None, Ok::<_, NyError>)
-            .unwrap();
+        let seen = slicer.measured(None, Ok::<_, NyError>).unwrap();
         assert_eq!(seen, None, "no ceiling in, no deadline out");
     }
 
@@ -2151,9 +2689,7 @@ mod child_bound_cap_tests {
     fn the_unarmed_slicer_passes_the_ceiling_through_untouched() {
         let slicer = ChildBoundSlicer::new(&BetaCrownConfig::default());
         let ceiling = Some(Instant::now() + Duration::from_mins(15));
-        let seen = slicer
-            .measured(ceiling, Ok::<_, NyError>)
-            .unwrap();
+        let seen = slicer.measured(ceiling, Ok::<_, NyError>).unwrap();
         assert_eq!(seen, ceiling, "no cap, no calibration: pass-through");
     }
 
@@ -2200,9 +2736,7 @@ mod child_bound_cap_tests {
         let ceiling = Some(Instant::now() + Duration::from_mins(15));
         for _ in 0..8 {
             let outcome: Result<()> = slicer.measured(ceiling, |_| {
-                Err(NyError::InternalError(
-                    "not a deadline problem".into(),
-                ))
+                Err(NyError::InternalError("not a deadline problem".into()))
             });
             assert!(outcome.is_err());
         }
@@ -2807,6 +3341,88 @@ mod imb_early_layout_tests {
         assert!(
             !crate::imb::early_attempted(),
             "invalid configuration must be refused before gate or graph work"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cap_extend_floor_tests {
+    use super::{cap_extend_decision, CAP_EXTEND_MIN_VERIFIED_FRAC};
+
+    /// The exact frontier the shipped rule denies on cgan `upsample_prop_0`.
+    const EXPLORED: usize = 2500;
+    const VERIFIED: usize = 91; // 3.6%
+    const GAP: f32 = -0.0009; // 55x inside CAP_EXTEND_GAP_EPS
+
+    #[test]
+    fn the_measured_upsample_frontier_is_denied_by_the_shipped_floor() {
+        assert!(
+            !cap_extend_decision(true, false, EXPLORED, VERIFIED, GAP),
+            "the shipped 25% floor must still deny 3.6%; this pins the defect"
+        );
+    }
+
+    #[test]
+    fn the_gap_half_passes_with_a_wide_margin_on_that_frontier() {
+        // Isolate WHICH half denies: at a 0% floor only the gap test remains,
+        // and it must pass — otherwise the floor is not the blocker.
+        let decide = |frac: f64| {
+            let productive = VERIFIED as f64 >= frac * EXPLORED as f64;
+            let near_zero = GAP >= -0.05f32;
+            near_zero && productive
+        };
+        assert!(
+            decide(0.0),
+            "gap half must pass; it is 55x inside the epsilon"
+        );
+        assert!(decide(0.01), "3.6% clears a 1% floor");
+        assert!(!decide(0.25), "3.6% cannot clear the shipped 25% floor");
+    }
+
+    #[test]
+    fn a_stalled_frontier_is_denied_even_at_a_one_percent_floor() {
+        // The floor exists to stop a tree that grazed zero but closes nothing.
+        // Lowering it must NOT admit that case.
+        let productive = 0f64 >= 0.01 * EXPLORED as f64;
+        assert!(!productive, "verified=0 must fail any positive floor");
+    }
+
+    #[test]
+    fn a_far_frontier_is_denied_however_low_the_floor_goes() {
+        // The measured hopeless control: best_gap -0.7603.
+        assert!(
+            !cap_extend_decision(true, false, EXPLORED, VERIFIED, -0.7603),
+            "the gap half is independent of the floor and must still deny"
+        );
+    }
+
+    #[test]
+    fn the_disarmed_and_already_granted_paths_are_untouched() {
+        assert!(
+            !cap_extend_decision(false, false, EXPLORED, VERIFIED, GAP),
+            "unarmed"
+        );
+        assert!(
+            !cap_extend_decision(true, true, EXPLORED, VERIFIED, GAP),
+            "one-time only"
+        );
+        assert!(!cap_extend_decision(true, false, 0, 0, GAP), "explored=0");
+    }
+
+    #[test]
+    fn a_forty_percent_frontier_is_granted_under_the_shipped_rule() {
+        // The guard's own calibration point (cgan2026 row 7, ~40% verified).
+        // Proves the patch does not disturb the case the shipped floor exists
+        // to admit.
+        assert!(cap_extend_decision(true, false, 2500, 1000, -0.0000));
+    }
+
+    #[test]
+    fn cap_extend_floor_ships_off() {
+        assert!(
+            CAP_EXTEND_MIN_VERIFIED_FRAC.is_none(),
+            "`None` keeps the shipped EXACT INTEGER comparison, so the disarmed \
+path is bit-identical rather than merely equivalent"
         );
     }
 }

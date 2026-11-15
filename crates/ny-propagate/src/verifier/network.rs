@@ -57,7 +57,7 @@ impl Verifier {
         spec: &VerificationSpec,
         engine: Option<&dyn GemmEngine>,
     ) -> Result<VerificationResult> {
-        // Guard: reject empty spec before wasting propagation compute (#2266)
+        // Guard: reject empty spec before wasting propagation compute
         if spec.output_bounds().is_empty() {
             return Err(NyError::InvalidSpec(
                 "empty output_bounds in specification — nothing to verify".to_string(),
@@ -283,7 +283,7 @@ impl Verifier {
             None => BetaCrownVerifier::new(config),
         };
 
-        // Derive BaB threshold from output bounds (#2241).
+        // Derive BaB threshold from output bounds.
         //
         // For multi-output specs, use min(all finite lower bounds) as the BaB
         // threshold. The BaB engine verifies `min(all_outputs) > threshold` via

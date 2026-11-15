@@ -6,8 +6,6 @@
 //!
 //! Extracted from per-layer `validated_eps()` and `MIN_EPS` constants
 //! that were duplicated 4x (LayerNorm, RmsNorm, InstanceNorm, AdaIN).
-//!
-//! Reference: designs/2026-02-27-normalization-trait-dedup.md
 
 use ny_core::{NyError, Result};
 

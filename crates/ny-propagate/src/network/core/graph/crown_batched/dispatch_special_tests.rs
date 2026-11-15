@@ -4,7 +4,7 @@
 
 //! Unit tests for `dispatch_special_batched_operator` error routing.
 //!
-//! Part of #4280: these tests encode that MulBinary and BilinearCrown error
+//! These tests encode that MulBinary and BilinearCrown error
 //! branches correctly route to partial CROWN fallback (for fallback-eligible
 //! errors) or propagate the error (for non-eligible errors).
 //!
@@ -91,7 +91,7 @@ fn make_mul_node() -> GraphNode {
     )
 }
 
-// ---- dispatch_special_batched_operator: error routing tests (#4280 checkbox 6) ----
+// ---- dispatch_special_batched_operator: error routing tests ----
 
 /// MulBinary with infinite input bounds triggers McCormick validation failure
 /// (UnsupportedOp), which is fallback-eligible → PartialFallback with IBP bounds.
@@ -266,7 +266,7 @@ fn test_dispatch_special_mulbinary_success_returns_handled() {
     }
 }
 
-// ---- dispatch_special_batched_operator: BilinearCrown error routing tests (#4280 checkbox 6) ----
+// ---- dispatch_special_batched_operator: BilinearCrown error routing tests ----
 
 /// Build a minimal GraphNetwork with a BilinearCrown(NETWORK_INPUT, NETWORK_INPUT) node.
 fn make_bilinear_graph() -> GraphNetwork {

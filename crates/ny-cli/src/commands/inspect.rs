@@ -300,7 +300,7 @@ pub(crate) fn handle_compare_command(
     {
         let lower_diff: f32 = (rl - tl).abs();
         let upper_diff: f32 = (ru - tu).abs();
-        // nan_propagating_max propagates NaN instead of absorbing it (#2852).
+        // nan_propagating_max propagates NaN instead of absorbing it.
         max_lower_diff = nan_propagating_max(max_lower_diff, lower_diff);
         max_upper_diff = nan_propagating_max(max_upper_diff, upper_diff);
         let exceeds = lower_diff > tolerance
@@ -312,7 +312,7 @@ pub(crate) fn handle_compare_command(
         }
     }
 
-    // Overlap metric: non-finite endpoints conservatively count as non-overlapping (#2852).
+    // Overlap metric: non-finite endpoints conservatively count as non-overlapping.
     let total = ref_lower.len();
     let overlap_count = ref_lower
         .iter()

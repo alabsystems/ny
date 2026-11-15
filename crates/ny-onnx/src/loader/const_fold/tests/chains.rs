@@ -206,7 +206,7 @@ fn ml4acopf_neg1_expand_graph() -> (GraphProto, WeightStore) {
     (graph, weights)
 }
 
-/// Regression: full ml4acopf chain Where→[1,-1]→Expand→squeeze to [20] (#3602).
+/// Regression: full ml4acopf chain Where→[1,-1]→Expand→squeeze to [20].
 #[test]
 fn test_ml4acopf_chain_negative_one_expand_3602() {
     let (graph, mut weights) = ml4acopf_neg1_expand_graph();

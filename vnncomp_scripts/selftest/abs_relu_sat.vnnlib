@@ -1,0 +1,10 @@
+; ny install self-test (vnncomp_scripts/selftest/make_selftest.py):
+; f(x) = relu(x) + relu(-x) = |x| on the box x in [-1, 1].
+; Violation asserted: Y_0 >= 0.5. |x| >= 0.5 for every x in [0.5, 1] (and at
+; x = +-1 exactly 1), so the violation is reachable and the only correct
+; answer is sat, with a counterexample.
+(declare-const X_0 Real)
+(declare-const Y_0 Real)
+(assert (>= X_0 -1))
+(assert (<= X_0 1))
+(assert (>= Y_0 0.5))

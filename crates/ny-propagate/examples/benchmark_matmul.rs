@@ -4,9 +4,9 @@
 
 //! Benchmark comparing ndarray vs faer matrix multiplication
 //!
-//! Run with: cargo run --release --example benchmark_matmul -p ny-propagate
+//! Run with: targo --unverified run --release --example benchmark_matmul -p ny-propagate
 
-// Link macOS Accelerate BLAS for ndarray::dot() acceleration (#4259).
+// Link macOS Accelerate BLAS for ndarray::dot() acceleration.
 #[cfg(target_os = "macos")]
 extern crate blas_src;
 

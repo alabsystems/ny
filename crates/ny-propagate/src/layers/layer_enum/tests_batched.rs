@@ -326,3 +326,81 @@ fn test_layer_logsumexp_batched_crown_dispatch_matches_direct() -> Result<()> {
     assert_eq!(actual.upper_b(), expected.upper_b());
     Ok(())
 }
+
+/// #cgan-shape-err-compose: the four pure 1:1 shape remaps must PROPAGATE an
+/// incoming certified coefficient error, not take the dispatcher's output-box
+/// discharge.
+///
+/// Their batched backward is `Ok(bounds.clone())` — a literal IDENTITY on the
+/// coefficient matrix (a reshape is metadata; the flat coefficient layout is
+/// unchanged) — so an incoming certificate `|A_stored - A_true| <= e` holds
+/// VERBATIM on the result. Discharging instead folds a u-scale RELATIVE error
+/// into an ABSOLUTE width penalty at intermediate-box magnitude, the mechanism
+/// that made BatchNorm the dominant cGAN CROWN looseness before eb651c59.
+///
+/// The observable is the err ITSELF surviving on the result together with an
+/// UNWIDENED bias: a discharge is visible as `lower_a_err == None` plus a bias
+/// pushed outward by `Σ_j max(|y_j|)·e_j`. Asserting only "no panic" would pass
+/// on the defective routing, so both halves are load-bearing.
+#[test]
+fn batched_shape_remaps_propagate_incoming_coeff_err_and_do_not_widen_bias() -> Result<()> {
+    let pre = BoundedTensor::new(
+        ArrayD::from_shape_vec(IxDyn(&[1, 6]), vec![-2.0, -1.0, -0.5, 0.5, 1.0, 2.0])
+            .expect("lower"),
+        ArrayD::from_shape_vec(IxDyn(&[1, 6]), vec![-1.0, 0.0, 0.5, 1.5, 2.0, 3.0]).expect("upper"),
+    )?;
+    let rows = 2usize;
+    let n = 6usize;
+    let a = ArrayD::from_shape_vec(
+        IxDyn(&[1, rows, n]),
+        (0..rows * n)
+            .map(|i| ((i % 5) as f32) - 2.0)
+            .collect::<Vec<f32>>(),
+    )
+    .expect("a");
+    let b = ArrayD::from_shape_vec(IxDyn(&[1, rows]), vec![0.0f32; rows]).expect("b");
+    let err = ArrayD::from_shape_vec(IxDyn(&[1, rows, n]), vec![0.125f32; rows * n]).expect("err");
+
+    let cases: Vec<(&str, Layer)> = vec![
+        ("Reshape", Layer::Reshape(ReshapeLayer::new(vec![1, 6]))),
+        ("Flatten", Layer::Flatten(FlattenLayer::new(1))),
+        ("Squeeze", Layer::Squeeze(SqueezeLayer::new(0))),
+        ("Unsqueeze", Layer::Unsqueeze(UnsqueezeLayer::new(0))),
+    ];
+
+    for (tag, layer) in cases {
+        let mut bounds = BatchedLinearBounds::new_or_conservative(
+            a.clone(),
+            b.clone(),
+            a.clone(),
+            b.clone(),
+            vec![1, 6],
+            vec![1, rows],
+        )?;
+        bounds.lower_a_err = Some(err.clone());
+        bounds.upper_a_err = Some(err.clone());
+        assert!(
+            bounds.has_coeff_err(),
+            "{tag}: fixture must carry coeff err"
+        );
+
+        let out = layer.propagate_crown_backward_batched(&bounds, Some(&pre), None)?;
+
+        assert!(
+            out.lower_a_err.is_some() && out.upper_a_err.is_some(),
+            "{tag}: incoming coeff err was DISCHARGED by the batched dispatcher; \
+             a 1:1 shape remap must PROPAGATE it (#cgan-shape-err-compose)"
+        );
+        assert_eq!(
+            out.lower_b(),
+            b,
+            "{tag}: lower bias widened => the output-box discharge ran"
+        );
+        assert_eq!(
+            out.upper_b(),
+            b,
+            "{tag}: upper bias widened => the output-box discharge ran"
+        );
+    }
+    Ok(())
+}

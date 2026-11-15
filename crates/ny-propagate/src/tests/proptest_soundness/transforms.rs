@@ -9,7 +9,7 @@
 //! `propagate_ibp([l, u])`.
 //!
 //! Part of #40.
-//! CROWN backward tests: Part of #1825.
+//! CROWN backward tests:
 
 use crate::layers::common::BoundPropagation;
 use crate::layers::{
@@ -175,7 +175,7 @@ proptest! {
 }
 
 // =============================================================================
-// TIGHTNESS: Shape-transform layers must preserve exact bound values (#2131)
+// TIGHTNESS: Shape-transform layers must preserve exact bound values
 // =============================================================================
 //
 // Shape-transform layers (Reshape, Flatten, Transpose, Squeeze, Unsqueeze) are
@@ -243,7 +243,7 @@ fn assert_transform_exact_values<L: BoundPropagation>(
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(300) })]
 
-    /// Reshape preserves exact bound values (#2131 tightness).
+    /// Reshape preserves exact bound values (tightness).
     #[ntest::timeout(10000)]
     #[test]
     fn tightness_reshape_exact_values(intervals in prop::collection::vec(valid_interval(10.0), 6)) {
@@ -251,7 +251,7 @@ proptest! {
         assert_transform_exact_values(&layer, &[2, 3], &intervals, "Reshape")?;
     }
 
-    /// Flatten preserves exact bound values (#2131 tightness).
+    /// Flatten preserves exact bound values (tightness).
     #[ntest::timeout(10000)]
     #[test]
     fn tightness_flatten_exact_values(intervals in prop::collection::vec(valid_interval(10.0), 8)) {
@@ -259,7 +259,7 @@ proptest! {
         assert_transform_exact_values(&layer, &[2, 2, 2], &intervals, "Flatten")?;
     }
 
-    /// Squeeze preserves exact bound values (#2131 tightness).
+    /// Squeeze preserves exact bound values (tightness).
     #[ntest::timeout(10000)]
     #[test]
     fn tightness_squeeze_exact_values(intervals in prop::collection::vec(valid_interval(10.0), 6)) {
@@ -267,7 +267,7 @@ proptest! {
         assert_transform_exact_values(&layer, &[2, 1, 3], &intervals, "Squeeze")?;
     }
 
-    /// Unsqueeze preserves exact bound values (#2131 tightness).
+    /// Unsqueeze preserves exact bound values (tightness).
     #[ntest::timeout(10000)]
     #[test]
     fn tightness_unsqueeze_exact_values(intervals in prop::collection::vec(valid_interval(10.0), 6)) {
@@ -275,7 +275,7 @@ proptest! {
         assert_transform_exact_values(&layer, &[2, 3], &intervals, "Unsqueeze")?;
     }
 
-    /// Transpose preserves exact bound values under reindexing (#2131 tightness).
+    /// Transpose preserves exact bound values under reindexing (tightness).
     /// Unlike Reshape/Flatten/Squeeze, Transpose changes element order, so we
     /// compare input[i,j] == output[j,i] rather than flat-order equality.
     #[ntest::timeout(10000)]
@@ -306,7 +306,7 @@ proptest! {
 }
 
 // =============================================================================
-// CROWN BACKWARD SOUNDNESS: Tile and Slice (#1825)
+// CROWN BACKWARD SOUNDNESS: Tile and Slice
 // =============================================================================
 
 /// Concretize LinearBounds to concrete lower/upper bound vectors.
@@ -323,7 +323,7 @@ fn concretize_crown_1d(
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(500) })]
 
-    /// Tile CROWN backward with identity incoming bounds (#1825).
+    /// Tile CROWN backward with identity incoming bounds.
     ///
     /// For input shape [2, 3] tiled along axis 1 with reps=2, output is [2, 6].
     /// Identity CROWN backward over the 12-element output should produce bounds
@@ -380,7 +380,7 @@ proptest! {
         }
     }
 
-    /// Tile CROWN backward with non-identity incoming bounds (#1825).
+    /// Tile CROWN backward with non-identity incoming bounds.
     ///
     /// Random coefficient matrix — verify that for every sampled input point,
     /// the true composed output lies within the concretized CROWN bounds.
@@ -464,7 +464,7 @@ proptest! {
         }
     }
 
-    /// Tile CROWN backward with asymmetric lower/upper coefficients (#1825).
+    /// Tile CROWN backward with asymmetric lower/upper coefficients.
     ///
     /// Tests the case where lower_a != upper_a, which occurs after passing
     /// through nonlinear layers in multi-layer CROWN backward.
@@ -549,7 +549,7 @@ proptest! {
         }
     }
 
-    /// Slice CROWN backward with identity incoming bounds (#1825).
+    /// Slice CROWN backward with identity incoming bounds.
     ///
     /// For input [2, 4] sliced along axis -1 with start=1, end=3, output is [2, 2].
     /// Identity CROWN backward should produce bounds matching IBP.
@@ -605,7 +605,7 @@ proptest! {
         }
     }
 
-    /// Slice CROWN backward with non-identity incoming bounds (#1825).
+    /// Slice CROWN backward with non-identity incoming bounds.
     ///
     /// Random coefficients — verify sampled input points produce outputs within bounds.
     /// Slice(axis=-1, start=1, end=3) on [2, 4] -> [2, 2].
@@ -690,7 +690,7 @@ proptest! {
         }
     }
 
-    /// Slice CROWN backward with asymmetric lower/upper coefficients (#1825).
+    /// Slice CROWN backward with asymmetric lower/upper coefficients.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_slice_crown_asymmetric_bounds(
@@ -772,7 +772,7 @@ proptest! {
         }
     }
 
-    /// Batched CROWN Slice backward + concretize regression (#3188).
+    /// Batched CROWN Slice backward + concretize regression.
     ///
     /// Before the input_shape fix, `concretize` would fail with ShapeMismatch
     /// because the returned `BatchedLinearBounds` carried the post-slice shape
@@ -829,7 +829,7 @@ proptest! {
 }
 
 // =============================================================================
-// BATCHED CROWN BACKWARD SOUNDNESS: Tile (#287)
+// BATCHED CROWN BACKWARD SOUNDNESS: Tile
 // =============================================================================
 //
 // These tests verify the batched CROWN propagation path (propagate_linear_batched)
@@ -840,7 +840,7 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(500) })]
 
-    /// Tile batched CROWN backward with identity incoming bounds (#287).
+    /// Tile batched CROWN backward with identity incoming bounds.
     ///
     /// For input [6] tiled along axis 0 with reps=2, output is [12].
     /// Identity CROWN should produce concretized bounds matching IBP.
@@ -897,7 +897,7 @@ proptest! {
         }
     }
 
-    /// Tile batched CROWN backward for 1D reps=3 (#287).
+    /// Tile batched CROWN backward for 1D reps=3.
     ///
     /// For Tile(axis=0, reps=3) on [4], output [12]. With identity batched bounds
     /// the backward should sum contributions from 3 replicas per input position.
@@ -952,7 +952,7 @@ proptest! {
         }
     }
 
-    /// Tile batched CROWN with pointwise soundness verification (#287).
+    /// Tile batched CROWN with pointwise soundness verification.
     ///
     /// For Tile(axis=0, reps=2) on [4] -> [8], verify that for every
     /// sampled input point within bounds, the tiled output lies within the
@@ -1009,7 +1009,7 @@ proptest! {
 }
 
 // =============================================================================
-// CROWN BACKWARD SOUNDNESS: Gather (#3400)
+// CROWN BACKWARD SOUNDNESS: Gather
 // =============================================================================
 //
 // GatherLayer is a linear selection operation: it picks elements along an axis.
@@ -1021,7 +1021,7 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(500) })]
 
-    /// Gather CROWN backward with identity incoming bounds (#3400).
+    /// Gather CROWN backward with identity incoming bounds.
     ///
     /// For input [4], gather indices=[1, 3], output [2].
     /// Identity CROWN backward should produce bounds matching IBP exactly.
@@ -1070,7 +1070,7 @@ proptest! {
         }
     }
 
-    /// Gather CROWN backward with identity incoming bounds, 2D axis=0 (#3400).
+    /// Gather CROWN backward with identity incoming bounds, 2D axis=0.
     ///
     /// Input [3, 2], gather axis=0 indices=[0, 2], output [2, 2] (4 elements).
     #[ntest::timeout(10000)]
@@ -1122,7 +1122,7 @@ proptest! {
         }
     }
 
-    /// Gather CROWN backward with non-identity incoming bounds (#3400).
+    /// Gather CROWN backward with non-identity incoming bounds.
     ///
     /// Random coefficients — verify that for every sampled input point,
     /// the true composed output lies within the concretized CROWN bounds.
@@ -1188,7 +1188,7 @@ proptest! {
         }
     }
 
-    /// Gather CROWN backward with asymmetric lower/upper coefficients (#3400).
+    /// Gather CROWN backward with asymmetric lower/upper coefficients.
     ///
     /// Tests the case where lower_a != upper_a, which occurs after passing
     /// through nonlinear layers in multi-layer CROWN backward.
@@ -1254,7 +1254,7 @@ proptest! {
         }
     }
 
-    /// Gather CROWN backward with duplicate indices (#3400).
+    /// Gather CROWN backward with duplicate indices.
     ///
     /// Gather(axis=0, indices=[1, 1]) on [3] -> [2]. Both output positions
     /// select the same input element. The backward scatter must accumulate

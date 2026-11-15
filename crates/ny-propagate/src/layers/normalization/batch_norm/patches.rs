@@ -289,9 +289,6 @@ fn anchored_bn_publish_error(value: f64) -> f32 {
 ///
 /// No upper/lower swap needed: CROWN backward composes by substitution (exact linear
 /// layer), not IBP. Negative scale just flips coefficient sign.
-///
-/// Reference: designs/2026-02-28-patches-mode-wrapper-enum-design.md Phase 2
-/// Part of #2613
 impl crate::layers::common::PatchesPropagation for BatchNormLayer {
     fn propagate_patches(
         &self,
@@ -966,7 +963,7 @@ impl BatchNormLayer {
                 input_shape: patches_data.input_shape,
                 unstable_idx: None,
             };
-            // HOLE1 bias discharge (`widen`) + directed rounding (#1745) are applied
+            // HOLE1 bias discharge (`widen`) + directed rounding are applied
             // by the caller (lower_b -= widen then round down, upper_b += widen up).
             Ok((new_data, new_bias, widen))
         };
@@ -976,11 +973,11 @@ impl BatchNormLayer {
         let (new_upper_a, new_upper_b, widen_upper) =
             process_patches(&bounds.upper_a, &bounds.upper_b, OutwardDirection::Upper)?;
 
-        // Discharge the HOLE1 bias widening OUTWARD, then directed rounding (#1745):
+        // Discharge the HOLE1 bias widening OUTWARD, then directed rounding:
         // lower bounds subtract widen and round down, upper bounds add widen and
         // round up. Each branch uses its own path's widen (lower_a's vs upper_a's
         // coeffs/old_err). widen >= 0, so this only ever loosens the bound; the
-        // single f64->f32 cast per cell preserves the #1745 soundness.
+        // single f64->f32 cast per cell preserves the soundness of the f64 bias accumulation.
         let new_lower_b = ndarray::Zip::from(&new_lower_b)
             .and(&widen_lower)
             .map_collect(|&b, &w| next_down_f32((b - w) as f32));
@@ -1499,6 +1496,7 @@ mod anchored_budget_tests {
             bias_err: ArrayD::from_shape_vec(IxDyn(&[1]), vec![0.0]).unwrap(),
             num_channels: 1,
             channel_axis_hint: None,
+            exact_affine: None,
         };
         let geometry = PatchGeometry::anchored(vec![0], vec![0]).unwrap();
         let make_side = || PatchesData {

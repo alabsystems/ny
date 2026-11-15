@@ -6,8 +6,6 @@
 //!
 //! Runs verification on ACAS-Xu benchmark instances from VNN-COMP (year-selectable).
 //! Primary success metric: >95% verified rate on ACAS-Xu benchmark.
-//!
-//! Part of #154.
 
 mod discovery;
 mod verification;
@@ -36,7 +34,7 @@ type VerificationOutcome = (BabVerificationStatus, usize, usize);
 /// `NaiveCpuGemmEngine` from ny-core.
 ///
 /// Stores `Arc<ComputeDevice>` so the engine can be shared with
-/// `BetaCrownVerifier::new_with_engine` for stored-engine construction (#3643).
+/// `BetaCrownVerifier::new_with_engine` for stored-engine construction.
 struct GpuBabEngineRuntime {
     compute_device: Option<Arc<ComputeDevice>>,
     fallback_reason: Option<String>,
@@ -273,7 +271,6 @@ impl Default for AcasxuBenchmarkArgs {
             include_results: true,
             // Default to input branching for ACAS-Xu: achieves 98.4% vs 28% with width.
             // This matches α,β-CROWN's ACAS-Xu configuration.
-            // See: reports/experiments/2026-02-03-acasxu-config-experiments.md
             branching: "input".to_string(),
             max_domains: 10000,
             proactive_cuts: false,
@@ -595,7 +592,6 @@ mod tests {
     fn test_args_default_branching() {
         // CRITICAL: Default branching is "input" to match α,β-CROWN's ACAS-Xu config.
         // This achieves 98.4% pass rate vs 28% with "width".
-        // See reports/experiments/2026-02-03-acasxu-config-experiments.md
         let args = AcasxuBenchmarkArgs::default();
         assert_eq!(
             args.branching, "input",
@@ -716,9 +712,7 @@ mod tests {
             "Fallback summary must disclose concrete cpu engine: {summary}"
         );
 
-        // Regression guard for #2343: GPU BaB dispatch must never receive `None`
-        // for GEMM engine wiring. Even fallback mode exposes a concrete adapter.
-        // Post-#3643: engine_arc returns None when no compute device — the verifier
+        // engine_arc returns None when there is no compute device — the verifier
         // construction path handles this by using BetaCrownVerifier::new (no engine).
         assert!(
             runtime.engine_arc().is_none(),

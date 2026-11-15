@@ -9,9 +9,10 @@ use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
 use super::super::matmul::decode_batch_index_into_buf;
 use super::BilinearCrownLayer;
 use crate::bounds::{nan_propagating_max, nan_propagating_min};
+use crate::layers::linear::bias::{add_f64_down, add_f64_up};
 
 impl BilinearCrownLayer {
-    /// N-D one-sided CROWN compose through BilinearCrown (#286).
+    /// N-D one-sided CROWN compose through BilinearCrown.
     ///
     /// When the downstream has N-D structure (last dim = n, not m*n), composes
     /// along the n dimension only:
@@ -120,7 +121,7 @@ impl BilinearCrownLayer {
             ));
         }
         let batch_index_len = a_batch.len();
-        // Stack-allocated index buffers (#2237 F4).
+        // Stack-allocated index buffers.
         assert!(
             batch_index_len + 2 <= 8,
             "BilinearCrown N-D: batch_index_len + 2 exceeds stack buffer"
@@ -264,16 +265,23 @@ impl BilinearCrownLayer {
                             // interval-interval product (4-corner) — keep it.
                             let (k_conc_l, k_conc_u) =
                                 interval_mul_for_bounds(beta_prod_l, beta_prod_u, k_l, k_u);
-                            bias_lower[[ob, i, o]] += k_conc_l as f64;
-                            bias_upper[[ob, i, o]] += k_conc_u as f64;
+                            // Directed: this chain is mixed-sign and the single
+                            // directed f32 step at publication is at the scale of
+                            // the final sum, so it cannot cover in-chain cancellation.
+                            bias_lower[[ob, i, o]] =
+                                add_f64_down(bias_lower[[ob, i, o]], k_conc_l as f64);
+                            bias_upper[[ob, i, o]] =
+                                add_f64_up(bias_upper[[ob, i, o]], k_conc_u as f64);
 
                             // Ny path: sign-split compose(ds_A, [ny_l, ny_u]) — each
                             // McCormick term l contributes its own lower / upper plane
                             // bias (varies per l with per-element intervals).
                             let (g_prod_l, g_prod_u) =
                                 sign_split_compose_for_bounds(ds_l, ds_u, ny_l, ny_u);
-                            bias_lower[[ob, i, o]] += g_prod_l as f64;
-                            bias_upper[[ob, i, o]] += g_prod_u as f64;
+                            bias_lower[[ob, i, o]] =
+                                add_f64_down(bias_lower[[ob, i, o]], g_prod_l as f64);
+                            bias_upper[[ob, i, o]] =
+                                add_f64_up(bias_upper[[ob, i, o]], g_prod_u as f64);
                         }
                     }
                 }
@@ -315,8 +323,10 @@ impl BilinearCrownLayer {
         for ob in 0..outer_batch_size {
             for i in 0..m {
                 for o in 0..out_dim {
-                    bias_lower[[ob, i, o]] += ds_lb_flat[[ob, i, o]] as f64;
-                    bias_upper[[ob, i, o]] += ds_ub_flat[[ob, i, o]] as f64;
+                    bias_lower[[ob, i, o]] =
+                        add_f64_down(bias_lower[[ob, i, o]], ds_lb_flat[[ob, i, o]] as f64);
+                    bias_upper[[ob, i, o]] =
+                        add_f64_up(bias_upper[[ob, i, o]], ds_ub_flat[[ob, i, o]] as f64);
                 }
             }
         }

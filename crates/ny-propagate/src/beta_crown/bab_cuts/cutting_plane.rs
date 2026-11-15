@@ -73,7 +73,7 @@ impl CuttingPlane {
             )));
         }
         // Validate term coefficients: NaN/Inf coefficients would propagate
-        // through evaluate() and corrupt bound computations (#3076).
+        // through evaluate() and corrupt bound computations.
         for (i, term) in terms.iter().enumerate() {
             if !term.coefficient.is_finite() {
                 return Err(NyError::NumericalInstability(format!(
@@ -132,7 +132,7 @@ impl CuttingPlane {
     /// Gradient: d(lb)/d(lambda) = bias - constraint_min.
     /// The cut adds: lambda * (bias - constraint_min) to the lower bound.
     /// NaN/Inf gradients are reset to 0.0 to prevent corruption of Adam
-    /// moment estimates (#3076).
+    /// moment estimates.
     pub fn set_lambda_grad(&mut self, value: f32) {
         self.lambda_grad = if value.is_finite() {
             value
@@ -161,7 +161,7 @@ impl CuttingPlane {
         // Gradient ascent step (maximize lower bound)
         self.lambda += lr * self.lambda_grad;
         // Project to feasible region: 0 <= lambda <= MAX_LAMBDA
-        // NaN guard: clamp() preserves NaN (IEEE 754). Reset to 0.0. (#2598)
+        // NaN guard: clamp() preserves NaN (IEEE 754). Reset to 0.0.
         const MAX_LAMBDA: f32 = 10.0;
         if self.lambda.is_finite() {
             self.lambda = self.lambda.clamp(0.0, MAX_LAMBDA);
@@ -367,7 +367,7 @@ impl CuttingPlane {
             .map(|term| {
                 // Use lower bound if coefficient positive, upper if negative
                 // This gives the worst-case (minimum) value of the constraint.
-                // Bounds-checked: stale cuts may reference neurons beyond the slice (#2860).
+                // Bounds-checked: stale cuts may reference neurons beyond the slice.
                 let (lo, hi) = pre_activations
                     .get(term.neuron_idx)
                     .copied()
@@ -382,7 +382,7 @@ impl CuttingPlane {
 
         let result = self.lambda * (constraint_value - self.bias);
         // NaN guard: if lambda or any pre-activation is NaN, return 0.0
-        // (neutral contribution) rather than propagating NaN. (#2598)
+        // (neutral contribution) rather than propagating NaN.
         if result.is_finite() {
             result
         } else {
@@ -406,7 +406,7 @@ impl CuttingPlane {
         let beta2 = config.beta2;
         let lr = config.lr_lambda.unwrap_or(config.beta_lr);
         // Guard against t=0: bias correction divides by (1 - beta^t), which is
-        // zero when t=0 (#2575).
+        // zero when t=0.
         let t = t.max(1);
 
         // Update biased first moment estimate
@@ -416,9 +416,9 @@ impl CuttingPlane {
         self.lambda_v = beta2 * self.lambda_v + (1.0 - beta2) * self.lambda_grad * self.lambda_grad;
 
         // Compute bias-corrected estimates
-        // Guard: beta=1.0 makes denominator=0, causing division by zero (#2575, #2586).
+        // Guard: beta=1.0 makes denominator=0, causing division by zero.
         // Matches alpha.rs:116-117 pattern.
-        // Saturate t to i32::MAX to prevent silent wrapping in powi (#2840).
+        // Saturate t to i32::MAX to prevent silent wrapping in powi.
         let t_i32 = t.min(i32::MAX as usize) as i32;
         let m_hat = if config.bias_correction {
             self.lambda_m / (1.0 - beta1.powi(t_i32)).max(f32::EPSILON)
@@ -441,7 +441,6 @@ impl CuttingPlane {
         const MAX_LAMBDA: f32 = 10.0;
         // NaN guard: clamp() propagates NaN (IEEE 754). Check lambda, m, v —
         // lambda can become NaN independently if lr is NaN while grad is zero
-        // (#2598, #3076).
         if !self.lambda.is_finite() || !self.lambda_m.is_finite() || !self.lambda_v.is_finite() {
             tracing::warn!(
                 "NaN/Inf in CuttingPlane::gradient_step_adam, resetting lambda/m/v/grad to 0.0: lambda={}, lambda_m={}, lambda_v={}",

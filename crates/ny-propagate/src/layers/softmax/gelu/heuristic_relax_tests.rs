@@ -44,7 +44,7 @@ fn test_chord_relaxation_negative_interval() {
 }
 
 /// Point interval should return sound derivative-based relaxation.
-/// After directed rounding (#3329), lower/upper intercepts intentionally
+/// After directed rounding, lower/upper intercepts intentionally
 /// differ by 2*slope_err + 2 ULP. Test soundness at zero tolerance.
 #[test]
 fn test_chord_relaxation_point_interval() {
@@ -228,13 +228,13 @@ fn test_chord_soundness_sweep() {
 }
 
 // =========================================================================
-// Directed rounding regression (#3329)
+// Directed rounding regression
 // =========================================================================
 
 /// Narrow intervals just above the 1e-8 early-return threshold trigger
 /// the chord computation (gu - gl) / (u - l). In f32, both numerator and
 /// denominator approach 0, causing catastrophic cancellation.
-/// The f64 upgrade + directed rounding (#3329) prevents this.
+/// The f64 upgrade + directed rounding prevents this.
 #[test]
 fn test_heuristic_narrow_interval_directed_rounding() {
     let test_centers: &[f32] = &[-3.0, -1.0, -0.5, 0.0, 0.5, 1.0, 3.0];
@@ -309,7 +309,7 @@ fn test_all_modes_soundness_sweep() {
 }
 
 // =========================================================================
-// Proptest soundness envelope (#2161)
+// Proptest soundness envelope
 // =========================================================================
 //
 // Heuristic relaxations use sampling + epsilon for soundness approximation.
@@ -390,7 +390,7 @@ fn assert_heuristic_soundness_f64(
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(500) })]
 
-    /// #2161: Chord (heuristic) relaxation soundness envelope.
+    /// Chord (heuristic) relaxation soundness envelope.
     #[test]
     fn proptest_heuristic_chord_soundness(
         l in -10.0f32..10.0,
@@ -407,7 +407,7 @@ proptest! {
         }
     }
 
-    /// #2161: Chord soundness on asymmetric intervals near GELU inflection.
+    /// Chord soundness on asymmetric intervals near GELU inflection.
     #[test]
     fn proptest_heuristic_chord_asymmetric_soundness(
         center in -3.0f32..3.0,
@@ -431,7 +431,7 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(300) })]
 
-    /// #2161: Tangent relaxation soundness envelope.
+    /// Tangent relaxation soundness envelope.
     #[test]
     fn proptest_heuristic_tangent_soundness(
         l in -10.0f32..10.0,
@@ -448,7 +448,7 @@ proptest! {
         }
     }
 
-    /// #2161: TwoSlope relaxation soundness envelope.
+    /// TwoSlope relaxation soundness envelope.
     #[test]
     fn proptest_heuristic_two_slope_soundness(
         l in -10.0f32..10.0,
@@ -465,7 +465,7 @@ proptest! {
         }
     }
 
-    /// #2161: Adaptive mode selection soundness envelope.
+    /// Adaptive mode selection soundness envelope.
     #[test]
     fn proptest_heuristic_adaptive_soundness(
         l in -10.0f32..10.0,
@@ -484,7 +484,7 @@ proptest! {
         }
     }
 
-    /// #2161: Adaptive produces bounds no wider than chord at center.
+    /// Adaptive produces bounds no wider than chord at center.
     #[test]
     fn proptest_adaptive_no_wider_than_chord(
         l in -10.0f32..10.0,

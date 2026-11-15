@@ -5,6 +5,7 @@
 use ndarray::{Array2, Array3, Array4, ArrayD, Axis, IxDyn};
 use ny_core::{checked_shape_product, NyError, Result};
 
+use crate::rounding::sub_up_f32;
 use crate::BoundedTensor;
 
 use super::ZonotopeTensor;
@@ -197,8 +198,21 @@ impl ZonotopeTensor {
     /// This is a lossy conversion - we can't recover the original correlations.
     /// The resulting zonotope has center = (lower+upper)/2 and radius = (upper-lower)/2.
     pub fn from_bounded_tensor(bounds: &BoundedTensor) -> Self {
-        let center = (bounds.lower() + bounds.upper()) / 2.0;
-        let radius = (bounds.upper() - bounds.lower()) / 2.0;
+        // Halve FIRST (exact: 0.5 is a power of two) so `l + u` cannot overflow to
+        // inf on wide bounds and leave `radius` NaN.
+        let center = &(bounds.lower() * 0.5) + &(bounds.upper() * 0.5);
+        // Choose the radius to SATISFY containment rather than assuming it: the box
+        // [center-radius, center+radius] encloses [lower, upper] iff
+        // radius >= max(center - lower, upper - center). Each subtraction rounds UP,
+        // so this holds whichever way `center` rounded.
+        let mut radius = ndarray::Array::zeros(center.raw_dim());
+        ndarray::Zip::from(&mut radius)
+            .and(&center)
+            .and(bounds.lower())
+            .and(bounds.upper())
+            .for_each(|r, &c, &l, &u| {
+                *r = sub_up_f32(c, l).max(sub_up_f32(u, c)).max(0.0);
+            });
 
         let element_shape = bounds.shape().to_vec();
         let mut coeffs_shape = vec![2]; // center + 1 error term
@@ -244,8 +258,21 @@ impl ZonotopeTensor {
             })?
             .max(1);
 
-        let center = (bounds.lower() + bounds.upper()) / 2.0;
-        let radius = (bounds.upper() - bounds.lower()) / 2.0;
+        // Halve FIRST (exact: 0.5 is a power of two) so `l + u` cannot overflow to
+        // inf on wide bounds and leave `radius` NaN.
+        let center = &(bounds.lower() * 0.5) + &(bounds.upper() * 0.5);
+        // Choose the radius to SATISFY containment rather than assuming it: the box
+        // [center-radius, center+radius] encloses [lower, upper] iff
+        // radius >= max(center - lower, upper - center). Each subtraction rounds UP,
+        // so this holds whichever way `center` rounded.
+        let mut radius = ndarray::Array::zeros(center.raw_dim());
+        ndarray::Zip::from(&mut radius)
+            .and(&center)
+            .and(bounds.lower())
+            .and(bounds.upper())
+            .for_each(|r, &c, &l, &u| {
+                *r = sub_up_f32(c, l).max(sub_up_f32(u, c)).max(0.0);
+            });
 
         let center_3d = center
             .into_shape_with_order(IxDyn(&[batch_size, seq, dim]))

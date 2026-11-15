@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Channel-only alpha helpers for `GraphAlphaState` (#4404).
+//! Channel-only alpha helpers for `GraphAlphaState`.
 //!
 //! When `full_conv_alpha: False`, conv-output ReLU alpha is reduced to
 //! per-channel (length C instead of C*H*W). These helpers handle:

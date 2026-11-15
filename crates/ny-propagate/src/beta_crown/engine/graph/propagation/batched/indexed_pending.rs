@@ -7,12 +7,10 @@
 //! This mirrors the graph-CROWN dispatch-plan pattern but stores per-domain
 //! `LinearBounds` payloads for the batched beta-CROWN reverse traversal.
 
-use std::collections::HashMap;
-
 use ndarray::Array2;
 use ny_core::{NyError, Result};
 
-use crate::network::CrownDispatchPlan;
+use crate::network::{CrownDispatchPlan, SharedNameIndex};
 use crate::{GraphNetwork, LinearBounds};
 
 /// #lsnc-fast-merge-err gate. The certified coefficient-error merge
@@ -132,7 +130,7 @@ pub(super) fn merged_err_elem(existing: Option<f32>, new: Option<f32>, merged_co
 
 pub(super) struct IndexedPendingLinearBounds {
     storage: Vec<Option<Vec<Option<LinearBounds>>>>,
-    name_to_idx: HashMap<String, usize>,
+    name_to_idx: SharedNameIndex,
     network_input_idx: usize,
     n_domains: usize,
     input_accumulated: Vec<bool>,
@@ -189,6 +187,39 @@ impl IndexedPendingLinearBounds {
     #[inline]
     pub(super) fn input_accumulated(&self) -> &[bool] {
         &self.input_accumulated
+    }
+
+    /// #la-warm-frontier (review): bytes `domain_idx`'s pending blocks hold
+    /// (every node slot and the network-input slot, coefficient error
+    /// included), WITHOUT cloning them: the batched capture's admission check,
+    /// the counterpart of the accumulator captures' transactional snapshot
+    /// budget.
+    pub(super) fn domain_pending_bytes(&self, domain_idx: usize) -> usize {
+        self.storage
+            .iter()
+            .filter_map(|slot| slot.as_ref()?.get(domain_idx)?.as_ref())
+            .fold(0usize, |sum, block| {
+                sum.saturating_add(block.memory_bytes())
+            })
+    }
+
+    /// #la-warm-frontier: clone every block still pending for `domain_idx`
+    /// (every node slot and the network-input slot), keyed by name. Called
+    /// right after a node's slot was taken, so the result is exactly the rest
+    /// of that domain's backward state at the pop.
+    pub(super) fn snapshot_domain(
+        &self,
+        domain_idx: usize,
+        plan: &CrownDispatchPlan,
+    ) -> Vec<(String, LinearBounds)> {
+        self.storage
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| {
+                let block = slot.as_ref()?.get(domain_idx)?.as_ref()?;
+                Some((plan.name_of(idx).to_string(), block.clone()))
+            })
+            .collect()
     }
 
     pub(super) fn accumulate_name(
@@ -679,5 +710,114 @@ mod tests {
         assert_eq!(result.upper_b[0], f32::INFINITY);
         assert!((result.lower_a[[0, 1]] - 4.0_f32).abs() < 1e-6);
         assert!((result.upper_a[[0, 1]] - 6.0_f32).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+    use crate::network::TrackedStringMap;
+    use crate::{GraphNode, Layer, LinearLayer};
+
+    fn plan_with_spare_key_capacity() -> CrownDispatchPlan {
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input(
+            "affine",
+            Layer::Linear(LinearLayer::new(Array2::eye(2), None).unwrap()),
+        ));
+        graph.set_output("affine");
+        let mut plan = CrownDispatchPlan::build(&graph).unwrap();
+        plan.name_to_idx = SharedNameIndex::from_map(TrackedStringMap::from_entries(
+            plan.name_to_idx.iter().map(|(name, &index)| {
+                let mut owned = String::with_capacity(2048 + name.len());
+                owned.push_str(name);
+                (owned, index)
+            }),
+        ));
+        plan
+    }
+
+    #[test]
+    fn indexed_pending_clone_shares_original_immutable_table_and_string_key_capacities() {
+        let plan = plan_with_spare_key_capacity();
+        let pending = IndexedPendingLinearBounds::new(&plan, 2);
+        assert_eq!(
+            pending.name_to_idx.owner_identity(),
+            plan.name_to_idx.owner_identity()
+        );
+        let actual: usize = pending.name_to_idx.keys().map(String::capacity).sum();
+        assert_eq!(
+            pending.name_to_idx.key_payload_capacity_bytes_v2(),
+            Some(actual)
+        );
+        let table = pending.name_to_idx.allocation_fact_v1();
+        assert_eq!(
+            table.current_table_allocation_bytes(),
+            pending.name_to_idx.allocation_size()
+        );
+        assert!(
+            table.conservative_table_high_water_charge_bytes()
+                >= table.current_table_allocation_bytes()
+        );
+        for (name, &index) in &plan.name_to_idx {
+            let (owned, &stored) = pending.name_to_idx.get_key_value(name.as_str()).unwrap();
+            assert_eq!(stored, index);
+            assert_eq!(pending.index_of(name).unwrap(), index);
+            assert_eq!(owned.as_ptr(), name.as_ptr());
+        }
+        assert!(pending.index_of("absent").is_err());
+    }
+
+    #[test]
+    fn indexed_pending_owned_name_index_survives_source_plan_drop_and_preserves_name_route() {
+        let plan = plan_with_spare_key_capacity();
+        let index = plan.output_node_idx;
+        let mut pending = IndexedPendingLinearBounds::new(&plan, 2);
+        let expected = LinearBounds::identity(2);
+        drop(plan);
+        pending.seed_name("affine", 1, expected.clone()).unwrap();
+        let taken = pending.take_idx(index).unwrap();
+        assert!(taken[0].is_none());
+        let got = taken[1].as_ref().unwrap();
+        assert_eq!(got.lower_a(), expected.lower_a());
+        assert_eq!(got.upper_a(), expected.upper_a());
+        assert_eq!(got.lower_b(), expected.lower_b());
+        assert_eq!(got.upper_b(), expected.upper_b());
+        let actual: usize = pending.name_to_idx.keys().map(String::capacity).sum();
+        assert_eq!(
+            pending.name_to_idx.key_payload_capacity_bytes_v2(),
+            Some(actual)
+        );
+    }
+}
+
+#[cfg(test)]
+mod sharing_tests {
+    use super::*;
+    use crate::{GraphNode, Layer, LinearLayer};
+    #[test]
+    fn indexed_pending_many_backward_users_share_one_immutable_name_index() {
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input(
+            "linear",
+            Layer::Linear(LinearLayer::new(Array2::eye(2), None).unwrap()),
+        ));
+        graph.set_output("linear");
+        let plan = CrownDispatchPlan::build(&graph).unwrap();
+        let identity = plan.name_to_idx.owner_identity();
+        let users: Vec<_> = (0..128)
+            .map(|_| IndexedPendingLinearBounds::new(&plan, 1))
+            .collect();
+        let key = plan.name_to_idx.get_key_value("linear").unwrap().0.as_ptr();
+        drop(plan);
+        drop(graph);
+        for user in users {
+            assert_eq!(user.name_to_idx.owner_identity(), identity);
+            assert_eq!(
+                user.name_to_idx.get_key_value("linear").unwrap().0.as_ptr(),
+                key
+            );
+            assert!(user.index_of("linear").is_ok());
+        }
     }
 }

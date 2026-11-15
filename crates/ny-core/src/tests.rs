@@ -1220,12 +1220,35 @@ fn test_method_used_from_str_all_known_variants() {
     );
     assert_eq!(MethodUsed::from("Mip"), MethodUsed::Mip);
     assert_eq!(MethodUsed::from("MipHiGHS"), MethodUsed::MipHiGHS);
+    assert_eq!(
+        MethodUsed::from("MipAyStrictSideArtifact"),
+        MethodUsed::MipAyStrictSideArtifact
+    );
     assert_eq!(MethodUsed::from("MipVnnlib"), MethodUsed::MipVnnlib);
     assert_eq!(MethodUsed::from("Ibp_f64"), MethodUsed::IbpF64);
     assert_eq!(MethodUsed::from("Crown_f64"), MethodUsed::CrownF64);
     assert_eq!(
         MethodUsed::from("NewMethod"),
         MethodUsed::Other("NewMethod".to_string())
+    );
+}
+
+/// #mip-conv-sound-enclosure review (2026-09-12): the AY strict-side-artifact
+/// provenance tag must round-trip as a KNOWN variant (never collapse into
+/// `Other`), and its wire string must differ from `MipHiGHS` so a banked
+/// unsat from that lane is distinguishable in the bank's metadata.
+#[test]
+fn test_method_used_mip_ay_strict_side_artifact_is_a_distinct_known_tag() {
+    let tag = MethodUsed::MipAyStrictSideArtifact;
+    assert_eq!(tag.as_str(), "MipAyStrictSideArtifact");
+    assert_ne!(tag.as_str(), MethodUsed::MipHiGHS.as_str());
+    let json = serde_json::to_value(&tag).unwrap();
+    assert_eq!(json, serde_json::json!("MipAyStrictSideArtifact"));
+    let back: MethodUsed = serde_json::from_value(json).unwrap();
+    assert_eq!(back, MethodUsed::MipAyStrictSideArtifact);
+    assert_eq!(
+        MethodUsed::from(String::from("MipAyStrictSideArtifact")),
+        MethodUsed::MipAyStrictSideArtifact
     );
 }
 
@@ -1505,7 +1528,7 @@ fn test_verification_spec_builder_chain() {
 }
 
 // ============================================================================
-// Regression tests for VerificationSpec shape product overflow (#2371)
+// Regression tests for VerificationSpec shape product overflow
 // ============================================================================
 
 #[test]
@@ -1545,7 +1568,7 @@ fn test_verification_spec_with_input_shape_overflow() {
 
 /// NaN output must be detected as a violation, not silently passed through.
 /// IEEE 754: NaN < x and NaN > x are both false, so without a NaN guard
-/// a NaN counterexample would return None (no violation). (#3291 F1)
+/// a NaN counterexample would return None (no violation).
 #[test]
 fn test_violated_constraint_detect_nan_output() {
     let output = vec![0.5, f32::NAN, 0.8];

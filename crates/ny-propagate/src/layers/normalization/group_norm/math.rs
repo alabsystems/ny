@@ -44,7 +44,7 @@ impl GroupNormLayer {
             )));
         }
 
-        // f64 accumulation to avoid catastrophic cancellation (#3325)
+        // f64 accumulation to avoid catastrophic cancellation
         let nf = n as f64;
         let mean = group_vals.iter().map(|&xi| xi as f64).sum::<f64>() / nf;
         let var = group_vals
@@ -93,7 +93,7 @@ impl GroupNormLayer {
             ));
         }
 
-        // f64 accumulation to avoid catastrophic cancellation in Jacobian (#3325)
+        // f64 accumulation to avoid catastrophic cancellation in Jacobian
         let nf = n as f64;
         let mean = group_vals.iter().map(|&xi| xi as f64).sum::<f64>() / nf;
         let var = group_vals

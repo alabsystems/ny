@@ -21,6 +21,7 @@ pub(crate) use options::resolve_effective_backend_with_factory;
 pub(crate) use request::VerificationConfig;
 pub(crate) use result::exit_codes;
 pub(crate) use result::json_f32;
+pub(crate) use result::{preview_f32s, TEXT_PREVIEW_LEN};
 
 use anyhow::Result;
 use ny_core::GemmEngine;
@@ -372,7 +373,7 @@ mod tests {
         );
     }
 
-    /// #3866: a successfully qualified proof device must survive option
+    /// A successfully qualified proof device must survive option
     /// resolution, model loading, verifier construction, and graph dispatch.
     /// The injected factory stands for the typed `new_for_proof` constructor;
     /// unlike a real adapter it is hermetic and lets this test observe the

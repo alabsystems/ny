@@ -148,7 +148,7 @@ fn confirm_disjunctive_pgd_candidate(
 
     // Epsilon margin guard: reject borderline counterexamples where f32
     // accumulation-order divergence could cause sign flips between our
-    // forward pass and the VNN-COMP reference evaluator. Part of #4375;
+    // forward pass and the VNN-COMP reference evaluator. The margin is
     // noise-scaled (fixed 1e-5 was below the measured ~3e-5 ny<->ORT
     // deviation on cora cifar10 — see noise_scaled_margin).
     let epsilon = super::noise_scaled_margin(&output);

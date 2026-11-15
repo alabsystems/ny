@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! BilinearCrown attention tests for #286: probs@V through broadcast McCormick.
+//! BilinearCrown attention tests: probs@V through broadcast McCormick.
 
 use super::prelude::*;
 
@@ -45,7 +45,7 @@ fn build_bilinear_attention_graph(seq: usize, dim: usize) -> (GraphNetwork, Boun
 #[ntest::timeout(60000)]
 #[test]
 fn test_bilinear_crown_probs_v_large_seq_fallback() {
-    // Part of #286: BilinearCrown probs@V at output node gracefully falls back
+    // BilinearCrown probs@V at output node gracefully falls back
     // to partial CROWN (ShapeMismatch: N-D identity last dim != m*n).
     let (graph, input) = build_bilinear_attention_graph(65, 4);
     let ibp = graph.propagate_ibp(&input).unwrap();
@@ -70,7 +70,7 @@ fn test_bilinear_crown_probs_v_large_seq_fallback() {
 /// Uses self-attention pattern (Q and K share shape [1, 1, seq, dim])
 /// with transpose_b=true so output is [1, 1, seq, seq] and z_size = seq^2.
 ///
-/// This isolates the flat identity optimization (#286) without the
+/// This isolates the flat identity optimization without the
 /// complexity of a full attention graph (no Softmax → BilinearCrown chain).
 fn build_bilinear_output_graph(seq: usize, dim: usize) -> (GraphNetwork, BoundedTensor) {
     let mut graph = GraphNetwork::new();
@@ -102,7 +102,7 @@ fn build_bilinear_output_graph(seq: usize, dim: usize) -> (GraphNetwork, Bounded
 #[ntest::timeout(10000)]
 #[test]
 fn test_bilinear_output_flat_identity_small() {
-    // Part of #286: When BilinearCrown is the output node, McCormick linearization
+    // When BilinearCrown is the output node, McCormick linearization
     // at the output node is inherently no tighter than IBP (the McCormick lower plane
     // is below the actual product curve). The N-D compose correctly skips the output
     // node (identity downstream) and falls through to partial CROWN = IBP.
@@ -131,7 +131,7 @@ fn test_bilinear_output_flat_identity_small() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_bilinear_output_flat_identity_at_threshold() {
-    // Part of #286: z_size = 64 * 64 = 4096 — exactly at the threshold.
+    // z_size = 64 * 64 = 4096 — exactly at the threshold.
     // Self-attention: seq=64, dim=1. Output [1,1,64,64], z_size = 64*64 = 4096 = threshold.
     // Should use flat identity (z_size <= 4096), not fall back to partial CROWN.
     let (graph, input) = build_bilinear_output_graph(64, 1);

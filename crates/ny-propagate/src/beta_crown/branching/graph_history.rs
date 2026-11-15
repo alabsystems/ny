@@ -34,7 +34,7 @@ pub struct GraphSplitHistory {
     /// O(1) lookup cache for GenBaB constraints: node_name -> (neuron_idx -> (lower, upper)).
     /// Mirrors `relu_lookup` structure. Lower bound comes from `is_upper_branch=true` (the neuron
     /// is above split_point), upper bound from `is_upper_branch=false` (below split_point).
-    /// Replaces the O(D) linear scan in `is_genbab_constrained` (#4315).
+    /// Replaces the O(D) linear scan in `is_genbab_constrained`.
     genbab_lookup: HashMap<String, HashMap<usize, (Option<f32>, Option<f32>)>>,
     /// GenBaB norm-branching `inv_rms` clamps (#norm-genbab). One entry per
     /// applied norm split; stacked splits on the same node intersect (see
@@ -178,7 +178,7 @@ impl GraphSplitHistory {
     /// Check if a neuron has GenBaB constraints.
     ///
     /// Returns (lower_bound, upper_bound) if constrained, where each bound may be None.
-    /// O(1) complexity via two-level HashMap lookup, mirroring `relu_lookup` (#4315).
+    /// O(1) complexity via two-level HashMap lookup, mirroring `relu_lookup`.
     pub fn is_genbab_constrained(
         &self,
         node_name: &str,
@@ -236,7 +236,7 @@ impl GraphSplitHistory {
     ///
     /// Returns `true` if the neuron has any constraint (ReLU binary or GenBaB split-point).
     /// Use this instead of `is_constrained()` when both constraint types should be considered,
-    /// e.g. when determining whether a neuron should be skipped for branching. (#2399)
+    /// e.g. when determining whether a neuron should be skipped for branching.
     pub fn is_any_constrained(&self, node_name: &str, neuron_idx: usize) -> bool {
         if self.is_constrained(node_name, neuron_idx).is_some() {
             return true;

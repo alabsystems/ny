@@ -4,7 +4,7 @@
 
 //! Benchmarks for f16 compressed bounds.
 //!
-//! Run with: cargo bench -p ny-tensor -- Compressed
+//! Run with: targo --unverified bench -p ny-tensor -- Compressed
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use ndarray::{ArrayD, IxDyn};

@@ -9,8 +9,6 @@
 //! assert element-by-element equivalence within FP tolerance.
 //!
 //! Pattern from `batchnorm_batched_matches_scalar` (commit a073f40).
-//!
-//! Part of #3247.
 
 use crate::layers::arithmetic::{
     AddConstantLayer, DivConstantLayer, MulConstantLayer, SubConstantLayer,
@@ -22,6 +20,7 @@ use crate::layers::trigonometric::SigmoidLayer;
 use crate::layers::{Layer, LinearLayer, ReshapeLayer, TransposeLayer};
 use crate::{BatchedLinearBounds, LinearBounds};
 use ndarray::{Array1, Array2, ArrayD, IxDyn};
+use ny_core::NyError;
 use ny_tensor::BoundedTensor;
 use proptest::prelude::*;
 
@@ -30,7 +29,7 @@ use proptest::prelude::*;
 /// Most batched/scalar pairs reuse the exact same math and should match bit-for-bit.
 /// `AddConstant`/`SubConstant` bias paths are the exception: scalar uses `dot_bias_f64`
 /// while batched does `sum_axis` then one multiply, so f64 evaluation order can differ
-/// by about one f32 ULP after directed rounding. (#3255)
+/// by about one f32 ULP after directed rounding.
 #[derive(Clone, Copy)]
 struct EquivTolerances {
     coefficient: f32,
@@ -168,7 +167,6 @@ proptest! {
     ///
     /// y = x * c. CROWN backward scales coefficient columns by c.
     /// Both paths should produce identical results modulo FP ordering.
-    /// Part of #3247.
     #[ntest::timeout(10000)]
     #[test]
     fn mulconstant_batched_matches_scalar(
@@ -210,7 +208,6 @@ proptest! {
     /// DivConstant batched CROWN matches scalar CROWN.
     ///
     /// y = x / c. DivConstant delegates to MulConstant(1/c) internally.
-    /// Part of #3247.
     #[ntest::timeout(10000)]
     #[test]
     fn divconstant_batched_matches_scalar(
@@ -254,7 +251,6 @@ proptest! {
     /// y = x + c. CROWN backward: A unchanged, bias += A @ c.
     /// The batched path uses f64 accumulation + directed rounding for the
     /// row-sum (A @ c) computation. Scalar path should match.
-    /// Part of #3247.
     #[ntest::timeout(10000)]
     #[test]
     fn addconstant_batched_matches_scalar(
@@ -299,7 +295,6 @@ proptest! {
     /// SubConstant (y = x - c) batched CROWN matches scalar CROWN.
     ///
     /// CROWN backward: A unchanged, bias -= A @ c.
-    /// Part of #3247.
     #[ntest::timeout(10000)]
     #[test]
     fn subconstant_batched_matches_scalar(
@@ -336,7 +331,6 @@ proptest! {
     /// SubConstant reverse (y = c - x) batched CROWN matches scalar CROWN.
     ///
     /// Reverse negates coefficients and shifts bias. Tests sign-flip path.
-    /// Part of #3247.
     #[ntest::timeout(10000)]
     #[test]
     fn subconstant_reverse_batched_matches_scalar(
@@ -383,7 +377,6 @@ proptest! {
     /// For W=[4x3], bias=[4], input dim=3, output dim=4.
     /// Incoming bounds: [2x4] (2 output rows, 4 intermediate dims).
     /// After backward through Linear: new A is [2x3], new b is [2].
-    /// Part of #3247.
     #[ntest::timeout(10000)]
     #[test]
     fn linear_batched_matches_scalar(
@@ -432,7 +425,6 @@ proptest! {
     /// Linear layer no-bias batched CROWN matches scalar.
     ///
     /// Tests the path where bias is None — only weight multiplication.
-    /// Part of #3247.
     #[ntest::timeout(10000)]
     #[test]
     fn linear_nobias_batched_matches_scalar(
@@ -480,13 +472,20 @@ proptest! {
 // RESHAPE BATCHED CROWN EQUIV
 // =============================================================================
 //
-// Reshape is a passthrough in batched mode (bounds.clone()). The scalar path
-// also doesn't modify coefficient matrices for Reshape. This test confirms
-// that the batched passthrough produces the same result as scalar propagation
-// by going through the Layer enum's `propagate_crown_backward_batched` dispatch,
-// which includes `validate_flatten_like` validation.
+// Reshape moves no coefficient in batched mode, and the scalar path does not
+// modify coefficient matrices for Reshape either. This test confirms that the
+// batched step produces the same result as scalar propagation by going
+// through the Layer enum's `propagate_crown_backward_batched` dispatch.
 //
-// Fix for #3253: previous test was vacuous — it compared raw input against
+// The incoming carrier indexes the reshape's AUTHORED OUTPUT. The dispatch
+// (`ReshapeLayer::try_remap_global_batched`) authenticates the carrier's
+// `input_shape` against that output and only then relabels it with the
+// pre-activation shape; a carrier of the same volume and another layout is
+// refused, because equal volumes cannot tell a stale transpose or another
+// edge's carrier from the right one
+// (`batched_reshape_rejects_stale_global_metadata_with_the_same_volume`).
+//
+// An earlier version of this test was vacuous: it compared raw input against
 // itself without calling propagate_linear_batched.
 
 proptest! {
@@ -495,8 +494,9 @@ proptest! {
     /// Reshape batched CROWN matches scalar CROWN via Layer dispatch.
     ///
     /// Exercises the actual `propagate_crown_backward_batched` path on the
-    /// Layer enum, which runs `validate_flatten_like` before the passthrough.
-    /// Part of #3247, Fixes #3253.
+    /// Layer enum: a carrier over the authored output `[3, 2]` comes back
+    /// relabelled with the pre-activation shape `[6]` and numerically
+    /// untouched, and the same carrier labelled `[6]` is refused.
     #[ntest::timeout(10000)]
     #[test]
     fn reshape_batched_matches_scalar(
@@ -505,23 +505,34 @@ proptest! {
         lower_b_vals in prop::collection::vec(-5.0f32..5.0, 2),
         upper_b_vals in prop::collection::vec(-5.0f32..5.0, 2),
     ) {
-        let num_in = 6;  // flattened: 2*3 = 6
+        let num_in = 6;  // flattened: 3*2 = 6
         let num_out = 2;
+        let authored_output = vec![3_usize, 2];
 
         let layer = ReshapeLayer::new(vec![3, 2]);
 
-        let (scalar_bounds, batched_bounds) = build_bounds_pair(
+        // `build_bounds_pair` labels its batched carrier with the flat
+        // `[num_in]`: the stale layout. The authored carrier holds the same
+        // numbers under the reshape's output shape.
+        let (scalar_bounds, stale_bounds) = build_bounds_pair(
             num_out, num_in,
             lower_a_vals, lower_b_vals,
             upper_a_vals, upper_b_vals,
+        );
+        let batched_bounds = BatchedLinearBounds::from_parts_unchecked(
+            scalar_bounds.lower_a.clone().into_dyn(),
+            scalar_bounds.lower_b.clone().into_dyn(),
+            scalar_bounds.upper_a.clone().into_dyn(),
+            scalar_bounds.upper_b.clone().into_dyn(),
+            authored_output,
+            vec![num_out],
         );
 
         let expected = layer.propagate_linear(&scalar_bounds)
             .map_err(|e| TestCaseError::fail(format!("scalar CROWN failed: {e}")))?
             .into_owned();
 
-        // Call through the Layer enum dispatch to exercise the real batched path
-        // including validate_flatten_like validation.
+        // Call through the Layer enum dispatch to exercise the real batched path.
         let layer_enum = Layer::Reshape(layer);
         let pre_act_lower = ArrayD::from_elem(IxDyn(&[num_in]), -1.0f32);
         let pre_act_upper = ArrayD::from_elem(IxDyn(&[num_in]), 1.0f32);
@@ -532,7 +543,18 @@ proptest! {
             .propagate_crown_backward_batched(&batched_bounds, Some(&pre_activation), None)
             .map_err(|e| TestCaseError::fail(format!("batched CROWN failed: {e}")))?;
 
+        prop_assert_eq!(actual.input_shape(), &[num_in][..]);
+        prop_assert_eq!(actual.output_shape(), &[num_out][..]);
         assert_batched_equiv(&actual, &expected, "Reshape", EXACT_EQUIV_TOLERANCES)?;
+
+        let stale = layer_enum
+            .propagate_crown_backward_batched(&stale_bounds, Some(&pre_activation), None);
+        prop_assert!(
+            matches!(stale, Err(NyError::InvalidSpec(_))),
+            "a carrier labelled [{}] for a reshape to [3, 2] must be refused, got {:?}",
+            num_in,
+            stale.map(|bounds| bounds.input_shape().to_vec())
+        );
     }
 }
 
@@ -551,7 +573,6 @@ proptest! {
     /// For input shape [2, 3] (6 elements), Transpose([1,0]) produces [3, 2].
     /// The scalar path uses propagate_linear, the batched path uses
     /// propagate_linear_batched with input_shape set.
-    /// Part of #3247.
     #[ntest::timeout(10000)]
     #[test]
     fn transpose_batched_matches_scalar(
@@ -585,7 +606,6 @@ proptest! {
     ///
     /// For input shape [2, 3, 2] (12 elements), Transpose([2,0,1]) -> [2, 2, 3].
     /// Tests a more complex permutation pattern.
-    /// Part of #3247.
     #[ntest::timeout(10000)]
     #[test]
     fn transpose_3d_batched_matches_scalar(
@@ -617,13 +637,12 @@ proptest! {
 }
 
 // =============================================================================
-// TRANSPOSE GROUPED MULTI-DIMENSIONAL BATCHED CROWN EQUIV (#4171)
+// TRANSPOSE GROUPED MULTI-DIMENSIONAL BATCHED CROWN EQUIV
 // =============================================================================
 //
 // When incoming BatchedLinearBounds have grouped (multi-dimensional) batch
 // dimensions, TransposeLayer must flatten to block-diagonal before permuting.
-// This proptest verifies the flat-grouped path introduced in #4171 Packet A
-// matches the scalar oracle.
+// This proptest verifies that the flat-grouped path matches the scalar oracle.
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(100) })]
@@ -634,7 +653,6 @@ proptest! {
     /// identity shape [2, 3] produces grouped bounds with batch_dims=[2], dim=3.
     /// Transpose([1,0]) swaps axis 0 and 1 on the input shape [3, 2] → output [2, 3].
     /// The flatten_to_block_diagonal path produces a flat [6, 6] A matrix.
-    /// Part of #4171 Packet B.
     #[ntest::timeout(10000)]
     #[test]
     fn transpose_grouped_2d_identity_matches_scalar_4171(
@@ -686,7 +704,6 @@ proptest! {
     /// Tests a 3D grouped identity which exercises the full flatten path with
     /// batch_dims=[1, 3], dim=4 (Kokoro-shaped). Uses batched_transpose() which
     /// auto-swaps the last two dimensions: [1, 4, 3] -> [1, 3, 4].
-    /// Part of #4171 Packet B.
     #[ntest::timeout(10000)]
     #[test]
     fn transpose_grouped_3d_identity_matches_scalar_4171(
@@ -743,7 +760,6 @@ proptest! {
     ///
     /// kernel=(1,1,2,2), stride=(1,1), pad=(0,0), input=(3,3), output=(2,2).
     /// conv_out_size=4, conv_in_size=9. Incoming bounds: [2,4] -> output: [2,9].
-    /// Part of #3247.
     #[ntest::timeout(60000)]
     #[test]
     fn conv2d_batched_matches_scalar(
@@ -794,7 +810,6 @@ proptest! {
     /// Conv2d (no bias) batched CROWN matches scalar CROWN.
     ///
     /// Tests the path where bias is None — only conv_transpose affects coefficients.
-    /// Part of #3247.
     #[ntest::timeout(60000)]
     #[test]
     fn conv2d_nobias_batched_matches_scalar(
@@ -850,7 +865,6 @@ proptest! {
     ///
     /// kernel=(1,1,3), stride=1, pad=0, input_len=5, output_len=3.
     /// conv_out_size=3, conv_in_size=5. Incoming bounds: [2,3] -> output: [2,5].
-    /// Part of #3247.
     #[ntest::timeout(60000)]
     #[test]
     fn conv1d_batched_matches_scalar(
@@ -890,7 +904,6 @@ proptest! {
     /// Conv1d (no bias) batched CROWN matches scalar CROWN.
     ///
     /// Tests the no-bias path where only conv1d_transpose affects coefficients.
-    /// Part of #3247.
     #[ntest::timeout(60000)]
     #[test]
     fn conv1d_nobias_batched_matches_scalar(
@@ -932,7 +945,6 @@ proptest! {
 // First batched-vs-scalar equivalence proptest for a nonlinear elementwise
 // activation. Tests the `crown_elementwise_backward_batched` code path that
 // ALL elementwise activations share via the `impl_elementwise_activation!` macro.
-// Part of #3400.
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(500) })]
@@ -946,7 +958,6 @@ proptest! {
     /// Tests with 3 input neurons and 2 output neurons (bound rows).
     /// Pre-activation bounds are drawn from [-5, 5] to cover the full sigmoid
     /// transition (near-zero sigmoid, mid-range, and near-one sigmoid).
-    /// Part of #3400.
     #[ntest::timeout(10000)]
     #[test]
     fn sigmoid_batched_matches_scalar(

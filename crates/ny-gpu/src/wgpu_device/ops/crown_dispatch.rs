@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! CROWN backward GPU shader dispatch helpers (#3397).
+//! CROWN backward GPU shader dispatch helpers.
 //!
 //! Contains shared types and compute pass submission/encoding helpers.
 //! The batched backward path in `crown_backward.rs` builds bind groups
@@ -18,7 +18,7 @@ impl WgpuDevice {
     ///
     /// Used by the batched CROWN backward path to accumulate all dispatch
     /// passes into a single command encoder, eliminating per-dispatch submit
-    /// overhead (#3397).
+    /// overhead.
     pub(super) fn encode_compute(
         encoder: &mut wgpu::CommandEncoder,
         label: &'static str,

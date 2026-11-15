@@ -14,11 +14,6 @@
 //! - Concatenated constraint headers from all domains
 //! - Concatenated coefficients and indices
 //! - Domain offset array for O(1) per-domain constraint lookup
-//!
-//! # Sources
-//!
-//! - Design doc: `designs/2026-01-29-gpu-constraint-buffer-layout.md`
-//! - Issue: #226, #256
 
 use ny_propagate::BatchedConstraintBuffer;
 use wgpu::util::{BufferInitDescriptor, DeviceExt};

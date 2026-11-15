@@ -1,0 +1,25 @@
+# ROUTER ADMISSION DEBT (#router-r1, ROUTER_PROGRAM §3.2 C2, §11.1 file 19) — registered
+# capabilities whose OWN admission predicate the router cannot evaluate at start, so it
+# reports Unknown (a refusal: today's route runs).
+#
+# Columns:  capability-id <TAB> kind <TAB> where the admission lives
+#   inline      the admission is inline in a lane body (refactor it into a named function
+#               the lane and the registry both call, then delete the row)
+#   uncallable  a named predicate exists but needs an input the router must never build
+#               (a loaded graph, a parsed specification)
+#
+# A RATCHET THAT MAY ONLY FALL: `router_admission_debt_matches_manifest` (ny-cli, --bin ny)
+# fails on any delta. Removing a row is the payoff of making an admission callable; adding
+# one means a new capability shipped without a callable predicate. Authored with the registry
+# in the same commit (it is the registry's own data, printed by the test on any mismatch).
+box_refine.screen	inline	ny-cli model_load.rs: >=512-clause box disjunction
+attack.upfront_apgd	inline	vnncomp.rs D14: differentiable graph, <=5-input common-RHS conjunction
+attack.disjunctive_pgd	inline	verify/disjunctive.rs: disjunctive specification
+attack.bnn_lp	inline	vnncomp.rs D17: Sign present (sign-space LP lane)
+attack.bnn_ste	inline	vnncomp.rs D17: Sign present (STE-PGD lane, fixed anneal)
+nonlinear_vnnlib	inline	vnncomp.rs D45: the affine parser refused the specification
+lowdim	uncallable	ny_propagate::lowdim::admit
+mip.ay	inline	vnncomp.rs D27: encodable, <=5M params, unstable budget
+input_split	inline	preset/branching.rs resolve_branching + engine input-split route
+relu_split.graph	inline	loader lowers the graph (run_bab_with_fallback)
+margin-row	inline	vnncomp.rs D20: robustness spec, extract_twin_spec, head compiles, tableau <= 2^30

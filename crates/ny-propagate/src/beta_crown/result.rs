@@ -84,6 +84,74 @@ pub fn take_global_timeout_deadline_source() -> Option<Instant> {
     })
 }
 
+/// How the sequential initial phase disposed of an early quit
+/// (#seq-early-attack).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequentialEarlyQuitDisposition {
+    /// The initial phase completed inside its warmup cap; no early quit.
+    None,
+    /// The warmup cap expired and the post-BaB PGD fallback was consulted
+    /// before the Timeout was published.
+    Attacked,
+    /// The warmup cap expired and the historical forfeit was kept
+    /// (`sequential_early_quit_attack: false`).
+    ForfeitedByKillSwitch,
+}
+
+/// Receipt of the sequential initial phase's time schedule
+/// (#seq-single-reserve / #seq-early-attack).
+///
+/// Observation only: recorded by `verify_phases/initial.rs` AFTER the
+/// schedule has been computed and consumed, taken by the CLI to emit the
+/// lever's flight note. Nothing reads it back into scheduling or verdict
+/// authority.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SequentialInitialScheduleReceipt {
+    /// The effective total window the engine derived its phases from, secs.
+    pub effective_total_secs: f64,
+    /// The BaB search boundary (engine single reserve kept), secs.
+    pub bab_timeout_secs: f64,
+    /// The warmup cap actually used, secs.
+    pub warmup_cap_secs: f64,
+    /// Whether the warmup cap was based on the caller's ledger-true boundary
+    /// (the reserve NOT double-taken).
+    pub warmup_single_reserve_applied: bool,
+    /// Whether the engine was handed an explicit caller deadline.
+    pub caller_deadline: bool,
+    /// How an early quit, if any, was disposed of.
+    pub early_quit: SequentialEarlyQuitDisposition,
+}
+
+thread_local! {
+    /// Last sequential initial-phase schedule receipt on this thread.
+    ///
+    /// Same seam discipline as `GLOBAL_TIMEOUT_DEADLINE_SOURCE`: the CLI
+    /// resets before one top-level invocation and takes after it. Overwrite
+    /// semantics (last write wins) keep a re-entrant engine call from
+    /// leaking a stale receipt.
+    static SEQUENTIAL_INITIAL_SCHEDULE_RECEIPT: Cell<Option<SequentialInitialScheduleReceipt>> =
+        const { Cell::new(None) };
+}
+
+/// Reset the sequential initial-phase schedule receipt before one top-level
+/// β-CROWN invocation.
+pub fn reset_sequential_initial_schedule_receipt() {
+    SEQUENTIAL_INITIAL_SCHEDULE_RECEIPT.with(|cell| cell.set(None));
+}
+
+/// Record (or overwrite) the sequential initial-phase schedule receipt.
+pub(crate) fn record_sequential_initial_schedule_receipt(
+    receipt: SequentialInitialScheduleReceipt,
+) {
+    SEQUENTIAL_INITIAL_SCHEDULE_RECEIPT.with(|cell| cell.set(Some(receipt)));
+}
+
+/// Take the sequential initial-phase schedule receipt after the
+/// corresponding engine invocation.
+pub fn take_sequential_initial_schedule_receipt() -> Option<SequentialInitialScheduleReceipt> {
+    SEQUENTIAL_INITIAL_SCHEDULE_RECEIPT.with(|cell| cell.take())
+}
+
 #[derive(Debug, Clone)]
 pub struct BetaCrownResult {
     /// Verification result.
@@ -187,12 +255,12 @@ impl BabVerificationStatus {
 /// Uses `Bound::new_allow_infinite` since β-CROWN may produce infinite bounds
 /// in timeout or unknown cases (e.g., bounds that exploded during propagation).
 ///
-/// NaN sanitization (#2663): If any element is NaN (from upstream numerical
+/// NaN sanitization: If any element is NaN (from upstream numerical
 /// instability that escaped the optimization loop guards), it is replaced with
 /// the conservative bound (-inf, +inf). `Bound::new_allow_infinite` asserts
 /// non-NaN, so passing NaN through would panic.
 ///
-/// Inverted bound repair (#3216, #3307): finite inversions are repaired via the
+/// Inverted bound repair: finite inversions are repaired via the
 /// shared `ny_tensor::repair_inverted_bounds(..., InversionRepair::Swap)`
 /// helper so Beta-CROWN export uses the same swap strategy as SMT export and
 /// bounded-tensor constructors.
@@ -415,7 +483,7 @@ mod tests {
         assert!(bounds[0].upper().is_infinite());
     }
 
-    /// Regression test for #2663: NaN bounds must be sanitized to conservative
+    /// Regression test: NaN bounds must be sanitized to conservative
     /// (-inf, +inf) instead of panicking in Bound::new_allow_infinite.
     #[ntest::timeout(5000)]
     #[test]
@@ -443,7 +511,7 @@ mod tests {
         assert!((bounds[2].upper() - 1.5).abs() < 1e-6);
     }
 
-    /// Regression test for #3216: inverted bounds from CROWN numerical instability
+    /// Regression test: inverted bounds from CROWN numerical instability
     /// must be swapped (sound over-approximation), not panic.
     #[ntest::timeout(5000)]
     #[test]
@@ -469,7 +537,7 @@ mod tests {
         assert!((bounds[2].upper() - 3.0).abs() < 1e-6);
     }
 
-    /// Regression test for #3216: end-to-end — BetaCrownResult with inverted output
+    /// Regression test: end-to-end — BetaCrownResult with inverted output
     /// bounds converts to VerificationResult without panicking.
     #[ntest::timeout(5000)]
     #[test]

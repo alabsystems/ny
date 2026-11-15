@@ -77,7 +77,7 @@ pub(in crate::native) fn build_mlp_network(
             layers.push(LayerSpec {
                 name: format!("layer{}_relu", idx),
                 layer_type: LayerType::ReLU,
-                inputs: vec![output_name.clone()],
+                inputs: vec![output_name],
                 outputs: vec![relu_out.clone()],
                 weights: None,
                 attributes: HashMap::new(),

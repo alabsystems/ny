@@ -86,7 +86,7 @@ impl BetaCrownVerifier {
                 }
 
                 let width = u - l;
-                // Skip NaN widths — corrupt bounds must not be selected (#2588).
+                // Skip NaN widths — corrupt bounds must not be selected.
                 if width.is_nan() {
                     continue;
                 }
@@ -163,7 +163,7 @@ impl BetaCrownVerifier {
                 })
                 .main_score;
 
-            // Skip NaN-scored neurons — corrupt scores must not be selected (#2588).
+            // Skip NaN-scored neurons — corrupt scores must not be selected.
             if score.is_nan() {
                 continue;
             }
@@ -269,7 +269,7 @@ impl BetaCrownVerifier {
             ));
         }
 
-        // Get top-k by BaBSR score (higher is better - "alpha" score, NaN last — #2995)
+        // Get top-k by BaBSR score (higher is better - "alpha" score, NaN last)
         let mut babsr_ranked = scored.clone();
         babsr_ranked.sort_by(|a, b| crate::cmp_utils::nan_last_descending_cmp(&a.2, &b.2));
 
@@ -313,7 +313,7 @@ impl BetaCrownVerifier {
                 None => continue,
             };
 
-            // Skip NaN-scored candidates — corrupt scores must not win (#2588).
+            // Skip NaN-scored candidates — corrupt scores must not win.
             if fsb_score.is_nan() {
                 continue;
             }
@@ -451,7 +451,7 @@ impl BetaCrownVerifier {
             }
         }
 
-        // Get top-k by BaBSR/main score (higher is better, NaN last — #2995)
+        // Get top-k by BaBSR/main score (higher is better, NaN last)
         let mut main_ranked = scored.clone();
         main_ranked.sort_by(|a, b| crate::cmp_utils::nan_last_descending_cmp(&a.2, &b.2));
 
@@ -466,7 +466,7 @@ impl BetaCrownVerifier {
         }
 
         if !intercept_only {
-            // Backup ranking keeps the #2539 ascending-order contract for regular kFSB.
+            // Backup ranking keeps the ascending-order contract for regular kFSB.
             let mut intercept_ranked = scored.clone();
             intercept_ranked.sort_by(|a, b| crate::cmp_utils::nan_propagating_cmp(&a.3, &b.3));
 
@@ -506,7 +506,7 @@ impl BetaCrownVerifier {
                 KfsbReduceOp::Mean => f32::midpoint(active_val, inactive_val), // Balanced
             };
 
-            // Skip NaN-scored candidates — corrupt scores must not win (#2588).
+            // Skip NaN-scored candidates — corrupt scores must not win.
             if kfsb_score.is_nan() {
                 continue;
             }
@@ -605,7 +605,7 @@ impl BetaCrownVerifier {
                 })?;
 
             if is_active {
-                // NaN-safe: propagate NaN instead of silently clamping to 0.0 (#2643)
+                // NaN-safe: propagate NaN instead of silently clamping to 0.0
                 lower_flat[[neuron_idx]] = nan_propagating_max(lower_flat[[neuron_idx]], 0.0);
             } else {
                 upper_flat[[neuron_idx]] = nan_propagating_min(upper_flat[[neuron_idx]], 0.0);
@@ -736,7 +736,7 @@ impl BetaCrownVerifier {
                 Layer::Sign(_) => {
                     // For Sign, record coefficients (same structure as ReLU) and
                     // apply Sign fixed-CROWN proxy slopes for backward propagation.
-                    // Part of #3769: Sign neurons are zero-threshold branching candidates.
+                    // Sign neurons are zero-threshold branching candidates.
                     let flat = pre_bounds.flatten();
                     let num_neurons = current_coeffs.ncols().min(flat.len());
 
@@ -767,7 +767,7 @@ impl BetaCrownVerifier {
                     // Coefficients computed for layers above this point are still
                     // valid branching scores. Continuing with identity passthrough
                     // would produce incorrect scores for layers below, potentially
-                    // causing suboptimal branching decisions (#2271).
+                    // causing suboptimal branching decisions.
                     tracing::debug!(
                         "compute_crown_coefficients: stopping at unsupported layer {} ({})",
                         layer_idx,
@@ -787,6 +787,9 @@ impl BetaCrownVerifier {
         domain: &BabDomain,
         reduce_op: KfsbReduceOp,
     ) -> Result<std::collections::HashMap<(usize, usize), BabsrScoreParts>> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost =
+            ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BranchPrescore);
         let mut scores = std::collections::HashMap::new();
 
         if network.layers.is_empty() {
@@ -886,6 +889,9 @@ impl BetaCrownVerifier {
         network: &Network,
         domain: &BabDomain,
     ) -> Result<std::collections::HashMap<(usize, usize), f32>> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost =
+            ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BranchPrescore);
         let mut scores = std::collections::HashMap::new();
 
         if network.layers.is_empty() {

@@ -181,7 +181,7 @@ fn logsoftmax_ibp_nonfinite_fallback() {
     // Non-finite input triggers the conservative fallback: [-inf, +inf] per
     // element. new_repaired preserves the ±Inf endpoints — a non-finite
     // endpoint proves nothing, so any finite substitute would be an unsound
-    // tightening (#3423).
+    // tightening.
     assert!(
         output.lower().iter().all(|&v| v == f32::NEG_INFINITY),
         "fallback lower should be -inf, got {:?}",
@@ -194,7 +194,7 @@ fn logsoftmax_ibp_nonfinite_fallback() {
     );
 }
 
-/// Regression test for #2713: all-NEG_INFINITY inputs must NOT produce NaN.
+/// Regression test: all-NEG_INFINITY inputs must NOT produce NaN.
 /// The input guard returns conservative ±inf bounds (via new_repaired),
 /// which prevents NaN from propagating through ln(sum_exp).
 #[test]
@@ -225,13 +225,13 @@ fn logsoftmax_ibp_all_neg_infinity_no_nan_2713() {
     }
 }
 
-// ========== NaN integration tests (#2627) ==========
+// ========== NaN integration tests ==========
 // LogSoftmax IBP has a non-finite input guard at logsoftmax/mod.rs:118-126:
 // any NaN/Inf in input → conservative bounds via new_repaired. These tests
 // verify the fold site (nan_propagating_max in logsumexp_directed) integrates
 // correctly with the guard.
 
-/// NaN in lower bound triggers conservative fallback (#2627).
+/// NaN in lower bound triggers conservative fallback.
 #[test]
 fn logsoftmax_ibp_nan_in_lower_fallback_2627() {
     let layer = LogSoftmaxLayer::new(-1);
@@ -262,7 +262,7 @@ fn logsoftmax_ibp_nan_in_lower_fallback_2627() {
     }
 }
 
-/// NaN in upper bound triggers conservative fallback (#2627).
+/// NaN in upper bound triggers conservative fallback.
 #[test]
 fn logsoftmax_ibp_nan_in_upper_fallback_2627() {
     let layer = LogSoftmaxLayer::new(-1);
@@ -284,7 +284,7 @@ fn logsoftmax_ibp_nan_in_upper_fallback_2627() {
     );
 }
 
-/// All-NaN input triggers conservative fallback with no NaN in output (#2627).
+/// All-NaN input triggers conservative fallback with no NaN in output.
 #[test]
 fn logsoftmax_ibp_all_nan_fallback_2627() {
     let layer = LogSoftmaxLayer::new(-1);
@@ -624,7 +624,7 @@ fn logsoftmax_crown_nonfinite_preact_returns_constant() {
     }
 }
 
-/// Regression test for #2713: CROWN with all-NEG_INFINITY pre-activation
+/// Regression test: CROWN with all-NEG_INFINITY pre-activation
 /// must not produce NaN. The sound path guard (crown.rs:127-134) detects
 /// non-finite pre-activation bounds and returns constant fallback bounds.
 #[test]
@@ -846,7 +846,7 @@ fn logsoftmax_crown_backward_with_preact_succeeds() {
     );
 }
 
-// ========== Preserve-leading-axis tests (#4096) ==========
+// ========== Preserve-leading-axis tests ==========
 
 fn make_bt_2d(lower: &[f32], upper: &[f32], shape: &[usize]) -> BoundedTensor {
     BoundedTensor::new(
@@ -857,7 +857,7 @@ fn make_bt_2d(lower: &[f32], upper: &[f32], shape: &[usize]) -> BoundedTensor {
 }
 
 /// Positive stored axis under preserve-leading-axis mode should shift right
-/// by one, matching the sequential result. Part of #4096.
+/// by one, matching the sequential result.
 #[test]
 fn logsoftmax_preserve_leading_axis_restores_positive_axis_4096() {
     // Simulate: ONNX LogSoftmax(axis=2) on [seq, hidden, vocab] stored as axis=1.

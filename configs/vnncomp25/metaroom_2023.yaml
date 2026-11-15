@@ -127,12 +127,9 @@ bab:
     # `reduceop: max`. Without arm A passing, arm B measures a code change and a
     # config change at once.
     candidates: 10
-    reduceop: max
   alpha_crown:
     lr_alpha: 0.25
-    iterations: 100
   beta_crown:
-    lr_alpha: 0.1
     lr_beta: 0.2
     iterations: 50
 

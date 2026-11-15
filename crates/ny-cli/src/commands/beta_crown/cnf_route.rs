@@ -299,7 +299,15 @@ fn solve_gate(
 
     let mut solver = Solver::new(cnf.n_vars);
     solver.set_preprocess_enabled(false);
-    solver.set_solve_deadline(deadline);
+    // `deadline` is a std wall instant. It enters ay-sat through ay's own
+    // `From` into `ay_core::time::Instant`, so this call keeps compiling when
+    // ay's clock seam (Trust's determinism plan, P4a) makes that type a
+    // newtype; until then the conversion is the identity.
+    #[expect(
+        clippy::useless_conversion,
+        reason = "identity while ay's Instant re-exports std's; delete once ay's clock seam makes it a newtype"
+    )]
+    solver.set_solve_deadline(deadline.map(Into::into));
     for clause in clauses {
         solver.add_clause(clause.iter().copied().map(Literal::from_dimacs).collect());
     }

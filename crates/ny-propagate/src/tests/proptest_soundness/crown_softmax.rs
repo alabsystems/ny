@@ -12,8 +12,6 @@
 //! - IBP: per-row softmax over active (causal-masked) positions
 //! - CROWN sound: falls back to IBP-derived constant bounds
 //! - CROWN heuristic: Jacobian-based linearization with sampling error estimation
-//!
-//! Part of #1950.
 
 use crate::layers::common::BoundPropagation;
 use crate::layers::softmax::CausalSoftmaxLayer;
@@ -66,7 +64,6 @@ proptest! {
     /// A_l @ x + b_l <= softmax(x) <= A_u @ x + b_u.
     ///
     /// Uses 3-element input to keep vertex enumeration tractable (2^3 = 8 vertices).
-    /// Part of #1950.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_softmax_crown_sound_3d(
@@ -123,7 +120,6 @@ proptest! {
     ///
     /// Tests that CROWN bounds are also tight for narrow intervals — the LSE-based
     /// affine bounds should converge to the Jacobian as epsilon → 0.
-    /// Part of #1950.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_softmax_crown_sound_tight(
@@ -179,7 +175,6 @@ proptest! {
     ///
     /// Each row of the 2D tensor is independently normalized via softmax.
     /// CROWN bounds should contain the true output for all sampled inputs.
-    /// Part of #1950.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_softmax_crown_sound_2d(
@@ -256,7 +251,6 @@ proptest! {
     /// Softmax IBP soundness: bounds contain true softmax output at sampled points.
     ///
     /// For a 3-element interval box, we verify all 8 vertices plus center.
-    /// Part of #1950.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_softmax_ibp_3d(
@@ -322,7 +316,6 @@ proptest! {
     ///
     /// The causal mask means row i computes softmax over positions 0..=i only.
     /// IBP must handle the masking correctly: masked positions should always be 0.
-    /// Part of #1950.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_causal_softmax_ibp_3x3(
@@ -397,7 +390,6 @@ proptest! {
     /// Causal softmax IBP with vertex enumeration for a 2x2 attention matrix.
     ///
     /// Small enough (4 elements, 2^4 = 16 vertices) to check ALL vertices per proptest case.
-    /// Part of #1950.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_causal_softmax_ibp_2x2_exhaustive(
@@ -459,7 +451,6 @@ proptest! {
     ///
     /// Sound mode falls back to IBP-derived constant bounds, so CROWN bounds
     /// should contain true causal softmax at all vertices.
-    /// Part of #1950.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_causal_softmax_crown_sound_2x2(
@@ -529,7 +520,7 @@ proptest! {
 // =============================================================================
 
 /// Tolerance for LogSoftmax IBP.
-/// LogSoftmax uses f64 intermediate + directed rounding (#3245),
+/// LogSoftmax uses f64 intermediate + directed rounding,
 /// so strict (zero) tolerance should hold. We use a tiny tolerance
 /// for the reference computation's own FP error.
 const LOGSOFTMAX_IBP_TOLERANCE: f32 = 1e-5;
@@ -543,7 +534,7 @@ proptest! {
     /// Lower: x_i^L - logsumexp(x^U)
     /// Upper: x_i^U - logsumexp(x^L)
     ///
-    /// Covers the directed rounding refactoring in #3245. Previously this layer
+    /// Covers the directed rounding refactoring. Previously this layer
     /// had only hand-picked unit tests; this proptest exercises random intervals.
     #[ntest::timeout(10000)]
     #[test]
@@ -600,7 +591,7 @@ proptest! {
 
     /// LogSoftmax IBP tight: epsilon-ball inputs produce sound bounds at center.
     ///
-    /// Verifies that with directed rounding (#3245), bounds are sound and
+    /// Verifies that with directed rounding, bounds are sound and
     /// logsoftmax properties hold (all values <= 0, non-inverted intervals).
     #[ntest::timeout(10000)]
     #[test]
@@ -742,9 +733,6 @@ proptest! {
     ///
     /// This path runs in production when attention CROWN backward calls
     /// `flatten_to_block_diagonal` before softmax backward.
-    ///
-    /// Design: designs/2026-03-03-flat-grouped-softmax-crown-testing.md Test 1.
-    /// Part of #3247.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_flat_grouped_softmax_crown_sound(
@@ -853,9 +841,6 @@ proptest! {
     ///
     /// The A coefficients should match exactly (same code path, same inputs).
     /// Bias matches within directed-rounding tolerance from the equal split.
-    ///
-    /// Design: designs/2026-03-03-flat-grouped-softmax-crown-testing.md Test 2.
-    /// Part of #3247.
     #[ntest::timeout(60000)]
     #[test]
     fn flat_grouped_matches_per_group_softmax_crown_sound(

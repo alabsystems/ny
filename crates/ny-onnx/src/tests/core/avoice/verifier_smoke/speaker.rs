@@ -11,8 +11,6 @@ use super::shared::{
 /// `Verifier::verify_graph(...)`. norm_sq is always non-negative.
 ///
 /// Uses IBP for runtime stability on the full real-model graph.
-///
-/// Part of #3654.
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
 #[cfg(feature = "external-avoice")]
@@ -44,11 +42,9 @@ fn test_avoice_speaker_norm_sq_verifier_smoke_3654() {
 /// through `Verifier::verify_graph(...)`.
 ///
 /// This is the speaker analogue of the Kokoro round-trip verifier smoke
-/// (`#4100`). It exercises the `OnnxModel -> GraphModel -> GraphNetwork`
+/// test. It exercises the `OnnxModel -> GraphModel -> GraphNetwork`
 /// path that builder-style downstream consumers use, then verifies the
 /// same scalar `norm_sq >= 0` property through the shared route harness.
-///
-/// Part of #4179.
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
 #[cfg(feature = "external-avoice")]

@@ -48,7 +48,7 @@ use super::kfsb_multi::kfsb_probe_enabled;
 /// `gpu_beta_optimize_wide`), so a wider chunk amortizes the fixed per-pass Metal
 /// dispatch + buffer-alloc + device-wait overhead across more domains. Chunking
 /// still bounds the overrun past the deadline to ~one chunk of β-iteration passes
-/// (the deadline is re-checked between chunks). 2026-07-11 cifar100 A/B: 8→255,
+/// (the deadline is re-checked between chunks). 2026-07-11 cifar100 A/B: 8→255.
 /// A 64-domain chunk was measured at roughly 25 seconds on the held-out
 /// CIFAR-100 path, so it cannot preserve the verifier's five-second tail.
 /// Deadline-scored calls hard-cap even an environment override to this width;
@@ -129,6 +129,57 @@ fn child_uses_dense_spec_adapter(
     !bounded_shared_lane && (gpu_single_pass_lane || !cpu_beta_optimization_applies)
 }
 
+/// Dense-spec partition predicate: `(relu_nodes_present,
+/// first_obj_finite, batchable)` for one child of a batched MO wave.
+///
+/// Extracted so the oracle tests pin the partition law directly. The law:
+/// children carrying `per_disjunct_alphas` ARE batchable — the dense-spec
+/// adapter evaluates them under the SHARED `child.alpha_state`, exactly what
+/// the exact per-child fallback (`eval_child`,
+/// `.with_alpha(&child.alpha_state)`) uses, so relaxation choice is unchanged
+/// on this lane and any α in [0,1] is sound
+/// (docs/REGRESSION_FC_UNSAT_LOST_2026-08-14.md, S3 design map (b)).
+#[inline]
+pub(in crate::beta_crown::engine::graph) fn multi_objective_child_batchable(
+    cuts_inactive: bool,
+    single_pass_branch: bool,
+    child: &MultiObjectiveGraphBabDomain,
+    relu_nodes: &[String],
+) -> (bool, bool, bool) {
+    let relu_nodes_present = relu_nodes
+        .iter()
+        .all(|name| child.node_bounds.contains_key(name));
+    let first_obj_finite = child
+        .objective_bounds
+        .first()
+        .is_some_and(|(l, u)| l.is_finite() && u.is_finite());
+    let batchable = cuts_inactive && single_pass_branch && relu_nodes_present && first_obj_finite;
+    (relu_nodes_present, first_obj_finite, batchable)
+}
+
+/// #vit-v3-bankable: whether a committed kFSB child set is a COMPLETE cover of
+/// its parent as the per-row frame will see it: one child at the parent's own
+/// depth (a terminal parent close), or exactly `2^k` children all at depth
+/// `parent + k` (every side of a depth-`k` commit present). Anything else
+/// omitted an empty side the frame never saw.
+fn kfsb_commit_is_complete(parent_depth: usize, child_depths: impl Iterator<Item = usize>) -> bool {
+    let depths: Vec<usize> = child_depths.collect();
+    let Some(&first) = depths.first() else {
+        return false;
+    };
+    if depths.iter().any(|&d| d != first) || first < parent_depth {
+        return false;
+    }
+    let k = first - parent_depth;
+    if k == 0 {
+        return depths.len() == 1;
+    }
+    u32::try_from(k)
+        .ok()
+        .and_then(|k| 1usize.checked_shl(k))
+        .is_some_and(|expected| depths.len() == expected)
+}
+
 #[inline]
 fn branch_selector_may_use_engine(bounded_shared_lane: bool) -> bool {
     !bounded_shared_lane
@@ -145,6 +196,224 @@ fn batched_child_refusal_has_cpu_fallback(
     error: Option<MultiObjectiveChildEvalError>,
 ) -> bool {
     !bounded_shared_lane && error == Some(MultiObjectiveChildEvalError::PropagationFailure)
+}
+
+// ---------------------------------------------------------------------------
+// Fold observability (unconditional, rate-limited, print-only)
+// ---------------------------------------------------------------------------
+//
+// Two events on this lane had NO observable at all before these lines:
+//
+// * a split whose children BOTH come back `InfeasibleDomain` folds to
+//   `Children([])` — nothing is queued. Under the empty-children rule ("empty = trivially
+//   verified") the lane could then publish `Verified` with the parent's whole
+//   region closed by two error returns and no bound — the 2026-08-30 vit
+//   alarm's silent path. The `[mo-fold] infeasible-pair` line and
+//   `GraphBabLifecycle::domains_infeasible` made it countable; since
+//   #spine-legacy-lanes (M2c certified-infeasibility rule) the queue fold ALSO
+//   raises `unresolved_due_to_propagation_failure` for it, so a drain through
+//   an infeasible pair can no longer finalize `Verified` on any run.
+// * the moment a child receives its first own bound (`update_bounds`), i.e.
+//   the only point where parent-vs-child lift on the straggler row, the
+//   delta-form α flag and the β warm start are all in one scope. The
+//   `[mo-child-birth]` line samples it.
+//
+// Neither line reads an environment variable (a raw `NY_*` read would raise
+// the ny-levers ratchet) and neither touches control flow, a verdict, or a
+// bound: every value printed is a copy of state the fold already holds.
+
+/// Hard cap on `[mo-fold] infeasible-pair` lines per process.
+const MO_FOLD_INFEASIBLE_PAIR_LINES_MAX: u64 = 50;
+static MO_FOLD_INFEASIBLE_PAIR_LINES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The first this-many children per process always print `[mo-child-birth]`.
+const MO_CHILD_BIRTH_UNCONDITIONAL_LINES: u64 = 64;
+/// After the unconditional window, only a child whose straggler-row lift
+/// exceeds this prints.
+const MO_CHILD_BIRTH_LIFT_ALWAYS: f32 = 0.25;
+static MO_CHILD_BIRTH_CHILDREN_SEEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `[mo-fold] infeasible-pair`: a parent every one of whose evaluated children
+/// raised `InfeasibleDomain`, so the fold recorded `Children([])`.
+///
+/// `recorded` is the per-parent `(count, depth, reason)` captured in the
+/// `Infeasible` arm; `None` means `Children([])` arose with NO infeasible child
+/// recorded, which the line reports rather than hides (empty-grep rule).
+fn mo_fold_infeasible_pair_line(parent_idx: usize, recorded: Option<&(usize, usize, String)>) {
+    let n = MO_FOLD_INFEASIBLE_PAIR_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n >= MO_FOLD_INFEASIBLE_PAIR_LINES_MAX {
+        return;
+    }
+    match recorded {
+        Some((count, depth, reason)) => eprintln!(
+            "[mo-fold] infeasible-pair depth={depth} nchild={count} parent={parent_idx} reason={reason}"
+        ),
+        None => eprintln!(
+            "[mo-fold] infeasible-pair depth=? nchild=0 parent={parent_idx} reason=<no infeasible child recorded — Children([]) from another source>"
+        ),
+    }
+    if n + 1 == MO_FOLD_INFEASIBLE_PAIR_LINES_MAX {
+        eprintln!(
+            "[mo-fold] infeasible-pair line cap reached ({MO_FOLD_INFEASIBLE_PAIR_LINES_MAX}); \
+             further pairs are counted in domains_infeasible only"
+        );
+    }
+}
+
+/// Hard cap on `[mo-fold] infeasible-empty` / `infeasible-cover` lines per
+/// process (shared by both sites; the lifecycle counter is never capped).
+const MO_FOLD_INFEASIBLE_SITE_LINES_MAX: u64 = 50;
+static MO_FOLD_INFEASIBLE_SITE_LINES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// #vit-bank-gate: the two remaining infeasibility dispositions on this lane
+/// that the `infeasible-pair` line above does not cover.
+///
+/// * `kind = "empty"`: a NoUnstable domain whose own final constrained
+///   propagation raised `InfeasibleDomain`; it folds VERIFIED and is
+///   now [`MultiObjectiveGraphDomainResult::InfeasibleEmpty`].
+/// * `kind = "cover"`: a split parent none of whose children reached
+///   evaluation; it folds as the conservative `PropagationFailure` and
+///   is now [`MultiObjectiveGraphDomainResult::InfeasibleCoverRefused`].
+///
+/// Both are counted in `GraphBabLifecycle::domains_infeasible` by the queue
+/// fold; this line names WHICH disposition produced the count. Unconditional
+/// (no environment read), rate-limited, print-only.
+fn mo_fold_infeasible_site_line(
+    kind: &str,
+    parent_idx: usize,
+    depth: Option<usize>,
+    outcome: &str,
+    reason: &str,
+) {
+    let n = MO_FOLD_INFEASIBLE_SITE_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n >= MO_FOLD_INFEASIBLE_SITE_LINES_MAX {
+        return;
+    }
+    let depth = depth.map_or_else(|| "?".to_string(), |d| d.to_string());
+    eprintln!(
+        "[mo-fold] infeasible-{kind} depth={depth} parent={parent_idx} outcome={outcome} reason={reason}"
+    );
+    if n + 1 == MO_FOLD_INFEASIBLE_SITE_LINES_MAX {
+        eprintln!(
+            "[mo-fold] infeasible-empty/cover line cap reached ({MO_FOLD_INFEASIBLE_SITE_LINES_MAX}); \
+             further events are counted in domains_infeasible only"
+        );
+    }
+}
+
+/// Hard cap on `[mo-fold] infeasible-sibling` lines per process.
+const MO_FOLD_INFEASIBLE_SIBLING_LINES_MAX: u64 = 50;
+static MO_FOLD_INFEASIBLE_SIBLING_LINES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// #vit-bank-gate (review): `[mo-fold] infeasible-sibling` — a split parent
+/// SOME, but not all, of whose evaluated children raised `InfeasibleDomain`.
+///
+/// Those children are dropped as empty and only the survivors are
+/// queued, so the sub-region they covered is closed by an emptiness claim
+/// exactly as in the `infeasible-pair` case. The fold result, however, is an
+/// ordinary non-empty `Children`, so `GraphBabLifecycle::domains_infeasible`
+/// does NOT count it and `[bab-stop] infeasible=` can read 0 while a verified
+/// drain rested on it.
+///
+/// This line is therefore the event's ONLY observable. The first event in a
+/// process always prints, so a log with no `[mo-fold] infeasible-sibling` line
+/// had none, and a bank gate that requires `infeasible=0` must ALSO require
+/// this line to be absent. Unconditional (no environment read), rate-limited,
+/// print-only: the fold is unchanged.
+fn mo_fold_infeasible_sibling_line(
+    parent_idx: usize,
+    recorded: &(usize, usize, String),
+    survivors: usize,
+) {
+    let n = MO_FOLD_INFEASIBLE_SIBLING_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n >= MO_FOLD_INFEASIBLE_SIBLING_LINES_MAX {
+        return;
+    }
+    let (dropped, depth, reason) = recorded;
+    eprintln!(
+        "[mo-fold] infeasible-sibling depth={depth} dropped={dropped} survivors={survivors} \
+         parent={parent_idx} reason={reason}"
+    );
+    if n + 1 == MO_FOLD_INFEASIBLE_SIBLING_LINES_MAX {
+        eprintln!(
+            "[mo-fold] infeasible-sibling line cap reached ({MO_FOLD_INFEASIBLE_SIBLING_LINES_MAX}); \
+             further sibling drops are NOT counted anywhere"
+        );
+    }
+}
+
+/// Worst UNVERIFIED objective row — the parent's straggler. Mirrors the
+/// `[branch-trace]` selector: lowest lower bound over rows not yet verified,
+/// with NaN reading as `-inf` so it can never be skipped as "fine".
+fn worst_unverified_row(bounds: &[(f32, f32)], verified: &[bool]) -> Option<(usize, f32)> {
+    let mut straggler: Option<(usize, f32)> = None;
+    for (i, (lo, _)) in bounds.iter().enumerate() {
+        if verified.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let lo = if lo.is_nan() { f32::NEG_INFINITY } else { *lo };
+        if straggler.is_none_or(|(_, w)| lo < w) {
+            straggler = Some((i, lo));
+        }
+    }
+    straggler
+}
+
+/// `[mo-child-birth]`: printed immediately BEFORE `update_bounds`, while
+/// `child.objective_bounds` / `child.verified` still hold the INHERITED parent
+/// state, so `parent_lb` is the parent's bound on its straggler row and
+/// `child_lb` is the child's freshly computed (parent-tightened) bound there.
+///
+/// `staged_alpha` is the continuation α the fold is about to install; `None`
+/// means the child keeps its inherited α, in which case the delta-form flag is
+/// read from that. β is the staged warm start (`entries` count, max value;
+/// β ≥ 0 so an empty set reports `0`).
+fn mo_child_birth_line(
+    child: &MultiObjectiveGraphBabDomain,
+    child_bounds: &[(f32, f32)],
+    beta_state: &crate::beta_crown::state::GraphBetaState,
+    staged_alpha: Option<&GraphDomainAlphaState>,
+) {
+    let seen = MO_CHILD_BIRTH_CHILDREN_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let Some((row, parent_lb)) = worst_unverified_row(&child.objective_bounds, &child.verified)
+    else {
+        return;
+    };
+    let child_lb = child_bounds.get(row).map(|(l, _)| *l).unwrap_or(f32::NAN);
+    let lift = child_lb - parent_lb;
+    // Past the unconditional window, print only a clear lift; a NaN lift
+    // (either bound non-finite) never qualifies.
+    let lift_qualifies = lift > MO_CHILD_BIRTH_LIFT_ALWAYS;
+    if seen >= MO_CHILD_BIRTH_UNCONDITIONAL_LINES && !lift_qualifies {
+        return;
+    }
+    let (alpha_delta, alpha_src) = match staged_alpha {
+        Some(alpha) => (alpha.split_refresh(), "staged"),
+        None => (child.alpha_state.split_refresh(), "inherited"),
+    };
+    let beta_max = beta_state
+        .entries
+        .iter()
+        .map(|entry| entry.value)
+        .fold(0.0f32, f32::max);
+    eprintln!(
+        "[mo-child-birth] depth={} straggler={} parent_lb={:.5} child_lb={:.5} lift={:.5} \
+         alpha_delta={} alpha_src={} beta_entries={} beta_max={:.4} seen={}",
+        child.depth,
+        row,
+        parent_lb,
+        child_lb,
+        lift,
+        alpha_delta,
+        alpha_src,
+        beta_state.entries.len(),
+        beta_max,
+        seen,
+    );
 }
 
 /// Return the root split committed by an exhaustive child cover.
@@ -845,7 +1114,7 @@ impl BetaCrownVerifier {
     /// Similar to `process_graph_domains_batched_gpu` but handles multiple objectives.
     /// This batches the CROWN computation across all child domains to improve GPU utilization.
     ///
-    /// Part of #3813: `cut_pool` is a read-only view of the current cutting
+    /// `cut_pool` is a read-only view of the current cutting
     /// planes. The batched path applies existing cuts during CROWN backward
     /// propagation but does not generate or merge new cuts — that happens in
     /// the outer BaB loop after batch results return.
@@ -904,9 +1173,11 @@ impl BetaCrownVerifier {
             // Quick violation check.
             //
             // #violdrop: only the ROOT may be abandoned on a `upper < threshold`
-            // reading — a BaB child's interval is β-derived and its upper end
-            // carries no certificate for the child's sub-region
-            // (`violation_drop_is_certified`). Measured on vit_2023
+            // reading (`violation_drop_is_certified`); a child is kept as an
+            // ordinary frontier domain. (The measured bad child readings came
+            // from the lA warm start seeding children with an incomplete block
+            // on a residual graph — #warm-dag, `propagation/warm_start_guard.rs`
+            // — not from β, which is sound in both directions.) Measured on vit_2023
             // ibp_3_3_8_3005: with only the child-assembly and pop-time sites
             // fixed, the two depth-1 children were still discarded HERE, so the
             // queue still emptied at `explored=3 queue=0 max_depth=1` after
@@ -976,6 +1247,9 @@ impl BetaCrownVerifier {
         // BaB window, so ~30 s (~70%) executes outside every timer. Each stage
         // below is timed separately; gate-off is one cached-bool load per stage
         // and no allocation.
+        // #phase-cost: the unstable scan is the first step of branching.
+        let scan_phase_cost =
+            ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BranchSelect);
         let __t_unstable_scan =
             crate::phase_telemetry::phase_telemetry_enabled().then(Instant::now);
         // Find unstable neurons. The bounded lane serializes its K<=8 wave and
@@ -1024,6 +1298,7 @@ impl BetaCrownVerifier {
                 t.elapsed().as_secs_f64(),
             );
         }
+        drop(scan_phase_cost);
 
         // Separate domains with/without unstable neurons
         let mut domains_with_unstable: Vec<MultiObjDomainWithUnstable<'_>> = Vec::new();
@@ -1096,7 +1371,7 @@ impl BetaCrownVerifier {
                         match Self::objective_bounds_multi(&output, objectives) {
                             Ok(new_bounds) => {
                                 // Defense-in-depth: reject length mismatch instead of
-                                // silent .zip() truncation (#3383).
+                                // silent.zip() truncation.
                                 if new_bounds.len() != thresholds.len() {
                                     debug!(
                                         "batched multi-objective NoUnstable: new_bounds/thresholds length mismatch ({} vs {}) (#3383)",
@@ -1109,6 +1384,9 @@ impl BetaCrownVerifier {
                                     );
                                     continue;
                                 }
+                                // #vit-v3-bankable: the re-bounded parent's rows,
+                                // at its own region, onto the per-row frame.
+                                self.mo_cover_note_bounds(&domain.history, &new_bounds);
                                 let all_verified = new_bounds.iter().zip(thresholds.iter()).all(
                                     |(&(lower, upper), &threshold)| {
                                         crate::BetaCrownConfig::domain_is_verified_for_mode(
@@ -1116,13 +1394,13 @@ impl BetaCrownVerifier {
                                         )
                                     },
                                 );
-                                // #1866: Compute any_violated so the BaB loop can detect
+                                // Compute any_violated so the BaB loop can detect
                                 // conclusive violations in fully-constrained domains.
                                 //
                                 // #violdrop: on a SPLIT leaf (`depth > 0`) this
-                                // reading is not a certificate — the bounds above
-                                // came from a β-augmented backward over the split
-                                // history, which certifies the LOWER end only. A
+                                // reading is not treated as a certificate (policy,
+                                // `violation_drop_is_certified`; the historical bad
+                                // readings were the #warm-dag seed defect, not β). A
                                 // false `any_violated` here reports the run as
                                 // "Some domains conclusively violated the property"
                                 // instead of the TRUTHFUL "No unstable ReLU/Sign
@@ -1178,9 +1456,23 @@ impl BetaCrownVerifier {
                         }
                     }
                     Err(ref e) if e.is_infeasible_domain() => {
-                        // #2926: Infeasible domain = empty = trivially verified.
+                        // Infeasible domain = empty = trivially verified.
                         debug!(error = %e, "Multi-objective NoUnstable infeasible (empty)");
-                        quick_results.insert(idx, MultiObjectiveGraphDomainResult::AlreadyVerified);
+                        // #vit-bank-gate: same verdict as `AlreadyVerified`,
+                        // but counted in `domains_infeasible` and named, so a
+                        // verified drain through emptiness claims is visible.
+                        mo_fold_infeasible_site_line(
+                            "empty",
+                            idx,
+                            Some(domain.depth),
+                            "verified",
+                            &e.to_string(),
+                        );
+                        // #vit-v3-bankable: the emptiness close, with the
+                        // certified slack its message carries (none: the
+                        // per-row frame gives up — an error is never a close).
+                        self.mo_cover_note_infeasible(&domain.history, None, &e.to_string());
+                        quick_results.insert(idx, MultiObjectiveGraphDomainResult::InfeasibleEmpty);
                     }
                     Err(ref e) if e.is_deadline_exceeded() => {
                         quick_results.insert(idx, MultiObjectiveGraphDomainResult::DeadlineExpired);
@@ -1305,12 +1597,23 @@ impl BetaCrownVerifier {
             };
 
         // Branch-selection and child-construction failures preserve whether
-        // the cause was numerical or the authoritative deadline (#2143).
+        // the cause was numerical or the authoritative deadline.
         let create_children = |(idx, domain, unstable): &MultiObjDomainWithUnstable<'_>| {
             // #kfsb-multi: committed winner children, if the wave selector
             // resolved this domain (children_info shape matches the
             // advisory path: 0..=2^d entries, infeasible leaves absent).
             if let Some(pre) = kfsb_precomputed.lock().ok().and_then(|mut m| m.remove(idx)) {
+                // #vit-v3-bankable: a committed kFSB cover that omits a side
+                // (an empty leaf the selector dropped) closes that side with no
+                // record; the per-row frame cannot see it, so it gives up.
+                if self.mo_cover.is_armed()
+                    && !kfsb_commit_is_complete(
+                        domain.depth,
+                        pre.iter().map(|(child, _, _)| child.depth),
+                    )
+                {
+                    self.mo_cover_unbuildable("kfsb_commit_omits_a_side");
+                }
                 let children_info: Vec<_> = pre
                     .into_iter()
                     .map(|(child, is_active, cert_effect)| (*idx, child, is_active, cert_effect))
@@ -1368,6 +1671,9 @@ impl BetaCrownVerifier {
                 is_active: true,
                 score,
             };
+            // #vit-v3-bankable: the half-space, kept for the per-row frame's
+            // emptiness record (armed only).
+            let active_record = self.mo_cover.is_armed().then(|| active_constraint.clone());
             let active_child = if bounded_shared_lane {
                 domain.with_constraint_without_optional_warm_starts(
                     graph,
@@ -1380,9 +1686,32 @@ impl BetaCrownVerifier {
             };
             match active_child {
                 Ok(Some(child)) => children_info.push((*idx, child, true, KfsbCertEffect::None)),
-                Ok(None) => {}
+                Ok(None) => {
+                    // #vit-margin-alpha-complex (P8): an empty half-space
+                    // closes its region without a bound; counted for the
+                    // fenced run's emptiness gate (bookkeeping only).
+                    super::super::containment_fence_lane::note_emptiness_claim(
+                        super::super::containment_fence_lane::EmptinessClaim::Construct,
+                    );
+                    // #vit-v3-bankable: with its certified slack.
+                    if let Some(record) = active_record.as_ref() {
+                        self.mo_cover_note_empty(
+                            &domain.history,
+                            Some(record),
+                            domain.split_emptiness_slack(graph, record),
+                        );
+                    }
+                }
                 Err(ref e) if e.is_infeasible_domain() => {
-                    // #2926: Infeasible constraint = empty child, skip.
+                    // Infeasible constraint = empty child, skip.
+                    super::super::containment_fence_lane::note_emptiness_claim(
+                        super::super::containment_fence_lane::EmptinessClaim::Construct,
+                    );
+                    self.mo_cover_note_infeasible(
+                        &domain.history,
+                        active_record.as_ref(),
+                        &e.to_string(),
+                    );
                 }
                 Err(e) => {
                     tracing::warn!("with_constraint (active) failed for idx {}: {e}", idx);
@@ -1404,6 +1733,10 @@ impl BetaCrownVerifier {
                 is_active: false,
                 score,
             };
+            let inactive_record = self
+                .mo_cover
+                .is_armed()
+                .then(|| inactive_constraint.clone());
             let inactive_child = if bounded_shared_lane {
                 domain.with_constraint_without_optional_warm_starts(
                     graph,
@@ -1416,9 +1749,30 @@ impl BetaCrownVerifier {
             };
             match inactive_child {
                 Ok(Some(child)) => children_info.push((*idx, child, false, KfsbCertEffect::None)),
-                Ok(None) => {}
+                Ok(None) => {
+                    // #vit-margin-alpha-complex (P8): see the active arm.
+                    super::super::containment_fence_lane::note_emptiness_claim(
+                        super::super::containment_fence_lane::EmptinessClaim::Construct,
+                    );
+                    // #vit-v3-bankable: with its certified slack.
+                    if let Some(record) = inactive_record.as_ref() {
+                        self.mo_cover_note_empty(
+                            &domain.history,
+                            Some(record),
+                            domain.split_emptiness_slack(graph, record),
+                        );
+                    }
+                }
                 Err(ref e) if e.is_infeasible_domain() => {
-                    // #2926: Infeasible constraint = empty child, skip.
+                    // Infeasible constraint = empty child, skip.
+                    super::super::containment_fence_lane::note_emptiness_claim(
+                        super::super::containment_fence_lane::EmptinessClaim::Construct,
+                    );
+                    self.mo_cover_note_infeasible(
+                        &domain.history,
+                        inactive_record.as_ref(),
+                        &e.to_string(),
+                    );
                 }
                 Err(e) => {
                     tracing::warn!("with_constraint (inactive) failed for idx {}: {e}", idx);
@@ -1431,6 +1785,9 @@ impl BetaCrownVerifier {
         // Optional alpha maps are rebuilt during child construction and have
         // no inner allocation seam. Serialize this small K<=8 wave for the
         // bounded facade; legacy lanes retain their parallel schedule.
+        // #phase-cost: per-domain branch selection + child construction.
+        let create_phase_cost =
+            ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BranchSelect);
         let __t_create_children =
             crate::phase_telemetry::phase_telemetry_enabled().then(Instant::now);
         let child_creation_results: Vec<_> = if bounded_shared_lane {
@@ -1455,7 +1812,12 @@ impl BetaCrownVerifier {
                 t.elapsed().as_secs_f64(),
             );
         }
-        // Handle branch selection failures explicitly (#2143).
+        drop(create_phase_cost);
+        // #phase-cost: from the committed children to the queue fold is the
+        // wave's child bounding (clip precompute, batched pass, fallbacks).
+        let child_phase_cost =
+            ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::ChildBound);
+        // Handle branch selection failures explicitly.
         let mut branch_selection_failures: std::collections::HashSet<usize> =
             std::collections::HashSet::new();
         let successful_results: Vec<_> = child_creation_results
@@ -1488,6 +1850,12 @@ impl BetaCrownVerifier {
                 .any(|(_, _, _, effect)| effect.receipt().is_some())
         });
         let kfsb_cert_probe = kfsb_has_cert_receipt && kfsb_probe_enabled();
+        // #vit-v3-bankable: a kFSB certificate receipt closes rows by a scalar
+        // lower certificate the per-row frame does not re-derive from the
+        // child's bound pair; the frame gives up rather than guess.
+        if kfsb_has_cert_receipt {
+            self.mo_cover_unbuildable("kfsb_cert_receipt");
+        }
         // Remove terminal certified leaves BEFORE Complete Clip and every
         // dense/scalar child evaluator. This is the critical empty-spec
         // short-circuit: routing an all-verified child through either fallback
@@ -1777,9 +2145,9 @@ impl BetaCrownVerifier {
                         ChildContinuationStateProvenance::Established,
                     ))
                 }
-                // #2926: Preserve infeasibility signal through the parallel closure.
+                // Preserve infeasibility signal through the parallel closure.
                 Err(ref e) if e.is_infeasible_domain() => {
-                    Err(MultiObjectiveChildEvalError::Infeasible)
+                    Err(MultiObjectiveChildEvalError::Infeasible(e.to_string()))
                 }
                 Err(ref e) if e.is_deadline_exceeded() => {
                     Err(MultiObjectiveChildEvalError::DeadlineExpired)
@@ -1802,13 +2170,39 @@ impl BetaCrownVerifier {
         // OPTIMIZATION for ~10x domain throughput. Default ON; NY_MO_GPU_BATCH=0
         // restores the legacy per-child beta-opt lane byte-identically.
         let authority_deadline = self.effective_graph_bab_deadline();
+        // #chain-wide (S2): FC (pure Linear/ReLU chain) graphs are admitted to
+        // the same lane when the typed `bab.chain_wide` key is armed TOGETHER
+        // with `bab.beta_graft` — the wide-chain base relaxation is 2.4-2.9x
+        // looser than the dense backward, so the FC lane exists only as the
+        // #mo-beta-graft elementwise-tightest composition (the wide bound is
+        // captured, never a replacement). The sound-backend eligibility check
+        // below still applies unchanged; unarmed, routing is byte-identical.
+        let chain_wide_fc_lane = self.bab_chain_wide_active() && self.mo_beta_graft_active();
         let gpu_single_pass_lane = multi_objective_gpu_single_pass_enabled()
-            && graph.has_conv_layers()
+            && (graph.has_conv_layers() || chain_wide_fc_lane)
             && (crate::sound_gpu_gate::sound_gpu_crown_for_wide_with_deadline(authority_deadline)
                 .is_some_and(|gpu| gpu_single_pass_backend_eligible(gpu, authority_deadline))
                 || engine
                     .as_gpu_crown_backward()
                     .is_some_and(|gpu| gpu_single_pass_backend_eligible(gpu, authority_deadline)));
+        // #chain-wide observability (dark, NY_BETA_GPU_PROBE=1): name WHICH
+        // term of the lane gate held/failed — the exact ambiguity that made
+        // earlier probes of this lane VOID. Print-only.
+        if crate::beta_gpu_probe_armed() {
+            eprintln!(
+                "[mo-lane] single_pass={} enabled={} conv={} chain_wide_fc={} \
+                 backend_global={} backend_local={}",
+                gpu_single_pass_lane,
+                multi_objective_gpu_single_pass_enabled(),
+                graph.has_conv_layers(),
+                chain_wide_fc_lane,
+                crate::sound_gpu_gate::sound_gpu_crown_for_wide_with_deadline(authority_deadline)
+                    .is_some_and(|gpu| gpu_single_pass_backend_eligible(gpu, authority_deadline)),
+                engine
+                    .as_gpu_crown_backward()
+                    .is_some_and(|gpu| gpu_single_pass_backend_eligible(gpu, authority_deadline)),
+            );
+        }
         // The default-dark bounded CPU facade deliberately exposes no broad
         // GPU trait. Keep its children OUT of the dense-spec adapter: that
         // adapter's broad ResNet selector correctly rejects CUDA's narrower
@@ -1819,11 +2213,19 @@ impl BetaCrownVerifier {
         //   * cuts inactive (the dense-spec primitive does not apply cuts);
         //   * the single-pass branch applies (NOT beta-opt for this depth, OR
         //     the GPU single-pass lane is on);
-        //   * no per-disjunct alphas (no GraphBabDomain equivalent);
         //   * every relu node is present in `child.node_bounds`
         //     (`from_graph_domains` errors otherwise);
         //   * the first objective bound is finite.
         // Everything else falls back to the EXACT per-child path.
+        //
+        // Children carrying `per_disjunct_alphas` ARE batchable. The
+        // adapter evaluates such children under the SHARED `child.alpha_state`
+        // — exactly what the exact per-child fallback (`eval_child`,
+        // `.with_alpha(&child.alpha_state)`) already uses, so relaxation
+        // choice is unchanged on this lane; any α in [0,1] is sound. The
+        // per-disjunct evaluator is reachable only from the sequential
+        // (non-batched) lane, so excluding here bought zero alpha fidelity
+        // (docs/REGRESSION_FC_UNSAT_LOST_2026-08-14.md, S3 design map (b)).
         let cuts_inactive = cut_pool.map_or(true, |pool| pool.is_empty());
         let mut batchable_positions: Vec<usize> = Vec::new();
         for (pos, (_parent_idx, child, _is_active, _cert_effect)) in all_children.iter().enumerate()
@@ -1833,18 +2235,24 @@ impl BetaCrownVerifier {
                 gpu_single_pass_lane,
                 self.config.beta_iterations > 0 && child.depth <= self.config.beta_max_depth,
             );
-            let relu_nodes_present = relu_nodes
-                .iter()
-                .all(|name| child.node_bounds.contains_key(name));
-            let first_obj_finite = child
-                .objective_bounds
-                .first()
-                .is_some_and(|(l, u)| l.is_finite() && u.is_finite());
-            let batchable = cuts_inactive
-                && single_pass_branch
-                && child.per_disjunct_alphas().is_none()
-                && relu_nodes_present
-                && first_obj_finite;
+            let (relu_nodes_present, first_obj_finite, batchable) = multi_objective_child_batchable(
+                cuts_inactive,
+                single_pass_branch,
+                child,
+                relu_nodes,
+            );
+            // #chain-wide observability (dark, NY_BETA_GPU_PROBE=1): name the
+            // failing batchability term for the first few children. Print-only.
+            // `per_disjunct_alphas` is INFORMATIONAL — it no
+            // longer excludes; kept so wave logs still show the alpha shape.
+            if !batchable && pos < 3 && crate::beta_gpu_probe_armed() {
+                eprintln!(
+                    "[mo-partition] pos={pos} cuts_inactive={cuts_inactive} \
+                     single_pass_branch={single_pass_branch} per_disjunct_alphas={} \
+                     relu_nodes_present={relu_nodes_present} first_obj_finite={first_obj_finite}",
+                    child.per_disjunct_alphas().is_some(),
+                );
+            }
             if batchable {
                 batchable_positions.push(pos);
             } else {
@@ -2053,7 +2461,7 @@ impl BetaCrownVerifier {
                                 // pre-deadline Unknown despite a sound fallback.
                                 let retry = batched_child_refusal_has_cpu_fallback(
                                     bounded_shared_lane,
-                                    result.as_ref().err().copied(),
+                                    result.as_ref().err().cloned(),
                                 );
                                 let result = if retry
                                     && admit_multi_objective_child_wave(
@@ -2177,11 +2585,17 @@ impl BetaCrownVerifier {
             Vec<(MultiObjectiveGraphBabDomain, bool)>,
         > = preverified_children_by_parent;
 
-        // #1861: Track parents that had child propagation failures or violations.
+        // Track parents that had child propagation failures or violations.
         let mut parents_with_failure: std::collections::HashSet<usize> =
             std::collections::HashSet::new();
         let mut parents_with_violation: std::collections::HashSet<usize> =
             std::collections::HashSet::new();
+        // [mo-fold] observability: per parent, (infeasible-child count, depth,
+        // first reason text). Read only by the `Children([])` line below.
+        let mut infeasible_children_by_parent: std::collections::HashMap<
+            usize,
+            (usize, usize, String),
+        > = std::collections::HashMap::new();
 
         // #boxlift [frontier] telemetry (dark, NY_PHASE_TELEMETRY=1, print-only):
         // per-depth worst-child accumulator for THIS batch. The resnet batched
@@ -2201,6 +2615,15 @@ impl BetaCrownVerifier {
         // #phase-telemetry: the fold below consumes `all_children`, so capture
         // its width alongside the start instant. Reuses the gate bool already
         // cached above — no second environment read.
+        ny_core::phase_cost::add_units(
+            ny_core::phase_cost::CostPhase::ChildBound,
+            all_children.len() as u64,
+        );
+        ny_core::phase_cost::count(
+            ny_core::phase_cost::CostCounter::ChildrenCreated,
+            all_children.len() as u64,
+        );
+        drop(child_phase_cost);
         let __t_child_fold = frontier_telemetry_on.then(|| (Instant::now(), all_children.len()));
         for ((parent_idx, mut child, _is_active, _cert_effect), bounds_result) in
             all_children.into_iter().zip(child_bounds)
@@ -2257,9 +2680,7 @@ impl BetaCrownVerifier {
                         Some((node_cache, beta_state, alpha_state, state_provenance));
                     // #bab-warm-start trace, joint multi-objective twin
                     // (NY_BAB_CHILD_TRACE=1): sampled per-child objective
-                    // bounds vs depth on the ACTUAL joint-lane install site
-                    // (the 2026-08-22 doc entry mis-attributed this lane
-                    // because only the single/relu_split sites were probed).
+                    // bounds vs depth on the ACTUAL joint-lane install site.
                     {
                         static TRACE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                         static COUNT: std::sync::atomic::AtomicU64 =
@@ -2284,6 +2705,14 @@ impl BetaCrownVerifier {
                                 );
                             }
                         }
+                    }
+                    // [mo-child-birth] (unconditional, rate-limited, print-only):
+                    // the one point where the inherited parent state, the
+                    // child's first own bound, and the staged α/β are all in
+                    // scope. `continuation_state` is `Some` here by
+                    // construction; the guard is belt-and-braces.
+                    if let Some((_, beta_state, alpha_state, _)) = continuation_state.as_ref() {
+                        mo_child_birth_line(&child, &obj_bounds, beta_state, alpha_state.as_ref());
                     }
                     let mut bounds_ok = child.update_bounds(obj_bounds, thresholds, false).is_ok();
                     if !bounds_ok && !bounded_shared_lane {
@@ -2341,7 +2770,7 @@ impl BetaCrownVerifier {
                         }
                     }
                     if !bounds_ok {
-                        // NaN in objective bounds → treat as propagation failure (#2982)
+                        // NaN in objective bounds → treat as propagation failure
                         if std::env::var("NY_PROPFAIL_PROBE").ok().as_deref() == Some("1") {
                             eprintln!("[propfail] site=NaN-bounds depth={}", child.depth);
                         }
@@ -2425,7 +2854,7 @@ impl BetaCrownVerifier {
                     // violated) contribute a margin; every child that completed
                     // a bounds update counts toward the cumulative domain
                     // counter. Bounds here are finite: update_bounds rejects
-                    // non-finite unverified bounds via its priority fold (#2982).
+                    // non-finite unverified bounds via its priority fold.
                     if frontier_telemetry_on {
                         frontier_batch_domains += 1;
                         if !all_verified && !any_violated {
@@ -2461,7 +2890,7 @@ impl BetaCrownVerifier {
                     // ibp_3_3_8_3005: both root children were dropped and BaB
                     // returned after 2.58 s of a 90.25 s grant.
                     if any_violated && violation_drop_is_certified(child.depth) {
-                        // #1861: Track violated children instead of silently dropping.
+                        // Track violated children instead of silently dropping.
                         parents_with_violation.insert(parent_idx);
                     } else {
                         let merged_cached_las = merge_pruned_cached_las(
@@ -2482,16 +2911,31 @@ impl BetaCrownVerifier {
                             .push((child, all_verified));
                     }
                 }
-                Err(MultiObjectiveChildEvalError::Infeasible) => {
-                    // #2926: Infeasible domain = empty = trivially verified.
-                    // Ensure parent doesn't fall to PropagationFailure when both children infeasible.
+                Err(MultiObjectiveChildEvalError::Infeasible(reason)) => {
+                    // #vit-v3-bankable: the child's region is empty, with the
+                    // certified slack its message carries (none: the per-row
+                    // frame gives up).
+                    self.mo_cover_note_infeasible(&child.history, None, &reason);
+                    // An infeasible child is dropped as empty. The
+                    // entry below makes a parent whose EVERY child is
+                    // infeasible assemble to `Children([])` (not
+                    // PropagationFailure here); the queue fold then refuses
+                    // that pair as an uncertified emptiness close
+                    // (#spine-legacy-lanes).
                     children_by_parent.entry(parent_idx).or_default();
+                    // [mo-fold] observability: remember the disposition so the
+                    // assembly below can tell an infeasible PAIR
+                    // (`Children([])`) apart from an ordinary split.
+                    let slot = infeasible_children_by_parent
+                        .entry(parent_idx)
+                        .or_insert_with(|| (0, child.depth, reason));
+                    slot.0 += 1;
                 }
                 Err(MultiObjectiveChildEvalError::DeadlineExpired) => {
                     parents_with_deadline.insert(parent_idx);
                 }
                 Err(MultiObjectiveChildEvalError::PropagationFailure) => {
-                    // #1861: child bounds computation failed — sub-region unexplored.
+                    // Child bounds computation failed — sub-region unexplored.
                     if std::env::var("NY_PROPFAIL_PROBE").ok().as_deref() == Some("1") {
                         eprintln!("[propfail] site=child-eval-failure parent={parent_idx}");
                     }
@@ -2620,7 +3064,7 @@ impl BetaCrownVerifier {
                 );
                 continue;
             }
-            // Branch selection failures are already in quick_results (#2143).
+            // Branch selection failures are already in quick_results.
             if branch_selection_failures.contains(parent_idx) {
                 continue;
             }
@@ -2630,6 +3074,28 @@ impl BetaCrownVerifier {
             ) {
                 quick_results.insert(*parent_idx, terminal);
             } else if let Some(children) = children_by_parent.remove(parent_idx) {
+                if children.is_empty() {
+                    // [mo-fold] observability: every evaluated child of this
+                    // parent was `InfeasibleDomain`, so the result below is
+                    // `Children([])` — queues nothing. The queue fold counts
+                    // it in `domains_infeasible` and refuses it as an
+                    // uncertified emptiness close (propagation-failure flag,
+                    // #spine-legacy-lanes).
+                    mo_fold_infeasible_pair_line(
+                        *parent_idx,
+                        infeasible_children_by_parent.get(parent_idx),
+                    );
+                } else if let Some(recorded) = infeasible_children_by_parent.get(parent_idx) {
+                    // #vit-bank-gate (review): some children were dropped as
+                    // empty while siblings survive. Print-only; the result
+                    // below is built exactly as before.
+                    mo_fold_infeasible_sibling_line(*parent_idx, recorded, children.len());
+                    // #vit-margin-alpha-complex (P8): and counted for the
+                    // fenced run's emptiness gate (bookkeeping only).
+                    super::super::containment_fence_lane::note_emptiness_claim(
+                        super::super::containment_fence_lane::EmptinessClaim::Sibling,
+                    );
+                }
                 // #violdrop: SURVIVING SIBLINGS ARE NEVER DISCARDED. This arm
                 // used to sit BELOW the violation arm, so a single dropped child
                 // replaced the whole result with `Violation` and threw away every
@@ -2645,19 +3111,32 @@ impl BetaCrownVerifier {
                 };
                 quick_results.insert(*parent_idx, result);
             } else if parents_with_violation.contains(parent_idx) {
-                // #1861: every child violated (no survivor to enqueue) — track as
+                // Every child violated (no survivor to enqueue) — track as
                 // violation instead of silently dropping.
                 quick_results.insert(*parent_idx, MultiObjectiveGraphDomainResult::Violation);
             } else {
                 // Both children infeasible (with_constraint returned None for both).
-                // This is a legitimate outcome, not an internal failure (#2143).
+                // This is a legitimate outcome, not an internal failure.
                 tracing::debug!(
                     "process_graph_domains_batched_gpu_multi_objective: both children infeasible for parent idx {} (#2143)",
                     parent_idx
                 );
+                // #vit-bank-gate: same conservative verdict as
+                // `PropagationFailure`, but counted in `domains_infeasible`
+                // and named, instead of a `debug!` nobody sees under
+                // `RUST_LOG=error`.
+                mo_fold_infeasible_site_line(
+                    "cover",
+                    *parent_idx,
+                    parent_domain_lookup
+                        .get(parent_idx)
+                        .map(|parent| parent.depth),
+                    "propagation_failure",
+                    "zero children reached evaluation (every half-space refused at construction)",
+                );
                 quick_results.insert(
                     *parent_idx,
-                    MultiObjectiveGraphDomainResult::PropagationFailure,
+                    MultiObjectiveGraphDomainResult::InfeasibleCoverRefused,
                 );
             }
         }
@@ -3210,7 +3689,7 @@ mod mo_gpu_chunk_tests {
         );
 
         assert_eq!(partition.invalid_parents, HashSet::from([17]));
-        assert!(partition.pending.is_empty());
+        assert_eq!((partition.pending).len(), 0);
         assert!(partition.preverified.is_empty());
         assert!(partition.certified_parent_deadlines.is_empty());
         assert_eq!(partition.accounting.invalid_parents, 1);
@@ -3702,6 +4181,36 @@ mod mo_gpu_chunk_tests {
         assert!(child_bounds[0].is_none());
     }
 
+    /// `[mo-child-birth]` picks the parent's straggler the way `[branch-trace]`
+    /// does: lowest lower bound over UNVERIFIED rows, NaN reading as -inf, and
+    /// nothing when every row is verified.
+    #[test]
+    fn worst_unverified_row_mirrors_the_branch_trace_selector() {
+        let bounds = [(0.5f32, 1.0f32), (-2.0, 1.0), (-3.0, 1.0), (f32::NAN, 1.0)];
+        // Row 2 is the lowest unverified row when row 3 (NaN) is verified.
+        assert_eq!(
+            super::worst_unverified_row(&bounds, &[false, false, false, true]),
+            Some((2, -3.0))
+        );
+        // A NaN lower bound on an unverified row reads as -inf and wins.
+        assert_eq!(
+            super::worst_unverified_row(&bounds, &[false, false, false, false]),
+            Some((3, f32::NEG_INFINITY))
+        );
+        // Verified rows are skipped even when they are the lowest.
+        assert_eq!(
+            super::worst_unverified_row(&bounds, &[false, true, true, true]),
+            Some((0, 0.5))
+        );
+        // Every row verified: no straggler, no line.
+        assert_eq!(super::worst_unverified_row(&bounds, &[true; 4]), None);
+        // A short `verified` vector reads missing entries as unverified.
+        assert_eq!(
+            super::worst_unverified_row(&bounds[..2], &[]),
+            Some((1, -2.0))
+        );
+    }
+
     #[test]
     fn heterogeneous_gpu_child_refusals_retry_exactly_when_cpu_authority_exists() {
         assert!(batched_child_refusal_has_cpu_fallback(
@@ -3710,7 +4219,7 @@ mod mo_gpu_chunk_tests {
         ));
         for terminal in [
             None,
-            Some(MultiObjectiveChildEvalError::Infeasible),
+            Some(MultiObjectiveChildEvalError::Infeasible(String::new())),
             Some(MultiObjectiveChildEvalError::DeadlineExpired),
         ] {
             assert!(

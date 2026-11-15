@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Batched single-objective deferred-rebound kernel tests (#4210).
+//! Batched single-objective deferred-rebound kernel tests.
 //!
 //! # What these four tests observe, and why it changed
 //!
@@ -670,7 +670,7 @@ fn test_bound_deferred_domains_batch_tightens_with_root_bounds_4210() {
     );
 }
 
-/// Verify the batched kernel fires with alpha state. Part of #4210.
+/// Verify the batched kernel fires with alpha state.
 /// Before this fix, `alpha_state.is_some()` forced rayon par_iter fallback.
 #[test]
 fn test_bound_deferred_domains_batch_uses_batched_kernel_with_alpha_state_4210() {
@@ -746,7 +746,7 @@ fn test_bound_deferred_domains_batch_uses_batched_kernel_with_alpha_state_4210()
     }
 }
 
-/// Verify the batched kernel fires when ibp_enhancement=true. Part of #4210.
+/// Verify the batched kernel fires when ibp_enhancement=true.
 /// Before this fix, `ibp_enhancement` forced rayon par_iter fallback.
 #[test]
 fn test_bound_deferred_domains_batch_fires_with_ibp_enhancement_4210() {

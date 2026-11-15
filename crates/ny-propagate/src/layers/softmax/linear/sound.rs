@@ -10,17 +10,16 @@
 //! and the denominator sum_exp is bounded similarly, yielding affine bounds
 //! on each softmax output.
 
-use ndarray::{Array1, Array2, ArrayD, IxDyn};
+use ndarray::{Array1, Array2};
 use ny_core::{NyError, Result};
 use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
 use std::sync::OnceLock;
 
-use crate::bounds::nan_propagating_max;
 use crate::LinearBounds;
 
-use super::super::bounds::constant_bounds_from_output;
 use super::super::layer::SoftmaxLayer;
 use super::super::utils;
+use super::super::weighted_support::{Interval as I, WeightedScoreBox};
 
 const SOFTMAX_OBJECTIVE_ENVELOPE_ENV: &str = "NY_SOFTMAX_OBJECTIVE_ENVELOPE";
 
@@ -89,6 +88,7 @@ impl SoftmaxLayer {
         pre_lower: &Array1<f32>,
         pre_upper: &Array1<f32>,
     ) -> Result<LinearBounds> {
+        super::grouped_sound::checkpoint()?;
         let num_neurons = pre_lower.len();
         if pre_upper.len() != num_neurons {
             return Err(NyError::ShapeMismatch {
@@ -102,36 +102,115 @@ impl SoftmaxLayer {
                 got: vec![bounds.num_inputs()],
             });
         }
+        if num_neurons == 0 {
+            return Ok(bounds.clone());
+        }
+        if bounds
+            .num_outputs()
+            .checked_mul(num_neurons)
+            .and_then(|n| n.checked_mul(8))
+            .is_none_or(|bytes| bytes > 128 * 1024 * 1024)
+        {
+            return Err(NyError::UnsupportedOp(
+                "checked softmax output memory admission".into(),
+            ));
+        }
 
         let has_non_finite =
             pre_lower.iter().any(|&v| !v.is_finite()) || pre_upper.iter().any(|&v| !v.is_finite());
         if has_non_finite {
-            let lower = ArrayD::from_elem(IxDyn(&[num_neurons]), 0.0);
-            let upper = ArrayD::from_elem(IxDyn(&[num_neurons]), 1.0);
-            // [0, 1] bounds are finite by construction — use validated constructor.
-            let output_bounds = BoundedTensor::new(lower, upper)?;
-            return constant_bounds_from_output(bounds, &output_bounds);
+            let mut result = checked_constant_from_probability_box(
+                bounds,
+                &Array1::zeros(num_neurons),
+                &Array1::ones(num_neurons),
+            )?;
+            charge_incoming_error(&mut result, bounds);
+            return Ok(result);
         }
 
+        let weighted = self.weighted_objective_bounds(bounds, pre_lower, pre_upper)?;
+        // The scalar route stays linear in width; an intermediate identity
+        // direction may still inherently require a large M-by-T result, but
+        // no T-by-T LSE Jacobian is built on the vocabulary-sized route.
+        if num_neurons
+            .checked_mul(num_neurons)
+            .is_none_or(|n| n > 4_000_000)
+        {
+            super::grouped_sound::checkpoint()?;
+            return Ok(weighted);
+        }
         let Some((lower_a, lower_b, upper_a, upper_b)) =
             self.softmax_lse_affine_bounds(pre_lower, pre_upper)
         else {
-            let lower = ArrayD::from_elem(IxDyn(&[num_neurons]), 0.0);
-            let upper = ArrayD::from_elem(IxDyn(&[num_neurons]), 1.0);
-            // [0, 1] bounds are finite by construction — use validated constructor.
-            let output_bounds = BoundedTensor::new(lower, upper)?;
-            return constant_bounds_from_output(bounds, &output_bounds);
+            super::grouped_sound::checkpoint()?;
+            return Ok(weighted);
         };
 
-        let lse_candidate =
+        let mut lse_candidate =
             self.apply_affine_bounds(bounds, &lower_a, &lower_b, &upper_a, &upper_b)?;
+        charge_incoming_error(&mut lse_candidate, bounds);
+        let candidate = select_complete_rows(lse_candidate, weighted, pre_lower, pre_upper)?;
+        super::grouped_sound::checkpoint()?;
         if !softmax_objective_envelope_enabled() {
-            // Keep the historical default-off path byte-identical: the exact
-            // LSE-composed coefficients and biases are returned unchanged.
-            return Ok(lse_candidate);
+            return Ok(candidate);
         }
 
-        self.select_softmax_objective_envelope(bounds, pre_lower, pre_upper, lse_candidate)
+        let result =
+            self.select_softmax_objective_envelope(bounds, pre_lower, pre_upper, candidate)?;
+        super::grouped_sound::checkpoint()?;
+        Ok(result)
+    }
+
+    /// Checked fixed-direction support is active in every sound softmax route.
+    /// It is a constant carrier, never a disguised affine slope or sampled bound.
+    pub(super) fn weighted_objective_bounds(
+        &self,
+        bounds: &LinearBounds,
+        lower: &Array1<f32>,
+        upper: &Array1<f32>,
+    ) -> Result<LinearBounds> {
+        let l: Vec<f64> = lower.iter().map(|&x| x as f64).collect();
+        let u: Vec<f64> = upper.iter().map(|&x| x as f64).collect();
+        let score = WeightedScoreBox::new(&l, &u);
+        super::grouped_sound::checkpoint()?;
+        let score = score
+            .ok_or_else(|| NyError::UnsupportedOp("invalid weighted softmax score box".into()))?;
+        let mut lb = Array1::zeros(bounds.num_outputs());
+        let mut ub = lb.clone();
+        for row in 0..bounds.num_outputs() {
+            super::grouped_sound::checkpoint()?;
+            let lc: Vec<f64> = bounds
+                .lower_a()
+                .row(row)
+                .iter()
+                .map(|&x| x as f64)
+                .collect();
+            let uc: Vec<f64> = bounds
+                .upper_a()
+                .row(row)
+                .iter()
+                .map(|&x| x as f64)
+                .collect();
+            lb[row] = next_down_f32(
+                I::point(bounds.lower_b()[row] as f64)
+                    .add(I::point(score.lower(&lc)))
+                    .lo as f32,
+            );
+            ub[row] = next_up_f32(
+                I::point(bounds.upper_b()[row] as f64)
+                    .add(I::point(score.upper(&uc)))
+                    .hi as f32,
+            );
+        }
+        let mut result = LinearBounds::new_or_conservative(
+            Array2::zeros((bounds.num_outputs(), lower.len())),
+            lb,
+            Array2::zeros((bounds.num_outputs(), lower.len())),
+            ub,
+        )?;
+        charge_incoming_error(&mut result, bounds);
+        super::grouped_sound::checkpoint()?;
+        Ok(result)
     }
 
     /// Select the stronger of two independently sound backward bounds for
@@ -156,198 +235,38 @@ impl SoftmaxLayer {
         // This extracted group is always exactly 1-D. Resolve it explicitly as
         // axis 0; using self.propagate_ibp() here would incorrectly reinterpret
         // a positive axis retained from the original 2-D/N-D Softmax layer.
-        let softmax_box = Self::propagate_ibp_with_axis(&logit_box, 0)?;
-        let constant_candidate = constant_bounds_from_output(bounds, &softmax_box)?;
-
-        let lse_concrete = lse_candidate.concretize_sound(&logit_box);
-        let constant_concrete = constant_candidate.concretize_sound(&logit_box);
-
-        let mut lower_a = lse_candidate.lower_a().clone();
-        let mut lower_b = lse_candidate.lower_b().clone();
-        let mut upper_a = lse_candidate.upper_a().clone();
-        let mut upper_b = lse_candidate.upper_b().clone();
-
-        for row in 0..bounds.num_outputs() {
-            // Ties deliberately retain LSE so the affine carrier is not lost.
-            if lse_concrete.lower()[[row]] < constant_concrete.lower()[[row]] {
-                lower_a
-                    .row_mut(row)
-                    .assign(&constant_candidate.lower_a().row(row));
-                lower_b[row] = constant_candidate.lower_b()[row];
-            }
-            if lse_concrete.upper()[[row]] > constant_concrete.upper()[[row]] {
-                upper_a
-                    .row_mut(row)
-                    .assign(&constant_candidate.upper_a().row(row));
-                upper_b[row] = constant_candidate.upper_b()[row];
-            }
+        let l: Vec<f64> = pre_lower.iter().map(|&x| x as f64).collect();
+        let u: Vec<f64> = pre_upper.iter().map(|&x| x as f64).collect();
+        let scores = WeightedScoreBox::new(&l, &u)
+            .ok_or_else(|| NyError::UnsupportedOp("invalid softmax coordinate score box".into()))?;
+        let mut lo = Array1::zeros(l.len());
+        let mut hi = lo.clone();
+        let mut direction = vec![0.0; l.len()];
+        for i in 0..l.len() {
+            direction[i] = 1.0;
+            lo[i] = next_down_f32(scores.lower(&direction) as f32).max(0.0);
+            hi[i] = next_up_f32(scores.upper(&direction) as f32).min(1.0);
+            direction[i] = 0.0;
         }
-
-        LinearBounds::new_or_conservative(lower_a, lower_b, upper_a, upper_b)
+        let mut constant_candidate = checked_constant_from_probability_box(bounds, &lo, &hi)?;
+        charge_incoming_error(&mut constant_candidate, bounds);
+        let _ = logit_box;
+        select_complete_rows(lse_candidate, constant_candidate, pre_lower, pre_upper)
     }
 
     // Justification: The 4-tuple return (lower_A, lower_b, upper_A, upper_b) represents
     // the standard affine bound coefficient structure for softmax-via-LSE relaxation.
     // Extracting a struct would add overhead for a private method with one call site.
     #[allow(clippy::type_complexity)]
-    pub(super) fn softmax_lse_affine_bounds(
+    /// The LSE affine bounds of one softmax group (row `i` of each matrix is
+    /// output `i`). `pub(crate)` so the vit root α search copy
+    /// (#vit-root-alpha) can carry the lane's own frozen relaxation.
+    pub(crate) fn softmax_lse_affine_bounds(
         &self,
         pre_lower: &Array1<f32>,
         pre_upper: &Array1<f32>,
     ) -> Option<(Array2<f32>, Array1<f32>, Array2<f32>, Array1<f32>)> {
-        let num_neurons = pre_lower.len();
-        // Bit-identical linearization center: f32::midpoint rounds differently at overflow edges.
-        #[allow(clippy::manual_midpoint)]
-        let x_center: Array1<f32> = pre_lower
-            .iter()
-            .zip(pre_upper.iter())
-            .map(|(&l, &u)| (l + u) / 2.0)
-            .collect();
-
-        // Directed rounding: lse_upper must not understate, lse_lower must not
-        // overstate. logsumexp_1d computes in f64 but casts to f32 with nearest
-        // rounding — wrap with next_up/next_down to match logsumexp_directed
-        // pattern from logsoftmax/mod.rs:72-100. See #3275 Gap 1.
-        let lse_upper = next_up_f32(utils::logsumexp_1d(pre_upper));
-        let lse_lower = next_down_f32(utils::logsumexp_1d(pre_lower));
-        let lse_center = utils::logsumexp_1d(&x_center);
-        if !lse_upper.is_finite() || !lse_lower.is_finite() || !lse_center.is_finite() {
-            return None;
-        }
-
-        let softmax_center = utils::softmax_1d(&x_center);
-        if softmax_center.iter().any(|&v| !v.is_finite()) {
-            return None;
-        }
-
-        // NaN-propagating fold: NaN in pre_upper must propagate — see #2577.
-        let shift = pre_upper
-            .iter()
-            .cloned()
-            .fold(f32::NEG_INFINITY, nan_propagating_max);
-        if !shift.is_finite() {
-            return None;
-        }
-
-        let mut se_slope = Array1::<f32>::zeros(num_neurons);
-        let mut se_intercept = Array1::<f32>::zeros(num_neurons);
-        for i in 0..num_neurons {
-            let l = pre_lower[i];
-            let u = pre_upper[i];
-            if !l.is_finite() || !u.is_finite() {
-                return None;
-            }
-            // f64 intermediates for sum-exp chord to reduce rounding error.
-            // Nearest rounding on cast: se_slope/se_intercept feed se_center
-            // which has its own rationale for nearest rounding (lines 140-142).
-            // See #3275 Gap 2.
-            if (u - l).abs() < 1e-8 {
-                let exp_l = ((l - shift) as f64).exp();
-                se_slope[i] = 0.0;
-                se_intercept[i] = exp_l as f32;
-            } else {
-                let exp_l = ((l - shift) as f64).exp();
-                let exp_u = ((u - shift) as f64).exp();
-                let slope_f64 = (exp_u - exp_l) / (u as f64 - l as f64);
-                let intercept_f64 = exp_l - slope_f64 * l as f64;
-                se_slope[i] = slope_f64 as f32;
-                se_intercept[i] = intercept_f64 as f32;
-            }
-        }
-
-        // #2423: f64 accumulation for se_center to prevent precision loss when
-        // num_neurons is large. This value feeds the lower bound denominators
-        // (lower_val = exp_center / se_center, ratio = se_slope[k] / se_center).
-        let se_center_f64: f64 = se_slope
-            .iter()
-            .zip(x_center.iter())
-            .map(|(&s, &x)| s as f64 * x as f64)
-            .sum::<f64>()
-            + se_intercept.iter().map(|&v| v as f64).sum::<f64>();
-        // Nearest rounding: se_center feeds both lower_val and lower_a slopes.
-        // Directed rounding would change slopes with unpredictable second-order
-        // effects on the affine bound; the final intercept has its own next_down_f32.
-        let se_center = se_center_f64 as f32;
-        if !se_center.is_finite() || se_center <= 0.0 {
-            return None;
-        }
-
-        let mut lower_a = Array2::<f32>::zeros((num_neurons, num_neurons));
-        let mut lower_b = Array1::<f32>::zeros(num_neurons);
-        let mut upper_a = Array2::<f32>::zeros((num_neurons, num_neurons));
-        let mut upper_b = Array1::<f32>::zeros(num_neurons);
-
-        for i in 0..num_neurons {
-            let exp_center = (x_center[i] - shift).exp();
-            if !exp_center.is_finite() {
-                return None;
-            }
-            let lower_val = exp_center / se_center;
-            if !lower_val.is_finite() {
-                return None;
-            }
-
-            // #2423: f64 accumulation for lower_dot to prevent precision loss
-            // in the intercept computation. num_neurons mixed-sign terms cancel.
-            let mut lower_dot = 0.0_f64;
-            for k in 0..num_neurons {
-                let ratio = se_slope[k] / se_center;
-                let grad = if k == i {
-                    lower_val * (1.0 - ratio)
-                } else {
-                    -lower_val * ratio
-                };
-                lower_a[[i, k]] = grad;
-                lower_dot += grad as f64 * x_center[k] as f64;
-            }
-            // Directed rounding: lower intercept must not overstate the bound.
-            lower_b[i] = next_down_f32((lower_val as f64 - lower_dot) as f32);
-
-            let r_min = pre_lower[i] - lse_upper;
-            let r_max = pre_upper[i] - lse_lower;
-            let (r_lo, r_hi) = if r_min <= r_max {
-                (r_min, r_max)
-            } else {
-                (r_max, r_min)
-            };
-            if !r_lo.is_finite() || !r_hi.is_finite() {
-                return None;
-            }
-
-            // f64 intermediates for upper-bound exp chord. Slope uses nearest
-            // rounding (directed rounding on A-coefficients is not unconditionally
-            // sound, #2208). Intercept uses next_up_f32 — upper bound bias must
-            // not understate. See #3275 Gap 2.
-            let (slope, intercept) = if (r_hi - r_lo).abs() < 1e-6 {
-                let exp_r_f64 = (r_lo as f64).exp();
-                let intercept_f64 = exp_r_f64 - exp_r_f64 * r_lo as f64;
-                (exp_r_f64 as f32, next_up_f32(intercept_f64 as f32))
-            } else {
-                let exp_r_lo = (r_lo as f64).exp();
-                let exp_r_hi = (r_hi as f64).exp();
-                let slope_f64 = (exp_r_hi - exp_r_lo) / (r_hi as f64 - r_lo as f64);
-                let intercept_f64 = exp_r_lo - slope_f64 * r_lo as f64;
-                (slope_f64 as f32, next_up_f32(intercept_f64 as f32))
-            };
-
-            let r_center = x_center[i] - lse_center;
-            let upper_val = slope * r_center + intercept;
-            if !upper_val.is_finite() {
-                return None;
-            }
-
-            // #2423: f64 accumulation for upper_dot, same rationale as lower_dot.
-            let mut upper_dot = 0.0_f64;
-            for k in 0..num_neurons {
-                let grad = slope * ((if k == i { 1.0 } else { 0.0 }) - softmax_center[k]);
-                upper_a[[i, k]] = grad;
-                upper_dot += grad as f64 * x_center[k] as f64;
-            }
-            // Directed rounding: upper intercept must not understate the bound.
-            upper_b[i] = next_up_f32((upper_val as f64 - upper_dot) as f32);
-        }
-
-        Some((lower_a, lower_b, upper_a, upper_b))
+        super::super::checked_lse::affine_bounds(pre_lower, pre_upper)
     }
 
     pub(super) fn apply_affine_bounds(
@@ -360,4 +279,102 @@ impl SoftmaxLayer {
     ) -> Result<LinearBounds> {
         utils::apply_affine_bounds_f64(bounds, lower_a, lower_b, upper_a, upper_b)
     }
+}
+
+fn charge_incoming_error(result: &mut LinearBounds, incoming: &LinearBounds) {
+    // p lies on the simplex, so sum err_i*p_i <= max err_i. This charge
+    // represents the original objective's coefficient uncertainty; it cannot
+    // be recovered later from the newly composed coefficient-error arrays.
+    for row in 0..incoming.num_outputs() {
+        let le = incoming
+            .lower_a_err()
+            .map_or(0.0, |e| e.row(row).iter().copied().fold(0.0_f32, f32::max));
+        let ue = incoming
+            .upper_a_err()
+            .map_or(0.0, |e| e.row(row).iter().copied().fold(0.0_f32, f32::max));
+        if le > 0.0 {
+            result.lower_b[row] = next_down_f32(
+                I::point(result.lower_b[row] as f64)
+                    .sub(I::point(le as f64))
+                    .lo as f32,
+            );
+        }
+        if ue > 0.0 {
+            result.upper_b[row] = next_up_f32(
+                I::point(result.upper_b[row] as f64)
+                    .add(I::point(ue as f64))
+                    .hi as f32,
+            );
+        }
+    }
+}
+
+fn checked_constant_from_probability_box(
+    bounds: &LinearBounds,
+    lower: &Array1<f32>,
+    upper: &Array1<f32>,
+) -> Result<LinearBounds> {
+    let mut lb = Array1::zeros(bounds.num_outputs());
+    let mut ub = lb.clone();
+    for row in 0..bounds.num_outputs() {
+        let mut lo = I::point(bounds.lower_b()[row] as f64);
+        let mut hi = I::point(bounds.upper_b()[row] as f64);
+        for j in 0..lower.len() {
+            let p = I::new(lower[j] as f64, upper[j] as f64);
+            lo = lo.add(I::point(bounds.lower_a()[[row, j]] as f64).mul(p));
+            hi = hi.add(I::point(bounds.upper_a()[[row, j]] as f64).mul(p));
+        }
+        lb[row] = next_down_f32(lo.lo as f32);
+        ub[row] = next_up_f32(hi.hi as f32);
+    }
+    LinearBounds::new_or_conservative(
+        Array2::zeros((bounds.num_outputs(), lower.len())),
+        lb,
+        Array2::zeros((bounds.num_outputs(), lower.len())),
+        ub,
+    )
+}
+
+fn select_complete_rows(
+    first: LinearBounds,
+    second: LinearBounds,
+    lower: &Array1<f32>,
+    upper: &Array1<f32>,
+) -> Result<LinearBounds> {
+    let domain = BoundedTensor::new(lower.clone().into_dyn(), upper.clone().into_dyn())?;
+    let fc = first.concretize_sound(&domain);
+    let sc = second.concretize_sound(&domain);
+    let mut la = first.lower_a().clone();
+    let mut ua = first.upper_a().clone();
+    let mut lb = first.lower_b().clone();
+    let mut ub = first.upper_b().clone();
+    let mut le = first
+        .lower_a_err()
+        .cloned()
+        .unwrap_or_else(|| Array2::zeros(la.raw_dim()));
+    let mut ue = first
+        .upper_a_err()
+        .cloned()
+        .unwrap_or_else(|| Array2::zeros(ua.raw_dim()));
+    for row in 0..first.num_outputs() {
+        if sc.lower()[[row]] > fc.lower()[[row]] {
+            la.row_mut(row).assign(&second.lower_a().row(row));
+            lb[row] = second.lower_b()[row];
+            if let Some(err) = second.lower_a_err() {
+                le.row_mut(row).assign(&err.row(row));
+            } else {
+                le.row_mut(row).fill(0.0);
+            }
+        }
+        if sc.upper()[[row]] < fc.upper()[[row]] {
+            ua.row_mut(row).assign(&second.upper_a().row(row));
+            ub[row] = second.upper_b()[row];
+            if let Some(err) = second.upper_a_err() {
+                ue.row_mut(row).assign(&err.row(row));
+            } else {
+                ue.row_mut(row).fill(0.0);
+            }
+        }
+    }
+    LinearBounds::new_or_conservative_with_err(la, lb, ua, ub, le, ue)
 }

@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Report writing for weak-region mining results (#3520).
+//! Report writing for weak-region mining results.
 //!
 //! Owns `manifest.json`, `weak_regions.jsonl`, and `top_bounds/*.safetensors`
 //! emission. Does NOT call profiling or CROWN propagation — only serialization.

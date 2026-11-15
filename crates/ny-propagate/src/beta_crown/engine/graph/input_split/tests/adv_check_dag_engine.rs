@@ -2,10 +2,20 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Regression: prove that `adv_check` selects the graph-DAG cached-plan path
-//! when a DAG-capable engine is present, and avoids it on unsupported graphs.
+//! Regression (#4276): what `adv_check` asks of a DAG-capable engine.
 //!
-//! Part of #4276 — mirrors the sequential PGD counting-engine pattern from
+//! `adv_check` reports the concrete point forward as the witness's network
+//! value without re-evaluating it, so that forward must be a point evaluation.
+//! A resident DAG plan is an interval (IBP) plan: its output encloses the value
+//! and its midpoint need not equal it. Since 3978f781c the concrete point
+//! forward never consults an interval plan on a lowerable graph and evaluates
+//! Linear nodes with the original coefficients through the engine's GEMM
+//! (`graph_point_declines_resident_interval_midpoints_and_uses_original_gemm`
+//! pins that contract for `propagate_concrete_point` itself). The pins below
+//! hold `adv_check` to it: a lowerable graph prepares no plan and runs the
+//! engine's GEMM, and an unsupported graph never reaches the plan either.
+//!
+//! Mirrors the sequential PGD counting-engine pattern from
 //! `pgd_attack/attacker/tests/common.rs`.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -35,7 +45,14 @@ use super::super::adv_check::try_adv_check_on_domain;
 struct DagCachedPlanCounters {
     plan_preparations: AtomicUsize,
     cached_calls: AtomicUsize,
+    gemm_calls: AtomicUsize,
 }
+
+/// The interval every element of [`DagCachedPlan`]'s output claims. It is a
+/// legal-looking enclosure whose midpoint (-1999) lies far below the
+/// threshold the pins use, so a forward that took an interval plan's midpoint
+/// as the network value would report a violation the network does not have.
+const PLAN_ENCLOSURE: (f32, f32) = (-2000.0, -1998.0);
 
 struct DagCachedPlan {
     counters: Arc<DagCachedPlanCounters>,
@@ -52,8 +69,8 @@ impl GpuDagIbpModelPlan for DagCachedPlan {
         self.counters.cached_calls.fetch_add(1, Ordering::SeqCst);
         let n = self.output_shape.iter().product::<usize>();
         Ok(GpuIbpResult {
-            lower_bounds: vec![0.1; n],
-            upper_bounds: vec![0.2; n],
+            lower_bounds: vec![PLAN_ENCLOSURE.0; n],
+            upper_bounds: vec![PLAN_ENCLOSURE.1; n],
             output_shape: self.output_shape.clone(),
         })
     }
@@ -77,6 +94,10 @@ impl DagCachedPlanCountingEngine {
     fn cached_calls(&self) -> usize {
         self.counters.cached_calls.load(Ordering::SeqCst)
     }
+
+    fn gemm_calls(&self) -> usize {
+        self.counters.gemm_calls.load(Ordering::SeqCst)
+    }
 }
 
 impl GpuDagIbpForwardExt for DagCachedPlanCountingEngine {
@@ -97,15 +118,9 @@ impl GpuDagIbpForwardExt for DagCachedPlanCountingEngine {
 }
 
 impl GemmEngine for DagCachedPlanCountingEngine {
-    fn gemm_f32(
-        &self,
-        _m: usize,
-        _k: usize,
-        _n: usize,
-        _a: &[f32],
-        _b: &[f32],
-    ) -> NyResult<Vec<f32>> {
-        panic!("DAG cached-plan path should bypass per-layer GEMM");
+    fn gemm_f32(&self, m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> NyResult<Vec<f32>> {
+        self.counters.gemm_calls.fetch_add(1, Ordering::SeqCst);
+        NaiveCpuGemmEngine.gemm_f32(m, k, n, a, b)
     }
 
     fn as_gpu_dag_ibp_forward_ext(&self) -> Option<&dyn GpuDagIbpForwardExt> {
@@ -258,27 +273,50 @@ fn build_unsupported_graph() -> GraphNetwork {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Prove that `try_adv_check_on_domain` reaches the DAG cached-plan fast path
-/// (prepare_dag_model_plan + dag_ibp_forward_cached) when a DAG-capable engine
-/// is present and the graph is DAG-lowerable.
+/// Hand-computed forward of [`build_dag_lowerable_graph`] in binary64:
+/// `residual = x + W2·relu(W1·x + b1)`.
+fn dag_lowerable_forward_f64(x: &[f32]) -> [f64; 2] {
+    let x = [f64::from(x[0]), f64::from(x[1])];
+    let l1 = [
+        0.8 * x[0] - 0.3 * x[1] + 0.1,
+        0.4 * x[0] + 0.9 * x[1] - 0.05,
+    ];
+    let r = [l1[0].max(0.0), l1[1].max(0.0)];
+    [
+        x[0] + 0.6 * r[0] - 0.2 * r[1],
+        x[1] - 0.4 * r[0] + 0.7 * r[1],
+    ]
+}
+
+/// `try_adv_check_on_domain` on a DAG-lowerable graph with a DAG-capable
+/// engine evaluates its points through the engine's original-coefficient GEMM
+/// and never prepares or executes the resident interval plan, so the plan's
+/// enclosure midpoint can never become a reported witness.
 ///
-/// Regression for #4276.
+/// This replaces the earlier pin that REQUIRED the cached plan and forbade the
+/// GEMM: that contract was withdrawn by 3978f781c and contradicts
+/// `graph_point_declines_resident_interval_midpoints_and_uses_original_gemm`
+/// for the very function `adv_check` calls. Had the plan answered here, this
+/// domain (output 0 lies in [-1.25, 1.72] at every point) would have reported
+/// the plan midpoint -1999 as a violation of the threshold -1000.
 #[test]
-fn test_adv_check_dag_lowerable_graph_hits_cached_plan_path_4276() {
+fn test_adv_check_dag_lowerable_graph_declines_interval_plan_and_uses_original_gemm_4276() {
     let graph = build_dag_lowerable_graph();
     let engine = DagCachedPlanCountingEngine::new();
 
-    // Wide domain so SPSA steps don't immediately violate, forcing multiple IBP calls.
+    // Wide domain so SPSA steps don't immediately violate, forcing multiple point
+    // evaluations.
     let input_bounds = BoundedTensor::new(
         ArrayD::from_shape_vec(IxDyn(&[2]), vec![-1.0, -1.0]).unwrap(),
         ArrayD::from_shape_vec(IxDyn(&[2]), vec![1.0, 1.0]).unwrap(),
     )
     .unwrap();
 
-    // Objective and threshold chosen so no violation is found (path-selection
-    // proof, not SAT/UNSAT correctness).
+    // No point of the domain reaches the threshold; only an interval-plan
+    // midpoint (PLAN_ENCLOSURE) would.
     let objective = [1.0_f32, 0.0];
     let threshold = -1000.0;
+    assert!(f32::midpoint(PLAN_ENCLOSURE.0, PLAN_ENCLOSURE.1) < threshold);
 
     let result = try_adv_check_on_domain(
         &graph,
@@ -290,34 +328,60 @@ fn test_adv_check_dag_lowerable_graph_hits_cached_plan_path_4276() {
         0,
         Some(&engine),
     );
-
+    let witness = result.expect("adv_check should succeed with a DAG-capable engine");
     assert!(
-        result.is_ok(),
-        "adv_check should succeed with DAG engine: {:?}",
-        result.err()
+        witness.is_none(),
+        "no point of the domain violates the threshold; a witness here is an \
+         interval midpoint reported as a network value: {witness:?}"
+    );
+    assert_eq!(
+        engine.plan_preparations(),
+        0,
+        "a concrete point forward must not prepare the resident interval plan"
+    );
+    assert_eq!(
+        engine.cached_calls(),
+        0,
+        "a concrete point forward must not execute the resident interval plan"
+    );
+    // Two Linear nodes per point forward; at least one forward ran.
+    assert!(
+        engine.gemm_calls() >= 2,
+        "point evaluation must run the engine's original-coefficient GEMM, got {} calls",
+        engine.gemm_calls()
     );
 
-    // Plan is prepared once (cached across all SPSA evaluations within the call).
-    // The current implementation in graph_ibp.rs prepares a fresh plan per
-    // propagate_ibp_with_engine call, so plan_preparations >= 1.
-    assert!(
-        engine.plan_preparations() >= 1,
-        "DAG engine should have prepared at least 1 plan, got {}",
-        engine.plan_preparations()
-    );
-
-    assert!(
-        engine.cached_calls() > 0,
-        "DAG engine should have executed cached forward at least once, got {}",
-        engine.cached_calls()
-    );
+    // A threshold every point meets: the carried witness output is the network
+    // value at the witness input (binary64 hand forward), not a plan midpoint.
+    let engine = DagCachedPlanCountingEngine::new();
+    let witness = try_adv_check_on_domain(
+        &graph,
+        &input_bounds,
+        &objective,
+        1000.0,
+        false,
+        None,
+        0,
+        Some(&engine),
+    )
+    .expect("adv_check should succeed with a DAG-capable engine")
+    .expect("every point meets threshold 1000, so restart 0 reports a witness");
+    let expected = dag_lowerable_forward_f64(&witness.input);
+    for (index, (&got, &want)) in witness.output.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (f64::from(got) - want).abs() <= 1e-5,
+            "witness output[{index}] {got} must be the network value {want} at {:?}",
+            witness.input
+        );
+    }
+    assert_eq!(engine.plan_preparations(), 0);
+    assert_eq!(engine.cached_calls(), 0);
+    assert!(engine.gemm_calls() >= 2);
 }
 
 /// Prove that `try_adv_check_on_domain` does NOT call prepare_dag_model_plan
 /// or dag_ibp_forward_cached when the graph contains an unsupported op (Sign).
 /// The DAG lowering returns None, so the engine's DAG methods are never reached.
-///
-/// Regression for #4276.
 #[test]
 fn test_adv_check_unsupported_graph_skips_dag_plan_4276() {
     let graph = build_unsupported_graph();
@@ -361,12 +425,12 @@ fn test_adv_check_unsupported_graph_skips_dag_plan_4276() {
     );
 }
 
-/// Value correctness for the DAG-lowerable fast path of
-/// `GraphNetwork::propagate_concrete_point` (#cgan-eval / #4276): on a
-/// widening-free DAG a point input must stay degenerate and the returned value
-/// must equal the TRUE network forward — NOT a widened box (the whole bug this
-/// routine exists to avoid). We check this independently of the IBP machinery by
-/// hand-computing `residual = x + W2·relu(W1·x + b1)` for the residual-add graph.
+/// Value correctness of `GraphNetwork::propagate_concrete_point` on the
+/// DAG-lowerable graph (#cgan-eval): a point input must stay degenerate and
+/// the returned value must equal the TRUE network forward — NOT a widened box
+/// (the whole bug this routine exists to avoid). We check this independently
+/// of the IBP machinery by hand-computing `residual = x + W2·relu(W1·x + b1)`
+/// for the residual-add graph.
 #[test]
 fn test_propagate_concrete_point_dag_fast_path_returns_true_forward() {
     let graph = build_dag_lowerable_graph();
@@ -386,8 +450,8 @@ fn test_propagate_concrete_point_dag_fast_path_returns_true_forward() {
     let l2 = [0.6 * r[0] - 0.2 * r[1], -0.4 * r[0] + 0.7 * r[1]];
     let expected = [x[0] + l2[0], x[1] + l2[1]];
 
-    // engine = None exercises the fast path's CPU box-forward delegation; the result
-    // must be degenerate (lower == upper) and equal the true forward.
+    // engine = None exercises the CPU point dispatcher; the result must be
+    // degenerate (lower == upper) and equal the true forward.
     let out = graph
         .propagate_concrete_point(&point, None, None)
         .expect("concrete point forward on DAG-lowerable graph should succeed");
@@ -410,8 +474,8 @@ fn test_propagate_concrete_point_dag_fast_path_returns_true_forward() {
         );
     }
 
-    // Same via the GEMM-engine entry: a non-DAG CPU engine still delegates to the
-    // box forward (no DAG ext) and must produce the identical true forward.
+    // Same via the GEMM-engine entry: Linear nodes run the engine's
+    // original-coefficient GEMM and must produce the identical true forward.
     let out_engine = graph
         .propagate_concrete_point(&point, Some(&NaiveCpuGemmEngine), None)
         .expect("concrete point forward with engine should succeed");

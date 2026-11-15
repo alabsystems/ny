@@ -70,7 +70,7 @@ impl ZonotopeTensor {
         let softmax_dim = self.element_shape[axis_usize];
 
         // Helper: stable softmax computation
-        // #2676 Site 1: Guard against NaN input and non-finite sum.
+        // Guard against NaN input and non-finite sum.
         // NaN input → nan_propagating_max returns NaN → exp(NaN) = NaN → sum = NaN.
         // Fallback: uniform distribution (maximally uncertain, sound over-approximation).
         fn compute_softmax(x: &[f32]) -> Vec<f32> {
@@ -108,7 +108,7 @@ impl ZonotopeTensor {
             let dim = softmax_dim;
             // Each element gets its own approximation-error symbol to prevent
             // false cancellation across coordinates after downstream linear ops.
-            // Same fix as GELU (gelu.rs gelu_affine_1d, #2470) and SiLU (#2486).
+            // Same fix as GELU (gelu.rs gelu_affine_1d) and SiLU.
             let n_new_error_terms = dim;
             let n_rows = (1usize + self.n_error_terms)
                 .checked_add(n_new_error_terms)
@@ -134,7 +134,7 @@ impl ZonotopeTensor {
             // Σ_k ||a_k||_1 (sum over all error terms), NOT max_k ||a_k||_1.
             // The zonotope z = c + Σ_k ε_k·a_k achieves max perturbation when
             // all ε_k align, giving ||z - c||_1 = Σ_k ||a_k||_1.
-            // Fix for #2473: was `max_radius.max(radius_k)`, now accumulates sum.
+            // An earlier version took `max_radius.max(radius_k)`; this accumulates the sum.
             let mut total_radius = 0.0f32;
             for k in 1..=self.n_error_terms {
                 let err_k: Vec<f32> = self.coeffs.index_axis(Axis(0), k).iter().cloned().collect();
@@ -150,7 +150,7 @@ impl ZonotopeTensor {
                 }
             }
 
-            // Add per-element approximation error terms (#2522)
+            // Add per-element approximation error terms
             // Taylor remainder: |σ(z) - linear_approx|_∞ ≤ 0.5 * H_MAX * r²
             // where r = Σ_k ||a_k||_1 is the total worst-case perturbation radius
             // and H_MAX = √3/18 ≈ 0.0962 is the tight element-wise Hessian bound.
@@ -185,8 +185,8 @@ impl ZonotopeTensor {
                     ))
                 })?;
             let dim = softmax_dim;
-            // Each element gets its own approximation-error symbol (#2522).
-            // Same per-element fix as GELU (#2470) and SiLU (#2486).
+            // Each element gets its own approximation-error symbol.
+            // Same per-element fix as GELU and SiLU.
             let n_new_error_terms = prefix_size.checked_mul(dim).ok_or_else(|| {
                 NyError::InvalidSpec(format!(
                     "softmax_affine: error term count overflows: {} * {}",
@@ -238,7 +238,7 @@ impl ZonotopeTensor {
                 }
 
                 // Transform error coefficients
-                // Fix for #2473: accumulate sum of per-term L1 radii, not max.
+                // Accumulate sum of per-term L1 radii, not max.
                 // See 1D path comment for mathematical justification.
                 let mut total_radius_this_row = 0.0f32;
                 for k in 1..=self.n_error_terms {
@@ -252,7 +252,7 @@ impl ZonotopeTensor {
                     }
                 }
 
-                // Per-element approximation error terms (#2522)
+                // Per-element approximation error terms
                 // Each (row_idx, d) pair gets its own independent error symbol.
                 // Taylor remainder with tight Hessian bound: 0.5 * √3/18 * r²
                 let approx_error =
@@ -344,8 +344,8 @@ impl ZonotopeTensor {
             ))
         })?;
         // center + existing errors
-        // Each element gets its own approximation-error symbol (#2522).
-        // Same per-element fix as GELU (#2470), SiLU (#2486), and softmax 1D/2D.
+        // Each element gets its own approximation-error symbol.
+        // Same per-element fix as GELU, SiLU, and softmax 1D/2D.
         let n_new_error_terms = n_attn_rows.checked_mul(seq_k).ok_or_else(|| {
             NyError::InvalidSpec(format!(
                 "softmax_affine_causal: n_new_error_terms overflows: {} * {}",
@@ -359,7 +359,7 @@ impl ZonotopeTensor {
             ))
         })?;
 
-        // #2676 Site 1: Same NaN guard as compute_softmax (see softmax_affine).
+        // Same NaN guard as compute_softmax (see softmax_affine).
         fn compute_softmax_prefix(x: &[f32]) -> Vec<f32> {
             let n = x.len();
             let max_val = x
@@ -416,7 +416,7 @@ impl ZonotopeTensor {
                 out_coeffs_3d[[0, row, j]] = sc;
             }
 
-            // Fix for #2473: accumulate sum of per-term L1 radii, not max.
+            // Accumulate sum of per-term L1 radii, not max.
             // See softmax_affine 1D path comment for mathematical justification.
             let mut total_radius_this_row = 0.0f32;
             for k in 1..=self.n_error_terms {
@@ -430,7 +430,7 @@ impl ZonotopeTensor {
                 }
             }
 
-            // Per-element approximation error terms (#2522), only for unmasked entries.
+            // Per-element approximation error terms, only for unmasked entries.
             // Each (row, j) pair gets its own independent error symbol.
             // Taylor remainder with tight Hessian bound: 0.5 * √3/18 * r²
             let approx_error =

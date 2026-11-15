@@ -16,7 +16,7 @@
 //! Run:
 //! ```text
 //! NY_PROBE_ONNX=... NY_PROBE_VNNLIB=... NY_PROBE_PATCHES=1 \
-//!   cargo run -p ny-onnx --release --example slack_probe_pool
+//!   targo --unverified run -p ny-onnx --release --example slack_probe_pool
 //! ```
 
 use ndarray::{Array2, ArrayD, IxDyn};

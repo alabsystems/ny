@@ -102,7 +102,7 @@ fn test_safe_add_upper_for_bounds_nan_to_pos_inf() {
 #[test]
 fn test_batched_interval_matvec_deterministic() {
     // When lower == upper for coefficients, result should be a sound interval
-    // containing the true dot product. Directed rounding (#2391) widens by
+    // containing the true dot product. Directed rounding widens by
     // at most 1 ULP on each side, so lower and upper may differ by up to 2 ULPs.
     let a = ArrayD::from_shape_vec(IxDyn(&[2, 3]), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0_f32]).unwrap();
     let x_lower = ArrayD::from_shape_vec(IxDyn(&[3]), vec![1.0, 2.0, 3.0_f32]).unwrap();
@@ -142,7 +142,7 @@ fn test_batched_interval_matvec_deterministic() {
 #[ntest::timeout(5000)]
 #[test]
 fn test_batched_interval_matvec_negative_input() {
-    // Test case that triggered bug #229: negative input with interval coefficients
+    // Regression case: negative input with interval coefficients
     // Coefficient: [0, 0.1], Input: [-1.0, -0.5]
     // Products: 0*-1=0, 0*-0.5=0, 0.1*-1=-0.1, 0.1*-0.5=-0.05
     // Result: [min(-0.1, 0), max(0, -0.05)] = [-0.1, 0]
@@ -158,7 +158,7 @@ fn test_batched_interval_matvec_negative_input() {
     // Result should be [-0.1, 0] (sound interval)
     assert!((result_lower[[0]] - (-0.1)).abs() < 1e-6);
     assert!((result_upper[[0]] - 0.0).abs() < 1e-6);
-    // Critical: lower <= upper (the bug that #229 caught)
+    // Critical: lower <= upper (the original bug)
     assert!(result_lower[[0]] <= result_upper[[0]]);
 }
 
@@ -457,7 +457,7 @@ fn test_batched_interval_matvec_valid_input_unchanged() {
         .expect("valid input should succeed");
 
     // Result should be [1*1 + 2*2 + 3*3, 4*1 + 5*2 + 6*3] = [14, 32]
-    // Directed rounding (#2391) widens by at most 1 ULP per side.
+    // Directed rounding widens by at most 1 ULP per side.
     assert_eq!(lower.shape(), &[2]);
     assert!(lower[[0]] <= 14.0, "lower {} must be <= 14.0", lower[[0]]);
     assert!(upper[[0]] >= 14.0, "upper {} must be >= 14.0", upper[[0]]);
@@ -501,7 +501,7 @@ fn test_batched_interval_matvec_directed_rounding_soundness() {
     );
     // With directed rounding on point-valued intervals, next_down_f32(x) < next_up_f32(x)
     // for any finite non-zero x. Without directed rounding, lower == upper (plain `as f32`).
-    // This assertion would FAIL without the next_down/next_up fix. (#2391)
+    // This assertion would FAIL without the next_down/next_up fix.
     assert!(
         result_lower[[0]] < result_upper[[0]],
         "directed rounding must widen point-valued interval: lower {} must be strictly < upper {} (#2391)",
@@ -538,7 +538,7 @@ fn test_batched_interval_matvec_directed_rounding_large_sum() {
         result_upper[[0]]
     );
     // With directed rounding, lower and upper MUST differ for finite non-zero sums.
-    // Without the fix, both would be `true_f32` (plain `as f32`). (#2391)
+    // Without the fix, both would be `true_f32` (plain `as f32`).
     assert!(
         result_lower[[0]] < result_upper[[0]],
         "directed rounding must widen point-valued interval: lower {} must be strictly < upper {} (#2391)",

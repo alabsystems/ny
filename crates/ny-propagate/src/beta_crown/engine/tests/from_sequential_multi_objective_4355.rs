@@ -7,8 +7,6 @@
 //! Reproduces the NaN child domain CROWN backward observed on cora_2024 when
 //! `optimize_disjuncts_separately` routes through multi-objective Graph BaB
 //! on models loaded as Sequential (MLP) and converted via `from_sequential`.
-//!
-//! Part of #4355.
 
 use super::prelude::*;
 
@@ -230,7 +228,7 @@ fn build_direct_graph_4out() -> (GraphNetwork, BoundedTensor) {
     (graph, input)
 }
 
-/// Direct GraphNetwork (not from_sequential) with per-disjunct alpha (#4355).
+/// Direct GraphNetwork (not from_sequential) with per-disjunct alpha.
 /// Regression test for "Child propagation failed" on benchmark models.
 #[ntest::timeout(30000)]
 #[test]

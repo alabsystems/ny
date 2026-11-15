@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Batched GEMM for Conv2d forward (ConvTranspose2d CROWN backward) (#3598).
+//! Batched GEMM for Conv2d forward (ConvTranspose2d CROWN backward).
 //!
 //! Replaces per-row `conv2d_single` calls with a single im2col + GEMM,
 //! enabling GPU dispatch via `GemmEngine`. Mirrors the pattern in
@@ -23,6 +23,9 @@ use std::{
 use tracing::debug;
 
 use crate::faer_parallelism::{mat_mul, mat_mul_f64};
+
+#[path = "ops_gemm_bounded.rs"]
+mod bounded_f64;
 
 /// Maximum scalar multiply/add operations admitted between literal deadline
 /// polls on finite-deadline CPU convolution paths. Since
@@ -605,7 +608,8 @@ pub(crate) fn conv2d_forward_backward_coeff_f64_with_deadline(
     // enclosure, but it remains dark by default until the required on-device
     // parity, contention, memory, and sealed-scorecard gates have passed.
     let sound_f64_gpu_enabled = convtranspose_sound_f64_gpu_enabled(
-        std::env::var_os("NY_CONVTRANSPOSE_SOUND_F64_GPU").as_deref(),
+        ny_levers::read_raw_os(&ny_levers::decls::kernel_inputs::CONVTRANSPOSE_SOUND_F64_GPU)
+            .as_deref(),
     );
     conv2d_forward_backward_coeff_f64_with_deadline_and_engine(
         a_coefficients,
@@ -1123,13 +1127,54 @@ fn conv2d_forward_backward_coeff_f64_pollable_cpu_with_block_objs(
 
     // Kernel reshape — identical to the no-deadline twin's W_T:
     // (conv_out_c, conv_in_c, kh, kw) → (col_width, conv_out_c).
-    let w_t = Mat::<f64>::from_fn(geometry.col_width, geometry.conv_out_c, |col, oc| {
-        let ic = col / geometry.kernel_spatial;
-        let rem = col % geometry.kernel_spatial;
-        let ki = rem / geometry.kw;
-        let kj = rem % geometry.kw;
-        f64::from(kernel[[oc, ic, ki, kj]])
-    });
+    //
+    // IDENTITY ON A CONTIGUOUS SLAB (#conv-fill-hoist, W side; the same rewrite
+    // already ships for the deadline-bounded Conv2d W prep in
+    // `ops_transpose_gemm.rs`). `col` is the FAST index of a column-major `Mat`
+    // (faer 0.24's `Mat::from_fn` runs `for j in cols { for i in rows { f(i, j)
+    // } }`, and here the row index IS `col`), so none of the closure's four
+    // div/mods can be hoisted out of the fill: two hardware divisions per
+    // element, on top of a 4-axis DYNAMIC-RANK `ArrayD` index — a stride dot
+    // product with a per-axis bounds check.
+    //
+    // None of it is needed. `col = ic*kernel_spatial + ki*kw + kj` is by
+    // construction the flat offset of `[oc, ic, ki, kj]` inside row `oc` of a
+    // standard-layout `(conv_out_c, conv_in_c, kh, kw)` slab, and a
+    // column-major `Mat` of shape `(col_width, conv_out_c)` stores `(col, oc)`
+    // at offset `col` of column `oc`. So column `oc` of W_T is exactly
+    // `kernel_flat[oc*col_width..(oc + 1)*col_width]` widened IN ORDER: there
+    // is no transpose to perform and no index arithmetic to do.
+    //
+    // Bit-identical operand: faer's `Mat::zeros` IS `Mat::from_fn(.., |_, _|
+    // T::zero_impl())` (`mat/matown.rs`), so shape, `row_capacity`, strides and
+    // alignment are what the closure produced — the layout `mat_mul_f64`
+    // selects its kernel and blocking from — and every slot is then overwritten
+    // with the same exactly-widened `f64` the closure stored. Guarded
+    // structurally by `pollable_f64_kernel_slab` on precisely the shape and
+    // layout facts the algebra needs; any mismatch keeps the closure, which
+    // stays the definition of W_T.
+    let kernel_flat = pollable_f64_kernel_slab(kernel, geometry);
+    let w_t = if let Some(kernel_flat) = kernel_flat {
+        let mut w_t = Mat::<f64>::zeros(geometry.col_width, geometry.conv_out_c);
+        for oc in 0..geometry.conv_out_c {
+            // `(oc + 1) * col_width <= conv_out_c * col_width == kernel.len()`
+            // by the guard above, and `col_as_slice_mut` yields exactly
+            // `col_width` slots, so the zip covers the whole column.
+            let weights = &kernel_flat[oc * geometry.col_width..(oc + 1) * geometry.col_width];
+            for (slot, &weight) in w_t.col_as_slice_mut(oc).iter_mut().zip(weights) {
+                *slot = f64::from(weight);
+            }
+        }
+        w_t
+    } else {
+        Mat::<f64>::from_fn(geometry.col_width, geometry.conv_out_c, |col, oc| {
+            let ic = col / geometry.kernel_spatial;
+            let rem = col % geometry.kernel_spatial;
+            let ki = rem / geometry.kw;
+            let kj = rem % geometry.kw;
+            f64::from(kernel[[oc, ic, ki, kj]])
+        })
+    };
 
     let mut obj_start = 0usize;
     while obj_start < geometry.num_objectives {
@@ -1146,7 +1191,188 @@ fn conv2d_forward_backward_coeff_f64_pollable_cpu_with_block_objs(
 
         // im2col — gather receptive-field patches for this objective block,
         // identical index math to the no-deadline twin.
-        let im2col_block = Mat::<f64>::from_fn(block_rows, geometry.col_width, |pos, col| {
+        let im2col_block =
+            pollable_f64_im2col_block(a_coefficients, geometry, obj_start, block, block_rows);
+        // Do not launch a GEMM after im2col itself has consumed the remaining
+        // node budget (mirrors the no-deadline twin's post-im2col poll).
+        if DeadlineInstant::now() >= deadline {
+            return Err(super::ops_transpose_gemm::per_node_deadline_exceeded());
+        }
+        let prod = mat_mul_f64(&im2col_block, &w_t);
+
+        // Scatter to (obj, oc * spatial_per_obj + spatial) layout.
+        //
+        // Both sides are contiguous over `spatial`, so this moves whole runs
+        // instead of scalars. `prod` is column-major, so GEMM rows
+        // `local_obj*spatial_per_obj ..` of column `oc` are adjacent inside
+        // `prod.col_as_slice(oc)`; the destination run starts at
+        // `obj*conv_out_size + oc*spatial_per_obj` and is `spatial_per_obj`
+        // long. The former `prod[(gemm_row, oc)]` rebuilt a strided 2-D address
+        // and its bounds check for each of the `block_rows * conv_out_c`
+        // scalars. Same bytes, same values — the loop nest is only reordered
+        // (oc outermost, so each column slice is taken once) and no floating
+        // point is performed here at all.
+        for oc in 0..geometry.conv_out_c {
+            let column = prod.col_as_slice(oc);
+            for local_obj in 0..block {
+                let obj = obj_start + local_obj;
+                let gemm_row = local_obj * geometry.spatial_per_obj;
+                let result_index = obj * geometry.conv_out_size + oc * geometry.spatial_per_obj;
+                result[result_index..result_index + geometry.spatial_per_obj]
+                    .copy_from_slice(&column[gemm_row..gemm_row + geometry.spatial_per_obj]);
+            }
+        }
+        obj_start += block;
+    }
+    if DeadlineInstant::now() >= deadline {
+        return Err(super::ops_transpose_gemm::per_node_deadline_exceeded());
+    }
+    Array2::from_shape_vec((geometry.num_objectives, geometry.conv_out_size), result)
+        .map_err(|e| NyError::InternalError(format!("conv2d f64 forward reshape: {e}")))
+}
+
+/// Element count at or above which [`pollable_f64_im2col_block`] fills a block's
+/// columns on the rayon pool rather than on the calling thread.
+///
+/// NOT a measured crossover, and no measurement is claimed: it is a floor, so
+/// that a rayon fork/join plus `col_width` task hand-offs are never paid to move
+/// less than 512 KiB (`1 << 16` f64). What the source does fix is the block
+/// SIZE, not where any particular caller lands relative to this floor. A block
+/// is `block * row_elems` elements with `row_elems = spatial_per_obj *
+/// col_width` and `block <= block_objs = clamp((1 << 23) / row_elems, 1,
+/// num_objectives)` (`DirectF64PairGeometry::checked`), so a block reaches that
+/// 64 MiB im2col quantum only when `num_objectives * row_elems` does. Who lands
+/// where is then arithmetic, not a benchmark: the twin's own note on this
+/// blocking records that "identity-A backwards make `num_objectives` large:
+/// 4608+ rows on cGAN nodes", and at 4608 rows any `row_elems >= 15` already
+/// clears this floor — while a few-row spec block on a small geometry, and the
+/// `block_objs = 1` deadline tests, do not. Those small callers are exactly who
+/// the floor is for: without it they would pay the scheduler once per column to
+/// move a handful of rows.
+const IM2COL_PARALLEL_FILL_MIN_ELEMENTS: usize = 1 << 16;
+
+/// Which fill lane [`pollable_f64_im2col_block`] uses for one objective block.
+///
+/// The lane is a separate, NAMED decision so a bit-parity pin can assert the
+/// lane it is pinning was actually taken. Comparing a fast lane against the
+/// closure proves nothing if the input silently routed to the closure on both
+/// sides, and the no-deadline twin this route is pinned against always runs the
+/// closure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Im2colFillLane {
+    /// Contiguous-coefficient slab fill, columns filled on the calling thread.
+    SlabSerial,
+    /// Contiguous-coefficient slab fill, columns filled on the rayon pool.
+    SlabParallel,
+    /// The pre-existing `Mat::from_fn` closure, kept verbatim for coefficients
+    /// that are not one contiguous standard-layout slab.
+    Closure,
+}
+
+/// The lane [`pollable_f64_im2col_block`] takes for these coefficients at this
+/// block shape. `Array2::as_slice` is the slab guard; the element count is
+/// [`IM2COL_PARALLEL_FILL_MIN_ELEMENTS`].
+fn im2col_fill_lane(
+    a_coefficients: &Array2<f32>,
+    block_rows: usize,
+    col_width: usize,
+) -> Im2colFillLane {
+    if a_coefficients.as_slice().is_none() {
+        Im2colFillLane::Closure
+    } else if block_rows.saturating_mul(col_width) >= IM2COL_PARALLEL_FILL_MIN_ELEMENTS {
+        Im2colFillLane::SlabParallel
+    } else {
+        Im2colFillLane::SlabSerial
+    }
+}
+
+/// im2col patch matrix for ONE objective block of the finite-deadline sound-f64
+/// recompute — the LHS operand `mat_mul_f64` consumes.
+///
+/// FILL COST. The `Mat::<f64>::from_fn(block_rows, col_width, ..)` this
+/// replaces paid, PER ELEMENT: four `/` + `%` pairs, two of them on `pos`,
+/// which faer's `from_fn` varies FASTEST (`for j in cols { for i in rows { f(i,
+/// j) } }`, `mat/matown.rs`), so only the `col` half is even a hoisting
+/// candidate; the `checked_mul`/`checked_add`/`checked_sub`/`filter` chain on
+/// both spatial axes; and one bounds-checked 2-D `ndarray` index. All of it
+/// single-threaded, in front of a `mat_mul_f64` that is not, on a block sized by
+/// `DirectF64PairGeometry::checked`'s objective blocking.
+///
+/// WHAT REPLACES IT. `col` decomposes into `(ic, ki, kj)` once per column, and
+/// the `ow` window `[ow_lo, ow_hi)` on which `iw = ow*sw + kj*dw - pw` lands
+/// inside `0..in_w` is derived once per column too — it depends on neither the
+/// objective nor `oh`. Inside that window the input index is in range by
+/// construction, so the innermost loop carries no validity test; outside it,
+/// and for every `oh` whose `ih` falls out of range, the entry keeps the
+/// `Mat::zeros` `+0.0` the closure used to write explicitly. Columns are
+/// disjoint destinations, so a large block fills them in parallel.
+///
+/// BIT-IDENTICAL OPERAND. faer's `Mat::zeros` IS `Mat::from_fn(.., |_, _|
+/// T::zero_impl())`, i.e. the same `RawMat::try_with_capacity` allocation, so
+/// the result's shape, `row_capacity`, strides and alignment are exactly what
+/// the closure produced — and that layout is what faer selects its GEMM kernel
+/// and blocking from. Every stored value is still `f64::from(a_coefficients[[obj,
+/// ic*input_spatial + ih*in_w + iw]])` (an exact widening) at exactly the same
+/// `(pos, col)`, or padding zero; `<f64 as ComplexField>::zero_impl()` is
+/// `0.0`, not `-0.0`, so the padding taps are unchanged as well. Only integer
+/// address arithmetic and thread assignment moved.
+///
+/// INDEX ARITHMETIC. `[profile.release] overflow-checks = true`, so the plain
+/// `*`/`+` below has to be argued rather than assumed.
+/// `DirectF64PairGeometry::checked` is the type's ONLY constructor (it has no
+/// struct literal anywhere), and it proved `padded_w = 2*pw + in_w` and
+/// `padded_h = 2*ph + in_h` representable with `out_w = (padded_w -
+/// eff_kw)/sw + 1`; hence `(out_w - 1)*sw <= padded_w - eff_kw` and therefore
+/// `ow*sw + kj*dw <= padded_w - 1` for every `ow < out_w`, and symmetrically on
+/// the h axis. These are the same invariants the surrounding block loop's own
+/// unchecked `block * spatial_per_obj` and `obj * conv_out_size + ..` already
+/// lean on.
+///
+/// FALLBACK. Coefficients that are not one contiguous standard-layout slab keep
+/// the original closure verbatim; [`im2col_fill_lane`] carries the guard.
+fn pollable_f64_im2col_block(
+    a_coefficients: &Array2<f32>,
+    geometry: DirectF64PairGeometry,
+    obj_start: usize,
+    block: usize,
+    block_rows: usize,
+) -> Mat<f64> {
+    pollable_f64_im2col_block_on_lane(
+        a_coefficients,
+        geometry,
+        obj_start,
+        block,
+        block_rows,
+        im2col_fill_lane(a_coefficients, block_rows, geometry.col_width),
+    )
+}
+
+/// Testable core of [`pollable_f64_im2col_block`], with the fill lane supplied
+/// rather than chosen.
+///
+/// Production always passes [`im2col_fill_lane`]'s verdict, so this split moves
+/// no float and changes no dispatch. Tests pass a lane explicitly, which is what
+/// lets the parallel arm be compared bit-for-bit against the serial arm and
+/// against the closure on ONE geometry — the three lanes are otherwise mutually
+/// unreachable for a given input. Asking for a slab lane on coefficients that
+/// are not a contiguous slab still takes the closure: the lane argument can only
+/// narrow what the `as_slice` guard already allows, never widen it.
+fn pollable_f64_im2col_block_on_lane(
+    a_coefficients: &Array2<f32>,
+    geometry: DirectF64PairGeometry,
+    obj_start: usize,
+    block: usize,
+    block_rows: usize,
+    lane: Im2colFillLane,
+) -> Mat<f64> {
+    use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+
+    let slab = match lane {
+        Im2colFillLane::SlabSerial | Im2colFillLane::SlabParallel => a_coefficients.as_slice(),
+        Im2colFillLane::Closure => None,
+    };
+    let Some(a_flat) = slab else {
+        return Mat::<f64>::from_fn(block_rows, geometry.col_width, |pos, col| {
             let obj = obj_start + pos / geometry.spatial_per_obj;
             let spatial = pos % geometry.spatial_per_obj;
             let oh = spatial / geometry.out_w;
@@ -1173,42 +1399,203 @@ fn conv2d_forward_backward_coeff_f64_pollable_cpu_with_block_objs(
                 _ => 0.0,
             }
         });
-        // Do not launch a GEMM after im2col itself has consumed the remaining
-        // node budget (mirrors the no-deadline twin's post-im2col poll).
-        if DeadlineInstant::now() >= deadline {
-            return Err(super::ops_transpose_gemm::per_node_deadline_exceeded());
-        }
-        let prod = mat_mul_f64(&im2col_block, &w_t);
+    };
+    let a_cols = a_coefficients.ncols();
+    // Exact: `checked` built `spatial_per_obj` as `out_h * out_w`, and `out_w`
+    // is at least 1 there.
+    let out_h = geometry.spatial_per_obj / geometry.out_w;
 
-        // Scatter to (obj, oc * spatial_per_obj + spatial) layout.
-        for local_obj in 0..block {
-            let obj = obj_start + local_obj;
-            for oc in 0..geometry.conv_out_c {
-                for spatial in 0..geometry.spatial_per_obj {
-                    let gemm_row = local_obj * geometry.spatial_per_obj + spatial;
-                    let result_index =
-                        obj * geometry.conv_out_size + oc * geometry.spatial_per_obj + spatial;
-                    result[result_index] = prod[(gemm_row, oc)];
-                }
+    let mut im2col_block = Mat::<f64>::zeros(block_rows, geometry.col_width);
+    // NESTED PARALLELISM, and why this one is knob-less. The live route reaches
+    // here from inside a `rayon::join` (`bound_transpose.rs`'s two-sided
+    // `recompute_side`), where `current_par()` (`faer_parallelism.rs`) forces
+    // faer to `Par::Seq`, and where the tree gates its one deliberate exception
+    // behind `NestedFaerParGuard` / `NY_INPUT_SPLIT_NESTED_PAR`. What that guard
+    // gates is a GEMM whose summation order — and so a bound's last ULP — moves
+    // with the thread count; that is why it carries its own soundness paragraph.
+    // This fill performs no arithmetic at all: columns are disjoint
+    // destinations written with exactly-widened `f32`s that are pure functions
+    // of the index, so which thread writes a slot cannot change its bits, and
+    // `convtranspose_sound_f64_im2col_parallel_fill_matches_serial_and_closure_bitwise`
+    // pins exactly that against both the serial arm and the pre-hoist closure.
+    // On blocking, the tree's own written position (`NestedFaerParGuard`) is
+    // that a work-stealing rayon scope nested in an outer `par_iter` worker
+    // "participates in work-stealing rather than blocking" — the guarded hazard is
+    // faer's `&Mat * &Mat` operator, which this is not — and that a saturated
+    // pool leaves the nested scope nothing to steal, so it costs a fork/join and
+    // runs where it already was.
+    if lane == Im2colFillLane::SlabParallel {
+        im2col_block
+            .par_col_iter_mut()
+            .enumerate()
+            .for_each(|(col, column)| {
+                // Infallible for an owned `Mat`, whose row stride is 1: faer's
+                // own `Mat::col_as_slice_mut` — the sequential arm below —
+                // `unwrap()`s this exact call (`faer-0.24.0 mat/matown.rs`), so
+                // the serial lane already carries the identical assumption and
+                // this arm adds no new failure mode.
+                let dst = column
+                    .try_as_col_major_mut()
+                    .expect("an owned faer Mat has unit row stride")
+                    .as_slice_mut();
+                fill_pollable_f64_im2col_column(
+                    dst, a_flat, a_cols, geometry, out_h, obj_start, block, col,
+                );
+            });
+    } else {
+        for col in 0..geometry.col_width {
+            let dst = im2col_block.col_as_slice_mut(col);
+            fill_pollable_f64_im2col_column(
+                dst, a_flat, a_cols, geometry, out_h, obj_start, block, col,
+            );
+        }
+    }
+    im2col_block
+}
+
+/// One column of [`pollable_f64_im2col_block`]'s patch matrix.
+///
+/// `dst` is that column's `block_rows` contiguous f64 slots, already `+0.0`
+/// from `Mat::zeros`; only the in-bounds taps are written, so every skipped
+/// position keeps the padding zero the old closure stored there. See
+/// [`pollable_f64_im2col_block`] for the bit-identity and overflow arguments.
+fn fill_pollable_f64_im2col_column(
+    dst: &mut [f64],
+    a_flat: &[f32],
+    a_cols: usize,
+    geometry: DirectF64PairGeometry,
+    out_h: usize,
+    obj_start: usize,
+    block: usize,
+    col: usize,
+) {
+    let ic = col / geometry.kernel_spatial;
+    let rem = col % geometry.kernel_spatial;
+    let ki = rem / geometry.kw;
+    let kj = rem % geometry.kw;
+    let kh_offset = ki * geometry.dh;
+    let kw_offset = kj * geometry.dw;
+    let channel_base = ic * geometry.input_spatial;
+
+    let (ow_lo, ow_hi) = im2col_column_ow_window(geometry, kw_offset);
+    if ow_lo >= ow_hi {
+        // Every tap in this column is padding; the zeros already there are the
+        // answer.
+        return;
+    }
+
+    for local_obj in 0..block {
+        let obj = obj_start + local_obj;
+        let row = &a_flat[obj * a_cols..(obj + 1) * a_cols];
+        let obj_base = local_obj * geometry.spatial_per_obj;
+        for oh in 0..out_h {
+            let padded = oh * geometry.sh + kh_offset;
+            if padded < geometry.ph {
+                continue;
+            }
+            let ih = padded - geometry.ph;
+            if ih >= geometry.in_h {
+                continue;
+            }
+            let row_base = channel_base + ih * geometry.in_w;
+            let dst_base = obj_base + oh * geometry.out_w;
+            for (offset, slot) in dst[dst_base + ow_lo..dst_base + ow_hi]
+                .iter_mut()
+                .enumerate()
+            {
+                let iw = (ow_lo + offset) * geometry.sw + kw_offset - geometry.pw;
+                *slot = f64::from(row[row_base + iw]);
             }
         }
-        obj_start += block;
     }
-    if DeadlineInstant::now() >= deadline {
-        return Err(super::ops_transpose_gemm::per_node_deadline_exceeded());
+}
+
+/// The half-open `ow` window `[lo, hi)` on which an im2col column whose
+/// horizontal kernel offset is `kw_offset = kj*dw` has a tap `iw = ow*sw +
+/// kw_offset - pw` that is both defined and inside `0..in_w`.
+///
+/// `iw` exists and is in range exactly when `pw <= ow*sw + kw_offset < in_w +
+/// pw`. That is a property of the COLUMN alone — neither the objective nor `oh`
+/// appears — so [`fill_pollable_f64_im2col_column`] solves it once per column
+/// and its innermost loop then runs with no per-element validity test, where the
+/// closure it replaces re-evaluated a `checked_mul`/`checked_add`/`checked_sub`/
+/// `filter` chain for every element. `lo >= hi` means every tap in the column is
+/// padding.
+///
+/// Both `div_ceil`s are exact inverses of a strict integer inequality for `sw >=
+/// 1` (`x*sw >= c  <=>  x >= c.div_ceil(sw)` and `x*sw < c  <=>  x <
+/// c.div_ceil(sw)`), and `DirectF64PairGeometry::checked` — the type's only
+/// constructor — rejects a zero stride and proves `in_w + pw <= padded_w`
+/// representable, so neither the multiplication nor either subtraction can
+/// overflow under `[profile.release] overflow-checks = true`.
+/// `convtranspose_sound_f64_im2col_column_window_is_exact_and_covers_clipping`
+/// brute-forces this against the closure's own predicate, and asserts its grid
+/// really contains the empty, low-clipped, high-clipped and both-ends-clipped
+/// shapes.
+fn im2col_column_ow_window(geometry: DirectF64PairGeometry, kw_offset: usize) -> (usize, usize) {
+    let ow_lo = if kw_offset >= geometry.pw {
+        0
+    } else {
+        (geometry.pw - kw_offset).div_ceil(geometry.sw)
+    };
+    let ow_hi = if kw_offset >= geometry.in_w + geometry.pw {
+        0
+    } else {
+        (geometry.in_w + geometry.pw - kw_offset)
+            .div_ceil(geometry.sw)
+            .min(geometry.out_w)
+    };
+    (ow_lo, ow_hi)
+}
+
+/// The kernel viewed as ONE contiguous C-order `(conv_out_c, conv_in_c, kh, kw)`
+/// slab whose row `oc` is exactly column `oc` of W_T, or `None` when any shape
+/// or layout fact that identity needs is missing — in which case
+/// [`conv2d_forward_backward_coeff_f64_pollable_cpu_with_block_objs`] keeps the
+/// original `Mat::from_fn` closure, which stays the definition of W_T.
+///
+/// Split out from the call site so a bit-parity pin can assert the slab lane it
+/// is pinning was actually entered, rather than silently comparing the fallback
+/// closure against the no-deadline twin's identical closure.
+///
+/// `ndarray`'s `is_layout_c` (`dimension/mod.rs`, behind `is_standard_layout`)
+/// SKIPS unit axes, so a permuted unit axis can keep it true; harmless here,
+/// because a unit axis's index is always 0 and contributes 0 to both the C-order
+/// offset and the real address. It also short-circuits TRUE on any zero-length
+/// axis — but `DirectF64PairGeometry::checked` rejects every zero kernel axis
+/// (`kh` and `kw` directly, `conv_out_c` directly, and `conv_in_c` through
+/// `col_width == 0`), so `conv_out_c * col_width` is positive here and the
+/// `kernel.len()` equality below would reject a degenerate kernel anyway.
+fn pollable_f64_kernel_slab(
+    kernel: &ArrayD<f32>,
+    geometry: DirectF64PairGeometry,
+) -> Option<&[f32]> {
+    if kernel.ndim() != 4 || !kernel.is_standard_layout() {
+        return None;
     }
-    Array2::from_shape_vec((geometry.num_objectives, geometry.conv_out_size), result)
-        .map_err(|e| NyError::InternalError(format!("conv2d f64 forward reshape: {e}")))
+    let shape = kernel.shape();
+    if shape[0] != geometry.conv_out_c
+        || shape[3] != geometry.kw
+        || shape[2].checked_mul(shape[3]) != Some(geometry.kernel_spatial)
+        || shape[1].checked_mul(geometry.kernel_spatial) != Some(geometry.col_width)
+        || geometry.conv_out_c.checked_mul(geometry.col_width) != Some(kernel.len())
+    {
+        return None;
+    }
+    kernel.as_slice_memory_order()
 }
 
 /// Optional paired direct-layout recompute for ConvTranspose lower/upper CROWN
-/// coefficients. This route is admitted only by the same exact
-/// `NY_CONVTRANSPOSE_SOUND_F64_GPU=1` gate as the existing per-side CUDA seam.
-/// Gate-off execution never enters this function's engine or allocation path.
+/// coefficients. With no deadline, the exact historical
+/// `NY_CONVTRANSPOSE_SOUND_F64_GPU=1` gate remains unchanged. Finite authority
+/// uses a separate default-on bounded contract; literal `0` disables both.
+/// A refused finite attempt selects the old pollable per-side CPU route.
 ///
 /// Unlike the legacy route, this constructs exact-widened row-major im2col
-/// blocks directly, builds the shared row-major kernel once, and submits the two
-/// independent products through `GemmEngine::gemm_f64_pair_shared_rhs`. Any
+/// blocks directly and builds the shared row-major kernel once. With no deadline,
+/// it submits both products through `GemmEngine::gemm_f64_pair_shared_rhs`;
+/// a finite deadline requires separate `GemmEngine::gemm_f64_with_deadline` calls.
+/// Any
 /// unsupported geometry, allocation failure, engine error/panic, or malformed
 /// output returns `Ok(None)` so the caller can run the unchanged legacy faer
 /// recomputes. Deadline expiry remains a hard `DeadlineExceeded`.
@@ -1227,12 +1614,16 @@ pub(crate) fn conv2d_forward_backward_coeff_f64_pair_with_deadline(
         if DeadlineInstant::now() >= limit {
             return Err(super::ops_transpose_gemm::per_node_deadline_exceeded());
         }
-        // A finite authority never enters the process-global engine. Returning
-        // `None` selects the two pollable per-side CPU recomputes in the caller.
-        return Ok(None);
+        // The finite-only route can use only the explicit bounded f64
+        // contract. Refusal retains the two historical per-side CPU
+        // recomputes; no ordinary engine or partially computed pair escapes.
+        return bounded_f64::try_pair(
+            lower, upper, kernel, stride, padding, dilation, input_size, limit,
+        );
     }
     let enabled = convtranspose_sound_f64_gpu_enabled(
-        std::env::var_os("NY_CONVTRANSPOSE_SOUND_F64_GPU").as_deref(),
+        ny_levers::read_raw_os(&ny_levers::decls::kernel_inputs::CONVTRANSPOSE_SOUND_F64_GPU)
+            .as_deref(),
     );
     if !enabled {
         return Ok(None);
@@ -1915,8 +2306,10 @@ mod tests {
         conv2d_forward_backward_coeff_f64_with_deadline_and_engine, conv2d_forward_batched_gemm,
         conv2d_forward_batched_gemm_with_deadline, conv2d_forward_f64_block_with_engine_and_gate,
         conv2d_forward_f64_pair_with_engine_and_gate, convtranspose_sound_f64_gpu_enabled,
-        run_f32_gemm_before_deadline_with_clock, try_zeroed_f64, CheckedSoundF64GemmShape,
-        DirectF64PairGeometry,
+        im2col_column_ow_window, im2col_fill_lane, pollable_f64_im2col_block_on_lane,
+        pollable_f64_kernel_slab, run_f32_gemm_before_deadline_with_clock, try_zeroed_f64,
+        CheckedSoundF64GemmShape, DirectF64PairGeometry, Im2colFillLane,
+        IM2COL_PARALLEL_FILL_MIN_ELEMENTS,
     };
 
     struct CountingF32Engine {
@@ -3307,6 +3700,597 @@ mod tests {
                     got.to_bits(),
                     want.to_bits(),
                     "bit mismatch at {index}: got={got:e}, want={want:e}"
+                );
+            }
+        }
+    }
+
+    /// The im2col fill this file shipped BEFORE #conv-fill-hoist, transcribed
+    /// from the `Mat::from_fn` closure at HEAD — the definition every fast lane
+    /// has to reproduce. Deliberately duplicated rather than sharing a helper
+    /// with production: a reference that moves with the code under test proves
+    /// nothing.
+    fn reference_im2col_block(
+        a_coefficients: &Array2<f32>,
+        geometry: DirectF64PairGeometry,
+        obj_start: usize,
+        block_rows: usize,
+    ) -> Mat<f64> {
+        Mat::<f64>::from_fn(block_rows, geometry.col_width, |pos, col| {
+            let obj = obj_start + pos / geometry.spatial_per_obj;
+            let spatial = pos % geometry.spatial_per_obj;
+            let oh = spatial / geometry.out_w;
+            let ow = spatial % geometry.out_w;
+            let ic = col / geometry.kernel_spatial;
+            let rem = col % geometry.kernel_spatial;
+            let ki = rem / geometry.kw;
+            let kj = rem % geometry.kw;
+            let ih = oh
+                .checked_mul(geometry.sh)
+                .and_then(|base| ki.checked_mul(geometry.dh)?.checked_add(base))
+                .and_then(|padded| padded.checked_sub(geometry.ph))
+                .filter(|&index| index < geometry.in_h);
+            let iw = ow
+                .checked_mul(geometry.sw)
+                .and_then(|base| kj.checked_mul(geometry.dw)?.checked_add(base))
+                .and_then(|padded| padded.checked_sub(geometry.pw))
+                .filter(|&index| index < geometry.in_w);
+            match (ih, iw) {
+                (Some(ih), Some(iw)) => {
+                    let input_index = ic * geometry.input_spatial + ih * geometry.in_w + iw;
+                    f64::from(a_coefficients[[obj, input_index]])
+                }
+                _ => 0.0,
+            }
+        })
+    }
+
+    /// Bitwise `Mat<f64>` comparison — `to_bits()`, never an epsilon, and with
+    /// no signed-zero allowance: the im2col fill performs no arithmetic at all,
+    /// so every slot must carry the identical bit pattern (`Mat::zeros` writes
+    /// `+0.0` exactly where the closure wrote `0.0`).
+    fn assert_im2col_bits_eq(got: &Mat<f64>, want: &Mat<f64>, context: &str) {
+        assert_eq!(got.nrows(), want.nrows(), "{context}: row count");
+        assert_eq!(got.ncols(), want.ncols(), "{context}: column count");
+        for col in 0..want.ncols() {
+            for row in 0..want.nrows() {
+                let (actual, expected) = (got[(row, col)], want[(row, col)]);
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "{context}: bit mismatch at ({row}, {col}): got={actual:e} want={expected:e}"
+                );
+            }
+        }
+    }
+
+    /// A geometry for the column-window probe, built through
+    /// `DirectF64PairGeometry::checked` — the type's only constructor — so the
+    /// invariants the solver leans on are the production ones. `None` where
+    /// `checked` itself rejects the shape.
+    fn window_probe_geometry(
+        in_c: usize,
+        in_h: usize,
+        in_w: usize,
+        kh: usize,
+        kw: usize,
+        stride: (usize, usize),
+        padding: (usize, usize),
+        dilation: (usize, usize),
+    ) -> Option<DirectF64PairGeometry> {
+        let a = Array2::<f32>::zeros((1, in_c * in_h * in_w));
+        let kernel = ArrayD::<f32>::zeros(IxDyn(&[1, in_c, kh, kw]));
+        DirectF64PairGeometry::checked(&a, &a, &kernel, stride, padding, dilation, (in_h, in_w))
+    }
+
+    /// #conv-fill-hoist column-window solver: `im2col_column_ow_window` must
+    /// return EXACTLY the `ow` set the closure it replaced admitted, and the
+    /// grid it is checked on must really contain the clipped shapes — a window
+    /// that is empty (every tap padding), one clipped only at the low end, one
+    /// only at the high end, and one at BOTH ends.
+    ///
+    /// The coverage counters are the fail-closed half. Before this test the only
+    /// geometry that reached the solver was `run_fixture`'s padding `(1, 0)`;
+    /// with `pw = 0`, `kw_offset >= geometry.pw` always holds, so `ow_lo` is
+    /// unconditionally 0 and `ow_hi` unconditionally `out_w`, and every branch
+    /// below was dead. A wrong window was undetectable.
+    #[test]
+    fn convtranspose_sound_f64_im2col_column_window_is_exact_and_covers_clipping() {
+        let mut columns = 0usize;
+        let (mut empty, mut low_only, mut high_only, mut both_ends, mut unclipped) =
+            (0usize, 0usize, 0usize, 0usize, 0usize);
+
+        for in_w in [2usize, 4, 5] {
+            for kw in [1usize, 2, 3, 4] {
+                for sw in [1usize, 2, 3] {
+                    for dw in [1usize, 2] {
+                        for pw in [0usize, 1, 2] {
+                            let Some(geometry) =
+                                window_probe_geometry(1, 3, in_w, 1, kw, (1, sw), (0, pw), (1, dw))
+                            else {
+                                continue;
+                            };
+                            for kj in 0..kw {
+                                let kw_offset = kj * dw;
+                                let (lo, hi) = im2col_column_ow_window(geometry, kw_offset);
+                                // The closure's own per-element predicate,
+                                // brute-forced: `iw = ow*sw + kw_offset - pw`
+                                // must be defined and below `in_w`.
+                                let expected: Vec<usize> = (0..geometry.out_w)
+                                    .filter(|&ow| {
+                                        let padded = ow * sw + kw_offset;
+                                        padded >= pw && padded - pw < in_w
+                                    })
+                                    .collect();
+                                let got: Vec<usize> = if lo >= hi {
+                                    Vec::new()
+                                } else {
+                                    (lo..hi).collect()
+                                };
+                                assert_eq!(
+                                    got, expected,
+                                    "window mismatch: in_w={in_w} kw={kw} sw={sw} dw={dw} pw={pw} \
+                                     kj={kj} out_w={} -> [{lo},{hi})",
+                                    geometry.out_w
+                                );
+                                columns += 1;
+                                if expected.is_empty() {
+                                    empty += 1;
+                                } else {
+                                    match (lo > 0, hi < geometry.out_w) {
+                                        (true, true) => both_ends += 1,
+                                        (true, false) => low_only += 1,
+                                        (false, true) => high_only += 1,
+                                        (false, false) => unclipped += 1,
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            columns >= 300,
+            "expected a broad column grid, got {columns}"
+        );
+        assert!(
+            empty > 0,
+            "grid must contain a fully clipped (empty) window"
+        );
+        assert!(
+            low_only > 0,
+            "grid must contain a window clipped only at the low end"
+        );
+        assert!(
+            high_only > 0,
+            "grid must contain a window clipped only at the high end"
+        );
+        assert!(
+            both_ends > 0,
+            "grid must contain a window clipped at BOTH ends"
+        );
+        assert!(unclipped > 0, "grid must contain an unclipped window");
+    }
+
+    /// #cgan-deadline-f32-gemm / #conv-fill-hoist: the finite-deadline f64
+    /// recompute must stay BIT-IDENTICAL to the no-deadline twin on PADDED
+    /// geometries, where the column-window solver's clamping branches are the
+    /// live ones.
+    ///
+    /// `convtranspose_sound_f64_finite_deadline_matches_no_deadline_twin_bitwise`
+    /// pins only `run_fixture`'s padding `(1, 0)`, and `pw = 0` degenerates the
+    /// solver to `[0, out_w)` on every column — so it could not have caught a
+    /// wrong window. It also could not have caught a fast lane that stopped
+    /// engaging: the no-deadline twin ALWAYS fills im2col and W_T with the
+    /// closures, so a run that fell back would compare the closure with itself
+    /// and pass. Both holes are asserted shut here — the two slab lanes are
+    /// checked to be the ones taken, and the grid is checked to contain every
+    /// clipping shape.
+    #[test]
+    fn convtranspose_sound_f64_finite_deadline_matches_twin_bitwise_on_padded_geometries() {
+        let (in_c, out_c, objectives) = (2usize, 3usize, 3usize);
+        let (in_h, in_w) = (4usize, 5usize);
+        let a = Array2::from_shape_fn((objectives, in_c * in_h * in_w), |(row, col)| {
+            (((row * 29 + col * 23) % 43) as f32 - 21.0) / 6.0
+        });
+        let mut cases = 0usize;
+        let (mut empty, mut low_only, mut high_only, mut both_ends) =
+            (0usize, 0usize, 0usize, 0usize);
+
+        for (kh, kw) in [(1usize, 1usize), (2, 3), (3, 3), (1, 4)] {
+            for stride in [(1usize, 1usize), (2, 1), (1, 2), (2, 3)] {
+                for padding in [
+                    (0usize, 0usize),
+                    (1, 0),
+                    (0, 1),
+                    (1, 1),
+                    (2, 1),
+                    (1, 2),
+                    (2, 2),
+                ] {
+                    for dilation in [(1usize, 1usize), (2, 1), (1, 2)] {
+                        let kernel = ArrayD::from_shape_fn(IxDyn(&[out_c, in_c, kh, kw]), |idx| {
+                            (((idx[0] * 23 + idx[1] * 17 + idx[2] * 11 + idx[3] * 7) % 31) as f32
+                                - 15.0)
+                                / 13.0
+                        });
+                        let Some(geometry) = DirectF64PairGeometry::checked(
+                            &a,
+                            &a,
+                            &kernel,
+                            stride,
+                            padding,
+                            dilation,
+                            (in_h, in_w),
+                        ) else {
+                            continue;
+                        };
+                        let shape = format!(
+                            "kh={kh} kw={kw} stride={stride:?} padding={padding:?} \
+                             dilation={dilation:?}"
+                        );
+
+                        // `block_objs <= num_objectives`, so this is the first
+                        // block's row count.
+                        let block_rows = geometry.block_objs * geometry.spatial_per_obj;
+                        assert_eq!(
+                            im2col_fill_lane(&a, block_rows, geometry.col_width),
+                            Im2colFillLane::SlabSerial,
+                            "im2col slab lane must be the one taken ({shape})"
+                        );
+                        assert!(
+                            pollable_f64_kernel_slab(&kernel, geometry).is_some(),
+                            "W_T slab lane must be the one taken ({shape})"
+                        );
+                        for kj in 0..kw {
+                            let (lo, hi) = im2col_column_ow_window(geometry, kj * dilation.1);
+                            if lo >= hi {
+                                empty += 1;
+                            } else {
+                                match (lo > 0, hi < geometry.out_w) {
+                                    (true, true) => both_ends += 1,
+                                    (true, false) => low_only += 1,
+                                    (false, true) => high_only += 1,
+                                    (false, false) => {}
+                                }
+                            }
+                        }
+
+                        let reference = conv2d_forward_backward_coeff_f64_with_deadline_and_engine(
+                            &a,
+                            &kernel,
+                            stride,
+                            padding,
+                            dilation,
+                            (in_h, in_w),
+                            None,
+                            usize::MAX,
+                            |_, _, _| panic!("CPU reference bypasses engine"),
+                        )
+                        .expect("no-deadline CPU reference");
+                        let finite = conv2d_forward_backward_coeff_f64_with_deadline_and_engine(
+                            &a,
+                            &kernel,
+                            stride,
+                            padding,
+                            dilation,
+                            (in_h, in_w),
+                            Some(Instant::now() + Duration::from_secs(30)),
+                            usize::MAX,
+                            |_, _, _| {
+                                panic!("finite-deadline path must not enter an opaque engine")
+                            },
+                        )
+                        .expect("finite-deadline recompute");
+
+                        assert_eq!(
+                            finite.raw_dim(),
+                            reference.raw_dim(),
+                            "result shape ({shape})"
+                        );
+                        for (index, (&got, &want)) in
+                            finite.iter().zip(reference.iter()).enumerate()
+                        {
+                            if want.is_nan() {
+                                assert!(got.is_nan(), "expected NaN at {index}, got {got}");
+                            } else if got == 0.0 && want == 0.0 {
+                                // Signed zero only (#cifar100-deadline-gemm precedent).
+                            } else {
+                                assert_eq!(
+                                    got.to_bits(),
+                                    want.to_bits(),
+                                    "bit mismatch at {index}: got={got:e} want={want:e} ({shape})"
+                                );
+                            }
+                        }
+                        cases += 1;
+                    }
+                }
+            }
+        }
+
+        assert!(cases >= 200, "expected broad padded coverage, got {cases}");
+        assert!(
+            empty > 0,
+            "grid must exercise a fully clipped column window"
+        );
+        assert!(
+            low_only > 0,
+            "grid must exercise a low-clipped column window"
+        );
+        assert!(
+            high_only > 0,
+            "grid must exercise a high-clipped column window"
+        );
+        assert!(
+            both_ends > 0,
+            "grid must exercise a both-ends-clipped column window"
+        );
+    }
+
+    /// #conv-fill-hoist parallel fill arm. At or above
+    /// `IM2COL_PARALLEL_FILL_MIN_ELEMENTS` a block's columns are filled on the
+    /// rayon pool, and that arm was dead in every test before this one:
+    /// `run_fixture` is 3 objectives x 9 spatial x 8 columns = 216 elements and
+    /// `convtranspose_sound_f64_deadline_expires_between_blocks_with_typed_error`
+    /// forces `block_objs = 1` for 72, both ~3 orders of magnitude under the
+    /// 65536 floor.
+    ///
+    /// It is pinned here against BOTH the serial slab arm and the
+    /// pre-#conv-fill-hoist closure, bit for bit, on a geometry that the
+    /// production chooser really routes to the parallel arm and whose column
+    /// windows are really clipped — asserted, not assumed, so that raising the
+    /// floor or unpadding the fixture makes this FAIL instead of quietly
+    /// re-testing the serial lane.
+    #[test]
+    fn convtranspose_sound_f64_im2col_parallel_fill_matches_serial_and_closure_bitwise() {
+        let (in_c, out_c, objectives) = (2usize, 1usize, 16usize);
+        let (in_h, in_w) = (16usize, 16usize);
+        let a = Array2::from_shape_fn((objectives, in_c * in_h * in_w), |(row, col)| {
+            (((row * 41 + col * 19) % 53) as f32 - 26.0) / 7.0
+        });
+        let kernel = ArrayD::from_shape_fn(IxDyn(&[out_c, in_c, 3, 3]), |idx| {
+            (((idx[0] * 13 + idx[1] * 7 + idx[2] * 5 + idx[3] * 3) % 17) as f32 - 8.0) / 9.0
+        });
+        let geometry =
+            DirectF64PairGeometry::checked(&a, &a, &kernel, (1, 1), (1, 1), (1, 1), (in_h, in_w))
+                .expect("parallel-fill geometry is valid");
+
+        assert_eq!(
+            geometry.block_objs, objectives,
+            "one block must cover the whole fixture"
+        );
+        assert_eq!(geometry.spatial_per_obj, 256, "16x16 output per objective");
+        assert_eq!(geometry.col_width, 18, "2 input channels x 3x3 kernel");
+        // `ph = pw = 1`, so two of the three `kj` are clipped at one end inside
+        // the parallel arm, and the h-axis `padded < ph` and `ih >= in_h` skips
+        // both fire.
+        assert_eq!(im2col_column_ow_window(geometry, 0), (1, 16));
+        assert_eq!(im2col_column_ow_window(geometry, 1), (0, 16));
+        assert_eq!(im2col_column_ow_window(geometry, 2), (0, 15));
+
+        // `obj_start = 1` also exercises the per-objective row slice at a
+        // non-zero offset, which a single full-width block never does.
+        for (obj_start, block) in [(0usize, objectives), (1usize, objectives - 1)] {
+            let block_rows = block * geometry.spatial_per_obj;
+            let elements = block_rows * geometry.col_width;
+            assert!(
+                elements >= IM2COL_PARALLEL_FILL_MIN_ELEMENTS,
+                "block must sit above the parallel floor: {elements} vs {}",
+                IM2COL_PARALLEL_FILL_MIN_ELEMENTS
+            );
+            assert_eq!(
+                im2col_fill_lane(&a, block_rows, geometry.col_width),
+                Im2colFillLane::SlabParallel,
+                "production must route obj_start={obj_start} block={block} to the parallel fill"
+            );
+
+            let reference = reference_im2col_block(&a, geometry, obj_start, block_rows);
+            let closure = pollable_f64_im2col_block_on_lane(
+                &a,
+                geometry,
+                obj_start,
+                block,
+                block_rows,
+                Im2colFillLane::Closure,
+            );
+            let serial = pollable_f64_im2col_block_on_lane(
+                &a,
+                geometry,
+                obj_start,
+                block,
+                block_rows,
+                Im2colFillLane::SlabSerial,
+            );
+            let parallel = pollable_f64_im2col_block_on_lane(
+                &a,
+                geometry,
+                obj_start,
+                block,
+                block_rows,
+                Im2colFillLane::SlabParallel,
+            );
+
+            // The shipped closure lane against the transcription FIRST: that is
+            // what makes `reference` a trustworthy stand-in for the pre-hoist
+            // definition in the two comparisons after it.
+            assert_im2col_bits_eq(
+                &closure,
+                &reference,
+                &format!("closure lane vs transcribed reference (obj_start={obj_start})"),
+            );
+            assert_im2col_bits_eq(
+                &serial,
+                &reference,
+                &format!("serial slab lane vs reference (obj_start={obj_start})"),
+            );
+            assert_im2col_bits_eq(
+                &parallel,
+                &reference,
+                &format!("parallel slab lane vs reference (obj_start={obj_start})"),
+            );
+            assert_im2col_bits_eq(
+                &parallel,
+                &serial,
+                &format!("parallel lane vs serial lane (obj_start={obj_start})"),
+            );
+        }
+    }
+
+    /// #conv-fill-hoist fallback guards, in BOTH directions.
+    ///
+    /// Each fast lane is admitted by a layout test — `Array2::as_slice` for the
+    /// im2col slab (via `im2col_fill_lane`) and `is_standard_layout` +
+    /// shape algebra for W_T (`pollable_f64_kernel_slab`) — and a layout test
+    /// that stops rejecting is invisible to every other pin in this file,
+    /// because they all feed standard-layout inputs: the slab lanes would read
+    /// the wrong bytes and nothing would fail. Conversely a guard that stops
+    /// accepting turns the whole change into a no-op that still passes.
+    ///
+    /// So both verdicts are asserted on one padded geometry, against a permuted
+    /// pair carrying the IDENTICAL values, and the rejected pair's
+    /// finite-deadline result is then pinned bit-for-bit against the no-deadline
+    /// twin on the standard pair.
+    ///
+    /// This is the only test that reaches the W_T fallback closure at all: every
+    /// other test on the finite-deadline f64 route builds its kernel with
+    /// `ArrayD::from_shape_fn`, which is standard-layout, and the one existing
+    /// non-standard-layout test
+    /// (`convtranspose_sound_f64_direct_pair_handles_nonstandard_array_layout`)
+    /// permutes only the coefficients and passes `deadline: None`, so it never
+    /// enters this route. It is also the only test where the im2col CHOOSER
+    /// picks the closure —
+    /// `convtranspose_sound_f64_im2col_parallel_fill_matches_serial_and_closure_bitwise`
+    /// exercises that closure lane, but by naming it on a contiguous slab.
+    #[test]
+    fn convtranspose_sound_f64_layout_fallbacks_are_rejected_and_stay_bitwise() {
+        let (in_c, out_c, objectives) = (2usize, 3usize, 3usize);
+        let (in_h, in_w) = (4usize, 5usize);
+        let (kh, kw) = (2usize, 3usize);
+        let (stride, padding, dilation) = ((1usize, 2usize), (1usize, 2usize), (1usize, 1usize));
+
+        let a = Array2::from_shape_fn((objectives, in_c * in_h * in_w), |(row, col)| {
+            (((row * 31 + col * 17) % 47) as f32 - 23.0) / 5.0
+        });
+        let kernel = ArrayD::from_shape_fn(IxDyn(&[out_c, in_c, kh, kw]), |idx| {
+            (((idx[0] * 19 + idx[1] * 13 + idx[2] * 7 + idx[3] * 3) % 23) as f32 - 11.0) / 11.0
+        });
+
+        // Same values in the same logical order, different memory layout:
+        // materialise with two axes swapped, then swap them back. Every `f32` is
+        // copied, never recomputed, so a bit mismatch below can only come from
+        // the fill — not from the fixture.
+        let permuted_a = Array2::from_shape_fn((a.ncols(), a.nrows()), |(col, row)| a[[row, col]])
+            .reversed_axes();
+        let permuted_kernel = ArrayD::from_shape_fn(IxDyn(&[in_c, out_c, kh, kw]), |idx| {
+            kernel[[idx[1], idx[0], idx[2], idx[3]]]
+        })
+        .permuted_axes(IxDyn(&[1, 0, 2, 3]));
+        assert_eq!(permuted_a.shape(), a.shape(), "permuted coefficients shape");
+        assert_eq!(
+            permuted_kernel.shape(),
+            kernel.shape(),
+            "permuted kernel shape"
+        );
+        assert!(
+            permuted_a == a,
+            "permuted coefficients must carry identical values"
+        );
+        assert!(
+            permuted_kernel == kernel,
+            "permuted kernel must carry identical values"
+        );
+        // `out_c = 3` and `in_c = 2` are both above 1, so neither permutation is
+        // a unit-axis reorder — `is_layout_c` SKIPS unit axes, and would still
+        // report `true` for one of those.
+        assert!(
+            !permuted_a.is_standard_layout(),
+            "permuted coefficients must not be standard-layout"
+        );
+        assert!(
+            !permuted_kernel.is_standard_layout(),
+            "permuted kernel must not be standard-layout"
+        );
+
+        let geometry = DirectF64PairGeometry::checked(
+            &a,
+            &a,
+            &kernel,
+            stride,
+            padding,
+            dilation,
+            (in_h, in_w),
+        )
+        .expect("fallback-probe geometry is valid");
+        // `block_objs <= num_objectives`, so this is the first block's row count.
+        let block_rows = geometry.block_objs * geometry.spatial_per_obj;
+
+        assert_eq!(
+            im2col_fill_lane(&a, block_rows, geometry.col_width),
+            Im2colFillLane::SlabSerial,
+            "contiguous coefficients must reach the fast im2col lane"
+        );
+        assert_eq!(
+            im2col_fill_lane(&permuted_a, block_rows, geometry.col_width),
+            Im2colFillLane::Closure,
+            "non-contiguous coefficients must fall back to the im2col closure"
+        );
+        assert!(
+            pollable_f64_kernel_slab(&kernel, geometry).is_some(),
+            "a C-order kernel must reach the fast W_T lane"
+        );
+        assert!(
+            pollable_f64_kernel_slab(&permuted_kernel, geometry).is_none(),
+            "a permuted kernel must fall back to the W_T closure"
+        );
+
+        // Padded on both axes, so the fallback is compared where the fast lane's
+        // window really clips rather than on a degenerate full-width one:
+        // `pw = 2`, `sw = 2`, `in_w = 5`, `out_w = 4`, and `dw = 1` so
+        // `kw_offset = kj`. Low-clipped, both-ends-clipped, high-clipped.
+        assert_eq!(geometry.out_w, 4, "out_w");
+        assert_eq!(im2col_column_ow_window(geometry, 0), (1, 4));
+        assert_eq!(im2col_column_ow_window(geometry, 1), (1, 3));
+        assert_eq!(im2col_column_ow_window(geometry, 2), (0, 3));
+
+        let reference = conv2d_forward_backward_coeff_f64_with_deadline_and_engine(
+            &a,
+            &kernel,
+            stride,
+            padding,
+            dilation,
+            (in_h, in_w),
+            None,
+            usize::MAX,
+            |_, _, _| panic!("CPU reference bypasses engine"),
+        )
+        .expect("no-deadline CPU reference");
+        let fallback = conv2d_forward_backward_coeff_f64_with_deadline_and_engine(
+            &permuted_a,
+            &permuted_kernel,
+            stride,
+            padding,
+            dilation,
+            (in_h, in_w),
+            Some(Instant::now() + Duration::from_secs(30)),
+            usize::MAX,
+            |_, _, _| panic!("finite-deadline path must not enter an opaque engine"),
+        )
+        .expect("finite-deadline recompute on non-standard layouts");
+
+        assert_eq!(fallback.raw_dim(), reference.raw_dim(), "result shape");
+        for (index, (&got, &want)) in fallback.iter().zip(reference.iter()).enumerate() {
+            if want.is_nan() {
+                assert!(got.is_nan(), "expected NaN at {index}, got {got}");
+            } else if got == 0.0 && want == 0.0 {
+                // Signed zero only (#cifar100-deadline-gemm precedent).
+            } else {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "bit mismatch at {index}: got={got:e} want={want:e}"
                 );
             }
         }

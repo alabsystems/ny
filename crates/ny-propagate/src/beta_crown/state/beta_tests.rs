@@ -7,7 +7,7 @@
 use super::*;
 use crate::beta_crown::branching::NeuronConstraint;
 
-/// Regression test for #2880: lookahead_step must return Err, not panic,
+/// Regression test: lookahead_step must return Err, not panic,
 /// when slow weights length diverges from entries length.
 #[test]
 fn test_lookahead_step_length_mismatch_returns_err_2880() {
@@ -38,7 +38,7 @@ fn test_lookahead_step_length_mismatch_returns_err_2880() {
     );
 }
 
-/// Regression test for #2939: standard (non-Adam) gradient_step must recover
+/// Regression test: standard (non-Adam) gradient_step must recover
 /// from NaN gradients instead of permanently corrupting beta values.
 ///
 /// Before the fix, `nan_propagating_max(NaN + lr*NaN, 0.0) = NaN` left
@@ -100,7 +100,7 @@ fn test_gradient_step_nan_recovery_2939() {
     );
 }
 
-/// Regression test for #2939: after NaN recovery, the next gradient step must
+/// Regression test: after NaN recovery, the next gradient step must
 /// work normally (the corruption is not permanent).
 #[test]
 fn test_gradient_step_nan_recovery_then_normal_2939() {
@@ -140,7 +140,7 @@ fn test_gradient_step_nan_recovery_then_normal_2939() {
     );
 }
 
-/// Regression test for #2416: verify convergence check doesn't terminate prematurely
+/// Regression test: verify convergence check doesn't terminate prematurely
 /// after a flat-then-steep gradient sequence. With the old m_hat-based check, the EMA
 /// (β₁=0.9) would lag behind — after 10 near-zero gradient steps, a large gradient
 /// would still show m_hat ≈ 0, causing premature convergence. With raw gradient, the
@@ -176,7 +176,7 @@ fn test_gradient_step_adam_flat_then_steep_no_premature_convergence_2416() {
     state.entries[0].grad = 5.0;
     let max_grad = state.gradient_step_adam(&config, 11);
 
-    // With raw gradient semantics (#2416), max_grad = |5.0| = 5.0.
+    // With raw gradient semantics, max_grad = |5.0| = 5.0.
     // With old m_hat semantics, max_grad would be ≈ 0.73 (far below 5.0).
     assert!(
         (max_grad - 5.0).abs() < 1e-5,
@@ -184,7 +184,7 @@ fn test_gradient_step_adam_flat_then_steep_no_premature_convergence_2416() {
     );
 }
 
-/// Regression test for #2939: convergence tracking with nan_propagating_max
+/// Regression test: convergence tracking with nan_propagating_max
 /// must surface NaN gradients instead of silently dropping them via f32::max.
 #[test]
 fn test_gradient_step_adam_nan_convergence_tracking_2939() {
@@ -201,7 +201,7 @@ fn test_gradient_step_adam_nan_convergence_tracking_2939() {
     let config = AdaptiveOptConfig::default();
     let max_grad = state.gradient_step_adam(&config, 1);
 
-    // With nan_propagating_max, NaN grad → NaN grad.abs() → NaN max_grad (#2416, #2939).
+    // With nan_propagating_max, NaN grad → NaN grad.abs() → NaN max_grad.
     // Before the fix, f32::max(0.0, NaN) = 0.0, silently hiding the NaN.
     assert!(
         max_grad.is_nan(),
@@ -480,7 +480,7 @@ fn test_gradient_step_adam_inf_gradient_no_clip_resets_state() {
     );
 }
 
-// ── Performance proofs: O(1) indexed lookups at BaB scale (#2936) ─────────────
+// ── Performance proofs: O(1) indexed lookups at BaB scale ─────────────
 
 /// Performance proof: BetaState index covers all entries after construction,
 /// guaranteeing O(1) `entry()` lookups at BaB-realistic scale (500 constraints).
@@ -491,7 +491,6 @@ fn test_gradient_step_adam_inf_gradient_no_clip_resets_state() {
 ///
 /// This test verifies the structural invariant: `indexed_entries == entries.len()`
 /// holds after `from_history()`, meaning the O(1) path is always taken.
-/// Tracks: #2936 Finding 5.
 #[test]
 fn test_beta_state_index_fresh_at_scale_2936() {
     let n = 500;
@@ -539,7 +538,6 @@ fn test_beta_state_index_fresh_at_scale_2936() {
 /// count, not O(B) scanning all entries.
 ///
 /// Verifies that the per-layer grouping is correct across 50 layers × 10 neurons.
-/// Tracks: #2936 Finding 5.
 #[test]
 fn test_beta_state_entries_for_layer_indexed_correctness_2936() {
     let n = 500;

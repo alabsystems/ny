@@ -487,6 +487,14 @@ fn make_layer_profile(growth: f32, status: BoundStatus) -> LayerProfile {
         input_width: 0.1,
         output_width: growth * 0.1,
         mean_output_width: growth * 0.1,
+        // AMBIENT REPAIR, not part of #budget-abandonment. `unstable_count` was
+        // added to `LayerProfile` by 5e1453805 and this constructor was never
+        // updated, so `--all-targets` has not compiled on main since. The
+        // ordinary `cargo check`/`cargo test -p <other crate>` paths never
+        // build this target, which is why it went unnoticed. Zero is the
+        // neutral value: no assertion in this file reads the field, and the
+        // two tests it feeds exercise `is_choke_point` and `__repr__`.
+        unstable_count: 0,
         median_output_width: growth * 0.1,
         growth_ratio: growth,
         cumulative_expansion: growth,
@@ -794,7 +802,7 @@ fn test_verify_runtime_signatures_include_backend_kwarg() {
 }
 
 // =========================================================================
-// Python Verify Backend Helper Tests (#3627)
+// Python Verify Backend Helper Tests
 // =========================================================================
 
 use crate::verify::{
@@ -1096,7 +1104,7 @@ fn test_verify_result_clone() {
 }
 
 // =========================================================================
-// Boundary Validation Tests (#2797)
+// Boundary Validation Tests
 // =========================================================================
 // Validates that NaN, negative, and Inf inputs produce Err at the
 // Python-Rust boundary instead of propagating to downstream panics.
@@ -1174,7 +1182,7 @@ fn test_validate_tolerance_rejects_negative_inf() {
 }
 
 // =========================================================================
-// Input Array NaN/Inf Validation Tests (#2898)
+// Input Array NaN/Inf Validation Tests
 // =========================================================================
 // Tests validate_input_finite(), the shared validator used by diff(),
 // diff_bytes(), run_with_intermediates(), and compare() to reject
@@ -1239,7 +1247,7 @@ fn test_validate_input_finite_rejects_mixed_inf() {
 }
 
 // =========================================================================
-// Beta-CROWN Output Bounds Regression Tests (#2802)
+// Beta-CROWN Output Bounds Regression Tests
 // =========================================================================
 // Validates that build_verify_result returns actual computed bounds
 // instead of fabricated [-inf, +inf] when real bounds are available.
@@ -1257,7 +1265,7 @@ fn make_rust_verified(output_bounds: Vec<RustBound>) -> RustVerificationResult {
     }
 }
 
-/// Regression test #2802: Verified status with real bounds passes them through
+/// Regression test: Verified status with real bounds passes them through
 /// to the Python VerifyResult (not vacuous [-inf, +inf]).
 #[test]
 fn test_build_verify_result_verified_real_bounds_2802() {
@@ -1275,7 +1283,7 @@ fn test_build_verify_result_verified_real_bounds_2802() {
     assert!((output_bounds[1].upper - 0.9).abs() < 1e-6);
 }
 
-/// Regression test #2802: Verified status with empty bounds (BaB loop path
+/// Regression test: Verified status with empty bounds (BaB loop path
 /// where output_bounds is None) returns empty vec, not fabricated bounds.
 #[test]
 fn test_build_verify_result_verified_empty_bounds_2802() {
@@ -1290,7 +1298,7 @@ fn test_build_verify_result_verified_empty_bounds_2802() {
     );
 }
 
-/// Regression test #2802: Unknown status with real bounds passes them through.
+/// Regression test: Unknown status with real bounds passes them through.
 #[test]
 fn test_build_verify_result_unknown_real_bounds_2802() {
     let bounds = vec![RustBound::new(-1.0, 2.0)];
@@ -1309,7 +1317,7 @@ fn test_build_verify_result_unknown_real_bounds_2802() {
     assert!((output_bounds[0].upper - 2.0).abs() < 1e-6);
 }
 
-/// Regression test #2802: Timeout status with None partial_bounds returns None
+/// Regression test: Timeout status with None partial_bounds returns None
 /// output_bounds (not fabricated [-inf, +inf]).
 #[test]
 fn test_build_verify_result_timeout_none_bounds_2802() {
@@ -1327,7 +1335,7 @@ fn test_build_verify_result_timeout_none_bounds_2802() {
     );
 }
 
-/// Regression test #2802: Timeout status with real partial_bounds passes them through.
+/// Regression test: Timeout status with real partial_bounds passes them through.
 #[test]
 fn test_build_verify_result_timeout_real_bounds_2802() {
     let bounds = vec![RustBound::new_allow_infinite(-2.0, 3.0)];
@@ -1346,7 +1354,7 @@ fn test_build_verify_result_timeout_real_bounds_2802() {
 }
 
 // =========================================================================
-// BaB Threshold Derivation Tests (#3229)
+// BaB Threshold Derivation Tests
 // =========================================================================
 // Validates that derive_bab_threshold correctly computes the BaB threshold
 // from spec output bounds, matching the pattern in network.rs:183-195.
@@ -1355,7 +1363,7 @@ fn test_build_verify_result_timeout_real_bounds_2802() {
 
 use crate::verify::derive_bab_threshold;
 
-/// Regression test #3229: Trivial output bounds (-inf, +inf) produce NEG_INFINITY
+/// Regression test: Trivial output bounds (-inf, +inf) produce NEG_INFINITY
 /// threshold (no finite lower constraints → BaB has no meaningful target).
 #[test]
 fn test_derive_bab_threshold_trivial_bounds_3229() {
@@ -1366,7 +1374,7 @@ fn test_derive_bab_threshold_trivial_bounds_3229() {
     assert_eq!(derive_bab_threshold(&bounds), f32::NEG_INFINITY);
 }
 
-/// Regression test #3229: Finite lower bounds produce meaningful threshold.
+/// Regression test: Finite lower bounds produce meaningful threshold.
 /// BaB must check `lower_bound > threshold` against this value, not NEG_INFINITY.
 #[test]
 fn test_derive_bab_threshold_finite_lower_bounds_3229() {
@@ -1375,7 +1383,7 @@ fn test_derive_bab_threshold_finite_lower_bounds_3229() {
     assert!((derive_bab_threshold(&bounds) - (-0.5)).abs() < 1e-6);
 }
 
-/// Regression test #3229: Mixed finite and infinite lower bounds — only
+/// Regression test: Mixed finite and infinite lower bounds — only
 /// finite bounds contribute to threshold.
 #[test]
 fn test_derive_bab_threshold_mixed_finite_infinite_3229() {
@@ -1388,20 +1396,20 @@ fn test_derive_bab_threshold_mixed_finite_infinite_3229() {
     assert!((derive_bab_threshold(&bounds) - 0.1).abs() < 1e-6);
 }
 
-/// Regression test #3229: Single output bound with finite lower.
+/// Regression test: Single output bound with finite lower.
 #[test]
 fn test_derive_bab_threshold_single_finite_bound_3229() {
     let bounds = vec![RustBound::new(-1.0, 1.0)];
     assert!((derive_bab_threshold(&bounds) - (-1.0)).abs() < 1e-6);
 }
 
-/// Regression test #3229: Empty bounds produce NEG_INFINITY (defensive).
+/// Regression test: Empty bounds produce NEG_INFINITY (defensive).
 #[test]
 fn test_derive_bab_threshold_empty_bounds_3229() {
     assert_eq!(derive_bab_threshold(&[]), f32::NEG_INFINITY);
 }
 
-/// Regression test #3229: Multiple finite bounds — threshold is the minimum.
+/// Regression test: Multiple finite bounds — threshold is the minimum.
 #[test]
 fn test_derive_bab_threshold_multiple_finite_minimum_3229() {
     // With multiple finite lower bounds, threshold = min of all

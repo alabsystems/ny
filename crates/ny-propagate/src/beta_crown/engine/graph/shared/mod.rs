@@ -7,8 +7,6 @@
 //! Provides reusable bootstrap, setup, and lifecycle state services used by
 //! all three graph-BaB modes: single-objective ReLU split, multi-objective,
 //! and GPU BaB.
-//!
-//! Part of #1860 (graph BaB service convergence).
 
 pub(crate) mod init;
 pub(crate) mod setup;

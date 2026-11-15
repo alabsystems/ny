@@ -4,7 +4,6 @@
 
 //! Tests for the 3 input-validation error returns in `softmax_affine_causal`:
 //! ndim < 2, axis != last, seq_q > seq_k.
-//! Coverage gap identified in #2519.
 
 use super::super::*;
 use ndarray::{ArrayD, IxDyn};

@@ -53,7 +53,7 @@ pub(crate) fn center_and_radius(
                 "{context}: interval constant endpoint is not a finite ordered pair"
             )));
         }
-        let mid = ((f64::from(l) + f64::from(u)) * 0.5) as f32;
+        let mid = f64::midpoint(f64::from(l), f64::from(u)) as f32;
         if !mid.is_finite() {
             return Err(NyError::UnsupportedOp(format!(
                 "{context}: interval constant midpoint overflows binary32"

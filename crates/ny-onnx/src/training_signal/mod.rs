@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Weak-region mining for verification-guided training (#3520).
+//! Weak-region mining for verification-guided training.
 //!
 //! This module identifies which input regions produce the widest (weakest)
 //! CROWN output bounds, enabling downstream training to focus on model

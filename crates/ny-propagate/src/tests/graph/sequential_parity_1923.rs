@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Diagnostic tests for #1923: GraphNetwork bound propagation looser
+//! Diagnostic tests for GraphNetwork bound propagation being looser
 //! than Network for ACAS-Xu 4_x family.
 //!
 //! ACAS-Xu has architecture: 5 inputs, 6 hidden layers of 50 neurons, 5 outputs.
@@ -411,7 +411,7 @@ fn test_1923_fixed_slope_crown_parity() {
 
 /// Phase 3: Alpha-CROWN comparison between Network and GraphNetwork.
 ///
-/// This is the key diagnostic for #1923. If the graph alpha-CROWN produces
+/// This is the key diagnostic. If the graph alpha-CROWN produces
 /// significantly looser bounds, it explains why GPU BaB (which uses
 /// GraphNetwork) times out while the sequential path (which uses Network)
 /// verifies.
@@ -555,12 +555,12 @@ fn test_1923_bound_tightening_progression() {
 ///
 /// The two lanes intentionally differ at activation nodes: the graph DAG
 /// collection demand-skips nodes no downstream nonlinear consumer needs
-/// (#3775, provenance `DemandDrivenSkip`) and leaves them at their forward
+/// (provenance `DemandDrivenSkip`) and leaves them at their forward
 /// IBP bounds, because alpha-CROWN/BaB only consume PRE-ACTIVATION bounds.
 /// So the parity contract is per-provenance:
 /// - `Crown` nodes (the pre-activation/output targets that seed alpha-CROWN)
 ///   must match the sequential widths to fp-accumulation noise — a looser
-///   graph side here is the #1923 timeout mechanism.
+///   graph side here is the GPU BaB timeout mechanism.
 /// - `DemandDrivenSkip` nodes must CONTAIN the sequential CROWN-IBP bounds
 ///   (IBP is never tighter than the intersected CROWN-IBP result).
 #[ntest::timeout(10000)]
@@ -615,7 +615,7 @@ fn test_1923_crown_ibp_intermediate_parity() {
 
         match provenance {
             BoundsProvenance::ForwardFallback(CrownIbpFallbackReason::DemandDrivenSkip) => {
-                // Deliberately left at forward IBP (#3775): the skipped node
+                // Deliberately left at forward IBP: the skipped node
                 // may be looser than sequential CROWN-IBP, but must never be
                 // tighter (the sequential result is intersected with the same
                 // forward IBP bounds).
@@ -641,7 +641,7 @@ fn test_1923_crown_ibp_intermediate_parity() {
                 // lane (observed: layer_8 graph 0.0022 vs seq 0.0060). What it
                 // must never be is LOOSER beyond fp-accumulation noise — a
                 // looser graph side starts alpha-CROWN from a worse baseline
-                // and compounds the bound gap (the #1923 timeout mechanism).
+                // and compounds the bound gap (the GPU BaB timeout mechanism).
                 let tol = 1e-3_f32.max(seq_width.abs() * 1e-3);
                 assert!(
                     graph_width <= seq_width + tol,
@@ -717,13 +717,13 @@ fn test_1923_public_crown_entrypoint_gap() {
 ///
 /// The primary assertion: GraphNetwork spec-guided CROWN matches sequential
 /// fixed-slope CROWN on every bisected child domain.  This confirms that
-/// the #1923 bound gap is NOT caused by the graph representation itself.
+/// the ACAS-Xu bound gap is NOT caused by the graph representation itself.
 ///
 /// Alpha tightening beyond fixed-slope CROWN is measured but not required
 /// to be positive: on this synthetic ACAS-Xu-like network with very tight
 /// child domains (~0.0001 width), alpha optimization has no room to improve
 /// over fixed-slope CROWN.  Per R1 (commit 75ab9a5b9), per-domain alpha is
-/// a separate tightening experiment, not evidence for the #1923 root cause.
+/// a separate tightening experiment, not evidence for the timeout root cause.
 #[ntest::timeout(60000)]
 #[test]
 fn test_1923_child_domain_gap_is_per_domain_alpha_not_graph_representation() {

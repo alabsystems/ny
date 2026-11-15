@@ -135,6 +135,50 @@ const PATCHES_DEADLINE_FLAT_BIAS_READERS: &[ReaderSite] = &[
     },
 ];
 
+const PATCHES_ENGINE_SEAM_SCOPE: Scope = Scope {
+    package: "ny-propagate",
+    subsystem: "crown-patches-engine-seam",
+};
+
+const PATCHES_ENGINE_REFUSAL_CONTAINMENT_READERS: &[ReaderSite] = &[
+    ReaderSite {
+        scope: CLI_PRESET,
+        role: "bridge the typed bab.patches_engine_refusal_containment key into the ny-propagate cell before any lane starts",
+        site: "crates/ny-cli/src/preset_gates.rs:apply",
+    },
+    ReaderSite {
+        scope: PATCHES_ENGINE_SEAM_SCOPE,
+        role: "decide whether an engine POLICY refusal (UnsupportedConfiguration) at the Conv2d Patches compose GEMM seam is treated as an absent accelerator (fall through to the byte-identical CPU scatter, staying in patches) instead of escaping as a compose failure",
+        site: "crates/ny-propagate/src/layers/convolution/conv2d/ops.rs:conv2d_transpose_grouped_batched_fast",
+    },
+];
+
+const PATCHES_GPU_READERS: &[ReaderSite] = &[
+    ReaderSite {
+        scope: PATCHES_ENGINE_SEAM_SCOPE,
+        role: "decide whether the Conv2d Patches compose may route through a single engine GEMM at all (legacy truthy grammar; absence defers to fast_f32_gemm::is_installed())",
+        site: "crates/ny-propagate/src/layers/convolution/conv2d/bound_patches.rs:patches_gpu_enabled",
+    },
+    ReaderSite {
+        scope: PATCHES_ENGINE_SEAM_SCOPE,
+        role: "carry the same seam decision into the graph-route CROWN collector's cache identity and telemetry",
+        site: "crates/ny-propagate/src/network/graph_alpha/bounds/crown.rs",
+    },
+];
+
+const FAST_F32_PREWARM_READERS: &[ReaderSite] = &[
+    ReaderSite {
+        scope: CLI_PRESET,
+        role: "bridge the typed bab.fast_f32_prewarm key into the ny-propagate cell before any lane starts",
+        site: "crates/ny-cli/src/preset_gates.rs:apply",
+    },
+    ReaderSite {
+        scope: CLI_VNNCOMP,
+        role: "materialize the registered fast-f32 GEMM factory on the vnncomp route for ALL builds, before any lane consults it under finite deadline authority",
+        site: "crates/ny-cli/src/commands/vnncomp.rs:run_and_translate",
+    },
+];
+
 const CROWN_HONEST_PROVENANCE_READERS: &[ReaderSite] = &[
     ReaderSite {
         scope: CROWN_PROVENANCE_SCOPE,
@@ -330,6 +374,102 @@ override; the lower developer wrapper preserves it for sealed A/B work.",
         readers: PATCHES_DEADLINE_FLAT_BIAS_READERS,
     };
 
+    /// `NY_PATCHES_ENGINE_REFUSAL_CONTAINMENT` — engine policy refusal
+    /// containment at the Conv2d Patches compose GEMM seam.
+    pub PATCHES_ENGINE_REFUSAL_CONTAINMENT = LeverDecl {
+        name: "NY_PATCHES_ENGINE_REFUSAL_CONTAINMENT",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(false),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Default-dark containment for the one caller that launders an engine POLICY \
+refusal into a representation refusal (#patches-engine-refusal-containment, \
+reports/measured-2026/cct_bound_gap_2026-08-31). The Conv2d Patches compose's \
+GEMM of last resort can be the process-global WGPU proof adapter, whose \
+`gemm_f32` refuses BY DESIGN (`UnsupportedConfiguration`, the proof \
+quarantine); today that refusal escapes as a compose failure, the walk retries \
+DENSE, the dense pair blows the memory budget, and the target keeps IBP \
+bounds. Exact `1` treats a refusing engine exactly like an absent accelerator: \
+the compose falls through to its own pre-existing, byte-identical per-position \
+CPU scatter and STAYS IN PATCHES. Genuine failures (`ShapeMismatch`, \
+`InvalidSpec`, `DeadlineExceeded`, numeric) still propagate. Absence, exact \
+`0`, and malformed values keep today's escape byte-identical. The typed \
+competition route is `bab.patches_engine_refusal_containment`. CONTAINMENT, \
+not finiteness: no bound value changes on any path that works today; the only \
+behavioral delta is that a walk which today dies into dense/IBP instead \
+completes in patches on the documented-value-equivalent reference \
+implementation.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "false preserves the historical refusal escape byte-for-byte; the armed arm only substitutes the seam's own documented-value-equivalent CPU scatter for a refusing engine",
+        },
+        owner: PATCHES_ENGINE_SEAM_SCOPE,
+        readers: PATCHES_ENGINE_REFUSAL_CONTAINMENT_READERS,
+    };
+
+    /// `NY_PATCHES_GPU` — the Conv2d Patches compose engine-GEMM seam's
+    /// historical kill switch / force arm, declared so its name stops being
+    /// undeclared debt. The runtime read remains the legacy live parser at
+    /// its two sites (reader-frontier debt, unchanged by this declaration).
+    pub PATCHES_GPU = LeverDecl {
+        name: "NY_PATCHES_GPU",
+        // Legacy truthy grammar, deliberately NOT rounded to an exact-"1"
+        // Bool: any non-empty value other than exactly "0" ARMS the seam,
+        // exact "0" and empty force the byte-identical CPU scatter, and
+        // ABSENCE defers to `fast_f32_gemm::is_installed()` — a contextual
+        // default no registry constant can represent.
+        kind: LeverKind::Text,
+        default: DefaultSpec::Unset,
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Route the patches-mode Conv2d transpose-conv composition through a single \
+engine GEMM instead of the per-position CPU scatter. Truthy legacy grammar: \
+non-empty and not exactly `0` forces the seam ON (e.g. a CPU build with a \
+wgpu engine), exact `0`/empty forces the byte-identical CPU scatter even on \
+a CUDA box, and absence enables the seam exactly when the process-global \
+fast-f32 accelerator is installed. `NY_PATCHES_GPU=0` is the pre-existing \
+kill switch the cct engine-wiring canary used to prove the quarantine \
+mechanism (reports/measured-2026/cct_bound_gap_2026-08-31 §6). The seam is \
+value-equivalent up to the certified coefficient rounding, so both arms \
+publish sound enclosures.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "absence preserves the installed-accelerator policy; both arms run the same certified compose, differing only in which implementation computes documented-value-equivalent coefficients",
+        },
+        owner: PATCHES_ENGINE_SEAM_SCOPE,
+        readers: PATCHES_GPU_READERS,
+    };
+
+    /// `NY_FAST_F32_PREWARM` — vnncomp-route fast-f32 GEMM materialization on
+    /// every host, not only CUDA builds.
+    pub FAST_F32_PREWARM = LeverDecl {
+        name: "NY_FAST_F32_PREWARM",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(false),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Default-dark all-hosts prewarm of the process-global fast-f32 GEMM slot on the \
+vnncomp route (#fast-f32-prewarm-all-hosts, \
+reports/measured-2026/cct_bound_gap_2026-08-31). Only the CUDA build prewarms \
+today, so on every non-CUDA host the factory installed by #cpu-gemm-engine is \
+never materialized, `fast_f32_gemm::is_preinitialized()` is false for the \
+whole run (finite-deadline resolution deliberately fails closed on an \
+unmaterialized OnceLock), and the Conv2d Patches compose's GEMM of last resort \
+becomes the quarantined WGPU proof adapter. Exact `1` materializes the \
+registered factory once, before any lane consults it under finite authority — \
+for the CPU faer engine this is allocation-free. Scheduling-only by the \
+codebase's own doctrine (an engine materialization, no bound math), but it \
+changes which certified work completes before the deadline, so it ships dark \
+and gets the cross-family A/B. The typed competition route is \
+`bab.fast_f32_prewarm`.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "false preserves the historical cold slot; the armed arm only materializes an already-registered engine before finite authority exists, never touching bound arithmetic",
+        },
+        owner: PATCHES_ENGINE_SEAM_SCOPE,
+        readers: FAST_F32_PREWARM_READERS,
+    };
+
     /// `NY_CROWN_HONEST_PROVENANCE` — quality-publication guard.
     pub CROWN_HONEST_PROVENANCE = LeverDecl {
         name: "NY_CROWN_HONEST_PROVENANCE",
@@ -461,7 +601,11 @@ mod tests {
 
     #[test]
     fn adjacent_crown_cache_policies_resolve_to_effective_booleans() {
-        for decl in [&PATCHES_DEADLINE_FLAT_BIAS] {
+        for decl in [
+            &PATCHES_DEADLINE_FLAT_BIAS,
+            &PATCHES_ENGINE_REFUSAL_CONTAINMENT,
+            &FAST_F32_PREWARM,
+        ] {
             for (raw, expected) in [
                 (None, false),
                 (Some("0"), false),

@@ -58,7 +58,7 @@ pub fn crown_per_position_sequential_with_engine(
         ))
     })?;
 
-    // Guard: zero-batch input → no positions to process (#2870, #2920 WP-C).
+    // Guard: zero-batch input → no positions to process.
     if num_positions == 0 {
         return Err(NyError::InvalidSpec(
             "crown_per_position_sequential: zero-batch input (num_positions=0)".into(),
@@ -241,7 +241,7 @@ pub fn crown_per_position_parallel_with_engine(
         ))
     })?;
 
-    // Guard: zero-batch input → no positions to process (#2870, #2920 WP-C).
+    // Guard: zero-batch input → no positions to process.
     if num_positions == 0 {
         return Err(NyError::InvalidSpec(
             "crown_per_position_parallel: zero-batch input (num_positions=0)".into(),

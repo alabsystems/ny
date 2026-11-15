@@ -254,6 +254,11 @@ pub(crate) fn set_preset(p: Preset) {
 /// from both, the declaration's `false` default stands. Scored routes do not
 /// call this function after freezing their runtime policy.
 pub(crate) fn enabled() -> bool {
+    env_enabled()
+}
+
+/// The env/preset half of [`enabled`], latched once per process.
+fn env_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         let on = ny_levers::gate::resolve_bool(
@@ -674,14 +679,31 @@ pub(crate) fn report(
     static N: AtomicUsize = AtomicUsize::new(0);
     static ACC: AtomicUsize = AtomicUsize::new(0);
     static WARM: AtomicUsize = AtomicUsize::new(0);
+    // PER-CALL cost (#dom-alpha-percall). GRAD_US/TRIAL_US/TRIALS are CUMULATIVE
+    // process totals; differencing them here yields THIS call's own cost, which the
+    // cumulative fields cannot express. Reading a cumulative counter as per-call
+    // over-counts a summed series by ~3x, which is exactly the error this line
+    // exists to prevent.
+    static PREV_GRAD: AtomicU64 = AtomicU64::new(0);
+    static PREV_TRIAL: AtomicU64 = AtomicU64::new(0);
+    static PREV_TRIALS: AtomicUsize = AtomicUsize::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     ACC.fetch_add(accepted, Ordering::Relaxed);
     WARM.fetch_add(warm, Ordering::Relaxed);
-    if n < 8 || n.is_multiple_of(128) {
+    let cur_grad = GRAD_US.load(Ordering::Relaxed) / 1000;
+    let cur_trial = TRIAL_US.load(Ordering::Relaxed) / 1000;
+    let cur_trials = TRIALS.load(Ordering::Relaxed);
+    let d_grad = cur_grad.saturating_sub(PREV_GRAD.swap(cur_grad, Ordering::Relaxed));
+    let d_trial = cur_trial.saturating_sub(PREV_TRIAL.swap(cur_trial, Ordering::Relaxed));
+    let d_trials = cur_trials.saturating_sub(PREV_TRIALS.swap(cur_trials, Ordering::Relaxed));
+    // Log DENSELY enough that the true call count and the depth curve are both
+    // recoverable: the old `n < 8` window logged 8 lines whatever the real count was,
+    // so "8 calls" was a LOGGING artifact, not a measurement.
+    if n < 64 || n.is_multiple_of(16) {
         eprintln!(
             "[dom-alpha] call={n} depth={depth} movable={movable} warm={warm} steps={steps} \
 accepted={accepted} b0={b0:+.6} b1={b1:+.6} delta={:+.3e} eta={eta:.3} accepted_total={} \
-warm_total={} skipped={} grad_ms={} trial_ms={} trials={}",
+warm_total={} skipped={} grad_ms={} trial_ms={} trials={} call_grad_ms={d_grad} call_trial_ms={d_trial} call_trials={d_trials}",
             b1 - b0,
             ACC.load(Ordering::Relaxed),
             WARM.load(Ordering::Relaxed),
@@ -735,9 +757,17 @@ pub(crate) fn cost_summary() {
     }
     let trial_ms = TRIAL_US.load(Ordering::Relaxed) as f64 / 1000.0;
     let grad_ms = GRAD_US.load(Ordering::Relaxed) as f64 / 1000.0;
-    let per_trial_ms = if trials > 0 { trial_ms / trials as f64 } else { 0.0 };
+    let per_trial_ms = if trials > 0 {
+        trial_ms / trials as f64
+    } else {
+        0.0
+    };
     let total_ms = trial_ms + grad_ms;
-    let fixed_frac = if total_ms > 0.0 { grad_ms / total_ms } else { 0.0 };
+    let fixed_frac = if total_ms > 0.0 {
+        grad_ms / total_ms
+    } else {
+        0.0
+    };
     eprintln!(
         "[dom-alpha] COST skipped={skipped} trials={trials} trial_ms={trial_ms:.0} \
 grad_ms={grad_ms:.0} per_trial_ms={per_trial_ms:.1} fixed_frac={fixed_frac:.3}"

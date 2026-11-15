@@ -40,7 +40,7 @@ impl BoundPropagation for AbsLayer {
     fn propagate_ibp(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
         // Guard: NaN input bounds fail closed. NaN inputs fell through
         // comparisons to the crossing branch where (-l).max(u) silently
-        // swallowed NaN (IEEE 754-2008 §5.3.1). (#3316)
+        // swallowed NaN (IEEE 754-2008 §5.3.1).
         //
         // ±Inf endpoints are NOT rejected (deep-stack IBP overflow saturation,
         // dc9da0fde class): the interval analysis below is limit-correct at
@@ -70,7 +70,7 @@ impl BoundPropagation for AbsLayer {
                 out_upper[idx] = -l;
             } else {
                 out_lower[idx.clone()] = 0.0;
-                // NaN-propagating: .max() swallows NaN (IEEE 754-2008). (#3316)
+                // NaN-propagating:.max() swallows NaN (IEEE 754-2008).
                 out_upper[idx] = nan_propagating_max(-l, u);
             }
         }
@@ -158,17 +158,12 @@ pub fn abs_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
         let needed = needed_at_l.max(needed_at_u);
         // Closed-form safety margin for f32 evaluation rounding.
         //
-        // We use `eps = f32::EPSILON` (2^-23) as a conservative roundoff unit.
-        // This over-approximates per-op roundoff (`u = 2^-24`) and keeps the
-        // Kani proof arithmetic simple. For endpoint evaluation of
-        // `slope*x + intercept`, we conservatively bound:
+        // We use `eps = f32::EPSILON` (2^-23) as a conservative roundoff unit,
+        // over-approximating per-op roundoff (`u = 2^-24`). For endpoint
+        // evaluation of `slope*x + intercept`, we conservatively bound:
         //   - multiply + add roundoff, and
         //   - f64→f32 intercept cast roundoff.
         // A `4 * eps * max_endpoint` margin gives a robust safety factor.
-        //
-        // This replaces an iterative 8-step ULP repair loop that was correct but
-        // made Kani/CBMC proofs intractable (600K+ variable SAT formulas).
-        // Reference: #1784 for mathematical justification.
         let eps_f64: f64 = f64::from(f32::EPSILON);
         let max_endpoint = (-l64).max(u64);
         let margin = 4.0 * eps_f64 * max_endpoint;
@@ -217,7 +212,7 @@ impl AbsLayer {
     }
 
     /// Patches CROWN backward propagation with pre-activation bounds.
-    /// Part of #2613 Phase 2: generic activation Patches support.
+    /// Part of generic activation Patches support.
     pub(crate) fn propagate_patches_with_bounds(
         &self,
         bounds: &crate::bounds::patches::PatchesLinearBounds,

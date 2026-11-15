@@ -13,8 +13,6 @@
 //! LayerNorm already has batched asymmetric coverage in crown_normalization_layernorm.rs.
 //! All batched containment tests in this file use
 //! `LayerNormCrownMode::IbpValidated`, the sound normalization CROWN mode.
-//!
-//! Part of #3284.
 
 use crate::layers::normalization::{
     AdaIN1dLayer, GroupNormLayer, InstanceNorm1dLayer, LayerNormCrownMode, RmsNormLayer,
@@ -50,14 +48,11 @@ fn concretize_batched_crown(
 //
 // RmsNorm: norm_size=3, batch=2, out_dim=1.
 // Asymmetric incoming: different coefficients for lower and upper bounds.
-//
-// Part of #3284.
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(300) })]
 
     /// RmsNorm batched CROWN soundness with asymmetric incoming (la != ua).
-    /// Part of #3284.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_rmsnorm_batched_crown_asymmetric(
@@ -176,15 +171,12 @@ proptest! {
 // InstanceNorm1d operates on [C, T] per batch position. Uses 2 channels x
 // 2 timesteps = in_dim=4. Asymmetric incoming coefficients are applied across
 // the full flattened dimension.
-//
-// Part of #3284.
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(300) })]
 
     /// InstanceNorm1d batched CROWN soundness with asymmetric incoming (la != ua).
     /// Uses 2 channels, 2 timesteps per channel (in_dim=4), batch=2, out_dim=1.
-    /// Part of #3284.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_instancenorm_batched_crown_asymmetric(
@@ -321,15 +313,12 @@ proptest! {
 // AdaIN1d wraps InstanceNorm1d and applies style_gamma * norm(x) + style_beta.
 // Uses the same [C, T] layout: 2 channels, 2 timesteps, in_dim=4, batch=2.
 // Asymmetric incoming coefficients exercise the composed backward path.
-//
-// Part of #3284.
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(300) })]
 
     /// AdaIN1d batched CROWN soundness with asymmetric incoming (la != ua).
     /// Uses 2 channels, 2 timesteps per channel (in_dim=4), batch=2, out_dim=1.
-    /// Part of #3284.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_adain_batched_crown_asymmetric(
@@ -488,15 +477,12 @@ proptest! {
 // GroupNorm: C=2, T=3, in_dim=6, batch=2, num_groups=1, out_dim=1.
 // Asymmetric incoming coefficients exercise the group_norm flatten/reshape
 // composition with different lower/upper relaxation slopes.
-//
-// Part of #3284.
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(300) })]
 
     /// GroupNorm batched CROWN soundness with asymmetric incoming (la != ua).
     /// Uses C=2, T=3 (in_dim=6), batch=2, num_groups=1, out_dim=1.
-    /// Part of #3284.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_groupnorm_batched_crown_asymmetric(

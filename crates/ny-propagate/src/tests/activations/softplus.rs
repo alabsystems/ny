@@ -57,7 +57,7 @@ fn test_softplus_always_positive() {
     }
 }
 
-/// Regression test for #3316: softplus IBP lower bound must be >= 0 even for
+/// Regression test: softplus IBP lower bound must be >= 0 even for
 /// extreme negative inputs where directed rounding could push past zero.
 /// softplus(-1000) → 0 via f64 underflow, next_down_f32(0.0) = -1e-45.
 #[ntest::timeout(10000)]

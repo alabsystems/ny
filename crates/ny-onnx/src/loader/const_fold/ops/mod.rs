@@ -33,10 +33,11 @@ pub(super) fn try_fold_all_const_node(
     node: &onnx_proto::NodeProto,
     weights: &WeightStore,
     model_unbatched: bool,
+    qdq_activation_relaxation: bool,
 ) -> Option<FoldedTensor> {
     quantization::try_fold(node, weights)
         .or_else(|| trilu::try_fold(node, weights))
-        .or_else(|| elementwise::try_fold(node, weights))
+        .or_else(|| elementwise::try_fold(node, weights, qdq_activation_relaxation))
         .or_else(|| reductions::try_fold(node, weights))
         .or_else(|| constants::try_fold(node, weights, model_unbatched))
         .or_else(|| range::try_fold(node, weights))

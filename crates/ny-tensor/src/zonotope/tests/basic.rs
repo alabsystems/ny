@@ -535,10 +535,25 @@ fn test_add_constant_broadcast_channel_first_bias_compatibility() {
     assert_eq!(result.shape(), &[3, 2, 2]);
 
     let bounds = result.to_bounded_tensor().unwrap();
-    assert!((bounds.lower()[[0, 0, 0]] - 10.9).abs() < 1e-6);
-    assert!((bounds.upper()[[0, 0, 0]] - 11.1).abs() < 1e-6);
-    assert!((bounds.lower()[[2, 1, 1]] - 41.9).abs() < 1e-6);
-    assert!((bounds.upper()[[2, 1, 1]] - 42.1).abs() < 1e-6);
+    // Endpoints are now emitted with DIRECTED rounding (sub_down_f32/add_up_f32),
+    // so each sits up to ONE f32 ULP outside the decimal it approximates. At
+    // magnitude 42 that ULP is 3.8e-6 -- larger than the old 1e-6 tolerance, which
+    // was below f32 resolution here and only passed because round-to-nearest
+    // happened to land close. It also landed on the WRONG SIDE: the old lower
+    // endpoint at [2,1,1] was 41.900001526 against a true 41.899999998, i.e. ABOVE
+    // the true minimum, so the published box EXCLUDED admissible points. The width
+    // assertion below is the invariant that actually matters.
+    assert!((bounds.lower()[[0, 0, 0]] - 10.9).abs() < 1e-5);
+    assert!((bounds.upper()[[0, 0, 0]] - 11.1).abs() < 1e-5);
+    assert!((bounds.lower()[[2, 1, 1]] - 41.9).abs() < 1e-5);
+    assert!((bounds.upper()[[2, 1, 1]] - 42.1).abs() < 1e-5);
+    // Soundness regression guard, exact and non-flaky. At center 42.0 the true
+    // interval is [41.899999998, 42.100000001]. Directed emission MUST land
+    // strictly outside the f32 decimals on both sides; the previous
+    // round-to-nearest emission produced lower = 41.900001526 (ABOVE the true
+    // minimum) and upper = 42.099998474, so it fails both of these.
+    assert!(bounds.lower()[[2, 1, 1]] < 41.9);
+    assert!(bounds.upper()[[2, 1, 1]] > 42.1);
 }
 
 #[test]
@@ -586,7 +601,7 @@ fn test_mul_constant_broadcast_last_axis_scale() {
 
 #[test]
 fn test_mul_constant_broadcast_channel_first_scale_parity() {
-    // #3457 parity regression: verify [C, H, W] * [C] channel-first broadcast
+    // Parity regression: verify [C, H, W] * [C] channel-first broadcast
     // matches the IBP compatibility path (R1 directive from commit 5ffa88a).
     let values = ndarray::Array::from_shape_vec(
         (3, 2, 2),
@@ -608,16 +623,27 @@ fn test_mul_constant_broadcast_channel_first_scale_parity() {
     let bounds = result.to_bounded_tensor().unwrap();
     // Channel 0: value * 2.0, so center ± width*2
     // [0,0,0]: 1.0*2.0 = 2.0, width = 0.2*2.0 = 0.4
-    assert!((bounds.lower()[[0, 0, 0]] - 1.8).abs() < 1e-6);
-    assert!((bounds.upper()[[0, 0, 0]] - 2.2).abs() < 1e-6);
+    // See the tolerance note in the bias-compatibility test above: directed
+    // emission puts each endpoint up to one f32 ULP (3.8e-6 at magnitude 36)
+    // outside the decimal, which the old 1e-6 tolerance could not express.
+    assert!((bounds.lower()[[0, 0, 0]] - 1.8).abs() < 1e-5);
+    assert!((bounds.upper()[[0, 0, 0]] - 2.2).abs() < 1e-5);
     // Channel 1: value * 0.5
     // [1,0,0]: 5.0*0.5 = 2.5, width = 0.2*0.5 = 0.1
-    assert!((bounds.lower()[[1, 0, 0]] - 2.45).abs() < 1e-6);
-    assert!((bounds.upper()[[1, 0, 0]] - 2.55).abs() < 1e-6);
+    assert!((bounds.lower()[[1, 0, 0]] - 2.45).abs() < 1e-5);
+    assert!((bounds.upper()[[1, 0, 0]] - 2.55).abs() < 1e-5);
     // Channel 2: value * 3.0
     // [2,1,1]: 12.0*3.0 = 36.0, width = 0.2*3.0 = 0.6
-    assert!((bounds.lower()[[2, 1, 1]] - 35.7).abs() < 1e-6);
-    assert!((bounds.upper()[[2, 1, 1]] - 36.3).abs() < 1e-6);
+    assert!((bounds.lower()[[2, 1, 1]] - 35.7).abs() < 1e-5);
+    assert!((bounds.upper()[[2, 1, 1]] - 36.3).abs() < 1e-5);
+    // Soundness: the box must enclose its own center, and be ordered. A width
+    // assertion is deliberately NOT used here -- at these small magnitudes the
+    // `upper - lower` subtraction itself rounds, which would make the assertion
+    // flaky rather than discriminating. The exact directional guard lives in the
+    // bias-compatibility test above, where the values are known in closed form.
+    for idx in [[0usize, 0, 0], [1, 0, 0], [2, 1, 1]] {
+        assert!(bounds.lower()[idx] <= bounds.upper()[idx]);
+    }
 }
 
 #[test]
@@ -786,7 +812,7 @@ fn test_tile_identity() {
 #[test]
 fn test_to_bounded_tensor_rejects_nan_coefficients() {
     // NaN in zonotope coefficients must be caught by to_bounded_tensor(),
-    // not silently passed through via from_parts_unchecked (soundness fix #2396).
+    // not silently passed through via from_parts_unchecked (a soundness fix).
     let mut coeffs = arr2(&[[1.0_f32, 2.0], [0.1, 0.2]]).into_dyn();
     coeffs[[1, 0]] = f32::NAN; // inject NaN into error coefficient
     let z = ZonotopeTensor::new(coeffs).unwrap();
@@ -824,7 +850,7 @@ fn test_to_bounded_tensor_allows_infinite_bounds() {
     );
 }
 
-/// #2676: max_width must propagate NaN from coefficients, not silently absorb it.
+/// max_width must propagate NaN from coefficients, not silently absorb it.
 /// f32::max(NaN, x) == x (IEEE 754), so the old fold(0.0, f32::max) would
 /// return a finite value even when NaN is present. nan_propagating_max fixes this.
 #[test]
@@ -842,7 +868,7 @@ fn test_max_width_nan_coefficient_propagates_2676() {
     );
 }
 
-/// #2676: max_width with all-finite coefficients still works correctly.
+/// max_width with all-finite coefficients still works correctly.
 #[test]
 fn test_max_width_finite_unaffected_2676() {
     let values = arr1(&[1.0, 2.0]).into_dyn();

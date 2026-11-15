@@ -2,13 +2,11 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Talker attention training_signal integration tests (#3520 Packets B+C).
+//! Talker attention training_signal integration tests (Packets B+C).
 //!
 //! Split from the monolithic `training_signal.rs` into lane-specific leaves:
-//! - `output_width.rs` — output-width smoke/ranking (#3520 Packet B)
-//! - `property.rs` — property-guided centroid-monotonicity (#3520 Packet C)
-//!
-//! Part of #3834 avoice training_signal structure dedup.
+//! - `output_width.rs` — output-width smoke/ranking (Packet B)
+//! - `property/` — property-guided centroid-monotonicity (Packet C)
 
 use super::*;
 use crate::training_signal::{

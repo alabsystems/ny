@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared CPU dense-materialization policy for CROWN paths (#3515, #3550).
+//! Shared CPU dense-materialization policy for CROWN paths.
 //!
 //! Provides upfront memory estimates and budget checks for both sequential
 //! (unbatched) and batched dense identity/densification allocations. All CPU
@@ -21,7 +21,8 @@ use std::os::unix::fs::FileExt;
 #[cfg(target_os = "linux")]
 use std::path::{Component, Path, PathBuf};
 #[cfg(target_os = "linux")]
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
@@ -204,15 +205,106 @@ const LOW_MEMORY_REPORT_THRESHOLD_BYTES: u64 = 1536 * 1024 * 1024;
 #[cfg(not(target_os = "linux"))]
 const LIVE_MEMORY_PROBE_TTL: Duration = Duration::from_secs(1);
 
-/// Get the sequential CPU Dense-materialization budget in bytes (#3515).
+/// Get the sequential CPU Dense-materialization budget in bytes.
 ///
 /// Priority: `NY_DENSE_BUDGET_MB` env var > host-adaptive share > 2 GiB floor,
 /// then the live cgroup/RLIMIT envelope clamps every path.  An operator value
 /// overrides a heuristic; it cannot override a limit the kernel will enforce.
 pub fn cpu_crown_dense_budget_bytes() -> usize {
+    // #poll-amortise: ONE observation of the memory terms, used for both the
+    // adaptive policy and the process-envelope clamp. This function used to
+    // derive them TWICE per call -- once inside `adaptive_..._bytes` and once
+    // again for the clamp -- so the clamp could be computed from a different
+    // instant than the budget it clamps. Sharing one observation is strictly
+    // more coherent as well as half the cost.
+    let terms = amortised_memory_terms();
     let requested = explicit_cpu_crown_dense_budget_bytes()
-        .unwrap_or_else(adaptive_cpu_crown_dense_budget_bytes);
-    clamp_dense_budget_to_process_envelope(requested, process_memory_headroom_bytes())
+        .unwrap_or_else(|| adaptive_cpu_crown_dense_budget_from_terms(terms));
+    let budget = clamp_dense_budget_to_process_envelope(requested, terms.headroom_bytes);
+    // #kfsb-production: a fan-out SHARE installed on this thread narrows the
+    // budget (never widens it). No share is installed anywhere but inside a
+    // shared-budget fan-out's own worker threads, so everywhere else this is
+    // `budget` unchanged.
+    apply_dense_budget_thread_cap(budget, dense_budget_thread_cap())
+}
+
+// ---------------------------------------------------------------------------
+// #kfsb-production -- a per-thread SHARE of the dense budget for fan-outs.
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// The dense-budget share installed on this thread by
+    /// [`DenseBudgetThreadCap`] (`None`: no share; the live budget applies).
+    static DENSE_BUDGET_THREAD_CAP: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The dense-budget share installed on this thread, if any.
+pub(crate) fn dense_budget_thread_cap() -> Option<usize> {
+    DENSE_BUDGET_THREAD_CAP.with(std::cell::Cell::get)
+}
+
+/// `budget` narrowed to `cap`. Pure; a cap never widens the budget.
+pub(crate) const fn apply_dense_budget_thread_cap(budget: usize, cap: Option<usize>) -> usize {
+    match cap {
+        Some(cap) if cap < budget => cap,
+        _ => budget,
+    }
+}
+
+/// RAII: while alive, [`cpu_crown_dense_budget_bytes`] on THIS thread returns
+/// at most `bytes` (#kfsb-production).
+///
+/// # Why
+///
+/// The dense budget is "what ONE advertised dense pair may claim": a share of
+/// LIVE headroom (`headroom / 8`), sized so a single materialization's real
+/// peak (up to four times the advertised pair) leaves half the headroom for
+/// everything else. A parallel fan-out of `k` independent CROWN passes read
+/// that same figure `k` times, so `k` passes could each claim it at once —
+/// on a unified-memory host with no cgroup (competition), a global OOM. A
+/// fan-out that installs `total / width` on each of its `width` workers keeps
+/// the sum of what its passes may claim at or under the ONE budget a single
+/// pass gets.
+///
+/// # Scope
+///
+/// The share lives on the THREAD that installed it. A fan-out therefore
+/// installs it on EVERY worker of a pool it owns (the thread wrapper of a
+/// scoped Rayon pool), so a nested Rayon job one of its passes spawns — run
+/// by whichever worker of that pool steals it — sees the share too. Nested
+/// installations take the minimum; dropping restores the previous value.
+///
+/// # Never a verdict input
+///
+/// A budget is route information (dense vs. the cheap representation),
+/// never a bound: a smaller share can only make a pass take its cheaper,
+/// looser — still sound — representation.
+#[must_use = "the dense-budget share applies only while the guard is alive"]
+pub(crate) struct DenseBudgetThreadCap {
+    previous: Option<usize>,
+    // A thread-local guard must be dropped on the thread that created it.
+    _thread_affine: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl DenseBudgetThreadCap {
+    /// Install `bytes` (or keep a tighter share already installed).
+    pub(crate) fn install(bytes: usize) -> Self {
+        let previous = DENSE_BUDGET_THREAD_CAP.with(|cap| {
+            let narrowed = Some(apply_dense_budget_thread_cap(bytes, cap.get()));
+            cap.replace(narrowed)
+        });
+        Self {
+            previous,
+            _thread_affine: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for DenseBudgetThreadCap {
+    fn drop(&mut self) {
+        DENSE_BUDGET_THREAD_CAP.with(|cap| cap.set(self.previous));
+    }
 }
 
 fn clamp_dense_budget_to_process_envelope(
@@ -224,6 +316,303 @@ fn clamp_dense_budget_to_process_envelope(
             .unwrap_or(usize::MAX);
         requested_bytes.min(share)
     })
+}
+
+// ---------------------------------------------------------------------------
+// #poll-amortise -- one observation of the live memory terms, reused for a
+// bounded window.
+// ---------------------------------------------------------------------------
+
+/// How long ONE observation of the process/host memory terms may be reused
+/// across dense-admission gates (#poll-amortise).
+///
+/// # Why this exists
+///
+/// `cpu_crown_dense_budget_bytes()` is reached from 87 call sites, several of
+/// them per graph node per BaB domain -- `merge_accumulator.rs` alone holds 13.
+/// Every call used to derive the terms TWICE (see that function), and each
+/// derivation takes a process-global `Mutex`, preads `/proc/self/cgroup` to
+/// revalidate cgroup membership, then reads `/proc/self/limits`,
+/// `/proc/self/status` and `/proc/meminfo` LIVE. `process_memory_headroom_from_snapshot`
+/// documents that `/proc/self/status` generation walks the mm and is therefore
+/// the dominant per-admission cost; this module's own header already records
+/// that a SafeNLP proof reached 13,500 probes, and that figure predates the
+/// admission gates now sitting on the per-domain CROWN path.
+///
+/// # Why 100 ms is a safe stride
+///
+/// This is a NEW value-staleness, not one the module already had. The Linux
+/// probe snapshot's own `MEMORY_PROBE_CACHE_TTL` (also 100 ms) bounds only the
+/// reuse of open descriptors and cgroup topology; before #poll-amortise every
+/// gate re-read the VALUES live through those handles. What makes 100 ms
+/// acceptable is the rate of the condition the governor guards, which develops
+/// over seconds, not milliseconds: the measured 2026-08-26 blowup reached
+/// 118 GB over ~1150 s, i.e. ~100 MB/s on average, so a 100 ms stale headroom
+/// is off by ~10 MB against a `SYSTEM_MEMORY_RESERVE_BYTES` reserve of 4 GiB --
+/// roughly 400x of margin. That is an AVERAGE: one dense materialization can
+/// allocate far faster, and during such a burst the error is the burst's own
+/// allocation rate times the window. The 1/8 envelope share and the 4 GiB
+/// reserve absorb that, exactly as they already absorbed the pre-existing
+/// check-then-allocate window between an admission and its allocation. The
+/// derived budget moves by at most the headroom error divided by
+/// `PROCESS_ENVELOPE_DENSE_BUDGET_SHARE_DIVISOR`.
+///
+/// The window also delays, by at most one TTL, what the live read noticed at
+/// the next gate: a lowered `RLIMIT_AS`, a migration into a tighter cgroup, and
+/// the self-RSS backstop crossing its ceiling. [`process_memory_envelope`], the
+/// strict fail-closed API, is NOT served from this cache and stays live per
+/// call.
+///
+/// # Why this cannot change a verdict
+///
+/// A budget is scheduling and route information, never a bound. `instance_budget`
+/// states the doctrine for the wall clock and it holds here verbatim: a wrong
+/// value can only mis-schedule -- pick the cheap representation instead of the
+/// dense one -- never mis-certify. The figure is also an inherently live
+/// measurement: two runs of the same instance already read different headrooms
+/// at every probe, so there is no bit-identity to lose.
+const MEMORY_TERMS_AMORTISE_TTL: Duration = Duration::from_millis(100);
+
+/// Sentinel for `None` in the lock-free term cache. No real byte count reaches
+/// `u64::MAX`.
+const MEMORY_TERM_NONE: u64 = u64::MAX;
+
+/// Declared procfs reads avoided per amortised probe, for the observable only.
+///
+/// Two derivations per `cpu_crown_dense_budget_bytes()` call, each reading
+/// `/proc/self/cgroup` (membership revalidation), `/proc/self/limits`,
+/// `/proc/self/status` and `/proc/meminfo`, plus one cgroup counter pair:
+/// 2 x 5. This is a DECLARED count read off the call graph, not a measurement.
+const PROCFS_READS_PER_BUDGET_PROBE: u64 = 10;
+
+/// The live memory readings every dense-admission gate needs, observed
+/// together so one budget decision can never mix two instants.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AmortisedMemoryTerms {
+    observed_host_bytes: Option<u64>,
+    headroom_bytes: Option<u64>,
+    live_available_bytes: Option<u64>,
+}
+
+/// Probes served (cache hits + observations).
+static MEMORY_TERM_PROBES: AtomicU64 = AtomicU64::new(0);
+/// Probes that actually went to the kernel.
+static MEMORY_TERM_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
+static MEMORY_TERM_VALID_UNTIL_NANOS: AtomicU64 = AtomicU64::new(0);
+static MEMORY_TERM_OBSERVED_HOST: AtomicU64 = AtomicU64::new(MEMORY_TERM_NONE);
+static MEMORY_TERM_HEADROOM: AtomicU64 = AtomicU64::new(MEMORY_TERM_NONE);
+static MEMORY_TERM_LIVE_AVAILABLE: AtomicU64 = AtomicU64::new(MEMORY_TERM_NONE);
+
+const fn encode_memory_term(value: Option<u64>) -> u64 {
+    match value {
+        Some(bytes) if bytes != MEMORY_TERM_NONE => bytes,
+        Some(_) => MEMORY_TERM_NONE - 1,
+        None => MEMORY_TERM_NONE,
+    }
+}
+
+const fn decode_memory_term(value: u64) -> Option<u64> {
+    if value == MEMORY_TERM_NONE {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// Monotonic nanoseconds since the first probe.
+fn memory_term_clock_nanos() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let epoch = EPOCH.get_or_init(Instant::now);
+    u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// The memory terms, from the amortised observation when it is still inside
+/// [`MEMORY_TERMS_AMORTISE_TTL`].
+///
+/// Two threads may refresh concurrently; both write legitimate live
+/// observations and the last writer wins, so a reader can at worst combine two
+/// readings taken inside one TTL window. That is not a new hazard: the
+/// two-derivation shape this replaces mixed two instants inside a SINGLE
+/// budget call.
+fn amortised_memory_terms() -> AmortisedMemoryTerms {
+    MEMORY_TERM_PROBES.fetch_add(1, Ordering::Relaxed);
+    let now = memory_term_clock_nanos();
+    if now < MEMORY_TERM_VALID_UNTIL_NANOS.load(Ordering::Acquire) {
+        return AmortisedMemoryTerms {
+            observed_host_bytes: decode_memory_term(
+                MEMORY_TERM_OBSERVED_HOST.load(Ordering::Relaxed),
+            ),
+            headroom_bytes: decode_memory_term(MEMORY_TERM_HEADROOM.load(Ordering::Relaxed)),
+            live_available_bytes: decode_memory_term(
+                MEMORY_TERM_LIVE_AVAILABLE.load(Ordering::Relaxed),
+            ),
+        };
+    }
+    MEMORY_TERM_OBSERVATIONS.fetch_add(1, Ordering::Relaxed);
+    let terms = observe_memory_terms();
+    MEMORY_TERM_OBSERVED_HOST.store(
+        encode_memory_term(terms.observed_host_bytes),
+        Ordering::Relaxed,
+    );
+    MEMORY_TERM_HEADROOM.store(encode_memory_term(terms.headroom_bytes), Ordering::Relaxed);
+    MEMORY_TERM_LIVE_AVAILABLE.store(
+        encode_memory_term(terms.live_available_bytes),
+        Ordering::Relaxed,
+    );
+    let ttl = u64::try_from(MEMORY_TERMS_AMORTISE_TTL.as_nanos()).unwrap_or(u64::MAX);
+    MEMORY_TERM_VALID_UNTIL_NANOS.store(now.saturating_add(ttl), Ordering::Release);
+    terms
+}
+
+/// Discard the amortised observation. Test-only: in production the TTL is the
+/// whole contract, and nothing needs to force a live read.
+#[cfg(test)]
+pub(crate) fn invalidate_amortised_memory_terms() {
+    MEMORY_TERM_VALID_UNTIL_NANOS.store(0, Ordering::Release);
+}
+
+/// The UNCONDITIONAL `#poll-amortise` observable.
+///
+/// Maintained with no feature gate, no env read and no preset key, so a null
+/// measurement can be told from a dark one: `memory_probes=0` means the
+/// amortiser was never reached, `factor=1.00` means it was reached and saved
+/// nothing.
+#[must_use]
+pub fn amortisation_line() -> String {
+    let probes = MEMORY_TERM_PROBES.load(Ordering::Relaxed);
+    let observations = MEMORY_TERM_OBSERVATIONS.load(Ordering::Relaxed);
+    let saved = probes.saturating_sub(observations);
+    let hundredths = probes.saturating_mul(100) / observations.max(1);
+    format!(
+        "[poll-amortise] memory_probes={probes} memory_observations={observations} \
+         memory_probes_saved={saved} memory_factor={}.{:02} memory_ttl_ms={} \
+         procfs_reads_saved_estimate={} {}",
+        hundredths / 100,
+        hundredths % 100,
+        MEMORY_TERMS_AMORTISE_TTL.as_millis(),
+        saved.saturating_mul(PROCFS_READS_PER_BUDGET_PROBE),
+        crate::amortise::poll_amortisation_fragment(),
+    )
+}
+
+#[cfg(test)]
+mod amortise_tests {
+    use super::*;
+
+    /// The counters are PROCESS-GLOBAL and this lib test binary runs thousands
+    /// of tests in parallel, many of which reach `cpu_crown_dense_budget_bytes`
+    /// through the CROWN admission gates. So an exact delta on
+    /// `MEMORY_TERM_PROBES` is not a property of this test, a concurrent
+    /// refresher can overwrite the cached terms, and a window that outlives the
+    /// TTL may legitimately re-observe. Each of those is SPORADIC; every defect
+    /// this test exists to catch (no caching, invalidation that does not force
+    /// an observation, a cache hit that returns something other than the
+    /// stored observation, an uncounted probe) is SYSTEMATIC and fails every
+    /// attempt. So: retry a bounded number of windows and require ONE window in
+    /// which every assertion holds; never pass without one.
+    ///
+    /// The value check compares TERMS, not only budgets. On a large host the
+    /// budget saturates at `MAX_ADAPTIVE_DENSE_BUDGET_MB` (at quiescence the GB10
+    /// reads 12 GiB whatever the headroom is), so a budget-only equality could
+    /// not see a hit path that decodes the wrong bytes. The miss path returns
+    /// the live observation ITSELF; a hit must reproduce it field for field.
+    #[test]
+    fn dense_budget_probe_is_served_from_the_amortised_cache() {
+        const PROBES_PER_WINDOW: u64 = 64;
+        const ATTEMPTS: usize = 32;
+        // Hold the env lock with the operator override REMOVED, so the budget
+        // is the adaptive value derived from the cached terms and no concurrent
+        // `with_crown_dense_budget_mb` test can change it mid-window.
+        crate::tests::with_serialized_env_vars_removed(&[CROWN_DENSE_BUDGET_ENV], || {
+            let mut last_failure = String::new();
+            for attempt in 0..ATTEMPTS {
+                invalidate_amortised_memory_terms();
+                let window = Instant::now();
+                let before_observations = MEMORY_TERM_OBSERVATIONS.load(Ordering::Relaxed);
+                // A miss: this is the kernel observation itself, not a decoded copy.
+                let observed = amortised_memory_terms();
+                let after_first = MEMORY_TERM_OBSERVATIONS.load(Ordering::Relaxed);
+                let first = clamp_dense_budget_to_process_envelope(
+                    adaptive_cpu_crown_dense_budget_from_terms(observed),
+                    observed.headroom_bytes,
+                );
+                let before_probes = MEMORY_TERM_PROBES.load(Ordering::Relaxed);
+                let repeats: Vec<usize> = (0..PROBES_PER_WINDOW)
+                    .map(|_| cpu_crown_dense_budget_bytes())
+                    .collect();
+                // A hit: decoded from the lock-free cache.
+                let hit = amortised_memory_terms();
+                let after_observations = MEMORY_TERM_OBSERVATIONS.load(Ordering::Relaxed);
+                let after_probes = MEMORY_TERM_PROBES.load(Ordering::Relaxed);
+                let elapsed = window.elapsed();
+
+                last_failure = if elapsed >= MEMORY_TERMS_AMORTISE_TTL / 2 {
+                    format!("attempt {attempt}: window took {elapsed:?}, too close to the TTL")
+                } else if after_first <= before_observations {
+                    format!(
+                        "attempt {attempt}: invalidation did not force a kernel observation \
+                         ({before_observations} -> {after_first})"
+                    )
+                } else if after_observations != after_first {
+                    format!(
+                        "attempt {attempt}: {PROBES_PER_WINDOW} probes inside the TTL reached \
+                         the kernel {} more time(s)",
+                        after_observations - after_first
+                    )
+                } else if after_probes < before_probes + PROBES_PER_WINDOW + 1 {
+                    format!(
+                        "attempt {attempt}: only {} of {} probes were counted",
+                        after_probes - before_probes,
+                        PROBES_PER_WINDOW + 1
+                    )
+                } else if hit != observed {
+                    format!(
+                        "attempt {attempt}: a cache hit decoded {hit:?}, not the observation \
+                         {observed:?}"
+                    )
+                } else if let Some(different) = repeats.iter().find(|&&budget| budget != first) {
+                    format!(
+                        "attempt {attempt}: an amortised probe returned {different}, not the \
+                         {first} derived from the observation"
+                    )
+                } else {
+                    return;
+                };
+            }
+            panic!("no clean amortisation window in {ATTEMPTS} attempts; last: {last_failure}");
+        });
+    }
+
+    #[test]
+    fn amortisation_line_carries_both_halves_unconditionally() {
+        let line = amortisation_line();
+        for field in [
+            "[poll-amortise]",
+            "memory_probes=",
+            "memory_observations=",
+            "memory_factor=",
+            "memory_ttl_ms=100",
+            "procfs_reads_saved_estimate=",
+            "poll_units=",
+            "poll_chunk=4096",
+        ] {
+            assert!(line.contains(field), "missing {field} in {line}");
+        }
+    }
+
+    #[test]
+    fn memory_term_sentinel_round_trips() {
+        assert_eq!(decode_memory_term(encode_memory_term(None)), None);
+        assert_eq!(decode_memory_term(encode_memory_term(Some(0))), Some(0));
+        assert_eq!(
+            decode_memory_term(encode_memory_term(Some(1 << 40))),
+            Some(1 << 40)
+        );
+        assert!(
+            decode_memory_term(encode_memory_term(Some(MEMORY_TERM_NONE))).is_some(),
+            "a saturated byte count must not decode as an absent observation"
+        );
+    }
 }
 
 /// Size the Dense budget from MEASURED host memory instead of a fixed constant
@@ -252,32 +641,22 @@ fn clamp_dense_budget_to_process_envelope(
 ///
 /// With neither an observable host-memory value nor a process-envelope value,
 /// this returns exactly the historical default.
-fn adaptive_cpu_crown_dense_budget_bytes() -> usize {
-    #[cfg(target_os = "linux")]
-    {
-        let snapshot = linux_memory_probe_snapshot();
-        adaptive_cpu_crown_dense_budget_from(
-            observed_host_memory_bytes_from_snapshot(&snapshot),
-            process_memory_headroom_from_snapshot(&snapshot),
-            // Linux already reads `MemAvailable` as its host observation, so
-            // the observation IS the live figure; no separate valve is needed.
-            None,
-        )
-    }
+fn adaptive_cpu_crown_dense_budget_from_terms(terms: AmortisedMemoryTerms) -> usize {
+    let budget = adaptive_cpu_crown_dense_budget_from(
+        terms.observed_host_bytes,
+        terms.headroom_bytes,
+        terms.live_available_bytes,
+    );
     #[cfg(not(target_os = "linux"))]
     {
-        let observed = observed_host_memory_bytes();
-        let headroom = process_memory_headroom_bytes();
-        let live = live_available_memory_bytes();
-        let budget = adaptive_cpu_crown_dense_budget_from(observed, headroom, live);
         // #dense-budget-valve: REPORT a critically low host once per process.
         // This deliberately does not change `budget` -- see the policy function's
         // doc comment for why the clamp was withdrawn.
-        if let Some(available) = live {
+        if let Some(available) = terms.live_available_bytes {
             static WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if available < LOW_MEMORY_REPORT_THRESHOLD_BYTES
-                && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+                && !WARNED.swap(true, Ordering::Relaxed)
             {
                 tracing::warn!(
                     "#dense-budget-valve: host has {available} bytes reclaimable-now, below \
@@ -287,8 +666,8 @@ fn adaptive_cpu_crown_dense_budget_bytes() -> usize {
                 );
             }
         }
-        budget
     }
+    budget
 }
 
 /// Pure adaptive-budget policy, separated from the host probes so the
@@ -375,10 +754,6 @@ fn adaptive_cpu_crown_dense_budget_from(
                 .unwrap_or(usize::MAX);
         budget = budget.min(headroom_share);
     }
-    // #dense-budget-valve: same reasoning as the envelope above, but against a
-    // LIVE host-wide reading rather than a per-process kernel limit. Kept as a
-    // separate term so `process_memory_headroom_bytes`' "kernel-enforced"
-    // contract stays literally true.
     // #dense-budget-valve WITHDRAWN 2026-08-01 -- see the doc comment above.
     // The live reading is still taken and still reported once per process,
     // because "the host is nearly out of memory" is worth saying. It no longer
@@ -765,9 +1140,10 @@ Pages free:                                   100.\n";
 ///
 /// Dense admission sits in per-domain hot loops, where reopening procfs and
 /// rediscovering the same cgroup mount thousands of times can cost more than
-/// the proof itself. Linux keeps a short-lived snapshot of open handles but
-/// reads `MemAvailable` from that handle at every call, so the value remains
-/// live without repeated `openat`/`statx`/`close` traffic.
+/// the proof itself. Linux keeps a short-lived snapshot of open handles and
+/// reads `MemAvailable` from that handle at every OBSERVATION, without repeated
+/// `openat`/`statx`/`close` traffic. Since #poll-amortise the dense-budget
+/// gates share one observation for at most `MEMORY_TERMS_AMORTISE_TTL`.
 #[cfg(not(target_os = "linux"))]
 fn observed_host_memory_bytes() -> Option<u64> {
     physical_memory_bytes().map(|total| total / 2)
@@ -978,26 +1354,49 @@ pub(crate) fn explicit_cpu_crown_dense_budget_bytes() -> Option<usize> {
 /// The minimum remaining headroom is returned. An unreadable, malformed, or
 /// unlimited source contributes no bound; callers must retain their own
 /// conservative fallback. Every resolved cgroup limit/usage pair, both RLIMIT
-/// inputs, and both self-governing inputs are read at every allocation gate
-/// through cached open handles. Only path discovery and handle opening use a
-/// short, invalidating snapshot, so dynamic envelope semantics stay live
-/// without turning `openat`/`statx`/`close` into the dominant workload.
+/// inputs, and both self-governing inputs are read through cached open handles
+/// at every OBSERVATION, and since #poll-amortise one observation is shared by
+/// every gate for at most `MEMORY_TERMS_AMORTISE_TTL` (100 ms) -- so the value
+/// returned here may be up to that old. Path discovery and handle opening use
+/// a separate short, invalidating snapshot, so `openat`/`statx`/`close` never
+/// become the dominant workload. Callers that must see a kernel envelope LIVE
+/// use [`process_memory_envelope`], which bypasses the amortised cache.
 ///
 /// This narrows; it never widens. See [`system_memory_headroom_from`] for why
 /// that makes the governor incapable of tightening any bound.
 ///
 /// [`ProcessMemoryEnvelope`] is deliberately NOT affected: that API's contract
-/// is strictly about limits the kernel will enforce, and callers use it to fail
-/// CLOSED on ambiguity. A host-derived observation has no place in it.
+/// is strictly about envelopes the kernel will enforce, and callers use it to
+/// fail CLOSED on ambiguity. On Linux a host-derived observation has no place
+/// in it — `MemAvailable` is advisory there, and the enforced envelopes are
+/// cgroup/RLIMIT. The Darwin arm of that API (#darwin-memory-envelope) is not
+/// an exception to this rule: `hw.memsize − phys_footprint` is the envelope
+/// XNU's jetsam ledger enforces on a machine whose unified physical memory is
+/// fixed, not an advisory availability heuristic.
 pub fn process_memory_headroom_bytes() -> Option<u64> {
+    amortised_memory_terms().headroom_bytes
+}
+
+/// One live observation of the memory terms, WITHOUT the amortised cache.
+fn observe_memory_terms() -> AmortisedMemoryTerms {
     #[cfg(target_os = "linux")]
     {
         let snapshot = linux_memory_probe_snapshot();
-        process_memory_headroom_from_snapshot(&snapshot)
+        AmortisedMemoryTerms {
+            observed_host_bytes: observed_host_memory_bytes_from_snapshot(&snapshot),
+            headroom_bytes: process_memory_headroom_from_snapshot(&snapshot),
+            // Linux already reads `MemAvailable` as its host observation, so
+            // the observation IS the live figure; no separate valve is needed.
+            live_available_bytes: None,
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
-        None
+        AmortisedMemoryTerms {
+            observed_host_bytes: observed_host_memory_bytes(),
+            headroom_bytes: None,
+            live_available_bytes: live_available_memory_bytes(),
+        }
     }
 }
 
@@ -1019,31 +1418,532 @@ pub enum ProcessMemoryEnvelope {
     Unavailable,
 }
 
-/// Return a strict classification of the process's cgroup/RLIMIT envelope.
+/// Return a strict classification of the process's kernel-enforced envelope.
 ///
 /// Linux requires complete, internally consistent observations from both
 /// cgroups and `RLIMIT_AS`. Any ambiguous source makes the aggregate
-/// unavailable. Other operating systems currently have no equivalent probe
-/// and report [`ProcessMemoryEnvelope::Unavailable`].
+/// unavailable.
+///
+/// macOS (#darwin-memory-envelope) derives the same classification from the
+/// machine's fixed physical memory (`sysctl hw.memsize`) minus this process's
+/// kernel-charged footprint (`task_info` `TASK_VM_INFO` `phys_footprint` — the
+/// ledger jetsam enforces), narrowed by a finite `RLIMIT_AS` soft limit when
+/// one is installed, mirroring the Linux RLIMIT term. Any failed syscall makes
+/// the aggregate [`ProcessMemoryEnvelope::Unavailable`], so the fail-closed
+/// contract for genuinely unknown envelopes is preserved; what changed is that
+/// macOS stopped being "unknown BY CONSTRUCTION" — before this arm existed, no
+/// measurement on a macOS host could ever exercise the optional-heavy lanes
+/// behind this gate (the margin-row lane's flight sidecar showed
+/// `outer_route=memory` on every cifar100 run at every commit).
+///
+/// Operating systems with no equivalent probe still report
+/// [`ProcessMemoryEnvelope::Unavailable`].
 pub fn process_memory_envelope() -> ProcessMemoryEnvelope {
     #[cfg(target_os = "linux")]
     {
         let snapshot = linux_memory_probe_snapshot();
         process_memory_envelope_from_snapshot(&snapshot)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        let snapshot = darwin_memory_probe_snapshot();
+        process_memory_envelope_from_darwin_snapshot(&snapshot)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         ProcessMemoryEnvelope::Unavailable
     }
 }
 
-#[cfg(all(test, not(target_os = "linux")))]
+#[cfg(all(test, not(any(target_os = "linux", target_os = "macos"))))]
 #[test]
 fn process_memory_envelope_is_unavailable_without_a_platform_probe() {
     assert_eq!(
         process_memory_envelope(),
         ProcessMemoryEnvelope::Unavailable
     );
+}
+
+// === Darwin strict memory envelope (#darwin-memory-envelope) ===
+//
+// macOS has no cgroup, so before this section existed `process_memory_envelope`
+// returned `Unavailable` on every macOS host BY CONSTRUCTION, and the
+// fail-closed consumers (`optional_heavy_memory_allowed_now`, the
+// override-rebound admission) were structurally dark: no measurement taken on
+// a macOS machine had ever exercised the lanes behind them. This section makes
+// the gate MEASURE instead of failing closed per-platform, with the same
+// strictness law as Linux: every applicable source must be observed
+// completely, and any failed syscall is `Unavailable`.
+//
+// The probe deliberately uses direct libSystem calls declared here rather than
+// a new dependency: ny-propagate does not link `libc` or `mach2`
+// (Cargo.toml has neither), libSystem is always linked on Darwin, and the
+// three calls needed (`sysctlbyname`, `task_info`, `getrlimit`) have stable
+// documented ABIs. It also does not fork the `sysctl`/`vm_stat` child
+// processes the legacy budget heuristics use — this is an admission gate, not
+// a heuristic, and it must not cost a process spawn per check.
+
+/// `sysctl` name of total physical memory, immutable for the process lifetime.
+#[cfg(target_os = "macos")]
+const DARWIN_HW_MEMSIZE_SYSCTL: &[u8] = b"hw.memsize\0";
+
+/// `TASK_VM_INFO` flavor id from `mach/task_info.h`.
+#[cfg(target_os = "macos")]
+const DARWIN_TASK_VM_INFO_FLAVOR: u32 = 22;
+
+/// `KERN_SUCCESS` from `mach/kern_return.h`.
+#[cfg(target_os = "macos")]
+const DARWIN_KERN_SUCCESS: i32 = 0;
+
+/// `RLIMIT_AS` from Darwin's `sys/resource.h` (aliased there to `RLIMIT_RSS`).
+#[cfg(target_os = "macos")]
+const DARWIN_RLIMIT_AS: i32 = 5;
+
+/// `RLIM_INFINITY` from Darwin's `sys/resource.h`: `(1 << 63) - 1`.
+#[cfg(target_os = "macos")]
+const DARWIN_RLIM_INFINITY: u64 = 0x7fff_ffff_ffff_ffff;
+
+/// Prefix of XNU's `struct task_vm_info` (rev1) through `phys_footprint`.
+///
+/// Field order and widths mirror `osfmk/mach/task_info.h` exactly; only
+/// `virtual_size` and `phys_footprint` are read, the rest exist to make the
+/// kernel's write land at the documented offsets. `phys_footprint` is the
+/// kernel-charged footprint ledger — the number jetsam enforces — which is why
+/// it, and not `resident_size`, is subtracted from physical memory below.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct DarwinTaskVmInfo {
+    virtual_size: u64,
+    _region_count: i32,
+    _page_size: i32,
+    _resident_size: u64,
+    _resident_size_peak: u64,
+    _device: u64,
+    _device_peak: u64,
+    _internal: u64,
+    _internal_peak: u64,
+    _external: u64,
+    _external_peak: u64,
+    _reusable: u64,
+    _reusable_peak: u64,
+    _purgeable_volatile_pmap: u64,
+    _purgeable_volatile_resident: u64,
+    _purgeable_volatile_virtual: u64,
+    _compressed: u64,
+    _compressed_peak: u64,
+    _compressed_lifetime: u64,
+    phys_footprint: u64,
+}
+
+/// Darwin's `struct rlimit`: two `rlim_t` (`u64`) fields.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct DarwinRlimit {
+    rlim_cur: u64,
+    rlim_max: u64,
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    /// This process's task port; libSystem exports it as a data symbol
+    /// (`mach_task_self()` is a macro over it in C).
+    static mach_task_self_: u32;
+    fn task_info(
+        target_task: u32,
+        flavor: u32,
+        task_info_out: *mut i32,
+        task_info_out_cnt: *mut u32,
+    ) -> i32;
+    fn sysctlbyname(
+        name: *const std::ffi::c_char,
+        oldp: *mut std::ffi::c_void,
+        oldlenp: *mut usize,
+        newp: *mut std::ffi::c_void,
+        newlen: usize,
+    ) -> std::ffi::c_int;
+    fn getrlimit(resource: std::ffi::c_int, rlp: *mut DarwinRlimit) -> std::ffi::c_int;
+}
+
+/// One complete observation of every source the Darwin envelope consults.
+///
+/// Mirrors the Linux `LinuxMemoryProbeSnapshot` split: the live syscalls fill
+/// this struct, and [`process_memory_envelope_from_darwin_snapshot`] is a pure
+/// derivation over it, so the arithmetic and the fail-closed law are
+/// unit-testable without syscalls. `None` in any field means the corresponding
+/// syscall failed — never zero, which would fabricate a bound.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DarwinMemoryProbeSnapshot {
+    /// `sysctl hw.memsize`: total physical memory.
+    total_physical_bytes: Option<u64>,
+    /// `TASK_VM_INFO` `phys_footprint`: this process's jetsam-charged bytes.
+    phys_footprint_bytes: Option<u64>,
+    /// `getrlimit(RLIMIT_AS)` soft limit, with `RLIM_INFINITY` mapped to
+    /// [`ParsedMemoryLimit::Unlimited`].
+    address_space_limit: Option<ParsedMemoryLimit>,
+    /// `TASK_VM_INFO` `virtual_size`, consulted only against a finite
+    /// `RLIMIT_AS` (the same shape as Linux's `VmSize` subtraction).
+    virtual_size_bytes: Option<u64>,
+}
+
+/// Live Darwin observation. Uncached except for the immutable `hw.memsize`:
+/// unlike the Linux probe this is two cheap kernel calls, not procfs handle
+/// discovery, and the strict envelope's consumers are admission gates rather
+/// than per-allocation hot loops.
+#[cfg(target_os = "macos")]
+fn darwin_memory_probe_snapshot() -> DarwinMemoryProbeSnapshot {
+    let task = darwin_task_vm_info();
+    DarwinMemoryProbeSnapshot {
+        total_physical_bytes: darwin_total_physical_memory_bytes(),
+        phys_footprint_bytes: task.map(|info| info.phys_footprint),
+        address_space_limit: darwin_address_space_soft_limit(),
+        virtual_size_bytes: task.map(|info| info.virtual_size),
+    }
+}
+
+/// `sysctl hw.memsize` via `sysctlbyname`, cached for the process lifetime
+/// (physical memory cannot change under a live process).
+// The crate denies unsafe_code; this FFI probe is one of the narrow allowed
+// seams (same convention as `imb::from_independently_verified_parts`): a
+// direct libSystem call whose invariants are stated at the call site.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn darwin_total_physical_memory_bytes() -> Option<u64> {
+    static MEMSIZE: OnceLock<Option<u64>> = OnceLock::new();
+    *MEMSIZE.get_or_init(|| {
+        let mut value: u64 = 0;
+        let mut len = size_of::<u64>();
+        // SAFETY: the name is NUL-terminated; `oldp`/`oldlenp` describe the
+        // valid 8-byte buffer `value`; no new value is written (`newp` null,
+        // `newlen` 0).
+        let rc = unsafe {
+            sysctlbyname(
+                DARWIN_HW_MEMSIZE_SYSCTL.as_ptr().cast(),
+                (&raw mut value).cast(),
+                &raw mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        // A shorter-than-expected reply would leave high bytes unwritten;
+        // refuse it instead of parsing a permissive partial value (the same
+        // truncation law as `OpenMemoryFile::parse` on Linux).
+        (rc == 0 && len == size_of::<u64>() && value > 0).then_some(value)
+    })
+}
+
+/// `task_info(TASK_VM_INFO)` on this process, or `None` on any failure.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn darwin_task_vm_info() -> Option<DarwinTaskVmInfo> {
+    let mut info = DarwinTaskVmInfo::default();
+    let mut count = u32::try_from(size_of::<DarwinTaskVmInfo>() / size_of::<i32>()).ok()?;
+    // SAFETY: `info` is a valid, writable rev1-prefix buffer whose length in
+    // `integer_t` units is exactly `count`, so the kernel writes at most
+    // `count * 4` bytes into it; `mach_task_self_` is libSystem's own task
+    // port for this process.
+    let rc = unsafe {
+        task_info(
+            mach_task_self_,
+            DARWIN_TASK_VM_INFO_FLAVOR,
+            (&raw mut info).cast::<i32>(),
+            &raw mut count,
+        )
+    };
+    if rc != DARWIN_KERN_SUCCESS {
+        return None;
+    }
+    // The kernel writes min(requested, supported) integers and stores that
+    // number back into `count`. Require every field through `phys_footprint`
+    // to have been filled: a hypothetical pre-rev1 kernel would leave it at
+    // the zero this struct was initialized with, which must read as "no
+    // observation", never as a zero footprint.
+    let filled_bytes = usize::try_from(count).ok()?.checked_mul(size_of::<i32>())?;
+    (filled_bytes >= size_of::<DarwinTaskVmInfo>()).then_some(info)
+}
+
+/// `getrlimit(RLIMIT_AS)` soft limit, mirroring the Linux
+/// `parse_address_space_soft_limit_strict` semantics: `None` on observation
+/// failure, `Unlimited` for `RLIM_INFINITY`, `Finite` otherwise. XNU enforces
+/// a finite `RLIMIT_AS` against the task's map size, so this is a
+/// kernel-enforced envelope in exactly the Linux arm's sense; no cgroup term
+/// exists to mirror.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn darwin_address_space_soft_limit() -> Option<ParsedMemoryLimit> {
+    let mut limit = DarwinRlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid, writable `struct rlimit`-layout buffer.
+    let rc = unsafe { getrlimit(DARWIN_RLIMIT_AS, &raw mut limit) };
+    if rc != 0 {
+        return None;
+    }
+    Some(if limit.rlim_cur >= DARWIN_RLIM_INFINITY {
+        ParsedMemoryLimit::Unlimited
+    } else {
+        ParsedMemoryLimit::Finite(limit.rlim_cur)
+    })
+}
+
+/// Pure derivation of the strict Darwin envelope from one snapshot.
+///
+/// The physical term is `hw.memsize − phys_footprint`, saturating at zero: a
+/// footprint at or above physical memory reads as NO headroom (fail closed in
+/// the bounded direction), never as unknown. The RLIMIT term mirrors Linux's:
+/// an unlimited soft limit contributes no bound, a finite one contributes
+/// `limit − virtual_size`. Either source observed incompletely makes the
+/// aggregate `Unavailable`, via the same
+/// [`combine_process_memory_envelopes`] law the Linux arm uses.
+#[cfg(target_os = "macos")]
+fn process_memory_envelope_from_darwin_snapshot(
+    snapshot: &DarwinMemoryProbeSnapshot,
+) -> ProcessMemoryEnvelope {
+    combine_process_memory_envelopes(&[
+        darwin_physical_memory_envelope_from_snapshot(snapshot),
+        darwin_address_space_memory_envelope_from_snapshot(snapshot),
+    ])
+}
+
+/// Physical-memory term: the envelope jetsam enforces. Both observations must
+/// be present; there is no `Unbounded` case, because a machine's physical
+/// memory is always finite.
+#[cfg(target_os = "macos")]
+fn darwin_physical_memory_envelope_from_snapshot(
+    snapshot: &DarwinMemoryProbeSnapshot,
+) -> ProcessMemoryEnvelope {
+    match (snapshot.total_physical_bytes, snapshot.phys_footprint_bytes) {
+        (Some(total), Some(footprint)) => ProcessMemoryEnvelope::Bounded {
+            headroom_bytes: total.saturating_sub(footprint),
+        },
+        _ => ProcessMemoryEnvelope::Unavailable,
+    }
+}
+
+/// Address-space term, the Darwin mirror of
+/// `strict_address_space_memory_envelope_from_snapshot`: the usage
+/// subtraction is required only once the limit is finite.
+#[cfg(target_os = "macos")]
+fn darwin_address_space_memory_envelope_from_snapshot(
+    snapshot: &DarwinMemoryProbeSnapshot,
+) -> ProcessMemoryEnvelope {
+    match snapshot.address_space_limit {
+        None => ProcessMemoryEnvelope::Unavailable,
+        Some(ParsedMemoryLimit::Unlimited) => ProcessMemoryEnvelope::Unbounded,
+        Some(ParsedMemoryLimit::Finite(limit)) => match snapshot.virtual_size_bytes {
+            Some(used) => ProcessMemoryEnvelope::Bounded {
+                headroom_bytes: limit.saturating_sub(used),
+            },
+            None => ProcessMemoryEnvelope::Unavailable,
+        },
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod darwin_process_memory_tests {
+    use super::*;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn snapshot(
+        total_physical_bytes: Option<u64>,
+        phys_footprint_bytes: Option<u64>,
+        address_space_limit: Option<ParsedMemoryLimit>,
+        virtual_size_bytes: Option<u64>,
+    ) -> DarwinMemoryProbeSnapshot {
+        DarwinMemoryProbeSnapshot {
+            total_physical_bytes,
+            phys_footprint_bytes,
+            address_space_limit,
+            virtual_size_bytes,
+        }
+    }
+
+    #[test]
+    fn darwin_headroom_is_memsize_minus_footprint() {
+        let observed = snapshot(
+            Some(36 * GIB),
+            Some(4 * GIB),
+            Some(ParsedMemoryLimit::Unlimited),
+            Some(400 * GIB),
+        );
+        assert_eq!(
+            process_memory_envelope_from_darwin_snapshot(&observed),
+            ProcessMemoryEnvelope::Bounded {
+                headroom_bytes: 32 * GIB
+            },
+            "an unlimited RLIMIT_AS must leave the physical envelope as the bound"
+        );
+    }
+
+    #[test]
+    fn darwin_footprint_at_or_above_memsize_saturates_to_zero_headroom() {
+        for footprint in [8 * GIB, 9 * GIB, u64::MAX] {
+            let observed = snapshot(
+                Some(8 * GIB),
+                Some(footprint),
+                Some(ParsedMemoryLimit::Unlimited),
+                Some(0),
+            );
+            assert_eq!(
+                process_memory_envelope_from_darwin_snapshot(&observed),
+                ProcessMemoryEnvelope::Bounded { headroom_bytes: 0 },
+                "a full machine reads as ZERO headroom (fail closed in the \
+                 bounded direction), never as unknown"
+            );
+        }
+    }
+
+    #[test]
+    fn darwin_extreme_values_stay_saturating_not_wrapping() {
+        let observed = snapshot(
+            Some(u64::MAX),
+            Some(0),
+            Some(ParsedMemoryLimit::Unlimited),
+            Some(0),
+        );
+        assert_eq!(
+            process_memory_envelope_from_darwin_snapshot(&observed),
+            ProcessMemoryEnvelope::Bounded {
+                headroom_bytes: u64::MAX
+            }
+        );
+        let zero_machine = snapshot(
+            Some(0),
+            Some(0),
+            Some(ParsedMemoryLimit::Unlimited),
+            Some(0),
+        );
+        assert_eq!(
+            process_memory_envelope_from_darwin_snapshot(&zero_machine),
+            ProcessMemoryEnvelope::Bounded { headroom_bytes: 0 }
+        );
+    }
+
+    #[test]
+    fn darwin_any_missing_observation_is_unavailable() {
+        let complete = snapshot(
+            Some(36 * GIB),
+            Some(GIB),
+            Some(ParsedMemoryLimit::Unlimited),
+            Some(400 * GIB),
+        );
+        assert_ne!(
+            process_memory_envelope_from_darwin_snapshot(&complete),
+            ProcessMemoryEnvelope::Unavailable,
+            "control: the complete snapshot must resolve"
+        );
+        let cases = [
+            snapshot(
+                None,
+                Some(GIB),
+                Some(ParsedMemoryLimit::Unlimited),
+                Some(GIB),
+            ),
+            snapshot(
+                Some(36 * GIB),
+                None,
+                Some(ParsedMemoryLimit::Unlimited),
+                Some(GIB),
+            ),
+            snapshot(Some(36 * GIB), Some(GIB), None, Some(GIB)),
+            // A finite RLIMIT_AS needs the usage subtraction; without it the
+            // aggregate is ambiguous even though the physical term resolved.
+            snapshot(
+                Some(36 * GIB),
+                Some(GIB),
+                Some(ParsedMemoryLimit::Finite(10 * GIB)),
+                None,
+            ),
+            DarwinMemoryProbeSnapshot::default(),
+        ];
+        for observed in cases {
+            assert_eq!(
+                process_memory_envelope_from_darwin_snapshot(&observed),
+                ProcessMemoryEnvelope::Unavailable,
+                "incomplete observation must fail closed: {observed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn darwin_finite_rlimit_narrows_the_physical_envelope_and_vice_versa() {
+        // RLIMIT term (10 - 4 = 6 GiB) below the physical term (32 GiB).
+        let rlimit_narrower = snapshot(
+            Some(36 * GIB),
+            Some(4 * GIB),
+            Some(ParsedMemoryLimit::Finite(10 * GIB)),
+            Some(4 * GIB),
+        );
+        assert_eq!(
+            process_memory_envelope_from_darwin_snapshot(&rlimit_narrower),
+            ProcessMemoryEnvelope::Bounded {
+                headroom_bytes: 6 * GIB
+            }
+        );
+        // Physical term (2 GiB) below the RLIMIT term (60 GiB).
+        let physical_narrower = snapshot(
+            Some(36 * GIB),
+            Some(34 * GIB),
+            Some(ParsedMemoryLimit::Finite(100 * GIB)),
+            Some(40 * GIB),
+        );
+        assert_eq!(
+            process_memory_envelope_from_darwin_snapshot(&physical_narrower),
+            ProcessMemoryEnvelope::Bounded {
+                headroom_bytes: 2 * GIB
+            },
+            "the narrowest live envelope must win, as on Linux"
+        );
+    }
+
+    /// Live integration proof (#darwin-memory-envelope): on a real macOS host
+    /// every syscall must resolve and the strict envelope must be `Bounded`
+    /// with headroom inside `(0, hw.memsize]` — the exact opposite of the
+    /// pre-existing law this section replaced (`Unavailable` by construction,
+    /// pinned by the old `process_memory_envelope_is_unavailable_without_a_
+    /// platform_probe` test, which now covers only probe-less platforms).
+    /// `Unavailable` remains lawful ONLY as a syscall-failure outcome, and a
+    /// syscall failure in this test process is itself a defect worth failing.
+    #[test]
+    fn darwin_live_envelope_is_bounded_within_physical_memory() {
+        let total = darwin_total_physical_memory_bytes()
+            .expect("hw.memsize must resolve on a live macOS host");
+        assert!(total > 0);
+        match process_memory_envelope() {
+            ProcessMemoryEnvelope::Bounded { headroom_bytes } => {
+                assert!(
+                    headroom_bytes > 0,
+                    "a test process cannot have consumed all {total} bytes of physical memory"
+                );
+                assert!(
+                    headroom_bytes <= total,
+                    "headroom {headroom_bytes} must never exceed physical memory {total}"
+                );
+            }
+            other => panic!(
+                "macOS must MEASURE its envelope instead of failing closed by \
+                 construction; got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn darwin_live_task_vm_info_reports_a_plausible_footprint() {
+        let info = darwin_task_vm_info().expect("task_info(TASK_VM_INFO) must resolve live");
+        assert!(
+            info.phys_footprint > 0,
+            "a running process has a nonzero jetsam-charged footprint"
+        );
+        assert!(
+            info.virtual_size >= info.phys_footprint,
+            "virtual size {} cannot be below the physical footprint {}",
+            info.virtual_size,
+            info.phys_footprint
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1053,7 +1953,7 @@ enum CgroupMemoryVersion {
     V2,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ParsedMemoryLimit {
     Finite(u64),
@@ -1066,9 +1966,13 @@ enum ParsedMemoryLimit {
 /// Resource admission already has an unavoidable time-of-check/time-of-use
 /// window. Keeping this at 100 ms preserves prompt response to a changed
 /// cgroup identity while reducing a measured 13,500 full discoveries per
-/// SafeNLP proof to at most roughly ten per second. Values are never cached:
-/// procfs plus every resolved `memory.max`/`memory.current` pair are read live
-/// through the open handles on every admission.
+/// SafeNLP proof to at most roughly ten per second. This snapshot never caches
+/// values: procfs plus every resolved `memory.max`/`memory.current` pair are
+/// read live through the open handles on every call that consults it. Note the
+/// separate VALUE cache in front of it (#poll-amortise,
+/// `MEMORY_TERMS_AMORTISE_TTL`): the dense-budget and headroom probes consult
+/// this snapshot at most once per that window; `process_memory_envelope` still
+/// consults it on every call.
 #[cfg(target_os = "linux")]
 const MEMORY_PROBE_CACHE_TTL: Duration = Duration::from_millis(100);
 
@@ -1353,9 +2257,11 @@ fn observed_host_memory_bytes_from_snapshot(snapshot: &LinuxMemoryProbeSnapshot)
 #[cfg(target_os = "linux")]
 fn process_memory_headroom_from_snapshot(snapshot: &LinuxMemoryProbeSnapshot) -> Option<u64> {
     let cgroup = cgroup_memory_headroom_from_open(&snapshot.cgroup_counters);
-    // Read both inputs live on every admission. In particular, an unlimited
-    // RLIMIT_AS that is lowered mid-proof must become authoritative
-    // immediately; the snapshot caches only the open descriptors.
+    // Read both inputs live on every observation. In particular, an unlimited
+    // RLIMIT_AS that is lowered mid-proof must become authoritative at the next
+    // observation; the snapshot caches only the open descriptors. (The
+    // #poll-amortise value cache in front of this function bounds that delay
+    // by `MEMORY_TERMS_AMORTISE_TTL`.)
     let address_limit = snapshot.limits.as_ref().and_then(|file| {
         file.parse::<PROC_MEMORY_FILE_BYTES, _>(parse_address_space_soft_limit_bytes)
     });
@@ -1576,7 +2482,7 @@ fn process_memory_envelope_from_snapshot(
     ])
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn combine_process_memory_envelopes(envelopes: &[ProcessMemoryEnvelope]) -> ProcessMemoryEnvelope {
     if envelopes.is_empty() || envelopes.contains(&ProcessMemoryEnvelope::Unavailable) {
         return ProcessMemoryEnvelope::Unavailable;
@@ -2140,7 +3046,7 @@ pub(crate) fn identity_pair_bytes(dim: usize) -> Option<usize> {
     dense_pair_bytes(dim, dim)
 }
 
-/// Upfront estimate for a batched Dense coefficient-pair materialization (#3550).
+/// Upfront estimate for a batched Dense coefficient-pair materialization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BatchedDenseMaterializationEstimate {
     pub site: &'static str,

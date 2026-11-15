@@ -2,142 +2,41 @@
 # Copyright 2026 Andrew Yates
 # Author: Andrew Yates <andrewyates.name@gmail.com>
 # SPDX-License-Identifier: Apache-2.0
-"""Lever search harness: drive `ny benchmarks run` over arms, and REFUSE the fakes.
+"""Search typed lever arms through ``ny benchmarks run`` and validate results.
 
-WHAT IT DOES. Generates arms over the axes of `crates/ny-levers/src/space.rs`,
-runs each as `ny benchmarks run --year Y --category C --lever NAME=VALUE ...`,
-then validates the artifacts the run already wrote and records one JSONL row per
-(arm, category). An arm that fails validation is reported INVALID and EXCLUDED —
-never averaged in, never counted as a negative result.
+Each (arm, category) produces a JSONL record. Invalid runs are excluded from
+comparisons. Measured runs and dry runs require the selected binary's compiled
+``benchmarks space --json`` schema and ``--lever NAME=VALUE`` delivery. Source
+parsing is limited to self-tests and ``--list-space --dev-source-schema``.
 
-WHY VALIDATION IS THE POINT, NOT THE PLUMBING. Every failure mode below has
-already produced a confident-but-empty conclusion in this repository, and each
-one looks exactly like a legitimate measurement from the outside:
+Validation contract:
+  T0: exclude values that do not parse, match their effective baseline, have
+      unmet dependencies, or do not apply to the category. Contextual baselines
+      require an axis-specific engagement contract before search.
+  T1: check resolved receipts, requested arm, clean ambient environment, retained
+      SAT witnesses, executable and model/property hashes, execution evidence
+      and agreement between summary and row metadata. Reject errors and wholly
+      cache-served runs. Every graduated treatment axis must prove engagement
+      on each scored row; other axes establish delivery only. The authoritative
+      graduated-family list is ``_AXIS_SPECIFIC_T1_CONTRACTS``.
 
-  * A REJECTED LEVER VALUE resolves to the declaration default. `resolve_raw`
-    arms a Bool on the exact byte string "1" and disarms on exact "0"; "true",
-    "01", " 1" and "" are REJECTIONS recorded in `rejected_raw`. A harness that
-    emits one of those spends a full instance budget measuring the BASELINE and
-    reports it as a treatment. Override-style selectors instead retain their
-    lower layer and record the near-miss in `ignored_raw`; that is equally not a
-    treatment. T1 therefore asserts both evidence fields are empty on every row
-    of every completed run.
-  * An INERT ARM is the same waste without the receipt: a child axis whose
-    prerequisite is unmet is read by nobody. The lattice is mirrored here so
-    such a sample is never GENERATED — the binary would refuse it, but a
-    refusal round-trip per sample is silly, and in grid mode most corners are
-    forbidden.
-  * A VALUE EQUAL TO THE COMPILED DEFAULT is a no-op run wearing a treatment
-    label. `NY_INTERM_ROW_CHUNKS=1` is the live example: `DefaultSpec::U64(1)`,
-    and `space.rs` says in as many words that 1 is byte-identical to the
-    historical single sweep. T0 (below) drops those before they cost 100 s.
-  * An AMBIENT LEVER exported into the calling shell is inherited by every
-    child and is invisible in the result. This harness scrubs `NY_*`,
-    `RAYON_NUM_THREADS`, and deprecated `RAYON_RS_NUM_CPUS` from the child
-    environment and then CHECKS the sealed `ambient_env` in the manifest,
-    because trusting its own scrub would be the same class of mistake.
-  * A SAT ROW WITHOUT A RETAINED WITNESS cannot be revalidated by anyone. A
-    run with any such row is invalid here, full stop.
-  * A ROW SERVED FROM THE VERDICT CACHE is a replay, not a measurement, and it
-    is the newest member of this list. `--cache` embeds the EARLIER run's
-    flight record in the bank verbatim, so every receipt check below (T1.1,
-    T1.2, T1.4) passes against evidence produced by a different process: a
-    sweep in which zero children ran would otherwise be byte-indistinguishable
-    from one that ran in full. T1.10 reads the per-row `from_cache` marker,
-    fails a bank in which EVERY row was served, and warns on any partial
-    replay; T1.7 additionally refuses a summary claiming more `cache_hits`
-    than the bank marks.
+Random mode changes one sampled axis by default; required parent controls may
+be added. Multi-axis results belong to the joint treatment. Paired comparisons
+require matching category, repeat, binary, backend and host, and omit invalid,
+cache-served and unmatched runs. ``pair-cover`` requires an explicit axis list
+and refuses enumeration beyond its limits. No multi-fidelity scheduler is used.
 
-T0 (pre-flight, free) and T1 (post-run, from artifacts):
+``--instances FILE`` selects exact ``category,onnx,vnnlib`` CSV triples. The
+harness seals selector identity, measured rows and resolved input hashes, and
+forwards the native ``--instances`` selector rather than approximating a limit.
 
-  T0  every (axis, value) about to be emitted must PARSE under the axis's
-      declared `LeverKind` (scraped from `crates/ny-levers/src/decls/*.rs`) and
-      must DIFFER from its effective baseline: an explicit preset value, a
-      declared absent-key equivalent, or `DefaultSpec` only where the compiled
-      schema says that is the execution default. A contextual absence is a
-      runtime policy rather than an explicit token, so its explicit treatments
-      stay searchable only when a versioned post-run engagement contract exists
-      for that axis. Category-inapplicable axes are excluded. Axes
-      whose kind cannot be read are excluded unless
-      `--allow-unchecked-domains`; fail-closed, because the failure mode of
-      guessing is a whole sweep of fake treatments.
-  T1  per completed run: empty `rejected_raw` and `ignored_raw` on every row, a resolved lever
-      receipt, the row `arm` and the child's `ambient_env` equal to what was
-      requested, versioned execution evidence for the explicitly graduated
-      families: contextual upfront; margin-row frontier, policy, root precision,
-      root alpha/rebake, and backward-intermediate; sequential fast-gradient;
-      post-BaB reserve; root-joint intermediate-alpha; the canonical
-      multi-objective kFSB master and reducer; and exact-VJP PGD.
-      Because category outcomes are scored as one aggregate, every graduated
-      treatment axis must prove causal engagement independently on every scored
-      row; a live row cannot lend credit to an inactive sibling.
-      Every axis outside `_AXIS_SPECIFIC_T1_CONTRACTS` is delivery-only until it
-      graduates an axis-specific execution contract. Also required: a clean
-      parent ambient,
-      `sat_rows_without_witness == 0`, no `error` rows, at least one row
-      actually MEASURED rather than
-      served from the verdict cache, the exact selected executable and resolved
-      ONNX / VNN-LIB bytes, and the printed summary agreeing with the metadata
-      bank.
-
-WHY THERE IS NO ASHA / MULTI-FIDELITY SCHEDULER HERE. Deliberate. A
-multi-fidelity scheduler needs a cheap signal that RANKS arms the same way the
-expensive one does, and the obvious candidate on this codebase — the root
-objective census (`NY_ACASXU_PROF=1`) — is SUSPECT, not merely unproven: it has
-already moved 0/99 -> 92/99 while converting ZERO rows. An arm that improves the
-census by 92 objectives and solves nothing would be promoted by ASHA over an arm
-that solves a row, which is not early stopping, it is an automated wrong answer.
-The same applies to shrinking the budget as a fidelity: 5 cifar100 timeout rows
-re-run at {30 s, 50 s} converted 0/10, so budget is not a cheap proxy either. A
-scheduler attaches at `select_next_arms` below, and it must not be attached
-until some cheap signal has been CALIBRATED against measured row conversions.
-
-ATTRIBUTION BEFORE OPTIMIZATION. Random mode therefore moves ONE sampled axis
-per arm by default. Dependency repair may add the explicit parent controls
-needed to make that treatment reachable, but it does not add another sampled
-treatment. `--max-axes >1` is an explicit interaction screen: any conversion
-then belongs to the JOINT arm and cannot be credited to one parameter. The raw
-leaderboard remains a run-by-run audit. Its paired aggregate compares a
-treatment only with the fully measured baseline from the same category, repeat,
-binary, backend and host; invalid, cache-served and unmatched runs are omitted.
-For a deterministic bounded interaction design, `pair-cover` requires an
-explicit shortlist of at least two `--axis` names and emits their main effects
-and every two-axis value pair. It refuses rather than truncates at either the raw
-enumeration or executable-arm guard.
-
-EXACT ROW SUBSETS. `--instances FILE` is the native Rust selector contract:
-one CSV triple `category,onnx,vnnlib` per physical line. Comments and blanks are
-ignored; quoted commas are supported; duplicates and unmatched categories are
-refused. The harness projects a multi-category file into an immutable canonical
-file for each native category invocation, forwards `--instances` (never
-`--limit`), and seals the set-like selector intent, exact measured row multiset,
-and every resolved input-file hash into each result's pairing context.
-
-WHAT THE BINARY CURRENTLY OFFERS (probed at run time, never assumed):
-`benchmarks run --lever NAME=VALUE` IS wired and is the only way arms are
-delivered — if a binary lacks it this harness REFUSES to run rather than fall
-back to exporting the arm into the environment, which is the invisible-arm hole
-`ambient_env` sealing exists to close. `--cache` is passed automatically when
-the probed binary has it (older binaries simply measure every (arm, row) pair
-fresh); a served row is then marked `from_cache` in the bank and T1.10 is what
-stops that saving from becoming a fake measurement. New binaries publish the
-compiled axes, edges and declaration parser contracts through `benchmarks
-space --json`. Configured searches, dry runs and measured runs REQUIRE that
-contract: pairing a stale executable with the checkout's `space.rs` describes
-neither program. Source parsing is reserved for `--self-test` and the explicit
-developer-only `--list-space --dev-source-schema` fallback.
-
-Examples
+Examples:
   scripts/ny_search.py --list-space
-  scripts/ny_search.py --category cifar100 --mode cover --delivery preset --dry-run
-  scripts/ny_search.py --category cifar100 --mode random --samples 8 --dry-run
-  scripts/ny_search.py --category cifar100_2024 --mode pair-cover \
-      --axis NY_MARGIN_ROW_ALPHA_OPT --axis NY_MARGIN_ROW_BRANCH_REDUCE_MAX --dry-run
-  scripts/ny_search.py --category cifar100_2024 --mode random --samples 8 \
-      --configs-dir configs --out-dir reports/search/2026-08-16
+  scripts/ny_search.py --category cifar100_2024 --mode cover --dry-run
+  scripts/ny_search.py --category cifar100_2024 --mode random --samples 8 --dry-run
   scripts/ny_search.py --category cifar100_2024 --instances near_misses.csv \
       --mode cover --configs-dir configs --cache off
-  scripts/ny_search.py --self-test        # no GPU, no binary, no benchmarks
+  scripts/ny_search.py --self-test
 """
 
 import argparse
@@ -396,10 +295,41 @@ def _parse_domain(chunk):
     raise ValueError("unknown Domain::%s" % kind)
 
 
-def _parse_axes(body):
+def _declared_lever_name(decls_dir, module, constant):
+    """Resolve exactly one declaration in the source checkout."""
+    path = Path(decls_dir) / (module + ".rs")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise ValueError("cannot resolve axis declaration %s::%s: %s is unreadable: %s"
+                         % (module, constant, path, error)) from error
+    declarations = list(re.finditer(
+        r"\bpub\s+" + re.escape(constant) + r"\s*=\s*LeverDecl\s*\{", text,
+    ))
+    if len(declarations) != 1:
+        raise ValueError("cannot uniquely resolve axis declaration %s::%s: "
+                         "%s does not declare exactly one matching LeverDecl"
+                         % (module, constant, path))
+    name = re.match(r'\s*name:\s*"([^"]+)"', text[declarations[0].end():])
+    if not name:
+        raise ValueError("%s declares %s without a leading `name:` literal" % (path, constant))
+    return name.group(1)
+
+
+def _axis_name(chunk, decls_dir):
+    literal = re.search(r'name:\s*"([^"]+)"', chunk)
+    if literal:
+        return literal.group(1)
+    reference = re.search(r"name:\s*crate::decls::(\w+)::(\w+)\.name\b", chunk)
+    if reference:
+        return _declared_lever_name(decls_dir, *reference.groups())
+    raise ValueError("axis record has an unsupported name: %r" % chunk[:120])
+
+
+def _parse_axes(body, decls_dir=DECLS_DIR):
     axes = []
     for chunk in _parse_axis_records(body):
-        name = re.search(r'name:\s*"([^"]+)"', chunk).group(1)
+        name = _axis_name(chunk, decls_dir)
         kind, values = _parse_domain(chunk)
         cls = re.search(r"class:\s*Class::(\w+)", chunk).group(1)
         preset = re.search(r'deliver:\s*Deliver::PresetKey\("([^"]+)"\)', chunk)
@@ -563,9 +493,12 @@ def _parse_preset_baseline_keys(text):
 def parse_space_rs(path=SPACE_RS):
     """Parse the search space out of `space.rs` — the fallback source."""
     text = path.read_text(encoding="utf-8")
-    axes = _parse_axes(_rust_block(text, "const AXES: &[Axis] = &["))
+    decls_dir = Path(path).parent / "decls"
+    axes = _parse_axes(_rust_block(text, "const AXES: &[Axis] = &["), decls_dir)
     edges = _parse_edges(_rust_block(text, "const EDGES: &[Edge] = &["))
-    unsafe_axes = _parse_axes(_rust_block(text, "const UNSAFE_AXES: &[Axis] = &["))
+    unsafe_axes = _parse_axes(
+        _rust_block(text, "const UNSAFE_AXES: &[Axis] = &["), decls_dir
+    )
     instruments = _rust_str_list(_rust_block(text, "const INSTRUMENT_ONLY: &[&str] = &["))
     test_only = _rust_str_list(_rust_block(text, "const TEST_ONLY: &[&str] = &["))
     if not axes:
@@ -4673,9 +4606,17 @@ def _machine_event_fields(row, method, schema):
                 in {"forced_by_environment", "forced_by_preset"}
             )
             or (
+                # #ml4acopf-upfront-single: the typed preset force keeps a
+                # multi-clause disjunction on its automatic admission (and
+                # automatic cap); only the environment force re-admits it as
+                # `forced`.
                 fields["admission"] == "auto_disjunction"
                 and fields["route"]
-                in {"auto_disjunction", "preset_relational_conjunction"}
+                in {
+                    "auto_disjunction",
+                    "preset_relational_conjunction",
+                    "forced_by_preset",
+                }
             )
             or (
                 fields["admission"] == "preset_relational_conjunction"

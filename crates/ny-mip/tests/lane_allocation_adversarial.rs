@@ -330,7 +330,7 @@ fn adversarial_optimality_against_brute_force() {
         let (w, planned) = check(&spec, &format!("random#{i}"));
         walls.push(w);
         if worst.as_ref().is_none_or(|(b, _, _)| w > *b) {
-            worst = Some((w, i, spec.clone()));
+            worst = Some((w, i, spec));
         }
         if planned {
             solved += 1;
@@ -574,7 +574,7 @@ fn adversarial_degenerate_cases() {
         reserve: 0,
     };
     match allocate(&to_request(&empty)) {
-        AllocationOutcome::Allocated(p) => assert!(p.grants().is_empty()),
+        AllocationOutcome::Allocated(p) => assert_eq!(p.grants(), []),
         other => panic!("zero lanes must plan trivially: {other:?}"),
     }
 

@@ -2,11 +2,10 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! ECAPA-TDNN compositional verification helpers for #3499.
+//! ECAPA-TDNN compositional verification helpers.
 //!
 //! This module implements the structural MFA boundary discovery and single-input
-//! subgraph extraction described in
-//! `designs/2026-03-12-issue-3499-ecapa-composition-packet-a-execution.md`.
+//! subgraph extraction.
 //!
 //! The ECAPA architecture saves three SE-Res2Net block outputs (x2, x3, x4)
 //! and concatenates them at a multi-layer feature aggregation (MFA) node.
@@ -14,7 +13,7 @@
 //! into stage-local and suffix-local single-input subgraphs, and verifies
 //! that the suffix reproduces the full encoder output when fed exact MFA bounds.
 
-// Explicit owner imports from speaker_encoder support leaves (#3837 Packet C step 2)
+// Explicit owner imports from speaker_encoder support leaves.
 use super::cosine_head::{
     build_component_node_bounds, build_speaker_cosine_component_graphs, scalar_width,
     speaker_cosine_distance_upper,

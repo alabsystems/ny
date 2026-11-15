@@ -374,7 +374,7 @@ fn audit_pattern3_concat_then_linear() {
 }
 
 // ===========================================================================
-// Pattern 4: MaxBinary / MinBinary of two affine branches (#1934 generalized)
+// Pattern 4: MaxBinary / MinBinary of two affine branches
 // ===========================================================================
 
 #[test]

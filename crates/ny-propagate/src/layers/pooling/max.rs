@@ -12,6 +12,7 @@ use std::borrow::Cow;
 use crate::bounds::nan_propagating_max;
 use crate::contiguous_flat_slice;
 use crate::layers::common::BoundPropagation;
+use crate::layers::linear::bias::{add_f64_down, add_f64_up};
 use crate::LinearBounds;
 
 use super::checked_pool_output_size;
@@ -216,13 +217,13 @@ impl BoundPropagation for MaxPool2dLayer {
         }
 
         // NaN in output indicates NaN in input (data corruption, not overflow).
-        // Must check before new_repaired which would silently swallow NaN (#2812, #3423).
+        // Must check before new_repaired which would silently swallow NaN.
         if out_lower.iter().any(|v| v.is_nan()) || out_upper.iter().any(|v| v.is_nan()) {
             return Err(NyError::NumericalInstability(
                 "MaxPool2d IBP: NaN in bounds (from NaN input)".into(),
             ));
         }
-        // Repair non-finite outputs (Inf→fallback) for consistency with linear IBP (#3030).
+        // Repair non-finite outputs (Inf→fallback) for consistency with linear IBP.
         BoundedTensor::new_repaired(out_lower, out_upper, RepairStrategy::Conservative)
     }
 
@@ -347,6 +348,28 @@ impl MaxPool2dLayer {
         let mut upper_s = Array2::<f64>::zeros((num_outputs, input_size));
         let mut lower_cnt = Array2::<u32>::zeros((num_outputs, input_size));
         let mut upper_cnt = Array2::<u32>::zeros((num_outputs, input_size));
+        // BIAS (#maxpool-dense-bias-accum): the constant arms below fold one
+        // `la·max_upper` / `ua·max_upper` term per non-winner window into the
+        // SAME bias slot, seeded from the incoming `lower_b`/`upper_b`. Those
+        // products are exact in f64 (f32×f32 needs at most 48 significand bits),
+        // so the ONLY error is the addition chain — and a plain `+=` chain
+        // rounds to NEAREST, i.e. it can round the running sum INWARD on every
+        // step. The final `next_down_f32`/`next_up_f32` at publication is worth
+        // ~1 ulp OF THE RESULT (≈2^-23·|b|); the accumulation residual is
+        // ~n·2^-53·Σ|term|, which is LARGER whenever the terms cancel
+        // (Σ|term|/|b| > 2^30/n) — mixed-sign windows do exactly that. That is
+        // the `γ_n·Σ|terms|` vs `ulp(|Σ terms|)` conflation, and it made the
+        // published constant TIGHTER THAN TRUE = false proof.
+        //
+        // Fix: take a DIRECTED f64 step after every addition
+        // (`add_f64_down` on the lower bias, `add_f64_up` on the upper), so the
+        // accumulator ENCLOSES the exact real sum however many additions round
+        // the same way — and NaN fails closed to ∓inf instead of poisoning the
+        // published bias. This mirrors the already-certified sibling
+        // `ny-gpu` `wgpu_device/ops/maxpool_crown_sound.rs`
+        // (`accumulate_lower_bias_outward`/`accumulate_upper_bias_outward`),
+        // whose module doc claims its bias is a SUPERSET of THIS function's —
+        // a claim that only becomes true with this step in place.
         let mut new_lower_b_f64 = bounds.lower_b().mapv(|x| x as f64);
         let mut new_upper_b_f64 = bounds.upper_b().mapv(|x| x as f64);
 
@@ -422,7 +445,7 @@ impl MaxPool2dLayer {
                         }
 
                         // Find the maximum lower bound and upper bound across inputs
-                        // NaN-propagating folds: NaN in input bounds must propagate — see #2577.
+                        // NaN-propagating folds: NaN in input bounds must propagate.
                         let max_lower = window_inputs
                             .iter()
                             .map(|&(_, l, _, _)| l)
@@ -495,7 +518,7 @@ impl MaxPool2dLayer {
                                 let ua = bounds.upper_a()[[out_idx, y_flat]];
 
                                 // Lower bound row: la * y.
-                                // Guard: skip zero coefficients to avoid 0*inf NaN (#1739).
+                                // Guard: skip zero coefficients to avoid 0*inf NaN.
                                 if la > 0.0 {
                                     // SOUND tighter: route through x_{i*} (y >= x_{i*}).
                                     if let Some(istar) = istar_flat {
@@ -503,17 +526,26 @@ impl MaxPool2dLayer {
                                         lower_s[[out_idx, istar]] += (la as f64).abs();
                                         lower_cnt[[out_idx, istar]] += 1;
                                     } else {
-                                        new_lower_b_f64[out_idx] += la as f64 * max_lower as f64;
+                                        new_lower_b_f64[out_idx] = add_f64_down(
+                                            new_lower_b_f64[out_idx],
+                                            la as f64 * max_lower as f64,
+                                        );
                                     }
                                 } else if la < 0.0 {
                                     // UNCHANGED: x_{i*} is not an upper bound on y → constant.
-                                    new_lower_b_f64[out_idx] += la as f64 * max_upper as f64;
+                                    new_lower_b_f64[out_idx] = add_f64_down(
+                                        new_lower_b_f64[out_idx],
+                                        la as f64 * max_upper as f64,
+                                    );
                                 }
 
                                 // Upper bound row: ua * y.
                                 if ua > 0.0 {
                                     // UNCHANGED: x_{i*} is not an upper bound on y → constant.
-                                    new_upper_b_f64[out_idx] += ua as f64 * max_upper as f64;
+                                    new_upper_b_f64[out_idx] = add_f64_up(
+                                        new_upper_b_f64[out_idx],
+                                        ua as f64 * max_upper as f64,
+                                    );
                                 } else if ua < 0.0 {
                                     // SOUND tighter: route through x_{i*} (y >= x_{i*}).
                                     if let Some(istar) = istar_flat {
@@ -521,7 +553,10 @@ impl MaxPool2dLayer {
                                         upper_s[[out_idx, istar]] += (ua as f64).abs();
                                         upper_cnt[[out_idx, istar]] += 1;
                                     } else {
-                                        new_upper_b_f64[out_idx] += ua as f64 * max_lower as f64;
+                                        new_upper_b_f64[out_idx] = add_f64_up(
+                                            new_upper_b_f64[out_idx],
+                                            ua as f64 * max_lower as f64,
+                                        );
                                     }
                                 }
                             }
@@ -569,5 +604,99 @@ impl MaxPool2dLayer {
             new_lower_a_err,
             new_upper_a_err,
         )
+    }
+}
+
+// --- Dense CROWN-backward BIAS accumulation certificate (#maxpool-dense-bias-accum) ---
+#[cfg(test)]
+mod dense_bias_accumulation_tests {
+    use super::*;
+    use ndarray::Array1;
+
+    /// COUNTEREXAMPLE for the uncertified bias `+=` chain.
+    ///
+    /// Three no-winner windows whose constant-arm terms are exactly
+    /// `+2^40`, `-2^-14`, `-2^40` (each product is exact in binary64: f32×f32
+    /// needs at most 48 significand bits). The exact real bias is therefore
+    /// `-2^-14 = -6.1e-5`. A round-to-nearest f64 `+=` chain SWALLOWS the middle
+    /// term — `2^40 - 2^-14` sits 0.25 ulp below `2^40`, so it rounds back to
+    /// `2^40` — and the chain lands on EXACTLY `0.0`. The published
+    /// `next_down_f32(0.0)` is then `-1.4e-45`, i.e. **6.1e-5 ABOVE** the
+    /// constant it is required to under-approximate: a lower bound tighter than
+    /// the truth, which is a false-`unsat` generator.
+    ///
+    /// This is a WIRING test, not a summation-kernel test: the addends are
+    /// produced by this layer's own `la<0 → la·max_upper` and
+    /// `ua>0 → ua·max_upper` constant arms, reached through the public
+    /// `propagate_linear_with_bounds` entry point with no `max`-specific
+    /// scaffolding. It FAILS on the pre-fix tree (bias `0.0`) and passes with
+    /// the directed f64 step.
+    #[test]
+    fn maxpool_dense_bias_chain_encloses_exact_constant_under_cancellation() {
+        const P20: f32 = 1_048_576.0; // 2^20, exact
+        const PM14: f32 = 6.103_515_6e-5; // 2^-14, exact
+
+        // (1,1,6) → (1,1,3) with kernel == stride == (1,2) and no padding.
+        // Every window holds two identical intervals, so no input can dominate
+        // (l_i >= u_j is false) and all three windows take the CONSTANT arm.
+        // Per-window `max_upper`: -2^20, +1, +2^20.
+        let layer = MaxPool2dLayer::new((1, 2), (1, 2), (0, 0));
+        let pre = BoundedTensor::new(
+            ArrayD::from_shape_vec(
+                IxDyn(&[1, 1, 6]),
+                vec![-3.0 * P20, -3.0 * P20, -1.0, -1.0, -P20, -P20],
+            )
+            .unwrap(),
+            ArrayD::from_shape_vec(IxDyn(&[1, 1, 6]), vec![-P20, -P20, 1.0, 1.0, P20, P20])
+                .unwrap(),
+        )
+        .unwrap();
+
+        // lower row: all la < 0 → term = la·max_upper = +2^40, -2^-14, -2^40.
+        // upper row: all ua > 0 → term = ua·max_upper = -2^40, +2^-14, +2^40.
+        let incoming = LinearBounds::new(
+            Array2::from_shape_vec((1, 3), vec![-P20, -PM14, -P20]).unwrap(),
+            Array1::zeros(1),
+            Array2::from_shape_vec((1, 3), vec![P20, PM14, P20]).unwrap(),
+            Array1::zeros(1),
+        )
+        .unwrap();
+
+        let out = layer
+            .propagate_linear_with_bounds(&incoming, &pre)
+            .expect("MaxPool2d CROWN backward must succeed on this fixture");
+
+        // Exact real constants: 2^40 - 2^-14 - 2^40 = -2^-14 (and its mirror).
+        let true_lower = -f64::from(PM14);
+        let true_upper = f64::from(PM14);
+
+        assert!(
+            f64::from(out.lower_b()[0]) <= true_lower,
+            "MaxPool dense lower bias {} is ABOVE the exact constant {true_lower}: \
+             the f64 `+=` accumulation residual is uncertified",
+            out.lower_b()[0]
+        );
+        assert!(
+            f64::from(out.upper_b()[0]) >= true_upper,
+            "MaxPool dense upper bias {} is BELOW the exact constant {true_upper}: \
+             the f64 `+=` accumulation residual is uncertified",
+            out.upper_b()[0]
+        );
+
+        // Liveness of the fixture: a nearest-rounding chain really does land on
+        // 0.0 here, so the assertions above are not vacuously satisfied by a
+        // fixture that never exercises cancellation.
+        let mut nearest = 0.0_f64;
+        for term in [
+            f64::from(-P20) * f64::from(-P20),
+            f64::from(-PM14),
+            f64::from(-P20) * f64::from(P20),
+        ] {
+            nearest += term;
+        }
+        assert_eq!(
+            nearest, 0.0,
+            "fixture no longer exercises the swallowed-term cancellation"
+        );
     }
 }

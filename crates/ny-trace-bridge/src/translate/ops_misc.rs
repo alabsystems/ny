@@ -24,14 +24,21 @@
 //!   stays deleted; the native layer refuses the undefined domains
 //!   (non-integer p on x < 0, negative p across zero) fail-closed at
 //!   propagation time instead.
-//! - `Fract` → `Sub(x, Trunc(x))`, the exact truncation-toward-zero identity
-//!   for every sign (the former `x − floor(x)` lowering was wrong for
-//!   negative inputs; a refusal replaced it until `TruncLayer` landed).
-//!   Exact whenever the interval stays within one unit period, loose across
-//!   period boundaries (the Sub decorrelates `x` from `trunc(x)`).
+//! - `Fract` → `Sub(x, Floor(x))`, NN's FLOOR convention: `fract(x) =
+//!   x − floor(x)`, range `[0, 1)`. Ground truth is NN's own CPU reference
+//!   (the `nn` repo's `crates/nn-core/src/dyn_tensor/ops/math.rs`:
+//!   `UnaryOp::Fract => f32_arr.mapv(|x| x - x.floor())`), matched by its IR
+//!   contract (`crates/nn-dsl/src/ir_enums.rs`, `UnaryFnKind::Fract`) and its
+//!   Metal codegen (`crates/nn-dsl/src/codegen_msl_helpers.rs` →
+//!   `metal::fract`). Exact whenever the interval stays within one unit
+//!   period, loose across period boundaries (the Sub decorrelates `x` from
+//!   `floor(x)`). **RETRACTION — do not reinstate `Sub(x, Trunc(x))`:** this
+//!   bullet used to advertise the trunc identity as "exact … for every sign".
+//!   That was false about NN's `Fract`; see [`translate_fract`] for the
+//!   disjoint-interval worked example and the tests that pin it.
 //! - `Atan2` → `LayerType::Atan2` binary spec.
 //! - `Cumsum` → a single native `LayerType::CumSum` spec (ny-propagate's
-//!   `CumsumLayer`, #3919: exact IBP via monotonicity, O(T) CROWN backward) —
+//!   `CumsumLayer`: exact IBP via monotonicity, O(T) CROWN backward) —
 //!   no size cap; the former N × Slice + (N−1) × Add + Concat decomposition
 //!   was capped at `MAX_DECOMPOSE_DIM` and refused Kokoro's T=24000 harmonic
 //!   source.
@@ -70,7 +77,10 @@
 //!   attacked the `m*x + (1-m)*y` mask-arithmetic decompose ny does not use —
 //!   no longer applies. IBP-only (a data-dependent select has no useful CROWN
 //!   linear relaxation; `WhereLayer::propagate_linear` fails closed).
-//!   Both-branch-constant nodes use the builder's embedded-constant path;
+//!   Both-branch-constant nodes use the builder's embedded-constant path,
+//!   whose exact select reads the condition as ONNX BOOL (`{0, 1}`); a
+//!   non-constant nn mask is first lowered to that meaning, `mask != 0`,
+//!   by an explicit `Compare(Ne, 0)`;
 //!   any other UNIFORM constant input (nn's `masked_fill` fill) gets an
 //!   exact `Clip[v, v]` activation carrier; a non-uniform single constant is
 //!   refused (see [`translate_where_cond`]).
@@ -208,7 +218,7 @@ const MAX_DECOMPOSE_DIM: usize = 2048;
 /// f64 → f32 exponent narrowing in [`translate_powf`] cannot flip an
 /// exponent's integrality or parity — the properties `PowConstantLayer`'s
 /// sign-aware IBP branches key on. (The layer's own parity-check saturation
-/// guard, #2911, sits far above at i32::MAX.)
+/// guard sits far above at i32::MAX.)
 pub(crate) const MAX_POW_EXPONENT_ABS: f64 = 16_777_216.0; // 2^24
 
 /// Match the loader's constant-folding resource limit for materialized ranges.
@@ -472,7 +482,7 @@ pub(super) fn translate_misc(
 /// Translate `TraceOp::SwiGlu` by decomposing into `SiLU(gate) * up`.
 ///
 /// SwiGlu requires exactly 2 inputs: gate (`input[0]`) and up (`input[1]`).
-/// Mirrors NN's `translate_swiglu` (#3557).
+/// Mirrors NN's `translate_swiglu`.
 fn translate_swiglu(
     name: &str,
     input_tensors: &[String],
@@ -514,8 +524,7 @@ fn translate_swiglu(
 
 /// Translate `TraceOp::Powf` to a sound power lowering.
 ///
-/// Special cases map to exact primitives (mirrors NN's `translate_powf`,
-/// #3557):
+/// Special cases map to exact primitives (mirrors NN's `translate_powf`):
 ///   - 0 → Clip\[1,1\] (constant 1.0)
 ///   - 0.5 → Sqrt
 ///   - 1.0 → identity (`Add + 0`)
@@ -660,19 +669,41 @@ fn translate_powf(
     )))
 }
 
-/// Translate `TraceOp::Atan2` — binary `LayerType::Atan2` spec.
+/// Translate `TraceOp::Fract` → `Sub(x, Floor(x))`.
 ///
-/// Mirrors NN's `translate_binary` arm `TraceOp::Atan2 => LayerType::Atan2`
-/// (Kokoro STFT polar-to-rect, NN #2218 F9). Kept local because the bridge's
-/// `ops_core::translate_binary` covers only the core Add/Mul/Div/Max/Min set.
-/// Fract → `Sub(x, Trunc(x))` — the exact truncation-toward-zero identity.
+/// `TraceOp::Fract` is NN's op and NN defines it FLOOR-based:
+/// `fract(x) = x − floor(x)`, range `[0, 1)`. Ground truth is NN's CPU
+/// reference — the `nn` repo's `crates/nn-core/src/dyn_tensor/ops/math.rs`,
+/// `UnaryOp::Fract => f32_arr.mapv(|x| x - x.floor())`. The same convention is
+/// pinned independently by NN's IR contract
+/// (`crates/nn-dsl/src/ir_enums.rs`, `UnaryFnKind::Fract`, whose doc spells
+/// out *"differs from Rust `f32::fract()` which uses trunc … `fract(-1.7)` =
+/// 0.3 (floor-based), not -0.7"*) and by its Metal codegen
+/// (`crates/nn-dsl/src/codegen_msl_helpers.rs` → `metal::fract`).
 ///
-/// `fract(x) = x - trunc(x)` for every sign (`floor` differs on negatives:
-/// `floor(-1.5) = -2` but `trunc(-1.5) = -1`). `TruncLayer`'s IBP is exact
-/// (monotone step function), so the composition is a sound enclosure — EXACT
-/// whenever `trunc(lower) == trunc(upper)` (the interval stays within one
-/// unit period; the kokoro sinegen frame-rate phases live there) and loose
-/// across period boundaries, where the Sub decorrelates `x` from `trunc(x)`.
+/// `FloorLayer`'s IBP applies `f32::floor` to each endpoint independently
+/// (ny-propagate `layers/misc/piecewise_constant.rs`, the simple
+/// `piecewise_constant_layer!` form), which is exact for a monotone
+/// non-decreasing map. So the composition is a sound enclosure — EXACT
+/// whenever `floor(lower) == floor(upper)` (the interval stays within one unit
+/// period) and loose across period boundaries, where the `Sub` decorrelates
+/// `x` from `floor(x)`.
+///
+/// # RETRACTION — do not reinstate `Sub(x, Trunc(x))`
+///
+/// This is history, not advice. This arm once emitted `Sub(x, Trunc(x))` and
+/// this doc once called it "the exact truncation-toward-zero identity for
+/// every sign". That claim was FALSE about NN's `Fract`: the trunc form
+/// agrees with NN only for `x >= 0` and differs by exactly 1 at every negative
+/// non-integer. On `x ∈ [-1.5, -1.2]` NN's reachable set is `[0.5, 0.8]` while
+/// the trunc lowering emitted `[-0.5, -0.2]` — DISJOINT from it, so the
+/// emitted interval EXCLUDED the traced value. That is a false proof, not a
+/// loose bound, and it is the one failure direction this project does not
+/// trade for tightness.
+///
+/// The retraction is enforced by tests rather than by this comment:
+/// `fract_lowers_to_floor_sub_and_encloses_nns_value_on_negatives` and
+/// `fract_negative_1_7_is_0_3_not_minus_0_7_floor_convention`.
 fn translate_fract(
     name: &str,
     input_tensors: &[String],
@@ -680,16 +711,20 @@ fn translate_fract(
 ) -> Result<NodeOutput> {
     let data_input = first_input(input_tensors, "Fract")?;
     // FLOOR, not trunc. `TraceOp::Fract` is NN's op and NN defines it
-    // `x - floor(x)` with range `[0, 1)` (`nn-core/src/dyn_tensor/ops/math.rs`:
+    // `x - floor(x)` with range `[0, 1)` — the `nn` repo's
+    // `crates/nn-core/src/dyn_tensor/ops/math.rs`:
     // `UnaryOp::Fract => f32_arr.mapv(|x| x - x.floor())`, and the same
-    // convention in NN's Metal kernel and its IR docs, which call out the
-    // difference from Rust's trunc-based `f32::fract()` explicitly).
+    // convention in NN's Metal kernel (`crates/nn-dsl/src/codegen_msl_helpers.rs`
+    // -> `metal::fract`) and its IR docs (`crates/nn-dsl/src/ir_enums.rs`,
+    // `UnaryFnKind::Fract`), which call out the difference from Rust's
+    // trunc-based `f32::fract()` explicitly.
     //
-    // This arm used to emit `Sub(x, Trunc(x))`. The two agree for x >= 0 and
-    // differ by exactly 1 for every negative non-integer: at x = -1.7 NN
-    // computes 0.3 while the trunc identity gives -0.7. The emitted interval
-    // therefore EXCLUDED the traced value on any input box reaching below
-    // zero — a false proof, not a loose bound.
+    // RETRACTION (history, not a suggestion): this arm used to emit
+    // `Sub(x, Trunc(x))`. The two agree for x >= 0 and differ by exactly 1 for
+    // every negative non-integer: at x = -1.7 NN computes 0.3 while the trunc
+    // identity gives -0.7. The emitted interval therefore EXCLUDED the traced
+    // value on any input box reaching below zero — a false proof, not a loose
+    // bound. Do not reinstate it; see the tests named in the doc above.
     let floor_name = format!("{name}_floor");
     let floor_out = format!("{floor_name}_out");
     let floor_spec = simple_spec(
@@ -711,6 +746,14 @@ fn translate_fract(
     })
 }
 
+/// Translate `TraceOp::Atan2` — binary `LayerType::Atan2` spec.
+///
+/// Mirrors NN's `translate_binary` arm `TraceOp::Atan2 => LayerType::Atan2`
+/// (Kokoro STFT polar-to-rect). Kept local because the bridge's
+/// `ops_core::translate_binary` covers only the core Add/Mul/Div/Max/Min set.
+///
+/// (This paragraph previously sat on [`translate_fract`], where the two docs
+/// had been spliced together; it documents this function.)
 fn translate_atan2(
     name: &str,
     input_tensors: &[String],
@@ -914,7 +957,7 @@ fn translate_roll(
 
 /// Cumsum → a single native `LayerType::CumSum` spec.
 ///
-/// ny-propagate's `CumsumLayer` (#3919) was built for exactly this op: IBP is
+/// ny-propagate's `CumsumLayer` was built for exactly this op: IBP is
 /// exact because cumsum is monotone in every input (partial sums are
 /// directed-rounded outward), and CROWN backward is an O(T) suffix sum. No
 /// size cap is needed — the former N × Slice + (N−1) × Add + Concat
@@ -1208,7 +1251,6 @@ fn translate_repeat_interleave(
 /// For input shape `[d0, ..., d_dim, ..., dN]` with `unfold(dim, size, step)`,
 /// produces `[d0, ..., n_windows, ..., dN, size]` where
 /// `n_windows = (d_dim - size) / step + 1`. Mirrors NN's `translate_unfold`
-/// (#3094).
 #[allow(clippy::too_many_arguments)]
 fn translate_unfold(
     name: &str,
@@ -1371,7 +1413,7 @@ fn translate_unfold(
 /// `SliceSet { dim, start }` writes `src` (`input[1]`) into `self`
 /// (`input[0]`) at `[start..start+src_len]` along `dim`; the output has the
 /// shape of `self`. Decomposes into before-slice / src / after-slice
-/// concatenated along `dim`. Mirrors NN's `translate_slice_set` (#3094).
+/// concatenated along `dim`. Mirrors NN's `translate_slice_set`.
 #[allow(clippy::too_many_arguments)]
 fn translate_slice_set(
     name: &str,
@@ -1480,7 +1522,7 @@ fn translate_slice_set(
 /// Arange is data-independent: `[start, start+step, start+2*step, ...]` is
 /// fully determined at trace time. Emit as a constant weight so downstream
 /// ops treat it as a fixed tensor, not a variable input. Mirrors NN's
-/// `translate_arange` (#2271).
+/// `translate_arange`.
 fn translate_arange(
     name: &str,
     start: f64,
@@ -1559,7 +1601,7 @@ fn translate_arange(
 /// The graph-build backend's `convert_triangular` generates a binary mask from
 /// the input shape and diagonal offset, producing a `MulConstantLayer`. The
 /// LayerSpec just needs the `diagonal` attribute. Mirrors NN's
-/// `translate_triangular` (#2271).
+/// `translate_triangular`.
 fn translate_triangular(
     name: &str,
     diagonal: i64,
@@ -2418,9 +2460,16 @@ fn translate_compare_tensor(
 /// via `WhereLayer::with_constants`, condition as the sole activation).
 /// Anything else filters the constant out of activation wiring and fails the
 /// ternary arity check at build time. The bridge therefore:
-/// - emits the spec verbatim when both branches are translate-time constants
-///   (the builder's embedded path — also the tighter one: it selects exactly
-///   when the condition is determined);
+/// - routes a both-constant node to the builder's embedded path (the tighter
+///   one: it selects exactly when the condition is determined). That path
+///   reads its condition as ONNX BOOL, `{0, 1}`-valued, and decides a
+///   determined interval by the side of `0.5` it lies on; nn's mask is an
+///   arbitrary F32 selected on `mask != 0`, and the two readings disagree on
+///   every nonzero value below `0.5` (and every negative one). So a
+///   non-constant mask is lowered to its BOOL meaning first — an explicit
+///   `Compare(mask, 0, Ne)`, exact `{0, 1}` IBP — and the Where reads that
+///   (#eng7d where-mask-semantics). A constant mask keeps the verbatim spec;
+///   it never reaches the embedded path's activation wiring;
 /// - gives any OTHER constant input (a single constant branch — nn's
 ///   `masked_fill` sugar traces `full_like` fills this way — or a constant
 ///   condition) an activation CARRIER when its captured tensor is UNIFORM
@@ -2438,7 +2487,7 @@ fn translate_where_cond(
     name: &str,
     input_tensors: &[String],
     output_tensor: &str,
-    ctx: &Ctx,
+    ctx: &mut Ctx,
 ) -> Result<NodeOutput> {
     if input_tensors.len() < 3 {
         return Err(NyError::UnsupportedOp(format!(
@@ -2446,20 +2495,54 @@ fn translate_where_cond(
             input_tensors.len()
         )));
     }
-    let is_const = |t: &str| ctx.constant_tensors.contains(t);
+    let condition = &input_tensors[0];
     let on_true = &input_tensors[1];
     let on_false = &input_tensors[2];
 
-    // Both branches constant: the builder embeds them into the layer.
-    if is_const(on_true) && is_const(on_false) {
-        return Ok(NodeOutput::one(simple_spec(
-            name,
-            LayerType::Where,
-            input_tensors[..3].to_vec(),
-            output_tensor,
-            HashMap::new(),
-        )));
+    // Both branches constant: the builder embeds them into the layer, whose
+    // exact select reads the condition as BOOL. Lower nn's `mask != 0` to
+    // that meaning first (see the doc above); a constant mask stays verbatim.
+    if ctx.constant_tensors.contains(on_true.as_str())
+        && ctx.constant_tensors.contains(on_false.as_str())
+    {
+        if ctx.constant_tensors.contains(condition.as_str()) {
+            return Ok(NodeOutput::one(simple_spec(
+                name,
+                LayerType::Where,
+                input_tensors[..3].to_vec(),
+                output_tensor,
+                HashMap::new(),
+            )));
+        }
+        let nonzero_name = format!("{name}_mask_nonzero");
+        let nonzero_out = format!("{nonzero_name}_out");
+        let zero_name = format!("{nonzero_name}_zero");
+        insert_scalar_constant(ctx, &zero_name, 0.0)?;
+        let mut nonzero_attrs = HashMap::new();
+        nonzero_attrs.insert(
+            "compare_op".to_string(),
+            AttributeValue::String(compare_op_attr(CompareOp::Ne).to_string()),
+        );
+        return Ok(NodeOutput {
+            specs: vec![
+                simple_spec(
+                    &nonzero_name,
+                    LayerType::Compare,
+                    vec![condition.clone(), zero_name],
+                    &nonzero_out,
+                    nonzero_attrs,
+                ),
+                simple_spec(
+                    name,
+                    LayerType::Where,
+                    vec![nonzero_out, on_true.clone(), on_false.clone()],
+                    output_tensor,
+                    HashMap::new(),
+                ),
+            ],
+        });
     }
+    let is_const = |t: &str| ctx.constant_tensors.contains(t);
 
     // At least one branch is variable here; it anchors every carrier's shape.
     let source = if is_const(on_true) {
@@ -2869,7 +2952,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("{what}: GraphModel must build a graph network: {e:?}"));
     }
 
-    /// SwiGlu decomposes into SiLU(gate) + Mul(silu_out, up) — NN #3557.
+    /// SwiGlu decomposes into SiLU(gate) + Mul(silu_out, up), mirroring NN.
     #[test]
     fn swiglu_decomposes_to_silu_mul() {
         // gate = relu(x), up = x — both derive from the single input.
@@ -3123,6 +3206,85 @@ mod tests {
         assert!(
             lo > 0.0,
             "a trunc-based lowering yields a negative interval here; got [{lo}, {hi}]"
+        );
+    }
+
+    /// `fract(-1.7) == 0.3`, NOT `-0.7` — the named pin on NN's FLOOR
+    /// convention and the enforcement of the retraction documented at
+    /// `translate_fract`.
+    ///
+    /// Deliberately separate from the interval test above and named for its
+    /// own numeric claim: if someone follows the (now-retracted) "exact
+    /// truncation-toward-zero identity" advice and re-emits
+    /// `Sub(x, Trunc(x))`, the failing test's NAME says which convention
+    /// broke. `-1.7` is the exact witness NN's own IR contract uses
+    /// (`crates/nn-dsl/src/ir_enums.rs`, `UnaryFnKind::Fract`).
+    #[test]
+    fn fract_negative_1_7_is_0_3_not_minus_0_7_floor_convention() {
+        // Both conventions computed the way the kernels compute them, never
+        // from decimal literals: f32(-1.7) is -1.70000004768…, so NN's value
+        // is 0.29999995… and the retracted one is -0.70000005….
+        let x = -1.7f32;
+        let nn_value = x - x.floor();
+        let retracted_trunc_value = x - x.trunc();
+        assert!(
+            (nn_value - 0.3).abs() < 1e-6,
+            "fixture: NN's fract(-1.7) must be 0.3, got {nn_value}"
+        );
+        assert!(
+            (retracted_trunc_value + 0.7).abs() < 1e-6,
+            "fixture: the retracted trunc identity gives -0.7, got \
+             {retracted_trunc_value}"
+        );
+
+        let graph = ComputationGraph::from_nodes(vec![
+            node(0, "x", TraceOp::Input, &[], &[1]),
+            node(1, "f", TraceOp::Fract, &[0], &[1]),
+        ]);
+        let model = translate(&graph).expect("Fract lowers via Sub(x, Floor(x))");
+        assert_eq!(
+            count(&model, &LayerType::Trunc),
+            0,
+            "the trunc convention is RETRACTED: it excludes NN's value on \
+             every negative non-integer"
+        );
+        assert_eq!(
+            count(&model, &LayerType::Floor),
+            1,
+            "Fract must lower through Floor"
+        );
+        let network = model
+            .build_graph_network(ny_build::GraphNetworkOptions::default())
+            .expect("Fract composition builds");
+
+        // Degenerate box at exactly -1.7: floor is constant across it, so the
+        // emitted interval must pin NN's single value rather than merely
+        // contain it loosely.
+        let bounds = ny_tensor::BoundedTensor::new(
+            ndarray::arr1(&[x]).into_dyn(),
+            ndarray::arr1(&[x]).into_dyn(),
+        )
+        .expect("degenerate bounds");
+        let out = network.propagate_ibp(&bounds).expect("Fract IBP");
+        let lo = out.lower()[[0]];
+        let hi = out.upper()[[0]];
+        assert!(
+            lo <= nn_value && hi >= nn_value,
+            "emitted [{lo}, {hi}] must ENCLOSE NN's fract(-1.7) = {nn_value}"
+        );
+        // Also pins that the node really built (an `OpaqueSkip` substitution
+        // would emit [-inf, +inf], which encloses but proves nothing) and that
+        // the trunc value is NOT in the emitted set.
+        assert!(
+            lo >= nn_value - 1e-6 && hi <= nn_value + 1e-6,
+            "emitted [{lo}, {hi}] must be tight around {nn_value}; a vacuous \
+             or degraded box would pass the enclosure check alone"
+        );
+        assert!(
+            lo > 0.0 && hi < 1.0,
+            "NN's fract has range [0, 1); a trunc lowering would emit \
+             ~[{retracted_trunc_value}, {retracted_trunc_value}] here. \
+             Got [{lo}, {hi}]"
         );
     }
 
@@ -3585,7 +3747,7 @@ mod tests {
         );
     }
 
-    /// Arange is emitted as a constant weight (no layer), like NN #2271.
+    /// Arange is emitted as a constant weight (no layer), like NN.
     #[test]
     fn arange_becomes_constant_weight() {
         let graph = ComputationGraph::from_nodes(vec![
@@ -3946,7 +4108,7 @@ mod tests {
         }
     }
     /// Compare lowers to a 2-input Compare layer: data + scalar-threshold
-    /// constant, with the `compare_op` attribute (NN #2271 parity).
+    /// constant, with the `compare_op` attribute (parity with NN).
     #[test]
     fn compare_scalar_lowers_to_compare_layer() {
         let graph = ComputationGraph::from_nodes(vec![
@@ -3980,7 +4142,7 @@ mod tests {
     }
 
     /// CompareTensor lowers to a 2-activation-input CompareTensor layer with
-    /// the `compare_op` attribute (NN #2271 parity).
+    /// the `compare_op` attribute (parity with NN).
     #[test]
     fn compare_tensor_lowers_to_compare_tensor_layer() {
         let graph = ComputationGraph::from_nodes(vec![
@@ -4190,6 +4352,94 @@ mod tests {
                 "must stay in the hull: [{lo}, {hi}]"
             );
         }
+    }
+
+    /// #eng7d where-mask-semantics: nn's `where_cond` selects on `mask != 0`
+    /// (nn-core `selection/where_cond.rs`: `if m != 0 { on_true } else
+    /// { on_false }`, F32 masks admitted), and nothing makes a traced mask
+    /// `{0, 1}`-valued. The embedded-constant `WhereLayer` decides a
+    /// determined select with the ONNX rule `cond >= 0.5`, which agrees with
+    /// `!= 0` only on `{0, 1}`. A mask in `[0.1, 0.3]` or `[-3, -1]` is
+    /// nonzero everywhere, so nn outputs the TRUE constant `9`; every CROWN
+    /// bound the graph publishes must enclose it. Controls: an exactly-zero
+    /// mask selects `-9`, and the IBP union encloses both.
+    #[test]
+    fn where_cond_both_constant_selects_on_a_nonzero_float_mask_like_nn() {
+        let graph = ComputationGraph::from_nodes(vec![
+            node(0, "x", TraceOp::Input, &[], &[2]),
+            node(
+                1,
+                "t",
+                TraceOp::ConstantWeight {
+                    weight: WeightPayload::f32(vec![9.0, 9.0], vec![2]),
+                },
+                &[],
+                &[2],
+            ),
+            node(
+                2,
+                "f",
+                TraceOp::ConstantWeight {
+                    weight: WeightPayload::f32(vec![-9.0, -9.0], vec![2]),
+                },
+                &[],
+                &[2],
+            ),
+            node(3, "w", TraceOp::WhereCond, &[0, 1, 2], &[2]),
+        ]);
+        let model = translate(&graph).expect("float-mask WhereCond translates");
+        let network = model
+            .build_graph_network(ny_build::GraphNetworkOptions::default())
+            .expect("embedded-constant Where builds");
+        let mut violations = Vec::new();
+        for (label, lo_in, hi_in, truth) in [
+            ("mask in [0.1, 0.3]", 0.1f32, 0.3f32, 9.0f32),
+            ("mask in [-3, -1]", -3.0, -1.0, 9.0),
+            ("mask exactly 0", 0.0, 0.0, -9.0),
+        ] {
+            let bounds = ny_tensor::BoundedTensor::new(
+                ndarray::arr1(&[lo_in, lo_in]).into_dyn(),
+                ndarray::arr1(&[hi_in, hi_in]).into_dyn(),
+            )
+            .expect("bounds");
+            let ibp = network.propagate_ibp(&bounds).expect("embedded Where IBP");
+            let fixed = network
+                .propagate_crown_fixed_slope(&bounds)
+                .expect("embedded Where fixed-slope CROWN");
+            // Non-vacuity: with the mask lowered to BOOL the embedded exact
+            // select must still ENGAGE on a determined mask (the IBP union
+            // would enclose nn's value too, and prove nothing).
+            for i in 0..2 {
+                let (lo, hi) = (fixed.lower()[[i]], fixed.upper()[[i]]);
+                if !((truth - 1e-3)..=(truth + 1e-3)).contains(&lo)
+                    || !((truth - 1e-3)..=(truth + 1e-3)).contains(&hi)
+                {
+                    violations.push(format!(
+                        "{label} crown_fixed_slope out[{i}]=[{lo}, {hi}] is not the exact \
+                         select {truth}: the embedded path did not engage"
+                    ));
+                }
+            }
+            let mut routes = vec![("ibp", ibp), ("crown_fixed_slope", fixed)];
+            if let Ok(alpha) = network.propagate_crown(&bounds) {
+                routes.push(("crown", alpha));
+            }
+            for (route, out) in routes {
+                for i in 0..2 {
+                    let (lo, hi) = (out.lower()[[i]], out.upper()[[i]]);
+                    println!("[where-mask] {label} route={route} out[{i}]=[{lo}, {hi}] nn={truth}");
+                    if lo > truth || hi < truth {
+                        violations.push(format!(
+                            "{label} route={route} out[{i}]=[{lo}, {hi}] excludes nn's {truth}"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "a published bound excludes nn's `mask != 0` select: {violations:#?}"
+        );
     }
 
     /// A NON-uniform single constant branch has no exact activation carrier

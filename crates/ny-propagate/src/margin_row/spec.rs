@@ -105,6 +105,16 @@ pub enum TwinOpSpec {
         input: usize,
     },
     /// Dense layer `y = W x + b`, `W` row-major (n_out, n_in).
+    ///
+    /// #cct-margin-row-admission: the HEAD Gemm may carry an inference-form
+    /// `BatchNormalization` folded in by the builder (CNN7's
+    /// `Gemm -> BatchNormalization -> Relu -> Gemm` head), exactly as `Conv`
+    /// carries a folded BN. The fold is irrational (`gamma / sqrt(var + eps)`),
+    /// so it cannot be exact in f64; its certified error travels with the op
+    /// and the compiler charges it wherever the head weights enter a bound.
+    /// An unfolded Gemm is EXACT: `bias_err` empty and `weight_rel_err` 0.0.
+    /// The compiler refuses a fold error on the FINAL Gemm (every margin
+    /// consumer reads it as exact).
     Gemm {
         /// Producer tensor id consumed.
         input: usize,
@@ -112,10 +122,65 @@ pub enum TwinOpSpec {
         weight: Vec<f64>,
         /// Bias (n_out).
         bias: Vec<f64>,
+        /// Certified ABSOLUTE per-row error bound on `bias` vs the exact
+        /// real-arithmetic fold. EMPTY means exact (no folded parameter);
+        /// otherwise exactly one entry per output row.
+        bias_err: Vec<f64>,
+        /// Certified RELATIVE error bound on every `weight` entry vs the exact
+        /// real fold, relative to the STORED weight (0.0 when nothing was
+        /// folded).
+        weight_rel_err: f64,
         /// (n_out, n_in).
         shape: (usize, usize),
     },
 }
+
+impl TwinOpSpec {
+    /// Does this op carry a nonzero certified fold-error budget (a `Gemm`
+    /// with a folded BatchNormalization)? `false` for every other op kind,
+    /// whose error budgets the compiler handles in place.
+    pub fn is_folded_gemm(&self) -> bool {
+        match self {
+            Self::Gemm {
+                bias_err,
+                weight_rel_err,
+                ..
+            } => *weight_rel_err != 0.0 || bias_err.iter().any(|e| *e != 0.0),
+            _ => false,
+        }
+    }
+}
+
+/// #cct-margin-row-admission — ceiling on the ROOT FORWARD TABLEAU of a net
+/// the lane will compile, in f64 ENTRIES of its widest `(tensor, n_in + 1)`
+/// matrix.
+///
+/// The root forward (`root.rs`) materializes, per live tensor, a `(n, n_in+1)`
+/// value matrix and a second deviation matrix of the same shape. Nothing else
+/// bounds that allocation, and on the uncapped competition path ny has NO
+/// memory governor (CLAUDE.md: `anon-rss 118 GB`, `global_oom`). The widest
+/// tensor of every net the lane has banked evidence on sits under this cap:
+///
+/// | net                                   | widest x (n_in+1) |
+/// |---------------------------------------|-------------------|
+/// | CIFAR100_resnet_medium                | 4.4e7             |
+/// | CIFAR100_resnet_large                 | 2.0e8             |
+/// | TinyImageNet_resnet_medium            | 4.4e8 (41% of cap)|
+/// | cct cifar10 cnn7 / wide cnn7          | 2.0e8 / 4.0e8     |
+/// | relusplitter oval21 (all kw variants) | <= 2.6e7          |
+/// | metaroom_2023 4cnn                    | 2.9e7             |
+///
+/// (TinyImageNet_resnet_medium: input 3x56x56 = 9408, widest tensor the
+/// stride-2 stem conv's 64x27x27 = 46656, so 46656 x 9409 = 4.39e8, derived
+/// from the ONNX graphs, not from an assumed 64x64 input.)
+///
+/// while the cct TinyImageNet CNN7 pair — structurally inside the family once
+/// the FC-BN fold admits it — needs 3.2e9 / 6.4e9 entries (26 / 52 GB per f64
+/// matrix, two matrices per live tensor): a guaranteed OOM on a 121 GiB host
+/// and a lost verdict on any competition machine. `2^30` entries = 8 GiB per
+/// f64 matrix. Refusing is fail-closed: the lane does not run and the internal
+/// verifier keeps its whole budget.
+pub const MAX_ROOT_TABLEAU_ENTRIES: usize = 1 << 30;
 
 /// The full network description.
 #[derive(Debug, Clone)]
@@ -126,4 +191,77 @@ pub struct TwinSpec {
     /// `Flatten` and followed by `Relu` then the final `Gemm` (validated by
     /// the compiler).
     pub ops: Vec<TwinOpSpec>,
+}
+
+impl TwinSpec {
+    /// Checked flat geometry shared by source admission and the dense census.
+    /// Structural/parameter validation remains the compiler's responsibility.
+    pub fn root_tensor_sizes(&self) -> Option<Vec<usize>> {
+        let mut sizes = Vec::with_capacity(self.ops.len().checked_add(1)?);
+        sizes.push(self.n_in);
+        for (k, op) in self.ops.iter().enumerate() {
+            let input = |id: usize| {
+                if id <= k {
+                    sizes.get(id).copied()
+                } else {
+                    None
+                }
+            };
+            let size = match op {
+                TwinOpSpec::Conv {
+                    input: id, oshape, ..
+                }
+                | TwinOpSpec::ConvTranspose {
+                    input: id, oshape, ..
+                } => {
+                    input(*id)?;
+                    oshape.0.checked_mul(oshape.1)?.checked_mul(oshape.2)?
+                }
+                TwinOpSpec::ChannelAffine {
+                    input: id, shape, ..
+                } => {
+                    let size = shape.0.checked_mul(shape.1)?.checked_mul(shape.2)?;
+                    if input(*id)? != size {
+                        return None;
+                    }
+                    size
+                }
+                TwinOpSpec::Relu { input: id } | TwinOpSpec::Flatten { input: id } => input(*id)?,
+                TwinOpSpec::Add { lhs, rhs } => {
+                    let size = input(*lhs)?;
+                    if input(*rhs)? != size {
+                        return None;
+                    }
+                    size
+                }
+                TwinOpSpec::Gemm {
+                    input: id, shape, ..
+                } => {
+                    if input(*id)? != shape.1 {
+                        return None;
+                    }
+                    shape.0
+                }
+            };
+            sizes.push(size);
+        }
+        Some(sizes)
+    }
+    /// Entries of the widest root-tableau matrix: `max tensor size x
+    /// (n_in + 1)`, over tensor 0 (the input) and every op output, using the
+    /// SAME size rule as the compiler's `tsize` walk (`net.rs`). `None` on a
+    /// dangling tensor id or arithmetic overflow — the caller refuses.
+    pub fn root_tableau_entries(&self) -> Option<usize> {
+        let sizes = self.root_tensor_sizes()?;
+        let widest = sizes.iter().copied().max()?;
+        widest.checked_mul(self.n_in.checked_add(1)?)
+    }
+
+    /// Is the root tableau within [`MAX_ROOT_TABLEAU_ENTRIES`]? The single
+    /// predicate shared by the compiler and the ny-cli admission probe, so the
+    /// two cannot disagree about which nets are too wide to run.
+    pub fn root_tableau_within_cap(&self) -> bool {
+        self.root_tableau_entries()
+            .is_some_and(|entries| entries <= MAX_ROOT_TABLEAU_ENTRIES)
+    }
 }

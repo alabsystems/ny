@@ -188,8 +188,6 @@ impl BatchedLinearBounds {
     /// allows ±Inf because `compose()` legitimately produces ±Inf coefficients
     /// as conservative NaN fallbacks (lines 560-569 of compose()). Only NaN is
     /// rejected — it represents a computation error, not a conservative bound.
-    ///
-    /// Reference: designs/2026-02-26-batched-linear-bounds-encapsulation.md
     pub(crate) fn validate_no_nan(&self) -> Result<()> {
         if any_nan(&self.lower_a) {
             return Err(NyError::NumericalInstability(
@@ -260,17 +258,14 @@ impl BatchedLinearBounds {
     /// Validated construction that falls back to conservative bounds on NaN.
     ///
     /// This is the batched CROWN backward NaN firewall (Tier 2 of the NaN
-    /// strategy, designs/2026-02-25-nan-strategy-unification.md). When CROWN
-    /// backward produces NaN coefficients due to numerical instability, instead
-    /// of returning `Err(NumericalInstability)`, this returns conservative
+    /// strategy). When CROWN backward produces NaN coefficients due to numerical
+    /// instability, instead of returning `Err(NumericalInstability)`, this returns conservative
     /// bounds (A=0, b=±∞) that are sound but maximally imprecise.
     ///
     /// Use this at CROWN backward output points where the caller would
     /// otherwise discard the entire verification attempt on NaN. For
     /// construction sites where NaN should be a hard error, use
     /// [`new()`](Self::new) instead.
-    ///
-    /// Reference: #2812 (IBP-vs-CROWN NaN defense asymmetry)
     pub fn new_or_conservative(
         lower_a: ArrayD<f32>,
         lower_b: ArrayD<f32>,
@@ -787,7 +782,6 @@ impl BatchedLinearBounds {
     /// - No NaN in any array
     ///
     /// Tracked: grep for `from_parts_unchecked` to audit usage sites.
-    /// Reference: designs/2026-02-26-batched-linear-bounds-encapsulation.md §Step 1
     pub(crate) fn from_parts_unchecked(
         lower_a: ArrayD<f32>,
         lower_b: ArrayD<f32>,
@@ -873,7 +867,7 @@ impl BatchedLinearBounds {
         let total_batch = total_batch.max(1);
 
         // Stack identity matrices — build each array's backing vec separately
-        // to avoid a .clone() that doubles peak allocation (#2220 F6).
+        // to avoid a .clone() that doubles peak allocation.
         // For dim=4096 × 16 batch, this saves ~1 GB of transient allocation.
         let build_identity_vec = |cap: usize| -> Vec<f32> {
             let mut v = Vec::with_capacity(cap);
@@ -942,7 +936,7 @@ impl BatchedLinearBounds {
         // For seq > 64, flat_size > 4096, and the identity would exceed 16M elements.
         // This limit only affects the MatMul attention retry path (crown_batched.rs).
         //
-        // For BilinearCrown nodes, BilinearRelaxation (#286 Approach A) handles
+        // For BilinearCrown nodes, BilinearRelaxation handles
         // arbitrary seq without needing this dense identity — it stores O(batch*m*n*k)
         // per-batch coefficients and composes via broadcast einsum.
         if flat_size > 4096 {

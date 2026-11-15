@@ -29,7 +29,7 @@ pub(crate) struct AttentionSubgraphArtifacts {
 /// - `LayerNormOutput`: suffix graph starting after the attention LayerNorm,
 ///   with the unresolved `ln_output` tensor mapping to `_input`
 ///
-/// Part of #318: shared-source prefix cut for zonotope attention.
+/// Part of the shared-source prefix cut for zonotope attention.
 enum AttentionGraphRoot {
     BlockInput,
     #[cfg(test)]
@@ -1754,7 +1754,7 @@ impl WhisperModel {
         // When root is LayerNormOutput, omit the LayerNorm node so its output
         // tensor (`ln_output`) stays unresolved and maps to `_input` via the
         // existing external-activation collapse. This gives Q, K, and V one
-        // shared zonotope source. Part of #318.
+        // shared zonotope source.
         let include_ln = match root {
             AttentionGraphRoot::BlockInput => true,
             #[cfg(test)]
@@ -1849,7 +1849,7 @@ impl WhisperModel {
             std::collections::HashSet::new();
         let mut constant_tensors_local = self.model.constant_tensors.clone();
 
-        // Pre-evaluate constant chains for the attention subgraph block (#696).
+        // Pre-evaluate constant chains for the attention subgraph block.
         let (block_start, block_end) = self.block_onnx_bounds(index)?;
         let evaluated_constants =
             self.evaluate_block_constants(block_start, block_end, &constant_tensors_local);
@@ -1861,7 +1861,7 @@ impl WhisperModel {
                 continue;
             }
 
-            // Filter evaluated_constants (#697, #1204): pre-evaluated constant chains
+            // Filter evaluated_constants: pre-evaluated constant chains
             // may not be in constant_tensors_local but are still constant.
             let activation_inputs: Vec<&String> = spec
                 .inputs
@@ -1910,7 +1910,7 @@ impl WhisperModel {
 
             // Skip Concat with <2 activation inputs when there are no constant data
             // inputs. Shape-computing Concats fit this pattern, but data Concats with
-            // constant data should remain in the graph (#1204).
+            // constant data should remain in the graph.
             if spec.layer_type == LayerType::Concat
                 && activation_inputs.len() < 2
                 && !spec
@@ -1965,7 +1965,7 @@ impl WhisperModel {
                 continue;
             }
 
-            // For Concat, use convert_concat_with_evaluated to embed constants (#696).
+            // For Concat, use convert_concat_with_evaluated to embed constants.
             let mut layer = if spec.layer_type == LayerType::Concat {
                 self.model
                     .convert_context()
@@ -2003,7 +2003,7 @@ impl WhisperModel {
                 tensor_to_node.insert(output_name.clone(), spec.name.clone());
             }
 
-            // Insert shape transform nodes (#2686: try_add_node returns Result)
+            // Insert shape transform nodes (try_add_node returns Result)
             if spec.name == *q_src {
                 graph.try_add_node(GraphNode::new(
                     q_reshape.clone(),

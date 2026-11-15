@@ -14,8 +14,6 @@
 //! 5. Cornish-Fisher moment propagation
 //! 6. CGF/Chernoff propagation
 //! 7. Branch-and-bound distributional refinement
-//!
-//! Part of #4265.
 
 use super::*;
 use ndarray::{ArrayD, IxDyn};

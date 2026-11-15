@@ -74,7 +74,7 @@ impl SliceLayer {
         Ok((axis, self.start.min(input_shape[axis]), end))
     }
 
-    /// Validate and clamp `start`/`end` to axis size, returning the resolved axis (#2759, #3206).
+    /// Validate and clamp `start`/`end` to axis size, returning the resolved axis.
     ///
     /// ONNX semantics: both `start` and `end` are clamped to `[0, axis_len]`.
     /// ONNX uses INT64_MAX as a sentinel for "slice to end of dimension".
@@ -84,7 +84,7 @@ impl SliceLayer {
     fn validate_range(&self, input_shape: &[usize]) -> Result<(usize, usize)> {
         let axis = self.resolve_axis(input_shape.len())?;
         let axis_len = input_shape[axis];
-        // Clamp both start and end to axis size (ONNX spec #3206)
+        // Clamp both start and end to axis size (ONNX spec)
         let start = self.start.min(axis_len);
         let end = self
             .end_offset_from_axis_end
@@ -504,7 +504,7 @@ mod tests {
         );
     }
 
-    // -- resolve_axis error cases (#1952) --
+    // -- resolve_axis error cases --
 
     #[ntest::timeout(5000)]
     #[test]
@@ -552,7 +552,7 @@ mod tests {
     fn test_ibp_slice_usize_max_sentinel_clamps_to_axis_size_3193() {
         // Regression: ONNX uses INT64_MAX → usize::MAX as "slice to end" sentinel.
         // validate_range must clamp this to axis_len, not reject it.
-        // Source: #3193 — linearizenn models use end = MAX sentinel.
+        // Source: linearizenn models use end = MAX sentinel.
         let lower = ArrayD::from_shape_vec(IxDyn(&[4]), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         let upper = ArrayD::from_shape_vec(IxDyn(&[4]), vec![5.0, 6.0, 7.0, 8.0]).unwrap();
         let input = make_bounded(lower.clone(), upper.clone());
@@ -799,7 +799,7 @@ mod tests {
         assert_eq!(result.lower_a.shape(), &[2, 4]);
     }
 
-    // -- Batched CROWN backward propagation (#3188) --
+    // -- Batched CROWN backward propagation --
 
     #[ntest::timeout(5000)]
     #[test]

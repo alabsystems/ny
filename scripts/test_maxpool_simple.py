@@ -85,7 +85,7 @@ def create_vnnlib(output_dim, output_dir: Path):
 def run_ny_verify(onnx_path, vnnlib_path, method="ibp", expected_outputs=32):
     """Run ny verify and parse output."""
     result = subprocess.run(
-        ["cargo", "run", "--release", "-p", "ny-cli", "--",
+        ["targo", "--unverified", "run", "--release", "-p", "ny-cli", "--",
          "verify", onnx_path, "--property", vnnlib_path, "--method", method,
          "--json", "--require-sound"],
         capture_output=True, text=True, cwd=REPO_ROOT

@@ -5,7 +5,6 @@
 //! Alpha-CROWN propagation entry points for sequential networks.
 //!
 //! Moved out of the sequential core module to break bidirectional dependency
-//! (#2380).
 
 use crate::bounds::AlphaCrownConfig;
 use crate::network::Network;

@@ -333,9 +333,81 @@
 #                   consume the entry-time frozen LeverSet instead of rereading
 #                   the process environment. Removed three direct var readers:
 #                   630 var + 86 var_os.
+# 2026-08-28  709   Promoted NY_MARGIN_ROW_DOMAIN_STACK (#domain-stack) out of a
+#                   raw read into the typed key margin_row.domain_stack: with
+#                   run_instance.sh exporting no NY_*, the cross-domain scoring
+#                   lane could not be armed on a scored binary at all.
 # 2026-08-26  710   Governed the coupled objective-chunk controls, Patches
 #                   flat-bias experiment, and honest-provenance guard through
 #                   ny-levers; retired the already-inert deadline-scatter flag
 #                   and removed redundant raw cache-identity readers:
 #                   627 var + 83 var_os.
-710
+# 2026-09-11  707   #nn4sys-1d-cover promotion. `NY_NN4SYS_1D_COMPLETE_COVER`
+#                   is declared (decls/nn4sys_1d_cover.rs) and its production
+#                   reader in verify/nn4sys_scalar_cover.rs::enabled now
+#                   resolves through the typed preset gate, so the one counted
+#                   direct-literal read leaves the tree. Its two siblings in
+#                   the same promotion pay nothing HERE by construction:
+#                   NY_NN4SYS_1D_COVER_DEPTH was read through the dynamic-name
+#                   helper `bounded_env_u8`, which this net-count tripwire
+#                   declares a known blind spot, and NY_NN4SYS_1D_COVER_SLICE
+#                   is a new declaration with no raw reader at all. Their debt
+#                   is paid on the SOURCE frontier instead, which sees helper
+#                   resolution. Re-derived with the test's own two substrings
+#                   on this tree: 625 var + 82 var_os.
+# 2026-09-15  706   #fl-f32-seam-key promotion. `NY_FORWARD_LINEAR_F32` had TWO
+#                   byte-identical direct readers -- forward_linear.rs and
+#                   forward_linear/image.rs -- and no typed key at all, so with
+#                   run_instance.sh exporting no NY_*, the f32 value-GEMM seam
+#                   could not be armed on a scored binary however it measured.
+#                   image.rs now defers to the parent's single reader, which
+#                   consults a preset-settable override before the legacy env
+#                   read. That matters beyond tidiness: the two sites keyed BOTH
+#                   the cache fingerprint AND the rate calibration, so a split
+#                   view between them was a correctness hazard. One counted read
+#                   leaves the tree; the surviving reader is the deliberate
+#                   legacy fallback. Re-derived by scan on this tree.
+# 2026-09-24  705   #vit-margin-alpha promotion. The env-only child gate
+#                   `NY_ROOT_ALPHA_MARGIN_GRADIENT` (one direct `var` read in
+#                   graph_alpha/propagate_dag/mod.rs) is now DECLARED
+#                   (decls/root_alpha.rs) and resolved env-over-config through
+#                   `ny_levers::read_over_config` from the typed key
+#                   bab.alpha_crown.root_alpha_margin_gradient. The legacy
+#                   token still wins in both directions; the raw read is gone.
+#                   Re-derived with this test's own two substrings on this
+#                   tree (705 total); the frontier manifests move on the
+#                   SOURCE frontier, which must be regenerated from
+#                   source_frontier.rs's own failure output.
+# 2026-09-28  704   #name-blind-routing deleted the category-name-keyed,
+#                   env-dark SafeNLP direct-MIP-first route (armed only by
+#                   `NY_MIP_SAFENLP_DIRECT_FIRST=1` on the literal category
+#                   `safenlp_2024`, which run_instance.sh never exports). Its
+#                   own env gate was alias-based and never counted here, but its
+#                   route markers used dispatch.rs's private
+#                   `phase_telemetry_enabled()`, a direct
+#                   `var_os("NY_PHASE_TELEMETRY")` read with no other caller,
+#                   which went with it. Re-derived by scan with this test's own
+#                   two substrings on this tree (no cargo available to the
+#                   task; the integrator's run is the authority):
+#                   623 var + 81 var_os.
+# 2026-10-02  700   #fl-alpha-composition review (reader drift, PL5). The four
+#                   forward-linear switches declared in decls/forward_linear.rs
+#                   (NY_NO_FORWARD_LINEAR_REF,
+#                   NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF,
+#                   NY_FORWARD_LINEAR_SEQ_CONV_REF, NY_FORWARD_LINEAR_F32) are
+#                   now READ through those declarations (`ny_levers::read`) in
+#                   network/core/graph/forward_linear.rs (three readers) and
+#                   graph_alpha/bounds/alpha.rs (the sequential-Conv2d gate),
+#                   so a live reader can no longer drift from the flight
+#                   receipt. LeverKind::Bool is the historical exact-"1"
+#                   predicate on every input, so no decision changes. Four
+#                   direct var reads leave the tree. Re-derived with this
+#                   test's own two substrings on this tree:
+#                   619 var + 81 var_os.
+# 2026-10-14  698   Declared the three diagnostic/corpus paths and classwise
+#                   research schedule. Six direct readers leave current704;
+#                   the two older sibling readers also leave the prior700
+#                   baseline. Actual Trust ratchet:617 var +81 var_os.
+692
+# 2026-11-07: govern all ten raw readers for three existing kernel/calibration
+# inputs (base had four unrecorded additions); 702 actual minus 10 = 692.

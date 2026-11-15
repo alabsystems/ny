@@ -6,6 +6,41 @@ use ny_core::Result;
 
 use crate::beta_crown::branching::{LayerRef, NeuronSplit};
 
+/// Do `points` split the closed interval `[lower, upper]` into
+/// `points.len() + 1` NON-EMPTY closed children, each STRICTLY narrower than
+/// the parent? (#genbab-selector-convention)
+///
+/// [`BranchingDecision::to_splits`] builds the children as
+/// `[cur_l, p1], [p1, p2], ..., [pk, cur_u]` (the outer ends are `None`, i.e.
+/// the domain's current bounds), and `with_general_split` intersects each with
+/// the domain's current pre-activation interval `[cur_l, cur_u]`. Their UNION
+/// is `[cur_l, cur_u]` for ANY finite points — coverage, the soundness half, is
+/// structural. What is NOT structural is PROGRESS: a point outside
+/// `(cur_l, cur_u)` yields one EMPTY child (`with_general_split` returns
+/// `Ok(None)`) and one child IDENTICAL to the parent, so the split is a no-op
+/// and the selector, seeing the same bounds, re-picks the same neuron until the
+/// depth cap. That is exactly what the pre-fix selector did for every
+/// Sigmoid/Sin/Cos candidate whose output-space midpoint missed the input
+/// interval.
+///
+/// So a candidate is emitted only when this predicate holds against the SAME
+/// interval `with_general_split` reads: every point finite, strictly increasing,
+/// and strictly inside `(lower, upper)`. It also rejects the f32 corner where a
+/// ULP-wide interval's midpoint rounds onto an endpoint.
+pub fn points_strictly_partition(lower: f32, upper: f32, points: &[f32]) -> bool {
+    if points.is_empty() || !lower.is_finite() || !upper.is_finite() || lower >= upper {
+        return false;
+    }
+    let mut prev = lower;
+    for &point in points {
+        if !point.is_finite() || point <= prev {
+            return false;
+        }
+        prev = point;
+    }
+    prev < upper
+}
+
 /// A branching decision for a single neuron.
 #[derive(Debug, Clone)]
 pub struct BranchingDecision {

@@ -354,17 +354,24 @@ fn test_crown_merge_accumulator_preserves_three_term_cancellation_2657() {
         naive_b[0], 0.0,
         "serial f32 bias merge should lose the low-order term"
     );
+    // The f64 sum is exactly 1, an f32: the coefficient is published exactly
+    // and needs no error plane. (It used to come back nudged one ulp outward,
+    // which is no certificate for a coefficient on a signed input.)
     assert_eq!(
         merged.lower_a()[[0, 0]],
-        next_down_f32(1.0),
-        "f64 sidecar merge should preserve the residual and round the lower side soundly"
+        1.0,
+        "f64 sidecar merge should preserve the residual exactly"
+    );
+    assert_eq!(merged.upper_a()[[0, 0]], 1.0);
+    assert!(
+        !merged.has_coeff_err(),
+        "an exact fan-in sum needs no coefficient-error plane"
     );
     assert_eq!(
         merged.lower_b()[0],
         next_down_f32(1.0),
         "f64 sidecar bias merge should preserve the residual and round the lower side soundly"
     );
-    assert_eq!(merged.upper_a()[[0, 0]], next_up_f32(1.0));
     assert_eq!(merged.upper_b()[0], next_up_f32(1.0));
 }
 
@@ -373,8 +380,8 @@ fn test_merge_binary64_cancellation_bias_is_directed_and_coeff_error_is_carried(
     // Excluded from overlapping an env WRITER. Siblings in THIS FILE set
     // NY_DENSE_BUDGET_MB=0; an unguarded reader that races one sees
     // `budget_bytes: 0` in CrownMergeAccumulator staging. Every reader here
-    // is guarded as a class -- three had already failed one at a time
-    // (2026-08-19, 2026-08-20 x2), each printing the leaked value verbatim.
+    // is guarded as a class -- three had already failed one at a time, each
+    // printing the leaked value verbatim.
     let _env = crate::tests::lock_env_shared();
     use ny_tensor::BoundedTensor;
 
@@ -414,8 +421,8 @@ fn test_merge_error_addition_rounds_up_per_addend() {
     // Excluded from overlapping an env WRITER. Siblings in THIS FILE set
     // NY_DENSE_BUDGET_MB=0; an unguarded reader that races one sees
     // `budget_bytes: 0` in CrownMergeAccumulator staging. Every reader here
-    // is guarded as a class -- three had already failed one at a time
-    // (2026-08-19, 2026-08-20 x2), each printing the leaked value verbatim.
+    // is guarded as a class -- three had already failed one at a time, each
+    // printing the leaked value verbatim.
     let _env = crate::tests::lock_env_shared();
     let large = 2.0_f64.powi(60);
     let mut existing = Some(array![[large]]);
@@ -435,8 +442,89 @@ fn test_merge_error_addition_rounds_up_per_addend() {
     assert_eq!(residual[[0, 0]], 1.0);
 }
 
+/// Exact vertex enumeration of a merged scalar relation `c*x + b` (with its
+/// coefficient-error planes) against the exact merged objectives
+/// `L(x) = l_c*x + l_b` and `U(x) = u_c*x + u_b`. A linear-versus-linear gap
+/// is extremal at a box vertex, so checking `x = -1` and `x = 1` in exact
+/// rational arithmetic is complete on `[-1, 1]`.
+fn assert_scalar_merge_contains_exact(merged: &LinearBounds, exact: [f64; 4]) {
+    use num_rational::BigRational;
+    let q = |v: f64| BigRational::from_float(v).expect("finite");
+    let q32 = |v: f32| q(f64::from(v));
+    let [l_c, l_b, u_c, u_b] = exact;
+    let e_lo = merged.lower_a_err.as_ref().map_or(0.0, |e| e[[0, 0]]);
+    let e_up = merged.upper_a_err.as_ref().map_or(0.0, |e| e[[0, 0]]);
+    for x in [-1.0_f64, 1.0] {
+        let lower = q32(merged.lower_a()[[0, 0]]) * q(x) + q32(merged.lower_b()[0])
+            - q32(e_lo) * q(x.abs());
+        let upper = q32(merged.upper_a()[[0, 0]]) * q(x)
+            + q32(merged.upper_b()[0])
+            + q32(e_up) * q(x.abs());
+        assert!(
+            lower <= q(l_c) * q(x) + q(l_b),
+            "published lower exceeds the exact merged objective at x={x}"
+        );
+        assert!(
+            upper >= q(u_c) * q(x) + q(u_b),
+            "published upper falls below the exact merged objective at x={x}"
+        );
+    }
+}
+
+/// Merge `c*x + 0` contributions through the non-batched accumulator. A zero
+/// bias keeps the coefficient's error visible at `x = -1` (a fixture whose
+/// bias equals its coefficient cancels it there).
+fn merge_coefficient_only_scalar_bounds(first: f32, rest: &[f32]) -> LinearBounds {
+    let bounds = |c: f32| {
+        LinearBounds::from_parts_unchecked(array![[c]], array![0.0], array![[c]], array![0.0])
+    };
+    let mut accumulator = CrownMergeAccumulator::new();
+    accumulator.insert("residual".to_string(), CrownBounds::Dense(bounds(first)));
+    for &c in rest {
+        accumulator
+            .merge_dense("residual", bounds(c))
+            .expect("merge should succeed");
+    }
+    accumulator
+        .take("residual")
+        .expect("take should succeed")
+        .expect("residual entry should exist")
+        .into_dense()
+        .expect("merged residual entry should be dense")
+}
+
+/// Merge `((lower_c, lower_b), (upper_c, upper_b))` contributions through the
+/// non-batched accumulator, the first as the pending entry. Lets one side's
+/// fan-in sum be an f32 while the other's is not.
+fn merge_two_sided_scalar_bounds(contributions: &[((f32, f32), (f32, f32))]) -> LinearBounds {
+    let bounds = |((lower_c, lower_b), (upper_c, upper_b)): ((f32, f32), (f32, f32))| {
+        LinearBounds::from_parts_unchecked(
+            array![[lower_c]],
+            array![lower_b],
+            array![[upper_c]],
+            array![upper_b],
+        )
+    };
+    let (first, rest) = contributions
+        .split_first()
+        .expect("at least one contribution");
+    let mut accumulator = CrownMergeAccumulator::new();
+    accumulator.insert("residual".to_string(), CrownBounds::Dense(bounds(*first)));
+    for &contribution in rest {
+        accumulator
+            .merge_dense("residual", bounds(contribution))
+            .expect("merge should succeed");
+    }
+    accumulator
+        .take("residual")
+        .expect("take should succeed")
+        .expect("residual entry should exist")
+        .into_dense()
+        .expect("merged residual entry should be dense")
+}
+
 #[test]
-fn test_crown_merge_accumulator_downcasts_with_directed_rounding_2657() {
+fn test_crown_merge_accumulator_downcast_pays_coefficient_gap_and_directs_bias_2657() {
     let _env = crate::tests::lock_env_shared();
     let lower_half_ulp = 2.0_f32.powi(-24);
     let lower_quarter_ulp = 2.0_f32.powi(-25);
@@ -447,27 +535,104 @@ fn test_crown_merge_accumulator_downcasts_with_directed_rounding_2657() {
         (lower_half_ulp, upper_half_ulp),
         (lower_quarter_ulp, 0.0),
     ]);
+    let exact_lower = 1.0_f64 + f64::from(lower_half_ulp) + f64::from(lower_quarter_ulp);
+    let exact_upper = 1.0_f64 + f64::from(upper_half_ulp);
 
-    assert_eq!(
-        merged.lower_a()[[0, 0]],
-        1.0,
-        "lower coefficient must round toward -inf on f64->f32 downcast"
+    // Coefficients multiply a signed input, so no rounding DIRECTION certifies
+    // them: they are stored at the nearest f32 and the full cast gap is paid
+    // through the coefficient-error plane.
+    assert_eq!(merged.lower_a()[[0, 0]], exact_lower as f32);
+    assert_eq!(merged.upper_a()[[0, 0]], exact_upper as f32);
+    let lower_err = merged
+        .lower_a_err
+        .as_ref()
+        .expect("an inexact coefficient cast must allocate the error plane")[[0, 0]];
+    let upper_err = merged
+        .upper_a_err
+        .as_ref()
+        .expect("an inexact coefficient cast must allocate the error plane")[[0, 0]];
+    assert!(
+        f64::from(lower_err) >= (f64::from(exact_lower as f32) - exact_lower).abs(),
+        "lower coefficient error must cover the cast gap"
     );
+    assert!(
+        f64::from(upper_err) >= (f64::from(exact_upper as f32) - exact_upper).abs(),
+        "upper coefficient error must cover the cast gap"
+    );
+
+    // Biases are additive constants: a directed step IS their certificate.
     assert_eq!(
         merged.lower_b()[0],
         1.0,
         "lower bias must round toward -inf on f64->f32 downcast"
     );
     assert_eq!(
-        merged.upper_a()[[0, 0]],
-        next_up_f32(1.0),
-        "upper coefficient must round toward +inf on f64->f32 downcast"
-    );
-    assert_eq!(
         merged.upper_b()[0],
         next_up_f32(1.0),
         "upper bias must round toward +inf on f64->f32 downcast"
     );
+    assert_scalar_merge_contains_exact(
+        &merged,
+        [exact_lower, exact_lower, exact_upper, exact_upper],
+    );
+}
+
+/// eng9b class on the non-batched fan-in carrier. `0.5*x + 0.5*x` is exact
+/// and representable: it used to come back as `next_down(1)*x - 2^-149`
+/// with no error plane, which at `x = -1` exceeds the exact `-1`. It must now
+/// be bit-exact and err-free. `1*x + 2^-30*x` is exact in f64 but not an f32:
+/// its nearest-f32 cast gap must be paid through the error plane. With one
+/// side exact and the other inexact (both ways round) the plane decision must
+/// still see the inexact side: a scan of one side only publishes the other
+/// side's nearest-f32 coefficient with no plane (eng9b review plant PL1).
+#[test]
+fn test_crown_merge_accumulator_fan_in_downcast_vertex_enumeration() {
+    let _env = crate::tests::lock_env_shared();
+    let exact = merge_coefficient_only_scalar_bounds(0.5, &[0.5]);
+    assert_eq!(exact.lower_a()[[0, 0]], 1.0);
+    assert_eq!(exact.upper_a()[[0, 0]], 1.0);
+    assert!(
+        !exact.has_coeff_err(),
+        "an exact, representable fan-in sum needs no plane"
+    );
+    assert_scalar_merge_contains_exact(&exact, [1.0, 0.0, 1.0, 0.0]);
+
+    let tiny = 2.0_f32.powi(-30);
+    let inexact = merge_coefficient_only_scalar_bounds(1.0, &[tiny]);
+    let exact_sum = 1.0_f64 + f64::from(tiny);
+    assert!(
+        f64::from(exact_sum as f32) != exact_sum,
+        "fixture premise: the f64 sum is not an f32"
+    );
+    assert!(
+        inexact.has_coeff_err(),
+        "the inexact cast must be paid through the error plane"
+    );
+    assert_scalar_merge_contains_exact(&inexact, [exact_sum, 0.0, exact_sum, 0.0]);
+
+    // `+-2^-31` per bias keeps each relation a lower/upper pair on [-1, 1];
+    // the biases' directed step is far below the 2^-30 coefficient gap.
+    let h = 2.0_f32.powi(-31);
+    let bias = 2.0_f64.powi(-30);
+    for (case, contributions, exact) in [
+        (
+            "lower-exact/upper-inexact",
+            [((0.5, -h), (1.0, h)), ((0.5, -h), (tiny, h))],
+            [1.0, -bias, exact_sum, bias],
+        ),
+        (
+            "lower-inexact/upper-exact",
+            [((1.0, -h), (0.5, h)), ((tiny, -h), (0.5, h))],
+            [exact_sum, -bias, 1.0, bias],
+        ),
+    ] {
+        let merged = merge_two_sided_scalar_bounds(&contributions);
+        assert!(
+            merged.has_coeff_err(),
+            "{case}: the inexact side's cast must be paid through the error plane"
+        );
+        assert_scalar_merge_contains_exact(&merged, exact);
+    }
 }
 
 #[test]
@@ -475,8 +640,8 @@ fn test_crown_merge_accumulator_missing_network_input_merge_errors_2657() {
     // Excluded from overlapping an env WRITER. Siblings in THIS FILE set
     // NY_DENSE_BUDGET_MB=0; an unguarded reader that races one sees
     // `budget_bytes: 0` in CrownMergeAccumulator staging. Every reader here
-    // is guarded as a class -- three had already failed one at a time
-    // (2026-08-19, 2026-08-20 x2), each printing the leaked value verbatim.
+    // is guarded as a class -- three had already failed one at a time, each
+    // printing the leaked value verbatim.
     let _env = crate::tests::lock_env_shared();
     let graph = test_graph();
     let mut accumulator = CrownMergeAccumulator::new();
@@ -511,8 +676,8 @@ fn test_crown_merge_accumulator_has_only_key_after_dense_promotion_4023() {
     // Excluded from overlapping an env WRITER. Siblings in THIS FILE set
     // NY_DENSE_BUDGET_MB=0; an unguarded reader that races one sees
     // `budget_bytes: 0` in CrownMergeAccumulator staging. Every reader here
-    // is guarded as a class -- three had already failed one at a time
-    // (2026-08-19, 2026-08-20 x2), each printing the leaked value verbatim.
+    // is guarded as a class -- three had already failed one at a time, each
+    // printing the leaked value verbatim.
     let _env = crate::tests::lock_env_shared();
     let mut accumulator = CrownMergeAccumulator::new();
     accumulator.insert(
@@ -543,8 +708,8 @@ fn test_crown_merge_accumulator_indexed_take_by_idx_round_trips_4296() {
     // Excluded from overlapping an env WRITER. Siblings in THIS FILE set
     // NY_DENSE_BUDGET_MB=0; an unguarded reader that races one sees
     // `budget_bytes: 0` in CrownMergeAccumulator staging. Every reader here
-    // is guarded as a class -- three had already failed one at a time
-    // (2026-08-19, 2026-08-20 x2), each printing the leaked value verbatim.
+    // is guarded as a class -- three had already failed one at a time, each
+    // printing the leaked value verbatim.
     let _env = crate::tests::lock_env_shared();
     let exec_order = vec!["hidden".to_string(), "output".to_string()];
     let mut accumulator = CrownMergeAccumulator::new_indexed(&exec_order);
@@ -583,14 +748,14 @@ fn test_crown_merge_accumulator_indexed_take_by_idx_round_trips_4296() {
 }
 
 #[test]
-/// #4382 regression: merge_crown with compatible Patches keeps them in Patches
-/// form instead of promoting to Dense.
+/// Regression: merge_crown with compatible Patches keeps them in Patches form
+/// instead of promoting to Dense.
 fn test_crown_merge_accumulator_merge_crown_patches_stays_patches_4382() {
     // Excluded from overlapping an env WRITER. Siblings in THIS FILE set
     // NY_DENSE_BUDGET_MB=0; an unguarded reader that races one sees
     // `budget_bytes: 0` in CrownMergeAccumulator staging. Every reader here
-    // is guarded as a class -- three had already failed one at a time
-    // (2026-08-19, 2026-08-20 x2), each printing the leaked value verbatim.
+    // is guarded as a class -- three had already failed one at a time, each
+    // printing the leaked value verbatim.
     let _env = crate::tests::lock_env_shared();
     let mut accumulator = CrownMergeAccumulator::new();
     accumulator.insert(
@@ -615,37 +780,188 @@ fn test_crown_merge_accumulator_merge_crown_patches_stays_patches_4382() {
     );
 }
 
+/// The hard-authority merge tests below decide by `NY_PATCHES_FINITE_EXPIRY`,
+/// which ships ARMED. A disarmed process (the `=0` kill switch in the
+/// environment) would turn every "native merge kept" assertion into a test of
+/// the historical presence refusal instead, so fail loudly rather than pass or
+/// fail by inference.
+fn assert_patches_finite_expiry_armed() {
+    assert!(
+        crate::network::core::sequential::crown::patches_step::expiry_authority_armed(),
+        "#patches-merge-expiry tests require the shipped-default ARMED \
+         NY_PATCHES_FINITE_EXPIRY lever; this process has it disarmed"
+    );
+}
+
+/// Merge `incoming` into a pending `pending` carrier through
+/// `merge_crown_with_deadline_authority` and return the published Patches
+/// carrier, failing if the merge densified.
+fn merged_patches(
+    indexed: bool,
+    pending: PatchesLinearBounds,
+    incoming: PatchesLinearBounds,
+    deadline: Option<Instant>,
+    deadline_is_hard: bool,
+) -> PatchesLinearBounds {
+    let mut accumulator = merge_test_accumulator(indexed);
+    accumulator.insert(
+        "residual".to_string(),
+        CrownBounds::Patches(Box::new(pending)),
+    );
+    accumulator
+        .merge_crown_with_deadline_authority(
+            "residual",
+            CrownBounds::Patches(Box::new(incoming)),
+            deadline,
+            deadline_is_hard,
+        )
+        .expect("a compatible Patches merge under a live deadline must succeed");
+    match accumulator
+        .take("residual")
+        .expect("merged residual take succeeds")
+        .expect("merge retains the residual entry")
+    {
+        CrownBounds::Patches(merged) => *merged,
+        CrownBounds::Dense(_) => panic!(
+            "#patches-merge-expiry: a compatible Patches+Patches residual join was promoted to \
+             Dense (hard={deadline_is_hard}); the native merge was skipped"
+        ),
+    }
+}
+
+/// #patches-merge-expiry case (a), audit N6: a LIVE hard deadline with the
+/// expiry lever armed keeps the native Patches merge, and its result is
+/// BIT-IDENTICAL to the soft-authority and no-deadline merges of the same
+/// inputs. Before the fix the hard arm promoted both carriers to Dense.
 #[test]
-fn soft_deadline_keeps_compatible_patches_merge_native_but_hard_deadline_does_not() {
+fn hard_live_deadline_keeps_native_patches_merge_bit_identical_to_soft() {
+    assert_patches_finite_expiry_armed();
+    crate::tests::with_crown_dense_budget_mb("64", || {
+        let live = Instant::now() + Duration::from_secs(300);
+        let (saved_before, _) = super::patches_merge_graph_preserve_snapshot();
+
+        for indexed in [false, true] {
+            let pending = || affine_merge_fixture(0.25, 0.75);
+            let incoming = || affine_merge_fixture(0.1, 0.5);
+            let hard = merged_patches(indexed, pending(), incoming(), Some(live), true);
+            let soft = merged_patches(indexed, pending(), incoming(), Some(live), false);
+            let unbounded = merged_patches(indexed, pending(), incoming(), None, false);
+            assert_patches_exact(&hard, &soft);
+            assert_patches_exact(&hard, &unbounded);
+            assert!(
+                hard.lower_a.coeff_err.is_some() && hard.upper_a.coeff_err.is_some(),
+                "the native merge must publish its certified rounding receipt"
+            );
+        }
+
+        // Lever's own observable: `[deadline-preserve] patches-merge-graph`
+        // counted both hard merges as SAVED. Counters only ever increase, so a
+        // concurrent test cannot make this lower bound fail.
+        let (saved_after, _) = super::patches_merge_graph_preserve_snapshot();
+        assert!(
+            saved_after >= saved_before + 2,
+            "patches-merge-graph saved counter did not move ({saved_before} -> {saved_after}): \
+             the hard-authority native merge never engaged"
+        );
+    });
+}
+
+/// #patches-merge-expiry case (b): an EXPIRED hard deadline refuses before any
+/// publication with `DeadlineExceeded`, leaving the pending carrier
+/// bit-identical — and the shared expiry predicate refuses on expiry, keeps the
+/// native route while live, and never refuses a soft timestamp.
+#[test]
+fn hard_expired_deadline_refuses_native_merge_and_preserves_pending() {
+    let _env = crate::tests::lock_env_shared();
+    assert_patches_finite_expiry_armed();
+    let expired = Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .expect("system uptime exceeds one millisecond");
+
+    for indexed in [false, true] {
+        let expected = affine_merge_fixture(0.25, 0.75);
+        let mut accumulator = merge_test_accumulator(indexed);
+        accumulator.insert(
+            "residual".to_string(),
+            CrownBounds::Patches(Box::new(expected.clone())),
+        );
+        let error = accumulator
+            .merge_crown_with_deadline(
+                "residual",
+                CrownBounds::Patches(Box::new(affine_merge_fixture(0.1, 0.5))),
+                Some(expired),
+            )
+            .expect_err("an expired hard deadline must refuse the merge");
+        assert!(
+            matches!(error, ny_core::NyError::DeadlineExceeded(_)),
+            "expected DeadlineExceeded, got {error:?}"
+        );
+        match accumulator
+            .take("residual")
+            .expect("deadline refusal leaves the entry readable")
+            .expect("deadline refusal retains the pending entry")
+        {
+            CrownBounds::Patches(actual) => assert_patches_exact(&actual, &expected),
+            CrownBounds::Dense(_) => panic!("deadline refusal changed the carrier type"),
+        }
+    }
+
+    let counters =
+        super::super::backward_helpers::DeadlinePreserveCounters::new("patches-merge-graph-test");
+    let refuses = |hard, deadline| {
+        super::super::backward_helpers::finite_authority_refuses_native_patches(
+            hard, deadline, &counters,
+        )
+    };
+    assert!(
+        refuses(true, Some(expired)),
+        "expired hard authority must refuse"
+    );
+    assert!(
+        !refuses(true, Some(Instant::now() + Duration::from_secs(300))),
+        "a LIVE hard deadline must keep the native route (expiry, not presence)"
+    );
+    assert!(
+        !refuses(false, Some(expired)),
+        "a soft collector timestamp never refuses the native route"
+    );
+    assert_eq!(
+        counters.snapshot(),
+        (1, 1),
+        "hard decisions are counted once each (saved=1, discarded=1); soft ones are not"
+    );
+}
+
+/// #patches-merge-expiry case (c): under hard authority the native merge's
+/// transient footprint is charged before entry. Over budget, the merge refuses
+/// with `CpuMemoryExceeded` naming the NATIVE receipt (the guarded Dense
+/// promotion refuses too, far larger), and the pending carrier is untouched. A
+/// soft timestamp keeps the historical unreceipted native merge.
+#[test]
+fn hard_deadline_native_merge_over_budget_refuses_atomically_but_soft_stays_native() {
+    assert_patches_finite_expiry_armed();
     crate::tests::with_env_edits(|env| {
         env.set("NY_DENSE_BUDGET_MB", "0");
         let live = Instant::now() + Duration::from_secs(30);
 
         for indexed in [false, true] {
-            let mut soft = merge_test_accumulator(indexed);
-            soft.insert(
-                "residual".to_string(),
-                CrownBounds::Patches(Box::new(affine_merge_fixture(0.25, 0.75))),
-            );
-            soft.merge_crown_with_deadline_authority(
-                "residual",
-                CrownBounds::Patches(Box::new(affine_merge_fixture(0.1, 0.5))),
+            let soft = merged_patches(
+                indexed,
+                affine_merge_fixture(0.25, 0.75),
+                affine_merge_fixture(0.1, 0.5),
                 Some(live),
                 false,
-            )
-            .expect("a soft collector timestamp must preserve the native Patches merge");
-            assert!(
-                soft.take("residual")
-                    .expect("soft merge take succeeds")
-                    .expect("soft merge retains the residual")
-                    .is_patches(),
+            );
+            assert_eq!(
+                soft.row_count, 4,
                 "soft-authority compatible merge must remain Patches under a zero dense budget"
             );
 
+            let expected = affine_merge_fixture(0.25, 0.75);
             let mut hard = merge_test_accumulator(indexed);
             hard.insert(
                 "residual".to_string(),
-                CrownBounds::Patches(Box::new(affine_merge_fixture(0.25, 0.75))),
+                CrownBounds::Patches(Box::new(expected.clone())),
             );
             let error = hard
                 .merge_crown_with_deadline(
@@ -653,22 +969,169 @@ fn soft_deadline_keeps_compatible_patches_merge_native_but_hard_deadline_does_no
                     CrownBounds::Patches(Box::new(affine_merge_fixture(0.1, 0.5))),
                     Some(live),
                 )
-                .expect_err("hard authority must retain the cooperative promotion policy");
-            assert!(matches!(error, ny_core::NyError::CpuMemoryExceeded { .. }));
-            assert!(
-                hard.take("residual")
-                    .expect("hard refusal take succeeds")
-                    .expect("hard refusal retains the pending residual")
-                    .is_patches(),
-                "hard-authority refusal must be atomic"
-            );
+                .expect_err("a zero budget must refuse the hard-authority native merge");
+            match error {
+                ny_core::NyError::CpuMemoryExceeded {
+                    required_bytes,
+                    budget_bytes,
+                    site,
+                } => {
+                    assert_eq!(
+                        site,
+                        super::NATIVE_PATCHES_MERGE_SITE,
+                        "the refusal must name the native merge receipt, not the Dense promotion"
+                    );
+                    assert_eq!(budget_bytes, 0);
+                    // Two 1x2x2x1x3x3 sides (S = 36 elements), 4-row vectors:
+                    // (12 * S + 16 * R) f32 elements.
+                    assert_eq!(required_bytes, (12 * 36 + 16 * 4) * size_of::<f32>());
+                }
+                error => panic!("expected typed memory refusal, got {error:?}"),
+            }
+            match hard
+                .take("residual")
+                .expect("memory refusal leaves the entry readable")
+                .expect("memory refusal retains the pending entry")
+            {
+                CrownBounds::Patches(actual) => assert_patches_exact(&actual, &expected),
+                CrownBounds::Dense(_) => panic!("memory refusal changed the carrier type"),
+            }
+        }
+    });
+}
+
+/// A 6-D affine carrier `[out_c, out_h, out_w, in_c, k, k]` (stride 1,
+/// symmetric padding `pad`) over a same-size input, with a certified per-row
+/// coefficient error on both sides — the representation a composed residual
+/// branch carries into a join.
+fn residual_branch_carrier(
+    output_shape: (usize, usize, usize),
+    in_c: usize,
+    kernel: usize,
+    pad: usize,
+    fill: f32,
+) -> PatchesLinearBounds {
+    let (oc, oh, ow) = output_shape;
+    let rows = oc * oh * ow;
+    let side = |value: f32| PatchesData {
+        coeff_err: Some(Array1::from_elem(rows, 1.0e-7)),
+        patches: Some(ArrayD::from_elem(
+            IxDyn(&[oc, oh, ow, in_c, kernel, kernel]),
+            value,
+        )),
+        geometry: PatchGeometry::affine((1, 1), (pad, pad, pad, pad)),
+        identity: false,
+        output_shape,
+        input_shape: (in_c, oh, ow),
+        unstable_idx: None,
+    };
+    PatchesLinearBounds {
+        row_count: rows,
+        lower_a: side(fill),
+        lower_b: Array1::from_elem(rows, -fill),
+        upper_a: side(fill + 0.5),
+        upper_b: Array1::from_elem(rows, fill),
+    }
+}
+
+/// Shape check-first, yolo_2023 `Conv_5` (audit N6): the real residual-join
+/// carriers — `[16,52,52,3,7,7]` pad 3 and `[16,52,52,3,3,3]` pad 1, each with
+/// a 43,264-row coefficient error — merge NATIVELY under a live hard deadline,
+/// in both arrival orders. The native receipt is ~294 MiB; the Dense promotion
+/// it replaces asked ~22.5 GB of a ~12 GB budget.
+#[ntest::timeout(300000)]
+#[test]
+fn hard_live_deadline_merges_yolo_conv5_residual_carriers_natively() {
+    assert_patches_finite_expiry_armed();
+    crate::tests::with_crown_dense_budget_mb("1024", || {
+        let live = Instant::now() + Duration::from_secs(600);
+        let wide = || residual_branch_carrier((16, 52, 52), 3, 7, 3, 0.01);
+        let narrow = || residual_branch_carrier((16, 52, 52), 3, 3, 1, 0.02);
+        // Build each arrival order only when it runs: one full-size pair is
+        // ~60 MB and the merge's own transient peak ~300 MB.
+        for wide_is_pending in [true, false] {
+            let (pending, incoming) = if wide_is_pending {
+                (wide(), narrow())
+            } else {
+                (narrow(), wide())
+            };
+            let merged = merged_patches(true, pending, incoming, Some(live), true);
+            for side in [&merged.lower_a, &merged.upper_a] {
+                assert_eq!(
+                    side.patches
+                        .as_ref()
+                        .expect("merged carrier stores patches")
+                        .shape(),
+                    &[16, 52, 52, 3, 7, 7]
+                );
+                assert_eq!(side.geometry, PatchGeometry::affine((1, 1), (3, 3, 3, 3)));
+                assert_eq!(
+                    side.coeff_err
+                        .as_ref()
+                        .expect("merge carries a certified error")
+                        .len(),
+                    43_264
+                );
+            }
+            // The 3x3 kernel lands on the centre taps of the padded 7x7 window:
+            // there the lower relation holds the outward-rounded sum, off the
+            // centre the wide carrier alone (outward-rounded against zero).
+            let lower = merged.lower_a.patches.as_ref().expect("lower patches");
+            let exact_centre = f64::from(0.01_f32) + f64::from(0.02_f32);
+            assert!(f64::from(lower[[5, 10, 20, 1, 3, 3]]) <= exact_centre);
+            assert!(f64::from(lower[[5, 10, 20, 1, 3, 3]]) > 0.029);
+            assert!(f64::from(lower[[5, 10, 20, 1, 0, 0]]) <= f64::from(0.01_f32));
+            assert!(f64::from(lower[[5, 10, 20, 1, 0, 0]]) > 0.0099);
+        }
+    });
+}
+
+/// Shape check-first, yolo_2023 `Add_8` (audit N6): a PENDING virtual identity
+/// (the skip branch) joined by a 6-D 5x5 pad-2 carrier (the two-conv branch).
+/// The identity must materialize at the same rank (`[C,H,W,C,1,1]`,
+/// `bounds/patches/types.rs` `try_materialize_identity`) and pad to 5x5, so the
+/// join stays native under a live hard deadline, in both arrival orders.
+/// Channels reduced to 4; spatial size and pad/kernel geometry are the real ones.
+#[ntest::timeout(120000)]
+#[test]
+fn hard_live_deadline_merges_add8_identity_with_padded_carrier_natively() {
+    assert_patches_finite_expiry_armed();
+    crate::tests::with_crown_dense_budget_mb("256", || {
+        let live = Instant::now() + Duration::from_secs(600);
+        let identity = || PatchesLinearBounds::identity((4, 52, 52), (4, 52, 52));
+        let branch = || residual_branch_carrier((4, 52, 52), 4, 5, 2, 0.01);
+        for (pending, incoming) in [(identity(), branch()), (branch(), identity())] {
+            let merged = merged_patches(true, pending, incoming, Some(live), true);
+            for side in [&merged.lower_a, &merged.upper_a] {
+                assert!(!side.identity, "the merged join is an explicit carrier");
+                assert_eq!(
+                    side.patches
+                        .as_ref()
+                        .expect("merged carrier stores patches")
+                        .shape(),
+                    &[4, 52, 52, 4, 5, 5]
+                );
+                assert_eq!(side.geometry, PatchGeometry::affine((1, 1), (2, 2, 2, 2)));
+            }
+            // Row (c=1, h=10, w=20): the identity contributes exactly 1 at its
+            // own channel's centre tap and nothing elsewhere.
+            let lower = merged.lower_a.patches.as_ref().expect("lower patches");
+            let upper = merged.upper_a.patches.as_ref().expect("upper patches");
+            let exact_lower = 1.0 + f64::from(0.01_f32);
+            let exact_upper = 1.0 + f64::from(0.51_f32);
+            assert!(f64::from(lower[[1, 10, 20, 1, 2, 2]]) <= exact_lower);
+            assert!(f64::from(lower[[1, 10, 20, 1, 2, 2]]) > 1.0);
+            assert!(f64::from(upper[[1, 10, 20, 1, 2, 2]]) >= exact_upper);
+            assert!(f64::from(upper[[1, 10, 20, 1, 2, 2]]) < 1.52);
+            assert!(f64::from(lower[[1, 10, 20, 0, 2, 2]]) <= f64::from(0.01_f32));
+            assert!(f64::from(upper[[1, 10, 20, 0, 2, 2]]) >= f64::from(0.51_f32));
         }
     });
 }
 
 #[test]
-/// #4382 regression: merge_crown with incompatible patches (different stride)
-/// promotes to Dense without panicking.
+/// Regression: merge_crown with incompatible patches (different stride) promotes
+/// to Dense without panicking.
 fn test_crown_merge_accumulator_merge_crown_incompatible_patches_promotes_dense_4382() {
     let _env = crate::tests::lock_env_shared();
     use crate::bounds::patches::PatchesData;
@@ -734,7 +1197,7 @@ fn test_crown_merge_accumulator_merge_crown_incompatible_patches_promotes_dense_
 }
 
 #[test]
-/// #4382 regression: merge_crown with mixed Dense+Patches promotes to Dense.
+/// Regression: merge_crown with mixed Dense+Patches promotes to Dense.
 fn test_crown_merge_accumulator_merge_crown_mixed_dense_patches_promotes_4382() {
     // Excluded from overlapping an env WRITER. `NY_DENSE_BUDGET_MB` is read
     // process-globally by `crown_memory::explicit_cpu_crown_dense_budget_bytes`;
@@ -836,8 +1299,8 @@ fn expired_merge_preserves_pending_anchored_patches_in_both_stores() {
     // Excluded from overlapping an env WRITER. Siblings in THIS FILE set
     // NY_DENSE_BUDGET_MB=0; an unguarded reader that races one sees
     // `budget_bytes: 0` in CrownMergeAccumulator staging. Every reader here
-    // is guarded as a class -- three had already failed one at a time
-    // (2026-08-19, 2026-08-20 x2), each printing the leaked value verbatim.
+    // is guarded as a class -- three had already failed one at a time, each
+    // printing the leaked value verbatim.
     let _env = crate::tests::lock_env_shared();
     let expired = Instant::now()
         .checked_sub(Duration::from_millis(1))
@@ -876,8 +1339,8 @@ fn expired_frontier_snapshot_is_atomic_for_anchored_patches() {
     // Excluded from overlapping an env WRITER. Siblings in THIS FILE set
     // NY_DENSE_BUDGET_MB=0; an unguarded reader that races one sees
     // `budget_bytes: 0` in CrownMergeAccumulator staging. Every reader here
-    // is guarded as a class -- three had already failed one at a time
-    // (2026-08-19, 2026-08-20 x2), each printing the leaked value verbatim.
+    // is guarded as a class -- three had already failed one at a time, each
+    // printing the leaked value verbatim.
     let _env = crate::tests::lock_env_shared();
     let expired = Instant::now()
         .checked_sub(Duration::from_millis(1))
@@ -1043,8 +1506,8 @@ fn expired_take_preserves_f64_sidecar_for_later_publication() {
     // Excluded from overlapping an env WRITER. Siblings in THIS FILE set
     // NY_DENSE_BUDGET_MB=0; an unguarded reader that races one sees
     // `budget_bytes: 0` in CrownMergeAccumulator staging. Every reader here
-    // is guarded as a class -- three had already failed one at a time
-    // (2026-08-19, 2026-08-20 x2), each printing the leaked value verbatim.
+    // is guarded as a class -- three had already failed one at a time, each
+    // printing the leaked value verbatim.
     let _env = crate::tests::lock_env_shared();
     let expired = Instant::now()
         .checked_sub(Duration::from_millis(1))

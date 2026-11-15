@@ -60,7 +60,7 @@ class TestAcasXuBaseline:
 
     def test_ny_binary_exists(self):
         """Verify ny binary is built."""
-        assert NY_BINARY.exists(), "Build ny first: cargo build --release"
+        assert NY_BINARY.exists(), "Build ny first: targo --unverified build --release"
 
     def test_acasxu_benchmark_exists(self):
         """Verify ACAS-Xu benchmark files exist."""

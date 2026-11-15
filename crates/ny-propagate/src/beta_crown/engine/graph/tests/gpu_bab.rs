@@ -29,6 +29,7 @@ fn make_tagged_cached_la(coeff: f32) -> CachedLinearBounds {
         upper_a,
         lower_b,
         upper_b,
+        frontiers: HashMap::new(),
     }
 }
 

@@ -28,7 +28,6 @@ impl BilinearRelaxation {
     /// both A and alpha as intervals simultaneously.
     ///
     /// Reference: auto_LiRPA `operators/linear.py:490-510` (`propagate_A_xy`)
-    /// Design: `designs/2026-03-04-286-attention-bilinear-alternative.md` Approach A
     pub(crate) fn compose_backward_broadcast(
         &self,
         downstream: &crate::BatchedLinearBounds,

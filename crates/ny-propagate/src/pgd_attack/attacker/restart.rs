@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Restart-when-stuck helpers for PGD attack (#4278).
+//! Restart-when-stuck helpers for PGD attack.
 //!
 //! Detects projected no-op updates and resamples fresh points from the input
 //! box when `PgdConfig::restart_when_stuck` is enabled.

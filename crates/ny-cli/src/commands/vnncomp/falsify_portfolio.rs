@@ -66,12 +66,11 @@ const PORTFOLIO_MIN_BUDGET: Duration = Duration::from_millis(800);
 
 /// Whether the portfolio lane is armed.
 ///
-/// PROMOTED 2026-08-23 (#lever-reachability). The paragraph that used to sit
-/// here said it plainly: "Environment only, and deliberately: there is no typed
-/// `attack.*` preset key, so a competition harness (which exports no `NY_*`)
-/// cannot reach this lane at all." That was the defect, not a design — the lane
-/// produces SAT verdicts, which is the half of the score BaB cannot reach, and
-/// it could not be delivered.
+/// PROMOTED 2026-08-23 (#lever-reachability). Before that the lane was reachable
+/// only through the environment, with no typed `attack.*` preset key, so a
+/// competition harness (which exports no `NY_*`) could not reach it at all,
+/// although the lane produces SAT verdicts, the half of the score BaB cannot
+/// reach.
 ///
 /// Now: `NY_FALSIFY_PORTFOLIO` still wins in BOTH directions where present —
 /// exact `"1"` arms, exact `"0"` disarms, any other byte string is a recorded

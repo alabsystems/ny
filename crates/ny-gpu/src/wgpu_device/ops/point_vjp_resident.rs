@@ -67,6 +67,7 @@ use std::sync::{Arc, Mutex};
 
 use ny_core::{GpuCrownLayer, NyError, Result};
 
+use super::super::error_scope::run_gpu_checked_on_device;
 use super::super::WgpuDevice;
 use super::gemm::select_gemm_dispatch;
 use super::resident_weights::WeightForm;
@@ -401,6 +402,37 @@ impl WgpuDevice {
         output_dim: usize,
         input_dim: usize,
     ) -> Result<Arc<PointVjpResidentEntry>> {
+        self.point_vjp_resident_entry_with(key, || {
+            self.build_point_vjp_resident_entry(
+                layers_backward,
+                mask_positions,
+                num_specs,
+                output_dim,
+                input_dim,
+            )
+        })
+    }
+
+    /// [`Self::point_vjp_resident_entry`] with the entry builder passed in.
+    /// Production passes [`Self::build_point_vjp_resident_entry`]; the
+    /// gpu-tests pin passes a real build that also hits a wgpu error, standing
+    /// in for an allocation failure it cannot provoke on demand.
+    ///
+    /// A miss builds the entry inside its OWN wgpu error scope and caches it
+    /// only when that scope is clean. wgpu reports a failed `create_buffer`
+    /// (out of memory, or a size past a device limit) through the error scopes
+    /// and still hands back a buffer handle, so the build returns `Ok` with an
+    /// invalid buffer in it. Building inside the caller's scope alone
+    /// (`crown_point_vjp_batched_resident`'s `run_gpu_checked`) failed that
+    /// call but had already cached the entry, and every later step with the
+    /// same template and K hit it and failed too, until the next
+    /// `clear_crown_working_set`. The caller never runs inside a checked
+    /// transaction, so the nested scope cannot outlive a transaction deadline.
+    fn point_vjp_resident_entry_with(
+        &self,
+        key: PointVjpPlanKey,
+        build: impl FnOnce() -> Result<PointVjpResidentEntry>,
+    ) -> Result<Arc<PointVjpResidentEntry>> {
         {
             let cache = self.point_vjp_resident_plans.lock().map_err(|err| {
                 NyError::InternalError(format!("point-vjp plan cache lock poisoned: {err}"))
@@ -409,12 +441,10 @@ impl WgpuDevice {
                 return Ok(Arc::clone(entry));
             }
         }
-        let entry = Arc::new(self.build_point_vjp_resident_entry(
-            layers_backward,
-            mask_positions,
-            num_specs,
-            output_dim,
-            input_dim,
+        let entry = Arc::new(run_gpu_checked_on_device(
+            &self.device,
+            "point-vjp resident build",
+            build,
         )?);
         let mut cache = self.point_vjp_resident_plans.lock().map_err(|err| {
             NyError::InternalError(format!("point-vjp plan cache lock poisoned: {err}"))
@@ -1025,10 +1055,18 @@ impl WgpuDevice {
 /// The shared cache-map type stored on [`WgpuDevice`].
 pub(crate) type PointVjpResidentPlans = Mutex<HashMap<PointVjpPlanKey, Arc<PointVjpResidentEntry>>>;
 
+// Real-adapter tests (`gpu-tests`). The three oracles that open the UNCHARGED
+// verdict device (`require_verdict_device`) carry the `gpu-tests-uncharged`
+// cfg themselves, with their one private helper. The failed-build cache pin
+// (D10) reads no verdict authority and runs on the plain device in
+// `gpu-tests`, on every real adapter.
 #[cfg(all(test, feature = "gpu-tests"))]
 mod gpu_tests {
     use super::*;
-    use crate::wgpu_device::test_support::{gpu_test_serial_guard, require_verdict_device};
+    #[cfg(feature = "gpu-tests-uncharged")]
+    use crate::wgpu_device::test_support::require_verdict_device;
+    use crate::wgpu_device::test_support::{gpu_test_serial_guard, require_device};
+    #[cfg(feature = "gpu-tests-uncharged")]
     use ny_test_utils::env::ScopedEnvVar;
 
     /// Deterministic xorshift (no dev-dep).
@@ -1150,6 +1188,7 @@ mod gpu_tests {
     /// point-VJP helper also concretizes bounds that its caller discards; armed
     /// C1 correctly refuses that unworded verdict boundary, whereas this test
     /// needs only the pre-concretization coefficients it compares below.
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn uncached_point_vjp_coeff(
         device: &WgpuDevice,
         wide: &[GpuCrownLayer],
@@ -1184,6 +1223,7 @@ mod gpu_tests {
     /// (cache-hit path), for a soundnessbench-shaped conv chain and a
     /// static-activation chain. Also proves the cache builds ONCE.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn resident_vjp_gradients_bit_identical_to_uncached() {
         let _g = gpu_test_serial_guard();
         // This diagnostic compares raw coefficient values and cache behavior,
@@ -1279,6 +1319,7 @@ mod gpu_tests {
     /// overhead); the assert only requires "strictly faster" so adapter noise
     /// can't flake CI — the printed numbers feed the measurement report.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn resident_vjp_soundnessbench_dims_throughput_probe() {
         let _g = gpu_test_serial_guard();
         // This is a raw throughput/bit-identity probe, not an authority oracle.
@@ -1392,6 +1433,7 @@ mod gpu_tests {
     /// bit-identical gradients, and a CONTENT change in the static slab must
     /// key a NEW entry (no stale-slab reuse).
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn resident_vjp_static_activation_and_content_keying() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -1460,5 +1502,113 @@ mod gpu_tests {
         assert_eq!(device.point_vjp_resident_cache_len(), 2);
 
         device.clear_crown_working_set().expect("clear");
+    }
+
+    /// A template whose resident build hit a wgpu error never enters the
+    /// point-VJP cache.
+    ///
+    /// The fault stands in for a `create_buffer` that fails (out of memory, or
+    /// a size past a device limit): wgpu reports it through the error scopes
+    /// and still hands back a handle, so the build returns `Ok` with an
+    /// invalid buffer in the entry. Before the fix the entry was cached inside
+    /// the caller's scope, the step failed, and every later step with the same
+    /// template and K hit the broken entry (its readback copies into the
+    /// invalid staging buffer) until `clear_crown_working_set`. Runs on the
+    /// plain device: this attack-only fold reads no verdict authority.
+    #[test]
+    fn resident_vjp_build_with_gpu_error_is_not_cached() {
+        let _g = gpu_test_serial_guard();
+        let device = require_device();
+        device.clear_crown_working_set().expect("clear");
+
+        let mut rng = Rng(0x7e57_ca5e ^ 0x0bad_f00d);
+        let (layers, mask_positions, output_dim, input_dim, widths) = sb_shaped_template(&mut rng);
+        let k = 4usize;
+        let masks = random_masks(&mut rng, k, &widths);
+        let spec_rows: Vec<f32> = (0..k * output_dim).map(|_| rng.next_f32()).collect();
+        let fold = || {
+            device.crown_point_vjp_batched_resident(
+                &layers,
+                &mask_positions,
+                &masks,
+                &spec_rows,
+                output_dim,
+                input_dim,
+            )
+        };
+        let reference = fold().expect("clean resident fold reference");
+        device
+            .clear_crown_working_set()
+            .expect("clear after the reference");
+
+        let key =
+            WgpuDevice::point_vjp_plan_key(&layers, &mask_positions, k, output_dim, input_dim)
+                .expect("the template is a supported pure chain");
+        let past_limit = device
+            .device
+            .limits()
+            .max_buffer_size
+            .checked_add(4)
+            .expect("max_buffer_size + 4 fits u64");
+        let builds_before = device.point_vjp_resident_build_count();
+        let failed = device.run_gpu_checked("point-vjp resident build fault pin", || {
+            device.point_vjp_resident_entry_with(key, || {
+                let mut entry = device.build_point_vjp_resident_entry(
+                    &layers,
+                    &mask_positions,
+                    k,
+                    output_dim,
+                    input_dim,
+                )?;
+                entry.stage = device.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("point-vjp fault pin: past max_buffer_size"),
+                    size: past_limit,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                Ok(entry)
+            })
+        });
+        let cached_after_failure = device.point_vjp_resident_cache_len();
+        let retry = fold();
+        let cached_after_retry = device.point_vjp_resident_cache_len();
+        let builds = device.point_vjp_resident_build_count() - builds_before;
+        device
+            .clear_crown_working_set()
+            .expect("clear after the pin");
+
+        match &failed {
+            Err(NyError::InternalError(msg)) => assert!(
+                msg.contains("wgpu validation error"),
+                "the build's wgpu error must fail the call: {msg}"
+            ),
+            Err(other) => panic!("expected the build's wgpu validation error, got {other}"),
+            Ok(_) => panic!("a build that hit a wgpu error must not return an entry"),
+        }
+        let retry = retry.unwrap_or_else(|e| {
+            panic!(
+                "the same template must build clean after a failed build (entries cached \
+                 by the failed build: {cached_after_failure}): {e}"
+            )
+        });
+        assert_eq!(
+            cached_after_failure, 0,
+            "a build that hit a wgpu error must not enter the point-VJP cache"
+        );
+        assert_eq!(
+            cached_after_retry, 1,
+            "the clean retry builds and caches one entry"
+        );
+        assert_eq!(builds, 2, "the failed build plus the clean rebuild");
+        let bits = |g: &Vec<Vec<f32>>| -> Vec<Vec<u32>> {
+            g.iter()
+                .map(|v| v.iter().map(|x| x.to_bits()).collect())
+                .collect()
+        };
+        assert_eq!(
+            bits(&retry),
+            bits(&reference),
+            "the rebuilt entry must be bit-identical to a clean build"
+        );
     }
 }

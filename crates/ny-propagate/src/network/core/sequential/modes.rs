@@ -25,6 +25,7 @@ impl Network {
     /// Create a copy of this network with forward mode enabled for all
     /// normalization layers that share `LayerNormCrownMode`.
     #[deprecated(
+        since = "0.1.0",
         note = "use set_layernorm_forward_mode() instead — it returns the count of layers modified"
     )]
     pub fn with_layernorm_forward_mode(mut self, enabled: bool) -> Self {
@@ -55,6 +56,7 @@ impl Network {
 
     /// Create a copy of this network with the specified LayerNorm normalization mode.
     #[deprecated(
+        since = "0.1.0",
         note = "use set_layernorm_norm_mode() instead — it returns the count of layers modified"
     )]
     pub fn with_layernorm_norm_mode(mut self, mode: crate::layers::LayerNormMode) -> Self {
@@ -71,6 +73,7 @@ impl Network {
 
     /// Create a copy of this network with sound GELU relaxations enabled/disabled.
     #[deprecated(
+        since = "0.1.0",
         note = "use set_gelu_sound_mode() instead — it returns the count of layers modified"
     )]
     pub fn with_gelu_sound_mode(mut self, enabled: bool) -> Self {
@@ -87,6 +90,7 @@ impl Network {
 
     /// Create a copy of this network with sound LogSoftmax relaxations enabled/disabled.
     #[deprecated(
+        since = "0.1.0",
         note = "use set_logsoftmax_sound_mode() instead — it returns the count of layers modified"
     )]
     pub fn with_logsoftmax_sound_mode(mut self, enabled: bool) -> Self {
@@ -103,6 +107,7 @@ impl Network {
 
     /// Create a copy of this network with sound Softmax relaxations enabled/disabled.
     #[deprecated(
+        since = "0.1.0",
         note = "use set_softmax_sound_mode() instead — it returns the count of layers modified"
     )]
     pub fn with_softmax_sound_mode(mut self, enabled: bool) -> Self {
@@ -119,6 +124,7 @@ impl Network {
 
     /// Create a copy of this network with sound CausalSoftmax relaxations enabled/disabled.
     #[deprecated(
+        since = "0.1.0",
         note = "use set_causal_softmax_sound_mode() instead — it returns the count of layers modified"
     )]
     pub fn with_causal_softmax_sound_mode(mut self, enabled: bool) -> Self {
@@ -135,6 +141,7 @@ impl Network {
 
     /// Create a copy of this network with conservative Sin relaxations enabled/disabled.
     #[deprecated(
+        since = "0.1.0",
         note = "use set_sin_sound_mode() instead — it returns the count of layers modified"
     )]
     pub fn with_sin_sound_mode(mut self, enabled: bool) -> Self {
@@ -151,6 +158,7 @@ impl Network {
 
     /// Create a copy of this network with conservative Cos relaxations enabled/disabled.
     #[deprecated(
+        since = "0.1.0",
         note = "use set_cos_sound_mode() instead — it returns the count of layers modified"
     )]
     pub fn with_cos_sound_mode(mut self, enabled: bool) -> Self {

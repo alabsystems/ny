@@ -16,8 +16,6 @@
 //! The distributional objective and gradient enable future integration with
 //! the alpha-CROWN optimization loop (`alpha_crown_loop.rs`) to optimize
 //! relaxation slopes for distributional tightness instead of worst-case.
-//!
-//! Part of #3921 / #4249.
 
 use ndarray::{Array1, Array2, ArrayD, IxDyn};
 use ny_core::{NyError, Result};

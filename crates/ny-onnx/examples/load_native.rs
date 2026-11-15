@@ -4,7 +4,7 @@
 
 //! Example: Load a model from native format (PyTorch/SafeTensors) without ONNX export.
 //!
-//! Usage: cargo run --example load_native --features pytorch -- <model_path>
+//! Usage: targo --unverified run --example load_native --features pytorch -- <model_path>
 
 use ny_onnx::native::NativeModel;
 use std::env;

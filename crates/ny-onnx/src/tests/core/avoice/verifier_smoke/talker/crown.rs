@@ -18,8 +18,6 @@ use std::sync::Arc;
 /// which has distinct routing from the IBP path: it enters graph alpha/CROWN
 /// dispatch, can mutate `actual_method` on fallback, and is the verifier-owned
 /// route that later avoice property-verification packets depend on.
-///
-/// Part of #3701.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
 #[cfg(feature = "external-avoice")]
@@ -38,8 +36,8 @@ fn test_avoice_talker_softmax_range_crown_verifier_smoke_3701() {
         "talker softmax CROWN verifier smoke",
     );
 
-    // #3701: CROWN used to fall back to IBP because backward_sqrt_node wrapped
-    // UnsupportedConfiguration in InvalidSpec (#3619). Fix (#3840, 035d13c7d)
+    // CROWN used to fall back to IBP because backward_sqrt_node wrapped
+    // UnsupportedConfiguration in InvalidSpec. The fix
     // preserves structured errors so CROWN-IBP falls back gracefully.
 
     talker_verifier::assert_softmax_verifier_result(
@@ -121,10 +119,10 @@ fn diagnose_certify_vs_verify(verify_result: &VerificationResult, cert: &BoundCe
     );
 }
 
-/// Comparison harness for #4219: run both `verify_graph(...)` and
+/// Comparison harness: run both `verify_graph(...)` and
 /// `certify_graph_bounds(...)` on the same short-seq talker softmax graph to
 /// distinguish propagation tightness regression from verifier/spec plumbing
-/// regression. Permanent regression pin. Part of #4219.
+/// regression. Permanent regression pin.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
 #[cfg(feature = "external-avoice")]

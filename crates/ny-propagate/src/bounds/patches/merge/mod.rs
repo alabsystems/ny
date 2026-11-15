@@ -6,7 +6,7 @@
 //!
 //! When two branches of a residual connection both carry `PatchesLinearBounds`,
 //! these helpers allow merging them in patches form instead of forcing dense
-//! materialization. This is the key optimization for CNN DAGs (#4382).
+//! materialization. This is the key optimization for CNN DAGs.
 //!
 //! Reference: alpha-beta-CROWN `auto_LiRPA/patches.py:147-171` (`Patches.__add__`)
 
@@ -309,6 +309,116 @@ impl PatchesLinearBounds {
     ///
     /// Reference: alpha-beta-CROWN `patches.py:147-171` (`Patches.__add__`)
     pub(crate) fn try_merge_inplace(&mut self, other: &Self) -> Result<bool> {
+        let Some((lower_padding, upper_padding)) = self.native_merge_paddings(other)? else {
+            return Ok(false);
+        };
+
+        let (other_lower, other_upper) = materialize_pair_cloned(other)?;
+        let (mut self_lower, mut self_upper) = self.take_or_materialize_pair()?;
+
+        if !try_merge_patches_pair(
+            &mut self_lower,
+            &other_lower,
+            lower_padding,
+            &mut self_upper,
+            &other_upper,
+            upper_padding,
+        ) {
+            self.lower_a = self_lower;
+            self.upper_a = self_upper;
+            return Ok(false);
+        }
+
+        self.lower_a = self_lower;
+        self.upper_a = self_upper;
+        self.lower_b = outward_round_add_lower_1d(&self.lower_b, &other.lower_b);
+        self.upper_b = outward_round_add_upper_1d(&self.upper_b, &other.upper_b);
+        Ok(true)
+    }
+
+    /// Upper bound on the bytes [`Self::try_merge_inplace`] holds live at its
+    /// transient peak, or `None` when that merge would decline (`Ok(false)`)
+    /// before allocating anything — or would fail to materialize a virtual
+    /// identity side.
+    ///
+    /// The native merge is not cooperatively pollable and allocates without a
+    /// fallible check: `materialize_pair_cloned`, `pad_patches_if_needed` and
+    /// the `outward_round_add_*` helpers all use infallible ndarray
+    /// allocation. A hard finite-authority caller therefore charges this
+    /// receipt against its memory budget BEFORE entering the merge
+    /// (#patches-merge-expiry, `CrownMergeAccumulator`).
+    ///
+    /// Let `S` be the largest element count any one coefficient side reaches
+    /// after identity materialization and padding reconciliation. Per side
+    /// (lower or upper), the peak inside `try_merge_patches_pair` holds at once:
+    /// the receiver's own coefficients (<= S), the peer's borrowed original
+    /// (<= S), the peer's owned clone (<= S), the two padded copies (2 S) and
+    /// the rounded sum (S) — at most `6 S`, so `12 S` for both sides. Row
+    /// vectors (biases and certified coefficient errors of receiver, peer, the
+    /// peer clone and both results) are bounded by `16 R` with `R` the longest
+    /// row vector. Overflow saturates, which refuses.
+    ///
+    /// Shares the preflight with `try_merge_inplace` (`native_merge_paddings`)
+    /// so the receipt can never describe a merge the operator would not run.
+    pub(crate) fn native_merge_peak_bytes(&self, other: &Self) -> Result<Option<usize>> {
+        /// Coefficient-side multiple; see the derivation above.
+        const SIDE_MULTIPLE: usize = 12;
+        /// Row-vector multiple; see the derivation above.
+        const ROW_VECTOR_MULTIPLE: usize = 16;
+
+        let Some((lower_padding, upper_padding)) = self.native_merge_paddings(other)? else {
+            return Ok(None);
+        };
+        // A virtual identity the merge would have to materialize but cannot
+        // (non-unit geometry, or a seed whose input shape already names a later
+        // operator's input) makes `try_merge_inplace` ERROR, not decline. Report
+        // it as "no native merge" so a hard-authority caller keeps its legacy
+        // route for that carrier instead of inheriting a new failure mode.
+        if [&self.lower_a, &self.upper_a, &other.lower_a, &other.upper_a]
+            .into_iter()
+            .any(|side| side.identity && side.validate_identity_geometry().is_err())
+        {
+            return Ok(None);
+        }
+        let side_elements = [
+            padded_side_elements(&self.lower_a, lower_padding),
+            padded_side_elements(&other.lower_a, lower_padding),
+            padded_side_elements(&self.upper_a, upper_padding),
+            padded_side_elements(&other.upper_a, upper_padding),
+        ]
+        .into_iter()
+        .fold(0usize, |largest, elements| {
+            largest.max(elements.unwrap_or(usize::MAX))
+        });
+        let row_vector_elements = [
+            Some(self.row_count),
+            Some(self.lower_b.len()),
+            Some(self.upper_b.len()),
+            Some(other.lower_b.len()),
+            Some(other.upper_b.len()),
+            self.lower_a.coeff_err.as_ref().map(Array1::len),
+            self.upper_a.coeff_err.as_ref().map(Array1::len),
+            other.lower_a.coeff_err.as_ref().map(Array1::len),
+            other.upper_a.coeff_err.as_ref().map(Array1::len),
+        ]
+        .into_iter()
+        .flatten()
+        .max()
+        .unwrap_or(0);
+        let elements = side_elements
+            .saturating_mul(SIDE_MULTIPLE)
+            .saturating_add(row_vector_elements.saturating_mul(ROW_VECTOR_MULTIPLE));
+        Ok(Some(elements.saturating_mul(size_of::<f32>())))
+    }
+
+    /// Shared preflight for [`Self::try_merge_inplace`] and
+    /// [`Self::native_merge_peak_bytes`]: authenticate both carriers and return
+    /// the reconciled `(lower, upper)` paddings, or `None` when the native merge
+    /// must decline before any allocation or receiver mutation.
+    fn native_merge_paddings(
+        &self,
+        other: &Self,
+    ) -> Result<Option<((usize, usize, usize, usize), (usize, usize, usize, usize))>> {
         // Authenticate both dual-side carriers before inspecting the affine
         // representation or reconciling padding.  Besides guaranteeing that
         // lower/upper use one exact map, this rejects malformed affine
@@ -340,10 +450,10 @@ impl PatchesLinearBounds {
                 .require_affine("Patches upper merge peer")
                 .is_err()
         {
-            return Ok(false);
+            return Ok(None);
         }
         if !self.check_merge_compatibility(other) {
-            return Ok(false);
+            return Ok(None);
         }
 
         let self_lower_geometry = self
@@ -367,37 +477,16 @@ impl PatchesLinearBounds {
             other_lower_geometry.padding(),
         ) {
             Some(p) => p,
-            None => return Ok(false),
+            None => return Ok(None),
         };
         let upper_padding = match reconcile_padding(
             self_upper_geometry.padding(),
             other_upper_geometry.padding(),
         ) {
             Some(p) => p,
-            None => return Ok(false),
+            None => return Ok(None),
         };
-
-        let (other_lower, other_upper) = materialize_pair_cloned(other)?;
-        let (mut self_lower, mut self_upper) = self.take_or_materialize_pair()?;
-
-        if !try_merge_patches_pair(
-            &mut self_lower,
-            &other_lower,
-            lower_padding,
-            &mut self_upper,
-            &other_upper,
-            upper_padding,
-        ) {
-            self.lower_a = self_lower;
-            self.upper_a = self_upper;
-            return Ok(false);
-        }
-
-        self.lower_a = self_lower;
-        self.upper_a = self_upper;
-        self.lower_b = outward_round_add_lower_1d(&self.lower_b, &other.lower_b);
-        self.upper_b = outward_round_add_upper_1d(&self.upper_b, &other.upper_b);
-        Ok(true)
+        Ok(Some((lower_padding, upper_padding)))
     }
 
     fn check_merge_compatibility(&self, other: &Self) -> bool {
@@ -865,6 +954,43 @@ pub(super) fn reconcile_padding(
     } else {
         None
     }
+}
+
+/// Element count one coefficient side occupies inside the native merge after
+/// identity materialization and padding reconciliation to `target`.
+///
+/// Mirrors `try_materialize_identity` (a virtual identity becomes the 6-D
+/// `[out_c, out_h, out_w, in_c, 1, 1]` tensor) and `pad_patches_if_needed`
+/// (the two trailing kernel axes grow by the padding delta). `None` means the
+/// count overflows or the side is not in the affine form the preflight
+/// admitted; the receipt treats that as unbounded, which refuses.
+fn padded_side_elements(side: &PatchesData, target: (usize, usize, usize, usize)) -> Option<usize> {
+    let current = side
+        .geometry
+        .require_affine("Patches merge receipt")
+        .ok()?
+        .padding();
+    let mut shape: Vec<usize> = if side.identity {
+        let (out_c, out_h, out_w) = side.output_shape;
+        vec![out_c, out_h, out_w, side.input_shape.0, 1, 1]
+    } else {
+        side.patches.as_ref()?.shape().to_vec()
+    };
+    let ndim = shape.len();
+    if ndim < 2 {
+        return None;
+    }
+    let grow_h = target
+        .2
+        .checked_sub(current.2)?
+        .checked_add(target.3.checked_sub(current.3)?)?;
+    let grow_w = target
+        .0
+        .checked_sub(current.0)?
+        .checked_add(target.1.checked_sub(current.1)?)?;
+    shape[ndim - 2] = shape[ndim - 2].checked_add(grow_h)?;
+    shape[ndim - 1] = shape[ndim - 1].checked_add(grow_w)?;
+    checked_shape_product(&shape)
 }
 
 fn pad_patches_if_needed(

@@ -4,7 +4,7 @@
 
 //! Helper functions for backward CROWN dispatch.
 //!
-//! Extracted from `dispatch.rs` to stay under the 500-line file limit (#3424).
+//! Extracted from `dispatch.rs` to stay under the 500-line file limit.
 
 use std::borrow::Cow;
 use std::time::Instant;
@@ -20,7 +20,7 @@ use super::types::{BackwardDispatchResult, DispatchContext};
 
 /// Preserve structured error types (ShapeMismatch, UnsupportedOp, etc.) so callers
 /// can match on them for IBP fallback. Only wrap unstructured errors in InvalidSpec.
-/// #3602: Without this, ShapeMismatch from complex DAG topologies is wrapped in
+/// Without this, ShapeMismatch from complex DAG topologies is wrapped in
 /// InvalidSpec, preventing the CROWN-IBP catch from falling back to IBP.
 /// #conv-crown-oom: CpuMemoryExceeded (the Conv2d backward per-buffer memory-cap
 /// backstop) must likewise stay structured — every CROWN-IBP / spec-root catch site
@@ -64,7 +64,7 @@ pub(super) fn resolve_input_bounds<'a>(
     }
 }
 
-/// Engine-aware convolution dispatch helper (#3598).
+/// Engine-aware convolution dispatch helper.
 ///
 /// Threads `GemmEngine` for GPU acceleration instead of going through the
 /// `BoundPropagation` trait (which discards engine). The closure receives the
@@ -187,7 +187,7 @@ mod tests {
         );
     }
 
-    /// Companion control (#3602): ShapeMismatch is likewise preserved.
+    /// Companion control: ShapeMismatch is likewise preserved.
     #[test]
     fn preserve_keeps_shape_mismatch_structured() {
         let e = NyError::ShapeMismatch {

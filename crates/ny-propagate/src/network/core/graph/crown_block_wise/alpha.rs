@@ -6,8 +6,6 @@
 //!
 //! Uses per-neuron coordinate descent to optimize GELU alpha parameters
 //! within each transformer block for tighter lower bounds.
-//!
-//! Part of #3221 Phase 4, #3447.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -33,8 +31,6 @@ impl GraphNetwork {
     ///
     /// The objective is `sum_of_widths` (sum of upper - lower across all output
     /// dimensions), which is differentiable and decomposable across neurons.
-    ///
-    /// Part of #3221 Phase 4.
     pub fn propagate_alpha_crown_block_wise(
         &self,
         input: &BoundedTensor,
@@ -43,7 +39,7 @@ impl GraphNetwork {
         self.propagate_alpha_crown_block_wise_internal(input, epsilon, None, None)
     }
 
-    /// Engine-aware variant of `propagate_alpha_crown_block_wise` (#3597).
+    /// Engine-aware variant of `propagate_alpha_crown_block_wise`.
     pub fn propagate_alpha_crown_block_wise_with_engine(
         &self,
         input: &BoundedTensor,
@@ -60,6 +56,7 @@ impl GraphNetwork {
         engine: Option<&dyn GemmEngine>,
         deadline: Option<Instant>,
     ) -> Result<BlockWiseCrownResult> {
+        self.ensure_proof_eligible()?;
         let exec_order = self.exec_order()?;
         let block_nodes = Self::collect_block_nodes(exec_order);
 
@@ -102,7 +99,7 @@ impl GraphNetwork {
             );
             let (crown_max_width, crown_successful) = match crown_result {
                 Ok((bounds, _stats, provenance)) => {
-                    // #4256: derive success from provenance, not from Ok(_).
+                    // Derive success from provenance, not from Ok(_).
                     (bounds.max_width(), !provenance.is_fallback())
                 }
                 Err(e) => {
@@ -190,6 +187,8 @@ impl GraphNetwork {
         block_name: &str,
         engine: Option<&dyn GemmEngine>,
     ) -> Result<Option<f32>> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::AlphaOpt);
         let alpha_candidates: &[f32] = &[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
         let max_sweeps = 3;
 
@@ -217,7 +216,7 @@ impl GraphNetwork {
                     .cloned()
                     .unwrap_or_else(|| Array1::from_elem(*dim, 0.5_f32));
 
-                let mut neuron_best_alphas = alphas.clone();
+                let mut neuron_best_alphas = alphas;
                 for neuron_idx in 0..*dim {
                     let current_alpha = neuron_best_alphas[neuron_idx];
                     let mut best_neuron_sum = best_sum_width;

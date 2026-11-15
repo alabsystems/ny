@@ -33,7 +33,7 @@ impl InstanceNorm1dLayer {
             )));
         }
 
-        // f64 accumulation to avoid catastrophic cancellation (#3325)
+        // f64 accumulation to avoid catastrophic cancellation
         let n = t as f64;
         let mean = x.iter().map(|&xi| xi as f64).sum::<f64>() / n;
         let var = x
@@ -97,7 +97,7 @@ impl InstanceNorm1dLayer {
             )));
         }
 
-        // f64 accumulation to avoid catastrophic cancellation in Jacobian (#3325)
+        // f64 accumulation to avoid catastrophic cancellation in Jacobian
         let nf = t as f64;
         let mean = x.iter().map(|&xi| xi as f64).sum::<f64>() / nf;
         let var = x

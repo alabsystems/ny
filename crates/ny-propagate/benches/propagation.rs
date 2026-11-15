@@ -4,7 +4,7 @@
 
 //! Criterion benchmarks for ny bound propagation
 //!
-//! Run with: cargo bench -p ny-propagate
+//! Run with: targo --unverified bench -p ny-propagate
 //! HTML reports: target/criterion/report/index.html
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};

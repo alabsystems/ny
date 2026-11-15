@@ -14,7 +14,7 @@ const F32_INT_EXACT_LIMIT: i64 = 1 << 24; // 16_777_216
 
 /// Convert a SafeTensors tensor view to an f32 ndarray.
 ///
-/// Returns an error for unsupported dtypes or shape/data mismatches (#2900).
+/// Returns an error for unsupported dtypes or shape/data mismatches.
 pub(crate) fn tensor_view_to_f32_array(
     view: &TensorView<'_>,
     shape: &[usize],
@@ -125,7 +125,7 @@ fn convert_i32(data: &[u8]) -> Vec<f32> {
 /// Convert IEEE 754 half-precision (f16) to f32.
 ///
 /// Delegates to the `half` crate for correctness, eliminating divergence
-/// between hand-rolled and crate implementations (#2772).
+/// between hand-rolled and crate implementations.
 #[inline]
 pub fn half_to_f32(bits: u16) -> f32 {
     half::f16::from_bits(bits).to_f32()

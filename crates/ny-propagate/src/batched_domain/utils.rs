@@ -92,7 +92,7 @@ pub(super) fn stack_arrays_pooled(arrays: &[ArrayD<f32>]) -> Result<PooledArray>
 ///
 /// Returns `Err(NumericalInstability)` if any lower or upper bound is NaN or infinite.
 /// This guard prevents corrupted values from reaching sort ordering, branch selection,
-/// and stability classification (#2246).
+/// and stability classification.
 pub(super) fn validate_global_bounds_finite(
     lower_bounds: &[f32],
     upper_bounds: &[f32],
@@ -112,7 +112,7 @@ pub(super) fn validate_global_bounds_finite(
 ///
 /// Treats axis 0 as the batch dimension. When `keep_mask` is `Some`, only
 /// rows where `keep_mask[i] == true` are validated — dropped rows may contain
-/// non-finite values without triggering an error (#3115).
+/// non-finite values without triggering an error.
 ///
 /// Returns `Err(NumericalInstability)` if any validated element is NaN or infinite.
 pub(super) fn validate_batched_tensor_finite(
@@ -145,7 +145,7 @@ pub(super) fn validate_batched_tensor_finite(
 ///
 /// Calls [`validate_batched_tensor_finite`] for every entry in the map,
 /// encoding the layer name and `bound_kind` (e.g. "lower"/"upper") in the
-/// field name for diagnostics (#3115).
+/// field name for diagnostics.
 pub(super) fn validate_named_batched_tensors_finite(
     tensors: &std::collections::HashMap<String, ArrayD<f32>>,
     context: &str,
@@ -192,7 +192,7 @@ pub(super) fn validate_node_bounds_override_finite(
 /// Reject non-finite (NaN/Inf) values in queued per-domain node-bounds overrides.
 ///
 /// When `keep_mask` is `Some`, only kept metadata entries are validated so dropped
-/// rows can still carry debugging/corrupted data without blocking `add()` (#3115).
+/// rows can still carry debugging/corrupted data without blocking `add()`.
 pub(super) fn validate_metadata_node_bounds_overrides_finite(
     metadata: &[DomainMetadata],
     context: &str,
@@ -239,7 +239,7 @@ pub(super) fn unstable_mask_from_bounds(
     for (l, u) in lower.iter().zip(upper.iter()) {
         // NaN bounds are conservatively classified as unstable — without this,
         // both NaN < 0 and NaN > 0 return false, causing NaN-bounded neurons
-        // to appear stable and preventing necessary branching (#2246).
+        // to appear stable and preventing necessary branching.
         data.push((*l < 0.0 && *u > 0.0) || l.is_nan() || u.is_nan());
     }
 

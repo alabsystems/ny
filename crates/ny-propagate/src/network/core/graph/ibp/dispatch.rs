@@ -9,9 +9,6 @@
 //! provides its own input resolution strategy via a closure; the dispatch
 //! logic here handles layer arity detection, Concat constant_inputs
 //! interleaving, and propagation method selection.
-//!
-//! Design: `designs/2026-03-03-graph-ibp-dispatch-dedup.md`
-//! Issues: #2405, #1948, #1856
 
 use crate::layers::{BoundPropagation, ConcatLayer, Layer};
 
@@ -28,8 +25,6 @@ use super::super::GraphNode;
 ///
 /// Shared by [`resolve_node_inputs`] and `graph_alpha/bounds/ibp.rs` to avoid
 /// duplicating the same arity/first-input classification logic.
-///
-/// Design: Slice B of `designs/2026-03-10-issue-2633-graphnode-accessor-refresh.md`
 pub(crate) enum ResolvedInputNames<'a> {
     /// Single input (most layers, SkipMerge, OpaqueSkip,
     /// Where with embedded constants).
@@ -96,7 +91,6 @@ fn classify_variable_arity_node_inputs<'a>(
 /// **Soundness note:** Concat is checked *before* `is_binary()` because
 /// `Layer::is_binary()` returns true for Concat. Without this ordering,
 /// n-ary Concat (3+ inputs) would silently drop inputs beyond the first two.
-/// See #2405.
 pub(crate) fn classify_node_inputs<'a>(
     node: &'a GraphNode,
     node_name: &str,
@@ -186,7 +180,7 @@ pub(crate) fn classify_node_inputs<'a>(
         Layer::OpaqueSkip(_) => {
             // OpaqueSkip is intentionally opaque: it ignores its inputs' values
             // and emits conservative unbounded bounds shaped like its first input.
-            // Multi-input skipped ops are legal (#2666), so accept >=1 inputs and
+            // Multi-input skipped ops are legal, so accept >=1 inputs and
             // resolve only the first for shape — do NOT require exactly one input.
             let input_name = node.inputs.first().map(String::as_str).ok_or_else(|| {
                 NyError::InvalidSpec(format!("OpaqueSkip node {} has no inputs", node_name))
@@ -248,7 +242,6 @@ pub(crate) enum ResolvedInputs {
 /// **Soundness note:** Concat is checked *before* `is_binary()` because
 /// `Layer::is_binary()` returns true for Concat. Without this ordering,
 /// n-ary Concat (3+ inputs) would silently drop inputs beyond the first two.
-/// See #2405.
 pub(crate) fn resolve_node_inputs<F>(
     node: &GraphNode,
     node_name: &str,
@@ -260,7 +253,6 @@ where
     // Single source of truth: classify arity via classify_node_inputs, then
     // resolve each name to a BoundedTensor. This eliminates the duplicated
     // match block that previously mirrored classify_node_inputs.
-    // Design: designs/2026-03-13-ibp-dispatch-classify-then-resolve.md
     let classified = classify_node_inputs(node, node_name)?;
     match classified {
         ResolvedInputNames::Unary(name) => Ok(ResolvedInputs::Unary(resolve(name)?)),
@@ -403,10 +395,9 @@ where
 /// NaN firewall: check output bounds for NaN and return `NumericalInstability`
 /// error if any element is NaN.
 ///
-/// Single source of truth for NaN policy across all IBP paths (#2706, #2812).
+/// Single source of truth for NaN policy across all IBP paths.
 /// NaN bounds corrupt all downstream nodes and are never valid — this is the
-/// consistent error behavior established by the NaN Strategy design
-/// (`designs/archive/2026-02-25-nan-strategy-unification.md`).
+/// consistent error behavior established by the NaN Strategy design.
 ///
 /// `context` identifies the calling path for diagnostics (e.g., "IBP detailed").
 pub(crate) fn check_nan_firewall(
@@ -481,7 +472,7 @@ where
 /// one node, and still sound because the union contains both operands). It
 /// returns `None` on exactly two causes: a shape mismatch (not expected for two
 /// views of one node) **or** a NaN in any endpoint of either operand
-/// (`ny_tensor::BoundedTensor::intersection_per_element`, #2640 — NaN is
+/// (`ny_tensor::BoundedTensor::intersection_per_element` — NaN is
 /// rejected, never absorbed). On `None` we keep `zono`, matching the prior
 /// unconditional-zonotope behavior.
 ///

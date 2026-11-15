@@ -189,7 +189,7 @@ def main() -> int:
 
     if not NY_BINARY.exists():
         print(f"Error: ny binary not found at {NY_BINARY}")
-        print("Run: cargo build --release -p ny-cli")
+        print("Run: targo --unverified build --release -p ny-cli")
         return 2
 
     print(f"Running {len(instances)} ACAS-Xu instances...")

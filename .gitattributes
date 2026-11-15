@@ -1,0 +1,37 @@
+# Shell scripts must be LF for the Linux VNN-COMP eval server: CRLF makes the
+# kernel see `#!/bin/bash\r` and fail with "bad interpreter". This repo is
+# developed on Windows (core.autocrlf=true), so pin scripts to LF explicitly.
+*.sh text eol=lf
+
+# The same reasoning, and the same failure, applies to every other shebang file.
+# The rule above covers only `*.sh`, but `scripts/ny-safe-gpu-run` carries no
+# extension and tracked `*.py` files may also be executed directly. A trailing
+# `\r` in the interpreter line makes all of them unrunnable on Linux.
+*.py text eol=lf
+scripts/ny-safe-gpu-run text eol=lf
+
+# The historical measured-result bank is byte-bound evidence and uses CRLF.
+# Treat that carriage return as part of the line ending for whitespace checks;
+# do not normalize the files and invalidate their indexed SHA-256 identities.
+reports/measured/*.csv whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+
+# VNN-COMP property files are byte-bound evidence: their SHA-256 identities are
+# asserted against sealed constants (crates/ny-onnx/tests/certified_scalar_moat.rs)
+# and they must match the bytes the competition distributes, which are LF. Under
+# core.autocrlf=true the checkout rewrote them to CRLF, changing every hash and
+# failing the seal on Windows. `-text` disables conversion in both directions.
+*.vnnlib -text
+
+# Vendored third-party sources carry SHA-256 checksums (.cargo-checksum.json).
+# They MUST be stored and checked out byte-for-byte (LF), or cargo rejects the
+# vendored source. `-text` disables all EOL conversion despite core.autocrlf.
+vendor/** -text
+vendor/** linguist-vendored
+
+# The untrusted search kernels' committed image (ENGINE_PROGRAM §1.9): the
+# manifest ratchet hashes the CUDA source and the manifest byte for byte, so
+# they must be LF on every checkout (an autocrlf CRLF copy would read as a
+# stale image), and the fatbin must never be touched by EOL conversion.
+crates/ny-cuda/kernels/*.cu text eol=lf
+crates/ny-cuda/kernels/*.manifest text eol=lf
+crates/ny-cuda/kernels/*.fatbin binary

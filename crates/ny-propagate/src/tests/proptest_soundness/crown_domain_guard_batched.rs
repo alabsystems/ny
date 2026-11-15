@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Batched CROWN backward domain guard rejection tests (#3084).
+//! Batched CROWN backward domain guard rejection tests.
 //!
 //! Mirrors `crown_domain_guard.rs` but exercises `propagate_linear_batched_with_bounds`
 //! instead of `propagate_linear_with_bounds`. Layers with `non_finite_domain_guard`
@@ -12,8 +12,6 @@
 //! branches), so they reject NaN but accept ±Inf and stay sound — covered by
 //! `test_domain_guard_relu_batched_rejects_nan_accepts_inf` and
 //! `test_domain_guard_leaky_relu_batched_rejects_nan_accepts_inf`.
-//!
-//! Part of #3084, #3070, #1696.
 
 use crate::layers::activations::{
     CeluLayer, ClipLayer, EluLayer, HardSigmoidLayer, HardSwishLayer, LeakyReLULayer, MishLayer,

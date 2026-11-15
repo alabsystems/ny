@@ -98,4 +98,3 @@ sat_relu,onnx/sat_v85_c207.onnx,vnnlib/sat_v85_c207.vnnlib,prepared,sat,1.55
 sat_relu,onnx/unsat_v85_c207.onnx,vnnlib/unsat_v85_c207.vnnlib,prepared,unsat,87.25
 sat_relu,onnx/sat_v44_c52.onnx,vnnlib/sat_v44_c52.vnnlib,prepared,sat,0.07
 sat_relu,onnx/unsat_v44_c52.onnx,vnnlib/unsat_v44_c52.vnnlib,prepared,unsat,54.20
-sat_relu,onnx/test_nano.onnx,vnnlib/test_nano.vnnlib,0,unsat,0

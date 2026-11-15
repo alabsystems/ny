@@ -198,7 +198,7 @@ impl GraphDomainAlphaState {
     /// Accumulate gradient for a specific neuron.
     ///
     /// Zero heap allocations: looks up node by `&str`, then neuron by `usize`.
-    /// NaN guard (#3112): skip non-finite gradients to prevent NaN from entering the
+    /// NaN guard: skip non-finite gradients to prevent NaN from entering the
     /// optimizer state.
     pub fn accumulate_grad(&mut self, node_name: &str, neuron_idx: usize, grad: f32) {
         if !grad.is_finite() {
@@ -229,7 +229,7 @@ impl GraphDomainAlphaState {
 
     /// Perform Adam optimizer step for α parameters.
     ///
-    /// Returns the maximum raw gradient magnitude for convergence check (#2416).
+    /// Returns the maximum raw gradient magnitude for convergence check.
     pub fn gradient_step_adam(&mut self, config: &AdaptiveOptConfig, t: usize) -> f32 {
         let lower_max = step_graph_alpha_neuron_maps_adam(&mut self.neurons, config, t);
         let upper_max = step_graph_alpha_neuron_maps_adam(&mut self.upper_neurons, config, t);

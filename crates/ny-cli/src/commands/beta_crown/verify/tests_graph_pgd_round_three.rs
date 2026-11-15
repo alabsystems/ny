@@ -95,7 +95,7 @@ fn graph_pgd_preserve_leading_axis_matches_sequential_flatten_4096() {
 
         // Flatten(0) intentionally drops the synthetic singleton axis from the
         // sample-space output under preserve-leading-axis mode. Compare after
-        // squeezing unit axes so the regression matches the approved #4093 contract.
+        // squeezing unit axes so the regression matches that intended behavior.
         assert_arrays_close(
             &squeeze_unit_axes(batched_lower),
             &squeeze_unit_axes(sequential_output.lower().clone()),

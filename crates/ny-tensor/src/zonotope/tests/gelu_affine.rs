@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Tests for `ZonotopeTensor::gelu_affine()`.
-//! Regression tests for #2470: GELU zonotope must use GELU math, not SiLU.
+//! Regression tests: GELU zonotope must use GELU math, not SiLU.
 
 use super::super::*;
 use ndarray::{arr1, arr2};
@@ -207,7 +207,7 @@ fn test_gelu_affine_nd_recursive() {
     }
 }
 
-/// Regression for follow-up audit after #2470:
+/// Regression from a follow-up audit of the GELU fix:
 /// GELU approximation errors must be independent per element so they cannot
 /// cancel under downstream linear combinations (for example [1, -1] projection).
 #[test]
@@ -295,7 +295,7 @@ fn test_gelu_affine_linear_projection_soundness_2d_independent_error_terms() {
     );
 }
 
-// #2850: Proptest that zonotope GELU (erf) error bounds contain all sampled outputs.
+// Proptest that zonotope GELU (erf) error bounds contain all sampled outputs.
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(256) })]
     #[test]
@@ -355,9 +355,9 @@ proptest! {
     }
 }
 
-// ==================== NaN/Inf safety tests (#2676 Site 2) ====================
+// ==================== NaN/Inf safety tests ====================
 
-/// #2676 Site 2: GELU with very large center should produce finite bounds,
+/// GELU with very large center should produce finite bounds,
 /// not NaN from 0·Inf indeterminate form in the second derivative.
 #[test]
 fn test_gelu_affine_large_center_no_nan_2676() {
@@ -385,7 +385,7 @@ fn test_gelu_affine_large_center_no_nan_2676() {
     );
 }
 
-/// #2676 Site 2: GELU with Inf center should not produce NaN in error bound.
+/// GELU with Inf center should not produce NaN in error bound.
 #[test]
 fn test_gelu_affine_inf_center_no_nan_2676() {
     let values = arr1(&[f32::INFINITY]);
@@ -402,7 +402,7 @@ fn test_gelu_affine_inf_center_no_nan_2676() {
     );
 }
 
-/// #2676 Site 2: GELU with negative Inf center should return 0.
+/// GELU with negative Inf center should return 0.
 #[test]
 fn test_gelu_affine_neg_inf_center_2676() {
     let values = arr1(&[f32::NEG_INFINITY]);
@@ -418,7 +418,7 @@ fn test_gelu_affine_neg_inf_center_2676() {
     );
 }
 
-/// #2676: GELU derivative at ±Inf must not produce NaN.
+/// GELU derivative at ±Inf must not produce NaN.
 /// When error terms exist, the derivative is used as the slope to transform them.
 /// gelu_erf_derivative(+Inf) = 1 (not NaN from Inf·0), gelu_erf_derivative(-Inf) = 0.
 #[test]
@@ -438,7 +438,7 @@ fn test_gelu_affine_inf_center_with_error_erf_2676() {
     );
 }
 
-/// #2676: Same test for tanh variant.
+/// Same test for tanh variant.
 #[test]
 fn test_gelu_affine_inf_center_with_error_tanh_2676() {
     let values = arr1(&[f32::INFINITY]);
@@ -454,7 +454,7 @@ fn test_gelu_affine_inf_center_with_error_tanh_2676() {
     );
 }
 
-/// #2676: GELU derivative at -Inf with error terms.
+/// GELU derivative at -Inf with error terms.
 /// Slope = 0, so error terms should be zeroed out.
 #[test]
 fn test_gelu_affine_neg_inf_center_with_error_2676() {

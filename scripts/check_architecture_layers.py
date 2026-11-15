@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import subprocess
 import sys
 from collections import defaultdict
@@ -44,14 +45,22 @@ def load_policy(path: Path) -> dict:
 
 def get_workspace_graph() -> tuple[set[str], list[dict]]:
     """Return workspace package names and workspace-internal dependency edges."""
-    result = subprocess.run(
-        ["cargo", "metadata", "--format-version", "1", "--no-deps"],
-        capture_output=True,
-        text=True,
-        cwd=REPO_ROOT,
-    )
+    # `$CARGO` when spawned under a build tool (the ny-test-utils python-tools
+    # lane sets it), else targo (owner directive 2026-09-28: the Trust
+    # toolchain; no stock fallback). `metadata` needs no lane flag.
+    cargo = os.environ.get("CARGO") or "targo"
+    try:
+        result = subprocess.run(
+            [cargo, "metadata", "--format-version", "1", "--no-deps"],
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+        )
+    except OSError as error:
+        log.error("could not run %s metadata (set CARGO or put targo on PATH): %s", cargo, error)
+        sys.exit(2)
     if result.returncode != 0:
-        log.error("cargo metadata failed:\n%s", result.stderr)
+        log.error("%s metadata failed:\n%s", cargo, result.stderr)
         sys.exit(2)
 
     meta = json.loads(result.stdout)

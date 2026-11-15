@@ -35,8 +35,6 @@
 //!
 //! # Reference
 //!
-//! - Design: `designs/2026-02-02-gpu-bab-execution-path.md`
-//! - Decomposition: `designs/2026-02-10-code-structure-wave8-domain-list-gpu-bab-split.md`
 //! - Alpha-beta-CROWN: `complete_verifier/branching_domains.py`:87-412
 
 mod batched_gpu;
@@ -47,6 +45,10 @@ mod init;
 mod input_split;
 mod input_split_support;
 mod kfsb;
+pub(crate) mod kfsb_fanout;
+mod kfsb_single_shot;
+#[cfg(test)]
+pub(in crate::beta_crown::engine) use kfsb_single_shot::kfsb_single_shot_calls_for_tests;
 mod metrics;
 mod parent_contexts;
 pub(crate) mod prefilter;
@@ -92,6 +94,38 @@ fn latch_domain_list_eviction(
     }
 }
 
+/// #budget-abandonment FIX A observable, unconditional and at default
+/// verbosity. An ABSENT line means the binary has no lever, so a null measured
+/// on it is VOID rather than negative.
+fn emit_warmup_fallback(
+    armed: bool,
+    tier: Option<super::shared::init::WarmupFallbackTier>,
+    phase_start: Instant,
+    iterative_deadline: Option<Instant>,
+    global_deadline: Option<Instant>,
+    root: Option<(f32, f32)>,
+    threshold: f32,
+) {
+    let now = Instant::now();
+    let cap_s = iterative_deadline.map_or(0.0, |dl| {
+        dl.saturating_duration_since(phase_start).as_secs_f64()
+    });
+    let elapsed_s = now.saturating_duration_since(phase_start).as_secs_f64();
+    let remaining_s =
+        global_deadline.map_or(0.0, |dl| dl.saturating_duration_since(now).as_secs_f64());
+    let root = root.map_or_else(
+        || "[none,none]".to_string(),
+        |(lower, upper)| format!("[{lower},{upper}]"),
+    );
+    eprintln!(
+        "[warmup-fallback] armed={} fired={} tier={} cap_s={cap_s:.1} elapsed_s={elapsed_s:.1} \
+remaining_s={remaining_s:.1} root={root} thr={threshold}",
+        u8::from(armed),
+        u8::from(tier.is_some()),
+        tier.map_or("none", super::shared::init::WarmupFallbackTier::label),
+    );
+}
+
 fn initial_bounds_deadline_status(
     now: Instant,
     iterative_deadline: Option<Instant>,
@@ -122,10 +156,8 @@ impl BetaCrownVerifier {
     /// * `threshold` - Verification threshold
     /// * `engine` - Optional GPU engine for acceleration
     ///
-    /// # Reference
-    /// Design: `designs/2026-02-02-gpu-bab-execution-path.md`
     /// `deadline`: If `Some`, the BaB engine derives its phase budgets from
-    /// remaining wall-clock time instead of `self.config.timeout` (#4321).
+    /// remaining wall-clock time instead of `self.config.timeout`.
     pub fn verify_graph_gpu_domain_list(
         &self,
         graph: &GraphNetwork,
@@ -135,10 +167,22 @@ impl BetaCrownVerifier {
         engine: Option<&dyn GemmEngine>,
         deadline: Option<Instant>,
     ) -> Result<crate::beta_crown::result::BetaCrownResult> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BabLoop);
+        graph.ensure_proof_eligible()?;
         // The input-split IBP pre-screen below may issue a final verdict before
         // `compute_initial_bounds` reaches its own validation.  This public
         // ingress therefore owns the fail-closed configuration check.
         self.config.validate()?;
+        // #la-warm-frontier: one `[la-warm-frontier] lane=domain_list …` line
+        // when this run ends, armed only (a dark run prints nothing).
+        let _la_warm_frontier_line =
+            super::propagation::warm_frontier::WarmFrontierLaneScope::enter(self, "domain_list");
+        // #kfsb-production: one `[kfsb-single-shot] summary lane=domain_list …`
+        // line when this run ends, and the lane's R4 fan-out lease returned;
+        // armed only (a dark run prints nothing and asks nothing).
+        let _kfsb_single_shot_lane =
+            kfsb_fanout::KfsbSingleShotLaneScope::enter(self, "domain_list");
         let graph = self.configured_graph_for_crown(graph);
         let graph = &graph;
         let engine = self.resolve_engine(engine);
@@ -148,7 +192,7 @@ impl BetaCrownVerifier {
             &self.config.branching_heuristic,
             BranchingHeuristic::InputSplit
         );
-        // When a wall-clock deadline is provided (#4321), derive the effective
+        // When a wall-clock deadline is provided, derive the effective
         // timeout from remaining time instead of the configured timeout.
         let pgd_frac = self
             .config
@@ -163,14 +207,46 @@ impl BetaCrownVerifier {
         let _complete_clip_deadline = self.complete_clip_deadline_overrides.scoped(Some(
             GraphBabLifecycle::fail_closed_deadline(now, bab_timeout),
         ));
+        // #lowdim-prover (typed opt-in `bab.branching.input_split.lowdim_prover`):
+        // on a small-input graph, try the sound forward-linear lane FIRST with
+        // half of this BaB slice. It only ever returns a PROOF of
+        // lower(objective · y) > threshold; Unproved/Declined fall through to
+        // the driver below, unchanged, with the time that remains. Skipped in
+        // upper-bound mode, whose verdict predicate the lane does not prove.
+        if is_input_split_mode
+            && self.config.input_split_lowdim_prover
+            && !self.config.verify_upper_bound
+        {
+            let lane_deadline = now + bab_timeout.mul_f32(self.config.lowdim_prover_share());
+            let outcome = crate::lowdim::prove_objective_lower_bound(
+                graph,
+                input,
+                objective,
+                threshold,
+                lane_deadline,
+                &self.config.lowdim_config(),
+            );
+            crate::lowdim::emit_line(0, &outcome);
+            if let crate::lowdim::LowDimOutcome::Verified(stats) = outcome {
+                return Ok(crate::beta_crown::result::BetaCrownResult {
+                    result: BabVerificationStatus::Verified,
+                    domains_explored: usize::try_from(stats.domains).unwrap_or(usize::MAX),
+                    time_elapsed: now.elapsed(),
+                    max_depth_reached: stats.max_depth as usize,
+                    output_bounds: None,
+                    cuts_generated: 0,
+                    domains_verified: usize::try_from(stats.closed).unwrap_or(usize::MAX),
+                });
+            }
+        }
         // Foundational IBP pre-screen + node-bounds bootstrap must reach every
         // node, so they get the full global deadline (not the warmup fraction);
         // capping it choked conv-heavy DAGs into premature "deadline exceeded
-        // before node 'Conv_0'" with budget unused (#4321).
+        // before node 'Conv_0'" with budget unused.
         let initial_deadline = Some(GraphBabLifecycle::fail_closed_deadline(now, bab_timeout));
         // The genuinely-iterative root α-CROWN warmup + spec-guided output
         // optimization is capped at `initial_bounds_fraction` of the BaB budget
-        // (#4095/#4413), mirroring the CPU ReLU-split path. With fraction 0.0 this
+        //mirroring the CPU ReLU-split path. With fraction 0.0 this
         // expires instantly so the alpha warmup bails to a warmup-cap Unknown
         // instead of consuming the whole budget before branching.
         let iterative_deadline = {
@@ -185,7 +261,7 @@ impl BetaCrownVerifier {
             ))
         };
 
-        // IBP root pre-screen (Part of #3870, parity with CPU single_objective.rs:156-176).
+        // IBP root pre-screen (parity with CPU single_objective.rs:156-176).
         //
         // When input_split_ibp_enhancement is enabled, run a cheap IBP pass on the
         // root domain before the expensive alpha-CROWN / CROWN bootstrap. If IBP
@@ -236,9 +312,9 @@ impl BetaCrownVerifier {
         }
 
         // Step 1-2: Compute initial bounds (alpha-CROWN, IBP, or CROWN-IBP)
-        // Thread deadline so α-CROWN bails early if timeout budget exhausted (#2698)
+        // Thread deadline so α-CROWN bails early if timeout budget exhausted
         //
-        // Warmup cap (#2206 Packet C, #4095): initial bounds get at most
+        // Warmup cap: initial bounds get at most
         // `initial_bounds_fraction` of the BaB timeout. Mirrors core.rs pattern.
         let mut init_result = match compute_initial_bounds(
             graph,
@@ -256,6 +332,19 @@ impl BetaCrownVerifier {
                     "DomainList BaB: initial-bound propagation exceeded a deadline after {:.3}s",
                     state.start_time.elapsed().as_secs_f64()
                 );
+                // #budget-abandonment FIX A observable: the cap was hit and no
+                // fallback reached the root. `armed=1 fired=0` here is the
+                // uncovered half of this lane -- an expiry inside the alpha
+                // BOOTSTRAP leaves no collected node bounds to fall back on.
+                emit_warmup_fallback(
+                    self.config.initial_bounds_warmup_fallback,
+                    None,
+                    state.start_time,
+                    iterative_deadline,
+                    initial_deadline,
+                    None,
+                    threshold,
+                );
                 let status = initial_bounds_deadline_status(
                     Instant::now(),
                     iterative_deadline,
@@ -269,7 +358,19 @@ impl BetaCrownVerifier {
             Err(err) => return Err(err),
         };
 
-        // Fix (#4095): compute_initial_bounds stores the warmup deadline in
+        if let Some(tier) = init_result.warmup_fallback_tier {
+            emit_warmup_fallback(
+                true,
+                Some(tier),
+                state.start_time,
+                iterative_deadline,
+                initial_deadline,
+                Some((init_result.root_lower, init_result.root_upper)),
+                threshold,
+            );
+        }
+
+        // Fix: compute_initial_bounds stores the warmup deadline in
         // InputSplitBootstrap.deadline, which then leaks into per-domain BaB
         // CROWN passes. Per-domain passes should use the full bab_timeout,
         // not the warmup fraction.
@@ -315,7 +416,7 @@ impl BetaCrownVerifier {
 
         // Timeout guard: initial bounds computation (alpha-CROWN, IBP) may
         // consume the entire budget for large models. Check before entering
-        // the BaB loop (#2698). Use bab_timeout for PGD reservation (#4095).
+        // the BaB loop. Use bab_timeout for PGD reservation.
         if let Some(result) = state.check_termination(bab_timeout, self.config.max_domains) {
             return Ok(result);
         }
@@ -344,7 +445,7 @@ impl BetaCrownVerifier {
         //
         // For input-split mode, cap the pick batch size to control termination
         // granularity and scheduling overhead. With rayon parallelism in
-        // compute_crown_or_ibp_bounds_batched (Phase 2, #3870), the per-domain
+        // the batched CROWN bound computation, the per-domain
         // CROWN cost is amortized across CPU cores, so the cap is no longer
         // a throughput bottleneck — it just bounds how many domains are processed
         // between termination checks.
@@ -386,7 +487,7 @@ impl BetaCrownVerifier {
         // best-first ordering parity with the CPU BinaryHeap. Without this,
         // newly-split children with high priority sit at the back of the
         // FIFO queue for multiple iterations, causing the GPU path to waste
-        // computation on low-priority domains. Benchmark evidence (#3870):
+        // computation on low-priority domains. Benchmark evidence:
         // 2.3% verification rate at interval=3 vs 22% on CPU heap.
         //
         // ReLU-split mode keeps interval=3 since the GPU batch backward
@@ -400,7 +501,7 @@ impl BetaCrownVerifier {
         while !domain_list.is_empty() {
             latch_domain_list_eviction(&domain_list, &mut state);
 
-            // Check termination conditions (use bab_timeout for PGD reservation #4095)
+            // Check termination conditions (use bab_timeout for PGD reservation)
             if let Some(result) = state.check_termination(bab_timeout, self.config.max_domains) {
                 // #bab-frontier graph lane: the surviving DomainList is exactly
                 // where a CE must live; export the top-K subboxes as attack
@@ -481,7 +582,7 @@ impl BetaCrownVerifier {
                                     let outcome = effects.commit(&mut state, &mut domain_list)?;
                                     let elapsed = attempt_start.elapsed();
                                     let observed_bytes = estimate_picked_bytes_per_domain(&picked);
-                                    cursor.commit(range.clone());
+                                    cursor.commit(range);
                                     controller.on_success(
                                         requested,
                                         processable_picked_indices.len(),
@@ -671,7 +772,7 @@ impl BetaCrownVerifier {
 
             latch_domain_list_eviction(&domain_list, &mut state);
 
-            // Adaptive batch sizing (#4303): double when domain list supplied a full batch.
+            // Adaptive batch sizing: double when domain list supplied a full batch.
             self.config.try_enlarge_batch_size(
                 &mut batch_size,
                 picked.batch_size,
@@ -689,7 +790,7 @@ impl BetaCrownVerifier {
         // (domain_list empty, no timeout, no unresolved flags), every domain was
         // either verified inline or its children were verified recursively.
         //
-        // Previous bug (#1896): used `domains_verified == domains_explored` which
+        // Previous bug: used `domains_verified == domains_explored` which
         // can never be true when branching occurs — parent domains increment
         // `domains_explored` but only their children increment `domains_verified`,
         // and these are disjoint sets.

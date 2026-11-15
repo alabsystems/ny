@@ -158,7 +158,7 @@ fn discover_from_files(bench_dir: &Path, args: &AcasxuBenchmarkArgs) -> Result<A
                 model_path: model_path.clone(),
                 property_path: property_path.clone(),
                 model_name: model_name.clone(),
-                property_name: property_name.clone(),
+                property_name,
                 timeout: args.timeout_override.unwrap_or(args.timeout),
             });
         }
@@ -277,7 +277,7 @@ mod tests {
         let _ = discover_problems(&args);
     }
 
-    // Issue #165: Year-aware benchmark discovery tests
+    // Year-aware benchmark discovery tests
 
     #[test]
     fn test_resolve_benchmark_dir_supported_years() {

@@ -75,7 +75,7 @@ fn test_tanh_ibp_soundness() {
     }
 }
 
-/// Regression test for #3316: tanh IBP bounds must stay in [-1, 1] even for
+/// Regression test: tanh IBP bounds must stay in [-1, 1] even for
 /// extreme inputs where directed rounding could push past the range boundary.
 /// tanh(1000) → 1 via f64 saturation, next_up_f32(1.0) > 1.
 /// tanh(-1000) → -1 via f64 saturation, next_down_f32(-1.0) < -1.

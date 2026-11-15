@@ -1,0 +1,2 @@
+binary <home>/ny-pins/ny_next3_114ff7e23 sha256 3124e5eb002c42ad; configs bank/2026-09-29 @114ff7e23 (configs/ identical to sweep head 114ff7e23); ny benchmarks run --year 2025 at official budgets via ny_box.sh measure (refine2/ship27_sweep_v2.sh sha256 615b42efdd043f51; sweep log refine2/next3_sweep.log)
+  BANKCMP acasxu_2023-2025 rows=186 held=181 converted=4 lost=0 emergency=0 unmatched=0

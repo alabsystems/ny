@@ -12,7 +12,7 @@ use crate::pgd_attack::attacker::eval::output_value;
 use crate::pgd_attack::attacker::PgdAttacker;
 use crate::pgd_attack::config::PgdConfig;
 
-/// Regression test for #2082/#2091: output_value must return InvalidSpec for
+/// Regression test: output_value must return InvalidSpec for
 /// out-of-bounds indices. Before the fix, it returned `unwrap_or(0.0)`, silently
 /// corrupting PGD gradients and violation checks.
 #[test]
@@ -46,7 +46,7 @@ fn output_value_oob_returns_invalid_spec() {
     );
 }
 
-/// Regression test for #2721: project() replaces NaN with lower bound.
+/// Regression test: project() replaces NaN with lower bound.
 #[ntest::timeout(10000)]
 #[test]
 fn test_project_nan_replaced_with_lower_bound() {
@@ -74,7 +74,7 @@ fn test_project_nan_replaced_with_lower_bound() {
     assert!(!projected.iter().any(|v| v.is_nan()), "no NaN in result");
 }
 
-/// Regression test for #2721: project() clamps Inf correctly.
+/// Regression test: project() clamps Inf correctly.
 #[ntest::timeout(10000)]
 #[test]
 fn test_project_inf_clamped() {

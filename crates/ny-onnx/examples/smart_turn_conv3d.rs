@@ -5,7 +5,7 @@
 //! Real-corpus qualification for Conv3d fallback in the official VNN-COMP 2026
 //! Smart Turn multimodal model.
 //!
-//! Run: `cargo run -p ny-onnx --release --example smart_turn_conv3d`.
+//! Run: `targo --unverified run -p ny-onnx --release --example smart_turn_conv3d`.
 //! Hermetic default tests for unsupported-op fallback live with the ONNX
 //! conversion and graph-building implementations.
 

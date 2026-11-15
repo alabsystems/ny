@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
+// wgpu's nested device/buffer ownership exceeds the default auto-trait budget.
+#![recursion_limit = "256"]
 
 //! Accelerated bound propagation for ny.
 //!
@@ -39,7 +41,7 @@
 //! // Use gpu_device for accelerated bound propagation
 //! ```
 
-// Link macOS Accelerate BLAS for ndarray::dot() acceleration (#4259).
+// Link macOS Accelerate BLAS for ndarray::dot() acceleration.
 #[cfg(target_os = "macos")]
 extern crate blas_src;
 
@@ -96,18 +98,21 @@ pub(crate) use ny_core::FALLBACK_BOUND;
 mod tests;
 
 // Bound-correctness tests for the C-matrix-seeded GPU resnet ROOT pass
-// (#w4-root-gpu). Real-device tests: compiled only under `gpu-tests`.
-#[cfg(all(test, feature = "gpu-tests"))]
+// (#w4-root-gpu). Real-device tests on an UNCHARGED verdict device: compiled
+// only under `gpu-tests-uncharged` (see TEST_CONFORMANCE.md).
+#[cfg(all(test, feature = "gpu-tests-uncharged"))]
 mod spec_root_gpu_tests;
 
 // Parity + never-looser tests for the GPU per-domain β optimization
-// (#w4-split-tightening). Real-device tests: compiled only under `gpu-tests`.
-#[cfg(all(test, feature = "gpu-tests"))]
+// (#w4-split-tightening). Real-device tests on an UNCHARGED verdict device:
+// compiled only under `gpu-tests-uncharged`.
+#[cfg(all(test, feature = "gpu-tests-uncharged"))]
 mod beta_grad_gpu_tests;
 
 // Enclosure oracle for per-subdomain intermediate-bound refinement
-// (#interm-refine). Real-device tests: compiled only under `gpu-tests`.
-#[cfg(all(test, feature = "gpu-tests"))]
+// (#interm-refine). Real-device tests on an UNCHARGED verdict device:
+// compiled only under `gpu-tests-uncharged`.
+#[cfg(all(test, feature = "gpu-tests-uncharged"))]
 mod interm_refine_gpu_tests;
 
 /// Accelerated per-position CROWN verification with parallel and sequential execution modes.
@@ -142,11 +147,6 @@ pub use gradient_steering::GradientSteeringDevice;
 // #fl-value-gpu-tier: deadline-capable WGPU f32 GEMM for the forward-linear
 // VALUE seam only (the call site charges `gamma^f32·S` + FTZ for the values;
 // every other engine surface typed-refuses).
-//
-// RE-LANDED 2026-08-02: `fde664d8` shipped consumers without this producer
-// (the file was untracked — commit-partition miss); withdrawn by 0e8dfb7a,
-// restored here together with the implementation file, per that hotfix's
-// re-landing instructions.
 #[cfg(feature = "wgpu")]
 pub mod fl_value_gemm;
 #[cfg(feature = "wgpu")]

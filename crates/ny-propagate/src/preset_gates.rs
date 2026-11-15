@@ -23,15 +23,16 @@
 //! * an ADMISSIBLE environment value still WINS, in BOTH directions: `"1"`
 //!   arms and `"0"` disarms whatever a preset asked for, so every banked A/B
 //!   recipe keeps working unchanged;
-//! * a PRESENT but malformed environment value is a KILL SWITCH: it suppresses
+//! * a PRESENT but malformed environment value suppresses
 //!   the preset and resolves to the declaration default, never to the preset;
 //! * the layering is [`ny_levers::gate`]'s, which is
 //!   [`ny_levers::read_over_config`]'s, which is the audited primitive the
 //!   typed root-alpha seam already uses. No gate here re-implements precedence.
 //!
-//! PROMOTION IS NOT ARMING. Nothing in this module changes a default, and
-//! `crates/ny-cli/src/preset/lever_delivery_pin_tests.rs` pins that no shipped yaml
-//! sets any of these keys. Arming one stays a separate, measured decision.
+//! Typed delivery alone does not change a default. The separately authorized
+//! head-group and directional-cut defaults are true, including on malformed
+//! legacy values; use exact `"0"` or typed `false` to disable them. Shipped
+//! arming exceptions are pinned in the CLI preset delivery tests.
 //!
 //! # Ordering
 //!
@@ -458,10 +459,56 @@ bool_gate!(
 );
 
 bool_gate!(
+    MARGIN_ROW_SPEC_ALPHA,
+    set_margin_row_spec_alpha_preset,
+    margin_row_spec_alpha_enabled,
+    ny_levers::decls::sound_channel::MARGIN_ROW_SPEC_ALPHA
+);
+
+usize_value_gate!(
+    MARGIN_ROW_SPEC_ALPHA_WIDTH,
+    set_margin_row_spec_alpha_width_preset,
+    margin_row_spec_alpha_width,
+    ny_levers::decls::sound_channel::MARGIN_ROW_SPEC_ALPHA_WIDTH,
+    3
+);
+
+usize_value_gate!(
+    MARGIN_ROW_SPEC_ALPHA_CANDS,
+    set_margin_row_spec_alpha_cands_preset,
+    margin_row_spec_alpha_cands,
+    ny_levers::decls::sound_channel::MARGIN_ROW_SPEC_ALPHA_CANDS,
+    3
+);
+
+usize_value_gate!(
+    MARGIN_ROW_SPEC_ALPHA_ROUNDS,
+    set_margin_row_spec_alpha_rounds_preset,
+    margin_row_spec_alpha_rounds,
+    ny_levers::decls::sound_channel::MARGIN_ROW_SPEC_ALPHA_ROUNDS,
+    1
+);
+
+usize_value_gate!(
+    MARGIN_ROW_SPEC_ALPHA_ENTRIES,
+    set_margin_row_spec_alpha_entries_preset,
+    margin_row_spec_alpha_entries,
+    ny_levers::decls::sound_channel::MARGIN_ROW_SPEC_ALPHA_ENTRIES,
+    65_536
+);
+
+bool_gate!(
     MARGIN_ROW_CLIP,
     set_margin_row_clip_preset,
     margin_row_clip_enabled,
     ny_levers::decls::sound_channel::MARGIN_ROW_CLIP
+);
+
+bool_gate!(
+    MARGIN_ROW_CLIP_HEAD,
+    set_margin_row_clip_head_preset,
+    margin_row_clip_head_enabled,
+    ny_levers::decls::sound_channel::MARGIN_ROW_CLIP_HEAD
 );
 
 bool_gate!(
@@ -542,6 +589,14 @@ usize_value_gate!(
     1024
 );
 
+usize_value_gate!(
+    MARGIN_ROW_INTERM_ALPHA,
+    set_margin_row_interm_alpha_preset,
+    margin_row_interm_alpha,
+    ny_levers::decls::margin_row::MARGIN_ROW_INTERM_ALPHA,
+    0
+);
+
 bool_gate!(
     MARGIN_ROW_BETA,
     set_margin_row_beta_preset,
@@ -606,6 +661,166 @@ bool_gate!(
     ny_levers::decls::margin_row::MARGIN_ROW_TABLEAU_F32
 );
 
+// #mr-ibp-seed: intersect every trunk box of the root tableau walk with its
+// certified IBP box, shrink-only, after the forward-only `bi_cal` capture and
+// before #backward-interm (`margin_row/ibp_seed.rs`). This cell serves the
+// COMPATIBILITY resolver only (`RootPrecisionRuntimePolicy::
+// from_layered_process`); the scored route resolves the key from its frozen
+// LeverSet. Dark = byte-identical; residual trunks decline.
+bool_gate!(
+    MARGIN_ROW_IBP_SEED,
+    set_margin_row_ibp_seed_preset,
+    margin_row_ibp_seed_enabled,
+    ny_levers::decls::margin_row::MARGIN_ROW_IBP_SEED
+);
+
+// #domain-stack: score every domain in a frontier batch in ONE wide certified
+// pass instead of one pass per domain. Column-local, so a stacked score is
+// bit-identical to the independent one (pinned by
+// `domain_stacked_candidate_scores_match_independent_frontier_bit_exact`); this
+// selects a schedule, not a relaxation, and cannot move a published bound.
+bool_gate!(
+    MARGIN_ROW_DOMAIN_STACK,
+    set_margin_row_domain_stack_preset,
+    margin_row_domain_stack_enabled,
+    ny_levers::decls::margin_row::MARGIN_ROW_DOMAIN_STACK
+);
+
+// #mr-errlane (margin-row throughput plan B3): the certified error-lane
+// representation, `off` | `envelope` | `per_channel` | `audit`. A `text_gate!`
+// rather than a `bool_gate!` because the key carries a second (per-channel)
+// value and a measurement-only audit value on the same axis. This cell serves
+// the COMPATIBILITY resolver only (`RootPrecisionRuntimePolicy::
+// from_layered_process`); the scored route resolves the key from its frozen
+// LeverSet and never reads it. Every value is sound: an envelope dominates the
+// per-column lane, so a wrong value costs proofs (looseness, audit wall),
+// never manufactures one.
+text_gate!(
+    MARGIN_ROW_ERR_ENVELOPE,
+    set_margin_row_err_envelope_preset,
+    margin_row_err_envelope,
+    ny_levers::decls::margin_row::MARGIN_ROW_ERR_ENVELOPE
+);
+
+// #mr-gpu-eval: RETIRED 2026-09-29 (ENGINE_PROGRAM R1 kill line + R2). The
+// cell survives only so an ENVIRONMENT request resolves and is REFUSED loudly
+// (`margin_row::gpu_conv::requested` -> `[mr-gpu-conv] refused`); no bridge
+// writes it (preset validation refuses `margin_row.gpu_conv`) and
+// `gpu_conv::armed` is false in every build.
+bool_gate!(
+    MARGIN_ROW_GPU_CONV,
+    set_margin_row_gpu_conv_preset,
+    margin_row_gpu_conv_enabled,
+    ny_levers::decls::margin_row::MARGIN_ROW_GPU_CONV
+);
+
+// #frozen-dual-bab (V1 stage B, on stage A's #frozen-dual-state): arm the
+// certified frozen alpha-zonotope dual BaB as a tier between the margin-row
+// root and its tree. A class it closes is certified on the whole box (every
+// leaf `certified > 0`, level ledger closed); every other class is handed to
+// the tree unchanged. Latched once per process by
+// `margin_row::zono_state::armed`, after the CLI bridge writes the cell.
+bool_gate!(
+    MARGIN_ROW_FROZEN_DUAL_BAB,
+    set_margin_row_frozen_dual_bab_preset,
+    margin_row_frozen_dual_bab_enabled,
+    ny_levers::decls::margin_row::MARGIN_ROW_FROZEN_DUAL_BAB
+);
+
+// #frozen-dual-bab: nodes one objective's search may evaluate (reader clamp
+// `1..=200M` in `zono_bab::TierPolicy`). Wall clock and memory only: a capped
+// search is OPEN and handed back, never closed.
+usize_value_gate!(
+    MARGIN_ROW_FROZEN_DUAL_BAB_NODE_CAP,
+    set_margin_row_frozen_dual_bab_node_cap_preset,
+    margin_row_frozen_dual_bab_node_cap,
+    ny_levers::decls::margin_row::MARGIN_ROW_FROZEN_DUAL_BAB_NODE_CAP,
+    2_000_000
+);
+
+// #frozen-dual-bab: the tier's wall request in seconds; 0 (the declaration
+// default) takes half of the time the root left, a positive request is capped
+// to three quarters of it (`zono_bab::TierPolicy::budget_secs`).
+f64_value_gate!(
+    MARGIN_ROW_FROZEN_DUAL_BAB_SECS,
+    set_margin_row_frozen_dual_bab_secs_preset,
+    margin_row_frozen_dual_bab_secs,
+    ny_levers::decls::margin_row::MARGIN_ROW_FROZEN_DUAL_BAB_SECS,
+    0.0
+);
+
+// #breakpoint-dual: zero preserves the original frozen-dual evaluator;
+// TierPolicy bounds a nonzero request to at most 32 refinement steps.
+usize_value_gate!(
+    MARGIN_ROW_FROZEN_DUAL_REFINE_STEPS,
+    set_margin_row_frozen_dual_refine_steps_preset,
+    margin_row_frozen_dual_refine_steps,
+    ny_levers::decls::margin_row::MARGIN_ROW_FROZEN_DUAL_REFINE_STEPS,
+    0
+);
+
+// #fd-shared-state (ENGINE_PROGRAM M3): how the frozen-dual tier builds its
+// per-class states, `per_class` (the declaration default: one full build per
+// class inside its fair share, the pre-M3 tier bit for bit) | `shared` (ONE
+// trunk of every unstable row under slopes shared across the open classes,
+// built before the shares, plus a one-column margin tail per class). A
+// `text_gate!` because the key is an enum; read by
+// `zono_bab::TierPolicy::from_gates`. Every value is sound: any slope in
+// [0, 1] certifies, and a tail that disagrees with the trunk on a slope a row
+// reads is refused.
+text_gate!(
+    MARGIN_ROW_FROZEN_DUAL_BAB_STATE,
+    set_margin_row_frozen_dual_bab_state_preset,
+    margin_row_frozen_dual_bab_state,
+    ny_levers::decls::margin_row::MARGIN_ROW_FROZEN_DUAL_BAB_STATE
+);
+
+// #wide-fd-search (ENGINE_PROGRAM M4): which search scores the frozen-dual
+// tier's nodes, `f64` (default, the M1 path bit for bit) | `cpu_f32` |
+// `cuda` | `auto` (`zono_bab::TierPolicy::from_gates`). A `text_gate!`
+// because the key is an enum. Every value is sound: a backend only PROPOSES
+// dual points; the tier certifies each prune in f64 with its own evaluator
+// and splits every node no proposal certifies.
+text_gate!(
+    MARGIN_ROW_FROZEN_DUAL_BAB_SEARCH,
+    set_margin_row_frozen_dual_bab_search_preset,
+    margin_row_frozen_dual_bab_search,
+    ny_levers::decls::margin_row::MARGIN_ROW_FROZEN_DUAL_BAB_SEARCH
+);
+
+// #wave-beta-bab (ENGINE_PROGRAM M6): the margin-row tree engine of the outer
+// frame, `legacy` (default: today's best-first tree bit for bit) | `wave`
+// (`bab::wave`: batched untrusted beta-CROWN search, a streaming certify
+// queue on a private pool, the path-based cover gate). Read by
+// `bab::wave::WavePolicy::from_gates`. Every value is sound: the search only
+// proposes; every close is certified by the lane's own evaluator.
+text_gate!(
+    MARGIN_ROW_TREE_MODE,
+    set_margin_row_tree_mode_preset,
+    margin_row_tree_mode,
+    ny_levers::decls::margin_row::MARGIN_ROW_TREE_MODE
+);
+
+// #wave-beta-bab: domains per wave (reader clamp `1..=16384` in
+// `bab::wave::WavePolicy::clamped`). Schedule only.
+usize_value_gate!(
+    MARGIN_ROW_TREE_WAVE_BATCH,
+    set_margin_row_tree_wave_batch_preset,
+    margin_row_tree_wave_batch,
+    ny_levers::decls::margin_row::MARGIN_ROW_TREE_WAVE_BATCH,
+    256
+);
+
+// #wave-beta-bab: threads of the private certify pool (0 = half of the lane's
+// rayon threads; reader clamp `..=1024`). Schedule only.
+usize_value_gate!(
+    MARGIN_ROW_TREE_WAVE_CERT_THREADS,
+    set_margin_row_tree_wave_cert_threads_preset,
+    margin_row_tree_wave_cert_threads,
+    ny_levers::decls::margin_row::MARGIN_ROW_TREE_WAVE_CERT_THREADS,
+    0
+);
+
 usize_value_gate!(
     MARGIN_ROW_REBAKE_ROUNDS,
     set_margin_row_rebake_rounds_preset,
@@ -620,6 +835,163 @@ f64_value_gate!(
     margin_row_rebake_secs,
     ny_levers::decls::margin_row::MARGIN_ROW_REBAKE_SECS,
     30.0
+);
+
+// #bi-window: receptive-field-cropped backward-interm prefix passes. Each
+// cropped pair is a certified pass of the unchanged engine on a net computing
+// exactly the seeded pre-activations, never looser than the dense pair. This
+// cell serves the COMPATIBILITY resolver only; the scored route resolves the
+// key from its frozen LeverSet.
+bool_gate!(
+    MARGIN_ROW_BI_WINDOW,
+    set_margin_row_bi_window_preset,
+    margin_row_bi_window_enabled,
+    ny_levers::decls::margin_row::MARGIN_ROW_BI_WINDOW
+);
+
+// #bi-gpu: RETIRED 2026-09-29 (ENGINE_PROGRAM R2, the device never
+// certifies). The cell serves the COMPATIBILITY resolver only (the scored route
+// resolves the flag from its frozen LeverSet); either way an armed phase is
+// REFUSED at runtime (`[bi-gpu] refused`), and no bridge writes the cell
+// (preset validation refuses `margin_row.bi_gpu`).
+bool_gate!(
+    MARGIN_ROW_BI_GPU,
+    set_margin_row_bi_gpu_preset,
+    margin_row_bi_gpu_enabled,
+    ny_levers::decls::margin_row::MARGIN_ROW_BI_GPU
+);
+
+// #bi-patch: per-column receptive-field (patch-mode) backward-interm prefix
+// passes — the arm, the crossover ratio and the per-pass working-set cap. Each
+// patch pair is the dense pair restricted to its support (never looser). These
+// cells serve the COMPATIBILITY resolver only; the scored route resolves the
+// keys from its frozen LeverSet, like #bi-window's.
+bool_gate!(
+    MARGIN_ROW_BI_PATCH,
+    set_margin_row_bi_patch_preset,
+    margin_row_bi_patch_enabled,
+    ny_levers::decls::margin_row::MARGIN_ROW_BI_PATCH
+);
+
+f64_value_gate!(
+    MARGIN_ROW_BI_PATCH_RATIO,
+    set_margin_row_bi_patch_ratio_preset,
+    margin_row_bi_patch_ratio,
+    ny_levers::decls::margin_row::MARGIN_ROW_BI_PATCH_RATIO,
+    0.5
+);
+
+usize_value_gate!(
+    MARGIN_ROW_BI_PATCH_MB,
+    set_margin_row_bi_patch_mb_preset,
+    margin_row_bi_patch_mb,
+    ny_levers::decls::margin_row::MARGIN_ROW_BI_PATCH_MB,
+    256
+);
+
+// #joint-refresh: rounds (0 = dark) and wall request of the backward-only joint
+// intermediate refresh. Compatibility cells only, like #bi-window's.
+usize_value_gate!(
+    MARGIN_ROW_JOINT_REFRESH,
+    set_margin_row_joint_refresh_preset,
+    margin_row_joint_refresh,
+    ny_levers::decls::margin_row::MARGIN_ROW_JOINT_REFRESH,
+    0
+);
+
+f64_value_gate!(
+    MARGIN_ROW_JOINT_REFRESH_SECS,
+    set_margin_row_joint_refresh_secs_preset,
+    margin_row_joint_refresh_secs,
+    ny_levers::decls::margin_row::MARGIN_ROW_JOINT_REFRESH_SECS,
+    30.0
+);
+
+// Source-owned head groups: compatibility cell only. Scored runs consume the
+// same boolean from their frozen LeverSet and arm one fixed bounded policy.
+bool_gate!(
+    MARGIN_ROW_HEAD_GROUPS,
+    set_margin_row_head_groups_preset,
+    margin_row_head_groups_enabled,
+    ny_levers::decls::margin_row::MARGIN_ROW_HEAD_GROUPS
+);
+
+bool_gate!(
+    MARGIN_ROW_HEAD_DIRECTIONAL_CUTS,
+    set_margin_row_head_directional_cuts_preset,
+    margin_row_head_directional_cuts_enabled,
+    ny_levers::decls::margin_row::MARGIN_ROW_HEAD_DIRECTIONAL_CUTS
+);
+
+// Optional complete Source phase cover; zero keeps existing head groups.
+usize_value_gate!(
+    MARGIN_ROW_HEAD_PHASE_COVER,
+    set_margin_row_head_phase_cover_preset,
+    margin_row_head_phase_cover,
+    ny_levers::decls::margin_row::MARGIN_ROW_HEAD_PHASE_COVER,
+    0
+);
+
+// #root-certify-once: arm, untrusted spec iterations, untrusted joint rounds and
+// wall request of the search-untrusted / certify-once root alpha phase. The
+// published root is only ever a CERTIFIED evaluation that strictly beats the
+// certified incumbent. Compatibility cells only, like #joint-refresh's; the
+// scored route resolves the keys from its frozen LeverSet.
+bool_gate!(
+    MARGIN_ROW_ROOT_CERTIFY_ONCE,
+    set_margin_row_root_certify_once_preset,
+    margin_row_root_certify_once_enabled,
+    ny_levers::decls::margin_row::MARGIN_ROW_ROOT_CERTIFY_ONCE
+);
+
+usize_value_gate!(
+    MARGIN_ROW_ROOT_CERTIFY_ONCE_ITERS,
+    set_margin_row_root_certify_once_iters_preset,
+    margin_row_root_certify_once_iters,
+    ny_levers::decls::margin_row::MARGIN_ROW_ROOT_CERTIFY_ONCE_ITERS,
+    20
+);
+
+usize_value_gate!(
+    MARGIN_ROW_ROOT_CERTIFY_ONCE_REFRESH,
+    set_margin_row_root_certify_once_refresh_preset,
+    margin_row_root_certify_once_refresh,
+    ny_levers::decls::margin_row::MARGIN_ROW_ROOT_CERTIFY_ONCE_REFRESH,
+    0
+);
+
+f64_value_gate!(
+    MARGIN_ROW_ROOT_CERTIFY_ONCE_SECS,
+    set_margin_row_root_certify_once_secs_preset,
+    margin_row_root_certify_once_secs,
+    ny_levers::decls::margin_row::MARGIN_ROW_ROOT_CERTIFY_ONCE_SECS,
+    20.0
+);
+
+// #bbe-joint-root (ENGINE_PROGRAM M5a): which UNTRUSTED search proposes the
+// root slopes inside #root-certify-once, `ascent` (default, bit-identical) |
+// `joint_f32` (the injected joint-alpha root search). A `text_gate!` because
+// the key is an enum. Compatibility cell only; the scored route resolves the
+// key from its frozen LeverSet. Every value is sound: the slopes reach the
+// certified root only through the ingest gate and one certified evaluation.
+text_gate!(
+    MARGIN_ROW_ROOT_SEARCH,
+    set_margin_row_root_search_preset,
+    margin_row_root_search,
+    ny_levers::decls::margin_row::MARGIN_ROW_ROOT_SEARCH
+);
+
+// #root-box-source (ENGINE_PROGRAM M5b): which certified construction supplies
+// the root's trunk boxes, `tableau` (default, bit-identical) |
+// `patch_backward` (`margin_row/root_box.rs`). A `text_gate!` because the key
+// is an enum. Compatibility cell only; the scored route resolves the key from
+// its frozen LeverSet into the root-precision policy. Every value is sound:
+// both sources publish certified boxes only.
+text_gate!(
+    MARGIN_ROW_ROOT_BOX_SOURCE,
+    set_margin_row_root_box_source_preset,
+    margin_row_root_box_source,
+    ny_levers::decls::margin_row::MARGIN_ROW_ROOT_BOX_SOURCE
 );
 
 usize_value_gate!(
@@ -733,6 +1105,27 @@ u64_gate!(
     ny_levers::decls::cgan_stacked::CGAN_STACKED_BUDGET_MB
 );
 
+// #patches-engine-refusal-containment + #fast-f32-prewarm-all-hosts
+// (reports/measured-2026/cct_bound_gap_2026-08-31): the cct engine-wiring
+// pair. Both DEFAULT OFF, set by no category-resolvable yaml, never
+// autonomously armed. The containment reader is consulted per compose at the
+// Conv2d Patches GEMM seam (`conv2d/ops.rs`); the prewarm reader is consulted
+// once on the vnncomp route by the CLI, which owns the actual
+// `fast_f32_gemm::prewarm_fast_f32_gemm()` call.
+bool_gate!(
+    PATCHES_ENGINE_REFUSAL_CONTAINMENT,
+    set_patches_engine_refusal_containment_preset,
+    patches_engine_refusal_containment_armed,
+    ny_levers::decls::crown_ibp_budget::PATCHES_ENGINE_REFUSAL_CONTAINMENT
+);
+
+bool_gate!(
+    FAST_F32_PREWARM,
+    set_fast_f32_prewarm_preset,
+    fast_f32_prewarm_armed,
+    ny_levers::decls::crown_ibp_budget::FAST_F32_PREWARM
+);
+
 static POLLABLE_FAER: BoolCell = BoolCell::new();
 
 /// Record the typed canonical Boolean arm for the legacy-truthy pollable-faer
@@ -835,6 +1228,19 @@ bool_gate!(
     set_crown_partial_finite_expiry_preset,
     crown_partial_finite_expiry_enabled,
     ny_levers::decls::diagnostics::CROWN_PARTIAL_FINITE_EXPIRY
+);
+
+// #dense-sparse-seed: the stability threshold of the sequential CROWN-IBP
+// partial walk's Dense unstable-rows seed (`network/ibp/crown_partial.rs`).
+// The declaration default 0.9 is that seed's historical literal, so an
+// unwritten cell is byte-identical; the read site applies a written value only
+// to targets whose successor layer is a ReLU.
+f64_value_gate!(
+    CROWN_PARTIAL_DENSE_MIN_STABLE,
+    set_crown_partial_dense_min_stable_preset,
+    crown_partial_dense_min_stable,
+    ny_levers::decls::crown_partial_seed::CROWN_PARTIAL_DENSE_MIN_STABLE,
+    0.9
 );
 
 // --- #lever-reachability batch 2: the `read_raw` predicate gates ------------
@@ -1013,8 +1419,16 @@ mod tests {
                 margin_row_alpha_guard_enabled(),
             ),
             (
+                &ny_levers::decls::sound_channel::MARGIN_ROW_SPEC_ALPHA,
+                margin_row_spec_alpha_enabled(),
+            ),
+            (
                 &ny_levers::decls::sound_channel::MARGIN_ROW_CLIP,
                 margin_row_clip_enabled(),
+            ),
+            (
+                &ny_levers::decls::sound_channel::MARGIN_ROW_CLIP_HEAD,
+                margin_row_clip_head_enabled(),
             ),
             (
                 &ny_levers::decls::sound_channel::MARGIN_ROW_CLIP_INTERM,
@@ -1041,8 +1455,36 @@ mod tests {
                 margin_row_rebake_enabled(),
             ),
             (
+                &ny_levers::decls::margin_row::MARGIN_ROW_BI_WINDOW,
+                margin_row_bi_window_enabled(),
+            ),
+            (
+                &ny_levers::decls::margin_row::MARGIN_ROW_HEAD_GROUPS,
+                margin_row_head_groups_enabled(),
+            ),
+            (
+                &ny_levers::decls::margin_row::MARGIN_ROW_HEAD_DIRECTIONAL_CUTS,
+                margin_row_head_directional_cuts_enabled(),
+            ),
+            (
+                &ny_levers::decls::margin_row::MARGIN_ROW_ROOT_CERTIFY_ONCE,
+                margin_row_root_certify_once_enabled(),
+            ),
+            (
+                &ny_levers::decls::margin_row::MARGIN_ROW_BI_GPU,
+                margin_row_bi_gpu_enabled(),
+            ),
+            (
+                &ny_levers::decls::margin_row::MARGIN_ROW_BI_PATCH,
+                margin_row_bi_patch_enabled(),
+            ),
+            (
                 &ny_levers::decls::margin_row::MARGIN_ROW_TABLEAU_F32,
                 margin_row_tableau_f32_enabled(),
+            ),
+            (
+                &ny_levers::decls::margin_row::MARGIN_ROW_IBP_SEED,
+                margin_row_ibp_seed_enabled(),
             ),
             (
                 &ny_levers::decls::diagnostics::PATCHES_FINITE_EXPIRY,
@@ -1156,6 +1598,22 @@ mod tests {
                 margin_row_alpha_cols(),
             ),
             (
+                &ny_levers::decls::sound_channel::MARGIN_ROW_SPEC_ALPHA_WIDTH,
+                margin_row_spec_alpha_width(),
+            ),
+            (
+                &ny_levers::decls::sound_channel::MARGIN_ROW_SPEC_ALPHA_CANDS,
+                margin_row_spec_alpha_cands(),
+            ),
+            (
+                &ny_levers::decls::sound_channel::MARGIN_ROW_SPEC_ALPHA_ROUNDS,
+                margin_row_spec_alpha_rounds(),
+            ),
+            (
+                &ny_levers::decls::sound_channel::MARGIN_ROW_SPEC_ALPHA_ENTRIES,
+                margin_row_spec_alpha_entries(),
+            ),
+            (
                 &ny_levers::decls::sound_channel::MARGIN_ROW_CLIP_TOPK,
                 margin_row_clip_topk(),
             ),
@@ -1180,12 +1638,48 @@ mod tests {
                 margin_row_bi_topk(),
             ),
             (
+                &ny_levers::decls::margin_row::MARGIN_ROW_INTERM_ALPHA,
+                margin_row_interm_alpha(),
+            ),
+            (
                 &ny_levers::decls::margin_row::MARGIN_ROW_BETA_ITERS,
                 margin_row_beta_iters(),
             ),
             (
                 &ny_levers::decls::margin_row::MARGIN_ROW_REBAKE_ROUNDS,
                 margin_row_rebake_rounds(),
+            ),
+            (
+                &ny_levers::decls::margin_row::MARGIN_ROW_JOINT_REFRESH,
+                margin_row_joint_refresh(),
+            ),
+            (
+                &ny_levers::decls::margin_row::MARGIN_ROW_BI_PATCH_MB,
+                margin_row_bi_patch_mb(),
+            ),
+            (
+                &ny_levers::decls::margin_row::MARGIN_ROW_ROOT_CERTIFY_ONCE_ITERS,
+                margin_row_root_certify_once_iters(),
+            ),
+            (
+                &ny_levers::decls::margin_row::MARGIN_ROW_ROOT_CERTIFY_ONCE_REFRESH,
+                margin_row_root_certify_once_refresh(),
+            ),
+            (
+                &ny_levers::decls::margin_row::MARGIN_ROW_FROZEN_DUAL_BAB_NODE_CAP,
+                margin_row_frozen_dual_bab_node_cap(),
+            ),
+            (
+                &ny_levers::decls::margin_row::MARGIN_ROW_FROZEN_DUAL_REFINE_STEPS,
+                margin_row_frozen_dual_refine_steps(),
+            ),
+            (
+                &ny_levers::decls::margin_row::MARGIN_ROW_TREE_WAVE_BATCH,
+                margin_row_tree_wave_batch(),
+            ),
+            (
+                &ny_levers::decls::margin_row::MARGIN_ROW_TREE_WAVE_CERT_THREADS,
+                margin_row_tree_wave_cert_threads(),
             ),
             (&ny_levers::decls::margin_row::EPOCH_TIER0, epoch_tier0()),
             (
@@ -1235,8 +1729,28 @@ mod tests {
                 margin_row_rebake_secs(),
             ),
             (
+                &ny_levers::decls::margin_row::MARGIN_ROW_JOINT_REFRESH_SECS,
+                margin_row_joint_refresh_secs(),
+            ),
+            (
+                &ny_levers::decls::margin_row::MARGIN_ROW_BI_PATCH_RATIO,
+                margin_row_bi_patch_ratio(),
+            ),
+            (
+                &ny_levers::decls::margin_row::MARGIN_ROW_ROOT_CERTIFY_ONCE_SECS,
+                margin_row_root_certify_once_secs(),
+            ),
+            (
                 &ny_levers::decls::margin_row::MARGIN_ROW_BI_CHUNK_SECS,
                 margin_row_bi_chunk_secs(),
+            ),
+            (
+                &ny_levers::decls::margin_row::MARGIN_ROW_FROZEN_DUAL_BAB_SECS,
+                margin_row_frozen_dual_bab_secs(),
+            ),
+            (
+                &ny_levers::decls::crown_partial_seed::CROWN_PARTIAL_DENSE_MIN_STABLE,
+                crown_partial_dense_min_stable(),
             ),
         ] {
             assert_eq!(
@@ -1263,6 +1777,66 @@ mod tests {
             ny_levers::read(&ny_levers::decls::conv_ibp_blocked::CONV_IBP_BLOCKED)
                 .value
                 .as_str()
+        );
+        // #bbe-joint-root: the unwritten enum cell resolves to the declaration
+        // default, which is the bit-identical `ascent` search.
+        assert_eq!(
+            margin_row_root_search().as_deref(),
+            ny_levers::read(&ny_levers::decls::margin_row::MARGIN_ROW_ROOT_SEARCH)
+                .value
+                .as_str()
+        );
+        assert_eq!(
+            margin_row_root_search().as_deref(),
+            Some(crate::margin_row::RootSearch::Ascent.token())
+        );
+        // #fd-shared-state: the unwritten enum cell resolves to the declaration
+        // default, which is the bit-identical `per_class` tier.
+        assert_eq!(
+            margin_row_frozen_dual_bab_state().as_deref(),
+            ny_levers::read(&ny_levers::decls::margin_row::MARGIN_ROW_FROZEN_DUAL_BAB_STATE)
+                .value
+                .as_str()
+        );
+        assert_eq!(
+            margin_row_frozen_dual_bab_state().as_deref(),
+            Some(crate::margin_row::zono_bab::FrozenDualStateMode::PerClass.token())
+        );
+        // #root-box-source: the unwritten enum cell resolves to the
+        // declaration default, which is the bit-identical `tableau` source.
+        assert_eq!(
+            margin_row_root_box_source().as_deref(),
+            ny_levers::read(&ny_levers::decls::margin_row::MARGIN_ROW_ROOT_BOX_SOURCE)
+                .value
+                .as_str()
+        );
+        assert_eq!(
+            margin_row_root_box_source().as_deref(),
+            Some(crate::margin_row::RootBoxSource::Tableau.token())
+        );
+        // #wide-fd-search: the unwritten enum cell resolves to the declaration
+        // default, the bit-identical `f64` search.
+        assert_eq!(
+            margin_row_frozen_dual_bab_search().as_deref(),
+            ny_levers::read(&ny_levers::decls::margin_row::MARGIN_ROW_FROZEN_DUAL_BAB_SEARCH)
+                .value
+                .as_str()
+        );
+        assert_eq!(
+            margin_row_frozen_dual_bab_search().as_deref(),
+            Some(crate::margin_row::FrozenDualSearch::F64.token())
+        );
+        // #wave-beta-bab: the unwritten enum cell resolves to the declaration
+        // default, the bit-identical `legacy` tree.
+        assert_eq!(
+            margin_row_tree_mode().as_deref(),
+            ny_levers::read(&ny_levers::decls::margin_row::MARGIN_ROW_TREE_MODE)
+                .value
+                .as_str()
+        );
+        assert_eq!(
+            margin_row_tree_mode().as_deref(),
+            Some(crate::margin_row::TreeMode::Legacy.token())
         );
         let margin_row_parallel =
             ny_levers::read(&ny_levers::decls::margin_row::MARGIN_ROW_PARALLEL);
@@ -1764,6 +2338,132 @@ mod tests {
         parallel.set("8");
         assert_eq!(margin_row_lru_cap_from(&lru), 64);
         assert_eq!(margin_row_frontier_from(&parallel, 12), 12);
+    }
+
+    /// #spec-alpha REACHABILITY (T12). `run_instance.sh` exports ZERO `NY_*`,
+    /// so a lever reachable only through the environment is dead capability in
+    /// competition however well built. The assertion that matters is therefore
+    /// on the SOURCE, not the value: arming through the typed cell must resolve
+    /// `Source::Config`.
+    ///
+    /// NECESSARY BUT NOT SUFFICIENT, and the gap has shipped dead capability
+    /// before: this exercises the RESOLVER, not the CLI bridge that writes the
+    /// cell before the lane starts -- and that bridge has been silently
+    /// clobbered in a merge before, turning every typed key dark while a test
+    /// exactly like this one stayed green. The arrival proof is a RUN: armed
+    /// yaml, zero `NY_*` set, and `[spec-alpha] armed:` plus `apply: round=1`
+    /// on the row's own stderr.
+    #[test]
+    fn margin_row_spec_alpha_keys_are_delivered_by_preset_not_env() {
+        use ny_levers::{LeverValue, Source};
+
+        let decl = &ny_levers::decls::sound_channel::MARGIN_ROW_SPEC_ALPHA;
+        let resolve = |preset: Option<bool>, raw: Option<&str>| {
+            let raw = raw.map(str::to_owned);
+            ny_levers::read_over_config_with(decl, move |_| raw, preset.map(LeverValue::Bool))
+                .expect("Bool config is admissible for a Bool declaration")
+        };
+
+        // Dark by default: promotion is not arming, and no shipped yaml arms it.
+        let absent = resolve(None, None);
+        assert!(!absent.value.as_bool());
+        assert_eq!(absent.source, Source::Default);
+
+        let armed = resolve(Some(true), None);
+        assert!(armed.value.as_bool());
+        assert_ne!(
+            armed.source,
+            Source::LegacyEnv,
+            "arming through the typed key must NOT report a legacy-env source; \
+             that would mean the preset route is not what fired"
+        );
+        assert_eq!(armed.source, Source::Config);
+        assert!(!resolve(Some(false), None).value.as_bool());
+
+        // Env wins in BOTH directions, so a developer A/B keeps working and
+        // `=0` stays a kill switch.
+        assert!(resolve(Some(false), Some("1")).value.as_bool());
+        let killed = resolve(Some(true), Some("0"));
+        assert!(!killed.value.as_bool());
+        assert_eq!(killed.source, Source::LegacyEnv);
+
+        // The four child values: same source requirement, defaults intact.
+        let children: [(&ny_levers::LeverDecl, u64); 4] = [
+            (
+                &ny_levers::decls::sound_channel::MARGIN_ROW_SPEC_ALPHA_WIDTH,
+                3,
+            ),
+            (
+                &ny_levers::decls::sound_channel::MARGIN_ROW_SPEC_ALPHA_CANDS,
+                3,
+            ),
+            (
+                &ny_levers::decls::sound_channel::MARGIN_ROW_SPEC_ALPHA_ROUNDS,
+                1,
+            ),
+            (
+                &ny_levers::decls::sound_channel::MARGIN_ROW_SPEC_ALPHA_ENTRIES,
+                65_536,
+            ),
+        ];
+        for (decl, want_default) in children {
+            let bare = ny_levers::read_over_config_with(decl, |_| None, None)
+                .expect("U64 config is admissible");
+            assert_eq!(
+                bare.value.as_u64(),
+                Some(want_default),
+                "{} default drifted",
+                decl.name
+            );
+            assert_eq!(bare.source, Source::Default, "{}", decl.name);
+            let set = ny_levers::read_over_config_with(decl, |_| None, Some(LeverValue::U64(2)))
+                .expect("U64 config is admissible");
+            assert_eq!(set.value.as_u64(), Some(2), "{}", decl.name);
+            assert_ne!(set.source, Source::LegacyEnv, "{}", decl.name);
+            assert_eq!(set.source, Source::Config, "{}", decl.name);
+        }
+    }
+
+    /// #clip-head REACHABILITY. NECESSARY, NOT SUFFICIENT: this exercises the
+    /// RESOLVER, and the resolver is not the CLI bridge that writes the cell
+    /// before the lane starts. That bridge was once "silently clobbered in a
+    /// merge", turning every typed `margin_row` key dark while a test of this
+    /// exact shape stayed green. The arrival proof is a run with the ARMED YAML
+    /// and ZERO `NY_*` set that prints `[clip-head] armed` — see the key's own
+    /// doc. This test only rules out the OTHER failure: a key that can be armed
+    /// by nothing but an environment variable `run_instance.sh` never exports.
+    #[test]
+    fn clip_head_is_reachable_by_preset_not_only_by_env() {
+        use ny_levers::{LeverValue, Source};
+
+        let decl = &ny_levers::decls::sound_channel::MARGIN_ROW_CLIP_HEAD;
+        let resolve = |preset: Option<bool>, raw: Option<&str>| {
+            let raw = raw.map(str::to_owned);
+            ny_levers::read_over_config_with(decl, move |_| raw, preset.map(LeverValue::Bool))
+                .expect("Bool config is admissible for a Bool declaration")
+        };
+
+        let absent = resolve(None, None);
+        assert!(!absent.value.as_bool(), "the head clip ships dark");
+        assert_eq!(absent.source, Source::Default);
+
+        let armed = resolve(Some(true), None);
+        assert!(armed.value.as_bool());
+        assert_ne!(
+            armed.source,
+            Source::LegacyEnv,
+            "arming through the typed key must NOT report a legacy-env source; \
+             that would mean the preset route is not what fired"
+        );
+        assert_eq!(armed.source, Source::Config);
+        assert!(!resolve(Some(false), None).value.as_bool());
+
+        // Env wins in BOTH directions, so an A/B recipe keeps working and `=0`
+        // stays a kill switch on a yaml that arms it.
+        assert!(resolve(Some(false), Some("1")).value.as_bool());
+        let killed = resolve(Some(true), Some("0"));
+        assert!(!killed.value.as_bool());
+        assert_eq!(killed.source, Source::LegacyEnv);
     }
 
     /// #tableau-f32 REACHABILITY. The rule this repo learned the hard way is

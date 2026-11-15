@@ -215,7 +215,7 @@ fn test_whisper_single_block_ibp() {
         Err(err) => {
             // Sequential extraction doesn't model residual connections or
             // attention head reshapes; expect shape-related errors in IBP.
-            // After #3312, the first failure is typically Reshape (head split)
+            // The first failure is now typically Reshape (head split)
             // rather than the old Concat error.
             let msg = format!("{:?}", err);
             assert!(

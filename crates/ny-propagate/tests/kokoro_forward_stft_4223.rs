@@ -211,7 +211,7 @@ fn test_kokoro_forward_stft_phase_raw_wrap_canary_4223_integration() {
         // ±0 the f64 sum lands on is not a robust signal. The phase wrap is
         // confirmed by the `gap > 6.0` check above (graph phases differ by ~2π).
         // This matches the fixed in-crate canary
-        // (tests::graph::kokoro_forward_stft::...raw_wrap_canary_4223). (#4223)
+        // (tests::graph::kokoro_forward_stft::...raw_wrap_canary_4223).
         assert!(
             minus_reference.imag[idx]
                 .abs()

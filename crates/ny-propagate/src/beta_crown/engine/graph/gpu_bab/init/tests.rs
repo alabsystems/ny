@@ -106,7 +106,11 @@ fn test_cache_restore_input_split_linear_bounds_round_trip_3089() -> Result<()> 
         arr1(&[-0.5_f32]),
     )?;
     let mut metadata = DomainMetadata::root(-1.0, 1.0)?;
-    metadata.cached_la = Some(Arc::new(cache_input_split_linear_bounds(&linear_bounds)));
+    let input = BoundedTensor::new(
+        arr1(&[-1.0_f32, -1.0_f32]).into_dyn(),
+        arr1(&[1.0_f32, 1.0_f32]).into_dyn(),
+    )?;
+    metadata.cached_la = cache_input_split_linear_bounds(&linear_bounds, &input).map(Arc::new);
 
     let restored = restore_input_split_linear_bounds(&metadata)
         .expect("input-split cache should restore the stored linear bounds");
@@ -470,7 +474,29 @@ fn test_create_domain_list_input_split_preserves_cached_linear_bounds_3089() -> 
         picked.metadata[0].alpha_state().is_some(),
         "root domain should preserve alpha initialization alongside cached lA"
     );
-    assert_linear_bounds_eq(restored, expected_linear);
+    // #warm-cache-err: the cache publishes the root bounds with their certified
+    // coefficient error folded into the bias over the root input box (the cache
+    // stores no error), so the round trip keeps the coefficients exactly and may
+    // only widen the biases, by exactly that fold.
+    let mut expected_folded = expected_linear.clone();
+    assert!(
+        CachedLinearBounds::fold_capture_coeff_err(&mut expected_folded, Some(&input), None)?,
+        "the root input box must fold the root bounds' coefficient error"
+    );
+    assert!(
+        restored
+            .lower_b()
+            .iter()
+            .zip(expected_linear.lower_b().iter())
+            .all(|(cached, root)| cached <= root)
+            && restored
+                .upper_b()
+                .iter()
+                .zip(expected_linear.upper_b().iter())
+                .all(|(cached, root)| cached >= root),
+        "the cached biases must never be tighter than the root bounds'"
+    );
+    assert_linear_bounds_eq(restored, expected_folded);
 
     Ok(())
 }
@@ -528,5 +554,66 @@ fn test_create_domain_list_root_warm_start_uses_bounds_when_beta_disabled_3089()
         "beta_iterations=0 should still initialize heuristic graph alpha state from bounds"
     );
 
+    Ok(())
+}
+
+/// #warm-cache-err: the input-split root cache (`cache_input_split_linear_bounds`,
+/// read back by `restore_input_split_linear_bounds` for the #3870 Gap B parent
+/// clip) must not drop the certified coefficient error the root linear bounds
+/// carry. `out = W·x` with `W = [[-1], [-2^-26]]` and objective `[1, 1]` has
+/// true coefficient `-(1 + 2^-26)`, which rounds to `-1` in f32 with no bias
+/// to absorb it, so a restored block without the error charge lies above the
+/// objective at `x = 1` (lower plane) and below it at `x = -1` (upper plane).
+#[ntest::timeout(20000)]
+#[test]
+fn warm_err_input_split_root_cache_charges_coefficient_error() -> Result<()> {
+    let d0 = 1.0_f32 / 67_108_864.0;
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input(
+        "linear1",
+        Layer::Linear(LinearLayer::new(arr2(&[[-1.0_f32], [-d0]]), None)?),
+    ));
+    graph.set_output("linear1");
+    let input = BoundedTensor::new(arr1(&[-1.0_f32]).into_dyn(), arr1(&[1.0_f32]).into_dyn())?;
+    let config = BetaCrownConfig {
+        branching_heuristic: BranchingHeuristic::InputSplit,
+        verify_upper_bound: false,
+        ..test_config()
+    };
+
+    let init =
+        compute_initial_bounds(&graph, &input, &[1.0, 1.0], &config, None, None, None, true)?;
+    let setup = crate::beta_crown::engine::graph::shared::setup::build_graph_bab_setup(
+        &graph,
+        &init.initial_node_bounds,
+    );
+    let (mut domain_list, _layer_names) =
+        create_domain_list(&init, &input, &graph, &config, true, &setup)?;
+    let picked = domain_list.pick_out(1)?;
+    let restored = restore_input_split_linear_bounds(&picked.metadata[0])
+        .expect("input-split root must publish its linear cache (else this test is vacuous)");
+
+    let truth = |x: f64| -(1.0 + d0 as f64) * x;
+    let mut violations = Vec::new();
+    for x in [-1.0_f64, -0.5, 0.0, 0.5, 1.0] {
+        let lower = restored.lower_a()[[0, 0]] as f64 * x + restored.lower_b()[0] as f64;
+        let upper = restored.upper_a()[[0, 0]] as f64 * x + restored.upper_b()[0] as f64;
+        if lower > truth(x) {
+            violations.push(format!("x={x}: lower plane {lower:e} > f {:e}", truth(x)));
+        }
+        if upper < truth(x) {
+            violations.push(format!("x={x}: upper plane {upper:e} < f {:e}", truth(x)));
+        }
+    }
+    println!(
+        "[warm-err] site=input_split_root_cache violations={}",
+        violations.len()
+    );
+    assert!(
+        violations.is_empty(),
+        "restored input-split cache is TIGHTER than the certified root bound \
+         (dropped coefficient error): {violations:#?}"
+    );
+    println!("[warm-err] TEST_COMPLETE name=warm_err_input_split_root_cache");
     Ok(())
 }

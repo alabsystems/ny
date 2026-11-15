@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Tests for GroupNorm IBP and CROWN propagation.
-//! Part of #3205.
 
 use ndarray::{Array1, ArrayD, IxDyn};
 use ny_tensor::BoundedTensor;
@@ -452,7 +451,7 @@ fn test_crown_mode_sound_returns_error() {
     assert!(result.is_err(), "Sound mode should return error");
 }
 
-/// Regression test for #3257: cpg*time_len exceeds f32 exact integer range
+/// Regression test: cpg*time_len exceeds f32 exact integer range
 /// even when time_len alone does not.
 /// Uses validate_ibp_input directly to avoid allocating huge computation buffers.
 #[test]
@@ -521,11 +520,11 @@ fn test_crown_mode_cut_returns_identity() {
     assert_eq!(result.num_inputs(), 12);
 }
 
-// ── CROWN scalar NaN/Inf pre-activation guard tests (#3259) ────────────────
+// ── CROWN scalar NaN/Inf pre-activation guard tests ────────────────
 // GroupNorm delegates to crown_common::sampling_crown_scalar which has the
 // non-finite guard. These tests verify GroupNorm reaches that guard correctly.
 
-/// NaN in pre-activation lower bound triggers constant bounds fallback (#3259).
+/// NaN in pre-activation lower bound triggers constant bounds fallback.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_scalar_nan_pre_activation_lower_returns_constant_bounds() {
@@ -560,7 +559,7 @@ fn test_crown_scalar_nan_pre_activation_lower_returns_constant_bounds() {
     );
 }
 
-/// NaN in pre-activation upper bound triggers constant bounds fallback (#3259).
+/// NaN in pre-activation upper bound triggers constant bounds fallback.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_scalar_nan_pre_activation_upper_returns_constant_bounds() {
@@ -594,7 +593,7 @@ fn test_crown_scalar_nan_pre_activation_upper_returns_constant_bounds() {
     );
 }
 
-/// Inf in pre-activation bounds triggers constant bounds fallback (#3259).
+/// Inf in pre-activation bounds triggers constant bounds fallback.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_scalar_inf_pre_activation_returns_constant_bounds() {

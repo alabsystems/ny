@@ -580,10 +580,20 @@ impl GraphNetwork {
                         );
                         return report;
                     };
+                    let effective_shape = match layer.effective_broadcast_shape(&input.shape) {
+                        Ok(shape) => shape,
+                        Err(_) => {
+                            report.decline(
+                                OneAxisDeclineReason::ShapeMismatch,
+                                Some(name),
+                                Some(layer_type),
+                            );
+                            return report;
+                        }
+                    };
                     if layer.constant().ndim() > ONE_AXIS_MAX_RANK
                         || layer.constant().len() > ONE_AXIS_MAX_TENSOR_ELEMENTS
-                        || crate::shape::broadcast_shapes(&input.shape, layer.constant().shape())
-                            .as_deref()
+                        || crate::shape::broadcast_shapes(&input.shape, &effective_shape).as_deref()
                             != Some(output_shape.as_slice())
                         || input.expression == AxisExpression::SigmoidPiecewiseAffine
                     {

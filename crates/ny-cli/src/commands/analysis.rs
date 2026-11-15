@@ -523,6 +523,8 @@ pub(crate) fn handle_profile_bounds_command(
                     "input_width": l.input_width,
                     "output_width": l.output_width,
                     "mean_output_width": l.mean_output_width,
+                    "unstable_count": l.unstable_count,
+                    "num_elements": l.num_elements,
                     "median_output_width": l.median_output_width,
                     "growth_ratio": l.growth_ratio,
                     "cumulative_expansion": l.cumulative_expansion,

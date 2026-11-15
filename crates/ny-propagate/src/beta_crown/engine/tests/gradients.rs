@@ -447,7 +447,7 @@ fn test_analytical_gradient_multiple_constraints() {
     );
 }
 
-/// Regression test for #2192: compute_joint_gradients with an unsupported layer
+/// Regression test: compute_joint_gradients with an unsupported layer
 /// must succeed using IBP concretization (backward) and zero sensitivity (forward),
 /// not silently skip the layer or return identity bounds.
 #[ntest::timeout(10000)]
@@ -583,7 +583,7 @@ fn alpha_gradient_test_fixture() -> (
     )
 }
 
-/// Regression test for #2252: alpha gradient dead conditional fix.
+/// Regression test: alpha gradient dead conditional fix.
 /// Verifies analytical alpha gradients are finite and at least one is non-zero.
 #[ntest::timeout(10000)]
 #[test]
@@ -601,7 +601,7 @@ fn test_alpha_gradient_includes_preactivation_factor_2252() {
     }
 }
 
-/// Regression test for #2252: numerical gradient consistency.
+/// Regression test: numerical gradient consistency.
 /// Verifies analytical alpha gradients match numerical gradients in magnitude,
 /// not just sign. Uses the same relative+absolute tolerance as the beta gradient
 /// test (test_analytical_vs_numerical_gradient_consistency).
@@ -695,7 +695,7 @@ fn nan_pre_relu_fixture() -> (Network, BoundedTensor, Vec<Arc<BoundedTensor>>) {
     (network, input, layer_bounds)
 }
 
-/// Regression test for #2902: compute_joint_gradients NaN guard gap.
+/// Regression test: compute_joint_gradients NaN guard gap.
 /// NaN pre-ReLU bounds must not produce NaN slopes via u/(u-l) division.
 #[ntest::timeout(10000)]
 #[test]
@@ -784,7 +784,7 @@ fn near_zero_width_pre_relu_fixture() -> (Network, BoundedTensor, Vec<Arc<Bounde
     (network, input, layer_bounds)
 }
 
-/// Regression test for #2697: near-zero-width pre-ReLU bounds must not produce
+/// Regression test: near-zero-width pre-ReLU bounds must not produce
 /// Inf slopes via unguarded u/(u-l) division in the gradient backward path.
 #[ntest::timeout(10000)]
 #[test]

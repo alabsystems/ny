@@ -573,7 +573,6 @@ fn test_crown_negative_slope_negative_coeff_soundness() -> Result<()> {
 // ---- Alpha=0 boundary case (#1914) ----
 
 /// PReLU with alpha=0 should behave identically to ReLU.
-/// Part of #1914.
 #[ntest::timeout(5000)]
 #[test]
 fn test_ibp_alpha_zero_reduces_to_relu() -> Result<()> {
@@ -600,7 +599,6 @@ fn test_ibp_alpha_zero_reduces_to_relu() -> Result<()> {
 }
 
 /// PReLU CROWN with alpha=0 should produce ReLU-equivalent relaxation.
-/// Part of #1914.
 #[ntest::timeout(5000)]
 #[test]
 fn test_crown_alpha_zero_reduces_to_relu() -> Result<()> {
@@ -633,9 +631,9 @@ fn test_crown_alpha_zero_reduces_to_relu() -> Result<()> {
     Ok(())
 }
 
-// ---- IBP negative slope crossing precision (#1914) ----
+// ---- IBP negative slope crossing precision ----
 
-/// Regression test for #1914: IBP with negative slope in crossing region
+/// Regression test: IBP with negative slope in crossing region
 /// must produce tight bounds (lower=0, upper=max(slope*l, u)), not the
 /// overly conservative bounds from the old code.
 #[ntest::timeout(5000)]
@@ -667,9 +665,9 @@ fn test_ibp_negative_slope_crossing_tight_bounds() -> Result<()> {
     Ok(())
 }
 
-// ---- Empty slope rejection (#2865) ----
+// ---- Empty slope rejection ----
 
-/// Regression test for #2865: `PReluLayer::new` with empty slope must return
+/// Regression test: `PReluLayer::new` with empty slope must return
 /// an error, not construct a layer that panics on `get_slope(idx % 0)`.
 #[test]
 fn test_new_empty_slope_is_rejected() {
@@ -682,7 +680,7 @@ fn test_new_empty_slope_is_rejected() {
     );
 }
 
-// ── CROWN relaxation soundness proptest (#3321) ─────────────────────
+// ── CROWN relaxation soundness proptest ─────────────────────
 
 /// Reference PReLU in f64, independent of the crate f32 implementation.
 fn prelu_f64_reference(x: f64, alpha: f64) -> f64 {
@@ -696,7 +694,7 @@ fn prelu_f64_reference(x: f64, alpha: f64) -> f64 {
 proptest::proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(1000) })]
 
-    /// #3321: Verify prelu_linear_relaxation produces strictly sound bounds.
+    /// Verify prelu_linear_relaxation produces strictly sound bounds.
     /// For random intervals, the lower bound must satisfy
     ///   lower_slope * x + lower_intercept <= PReLU(x)  for all x in [l, u]
     /// and the upper bound must satisfy
@@ -746,9 +744,9 @@ proptest::proptest! {
     }
 }
 
-// ── Per-channel PReLU with spatial dimensions (regression #4168) ─────
+// ── Per-channel PReLU with spatial dimensions (regression) ───────────
 
-/// Regression test for #4168: IBP with per-channel slopes on [C=2, T=3] input.
+/// Regression test: IBP with per-channel slopes on [C=2, T=3] input.
 /// The old modulo-based slope(idx % C) gave wrong channel assignments for spatial
 /// dims; stride-based slope_for_flat(idx, stride=T) with idx/T is correct.
 #[ntest::timeout(5000)]
@@ -803,7 +801,7 @@ fn test_per_channel_ibp_with_spatial_dims_4168() -> Result<()> {
     Ok(())
 }
 
-/// Regression test for #4168: CROWN backward with per-channel slopes on [C=2, T=2] input.
+/// Regression test: CROWN backward with per-channel slopes on [C=2, T=2] input.
 /// Verifies that the diagonal relaxation entries use the correct channel slope.
 #[ntest::timeout(5000)]
 #[test]
@@ -859,7 +857,7 @@ fn test_per_channel_crown_with_spatial_dims_4168() -> Result<()> {
     Ok(())
 }
 
-/// Regression test for #4168: stride mismatch when total elements not divisible by slope count.
+/// Regression test: stride mismatch when total elements not divisible by slope count.
 #[ntest::timeout(5000)]
 #[test]
 fn test_per_channel_stride_mismatch_returns_error() {
@@ -882,7 +880,7 @@ fn test_per_channel_stride_mismatch_returns_error() {
 proptest::proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(128) })]
 
-    /// Property regression for #4168: per-channel slopes must stay constant
+    /// Property regression: per-channel slopes must stay constant
     /// across spatial positions within a channel for multi-element `[C, T]`
     /// inputs. The old modulo lookup (`idx % C`) violated this when `T > 1`.
     #[test]

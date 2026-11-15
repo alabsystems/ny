@@ -280,7 +280,7 @@ fn assert_two_chunk_crown_crossfade_guarantees(
 #[cfg(feature = "external-avoice")]
 fn test_prefix_crown_crossfade_refines_ibp_guarantees_3500() {
     crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
-    // Concrete-point containment (#3683): evaluate prefix at center of the
+    // Concrete-point containment: evaluate prefix at center of the
     // epsilon ball and assert the output is within IBP bounds.
     {
         let fixture = with_kokoro_crown_lock(cached_prefix_crown_fixture);
@@ -336,7 +336,7 @@ fn test_prefix_crown_crossfade_refines_ibp_guarantees_3500() {
             (&crown_xfade_lo, &crown_xfade_hi),
             (&crown_xfade_e_lo, &crown_xfade_e_hi),
         );
-    // #3683: assert refinement metrics are non-trivial, not just logged.
+    // Assert refinement metrics are non-trivial, not just logged.
     // CROWN should tighten at least some crossfade intervals or energies
     // relative to IBP. Zero tightening signals a regression in the CROWN
     // pipeline or a vacuous comparison.

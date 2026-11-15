@@ -6,8 +6,6 @@
 //!
 //! Verifies `decomposed_norm_crown_backward` from `layernorm.rs` produces
 //! sound linear bounds that always contain the true LayerNorm output.
-//!
-//! Part of #4209.
 
 use super::layernorm::decomposed_norm_crown_backward;
 use super::tests_support::{constant_batched_bounds, interpolate};

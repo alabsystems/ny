@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! CROWN backward pass GPU pipeline creation (#3397).
+//! CROWN backward pass GPU pipeline creation.
 //!
 //! Split from pipelines.rs for file size compliance. Contains pipeline and
 //! bind group layout setup for the three CROWN backward compute shaders:
@@ -26,7 +26,7 @@ impl WgpuDevice {
             CROWN_ACTIVATION_BACKWARD_SHADER,
         );
 
-        // Bind group layout: 8 bindings (was 11 before #3444 fix).
+        // Bind group layout: 8 bindings (formerly 11).
         // Slopes/intercepts packed into a single buffer (binding 3) to avoid
         // buffer aliasing where all 4 sub-arrays read from offset 0.
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -141,7 +141,7 @@ impl WgpuDevice {
         (pipeline, bind_group_layout)
     }
 
-    /// Create the ReLU dual-alpha activation backward pipeline (#4313).
+    /// Create the ReLU dual-alpha activation backward pipeline.
     ///
     /// Reuses the same bind-group layout as the standard activation backward
     /// pipeline (same 8 bindings, same `CrownActivationParams`), but dispatches

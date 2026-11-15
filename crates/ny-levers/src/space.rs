@@ -273,6 +273,9 @@ const CATEGORY_PREFIXES: &[(&str, &[&str])] = &[
         &["isomorphic_acasxu", "monotonic_acasxu"],
     ),
     ("NY_NN4SYS_CTX_GROUP", &["nn4sys"]),
+    ("NY_NN4SYS_1D_COMPLETE_COVER", &["nn4sys"]),
+    ("NY_NN4SYS_1D_COVER_DEPTH", &["nn4sys"]),
+    ("NY_NN4SYS_1D_COVER_SLICE", &["nn4sys"]),
     ("NY_SAFENLP_MIP_CYCLE", &["safenlp"]),
     ("NY_BNN_SIGN_SPACE", &["traffic_signs_recognition"]),
     (
@@ -372,6 +375,134 @@ impl std::fmt::Display for Inert {
 /// UNSAFE axes, excluded permanently. Listed rather than omitted so that a future
 /// reader can see they were considered and rejected on purpose.
 const UNSAFE_AXES: &[Axis] = &[
+    Axis {
+        name: crate::decls::kernel_inputs::CONVTRANSPOSE_SOUND_F64_GPU.name,
+        domain: Domain::Enum(&["0", "1"]),
+        class: Class::Unsafe,
+        deliver: Deliver::EnvOnly,
+        why: "Existing raw kernel input with different finite and legacy defaults; source/error/deadline/backend authority must remain unchanged. Manual rollback/conformance only; not an automated search dimension",
+    },
+    Axis {
+        name: crate::decls::kernel_inputs::CONV_SKIP_DEAD_F32.name,
+        domain: Domain::Enum(&["0", "1"]),
+        class: Class::Unsafe,
+        deliver: Deliver::EnvOnly,
+        why: "Inherited literal-zero rollback over certified f64 recomputation; declaring the input preserves its not-zero predicate and default. No new search or typed preset promotion",
+    },
+    Axis {
+        name: crate::decls::kernel_inputs::FORWARD_LINEAR_MACS_PER_SEC.name,
+        domain: Domain::Grid(&[]),
+        class: Class::Unsafe,
+        deliver: Deliver::EnvOnly,
+        why: "Manual positive-u128 cost calibration override; no automatic tuning domain. Both existing readers retain env/probe/cache/fallback precedence and their original parser",
+    },
+    Axis {
+        name: "NY_ROOT_CERTIFIED_CUT",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::EnvOnly,
+        why: "Owner-directed default-on authored raw-chain loading and one-query certified root-cut attempt; literal0 rollback. Actual source/deadline/memory/work guards required; no current category performance qualification or automated search permission",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_CLASSWISE",
+        domain: Domain::Enum(&["0", "1"]),
+        class: Class::Unsafe,
+        deliver: Deliver::EnvOnly,
+        why: "legacy classwise research schedule changes proof scheduling and suppresses \
+              parallel frontiers; declaration preserves its broader truthy Text predicate. \
+              Default off, no typed promotion or automated search qualification",
+    },
+    Axis {
+        name: "NY_SWEEP_CROSSING_TARGETS_ONLY",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::EnvOnly,
+        why: "exact-\"1\" research switch for the comprehensive root sweep's per-chunk row \
+              budget (ccb88c16b): drops zero-crossing targets and gives each survivor its own \
+              window cursor. Landed declared but UNCATEGORISED, which left \
+              every_declared_lever_is_accounted_for red on origin/main. Withheld from search \
+              rather than promoted: its own declaration is moat High and says the forfeited \
+              stable rows are an UNQUANTIFIED loss, with no armed-vs-unarmed comparison yet. \
+              Absence is its declaration default (dark, byte-for-byte today's allocation). \
+              Promote it to a typed preset key only once that comparison exists",
+    },
+    Axis {
+        name: "NY_NO_CELL_ENUM",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::EnvOnly,
+        why: "exact-\"1\" kill switch that WITHDRAWS the cell-enumeration authority at all \
+              three of its sites. Excluded rather than searched because one arm strictly \
+              dominates: absence leaves the authority engaged, and arming it can only remove \
+              a verdict path — try_cell_enumeration returns None so the ordinary pipeline \
+              runs unchanged, and f64_point_definitely_safe returns None, i.e. NO CLAIM. It \
+              can lose a proof cell enumeration would have produced and cannot mint one, so \
+              there is nothing for a search to find. Declared 2026-09-02 (#no-cell-enum) to \
+              retire the raw-read debt of its three byte-identical direct-literal readers; \
+              it stays a manual research/kill switch",
+    },
+    Axis {
+        name: "NY_PATCHES_GPU",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::EnvOnly,
+        why: "legacy truthy-grammar master for the Conv2d Patches compose engine-GEMM seam whose \
+              ABSENCE defers to fast_f32_gemm::is_installed() — a contextual default no emitted \
+              token can restore, so a search that touches it cannot return to baseline. Declared \
+              2026-09-01 (#patches-engine-wiring) to retire its literal-frontier debt; the seam's \
+              scored-route levers are the typed bab.patches_engine_refusal_containment / \
+              bab.fast_f32_prewarm pair, and this stays a manual research/kill switch",
+    },
+    Axis {
+        name: "NY_NO_FORWARD_LINEAR_REF",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::EnvOnly,
+        why: "exact-\"1\" kill switch that withdraws the default-ON conv-DAG forward-linear \
+              reference source from every consumer at once (Step-1 intermediates, alpha \
+              references, the spec-margin rebuild, the attack-phase cache warmer). Arming it \
+              is a whole-route rollback onto incomparable collectors, not a treatment a \
+              search should sample. Declared 2026-09-30 (#fl-alpha-composition) to retire \
+              its literal-frontier debt; it stays a manual research/kill switch",
+    },
+    Axis {
+        name: "NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::EnvOnly,
+        why: "exact-\"1\" kill switch for the default-ON ConvTranspose2d/BatchNorm image \
+              forward-linear surface, whose engaged arm is the cGAN root enclosure recorded \
+              ~1000x tighter than the collectors it replaced. Arming it only rolls that \
+              surface back. Declared 2026-09-30 (#fl-alpha-composition) to retire its \
+              literal-frontier debt; it stays a manual research/kill switch",
+    },
+    Axis {
+        name: "NY_FORWARD_LINEAR_SEQ_CONV_REF",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::EnvOnly,
+        why: "default-dark #cora-fwdlin-ref research gate admitting plain-Conv2d SEQUENTIAL \
+              chains to the forward-linear alpha reference attempt. It has no typed preset \
+              key and no armed-vs-unarmed comparison, so it is withheld from search rather \
+              than counted as undelivered verdict-affecting debt. Declared 2026-09-30 \
+              (#fl-alpha-composition) to retire its literal-frontier debt",
+    },
+    Axis {
+        name: "NY_FORWARD_LINEAR_F32",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::PresetKey("model.forward_linear_f32_seam"),
+        why: "legacy env route of the #fl-f32-seam-key f32 value-GEMM seam, which REPLACES \
+              the composition's certified f64 GEMM error bound with the looser Higham f32 \
+              one: sound but PRECISION-NEGATIVE (0 gains, 1 regression on cifar100 per \
+              docs/CIFAR100_BOUND_PARITY_ORACLE.md) with a standing do-not-arm record. \
+              The CLI layers this variable over the key exactly as the flight receipt does \
+              (resolve_forward_linear_f32_seam), so a sampled env value WOULD override a \
+              preset's own choice, one more reason it is never searched. \
+              Arm it per preset on measured evidence through model.forward_linear_f32_seam, \
+              never by search. Declared 2026-09-30 (#fl-alpha-composition) to retire its \
+              literal-frontier debt",
+    },
     Axis {
         name: "NY_PATCHES_DEADLINE_FLAT_BIAS",
         domain: Domain::Bool,
@@ -626,6 +757,295 @@ const UNSAFE_AXES: &[Axis] = &[
         deliver: Deliver::PresetKey("bab.root_joint_interm_alpha_layers"),
         why: "free-form graph-local ReLU names are deliverable for reproducible instance research but do not define a portable global treatment. The sole listed token is the automatic-selection control; automated search must not synthesize node names or graduate an unmatched selector as negative evidence",
     },
+    // RETIRED 2026-09-29 (ENGINE_PROGRAM R1 kill line + R2). Both were promoted
+    // `margin_row.*` keys; the typed keys are now refused at preset validation
+    // and the lanes refuse an environment request, so neither is a treatment a
+    // search may set.
+    Axis {
+        // #mr-gpu-eval: the certified pass's conv backward products on cuBLAS.
+        name: "NY_MARGIN_ROW_GPU_CONV",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::EnvOnly,
+        why: "RETIRED by measurement: per-op conv offload of the certified margin-row pass \
+              (38,552 convs at 3.74 ms each) turned cifar100 c2050 unsat 88.5 s into a timeout \
+              and c1590 unsat 78 s into unknown on the yaml route with zero NY_* (W7B), which \
+              is program rule R1's kill line; its device products also enter certified values, \
+              which R2 forbids until the M9 preconditions hold. The typed key \
+              margin_row.gpu_conv is refused at preset validation and the lane never arms the \
+              route (`gpu_conv::armed` is false; a request prints `[mr-gpu-conv] refused \
+              reason=retired(...)`). Kept declared so an old environment gets a loud refusal",
+    },
+    Axis {
+        // #bi-gpu: backward-interm / joint-refresh prefix pairs on cuBLAS.
+        name: "NY_MARGIN_ROW_BI_GPU",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::EnvOnly,
+        why: "RETIRED under R2 (the device never certifies): its cuBLAS Dgemm products are the \
+              CERTIFIED intermediate boxes, covered only by a-priori charges, with no \
+              `-fmad=false` build, SASS-only authority, live-state KAT or A10G moat (M9 \
+              preconditions), and its gated tests ran emulated engines only; it is also the \
+              per-op offload shape R1 retired with margin_row.gpu_conv. The typed key \
+              margin_row.bi_gpu is refused at preset validation and an armed phase is refused \
+              at runtime (`[bi-gpu] refused reason=r2_device_never_certifies`, the dark CPU \
+              pairs bit for bit). Kept declared so an old environment gets a loud refusal",
+    },
+    Axis {
+        // #router-r2 (ROUTER_PROGRAM R2). The seven acting-rule ablation
+        // switches, appended LAST so no existing literal site's structural
+        // anchor moves.
+        name: "NY_ROUTER_RULE_ADMISSION",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::PresetKey("router.rules.admission"),
+        why: "ablation switch of the acting router rule CR-A: it can move a verdict only \
+              under router.mode: on, which search never selects (NY_ROUTER_MODE's domain is \
+              off|shadow), and a rule joins or leaves the shipped acting set by a compiled \
+              move after its moat, never by a searched value. Typed key so a measurement \
+              ablates it with zero NY_*; engagement evidence is `[router] act rule=CR-A \
+              acts=`",
+    },
+    Axis {
+        name: "NY_ROUTER_RULE_CONTRACTS",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::PresetKey("router.rules.contracts"),
+        why: "ablation switch of the acting router rule CR-C: it can move a verdict only \
+              under router.mode: on, which search never selects (NY_ROUTER_MODE's domain is \
+              off|shadow), and a rule joins or leaves the shipped acting set by a compiled \
+              move after its moat, never by a searched value. Typed key so a measurement \
+              ablates it with zero NY_*; engagement evidence is `[router] act rule=CR-C \
+              acts=`",
+    },
+    Axis {
+        name: "NY_ROUTER_RULE_CAP_AUTHORITY",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::PresetKey("router.rules.cap_authority"),
+        why: "ablation switch of the acting router rule CR-1: it can move a verdict only \
+              under router.mode: on, which search never selects (NY_ROUTER_MODE's domain is \
+              off|shadow), and a rule joins or leaves the shipped acting set by a compiled \
+              move after its moat, never by a searched value. Typed key so a measurement \
+              ablates it with zero NY_*; engagement evidence is `[router] act rule=CR-1 \
+              acts=`",
+    },
+    Axis {
+        name: "NY_ROUTER_RULE_TERMINAL",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::PresetKey("router.rules.terminal"),
+        why: "ablation switch of the acting router rule CR-T: it can move a verdict only \
+              under router.mode: on, which search never selects (NY_ROUTER_MODE's domain is \
+              off|shadow), and a rule joins or leaves the shipped acting set by a compiled \
+              move after its moat, never by a searched value. Typed key so a measurement \
+              ablates it with zero NY_*; engagement evidence is `[router] act rule=CR-T \
+              acts=`",
+    },
+    Axis {
+        name: "NY_ROUTER_RULE_HAND_ON",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::PresetKey("router.rules.hand_on"),
+        why: "ablation switch of the acting router rule CR-H: it can move a verdict only \
+              under router.mode: on, which search never selects (NY_ROUTER_MODE's domain is \
+              off|shadow), and a rule joins or leaves the shipped acting set by a compiled \
+              move after its moat, never by a searched value. Typed key so a measurement \
+              ablates it with zero NY_*; engagement evidence is `[router] act rule=CR-H \
+              acts=`",
+    },
+    Axis {
+        name: "NY_ROUTER_RULE_PUBLISH_GRACE",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::PresetKey("router.rules.publish_grace"),
+        why: "ablation switch of the acting router rule CR-R: it can move a verdict only \
+              under router.mode: on, which search never selects (NY_ROUTER_MODE's domain is \
+              off|shadow), and a rule joins or leaves the shipped acting set by a compiled \
+              move after its moat, never by a searched value. Typed key so a measurement \
+              ablates it with zero NY_*; engagement evidence is `[router] act rule=CR-R \
+              acts=`",
+    },
+    Axis {
+        name: "NY_ROUTER_RULE_DERIVED_CAPS",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::PresetKey("router.rules.derived_caps"),
+        why: "ablation switch of the acting router rule CR-K: it can move a verdict only \
+              under router.mode: on, which search never selects (NY_ROUTER_MODE's domain is \
+              off|shadow), and a rule joins or leaves the shipped acting set by a compiled \
+              move after its moat, never by a searched value. Typed key so a measurement \
+              ablates it with zero NY_*; engagement evidence is `[router] act rule=CR-K \
+              acts=`",
+    },
+    // #router-r3 (ROUTER_PROGRAM R3). The four O-STOP optimizer-rule ablation
+    // switches, appended LAST so no existing literal site's structural anchor
+    // moves.
+    Axis {
+        name: "NY_OPTIMIZER_RULE_GOVERNOR",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::PresetKey("optimizer.rules.governor"),
+        why: "ablation switch of the acting optimizer rule rule.governor: it can move a verdict only \
+              under optimizer.mode: on, which search never selects (the optimizer mode's \
+              searched domain is off|shadow), and a rule joins or leaves the shipped acting \
+              set by a compiled move after its moat, never by a searched value. Typed key so \
+              a measurement ablates it with zero environment; engagement evidence is \
+              `[optimizer] act rule=rule.governor acts=`",
+    },
+    Axis {
+        name: "NY_OPTIMIZER_RULE_IA_YIELD",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::PresetKey("optimizer.rules.ia_yield"),
+        why: "ablation switch of the acting optimizer rule rule.ia_yield: it can move a verdict only \
+              under optimizer.mode: on, which search never selects (the optimizer mode's \
+              searched domain is off|shadow), and a rule joins or leaves the shipped acting \
+              set by a compiled move after its moat, never by a searched value. Typed key so \
+              a measurement ablates it with zero environment; engagement evidence is \
+              `[optimizer] act rule=rule.ia_yield acts=`",
+    },
+    Axis {
+        name: "NY_OPTIMIZER_RULE_ATTACK_DEFER",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::PresetKey("optimizer.rules.attack_defer"),
+        why: "ablation switch of the acting optimizer rule rule.attack_defer: it can move a verdict only \
+              under optimizer.mode: on, which search never selects (the optimizer mode's \
+              searched domain is off|shadow), and a rule joins or leaves the shipped acting \
+              set by a compiled move after its moat, never by a searched value. Typed key so \
+              a measurement ablates it with zero environment; engagement evidence is \
+              `[optimizer] act rule=rule.attack_defer acts=`",
+    },
+    Axis {
+        name: "NY_OPTIMIZER_RULE_ROOT_ADMISSION",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::PresetKey("optimizer.rules.root_admission"),
+        why: "ablation switch of the acting optimizer rule rule.root_admission: it can move a verdict only \
+              under optimizer.mode: on, which search never selects (the optimizer mode's \
+              searched domain is off|shadow), and a rule joins or leaves the shipped acting \
+              set by a compiled move after its moat, never by a searched value. Typed key so \
+              a measurement ablates it with zero environment; engagement evidence is \
+              `[optimizer] act rule=rule.root_admission acts=`",
+    },
+    // #router-r4 (ROUTER_PROGRAM R4). Acting set 3's two ablation switches,
+    // appended LAST so no existing literal site's structural anchor moves.
+    Axis {
+        name: "NY_ROUTER_RULE_LEASE",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::PresetKey("router.rules.lease"),
+        why: "ablation switch of the acting router rule CR-L (the memory lease): it can move a \
+              verdict only under router.mode: on, which search never selects (the router \
+              mode's searched domain is off|shadow), and a rule joins or leaves the shipped \
+              acting set by a compiled move after its moat, never by a searched value. Typed \
+              key so a measurement ablates it with zero environment; engagement evidence is \
+              `[router] act rule=CR-L acts=`",
+    },
+    Axis {
+        name: "NY_ROUTER_RULE_FAR_HAND_ON",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::PresetKey("router.rules.far_hand_on"),
+        why: "ablation switch of the acting router rule CR-F (the FAR hand-on): it can move a \
+              verdict only under router.mode: on, which search never selects (the router \
+              mode's searched domain is off|shadow), and a rule joins or leaves the shipped \
+              acting set by a compiled move after its moat, never by a searched value. Typed \
+              key so a measurement ablates it with zero environment; engagement evidence is \
+              `[router] act rule=CR-F acts=`",
+    },
+    // #router-r5 (ROUTER_PROGRAM R5). Acting set 4's two ablation switches,
+    // appended LAST so no existing literal site's structural anchor moves.
+    Axis {
+        name: "NY_ROUTER_RULE_ROUTE",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::PresetKey("router.rules.route"),
+        why: "ablation switch of the acting router rule CR-RS (capabilities routed only at \
+              SR.seal): it can move a verdict only under router.mode: on, which search never \
+              selects (the router mode's searched domain is off|shadow), and a rule joins or \
+              leaves the shipped acting set by a compiled move after its moat, never by a \
+              searched value. Typed key so a measurement ablates it with zero environment; \
+              engagement evidence is `[router] act rule=CR-RS acts=`",
+    },
+    Axis {
+        name: "NY_ROUTER_RULE_GAP_CONTRACT",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::PresetKey("router.rules.gap_contract"),
+        why: "ablation switch of the acting router rule CR-G (gap-order contracts inside \
+              multi-objective lanes): it can move a verdict only under router.mode: on, which \
+              search never selects (the router mode's searched domain is off|shadow), and a \
+              rule joins or leaves the shipped acting set by a compiled move after its moat, \
+              never by a searched value. Typed key so a measurement ablates it with zero \
+              environment; engagement evidence is `[router] act rule=CR-G acts=`",
+    },
+    // #router-r6 (ROUTER_PROGRAM R6). The four O-TRIAL optimizer-rule
+    // ablation switches, appended LAST so no existing literal site's
+    // structural anchor moves.
+    Axis {
+        name: "NY_OPTIMIZER_RULE_TRIAL_WIDTH",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::PresetKey("optimizer.rules.trial_width"),
+        why: "ablation switch of the acting optimizer trial rule rule.trial_width: it can move a \
+              verdict only under optimizer.mode: on, which search never selects (the \
+              optimizer mode's searched domain is off|shadow), and a rule joins or leaves \
+              the shipped acting set by a compiled move after its moat, never by a searched \
+              value. Typed key so a measurement ablates it with zero environment; \
+              engagement evidence is `[optimizer] act rule=rule.trial_width acts=`",
+    },
+    Axis {
+        name: "NY_OPTIMIZER_RULE_TRIAL_LR_BACKOFF",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::PresetKey("optimizer.rules.trial_lr_backoff"),
+        why: "ablation switch of the acting optimizer trial rule rule.trial_lr_backoff: it can move a \
+              verdict only under optimizer.mode: on, which search never selects (the \
+              optimizer mode's searched domain is off|shadow), and a rule joins or leaves \
+              the shipped acting set by a compiled move after its moat, never by a searched \
+              value. Typed key so a measurement ablates it with zero environment; \
+              engagement evidence is `[optimizer] act rule=rule.trial_lr_backoff acts=`",
+    },
+    Axis {
+        name: "NY_OPTIMIZER_RULE_TRIAL_SPLIT_RESTART",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::PresetKey("optimizer.rules.trial_split_restart"),
+        why: "ablation switch of the acting optimizer trial rule rule.trial_split_restart: it can move a \
+              verdict only under optimizer.mode: on, which search never selects (the \
+              optimizer mode's searched domain is off|shadow), and a rule joins or leaves \
+              the shipped acting set by a compiled move after its moat, never by a searched \
+              value. Typed key so a measurement ablates it with zero environment; \
+              engagement evidence is `[optimizer] act rule=rule.trial_split_restart acts=`",
+    },
+    Axis {
+        name: "NY_OPTIMIZER_RULE_TRIAL_ATTACK_HALVING",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::PresetKey("optimizer.rules.trial_attack_halving"),
+        why: "ablation switch of the acting optimizer trial rule rule.trial_attack_halving: it can move a \
+              verdict only under optimizer.mode: on, which search never selects (the \
+              optimizer mode's searched domain is off|shadow), and a rule joins or leaves \
+              the shipped acting set by a compiled move after its moat, never by a searched \
+              value. Typed key so a measurement ablates it with zero environment; \
+              engagement evidence is `[optimizer] act rule=rule.trial_attack_halving acts=`",
+    },
+    // #router-r7 (ROUTER_PROGRAM R7). The offline-prior switch, appended LAST
+    // so no existing literal site's structural anchor moves.
+    Axis {
+        name: "NY_OPTIMIZER_PRIORS",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::PresetKey("optimizer.priors"),
+        why: "lets the router read the compiled offline cost-model prior for planning \
+              (first rungs, CR-C contracts; CR-A keeps an unfit priced slot on today's \
+              deadline under router.mode: on). Withheld from search like the rule switches: \
+              a prior joins the shipped plan by a compiled default move after its moat and \
+              its held-out gates, never by a searched value. Typed key so a measurement arms \
+              it with zero environment; engagement evidence is `[router] priors v=`",
+    },
 ];
 
 /// Telemetry axes. Instruments, never treatment arms.
@@ -724,10 +1144,26 @@ const INSTRUMENT_ONLY: &[&str] = &[
     "NY_CONV_PATCHES_DEBUG",
     "NY_BNN_SIGN_SPACE_TRACE",
     "NY_DUMP_NODE_BOUNDS",
+    // #graph-free-candidates (#smart-turn-x86-harvest), 2026-09-26. A side
+    // file, not a treatment: it records the candidates the graph-free lane
+    // offers to its UNCHANGED acceptance gates (and a bounded sample of the
+    // surrogate incumbents) for offline replay on a checker-parity x86 host,
+    // and nothing it writes is read back by ny. It cannot move a bound or a
+    // verdict — this list's admission rule — but it is not free: each record
+    // is ~6.7 MB of encoding and I/O inside the lane's deadline, which is
+    // exactly the "instruments are NOT free" hazard, so it must never ride in
+    // a timing arm. It has a typed preset key (`attack.graph_free_candidate_sidefile`)
+    // only because run_instance.sh exports no NY_*, so a zero-NY_* diagnostic
+    // run needs a yaml route; the flight receipt projects that key through
+    // `graph_free_sidefile::preset_config_value`, not through an axis.
+    "NY_GRAPH_FREE_CANDIDATE_SIDEFILE",
 ];
 
 /// Test-only axes, excluded: they exist to drive fixtures, not the scored path.
 const TEST_ONLY: &[&str] = &[
+    "NY_HULL_RESOURCE_ORIGINAL_REQUEST",
+    "NY_GROUPED_ORIGINAL_PROBE_REQUEST",
+    "NY_VIT_BENCH",
     "NY_FULL_MEASUREMENTS",
     "NY_BENCH_ROOT",
     "NY_BENCH_ROOT_2026",
@@ -950,6 +1386,28 @@ const AXES: &[Axis] = &[
         why: "the ONLY axis in the registry carrying Provenance::Measured — and \
               its recorded delta is zero row conversions",
     },
+    // #vit-margin-alpha (2026-09-24). Both PROMOTED dark: a typed key armed by
+    // no shipped yaml, so this is DELIVERABLE, not armed. The vit measurement
+    // arms them only in a scratch configs dir.
+    Axis {
+        name: "NY_ROOT_ALPHA_MARGIN_GRADIENT",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        // Was an undeclared raw env read (`propagate_dag/mod.rs`), i.e. dead in
+        // competition; now resolved env-over-config from this key.
+        deliver: Deliver::PresetKey("bab.alpha_crown.root_alpha_margin_gradient"),
+        why: "margin C-row root alpha loss; on bilinear-state roots it runs the \
+              certified C-row margin ascent and publishes a certify-once margin \
+              bound the root intersects, so it can move a published bound",
+    },
+    Axis {
+        name: "NY_ROOT_ALPHA_MATMUL",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("bab.alpha_crown.matmul_alpha"),
+        why: "alpha on the attention McCormick planes inside the margin ascent; \
+              changes the certified margin bound the root merges",
+    },
     // --- misc engine ---
     Axis {
         name: "NY_TRUE_GRAD_GPU_REPLAY",
@@ -1101,6 +1559,54 @@ const AXES: &[Axis] = &[
               banked proof to a frozen-frame gain that fails to transfer",
     },
     Axis {
+        name: "NY_MARGIN_ROW_SPEC_ALPHA",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.spec_alpha"),
+        why: "#spec-alpha: the per-START-NODE (spec) alpha axis at the root \
+              direct pass. abc optimises alpha[relu][start_node] and gains a \
+              median +0.163 at the root; ny holds one shared alpha per \
+              (layer, neuron). Folds by element-wise max, so it raises the \
+              published root or costs only wall",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_SPEC_ALPHA_WIDTH",
+        domain: Domain::Grid(&[1, 2, 3, 4, 8]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.spec_alpha_width"),
+        why: "how many hardest failing classes get candidates; candidates are \
+              pass WIDTH not pass COUNT, so this prices columns rather than \
+              passes. `1` is the control",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_SPEC_ALPHA_CANDS",
+        domain: Domain::Grid(&[1, 2, 3, 5]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.spec_alpha_cands"),
+        why: "candidates per class from the five-entry closed-form ladder, \
+              ordered most-distinct-first so a truncated dose keeps the \
+              informative candidates",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_SPEC_ALPHA_ROUNDS",
+        domain: Domain::Grid(&[1, 2, 3]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.spec_alpha_rounds"),
+        why: "gradient rounds after the ladder; `1` (enumerate only) is the \
+              control and each further round is one more certified pass, which \
+              is what prices the mechanism against the row's wall",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_SPEC_ALPHA_ENTRIES",
+        domain: Domain::Grid(&[0, 4096, 65536, 1048576]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.spec_alpha_entries"),
+        why: "hard cap on committed exception entries; the margin-row lane \
+              consults no memory governor and competition runs with no cgroup, \
+              so this is one of the only two bounds that exist. `0` refuses \
+              loudly and is the negative control",
+    },
+    Axis {
         name: "NY_MARGIN_ROW_K_ADAPT",
         domain: Domain::Bool,
         class: Class::VerdictAffecting,
@@ -1119,11 +1625,36 @@ const AXES: &[Axis] = &[
         why: "clips the margin row against the certified envelope",
     },
     Axis {
+        name: "NY_MARGIN_ROW_CLIP_HEAD",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.clip_head"),
+        why: "per-domain HEAD-split halfspaces re-concretize the OTHER head neurons before the \
+              head gates are derived (alpha-beta-CROWN clip_interm_domain, head layer -- the \
+              dominant term on the traced rows). Needs no clip_rows retention: the certified \
+              head lines come from the y-pack the eval already holds",
+    },
+    Axis {
         name: "NY_MARGIN_ROW_CLIP_INTERM",
         domain: Domain::Bool,
         class: Class::VerdictAffecting,
+        // Promoted from EnvOnly: `run_instance.sh` exports exactly one `NY_*`,
+        // so while this was env-only the whole Clip-and-Verify intermediate
+        // half was unreachable on a scored run however well it measured.
         deliver: Deliver::PresetKey("margin_row.clip_interm"),
         why: "extends that clip to intermediate bounds; refinement of the clip above",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_CLIP_STATEFUL",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.clip_stateful"),
+        why: "accumulates the clip's intermediate tightening per domain and inherits it \
+              parent -> child instead of recomputing from the root frame and discarding it. \
+              This is the alpha-beta-CROWN 2024->2025 cifar100 diff (add clip_interm_domain, \
+              REMOVE interm_transfer:False) and it is the reason ny's stateless port measured \
+              a FLAT dose-response. Only searchable jointly with NY_MARGIN_ROW_CLIP_INTERM: \
+              armed alone it is inert",
     },
     Axis {
         name: "NY_MARGIN_ROW_CLIP_ROWS",
@@ -1131,6 +1662,9 @@ const AXES: &[Axis] = &[
         class: Class::SafeToSearch,
         deliver: Deliver::PresetKey("margin_row.clip_rows"),
         why: "retains the certified clip halfspace rows required by both clip consumers; retention alone is value-neutral, but the declaration records Low moat risk because those rows are load-bearing for bound-moving paths",
+        // Promoted from EnvOnly: this is THE THIRD GATE. Root-build retention is
+        // the prerequisite of every Clip-and-Verify consumer, so while it was
+        // env-only the other two clip axes could not fire on a scored run at all.
     },
     Axis {
         name: "NY_MARGIN_ROW_CLIP_TOPK",
@@ -1294,6 +1828,16 @@ const AXES: &[Axis] = &[
               tinyimagenet configs both choose the former and ny hardcoded the latter",
     },
     Axis {
+        name: "NY_MARGIN_ROW_PARENT_LIFT",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.parent_lift"),
+        why: "fold the branching scores the expansion already paid for into the child bound \
+              floor: each scored candidate splits the parent into two children that COVER \
+              it, so min(l_i, r_i) lower-bounds the parent and max_i of that is free \
+              evidence ny currently discards for all but the candidate it splits on",
+    },
+    Axis {
         name: "NY_MARGIN_ROW_CLOSURE_ADAPTIVE",
         domain: Domain::Bool,
         class: Class::VerdictAffecting,
@@ -1357,6 +1901,27 @@ const AXES: &[Axis] = &[
         class: Class::VerdictAffecting,
         deliver: Deliver::PresetKey("bab.cpu_compute_engine"),
         why: "retains or suppresses the optional CPU compute-engine presence handle; this can change which sound verifier work reaches the deadline, while an independently qualified WGPU proof device is always retained",
+    },
+    Axis {
+        name: "NY_PATCHES_ENGINE_REFUSAL_CONTAINMENT",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        // PROMOTED DARK 2026-08-31 (#patches-engine-refusal-containment,
+        // reports/measured-2026/cct_bound_gap_2026-08-31). Default OFF and set
+        // by no category-resolvable yaml, so this is a no-op today: it makes
+        // the containment DELIVERABLE, not armed.
+        deliver: Deliver::PresetKey("bab.patches_engine_refusal_containment"),
+        why: "treats a POLICY-refusing GEMM engine at the Conv2d Patches compose seam as an absent accelerator so the walk keeps its byte-identical CPU scatter in patches instead of dying into a dense retry that blows the memory budget and leaves IBP-grade intermediates",
+    },
+    Axis {
+        name: "NY_FAST_F32_PREWARM",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        // PROMOTED DARK 2026-08-31 (#fast-f32-prewarm-all-hosts, same report).
+        // Scheduling-only (engine materialization, no bound math), but it
+        // changes which certified work completes before the deadline.
+        deliver: Deliver::PresetKey("bab.fast_f32_prewarm"),
+        why: "materializes the registered fast-f32 GEMM factory on the vnncomp route for every build, so finite-deadline consumers (which fail closed on a cold slot) can reach a real GEMM instead of the quarantined proof adapter",
     },
     Axis {
         name: "NY_ROOT_JOINT_INTERM_ALPHA",
@@ -1633,6 +2198,20 @@ const AXES: &[Axis] = &[
         deliver: Deliver::PresetKey("attack.pgd_hinge_tau"),
         why: "odd-lane tau-hinge threshold changes which conjunct rows contribute to the exact gradient; zero is the measured incumbent",
     },
+    Axis {
+        name: "NY_PGD_DISJ_ODI",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("attack.pgd_disj_odi"),
+        why: "#disj-odi: arms the ODI phase on every disjunctive exact-VJP wave's dynamic lanes, so ODI_STEPS/ODI_ETA reach the disjunctive driver; it moves those lanes' start points and spends ODI VJP passes of the attack slice",
+    },
+    Axis {
+        name: "NY_PGD_DISJ_FOCUS_LANES",
+        domain: Domain::Grid(&[0, 16, 32, 48, 64]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("attack.pgd_disj_focus_lanes"),
+        why: "#disj-odi: dangerous-class focus lanes appended after the disjunctive restart waves (ODI init, HINGE_TAU hinge, cosine momentum-sign steps); they spend the rest of the attack slice on the two closest clauses",
+    },
     // --- VNN-COMP scored-entry upfront falsification policy ---
     //
     // These four values are resolved from one entry-time LeverSet and the same
@@ -1691,6 +2270,13 @@ const AXES: &[Axis] = &[
         why: "fixed whole-second transfer from the internal verifier to the outer post-BaB trusted-ORT falsifier. Absence/zero is the current historical baseline rather than an advertised treatment; 100 is the ACAS Xu hypothesis that produced host-local SAT candidates, with smaller allocations pricing how much proof time that result actually needs. Search is restricted to ACAS Xu until another family has both outcome evidence and typed engine-deadline provenance. Configured search also excludes exact relational entry bypasses and any category preset that explicitly disables the outer wrapper before spending a run. A request can saturate at the ten-second verifier floor or lose/tie another deadline authority, and the lane can fail to start real work, so only an unsaturated versioned execution receipt can establish engagement",
     },
     Axis {
+        name: "NY_POSTBAB_RESTARTS",
+        domain: Domain::Grid(&[2, 4, 8, 16]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("attack.post_bab_restarts"),
+        why: "diversified-restart count for the post-BaB stage-0 alternation after it self-terminates with attack window remaining. Absence/zero is the historical convergent single-descent baseline; the 2026-08-31 soundnessbench window probe measured that stack reaching bit-identical fixed points at 11 s and 49.6 s windows, so restart DIVERSITY (different basins) rather than window length is the axis under measurement, and the reference tool runs 250 restarts on that family. Engagement evidence is the lane's own per-restart basin/margin lines plus its terminal restarts-used line; a run without them is VOID, not negative. Every restart candidate still passes the unchanged trusted-ORT acceptance and the caller's unchanged gate_sat_with_trusted_oracle",
+    },
+    Axis {
         name: "NY_POSTBAB_ATTACK",
         // The legacy process input is deliberately a one-way rollback: only
         // exact `0` owns the env layer. Search measures the kill against the
@@ -1720,6 +2306,28 @@ const AXES: &[Axis] = &[
         // no-op today: it makes the mechanism DELIVERABLE, not armed.
         deliver: Deliver::PresetKey("attack.falsify_portfolio_secs"),
         why: "wall budget for that portfolio, taken from the same instance window the sound lanes spend",
+    },
+    Axis {
+        name: "NY_FLAT_SURROGATE_MAX_BLOCKS",
+        domain: Domain::Grid(&[0, 512, 2048, 4096]),
+        class: Class::VerdictAffecting,
+        // PROMOTED AT BIRTH (#flat-ladder-depth, 2026-08-31): the typed key is
+        // the primary route and the env name exists only for A/B recipes.
+        // Default 0 and set by no shipped yaml, so this is a no-op today: it
+        // makes the mechanism DELIVERABLE, not armed.
+        deliver: Deliver::PresetKey("attack.flat_surrogate_max_blocks"),
+        why: "caps the active Hadamard block count in the flat-objective surrogate ladder, switching it to selective deep refinement; changes which zeroth-order probes are spent and therefore which counterexamples are findable within the budget",
+    },
+    Axis {
+        name: "NY_FLAT_SURROGATE_TRANSFER",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        // PROMOTED AT BIRTH (#flat-surrogate-transfer, 2026-08-31): the typed
+        // key is the primary route and the env name exists only for A/B
+        // recipes. Default false and set by no shipped yaml, so this is a
+        // no-op today: it makes the mechanism DELIVERABLE, not armed.
+        deliver: Deliver::PresetKey("attack.flat_surrogate_transfer"),
+        why: "runs the surrogate->real transfer stage after the surrogate margin crosses zero, walking the real output's quantizer staircase from the surrogate optimum; changes which zeroth-order probes are spent and therefore which counterexamples are findable within the budget",
     },
     Axis {
         name: "NY_ATTACK_PRE_SOFTMAX_OBJECTIVE",
@@ -1857,6 +2465,30 @@ const AXES: &[Axis] = &[
         deliver: Deliver::PresetKey("bab.graph_mip_leaf_sat"),
         why: "hands BaB leaves to the MIP backend for a SAT decision instead of leaving them unknown",
     },
+    Axis {
+        name: "NY_MIP_LEAF_UNDECIDED_STREAK_CAP",
+        domain: Domain::Grid(&[0, 1, 2, 3]),
+        class: Class::VerdictAffecting,
+        // PROMOTED AT BIRTH (#metaroom-mip-governor, 2026-09-11): the typed key
+        // is the primary route and the env name exists only for A/B recipes.
+        // Default 0 (no cap) and set by no shipped yaml, so this is a no-op
+        // today: it makes the mechanism DELIVERABLE, not armed.
+        deliver: Deliver::PresetKey("bab.mip.leaf_undecided_streak_cap"),
+        why: "stops the Graph-MIP leaf oracle after N consecutive undecided consults and returns the \
+              remaining seconds to branch-and-bound; on metaroom spec_idx_28 the oracle spent 60.4s of \
+              a 210s budget for six undecided replies, so the cap changes how much search the row gets",
+    },
+    Axis {
+        name: "NY_MIP_ESCALATE_SKIP_CERTIFIED",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        // PROMOTED AT BIRTH (#metaroom-mip-governor, 2026-09-11): same shape as
+        // the sibling above. Default false and set by no shipped yaml.
+        deliver: Deliver::PresetKey("bab.mip.escalation_skips_certified_clauses"),
+        why: "seeds the disjunctive MIP escalation's pending set from the uncertified clauses only, so the \
+              one open clause gets the whole slice instead of 1/19th of it; changes which clause is \
+              actually solved within the escalation budget",
+    },
     // --- margin-row backward / beta / cgan (4227a10bc, declared after the fact) ---
     Axis {
         name: "NY_MARGIN_ROW_BACKWARD_INTERM",
@@ -1931,6 +2563,24 @@ const AXES: &[Axis] = &[
         class: Class::VerdictAffecting,
         deliver: Deliver::PresetKey("margin_row.bi_topk"),
         why: "how many neurons get refined; unlike the chunk size this changes WHICH bounds move",
+    },
+    Axis {
+        // #interm-alpha. Without this axis the typed key existed but the frozen
+        // LeverSet had no config layer for it, so the scored path resolved the
+        // declaration default 0 while `set_margin_row_interm_alpha_preset` set a
+        // compat cell the scored path never reads — the 2026-08-27 preset-bridge
+        // proof run showed `[backward-interm] armed` and NO `[interm-alpha]`
+        // line with `interm_alpha: 2` in the loaded yaml. Delivery is the axis
+        // entry, not the cell.
+        name: "NY_MARGIN_ROW_INTERM_ALPHA",
+        domain: Domain::Grid(&[0, 1, 2, 3, 4, 5]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.interm_alpha"),
+        why: "per-START-NODE prefix alpha candidates in the backward-intermediate phase; \
+              each candidate box is intersected shrink-only into the published box, so a \
+              wrong dose costs wall (charged as ia_secs against the BI budget), never \
+              soundness — but the wall it costs can lose a marginal proof, which keeps it \
+              verdict-affecting",
     },
     Axis {
         name: "NY_MARGIN_ROW_BETA",
@@ -2079,6 +2729,154 @@ const AXES: &[Axis] = &[
               certified build, so a short budget publishes an earlier root rather than a wrong one",
     },
     Axis {
+        // #bi-window (cct plan P5 step 1).
+        name: "NY_MARGIN_ROW_BI_WINDOW",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.bi_window"),
+        why: "receptive-field-cropped backward-interm prefix passes; each cropped pair is a \
+              certified pass of the unchanged engine on a net that computes exactly the seeded \
+              pre-activations (never looser than the dense pair), so it cannot unsound a box, \
+              but it changes how many boxes the phase can afford inside its wall budget and \
+              therefore the published root",
+    },
+    Axis {
+        // #bi-patch (per-column receptive-field prefix passes).
+        name: "NY_MARGIN_ROW_BI_PATCH",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.bi_patch"),
+        why: "backward-interm and joint-refresh prefix pass pairs as per-column receptive-field \
+              walks; each patch pair is the dense pair restricted to its support (never looser, \
+              certified on its own), so it cannot unsound a box, but it changes how many boxes \
+              the phase can afford inside its wall budget and therefore the published root",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_BI_PATCH_RATIO",
+        // Every token must survive the F64ClosedTrimmed { 0.05, 1.0 } parser,
+        // pinned by `every_domain_token_survives_the_real_parser`.
+        domain: Domain::Enum(&["0.25", "0.5", "1.0"]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.bi_patch_ratio"),
+        why: "the patch-to-dense crossover of the patch walk; every setting is the same \
+              certified pass over a support containing the true one, but it moves the phase's \
+              wall and therefore how many boxes it tightens",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_BI_PATCH_MB",
+        domain: Domain::Grid(&[128, 256, 512]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.bi_patch_mb"),
+        why: "per-pass working-set cap of the patch walk (batching only: the same columns, \
+              grouped differently); it moves the phase's wall and memory and therefore how \
+              many boxes it tightens",
+    },
+    Axis {
+        // #joint-refresh (cct plan P5 step 2).
+        name: "NY_MARGIN_ROW_JOINT_REFRESH",
+        domain: Domain::Grid(&[0, 2, 4]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.joint_refresh"),
+        why: "rounds of the backward-only joint intermediate refresh (re-derive every trunk box \
+              from the current gates shrink-only, re-steer alpha on the refreshed head frame, \
+              round-monotone accept on the certified root bound); an accepted round moves the \
+              published root bound and spends root wall the tree needs",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_JOINT_REFRESH_SECS",
+        domain: Domain::Grid(&[15, 30, 60]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.joint_refresh_secs"),
+        why: "wall budget for the joint refresh; a round the remainder cannot pay is refused \
+              and expiry fails closed to the previously accepted certified root",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_HEAD_GROUPS",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.head_groups"),
+        why: "complete two- or four-neuron phase covers can improve published outer-root \
+              class bounds through source-owned outward weak-dual replay; the fixed pass \
+              spends at most five seconds within the original deadline. User-directed \
+              default true, explicitly enabled by SafeNLP; false disables the whole \
+              route. This default is not evidence of an added solved query",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_HEAD_DIRECTIONAL_CUTS",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.head_directional_cuts"),
+        why: "Source-certified directional cuts share one root relaxation and the \
+              existing bounded deadline. Default true; explicit false disables only \
+              this stage, while parent head_groups false disables the entire route. \
+              Invalid replay or expiry keeps the incumbent; benefit remains unmeasured",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_HEAD_PHASE_COVER",
+        domain: Domain::Grid(&[0, 1, 2, 3, 4, 5, 6, 7]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.head_phase_cover"),
+        why: "opt-in complete original-input Source phase cover can strengthen the root \
+              only after every closed leaf is locally replayed; at most seven heads, \
+              within the existing head-group and original instance deadlines. Zero and \
+              absence are off, head_groups must also be armed, and no shipped yaml \
+              sets this key; performance qualification remains pending",
+    },
+    Axis {
+        // #root-certify-once (VIBECHECK_PLAN Phase-0.5 root alpha,
+        // search-untrusted / certify-once).
+        name: "NY_MARGIN_ROW_ROOT_CERTIFY_ONCE",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.root_certify_once"),
+        why: "runs the root alpha ascent UNTRUSTED on a Parity scratch root and publishes ONE \
+              certified evaluation of the chosen alpha only if it strictly beats the certified \
+              incumbent; an accepted candidate moves the published root bound, and the phase \
+              spends root wall the tree needs. Engagement evidence is the \
+              `[root-certify-once] armed=1 iters=` terminal line; an armed run without it is VOID",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_ROOT_CERTIFY_ONCE_ITERS",
+        domain: Domain::Grid(&[10, 20, 40]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.root_certify_once_iters"),
+        why: "untrusted spec-phase iterations; they decide which alpha reaches the single \
+              certified evaluation and how much of the phase's wall the search spends",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_ROOT_CERTIFY_ONCE_REFRESH",
+        domain: Domain::Grid(&[0, 5, 10]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.root_certify_once_refresh"),
+        why: "untrusted joint-intermediate rounds (abc's per-iteration intermediate refresh on \
+              the scratch); a round that tightens adds one certified refresh of the chosen \
+              alpha's boxes, which can become the published root, and costs root wall",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_ROOT_CERTIFY_ONCE_SECS",
+        domain: Domain::Grid(&[10, 20, 40]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.root_certify_once_secs"),
+        why: "wall budget for the certify-once phase; the certified evaluation is reserved \
+              first and a budget that cannot pay a search step refuses, leaving the certified \
+              incumbent root standing",
+    },
+    Axis {
+        // #bbe-joint-root (ENGINE_PROGRAM M5a).
+        name: "NY_MARGIN_ROW_ROOT_SEARCH",
+        domain: Domain::Enum(&["ascent", "joint_f32"]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.root_search"),
+        why: "selects the UNTRUSTED search inside #root-certify-once: today's ascent \
+              (bit-identical) or the injected ny-bbe joint-alpha root search (CROWN init, spec \
+              prune, per-start-node alpha with in-loop refresh, early exits). Its slopes reach \
+              the certified root only through the existing ingest gate and ONE certified \
+              evaluation, but an accepted candidate moves the published root bound and the \
+              search spends root wall. Engagement evidence is the \
+              `[bbe] phase=joint_root iters= search_s= certify_s= root_lb=` line; an armed \
+              `joint_f32` run without it is VOID",
+    },
+    Axis {
         name: "NY_MARGIN_ROW_ROOT_F32",
         domain: Domain::Bool,
         class: Class::VerdictAffecting,
@@ -2097,6 +2895,35 @@ const AXES: &[Axis] = &[
               directed-up, or charged into the certified g_err concretize slack, so it can \
               only LOOSEN a published bound (costing a proof, never manufacturing one). \
               Inert — refused loudly — unless margin_row.root_f32 arms the f32 compute lane",
+    },
+    Axis {
+        // #mr-ibp-seed (FRONTIER_PLAN 7.F2).
+        name: "NY_MARGIN_ROW_IBP_SEED",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.ibp_seed"),
+        why: "intersects every trunk box of the root tableau walk shrink-only with its certified \
+              IBP box (after the forward-only bi_cal capture, before backward-interm); on \
+              IBP-trained nets it moves the published root bound by whole units, and an \
+              under-charged radius would be a false-unsat generator. Residual trunks decline \
+              byte-identically. Engagement evidence is the `[mr-ibp-seed] layer=` line per \
+              trunk relu; an armed run without it is VOID",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_DOMAIN_STACK",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.domain_stack"),
+        why: "One wide certified scoring pass across the whole frontier batch instead of one \
+              pass per domain (#domain-stack). The certified pass is linear above R~64 columns \
+              on a 45-60 ms fixed cost but the lane runs it at R = nf = 3-11, ~13x the marginal \
+              cost, and scoring is 83% of the lane — so this moves the prover onto the linear \
+              part of its own cost curve, and is the affordability precondition for a \
+              per-domain joint alpha+beta re-optimisation. Column-local by construction: a \
+              stacked score is BIT-IDENTICAL to the independent one (pinned by \
+              domain_stacked_candidate_scores_match_independent_frontier_bit_exact), so it \
+              selects a schedule, not a relaxation, and cannot move a published bound. \
+              Verdict-affecting because it changes what the lane can finish inside its budget",
     },
     Axis {
         name: "NY_MARGIN_ROW_GPU_BACKWARD",
@@ -2220,6 +3047,54 @@ const AXES: &[Axis] = &[
               per box. Fail-closed cover/disjointness proofs, but it changes WHICH \
               boxes get bounded, so coverage — hence verdicts — can move",
     },
+    // --- #nn4sys-1d-cover (2026-09-11) ------------------------------------
+    // Promoted TOGETHER. The master alone is reachable and INERT: the cover's
+    // pass is all-or-nothing, so the reader's DEFAULT_DEPTH of 8 decides
+    // whether an armed run publishes anything at all, and an unfenced cover
+    // can take the whole screen slice and return `None`.
+    Axis {
+        name: "NY_NN4SYS_1D_COMPLETE_COVER",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        // PROMOTED 2026-09-11. Default OFF. Armed by exactly ONE shipped yaml,
+        // `configs/vnncomp25/nn4sys_1dcover_canary.yaml`, whose basename no
+        // category can resolve to (`preset_basename_candidates` yields only
+        // the lowercased category and its year-stripped base), so this is a
+        // no-op on every scored run — it makes the mechanism DELIVERABLE and
+        // MEASURABLE through the real route, not armed.
+        deliver: Deliver::PresetKey("bab.nn4sys_1d_cover"),
+        why: "exact one-axis f64 complete cover as a prepass in front of the \
+              box-refinement clause screen. The census says 97.2-97.8% of non-dual \
+              and 75.8-79.1% of DUAL nn4sys clauses are one-axis candidates, so this \
+              is the only mechanism on the front that reduces the root box COUNT \
+              rather than the per-box constant. All-or-nothing and fail-closed, but \
+              it publishes per-clause discharges, so verdicts move",
+    },
+    Axis {
+        name: "NY_NN4SYS_1D_COVER_DEPTH",
+        // The reader clamps to HARD_MAX_DEPTH = 24 and requires
+        // centered_start_depth <= depth, so every token here is admissible at
+        // the read site as well as at the parser.
+        domain: Domain::Grid(&[8, 12, 16, 20, 24]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("bab.nn4sys_1d_cover_depth"),
+        why: "per-axis bisection depth of the cover. NOT a refinement of the master \
+              but a condition on it: the pass discards everything on one undecided \
+              leaf, so too small a depth delivers a correct, reachable, INERT \
+              mechanism — the alpha_iteration:1 / cols=8->cols=1 shape",
+    },
+    Axis {
+        name: "NY_NN4SYS_1D_COVER_SLICE",
+        // Every token must survive the F64ClosedTrimmed { 0.02, 0.5 } parser,
+        // pinned by `every_domain_token_survives_the_real_parser`.
+        domain: Domain::Enum(&["0.05", "0.10", "0.25", "0.50"]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("bab.nn4sys_1d_cover_slice"),
+        why: "fraction of the caller's REMAINING deadline the cover may consume, and \
+              the selector for the bounded partial mode. A budget only — but this \
+              benchmark's own banked sat_escape_branch A/B took 12 dual rows to 1 by \
+              re-slicing the same budget, so it is VerdictAffecting",
+    },
     Axis {
         name: "NY_POLLABLE_FAER",
         // NOTE: the declaration is Text (legacy truthy parser: trimmed non-empty,
@@ -2250,6 +3125,411 @@ const AXES: &[Axis] = &[
               to IBP and that degraded intermediate is published into every \
               downstream bound, so the choice moves bounds — hence verdicts — in \
               both directions",
+    },
+    // --- #dense-sparse-seed (2026-09-24) -----------------------------------
+    // ARMED at 0.1 by configs/vnncomp26/challenging_certified_training_2026.yaml
+    // (and its patches-wiring canary, which must differ from it by exactly two
+    // other keys). Not category-scoped in the implementation: any sequential
+    // CROWN-IBP collection with a Dense-carrier ReLU-successor target reads it.
+    Axis {
+        name: "NY_CROWN_PARTIAL_DENSE_MIN_STABLE",
+        // Every token must survive the F64ClosedTrimmed { 0.0, 1.0 } parser,
+        // pinned by `every_domain_token_survives_the_real_parser`. "0.9" is the
+        // historical literal (the declaration default); "0.1" is
+        // alpha-beta-CROWN's `minimum_sparsity: 0.9` in ny's convention.
+        domain: Domain::Enum(&["0.1", "0.25", "0.5", "0.9"]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("bab.crown_partial_dense_min_stable"),
+        why: "minimum IBP-stable fraction at which a Dense-seeded CROWN-IBP partial \
+              walk with a ReLU successor seeds only its IBP-unstable rows. Untracked \
+              stable neurons publish the certified IBP over the tightened prior \
+              instead of initial-IBP-intersect-CROWN; neither contains the other, so \
+              their magnitudes, and every later bound chained from them, move in \
+              BOTH directions. The successor ReLU's stable set can only grow (to \
+              rounding). The walk's row count falls with the unstable fraction, and \
+              that decides whether the collection finishes inside the budget at all",
+    },
+    // --- #lsnc-attack-twin (2026-09-24) -------------------------------------
+    // Post-BaB exact-gradient PGD on a point-folded ATTACK twin. Not category
+    // scoped in the implementation: it engages on any net whose real graph is
+    // outside the point-VJP fragment and whose constant frontier ONNX Runtime
+    // can fold; lsnc_relu is the motivating family.
+    Axis {
+        name: "NY_ATTACK_POINT_FOLDED_TWIN",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("attack.point_folded_twin"),
+        why: "admits the post-BaB twin lane, which can convert unknown to sat (every \
+              candidate through the unchanged trusted-ORT gate) and takes the post-BaB \
+              tail the ordinary lanes would otherwise own, so it changes which \
+              counterexamples are reachable within the budget. Engagement evidence is the \
+              lane's own `[lsnc-attack-twin] armed folded=` line plus its terminal `done` \
+              line; a run without them is VOID, not negative",
+    },
+    // --- #lsnc-lane (2026-09-24) --------------------------------------------
+    // The #lowdim-prover lane's LANE-PRIVATE interval twin: a second,
+    // interval-folded load of a model whose exact load left OpaqueSkip nodes,
+    // readable only by the lowdim lane. Not category scoped in the
+    // implementation; lsnc_relu is the motivating family. The global carrier
+    // NY_CONST_MATMUL_INTERVAL stays in UNSAFE_AXES, EnvOnly.
+    Axis {
+        name: "NY_LOWDIM_INTERVAL_TWIN",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("bab.branching.input_split.lowdim_interval_twin"),
+        why: "admits the lowdim lane on a model the exact loader leaves unboundable, so \
+              the lane can convert unknown to unsat (and hand a candidate point to the \
+              trusted-ORT confirmer) on rows it otherwise declines; a bound path on a \
+              family with a false-unsat history. Engagement evidence is the \
+              `[lowdim-twin] armed=1 ... attached=1` line and the lane's own \
+              `[lowdim] armed=1 entry=... interval_consts=K` with K > 0; a run \
+              without them is VOID, not negative",
+    },
+    // #lsnc-lane stage 2 (2026-09-25): the lowdim lane's JOINT QUADRATIC bound
+    // at ReduceSum(Mul) sites. Not category scoped in the implementation (a
+    // program without such a site is unaffected); lsnc_relu's lane twin is the
+    // only lowered program that has one.
+    Axis {
+        name: "NY_LOWDIM_JOINT_QUADRATIC",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("bab.branching.input_split.lowdim_joint_quadratic"),
+        why: "replaces per-product McCormick at the lowdim lane's ReduceSum(Mul) sites \
+              with one quadratic over the input box (CROWN operand certificates, exact \
+              vertex maximisation, eigen residual charged), which the numpy gate \
+              measured as 2e5-1.4e6 instead of ~5.6e7 domains per lsnc_relu unsat \
+              row — a new bound path on a family with a false-unsat history. \
+              Engagement evidence is the grouped entry's `[lowdim] joint sites=2 \
+              armed=1 root dv_ub=.. v_lb=.. site[..]=[..] planes=1` line (planes=1 at \
+              every site); `armed=1` with planes=0 is VOID, not negative",
+    },
+    // #lsnc-lane stage 3 (2026-09-25): the lowdim lane's SEARCH step. Not
+    // category scoped in the implementation; armed only in the lsnc
+    // measurement configs.
+    Axis {
+        name: "NY_LOWDIM_SPLIT",
+        domain: Domain::Enum(&["widest", "gradient", "sb", "sbwr"]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("bab.branching.input_split.lowdim_split"),
+        why: "chooses the coordinate the lowdim lane bisects: the numpy gate measured the \
+              aspect-guarded sbwr rule at 2.0e5-1.4e6 domains per lsnc_relu unsat row \
+              against 3.1e5-3.7e6 for plain sb with the same stack, so the tree shape \
+              decides whether a deadline-bounded row converts. Engagement evidence is \
+              `[lowdim-split] armed=1 value=..` and the lane's `[lowdim] lane-config \
+              split=..` line; a run whose lane-config shows the default is VOID",
+    },
+    Axis {
+        name: "NY_LOWDIM_CLIP",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("bab.branching.input_split.lowdim_clip"),
+        why: "relaxed Clip-and-Verify of each lowdim box by its own passes' planes, \
+              outward rounded: a new way to CLOSE a box on a family whose false unsat \
+              came from clipping with reused planes (807bf511). Engagement evidence is \
+              the per-clause `[lowdim] clause=.. clip_closed=.. clip_shrunk=..` counters; \
+              armed with both zero is VOID, not negative",
+    },
+    Axis {
+        name: "NY_LOWDIM_PARALLEL",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("bab.branching.input_split.lowdim_parallel"),
+        why: "decides each lowdim domain inside its rayon task instead of serially after \
+              the bound: outcome-identical by construction, but lsnc_relu is \
+              throughput-bound (1e5+ domains/s needed in 25 s), so it moves the \
+              deadline-bounded verdict. Engagement evidence is `[lowdim] lane-config \
+              parallel=full threads=T` with T > 1",
+    },
+    // #mr-errlane (margin-row throughput plan B3, 2026-09-26). `audit` is a
+    // declared token but deliberately NOT a search value: it publishes the
+    // `off` lane and doubles pass cost to MEASURE the envelopes' looseness.
+    Axis {
+        name: "NY_MARGIN_ROW_ERR_ENVELOPE",
+        domain: Domain::Enum(&["off", "envelope", "per_channel"]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.err_envelope"),
+        why: "carries the margin-row certified coefficient-error lane as ONE dominating \
+              envelope per row (`envelope`, passes with R >= 16) or per channel \
+              (`per_channel`, every pass) instead of an n x R matrix. The error lane is \
+              exactly half of every certified pass (B1 probe, all three nets), so this \
+              moves wide passes toward half cost; dominance is monotone induction and \
+              the coefficient lane is untouched, so it only LOOSENS the certified \
+              penalty — costing proofs, never manufacturing one. Engagement evidence \
+              is `[mr-errlane] done ... env_passes=` (or `pc_passes=`) > 0; an armed run \
+              with zero is VOID",
+    },
+    // #frozen-dual-state (2026-09-27): V1 stage A of the frozen dual-ascent BaB;
+    // #frozen-dual-bab: stage B makes it arm the certified search tier.
+    Axis {
+        name: "NY_MARGIN_ROW_FROZEN_DUAL_BAB",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.frozen_dual_bab"),
+        why: "arms the certified frozen alpha-zonotope dual BaB as a tier between the \
+              margin-row root and its tree: per open class, stage A's certified state \
+              (binary64, explicit gamma charges, certified fold errors, outward rounding), \
+              the static box+halfspace order, and a level-synchronous BFS whose nodes are \
+              pruned only on a certified node bound > 0 at clamped dual points. A class \
+              closes only when every leaf is certified and the level ledger closes, and it \
+              then leaves the tree's conjunction — hence verdict-affecting; the tier's wall \
+              also comes out of the tree's window. Engagement evidence is the \
+              `[frozen-dual] armed=1 objectives=` summary; an armed run without it is VOID. \
+              User-directed CIFAR100/TinyImageNet presets arm its bounded automatic tier",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_FROZEN_DUAL_BAB_NODE_CAP",
+        domain: Domain::Grid(&[250_000, 2_000_000, 8_000_000]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.frozen_dual_bab_node_cap"),
+        why: "nodes one objective's frozen-dual search may evaluate before it is handed \
+              back open; a cap can never close a class, but it decides which classes the \
+              tier closes inside the budget and how much wall it spends before the tree",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_FROZEN_DUAL_BAB_SECS",
+        // 0 selects bounded automatic mode (4 s / 5%, 8192 nodes per objective,
+        // 256 MiB state); dense estimates >=64 MiB select one objective,
+        // otherwise at most two. Positive requests retain manual mode.
+        domain: Domain::Grid(&[0, 20, 40]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.frozen_dual_bab_secs"),
+        why: "wall the frozen-dual tier may take from the tree's window; it decides how \
+              many classes the tier can close and how much budget the tree keeps for the \
+              rest, so it moves verdicts in both directions on the lane that decides \
+              cifar100 and tinyimagenet",
+    },
+    // #breakpoint-dual: bounded category-default refinement of the frozen-dual tier.
+    Axis {
+        name: "NY_MARGIN_ROW_FROZEN_DUAL_REFINE_STEPS",
+        domain: Domain::Grid(&[0, 4, 8, 16, 32]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.frozen_dual_refine_steps"),
+        why: "optional untrusted breakpoint dual refinement inside the frozen-dual tier; \
+              every candidate is scored by the unchanged certified node evaluator and \
+              retained only on strict certified improvement, while the cover ledger is \
+              unchanged. The work changes pruning and spends the tier's wall; generic \
+              default 0 keeps the historical evaluator, while the user-directed shipped \
+              CIFAR100 and TinyImageNet presets request 4 steps in bounded automatic mode",
+    },
+    Axis {
+        // #fd-shared-state (ENGINE_PROGRAM M3).
+        name: "NY_MARGIN_ROW_FROZEN_DUAL_BAB_STATE",
+        domain: Domain::Enum(&["per_class", "shared"]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.frozen_dual_bab_state"),
+        why: "how the frozen-dual tier builds its per-class states: one full build per \
+              class inside its share (per_class, bit-identical) or ONE shared trunk of rows \
+              built before the shares plus a one-column margin tail per class (shared). \
+              Shared slopes change every class's state and root (the shared-lambda root \
+              loss) and move the build out of the class shares, so which classes the tier \
+              builds, searches and closes moves in both directions. Engagement evidence is \
+              the `[frozen-dual] trunk state=shared lambda=` line; an armed `shared` run \
+              without it is VOID",
+    },
+    // #wide-fd-search (ENGINE_PROGRAM M4, 2026-09-29).
+    Axis {
+        name: "NY_MARGIN_ROW_FROZEN_DUAL_BAB_SEARCH",
+        domain: Domain::Enum(&["f64", "cpu_f32", "cuda", "auto"]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.frozen_dual_bab_search"),
+        why: "selects which search scores the frozen-dual tier's nodes: the tier's own f64 \
+              search (bit-identical) or an injected UNTRUSTED backend (ny-bbe CPU f32 SIMD, \
+              ny-cuda) whose proposed dual points the tier certifies in f64 with its own \
+              evaluator, splitting every node no proposal certifies. Every prune stays \
+              certified, but the search decides which nodes prune inside the budget, hence \
+              which classes close. Engagement evidence is the `[bbe] armed=1 backend= \
+              probe=ok` line and `search=cpu_f32 claimed=` on the class lines; an armed \
+              non-`f64` run without them is VOID",
+    },
+    // #wave-beta-bab (ENGINE_PROGRAM M6, 2026-09-29).
+    //
+    // `wave_cuda` (M6's device half) searches on the device, bit for bit the
+    // CPU f32 search; a refused device falls through to it. A run the device
+    // searched ALONE reads exactly `backend=cuda ` (trailing space) on the
+    // `[bbe] phase=wave` line; `backend=cuda->cpu_f32` starts with the same
+    // bytes and was switched to the CPU search by a device fault (it counts as
+    // a CPU run for engagement). This note is a COMMENT on
+    // purpose: `source_frontier.rs` fingerprints every lever-name literal by
+    // the 12 tokens on each side, string contents included, and the `why`
+    // string below sits 8 tokens before the next axis's
+    // `NY_MARGIN_ROW_TREE_WAVE_BATCH` literal, so editing its text
+    // re-anchors that registered frontier row. Comments are not tokens.
+    Axis {
+        name: "NY_MARGIN_ROW_TREE_MODE",
+        domain: Domain::Enum(&["legacy", "wave", "wave_cuda"]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.tree_mode"),
+        why: "selects the margin-row outer frame's tree engine: today's best-first tree \
+              (bit-identical) or waves of injected UNTRUSTED output-only beta-CROWN search \
+              whose claims a private pool certifies with the lane's own Outward evaluator \
+              (frozen -> clip -> y-pack ladder), splitting every domain it does not claim \
+              and every claim it cannot certify. Every close stays certified and passes the \
+              path-based cover gate, but the engine replaces the whole search trajectory on \
+              the lane that decides cifar100 and tinyimagenet. Engagement evidence is the \
+              `[bbe] phase=wave armed=1 backend=` line; an armed `wave` run without it is \
+              VOID",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_TREE_WAVE_BATCH",
+        domain: Domain::Grid(&[64, 256, 1024]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.tree_wave_batch"),
+        why: "domains per wave of the wave tree: the width decides which domains are \
+              searched, claimed and certified inside the budget, so it moves verdicts in \
+              both directions although every close stays certified",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_TREE_WAVE_CERT_THREADS",
+        // 0 is the SHIPPED DEFAULT (half of the lane's rayon threads).
+        domain: Domain::Grid(&[0, 4, 10]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.tree_wave_cert_threads"),
+        why: "threads of the wave tree's private certify pool; the tree is independent of \
+              it, but the certify wall per wave is not, so it decides how many claims \
+              certify inside the budget",
+    },
+    // #lowdim-bundle (2026-09-27): four dark keys of the #lowdim-prover lane.
+    // Not category scoped in the implementation; the motivating rows are
+    // dist_shift_2023 index2734 (varying dims + Sigmoid), acasxu 3_3 prop_2
+    // (boundary alpha), lsnc_relu row 58 (leaf attack) and the nn4sys
+    // mscn_2048d_dual residual clauses (shared worklist).
+    Axis {
+        name: "NY_LOWDIM_VARYING_DIMS",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("bab.branching.input_split.lowdim_varying_dims"),
+        why: "admits the lowdim lane on a box wider than its 16-dimension cap whose other \
+              coordinates are pinned, and lowers Sigmoid to rigorous planes: a new bound \
+              path that can convert unknown to unsat on rows the lane declined \
+              (dist_shift_2023's 8 varying of 792 inputs). Engagement evidence is every \
+              lane entry's `[lowdim-varying] armed=1 status=folded d_free=..`; an armed \
+              run on a pinned box without status=folded is VOID, not negative",
+    },
+    Axis {
+        name: "NY_LOWDIM_ALPHA_ITERS",
+        domain: Domain::Grid(&[0, 5, 10, 20, 40]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("bab.branching.input_split.lowdim_alpha_iters"),
+        why: "optimises the lowdim lane's lower ReLU slopes on open leaves within 10 of \
+              their threshold (Vibecheck's acasxu wide band took 3_3 prop_2 from 1.88M \
+              leaves/unknown to 431k/verified), so it closes leaves the historical bound \
+              leaves open and moves the deadline-bounded verdict. Engagement evidence is \
+              the per-run `[lowdim-alpha] done iters=.. domains=..` with domains > 0; \
+              armed with domains=0 is VOID, not negative",
+    },
+    Axis {
+        name: "NY_LOWDIM_LEAF_ATTACK_EVERY",
+        domain: Domain::Grid(&[0, 3, 10, 40]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("bab.branching.input_split.lowdim_leaf_attack_every"),
+        why: "runs PGD on the lowdim lane's worst open leaves every N waves; a hit leaves \
+              the lane as a candidate that the entry's trusted forward and the unchanged \
+              trusted-oracle gate decide, so it can turn unknown into sat (lsnc_relu row \
+              58) and ends the lane for a clause whose candidate is rejected. Engagement \
+              evidence is the per-run `[lowdim-leaf-attack] done rounds=.. evals=..`; \
+              armed with rounds=0 and skipped=0 never reached a due wave",
+    },
+    Axis {
+        name: "NY_LOWDIM_SHARED_WORKLIST",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("bab.branching.input_split.lowdim_shared_worklist"),
+        why: "proves the lowdim fold's families on one round-robin worklist without the \
+              per-clause 200k-domain cap instead of family by family, which changes which \
+              nn4sys dual clauses a deadline-bounded run closes. Engagement evidence is \
+              the fold's `[lowdim-shared] done families=.. waves=..`; an armed fold run \
+              without it is VOID, not negative",
+    },
+    Axis {
+        // #root-box-source (ENGINE_PROGRAM M5b). Appended LAST so no existing
+        // literal site's structural anchor moves.
+        name: "NY_MARGIN_ROW_ROOT_BOX_SOURCE",
+        domain: Domain::Enum(&["tableau", "patch_backward"]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.root_box_source"),
+        why: "selects how every root walk (initial, rebake round, epoch rebuild) builds its \
+              trunk boxes: the forward tableau (bit-identical) or a certified IBP reference \
+              plus a certified patch-backward pass over the reference-unstable neurons, \
+              intersected shrink-only. It replaces the source of every root box and moves the \
+              published root bound and the root wall. Engagement evidence is the \
+              `[root-box] source=patch_backward ... certify_s=` line; an armed run without it \
+              (or with `source=tableau declined=`) is VOID",
+    },
+    // #router-r1 (ROUTER_PROGRAM R1). Appended LAST so no existing literal
+    // site's structural anchor moves. The domain omits `on`: automated search
+    // never picks the acting mode, which is a compiled-default move after a
+    // both-year moat (§2.5), never a searched value.
+    //
+    // #router-r2: the `why` below predates R2 and is kept byte-for-byte (it
+    // sits inside the next literal's structural-anchor window). Since R2 `on`
+    // ACTS through acting set 1 (lane deadlines, the publish grace, rule-owned
+    // caps), so the parenthetical "`on` is effectively shadow" no longer holds
+    // for `on`; it still holds for the searched domain, which omits `on`, so
+    // this axis still cannot change a verdict. The declaration's own doc and
+    // its MoatRisk (High since R2) carry the acting mode.
+    Axis {
+        name: "NY_ROUTER_MODE",
+        domain: Domain::Enum(&["off", "shadow"]),
+        class: Class::SafeToSearch,
+        deliver: Deliver::PresetKey("router.mode"),
+        why: "the verdict-free runtime router in shadow: it extracts static facts, logs a \
+              pure hashed plan, and evaluates its checkpoints retrospectively AFTER the \
+              verdict is published. It emits no value and moves no cap (`on` is effectively \
+              shadow while ACTING_RULES is empty), so it cannot change a verdict; it costs \
+              wall clock only (kill line 0.5% on 20 s rows). Engagement evidence is the \
+              `[router] v1 mode=shadow` and `[router] done faults=` pair; a shadow run \
+              without both is VOID",
+    },
+    Axis {
+        name: "NY_OPTIMIZER_MODE",
+        domain: Domain::Enum(&["off", "shadow"]),
+        class: Class::SafeToSearch,
+        deliver: Deliver::PresetKey("optimizer.mode"),
+        why: "the runtime optimizer in shadow: after publication it logs what each O-STOP rule \
+              would have done (`[optimizer] rule= would=`); it changes no iterate, cap or \
+              clamp (`on` is effectively shadow while ACTING_OPTIMIZER_RULES is empty), so it \
+              cannot change a verdict and costs wall clock only",
+    },
+    Axis {
+        // #m8-input-split-batch (ENGINE_PROGRAM M8a). Appended LAST so no
+        // existing literal site's structural anchor moves.
+        name: "NY_LOWDIM_BATCH_ENGINE",
+        domain: Domain::Enum(&["legacy", "bbe"]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("bab.branching.input_split.lowdim_batch_engine"),
+        why: "chooses the lowdim lane's wave bounder: its own f64 forms on every domain \
+              (bit-identical) or an injected untrusted forward-linear search whose claims the \
+              lane re-bounds in f64 and whose other leaves it splits, which changes the tree \
+              and the throughput a deadline-bounded verdict depends on. Engagement evidence \
+              is `[bbe] phase=input_split lane=lowdim scheduler=.. fallback=none ... \
+              m8-input-split-batch/v1` with calls > 1 and certified > 0; an armed run whose \
+              line shows another fallback is VOID, not negative",
+    },
+    Axis {
+        // #m8-input-split-batch (ENGINE_PROGRAM M8a).
+        name: "NY_INPUT_SPLIT_ENGINE",
+        domain: Domain::Enum(&["legacy", "bbe"]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("bab.branching.input_split.engine"),
+        why: "chooses the lowdim lane's multi-clause scheduler: one tree per clause, or one \
+              disjunction tree per shared box (a leaf serves every clause still open on it) \
+              and the fold's shared worklist, which changes which clauses a deadline-bounded \
+              run proves. Engagement evidence is the grouped entry's `[lowdim-disjunction] \
+              done clauses=..` line or the fold's `[lowdim-shared] done`; an armed run \
+              without one is VOID, not negative",
+    },
+    // #vit-v3-bankable: the multi-objective cover certification gate.
+    Axis {
+        name: "NY_MO_COVER_CERTIFY",
+        domain: Domain::Enum(&["off", "ledger", "replay"]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("bab.mo_cover_certify"),
+        why: "downgrade-only certification of the disjunctive graph multi-objective \
+              BaB: `ledger` withdraws a Verified whose per-row leaves do not cover the \
+              root (and lets a proved one publish from a token), `replay` also withdraws \
+              one whose witness leaves do not re-certify without reused lane state; it \
+              never creates or tightens a verdict, but it can turn a published unsat \
+              into unknown, so every candidate must clear the moat gate",
     },
 ];
 
@@ -2406,6 +3686,21 @@ const EDGES: &[Edge] = &[
         site: "graph_pgd.rs — conjunctive tau-hinge rows are unreachable under generic batched routing",
     },
     Edge {
+        child: "NY_PGD_DISJ_ODI",
+        requires: Requirement::Armed("NY_PGD_VJP_BATCH"),
+        site: "graph_pgd_vjp_batched_disj.rs — the ODI phase runs only inside the admitted wide disjunctive driver",
+    },
+    Edge {
+        child: "NY_PGD_DISJ_ODI",
+        requires: Requirement::NotEquals("NY_PGD_ODI_STEPS", "0"),
+        site: "graph_pgd_vjp_disj_odi.rs:run_odi_phase — zero ODI steps skips the phase, so the arm would re-measure the baseline",
+    },
+    Edge {
+        child: "NY_PGD_DISJ_FOCUS_LANES",
+        requires: Requirement::Armed("NY_PGD_VJP_BATCH"),
+        site: "graph_pgd_vjp_batched_disj.rs — the focus wave runs only inside the admitted wide disjunctive driver",
+    },
+    Edge {
         child: "NY_UPFRONT_ATTACK_CAP",
         requires: Requirement::NotEquals("NY_UPFRONT_ATTACK", "0"),
         site: "commands/vnncomp.rs:try_upfront_falsify — an explicit master kill returns before budget sizing; absence remains contextual and may execute",
@@ -2502,20 +3797,48 @@ const EDGES: &[Edge] = &[
         requires: Requirement::AnyArmed(&[
             "NY_MARGIN_ROW_ALPHA_OPT",
             "NY_MARGIN_ROW_REBAKE",
+            "NY_MARGIN_ROW_ROOT_CERTIFY_ONCE",
         ]),
-        site: "margin_row/alpha_opt.rs:maybe_optimize_root_alpha and \
-               margin_row/rebake.rs:rebake_root — either root-ascent owner consumes the \
-               shared Adam step",
+        site: "margin_row/alpha_opt.rs:maybe_optimize_root_alpha, \
+               margin_row/rebake.rs:rebake_root and \
+               margin_row/root_certify_once.rs:certify_once_root — every root-ascent owner \
+               (the untrusted certify-once ascent included) consumes the shared Adam step",
     },
     Edge {
         child: "NY_MARGIN_ROW_ALPHA_COLS",
         requires: Requirement::AnyArmed(&[
             "NY_MARGIN_ROW_ALPHA_OPT",
             "NY_MARGIN_ROW_REBAKE",
+            "NY_MARGIN_ROW_ROOT_CERTIFY_ONCE",
         ]),
-        site: "margin_row/alpha_opt.rs:maybe_optimize_root_alpha and \
-               margin_row/rebake.rs:rebake_root — either root-ascent owner consumes the \
-               shared steering width",
+        site: "margin_row/alpha_opt.rs:maybe_optimize_root_alpha, \
+               margin_row/rebake.rs:rebake_root and \
+               margin_row/root_certify_once.rs:certify_once_root — every root-ascent owner \
+               (the untrusted certify-once ascent included) consumes the shared steering width",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_SPEC_ALPHA_WIDTH",
+        requires: Requirement::Armed("NY_MARGIN_ROW_SPEC_ALPHA"),
+        site: "margin_row/spec_alpha.rs:refine — the hardest-class width is \
+               consumed only after the axis arm passes",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_SPEC_ALPHA_CANDS",
+        requires: Requirement::Armed("NY_MARGIN_ROW_SPEC_ALPHA"),
+        site: "margin_row/spec_alpha.rs:refine — the ladder dose is consumed \
+               only after the axis arm passes",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_SPEC_ALPHA_ROUNDS",
+        requires: Requirement::Armed("NY_MARGIN_ROW_SPEC_ALPHA"),
+        site: "margin_row/spec_alpha.rs:refine — the gradient round count is \
+               consumed only after the axis arm passes",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_SPEC_ALPHA_ENTRIES",
+        requires: Requirement::Armed("NY_MARGIN_ROW_SPEC_ALPHA"),
+        site: "margin_row/spec_alpha.rs:refine — the committed-exception cap is \
+               consumed only after the axis arm passes",
     },
     Edge {
         child: "NY_MARGIN_ROW_ALPHA_GUARD",
@@ -2672,6 +3995,49 @@ const EDGES: &[Edge] = &[
                refused unless the f32 compute lane is effective",
     },
     Edge {
+        child: "NY_MARGIN_ROW_FROZEN_DUAL_BAB_NODE_CAP",
+        requires: Requirement::Armed("NY_MARGIN_ROW_FROZEN_DUAL_BAB"),
+        site: "margin_row/bab.rs:run_inner — the tier (and its TierPolicy::from_gates read) \
+               runs only when margin_row::zono_state::armed() latches true",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_FROZEN_DUAL_BAB_SECS",
+        requires: Requirement::Armed("NY_MARGIN_ROW_FROZEN_DUAL_BAB"),
+        site: "margin_row/bab.rs:run_inner — the tier (and its TierPolicy::from_gates read) \
+               runs only when margin_row::zono_state::armed() latches true",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_FROZEN_DUAL_REFINE_STEPS",
+        requires: Requirement::Armed("NY_MARGIN_ROW_FROZEN_DUAL_BAB"),
+        site: "margin_row/bab.rs:run_inner — refinement is read only by the armed \
+               frozen-dual tier's TierPolicy::from_gates and zero steps keeps its evaluator",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_FROZEN_DUAL_BAB_STATE",
+        requires: Requirement::Armed("NY_MARGIN_ROW_FROZEN_DUAL_BAB"),
+        site: "margin_row/bab.rs:run_inner — the tier (and its TierPolicy::from_gates read) \
+               runs only when margin_row::zono_state::armed() latches true",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_FROZEN_DUAL_BAB_SEARCH",
+        requires: Requirement::Armed("NY_MARGIN_ROW_FROZEN_DUAL_BAB"),
+        site: "margin_row/bab.rs:run_inner — the tier (and its TierPolicy::from_gates read of \
+               the search selector) runs only when margin_row::zono_state::armed() latches \
+               true",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_TREE_WAVE_BATCH",
+        requires: Requirement::Equals("NY_MARGIN_ROW_TREE_MODE", "wave"),
+        site: "margin_row/bab.rs:run_inner — the wave engine (and its width) runs only when \
+               BabConfig::wave is armed on the outer frame",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_TREE_WAVE_CERT_THREADS",
+        requires: Requirement::Equals("NY_MARGIN_ROW_TREE_MODE", "wave"),
+        site: "margin_row/bab.rs:run_inner — the wave engine (and its certify pool) runs only \
+               when BabConfig::wave is armed on the outer frame",
+    },
+    Edge {
         child: "NY_MARGIN_ROW_REBAKE_ROUNDS",
         requires: Requirement::Armed("NY_MARGIN_ROW_REBAKE"),
         site: "margin_row/rebake.rs:maybe_rebake_root — the frozen round cap is \
@@ -2682,6 +4048,76 @@ const EDGES: &[Edge] = &[
         requires: Requirement::Armed("NY_MARGIN_ROW_REBAKE"),
         site: "margin_row/rebake.rs:maybe_rebake_root — the frozen wall request \
                is consumed only inside the armed entry",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_BI_WINDOW",
+        requires: Requirement::Armed("NY_MARGIN_ROW_BACKWARD_INTERM"),
+        site: "margin_row/backward_interm.rs:BiState::tighten_layer and \
+               refresh_root_intermediates — the crop flag is read only by the phase (which \
+               returns before any pass when disarmed) and by #joint-refresh, which refuses \
+               unless the phase is armed",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_BI_PATCH",
+        requires: Requirement::Armed("NY_MARGIN_ROW_BACKWARD_INTERM"),
+        site: "margin_row/backward_interm.rs:BiState::new and rebake.rs:joint_refresh_root — \
+               the patch config reaches the phase only when the phase is armed, and \
+               #joint-refresh refuses unless the phase is armed",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_BI_PATCH_RATIO",
+        requires: Requirement::Armed("NY_MARGIN_ROW_BI_PATCH"),
+        site: "margin_row/mod.rs:BiPatchRuntimePolicy::cfg — the crossover ratio is carried \
+               into a phase config only when patch mode is armed",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_BI_PATCH_MB",
+        requires: Requirement::Armed("NY_MARGIN_ROW_BI_PATCH"),
+        site: "margin_row/mod.rs:BiPatchRuntimePolicy::cfg — the working-set cap is carried \
+               into a phase config only when patch mode is armed",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_JOINT_REFRESH",
+        requires: Requirement::Armed("NY_MARGIN_ROW_BACKWARD_INTERM"),
+        site: "margin_row/rebake.rs:joint_refresh_root — refuses loudly unless the \
+               backward-interm phase is armed (the refresh re-runs its frozen policy)",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_JOINT_REFRESH_SECS",
+        requires: Requirement::GreaterThan("NY_MARGIN_ROW_JOINT_REFRESH", 0),
+        site: "margin_row/rebake.rs:maybe_joint_refresh_root — the frozen wall request is \
+               consumed only after a nonzero round request passes the entry",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_ROOT_CERTIFY_ONCE_ITERS",
+        requires: Requirement::Armed("NY_MARGIN_ROW_ROOT_CERTIFY_ONCE"),
+        site: "margin_row/root_certify_once.rs:maybe_certify_once_root — the frozen policy is \
+               consumed only inside the armed entry",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_ROOT_CERTIFY_ONCE_REFRESH",
+        requires: Requirement::Armed("NY_MARGIN_ROW_ROOT_CERTIFY_ONCE"),
+        site: "margin_row/root_certify_once.rs:maybe_certify_once_root — the frozen policy is \
+               consumed only inside the armed entry",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_ROOT_CERTIFY_ONCE_REFRESH",
+        requires: Requirement::Armed("NY_MARGIN_ROW_BACKWARD_INTERM"),
+        site: "margin_row/root_certify_once.rs:certify_once_root — the joint rounds are \
+               refused (spec phase only) unless the backward-interm phase is armed; they \
+               re-run its frozen topk/chunk/window policy",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_ROOT_CERTIFY_ONCE_SECS",
+        requires: Requirement::Armed("NY_MARGIN_ROW_ROOT_CERTIFY_ONCE"),
+        site: "margin_row/root_certify_once.rs:maybe_certify_once_root — the frozen wall \
+               request is consumed only inside the armed entry",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_ROOT_SEARCH",
+        requires: Requirement::Armed("NY_MARGIN_ROW_ROOT_CERTIFY_ONCE"),
+        site: "margin_row/root_certify_once.rs:maybe_certify_once_root — the search selector \
+               is consumed (and the backend resolved) only inside the armed entry",
     },
     Edge {
         child: "NY_MARGIN_ROW_BETA_ETA",
@@ -2856,6 +4292,13 @@ const EDGES: &[Edge] = &[
         requires: Requirement::NotArmed("NY_ROOT_COMPREHENSIVE_GPU_INTERM_CROWN"),
         site: "multi_objective/root.rs comprehensive_gpu_or_legacy_wide — a \
                comprehensive Some(0) still owns the slot, so wide never runs",
+    },
+    Edge {
+        child: "NY_ROOT_ALPHA_MATMUL",
+        requires: Requirement::Armed("NY_ROOT_ALPHA_MARGIN_GRADIENT"),
+        site: "propagate_dag/margin_alpha.rs prepare_margin_alpha_lane — the \
+               interpolation parameters exist only inside the certified C-row \
+               margin ascent, which only the gradient key admits",
     },
 ];
 
@@ -3338,7 +4781,7 @@ mod tests {
                 "bab.branching.reduceop",
             ]
         );
-        assert!(preset_baseline_keys("NOT_A_LEVER").is_empty());
+        assert_eq!(preset_baseline_keys("NOT_A_LEVER"), &[] as &[&str]);
     }
 
     #[test]
@@ -3355,6 +4798,8 @@ mod tests {
             ("NY_PGD_LANE_WINDOW", "attack.pgd_lane_window"),
             ("NY_PGD_EXPLOIT", "attack.pgd_exploit"),
             ("NY_PGD_HINGE_TAU", "attack.pgd_hinge_tau"),
+            ("NY_PGD_DISJ_ODI", "attack.pgd_disj_odi"),
+            ("NY_PGD_DISJ_FOCUS_LANES", "attack.pgd_disj_focus_lanes"),
         ];
         for (name, key) in expected {
             let axis = AXES.iter().find(|axis| axis.name == name).unwrap();
@@ -3502,7 +4947,7 @@ mod tests {
             category_prefixes("NY_BNN_ATTACK_CAP"),
             &["traffic_signs_recognition"]
         );
-        assert!(category_prefixes("NY_MO_ALPHA_HEURISTIC").is_empty());
+        assert_eq!(category_prefixes("NY_MO_ALPHA_HEURISTIC"), &[] as &[&str]);
     }
 
     #[test]

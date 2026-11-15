@@ -13,6 +13,29 @@ use tracing::{debug, warn};
 
 use super::{certified_affine_sum_f32, certified_affine_sum_f32_with_poll, OutwardDirection};
 
+#[path = "linear/publication.rs"]
+#[allow(dead_code)] // Prepared private publication seam; finite collector stays closed.
+mod publication;
+
+#[inline]
+fn coefficient_non_finite(value: &f32) -> bool {
+    !value.is_finite()
+}
+
+#[inline]
+fn bias_nan(value: &f32) -> bool {
+    value.is_nan()
+}
+
+#[inline]
+fn sanitize_coefficient_error(value: f32) -> f32 {
+    if value.is_finite() && value >= 0.0 {
+        value
+    } else {
+        f32::INFINITY
+    }
+}
+
 // ---- NY_SLACK_PROBE (dark, print-only): total accumulated f32 soundness slack ----
 //
 // Sums, per objective row, the outward-rounding penalty
@@ -66,8 +89,8 @@ pub fn slack_probe_take() -> Vec<f64> {
 #[inline]
 fn any_non_finite<D: Dimension>(arr: &Array<f32, D>) -> bool {
     match arr.as_slice() {
-        Some(slice) => slice.iter().any(|v| !v.is_finite()),
-        None => arr.iter().any(|v| !v.is_finite()),
+        Some(slice) => slice.iter().any(coefficient_non_finite),
+        None => arr.iter().any(coefficient_non_finite),
     }
 }
 
@@ -141,8 +164,8 @@ fn f32_sum_f64_down(left: f32, right: f32) -> f64 {
 #[inline]
 fn any_nan<D: Dimension>(arr: &Array<f32, D>) -> bool {
     match arr.as_slice() {
-        Some(slice) => slice.iter().any(|v| v.is_nan()),
-        None => arr.iter().any(|v| v.is_nan()),
+        Some(slice) => slice.iter().any(bias_nan),
+        None => arr.iter().any(bias_nan),
     }
 }
 
@@ -204,6 +227,39 @@ impl LinearCloneAdmission {
     }
 }
 
+/// Copy `len` elements into `destination`, polling once per
+/// [`crate::amortise::POLL_CHUNK_UNITS`] elements (#poll-amortise).
+///
+/// `contiguous` is the standard-layout slice when the source has one: that arm
+/// is a chunked `extend_from_slice`, i.e. a real memcpy, which is what these
+/// clone paths did before the per-element `push` + `poll(1)` rewrite. The
+/// fallback arm keeps the element-wise walk for a non-standard layout and only
+/// amortises the poll. Either way the poll is charged the same total units, so
+/// the downstream `PatchesMaterializationDeadline` accounting is unchanged and
+/// expiry is noticed at most one stride later.
+fn copy_elements_polled<I>(
+    contiguous: Option<&[f32]>,
+    elements: I,
+    destination: &mut Vec<f32>,
+    deadline: &mut super::patches::PatchesMaterializationDeadline,
+    site: &'static str,
+) -> Result<()>
+where
+    I: Iterator<Item = f32>,
+{
+    if let Some(slice) = contiguous {
+        return crate::amortise::extend_polled(destination, slice, |units| {
+            deadline.work(units, site)
+        });
+    }
+    let mut poll = crate::amortise::ChunkedPoll::new(|units| deadline.work(units, site));
+    for value in elements {
+        destination.push(value);
+        crate::amortise::ReductionPoll::tick(&mut poll)?;
+    }
+    crate::amortise::ReductionPoll::flush(&mut poll)
+}
+
 fn try_copy_array2_with_deadline(
     source: &Array2<f32>,
     deadline: &mut super::patches::PatchesMaterializationDeadline,
@@ -218,10 +274,13 @@ fn try_copy_array2_with_deadline(
         .map_err(|_| admission.allocation_error(site))?;
     admission.reconcile_f32_capacity(len, values.capacity(), site)?;
     deadline.checkpoint(site)?;
-    for &value in source {
-        values.push(value);
-        deadline.work(1, site)?;
-    }
+    copy_elements_polled(
+        source.as_slice(),
+        source.iter().copied(),
+        &mut values,
+        deadline,
+        site,
+    )?;
     deadline.checkpoint(site)?;
     Array2::from_shape_vec(source.raw_dim(), values).map_err(|error| {
         NyError::InvalidSpec(format!(
@@ -244,10 +303,13 @@ fn try_copy_array1_with_deadline(
         .map_err(|_| admission.allocation_error(site))?;
     admission.reconcile_f32_capacity(len, values.capacity(), site)?;
     deadline.checkpoint(site)?;
-    for &value in source {
-        values.push(value);
-        deadline.work(1, site)?;
-    }
+    copy_elements_polled(
+        source.as_slice(),
+        source.iter().copied(),
+        &mut values,
+        deadline,
+        site,
+    )?;
     deadline.checkpoint(site)?;
     Ok(Array1::from_vec(values))
 }
@@ -314,7 +376,6 @@ fn try_generate_f32_vec_with_deadline(
 ///
 /// Code that consumes intermediate `LinearBounds` between accumulation and
 /// concretization must **not** assume `coefficients.iter().all(|v| v.is_finite())`.
-/// See: #3032 (safe_add Inf production), #3094 (this documentation).
 #[derive(Debug, Clone)]
 #[must_use = "LinearBounds from CROWN propagation should not be silently discarded"]
 pub struct LinearBounds {
@@ -354,7 +415,7 @@ impl LinearBounds {
     /// - `lower_b.len() == lower_a.nrows()`
     /// - `upper_b.len() == lower_a.nrows()`
     ///
-    /// NaN/Inf invariants (see §Key Insight in designs/2026-02-25-validated-linear-bounds.md):
+    /// NaN/Inf invariants:
     /// - Coefficient matrices (lower_a, upper_a) must be finite (no NaN or Inf).
     ///   An infinite coefficient means the bound is unbounded in proportion to
     ///   input, which is not a valid linear relaxation.
@@ -390,8 +451,6 @@ impl LinearBounds {
     /// means the bound is unbounded in proportion to input, which is not a valid
     /// linear relaxation. Biases may be ±Inf (conservative bounds from CROWN
     /// backward widening) but not NaN.
-    ///
-    /// Reference: designs/2026-02-25-validated-linear-bounds.md §Step 1
     pub(crate) fn validate_no_nan(&self) -> Result<()> {
         if any_non_finite(&self.lower_a) {
             return Err(NyError::NumericalInstability(
@@ -565,8 +624,6 @@ impl LinearBounds {
     ///
     /// Known-safe by construction: zero coefficients and ±Inf biases contain
     /// no NaN.
-    ///
-    /// Reference: designs/2026-02-25-validated-linear-bounds.md §Step 2
     pub fn conservative(num_outputs: usize, num_inputs: usize) -> Self {
         Self {
             lower_a: Array2::zeros((num_outputs, num_inputs)),
@@ -580,19 +637,16 @@ impl LinearBounds {
 
     /// Validated construction that falls back to conservative bounds on NaN.
     ///
-    /// This is the CROWN backward NaN firewall (Tier 2 of the NaN strategy,
-    /// designs/2026-02-25-nan-strategy-unification.md). When CROWN backward
-    /// produces NaN/Inf coefficients due to numerical instability, instead of
-    /// returning `Err(NumericalInstability)` (which aborts the entire backward
-    /// chain), this returns conservative bounds (A=0, b=±∞) that are sound
-    /// but maximally imprecise.
+    /// This is the CROWN backward NaN firewall (Tier 2 of the NaN strategy).
+    /// When CROWN backward produces NaN/Inf coefficients due to numerical
+    /// instability, instead of returning `Err(NumericalInstability)` (which
+    /// aborts the entire backward chain), this returns conservative bounds
+    /// (A=0, b=±∞) that are sound but maximally imprecise.
     ///
     /// Use this at CROWN backward output points where the caller would
     /// otherwise discard the entire verification attempt on NaN. For
     /// construction sites where NaN should be a hard error (e.g., spec matrix
     /// initialization), use [`new()`](Self::new) instead.
-    ///
-    /// Reference: #2812 (IBP-vs-CROWN NaN defense asymmetry)
     pub fn new_or_conservative(
         lower_a: Array2<f32>,
         lower_b: Array1<f32>,
@@ -624,7 +678,7 @@ impl LinearBounds {
     /// Construct LinearBounds with automatic NaN/Inf repair per strategy.
     ///
     /// Element-wise repair (more precise than `new_or_conservative` which does
-    /// all-or-nothing fallback). Part of #3423.
+    /// all-or-nothing fallback).
     ///
     /// Coefficient repair: Conservative: NaN/Inf → 0.0; Widen: NaN → 0.0,
     /// Inf kept (two-phase invariant); Strict: error.
@@ -1018,12 +1072,14 @@ impl LinearBounds {
     ///
     /// `Some(err)` carries `|lower_a[i,j] - true_coeff| <= err[i,j]` (all >= 0,
     /// finite). `None` means exact (error 0). See struct field docs.
-    pub(crate) fn lower_a_err(&self) -> Option<&Array2<f32>> {
+    /// This read-only view conveys no certificate scope or publication authority.
+    pub fn lower_a_err(&self) -> Option<&Array2<f32>> {
         self.lower_a_err.as_ref()
     }
 
     /// Certified per-coefficient error on the upper relaxation coefficients.
-    pub(crate) fn upper_a_err(&self) -> Option<&Array2<f32>> {
+    /// This read-only view conveys no certificate scope or publication authority.
+    pub fn upper_a_err(&self) -> Option<&Array2<f32>> {
         self.upper_a_err.as_ref()
     }
 
@@ -1047,15 +1103,8 @@ impl LinearBounds {
             *self = Self::conservative(n_out, n_in);
             return;
         }
-        let sanitize = |v: f32| {
-            if v.is_finite() && v >= 0.0 {
-                v
-            } else {
-                f32::INFINITY
-            }
-        };
-        self.lower_a_err = Some(lower_err.mapv(sanitize));
-        self.upper_a_err = Some(upper_err.mapv(sanitize));
+        self.lower_a_err = Some(lower_err.mapv(sanitize_coefficient_error));
+        self.upper_a_err = Some(upper_err.mapv(sanitize_coefficient_error));
     }
 
     /// Apply a β-CROWN split contribution to neuron column `neuron_idx`,
@@ -1796,6 +1845,9 @@ impl LinearBounds {
     /// that decompose bounds for non-verdict bookkeeping (batched-domain picked
     /// conversion, OpaqueSkip rebias) use this and lose only a precision penalty
     /// for bounds that do not reach a Verified verdict through this object.
+    /// `CachedLinearBounds` (warm-start seeds, which DO reach verdicts) refuses
+    /// error-carrying blocks; its capture sites fold the error first via
+    /// `CachedLinearBounds::fold_capture_coeff_err` (#warm-cache-err).
     pub fn into_parts(self) -> (Array2<f32>, Array1<f32>, Array2<f32>, Array1<f32>) {
         (self.lower_a, self.lower_b, self.upper_a, self.upper_b)
     }
@@ -1816,7 +1868,7 @@ impl LinearBounds {
     /// - Biases do not contain NaN
     ///
     /// Tracked: grep for `from_parts_unchecked` to audit usage sites.
-    /// Target: < 20 production uses. See designs/2026-02-25-validated-linear-bounds.md §Step 2.
+    /// Target: < 20 production uses.
     pub(crate) fn from_parts_unchecked(
         lower_a: Array2<f32>,
         lower_b: Array1<f32>,
@@ -1931,20 +1983,11 @@ impl LinearBounds {
         let mut base = Self::new_or_conservative(lower_a, lower_b, upper_a, upper_b)?;
         // If the firewall degraded to conservative bounds (coeffs zeroed), the
         // error matrices may no longer match shape; only attach when shapes line up.
-        let sanitize = |e: Array2<f32>| {
-            e.mapv(|v| {
-                if v.is_finite() && v >= 0.0 {
-                    v
-                } else {
-                    f32::INFINITY
-                }
-            })
-        };
         if lower_a_err.shape() == base.lower_a.shape()
             && upper_a_err.shape() == base.upper_a.shape()
         {
-            base.lower_a_err = Some(sanitize(lower_a_err));
-            base.upper_a_err = Some(sanitize(upper_a_err));
+            base.lower_a_err = Some(lower_a_err.mapv(sanitize_coefficient_error));
+            base.upper_a_err = Some(upper_a_err.mapv(sanitize_coefficient_error));
         } else {
             // The error matrices are part of the proof object, not optional
             // metadata.  Silently dropping a malformed carrier would publish the

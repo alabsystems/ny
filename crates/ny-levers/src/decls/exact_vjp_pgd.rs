@@ -67,6 +67,18 @@ const CONJUNCTIVE_POLICY_READERS: &[ReaderSite] = &[
         site: "crates/ny-cli/src/commands/beta_crown/verify/graph_pgd_vjp_batched.rs (try_graph_pgd_vjp_batched)",
     },
 ];
+const DISJUNCTIVE_POLICY_READERS: &[ReaderSite] = &[
+    ReaderSite {
+        scope: POLICY_SCOPE,
+        role: "resolve the entry-time frozen lever into the typed per-run PGD policy",
+        site: "crates/ny-propagate/src/pgd_attack/config.rs (ExactVjpPgdConfig)",
+    },
+    ReaderSite {
+        scope: DISJUNCTIVE_SCOPE,
+        role: "configure the disjunctive batched exact-VJP attack's ODI phase and dangerous-class focus wave",
+        site: "crates/ny-cli/src/commands/beta_crown/verify/graph_pgd_vjp_disj_odi.rs (DisjOdiPolicy::from_config)",
+    },
+];
 const FAST_GRAD_READERS: &[ReaderSite] = &[
     ReaderSite {
         scope: POLICY_SCOPE,
@@ -276,5 +288,35 @@ declare_levers! {
         },
         owner: POLICY_SCOPE,
         readers: CONJUNCTIVE_POLICY_READERS,
+    };
+
+    /// #disj-odi: default-off ODI phase on the disjunctive driver's dynamic lanes.
+    pub DISJ_ODI = LeverDecl {
+        name: "NY_PGD_DISJ_ODI",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(false),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "#disj-odi. Arms output-diversified initialization inside the batched disjunctive exact-VJP driver: before the step loop of every restart wave, the wave's DYNAMIC (uniform-init, best-disjunct) lanes take `NY_PGD_ODI_STEPS` box-clamped sign steps of scale `NY_PGD_ODI_ETA` half-ranges up a fixed random output direction, through one batched exact VJP per step, with a free candidate screen on the ODI trajectory; targeted lanes keep their clean init. Until now the disjunctive driver never read the ODI fields, so every cifar100/tinyimagenet row reported `odi_steps_configured=8 odi_vjp_steps=0` (configured, not arrived). Default false: the driver never enters the phase and is byte-identical. Attack-only: a candidate must still clear the driver's exact re-screen (`noise_scaled_margin`), `re_evaluate_and_confirm` and the trusted-ORT publication gate, and nothing here can produce `unsat`. High because it changes which counterexamples the attack slice reaches and spends ODI VJP passes of that slice.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "default false and armed by no shipped yaml, so promotion changes no scored run; the dark driver is byte-identical (named test disj_odi_dark_is_byte_identical) and an armed run counts its ODI passes (disj_odi_moves_lanes_and_counts_vjp_steps); the calibration it ports (tinyimagenet GAP idx_1831/idx_5529, ORT-confirmed in torch) is not yet measured through ny",
+        },
+        owner: POLICY_SCOPE,
+        readers: DISJUNCTIVE_POLICY_READERS,
+    };
+
+    /// #disj-odi: default-off dangerous-class focus lanes of the disjunctive driver.
+    pub DISJ_FOCUS_LANES = LeverDecl {
+        name: "NY_PGD_DISJ_FOCUS_LANES",
+        kind: LeverKind::Usize { min: 0 },
+        default: DefaultSpec::U64(0),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "#disj-odi. Number of dangerous-class focus lanes the batched disjunctive exact-VJP driver runs AFTER its restart waves finish without a candidate and before the attack deadline. The two closest-to-violation clauses seen so far (clean point plus every restart-wave point; rule `wave0`, or `clean` when no wave point was observed) are pinned round-robin across the lanes; each lane starts uniform plus `NY_PGD_ODI_STEPS` ODI steps, ascends its clause's margin row under the `NY_PGD_HINGE_TAU` hinge (a lane at or above tau contributes no gradient) with bias-corrected-Adam sign steps on the cosine schedule h*(0.15*(1+cos(pi*k/200))+0.003) for up to 200 steps. The wave is RSS-admitted against half the observed memory headroom (4 GiB when unobservable), capped at 256 lanes, and halves its width on a wide-VJP refusal. Zero disables and the driver is byte-identical. Attack-only, same candidate funnel as every other lane; it never sets the restart-sequence deadline flag, so the attack extension decision is unchanged. High because it spends attack-slice wall and changes which counterexamples are reachable.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "zero by default and armed by no shipped yaml, so promotion changes no scored run; the dark driver is byte-identical (disj_odi_dark_is_byte_identical), focus lanes pin the ranked classes and respect the hinge (disj_focus_lanes_pin_the_selected_class_and_respect_the_hinge), and a below-floor near miss never becomes a candidate (disj_odi_near_miss_below_floor_never_returns_a_candidate); the conversion A/B on tinyimagenet idx_1831/idx_5529 is the pending measurement",
+        },
+        owner: POLICY_SCOPE,
+        readers: DISJUNCTIVE_POLICY_READERS,
     };
 }

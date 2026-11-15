@@ -17,7 +17,10 @@ use std::borrow::Cow;
 
 use ndarray::{Array1, ArrayD, IxDyn};
 use ny_core::{checked_dim_product, NyError, Result};
-use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor, L2Constraint, RepairStrategy};
+use ny_tensor::{
+    div_down_f32, div_up_f32, next_down_f32, next_up_f32, BoundedTensor, L2Constraint,
+    RepairStrategy,
+};
 
 use super::super::math_common::{outward_midpoint_radius, square_interval_bounds};
 
@@ -173,7 +176,7 @@ impl RmsNormLayer {
     /// behavior but does not change that provenance classification.
     ///
     /// Reference: Jacobian from `math.rs` (verified against finite differences).
-    /// Fix for #3098: replaces the unsound `max_radius / n` coupling correction.
+    /// Replaces the unsound `max_radius / n` coupling correction.
     #[inline]
     fn propagate_ibp_forward_mode(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
         let shape = input.shape();
@@ -237,7 +240,7 @@ impl RmsNormLayer {
         emit: &mut impl FnMut(usize, f32, f32),
     ) {
         let norm_size = center.len();
-        // f64 accumulation + directed rounding (#3327, pattern from #3324)
+        // f64 accumulation + directed rounding
         let nf_64 = norm_size as f64;
 
         // Sound z-saturation envelope for the forward (Jacobian) mode.
@@ -305,7 +308,7 @@ impl RmsNormLayer {
         }
         // next_down: mean_sq_lower feeds into rms_min denominator → round DOWN for soundness
         let mean_sq_lower = next_down_f32((mean_sq_lower_f64 / nf_64) as f32);
-        // next_down: rms_min is a denominator → smaller = larger R2 = sound. #3327.
+        // next_down: rms_min is a denominator → smaller = larger R2 = sound.
         let rms_min = next_down_f32(((mean_sq_lower as f64 + self.eps as f64).sqrt()) as f32);
         let rms_min_cubed = rms_min * rms_min * rms_min;
         let rms_min_5th = rms_min_cubed * rms_min * rms_min;
@@ -323,7 +326,7 @@ impl RmsNormLayer {
         //   R₂(i) ≤ (|γ_i|/2) · [2·r_i·S_Xr/(n·rms_min³)
         //     + X_i·‖r‖²/(n·rms_min³) + 3·X_i·S_Xr²/(n²·rms_min⁵)]
         // where S_Xr = Σ_k X_k · r_k.
-        // next_up_f32: s_xr is in NUMERATOR of R2 → round up (sound). #3327.
+        // next_up_f32: s_xr is in NUMERATOR of R2 → round up (sound).
         let s_xr: f32 = next_up_f32(
             (0..norm_size)
                 .map(|k| {
@@ -344,7 +347,7 @@ impl RmsNormLayer {
 
             // First-order: output_radius_i = sum_j |J[i,j]| * radius_j
             // J[i,j] = ny_i * (delta_ij / rms - c_i * c_j / (n * rms^3))
-            // Jacobian entries and sum computed in f64 to avoid cancellation (#3327)
+            // Jacobian entries and sum computed in f64 to avoid cancellation
             let mut first_order_radius_f64 = 0.0_f64;
             for j in 0..norm_size {
                 let delta_ij: f64 = if i == j { 1.0 } else { 0.0 };
@@ -407,7 +410,7 @@ impl RmsNormLayer {
         emit: &mut impl FnMut(usize, f32, f32),
     ) {
         let norm_size = lower.len();
-        // f64 accumulation + directed rounding for sq_sum (#3327, pattern from #3324)
+        // f64 accumulation + directed rounding for sq_sum
         let nf_64 = norm_size as f64;
 
         // Bound mean(x^2) via interval arithmetic on x_i^2 per coordinate
@@ -459,7 +462,7 @@ impl RmsNormLayer {
         // |z_i| ceiling the clamped IBP interval is a sound SUPERSET of the
         // reachable set => SOUND. It is still strictly tighter than the unclamped
         // 4-corner interval in the high-magnitude / low-variance regime,
-        // retaining the #3196 benefit.
+        // retaining the tightening benefit.
         let max_norm = {
             let base = (norm_size as f32).sqrt();
             let ulp_b = next_up_f32(base) - base; // 1 ULP at sqrt(n)
@@ -635,7 +638,7 @@ fn validate_ibp_input(shape: &[usize], ny: &Array1<f32>, input: &BoundedTensor) 
 /// The caller builds full N-D indices on the stack by appending the
 /// feature index to the prefix.
 ///
-/// Part of #2237: replaced `Fn(usize) -> Vec<usize>` callback with
+/// Replaces a `Fn(usize) -> Vec<usize>` callback with
 /// direct prefix passing to eliminate per-element heap allocations.
 fn for_each_norm_slice(shape: &[usize], mut process: impl FnMut(&[usize])) -> Result<()> {
     let ndim = shape.len();
@@ -669,17 +672,30 @@ fn bound_ny_x_over_rms(
     rms_upper: f32,
     max_norm: f32,
 ) -> (f32, f32) {
-    let corners = [
-        xl / rms_upper,
-        xl / rms_lower,
-        xu / rms_upper,
-        xu / rms_lower,
+    // The corner divisions were the ONE bare (round-to-nearest) step in an
+    // otherwise fully directed chain. A corner that rounds inward narrows the
+    // ratio interval, and the directed step on the final `g*norm + b` is at the
+    // scale of that SUM -- it collapses whenever beta cancels the product.
+    // Compute each corner TWICE (down for the min-fold, up for the max-fold),
+    // mirroring `BoundedTensor::mul`. div_down/div_up_f32 are exact-remainder
+    // (fma) certified and pass NaN through to the folds unchanged.
+    let corners_down = [
+        div_down_f32(xl, rms_upper),
+        div_down_f32(xl, rms_lower),
+        div_down_f32(xu, rms_upper),
+        div_down_f32(xu, rms_lower),
+    ];
+    let corners_up = [
+        div_up_f32(xl, rms_upper),
+        div_up_f32(xl, rms_lower),
+        div_up_f32(xu, rms_upper),
+        div_up_f32(xu, rms_lower),
     ];
 
-    let ratio_l = corners
+    let ratio_l = corners_down
         .iter()
         .fold(f32::INFINITY, |a, &b| nan_propagating_min(a, b));
-    let ratio_u = corners
+    let ratio_u = corners_up
         .iter()
         .fold(f32::NEG_INFINITY, |a, &b| nan_propagating_max(a, b));
 
@@ -689,7 +705,7 @@ fn bound_ny_x_over_rms(
     let ratio_u = nan_propagating_min(ratio_u, max_norm);
 
     if ny >= 0.0 {
-        // directed rounding (#3344)
+        // directed rounding
         (next_down_f32(ny * ratio_l), next_up_f32(ny * ratio_u))
     } else {
         (next_down_f32(ny * ratio_u), next_up_f32(ny * ratio_l))

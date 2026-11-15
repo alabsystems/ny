@@ -11,7 +11,8 @@
 //! input-bound surface as exact rationals and rounds each endpoint outward to
 //! `f64`.
 //!
-//! Only top-level, axis-aligned VNN-LIB 1.0 atoms are accepted:
+//! Only top-level, axis-aligned scalar atoms are accepted. Canonical `X_i`
+//! names and VNN-LIB 2.0 singleton-batch `X[0,i]` names are recognized:
 //!
 //! ```text
 //! (assert (<= X_0 0.25))
@@ -1242,11 +1243,255 @@ fn atom<'a>(expression: &RawExpr<'a>) -> Option<&'a str> {
 }
 
 fn parse_input_index(atom: &str) -> Option<usize> {
-    parse_canonical_variable_index(atom, "X_")
+    parse_canonical_variable_index(atom, "X_").or_else(|| parse_singleton_batch_index(atom, "X[0,"))
+}
+
+/// Authenticate the complete original scalar namespace for a deliberately
+/// narrow VNN-LIB1 single-input/single-output instance. This API preserves
+/// `Real` declarations and raw decimals; it does not manufacture a tensor
+/// declaration or authorize an ONNX shape. A caller must separately prove that
+/// the one original graph input/output flatten to these complete namespaces.
+pub fn parse_vnnlib_with_certified_scalar_singleton_property(
+    content: &str,
+    expected_inputs: usize,
+) -> Result<(
+    VnnLibSpec,
+    CertifiedInputBox,
+    CertifiedRelationalOutputConjunction,
+)> {
+    // Initial admitted legacy architecture: the original SafeNLP30-to2
+    // contract. Typed singleton-batch admission remains a separate API.
+    if expected_inputs != 30 {
+        return Err(certified_output_shape_error());
+    }
+    check_certified_source_size(content.len())?;
+    preflight_certified_syntax(content)?;
+    let cleaned = strip_vnnlib_comments(content);
+    let tokens = tokenize(&cleaned)?;
+    check_raw_token_count(tokens.len())?;
+    reject_noncanonical_variable_aliases(&tokens)?;
+    let expressions = parse_raw_expressions(&tokens)?;
+    let mut input_declarations = [false; 30];
+    let mut output_declarations = [false; 2];
+    let mut outputs = 0usize;
+    let mut versions = 0usize;
+    for expression in &expressions {
+        let RawExpr::List(items) = expression else {
+            return Err(certified_output_shape_error());
+        };
+        match items.first().and_then(atom) {
+            Some("vnnlib-version") => {
+                versions += 1;
+                if versions != 1
+                    || items.len() != 2
+                    || !matches!(atom(&items[1]), Some("1.0" | "<1.0>"))
+                {
+                    return Err(certified_output_shape_error());
+                }
+            }
+            Some("declare-const") => {
+                if items.len() != 3 || atom(&items[2]) != Some("Real") {
+                    return Err(certified_output_shape_error());
+                }
+                let name = atom(&items[1]).ok_or_else(certified_output_shape_error)?;
+                let slot = if let Some(index) = parse_canonical_variable_index(name, "X_") {
+                    input_declarations.get_mut(index)
+                } else if let Some(index) = parse_canonical_variable_index(name, "Y_") {
+                    output_declarations.get_mut(index)
+                } else {
+                    None
+                }
+                .ok_or_else(certified_output_shape_error)?;
+                if *slot {
+                    return Err(certified_output_shape_error());
+                }
+                *slot = true;
+            }
+            Some("assert") => {
+                if items.len() != 2 {
+                    return Err(certified_output_shape_error());
+                }
+                let RawExpr::List(row) = &items[1] else {
+                    return Err(certified_output_shape_error());
+                };
+                if row.len() != 3 || !matches!(row.first().and_then(atom), Some("<=" | ">=")) {
+                    return Err(certified_output_shape_error());
+                }
+                let a = atom(&row[1]).ok_or_else(certified_output_shape_error)?;
+                let b = atom(&row[2]).ok_or_else(certified_output_shape_error)?;
+                let ax = parse_canonical_variable_index(a, "X_");
+                let bx = parse_canonical_variable_index(b, "X_");
+                if ax.is_some() ^ bx.is_some() {
+                    // Exact input extraction below checks the other operand,
+                    // every endpoint, and the ordinary parser independently.
+                    if ax
+                        .or(bx)
+                        .is_some_and(|index| index >= expected_inputs || !input_declarations[index])
+                    {
+                        return Err(certified_output_shape_error());
+                    }
+                    continue;
+                }
+                if parse_canonical_variable_index(a, "Y_").is_some_and(|index| index < 2)
+                    && parse_canonical_variable_index(b, "Y_").is_some_and(|index| index < 2)
+                    && a != b
+                {
+                    let ai = parse_canonical_variable_index(a, "Y_").unwrap();
+                    let bi = parse_canonical_variable_index(b, "Y_").unwrap();
+                    if !output_declarations[ai] || !output_declarations[bi] {
+                        return Err(certified_output_shape_error());
+                    }
+                    outputs += 1;
+                } else {
+                    return Err(certified_output_shape_error());
+                }
+            }
+            // No auxiliary symbols, functions, tensor syntax, hidden nodes,
+            // quantifiers, nested semantic forms, or mixed version grammar.
+            _ => return Err(certified_output_shape_error()),
+        }
+    }
+    if input_declarations.iter().any(|&present| !present)
+        || output_declarations.iter().any(|&present| !present)
+        || outputs != 1
+    {
+        return Err(certified_output_shape_error());
+    }
+    let result = parse_vnnlib_with_certified_affine_property(content)?;
+    let (spec, _, atoms) = &result;
+    if spec.num_inputs != expected_inputs
+        || spec.num_outputs != 2
+        || spec.dual_network.is_some()
+        || spec.is_disjunction
+        || atoms.atoms().len() != 1
+        || !super::parse_vnnlib_assignment_declarations(content)?.is_empty()
+    {
+        return Err(certified_output_cross_check_error());
+    }
+    Ok(result)
+}
+
+/// Original singleton-batch tensor symbols, with no legacy scalar aliases or
+/// additional semantic declarations. The ordinary normalized parser and the
+/// exact raw affine extractor must both preserve this same single comparison.
+pub fn parse_vnnlib_with_certified_singleton_batch_property(
+    content: &str,
+) -> Result<(
+    VnnLibSpec,
+    CertifiedInputBox,
+    CertifiedRelationalOutputConjunction,
+)> {
+    check_certified_source_size(content.len())?;
+    preflight_certified_syntax(content)?;
+    let cleaned = strip_vnnlib_comments(content);
+    let tokens = tokenize(&cleaned)?;
+    check_raw_token_count(tokens.len())?;
+    if tokens
+        .iter()
+        .any(|t| t.starts_with("X_") || t.starts_with("Y_"))
+    {
+        return Err(certified_output_shape_error());
+    }
+    let expressions = parse_raw_expressions(&tokens)?;
+    let mut declarations = 0usize;
+    let mut versions = 0usize;
+    let mut outputs = 0usize;
+    for expression in &expressions {
+        let RawExpr::List(items) = expression else {
+            return Err(certified_output_shape_error());
+        };
+        match items.first().and_then(atom) {
+            Some("vnnlib-version") => {
+                versions += 1;
+                if items.len() != 2 || atom(&items[1]) != Some("<2.0>") {
+                    return Err(certified_output_shape_error());
+                }
+            }
+            Some("declare-network") => {
+                declarations += 1;
+                if items.len() != 4 || atom(&items[1]).is_none() {
+                    return Err(certified_output_shape_error());
+                }
+                for (child, kind) in items[2..].iter().zip(["declare-input", "declare-output"]) {
+                    let RawExpr::List(fields) = child else {
+                        return Err(certified_output_shape_error());
+                    };
+                    if fields.len() < 4
+                        || fields.first().and_then(atom) != Some(kind)
+                        || fields.get(1).and_then(atom).is_none()
+                        || fields.get(2).and_then(atom) != Some("float32")
+                    {
+                        return Err(certified_output_shape_error());
+                    }
+                    // The ordinary declaration parser permits trailing or
+                    // nested fields it does not understand. This authenticated
+                    // surface accepts only the original dense shape tokens.
+                    let shape = fields[3..]
+                        .iter()
+                        .map(|f| atom(f).ok_or_else(certified_output_shape_error))
+                        .collect::<Result<Vec<_>>>()?
+                        .join(" ");
+                    if !shape.starts_with('[')
+                        || !shape.ends_with(']')
+                        || shape.bytes().filter(|&b| b == b'[').count() != 1
+                        || shape.bytes().filter(|&b| b == b']').count() != 1
+                        || !shape
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || matches!(b, b'[' | b']' | b',' | b' '))
+                    {
+                        return Err(certified_output_shape_error());
+                    }
+                }
+            }
+            Some("assert") => {
+                if items.len() != 2 {
+                    return Err(certified_output_shape_error());
+                }
+                let RawExpr::List(row) = &items[1] else {
+                    return Err(certified_output_shape_error());
+                };
+                if row.len() != 3 || !matches!(row.first().and_then(atom), Some("<=" | ">=")) {
+                    return Err(certified_output_shape_error());
+                }
+                let a = atom(&row[1]).ok_or_else(certified_output_shape_error)?;
+                let b = atom(&row[2]).ok_or_else(certified_output_shape_error)?;
+                let ax = parse_singleton_batch_index(a, "X[0,");
+                let bx = parse_singleton_batch_index(b, "X[0,");
+                if ax.is_some() ^ bx.is_some() {
+                    continue;
+                }
+                if parse_singleton_batch_index(a, "Y[0,").is_some()
+                    && parse_singleton_batch_index(b, "Y[0,").is_some()
+                {
+                    outputs += 1;
+                } else {
+                    return Err(certified_output_shape_error());
+                }
+            }
+            _ => return Err(certified_output_shape_error()),
+        }
+    }
+    if declarations != 1 || versions != 1 || outputs != 1 {
+        return Err(certified_output_shape_error());
+    }
+    parse_vnnlib_with_certified_affine_property(content)
 }
 
 fn parse_output_index(atom: &str) -> Option<usize> {
-    parse_canonical_variable_index(atom, "Y_")
+    parse_canonical_variable_index(atom, "Y_").or_else(|| parse_singleton_batch_index(atom, "Y[0,"))
+}
+
+// No flattening guess: only the explicitly supported singleton batch index.
+// The independent ordinary parser must agree on every endpoint/output atom.
+fn parse_singleton_batch_index(atom: &str, prefix: &str) -> Option<usize> {
+    let index = atom.strip_prefix(prefix)?.strip_suffix(']')?;
+    if index.is_empty()
+        || index.len() > 1 && index.starts_with('0')
+        || !index.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    index.parse().ok()
 }
 
 fn parse_canonical_variable_index(atom: &str, prefix: &str) -> Option<usize> {
@@ -1269,7 +1514,10 @@ fn reject_noncanonical_variable_aliases(tokens: &[String]) -> Result<()> {
         } else {
             None
         };
-        if prefix.is_some_and(|prefix| parse_canonical_variable_index(token, prefix).is_none()) {
+        if prefix.is_some_and(|prefix| parse_canonical_variable_index(token, prefix).is_none())
+            || token.starts_with("X[") && parse_singleton_batch_index(token, "X[0,").is_none()
+            || token.starts_with("Y[") && parse_singleton_batch_index(token, "Y[0,").is_none()
+        {
             return Err(NyError::InvalidSpec(format!(
                 "certified input parser rejects noncanonical variable alias `{token}`"
             )));
@@ -1443,6 +1691,27 @@ mod tests {
 
     fn exact(value: f64) -> BigRational {
         BigRational::from_float(value).expect("finite test value")
+    }
+
+    #[test]
+    fn singleton_batch_exact_decimal_and_original_relational_atom_are_authenticated() {
+        let content="(vnnlib-version <2.0>)\n(declare-network N (declare-input X float32 [1, 1]) (declare-output Y float32 [1, 2]))\n(assert (>= X[0,0] 0.1))\n(assert (<= X[0,0] 0.1))\n(assert (<= Y[0,0] Y[0,1]))\n";
+        let (spec, box_, outputs) =
+            parse_vnnlib_with_certified_singleton_batch_property(content).unwrap();
+        let decimal = BigRational::new(BigInt::from(1), BigInt::from(10));
+        assert!(exact(box_.lower()[0]) <= decimal && exact(box_.upper()[0]) >= decimal);
+        assert!(box_.lower()[0] < box_.upper()[0]);
+        assert!(!spec.is_disjunction && spec.num_outputs == 2);
+        assert_eq!(
+            outputs.atoms(),
+            &[CertifiedRelationalOutputAtom::LessEq(0, 1)]
+        );
+        for bad in ["X[1,0]", "X[0,00]", "X[0,0,0]"] {
+            assert!(parse_vnnlib_with_certified_singleton_batch_property(
+                &content.replace("X[0,0]", bad)
+            )
+            .is_err());
+        }
     }
 
     #[test]
@@ -1634,5 +1903,121 @@ mod tests {
             .iter()
             .zip(box_.upper())
             .all(|(&lower, &upper)| lower.is_finite() && lower <= upper && upper.is_finite()));
+    }
+}
+
+#[cfg(test)]
+mod scalar_singleton_tests {
+    use super::*;
+
+    fn property() -> String {
+        let mut result = String::new();
+        for index in 0..30 {
+            result.push_str(&format!("(declare-const X_{index} Real)\n"));
+        }
+        result.push_str("(declare-const Y_0 Real)\n(declare-const Y_1 Real)\n");
+        for index in 0..30 {
+            result.push_str(&format!(
+                "(assert (>= X_{index} -1))\n(assert (<= X_{index} 1))\n"
+            ));
+        }
+        result.push_str("(assert (<= Y_0 Y_1))\n");
+        result
+    }
+
+    #[test]
+    fn complete_real_namespace_and_direct_atom_preserve_raw_decimal_enclosure() {
+        let raw = property()
+            .replace("(>= X_0 -1)", "(>= X_0 0.1)")
+            .replace("(<= X_0 1)", "(<= X_0 0.1)");
+        let (spec, box_, outputs) =
+            parse_vnnlib_with_certified_scalar_singleton_property(&raw, 30).unwrap();
+        assert_eq!((spec.num_inputs, spec.num_outputs), (30, 2));
+        assert_eq!(
+            outputs.atoms(),
+            &[CertifiedRelationalOutputAtom::LessEq(0, 1)]
+        );
+        assert!(box_.lower()[0] < 0.1 && box_.upper()[0] == 0.1);
+        assert_ne!(box_.upper()[0], f64::from(0.1_f32));
+        assert!(box_.declared_point()[0]);
+        assert_eq!(
+            (super::super::parse_vnnlib_assignment_declarations(&raw).unwrap()).len(),
+            0
+        );
+    }
+
+    #[test]
+    fn scalar_singleton_refuses_incomplete_duplicate_aliased_and_non_real_namespaces() {
+        let raw = property();
+        for fault in [
+            raw.replace("(declare-const X_8 Real)\n", ""),
+            raw.replace("(declare-const Y_1 Real)\n", ""),
+            format!("{raw}(declare-const X_0 Real)\n"),
+            format!("{raw}(declare-const Z_0 Real)\n"),
+            raw.replace("X_8", "X_08"),
+            raw.replace("Y_1", "Y_01"),
+            raw.replace("(declare-const X_8 Real)", "(declare-const X_8 Int)"),
+            raw.replace("(declare-const Y_1 Real)", "(declare-const Y_1 float32)"),
+            raw.replace("X_29", "X_30"),
+            raw.replace("(declare-const X_8 Real)", "(declare-const X_8 Real extra)"),
+        ] {
+            assert!(parse_vnnlib_with_certified_scalar_singleton_property(&fault, 30).is_err());
+        }
+        for width in [0, 29, 31, 128] {
+            assert!(parse_vnnlib_with_certified_scalar_singleton_property(&raw, width).is_err());
+        }
+    }
+
+    #[test]
+    fn scalar_singleton_refuses_extra_semantics_and_requires_one_inclusive_original_atom() {
+        let raw = property();
+        for fault in [
+            format!("{raw}(define-fun auxiliary () Real 0)\n"),
+            format!("{raw}(assert (<= Y_0 Y_1))\n"),
+            raw.replace("(<= Y_0 Y_1)", "(< Y_0 Y_1)"),
+            raw.replace("(<= Y_0 Y_1)", "(= Y_0 Y_1)"),
+            raw.replace("(<= Y_0 Y_1)", "(<= Y_0 Y_0)"),
+            raw.replace("(<= Y_0 Y_1)", "(and (<= Y_0 Y_1))"),
+            raw.replace("(<= Y_0 Y_1)", "(<= (+ Y_0 0) Y_1)"),
+            raw.replace("(>= X_0 -1)", "(>= X_0 X_1)"),
+            raw.replace("(>= X_0 -1)", "(>= X_0 NaN)"),
+            raw.replace("(assert (>= X_0 -1))\n", ""),
+            raw.replace("X_0", "X[0,0]"),
+            format!("(assert (<= Y_0 Y_1))\n{raw}"),
+        ] {
+            assert_ne!(fault, raw, "refusal fixture must change the valid property");
+            assert!(parse_vnnlib_with_certified_scalar_singleton_property(&fault, 30).is_err());
+        }
+        let (_, _, reverse) = parse_vnnlib_with_certified_scalar_singleton_property(
+            &raw.replace("(<= Y_0 Y_1)", "(>= Y_0 Y_1)"),
+            30,
+        )
+        .unwrap();
+        assert_eq!(
+            reverse.atoms(),
+            &[CertifiedRelationalOutputAtom::GreaterEq(0, 1)]
+        );
+    }
+
+    #[test]
+    fn scalar_and_tensor_version_surfaces_remain_distinct() {
+        let raw = property();
+        assert!(parse_vnnlib_with_certified_scalar_singleton_property(&raw, 30).is_ok());
+        assert!(parse_vnnlib_with_certified_singleton_batch_property(&raw).is_err());
+        for version in ["<2.0>", "<2.1>", "<9.0>"] {
+            assert!(parse_vnnlib_with_certified_scalar_singleton_property(
+                &format!("(vnnlib-version {version})\n{raw}"),
+                30,
+            )
+            .is_err());
+        }
+        assert!(parse_vnnlib_with_certified_scalar_singleton_property(
+            &format!("(vnnlib-version <1.0>)\n(vnnlib-version <1.0>)\n{raw}"),
+            30,
+        )
+        .is_err());
+        let misplaced =
+            raw.replace("(declare-const X_0 Real)\n", "") + "(declare-const X_0 Real)\n";
+        assert!(parse_vnnlib_with_certified_scalar_singleton_property(&misplaced, 30).is_err());
     }
 }

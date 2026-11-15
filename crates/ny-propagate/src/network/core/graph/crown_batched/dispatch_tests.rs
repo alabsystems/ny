@@ -4,10 +4,10 @@
 
 //! Unit tests for `dispatch_batched_unary` has_other_pending soundness guard.
 //!
-//! Part of #4280: these tests encode the invariant that partial CROWN fallback
+//! These tests encode the invariant that partial CROWN fallback
 //! is only safe when no other paths have accumulated bounds. With pending
 //! paths, partial fallback would capture only one path's contribution —
-//! producing unsound bounds (#2072).
+//! producing unsound bounds.
 //!
 //! Loaded from `crown_batched.rs` via `#[path]` so that `dispatch_batched_unary`
 //! (which is `pub(super)` on `impl GraphNetwork`) is accessible.
@@ -58,7 +58,7 @@ fn make_interval(size: usize) -> BoundedTensor {
     BoundedTensor::new(lower, upper).unwrap()
 }
 
-// ---- dispatch_batched_unary: has_other_pending guard (Part of #2072) ----
+// ---- dispatch_batched_unary: has_other_pending guard ----
 
 /// When accumulator is empty and a layer returns UnsupportedOp,
 /// dispatch_batched_unary should return Ok(Some(fallback_bounds))
@@ -101,7 +101,7 @@ fn test_dispatch_unary_empty_accumulator_unsupported_triggers_fallback() {
 
 /// When accumulator has pending paths from a binary op split and a layer
 /// returns UnsupportedOp, the error MUST be propagated (not fallback).
-/// Partial CROWN with pending paths would produce unsound bounds (#2072).
+/// Partial CROWN with pending paths would produce unsound bounds.
 #[test]
 fn test_dispatch_unary_nonempty_accumulator_unsupported_propagates_error() {
     let plan = make_test_plan();
@@ -144,7 +144,7 @@ fn test_dispatch_unary_nonempty_accumulator_unsupported_propagates_error() {
 
 /// When accumulator has pending paths and any fallback-eligible error occurs,
 /// the error must be propagated — not just UnsupportedOp but also
-/// NumericalInstability and ShapeMismatch (#4146 defense-in-depth).
+/// NumericalInstability and ShapeMismatch (defense-in-depth).
 #[test]
 fn test_dispatch_unary_nonempty_accumulator_any_eligible_error_propagates() {
     let plan = make_test_plan();

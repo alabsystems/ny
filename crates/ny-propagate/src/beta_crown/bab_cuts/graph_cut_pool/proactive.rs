@@ -134,7 +134,7 @@ impl GraphCutPool {
                 })
                 .collect();
 
-            // Sort by score descending (most balanced first, NaN last — #2995), then by index for determinism.
+            // Sort by score descending (most balanced first, NaN last), then by index for determinism.
             scored_neurons.sort_by(|a, b| {
                 crate::cmp_utils::nan_last_descending_cmp(&a.1, &b.1).then_with(|| a.0.cmp(&b.0))
             });

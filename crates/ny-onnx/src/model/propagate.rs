@@ -4,7 +4,7 @@
 
 //! Sequential network conversion delegate.
 //!
-//! The core logic now lives in [`ny_build::build_propagate_network`] (#1752).
+//! The core logic now lives in [`ny_build::build_propagate_network`].
 //! This module keeps the `OnnxModel` method surface for backwards compatibility.
 
 use ny_build::build_propagate_network;

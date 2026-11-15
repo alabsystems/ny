@@ -283,7 +283,7 @@ impl BetaState {
 
     /// Accumulate gradient for a specific neuron.
     ///
-    /// NaN guard (#3112): skip non-finite gradients to prevent NaN from entering the
+    /// NaN guard: skip non-finite gradients to prevent NaN from entering the
     /// optimizer state. Without this, a single NaN gradient poisons m/v accumulators
     /// and wastes an Adam step before the post-step guard resets everything.
     pub fn accumulate_grad(&mut self, layer_idx: usize, neuron_idx: usize, grad: f32) {
@@ -305,13 +305,13 @@ impl BetaState {
     pub fn gradient_step(&mut self, lr: f32) -> f32 {
         let mut max_grad = 0.0f32;
         for entry in &mut self.entries {
-            // NaN-aware convergence tracking: f32::max silently drops NaN (#2939).
+            // NaN-aware convergence tracking: f32::max silently drops NaN.
             max_grad = nan_propagating_max(max_grad, entry.grad.abs());
             // Gradient ascent (we want to maximize lower bound)
-            // NaN-safe: propagate NaN instead of silently projecting to 0.0 (#2643)
+            // NaN-safe: propagate NaN instead of silently projecting to 0.0
             entry.value = nan_propagating_max(entry.value + lr * entry.grad, 0.0);
             // NaN guard: if grad was NaN, value is now permanently NaN.
-            // Reset to zero (matches Adam path at line ~250). (#2939)
+            // Reset to zero (matches Adam path at line ~250).
             if !entry.value.is_finite() {
                 tracing::warn!(
                     "NaN/Inf in BetaState::gradient_step (SGD), resetting beta and grad to 0.0: layer={}, neuron={}",
@@ -343,7 +343,7 @@ impl BetaState {
     ///
     /// Parameter `t` is 1-indexed (first iteration is t=1) for bias correction.
     ///
-    /// Returns the maximum raw gradient magnitude for convergence check (#2416).
+    /// Returns the maximum raw gradient magnitude for convergence check.
     pub fn gradient_step_adam(&mut self, config: &AdaptiveOptConfig, t: usize) -> f32 {
         let mut max_grad = 0.0f32;
         let t_float = t.max(1) as f32; // Avoid division by zero
@@ -353,7 +353,7 @@ impl BetaState {
             None
         };
 
-        // Bias correction factors — .max(EPSILON) guards div-by-zero when beta=1.0 (#2575, #2586)
+        // Bias correction factors —.max(EPSILON) guards div-by-zero when beta=1.0
         let beta1_corr = if config.bias_correction {
             (1.0 - config.beta1.powf(t_float)).max(f32::EPSILON)
         } else {
@@ -380,7 +380,7 @@ impl BetaState {
                 .factor(entry.layer_idx, total_layers);
             let scheduled_lr = base_scheduled_lr * layer_factor;
 
-            // Gradient clipping (NaN.clamp() returns NaN — not a NaN filter, #2596)
+            // Gradient clipping (NaN.clamp() returns NaN — not a NaN filter)
             let grad = if config.grad_clip > 0.0 {
                 entry.grad.clamp(-config.grad_clip, config.grad_clip)
             } else {
@@ -397,7 +397,7 @@ impl BetaState {
             let m_hat = entry.m / beta1_corr;
 
             // AMSGrad: use maximum of past squared gradients for stable convergence.
-            // #3111: use nan_propagating_max instead of f32::max so NaN in v
+            // Use nan_propagating_max instead of f32::max so NaN in v
             // propagates immediately rather than being silently absorbed.
             let v_for_update = if config.amsgrad {
                 entry.v_max = nan_propagating_max(entry.v_max, entry.v);
@@ -407,11 +407,11 @@ impl BetaState {
             };
             let v_hat = v_for_update / beta2_corr;
 
-            // NaN-aware convergence tracking: f32::max silently drops NaN (#2939).
+            // NaN-aware convergence tracking: f32::max silently drops NaN.
             // Use raw gradient (not m_hat) for convergence check. m_hat is an EMA
             // (β₁=0.9) that lags the true gradient — after a flat→steep transition,
             // m_hat stays near zero for several iterations, causing premature
-            // termination. Raw gradient reflects the current landscape. (#2416)
+            // termination. Raw gradient reflects the current landscape.
             // GraphBetaState already uses raw gradient; this makes all states consistent.
             max_grad = nan_propagating_max(max_grad, grad.abs());
 
@@ -437,10 +437,10 @@ impl BetaState {
             } else {
                 1.0
             };
-            // NaN-safe: propagate NaN instead of silently projecting to 0.0 (#2643)
+            // NaN-safe: propagate NaN instead of silently projecting to 0.0
             entry.value = nan_propagating_max(entry.value * decay_factor + update, 0.0);
             // NaN guard: NaN propagates through projection; m/v remain NaN permanently.
-            // Check m (first to become NaN via grad propagation). (#2596)
+            // Check m (first to become NaN via grad propagation).
             if !entry.m.is_finite() || !entry.v.is_finite() {
                 tracing::warn!(
                     "NaN/Inf in BetaState::gradient_step_adam, resetting beta/m/v/v_max to 0.0: layer={}, neuron={}, m={}, v={}",
@@ -523,7 +523,7 @@ impl BetaState {
             slow[i] = slow[i] + config.alpha * (fast - slow[i]);
             // fast = slow (reset fast weights to slow)
             // Apply projection to [0, ∞) since β must be non-negative
-            // NaN-safe: propagate NaN instead of silently projecting to 0.0 (#2643)
+            // NaN-safe: propagate NaN instead of silently projecting to 0.0
             entry.value = nan_propagating_max(slow[i], 0.0);
         }
         Ok(())

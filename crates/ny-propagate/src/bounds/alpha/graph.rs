@@ -20,6 +20,7 @@ use crate::contiguous_flat_slice;
 use super::super::alpha_reciprocal::ReciprocalAlpha;
 use super::super::alpha_s_shaped::MonotoneSShapedAlpha;
 use super::super::alpha_sqrt::SqrtAlpha;
+use super::margin_publication::MarginAlphaPublication;
 use super::shared::{
     extract_contiguous_bounds, init_alpha_from_bounds, update_alphas_adam, update_alphas_sgd,
 };
@@ -56,9 +57,9 @@ pub struct GraphAlphaState {
     /// Each Array1 has length equal to the number of neurons in that ReLU node.
     /// BTreeMap ensures deterministic iteration order, which is required for
     /// reproducible SPSA gradient estimation (RNG consumption order must be
-    /// consistent across runs). See #1976.
+    /// consistent across runs).
     pub(crate) alphas: std::collections::BTreeMap<String, Array1<f32>>,
-    /// Alpha values per ReLU node for the **upper bound path** (alpha[1]). (#3393)
+    /// Alpha values per ReLU node for the **upper bound path** (alpha[1]).
     pub(crate) alphas_upper: std::collections::BTreeMap<String, Array1<f32>>,
     /// Mask for unstable neurons (l < 0 < u). Only these neurons have optimizable alpha.
     pub(crate) unstable_mask: std::collections::BTreeMap<String, Array1<bool>>,
@@ -68,11 +69,11 @@ pub struct GraphAlphaState {
     pub(crate) adam_m: std::collections::BTreeMap<String, Array1<f32>>,
     /// Second moment estimate (uncentered variance) for Adam optimizer.
     pub(crate) adam_v: std::collections::BTreeMap<String, Array1<f32>>,
-    /// Upper-path optimizer state (#3393).
+    /// Upper-path optimizer state.
     pub(crate) velocity_upper: std::collections::BTreeMap<String, Array1<f32>>,
-    /// Upper-path first moment estimate (#3393).
+    /// Upper-path first moment estimate.
     pub(crate) adam_m_upper: std::collections::BTreeMap<String, Array1<f32>>,
-    /// Upper-path second moment estimate (#3393).
+    /// Upper-path second moment estimate.
     pub(crate) adam_v_upper: std::collections::BTreeMap<String, Array1<f32>>,
     /// Tangent-point alpha bundles for monotone Sigmoid/Tanh DAG nodes.
     pub(crate) monotone_s_shaped_alphas: std::collections::BTreeMap<String, MonotoneSShapedAlpha>,
@@ -126,6 +127,13 @@ pub struct GraphAlphaState {
     pub(crate) spec_adam_m: std::collections::BTreeMap<String, Array2<f32>>,
     /// Adam second-moment state for δ rows (slice 2b).
     pub(crate) spec_adam_v: std::collections::BTreeMap<String, Array2<f32>>,
+    /// #vit-margin-alpha: the certify-once margin publication minted by the
+    /// certified C-row margin ascent for THIS state's root box. Never read by
+    /// a backward pass; consumed only by the multi-objective root, which
+    /// refuses it unless box and objectives match bit-for-bit
+    /// ([`MarginAlphaPublication::describes`]). `Arc` keeps warm-start clones
+    /// cheap; backward and warm-start copies drop it.
+    margin_publication: Option<std::sync::Arc<MarginAlphaPublication>>,
 }
 
 impl GraphAlphaState {
@@ -152,6 +160,7 @@ impl GraphAlphaState {
             spec_slot_rows: Vec::new(),
             spec_adam_m: std::collections::BTreeMap::new(),
             spec_adam_v: std::collections::BTreeMap::new(),
+            margin_publication: None,
         }
     }
 
@@ -202,6 +211,8 @@ impl GraphAlphaState {
             // δ optimizer state is update-only, like the six base maps.
             spec_adam_m: std::collections::BTreeMap::new(),
             spec_adam_v: std::collections::BTreeMap::new(),
+            // A root-scoped publication is never read by a backward pass.
+            margin_publication: None,
         }
     }
 
@@ -222,7 +233,39 @@ impl GraphAlphaState {
         self.velocity_upper.clear();
         self.adam_m_upper.clear();
         self.adam_v_upper.clear();
+        // #vit-margin-alpha: a warm-start seed serves a CHILD box; the
+        // root-scoped publication has no meaning there.
+        self.margin_publication = None;
         self
+    }
+
+    /// #vit-margin-alpha: the certify-once margin publication attached by the
+    /// certified C-row margin ascent, if any. See
+    /// [`MarginAlphaPublication`].
+    #[must_use]
+    pub fn margin_alpha_publication(&self) -> Option<&MarginAlphaPublication> {
+        self.margin_publication.as_deref()
+    }
+
+    /// Attach a certify-once margin publication (the margin ascent's only
+    /// write site).
+    pub(crate) fn attach_margin_alpha_publication(&mut self, publication: MarginAlphaPublication) {
+        self.margin_publication = Some(std::sync::Arc::new(publication));
+    }
+
+    /// Drop every per-spec δ slot and its optimizer state, leaving the shared
+    /// α untouched (#vit-margin-alpha).
+    ///
+    /// The margin ascent keys its slots by MARGIN row, while every downstream
+    /// consumer of a returned state keys spec rows by OUTPUT row. Handing the
+    /// slots on would therefore apply one row's δ to another — still sound
+    /// (every α in [0,1] is), but meaningless. The per-spec gain is carried by
+    /// the certify-once publication instead.
+    pub(crate) fn clear_spec_slots(&mut self) {
+        self.spec_deltas.clear();
+        self.spec_slot_rows.clear();
+        self.spec_adam_m.clear();
+        self.spec_adam_v.clear();
     }
 
     /// Initialize alpha state from pre-activation bounds for a single ReLU node.
@@ -295,7 +338,7 @@ impl GraphAlphaState {
             (alpha, mask, num_neurons)
         };
 
-        // Dual alpha (#3393): upper path initialized identically to lower path.
+        // Dual alpha: upper path initialized identically to lower path.
         self.alphas_upper
             .insert(node_name.to_string(), alpha.clone());
         self.alphas.insert(node_name.to_string(), alpha);
@@ -316,6 +359,61 @@ impl GraphAlphaState {
     }
 
     /// Lower-path alpha values for a specific ReLU node.
+    /// `#graph-alpha-saturation`: how many OPTIMIZABLE alphas sit EXACTLY at a
+    /// clamp, over both bound paths. Returns `(committed, at_clamp)`.
+    ///
+    /// # Why this exists
+    ///
+    /// The margin-row lane prints
+    /// `[alpha-opt] saturation committed=N at_clamp=M frac=F`, and that line is
+    /// what revealed the campaign's biggest root cause: **95.57% of alphas AT
+    /// THE CLAMP**, so the ascent cannot move and no budget change can help it.
+    /// The GRAPH lane — which runs cora and 14 of the 16 regular categories —
+    /// had no equivalent, so the same question could not even be asked there.
+    /// Measured 2026-09-17 on cora `cifar10-set`: the ascent exits on patience
+    /// with `best_impr_last=0.000e0` in 0.18 s on BOTH the row it proves and the
+    /// rows it fails, while the root bound (-0.243 vs -0.957) decides the
+    /// verdict outright.
+    ///
+    /// # How to read it — `frac=1.0` can be a NULL, not a finding
+    ///
+    /// Alpha INITIALISATION is binary, so an ascent that has committed nothing
+    /// leaves every alpha at 0 or 1 and `frac` reads 1.0. That is the untouched
+    /// heuristic, not evidence of saturation. Read it together with the
+    /// `iters=`/`exit=` fields on the same line: saturation is a finding when
+    /// the ascent RAN and still could not move off the clamp.
+    ///
+    /// Exact equality, not an epsilon, and the denominator is the UNSTABLE mask
+    /// — both mirror `margin_row::alpha_opt` so the two lanes' numbers compare
+    /// directly without a translation step.
+    pub(crate) fn clamp_saturation(&self) -> (usize, usize) {
+        let (mut committed, mut at_clamp) = (0usize, 0usize);
+        for map in [&self.alphas, &self.alphas_upper] {
+            for (node, alpha) in map.iter() {
+                // Channel-only alpha nodes (`spatial_shapes`) carry a mask of a
+                // different length; counting against a mismatched mask would be
+                // wrong, so skip rather than guess. A node with no mask has no
+                // optimizable alpha by this struct's own field doc.
+                let Some(mask) = self.unstable_mask.get(node) else {
+                    continue;
+                };
+                if mask.len() != alpha.len() {
+                    continue;
+                }
+                for (i, &unstable) in mask.iter().enumerate() {
+                    if !unstable {
+                        continue;
+                    }
+                    committed += 1;
+                    if alpha[i] == 0.0 || alpha[i] == 1.0 {
+                        at_clamp += 1;
+                    }
+                }
+            }
+        }
+        (committed, at_clamp)
+    }
+
     pub fn alpha(&self, node_name: &str) -> Option<&Array1<f32>> {
         self.alphas.get(node_name)
     }
@@ -574,9 +672,9 @@ impl GraphAlphaState {
 
     /// Register positive-domain Sqrt tangent-point alpha state for one DAG node.
     ///
-    /// Kept `pub(crate)` per #3773 design: all observed call sites are crate-internal
+    /// Kept `pub(crate)`: all observed call sites are crate-internal
     /// DAG wiring helpers. The existing `pub` on `add_sigmoid_node`/`add_tanh_node`
-    /// is acknowledged visibility debt (#2611).
+    /// is acknowledged visibility debt.
     pub(crate) fn add_sqrt_node(
         &mut self,
         node_name: &str,
@@ -675,7 +773,7 @@ impl GraphAlphaState {
             return;
         };
 
-        // Guard against length mismatch from fallback gradients (#1937).
+        // Guard against length mismatch from fallback gradients.
         if gradient.len() != alpha.len() {
             tracing::warn!(
                 "GraphAlphaState::update: gradient length {} != alpha length {} for '{}' (#1937), skipping",
@@ -717,7 +815,7 @@ impl GraphAlphaState {
             return;
         };
 
-        // Guard against length mismatch from fallback gradients (#1937).
+        // Guard against length mismatch from fallback gradients.
         if gradient.len() != alpha.len() {
             tracing::warn!(
                 "GraphAlphaState::update_adam: gradient length {} != alpha length {} for '{}' (#1937), skipping",
@@ -729,7 +827,7 @@ impl GraphAlphaState {
         update_alphas_adam(alpha, gradient, mask, m, v, params);
     }
 
-    /// Update upper-path alpha values using gradient descent with optional momentum. (#3393)
+    /// Update upper-path alpha values using gradient descent with optional momentum.
     pub fn update_upper(
         &mut self,
         node_name: &str,
@@ -758,7 +856,7 @@ impl GraphAlphaState {
         update_alphas_sgd(alpha, gradient, mask, vel, learning_rate, momentum);
     }
 
-    /// Update upper-path alpha values using Adam optimizer. (#3393)
+    /// Update upper-path alpha values using Adam optimizer.
     pub fn update_adam_upper(
         &mut self,
         node_name: &str,
@@ -1142,5 +1240,63 @@ mod spec_slot_reassignment_tests {
         );
         assert!(state.spec_adam_m["relu"].row(0).iter().all(|&m| m == 0.0));
         assert!(state.spec_adam_v["relu"].row(1).iter().all(|&v| v == 0.5));
+    }
+}
+
+#[cfg(test)]
+mod clamp_saturation_tests {
+    use super::GraphAlphaState;
+    use ndarray::Array1;
+
+    fn state(node: &str, lower: &[f32], upper: &[f32], mask: &[bool]) -> GraphAlphaState {
+        let mut st = GraphAlphaState::new();
+        st.alphas
+            .insert(node.to_string(), Array1::from(lower.to_vec()));
+        st.alphas_upper
+            .insert(node.to_string(), Array1::from(upper.to_vec()));
+        st.unstable_mask
+            .insert(node.to_string(), Array1::from(mask.to_vec()));
+        st
+    }
+
+    /// The denominator is the UNSTABLE mask, not every alpha — stable neurons
+    /// have no optimizable alpha and would dilute the fraction toward zero.
+    #[test]
+    fn clamp_saturation_counts_only_unstable_neurons() {
+        // lower [0.0, 0.0, 0.5] / upper [1.0, 0.25, 0.25], mask [T, F, T].
+        // Per path: 2 committed, 1 at a clamp (index 1 is masked OUT, and it is
+        // the one whose 0.0 would otherwise inflate at_clamp).
+        let st = state(
+            "n",
+            &[0.0, 0.0, 0.5],
+            &[1.0, 0.25, 0.25],
+            &[true, false, true],
+        );
+        assert_eq!(st.clamp_saturation(), (4, 2));
+    }
+
+    /// Channel-only alpha (`spatial_shapes`) gives a mask of a different length.
+    /// Counting against a mismatched mask would silently misalign neurons, so
+    /// the node is skipped rather than guessed at.
+    #[test]
+    fn clamp_saturation_skips_a_mask_length_mismatch() {
+        let st = state("c", &[0.0, 0.0], &[1.0, 1.0], &[true, true, true]);
+        assert_eq!(st.clamp_saturation(), (0, 0));
+    }
+
+    /// EXACT equality, mirroring `margin_row::alpha_opt`, so the two lanes'
+    /// numbers compare without a translation step. An epsilon here would make
+    /// the graph lane read as more saturated than margin-row on identical data.
+    #[test]
+    fn clamp_saturation_uses_exact_equality_like_margin_row() {
+        let st = state("e", &[1.0, 0.99], &[1.0, 0.99], &[true, true]);
+        assert_eq!(st.clamp_saturation(), (4, 2), "0.99 is NOT at the clamp");
+    }
+
+    /// A state with no alphas reports zeros, so the caller's `frac` is NaN
+    /// rather than a fabricated 0.0 or 1.0.
+    #[test]
+    fn clamp_saturation_is_zero_on_an_empty_state() {
+        assert_eq!(GraphAlphaState::new().clamp_saturation(), (0, 0));
     }
 }

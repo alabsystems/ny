@@ -73,6 +73,7 @@ use super::normalization::GroupNormLayer;
 use super::normalization::InstanceNorm1dLayer;
 use super::normalization::LayerNormLayer;
 use super::normalization::RmsNormLayer;
+use super::point_linear::PointLinearLayer;
 use super::pooling::AveragePoolLayer;
 use super::pooling::MaxPool2dLayer;
 use super::reduction::ArgMaxLayer;
@@ -118,8 +119,8 @@ use super::trigonometric::TanhLayer;
 /// -> Result<BatchedLinearBounds>`.
 ///
 /// This is the single source of truth for which Layer variants are elementwise activations.
-/// Used to generate match arms in `propagate_crown_backward_batched` (#1708) and
-/// `is_elementwise_activation` (#1753), eliminating N-way duplication across dispatch sites.
+/// Used to generate match arms in `propagate_crown_backward_batched` and
+/// `is_elementwise_activation`, eliminating N-way duplication across dispatch sites.
 macro_rules! for_each_elementwise_activation {
     ($macro_name:ident) => {
         $macro_name!(
@@ -174,8 +175,6 @@ pub(crate) use for_each_elementwise_activation;
 ///
 /// Activations NOT listed here fall back to Dense via `ensure_dense()` in the CROWN
 /// backward engine. They can be added incrementally as they gain Patches support.
-///
-/// Part of #2613 Phase 2 step 11.
 macro_rules! for_each_patches_capable_activation {
     ($macro_name:ident) => {
         $macro_name!(
@@ -257,6 +256,10 @@ pub(crate) use for_each_patches_capable_activation;
 #[derive(Debug, Clone)]
 pub enum Layer {
     Linear(LinearLayer),
+    /// Immutable original coefficients with diagnostic point-only authority.
+    /// Interval/CROWN consumers must acquire a separately priced qualified
+    /// adapter or explicitly refuse; this is never an identity/passthrough.
+    PointLinear(PointLinearLayer),
     /// Affine layer whose frozen constant is a rigorous ENCLOSURE rather than a
     /// point (see `layers::interval_const`). A SEPARATE variant on purpose: an
     /// interval that some propagation path silently reads as its midpoint is
@@ -471,3 +474,5 @@ pub enum Layer {
 mod tests;
 #[cfg(test)]
 mod tests_batched;
+#[cfg(test)]
+mod tests_batched_reshape;

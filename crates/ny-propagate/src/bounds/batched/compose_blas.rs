@@ -10,8 +10,6 @@
 //! Matching alpha-beta-CROWN backward_bound.py:
 //!   lA_new = clamp(lA, min=0) @ lA_next + clamp(lA, max=0) @ uA_next
 //!   uA_new = clamp(uA, min=0) @ uA_next + clamp(uA, max=0) @ lA_next
-//!
-//! Part of #2220 Packet C.
 
 use super::compose::{add_f64_down, add_f64_up};
 use super::BatchedLinearBounds;

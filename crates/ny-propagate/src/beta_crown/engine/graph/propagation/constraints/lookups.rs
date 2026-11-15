@@ -28,7 +28,6 @@ use crate::{GraphNetwork, Layer};
 /// - `pre_genbab`: Maps pre-activation node name -> list of (neuron_idx, split_point,
 ///   is_upper_branch, genbab_node_name). Used during the forward pass to tighten bounds
 ///   at pre-activation nodes of general nonlinearities (GeLU, Sigmoid, Tanh, etc.).
-///   (#2399)
 pub(in crate::beta_crown::engine::graph::propagation) struct ConstraintLookups {
     pub by_relu: HashMap<String, HashMap<usize, bool>>,
     pub pre: HashMap<String, Vec<(usize, bool, String)>>,
@@ -43,7 +42,7 @@ pub(in crate::beta_crown::engine::graph::propagation) struct ConstraintLookups {
 ///
 /// # Arguments
 /// * `constraints` - The ReLU neuron constraints from a domain's split history
-/// * `genbab_constraints` - The GenBaB constraints for general nonlinearities (#2399)
+/// * `genbab_constraints` - The GenBaB constraints for general nonlinearities
 /// * `graph` - The graph network for node lookups
 pub(super) fn build_constraint_lookups(
     constraints: &[GraphNeuronConstraint],
@@ -72,7 +71,7 @@ pub(super) fn build_constraint_lookups(
                 c.node_name
             )));
         }
-        // #2098: Reject nodes with empty inputs rather than fabricating "_input".
+        // Reject nodes with empty inputs rather than fabricating "_input".
         let pre_name = relu_node.inputs.first().cloned().ok_or_else(|| {
             NyError::InvalidSpec(format!(
                 "ReLU node '{}' has no inputs — cannot determine pre-activation",
@@ -84,7 +83,7 @@ pub(super) fn build_constraint_lookups(
             .push((c.neuron_idx, c.is_active, c.node_name.clone()));
     }
 
-    // #2399: Build GenBaB pre-activation lookup.
+    // Build GenBaB pre-activation lookup.
     // GenBaB constraints specify a split_point for general nonlinearities (GeLU, Sigmoid, etc.).
     // We map each constraint to the pre-activation node of the constrained nonlinear node,
     // so the forward pass can tighten pre-activation bounds at the split_point.
@@ -158,13 +157,13 @@ pub(super) fn apply_pre_constraints(
             )));
         }
         if *is_active {
-            // NaN-safe: propagate NaN instead of silently clamping to 0.0 (#2643)
+            // NaN-safe: propagate NaN instead of silently clamping to 0.0
             lower[[*neuron_idx]] = nan_propagating_max(lower[[*neuron_idx]], 0.0);
         } else {
             upper[[*neuron_idx]] = nan_propagating_min(upper[[*neuron_idx]], 0.0);
         }
         if lower[[*neuron_idx]] > upper[[*neuron_idx]] {
-            // #2926: Constraint application produced inverted bounds — domain is empty.
+            // Constraint application produced inverted bounds — domain is empty.
             return Err(NyError::InfeasibleDomain(format!(
                 "pre-constraint at relu='{}' idx={}: [{}, {}]",
                 relu_name,
@@ -205,7 +204,6 @@ pub(super) fn apply_pre_constraints(
 ///
 /// Reference: α,β-CROWN GenBaB branching applies the same split_point clamping
 /// in the forward pass. See `auto_LiRPA/branching_domains.py`.
-/// (#2399)
 pub(super) fn apply_genbab_pre_constraints(
     bounds: &BoundedTensor,
     constraints: &[(usize, f32, bool, String)],
@@ -230,14 +228,14 @@ pub(super) fn apply_genbab_pre_constraints(
         }
         if *is_upper_branch {
             // Upper branch: x >= split_point → tighten lower bound
-            // NaN-safe: propagate NaN instead of silently clamping (#2643)
+            // NaN-safe: propagate NaN instead of silently clamping
             lower[[*neuron_idx]] = nan_propagating_max(lower[[*neuron_idx]], *split_point);
         } else {
             // Lower branch: x <= split_point → tighten upper bound
             upper[[*neuron_idx]] = nan_propagating_min(upper[[*neuron_idx]], *split_point);
         }
         if lower[[*neuron_idx]] > upper[[*neuron_idx]] {
-            // #2926: Constraint application produced inverted bounds — domain is empty.
+            // Constraint application produced inverted bounds — domain is empty.
             return Err(NyError::InfeasibleDomain(format!(
                 "genbab pre-constraint at node='{}' idx={} split={}: [{}, {}]",
                 genbab_node_name,

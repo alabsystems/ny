@@ -9,7 +9,7 @@ use crate::beta_crown::engine::domain_results::GraphDomainResult;
 use crate::beta_crown::BetaCrownVerifier;
 use crate::GraphNetwork;
 
-/// Regression test for #2038: branch-selection failures in the ReLU-split
+/// Regression test: branch-selection failures in the ReLU-split
 /// loop must become PropagationFailure (domain unresolved), not Err aborts.
 #[ntest::timeout(5000)]
 #[test]

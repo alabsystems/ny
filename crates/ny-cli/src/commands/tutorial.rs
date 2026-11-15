@@ -2,14 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! `ny tutorial` — learn to verify neural networks, interactively.
-//!
-//! Design principles (borrowed from the `ay` tutorial):
-//! - Never patronizing. No "great job!", no baby talk.
-//! - Show the verifier's real work — actual verdicts, actual exit codes.
-//! - Honest. If a method cannot decide something, say so; never a guess.
-//! - A thin wrapper over the real `ny` engine: `ny tutorial demo` runs the
-//!   same binary the reader would run.
+//! Verification lessons and a demo that invokes the current ny binary.
 
 use std::path::Path;
 use std::process::Command as ProcCommand;
@@ -17,8 +10,7 @@ use std::process::Command as ProcCommand;
 use anyhow::{Context, Result};
 use clap::Subcommand;
 
-// Tiny embedded fixtures (f(x) = |x|, 111-byte network) so `ny tutorial demo`
-// runs with no files on disk and no dependency on the checkout layout.
+// Embed f(x) = |x| fixtures so the demo can write its own temporary files.
 const CROSSING_RELU_NNET: &[u8] = include_bytes!("tutorial/crossing_relu.nnet");
 const CROSSING_RELU_SAFE: &[u8] = include_bytes!("tutorial/crossing_relu_safe.vnnlib");
 const CROSSING_RELU_UNSAFE: &[u8] = include_bytes!("tutorial/crossing_relu_unsafe.vnnlib");
@@ -214,8 +206,8 @@ fn certificates() {
   Two kinds of evidence back a verdict:
 
   A COUNTEREXAMPLE is self-evidencing. ny re-executes the reported input through
-  the model and shows it violates the property before printing it. Re-run it in
-  any inference engine and you will see the same violation.
+  the model to confirm the violation before printing it. You can replay it
+  independently against the same model and property.
 
   A PROOF is what backs a `verified` verdict. On a sequential fully-connected
   ReLU network (up to 8192 hidden neurons), ny re-derives the CROWN bound in
@@ -226,9 +218,8 @@ fn certificates() {
   The certificate is self-checked before it is written, then stands on its own —
   the claim, the exact-rational Farkas multipliers, and the linear premises that
   empty the unsafe region. No floating point, no reference to ny's solver state.
-  ny's external kernel checker, Clean, replays these end to end (published
-  alongside ny; until then the Lean corpus in crates/ny-cert/proofs/lean/ is the
-  reproducible kernel-check path).
+  The external kernel checker, Clean, replays the certificate. The Lean corpus
+  in crates/ny-cert/proofs/ documents the proof lemmas and their assumptions.
 
   Related evidence:
       ny lipschitz model.onnx        sound certified global Lipschitz bound
@@ -257,7 +248,7 @@ fn features() {
 
   Compare and port
       ny diff          where two ONNX models diverge, layer by layer
-      ny compare       equivalence between two models
+      ny compare       propagated output bounds of two models
       ny weights       inspect and diff weights (ONNX, SafeTensors)
       ny quantize-check  float16 / int8 quantization safety
 

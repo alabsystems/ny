@@ -7,7 +7,7 @@
 //! Verifies that alpha-CROWN with BilinearCrown alpha optimization produces
 //! bounds tighter than IBP on attention subgraphs.
 //!
-//! Part of #3287: Wire BilinearCrown alpha optimization into alpha_crown_loop.
+//! Covers the BilinearCrown alpha optimization wired into alpha_crown_loop.
 
 use crate::layers::binary_ops::BilinearCrownLayer;
 use crate::*;
@@ -125,7 +125,7 @@ fn build_attention_qk_graph() -> GraphNetwork {
     graph
 }
 
-/// Measurement test for #3287: BilinearCrown alpha optimization on attention subgraph.
+/// Measurement test: BilinearCrown alpha optimization on attention subgraph.
 ///
 /// Builds: Input -> Linear+ReLU (Q) + Linear+ReLU (K) -> BilinearCrown(Q @ K^T).
 /// Alpha-CROWN should optimize both ReLU and BilinearCrown alphas, producing

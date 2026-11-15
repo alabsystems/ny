@@ -18,7 +18,7 @@
 //! Run it deliberately:
 //!
 //! ```sh
-//! cargo run -p ny-cli --example f64_tail_census
+//! targo --unverified run -p ny-cli --example f64_tail_census
 //! ```
 
 use std::path::Path;

@@ -40,6 +40,12 @@
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
+/// #router-r2 CR-1 (ROUTER_PROGRAM §6.4): the per-lane MONOTONE deadline cells
+/// live beside the one instance deadline they are all bounded by. The acting
+/// router arms them from this module's published deadline; see
+/// [`crate::deadline_authority`].
+pub use crate::deadline_authority::{Authority as LaneAuthority, LaneDeadline, LaneSlot};
+
 static INSTANCE_DEADLINE: RwLock<Option<Instant>> = RwLock::new(None);
 
 /// Publish the instance's authoritative deadline. Replaces any previous value.

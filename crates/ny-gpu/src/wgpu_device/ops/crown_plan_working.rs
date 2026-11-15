@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Dedicated working buffers and pre-built bind groups for GPU CROWN backward
-//! plans (#3397 Step 4).
+//! plans.
 //!
 //! By owning the working buffers inside the cached plan and pre-building all
 //! bind groups at plan creation time, we eliminate ~20-30

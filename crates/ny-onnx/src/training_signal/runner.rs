@@ -370,7 +370,7 @@ mod runner_tests {
         }
     }
 
-    /// Lower slack should sort before higher slack (#3520 Packet C).
+    /// Lower slack should sort before higher slack.
     #[test]
     fn test_property_ranking_prefers_lower_slack_3520() {
         let mut records = vec![

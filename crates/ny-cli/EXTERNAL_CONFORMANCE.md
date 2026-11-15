@@ -10,10 +10,18 @@ after checking nothing.
 Run the complete CLI corpus lane with the MIP-only qualifications enabled:
 
 ```sh
-cargo test -p ny-cli --features 'mip external-vnncomp'
+targo --unverified test --release -p ny-cli --features 'mip external-vnncomp'
 ```
 
-Download the VNN-COMP benchmark repositories first. The cGAN tests use
+Run it in release: the #mr-ibp-seed CNN7 real-ONNX gates
+(`commands/margin_row_bab/ibp_seed_real_tests.rs`) build full root tableaux and
+refuse a debug build as VOID, and the `proof_check_real` integration target
+drives the release `ny` binary on banked rows (it also needs python3 with
+onnxruntime and is meant to run under `scripts/ny_box.sh measure`). The lane
+also carries `f64_tail_census` and the dist_shift real-model admission probe.
+
+Download the VNN-COMP benchmark repositories first
+(`benchmarks/download_benchmarks.sh`). The cGAN tests use
 `benchmarks/vnncomp2025/benchmarks/cgan_2023` by default; set
 `NY_CGAN_NCH1_ROOT` only when that category is staged elsewhere. The preset
 load guard needs every benchmark root referenced by a shipped preset. Set
@@ -33,17 +41,18 @@ collect a per-clause table where timeouts are useful data, use the explicit
 research command instead:
 
 ```sh
-cargo run -p ny-cli --release --features mip -- \
-  vnncomp research graph-mip mscn-per-clause-128d \
+targo --unverified run -p ny-cli --release --features mip -- \
+  vnncomp-research graph-mip mscn-per-clause-128d \
   --bench-dir /path/to/nn4sys/1.0
 ```
 
-`NY_GRAPH_MIP_TEST_BUDGET` sets that harness's per-clause budget in seconds.
+`NY_GRAPH_MIP_TEST_BUDGET` sets that harness's per-clause budget in seconds
+(default 10).
 
 ## External ay lane
 
 ```sh
-cargo test -p ny-cli --features external-ay
+targo --unverified test -p ny-cli --features external-ay
 ```
 
 This lane requires the revision-pinned `ay` executable through `NY_AY` or

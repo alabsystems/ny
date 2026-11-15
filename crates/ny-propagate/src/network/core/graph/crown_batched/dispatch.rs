@@ -50,7 +50,7 @@ pub(super) enum SpecialBatchedDispatchResult {
 /// Unsupported operations/configurations and explicit numerical-instability
 /// guards degrade to IBP because the fallback remains sound. Shape mismatch is
 /// intentionally excluded for the base path because silently widening previously
-/// supported layers can mask regressions (#4219).
+/// supported layers can mask regressions.
 pub(super) fn is_fallback_eligible_error(error: &NyError) -> bool {
     matches!(
         error,
@@ -87,6 +87,94 @@ fn batched_operand_layout_matches(bounds: &BatchedLinearBounds, shape: &[usize])
     let batch = &a_shape[..a_shape.len() - 2];
     let in_dim = a_shape[a_shape.len() - 1];
     shape.len() == batch.len() + 1 && shape[..batch.len()] == *batch && shape[batch.len()] == in_dim
+}
+
+fn global_operand_layout_matches(bounds: &BatchedLinearBounds, shape: &[usize]) -> bool {
+    let a = bounds.lower_a().shape();
+    a.len() >= 2
+        && a.len() <= 10
+        && shape.len() <= 8
+        && checked_shape_product(&a[..a.len() - 2]) == Some(1)
+        && checked_shape_product(shape) == Some(a[a.len() - 1])
+        && bounds.input_shape() == shape
+}
+
+/// Recover global property rows through an ORIGINAL Flatten that collapsed
+/// every tensor cell into one feature row. Singleton carrier prefixes are
+/// storage metadata, not separate Softmax groups. Keep the full original
+/// column order and all certified error cells, without allocating new arrays.
+/// Local/batched carriers retain the ordinary dispatcher unchanged.
+pub(crate) fn remap_global_flatten_batched(
+    layer: &Layer,
+    bounds: BatchedLinearBounds,
+    pre_activation: &BoundedTensor,
+) -> Result<BatchedLinearBounds> {
+    let Layer::Flatten(flatten) = layer else {
+        return Ok(bounds);
+    };
+    bounds.validate_internal_shapes()?;
+    let a_shape = bounds.lower_a().shape();
+    let rank = a_shape.len();
+    let original_shape = pre_activation.shape();
+    if rank > 10 || original_shape.len() > 8 || bounds.input_shape().len() > 8 {
+        return Ok(bounds);
+    }
+    let columns = a_shape[rank - 1];
+    let rows = a_shape[rank - 2];
+    // The authored Flatten must really produce [1, ALL original cells].
+    // Equal products alone do not authenticate arbitrary reshape semantics.
+    let flattened_shape = flatten.compute_output_shape(original_shape)?;
+    if rows == 0
+        || columns == 0
+        || flattened_shape.as_slice() != [1, columns]
+        || bounds.input_shape() != flattened_shape.as_slice()
+        || checked_shape_product(original_shape) != Some(columns)
+        || checked_shape_product(&a_shape[..rank - 2]) != Some(1)
+        || bounds.lower_b().len() != rows
+        || !bounds.lower_a().is_standard_layout()
+        || !bounds.upper_a().is_standard_layout()
+        || !bounds.lower_b().is_standard_layout()
+        || !bounds.upper_b().is_standard_layout()
+        || bounds
+            .lower_a_err
+            .iter()
+            .chain(bounds.upper_a_err.iter())
+            .any(|error| !error.is_standard_layout())
+    {
+        return Ok(bounds);
+    }
+    let BatchedLinearBounds {
+        lower_a,
+        lower_b,
+        upper_a,
+        upper_b,
+        output_shape,
+        lower_a_err,
+        upper_a_err,
+        ..
+    } = bounds;
+    let matrix = |array: ArrayD<f32>| {
+        array
+            .into_shape_with_order(IxDyn(&[rows, columns]))
+            .map_err(|error| NyError::InvalidSpec(format!("global Flatten carrier: {error}")))
+    };
+    let bias = |array: ArrayD<f32>| {
+        array
+            .into_shape_with_order(IxDyn(&[rows]))
+            .map_err(|error| NyError::InvalidSpec(format!("global Flatten bias: {error}")))
+    };
+    let remapped = BatchedLinearBounds {
+        lower_a: matrix(lower_a)?,
+        lower_b: bias(lower_b)?,
+        upper_a: matrix(upper_a)?,
+        upper_b: bias(upper_b)?,
+        lower_a_err: lower_a_err.map(matrix).transpose()?,
+        upper_a_err: upper_a_err.map(matrix).transpose()?,
+        input_shape: original_shape.to_vec(),
+        output_shape,
+    };
+    remapped.validate_internal_shapes()?;
+    Ok(remapped)
 }
 
 /// Run an EXACT-linear binary split under the certified coefficient-error
@@ -136,7 +224,7 @@ fn split_exact_linear_with_coeff_err(
 ///   it is NOT conservative — see the proof note in `sub.rs`, which records a
 ///   reproduced false bound from the swapped form.)
 /// * the incoming bias is split in half with DIRECTED rounding so the two
-///   accumulated halves re-sum conservatively (#2173), exactly as `Add` does.
+///   accumulated halves re-sum conservatively, exactly as `Add` does.
 ///
 /// `SubLayer` has no batched backward of its own, so the split lives here beside
 /// the dispatcher that needs it; the transform is exact (no relaxation), so
@@ -277,7 +365,27 @@ impl GraphNetwork {
         attention_runtime: &mut AttentionCompositionRuntime<'_>,
         node_linear_bounds: &mut BatchedCrownAccumulator,
     ) -> Result<SpecialBatchedDispatchResult> {
+        // The immutable original PV/Softmax/scale/QK region is a proof-only
+        // three-source replacement for this contribution. It does not alter
+        // the existing MatMul identity-retry policy or skip pending internals.
+        if let Some(regions) = &mut attention_runtime.regions {
+            if regions.try_global_unary(node, node_lb, input, node_bounds, node_linear_bounds)? {
+                return Ok(SpecialBatchedDispatchResult::Handled);
+            }
+            if regions.try_batched(
+                self,
+                node,
+                node_lb,
+                input,
+                node_bounds,
+                node_linear_bounds,
+                None,
+            )? {
+                return Ok(SpecialBatchedDispatchResult::Handled);
+            }
+        }
         match &node.layer {
+            Layer::PointLinear(_) => Err(crate::network::proof_eligibility::diagnostic_only()),
             Layer::ExpandLikeLastAxis(expand) => {
                 let binary_inputs = resolve_binary_input_bounds(
                     node,
@@ -308,18 +416,37 @@ impl GraphNetwork {
                 Ok(SpecialBatchedDispatchResult::Handled)
             }
             Layer::Add(add) => {
-                let (add_a, add_b) = node.require_binary_inputs()?;
-                let (lb_a, lb_b) = add.propagate_linear_batched_binary(node_lb).map_err(|e| {
+                let binary_inputs = resolve_binary_input_bounds(
+                    node, input, node_bounds, "IBP bounds for Add input A", "IBP bounds for Add input B",
+                )?;
+                node_lb.validate_internal_shapes()?;
+                node_lb.validate_no_nan()?;
+                let shape = binary_inputs.input_a_bounds.shape();
+                if shape != binary_inputs.input_b_bounds.shape()
+                    || node_lb.input_shape() != shape
+                    || !(batched_operand_layout_matches(node_lb, shape)
+                        || global_operand_layout_matches(node_lb, shape))
+                {
+                    // A broadcast would require summing original columns, not
+                    // duplicating them. Preserve the complete ordinary fallback.
+                    return Ok(SpecialBatchedDispatchResult::NotHandled);
+                }
+                // Add duplicates each coefficient onto both original operands;
+                // its certified error must follow BOTH copies too. The direct
+                // layer split only constructs the nominal arrays/bias halves.
+                let (lb_a, lb_b) = split_exact_linear_with_coeff_err(node_lb, |bounds| {
+                    add.propagate_linear_batched_binary(bounds)
+                }).map_err(|e| {
                     NyError::InvalidSpec(format!(
                         "Batched CROWN failed at node '{}' (Add): {}",
                         node_name, e
                     ))
                 })?;
-                Self::accumulate_binary_bounds(add_a, lb_a, add_b, lb_b, node_linear_bounds)?;
+                Self::accumulate_binary_bounds(binary_inputs.input_a_name, lb_a, binary_inputs.input_b_name, lb_b, node_linear_bounds)?;
                 Ok(SpecialBatchedDispatchResult::Handled)
             }
             // === Sub: exact binary split, B negated (dense-dispatch mirror) ===
-            // The DENSE dispatcher has had a `Layer::Sub` arm since #2617; the
+            // The DENSE dispatcher already had a `Layer::Sub` arm; the
             // batched dispatcher had none, so every `Sub` node fell through to the
             // generic unary dispatch, whose `UnsupportedOp` either concretized the
             // node through its IBP forward (partial CROWN — the condition-blind
@@ -909,6 +1036,9 @@ impl GraphNetwork {
         output_shape: &[usize],
         node_linear_bounds: &mut BatchedCrownAccumulator,
     ) -> Result<Option<BoundedTensor>> {
+        if layer.is_diagnostic_point_only() {
+            return Err(crate::network::proof_eligibility::diagnostic_only());
+        }
         if deadline.is_some_and(|limit| Instant::now() >= limit) {
             return Err(NyError::DeadlineExceeded(format!(
                 "batched CROWN: deadline exceeded before unary dispatch at '{node_name}'"
@@ -926,10 +1056,10 @@ impl GraphNetwork {
                 node_linear_bounds.accumulate_dense(first_input, new_lb)?;
                 Ok(None)
             }
-            // #3131: Catch UnsupportedOp and UnsupportedConfiguration for partial CROWN
-            // fallback. #2888: NumericalInstability also triggers fallback — non-finite
+            // Catch UnsupportedOp and UnsupportedConfiguration for partial CROWN
+            // fallback. NumericalInstability also triggers fallback — non-finite
             // pre-activation bounds should degrade to IBP, not abort verification.
-            // #4146: ShapeMismatch also triggers fallback — defense-in-depth for layers
+            // ShapeMismatch also triggers fallback — defense-in-depth for layers
             // that still emit ShapeMismatch from batched CROWN (e.g., Resize, Pad).
             Err(
                 e @ NyError::UnsupportedOp(_)
@@ -942,7 +1072,7 @@ impl GraphNetwork {
                 // accumulated from a different path, partial CROWN fallback at this
                 // node would only capture this one path's contribution — producing
                 // unsound bounds. Propagate the error so the caller can fall back
-                // to IBP entirely.  Part of #2072.
+                // to IBP entirely.
                 let has_other_pending = !node_linear_bounds.is_empty();
                 if has_other_pending {
                     debug!(
@@ -967,14 +1097,14 @@ impl GraphNetwork {
                     Self::partial_crown_fallback(node_lb, node_ibp_bounds, output_shape)?;
                 Ok(Some(fallback))
             }
-            // #3107: Preserve error type — don't wrap in InvalidSpec.
+            // Preserve error type — don't wrap in InvalidSpec.
             Err(e) => Err(e),
         }
     }
 
     /// Try Conv2d Patches fast-path for a single-input Conv2d node, or convert to Dense.
     ///
-    /// Phase 4 (#2613): For single-input Conv2d nodes in Patches mode, uses the unbatched
+    /// Phase 4: For single-input Conv2d nodes in Patches mode, uses the unbatched
     /// Patches backward to compose strides/padding without materializing the full dense
     /// A-matrix. This provides the same 222x memory reduction as the unbatched CROWN path.
     ///
@@ -1075,6 +1205,391 @@ impl GraphNetwork {
                 deadline,
             )?,
         )))
+    }
+}
+
+#[cfg(test)]
+mod global_attention_row_tests {
+    use super::*;
+    use crate::layers::{AddLayer, FlattenLayer, MulConstantLayer};
+    use crate::network::core::graph::dispatch_plan::CrownDispatchPlan;
+    use crate::network::NETWORK_INPUT;
+    use ndarray::Dimension;
+    use num_rational::BigRational;
+    use num_traits::Signed;
+
+    fn rational(value: f32) -> BigRational {
+        BigRational::from_float(f64::from(value)).unwrap()
+    }
+
+    fn assert_bits(left: &ArrayD<f32>, right: &ArrayD<f32>) {
+        assert_eq!(left.len(), right.len());
+        for (&left, &right) in left.iter().zip(right) {
+            assert_eq!(left.to_bits(), right.to_bits());
+        }
+    }
+
+    fn global_carrier(shape: &[usize], rows: usize) -> BatchedLinearBounds {
+        let columns = checked_shape_product(shape).unwrap();
+        let a_shape = [1, 1, 1, rows, columns];
+        let lower = ArrayD::from_shape_fn(IxDyn(&a_shape), |i| {
+            ((i[3] * 7 + i[4] * 3) % 13) as f32 * 0.125 - 0.75
+        });
+        let upper = lower.mapv(|value| -value * 0.5);
+        let bias_shape = [1, 1, 1, rows];
+        let mut result = BatchedLinearBounds::new(
+            lower,
+            ArrayD::from_shape_fn(IxDyn(&bias_shape), |i| i[3] as f32 * 0.03125 - 0.25),
+            upper,
+            ArrayD::from_shape_fn(IxDyn(&bias_shape), |i| 0.5 - i[3] as f32 * 0.015625),
+            vec![1, columns],
+            vec![1, rows],
+        )
+        .unwrap();
+        result.lower_a_err = Some(ArrayD::from_shape_fn(IxDyn(&a_shape), |i| {
+            ((i[3] + i[4] * 2) % 5) as f32 * 0.015625
+        }));
+        result.upper_a_err = Some(ArrayD::from_shape_fn(IxDyn(&a_shape), |i| {
+            ((i[3] * 3 + i[4]) % 7) as f32 * 0.0078125
+        }));
+        result
+    }
+
+    #[test]
+    fn attention_region_global_flatten_keeps_all_rank_axes_rows_and_signed_error_bits() {
+        for shape in [vec![2, 3, 2], vec![2, 2, 3, 2], vec![1, 2, 3, 2, 2]] {
+            let input = BoundedTensor::new(
+                ArrayD::from_shape_fn(IxDyn(&shape), |i| {
+                    i.slice().iter().sum::<usize>() as f32 * 0.125 - 0.5
+                }),
+                ArrayD::from_shape_fn(IxDyn(&shape), |i| {
+                    i.slice().iter().sum::<usize>() as f32 * 0.125 - 0.25
+                }),
+            )
+            .unwrap();
+            let original = global_carrier(&shape, 9);
+            let saved = original.clone();
+            let pointers = [
+                original.lower_a.as_ptr(),
+                original.upper_a.as_ptr(),
+                original.lower_b.as_ptr(),
+                original.upper_b.as_ptr(),
+                original.lower_a_err.as_ref().unwrap().as_ptr(),
+                original.upper_a_err.as_ref().unwrap().as_ptr(),
+            ];
+            let result = remap_global_flatten_batched(
+                &Layer::Flatten(FlattenLayer::flatten_all()),
+                original,
+                &input,
+            )
+            .unwrap();
+            assert_eq!(result.input_shape(), shape.as_slice());
+            assert_eq!(result.lower_a.shape(), [9, input.len()]);
+            assert_eq!(result.lower_b.shape(), [9]);
+            assert_eq!(result.output_shape(), saved.output_shape());
+            for (actual, expected) in [
+                (&result.lower_a, &saved.lower_a),
+                (&result.upper_a, &saved.upper_a),
+                (&result.lower_b, &saved.lower_b),
+                (&result.upper_b, &saved.upper_b),
+                (
+                    result.lower_a_err.as_ref().unwrap(),
+                    saved.lower_a_err.as_ref().unwrap(),
+                ),
+                (
+                    result.upper_a_err.as_ref().unwrap(),
+                    saved.upper_a_err.as_ref().unwrap(),
+                ),
+            ] {
+                assert_bits(actual, expected);
+            }
+            assert_eq!(
+                pointers,
+                [
+                    result.lower_a.as_ptr(),
+                    result.upper_a.as_ptr(),
+                    result.lower_b.as_ptr(),
+                    result.upper_b.as_ptr(),
+                    result.lower_a_err.as_ref().unwrap().as_ptr(),
+                    result.upper_a_err.as_ref().unwrap().as_ptr(),
+                ],
+                "the exact metadata remap must allocate no coefficient/bias/error copies"
+            );
+            let concrete = result.concretize_sound(&input).unwrap();
+            // Independent exact affine/error arithmetic at original tensor
+            // endpoints, with nonzero signed rows and distinct error planes.
+            for take_upper in [false, true] {
+                let point = if take_upper {
+                    input.upper()
+                } else {
+                    input.lower()
+                };
+                for row in 0..9 {
+                    let mut lower = rational(result.lower_b[[row]]);
+                    let mut upper = rational(result.upper_b[[row]]);
+                    for (column, &x) in point.iter().enumerate() {
+                        let x = rational(x);
+                        lower += rational(result.lower_a[[row, column]]) * &x
+                            - rational(result.lower_a_err.as_ref().unwrap()[[row, column]])
+                                * x.abs();
+                        upper += rational(result.upper_a[[row, column]]) * &x
+                            + rational(result.upper_a_err.as_ref().unwrap()[[row, column]])
+                                * x.abs();
+                    }
+                    assert!(rational(concrete.lower().as_slice().unwrap()[row]) <= lower);
+                    assert!(rational(concrete.upper().as_slice().unwrap()[row]) >= upper);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn attention_region_global_flatten_declines_local_rows_and_malformed_extents() {
+        let input = BoundedTensor::concrete(ArrayD::zeros(IxDyn(&[2, 3, 2]))).unwrap();
+        let flatten = Layer::Flatten(FlattenLayer::flatten_all());
+        let local = BatchedLinearBounds::identity(&[2, 6]).unwrap();
+        let expected = local.clone();
+        let declined = remap_global_flatten_batched(&flatten, local, &input).unwrap();
+        assert_eq!(declined.lower_a.shape(), expected.lower_a.shape());
+        assert_eq!(declined.input_shape(), expected.input_shape());
+        assert_bits(&declined.lower_a, &expected.lower_a);
+        let original = global_carrier(input.shape(), 9);
+        let authored_local = remap_global_flatten_batched(
+            &Layer::Flatten(FlattenLayer::new(1)),
+            original.clone(),
+            &input,
+        )
+        .unwrap();
+        assert_eq!(authored_local.lower_a.shape(), original.lower_a.shape());
+        let wrong_extent = BoundedTensor::concrete(ArrayD::zeros(IxDyn(&[2, 2, 2]))).unwrap();
+        let declined =
+            remap_global_flatten_batched(&flatten, original.clone(), &wrong_extent).unwrap();
+        assert_eq!(declined.lower_a.shape(), original.lower_a.shape());
+        let mut malformed = original;
+        malformed.upper_a_err = Some(ArrayD::zeros(IxDyn(&[1, 1, 1, 9, 11])));
+        assert!(remap_global_flatten_batched(&flatten, malformed, &input).is_err());
+        // Zero coefficients still preserve a negative lower and positive upper
+        // bound, so this metadata adapter cannot create a closing margin.
+        let zero = BatchedLinearBounds::new(
+            ArrayD::zeros(IxDyn(&[1, 3, 12])),
+            ArrayD::from_elem(IxDyn(&[1, 3]), -0.25),
+            ArrayD::zeros(IxDyn(&[1, 3, 12])),
+            ArrayD::from_elem(IxDyn(&[1, 3]), 0.5),
+            vec![1, 12],
+            vec![1, 3],
+        )
+        .unwrap();
+        let zero = remap_global_flatten_batched(&flatten, zero, &input).unwrap();
+        let concrete = zero.concretize_sound(&input).unwrap();
+        assert!(concrete.lower().iter().all(|&value| value <= -0.25));
+        assert!(concrete.upper().iter().all(|&value| value >= 0.5));
+    }
+
+    fn add_dispatch(incoming: &BatchedLinearBounds) -> Result<[BatchedLinearBounds; 2]> {
+        let mut graph = GraphNetwork::new();
+        for name in ["left", "right"] {
+            graph.add_node(GraphNode::from_input(
+                name,
+                Layer::MulConstant(MulConstantLayer::scalar(1.0)),
+            ));
+        }
+        graph.add_node(GraphNode::binary(
+            "sum",
+            Layer::Add(AddLayer),
+            "left",
+            "right",
+        ));
+        graph.set_output("sum");
+        let plan = CrownDispatchPlan::build(&graph)?;
+        let mut accumulator = BatchedCrownAccumulator::new(&plan);
+        let input = BoundedTensor::concrete(ArrayD::zeros(IxDyn(&[1, 3])))?;
+        let boxes = HashMap::from([
+            ("left".into(), input.clone()),
+            ("right".into(), input.clone()),
+        ]);
+        let mut runtime = AttentionCompositionRuntime::production();
+        let result = graph.dispatch_special_batched_operator(
+            graph.nodes.get("sum").unwrap(),
+            "sum",
+            incoming,
+            &input,
+            &boxes,
+            &[1, 2],
+            MulBinaryRelaxationMode::default(),
+            None,
+            &mut runtime,
+            &mut accumulator,
+        )?;
+        assert!(matches!(result, SpecialBatchedDispatchResult::Handled));
+        assert!(accumulator.take(NETWORK_INPUT).is_none());
+        Ok([
+            accumulator
+                .take("left")
+                .unwrap()
+                .into_batched_dense_checked("Add:left")?,
+            accumulator
+                .take("right")
+                .unwrap()
+                .into_batched_dense_checked("Add:right")?,
+        ])
+    }
+
+    #[test]
+    fn attention_region_add_preserves_signed_and_error_only_original_rows() {
+        let lower = ArrayD::from_shape_vec(IxDyn(&[1, 2, 3]), vec![0.0, 0.0, 0.0, -0.5, 0.25, 1.0])
+            .unwrap();
+        let upper =
+            ArrayD::from_shape_vec(IxDyn(&[1, 2, 3]), vec![0.0, 0.0, 0.0, 0.5, -0.25, -1.0])
+                .unwrap();
+        let mut incoming = BatchedLinearBounds::new(
+            lower,
+            ArrayD::from_shape_vec(IxDyn(&[1, 2]), vec![0.0, -0.125]).unwrap(),
+            upper,
+            ArrayD::from_shape_vec(IxDyn(&[1, 2]), vec![0.0, 0.25]).unwrap(),
+            vec![1, 3],
+            vec![1, 2],
+        )
+        .unwrap();
+        incoming.lower_a_err = Some(
+            ArrayD::from_shape_vec(IxDyn(&[1, 2, 3]), vec![0.125, 0.25, 0.0, 0.0, 0.125, 0.25])
+                .unwrap(),
+        );
+        incoming.upper_a_err = Some(
+            ArrayD::from_shape_vec(IxDyn(&[1, 2, 3]), vec![0.0, 0.25, 0.125, 0.25, 0.0, 0.125])
+                .unwrap(),
+        );
+        let children = add_dispatch(&incoming).unwrap();
+        for child in &children {
+            assert!(child.has_coeff_err());
+            assert!(child.lower_a_err.as_ref().unwrap()[[0, 0, 0]] >= 0.125);
+            assert!(child.upper_a_err.as_ref().unwrap()[[0, 0, 2]] >= 0.125);
+        }
+        let lo = [-0.75, 0.25, -0.5, -0.25, -0.5, 0.125];
+        let hi = [0.5, 0.75, 0.25, 0.75, 0.25, 0.625];
+        for mask in 0..64 {
+            let point: [f32; 6] =
+                std::array::from_fn(|i| if mask & (1 << i) == 0 { lo[i] } else { hi[i] });
+            for row in 0..2 {
+                let mut original_lower = rational(incoming.lower_b[[0, row]]);
+                let mut original_upper = rational(incoming.upper_b[[0, row]]);
+                let mut actual_lower = BigRational::from_integer(0.into());
+                let mut actual_upper = actual_lower.clone();
+                for column in 0..3 {
+                    let z = rational(point[column]) + rational(point[3 + column]);
+                    original_lower += rational(incoming.lower_a[[0, row, column]]) * &z
+                        - rational(incoming.lower_a_err.as_ref().unwrap()[[0, row, column]])
+                            * z.abs();
+                    original_upper += rational(incoming.upper_a[[0, row, column]]) * &z
+                        + rational(incoming.upper_a_err.as_ref().unwrap()[[0, row, column]])
+                            * z.abs();
+                }
+                for (side, child) in children.iter().enumerate() {
+                    actual_lower += rational(child.lower_b[[0, row]]);
+                    actual_upper += rational(child.upper_b[[0, row]]);
+                    for column in 0..3 {
+                        let x = rational(point[side * 3 + column]);
+                        actual_lower += rational(child.lower_a[[0, row, column]]) * &x
+                            - rational(child.lower_a_err.as_ref().unwrap()[[0, row, column]])
+                                * x.abs();
+                        actual_upper += rational(child.upper_a[[0, row, column]]) * &x
+                            + rational(child.upper_a_err.as_ref().unwrap()[[0, row, column]])
+                                * x.abs();
+                    }
+                }
+                assert!(
+                    actual_lower <= original_lower,
+                    "Add lower mask={mask} row={row}"
+                );
+                assert!(
+                    actual_upper >= original_upper,
+                    "Add upper mask={mask} row={row}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn attention_region_add_zero_and_malformed_error_controls_fail_closed() {
+        let zero = BatchedLinearBounds::new(
+            ArrayD::zeros(IxDyn(&[1, 2, 3])),
+            ArrayD::from_elem(IxDyn(&[1, 2]), -0.5),
+            ArrayD::zeros(IxDyn(&[1, 2, 3])),
+            ArrayD::from_elem(IxDyn(&[1, 2]), 0.25),
+            vec![1, 3],
+            vec![1, 2],
+        )
+        .unwrap();
+        let children = add_dispatch(&zero).unwrap();
+        assert!(children.iter().all(|child| !child.has_coeff_err()));
+        for row in 0..2 {
+            assert!(
+                rational(children[0].lower_b[[0, row]]) + rational(children[1].lower_b[[0, row]])
+                    <= rational(-0.5)
+            );
+            assert!(
+                rational(children[0].upper_b[[0, row]]) + rational(children[1].upper_b[[0, row]])
+                    >= rational(0.25)
+            );
+        }
+        let mut malformed = zero.clone();
+        malformed.lower_a_err = Some(ArrayD::zeros(IxDyn(&[1, 2, 2])));
+        assert!(add_dispatch(&malformed).is_err());
+        for value in [f32::NAN, -0.125] {
+            let mut invalid = zero.clone();
+            invalid.upper_a_err = Some(ArrayD::from_elem(IxDyn(&[1, 2, 3]), value));
+            assert!(add_dispatch(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn attention_region_add_broadcast_original_operand_declines_without_publication() {
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input(
+            "left",
+            Layer::MulConstant(MulConstantLayer::scalar(1.0)),
+        ));
+        graph.add_node(GraphNode::from_input(
+            "right",
+            Layer::ReduceMean(crate::layers::ReduceMeanLayer::last_axis()),
+        ));
+        graph.add_node(GraphNode::binary(
+            "sum",
+            Layer::Add(AddLayer),
+            "left",
+            "right",
+        ));
+        graph.set_output("sum");
+        let plan = CrownDispatchPlan::build(&graph).unwrap();
+        let mut accumulator = BatchedCrownAccumulator::new(&plan);
+        let input = BoundedTensor::concrete(ArrayD::zeros(IxDyn(&[1, 3]))).unwrap();
+        let right = BoundedTensor::concrete(ArrayD::zeros(IxDyn(&[1, 1]))).unwrap();
+        let boxes = HashMap::from([("left".into(), input.clone()), ("right".into(), right)]);
+        let bounds = BatchedLinearBounds::identity(&[1, 3]).unwrap();
+        let mut runtime = AttentionCompositionRuntime::production();
+        let result = graph
+            .dispatch_special_batched_operator(
+                graph.nodes.get("sum").unwrap(),
+                "sum",
+                &bounds,
+                &input,
+                &boxes,
+                &[1, 3],
+                MulBinaryRelaxationMode::default(),
+                None,
+                &mut runtime,
+                &mut accumulator,
+            )
+            .unwrap();
+        assert!(matches!(result, SpecialBatchedDispatchResult::NotHandled));
+        assert!(
+            accumulator.is_empty(),
+            "broadcast columns cannot be copied onto a shorter operand"
+        );
+        // The default coordinator must follow its checked partial fallback,
+        // rather than reaching the old Add-always-handled unreachable arm.
+        let published = graph.propagate_crown_batched(&input).unwrap();
+        assert!(published.lower().iter().all(|&v| v <= 0.0));
+        assert!(published.upper().iter().all(|&v| v >= 0.0));
     }
 }
 

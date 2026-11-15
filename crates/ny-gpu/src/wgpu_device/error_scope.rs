@@ -67,7 +67,9 @@ thread_local! {
 /// only this transaction's two existing checked phase wrappers reuse the lock;
 /// another device, thread, or nested transaction must acquire its own guard.
 pub(super) struct GpuCheckedTransaction<'a> {
-    owner: &'a WgpuDevice,
+    device: &'a wgpu::Device,
+    uncaptured_errors: &'a UncapturedErrorState,
+    identity: usize,
     _guard: MutexGuard<'a, ()>,
     oom_scope: Option<wgpu::ErrorScopeGuard>,
     internal_scope: Option<wgpu::ErrorScopeGuard>,
@@ -75,6 +77,13 @@ pub(super) struct GpuCheckedTransaction<'a> {
     start_generation: u64,
     deadline: std::time::Instant,
     active: bool,
+    /// The device whose resident-weight cache this transaction may grow
+    /// (`None` for the device-level transactions of cached IBP plans, which
+    /// never reach that cache). An upload made inside the transaction cannot
+    /// push its own error scope, so its entry stays uncommitted until the
+    /// transaction's scopes pop clean: a clean `finish`/`finish_bounded`
+    /// commits it, and `Drop` evicts whatever is still uncommitted.
+    cache_owner: Option<&'a WgpuDevice>,
 }
 
 impl GpuCheckedTransaction<'_> {
@@ -83,12 +92,88 @@ impl GpuCheckedTransaction<'_> {
     /// deadline remain valid at this final transaction boundary.
     pub(super) fn finish(&mut self, label: &str) -> Result<()> {
         self.finish_scopes(label)?;
-        self.owner
-            .finish_checked_transaction(label, self.start_generation, self.deadline)?;
-        if !self.owner.checked_transaction_active() {
+        self.finish_checks(label)?;
+        self.commit_cache_inserts();
+        Ok(())
+    }
+
+    /// Cached preparation can enqueue uploads without a final readback. Pop
+    /// every scope before bounded completion; cached execution uses this same
+    /// finish if its backend scope futures need another nonblocking poll.
+    pub(super) fn finish_bounded(&mut self, label: &str) -> Result<()> {
+        self.finish_scopes_until(label)?;
+        self.finish_checks(label)?;
+        self.commit_cache_inserts();
+        Ok(())
+    }
+
+    /// Every scope popped clean and every final check passed: the uploads
+    /// made under this transaction succeeded, so its cache entries are kept.
+    fn commit_cache_inserts(&self) {
+        if let Some(owner) = self.cache_owner {
+            owner.commit_transaction_resident_weights();
+        }
+    }
+
+    fn finish_checks(&self, label: &str) -> Result<()> {
+        if self.uncaptured_errors.generation() != self.start_generation {
+            return Err(NyError::InternalError(format!(
+                "uncaptured wgpu error during {label} (recoverable; falling back to CPU): {}",
+                self.uncaptured_errors
+                    .last_message()
+                    .unwrap_or_else(|| "unknown".into())
+            )));
+        }
+        if std::time::Instant::now() >= self.deadline {
+            return Err(NyError::DeadlineExceeded(format!(
+                "{label}: deadline expired while finalizing the WGPU transaction"
+            )));
+        }
+        if !CHECKED_TRANSACTION_DEVICE.with(|slot| slot.get() == Some(self.identity)) {
             return Err(NyError::InternalError(format!(
                 "{label}: WGPU checked-transaction authority token was lost"
             )));
+        }
+        Ok(())
+    }
+
+    fn finish_scopes_until(&mut self, label: &str) -> Result<()> {
+        let scopes = [
+            self.validation_scope.take(),
+            self.internal_scope.take(),
+            self.oom_scope.take(),
+        ];
+        // Pop in strict reverse order even if a missing scope or timeout is
+        // discovered later. Dropping a future discards its result, not its pop.
+        let mut futures = scopes.map(|scope| scope.map(|scope| Box::pin(scope.pop())));
+        for (kind, future) in ["validation", "internal", "out-of-memory"]
+            .into_iter()
+            .zip(futures.iter_mut())
+        {
+            let future = future
+                .as_mut()
+                .ok_or_else(|| NyError::InternalError(format!("{label}: {kind} scope missing")))?;
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            let error = wait_for_scope_ready(
+                self.deadline,
+                label,
+                || {
+                    self.device
+                        .poll(wgpu::PollType::Poll)
+                        .map(|_| ())
+                        .map_err(|error| {
+                            NyError::InternalError(format!(
+                                "{label}: nonblocking WGPU poll failed: {error}"
+                            ))
+                        })
+                },
+                || future.as_mut().poll(&mut context),
+            )?;
+            if let Some(error) = error {
+                return Err(NyError::InternalError(format!(
+                    "wgpu {kind} error during {label}: {error}"
+                )));
+            }
         }
         Ok(())
     }
@@ -97,7 +182,7 @@ impl GpuCheckedTransaction<'_> {
         // Every accepted sweep reaches a bounded readback before this point.
         // One final nonblocking maintain makes any synchronous validation and
         // completed-submission errors observable without spending deadline.
-        let poll_error = self.owner.device.poll(wgpu::PollType::Poll).err();
+        let poll_error = self.device.poll(wgpu::PollType::Poll).err();
         let poll_once = |scope: wgpu::ErrorScopeGuard| {
             let mut future = std::pin::pin!(scope.pop());
             let mut context = std::task::Context::from_waker(std::task::Waker::noop());
@@ -166,7 +251,7 @@ impl GpuCheckedTransaction<'_> {
         if !self.active {
             return true;
         }
-        let identity = self.owner.checked_transaction_identity();
+        let identity = self.identity;
         let matched = CHECKED_TRANSACTION_DEVICE.with(|slot| {
             let matched = slot.get() == Some(identity);
             slot.set(None);
@@ -177,11 +262,42 @@ impl GpuCheckedTransaction<'_> {
     }
 }
 
+fn wait_for_scope_ready<T>(
+    deadline: std::time::Instant,
+    label: &str,
+    mut maintain: impl FnMut() -> Result<()>,
+    mut poll: impl FnMut() -> std::task::Poll<T>,
+) -> Result<T> {
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(NyError::DeadlineExceeded(format!(
+                "{label}: deadline expired waiting for WGPU error scopes"
+            )));
+        }
+        maintain()?;
+        let ready = poll();
+        if std::time::Instant::now() >= deadline {
+            return Err(NyError::DeadlineExceeded(format!(
+                "{label}: deadline expired finalizing WGPU error scopes"
+            )));
+        }
+        if let std::task::Poll::Ready(value) = ready {
+            return Ok(value);
+        }
+        std::thread::yield_now();
+    }
+}
+
 impl Drop for GpuCheckedTransaction<'_> {
     fn drop(&mut self) {
         // Every `?` exit must release both the TLS authority and the mutex. A
         // mismatch is fail-closed for reentrancy because the slot is cleared.
         self.discard_scopes();
+        // Uploads no clean finish committed may hold invalid buffers: evict
+        // them while the serialization guard is still held.
+        if let Some(owner) = self.cache_owner {
+            owner.discard_transaction_resident_weights();
+        }
         let _ = self.clear_token();
     }
 }
@@ -233,10 +349,10 @@ impl UncapturedErrorState {
 
 impl WgpuDevice {
     fn checked_transaction_identity(&self) -> usize {
-        std::ptr::from_ref(self).addr()
+        Arc::as_ptr(&self.gpu_serialize).addr()
     }
 
-    fn checked_transaction_active(&self) -> bool {
+    pub(super) fn checked_transaction_active(&self) -> bool {
         let identity = self.checked_transaction_identity();
         CHECKED_TRANSACTION_DEVICE.with(|slot| slot.get() == Some(identity))
     }
@@ -254,21 +370,6 @@ impl WgpuDevice {
         )))
     }
 
-    fn finish_checked_transaction(
-        &self,
-        label: &str,
-        start_generation: u64,
-        deadline: std::time::Instant,
-    ) -> Result<()> {
-        self.uncaptured_error_since(label, start_generation)?;
-        if std::time::Instant::now() >= deadline {
-            return Err(NyError::DeadlineExceeded(format!(
-                "{label}: deadline expired while finalizing the WGPU transaction"
-            )));
-        }
-        Ok(())
-    }
-
     /// Acquire one deadline-aware outer transaction for a multi-phase GPU
     /// operation. The returned guard installs the exact-device reentrancy token
     /// and must remain alive until all result association and validation have
@@ -278,50 +379,19 @@ impl WgpuDevice {
         label: &str,
         deadline: std::time::Instant,
     ) -> Result<GpuCheckedTransaction<'_>> {
-        if CHECKED_TRANSACTION_DEVICE.with(|slot| slot.get().is_some()) {
-            return Err(NyError::InternalError(format!(
-                "{label}: nested WGPU checked transaction refused"
-            )));
-        }
-        let guard = loop {
-            match self.gpu_serialize.try_lock() {
-                Ok(guard) => break guard,
-                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                    break poisoned.into_inner();
-                }
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    if std::time::Instant::now() >= deadline {
-                        return Err(NyError::DeadlineExceeded(format!(
-                            "{label}: deadline expired while waiting for the WGPU transaction lock"
-                        )));
-                    }
-                    std::thread::yield_now();
-                }
-            }
-        };
-        if std::time::Instant::now() >= deadline {
-            return Err(NyError::DeadlineExceeded(format!(
-                "{label}: deadline expired before the WGPU transaction began"
-            )));
-        }
-        let identity = self.checked_transaction_identity();
-        // Own innermost scopes for the complete transaction. This prevents an
-        // outer scope installed through the public raw device accessor from
-        // intercepting and hiding sweep validation/internal/OOM errors.
-        let oom_scope = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-        let internal_scope = self.device.push_error_scope(wgpu::ErrorFilter::Internal);
-        let validation_scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        CHECKED_TRANSACTION_DEVICE.with(|slot| slot.set(Some(identity)));
-        Ok(GpuCheckedTransaction {
-            owner: self,
-            _guard: guard,
-            oom_scope: Some(oom_scope),
-            internal_scope: Some(internal_scope),
-            validation_scope: Some(validation_scope),
-            start_generation: self.uncaptured_errors.generation(),
+        let mut transaction = begin_gpu_checked_transaction_on_device(
+            &self.device,
+            &self.gpu_serialize,
+            &self.uncaptured_errors,
+            label,
             deadline,
-            active: true,
-        })
+        )?;
+        // The serialization guard is held, so no other transaction is in
+        // progress on this device: any uncommitted upload is stale. Evict it
+        // so uncommitted entries only ever belong to this transaction.
+        self.discard_transaction_resident_weights();
+        transaction.cache_owner = Some(self);
+        Ok(transaction)
     }
 
     /// Install the non-panicking uncaptured-error backstop on a freshly created
@@ -478,6 +548,59 @@ impl WgpuDevice {
     }
 }
 
+/// Cached plans retain these exact shared owner resources, so transaction
+/// serialization/error generations survive without impersonating WgpuDevice.
+pub(super) fn begin_gpu_checked_transaction_on_device<'a>(
+    device: &'a wgpu::Device,
+    serialize: &'a Arc<Mutex<()>>,
+    uncaptured_errors: &'a UncapturedErrorState,
+    label: &str,
+    deadline: std::time::Instant,
+) -> Result<GpuCheckedTransaction<'a>> {
+    if CHECKED_TRANSACTION_DEVICE.with(|slot| slot.get().is_some()) {
+        return Err(NyError::InternalError(format!(
+            "{label}: nested WGPU checked transaction refused"
+        )));
+    }
+    let guard = loop {
+        match serialize.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(NyError::DeadlineExceeded(format!(
+                        "{label}: deadline expired while waiting for the WGPU transaction lock"
+                    )));
+                }
+                std::thread::yield_now();
+            }
+        }
+    };
+    if std::time::Instant::now() >= deadline {
+        return Err(NyError::DeadlineExceeded(format!(
+            "{label}: deadline expired before the WGPU transaction began"
+        )));
+    }
+    let identity = Arc::as_ptr(serialize).addr();
+    let oom_scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let internal_scope = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let validation_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    CHECKED_TRANSACTION_DEVICE.with(|slot| slot.set(Some(identity)));
+    Ok(GpuCheckedTransaction {
+        device,
+        uncaptured_errors,
+        identity,
+        _guard: guard,
+        oom_scope: Some(oom_scope),
+        internal_scope: Some(internal_scope),
+        validation_scope: Some(validation_scope),
+        start_generation: uncaptured_errors.generation(),
+        deadline,
+        active: true,
+        cache_owner: None,
+    })
+}
+
 /// Run `op` inside wgpu validation/internal/OOM error scopes on the calling
 /// thread, turning any captured GPU error into `Err` instead of a process abort.
 ///
@@ -525,4 +648,69 @@ pub(super) fn run_gpu_checked_on_device<T>(
     }
 
     op_result
+}
+
+#[cfg(test)]
+mod deadline_scope_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn expired_scope_wait_never_runs_maintenance_or_polls() {
+        let maintained = Cell::new(0);
+        let polled = Cell::new(0);
+        let result = wait_for_scope_ready(
+            Instant::now(),
+            "scripted",
+            || {
+                maintained.set(maintained.get() + 1);
+                Ok(())
+            },
+            || {
+                polled.set(polled.get() + 1);
+                std::task::Poll::Ready(())
+            },
+        );
+        assert!(matches!(result, Err(NyError::DeadlineExceeded(_))));
+        assert_eq!((maintained.get(), polled.get()), (0, 0));
+    }
+
+    #[test]
+    fn scope_wait_handles_pending_then_ready_without_blocking_executor() {
+        let polls = Cell::new(0);
+        let value = wait_for_scope_ready(
+            Instant::now() + Duration::from_secs(10),
+            "scripted",
+            || Ok(()),
+            || {
+                polls.set(polls.get() + 1);
+                if polls.get() == 1 {
+                    std::task::Poll::Pending
+                } else {
+                    std::task::Poll::Ready(7)
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(value, 7);
+        assert_eq!(polls.get(), 2);
+    }
+
+    #[test]
+    fn scope_wait_refuses_ready_value_when_maintenance_crosses_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(1);
+        let result = wait_for_scope_ready(
+            deadline,
+            "scripted",
+            || {
+                while Instant::now() < deadline {
+                    std::hint::spin_loop();
+                }
+                Ok(())
+            },
+            || std::task::Poll::Ready(7),
+        );
+        assert!(matches!(result, Err(NyError::DeadlineExceeded(_))));
+    }
 }

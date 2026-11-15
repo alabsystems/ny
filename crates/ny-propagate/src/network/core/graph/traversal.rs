@@ -51,7 +51,7 @@ impl GraphNetwork {
     /// For each node, ancestors are all nodes reachable backward (excluding
     /// `NETWORK_INPUT`), returned in topological order. The map is computed
     /// incrementally in O(N*(N+E)) total by walking exec_order forward and
-    /// unioning parent ancestor sets (#2220 Packet A, #2237 F1).
+    /// unioning parent ancestor sets.
     pub(crate) fn all_ancestors(&self) -> Result<&HashMap<String, Vec<String>>> {
         if let Some(cached) = self.cached_ancestors.get() {
             return Ok(cached);

@@ -27,7 +27,7 @@ use crate::network::core::{GraphNetwork, NETWORK_INPUT};
 ///
 /// Widening is sound because `[-inf, +inf]` is always a valid overapproximation.
 /// The previous behavior (clamping `lower` to `upper`) created degenerate
-/// `[upper, upper]` intervals which could exclude the true value (#2655).
+/// `[upper, upper]` intervals which could exclude the true value.
 /// This matches `LinearBounds::concretize_sound` (`linear.rs:236-244`) which
 /// also widens inversions to `[-inf, +inf]`.
 ///
@@ -173,7 +173,7 @@ pub(crate) fn update_elementwise_best_bounds(
     for (best, &curr) in best_lower.iter_mut().zip(concrete_bounds.lower().iter()) {
         // NaN-safe max: if best is NaN (stuck from iteration 0), any finite curr
         // replaces it. IEEE 754: `curr > NaN` is false, so without this guard a
-        // NaN best value is permanently stuck (#3093).
+        // NaN best value is permanently stuck.
         if curr > *best || best.is_nan() {
             *best = curr;
         }
@@ -188,7 +188,7 @@ pub(crate) fn update_elementwise_best_bounds(
         )));
     }
     for (best, &curr) in best_upper.iter_mut().zip(concrete_bounds.upper().iter()) {
-        // NaN-safe min: symmetric to the lower-bound guard above (#3093).
+        // NaN-safe min: symmetric to the lower-bound guard above.
         if curr < *best || best.is_nan() {
             *best = curr;
         }
@@ -217,7 +217,7 @@ impl GraphNetwork {
             ))
         })?;
 
-        // #2098: Reject nodes with empty inputs rather than fabricating NETWORK_INPUT.
+        // Reject nodes with empty inputs rather than fabricating NETWORK_INPUT.
         // A ReLU with no inputs is a graph construction bug; using network input
         // bounds as pre-activation would produce unsound relaxations.
         let producer_name = relu_node
@@ -249,7 +249,7 @@ impl GraphNetwork {
         })
     }
 
-    // `is_sequential_graph()` moved to `network/core/graph/convert.rs` (#4097)
+    // `is_sequential_graph()` moved to `network/core/graph/convert.rs`
     // to share with non-alpha consumers (resident PGD, etc.).
 }
 
@@ -287,8 +287,8 @@ mod tests {
         assert!(msg.contains("test-missing"), "lookup context not included");
     }
 
-    /// #2991: Empty-input ReLU is now caught at construction time by
-    /// GraphNode::try_new() arity validation (#2481, #2686).
+    /// Empty-input ReLU is now caught at construction time by
+    /// GraphNode::try_new() arity validation.
     #[test]
     fn test_relu_preactivation_bounds_empty_inputs_returns_invalid_spec_2098() {
         let err = GraphNode::try_new("relu", Layer::ReLU(ReLULayer), vec![])
@@ -315,7 +315,7 @@ mod tests {
         let widened = clamp_inverted_best_bounds(&mut best_lower, &mut best_upper, "test");
 
         assert_eq!(widened, 1, "exactly one element should be widened");
-        // Inverted element widened to [-inf, +inf] (#2655: sound overapproximation)
+        // Inverted element widened to [-inf, +inf] (sound overapproximation)
         assert_eq!(best_lower[[1]], f32::NEG_INFINITY);
         assert_eq!(best_upper[[1]], f32::INFINITY);
         // Non-inverted elements unchanged
@@ -396,7 +396,7 @@ mod tests {
         }
     }
 
-    /// #3093: NaN in best_lower is replaced by subsequent finite value.
+    /// NaN in best_lower is replaced by subsequent finite value.
     /// Before fix, `curr > NaN` was always false (IEEE 754), so NaN was permanently stuck.
     #[test]
     fn test_update_elementwise_best_bounds_nan_lower_replaced_3093() {
@@ -430,7 +430,7 @@ mod tests {
         );
     }
 
-    /// #3093: NaN in best_upper is replaced by subsequent finite value.
+    /// NaN in best_upper is replaced by subsequent finite value.
     #[test]
     fn test_update_elementwise_best_bounds_nan_upper_replaced_3093() {
         let mut best_lower = array![-10.0_f32, -10.0, -10.0].into_dyn();
@@ -463,7 +463,7 @@ mod tests {
         );
     }
 
-    /// #3093: clamp_inverted_best_bounds widens NaN elements to [-inf, +inf].
+    /// clamp_inverted_best_bounds widens NaN elements to [-inf, +inf].
     #[test]
     fn test_clamp_inverted_best_bounds_widens_nan_3093() {
         let mut best_lower = array![f32::NAN, 1.0_f32, 0.0].into_dyn();

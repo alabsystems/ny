@@ -704,7 +704,7 @@ fn test_match_layer_names_empty_inputs() {
     let layers_b = vec![make_layer("fc1", LayerType::Linear)];
 
     let matches = match_layer_names(&empty, &layers_b, &HashMap::new());
-    assert!(matches.is_empty());
+    assert_eq!((matches).len(), 0);
 }
 
 // ========================================================================
@@ -1163,7 +1163,7 @@ fn test_diff_status_copy() {
 fn test_diff_status_clone() {
     let status = DiffStatus::ExceedsTolerance;
     // DiffStatus is Copy, but test clone trait is also implemented
-    let cloned: DiffStatus = Clone::clone(&status);
+    let cloned: DiffStatus = status;
     assert_eq!(status, cloned);
 }
 
@@ -1454,7 +1454,7 @@ fn test_diff_result_statuses_empty() {
         diagnosis: None,
     };
     let statuses = result.statuses();
-    assert!(statuses.is_empty());
+    assert_eq!((statuses).len(), 0);
 }
 
 // ========================================================================
@@ -1562,7 +1562,7 @@ fn test_compare_arrays_nan_values() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_compare_arrays_matching_inf_masks_real_divergence() {
-    // Regression test for #2798: matching Inf at position 0 previously produced NaN
+    // Regression test: matching Inf at position 0 previously produced NaN
     // that poisoned mean_diff. The real divergence at position 1 must be detected.
     let a = ArrayD::from_shape_vec(IxDyn(&[2]), vec![f32::INFINITY, 1.0]).unwrap();
     let b = ArrayD::from_shape_vec(IxDyn(&[2]), vec![f32::INFINITY, 2.0]).unwrap();
@@ -1604,7 +1604,8 @@ fn test_compare_arrays_nan_vs_finite_detected() {
     // NaN - 0.0 = NaN, which is a genuine divergence (not matching specials).
     // f32::max(0.0, NaN) deterministically returns 0.0, so max_diff will NOT
     // catch NaN-vs-finite divergence. mean_diff is NaN (via sum), which signals
-    // the divergence to callers. See #2688 for the exceeds_tolerance gap.
+    // the divergence to callers; exceeds_tolerance, derived from max_diff,
+    // misses it.
     assert!(
         comp.mean_diff.is_nan(),
         "NaN vs finite must produce NaN in mean_diff"

@@ -21,10 +21,13 @@ use std::borrow::Cow;
 
 use ndarray::{ArrayD, IxDyn};
 use ny_core::{checked_dim_product, NyError, Result};
-use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor, RepairStrategy};
+use ny_tensor::{
+    div_down_f32, div_up_f32, next_down_f32, next_up_f32, BoundedTensor, RepairStrategy,
+};
 
 use super::super::math_common::{
     compute_batch_prefix, outward_midpoint_radius, square_interval_bounds,
+    CENTERED_NORM_SECOND_ORDER_COEFF,
 };
 
 use super::types::InstanceNorm1dLayer;
@@ -63,7 +66,7 @@ impl InstanceNorm1dLayer {
             return BoundedTensor::new(ArrayD::zeros(IxDyn(shape)), ArrayD::zeros(IxDyn(shape)));
         }
 
-        // Max |z| = sqrt(T-1), rounded UP for soundness (#3344).
+        // Max |z| = sqrt(T-1), rounded UP for soundness.
         let z_max = if time_len <= 1 {
             0.0
         } else {
@@ -78,7 +81,7 @@ impl InstanceNorm1dLayer {
             let g = self.ny[c];
             let b = self.beta[c];
 
-            // Directed rounding on fallback bounds (#3344).
+            // Directed rounding on fallback bounds.
             let (ch_lower, ch_upper) = if !g.is_finite() || !b.is_finite() {
                 (f32::NEG_INFINITY, f32::INFINITY)
             } else if g >= 0.0 {
@@ -122,7 +125,7 @@ impl InstanceNorm1dLayer {
     /// Same formula as LayerNorm Jacobian but with a single ny per channel.
     ///
     /// Reference: Jacobian from `math.rs` (verified against finite differences).
-    /// Fix for #3098: replaces the unsound `max_radius / T` coupling correction.
+    /// Replaces the unsound `max_radius / T` coupling correction.
     fn propagate_ibp_forward_mode(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
         let shape = input.shape();
         let ndim = shape.len();
@@ -197,7 +200,7 @@ impl InstanceNorm1dLayer {
     /// ```
     /// where `z_t = (c_t - mean_c) / std_c`.
     ///
-    /// Fix for #3098: replaces the unsound `max_radius / T` coupling correction
+    /// Replaces the unsound `max_radius / T` coupling correction
     /// with exact Jacobian propagation plus a conservative second-order remainder.
     #[inline]
     fn forward_mode_channel_1d_slice(
@@ -216,7 +219,7 @@ impl InstanceNorm1dLayer {
 
         // Compute mean and std at center using f64 accumulation.
         // f32 accumulation loses ~log2(T) bits of precision for T=768+.
-        // Ported from LayerNorm #2423.
+        // Ported from LayerNorm.
         let mean_c_f64: f64 = center.iter().map(|&x| x as f64).sum::<f64>() / nf_64;
         let mean_c = mean_c_f64 as f32;
         let var_c: f32 = (center
@@ -230,7 +233,7 @@ impl InstanceNorm1dLayer {
         let std_c = (var_c + self.eps).sqrt();
 
         // Normalized values at center, computed in f64 to prevent cancellation
-        // in z_s * z_t terms used by the Jacobian. Ported from LayerNorm #2423.
+        // in z_s * z_t terms used by the Jacobian. Ported from LayerNorm.
         let std_c_f64 = std_c as f64;
         let z_f64: Vec<f64> = center
             .iter()
@@ -241,7 +244,7 @@ impl InstanceNorm1dLayer {
         // Precompute: sum of radius^2 for the second-order remainder (f64 accumulation).
         // next_up_f32: radius_sq_sum is in the NUMERATOR of the second-order bound
         // R₂ = 3.5·|γ|·||r||²/(√T·σ²). Rounding up ensures R₂ is an upper bound.
-        // Ported from LayerNorm #3270.
+        // Ported from LayerNorm.
         let radius_sq_sum: f32 =
             next_up_f32((radius.iter().map(|&r| (r as f64) * (r as f64)).sum::<f64>()) as f32);
 
@@ -251,7 +254,7 @@ impl InstanceNorm1dLayer {
         // next_up_f32: mean_radius widens the centered intervals [a_lower, a_upper].
         // Rounding UP makes intervals wider → var_lower smaller → std_min smaller →
         // second-order remainder larger (conservative, sound).
-        // Ported from LayerNorm #3270.
+        // Ported from LayerNorm.
         let mean_radius: f32 =
             next_up_f32((radius.iter().map(|&r| r as f64).sum::<f64>() / nf_64) as f32);
         let mut var_lower_f64: f64 = 0.0;
@@ -270,11 +273,11 @@ impl InstanceNorm1dLayer {
         }
         // Directed rounding: var_lower is a lower bound on variance → round down.
         // Smaller variance → smaller std denominator → tighter (unsound) bounds
-        // if not rounded conservatively. Ported from LayerNorm #3270.
+        // if not rounded conservatively. Ported from LayerNorm.
         let var_lower = next_down_f32((var_lower_f64 / nf_64) as f32);
         // Directed rounding on sqrt: std_min is a denominator → round DOWN
         // (smaller denominator = larger R₂ = sound). f64 intermediate for
-        // precision. Pattern from GroupNorm #3327, fix for #3332.
+        // precision. Pattern from GroupNorm.
         let std_min = next_down_f32(((var_lower as f64 + self.eps as f64).sqrt()) as f32);
 
         // Sound affine-envelope ceiling for the forward-mode (Jacobian + 2nd-order)
@@ -334,7 +337,7 @@ impl InstanceNorm1dLayer {
             // First-order: output_radius_s = sum_t |J[s,t]| * radius_t
             // J[s,t] = ny[c] / std_c * (delta_st - 1/T - z_s * z_t / T)
             // f64 for both individual Jacobian entries and the sum to prevent
-            // cancellation in (delta_st - 1/T - z_s*z_t/T). Ported from LayerNorm #2423.
+            // cancellation in (delta_st - 1/T - z_s*z_t/T). Ported from LayerNorm.
             let mut first_order_radius_f64 = 0.0_f64;
             for t in 0..time_len {
                 let delta_st: f64 = if s == t { 1.0 } else { 0.0 };
@@ -342,7 +345,7 @@ impl InstanceNorm1dLayer {
                     g_f64 / std_c_f64 * (delta_st - 1.0 / nf_64 - z_f64[s] * z_f64[t] / nf_64);
                 first_order_radius_f64 += j_st_f64.abs() * radius[t] as f64;
             }
-            // Directed rounding: radius widens output bounds → round up. #3270.
+            // Directed rounding: radius widens output bounds → round up.
             let first_order_radius = next_up_f32(first_order_radius_f64 as f32);
 
             // Second-order remainder: R₂(s) ≤ 7|γ|·||r||² / (2√T·σ_min²)
@@ -355,7 +358,7 @@ impl InstanceNorm1dLayer {
             // See LayerNorm forward_mode_standard_1d_slice for full rationale.
             let second_order_denom = nf.sqrt() * std_min * std_min;
             let second_order = if second_order_denom.is_finite() && second_order_denom > 0.0 {
-                3.5 * g.abs() * radius_sq_sum / second_order_denom
+                CENTERED_NORM_SECOND_ORDER_COEFF * g.abs() * radius_sq_sum / second_order_denom
             } else {
                 f32::INFINITY
             };
@@ -364,7 +367,7 @@ impl InstanceNorm1dLayer {
 
             // Directed rounding on final emit: y_center has f64→f32 rounding
             // error up to 0.5 ULP, and f32 subtraction/addition adds another
-            // 0.5 ULP. next_down/next_up compensates both. Part of #3344.
+            // 0.5 ULP. next_down/next_up compensates both.
             let mut jac_lower = next_down_f32(y_center - output_radius);
             let mut jac_upper = next_up_f32(y_center + output_radius);
 
@@ -420,7 +423,7 @@ impl InstanceNorm1dLayer {
         // f32 accumulation loses ~log2(T) bits of precision for T=768+.
         // Directed rounding: mean_lower rounds down (next_down_f32), mean_upper
         // rounds up (next_up_f32) so the interval encloses the true mean.
-        // Ported from LayerNorm #2423/#3270.
+        // Ported from LayerNorm.
         let mean_lower: f32 =
             next_down_f32((x_lowers.iter().map(|&x| x as f64).sum::<f64>() / nf_64) as f32);
         let mean_upper: f32 =
@@ -433,7 +436,7 @@ impl InstanceNorm1dLayer {
             let g = self.ny[channel];
             let b = self.beta[channel];
             let z_max = if time_len > 1 {
-                // #3344: round UP
+                // Round UP
                 next_up_f32(((time_len as f32) - 1.0).sqrt())
             } else {
                 0.0
@@ -450,9 +453,15 @@ impl InstanceNorm1dLayer {
                 // for that reason — and its doc names InstanceNorm1d as the repro
                 // — but converted only `fallback_output_bounds`, leaving this
                 // mean-overflow branch on the banned form.
-                (affine_fallback_down(b, g, -z_max), affine_fallback_up(b, g, z_max))
+                (
+                    affine_fallback_down(b, g, -z_max),
+                    affine_fallback_up(b, g, z_max),
+                )
             } else {
-                (affine_fallback_down(b, g, z_max), affine_fallback_up(b, g, -z_max))
+                (
+                    affine_fallback_down(b, g, z_max),
+                    affine_fallback_up(b, g, -z_max),
+                )
             };
             for t in 0..time_len {
                 out_lower[t] = ch_lower;
@@ -463,13 +472,12 @@ impl InstanceNorm1dLayer {
 
         // Step 2-3: Bound variance and std using f64 accumulation.
         // Catastrophic cancellation in (xi - mean)^2 when xi ≈ mean is the
-        // primary precision concern. Ported from LayerNorm #2423.
+        // primary precision concern. Ported from LayerNorm.
         let mut sq_sum_lower_f64 = 0.0_f64;
         let mut sq_sum_upper_f64 = 0.0_f64;
         for t in 0..time_len {
             // Directed rounding on intermediate deviation: feeds variance via
             // square_interval_bounds — too-narrow domain → too-narrow variance → unsound.
-            // Part of #3344.
             let centered_lower = next_down_f32(x_lowers[t] - mean_upper);
             let centered_upper = next_up_f32(x_uppers[t] - mean_lower);
             let (sq_l, sq_u) = square_interval_bounds(centered_lower, centered_upper);
@@ -478,12 +486,12 @@ impl InstanceNorm1dLayer {
         }
 
         // Directed rounding: var_lower is denominator bound → round down,
-        // var_upper is range bound → round up. Ported from LayerNorm #3270.
+        // var_upper is range bound → round up. Ported from LayerNorm.
         let var_lower = next_down_f32((sq_sum_lower_f64 / nf_64) as f32);
         let var_upper = next_up_f32((sq_sum_upper_f64 / nf_64) as f32);
         // Directed rounding on sqrt: std_lower is denominator → round DOWN,
         // std_upper is range bound → round UP (wider interval = sound).
-        // f64 intermediate for precision. Pattern from GroupNorm #3327, fix for #3332.
+        // f64 intermediate for precision. Pattern from GroupNorm.
         let std_lower = next_down_f32(((var_lower as f64 + self.eps as f64).sqrt()) as f32);
         let std_upper = next_up_f32(((var_upper as f64 + self.eps as f64).sqrt()) as f32);
 
@@ -493,7 +501,7 @@ impl InstanceNorm1dLayer {
         // Theoretical bound: normalized values are in [-sqrt(T-1), sqrt(T-1)]
         // because sum of centered-normalized deviations = 0. The interval arithmetic
         // over-approximation (treating x_t, mean, std as independent) can exceed this.
-        // Max |z| = sqrt(T-1) for clamping (#3196), rounded UP (#3344).
+        // Max |z| = sqrt(T-1) for clamping, rounded UP.
         //
         // Sound f32 float-error margin for the sqrt(T-1) z-clamp.
         //
@@ -560,21 +568,34 @@ impl InstanceNorm1dLayer {
         // Step 4: Bound y[t] = g * (x[t] - mean) / std + b
         for t in 0..time_len {
             // Directed rounding on intermediate deviation: if centered_lower
-            // rounds UP, the 4-corner domain is too narrow → unsound. Part of #3344.
+            // rounds UP, the 4-corner domain is too narrow → unsound.
             let centered_lower = next_down_f32(x_lowers[t] - mean_upper);
             let centered_upper = next_up_f32(x_uppers[t] - mean_lower);
 
-            let corners = [
-                centered_lower / std_upper,
-                centered_lower / std_lower,
-                centered_upper / std_upper,
-                centered_upper / std_lower,
+            // The corner divisions were the ONE bare (round-to-nearest) step in an
+            // otherwise fully directed chain. A corner that rounds inward narrows the
+            // ratio interval, and the directed step on the final `g*norm + b` is at the
+            // scale of that SUM -- it collapses whenever beta cancels the product.
+            // Compute each corner TWICE (down for the min-fold, up for the max-fold),
+            // mirroring `BoundedTensor::mul`. div_down/div_up_f32 are exact-remainder
+            // (fma) certified and pass NaN through to the folds unchanged.
+            let corners_down = [
+                div_down_f32(centered_lower, std_upper),
+                div_down_f32(centered_lower, std_lower),
+                div_down_f32(centered_upper, std_upper),
+                div_down_f32(centered_upper, std_lower),
+            ];
+            let corners_up = [
+                div_up_f32(centered_lower, std_upper),
+                div_up_f32(centered_lower, std_lower),
+                div_up_f32(centered_upper, std_upper),
+                div_up_f32(centered_upper, std_lower),
             ];
 
-            let ratio_l = corners
+            let ratio_l = corners_down
                 .iter()
                 .fold(f32::INFINITY, |a, &b| nan_propagating_min(a, b));
-            let ratio_u = corners
+            let ratio_u = corners_up
                 .iter()
                 .fold(f32::NEG_INFINITY, |a, &b| nan_propagating_max(a, b));
 
@@ -584,7 +605,7 @@ impl InstanceNorm1dLayer {
             let ratio_u = nan_propagating_min(ratio_u, max_norm);
 
             // Directed rounding on final bounds: bare f32 mul+add from
-            // corner division results. Part of #3344.
+            // corner division results.
             let (y_l, y_u) = if g >= 0.0 {
                 (next_down_f32(g * ratio_l + b), next_up_f32(g * ratio_u + b))
             } else {

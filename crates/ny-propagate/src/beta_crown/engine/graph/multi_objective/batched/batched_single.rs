@@ -55,7 +55,7 @@ impl BetaCrownVerifier {
     /// optionally run per-child beta optimization for unverified shallow children.
     /// Returns results for each domain in the same order as input.
     ///
-    /// Part of #3813: `cut_pool` is a read-only view of the current cutting
+    /// `cut_pool` is a read-only view of the current cutting
     /// planes, applied during CROWN backward propagation. Cut generation and
     /// merging remain in the outer BaB loop.
     // Justification: batched single-objective processing needs graph, domains,
@@ -91,6 +91,14 @@ impl BetaCrownVerifier {
                 self.config
                     .domain_is_verified(domain.lower_bound, domain.upper_bound, threshold);
             if already_verified {
+                self.cover_note_bound(
+                    objective,
+                    threshold,
+                    &domain.history,
+                    Some(&domain.beta_state),
+                    domain.lower_bound,
+                    domain.upper_bound,
+                );
                 quick_results.insert(idx, GraphDomainResult::AlreadyVerified);
                 continue;
             }
@@ -172,6 +180,16 @@ impl BetaCrownVerifier {
                         let l = output.lower_scalar();
                         let u = output.upper_scalar();
                         let verified = self.config.domain_is_verified(l, u, threshold);
+                        if verified {
+                            self.cover_note_bound(
+                                objective,
+                                threshold,
+                                &domain.history,
+                                Some(&domain.beta_state),
+                                l,
+                                u,
+                            );
+                        }
                         quick_results.insert(
                             idx,
                             GraphDomainResult::NoUnstable {
@@ -182,7 +200,8 @@ impl BetaCrownVerifier {
                         );
                     }
                     Err(ref e) if e.is_infeasible_domain() => {
-                        // #2926: empty = verified
+                        // Empty = verified
+                        self.cover_note_infeasible(objective, threshold, &domain.history, None);
                         quick_results.insert(idx, GraphDomainResult::AlreadyVerified);
                     }
                     Err(e) => {
@@ -214,7 +233,7 @@ impl BetaCrownVerifier {
         //
         // Returns Ok(children_info) on success, Err(idx) on branch selection failure.
         // This makes failures explicit instead of relying on the empty-children
-        // catch-all to detect them (#2143).
+        // catch-all to detect them.
         let child_creation_results: Vec<_> = domains_with_unstable
             .par_iter()
             .map(|(idx, domain, unstable)| {
@@ -244,10 +263,18 @@ impl BetaCrownVerifier {
                             return Err(*idx);
                         }
                     };
-                    let children = match domain.with_multi_constraints(
+                    let children = match domain.with_multi_constraints_observed(
                         graph,
                         &branches,
                         self.config.verify_upper_bound,
+                        &mut |history, constraint| {
+                            self.cover_note_infeasible(
+                                objective,
+                                threshold,
+                                history,
+                                Some(constraint),
+                            );
+                        },
                     ) {
                         Ok(children) => children,
                         Err(error) if error.is_infeasible_domain() => Vec::new(),
@@ -290,13 +317,24 @@ impl BetaCrownVerifier {
                 };
                 match domain.with_constraint(
                     graph,
-                    active_constraint,
+                    active_constraint.clone(),
                     self.config.verify_upper_bound,
                 ) {
                     Ok(Some(child)) => children_info.push((*idx, child, true)),
-                    Ok(None) => {}
+                    Ok(None) => self.cover_note_infeasible(
+                        objective,
+                        threshold,
+                        &domain.history,
+                        Some(&active_constraint),
+                    ),
                     Err(ref e) if e.is_infeasible_domain() => {
-                        // #2926: Infeasible constraint = empty child, skip.
+                        // Infeasible constraint = empty child, skip.
+                        self.cover_note_infeasible(
+                            objective,
+                            threshold,
+                            &domain.history,
+                            Some(&active_constraint),
+                        );
                     }
                     Err(e) => {
                         tracing::warn!("with_constraint (active) failed for idx {}: {e}", idx);
@@ -313,13 +351,24 @@ impl BetaCrownVerifier {
                 };
                 match domain.with_constraint(
                     graph,
-                    inactive_constraint,
+                    inactive_constraint.clone(),
                     self.config.verify_upper_bound,
                 ) {
                     Ok(Some(child)) => children_info.push((*idx, child, false)),
-                    Ok(None) => {}
+                    Ok(None) => self.cover_note_infeasible(
+                        objective,
+                        threshold,
+                        &domain.history,
+                        Some(&inactive_constraint),
+                    ),
                     Err(ref e) if e.is_infeasible_domain() => {
-                        // #2926: Infeasible constraint = empty child, skip.
+                        // Infeasible constraint = empty child, skip.
+                        self.cover_note_infeasible(
+                            objective,
+                            threshold,
+                            &domain.history,
+                            Some(&inactive_constraint),
+                        );
                     }
                     Err(e) => {
                         tracing::warn!("with_constraint (inactive) failed for idx {}: {e}", idx);
@@ -332,7 +381,7 @@ impl BetaCrownVerifier {
             .collect();
 
         // Collect all children that need CROWN bounds computation.
-        // Handle branch selection failures explicitly (#2143) instead of letting
+        // Handle branch selection failures explicitly instead of letting
         // empty children flow through to the catch-all.
         let mut all_children: Vec<(usize, GraphBabDomain, bool)> = Vec::new();
         let mut parent_domain_lookup: std::collections::HashMap<usize, &GraphBabDomain> =
@@ -355,7 +404,7 @@ impl BetaCrownVerifier {
             let (parent_idx, children_info) = match result {
                 Ok(v) => v,
                 Err(failed_idx) => {
-                    // Branch selection failed — record explicitly (#2143).
+                    // Branch selection failed — record explicitly.
                     branch_selection_failures.insert(*failed_idx);
                     quick_results.insert(*failed_idx, GraphDomainResult::PropagationFailure);
                     continue;
@@ -422,7 +471,7 @@ impl BetaCrownVerifier {
                     return Err(reason);
                 }
                 // If batched processing fails, fall back to sequential with beta
-                // optimization. Part of #1484.
+                // optimization.
                 tracing::warn!(
                     "Batched CROWN failed ({}), falling back to sequential with beta optimization",
                     e
@@ -485,11 +534,11 @@ impl BetaCrownVerifier {
         // Build results from child bounds
         let mut children_by_parent: std::collections::HashMap<usize, Vec<(GraphBabDomain, bool)>> =
             std::collections::HashMap::new();
-        // #1861: Track parents that had at least one child propagation failure.
+        // Track parents that had at least one child propagation failure.
         let mut parents_with_failure: std::collections::HashSet<usize> =
             std::collections::HashSet::new();
 
-        // Part of #1484: check if beta optimization is configured
+        // Check if beta optimization is configured
         let should_optimize_any = self.config.beta_iterations > 0;
 
         for ((parent_idx, mut child, _is_active), bounds_result) in
@@ -526,7 +575,7 @@ impl BetaCrownVerifier {
                 child.priority = match self.config.domain_priority(l, u) {
                     Ok(p) => p,
                     Err(e) => {
-                        // NaN in domain bounds → treat as propagation failure (#2982)
+                        // NaN in domain bounds → treat as propagation failure
                         tracing::warn!("Batched single domain_priority failed (NaN bounds): {e}");
                         parents_with_failure.insert(parent_idx);
                         continue;
@@ -534,8 +583,11 @@ impl BetaCrownVerifier {
                 };
 
                 let mut verified = self.config.domain_is_verified(l, u, threshold);
+                // #graph-bab-cover-ledger: whether `verified` came from the
+                // refinement's certified emptiness rather than a bound.
+                let mut emptied_by_refinement = false;
 
-                // Part of #1484: Post-batched beta optimization refinement.
+                // Post-batched beta optimization refinement.
                 if !verified && should_optimize_any && child.depth <= self.config.beta_max_depth {
                     let parent_bounds = child.node_bounds.clone();
                     match self.evaluate_graph_child_bounds(
@@ -556,6 +608,7 @@ impl BetaCrownVerifier {
                         Ok(false) => {} // Bounds trivially empty — keeps pre-refinement bounds
                         Err(ref e) if e.is_infeasible_domain() => {
                             verified = true;
+                            emptied_by_refinement = true;
                         } // #2926
                         Err(e) => {
                             debug!(error = %e, depth = child.depth, "Beta refinement failed for child (#1978)");
@@ -563,36 +616,48 @@ impl BetaCrownVerifier {
                     }
                 }
 
+                if emptied_by_refinement {
+                    self.cover_note_infeasible(objective, threshold, &child.history, None);
+                } else if verified {
+                    self.cover_note_bound(
+                        objective,
+                        threshold,
+                        &child.history,
+                        Some(&child.beta_state),
+                        child.lower_bound,
+                        child.upper_bound,
+                    );
+                }
                 children_by_parent
                     .entry(parent_idx)
                     .or_default()
                     .push((child, verified));
             } else {
-                // #1861: child bounds computation failed — sub-region unexplored.
+                // Child bounds computation failed — sub-region unexplored.
                 parents_with_failure.insert(parent_idx);
             }
         }
 
         // Assemble final results
         for (parent_idx, _, _) in &domains_with_unstable {
-            // Branch selection failures are already in quick_results (#2143).
+            // Branch selection failures are already in quick_results.
             if branch_selection_failures.contains(parent_idx) {
                 continue;
             }
             if parents_with_failure.contains(parent_idx) {
-                // #1861: At least one child failed — signal propagation failure.
+                // At least one child failed — signal propagation failure.
                 if let Some(children) = children_by_parent.remove(parent_idx) {
                     if !children.is_empty() {
                         quick_results.insert(*parent_idx, GraphDomainResult::Children(children));
                     }
                 }
-                // Override with PropagationFailure — soundness over performance (#1861).
+                // Override with PropagationFailure — soundness over performance.
                 quick_results.insert(*parent_idx, GraphDomainResult::PropagationFailure);
             } else if let Some(children) = children_by_parent.remove(parent_idx) {
                 quick_results.insert(*parent_idx, GraphDomainResult::Children(children));
             } else {
                 // Both children infeasible (with_constraint returned None for both).
-                // This is a legitimate outcome, not an internal failure (#2143).
+                // This is a legitimate outcome, not an internal failure.
                 tracing::debug!(
                     "process_graph_domains_batched_gpu: both children infeasible for parent idx {} (#2143)",
                     parent_idx

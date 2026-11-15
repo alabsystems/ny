@@ -14,7 +14,7 @@ use ndarray::{arr1, arr2, array};
 use ny_tensor::BoundedTensor;
 
 // broadcast_shapes→shape/mod.rs, relu_ibp→layers/activations/relu/ibp.rs, relu_crown→relu_relax.rs
-// AttentionGraphBuilder tests moved to graph_builder.rs (Part of #170)
+// AttentionGraphBuilder tests moved to graph_builder.rs
 
 #[ntest::timeout(10000)]
 #[test]
@@ -739,7 +739,7 @@ fn test_graphnetwork_get_node_alias_matches_node() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_graphnetwork_try_add_node_duplicate_error() {
-    // Part of #172: Validate try_add_node returns error on duplicate names
+    // Validate try_add_node returns error on duplicate names
     let mut graph = GraphNetwork::new();
     let node1 = GraphNode::from_input("duplicate", Layer::ReLU(ReLULayer));
     graph.try_add_node(node1).unwrap();
@@ -987,7 +987,7 @@ fn test_graphnode_new_with_inputs() {
     assert_eq!(node.inputs, vec!["a", "b"]);
 }
 
-/// Regression test for #2686: duplicate node names must return Err, not panic.
+/// Regression test: duplicate node names must return Err, not panic.
 #[ntest::timeout(10000)]
 #[test]
 fn test_try_add_node_duplicate_returns_error_2686() {
@@ -1006,5 +1006,3 @@ fn test_try_add_node_duplicate_returns_error_2686() {
         "expected InvalidSpec for duplicate node, got {err:?}"
     );
 }
-
-// AttentionGraphBuilder tests moved to graph_builder.rs (Part of #170)

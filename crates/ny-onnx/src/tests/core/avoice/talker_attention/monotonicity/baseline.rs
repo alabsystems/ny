@@ -75,8 +75,6 @@ fn test_graph_crown_avoice_talker_attention_centroid_monotonicity_3497() {
 /// vacuous (max_gap=105.0 = the fully vacuous value at seq16). Measured
 /// critical epsilon on this export: 2.759e-6 (bracket
 /// [2.7588e-6, 2.7593e-6]); the pre-June export certified ~1.47e-3.
-///
-/// Reference: designs/2026-03-11-issue-3497-centroid-monotonicity-verification-path.md Phase 2
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
 #[cfg(feature = "external-avoice")]

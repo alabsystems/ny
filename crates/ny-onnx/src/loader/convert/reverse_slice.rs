@@ -551,7 +551,7 @@ mod tests {
         // An oversized start clamps to dim - 1 (NOT dim, as a forward slice would).
         assert_eq!(reversed_indices(99, -5, 4), vec![3, 2, 1, 0]);
         // start <= end selects nothing.
-        assert!(reversed_indices(1, 2, 4).is_empty());
-        assert!(reversed_indices(0, 0, 4).is_empty());
+        assert_eq!((reversed_indices(1, 2, 4)).len(), 0);
+        assert_eq!((reversed_indices(0, 0, 4)).len(), 0);
     }
 }

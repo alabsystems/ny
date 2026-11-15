@@ -19,9 +19,106 @@ attack:
   pgd_order: before
   pgd_restarts: 50
   attack_tolerance: 0.0001
+  # #ml4acopf-upfront-single — the prop2 rows are ONE-constraint threshold specs
+  # (`(assert (>= Y_2382 0.99))` on 300_ieee, a thermal-limit output), so the
+  # automatic upfront rule (multi-clause disjunctions only) never admitted them:
+  # 300_ieee lin-res prop2 printed no `Upfront attack:` line and was found only by
+  # the post-BaB lane at sat@582.8 s of 600, and 300_ieee base prop2 ended
+  # unknown@595 (pin af24b7593, scratchpad/refine2/av_{2,3}.raw). alpha-beta-CROWN
+  # finds all three 300_ieee prop2 sats in 6.1-6.2 s wall (0.5-0.6 s of attack)
+  # with exactly this recipe: `pgd_order: before`, 50 restarts, hinge loss.
+  #
+  # `upfront_attack: true` admits the single-clause rows. On a single-output
+  # constant threshold the lane ascends the raw margin (= abc's hinge below the
+  # threshold) on every restart instead of the margin/DLR ensemble, whose DLR
+  # term there ascends Y_pi1 - Y_pi3, two outputs the property never reads.
+  # Multi-clause rows (prop1, prop3-14, prop105) KEEP their automatic admission,
+  # their 4 s `upfront_attack_auto_cap_secs` clamp and their loss ensemble: this
+  # key does not un-clamp them, so every banked sat (all multi-clause) and every
+  # multi-clause unsat runs the same upfront slice as before.
+  #
+  # 45 s: the effective window is min(cap, 0.08 x live remaining) and 0.08 x the
+  # ~570-597 s remaining is 45.4-47.5 s, so the cap and the fraction nearly
+  # coincide. Measured cost of this lane on 300_ieee is 23 ms (base) to 89 ms
+  # (lin-res) per exact-gradient step, i.e. roughly 4-15 restarts of <=120 steps
+  # in 45 s. The only rows that pay the full 45 s are the single-clause (prop2)
+  # rows it does not falsify: 14_ieee (banked unsat at 3-11 s), 118_ieee (banked
+  # unknown/timeout) and any 300_ieee prop2 it misses. 300_ieee lin-res prop2 is
+  # the one banked verdict inside 45 s of the budget (sat@582.8 s, post-BaB
+  # lane). The upfront seconds are charged to BaB's internal timeout, not to the
+  # post-BaB window, but BaB's seed and frontier feed that lane's restarts, so
+  # the measurement must show that row still sat. Every witness still passes
+  # gate_sat_with_trusted_oracle.
+  # DISARMED 2026-09-26 (M1, pin ny_wave3_c5e9ce88f): the lane ENGAGED on all three 300_ieee prop2 rows
+  # ([upfront-loss] schedule=margin_only, 45 s, up to 1963 gradient steps) and found NONE of the three sats
+  # (base/lin-nonres timeout@595, lin-res still sat only via the post-BaB lane @586.9 s), so it only costs
+  # 45 s per single-clause row. The code stays (feat/ml4acopf-upfront-single); the attack itself is the gap.
+  # RE-ARMED 2026-09-26 with #attack-vertex-geometry (wave-6 C3: abc's global scalar sign step, alpha = max_eps/4, flips
+  # most dimensions vertex-to-vertex). W6B on ny_wave6_cf376ec20 (official 600 s): all three 300_ieee prop2 rows sat 3/3 —
+  # base 0.97 s, -linear-nonresidual 6.6-6.8 s, -linear-residual 6.4-6.5 s (bank: unknown / sat only at 584 s); every
+  # witness still passes gate_sat_with_trusted_oracle. Cap 20 s (the C3 measurement's value).
+  upfront_attack: true
+  upfront_attack_cap_secs: 20
+  upfront_step_geometry: global_max_eps
 
 bab:
+  # #budget-abandonment FIX A + FIX B, armed 2026-09-13 after an 84-row
+  # two-year moat (held=72, held_not_exercised=12, lost=0, marginal=0,
+  # emergency=0, regression=0) and a 3/3 conversion.
+  #
+  # FIX A: the iterative root alpha-CROWN warmup is capped at
+  # `initial_bounds_fraction` (0.20) of the BaB deadline, and before this key
+  # an expiry THERE returned Unknown and BaB never started -- even though the
+  # mandatory node sweep had already finished and its certified output-node
+  # enclosure was in hand. Measured at HEAD on 14_ieee: bootstrap 0 -> 121.0 s
+  # against a 114 s cap, 449 s of the 600 s budget abandoned. A wider root can
+  # only make domain_is_verified / domain_is_violation HARDER to satisfy, so
+  # it mints neither an unsat nor a spurious violation -- only more search.
+  #
+  # FIX B: the per-clause budget allocator is ONE pass and back-loads it
+  # (`remaining / remaining_clauses`), so the FIRST clauses get the SMALLEST
+  # slice and the failures concentrate exactly there. Measured on 14_ieee
+  # prop1 (56 OR-clauses): clause 1 got 10 s and died, clause 56 got 442 s
+  # and used 2.1 s, and the row ended with 470 s of 600 unspent. Retry passes
+  # are bounded by bab_deadline(), which already reserves the post-BaB PGD
+  # slice and the Graph-MIP escalation wall, and a retry can never erase a
+  # recorded potential violation.
+  #
+  # MEASURED CONVERSION: 118_ieee_ml4acopf-linear-residual / 118_ieee_prop6
+  # (2026 corpus, 600 s) unknown@141.5-141.8 s -> unsat@144.4-145.1 s, 3/3
+  # armed with the fallback fired, 3/3 control unknown.
+  initial_bounds_warmup_fallback: true
+  disjunctive_clause_retry_passes: 2
+  # #pwl-lookup (wave-6 C1): intersect each ReLU lookup table's IBP box with its exact 1-D range (outward-rounded
+  # f64; shrink-only; an empty intersection keeps the plain box and prints CONTRADICTION). MEASURED 2026-09-26 on
+  # ny_wave6_cf376ec20 (scratchpad/w6b): all 12 '-linear-*' prop3/prop4 rows (14/118/300 bus, lres/lnon) unsat in
+  # 1.0-4.1 s (bank: unknown at the 596 s budget), contradiction=0 on every call.
+  pwl_lookup_exact_range: true
   batch_size: 8
+  # #ml4acopf-depth-cap — MEASURED 2026-09-21/22, and the reason is that this
+  # preset never set a depth cap at all, so the category inherited the GLOBAL
+  # default of 100.
+  #
+  # The dose-response on `118_ieee_ml4acopf-linear-nonresidual x
+  # 118_ieee_prop6` at the official 600 s budget:
+  #     max_depth    100 (default)   wall   9.91s   98.3% unspent  "Max depth 100 reached"
+  #     max_depth  2 000             wall  47.10s   92.1% unspent  "Max depth 2000 reached"
+  #     max_depth100 000             wall 244.07s              ->  **unsat**
+  # Replicated 4/4 (244.07, 247.11, 242.12, 243.39 s), banked `unknown@283.0s`.
+  # The proof was REACHABLE all along and the cap was severing it: the converted
+  # run finishes FASTER than the banked unknown's own wall.
+  #
+  # WHY THIS CANNOT LOSE A BANKED ROW. Raising a depth cap cannot change a run
+  # that never reached it, and a run that returns `unsat` closed its whole tree
+  # before the cap by definition — "Max depth N reached" is a stop reason that
+  # yields `unknown`. So all 43 banked unsat and 2 sat rows execute identically.
+  # Only the rows being cut off change, and those score zero today.
+  #
+  # MEMORY is guarded by `bab.max_queue_bytes` below, which is the limit this
+  # benchmark's own measurement chose after a COUNT-based cap authorised a
+  # 137 GB queue and produced a 116.3 GiB RSS SIGKILL. Depth 100 was doing no
+  # work that byte cap is not already doing.
+  max_depth: 100000
   auto_enlarge_batch_size: true
   # #ml4acopf-bab-queue-mem — REQUIRED companion to alpha_crown.fix_interm_bounds
   # below. Byte cap on the resident graph ReLU-split BaB queue.
@@ -68,10 +165,19 @@ bab:
     # which sound sub-box to bound next, never a verdict.
     method: nonlinear
     candidates: 100
-    reduceop: max
     nonlinear_split:
       filter: true
       filter_beta: true
+      # #genbab-selector-convention: abc's GenBaB candidate budget, delivered to
+      # the GenBaB selector (`NonlinearBranchingConfig::num_candidates`).
+      # `branching.candidates` above lands on fsb_candidates, which no GenBaB
+      # lane reads. VALUE-NEUTRAL TODAY: both GenBaB consumers branch on
+      # decisions[0] and the score sort is stable, so the chosen split is the
+      # same at 1 and at 100 (pinned by
+      # nonlinear_branching::tests::convention::genbab_top_decision_is_independent_of_num_candidates).
+      # It becomes load-bearing only when a consumer reads decisions[1..] —
+      # the BBPS filter that `filter`/`filter_beta` ask for, still unbuilt.
+      num_candidates: 100
   alpha_crown:
     lr_alpha: 0.2
     lr_decay: 0.99

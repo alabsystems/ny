@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Regressions for graph `forward+crown` root-output routing.
-//! Part of #4354.
 
 use super::prelude::*;
 use crate::beta_crown::engine::graph::forward_mode_test_support::{

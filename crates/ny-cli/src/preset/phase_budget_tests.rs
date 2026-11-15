@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Phase budget preset tests (#2206 Packet E).
+//! Phase budget preset tests.
 
 use super::apply::apply_preset;
 use super::load_preset;
@@ -36,7 +36,7 @@ fn assert_phase_budget_pair(name: &str, path: &str, initial_bounds_fraction: f32
     );
 }
 
-/// #2206 Packet E: phase_budget preset overrides flow to BetaCrownConfig.
+/// The phase_budget preset overrides flow to BetaCrownConfig.
 #[test]
 fn apply_preset_propagates_phase_budget_overrides_2206() {
     let preset = PresetConfig {
@@ -78,7 +78,7 @@ fn apply_preset_propagates_phase_budget_overrides_2206() {
     );
 }
 
-/// #2206 Packet E: phase_budget YAML section deserializes correctly.
+/// The phase_budget YAML section deserializes correctly.
 #[test]
 fn phase_budget_yaml_deserialization_2206() {
     let yaml = r#"
@@ -112,7 +112,7 @@ bab:
     );
 }
 
-/// #2206 Packet E: soundnessbench and cifar100_2024 presets cap initial_bounds_fraction.
+/// The soundnessbench and cifar100_2024 presets cap initial_bounds_fraction.
 #[test]
 fn soundnessbench_and_cifar100_presets_cap_initial_bounds_fraction_2206() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -333,7 +333,7 @@ fn nn4sys_and_safenlp_retain_nonzero_mip_reservation_admission() {
     }
 }
 
-/// #2206 Packet E: post_bab_pgd_fraction flows through preset system.
+/// The post_bab_pgd_fraction key flows through the preset system.
 #[test]
 fn post_bab_pgd_fraction_preset_override_2206() {
     let preset = PresetConfig {
@@ -361,7 +361,7 @@ fn post_bab_pgd_fraction_preset_override_2206() {
     );
 }
 
-/// #2206 Packet E: post_bab_pgd_fraction deserializes from YAML.
+/// The post_bab_pgd_fraction key deserializes from YAML.
 #[test]
 fn post_bab_pgd_fraction_yaml_deserialization_2206() {
     let yaml = r#"
@@ -439,7 +439,7 @@ fn finite_post_bab_fraction_preserves_local_clamp_compatibility() {
     }
 }
 
-/// #2206 Packet E: VNN-COMP presets set post_bab_pgd_fraction for PGD reservation.
+/// VNN-COMP presets set post_bab_pgd_fraction for PGD reservation.
 #[test]
 fn vnncomp_presets_set_post_bab_pgd_fraction_2206() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -468,7 +468,7 @@ fn vnncomp_presets_set_post_bab_pgd_fraction_2206() {
     }
 }
 
-/// #2206 Packet E: tinyimagenet_2024 preset caps initial_bounds_fraction.
+/// The tinyimagenet_2024 preset caps initial_bounds_fraction.
 #[test]
 fn tinyimagenet_preset_caps_initial_bounds_fraction_2206() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -515,7 +515,7 @@ fn cersyve_main_uses_measured_proof_tail_while_gpu_sidecar_stays_unchanged() {
     );
 }
 
-/// #4283 regression: lsnc_relu disables the alpha-CROWN warmup cap in both the
+/// Regression: lsnc_relu disables the alpha-CROWN warmup cap in both the
 /// canonical preset and the standalone GPU-BaB sidecar.
 #[test]
 fn lsnc_relu_presets_disable_warmup_cap_4283() {
@@ -530,7 +530,7 @@ fn lsnc_relu_presets_disable_warmup_cap_4283() {
     }
 }
 
-/// #2206: default PhaseBudgetPreset (all None) does not alter config defaults.
+/// Default PhaseBudgetPreset (all None) does not alter config defaults.
 #[test]
 fn empty_phase_budget_preset_preserves_defaults_2206() {
     let preset = PresetConfig::default();
@@ -576,32 +576,37 @@ fn postbab_fixed_reserve_is_wrapper_only() {
     assert_eq!(config.phase_budget, before);
 }
 
-/// #attack-floor: the lsnc_relu preset must carry the disjunctive-attack floor
-/// all the way into the runtime ledger, and no other category may acquire it by
-/// accident.
+/// #attack-floor: the floor is plumbed end to end (a preset value reaches the
+/// runtime ledger), it is opt-in only, and the shipped lsnc_relu preset no
+/// longer carries it.
 ///
-/// MEASURED (official 25s instance budget => 20s internal, preset confirmed in
-/// the log): with the tiny-budget cap alone the disjunctive attack gets 3.0s and
-/// `quadrotor2d_state_34` returns `unknown` 3/3; with the 5s floor it returns
-/// an ORT-confirmed `sat` at ~4.9s wall 3/3. BaB still keeps 15s of the 20s.
+/// HISTORY (official 25s instance budget => 20s internal): on the pre-lane
+/// preset the tiny-budget cap alone gave the disjunctive attack 3.0s and
+/// `quadrotor2d_state_34` returned `unknown` 3/3, while an 8s floor returned
+/// `sat` at ~4.9s 3/3. The #lsnc-lane preset (dd07682bb) drops the floor,
+/// because every lane unsat row is throughput-bound and the floor took ~5s of
+/// lane time from each. MEASURED 2026-09-26 (scratchpad/lsncsat, pin
+/// ny_wave5_b44d1404b, production-identical to the ship pin): all 23 banked
+/// lsnc sats, both years, 3 reps x {no floor, floor 8s}: 69/69 sat in BOTH
+/// arms; state_34 lands at 3.86-3.89s without the floor (4.60-4.69s with it).
 #[test]
 fn lsnc_preset_carries_the_disjunctive_attack_floor() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let preset = load_preset(&repo_root.join("configs/vnncomp25/lsnc_relu.yaml")).unwrap();
     assert_eq!(
-        preset.bab.phase_budget.disjunctive_pgd_min_secs,
-        Some(8),
-        "lsnc_relu must floor its disjunctive attack at 8s: the 15% tiny-budget \
-         cap gives 3.0s and the state_34 counterexample lands at ~4.54s (measured \
-         cliff: 4s => unknown, 5s => sat; 8s is the headroom choice)"
+        preset.bab.phase_budget.disjunctive_pgd_min_secs, None,
+        "the shipped lsnc_relu preset is the measured #lsnc-lane config, which \
+         drops the disjunctive attack floor (every banked sat holds 3/3 without it)"
     );
 
+    let mut floored = preset;
+    floored.bab.phase_budget.disjunctive_pgd_min_secs = Some(8);
     let mut config = BetaCrownConfig::default();
-    apply_preset(&mut config, &preset).unwrap();
+    apply_preset(&mut config, &floored).unwrap();
     assert_eq!(
         config.phase_budget.disjunctive_pgd_min_secs,
         Some(8),
-        "the floor must reach the runtime phase-budget ledger"
+        "a preset floor must reach the runtime phase-budget ledger"
     );
 
     // Opt-in only: the default policy is untouched for every other category.
@@ -713,4 +718,183 @@ fn attack_stall_cutoff_is_plumbed_but_armed_nowhere() {
             );
         }
     }
+}
+
+/// #flush-grace — `results_flush_grace_secs` is a WRAPPER key, not an engine
+/// key.
+///
+/// It parses out of a yaml under `bab.phase_budget` like its siblings, but it
+/// is deliberately absent from `preset::apply`: it sizes the RESULTS_FILE
+/// publication reserve the VNN-COMP router subtracts from the scored budget to
+/// form the internal `ny --timeout`, and names no `PhaseBudgetConfig` field.
+/// This test pins BOTH halves — it must arrive in the PresetConfig, and it
+/// must leave the resolved engine config bit-identical — because the failure
+/// mode this whole family of gates exists for is a key that looks delivered
+/// and reaches nothing.
+#[test]
+fn results_flush_grace_secs_parses_from_yaml_and_never_touches_the_engine_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("flush_grace.yaml");
+    std::fs::write(
+        &path,
+        "bab:\n  phase_budget:\n    results_flush_grace_secs: 1\n",
+    )
+    .expect("write preset");
+
+    let preset = load_preset(&path).expect("the typed key must parse");
+    assert_eq!(
+        preset.bab.phase_budget.results_flush_grace_secs,
+        Some(1),
+        "results_flush_grace_secs must survive the yaml -> PresetConfig hop"
+    );
+
+    let mut config = BetaCrownConfig::default();
+    let baseline = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).expect("apply must succeed");
+    assert_eq!(
+        config.phase_budget, baseline.phase_budget,
+        "a wrapper-only key must leave the engine phase budget bit-identical"
+    );
+}
+
+/// An absent key is the default, and the default is `None` — the declaration
+/// that means "today's `max(5, budget/20)` rule".
+#[test]
+fn results_flush_grace_secs_defaults_to_absent() {
+    assert_eq!(
+        PhaseBudgetPreset::default().results_flush_grace_secs,
+        None,
+        "the lever must be DARK by default"
+    );
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("no_flush_grace.yaml");
+    std::fs::write(&path, "bab:\n  phase_budget:\n    mip_min_secs: 10\n").expect("write preset");
+    let preset = load_preset(&path).expect("preset must parse");
+    assert_eq!(preset.bab.phase_budget.results_flush_grace_secs, None);
+}
+
+/// The key is armed by EXACTLY this set, and every row is a MEASUREMENT claim
+/// about that family's own publication tail.
+///
+/// This inverts an earlier pin that asserted "no shipped production preset
+/// arms it": once `b1e402055` armed safenlp without touching that pin, it
+/// asserted a falsehood on every run, and a permanently red ratchet protects
+/// nothing, because the NEXT arming is indistinguishable from the one already
+/// failing it. Freezing the armed SET with its evidence means an arming has to
+/// be declared here and a stale or accidental one fails at review time.
+///
+/// To arm a new category: add its row with the A/B that justified the number.
+/// The value is not free — the grace has to cover the publication write plus
+/// the error in the branch-and-bound stop estimate, and a grace below that
+/// tail loses the verdict entirely rather than merely finishing late.
+///
+/// ⛔ AND IT IS NOT WRAPPER-ONLY IN EFFECT. The key's own doc block says it
+/// "never touches the engine config", which is true of the CONFIG and false of
+/// the RUN. Setting it produces a beta phase deadline, `proof_tail_reserved`
+/// becomes true, and `handle_vnncomp_command` then takes
+/// `MarginRowScheduleOuterRoute::ProofTail`, whose branch **suppresses the
+/// concurrent margin-row lane outright** (`concurrent_route=outer_suppressed`,
+/// deliberately, so no detached worker can contend with the fixed publication
+/// reserve). On a category whose proofs come from that lane, arming this key
+/// does not shave a tail — it removes the prover.
+///
+/// MEASURED 2026-09-17 on tinyimagenet_2024 `idx_2045_sidx_7367`, one pinned
+/// binary, official 100 s, zero `NY_*`, arms differing by this key alone:
+///
+/// * control (key absent, grace 5) — `outer_route=actionable`,
+///   `concurrent_spawned=true`, and the lane publishes
+///   `UNSAT in 91.6-92.3s` through the final join, 3 of 4 runs;
+/// * armed at 2 — `outer_route=proof_tail`, `concurrent_spawned=false`, no
+///   join line at all, `timeout` 2 of 2.
+///
+/// safenlp is unaffected because its proofs do not come from that lane. So the
+/// rule is not "never arm this", it is: before arming it on a new family,
+/// check whether the concurrent margin-row lane is what proves that family's
+/// rows, and assert `concurrent_spawned=true` survives the arming.
+const FLUSH_GRACE_ARMED: &[(&str, &str, &str)] = &[
+    (
+        "vnncomp25/safenlp_2024.yaml",
+        "2",
+        "b1e402055, 2026-09-13 — 102-row A/B then a 63-run confirm, pinned \
+         binary, official budgets, zero NY_*: the historical max(5, budget/20) \
+         is a 25% tax on a 20 s row and was costing FOUR banked proofs that \
+         need 14.8-17.0 s of internal compute. grace=1 is the WRONG value \
+         (overhead 1.19-1.87 s put 30 rows at 20.19-20.40 s against a 20 s \
+         budget); grace=2 tops out at 19.69 s over 63 runs with ZERO overruns.",
+    ),
+    (
+        "vnncomp26/safenlp_2024.yaml",
+        "2",
+        "b1e402055, 2026-09-13 — the same measurement, carried to the 2026 \
+         copy of the family in the same commit.",
+    ),
+];
+
+#[test]
+fn results_flush_grace_secs_is_armed_by_exactly_the_declared_set() {
+    let configs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+    let mut armed: Vec<(String, String)> = Vec::new();
+    let mut scanned = 0usize;
+    for year in ["vnncomp24", "vnncomp25", "vnncomp26"] {
+        let dir = configs.join(year);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            scanned += 1;
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for line in text.lines() {
+                let code = line.split('#').next().unwrap_or("").trim();
+                let Some(value) = code.strip_prefix("results_flush_grace_secs:") else {
+                    continue;
+                };
+                armed.push((
+                    format!("{year}/{}", path.file_name().unwrap().to_string_lossy()),
+                    value.trim().to_string(),
+                ));
+            }
+        }
+    }
+    assert!(
+        scanned > 0,
+        "the config scan matched NO yaml at all, so a zero here would be vacuous"
+    );
+    armed.sort();
+
+    // Report EVERY violation at once: a sequential pin reveals one debt per run
+    // and turns a two-line fix into two box-less round trips.
+    let mut violations: Vec<String> = Vec::new();
+    for (path, value) in &armed {
+        match FLUSH_GRACE_ARMED.iter().find(|(p, _, _)| p == path) {
+            None => violations.push(format!(
+                "{path} arms results_flush_grace_secs: {value} and is NOT declared \
+                 in FLUSH_GRACE_ARMED — add the row WITH the A/B that justified it"
+            )),
+            Some((_, declared, _)) if declared != value => violations.push(format!(
+                "{path} arms {value} but FLUSH_GRACE_ARMED declares {declared} — \
+                 the value is the measurement, so re-measure or correct the row"
+            )),
+            Some(_) => {}
+        }
+    }
+    for (path, _, _) in FLUSH_GRACE_ARMED {
+        if !armed.iter().any(|(p, _)| p == path) {
+            violations.push(format!(
+                "FLUSH_GRACE_ARMED declares {path}, which no longer arms the key — \
+                 a disarming is also a measurement claim; drop the row deliberately"
+            ));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "results_flush_grace_secs arming drifted from its declaration:\n  {}",
+        violations.join("\n  ")
+    );
 }

@@ -7,8 +7,6 @@
 //! Samples inputs from a specified distribution, evaluates the network on
 //! each sample, and computes empirical output statistics. CROWN bounds
 //! provide a sound certificate that the empirical bounds must lie within.
-//!
-//! Part of #3921.
 
 use ndarray::{ArrayD, IxDyn};
 use ny_core::{NyError, Result};

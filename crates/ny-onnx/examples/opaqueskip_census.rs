@@ -111,10 +111,8 @@ fn main() -> ExitCode {
     }
     eprintln!("scanning {} models", models.len());
 
-    let config =
-        OnnxLoadConfig::default().with_shape_infer_backend(ShapeInferBackend::Subprocess {
-            exe: ny_exe,
-        });
+    let config = OnnxLoadConfig::default()
+        .with_shape_infer_backend(ShapeInferBackend::Subprocess { exe: ny_exe });
     let options = GraphNetworkOptions {
         compound_node_policy: CompoundNodePolicy::DecomposeNormalization,
         ..GraphNetworkOptions::default()

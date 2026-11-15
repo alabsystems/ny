@@ -264,7 +264,7 @@ fn test_silu_affine_error_covers_lobe_curvature_peak() {
     }
 }
 
-// #2850: Proptest that zonotope SiLU error bounds are sound for random intervals.
+// Proptest that zonotope SiLU error bounds are sound for random intervals.
 // For each random center and radius, the zonotope bounds must contain all sampled
 // SiLU outputs within the interval [center-radius, center+radius].
 proptest! {

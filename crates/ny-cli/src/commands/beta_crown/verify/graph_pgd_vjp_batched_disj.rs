@@ -62,6 +62,10 @@ use super::graph_pgd_exact_vjp_evidence::{
 use super::graph_pgd_init::{
     evaluate_graph, initialize_graph_point, sample_center_point, sample_uniform_point, SimpleRng,
 };
+use super::graph_pgd_vjp_disj_odi::{
+    observe_clause_margins, odi_directions, run_focus_wave, run_odi_phase, DisjLaneEnv,
+    DisjOdiPolicy, DisjOdiReceipt, FocusEnd, LanePhaseEnd,
+};
 
 pub(super) enum DisjVjpBatchedOutcome {
     /// The batched attack ran to completion (candidate, deadline, or budget
@@ -79,6 +83,11 @@ pub(super) enum DisjVjpBatchedOutcome {
 /// `stall` (#attack-stall) is the adaptive cutoff policy for this phase;
 /// [`AttackStallPolicy::disabled`] (the default) keeps the lane byte-identical
 /// to before the cutoff existed.
+///
+/// #disj-odi: when `attack.pgd_disj_odi` or `attack.pgd_disj_focus_lanes` is
+/// armed, one fixed-schema `[pgd-vjp-disj] disj-odi` line is printed on EVERY
+/// return path (including `Err`); dark, nothing is printed and the driver is
+/// byte-identical.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
     graph: &GraphNetwork,
@@ -90,6 +99,63 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
     stall: AttackStallPolicy,
     outcome: &mut GraphDisjunctiveAttackOutcome,
 ) -> Result<DisjVjpBatchedOutcome> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Attack);
+    let mut receipt = DisjOdiReceipt::new(DisjOdiPolicy::from_config(pgd_config.exact_vjp));
+    let result = run_disj_vjp_batched(
+        graph,
+        input,
+        clauses,
+        pgd_config,
+        gemm_engine,
+        json,
+        stall,
+        outcome,
+        &mut receipt,
+    );
+    if receipt.policy().armed() {
+        receipt.outcome = disj_odi_outcome_token(&result, outcome);
+        eprintln!("{}", receipt.line());
+    }
+    result
+}
+
+/// The driver's terminal disposition for the #disj-odi receipt.
+fn disj_odi_outcome_token(
+    result: &Result<DisjVjpBatchedOutcome>,
+    outcome: &GraphDisjunctiveAttackOutcome,
+) -> &'static str {
+    match result {
+        Err(_) => "error",
+        Ok(DisjVjpBatchedOutcome::FallbackToSequential) => "fallback_sequential",
+        Ok(DisjVjpBatchedOutcome::Completed) => {
+            if outcome.candidate.is_some() {
+                "candidate"
+            } else if outcome.stalled_out {
+                "stalled"
+            } else if outcome.hit_deadline {
+                "deadline"
+            } else {
+                "exhausted"
+            }
+        }
+    }
+}
+
+/// The driver body. `receipt` carries the #disj-odi policy and counters; with
+/// both keys dark none of its phases run and this is the historical driver.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_disj_vjp_batched(
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    clauses: &[Vec<OutputConstraint>],
+    pgd_config: &PgdConfig,
+    gemm_engine: Option<&dyn GemmEngine>,
+    json: bool,
+    stall: AttackStallPolicy,
+    outcome: &mut GraphDisjunctiveAttackOutcome,
+    receipt: &mut DisjOdiReceipt,
+) -> Result<DisjVjpBatchedOutcome> {
     use DisjVjpBatchedOutcome::{Completed, FallbackToSequential};
 
     let evidence = ExactVjpExecution::disjunctive(
@@ -99,7 +165,16 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
     );
     // A deferred/zero slice must not pay the potentially large exact-VJP plan
     // construction cost before discovering that no attack time exists.
-    if exact_vjp_slice_expired(pgd_config.deadline, Instant::now()) {
+    // #attack-setup-regrant: unless the phase offered a re-grant that still has
+    // time under its cap — then the plan is built and the re-grant is applied
+    // below, once the search is actually ready to start.
+    let mut deadline = pgd_config.deadline;
+    if exact_vjp_slice_expired(deadline, Instant::now())
+        && pgd_config
+            .setup_regrant
+            .and_then(|r| r.regranted_deadline(deadline, Instant::now()))
+            .is_none()
+    {
         outcome.hit_deadline = true;
         evidence.finish(EvidenceOutcome::NotStarted, Inactive::DeadlineBeforeStart);
         return Ok(Completed);
@@ -126,11 +201,27 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
     // Prove the disabled treatment had a live counterfactual route without
     // issuing an attack forward or a GPU VJP. Plan construction is deterministic
     // and may consume the remaining slice, hence the second deadline check.
-    if exact_vjp_slice_expired(pgd_config.deadline, Instant::now()) {
-        outcome.hit_deadline = true;
-        evidence.finish(EvidenceOutcome::NotStarted, Inactive::DeadlineBeforeStart);
-        return Ok(Completed);
+    if exact_vjp_slice_expired(deadline, Instant::now()) {
+        // #attack-setup-regrant: the setup (dispatch prelude + this plan) ate
+        // the whole slice before the first search step. Re-grant, once, the
+        // slice the phase declared from NOW, capped by the overall deadline.
+        let now = Instant::now();
+        let regranted = pgd_config
+            .setup_regrant
+            .and_then(|r| r.regranted_deadline(deadline, now));
+        let Some(fresh) = regranted else {
+            outcome.hit_deadline = true;
+            evidence.finish(EvidenceOutcome::NotStarted, Inactive::DeadlineBeforeStart);
+            return Ok(Completed);
+        };
+        eprintln!(
+            "[attack-setup-regrant] regranted=1 route=disjunctive overrun_s={:.3} slice_s={:.3}",
+            deadline.map_or(0.0, |d| now.saturating_duration_since(d).as_secs_f64()),
+            fresh.saturating_duration_since(now).as_secs_f64(),
+        );
+        deadline = Some(fresh);
     }
+    let deadline = deadline;
     if !pgd_config.exact_vjp.batch_enabled {
         evidence.finish(EvidenceOutcome::BatchDisabled, Inactive::BatchDisabled);
         return Ok(FallbackToSequential);
@@ -141,13 +232,25 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
             .iter()
             .any(|clause| super::check_unsafe_counterexample(output, clause))
     };
+    // #disj-odi: the phases' view of this invocation. Only consulted when a
+    // #disj-odi key is armed.
+    let odi_policy = receipt.policy();
+    let env = DisjLaneEnv {
+        graph,
+        input,
+        clauses,
+        plan: &plan,
+        gpu,
+        gemm_engine,
+        deadline,
+    };
 
     let diag = std::env::var("NY_PGD_DIAG").ok().as_deref() == Some("1");
     let attack_start = Instant::now();
     // #attack-stall: probe window sized from THIS phase's own slice
     // (deadline - attack_start), so the policy carries no absolute constant.
-    let mut stall_monitor = stall.monitor(attack_start, pgd_config.deadline);
-    let deadline_hit = || pgd_config.deadline.is_some_and(|d| Instant::now() >= d);
+    let mut stall_monitor = stall.monitor(attack_start, deadline);
+    let deadline_hit = || deadline.is_some_and(|d| Instant::now() >= d);
     let total_restarts = pgd_config.num_restarts.max(1);
     let width = pgd_config.exact_vjp.disjunctive_batch_width();
     // Restart-index seed offset: same continuation convention as the
@@ -164,6 +267,11 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
     // from clean init; odd indices are dynamic random-init lanes.
     let clean_point = sample_center_point(input);
     evidence.mark_work_started();
+    // #disj-odi focus: per-clause running max of bottleneck margins over the
+    // clean point and every restart-wave point (`None` unless focus lanes are
+    // requested, so the dark driver never computes it).
+    let mut focus_clause_best: Option<Vec<f32>> = None;
+    let mut focus_observed_waves = false;
     let ranked: Vec<GraphPgdTarget> = {
         let clean_out = evaluate_graph(graph, &clean_point, gemm_engine)?;
         if let Some(m) = best_clause_bottleneck_margin(&clean_out, clauses) {
@@ -185,6 +293,11 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
             outcome.candidate = Some(clean_point);
             evidence.finish(EvidenceOutcome::Candidate, Inactive::None);
             return Ok(Completed);
+        }
+        if odi_policy.tracks_focus() {
+            let mut best = vec![f32::NEG_INFINITY; clauses.len()];
+            observe_clause_margins(&mut best, &clean_out, clauses);
+            focus_clause_best = Some(best);
         }
         ranked_disjunctive_targets(&clean_out, clauses)
     };
@@ -251,6 +364,71 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
             })
             .collect();
 
+        // #disj-odi: output-diversified initialization of this wave's DYNAMIC
+        // lanes (targeted lanes keep their clean init). Each dynamic lane
+        // draws a fixed output direction from its own stream AFTER its init,
+        // then the lanes take the configured ODI sign steps through one
+        // batched exact VJP per step, every ODI point screened like any other.
+        // Dark (`attack.pgd_disj_odi` unset) ⇒ zero steps ⇒ skipped entirely.
+        let wave_odi_steps = odi_policy.wave_odi_steps();
+        if wave_odi_steps > 0 {
+            let dynamic: Vec<usize> = (0..k).filter(|&i| fixed_targets[i].is_none()).collect();
+            let directions = odi_directions(&mut rngs, &dynamic, plan.output_dim());
+            let observe = focus_clause_best.is_some() && !dynamic.is_empty();
+            match run_odi_phase(
+                &env,
+                &mut xs,
+                &dynamic,
+                &directions,
+                wave_odi_steps,
+                odi_policy.odi_eta,
+                focus_clause_best.as_deref_mut(),
+                receipt,
+                &evidence,
+                outcome,
+                &mut stall_monitor,
+            )? {
+                LanePhaseEnd::Continue => {}
+                LanePhaseEnd::Candidate { lane, step } => {
+                    if !json {
+                        println!(
+                            "  Graph disjunctive PGD (batched exact-VJP) found candidate at restart {}, ODI step {step}!",
+                            restart_base + lane
+                        );
+                    }
+                    evidence.finish(EvidenceOutcome::Candidate, Inactive::None);
+                    return Ok(Completed);
+                }
+                LanePhaseEnd::Deadline => {
+                    outcome.hit_deadline = true;
+                    evidence.finish(EvidenceOutcome::Deadline, Inactive::None);
+                    return Ok(Completed);
+                }
+                LanePhaseEnd::Stalled => {
+                    outcome.stalled_out = true;
+                    super::attack_stall::report_stall_cut(
+                        json,
+                        diag,
+                        format_args!("wave {restart_base} ODI"),
+                        stall_monitor.best_margin(),
+                    );
+                    evidence.finish(EvidenceOutcome::Stalled, Inactive::None);
+                    return Ok(Completed);
+                }
+            }
+            if observe {
+                focus_observed_waves = true;
+            }
+            if diag {
+                eprintln!(
+                    "[pgd-vjp-disj] wave {restart_base}: ODI init done ({wave_odi_steps} steps, eta={}, dynamic_lanes={}, {:.1}s)",
+                    odi_policy.odi_eta,
+                    dynamic.len(),
+                    attack_start.elapsed().as_secs_f64()
+                );
+            }
+        }
+
         for step in 0..pgd_config.num_steps {
             if deadline_hit() {
                 outcome.hit_deadline = true;
@@ -295,6 +473,10 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
             for kk in 0..k {
                 let out_arr =
                     ArrayD::from_shape_vec(IxDyn(&[plan.output_dim()]), outputs[kk].clone())?;
+                if let Some(best) = focus_clause_best.as_deref_mut() {
+                    observe_clause_margins(best, &out_arr, clauses);
+                    focus_observed_waves = true;
+                }
                 if let Some(m) = best_clause_bottleneck_margin(&out_arr, clauses) {
                     outcome.best_margin = outcome.best_margin.max(m);
                     // #attack-stall: a full probe window in which the running
@@ -475,6 +657,10 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
             for kk in 0..k {
                 let out_arr =
                     ArrayD::from_shape_vec(IxDyn(&[plan.output_dim()]), outputs[kk].clone())?;
+                if let Some(best) = focus_clause_best.as_deref_mut() {
+                    observe_clause_margins(best, &out_arr, clauses);
+                    focus_observed_waves = true;
+                }
                 if let Some(m) = best_clause_bottleneck_margin(&out_arr, clauses) {
                     outcome.best_margin = outcome.best_margin.max(m);
                     // #attack-stall: these points count too — the monitor's
@@ -525,6 +711,53 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
         restart_base += k;
     }
 
+    // #disj-odi focus stage: the restart waves are done without a candidate
+    // and without hitting the deadline; spend the rest of the slice on the
+    // closest clauses. A focus deadline ends the stage only — it never sets
+    // `outcome.hit_deadline` (the restart-sequence flag the attack extension
+    // reads), and focus lanes never count as restarts.
+    let mut focus_deadline = false;
+    if let Some(best) = focus_clause_best.as_deref() {
+        if outcome.hit_deadline {
+            receipt.focus_reason = "deadline_before_start";
+        } else {
+            match run_focus_wave(
+                &env,
+                best,
+                focus_observed_waves,
+                restart_seed_offset,
+                receipt,
+                &evidence,
+                outcome,
+                &mut stall_monitor,
+            )? {
+                FocusEnd::Done => {}
+                FocusEnd::Candidate { lane, step, odi } => {
+                    if !json {
+                        println!(
+                            "  Graph disjunctive PGD (batched exact-VJP) found candidate at focus lane {lane}, {}step {step}!",
+                            if odi { "ODI " } else { "" }
+                        );
+                    }
+                    evidence.finish(EvidenceOutcome::Candidate, Inactive::None);
+                    return Ok(Completed);
+                }
+                FocusEnd::Deadline => focus_deadline = true,
+                FocusEnd::Stalled => {
+                    outcome.stalled_out = true;
+                    super::attack_stall::report_stall_cut(
+                        json,
+                        diag,
+                        format_args!("focus wave"),
+                        stall_monitor.best_margin(),
+                    );
+                    evidence.finish(EvidenceOutcome::Stalled, Inactive::None);
+                    return Ok(Completed);
+                }
+            }
+        }
+    }
+
     if diag {
         eprintln!(
             "[pgd-vjp-disj] {} ({:.1}s): wave_steps={wave_steps} avg fwd={:.1}ms vjp={:.1}ms best_margin={:.5}",
@@ -552,7 +785,7 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
         ),
     );
     evidence.finish(
-        if outcome.hit_deadline {
+        if outcome.hit_deadline || focus_deadline {
             EvidenceOutcome::Deadline
         } else {
             EvidenceOutcome::Exhausted

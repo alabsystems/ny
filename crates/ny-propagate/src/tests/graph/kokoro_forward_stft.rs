@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Graph tests for the local Kokoro forward-STFT DSP bridge (#4215, #4223).
+//! Graph tests for the local Kokoro forward-STFT DSP bridge.
 
 use std::f64::consts::PI;
 use std::sync::{Mutex, OnceLock};
@@ -192,7 +192,7 @@ fn assert_close_tensor(actual: &BoundedTensor, expected: &[f32], tol: f32, label
 /// wrap. Phase is a circular quantity: +π and -π denote the *same* angle. At a
 /// branch-cut cell (real < 0, imag ≈ 0) the f32 graph and the f64 scalar
 /// reference can legitimately land on opposite sides of the cut, so a raw
-/// |a - b| comparison spuriously reports a ~2π error. (#4223)
+/// |a - b| comparison spuriously reports a ~2π error.
 fn angular_diff(a: f32, b: f32) -> f32 {
     let two_pi = 2.0 * std::f32::consts::PI;
     let mut d = (a - b).rem_euclid(two_pi);
@@ -328,7 +328,7 @@ fn assert_raw_phase_wrap_canary(
     // cut the imaginary part is numerically zero, and which side of ±0 the f64
     // sum lands on is not a robust, meaningful signal. The phase wrap is instead
     // confirmed by `best.gap > 6.0` above (the graph phases differ by ~2π) and by
-    // the angular agreement with the reference below. (#4223)
+    // the angular agreement with the reference below.
     assert!(
         minus_reference.imag[idx]
             .abs()
@@ -543,7 +543,7 @@ fn test_kokoro_forward_stft_full_concrete_matches_reference_4223() {
 
         // The full surface concatenates magnitude (linear) then phase (circular).
         // Compare each half with the appropriate metric: magnitude with absolute
-        // tolerance, phase with angular distance so branch-cut cells (±π) match. (#4223)
+        // tolerance, phase with angular distance so branch-cut cells (±π) match.
         let mag_len = reference.magnitude.len();
         let lower = output
             .lower()

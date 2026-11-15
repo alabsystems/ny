@@ -11,8 +11,6 @@
 //!   constant = g_c * (z_c - J_instnorm · x_c)
 //!
 //! Returns `BackwardDispatchResult::Nary` with 3 `LinearBounds` for (x, g, b).
-//!
-//! Ref: designs/2026-03-18-issue-4142-packet-a-ny-local-ternary.md
 
 use ndarray::{Array1, Array2};
 use ny_core::{NyError, Result};
@@ -64,7 +62,7 @@ impl AdaIN1dLayer {
         let n = x_lower.len();
         let d = node_lb.num_outputs();
 
-        // Non-finite guard (#3259).
+        // Non-finite guard.
         let has_non_finite = [&x_lower, &x_upper, &g_lower, &g_upper, &b_lower, &b_upper]
             .iter()
             .any(|a| a.iter().any(|v| !v.is_finite()));

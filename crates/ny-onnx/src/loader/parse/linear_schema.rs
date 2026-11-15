@@ -22,6 +22,7 @@ const FLOAT: i32 = 1;
 pub(super) fn validate_linear_convolution_schemas(
     graph: &GraphProto,
     opset_imports: &HashMap<String, i64>,
+    accept_conv3d: bool,
 ) -> Result<()> {
     let standard_opset = opset_imports
         .get("")
@@ -42,7 +43,9 @@ pub(super) fn validate_linear_convolution_schemas(
         match kind {
             RepresentedKind::MatMul => validate_matmul_schema(node, opset)?,
             RepresentedKind::Gemm => validate_gemm_schema(node, opset)?,
-            RepresentedKind::Convolution => validate_convolution_schema(graph, node, opset)?,
+            RepresentedKind::Convolution => {
+                validate_convolution_schema(graph, node, opset, accept_conv3d)?;
+            }
         }
         authenticate_float32_data_path(node, &mut raw_dtypes)?;
     }
@@ -126,7 +129,12 @@ fn validate_gemm_schema(node: &NodeProto, opset: i64) -> Result<()> {
     Ok(())
 }
 
-fn validate_convolution_schema(graph: &GraphProto, node: &NodeProto, opset: i64) -> Result<()> {
+fn validate_convolution_schema(
+    graph: &GraphProto,
+    node: &NodeProto,
+    opset: i64,
+    accept_conv3d: bool,
+) -> Result<()> {
     require_minimum_opset(node, opset, 1)?;
     if !matches!(node.input.len(), 2 | 3)
         || node.input[0..2].iter().any(String::is_empty)
@@ -251,7 +259,16 @@ fn validate_convolution_schema(graph: &GraphProto, node: &NodeProto, opset: i64)
         }
     }
 
-    let spatial_rank = authenticate_represented_conv_rank(
+    // 3-D spatial rank is admitted only for plain `Conv`, and only under the
+    // dark `qdq_activation_relaxation` load gate (#smart-turn-qdq): ny-build
+    // already lowers a rank-5 kernel to `Conv3dLayer` (IBP-only; its CROWN
+    // backward fails closed and the network degrades to IBP), and this
+    // preflight was the remaining refusal in front of it. Default OFF keeps
+    // the historical 1D/2D-only message byte-identical. `ConvTranspose`
+    // stays 1D/2D everywhere: no 3-D transpose layer exists.
+    let accept_rank3 = accept_conv3d && !transpose;
+    let spatial_rank = authenticate_represented_conv_rank_with_rank3(
+        accept_rank3,
         graph,
         node,
         kernel_shape,
@@ -341,7 +358,8 @@ fn validate_convolution_schema(graph: &GraphProto, node: &NodeProto, opset: i64)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn authenticate_represented_conv_rank(
+fn authenticate_represented_conv_rank_with_rank3(
+    accept_rank3: bool,
     graph: &GraphProto,
     node: &NodeProto,
     kernel_shape: Option<&[i64]>,
@@ -394,7 +412,7 @@ fn authenticate_represented_conv_rank(
     let Some((first_source, rank)) = candidates.first() else {
         return Ok(None);
     };
-    if !matches!(*rank, 1 | 2) {
+    if !(matches!(*rank, 1 | 2) || (accept_rank3 && *rank == 3)) {
         return Err(NyError::UnsupportedOp(format!(
             "standard ONNX {} node '{}' has spatial rank {} authenticated by {}; ny represents only 1D and 2D convolution",
             node.op_type, node.name, rank, first_source
@@ -728,6 +746,37 @@ mod tests {
     }
 
     #[test]
+    fn conv_spatial_rank3_is_gated_behind_the_qdq_relaxation_flag() {
+        // #smart-turn-qdq: a rank-5 Conv kernel (3 spatial axes) keeps the
+        // historical refusal on the default path, byte-for-byte, and is
+        // admitted only under the dark gate. ConvTranspose stays refused in
+        // BOTH states: no 3-D transpose layer exists.
+        let graph = convolution_graph("Conv", &[64, 3, 3, 7, 7], vec![]);
+        let error = validate_linear_convolution_schemas(&graph, &opsets(22), false)
+            .expect_err("rank-3 Conv must refuse on the default path");
+        assert!(
+            error
+                .to_string()
+                .contains("ny represents only 1D and 2D convolution"),
+            "{error}"
+        );
+        validate_linear_convolution_schemas(&graph, &opsets(22), true)
+            .expect("rank-3 Conv must be admitted under the gate");
+
+        let transpose = convolution_graph("ConvTranspose", &[3, 64, 3, 7, 7], vec![]);
+        for accept in [false, true] {
+            let error = validate_linear_convolution_schemas(&transpose, &opsets(22), accept)
+                .expect_err("rank-3 ConvTranspose must refuse in both gate states");
+            assert!(
+                error
+                    .to_string()
+                    .contains("ny represents only 1D and 2D convolution"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn matmul_rejects_internal_only_attributes_in_standard_domain() {
         let mut matmul = node("MatMul", &["a", "b"]);
         matmul.attribute.push(AttributeProto {
@@ -772,7 +821,7 @@ mod tests {
             output: vec![value_info("y", FLOAT)],
             ..Default::default()
         };
-        let error = validate_linear_convolution_schemas(&graph, &opsets(13))
+        let error = validate_linear_convolution_schemas(&graph, &opsets(13), false)
             .expect_err("integer MatMul must not become f32 arithmetic");
         assert!(matches!(error, NyError::UnsupportedOp(_)), "{error}");
     }
@@ -787,7 +836,7 @@ mod tests {
             output: vec![value_info("y", FLOAT)],
             ..Default::default()
         };
-        let error = validate_linear_convolution_schemas(&graph, &opsets(22))
+        let error = validate_linear_convolution_schemas(&graph, &opsets(22), false)
             .expect_err("integer Conv must not become f32 arithmetic");
         assert!(matches!(error, NyError::UnsupportedOp(_)), "{error}");
     }
@@ -802,7 +851,7 @@ mod tests {
             output: vec![value_info("y", INT64)],
             ..Default::default()
         };
-        let error = validate_linear_convolution_schemas(&graph, &opsets(22))
+        let error = validate_linear_convolution_schemas(&graph, &opsets(22), false)
             .expect_err("producer and authored output dtype must agree");
         assert!(
             error.to_string().contains("conflicting raw ONNX dtypes"),
@@ -819,11 +868,12 @@ mod tests {
             output: vec![value_info("y", FLOAT)],
             ..Default::default()
         };
-        validate_linear_convolution_schemas(&matmul, &opsets(22)).expect("valid MatMul failed");
+        validate_linear_convolution_schemas(&matmul, &opsets(22), false)
+            .expect("valid MatMul failed");
 
         for op_type in ["Conv", "ConvTranspose"] {
             let graph = convolution_graph(op_type, &[1, 1, 3, 3], vec![]);
-            validate_linear_convolution_schemas(&graph, &opsets(22))
+            validate_linear_convolution_schemas(&graph, &opsets(22), false)
                 .unwrap_or_else(|error| panic!("valid {op_type} failed: {error}"));
         }
     }
@@ -840,7 +890,7 @@ mod tests {
                 output: vec![value_info("y", FLOAT)],
                 ..Default::default()
             };
-            validate_linear_convolution_schemas(&graph, &opsets(22))
+            validate_linear_convolution_schemas(&graph, &opsets(22), false)
                 .unwrap_or_else(|error| panic!("valid optional {op_type} B failed: {error}"));
         }
     }
@@ -849,7 +899,7 @@ mod tests {
     fn convolution_attributes_are_strictly_typed_and_allowlisted() {
         let scalar_strides =
             convolution_graph("Conv", &[2, 3, 3, 3], vec![int_attribute("strides", 2)]);
-        let error = validate_linear_convolution_schemas(&scalar_strides, &opsets(22))
+        let error = validate_linear_convolution_schemas(&scalar_strides, &opsets(22), false)
             .expect_err("ONNX strides is INTS, never scalar INT");
         assert!(error.to_string().contains("must have type INTS"), "{error}");
 
@@ -858,7 +908,7 @@ mod tests {
             &[3, 2, 3, 3],
             vec![int_attribute("adj", 1)],
         );
-        let error = validate_linear_convolution_schemas(&unknown, &opsets(11))
+        let error = validate_linear_convolution_schemas(&unknown, &opsets(11), false)
             .expect_err("unknown standard-domain attributes must fail closed");
         assert!(
             error.to_string().contains("active ConvTranspose-11 schema"),
@@ -870,7 +920,7 @@ mod tests {
             &[3, 2, 3, 3],
             vec![int_attribute("output_padding", 1)],
         );
-        let error = validate_linear_convolution_schemas(&scalar_output_padding, &opsets(22))
+        let error = validate_linear_convolution_schemas(&scalar_output_padding, &opsets(22), false)
             .expect_err("ONNX output_padding is INTS, never scalar INT");
         assert!(error.to_string().contains("must have type INTS"), "{error}");
 
@@ -879,7 +929,9 @@ mod tests {
             &[2, 3, 3, 3],
             vec![string_attribute("auto_pad", b"same_upper")],
         );
-        assert!(validate_linear_convolution_schemas(&malformed_auto_pad, &opsets(1)).is_err());
+        assert!(
+            validate_linear_convolution_schemas(&malformed_auto_pad, &opsets(1), false).is_err()
+        );
     }
 
     #[test]
@@ -896,7 +948,7 @@ mod tests {
                 int_attribute("group", 1),
             ],
         );
-        validate_linear_convolution_schemas(&represented, &opsets(1))
+        validate_linear_convolution_schemas(&represented, &opsets(1), false)
             .expect("the represented Conv-1 attribute subset should pass");
 
         for malformed in [
@@ -919,7 +971,7 @@ mod tests {
             convolution_graph("Conv", &[2, 3, 3, 5], vec![int_attribute("group", 0)]),
         ] {
             assert!(
-                validate_linear_convolution_schemas(&malformed, &opsets(22)).is_err(),
+                validate_linear_convolution_schemas(&malformed, &opsets(22), false).is_err(),
                 "malformed or unrepresented convolution attributes must fail closed: {:?}",
                 malformed.node[0].attribute
             );
@@ -936,7 +988,7 @@ mod tests {
                 ints_attribute("output_padding", &[1, 1]),
             ],
         );
-        validate_linear_convolution_schemas(&represented, &opsets(22))
+        validate_linear_convolution_schemas(&represented, &opsets(22), false)
             .expect("represented ConvTranspose2d output_padding should pass");
 
         let output_shape = convolution_graph(
@@ -944,7 +996,7 @@ mod tests {
             &[3, 2, 3, 3],
             vec![ints_attribute("output_shape", &[10, 10])],
         );
-        let error = validate_linear_convolution_schemas(&output_shape, &opsets(22))
+        let error = validate_linear_convolution_schemas(&output_shape, &opsets(22), false)
             .expect_err("output_shape auto-generated padding is not represented");
         assert!(
             error.to_string().contains("spatial-only output_shape")
@@ -981,7 +1033,7 @@ mod tests {
             ),
         ] {
             assert!(
-                validate_linear_convolution_schemas(&unsupported, &opsets(22)).is_err(),
+                validate_linear_convolution_schemas(&unsupported, &opsets(22), false).is_err(),
                 "unrepresented ConvTranspose controls must fail closed: {:?}",
                 unsupported.node[0].attribute
             );

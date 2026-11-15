@@ -35,7 +35,7 @@ impl GraphNetwork {
     /// Creates a linear chain of nodes: input -> layer0 -> layer1 -> ... -> output
     /// For empty networks, returns an empty graph with output node [`NETWORK_INPUT`].
     ///
-    /// Returns `Err` if duplicate node names are detected (#2686).
+    /// Returns `Err` if duplicate node names are detected.
     pub fn from_sequential(network: &Network) -> Result<Self> {
         let mut graph = GraphNetwork::new();
 
@@ -68,7 +68,7 @@ impl GraphNetwork {
     ///
     /// A sequential graph has no binary ops and no nodes with multiple consumers.
     /// Moved from `graph_alpha/propagate_helpers.rs` to share with non-alpha
-    /// consumers (e.g., resident PGD in #4081).
+    /// consumers (e.g., resident PGD).
     pub(crate) fn is_sequential_graph(&self, exec_order: &[String]) -> bool {
         if exec_order.is_empty() {
             return true;
@@ -113,7 +113,7 @@ impl GraphNetwork {
     /// Returns `Err` only for invariant violations (missing node, malformed unary arity).
     ///
     /// This is the shared lowering seam for SDP-CROWN, CROWN-IBP sequential
-    /// fast path, and future resident PGD (#4081 Slice 2).
+    /// fast path, and future resident PGD.
     pub(crate) fn try_unary_chain(&self, exec_order: &[String]) -> Result<Option<GraphUnaryChain>> {
         if !self.is_sequential_graph(exec_order) {
             return Ok(None);
@@ -152,7 +152,7 @@ mod tests {
     use crate::layers::transform::FlattenLayer;
     use crate::layers::{Layer, ReLULayer};
 
-    /// #4097: A valid unary chain with non-SDP layers (ReLU + Flatten) returns
+    /// A valid unary chain with non-SDP layers (ReLU + Flatten) returns
     /// `Some(GraphUnaryChain)` with correct layer count and node name order.
     #[test]
     fn graph_unary_chain_extracts_generic_layers_and_names_4097() {
@@ -175,7 +175,7 @@ mod tests {
         assert_eq!(chain.node_names, vec!["relu", "flatten"]);
     }
 
-    /// #4097: A branching graph (binary Add with two inputs) returns `None`.
+    /// A branching graph (binary Add with two inputs) returns `None`.
     #[test]
     fn graph_unary_chain_rejects_branch_4097() {
         let mut graph = GraphNetwork::new();
@@ -194,7 +194,7 @@ mod tests {
         assert!(result.is_none(), "branching graph should return None");
     }
 
-    /// #4097: malformed multi-input unary nodes must surface `InvalidSpec`
+    /// Malformed multi-input unary nodes must surface `InvalidSpec`
     /// instead of being silently lowered as a one-input chain.
     #[test]
     fn graph_unary_chain_rejects_multi_input_unary_node_4097() {

@@ -53,6 +53,7 @@ pub mod picked;
 pub mod processed;
 mod storage;
 pub mod types;
+mod warm_frontier;
 
 #[cfg(test)]
 use grouped::{
@@ -69,8 +70,10 @@ pub(crate) use grouped::{
 pub use picked::PickedDomains;
 pub use processed::ProcessedDomains;
 pub use types::{CachedLinearBounds, DomainListConfig, DomainMetadata};
+pub use warm_frontier::WarmFrontier;
+pub(crate) use warm_frontier::{FrontierBlock, FrontierCapture};
 
-// Test-only re-exports (tests/pick_add.rs and tests/permutation.rs via `use super::*`)
+// Test-only re-exports (tests/pick_add/ and tests/permutation.rs via `use super::*`)
 #[cfg(test)]
 pub(crate) use filter::filter_batch;
 #[cfg(test)]

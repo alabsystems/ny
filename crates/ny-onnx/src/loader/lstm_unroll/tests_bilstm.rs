@@ -5,7 +5,6 @@
 //! Tests for bidirectional LSTM (BiLSTM) unrolling and Kokoro duration predictor.
 //!
 //! Split from `tests.rs` to stay under the 500-line file limit.
-//! Part of #3497: Kokoro BiLSTM duration predictor CROWN verification.
 
 use super::node_builder::make_int_attr;
 use super::*;
@@ -497,7 +496,7 @@ fn test_bilstm_y_output_proof_fixture_never_reaches_propagation_3497() {
     );
 }
 
-// --- Weight slicing unit tests (proof_coverage: Re: #3497) ---
+// --- Weight slicing unit tests ---
 // These verify the critical correctness property: direction slicing extracts
 // exactly the right weight block. If off by one, all BiLSTM bounds are silently wrong.
 

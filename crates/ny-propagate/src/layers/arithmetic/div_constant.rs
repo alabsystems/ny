@@ -101,7 +101,6 @@ impl DivConstantLayer {
         // Compute 1/c in f64 to reduce rounding error in the CROWN coefficient
         // path. The remaining ULP from f64->f32 cast is covered by
         // concretize_sound()'s directed rounding at concretization time.
-        // Part of #1483.
         Ok(self.constant.mapv(|v| (1.0_f64 / v as f64) as f32))
     }
 }
@@ -169,7 +168,7 @@ impl BoundPropagation for DivConstantLayer {
                 ));
             }
 
-            // Directed division (#1483). `div_down_f32`/`div_up_f32` certify
+            // Directed division. `div_down_f32`/`div_up_f32` certify
             // the f64 quotient with its own exact fma remainder and then narrow
             // in the correct direction, so they step only when the division
             // actually rounded — unlike the previous

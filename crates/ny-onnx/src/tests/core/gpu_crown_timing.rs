@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! GPU CROWN backward timing benchmarks for #3460 acceptance criteria.
+//! GPU CROWN backward timing benchmarks.
 //!
 //! Separated from gpu_crown.rs to avoid cross-worker file ownership conflicts.
 //! These tests measure wall-clock CPU vs GPU CROWN backward timing on real
@@ -139,7 +139,7 @@ fn print_timing_report(
 }
 
 // ───────────────────────────────────────────────────────────────────────
-// ACAS-Xu GPU vs CPU CROWN backward timing (#3460 acceptance criterion)
+// ACAS-Xu GPU vs CPU CROWN backward timing
 // ───────────────────────────────────────────────────────────────────────
 
 /// Timing benchmark: ACAS-Xu 1_1 CPU CROWN vs GPU CROWN backward.

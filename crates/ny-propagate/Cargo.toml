@@ -10,11 +10,24 @@ readme.workspace = true
 
 [features]
 benchmarks = []
-kani-proofs = []
+# Explicit pinned original-model conformance. Missing request/assets fail;
+# normal numerical tests and production routing do not require model downloads.
+external-models = []
 # Real-adapter integration for propagation's GPU-CROWN consumer seams. Default
 # tests use hermetic recording engines; this explicit lane fails fast when the
 # explicitly requested device cannot pass the five-rung sound-authority ladder.
 gpu-tests = []
+# The subset of that lane whose subject is UNCHARGED verdict authority or the
+# margin-row EFT channel: it needs an adapter that passes the uncharged
+# five-rung ladder and keeps subnormals and EFT residuals (DenormPreserve) —
+# measured only on Vulkan with the SPIR-V DenormPreserve injection (GB10). A
+# pure-flush adapter (Apple/Metal, measured) refuses by hardware, so selecting
+# this lane there fails each test naming the refusal; the plain `gpu-tests`
+# lane stays meaningful on such a host. See TEST_CONFORMANCE.md.
+gpu-tests-uncharged = ["gpu-tests"]
+# Explicit CUDA small-row sound-fold conformance. Constructs a real device and
+# fails if unavailable; never enabled by the portable GPU/CPU test lanes.
+gpu-tests-cuda = []
 # Diagnostic harnesses that PRINT observed behaviour for re-seeding a pinned
 # guard, rather than asserting anything. They are tools, not coverage, so they
 # are absent from the default lane instead of `#[ignore]`d in it — TEST_CONFORMANCE.md:
@@ -36,7 +49,8 @@ rayon.workspace = true
 rustc-hash.workspace = true
 tracing.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# Certificate replay compares original binary64 summaries exactly after JSON.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 hashbrown.workspace = true
 libm.workspace = true
 faer.workspace = true
@@ -53,6 +67,7 @@ proptest.workspace = true
 ntest.workspace = true
 criterion.workspace = true
 ny-gpu = { path = "../ny-gpu" }
+ny-cuda = { path = "../ny-cuda" }
 ny-tensor = { path = "../ny-tensor", features = ["test-utils"] }
 ny-test-utils = { path = "../ny-test-utils" }
 # Exact-rational CROWN gold oracle for the strict A·W soundness proptest

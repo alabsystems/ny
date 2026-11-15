@@ -5,7 +5,7 @@
 //!
 //! The knob stops the fixed-slope CROWN backward after N layers and concretizes
 //! the remaining trunk with sound forward bounds. Its purpose, stated where it
-//! is set (`configs/vnncomp25/relusplitter.yaml`, "#3813"), is to escape the
+//! is set (`configs/vnncomp25/relusplitter.yaml`), is to escape the
 //! Conv2d backward bottleneck: a single Conv2d backward can eat tens of seconds
 //! on this workload, so trading bound tightness for airtime is a win *there*.
 //!

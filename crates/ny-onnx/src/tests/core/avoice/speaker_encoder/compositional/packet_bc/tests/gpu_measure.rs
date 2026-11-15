@@ -87,7 +87,7 @@ fn report_gpu_vs_cpu(cpu: &StageMeasurement, gpu: &StageMeasurement, deadline_se
 /// Measurement: compare CROWN-IBP Stage A tightening depth with and without
 /// a real GPU engine on the same 60s deadline. Answers: does GPU acceleration
 /// push CROWN backward past the 4/52-node envelope seen with CPU-only?
-/// Part of #3499 — GPU threading measurement lane.
+/// Part of the GPU threading measurement lane.
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
 #[cfg(all(feature = "external-avoice", feature = "external-wgpu"))]
@@ -177,9 +177,7 @@ fn report_alpha_gpu_vs_cpu(
     eprintln!("  GPU runtime: {:.1}s", gpu.1);
 }
 
-/// Level 0.5 measurement for #3499: alpha-CROWN GPU vs CPU stage widths.
-///
-/// Reference: `designs/2026-03-13-issue-3499-res2net-bound-widening-root-cause.md`
+/// Level 0.5 measurement: alpha-CROWN GPU vs CPU stage widths.
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
 #[cfg(all(feature = "external-avoice", feature = "external-wgpu"))]

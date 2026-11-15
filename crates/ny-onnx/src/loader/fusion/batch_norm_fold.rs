@@ -2,6 +2,89 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+//! Conv/Gemm/ConvTranspose <- BatchNormalization folding, and THE MODULE-LEVEL
+//! ASSESSMENT of what that fold does and does not certify (referenced from
+//! `bn_fold_interval.rs`, which until now forward-referenced an assessment that
+//! did not exist).
+//!
+//! # What the UNFUSED pair guarantees
+//!
+//! `BatchNormLayer::new` (`ny-propagate`, `layers/normalization/batch_norm/
+//! types.rs`) does not merely round `gamma / sqrt(var + eps)` into binary32. It
+//! encloses the EXACT REAL affine in outward-rounded binary64 intervals, refuses
+//! construction with `NyError::SoundnessRefusal` when it cannot, and publishes
+//! the per-channel radii `scale_err`/`bias_err`. All four consumers charge them
+//! OUTWARD — `ibp.rs`, `crown_scalar.rs`, `crown_batched.rs`, `patches.rs` — so
+//! an unfused `Conv -> BatchNormalization` pair encloses the authored ONNX graph
+//! evaluated in exact real arithmetic over its binary32 leaves. That is the
+//! truth model the rest of the tree states explicitly: see the header of
+//! `loader/const_fold/interval.rs` ("the exact real-arithmetic value ... lies in
+//! `[lower, upper]`. This is the truth model the rest of the tree already
+//! uses") and the `LinearBounds::lower_a_err` invariant.
+//!
+//! # What the FOLD carries, and what it drops
+//!
+//! CARRIED. The per-channel affine is composed in binary64
+//! (`batch_norm_affine`), the degenerate-denominator refusals match, and this
+//! module now also refuses a channel whose exact-real affine cannot be
+//! ENCLOSED at all — the same precondition `BatchNormLayer::new` fails closed
+//! on. A fold that cannot state the enclosure declines, and the authored
+//! BatchNormalization node survives to be built as a certified layer instead.
+//!
+//! DROPPED. The composed COEFFICIENT enclosure. `Conv2dLayer` and `LinearLayer`
+//! have no weight-error field (`kernel`/`weight` are bare `ArrayD<f32>`), so the
+//! stored `W'_ij` is a binary32 POINT standing in for the exact real
+//! `W_ij * gamma_c / sqrt(var_c + eps)`, with nothing charging the difference:
+//!
+//!   * WEIGHT (`fuse_conv_weight` / `fuse_conv_transpose_weight` /
+//!     `fuse_gemm_weight`, all `channel *= scale[c]`): TWO binary32 roundings,
+//!     not one — `scale[c]` is already the rounded binary32 of the binary64
+//!     quotient, and the per-channel scaling then rounds the product again. The
+//!     residual is up to `~1 ulp(W')`, i.e. `~2^-23 * |W'|`, NOT the `<= 0.5 ulp`
+//!     the loop comment in `batch_norm_affine` used to claim (that claim is
+//!     true of `channel_scale`/`channel_shift` alone, which is not where the
+//!     stored coefficient ends up).
+//!   * BIAS (`fuse_bias`, `b * scale + shift`): two more binary32 roundings, and
+//!     `shift = beta - mean*scale` is built to CANCEL `b*scale`, so the
+//!     `0.5 ulp(b*scale)` term is levied at magnitude scale while the result is
+//!     post-cancellation — the same magnitude-vs-result conflation the IBP path
+//!     carried until `batch_norm/ibp.rs` grew its evaluation charge.
+//!
+//! Nothing downstream absorbs this on the arm competition runs.
+//! `Conv2dLayer::propagate_ibp_sound_with_engine_and_deadline` routes ANY finite
+//! deadline to the certified binary64 dual accumulator, whose residual is
+//! `~gamma^f64_K * S ~ K*1.1e-16*S`; the fold's model error is `~2^-24 * S`,
+//! about `10^6` times larger. (The no-deadline arm's `gamma^f32_{K+2} * S_safe`
+//! happens to dominate it, but that is coincidence, not a certificate.)
+//!
+//! # Why this is not fixed by refusing to fold
+//!
+//! Refusing is the fail-closed move and it is always available
+//! (`BatchNormFoldingPolicy::PreserveRaw`), and for a fold whose value is not
+//! exactly representable it is what `const_fold/interval.rs` prescribes. It has
+//! ALREADY BEEN TRIED HERE and reverted WITH MEASUREMENTS: the hard gate
+//! `BATCH_NORM_AFFINE_COMPOSITION_AUTHENTICATED = false` disabled this fold
+//! until #bn-fold-restore (2026-08-05, see the block comment at
+//! `loader/convert.rs`). At the official cifar100 budgets it cost 15 `unsat`
+//! rows on resnet_large alone — every one independently confirmed `unsat` by the
+//! official 2025 field, i.e. it deleted SOUND PROOFS (~11.6 normalized points) —
+//! and pushed resnet_large 41 -> 61 and resnet_medium 40 -> 59 nodes, past
+//! `CROWN_IBP_PER_NODE_THRESHOLD = 50`, losing the per-node CROWN-IBP lane
+//! entirely. Re-landing that gate blind would re-inflict a measured loss without
+//! closing the defect class.
+//!
+//! # The end-state
+//!
+//! CERTIFICATE TRANSFER, not refusal: a `kernel_err`/`weight_err` channel on
+//! `Conv2dLayer`/`LinearLayer` seeded from this fold's per-channel enclosure,
+//! charged by the conv/linear certificates the way `scale_err`/`bias_err` are
+//! charged by BatchNorm's. The rigorous interval machinery for the seed already
+//! exists next door in `bn_fold_interval.rs` — today it is a LOGGER behind
+//! `NY_BN_FOLD_INTERVAL_REPORT=1`, a variable `vnncomp_scripts/run_instance.sh`
+//! cannot set, so it can never fire in competition. Until that channel exists
+//! the residual above is a KNOWN, BOUNDED, UNCERTIFIED gap and must be described
+//! as one, not justified away.
+
 use super::bn_fold_interval::{
     channel_affine_interval, emit_report, fold_interval_report, interval_report_enabled,
     ChannelAffineInterval, ChannelAxis,
@@ -13,9 +96,25 @@ use crate::onnx_proto::{self, attribute_type};
 use crate::WeightStore;
 use ndarray::{Array1, ArrayD, Axis};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::debug;
 
 const DEFAULT_BATCH_NORM_EPSILON: f32 = 1.0e-5;
+
+/// #graph-bab-cover-ledger review (M2e): set, for the rest of the process,
+/// the first time any load folds a BatchNormalization with its coefficient
+/// enclosure DROPPED (the module header's "DROPPED" paragraph; the same
+/// condition that prints the `[bn-fold-charge]` receipt). Never cleared: a
+/// model folded before a publication window opened may still be the one a
+/// verdict rests on, so "some fold happened in this process" is the
+/// conservative reading.
+static ENCLOSURE_DROPPING_FOLD_APPLIED: AtomicBool = AtomicBool::new(false);
+
+/// Whether any load in this process folded a BatchNormalization with its
+/// coefficient enclosure dropped (see `ENCLOSURE_DROPPING_FOLD_APPLIED`).
+pub(crate) fn enclosure_dropping_fold_applied() -> bool {
+    ENCLOSURE_DROPPING_FOLD_APPLIED.load(Ordering::SeqCst)
+}
 
 /// Extended BN folds (#cgan-structural-fold): ConvTranspose+BN,
 /// Gemm->Reshape->BN, and BN->Reshape->Gemm. Default ON;
@@ -64,6 +163,10 @@ pub(crate) fn fold_batch_norm_into_conv_linear_with_context(
     if policy == BatchNormFoldingPolicy::PreserveRaw {
         return consumed;
     }
+    // #bn-fold-charge (observation only): the largest dropped coefficient
+    // enclosure across every fold in this model, and the row magnitude it
+    // scales with. Emitted once per model below.
+    let (mut charge_max_l1, mut charge_max_dev, mut charge_folds) = (0.0f64, 0.0f64, 0usize);
 
     for bn_idx in 0..nodes.len() {
         if nodes[bn_idx].op_type != "BatchNormalization" {
@@ -160,8 +263,8 @@ pub(crate) fn fold_batch_norm_into_conv_linear_with_context(
             continue;
         }
         // Guard: skip Gemm+BN fusion when Gemm has non-default parameters.
-        // transA=1 changes input layout (#2320), alpha/beta!=1.0 changes the
-        // matmul/bias scaling that BN fusion equations assume (#2319).
+        // transA=1 changes input layout, alpha/beta!=1.0 changes the
+        // matmul/bias scaling that BN fusion equations assume.
         if predecessor_op_type == "Gemm" {
             if gemm_trans_a(predecessor) {
                 debug!(
@@ -283,10 +386,22 @@ pub(crate) fn fold_batch_norm_into_conv_linear_with_context(
             // Gemm: transB determines weight layout.
             //   transB=1 (default PyTorch): weight is (out, in) → scale axis 0
             //   transB=0: weight is (in, out) → scale axis 1
-            // Fix for #2309: without transB, square weights always matched axis 0.
+            // Without transB, square weights would always match axis 0.
             let trans_b = gemm_trans_b(predecessor);
             fuse_gemm_weight(&predecessor_weight, &affine.scale, trans_b)
         };
+        if predecessor_op_type == "Conv" {
+            if let Some(fused) = fused_weight.as_ref() {
+                let (l1, dev) = fold_coefficient_charge(&predecessor_weight, fused, &affine.scale);
+                charge_folds += 1;
+                if l1 > charge_max_l1 {
+                    charge_max_l1 = l1;
+                }
+                if dev > charge_max_dev {
+                    charge_max_dev = dev;
+                }
+            }
+        }
         let fused_weight = match fused_weight {
             Some(weight) => weight,
             None => continue,
@@ -342,19 +457,19 @@ pub(crate) fn fold_batch_norm_into_conv_linear_with_context(
             }
         }
 
-        weights.insert(weight_name.clone(), fused_weight);
+        weights.insert(weight_name, fused_weight);
         weights.insert(bias_name.clone(), fused_bias);
 
         if let Some(predecessor_node) = nodes.get_mut(predecessor_idx) {
             if predecessor_node.output.is_empty() {
-                predecessor_node.output.push(bn_output_name.clone());
+                predecessor_node.output.push(bn_output_name);
             } else {
-                predecessor_node.output[0] = bn_output_name.clone();
+                predecessor_node.output[0] = bn_output_name;
             }
             if predecessor_node.input.len() >= 3 {
-                predecessor_node.input[2] = bias_name.clone();
+                predecessor_node.input[2] = bias_name;
             } else {
-                predecessor_node.input.push(bias_name.clone());
+                predecessor_node.input.push(bias_name);
             }
         }
 
@@ -367,6 +482,38 @@ pub(crate) fn fold_batch_norm_into_conv_linear_with_context(
         debug!(
             "Fused {} node {} with BatchNormalization node {}",
             predecessor_op_type, predecessor_idx, bn_idx
+        );
+    }
+
+    // #bn-fold-charge receipt: ONE line per model, unconditional so its absence
+    // means "this binary predates the receipt", never "the charge was zero".
+    //
+    // `dev` is the coefficient enclosure this fold DROPS (module header:
+    // "DROPPED. The composed COEFFICIENT enclosure"). It is what an eventual
+    // `kernel_err`/`weight_err` channel on Conv2dLayer would have to carry.
+    // `rel` is dev/l1 — IEEE-754 round-to-nearest bounds it by 2^-24 = 5.96e-8,
+    // so a `rel` above that is a bug in this measurement, not a discovery.
+    //
+    // #spine-legacy-lanes (M2e): the line also counts EVERY BatchNormalization
+    // folded with its enclosure dropped (`bn_folds=`, Gemm / ConvTranspose /
+    // extended folds included, which `conv_folds` does not measure), and it
+    // prints whenever any fold happened, so an uncharged fold on a graph a
+    // verdict rests on is countable in every run log. `rel` measures the
+    // product rounding against the binary32 scale only; the scale's own
+    // rounding (a second `2^-24`) is not in it.
+    if !consumed.is_empty() {
+        ENCLOSURE_DROPPING_FOLD_APPLIED.store(true, Ordering::SeqCst);
+        let rel = if charge_max_l1 > 0.0 {
+            charge_max_dev / charge_max_l1
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[bn-fold-charge] conv_folds={charge_folds} max_row_l1={charge_max_l1:.6e} \
+max_row_dev={charge_max_dev:.6e} rel={rel:.3e} ieee_bound={:.3e} bn_folds={} \
+enclosure=dropped",
+            f64::from(2.0f32).powi(-24),
+            consumed.len()
         );
     }
 
@@ -414,11 +561,26 @@ fn batch_norm_affine(
     // Fold equations from alpha-beta-CROWN's Conv/BN merge logic:
     // complete_verifier/onnx_opt.py (fuse_conv_and_bn + merge_bn branches).
     for idx in 0..ny.len() {
-        // #bn-fold-restore: compose in f64 with one final rounding, so the
-        // uncertified residual on the folded parameters is at most the f32
-        // storage rounding (<= 0.5 ulp) rather than accumulated f32 arithmetic
-        // error. The reference fold (alpha-beta-CROWN onnx_opt.py) composes in
-        // f32; this is strictly tighter.
+        // #bn-fold-restore: compose in f64 with one final rounding. The
+        // reference fold (alpha-beta-CROWN onnx_opt.py) composes in f32; this is
+        // strictly tighter, and `channel_scale`/`channel_shift` below really do
+        // carry at most the 0.5 ulp of that single binary32 store.
+        //
+        // THE CLAIM THAT USED TO STAND HERE — "the uncertified residual on the
+        // folded parameters is at most the f32 storage rounding (<= 0.5 ulp)" —
+        // IS FALSE FOR THE PARAMETERS THE FOLD ACTUALLY STORES, and being
+        // written down is what let it pass review (it is quoted verbatim in the
+        // #bn-fold-restore risk acceptance at `loader/convert.rs`). These two
+        // f32 values are not the folded parameters; `fuse_conv_weight` /
+        // `fuse_conv_transpose_weight` / `fuse_gemm_weight` then apply
+        // `channel *= scale[c]`, a SECOND binary32 rounding, so the stored
+        // coefficient's residual against the exact real
+        // `W_ij * gamma_c / sqrt(var_c + eps)` is up to ~1 ulp(W'), ~2x the
+        // stated figure — and `fuse_bias`'s `b*scale + shift` adds two more
+        // roundings against a shift built to cancel `b*scale`. See the
+        // module-level assessment above for why that residual is uncertified,
+        // what does NOT absorb it, and why refusing the fold is not the
+        // remedy.
         let denominator = f64::from(var[idx]) + f64::from(epsilon);
         let denominator = denominator.sqrt();
         if !denominator.is_finite() || denominator <= 0.0 {
@@ -430,6 +592,23 @@ fn batch_norm_affine(
         if !channel_scale.is_finite() || !channel_shift.is_finite() {
             return None;
         }
+        // FAIL CLOSED WHERE THE UNFUSED LAYER WOULD. `BatchNormLayer::new`
+        // refuses (`NyError::SoundnessRefusal`) any channel whose exact-real
+        // affine cannot be enclosed in outward binary64 — a denominator not
+        // provably strictly positive, an overflowing scale/mean-scale/bias
+        // interval. The binary32/binary64 point checks above do not imply that
+        // enclosure, so a fold that fired on such a channel would REPLACE a
+        // layer the propagator refuses to build with conv weights nothing
+        // checks. Declining leaves the authored BatchNormalization node in
+        // place, where that refusal surfaces properly. This is the half of the
+        // unfused guarantee the fold CAN carry without a weight-error channel
+        // on `Conv2dLayer`; the coefficient enclosure itself is the half it
+        // cannot (module-level assessment above).
+        //
+        // Recomputed rather than hoisted out of the `intervals` push below on
+        // purpose: that push is dark-gated and must stay observational, and
+        // this gate must run on every load.
+        channel_affine_interval(ny[idx], beta[idx], mean[idx], var[idx], epsilon)?;
         scale.push(channel_scale);
         shift.push(channel_shift);
         if let Some(intervals) = intervals.as_mut() {
@@ -492,6 +671,46 @@ fn weight_vector(weights: &WeightStore, name: &str) -> Option<Vec<f32>> {
     Some(tensor.iter().copied().collect())
 }
 
+/// `#bn-fold-charge` (OBSERVATION ONLY): the coefficient error this fold drops.
+///
+/// Returns `(max_row_l1, max_row_dev)` over output channels, where for channel
+/// `c`:
+///
+/// * `row_l1  = sum_j |W'_cj|`            — the row magnitude the charge scales with
+/// * `row_dev = sum_j |W'_cj - (W_cj * s_c)_exact|` — the DROPPED enclosure
+///
+/// `f32 * f32` is exact in binary64 (24 + 24 <= 53 significand bits), so the
+/// exact product is computable and `row_dev` is MEASURED, not bounded by a
+/// `k * ulp` estimate. IEEE-754 round-to-nearest already guarantees
+/// `row_dev <= 2^-24 * row_l1`; this function exists to confirm that empirically
+/// on real models and to expose the magnitude the eventual `kernel_err` channel
+/// must carry (module header: "DROPPED. The composed COEFFICIENT enclosure").
+///
+/// Pure and allocation-free; changes no weight and no verdict.
+fn fold_coefficient_charge(weight: &ArrayD<f32>, fused: &ArrayD<f32>, scale: &[f32]) -> (f64, f64) {
+    let (mut max_l1, mut max_dev) = (0.0f64, 0.0f64);
+    for (c, (raw_ch, fused_ch)) in weight
+        .axis_iter(Axis(0))
+        .zip(fused.axis_iter(Axis(0)))
+        .enumerate()
+    {
+        let Some(&s_c) = scale.get(c) else { continue };
+        let (mut l1, mut dev) = (0.0f64, 0.0f64);
+        for (raw, stored) in raw_ch.iter().zip(fused_ch.iter()) {
+            let exact = f64::from(*raw) * f64::from(s_c);
+            l1 += f64::from(*stored).abs();
+            dev += (f64::from(*stored) - exact).abs();
+        }
+        if l1 > max_l1 {
+            max_l1 = l1;
+        }
+        if dev > max_dev {
+            max_dev = dev;
+        }
+    }
+    (max_l1, max_dev)
+}
+
 fn fuse_conv_weight(weight: &ArrayD<f32>, scale: &[f32]) -> Option<ArrayD<f32>> {
     if weight.ndim() < 1 || weight.shape().first().copied().unwrap_or_default() != scale.len() {
         return None;
@@ -548,7 +767,7 @@ fn fuse_conv_transpose_weight(weight: &ArrayD<f32>, scale: &[f32]) -> Option<Arr
 /// ONNX Gemm spec: transA defaults to 0 (no transpose). When transA=1, the
 /// first input matrix A is transposed before multiplication. BN fusion logic
 /// assumes standard (non-transposed) input layout and produces incorrect fused
-/// weights when transA=1. Guard: skip fusion for transA=1 (#2320).
+/// weights when transA=1. Guard: skip fusion for transA=1.
 fn gemm_trans_a(node: &onnx_proto::NodeProto) -> bool {
     node.attribute
         .iter()
@@ -571,7 +790,7 @@ fn gemm_trans_b(node: &onnx_proto::NodeProto) -> bool {
 ///
 /// ONNX Gemm computes: Y = alpha * A' * B' + beta * C.
 /// Default alpha=1.0. When alpha!=1.0, the BN fusion equations change because
-/// BN sees alpha-scaled matmul output. Guard: skip fusion for alpha!=1.0 (#2319).
+/// BN sees alpha-scaled matmul output. Guard: skip fusion for alpha!=1.0.
 fn gemm_alpha(node: &onnx_proto::NodeProto) -> f32 {
     node.attribute
         .iter()
@@ -585,7 +804,7 @@ fn gemm_alpha(node: &onnx_proto::NodeProto) -> f32 {
 /// ONNX Gemm computes: Y = alpha * A' * B' + beta * C.
 /// Default beta=1.0. When beta!=1.0, the existing bias is scaled by beta before
 /// BN sees it, so fuse_bias produces incorrect results. Guard: skip fusion for
-/// beta!=1.0 (#2319).
+/// beta!=1.0.
 fn gemm_beta(node: &onnx_proto::NodeProto) -> f32 {
     node.attribute
         .iter()
@@ -607,7 +826,7 @@ pub(crate) fn gemm_has_exact_default_affine(node: &onnx_proto::NodeProto) -> boo
 /// - `trans_b=true`: weight is (out, in) — scale along axis 0 (rows)
 /// - `trans_b=false`: weight is (in, out) — scale along axis 1 (columns)
 ///
-/// Fix for #2309: without transB, square weights always matched axis 0.
+/// Without transB, square weights would always match axis 0.
 fn fuse_gemm_weight(weight: &ArrayD<f32>, scale: &[f32], trans_b: bool) -> Option<ArrayD<f32>> {
     if weight.ndim() != 2 {
         return None;

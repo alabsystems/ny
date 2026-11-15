@@ -24,7 +24,7 @@ shift
 
 BENCH_ROOT="${BENCH_ROOT:-benchmarks/vnncomp2025/benchmarks}"
 BENCH_DIR="${BENCH_DIR:-$BENCH_ROOT/$CATEGORY}"
-# Track whether the caller explicitly set NY_BIN for provenance tagging (#4346)
+# Track whether the caller explicitly set NY_BIN for provenance tagging
 NY_BIN_EXPLICIT=""
 if [[ -n "${NY_BIN:-}" ]]; then
     NY_BIN_EXPLICIT="explicit"
@@ -75,7 +75,7 @@ done
 case "$CATEGORY" in
     acasxu_2023)
         # ACAS-Xu: alpha-CROWN regresses from 99.8% to 0% verified because
-        # frozen root alpha bounds don't tighten for sub-domains (#3453).
+        # frozen root alpha bounds don't tighten for sub-domains.
         # Reference uses bound_prop_method=crown (plain CROWN, not alpha-CROWN).
         CATEGORY_EXTRA_FLAGS="--no-alpha"
         ;;
@@ -95,7 +95,7 @@ fi
 
 # Category-default MIP routing: categories that the reference alpha-beta-CROWN
 # routes to complete_verifier=mip. Only applied when caller hasn't specified
-# --complete-verifier explicitly. (#3218, #2569)
+# --complete-verifier explicitly.
 if [[ -z "$VERIFIER_FLAG" ]]; then
     case "$CATEGORY" in
         sat_relu|malbeware|safenlp_2024|relusplitter|relusplitter_2026)
@@ -188,6 +188,9 @@ TMPOUT="$BENCHMARK_TMP_DIR/ny.stdout"
 VNNCOMP_RESULTS_FILE="$BENCHMARK_TMP_DIR/vnncomp.results"
 : > "$TMPOUT"
 cleanup_benchmark_tmp() {
+    # A watchdog killed before resetting traps can inherit this EXIT handler.
+    # Only the main shell owns the shared output and marker files.
+    [[ "$BASH_SUBSHELL" -eq 0 ]] || return 0
     if [[ -n "${WATCHDOG_MARKER:-}" ]]; then
         rm -f -- "$WATCHDOG_MARKER"
     fi
@@ -205,7 +208,7 @@ LAST_ACTUAL_METHOD=""
 # shellcheck source=scripts/benchmark_vnncomp_helpers.sh
 source "$SCRIPT_DIR/benchmark_vnncomp_helpers.sh"
 
-# Compute binary provenance once at startup (#4346)
+# Compute binary provenance once at startup
 compute_ny_provenance "$NY_BIN" "$NY_BIN_EXPLICIT"
 PROVENANCE_NOTES=$(format_provenance_tags)
 if [[ "$COMPETITION_WRAPPER" == "true" ]]; then
@@ -215,7 +218,7 @@ else
     EXECUTION_SURFACE="beta-crown-diagnostic"
     PROVENANCE_NOTES="${PROVENANCE_NOTES}; execution_surface=${EXECUTION_SURFACE}; score_claim_eligible=false"
 fi
-# Stamp compare-backends invocations with a compare_run_id (#4383)
+# Stamp compare-backends invocations with a compare_run_id
 if [[ "$COMPARE_BACKENDS" == "true" ]]; then
     COMPARE_RUN_ID="${CATEGORY}_${TIMESTAMP}"
     PROVENANCE_NOTES="${PROVENANCE_NOTES}; compare_run_id=${COMPARE_RUN_ID}"

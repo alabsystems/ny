@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Backward CROWN dispatch coverage matrix test (#3424).
+//! Backward CROWN dispatch coverage matrix test.
 //!
 //! Validates that each dispatch site handles exactly the expected set of
 //! Layer variants. When the canonical dispatch (`dispatch_backward_layer`)

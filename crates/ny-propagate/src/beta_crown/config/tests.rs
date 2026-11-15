@@ -301,7 +301,7 @@ fn acas_xu_preset_has_expected_values() {
     assert_eq!(config.batch_size, 16_384);
 
     // ACAS-Xu disables alpha-CROWN (reference uses plain CROWN).
-    // Frozen root alpha (#3453) regresses ACAS-Xu from 99.8% to 0%.
+    // Frozen root alpha regresses ACAS-Xu from 99.8% to 0%.
     assert!(
         !config.use_alpha_crown,
         "ACAS-Xu preset should disable alpha-CROWN (#3453)"
@@ -374,7 +374,7 @@ fn lookahead_config_new_sanitizes_nan_alpha() {
     );
 }
 
-// --- Domain check method tests (#2086) ---
+// --- Domain check method tests ---
 
 #[ntest::timeout(5000)]
 #[test]
@@ -586,13 +586,13 @@ fn domain_is_violation_instance_delegates_to_for_mode() {
     );
 }
 
-// --- Lambda optimization config regression tests (#2761) ---
+// --- Lambda optimization config regression tests ---
 // Prove BaB lambda params come from config, not hardcoded constants.
 
 #[ntest::timeout(5000)]
 #[test]
 fn lambda_opt_defaults_match_prior_hardcoded_values() {
-    // Before #2761 these were inline constants in bab_loop.rs and relu_split_bounds.rs.
+    // These were formerly inline constants in bab_loop.rs and relu_split_bounds.rs.
     // Verify defaults preserve the original behavior.
     let config = BetaCrownConfig::default();
     assert_eq!(config.lambda_opt_interval, 20);
@@ -742,7 +742,7 @@ fn domain_is_violation_nan_threshold_returns_false() {
     assert_domain_not_violation(false, -2.0, -0.1, f32::NAN);
 }
 
-// --- Inf soundness tests for domain_is_verified / domain_is_violation (#2993) ---
+// --- Inf soundness tests for domain_is_verified / domain_is_violation ---
 // Inf bounds indicate propagation failure (reciprocal zero-crossing, non-convergence),
 // not genuine verification/violation results. Both must return false.
 
@@ -772,7 +772,7 @@ fn domain_is_verified_inf_upper_returns_false_2993() {
 #[ntest::timeout(5000)]
 #[test]
 fn domain_is_violation_inf_lower_returns_false_2993() {
-    // +Inf lower: the exact bug from #2993. lower >= threshold would be true,
+    // +Inf lower: the original bug. lower >= threshold would be true,
     // incorrectly returning Violation.
     assert_domain_not_violation(true, f32::INFINITY, 2.0, 0.0);
     assert_domain_not_violation(false, f32::INFINITY, -0.5, 0.0);
@@ -811,7 +811,7 @@ fn domain_is_violation_both_inf_returns_false_2993() {
     assert_domain_not_violation(false, f32::NEG_INFINITY, f32::NEG_INFINITY, 0.0);
 }
 
-// --- Inf threshold tests (#2993 self-audit finding) ---
+// --- Inf threshold tests (self-audit finding) ---
 // Inf threshold would trivially verify/violate all domains:
 // upper < +Inf is always true → every domain "verified"
 // lower >= -Inf is always true → every domain "violated"
@@ -868,7 +868,7 @@ fn domain_priority_for_mode_rejects_inverted_bounds() {
 #[ntest::timeout(5000)]
 #[test]
 fn domain_priority_for_mode_rejects_nan_bounds() {
-    // NaN lower bound must produce Err(NumericalInstability) (#2982)
+    // NaN lower bound must produce Err(NumericalInstability)
     assert!(
         BetaCrownConfig::domain_priority_for_mode(true, f32::NAN, 1.0).is_err(),
         "NaN lower + upper-bound mode should return error"
@@ -921,7 +921,7 @@ fn violation_priority_matches_domain_priority() {
     );
 }
 
-// --- LR scheduler guard regression tests (#2840) ---
+// --- LR scheduler guard regression tests ---
 
 #[ntest::timeout(5000)]
 #[test]
@@ -1002,7 +1002,7 @@ fn lr_step_decay_normal_operation() {
     );
 }
 
-// --- AdaptiveOptConfig validation tests (#2942) ---
+// --- AdaptiveOptConfig validation tests ---
 
 #[ntest::timeout(5000)]
 #[test]
@@ -1137,7 +1137,7 @@ fn adaptive_opt_config_valid_custom_validates() {
     config.validate().unwrap();
 }
 
-// --- BetaCrownConfig::validate() tests (#2942) ---
+// --- BetaCrownConfig::validate() tests ---
 
 #[ntest::timeout(5000)]
 #[test]
@@ -1337,7 +1337,7 @@ fn beta_crown_config_validates_adaptive_config() {
     assert_invalid_config_contains(&err, "epsilon");
 }
 
-// --- effective_relu_split_depth tests (#2767) ---
+// --- effective_relu_split_depth tests ---
 // Reference: alpha-beta-CROWN `get_split_depth()` in `bab.py:40-48`.
 
 #[ntest::timeout(5000)]
@@ -1464,7 +1464,7 @@ fn effective_relu_split_depth_default_config_disabled() {
 }
 
 // ============================================================
-// auto_enlarge_batch_size (#4303)
+// auto_enlarge_batch_size
 // ============================================================
 
 #[test]
@@ -1521,7 +1521,7 @@ fn maybe_enlarge_batch_size_caps_at_8192_4303() {
 }
 
 // ============================================================
-// try_enlarge_batch_size shared closeout helper (#4303)
+// try_enlarge_batch_size shared closeout helper
 // ============================================================
 
 #[test]
@@ -1696,10 +1696,7 @@ fn verification_artifact_authority_is_runtime_only_and_fail_closed_under_serde()
         "runtime-only authority must be rejected by config deserialization"
     );
 
-    let frozen = std::sync::Arc::new(ny_levers::LeverSet::freeze_with(
-        ny_levers::all(),
-        |_| None,
-    ));
+    let frozen = std::sync::Arc::new(ny_levers::LeverSet::freeze_with(ny_levers::all(), |_| None));
     let runtime = BetaCrownConfig {
         verification_artifact_authority: VerificationArtifactAuthority::VerdictOnly,
         frozen_levers: Some(std::sync::Arc::clone(&frozen)),
@@ -1958,4 +1955,113 @@ fn atomic_root_c_margin_iterations_are_typed_dark_and_hard_capped() {
     };
     let error = over.validate().expect_err("work above the cap must refuse");
     assert_invalid_config_contains(&error, "atomic_root_c_margin_iterations");
+}
+
+/// #hull-root / #hull-bab: the typed mode is dark by default (the pre-key
+/// tree) and parses exactly its three snake_case spellings `off | root | bab`.
+/// `bab` was refused while phase 2 was unbuilt; #hull-bab builds it, so this
+/// test now ACCEPTS it (deliberately) and still refuses every other spelling.
+#[test]
+fn single_hidden_hull_mode_is_typed_dark_by_default() {
+    let default = BetaCrownConfig::default();
+    assert_eq!(default.single_hidden_hull, SingleHiddenHullMode::Off);
+    assert!(!default.single_hidden_hull.is_armed());
+    default.validate().expect("dark default validates");
+
+    let absent: BetaCrownConfig =
+        serde_json::from_value(serde_json::json!({})).expect("empty config deserializes");
+    assert_eq!(absent.single_hidden_hull, SingleHiddenHullMode::Off);
+
+    let armed: BetaCrownConfig =
+        serde_json::from_value(serde_json::json!({ "single_hidden_hull": "root" }))
+            .expect("root deserializes");
+    assert_eq!(armed.single_hidden_hull, SingleHiddenHullMode::Root);
+    assert!(armed.single_hidden_hull.is_armed());
+    assert_eq!(armed.single_hidden_hull.label(), "root");
+
+    let bab: BetaCrownConfig =
+        serde_json::from_value(serde_json::json!({ "single_hidden_hull": "bab" }))
+            .expect("bab deserializes now that #hull-bab is built");
+    assert_eq!(bab.single_hidden_hull, SingleHiddenHullMode::Bab);
+    assert!(bab.single_hidden_hull.is_armed());
+    assert_eq!(bab.single_hidden_hull.label(), "bab");
+    bab.validate().expect("armed bab validates");
+
+    for bad in ["Bab", "BAB", "tree", "hull_bab", "on", ""] {
+        assert!(
+            serde_json::from_value::<BetaCrownConfig>(
+                serde_json::json!({ "single_hidden_hull": bad })
+            )
+            .is_err(),
+            "`{bad}` must not parse: the mode enum is closed"
+        );
+    }
+}
+
+/// #relusplitter-lp-refine: the typed refiner arming is dark by default (no
+/// refiner is ever attached), presence arms it with the Vibecheck-recipe
+/// defaults, unknown sub-keys are refused, and inadmissible values fail
+/// validation instead of being clamped.
+#[test]
+fn mip_refine_intermediates_is_typed_dark_by_default() {
+    let default = BetaCrownConfig::default();
+    assert_eq!(default.mip_refine_intermediates, None);
+    default.validate().expect("dark default validates");
+
+    let absent: BetaCrownConfig =
+        serde_json::from_value(serde_json::json!({})).expect("empty config deserializes");
+    assert_eq!(absent.mip_refine_intermediates, None);
+
+    let armed: BetaCrownConfig =
+        serde_json::from_value(serde_json::json!({ "mip_refine_intermediates": {} }))
+            .expect("an empty map arms the defaults");
+    assert_eq!(
+        armed.mip_refine_intermediates,
+        Some(MipRefineIntermediates {
+            layers: 3,
+            budget_frac: 0.3,
+        })
+    );
+    armed.validate().expect("armed defaults validate");
+
+    let explicit: BetaCrownConfig = serde_json::from_value(serde_json::json!({
+        "mip_refine_intermediates": { "layers": 2, "budget_frac": 0.5 }
+    }))
+    .expect("explicit values deserialize");
+    assert_eq!(
+        explicit.mip_refine_intermediates,
+        Some(MipRefineIntermediates {
+            layers: 2,
+            budget_frac: 0.5,
+        })
+    );
+
+    assert!(
+        serde_json::from_value::<BetaCrownConfig>(serde_json::json!({
+            "mip_refine_intermediates": { "layer": 2 }
+        }))
+        .is_err(),
+        "a misspelled sub-key must be refused"
+    );
+
+    for (layers, budget_frac) in [
+        (0usize, 0.3_f64),
+        (MipRefineIntermediates::MAX_LAYERS + 1, 0.3),
+        (3, 0.0),
+        (3, -0.1),
+        (3, 0.95),
+        (3, f64::NAN),
+    ] {
+        let config = BetaCrownConfig {
+            mip_refine_intermediates: Some(MipRefineIntermediates {
+                layers,
+                budget_frac,
+            }),
+            ..BetaCrownConfig::default()
+        };
+        let error = config
+            .validate()
+            .expect_err("an inadmissible arming must be refused");
+        assert_invalid_config_contains(&error, "mip_refine_intermediates");
+    }
 }

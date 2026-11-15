@@ -8,7 +8,7 @@
 //! (`nan_propagating_min` vs `nan_propagating_max`).
 //! This module provides `elementwise_binary_ibp` to eliminate the duplication.
 //!
-//! **NaN safety (#3147):** All `op` calls are wrapped with a NaN guard so that
+//! **NaN safety:** All `op` calls are wrapped with a NaN guard so that
 //! NaN inputs always produce NaN outputs, even if the caller accidentally passes
 //! an IEEE 754 NaN-absorbing function like `f32::min`/`f32::max`.
 
@@ -28,7 +28,7 @@ use crate::shape::broadcast_shapes;
 /// op(lower_a, lower_b) gives the lower bound of the output and
 /// op(upper_a, upper_b) gives the upper bound.
 ///
-/// **NaN safety (#3147):** `op` MUST be NaN-propagating (use
+/// **NaN safety:** `op` MUST be NaN-propagating (use
 /// `nan_propagating_min`/`nan_propagating_max` from `ny_core`).
 /// As defense-in-depth, this function wraps each `op` call so that
 /// NaN in either operand always produces NaN in the output, even if
@@ -39,7 +39,7 @@ pub fn elementwise_binary_ibp(
     op: fn(f32, f32) -> f32,
     op_name: &str,
 ) -> Result<BoundedTensor> {
-    // Defense-in-depth: wrap op so NaN always propagates (#3147).
+    // Defense-in-depth: wrap op so NaN always propagates.
     // f32::min/max absorb NaN per IEEE 754 — this guard prevents silent
     // unsoundness if a caller accidentally passes the wrong function.
     let nan_safe_op = |a: f32, b: f32| -> f32 {
@@ -77,7 +77,7 @@ pub fn elementwise_binary_ibp(
         // never combine into NaN; ±Inf flows through unchanged and is a sound
         // endpoint. A NaN output therefore implies a NaN INPUT (the guard above
         // propagates it) — a real bug — which `new_allow_infinite` still
-        // rejects as a hard error (#3147 tests below keep exercising that).
+        // rejects as a hard error (the tests below keep exercising that).
         BoundedTensor::new_allow_infinite(lower, upper)
     } else {
         // Broadcasting path
@@ -260,7 +260,7 @@ mod tests {
         .unwrap()
     }
 
-    /// Regression test for #3147: NaN in lower bounds of input A must propagate
+    /// Regression test: NaN in lower bounds of input A must propagate
     /// to the output (Err from BoundedTensor::new), not be silently absorbed
     /// into a finite Ok. Tests fast path (same shape).
     #[test]
@@ -282,7 +282,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #3147: NaN in upper bounds of input B must propagate.
+    /// Regression test: NaN in upper bounds of input B must propagate.
     #[test]
     fn test_nan_propagation_upper_b_same_shape() {
         let a = make_bt(&[0.0, 1.0], &[2.0, 3.0]);
@@ -301,7 +301,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #3147: defense-in-depth — even with the NaN-absorbing
+    /// Regression test: defense-in-depth — even with the NaN-absorbing
     /// `f32::min`, the NaN guard inside `elementwise_binary_ibp` prevents silent
     /// absorption. Before the fix, `f32::min(NaN, 2.0) = 2.0` silently dropped
     /// NaN and produced `Ok(wrong_bounds)`. After: NaN propagates → `Err`.
@@ -318,7 +318,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #3147: NaN propagation through broadcast path.
+    /// Regression test: NaN propagation through broadcast path.
     #[test]
     fn test_nan_propagation_broadcast_path() {
         // A: [1, 2] with NaN in lower[0], B: [2, 2] — triggers broadcast path
@@ -362,7 +362,7 @@ mod tests {
     }
 
     /// NaN input (a real bug, not OpaqueSkip taint) must still hard-error:
-    /// `new_allow_infinite` rejects NaN. Complements the #3147 tests above.
+    /// `new_allow_infinite` rejects NaN. Complements the tests above.
     #[test]
     fn test_ibp_nan_input_still_errors_after_inf_migration() {
         let a = make_bt_unchecked(&[f32::NAN], &[2.0]);

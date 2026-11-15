@@ -24,12 +24,12 @@ impl DomainList {
             TreeTraversal::DepthFirst => {
                 // Ascending: lowest score first, highest score last (popped first by stack).
                 // Uses total_cmp for deterministic NaN handling — NaN sorts after all
-                // finite values, preventing sort transitivity violations (#2246).
+                // finite values, preventing sort transitivity violations.
                 indices.sort_by(|&a, &b| sort_scores[a].total_cmp(&sort_scores[b]));
             }
             TreeTraversal::BreadthFirst => {
                 // Descending: highest score first (popped first by queue).
-                // Uses total_cmp for deterministic NaN handling (#2246).
+                // Uses total_cmp for deterministic NaN handling.
                 indices.sort_by(|&a, &b| sort_scores[b].total_cmp(&sort_scores[a]));
             }
         }
@@ -63,11 +63,11 @@ impl DomainList {
     ///
     /// Delegates to `BetaCrownConfig::domain_priority_for_mode` so the
     /// DomainList frontier uses the exact same priority contract (including
-    /// NaN rejection) as the CPU heap path (#4406).
+    /// NaN rejection) as the CPU heap path.
     ///
     /// Keeping the DomainList queue on the same priority contract as the
     /// CPU heap avoids GPU-BaB exploring a different frontier after each
-    /// periodic re-sort (#3870).
+    /// periodic re-sort.
     pub fn sort_by_domain_priority(&mut self, verify_upper_bound: bool) -> Result<()> {
         if self.grouped.is_some() && verify_upper_bound {
             return Err(ny_core::NyError::InvalidSpec(
@@ -84,7 +84,7 @@ impl DomainList {
         }
         // Derive sort scores from DomainMetadata via the shared helper,
         // which rejects NaN bounds with an explicit error rather than
-        // allowing silent NaN propagation through the sort (#4406).
+        // allowing silent NaN propagation through the sort.
         // Metadata stays aligned with domain storage through the same
         // keep_mask contract that add() and reorder() maintain.
         let sort_scores: Vec<f32> = self

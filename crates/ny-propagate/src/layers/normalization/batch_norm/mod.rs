@@ -13,4 +13,4 @@ mod patches;
 mod tests;
 mod types;
 
-pub use types::{BatchNormChannelAxisHint, BatchNormLayer};
+pub use types::{BatchNormChannelAxisHint, BatchNormExactAffine, BatchNormLayer};

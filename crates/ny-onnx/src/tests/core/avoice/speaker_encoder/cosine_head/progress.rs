@@ -97,7 +97,7 @@ fn run_speaker_cosine_distance_crown_bounds(
 
 /// Verify that the real ECAPA-TDNN speaker encoder + cosine-distance surface
 /// stays numerically well-defined and reports whether the current bound meets
-/// the `#3499` acceptance target or is still on the explicit vacuous fallback.
+/// the acceptance target or is still on the explicit vacuous fallback.
 ///
 /// The bound is computed analytically from separate CROWN passes on the
 /// dot-product and norm-squared graphs:
@@ -110,7 +110,7 @@ fn run_speaker_cosine_distance_crown_bounds(
 /// ~70s per component graph - enough to keep the total under the 600s cargo
 /// wrapper timeout under CPU contention from concurrent workers.
 ///
-/// `#3596` separately measures the real speaker scalar heads under explicit
+/// A separate diagnostic measures the real speaker scalar heads under explicit
 /// IBP-intermediate CROWN and currently proves that path runs without
 /// loosening the pure-IBP scalar bounds on this deep InstanceNorm-heavy DAG.
 /// This end-to-end progress test keeps using the spec-guided CROWN path with

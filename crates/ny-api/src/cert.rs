@@ -2778,6 +2778,6 @@ mod tests {
             .as_ref()
             .unwrap_or_else(|| panic!("expected Alethe pairs; note: {}", out.alethe_note));
         assert_eq!(alethe.len(), 1, "one pair per certificate conjunct");
-        assert!(!alethe[0].entailment.proof.is_empty());
+        assert_ne!(alethe[0].entailment.proof, "");
     }
 }

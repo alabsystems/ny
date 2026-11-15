@@ -12,7 +12,7 @@ use ny_propagate::layers::{MulConstantLayer, PowConstantLayer, ReduceSumLayer};
 use ny_propagate::{GraphNetwork, GraphNode, Layer};
 
 // ---------------------------------------------------------------------------
-// Real-weight cosine distance head (#3499 progress surface)
+// Real-weight cosine distance head (progress surface)
 // ---------------------------------------------------------------------------
 //
 // The cosine distance verification is split into two CROWN-friendly graphs

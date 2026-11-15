@@ -9,20 +9,27 @@
 //! but no Rust panic boundary can contain a native abort, segmentation fault,
 //! or hung FFI call. Running inference in a short-lived child process makes
 //! those failures observable as an ordinary exit status or timeout: the parent
-//! reports a shape-inference error and the loaders degrade to the same graceful
-//! no-inferred-shapes fallback used for any other inference failure.
+//! reports a shape-inference error and the loaders degrade to the same
+//! ORT-free static fallback (`static_infer`: exact rules only, every other
+//! tensor left unknown) used for any other inference failure.
 //!
-//! # Wire protocol (version 1)
+//! # Wire protocol (version 2)
 //!
 //! * Parent spawns `<exe> __shape-infer` with piped stdin/stdout/stderr.
 //! * Parent streams the raw ONNX model bytes to the child's stdin, then closes
 //!   it (EOF marks end of input).
 //! * Child runs the in-process shape inference and writes a single JSON
-//!   document to stdout: `{"version": 1, "shapes": {"tensor": [1, 3], ...}}`.
+//!   document to stdout: `{"version": 2, "shapes": {"tensor": [1, 3], ...}}`.
 //! * Exit status 0 with a parseable, version-matching document is the ONLY
 //!   success. Anything else — spawn failure, non-zero exit, signal/abort,
 //!   deadline expiry, unparseable output, version mismatch — is an inference
 //!   error. Shapes are never fabricated from a failed exchange.
+//!
+//! The CHILD settles every rank: `"t": []` in a version-2 document means ONNX
+//! Runtime proved `t` rank 0, and a tensor ORT could not type is absent
+//! (`super::resolve_zero_dim_ranks`). The parent only parses. Version 1 had
+//! the same format but recorded an untyped tensor as `[]` too, so a v1 child
+//! — an older binary serving the subcommand — is refused rather than trusted.
 
 use ny_core::{NyError, Result};
 use serde::{Deserialize, Serialize};
@@ -39,12 +46,14 @@ use std::time::{Duration, Instant};
 /// normal CLI parsing.
 pub const SHAPE_INFER_SUBCOMMAND: &str = "__shape-infer";
 
-/// Version tag carried in every response; bump on any wire-format change so a
-/// parent never misreads output from a mismatched child binary.
-const SHAPE_INFER_PROTOCOL_VERSION: u32 = 1;
+/// Version tag carried in every response; bump on any wire-format OR
+/// meaning change so a parent never misreads output from a mismatched child
+/// binary. 2: `[]` means proven rank 0 (the child runs the rank probe).
+const SHAPE_INFER_PROTOCOL_VERSION: u32 = 2;
 
 /// Parent-side deadline for the whole child exchange. The child enforces its
-/// own 30s in-process ORT deadline (`ORT_SHAPE_INFERENCE_TIMEOUT`) and exits
+/// own 30s in-process ORT deadline (`ORT_SHAPE_INFERENCE_TIMEOUT`, one budget
+/// shared by the first session and the rank probe) and exits
 /// cleanly when it fires, so this outer limit only backstops a child that is
 /// itself wedged (e.g. ORT hanging process teardown). It must stay comfortably
 /// above the child's internal deadline so the child's clean timeout path wins.
@@ -98,8 +107,8 @@ pub fn serve_shape_infer_request(input: &mut dyn Read, output: &mut dyn Write) -
 /// child process serving [`SHAPE_INFER_SUBCOMMAND`].
 ///
 /// Every failure mode returns `Err` (never panics, never fabricates shapes);
-/// the loaders' existing `unwrap_or_else` fallback turns that into the sound
-/// no-inferred-shapes path.
+/// the loaders' `unwrap_or_else` then switches to the ORT-free static
+/// fallback, which uses nothing from the failed exchange.
 pub(crate) fn infer_tensor_shapes_via_subprocess(
     exe: &Path,
     model_bytes: &[u8],

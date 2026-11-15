@@ -7,8 +7,6 @@
 //! Pure data transforms from [`VnnLibSpec`] to verification plan structures.
 //! Used by both `beta_crown verify` and `bench_acasxu` to eliminate semantic
 //! drift in constraint classification and objective construction.
-//!
-//! Part of #1881: CLI verification semantics unification.
 
 use ny_core::NyError;
 use ny_onnx::vnnlib::{OutputConstraint, VnnLibSpec};
@@ -80,8 +78,8 @@ pub(crate) struct RelationalObjective {
 /// both types so that mixed specs (relational + constant) are fully evaluated
 /// without silently dropping constant constraints.
 ///
-/// Fixes #1888: constant constraints were previously dropped when any
-/// relational constraint was present in the spec.
+/// Constant constraints were previously dropped when any relational
+/// constraint was present in the spec.
 #[derive(Debug, Clone)]
 pub(crate) enum ConstraintObjective {
     /// Relational constraint: Y_i op Y_j encoded as spec_coeffs, threshold = 0.
@@ -180,7 +178,7 @@ pub(crate) fn extract_constant_params(vnnlib: &VnnLibSpec) -> Option<ConstantCon
     vnnlib.output_constraints.iter().find_map(|c| match c {
         OutputConstraint::GreaterEqConst(i, val) | OutputConstraint::GreaterThanConst(i, val) => {
             // Property: Y_i >= c (unsafe). Standard verification proves upper(Y_i) < threshold.
-            // Round DOWN so threshold <= c → verified upper(Y_i) is still < c. (#3462)
+            // Round DOWN so threshold <= c → verified upper(Y_i) is still < c.
             Some(ConstantConstraintParams {
                 threshold: ny_core::f64_to_f32_down(*val),
                 verify_upper: true,
@@ -189,7 +187,7 @@ pub(crate) fn extract_constant_params(vnnlib: &VnnLibSpec) -> Option<ConstantCon
         }
         OutputConstraint::LessEqConst(i, val) | OutputConstraint::LessThanConst(i, val) => {
             // Property: Y_i <= c (unsafe). Standard verification proves lower(Y_i) > threshold.
-            // Round UP so threshold >= c → verified lower(Y_i) is still > c. (#3462)
+            // Round UP so threshold >= c → verified lower(Y_i) is still > c.
             Some(ConstantConstraintParams {
                 threshold: ny_core::f64_to_f32_up(*val),
                 verify_upper: false,
@@ -205,8 +203,8 @@ pub(crate) fn extract_constant_params(vnnlib: &VnnLibSpec) -> Option<ConstantCon
 /// Unlike [`extract_constant_params`] which returns only the first constant,
 /// this returns parameters for every constant constraint in the spec.
 ///
-/// Fixes #1889: multi-constant specs previously had all but the first constant
-/// silently dropped. Production code now routes multi-constant specs through
+/// Multi-constant specs previously had all but the first constant silently
+/// dropped. Production code now routes multi-constant specs through
 /// the per-constraint loop via `build_constraint_objective`, but this function
 /// is retained for test validation and potential future callers.
 #[cfg(test)]
@@ -256,9 +254,6 @@ fn constant_params_from_constraint(
 /// this always returns `Some(ConstraintObjective)` for valid constraints.
 /// This ensures constant constraints are never silently skipped in
 /// per-constraint verification loops.
-///
-/// Fixes #1888: mixed relational+constant specs now have all constraints
-/// represented in the verification loop.
 ///
 /// # Errors
 ///
@@ -341,7 +336,7 @@ pub(crate) fn build_constraint_objective(
 ///
 /// # Errors
 ///
-/// Returns `NyError::InvalidSpec` if any output index >= `num_outputs`. (#1886)
+/// Returns `NyError::InvalidSpec` if any output index >= `num_outputs`.
 pub(crate) fn build_relational_objective(
     constraint: &OutputConstraint,
     num_outputs: usize,
@@ -392,13 +387,13 @@ pub(crate) fn build_relational_objective(
 /// This replaces the inline `objectives: Vec<Vec<f32>>` construction in
 /// `verify_graph_relational` (verify.rs lines 317-335).
 ///
-/// Fixes #1888: previously filtered out constant constraints via
+/// The inline construction previously filtered out constant constraints via
 /// `build_relational_objective` returning None.
 ///
 /// # Errors
 ///
 /// Propagates `NyError::InvalidSpec` from `build_constraint_objective` if
-/// any constraint references out-of-range output indices. (#1886)
+/// any constraint references out-of-range output indices.
 pub(crate) fn build_multi_objectives(
     vnnlib: &VnnLibSpec,
 ) -> ny_core::Result<(Vec<Vec<f32>>, Vec<f32>)> {
@@ -417,8 +412,6 @@ pub(crate) fn build_multi_objectives(
 /// Flattens all clause rows into a single objectives/thresholds surface while
 /// preserving clause boundaries in `clause_sizes`. Matches the reference's
 /// `or_spec_size` contract (`specifications.py:298-339`).
-///
-/// Part of #3740 Packet B.
 pub(crate) struct GroupedObjectivePlan {
     pub(crate) objectives: Vec<Vec<f32>>,
     pub(crate) thresholds: Vec<f32>,
@@ -434,8 +427,6 @@ pub(crate) struct GroupedObjectivePlan {
 ///
 /// Uses `build_constraint_objective(...)` for every row so constant-vs-relational
 /// semantics stay aligned with the existing CLI planner.
-///
-/// Part of #3740 Packet B.
 pub(crate) fn build_grouped_disjunctive_objectives(
     vnnlib: &VnnLibSpec,
 ) -> ny_core::Result<GroupedObjectivePlan> {
@@ -631,7 +622,7 @@ mod tests {
             .is_none());
     }
 
-    /// #1886: Out-of-range index in LessEq must return error, not silently mask.
+    /// Out-of-range index in LessEq must return error, not silently mask.
     #[test]
     fn test_build_relational_objective_out_of_range_less_eq_1886() {
         let constraint = OutputConstraint::LessEq(1, 5); // Y_5 with only 5 outputs (0-4)
@@ -645,7 +636,7 @@ mod tests {
         );
     }
 
-    /// #1886: Out-of-range index in GreaterEq must return error, not silently mask.
+    /// Out-of-range index in GreaterEq must return error, not silently mask.
     #[test]
     fn test_build_relational_objective_out_of_range_greater_eq_1886() {
         let constraint = OutputConstraint::GreaterEq(10, 0); // Y_10 with only 3 outputs
@@ -661,7 +652,7 @@ mod tests {
         );
     }
 
-    /// #1886: Both indices out of range produces error.
+    /// Both indices out of range produces error.
     #[test]
     fn test_build_relational_objective_both_indices_out_of_range_1886() {
         let constraint = OutputConstraint::LessThan(7, 8); // both out of range for 5 outputs
@@ -678,7 +669,7 @@ mod tests {
         );
     }
 
-    /// #1888: build_multi_objectives now includes constant constraints.
+    /// build_multi_objectives now includes constant constraints.
     #[test]
     fn test_build_multi_objectives_includes_constants_1888() {
         let spec = make_spec(
@@ -708,7 +699,7 @@ mod tests {
         );
     }
 
-    /// #1886: build_multi_objectives propagates error from invalid indices.
+    /// build_multi_objectives propagates error from invalid indices.
     #[test]
     fn test_build_multi_objectives_invalid_index_1886() {
         let spec = make_spec(
@@ -730,7 +721,7 @@ mod tests {
         );
     }
 
-    /// #1889: extract_all_constant_params returns all constants, not just first.
+    /// extract_all_constant_params returns all constants, not just first.
     #[test]
     fn test_extract_all_constant_params_multi_1889() {
         let spec = make_spec(
@@ -749,7 +740,7 @@ mod tests {
         assert!(!params[1].verify_upper);
     }
 
-    /// #1889: extract_all_constant_params returns empty for relational-only.
+    /// extract_all_constant_params returns empty for relational-only.
     #[test]
     fn test_extract_all_constant_params_relational_only_1889() {
         let spec = make_spec(
@@ -763,7 +754,7 @@ mod tests {
         assert!(params.is_empty());
     }
 
-    /// #1888: build_constraint_objective handles relational.
+    /// build_constraint_objective handles relational.
     #[test]
     fn test_build_constraint_objective_relational_1888() {
         let constraint = OutputConstraint::LessEq(1, 3);
@@ -773,7 +764,7 @@ mod tests {
         assert!((obj.threshold()).abs() < 1e-6);
     }
 
-    /// #1888: build_constraint_objective handles constant (upper bound).
+    /// build_constraint_objective handles constant (upper bound).
     /// GreaterEqConst(2, 3.99): unsafe if Y_2 >= 3.99.
     /// Prove violation: -Y_2 > -3.99 → spec[2]=-1.0, threshold=-3.99.
     #[test]
@@ -785,7 +776,7 @@ mod tests {
         assert!((obj.threshold() - (-3.99)).abs() < 1e-4);
     }
 
-    /// #1888: build_constraint_objective handles constant (lower bound).
+    /// build_constraint_objective handles constant (lower bound).
     /// LessEqConst(1, 5.0): unsafe if Y_1 <= 5.0.
     /// Prove violation: Y_1 > 5.0 → spec[1]=1.0, threshold=5.0.
     #[test]
@@ -797,7 +788,7 @@ mod tests {
         assert!((obj.threshold() - 5.0).abs() < 1e-4);
     }
 
-    /// #1888: build_constraint_objective rejects out-of-range constant index.
+    /// build_constraint_objective rejects out-of-range constant index.
     #[test]
     fn test_build_constraint_objective_constant_out_of_range_1888() {
         let constraint = OutputConstraint::GreaterEqConst(5, 1.0);
@@ -919,7 +910,6 @@ mod tests {
 
     /// Grouped planner preserves clause boundaries as clause_sizes.
     /// Two clauses with different widths (2, 1): clause_sizes = [2, 1].
-    /// Part of #3740 Packet B.
     #[test]
     fn test_build_grouped_disjunctive_objectives_preserves_clause_sizes_3740() {
         let clause0 = vec![
@@ -949,7 +939,6 @@ mod tests {
 
     /// Grouped planner flattens rows in clause order: clause 0 rows first,
     /// then clause 1 rows, matching the reference's or_spec_size contract.
-    /// Part of #3740 Packet B.
     #[test]
     fn test_build_grouped_disjunctive_objectives_flattens_clause_order_3740() {
         // Clause 0: Y_0 <= Y_1 (prove Y_1 - Y_0 > 0)
@@ -987,7 +976,6 @@ mod tests {
 
     /// Fallback: when output_constraint_clauses is empty, treat output_constraints
     /// as a single clause for backward compatibility.
-    /// Part of #3740 Packet B.
     #[test]
     fn test_build_grouped_disjunctive_objectives_fallback_single_clause_3740() {
         let spec = VnnLibSpec {

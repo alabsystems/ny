@@ -179,7 +179,7 @@ fn test_ibp_constant_input_gives_beta() {
     // Tolerance 1e-3: directed rounding on mean (next_down_f32/next_up_f32) creates
     // tiny centered intervals even for point inputs, which propagate through
     // variance/std to widen output bounds by ~ny * ULP_effect. This is expected
-    // and correct — soundness requires this widening. Part of #3324.
+    // and correct — soundness requires this widening.
     for t in 0..3 {
         assert!(
             (out.lower()[[0, t]] - 10.0).abs() < 1e-3,
@@ -210,7 +210,7 @@ fn test_ibp_forward_mode_tighter() {
     // 1. Center-point variance is large (σ_min close to σ_center)
     // 2. Perturbation radius is small (second-order remainder < first-order)
     //
-    // After #3159 fix (std_min via interval arithmetic instead of center-point std),
+    // Since std_min uses interval arithmetic instead of the center-point std,
     // the second-order remainder is more conservative. With small T and moderate
     // perturbation (original T=4, r=0.3), second-order dominates and forward mode
     // can be wider. Use high-variance inputs with small perturbation where Jacobian-
@@ -355,9 +355,9 @@ fn test_crown_cut_mode_returns_identity() {
     assert_eq!(result.lower_a(), bounds.lower_a());
 }
 
-// ── Forward-mode soundness regression tests (#3098) ──────────────────
+// ── Forward-mode soundness regression tests ──────────────────
 
-/// Regression test for #3098: verifies that forward-mode IBP produces sound bounds.
+/// Regression test: verifies that forward-mode IBP produces sound bounds.
 ///
 /// The old formula `output_radius = sensitivity * (rv + max_radius / time_len)` was
 /// unsound — this test generates random inputs within bounds and verifies that all
@@ -442,7 +442,7 @@ fn test_ibp_forward_mode_soundness_issue_3098_wide_perturbation() {
     }
 }
 
-/// Regression test for #3098: forward-mode soundness with custom ny/beta.
+/// Regression test: forward-mode soundness with custom ny/beta.
 ///
 /// Uses large ny values and asymmetric perturbation to stress-test the
 /// Jacobian-based propagation.
@@ -524,9 +524,9 @@ fn test_ibp_forward_mode_soundness_custom_ny_3098() {
     }
 }
 
-// ── f64 precision and directed rounding regression tests (#3324) ─────
+// ── f64 precision and directed rounding regression tests ─────
 
-/// Regression test for #3324: InstanceNorm conservative IBP with large T dimension.
+/// Regression test: InstanceNorm conservative IBP with large T dimension.
 ///
 /// With T=768 (typical transformer hidden dim), f32 accumulation of mean loses
 /// ~log2(768)≈10 bits of precision. Values near the mean trigger catastrophic
@@ -608,10 +608,9 @@ fn test_ibp_conservative_large_t_f64_precision_3324() {
     }
 }
 
-// ── NormLayer trait input validation tests (#3339) ───────────────────
+// ── NormLayer trait input validation tests ───────────────────
 
 /// Verify that eval() rejects input whose length is not divisible by num_channels.
-/// Part of #3339.
 #[test]
 fn test_normlayer_eval_rejects_indivisible_input() {
     use super::super::trait_norm::NormLayer;
@@ -626,7 +625,6 @@ fn test_normlayer_eval_rejects_indivisible_input() {
 }
 
 /// Verify that jacobian() rejects input whose length is not divisible by num_channels.
-/// Part of #3339.
 #[test]
 fn test_normlayer_jacobian_rejects_indivisible_input() {
     use super::super::trait_norm::NormLayer;
@@ -639,7 +637,7 @@ fn test_normlayer_jacobian_rejects_indivisible_input() {
     );
 }
 
-/// Regression test for #3324: InstanceNorm forward-mode IBP with large T dimension.
+/// Regression test: InstanceNorm forward-mode IBP with large T dimension.
 ///
 /// Tests that the f64-hardened forward-mode path produces sound bounds with T=768.
 /// The Jacobian computation (delta_st - 1/T - z_s*z_t/T) involves cancellation of

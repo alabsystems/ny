@@ -5,20 +5,99 @@
 //! IBP and `BoundPropagation` trait wiring for BatchNorm.
 
 use ndarray::{ArrayD, IxDyn};
-use ny_core::{NyError, Result};
-use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor, RepairStrategy};
+use ny_core::{
+    dd::{next_down_f64, next_up_f64, two_sum},
+    f32_to_f64_exact, f64_to_f32_down, f64_to_f32_up, require_f64_interval_proof_environment,
+    NyError, Result,
+};
+use ny_tensor::{BoundedTensor, RepairStrategy};
 use std::borrow::Cow;
 
-use super::math::detect_input_layout;
+use super::math::{detect_input_layout, nonnegative_add_up, nonnegative_mul_up};
 use super::types::BatchNormLayer;
-use crate::bounds::safe_mul_for_bounds;
+use crate::bounds::safe_mul_for_bounds_f64;
 use crate::layers::common::BoundPropagation;
 use crate::LinearBounds;
+
+/// Add two binary64 values toward negative infinity.
+///
+/// Every finite BatchNorm product below is exact in binary64 because both
+/// operands are binary32 (at most 48 significant product bits). `two_sum`
+/// therefore needs to direct only the subsequent addition/subtraction.
+#[inline]
+fn add_down_f64(left: f64, right: f64) -> f64 {
+    if !left.is_finite() || !right.is_finite() {
+        let sum = left + right;
+        return if sum.is_nan() { f64::NEG_INFINITY } else { sum };
+    }
+    let (sum, residual) = two_sum(left, right);
+    if residual < 0.0 {
+        next_down_f64(sum)
+    } else {
+        sum
+    }
+}
+
+/// Upper-bound mirror of [`add_down_f64`].
+#[inline]
+fn add_up_f64(left: f64, right: f64) -> f64 {
+    if !left.is_finite() || !right.is_finite() {
+        let sum = left + right;
+        return if sum.is_nan() { f64::INFINITY } else { sum };
+    }
+    let (sum, residual) = two_sum(left, right);
+    if residual > 0.0 {
+        next_up_f64(sum)
+    } else {
+        sum
+    }
+}
+
+/// Certified effect of the stored scale/bias radii over one input interval.
+#[inline]
+fn affine_model_error(x_magnitude: f32, scale_error: f32, bias_error: f32) -> f64 {
+    nonnegative_add_up(
+        nonnegative_mul_up(f32_to_f64_exact(x_magnitude), f32_to_f64_exact(scale_error)),
+        f32_to_f64_exact(bias_error),
+    )
+}
+
+/// Maximum endpoint magnitude by representation, independent of DAZ.
+#[inline]
+fn max_magnitude(left: f32, right: f32) -> f32 {
+    let left = left.to_bits() & 0x7fff_ffff;
+    let right = right.to_bits() & 0x7fff_ffff;
+    f32::from_bits(left.max(right))
+}
+
+/// Evaluate the stored affine in binary64 and publish one outward endpoint.
+///
+/// This avoids using `fl32(fl32(x*s)+b)` as the center. A single ULP at the
+/// post-cancellation result cannot cover multiplication error incurred at the
+/// much larger `x*s` magnitude. Representation-exact binary32 decoding also
+/// prevents DAZ from erasing a subnormal input or coefficient.
+#[inline]
+fn affine_endpoint(operand: f32, scale: f32, bias: f32, model_error: f64, lower: bool) -> f32 {
+    let product = safe_mul_for_bounds_f64(f32_to_f64_exact(operand), f32_to_f64_exact(scale));
+    let bias = f32_to_f64_exact(bias);
+    if lower {
+        let center = add_down_f64(product, bias);
+        f64_to_f32_down(add_down_f64(center, -model_error))
+    } else {
+        let center = add_up_f64(product, bias);
+        f64_to_f32_up(add_up_f64(center, model_error))
+    }
+}
 
 impl BoundPropagation for BatchNormLayer {
     #[inline]
     fn propagate_ibp(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
         self.validate_affine_parameters()?;
+        // `TwoSum` residual direction and adjacent-f64 publication are proof
+        // arithmetic only under the probed RN/gradual binary64 environment.
+        // `from_scale_bias` does not pass through `BatchNormLayer::new`, so the
+        // gate belongs at this consumer as well as at raw-model construction.
+        require_f64_interval_proof_environment()?;
         let input_shape = input.shape();
         let layout =
             detect_input_layout(input_shape, self.num_channels, None, self.channel_axis_hint)?;
@@ -38,38 +117,28 @@ impl BoundPropagation for BatchNormLayer {
             let s = self.scale[[channel_idx]];
             let b = self.bias[[channel_idx]];
 
-            // Outward widening for the f32 rounding error baked into the
-            // precomputed `scale`/`bias`. The stored coefficients differ from the
-            // exact real affine by up to `scale_err`/`bias_err`; over this input
-            // element the worst-case effect on the value is
-            // `max(|l|,|u|)·scale_err + bias_err`. Folding it outward keeps the
-            // bound sound against the *real* batchnorm, not just the f32-rounded
-            // affine — a single final next_down/next_up only covers the evaluation
-            // rounding, not the ~ulp(scale)·|x| precompute error that can reach
-            // several ulps at large magnitudes (#batchnorm-ibp-directed-rounding).
-            // safe_mul keeps 0·∞ = 0 for degenerate channels (an ∞ scale_err with
-            // a zero-magnitude input contributes nothing; an ∞ with nonzero |x|
-            // genuinely widens to ±∞, which is sound).
+            // The stored affine differs from exact-real BatchNorm by at most
+            // `max(|l|,|u|) * scale_err + bias_err`. Form that radius with
+            // upward binary64 operations, then evaluate the stored affine with
+            // directed binary64 endpoints. This covers both precomputation and
+            // evaluation without relying on a result-scaled f32 ULP.
             let se = self.scale_err[[channel_idx]];
             let be = self.bias_err[[channel_idx]];
-            let xmag = l.abs().max(u.abs());
-            let widen = safe_mul_for_bounds(xmag, se) + be;
+            let xmag = max_magnitude(l, u);
+            let model_error = affine_model_error(xmag, se, be);
 
-            // Directed rounding on final bounds. safe_mul_for_bounds keeps 0*Inf=0
-            // (not NaN) for degenerate var+eps==0 channels (Inf scale): without it,
-            // a finite-zero input bound times the Inf scale poisons the bound with
-            // NaN, which the downstream new_repaired must then catch. Folding it here
-            // keeps NaN out of the arithmetic entirely (#3344, batchnorm-nan).
-            if s >= 0.0 {
-                out_lower[idx.clone()] = next_down_f32(safe_mul_for_bounds(l, s) + b - widen);
-                out_upper[idx] = next_up_f32(safe_mul_for_bounds(u, s) + b + widen);
+            // Read the sign bit rather than comparing in floating point: DAZ
+            // may otherwise reinterpret a negative-subnormal scale as -0.
+            let (lower_operand, upper_operand) = if s.to_bits() >> 31 == 0 {
+                (l, u)
             } else {
-                out_lower[idx.clone()] = next_down_f32(safe_mul_for_bounds(u, s) + b - widen);
-                out_upper[idx] = next_up_f32(safe_mul_for_bounds(l, s) + b + widen);
-            }
+                (u, l)
+            };
+            out_lower[idx.clone()] = affine_endpoint(lower_operand, s, b, model_error, true);
+            out_upper[idx] = affine_endpoint(upper_operand, s, b, model_error, false);
         }
 
-        // Repair non-finite outputs for consistency with linear IBP (#3030).
+        // Repair non-finite outputs for consistency with linear IBP.
         BoundedTensor::new_repaired(out_lower, out_upper, RepairStrategy::Conservative)
     }
 
@@ -95,3 +164,7 @@ impl BoundPropagation for BatchNormLayer {
         BatchNormLayer::propagate_linear_with_bounds(self, bounds, pre_activation)
     }
 }
+
+#[cfg(test)]
+#[path = "ibp_certificate_tests.rs"]
+mod certificate_tests;

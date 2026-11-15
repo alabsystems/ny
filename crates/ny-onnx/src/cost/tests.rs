@@ -641,13 +641,11 @@ fn test_ceil_time_ns_conservative_for_large_bytes_counter_3498() {
 }
 
 // ========================================================================
-// Real avoice timing smoke tests (#3498)
+// Real avoice timing smoke tests
 //
 // Exercise the timing estimator on shape-specialized variants of the real
-// avoice ONNX exports from #3554. These are deterministic static-cost
-// smoke tests — no runtime benchmarking, no Metal calibration claims.
-//
-// Reference: designs/2026-03-12-issue-3498-real-export-timing-smoke.md
+// avoice ONNX exports. These are deterministic static-cost smoke tests — no
+// runtime benchmarking, no Metal calibration claims.
 // ========================================================================
 
 /// Replace all dynamic dimensions in the protobuf with `default_value`.

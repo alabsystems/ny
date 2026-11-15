@@ -138,7 +138,9 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     log.info("Binary: %s (exists=%s)", NY_BINARY, NY_BINARY.exists())
     if not NY_BINARY.exists():
-        log.error("ny binary not found. Run: cargo build -p ny-cli --release")
+        log.error(
+            "ny binary not found. Run: targo --unverified build -p ny-cli --release"
+        )
         sys.exit(1)
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)

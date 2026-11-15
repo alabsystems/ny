@@ -34,7 +34,7 @@ fn test_new_explicit_shape_overrides() {
 fn test_new_no_indices_empty_shape() {
     let layer = GatherLayer::new(0, None, vec![]);
     assert!(layer.indices.is_none());
-    assert!(layer.indices_shape.is_empty());
+    assert_eq!((layer.indices_shape).len(), 0);
 }
 
 // =========================================================================
@@ -256,7 +256,7 @@ fn test_propagate_linear_dynamic_indices_returns_error() {
 }
 
 // =========================================================================
-// CROWN backward propagation (#3400)
+// CROWN backward propagation
 // =========================================================================
 
 #[ntest::timeout(5000)]

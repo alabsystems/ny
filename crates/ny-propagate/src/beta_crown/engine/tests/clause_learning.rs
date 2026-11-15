@@ -155,7 +155,7 @@ fn test_records_verified_domain_then_prunes_only_true_supersets() {
         THRESHOLD,
         &mut state,
     );
-    assert!(to_process.is_empty());
+    assert_eq!((to_process).len(), 0);
     assert_eq!(state.domains_verified, 1);
     assert_eq!(
         state.clause_store.len(),
@@ -243,7 +243,7 @@ fn test_child_verified_close_records_clause() {
         THRESHOLD,
         &mut state,
     );
-    assert!(to_process.is_empty());
+    assert_eq!((to_process).len(), 0);
     assert_eq!(state.domains_clause_pruned, 1);
 }
 
@@ -263,7 +263,7 @@ fn test_disabled_store_never_records_nor_prunes() {
         THRESHOLD,
         &mut state,
     );
-    assert!(to_process.is_empty());
+    assert_eq!((to_process).len(), 0);
     assert_eq!(state.clause_store.len(), 0, "gate off: nothing recorded");
 
     let superset = [(0, 0, true), (0, 1, true), (1, 0, false)];
@@ -298,7 +298,7 @@ fn test_input_split_domains_neither_recorded_nor_pruned() {
         THRESHOLD,
         &mut state,
     );
-    assert!(to_process.is_empty());
+    assert_eq!((to_process).len(), 0);
     assert_eq!(state.domains_verified, 1);
     assert_eq!(
         state.clause_store.len(),
@@ -313,7 +313,7 @@ fn test_input_split_domains_neither_recorded_nor_pruned() {
         THRESHOLD,
         &mut state,
     );
-    assert!(to_process.is_empty());
+    assert_eq!((to_process).len(), 0);
     assert_eq!(state.clause_store.len(), 1);
 
     let superset = [(0, 0, true), (0, 1, true), (1, 0, false)];

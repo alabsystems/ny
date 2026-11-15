@@ -91,7 +91,7 @@ impl NNetNetwork {
     }
 
     /// Deprecated compatibility alias for [`normalized_input_bounds`](Self::normalized_input_bounds).
-    #[deprecated(note = "use normalized_input_bounds")]
+    #[deprecated(since = "0.1.0", note = "use normalized_input_bounds")]
     pub fn get_normalized_input_bounds(&self) -> (Vec<f32>, Vec<f32>) {
         self.normalized_input_bounds()
     }

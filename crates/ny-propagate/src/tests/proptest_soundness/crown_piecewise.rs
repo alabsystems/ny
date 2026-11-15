@@ -11,13 +11,13 @@
 //!
 //! **PReLU**: CROWN is sound — proptest passes across negative and positive slopes.
 //!
-//! **Clip**: CROWN is sound — 6-case analytical relaxation. Fixed in #1714.
+//! **Clip**: CROWN is sound — 6-case analytical relaxation.
 //!
-//! **HardSigmoid**: CROWN is sound — 6-case analytical relaxation. Fixed in #1714.
+//! **HardSigmoid**: CROWN is sound — 6-case analytical relaxation.
 //!
-//! **Softsign**: CROWN is sound — analytical tangent-line relaxation. Fixed in #1715.
+//! **Softsign**: CROWN is sound — analytical tangent-line relaxation.
 //!
-//! **HardSwish**: CROWN is sound — analytical max-deviation relaxation. Fixed in #1715.
+//! **HardSwish**: CROWN is sound — analytical max-deviation relaxation.
 //!
 //! ## IBP soundness status
 //!
@@ -83,7 +83,6 @@ proptest! {
 
     /// Clip(x, 0, 1) = clamp(x, 0, 1). Piecewise linear with two breakpoints.
     /// Fixed by 6-case analytical relaxation per BoundHardTanh pattern.
-    /// Reference: designs/2026-02-08-piecewise-crown-relaxation-fixes.md Part 1
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_clip_crown(l in -10.0f32..10.0, delta in 0.0f32..20.0) {
@@ -116,7 +115,6 @@ proptest! {
 
     /// HardSigmoid(x) = clamp(0.2*x + 0.5, 0, 1). Piecewise linear.
     /// Fixed by 6-case analytical relaxation per BoundHardTanh pattern.
-    /// Reference: designs/2026-02-08-piecewise-crown-relaxation-fixes.md Part 2
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_hardsigmoid_crown(l in -10.0f32..10.0, delta in 0.0f32..20.0) {
@@ -149,7 +147,6 @@ proptest! {
 
     /// Softsign(x) = x / (1 + |x|). S-shaped: convex for x<0, concave for x>0.
     /// Analytical CROWN relaxation using tangent-line approach per BoundSShaped.
-    /// Reference: designs/2026-02-08-piecewise-crown-relaxation-fixes.md Part 3
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_softsign_crown(l in -20.0f32..20.0, delta in 0.0f32..40.0) {
@@ -182,7 +179,6 @@ proptest! {
 
     /// HardSwish(x) = x * clamp(x/6 + 0.5, 0, 1). Non-monotonic (min at x≈-1.5).
     /// Analytical max-deviation relaxation for boundary-crossing intervals.
-    /// Reference: designs/2026-02-08-piecewise-crown-relaxation-fixes.md Part 4
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_hardswish_crown(l in -10.0f32..10.0, delta in 0.0f32..20.0) {
@@ -455,7 +451,7 @@ proptest! {
     /// PReLU IBP with negative slopes (alpha < 0): V-shaped function.
     /// PReLU(x) = x if x >= 0, slope*x if x < 0. With slope < 0, the negative
     /// branch reflects upward, creating a V-shape with minimum at x=0.
-    /// Part of #1914: verifies the IBP crossing fix for negative slopes.
+    /// Verifies the IBP crossing fix for negative slopes.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_prelu_ibp_negative_slope(
@@ -493,7 +489,6 @@ proptest! {
 
     /// PReLU IBP with alpha=0 boundary case: reduces to ReLU.
     /// PReLU(x, 0) = x if x >= 0, 0 if x < 0. This is exactly ReLU.
-    /// Part of #1914.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_prelu_ibp_alpha_zero(l in -10.0f32..10.0, delta in 0.0f32..20.0) {
@@ -533,14 +528,12 @@ proptest! {
 // Each test pins concrete inputs where the old chord-based CROWN relaxation
 // violated the envelope condition, and asserts the fixed analytical relaxation
 // satisfies lower <= f(x) <= upper on them. A failure here is a soundness
-// REGRESSION. See #1714, #1715 and
-// designs/2026-02-08-piecewise-crown-relaxation-fixes.md.
+// REGRESSION.
 // =============================================================================
 
 /// Clip CROWN: regression test for boundary-crossing soundness.
 /// Previously the chord was used for both upper and lower bounds, causing
 /// upper < f(x) in the identity region. Fixed by 6-case analytical relaxation.
-/// Reference: designs/2026-02-08-piecewise-crown-relaxation-fixes.md Part 1
 #[ntest::timeout(10000)]
 #[test]
 fn regression_clip_crown_unsound_crossing() {
@@ -576,7 +569,6 @@ fn regression_clip_crown_unsound_crossing() {
 /// HardSigmoid CROWN: regression test for boundary-crossing soundness.
 /// Previously the chord was used for both upper and lower bounds, causing
 /// upper < f(x) in the linear region. Fixed by 6-case analytical relaxation.
-/// Reference: designs/2026-02-08-piecewise-crown-relaxation-fixes.md Part 2
 #[ntest::timeout(10000)]
 #[test]
 fn regression_hardsigmoid_crown_unsound_crossing() {
@@ -613,7 +605,6 @@ fn regression_hardsigmoid_crown_unsound_crossing() {
 /// Previously the chord sandwich with 50-point sampling missed the max
 /// deviation for wide asymmetric intervals. Fixed by analytical tangent-line
 /// relaxation per BoundSShaped.
-/// Reference: designs/2026-02-08-piecewise-crown-relaxation-fixes.md Part 3
 #[ntest::timeout(10000)]
 #[test]
 fn regression_softsign_crown_unsound_wide() {
@@ -656,7 +647,6 @@ fn regression_softsign_crown_unsound_wide() {
 /// HardSwish CROWN: regression test for boundary-crossing soundness.
 /// Previously the chord was used as lower bound, overestimating at the
 /// boundary crossing. Fixed by analytical max-deviation relaxation.
-/// Reference: designs/2026-02-08-piecewise-crown-relaxation-fixes.md Part 4
 #[ntest::timeout(10000)]
 #[test]
 fn regression_hardswish_crown_unsound_crossing() {
@@ -690,7 +680,7 @@ fn regression_hardswish_crown_unsound_crossing() {
 }
 
 // =============================================================================
-// REGRESSION: LeakyReLU/PReLU alpha > 1 (#1803, P264 finding, W1 794 fix)
+// REGRESSION: LeakyReLU/PReLU alpha > 1 (P264 finding, W1 794 fix)
 //
 // For alpha > 1, the piecewise kink is concave (slope decreases: alpha → 1).
 // Original code assumed convex kink (alpha < 1), causing:
@@ -709,7 +699,7 @@ fn regression_hardswish_crown_unsound_crossing() {
 #[ntest::timeout(10000)]
 #[test]
 fn regression_prelu_alpha_gt_one_infinite_upper() {
-    // Updated for #2977: domain_guard rejects non-finite pre-activation.
+    // domain_guard rejects non-finite pre-activation.
     let alpha = 2.0_f32;
     let layer = PReluLayer::from_scalar(alpha);
     let identity = LinearBounds::identity(1);

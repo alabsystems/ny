@@ -371,14 +371,14 @@ fn test_supports_batched_crown_includes_expected_layers() {
     assert_layer_supports_batched_crown(flatten(), true);
     assert_layer_supports_batched_crown(transpose_l(), true);
     assert_layer_supports_batched_crown(add_const(), true);
-    // Tile, Reduction, and Slice ops (#287)
+    // Tile, Reduction, and Slice ops
     assert_layer_supports_batched_crown(tile_l(), true);
     assert_layer_supports_batched_crown(slice_l(), true);
     assert_layer_supports_batched_crown(reduce_sum(), true);
     assert_layer_supports_batched_crown(reduce_mean(), true);
     assert_layer_supports_batched_crown(reduce_max(), true);
     assert_layer_supports_batched_crown(reduce_min(), true);
-    // BatchNorm: has batched CROWN dispatch + implementation (#3281)
+    // BatchNorm: has batched CROWN dispatch + implementation
     let bn = BatchNormLayer::from_scale_bias(
         ArrayD::from_elem(IxDyn(&[2]), 1.0_f32),
         ArrayD::from_elem(IxDyn(&[2]), 0.0_f32),
@@ -404,7 +404,7 @@ fn test_epsilon_expand_classifies_as_plain_unary() {
     // backward is bounds-free — it must not demand pre-activation tightening.
     assert!(!layer.is_elementwise_activation());
     assert!(!layer.requires_pre_activation_bounds());
-    assert!(layer.required_input_bound_indices().is_empty());
+    assert_eq!((layer.required_input_bound_indices()).len(), 0);
     // It rebuilds LinearBounds without the certified coefficient-error
     // matrices, so it must NOT claim to carry them (fail closed to IBP).
     assert!(!layer.propagates_coeff_err());

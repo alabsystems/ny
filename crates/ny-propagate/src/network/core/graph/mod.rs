@@ -80,11 +80,14 @@ pub(crate) use backward_helpers::{
 pub(crate) use crown_degradation_log::CrownDegradationLogReceipt;
 use crown_degradation_log::CrownDegradationLogScope;
 pub(crate) use fallback_reason::graph_crown_dispatch_fallback_reason;
-#[cfg(test)]
-pub(crate) use forward_linear::ForwardLinearCollectionRequestCounter;
+pub(crate) use forward_linear::forward_linear_cached_rate;
 pub use forward_linear::{
-    forward_linear_admission_record, forward_linear_measured_rate, ForwardLinearAdmissionRecord,
-    ForwardLinearRateObservation,
+    forward_linear_admission_record, forward_linear_measured_rate, set_forward_linear_f32_seam,
+    ForwardLinearAdmissionRecord, ForwardLinearRateObservation,
+};
+#[cfg(test)]
+pub(crate) use forward_linear::{
+    ForwardLinearCollectionRequestCounter, ForwardLinearRateAccessCounter,
 };
 pub use ibp::{ZonotopePropagationOptions, ZonotopeSoftmaxMode};
 pub use maxpool_relu::{VggMaxPoolRewriteMode, VggMaxPoolRewriteReport};
@@ -135,6 +138,19 @@ pub use softmax_complex::{SoftmaxComplexReport, SOFTMAX_COMPLEX_SHIFT_GUARD};
 pub(crate) struct ForwardLinearMapCache {
     pub(crate) fixed: std::sync::RwLock<Option<ForwardLinearCacheEntry>>,
     pub(crate) alpha: std::sync::RwLock<Option<ForwardLinearCacheEntry>>,
+    /// `#fl-map-lru`: bounded companion to `fixed`, consulted only on a `fixed`
+    /// miss. Capacity is `forward_linear::FL_MAP_LRU_CAP`; at 0 (the shipped
+    /// value) this vector is never read or written and the cache is exactly the
+    /// historical single slot.
+    ///
+    /// WHY A SECOND SLOT RATHER THAN WIDENING `fixed`: every existing call site
+    /// keeps its semantics untouched, so the disarmed path is bit-identical by
+    /// construction instead of by inspection.
+    ///
+    /// Soundness is inherited, not added: an entry is served ONLY on
+    /// `fingerprint.exact_match`, which pins the input box bit-exactly, so
+    /// holding more entries can never answer a different request.
+    pub(crate) fixed_lru: std::sync::RwLock<Vec<ForwardLinearCacheEntry>>,
     /// Memo for the forward-map alpha OPTIMIZER (#w4-root-alpha-opt), keyed by
     /// an exact canonical fingerprint of input shape/endpoints, spec bits,
     /// incumbent bounds, and policy. Stores the optimized per-node alphas plus
@@ -382,6 +398,25 @@ pub(crate) struct CrownIbpRuntimePolicy {
     pub(crate) chunk_wave_parallel_enabled: bool,
     pub(crate) patches_deadline_flat_bias_enabled: bool,
     pub(crate) honest_provenance_enabled: bool,
+    /// Request-scoped (`#cgan-collector-dense`, E5): the typed cGAN cascade
+    /// runs its conv backward walks in dense (matrix) mode — the sequential
+    /// shortcut is declined and `collector_patches_override` is cleared for
+    /// every target. Never derived from a lever; set only from
+    /// `CrownIbpCollectOptions::cgan_collector_dense` at the collection entry,
+    /// and part of the collection-cache fingerprint.
+    pub(crate) collector_dense_override: bool,
+    /// Request-scoped (`#cgan-unstable-rows`): inside a shrink-only typed cGAN
+    /// cascade, seed each demanded ReLU-preactivation target with only its
+    /// baseline-unstable rows. Never derived from a lever; set only from
+    /// `CrownIbpCollectOptions::cgan_unstable_rows` at the collection entry,
+    /// and part of the collection-cache fingerprint (a sparse-seeded map and a
+    /// full-width map for the same box are both sound and generally differ).
+    pub(crate) collector_unstable_rows: bool,
+    /// Companion ceiling for `collector_unstable_rows`, in PER MILLE of a
+    /// target's rows. 900 is abc's `minimum_sparsity` (0.9) and reproduces the
+    /// historical predicate exactly. Integer so this policy keeps `Eq` and the
+    /// cache fingerprint never compares floats.
+    pub(crate) collector_unstable_rows_max_permille: u16,
 }
 
 impl CrownIbpRuntimePolicy {
@@ -455,7 +490,55 @@ pub struct GraphNetwork {
     /// This is graph-local so clones and cache users cannot observe a
     /// process-global environment change halfway through verification.
     pub(crate) forward_linear_spec_alpha: bool,
-    /// Per-node CROWN-IBP time-budget policy overrides (#4413, #cgan-bn11-budget).
+    /// #fl-seq-no-transpose: admit the SEQUENTIAL forward-linear intermediate
+    /// reference on a Conv2d graph that has NO ConvTranspose2d.
+    ///
+    /// `should_collect_forward_linear_intermediate_reference` admits sequential
+    /// graphs only when they carry BOTH Conv2d and ConvTranspose2d. That clause
+    /// was written to target the cGAN image surface, and its own doc states the
+    /// soundness position plainly: "Tightening a reference bound is
+    /// sound-by-construction here: the value is an enclosure either way, and a
+    /// narrower enclosure can only remove spurious relaxations." So the
+    /// ConvTranspose requirement is SCOPING, not correctness — it avoids shapes
+    /// where the collector may fail closed.
+    ///
+    /// MEASURED 2026-09-14: `cGAN_imgSz32_nCh_3_upsample` builds with
+    /// Upsample+Conv and has no ConvTranspose at all, so it can never satisfy
+    /// the clause. At the official 1200 s budget it logs
+    /// `[cgan-root] DECLINED: ... forward_linear_reference=false` and the whole
+    /// typed cGAN root cascade is inert, making its timeout VOID rather than a
+    /// capability result. That row is 4.75 normalized points.
+    ///
+    /// Default FALSE: absent reproduces the shipped admission byte-identically.
+    pub(crate) forward_linear_sequential_without_conv_transpose: bool,
+    /// `#fl-s-shaped-untyped`: admit MONOTONE S-SHAPED nodes (Tanh, Sigmoid) on
+    /// the ORDINARY (untyped) forward-linear surface, not only through the typed
+    /// cGAN request.
+    ///
+    /// WHY. `GraphNetwork spec-CROWN` asks for forward-linear intermediates
+    /// through `collect_forward_linear_bounds_dag_cached`, which passes
+    /// `allow_typed_tanh = false`, so on a graph carrying Tanh/Sigmoid it refuses
+    /// and logs "forward-linear intermediates unavailable ... falling back
+    /// (fail-closed)". Measured on cgan's two open rows: the typed ROOT cascade
+    /// now completes (`mode=CganComplete`) while spec-CROWN still falls back five
+    /// times per run, so its spec-guided intermediates come from the weaker path
+    /// on exactly the rows that need them. Those rows are 4.75 points each.
+    ///
+    /// ⚠ NOT OBVIOUSLY POSITIVE, AND THE SIGN IS UNMEASURED. The fallback is
+    /// per-node CROWN-IBP, not plain IBP, and neither enclosure dominates the
+    /// other — so replacing it can LOOSEN spec-CROWN's intermediates as easily as
+    /// tighten them. This exists to be MEASURED, not to be promoted.
+    ///
+    /// ⚠ AND IT CAN EVICT THE ROOT MAP. The forward-linear `fixed` cache is a
+    /// SINGLE slot keyed on the input box. Today a per-domain untyped request on
+    /// such a graph FAILS at the allowlist and errors are never cached, so the
+    /// root map survives. Armed, those per-domain builds SUCCEED, each with a
+    /// different box, and overwrite the entry the root cascade paid for. Watch
+    /// for that in any measurement rather than assuming it away.
+    ///
+    /// Default FALSE: absent reproduces the shipped admission byte-identically.
+    pub(crate) forward_linear_s_shaped_untyped: bool,
+    /// Per-node CROWN-IBP time-budget policy overrides (#cgan-bn11-budget).
     /// Set from `BetaCrownConfig::crown_ibp_per_node_time_budget()` by the
     /// verifier (same plumbing pattern as `use_patches_mode`); carried by
     /// `Clone` so every configured graph copy inherits it. Default: all-`None`
@@ -480,6 +563,21 @@ pub struct GraphNetwork {
     /// the historical CROWN-IBP fallback. Both routes return certified
     /// enclosures; this flag controls only endgame cost versus tightness.
     pub(crate) forward_linear_deadline_fallback_to_ibp: bool,
+    /// #pwl-lookup (DARK, `bab.pwl_lookup_exact_range`): intersect the IBP box
+    /// of every ReLU lookup-table output (`SubConstant → ReLU → Linear(1×K)` or
+    /// `→ MulConstant → ReduceSum(-1)`) with the table's exact 1-D range. Set
+    /// from `BetaCrownConfig::pwl_lookup_exact_range` by the verifier; carried
+    /// by `Clone`. Default FALSE: every IBP entry point is byte-identical. See
+    /// `graph_alpha::bounds::pwl_lookup`.
+    pub(crate) pwl_lookup_armed: bool,
+    /// #vit-zono-root (DARK, `bab.vit_zono_root`): the resolved plan of the
+    /// certified forward-zonotope ROOT reference map
+    /// (`zono_core::vit_root`). Stamped by the CLI from the typed key and,
+    /// sticky-on, by `BetaCrownVerifier::configured_graph_for_crown`; carried
+    /// by `Clone`. `None` (the default, every shipped preset) keeps the alpha
+    /// reference collector on its historical route byte-for-byte. Named apart
+    /// from the config field so the preset override frontier sees no write.
+    pub(crate) vit_zono_root_plan: Option<crate::zono_core::VitZonoRootPlan>,
     /// Cached topological execution order for hot CROWN backward paths.
     pub(crate) cached_exec_order: OnceLock<Vec<String>>,
     /// Cached pre-compiled dispatch plan for CROWN backward loops.
@@ -487,7 +585,7 @@ pub struct GraphNetwork {
     pub(crate) cached_dispatch_plan: OnceLock<dispatch_plan::CrownDispatchPlan>,
     /// Cached per-node ancestor sets (nodes reachable backward from each target),
     /// returned in topological order. Eliminates O(N^2) redundant BFS in CROWN-IBP
-    /// collection (#2220 Packet A, #2237 F1).
+    /// collection.
     pub(crate) cached_ancestors: OnceLock<HashMap<String, Vec<String>>>,
     /// See [`ForwardLinearMapCache`].
     pub(crate) cached_forward_linear_map: ForwardLinearMapCache,
@@ -514,6 +612,19 @@ pub struct GraphNetwork {
     /// different graph in the same process — that would be unsound, not just
     /// noisy. See `bab_cuts::CutFoldScope`.
     pub(crate) cut_fold_scope: crate::beta_crown::bab_cuts::CutFoldScope,
+    /// #lsnc-lane: the `#lowdim-prover` lane's PRIVATE interval twin of this
+    /// model (see [`crate::lowdim::LaneTwin`]), bound to the identity token
+    /// this graph carried when it was attached. Only the lowdim lane reads it
+    /// ([`Self::lowdim_twin`], crate-private), and only while the token still
+    /// matches: any structural mutation or output retarget mints a new
+    /// `cut_fold_scope`, which makes the twin stale (the lane then lowers this
+    /// graph itself and fails closed on whatever it cannot admit). `None`
+    /// everywhere except a graph whose loader armed
+    /// `bab.branching.input_split.lowdim_interval_twin`.
+    pub(crate) lowdim_twin: Option<(
+        crate::beta_crown::bab_cuts::CutFoldScope,
+        std::sync::Arc<crate::lowdim::LaneTwin>,
+    )>,
 }
 
 /// Borrow-bound, non-authorizing receipt for the configured graph's two
@@ -670,7 +781,7 @@ impl GraphNetwork {
     /// safe for those surfaces.
     ///
     /// Unary transformer ops (Softmax, CausalSoftmax, LayerNorm, RmsNorm, SiLU, GELU)
-    /// are now ALLOWED (#3775): they already have direct CROWN backward support, and
+    /// are now ALLOWED: they already have direct CROWN backward support, and
     /// the demand-driven selection in `crown_tighten.rs` limits the O(N²) tightening
     /// loop to only the producer nodes that downstream nonlinear ops actually need.
     ///
@@ -680,7 +791,7 @@ impl GraphNetwork {
     /// InstanceNorm1d and AdaIN1d are NOT blocklisted: AdaIN now routes
     /// `IbpValidated` CROWN through its effective InstanceNorm1d equivalent, so
     /// both CNN-style normalization surfaces benefit from CROWN-IBP
-    /// intermediate tightening. Unblocked by #3596 and #3912.
+    /// intermediate tightening.
     pub(crate) fn should_use_crown_ibp_intermediates(&self) -> bool {
         // #binary-relax-crown-ibp (DARK, `NY_CROWN_IBP_BINARY=1`): the
         // binary-relaxation blocklist is a COST guard, not a soundness guard —
@@ -689,7 +800,7 @@ impl GraphNetwork {
         // so the collected map is elementwise never looser than the plain-IBP
         // map this refuses to. MatMul / MulBinary / BilinearCrown all have real
         // CROWN backward support (`dispatch_shared_core`), and the per-input
-        // concreteness filter the #3775 comment asks for now exists in
+        // concreteness filter the blocklist doc above asks for now exists in
         // `demand::nodes_requiring_crown_tightening` (it skips producers whose
         // IBP bounds are already concrete). The remaining exposure is runtime:
         // O(N²) backward passes on a graph that may carry many binary nodes.
@@ -759,7 +870,7 @@ impl GraphNetwork {
                     node.layer,
                     // Binary relaxation ops: conservative gate until
                     // demand-driven selection handles the per-input
-                    // concreteness check (#3775).
+                    // concreteness check.
                     Layer::MatMul(_)
                         | Layer::BilinearCrown(_)
                         | Layer::MulBinary(_)
@@ -840,7 +951,63 @@ impl GraphNetwork {
     /// Conv/Gemm benchmarks (acasxu, metaroom, collins_rul_cnn, malbeware) keep the
     /// prescreen.
     pub(crate) fn is_input_split_batch_stack_safe(&self) -> bool {
-        !self.nodes.values().any(|node| {
+        self.is_input_split_batch_stack_safe_inner(false)
+    }
+
+    /// Prescreen-only variant that consults PER-NODE shape provenance.
+    ///
+    /// The blanket predicate above refuses every `BatchNorm` graph because
+    /// relaxed clipping depends on it. The batched IBP prescreen has a weaker
+    /// obligation and can discharge it per node: `declared_shape` gives each
+    /// BatchNorm's AUTHORED operand shape, which is what decides the axis rule
+    /// once a leading domain axis is prepended.
+    ///
+    /// SUFFICIENCY, not an oracle pass. Channel-axis BatchNorm on `[N,C,H,W]`
+    /// reads its affine from axis 1. Stacking domains on a fresh leading axis
+    /// leaves axis 1 pointing at the same channel it pointed at unbatched, and
+    /// every element of domain `n` lives in row `n`, so domain `n` receives
+    /// exactly the affine it would have received alone. No value crosses `n`.
+    /// That is an equality argument about the operator, not a spot check, which
+    /// is what `batch_stack_enclosure_oracle` (a NECESSARY-condition diagnostic
+    /// whose own test forbids using it to lift a guard) cannot supply.
+    ///
+    /// The ambiguous case stays refused: an unbatched rank-2 `[C,L]` stacks to
+    /// rank-3 `[N,C,L]`, and when `N == C` the squeezed-layout rule must pick
+    /// axis 0 — scaling every element of domain `n` by channel `n`'s affine.
+    /// Only an authored operand rank of 3 is admitted, so that case cannot
+    /// reach here. A node with no declared shape is refused (fail-closed).
+    ///
+    /// Deliberately NOT used by relaxed clipping, which carries additional
+    /// parent-plane obligations and a measured false-unsat history
+    /// (`state_34`/`state_45`, 2026-07-24). Those call sites keep the blanket
+    /// predicate.
+    pub(crate) fn is_input_split_batch_stack_safe_for_prescreen(&self) -> bool {
+        self.is_input_split_batch_stack_safe_inner(true)
+    }
+
+    fn is_input_split_batch_stack_safe_inner(&self, prescreen: bool) -> bool {
+        !self.nodes.iter().any(|(name, node)| {
+            if matches!(node.layer, Layer::BatchNorm(_)) {
+                if !prescreen {
+                    // The blanket predicate serves relaxed clipping, which has
+                    // additional parent-plane obligations and a measured
+                    // false-unsat history. It refuses every BatchNorm graph.
+                    return true;
+                }
+                // Admit iff this node's AUTHORED (unbatched) operand rank is 3,
+                // so the stacked tensor is rank 4. `batch_norm::math` resolves
+                // rank-4+ to channel axis 1 UNCONDITIONALLY and fail-closes on a
+                // channel-count mismatch, whereas rank 3 is the ambiguous case
+                // it must guess ([C,H,W] axis 0 vs [N,C,L] axis 1). Missing
+                // provenance refuses: `map_or(true, ..)` is fail-closed.
+                //
+                // Keying on the NODE's rank, not the graph input's: cgan's input
+                // is a rank-1 latent (5 vars), so the stacked input is rank 2
+                // while the BatchNorms downstream of the Reshape see rank 4.
+                return self
+                    .declared_shape(name)
+                    .map_or(true, |shape| shape.len() != 3);
+            }
             matches!(
                 node.layer,
                 // Index / select / scatter along an absolute axis.
@@ -883,7 +1050,9 @@ impl GraphNetwork {
                     // resolve their axes relative to the TRAILING dimension,
                     // which is invariant under a prepended batch axis, so they
                     // stay off this list.
-                    | Layer::BatchNorm(_)
+                    // NOTE: `Layer::BatchNorm` is handled ABOVE, before this
+                    // `matches!`, because its admissibility depends on the
+                    // stacked rank rather than on the operator alone.
                     // Axis permutation / padding / resize.
                     | Layer::Transpose(_)
                     | Layer::Pad(_)
@@ -900,10 +1069,14 @@ impl GraphNetwork {
             output_node: String::new(),
             use_patches_mode: true,
             forward_linear_spec_alpha: false,
+            forward_linear_sequential_without_conv_transpose: false,
+            forward_linear_s_shaped_untyped: false,
             crown_ibp_per_node_time_budget: crate::types::CrownIbpPerNodeTimeBudget::default(),
             chunk_wave_parallel_enabled: false,
             frozen_levers: None,
             forward_linear_deadline_fallback_to_ibp: false,
+            pwl_lookup_armed: false,
+            vit_zono_root_plan: None,
             cached_exec_order: OnceLock::new(),
             cached_dispatch_plan: OnceLock::new(),
             cached_ancestors: OnceLock::new(),
@@ -912,6 +1085,39 @@ impl GraphNetwork {
             crown_degradation_log_scope: std::sync::Arc::new(CrownDegradationLogScope::default()),
             declared_shapes: TrackedStringMap::new(),
             cut_fold_scope: crate::beta_crown::bab_cuts::CutFoldScope::fresh(),
+            lowdim_twin: None,
+        }
+    }
+
+    /// #lsnc-lane: attach the `#lowdim-prover` lane's private interval twin of
+    /// THIS model, bound to the graph's current identity token.
+    ///
+    /// The caller asserts that `twin` was loaded from the same model bytes with
+    /// the same loader configuration as this graph, and that this graph has not
+    /// been rewritten since it was built (a terminal peel or a graph rewrite
+    /// changes the function the property is about). Every later structural
+    /// mutation invalidates the binding by minting a new identity token.
+    pub fn attach_lowdim_twin(&mut self, twin: crate::lowdim::LaneTwin) {
+        self.lowdim_twin = Some((self.cut_fold_scope, std::sync::Arc::new(twin)));
+    }
+
+    /// The attached lane twin, only while this graph is still the model it was
+    /// attached to. Crate-private: nothing outside the lowdim lane may bound
+    /// through it.
+    pub(crate) fn lowdim_twin(&self) -> Option<&crate::lowdim::LaneTwin> {
+        match &self.lowdim_twin {
+            Some((scope, twin)) if *scope == self.cut_fold_scope => Some(&**twin),
+            _ => None,
+        }
+    }
+
+    /// Diagnostic state of the lane twin: `none`, `bound`, or `stale` (attached
+    /// to a graph that has since been mutated). Observable only.
+    pub fn lowdim_twin_state(&self) -> &'static str {
+        match &self.lowdim_twin {
+            None => "none",
+            Some((scope, _)) if *scope == self.cut_fold_scope => "bound",
+            Some(_) => "stale",
         }
     }
 
@@ -1149,7 +1355,7 @@ impl GraphNetwork {
     }
 
     /// Set the per-node CROWN-IBP time-budget policy from BetaCrownConfig
-    /// (#4413, #cgan-bn11-budget). Purely a time-vs-tightness policy: any
+    /// (#cgan-bn11-budget). Purely a time-vs-tightness policy: any
     /// value is sound (a skipped node degrades to IBP; a longer budget only
     /// lets the CROWN backward finish), so no bound cache is invalidated.
     pub fn set_crown_ibp_per_node_time_budget(
@@ -1163,6 +1369,21 @@ impl GraphNetwork {
     /// truncated CROWN cache identity includes it explicitly.
     pub fn set_chunk_wave_parallel_enabled(&mut self, enabled: bool) {
         self.chunk_wave_parallel_enabled = enabled;
+    }
+
+    /// #vit-zono-root: stamp (or, with `None`, clear) the certified
+    /// forward-zonotope root-map plan on THIS graph and every later clone.
+    ///
+    /// No bound cache is invalidated: a map computed in either state is a
+    /// certified enclosure of the same function over the same box, so serving
+    /// one to the other is sound (only its tightness differs).
+    pub fn set_vit_zono_root_plan(&mut self, plan: Option<crate::zono_core::VitZonoRootPlan>) {
+        self.vit_zono_root_plan = plan;
+    }
+
+    /// The stamped #vit-zono-root plan, if any.
+    pub fn vit_zono_root_plan(&self) -> Option<crate::zono_core::VitZonoRootPlan> {
+        self.vit_zono_root_plan
     }
 
     /// Attach the receipt-owning frozen parameter set to this graph.
@@ -1214,6 +1435,11 @@ impl GraphNetwork {
             },
             patches_deadline_flat_bias_enabled: value(&PATCHES_DEADLINE_FLAT_BIAS).as_bool(),
             honest_provenance_enabled: value(&CROWN_HONEST_PROVENANCE).as_bool(),
+            // Request-scoped; the options entry point overrides it per call.
+            collector_dense_override: false,
+            collector_unstable_rows: false,
+            collector_unstable_rows_max_permille:
+                crate::network::graph_alpha::DEFAULT_SPARSE_RELU_MAX_PERMILLE,
         }
     }
 
@@ -1265,7 +1491,7 @@ impl GraphNetwork {
         // broadcasting (e.g., [1024] / scalar in L2 normalization) and MulBinary
         // CROWN backward doesn't support broadcasting. Instead, the spec-guided
         // CROWN backward handles Div via per-node IBP concretization (see
-        // spec_propagation.rs BackwardDispatchResult::Unsupported). #3596
+        // spec_propagation.rs BackwardDispatchResult::Unsupported).
         let name = node.name.clone();
         if self.nodes.contains_key(&name) {
             return Err(NyError::InvalidSpec(format!(
@@ -1392,7 +1618,7 @@ impl GraphNetwork {
     }
 
     /// Legacy compatibility alias for [`Self::output_name`].
-    #[deprecated(note = "use output_name")]
+    #[deprecated(since = "0.1.0", note = "use output_name")]
     pub fn get_output_name(&self) -> &str {
         self.output_name()
     }
@@ -1403,7 +1629,7 @@ impl GraphNetwork {
     }
 
     /// Legacy compatibility alias for [`Self::node`].
-    #[deprecated(note = "use node")]
+    #[deprecated(since = "0.1.0", note = "use node")]
     pub fn get_node(&self, name: &str) -> Option<&GraphNode> {
         self.node(name)
     }

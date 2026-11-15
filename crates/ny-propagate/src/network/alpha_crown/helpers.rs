@@ -61,7 +61,7 @@ pub(super) fn compute_chain_rule_gradients(
             // Guard: non-finite pre-ReLU bounds cannot produce meaningful gradients.
             // IEEE-754: NaN comparisons return false, so `l >= 0.0 || u <= 0.0`
             // would fail for NaN bounds, treating them as "unstable" and flowing
-            // NaN into gradient arithmetic. Explicitly skip non-finite. (#2809)
+            // NaN into gradient arithmetic. Explicitly skip non-finite.
             if !l.is_finite() || !u.is_finite() {
                 continue;
             }
@@ -87,7 +87,7 @@ pub(super) fn compute_chain_rule_gradients(
 
                 // Guard: non-finite A coefficient cannot produce meaningful
                 // gradient contributions. Without this, NaN a_ji silently
-                // drops the contribution via `a_ji > 0.0` returning false. (#2809)
+                // drops the contribution via `a_ji > 0.0` returning false.
                 if !a_ji.is_finite() {
                     continue;
                 }
@@ -118,7 +118,7 @@ pub(super) fn compute_chain_rule_gradients(
 /// Returns `true` if INVPROP was enabled and initialized, `false` otherwise.
 ///
 /// `input_len` is the number of input neurons, used to allocate NETWORK_INPUT
-/// gammas when `should_apply_to_input()` is true (#2928).
+/// gammas when `should_apply_to_input()` is true.
 pub(super) fn init_invprop_if_enabled(
     config: &AlphaCrownConfig,
     alpha_state: &mut AlphaState,

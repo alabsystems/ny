@@ -15,8 +15,6 @@
 //! These containment tests use `LayerNormCrownMode::IbpValidated`, the sound
 //! normalization CROWN mode. Structural `Sampling` coverage remains in
 //! `crown_normalization.rs`.
-//!
-//! Part of #3103.
 
 use crate::layers::normalization::{
     AdaIN1dLayer, InstanceNorm1dLayer, LayerNormCrownMode, LayerNormLayer, RmsNormLayer,
@@ -89,7 +87,6 @@ proptest! {
     ///
     /// lower_a != upper_a exercises the coefficient split path where positive
     /// and negative coefficient handling differs for lower vs upper bounds.
-    /// Part of #3103.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_rmsnorm_crown_asymmetric_incoming(
@@ -182,7 +179,6 @@ proptest! {
     /// lower_a != upper_a exercises the coefficient split path where positive
     /// and negative coefficient handling differs for lower vs upper bounds.
     /// LayerNorm is the mean+variance normalization (vs RmsNorm which is RMS-only).
-    /// Part of #2167.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_layernorm_crown_asymmetric_incoming(
@@ -273,7 +269,6 @@ proptest! {
 
     /// InstanceNorm1d CROWN backward with asymmetric incoming coefficients.
     /// 1 channel, 4 timesteps.
-    /// Part of #3103.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_instancenorm_crown_asymmetric_incoming(
@@ -360,7 +355,6 @@ proptest! {
 
     /// AdaIN1d CROWN backward with asymmetric incoming coefficients.
     /// 1 channel, 3 timesteps.
-    /// Part of #3103.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_adain_crown_asymmetric_incoming(

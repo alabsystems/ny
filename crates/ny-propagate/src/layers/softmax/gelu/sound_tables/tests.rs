@@ -313,10 +313,10 @@ fn assert_upper_bound_sound_on_grid(
 fn test_erf_table_construction() {
     let tables = get_gelu_precompute();
     assert_eq!(tables.step_pre, 0.01);
-    assert!(!tables.d_lower_right.is_empty());
-    assert!(!tables.d_lower_left.is_empty());
-    assert!(!tables.d_upper_right.is_empty());
-    assert!(!tables.d_upper_left.is_empty());
+    assert_ne!((tables.d_lower_right).len(), 0);
+    assert_ne!((tables.d_lower_left).len(), 0);
+    assert_ne!((tables.d_upper_right).len(), 0);
+    assert_ne!((tables.d_upper_left).len(), 0);
     // All four tables should have same length
     let n = tables.d_lower_right.len();
     assert_eq!(tables.d_lower_left.len(), n);
@@ -353,10 +353,10 @@ fn test_erf_table_construction() {
 fn test_tanh_table_construction() {
     let tables = get_gelu_tanh_precompute();
     assert_eq!(tables.step_pre, 0.01);
-    assert!(!tables.d_lower_right.is_empty());
-    assert!(!tables.d_lower_left.is_empty());
-    assert!(!tables.d_upper_right.is_empty());
-    assert!(!tables.d_upper_left.is_empty());
+    assert_ne!((tables.d_lower_right).len(), 0);
+    assert_ne!((tables.d_lower_left).len(), 0);
+    assert_ne!((tables.d_upper_right).len(), 0);
+    assert_ne!((tables.d_upper_left).len(), 0);
     let n = tables.d_lower_right.len();
     assert_eq!(tables.d_lower_left.len(), n);
     assert_eq!(tables.d_upper_right.len(), n);
@@ -927,7 +927,6 @@ fn test_tanh_d_upper_right_soundness_sampled() {
 }
 
 /// Soundness check for tanh d_lower_left table via posthoc-adjusted path.
-/// Part of #1905.
 #[test]
 fn test_tanh_d_lower_left_soundness_sampled() {
     let tables = get_gelu_tanh_precompute();
@@ -946,7 +945,6 @@ fn test_tanh_d_lower_left_soundness_sampled() {
 }
 
 /// Soundness check for tanh d_upper_left table via posthoc-adjusted path.
-/// Part of #1905.
 #[test]
 fn test_tanh_d_upper_left_soundness_sampled() {
     let tables = get_gelu_tanh_precompute();

@@ -7,7 +7,7 @@
 //! Prints per-node IBP vs alpha-CROWN intermediate bound widths and the
 //! spec-guided CROWN output bounds for cGAN_imgSz32_nCh_1 prop_1's input box.
 //! This is an explicit measurement lane, not a test. Run it with
-//! `cargo run -p ny-cli --release --example cgan_bound_probe -- <name>`.
+//! `targo --unverified run -p ny-cli --release --example cgan_bound_probe -- <name>`.
 
 use ndarray::Array2;
 use ny_onnx::{load_onnx_with_config, GraphNetworkOptions, OnnxLoadConfig};
@@ -195,7 +195,7 @@ const UPPER3: [f32; 5] = [
 ];
 
 /// Validated numpy textbook-CROWN reference widths (per-node max width) from
-/// `tools/cgan_crown_reference/crown_probe.out` (same adaptive-slope relaxation,
+/// `tools/cgan_crown_reference/crown_probe.py` (same adaptive-slope relaxation,
 /// same sequential CROWN∩IBP anchor cascade, f32 coefficients; 302-point
 /// sampling showed zero soundness violations; BN_5 matches the exact f64
 /// affine width).
@@ -371,7 +371,7 @@ fn cgan_bn5_pure_affine_exactness() {
 /// every claimed per-node bound of the collection. The concrete value is only
 /// known up to the sound point-IBP interval, so a violation is flagged only
 /// when that interval lies strictly outside the claimed bound (definite
-/// violation). Mirrors tools/cgan_crown_reference/sampling_check.out.
+/// violation).
 fn cgan_sampling_soundness_nch1() {
     let onnx = Path::new(ONNX).to_path_buf();
     let model = load_onnx_with_config(&onnx, &OnnxLoadConfig::default()).expect("load onnx");

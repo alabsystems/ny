@@ -10,11 +10,10 @@
 //! - Timeout budgeting per constraint
 //! - Status accumulation and display
 //! - Early exit (conjunctive: first proved, disjunctive: first failure)
-//! - Cross-validation of per-constraint BaB counterexamples (#3209)
+//! - Cross-validation of per-constraint BaB counterexamples
 //! - Final status computation
 //!
 //! Backends provide a dispatch closure for the actual verification call.
-//! Part of #2215.
 
 use std::sync::Arc;
 
@@ -47,7 +46,7 @@ pub(super) struct ConstraintIterConfig<'a> {
     pub base_config: BetaCrownConfig,
     /// Parent verifier to clone runtime-only resources from when present.
     pub parent_verifier: Option<&'a BetaCrownVerifier>,
-    /// Stored GPU engine for per-constraint sub-verifiers (#3627).
+    /// Stored GPU engine for per-constraint sub-verifiers.
     pub engine: Option<Arc<dyn GemmEngine>>,
     /// Suppress non-JSON output.
     pub json: bool,
@@ -72,7 +71,7 @@ pub(super) struct ConstraintDispatch<'a> {
 /// concrete input, returning the full output vector. When provided and in conjunctive
 /// mode, per-constraint BaB counterexamples are cross-validated against ALL constraints.
 /// If any single-constraint counterexample satisfies ALL constraints, the property is
-/// immediately reported as Violated. This fixes #3209 where per-constraint BaB finds
+/// immediately reported as Violated. This fixes the case where per-constraint BaB finds
 /// counterexamples for each constraint independently but never checks if any input
 /// satisfies all constraints simultaneously.
 #[allow(clippy::type_complexity)]
@@ -165,7 +164,6 @@ where
         // In conjunctive mode, if BaB finds a concrete input violating constraint i,
         // that same input might satisfy ALL constraints — making it a joint counterexample
         // proving the property VIOLATED. This is essentially free (one forward pass).
-        // Part of #3209.
         if !is_disjunction {
             if let BabVerificationStatus::Violated { counterexample, .. } =
                 &constraint_result.result
@@ -241,11 +239,19 @@ where
     }
 
     let final_status = final_status_override.unwrap_or_else(|| {
+        // #budget-abandonment FIX D: carry the FIRST unproved constraint's own
+        // reason into the aggregate message instead of dropping it here.
+        let statuses: Vec<(String, BabVerificationStatus)> = constraint_results
+            .iter()
+            .map(|(desc, result)| (desc.clone(), result.result.clone()))
+            .collect();
+        let detail = super::first_unproved_constraint_detail(&statuses);
         finalize_relational_status(
             config.aggregation,
             proved_violated_count,
             config.total_constraint_count,
             constraint_results.len(),
+            detail.as_deref(),
         )
     });
 

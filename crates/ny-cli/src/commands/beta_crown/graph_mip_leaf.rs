@@ -67,6 +67,26 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// #metaroom-mip-governor — the consecutive-`Undecided` cut-out, resolved
+/// through the typed preset route (`bab.mip.leaf_undecided_streak_cap`) with
+/// `NY_MIP_LEAF_UNDECIDED_STREAK_CAP` still winning in both directions.
+///
+/// `0` means NO CAP and is the shipped behaviour, so a build whose preset is
+/// silent resolves exactly as it did before this lever existed.
+/// THE CUT-OUT PREDICATE, named so a test can assert "at the cap and not
+/// before" without touching a process-global cell.
+///
+/// `cap == 0` is NO CAP and is the shipped behaviour; otherwise the oracle
+/// declines once `streak` consecutive consults have come back `Undecided`, so a
+/// cap of 1 still allows the FIRST consult and declines the second.
+fn undecided_streak_disarms(streak: u64, cap: u64) -> bool {
+    cap > 0 && streak >= cap
+}
+
+fn leaf_undecided_streak_cap() -> u64 {
+    crate::preset_gates::mip_leaf_undecided_streak_cap().unwrap_or(0)
+}
+
 fn env_f64(key: &str, default: f64) -> f64 {
     std::env::var(key)
         .ok()
@@ -201,6 +221,136 @@ pub(super) fn estimate_encode_nnz(
     Some(nnz)
 }
 
+/// #mip-demand — a purely STATIC LOWER BOUND on what [`estimate_encode_nnz`]
+/// will return for this graph, computed from the model and the network input
+/// SHAPE alone (no bounds, no forward pass, no allocation beyond one shape map).
+///
+/// WHY A LOWER BOUND. The whole-net escalation declines when
+/// `estimate_encode_nnz(..) > cap`. To move that decline BEFORE BaB — i.e. to
+/// stop `bab_deadline` reserving a slice for a lane that cannot run — the
+/// pre-BaB answer must never be LARGER than the runtime one, or the reserve
+/// would be dropped on a model the escalation would actually have admitted.
+/// Every term of the runtime estimate is a non-negative addition, and the only
+/// term that depends on the BOUNDS rather than on the shapes is the ReLU term
+/// (`7 * unstable`). Dropping it, and dropping every term this walk cannot
+/// establish, therefore yields
+///
+///   `static_encode_nnz_floor(..) <= estimate_encode_nnz(.., any bounds)`
+///
+/// so `floor > cap` PROVES `runtime > cap`. The converse is not claimed and is
+/// not needed: a floor at or under the cap simply reserves as before.
+///
+/// FAIL CLOSED. `None` — "no static claim" — on any layer outside the
+/// escalation gate's own set (`graph_unstable_relu_count`'s
+/// `{Linear, Conv2d, Flatten, Reshape, BatchNorm, Add, ReLU}`; anything else is
+/// already handled by `#deadlane`'s layer-set predicate), on any shape this
+/// walk cannot derive, and on any arithmetic that would overflow.
+///
+/// The shape arithmetic is deliberately the SAME as the GPU DAG lowering
+/// (`network/core/graph/ibp/gpu_plan`): `Conv2dLayer::output_size` for conv,
+/// `compute_output_shape` for Flatten/Reshape, element-count-preserving for
+/// BatchNorm/ReLU, equal-shape-only for Add.
+pub(super) fn static_encode_nnz_floor(
+    graph: &GraphNetwork,
+    input_shape: &[usize],
+) -> Option<usize> {
+    fn elements(shape: &[usize]) -> Option<usize> {
+        shape.iter().try_fold(1usize, |acc, d| acc.checked_mul(*d))
+    }
+
+    let exec = graph.exec_order().ok()?;
+    // Per-node output SHAPE, in execution order. The network input is keyed by
+    // its own node name when it appears in the exec order, and additionally
+    // seeded under `NETWORK_INPUT` so a first hidden node can resolve it.
+    let mut shapes: HashMap<String, Vec<usize>> = HashMap::with_capacity(exec.len() + 1);
+    shapes.insert(
+        ny_propagate::NETWORK_INPUT.to_string(),
+        input_shape.to_vec(),
+    );
+    let mut nnz: usize = 0;
+
+    for name in exec {
+        let node = graph.node(name)?;
+        let in_shape_of =
+            |shapes: &HashMap<String, Vec<usize>>, idx: usize| -> Option<Vec<usize>> {
+                let input = node.inputs().get(idx)?;
+                shapes.get(input.as_str()).cloned()
+            };
+        let out_shape: Vec<usize> = match node.layer() {
+            Layer::Linear(lin) => {
+                let (out_dim, in_dim) = lin.weight().dim();
+                nnz = nnz.checked_add(out_dim.checked_mul(in_dim.checked_add(1)?)?)?;
+                let mut shape = in_shape_of(&shapes, 0)?;
+                // A Linear consumes the LAST axis; every leading axis survives.
+                // Same guard as the DAG lowering: a shape whose last axis is not
+                // the weight's input dimension is one this walk does not model.
+                if shape.last().copied()? != in_dim {
+                    return None;
+                }
+                *shape.last_mut()? = out_dim;
+                shape
+            }
+            Layer::Conv2d(conv) => {
+                let in_shape = in_shape_of(&shapes, 0)?;
+                let (batch, in_c, in_h, in_w) = match in_shape.as_slice() {
+                    [c, h, w] => (None, *c, *h, *w),
+                    [b, c, h, w] => (Some(*b), *c, *h, *w),
+                    _ => return None,
+                };
+                if in_c != conv.in_channels() {
+                    return None;
+                }
+                let (out_h, out_w) = conv.output_size(in_h, in_w).ok()?;
+                let shape = match batch {
+                    Some(b) => vec![b, conv.out_channels(), out_h, out_w],
+                    None => vec![conv.out_channels(), out_h, out_w],
+                };
+                // Identical row-density formula to `estimate_encode_nnz`:
+                // `kernel.shape()[1..4]` is `(in_c / groups, kh, kw)`.
+                let k = conv.kernel.shape();
+                let row = k
+                    .get(1)
+                    .copied()
+                    .unwrap_or(1)
+                    .checked_mul(k.get(2).copied().unwrap_or(1))?
+                    .checked_mul(k.get(3).copied().unwrap_or(1))?
+                    .checked_add(1)?;
+                nnz = nnz.checked_add(elements(&shape)?.checked_mul(row)?)?;
+                shape
+            }
+            Layer::BatchNorm(_) => {
+                let shape = in_shape_of(&shapes, 0)?;
+                nnz = nnz.checked_add(elements(&shape)?.checked_mul(2)?)?;
+                shape
+            }
+            Layer::Add(_) => {
+                let a = in_shape_of(&shapes, 0)?;
+                let b = in_shape_of(&shapes, 1)?;
+                // Broadcast is not modelled: fail closed rather than guess an
+                // output length the runtime estimator would disagree with.
+                if a != b {
+                    return None;
+                }
+                nnz = nnz.checked_add(elements(&a)?.checked_mul(3)?)?;
+                a
+            }
+            // The bounds-dependent term. `unstable >= 0`, so dropping it keeps
+            // the running total a LOWER bound on the runtime estimate.
+            Layer::ReLU(_) => in_shape_of(&shapes, 0)?,
+            Layer::Flatten(f) => f.compute_output_shape(&in_shape_of(&shapes, 0)?).ok()?,
+            Layer::Reshape(r) => r.compute_output_shape(&in_shape_of(&shapes, 0)?).ok()?,
+            // Every other layer is outside the escalation gate's own set
+            // (`graph_unstable_relu_count` returns `None` for it), so the
+            // layer-set predicate already answers this model. No static nnz
+            // claim is made here.
+            _ => return None,
+        };
+        shapes.insert(name.clone(), out_shape);
+    }
+
+    Some(nnz)
+}
+
 /// Rate-limited info logging for eligibility declines (defect 4): the first
 /// few declines per run log at INFO (the visibility the live measurement
 /// lacked), the rest at DEBUG (a deep BaB consults thousands of leaves).
@@ -217,6 +367,17 @@ struct LeafBudgetState {
     first_remaining: Option<f64>,
     /// Cumulative seconds spent inside leaf solves.
     spent: f64,
+    /// #metaroom-mip-governor — how many CONSECUTIVE consults have come back
+    /// `Undecided`. Reset by any decisive reply (`VerifiedAllRows` or a
+    /// confirmed `Violated` witness).
+    ///
+    /// WHY IT EXISTS. Only two things disarm this oracle today: a confirmed SAT
+    /// witness (`sat_latch`) and the cumulative wall fraction, which defaults to
+    /// HALF the BaB budget. On metaroom_2023 4cnn_ry_57_9 spec_idx_28 that
+    /// bought six 10 s consults, every one `undecided`, for 60.39 s of a 210 s
+    /// instance budget — 29% of the row spent on a lane that decided nothing
+    /// while the branch-and-bound search that WAS making progress starved.
+    consecutive_undecided: u64,
 }
 
 /// The leaf oracle: eligibility gates → pinned encoding → per-row decision
@@ -262,6 +423,12 @@ impl GraphMipLeafSolver {
 
     /// Per-leaf wall slice (design doc §3): declines (`None`) when the
     /// cumulative cap is exhausted or the remaining slice is uselessly small.
+    ///
+    /// UNCHANGED, DELIBERATELY (#metaroom-mip-governor). The consecutive-
+    /// `Undecided` cut-out and its observable live in
+    /// [`Self::admit_slice_governed`], which WRAPS this function, so the
+    /// historical body — and with it the `NY_GRAPH_MIP_LEAF_SLICE_S` legacy
+    /// reader the source frontier tracks — keeps its exact structure.
     fn admit_slice(&self, deadline: Option<Instant>) -> Option<f64> {
         let remaining = match deadline {
             Some(d) => d.saturating_duration_since(Instant::now()).as_secs_f64(),
@@ -285,9 +452,73 @@ impl GraphMipLeafSolver {
         Some(slice)
     }
 
+    /// #metaroom-mip-governor — the GOVERNED entry point every consult goes
+    /// through, and the only caller of [`Self::admit_slice`].
+    ///
+    /// Two things happen here that could not happen before. First, the
+    /// consecutive-`Undecided` cut-out: today only a confirmed SAT witness
+    /// (`sat_latch`) or the cumulative-wall fraction — default 0.5, i.e. HALF
+    /// the branch-and-bound budget — can stop this oracle, and on metaroom_2023
+    /// 4cnn_ry_57_9 spec_idx_28 that bought six 10.0 s consults, every one
+    /// `undecided`, for 60.39 s of a 210 s instance budget. Second, an
+    /// UNCONDITIONAL observable on EVERY call, so a binary that lacks the lever
+    /// is distinguishable from a lever that ran and declined to fire — the
+    /// absence of the line means VOID, not negative.
+    ///
+    /// SOUNDNESS: declining here leaves the leaf in branch-and-bound, which is
+    /// exactly what the `Undecided` verdict the consult would otherwise have
+    /// returned already does. The oracle can only ever UPGRADE a leaf — to
+    /// `VerifiedAllRows` or to a graph-forward-confirmed `Violated` witness — so
+    /// a decline can cost a proof and can never manufacture one, in either
+    /// verdict direction.
+    fn admit_slice_governed(&self, deadline: Option<Instant>) -> Option<f64> {
+        let cap = leaf_undecided_streak_cap();
+        let (streak, spent) = match self.budget.lock() {
+            Ok(budget) => (budget.consecutive_undecided, budget.spent),
+            Err(_) => {
+                // A poisoned mutex is a decline, exactly as the historical
+                // `.ok()?` was. Report it rather than dropping the observable.
+                eprintln!(
+                    "[mip-leaf-governor] streak=? cap={cap} action=disarm spent_s=? \
+reason=budget-lock-poisoned"
+                );
+                return None;
+            }
+        };
+        if undecided_streak_disarms(streak, cap) {
+            eprintln!(
+                "[mip-leaf-governor] streak={streak} cap={cap} action=disarm \
+spent_s={spent:.3} reason=undecided-streak-cap"
+            );
+            return None;
+        }
+        let slice = self.admit_slice(deadline);
+        let (action, reason) = match slice {
+            Some(_) => ("consult", "admitted"),
+            None => ("disarm", "legacy-budget-gate"),
+        };
+        eprintln!(
+            "[mip-leaf-governor] streak={streak} cap={cap} action={action} \
+spent_s={spent:.3} reason={reason}"
+        );
+        slice
+    }
+
     fn record_spent(&self, secs: f64) {
         if let Ok(mut budget) = self.budget.lock() {
             budget.spent += secs;
+        }
+    }
+
+    /// #metaroom-mip-governor — fold one consult's outcome into the streak.
+    /// Any decisive reply resets it; only `Undecided` extends it.
+    fn record_outcome(&self, verdict: &GraphMipLeafVerdict) {
+        if let Ok(mut budget) = self.budget.lock() {
+            if matches!(verdict, GraphMipLeafVerdict::Undecided) {
+                budget.consecutive_undecided = budget.consecutive_undecided.saturating_add(1);
+            } else {
+                budget.consecutive_undecided = 0;
+            }
         }
     }
 }
@@ -551,7 +782,7 @@ impl GraphMipLeafSolver {
                 return GraphMipLeafVerdict::Undecided;
             }
         }
-        let Some(slice) = self.admit_slice(req.deadline) else {
+        let Some(slice) = self.admit_slice_governed(req.deadline) else {
             debug!("Graph-MIP leaf: declined (budget exhausted or slice too small)");
             return GraphMipLeafVerdict::Undecided;
         };
@@ -566,6 +797,7 @@ impl GraphMipLeafSolver {
         let start = Instant::now();
         let verdict = self.solve_leaf_inner(req, &flat_bounds, slice);
         self.record_spent(start.elapsed().as_secs_f64());
+        self.record_outcome(&verdict);
         // VERDICT visibility (defect 4).
         match &verdict {
             GraphMipLeafVerdict::VerifiedAllRows => info!(
@@ -1829,5 +2061,60 @@ mod witness_publication_tests {
         assert!(publishing.may_publish_violation_witness());
         let advisory = GraphMipLeafSolver::with_publication(MipBackend::default(), false);
         assert!(!advisory.may_publish_violation_witness());
+    }
+}
+
+#[cfg(test)]
+mod mip_leaf_governor_tests {
+    use super::{undecided_streak_disarms, GraphMipLeafSolver};
+    use ny_mip::MipBackend;
+    use ny_propagate::beta_crown::graph_mip_leaf::GraphMipLeafVerdict;
+
+    /// #metaroom-mip-governor: the cut-out fires AT the cap, never before, and
+    /// `0` is the shipped no-cap behaviour at every streak length.
+    #[test]
+    fn undecided_streak_cap_disarms_at_the_cap_and_not_before() {
+        for streak in 0..8u64 {
+            assert!(
+                !undecided_streak_disarms(streak, 0),
+                "cap 0 must mean NO CAP; streak {streak} disarmed"
+            );
+        }
+        for cap in 1..6u64 {
+            for streak in 0..cap {
+                assert!(
+                    !undecided_streak_disarms(streak, cap),
+                    "cap {cap} disarmed early at streak {streak}"
+                );
+            }
+            for streak in cap..cap + 4 {
+                assert!(
+                    undecided_streak_disarms(streak, cap),
+                    "cap {cap} failed to disarm at streak {streak}"
+                );
+            }
+        }
+    }
+
+    /// The streak counts CONSECUTIVE undecided replies: any decisive reply
+    /// resets it, so an oracle that is still deciding things is never cut out.
+    #[test]
+    fn a_decisive_leaf_verdict_resets_the_undecided_streak() {
+        let solver = GraphMipLeafSolver::new(MipBackend::Ay);
+        let streak = || {
+            solver
+                .budget
+                .lock()
+                .expect("budget lock")
+                .consecutive_undecided
+        };
+        assert_eq!(streak(), 0);
+        solver.record_outcome(&GraphMipLeafVerdict::Undecided);
+        solver.record_outcome(&GraphMipLeafVerdict::Undecided);
+        assert_eq!(streak(), 2, "two undecided consults must extend the streak");
+        solver.record_outcome(&GraphMipLeafVerdict::VerifiedAllRows);
+        assert_eq!(streak(), 0, "a certified leaf must reset the streak");
+        solver.record_outcome(&GraphMipLeafVerdict::Undecided);
+        assert_eq!(streak(), 1);
     }
 }

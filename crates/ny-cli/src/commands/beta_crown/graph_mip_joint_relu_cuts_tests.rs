@@ -358,7 +358,7 @@ fn joint_cuts_hold_at_every_reachable_point_on_a_real_diff_net() {
                     for (i, &c) in cols.iter().enumerate() {
                         if i < lo.len() {
                             // exact point → lo == hi; use the midpoint defensively.
-                            colval.insert(c.0, 0.5 * (lo[[i]] as f64 + hi[[i]] as f64));
+                            colval.insert(c.0, f64::midpoint(lo[[i]] as f64, hi[[i]] as f64));
                         }
                     }
                 }

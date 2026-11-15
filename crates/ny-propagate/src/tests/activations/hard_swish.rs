@@ -4,7 +4,7 @@
 
 //! HardSwish NaN/Inf guard tests.
 //!
-//! Updated for #2977: CROWN backward domain_guard rejects non-finite pre-activation
+//! CROWN backward domain_guard rejects non-finite pre-activation
 //! with NumericalInstability. Previously these tested maximally-loose fallback bounds;
 //! now they verify the early rejection is correct.
 
@@ -14,7 +14,7 @@ use ndarray::{ArrayD, IxDyn};
 #[ntest::timeout(10000)]
 #[test]
 fn test_hardswish_crown_nan_inf_guard_returns_maximally_loose_bounds() {
-    // Updated for #2977: domain_guard now rejects non-finite pre-activation.
+    // The domain_guard now rejects non-finite pre-activation.
     let layer = HardSwishLayer::new();
     let linear_bounds = LinearBounds::identity(1);
 
@@ -37,7 +37,7 @@ fn test_hardswish_crown_nan_inf_guard_returns_maximally_loose_bounds() {
     }
 }
 
-/// Regression test for #1736/#2977: multi-neuron with Inf pre-activation now rejected.
+/// Regression test: multi-neuron with Inf pre-activation now rejected.
 #[ntest::timeout(10000)]
 #[test]
 fn test_hardswish_crown_nan_contamination_multi_neuron_1736() {
@@ -90,7 +90,7 @@ fn test_hardswish_crown_nan_contamination_nonidentity_1736() {
 }
 
 // =============================================================================
-// Proptest: multi-neuron NaN guard (#1736/#2977)
+// Proptest: multi-neuron NaN guard
 // =============================================================================
 
 use proptest::prelude::*;
@@ -98,11 +98,11 @@ use proptest::prelude::*;
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(200) })]
 
-    /// Proptest for #1736/#2977: verify CROWN rejects non-finite pre-activation.
+    /// Proptest: verify CROWN rejects non-finite pre-activation.
     ///
     /// Setup: 3 neurons, one with ±inf pre-activation (triggers domain_guard),
     /// the other two with random finite bounds.
-    /// Updated for #2977: domain_guard now returns NumericalInstability.
+    /// The domain_guard now returns NumericalInstability.
     #[ntest::timeout(10000)]
     #[test]
     fn test_hardswish_nan_guard_proptest_1736(

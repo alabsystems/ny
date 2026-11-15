@@ -22,7 +22,7 @@ pub(super) fn ln_internal_err(ctx: &str) -> NyError {
 /// Replaces ndarray `mean_axis()` which accumulates in f32, losing ~log2(n) bits
 /// of precision for norm_size=768+. Uses `next_down_f32` on the f64->f32 cast so
 /// the result is always <= the true f64 mean -- required when the mean is used as
-/// a lower bound (e.g., `xu - mean_lower`). Part of #2423.
+/// a lower bound (e.g., `xu - mean_lower`).
 pub(super) fn mean_axis_f64_lower(arr: &ArrayD<f32>, axis: ndarray::Axis) -> Option<ArrayD<f32>> {
     let n = arr.shape().get(axis.0).copied()?;
     if n == 0 {
@@ -38,7 +38,7 @@ pub(super) fn mean_axis_f64_lower(arr: &ArrayD<f32>, axis: ndarray::Axis) -> Opt
 ///
 /// Uses `next_up_f32` on the f64->f32 cast so the result is always >= the true
 /// f64 mean -- required when the mean is used as an upper bound (e.g.,
-/// `xl - mean_upper`). Part of #2423.
+/// `xl - mean_upper`).
 pub(super) fn mean_axis_f64_upper(arr: &ArrayD<f32>, axis: ndarray::Axis) -> Option<ArrayD<f32>> {
     let n = arr.shape().get(axis.0).copied()?;
     if n == 0 {
@@ -97,19 +97,19 @@ pub(super) fn validate_ibp_input(
     }
 
     // Guard: zero-valued dimensions cause division-by-zero in batch index
-    // decoding. (#2806)
+    // decoding.
     if shape.contains(&0) {
         return Err(NyError::InvalidSpec(
             "LayerNorm: zero-valued dimension in input shape".to_string(),
         ));
     }
 
-    // Category B per domain validation policy (designs/2026-02-07-domain-validation-policy.md):
+    // Category B per the domain validation policy:
     // NaN input bounds fail closed — NaN carries no bound information and would
     // silently poison the normalization arithmetic (0/0, inf/inf). ±Inf
     // endpoints are handled separately below: they are the conservative-bounds
     // convention for "unbounded in that direction" and must saturate, not
-    // error (consistent with the CROWN path's constant-bounds fallback, #3259).
+    // error (consistent with the CROWN path's constant-bounds fallback).
     if input.lower().iter().any(|x| x.is_nan()) || input.upper().iter().any(|x| x.is_nan()) {
         return Err(NyError::NumericalInstability(
             "LayerNorm IBP: NaN input bounds".to_string(),
@@ -118,7 +118,7 @@ pub(super) fn validate_ibp_input(
 
     let norm_size = shape[ndim - 1];
     if norm_size > (1 << 24) {
-        // f32 precision guard (#2136)
+        // f32 precision guard
         return Err(NyError::InternalError(format!(
             "LayerNorm dimension {norm_size} exceeds f32 exact integer range"
         )));
@@ -170,7 +170,7 @@ impl LayerNormLayer {
 
         if self.mode == LayerNormMode::MeanOnly {
             // MeanOnly fallback: no bound information available. Use FALLBACK_BOUND
-            // for consistency with the IBP overflow strategy (#3030, #3060).
+            // for consistency with the IBP overflow strategy.
             // Previously used raw [-inf, +inf] which BoundedTensor::new() rejects.
             let out_lower = ArrayD::from_elem(IxDyn(shape), f32::NEG_INFINITY);
             let out_upper = ArrayD::from_elem(IxDyn(shape), f32::INFINITY);
@@ -182,7 +182,7 @@ impl LayerNormLayer {
         }
 
         let z_max = if norm_size <= 1 {
-            // #3344: round UP
+            // Round UP
             0.0
         } else {
             next_up_f32(((norm_size as f32) - 1.0).sqrt())
@@ -204,7 +204,7 @@ impl LayerNormLayer {
             }
 
             if g >= 0.0 {
-                // #3344: directed rounding on fallback
+                // Directed rounding on fallback
                 per_dim_lower[i] = affine_fallback_down(b, g, z_lower);
                 per_dim_upper[i] = affine_fallback_up(b, g, z_upper);
             } else {
@@ -224,7 +224,7 @@ impl LayerNormLayer {
 
         // Repair non-finite outputs: non-finite ny/beta -> [-inf, +inf] fill above,
         // or extreme ny * z_max can overflow. Consistent with IBP overflow
-        // strategy (#3030, #3060).
+        // strategy.
         BoundedTensor::new_repaired(out_lower, out_upper, RepairStrategy::Conservative)
     }
 }

@@ -9,7 +9,7 @@
 //! from ny-cli — the primary downstream consumer — via the curated
 //! `ny_api::model` surface.
 //!
-//! This is the narrower integration smoke that `#3288` needs: the programmatic
+//! This is the narrower integration smoke: the programmatic
 //! traced-producer path works end-to-end from a consumer that is NOT ny-api.
 
 use std::collections::{HashMap, HashSet};
@@ -196,8 +196,8 @@ fn talker_like_rotary_bias_graph_model() -> GraphModel {
         .build()
 }
 
-/// Build a sequence-shaped phoneme encoder that mirrors the `#3519`
-/// adversarial robustness contract:
+/// Build a sequence-shaped phoneme encoder that mirrors the adversarial
+/// robustness contract:
 ///
 /// `phoneme_embeddings[seq, dim] -> Linear -> ReLU -> Linear`
 ///
@@ -274,7 +274,7 @@ fn adversarial_phoneme_input_bounds() -> Vec<Bound> {
     ]
 }
 
-/// Exact interval image of the #3519 phoneme encoder over
+/// Exact interval image of the phoneme encoder over
 /// [`adversarial_phoneme_input_bounds`]: row-wise `x0 + x1 + 1.75`.
 fn adversarial_phoneme_exact_bounds() -> Vec<Bound> {
     vec![Bound::new(2.25, 2.75), Bound::new(4.25, 4.75)]
@@ -514,7 +514,7 @@ fn test_graph_model_consumer_verifies_talker_like_multi_frozen_packet_3924() {
 }
 
 // ---------------------------------------------------------------------------
-// Owned `GraphModel::new(...)` consumer smoke (#3958)
+// Owned `GraphModel::new(...)` consumer smoke
 //
 // Proves that a downstream consumer crate can use the owned `NetworkSpec`
 // construction path — the shape a translator naturally has after it already

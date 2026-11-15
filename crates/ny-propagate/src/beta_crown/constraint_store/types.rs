@@ -89,7 +89,7 @@ impl ConstraintHeader {
     /// Get the constraint sense.
     ///
     /// Returns `Err` if the byte is not a valid `ConstraintSense` discriminant,
-    /// which indicates GPU buffer corruption (#2261).
+    /// which indicates GPU buffer corruption.
     pub fn sense(&self) -> ny_core::Result<ConstraintSense> {
         match self.sense {
             0 => Ok(ConstraintSense::Le),
@@ -105,7 +105,7 @@ impl ConstraintHeader {
     /// Get the constraint origin.
     ///
     /// Returns `Err` if the byte is not a valid `ConstraintOrigin` discriminant,
-    /// which indicates GPU buffer corruption (#2261).
+    /// which indicates GPU buffer corruption.
     pub fn origin(&self) -> ny_core::Result<ConstraintOrigin> {
         match self.origin {
             0 => Ok(ConstraintOrigin::Split),

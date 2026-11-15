@@ -217,6 +217,84 @@ where
         }
     }
 
+    let (aw, s) = pooled_products(m, k, p, par, &af, &aabs, &wf, &wabs);
+
+    recycle_f64(af);
+    recycle_f64(aabs);
+    recycle_f64(wf);
+    recycle_f64(wabs);
+    (aw, s)
+}
+
+/// [`pooled_aw_and_abssum`] for a caller that already holds `W` and `|W|`
+/// widened to f64 in the SAME packed column-major layout this module fills per
+/// call — the immutable-layer-weight cache
+/// (`crate::layers::linear::crown_single::WidenedWeightF64`).
+///
+/// The pool recycled the `wf`/`wabs` BUFFERS but still re-converted the whole
+/// weight into them on every Linear backward of every domain; the layer's
+/// weight cannot change, so that conversion is pure repeat work.
+///
+/// BIT-IDENTICAL. `wf`/`wabs` are handed to `MatRef::from_column_major_slice`
+/// with the same `(k, p)` as the per-call fill, hence the same unit row stride
+/// and the same `k` column stride, over the same `k·p` f64 values (the `f32→f64`
+/// widening and f64 `abs` that produced them are EXACT). `matmul` therefore
+/// receives operand views it cannot distinguish from the ones it gets today,
+/// under the same `par` and the same `Accum::Replace`. Only the buffers'
+/// ADDRESSES differ — and this path already hands faer pool-recycled buffers of
+/// arbitrary address under the raw-bit parity moat above.
+pub(crate) fn pooled_aw_and_abssum_with_widened<FA>(
+    m: usize,
+    k: usize,
+    p: usize,
+    par: Par,
+    a: FA,
+    wf: &[f64],
+    wabs: &[f64],
+) -> (Vec<f64>, Vec<f64>)
+where
+    FA: Fn(usize, usize) -> f64,
+{
+    #[cfg(test)]
+    POOLED_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+
+    debug_assert_eq!(wf.len(), k * p);
+    debug_assert_eq!(wabs.len(), k * p);
+
+    // Identical column-major operand fill to [`pooled_aw_and_abssum`]; only the
+    // `w` half is already done.
+    let mut af = take_f64(m * k);
+    let mut aabs = take_f64(m * k);
+    for j in 0..k {
+        let base = j * m;
+        for i in 0..m {
+            let v = a(i, j);
+            af[base + i] = v;
+            aabs[base + i] = v.abs();
+        }
+    }
+
+    let (aw, s) = pooled_products(m, k, p, par, &af, &aabs, wf, wabs);
+
+    recycle_f64(af);
+    recycle_f64(aabs);
+    (aw, s)
+}
+
+/// The two faer `matmul` dispatches shared by both entry points above, over
+/// already-filled column-major operands. Split out so the cached-weight entry
+/// can skip the `wf`/`wabs` refill without perturbing the arithmetic: same
+/// operand views, same `Accum::Replace`, same `par`, same destination layout.
+fn pooled_products(
+    m: usize,
+    k: usize,
+    p: usize,
+    par: Par,
+    af: &[f64],
+    aabs: &[f64],
+    wf: &[f64],
+    wabs: &[f64],
+) -> (Vec<f64>, Vec<f64>) {
     let mut aw = take_f64(m * p);
     let mut s = take_f64(m * p);
     {
@@ -231,11 +309,6 @@ where
         let s_dst = MatMut::from_column_major_slice_mut(&mut s[..m * p], m, p);
         matmul(s_dst, Accum::Replace, aabs_ref, wabs_ref, 1.0, par);
     }
-
-    recycle_f64(af);
-    recycle_f64(aabs);
-    recycle_f64(wf);
-    recycle_f64(wabs);
     (aw, s)
 }
 

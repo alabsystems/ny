@@ -16,7 +16,7 @@ use ndarray::Array2;
 use ny_core::{NyError, Result};
 
 use super::engine::{BackwardEngine, PassOut, Seed};
-use super::net::TwinNet;
+use super::net::{nominal_product_dust, TwinNet};
 use super::root::{gates_from_box, repair_upper_lines, RetainedLayer, RootGates};
 use super::rounding::{certify_up, gamma_n, next_down, next_up, slack16, RoundMode, UNIT};
 
@@ -166,7 +166,29 @@ pub struct HeadGates {
 
 /// DeepPoly head gates from a (clamped) y-box.
 pub fn head_gates(ybox: &YBox, mode: RoundMode) -> HeadGates {
-    let (alpha, mut s, mut c) = gates_from_box(&ybox.ly, &ybox.uy);
+    head_gates_with(ybox, mode, None)
+}
+
+/// #head-alpha: [`head_gates`] with the root's optimized head slopes
+/// (`RootGates::head_alpha`) substituted for the binary area heuristic on every
+/// head neuron that is UNSTABLE in this box (`ly < 0 < uy`).
+///
+/// Sound for any box: an unstable relu admits `alpha * y` as a lower line for
+/// every `alpha` in `[0, 1]`, and the slope is clamped into that interval (a
+/// non-finite slope keeps the heuristic). Stable neurons keep their exact lines
+/// (`(1,1,0)` / `(0,0,0)`), and the upper chord `(s, c)` is untouched. The seed
+/// arithmetic in `margin_seed` / `compose_viay` already charges the rounding of
+/// `wp * alpha` for an arbitrary f64 `alpha`. `None`, or a length mismatch, is
+/// the heuristic bit-identically.
+pub fn head_gates_with(ybox: &YBox, mode: RoundMode, head_alpha: Option<&[f64]>) -> HeadGates {
+    let (mut alpha, mut s, mut c) = gates_from_box(&ybox.ly, &ybox.uy);
+    if let Some(ha) = head_alpha.filter(|ha| ha.len() == alpha.len()) {
+        for (j, a) in alpha.iter_mut().enumerate() {
+            if ybox.ly[j] < 0.0 && ybox.uy[j] > 0.0 && ha[j].is_finite() {
+                *a = ha[j].clamp(0.0, 1.0);
+            }
+        }
+    }
     if mode.outward() {
         repair_upper_lines(&ybox.ly, &ybox.uy, &mut s, &mut c);
     }
@@ -209,6 +231,19 @@ pub fn margin_seed(
                 let mag = (mb.wp[r0 * n_y + j] * gates.alpha[j]).abs()
                     + (mb.wn[r0 * n_y + j] * gates.s[j]).abs();
                 e[[j, r0]] = slack16(3.0 * UNIT * mag);
+                if head_underflow(mb.wp[r0 * n_y + j], gates.alpha[j])
+                    || head_underflow(mb.wn[r0 * n_y + j], gates.s[j])
+                {
+                    let lo = head_sum_lo(
+                        head_prod_lo(mb.wp[r0 * n_y + j], gates.alpha[j]),
+                        head_prod_lo(mb.wn[r0 * n_y + j], gates.s[j]),
+                    );
+                    let hi = head_sum_hi(
+                        head_prod_hi(mb.wp[r0 * n_y + j], gates.alpha[j]),
+                        head_prod_hi(mb.wn[r0 * n_y + j], gates.s[j]),
+                    );
+                    e[[j, r0]] = e[[j, r0]].max(head_gap(v, lo, hi));
+                }
             }
         }
     }
@@ -225,11 +260,16 @@ pub fn margin_seed(
         let mut abs_c = 0.0;
         let mut acc_m = 0.0;
         let mut abs_m = 0.0;
+        let (mut underflow_c, mut underflow_m) = (false, false);
         for j in 0..n_y {
             acc_c += wn[j] * gates.c[j];
             abs_c += wn[j].abs() * gates.c[j];
             acc_m += wp[j] * zl[j] + wn[j] * zu[j];
             abs_m += wp[j] * zl[j] + wn[j].abs() * zu[j];
+            if mode.outward() {
+                underflow_c |= head_underflow(wn[j], gates.c[j]);
+                underflow_m |= head_underflow(wp[j], zl[j]) || head_underflow(wn[j], zu[j]);
+            }
         }
         cst[r0] = acc_c + mb.cst[r0];
         m1[r0] = acc_m + mb.cst[r0];
@@ -237,6 +277,35 @@ pub fn margin_seed(
             cst_err[r0] = slack16(gam * (abs_c + mb.cst[r0].abs()));
             let sl = next_up(gam * (abs_m + mb.cst[r0].abs()));
             m1[r0] = next_down(next_down(m1[r0] - sl));
+            if underflow_c {
+                let (mut lo, mut hi) = (0.0, 0.0);
+                for j in 0..n_y {
+                    lo = head_sum_lo(lo, head_prod_lo(wn[j], gates.c[j]));
+                    hi = head_sum_hi(hi, head_prod_hi(wn[j], gates.c[j]));
+                }
+                cst_err[r0] = cst_err[r0].max(head_gap(
+                    cst[r0],
+                    head_sum_lo(lo, mb.cst[r0]),
+                    head_sum_hi(hi, mb.cst[r0]),
+                ));
+            }
+            if underflow_m {
+                let mut lo = 0.0;
+                for j in 0..n_y {
+                    lo = head_sum_lo(
+                        lo,
+                        head_sum_lo(head_prod_lo(wp[j], zl[j]), head_prod_lo(wn[j], zu[j])),
+                    );
+                }
+                let directed = head_sum_lo(lo, mb.cst[r0]);
+                // NaN must remain visible to the caller's finite firewall;
+                // f64::min itself would hide a failed confirmation.
+                m1[r0] = if directed.is_finite() {
+                    m1[r0].min(directed)
+                } else {
+                    f64::NAN
+                };
+            }
         }
     }
     MarginSeed {
@@ -289,12 +358,20 @@ pub fn row_dots(root: &RootGates, pack: &PassOut) -> RowDots {
         let xa = root.xabs[i];
         let arow = &asl[i * r..(i + 1) * r];
         for (j, av) in arow.iter().enumerate() {
-            abs_dot[j] += av.abs() * xa;
+            if root.mode.outward() && head_underflow(av.abs(), xa) {
+                abs_dot[j] = head_sum_hi(abs_dot[j], head_prod_hi(av.abs(), xa));
+            } else {
+                abs_dot[j] += av.abs() * xa;
+            }
         }
         if let Some(es) = esl {
             let erow = &es[i * r..(i + 1) * r];
             for (j, ev) in erow.iter().enumerate() {
-                err_dot[j] += ev * xa;
+                if root.mode.outward() && head_underflow(*ev, xa) {
+                    err_dot[j] = head_sum_hi(err_dot[j], head_prod_hi(*ev, xa));
+                } else {
+                    err_dot[j] += ev * xa;
+                }
             }
         }
     }
@@ -332,10 +409,17 @@ pub fn compose_viay(
     for r0 in 0..nf {
         let wp = &mb.wp[r0 * n_y..(r0 + 1) * n_y];
         let wn = &mb.wn[r0 * n_y..(r0 + 1) * n_y];
+        let mut underflow = false;
         // Composition coefficients cA = wp*alpha (>=0 side on lower rows),
         // cB = wn*s (<=0 side on upper rows).
         let ca: Vec<f64> = (0..n_y).map(|j| wp[j] * gates.alpha[j]).collect();
         let cb: Vec<f64> = (0..n_y).map(|j| wn[j] * gates.s[j]).collect();
+        if mode.outward() {
+            for j in 0..n_y {
+                underflow |=
+                    head_underflow(wp[j], gates.alpha[j]) || head_underflow(wn[j], gates.s[j]);
+            }
+        }
         // rows_r[k] = sum_j ca[j]*Al[k][j] + cb[j]*Au[k][j]
         for (k, rb) in rowbuf.iter_mut().enumerate() {
             let arow = &asl[k * n_y..(k + 1) * n_y];
@@ -343,6 +427,9 @@ pub fn compose_viay(
             let mut acc = 0.0;
             for j in 0..n_y {
                 acc += ca[j] * arow[j] + cb[j] * urow[j];
+                if mode.outward() {
+                    underflow |= head_underflow(ca[j], arow[j]) || head_underflow(cb[j], urow[j]);
+                }
             }
             *rb = acc;
         }
@@ -351,6 +438,11 @@ pub fn compose_viay(
         for j in 0..n_y {
             bias += ca[j] * al.b[j] + cb[j] * au.b[j];
             cterm += wn[j] * gates.c[j];
+            if mode.outward() {
+                underflow |= head_underflow(ca[j], al.b[j])
+                    || head_underflow(cb[j], au.b[j])
+                    || head_underflow(wn[j], gates.c[j]);
+            }
         }
         // Concretize rowbuf over the box.
         let mut v = 0.0;
@@ -358,6 +450,10 @@ pub fn compose_viay(
         for (k, rb) in rowbuf.iter().enumerate() {
             v += rb * root.mid[k];
             rr += rb.abs() * root.rad[k];
+            if mode.outward() {
+                underflow |=
+                    head_underflow(*rb, root.mid[k]) || head_underflow(rb.abs(), root.rad[k]);
+            }
         }
         let raw = v - rr + bias + cterm + mb.cst[r0];
         if !mode.outward() {
@@ -371,6 +467,15 @@ pub fn compose_viay(
         for j in 0..n_y {
             let ea = slack16(3.0 * UNIT * ca[j].abs());
             let ebc = slack16(3.0 * UNIT * cb[j].abs());
+            underflow |= head_underflow(3.0 * UNIT, ca[j].abs())
+                || head_underflow(3.0 * UNIT, cb[j].abs())
+                || head_underflow(ca[j].abs() + ea, al_dots.err_dot[j])
+                || head_underflow(ea, al_dots.abs_dot[j])
+                || head_underflow(cb[j].abs() + ebc, au_dots.err_dot[j])
+                || head_underflow(ebc, au_dots.abs_dot[j])
+                || head_underflow(ca[j].abs(), al_dots.abs_dot[j])
+                || head_underflow(cb[j].abs(), au_dots.abs_dot[j])
+                || head_underflow(wn[j].abs(), gates.c[j]);
             pen += (ca[j].abs() + ea) * al_dots.err_dot[j]
                 + ea * al_dots.abs_dot[j]
                 + (cb[j].abs() + ebc) * au_dots.err_dot[j]
@@ -384,6 +489,16 @@ pub fn compose_viay(
             certify_up(pen, 1e-13) + next_up((gam_row + gam_con) * certify_up(tmag, 1e-13)),
         );
         out[r0] = next_down(next_down(raw - slack));
+        underflow |= head_underflow(gam_row + gam_con, certify_up(tmag, 1e-13));
+        if underflow {
+            let check = || Ok(());
+            let confirmation = HeadPoll::new(&check)
+                .and_then(|mut poll| head_confirm_viay_row(root, mb, gates, al, au, r0, &mut poll));
+            out[r0] = match confirmation {
+                Ok(directed) if directed.is_finite() => out[r0].min(directed),
+                _ => f64::NAN,
+            };
+        }
     }
     out
 }
@@ -662,3 +777,962 @@ pub fn head_variant(
     }
     best
 }
+
+// These are numerical adapters, not proof producers. The prepared ordinary
+// evaluation owner holds the original source, row planes and SAME-ledger
+// admission for the quoted overlap before calling them. A callback cannot
+// authenticate supplied numerical premises or create a new proof scope.
+const HEAD_POLL: usize = 256;
+const HEAD_META: usize = 4096;
+
+/// Conservative complete local arithmetic buffers, including transient
+/// overlap. The caller retains the corresponding original WorkLease while
+/// any returned numerical payload remains live; the owned evaluation prices
+/// all simultaneously retained helper outputs, not just their maximum.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct HeadArithmeticRequest {
+    pub(super) scratch_bytes: usize,
+    pub(super) work: u64,
+}
+
+fn head_invalid(message: &'static str) -> NyError {
+    NyError::InvalidSpec(message.into())
+}
+fn head_add(a: usize, b: usize) -> Result<usize> {
+    a.checked_add(b)
+        .ok_or_else(|| head_invalid("cooperative head size overflow"))
+}
+fn head_mul(a: usize, b: usize) -> Result<usize> {
+    a.checked_mul(b)
+        .ok_or_else(|| head_invalid("cooperative head size overflow"))
+}
+fn head_request(cells: usize, ids: usize, units: usize) -> Result<HeadArithmeticRequest> {
+    Ok(HeadArithmeticRequest {
+        scratch_bytes: head_add(
+            HEAD_META,
+            head_add(head_mul(cells, 8)?, head_mul(ids, size_of::<usize>())?)?,
+        )?,
+        work: u64::try_from(units).map_err(|_| head_invalid("cooperative head work overflow"))?,
+    })
+}
+pub(super) fn margin_batch_request(n_y: usize, nf: usize) -> Result<HeadArithmeticRequest> {
+    let cells = head_mul(n_y, nf)?;
+    head_request(
+        head_add(head_mul(2, cells)?, nf)?,
+        nf,
+        head_add(head_mul(cells, 32)?, head_add(head_mul(nf, 16)?, 256)?)?,
+    )
+}
+pub(super) fn head_gates_request(n_y: usize) -> Result<HeadArithmeticRequest> {
+    head_request(
+        head_mul(3, head_add(n_y, n_y.min(HEAD_POLL))?)?,
+        0,
+        head_add(head_mul(n_y, 256)?, 256)?,
+    )
+}
+pub(super) fn margin_seed_request(
+    n_y: usize,
+    nf: usize,
+    mode: RoundMode,
+) -> Result<HeadArithmeticRequest> {
+    let cells = head_mul(n_y, nf)?;
+    let matrix_count = if mode.outward() { 2 } else { 1 };
+    head_request(
+        head_add(
+            head_mul(matrix_count, cells)?,
+            head_add(head_mul(3, nf)?, head_mul(2, n_y)?)?,
+        )?,
+        0,
+        head_add(
+            head_mul(cells, 256)?,
+            head_add(head_mul(n_y, 32)?, head_add(head_mul(nf, 64)?, 256)?)?,
+        )?,
+    )
+}
+pub(super) fn row_dots_request(n_in: usize, columns: usize) -> Result<HeadArithmeticRequest> {
+    head_request(
+        head_mul(2, columns)?,
+        0,
+        head_add(
+            head_mul(head_mul(n_in, columns)?, 64)?,
+            head_add(head_mul(columns, 32)?, 256)?,
+        )?,
+    )
+}
+pub(super) fn compose_viay_request(
+    n_in: usize,
+    n_y: usize,
+    nf: usize,
+) -> Result<HeadArithmeticRequest> {
+    head_request(
+        head_add(nf, head_add(head_mul(3, n_in)?, head_mul(6, n_y)?)?)?,
+        0,
+        head_add(
+            head_mul(head_mul(head_mul(nf, head_add(n_in, 1)?)?, n_y)?, 512)?,
+            head_add(
+                head_mul(head_mul(head_add(nf, 1)?, head_add(n_in, n_y)?)?, 128)?,
+                256,
+            )?,
+        )?,
+    )
+}
+pub(super) fn direct_from_lower_request(nf: usize) -> Result<HeadArithmeticRequest> {
+    head_request(nf, 0, head_add(head_mul(nf, 32)?, 256)?)
+}
+
+struct HeadPoll<'a> {
+    check: &'a dyn Fn() -> Result<()>,
+    cells: usize,
+}
+impl<'a> HeadPoll<'a> {
+    fn new(check: &'a dyn Fn() -> Result<()>) -> Result<Self> {
+        check()?;
+        Ok(Self { check, cells: 0 })
+    }
+    #[inline]
+    fn tick(&mut self) -> Result<()> {
+        self.cells += 1;
+        if self.cells == HEAD_POLL {
+            self.cells = 0;
+            (self.check)()?;
+        }
+        Ok(())
+    }
+    fn finish(&self) -> Result<()> {
+        (self.check)()
+    }
+}
+fn head_buffer<T: Copy>(n: usize, value: T, poll: &mut HeadPoll<'_>) -> Result<Vec<T>> {
+    poll.finish()?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(n)
+        .map_err(|_| head_invalid("cooperative head buffer allocation refused"))?;
+    poll.finish()?;
+    if out.capacity() != n {
+        return Err(NyError::CpuMemoryExceeded {
+            required_bytes: out.capacity().saturating_mul(size_of::<T>()),
+            budget_bytes: n.saturating_mul(size_of::<T>()),
+            site: "cooperative head buffer actual capacity",
+        });
+    }
+    for _ in 0..n {
+        poll.tick()?;
+        out.push(value);
+    }
+    poll.finish()?;
+    Ok(out)
+}
+fn head_matrix(rows: usize, cols: usize, poll: &mut HeadPoll<'_>) -> Result<Array2<f64>> {
+    Array2::from_shape_vec((rows, cols), head_buffer(head_mul(rows, cols)?, 0.0, poll)?)
+        .map_err(|_| head_invalid("cooperative head matrix shape"))
+}
+fn head_qualify(mode: RoundMode) -> Result<()> {
+    if mode.outward() {
+        ny_core::require_f64_interval_proof_environment()?;
+    }
+    Ok(())
+}
+fn head_finite(x: f64) -> Result<()> {
+    if !x.is_finite() {
+        return Err(head_invalid("cooperative head nonfinite arithmetic"));
+    }
+    Ok(())
+}
+// Qualified RN+gradual-underflow operations lie between their adjacent
+// representable values. Exact zero/additive identity and +/-1 products are
+// preserved, avoiding artificial dust on genuine zero error lanes.
+#[inline]
+fn head_underflow(a: f64, b: f64) -> bool {
+    nominal_product_dust(a, b) != 0.0
+}
+#[inline]
+fn head_endpoint(value: f64) -> f64 {
+    if value.is_finite() {
+        value
+    } else {
+        f64::NAN
+    }
+}
+#[inline]
+fn head_prod_lo(a: f64, b: f64) -> f64 {
+    if !a.is_finite() || !b.is_finite() {
+        return f64::NAN;
+    }
+    let p = a * b;
+    head_endpoint(
+        if a == 0.0 || b == 0.0 || a.abs() == 1.0 || b.abs() == 1.0 {
+            p
+        } else {
+            next_down(p)
+        },
+    )
+}
+#[inline]
+fn head_prod_hi(a: f64, b: f64) -> f64 {
+    if !a.is_finite() || !b.is_finite() {
+        return f64::NAN;
+    }
+    let p = a * b;
+    head_endpoint(
+        if a == 0.0 || b == 0.0 || a.abs() == 1.0 || b.abs() == 1.0 {
+            p
+        } else {
+            next_up(p)
+        },
+    )
+}
+#[inline]
+fn head_sum_lo(a: f64, b: f64) -> f64 {
+    if !a.is_finite() || !b.is_finite() {
+        return f64::NAN;
+    }
+    head_endpoint(if a == 0.0 {
+        b
+    } else if b == 0.0 {
+        a
+    } else if a == -b {
+        0.0
+    } else {
+        next_down(a + b)
+    })
+}
+#[inline]
+fn head_sum_hi(a: f64, b: f64) -> f64 {
+    if !a.is_finite() || !b.is_finite() {
+        return f64::NAN;
+    }
+    head_endpoint(if a == 0.0 {
+        b
+    } else if b == 0.0 {
+        a
+    } else if a == -b {
+        0.0
+    } else {
+        next_up(a + b)
+    })
+}
+#[inline]
+fn head_gap(center: f64, lo: f64, hi: f64) -> f64 {
+    if !center.is_finite() || !lo.is_finite() || !hi.is_finite() {
+        return f64::INFINITY;
+    }
+    let left = head_sum_hi(center, -lo);
+    let right = head_sum_hi(hi, -center);
+    if !left.is_finite() || !right.is_finite() {
+        return f64::INFINITY;
+    }
+    left.max(right).max(0.0)
+}
+#[inline]
+fn head_interval_product(al: f64, au: f64, bl: f64, bu: f64) -> (f64, f64) {
+    let low = [
+        head_prod_lo(al, bl),
+        head_prod_lo(al, bu),
+        head_prod_lo(au, bl),
+        head_prod_lo(au, bu),
+    ];
+    let high = [
+        head_prod_hi(al, bl),
+        head_prod_hi(al, bu),
+        head_prod_hi(au, bl),
+        head_prod_hi(au, bu),
+    ];
+    // f64::min/max ignore NaN: check every endpoint BEFORE selecting, so an
+    // overflowed interval can never be hidden by another finite corner.
+    if low.iter().chain(&high).any(|v| !v.is_finite()) {
+        return (f64::NAN, f64::NAN);
+    }
+    (
+        low[0].min(low[1]).min(low[2]).min(low[3]),
+        high[0].max(high[1]).max(high[2]).max(high[3]),
+    )
+}
+
+/// Paid caller numerical adapter; identical nominal head-difference order.
+pub(super) fn margin_batch_with_checkpoint(
+    net: &TwinNet,
+    t: usize,
+    adv: &[usize],
+    check: &dyn Fn() -> Result<()>,
+) -> Result<MarginBatch> {
+    let mut poll = HeadPoll::new(check)?;
+    ny_core::require_f64_interval_proof_environment()?;
+    let (w2, b2, (n_out, n_y)) = net.gemm2();
+    if t >= n_out {
+        return Err(head_invalid("margin_row: class out of range"));
+    }
+    for &j in adv {
+        poll.tick()?;
+        if j >= n_out {
+            return Err(head_invalid("margin_row: class out of range"));
+        }
+    }
+    let nf = adv.len();
+    let mut wp = head_buffer(head_mul(nf, n_y)?, 0.0, &mut poll)?;
+    let mut wn = head_buffer(head_mul(nf, n_y)?, 0.0, &mut poll)?;
+    let mut cst = head_buffer(nf, 0.0, &mut poll)?;
+    let mut classes = head_buffer(nf, 0usize, &mut poll)?;
+    for (r, &j) in adv.iter().enumerate() {
+        for k in 0..n_y {
+            poll.tick()?;
+            let w = w2[t * n_y + k] - w2[j * n_y + k];
+            head_finite(w)?;
+            wp[r * n_y + k] = w.max(0.0);
+            wn[r * n_y + k] = w.min(0.0);
+        }
+        poll.tick()?;
+        cst[r] = b2[t] - b2[j];
+        head_finite(cst[r])?;
+        classes[r] = j;
+    }
+    poll.finish()?;
+    Ok(MarginBatch {
+        t,
+        adv: classes,
+        wp,
+        wn,
+        cst,
+        n_y,
+    })
+}
+
+/// Same original gate formulas and repair, bounded to a paid 256-row chunk.
+pub(super) fn head_gates_with_checkpoint(
+    ybox: &YBox,
+    mode: RoundMode,
+    head_alpha: Option<&[f64]>,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<HeadGates> {
+    let mut poll = HeadPoll::new(check)?;
+    head_qualify(mode)?;
+    let n = ybox.ly.len();
+    if ybox.uy.len() != n {
+        return Err(head_invalid("cooperative head box shape"));
+    }
+    let mut alpha = head_buffer(n, 0.0, &mut poll)?;
+    let mut s = head_buffer(n, 0.0, &mut poll)?;
+    let mut c = head_buffer(n, 0.0, &mut poll)?;
+    for first in (0..n).step_by(HEAD_POLL) {
+        let end = (first + HEAD_POLL).min(n);
+        for j in first..end {
+            poll.tick()?;
+            if !ybox.ly[j].is_finite() || !ybox.uy[j].is_finite() || ybox.ly[j] > ybox.uy[j] {
+                return Err(head_invalid("cooperative head invalid box"));
+            }
+        }
+        poll.finish()?;
+        let (mut a, mut ss, mut cc) = gates_from_box(&ybox.ly[first..end], &ybox.uy[first..end]);
+        if a.capacity() != end - first
+            || ss.capacity() != end - first
+            || cc.capacity() != end - first
+        {
+            return Err(head_invalid("cooperative head gate chunk capacity"));
+        }
+        poll.finish()?;
+        if let Some(ha) = head_alpha.filter(|ha| ha.len() == n) {
+            for (offset, av) in a.iter_mut().enumerate() {
+                poll.tick()?;
+                let j = first + offset;
+                if ybox.ly[j] < 0.0 && ybox.uy[j] > 0.0 && ha[j].is_finite() {
+                    *av = ha[j].clamp(0.0, 1.0);
+                }
+            }
+        }
+        poll.finish()?;
+        if mode.outward() {
+            repair_upper_lines(&ybox.ly[first..end], &ybox.uy[first..end], &mut ss, &mut cc);
+        }
+        poll.finish()?;
+        for offset in 0..end - first {
+            poll.tick()?;
+            alpha[first + offset] = a[offset];
+            s[first + offset] = ss[offset];
+            c[first + offset] = cc[offset];
+            head_finite(a[offset])?;
+            head_finite(ss[offset])?;
+            head_finite(cc[offset])?;
+        }
+    }
+    poll.finish()?;
+    Ok(HeadGates { alpha, s, c })
+}
+fn head_shapes(mb: &MarginBatch, gates: &HeadGates) -> Result<()> {
+    let n = mb.n_y;
+    let cells = head_mul(mb.nf(), n)?;
+    if mb.wp.len() != cells
+        || mb.wn.len() != cells
+        || mb.cst.len() != mb.nf()
+        || gates.alpha.len() != n
+        || gates.s.len() != n
+        || gates.c.len() != n
+    {
+        return Err(head_invalid("cooperative head margin/gate shape"));
+    }
+    Ok(())
+}
+
+/// Nominal seed is legacy-bit-identical. Its errors and scalar bound include
+/// independent directed confirmations, including every subnormal product and
+/// cancellation; no relative-only positive m1 can enter a prepared close.
+pub(super) fn margin_seed_with_checkpoint(
+    mb: &MarginBatch,
+    gates: &HeadGates,
+    ybox: &YBox,
+    mode: RoundMode,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<MarginSeed> {
+    let mut poll = HeadPoll::new(check)?;
+    head_qualify(mode)?;
+    head_shapes(mb, gates)?;
+    let (nf, n_y) = (mb.nf(), mb.n_y);
+    if ybox.ly.len() != n_y || ybox.uy.len() != n_y {
+        return Err(head_invalid("cooperative head seed box shape"));
+    }
+    let mut s_mat = head_matrix(n_y, nf, &mut poll)?;
+    let mut e_mat = if mode.outward() {
+        Some(head_matrix(n_y, nf, &mut poll)?)
+    } else {
+        None
+    };
+    for j in 0..n_y {
+        poll.tick()?;
+        if !ybox.ly[j].is_finite()
+            || !ybox.uy[j].is_finite()
+            || ybox.ly[j] > ybox.uy[j]
+            || !gates.alpha[j].is_finite()
+            || !(0.0..=1.0).contains(&gates.alpha[j])
+            || !gates.s[j].is_finite()
+            || !(0.0..=1.0).contains(&gates.s[j])
+            || !gates.c[j].is_finite()
+            || gates.c[j] < 0.0
+        {
+            return Err(head_invalid("cooperative head seed invalid gates/box"));
+        }
+        for r0 in 0..nf {
+            poll.tick()?;
+            let wp = mb.wp[r0 * n_y + j];
+            let wn = mb.wn[r0 * n_y + j];
+            if !wp.is_finite() || wp < 0.0 || !wn.is_finite() || wn > 0.0 {
+                return Err(head_invalid("cooperative head margin signs"));
+            }
+            let v = wp * gates.alpha[j] + wn * gates.s[j];
+            head_finite(v)?;
+            s_mat[[j, r0]] = v;
+            if let Some(e) = e_mat.as_mut() {
+                let mag = (wp * gates.alpha[j]).abs() + (wn * gates.s[j]).abs();
+                let lo = head_sum_lo(
+                    head_prod_lo(wp, gates.alpha[j]),
+                    head_prod_lo(wn, gates.s[j]),
+                );
+                let hi = head_sum_hi(
+                    head_prod_hi(wp, gates.alpha[j]),
+                    head_prod_hi(wn, gates.s[j]),
+                );
+                e[[j, r0]] = slack16(3.0 * UNIT * mag).max(head_gap(v, lo, hi));
+                head_finite(e[[j, r0]])?;
+            }
+        }
+    }
+    let gam = gamma_n(head_add(n_y, 8)?);
+    let mut cst = head_buffer(nf, 0.0, &mut poll)?;
+    let mut cst_err = head_buffer(nf, 0.0, &mut poll)?;
+    let mut m1 = head_buffer(nf, 0.0, &mut poll)?;
+    let mut zl = head_buffer(n_y, 0.0, &mut poll)?;
+    let mut zu = head_buffer(n_y, 0.0, &mut poll)?;
+    for j in 0..n_y {
+        poll.tick()?;
+        zl[j] = ybox.ly[j].max(0.0);
+    }
+    for j in 0..n_y {
+        poll.tick()?;
+        zu[j] = ybox.uy[j].max(0.0);
+    }
+    for r0 in 0..nf {
+        let wp = &mb.wp[r0 * n_y..(r0 + 1) * n_y];
+        let wn = &mb.wn[r0 * n_y..(r0 + 1) * n_y];
+        let (mut acc_c, mut abs_c, mut acc_m, mut abs_m) = (0.0, 0.0, 0.0, 0.0);
+        let (mut cl, mut cu, mut ml) = (0.0, 0.0, 0.0);
+        for j in 0..n_y {
+            poll.tick()?;
+            acc_c += wn[j] * gates.c[j];
+            abs_c += wn[j].abs() * gates.c[j];
+            acc_m += wp[j] * zl[j] + wn[j] * zu[j];
+            abs_m += wp[j] * zl[j] + wn[j].abs() * zu[j];
+            if mode.outward() {
+                cl = head_sum_lo(cl, head_prod_lo(wn[j], gates.c[j]));
+                cu = head_sum_hi(cu, head_prod_hi(wn[j], gates.c[j]));
+                ml = head_sum_lo(
+                    ml,
+                    head_sum_lo(head_prod_lo(wp[j], zl[j]), head_prod_lo(wn[j], zu[j])),
+                );
+            }
+        }
+        poll.tick()?;
+        head_finite(mb.cst[r0])?;
+        cst[r0] = acc_c + mb.cst[r0];
+        m1[r0] = acc_m + mb.cst[r0];
+        if mode.outward() {
+            cl = head_sum_lo(cl, mb.cst[r0]);
+            cu = head_sum_hi(cu, mb.cst[r0]);
+            cst_err[r0] = slack16(gam * (abs_c + mb.cst[r0].abs())).max(head_gap(cst[r0], cl, cu));
+            let sl = next_up(gam * (abs_m + mb.cst[r0].abs()));
+            let directed_m1 = head_sum_lo(ml, mb.cst[r0]);
+            head_finite(directed_m1)?;
+            m1[r0] = next_down(next_down(m1[r0] - sl)).min(directed_m1);
+        }
+        head_finite(cst[r0])?;
+        head_finite(cst_err[r0])?;
+        head_finite(m1[r0])?;
+    }
+    poll.finish()?;
+    Ok(MarginSeed {
+        seed: Seed { s: s_mat, e: e_mat },
+        cst,
+        cst_err,
+        m1,
+        zu,
+    })
+}
+
+fn head_pack_shape(root: &RootGates, pack: &PassOut, columns: usize) -> Result<()> {
+    let n = root.mid.len();
+    if root.xabs.len() != n
+        || root.lo.len() != n
+        || root.hi.len() != n
+        || root.rad.len() != n
+        || pack.a.dim() != (n, columns)
+        || !pack.a.is_standard_layout()
+        || pack.b.len() != columns
+        || pack.eb.len() != columns
+        || pack
+            .e
+            .as_ref()
+            .is_some_and(|e| e.dim() != (n, columns) || !e.is_standard_layout())
+    {
+        return Err(head_invalid("cooperative head row pack shape"));
+    }
+    if root.mode.outward() && pack.e.is_none() {
+        return Err(head_invalid("cooperative head missing row error planes"));
+    }
+    Ok(())
+}
+/// Fully directed magnitude/error dots, not RN error products rounded to zero.
+pub(super) fn row_dots_with_checkpoint(
+    root: &RootGates,
+    pack: &PassOut,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<RowDots> {
+    let mut poll = HeadPoll::new(check)?;
+    head_qualify(root.mode)?;
+    let (n, r) = (root.mid.len(), pack.a.ncols());
+    head_pack_shape(root, pack, r)?;
+    let asl = pack
+        .a
+        .as_slice()
+        .ok_or_else(|| head_invalid("cooperative head row layout"))?;
+    let esl = pack.e.as_ref().and_then(|e| e.as_slice());
+    let mut abs_dot = head_buffer(r, 0.0, &mut poll)?;
+    let mut err_dot = head_buffer(r, 0.0, &mut poll)?;
+    for i in 0..n {
+        let xa = root.xabs[i].max(root.lo[i].abs().max(root.hi[i].abs()));
+        if !root.lo[i].is_finite()
+            || !root.hi[i].is_finite()
+            || root.lo[i] > root.hi[i]
+            || !xa.is_finite()
+            || xa < 0.0
+        {
+            return Err(head_invalid("cooperative head input magnitude"));
+        }
+        let arow = &asl[i * r..(i + 1) * r];
+        for (j, av) in arow.iter().enumerate() {
+            poll.tick()?;
+            head_finite(*av)?;
+            abs_dot[j] = if root.mode.outward() {
+                head_sum_hi(abs_dot[j], head_prod_hi(av.abs(), xa))
+            } else {
+                abs_dot[j] + av.abs() * xa
+            };
+        }
+        if let Some(es) = esl {
+            let erow = &es[i * r..(i + 1) * r];
+            for (j, ev) in erow.iter().enumerate() {
+                poll.tick()?;
+                if !ev.is_finite() || *ev < 0.0 {
+                    return Err(head_invalid("cooperative head row error"));
+                }
+                err_dot[j] = if root.mode.outward() {
+                    head_sum_hi(err_dot[j], head_prod_hi(*ev, xa))
+                } else {
+                    err_dot[j] + ev * xa
+                };
+            }
+        }
+    }
+    for j in 0..r {
+        poll.tick()?;
+        head_finite(pack.b[j])?;
+        if !pack.eb[j].is_finite() || pack.eb[j] < 0.0 {
+            return Err(head_invalid("cooperative head bias error"));
+        }
+        if root.mode.outward() {
+            abs_dot[j] = head_sum_hi(abs_dot[j], pack.b[j].abs());
+            err_dot[j] = head_sum_hi(err_dot[j], pack.eb[j]);
+        } else {
+            abs_dot[j] += pack.b[j].abs();
+            err_dot[j] += pack.eb[j];
+        }
+        head_finite(abs_dot[j])?;
+        head_finite(err_dot[j])?;
+    }
+    poll.finish()?;
+    Ok(RowDots { abs_dot, err_dot })
+}
+
+/// Precomputed direct concretization plus its own complete constant error.
+pub(super) fn per_class_direct_from_lower_with_checkpoint(
+    low: &[f64],
+    ms: &MarginSeed,
+    rows: std::ops::Range<usize>,
+    mode: RoundMode,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<Vec<f64>> {
+    let mut poll = HeadPoll::new(check)?;
+    head_qualify(mode)?;
+    if rows.start > rows.end
+        || rows.end > low.len()
+        || rows.end > ms.cst.len()
+        || rows.end > ms.cst_err.len()
+    {
+        return Err(head_invalid("cooperative head direct shape"));
+    }
+    let mut out = head_buffer(rows.len(), 0.0, &mut poll)?;
+    for (k, r0) in rows.enumerate() {
+        poll.tick()?;
+        head_finite(low[r0])?;
+        head_finite(ms.cst[r0])?;
+        if !ms.cst_err[r0].is_finite() || ms.cst_err[r0] < 0.0 {
+            return Err(head_invalid("cooperative head direct constant error"));
+        }
+        let v = low[r0] + ms.cst[r0];
+        out[k] = if mode.outward() {
+            next_down(next_down(v - next_up(ms.cst_err[r0])))
+        } else {
+            v
+        };
+        head_finite(out[k])?;
+    }
+    poll.finish()?;
+    Ok(out)
+}
+
+/// Same nominal composition order plus an independent fully directed lower
+/// confirmation. The original margin-difference residual remains the sealed
+/// caller's responsibility. Each row uses BOTH complete coefficient/bias
+/// error planes over the authentic original input magnitude/domain.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn compose_viay_with_checkpoint(
+    eng: &BackwardEngine<'_>,
+    mb: &MarginBatch,
+    gates: &HeadGates,
+    al: &PassOut,
+    au: &PassOut,
+    al_dots: &RowDots,
+    au_dots: &RowDots,
+    mode: RoundMode,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<Vec<f64>> {
+    let mut poll = HeadPoll::new(check)?;
+    head_qualify(mode)?;
+    head_shapes(mb, gates)?;
+    let (nf, n_y) = (mb.nf(), mb.n_y);
+    let root = eng.root;
+    let n_in = root.mid.len();
+    head_pack_shape(root, al, n_y)?;
+    head_pack_shape(root, au, n_y)?;
+    if root.mode != mode
+        || root.lo.len() != n_in
+        || root.hi.len() != n_in
+        || al_dots.abs_dot.len() != n_y
+        || al_dots.err_dot.len() != n_y
+        || au_dots.abs_dot.len() != n_y
+        || au_dots.err_dot.len() != n_y
+    {
+        return Err(head_invalid("cooperative head composition shape/mode"));
+    }
+    let asl =
+        al.a.as_slice()
+            .ok_or_else(|| head_invalid("cooperative head row layout"))?;
+    let usl =
+        au.a.as_slice()
+            .ok_or_else(|| head_invalid("cooperative head row layout"))?;
+    let gam_row = gamma_n(head_add(head_mul(2, n_y)?, 8)?);
+    let gam_con = gamma_n(head_add(n_in, 16)?);
+    let mut out = head_buffer(nf, 0.0, &mut poll)?;
+    let mut rowbuf = head_buffer(n_in, 0.0, &mut poll)?;
+    let mut rowlo = head_buffer(n_in, 0.0, &mut poll)?;
+    let mut rowhi = head_buffer(n_in, 0.0, &mut poll)?;
+    let mut ca = head_buffer(n_y, 0.0, &mut poll)?;
+    let mut cb = head_buffer(n_y, 0.0, &mut poll)?;
+    let mut cal = head_buffer(n_y, 0.0, &mut poll)?;
+    let mut cau = head_buffer(n_y, 0.0, &mut poll)?;
+    let mut cbl = head_buffer(n_y, 0.0, &mut poll)?;
+    let mut cbu = head_buffer(n_y, 0.0, &mut poll)?;
+    for j in 0..n_y {
+        poll.tick()?;
+        if !gates.alpha[j].is_finite()
+            || !(0.0..=1.0).contains(&gates.alpha[j])
+            || !gates.s[j].is_finite()
+            || !(0.0..=1.0).contains(&gates.s[j])
+            || !gates.c[j].is_finite()
+            || gates.c[j] < 0.0
+            || !al_dots.abs_dot[j].is_finite()
+            || al_dots.abs_dot[j] < 0.0
+            || !al_dots.err_dot[j].is_finite()
+            || al_dots.err_dot[j] < 0.0
+            || !au_dots.abs_dot[j].is_finite()
+            || au_dots.abs_dot[j] < 0.0
+            || !au_dots.err_dot[j].is_finite()
+            || au_dots.err_dot[j] < 0.0
+        {
+            return Err(head_invalid(
+                "cooperative head composition invalid gates/dots",
+            ));
+        }
+    }
+    for k in 0..n_in {
+        poll.tick()?;
+        if !root.lo[k].is_finite()
+            || !root.hi[k].is_finite()
+            || root.lo[k] > root.hi[k]
+            || !root.mid[k].is_finite()
+            || !root.rad[k].is_finite()
+            || root.rad[k] < 0.0
+        {
+            return Err(head_invalid("cooperative head composition domain"));
+        }
+    }
+    for r0 in 0..nf {
+        let wp = &mb.wp[r0 * n_y..(r0 + 1) * n_y];
+        let wn = &mb.wn[r0 * n_y..(r0 + 1) * n_y];
+        for j in 0..n_y {
+            poll.tick()?;
+            if !wp[j].is_finite() || wp[j] < 0.0 || !wn[j].is_finite() || wn[j] > 0.0 {
+                return Err(head_invalid("cooperative head composition margin signs"));
+            }
+            ca[j] = wp[j] * gates.alpha[j];
+            cal[j] = head_prod_lo(wp[j], gates.alpha[j]);
+            cau[j] = head_prod_hi(wp[j], gates.alpha[j]);
+        }
+        for j in 0..n_y {
+            poll.tick()?;
+            cb[j] = wn[j] * gates.s[j];
+            cbl[j] = head_prod_lo(wn[j], gates.s[j]);
+            cbu[j] = head_prod_hi(wn[j], gates.s[j]);
+        }
+        for (k, rb) in rowbuf.iter_mut().enumerate() {
+            let arow = &asl[k * n_y..(k + 1) * n_y];
+            let urow = &usl[k * n_y..(k + 1) * n_y];
+            let (mut acc, mut lo, mut hi) = (0.0, 0.0, 0.0);
+            for j in 0..n_y {
+                poll.tick()?;
+                head_finite(arow[j])?;
+                head_finite(urow[j])?;
+                acc += ca[j] * arow[j] + cb[j] * urow[j];
+                if mode.outward() {
+                    let (a, b) = head_interval_product(cal[j], cau[j], arow[j], arow[j]);
+                    let (c, d) = head_interval_product(cbl[j], cbu[j], urow[j], urow[j]);
+                    lo = head_sum_lo(lo, head_sum_lo(a, c));
+                    hi = head_sum_hi(hi, head_sum_hi(b, d));
+                }
+            }
+            *rb = acc;
+            rowlo[k] = lo;
+            rowhi[k] = hi;
+        }
+        let (mut bias, mut cterm, mut directed_bias, mut directed_c, mut directed_pen) =
+            (0.0, 0.0, 0.0, 0.0, 0.0);
+        for j in 0..n_y {
+            poll.tick()?;
+            head_finite(al.b[j])?;
+            head_finite(au.b[j])?;
+            bias += ca[j] * al.b[j] + cb[j] * au.b[j];
+            cterm += wn[j] * gates.c[j];
+            if mode.outward() {
+                let (a, _) = head_interval_product(cal[j], cau[j], al.b[j], al.b[j]);
+                let (b, _) = head_interval_product(cbl[j], cbu[j], au.b[j], au.b[j]);
+                directed_bias = head_sum_lo(directed_bias, head_sum_lo(a, b));
+                directed_c = head_sum_lo(directed_c, head_prod_lo(wn[j], gates.c[j]));
+                let ea = head_prod_hi(cal[j].abs().max(cau[j].abs()), al_dots.err_dot[j]);
+                let eb = head_prod_hi(cbl[j].abs().max(cbu[j].abs()), au_dots.err_dot[j]);
+                directed_pen = head_sum_hi(directed_pen, head_sum_hi(ea, eb));
+            }
+        }
+        let (mut v, mut rr, mut directed_input) = (0.0, 0.0, 0.0);
+        for (k, rb) in rowbuf.iter().enumerate() {
+            poll.tick()?;
+            v += rb * root.mid[k];
+            rr += rb.abs() * root.rad[k];
+            if mode.outward() {
+                let (l, _) = head_interval_product(rowlo[k], rowhi[k], root.lo[k], root.hi[k]);
+                directed_input = head_sum_lo(directed_input, l);
+            }
+        }
+        let raw = v - rr + bias + cterm + mb.cst[r0];
+        head_finite(raw)?;
+        if !mode.outward() {
+            out[r0] = raw;
+            continue;
+        }
+        let (mut pen, mut tmag) = (0.0, 0.0);
+        for j in 0..n_y {
+            poll.tick()?;
+            let ea = slack16(3.0 * UNIT * ca[j].abs());
+            let ebc = slack16(3.0 * UNIT * cb[j].abs());
+            pen += (ca[j].abs() + ea) * al_dots.err_dot[j]
+                + ea * al_dots.abs_dot[j]
+                + (cb[j].abs() + ebc) * au_dots.err_dot[j]
+                + ebc * au_dots.abs_dot[j];
+            tmag += ca[j].abs() * al_dots.abs_dot[j]
+                + cb[j].abs() * au_dots.abs_dot[j]
+                + wn[j].abs() * gates.c[j];
+        }
+        tmag += mb.cst[r0].abs();
+        let slack = next_up(
+            certify_up(pen, 1e-13) + next_up((gam_row + gam_con) * certify_up(tmag, 1e-13)),
+        );
+        let legacy = next_down(next_down(raw - slack));
+        let directed = head_sum_lo(
+            head_sum_lo(
+                head_sum_lo(head_sum_lo(directed_input, directed_bias), directed_c),
+                mb.cst[r0],
+            ),
+            -directed_pen,
+        );
+        head_finite(legacy)?;
+        head_finite(directed)?;
+        let confirmed = head_confirm_viay_row(root, mb, gates, al, au, r0, &mut poll)?;
+        out[r0] = legacy.min(directed).min(confirmed);
+    }
+    poll.finish()?;
+    Ok(out)
+}
+
+// Allocation-free confirmation shared by the prepared owner and subnormal
+// legacy repair. It reads the ACTUAL full row E/eb carriers, not RN cached
+// magnitude/error summaries. Exact original endpoint magnitudes also cover
+// legacy xabs whose abs(mid)+rad construction was nearest-rounded.
+#[allow(clippy::too_many_arguments)]
+fn head_confirm_viay_row(
+    root: &RootGates,
+    mb: &MarginBatch,
+    gates: &HeadGates,
+    al: &PassOut,
+    au: &PassOut,
+    column: usize,
+    poll: &mut HeadPoll<'_>,
+) -> Result<f64> {
+    head_qualify(RoundMode::Outward)?;
+    head_shapes(mb, gates)?;
+    let (n, ny) = (root.mid.len(), mb.n_y);
+    head_pack_shape(root, al, ny)?;
+    head_pack_shape(root, au, ny)?;
+    if column >= mb.nf() || root.lo.len() != n || root.hi.len() != n {
+        return Err(head_invalid(
+            "head confirmation original domain/column shape",
+        ));
+    }
+    let ae =
+        al.e.as_ref()
+            .and_then(|e| e.as_slice())
+            .ok_or_else(|| head_invalid("head confirmation lower error plane"))?;
+    let ue =
+        au.e.as_ref()
+            .and_then(|e| e.as_slice())
+            .ok_or_else(|| head_invalid("head confirmation upper error plane"))?;
+    let a =
+        al.a.as_slice()
+            .ok_or_else(|| head_invalid("head confirmation lower layout"))?;
+    let u =
+        au.a.as_slice()
+            .ok_or_else(|| head_invalid("head confirmation upper layout"))?;
+    let wp = &mb.wp[column * ny..(column + 1) * ny];
+    let wn = &mb.wn[column * ny..(column + 1) * ny];
+    let mut input = 0.0;
+    for k in 0..n {
+        poll.tick()?;
+        if !root.lo[k].is_finite() || !root.hi[k].is_finite() || root.lo[k] > root.hi[k] {
+            return Err(head_invalid("head confirmation original input endpoints"));
+        }
+        let (mut lo, mut hi) = (0.0, 0.0);
+        for j in 0..ny {
+            poll.tick()?;
+            let cal = head_prod_lo(wp[j], gates.alpha[j]);
+            let cau = head_prod_hi(wp[j], gates.alpha[j]);
+            let cbl = head_prod_lo(wn[j], gates.s[j]);
+            let cbu = head_prod_hi(wn[j], gates.s[j]);
+            let (ll, lh) = head_interval_product(cal, cau, a[k * ny + j], a[k * ny + j]);
+            let (ul, uh) = head_interval_product(cbl, cbu, u[k * ny + j], u[k * ny + j]);
+            lo = head_sum_lo(lo, head_sum_lo(ll, ul));
+            hi = head_sum_hi(hi, head_sum_hi(lh, uh));
+        }
+        let (lower, _) = head_interval_product(lo, hi, root.lo[k], root.hi[k]);
+        input = head_sum_lo(input, lower);
+    }
+    let (mut bias, mut constant, mut penalty) = (0.0, 0.0, 0.0);
+    for j in 0..ny {
+        poll.tick()?;
+        if !wp[j].is_finite()
+            || wp[j] < 0.0
+            || !wn[j].is_finite()
+            || wn[j] > 0.0
+            || !gates.alpha[j].is_finite()
+            || !(0.0..=1.0).contains(&gates.alpha[j])
+            || !gates.s[j].is_finite()
+            || !(0.0..=1.0).contains(&gates.s[j])
+            || !gates.c[j].is_finite()
+            || gates.c[j] < 0.0
+            || !al.eb[j].is_finite()
+            || al.eb[j] < 0.0
+            || !au.eb[j].is_finite()
+            || au.eb[j] < 0.0
+        {
+            return Err(head_invalid("head confirmation invalid source lanes"));
+        }
+        let cal = head_prod_lo(wp[j], gates.alpha[j]);
+        let cau = head_prod_hi(wp[j], gates.alpha[j]);
+        let cbl = head_prod_lo(wn[j], gates.s[j]);
+        let cbu = head_prod_hi(wn[j], gates.s[j]);
+        let (lower_bias, _) = head_interval_product(cal, cau, al.b[j], al.b[j]);
+        let (upper_bias, _) = head_interval_product(cbl, cbu, au.b[j], au.b[j]);
+        bias = head_sum_lo(bias, head_sum_lo(lower_bias, upper_bias));
+        constant = head_sum_lo(constant, head_prod_lo(wn[j], gates.c[j]));
+        let (mut eta_l, mut eta_u) = (al.eb[j], au.eb[j]);
+        for k in 0..n {
+            poll.tick()?;
+            let (el, eu) = (ae[k * ny + j], ue[k * ny + j]);
+            if !el.is_finite() || el < 0.0 || !eu.is_finite() || eu < 0.0 {
+                return Err(head_invalid("head confirmation coefficient error"));
+            }
+            let xa = root.lo[k].abs().max(root.hi[k].abs());
+            eta_l = head_sum_hi(eta_l, head_prod_hi(el, xa));
+            eta_u = head_sum_hi(eta_u, head_prod_hi(eu, xa));
+        }
+        let el = head_prod_hi(cal.abs().max(cau.abs()), eta_l);
+        let eu = head_prod_hi(cbl.abs().max(cbu.abs()), eta_u);
+        penalty = head_sum_hi(penalty, head_sum_hi(el, eu));
+    }
+    let lower = head_sum_lo(
+        head_sum_lo(
+            head_sum_lo(head_sum_lo(input, bias), constant),
+            mb.cst[column],
+        ),
+        -penalty,
+    );
+    head_finite(lower)?;
+    poll.finish()?;
+    Ok(lower)
+}
+
+#[cfg(test)]
+#[path = "bounds_cooperative_tests.rs"]
+mod cooperative_tests;

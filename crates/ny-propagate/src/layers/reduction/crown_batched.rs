@@ -9,8 +9,6 @@
 //! last-axis reduction with `keepdims=true`. This covers the primary use case:
 //! LayerNorm, RMSNorm, and InstanceNorm1d all reduce over the hidden/feature
 //! dimension (last axis) in their ONNX decomposition.
-//!
-//! Part of #3221 (CROWN tensor bounds through reduction ops degenerate).
 
 use ndarray::{ArrayD, IxDyn};
 use ny_core::{checked_shape_product, NyError, Result};

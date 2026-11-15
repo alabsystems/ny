@@ -29,7 +29,7 @@ def create_test_pytorch_file(path: Path):
 
 def run_ny(*args) -> subprocess.CompletedProcess:
     """Run ny CLI command."""
-    cmd = ["cargo", "run", "-p", "ny-cli", "--"] + list(args)
+    cmd = ["targo", "--unverified", "run", "-p", "ny-cli", "--"] + list(args)
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=Path(__file__).parent.parent)
     return result
 

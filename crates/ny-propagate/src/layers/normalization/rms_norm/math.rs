@@ -6,7 +6,7 @@
 //!
 //! RMSNorm: y_i = ny_i * x_i / sqrt(mean(x^2) + eps)
 //!
-//! Jacobian derivation (from designs/2026-02-26-p0-normalization-layers-rmsnorm-instancenorm-adain.md):
+//! Jacobian derivation:
 //!   Let s = sum(x^2) / n + eps, rms = sqrt(s)
 //!   drms/dx_j = x_j / (n * rms)
 //!   dy_i/dx_j = ny_i * [delta_ij * rms - x_i * x_j / (n * rms)] / rms^2
@@ -28,13 +28,13 @@ impl RmsNormLayer {
             ));
         }
         if x.len() > (1 << 24) {
-            // f32 precision guard (#2136)
+            // f32 precision guard
             return Err(NyError::InternalError(format!(
                 "RMSNorm dimension {} exceeds f32 exact integer range",
                 x.len()
             )));
         }
-        // f64 accumulation to avoid catastrophic cancellation (#3325)
+        // f64 accumulation to avoid catastrophic cancellation
         let n = x.len() as f64;
         let mean_sq = x.iter().map(|&xi| (xi as f64) * (xi as f64)).sum::<f64>() / n;
         let rms = (mean_sq + self.eps as f64).sqrt();
@@ -61,7 +61,7 @@ impl RmsNormLayer {
             ));
         }
         let n = x.len();
-        // f64 accumulation to avoid catastrophic cancellation in Jacobian (#3325)
+        // f64 accumulation to avoid catastrophic cancellation in Jacobian
         let nf = n as f64;
 
         let mean_sq = x.iter().map(|&xi| (xi as f64) * (xi as f64)).sum::<f64>() / nf;

@@ -43,7 +43,7 @@ fn test_addition() {
     assert_eq!(c.upper()[[0]], 2.5);
 }
 
-/// Regression test for #2743: BoundedTensor::add must repair NaN from inf + (-inf).
+/// Regression test: BoundedTensor::add must repair NaN from inf + (-inf).
 ///
 /// When lower[i] = -inf and other.lower[i] = +inf (or vice versa), IEEE-754
 /// produces NaN. The add() method must repair this to the conservative
@@ -85,7 +85,7 @@ fn test_add_inf_minus_inf_repairs_nan_conservatively() {
     assert_eq!(upper, 15.0, "finite upper should be preserved");
 }
 
-/// Regression test for #2743: add with both endpoints producing NaN.
+/// Regression test: add with both endpoints producing NaN.
 #[test]
 fn test_add_both_endpoints_nan_repaired() {
     // a = [-inf, +inf], b = [+inf, -inf] → lower: -inf+inf=NaN, upper: inf+(-inf)=NaN
@@ -128,7 +128,7 @@ fn test_add_finite_values_unchanged() {
     assert_eq!(result.upper()[[1]], 0.5);
 }
 
-/// Regression test for #2764: scale(0) must repair NaN from 0*inf.
+/// Regression test: scale(0) must repair NaN from 0*inf.
 #[test]
 fn test_scale_zero_times_infinite_bounds_repairs_non_finite() {
     let t = BoundedTensor::from_parts_unchecked(
@@ -146,10 +146,10 @@ fn test_scale_zero_times_infinite_bounds_repairs_non_finite() {
     assert_eq!(upper, f32::INFINITY);
 }
 
-/// Regression test for #2764: shift(neg_inf) on positive bounds must repair NaN.
+/// Regression test: shift(neg_inf) on positive bounds must repair NaN.
 ///
 /// inf + (-inf) = NaN under IEEE-754; must be repaired to the conservative
-/// unbounded direction. new_repaired preserves ±inf endpoints as-is (#3423).
+/// unbounded direction. new_repaired preserves ±inf endpoints as-is.
 #[test]
 fn test_shift_inf_plus_neg_inf_repairs_nan_conservatively() {
     // upper = +inf, shift by -inf → inf + (-inf) = NaN
@@ -203,10 +203,10 @@ fn test_scale_finite_values_unchanged() {
     assert_eq!(negative.upper()[[0]], 4.0);
 }
 
-/// Regression test (#2895): scale(NaN) must return conservative bounds, not swap bounds.
+/// Regression test: scale(NaN) must return conservative bounds, not swap bounds.
 ///
 /// Without the guard, `NaN >= 0.0` → false (IEEE 754), so NaN was treated as negative,
-/// swapping bounds unnecessarily before new_repaired fixed them to conservative (#3423).
+/// swapping bounds unnecessarily before new_repaired fixed them to conservative.
 /// The guard now returns conservative bounds directly without the pointless swap.
 #[test]
 fn test_scale_nan_returns_conservative_2895() {
@@ -239,7 +239,7 @@ fn test_scale_nan_returns_conservative_2895() {
     );
 }
 
-/// Regression test (#2895): scale(Inf) must return conservative bounds.
+/// Regression test: scale(Inf) must return conservative bounds.
 ///
 /// Inf * finite = Inf, and Inf * 0 = NaN. The guard catches Inf scalars
 /// before any per-element multiplication.
@@ -1069,7 +1069,7 @@ fn test_get_panics_with_try_get_hint_on_infeasible_element() {
     let _ = t.get(&[0]);
 }
 
-// === intersection_per_element additional tests (migrated from deprecated intersection(), #4253) ===
+// === intersection_per_element additional tests (migrated from deprecated intersection()) ===
 
 #[test]
 fn test_intersection_per_element_touching_single_point() {
@@ -1142,7 +1142,7 @@ fn test_intersection_per_element_infinite_bounds() {
 }
 
 // =============================================================================
-// Regression tests for #1809: runtime validation in release builds
+// Regression tests: runtime validation in release builds
 // =============================================================================
 
 /// concrete() must return Err on NaN in all builds (not just debug).
@@ -1239,7 +1239,7 @@ fn test_from_epsilon_clamps_overflow() {
     assert_eq!(t2.lower()[[0]], f32::MIN);
 }
 
-// ── intersection_per_element tests (#2935) ──────────────────────────
+// ── intersection_per_element tests ──────────────────────────
 
 /// All elements overlap: intersection_per_element tightens every element.
 #[test]
@@ -1325,7 +1325,7 @@ fn test_intersection_per_element_all_disjoint() {
 /// NaN in any endpoint returns None.
 #[test]
 fn test_intersection_per_element_nan_returns_none() {
-    // Use new_unchecked to bypass NaN validation in constructor (#2935).
+    // Use new_unchecked to bypass NaN validation in constructor.
     // This tests that intersection_per_element itself rejects NaN endpoints.
     let a = BoundedTensor::new_unchecked(
         arr1(&[f32::NAN, 1.0]).into_dyn(),
@@ -1354,12 +1354,12 @@ fn test_intersection_per_element_shape_mismatch_returns_none() {
 }
 
 // =============================================================================
-// Regression tests for #2929: repair of large/non-finite endpoints must never
+// Regression tests: repair of large/non-finite endpoints must never
 // tighten a bound (an unbounded endpoint proves nothing, so the repaired
 // interval has to contain the true range).
 // =============================================================================
 
-/// Regression test for #2929: add() with a finite lower sum and NaN upper.
+/// Regression test: add() with a finite lower sum and NaN upper.
 ///
 /// Scenario: A.lower = [1.5e10], A.upper = [inf], B.lower = [1.5e10], B.upper = [-inf].
 /// add() computes: lower = 3e10 (finite, preserved), upper = inf + (-inf) = NaN.
@@ -1394,7 +1394,7 @@ fn test_add_repair_nan_upper_2929() {
     );
 }
 
-/// Regression test for #2929: scale() with an upper product overflowing to inf.
+/// Regression test: scale() with an upper product overflowing to inf.
 ///
 /// tensor = [lower=[2.0], upper=[f32::MAX]] (valid input accepted by `new`).
 /// scale(1e10): lower = 2e10 (finite), upper = f32::MAX * 1e10 = inf.
@@ -1422,7 +1422,7 @@ fn test_scale_overflow_keeps_unbounded_upper_2929() {
     );
 }
 
-/// Regression test for #2929: shift() with an infinite upper endpoint.
+/// Regression test: shift() with an infinite upper endpoint.
 ///
 /// tensor = [lower=[1.5e10], upper=[inf]] (valid via new_allow_infinite).
 /// shift(1.5e10): lower = 3e10 (finite), upper = inf + 1.5e10 = inf.
@@ -1484,7 +1484,7 @@ fn test_from_parts_unchecked_rejects_finite_inversion_in_debug() {
 }
 
 // =============================================================================
-// Tests for new_allow_infinite (#2944)
+// Tests for new_allow_infinite
 // =============================================================================
 
 /// new_allow_infinite accepts [-inf, 0.0].
@@ -1634,7 +1634,7 @@ fn test_new_allow_infinite_rejects_shape_mismatch() {
 }
 
 // =============================================================================
-// Tests for round_for_soundness_n_ulps (#2944)
+// Tests for round_for_soundness_n_ulps
 // =============================================================================
 
 /// n=0: no widening occurs.
@@ -1844,7 +1844,7 @@ fn test_round_for_soundness_n_ulps_inplace_matches() {
 
 /// center() must return 0.0 for symmetric infinite bounds [-inf, +inf],
 /// not NaN. Such bounds arise from new_conservative() and new_repaired(Widen).
-/// IEEE 754: (-inf + inf) / 2.0 = NaN. (#3291 F3, #3423)
+/// IEEE 754: (-inf + inf) / 2.0 = NaN.
 #[test]
 fn test_center_infinite_bounds_returns_zero() {
     let lower = arr1(&[f32::NEG_INFINITY, -1.0, f32::NEG_INFINITY]).into_dyn();
@@ -1891,7 +1891,7 @@ fn test_center_one_sided_infinite_bounds() {
     );
 }
 
-/// center() on conservative bounds from new_repaired(Widen) should work (#3423).
+/// center() on conservative bounds from new_repaired(Widen) should work.
 #[test]
 fn test_center_after_widen_repair() {
     use crate::RepairStrategy;
@@ -2003,7 +2003,7 @@ fn test_repair_inverted_bounds_nd_repairs_mixed_tensor() {
 }
 
 // =============================================================================
-// new_repaired() constructor tests (Part of #3423)
+// new_repaired() constructor tests
 // =============================================================================
 
 #[test]

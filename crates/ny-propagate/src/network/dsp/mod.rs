@@ -8,7 +8,7 @@
 //! operations as compositions of existing ny layers, enabling
 //! bound propagation (IBP, CROWN, α-CROWN) without new layer types.
 //!
-//! Part of #3252 — avoice DSP kernel verification.
+//! Part of the avoice DSP kernel verification.
 
 mod envelope_follower;
 mod kokoro_forward_stft;

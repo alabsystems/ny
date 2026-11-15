@@ -6,13 +6,11 @@
 //!
 //! Graph construction and scalar-energy assertions for the Kokoro vocoder
 //! verifier smokes. Test functions live in the root
-//! `avoice/verifier_smoke.rs` entrypoint (#4029).
+//! `avoice/verifier_smoke.rs` entrypoint.
 //!
 //! Property: `sum(prefix_output^2) in [0, +inf)` — a sum of squares is
 //! always non-negative. The scalar energy head avoids exposing the raw
 //! ~15k prefix output coordinates in the `VerificationSpec`.
-//!
-//! Reference: designs/2026-03-17-issue-4029-kokoro-prefix-verifier-smoke.md
 
 use super::super::common;
 use super::graph_support::{first_conv_transpose_node, vocoder_prefix_subgraph};

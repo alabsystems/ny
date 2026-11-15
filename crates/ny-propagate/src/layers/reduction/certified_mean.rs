@@ -185,6 +185,49 @@ pub(super) fn certified_mean_enclosure(values: impl ExactSizeIterator<Item = f64
     (sub_down(quotient, half_width), add_up(quotient, half_width))
 }
 
+/// A rigorous enclosure `[lo, hi]` of the exact arithmetic SUM of `values`,
+/// each element read as an exact real.
+///
+/// The summation half of [`certified_mean_enclosure`], without the divide.
+/// `ReduceSum` needs exactly this: its f32→f64 widening is EXACT, so the f64
+/// accumulation is the only error in the node, and `sum_axis`'s round-to-nearest
+/// chain leaves it entirely uncharged. The downstream directed f32 cast does not
+/// rescue it — `cast_f64_to_f32_{down,up}` step only when the NARROWING actually
+/// rounded, so an exactly-representable accumulator is published with zero charge.
+/// Counterexample: `[2^30, 2^-30, -2^30]` accumulates to exactly `0.0` in f64
+/// (the small term is 60 binades below the large one, past binary64's 52-bit
+/// significand) and publishes `[0.0, 0.0]` for a true sum of `2^-30` ≈ 9.3e-10.
+///
+/// # Guarantees
+///
+/// * `lo <= sum(values) <= hi` for every finite input, for every length.
+/// * `lo <= hi` always.
+/// * `lo == hi` exactly when the whole reduction committed without a single
+///   rounding — so an exact reduction is published without giving up a ULP.
+/// * Non-finite accumulation returns `(v, v)` for the raw f64 value `v`,
+///   deferring to the downstream repair (matching the mean's convention).
+#[must_use]
+pub(super) fn certified_sum_enclosure(values: impl ExactSizeIterator<Item = f64>) -> (f64, f64) {
+    // A sum over nothing is exactly zero — unlike a MEAN over nothing, which is
+    // undefined and returns the whole line.
+    let mut sum = 0.0_f64;
+    let mut residual_charge = 0.0_f64;
+    for value in values {
+        let (hi, lo) = two_sum_f64(sum, value);
+        sum = hi;
+        // `lo` is the EXACT part `sum` could not hold.
+        residual_charge = add_up(residual_charge, lo.abs());
+    }
+
+    if !sum.is_finite() || !residual_charge.is_finite() {
+        return (sum, sum);
+    }
+    if residual_charge == 0.0 {
+        return (sum, sum);
+    }
+    (sub_down(sum, residual_charge), add_up(sum, residual_charge))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

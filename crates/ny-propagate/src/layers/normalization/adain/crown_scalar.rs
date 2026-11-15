@@ -9,8 +9,6 @@
 //!
 //! Previously 305 lines of duplicated code; now delegates to shared
 //! infrastructure, keeping only shape validation (layer-specific).
-//!
-//! Reference: designs/2026-02-27-normalization-trait-dedup.md
 
 use ny_core::{NyError, Result};
 use ny_tensor::BoundedTensor;

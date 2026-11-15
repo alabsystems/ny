@@ -46,7 +46,6 @@ pub(super) fn evaluate_graph(
 /// IBP (engine=None). This ensures the confirmation step is independent from
 /// the evaluator used during the attack loop. Matches the
 /// `independent_concrete_forward` pattern in `beta_crown/engine/pgd.rs:154`.
-/// Part of #4419.
 pub(super) fn independent_graph_forward(
     graph: &GraphNetwork,
     candidate: &ArrayD<f32>,
@@ -63,7 +62,7 @@ pub(super) fn independent_graph_forward(
 /// Returns `Some((candidate, revalidated_output))` if the counterexample is
 /// confirmed, `None` (with a tracing warning) if re-validation fails.
 /// Consolidates the repeated re-validation pattern in graph_pgd.rs and
-/// graph_pgd_batched.rs. Part of #4419.
+/// graph_pgd_batched.rs.
 pub(super) fn revalidate_graph_counterexample(
     graph: &GraphNetwork,
     candidate: ArrayD<f32>,

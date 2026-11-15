@@ -936,7 +936,7 @@ mod tests {
             &test_opts(),
         );
         assert_eq!(report.rounds, 0, "pre-expired deadline must run no rounds");
-        assert!(report.fixed.is_empty());
+        assert_eq!((report.fixed).len(), 0);
         assert_bits_identical(&bits, &bounds, "pre-expired");
 
         // Oracle 6b: a ~zero budget exits early with PARTIAL work; whatever
@@ -976,7 +976,7 @@ mod tests {
             &test_opts(),
         );
         assert_eq!(report.rounds, 0);
-        assert!(report.fixed.is_empty());
+        assert_eq!((report.fixed).len(), 0);
         assert_bits_identical(&bits, &bounds, "no-alpha");
     }
 

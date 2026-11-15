@@ -61,7 +61,7 @@ fn brute_force_relu_sub(al: f32, au: f32, bl: f32, bu: f32, n: usize) -> (f32, f
 ///   lower: `alpha·y`                  (valid for any alpha ∈ [0, 1])
 ///   upper: `s·y - s·l`, `s = u/(u-l)` (the chord through (l,0) and (u,u))
 ///
-/// This is the same shape ny's own `relu_crown_relaxation` produces, with
+/// This is the same shape ny's own `relu_linear_relaxation` produces, with
 /// `alpha` pinned so the probe can sweep the lower-slope choice.
 fn relu_relaxation_over(l: f32, u: f32, alpha: f32) -> LinearBounds {
     assert!(l < 0.0 && u > 0.0, "case must be an unstable ReLU");

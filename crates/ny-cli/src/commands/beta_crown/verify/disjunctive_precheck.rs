@@ -30,7 +30,7 @@ use super::BetaCrownModel;
 ///
 /// For malbeware 16-25 (16 hidden layers, 24 clauses), this reduces the
 /// precheck from ~192s (24 × 8s per-clause CROWN-IBP) to ~8s (1 shared
-/// CROWN-IBP pass). #3218
+/// CROWN-IBP pass).
 ///
 /// Returns a boolean vector where `true` means the clause at that index is
 /// verified (provably UNSAT) by CROWN bounds alone. If CROWN propagation
@@ -173,6 +173,84 @@ pub(super) fn tighten_input_to_box(
         }
     }
     BoundedTensor::new(lower, upper).unwrap_or_else(|_| input.clone())
+}
+
+/// `#lowdim-fold`: prove per-clause-box disjuncts on their FREE input
+/// coordinates with the lowdim lane, the fixed coordinates folded into
+/// constants (`ny_propagate::lowdim::prove_clause_folded`). Proofs only:
+/// `true` means the clause cannot be satisfied anywhere on its box; `false`
+/// claims nothing and the clause goes on to the existing screen. Only
+/// single-output models are admitted (each constraint becomes `s * Y > t`).
+pub(super) fn lowdim_fold_clauses(
+    graph: &ny_propagate::GraphNetwork,
+    input: &BoundedTensor,
+    clauses: &[Vec<OutputConstraint>],
+    per_clause_input_bounds: &[std::collections::BTreeMap<usize, (f64, f64)>],
+    num_outputs: usize,
+    cfg: &ny_propagate::lowdim::LowDimConfig,
+    deadline: Instant,
+) -> Vec<bool> {
+    use ny_propagate::lowdim::{prove_clauses_folded, FoldCache, FoldConjunct, LowDimOutcome};
+    let started = Instant::now();
+    let mut out = vec![false; clauses.len()];
+    if num_outputs != 1 || Instant::now() >= deadline {
+        return out;
+    }
+    // Admit each clause that has its own box and at least one usable conjunct.
+    let mut index = Vec::new();
+    let mut inputs = Vec::new();
+    let mut conjuncts = Vec::new();
+    for (idx, clause) in clauses.iter().enumerate() {
+        let Some(clause_box) = per_clause_input_bounds.get(idx).filter(|b| !b.is_empty()) else {
+            continue;
+        };
+        let cj: Vec<FoldConjunct> = clause
+            .iter()
+            .filter_map(|c| {
+                let obj = super::super::constraint_plan::build_constraint_objective(c, num_outputs)
+                    .ok()?;
+                let a = f64::from(*obj.spec_coeffs().first()?);
+                let thr = f64::from(obj.threshold());
+                if !(a != 0.0 && a.is_finite() && thr.is_finite()) {
+                    return None;
+                }
+                // `a * Y > thr` <= `s * Y > t` with t >= thr / |a|.
+                let t = thr / a.abs();
+                let t = t + t.abs() * (2.0 * f64::EPSILON) + f64::MIN_POSITIVE;
+                Some(FoldConjunct { s: a.signum(), t })
+            })
+            .collect();
+        if cj.is_empty() {
+            continue;
+        }
+        index.push(idx);
+        inputs.push(tighten_input_to_box(input, clause_box));
+        conjuncts.push(cj);
+    }
+    // One family run over every admitted clause: clauses with the same free
+    // coordinates share each wave's weight reads.
+    let results =
+        prove_clauses_folded(graph, &inputs, &conjuncts, deadline, cfg, &FoldCache::new());
+    let (mut unproved, mut declined, mut first_decline) = (0usize, 0usize, None::<String>);
+    for (&idx, r) in index.iter().zip(&results) {
+        match r {
+            LowDimOutcome::Verified(_) => out[idx] = true,
+            LowDimOutcome::Unproved(..) => unproved += 1,
+            LowDimOutcome::Declined(reason) => {
+                declined += 1;
+                first_decline.get_or_insert_with(|| reason.clone());
+            }
+        }
+    }
+    let proved = out.iter().filter(|&&v| v).count();
+    eprintln!(
+        "[lowdim-fold] clauses={} admitted={} proved={proved} unproved={unproved} declined={declined} secs={:.2} first_decline={:?}",
+        clauses.len(),
+        index.len(),
+        started.elapsed().as_secs_f64(),
+        first_decline.as_deref()
+    );
+    out
 }
 
 pub(super) fn crown_precheck_clauses(
@@ -348,7 +426,7 @@ fn try_spec_guided_crown_precheck(
 /// C-matrix directly to the Graph CROWN backward pass, using IBP intermediate
 /// bounds instead of the expensive O(N²) CROWN-IBP pass. For malbeware 16-25
 /// (Conv→ReLU→Flatten→Gemm, 61K ReLU neurons), this avoids ~34 billion scalar
-/// ops in the CROWN-IBP Dense backward through Conv2d. #3218
+/// ops in the CROWN-IBP Dense backward through Conv2d.
 fn try_spec_guided_crown_precheck_graph(
     graph: &ny_propagate::GraphNetwork,
     input: &BoundedTensor,
@@ -376,7 +454,7 @@ fn try_spec_guided_crown_precheck_graph(
     // This avoids the O(N²) CROWN-IBP intermediate tightening that
     // dominates graph CROWN time for Conv2d models with large spatial outputs.
     // For malbeware 16-25 (61K Conv2d output neurons), CROWN-IBP takes ~120s
-    // while IBP forward takes <1s. #3218
+    // while IBP forward takes <1s.
     let node_bounds = graph.collect_node_bounds(input).ok()?;
 
     // Spec-guided CROWN backward with pre-computed IBP bounds.
@@ -395,15 +473,49 @@ fn try_spec_guided_crown_precheck_graph(
     let flat_lower = output.lower().as_slice().unwrap_or(&[]);
     let flat_upper = output.upper().as_slice().unwrap_or(&[]);
 
+    // #pwl-lookup (DARK, armed on the graph): each spec row's CROWN bound is
+    // intersected with the same row's IBP bound from the node map above (which
+    // carries the exact lookup-table ranges when armed). Unarmed: `None`, and
+    // every row below is decided on its CROWN bound exactly as before.
+    let ibp_rows: Option<Vec<Option<(f32, f32)>>> = if graph.pwl_lookup_exact_range() {
+        node_bounds
+            .get(graph.output_name())
+            .map(|ibp| ibp_spec_row_bounds(ibp, &c_matrix))
+    } else {
+        None
+    };
+    let mut row_tally = PrecheckIbpTally::default();
+
     let result: Vec<bool> = row_constraint_type
         .iter()
         .enumerate()
         .map(|(row, kind)| {
             let lo = flat_lower.get(row).copied().unwrap_or(f32::NEG_INFINITY);
             let up = flat_upper.get(row).copied().unwrap_or(f32::INFINITY);
-            kind.is_unsatisfiable(lo, up)
+            let Some(rows) = ibp_rows.as_ref() else {
+                return kind.is_unsatisfiable(lo, up);
+            };
+            let ibp_row = rows.get(row).copied().flatten();
+            let crown_refutes = kind.is_unsatisfiable(lo, up);
+            let ibp_refutes = ibp_row.is_some_and(|(il, iu)| kind.is_unsatisfiable(il, iu));
+            let (lo, up) = match ibp_row.map(|ibp| intersect_row_bounds((lo, up), ibp)) {
+                Some(Some(merged)) => merged,
+                // Disjoint (or NaN): one of two enclosures of the same row is
+                // wrong. Fail closed to the CROWN row alone.
+                Some(None) => {
+                    row_tally.contradiction += 1;
+                    (lo, up)
+                }
+                None => (lo, up),
+            };
+            let merged_refutes = kind.is_unsatisfiable(lo, up);
+            row_tally.count(crown_refutes, ibp_refutes, merged_refutes);
+            merged_refutes
         })
         .collect();
+    if ibp_rows.is_some() {
+        row_tally.emit(num_clauses, "spec");
+    }
 
     let verified_count = result.iter().filter(|&&v| v).count();
     info!(
@@ -413,6 +525,156 @@ fn try_spec_guided_crown_precheck_graph(
     );
 
     Some(result)
+}
+
+/// #pwl-lookup: per-route tally behind the `[precheck-ibp]` observable.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PrecheckIbpTally {
+    pub(super) crown_refuted: usize,
+    pub(super) ibp_refuted: usize,
+    pub(super) merged_refuted: usize,
+    pub(super) contradiction: usize,
+}
+
+impl PrecheckIbpTally {
+    fn count(&mut self, crown: bool, ibp: bool, merged: bool) {
+        self.crown_refuted += usize::from(crown);
+        self.ibp_refuted += usize::from(ibp);
+        self.merged_refuted += usize::from(merged);
+    }
+
+    /// Unconditional (armed-only) engagement line. `merged_refuted` can only
+    /// be `>= max(crown_refuted, ibp_refuted)` unless a contradiction fired.
+    fn emit(&self, rows: usize, route: &str) {
+        eprintln!(
+            "[precheck-ibp] rows={rows} ibp_refuted={} crown_refuted={} merged_refuted={} \
+             contradiction={} route={route}",
+            self.ibp_refuted, self.crown_refuted, self.merged_refuted, self.contradiction
+        );
+    }
+}
+
+/// Intersection of two enclosures `(lower, upper)` of the SAME row over the
+/// SAME box. `None` when either carries a NaN or they are disjoint — which two
+/// sound enclosures of one non-empty set cannot be, so the caller must then
+/// keep its original row (fail closed), never an empty or repaired one.
+pub(super) fn intersect_row_bounds(crown: (f32, f32), ibp: (f32, f32)) -> Option<(f32, f32)> {
+    let ((cl, cu), (il, iu)) = (crown, ibp);
+    if cl.is_nan() || cu.is_nan() || il.is_nan() || iu.is_nan() {
+        return None;
+    }
+    let (lo, up) = (cl.max(il), cu.min(iu));
+    (lo <= up).then_some((lo, up))
+}
+
+/// IBP enclosure of each spec row `Y_i − Y_j` from the IBP output box: the
+/// row is `[l_i − u_j, u_i − l_j]`, each endpoint rounded OUTWARD in f32.
+/// Rows that are not exactly one `+1` and one `−1` coefficient (every row
+/// `build_spec_row` emits is) get `None` and keep their CROWN bound.
+pub(super) fn ibp_spec_row_bounds(
+    ibp_output: &BoundedTensor,
+    c_matrix: &Array2<f32>,
+) -> Vec<Option<(f32, f32)>> {
+    let lower: Vec<f32> = ibp_output.lower().iter().copied().collect();
+    let upper: Vec<f32> = ibp_output.upper().iter().copied().collect();
+    c_matrix
+        .rows()
+        .into_iter()
+        .map(|row| {
+            if row.len() != lower.len() {
+                return None;
+            }
+            let mut plus = None;
+            let mut minus = None;
+            for (index, &coefficient) in row.iter().enumerate() {
+                match coefficient {
+                    0.0 => {}
+                    c if c == 1.0 && plus.is_none() => plus = Some(index),
+                    c if c == -1.0 && minus.is_none() => minus = Some(index),
+                    _ => return None,
+                }
+            }
+            let (i, j) = (plus?, minus?);
+            let lo = ny_tensor::sub_down_f32(lower[i], upper[j]);
+            let up = ny_tensor::sub_up_f32(upper[i], lower[j]);
+            (lo.is_finite() && up.is_finite() && lo <= up).then_some((lo, up))
+        })
+        .collect()
+}
+
+/// Elementwise intersection of a CROWN output enclosure with the IBP output
+/// enclosure of the same graph over the same box (#pwl-lookup). `Err` on a
+/// shape mismatch, a NaN, or ANY disjoint element — the caller then keeps the
+/// CROWN box unchanged (fail closed; an empty box is never published).
+pub(super) fn intersect_output_enclosures(
+    crown: &BoundedTensor,
+    ibp: &BoundedTensor,
+) -> Result<BoundedTensor, &'static str> {
+    if crown.shape() != ibp.shape() {
+        return Err("shape mismatch");
+    }
+    let mut lower = crown.lower().to_owned();
+    let mut upper = crown.upper().to_owned();
+    for (((lo, up), &il), &iu) in lower
+        .iter_mut()
+        .zip(upper.iter_mut())
+        .zip(ibp.lower().iter())
+        .zip(ibp.upper().iter())
+    {
+        let Some((merged_lo, merged_up)) = intersect_row_bounds((*lo, *up), (il, iu)) else {
+            return Err("contradiction or nan");
+        };
+        *lo = merged_lo;
+        *up = merged_up;
+    }
+    BoundedTensor::new_allow_infinite(lower, upper).map_err(|_| "rebuild refused")
+}
+
+/// #pwl-lookup (armed graphs only): the per-output precheck's CROWN box
+/// intersected with the graph's IBP output box over the same input. On the
+/// finite-deadline route the graph CROWN entry already publishes the
+/// collected forward box (so this is idempotent there); on the no-deadline
+/// route it adds the exact lookup-table range the CROWN backward cannot see.
+/// Any failure keeps the CROWN box, and the tally line prints either way.
+fn precheck_output_with_ibp(
+    graph: &ny_propagate::GraphNetwork,
+    input: &BoundedTensor,
+    clauses: &[Vec<OutputConstraint>],
+    crown: BoundedTensor,
+    deadline: Option<Instant>,
+) -> BoundedTensor {
+    let refuted = |bounds: &BoundedTensor| {
+        clauses
+            .iter()
+            .filter(|clause| is_clause_unsatisfiable(clause, bounds.lower(), bounds.upper()))
+            .count()
+    };
+    let mut tally = PrecheckIbpTally {
+        crown_refuted: refuted(&crown),
+        ..PrecheckIbpTally::default()
+    };
+    let ibp = graph
+        .collect_node_bounds_with_engine_and_deadline(input, None, deadline)
+        .ok()
+        .and_then(|mut map| map.remove(graph.output_name()));
+    let merged = match ibp {
+        Some(ibp) => {
+            tally.ibp_refuted = refuted(&ibp);
+            match intersect_output_enclosures(&crown, &ibp) {
+                Ok(merged) => merged,
+                Err(reason) => {
+                    if reason == "contradiction or nan" {
+                        tally.contradiction += 1;
+                    }
+                    crown
+                }
+            }
+        }
+        None => crown,
+    };
+    tally.merged_refuted = refuted(&merged);
+    tally.emit(clauses.len(), "per_output");
+    merged
 }
 
 /// Kind of spec row for a clause's constraint.
@@ -433,7 +695,7 @@ impl SpecRowKind {
             // Constraint is unsatisfiable when the upper bound on the encoded
             // difference is strictly negative. For GreaterEq(i,j) with row
             // Y_i - Y_j: upper < 0 means Y_i < Y_j always. For LessEq(i,j)
-            // with row Y_j - Y_i: upper < 0 means Y_j < Y_i always. #3384
+            // with row Y_j - Y_i: upper < 0 means Y_j < Y_i always.
             SpecRowKind::DiffUpperNeg => upper < 0.0,
         }
     }
@@ -460,7 +722,7 @@ pub(crate) fn build_spec_row(
             OutputConstraint::LessEq(i, j) | OutputConstraint::LessThan(i, j) => {
                 if *i < num_outputs && *j < num_outputs {
                     // Encode Y_j - Y_i: UNSAT when upper(Y_j - Y_i) < 0,
-                    // meaning Y_j < Y_i always, so Y_i <= Y_j can never hold. #3384
+                    // meaning Y_j < Y_i always, so Y_i <= Y_j can never hold.
                     row[*j] = 1.0;
                     row[*i] = -1.0;
                     return Some(SpecRowKind::DiffUpperNeg);
@@ -499,6 +761,15 @@ fn crown_precheck_per_output(
             debug!(error = %e, "CROWN pre-check failed, falling back to per-clause BaB");
             return no_precheck;
         }
+    };
+    // #pwl-lookup (DARK): on an armed graph, decide each clause on the CROWN
+    // box intersected with the IBP box (shrink-only, fail-closed). Unarmed
+    // graphs and Sequential models keep the CROWN box exactly as before.
+    let output = match model_net {
+        BetaCrownModel::Graph(graph) if graph.pwl_lookup_exact_range() => {
+            precheck_output_with_ibp(graph, input, clauses, output, deadline)
+        }
+        _ => output,
     };
 
     let lower = output.lower();
@@ -669,7 +940,7 @@ pub(super) fn alpha_crown_precheck_clauses(
     // backward through Conv2d layers without meaningful alpha optimization
     // (patches mode doesn't support per-neuron alpha). The CROWN precheck
     // with spec-guided IBP intermediates already captures the same bounds.
-    // For malbeware 16-25, this avoids a wasteful 444s alpha-CROWN pass. #3218
+    // For malbeware 16-25, this avoids a wasteful 444s alpha-CROWN pass.
     if matches!(model_net, BetaCrownModel::Graph(_)) {
         info!("Skipping alpha-CROWN pre-check: Graph model (Conv2d DAG)");
         return already_verified.to_vec();
@@ -702,7 +973,7 @@ pub(super) fn alpha_crown_precheck_clauses(
     // above since alpha-CROWN falls back to CROWN for Conv2d layers.
     // Deep FC models (>8 ReLU layers, e.g., malbeware 16-25) are handled by
     // adaptive_skip in the propagation path — alpha-CROWN provides no benefit
-    // for deep networks where bounds are fundamentally loose. #3218
+    // for deep networks where bounds are fundamentally loose.
     let alpha_config = AlphaCrownConfig {
         iterations: 15,
         learning_rate: 0.1,
@@ -759,3 +1030,183 @@ pub(super) fn alpha_crown_precheck_clauses(
 
     result
 }
+
+// ---------------------------------------------------------------------------
+// #fwd-root-screen (V4, DARK behind `bab.forward_root_screen`)
+// ---------------------------------------------------------------------------
+
+/// Whether a single unsafe-region constraint is provably FALSE over the
+/// certified binary64 output box `[lo, hi]`, and its margin (`> 0`, or `>= 0`
+/// for a strict comparison, when refuted; for reporting only — the decision
+/// uses the direct comparison, never the rounded difference).
+///
+/// Mirrors `constraint_provably_false` on the f32 box: the threshold `k` is the
+/// spec's own f64 constant and the box endpoints are exact binary64 values,
+/// so `lo > k` is an exact comparison. A non-finite endpoint, an out-of-range
+/// index or a non-finite constant refutes nothing.
+pub(super) fn constraint_refuted_f64(lo: &[f64], hi: &[f64], c: &OutputConstraint) -> (bool, f64) {
+    let at = |v: &[f64], i: usize| v.get(i).copied().filter(|x| x.is_finite());
+    let unrefuted = (false, f64::NEG_INFINITY);
+    match *c {
+        OutputConstraint::LessEqConst(i, k) => match at(lo, i) {
+            Some(l) if k.is_finite() => (l > k, l - k),
+            _ => unrefuted,
+        },
+        OutputConstraint::LessThanConst(i, k) => match at(lo, i) {
+            Some(l) if k.is_finite() => (l >= k, l - k),
+            _ => unrefuted,
+        },
+        OutputConstraint::GreaterEqConst(i, k) => match at(hi, i) {
+            Some(u) if k.is_finite() => (u < k, k - u),
+            _ => unrefuted,
+        },
+        OutputConstraint::GreaterThanConst(i, k) => match at(hi, i) {
+            Some(u) if k.is_finite() => (u <= k, k - u),
+            _ => unrefuted,
+        },
+        OutputConstraint::LessEq(i, j) => match (at(lo, i), at(hi, j)) {
+            (Some(a), Some(b)) => (a > b, a - b),
+            _ => unrefuted,
+        },
+        OutputConstraint::LessThan(i, j) => match (at(lo, i), at(hi, j)) {
+            (Some(a), Some(b)) => (a >= b, a - b),
+            _ => unrefuted,
+        },
+        OutputConstraint::GreaterEq(i, j) => match (at(hi, i), at(lo, j)) {
+            (Some(a), Some(b)) => (a < b, b - a),
+            _ => unrefuted,
+        },
+        OutputConstraint::GreaterThan(i, j) => match (at(hi, i), at(lo, j)) {
+            (Some(a), Some(b)) => (a <= b, b - a),
+            _ => unrefuted,
+        },
+        // `OutputConstraint` is `#[non_exhaustive]`: a future variant refutes
+        // nothing until it is taught here (fail closed).
+        _ => unrefuted,
+    }
+}
+
+/// Per-clause `(refuted, margin)` over a certified output box. A clause (a
+/// conjunction of unsafe constraints) is refuted iff it is non-empty and ANY of
+/// its constraints is provably false; its margin is the best constraint margin.
+pub(super) fn screen_clause_verdicts(
+    lo: &[f64],
+    hi: &[f64],
+    clauses: &[Vec<OutputConstraint>],
+) -> (Vec<bool>, Vec<f64>) {
+    clauses
+        .iter()
+        .map(|clause| {
+            let mut refuted = false;
+            let mut margin = f64::NEG_INFINITY;
+            for constraint in clause {
+                let (r, m) = constraint_refuted_f64(lo, hi, constraint);
+                refuted |= r;
+                margin = margin.max(m);
+            }
+            (!clause.is_empty() && refuted, margin)
+        })
+        .unzip()
+}
+
+/// The UNION verdict: a clause is refuted when the existing precheck OR the
+/// screen refutes it. A missing or mis-sized screen result changes nothing, and
+/// a precheck refutation is never cleared.
+pub(super) fn union_refutations(precheck: &[bool], screen: Option<&[bool]>) -> Vec<bool> {
+    match screen {
+        Some(screen) if screen.len() == precheck.len() => {
+            precheck.iter().zip(screen).map(|(&a, &b)| a || b).collect()
+        }
+        _ => precheck.to_vec(),
+    }
+}
+
+/// Run the certified forward root screen once over the root input box and
+/// return the clauses its output box refutes (all `false` on any decline).
+///
+/// Prints the fixed-schema observable on EVERY call (the key is armed when
+/// this runs): `[fwd-root] ops=<census> admitted=1 symbols=<n> refuted=<k>/<n>
+/// min_margin=<m> slack_max=<s> elapsed_ms=<t> …` or `[fwd-root]
+/// ops=<census|-> admitted=0 reason=<token> …`, plus a `fwd_root_screen`
+/// flight note. `slack_max` is the largest certified remainder (the summed
+/// rounding/model charge) over every node; `min_margin` the smallest clause
+/// margin (negative = that clause is not refuted).
+pub(super) fn forward_root_screen_clauses(
+    graph: &ny_propagate::GraphNetwork,
+    input: &BoundedTensor,
+    clauses: &[Vec<OutputConstraint>],
+    max_mb: u32,
+    deadline: Option<Instant>,
+) -> Vec<bool> {
+    let max_bytes = u64::from(max_mb.max(1)) << 20;
+    match ny_propagate::zono_core::run_forward_root_screen(graph, input, max_bytes, deadline, true)
+    {
+        Ok(screen) => {
+            let (refuted, margins) =
+                screen_clause_verdicts(&screen.output_lo, &screen.output_hi, clauses);
+            let refuted_count = refuted.iter().filter(|&&r| r).count();
+            let min_margin = margins.iter().copied().fold(f64::INFINITY, f64::min);
+            let max_margin = margins.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let stats = &screen.stats;
+            let line = format!(
+                "ops={} admitted=1 symbols={} refuted={refuted_count}/{} min_margin={min_margin:e} \
+                 slack_max={:e} elapsed_ms={} max_margin={max_margin:e} input_symbols={} \
+                 fresh_relu={} fresh_mul={} fresh_square={} fresh_band={} relu_unstable={} \
+                 gens_peak={} live_mb_peak={} budget_mb={} peak_rss_mb={} ibp_tightened={} \
+                 source=config key=bab.forward_root_screen",
+                screen.census,
+                stats.symbols,
+                clauses.len(),
+                stats.max_remainder,
+                screen.elapsed.as_millis(),
+                stats.input_symbols,
+                stats.fresh_relu,
+                stats.fresh_mul,
+                stats.fresh_square,
+                stats.fresh_band,
+                stats.relu_unstable,
+                stats.gens_peak,
+                stats.live_bytes_peak >> 20,
+                screen.budget_bytes >> 20,
+                screen
+                    .peak_rss_mb
+                    .map_or_else(|| "na".to_string(), |mb| mb.to_string()),
+                stats.ibp_tightened,
+            );
+            eprintln!("[fwd-root] {line}");
+            crate::flight::note(
+                "fwd_root_screen",
+                crate::flight::FlightStatus::Ran,
+                Some(line),
+            );
+            refuted
+        }
+        Err(decline) => {
+            let detail = decline.reason.to_string().replace(char::is_whitespace, "_");
+            let line = format!(
+                "ops={} admitted=0 reason={} detail={detail} elapsed_ms={} budget_mb={} \
+                 refuted=0/{} source=config key=bab.forward_root_screen",
+                decline.census,
+                decline.reason.token(),
+                decline.elapsed.as_millis(),
+                decline.budget_bytes >> 20,
+                clauses.len(),
+            );
+            eprintln!("[fwd-root] {line}");
+            crate::flight::note(
+                "fwd_root_screen",
+                crate::flight::FlightStatus::Ran,
+                Some(line),
+            );
+            vec![false; clauses.len()]
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "pwl_lookup_precheck_tests.rs"]
+mod pwl_lookup_precheck_tests;
+
+#[cfg(test)]
+#[path = "fwd_root_screen_tests.rs"]
+mod fwd_root_screen_tests;

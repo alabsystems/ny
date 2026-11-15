@@ -25,7 +25,6 @@
 //! - LayerNorm: num_groups = 1 (all channels in one group)
 //!
 //! Used in: Demucs DConv sub-layers (dilated Conv1d + GroupNorm + GELU).
-//! Part of #3205.
 
 mod crown_batched;
 mod crown_scalar;

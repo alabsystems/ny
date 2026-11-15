@@ -32,8 +32,9 @@ use ny_core::{dd::two_sum, dd_selfcheck::dd_selfcheck_ok};
 use ny_core::{
     GemmEngine, GpuCrownLayer, GpuCrownResult, GpuCrownSeed, GpuCrownTrajectoryResult,
     GpuResidentCoeffBatched, GpuResnetBatchedDomainRef, GpuResnetSegment, NyError,
-    ResidentLowerCutCarrier, ResidentLowerCutChannel, Result,
-    DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS,
+    ResidentLocalL1LowerCutCarrier, ResidentLowerCutCarrier, ResidentLowerCutChannel,
+    ResidentTripletLowerCutCarrier, ResidentTwoLocalL1LowerCutCarrier,
+    ResidentTwoPairLowerCutCarrier, Result, DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS,
 };
 
 /// f64 unit roundoff, 2⁻⁵³ (exact).
@@ -371,6 +372,65 @@ pub(crate) fn linear_step_f64<E: GemmEngine + ?Sized>(
     Ok((a_new, a_err_new))
 }
 
+/// Borrow the four existing descriptor tables without allocating or rewriting
+/// optimized alpha state. For a dual descriptor the slots are alpha_L, chord,
+/// alpha_U, chord intercept; ordinary slots retain their original meanings.
+/// This transports affine branches only. The checked original-source caller
+/// must establish that both minorants and the chord enclose the actual ReLU.
+#[derive(Clone, Copy)]
+struct ActivationView<'a> {
+    tables: [&'a [f32]; 4],
+    dual: bool,
+}
+
+impl<'a> ActivationView<'a> {
+    fn from_layer(layer: &'a GpuCrownLayer) -> Option<Self> {
+        match layer {
+            GpuCrownLayer::Activation {
+                lower_slope,
+                upper_slope,
+                lower_intercept,
+                upper_intercept,
+                ..
+            } => Some(Self {
+                tables: [lower_slope, upper_slope, lower_intercept, upper_intercept],
+                dual: false,
+            }),
+            GpuCrownLayer::ActivationReluDualAlpha {
+                lower_pos_slope,
+                cross_slope,
+                upper_neg_slope,
+                cross_intercept,
+                ..
+            } => Some(Self {
+                tables: [
+                    lower_pos_slope,
+                    cross_slope,
+                    upper_neg_slope,
+                    cross_intercept,
+                ],
+                dual: true,
+            }),
+            _ => None,
+        }
+    }
+
+    fn intercepts(self, index: usize) -> (f32, f32) {
+        (
+            if self.dual {
+                0.0
+            } else {
+                self.tables[2][index]
+            },
+            self.tables[3][index],
+        )
+    }
+
+    fn upper_negative_slope(self) -> Option<&'a [f32]> {
+        self.dual.then_some(self.tables[2])
+    }
+}
+
 /// One SOUND f64-native activation step (elementwise, sign-routed slopes), the f64
 /// analogue of `ny_core::crown_activation_error_step`. Returns
 /// `(new_lower_a, new_upper_a, new_lower_err, new_upper_err)`, all f64.
@@ -385,8 +445,38 @@ pub(crate) fn activation_step_f64(
     lower_slope: &[f32],
     upper_slope: &[f32],
 ) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)> {
+    activation_step_f64_branches(
+        num_outputs,
+        num_neurons,
+        lower_a,
+        upper_a,
+        lower_err,
+        upper_err,
+        lower_slope,
+        upper_slope,
+        None,
+    )
+}
+
+/// Same four output buffers and center arithmetic as the ordinary step. A dual
+/// upper-negative branch needs its own sign-flip radius; it must not reuse the
+/// lower alpha when alpha_L and alpha_U differ.
+#[allow(clippy::too_many_arguments)]
+fn activation_step_f64_branches(
+    num_outputs: usize,
+    num_neurons: usize,
+    lower_a: &[f64],
+    upper_a: &[f64],
+    lower_err: &[f64],
+    upper_err: &[f64],
+    lower_slope: &[f32],
+    upper_slope: &[f32],
+    upper_negative_slope: Option<&[f32]>,
+) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)> {
+    ny_core::require_f64_interval_proof_environment()?;
     if num_neurons == 0
         || lower_slope.len() != upper_slope.len()
+        || upper_negative_slope.is_some_and(|values| values.len() != lower_slope.len())
         || !lower_slope.len().is_multiple_of(num_neurons)
     {
         return Err(NyError::InvalidSpec(
@@ -412,19 +502,56 @@ pub(crate) fn activation_step_f64(
             let idx = j * num_neurons + i;
             let ls = f64::from(lower_slope[param_base + i]);
             let us = f64::from(upper_slope[param_base + i]);
-            let slope_sum = ls.abs() + us.abs();
+            let slope_sum = certified_weight_charge::add_up(ls.abs(), us.abs())?;
 
             let la = lower_a[idx];
             let lsel = if la >= 0.0 { ls } else { us };
             let lcoeff = la * lsel;
             nla[idx] = lcoeff;
-            nle[idx] = lower_err[idx] * slope_sum + lcoeff.abs() * U64 + ETA64;
+            // Exact zero times a finite branch remains exact zero. Avoid an
+            // artificial underflow floor outside the proof frontier's support.
+            nle[idx] = if sparse_conv::exact_zero(la)
+                && sparse_conv::exact_zero(lower_err[idx])
+                && ls.is_finite()
+                && us.is_finite()
+            {
+                0.0
+            } else {
+                certified_weight_charge::add_up(
+                    certified_weight_charge::mul_up(lower_err[idx], slope_sum)?,
+                    certified_weight_charge::add_up(
+                        certified_weight_charge::mul_up(lcoeff.abs(), U64)?,
+                        ETA64,
+                    )?,
+                )?
+            };
 
+            let upper_negative =
+                upper_negative_slope.map_or(ls, |values| f64::from(values[param_base + i]));
+            let upper_slope_sum = if upper_negative_slope.is_some() {
+                certified_weight_charge::add_up(us.abs(), upper_negative.abs())?
+            } else {
+                slope_sum
+            };
             let ua = upper_a[idx];
-            let usel = if ua >= 0.0 { us } else { ls };
+            let usel = if ua >= 0.0 { us } else { upper_negative };
             let ucoeff = ua * usel;
             nua[idx] = ucoeff;
-            nue[idx] = upper_err[idx] * slope_sum + ucoeff.abs() * U64 + ETA64;
+            nue[idx] = if sparse_conv::exact_zero(ua)
+                && sparse_conv::exact_zero(upper_err[idx])
+                && us.is_finite()
+                && upper_negative.is_finite()
+            {
+                0.0
+            } else {
+                certified_weight_charge::add_up(
+                    certified_weight_charge::mul_up(upper_err[idx], upper_slope_sum)?,
+                    certified_weight_charge::add_up(
+                        certified_weight_charge::mul_up(ucoeff.abs(), U64)?,
+                        ETA64,
+                    )?,
+                )?
+            };
         }
     }
     Ok((nla, nua, nle, nue))
@@ -445,7 +572,8 @@ fn bias_fold_f64(
     bias: &[f32],
     acc: &mut [f64],
     acc_err: &mut [f64],
-) {
+) -> Result<()> {
+    ny_core::require_f64_interval_proof_environment()?;
     let gamma = gamma_k_f64(n + 1);
     let real_factor = 1.0 + 2.0 * gamma;
     let additive = 8.0 * ((n + 1) as f64) * ETA64;
@@ -456,10 +584,17 @@ fn bias_fold_f64(
             let prod = a[s * n + k] * bk;
             acc[s] += prod;
             mag += prod.abs();
-            acc_err[s] += a_err[s * n + k] * bk.abs();
+            acc_err[s] = certified_weight_charge::add_up(
+                acc_err[s],
+                certified_weight_charge::mul_up(a_err[s * n + k], bk.abs())?,
+            )?;
         }
-        acc_err[s] += gamma * mag * real_factor + additive;
+        acc_err[s] = certified_weight_charge::add_up(
+            acc_err[s],
+            certified_weight_charge::rounding_up(gamma, mag, real_factor, additive)?,
+        )?;
     }
+    Ok(())
 }
 
 /// SOUND f64 concretization → outward-rounded f32 `(lower, upper)` per spec.
@@ -625,6 +760,34 @@ fn conv_step_f64<E: GemmEngine + ?Sized>(
             vec![oc * n],
             vec![weight_col.len()],
         ));
+    }
+
+    // A zero center AND zero radius means the exact incoming coefficient is
+    // zero. Compact those spatial rows before the contraction, preserving full
+    // source geometry and both coefficient/error channels. The dense resource
+    // quote still bounds this smaller contraction and its support metadata.
+    if let Some(result) = sparse_conv::try_step(
+        eng,
+        batch,
+        a,
+        a_err,
+        weight_col,
+        sparse_conv::Geometry {
+            oc,
+            ic,
+            kh,
+            kw,
+            sh,
+            sw,
+            ph,
+            pw,
+            oh,
+            ow,
+            in_h,
+            in_w,
+        },
+    )? {
+        return Ok(result);
     }
 
     // Reshape [batch, oc, oh·ow] → [batch·oh·ow, oc] (transpose oc ↔ spatial per row).
@@ -1035,11 +1198,217 @@ fn frontier_to_resident_coeff(
 /// Elementwise `dst += src` in f64 with the merge rounding certified into `dst_err`
 /// (`+= |src_err| + U64·|dst|`, `U64 = 2^-53` the f64 unit roundoff — a sound bound
 /// on one correctly-rounded add `|fl(a+b) - (a+b)| <= U64·|fl(a+b)|`). Sound: widens
-/// the error, never tightens.
-fn merge_add(dst: &mut [f64], src: &[f64], dst_err: &mut [f64], src_err: &[f64]) {
+/// the error, never tightens. All propagated-radius sums/products are outward;
+/// zero model error does not waive an existing incoming coefficient radius.
+fn merge_add(dst: &mut [f64], src: &[f64], dst_err: &mut [f64], src_err: &[f64]) -> Result<()> {
+    ny_core::require_f64_interval_proof_environment()?;
     for i in 0..dst.len() {
         dst[i] += src[i];
-        dst_err[i] += src_err[i].abs() + U64 * dst[i].abs();
+        dst_err[i] = certified_weight_charge::add_up(
+            certified_weight_charge::add_up(dst_err[i], src_err[i])?,
+            certified_weight_charge::add_up(
+                certified_weight_charge::mul_up(U64, dst[i].abs())?,
+                ETA64,
+            )?,
+        )?;
+    }
+    Ok(())
+}
+
+/// Call-local arithmetic transport. Each multi-neuron arm has its own checked
+/// capability; neither changes the existing single-pair API.
+#[derive(Clone, Copy)]
+enum LowerCutRef<'a> {
+    Single(&'a ResidentLowerCutCarrier),
+    TwoPair(&'a ResidentTwoPairLowerCutCarrier),
+    Triplet(&'a ResidentTripletLowerCutCarrier),
+    LocalL1(&'a ResidentLocalL1LowerCutCarrier),
+    TwoLocalL1(&'a ResidentTwoLocalL1LowerCutCarrier),
+}
+
+impl LowerCutRef<'_> {
+    fn target_activation(self) -> usize {
+        match self {
+            Self::Single(carrier) => carrier.target_activation(),
+            Self::TwoPair(carrier) => carrier.target_activation(),
+            Self::Triplet(carrier) => carrier.target_activation(),
+            Self::LocalL1(carrier) => carrier.target_activation(),
+            Self::TwoLocalL1(carrier) => carrier.target_activation(),
+        }
+    }
+
+    fn apply_coefficients(
+        self,
+        lower_a: &mut [f64],
+        lower_err: &mut [f64],
+        num_specs: usize,
+        width: usize,
+        post: bool,
+    ) -> Result<()> {
+        match self {
+            Self::Single(carrier) => apply_lower_cut_coefficients_f64(
+                lower_a, lower_err, num_specs, width, carrier, post,
+            ),
+            Self::TwoPair(carrier) => {
+                if num_specs != 1
+                    || lower_a.len() != width
+                    || lower_err.len() != width
+                    || carrier.target_width() != width
+                {
+                    return Err(NyError::InvalidSpec(
+                        "cuda two-pair lower cut: target coefficient shape mismatch".into(),
+                    ));
+                }
+                let pairs = carrier.ordered_pairs();
+                let channels = if post { carrier.post() } else { carrier.pre() };
+                for position in 0..4 {
+                    let column = pairs[position / 2][position % 2];
+                    if column >= width {
+                        return Err(NyError::InvalidSpec(
+                            "cuda two-pair lower cut: target neuron is outside resident width"
+                                .into(),
+                        ));
+                    }
+                    add_lower_cut_channel_f64(
+                        &mut lower_a[column],
+                        &mut lower_err[column],
+                        channels[position],
+                    )?;
+                }
+                Ok(())
+            }
+            Self::Triplet(carrier) => {
+                if num_specs != 1
+                    || lower_a.len() != width
+                    || lower_err.len() != width
+                    || carrier.target_width() != width
+                {
+                    return Err(NyError::InvalidSpec(
+                        "cuda triplet lower cut: target coefficient shape mismatch".into(),
+                    ));
+                }
+                let indices = carrier.ordered_neurons();
+                let channels = if post { carrier.post() } else { carrier.pre() };
+                for position in 0..3 {
+                    let column = indices[position];
+                    if column >= width {
+                        return Err(NyError::InvalidSpec(
+                            "cuda triplet lower cut: target neuron is outside resident width"
+                                .into(),
+                        ));
+                    }
+                    add_lower_cut_channel_f64(
+                        &mut lower_a[column],
+                        &mut lower_err[column],
+                        channels[position],
+                    )?;
+                }
+                Ok(())
+            }
+            Self::LocalL1(carrier) => {
+                if num_specs != 1
+                    || lower_a.len() != width
+                    || lower_err.len() != width
+                    || carrier.target_width() != width
+                {
+                    return Err(NyError::InvalidSpec(
+                        "cuda local L1 lower cut: target coefficient shape mismatch".into(),
+                    ));
+                }
+                let indices = carrier.ordered_neurons();
+                let channels = if post { carrier.post() } else { carrier.pre() };
+                for position in 0..carrier.active_len() {
+                    let column = indices[position];
+                    if column >= width {
+                        return Err(NyError::InvalidSpec(
+                            "cuda local L1 lower cut: target neuron is outside resident width"
+                                .into(),
+                        ));
+                    }
+                    add_lower_cut_channel_f64(
+                        &mut lower_a[column],
+                        &mut lower_err[column],
+                        channels[position],
+                    )?;
+                }
+                Ok(())
+            }
+            Self::TwoLocalL1(carrier) => {
+                if num_specs != 1
+                    || lower_a.len() != width
+                    || lower_err.len() != width
+                    || carrier.target_width() != width
+                {
+                    return Err(NyError::InvalidSpec(
+                        "cuda two-local L1: target coefficient shape mismatch".into(),
+                    ));
+                }
+                let indices = carrier.ordered_neurons();
+                let channels = if post { carrier.post() } else { carrier.pre() };
+                for group in 0..2 {
+                    for position in 0..carrier.active_lens()[group] {
+                        let column = indices[group][position];
+                        if column >= width {
+                            return Err(NyError::InvalidSpec(
+                                "cuda two-local L1: target neuron outside resident width".into(),
+                            ));
+                        }
+                        add_lower_cut_channel_f64(
+                            &mut lower_a[column],
+                            &mut lower_err[column],
+                            channels[group][position],
+                        )?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn apply_bias(self, lb: &mut [f64], lb_err: &mut [f64]) -> Result<()> {
+        match self {
+            Self::Single(carrier) => apply_lower_cut_bias_f64(lb, lb_err, carrier),
+            Self::TwoPair(carrier) => {
+                if lb.len() != 1 || lb_err.len() != 1 {
+                    return Err(NyError::InvalidSpec(
+                        "cuda two-pair lower cut: bias row shape mismatch".into(),
+                    ));
+                }
+                // The private proof owner has already reduced both facet
+                // intercepts into this one outward center/error channel.
+                add_lower_cut_channel_f64(&mut lb[0], &mut lb_err[0], carrier.bias())
+            }
+            Self::Triplet(carrier) => {
+                if lb.len() != 1 || lb_err.len() != 1 {
+                    return Err(NyError::InvalidSpec(
+                        "cuda triplet lower cut: bias row shape mismatch".into(),
+                    ));
+                }
+                // The private proof owner has already reduced the relation
+                // intercept into this one outward center/error channel.
+                add_lower_cut_channel_f64(&mut lb[0], &mut lb_err[0], carrier.bias())
+            }
+            Self::LocalL1(carrier) => {
+                if lb.len() != 1 || lb_err.len() != 1 {
+                    return Err(NyError::InvalidSpec(
+                        "cuda local L1 lower cut: bias row shape mismatch".into(),
+                    ));
+                }
+                // The private proof owner has already reduced the relation
+                // intercept into this one outward center/error channel.
+                add_lower_cut_channel_f64(&mut lb[0], &mut lb_err[0], carrier.bias())
+            }
+            Self::TwoLocalL1(carrier) => {
+                if lb.len() != 1 || lb_err.len() != 1 {
+                    return Err(NyError::InvalidSpec(
+                        "cuda two-local L1: bias row shape mismatch".into(),
+                    ));
+                }
+                // Both original certificate products were jointly reduced by the
+                // private caller; this single channel is injected exactly once.
+                add_lower_cut_channel_f64(&mut lb[0], &mut lb_err[0], carrier.bias())
+            }
+        }
     }
 }
 
@@ -1062,7 +1431,7 @@ struct ActAux<'a> {
     /// Complete lower-only cut carrier for one target activation.  It is
     /// observation-only and call-local; ordinary beta/gradient constructors
     /// always leave it absent.
-    lower_cut: Option<&'a ResidentLowerCutCarrier>,
+    lower_cut: Option<LowerCutRef<'a>>,
     /// Proves the target activation was encountered exactly once in this fold.
     lower_cut_applied: bool,
     /// Shared fold cursor (advances once per Activation).
@@ -1144,10 +1513,18 @@ impl<'a> ActAux<'a> {
             beta_gather_idx: None,
             relu_grads: Vec::new(),
             beta_gather: Vec::new(),
-            lower_cut: Some(carrier),
+            lower_cut: Some(LowerCutRef::Single(carrier)),
             lower_cut_applied: false,
             cursor: 0,
         }
+    }
+
+    fn checked_cut(carrier: LowerCutRef<'a>) -> Self {
+        let mut state = Self::beta(&[]);
+        // No unrepresented split offset can enter either checked candidate.
+        state.beta_signed = None;
+        state.lower_cut = Some(carrier);
+        state
     }
 }
 
@@ -1164,13 +1541,12 @@ fn backward_layers_f64<E: GemmEngine + ?Sized>(
     aux: &mut Option<ActAux<'_>>,
 ) -> Result<Frontier> {
     eng.poll_crown_backward_deadline()?;
-    // #cert-err fail-closed: this is the single inner walk behind EVERY CUDA
-    // sound CROWN entry, and it charges only its own rounding against weights
-    // it treats as exact. A layer that declares a BN-fold `CertifiedWeightError`
-    // needs the `w_rel`/`bias_abs_err` charge the wgpu resident walk implements;
-    // until this walk implements it too, refuse rather than publish a radius
-    // that silently omits those terms.
-    ny_core::refuse_uncharged_certified_weight_error(layers, "cuda backward_layers_f64")?;
+    // Validate every declared model-error radius before any layer dispatch.
+    // Nonzero radii are charged into the existing private frontier below;
+    // The zero-declaration charge helper is unchanged. Shared propagated-error
+    // reductions are now outward even for exact stored weights; centers stay unchanged.
+    ny_core::require_f64_interval_proof_environment()?;
+    certified_weight_charge::validate_layers(layers)?;
     let Frontier {
         mut lower_a,
         mut upper_a,
@@ -1191,7 +1567,7 @@ fn backward_layers_f64<E: GemmEngine + ?Sized>(
                 bias,
                 out_features,
                 in_features,
-                ..
+                cert_err,
             } => {
                 if dim != *out_features {
                     return Err(NyError::shape_mismatch(vec![*out_features], vec![dim]));
@@ -1205,7 +1581,7 @@ fn backward_layers_f64<E: GemmEngine + ?Sized>(
                         bias,
                         &mut lb,
                         &mut lb_err,
-                    );
+                    )?;
                     bias_fold_f64(
                         num_specs,
                         *out_features,
@@ -1214,8 +1590,29 @@ fn backward_layers_f64<E: GemmEngine + ?Sized>(
                         bias,
                         &mut ub,
                         &mut ub_err,
-                    );
+                    )?;
                 }
+                // Stored-bias rounding used the original incoming error.
+                // Charge model bias against that same error, then enlarge the
+                // coefficient error before multiplying by the stored weights.
+                certified_weight_charge::charge(
+                    eng,
+                    num_specs,
+                    *out_features,
+                    &lower_a,
+                    &mut lower_err,
+                    &mut lb_err,
+                    *cert_err,
+                )?;
+                certified_weight_charge::charge(
+                    eng,
+                    num_specs,
+                    *out_features,
+                    &upper_a,
+                    &mut upper_err,
+                    &mut ub_err,
+                    *cert_err,
+                )?;
                 // Batch the lower + upper bounds into one set of (2·specs)-row
                 // GEMMs: 3 bigger cuBLAS calls per layer instead of 6 (better GPU
                 // utilization, fewer launches than the per-bound CPU path).
@@ -1242,13 +1639,13 @@ fn backward_layers_f64<E: GemmEngine + ?Sized>(
                 upper_err = ne[half..].to_vec();
                 dim = *in_features;
             }
-            GpuCrownLayer::Activation {
-                lower_slope,
-                upper_slope,
-                lower_intercept,
-                upper_intercept,
-                num_neurons,
-            } => {
+            GpuCrownLayer::Activation { num_neurons, .. }
+            | GpuCrownLayer::ActivationReluDualAlpha { num_neurons, .. } => {
+                let activation = ActivationView::from_layer(layer).ok_or_else(|| {
+                    NyError::InternalError("cuda activation view mismatch".into())
+                })?;
+                let [lower_slope, upper_slope, lower_intercept, upper_intercept] =
+                    activation.tables;
                 if dim != *num_neurons {
                     return Err(NyError::shape_mismatch(vec![*num_neurons], vec![dim]));
                 }
@@ -1293,12 +1690,11 @@ fn backward_layers_f64<E: GemmEngine + ?Sized>(
                     // Post channels participate in sign selection, intercept,
                     // and slope composition, so they must land before any part
                     // of this ReLU relaxation.
-                    apply_lower_cut_coefficients_f64(
+                    carrier.apply_coefficients(
                         &mut lower_a,
                         &mut lower_err,
                         num_specs,
                         *num_neurons,
-                        carrier,
                         true,
                     )?;
                 }
@@ -1318,15 +1714,16 @@ fn backward_layers_f64<E: GemmEngine + ?Sized>(
                         let la = lower_a[s * num_neurons + i];
                         let ua = upper_a[s * num_neurons + i];
                         let p = param_base + i;
+                        let (positive_intercept, negative_intercept) = activation.intercepts(p);
                         let li = if la >= 0.0 {
-                            lower_intercept[p]
+                            positive_intercept
                         } else {
-                            upper_intercept[p]
+                            negative_intercept
                         };
                         let ui = if ua >= 0.0 {
-                            upper_intercept[p]
+                            negative_intercept
                         } else {
-                            lower_intercept[p]
+                            positive_intercept
                         };
                         let lprod = la * f64::from(li);
                         let uprod = ua * f64::from(ui);
@@ -1334,13 +1731,33 @@ fn backward_layers_f64<E: GemmEngine + ?Sized>(
                         ub[s] += uprod;
                         lmag += lprod.abs();
                         umag += uprod.abs();
-                        let int_sum = f64::from(lower_intercept[p]).abs()
-                            + f64::from(upper_intercept[p]).abs();
-                        lb_err[s] += lower_err[s * num_neurons + i] * int_sum;
-                        ub_err[s] += upper_err[s * num_neurons + i] * int_sum;
+                        let int_sum = certified_weight_charge::add_up(
+                            f64::from(positive_intercept).abs(),
+                            f64::from(negative_intercept).abs(),
+                        )?;
+                        lb_err[s] = certified_weight_charge::add_up(
+                            lb_err[s],
+                            certified_weight_charge::mul_up(
+                                lower_err[s * num_neurons + i],
+                                int_sum,
+                            )?,
+                        )?;
+                        ub_err[s] = certified_weight_charge::add_up(
+                            ub_err[s],
+                            certified_weight_charge::mul_up(
+                                upper_err[s * num_neurons + i],
+                                int_sum,
+                            )?,
+                        )?;
                     }
-                    lb_err[s] += gamma * lmag * real_factor + additive;
-                    ub_err[s] += gamma * umag * real_factor + additive;
+                    lb_err[s] = certified_weight_charge::add_up(
+                        lb_err[s],
+                        certified_weight_charge::rounding_up(gamma, lmag, real_factor, additive)?,
+                    )?;
+                    ub_err[s] = certified_weight_charge::add_up(
+                        ub_err[s],
+                        certified_weight_charge::rounding_up(gamma, umag, real_factor, additive)?,
+                    )?;
                 }
                 // Non-soundness-critical captures from the PRE-transform lower coeff
                 // (before the slope transform), in ReLU fold order.
@@ -1402,16 +1819,31 @@ fn backward_layers_f64<E: GemmEngine + ?Sized>(
                     }
                 }
 
-                let (nla, nua, nle, nue) = activation_step_f64(
-                    num_specs,
-                    *num_neurons,
-                    &lower_a,
-                    &upper_a,
-                    &lower_err,
-                    &upper_err,
-                    lower_slope,
-                    upper_slope,
-                )?;
+                let (nla, nua, nle, nue) =
+                    if let Some(upper_negative) = activation.upper_negative_slope() {
+                        activation_step_f64_branches(
+                            num_specs,
+                            *num_neurons,
+                            &lower_a,
+                            &upper_a,
+                            &lower_err,
+                            &upper_err,
+                            lower_slope,
+                            upper_slope,
+                            Some(upper_negative),
+                        )?
+                    } else {
+                        activation_step_f64(
+                            num_specs,
+                            *num_neurons,
+                            &lower_a,
+                            &upper_a,
+                            &lower_err,
+                            &upper_err,
+                            lower_slope,
+                            upper_slope,
+                        )?
+                    };
                 lower_a = nla;
                 upper_a = nua;
                 lower_err = nle;
@@ -1429,15 +1861,14 @@ fn backward_layers_f64<E: GemmEngine + ?Sized>(
                     })?;
                     // Pre channels bypass the ReLU relaxation. The bias belongs
                     // to the same Lagrangian row and is charged once here.
-                    apply_lower_cut_coefficients_f64(
+                    carrier.apply_coefficients(
                         &mut lower_a,
                         &mut lower_err,
                         num_specs,
                         *num_neurons,
-                        carrier,
                         false,
                     )?;
-                    apply_lower_cut_bias_f64(&mut lb, &mut lb_err, carrier)?;
+                    carrier.apply_bias(&mut lb, &mut lb_err)?;
                     state.lower_cut_applied = true;
                 }
                 // β-CROWN split-constraint dual, folded into the POST-slope
@@ -1465,8 +1896,20 @@ fn backward_layers_f64<E: GemmEngine + ?Sized>(
                                 let b = f64::from(bk[param_base + i]);
                                 lower_a[idx] -= b;
                                 upper_a[idx] += b;
-                                lower_err[idx] += U64 * lower_a[idx].abs();
-                                upper_err[idx] += U64 * upper_a[idx].abs();
+                                lower_err[idx] = certified_weight_charge::add_up(
+                                    lower_err[idx],
+                                    certified_weight_charge::add_up(
+                                        certified_weight_charge::mul_up(U64, lower_a[idx].abs())?,
+                                        ETA64,
+                                    )?,
+                                )?;
+                                upper_err[idx] = certified_weight_charge::add_up(
+                                    upper_err[idx],
+                                    certified_weight_charge::add_up(
+                                        certified_weight_charge::mul_up(U64, upper_a[idx].abs())?,
+                                        ETA64,
+                                    )?,
+                                )?;
                             }
                         }
                     }
@@ -1489,7 +1932,7 @@ fn backward_layers_f64<E: GemmEngine + ?Sized>(
                 out_w,
                 in_h,
                 in_w,
-                ..
+                cert_err,
             } => {
                 let (oc, ic, kh, kw) = (*out_channels, *in_channels, *kernel_h, *kernel_w);
                 let out_d = oc * out_h * out_w;
@@ -1509,7 +1952,7 @@ fn backward_layers_f64<E: GemmEngine + ?Sized>(
                         bias,
                         &mut lb,
                         &mut lb_err,
-                    );
+                    )?;
                     bias_fold_f64(
                         num_specs,
                         out_d,
@@ -1518,8 +1961,26 @@ fn backward_layers_f64<E: GemmEngine + ?Sized>(
                         bias,
                         &mut ub,
                         &mut ub_err,
-                    );
+                    )?;
                 }
+                certified_weight_charge::charge(
+                    eng,
+                    num_specs,
+                    out_d,
+                    &lower_a,
+                    &mut lower_err,
+                    &mut lb_err,
+                    *cert_err,
+                )?;
+                certified_weight_charge::charge(
+                    eng,
+                    num_specs,
+                    out_d,
+                    &upper_a,
+                    &mut upper_err,
+                    &mut ub_err,
+                    *cert_err,
+                )?;
                 // Batch lower + upper rows through the transposed-conv coefficient map.
                 let mut a_stack = Vec::with_capacity(2 * num_specs * out_d);
                 a_stack.extend_from_slice(&lower_a);
@@ -1733,16 +2194,16 @@ fn resnet_fold_f64_core<E: GemmEngine + ?Sized>(
                     &f.lower_a,
                     &mut branch.lower_err,
                     &f.lower_err,
-                );
+                )?;
                 merge_add(
                     &mut branch.upper_a,
                     &f.upper_a,
                     &mut branch.upper_err,
                     &f.upper_err,
-                );
+                )?;
                 // Outer bias b_out (in f.lb/ub) added once; skip contributes none.
-                merge_add(&mut branch.lb, &f.lb, &mut branch.lb_err, &f.lb_err);
-                merge_add(&mut branch.ub, &f.ub, &mut branch.ub_err, &f.ub_err);
+                merge_add(&mut branch.lb, &f.lb, &mut branch.lb_err, &f.lb_err)?;
+                merge_add(&mut branch.ub, &f.ub, &mut branch.ub_err, &f.ub_err)?;
                 f = branch;
             }
             GpuResnetSegment::ResidualProj(fbranch, pbranch) => {
@@ -1770,18 +2231,18 @@ fn resnet_fold_f64_core<E: GemmEngine + ?Sized>(
                     &bp.lower_a,
                     &mut bf.lower_err,
                     &bp.lower_err,
-                );
+                )?;
                 merge_add(
                     &mut bf.upper_a,
                     &bp.upper_a,
                     &mut bf.upper_err,
                     &bp.upper_err,
-                );
-                merge_add(&mut bf.lb, &bp.lb, &mut bf.lb_err, &bp.lb_err);
-                merge_add(&mut bf.ub, &bp.ub, &mut bf.ub_err, &bp.ub_err);
+                )?;
+                merge_add(&mut bf.lb, &bp.lb, &mut bf.lb_err, &bp.lb_err)?;
+                merge_add(&mut bf.ub, &bp.ub, &mut bf.ub_err, &bp.ub_err)?;
                 // Outer bias b_out (in f.lb/ub), counted once.
-                merge_add(&mut bf.lb, &f.lb, &mut bf.lb_err, &f.lb_err);
-                merge_add(&mut bf.ub, &f.ub, &mut bf.ub_err, &f.ub_err);
+                merge_add(&mut bf.lb, &f.lb, &mut bf.lb_err, &f.lb_err)?;
+                merge_add(&mut bf.ub, &f.ub, &mut bf.ub_err, &f.ub_err)?;
                 f = bf;
             }
         }
@@ -1999,13 +2460,12 @@ fn validate_bounded_rows_layer<E: GemmEngine + ?Sized>(
             }
             Ok(*in_features)
         }
-        GpuCrownLayer::Activation {
-            lower_slope,
-            upper_slope,
-            lower_intercept,
-            upper_intercept,
-            num_neurons,
-        } => {
+        GpuCrownLayer::Activation { num_neurons, .. }
+        | GpuCrownLayer::ActivationReluDualAlpha { num_neurons, .. } => {
+            let activation = ActivationView::from_layer(layer).ok_or_else(|| {
+                NyError::InternalError("cuda activation validation view mismatch".into())
+            })?;
+            let [lower_slope, upper_slope, lower_intercept, upper_intercept] = activation.tables;
             if *num_neurons == 0
                 || current_dim != *num_neurons
                 || lower_slope.len() != *num_neurons
@@ -2017,10 +2477,25 @@ fn validate_bounded_rows_layer<E: GemmEngine + ?Sized>(
                     "malformed single-domain activation table",
                 ));
             }
-            validate_bounded_rows_finite(eng, lower_slope, "activation lower slope")?;
-            validate_bounded_rows_finite(eng, upper_slope, "activation upper slope")?;
-            validate_bounded_rows_finite(eng, lower_intercept, "activation lower intercept")?;
-            validate_bounded_rows_finite(eng, upper_intercept, "activation upper intercept")?;
+            let labels = if activation.dual {
+                [
+                    "activation lower-positive alpha",
+                    "activation crossing slope",
+                    "activation upper-negative alpha",
+                    "activation crossing intercept",
+                ]
+            } else {
+                [
+                    "activation lower slope",
+                    "activation upper slope",
+                    "activation lower intercept",
+                    "activation upper intercept",
+                ]
+            };
+            validate_bounded_rows_finite(eng, lower_slope, labels[0])?;
+            validate_bounded_rows_finite(eng, upper_slope, labels[1])?;
+            validate_bounded_rows_finite(eng, lower_intercept, labels[2])?;
+            validate_bounded_rows_finite(eng, upper_intercept, labels[3])?;
             activation_dims.push(*num_neurons);
             Ok(*num_neurons)
         }
@@ -2115,11 +2590,36 @@ fn validate_deadline_bounded_rows_resnet_request<E: GemmEngine + ?Sized>(
     frontier_abs: &[Vec<f32>],
     node_abs: &[Vec<f32>],
 ) -> Result<()> {
+    validate_deadline_bounded_rows_resnet_request_range(
+        eng,
+        segments,
+        seed,
+        input_lower,
+        input_upper,
+        frontier_abs,
+        node_abs,
+        2,
+        DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_deadline_bounded_rows_resnet_request_range<E: GemmEngine + ?Sized>(
+    eng: &E,
+    segments: &[GpuResnetSegment],
+    seed: &GpuCrownSeed,
+    input_lower: &[f32],
+    input_upper: &[f32],
+    frontier_abs: &[Vec<f32>],
+    node_abs: &[Vec<f32>],
+    min_rows: usize,
+    max_rows: usize,
+) -> Result<()> {
     eng.poll_crown_backward_deadline()?;
-    if !(2..=DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS).contains(&seed.num_specs) {
+    if !(min_rows..=max_rows).contains(&seed.num_specs) {
         return Err(bounded_rows_invalid(format!(
-            "row count must be in 2..={}, got {}",
-            DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS, seed.num_specs
+            "row count must be in {min_rows}..={max_rows}, got {}",
+            seed.num_specs
         )));
     }
     if segments.is_empty() || seed.current_dim == 0 {
@@ -2265,7 +2765,9 @@ fn validate_deadline_bounded_beta_table<E: GemmEngine + ?Sized>(
     ) -> Result<()> {
         for layer in layers {
             eng.poll_crown_backward_deadline()?;
-            if let GpuCrownLayer::Activation { num_neurons, .. } = layer {
+            if let GpuCrownLayer::Activation { num_neurons, .. }
+            | GpuCrownLayer::ActivationReluDualAlpha { num_neurons, .. } = layer
+            {
                 let values = beta_signed.get(*cursor).ok_or_else(|| {
                     bounded_rows_invalid("beta table is shorter than the activation fold")
                 })?;
@@ -3849,6 +4351,10 @@ pub(crate) fn crown_backward_gpu_sound_impl<E: GemmEngine + ?Sized>(
     );
     backward_f64_core(eng, layers, spec, num_specs, input_lower, input_upper)
 }
+
+// Separate explicitly bounded primitive; ordinary and shadow routes unchanged.
+#[path = "sound_crown/certified_lower_cut.rs"]
+pub(crate) mod certified_lower_cut;
 
 #[cfg(test)]
 mod tests {
@@ -6470,3 +6976,10 @@ mod cuda_sentinel_guard_tests {
         );
     }
 }
+
+#[path = "sound_crown/certified_weight_charge.rs"]
+mod certified_weight_charge;
+
+// Exact incoming support is execution metadata, never a new bound authority.
+#[path = "sound_crown/sparse_conv.rs"]
+mod sparse_conv;

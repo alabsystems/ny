@@ -106,7 +106,7 @@ def main():
     # Check if ny binary exists
     if not NY_BIN.exists():
         print(f"Error: ny binary not found at {NY_BIN}")
-        print("Run: cargo build --release -p ny-cli")
+        print("Run: targo --unverified build --release -p ny-cli")
         sys.exit(1)
 
     # Check if models directory exists

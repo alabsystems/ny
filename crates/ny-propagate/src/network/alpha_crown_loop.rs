@@ -12,7 +12,7 @@
 //! Extracted to eliminate the ~80% code duplication between
 //! `alpha_crown.rs` (Network) and `propagate_sequential.rs` (GraphNetwork).
 //! Ensures structural consistency of NaN guards, early stopping, optimizer
-//! updates, and best-bounds tracking across both paths. (#2835)
+//! updates, and best-bounds tracking across both paths.
 
 use crate::bounds::{
     AlphaCrownConfig, AlphaState, FacetBank, FacetBankSearchConfig, LinearBounds,
@@ -232,7 +232,7 @@ pub(crate) struct BackwardIterationResult {
     pub(crate) linear_bounds: LinearBounds,
     /// Gradients for each ReLU layer for lower alpha path (one `Array1` per ReLU).
     pub(crate) gradients: Vec<Array1<f32>>,
-    /// Gradients for each ReLU layer for upper alpha path (#3393).
+    /// Gradients for each ReLU layer for upper alpha path.
     pub(crate) gradients_upper: Vec<Array1<f32>>,
     /// Optional bounds computed without output constraints (for INVPROP best-of).
     pub(crate) bounds_without_oc: Option<LinearBounds>,
@@ -255,7 +255,7 @@ pub(crate) struct ReferenceBoundsCandidate {
 ///
 /// Optional hooks (with default no-ops) extend the loop for GraphNetwork features:
 /// reference bounds refresh, pilot iteration check, extended alpha types, and
-/// debug telemetry. Sequential backends use defaults and are unaffected. (#1948)
+/// debug telemetry. Sequential backends use defaults and are unaffected.
 pub(crate) trait AlphaCrownBackend {
     /// Run one backward pass iteration with current alpha values.
     ///
@@ -275,7 +275,7 @@ pub(crate) trait AlphaCrownBackend {
     ///
     /// Called after the backward pass succeeds. The `gradients` and `gradients_upper`
     /// parameters contain the analytic gradients from the backward pass for lower
-    /// and upper alpha paths respectively (#3393). Returns (lower_grads, upper_grads).
+    /// and upper alpha paths respectively. Returns (lower_grads, upper_grads).
     /// For numerical methods (SPSA, FiniteDiff), the same gradient is used for both
     /// paths since they are perturbed jointly.
     fn compute_gradients(
@@ -294,7 +294,7 @@ pub(crate) trait AlphaCrownBackend {
     /// Label for debug/info log messages (e.g., "α-CROWN", "GraphNetwork α-CROWN").
     fn log_label(&self) -> &str;
 
-    // --- Optional hooks for GraphNetwork features (#1948) ---
+    // --- Optional hooks for GraphNetwork features ---
     // Default implementations are no-ops so existing backends (SequentialAlphaCrownBackend)
     // continue working without changes.
 
@@ -377,7 +377,7 @@ pub(crate) trait AlphaCrownBackend {
 /// This prevents a single `-Inf` lower bound from poisoning the scalar early-stopping
 /// metric: `-Inf + finite = -Inf`, making `(-Inf) - (-Inf) = NaN` and disabling
 /// convergence detection entirely. With this helper, infinite elements are neutral
-/// and early stopping tracks improvement of the finite dimensions only. (#2857)
+/// and early stopping tracks improvement of the finite dimensions only.
 pub(crate) fn finite_lower_sum(arr: &ArrayD<f32>) -> f32 {
     arr.iter().filter(|v| v.is_finite()).copied().sum::<f32>()
 }
@@ -801,8 +801,7 @@ fn alpha_crown_optimize_impl<B: AlphaCrownBackend>(
     let crown_bounds = backend.crown_fallback(input)?;
     let mut best_lower: ArrayD<f32> = crown_bounds.lower().clone();
     let mut best_upper: ArrayD<f32> = crown_bounds.upper().clone();
-    // Use finite-only sum to prevent -Inf poisoning the early-stopping metric (#2857).
-    // Prior layout-agnostic fix: #1939.
+    // Use finite-only sum to prevent -Inf poisoning the early-stopping metric.
     let mut best_lower_sum: f32 = finite_lower_sum(crown_bounds.lower());
     let mut prev_best_lower_sum = best_lower_sum;
     let mut best_invprop_gap: Option<f64> = None;
@@ -821,7 +820,7 @@ fn alpha_crown_optimize_impl<B: AlphaCrownBackend>(
         && native_invprop_seed_treatment_eligible(alpha_state, best_lower.len());
 
     for iter in 0..config.iterations {
-        // Deadline check (#2698): bail early if verification timeout budget
+        // Deadline check: bail early if verification timeout budget
         // is exhausted. Return current best bounds instead of running all iterations.
         if config.past_deadline() {
             info!(
@@ -935,7 +934,7 @@ fn alpha_crown_optimize_impl<B: AlphaCrownBackend>(
             )?;
         }
 
-        // Finite-only sum for early stopping (#2857). Layout-agnostic (#1939).
+        // Finite-only sum for early stopping. Layout-agnostic.
         let lower_sum: f32 = finite_lower_sum(concrete_bounds.lower());
         let gamma_only_invprop = gamma_treatment_admissible && alpha_state.num_unstable() == 0;
         let gamma_probe_limit = if gamma_only_invprop {
@@ -952,7 +951,7 @@ fn alpha_crown_optimize_impl<B: AlphaCrownBackend>(
 
         // NaN detection: if any bound element is NaN, the backward pass produced
         // garbage. Break early to avoid wasting remaining iterations — the
-        // post-loop has_nan check will fall back to CROWN. (#2597)
+        // post-loop has_nan check will fall back to CROWN.
         if concrete_bounds.lower().iter().any(|v| v.is_nan())
             || concrete_bounds.upper().iter().any(|v| v.is_nan())
         {
@@ -1021,7 +1020,7 @@ fn alpha_crown_optimize_impl<B: AlphaCrownBackend>(
             break;
         }
 
-        // Pilot iteration check (#1948): after the first alpha-updated iteration
+        // Pilot iteration check: after the first alpha-updated iteration
         // (iter == 1), verify optimization helped before spending another update.
         // The DAG alpha-CROWN path performs this check before gradient computation
         // and parameter mutation for iteration 1.
@@ -1109,7 +1108,7 @@ fn alpha_crown_optimize_impl<B: AlphaCrownBackend>(
 
         let refresh_candidate = backend.post_bounds_update(iter, improved_output)?;
 
-        // Compute gradients via backend (returns separate lower/upper gradients, #3393)
+        // Compute gradients via backend (returns separate lower/upper gradients)
         let (numerical_gradients, numerical_gradients_upper) = backend.compute_gradients(
             config,
             alpha_state,
@@ -1132,7 +1131,7 @@ fn alpha_crown_optimize_impl<B: AlphaCrownBackend>(
 
         // Update alpha using gradient (gradient ascent to maximize lower bound).
         // For gradient ascent, negate the gradient (we want to maximize lower bound).
-        // Update both lower and upper alpha paths independently (#3393).
+        // Update both lower and upper alpha paths independently.
         let adam_params = config.adam_params(lr, iter + 1);
         for (relu_idx, grad) in numerical_gradients.iter().enumerate() {
             // Guard: reject non-finite gradients before optimizer update.
@@ -1141,7 +1140,7 @@ fn alpha_crown_optimize_impl<B: AlphaCrownBackend>(
             // the optimizer state (m/v for Adam, velocity for SGD), where the
             // downstream NaN sanitization in alpha.rs masks the root cause
             // by resetting alpha to 0.5. Skipping the update preserves the
-            // current alpha (a better heuristic than silent reset). (#2809, #2835)
+            // current alpha (a better heuristic than silent reset).
             if grad.iter().any(|v| !v.is_finite()) {
                 warn!(
                     "{label} iter {}: skipping ReLU {} gradient update — non-finite values detected (#2835)",
@@ -1165,7 +1164,7 @@ fn alpha_crown_optimize_impl<B: AlphaCrownBackend>(
                 }
             }
 
-            // Update upper alpha path (#3393).
+            // Update upper alpha path.
             if let Some(grad_upper) = numerical_gradients_upper.get(relu_idx) {
                 if grad_upper.iter().any(|v| !v.is_finite()) {
                     continue;
@@ -1187,7 +1186,7 @@ fn alpha_crown_optimize_impl<B: AlphaCrownBackend>(
             }
         }
 
-        // Extended alpha updates (#1948): bilinear, MulBinary, S-shaped activations.
+        // Extended alpha updates: bilinear, MulBinary, S-shaped activations.
         // Called after the standard ReLU alpha update so all gradient-based updates
         // happen in sequence before reference bounds refresh.
         backend.update_extended_alphas(config, lr, iter, &mut total_gradient_skips)?;
@@ -1197,7 +1196,7 @@ fn alpha_crown_optimize_impl<B: AlphaCrownBackend>(
             alpha_state.clip_gammas();
         }
 
-        // Reference bounds refresh (#1948): apply the candidate collected before
+        // Reference bounds refresh: apply the candidate collected before
         // gradient computation after alpha updates and ny clipping.
         if let Some(candidate) = refresh_candidate {
             backend.apply_reference_refresh(candidate, iter)?;
@@ -1211,7 +1210,7 @@ fn alpha_crown_optimize_impl<B: AlphaCrownBackend>(
                 "{label} iter {}: lower_sum = {:.6}, lr = {:.6}",
                 iter, lower_sum, lr,
             );
-            // Extended telemetry (#1948)
+            // Extended telemetry
             if tracing::enabled!(tracing::Level::DEBUG) {
                 backend.log_iteration_telemetry(iter);
             }
@@ -1220,7 +1219,7 @@ fn alpha_crown_optimize_impl<B: AlphaCrownBackend>(
         prev_best_lower_sum = best_lower_sum;
         prev_best_invprop_gap = best_invprop_gap;
     }
-    // Gradient skip summary (#2981 Slice 5).
+    // Gradient skip summary.
     if total_gradient_skips > 0 {
         warn!(
             "{label}: skipped {total_gradient_skips}/{} gradient updates (non-finite)",
@@ -1321,7 +1320,7 @@ fn alpha_crown_optimize_impl<B: AlphaCrownBackend>(
     // Infinite bounds are sound overapproximations from inversion widening
     // (clamp_inverted_best_bounds sets inverted elements to [-inf, +inf]).
     // The previous is_finite() check incorrectly discarded ALL optimization
-    // progress when any single element was infinite (#2909, cf. #2854 DAG fix).
+    // progress when any single element was infinite (the DAG path checks NaN the same way).
     let has_nan = best_lower.iter().any(|v| v.is_nan()) || best_upper.iter().any(|v| v.is_nan());
 
     if !has_nan {

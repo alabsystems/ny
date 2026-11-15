@@ -325,7 +325,7 @@ proptest! {
         );
     }
 
-    /// AC 4 (#3876): Inverted input bounds must produce InvalidSpec, not silent
+    /// AC 4: Inverted input bounds must produce InvalidSpec, not silent
     /// corruption. Generate arbitrary inverted boxes (x_l > x_u) and verify both
     /// complete_clip and relaxed_clip reject them.
     #[test]
@@ -372,7 +372,7 @@ proptest! {
         );
     }
 
-    /// Regression audit for #3876: the new ordering guard iterates over every
+    /// Regression audit: the ordering guard iterates over every
     /// active batch/dimension slot, so the property test should cover nontrivial
     /// shapes instead of only the 1x1 fast path.
     #[test]

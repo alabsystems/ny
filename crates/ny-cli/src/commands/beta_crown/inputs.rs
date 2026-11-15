@@ -124,7 +124,7 @@ pub(super) fn create_input_bounds(
         // EXACT-decimal input box alongside the engine's f32 one.
         //
         // `split_input_bounds_f32` above widens every endpoint outward by one
-        // f32 ULP (#2658) — correct for every existing path, and fatal for the
+        // f32 ULP — correct for every existing path, and fatal for the
         // certified double-double zonotope: on vggnet16 it turns all 150527
         // declared-POINT pixels into 2-ULP intervals, which that method can
         // neither carry symbolically (150528 generator columns) nor carry as
@@ -215,7 +215,7 @@ pub(super) fn create_input_bounds(
         })?;
         let input = BoundedTensor::new(lower, upper)?;
 
-        // Classify constraints via shared planning module (#1881)
+        // Classify constraints via shared planning module
         let classification = classify_constraints(&vnnlib);
         let has_relational = classification.has_relational;
 
@@ -264,3 +264,7 @@ pub(super) fn create_input_bounds(
         Ok((input, threshold, None, false, false, None)) // Default: verify lower > threshold, no relational
     }
 }
+
+#[cfg(test)]
+#[path = "lowdim_entry_box_tests.rs"]
+mod lowdim_entry_box_tests;

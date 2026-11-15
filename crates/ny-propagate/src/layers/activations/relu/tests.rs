@@ -306,7 +306,7 @@ fn test_alpha_crown_custom_alpha() -> Result<()> {
     // Gradient ∂(lower_bound)/∂α: for crossing neuron with la=1.0 > 0 and l=-2.0,
     // gradient = la * l = 1.0 * (-2.0) = -2.0. The negative sign is correct:
     // increasing alpha makes the lower bound more negative (worse), so the optimizer
-    // (which negates before Adam update) will decrease alpha. Fix: #3294.
+    // (which negates before Adam update) will decrease alpha.
     assert_close(gradient[0], -2.0, 1e-5, "custom alpha gradient[0]");
     Ok(())
 }
@@ -574,7 +574,7 @@ fn test_relaxation_point_interval_zero() {
     assert_close(ui, 0.0, 1e-6, "point zero upper intercept");
 }
 
-// ===== RELU_RELAX_MIN_WIDTH guard tests (#2382) =====
+// ===== RELU_RELAX_MIN_WIDTH guard tests =====
 
 #[ntest::timeout(5000)]
 #[test]
@@ -908,7 +908,7 @@ fn test_crown_non_identity_bounds() -> Result<()> {
 // ===== SDP-CROWN / alpha-CROWN near-zero-width crossing tests =====
 
 /// Verify SDP-CROWN backward pass stays finite on the smallest subnormal crossing
-/// interval. Re: #2410 — the reported `u - l -> 0` failure mode cannot happen on
+/// interval. The suspected `u - l -> 0` failure mode cannot happen on
 /// this branch because `l < 0 < u` makes the denominator an opposite-signed
 /// subtraction.
 #[ntest::timeout(5000)]
@@ -974,7 +974,7 @@ fn test_sdp_crown_near_zero_width_crossing_safe() -> Result<()> {
     Ok(())
 }
 
-/// Post-#2977: NaN in x_hat propagates to LinearBounds bias. The
+/// NaN in x_hat propagates to LinearBounds bias. The
 /// new_or_conservative firewall catches the NaN and falls back to
 /// conservative bounds (A=0, b=+/-Inf) instead of returning Err.
 #[ntest::timeout(5000)]
@@ -1121,7 +1121,7 @@ fn test_alpha_crown_large_crossing_width_safe() -> Result<()> {
     Ok(())
 }
 
-/// #3086: Verify that Inf coefficient in one row only degrades that row, not all rows.
+/// Verify that Inf coefficient in one row only degrades that row, not all rows.
 ///
 /// Before this fix, a single Inf coefficient caused `new_or_conservative` to replace
 /// the entire LinearBounds with conservative (A=0, b=±Inf). With per-row nonfinite
@@ -1194,7 +1194,7 @@ fn test_alpha_crown_inf_coefficient_per_row_fallback() -> Result<()> {
     Ok(())
 }
 
-// ===== Dual alpha behavioral tests (#3393) =====
+// ===== Dual alpha behavioral tests =====
 
 /// Dual alpha: non-identity bounds (la>0, ua<0) produce different gradients and bounds
 /// for lower vs upper paths. Identity bounds always have ua>=0, hiding dual alpha.
@@ -1550,4 +1550,135 @@ proptest! {
             }
         }
     }
+}
+
+/// ENCLOSURE ORACLE for ReLU alpha-CROWN backward with an ERROR-FREE incoming carrier.
+///
+/// Settles a question two separate audit findings reduce to: when the incoming carrier
+/// has no `coeff_err` plane, ReLU writes its relaxed coefficient through a DIRECTED cast
+/// (`next_down_f32` for lower, `next_up_f32` for upper) and charges no gap.
+/// `bounds/concretize.rs:1599-1620` applies a coefficient penalty ONLY from an explicit
+/// error plane, so with no plane the directed write is the sole protection.
+///
+/// Directing is unambiguously sound when the coefficient multiplies a NON-NEGATIVE
+/// quantity. After ReLU backward it multiplies the PRE-ACTIVATION x_j, and a crossing
+/// neuron has l_j < 0 by definition. The concern:
+///   exact:  obj >= SUM_j (a_j*alpha_j) x_j + b     (valid for all x in the box)
+///   stored: c_j = next_down_f32(a_j*alpha_j) <= a_j*alpha_j, with c_j >= 0
+///   for x_j < 0 a SMALLER c_j makes c_j*x_j LARGER, so the published lower bound can
+///   rise ABOVE the exact one.
+///
+/// This asserts the property directly rather than arguing about it: for randomized
+/// crossing-neuron configurations, the published affine lower bound must not exceed the
+/// TRUE objective at any sampled point of the box, and the upper must not fall below it.
+/// Modelled on `margin_row::tests::oracle_forward_tableau_cross_layer_rounding`, which
+/// caught an incorrect "fix" in this same campaign.
+///
+/// If this fails, the finding is confirmed and the fix is to compute the gap
+/// unconditionally and DISCHARGE it into the bias (never carry it -- coefficient-wise
+/// carrying measured ~18x throughput loss on metaroom spec_114). If it passes over a wide
+/// sample, the directed write is doing its job and both findings are refuted.
+#[ntest::timeout(60000)]
+#[test]
+fn oracle_relu_alpha_backward_encloses_exact_objective_without_incoming_err() -> Result<()> {
+    // Deterministic LCG: reproducible, no dev-dependency.
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = || -> f64 {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 11) as f64) / ((1u64 << 53) as f64)
+    };
+
+    let layer = ReLULayer::new();
+    let n = 8usize;
+    let mut violations = 0usize;
+    let mut worst = 0.0f64;
+    let mut worst_desc = String::new();
+
+    for trial in 0..400 {
+        // Crossing neurons: l_j < 0 < u_j, so the directed coefficient multiplies a
+        // signed x_j -- exactly the regime in question.
+        let lo: Vec<f32> = (0..n).map(|_| -(next() as f32) * 4.0 - 0.25).collect();
+        let up: Vec<f32> = (0..n).map(|_| (next() as f32) * 4.0 + 0.25).collect();
+        let pre = BoundedTensor::new(
+            ArrayD::from_shape_vec(IxDyn(&[n]), lo.clone()).unwrap(),
+            ArrayD::from_shape_vec(IxDyn(&[n]), up.clone()).unwrap(),
+        )?;
+
+        // One objective row with POSITIVE coefficients, so the lower envelope (slope
+        // alpha) is selected and the product a_j*alpha_j is the value being rounded.
+        // Values chosen to make that product inexact in binary32.
+        let a: Vec<f32> = (0..n).map(|_| (next() as f32) * 0.9 + 0.1).collect();
+        let b_in = (next() as f32) * 2.0 - 1.0;
+        let mut lower_a = Array2::<f32>::zeros((1, n));
+        let mut upper_a = Array2::<f32>::zeros((1, n));
+        for j in 0..n {
+            lower_a[[0, j]] = a[j];
+            upper_a[[0, j]] = a[j];
+        }
+        let bounds = LinearBounds::new(
+            lower_a,
+            Array1::from_elem(1, b_in),
+            upper_a,
+            Array1::from_elem(1, b_in),
+        )?;
+        assert!(
+            !bounds.has_coeff_err(),
+            "fixture must exercise the ERROR-FREE path"
+        );
+
+        let alpha: Array1<f32> = (0..n).map(|_| (next() as f32) * 0.98 + 0.01).collect();
+        let (out, _, _) = layer.propagate_linear_with_alpha(&bounds, &pre, &alpha, None)?;
+
+        // Sample the box, including the corners most likely to expose the concern.
+        for s in 0..24 {
+            let x: Vec<f32> = (0..n)
+                .map(|j| match s {
+                    0 => lo[j],
+                    1 => up[j],
+                    _ => lo[j] + ((up[j] - lo[j]) * next() as f32),
+                })
+                .collect();
+
+            // TRUE objective through the real ReLU, in f64 (all operands are f32, so
+            // every product is exact and the f64 sum error is ~2^-53 -- far below the
+            // ~2^-24 coefficient effect under test).
+            let mut exact = b_in as f64;
+            for j in 0..n {
+                exact += a[j] as f64 * (x[j].max(0.0)) as f64;
+            }
+
+            let mut pub_lo = out.lower_b()[0] as f64;
+            let mut pub_up = out.upper_b()[0] as f64;
+            for j in 0..n {
+                pub_lo += out.lower_a()[[0, j]] as f64 * x[j] as f64;
+                pub_up += out.upper_a()[[0, j]] as f64 * x[j] as f64;
+            }
+
+            if pub_lo > exact {
+                violations += 1;
+                if pub_lo - exact > worst {
+                    worst = pub_lo - exact;
+                    worst_desc = format!("trial={trial} sample={s} lower overshoot");
+                }
+            }
+            if pub_up < exact {
+                violations += 1;
+                if exact - pub_up > worst {
+                    worst = exact - pub_up;
+                    worst_desc = format!("trial={trial} sample={s} upper undershoot");
+                }
+            }
+        }
+    }
+
+    assert_eq!(
+        violations, 0,
+        "RELU-ALPHA ENCLOSURE ORACLE: {violations} sampled points fall outside the \
+         published affine bounds (worst {worst:.3e} @ {worst_desc}) with an ERROR-FREE \
+         incoming carrier -> the directed coefficient write does not by itself cover the \
+         relaxation's rounding for a signed pre-activation"
+    );
+    Ok(())
 }

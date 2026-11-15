@@ -8,8 +8,6 @@
 //! path (`decomposed_instance_norm_crown_backward`) via a scalar-to-batched
 //! bridge. In `Sampling` mode, delegates to the shared sampling-based CROWN
 //! linearization in [`super::super::crown_common`] via the `NormLayer` trait.
-//!
-//! Reference: designs/2026-03-14-instance-norm-decomposed-crown-backward.md
 
 use ndarray::{Ix1, Ix2};
 use ny_core::{NyError, Result};
@@ -31,7 +29,7 @@ impl InstanceNorm1dLayer {
     /// C blocks of size T×T, one per channel.
     ///
     /// Behavior depends on `crown_mode`:
-    /// - `IbpValidated` (default): Decomposed per-channel CROWN (sound). Part of #3830.
+    /// - `IbpValidated` (default): Decomposed per-channel CROWN (sound).
     /// - `Sound`: Returns error
     /// - `Cut`: Returns identity relaxation
     /// - `Sampling`: Heuristic sampling-based linearization
@@ -65,7 +63,7 @@ impl InstanceNorm1dLayer {
         }
 
         // IbpValidated: use decomposed per-channel CROWN via scalar-to-batched bridge.
-        // This reuses the LayerNorm decomposed infrastructure per channel. Part of #3830.
+        // This reuses the LayerNorm decomposed infrastructure per channel.
         if self.crown_mode == LayerNormCrownMode::IbpValidated {
             let time_len = total_neurons / num_channels;
             // Reshape to [C, T] — decomposed_instance_norm_crown_backward requires ≥2D input
@@ -92,7 +90,7 @@ impl InstanceNorm1dLayer {
             return batched_bounds_to_scalar(&decomposed.bounds);
         }
 
-        // Sampling mode: delegate to shared sampling CROWN (no IBP validation, #3775).
+        // Sampling mode: delegate to shared sampling CROWN (no IBP validation).
         sampling_crown_scalar(self, bounds, &pre_lower, &pre_upper)
     }
 }
@@ -100,7 +98,7 @@ impl InstanceNorm1dLayer {
 /// Convert scalar `LinearBounds` (2D) to `BatchedLinearBounds` (dynamic).
 ///
 /// Local bridge helper, same pattern as `layer_norm/crown_scalar.rs`.
-/// If #3821 extracts these to `decomposed/common.rs`, import from there.
+/// An identical shared copy now lives in `decomposed/common.rs`; prefer importing it.
 fn scalar_bounds_to_batched(bounds: &LinearBounds) -> Result<BatchedLinearBounds> {
     BatchedLinearBounds::new(
         bounds.lower_a().clone().into_dyn(),

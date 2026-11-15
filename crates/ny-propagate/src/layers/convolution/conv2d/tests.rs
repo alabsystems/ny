@@ -866,9 +866,9 @@ fn test_convtranspose2d_crown_2x2_kernel_soundness() -> Result<()> {
     Ok(())
 }
 
-// --- Regression tests for #2828: stride=0 and invalid spatial configs ---
+// --- Regression tests: stride=0 and invalid spatial configs ---
 
-/// Regression test for #2828: Conv2d stride=0 must be rejected by constructor.
+/// Regression test: Conv2d stride=0 must be rejected by constructor.
 #[ntest::timeout(10000)]
 #[test]
 fn conv2d_zero_stride_h_rejected() {
@@ -881,7 +881,7 @@ fn conv2d_zero_stride_h_rejected() {
     );
 }
 
-/// Regression test for #2828: Conv2d stride=0 in width must be rejected.
+/// Regression test: Conv2d stride=0 in width must be rejected.
 #[ntest::timeout(10000)]
 #[test]
 fn conv2d_zero_stride_w_rejected() {
@@ -894,7 +894,7 @@ fn conv2d_zero_stride_w_rejected() {
     );
 }
 
-/// Regression test for #2828: ConvTranspose2d stride=0 must be rejected.
+/// Regression test: ConvTranspose2d stride=0 must be rejected.
 #[ntest::timeout(10000)]
 #[test]
 fn conv_transpose2d_zero_stride_rejected() {
@@ -907,7 +907,7 @@ fn conv_transpose2d_zero_stride_rejected() {
     );
 }
 
-/// Regression test for #2828: Conv2d output_size underflow (kernel > padded input).
+/// Regression test: Conv2d output_size underflow (kernel > padded input).
 #[ntest::timeout(10000)]
 #[test]
 fn conv2d_output_size_underflow_returns_error() -> Result<()> {
@@ -924,7 +924,7 @@ fn conv2d_output_size_underflow_returns_error() -> Result<()> {
     Ok(())
 }
 
-/// Regression test for #2828: Conv2d valid stride=(1,1) is accepted.
+/// Regression test: Conv2d valid stride=(1,1) is accepted.
 #[ntest::timeout(10000)]
 #[test]
 fn conv2d_stride_one_accepted() {
@@ -1141,12 +1141,12 @@ fn conv2d_raw_ops_reject_invalid_geometry_without_panicking() {
     );
 }
 
-/// Regression test for #2877: IBP forward with kernel > padded input returns error, not panic.
+/// Regression test: IBP forward with kernel > padded input returns error, not panic.
 #[ntest::timeout(10000)]
 #[test]
 fn conv2d_ibp_kernel_oversized_returns_error() -> Result<()> {
     // kernel=(5,5), input=(2,2), padding=(0,0) → padded=(2,2) < (5,5) → conv2d_single underflow.
-    // Before #2877 fix, this caused usize underflow panic in conv2d_single.
+    // Before the fix, this caused usize underflow panic in conv2d_single.
     let kernel = ArrayD::from_shape_vec(IxDyn(&[1, 1, 5, 5]), vec![1.0; 25]).expect("kernel");
     let conv = Conv2dLayer::with_input_shape(kernel, None, (1, 1), (0, 0), 2, 2)?;
     let input = BoundedTensor::new(
@@ -1162,7 +1162,7 @@ fn conv2d_ibp_kernel_oversized_returns_error() -> Result<()> {
     Ok(())
 }
 
-/// Regression test for #2747: Conv2d CROWN backward with NaN kernel returns
+/// Regression test: Conv2d CROWN backward with NaN kernel returns
 /// NumericalInstability error instead of silently producing NaN coefficients.
 #[ntest::timeout(10000)]
 #[test]
@@ -1177,7 +1177,7 @@ fn conv2d_crown_backward_nan_kernel_returns_error() {
     );
 }
 
-/// Regression test for #2747: Conv2d CROWN backward with NaN bias returns
+/// Regression test: Conv2d CROWN backward with NaN bias returns
 /// NumericalInstability error.
 #[ntest::timeout(10000)]
 #[test]
@@ -1196,7 +1196,7 @@ fn conv2d_crown_backward_nan_bias_returns_error() {
     );
 }
 
-/// Regression test for #2747: ConvTranspose2d CROWN backward with NaN kernel
+/// Regression test: ConvTranspose2d CROWN backward with NaN kernel
 /// returns NumericalInstability error.
 #[ntest::timeout(10000)]
 #[test]
@@ -1211,10 +1211,10 @@ fn convtranspose2d_crown_backward_nan_kernel_returns_error() {
     );
 }
 
-/// Regression test for #3030: Conv2d IBP with overflow-producing inputs returns Ok
+/// Regression test: Conv2d IBP with overflow-producing inputs returns Ok
 /// with the overflowed ±Inf endpoints preserved, not NumericalInstability error.
 ///
-/// Before #3030, conv2d lacked NaN repair and would hard-fail via
+/// Previously conv2d lacked NaN repair and would hard-fail via
 /// `BoundedTensor::new()` rejecting Inf output. Now it matches linear layer behavior.
 #[ntest::timeout(10000)]
 #[test]
@@ -1249,7 +1249,7 @@ fn test_conv2d_ibp_overflow_preserved_as_inf() {
     }
 }
 
-/// Assert row has non-finite fallback: zeroed A, ±Inf bias (#2812).
+/// Assert row has non-finite fallback: zeroed A, ±Inf bias.
 fn assert_nonfinite_row_fallback(lb: &LinearBounds, row: usize) {
     for j in 0..lb.lower_a().ncols() {
         assert_eq!(lb.lower_a()[[row, j]], 0.0, "row {row} lower_a[{j}]");
@@ -1283,7 +1283,7 @@ fn make_overflow_bounds(num_cols: usize) -> LinearBounds {
     LinearBounds::new(la, Array1::zeros(2), ua, Array1::zeros(2)).expect("valid bounds")
 }
 
-/// Regression (#2812, #3228): Conv2d CROWN backward per-row coefficient magnitude fallback.
+/// Regression: Conv2d CROWN backward per-row coefficient magnitude fallback.
 /// Weight 1e5 * row 0 coeff 1e19 → 1e24 exceeds CROWN_COEFF_MAX, triggers fallback.
 /// Weight 1e5 * row 1 coeff 1.0 → 1e5 stays below CROWN_COEFF_MAX, remains safe.
 #[ntest::timeout(10000)]
@@ -1402,7 +1402,7 @@ fn test_convtranspose2d_batched_crown_engine_matches_cpu_3622() -> Result<()> {
     })
 }
 
-/// Regression (#2812, #3228): ConvTranspose2d CROWN backward per-row coefficient magnitude fallback.
+/// Regression: ConvTranspose2d CROWN backward per-row coefficient magnitude fallback.
 /// Weight 1e5 * row 0 coeff 1e19 → 1e24 exceeds CROWN_COEFF_MAX, triggers fallback.
 /// Weight 1e5 * row 1 coeff 1.0 → 1e5 stays below CROWN_COEFF_MAX, remains safe.
 #[ntest::timeout(10000)]
@@ -1470,13 +1470,12 @@ fn wall_deadwork_convtranspose_batched_authoritative_f64_keeps_row_firewall() ->
     })
 }
 
-// ===== GEMM-based conv2d_transpose tests (#3382) =====
+// ===== GEMM-based conv2d_transpose tests =====
 
 /// Verify conv2d_transpose_batched_gemm matches per-row conv2d_transpose for a 3x3 kernel.
 ///
 /// This tests the mathematical equivalence of the GEMM+col2im path (single faer matmul)
 /// against the reference scalar conv2d_transpose (6-deep nested loop) called per-row.
-/// Design doc: designs/2026-03-06-conv-crown-backward-gemm.md (#3382).
 #[ntest::timeout(10000)]
 #[test]
 fn test_conv2d_transpose_batched_gemm_matches_scalar_3x3_kernel() -> Result<()> {
@@ -1626,7 +1625,7 @@ fn test_conv2d_crown_backward_multichannel_3x3_matches_ibp() -> Result<()> {
     Ok(())
 }
 
-// ===== Grouped convolution tests (#3770) =====
+// ===== Grouped convolution tests =====
 
 /// Helper to verify CROWN bounds match IBP for a Conv2dLayer.
 /// For a linear layer, CROWN with identity A concretized on [lower, upper]
@@ -1687,7 +1686,7 @@ fn assert_crown_matches_ibp(
     Ok(())
 }
 
-/// #3770: IBP forward with groups=2, 1x1 kernel.
+/// IBP forward with groups=2, 1x1 kernel.
 ///
 /// Kernel shape: (4 out_c, 3 in_c_per_group, 1, 1), groups=2.
 /// Total in_c = 3*2 = 6. Group 0 maps in_c[0..3] → out_c[0..2],
@@ -1733,7 +1732,7 @@ fn test_conv2d_ibp_grouped_two_groups_1x1() -> Result<()> {
     Ok(())
 }
 
-/// #3770: IBP forward verifies group isolation — no cross-group leakage.
+/// IBP forward verifies group isolation — no cross-group leakage.
 ///
 /// Group 0 has weight 1.0, group 1 has weight -1.0.
 /// If groups are incorrect, cross-group contamination would produce wrong bounds.
@@ -1776,7 +1775,7 @@ fn test_conv2d_ibp_grouped_isolation() -> Result<()> {
     Ok(())
 }
 
-/// #3770: CROWN backward soundness for groups=2 with 3x3 kernel.
+/// CROWN backward soundness for groups=2 with 3x3 kernel.
 ///
 /// Verifies CROWN bounds concretized on [lower, upper] match IBP.
 /// This exercises the grouped GEMM path in conv2d_transpose_batched_gemm_grouped.
@@ -1806,7 +1805,7 @@ fn test_conv2d_crown_grouped_two_groups_soundness() -> Result<()> {
     assert_crown_matches_ibp(&layer, &lower_vals, &upper_vals, in_c, in_h, in_w, 1e-3)
 }
 
-/// #3770: CROWN backward correctness for groups=2, verifying A-coefficients.
+/// CROWN backward correctness for groups=2, verifying A-coefficients.
 ///
 /// With groups=2 and 1x1 kernel, the CROWN backward should produce a block-diagonal
 /// A matrix: group 0 channels only depend on group 0 input channels, and vice versa.
@@ -1852,7 +1851,7 @@ fn test_conv2d_crown_grouped_block_diagonal() -> Result<()> {
     Ok(())
 }
 
-/// #3770: Depthwise convolution (groups=in_channels) IBP forward.
+/// Depthwise convolution (groups=in_channels) IBP forward.
 ///
 /// Depthwise separable convolution: each input channel has its own kernel.
 /// Kernel shape: (4, 1, 3, 3) with groups=4 means each channel is independent.
@@ -1906,7 +1905,7 @@ fn test_conv2d_ibp_depthwise() -> Result<()> {
     Ok(())
 }
 
-/// #3770: Depthwise convolution (groups=in_channels) CROWN backward soundness.
+/// Depthwise convolution (groups=in_channels) CROWN backward soundness.
 ///
 /// Verifies CROWN bounds match IBP for depthwise separable convolution.
 #[ntest::timeout(10000)]
@@ -1935,7 +1934,7 @@ fn test_conv2d_crown_depthwise_soundness() -> Result<()> {
     assert_crown_matches_ibp(&layer, &lower_vals, &upper_vals, in_c, in_h, in_w, 1e-3)
 }
 
-/// #3770: Batched CROWN backward with groups=2 matches CPU path.
+/// Batched CROWN backward with groups=2 matches CPU path.
 ///
 /// Tests the `propagate_linear_batched` GEMM path with grouped convolution.
 #[ntest::timeout(10000)]
@@ -1976,7 +1975,7 @@ fn test_conv2d_batched_crown_grouped_engine_matches_cpu() -> Result<()> {
     Ok(())
 }
 
-/// #3770: GEMM grouped transpose matches scalar grouped transpose.
+/// GEMM grouped transpose matches scalar grouped transpose.
 ///
 /// Verifies conv2d_transpose_batched_gemm_grouped produces the same results
 /// as per-row conv2d_transpose_grouped for groups=2.
@@ -2072,7 +2071,7 @@ fn test_conv2d_transpose_batched_gemm_grouped_matches_scalar() -> Result<()> {
 /// produces the same result as the non-deadline path without engine.
 ///
 /// This triggers the `use_chunked_deadline` branch with total_spatial > 256,
-/// exercising the fused GPU code path added in Part of #3813. The CPU engine
+/// exercising the fused GPU code path. The CPU engine
 /// serves as a fused-path reference since its conv_transpose_2d does GEMM + col2im.
 #[ntest::timeout(10000)]
 #[test]
@@ -2159,7 +2158,7 @@ fn test_conv2d_transpose_deadline_fused_matches_nonfused() -> Result<()> {
     Ok(())
 }
 
-/// #3770: Constructor rejects groups=0.
+/// Constructor rejects groups=0.
 #[ntest::timeout(10000)]
 #[test]
 fn test_conv2d_new_full_rejects_groups_zero() {
@@ -2172,7 +2171,7 @@ fn test_conv2d_new_full_rejects_groups_zero() {
     );
 }
 
-/// #3770: Constructor rejects out_channels not divisible by groups.
+/// Constructor rejects out_channels not divisible by groups.
 #[ntest::timeout(10000)]
 #[test]
 fn test_conv2d_new_full_rejects_out_c_not_divisible_by_groups() {
@@ -2186,7 +2185,7 @@ fn test_conv2d_new_full_rejects_out_c_not_divisible_by_groups() {
     );
 }
 
-// ── #4238: IBP GEMM parity tests ──────────────────────────────────────────────
+// ── IBP GEMM parity tests ────────────────────────────────────────────────────
 //
 // Verify propagate_ibp_with_engine (GEMM path via ops_ibp_gemm.rs) produces
 // identical bounds to propagate_ibp (CPU path) across varying kernel sizes,
@@ -2219,7 +2218,7 @@ fn assert_ibp_gemm_parity(layer: &Conv2dLayer, input: &BoundedTensor, label: &st
     }
 }
 
-/// #4238: 1x1 kernel, 3D input (no batch), with bias.
+/// 1x1 kernel, 3D input (no batch), with bias.
 #[ntest::timeout(10000)]
 #[test]
 fn test_conv2d_ibp_gemm_parity_1x1_3d_with_bias() {
@@ -2235,7 +2234,7 @@ fn test_conv2d_ibp_gemm_parity_1x1_3d_with_bias() {
     assert_ibp_gemm_parity(&layer, &input, "1x1_3d_bias");
 }
 
-/// #4238: 1x1 kernel, 4D input (with batch), with bias.
+/// 1x1 kernel, 4D input (with batch), with bias.
 #[ntest::timeout(10000)]
 #[test]
 fn test_conv2d_ibp_gemm_parity_1x1_4d_with_bias() {
@@ -2251,7 +2250,7 @@ fn test_conv2d_ibp_gemm_parity_1x1_4d_with_bias() {
     assert_ibp_gemm_parity(&layer, &input, "1x1_4d_bias");
 }
 
-/// #4238: 2x2 kernel, mixed positive/negative weights, no bias.
+/// 2x2 kernel, mixed positive/negative weights, no bias.
 #[ntest::timeout(10000)]
 #[test]
 fn test_conv2d_ibp_gemm_parity_2x2_no_bias() {
@@ -2280,7 +2279,7 @@ fn test_conv2d_ibp_gemm_parity_2x2_no_bias() {
     assert_ibp_gemm_parity(&layer, &input, "2x2_no_bias");
 }
 
-/// #4238: 3x3 kernel with stride=2 and padding=1, 4D input, with bias.
+/// 3x3 kernel with stride=2 and padding=1, 4D input, with bias.
 #[ntest::timeout(10000)]
 #[test]
 fn test_conv2d_ibp_gemm_parity_3x3_stride2_pad1_4d() {
@@ -2299,7 +2298,7 @@ fn test_conv2d_ibp_gemm_parity_3x3_stride2_pad1_4d() {
     assert_ibp_gemm_parity(&layer, &input, "3x3_stride2_pad1_4d");
 }
 
-/// #4238: Multi-channel input (3 channels), 2x2 kernel, with bias.
+/// Multi-channel input (3 channels), 2x2 kernel, with bias.
 #[ntest::timeout(10000)]
 #[test]
 fn test_conv2d_ibp_gemm_parity_multichannel_2x2() {
@@ -2318,7 +2317,7 @@ fn test_conv2d_ibp_gemm_parity_multichannel_2x2() {
     assert_ibp_gemm_parity(&layer, &input, "multichannel_2x2");
 }
 
-/// #4238: groups>1 falls back to CPU (no crash, same result).
+/// `groups>1` falls back to CPU (no crash, same result).
 #[ntest::timeout(10000)]
 #[test]
 fn test_conv2d_ibp_gemm_grouped_falls_back_to_cpu() {
@@ -5253,21 +5252,20 @@ fn conv2d_blocked_certified_f64_shape_refusals_match_scalar() -> Result<()> {
         deadline,
     )
     .expect_err("channel mismatch must be refused");
-    let blocked =
-        ops_ibp_blocked::conv2d_ibp_forward_grouped_certified_f64_blocked_with_deadline(
-            lower.view(),
-            upper.view(),
-            &layer.kernel,
-            None,
-            layer.stride,
-            layer.padding,
-            layer.dilation,
-            layer.groups,
-            deadline,
-            ops_ibp_blocked::CONV_IBP_BLOCK_MACS,
-            true,
-        )
-        .expect_err("channel mismatch must be refused on the blocked route too");
+    let blocked = ops_ibp_blocked::conv2d_ibp_forward_grouped_certified_f64_blocked_with_deadline(
+        lower.view(),
+        upper.view(),
+        &layer.kernel,
+        None,
+        layer.stride,
+        layer.padding,
+        layer.dilation,
+        layer.groups,
+        deadline,
+        ops_ibp_blocked::CONV_IBP_BLOCK_MACS,
+        true,
+    )
+    .expect_err("channel mismatch must be refused on the blocked route too");
     assert_eq!(blocked.to_string(), scalar.to_string());
     Ok(())
 }

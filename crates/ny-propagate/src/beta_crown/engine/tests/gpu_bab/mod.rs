@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Unit tests for GPU BaB verify_graph_gpu_domain_list.
-//! Part of #1518: Add test coverage for GPU BaB execution path.
 //!
 //! Split into submodules by test category:
 //! - smoke: Immediate verification/violation, result structure tests
@@ -76,7 +75,7 @@ pub(super) fn gelu_graph_network() -> GraphNetwork {
 /// Create a CNN-like GraphNetwork: Conv2d -> ReLU -> Flatten -> Linear.
 ///
 /// This exercises the Conv2d and Flatten backward propagation paths in the
-/// lA-capture variant, which were identity pass-through before #1811.
+/// lA-capture variant, which were previously identity pass-through.
 pub(super) fn conv_graph_network() -> GraphNetwork {
     use crate::layers::FlattenLayer;
 

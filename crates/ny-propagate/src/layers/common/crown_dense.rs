@@ -7,11 +7,13 @@
 //! Operates on `Array2` A-matrices (output_neurons × input_neurons).
 
 use ndarray::Array2;
+use ny_core::dd::next_up_f64;
 use ny_core::{NyError, Result};
 use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
 
 use super::compose;
 use crate::layers::activations::LinearRelaxation;
+use crate::layers::linear::bias::{add_f64_down, add_f64_up, f32_to_f64_exact};
 use crate::LinearBounds;
 
 /// Helper function for CROWN backward propagation through element-wise activation functions.
@@ -85,11 +87,44 @@ where
         compose::precompute_relaxations(pre_lower_slice, pre_upper_slice, &relaxation_fn);
 
     // Backward propagation: compose the linear relaxation.
-    // Bias accumulation uses f64 to prevent catastrophic cancellation (#1745).
+    //
+    // CERTIFIED CONSTANT (#vnncomp-aw-constant). Widening the bias accumulator
+    // to binary64 does NOT certify the sum, and the comment that used
+    // to stand here said only that it did. Higham Thm 3.1 bounds the binary64
+    // error of a length-`d` sum by `gamma^f64_d * SUM|summand|` — scaled by the
+    // MAGNITUDE of the terms — while the outward binary32 cast at publication
+    // allows only `~2^-24 * |result|`. Under cancellation the result collapses
+    // toward zero and that allowance collapses with it; the true error does
+    // not. Worked shape, at `num_neurons = 4098`: `+2^60`, 4096 x `-1`, `-2^60`
+    // sum to EXACTLY 0.0 in binary64 (ulp(2^60) = 256 swallows every `-1`)
+    // where the truth is `-4096`, and the ULP of 0.0 is 1.4e-45. Published as a
+    // lower bias that claims a bound 4096 ABOVE the truth — a false proof, on
+    // the path every non-ReLU activation reaches a verdict through.
+    //
+    // The fix is idiom (b) of this crate's three constant-certificate idioms
+    // (`layers/linear/bias.rs`, also used by `pooling/max{,_patches}.rs`,
+    // `normalization/batch_norm/*` and this module's patches sibling): every
+    // bias accumulation below takes a DIRECTED binary64 step after each
+    // addition — `add_f64_down` on the lower accumulators, `add_f64_up` on the
+    // upper and on the non-negative error accumulators — so each accumulator is
+    // a certified bound on the exact real partial sum at every step, not merely
+    // at the end.
+    //
+    // Why (b) rather than (a)'s magnitude-sum + gamma charge: each
+    // `intercept_contrib` is an f32 x f32 product formed in f64, hence EXACT
+    // (24 + 24 <= 53 significand bits), so the accumulation is the ONLY error
+    // source and there is nothing else for a magnitude sum to cover. (b) is
+    // strictly stronger — it bounds the error actually realized rather than its
+    // worst case — and costs no second accumulator and no second pass.
+    //
+    // Seeds are decoded with `f32_to_f64_exact` rather than `as f64`: a plain
+    // hardware conversion may observe a binary32-subnormal seed as signed zero
+    // on a DAZ host, which for a lower bias reads `-1.4e-45` as `0.0` and moves
+    // the bound INWARD.
     let mut new_lower_a = Array2::<f32>::zeros((num_outputs, num_neurons));
-    let mut new_lower_b_f64 = bounds.lower_b().mapv(|x| x as f64);
+    let mut new_lower_b_f64 = bounds.lower_b().mapv(f32_to_f64_exact);
     let mut new_upper_a = Array2::<f32>::zeros((num_outputs, num_neurons));
-    let mut new_upper_b_f64 = bounds.upper_b().mapv(|x| x as f64);
+    let mut new_upper_b_f64 = bounds.upper_b().mapv(f32_to_f64_exact);
 
     // Certified coefficient-error propagation through the relaxation
     // (#vnncomp-aw-soundness). For input coefficient `a` with certified error
@@ -116,11 +151,16 @@ where
     let in_upper_err = bounds.upper_a_err();
     let mut new_lower_a_err = Array2::<f32>::zeros((num_outputs, num_neurons));
     let mut new_upper_a_err = Array2::<f32>::zeros((num_outputs, num_neurons));
-    // Per-row certified intercept (bias) error, subtracted from lower / added to upper.
+    // Per-row certified intercept (bias) error, subtracted from lower / added
+    // to upper. These are non-negative charge accumulators, so BOTH are summed
+    // with `add_f64_up` (#vnncomp-aw-constant): a round-to-nearest `+=` here
+    // UNDER-counts the charge — the same Higham/ULP mismatch as the bias sums,
+    // in the direction that shrinks a widening — and an under-counted widening
+    // is a false proof exactly like an over-tight bias.
     let mut lower_b_err = vec![0.0f64; num_outputs];
     let mut upper_b_err = vec![0.0f64; num_outputs];
 
-    // Track which output rows have non-finite coefficients after coeff × slope (#3009).
+    // Track which output rows have non-finite coefficients after coeff × slope.
     let mut lower_nonfinite_rows = vec![false; num_outputs];
     let mut upper_nonfinite_rows = vec![false; num_outputs];
 
@@ -182,17 +222,22 @@ where
 
                     let lr = compose::compose_lower(la, relax);
                     nla[i] = lr.new_coeff;
-                    st.lb += lr.intercept_contrib;
+                    // Certified accumulation, byte-for-byte the serial arm's
+                    // (#vnncomp-aw-constant). A rayon arm that charges
+                    // differently from its serial twin is the same asymmetry
+                    // one level down.
+                    st.lb = add_f64_down(st.lb, lr.intercept_contrib);
                     st.lnf |= lr.nonfinite;
 
                     let ur = compose::compose_upper(ua, relax);
                     nua[i] = ur.new_coeff;
-                    st.ub += ur.intercept_contrib;
+                    st.ub = add_f64_up(st.ub, ur.intercept_contrib);
                     st.unf |= ur.nonfinite;
 
-                    let slope_sum = (relax.lower_slope.abs() + relax.upper_slope.abs()) as f64;
-                    let int_sum =
-                        (relax.lower_intercept.abs() + relax.upper_intercept.abs()) as f64;
+                    // Outward two-line covers (see `cover_sum_up`); the serial
+                    // arm computes the identical values.
+                    let slope_sum = cover_sum_up(relax.lower_slope, relax.upper_slope);
+                    let int_sum = cover_sum_up(relax.lower_intercept, relax.upper_intercept);
 
                     // Lower direction (same certification as the serial loop).
                     {
@@ -216,7 +261,7 @@ where
                             };
                             nle[i] = next_up_f32((ea * slope_cover + gap) as f32);
                             if ea != 0.0 {
-                                st.lbe += ea * int_cover;
+                                st.lbe = add_f64_up(st.lbe, ea * int_cover);
                             }
                         }
                     }
@@ -243,14 +288,17 @@ where
                             };
                             nue[i] = next_up_f32((ea * slope_cover + gap) as f32);
                             if ea != 0.0 {
-                                st.ube += ea * int_cover;
+                                st.ube = add_f64_up(st.ube, ea * int_cover);
                             }
                         }
                     }
                 }
-                // Same end-of-row fold as the serial loop.
-                st.lb -= st.lbe;
-                st.ub += st.ube;
+                // Same end-of-row fold as the serial loop, and equally
+                // directed: the discharge is itself a binary64 addition, and it
+                // is the one most likely to cancel — `-st.lbe` is subtracted
+                // from a bias of arbitrary sign and magnitude.
+                st.lb = add_f64_down(st.lb, -st.lbe);
+                st.ub = add_f64_up(st.ub, st.ube);
             });
         for (j, st) in row_states.iter().enumerate() {
             new_lower_b_f64[j] = st.lb;
@@ -266,12 +314,14 @@ where
 
                 let lr = compose::compose_lower(la, &relaxations[i]);
                 new_lower_a[[j, i]] = lr.new_coeff;
-                new_lower_b_f64[j] += lr.intercept_contrib;
+                // Certified accumulation (#vnncomp-aw-constant); see the
+                // rationale above the accumulator declarations.
+                new_lower_b_f64[j] = add_f64_down(new_lower_b_f64[j], lr.intercept_contrib);
                 lower_nonfinite_rows[j] |= lr.nonfinite;
 
                 let ur = compose::compose_upper(ua, &relaxations[i]);
                 new_upper_a[[j, i]] = ur.new_coeff;
-                new_upper_b_f64[j] += ur.intercept_contrib;
+                new_upper_b_f64[j] = add_f64_up(new_upper_b_f64[j], ur.intercept_contrib);
                 upper_nonfinite_rows[j] |= ur.nonfinite;
 
                 // ALWAYS certify the per-coefficient error (#vnncomp-aw-activation).
@@ -301,8 +351,9 @@ where
                 //        exact-zero coefficients — an unsound hole in the
                 //        false-proof direction).
                 let relax = &relaxations[i];
-                let slope_sum = (relax.lower_slope.abs() + relax.upper_slope.abs()) as f64;
-                let int_sum = (relax.lower_intercept.abs() + relax.upper_intercept.abs()) as f64;
+                // Outward two-line covers (see `cover_sum_up`).
+                let slope_sum = cover_sum_up(relax.lower_slope, relax.upper_slope);
+                let int_sum = cover_sum_up(relax.lower_intercept, relax.upper_intercept);
 
                 // Lower direction.
                 {
@@ -327,7 +378,7 @@ where
                         };
                         new_lower_a_err[[j, i]] = next_up_f32((ea * slope_cover + gap) as f32);
                         if ea != 0.0 {
-                            lower_b_err[j] += ea * int_cover;
+                            lower_b_err[j] = add_f64_up(lower_b_err[j], ea * int_cover);
                         }
                     }
                 }
@@ -355,19 +406,21 @@ where
                         };
                         new_upper_a_err[[j, i]] = next_up_f32((ea * slope_cover + gap) as f32);
                         if ea != 0.0 {
-                            upper_b_err[j] += ea * int_cover;
+                            upper_b_err[j] = add_f64_up(upper_b_err[j], ea * int_cover);
                         }
                     }
                 }
             }
-            // Fold the certified intercept error into the bias accumulators BEFORE
-            // the directed cast: lower decreases, upper increases.
-            new_lower_b_f64[j] -= lower_b_err[j];
-            new_upper_b_f64[j] += upper_b_err[j];
+            // Fold the certified intercept error into the bias accumulators
+            // BEFORE the directed cast: lower decreases, upper increases. The
+            // fold is a binary64 addition like any other, so it takes the same
+            // directed step (#vnncomp-aw-constant).
+            new_lower_b_f64[j] = add_f64_down(new_lower_b_f64[j], -lower_b_err[j]);
+            new_upper_b_f64[j] = add_f64_up(new_upper_b_f64[j], upper_b_err[j]);
         }
     }
 
-    // #3009: Non-finite row fallback — zero A-row, set bias to ±Inf (sound but maximally loose).
+    // Non-finite row fallback — zero A-row, set bias to ±Inf (sound but maximally loose).
     let lower_affected = lower_nonfinite_rows.iter().filter(|&&r| r).count();
     let upper_affected = upper_nonfinite_rows.iter().filter(|&&r| r).count();
     compose::log_nonfinite_fallback("Activation", lower_affected, upper_affected, num_outputs);
@@ -376,8 +429,35 @@ where
     // whose true bias is exactly 0.0: a needless 1-ulp loosening, and a
     // violation of the stacked-seed invariant that zero rows stay exactly
     // zero through every admitted step (#cgan-stacked-backward injection
-    // guard refuses the whole pass on a nonzero find). `x == 0.0` casts
-    // exactly, so no widening is required there.
+    // guard refuses the whole pass on a nonzero find).
+    //
+    // CORRECTED RATIONALE (#vnncomp-aw-constant). This comment used to end
+    // "`x == 0.0` casts exactly, so no widening is required there." That claim
+    // is true of the CAST and was FALSE of the ACCUMULATION that produced `x`,
+    // and `x == 0.0` is precisely the CANCELLING case: the case where the
+    // binary32 allowance `~2^-24 * |x|` collapses to 1.4e-45 while the true
+    // binary64 accumulation error does not collapse at all. Under the previous
+    // round-to-nearest `+=`, a row whose exact bias was `-4096` could reach
+    // exactly 0.0 (see the accumulation comment above) and this branch then
+    // published a lower bias 4096 ABOVE the truth.
+    //
+    // The branch is sound now only because every accumulator above takes a
+    // directed binary64 step per addition. `add_f64_down`/`add_f64_up`
+    // short-circuit `term == 0.0` exactly, and otherwise step strictly outward,
+    // so a LOWER accumulator can hold exactly `+0.0` in only two ways: every
+    // term it saw was exactly zero (the structural zero row), or it stepped
+    // down from `+5e-324`, whose true sum is therefore >= 0.0. Both make `0.0`
+    // a sound lower bound. Symmetrically for the upper accumulator and `-0.0`.
+    // A row whose NONZERO terms merely cancel no longer lands on zero at all:
+    // it ends strictly outside and is published one binary32 ulp further out.
+    //
+    // The invariant the injection guard checks is therefore untouched.
+    // `inject_stacked_identity_block` refuses unless a seed row's coefficients,
+    // bias AND coefficient-error are all exactly zero; a row with all-zero
+    // incoming coefficients composes to `ComposeResult::ZERO`, contributes
+    // exactly 0.0 to every accumulator (short-circuited, never stepped), skips
+    // the error block entirely (`gap == 0.0 && ea == 0.0`), and still publishes
+    // an exact `+0.0` bias with a 0.0 error.
     let mut new_lower_b = new_lower_b_f64.mapv(|x| {
         if x == 0.0 {
             0.0
@@ -404,7 +484,7 @@ where
         }
     }
 
-    // CROWN backward NaN firewall (#2812): falls back to conservative bounds instead
+    // CROWN backward NaN firewall: falls back to conservative bounds instead
     // of aborting the verification chain when relaxation produces NaN/Inf coefficients.
     // Non-finite rows already zeroed above, but missed corruption is caught here.
     //
@@ -419,6 +499,29 @@ where
         new_lower_a_err,
         new_upper_a_err,
     )
+}
+
+/// Outward `|a| + |b|` for the sign-flip two-line cover (#vnncomp-aw-constant).
+///
+/// The bare form `(a.abs() + b.abs()) as f64` performs the addition in
+/// BINARY32 under round-to-nearest, so it can land BELOW the true sum. That
+/// cover multiplies the incoming coefficient error into both published halves —
+/// `new_*_a_err` and, through `int_cover`, the bias widening `*_b_err` — so a
+/// cover rounded the wrong way under-counts BOTH, in the false-proof direction.
+/// Converting exactly first also keeps a binary32-subnormal operand alive on a
+/// DAZ host, where a hardware `as f64` may read it as zero, and removes a
+/// spurious binary32 overflow to `+inf` for two near-`f32::MAX` intercepts.
+///
+/// Non-finite operands propagate: `+inf` stays `+inf`, NaN stays NaN and is
+/// sanitized to `+inf` by `new_or_conservative_with_err` — both vacuous, sound.
+#[inline]
+fn cover_sum_up(a: f32, b: f32) -> f64 {
+    let sum = f32_to_f64_exact(a).abs() + f32_to_f64_exact(b).abs();
+    if sum == 0.0 {
+        0.0
+    } else {
+        next_up_f64(sum)
+    }
 }
 
 /// The lower-direction slope actually used by [`compose::compose_lower`] for a
@@ -443,5 +546,171 @@ fn ur_slope(a: f32, relax: &LinearRelaxation) -> f64 {
         relax.lower_slope as f64
     } else {
         0.0
+    }
+}
+
+/// Cancelling-constant certificate for the dense element-wise CROWN backward
+/// (#vnncomp-aw-constant).
+///
+/// These tests FAIL on the pre-fix code, where both bias accumulators were a
+/// bare round-to-nearest binary64 `+=` and the publication branch preserved the
+/// resulting exact zero. They are named individually so a filter that stops
+/// matching them fails loudly rather than silently passing zero tests.
+#[cfg(test)]
+mod certified_constant_tests {
+    use super::*;
+    use ndarray::{Array1, Array2};
+
+    /// `2^60`. `ulp(2^60) = 256`, so a round-to-nearest binary64 accumulator
+    /// sitting at `2^60` swallows every `±1` added to it, exactly.
+    const BIG: f32 = 1_152_921_504_606_846_976.0;
+    /// How many unit terms vanish into `BIG`.
+    const UNITS: usize = 4096;
+    /// One `+BIG`, `UNITS` unit terms, one `-BIG`.
+    const N: usize = UNITS + 2;
+    /// Row 0 carries the cancelling shape; row 1 is a structural zero row.
+    const ROWS: usize = 2;
+    /// Exact real sum of row 0's lower-line intercepts: `2^60 - 4096 - 2^60`.
+    const TRUE_LOWER_SUM: f32 = -4096.0;
+    /// Exact real sum of row 0's upper-line intercepts (the mirror image).
+    const TRUE_UPPER_SUM: f32 = 4096.0;
+
+    /// Zero slopes, cancelling intercepts. The lower line's intercepts sum
+    /// EXACTLY to `-4096` and the upper line's to `+4096`, so one call violates
+    /// BOTH directions: the lower bias is published above its truth and the
+    /// upper bias below its truth.
+    fn cancelling_relaxation(_l: f32, _u: f32, i: usize) -> LinearRelaxation {
+        let lower_intercept = if i == 0 {
+            BIG
+        } else if i == N - 1 {
+            -BIG
+        } else {
+            -1.0
+        };
+        LinearRelaxation::new(0.0, lower_intercept, 0.0, -lower_intercept)
+    }
+
+    /// Row 0 all-ones (so `intercept_contrib == intercept`), row 1 all-zero.
+    ///
+    /// `contiguous == false` builds the SAME values in a transposed layout, so
+    /// `as_slice()` is `None` and the `can_par` guard takes the serial arm.
+    /// That is this test's own observable for which arm ran.
+    fn coeff_matrix(contiguous: bool) -> Array2<f32> {
+        if contiguous {
+            let mut data = vec![0.0f32; ROWS * N];
+            data[..N].fill(1.0);
+            Array2::from_shape_vec((ROWS, N), data).expect("ROWS x N data length")
+        } else {
+            let mut data = Vec::with_capacity(ROWS * N);
+            for _ in 0..N {
+                data.push(1.0f32);
+                data.push(0.0f32);
+            }
+            Array2::from_shape_vec((N, ROWS), data)
+                .expect("N x ROWS data length")
+                .reversed_axes()
+        }
+    }
+
+    /// Run one cancelling-shape backward and return the published biases.
+    fn run(contiguous: bool) -> (Array1<f32>, Array1<f32>) {
+        let lower_a = coeff_matrix(contiguous);
+        let upper_a = coeff_matrix(contiguous);
+        assert_eq!(
+            lower_a.as_slice().is_some(),
+            contiguous,
+            "test setup: contiguity decides which arm `can_par` selects, so it \
+             must be what this case intended"
+        );
+        let bounds = LinearBounds::new(lower_a, Array1::zeros(ROWS), upper_a, Array1::zeros(ROWS))
+            .expect("finite coefficients and biases");
+        let pre = BoundedTensor::new(
+            Array1::from_elem(N, -1.0f32).into_dyn(),
+            Array1::from_elem(N, 1.0f32).into_dyn(),
+        )
+        .expect("matching 1-D pre-activation shapes");
+        let out = crown_elementwise_backward_indexed(&bounds, &pre, cancelling_relaxation)
+            .expect("finite relaxation must not degrade to conservative");
+        (out.lower_b().clone(), out.upper_b().clone())
+    }
+
+    /// Both directions, one call. Widening to binary64 is not a certificate:
+    /// the exact bias is `∓4096` and a bare `+=` lands on exactly `0.0`.
+    fn assert_certified(lower_b: &Array1<f32>, upper_b: &Array1<f32>, arm: &str) {
+        assert!(
+            lower_b[0] <= TRUE_LOWER_SUM,
+            "{arm}: lower bias {} is ABOVE its exact value {TRUE_LOWER_SUM} — a \
+             false proof by {} (cancellation ate the binary64 accumulation error \
+             and the binary32 ULP of the result cannot pay for it)",
+            lower_b[0],
+            lower_b[0] - TRUE_LOWER_SUM
+        );
+        assert!(
+            upper_b[0] >= TRUE_UPPER_SUM,
+            "{arm}: upper bias {} is BELOW its exact value {TRUE_UPPER_SUM} — a \
+             false proof by {}",
+            upper_b[0],
+            TRUE_UPPER_SUM - upper_b[0]
+        );
+        assert!(
+            lower_b[0].is_finite() && upper_b[0].is_finite(),
+            "{arm}: the certificate must loosen the bias, not vacate the row: \
+             lower={} upper={}",
+            lower_b[0],
+            upper_b[0]
+        );
+        // The structural zero row must still publish an exact +0.0 in both
+        // directions — the invariant `inject_stacked_identity_block` refuses on.
+        assert_eq!(
+            lower_b[1].to_bits(),
+            0,
+            "{arm}: an all-zero-coefficient row must keep an exact +0.0 lower \
+             bias, got {}",
+            lower_b[1]
+        );
+        assert_eq!(
+            upper_b[1].to_bits(),
+            0,
+            "{arm}: an all-zero-coefficient row must keep an exact +0.0 upper \
+             bias, got {}",
+            upper_b[1]
+        );
+    }
+
+    #[test]
+    fn cancelling_constants_are_certified_in_both_directions_parallel_arm() {
+        let (lower_b, upper_b) = run(true);
+        assert_certified(&lower_b, &upper_b, "parallel arm");
+    }
+
+    #[test]
+    fn cancelling_constants_are_certified_in_both_directions_serial_arm() {
+        let (lower_b, upper_b) = run(false);
+        assert_certified(&lower_b, &upper_b, "serial arm");
+    }
+
+    /// A rayon arm that charges differently from its serial twin is the same
+    /// asymmetry one level down. Both arms keep the inner `i` order, so the
+    /// directed accumulation must be byte-identical, not merely both-sound.
+    #[test]
+    fn serial_and_parallel_arms_publish_bit_identical_certified_constants() {
+        let (par_lower, par_upper) = run(true);
+        let (ser_lower, ser_upper) = run(false);
+        for j in 0..ROWS {
+            assert_eq!(
+                par_lower[j].to_bits(),
+                ser_lower[j].to_bits(),
+                "row {j}: parallel lower bias {} != serial lower bias {}",
+                par_lower[j],
+                ser_lower[j]
+            );
+            assert_eq!(
+                par_upper[j].to_bits(),
+                ser_upper[j].to_bits(),
+                "row {j}: parallel upper bias {} != serial upper bias {}",
+                par_upper[j],
+                ser_upper[j]
+            );
+        }
     }
 }

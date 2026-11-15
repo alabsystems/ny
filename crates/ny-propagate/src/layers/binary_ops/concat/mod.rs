@@ -99,7 +99,7 @@ impl ConcatLayer {
     /// Normalize axis when a leading batch dimension was reintroduced for
     /// broadcasted inputs. Only axes known to have been shifted during ONNX
     /// conversion should move by +1 here.
-    pub(super) fn normalize_axis_with_restored_batch(
+    pub(crate) fn normalize_axis_with_restored_batch(
         &self,
         ndim: usize,
         restored_batch: bool,
@@ -282,7 +282,7 @@ impl ConcatLayer {
         let upper_a_b = bounds.upper_a().slice(ndarray::s![.., size_a..]).to_owned();
 
         // Split bias evenly between the two inputs
-        // Directed rounding on f32 halving to preserve soundness (#2173).
+        // Directed rounding on f32 halving to preserve soundness.
         let lower_b_half = bounds.lower_b().mapv(|v| next_down_f32(v * 0.5));
         let upper_b_half = bounds.upper_b().mapv(|v| next_up_f32(v * 0.5));
 
@@ -393,7 +393,7 @@ impl ConcatLayer {
             .into_dyn();
 
         // Split bias evenly
-        // Directed rounding on f32 halving to preserve soundness (#2173).
+        // Directed rounding on f32 halving to preserve soundness.
         let lower_b_half = bounds.lower_b.mapv(|v| next_down_f32(v * 0.5));
         let upper_b_half = bounds.upper_b.mapv(|v| next_up_f32(v * 0.5));
 

@@ -23,7 +23,7 @@ fn test_gpu_crown_memory_budget_batching_matches_manual_chunks_3515() {
     let full_estimate = estimate_crown_backward_peak_bytes(&layers, num_specs);
     let single_estimate = estimate_crown_backward_peak_bytes(&layers, 1);
     let budget_bytes = (full_estimate / 4).max(single_estimate);
-    // Use the production binary-search helper instead of a local linear scan (#3515 Phase 3).
+    // Use the production binary-search helper instead of a local linear scan.
     let budget_batch = max_specs_per_budget(&layers, num_specs, budget_bytes);
     assert!(
         budget_batch > 0,
@@ -99,7 +99,7 @@ fn test_gpu_crown_memory_budget_fallback_3515() {
 }
 
 /// Verify that the public CROWN working-set cleanup hook can be called between
-/// model runs without affecting correctness (#3515 Phase 2 readiness).
+/// model runs without affecting correctness.
 #[test]
 fn test_crown_resource_release_between_models() {
     let _gpu_serial = gpu_test_serial_guard();

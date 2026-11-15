@@ -203,7 +203,12 @@ impl SlicePolicy {
         };
         let d = Self::default();
         self.headroom = finite(self.headroom, d.headroom, 1.0, 1.0e9);
-        self.max_share_of_remaining = finite(self.max_share_of_remaining, d.max_share_of_remaining, 0.0, 1.0);
+        self.max_share_of_remaining = finite(
+            self.max_share_of_remaining,
+            d.max_share_of_remaining,
+            0.0,
+            1.0,
+        );
         self.probe_share = finite(self.probe_share, d.probe_share, 0.0, 1.0);
         self.growth = finite(self.growth, d.growth, 1.0, 1.0e3);
         self.window = self.window.clamp(1, 65_536);
@@ -342,11 +347,14 @@ impl CostObserver {
             return Slice::Ceiling;
         }
 
-        let growth_factor = self
-            .policy
-            .growth
-            .powi(i32::try_from(state.consecutive_truncated.min(self.policy.growth_steps_max))
-                .unwrap_or(i32::MAX));
+        let growth_factor = self.policy.growth.powi(
+            i32::try_from(
+                state
+                    .consecutive_truncated
+                    .min(self.policy.growth_steps_max),
+            )
+            .unwrap_or(i32::MAX),
+        );
         let growth_factor = if growth_factor.is_finite() {
             growth_factor.max(1.0)
         } else {
@@ -518,7 +526,10 @@ mod tests {
         // a regression.
         let observer = CostObserver::new(SlicePolicy::default());
         let probe = observer.slice(secs(1200.0));
-        let probe_secs = probe.bounded().expect("first probe is bounded").as_secs_f64();
+        let probe_secs = probe
+            .bounded()
+            .expect("first probe is bounded")
+            .as_secs_f64();
         assert!(
             probe_secs <= 0.05 * 1200.0 + 1e-9,
             "the probe must be CHEAP ({probe_secs}s), its job is to fail fast"
@@ -582,11 +593,17 @@ mod tests {
         let grown_once = observer.slice(secs(100_000.0)).bounded().unwrap();
         observer.observe(Observation::Truncated(grown_once));
         let grown_twice = observer.slice(secs(100_000.0)).bounded().unwrap();
-        assert!(grown_twice > grown_once && grown_once > base, "must escalate");
+        assert!(
+            grown_twice > grown_once && grown_once > base,
+            "must escalate"
+        );
 
         observer.observe(Observation::Completed(secs(0.5)));
         let reset = observer.slice(secs(100_000.0)).bounded().unwrap();
-        assert_eq!(reset, base, "a completion is evidence the allowance is fine");
+        assert_eq!(
+            reset, base,
+            "a completion is evidence the allowance is fine"
+        );
     }
 
     #[test]
@@ -711,7 +728,13 @@ mod tests {
         let engaged = CostObserver::new(SlicePolicy::default());
         warm(&engaged, 16, 0.1, 1200.0);
         let r = engaged.report();
-        assert!(r.ceiling == 0 && r.completed == 16 && r.max_slice_secs > 0.0, "engaged: {r}");
-        assert!(format!("{r}").contains("median_secs="), "line carries the measurement");
+        assert!(
+            r.ceiling == 0 && r.completed == 16 && r.max_slice_secs > 0.0,
+            "engaged: {r}"
+        );
+        assert!(
+            format!("{r}").contains("median_secs="),
+            "line carries the measurement"
+        );
     }
 }

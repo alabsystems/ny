@@ -25,7 +25,7 @@ pub(super) enum GraphDomainResult {
         upper: f32,
         verified: bool,
     },
-    /// Child propagation failed — domain is unresolved (#1861).
+    /// Child propagation failed — domain is unresolved.
     /// The BaB loop MUST NOT return Verified while any domain has this status,
     /// because it means part of the input space was not explored.
     PropagationFailure,
@@ -54,13 +54,13 @@ pub(super) enum MultiObjectiveGraphDomainResult {
     /// which is off by default.
     ChildrenWithViolatedDrop(Vec<(MultiObjectiveGraphBabDomain, bool)>),
     /// No unstable neurons - domain cannot be split.
-    /// #1866: Now carries `any_violated` so the BaB loop can distinguish
+    /// Now carries `any_violated` so the BaB loop can distinguish
     /// violation (PotentialViolation) from unresolved (Unknown).
     NoUnstable {
         all_verified: bool,
         any_violated: bool,
     },
-    /// Child propagation failed — domain is unresolved (#1861).
+    /// Child propagation failed — domain is unresolved.
     PropagationFailure,
     /// At least one child of this parent was not evaluated because the
     /// authoritative BaB deadline (or its safe GPU admission reserve) refused
@@ -68,4 +68,29 @@ pub(super) enum MultiObjectiveGraphDomainResult {
     /// propagation failure and must dominate every partial result for the
     /// parent; the outer verifier terminates with `Timeout`.
     DeadlineExpired,
+    /// #vit-bank-gate: a domain with NO unstable neuron left whose own final
+    /// constrained propagation raised `InfeasibleDomain` (empty =
+    /// trivially verified).
+    ///
+    /// Verdict semantics are EXACTLY those of [`Self::AlreadyVerified`]: the
+    /// fold still counts it in `domains_verified` (which
+    /// `finalize_multi_objective_result` reads — `Verified` requires
+    /// `domains_verified > 0`), queues nothing and raises no unresolved flag.
+    /// The only difference is that it is ALSO counted in
+    /// `GraphBabLifecycle::domains_infeasible`, so `[bab-stop] infeasible=`
+    /// can no longer read 0 while a verified drain rested on an emptiness
+    /// claim. Before this variant the site returned `AlreadyVerified` and was
+    /// byte-indistinguishable from a bound proof.
+    InfeasibleEmpty,
+    /// #vit-bank-gate: a split parent for which ZERO children reached
+    /// evaluation — every half-space was refused at construction
+    /// (`with_constraint` returned `Ok(None)` or `InfeasibleDomain`, or a
+    /// committed kFSB cover carried no feasible leaf).
+    ///
+    /// Verdict semantics are EXACTLY those of [`Self::PropagationFailure`]
+    /// (deliberately conservative: the run cannot publish `Verified`). It is
+    /// ALSO counted in `GraphBabLifecycle::domains_infeasible` so the refusal
+    /// is visible in `[bab-stop]` instead of reading as an ordinary numerical
+    /// failure.
+    InfeasibleCoverRefused,
 }

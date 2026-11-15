@@ -232,7 +232,7 @@ impl LogSoftmaxLayer {
 
             // Directed rounding: lse_upper feeds lower_b = -lse_upper, so understating
             // lse_upper overstates -lse_upper, making the lower bound unsound.
-            // Match softmax sound path pattern (linear/sound.rs:88, #3275 Gap 1).
+            // Match softmax sound path pattern (linear/sound.rs).
             let lse_upper = next_up_f32(utils::logsumexp_1d(&group_upper));
             let lse_center = utils::logsumexp_1d(&x_center);
             if !lse_upper.is_finite() || !lse_center.is_finite() {
@@ -287,7 +287,7 @@ impl LogSoftmaxLayer {
             });
         }
 
-        // Fall back to constant [-inf, +inf] bounds for non-finite pre-activations (#2591).
+        // Fall back to constant [-inf, +inf] bounds for non-finite pre-activations.
         // Returning bounds.clone() (identity passthrough) was unsound because
         // LogSoftmax is not the identity function. Constant bounds are trivially
         // sound and match the sound path's fallback (lines 127-134).

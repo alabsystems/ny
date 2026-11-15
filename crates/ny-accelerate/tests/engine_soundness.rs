@@ -367,7 +367,7 @@ fn empty_contraction_returns_the_zero_matrix() {
     let eng = engine();
     assert_eq!(eng.gemm_f64(3, 0, 4, &[], &[]).unwrap(), vec![0.0f64; 12]);
     assert_eq!(eng.gemm_f32(3, 0, 4, &[], &[]).unwrap(), vec![0.0f32; 12]);
-    assert!(eng.gemm_f64(0, 5, 4, &[], &[0.0; 20]).unwrap().is_empty());
+    assert_eq!((eng.gemm_f64(0, 5, 4, &[], &[0.0; 20]).unwrap()).len(), 0);
 }
 
 #[test]

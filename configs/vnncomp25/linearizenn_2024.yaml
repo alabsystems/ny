@@ -61,7 +61,6 @@ bab:
   branching:
     method: input
     candidates: 10
-    reduceop: max
     input_split:
       enable: true
       # #linearizenn-singleton-domainlist: only this production category opts
@@ -89,7 +88,3 @@ bab:
       # Keep sub-domain alpha optimization disabled. The useful composition is
       # shared root CROWN plus fresh child IBP; warm alpha work only adds cost.
       alpha_iteration: 0
-  beta_crown:
-    lr_alpha: 0.1
-    lr_beta: 0.15
-    iterations: 15

@@ -6,6 +6,10 @@ use std::cell::Cell;
 use std::mem::size_of;
 
 use faer::linalg::matmul::matmul;
+
+#[cfg(test)]
+#[path = "faer_parallelism/views_tests.rs"]
+mod views_tests;
 use faer::{Accum, Mat, MatRef, Par};
 
 thread_local! {
@@ -38,19 +42,19 @@ fn nested_faer_par_active() -> bool {
     NESTED_FAER_PAR_DEPTH.with(|d| d.get() > 0)
 }
 
-/// RAII guard that permits nested faer (Rayon) parallelism for GEMMs issued in
-/// its scope — even on a Rayon worker thread. Deadlock-free: faer's explicit
+/// RAII guard that permits nested faer (Rayon) parallelism for GEMMs issued in its
+/// scope — even on a Rayon worker thread. Deadlock-free: faer's explicit
 /// `Par::Rayon` path drives a work-stealing `rayon` scope (NOT the `&Mat * &Mat`
-/// operator that #4392 avoided), so nesting it inside an outer `par_iter` worker
-/// participates in work-stealing rather than blocking. Self-balancing: when the
-/// BaB batch already saturates every core, the nested scope finds no idle worker
-/// to steal and runs effectively sequentially (no oversubscription); when cores
-/// are idle (shallow tree, 1–few domains) the wide collection GEMM fans out
-/// across them. SOUNDNESS: this changes ONLY the GEMM summation order (blocked
-/// SIMD across threads); the certified `γ_n·S` coefficient-error envelope is
-/// summation-order independent (the identical Higham argument that already
-/// routes these products through cuBLAS/faer), so every bound stays a valid
-/// enclosure. A no-op when [`nested_faer_par_enabled`] is false.
+/// operator, which can deadlock when nested), so nesting it inside an outer
+/// `par_iter` worker participates in work-stealing rather than blocking.
+/// Self-balancing: when the BaB batch already saturates every core, the nested
+/// scope finds no idle worker to steal and runs effectively sequentially (no
+/// oversubscription); when cores are idle (shallow tree, 1–few domains) the wide
+/// collection GEMM fans out across them. SOUNDNESS: this changes ONLY the GEMM
+/// summation order (blocked SIMD across threads); the certified `γ_n·S`
+/// coefficient-error envelope is summation-order independent (the identical Higham
+/// argument that already routes these products through cuBLAS/faer), so every bound
+/// stays a valid enclosure. A no-op when [`nested_faer_par_enabled`] is false.
 #[must_use = "hold the guard for the full nested-parallel collection scope"]
 pub(crate) struct NestedFaerParGuard {
     active: bool,
@@ -74,12 +78,33 @@ impl Drop for NestedFaerParGuard {
     }
 }
 
+/// Public face of [`NestedFaerParGuard`] for a lane that runs its whole body
+/// inside a PRIVATE Rayon pool (#attack-concurrent: the concurrent attack
+/// lane, `ThreadPool::install`). On that pool's worker the closure is "inside
+/// a Rayon task", so without this scope every faer GEMM would degrade to
+/// `Par::Seq`; holding it lets faer's work-stealing scope fan the GEMM out
+/// over the SAME private pool (a `rayon::join` issued from a pool worker
+/// stays in that pool), never over the proof's global pool. Thread-local:
+/// hold it on the thread that issues the GEMMs. Summation order only — the
+/// attack's arithmetic never certifies anything.
+#[must_use = "hold the scope for the full private-pool body"]
+pub struct NestedFaerParScope {
+    _guard: NestedFaerParGuard,
+}
+
+/// Enter a [`NestedFaerParScope`] on the current thread.
+pub fn nested_faer_par_scope() -> NestedFaerParScope {
+    NestedFaerParScope {
+        _guard: NestedFaerParGuard::new(),
+    }
+}
+
 /// Matrix multiply with explicit faer parallelism control.
 ///
 /// faer 0.21.9's `&Mat * &Mat` operator uses `get_global_parallelism()`
 /// (`src/operator/operator_impl/matref.rs`, `src/lib.rs:1077-1097`). Inside a
 /// Rayon worker, that schedules nested Rayon work and can deadlock when the
-/// outer task is already running under `par_iter()` (#4392). Callers should use
+/// outer task is already running under `par_iter()`. Callers should use
 /// `mat_mul()` instead of the operator so Rayon-scoped work degrades to
 /// `Par::Seq` while sequential callers preserve the configured global policy.
 pub(crate) fn mat_mul_with_par(a: &Mat<f32>, b: &Mat<f32>, par: Par) -> Mat<f32> {
@@ -99,7 +124,7 @@ pub(crate) fn mat_mul(a: &Mat<f32>, b: &Mat<f32>) -> Mat<f32> {
 /// scalar loop it replaces.
 pub(crate) fn mat_mul_f64(a: &Mat<f64>, b: &Mat<f64>) -> Mat<f64> {
     let mut dst = Mat::<f64>::zeros(a.nrows(), b.ncols());
-    matmul(&mut dst, Accum::Replace, a, b, 1.0, current_par());
+    mat_mul_f64_views_into(dst.as_mut(), a.as_ref(), b.as_ref());
     dst
 }
 
@@ -108,7 +133,17 @@ pub(crate) fn mat_mul_f64(a: &Mat<f64>, b: &Mat<f64>) -> Mat<f64> {
 /// `Mat` and the per-element bounds-checked copy that would otherwise follow.
 /// Same faer kernel, same certificate coverage: the certified conv error is
 /// summation-order independent (#vnncomp-aw-soundness).
-pub(crate) fn mat_mul_f64_into(mut dst: faer::MatMut<'_, f64>, a: &Mat<f64>, b: &Mat<f64>) {
+pub(crate) fn mat_mul_f64_into(dst: faer::MatMut<'_, f64>, a: &Mat<f64>, b: &Mat<f64>) {
+    mat_mul_f64_views_into(dst, a.as_ref(), b.as_ref());
+}
+
+/// Shared fixed-view f64 dispatch. The caller owns allocation and preserves the
+/// desired layouts; full-k contraction and NestedFaerParGuard policy stay here.
+pub(crate) fn mat_mul_f64_views_into(
+    mut dst: faer::MatMut<'_, f64>,
+    a: MatRef<'_, f64>,
+    b: MatRef<'_, f64>,
+) {
     debug_assert_eq!(dst.nrows(), a.nrows());
     debug_assert_eq!(dst.ncols(), b.ncols());
     matmul(&mut dst, Accum::Replace, a, b, 1.0, current_par());
@@ -392,20 +427,6 @@ impl ny_core::GemmEngine for FaerCpuGemmEngine {
                 }
                 let cols = cols_per.min(n - j0);
                 let b_tile = b_mat.submatrix(0, j0, k, cols);
-                // HISTORICAL matmul form, deliberately: fresh column-major
-                // tile dst + row-major operand views is the exact call the
-                // tiled==untiled bit-parity pin was recorded against. Both
-                // zero-copy rewrites (row-major dst view; transposed-problem
-                // col-major view) selected kernel families whose per-element
-                // k-accumulation order varies with tile shape — 1-ULP
-                // divergence, caught by the pin. What WAS the measured cost
-                // here (the group arm's 21.5 s engine share against 0.05 s of
-                // tile matmul; REGRESSION doc, "conv-arm probes") was never
-                // the temp — it was the per-element bounds-checked 2D
-                // `dst[(i, j)]` copy, replaced below with per-column
-                // contiguous reads. Column sweeps revisit the same
-                // destination cache-line set (rows lines ≈ L2-resident for
-                // balanced tiles), so no extra blocking is needed.
                 // DIRECT-WRITE through a row-major MatMut view of the
                 // destination tile: no temp, no zeroing, no transpose copy.
                 // Receipts for this choice (2026-08-21, acceptance row, all
@@ -628,7 +649,8 @@ const CPU_SOUND_F64_ENGINE_ENV: &str = "NY_CPU_SOUND_F64_ENGINE";
 ///
 /// So the win is a *saved second f64 GEMM*, not a faster first one. That
 /// distinction was measured, not assumed
-/// (`docs/ACCELERATE_SEAM_REFUTED_2026-08-07.md`, `tests/audit_attribution.rs`):
+/// (`docs/ACCELERATE_SEAM_REFUTED_2026-08-07.md`,
+/// `crates/ny-accelerate/examples/audit_attribution.rs`):
 /// a three-arm experiment — engine absent / faer engine / Accelerate engine —
 /// isolated it as **FAER/OFF = 1.024x**, while the vendor BLAS on top measured
 /// **ACC/FAER = 0.955x**, i.e. negative. The whole reproducible gain belongs to
@@ -643,7 +665,7 @@ const CPU_SOUND_F64_ENGINE_ENV: &str = "NY_CPU_SOUND_F64_ENGINE";
 /// banked for cuBLAS on this exact seam: the `γ_n·S` certified-error bound is
 /// summation-order INDEPENDENT, so any conventional inner product satisfies the
 /// envelope the certificate needs. Measured on this seam: published bounds are
-/// bit-identical to the engine-absent arm (`tests/audit_attribution.rs` reports
+/// bit-identical to the engine-absent arm (the attribution example above reports
 /// `bounds: FAER==OFF true` on all six configurations), and enclosure was
 /// verified against an exact-rational (`BigRational`) oracle with 0 violations.
 /// Installing it can move a bound's last ULP, never its validity.
@@ -663,7 +685,7 @@ pub fn install_cpu_sound_f64_gemm_engine_if_absent() {
 pub(crate) fn current_par() -> Par {
     if is_inside_rayon_task() {
         // #tll-nested-collect-par: inside a Rayon worker we normally force
-        // `Par::Seq` to avoid the #4392 operator deadlock and cross-domain
+        // `Par::Seq` to avoid the nested matmul-operator deadlock and cross-domain
         // oversubscription. But when a `NestedFaerParGuard` is active (the
         // per-domain input-split CROWN collection), permit the configured
         // global parallelism: faer's work-stealing scope self-balances (fills
@@ -681,6 +703,19 @@ pub(crate) fn current_par() -> Par {
 
 fn is_inside_rayon_task() -> bool {
     rayon::current_thread_index().is_some() || RAYON_TASK_DEPTH.with(|depth| depth.get() > 0)
+}
+
+/// #vit-collector-throughput: may a non-faer kernel fan its own independent
+/// rows out over rayon from HERE?
+///
+/// The same nesting policy [`current_par`] applies to faer: yes on a driver
+/// thread; on a Rayon worker (or under a [`RayonTaskGuard`]) only when a
+/// [`NestedFaerParGuard`] scope permits nested parallelism, so a kernel issued
+/// from inside a per-domain BaB fan-out stays sequential exactly as a faer
+/// GEMM there would (no oversubscription). A kernel that answers `false`
+/// runs the SAME chunks sequentially, so the answer changes wall time only.
+pub(crate) fn nested_rayon_fanout_permitted() -> bool {
+    !is_inside_rayon_task() || nested_faer_par_active()
 }
 
 /// RAII guard for work launched from Rayon closures that can reach faer matmul.
@@ -1113,7 +1148,7 @@ mod tests {
     // #tll-nested-collect-par: with a `NestedFaerParGuard` active on a Rayon
     // worker, `current_par` must permit the global (Rayon) parallelism instead
     // of `Par::Seq`, and nesting faer's `Par::Rayon` matmul inside an outer
-    // `par_iter` worker must COMPLETE (no #4392-style deadlock) with correct
+    // `par_iter` worker must COMPLETE (no operator-style deadlock) with correct
     // results. Runs many outer domains × wide inner GEMMs to exercise
     // work-stealing under contention.
     #[test]

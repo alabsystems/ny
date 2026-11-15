@@ -40,7 +40,7 @@ impl GraphNetwork {
         self.propagate_crown_block_wise_with_deadline(input, epsilon, None)
     }
 
-    /// Deadline-aware variant of `propagate_crown_block_wise` (#4242).
+    /// Deadline-aware variant of `propagate_crown_block_wise`.
     pub fn propagate_crown_block_wise_with_deadline(
         &self,
         input: &BoundedTensor,
@@ -50,7 +50,7 @@ impl GraphNetwork {
         self.propagate_crown_block_wise_with_engine_and_deadline(input, epsilon, None, deadline)
     }
 
-    /// Engine-aware variant of `propagate_crown_block_wise` (#3597).
+    /// Engine-aware variant of `propagate_crown_block_wise`.
     ///
     /// Builds a `BlockSpec` from the legacy `layer{N}` name-based discovery
     /// and delegates to `propagate_crown_with_blocks_and_engine`.
@@ -63,7 +63,7 @@ impl GraphNetwork {
         self.propagate_crown_block_wise_with_engine_and_deadline(input, epsilon, engine, None)
     }
 
-    /// Deadline-aware engine variant of `propagate_crown_block_wise` (#4242).
+    /// Deadline-aware engine variant of `propagate_crown_block_wise`.
     pub fn propagate_crown_block_wise_with_engine_and_deadline(
         &self,
         input: &BoundedTensor,
@@ -71,6 +71,7 @@ impl GraphNetwork {
         engine: Option<&dyn GemmEngine>,
         deadline: Option<Instant>,
     ) -> Result<BlockWiseCrownResult> {
+        self.ensure_proof_eligible()?;
         let exec_order = self.exec_order()?;
         let block_nodes = Self::collect_block_nodes(exec_order);
 
@@ -83,7 +84,7 @@ impl GraphNetwork {
         }
 
         // Build a BlockSpec from the legacy layer{N} name-based discovery,
-        // preserving the same metadata the old path produced (#4024).
+        // preserving the same metadata the old path produced.
         let spec = BlockSpec {
             blocks: block_nodes
                 .iter()
@@ -105,7 +106,7 @@ impl GraphNetwork {
     /// Same per-block CROWN/IBP math as `propagate_crown_block_wise`, but block
     /// boundaries and metadata come from the caller's `BlockSpec` instead of
     /// being parsed from `layer{N}` node names. This allows traced or imported
-    /// graphs with arbitrary node names to use block-wise CROWN. Part of #4024.
+    /// graphs with arbitrary node names to use block-wise CROWN.
     pub fn propagate_crown_with_blocks(
         &self,
         input: &BoundedTensor,
@@ -115,7 +116,7 @@ impl GraphNetwork {
         self.propagate_crown_with_blocks_with_deadline(input, epsilon, block_spec, None)
     }
 
-    /// Deadline-aware variant of `propagate_crown_with_blocks` (#4242).
+    /// Deadline-aware variant of `propagate_crown_with_blocks`.
     pub fn propagate_crown_with_blocks_with_deadline(
         &self,
         input: &BoundedTensor,
@@ -128,7 +129,7 @@ impl GraphNetwork {
         )
     }
 
-    /// Engine-aware variant of `propagate_crown_with_blocks` (#4024).
+    /// Engine-aware variant of `propagate_crown_with_blocks`.
     pub fn propagate_crown_with_blocks_and_engine(
         &self,
         input: &BoundedTensor,
@@ -141,7 +142,7 @@ impl GraphNetwork {
         )
     }
 
-    /// Deadline-aware engine variant of `propagate_crown_with_blocks` (#4242).
+    /// Deadline-aware engine variant of `propagate_crown_with_blocks`.
     pub fn propagate_crown_with_blocks_and_engine_and_deadline(
         &self,
         input: &BoundedTensor,
@@ -150,6 +151,7 @@ impl GraphNetwork {
         engine: Option<&dyn GemmEngine>,
         deadline: Option<Instant>,
     ) -> Result<BlockWiseCrownResult> {
+        self.ensure_proof_eligible()?;
         // Disable the L2/Cauchy–Schwarz lever for block-wise CROWN: the per-block
         // loop below runs `collect_block_ibp_bounds` (a lever-firing IBP forward
         // pass) for every block. Chokepoint for all block-wise CROWN entry points.
@@ -192,7 +194,7 @@ impl GraphNetwork {
 
             let (crown_max_width, crown_successful) = match crown_result {
                 Ok((crown_bounds, _stats, provenance)) => {
-                    // #4256: derive success from provenance, not from Ok(_).
+                    // Derive success from provenance, not from Ok(_).
                     // Fallback provenance means we returned IBP bounds, not CROWN.
                     (crown_bounds.max_width(), !provenance.is_fallback())
                 }
@@ -240,8 +242,6 @@ impl GraphNetwork {
     /// output to input. Normalization and bilinear layers trigger partial fallback
     /// (concretized to IBP-quality), while linear and activation layers get full
     /// CROWN tightening.
-    ///
-    /// Part of #318.
     pub fn propagate_crown_within_graph(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
         self.propagate_crown_within_graph_with_deadline(input, None)
     }
@@ -254,7 +254,7 @@ impl GraphNetwork {
         self.propagate_crown_within_graph_with_provenance_and_deadline(input, None)
     }
 
-    /// Deadline-aware single-block graph CROWN with fallback provenance (#4256).
+    /// Deadline-aware single-block graph CROWN with fallback provenance.
     pub fn propagate_crown_within_graph_with_provenance_and_deadline(
         &self,
         input: &BoundedTensor,
@@ -265,7 +265,7 @@ impl GraphNetwork {
         )
     }
 
-    /// Engine-aware single-block graph CROWN with fallback provenance (#4256).
+    /// Engine-aware single-block graph CROWN with fallback provenance.
     pub fn propagate_crown_within_graph_with_provenance_and_engine(
         &self,
         input: &BoundedTensor,
@@ -276,7 +276,7 @@ impl GraphNetwork {
         )
     }
 
-    /// Engine + deadline single-block graph CROWN with fallback provenance (#4256).
+    /// Engine + deadline single-block graph CROWN with fallback provenance.
     pub fn propagate_crown_within_graph_with_provenance_and_engine_and_deadline(
         &self,
         input: &BoundedTensor,
@@ -290,7 +290,7 @@ impl GraphNetwork {
         Ok(result)
     }
 
-    /// Deadline-aware variant of `propagate_crown_within_graph` (#4242).
+    /// Deadline-aware variant of `propagate_crown_within_graph`.
     pub fn propagate_crown_within_graph_with_deadline(
         &self,
         input: &BoundedTensor,
@@ -299,7 +299,7 @@ impl GraphNetwork {
         self.propagate_crown_within_graph_with_engine_and_deadline(input, None, deadline)
     }
 
-    /// Engine-aware variant of `propagate_crown_within_graph` (#3772).
+    /// Engine-aware variant of `propagate_crown_within_graph`.
     pub fn propagate_crown_within_graph_with_engine(
         &self,
         input: &BoundedTensor,
@@ -308,7 +308,7 @@ impl GraphNetwork {
         self.propagate_crown_within_graph_with_engine_and_deadline(input, engine, None)
     }
 
-    /// Deadline-aware engine variant of `propagate_crown_within_graph` (#4242).
+    /// Deadline-aware engine variant of `propagate_crown_within_graph`.
     pub fn propagate_crown_within_graph_with_engine_and_deadline(
         &self,
         input: &BoundedTensor,
@@ -322,7 +322,7 @@ impl GraphNetwork {
     }
 
     /// Same as `propagate_crown_within_graph` but also returns row-collapse counts
-    /// from each decomposed normalization site. Part of #318.
+    /// from each decomposed normalization site.
     pub fn propagate_crown_within_graph_with_stats(
         &self,
         input: &BoundedTensor,
@@ -330,7 +330,7 @@ impl GraphNetwork {
         self.propagate_crown_within_graph_with_stats_and_deadline(input, None)
     }
 
-    /// Deadline-aware variant of `propagate_crown_within_graph_with_stats` (#4242).
+    /// Deadline-aware variant of `propagate_crown_within_graph_with_stats`.
     pub fn propagate_crown_within_graph_with_stats_and_deadline(
         &self,
         input: &BoundedTensor,
@@ -339,7 +339,7 @@ impl GraphNetwork {
         self.propagate_crown_within_graph_with_stats_and_engine_and_deadline(input, None, deadline)
     }
 
-    /// Engine-aware variant of `propagate_crown_within_graph_with_stats` (#3772).
+    /// Engine-aware variant of `propagate_crown_within_graph_with_stats`.
     pub fn propagate_crown_within_graph_with_stats_and_engine(
         &self,
         input: &BoundedTensor,
@@ -348,7 +348,7 @@ impl GraphNetwork {
         self.propagate_crown_within_graph_with_stats_and_engine_and_deadline(input, engine, None)
     }
 
-    /// Deadline-aware engine variant of `propagate_crown_within_graph_with_stats` (#4242).
+    /// Deadline-aware engine variant of `propagate_crown_within_graph_with_stats`.
     pub fn propagate_crown_within_graph_with_stats_and_engine_and_deadline(
         &self,
         input: &BoundedTensor,
@@ -368,6 +368,7 @@ impl GraphNetwork {
         engine: Option<&dyn GemmEngine>,
         deadline: Option<Instant>,
     ) -> Result<(CrownBackwardResult, Vec<LayerNormValidationStats>)> {
+        self.ensure_proof_eligible()?;
         let exec_order = self.exec_order()?;
         if exec_order.is_empty() {
             return Err(NyError::InvalidSpec(

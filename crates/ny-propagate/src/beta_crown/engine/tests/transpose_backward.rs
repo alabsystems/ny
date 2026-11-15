@@ -4,7 +4,7 @@
 
 //! Regression tests for beta-CROWN backward pass through Transpose layers.
 //!
-//! Prior to the fix in #1969, `propagate_layer_backward_with_alpha_beta` and
+//! Prior to the fix, `propagate_layer_backward_with_alpha_beta` and
 //! `propagate_layer_backward_with_beta` treated Transpose as a passthrough
 //! (identical to Flatten/Reshape), returning `output_bounds.clone()`. This is
 //! unsound because Transpose permutes elements — the CROWN coefficient columns

@@ -142,7 +142,7 @@ fn assert_alpha_block_wise_results_match(
 
 #[test]
 fn test_per_block_crown_threads_engine_3597() {
-    // Serialized against budget=0 tests to prevent CROWN fallback (#3515).
+    // Serialized against budget=0 tests to prevent CROWN fallback.
     tests::with_crown_dense_budget_mb("2048", || {
         let hidden = 4;
         let expansion = 2;
@@ -196,7 +196,7 @@ fn test_per_block_crown_threads_engine_3597() {
 
 #[test]
 fn test_alpha_block_crown_missing_gelu_alpha_threads_engine_3597() {
-    // Serialized against budget=0 tests to prevent CROWN fallback (#3515).
+    // Serialized against budget=0 tests to prevent CROWN fallback.
     tests::with_crown_dense_budget_mb("2048", || {
         let hidden = 4;
         let expansion = 2;
@@ -278,7 +278,7 @@ fn test_alpha_block_crown_missing_gelu_alpha_threads_engine_3597() {
 
 #[test]
 fn test_alpha_block_crown_threads_engine_3597() {
-    // Serialized against budget=0 tests to prevent CROWN fallback (#3515).
+    // Serialized against budget=0 tests to prevent CROWN fallback.
     tests::with_crown_dense_budget_mb("2048", || {
         let hidden = 4;
         let expansion = 2;

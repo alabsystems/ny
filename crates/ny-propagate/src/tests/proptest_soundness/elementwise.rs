@@ -165,7 +165,6 @@ proptest! {
     /// PowConstant(2) IBP soundness: for any x in [l, u], x^2 is in computed bounds.
     /// x^2 is convex with minimum at x=0. When the interval crosses zero, the lower
     /// bound of x^2 should be 0 (or close to it). The upper bound is max(l^2, u^2).
-    /// Part of #3126, #2435.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_pow2_ibp((l, u) in valid_interval(100.0)) {
@@ -190,7 +189,7 @@ proptest! {
 }
 
 // =============================================================================
-// TIGHTNESS: Point-input (degenerate interval) exactness tests (#2131)
+// TIGHTNESS: Point-input (degenerate interval) exactness tests
 // =============================================================================
 //
 // For monotone elementwise functions, a point input [x, x] should produce a

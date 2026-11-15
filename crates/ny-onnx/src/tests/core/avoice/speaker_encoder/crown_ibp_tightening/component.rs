@@ -39,7 +39,7 @@ fn assert_scalar_component_crown_exercises_path_without_loosening(
         .unwrap_or_else(|_| panic!("{label} IBP node-bound collection should succeed"));
 
     // Diagnostic: use _and_linear variant to check if CROWN backward produced
-    // linear bounds (Some) or fell back entirely to IBP (None). #3596
+    // linear bounds (Some) or fell back entirely to IBP (None).
     let spec = ndarray::arr2(&[[1.0_f32]]);
     let (crown_output, linear_bounds) = graph
         .propagate_crown_with_specs_and_node_bounds_and_linear(input, &spec, None, &ibp_bounds)
@@ -153,7 +153,7 @@ fn log_crown_backward_gaps(graph: &GraphNetwork, layer_type_counts: &HashMap<Str
 /// The real speaker dot-component graph must retain the explicit three-node
 /// cosine head after ONNX lowering. The inventory and backward-gap log remain
 /// useful diagnostics, while the topology assertions prevent an empty or
-/// miswired graph from passing as coverage. #3499
+/// miswired graph from passing as coverage.
 #[cfg_attr(not(debug_assertions), ntest::timeout(120000))]
 #[test]
 #[cfg(feature = "external-avoice")]

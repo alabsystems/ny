@@ -66,11 +66,11 @@
 //! # Ok::<(), ny_core::NyError>(())
 //! ```
 
-// Link macOS Accelerate BLAS for ndarray::dot() acceleration (#4259).
+// Link macOS Accelerate BLAS for ndarray::dot() acceleration.
 #[cfg(target_os = "macos")]
 extern crate blas_src;
 
-/// Bound export: serialize per-node IBP bounds to safetensors for downstream training (#3520).
+/// Bound export: serialize per-node IBP bounds to safetensors for downstream training.
 pub mod bound_export;
 /// Static compute-cost analysis: per-layer FLOP and activation-memory estimates.
 pub mod cost;
@@ -93,7 +93,7 @@ pub mod runtime;
 pub mod safetensors;
 /// Sensitivity analysis: measures how each layer amplifies input uncertainty.
 pub mod sensitivity;
-/// Weak-region mining for verification-guided training (#3520).
+/// Weak-region mining for verification-guided training.
 pub mod training_signal;
 
 /// PyTorch format loader: reads `.pt` pickle/zip model files via candle-core's pickle parser.
@@ -125,6 +125,14 @@ mod loader;
 mod model;
 mod whisper;
 
+/// Point-folded ATTACK-ONLY twin of a graph whose constant cones the exact
+/// loader fails closed (#lsnc-attack-twin). A distinct type with no route to
+/// any bound API: it yields search directions, never verdicts.
+pub mod attack_twin;
+/// LANE-PRIVATE interval twin for the `#lowdim-prover` lane (#lsnc-lane): the
+/// constant-only cones the exact loader declines, folded to rigorous
+/// enclosures for that lane alone (`ny_propagate::lowdim::LaneTwin`).
+pub mod lowdim_twin;
 /// Prost-derived protobuf struct definitions (`ModelProto`, etc.) for the ONNX format.
 pub mod onnx_proto;
 pub mod tail_surrogate;
@@ -148,16 +156,18 @@ pub use decoder::{
 };
 /// ONNX model loaders with optional custom operator registry.
 pub use loader::{
-    load_onnx, load_onnx_bytes, load_onnx_bytes_with_config, load_onnx_with_config,
-    read_onnx_bytes_maybe_gzip, serve_shape_infer_request, set_const_matmul_interval_preset,
-    BatchNormFoldingPolicy, CustomOpHandler, CustomOpRegistry, OnnxLoadConfig,
-    OnnxOptimizationFlag, ShapeInferBackend, ShapeInferencePolicy, SHAPE_INFER_SUBCOMMAND,
+    bn_fold_enclosure_dropped, load_onnx, load_onnx_bytes, load_onnx_bytes_with_config,
+    load_onnx_with_config, load_onnx_with_config_and_root_policy, read_onnx_bytes_maybe_gzip,
+    serve_shape_infer_request, set_const_matmul_interval_preset, BatchNormFoldingPolicy,
+    CustomOpHandler, CustomOpRegistry, OnnxLoadConfig, OnnxOptimizationFlag, RootCutLoadReceipt,
+    ShapeInferBackend, ShapeInferencePolicy, SHAPE_INFER_SUBCOMMAND,
 };
 /// ONNX model representation: layer specs, weight storage, and conversion options.
 pub use model::{
-    is_multi_output_split, resolve_dynamic_dim, resolve_dynamic_shape, AttributeValue,
-    CompoundNodePolicy, DataType, GraphNetworkOptions, LayerSpec, MissingOutputPolicy, Network,
-    OnnxModel, PropagateNetworkOptions, TensorSpec, WeightRef, WeightStore,
+    concat_input_layout, is_multi_output_split, resolve_dynamic_dim, resolve_dynamic_shape,
+    AttributeValue, CompoundNodePolicy, ConcatInputLayout, ConcatInputSlot, DataType,
+    GraphNetworkOptions, LayerSpec, MissingOutputPolicy, Network, OnnxModel,
+    PropagateNetworkOptions, TensorSpec, WeightRef, WeightStore,
 };
 /// Network optimization passes (e.g., peeling off final softmax layers).
 pub use optimization::{

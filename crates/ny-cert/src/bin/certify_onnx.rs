@@ -23,80 +23,10 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 // ---------------------------------------------------------------------------
-// Minimal protobuf reader (ONNX is protobuf-encoded).
+// Protobuf wire reader (ONNX is protobuf-encoded): the shared, total
+// `ny_cert::protobuf::Reader` — malformed input is a `WireError`, not a panic.
 // ---------------------------------------------------------------------------
-struct Pb<'a> {
-    buf: &'a [u8],
-    i: usize,
-}
-impl<'a> Pb<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        Pb { buf, i: 0 }
-    }
-    fn eof(&self) -> bool {
-        self.i >= self.buf.len()
-    }
-    fn varint(&mut self) -> u64 {
-        let mut shift = 0u32;
-        let mut result = 0u64;
-        loop {
-            let b = self.buf[self.i];
-            self.i += 1;
-            result |= ((b & 0x7f) as u64) << shift;
-            if b & 0x80 == 0 {
-                break;
-            }
-            shift += 7;
-        }
-        result
-    }
-    /// Returns (field_number, wire_type).
-    fn tag(&mut self) -> (u64, u8) {
-        let t = self.varint();
-        (t >> 3, (t & 7) as u8)
-    }
-    fn bytes(&mut self) -> &'a [u8] {
-        let len = self.varint() as usize;
-        let s = &self.buf[self.i..self.i + len];
-        self.i += len;
-        s
-    }
-    fn fixed32(&mut self) -> [u8; 4] {
-        let s = [
-            self.buf[self.i],
-            self.buf[self.i + 1],
-            self.buf[self.i + 2],
-            self.buf[self.i + 3],
-        ];
-        self.i += 4;
-        s
-    }
-    #[allow(dead_code)] // wire-type helper kept for completeness alongside fixed32/skip
-    fn fixed64(&mut self) -> [u8; 8] {
-        let mut s = [0u8; 8];
-        s.copy_from_slice(&self.buf[self.i..self.i + 8]);
-        self.i += 8;
-        s
-    }
-    /// Skip a field of the given wire type.
-    fn skip(&mut self, wt: u8) {
-        match wt {
-            0 => {
-                self.varint();
-            }
-            2 => {
-                let _ = self.bytes();
-            }
-            5 => {
-                self.i += 4;
-            }
-            1 => {
-                self.i += 8;
-            }
-            _ => panic!("unknown wire type {wt}"),
-        }
-    }
-}
+use ny_cert::protobuf::{Reader as Pb, WireError};
 
 // ---------------------------------------------------------------------------
 // ONNX structures we care about.
@@ -141,7 +71,7 @@ struct OnnxGraph {
 /// Parse an AttributeProto: name=1(str), f=2(fixed32 float), i=3(varint int64).
 /// Other payload kinds are skipped (attr decodes with `i`/`f` both None, which
 /// consumers reject — fail closed).
-fn parse_attr(buf: &[u8]) -> OnnxAttr {
+fn parse_attr(buf: &[u8]) -> Result<OnnxAttr, WireError> {
     let mut pb = Pb::new(buf);
     let mut a = OnnxAttr {
         name: String::new(),
@@ -149,18 +79,18 @@ fn parse_attr(buf: &[u8]) -> OnnxAttr {
         f: None,
     };
     while !pb.eof() {
-        let (fn_, wt) = pb.tag();
+        let (fn_, wt) = pb.tag()?;
         match (fn_, wt) {
-            (1, 2) => a.name = String::from_utf8_lossy(pb.bytes()).into_owned(),
-            (2, 5) => a.f = Some(f32::from_le_bytes(pb.fixed32())),
-            (3, 0) => a.i = Some(pb.varint() as i64),
-            _ => pb.skip(wt),
+            (1, 2) => a.name = String::from_utf8_lossy(pb.bytes()?).into_owned(),
+            (2, 5) => a.f = Some(f32::from_le_bytes(pb.fixed32()?)),
+            (3, 0) => a.i = Some(pb.varint()? as i64),
+            _ => pb.skip(wt)?,
         }
     }
-    a
+    Ok(a)
 }
 
-fn parse_node(buf: &[u8]) -> OnnxNode {
+fn parse_node(buf: &[u8]) -> Result<OnnxNode, WireError> {
     // NodeProto: input=1(str), output=2(str), op_type=4(str), attribute=5(msg)
     let mut pb = Pb::new(buf);
     let mut n = OnnxNode {
@@ -170,38 +100,38 @@ fn parse_node(buf: &[u8]) -> OnnxNode {
         attrs: vec![],
     };
     while !pb.eof() {
-        let (fn_, wt) = pb.tag();
+        let (fn_, wt) = pb.tag()?;
         match (fn_, wt) {
             (1, 2) => n
                 .inputs
-                .push(String::from_utf8_lossy(pb.bytes()).into_owned()),
+                .push(String::from_utf8_lossy(pb.bytes()?).into_owned()),
             (2, 2) => n
                 .outputs
-                .push(String::from_utf8_lossy(pb.bytes()).into_owned()),
-            (4, 2) => n.op_type = String::from_utf8_lossy(pb.bytes()).into_owned(),
-            (5, 2) => n.attrs.push(parse_attr(pb.bytes())),
-            _ => pb.skip(wt),
+                .push(String::from_utf8_lossy(pb.bytes()?).into_owned()),
+            (4, 2) => n.op_type = String::from_utf8_lossy(pb.bytes()?).into_owned(),
+            (5, 2) => n.attrs.push(parse_attr(pb.bytes()?)?),
+            _ => pb.skip(wt)?,
         }
     }
-    n
+    Ok(n)
 }
 
 /// Parse a ValueInfoProto far enough to extract its name (field 1).
-fn parse_value_info_name(buf: &[u8]) -> String {
+fn parse_value_info_name(buf: &[u8]) -> Result<String, WireError> {
     let mut pb = Pb::new(buf);
     let mut name = String::new();
     while !pb.eof() {
-        let (fn_, wt) = pb.tag();
+        let (fn_, wt) = pb.tag()?;
         if fn_ == 1 && wt == 2 {
-            name = String::from_utf8_lossy(pb.bytes()).into_owned();
+            name = String::from_utf8_lossy(pb.bytes()?).into_owned();
         } else {
-            pb.skip(wt);
+            pb.skip(wt)?;
         }
     }
-    name
+    Ok(name)
 }
 
-fn parse_tensor(buf: &[u8]) -> OnnxTensor {
+fn parse_tensor(buf: &[u8]) -> Result<OnnxTensor, WireError> {
     // TensorProto: dims=1(int64 repeated), data_type=2, float_data=4(repeated float),
     //              name=8(str), raw_data=9(bytes)
     let mut pb = Pb::new(buf);
@@ -213,29 +143,29 @@ fn parse_tensor(buf: &[u8]) -> OnnxTensor {
     let mut raw: Option<Vec<u8>> = None;
     let mut float_data: Vec<f32> = vec![];
     while !pb.eof() {
-        let (fn_, wt) = pb.tag();
+        let (fn_, wt) = pb.tag()?;
         match (fn_, wt) {
-            (1, 0) => t.dims.push(pb.varint() as i64),
+            (1, 0) => t.dims.push(pb.varint()? as i64),
             (1, 2) => {
                 // packed repeated int64 dims
-                let b = pb.bytes();
+                let b = pb.bytes()?;
                 let mut p2 = Pb::new(b);
                 while !p2.eof() {
-                    t.dims.push(p2.varint() as i64);
+                    t.dims.push(p2.varint()? as i64);
                 }
             }
-            (4, 5) => float_data.push(f32::from_le_bytes(pb.fixed32())),
+            (4, 5) => float_data.push(f32::from_le_bytes(pb.fixed32()?)),
             (4, 2) => {
                 // packed repeated float
-                let b = pb.bytes();
+                let b = pb.bytes()?;
                 let mut p2 = Pb::new(b);
                 while !p2.eof() {
-                    float_data.push(f32::from_le_bytes(p2.fixed32()));
+                    float_data.push(f32::from_le_bytes(p2.fixed32()?));
                 }
             }
-            (8, 2) => t.name = String::from_utf8_lossy(pb.bytes()).into_owned(),
-            (9, 2) => raw = Some(pb.bytes().to_vec()),
-            _ => pb.skip(wt),
+            (8, 2) => t.name = String::from_utf8_lossy(pb.bytes()?).into_owned(),
+            (9, 2) => raw = Some(pb.bytes()?.to_vec()),
+            _ => pb.skip(wt)?,
         }
     }
     if let Some(r) = raw {
@@ -246,22 +176,22 @@ fn parse_tensor(buf: &[u8]) -> OnnxTensor {
     } else {
         t.floats = float_data;
     }
-    t
+    Ok(t)
 }
 
-fn parse_onnx(data: &[u8]) -> OnnxGraph {
+fn parse_onnx(data: &[u8]) -> Result<OnnxGraph, OnnxError> {
     // ModelProto: graph=7 (GraphProto)
     let mut pb = Pb::new(data);
     let mut graph_bytes: Option<&[u8]> = None;
     while !pb.eof() {
-        let (fn_, wt) = pb.tag();
+        let (fn_, wt) = pb.tag()?;
         if fn_ == 7 && wt == 2 {
-            graph_bytes = Some(pb.bytes());
+            graph_bytes = Some(pb.bytes()?);
         } else {
-            pb.skip(wt);
+            pb.skip(wt)?;
         }
     }
-    let gb = graph_bytes.expect("no graph in ONNX");
+    let gb = graph_bytes.ok_or(OnnxError::NoGraph)?;
     // GraphProto: node=1(NodeProto), initializer=5(TensorProto),
     //             input=11(ValueInfoProto), output=12(ValueInfoProto)
     let mut pb = Pb::new(gb);
@@ -270,24 +200,62 @@ fn parse_onnx(data: &[u8]) -> OnnxGraph {
     let mut graph_inputs = vec![];
     let mut graph_outputs = vec![];
     while !pb.eof() {
-        let (fn_, wt) = pb.tag();
+        let (fn_, wt) = pb.tag()?;
         match (fn_, wt) {
-            (1, 2) => nodes.push(parse_node(pb.bytes())),
+            (1, 2) => nodes.push(parse_node(pb.bytes()?)?),
             (5, 2) => {
-                let t = parse_tensor(pb.bytes());
+                let t = parse_tensor(pb.bytes()?)?;
                 inits.insert(t.name.clone(), t);
             }
-            (11, 2) => graph_inputs.push(parse_value_info_name(pb.bytes())),
-            (12, 2) => graph_outputs.push(parse_value_info_name(pb.bytes())),
-            _ => pb.skip(wt),
+            (11, 2) => graph_inputs.push(parse_value_info_name(pb.bytes()?)?),
+            (12, 2) => graph_outputs.push(parse_value_info_name(pb.bytes()?)?),
+            _ => pb.skip(wt)?,
         }
     }
-    OnnxGraph {
+    Ok(OnnxGraph {
         nodes,
         inits,
         graph_inputs,
         graph_outputs,
+    })
+}
+
+/// Why an `.onnx` model could not be decoded.
+#[derive(Debug)]
+enum OnnxError {
+    /// The protobuf encoding itself is malformed (truncated, overlong, ...).
+    Wire(WireError),
+    /// The ModelProto carries no `graph` field.
+    NoGraph,
+}
+
+impl From<WireError> for OnnxError {
+    fn from(e: WireError) -> Self {
+        Self::Wire(e)
     }
+}
+
+impl std::fmt::Display for OnnxError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Wire(e) => write!(f, "malformed ONNX protobuf: {e}"),
+            Self::NoGraph => f.write_str("no graph in ONNX"),
+        }
+    }
+}
+
+/// Read and decode an `.onnx` file, or report why not and exit with status 2
+/// (the usage/input-error status). A malformed model used to panic inside the
+/// protobuf reader; it is now a diagnostic.
+fn load_onnx_or_exit(path: &str) -> OnnxGraph {
+    let data = std::fs::read(path).unwrap_or_else(|e| {
+        eprintln!("certify_onnx: cannot read {path}: {e}");
+        std::process::exit(2);
+    });
+    parse_onnx(&data).unwrap_or_else(|e| {
+        eprintln!("certify_onnx: {path}: {e}");
+        std::process::exit(2);
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -308,23 +276,123 @@ struct AffineLayer {
     b: Vec<Rat>,      // [out]
 }
 
+/// A loaded network: hidden layers (each followed by ReLU) and a linear
+/// read-out. The read-out is its own field rather than the last element of one
+/// `Vec`, so "every loaded net has a read-out" is a fact of the type and no
+/// caller computes `layers.len() - 1`.
 struct LoadedNet {
-    layers: Vec<AffineLayer>, // each followed by ReLU except the last (linear read-out)
+    hidden: Vec<AffineLayer>,
+    readout: AffineLayer,
     input_dim: usize,
+}
+
+impl LoadedNet {
+    /// Every affine layer in order: the hidden layers, then the read-out.
+    fn layers(&self) -> impl Iterator<Item = &AffineLayer> {
+        self.hidden.iter().chain(std::iter::once(&self.readout))
+    }
+}
+
+/// Longest vector this binary allocates for one layer, input box or output:
+/// 2^23 entries (32 MiB of `Rat` ids, 64 MiB of `f64`, 192 MiB for the row
+/// table of a 2^23-row matrix). Model dims are untrusted input; past this
+/// bound the loaders and the bound passes fail closed (`width_unsupported`)
+/// instead of asking the allocator for an input-chosen size. It sits as high
+/// as the verified lane's per-allocation bound (under 2^28 bytes) allows, far
+/// above the supported networks (ACAS Xu: 50 wide, cersyve: < 100) and above
+/// a 3x1024x1024 image input (3.1M), which an earlier 2^20 cap refused.
+const MAX_LAYER_WIDTH: usize = 1 << 23;
+
+/// Most entries in one matrix whose SHAPE the model chooses without backing
+/// it with data: identity read-outs, DAG basis identities and pass-through
+/// blocks, Gemm results over a basis. 2^26 entries (256 MiB of `Rat` ids,
+/// e.g. an 8192 x 8192 identity). A per-dimension bound alone is not enough:
+/// a 62-byte model declaring a `[2^20, 0]` Gemm asked for a 2^20 x 2^20
+/// identity (2^40 entries). Weight matrices (`rat_mat`) share the bound: a
+/// single layer of more than 2^26 weights (a 256 MiB f32 tensor) is refused.
+const MAX_MATRIX_ENTRIES: usize = 1 << 26;
+
+/// Fail closed on a width past [`MAX_LAYER_WIDTH`]: a diagnostic and exit
+/// status 2 (the same status as a malformed model), not an allocation of an
+/// input-chosen size.
+fn width_unsupported(n: usize) -> ! {
+    eprintln!("MODEL_UNSUPPORTED: vector width {n} exceeds MAX_LAYER_WIDTH ({MAX_LAYER_WIDTH})");
+    std::process::exit(2);
+}
+
+/// `n` zeros; fails closed past `MAX_LAYER_WIDTH`.
+fn zeros_f64(n: usize) -> Vec<f64> {
+    if n > MAX_LAYER_WIDTH {
+        width_unsupported(n);
+    }
+    vec![0.0; n]
+}
+
+/// `n` exact zeros; fails closed past `MAX_LAYER_WIDTH`.
+fn zeros_rat(n: usize) -> Vec<Rat> {
+    if n > MAX_LAYER_WIDTH {
+        width_unsupported(n);
+    }
+    vec![Rat::ZERO; n]
+}
+
+/// Fail closed on a matrix shape past [`MAX_MATRIX_ENTRIES`]: a diagnostic
+/// and exit status 2, not an allocation of an input-chosen size.
+fn matrix_unsupported(rows: usize, cols: usize) -> ! {
+    eprintln!(
+        "MODEL_UNSUPPORTED: matrix {rows}x{cols} exceeds MAX_MATRIX_ENTRIES ({MAX_MATRIX_ENTRIES})"
+    );
+    std::process::exit(2);
+}
+
+/// `n` `false` flags; fails closed past `MAX_LAYER_WIDTH`.
+fn falses(n: usize) -> Vec<bool> {
+    if n > MAX_LAYER_WIDTH {
+        width_unsupported(n);
+    }
+    vec![false; n]
+}
+
+/// A `rows x cols` exact zero matrix; fails closed when `rows * cols` is past
+/// `MAX_MATRIX_ENTRIES` (or `rows` past `MAX_LAYER_WIDTH`, for `cols == 0`).
+fn zero_rat_matrix(rows: usize, cols: usize) -> Vec<Vec<Rat>> {
+    let within = rows
+        .checked_mul(cols)
+        .is_some_and(|entries| entries <= MAX_MATRIX_ENTRIES);
+    if !within || rows > MAX_LAYER_WIDTH {
+        matrix_unsupported(rows, cols);
+    }
+    if rows == 0 {
+        return Vec::new();
+    }
+    vec![zeros_rat(cols); rows]
 }
 
 fn rat_mat(t: &OnnxTensor, rows: usize, cols: usize) -> Result<Vec<Vec<Rat>>, RatError> {
     // ONNX MatMul stores W as [in, out] row-major (in*out). We want [out][in].
+    // `rows`/`cols` come from the model's (untrusted) dims: an overflowing
+    // product is a size mismatch, not an arithmetic-overflow panic.
     assert_eq!(
-        t.floats.len(),
-        rows * cols,
+        Some(t.floats.len()),
+        rows.checked_mul(cols),
         "matrix size mismatch for {}",
         t.name
     );
-    let mut out = vec![vec![Rat::ZERO; rows]; cols]; // [out=cols][in=rows]
-    for r in 0..rows {
-        for c in 0..cols {
-            out[c][r] = f32_to_rat(t.floats[r * cols + c])?;
+    // Convert in the stored (row-major) order, so the first bad weight is the
+    // one reported, then transpose: column `c` of the stored matrix is every
+    // `cols`-th entry starting at `c`. No index arithmetic.
+    let flat: Vec<Rat> = t
+        .floats
+        .iter()
+        .map(|&f| f32_to_rat(f))
+        .collect::<Result<_, _>>()?;
+    if cols == 0 {
+        return Ok(Vec::new()); // [out=0][in=rows]: no columns
+    }
+    let mut out = zero_rat_matrix(cols, rows); // [out=cols][in=rows]
+    for (c, col) in out.iter_mut().enumerate() {
+        for (slot, v) in col.iter_mut().zip(flat.iter().skip(c).step_by(cols)) {
+            *slot = *v;
         }
     }
     Ok(out)
@@ -460,31 +528,38 @@ fn load_net(g: &OnnxGraph) -> LoadedNet {
             }
             "Relu" => {
                 let w = cur_w.take().expect("relu without matmul");
-                let b = cur_b.take().unwrap_or_else(|| vec![Rat::ZERO; w.len()]);
+                // A zero bias with one entry per output row of `w`.
+                let b = cur_b.take().unwrap_or_else(|| zeros_rat(w.len()));
                 layers.push(AffineLayer { w, b });
             }
             other => panic!("unsupported op {other}"),
         }
     }
     // Final linear read-out (the last MatMul+Add not followed by Relu).
-    if let Some(w) = cur_w.take() {
-        let b = cur_b.take().unwrap_or_else(|| vec![Rat::ZERO; w.len()]);
-        layers.push(AffineLayer { w, b });
+    let readout = if let Some(w) = cur_w.take() {
+        let b = cur_b.take().unwrap_or_else(|| zeros_rat(w.len()));
+        AffineLayer { w, b }
     } else {
         // The network ENDS in a ReLU (the last hidden layer is the output, e.g.
         // y = ReLU(W x)).  DeepReluProblem requires a linear read-out after the
         // last ReLU, so synthesize an identity read-out  y = a_last.
         let last_width = layers.last().expect("no layers at all").w.len();
-        let mut w = vec![vec![Rat::ZERO; last_width]; last_width];
-        for d in 0..last_width {
-            w[d][d] = Rat::ONE;
+        let mut w = zero_rat_matrix(last_width, last_width);
+        for (d, row) in w.iter_mut().enumerate() {
+            if let Some(diag) = row.get_mut(d) {
+                *diag = Rat::ONE; // square: `d < last_width` always
+            }
         }
-        layers.push(AffineLayer {
+        AffineLayer {
             w,
-            b: vec![Rat::ZERO; last_width],
-        });
+            b: zeros_rat(last_width),
+        }
+    };
+    LoadedNet {
+        hidden: layers,
+        readout,
+        input_dim,
     }
-    LoadedNet { layers, input_dim }
 }
 
 // ---------------------------------------------------------------------------
@@ -523,16 +598,21 @@ impl Aff {
     }
 
     /// Identity expression `v_basis` (width `dim`).
+    /// `dim` is the model's (untrusted) Gemm input width or an existing ReLU
+    /// width; past `MAX_MATRIX_ENTRIES` (`dim * dim`) this fails closed before
+    /// allocating.
     fn identity(basis: usize, dim: usize) -> Aff {
-        let mut m = vec![vec![Rat::ZERO; dim]; dim];
+        let mut m = zero_rat_matrix(dim, dim);
         for (d, row) in m.iter_mut().enumerate() {
-            row[d] = Rat::ONE;
+            if let Some(diag) = row.get_mut(d) {
+                *diag = Rat::ONE; // square: `d < dim` always
+            }
         }
         let mut terms = BTreeMap::new();
         terms.insert(basis, m);
         Aff {
             terms,
-            cst: vec![Rat::ZERO; dim],
+            cst: zeros_rat(dim),
         }
     }
 
@@ -568,39 +648,54 @@ impl DagNet {
 /// row-major, i.e. ONNX Gemm with transB=0): exact rational algebra.
 fn gemm_apply(a: &Aff, wfloats: &[f32], kin: usize, kout: usize, bias: &[Rat]) -> Aff {
     assert_eq!(a.rows(), kin, "Gemm inner dimension mismatch");
-    assert_eq!(wfloats.len(), kin * kout, "Gemm weight size mismatch");
+    assert_eq!(
+        Some(wfloats.len()),
+        kin.checked_mul(kout),
+        "Gemm weight size mismatch"
+    );
     assert_eq!(bias.len(), kout, "Gemm bias size mismatch");
-    let w: Vec<Vec<Rat>> = (0..kin)
-        .map(|i| {
-            (0..kout)
-                .map(|o| f32_to_rat(wfloats[i * kout + o]).expect("gemm weight"))
-                .collect()
-        })
+    if kout == 0 {
+        // No output rows: every term matrix is empty and `prune` drops it.
+        return Aff {
+            terms: BTreeMap::new(),
+            cst: Vec::new(),
+        };
+    }
+    // Exact weights in stored row-major order (row `i` = input `i`, `kout`
+    // entries); conversion order, and so the first bad weight, is unchanged.
+    let w: Vec<Rat> = wfloats
+        .iter()
+        .map(|&f| f32_to_rat(f).expect("gemm weight"))
         .collect();
     let mut terms = BTreeMap::new();
     for (b, m) in &a.terms {
         let bw = m.first().map_or(0, Vec::len);
-        let mut out = vec![vec![Rat::ZERO; bw]; kout];
-        for i in 0..kin {
-            for (o, orow) in out.iter_mut().enumerate() {
-                let wio = w[i][o];
+        // Every term matrix of `a` is `[a.rows()][bw]` by construction.
+        assert!(
+            m.len() == kin && m.iter().all(|r| r.len() == bw),
+            "Gemm operand term for basis {b} is not [{kin}][{bw}]"
+        );
+        let mut out = zero_rat_matrix(kout, bw);
+        // `w_i` is weight row `i`, `m_i` the operand's row `i`; `chunks_exact`
+        // (kout >= 1 here) yields exactly `kin` rows.
+        for (w_i, m_i) in w.chunks_exact(kout).zip(m) {
+            for (orow, &wio) in out.iter_mut().zip(w_i) {
                 if wio.is_zero() {
                     continue;
                 }
-                for (c, slot) in orow.iter_mut().enumerate() {
-                    *slot = slot.add(wio.mul(m[i][c]).unwrap()).unwrap();
+                for (slot, &mc) in orow.iter_mut().zip(m_i) {
+                    *slot = slot.add(wio.mul(mc).unwrap()).unwrap();
                 }
             }
         }
         terms.insert(*b, out);
     }
-    let mut cst = vec![Rat::ZERO; kout];
-    for (o, slot) in cst.iter_mut().enumerate() {
-        let mut acc = bias[o];
-        for i in 0..kin {
-            acc = acc.add(w[i][o].mul(a.cst[i]).unwrap()).unwrap();
+    // cst[o] = bias[o] + sum_i w[i][o] * a.cst[i], summed in increasing `i`.
+    let mut cst = bias.to_vec();
+    for (w_i, &ci) in w.chunks_exact(kout).zip(&a.cst) {
+        for (slot, &wio) in cst.iter_mut().zip(w_i) {
+            *slot = slot.add(wio.mul(ci).unwrap()).unwrap();
         }
-        *slot = acc;
     }
     Aff { terms, cst }.prune()
 }
@@ -822,7 +917,18 @@ fn flatten_dag(dag: &DagNet, root_lo: &[Rat]) -> LoadedNet {
                 .sum()
         }
     };
+    // Rows `row0 .. row0 + aff.rows()` of `w`/`bv` receive `aff`; a term over
+    // basis `b` lands in the column block where layer `src` carries `b`.
+    // Iterators over those blocks, not `row0 + u` / `col0 + c` indexing; the
+    // block bounds the indexing used to enforce are asserted up front, so a
+    // layout bug still fails closed instead of being truncated.
     let emit_aff = |aff: &Aff, src: usize, w: &mut [Vec<Rat>], bv: &mut [Rat], row0: usize| {
+        let nrows = aff.rows();
+        assert!(
+            w.len() == bv.len() && row0.checked_add(nrows).is_some_and(|end| end <= w.len()),
+            "affine block rows {row0}+{nrows} exceed the layer's {} rows",
+            w.len()
+        );
         for (b, m) in &aff.terms {
             let (col0, shift_const) = if src == 0 {
                 assert_eq!(*b, 0, "level-1 preact reads a ReLU var — level bug");
@@ -838,29 +944,45 @@ fn flatten_dag(dag: &DagNet, root_lo: &[Rat]) -> LoadedNet {
                     .unwrap_or_else(|| panic!("basis {b} not carried at layer {src}"));
                 (c, false)
             };
-            for (u, mrow) in m.iter().enumerate() {
-                for (c, v) in mrow.iter().enumerate() {
-                    if v.is_zero() {
-                        continue;
+            assert!(
+                m.len() <= nrows,
+                "term for basis {b} has more rows than the expression"
+            );
+            for ((wrow, bslot), mrow) in w.iter_mut().zip(bv.iter_mut()).skip(row0).zip(m) {
+                assert!(
+                    col0.checked_add(mrow.len())
+                        .is_some_and(|end| end <= wrow.len()),
+                    "basis {b} columns {col0}+{} exceed the layer width {}",
+                    mrow.len(),
+                    wrow.len()
+                );
+                for (slot, v) in wrow.iter_mut().skip(col0).zip(mrow) {
+                    if !v.is_zero() {
+                        *slot = slot.add(*v).unwrap();
                     }
-                    w[row0 + u][col0 + c] = w[row0 + u][col0 + c].add(*v).unwrap();
-                    if shift_const {
-                        // carried value is x_c - root_lo[c]; add back v * root_lo[c].
-                        bv[row0 + u] = bv[row0 + u].add(v.mul(root_lo[c]).unwrap()).unwrap();
+                }
+                if shift_const {
+                    // carried value is x_c - root_lo[c]; add back v * root_lo[c]
+                    // (same terms, same increasing-`c` order).
+                    assert!(mrow.len() <= root_lo.len(), "input term wider than root_lo");
+                    for (v, lo_c) in mrow.iter().zip(root_lo) {
+                        if !v.is_zero() {
+                            *bslot = bslot.add(v.mul(*lo_c).unwrap()).unwrap();
+                        }
                     }
                 }
             }
         }
-        for (u, v) in aff.cst.iter().enumerate() {
-            bv[row0 + u] = bv[row0 + u].add(*v).unwrap();
+        for (bslot, v) in bv.iter_mut().skip(row0).zip(&aff.cst) {
+            *bslot = bslot.add(*v).unwrap();
         }
     };
     let mut layers: Vec<AffineLayer> = vec![];
     for lvl in 1..=depth {
         let rows = width_of_layer(lvl);
         let prev = width_of_layer(lvl - 1);
-        let mut w = vec![vec![Rat::ZERO; prev]; rows];
-        let mut bv = vec![Rat::ZERO; rows];
+        let mut w = zero_rat_matrix(rows, prev);
+        let mut bv = zeros_rat(rows);
         let mut row = 0usize;
         for unit in &layer_units[lvl] {
             match unit {
@@ -899,12 +1021,12 @@ fn flatten_dag(dag: &DagNet, root_lo: &[Rat]) -> LoadedNet {
     // Linear read-out from layer `depth`.
     let out_dim = dag.output.rows();
     let prev = width_of_layer(depth);
-    let mut w = vec![vec![Rat::ZERO; prev]; out_dim];
-    let mut bv = vec![Rat::ZERO; out_dim];
+    let mut w = zero_rat_matrix(out_dim, prev);
+    let mut bv = zeros_rat(out_dim);
     emit_aff(&dag.output, depth, &mut w, &mut bv, 0);
-    layers.push(AffineLayer { w, b: bv });
     LoadedNet {
-        layers,
+        hidden: layers,
+        readout: AffineLayer { w, b: bv },
         input_dim: dag.input_dim,
     }
 }
@@ -913,11 +1035,19 @@ fn flatten_dag(dag: &DagNet, root_lo: &[Rat]) -> LoadedNet {
 fn eval_aff_at(aff: &Aff, basis: &[Vec<Rat>]) -> Vec<Rat> {
     let mut out = aff.cst.clone();
     for (b, m) in &aff.terms {
-        let v = &basis[*b];
-        for (u, row) in m.iter().enumerate() {
-            for (c, coef) in row.iter().enumerate() {
+        let Some(v) = basis.get(*b) else {
+            panic!("basis var {b} read before it is evaluated");
+        };
+        // `[rows][width(b)]` against `v` of `width(b)`: the shape the old
+        // `out[u]`/`v[c]` indexing enforced, checked once.
+        assert!(
+            m.len() <= out.len() && m.iter().all(|row| row.len() <= v.len()),
+            "term for basis {b} does not match the expression/basis widths"
+        );
+        for (slot, row) in out.iter_mut().zip(m) {
+            for (coef, vc) in row.iter().zip(v) {
                 if !coef.is_zero() {
-                    out[u] = out[u].add(coef.mul(v[c]).unwrap()).unwrap();
+                    *slot = slot.add(coef.mul(*vc).unwrap()).unwrap();
                 }
             }
         }
@@ -942,10 +1072,9 @@ fn dag_eval_exact(dag: &DagNet, x: &[Rat]) -> Vec<Rat> {
 /// Exact forward evaluation of a flattened `LoadedNet` (vector output).
 fn loaded_eval_vec(net: &LoadedNet, x: &[Rat]) -> Vec<Rat> {
     assert_eq!(x.len(), net.input_dim);
-    let k = net.layers.len() - 1;
     let mut act: Vec<Rat> = x.to_vec();
-    for layer in &net.layers[..k] {
-        let mut next = Vec::with_capacity(layer.w.len());
+    for layer in &net.hidden {
+        let mut next = Vec::new();
         for (row, b) in layer.w.iter().zip(&layer.b) {
             let mut z = *b;
             for (wv, a) in row.iter().zip(&act) {
@@ -955,7 +1084,7 @@ fn loaded_eval_vec(net: &LoadedNet, x: &[Rat]) -> Vec<Rat> {
         }
         act = next;
     }
-    let last = &net.layers[k];
+    let last = &net.readout;
     last.w
         .iter()
         .zip(&last.b)
@@ -988,13 +1117,27 @@ fn f32_forward(g: &OnnxGraph, x: &[f32]) -> Vec<f32> {
                 let c = &g.inits[&node.inputs[2]];
                 let (kin, kout) = (w.dims[0] as usize, w.dims[1] as usize);
                 assert_eq!(a.len(), kin);
+                // The shape `load_dag` already enforces on this graph; checked
+                // here too so the column walk below reads exactly `kin` weights.
+                assert_eq!(
+                    Some(w.floats.len()),
+                    kin.checked_mul(kout),
+                    "Gemm weight size mismatch"
+                );
+                assert_eq!(c.floats.len(), kout, "Gemm C length != output width");
                 let mut y = c.floats.clone();
-                for (o, slot) in y.iter_mut().enumerate() {
-                    let mut acc = 0.0f32;
-                    for (i, ai) in a.iter().enumerate() {
-                        acc += ai * w.floats[i * kout + o];
+                // `kout == 0` leaves `y` empty: nothing to accumulate.
+                if kout > 0 {
+                    for (o, slot) in y.iter_mut().enumerate() {
+                        // Column `o` of the row-major `[kin][kout]` weights is
+                        // every `kout`-th entry from `o`; summed in increasing
+                        // `i`, the natural order.
+                        let mut acc = 0.0f32;
+                        for (ai, wio) in a.iter().zip(w.floats.iter().skip(o).step_by(kout)) {
+                            acc += ai * wio;
+                        }
+                        *slot += acc;
                     }
-                    *slot += acc;
                 }
                 y
             }
@@ -1093,6 +1236,44 @@ fn var_index(v: &str) -> Option<usize> {
     v.get(2..).and_then(|s| s.parse::<usize>().ok())
 }
 
+/// Input arity of a VNNLIB property: one more than the largest `X_i` index.
+///
+/// The index is untrusted text, so this fails closed instead of computing
+/// `i + 1` (which overflowed for `X_18446744073709551615`) and then sizing the
+/// box vectors by it (`X_100000000000` asked for a 10^11-element allocation).
+/// A complete box needs a lower and an upper bound atom for every coordinate,
+/// so a property whose arity exceeds its number of `X` atoms is incomplete
+/// whatever else it says; rejecting it here keeps every complete property
+/// accepted and bounds the box allocation by the size of the input file.
+fn vnnlib_input_dim(atoms: &[VnnAtom]) -> Result<usize, String> {
+    let mut n_x = 0usize;
+    let mut max_idx: Option<usize> = None;
+    for a in atoms.iter().filter(|a| a.var.starts_with("X_")) {
+        n_x = n_x.saturating_add(1);
+        if let Some(i) = var_index(&a.var) {
+            max_idx = Some(max_idx.map_or(i, |m| m.max(i)));
+        }
+    }
+    let max_idx = max_idx.ok_or_else(|| "vnnlib has no X_i atoms".to_string())?;
+    // `checked_add` is the real overflow case (`X_<usize::MAX>`); the filter is
+    // the completeness bound. Either failure is the same out-of-range error.
+    let dim = max_idx
+        .checked_add(1)
+        .filter(|&dim| dim <= n_x)
+        .ok_or_else(|| {
+            format!(
+                "input index X_{max_idx} is out of range: only {n_x} X bound atoms, so the box cannot be complete"
+            )
+        })?;
+    // The box is a layer input: the same width bound as every loaded layer.
+    if dim > MAX_LAYER_WIDTH {
+        return Err(format!(
+            "input dimension {dim} exceeds MAX_LAYER_WIDTH ({MAX_LAYER_WIDTH})"
+        ));
+    }
+    Ok(dim)
+}
+
 /// Parse a decimal literal into an exact Rat (lossless: decimals are n/10^k).
 fn decimal_to_rat(s: &str) -> Result<Rat, RatError> {
     let neg = s.starts_with('-');
@@ -1113,6 +1294,68 @@ fn decimal_to_rat(s: &str) -> Result<Rat, RatError> {
     Rat::from_bigints(n, den)
 }
 
+/// ReLU envelope parameters `(p, q, r, t)` on a pre-activation box `[l, u]`:
+/// lower envelope `a >= p*z + q`, upper envelope `a <= r*z + t`. Stable active
+/// `a = z`; stable inactive `a = 0`; unstable: lower `a >= alpha*z` (alpha
+/// adaptive), upper `a <= s*(z - l)` with `s = u/(u - l)`. Matches crown_deep.
+fn relu_env(l: f64, u: f64) -> (f64, f64, f64, f64) {
+    if l >= 0.0 {
+        (1.0, 0.0, 1.0, 0.0)
+    } else if u <= 0.0 {
+        (0.0, 0.0, 0.0, 0.0)
+    } else {
+        let s = u / (u - l);
+        let alpha = if u >= -l { 1.0 } else { 0.0 };
+        (alpha, 0.0, s, s * (-l))
+    }
+}
+
+/// Width of the vector feeding layer `li` of an f64 net: the input width `n`
+/// for layer 0, else the width of layer `li - 1`.
+fn in_width_f64(weights: &[Vec<Vec<f64>>], li: usize, n: usize) -> usize {
+    li.checked_sub(1)
+        .and_then(|p| weights.get(p))
+        .map_or(n, Vec::len)
+}
+
+/// Fail closed unless `(weights, biases, lo, hi)` is a well-formed f64 net
+/// over an `n = lo.len()`-dimensional box: one bias per unit, every weight row
+/// exactly as wide as the layer below, `hi` as wide as `lo`. The f64 passes
+/// below walk these shapes with zipped iterators; this check keeps a malformed
+/// net a panic (as the index arithmetic it replaces made it) instead of a
+/// silently truncated sum. The loaders only ever build well-formed nets.
+fn assert_f64_net_shapes(weights: &[Vec<Vec<f64>>], biases: &[Vec<f64>], lo: &[f64], hi: &[f64]) {
+    assert_eq!(lo.len(), hi.len(), "f64 net: box lo/hi widths differ");
+    assert_eq!(
+        weights.len(),
+        biases.len(),
+        "f64 net: one bias vector per layer"
+    );
+    let mut prev = lo.len();
+    for (li, (w, b)) in weights.iter().zip(biases).enumerate() {
+        assert_eq!(b.len(), w.len(), "f64 net layer {li}: bias length != width");
+        assert!(
+            w.iter().all(|row| row.len() == prev),
+            "f64 net layer {li}: a weight row is not {prev} wide"
+        );
+        prev = w.len();
+    }
+}
+
+/// Contribution of the input box to a bound with coefficients `a_coeff` on the
+/// inputs: each coefficient takes the box end that minimises (`want_lower`) or
+/// maximises its term.
+fn input_box_term(a_coeff: &[f64], lo: &[f64], hi: &[f64], want_lower: bool, mut acc: f64) -> f64 {
+    for ((&d, &l), &h) in a_coeff.iter().zip(lo).zip(hi) {
+        if d > 0.0 {
+            acc += d * if want_lower { l } else { h };
+        } else if d < 0.0 {
+            acc += d * if want_lower { h } else { l };
+        }
+    }
+    acc
+}
+
 /// CROWN backward bound (f64) of a linear functional over hidden layer `up_to`'s
 /// pre-activations: given a coefficient vector `coeff` on z^(up_to) plus a const,
 /// substitute back through the ReLU envelopes (using already-computed preact
@@ -1122,7 +1365,9 @@ fn decimal_to_rat(s: &str) -> Result<Rat, RatError> {
 /// This is the standard "CROWN for intermediate bounds": far tighter than IBP on
 /// deep nets, and it stays SOUND because every envelope it uses is a valid
 /// over/under-approximation of ReLU on the (valid) preact box.
-#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+///
+/// Callers validate the net with [`assert_f64_net_shapes`] first.
+#[allow(clippy::too_many_arguments)]
 fn crown_bound_z(
     weights: &[Vec<Vec<f64>>],
     biases: &[Vec<f64>],
@@ -1140,53 +1385,45 @@ fn crown_bound_z(
     // z^(up_to) = W^(up_to) a^(up_to-1) + b^(up_to). Replace z by affine in a^(L-1):
     // accumulate into a_coeff on a^(up_to-1), then walk down through envelopes.
     let li0 = up_to; // 0-indexed layer producing z^(up_to)
+    let (Some(w_top), Some(b_top)) = (weights.get(li0), biases.get(li0)) else {
+        panic!("crown_bound_z: layer {li0} out of range");
+    };
+    assert_eq!(
+        z_coeff0.len(),
+        w_top.len(),
+        "crown_bound_z: coefficient width"
+    );
+    assert!(
+        pre_lo.len() >= li0 && pre_hi.len() >= li0,
+        "crown_bound_z: preact bounds missing below layer {li0}"
+    );
     let mut const_acc = const0;
     // First eliminate z^(li0) through its affine layer to get coeff on a^(li0-1)
     // (or inputs if li0==0).
-    let prev_dim = if li0 == 0 { n } else { weights[li0 - 1].len() };
-    let mut a_coeff = vec![0.0f64; prev_dim];
-    for j in 0..weights[li0].len() {
-        let c = z_coeff0[j];
+    let mut a_coeff = zeros_f64(in_width_f64(weights, li0, n));
+    for ((&c, row), &bj) in z_coeff0.iter().zip(w_top).zip(b_top) {
         if c == 0.0 {
             continue;
         }
-        let row = &weights[li0][j];
-        for (i, &wji) in row.iter().enumerate() {
-            a_coeff[i] += c * wji;
+        for (acc, &wji) in a_coeff.iter_mut().zip(row) {
+            *acc += c * wji;
         }
-        const_acc += c * biases[li0][j];
+        const_acc += c * bj;
     }
     // Now walk layers li from li0-1 down to 0: a^(li) -> envelope -> z^(li) -> affine.
-    if li0 == 0 {
-        // a_coeff is already on inputs.
-        for i in 0..n {
-            let d = a_coeff[i];
-            if d > 0.0 {
-                const_acc += d * if want_lower { lo[i] } else { hi[i] };
-            } else if d < 0.0 {
-                const_acc += d * if want_lower { hi[i] } else { lo[i] };
-            }
-        }
-        return const_acc;
-    }
-    for li in (0..li0).rev() {
-        let width = weights[li].len();
+    let below = weights
+        .iter()
+        .zip(biases)
+        .zip(pre_lo.iter().zip(pre_hi))
+        .enumerate()
+        .take(li0);
+    for (li, ((w_li, b_li), (pl, ph))) in below.rev() {
         // a^(li) -> z^(li) via envelope. For lower bound (want_lower) of the whole
         // functional: a term d*a with d>0 uses the LOWER envelope a>=alpha*z; d<0
         // uses the UPPER envelope a<=s(z-l). For upper bound, swap.
-        let mut z_coeff = vec![0.0f64; width];
-        for jj in 0..width {
-            let d = a_coeff[jj];
-            let (l, u) = (pre_lo[li][jj], pre_hi[li][jj]);
-            let (p, q, r, t) = if l >= 0.0 {
-                (1.0, 0.0, 1.0, 0.0)
-            } else if u <= 0.0 {
-                (0.0, 0.0, 0.0, 0.0)
-            } else {
-                let s = u / (u - l);
-                let alpha = if u >= -l { 1.0 } else { 0.0 };
-                (alpha, 0.0, s, s * (-l))
-            };
+        let mut z_coeff = zeros_f64(w_li.len());
+        for (((zc, &d), &l), &u) in z_coeff.iter_mut().zip(&a_coeff).zip(pl).zip(ph) {
+            let (p, q, r, t) = relu_env(l, u);
             // Choose envelope by direction and sign of d.
             // Lower bound of d*a: if d>0 -> a>=p*z+q -> contributes d*(p z + q);
             //                     if d<0 -> a<=r*z+t -> contributes d*(r z + t).
@@ -1194,40 +1431,29 @@ fn crown_bound_z(
             let use_lower_env = (d > 0.0) == want_lower;
             if d != 0.0 {
                 if use_lower_env {
-                    z_coeff[jj] += d * p;
+                    *zc += d * p;
                     const_acc += d * q;
                 } else {
-                    z_coeff[jj] += d * r;
+                    *zc += d * r;
                     const_acc += d * t;
                 }
             }
         }
         // z^(li) -> affine over a^(li-1) (or inputs).
-        let prev = if li == 0 { n } else { weights[li - 1].len() };
-        let mut prev_coeff = vec![0.0f64; prev];
-        for jj in 0..width {
-            let c = z_coeff[jj];
+        let mut prev_coeff = zeros_f64(in_width_f64(weights, li, n));
+        for ((&c, row), &bj) in z_coeff.iter().zip(w_li).zip(b_li) {
             if c == 0.0 {
                 continue;
             }
-            let row = &weights[li][jj];
-            for (i, &wji) in row.iter().enumerate() {
-                prev_coeff[i] += c * wji;
+            for (acc, &wji) in prev_coeff.iter_mut().zip(row) {
+                *acc += c * wji;
             }
-            const_acc += c * biases[li][jj];
+            const_acc += c * bj;
         }
         a_coeff = prev_coeff;
     }
     // a_coeff now on inputs.
-    for i in 0..n {
-        let d = a_coeff[i];
-        if d > 0.0 {
-            const_acc += d * if want_lower { lo[i] } else { hi[i] };
-        } else if d < 0.0 {
-            const_acc += d * if want_lower { hi[i] } else { lo[i] };
-        }
-    }
-    const_acc
+    input_box_term(&a_coeff, lo, hi, want_lower, const_acc)
 }
 
 /// Compute tight per-layer pre-activation bounds via CROWN (not IBP). For each
@@ -1241,39 +1467,42 @@ fn crown_intermediate_bounds_f64(
     lo: &[f64],
     hi: &[f64],
 ) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
-    let k = weights.len();
-    let mut pre_lo: Vec<Vec<f64>> = Vec::with_capacity(k);
-    let mut pre_hi: Vec<Vec<f64>> = Vec::with_capacity(k);
+    assert_f64_net_shapes(weights, biases, lo, hi);
+    let mut pre_lo: Vec<Vec<f64>> = Vec::new();
+    let mut pre_hi: Vec<Vec<f64>> = Vec::new();
     // Running IBP activation bounds — each unit's CROWN bound is INTERSECTED
     // with its IBP bound (both valid; IBP wins exactly where the lower envelope
     // loses the `a >= 0` fact, e.g. passthrough units of a flattened DAG).
     // Mirrors the exact intersection in crown_deep::preact_bounds_crown.
     let mut act_lo: Vec<f64> = lo.to_vec();
     let mut act_hi: Vec<f64> = hi.to_vec();
-    for li in 0..k {
-        let width = weights[li].len();
-        let mut zl = vec![0.0f64; width];
-        let mut zu = vec![0.0f64; width];
-        for j in 0..width {
-            let mut e = vec![0.0f64; width];
-            e[j] = 1.0;
+    for (li, (w_li, b_li)) in weights.iter().zip(biases).enumerate() {
+        let width = w_li.len();
+        let mut zl = zeros_f64(width);
+        let mut zu = zeros_f64(width);
+        let units = w_li.iter().zip(b_li).zip(zl.iter_mut().zip(zu.iter_mut()));
+        for (j, ((row, &bj), (zlj, zuj))) in units.enumerate() {
+            let mut e = zeros_f64(width);
+            if let Some(ej) = e.get_mut(j) {
+                *ej = 1.0; // `j < width`: `j` enumerates this layer's units
+            }
             let cl = crown_bound_z(weights, biases, lo, hi, &pre_lo, &pre_hi, li, &e, 0.0, true);
             let cu = crown_bound_z(
                 weights, biases, lo, hi, &pre_lo, &pre_hi, li, &e, 0.0, false,
             );
-            let mut il = biases[li][j];
-            let mut iu = biases[li][j];
-            for (i, &wji) in weights[li][j].iter().enumerate() {
+            let mut il = bj;
+            let mut iu = bj;
+            for ((&wji, &al), &ah) in row.iter().zip(&act_lo).zip(&act_hi) {
                 if wji >= 0.0 {
-                    il += wji * act_lo[i];
-                    iu += wji * act_hi[i];
+                    il += wji * al;
+                    iu += wji * ah;
                 } else {
-                    il += wji * act_hi[i];
-                    iu += wji * act_lo[i];
+                    il += wji * ah;
+                    iu += wji * al;
                 }
             }
-            zl[j] = cl.max(il);
-            zu[j] = cu.min(iu);
+            *zlj = cl.max(il);
+            *zuj = cu.min(iu);
         }
         act_lo = zl.iter().map(|&v| v.max(0.0)).collect();
         act_hi = zu.iter().map(|&v| v.max(0.0)).collect();
@@ -1290,7 +1519,6 @@ fn crown_intermediate_bounds_f64(
 /// ReLU envelope into z^(k), and bound via `crown_bound_z` at up_to=k-1... but
 /// since out is on a^(k) (the last hidden activation), we fold it: build coeff on
 /// a^(k) then run one envelope step into z^(k)=z^(layer k) and CROWN down.
-#[allow(clippy::needless_range_loop)]
 fn crown_lower_f64_tight(
     weights: &[Vec<Vec<f64>>],
     biases: &[Vec<f64>],
@@ -1299,33 +1527,31 @@ fn crown_lower_f64_tight(
     lo: &[f64],
     hi: &[f64],
 ) -> f64 {
-    let k = weights.len();
     let (pre_lo, pre_hi) = crown_intermediate_bounds_f64(weights, biases, lo, hi);
     // y' = out_bias + Σ out_weight[j] a^(k)_j. a^(k) is ReLU(z^(k)), z^(k)=layer k-1.
     // Fold the read-out (a functional on a^(k)=a^(last hidden)) through the last
     // envelope into z^(k) coeff, then CROWN down from layer (k-1).
-    let last = k - 1;
-    let width = weights[last].len();
-    let mut z_coeff = vec![0.0f64; width];
+    let Some(last) = weights.len().checked_sub(1) else {
+        panic!("crown_lower_f64_tight: the network has no hidden layer");
+    };
+    let (Some(pl), Some(ph)) = (pre_lo.get(last), pre_hi.get(last)) else {
+        panic!("crown_lower_f64_tight: no preact bounds for layer {last}");
+    };
+    assert_eq!(
+        out_weight.len(),
+        pl.len(),
+        "read-out width != last hidden width"
+    );
+    let mut z_coeff = zeros_f64(pl.len());
     let mut const_acc = out_bias;
-    for j in 0..width {
-        let d = out_weight[j];
-        let (l, u) = (pre_lo[last][j], pre_hi[last][j]);
-        let (p, q, r, t) = if l >= 0.0 {
-            (1.0, 0.0, 1.0, 0.0)
-        } else if u <= 0.0 {
-            (0.0, 0.0, 0.0, 0.0)
-        } else {
-            let s = u / (u - l);
-            let alpha = if u >= -l { 1.0 } else { 0.0 };
-            (alpha, 0.0, s, s * (-l))
-        };
+    for (((zc, &d), &l), &u) in z_coeff.iter_mut().zip(out_weight).zip(pl).zip(ph) {
+        let (p, q, r, t) = relu_env(l, u);
         // Lower bound: d>0 uses lower env a>=p z+q; d<0 uses upper env a<=r z+t.
         if d > 0.0 {
-            z_coeff[j] += d * p;
+            *zc += d * p;
             const_acc += d * q;
         } else if d < 0.0 {
-            z_coeff[j] += d * r;
+            *zc += d * r;
             const_acc += d * t;
         }
     }
@@ -1345,19 +1571,47 @@ struct ReluCut2 {
     b: f64, // f64 view; the exact pass recomputes b in rationals (outward).
 }
 
+/// Largest input dimension for which `cut2_box_b_f64` enumerates box corners
+/// (2^20 corners per neuron pair).
+const MAX_CUT2_CORNER_DIM: usize = 20;
+
 /// Box-corner max of relu(z1_i(x)) + relu(z1_j(x)) over the input box (f64).
 /// z1 is affine in the input, so relu(z1) is convex => the sum's max over the
 /// box is attained at a corner. We enumerate corners exactly (input_dim small).
+///
+/// Corner enumeration is `2^n`; past [`MAX_CUT2_CORNER_DIM`] inputs it is not
+/// attempted and the bound is `+inf`, which `discover_cuts2` never emits as a
+/// cut (a cut is an optional tightening, so omitting it keeps the bound
+/// sound). The old unguarded `1u32 << n` panicked for an input dimension of 32
+/// or more and ran for 2^n iterations below that.
 fn cut2_box_b_f64(w1: &[Vec<f64>], b1: &[f64], lo: &[f64], hi: &[f64], i: usize, j: usize) -> f64 {
     let n = lo.len();
+    if n > MAX_CUT2_CORNER_DIM {
+        return f64::INFINITY;
+    }
+    let (Some(&bi), Some(&bj), Some(wi), Some(wj)) = (b1.get(i), b1.get(j), w1.get(i), w1.get(j))
+    else {
+        panic!(
+            "cut2: neuron pair ({i}, {j}) out of range for a first layer of width {}",
+            w1.len()
+        );
+    };
+    assert!(
+        hi.len() >= n && wi.len() >= n && wj.len() >= n,
+        "cut2: box/weight rows narrower than the {n}-dimensional input"
+    );
     let mut best = f64::NEG_INFINITY;
     for mask in 0u32..(1u32 << n) {
-        let mut zi = b1[i];
-        let mut zj = b1[j];
-        for d in 0..n {
-            let x = if mask & (1 << d) != 0 { hi[d] } else { lo[d] };
-            zi += w1[i][d] * x;
-            zj += w1[j][d] * x;
+        let mut zi = bi;
+        let mut zj = bj;
+        // Bit `d` of `mask` picks hi[d] (set) or lo[d] (clear); `bits` walks
+        // the bits from the lowest, one input coordinate per step.
+        let mut bits = mask;
+        for (((&l, &h), &wid), &wjd) in lo.iter().zip(hi).zip(wi).zip(wj) {
+            let x = if bits & 1 != 0 { h } else { l };
+            bits >>= 1;
+            zi += wid * x;
+            zj += wjd * x;
         }
         let v = zi.max(0.0) + zj.max(0.0);
         if v > best {
@@ -1382,25 +1636,32 @@ fn discover_cuts2(
     max_cuts: usize,
 ) -> Vec<ReluCut2> {
     let width = w1.len();
-    let mut unstable: Vec<usize> = Vec::new();
-    for j in 0..width {
-        if pre_lo1[j] < 0.0 && pre_hi1[j] > 0.0 {
-            unstable.push(j);
+    assert!(
+        pre_lo1.len() >= width && pre_hi1.len() >= width,
+        "discover_cuts2: preact bounds narrower than the first layer"
+    );
+    // Unstable first-layer units, with their preact upper bound u.
+    let mut unstable: Vec<(usize, f64)> = Vec::new();
+    for (j, ((_, &l), &u)) in w1.iter().zip(pre_lo1).zip(pre_hi1).enumerate() {
+        if l < 0.0 && u > 0.0 {
+            unstable.push((j, u));
         }
     }
     // Score every unstable pair by the slack = (u_i + u_j) - b  (>0 means coupling
-    // genuinely tightens the joint relu sum below the independent max).
+    // genuinely tightens the joint relu sum below the independent max). Pairs
+    // are visited as (first, each later one), the first walking forward.
     let mut scored: Vec<(f64, usize, usize, f64)> = Vec::new();
-    for a in 0..unstable.len() {
-        for bb in (a + 1)..unstable.len() {
-            let (i, j) = (unstable[a], unstable[bb]);
+    let mut rest = unstable.as_slice();
+    while let Some((&(i, ui), later)) = rest.split_first() {
+        for &(j, uj) in later {
             let b = cut2_box_b_f64(w1, b1, lo, hi, i, j);
-            let indep = pre_hi1[i].max(0.0) + pre_hi1[j].max(0.0);
+            let indep = ui.max(0.0) + uj.max(0.0);
             let slack = indep - b;
             if slack > 1e-12 {
                 scored.push((slack, i, j, b));
             }
         }
+        rest = later;
     }
     scored.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap());
     scored.truncate(max_cuts);
@@ -1416,7 +1677,7 @@ fn discover_cuts2(
 /// known—each cut (a_i + a_j <= b) is applied with multiplier μ = min(|c_i|,|c_j|)
 /// over the SAME-sign (both contributing via the UPPER envelope) pair, replacing
 /// μ units of each per-neuron envelope by the joint μ·b. Returns the (>=) bound m.
-#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn crown_lower_f64_tight_cut(
     weights: &[Vec<Vec<f64>>],
     biases: &[Vec<f64>],
@@ -1426,31 +1687,29 @@ fn crown_lower_f64_tight_cut(
     hi: &[f64],
     cuts: &[ReluCut2],
 ) -> f64 {
-    let k = weights.len();
     let n = lo.len();
     let (pre_lo, pre_hi) = crown_intermediate_bounds_f64(weights, biases, lo, hi);
+    assert_eq!(
+        out_weight.len(),
+        in_width_f64(weights, weights.len(), n),
+        "read-out width != last hidden width"
+    );
     // Backward pass (same accumulation convention as crown_lower_f64): maintain
     // `-y <= const_acc` form; a_coeff is the running coeff on the current layer's
     // ACTIVATIONS a^(li). Start from the read-out on a^(k).
     let mut const_acc = -out_bias;
     let mut a_coeff = out_weight.to_vec();
-    for li in (0..k).rev() {
-        let width = weights[li].len();
-        let mut z_coeff = vec![0.0f64; width];
-        // Per-neuron envelope params for this layer.
-        let mut env = vec![(0.0f64, 0.0f64, 0.0f64, 0.0f64); width]; // (p,q,r,t)
-        for j in 0..width {
-            let (l, u) = (pre_lo[li][j], pre_hi[li][j]);
-            env[j] = if l >= 0.0 {
-                (1.0, 0.0, 1.0, 0.0)
-            } else if u <= 0.0 {
-                (0.0, 0.0, 0.0, 0.0)
-            } else {
-                let s = u / (u - l);
-                let alpha = if u >= -l { 1.0 } else { 0.0 };
-                (alpha, 0.0, s, s * (-l))
-            };
-        }
+    let layers = weights
+        .iter()
+        .zip(biases)
+        .zip(pre_lo.iter().zip(&pre_hi))
+        .enumerate();
+    for (li, ((w_li, b_li), (pl, ph))) in layers.rev() {
+        let width = w_li.len();
+        let mut z_coeff = zeros_f64(width);
+        // Per-neuron envelope params for this layer, (p,q,r,t) per unit.
+        let env: Vec<(f64, f64, f64, f64)> =
+            pl.iter().zip(ph).map(|(&l, &u)| relu_env(l, u)).collect();
         // First eliminate via per-neuron envelopes (as in the no-cut pass).
         // We additionally, ON THE FIRST LAYER, divert a μ-share of the negative-
         // coefficient pairs into joint cuts.  In the `-y <= const_acc` convention,
@@ -1461,7 +1720,7 @@ fn crown_lower_f64_tight_cut(
         //   by μ*b  (joint const) with NO z_coeff contribution from that share.
         // This lowers const_acc (raising the bound -const_acc) exactly when
         //   μ*b  <  μ*(t_i + t_j)  i.e. b < t_i + t_j  — the coupling gain.
-        let mut cut_share = vec![0.0f64; width]; // |c_j|-share already taken by cuts
+        let mut cut_share = zeros_f64(width); // |c_j|-share already taken by cuts
         if li == 0 {
             for cut in cuts {
                 let (ci, cj) = (a_coeff[cut.i], a_coeff[cut.j]);
@@ -1484,43 +1743,38 @@ fn crown_lower_f64_tight_cut(
                 }
             }
         }
-        for j in 0..width {
-            let c = a_coeff[j];
-            let (p, q, r, t) = env[j];
+        let units = z_coeff.iter_mut().zip(&a_coeff).zip(&env).zip(&cut_share);
+        for (((zc, &c), &(p, q, r, t)), &share) in units {
             if c > 0.0 {
-                z_coeff[j] += c * p;
+                *zc += c * p;
                 const_acc += c * (-q);
             } else if c < 0.0 {
-                // The cut already absorbed `cut_share[j]` of |c| (no envelope, no z).
-                let mag = (-c) - cut_share[j];
+                // The cut already absorbed `share` of |c| (no envelope, no z).
+                let mag = (-c) - share;
                 if mag > 0.0 {
                     // remaining magnitude uses the per-neuron upper envelope.
-                    z_coeff[j] += (-mag) * r; // c-share is negative => -mag
+                    *zc += (-mag) * r; // c-share is negative => -mag
                     const_acc += mag * t;
                 }
             }
         }
-        let prev_dim = if li == 0 { n } else { weights[li - 1].len() };
-        let mut prev_coeff = vec![0.0f64; prev_dim];
-        for j in 0..width {
-            let c = z_coeff[j];
+        let mut prev_coeff = zeros_f64(in_width_f64(weights, li, n));
+        for ((&c, row), &bj) in z_coeff.iter().zip(w_li).zip(b_li) {
             if c == 0.0 {
                 continue;
             }
-            let row = &weights[li][j];
-            for (i, &wji) in row.iter().enumerate() {
-                prev_coeff[i] += c * wji;
+            for (acc, &wji) in prev_coeff.iter_mut().zip(row) {
+                *acc += c * wji;
             }
-            const_acc += -(c * biases[li][j]);
+            const_acc += -(c * bj);
         }
         a_coeff = prev_coeff;
     }
-    for i in 0..n {
-        let d = a_coeff[i];
+    for ((&d, &l), &h) in a_coeff.iter().zip(lo).zip(hi) {
         if d > 0.0 {
-            const_acc += -(d * lo[i]);
+            const_acc += -(d * l);
         } else if d < 0.0 {
-            const_acc += (-d) * hi[i];
+            const_acc += (-d) * h;
         }
     }
     -const_acc
@@ -1550,7 +1804,6 @@ fn crown_lower_dispatch(
 /// substitution) but in f64 — microseconds instead of seconds.  Used ONLY to
 /// navigate the bisection (decide where/whether to split); the LEAF decision is
 /// always re-confirmed by the exact bignum pass.  `safe iff m > u_bound`.
-#[allow(clippy::needless_range_loop)]
 fn crown_lower_f64(
     weights: &[Vec<Vec<f64>>],
     biases: &[Vec<f64>],
@@ -1559,28 +1812,31 @@ fn crown_lower_f64(
     lo: &[f64],
     hi: &[f64],
 ) -> f64 {
-    let k = weights.len();
     let n = lo.len();
+    assert_f64_net_shapes(weights, biases, lo, hi);
+    assert_eq!(
+        out_weight.len(),
+        in_width_f64(weights, weights.len(), n),
+        "read-out width != last hidden width"
+    );
     // IBP pre-activation bounds per hidden layer.
-    let mut pre_lo: Vec<Vec<f64>> = Vec::with_capacity(k);
-    let mut pre_hi: Vec<Vec<f64>> = Vec::with_capacity(k);
+    let mut pre_lo: Vec<Vec<f64>> = Vec::new();
+    let mut pre_hi: Vec<Vec<f64>> = Vec::new();
     let mut act_lo = lo.to_vec();
     let mut act_hi = hi.to_vec();
-    for li in 0..k {
-        let w = &weights[li];
-        let b = &biases[li];
-        let mut zl = Vec::with_capacity(w.len());
-        let mut zu = Vec::with_capacity(w.len());
+    for (w, b) in weights.iter().zip(biases) {
+        let mut zl = Vec::new();
+        let mut zu = Vec::new();
         for (row, &bias) in w.iter().zip(b) {
             let mut lmin = bias;
             let mut umax = bias;
-            for (i, &wji) in row.iter().enumerate() {
+            for ((&wji, &al), &ah) in row.iter().zip(&act_lo).zip(&act_hi) {
                 if wji >= 0.0 {
-                    lmin += wji * act_lo[i];
-                    umax += wji * act_hi[i];
+                    lmin += wji * al;
+                    umax += wji * ah;
                 } else {
-                    lmin += wji * act_hi[i];
-                    umax += wji * act_lo[i];
+                    lmin += wji * ah;
+                    umax += wji * al;
                 }
             }
             zl.push(lmin);
@@ -1594,54 +1850,42 @@ fn crown_lower_f64(
     // Backward pass: const_acc with -y <= const_acc  =>  y >= -const_acc.
     let mut const_acc = -out_bias;
     let mut a_coeff = out_weight.to_vec();
-    for li in (0..k).rev() {
-        let width = weights[li].len();
-        let mut z_coeff = vec![0.0f64; width];
-        for j in 0..width {
-            let c = a_coeff[j];
-            let (l, u) = (pre_lo[li][j], pre_hi[li][j]);
-            // Envelope params matching crown_deep: stable active a=z; stable
-            // inactive a=0; unstable lower a>=alpha*z (alpha adaptive), upper
-            // a<= s*(z-l), s=u/(u-l).
-            let (p, q, r, t) = if l >= 0.0 {
-                (1.0, 0.0, 1.0, 0.0)
-            } else if u <= 0.0 {
-                (0.0, 0.0, 0.0, 0.0)
-            } else {
-                let s = u / (u - l);
-                let alpha = if u >= -l { 1.0 } else { 0.0 };
-                (alpha, 0.0, s, s * (-l))
-            };
+    let layers = weights
+        .iter()
+        .zip(biases)
+        .zip(pre_lo.iter().zip(&pre_hi))
+        .enumerate();
+    for (li, ((w_li, b_li), (pl, ph))) in layers.rev() {
+        let mut z_coeff = zeros_f64(w_li.len());
+        for (((zc, &c), &l), &u) in z_coeff.iter_mut().zip(&a_coeff).zip(pl).zip(ph) {
+            // Envelope params matching crown_deep (see `relu_env`).
+            let (p, q, r, t) = relu_env(l, u);
             if c > 0.0 {
-                z_coeff[j] += c * p;
+                *zc += c * p;
                 const_acc += c * (-q);
             } else if c < 0.0 {
                 let mag = -c;
-                z_coeff[j] += c * r;
+                *zc += c * r;
                 const_acc += mag * t;
             }
         }
-        let prev_dim = if li == 0 { n } else { weights[li - 1].len() };
-        let mut prev_coeff = vec![0.0f64; prev_dim];
-        for j in 0..width {
-            let c = z_coeff[j];
+        let mut prev_coeff = zeros_f64(in_width_f64(weights, li, n));
+        for ((&c, row), &bj) in z_coeff.iter().zip(w_li).zip(b_li) {
             if c == 0.0 {
                 continue;
             }
-            let row = &weights[li][j];
-            for (i, &wji) in row.iter().enumerate() {
-                prev_coeff[i] += c * wji;
+            for (acc, &wji) in prev_coeff.iter_mut().zip(row) {
+                *acc += c * wji;
             }
-            const_acc += -(c * biases[li][j]);
+            const_acc += -(c * bj);
         }
         a_coeff = prev_coeff;
     }
-    for i in 0..n {
-        let d = a_coeff[i];
+    for ((&d, &l), &h) in a_coeff.iter().zip(lo).zip(hi) {
         if d > 0.0 {
-            const_acc += -(d * lo[i]);
+            const_acc += -(d * l);
         } else if d < 0.0 {
-            const_acc += (-d) * hi[i];
+            const_acc += (-d) * h;
         }
     }
     -const_acc
@@ -1718,8 +1962,7 @@ fn main() {
     let forced_out: Option<usize> = args.get(4).and_then(|s| s.parse().ok());
 
     let t0 = Instant::now();
-    let data = std::fs::read(onnx_path).expect("read onnx");
-    let g = parse_onnx(&data);
+    let g = load_onnx_or_exit(onnx_path);
 
     // --- VNNLIB (parsed FIRST: the DAG flattener shifts its input passthrough
     // by the ROOT box lower bound, so the box must be known before loading) ---
@@ -1727,13 +1970,10 @@ fn main() {
     let atoms = parse_vnnlib(&vtext);
     // Input dimension = 1 + max X index present (the completeness assert below
     // rejects any gap, so this equals the true arity for every supported prop).
-    let vnn_input_dim = atoms
-        .iter()
-        .filter(|a| a.var.starts_with("X_"))
-        .filter_map(|a| var_index(&a.var))
-        .map(|i| i + 1)
-        .max()
-        .expect("vnnlib has no X_i atoms");
+    let vnn_input_dim = vnnlib_input_dim(&atoms).unwrap_or_else(|e| {
+        eprintln!("PARSE_FAILED: {e}");
+        std::process::exit(2);
+    });
 
     // Input box from X_i atoms.
     let mut lo = vec![Rat::ZERO; vnn_input_dim];
@@ -1803,8 +2043,8 @@ fn main() {
     );
     let load_us = t0.elapsed().as_micros();
 
-    let n_hidden = net.layers.len() - 1;
-    let widths: Vec<usize> = net.layers.iter().map(|l| l.w.len()).collect();
+    let n_hidden = net.hidden.len();
+    let widths: Vec<usize> = net.layers().map(|l| l.w.len()).collect();
     eprintln!(
         "[load] input_dim={} hidden_layers={} layer_widths={:?} loader={} ({} us)",
         net.input_dim,
@@ -1868,44 +2108,35 @@ fn main() {
     // (5 -> width^K -> 1) on which the first-layer relaxation is the dominant one,
     // making the first-layer multi-neuron cut a measurable decision lever. The
     // VNNLIB Y atom's threshold is reinterpreted as the bound on this y'.
-    let mut n_hidden = n_hidden;
-    let mut layers_trunc: Vec<AffineLayer>;
-    let net_layers: &Vec<AffineLayer> = if let Ok(ks) = std::env::var("NYCERT_TRUNC") {
-        let kk: usize = ks.parse().expect("NYCERT_TRUNC int");
-        assert!(kk >= 1 && kk <= n_hidden, "NYCERT_TRUNC out of range");
-        let width_k = net.layers[kk - 1].w.len();
-        // read-out weights on a^(K)
-        let ow: Vec<Rat> = if let Ok(s) = std::env::var("NYCERT_TRUNC_OW") {
-            let v: Vec<Rat> = s.split(',').map(|t| parse_rat_token(t.trim())).collect();
-            assert_eq!(v.len(), width_k, "NYCERT_TRUNC_OW arity");
-            v
+    let trunc_readout: AffineLayer;
+    let (hidden_layers, readout): (&[AffineLayer], &AffineLayer) =
+        if let Ok(ks) = std::env::var("NYCERT_TRUNC") {
+            let kk: usize = ks.parse().expect("NYCERT_TRUNC int");
+            assert!(kk >= 1 && kk <= n_hidden, "NYCERT_TRUNC out of range");
+            let width_k = net.hidden[kk - 1].w.len();
+            // read-out weights on a^(K)
+            let ow: Vec<Rat> = if let Ok(s) = std::env::var("NYCERT_TRUNC_OW") {
+                let v: Vec<Rat> = s.split(',').map(|t| parse_rat_token(t.trim())).collect();
+                assert_eq!(v.len(), width_k, "NYCERT_TRUNC_OW arity");
+                v
+            } else {
+                // default: alternating +1/-1 read-out (a real, nontrivial functional).
+                (0..width_k)
+                    .map(|j| if j % 2 == 0 { Rat::ONE } else { Rat::ONE.neg() })
+                    .collect()
+            };
+            trunc_readout = AffineLayer {
+                w: vec![ow],
+                b: vec![Rat::ZERO],
+            };
+            (&net.hidden[..kk], &trunc_readout)
         } else {
-            // default: alternating +1/-1 read-out (a real, nontrivial functional).
-            (0..width_k)
-                .map(|j| if j % 2 == 0 { Rat::ONE } else { Rat::ONE.neg() })
-                .collect()
+            (&net.hidden, &net.readout)
         };
-        layers_trunc = net.layers[..kk]
-            .iter()
-            .map(|l| AffineLayer {
-                w: l.w.clone(),
-                b: l.b.clone(),
-            })
-            .collect();
-        layers_trunc.push(AffineLayer {
-            w: vec![ow],
-            b: vec![Rat::ZERO],
-        });
-        n_hidden = kk;
-        &layers_trunc
-    } else {
-        &net.layers
-    };
 
     // Build DeepReluProblem with hidden layers and read-out.
-    let hidden_w: Vec<Vec<Vec<Rat>>> = net_layers[..n_hidden].iter().map(|l| l.w.clone()).collect();
-    let hidden_b: Vec<Vec<Rat>> = net_layers[..n_hidden].iter().map(|l| l.b.clone()).collect();
-    let readout = &net_layers[n_hidden];
+    let hidden_w: Vec<Vec<Vec<Rat>>> = hidden_layers.iter().map(|l| l.w.clone()).collect();
+    let hidden_b: Vec<Vec<Rat>> = hidden_layers.iter().map(|l| l.b.clone()).collect();
     let out_dim = readout.w.len();
 
     // Decide the output property. Each VNNLIB Y atom is part of the UNSAFE region.
@@ -2235,7 +2466,7 @@ fn main() {
                 rpath.push((c, mid, false));
                 stack.push(Item {
                     lo: hi_lo,
-                    hi: it.hi.clone(),
+                    hi: it.hi,
                     path: rpath,
                     nid: rid,
                 });
@@ -2920,15 +3151,28 @@ fn split_node(
         }
     }
     let mid = nd.lo[c].add(nd.hi[c]).unwrap().mul(ctx.half).unwrap();
-    let (lid, rid) = (*next_id, *next_id + 1);
-    *next_id += 2;
+    // Node ids and depths are counters; checked, so an (unreachable) wrap is a
+    // reported failure, not a reused id (release builds would wrap silently).
+    let lid = *next_id;
+    let (Some(rid), Some(after), Some(child_depth)) = (
+        lid.checked_add(1),
+        lid.checked_add(2),
+        nd.depth.checked_add(1),
+    ) else {
+        println!(
+            "CONJ_FAILED node id/depth counter exhausted at node {} on {}",
+            nd.id, ctx.label
+        );
+        std::process::exit(3);
+    };
+    *next_id = after;
     splits.insert(nd.id, (c, mid, lid, rid));
     let mut lo_hi = nd.hi.clone();
     lo_hi[c] = mid;
     work.push(ConjNode {
         lo: nd.lo.clone(),
         hi: lo_hi,
-        depth: nd.depth + 1,
+        depth: child_depth,
         id: lid,
     });
     let mut hi_lo = nd.lo.clone();
@@ -2936,7 +3180,7 @@ fn split_node(
     work.push(ConjNode {
         lo: hi_lo,
         hi: nd.hi.clone(),
-        depth: nd.depth + 1,
+        depth: child_depth,
         id: rid,
     });
 }
@@ -3029,8 +3273,16 @@ fn exact_leaf_compute(
         // true output at any box corner.
         if n <= 16 {
             for mask in 0u32..(1u32 << n) {
-                let x: Vec<Rat> = (0..n)
-                    .map(|i| if mask & (1 << i) != 0 { hi[i] } else { lo[i] })
+                // Bit `i` of `mask` picks hi[i] (set) or lo[i] (clear); `bits`
+                // walks the bits from the lowest, one coordinate per step.
+                let x: Vec<Rat> = lo
+                    .iter()
+                    .zip(&hi)
+                    .scan(mask, |bits, (l, h)| {
+                        let pick_hi = *bits & 1 != 0;
+                        *bits >>= 1;
+                        Some(if pick_hi { *h } else { *l })
+                    })
                     .collect();
                 let y = problem.eval(&x).expect("corner eval");
                 assert!(m <= y, "UNSOUND leaf: corner below certified bound");
@@ -3096,11 +3348,11 @@ fn conj_pipeline(
     out_dir: &str,
     load_us: u128,
 ) -> ! {
-    let n_hidden = net.layers.len() - 1;
+    let n_hidden = net.hidden.len();
     assert!(n_hidden >= 1, "need at least one hidden layer");
-    let hidden_w: Vec<Vec<Vec<Rat>>> = net.layers[..n_hidden].iter().map(|l| l.w.clone()).collect();
-    let hidden_b: Vec<Vec<Rat>> = net.layers[..n_hidden].iter().map(|l| l.b.clone()).collect();
-    let readout = &net.layers[n_hidden];
+    let hidden_w: Vec<Vec<Vec<Rat>>> = net.hidden.iter().map(|l| l.w.clone()).collect();
+    let hidden_b: Vec<Vec<Rat>> = net.hidden.iter().map(|l| l.b.clone()).collect();
+    let readout = &net.readout;
     let out_dim = readout.w.len();
 
     // Build the ORIGINAL exact source rows first. Synthetic targets may only be
@@ -3425,7 +3677,8 @@ fn conj_pipeline(
         )> = batch
             .drain(..)
             .map(|(nd, bt, cuts)| {
-                exact_calls += 1;
+                // A statistics counter: saturating, never a wrap or a panic.
+                exact_calls = exact_calls.saturating_add(1);
                 let (ow_s, ob_s, ub_s) = &targets_s[bt];
                 let hw = Arc::clone(&hidden_w_s);
                 let hb = Arc::clone(&hidden_b_s);
@@ -3741,7 +3994,6 @@ fn rat_lean(r: &Rat) -> String {
 /// computes `bias + dot row x` per unit — the same forward pass.
 fn emit_net_lean(name: &str, net: &LoadedNet, out: &mut String) {
     use std::fmt::Write as _;
-    let k = net.layers.len() - 1;
     let emit_layer = |layer: &AffineLayer, out: &mut String| {
         out.push_str("    [ ");
         for (o, (row, b)) in layer.w.iter().zip(&layer.b).enumerate() {
@@ -3756,7 +4008,7 @@ fn emit_net_lean(name: &str, net: &LoadedNet, out: &mut String) {
     let _ = writeln!(out, "noncomputable def {name} : Net :=");
     out.push_str("  { hidden :=\n");
     out.push_str("  [\n");
-    for (li, layer) in net.layers[..k].iter().enumerate() {
+    for (li, layer) in net.hidden.iter().enumerate() {
         if li > 0 {
             out.push_str("  ,\n");
         }
@@ -3765,24 +4017,24 @@ fn emit_net_lean(name: &str, net: &LoadedNet, out: &mut String) {
     }
     out.push_str("  ]\n");
     out.push_str("  , readout :=\n");
-    emit_layer(&net.layers[k], out);
+    emit_layer(&net.readout, out);
     out.push_str(" }\n\n");
 }
 
 /// Parse the vnnlib input box + output atoms (mirrors `main`'s inline logic).
 fn emit_parse_box(vtext: &str) -> (Vec<Rat>, Vec<Rat>, Vec<VnnAtom>) {
     let atoms = parse_vnnlib(vtext);
-    let dim = atoms
-        .iter()
-        .filter(|a| a.var.starts_with("X_"))
-        .filter_map(|a| var_index(&a.var))
-        .map(|i| i + 1)
-        .max()
-        .expect("vnnlib has no X_i atoms");
-    let mut lo = vec![Rat::ZERO; dim];
-    let mut hi = vec![Rat::ZERO; dim];
-    let mut lo_set = vec![false; dim];
-    let mut hi_set = vec![false; dim];
+    let dim = vnnlib_input_dim(&atoms).unwrap_or_else(|e| {
+        eprintln!("PARSE_FAILED: {e}");
+        std::process::exit(2);
+    });
+    // `vnnlib_input_dim` already refuses a dimension past `MAX_LAYER_WIDTH`;
+    // the allocation helpers check it again (failing closed, never
+    // truncating) where the verifier can see the bound.
+    let mut lo = zeros_rat(dim);
+    let mut hi = zeros_rat(dim);
+    let mut lo_set = falses(dim);
+    let mut hi_set = falses(dim);
     let mut y = vec![];
     for a in &atoms {
         if a.var.starts_with("X_") {
@@ -3812,8 +4064,7 @@ fn emit_parse_box(vtext: &str) -> (Vec<Rat>, Vec<Rat>, Vec<VnnAtom>) {
 
 /// Load + flatten one cersyve ONNX net against the shared root box lower bound.
 fn emit_load_flat(onnx_path: &str, lo: &[Rat]) -> LoadedNet {
-    let data = std::fs::read(onnx_path).expect("read onnx");
-    let g = parse_onnx(&data);
+    let g = load_onnx_or_exit(onnx_path);
     let dag = load_dag(&g);
     assert_eq!(dag.input_dim, lo.len(), "ONNX input dim != vnnlib box dim");
     flatten_dag(&dag, lo)
@@ -3870,8 +4121,8 @@ fn emit_lean_instance(
     let inv = emit_load_flat(inv_path, &lo);
     eprintln!(
         "[emit-lean] con widths={:?} inv widths={:?}",
-        con.layers.iter().map(|l| l.w.len()).collect::<Vec<_>>(),
-        inv.layers.iter().map(|l| l.w.len()).collect::<Vec<_>>()
+        con.layers().map(|l| l.w.len()).collect::<Vec<_>>(),
+        inv.layers().map(|l| l.w.len()).collect::<Vec<_>>()
     );
 
     // Snake-case system stem for theorem names / docstrings, derived from the
@@ -3879,19 +4130,25 @@ fn emit_lean_instance(
     // `double_integrator`), so the emitted theorem is `{sys}_safe_forever`.
     let sys = module_to_sys(module);
     // Human-readable box product for the docstring, e.g. `[-1,1]×[-1,1]×[-1,1]`.
-    let box_product: String = (0..dim)
-        .map(|i| format!("[{},{}]", fmt_rat(&lo[i]), fmt_rat(&hi[i])))
+    // (`lo`/`hi` are both `dim` long: `emit_parse_box` builds them pairwise.)
+    let box_product: String = lo
+        .iter()
+        .zip(&hi)
+        .map(|(l, h)| format!("[{},{}]", fmt_rat(l), fmt_rat(h)))
         .collect::<Vec<_>>()
         .join("×");
     // The Lean domain conjunction over every input coordinate (exact ℚ bounds).
-    let domain_body: String = (0..dim)
-        .map(|i| {
+    let domain_body: String = lo
+        .iter()
+        .zip(&hi)
+        .enumerate()
+        .map(|(i, (l, h))| {
             format!(
                 "{} ≤ x.getD {} 0 ∧ x.getD {} 0 ≤ {}",
-                rat_lean(&lo[i]),
+                rat_lean(l),
                 i,
                 i,
-                rat_lean(&hi[i])
+                rat_lean(h)
             )
         })
         .collect::<Vec<_>>()
@@ -4359,7 +4616,7 @@ mod dag_tests {
         let lo = vec![Rat::new(-1, 1).unwrap(); 2];
         let flat = flatten_dag(&dag, &lo);
         // depth 2: level(h1)=1, level(g)=1, level(h2)=2; readout reads h2, g, x.
-        assert_eq!(flat.layers.len(), 3);
+        assert_eq!(flat.hidden.len(), 2);
         // Points inside the box [-1,1]^2 (rational, incl. non-dyadic).
         let pts = [
             (Rat::new(0, 1).unwrap(), Rat::new(0, 1).unwrap()),
@@ -4433,5 +4690,416 @@ mod dag_tests {
         g.nodes.push(node("Add", &["out", "b6"], &["out2"]));
         g.graph_outputs = vec!["out2".into()];
         let _ = load_dag(&g);
+    }
+}
+
+#[cfg(test)]
+mod onnx_wire_tests {
+    use super::*;
+
+    fn varint(mut v: u64, out: &mut Vec<u8>) {
+        while v >= 0x80 {
+            out.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        out.push(v as u8);
+    }
+
+    /// One length-delimited field (wire type 2).
+    fn ld(field: u64, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        varint((field << 3) | 2, &mut out);
+        varint(payload.len() as u64, &mut out);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// ModelProto{ graph: GraphProto{ node Relu(x)->y, init w=[1.5, -2],
+    /// input x, output y } }.
+    fn model() -> Vec<u8> {
+        let mut node = ld(1, b"x");
+        node.extend(ld(2, b"y"));
+        node.extend(ld(4, b"Relu"));
+        let mut tensor = ld(1, &[2]); // packed dims [2]
+        tensor.extend(ld(8, b"w"));
+        let mut raw = 1.5f32.to_le_bytes().to_vec();
+        raw.extend((-2.0f32).to_le_bytes());
+        tensor.extend(ld(9, &raw));
+        let mut graph = ld(1, &node);
+        graph.extend(ld(5, &tensor));
+        graph.extend(ld(11, &ld(1, b"x")));
+        graph.extend(ld(12, &ld(1, b"y")));
+        let mut m = vec![0x08, 0x07]; // ir_version = 7 (skipped varint field)
+        m.extend(ld(7, &graph));
+        m
+    }
+
+    #[test]
+    fn well_formed_model_decodes() {
+        let g = parse_onnx(&model()).expect("well-formed model");
+        assert_eq!(g.nodes.len(), 1);
+        assert_eq!(g.nodes[0].op_type, "Relu");
+        assert_eq!(g.nodes[0].inputs, vec!["x".to_string()]);
+        let w = g.inits.get("w").expect("initializer w");
+        assert_eq!(w.dims, vec![2]);
+        assert_eq!(w.floats, vec![1.5, -2.0]);
+        assert_eq!(g.graph_inputs, vec!["x".to_string()]);
+        assert_eq!(g.graph_outputs, vec!["y".to_string()]);
+    }
+
+    #[test]
+    fn every_truncation_is_an_error_not_a_panic() {
+        // The old indexing reader panicked (index/slice out of range) on these.
+        let m = model();
+        for cut in 1..m.len() {
+            assert!(parse_onnx(&m[..cut]).is_err(), "prefix of {cut} bytes");
+        }
+    }
+
+    #[test]
+    fn missing_graph_and_bad_wire_type_are_errors() {
+        assert!(matches!(parse_onnx(&[0x08, 0x07]), Err(OnnxError::NoGraph)));
+        // field 1, wire type 3 (start-group): the old reader `panic!`ed.
+        assert!(matches!(
+            parse_onnx(&[0x0b]),
+            Err(OnnxError::Wire(WireError::UnsupportedWireType {
+                wire_type: 3
+            }))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod input_bound_tests {
+    use super::*;
+
+    fn atoms(text: &str) -> Vec<VnnAtom> {
+        parse_vnnlib(text)
+    }
+
+    #[test]
+    fn vnnlib_input_dim_of_a_complete_box() {
+        let a = atoms(
+            "(assert (>= X_0 -1.0))(assert (<= X_0 1.0))\
+             (assert (>= X_1 0.0))(assert (<= X_1 0.5))(assert (<= Y_0 0.0))",
+        );
+        assert_eq!(vnnlib_input_dim(&a), Ok(2));
+    }
+
+    #[test]
+    fn vnnlib_max_index_is_an_error_not_an_overflow_panic() {
+        // The old `.map(|i| i + 1)` overflowed on usize::MAX.
+        let a = atoms("(assert (>= X_18446744073709551615 0.0))");
+        assert!(vnnlib_input_dim(&a).unwrap_err().contains("out of range"));
+    }
+
+    #[test]
+    fn vnnlib_huge_index_is_rejected_before_allocating_the_box() {
+        // The old code sized `vec![Rat::ZERO; dim]` by this index (10^11).
+        let a = atoms("(assert (>= X_100000000000 0.0))(assert (<= X_100000000000 1.0))");
+        assert!(vnnlib_input_dim(&a).is_err());
+    }
+
+    #[test]
+    fn vnnlib_without_x_atoms_is_an_error() {
+        let a = atoms("(assert (<= Y_0 0.0))");
+        assert_eq!(
+            vnnlib_input_dim(&a),
+            Err("vnnlib has no X_i atoms".to_string())
+        );
+    }
+
+    #[test]
+    fn cut2_corner_bound_matches_enumeration_in_range() {
+        // z_i = x0 + x1, z_j = x0 - x1 on [-1,1]^2: max relu(z_i)+relu(z_j) = 2.
+        let w1 = vec![vec![1.0, 1.0], vec![1.0, -1.0]];
+        let b1 = vec![0.0, 0.0];
+        let (lo, hi) = (vec![-1.0, -1.0], vec![1.0, 1.0]);
+        assert_eq!(cut2_box_b_f64(&w1, &b1, &lo, &hi, 0, 1), 2.0);
+    }
+
+    #[test]
+    fn cut2_past_corner_cap_yields_no_cut_instead_of_a_shift_panic() {
+        // 40 inputs: the old `1u32 << n` panicked (and 2^n corners is infeasible).
+        let n = 40;
+        let w1 = vec![vec![1.0; n], vec![-1.0; n]];
+        let b1 = vec![0.0, 0.0];
+        let (lo, hi) = (vec![-1.0; n], vec![1.0; n]);
+        assert_eq!(cut2_box_b_f64(&w1, &b1, &lo, &hi, 0, 1), f64::INFINITY);
+        // ... so discover_cuts2 emits no cut for the (unstable) pair.
+        let (pl, ph) = (vec![-1.0, -1.0], vec![1.0, 1.0]);
+        assert!(discover_cuts2(&w1, &b1, &lo, &hi, &pl, &ph, 8).is_empty());
+    }
+
+    #[test]
+    fn matrix_size_with_overflowing_dims_is_a_size_mismatch() {
+        let t = OnnxTensor {
+            name: "w".into(),
+            dims: vec![],
+            floats: vec![1.0],
+        };
+        let r = std::panic::catch_unwind(|| rat_mat(&t, usize::MAX, 2));
+        let msg = r.expect_err("must reject");
+        let msg = msg.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(msg.contains("matrix size mismatch"), "{msg}");
+    }
+}
+
+/// The index-free rewrites of the loaders and the f64 bound passes compute
+/// what the index arithmetic computed, and keep its fail-closed shape checks.
+#[cfg(test)]
+mod index_free_tests {
+    use super::*;
+
+    fn t(dims: &[i64], floats: &[f32]) -> OnnxTensor {
+        OnnxTensor {
+            name: "w".into(),
+            dims: dims.to_vec(),
+            floats: floats.to_vec(),
+        }
+    }
+
+    fn r(n: i128, d: i128) -> Rat {
+        Rat::new(n, d).unwrap()
+    }
+
+    #[test]
+    fn rat_mat_transposes_like_the_index_formula() {
+        // stored [rows=2][cols=3] row-major; out[c][r] = floats[r*3 + c].
+        let floats = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let out = rat_mat(&t(&[2, 3], &floats), 2, 3).unwrap();
+        for (c, col) in out.iter().enumerate() {
+            for (rr, v) in col.iter().enumerate() {
+                assert_eq!(*v, f32_to_rat(floats[rr * 3 + c]).unwrap());
+            }
+        }
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|col| col.len() == 2));
+    }
+
+    #[test]
+    fn rat_mat_with_no_columns_is_empty() {
+        assert_eq!(
+            rat_mat(&t(&[4, 0], &[]), 4, 0).unwrap(),
+            [] as [Vec<Rat>; 0]
+        );
+    }
+
+    #[test]
+    fn gemm_apply_matches_the_dense_formula() {
+        // a = identity over a 2-wide input; W = [[1,2,3],[4,5,6]] ([kin=2][kout=3]).
+        let a = Aff::identity(0, 2);
+        let w = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let bias = vec![r(1, 2), Rat::ZERO, r(-1, 4)];
+        let out = gemm_apply(&a, &w, 2, 3, &bias);
+        assert_eq!(out.cst, bias);
+        let m = &out.terms[&0];
+        for (o, row) in m.iter().enumerate() {
+            for (i, v) in row.iter().enumerate() {
+                assert_eq!(*v, f32_to_rat(w[i * 3 + o]).unwrap(), "W^T[{o}][{i}]");
+            }
+        }
+    }
+
+    #[test]
+    fn gemm_apply_with_no_outputs_is_empty() {
+        let a = Aff::identity(0, 2);
+        let out = gemm_apply(&a, &[], 2, 0, &[]);
+        assert!(out.terms.is_empty() && out.cst.is_empty());
+    }
+
+    #[test]
+    fn relu_terminated_net_gets_an_identity_readout() {
+        // x (2) -> MatMul W [2,3] -> Relu: no trailing affine layer.
+        let mut inits = BTreeMap::new();
+        inits.insert(
+            "W".to_string(),
+            t(&[2, 3], &[1.0, 0.0, -1.0, 0.5, 2.0, 0.0]),
+        );
+        let g = OnnxGraph {
+            nodes: vec![
+                OnnxNode {
+                    op_type: "MatMul".into(),
+                    inputs: vec!["x".into(), "W".into()],
+                    outputs: vec!["m".into()],
+                    attrs: vec![],
+                },
+                OnnxNode {
+                    op_type: "Relu".into(),
+                    inputs: vec!["m".into()],
+                    outputs: vec!["h".into()],
+                    attrs: vec![],
+                },
+            ],
+            inits,
+            graph_inputs: vec!["x".into()],
+            graph_outputs: vec!["h".into()],
+        };
+        let net = load_net(&g);
+        assert_eq!(net.hidden.len(), 1);
+        assert_eq!(net.layers().count(), 2);
+        assert_eq!(net.readout.b, vec![Rat::ZERO; 3]);
+        for (d, row) in net.readout.w.iter().enumerate() {
+            for (c, v) in row.iter().enumerate() {
+                assert_eq!(*v, if c == d { Rat::ONE } else { Rat::ZERO });
+            }
+        }
+        // y = relu(W^T x): x = (1, 2) -> (1 + 1, 0 + 4, -1 + 0) -> (2, 4, 0).
+        let y = loaded_eval_vec(&net, &[Rat::ONE, Rat::from_int(2)]);
+        assert_eq!(y, vec![Rat::from_int(2), Rat::from_int(4), Rat::ZERO]);
+    }
+
+    /// The pre-rewrite `crown_lower_f64` (index arithmetic), kept verbatim as
+    /// the reference for the zipped version.
+    #[allow(clippy::needless_range_loop)]
+    fn crown_lower_f64_reference(
+        weights: &[Vec<Vec<f64>>],
+        biases: &[Vec<f64>],
+        out_weight: &[f64],
+        out_bias: f64,
+        lo: &[f64],
+        hi: &[f64],
+    ) -> f64 {
+        let k = weights.len();
+        let n = lo.len();
+        let mut pre_lo: Vec<Vec<f64>> = Vec::with_capacity(k);
+        let mut pre_hi: Vec<Vec<f64>> = Vec::with_capacity(k);
+        let mut act_lo = lo.to_vec();
+        let mut act_hi = hi.to_vec();
+        for li in 0..k {
+            let mut zl = Vec::new();
+            let mut zu = Vec::new();
+            for (row, &bias) in weights[li].iter().zip(&biases[li]) {
+                let (mut lmin, mut umax) = (bias, bias);
+                for (i, &wji) in row.iter().enumerate() {
+                    if wji >= 0.0 {
+                        lmin += wji * act_lo[i];
+                        umax += wji * act_hi[i];
+                    } else {
+                        lmin += wji * act_hi[i];
+                        umax += wji * act_lo[i];
+                    }
+                }
+                zl.push(lmin);
+                zu.push(umax);
+            }
+            act_lo = zl.iter().map(|&v| v.max(0.0)).collect();
+            act_hi = zu.iter().map(|&v| v.max(0.0)).collect();
+            pre_lo.push(zl);
+            pre_hi.push(zu);
+        }
+        let mut const_acc = -out_bias;
+        let mut a_coeff = out_weight.to_vec();
+        for li in (0..k).rev() {
+            let width = weights[li].len();
+            let mut z_coeff = vec![0.0f64; width];
+            for j in 0..width {
+                let c = a_coeff[j];
+                let (p, q, r, t) = relu_env(pre_lo[li][j], pre_hi[li][j]);
+                if c > 0.0 {
+                    z_coeff[j] += c * p;
+                    const_acc += c * (-q);
+                } else if c < 0.0 {
+                    z_coeff[j] += c * r;
+                    const_acc += (-c) * t;
+                }
+            }
+            let prev_dim = if li == 0 { n } else { weights[li - 1].len() };
+            let mut prev_coeff = vec![0.0f64; prev_dim];
+            for j in 0..width {
+                let c = z_coeff[j];
+                if c == 0.0 {
+                    continue;
+                }
+                for (i, &wji) in weights[li][j].iter().enumerate() {
+                    prev_coeff[i] += c * wji;
+                }
+                const_acc += -(c * biases[li][j]);
+            }
+            a_coeff = prev_coeff;
+        }
+        for i in 0..n {
+            let d = a_coeff[i];
+            if d > 0.0 {
+                const_acc += -(d * lo[i]);
+            } else if d < 0.0 {
+                const_acc += (-d) * hi[i];
+            }
+        }
+        -const_acc
+    }
+
+    fn net_2_3_2() -> (Vec<Vec<Vec<f64>>>, Vec<Vec<f64>>) {
+        (
+            vec![
+                vec![vec![1.0, -0.5], vec![0.25, 2.0], vec![-1.0, 0.75]],
+                vec![vec![0.5, -1.0, 1.5], vec![-0.25, 0.5, 1.0]],
+            ],
+            vec![vec![0.125, -0.25, 0.5], vec![-0.5, 0.25]],
+        )
+    }
+
+    #[test]
+    fn crown_lower_f64_matches_the_index_reference_bit_for_bit() {
+        let (w, b) = net_2_3_2();
+        let ow = [1.0, -2.0];
+        for (lo, hi) in [
+            ([-1.0, -1.0], [1.0, 1.0]),
+            ([0.0, -0.5], [0.5, 0.25]),
+            ([-2.0, 1.0], [-1.0, 3.0]),
+        ] {
+            let got = crown_lower_f64(&w, &b, &ow, 0.375, &lo, &hi);
+            let want = crown_lower_f64_reference(&w, &b, &ow, 0.375, &lo, &hi);
+            assert_eq!(got.to_bits(), want.to_bits(), "box {lo:?}..{hi:?}");
+        }
+    }
+
+    #[test]
+    fn tight_and_cut_bounds_are_no_looser_than_ibp_crown() {
+        // Tight CROWN intermediate bounds intersect IBP, and the cut pass with
+        // no cuts is the tight pass's backward pass: same or better bounds.
+        let (w, b) = net_2_3_2();
+        let ow = [1.0, -2.0];
+        let (lo, hi) = ([-1.0, -1.0], [1.0, 1.0]);
+        let ibp = crown_lower_f64(&w, &b, &ow, 0.0, &lo, &hi);
+        let tight = crown_lower_f64_tight(&w, &b, &ow, 0.0, &lo, &hi);
+        let cut0 = crown_lower_f64_tight_cut(&w, &b, &ow, 0.0, &lo, &hi, &[]);
+        assert!(tight >= ibp - 1e-12, "tight {tight} < ibp {ibp}");
+        assert!(
+            (cut0 - tight).abs() <= 1e-12,
+            "no-cut pass {cut0} != tight {tight}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "weight row is not 2 wide")]
+    fn ragged_f64_net_fails_closed() {
+        let (mut w, b) = net_2_3_2();
+        w[0][1].pop();
+        let _ = crown_intermediate_bounds_f64(&w, &b, &[0.0, 0.0], &[1.0, 1.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "no hidden layer")]
+    fn tight_bound_without_hidden_layers_fails_closed() {
+        let _ = crown_lower_f64_tight(&[], &[], &[1.0], 0.0, &[0.0], &[1.0]);
+    }
+}
+
+#[cfg(test)]
+mod input_width_tests {
+    use super::*;
+
+    #[test]
+    fn vnnlib_box_wider_than_2_pow_20_is_still_accepted() {
+        // A complete box over 2^20 + 1 inputs. A first cut of the width cap
+        // sat at 2^20 and refused this valid (if large) property, which the
+        // unbounded loader before it accepted; the cap is now far above it.
+        let n = (1usize << 20) + 1;
+        let mut text = String::new();
+        for i in 0..n {
+            text.push_str(&format!("(assert (>= X_{i} 0))(assert (<= X_{i} 1))"));
+        }
+        assert_eq!(vnnlib_input_dim(&parse_vnnlib(&text)), Ok(n));
     }
 }

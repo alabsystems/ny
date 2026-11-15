@@ -1,3 +1,9 @@
+# #lsnc-lane ARMED 2026-09-26 (ship/consolidate-2026-09-26): this file is byte-identical to the measurement config
+# that produced the two-year moat (scratchpad/lsnclane/configs/vnncomp25/lsnc_relu.yaml) on ny-pins/ny_wave3_c5e9ce88f:
+# 2026 79/80 (sat 11, unsat 68; +70, 0 lost, 0 sat<->unsat flips), 2025 80/80 (+69, 0 lost), CE-validity moat clean on
+# both years' field scoring; end-to-end rows 23/79/2 unsat in 4.8/5.1/7.8 s of 25 s with '[lowdim] armed' + joint + clip.
+# The lane-private interval twin (lowdim_interval_twin) is what makes the net boundable; the global
+# NY_CONST_MATMUL_INTERVAL carrier stays EnvOnly/dark by policy (see the history below).
 # Copyright 2026 Andrew Yates
 # Author: Andrew Yates <andrewyates.name@gmail.com>
 # SPDX-License-Identifier: Apache-2.0
@@ -64,13 +70,25 @@ attack:
   pgd_steps: 100
   pgd_alpha: 0.01
   pgd_alpha_scale: true
+  # #lsnc-attack-twin: the post-BaB tail runs exact-gradient PGD on a
+  # POINT-FOLDED ATTACK TWIN of this net (its four constant-only MatMul cones
+  # evaluated once by ONNX Runtime and baked in; the exact loader fails them
+  # closed, which is what leaves every gradient lane statically dead here and
+  # ~17 s of the 25 s budget unspent). Restarts alternate uniform / snapped
+  # onto the face the disjunct's own target points at — the 2026 field
+  # counterexamples for rows 14/17/58 sit on X_5 = +2. The twin is attack-only
+  # (a distinct type with no route to a bound API); every candidate is ORT-
+  # checked on the ORIGINAL model and re-gated by gate_sat_with_trusted_oracle,
+  # so the key can only add sat verdicts. Governs 2025 and 2026 rows alike (no
+  # vnncomp26 shadow): no witness is carried between rows or years.
+  # NY_ATTACK_POINT_FOLDED_TWIN still overrides (exact 0 kills, exact 1 forces).
+  point_folded_twin: true
 
 bab:
   batch_size: 1000000
   branching:
     method: input
     candidates: 5
-    reduceop: max
     input_split:
       enable: true
       sb_coeff_thresh: 1.0e-2
@@ -79,6 +97,35 @@ bab:
       reorder_bab: true
       adv_check: -1
       ibp_enhancement: true
+      # #lsnc-lane MEASUREMENT ARMING (scratchpad/lsnclane only; NOT the shipping
+      # yaml): the lowdim prover on the grouped 13x3 disjunctive route, lowering
+      # the LANE-PRIVATE interval twin of this net (bab.branching.input_split.
+      # lowdim_interval_twin). The grouped search is vacuous on the real graph
+      # (its OpaqueSkip cones bound to [-inf, inf]), so the lane gets 0.9 of the
+      # BaB slice; every layer is <= 8 wide, so refinement is on at width 8.
+      lowdim_prover: true
+      lowdim_interval_twin: true
+      lowdim_prover_share: 0.9
+      lowdim_prover_refine_width: 8
+      # #lsnc-lane stage 2 MEASUREMENT ARMING: the joint quadratic bound at the
+      # V and dV ReduceSum(Mul) sites (bab.branching.input_split.
+      # lowdim_joint_quadratic). Engagement: `[lowdim-joint] armed=1
+      # source=Config` and `[lowdim] joint sites=2 armed=1 ... planes=1` at both
+      # sites; the A/B arm deletes this one line.
+      lowdim_joint_quadratic: true
+      # #lsnc-lane stage 3 MEASUREMENT ARMING (the numpy gate's `allmax` stack):
+      # the aspect-guarded `sbwr` split (gate: 2.0e5-1.4e6 domains/row vs
+      # 3.1e5-3.7e6 for plain sb), the relaxed clip of each box by its OWN
+      # passes' planes (outward rounded; never a parent's plane), and deciding
+      # each domain inside the rayon tasks (outcome-identical, throughput only).
+      # Engagement: `[lowdim-split] armed=1 value=sbwr source=Config`,
+      # `[lowdim-clip] armed=1`, `[lowdim-parallel] armed=1`, then
+      # `[lowdim] lane-config split=sbwr clip=1 joint=1 parallel=full threads=T`
+      # and per clause `clip_closed=.. clip_shrunk=.. joint_sites=2 joint_hits=..`.
+      # A/B arms delete one line each (split -> widest by deletion).
+      lowdim_split: sbwr
+      lowdim_clip: true
+      lowdim_parallel: true
   clip:
     relaxed: true
     relaxed_iterations: 20
@@ -101,4 +148,13 @@ bab:
     #    over 5s for headroom on a shared box (~76% vs ~10%); the floor is
     #    clamped to total/2, so BaB still keeps 10s of the 18s it had and the
     #    whole-category sweep shows no row paying for it (0 unsat either way).
-    disjunctive_pgd_min_secs: 8
+    # #lsnc-lane stage 3 MEASUREMENT DIR ONLY: the floor is DROPPED here. That
+    # rationale ("BaB has NEVER produced an unsat here") is what the lowdim
+    # lane changes: the lane is throughput-bound (every unsat row needs
+    # ~2e5-1.4e6 domains), and the 8 s floor takes ~5 s of lane time from
+    # every row, sat or unsat. Without it the tiny-budget rule caps the attack
+    # at 15% (3.0 s of 20 s). COST TO WATCH: the banked sats found at ~3-4.5 s
+    # (rows 61/44 ~3 s; the state_34 cliff at 4-5 s measured above) — the moat
+    # step of the stage-3 runbook re-measures every banked sat 3x with and
+    # without this line before anything ships. Restore by uncommenting:
+    # disjunctive_pgd_min_secs: 8

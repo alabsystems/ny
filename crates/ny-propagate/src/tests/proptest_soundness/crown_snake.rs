@@ -103,7 +103,7 @@ proptest! {
     // =========================================================================
 
     /// Low frequency Snake: wide intervals relative to oscillation period.
-    /// Tests the multi-period relaxation path from #3051.
+    /// Tests the multi-period relaxation path.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_snake_crown_low_freq(center in -20.0f32..20.0, width in 0.0f32..20.0) {
@@ -370,7 +370,7 @@ proptest! {
         )?;
     }
 
-    /// Per-channel MIXED-sign alpha through the #4117 stride mapping: the
+    /// Per-channel MIXED-sign alpha through the channel stride mapping: the
     /// Kokoro checkpoint mixes signs within one alpha tensor, so the CROWN
     /// per-channel path must select the reflected envelope per ELEMENT.
     #[ntest::timeout(60000)]

@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! GPU-resident IBP forward pass (#4081).
+//! GPU-resident IBP forward pass.
 //!
 //! Keeps lower/upper bound buffers on GPU across all supported layers in a
 //! resident chain (Linear / Conv2d / ReLU / View) and only reads back the
@@ -91,6 +91,28 @@ impl GpuIbpForwardExt for WgpuDevice {
         Ok(Some(Box::new(
             self.prepare_model_plan_internal(layers, input_shape)?,
         )))
+    }
+
+    fn prepare_model_plan_with_deadline(
+        &self,
+        layers: &[GpuIbpLayer],
+        input_shape: &[usize],
+        deadline: std::time::Instant,
+    ) -> Result<Option<Box<dyn GpuIbpModelPlan>>> {
+        super::ibp_forward_plan::poll_plan_deadline(Some(deadline))?;
+        if layers.is_empty() {
+            return Ok(None);
+        }
+        let _deadline_scope = super::super::CallLocalCrownDeadlineScope::arm(
+            super::ibp_forward_plan::effective_plan_deadline(deadline),
+        );
+        let deadline = crate::wgpu_device::CALL_LOCAL_CROWN_DEADLINE
+            .with(std::cell::Cell::get)
+            .unwrap_or(deadline);
+        let mut transaction = self.begin_gpu_checked_transaction("ibp_plan_prepare", deadline)?;
+        let plan = self.prepare_model_plan_internal_until(layers, input_shape, Some(deadline))?;
+        transaction.finish_bounded("ibp_plan_prepare")?;
+        Ok(Some(Box::new(plan)))
     }
 }
 

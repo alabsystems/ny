@@ -87,7 +87,7 @@ fn hard_sigmoid_linear_relaxation(l: f32, u: f32, alpha: f32, beta: f32) -> Line
         // Entirely in linear region: y = alpha*x + beta
         LinearRelaxation::new(alpha, beta, alpha, beta)
     } else if l < x_low && u > x_high {
-        // Crosses both boundaries. Directed rounding (#3337).
+        // Crosses both boundaries. Directed rounding.
         // Upper: chord from (l, 0) to (x_high, 1). Lower: chord from (x_low, 0) to (u, 1).
         let max_abs = l.abs().max(u.abs()) as f64;
         let su64 = 1.0_f64 / (x_high as f64 - l as f64);
@@ -100,7 +100,7 @@ fn hard_sigmoid_linear_relaxation(l: f32, u: f32, alpha: f32, beta: f32) -> Line
         let il = next_down_f32((-sl64 * x_low as f64) as f32 - sl_err);
         LinearRelaxation::new(sl, il, su, iu)
     } else if l < x_low {
-        // Crosses lower boundary only. Directed rounding (#3337).
+        // Crosses lower boundary only. Directed rounding.
         let max_abs = l.abs().max(u.abs()) as f64;
         let su64 = yu as f64 / (u as f64 - l as f64);
         let su = su64 as f32;
@@ -113,7 +113,7 @@ fn hard_sigmoid_linear_relaxation(l: f32, u: f32, alpha: f32, beta: f32) -> Line
         let iu = next_up_f32((yu as f64 - su64 * u as f64) as f32 + su_err);
         LinearRelaxation::new(ls, li, su, iu)
     } else {
-        // Crosses upper boundary only. Directed rounding (#3337).
+        // Crosses upper boundary only. Directed rounding.
         let max_abs = l.abs().max(u.abs()) as f64;
         let sl64 = (1.0_f64 - yl as f64) / (u as f64 - l as f64);
         let sl = sl64 as f32;

@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Regression tests for #3720: graph CROWN fallback provenance contract.
+//! Regression tests for the graph CROWN fallback provenance contract.
 //!
 //! These tests verify that the shared `graph_crown_dispatch_fallback_reason`
 //! helper is wired into DAG-CROWN and that recoverable dispatch errors produce
@@ -12,7 +12,7 @@
 //! `network/core/graph/fallback_reason.rs`. This module adds public
 //! `propagate_crown_with_provenance(...)` regressions for unsupported fallback
 //! behavior and for rank-2 LayerNorm staying on the real CROWN path after the
-//! multi-dimensional scalar uplift in #4148.
+//! multi-dimensional scalar uplift.
 
 use crate::layers::{
     Conv1dLayer, Layer, LayerNormLayer, LinearLayer, NonZeroLayer, TransposeLayer,
@@ -35,7 +35,7 @@ fn assert_arrays_close_4148(actual: &ArrayD<f32>, expected: &ArrayD<f32>, tol: f
     }
 }
 
-/// Regression for #3720: DAG-CROWN classifies dispatch errors through
+/// Regression: DAG-CROWN classifies dispatch errors through
 /// the shared `graph_crown_dispatch_fallback_reason` helper and records
 /// structured fallback provenance.
 ///
@@ -88,7 +88,7 @@ fn test_graph_crown_fallback_provenance_unsupported_3720() {
     );
 }
 
-/// Regression for #4148: rank-2 LayerNorm should stay on the real DAG-CROWN
+/// Regression: rank-2 LayerNorm should stay on the real DAG-CROWN
 /// path instead of tripping the old scalar `ShapeMismatch` fallback.
 #[ntest::timeout(10000)]
 #[test]
@@ -181,7 +181,7 @@ fn build_conv1d_transpose_layernorm_graph_4148() -> (GraphNetwork, BoundedTensor
     (graph, input)
 }
 
-/// Regression for #4148 on the exact Kokoro-shaped route:
+/// Regression on the exact Kokoro-shaped route:
 /// Conv1d -> Transpose -> LayerNorm should keep the LayerNorm node and graph
 /// output on the real CROWN path.
 #[ntest::timeout(10000)]
@@ -247,8 +247,8 @@ fn test_graph_crown_conv1d_transpose_layernorm_node_stays_on_crown_4148() {
     );
 }
 
-/// Packet C (#4171): The transpose node itself must stay on exact CROWN and
-/// produce finite, correctly-shaped bounds. Before #4171 Packet A, grouped
+/// The transpose node itself must stay on exact CROWN and
+/// produce finite, correctly-shaped bounds. Previously, grouped
 /// multi-dimensional bounds triggered UnsupportedConfiguration fallback.
 #[ntest::timeout(10000)]
 #[test]

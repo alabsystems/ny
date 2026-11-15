@@ -3,10 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
-// Under tRustc contract verification (`--cfg trust_verify`) the first-class
-// `#[ensures]`/`#[requires]` attributes live in the unstable `core::contracts`
-// module; this feature gate enables them. Stable rustc never sees this (cfg-gated)
-// and falls back to the NY-owned `trust` compatibility macros. Mirrors ny-cert.
+// Enable compiler contracts in the verified lane; the unverified lane uses
+// NY's compatibility macros.
 #![cfg_attr(trust_verify, feature(contracts))]
 
 //! Core types and traits for ny neural network verification.
@@ -14,33 +12,46 @@
 //! This crate provides the foundational abstractions for bound propagation
 //! in neural networks, enabling formal verification of properties like
 //! robustness and equivalence.
-//!
-//! Implementation details live in module files; lib.rs is intentionally kept
-//! small and focused on re-exports.
 
 mod axis;
 mod bound;
 mod bound_tightener;
-mod counterexample;
 /// #cost-observer: invariant I1's missing PRODUCER. `#phase-window` requires a
 /// cost "predicted on this host, from a measured rate, not a constant", but the
 /// only two producers in the tree need an analytic MAC model. This measures a
 /// repeated seam's OWN per-call cost as the run proceeds and derives the
 /// allowance from that measurement plus the live remaining wall.
 pub mod cost_observer;
+mod counterexample;
 mod custom_op;
 /// Double-double (two-f64) compensated arithmetic + certified error envelope
 /// (`#dd-zonotope`).
 pub mod dd;
 /// One-time known-answer bit-exactness probe authorizing the double-double path.
 pub mod dd_selfcheck;
+/// #router-r2 CR-1: the ONE deadline authority — one monotone deadline cell
+/// per governed lane, contracts, the terminal's remainder, hand-on and the
+/// publish grace. Armed only by the ACTING router; unarmed every read is
+/// `None` and every lane keeps today's value.
+pub mod deadline_authority;
 mod display;
 pub mod eft;
 mod error;
+/// #router-r4 CR-F: the FAR hand-on authority — at a lane's own safe point it
+/// classifies the lane's progress at c2/c3 (work units) and hands the unspent
+/// contract to a STRICTLY sealed recipient through the deadline authority.
+/// Armed only by the ACTING router; unarmed every call is one atomic load and
+/// `Continue`.
+pub mod far_authority;
 mod floating_point;
 mod gemm;
 /// #mn-head-facet HEAD coupling-facet f64-recovery fold registry (shared seam).
 pub mod head_f64_fold;
+/// Sparse global functional search; private full-source replay grants validity.
+pub mod head_functional_advice;
+/// Numeric LP advice only; owned neural source replay grants validity.
+pub mod head_phase_advice;
+pub mod head_phase_cover_advice;
 /// #phase-window: invariant I1 — no fixed seconds. A phase window derives from
 /// predicted cost on this host and is admitted only inside a FRACTION of what
 /// remains; one that does not fit declines rather than half-running.
@@ -50,10 +61,18 @@ pub mod instance_budget;
 pub mod joint_alpha_grad;
 mod layer_output;
 mod layer_type;
+/// Fixed-capacity local weighted-L1 lower-cut arithmetic transport; not proof authority.
+pub mod local_l1_lower_cut;
 /// Injected device-executor seam for the margin-row certified GPU backward
 /// (#margin-row-gpu-eft): trait here, implementation in ny-gpu
 /// (`MarginRowLaneDevice`), registration in ny-propagate `margin_row`.
 pub mod margin_row_lane_gpu;
+/// #router-r4 CR-L: the memory lease authority — one envelope per row from
+/// the declared host's static envelope, leases held by the verifier and the
+/// graph-heavy optional lanes, never past the envelope in aggregate. Armed
+/// only by the ACTING router; unarmed every call is `None` and every gate
+/// keeps today's live decision.
+pub mod memory_lease;
 mod nan_math;
 mod output_constraint;
 /// #phase-scheduler: the marginal-value loop that composes I1/I2/I3 — spend the
@@ -66,13 +85,55 @@ pub mod phase_yield;
 /// Floating-point precision tags for mixed-precision verification (P8).
 pub mod precision;
 mod proof;
+/// #soundness-spine M2a: `ProofProfile { Proof, Competition }`, resolved once by
+/// the entry point. It selects artifact sinks and audit rates only; no
+/// certifier may name it.
+pub mod proof_profile;
 mod reshape_copy_axis;
 /// Certified Cut-CROWN resident cut-fold registry (shared writer/reader seam).
 pub mod resident_cut_fold;
 /// Arithmetic-only, call-local resident Cut-CROWN shadow transport.
 pub mod resident_cut_shadow;
+/// #router-r5 CR-RS / CR-G: the route authority — the capabilities the
+/// ACTING router routed on this row (each only at SR.seal) and whether the
+/// gap-order contract funds multi-objective classes. Unarmed every consult is
+/// one atomic load answering `false`.
+pub mod route_authority;
+/// #router-r1 (ROUTER_PROGRAM R1): the verdict-free runtime router — the
+/// capability declarations, the pure plan and checkpoints, the write-only
+/// progress bus and `fail_open`. It names no verdict type and no proof profile
+/// (`tests/router_ratchet.rs`), and it acts on nothing in R1.
+pub mod router;
+/// #bbe (ENGINE_PROGRAM §1.3): the UNTRUSTED search side's plain data types —
+/// `Untrusted<T>` / `Hint<T>`, the injected `SearchBackend` trait (implemented
+/// in `ny-bbe`, registered by ny-cli, seen by ny-propagate only as `&dyn`),
+/// and `SearchNet`, the plain-data search copy of a lane's IR.
+pub mod search;
+/// Fixed one-row, three-neuron lower-cut arithmetic transport; not proof authority.
+pub mod triplet_lower_cut;
+/// Two-disjoint-local weighted-L1 arithmetic transport.
+pub mod two_local_l1_lower_cut;
+/// Fixed one-row, two-pair lower-cut arithmetic transport; not proof authority.
+pub mod two_pair_lower_cut;
 
+/// #phase-cost: the per-phase COST CENSUS of one scored run (wall, thread time,
+/// enters, units, RSS per phase, plus run-level work counters), serialized into
+/// the flight sidecar by ny-cli. Observability only — nothing reads it to make
+/// a decision.
+pub mod phase_cost;
 mod soundness;
+/// #router-r3 O-STOP: the in-lane stop authority — which optimizer stop rules
+/// the acting router armed (`rule.governor`, `rule.ia_yield`,
+/// `rule.attack_defer`, `rule.root_admission`) and the ledger of what each
+/// stop freed and who received it. Armed only under `optimizer.mode: on`;
+/// unarmed every read is `None` and every phase keeps today's rule.
+pub mod stop_authority;
+/// #router-r6 O-TRIAL: the trial authority — which optimizer trial rules and
+/// sites the acting router armed (`rule.trial_width`, `rule.trial_lr_backoff`,
+/// `rule.trial_split_restart`, `rule.trial_attack_halving`) and the ledger of
+/// every trial event. Armed only under `optimizer.mode: on`; unarmed every
+/// read is `None` and every lane keeps today's value.
+pub mod trial_authority;
 mod verification_result;
 mod verification_spec;
 mod violation;
@@ -433,6 +494,8 @@ pub use gemm::{
 pub use layer_output::LayerOutput;
 /// Enum of all supported neural network layer types.
 pub use layer_type::LayerType;
+/// Fixed-capacity local weighted-L1 lower-cut arithmetic transport; not proof authority.
+pub use local_l1_lower_cut::ResidentLocalL1LowerCutCarrier;
 /// Margin-row certified GPU backward: injected device-executor seam.
 pub use margin_row_lane_gpu::{
     LaneArenaBuffer, LaneBinding, LaneProgramSpec, LaneProgramTiming, LaneResidentId,
@@ -475,6 +538,12 @@ pub use resident_cut_shadow::{
 };
 /// Soundness provenance tracking: which heuristics were used during verification.
 pub use soundness::{HeuristicUsed, SoundnessProvenance, VerificationSoundnessMode};
+/// Fixed-size lower-only transport for three distinct neurons; not a certificate.
+pub use triplet_lower_cut::ResidentTripletLowerCutCarrier;
+/// Two disjoint local certificates in one lower-only arithmetic fold.
+pub use two_local_l1_lower_cut::ResidentTwoLocalL1LowerCutCarrier;
+/// Fixed-size lower-only transport for two disjoint pairs; not a certificate.
+pub use two_pair_lower_cut::ResidentTwoPairLowerCutCarrier;
 /// Typed tag identifying which verification method produced a result.
 pub use verification_result::MethodUsed;
 /// Verification result with outcome and optional counterexample.

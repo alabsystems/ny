@@ -882,9 +882,9 @@ fn test_conv1d_crown_kernel3_soundness() -> Result<()> {
     Ok(())
 }
 
-// --- Regression tests for #2828: stride=0 and invalid spatial configs ---
+// --- Regression tests: stride=0 and invalid spatial configs ---
 
-/// Regression test for #2828: Conv1d stride=0 must be rejected by constructor.
+/// Regression test: Conv1d stride=0 must be rejected by constructor.
 #[ntest::timeout(10000)]
 #[test]
 fn conv1d_zero_stride_rejected() {
@@ -896,7 +896,7 @@ fn conv1d_zero_stride_rejected() {
     );
 }
 
-/// Regression test for #2828: ConvTranspose1d stride=0 must be rejected.
+/// Regression test: ConvTranspose1d stride=0 must be rejected.
 #[ntest::timeout(10000)]
 #[test]
 fn conv_transpose1d_zero_stride_rejected() {
@@ -908,7 +908,7 @@ fn conv_transpose1d_zero_stride_rejected() {
     );
 }
 
-/// Regression test for #2828: Conv1d output_length underflow (kernel > padded input).
+/// Regression test: Conv1d output_length underflow (kernel > padded input).
 #[ntest::timeout(10000)]
 #[test]
 fn conv1d_output_length_underflow_returns_error() -> Result<()> {
@@ -946,7 +946,7 @@ fn conv1d_output_length_checked_arithmetic_rejects_overflow() -> Result<()> {
     Ok(())
 }
 
-/// Regression test for #2828: Conv1d valid stride=1 is accepted.
+/// Regression test: Conv1d valid stride=1 is accepted.
 #[ntest::timeout(10000)]
 #[test]
 fn conv1d_stride_one_accepted() {
@@ -954,12 +954,12 @@ fn conv1d_stride_one_accepted() {
     Conv1dLayer::new(kernel, None, 1, 0).expect("stride=1 must be accepted");
 }
 
-/// Regression test for #2877: IBP forward with kernel > padded input returns error, not panic.
+/// Regression test: IBP forward with kernel > padded input returns error, not panic.
 #[ntest::timeout(10000)]
 #[test]
 fn conv1d_ibp_kernel_oversized_returns_error() -> Result<()> {
     // kernel_size=5, input_len=2, padding=0 → padded=2 < 5 → conv1d_single underflow.
-    // Before #2877 fix, this caused usize underflow panic in conv1d_single.
+    // Before the fix, this caused usize underflow panic in conv1d_single.
     let kernel = ArrayD::from_shape_vec(IxDyn(&[1, 1, 5]), vec![1.0; 5]).expect("kernel");
     let conv = Conv1dLayer::with_input_length(kernel, None, 1, 0, 2)?;
     let input = BoundedTensor::new(
@@ -975,7 +975,7 @@ fn conv1d_ibp_kernel_oversized_returns_error() -> Result<()> {
     Ok(())
 }
 
-/// Regression test for #2747: Conv1d CROWN backward with NaN kernel returns
+/// Regression test: Conv1d CROWN backward with NaN kernel returns
 /// NumericalInstability error instead of silently producing NaN coefficients.
 #[ntest::timeout(10000)]
 #[test]
@@ -990,7 +990,7 @@ fn conv1d_crown_backward_nan_kernel_returns_error() {
     );
 }
 
-/// Regression test for #2747: ConvTranspose1d CROWN backward with NaN kernel
+/// Regression test: ConvTranspose1d CROWN backward with NaN kernel
 /// returns NumericalInstability error.
 #[ntest::timeout(10000)]
 #[test]
@@ -1005,7 +1005,7 @@ fn convtranspose1d_crown_backward_nan_kernel_returns_error() {
     );
 }
 
-/// Regression test for #4204 / #2747: Conv1d CROWN backward with NaN bias
+/// Regression test: Conv1d CROWN backward with NaN bias
 /// returns NumericalInstability error (crown_helpers.rs line 25 guard).
 ///
 /// Conv2d already has conv2d_crown_backward_nan_bias_returns_error; this
@@ -1023,7 +1023,7 @@ fn conv1d_crown_backward_nan_bias_returns_error_4204() {
     );
 }
 
-/// Regression test for #4204 / #2747: ConvTranspose1d CROWN backward with NaN
+/// Regression test: ConvTranspose1d CROWN backward with NaN
 /// bias returns NumericalInstability error.
 #[ntest::timeout(10000)]
 #[test]
@@ -1073,7 +1073,7 @@ fn make_overflow_bounds(num_cols: usize) -> LinearBounds {
     LinearBounds::new(la, Array1::zeros(2), ua, Array1::zeros(2)).expect("valid bounds")
 }
 
-/// Regression (#2812, #3228): Conv1d CROWN backward per-row coefficient magnitude fallback.
+/// Regression: Conv1d CROWN backward per-row coefficient magnitude fallback.
 ///
 /// When large A-matrix coefficients (1e19) multiply weights (1e5), the output
 /// exceeds CROWN_COEFF_MAX (1e10). The per-row fallback zeros the affected row
@@ -1197,10 +1197,10 @@ fn test_convtranspose1d_batched_crown_engine_matches_cpu_3622() -> Result<()> {
     Ok(())
 }
 
-/// Regression (#2812): ConvTranspose1d CROWN backward per-row non-finite fallback.
+/// Regression: ConvTranspose1d CROWN backward per-row non-finite fallback.
 /// Weight 1e5 chosen so row 0 (coeff 1e19) overflows: 1e19 * 1e5 = 1e24 > CROWN_COEFF_MAX (1e10),
 /// but row 1 (coeff 1.0) stays safe: 1.0 * 1e5 = 1e5 < 1e10.
-/// (Prior test used 1e20 which made BOTH rows exceed CROWN_COEFF_MAX after #3228 tightened
+/// (Prior test used 1e20 which made BOTH rows exceed CROWN_COEFF_MAX after a fix tightened
 /// the threshold from is_finite() to is_crown_coeff_safe().)
 #[ntest::timeout(10000)]
 #[test]
@@ -1706,7 +1706,7 @@ fn test_conv1d_output_length_with_dilation() -> Result<()> {
     Ok(())
 }
 
-// ─── GemmEngine baseline parity tests (#3598) ───────────────────────────────
+// ─── GemmEngine baseline parity tests ───────────────────────────────
 //
 // Verify that propagate_linear_with_engine(bounds, Some(&NaiveCpuGemmEngine))
 // produces identical results to propagate_linear_with_engine(bounds, None).
@@ -2283,7 +2283,7 @@ fn finite_deadline_zero_output_channel_convtranspose1d_polls_input_traversal() {
 }
 
 /// Conv1d CROWN backward: engine=None matches engine=Some(NaiveCpuGemmEngine).
-/// Kernel size 3, no bias, single channel. (#3598)
+/// Kernel size 3, no bias, single channel.
 #[ntest::timeout(10000)]
 #[test]
 fn test_conv1d_crown_engine_parity_kernel3_no_bias_3598() -> Result<()> {
@@ -2302,7 +2302,7 @@ fn test_conv1d_crown_engine_parity_kernel3_no_bias_3598() -> Result<()> {
     Ok(())
 }
 
-/// Conv1d CROWN backward: engine parity with bias. (#3598)
+/// Conv1d CROWN backward: engine parity with bias.
 #[ntest::timeout(10000)]
 #[test]
 fn test_conv1d_crown_engine_parity_with_bias_3598() -> Result<()> {
@@ -2322,7 +2322,7 @@ fn test_conv1d_crown_engine_parity_with_bias_3598() -> Result<()> {
     Ok(())
 }
 
-/// Conv1d CROWN backward: engine parity with multi-channel (2 in, 3 out). (#3598)
+/// Conv1d CROWN backward: engine parity with multi-channel (2 in, 3 out).
 #[ntest::timeout(10000)]
 #[test]
 fn test_conv1d_crown_engine_parity_multichannel_3598() -> Result<()> {
@@ -2355,7 +2355,7 @@ fn test_conv1d_crown_engine_parity_multichannel_3598() -> Result<()> {
     Ok(())
 }
 
-/// Conv1d CROWN backward: engine parity with dilation=2. (#3598)
+/// Conv1d CROWN backward: engine parity with dilation=2.
 #[ntest::timeout(10000)]
 #[test]
 fn test_conv1d_crown_engine_parity_dilation2_3598() -> Result<()> {
@@ -2375,7 +2375,7 @@ fn test_conv1d_crown_engine_parity_dilation2_3598() -> Result<()> {
     Ok(())
 }
 
-/// Conv1d CROWN backward: engine parity with non-identity incoming bounds. (#3598)
+/// Conv1d CROWN backward: engine parity with non-identity incoming bounds.
 ///
 /// Using non-identity A matrices exercises the full GEMM path, not just
 /// the trivial identity-times-Toeplitz case.
@@ -2403,7 +2403,7 @@ fn test_conv1d_crown_engine_parity_non_identity_bounds_3598() -> Result<()> {
     Ok(())
 }
 
-/// ConvTranspose1d CROWN backward: engine=None matches engine=Some. (#3598)
+/// ConvTranspose1d CROWN backward: engine=None matches engine=Some.
 #[ntest::timeout(10000)]
 #[test]
 fn test_convtranspose1d_crown_engine_parity_3598() -> Result<()> {
@@ -2426,7 +2426,7 @@ fn test_convtranspose1d_crown_engine_parity_3598() -> Result<()> {
     Ok(())
 }
 
-/// ConvTranspose1d CROWN backward: engine parity with bias. (#3598)
+/// ConvTranspose1d CROWN backward: engine parity with bias.
 #[ntest::timeout(10000)]
 #[test]
 fn test_convtranspose1d_crown_engine_parity_with_bias_3598() -> Result<()> {
@@ -2449,7 +2449,7 @@ fn test_convtranspose1d_crown_engine_parity_with_bias_3598() -> Result<()> {
     Ok(())
 }
 
-/// ConvTranspose1d CROWN backward: engine parity with non-identity bounds. (#3598)
+/// ConvTranspose1d CROWN backward: engine parity with non-identity bounds.
 #[ntest::timeout(10000)]
 #[test]
 fn test_convtranspose1d_crown_engine_parity_non_identity_3598() -> Result<()> {
@@ -2484,7 +2484,7 @@ fn test_convtranspose1d_crown_engine_parity_non_identity_3598() -> Result<()> {
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(64) })]
 
-    /// #3500 / #3622: ConvTranspose1d has no auto_LiRPA 1D reference, so prove
+    /// ConvTranspose1d has no auto_LiRPA 1D reference, so prove
     /// the GEMM-backed backward pass against the explicit flattened forward
     /// Jacobian under ny's row-vector A convention.
     #[ntest::timeout(10000)]

@@ -70,4 +70,3 @@ dist_shift_2023,./onnx/mnist_concat.onnx,./vnnlib/index6199_delta0.13.vnnlib,pre
 dist_shift_2023,./onnx/mnist_concat.onnx,./vnnlib/index7534_delta0.13.vnnlib,prepared,sat,0.08
 dist_shift_2023,./onnx/mnist_concat.onnx,./vnnlib/index9021_delta0.13.vnnlib,prepared,unsat,57.30
 dist_shift_2023,./onnx/mnist_concat.onnx,./vnnlib/index6107_delta0.13.vnnlib,prepared,unsat,57.64
-dist_shift_2023,onnx/test_nano.onnx,vnnlib/test_nano.vnnlib,0,unknown,0,unscored-warmup-absent-from-instances-csv

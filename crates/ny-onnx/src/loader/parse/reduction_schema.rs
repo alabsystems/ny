@@ -14,6 +14,7 @@ use crate::onnx_proto::{self, AttributeProto, GraphProto, NodeProto};
 use ny_core::{NyError, Result};
 use std::collections::{HashMap, HashSet};
 
+use super::expand_identity::ExpandIdentityCones;
 use super::literal_cone::{is_exact_integer_literal_node, LiteralCone, LiteralExemptions};
 use super::quantization_preflight::RawDtypeResolver;
 
@@ -46,6 +47,7 @@ pub(super) fn validate_reduction_comparison_schemas(
     opset_imports: &HashMap<String, i64>,
     literals: &LiteralCone,
     exemptions: &mut LiteralExemptions,
+    expand_identity: &ExpandIdentityCones,
 ) -> Result<()> {
     let standard_opset = opset_imports
         .get("")
@@ -65,10 +67,23 @@ pub(super) fn validate_reduction_comparison_schemas(
                 validate_reduction(node, opset, &mut dtypes, &mut shapes)?
             }
             "CumSum" => validate_cumsum(node, opset, &mut dtypes, &mut shapes)?,
-            "Equal" | "Less" | "Greater" | "LessOrEqual" | "GreaterOrEqual" => {
-                validate_comparison(node, opset, &mut dtypes, &mut shapes, literals, exemptions)?
-            }
-            "Where" => validate_where(node, opset, &mut dtypes, literals, exemptions)?,
+            "Equal" | "Less" | "Greater" | "LessOrEqual" | "GreaterOrEqual" => validate_comparison(
+                node,
+                opset,
+                &mut dtypes,
+                &mut shapes,
+                literals,
+                exemptions,
+                expand_identity,
+            )?,
+            "Where" => validate_where(
+                node,
+                opset,
+                &mut dtypes,
+                literals,
+                exemptions,
+                expand_identity,
+            )?,
             _ => unreachable!("operator filtered above"),
         }
     }
@@ -86,8 +101,15 @@ pub(super) fn validate_reduction_comparison_schemas_unfolded(
 ) -> Result<()> {
     let literals = LiteralCone::new(graph);
     let mut exemptions = LiteralExemptions::default();
-    validate_reduction_comparison_schemas(graph, opset_imports, &literals, &mut exemptions)?;
-    exemptions.require_all_folded(&crate::WeightStore::new())
+    let expand_identity = ExpandIdentityCones::certify(graph);
+    validate_reduction_comparison_schemas(
+        graph,
+        opset_imports,
+        &literals,
+        &mut exemptions,
+        &expand_identity,
+    )?;
+    exemptions.require_all_folded(&crate::WeightStore::new(), graph)
 }
 
 fn is_audited_operator(op_type: &str) -> bool {
@@ -228,6 +250,7 @@ fn validate_cumsum(
     require_rank(node, shapes, &node.input[1], "axis", 0)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_comparison(
     node: &NodeProto,
     opset: i64,
@@ -235,6 +258,7 @@ fn validate_comparison(
     shapes: &mut RawShapeResolver<'_>,
     literals: &LiteralCone,
     exemptions: &mut LiteralExemptions,
+    expand_identity: &ExpandIdentityCones,
 ) -> Result<()> {
     let minimum = if matches!(node.op_type.as_str(), "LessOrEqual" | "GreaterOrEqual") {
         12
@@ -269,10 +293,21 @@ fn validate_comparison(
         ));
     }
     if let Err(refusal) = require_ny_float_data(node, lhs_dtype, "comparison operands") {
-        if !is_exact_integer_literal_node(node, literals, dtypes)? {
+        if is_exact_integer_literal_node(node, literals, dtypes)? {
+            exemptions.record(node, &refusal);
+        } else if expand_identity.is_certified_equal(node) {
+            // #cctsdb-expand-identity: `Equal(Shape(x), <provably negative>)`
+            // is CONSTANT all-false by ONNX semantics (dims are never
+            // negative), independent of the runtime shape values, so it never
+            // performs an integer comparison on ny's f32 data path.  The
+            // literal cone deliberately cannot answer here — its operand is
+            // `Shape`-rooted and runtime — so the refusal is deferred to the
+            // canonicalization ratchet instead: if `prepare` does not erase
+            // the node, this exact message re-raises (see `expand_identity`).
+            exemptions.record_canonicalizable(node, &refusal);
+        } else {
             return Err(refusal);
         }
-        exemptions.record(node, &refusal);
     }
     require_output_dtype(node, dtypes, BOOL)
 }
@@ -359,6 +394,7 @@ fn validate_where(
     dtypes: &mut RawDtypeResolver<'_>,
     literals: &LiteralCone,
     exemptions: &mut LiteralExemptions,
+    expand_identity: &ExpandIdentityCones,
 ) -> Result<()> {
     require_minimum_opset(node, opset, 9)?;
     require_exact_io(node, 3, 1)?;
@@ -385,10 +421,17 @@ fn validate_where(
         ));
     }
     if let Err(refusal) = require_ny_float_data(node, true_dtype, "selected values") {
-        if !is_exact_integer_literal_node(node, literals, dtypes)? {
+        if is_exact_integer_literal_node(node, literals, dtypes)? {
+            exemptions.record(node, &refusal);
+        } else if expand_identity.is_certified_where(node) {
+            // #cctsdb-expand-identity: a `Where` whose condition is a certified
+            // all-false `Equal` and whose `Y` IS the compared `Shape` output is
+            // a value-identity of `Y`; `prepare` canonicalizes it to
+            // `Identity(Y)` or this refusal re-raises verbatim.
+            exemptions.record_canonicalizable(node, &refusal);
+        } else {
             return Err(refusal);
         }
-        exemptions.record(node, &refusal);
     }
     require_output_dtype(node, dtypes, true_dtype)
 }

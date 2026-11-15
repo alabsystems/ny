@@ -465,11 +465,6 @@ fn gemm_reshape_bn_fold_reports_with_block_greater_than_one() {
     let _gate = ForceIntervalReport::enable();
     let consumed = fold_batch_norm_into_conv_linear(&mut nodes, &mut weights);
     assert_eq!(consumed.len(), 1, "the Gemm->Reshape->BN triple must fold");
-    // MEASURED 2026-07-29: the fold consumes the triple and emits ZERO reports.
-    // The certificate consequence is that a Gemm->Reshape->BN tail is a
-    // fold-rewritten region the interval reporter does not yet account for, so a
-    // certificate over such a graph must not claim authored-graph scope on the
-    // strength of this reporter alone.
     let reports = take_reports();
     assert_eq!(reports.len(), 1, "one report per folded node");
     let report = reports[0];

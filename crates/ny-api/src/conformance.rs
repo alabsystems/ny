@@ -2,66 +2,20 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Operation soundness-coverage gate (P9).
+//! Operator soundness classifications over [`ny_core::LayerType`], available
+//! without the `propagate` feature through [`ConformanceReport`].
 //!
-//! This module is the canonical, build-time-checked map from each
-//! [`ny_core::LayerType`] to how soundly ny's bound-propagation handles it.
-//! It classifies every operator into a [`SoundnessClass`] and exposes a
-//! [`ConformanceReport`] so external consumers (e.g. the NN ML framework)
-//! can query op coverage without reaching past the facade.
+//! `LayerType` is a cross-crate `#[non_exhaustive]` enum, so the required
+//! wildcard conservatively returns [`SoundnessClass::Unsupported`]. Rust
+//! cannot enforce exhaustive classification here. When adding a variant,
+//! update both [`soundness_class`] and [`all_variants`], not just a test count.
 //!
-//! It operates purely on `ny-core` types and is therefore always available
-//! (no `propagate` feature required).
-//!
-//! # Coverage gate
-//!
-//! [`soundness_class`] is implemented as a per-variant `match` that names
-//! every current `LayerType` explicitly. Adding a new operator that is left
-//! unclassified is intended to be caught here: the body lists each variant by
-//! name, so a reviewer extending `LayerType` must add a corresponding arm and
-//! deliberately assign a soundness class.
-//!
-//! Note: `LayerType` is `#[non_exhaustive]` and is defined in a different
-//! crate (`ny-core`), so the Rust compiler *requires* a trailing wildcard arm
-//! here — a fully wildcard-free exhaustive match is not permitted across the
-//! crate boundary. The wildcard conservatively classifies anything it catches
-//! as [`SoundnessClass::Unsupported`].
-//!
-//! **The wildcard is a real, silent catch — not a formality.** This module
-//! used to claim "every variant that exists today is named explicitly, so the
-//! wildcard is unreachable for the current enum". That claim was false, twice
-//! over. `LayerType::Trunc` and `LayerType::Erf` were the first pair; the
-//! second was `LayerType::Conv3d`, `LayerType::ScatterAdd` and
-//! `LayerType::IndexAdd`, all three of which had a `LayerType` variant, a real
-//! ny-propagate layer, an `ny-build` convert arm and a
-//! `ny_trace_bridge::coverage` classification, and were nevertheless being
-//! reported *unverifiable* here. Nothing in the type system catches that,
-//! because a cross-crate `#[non_exhaustive]` match compiles fine while missing
-//! arms.
-//!
-//! So the invariant is maintained by convention plus **two** pins, which
-//! between them cover both ways a variant can go missing:
-//!
-//! 1. [`all_variants`] must list every `LayerType`, and
-//!    `tests::report_covers_all_variants` asserts its length against the
-//!    enum's variant count. This catches a variant added to `ny-core` but not
-//!    listed here. When the count changes, add the arm in [`soundness_class`]
-//!    AND the entry in [`all_variants`] — do not simply bump the number.
-//! 2. `tests::unsupported_bucket_is_exactly_the_two_intended_ops` pins the
-//!    *contents* of the `Unsupported` bucket by name. This catches the other
-//!    direction — a variant listed in [`all_variants`] but never classified in
-//!    [`soundness_class`] falls into the wildcard, lands in that bucket, and
-//!    fails the test with its own name in the diff. That is the pin the
-//!    `Conv3d` / `ScatterAdd` / `IndexAdd` regression would have tripped; the
-//!    bumpable count alone would not have.
-//!
-//! Together they are the closest available surrogate for the wildcard-free
-//! exhaustive match `ny_trace_bridge::coverage::trace_op_soundness` gets to use
-//! over its own crate's `TraceOp`.
-//!
-//! Note: serde `Serialize`/`Deserialize` derives are intentionally omitted
-//! because `ny-api` does not currently depend on `serde`. Re-add them once
-//! `serde` is a dependency of this crate (see the structured report).
+//! `tests::report_covers_all_variants` pins the expected catalogue size;
+//! `tests::all_variants_is_a_duplicate_free_round_tripping_list` checks its
+//! identities; `tests::unsupported_bucket_is_exactly_the_two_intended_ops`
+//! pins unsupported names so a listed but unclassified variant fails visibly.
+//! These checks complement the required manual review of enum additions.
+//! Classifications do not certify the numeric soundness of an individual run.
 
 /// How soundly ny's bound propagation handles a given operation.
 ///
@@ -309,8 +263,10 @@ pub fn soundness_class(layer: &ny_core::LayerType) -> SoundnessClass {
         // deliberately loose wherever the condition is in fact decided. Only
         // the embedded-constant path (`embedded_constant_select_output`)
         // tightens to the exact select, and only per element where the
-        // condition's own interval is degenerate. IBP-only: a select has no
-        // useful CROWN linear relaxation.
+        // condition's own interval is determined (one side of 0.5 for a
+        // BOOL-valued condition; the trace bridge lowers nn's `mask != 0` to
+        // that meaning with an explicit `Compare(Ne, 0)`). IBP-only: a select
+        // has no useful CROWN linear relaxation.
         //
         // Sound but loose, therefore — NOT unsupported. Classifying `Where`
         // `Unsupported` reported a soundness hole on every masked graph

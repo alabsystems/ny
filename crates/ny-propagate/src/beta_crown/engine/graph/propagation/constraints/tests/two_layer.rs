@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Two-ReLU-layer regressions (#1926).
+//! Two-ReLU-layer regressions.
 
 use ndarray::{arr1, arr2};
 
@@ -196,7 +196,7 @@ fn test_two_relu_layers_storing_intermediates_captures_both_relus() {
     }
 }
 
-/// Shared setup for #1926: constrain both neurons so backward.rs enters
+/// Shared setup: constrain both neurons so backward.rs enters
 /// the pre-ReLU storage path.
 fn build_both_constrained_history_1926() -> GraphSplitHistory {
     GraphSplitHistory::new()
@@ -214,7 +214,7 @@ fn build_both_constrained_history_1926() -> GraphSplitHistory {
         })
 }
 
-/// Regression test for #1926: pre-ReLU bounds stored during intermediates mode
+/// Regression test: pre-ReLU bounds stored during intermediates mode
 /// must not be silent zeros from a failed `into_dimensionality::<Ix1>()`.
 #[test]
 fn test_pre_relu_bounds_not_silent_zeros_1926() {
@@ -246,7 +246,7 @@ fn test_pre_relu_bounds_not_silent_zeros_1926() {
     );
 }
 
-/// Regression test for #1926: stored pre-ReLU bounds must match forward cache.
+/// Regression test: stored pre-ReLU bounds must match forward cache.
 #[test]
 fn test_pre_relu_bounds_match_forward_cache_1926() {
     let verifier = BetaCrownVerifier::new(BetaCrownConfig::default());

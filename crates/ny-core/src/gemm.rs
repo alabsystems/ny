@@ -98,16 +98,16 @@ pub use gpu_ibp::{GpuIbpForward, GpuIbpForwardExt, GpuIbpLayer, GpuIbpModelPlan,
 /// the contract test `test_fallback_bound_consistent` verifies the values match.
 pub const FALLBACK_BOUND: f32 = 1e10;
 
-/// Maximum absolute value for CROWN backward A-matrix coefficients (#1932).
+/// Maximum absolute value for CROWN backward A-matrix coefficients.
 ///
 /// When |A[i,j]| exceeds this threshold after a backward propagation step,
 /// the entire row is degraded to zero coefficients with ±inf bias — the same
-/// sound treatment as actual Inf overflow (#2681), but triggered proactively
+/// sound treatment as actual Inf overflow, but triggered proactively
 /// before coefficients reach f32::INFINITY.
 ///
 /// Without this, coefficients growing via A_new = A @ W can silently reach
 /// magnitudes near f32::MAX (~3.4e38) where subsequent multiplications produce
-/// Inf or NaN. The #2681 handler only catches actual Inf, missing the "near
+/// Inf or NaN. The Inf overflow handler only catches actual Inf, missing the "near
 /// overflow" regime where a coefficient like 1e35 * 1e5 = 1e40 > f32::MAX.
 ///
 /// Set to match FALLBACK_BOUND for consistency with IBP overflow repair.
@@ -121,7 +121,7 @@ pub const CROWN_COEFF_MAX: f32 = 1e10;
 /// below [`CROWN_COEFF_MAX`]. The threshold itself is the finite overflow
 /// sentinel and therefore cannot represent a trustworthy coefficient. Used by
 /// CROWN backward paths to detect
-/// near-overflow coefficients before they cascade (#1932).
+/// near-overflow coefficients before they cascade.
 #[inline]
 #[must_use]
 pub fn is_crown_coeff_safe(value: f32) -> bool {
@@ -129,7 +129,7 @@ pub fn is_crown_coeff_safe(value: f32) -> bool {
 }
 
 /// f64 variant of [`is_crown_coeff_safe`] for normalization CROWN backward
-/// paths that accumulate coefficients in double precision (#3228).
+/// paths that accumulate coefficients in double precision.
 ///
 /// Uses the same [`CROWN_COEFF_MAX`] threshold (cast to f64). Values exceeding
 /// this would overflow when converted to f32 bounds downstream.
@@ -144,8 +144,6 @@ pub fn is_crown_coeff_safe_f64(value: f64) -> bool {
 /// Describes a single-group Conv2d backward: the caller loops over groups and
 /// passes per-group slices. All spatial dimensions refer to the forward conv's
 /// input/output (backward reverses the direction).
-///
-/// Reference: designs/2026-03-15-issue-3813-fused-gpu-conv2d-backward.md
 #[derive(Debug, Clone, Copy)]
 pub struct ConvTranspose2dParams {
     /// Number of specification/objective rows (S).
@@ -571,9 +569,6 @@ pub trait GemmEngine: Sync + Send {
     ///
     /// Default: returns `Err(Unsupported)`. Callers fall back to `gemm_f32` +
     /// CPU col2im when this method is not available.
-    ///
-    /// Reference: designs/2026-03-15-issue-3813-fused-gpu-conv2d-backward.md
-    /// Part of #3813.
     fn conv_transpose_2d(
         &self,
         _a_reshaped: &[f32],
@@ -613,7 +608,7 @@ pub trait GemmEngine: Sync + Send {
         Ok((lower, upper))
     }
 
-    /// Optional GPU CROWN backward accelerator (#3397).
+    /// Optional GPU CROWN backward accelerator.
     fn as_gpu_crown_backward(&self) -> Option<&dyn GpuCrownBackward> {
         None
     }
@@ -639,17 +634,17 @@ pub trait GemmEngine: Sync + Send {
         false
     }
 
-    /// Optional GPU-resident IBP forward accelerator (#4081).
+    /// Optional GPU-resident IBP forward accelerator.
     fn as_gpu_ibp_forward(&self) -> Option<&dyn GpuIbpForward> {
         None
     }
 
-    /// Optional cached GPU-resident IBP planner (#4268).
+    /// Optional cached GPU-resident IBP planner.
     fn as_gpu_ibp_forward_ext(&self) -> Option<&dyn GpuIbpForwardExt> {
         None
     }
 
-    /// Optional cached graph-DAG GPU-resident IBP planner (#4276, #4318).
+    /// Optional cached graph-DAG GPU-resident IBP planner.
     fn as_gpu_dag_ibp_forward_ext(&self) -> Option<&dyn GpuDagIbpForwardExt> {
         None
     }
@@ -1539,15 +1534,13 @@ pub struct CertifiedCoeffs {
 /// Describes one layer in the backward propagation sequence. Linear layers
 /// contribute weight matrix multiplication; activation layers contribute
 /// element-wise slope/intercept relaxation.
-///
-/// Reference: designs/2026-03-06-gpu-crown-backward.md
 #[derive(Clone)]
 pub enum GpuCrownLayer {
     /// Linear: A_new = A @ weight, bias_new += A_old @ layer_bias
     Linear {
         /// Weight matrix (out_features × in_features) row-major.
         /// Uses `Arc<[f32]>` so static weights are shared across CROWN calls
-        /// without per-call cloning (#3397 plan cache Step 1).
+        /// without per-call cloning.
         weight: Arc<[f32]>,
         /// Layer bias (out_features,), None if no bias
         bias: Option<Arc<[f32]>>,
@@ -1581,10 +1574,9 @@ pub enum GpuCrownLayer {
     /// 3. col2im gather: (S*OH*OW, IC*KH*KW) → (S, IC*IH*IW)
     ///
     /// Reference: alpha-beta-CROWN auto_LiRPA/operators/convolution.py:bound_backward
-    /// Reference: designs/2026-03-06-conv-crown-backward-gemm.md
     Conv2d {
         /// Kernel reshaped to W_col: (out_c, in_c * kh * kw) row-major.
-        /// Uses `Arc<[f32]>` for zero-copy sharing (#3397).
+        /// Uses `Arc<[f32]>` for zero-copy sharing.
         weight_col: Arc<[f32]>,
         /// Optional per-channel bias expanded to (out_c * oh * ow)
         bias_expanded: Option<Arc<[f32]>>,
@@ -1607,7 +1599,7 @@ pub enum GpuCrownLayer {
         /// zeros) is the legacy exact-weight contract and charges nothing.
         cert_err: CertifiedWeightError,
     },
-    /// ReLU dual-alpha activation: exact per-neuron alpha_lower/alpha_upper parity (#4313).
+    /// ReLU dual-alpha activation: exact per-neuron alpha_lower/alpha_upper parity.
     ///
     /// Unlike `Activation` (which uses symmetric 2-slope lower/upper semantics),
     /// this variant routes three independent affine branches based on coefficient
@@ -1700,7 +1692,7 @@ pub enum GpuResnetSegment {
 ///
 /// This lets graph constrained backward hand its live `LinearBounds` frontier
 /// into the existing GPU CROWN suffix without re-running the already-computed
-/// prefix on CPU. Part of #3813.
+/// prefix on CPU.
 #[derive(Clone, Debug)]
 pub struct GpuCrownSeed {
     pub lower_a: Arc<[f32]>,
@@ -3214,7 +3206,7 @@ pub struct GpuCrownTrajectoryResult {
 /// bounds. This eliminates N-1 roundtrips for an N-layer network.
 ///
 /// Reference: alpha-beta-CROWN keeps PyTorch tensors on GPU from the initial
-/// C matrix through to concretization. Source: designs/2026-03-06-gpu-crown-backward.md
+/// C matrix through to concretization.
 pub trait GpuCrownBackward: Sync + Send {
     /// Release model/wave-specific resident CROWN and point-VJP working state.
     ///
@@ -3901,11 +3893,196 @@ pub trait GpuCrownBackward: Sync + Send {
         })
     }
 
-    /// Whether this backend implements the observation-only, explicit-deadline
-    /// resident Cut-CROWN method above.
+    /// Explicit one-objective, zero-beta lower-cut arithmetic capability.
+    /// The caller must separately authenticate the exact facet, same graph,
+    /// domain, objective and generation. The public carrier is transport only.
+    /// A shadow observation is never an accepted argument or returned proof.
+    /// Implementations must use bounded full-K arithmetic, charge source and
+    /// mutation errors, reject uncharged weight errors/sentinels, and publish
+    /// no scalar after the supplied deadline. Ordinary GPU permissions are
+    /// unchanged. Default Unsupported keeps existing backends unmodified.
+    #[allow(clippy::too_many_arguments)]
+    fn crown_backward_gpu_resnet_lower_cut_with_deadline(
+        &self,
+        _segments: &[GpuResnetSegment],
+        _seed: &GpuCrownSeed,
+        _input_lower: &[f32],
+        _input_upper: &[f32],
+        _carrier: &crate::ResidentLowerCutCarrier,
+        _deadline: std::time::Instant,
+    ) -> Result<f32> {
+        Err(NyError::UnsupportedOp(
+            "bounded certified lower-cut arithmetic unavailable".into(),
+        ))
+    }
+
+    fn provides_bounded_lower_cut(&self) -> bool {
+        false
+    }
+
+    /// Explicit one-objective, zero-beta joint arithmetic for two disjoint pairs.
     ///
-    /// This does not grant verdict authority and does not claim that the
-    /// backend's other CROWN methods honor deadlines. The default is false.
+    /// This capability is independent of the old single-pair capability. The
+    /// private caller must authenticate BOTH facets under one original source,
+    /// domain, bound map, objective, generation and deadline. The fixed public
+    /// carrier is arithmetic transport, never a certificate or verdict token.
+    /// The private caller must establish the IEEE proof environment BEFORE
+    /// reducing or constructing `ResidentLowerCutChannel` values. A backend
+    /// entry guard cannot restore a source-error charge flushed earlier.
+    ///
+    /// Implementations must require a nonzero multiplier, validate the exact
+    /// one-row call and four distinct indices, enforce the IEEE environment,
+    /// and use bounded full-K arithmetic
+    /// with all source/mutation errors charged. Apply all four post channels
+    /// before ReLU sign selection, all four pre channels after slope propagation,
+    /// and the aggregate bias exactly once. Preserve upper arithmetic, refuse
+    /// uncharged model errors/sentinels, and publish no scalar after the deadline.
+    /// The default never delegates to the old cut or ordinary arithmetic paths.
+    #[allow(clippy::too_many_arguments)]
+    fn crown_backward_gpu_resnet_two_pair_lower_cut_with_deadline(
+        &self,
+        _segments: &[GpuResnetSegment],
+        _seed: &GpuCrownSeed,
+        _input_lower: &[f32],
+        _input_upper: &[f32],
+        _carrier: &crate::ResidentTwoPairLowerCutCarrier,
+        _deadline: std::time::Instant,
+    ) -> Result<f32> {
+        Err(NyError::UnsupportedOp(
+            "bounded two-pair lower-cut arithmetic unavailable".into(),
+        ))
+    }
+
+    /// Whether this engine implements the separate bounded two-pair method.
+    /// The old single-pair capability does not imply this capability.
+    fn provides_bounded_two_pair_lower_cut(&self) -> bool {
+        false
+    }
+
+    /// Explicit one-objective, zero-beta arithmetic for one three-neuron relation.
+    ///
+    /// This capability is independent of the single-pair and two-pair methods.
+    /// The private caller authenticates the complete relation, three indices,
+    /// weights, original source/domain/bounds, seed, generation and deadline.
+    /// The fixed carrier is arithmetic transport, never a certificate.
+    /// Establish the IEEE proof environment BEFORE reducing or constructing
+    /// channels; a backend guard cannot restore an earlier flushed error.
+    ///
+    /// Require one exact objective row, three distinct indices and a nonzero
+    /// multiplier. Apply all three post channels before ReLU sign selection,
+    /// all three pre channels after slope propagation, and one bias exactly
+    /// once. Preserve upper arithmetic and use bounded full-K arithmetic with
+    /// all source/mutation errors charged, IEEE and sentinel checks, and final
+    /// deadline checks. The default never delegates to another capability.
+    #[allow(clippy::too_many_arguments)]
+    fn crown_backward_gpu_resnet_triplet_lower_cut_with_deadline(
+        &self,
+        _segments: &[GpuResnetSegment],
+        _seed: &GpuCrownSeed,
+        _input_lower: &[f32],
+        _input_upper: &[f32],
+        _carrier: &crate::ResidentTripletLowerCutCarrier,
+        _deadline: std::time::Instant,
+    ) -> Result<f32> {
+        Err(NyError::UnsupportedOp(
+            "bounded triplet lower-cut arithmetic unavailable".into(),
+        ))
+    }
+
+    /// Separate checked triplet capability; no old capability implies it.
+    fn provides_bounded_triplet_lower_cut(&self) -> bool {
+        false
+    }
+
+    /// Explicit one-objective arithmetic for an authenticated local weighted-L1 cut.
+    ///
+    /// This capability is independent of support4 and all prior cut methods.
+    /// The private caller authenticates the local certificate, its 3 through 8
+    /// sorted indices, original source/domain/bounds, seed, generation and clock.
+    /// The fixed carrier is arithmetic transport, never proof authority.
+    /// Establish IEEE BEFORE reducing or constructing channels: backend checks
+    /// cannot restore an earlier flushed source-error radius.
+    ///
+    /// Require one exact row and a positive multiplier. Apply active post
+    /// channels before ReLU sign selection, active pre channels after slopes,
+    /// and the aggregate bias exactly once. Preserve upper arithmetic and all
+    /// dual-alpha, source/mutation error, full-K, sentinel, size, cursor and
+    /// final deadline guards. The default never delegates or initializes a
+    /// backend. A separate root owner must select an already available engine.
+    #[allow(clippy::too_many_arguments)]
+    fn crown_backward_gpu_resnet_local_l1_lower_cut_with_deadline(
+        &self,
+        _segments: &[GpuResnetSegment],
+        _seed: &GpuCrownSeed,
+        _input_lower: &[f32],
+        _input_upper: &[f32],
+        _carrier: &crate::ResidentLocalL1LowerCutCarrier,
+        _deadline: std::time::Instant,
+    ) -> Result<f32> {
+        Err(NyError::UnsupportedOp(
+            "bounded local L1 lower-cut arithmetic unavailable".into(),
+        ))
+    }
+
+    /// Separate checked local-L1 capability; support4 is neither required nor implied.
+    fn provides_bounded_local_l1_lower_cut(&self) -> bool {
+        false
+    }
+
+    /// One original-objective fold for two authenticated disjoint local-L1 cuts.
+    /// This is a separate permission, independent of support4 and old local8.
+    /// The private caller binds both certificates, original source/map/domain,
+    /// all indices/weights/multipliers, exact seed, generation and deadline.
+    /// Establish IEEE BEFORE reducing/constructing channels. Reduce both original
+    /// f32 bias products into ONE outward center/error channel; never drop a radius.
+    /// Apply active post channels before sign selection and active pre channels
+    /// after slopes, then add the aggregate bias once. Preserve all checked full-K,
+    /// dual-alpha, model/source/error, size, cursor and final-deadline guards.
+    /// The default neither delegates to old methods nor initializes a backend.
+    #[allow(clippy::too_many_arguments)]
+    fn crown_backward_gpu_resnet_two_local_l1_lower_cut_with_deadline(
+        &self,
+        _segments: &[GpuResnetSegment],
+        _seed: &GpuCrownSeed,
+        _input_lower: &[f32],
+        _input_upper: &[f32],
+        _carrier: &crate::ResidentTwoLocalL1LowerCutCarrier,
+        _deadline: std::time::Instant,
+    ) -> Result<f32> {
+        Err(NyError::UnsupportedOp(
+            "bounded two-local L1 lower-cut arithmetic unavailable".into(),
+        ))
+    }
+
+    /// Independent checked full-fold capability; support4 is not required or implied.
+    fn provides_bounded_two_local_l1_lower_cut(&self) -> bool {
+        false
+    }
+
+    /// Four exact objective rows with unconditional source/Frontier safety
+    /// validation and explicit model-error charging. This does not authorize
+    /// any particular graph/domain; the private caller constructs the four
+    /// objectives and binds returned support to the same borrowed raw source.
+    fn crown_backward_gpu_resnet_support4_with_deadline(
+        &self,
+        _segments: &[GpuResnetSegment],
+        _seed: &GpuCrownSeed,
+        _input_lower: &[f32],
+        _input_upper: &[f32],
+        _deadline: std::time::Instant,
+    ) -> Result<GpuCrownResult> {
+        Err(NyError::UnsupportedOp(
+            "checked four-row support unavailable".into(),
+        ))
+    }
+
+    fn provides_bounded_support4(&self) -> bool {
+        false
+    }
+
+    /// Whether this backend implements the observation-only, explicit-deadline
+    /// resident Cut-CROWN shadow method. This does not grant verdict authority
+    /// or claim that other CROWN methods honor deadlines. The default is false.
     fn provides_resident_cut_shadow(&self) -> bool {
         false
     }

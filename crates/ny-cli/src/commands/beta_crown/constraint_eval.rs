@@ -8,8 +8,6 @@
 //! `constraint_plan` and produce verification results. Used by both
 //! `beta_crown verify` and `bench_acasxu` to eliminate duplicated
 //! evaluation logic.
-//!
-//! Part of #1881: CLI verification semantics unification.
 
 use anyhow::{Context, Result};
 use ndarray::Array2;
@@ -318,13 +316,13 @@ mod tests {
     }
 
     // ======================================================================
-    // Semantic parity regression tests (#1881 Step 5)
+    // Semantic parity regression tests
     //
     // These tests verify that the shared evaluation helpers produce identical
     // results to the inline logic they replaced in bench_acasxu.rs and verify.rs.
     // ======================================================================
 
-    /// #1881: Aggregation parity — Violated status continues (doesn't short-circuit).
+    /// Aggregation parity — Violated status continues (doesn't short-circuit).
     ///
     /// The old bench_acasxu inline code matched Violated to "continue checking"
     /// rather than returning immediately. Verify shared aggregate_conjunctive
@@ -353,7 +351,7 @@ mod tests {
         assert_eq!(verified, 75, "Should accumulate verified from both");
     }
 
-    /// #1881: Aggregation parity — only Verified and Timeout cause early exit.
+    /// Aggregation parity — only Verified and Timeout cause early exit.
     ///
     /// The old inline code in bench_acasxu had:
     /// - Verified → return immediately
@@ -390,7 +388,7 @@ mod tests {
         assert_eq!(verified, 0);
     }
 
-    /// #1881: spec coefficients parity — sequential constant upper-bound.
+    /// Spec coefficients parity — sequential constant upper-bound.
     ///
     /// Previously `verify_constant` in bench_acasxu built coefficients inline:
     /// `coeffs[output_idx] = if verify_upper { 1.0 } else { -1.0 }`
@@ -427,7 +425,7 @@ mod tests {
         assert!((eff - 3.99).abs() < 1e-6);
     }
 
-    /// #1881: graph objective parity — constant constraint always uses +1.0.
+    /// Graph objective parity — constant constraint always uses +1.0.
     ///
     /// Both graph modes select `+Y`; the verifier mode, not threshold/objective
     /// negation, determines which complement is proved.
@@ -456,7 +454,7 @@ mod tests {
         assert_eq!(compute_effective_threshold(&lower), 3.99);
     }
 
-    /// #1881: augmented network parity — spec layer has correct shape.
+    /// Augmented network parity — spec layer has correct shape.
     ///
     /// The old inline code created:
     /// `Array2::from_shape_vec((1, num_outputs), coeffs)`
@@ -481,7 +479,7 @@ mod tests {
         assert_eq!(network.layers().len(), 1);
     }
 
-    /// #1881: Aggregation preserves exact domain/verified counts on early exit.
+    /// Aggregation preserves exact domain/verified counts on early exit.
     ///
     /// When Verified is hit at constraint i, the returned domain count must
     /// include domains from constraints 0..=i (inclusive), not just constraint i.

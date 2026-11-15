@@ -96,6 +96,7 @@ impl BetaCrownVerifier {
         std::collections::HashMap<String, Arc<BoundedTensor>>,
         Option<CachedLinearBounds>,
     )> {
+        graph.ensure_proof_eligible()?;
         let deadline = self.effective_graph_bab_deadline();
         ensure_constrained_propagation_deadline(
             deadline,
@@ -120,7 +121,7 @@ impl BetaCrownVerifier {
             "after Complete Clip and before constrained backward preparation",
         )?;
 
-        // #1817 diagnostic: dump forward bounds after constraint tightening when fully constrained
+        // Diagnostic: dump forward bounds after constraint tightening when fully constrained
         if tracing::enabled!(tracing::Level::DEBUG) {
             let total_relu_neurons: usize = exec_order
                 .iter()
@@ -144,7 +145,7 @@ impl BetaCrownVerifier {
                 }
             }
         }
-        // #1817: log exec order for debugging
+        // Log exec order for debugging
         if context.history.constraints.len() >= 12 {
             debug!("[#1817 exec] order: {:?}", exec_order);
         }
@@ -308,7 +309,7 @@ impl BetaCrownVerifier {
                     .collect()
             };
 
-        // #2399: Build lookups from both ReLU and GenBaB constraints so the forward pass
+        // Build lookups from both ReLU and GenBaB constraints so the forward pass
         // tightens bounds at general nonlinearities (GeLU, Sigmoid, Tanh), not just ReLU.
         let lookups =
             build_constraint_lookups(&history.constraints, &history.genbab_constraints, graph)?;
@@ -458,7 +459,7 @@ impl BetaCrownVerifier {
                 let crown_bounds = current_bounds.flatten();
 
                 // ReLU preserves shape: pre-activation and current (post-activation)
-                // bounds must have the same flat length. (#2671, #2920 WP-B)
+                // bounds must have the same flat length.
                 if pre_flat.len() != crown_bounds.len() {
                     return Err(NyError::InternalError(format!(
                         "pre_flat vs current_bounds shape mismatch at ReLU node '{}': \
@@ -477,12 +478,15 @@ impl BetaCrownVerifier {
                     match constrained {
                         Some(true) => {
                             if u < 0.0 {
-                                // #2926: Single-constraint infeasibility — active constraint
+                                // Single-constraint infeasibility — active constraint
                                 // on provably-negative neuron. Domain is empty.
-                                return Err(NyError::InfeasibleDomain(format!(
-                                    "active ReLU constraint at node '{}' idx={} but pre_u={} < 0",
-                                    node_name, neuron_idx, u
-                                )));
+                                // #vit-v3-bankable: the message carries the
+                                // certified slack `-u` (`emptiness_slack`).
+                                return Err(NyError::InfeasibleDomain(
+                                    super::emptiness_slack::active_message(
+                                        node_name, neuron_idx, u,
+                                    ),
+                                ));
                             }
                             // The active child is a subset of its parent, so the
                             // parent's post-ReLU CROWN enclosure remains valid.
@@ -516,19 +520,22 @@ impl BetaCrownVerifier {
                         }
                         Some(false) => {
                             if l > 0.0 {
-                                // #2926: Single-constraint infeasibility — inactive constraint
+                                // Single-constraint infeasibility — inactive constraint
                                 // on provably-positive neuron. Domain is empty.
-                                return Err(NyError::InfeasibleDomain(format!(
-                                    "inactive ReLU constraint at node '{}' idx={} but pre_l={} > 0",
-                                    node_name, neuron_idx, l
-                                )));
+                                // #vit-v3-bankable: the message carries the
+                                // certified slack `l` (`emptiness_slack`).
+                                return Err(NyError::InfeasibleDomain(
+                                    super::emptiness_slack::inactive_message(
+                                        node_name, neuron_idx, l,
+                                    ),
+                                ));
                             }
                             lower[[neuron_idx]] = 0.0;
                             upper[[neuron_idx]] = 0.0;
                         }
                         None => {
                             // Unconstrained: use the fresh child-domain ReLU bound, and only
-                            // intersect with inherited cache entries when they agree. (#1817)
+                            // intersect with inherited cache entries when they agree.
                             let relu_lower = nan_propagating_max(l, 0.0);
                             let relu_upper = nan_propagating_max(u, 0.0);
                             let crown_l = crown_bounds.lower()[[neuron_idx]];
@@ -551,16 +558,37 @@ impl BetaCrownVerifier {
                     }
                 }
 
-                // #2926: Check for multi-constraint infeasibility before constructing
+                // Check for multi-constraint infeasibility before constructing
                 // BoundedTensor. When constraint tightening + intersection produces
                 // lower > upper for any element, the domain is empty. Return
                 // InfeasibleDomain so the BaB loop treats this as verified, not failed.
                 let has_inverted = lower.iter().zip(upper.iter()).any(|(&l, &u)| l > u);
                 if has_inverted {
-                    return Err(NyError::InfeasibleDomain(format!(
-                        "constraint interaction at ReLU node '{}': tightened bounds have lower > upper",
-                        node_name,
-                    )));
+                    // #vit-v3-bankable: name the WIDEST inversion, so the
+                    // message carries the certified slack `l - u`
+                    // (`emptiness_slack`). The decision above is unchanged.
+                    let (worst, worst_lower, worst_upper) = lower
+                        .iter()
+                        .zip(upper.iter())
+                        .enumerate()
+                        .filter(|(_, (&l, &u))| l > u)
+                        .fold((0usize, f32::NAN, f32::NAN), |best, (i, (&l, &u))| {
+                            let gap = f64::from(l) - f64::from(u);
+                            let best_gap = f64::from(best.1) - f64::from(best.2);
+                            if best.1.is_nan() || gap > best_gap {
+                                (i, l, u)
+                            } else {
+                                best
+                            }
+                        });
+                    return Err(NyError::InfeasibleDomain(
+                        super::emptiness_slack::interaction_message(
+                            node_name,
+                            worst,
+                            worst_lower,
+                            worst_upper,
+                        ),
+                    ));
                 }
 
                 let lower_arr = lower
@@ -574,13 +602,13 @@ impl BetaCrownVerifier {
                 // Re-propagate forward through non-ReLU layers using constraint-tightened
                 // input bounds. Without this, linear layers after constrained ReLUs keep their
                 // original (wide) IBP bounds, causing CROWN backward to see unstable neurons
-                // that should be fully determined. (#1817)
+                // that should be fully determined.
                 let repropagated = if node.inputs.is_empty() {
                     current_bounds.as_ref().clone()
                 } else if matches!(node.layer, Layer::Concat(_)) {
                     // Concat is n-ary — must be checked before is_binary() to avoid
                     // routing through propagate_ibp_binary which only uses 2 inputs.
-                    // Matches the dispatch order in graph_ibp.rs and detailed.rs. (#2398)
+                    // Matches the dispatch order in graph_ibp.rs and detailed.rs.
                     if let Layer::Concat(concat) = &node.layer {
                         // Reconstruct full input list: constant_inputs indexed by
                         // original ONNX order, graph edges for non-constant slots.
@@ -694,7 +722,7 @@ impl BetaCrownVerifier {
                     // Unary layer (Linear, BatchNorm, Flatten, activation, etc.).
                     // Surface the real arity on a malformed multi-input unary node
                     // (e.g. a Sigmoid/SkipMerge wired with 2 inputs) instead of
-                    // masking every failure as "has no inputs" (#1840).
+                    // masking every failure as "has no inputs".
                     let input_name = node.require_unary_input().map_err(|_| {
                         NyError::InvalidSpec(format!(
                             "Constraint forward: {} node {} expects exactly 1 input, got {}",
@@ -738,6 +766,40 @@ impl BetaCrownVerifier {
                             None,
                             layer_deadline,
                         ),
+                        // #graph-constrained-forward-sound: the rest of the
+                        // conv family and AveragePool carried the SAME
+                        // round-to-nearest gap through the `_` arm below --
+                        // `bound_transpose.rs` documents its plain forward as
+                        // no-Higham -- and this per-domain box is intersected
+                        // tighter-wins into the inherited certified enclosure,
+                        // so an inward plain box REPLACED the sound one and fed
+                        // every later ReLU phase decision. On a cGAN generator
+                        // every node is a ConvTranspose2d, i.e. this was the
+                        // live plain-forward site on cgan's lane. Route them
+                        // exactly as the DAG collector's `node_ibp_step` does
+                        // (`graph_alpha/bounds/ibp.rs`): certified, and
+                        // deadline-pollable where the arm has one. Sound and
+                        // LOOSER-OR-EQUAL, never tighter.
+                        Layer::Conv1d(conv) => conv.propagate_ibp_sound_with_engine_and_deadline(
+                            node_input,
+                            None,
+                            layer_deadline,
+                        ),
+                        Layer::ConvTranspose1d(conv) => conv
+                            .propagate_ibp_sound_with_engine_and_deadline(
+                                node_input,
+                                None,
+                                layer_deadline,
+                            ),
+                        Layer::ConvTranspose2d(conv) => conv
+                            .propagate_ibp_sound_with_engine_and_deadline(
+                                node_input,
+                                None,
+                                layer_deadline,
+                            ),
+                        // AveragePool's certified kernel takes neither engine
+                        // nor deadline (see `node_ibp_step`).
+                        Layer::AveragePool(pool) => pool.propagate_ibp_sound(node_input),
                         // N-D Linear IBP otherwise enters four opaque faer
                         // products. The finite helper caps all geometry and
                         // polls its direct f64 contractions.
@@ -746,6 +808,10 @@ impl BetaCrownVerifier {
                             None,
                             layer_deadline,
                         ),
+                        // Remaining unary kinds: ReLU/Flatten/Reshape are
+                        // exact; BatchNorm self-certifies; the others are the
+                        // 1-ULP class the sequential certified table also
+                        // carries (documented there), not the conv-family gap.
                         _ => node.layer.propagate_ibp(node_input),
                     };
                     propagated.map_err(|e| {
@@ -762,7 +828,7 @@ impl BetaCrownVerifier {
                     })?
                 };
                 // Per-element intersection of re-propagated bounds with original CROWN-IBP
-                // bounds to keep whichever is tighter in each dimension (#2935).
+                // bounds to keep whichever is tighter in each dimension.
                 repropagated
                     .intersection_per_element(current_bounds.as_ref())
                     .map(|(b, _)| b)
@@ -772,7 +838,7 @@ impl BetaCrownVerifier {
             if let Some(cons) = lookups.pre.get(node_name) {
                 output_bounds = apply_pre_constraints(&output_bounds, cons)?;
             }
-            // #2399: Apply GenBaB pre-activation constraints (GeLU, Sigmoid, Tanh, etc.).
+            // Apply GenBaB pre-activation constraints (GeLU, Sigmoid, Tanh, etc.).
             // Tightens pre-activation bounds at arbitrary split points, analogous to how
             // ReLU pre-constraints tighten at 0.0.
             if let Some(cons) = lookups.pre_genbab.get(node_name) {
@@ -863,6 +929,7 @@ impl BetaCrownVerifier {
         beta_state: Option<&GraphBetaState>,
         objective: Option<&[f32]>,
     ) -> Result<DomainCrownResultWithIntermediates> {
+        graph.ensure_proof_eligible()?;
         let deadline = self.effective_graph_bab_deadline();
         ensure_constrained_propagation_deadline(
             deadline,

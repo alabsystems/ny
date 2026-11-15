@@ -7,8 +7,6 @@
 //! These tests exercise the full end-to-end path: CLI binary → model loading →
 //! BaB verification → JSON output. This is the competition entry path used by
 //! `vnncomp_scripts/run_instance.sh`.
-//!
-//! Part of #2604.
 
 use ny_test_utils::{require_model, test_models_dir, workspace_root};
 use std::io::Write;
@@ -31,7 +29,7 @@ fn ny_binary() -> String {
     let workspace = workspace_root();
 
     // Check per-worker target directories (most recently modified first).
-    // The cargo wrapper uses target/worker_N/ for concurrent builds (#5590).
+    // The cargo wrapper uses target/worker_N/ for concurrent builds.
     if let Ok(entries) = std::fs::read_dir(workspace.join("target")) {
         let mut worker_bins: Vec<_> = entries
             .filter_map(|e| e.ok())
@@ -362,7 +360,7 @@ fn test_beta_crown_falsifiable_property_is_not_verified() {
     let status = json["status"]
         .as_str()
         .expect("JSON output must contain 'status' string field");
-    // After #3678, PotentialViolation is either confirmed to Violated (concrete
+    // PotentialViolation is either confirmed to Violated (concrete
     // counterexample found) or downgraded to Unknown. The easy property Y_0 <= 100
     // should be confirmed as Violated by the post-BaB sampling attack.
     assert!(
@@ -382,8 +380,6 @@ fn test_beta_crown_falsifiable_property_is_not_verified() {
 /// Input: (1, 1, 8, 8), Output: (1, 2)
 /// Property: adversarial robustness (unsafe region Y_0 <= Y_1 unreachable;
 /// class 0 wins by ~0.14 at the box center) around center point with eps=0.01
-///
-/// Part of #2665.
 #[ntest::timeout(60000)]
 #[test]
 fn test_beta_crown_cnn_with_flatten_verified() {
@@ -437,7 +433,7 @@ fn test_beta_crown_cnn_with_flatten_verified() {
 
 /// End-to-end CNN alpha-CROWN with Patches mode via auto graph routing.
 ///
-/// Exercises the patches-mode pipeline added by W2 commits 38-41 (#3218):
+/// Exercises the patches-mode pipeline added by W2 commits 38-41:
 /// 1. Conv2d detection triggers auto-routing to GraphNetwork (mod.rs:267-299)
 /// 2. Alpha-CROWN precheck is skipped for CNN models (Conv2d fallback)
 /// 3. Graph engine runs patches-mode CROWN backward (crown.rs CrownBounds)
@@ -449,8 +445,6 @@ fn test_beta_crown_cnn_with_flatten_verified() {
 ///
 /// Architecture: Conv(3x3, pad=1, 1→4ch) → ReLU → MaxPool(2x2) → Flatten → Linear(64→2)
 /// Input: (1, 1, 8, 8), Output: (1, 2)
-///
-/// Part of #3218.
 #[ntest::timeout(60000)]
 #[test]
 fn test_beta_crown_cnn_alpha_crown_patches_mode() {
@@ -518,8 +512,6 @@ fn test_beta_crown_cnn_alpha_crown_patches_mode() {
 ///
 /// Architecture: Conv(3x3, pad=1, 1→4ch) → ReLU → MaxPool(2x2) → Flatten → Gemm(64→2)
 /// Input: (1, 1, 8, 8), Output: (1, 2)
-///
-/// Part of #2665.
 #[ntest::timeout(60000)]
 #[test]
 fn test_beta_crown_cnn_maxpool_bab_loop() {
@@ -607,7 +599,7 @@ fn assert_nullable_fields(json: &serde_json::Value) {
     );
 }
 
-/// Regression test for #2800: contradictory VNN-LIB bounds (lower > upper) must
+/// Regression test: contradictory VNN-LIB bounds (lower > upper) must
 /// produce a structured error, NOT a panic/crash from `Bound::new`.
 ///
 /// Previously, `build_verification_spec` called `Bound::new(l, u)` on unvalidated
@@ -664,7 +656,7 @@ fn test_verify_contradictory_vnnlib_returns_error_not_panic_2800() {
     );
 }
 
-/// Regression test for #2800: non-finite VNN-LIB input bounds must surface as
+/// Regression test: non-finite VNN-LIB input bounds must surface as
 /// structured errors, not panic via bound construction.
 #[ntest::timeout(10000)]
 #[test]
@@ -729,7 +721,7 @@ fn test_verify_nan_vnnlib_bound_returns_error_not_panic_2800() {
 /// End-to-end timeout enforcement: `--timeout 2` must cause the process to
 /// finish within a bounded wall-clock window and report timeout/unknown status.
 ///
-/// This is the end-to-end regression test for #3328. The CROWN backward pass
+/// This is the end-to-end regression test. The CROWN backward pass
 /// and CROWN-IBP collection now check the deadline between layers, so even the
 /// initial bounds computation respects the timeout. Previously, the initial
 /// CROWN pass ran to completion regardless of the timeout flag.
@@ -743,8 +735,6 @@ fn test_verify_nan_vnnlib_bound_returns_error_not_panic_2800() {
 /// to BaB deadline enforcement: the post-verdict certificate pass has its own
 /// deadline gates and its own regression test
 /// (`test_beta_crown_certificate_pass_honors_timeout` below).
-///
-/// Part of #3328.
 #[ntest::timeout(10000)]
 #[test]
 fn test_beta_crown_timeout_enforcement_3328() {
@@ -817,7 +807,7 @@ fn test_beta_crown_timeout_enforcement_3328() {
     );
 }
 
-/// The post-verdict certificate pass must also honor `--timeout` (#3328).
+/// The post-verdict certificate pass must also honor `--timeout`.
 ///
 /// On a many-core box, parallel BaB verifies ACAS Xu 1_1 / prop2 well inside a
 /// 2s budget (~0.9s wall). The Verified verdict then enters

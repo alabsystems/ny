@@ -43,7 +43,7 @@ impl SnakeLayer {
     /// IEEE zeros are refused). Negative `a` is certified via the point
     /// reflection `f_a(x) = -f_{|a|}(-x)` in [`snake_linear_relaxation`];
     /// production checkpoints (Kokoro `alpha1/alpha2`) carry small negative
-    /// alphas. The #3095 unsoundness (empty `enumerate_periodic_points`
+    /// alphas. The old unsoundness (empty `enumerate_periodic_points`
     /// range for `a < 0`) is unreachable: the chord path only ever sees
     /// `a > 0` behind the reflection.
     pub fn new(a: f32) -> Result<Self> {
@@ -104,7 +104,7 @@ impl SnakeLayer {
         }
     }
 
-    /// Compute per-channel spatial stride via shared helper. Part of #4169.
+    /// Compute per-channel spatial stride via shared helper.
     fn per_channel_stride(&self, total_elements: usize) -> Result<usize> {
         crate::layers::common::per_channel::per_channel_spatial_stride(
             total_elements,
@@ -146,7 +146,7 @@ impl BoundPropagation for SnakeLayer {
     /// IBP for Snake: exact bounds via monotonicity.
     ///
     /// f'(x) = 1 + sin(2ax) >= 0, so f([l, u]) = [f(l), f(u)].
-    /// This is the key insight solving #3051: the composite Snake function is monotone
+    /// This is the key insight: the composite Snake function is monotone
     /// and produces tight bounds directly, unlike the Sin/Pow/Div composition.
     #[inline]
     fn propagate_ibp(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
@@ -169,7 +169,7 @@ impl BoundPropagation for SnakeLayer {
         let mut upper = Array1::zeros(flat_upper.len());
 
         // Directed rounding: snake_eval_f64 computes in f64 but the as-f32 cast
-        // does nearest rounding. Apply next_down/next_up for soundness. (#3245)
+        // does nearest rounding. Apply next_down/next_up for soundness.
         //
         // Per-channel alpha: compute stride so flat index maps to correct channel.
         // For [C, T] input with C-channel alpha, stride = T, channel = i / T.
@@ -287,7 +287,7 @@ fn enumerate_periodic_points(
 ) -> bool {
     let k_start_f64 = ((2.0 * a * l - base) / period).ceil();
     let k_end_f64 = ((2.0 * a * u - base) / period).floor();
-    // SAFETY(#3100): If the division produces non-finite values (Inf/NaN from
+    // SAFETY: If the division produces non-finite values (Inf/NaN from
     // very large a*l or a*u), or values outside i64 range, fall back to
     // conservative bounds. Saturating `as i64` on Inf/huge values would produce
     // garbage iteration bounds, potentially skipping critical points (unsound).
@@ -333,7 +333,7 @@ fn enumerate_periodic_points(
 /// path's `next_up` on its upper intercept becomes a downward-rounded lower
 /// intercept after negation, and vice versa — outward stays outward. The swap
 /// itself is load-bearing: applying the lines to their original sides is
-/// silently unsound in both directions. The reflection also keeps the #3095
+/// silently unsound in both directions. The reflection also keeps the known
 /// chord-path defects (empty `enumerate_periodic_points` range, inverted
 /// conservative fallback) unreachable — no `sin`-evaluating branch ever
 /// executes with `a < 0`.
@@ -372,8 +372,8 @@ pub(crate) fn snake_linear_relaxation(l: f32, u: f32, a: f32) -> LinearRelaxatio
         return snake_band_relaxation(l, u, a);
     }
     // Ordered BEFORE the phase check on purpose: an unbounded side makes
-    // `|a·x|` unresolvable by construction, and the constant-bound shape that
-    // #3083 pinned is what callers of a half-infinite domain expect.
+    // `|a·x|` unresolvable by construction, and the constant-bound shape the
+    // infinite-endpoint tests pin is what callers of a half-infinite domain expect.
     // `snake_infinite_relaxation` makes its own phase check for its one finite
     // endpoint.
     if l.is_infinite() || u.is_infinite() {
@@ -544,7 +544,7 @@ impl SnakeLayer {
     /// For per-channel alpha, computes channel stride from pre-activation shape
     /// to correctly map flat neuron index → channel index. This avoids the
     /// modulo bug where `flat_idx % C` gives the wrong channel for inputs with
-    /// spatial dimensions (e.g., `[C, T]` audio tensors). (#4117)
+    /// spatial dimensions (e.g., `[C, T]` audio tensors).
     pub fn propagate_linear_with_bounds(
         &self,
         bounds: &crate::LinearBounds,

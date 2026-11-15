@@ -12,10 +12,12 @@ mod builder;
 mod compound_nodes;
 mod helpers;
 mod inputs;
+mod multi_input;
 mod norm_decompose;
 mod normalization_fusion;
 mod outputs;
 
-pub use builder::{build_graph_network, GraphBuildInputs};
+pub use builder::{build_graph_network, build_graph_network_with_linear_storage, GraphBuildInputs};
+pub use multi_input::{concat_input_layout, ConcatInputLayout, ConcatInputSlot};
 
 pub(super) const INPUT_NODE_NAME: &str = "_input";

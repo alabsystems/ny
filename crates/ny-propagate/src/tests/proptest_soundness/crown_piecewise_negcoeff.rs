@@ -5,7 +5,6 @@
 //! CROWN negative-coefficient soundness tests for piecewise layers.
 //!
 //! Split from `crown_piecewise.rs` to keep files under 1000 lines.
-//! Part of #40, #1793.
 //!
 //! These tests exercise CROWN backward propagation with non-identity incoming
 //! bounds -- specifically, incoming coefficient matrices with at least one
@@ -438,7 +437,6 @@ proptest! {
 
     /// ThresholdedRelu CROWN backward with l ≈ alpha boundary (division-by-zero guard).
     /// When l == alpha, the denominator (alpha - l) == 0, producing Inf slopes.
-    /// Part of #1759.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_thresholded_relu_crown_l_eq_alpha(
@@ -707,7 +705,7 @@ proptest! {
     }
 }
 
-/// Regression for #1803/#2977: PReLU NaN guard now rejects non-finite pre-activation
+/// Regression: PReLU NaN guard now rejects non-finite pre-activation
 /// via domain_guard with NumericalInstability.
 #[ntest::timeout(10000)]
 #[test]

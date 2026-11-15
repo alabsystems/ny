@@ -34,6 +34,12 @@ solver:
   bound_prop_method: crown
 
 model:
+  # #fl-s-shaped-untyped: MIRRORS the scored cgan preset. Present so this file
+  # keeps its exact knob-delta / byte-identity invariant against cgan_2023.yaml,
+  # which arms it on measured evidence (converts nonlinear_activations_prop_0
+  # timeout@1195s -> unsat@83s 4/4; 18/18 banked verdicts held and every banked
+  # unsat 12-50% FASTER). NOT this file's own axis.
+  forward_linear_s_shaped_untyped: true
   batch_norm_folding: preserve_raw
   require_authored_float32_initializers: true
   cgan_forward_alpha_surrogate: false
@@ -55,10 +61,42 @@ bab:
     disjunctive_pgd_fraction: 0.10
     disjunctive_pgd_max_secs: 5
     attack_extension_fraction: 0.0
-    # The byte-identical models use the same fast cached forward-linear map.
-    # These fractions remain generous ceilings rather than reserved spend.
+    # CORRECTED 2026-08-30. This block used to read "These fractions remain
+    # generous ceilings rather than reserved spend." That was FALSE on the
+    # measured binary: 0.85 is granted from the PHASE START (the attack phase's
+    # spend is not deducted), so on cgan2026 row 10 (`cGAN_imgSz64_nCh_1`
+    # `prop_2`, official 900 s) the precheck phase ran to `elapsed_s=717.884`
+    # — 80% of the whole budget, 94% of the 0.85*900 = 765 s slice — and
+    # returned `verified=0 of 2`. A fraction bounds nothing relative to what is
+    # left, and the work it sizes (the root CROWN-IBP collection) grows with the
+    # model, so on the imgSz64 models it degenerates into a BaB-starvation lever.
     initial_bounds_fraction: 0.45
     disjunctive_precheck_fraction: 0.85
+    # #precheck-abs-cap: the ABSOLUTE ceiling that actually bounds the phase.
+    # It clamps BOTH prechecks — the CROWN one and the second Alpha-CROWN one at
+    # `disjunctive.rs:765`, which otherwise takes another full fraction slice
+    # from NOW, so together they can spend `2 * 0.85 * total` after the attack.
+    #
+    # WHY IT IS SAFE TO CAP HERE, measured not assumed: the phase's output is a
+    # pure discard on this family. With the precheck cut 4.8x, BaB's first
+    # `[disjunctive-trajectory]` line still lands at t=3.1 s (so BaB does NOT
+    # re-pay a collection) and its first SIX trajectory rows are BIT-IDENTICAL
+    # (-502.7026 / -379.0829 / -318.7668 / -64.6484 / -48.8580 / -17.7884). The
+    # 717.9 s changes BaB's bounds by exactly nothing.
+    #
+    # WHAT IT BUYS: on row 10, 4.4x the BaB span (168.0 s -> 823.8 s), 4.4x the
+    # domains explored (370 -> 1635), and a ~1000x better head gap (-4.9324 ->
+    # -0.0046). It converts no row today — cgan2026's residual is the relaxation
+    # floor, not the schedule — but the seconds are real and compound.
+    #
+    # NOT set on the byte-identical `configs/vnncomp25/cgan_2023.yaml`: that
+    # category banks two `unsat` rows and its corpus is absent from the
+    # measuring host, so the cap must not be transferred there unmeasured. See
+    # the counter-note at its own `disjunctive_precheck_fraction`.
+    #
+    # Basis: reports/measured-2026/precheck_discard_2026-08-30/ and
+    #        reports/measured-2026/precheck_ship_2026-08-30/.
+    disjunctive_precheck_max_secs: 60
     # Spend the remaining official budget on the proof tree after upfront PGD.
     post_bab_pgd_fraction: 0.0
     # Match the measured cgan_2023 policy for the independent wrapper lane.
@@ -66,7 +104,6 @@ bab:
   branching:
     method: input
     candidates: 5
-    reduceop: max
     input_split:
       # Mirrors production #cgan-abc-parity: sb selection threshold and the
       # periodic SAT-only probe (0 ENABLES; -1 disables).
@@ -82,6 +119,9 @@ bab:
       # paths on unsupported shapes or metadata.
       ibp_enhancement: true
       stacked_rebound: true
+      # #cap-extend: mirrors cgan_2023.yaml (measured there 2026-09-10; the 2026 corpus samples the
+      # same seven models). Keeps the branching sections byte-identical per the mirror test.
+      cap_extend_near_closure: true
   clip:
     relaxed: true
     relaxed_iterations: 20
@@ -90,12 +130,27 @@ bab:
     input_split_fresh_domain_clip: true
   alpha_crown:
     lr_alpha: 0.2
-    iterations: 100
     # These models are byte-identical to the audited 2025 cGAN models. Reuse
     # the same certified root-only complete cascade; property resampling does
     # not affect its structural eligibility or soundness, and child domains
     # still clear the policy before taking the cheap forward-linear route.
     cgan_complete_crown_ibp_root: true
+    # #cgan-dense-root (MEASURED 2026-09-10, nCh_3 prop_0, GB10, zero NY_*): the CROWN-IBP collector's
+    # forced PATCHES mode expires inside the ConvTranspose2d composition on the discriminator targets,
+    # is salvaged by IBP and discarded, leaving Conv_14/16/19/22 at 536/369/736/512 unstable (abc: 59/18/
+    # 12/6) and the root margin at -5.8945. Dense mode: cascade 82.8 s, every node's unstable count equal
+    # to abc's, root [0.6358779, 0.6731632] (abc [0.6359, 0.6732]), margin -0.0034, then unsat in 148 s
+    # of BaB. `cgan_crown_root_map` hands that map to the input-split BaB from the `crown` arm.
+    cgan_collector_dense: true
+    cgan_crown_root_map: true
+    # #cgan-unstable-rows (MEASURED 2026-09-12, GB10, pinned fa34dcc37 build, official budgets, zero NY_*,
+    # MemoryMax=96G cap-survival): seed each demanded ReLU-preactivation target's CROWN backward with ONLY
+    # its baseline-unstable rows (abc's sparse_intermediate_bounds, minimum_sparsity 0.9). The cascade that
+    # cost 245 s on the 64-px rows costs 73-120 s, BatchNormalization_13 (61,504 rows) completes in 4.4 s
+    # instead of aborting to IBP, and Sz64 nCh_3 prop_3 converts timeout -> unsat 160.4/160.6/160.6 s (3/3);
+    # 21-row moat, both arms, one hold: zero flips, all 12 sat and all 5 banked unsat rows held. Sound by
+    # construction: unselected rows keep the certified baseline; a wrong mask is looser, never unsound.
+    cgan_unstable_rows: true
     # Aggregate scheduling-only ceiling shared with the byte-identical 2025
     # models; expiry retains the previous certified reference map.
     reference_refresh_max_secs: 12
@@ -103,6 +158,4 @@ bab:
     # forward-linear deadline refusal, select certified plain IBP directly.
     forward_linear_deadline_fallback_to_ibp: true
   beta_crown:
-    lr_alpha: 0.1
-    lr_beta: 0.15
     iterations: 25

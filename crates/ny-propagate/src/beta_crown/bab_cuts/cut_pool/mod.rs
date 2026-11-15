@@ -178,7 +178,7 @@ impl CutPool {
 
     /// Get cuts that are relevant for a domain (not redundant).
     ///
-    /// Pre-allocates the result vector to avoid repeated reallocations (#2326).
+    /// Pre-allocates the result vector to avoid repeated reallocations.
     pub fn relevant_cuts_for(&self, history: &SplitHistory) -> Vec<&CuttingPlane> {
         let iter = self.bump_iter();
         let mut relevant = Vec::with_capacity(self.cuts.len());
@@ -405,10 +405,10 @@ impl CutPool {
 
     fn score_cut(&self, cut: &CuttingPlane, current_iter: usize) -> f32 {
         let weights = &self.cut_score_weights;
-        // NaN-safe: propagate NaN instead of silently clamping to 0.0 (#2643)
+        // NaN-safe: propagate NaN instead of silently clamping to 0.0
         let lambda_cap = nan_propagating_max(weights.lambda_cap, 0.0);
         let contrib_cap = nan_propagating_max(weights.contrib_cap, 0.0);
-        // NaN guard: clamp() propagates NaN; treat NaN lambda as 0.0 (#2598)
+        // NaN guard: clamp() propagates NaN; treat NaN lambda as 0.0
         let lambda = if cut.lambda.is_finite() {
             cut.lambda.clamp(0.0, lambda_cap)
         } else {

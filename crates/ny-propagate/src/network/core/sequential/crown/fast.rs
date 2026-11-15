@@ -83,10 +83,11 @@ impl Network {
     /// 1. Run IBP forward to collect intermediate bounds (fast)
     /// 2. Run CROWN backward using IBP bounds for ReLU relaxation
     /// 3. Concretize final linear bounds using input bounds
-    /// 4. Intersect with IBP forward bounds to ensure output is at least as tight as IBP (#2990)
+    /// 4. Intersect with IBP forward bounds to ensure output is at least as tight as IBP
     #[inline]
     #[instrument(skip(self, input), fields(num_layers = self.layers.len(), input_shape = ?input.shape()))]
     pub fn propagate_crown_fast(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
+        self.ensure_proof_eligible()?;
         if self.layers.is_empty() {
             return Ok(input.clone());
         }
@@ -111,7 +112,6 @@ impl Network {
 
         // Step 2: Initialize CROWN bounds — use Patches mode for CNN networks
         // with 3D spatial output. Same logic as propagate_crown_with_engine.
-        // Part of #2613: extends Patches optimization to the fast CROWN path.
         let has_conv2d = self.layers.iter().any(|l| matches!(l, Layer::Conv2d(_)));
         let mut crown_bounds = match initialize_fast_crown_bounds(
             has_conv2d,
@@ -155,7 +155,7 @@ impl Network {
         };
         let concrete_bounds = linear_bounds.concretize_sound(input);
         let concrete_bounds = concrete_bounds.reshape(&output_shape)?;
-        // Step 5+6: Degrade check + forward-bound tightening (#3043 dedup).
+        // Step 5+6: Degrade check + forward-bound tightening.
         super::tighten_crown_output(concrete_bounds, output_bounds, "CROWN-fast")
     }
 
@@ -170,12 +170,13 @@ impl Network {
         self.propagate_crown_with_linear_and_engine(input, None)
     }
 
-    /// Fast CROWN with linear, with optional GemmEngine for GPU backward (#3598).
+    /// Fast CROWN with linear, with optional GemmEngine for GPU backward.
     pub fn propagate_crown_with_linear_and_engine(
         &self,
         input: &BoundedTensor,
         engine: Option<&dyn GemmEngine>,
     ) -> Result<(BoundedTensor, LinearBounds)> {
+        self.ensure_proof_eligible()?;
         if self.layers.is_empty() {
             let dim = input.len();
             return Ok((input.clone(), LinearBounds::identity(dim)));
@@ -195,7 +196,7 @@ impl Network {
         let output_shape = output_bounds.shape().to_vec();
 
         // Step 2: Initialize CROWN bounds — use Patches mode for CNN networks
-        // with 3D spatial output. Part of #2613: extends Patches to fast-with-linear.
+        // with 3D spatial output.
         let has_conv2d = self.layers.iter().any(|l| matches!(l, Layer::Conv2d(_)));
         let mut crown_bounds = match initialize_fast_crown_bounds(
             has_conv2d,
@@ -251,7 +252,7 @@ impl Network {
         let concrete = linear_bounds
             .concretize_sound(input)
             .reshape(&output_shape)?;
-        // Tightening heuristic: prefer IBP if CROWN degraded to non-finite bounds (#2287).
+        // Tightening heuristic: prefer IBP if CROWN degraded to non-finite bounds.
         // Divergent fallback — returns (BoundedTensor, LinearBounds), so cannot use
         // tighten_crown_output directly for this branch.
         if super::has_degraded_bounds(&concrete) {
@@ -261,7 +262,7 @@ impl Network {
             return self.ibp_fallback_with_constant_linear(input);
         }
 
-        // Step 5: Intersect concrete bounds with IBP forward bounds (#3043 dedup).
+        // Step 5: Intersect concrete bounds with IBP forward bounds.
         // Note: linear_bounds are returned unmodified — they represent the A matrices
         // and biases of the linear relaxation, not the concrete interval bounds.
         let concrete =
@@ -337,7 +338,7 @@ mod tests {
         let (output, linear_bounds) = network.propagate_crown_with_linear(&input)?;
 
         assert_eq!(output.len(), 1);
-        // Directed rounding on bias (#2164) widens bounds by 1 ULP — check soundness + proximity
+        // Directed rounding on bias widens bounds by 1 ULP — check soundness + proximity
         let (lo, hi) = (output.lower()[[0]], output.upper()[[0]]);
         assert!(lo <= 1.0 && (lo - 1.0).abs() < 1e-6, "lower={lo}");
         assert!(hi >= 3.0 && (hi - 3.0).abs() < 1e-6, "upper={hi}");
@@ -490,7 +491,6 @@ mod tests {
     fn propagate_crown_with_linear_gather_produces_selection_matrix_bounds() -> Result<()> {
         // Gather(axis=0, indices=[0, 2]) on input [3] produces output [2].
         // CROWN backward produces a selection matrix (exact, no relaxation).
-        // Reference: #3400 — Gather CROWN backward implementation.
         let indices = ArrayD::from_shape_vec(IxDyn(&[2]), vec![0i64, 2]).unwrap();
         let mut network = Network::new();
         network.add_layer(Layer::Gather(GatherLayer::new(0, Some(indices), vec![])));
@@ -501,7 +501,12 @@ mod tests {
         )?;
 
         let (concrete, linear_bounds) = network.propagate_crown_with_linear(&input)?;
-        let linear_concrete = linear_bounds.concretize(&input);
+        // The published bound is the CERTIFIED (outward-rounded)
+        // concretization, `concretize_sound`; a plain `concretize` of the same
+        // relation is 1 ulp tighter ([1, 3] vs [0.99999994, 2.9999998] lower)
+        // and is not what the path publishes (#eng7d: this assertion compared
+        // against `concretize` and was red on origin/main 399b67da7).
+        let linear_concrete = linear_bounds.concretize_sound(&input);
         let concrete_flat = concrete.flatten();
 
         assert_eq!(concrete.shape(), &[2]);

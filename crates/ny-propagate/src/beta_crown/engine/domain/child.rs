@@ -88,7 +88,7 @@ impl BetaCrownVerifier {
 
             if is_active {
                 // Neuron is active: x >= 0, so lower bound becomes max(lower, 0)
-                // NaN-safe: propagate NaN instead of silently clamping to 0.0 (#2643)
+                // NaN-safe: propagate NaN instead of silently clamping to 0.0
                 lower_flat[[neuron_idx]] = nan_propagating_max(lower_flat[[neuron_idx]], 0.0);
             } else {
                 // Neuron is inactive: x <= 0, so upper bound becomes min(upper, 0)
@@ -274,7 +274,7 @@ impl BetaCrownVerifier {
         }
         CHILDREN_CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        // #2950: Prune domains with inverted output bounds (lower > upper for any element).
+        // Prune domains with inverted output bounds (lower > upper for any element).
         // BaB splits can make the constraint set infeasible — these domains can never
         // produce counterexamples so exploring them wastes verification budget.
         // Reference: alpha-beta-CROWN branching_domains.py:370-381 (check_infeasible_bounds).
@@ -289,7 +289,7 @@ impl BetaCrownVerifier {
         // Guard: non-finite bounds from lower_scalar/upper_scalar indicate NaN/Inf
         // propagation through bounds. These produce zombie domains that consume BaB
         // budget without contributing to verification. Prune at construction to match
-        // GPU BaB is_finite() guard in batched_gpu.rs. (#2986)
+        // GPU BaB is_finite() guard in batched_gpu.rs.
         if !new_lower.is_finite() || !new_upper.is_finite() {
             warn!(
                 "create_child_domain: pruned zombie domain — non-finite bounds \
@@ -301,9 +301,9 @@ impl BetaCrownVerifier {
             return Ok(None);
         }
 
-        // Use validated child constructor to enforce NaN rejection (#3125).
+        // Use validated child constructor to enforce NaN rejection.
         // Priority defaults to lower_bound; BaB loop overwrites via
-        // set_priority()/violation_priority() before queue insertion (#2682).
+        // set_priority()/violation_priority() before queue insertion.
         Ok(Some(BabDomain::child(
             new_history,
             new_lower,
@@ -369,7 +369,7 @@ impl BetaCrownVerifier {
                 })?;
 
             if constraint.is_active {
-                // NaN-safe: propagate NaN instead of silently clamping to 0.0 (#2643)
+                // NaN-safe: propagate NaN instead of silently clamping to 0.0
                 lower_flat[[constraint.neuron_idx]] =
                     nan_propagating_max(lower_flat[[constraint.neuron_idx]], 0.0);
             } else {

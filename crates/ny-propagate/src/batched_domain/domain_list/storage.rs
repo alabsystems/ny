@@ -353,7 +353,7 @@ impl DomainList {
             }
         };
 
-        // Defense-in-depth: reject stored non-finite data before branching (#3115).
+        // Defense-in-depth: reject stored non-finite data before branching.
         let validation = (|| -> Result<()> {
             super::super::utils::validate_global_bounds_finite(
                 &global_lbs,
@@ -546,8 +546,7 @@ impl DomainList {
 
     /// Convenience wrapper around `pick_out` that accepts GPU batch options.
     ///
-    /// Reference: `designs/2026-02-03-batched-domain-pickout-gpu-transfer.md`,
-    /// alpha-beta-CROWN `complete_verifier/branching_domains.py`:270-305
+    /// Reference: alpha-beta-CROWN `complete_verifier/branching_domains.py`:270-305
     pub fn pick_out_batched(
         &mut self,
         batch_size: usize,
@@ -638,14 +637,14 @@ impl DomainList {
             return Ok(());
         }
 
-        // Reject domains with NaN/Inf global bounds (#2246).
+        // Reject domains with NaN/Inf global bounds.
         super::super::utils::validate_global_bounds_finite(
             &processed.global_lbs,
             &processed.global_ubs,
             "DomainList::add",
         )?;
 
-        // Reject non-finite kept layer/input tensors (#3115).
+        // Reject non-finite kept layer/input tensors.
         // Uses keep_mask so dropped rows don't trigger rejection.
         let mask = &processed.keep_mask;
         super::super::utils::validate_named_batched_tensors_finite(
@@ -792,7 +791,7 @@ impl DomainList {
             .collect();
         self.metadata.extend(filtered_metadata);
 
-        // Evict lowest-priority domains when queue exceeds max_queue_size (#2326).
+        // Evict lowest-priority domains when queue exceeds max_queue_size.
         // Eviction discards unverified domains; it is recorded in
         // `evicted_count()` so the BaB loop reports Unknown rather than
         // Verified when the truncated queue drains.

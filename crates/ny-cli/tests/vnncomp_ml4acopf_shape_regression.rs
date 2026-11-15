@@ -6,7 +6,7 @@
 
 //! Regression tests for the real `ml4acopf_2024` graph BaB path.
 //!
-//! These cover the historical `#3602` shape mismatch on disjunctive DAG
+//! These cover a historical shape mismatch on disjunctive DAG
 //! properties and pin one concrete solved row from the same benchmark family.
 
 #[path = "common/vnncomp.rs"]
@@ -56,7 +56,7 @@ fn assert_valid_verifier_exit(output: &Output, command_label: &str) {
     );
 }
 
-/// Regression test for #3602: the exact 14_ieee prop9 disjunctive DAG case
+/// Regression test: the exact 14_ieee prop9 disjunctive DAG case
 /// must not regress to `Shape mismatch: expected [1], got [2]`.
 #[ntest::timeout(60000)]
 #[test]
@@ -78,7 +78,7 @@ fn test_beta_crown_ml4acopf_disjunctive_property_avoids_shape_mismatch_3602() {
     );
 }
 
-/// Acceptance guard for #3602: at least one real ml4acopf graph BaB invocation
+/// Acceptance guard: at least one real ml4acopf graph BaB invocation
 /// should now resolve to a concrete verification verdict instead of crashing.
 #[ntest::timeout(60000)]
 #[test]

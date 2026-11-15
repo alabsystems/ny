@@ -10,8 +10,6 @@
 //!
 //! Soundness property: for any concrete x in [x_l, x_u], the true LayerNorm
 //! output must fall within the CROWN-concretized bounds.
-//!
-//! Part of #318 (Path 6b acceptance criterion: proptest soundness).
 
 use ndarray::{Array1, ArrayD, IxDyn};
 use ny_tensor::BoundedTensor;
@@ -200,8 +198,6 @@ proptest! {
     ///
     /// Small n=3 tests the core McCormick + fan-out composition without
     /// excessive per-case compute cost.
-    ///
-    /// Part of #318.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_decomposed_norm_crown_identity_tight_n3(
@@ -237,8 +233,6 @@ proptest! {
     ///
     /// Tests McCormick relaxation quality with wider input intervals where
     /// the bilinear d*inv_std approximation is less tight.
-    ///
-    /// Part of #318.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_decomposed_norm_crown_wide_perturbation_n3(
@@ -275,8 +269,6 @@ proptest! {
     /// Tests scaling: as n grows, the mean-subtraction backward Jacobian
     /// (δ_{ik} - 1/n) spreads A-matrix contributions across more elements.
     /// The variance path (Sqr→mean→Sqrt→Reciprocal) also depends on n.
-    ///
-    /// Part of #318.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_decomposed_norm_crown_identity_tight_n8(
@@ -317,8 +309,6 @@ proptest! {
     /// weight-sign-dependent plane selection works correctly when weights
     /// are negative. This is critical: McCormick lower/upper plane selection
     /// flips when the incoming coefficient is negative.
-    ///
-    /// Part of #318.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_decomposed_norm_crown_negcoeff_n3(
@@ -464,8 +454,6 @@ proptest! {
     ///
     /// Critical: lower bound must use lower_a @ LayerNorm(x) + lower_b,
     /// upper bound must use upper_a @ LayerNorm(x) + upper_b (independent).
-    ///
-    /// Part of #318. Directed by Prover P1-1074.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_decomposed_norm_crown_asymmetric_a_n3(

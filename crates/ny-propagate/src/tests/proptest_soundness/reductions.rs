@@ -105,7 +105,7 @@ proptest! {
 // bounds should produce results that exactly match IBP (within FP tolerance).
 //
 // Critical coverage gap: prior to these tests, only IBP proptests existed for
-// reductions. The identity-fallback bug (#1733) in propagate_linear was only
+// reductions. The identity-fallback bug in propagate_linear was only
 // caught by manual coefficient inspection tests, not by randomized testing.
 //
 // These tests exercise the `propagate_crown_backward` trait method via the Layer
@@ -707,7 +707,7 @@ proptest! {
         }
     }
 
-    /// ReduceSum batched CROWN backward with identity bounds (#287).
+    /// ReduceSum batched CROWN backward with identity bounds.
     ///
     /// Tests propagate_linear_batched for ReduceSum (last axis, keepdims=true).
     /// For input [2, 3] reduced to [2, 1], identity batched CROWN backward
@@ -774,7 +774,7 @@ proptest! {
         }
     }
 
-    /// ReduceMean batched CROWN backward with identity bounds (#287).
+    /// ReduceMean batched CROWN backward with identity bounds.
     ///
     /// Tests propagate_linear_batched for ReduceMean (last axis, keepdims=true).
     /// For input [2, 3] reduced to [2, 1], identity batched CROWN backward
@@ -839,7 +839,7 @@ proptest! {
         }
     }
 
-    /// ReduceSum batched CROWN backward with pointwise soundness (#287).
+    /// ReduceSum batched CROWN backward with pointwise soundness.
     ///
     /// For ReduceSum(axis=-1, keepdims=true) on [3, 4], verify that for every
     /// sampled input point, the reduced output lies within concretized bounds.

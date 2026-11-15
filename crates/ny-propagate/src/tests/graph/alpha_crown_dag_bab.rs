@@ -2,10 +2,10 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for DAG alpha-CROWN in the BaB initialization path (#3357).
+//! Tests for DAG alpha-CROWN in the BaB initialization path.
 //!
 //! The BaB path through `collect_alpha_crown_bounds_dag` initializes alpha state
-//! for all unstable ReLU neurons. Prior to #3357, DAGs with skip connections
+//! for all unstable ReLU neurons. Previously, DAGs with skip connections
 //! used IBP bounds (O(N) but very loose), causing most neurons to appear stable
 //! and the alpha state to be empty. The fix auto-detects DAGs and uses CROWN-IBP
 //! bounds (O(N^2) but much tighter).
@@ -124,7 +124,7 @@ fn build_skip_dag_loose_ibp() -> (GraphNetwork, BoundedTensor) {
     (graph, input)
 }
 
-/// #3357: BaB alpha-CROWN initialization on a DAG produces non-empty alpha state.
+/// BaB alpha-CROWN initialization on a DAG produces non-empty alpha state.
 ///
 /// Before the fix, `collect_alpha_crown_bounds_dag` used IBP bounds for
 /// intermediate nodes even on DAGs. For skip-connection DAGs, IBP is so loose
@@ -137,7 +137,7 @@ fn build_skip_dag_loose_ibp() -> (GraphNetwork, BoundedTensor) {
 fn test_dag_bab_alpha_state_non_empty_with_crown_ibp_3357() {
     let (graph, input) = build_skip_dag_loose_ibp();
 
-    // Use default config (fix_interm_bounds=true). The #3357 fix auto-overrides
+    // Use default config (fix_interm_bounds=true). The fix auto-overrides
     // to CROWN-IBP for DAGs.
     let config = AlphaCrownConfig::default();
 
@@ -153,7 +153,7 @@ fn test_dag_bab_alpha_state_non_empty_with_crown_ibp_3357() {
     );
 }
 
-/// #3357: Alpha-CROWN on a DAG produces strictly tighter bounds than baseline CROWN.
+/// Alpha-CROWN on a DAG produces strictly tighter bounds than baseline CROWN.
 ///
 /// This verifies the end-to-end result: alpha optimization on CROWN-IBP-initialized
 /// alpha state produces bounds that are at least as tight as (and ideally tighter

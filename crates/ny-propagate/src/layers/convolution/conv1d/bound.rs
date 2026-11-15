@@ -293,7 +293,7 @@ impl BoundPropagation for Conv1dLayer {
                     }
                 }
 
-                // Repair non-finite outputs for consistency with linear IBP (#3030).
+                // Repair non-finite outputs for consistency with linear IBP.
                 BoundedTensor::new_repaired(lower_y, upper_y, RepairStrategy::Conservative)
             }
             3 => {
@@ -377,7 +377,7 @@ impl BoundPropagation for Conv1dLayer {
                     }
                 }
 
-                // Repair non-finite outputs for consistency with linear IBP (#3030).
+                // Repair non-finite outputs for consistency with linear IBP.
                 BoundedTensor::new_repaired(lower_y, upper_y, RepairStrategy::Conservative)
             }
             _ => Err(NyError::ShapeMismatch {
@@ -731,7 +731,7 @@ impl Conv1dLayer {
         }
     }
 
-    /// CROWN backward propagation through Conv1d layer with optional GemmEngine (#3598).
+    /// CROWN backward propagation through Conv1d layer with optional GemmEngine.
     ///
     /// For a conv layer y = conv1d(x, W) + b, and current linear bounds A @ y + c:
     /// - The backward pass through conv is a transposed convolution
@@ -771,7 +771,7 @@ impl Conv1dLayer {
 
         let conv_in_size = in_c * in_len;
 
-        // Batched GEMM: process all objectives in a single GEMM + col2im scatter (#3598).
+        // Batched GEMM: process all objectives in a single GEMM + col2im scatter.
         // Replaces the per-row conv1d_transpose loop. Dispatches to GPU when engine
         // is available. Reference: Conv2d pattern at conv2d/bound.rs.
         let mut new_lower_a = conv1d_transpose_batched_gemm(
@@ -934,7 +934,7 @@ impl Conv1dLayer {
             }
         }
 
-        // CROWN backward NaN firewall (#2812): conservative fallback instead of hard error.
+        // CROWN backward NaN firewall: conservative fallback instead of hard error.
         Ok(Cow::Owned(LinearBounds::new_or_conservative_with_err(
             new_lower_a,
             new_lower_b,
@@ -1186,7 +1186,7 @@ impl BoundPropagation for ConvTranspose1dLayer {
                     }
                 }
 
-                // Repair non-finite outputs for consistency with linear IBP (#3030).
+                // Repair non-finite outputs for consistency with linear IBP.
                 BoundedTensor::new_repaired(lower_y, upper_y, RepairStrategy::Conservative)
             }
             3 => {
@@ -1268,7 +1268,7 @@ impl BoundPropagation for ConvTranspose1dLayer {
                     }
                 }
 
-                // Repair non-finite outputs for consistency with linear IBP (#3030).
+                // Repair non-finite outputs for consistency with linear IBP.
                 BoundedTensor::new_repaired(lower_y, upper_y, RepairStrategy::Conservative)
             }
             _ => Err(NyError::ShapeMismatch {
@@ -1554,7 +1554,7 @@ impl ConvTranspose1dLayer {
         }
     }
 
-    /// CROWN backward propagation through ConvTranspose1d layer with optional GemmEngine (#3598).
+    /// CROWN backward propagation through ConvTranspose1d layer with optional GemmEngine.
     ///
     /// For a transposed conv layer y = conv_transpose1d(x, W) + b, and current linear bounds A @ y + c:
     /// - The backward pass through conv_transpose is a regular convolution
@@ -1595,7 +1595,7 @@ impl ConvTranspose1dLayer {
 
         let conv_in_size = in_c * in_len;
 
-        // Batched im2col + GEMM: process all objectives at once (#3598).
+        // Batched im2col + GEMM: process all objectives at once.
         // ConvTranspose1d backward = forward conv. The kernel is in ONNX ConvTranspose
         // layout (in_c, out_c/groups, k); conv1d_forward_batched_gemm treats it as
         // grouped Conv1d layout with out_c_conv=kernel[0] and in_c_per_group=kernel[1].
@@ -1764,7 +1764,7 @@ impl ConvTranspose1dLayer {
             }
         }
 
-        // CROWN backward NaN firewall (#2812): conservative fallback instead of hard error.
+        // CROWN backward NaN firewall: conservative fallback instead of hard error.
         Ok(Cow::Owned(LinearBounds::new_or_conservative_with_err(
             new_lower_a,
             new_lower_b,

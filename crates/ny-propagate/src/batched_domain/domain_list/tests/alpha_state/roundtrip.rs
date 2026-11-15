@@ -27,7 +27,7 @@ fn domain_metadata_with_alpha(
 ///
 /// This verifies that optimized alpha values persisted in DomainMetadata are
 /// not lost when domains pass through the DomainList storage cycle.
-/// Regression test for #1845 alpha persistence.
+/// Regression test alpha persistence.
 #[ntest::timeout(10000)]
 #[test]
 fn test_alpha_state_roundtrip_through_domain_list_1845() {

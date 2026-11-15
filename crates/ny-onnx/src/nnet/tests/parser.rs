@@ -117,7 +117,7 @@ fn test_nnet_max_layer_size_field() {
 #[test]
 fn test_parse_csv_line_empty() {
     let result: Vec<usize> = parse_csv_line("").unwrap();
-    assert!(result.is_empty());
+    assert_eq!((result).len(), 0);
 }
 
 #[ntest::timeout(10000)]

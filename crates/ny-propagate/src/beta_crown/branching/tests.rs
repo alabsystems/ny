@@ -416,7 +416,7 @@ fn test_general_split_history_does_not_merge_different_neurons() {
 #[test]
 fn test_nonzero_split_point_regression() {
     // Regression test: ensure non-zero split points are preserved correctly
-    // This tests the fix for #205 (GenBaB splits were approximated as ReLU constraints)
+    // This tests the fix for GenBaB splits being approximated as ReLU constraints
 
     let mut history = GraphSplitHistory::new();
 
@@ -474,7 +474,7 @@ fn test_genbab_constraint_rejects_nan_split_point() {
 
 /// Verify that pub(crate) accessor methods return the same values passed to new().
 /// Fields are pub(crate) to prevent struct literal construction that bypasses NaN
-/// validation in new(). (#3017)
+/// validation in new().
 #[ntest::timeout(10000)]
 #[test]
 fn test_genbab_constraint_accessors_3017() {
@@ -494,7 +494,7 @@ fn test_genbab_constraint_accessors_3017() {
     );
 }
 
-/// Verify that NaN/Inf scores are rejected by GenBabConstraint::new(). (#3017)
+/// Verify that NaN/Inf scores are rejected by GenBabConstraint::new().
 #[ntest::timeout(10000)]
 #[test]
 fn test_genbab_constraint_rejects_nan_score_3017() {
@@ -515,7 +515,7 @@ fn test_genbab_constraint_rejects_nan_score_3017() {
     assert!(ok.is_ok(), "Finite score must be accepted");
 }
 
-/// Verify that NaN/Inf point values are rejected by NeuronSplit::at_point(). (#3017)
+/// Verify that NaN/Inf point values are rejected by NeuronSplit::at_point().
 #[ntest::timeout(10000)]
 #[test]
 fn test_neuron_split_rejects_nan_point_3017() {

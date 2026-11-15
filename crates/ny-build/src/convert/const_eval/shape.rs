@@ -332,6 +332,22 @@ impl ConvertContext<'_> {
     ) -> Option<ArrayD<f32>> {
         // ONNX Shape op: returns a 1-D tensor containing the static shape of the input.
         // The input must have a known static shape in tensor_shapes.
+        //
+        // A recorded EMPTY shape is trusted as rank 0 and folds to the empty
+        // vector. Where `[]` can come from (ny-onnx
+        // `loader::parse::metadata::build_tensor_shapes`): a scalar weight; the
+        // loader's inferred table, which records `[]` only when ONNX Runtime
+        // types the tensor rank 0 (`shape_infer::resolve_zero_dim_ranks` leaves
+        // out a tensor ORT could not type, which ORT also reports with zero
+        // dims) or its static fallback derives it exactly; or a MODEL-AUTHORED
+        // zero-dim declaration (graph I/O or intermediate `value_info`), which
+        // the loader keeps only when the inferred table has no entry for that
+        // tensor. That last source is NOT vetted by the rank probe: a stale
+        // `value_info` `[]` on a tensor ORT cannot type would still fold here.
+        // Measured 2026-09-28 over every distinct VNN-COMP model: none does
+        // (the 8 declared-`[]` intermediates, all in smart_turn, each have an
+        // inferred entry). A tensor with neither is absent here, so the lookup
+        // below declines it.
         let input_name = spec.inputs.first()?;
         let input_shape = self.tensor_shapes.get(input_name)?;
         // Non-positive dimensions are ny's unresolved-shape markers. Folding

@@ -24,24 +24,62 @@
 //! can only return `Unsat` or `Unknown` — never `Sat`.
 
 use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicUsize as ClipHeadCounter, Ordering as ClipHeadOrder};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ndarray::{s, Array2};
 use ny_core::{NyError, Result};
 use rayon::prelude::*;
 
 use super::bounds::{
-    compose_viay, head_gates, head_variant, margin_seed, per_class_direct, row_dots, trunk_variant,
-    variant_state, HeadGates, MarginBatch, MarginSeed, RowDots, YBox,
+    compose_viay, head_gates_with, head_variant, margin_seed, per_class_direct, row_dots,
+    trunk_variant, variant_state, HeadGates, MarginBatch, MarginSeed, RowDots, YBox,
 };
+use super::close_integrity::{Cert, CertKind, CertTally, CloseIntegrityEvidence};
 use super::engine::{
-    domain_gates, BackwardEngine, Collect, DomainGates, Exc, Exceptions, PassOut,
+    domain_gates, domain_gates_acc, BackwardEngine, Collect, DomainGates, Exc, Exceptions, PassOut,
     RowDomainGateBlock, Seed,
 };
 use super::net::TwinNet;
 use super::root::{RetainedRows, RootGates};
 use super::rounding::{next_down, next_up, RoundMode, UNIT};
+use crate::certify::margin_row::{self as cert_mr, ChildSplit};
+use crate::certify::{
+    authorize_unsat, AbsLit, ClassCover, CoverLedger, FdProofTrace, FrameSplit, GuardReport,
+    HintLedger, LeafClose, LeafEvidence, LeafHint, PreHint, RetireHint, SiteMap, TokenScope,
+    UnsatToken,
+};
+
+// #mr-stack (margin-row throughput plan B5): the domain-stacked frontier's
+// shared main-eval pass, its receipt, and the trajectory hash.
+mod prepared_domain_eval;
+#[cfg(test)]
+pub(in crate::margin_row) use prepared_domain_eval::evaluate_prepared_domain;
+mod prepared_root_eval;
+mod prepared_tree;
+pub use prepared_tree::{
+    PreparedTreeCertificate, PreparedTreeOpen, PreparedTreeOpenReason, PreparedTreeOptions,
+    PreparedTreeOutcome, PreparedTreeReceipt, PreparedTreeSchedule,
+};
+mod stack_eval;
+pub(super) use prepared_root_eval::{
+    prepared_root_eval_reuse, PreparedRootEvaluation, PreparedRootEvaluationReceipt,
+    PreparedRootYBox,
+};
+#[cfg(test)]
+pub(crate) use stack_eval::take_last_trajectory;
+
+// #wave-beta-bab (ENGINE_PROGRAM M6): the wave tree engine behind
+// `margin_row.tree_mode: wave` (dark; `legacy` never enters it).
+pub mod wave;
+
+// ENGINE_PROGRAM §1.7 B1 (proof bundle v2): the emitter's unit tests.
+#[cfg(test)]
+mod direct_publication_tests;
+#[cfg(test)]
+mod proof_hint_tests;
+pub(crate) use stack_eval::{mr_stack_fields, mr_stack_reset, mr_stack_stop_line};
 
 /// Trunk piece-fix: (layer, position in the layer's unstable list, direction).
 pub type TrunkSplit = (usize, usize, i8);
@@ -66,6 +104,28 @@ pub enum EpochFrameRoute {
     /// Subtree created by an incremental parent-frame refresh.
     NestedIncremental,
 }
+
+/// Engagement counters for the `[domain-stack]` lane. A scored run is one
+/// process, so process-global counters report it without threading fields
+/// through the engine. Diagnostics only — never read by any bound, gate or
+/// verdict.
+///
+/// `MAX_WIDTH` rather than a first-hit latch, deliberately: the first stacked
+/// expansion occurs when the heap has barely filled and is therefore the
+/// NARROWEST of the run, so reporting it understates the mechanism and would
+/// make a width-sensitive A/B unreadable.
+static DOMAIN_STACK_MAX_WIDTH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static DOMAIN_STACK_EXPANSIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// #mr-stack (throughput plan B5) kill switch: with `margin_row.domain_stack`
+/// armed, run a frontier batch's main eval passes as ONE stacked pass
+/// (`bab/stack_eval.rs`). A trusted code constant, not a lever — the stacked
+/// pass is bit-identical to the per-domain passes it replaces, so it selects a
+/// schedule and cannot move a bound. `false` restores the per-domain main pass
+/// exactly (score stacking is unaffected).
+pub(crate) const DOMAIN_STACK_MAIN_EVAL: bool = true;
 
 /// Tuning knobs (defaults = the verified Part-B protocol).
 #[derive(Clone)]
@@ -94,8 +154,36 @@ pub struct BabConfig {
     pub contextual_adaptive: bool,
     /// Expansion cap.
     pub max_expansions: usize,
-    /// Wall-clock deadline.
+    /// Wall-clock deadline for SEARCHING.
     pub deadline: Option<Instant>,
+    /// Optional source-owned joint head relaxation, once on the outer root.
+    /// Its bounded slice is charged within `deadline`; the raw root memo is
+    /// never changed by this refinement.
+    pub head_groups: Option<super::HeadGroupPolicy>,
+    /// #publish-deadline — wall-clock deadline for PUBLISHING a verdict whose
+    /// proof is already complete.
+    ///
+    /// # Why this is separate from `deadline`
+    ///
+    /// `deadline` is the LANE deadline, set to `scored_deadline - 3s`
+    /// (`ny-cli/src/commands/margin_row_bab.rs:2681`) to "leave the tail to the
+    /// caller's own wrap-up (result write, witness gating)". That reserve is
+    /// correct for SEARCH. But the same instant was also used to discard a
+    /// verdict whose tree had ALREADY finished with a verdict-bearing stop
+    /// (`queue_empty` / `verified_bestfirst`), and at that point the remaining
+    /// work is a struct clone — microseconds, not seconds.
+    ///
+    /// MEASURED 2026-09-16 over 32 cifar100 resnet_large runs: 38% never publish
+    /// a `TREE DONE` receipt, and `idx_1280_sidx_5310` published a genuine
+    /// `UNSAT in 92.9s (ledger=Some(true))` — agreeing with alpha-beta-CROWN,
+    /// which also proves it unsat — while returning `unknown` on five other runs
+    /// with IDENTICAL tree statistics. `unspent_frac` was 0.020-0.031 on those
+    /// rows: 2-3 s of the official budget was still unused at the moment the
+    /// completed proof was thrown away.
+    ///
+    /// `None` falls back to `deadline`, which is byte-identical to the previous
+    /// behaviour.
+    pub publish_deadline: Option<Instant>,
     /// y-row LRU capacity (trunk-sets).
     pub lru_cap: usize,
     /// Parallel best-first frontier width: expand up to this many worst-open
@@ -109,11 +197,23 @@ pub struct BabConfig {
     /// post-run evidence compares one tree decision in the same Rayon context
     /// rather than reopening process-global state after the run.
     pub frontier_contextual: usize,
-    /// Default-off cross-domain candidate-score stacking canary.  Only the
+    /// Default-off cross-domain stacking (`margin_row.domain_stack`). The
     /// `score_candidates` backward passes of a parallel frontier batch are
-    /// stacked; node evaluation, candidate selection, and heap merge retain
-    /// their established per-domain paths and deterministic ordering.
+    /// stacked, and (#mr-stack, throughput plan B5) so are the domains' MAIN
+    /// eval passes while [`Self::domain_stack_main_eval`] holds; candidate
+    /// selection, the β / domain-alpha trials and the heap merge retain their
+    /// established per-domain paths and deterministic ordering.
     pub domain_stack: bool,
+    /// #mr-stack (throughput plan B5): with `domain_stack`, run the batch's
+    /// main eval passes as ONE stacked pass. NOT A LEVER: bit-identical by
+    /// construction (each domain's block of the stacked pass equals its own
+    /// pass bit-for-bit; pinned by `stacked_main_eval_bit_identical_to_per_domain`
+    /// and `expand_batch_trajectory_hash_unchanged`), no preset key, no
+    /// environment reader. Every production config carries the trusted code
+    /// constant `bab::DOMAIN_STACK_MAIN_EVAL` — that constant is the kill switch —
+    /// and the field exists only so the differential tests can run one tree
+    /// both ways in one process.
+    pub domain_stack_main_eval: bool,
     /// Immutable entry-time authority for per-domain alpha optimization.
     /// Every class and nested epoch driver inherits this policy unchanged.
     pub domain_alpha_policy: super::DomainAlphaRuntimePolicy,
@@ -166,6 +266,11 @@ pub struct BabConfig {
     /// Immutable authority for rebakes and nested epoch roots. Execution
     /// evidence is deliberately not read back into this policy.
     pub root_precision_policy: super::RootPrecisionRuntimePolicy,
+    /// #epoch-carry: the RUN's backward-interm policy, so a Tier-2 epoch rebuild
+    /// can re-run BI instead of discarding the root's tightening. `try_epoch`
+    /// previously passed `BackwardIntermRuntimePolicy::default()` (enabled:
+    /// false), which is why arming the epoch measured as a bound REGRESSION.
+    pub backward_interm_policy: super::BackwardIntermRuntimePolicy,
     /// Root-build execution evidence for the root-precision family.
     pub root_precision_execution: super::RootPrecisionExecutionEvidence,
     /// Root-build execution evidence for the frozen backward-intermediate
@@ -174,6 +279,46 @@ pub struct BabConfig {
     /// One closed receipt for the entry root's standalone alpha and rebake
     /// phases. Evidence-only and never recomputed by nested class/tree runs.
     pub root_alpha_execution: super::RootAlphaExecutionEvidence,
+    /// #wave-beta-bab (ENGINE_PROGRAM M6): the tree engine of the OUTER frame
+    /// (`margin_row.tree_mode`, `_tree_wave_batch`, `_tree_wave_cert_threads`).
+    /// The default `legacy` is today's best-first tree, bit for bit; `wave`
+    /// runs [`wave`]'s engine, whose every close is certified by this lane's
+    /// own evaluator and whose verdict passes the same cover gate. Nested
+    /// epoch frames and the classwise schedule always run the legacy tree.
+    pub wave: wave::WavePolicy,
+    /// B2.3: an IN-PROCESS HARNESS's explicit arming of the frozen-dual tier
+    /// on the outer frame (the route e2e tests run the tier through the
+    /// lane's own `authorize_frame` stream). NOT A LEVER and never fed by the
+    /// scored lane: `None` (every production config) is the governed gate
+    /// `margin_row.frozen_dual_bab`, latched once per process exactly as
+    /// before. The tier certifies every class it closes either way, so this
+    /// field can only choose WHETHER the certified tier runs.
+    pub frozen_dual_tier: Option<bool>,
+    /// #mr-close-telemetry TEST-ONLY switch: skip every proof-integrity
+    /// recording site of this driver (and of its class / nested epoch
+    /// drivers, which inherit it). NOT A LEVER: the field does not exist
+    /// outside `cfg(test)`, where `close_telemetry_on` is the constant
+    /// `true`. It exists only so `close_telemetry_trajectory_hash_unchanged`
+    /// can run one tree with and without the telemetry in one process and
+    /// prove the decision trajectory bit-identical.
+    #[cfg(test)]
+    pub(crate) close_telemetry_off: bool,
+}
+
+/// #mr-close-telemetry: whether this driver records proof-integrity
+/// telemetry. Always `true` outside tests (see the test-only
+/// `BabConfig::close_telemetry_off`).
+#[inline]
+fn close_telemetry_on(cfg: &BabConfig) -> bool {
+    #[cfg(test)]
+    {
+        !cfg.close_telemetry_off
+    }
+    #[cfg(not(test))]
+    {
+        let _ = cfg;
+        true
+    }
 }
 
 impl Default for BabConfig {
@@ -191,10 +336,13 @@ impl Default for BabConfig {
             contextual_adaptive: false,
             max_expansions: 20_000,
             deadline: None,
+            head_groups: None,
+            publish_deadline: None,
             lru_cap: 6,
             frontier: 1,
             frontier_contextual: 1,
             domain_stack: false,
+            domain_stack_main_eval: DOMAIN_STACK_MAIN_EVAL,
             domain_alpha_policy: super::DomainAlphaRuntimePolicy::default(),
             epoch_policy: super::EpochRuntimePolicy::default(),
             epoch_frame_route: EpochFrameRoute::Outer,
@@ -211,14 +359,26 @@ impl Default for BabConfig {
             beta_columns: 8,
             parallel_prebuild: false,
             root_precision_policy: super::RootPrecisionRuntimePolicy::default(),
+            backward_interm_policy: super::BackwardIntermRuntimePolicy::default(),
             root_precision_execution: super::RootPrecisionExecutionEvidence::default(),
             backward_interm_execution: super::BackwardIntermExecutionEvidence::default(),
             root_alpha_execution: super::RootAlphaExecutionEvidence::default(),
+            wave: wave::WavePolicy::default(),
+            frozen_dual_tier: None,
+            #[cfg(test)]
+            close_telemetry_off: false,
         }
     }
 }
 
 impl BabConfig {
+    /// The instant after which a COMPLETED proof may no longer be published.
+    /// Falls back to the search deadline, so `None` is byte-identical.
+    #[must_use]
+    pub fn effective_publish_deadline(&self) -> Option<Instant> {
+        self.publish_deadline.or(self.deadline)
+    }
+
     /// Canonicalize the operational epoch state at a public outer-tree entry.
     ///
     /// Nested epoch drivers bypass `run` and `run_classwise` through
@@ -617,12 +777,25 @@ pub struct PolicyExecutionEvidence {
     pub column_retire: bool,
     /// Frozen parallel-prebuild gate.
     pub parallel_prebuild: bool,
+    /// Frozen #clip-head gate (head-split halfspaces).
+    pub clip_head: bool,
     /// Frozen per-domain alpha gate.
     pub domain_alpha_enabled: bool,
     /// Frozen per-domain alpha trial cap.
     pub domain_alpha_iters: usize,
     /// Frozen initial per-domain alpha step, stored as exact f64 bits.
     pub domain_alpha_eta_bits: u64,
+    /// Evaluations where at least one head-split halfspace was actually built
+    /// and offered to the dual. ZERO with the gate armed means the run is VOID,
+    /// not negative.
+    pub clip_head_evals: usize,
+    /// Head columns whose interval strictly shrank under those halfspaces.
+    pub clip_head_moved: usize,
+    /// Head columns that became STABLE under them (abc's actual mechanism).
+    pub clip_head_closes: usize,
+    /// Head-clip steps refused: a crossed interval, a refused halfspace build,
+    /// or a pack whose certified-slack frame check failed.
+    pub clip_head_refused: usize,
     /// Live node evaluations whose first non-deadline ascent iteration
     /// consumed a per-column candidate set.
     pub beta_per_column_evals: usize,
@@ -687,9 +860,14 @@ impl PolicyExecutionEvidence {
             beta_columns: config.beta_columns.clamp(1, 32),
             column_retire: config.col_retire,
             parallel_prebuild: config.parallel_prebuild,
+            clip_head: crate::preset_gates::margin_row_clip_head_enabled(),
             domain_alpha_enabled: domain_alpha.enabled,
             domain_alpha_iters: domain_alpha.iters,
             domain_alpha_eta_bits: domain_alpha.eta.to_bits(),
+            clip_head_evals: 0,
+            clip_head_moved: 0,
+            clip_head_closes: 0,
+            clip_head_refused: 0,
             beta_per_column_evals: 0,
             beta_columns_binding_evals: 0,
             beta_columns_max_candidates: 0,
@@ -731,6 +909,17 @@ impl PolicyExecutionEvidence {
             return;
         }
         self.policy_mismatch |= other.policy_mismatch;
+        // The #clip-head gate is process-wide and read per call, not frozen from
+        // `BabConfig`, so a difference here is not a policy mismatch — it is a
+        // nested driver that resolved the same global. OR it in rather than
+        // failing the whole attribution closed.
+        self.clip_head |= other.clip_head;
+        self.clip_head_evals = self.clip_head_evals.saturating_add(other.clip_head_evals);
+        self.clip_head_moved = self.clip_head_moved.saturating_add(other.clip_head_moved);
+        self.clip_head_closes = self.clip_head_closes.saturating_add(other.clip_head_closes);
+        self.clip_head_refused = self
+            .clip_head_refused
+            .saturating_add(other.clip_head_refused);
         self.beta_per_column_evals = self
             .beta_per_column_evals
             .saturating_add(other.beta_per_column_evals);
@@ -1476,7 +1665,7 @@ pub struct ClassBabStats {
     pub epochs_attempted: usize,
     /// Tier-2 epochs that closed a subtree within this class tree.
     pub epochs_closed: usize,
-    /// This class tree's exact Kraft-ledger result when it verified.
+    /// This class tree's cover-gate result (see [`BabStats::ledger_ok`]).
     pub ledger_ok: Option<bool>,
     /// Forced-serial frontier decisions made by this class tree.
     pub frontier_execution: FrontierExecutionEvidence,
@@ -1486,6 +1675,17 @@ pub struct ClassBabStats {
     pub epoch_execution: EpochExecutionEvidence,
     /// Frozen width policy and ordinary-selector work observed by this class.
     pub width_execution: WidthExecutionEvidence,
+}
+
+/// #phase-cost: one finished margin-row tree's work denominators, added to the
+/// run's cost census (expansions = domains explored, closed = domains proved).
+/// Write-only telemetry: nothing reads these counters back.
+fn note_phase_cost_tree(stats: &BabStats) {
+    use ny_core::phase_cost::{count, CostCounter};
+    count(CostCounter::DomainsExplored, stats.expansions as u64);
+    count(CostCounter::DomainsVerified, stats.closed as u64);
+    count(CostCounter::ChildrenCreated, stats.domains_created as u64);
+    count(CostCounter::BabRuns, 1);
 }
 
 /// Run statistics (evidence numbers, not adjectives).
@@ -1520,11 +1720,14 @@ pub struct BabStats {
     pub epochs_attempted: usize,
     /// Tier-2 epochs that closed their subtree.
     pub epochs_closed: usize,
-    /// Kraft-ledger verdict on Unsat (#epoch-bab Phase E): `Some(true)` when
-    /// the closed leaves' prefix-free depths satisfy the exact-integer Kraft
-    /// equality `sum 2^(D-d_i) == 2^D` (leaves partition the root domain)
-    /// AND every nested epoch subtree's ledger verified too. Bookkeeping
-    /// only — never moves a verdict; `None` when the lane did not verify.
+    /// Cover-gate verdict (#soundness-spine M2c; formerly the depth-only
+    /// Kraft ledger of #epoch-bab Phase E, which never gated): `Some(true)`
+    /// when the frame was AUTHORIZED — the certified leaves' PATHS cover the
+    /// frame root (prefix-free, siblings split one site on opposite sides,
+    /// nested epoch subtrees closed by their own sub-domain tokens) and every
+    /// required class is covered; `Some(false)` when a verdict-bearing stop
+    /// was REFUSED (the outcome is then `Unknown`); `None` when the lane did
+    /// not reach a verdict-bearing stop.
     pub ledger_ok: Option<bool>,
     /// Frozen parallel-frontier policy plus observed tree decisions.
     pub frontier_execution: FrontierExecutionEvidence,
@@ -1540,50 +1743,646 @@ pub struct BabStats {
     pub backward_interm_execution: super::BackwardIntermExecutionEvidence,
     /// Governed standalone-alpha and rebake root-phase execution.
     pub root_alpha_execution: super::RootAlphaExecutionEvidence,
+    /// #mr-close-telemetry: the certified value of every close this
+    /// invocation's proof rests on, by kind (root `dj`, tree bound closes by
+    /// eval stage, child closes, emptiness slacks, retirements, closed epoch
+    /// subtrees). Recorded beside every Kraft `ledger.leaf` in the serial
+    /// merge. Telemetry only — never read by any bound, gate or verdict.
+    pub close_integrity: CloseIntegrityEvidence,
 }
 
-/// Prefix-free leaf ledger (#epoch-bab Phase E). Records each closed leaf's
-/// split depth; a complete binary split tree (every expansion produces
-/// exactly two children) has `sum 2^(-d_i) == 1` over its leaves, checked in
-/// exact integers below.
+/// The frame's cover ledger (#soundness-spine M2c). It replaces the
+/// depth-only Kraft ledger of #epoch-bab Phase E, which could not see paths
+/// (a duplicated leaf plus a missing sibling, or siblings that split different
+/// neurons, both summed to 1) and never gated (`Unsat` was returned whatever
+/// it said).
+///
+/// Every closed leaf is recorded with its PATH below the frame root and its
+/// certified evidence; a verdict-bearing stop then goes through
+/// [`authorize_frame`], which refuses unless the paths cover the root
+/// ([`CoverLedger::prove`]) and every required class is covered
+/// ([`authorize_unsat`]). Identical in both proof profiles.
 #[derive(Default)]
 struct Ledger {
-    depths: Vec<u32>,
-    overflow: bool,
+    cover: CoverLedger,
+    /// Who may consume this frame's token. `Default` is `Subdomain`, which can
+    /// never be published: a driver that forgets to scope itself fails closed.
+    scope: TokenScope,
+    /// Classes the frame's token must cover (`None` = the tree's own classes).
+    required: Option<Vec<usize>>,
+    /// Classes discharged before the tree (root closes, frozen-dual tier).
+    pre: Vec<ClassCover>,
+    /// Original-frame authority for a direct-prepass contribution. Kept
+    /// through tree work and checked after the common authorizer's own work.
+    direct_guard: Option<super::head_group::direct::DirectPublicationGuard>,
+    /// B2.3 x head routes (eng12b): the root-frame classes whose certified
+    /// root bound a direct-head or head-group computation RAISED. Hint data
+    /// only (read by nothing but the stream, after the token exists): such a
+    /// `Root` cover is streamed as the ordinary root evaluation's own claim
+    /// when that evaluation closed the class too, else as an opaque claim of
+    /// the head route — never as a `close: root` node carrying a margin the
+    /// checker's root rung does not compute.
+    head_raised: Vec<HeadRaised>,
+    /// A nested epoch subtree's token, parked by `try_epoch` for the leaf its
+    /// caller records next.
+    pending_subtree: Option<UnsatToken>,
+    /// ENGINE_PROGRAM §1.7 B1 (proof bundle v2): the frame's WRITE-ONLY hint
+    /// ledger. Captures only when the entry point's Proof arm switched hint
+    /// capture on; nothing a hint says reaches a bound, a gate or a verdict.
+    hints: HintLedger,
+    /// The absolute literals of this frame's root (a nested frame's parent
+    /// leaf), kept to translate a CHILD frame's prefix. Hint data only.
+    hint_prefix: Vec<AbsLit>,
+    /// B2.3: the frozen-dual tier's prune traces of the classes it closed
+    /// (Proof profile only; empty under Competition). Hint data only: read
+    /// by nothing but the stream, after the token exists.
+    fd_proofs: Vec<FdProofTrace>,
+    /// B2.3: the tree classes whose EVERY certified leaf went into this
+    /// frame's hint ledger from a route with its own per-class ledgers (the
+    /// wave engine): their `Tree` cover streams those leaves instead of an
+    /// opaque claim. Hint data only.
+    streamed_tree_classes: Vec<usize>,
 }
 
-impl Ledger {
-    fn leaf(&mut self, depth: usize) {
-        if depth > 120 {
-            self.overflow = true;
-        } else {
-            #[allow(clippy::cast_possible_truncation)]
-            self.depths.push(depth as u32);
+/// What a leaf hint needs beyond the cover path (proof bundle v2): the
+/// domain's split order and the β its closing bound was scored under, the
+/// retired columns in force, whether the bound came from an ancestor region,
+/// and whether the child split is the site found empty. Hint data only.
+#[derive(Clone, Copy)]
+struct HintCtx<'x> {
+    order: u128,
+    betas: &'x [f64],
+    head_betas: &'x [f64],
+    retired: &'x [u16],
+    lift: bool,
+    empty_child: bool,
+}
+
+impl<'x> HintCtx<'x> {
+    fn of(entry: &'x DomainEntry, lift: bool) -> Self {
+        Self {
+            order: entry.split_order,
+            betas: &entry.betas,
+            head_betas: &entry.head_betas,
+            retired: &entry.retired,
+            lift,
+            empty_child: false,
         }
     }
+}
 
-    /// Exact-integer Kraft equality over the recorded leaves.
-    fn kraft_ok(&self) -> bool {
-        if self.overflow || self.depths.is_empty() {
-            return false;
+/// A frame's splits below its root in BRANCH order, with β aligned, from the
+/// lane's own domain record: `order` bit `k` set means the `k`-th split of
+/// the frame was a head split (see [`DomainEntry::split_order`]); a record
+/// the mask cannot describe falls back to trunk-then-head order (which only
+/// costs the checker's ancestor retries). The child split (fresh, β 0) goes
+/// last. `None` when a split carries no side.
+fn hint_splits(
+    trunk: &[TrunkSplit],
+    heads: &[HeadFix],
+    root_heads: usize,
+    order: u128,
+    betas: &[f64],
+    head_betas: &[f64],
+    child: Option<ChildSplit>,
+) -> Option<(Vec<FrameSplit>, Vec<f64>)> {
+    let below = heads.get(root_heads..)?;
+    let tsplit = |&(layer, pos, dir): &TrunkSplit| -> Option<FrameSplit> {
+        if dir == 0 {
+            return None;
         }
-        let dmax = *self.depths.iter().max().expect("non-empty");
-        let target: u128 = 1u128 << dmax;
-        let mut sum: u128 = 0;
-        for &d in &self.depths {
-            let Some(s) = sum.checked_add(1u128 << (dmax - d)) else {
-                return false;
-            };
-            sum = s;
+        Some(FrameSplit::Trunk {
+            layer: u32::try_from(layer).ok()?,
+            pos: u32::try_from(pos).ok()?,
+            positive: dir > 0,
+        })
+    };
+    let hsplit = |&(index, dir): &HeadFix| -> Option<FrameSplit> {
+        if dir == 0 {
+            return None;
         }
-        sum == target
+        Some(FrameSplit::Head {
+            index: u32::try_from(index).ok()?,
+            positive: dir > 0,
+        })
+    };
+    let depth = trunk.len() + below.len();
+    let described = depth <= 128
+        && order.count_ones() as usize == below.len()
+        && (depth == 128 || order >> depth == 0);
+    let mut splits = Vec::with_capacity(depth + 1);
+    let mut beta = Vec::with_capacity(depth + 1);
+    let (mut ti, mut hi) = (0usize, 0usize);
+    for k in 0..depth {
+        let head = if described {
+            order >> k & 1 == 1
+        } else {
+            k >= trunk.len()
+        };
+        if head {
+            splits.push(hsplit(&below[hi])?);
+            beta.push(head_betas.get(root_heads + hi).copied().unwrap_or(0.0));
+            hi += 1;
+        } else {
+            splits.push(tsplit(&trunk[ti])?);
+            beta.push(betas.get(ti).copied().unwrap_or(0.0));
+            ti += 1;
+        }
+    }
+    match child {
+        Some(ChildSplit::Trunk(t)) => {
+            splits.push(tsplit(&t)?);
+            beta.push(0.0);
+        }
+        Some(ChildSplit::Head(h)) => {
+            splits.push(hsplit(&h)?);
+            beta.push(0.0);
+        }
+        None => {}
+    }
+    Some((splits, beta))
+}
+
+/// The split-order mask of a child of `entry` (see
+/// [`DomainEntry::split_order`]).
+fn child_split_order(entry: &DomainEntry, root_heads: usize, head: bool) -> u128 {
+    let depth = entry.trunk.len() + entry.heads.len().saturating_sub(root_heads);
+    if head && depth < 128 {
+        entry.split_order | (1u128 << depth)
+    } else {
+        entry.split_order
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only mutation hook: the next leaf this thread records is DROPPED.
+    static COVER_FAULT_DROP_NEXT_LEAF: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Test-only: drop the next cover leaf recorded on this thread (the mutation
+/// pin that proves the gate can SEE an incomplete tree).
+#[cfg(test)]
+pub(crate) fn inject_cover_fault_drop_next_leaf() {
+    COVER_FAULT_DROP_NEXT_LEAF.with(|c| c.set(true));
+}
+
+#[cfg(test)]
+fn cover_fault_drop_next_leaf() -> bool {
+    COVER_FAULT_DROP_NEXT_LEAF.with(|c| c.replace(false))
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn cover_fault_drop_next_leaf() -> bool {
+    false
+}
+
+/// #soundness-spine M2c: a child closed at its parent's expansion — the split
+/// that created it and its certified evidence — for the cover ledger.
+struct ClosedLeaf {
+    split: ChildSplit,
+    evidence: Option<LeafEvidence>,
+    /// Proof bundle v2: the closing bound came from the PARENT's region
+    /// (a parent-lift or the parent's bound), not the child's own score.
+    lift: bool,
+}
+
+/// Proof bundle v2: the hint context of one evaluated domain, carried from a
+/// rayon worker to the serial merge (built only while the frame captures;
+/// never read by any bound, gate or verdict).
+struct EvalHints {
+    /// The accepted β of this evaluation (aligned with the entry's trunk).
+    betas: Vec<f64>,
+    /// The accepted head β (aligned with the entry's heads).
+    head_betas: Vec<f64>,
+    /// The retirement set this evaluation passes to its children.
+    retired_out: Vec<u16>,
+    /// The closing bound came from the entry's inherited bound.
+    lift_eval: bool,
+}
+
+/// The token scope of a driver frame: only the OUTER frame speaks for the
+/// instance; a nested epoch frame proves a sub-domain.
+fn frame_scope(cfg: &BabConfig) -> TokenScope {
+    if cfg.epoch_frame_route == EpochFrameRoute::Outer {
+        TokenScope::Instance
+    } else {
+        TokenScope::Subdomain
+    }
+}
+
+/// The frozen-dual tier's closed classes as certified class covers, each
+/// re-derived from its own search report
+/// (`certify::margin_row::frozen_dual_class`) rather than read from the
+/// tier's `closed` list.
+fn frozen_dual_covers(tier: &super::zono_bab::TierReport) -> Vec<ClassCover> {
+    tier.classes
+        .iter()
+        .filter(|report| tier.closed.contains(&report.class))
+        .filter_map(cert_mr::frozen_dual_class)
+        .collect()
+}
+
+/// Whether `covers` holds a frozen-dual cover for `class`.
+fn fd_covered(covers: &[ClassCover], class: usize) -> bool {
+    covers
+        .iter()
+        .any(|c| matches!(c, ClassCover::FrozenDual { class: k, .. } if *k == class))
+}
+
+/// Fraction of the remaining search wall the G2 containment guard may spend
+/// when an instance-scoped proof is authorized. Downgrade-only work after the
+/// proof is complete: a guard the budget cannot pay for is SKIPPED (recorded),
+/// never allowed to delay publication.
+const G2_BUDGET_FRACTION: f64 = 0.02;
+
+/// G4 (#soundness-spine M2d, ENGINE_PROGRAM §1.7 B4): the frozen-dual tier's
+/// block-path cross-check rate, taken from the audit rates of the proof profile
+/// the ENTRY POINT froze — `Proof` re-checks every prune against the scalar
+/// evaluator, `Competition` one in 256 (plus every prune at depth `<= 4` in
+/// both). Read here, in the lane, and handed to the tier as a plain `u32`, so
+/// the tier (`zono_bab`) never names the profile. Downgrade-only: a mismatch
+/// refuses the search, never closes a class.
+fn fd_crosscheck_every() -> u32 {
+    let rates = ny_core::proof_profile::audit_rates();
+    rates.crosscheck_every
+}
+
+/// G2 on the outer root frame (#soundness-spine M2d): the root's certified
+/// boxes, root bounds and the verdict's margin claim against the lane's own
+/// f64 point evaluator. `adv` must be aligned with `re.dj`.
+/// Only authenticated producers construct this private view. It carries the
+/// actual producer's head box, without requiring identity affine rows.
+struct OwnedRootFrameView<'a> {
+    dj: &'a [f64],
+    ybox: YBox,
+}
+
+fn outer_frame_guards(
+    net: &TwinNet,
+    root: &RootGates,
+    t: usize,
+    adv: &[usize],
+    frame: OwnedRootFrameView<'_>,
+    cfg: &BabConfig,
+) -> (GuardReport, String) {
+    if frame.dj.len() != adv.len() {
+        return (GuardReport::new(), "g2=skipped(misaligned)".to_string());
+    }
+    let rates = ny_core::proof_profile::audit_rates();
+    let budget = cfg.deadline.map(|dl| {
+        dl.saturating_duration_since(Instant::now())
+            .mul_f64(G2_BUDGET_FRACTION)
+    });
+    let frame = super::containment_guard::RootFrame::new(net, root, t, adv, frame.dj, frame.ybox);
+    let out = crate::guards::containment::run_containment(&frame, rates.containment_points, budget);
+    (out.report(), out.fragment())
+}
+
+/// U5-U7 for one driver frame: prove the tree's cover (when a tree ran), add
+/// the pre-tree class covers, run the frame's guards, and authorize a token of
+/// the frame's scope — or refuse with a reason. Prints the G5 line
+/// (`[cover-gate] authorized ...`) for an instance-scoped proof and a
+/// `[cover-gate] REFUSED ...` line for every refusal.
+#[allow(clippy::too_many_arguments)]
+fn authorize_frame(
+    ledger: &mut Ledger,
+    tree_classes: &[usize],
+    tree_ran: bool,
+    net: &TwinNet,
+    root: &RootGates,
+    t: usize,
+    re: &RootEval,
+    cfg: &BabConfig,
+) -> std::result::Result<UnsatToken, String> {
+    authorize_frame_view(
+        ledger,
+        tree_classes,
+        tree_ran,
+        net,
+        root,
+        t,
+        OwnedRootFrameView {
+            dj: &re.dj,
+            ybox: re.root_ybox(),
+        },
+        cfg,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn authorize_frame_view(
+    ledger: &mut Ledger,
+    tree_classes: &[usize],
+    tree_ran: bool,
+    net: &TwinNet,
+    root: &RootGates,
+    t: usize,
+    frame: OwnedRootFrameView<'_>,
+    cfg: &BabConfig,
+) -> std::result::Result<UnsatToken, String> {
+    let scope = ledger.scope;
+    let mut hist = crate::guards::margin_hist::MarginHistogram::new();
+    let mut covers = std::mem::take(&mut ledger.pre);
+    // ENGINE_PROGRAM §1.7 B1 (proof bundle v2): the pre-tree class
+    // discharges as hints, so every class the token relies on is CLAIMED in
+    // the stream (a class covered by a route that streams nothing is claimed
+    // opaque). Hint data only; built only while capturing.
+    let pre_hints: Vec<PreHint> = if ledger.hints.capturing() {
+        let mut fd_proofs = std::mem::take(&mut ledger.fd_proofs);
+        covers
+            .iter()
+            .filter_map(|cover| {
+                head_route_pre_hint(cover, &ledger.head_raised).or_else(|| {
+                    proof_pre_hint(
+                        cover,
+                        &mut fd_proofs,
+                        &ledger.streamed_tree_classes,
+                        ledger.hint_prefix.is_empty(),
+                    )
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut tree_note = "tree=none".to_string();
+    if tree_ran {
+        let cover = match ledger.cover.prove(tree_classes) {
+            Ok(cover) => cover,
+            Err(refusal) => {
+                let reason = format!("cover gate refused: {refusal}");
+                eprintln!(
+                    "[cover-gate] REFUSED scope={} leaves={} reason={refusal}",
+                    scope.token(),
+                    ledger.cover.recorded()
+                );
+                return Err(reason);
+            }
+        };
+        for m in ledger.cover.bound_margins() {
+            hist.note(m);
+        }
+        tree_note = format!(
+            "tree_leaves={} tree_max_depth={} empty_leaves={} subtree_leaves={}",
+            cover.leaves(),
+            cover.max_depth(),
+            cover.empty_leaves(),
+            cover.subtree_leaves()
+        );
+        covers.push(ClassCover::Tree(cover));
+    }
+    for cover in &covers {
+        match cover {
+            ClassCover::Root { bound, .. } => hist.note(bound.value()),
+            ClassCover::FrozenDual { cert, .. } => hist.note(cert.value()),
+            ClassCover::Part(token) => hist.note(token.min_margin()),
+            // Specification-emptiness covers carry no bound; the margin-row
+            // lane never builds one.
+            ClassCover::Tree(_) | ClassCover::Exact { .. } => {}
+        }
+    }
+    let required: Vec<usize> = ledger
+        .required
+        .clone()
+        .unwrap_or_else(|| tree_classes.to_vec());
+    let (guards, g2) = if scope == TokenScope::Instance {
+        outer_frame_guards(net, root, t, &required, frame, cfg)
+    } else {
+        (GuardReport::new(), "g2=skipped(frame)".to_string())
+    };
+    match authorize_unsat(scope, &required, &covers, &guards) {
+        Ok(token) => {
+            if scope == TokenScope::Instance && ledger.direct_guard.is_none() {
+                eprintln!(
+                    "[cover-gate] authorized scope={} classes={} {tree_note} {} {g2}",
+                    scope.token(),
+                    required.len(),
+                    hist.fragment()
+                );
+            }
+            // ENGINE_PROGRAM §1.7 B1: the PROVED frame, as hints, into the
+            // process sink the entry point wired (a v2 bundle under Proof,
+            // `NullSink` under Competition, nothing in unit tests) — for EVERY
+            // authorized scope (instance, class part, nested subdomain), so a
+            // nested frame's nodes cover its parent's subtree leaf. Write-only
+            // and after the token exists: the token above is already minted,
+            // so nothing a sink does can reach it.
+            let capture = ledger.hints.capturing();
+            if capture || (scope == TokenScope::Instance && tree_ran) {
+                let mut hints = std::mem::take(&mut ledger.hints);
+                for h in pre_hints {
+                    hints.push_pre(h);
+                }
+                let sites = if capture {
+                    SiteMap::from_root(root, net)
+                } else {
+                    SiteMap::default()
+                };
+                crate::certify::stream_frame(&ledger.cover, hints, tree_classes, &sites);
+            }
+            #[cfg(test)]
+            if let Some(guard) = ledger.direct_guard.as_mut() {
+                DIRECT_EXPIRE_AFTER_AUTHORIZER.with(|fault| {
+                    if fault.replace(false) {
+                        guard.expire_for_test();
+                    }
+                });
+            }
+            if ledger
+                .direct_guard
+                .as_ref()
+                .is_some_and(|guard| !guard.valid(&BackwardEngine::new(net, root), t, &required))
+            {
+                eprintln!(
+                    "[cover-gate] REFUSED scope={} classes={} reason=direct_source_or_deadline_after_authorizer",
+                    scope.token(),
+                    required.len()
+                );
+                return Err("direct head source/deadline/FP at publication".into());
+            }
+            if scope == TokenScope::Instance && ledger.direct_guard.is_some() {
+                eprintln!(
+                    "[cover-gate] authorized scope={} classes={} {tree_note} {} {g2}",
+                    scope.token(),
+                    required.len(),
+                    hist.fragment()
+                );
+            }
+            Ok(token)
+        }
+        Err(refusal) => {
+            eprintln!(
+                "[cover-gate] REFUSED scope={} classes={} reason={refusal} {g2}",
+                scope.token(),
+                required.len()
+            );
+            Err(format!("unsat refused: {refusal}"))
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A deterministic deadline fault after the real containment/stream work.
+    static DIRECT_EXPIRE_AFTER_AUTHORIZER: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// B2.3 x head routes (eng12b): one root-frame class whose certified root
+/// bound a head route raised (see [`Ledger::head_raised`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HeadRaised {
+    class: usize,
+    /// `"direct_head"` (the direct all-head prepass) or `"head_group"` (the
+    /// source-owned head-group refinement of the root evaluation).
+    route: &'static str,
+    /// The ordinary root evaluation's own bound for the class, when THAT
+    /// bound already closed it (`None`: the root evaluation alone did not
+    /// close it, or never ran because the direct prepass closed the frame).
+    root_margin: Option<f64>,
+}
+
+/// B2.3 x head routes (eng12b): which classes the head routes raised, from
+/// the root evaluation's bounds (`root`), the bounds after the direct-prelude
+/// merge (`merged`) and after the head-group refinement (`fin`), all aligned
+/// with `adv`. Dark (no head route armed) the three are identical and the
+/// result is empty. A non-finite or misaligned entry is never "raised".
+fn head_raised_classes(
+    mode: RoundMode,
+    adv: &[usize],
+    root: &[f64],
+    merged: &[f64],
+    fin: &[f64],
+) -> Vec<HeadRaised> {
+    adv.iter()
+        .enumerate()
+        .filter_map(|(i, &class)| {
+            let (r, m, f) = (*root.get(i)?, *merged.get(i)?, *fin.get(i)?);
+            (f > r).then(|| HeadRaised {
+                class,
+                route: if f > m { "head_group" } else { "direct_head" },
+                root_margin: closed(mode, r).then_some(r),
+            })
+        })
+        .collect()
+}
+
+/// B2.3 x head routes (eng12b): the hint of a `Root` cover a head route
+/// raised (`None`: not one, so [`proof_pre_hint`] decides). A class the root
+/// evaluation closed on its own keeps that evaluation's checkable claim with
+/// ITS margin; any other is the head route's opaque claim — its phase-cover
+/// multipliers stream nothing the checker can replay.
+fn head_route_pre_hint(cover: &ClassCover, raised: &[HeadRaised]) -> Option<PreHint> {
+    let ClassCover::Root { class, .. } = cover else {
+        return None;
+    };
+    let head = raised.iter().find(|h| h.class == *class)?;
+    Some(match head.root_margin {
+        Some(margin) => PreHint::Root {
+            class: *class,
+            margin,
+        },
+        None => PreHint::Opaque {
+            classes: vec![*class],
+            route: head.route,
+        },
+    })
+}
+
+/// B2.3: a pre-tree class discharge as a proof hint, preferring a CHECKABLE
+/// stream over a claim: a frozen-dual close with a complete prune trace
+/// becomes its prunes (on a root frame: the tier runs only on the outer
+/// frame, whose prefix is empty), and a tree cover whose every class streamed
+/// its leaves into the frame's hint ledger (the wave engine) claims nothing
+/// more. Everything else is [`pre_hint`]'s claim.
+fn proof_pre_hint(
+    cover: &ClassCover,
+    fd_proofs: &mut Vec<FdProofTrace>,
+    streamed_tree_classes: &[usize],
+    root_frame: bool,
+) -> Option<PreHint> {
+    match cover {
+        ClassCover::FrozenDual { class, .. } if root_frame => {
+            if let Some(at) = fd_proofs
+                .iter()
+                .position(|p| p.class() == *class && p.complete())
+            {
+                return Some(PreHint::FrozenDualProof(Box::new(
+                    fd_proofs.swap_remove(at),
+                )));
+            }
+            pre_hint(cover)
+        }
+        ClassCover::Tree(tree)
+            if !tree.classes().is_empty()
+                && tree
+                    .classes()
+                    .iter()
+                    .all(|c| streamed_tree_classes.contains(c)) =>
+        {
+            None
+        }
+        _ => pre_hint(cover),
+    }
+}
+
+/// B2.3: the frozen-dual tier's prune traces of the classes `covers` closes,
+/// MOVED out of the tier report. Empty under Competition (no trace is ever
+/// built there).
+fn take_fd_proofs(
+    tier: &mut super::zono_bab::TierReport,
+    covers: &[ClassCover],
+) -> Vec<FdProofTrace> {
+    let mut out = Vec::new();
+    for report in &mut tier.classes {
+        if !fd_covered(covers, report.class) {
+            continue;
+        }
+        if let Ok(run) = report.result.as_mut() {
+            if let Some(proof) = run.proof.take() {
+                out.push(*proof);
+            }
+        }
+    }
+    out
+}
+
+/// A pre-tree class discharge as a proof hint (proof bundle v2).
+fn pre_hint(cover: &ClassCover) -> Option<PreHint> {
+    match cover {
+        ClassCover::Root { class, bound } => Some(PreHint::Root {
+            class: *class,
+            margin: bound.value(),
+        }),
+        ClassCover::FrozenDual { class, cert } => Some(PreHint::FrozenDual {
+            class: *class,
+            margin: cert.value(),
+        }),
+        // A tree cover in `pre` is a route that proved its classes without
+        // streaming leaves (the wave engine): claimed, never checkable.
+        ClassCover::Tree(tree) => Some(PreHint::Opaque {
+            classes: tree.classes().to_vec(),
+            route: "wave",
+        }),
+        // A class part streamed its own frame when it was authorized.
+        ClassCover::Part(_) => None,
+        ClassCover::Exact { class, .. } => Some(PreHint::Opaque {
+            classes: vec![*class],
+            route: "exact",
+        }),
     }
 }
 
 /// Outcome of the lane. NEVER `Sat`: fail-closed to `Unknown`.
 pub enum MarginRowOutcome {
-    /// Every class certified: margin > 0 on the whole box.
-    Unsat(BabStats),
+    /// Every class certified: margin > 0 on the whole box. The token is the
+    /// frame's authorization (#soundness-spine M2b/M2c): minted only after
+    /// the path-based cover gate and the class aggregation passed, scoped to
+    /// the instance for an outer frame and to the sub-domain for a nested one.
+    Unsat(BabStats, UnsatToken),
     /// Not decided (budget, candidates exhausted, or fail-closed error).
     Unknown {
         /// Why.
@@ -1593,13 +2392,53 @@ pub enum MarginRowOutcome {
     },
 }
 
-struct YPack {
-    al: PassOut,
-    au: PassOut,
-    ly0: Vec<f64>,
-    uy0: Vec<f64>,
+pub(super) struct YPack {
+    pub(super) al: PassOut,
+    pub(super) au: PassOut,
+    pub(super) ly0: Vec<f64>,
+    pub(super) uy0: Vec<f64>,
+    /// Minted before the owned unconditional source passes, never by the raw
+    /// row adapter. This is not an importable certificate or verdict token.
+    head_group_source: Option<super::head_group_source::YPackSource>,
+    /// #clip-head: the UNTIGHTENED concretization of `al`, kept verbatim as
+    /// `pack_from_rows` produced it.
+    ///
+    /// `ly0` is NOT a safe calibration base: `clip_tighten_pack` adds trunk
+    /// deltas into it in place whenever `margin_row.clip` is armed, and a slack
+    /// recovered against a TIGHTENED bound under-recovers (clamps toward zero),
+    /// which makes the halfspace claim the line bounds `y_i` more tightly than
+    /// certified — a false-`unsat` generator. This is the ordering trap
+    /// `root.rs`'s CALIBRATION INVARIANT records for the trunk rows.
+    ly_fwd: Vec<f64>,
+    /// #clip-head: the untightened concretization of `au`; see [`YPack::ly_fwd`].
+    uy_fwd: Vec<f64>,
+    /// #clip-head: certified slack recovered from the head lines, or `None`
+    /// when the gate is dark or the per-pack frame check refused.
+    head_slack: Option<super::clip::HeadSlack>,
     al_dots: RowDots,
     au_dots: RowDots,
+    // Last: actual numerical buffers cease before their original owner claims.
+    prepared_owner: Option<prepared_root_eval::PreparedPackOwner>,
+}
+
+impl YPack {
+    pub(super) fn owned_for_head_groups(&self, eng: &BackwardEngine<'_>) -> bool {
+        self.head_group_source
+            .as_ref()
+            .is_some_and(|source| source.matches(eng, &self.al, &self.au, &self.ly0, &self.uy0))
+    }
+
+    /// Freeze existing private provenance for an immediate prepared replay.
+    /// Cloning this sealed value creates no authority for another root frame.
+    pub(super) fn head_source_snapshot(
+        &self,
+        eng: &BackwardEngine<'_>,
+    ) -> Option<super::head_group_source::YPackSource> {
+        if !self.owned_for_head_groups(eng) {
+            return None;
+        }
+        Some(self.head_group_source.as_ref()?.clone())
+    }
 }
 
 struct Lru {
@@ -1683,6 +2522,25 @@ struct DomainEntry {
     /// through the movable-slot list). Always empty unless
     /// `NY_MARGIN_ROW_DOMAIN_ALPHA` is armed.
     alpha: Vec<super::domain_alpha::AlphaCarry>,
+    /// #clip-stateful: the ACCUMULATED Clip-and-Verify intermediate tightening
+    /// this domain inherits from its parent's evaluation — a sparse
+    /// `(layer, neuron, lo, hi)` delta, not a dense interval copy, because the
+    /// frontier reaches 400+ live entries.
+    ///
+    /// Same monotone parent -> child contract as `retired` and `betas`: every
+    /// stored interval was proved over an ANCESTOR region, and this domain's
+    /// region is a subset, so it stays a valid enclosure verbatim. The child's
+    /// own evaluation intersects its fresh tightening into it shrink-only.
+    /// `None` unless `margin_row.clip_stateful` (or `NY_MARGIN_ROW_CLIP_STATEFUL`)
+    /// is armed, in which case the whole lane is byte-identical to its history.
+    clip_acc: Option<Arc<super::clip::ClipAcc>>,
+    /// Proof bundle v2 (ENGINE_PROGRAM §1.7 B1): the BRANCH ORDER of this
+    /// domain's splits below its frame root — bit `k` set iff the frame's
+    /// `k`-th split was a head split (trunk and head splits are kept in two
+    /// vectors, which lose their interleaving). `Copy`, never read by any
+    /// bound, gate or verdict: only [`hint_splits`] reads it, to order a
+    /// leaf hint's literals.
+    split_order: u128,
 }
 
 impl PartialEq for DomainEntry {
@@ -1748,6 +2606,10 @@ struct NodeState {
     /// `DomainEntry::alpha`). Children inherit it verbatim. Equals the entry's
     /// list when disarmed or when no trial improved.
     alpha: Vec<super::domain_alpha::AlphaCarry>,
+    /// #clip-stateful: the OUT set for children — the entry's inherited
+    /// accumulation intersected with what THIS eval's `domain_gates_acc`
+    /// derived. `None` when the gate is dark.
+    clip_acc: Option<Arc<super::clip::ClipAcc>>,
     /// #margin-row-col-retire: the narrowed margin batch this node's `ms`,
     /// `pass` and per-column side lanes were computed under (`None` = the
     /// driver's full tree batch). Candidate selection/scoring for this node
@@ -1762,6 +2624,13 @@ struct NodeState {
     pass: PassOut,
     dom: DomainGates,
     pack: Arc<YPack>,
+    /// #mr-close-telemetry: the eval STAGE whose bound first closed (`Eval`
+    /// = the main pass, `Beta`, `DomainAlpha`). Meaningful only when the
+    /// returned bound closes. Telemetry only.
+    close_src: CertKind,
+    /// #mr-close-telemetry: the certified composite of every column THIS eval
+    /// newly retired (#margin-row-col-retire). Telemetry only.
+    retire_certs: CertTally,
 }
 
 /// A prospective child domain (heap `seq` assigned by the serial merge step).
@@ -1789,12 +2658,83 @@ struct ChildProto {
     /// `DomainEntry::alpha`). Carried verbatim; the child re-filters it against
     /// its OWN movable slots at its own eval.
     alpha: Vec<super::domain_alpha::AlphaCarry>,
+    /// #clip-stateful: inherited accumulation (see `DomainEntry::clip_acc`).
+    clip_acc: Option<Arc<super::clip::ClipAcc>>,
+    /// Proof bundle v2: see `DomainEntry::split_order`.
+    split_order: u128,
+}
+
+/// #mr-stack (throughput plan B5): one domain evaluation paused at its main
+/// certified pass — every local the unsplit `eval_with_pack` body computed
+/// before the pass and read after it. Produced by
+/// [`MarginRowBab::eval_prepare`], consumed by [`MarginRowBab::eval_finish`];
+/// the pass in between is the domain's own ([`MarginRowBab::eval_main_pass`])
+/// or its block of one domain-stacked pass (`bab/stack_eval.rs`).
+struct EvalSeeded {
+    /// `Phase::EvalNode` timer (profile-only), dropped at the end of the finish.
+    t_node: Option<super::prof::Timer>,
+    policy_execution: PolicyExecutionEvidence,
+    epoch_execution: EpochExecutionEvidence,
+    width_execution: WidthExecutionEvidence,
+    clip_acc: Option<Arc<super::clip::ClipAcc>>,
+    pack: Arc<YPack>,
+    ybox: YBox,
+    gates: HeadGates,
+    mb_local: Option<MarginBatch>,
+    survivors: Option<Vec<usize>>,
+    ms: MarginSeed,
+    beta_armed: bool,
+    betas: Vec<f64>,
+    head_betas: Vec<f64>,
+    beta_step: f64,
+    percol: bool,
+    pc: Vec<PcBetas>,
+    head_admissible: bool,
+    /// The gates the main pass runs under (inherited β / per-column β /
+    /// warm-started domain alpha already installed).
+    dom: DomainGates,
+    alpha_policy: super::DomainAlphaRuntimePolicy,
+    alpha_armed: bool,
+    alpha_slots: Vec<super::domain_alpha::Slot>,
+    alpha_cur: Vec<f64>,
+    alpha_warm: usize,
+    seed_main: Option<Seed>,
+    seed_main_pc: Option<Seed>,
+    /// `max(|ly|, |uy|)` of the final y-box (the GPU seam's `y_abs`).
+    eval_y_abs: Vec<f64>,
+}
+
+impl EvalSeeded {
+    /// The seed of the main pass: the per-column head-shifted seed, else the
+    /// shared head-shifted seed, else the base margin seed.
+    fn main_seed(&self) -> &Seed {
+        self.seed_main_pc
+            .as_ref()
+            .or(self.seed_main.as_ref())
+            .unwrap_or(&self.ms.seed)
+    }
+
+    /// Whether this eval's passes capture `unst_rows` (the β / domain-alpha
+    /// gradient input).
+    fn unst_rows(&self) -> bool {
+        self.beta_armed || self.alpha_armed
+    }
+}
+
+/// [`MarginRowBab::eval_prepare`]'s result.
+enum EvalPrep {
+    /// An early exit, returned exactly as the unsplit body returned it
+    /// (boxed like `PreparedExpand::Done`: the evidence record dwarfs a box).
+    Done(Box<EvalOut>),
+    /// Ready for its main pass (boxed: the payload is large).
+    Seeded(Box<EvalSeeded>),
 }
 
 /// Result of one domain evaluation (see [`MarginRowBab::eval_with_pack`]).
 enum EvalOut {
-    /// Provably empty region: the domain is closed.
-    Infeasible(PolicyExecutionEvidence),
+    /// Provably empty region: the domain is closed. The `f64` is the
+    /// emptiness certificate's slack (#mr-close-telemetry; telemetry only).
+    Infeasible(PolicyExecutionEvidence, f64),
     /// #deadline-poll (D2): an intra-expansion poll fired before the next
     /// costly phase. The caller aborts CLEANLY with no verdict — never a
     /// closure, never an error — exactly as the between-expansion check
@@ -1836,14 +2776,17 @@ impl DomainExecutionEvidence {
 }
 
 enum ExpandStep {
-    /// `eval_with_pack` returned `None` (provably empty box): closed.
-    Infeasible(DomainExecutionEvidence),
+    /// `eval_with_pack` returned `None` (provably empty box): closed. The
+    /// [`Cert`] carries the emptiness slack (#mr-close-telemetry).
+    Infeasible(DomainExecutionEvidence, Cert),
     /// #deadline-poll (D2): an intra-expansion poll fired inside this
     /// domain's eval or candidate scoring. The merge stops the tree loop with
     /// a wallclock stop reason; the domain is NOT closed and NOT counted.
     DeadlineHit(DomainExecutionEvidence),
-    /// The refreshed bound already closes the domain.
-    ClosedAtEval(DomainExecutionEvidence),
+    /// The refreshed bound already closes the domain. The [`Cert`] carries
+    /// the closing eval stage and bound (#mr-close-telemetry); the hints are
+    /// proof bundle v2 data (`None` unless the frame captures).
+    ClosedAtEval(DomainExecutionEvidence, Cert, Option<Box<EvalHints>>),
     /// No split candidates remain: the instance cannot close here (Unknown).
     NoCandidates(DomainExecutionEvidence),
     /// A verdict-bearing bound was non-finite: fail-closed to Unknown.
@@ -1860,17 +2803,131 @@ enum ExpandStep {
         closed_children: usize,
         /// Child slots that incremented `domains_created`.
         created_children: usize,
+        /// #mr-census: what closed the `closed_children` (telemetry only).
+        close_kinds: ChildCloseKinds,
+        /// #soundness-spine M2c: every closed child's split and certified
+        /// evidence, in child order — the cover ledger's leaves. One entry per
+        /// `closed_children`; the merge refuses the cover if they disagree.
+        closed_leaves: Vec<ClosedLeaf>,
         /// Pure per-evaluation policy counters for deterministic serial merge.
-        execution: DomainExecutionEvidence,
+        /// Boxed: with it inline `Expanded` was 1016 bytes against
+        /// `ClosedAtEval`'s 848 (clippy::large_enum_variant, threshold 64).
+        execution: Box<DomainExecutionEvidence>,
+        /// Proof bundle v2 hint context (`None` unless the frame captures).
+        hints: Option<Box<EvalHints>>,
     },
+}
+
+/// #mr-census: how an expansion's closed children closed. Telemetry only —
+/// counted beside `closed_children`, never read by a bound or a verdict.
+#[derive(Clone, Copy, Default)]
+struct ChildCloseKinds {
+    /// Child's own scored bound closes (`closed(raw)`).
+    raw: usize,
+    /// Closed only through `max(raw, b, lift)` with `raw` open: the parent
+    /// lift (the parent bound `b` was already checked open at eval).
+    lift: usize,
+    /// Head-split child slot whose bounds crossed (provably empty).
+    head_infeasible: usize,
+    /// #mr-close-telemetry: each closed child's certificate, in child order
+    /// (an expansion has at most two children). Not folded into the
+    /// trajectory hash: telemetry only.
+    certs: [Option<Cert>; 2],
+    /// #mr-close-telemetry: the columns the PARENT retired while staying
+    /// open (see `close_integrity`'s `retire`). Telemetry only.
+    retire: CertTally,
+}
+
+impl ChildCloseKinds {
+    fn note_scored(&mut self, raw_closes: bool) {
+        if raw_closes {
+            self.raw += 1;
+        } else {
+            self.lift += 1;
+        }
+    }
+
+    /// #mr-close-telemetry: record one closed child's certificate.
+    fn note_cert(&mut self, kind: CertKind, value: f64) {
+        if let Some(slot) = self.certs.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(Cert { kind, value });
+        }
+    }
+}
+
+/// #mr-close-telemetry: the certified slack of a crossed y-box — the largest
+/// `ly_i - uy_i` (positive exactly when some interval is empty). The emptiness
+/// DECISION stays `YBox::is_empty`, but since #soundness-spine M2c this slack
+/// is also the emptiness leaf's cover-gate EVIDENCE (`certify::margin_row::
+/// empty_evidence` refuses a slack that is not finite and `> 0`), so it must be
+/// computed on every emptiness exit — a telemetry-off `NaN` here would make
+/// the cover gate refuse an otherwise complete tree.
+fn ybox_crossing(ybox: &YBox) -> f64 {
+    ybox.ly
+        .iter()
+        .zip(&ybox.uy)
+        .map(|(l, u)| l - u)
+        .fold(f64::NEG_INFINITY, f64::max)
+}
+
+#[cfg(test)]
+mod close_telemetry_unit_tests {
+    use super::{ybox_crossing, CertKind, ChildCloseKinds, YBox};
+
+    /// `ybox_crossing_prices_the_emptiness_decision`: the recorded slack is the
+    /// largest `ly - uy`, and every box `YBox::is_empty` discharges carries a
+    /// slack above that decision's own `1e-12` margin.
+    #[test]
+    fn ybox_crossing_prices_the_emptiness_decision() {
+        let open = YBox {
+            ly: vec![-1.0, 0.0, 0.5],
+            uy: vec![1.0, 0.0, 0.5 + 1e-13],
+        };
+        assert!(!open.is_empty());
+        assert!(ybox_crossing(&open) <= 1e-12);
+        let crossed = YBox {
+            ly: vec![-1.0, 0.3, 2.0],
+            uy: vec![1.0, 0.1, 1.5],
+        };
+        assert!(crossed.is_empty());
+        assert_eq!(ybox_crossing(&crossed).to_bits(), 0.5f64.to_bits());
+        assert!(ybox_crossing(&crossed) > 1e-12);
+    }
+
+    /// `child_certs_fill_in_child_order_and_never_overwrite`: an expansion has
+    /// at most two children; their certificates land in order, an
+    /// (impossible) third never overwrites one, and the census counts are
+    /// untouched.
+    #[test]
+    fn child_certs_fill_in_child_order_and_never_overwrite() {
+        let mut k = ChildCloseKinds::default();
+        k.note_cert(CertKind::Raw, 1e-3);
+        k.note_cert(CertKind::HeadInfeasible, 2e-3);
+        k.note_cert(CertKind::Lift, 3e-3);
+        let got: Vec<(CertKind, u64)> = k
+            .certs
+            .iter()
+            .flatten()
+            .map(|c| (c.kind, c.value.to_bits()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (CertKind::Raw, 1e-3f64.to_bits()),
+                (CertKind::HeadInfeasible, 2e-3f64.to_bits()),
+            ]
+        );
+        assert_eq!((k.raw, k.lift, k.head_infeasible), (0, 0, 0));
+        assert_eq!(k.retire.n, 0);
+    }
 }
 
 impl ExpandStep {
     fn policy_execution(&self) -> PolicyExecutionEvidence {
         match self {
-            Self::Infeasible(evidence)
+            Self::Infeasible(evidence, _)
             | Self::DeadlineHit(evidence)
-            | Self::ClosedAtEval(evidence)
+            | Self::ClosedAtEval(evidence, _, _)
             | Self::NoCandidates(evidence)
             | Self::NonFiniteBound(evidence) => evidence.policy,
             Self::Expanded { execution, .. } => execution.policy,
@@ -1879,9 +2936,9 @@ impl ExpandStep {
 
     fn epoch_execution(&self) -> EpochExecutionEvidence {
         match self {
-            Self::Infeasible(evidence)
+            Self::Infeasible(evidence, _)
             | Self::DeadlineHit(evidence)
-            | Self::ClosedAtEval(evidence)
+            | Self::ClosedAtEval(evidence, _, _)
             | Self::NoCandidates(evidence)
             | Self::NonFiniteBound(evidence) => evidence.epoch,
             Self::Expanded { execution, .. } => execution.epoch,
@@ -1890,9 +2947,9 @@ impl ExpandStep {
 
     fn width_execution(&self) -> WidthExecutionEvidence {
         match self {
-            Self::Infeasible(evidence)
+            Self::Infeasible(evidence, _)
             | Self::DeadlineHit(evidence)
-            | Self::ClosedAtEval(evidence)
+            | Self::ClosedAtEval(evidence, _, _)
             | Self::NoCandidates(evidence)
             | Self::NonFiniteBound(evidence) => evidence.width,
             Self::Expanded { execution, .. } => execution.width,
@@ -1946,9 +3003,12 @@ pub struct MarginRowBab<'a> {
     stats: BabStats,
     /// Failed (Unknown-ending) Tier-2 epoch attempts so far (#epoch-bab).
     epoch_failures: usize,
-    /// Closed-leaf ledger (#epoch-bab Phase E).
+    /// The frame's path-based cover ledger and authorization scope
+    /// (#soundness-spine M2c).
     ledger: Ledger,
-    /// AND of every nested epoch subtree's own ledger verdict.
+    /// AND of every nested epoch subtree's own ledger verdict. Telemetry only
+    /// since M2c: a nested subtree now proves its leaf through its sub-domain
+    /// token, which the cover gate checks.
     nested_ledgers_ok: bool,
     /// B1 plan-residency cache for the certified GPU lane, OWNED HERE.
     ///
@@ -1964,6 +3024,9 @@ pub struct MarginRowBab<'a> {
     /// escalates to is process-global, which is what makes an escalation the
     /// parent earned stay in force inside the epoch.
     closure: super::closure::ClosureMonitor,
+    /// #mr-stack (B5): this tree's main-eval stacking receipt and trajectory
+    /// hash (telemetry only; see `bab/stack_eval.rs`).
+    b5: stack_eval::B5Trace,
 }
 
 /// Root evaluation shared by the driver and callers: via-y bounds for all
@@ -1975,6 +3038,22 @@ pub struct RootEval {
     pub tree_classes: Vec<usize>,
     /// The root y-pack (moved into the driver).
     pack: Arc<YPack>,
+    /// #spec-alpha yield for THIS evaluation. Evidence only; never feeds a
+    /// bound. `None` whenever the axis is dark, which is the shipped state.
+    pub spec_alpha: Option<super::spec_alpha::SpecAlphaReport>,
+}
+
+impl RootEval {
+    /// #frozen-dual-state: a copy of the certified head pre-activation box
+    /// (y-box) THIS evaluation used — exactly the `YBox` `root_eval` built its
+    /// head gates on. Read-only; the pack itself is untouched.
+    #[must_use]
+    pub fn root_ybox(&self) -> YBox {
+        YBox {
+            ly: self.pack.ly0.clone(),
+            uy: self.pack.uy0.clone(),
+        }
+    }
 }
 
 fn require_finite(context: &str, values: &[f64]) -> Result<()> {
@@ -1999,8 +3078,10 @@ fn require_finite(context: &str, values: &[f64]) -> Result<()> {
 /// nothing (idx_8762 proves in 9 expansions and never sees 32 open). This
 /// policy spends width exactly where the signature appears:
 ///
-///     open >= 32   ->  k = 16     (above every measured proving-row peak)
-///     open >= 256  ->  k = 32
+/// ```text
+/// open >= 32   ->  k = 16     (above every measured proving-row peak)
+/// open >= 256  ->  k = 32
+/// ```
 ///
 /// The ratchet is one-way (never narrows below the configured base), so a row
 /// that never explodes runs the configured width bit-identically.
@@ -2080,17 +3161,215 @@ fn note_reduceop(reduce_max: bool, site: &str, cands: usize, pick: usize, differ
     }
 }
 
-fn closed(mode: RoundMode, b: f64) -> bool {
-    // A non-finite arithmetic result is not a proof. In particular, `+inf`
-    // must not satisfy the strict-positive closure predicate.
-    if !b.is_finite() {
-        return false;
+/// #branch-parent-lift: recover the certified evidence the expansion throws away.
+///
+/// `score_candidates` runs a full certified backward pass over EVERY shortlisted
+/// candidate, producing `ch[i] = (l_i, r_i)`: sound lower bounds on the two
+/// children that candidate `i` would create. The expansion then splits on ONE
+/// candidate and discards the other ~31 pairs. But each discarded pair still
+/// certifies something about the PARENT:
+///
+/// Splitting `D` on candidate `i` partitions it into `D_i^+` and `D_i^-` with
+/// `D = D_i^+ ∪ D_i^-` (a ReLU sign split covers both signs; a head split
+/// covers `y_i >= 0` and `y_i <= 0`). Every `x ∈ D` therefore lies in at least
+/// one child, so
+///     margin(x) >= min(l_i, r_i)   for all x in D.
+/// That holds for each candidate INDEPENDENTLY, so the best of them
+///     lift = max_i min(l_i, r_i)
+/// is a valid lower bound on the parent — available for free, already paid for.
+///
+/// SOUNDNESS, precisely. `l_i` and `r_i` are the same `concretize_lower`
+/// outputs the expansion ALREADY relies on to CLOSE a child (`closed(mode, cb)`
+/// on `cb = raw.max(b)`, pushed at the `closed_children` sites with no
+/// re-evaluation). If they were not sound lower bounds ny would already be
+/// unsound there, so that half is inherited, not new. `closed()` is untouched
+/// and closure stays strict; the lift only raises a bound that is already
+/// published, through the SAME monotone floor, never by weakening a test.
+///
+/// ⚠ BUT IT IS NOT TRUST-FREE. The lift needs ONE premise the existing closure
+/// test does not: that candidate `i`'s two children COVER the parent. Closing a
+/// child only needs that child's own bound; concluding something about D needs
+/// the pair to leave no part of D unaccounted for. See [`CANDIDATES_ARE_A_COVER`]
+/// — that invariant is what makes this sound, and it is the thing a future
+/// candidate kind must preserve.
+///
+/// An empty child (`ly > uy`, the infeasible case the split loop skips) can only
+/// make `min(l_i, r_i)` SMALLER than the truth, so the reduction stays
+/// conservative there rather than over-claiming.
+///
+/// WHY IT PAYS. The frontier is `min` over open domains of their bounds, and
+/// this lane is expansion-limited: lifting the parent lifts BOTH children, so
+/// the gain propagates into the frontier instead of being spent on tree shape.
+/// When `lift > 0` both children close, so the branch contributes no open
+/// domain — though they are still CREATED and counted before closing, because
+/// the parent's own `b` is not raised. That covers the closure blind spot of the
+/// `max` reduction, which ranks by the BETTER child and can pass over a
+/// candidate whose worse child also closes.
+/// THE INVARIANT [`parent_lift`] RESTS ON: for every branching candidate, the
+/// two children the expansion builds from it COVER the parent domain.
+///
+/// It holds for both candidate kinds the lane has, and each is a dichotomy:
+/// * TRUNK — a ReLU sign split. `candidate_columns` fixes the gate to the exact
+///   identity line `(1,1,0)` and the exact zero line `(0,0,0)`; the constructed
+///   children are `trunk + (li,pos,+1)` and `trunk + (li,pos,-1)`. Every point
+///   has a sign, so the pair covers.
+/// * HEAD — `ly[i].max(0.0)` against `uy[i].min(0.0)`, i.e. `y_i >= 0` against
+///   `y_i <= 0`. They overlap at zero and cover `[ly, uy]`. When one side is
+///   infeasible the other IS the parent, and `min` (never `max`) keeps that
+///   case conservative.
+///
+/// A candidate kind that is NOT a dichotomy — a 3-way interval split, a
+/// tighten-both-sides split, a split that drops a boundary — would break this
+/// while every existing test stayed green, because nothing else in the lane
+/// needs the cover: closing a child only ever needs that child's own bound.
+/// **Anything added to `select_candidates` must preserve this, or `parent_lift`
+/// must be taught to skip it.**
+#[allow(dead_code)]
+const CANDIDATES_ARE_A_COVER: () = ();
+
+fn parent_lift(ch: &[(f64, f64)]) -> f64 {
+    let mut lift = f64::NEG_INFINITY;
+    for &(l, r) in ch {
+        if l.is_finite() && r.is_finite() {
+            let both = l.min(r);
+            if both > lift {
+                lift = both;
+            }
+        }
     }
-    // Production (outward) closure is STRICT: margin==0 admits a SAT point.
-    if mode.outward() {
-        b > 0.0
-    } else {
-        b >= 0.0
+    lift
+}
+
+#[cfg(test)]
+mod parent_lift_tests {
+    use super::parent_lift;
+
+    #[test]
+    fn lift_is_the_best_worse_child_over_all_candidates() {
+        // Candidate 0 has a spectacular better child and an open worse one;
+        // candidate 1 is mediocre on both but its WORSE child is positive, so
+        // it is the one that certifies the parent.
+        let ch = [(5.0, -0.1), (0.001, 0.002)];
+        assert_eq!(parent_lift(&ch), 0.001);
+    }
+
+    #[test]
+    fn lift_ignores_non_finite_pairs_rather_than_propagating_them() {
+        let ch = [
+            (f64::INFINITY, f64::INFINITY),
+            (-0.5, -0.25),
+            (f64::NAN, 1.0),
+        ];
+        // -0.5 is the worse child of the only finite pair.
+        assert_eq!(parent_lift(&ch), -0.5);
+    }
+
+    #[test]
+    fn all_non_finite_yields_neg_infinity_which_a_max_floor_absorbs() {
+        let ch = [(f64::NAN, 1.0), (f64::INFINITY, f64::NEG_INFINITY)];
+        let lift = parent_lift(&ch);
+        assert!(lift.is_infinite() && lift.is_sign_negative());
+        // The floor it feeds must be a no-op in that case.
+        let raw = -0.3f64;
+        let b = -0.4f64;
+        assert_eq!(raw.max(b).max(lift), raw.max(b));
+    }
+
+    #[test]
+    fn empty_candidate_set_cannot_manufacture_a_bound() {
+        let lift = parent_lift(&[]);
+        assert!(lift.is_infinite() && lift.is_sign_negative());
+    }
+
+    #[test]
+    fn the_reduction_is_min_not_max_so_an_infeasible_side_stays_conservative() {
+        // If one child is infeasible its score is an ordinary finite number
+        // that does NOT bound the parent; `min` keeps the pair honest, `max`
+        // would not. Here 9.0 must never be the answer.
+        let ch = [(9.0, -0.2)];
+        assert_eq!(parent_lift(&ch), -0.2);
+    }
+}
+
+/// #branch-parent-lift PERCOL probe. `score_candidates` collapses the COLUMN
+/// axis with `min` before [`parent_lift`] ever sees a pair, so the shipped lift
+/// is `max_i min_f`. But the domain's bound is itself `min_f`, and each COLUMN
+/// may be certified by a DIFFERENT candidate, so the sound form is
+///     lift_percol = min_f ( max_i min(l_{i,f}, r_{i,f}) )
+/// and `max_i min_f <= min_f max_i` always, so this is >= the shipped lift and
+/// equally sound. This probe MEASURES the headroom between the two before any
+/// plumbing is paid for; it prints and returns nothing, so verdicts are
+/// byte-identical whether or not it fires.
+///
+/// ANSWERED 2026-08-30, and the answer is ZERO. Across 71 sampled expansions on
+/// the cifar100 pool the headroom was `0.000000` on EVERY one — because
+/// `#margin-row-col-retire` has already collapsed the lane to `nf=1` (51 of 71
+/// samples) or `nf=2` (20 of 71) before branching begins, and at `nf=1` the two
+/// reduction orders are trivially identical. The refinement is real in theory
+/// and worth nothing here. KEEP THIS PROBE: it is the cheap standing check that
+/// would fire if a future change kept more columns alive into the tree, which
+/// is the only world where re-plumbing the certified scorer would pay.
+fn note_parent_lift_percol(site: &str, nf: usize, cands: usize, collapsed: f64, percol: f64) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 8 || n.is_multiple_of(64) {
+        let head = if percol.is_finite() && collapsed.is_finite() {
+            percol - collapsed
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[parent-lift-percol] n={n} site={site} nf={nf} cands={cands} \
+             collapsed={collapsed:.6} percol={percol:.6} headroom={head:.6}"
+        );
+    }
+}
+
+/// Rate-limited observable for [`parent_lift`]: first 8 expansions, then every
+/// 64th. `gain` is the amount the parent bound actually rose, so `gain=0` is a
+/// REAL null (the split candidate was already the best certifier) and the
+/// absence of the line entirely means the lever never ran.
+fn note_parent_lift(site: &str, cands: usize, b: f64, lift: f64, closes: bool) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 8 || n.is_multiple_of(64) {
+        let gain = if lift.is_finite() && lift > b {
+            lift - b
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[branch-parent-lift] n={n} site={site} cands={cands} b={b:.6} lift={lift:.6} \
+             gain={gain:.6} closes={}",
+            u8::from(closes),
+        );
+    }
+}
+
+/// THE margin-row closure predicate (#soundness-spine M2b). It routes through
+/// the certified facade: only an Outward engine value becomes a
+/// `Certified<f64>`, and `certify::closed` on it is strict (`b > 0`) and finite
+/// — bit-identical to the historical Outward branch. A non-finite result is
+/// not a proof (`+inf` must not close). The historical Parity branch
+/// (`b >= 0`) is GONE: a round-to-nearest value is a `SearchValue`, which has
+/// no closure predicate. (The tree never ran in Parity — `run` and
+/// `run_classwise` refuse it — so no verdict moves.)
+pub(crate) fn closed(mode: RoundMode, b: f64) -> bool {
+    cert_mr::closes(mode, b)
+}
+
+/// Root-evaluation SCHEDULING: which classes get the direct pass and which
+/// form the tree set. Outward: exactly [`closed`]. Parity (the measurement
+/// mode no verdict path accepts): the historical `>= 0` schedule on the
+/// SEARCH value, so parity measurements against the reference stay
+/// bit-identical. This is a schedule, never a closure: nothing that reads it
+/// can publish.
+fn root_schedules_closed(mode: RoundMode, b: f64) -> bool {
+    match cert_mr::classify(mode, b) {
+        cert_mr::MarginRowValue::Certified(c) => crate::certify::closed(&c),
+        cert_mr::MarginRowValue::Search(v) => v.hint().is_finite() && v.hint() >= 0.0,
     }
 }
 
@@ -2106,18 +3385,46 @@ fn poll_note(site: &str) {
     }
 }
 
-fn build_pack(
+pub(super) fn build_pack(
     eng: &BackwardEngine<'_>,
     dom: Option<&DomainGates>,
     splits: &[TrunkSplit],
 ) -> Result<YPack> {
+    let head_group_source = if dom.is_none() && splits.is_empty() {
+        super::head_group_source::YPackSource::capture(eng)
+    } else {
+        None
+    };
     // The identity-seeded y-row refresh is the seam's cleanest admission: the
     // seed is f32-exact and carries no certified error, so no `y_abs` is
     // needed, and one device walk publishes BOTH lanes. Dark + fail-closed:
     // with `NY_MARGIN_ROW_GPU` unset this is the established `y_rows` call.
-    let (al, au) = eng.y_rows_seamed(dom, &super::gpu_seam::SeamCtx::default())?;
+    let (al, au) = {
+        // #mr-census: two identity-seeded passes of n_y columns each.
+        let _census = super::census::SiteTimer::start(super::census::Site::YRows, 2 * eng.net.n_y);
+        let t_rows = Instant::now();
+        let rows = if head_group_source.is_some() {
+            // The source qualifier applies to the repaired CPU producer,
+            // whose absolute underflow budget the optional replay relies on.
+            // Separate device programs cannot inherit that qualification.
+            BackwardEngine::new(eng.net, eng.root)
+                .with_err_lane(eng.err_lane())
+                .with_gpu_conv_route(super::gpu_conv::GpuConvRoute::Off)
+                .y_rows(dom)?
+        } else {
+            eng.y_rows_seamed(dom, &super::gpu_seam::SeamCtx::default())?
+        };
+        // #root-eval-reuse: what a rows-memo hit saves (read by the store).
+        LAST_Y_ROWS_NS.with(|c| c.set(super::census::elapsed_ns(t_rows)));
+        rows
+    };
     let mut pack = pack_from_rows(eng, al, au);
     clip_tighten_pack(eng, splits, &mut pack);
+    pack.head_group_source = head_group_source.and_then(|mut source| {
+        source
+            .seal_rows(&pack.al, &pack.au, &pack.ly0, &pack.uy0)
+            .then_some(source)
+    });
     Ok(pack)
 }
 
@@ -2255,6 +3562,115 @@ fn clip_tighten_enabled() -> bool {
     *ON.get_or_init(crate::preset_gates::margin_row_clip_enabled)
 }
 
+/// #clip-head per-eval outcome: what the head-split halfspaces did to THIS
+/// domain's y-box.
+#[derive(Debug, Clone, Copy, Default)]
+struct ClipHeadOut {
+    /// Head sign fixes the domain carries.
+    heads: usize,
+    /// Halfspaces actually built from them.
+    hs: usize,
+    /// Head columns offered to the dual.
+    cols: usize,
+    /// Columns whose interval strictly shrank.
+    moved: usize,
+    /// Total shrink across those columns (both sides).
+    sum_delta: f64,
+    /// Columns that became STABLE (`ly >= 0` or `uy <= 0`) — abc's mechanism:
+    /// 15/16 and 16/16 children verify at iteration <= 1 once enough head
+    /// neurons close.
+    closes: usize,
+    /// Columns whose tightened interval would have CROSSED. Refused and kept at
+    /// the parent values: reading a crossing as an emptiness certificate
+    /// discharges a domain with no backward pass to disagree, which is the
+    /// false-`unsat` surface the stateful trunk port deliberately left shut.
+    refused_cross: usize,
+    /// The halfspace build itself refused (index/finiteness).
+    refused_hs: usize,
+    /// The pack carried no recovered slack (gate dark, or frame check refused).
+    frame_failed: usize,
+}
+
+/// #clip-head: announce the gate's resolved state ONCE per process, on the
+/// first eval that reaches the insertion point — before any domain can
+/// decline, exactly as `[beta] armed` does, and UNCONDITIONALLY: a dark run
+/// prints `armed=false`, so a control log proves the same binary ran the same
+/// site with the gate off, rather than merely being silent. A null from a
+/// lever whose telemetry never printed is VOID, not negative.
+fn clip_head_armed_once(on: bool) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "[clip-head] armed={on} h_cap={} c_cap={}",
+            super::clip::HEAD_H_CAP,
+            super::clip::HEAD_C_CAP
+        );
+    });
+}
+
+/// #clip-head process-global engagement counters. Written by every worker
+/// (the eval is `&self` and runs across rayon workers), read once at lane exit.
+static CLIP_HEAD_CALLS: ClipHeadCounter = ClipHeadCounter::new(0);
+static CLIP_HEAD_ENGAGED: ClipHeadCounter = ClipHeadCounter::new(0);
+static CLIP_HEAD_MOVED: ClipHeadCounter = ClipHeadCounter::new(0);
+static CLIP_HEAD_CLOSES: ClipHeadCounter = ClipHeadCounter::new(0);
+static CLIP_HEAD_REFUSED: ClipHeadCounter = ClipHeadCounter::new(0);
+static CLIP_HEAD_REFUSED_HS: ClipHeadCounter = ClipHeadCounter::new(0);
+static CLIP_HEAD_FRAME_FAILED: ClipHeadCounter = ClipHeadCounter::new(0);
+
+/// #clip-head per-eval telemetry, rate-limited like `[clip] call=`.
+fn clip_head_report(ch: &ClipHeadOut, us: u128) {
+    let n = CLIP_HEAD_CALLS.fetch_add(1, ClipHeadOrder::Relaxed);
+    if ch.hs > 0 {
+        CLIP_HEAD_ENGAGED.fetch_add(1, ClipHeadOrder::Relaxed);
+    }
+    CLIP_HEAD_MOVED.fetch_add(ch.moved, ClipHeadOrder::Relaxed);
+    CLIP_HEAD_CLOSES.fetch_add(ch.closes, ClipHeadOrder::Relaxed);
+    CLIP_HEAD_REFUSED.fetch_add(ch.refused_cross, ClipHeadOrder::Relaxed);
+    CLIP_HEAD_REFUSED_HS.fetch_add(ch.refused_hs, ClipHeadOrder::Relaxed);
+    CLIP_HEAD_FRAME_FAILED.fetch_add(ch.frame_failed, ClipHeadOrder::Relaxed);
+    if n < 4 || n.is_multiple_of(64) {
+        eprintln!(
+            "[clip-head] call={n} heads={} hs={} cols={} moved={} sum_delta={:.6e} \
+             closes={} refused_cross={} refused_hs={} ms={:.3}",
+            ch.heads,
+            ch.hs,
+            ch.cols,
+            ch.moved,
+            ch.sum_delta,
+            ch.closes,
+            ch.refused_cross,
+            ch.refused_hs,
+            us as f64 / 1000.0,
+        );
+    }
+}
+
+/// #clip-head lane-exit receipt. An armed run ALWAYS leaves one, so "ran and
+/// found nothing" is distinguishable from "never ran" without opening the log.
+fn clip_head_finish() {
+    if !crate::preset_gates::margin_row_clip_head_enabled() {
+        return;
+    }
+    let calls = CLIP_HEAD_CALLS.load(ClipHeadOrder::Relaxed);
+    let engaged = CLIP_HEAD_ENGAGED.load(ClipHeadOrder::Relaxed);
+    eprintln!(
+        "[clip-head] done evals={calls} engaged={engaged} moved_total={} closes_total={} \
+         refused_cross_total={} refused_hs_total={} frame_failed={}",
+        CLIP_HEAD_MOVED.load(ClipHeadOrder::Relaxed),
+        CLIP_HEAD_CLOSES.load(ClipHeadOrder::Relaxed),
+        CLIP_HEAD_REFUSED.load(ClipHeadOrder::Relaxed),
+        CLIP_HEAD_REFUSED_HS.load(ClipHeadOrder::Relaxed),
+        CLIP_HEAD_FRAME_FAILED.load(ClipHeadOrder::Relaxed),
+    );
+    if engaged == 0 {
+        eprintln!(
+            "[clip-head] ARMED BUT INERT: no evaluated domain produced a head halfspace \
+             - any measurement from this run is VACUOUS, not negative"
+        );
+    }
+}
+
 /// #margin-row-col-retire engagement telemetry (R9): `newly=` columns retired
 /// by THIS eval, `retired=` the child-inherited set size, `survivors=` the
 /// columns descendants will still pay for. Rate-limited like `[beta]`.
@@ -2284,14 +3700,463 @@ fn pack_from_rows(eng: &BackwardEngine<'_>, al: PassOut, au: PassOut) -> YPack {
     let ybox = YBox::from_rows(eng, &al, &au);
     let al_dots = row_dots(eng.root, &al);
     let au_dots = row_dots(eng.root, &au);
+    // #clip-head: capture the FORWARD concretization here, at the one place the
+    // rows and their untightened publication coexist. `clip_tighten_pack` runs
+    // immediately after `build_pack` calls this (and the batched prefill does
+    // the same) and mutates `ly0/uy0` in place, so anything recovered later
+    // would be calibrated against a tightened bound.
+    let ly_fwd = ybox.ly.clone();
+    let uy_fwd = ybox.uy.clone();
+    // Computed ONLY when the gate is armed: the dark lane then does no extra
+    // work at all and prints no frame line, which is what makes the OFF arm
+    // byte-identical AND free.
+    let head_slack = if crate::preset_gates::margin_row_clip_head_enabled() {
+        super::clip::head_slack(
+            &al,
+            &au,
+            &ly_fwd,
+            &uy_fwd,
+            &eng.root.mid,
+            &eng.root.rad,
+            &eng.root.xabs,
+            0.5,
+        )
+    } else {
+        None
+    };
     YPack {
+        head_group_source: None,
+        prepared_owner: None,
         ly0: ybox.ly,
         uy0: ybox.uy,
+        ly_fwd,
+        uy_fwd,
+        head_slack,
         al_dots,
         au_dots,
         al,
         au,
     }
+}
+
+// ---------------------------------------------------------------------------
+//  #root-eval-reuse — L1 root-eval dedupe (margin-row throughput plan B1(c))
+// ---------------------------------------------------------------------------
+//
+// THE WASTE. With the root alpha ascent and its published-frame guard armed
+// (the shipped cifar100/tinyimagenet presets), the root is fully evaluated up
+// to THREE times, and its y-rows derived once more, on at most two gate states
+// before the tree starts:
+//   1. `alpha_opt`'s published-frame guard baseline (`published_before`,
+//      `rebake::certified_root_bound`) on the entry gates G0;
+//   2. the ascent's frozen frame re-derives G0's y-rows (`search_alpha`'s
+//      `eng.y_rows(None)`) — the SAME 2 x n_y pass pair root_eval just ran;
+//   3. after an accepted iterate, the guard's `published_after` evaluates G1;
+//   4. `run_inner` then evaluates the published root AGAIN — G1 if the guard
+//      kept the iterate (all 22 arms of the 2026-09-23 tinyimagenet head-alpha
+//      A/B log `published_guard ... accepted=true`), G0 if it rolled back —
+//      bit-for-bit the evaluation (1) or (3) already produced.
+// (2) and (4) are pure recomputation.
+//
+// THE MEMO. `certified_root_bound` STORES its evaluation on the `RootGates` it
+// evaluated (`RootGates::root_eval_memo`, at most two entries); `run_inner`
+// and `run_classwise_inner` LOOK UP before evaluating and then release the
+// memo; `search_alpha` borrows the stored pack's y-rows. Every lookup is keyed
+// on the GATES GENERATION — a 128-bit content fingerprint of EVERY
+// `RootGates` field `root_eval` reads (mode, box, per-layer op/n/l/u/alpha/s/
+// c/ms/unst, clip-row presence and shape, head alpha, spec-alpha presence) —
+// plus the net's identity and head fingerprint, the property `(t, adv)`, and
+// the one process-global gate that shapes the pack (`clip_head`).
+//
+// WHY A CONTENT FINGERPRINT RATHER THAN A HAND-BUMPED COUNTER. `RootGates`'
+// fields are `pub` and are written in place at no fewer than five sites (the
+// ascent's commit and rollback, the rebake snapshot/restore and wholesale
+// replacement, the spec-alpha install). A counter is one forgotten bump away
+// from serving a stale pack; a fingerprint of the values themselves cannot be
+// forgotten. A wholesale replacement (`*root = cand`) carries the candidate's
+// OWN memo, which is exactly the evaluation of the root now published.
+//
+// BIT-IDENTITY. `root_eval` is a deterministic function of exactly those
+// inputs (pinned by `root_eval_reuse_bit_identical`), so a hit returns the
+// value a recomputation would. The memo REFUSES — never serves, never stores —
+// when either GPU lane or the #mr-gpu-eval conv route is armed (device refusals
+// make a pass run-dependent) or a spec-alpha policy is installed (its
+// refinement is deadline-dependent).
+//
+// SOUNDNESS does not rest on the key. Every memoized `RootEval` is itself a
+// certified evaluation of the SAME network over the SAME input box under a
+// valid relaxation; even a (2^-128) fingerprint collision would publish a
+// valid-but-different certified bound, never an unsound one.
+
+thread_local! {
+    /// Wall of the most recent `build_pack` y-row pair on this thread: what a
+    /// rows-memo hit saves. Written by `build_pack`, read by the store.
+    static LAST_Y_ROWS_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+static REUSE_LOOKUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REUSE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REUSE_ROW_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REUSE_SAVED_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REUSE_STORES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REUSE_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Two-lane word fingerprint (FNV-style xor-multiply beside a rotate-xor-
+/// multiply lane), length-prefixed per field so concatenations cannot alias.
+struct GateFingerprint {
+    a: u64,
+    b: u64,
+    n: u64,
+}
+
+impl GateFingerprint {
+    fn new() -> Self {
+        Self {
+            a: 0xcbf2_9ce4_8422_2325,
+            b: 0x6a09_e667_f3bc_c909,
+            n: 0,
+        }
+    }
+
+    #[inline]
+    fn word(&mut self, w: u64) {
+        self.a = (self.a ^ w).wrapping_mul(0x0000_0100_0000_01b3);
+        self.b = (self.b.rotate_left(29) ^ w).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        self.n = self.n.wrapping_add(1);
+    }
+
+    fn f64s(&mut self, v: &[f64]) {
+        self.word(v.len() as u64);
+        for x in v {
+            self.word(x.to_bits());
+        }
+    }
+
+    fn usizes(&mut self, v: &[usize]) {
+        self.word(v.len() as u64);
+        for &x in v {
+            self.word(x as u64);
+        }
+    }
+
+    fn finish(&self) -> [u64; 2] {
+        [self.a ^ self.n.rotate_left(17), self.b.wrapping_add(self.n)]
+    }
+}
+
+/// The GATES GENERATION: a content fingerprint of every `RootGates` field that
+/// `root_eval` reads. Any in-place write to any of them moves it.
+fn gates_generation(root: &RootGates) -> [u64; 2] {
+    let mut fp = GateFingerprint::new();
+    fp.word(u64::from(root.mode.outward()));
+    fp.f64s(&root.mid);
+    fp.f64s(&root.rad);
+    fp.f64s(&root.xabs);
+    fp.f64s(&root.lo);
+    fp.f64s(&root.hi);
+    fp.word(root.layers.len() as u64);
+    for layer in &root.layers {
+        fp.word(layer.op as u64);
+        fp.word(layer.n as u64);
+        fp.f64s(&layer.l);
+        fp.f64s(&layer.u);
+        fp.f64s(&layer.alpha);
+        fp.f64s(&layer.s);
+        fp.f64s(&layer.c);
+        fp.f64s(&layer.ms);
+        fp.usizes(&layer.unst);
+        match &layer.clip_rows {
+            Some(rows) => {
+                fp.word(1);
+                fp.word(rows.m.nrows() as u64);
+                fp.word(rows.m.ncols() as u64);
+            }
+            None => fp.word(0),
+        }
+    }
+    match &root.head_alpha {
+        Some(head) => {
+            fp.word(1);
+            fp.f64s(head);
+        }
+        None => fp.word(0),
+    }
+    fp.word(u64::from(root.spec_alpha_policy.is_some()));
+    fp.finish()
+}
+
+/// Net identity beyond its address: shape plus the head weights.
+fn net_fingerprint(net: &TwinNet) -> [u64; 2] {
+    let mut fp = GateFingerprint::new();
+    fp.word(net.n_in as u64);
+    fp.word(net.n_y as u64);
+    fp.word(net.n_out as u64);
+    fp.word(net.i_gemm1 as u64);
+    fp.word(net.ops.len() as u64);
+    fp.usizes(&net.tsize);
+    fp.usizes(&net.trunk_relus);
+    let (w1, b1, _) = net.gemm1();
+    fp.f64s(w1);
+    fp.f64s(b1);
+    let (fold_bias_err, fold_weight_err) = net.gemm1_fold_err();
+    fp.f64s(fold_bias_err);
+    fp.word(fold_weight_err.to_bits());
+    let (w2, b2, _) = net.gemm2();
+    fp.f64s(w2);
+    fp.f64s(b2);
+    fp.finish()
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct RootEvalKey {
+    gates: [u64; 2],
+    net_addr: usize,
+    net: [u64; 2],
+    t: usize,
+    adv: Vec<usize>,
+    clip_head: bool,
+}
+
+impl RootEvalKey {
+    fn of(net: &TwinNet, root: &RootGates, t: usize, adv: &[usize]) -> Self {
+        Self {
+            gates: gates_generation(root),
+            net_addr: std::ptr::from_ref(net) as usize,
+            net: net_fingerprint(net),
+            t,
+            adv: adv.to_vec(),
+            clip_head: crate::preset_gates::margin_row_clip_head_enabled(),
+        }
+    }
+
+    /// The y-rows depend on the gates and the net only (identity seed: no
+    /// property, no head gates).
+    fn same_rows(&self, other: &Self) -> bool {
+        self.gates == other.gates && self.net_addr == other.net_addr && self.net == other.net
+    }
+}
+
+struct MemoEntry {
+    key: RootEvalKey,
+    dj: Vec<f64>,
+    tree_classes: Vec<usize>,
+    pack: Arc<YPack>,
+    /// Wall of the evaluation that produced this entry (what a hit saves).
+    eval_ns: u64,
+    /// Wall of its y-row pair (what a rows hit saves).
+    rows_ns: u64,
+}
+
+/// Per-`RootGates` memo of `root_eval` results (see the section comment).
+/// Every `RootGates` constructor starts it EMPTY; it is never inherited.
+#[derive(Default)]
+pub(crate) struct RootEvalMemo(
+    std::sync::Mutex<Vec<MemoEntry>>,
+    std::sync::Mutex<prepared_root_eval::PreparedMemoSlots>,
+);
+
+impl RootEvalMemo {
+    /// At most the entry gates' and one candidate's evaluation (the guard's
+    /// before/after pair), so a rollback still hits.
+    const CAP: usize = 2;
+
+    fn put(&self, entry: MemoEntry) {
+        if let Ok(mut entries) = self.0.lock() {
+            entries.retain(|e| e.key != entry.key);
+            entries.push(entry);
+            while entries.len() > Self::CAP {
+                entries.remove(0);
+            }
+        }
+    }
+
+    fn clear(&self) {
+        if let Ok(mut entries) = self.0.lock() {
+            entries.clear();
+        }
+        if let Ok(mut prepared) = self.1.lock() {
+            prepared.clear();
+        }
+    }
+}
+
+/// The memo refuses (never serves, never stores) when an evaluation is not a
+/// deterministic function of the key.
+fn memo_eligible(eng: &BackwardEngine<'_>, net: &TwinNet) -> bool {
+    std::ptr::eq(eng.net, net)
+        && eng.root.spec_alpha_policy.is_none()
+        && !super::gpu_seam::enabled()
+        && !super::gpu_backward::enabled()
+        // #mr-gpu-eval: a device refusal (lock budget, non-CUDA slot) sends a
+        // conv to the CPU kernel, so an armed pass is run-dependent at the ulp
+        // level — the same reason the two GPU lanes above are refused.
+        && eng.gpu_conv_route().is_off()
+}
+
+/// Evaluate and STORE on the evaluated root (`rebake::certified_root_bound`,
+/// i.e. the alpha guard's `published_before`/`published_after` and every
+/// rebake round). Returns exactly what [`root_eval`] returns.
+pub(crate) fn root_eval_store(
+    eng: &BackwardEngine<'_>,
+    net: &TwinNet,
+    t: usize,
+    adv: &[usize],
+) -> Result<RootEval> {
+    let t0 = Instant::now();
+    LAST_Y_ROWS_NS.with(|c| c.set(0));
+    let re = root_eval_impl(eng, net, t, adv)?;
+    // #attack-open-disjuncts: this function is reached only through
+    // `rebake::certified_root_bound`, i.e. the alpha guard's published-frame
+    // evaluations and the rebake rounds — all of the lane's TOP-LEVEL root,
+    // never a nested epoch subdomain — so `re.dj` is a certified full-box
+    // bound. Attack scheduling only; one atomic load when unarmed.
+    super::root_open::publish_outer_root(t, adv, &re.dj);
+    let eval_ns = super::census::elapsed_ns(t0);
+    if memo_eligible(eng, net) {
+        eng.root.root_eval_memo.put(MemoEntry {
+            key: RootEvalKey::of(net, eng.root, t, adv),
+            dj: re.dj.clone(),
+            tree_classes: re.tree_classes.clone(),
+            pack: Arc::clone(&re.pack),
+            eval_ns,
+            rows_ns: LAST_Y_ROWS_NS.with(std::cell::Cell::get),
+        });
+        REUSE_STORES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(re)
+}
+
+/// Serve a stored evaluation of THIS root, gates generation, net and property.
+fn root_eval_lookup(
+    eng: &BackwardEngine<'_>,
+    net: &TwinNet,
+    t: usize,
+    adv: &[usize],
+) -> Option<RootEval> {
+    use std::sync::atomic::Ordering::Relaxed;
+    REUSE_LOOKUPS.fetch_add(1, Relaxed);
+    if !memo_eligible(eng, net) {
+        REUSE_REFUSED.fetch_add(1, Relaxed);
+        return None;
+    }
+    let key = RootEvalKey::of(net, eng.root, t, adv);
+    let entries = eng.root.root_eval_memo.0.lock().ok()?;
+    let hit = entries.iter().find(|e| e.key == key)?;
+    let hits = REUSE_HITS.fetch_add(1, Relaxed) + 1;
+    let saved = REUSE_SAVED_NS.fetch_add(hit.eval_ns, Relaxed) + hit.eval_ns;
+    eprintln!(
+        "[root-eval-reuse] hit kind=root_eval hits={hits} saved_ms={:.1} this_ms={:.1}",
+        saved as f64 / 1e6,
+        hit.eval_ns as f64 / 1e6
+    );
+    Some(RootEval {
+        dj: hit.dj.clone(),
+        tree_classes: hit.tree_classes.clone(),
+        pack: Arc::clone(&hit.pack),
+        // Eligibility requires `spec_alpha_policy == None`, under which a fresh
+        // evaluation reports `None` too.
+        spec_alpha: None,
+    })
+}
+
+/// `run_inner`/`run_classwise_inner`'s root evaluation: a memo hit, else the
+/// unchanged evaluation. The memo is then RELEASED — the tree holds the pack
+/// it needs, and a retained sibling entry would only pin memory.
+pub(super) fn root_eval_reuse(
+    eng: &BackwardEngine<'_>,
+    net: &TwinNet,
+    t: usize,
+    adv: &[usize],
+) -> Result<RootEval> {
+    let re = match root_eval_lookup(eng, net, t, adv) {
+        Some(hit) => hit,
+        None => root_eval_impl(eng, net, t, adv)?,
+    };
+    eng.root.root_eval_memo.clear();
+    Ok(re)
+}
+
+/// Borrowed y-rows of a stored evaluation (see [`root_rows_memo`]).
+pub(crate) struct MemoRows(Arc<YPack>);
+
+impl MemoRows {
+    /// Lower-lane y-rows, bit-identical to `BackwardEngine::y_rows(None).0`.
+    pub(crate) fn al(&self) -> &PassOut {
+        &self.0.al
+    }
+
+    /// Upper-lane y-rows, bit-identical to `BackwardEngine::y_rows(None).1`.
+    pub(crate) fn au(&self) -> &PassOut {
+        &self.0.au
+    }
+}
+
+/// The root alpha ascent's frozen frame (`alpha_opt::search_alpha`) re-derives
+/// the published root's y-rows. When a stored evaluation of the SAME gates
+/// generation exists, its pack's rows ARE those rows (identity seed, no
+/// splits, GPU lanes refused by eligibility), so borrow them.
+pub(crate) fn root_rows_memo(net: &TwinNet, root: &RootGates) -> Option<MemoRows> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let eng = BackwardEngine::new(net, root);
+    REUSE_LOOKUPS.fetch_add(1, Relaxed);
+    if !memo_eligible(&eng, net) {
+        REUSE_REFUSED.fetch_add(1, Relaxed);
+        return None;
+    }
+    // `t`/`adv` are not part of a rows match; any placeholder works.
+    let key = RootEvalKey::of(net, root, 0, &[]);
+    let entries = root.root_eval_memo.0.lock().ok()?;
+    let hit = entries.iter().find(|e| e.key.same_rows(&key))?;
+    let hits = REUSE_ROW_HITS.fetch_add(1, Relaxed) + 1;
+    let saved = REUSE_SAVED_NS.fetch_add(hit.rows_ns, Relaxed) + hit.rows_ns;
+    eprintln!(
+        "[root-eval-reuse] hit kind=rows row_hits={hits} saved_ms={:.1} this_ms={:.1}",
+        saved as f64 / 1e6,
+        hit.rows_ns as f64 / 1e6
+    );
+    Some(MemoRows(Arc::clone(&hit.pack)))
+}
+
+/// Reset the process-global reuse counters (lane start; `census::reset`).
+pub(crate) fn root_eval_reuse_reset() {
+    use std::sync::atomic::Ordering::Relaxed;
+    for counter in [
+        &REUSE_LOOKUPS,
+        &REUSE_HITS,
+        &REUSE_ROW_HITS,
+        &REUSE_SAVED_NS,
+        &REUSE_STORES,
+        &REUSE_REFUSED,
+    ] {
+        counter.store(0, Relaxed);
+    }
+}
+
+/// The `[root-eval-reuse]` stop receipt — printed at every lane stop, so
+/// `hits=0` (armed, nothing reusable) is distinguishable from a binary that
+/// lacks the mechanism (no line at all).
+pub(crate) fn root_eval_reuse_stop_line() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    format!(
+        "[root-eval-reuse] hits={} row_hits={} saved_ms={:.1} lookups={} stores={} refused={}",
+        REUSE_HITS.load(Relaxed),
+        REUSE_ROW_HITS.load(Relaxed),
+        REUSE_SAVED_NS.load(Relaxed) as f64 / 1e6,
+        REUSE_LOOKUPS.load(Relaxed),
+        REUSE_STORES.load(Relaxed),
+        REUSE_REFUSED.load(Relaxed),
+    )
+}
+
+/// The same counters as `[mr-census]` fields.
+pub(crate) fn root_eval_reuse_fields() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    format!(
+        " reuse_hits={} reuse_row_hits={} reuse_saved_ms={:.1}",
+        REUSE_HITS.load(Relaxed),
+        REUSE_ROW_HITS.load(Relaxed),
+        REUSE_SAVED_NS.load(Relaxed) as f64 / 1e6,
+    )
 }
 
 /// Root pass: mirrors `DirectBab.__init__` (via-y for all classes, direct for
@@ -2311,6 +4176,9 @@ fn root_eval_impl(
     t: usize,
     adv: &[usize],
 ) -> Result<RootEval> {
+    // #mr-census: one call per root evaluation actually computed (the L1
+    // root-eval dedupe shows up here as FEWER calls, not cheaper ones).
+    let _census = super::census::SiteTimer::start(super::census::Site::RootEval, adv.len());
     let mode = eng.root.mode;
     let pack = Arc::new(build_pack(eng, None, &[])?);
     let ybox = YBox {
@@ -2349,7 +4217,7 @@ fn root_eval_impl(
         );
     }
     let mb_all = MarginBatch::new(net, t, adv)?;
-    let gates = head_gates(&ybox, mode);
+    let gates = head_gates_with(&ybox, mode, eng.root.head_alpha.as_deref());
     let ms_all = margin_seed(&mb_all, &gates, &ybox, mode);
     let m2v_all = compose_viay(
         eng,
@@ -2366,7 +4234,10 @@ fn root_eval_impl(
         require_finite("root component", &[m1, m2v])?;
         dj.push(m1.max(m2v));
     }
-    let fail: Vec<usize> = (0..adv.len()).filter(|&k| !closed(mode, dj[k])).collect();
+    let mut spec_alpha_report: Option<super::spec_alpha::SpecAlphaReport> = None;
+    let fail: Vec<usize> = (0..adv.len())
+        .filter(|&k| !root_schedules_closed(mode, dj[k]))
+        .collect();
     if !fail.is_empty() {
         let fail_classes: Vec<usize> = fail.iter().map(|&k| adv[k]).collect();
         let mbf = MarginBatch::new(net, t, &fail_classes)?;
@@ -2391,16 +4262,37 @@ fn root_eval_impl(
             require_finite("direct root bound", &[direct[fi]])?;
             dj[k] = dj[k].max(direct[fi]);
         }
+        // ---- #spec-alpha: the ONLY addition to this function. One `Option`
+        // discriminant test when dark. When armed it runs additional certified
+        // passes whose COLUMNS are (hardest class, candidate alpha) pairs and
+        // folds them into `dj` by ELEMENT-WISE MAX -- so `dj_armed[k] >=
+        // dj_dark[k]` identically, for every k, for every candidate. That max
+        // IS the guard: it is per class, it is evaluated on the PUBLISHED
+        // frame, and it needs no rollback state because nothing is mutated.
+        if let Some(pol) = eng.root.spec_alpha_policy {
+            spec_alpha_report = Some(super::spec_alpha::refine(
+                eng,
+                net,
+                t,
+                pol,
+                &gates,
+                &ybox,
+                &fail,
+                &fail_classes,
+                &mut dj,
+            ));
+        }
     }
     require_finite("combined root bound", &dj)?;
     let tree_classes: Vec<usize> = (0..adv.len())
-        .filter(|&k| !closed(mode, dj[k]))
+        .filter(|&k| !root_schedules_closed(mode, dj[k]))
         .map(|k| adv[k])
         .collect();
     Ok(RootEval {
         dj,
         tree_classes,
         pack,
+        spec_alpha: spec_alpha_report,
     })
 }
 
@@ -2578,7 +4470,294 @@ mod closure_epoch_trigger_tests {
     }
 }
 
+/// Create one optional full-root attempt under the original deadline. The
+/// normal lane calls this before root owners; standalone BaB callers retain
+/// the same entry. Private carry state prevents restarting a declined attempt.
+pub(super) fn direct_root_attempt(
+    eng: &BackwardEngine<'_>,
+    t: usize,
+    adv: &[usize],
+    cfg: &BabConfig,
+) -> Option<super::head_group::direct::DirectAttempt> {
+    let policy = cfg.head_groups?;
+    if eng.root.root_precision_policy.box_source == super::RootBoxSource::PatchBackward
+        || cfg.epoch_frame_route != EpochFrameRoute::Outer
+        || !cfg.initial_heads.is_empty()
+        || cfg.initial_ybox.is_some()
+    {
+        return None;
+    }
+    let deadline = cfg.deadline?.min(cfg.effective_publish_deadline()?);
+    let mut attempt = super::head_group::direct::attempt(eng, t, adv, policy, deadline);
+    let start = Instant::now();
+    attempt.receipt();
+    attempt.charge_compute(start.elapsed());
+    Some(attempt)
+}
+
+fn direct_root_stats(cfg: &BabConfig, bounds: &[f64], elapsed: Duration) -> BabStats {
+    let mut stats = BabStats {
+        root_bound: bounds.iter().copied().fold(f64::INFINITY, f64::min),
+        tree_classes: Vec::new(),
+        root_closed_classes: bounds.len(),
+        expansions: 0,
+        domains_created: 1,
+        closed: 0,
+        max_depth: 0,
+        mono_raw_dips: 0,
+        mono_worst: 0.0,
+        stop: "direct_head_closed_at_root".into(),
+        elapsed_secs: elapsed.as_secs_f64(),
+        class_runs: Vec::new(),
+        epochs_attempted: 0,
+        epochs_closed: 0,
+        ledger_ok: None,
+        frontier_execution: FrontierExecutionEvidence::joint(cfg.frontier, cfg.frontier_contextual),
+        policy_execution: PolicyExecutionEvidence::from_config(cfg),
+        epoch_execution: EpochExecutionEvidence::from_config(cfg),
+        width_execution: WidthExecutionEvidence::from_config(cfg),
+        root_precision_execution: cfg.root_precision_execution,
+        backward_interm_execution: cfg.backward_interm_execution,
+        root_alpha_execution: cfg.root_alpha_execution,
+        close_integrity: CloseIntegrityEvidence::default(),
+    };
+    if close_telemetry_on(cfg) {
+        for &bound in bounds {
+            stats.close_integrity.note(CertKind::Root, bound);
+        }
+        super::close_integrity::publish_live(&stats.close_integrity);
+    }
+    stats
+}
+
+/// Complete direct covers enter the same conjunction/containment authorizer.
+/// There is no fabricated RootEval or identity-row pack on this path.
+pub(super) fn direct_root_outcome(
+    eng: &BackwardEngine<'_>,
+    t: usize,
+    adv: &[usize],
+    cfg: &BabConfig,
+    hint_prefix: &[AbsLit],
+    direct: Option<&mut super::head_group::direct::DirectAttempt>,
+    lane_start: Instant,
+) -> Option<MarginRowOutcome> {
+    let direct = direct?;
+    let start = Instant::now();
+    let result = (|| {
+        let prelude = direct.prelude.as_ref()?;
+        let deadline = cfg.deadline?.min(cfg.effective_publish_deadline()?);
+        if !hint_prefix.is_empty() || !prelude.complete() || !prelude.matches(eng, t, adv, deadline)
+        {
+            return None;
+        }
+        let covers: Vec<_> = adv
+            .iter()
+            .zip(prelude.bounds())
+            .filter_map(|(&class, &b)| cert_mr::root_class(eng.root.mode, class, b))
+            .collect();
+        if covers.len() != adv.len() || Instant::now() >= deadline {
+            return None;
+        }
+        let mut ledger = Ledger {
+            scope: TokenScope::Instance,
+            required: Some(adv.to_vec()),
+            pre: covers,
+            direct_guard: Some(prelude.publication_guard(deadline)),
+            // B2.3: no root evaluation ran; every class is the direct
+            // prepass's opaque claim.
+            head_raised: adv
+                .iter()
+                .map(|&class| HeadRaised {
+                    class,
+                    route: "direct_head",
+                    root_margin: None,
+                })
+                .collect(),
+            ..Ledger::default()
+        };
+        let mut stats = direct_root_stats(cfg, prelude.bounds(), lane_start.elapsed());
+        let token = authorize_frame_view(
+            &mut ledger,
+            &[],
+            false,
+            eng.net,
+            eng.root,
+            t,
+            OwnedRootFrameView {
+                dj: prelude.bounds(),
+                ybox: prelude.ybox(),
+            },
+            cfg,
+        );
+        // The common authorizer checks the private ledger guard after both
+        // containment and hint-stream work, including subsequent mixed covers.
+        stats.elapsed_secs = lane_start.elapsed().as_secs_f64();
+        Some(match token {
+            Ok(token) => {
+                stats.ledger_ok = Some(true);
+                MarginRowOutcome::Unsat(stats, token)
+            }
+            Err(reason) => {
+                stats.ledger_ok = Some(false);
+                stats.stop = "direct_head_unsat_refused".into();
+                MarginRowOutcome::Unknown {
+                    reason,
+                    stats: Some(stats),
+                }
+            }
+        })
+    })();
+    direct.charge_compute(start.elapsed());
+    result
+}
+
+fn merge_direct_prelude(
+    eng: &BackwardEngine<'_>,
+    t: usize,
+    adv: &[usize],
+    re: &mut RootEval,
+    cfg: &BabConfig,
+    direct: Option<&mut super::head_group::direct::DirectAttempt>,
+) -> Option<super::head_group::direct::DirectPublicationGuard> {
+    let direct = direct?;
+    let start = Instant::now();
+    let merged = (|| {
+        let prelude = direct.prelude.as_ref()?;
+        let deadline = cfg.deadline?.min(cfg.effective_publish_deadline()?);
+        if re.dj.len() != adv.len()
+            || re.dj.iter().any(|b| !b.is_finite())
+            || !prelude.matches(eng, t, adv, deadline)
+        {
+            return None;
+        }
+        // Only the returned clone changes; the ordinary root-eval memo and
+        // its genuine source pack retain their original numerical contents.
+        let mut improved = false;
+        for (old, &new) in re.dj.iter_mut().zip(prelude.bounds()) {
+            improved |= new > *old;
+            *old = old.max(new);
+        }
+        re.tree_classes = adv
+            .iter()
+            .zip(&re.dj)
+            .filter_map(|(&a, &b)| (!closed(eng.root.mode, b)).then_some(a))
+            .collect();
+        Some(improved.then(|| prelude.publication_guard(deadline)))
+    })();
+    direct.charge_compute(start.elapsed());
+    if merged.is_some() {
+        eprintln!("[direct-head] merge=owned_original_rows memo=unchanged");
+    }
+    merged.flatten()
+}
+
+pub(super) fn refine_head_groups(
+    eng: &BackwardEngine<'_>,
+    t: usize,
+    adv: &[usize],
+    re: &mut RootEval,
+    cfg: &BabConfig,
+) {
+    refine_head_groups_with_direct(eng, t, adv, re, cfg, None);
+}
+
+fn refine_head_groups_with_direct(
+    eng: &BackwardEngine<'_>,
+    t: usize,
+    adv: &[usize],
+    re: &mut RootEval,
+    cfg: &BabConfig,
+    direct: Option<&mut super::head_group::direct::DirectAttempt>,
+) {
+    let Some(policy) = cfg.head_groups else {
+        return;
+    };
+    if cfg.epoch_frame_route != EpochFrameRoute::Outer
+        || !cfg.initial_heads.is_empty()
+        || cfg.initial_ybox.is_some()
+    {
+        eprintln!("[head-groups] armed=1 status=ineligible_frame");
+        return;
+    }
+    let Some(deadline) = cfg.deadline else {
+        eprintln!("[head-groups] armed=1 status=missing_original_deadline");
+        return;
+    };
+    let start = Instant::now();
+    let result = match direct {
+        Some(direct) => direct.refine_existing(eng, &re.pack, t, adv, &re.dj, policy, deadline),
+        None => {
+            super::head_group::improve_root_margins(eng, &re.pack, t, adv, &re.dj, policy, deadline)
+        }
+    };
+    let Some(report) = result else {
+        eprintln!(
+            "[head-groups] armed=1 status=declined elapsed_s={:.6}",
+            start.elapsed().as_secs_f64()
+        );
+        return;
+    };
+    if Instant::now() >= deadline
+        || report.bounds.len() != adv.len()
+        || report.bounds.len() != re.dj.len()
+        || report
+            .bounds
+            .iter()
+            .zip(&re.dj)
+            .any(|(&new, &old)| !new.is_finite() || !old.is_finite() || new < old)
+    {
+        eprintln!("[head-groups] armed=1 status=publication_refused");
+        return;
+    }
+    let closed_before = re.dj.iter().filter(|&&b| b > 0.0).count();
+    let closed_after = report.bounds.iter().filter(|&&b| b > 0.0).count();
+    for candidate in &report.candidates {
+        eprintln!(
+            "[head-group-bound] adversary={} group={:?} phases={} lower_bits={:016x}",
+            candidate.adversary,
+            candidate.group,
+            candidate.phases,
+            candidate.lower.to_bits()
+        );
+    }
+    eprintln!(
+        "[head-groups] armed=1 status=complete groups={} phases={} improved={} closed_before={} closed_after={} native_passes={} native_columns={} native_improved_phases={} advice_calls={} advice_candidates={} advice_improved_phases={} functional_advice_calls={} functional_advice_candidates={} functional_classes_improved={} elapsed_s={:.6}",
+        report.groups_checked,
+        report.phases_checked,
+        report.classes_improved,
+        closed_before,
+        closed_after,
+        report.native_passes,
+        report.native_columns,
+        report.native_improved_phases,
+        report.advice_calls,
+        report.advice_candidates,
+        report.advice_improved_phases,
+        report.functional_advice_calls,
+        report.functional_advice_candidates,
+        report.functional_classes_improved,
+        report.elapsed_s
+    );
+    re.dj = report.bounds;
+    re.tree_classes = adv
+        .iter()
+        .zip(&re.dj)
+        .filter_map(|(&class, &bound)| (bound <= 0.0).then_some(class))
+        .collect();
+}
+
 impl<'a> MarginRowBab<'a> {
+    /// Enumerate authentic prepared descendants on their original ledger.
+    /// Runtime eligibility and the complete legacy fallback are chosen by
+    /// the source entry before construction; this method mints no token.
+    pub fn run_prepared(
+        open: super::support_program::PreparedRootOpen,
+        options: PreparedTreeOptions,
+        requested: Option<Instant>,
+    ) -> Result<PreparedTreeOutcome> {
+        prepared_tree::run(open, options, requested)
+    }
+
     /// Run the full lane: root pass, then best-first tree for failing classes.
     /// Authority granted 2026-07-18 (see `margin_row::margin_row_bab_enabled`):
     /// both proof obligations discharged, so production builds run the certified
@@ -2597,6 +4776,17 @@ impl<'a> MarginRowBab<'a> {
         adv: &[usize],
         cfg: BabConfig,
     ) -> MarginRowOutcome {
+        Self::run_with_direct(net, root, t, adv, cfg, None)
+    }
+
+    pub(super) fn run_with_direct(
+        net: &'a TwinNet,
+        root: &'a RootGates,
+        t: usize,
+        adv: &[usize],
+        cfg: BabConfig,
+        direct: Option<super::head_group::direct::DirectAttempt>,
+    ) -> MarginRowOutcome {
         if !root.mode.outward() {
             return MarginRowOutcome::Unknown {
                 reason: "margin-row BaB requires certified outward rounding".into(),
@@ -2610,7 +4800,7 @@ impl<'a> MarginRowBab<'a> {
         // let row N-1's escalation pre-arm row N — that would silently turn the
         // treatment arm into "always on" and destroy the measurement.
         super::closure::reset();
-        match Self::run_inner(net, root, t, adv, cfg) {
+        match Self::run_inner_with_direct(net, root, t, adv, cfg, Vec::new(), direct) {
             Ok(out) => out,
             Err(e) => MarginRowOutcome::Unknown {
                 reason: format!("fail-closed: {e}"),
@@ -2632,6 +4822,17 @@ impl<'a> MarginRowBab<'a> {
         adv: &[usize],
         cfg: BabConfig,
     ) -> MarginRowOutcome {
+        Self::run_classwise_with_direct(net, root, t, adv, cfg, None)
+    }
+
+    pub(super) fn run_classwise_with_direct(
+        net: &'a TwinNet,
+        root: &'a RootGates,
+        t: usize,
+        adv: &[usize],
+        cfg: BabConfig,
+        direct: Option<super::head_group::direct::DirectAttempt>,
+    ) -> MarginRowOutcome {
         if !root.mode.outward() {
             return MarginRowOutcome::Unknown {
                 reason: "classwise requires certified outward rounding".into(),
@@ -2645,7 +4846,7 @@ impl<'a> MarginRowBab<'a> {
         // start from, and re-paying the warm-up per class would spend the
         // budget on rediscovering the same fact.
         super::closure::reset();
-        match Self::run_classwise_inner(net, root, t, adv, cfg) {
+        match Self::run_classwise_inner(net, root, t, adv, cfg, direct) {
             Ok(out) => out,
             Err(e) => MarginRowOutcome::Unknown {
                 reason: format!("classwise fail-closed: {e}"),
@@ -2660,6 +4861,7 @@ impl<'a> MarginRowBab<'a> {
         t: usize,
         adv: &[usize],
         cfg: BabConfig,
+        direct: Option<super::head_group::direct::DirectAttempt>,
     ) -> Result<MarginRowOutcome> {
         let t0 = Instant::now();
         if cfg.deadline.is_some_and(|dl| Instant::now() > dl) {
@@ -2669,17 +4871,119 @@ impl<'a> MarginRowBab<'a> {
             });
         }
         let root_eng = BackwardEngine::new(net, root);
-        let re = {
+        let mut direct = direct.or_else(|| direct_root_attempt(&root_eng, t, adv, &cfg));
+        if let Some(attempt) = direct.as_mut() {
+            attempt.retain_current_frame(
+                &root_eng,
+                t,
+                adv,
+                cfg.deadline
+                    .zip(cfg.effective_publish_deadline())
+                    .map(|(a, b)| a.min(b)),
+            );
+        }
+        if let Some(outcome) =
+            direct_root_outcome(&root_eng, t, adv, &cfg, &[], direct.as_mut(), t0)
+        {
+            return Ok(outcome);
+        }
+        if cfg.deadline.is_some_and(|dl| Instant::now() >= dl) {
+            return Ok(MarginRowOutcome::Unknown {
+                reason: "classwise wallclock after direct head prepass".into(),
+                stats: None,
+            });
+        }
+        let mut re = {
             let _t = super::prof::Timer::start(super::prof::Phase::RootEval);
-            root_eval_impl(&root_eng, net, t, adv)?
+            // #root-eval-reuse (B1(c)): as in `run_inner`.
+            root_eval_reuse(&root_eng, net, t, adv)?
         };
+        // B2.3 x head routes: the bounds each head route started from.
+        let dj_root = re.dj.clone();
+        let direct_guard = merge_direct_prelude(&root_eng, t, adv, &mut re, &cfg, direct.as_mut());
+        let dj_merged = re.dj.clone();
+        refine_head_groups_with_direct(&root_eng, t, adv, &mut re, &cfg, direct.as_mut());
+        let head_raised = head_raised_classes(root.mode, adv, &dj_root, &dj_merged, &re.dj);
         if cfg.deadline.is_some_and(|dl| Instant::now() > dl) {
             return Ok(MarginRowOutcome::Unknown {
                 reason: "classwise wallclock after root evaluation".into(),
                 stats: None,
             });
         }
-        let schedule = classwise_schedule(t, adv, &re.dj)?;
+        // #attack-open-disjuncts: the joint root of the top-level classwise
+        // schedule (see `run_inner`). Attack scheduling only.
+        if cfg.epoch_frame_route == EpochFrameRoute::Outer {
+            super::root_open::publish_outer_root(t, adv, &re.dj);
+        }
+        // #spec-alpha YIELD -> the STRUCTURED receipt, not only stderr.
+        //
+        // `RootAlphaExecutionEvidence` is built in the root driver immediately
+        // after `#rebake` returns, which is BEFORE `#spec-alpha` runs inside
+        // `root_eval`, so it can only carry the policy echo at that point. This
+        // is the first site where the refinement has run and the receipt is
+        // still assemblable. Without it the yield is stderr-only and every
+        // sweep through `ny benchmarks run` (stdout nulled, `RUST_LOG=error`)
+        // is uninterpretable by construction -- the documented `#interm-alpha`
+        // gap. `None` (dark, or no failing class) leaves the fields at their
+        // "did not run" values, which is a DIFFERENT fact from a zero delta.
+        let cfg = BabConfig {
+            root_alpha_execution: cfg
+                .root_alpha_execution
+                .with_spec_alpha_yield(re.spec_alpha.as_ref()),
+            ..cfg
+        };
+        let mut schedule = classwise_schedule(t, adv, &re.dj)?;
+        // #soundness-spine M2c: every class the root closed, as a certified
+        // class cover (`classwise_schedule`'s own rule: finite and `> 0`).
+        let mut pre_covers: Vec<ClassCover> = adv
+            .iter()
+            .zip(&re.dj)
+            .filter_map(|(&class, &dj)| cert_mr::root_class(root.mode, class, dj))
+            .collect();
+        // #frozen-dual-bab (V1 stage B): the same outer-frame tier as
+        // `run_inner`; a class it certifies on the whole box leaves the
+        // schedule, every other class is scheduled unchanged. Called even when
+        // the root closed every class, exactly like `run_inner`, so an armed
+        // run ALWAYS prints its `[frozen-dual] armed=1` summary
+        // (`verdict=no_open_objective` here) — a silent armed run reads VOID.
+        let mut frozen_closed = 0usize;
+        // B2.3: the tier's prune traces (Proof profile only; hint data).
+        let mut fd_proofs: Vec<FdProofTrace> = Vec::new();
+        // B2.3: a harness's explicit arming, else the governed gate (read
+        // only when no harness chose: the dark lane is the historical one
+        // latched bool).
+        if cfg.epoch_frame_route == EpochFrameRoute::Outer
+            && match cfg.frozen_dual_tier {
+                Some(armed) => armed,
+                None => super::zono_state::armed(),
+            }
+        {
+            let pending: Vec<usize> = schedule.iter().map(|(class, _)| *class).collect();
+            let open_re = RootEval {
+                dj: re.dj.clone(),
+                tree_classes: pending,
+                pack: Arc::clone(&re.pack),
+                spec_alpha: None,
+            };
+            let mut tier = super::zono_bab::lane_tier(
+                net,
+                root,
+                t,
+                adv,
+                &open_re,
+                cfg.deadline,
+                fd_crosscheck_every(),
+                cfg.frozen_dual_tier.is_some(),
+            );
+            // #soundness-spine M2c: a class leaves the schedule only when its
+            // closure re-derives from its own search report.
+            let fd = frozen_dual_covers(&tier);
+            fd_proofs = take_fd_proofs(&mut tier, &fd);
+            let before = schedule.len();
+            schedule.retain(|(class, _)| !fd_covered(&fd, *class));
+            frozen_closed = before - schedule.len();
+            pre_covers.extend(fd);
+        }
         let root_closed_classes = adv.len() - schedule.len();
         let tree_classes: Vec<usize> = schedule.iter().map(|(class, _)| *class).collect();
         let root_bound = schedule.first().map_or(0.0, |(_, bound)| *bound);
@@ -2706,7 +5010,24 @@ impl<'a> MarginRowBab<'a> {
             root_precision_execution: cfg.root_precision_execution,
             backward_interm_execution: cfg.backward_interm_execution,
             root_alpha_execution: cfg.root_alpha_execution,
+            close_integrity: CloseIntegrityEvidence::default(),
         };
+        // #mr-close-telemetry: the classes the root closed, at their own `dj`.
+        // `classwise_schedule`'s rule exactly: a class leaves the schedule iff
+        // its (finite, checked above) root bound is `> 0`. Frozen-dual closes
+        // were scheduled (`dj <= 0`) and are counted apart. Telemetry only.
+        if close_telemetry_on(&cfg) {
+            for &dj in &re.dj {
+                if dj > 0.0 {
+                    aggregate.close_integrity.note(CertKind::Root, dj);
+                }
+            }
+            aggregate.close_integrity.frozen_dual_closes = frozen_closed as u64;
+            super::close_integrity::publish_live(&aggregate.close_integrity);
+        }
+        if frozen_closed > 0 && schedule.is_empty() {
+            aggregate.stop = "classwise_frozen_dual_closed".into();
+        }
         if schedule.is_empty() {
             aggregate.elapsed_secs = t0.elapsed().as_secs_f64();
             if cfg.deadline.is_some_and(|dl| Instant::now() > dl) {
@@ -2716,9 +5037,33 @@ impl<'a> MarginRowBab<'a> {
                     stats: Some(aggregate),
                 });
             }
-            return Ok(MarginRowOutcome::Unsat(aggregate));
+            // #soundness-spine M2c: the class covers ARE the proof.
+            let mut ledger = Ledger {
+                scope: frame_scope(&cfg),
+                required: Some(adv.to_vec()),
+                pre: pre_covers,
+                fd_proofs,
+                direct_guard,
+                head_raised,
+                ..Ledger::default()
+            };
+            return Ok(
+                match authorize_frame(&mut ledger, &[], false, net, root, t, &re, &cfg) {
+                    Ok(token) => MarginRowOutcome::Unsat(aggregate, token),
+                    Err(reason) => {
+                        aggregate.stop = "classwise_unsat_refused".into();
+                        aggregate.ledger_ok = Some(false);
+                        MarginRowOutcome::Unknown {
+                            reason,
+                            stats: Some(aggregate),
+                        }
+                    }
+                },
+            );
         }
 
+        // #soundness-spine M2c: each class tree's class-part token.
+        let mut part_covers: Vec<ClassCover> = Vec::new();
         let mut remaining_expansions = cfg.max_expansions;
         for (class, class_root_bound) in schedule {
             if cfg.deadline.is_some_and(|dl| Instant::now() > dl) {
@@ -2747,6 +5092,7 @@ impl<'a> MarginRowBab<'a> {
                     root_precision_execution: cfg.root_precision_execution,
                     backward_interm_execution: cfg.backward_interm_execution,
                     root_alpha_execution: cfg.root_alpha_execution,
+                    close_integrity: CloseIntegrityEvidence::default(),
                 };
                 absorb_class_stats(
                     &mut aggregate,
@@ -2783,6 +5129,7 @@ impl<'a> MarginRowBab<'a> {
                     root_precision_execution: cfg.root_precision_execution,
                     backward_interm_execution: cfg.backward_interm_execution,
                     root_alpha_execution: cfg.root_alpha_execution,
+                    close_integrity: CloseIntegrityEvidence::default(),
                 };
                 absorb_class_stats(
                     &mut aggregate,
@@ -2818,6 +5165,11 @@ impl<'a> MarginRowBab<'a> {
                 root_precision_execution: class_cfg.root_precision_execution,
                 backward_interm_execution: class_cfg.backward_interm_execution,
                 root_alpha_execution: class_cfg.root_alpha_execution,
+                // #mr-close-telemetry: CARRIED IN — the root closes and every
+                // earlier class's certificates — so this class tree's live
+                // publications show the whole proof so far. Handed back to the
+                // aggregate below (replaced, never absorbed twice).
+                close_integrity: aggregate.close_integrity,
             };
             let class_lru = fresh_class_lru(class_cfg.lru_cap, &re.pack);
             let mut bab = Self {
@@ -2834,7 +5186,12 @@ impl<'a> MarginRowBab<'a> {
                 // measures its OWN closure) over the shared process-global
                 // tier, so a tier class 1 earned carries into class 2.
                 closure: super::closure::ClosureMonitor::new(super::closure::armed()),
+                b5: stack_eval::B5Trace::default(),
             };
+            // #soundness-spine M2c: one class on the whole box; the
+            // instance-level aggregation below consumes the part token.
+            bab.ledger.scope = TokenScope::ClassPart;
+            bab.ledger.required = Some(vec![class]);
             let class_t0 = Instant::now();
             let class_result = bab.tree_loop(class_root_bound, &re);
             let outcome = match class_result {
@@ -2849,7 +5206,10 @@ impl<'a> MarginRowBab<'a> {
                 }
             };
             match outcome {
-                MarginRowOutcome::Unsat(stats) => {
+                MarginRowOutcome::Unsat(stats, token) => {
+                    // #mr-close-telemetry: the class tree carried the running
+                    // tally in; take it back (replace, never absorb twice).
+                    aggregate.close_integrity = stats.close_integrity;
                     if stats.expansions > remaining_expansions {
                         return Err(NyError::NumericalInstability(
                             "margin_row classwise: global expansion budget overshoot".into(),
@@ -2870,9 +5230,12 @@ impl<'a> MarginRowBab<'a> {
                     }
                     let stop = stats.stop.clone();
                     absorb_class_stats(&mut aggregate, class_record(class, true, &stats, stop));
+                    part_covers.push(ClassCover::Part(token));
                 }
                 MarginRowOutcome::Unknown { reason, stats } => {
                     let mut stats = stats.unwrap_or_else(|| bab.stats.clone());
+                    // #mr-close-telemetry: as in the Unsat arm.
+                    aggregate.close_integrity = stats.close_integrity;
                     if stats.stop == "classwise_tree" {
                         stats.stop = reason.clone();
                     }
@@ -2908,9 +5271,35 @@ impl<'a> MarginRowBab<'a> {
                 stats: Some(aggregate),
             });
         }
-        aggregate.stop = "classwise_verified_all".into();
-        aggregate.elapsed_secs = t0.elapsed().as_secs_f64();
-        Ok(MarginRowOutcome::Unsat(aggregate))
+        // #soundness-spine M2c: root closes + frozen-dual closes + every
+        // class tree's part token must cover every adversarial class.
+        let mut covers = pre_covers;
+        covers.extend(part_covers);
+        let mut ledger = Ledger {
+            scope: frame_scope(&cfg),
+            required: Some(adv.to_vec()),
+            pre: covers,
+            fd_proofs,
+            direct_guard,
+            head_raised,
+            ..Ledger::default()
+        };
+        match authorize_frame(&mut ledger, &[], false, net, root, t, &re, &cfg) {
+            Ok(token) => {
+                aggregate.stop = "classwise_verified_all".into();
+                aggregate.elapsed_secs = t0.elapsed().as_secs_f64();
+                Ok(MarginRowOutcome::Unsat(aggregate, token))
+            }
+            Err(reason) => {
+                aggregate.stop = "classwise_unsat_refused".into();
+                aggregate.ledger_ok = Some(false);
+                aggregate.elapsed_secs = t0.elapsed().as_secs_f64();
+                Ok(MarginRowOutcome::Unknown {
+                    reason,
+                    stats: Some(aggregate),
+                })
+            }
+        }
     }
 
     /// Full algorithm body. Production entry is [`Self::run`]; nested Tier-2
@@ -2921,6 +5310,19 @@ impl<'a> MarginRowBab<'a> {
         t: usize,
         adv: &[usize],
         cfg: BabConfig,
+        hint_prefix: Vec<AbsLit>,
+    ) -> Result<MarginRowOutcome> {
+        Self::run_inner_with_direct(net, root, t, adv, cfg, hint_prefix, None)
+    }
+
+    fn run_inner_with_direct(
+        net: &TwinNet,
+        root: &RootGates,
+        t: usize,
+        adv: &[usize],
+        cfg: BabConfig,
+        hint_prefix: Vec<AbsLit>,
+        direct: Option<super::head_group::direct::DirectAttempt>,
     ) -> Result<MarginRowOutcome> {
         let t0 = Instant::now();
         if cfg.deadline.is_some_and(|dl| Instant::now() > dl) {
@@ -2930,15 +5332,118 @@ impl<'a> MarginRowBab<'a> {
             });
         }
         let eng = BackwardEngine::new(net, root);
-        let re = {
+        let mut direct = direct.or_else(|| direct_root_attempt(&eng, t, adv, &cfg));
+        if let Some(attempt) = direct.as_mut() {
+            attempt.retain_current_frame(
+                &eng,
+                t,
+                adv,
+                cfg.deadline
+                    .zip(cfg.effective_publish_deadline())
+                    .map(|(a, b)| a.min(b)),
+            );
+        }
+        if let Some(outcome) =
+            direct_root_outcome(&eng, t, adv, &cfg, &hint_prefix, direct.as_mut(), t0)
+        {
+            return Ok(outcome);
+        }
+        if cfg.deadline.is_some_and(|dl| Instant::now() >= dl) {
+            return Ok(MarginRowOutcome::Unknown {
+                reason: "wallclock after direct head prepass".into(),
+                stats: None,
+            });
+        }
+        let mut re = {
             let _t = super::prof::Timer::start(super::prof::Phase::RootEval);
-            root_eval(&eng, net, t, adv)?
+            // #root-eval-reuse (B1(c)): the alpha guard's published evaluation
+            // of these exact gates, when one was stored; else unchanged.
+            root_eval_reuse(&eng, net, t, adv)?
         };
+        // B2.3 x head routes: the bounds each head route started from.
+        let dj_root = re.dj.clone();
+        let direct_guard = merge_direct_prelude(&eng, t, adv, &mut re, &cfg, direct.as_mut());
+        let dj_merged = re.dj.clone();
+        refine_head_groups_with_direct(&eng, t, adv, &mut re, &cfg, direct.as_mut());
+        let head_raised = head_raised_classes(root.mode, adv, &dj_root, &dj_merged, &re.dj);
         if cfg.deadline.is_some_and(|dl| Instant::now() > dl) {
             return Ok(MarginRowOutcome::Unknown {
                 reason: "wallclock after root evaluation".into(),
                 stats: None,
             });
+        }
+        // #attack-open-disjuncts: publish only the OUTER frame. A nested
+        // epoch run re-enters here on a ReLU-split subdomain, where a closed
+        // class is NOT closed on the box. Attack scheduling only; one atomic
+        // load when unarmed.
+        if cfg.epoch_frame_route == EpochFrameRoute::Outer {
+            super::root_open::publish_outer_root(t, adv, &re.dj);
+        }
+        // #spec-alpha YIELD -> the STRUCTURED receipt, not only stderr.
+        //
+        // `RootAlphaExecutionEvidence` is built in the root driver immediately
+        // after `#rebake` returns, which is BEFORE `#spec-alpha` runs inside
+        // `root_eval`, so it can only carry the policy echo at that point. This
+        // is the first site where the refinement has run and the receipt is
+        // still assemblable. Without it the yield is stderr-only and every
+        // sweep through `ny benchmarks run` (stdout nulled, `RUST_LOG=error`)
+        // is uninterpretable by construction -- the documented `#interm-alpha`
+        // gap. `None` (dark, or no failing class) leaves the fields at their
+        // "did not run" values, which is a DIFFERENT fact from a zero delta.
+        let cfg = BabConfig {
+            root_alpha_execution: cfg
+                .root_alpha_execution
+                .with_spec_alpha_yield(re.spec_alpha.as_ref()),
+            ..cfg
+        };
+        // #frozen-dual-bab (V1 stage B): the certified frozen alpha-zonotope
+        // dual BaB as a TIER between this root and the tree, on the OUTER frame
+        // only (a nested epoch run's frame is a ReLU-split subdomain) and only
+        // when `margin_row.frozen_dual_bab` is armed by the category preset or
+        // an explicit override. When disabled this is one latched bool and
+        // `re` is untouched. A class it returns is certified
+        // `margin > 0` on the WHOLE input box (every leaf certified, level
+        // ledger closed), so dropping it from the tree's conjunction is exact;
+        // every other class is handed to the tree unchanged. Counted with the
+        // root closures below so `root_closed_classes + tree_classes == adv`.
+        let mut re = re;
+        // #soundness-spine M2c: the classes the root closed, as certified class
+        // covers (`root_eval`'s own rule on this frame's Outward `dj`).
+        let mut pre_covers: Vec<ClassCover> = adv
+            .iter()
+            .zip(&re.dj)
+            .filter_map(|(&class, &dj)| cert_mr::root_class(root.mode, class, dj))
+            .collect();
+        let mut frozen_closed = 0usize;
+        // B2.3: the tier's prune traces (Proof profile only; hint data).
+        let mut fd_proofs: Vec<FdProofTrace> = Vec::new();
+        // B2.3: a harness's explicit arming, else the governed gate (read
+        // only when no harness chose: the dark lane is the historical one
+        // latched bool).
+        if cfg.epoch_frame_route == EpochFrameRoute::Outer
+            && match cfg.frozen_dual_tier {
+                Some(armed) => armed,
+                None => super::zono_state::armed(),
+            }
+        {
+            let mut tier = super::zono_bab::lane_tier(
+                net,
+                root,
+                t,
+                adv,
+                &re,
+                cfg.deadline,
+                fd_crosscheck_every(),
+                cfg.frozen_dual_tier.is_some(),
+            );
+            // #soundness-spine M2c: a class leaves the tree only when its
+            // closure re-derives from its own search report.
+            let fd = frozen_dual_covers(&tier);
+            fd_proofs = take_fd_proofs(&mut tier, &fd);
+            let before = re.tree_classes.len();
+            re.tree_classes.retain(|j| !fd_covered(&fd, *j));
+            frozen_closed = before - re.tree_classes.len();
+            pre_covers.extend(fd);
         }
         let root_closed_classes = adv.len() - re.tree_classes.len();
         let mut stats = BabStats {
@@ -2951,7 +5456,11 @@ impl<'a> MarginRowBab<'a> {
             max_depth: 0,
             mono_raw_dips: 0,
             mono_worst: 0.0,
-            stop: "closed_at_root".into(),
+            stop: if frozen_closed > 0 {
+                "frozen_dual_closed".into()
+            } else {
+                "closed_at_root".into()
+            },
             elapsed_secs: 0.0,
             class_runs: Vec::new(),
             epochs_attempted: 0,
@@ -2967,14 +5476,84 @@ impl<'a> MarginRowBab<'a> {
             root_precision_execution: cfg.root_precision_execution,
             backward_interm_execution: cfg.backward_interm_execution,
             root_alpha_execution: cfg.root_alpha_execution,
+            close_integrity: CloseIntegrityEvidence::default(),
         };
+        // #mr-close-telemetry: every class this root closed, at its own `dj` —
+        // `root_eval`'s `tree_classes` rule exactly (`closed(mode, dj)`), so
+        // frozen-dual closes (scheduled, `dj` open) are counted apart. On a
+        // nested epoch run these become the outer tally's `epoch_root` when
+        // the subtree closes. Telemetry only.
+        if close_telemetry_on(&cfg) {
+            for &dj in &re.dj {
+                if closed(root.mode, dj) {
+                    stats.close_integrity.note(CertKind::Root, dj);
+                }
+            }
+            stats.close_integrity.frozen_dual_closes = frozen_closed as u64;
+            if cfg.epoch_frame_route == EpochFrameRoute::Outer {
+                super::close_integrity::publish_live(&stats.close_integrity);
+            }
+        }
         if re.tree_classes.is_empty() {
             stats.elapsed_secs = t0.elapsed().as_secs_f64();
-            // Single leaf at depth 0: Kraft trivially holds.
-            stats.ledger_ok = Some(true);
-            return Ok(MarginRowOutcome::Unsat(stats));
+            // #frozen-dual-bab: a verdict the TIER completed is gated on the
+            // publish deadline exactly like the tree's own verdict
+            // (`tree_loop`'s #publish-deadline check); the tier spends lane
+            // wall that the closed-at-root path never did. Dark
+            // (`frozen_closed == 0`) this is not evaluated: bit-identical.
+            if frozen_closed > 0
+                && cfg
+                    .effective_publish_deadline()
+                    .is_some_and(|dl| Instant::now() > dl)
+            {
+                stats.stop = "frozen_dual_wallclock_before_verdict".into();
+                return Ok(MarginRowOutcome::Unknown {
+                    reason: "wallclock before the frozen-dual verdict".into(),
+                    stats: Some(stats),
+                });
+            }
+            // #soundness-spine M2c: every class closed before any tree, so
+            // the class covers ARE the proof.
+            let mut ledger = Ledger {
+                scope: frame_scope(&cfg),
+                required: Some(adv.to_vec()),
+                pre: pre_covers,
+                fd_proofs,
+                direct_guard,
+                head_raised,
+                ..Ledger::default()
+            };
+            ledger.hints.set_prefix(hint_prefix.clone());
+            ledger.hint_prefix = hint_prefix;
+            return Ok(
+                match authorize_frame(&mut ledger, &[], false, net, root, t, &re, &cfg) {
+                    Ok(token) => {
+                        stats.ledger_ok = Some(true);
+                        MarginRowOutcome::Unsat(stats, token)
+                    }
+                    Err(reason) => {
+                        stats.ledger_ok = Some(false);
+                        stats.stop = "unsat_refused".into();
+                        MarginRowOutcome::Unknown {
+                            reason,
+                            stats: Some(stats),
+                        }
+                    }
+                },
+            );
         }
         let mb = MarginBatch::new(net, t, &re.tree_classes)?;
+        let mut ledger = Ledger {
+            scope: frame_scope(&cfg),
+            required: Some(adv.to_vec()),
+            pre: pre_covers,
+            fd_proofs,
+            direct_guard,
+            head_raised,
+            ..Ledger::default()
+        };
+        ledger.hints.set_prefix(hint_prefix.clone());
+        ledger.hint_prefix = hint_prefix;
         let mut bab = MarginRowBab {
             eng,
             mb,
@@ -2985,10 +5564,11 @@ impl<'a> MarginRowBab<'a> {
             },
             stats,
             epoch_failures: 0,
-            ledger: Ledger::default(),
+            ledger,
             nested_ledgers_ok: true,
             lane_cache: super::gpu_backward::cache::PlanCache::default(),
             closure: super::closure::ClosureMonitor::new(super::closure::armed()),
+            b5: stack_eval::B5Trace::default(),
         };
         bab.lru.cap = bab.cfg.lru_cap;
         bab.lru.put(Vec::new(), re.pack.clone());
@@ -3007,7 +5587,13 @@ impl<'a> MarginRowBab<'a> {
                 stats: Some(bab.stats),
             });
         }
-        let outcome = if bab.cfg.frontier > 1 {
+        // #wave-beta-bab (ENGINE_PROGRAM M6): the wave engine only when armed
+        // AND on the outer frame; dark (`legacy`, the default) this is the
+        // established dispatch, bit for bit.
+        let outcome = if bab.cfg.wave.armed() && bab.cfg.epoch_frame_route == EpochFrameRoute::Outer
+        {
+            bab.tree_loop_wave(root_bound, &re)?
+        } else if bab.cfg.frontier > 1 {
             bab.tree_loop_parallel(root_bound, &re)?
         } else {
             bab.tree_loop(root_bound, &re)?
@@ -3041,10 +5627,146 @@ impl<'a> MarginRowBab<'a> {
             // #margin-row-domain-alpha: the root domain has no ancestor, so it
             // starts at the root's own (possibly `#alpha-opt`-optimized) alpha.
             alpha: Vec::new(),
+            // #clip-stateful: the root accumulates nothing (no splits, no
+            // halfspaces); the induction that keeps every stored interval a
+            // valid enclosure bottoms out exactly here.
+            clip_acc: None,
+            split_order: 0,
         }
     }
 
+    /// #soundness-spine M2c: record one closed leaf in this frame's cover
+    /// ledger — its path below the frame root, built from the SAME trunk
+    /// splits and head fixes its certified bound was computed under (plus the
+    /// child's split for a child closed at expansion), and its evidence. A
+    /// leaf whose path or evidence cannot be built is recorded as a refusal.
+    ///
+    /// ENGINE_PROGRAM §1.7 B1 (proof bundle v2): AFTER the ledger counted the
+    /// leaf, and only while the frame's hint ledger captures, the leaf's hint
+    /// (branch-order splits, aligned β, the classes it discharges, close
+    /// kind, margin) is pushed — write-only, never read back.
+    fn cover_leaf(
+        &mut self,
+        trunk: &[TrunkSplit],
+        heads: &[HeadFix],
+        child: Option<ChildSplit>,
+        evidence: Option<LeafEvidence>,
+        hint: HintCtx<'_>,
+    ) {
+        if cover_fault_drop_next_leaf() {
+            return;
+        }
+        let path = cert_mr::leaf_path(trunk, heads, &self.cfg.initial_heads, child);
+        let info = if self.ledger.hints.capturing() && path.is_some() {
+            evidence.as_ref().map(|e| match e {
+                LeafEvidence::Bound(c) => (LeafClose::Bound, c.value()),
+                LeafEvidence::Empty(c) => (LeafClose::Empty, c.value()),
+                LeafEvidence::Subtree(t) => (LeafClose::Subtree, t.min_margin()),
+                // Graph-lane evidence (never built by this lane): margin-free,
+                // exactly as `CoverLedger::records` reports it.
+                LeafEvidence::LaneClose(_) => (LeafClose::Lane, f64::NAN),
+            })
+        } else {
+            None
+        };
+        self.ledger.cover.leaf(path, evidence);
+        let Some((close, margin)) = info else {
+            return;
+        };
+        let Some((splits, beta)) = hint_splits(
+            trunk,
+            heads,
+            self.cfg.initial_heads.len(),
+            hint.order,
+            hint.betas,
+            hint.head_betas,
+            child,
+        ) else {
+            return;
+        };
+        let empty_split = (close == LeafClose::Empty && hint.empty_child && child.is_some())
+            .then(|| splits.len() - 1);
+        let dis = self.hint_dis(hint.retired);
+        self.ledger.hints.push_leaf(LeafHint {
+            splits,
+            beta,
+            close,
+            dis,
+            margin,
+            lift: hint.lift,
+            empty_split,
+        });
+    }
+
+    /// Proof bundle v2: the hint context of an evaluated domain, for the
+    /// serial merge (`None` unless this frame's hint ledger captures).
+    fn eval_hints(&self, st: &NodeState, lift_eval: bool) -> Option<Box<EvalHints>> {
+        self.ledger.hints.capturing().then(|| {
+            Box::new(EvalHints {
+                betas: st.betas.clone(),
+                head_betas: st.head_betas.clone(),
+                retired_out: st.retired.clone(),
+                lift_eval,
+            })
+        })
+    }
+
+    /// The tree classes still open under `retired` (column indices into the
+    /// tree's margin batch). Hint data only.
+    fn hint_dis(&self, retired: &[u16]) -> Vec<usize> {
+        self.mb
+            .adv
+            .iter()
+            .enumerate()
+            .filter(|(c, _)| !retired.iter().any(|&r| usize::from(r) == *c))
+            .map(|(_, &j)| j)
+            .collect()
+    }
+
+    /// Proof bundle v2: the columns `entry`'s evaluation newly retired, as a
+    /// retirement hint on `entry`'s region (scored under `betas` /
+    /// `head_betas`). Write-only; a no-op unless capturing.
+    fn push_retire_hint(
+        &mut self,
+        entry: &DomainEntry,
+        betas: &[f64],
+        head_betas: &[f64],
+        retired_out: &[u16],
+    ) {
+        if !self.ledger.hints.capturing() {
+            return;
+        }
+        let newly: Vec<usize> = retired_out
+            .iter()
+            .filter(|c| !entry.retired.contains(c))
+            .filter_map(|&c| self.mb.adv.get(usize::from(c)).copied())
+            .collect();
+        if newly.is_empty() {
+            return;
+        }
+        let Some((splits, beta)) = hint_splits(
+            &entry.trunk,
+            &entry.heads,
+            self.cfg.initial_heads.len(),
+            entry.split_order,
+            betas,
+            head_betas,
+            None,
+        ) else {
+            return;
+        };
+        self.ledger.hints.push_retire(RetireHint {
+            splits,
+            beta,
+            dis: newly,
+            margin: f64::NAN,
+        });
+    }
+
     fn tree_loop(&mut self, root_bound: f64, re: &RootEval) -> Result<MarginRowOutcome> {
+        // #phase-cost: the margin-row tree is this lane's BaB loop (a nested
+        // epoch subtree on the same thread is a counted re-entry).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BabLoop);
         // #margin-row-root-bound: announce where the search STARTS, before it can
         // time out.
         //
@@ -3069,11 +5791,21 @@ impl<'a> MarginRowBab<'a> {
              (this lane's own bound; NOT the multi-objective census)"
         );
         let t0 = Instant::now();
+        // #mr-census: tree wall/CPU on every exit of this loop (Drop), closure
+        // kinds in the serial merge below. Telemetry only.
+        let census_tree = super::census::TreeGuard::begin();
         let mode = self.eng.root.mode;
         let mut heap: BinaryHeap<DomainEntry> = BinaryHeap::new();
         let mut seq: u64 = 0;
         heap.push(self.root_entry(root_bound, re, seq));
         seq += 1;
+        // #mr-close-telemetry: record every close's certificate beside its
+        // Kraft leaf below; only the OUTERMOST tree publishes the running tally
+        // (a nested epoch tree's closes reach it through `try_epoch`). Kept
+        // clear of the `NY_MARGIN_ROW_TRACE` read below so that site's
+        // source-frontier fingerprint (+-12 tokens) is unchanged.
+        let close_telemetry = close_telemetry_on(&self.cfg);
+        let publish_close = close_telemetry && census_tree.is_outermost();
         let mut stop = "queue_empty".to_string();
         let trace = std::env::var("NY_MARGIN_ROW_TRACE").is_ok();
         while let Some(entry) = {
@@ -3085,6 +5817,9 @@ impl<'a> MarginRowBab<'a> {
             self.closure_step(heap.len(), t0.elapsed().as_secs_f64(), &re.pack);
             heap.pop()
         } {
+            if publish_close {
+                super::close_integrity::publish_live(&self.stats.close_integrity);
+            }
             if trace && self.stats.expansions.is_multiple_of(25) {
                 eprintln!(
                     "[trace] exp {:>5} pop bound {:+.5} depth {} ({:.1}s)",
@@ -3111,10 +5846,31 @@ impl<'a> MarginRowBab<'a> {
                 });
             }
             if closed(mode, entry.bound) {
+                census_tree.closed(super::census::CloseKind::Queued, 1 + heap.len());
                 self.stats.closed += 1 + heap.len();
-                self.ledger.leaf(entry.trunk.len() + entry.heads.len());
+                self.cover_leaf(
+                    &entry.trunk,
+                    &entry.heads,
+                    None,
+                    cert_mr::bound_evidence(mode, entry.bound),
+                    HintCtx::of(&entry, true),
+                );
+                if close_telemetry {
+                    self.stats
+                        .close_integrity
+                        .note(CertKind::Queued, entry.bound);
+                }
                 for e in heap.iter() {
-                    self.ledger.leaf(e.trunk.len() + e.heads.len());
+                    self.cover_leaf(
+                        &e.trunk,
+                        &e.heads,
+                        None,
+                        cert_mr::bound_evidence(mode, e.bound),
+                        HintCtx::of(e, true),
+                    );
+                    if close_telemetry {
+                        self.stats.close_integrity.note(CertKind::Queued, e.bound);
+                    }
                 }
                 heap.clear();
                 stop = "verified_bestfirst".into();
@@ -3125,8 +5881,20 @@ impl<'a> MarginRowBab<'a> {
             // Tier-2 epoch attempt (#epoch-bab): rebuild-with-baked-splits +
             // nested subtree run. Closing the subtree closes this domain.
             if self.try_epoch(&entry) {
+                census_tree.closed(super::census::CloseKind::Epoch, 1);
                 self.stats.closed += 1;
-                self.ledger.leaf(depth);
+                let subtree = self
+                    .ledger
+                    .pending_subtree
+                    .take()
+                    .map(LeafEvidence::Subtree);
+                self.cover_leaf(
+                    &entry.trunk,
+                    &entry.heads,
+                    None,
+                    subtree,
+                    HintCtx::of(&entry, false),
+                );
                 continue;
             }
             if self.stats.expansions >= self.cfg.max_expansions {
@@ -3142,11 +5910,21 @@ impl<'a> MarginRowBab<'a> {
             // Include the already-popped entry in the pre-decision open count.
             self.stats.frontier_execution.observe(heap.len() + 1);
             let (b_eval, mut st) = match self.eval_node(&entry)? {
-                EvalOut::Infeasible(policy_execution) => {
+                EvalOut::Infeasible(policy_execution, slack) => {
                     self.stats.policy_execution.absorb(policy_execution);
                     // Infeasible domain: provably empty, closed.
+                    census_tree.closed(super::census::CloseKind::Infeasible, 1);
                     self.stats.closed += 1;
-                    self.ledger.leaf(depth);
+                    self.cover_leaf(
+                        &entry.trunk,
+                        &entry.heads,
+                        None,
+                        cert_mr::empty_evidence(mode, slack),
+                        HintCtx::of(&entry, false),
+                    );
+                    if close_telemetry {
+                        self.stats.close_integrity.note(CertKind::Infeasible, slack);
+                    }
                     continue;
                 }
                 EvalOut::Deadline(policy_execution) => {
@@ -3166,10 +5944,30 @@ impl<'a> MarginRowBab<'a> {
                     stats: Some(self.stats.clone()),
                 });
             }
+            // Proof bundle v2: columns this evaluation retired, as a hint on
+            // this domain's region (write-only; a no-op unless capturing).
+            self.push_retire_hint(&entry, &st.betas, &st.head_betas, &st.retired);
             let b = b_eval.max(entry.bound);
             if closed(mode, b) {
+                census_tree.closed(super::census::CloseKind::Eval, 1);
                 self.stats.closed += 1;
-                self.ledger.leaf(depth);
+                self.cover_leaf(
+                    &entry.trunk,
+                    &entry.heads,
+                    None,
+                    cert_mr::bound_evidence(mode, b),
+                    HintCtx {
+                        order: entry.split_order,
+                        betas: &st.betas,
+                        head_betas: &st.head_betas,
+                        retired: &entry.retired,
+                        lift: b_eval < entry.bound,
+                        empty_child: false,
+                    },
+                );
+                if close_telemetry {
+                    self.stats.close_integrity.note(st.close_src, b);
+                }
                 continue;
             }
             // ---------- candidates ----------
@@ -3215,6 +6013,15 @@ impl<'a> MarginRowBab<'a> {
             let reduce_max = super::branch_reduce_max();
             let (pick, differs) = pick_candidate(&ch, reduce_max);
             note_reduceop(reduce_max, "serial", ch.len(), pick, differs);
+            // #branch-parent-lift: every scored candidate certifies a bound on
+            // the PARENT, not just on its own children. Recover the best one.
+            let lift = if super::parent_lift_enabled() {
+                let lift = parent_lift(&ch);
+                note_parent_lift("serial", ch.len(), b, lift, closed(mode, lift));
+                lift
+            } else {
+                f64::NEG_INFINITY
+            };
             let n_t = trunk_cands.len();
             let chb = ch[pick];
             // ---------- push children ----------
@@ -3230,7 +6037,7 @@ impl<'a> MarginRowBab<'a> {
                     self.stats.mono_raw_dips += 1;
                     self.stats.mono_worst = self.stats.mono_worst.min(raw - b);
                 }
-                let cb = raw.max(b);
+                let cb = raw.max(b).max(lift);
                 let (trunk_c, heads_c, ly_c, uy_c, betas_c, head_betas_c) = if pick < n_t {
                     super::prof::bump(super::prof::Counter::TrunkSplit, 1);
                     let (li, pos) = trunk_cands[pick];
@@ -3263,9 +6070,28 @@ impl<'a> MarginRowBab<'a> {
                         uy[i] = uy[i].min(0.0);
                     }
                     if ly[i] > uy[i] + 1e-12 {
+                        census_tree.closed(super::census::CloseKind::HeadInfeasible, 1);
                         self.stats.closed += 1;
                         self.stats.domains_created += 1;
-                        self.ledger.leaf(depth + 1);
+                        self.cover_leaf(
+                            &entry.trunk,
+                            &entry.heads,
+                            Some(ChildSplit::Head((i, dr))),
+                            cert_mr::empty_evidence(mode, ly[i] - uy[i]),
+                            HintCtx {
+                                order: entry.split_order,
+                                betas: &st.betas,
+                                head_betas: &st.head_betas,
+                                retired: &st.retired,
+                                lift: false,
+                                empty_child: true,
+                            },
+                        );
+                        if close_telemetry {
+                            self.stats
+                                .close_integrity
+                                .note(CertKind::HeadInfeasible, ly[i] - uy[i]);
+                        }
                         continue;
                     }
                     let mut hc = entry.heads.clone();
@@ -3278,8 +6104,44 @@ impl<'a> MarginRowBab<'a> {
                 };
                 self.stats.domains_created += 1;
                 if closed(mode, cb) {
+                    let raw_closes = closed(mode, raw);
+                    census_tree.closed(
+                        if raw_closes {
+                            super::census::CloseKind::Raw
+                        } else {
+                            super::census::CloseKind::Lift
+                        },
+                        1,
+                    );
                     self.stats.closed += 1;
-                    self.ledger.leaf(depth + 1);
+                    self.cover_leaf(
+                        &trunk_c,
+                        &heads_c,
+                        None,
+                        cert_mr::bound_evidence(mode, cb),
+                        HintCtx {
+                            order: child_split_order(
+                                &entry,
+                                self.cfg.initial_heads.len(),
+                                pick >= n_t,
+                            ),
+                            betas: &betas_c,
+                            head_betas: &head_betas_c,
+                            retired: &st.retired,
+                            lift: !raw_closes,
+                            empty_child: false,
+                        },
+                    );
+                    if close_telemetry {
+                        self.stats.close_integrity.note(
+                            if raw_closes {
+                                CertKind::Raw
+                            } else {
+                                CertKind::Lift
+                            },
+                            cb,
+                        );
+                    }
                 } else {
                     heap.push(DomainEntry {
                         bound: cb,
@@ -3300,14 +6162,37 @@ impl<'a> MarginRowBab<'a> {
                         // #margin-row-domain-alpha: warm start (see
                         // `DomainEntry::alpha`).
                         alpha: st.alpha.clone(),
+                        // #clip-stateful: monotone inheritance (see
+                        // `DomainEntry::clip_acc`).
+                        clip_acc: st.clip_acc.clone(),
+                        split_order: child_split_order(
+                            &entry,
+                            self.cfg.initial_heads.len(),
+                            pick >= n_t,
+                        ),
                     });
                     seq += 1;
                 }
             }
             self.stats.expansions += 1;
+            // Both child slots were processed (a non-finite child returns
+            // before this line), and each incremented `domains_created`.
+            census_tree.expanded(2);
+            // #mr-close-telemetry: columns this OPEN domain retired are
+            // certified here for its whole subtree (its leaves certify only
+            // the survivors).
+            if close_telemetry {
+                self.stats
+                    .close_integrity
+                    .note_tally(CertKind::Retire, &st.retire_certs);
+            }
         }
         self.stats.stop = stop.clone();
         self.stats.elapsed_secs = t0.elapsed().as_secs_f64();
+        // #router-r1: the tree's final progress sample (write-only).
+        self.router_tap(heap.len(), true);
+        // #phase-cost: the tree's work denominators for the run's cost census.
+        note_phase_cost_tree(&self.stats);
         // R9: the armed policy always leaves a receipt, so a run that observed
         // nothing is distinguishable from a run where the policy never loaded.
         self.closure.finish(
@@ -3316,15 +6201,48 @@ impl<'a> MarginRowBab<'a> {
             self.stats.closed,
             &stop,
         );
+        clip_head_finish();
         let mut verified = matches!(stop.as_str(), "verified_bestfirst" | "queue_empty");
-        if verified && self.cfg.deadline.is_some_and(|dl| Instant::now() > dl) {
+        // #publish-deadline: the tree has ALREADY finished with a verdict-bearing
+        // stop here, so gate publication on the publish deadline rather than on
+        // the search deadline's 3 s wrap-up reserve.
+        if verified
+            && self
+                .cfg
+                .effective_publish_deadline()
+                .is_some_and(|dl| Instant::now() > dl)
+        {
             stop = "wallclock_before_verdict".into();
             self.stats.stop.clone_from(&stop);
             verified = false;
         }
         if verified {
-            self.stats.ledger_ok = Some(self.ledger.kraft_ok() && self.nested_ledgers_ok);
-            Ok(MarginRowOutcome::Unsat(self.stats.clone()))
+            // #soundness-spine M2c: THE gate. The path-based cover, the class
+            // aggregation and (instance scope) the G2 guard, in BOTH proof
+            // profiles; a refusal is `Unknown`, never a verdict.
+            match authorize_frame(
+                &mut self.ledger,
+                &self.stats.tree_classes,
+                true,
+                self.eng.net,
+                self.eng.root,
+                self.mb.t,
+                re,
+                &self.cfg,
+            ) {
+                Ok(token) => {
+                    self.stats.ledger_ok = Some(true);
+                    Ok(MarginRowOutcome::Unsat(self.stats.clone(), token))
+                }
+                Err(reason) => {
+                    self.stats.ledger_ok = Some(false);
+                    self.stats.stop = "unsat_refused".into();
+                    Ok(MarginRowOutcome::Unknown {
+                        reason,
+                        stats: Some(self.stats.clone()),
+                    })
+                }
+            }
         } else {
             Ok(MarginRowOutcome::Unknown {
                 reason: stop,
@@ -3406,6 +6324,7 @@ impl<'a> MarginRowBab<'a> {
     /// whole batch and the deterministic merge is untouched. The policy writes
     /// nothing but an integer tier; it has no path to a published bound.
     fn closure_step(&mut self, open: usize, elapsed: f64, root_pack: &Arc<YPack>) {
+        self.router_tap(open, false);
         let remaining = self
             .cfg
             .deadline
@@ -3425,6 +6344,31 @@ impl<'a> MarginRowBab<'a> {
             }
             super::closure::Decision::Idle | super::closure::Decision::Hold => {}
         }
+    }
+
+    /// #router-r1: the margin-row tree's WRITE-ONLY progress tap
+    /// (ROUTER_PROGRAM §11.1 file 23). Called from the SERIAL section of both
+    /// tree loops (via `closure_step`) and once at `TREE DONE` (`force`). It
+    /// pushes plain counters to `ny_core::router::bus`, which nothing on the
+    /// verdict path reads back; while the router is off it is one relaxed
+    /// atomic load. One sample per `FRONTIER_WINDOW_UNITS` expansions (the
+    /// shipped closure window the FAR evidence was read in).
+    fn router_tap(&self, open: usize, force: bool) {
+        static CADENCE: ny_core::router::bus::Stride = ny_core::router::bus::Stride::new();
+        let expansions = self.stats.expansions as u64;
+        // Same evaluation order as before: the cadence stride is consulted
+        // (and advanced) only when the sample is not forced.
+        let forced = force && ny_core::router::bus::enabled();
+        if !(forced || CADENCE.due(expansions, ny_core::router::project::FRONTIER_WINDOW_UNITS)) {
+            return;
+        }
+        ny_core::router::bus::emit(ny_core::router::bus::ProgressSample::frontier(
+            ny_core::router::decl::ids::MARGIN_ROW,
+            expansions,
+            self.stats.domains_created as u64,
+            self.stats.closed as u64,
+            open as u64,
+        ));
     }
 
     /// #closure-adaptive top tier: the epoch rebuild is carried in `BabConfig`
@@ -3476,6 +6420,9 @@ impl<'a> MarginRowBab<'a> {
     }
 
     fn tree_loop_parallel(&mut self, root_bound: f64, re: &RootEval) -> Result<MarginRowOutcome> {
+        // #phase-cost: the margin-row tree is this lane's BaB loop (a nested
+        // epoch subtree on the same thread is a counted re-entry).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BabLoop);
         // #margin-row-root-bound: announce where the search STARTS, before it can
         // time out.
         //
@@ -3500,12 +6447,23 @@ impl<'a> MarginRowBab<'a> {
              (this lane's own bound; NOT the multi-objective census)"
         );
         let t0 = Instant::now();
+        // #mr-census: tree wall/CPU on every exit of this loop (Drop), batch
+        // straggler timing and closure kinds in the serial merge below.
+        // Telemetry only.
+        let census_tree = super::census::TreeGuard::begin();
         let mode = self.eng.root.mode;
         let width = self.cfg.frontier.max(1);
         let mut heap: BinaryHeap<DomainEntry> = BinaryHeap::new();
         let mut seq: u64 = 0;
         heap.push(self.root_entry(root_bound, re, seq));
         seq += 1;
+        // #mr-close-telemetry: record every close's certificate beside its
+        // Kraft leaf in the serial fill stage and merge below; only the
+        // OUTERMOST tree publishes the running tally, once per batch. Kept
+        // clear of the `NY_MARGIN_ROW_TRACE` read below so that site's
+        // source-frontier fingerprint (+-12 tokens) is unchanged.
+        let close_telemetry = close_telemetry_on(&self.cfg);
+        let publish_close = close_telemetry && census_tree.is_outermost();
         let mut stop = "queue_empty".to_string();
         let trace = std::env::var("NY_MARGIN_ROW_TRACE").is_ok();
         'outer: while !heap.is_empty() {
@@ -3535,6 +6493,12 @@ impl<'a> MarginRowBab<'a> {
             // #closure-adaptive: same observation as the serial lane, in the
             // serial section so the whole batch runs at one tier.
             self.closure_step(heap.len(), t0.elapsed().as_secs_f64(), &re.pack);
+            // #mr-close-telemetry: publish the tally merged so far (outermost
+            // tree only), so a SNAPSHOT of a lane that never returns is at
+            // most one batch stale. Telemetry only.
+            if publish_close {
+                super::close_integrity::publish_live(&self.stats.close_integrity);
+            }
             // Pop up to `width` worst-open domains into the batch. Open entries
             // are never closed (the push rule below never enqueues a closed
             // bound); the closed guard is defensive and, if it ever fires,
@@ -3549,8 +6513,21 @@ impl<'a> MarginRowBab<'a> {
                     });
                 }
                 if closed(mode, entry.bound) {
+                    census_tree.closed(super::census::CloseKind::Queued, 1);
+                    self.b5.fold_close(stack_eval::TRAJ_QUEUED, &entry);
                     self.stats.closed += 1;
-                    self.ledger.leaf(entry.trunk.len() + entry.heads.len());
+                    self.cover_leaf(
+                        &entry.trunk,
+                        &entry.heads,
+                        None,
+                        cert_mr::bound_evidence(mode, entry.bound),
+                        HintCtx::of(&entry, true),
+                    );
+                    if close_telemetry {
+                        self.stats
+                            .close_integrity
+                            .note(CertKind::Queued, entry.bound);
+                    }
                     continue;
                 }
                 let depth = entry.trunk.len() + entry.heads.len();
@@ -3559,8 +6536,21 @@ impl<'a> MarginRowBab<'a> {
                 // fill stage (the rebuild is internally rayon-parallel and
                 // needs `&mut self` for the attempt accounting).
                 if self.try_epoch(&entry) {
+                    census_tree.closed(super::census::CloseKind::Epoch, 1);
+                    self.b5.fold_close(stack_eval::TRAJ_EPOCH, &entry);
                     self.stats.closed += 1;
-                    self.ledger.leaf(depth);
+                    let subtree = self
+                        .ledger
+                        .pending_subtree
+                        .take()
+                        .map(LeafEvidence::Subtree);
+                    self.cover_leaf(
+                        &entry.trunk,
+                        &entry.heads,
+                        None,
+                        subtree,
+                        HintCtx::of(&entry, false),
+                    );
                     continue;
                 }
                 if self.stats.expansions >= self.cfg.max_expansions {
@@ -3681,38 +6671,126 @@ impl<'a> MarginRowBab<'a> {
                 heap.push(e);
             }
             // Gate OFF: retain the established per-domain expansion path
-            // exactly. Gate ON: evaluate/select independently, stack only the
-            // candidate-score rows, then restore batch order before the same
-            // deterministic serial heap merge below.
+            // exactly. Gate ON: stack the domains' MAIN eval passes (#mr-stack,
+            // B5) and their candidate-score rows, keep selection and the β /
+            // domain-alpha trials per domain, then restore batch order before
+            // the same deterministic serial heap merge below.
+            let batch_t0 = Instant::now();
             let steps: Vec<Result<ExpandStep>> = if self.cfg.domain_stack && batch.len() > 1 {
-                self.expand_domain_stacked_batch(&batch, &packs)?
-                    .into_iter()
-                    .map(Ok)
-                    .collect()
+                // #domain-stack R9: the stacked and independent paths are
+                // bit-identical by construction, so WITHOUT this line an armed
+                // run and a dark run are indistinguishable in the log — which
+                // makes any wall-clock A/B of this lever VOID rather than
+                // negative. Emit once, on the first stacked expansion.
+                // #domain-stack R9. Report the WIDEST stack seen, not the
+                // first: the first stacked expansion happens when the heap has
+                // barely filled, so it is necessarily the narrowest one this
+                // run will ever do. Latching on it systematically understates
+                // the mechanism — measured live, the first stack was 2 domains
+                // on both cifar100 and tinyimagenet, which says nothing about
+                // whether the column-scaling benefit was reached.
+                {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let w = batch.len();
+                    DOMAIN_STACK_EXPANSIONS.fetch_add(1, Relaxed);
+                    let prev = DOMAIN_STACK_MAX_WIDTH.fetch_max(w, Relaxed);
+                    if w > prev {
+                        eprintln!(
+                            "[domain-stack] armed: widest stack so far domains={w} \
+                             (one wide certified pass replaces {w} independent ones; \
+                             the pass is linear above ~64 columns)"
+                        );
+                    }
+                }
+                let (stacked_steps, stack_report) =
+                    self.expand_domain_stacked_batch(&batch, &packs)?;
+                // #mr-stack: this batch's main-eval stacking receipt (per tree
+                // and process-wide; printed as `[mr-stack]` at every stop).
+                self.b5.note_batch(stack_report);
+                let stacked: Vec<Result<ExpandStep>> = stacked_steps.into_iter().map(Ok).collect();
+                census_tree.stacked_batch(super::census::elapsed_ns(batch_t0));
+                stacked
             } else {
                 // Concurrent expansion (each domain's bound is bit-identical
                 // to serial; see method docs). `this` is a shared &Self across
                 // workers.
                 let this: &Self = self;
-                batch
+                // #mr-census: each domain's own evaluate+expand wall, so the
+                // batch barrier's straggler wait is measurable. The expansion
+                // call itself is unchanged.
+                let timed: Vec<(Result<ExpandStep>, u64)> = batch
                     .par_iter()
                     .zip(packs.par_iter())
-                    .map(|(entry, pack)| this.expand_one(pack, entry))
-                    .collect()
+                    .map(|(entry, pack)| {
+                        let t_dom = Instant::now();
+                        let step = this.expand_one(pack, entry);
+                        (step, super::census::elapsed_ns(t_dom))
+                    })
+                    .collect();
+                let (steps, domain_walls): (Vec<Result<ExpandStep>>, Vec<u64>) =
+                    timed.into_iter().unzip();
+                census_tree.batch(super::census::elapsed_ns(batch_t0), &domain_walls);
+                steps
             };
             super::prof::bump(super::prof::Counter::FrontierBatch, 1);
             super::prof::bump(super::prof::Counter::FrontierPopped, batch.len() as u64);
             // Deterministic serial merge in pop order.
             for (step, entry) in steps.into_iter().zip(&batch) {
-                let depth = entry.trunk.len() + entry.heads.len();
                 let step = step?;
+                // #mr-stack: fold every merged decision — its kind, the
+                // popped domain, and each child's bound and state bits — into
+                // the tree's trajectory hash (telemetry only).
+                self.b5.fold_step(&step, entry);
                 self.stats.policy_execution.absorb(step.policy_execution());
                 self.stats.epoch_execution.absorb(step.epoch_execution());
                 self.stats.width_execution.absorb(step.width_execution());
                 match step {
-                    ExpandStep::Infeasible(_) | ExpandStep::ClosedAtEval(_) => {
+                    ExpandStep::Infeasible(_, cert) => {
+                        census_tree.closed(super::census::CloseKind::Infeasible, 1);
                         self.stats.closed += 1;
-                        self.ledger.leaf(depth);
+                        self.cover_leaf(
+                            &entry.trunk,
+                            &entry.heads,
+                            None,
+                            cert_mr::empty_evidence(mode, cert.value),
+                            HintCtx::of(entry, false),
+                        );
+                        if close_telemetry {
+                            self.stats.close_integrity.note(cert.kind, cert.value);
+                        }
+                    }
+                    ExpandStep::ClosedAtEval(_, cert, hints) => {
+                        census_tree.closed(super::census::CloseKind::Eval, 1);
+                        self.stats.closed += 1;
+                        let ctx = match hints.as_deref() {
+                            Some(h) => {
+                                self.push_retire_hint(
+                                    entry,
+                                    &h.betas,
+                                    &h.head_betas,
+                                    &h.retired_out,
+                                );
+                                HintCtx {
+                                    order: entry.split_order,
+                                    betas: &h.betas,
+                                    head_betas: &h.head_betas,
+                                    retired: &entry.retired,
+                                    lift: h.lift_eval,
+                                    empty_child: false,
+                                }
+                            }
+                            None => HintCtx::of(entry, false),
+                        };
+                        self.cover_leaf(
+                            &entry.trunk,
+                            &entry.heads,
+                            None,
+                            cert_mr::bound_evidence(mode, cert.value),
+                            ctx,
+                        );
+                        if close_telemetry {
+                            self.stats.close_integrity.note(cert.kind, cert.value);
+                        }
                     }
                     ExpandStep::DeadlineHit(_) => {
                         // #deadline-poll (D2): clean early exit, no verdict.
@@ -3739,14 +6817,62 @@ impl<'a> MarginRowBab<'a> {
                         pushes,
                         closed_children,
                         created_children,
+                        close_kinds,
+                        closed_leaves,
                         execution: _,
+                        hints,
                     } => {
+                        census_tree.closed(super::census::CloseKind::Raw, close_kinds.raw);
+                        census_tree.closed(super::census::CloseKind::Lift, close_kinds.lift);
+                        census_tree.closed(
+                            super::census::CloseKind::HeadInfeasible,
+                            close_kinds.head_infeasible,
+                        );
+                        // #mr-close-telemetry: the closed children's
+                        // certificates and the parent's retirements.
+                        if close_telemetry {
+                            for cert in close_kinds.certs.iter().flatten() {
+                                self.stats.close_integrity.note(cert.kind, cert.value);
+                            }
+                            self.stats
+                                .close_integrity
+                                .note_tally(CertKind::Retire, &close_kinds.retire);
+                        }
+                        census_tree.expanded(created_children);
                         self.stats.mono_raw_dips += dips;
                         self.stats.mono_worst = self.stats.mono_worst.min(worst_dip);
                         self.stats.domains_created += created_children;
                         self.stats.closed += closed_children;
-                        for _ in 0..closed_children {
-                            self.ledger.leaf(depth + 1);
+                        if let Some(h) = hints.as_deref() {
+                            self.push_retire_hint(entry, &h.betas, &h.head_betas, &h.retired_out);
+                        }
+                        if closed_leaves.len() == closed_children {
+                            for leaf in closed_leaves {
+                                let empty_child =
+                                    matches!(leaf.evidence, Some(LeafEvidence::Empty(_)));
+                                let ctx = match hints.as_deref() {
+                                    Some(h) => HintCtx {
+                                        order: entry.split_order,
+                                        betas: &h.betas,
+                                        head_betas: &h.head_betas,
+                                        retired: &h.retired_out,
+                                        lift: leaf.lift,
+                                        empty_child,
+                                    },
+                                    None => HintCtx::of(entry, leaf.lift),
+                                };
+                                self.cover_leaf(
+                                    &entry.trunk,
+                                    &entry.heads,
+                                    Some(leaf.split),
+                                    leaf.evidence,
+                                    ctx,
+                                );
+                            }
+                        } else {
+                            // A close count without its paths is a bookkeeping
+                            // defect: record it so the cover gate refuses.
+                            self.ledger.cover.leaf(None, None);
                         }
                         for c in pushes {
                             heap.push(DomainEntry {
@@ -3762,6 +6888,8 @@ impl<'a> MarginRowBab<'a> {
                                 pc: c.pc,
                                 retired: c.retired,
                                 alpha: c.alpha,
+                                clip_acc: c.clip_acc,
+                                split_order: c.split_order,
                             });
                             seq += 1;
                         }
@@ -3772,6 +6900,15 @@ impl<'a> MarginRowBab<'a> {
         }
         self.stats.stop = stop.clone();
         self.stats.elapsed_secs = t0.elapsed().as_secs_f64();
+        // #mr-stack: publish the OUTERMOST tree's trajectory hash and
+        // main-eval stacking receipt (`[mr-stack]` at every lane stop).
+        if census_tree.is_outermost() {
+            self.b5.publish();
+        }
+        // #router-r1: the tree's final progress sample (write-only).
+        self.router_tap(heap.len(), true);
+        // #phase-cost: the tree's work denominators for the run's cost census.
+        note_phase_cost_tree(&self.stats);
         // R9: the armed policy always leaves a receipt, so a run that observed
         // nothing is distinguishable from a run where the policy never loaded.
         self.closure.finish(
@@ -3780,15 +6917,48 @@ impl<'a> MarginRowBab<'a> {
             self.stats.closed,
             &stop,
         );
+        clip_head_finish();
         let mut verified = matches!(stop.as_str(), "verified_bestfirst" | "queue_empty");
-        if verified && self.cfg.deadline.is_some_and(|dl| Instant::now() > dl) {
+        // #publish-deadline: the tree has ALREADY finished with a verdict-bearing
+        // stop here, so gate publication on the publish deadline rather than on
+        // the search deadline's 3 s wrap-up reserve.
+        if verified
+            && self
+                .cfg
+                .effective_publish_deadline()
+                .is_some_and(|dl| Instant::now() > dl)
+        {
             stop = "wallclock_before_verdict".into();
             self.stats.stop.clone_from(&stop);
             verified = false;
         }
         if verified {
-            self.stats.ledger_ok = Some(self.ledger.kraft_ok() && self.nested_ledgers_ok);
-            Ok(MarginRowOutcome::Unsat(self.stats.clone()))
+            // #soundness-spine M2c: THE gate. The path-based cover, the class
+            // aggregation and (instance scope) the G2 guard, in BOTH proof
+            // profiles; a refusal is `Unknown`, never a verdict.
+            match authorize_frame(
+                &mut self.ledger,
+                &self.stats.tree_classes,
+                true,
+                self.eng.net,
+                self.eng.root,
+                self.mb.t,
+                re,
+                &self.cfg,
+            ) {
+                Ok(token) => {
+                    self.stats.ledger_ok = Some(true);
+                    Ok(MarginRowOutcome::Unsat(self.stats.clone(), token))
+                }
+                Err(reason) => {
+                    self.stats.ledger_ok = Some(false);
+                    self.stats.stop = "unsat_refused".into();
+                    Ok(MarginRowOutcome::Unknown {
+                        reason,
+                        stats: Some(self.stats.clone()),
+                    })
+                }
+            }
         } else {
             Ok(MarginRowOutcome::Unknown {
                 reason: stop,
@@ -3797,24 +6967,31 @@ impl<'a> MarginRowBab<'a> {
         }
     }
 
-    /// Gate-on parallel-frontier expansion. Evaluation and candidate selection
-    /// remain per-domain and rayon-parallel. Only ready domains' candidate
-    /// rows enter one cross-domain engine pass; results are returned in the
-    /// original pop order for the established serial heap merge.
+    /// Gate-on parallel-frontier expansion. Candidate selection remains
+    /// per-domain and rayon-parallel. Two cross-domain engine passes serve the
+    /// whole batch: the domains' MAIN eval passes (#mr-stack, throughput plan
+    /// B5 — see `bab/stack_eval.rs`; β / domain-alpha trials stay per domain)
+    /// and the ready domains' candidate-score rows. Results are returned in the
+    /// original pop order for the established serial heap merge, with the
+    /// batch's main-eval stacking receipt.
     fn expand_domain_stacked_batch(
         &self,
         batch: &[DomainEntry],
         packs: &[Arc<YPack>],
-    ) -> Result<Vec<ExpandStep>> {
+    ) -> Result<(Vec<ExpandStep>, stack_eval::StackReport)> {
         if batch.len() != packs.len() {
             return Err(NyError::InvalidSpec(
                 "margin_row: domain-stack batch/pack length mismatch".into(),
             ));
         }
-        let preps: Vec<Result<PreparedExpand>> = batch
-            .par_iter()
-            .zip(packs.par_iter())
-            .map(|(entry, pack)| self.prepare_expand(pack, entry))
+        // Each slot is exactly the `Result` the per-domain `eval_with_pack`
+        // returns for that domain, so the first error in pop order below is
+        // the one the unstaged path surfaced.
+        let (evals, stack_report) = self.eval_batch_stacked(batch, packs);
+        let preps: Vec<Result<PreparedExpand>> = evals
+            .into_par_iter()
+            .zip(batch.par_iter())
+            .map(|(eval, entry)| eval.and_then(|eval| self.prepare_from_eval(entry, eval)))
             .collect();
         let preps: Vec<PreparedExpand> = preps.into_iter().collect::<Result<_>>()?;
         let ready_idx: Vec<usize> = preps
@@ -3879,15 +7056,22 @@ impl<'a> MarginRowBab<'a> {
                 },
             }
         }
-        Ok(out)
+        Ok((out, stack_report))
     }
 
-    fn prepare_expand(&self, pack: &Arc<YPack>, entry: &DomainEntry) -> Result<PreparedExpand> {
+    /// The post-eval half of a gate-on expansion: the finite / closed /
+    /// no-candidate exits and candidate selection, from one domain's
+    /// [`EvalOut`] (however its main pass was dispatched).
+    fn prepare_from_eval(&self, entry: &DomainEntry, eval: EvalOut) -> Result<PreparedExpand> {
         let mode = self.eng.root.mode;
-        let (b_eval, mut st) = match self.eval_with_pack(pack, entry)? {
-            EvalOut::Infeasible(policy_execution) => {
+        let (b_eval, mut st) = match eval {
+            EvalOut::Infeasible(policy_execution, slack) => {
                 return Ok(PreparedExpand::Done(Box::new(ExpandStep::Infeasible(
                     DomainExecutionEvidence::before_selection(policy_execution, &self.cfg),
+                    Cert {
+                        kind: CertKind::Infeasible,
+                        value: slack,
+                    },
                 ))))
             }
             EvalOut::Deadline(policy_execution) => {
@@ -3904,8 +7088,14 @@ impl<'a> MarginRowBab<'a> {
         }
         let b = b_eval.max(entry.bound);
         if closed(mode, b) {
+            let hints = self.eval_hints(&st, b_eval < entry.bound);
             return Ok(PreparedExpand::Done(Box::new(ExpandStep::ClosedAtEval(
                 DomainExecutionEvidence::from_state(&st),
+                Cert {
+                    kind: st.close_src,
+                    value: b,
+                },
+                hints,
             ))));
         }
         let (trunk_cands, head_cands) = self.select_candidates(&mut st, entry);
@@ -3948,6 +7138,20 @@ impl<'a> MarginRowBab<'a> {
         let reduce_max = super::branch_reduce_max();
         let (pick, differs) = pick_candidate(ch, reduce_max);
         note_reduceop(reduce_max, "parallel", ch.len(), pick, differs);
+        // #branch-parent-lift: see `parent_lift`.
+        let lift = if super::parent_lift_enabled() {
+            let lift = parent_lift(ch);
+            note_parent_lift(
+                "parallel",
+                ch.len(),
+                ready.b,
+                lift,
+                closed(self.eng.root.mode, lift),
+            );
+            lift
+        } else {
+            f64::NEG_INFINITY
+        };
         let n_t = ready.trunk_cands.len();
         let chb = ch[pick];
         let mut pushes = Vec::new();
@@ -3955,16 +7159,26 @@ impl<'a> MarginRowBab<'a> {
         let mut worst_dip = 0.0f64;
         let mut closed_children = 0usize;
         let mut created_children = 0usize;
+        let mut close_kinds = ChildCloseKinds::default();
+        let mut closed_leaves: Vec<ClosedLeaf> = Vec::new();
+        let mode = self.eng.root.mode;
         for (d_i, dr) in [(0usize, 1i8), (1usize, -1i8)] {
             let raw = if d_i == 0 { chb.0 } else { chb.1 };
             if !raw.is_finite() {
                 return ExpandStep::NonFiniteBound(execution);
             }
+            // #soundness-spine M2c: the split this child slot carries.
+            let split = if pick < n_t {
+                let (li, pos) = ready.trunk_cands[pick];
+                ChildSplit::Trunk((li, pos, dr))
+            } else {
+                ChildSplit::Head((ready.head_cands[pick - n_t], dr))
+            };
             if raw < ready.b - 1e-9 {
                 dips += 1;
                 worst_dip = worst_dip.min(raw - ready.b);
             }
-            let cb = raw.max(ready.b);
+            let cb = raw.max(ready.b).max(lift);
             let (trunk_c, heads_c, ly_c, uy_c, betas_c, head_betas_c) = if pick < n_t {
                 super::prof::bump(super::prof::Counter::TrunkSplit, 1);
                 let (li, pos) = ready.trunk_cands[pick];
@@ -3998,6 +7212,15 @@ impl<'a> MarginRowBab<'a> {
                 if ly[i] > uy[i] + 1e-12 {
                     closed_children += 1;
                     created_children += 1;
+                    close_kinds.head_infeasible += 1;
+                    if close_telemetry_on(&self.cfg) {
+                        close_kinds.note_cert(CertKind::HeadInfeasible, ly[i] - uy[i]);
+                    }
+                    closed_leaves.push(ClosedLeaf {
+                        split,
+                        evidence: cert_mr::empty_evidence(mode, ly[i] - uy[i]),
+                        lift: false,
+                    });
                     continue;
                 }
                 let mut hc = entry.heads.clone();
@@ -4011,6 +7234,23 @@ impl<'a> MarginRowBab<'a> {
             created_children += 1;
             if closed(self.eng.root.mode, cb) {
                 closed_children += 1;
+                closed_leaves.push(ClosedLeaf {
+                    split,
+                    evidence: cert_mr::bound_evidence(mode, cb),
+                    lift: !closed(mode, raw),
+                });
+                let raw_closes = closed(self.eng.root.mode, raw);
+                close_kinds.note_scored(raw_closes);
+                if close_telemetry_on(&self.cfg) {
+                    close_kinds.note_cert(
+                        if raw_closes {
+                            CertKind::Raw
+                        } else {
+                            CertKind::Lift
+                        },
+                        cb,
+                    );
+                }
             } else {
                 pushes.push(ChildProto {
                     bound: cb,
@@ -4029,8 +7269,19 @@ impl<'a> MarginRowBab<'a> {
                     // #margin-row-domain-alpha: warm start (see
                     // `DomainEntry::alpha`).
                     alpha: ready.st.alpha.clone(),
+                    // #clip-stateful: monotone inheritance.
+                    clip_acc: ready.st.clip_acc.clone(),
+                    split_order: child_split_order(
+                        entry,
+                        self.cfg.initial_heads.len(),
+                        pick >= n_t,
+                    ),
                 });
             }
+        }
+        // #mr-close-telemetry: this OPEN parent's retirements (telemetry only).
+        if close_telemetry_on(&self.cfg) {
+            close_kinds.retire = ready.st.retire_certs;
         }
         ExpandStep::Expanded {
             dips,
@@ -4038,7 +7289,10 @@ impl<'a> MarginRowBab<'a> {
             pushes,
             closed_children,
             created_children,
-            execution,
+            close_kinds,
+            closed_leaves,
+            execution: Box::new(execution),
+            hints: self.eval_hints(&ready.st, false),
         }
     }
 
@@ -4047,9 +7301,13 @@ impl<'a> MarginRowBab<'a> {
     fn expand_one(&self, pack: &Arc<YPack>, entry: &DomainEntry) -> Result<ExpandStep> {
         let mode = self.eng.root.mode;
         let (b_eval, mut st) = match self.eval_with_pack(pack, entry)? {
-            EvalOut::Infeasible(policy_execution) => {
+            EvalOut::Infeasible(policy_execution, slack) => {
                 return Ok(ExpandStep::Infeasible(
                     DomainExecutionEvidence::before_selection(policy_execution, &self.cfg),
+                    Cert {
+                        kind: CertKind::Infeasible,
+                        value: slack,
+                    },
                 ))
             }
             EvalOut::Deadline(policy_execution) => {
@@ -4066,8 +7324,14 @@ impl<'a> MarginRowBab<'a> {
         }
         let b = b_eval.max(entry.bound);
         if closed(mode, b) {
+            let hints = self.eval_hints(&st, b_eval < entry.bound);
             return Ok(ExpandStep::ClosedAtEval(
                 DomainExecutionEvidence::from_state(&st),
+                Cert {
+                    kind: st.close_src,
+                    value: b,
+                },
+                hints,
             ));
         }
         let (trunk_cands, head_cands) = self.select_candidates(&mut st, entry);
@@ -4106,6 +7370,14 @@ impl<'a> MarginRowBab<'a> {
         let reduce_max = super::branch_reduce_max();
         let (pick, differs) = pick_candidate(&ch, reduce_max);
         note_reduceop(reduce_max, "parallel", ch.len(), pick, differs);
+        // #branch-parent-lift: see `parent_lift`.
+        let lift = if super::parent_lift_enabled() {
+            let lift = parent_lift(&ch);
+            note_parent_lift("parallel", ch.len(), b, lift, closed(mode, lift));
+            lift
+        } else {
+            f64::NEG_INFINITY
+        };
         let n_t = trunk_cands.len();
         let chb = ch[pick];
         let mut pushes = Vec::new();
@@ -4113,6 +7385,8 @@ impl<'a> MarginRowBab<'a> {
         let mut worst_dip = 0.0f64;
         let mut closed_children = 0usize;
         let mut created_children = 0usize;
+        let mut close_kinds = ChildCloseKinds::default();
+        let mut closed_leaves: Vec<ClosedLeaf> = Vec::new();
         for (d_i, dr) in [(0usize, 1i8), (1usize, -1i8)] {
             let raw = if d_i == 0 { chb.0 } else { chb.1 };
             if !raw.is_finite() {
@@ -4120,11 +7394,18 @@ impl<'a> MarginRowBab<'a> {
                     DomainExecutionEvidence::from_state(&st),
                 ));
             }
+            // #soundness-spine M2c: the split this child slot carries.
+            let split = if pick < n_t {
+                let (li, pos) = trunk_cands[pick];
+                ChildSplit::Trunk((li, pos, dr))
+            } else {
+                ChildSplit::Head((head_cands[pick - n_t], dr))
+            };
             if raw < b - 1e-9 {
                 dips += 1;
                 worst_dip = worst_dip.min(raw - b);
             }
-            let cb = raw.max(b);
+            let cb = raw.max(b).max(lift);
             let (trunk_c, heads_c, ly_c, uy_c, betas_c, head_betas_c) = if pick < n_t {
                 super::prof::bump(super::prof::Counter::TrunkSplit, 1);
                 let (li, pos) = trunk_cands[pick];
@@ -4158,6 +7439,15 @@ impl<'a> MarginRowBab<'a> {
                 if ly[i] > uy[i] + 1e-12 {
                     closed_children += 1;
                     created_children += 1;
+                    close_kinds.head_infeasible += 1;
+                    if close_telemetry_on(&self.cfg) {
+                        close_kinds.note_cert(CertKind::HeadInfeasible, ly[i] - uy[i]);
+                    }
+                    closed_leaves.push(ClosedLeaf {
+                        split,
+                        evidence: cert_mr::empty_evidence(mode, ly[i] - uy[i]),
+                        lift: false,
+                    });
                     continue;
                 }
                 let mut hc = entry.heads.clone();
@@ -4171,6 +7461,23 @@ impl<'a> MarginRowBab<'a> {
             created_children += 1;
             if closed(mode, cb) {
                 closed_children += 1;
+                closed_leaves.push(ClosedLeaf {
+                    split,
+                    evidence: cert_mr::bound_evidence(mode, cb),
+                    lift: !closed(mode, raw),
+                });
+                let raw_closes = closed(mode, raw);
+                close_kinds.note_scored(raw_closes);
+                if close_telemetry_on(&self.cfg) {
+                    close_kinds.note_cert(
+                        if raw_closes {
+                            CertKind::Raw
+                        } else {
+                            CertKind::Lift
+                        },
+                        cb,
+                    );
+                }
             } else {
                 pushes.push(ChildProto {
                     bound: cb,
@@ -4189,8 +7496,19 @@ impl<'a> MarginRowBab<'a> {
                     // #margin-row-domain-alpha: warm start (see
                     // `DomainEntry::alpha`).
                     alpha: st.alpha.clone(),
+                    // #clip-stateful: monotone inheritance.
+                    clip_acc: st.clip_acc.clone(),
+                    split_order: child_split_order(
+                        entry,
+                        self.cfg.initial_heads.len(),
+                        pick >= n_t,
+                    ),
                 });
             }
+        }
+        // #mr-close-telemetry: this OPEN parent's retirements (telemetry only).
+        if close_telemetry_on(&self.cfg) {
+            close_kinds.retire = st.retire_certs;
         }
         Ok(ExpandStep::Expanded {
             dips,
@@ -4198,7 +7516,10 @@ impl<'a> MarginRowBab<'a> {
             pushes,
             closed_children,
             created_children,
-            execution: DomainExecutionEvidence::from_state(&st),
+            close_kinds,
+            closed_leaves,
+            execution: Box::new(DomainExecutionEvidence::from_state(&st)),
+            hints: self.eval_hints(&st, false),
         })
     }
 
@@ -4264,6 +7585,7 @@ impl<'a> MarginRowBab<'a> {
                 root_precision_execution: Default::default(),
                 backward_interm_execution: Default::default(),
                 root_alpha_execution: Default::default(),
+                close_integrity: CloseIntegrityEvidence::default(),
             },
             epoch_failures: 0,
             ledger: Ledger::default(),
@@ -4274,6 +7596,7 @@ impl<'a> MarginRowBab<'a> {
             // and the tier stays at `TIER_BASE` — byte-identical to the
             // pre-policy driver rather than a hand-set tier.
             closure: super::closure::ClosureMonitor::new(false),
+            b5: stack_eval::B5Trace::default(),
         };
         bab.lru.put(Vec::new(), re.pack.clone());
         let mut entry = DomainEntry {
@@ -4289,6 +7612,8 @@ impl<'a> MarginRowBab<'a> {
             pc: Vec::new(),
             retired: Vec::new(),
             alpha: Vec::new(),
+            clip_acc: None,
+            split_order: 0,
         };
         let mut out = Vec::new();
         for _ in 0..steps {
@@ -4333,6 +7658,8 @@ impl<'a> MarginRowBab<'a> {
                         pc: c.pc,
                         retired: c.retired,
                         alpha: c.alpha,
+                        clip_acc: c.clip_acc,
+                        split_order: c.split_order,
                     };
                 }
                 _ => break,
@@ -4458,7 +7785,28 @@ impl<'a> MarginRowBab<'a> {
     /// the parallel-frontier lane reuses this across rayon workers. Every
     /// bound here is a deterministic function of `(pack, entry)`, so a domain's
     /// result is BIT-IDENTICAL whether evaluated serially or in a worker.
+    ///
+    /// #mr-stack (throughput plan B5): the body is split at the domain's main
+    /// certified pass — [`Self::eval_prepare`] (gates, y-box, seed, inherited
+    /// β/α state), [`Self::eval_main_pass`] (the pass itself), then
+    /// [`Self::eval_finish`] (per-column directs, via-y composition, both
+    /// ascents, retirement) — so the domain-stacked frontier can run ONE main
+    /// pass for a whole batch between the per-domain halves. This function is
+    /// those three calls in sequence: the same statements in the same order as
+    /// the unsplit body, so every existing caller is unchanged.
     fn eval_with_pack(&self, pack: &Arc<YPack>, entry: &DomainEntry) -> Result<EvalOut> {
+        let seeded = match self.eval_prepare(pack, entry)? {
+            EvalPrep::Done(out) => return Ok(*out),
+            EvalPrep::Seeded(seeded) => seeded,
+        };
+        let pass = self.eval_main_pass(&seeded)?;
+        self.eval_finish(entry, seeded, pass)
+    }
+
+    /// Everything a domain eval computes BEFORE its main certified pass (see
+    /// [`Self::eval_with_pack`]). `Done` carries the early exits (deadline,
+    /// empty region) exactly as the unsplit body returned them.
+    fn eval_prepare(&self, pack: &Arc<YPack>, entry: &DomainEntry) -> Result<EvalPrep> {
         let mut policy_execution = PolicyExecutionEvidence::from_config(&self.cfg);
         let epoch_execution = EpochExecutionEvidence::from_config(&self.cfg);
         let width_execution = WidthExecutionEvidence::from_config(&self.cfg);
@@ -4466,17 +7814,33 @@ impl<'a> MarginRowBab<'a> {
         // certified pass about to be spent.
         if self.deadline_hit() {
             poll_note("eval_node");
-            return Ok(EvalOut::Deadline(policy_execution));
+            return Ok(EvalPrep::Done(Box::new(EvalOut::Deadline(
+                policy_execution,
+            ))));
         }
         let mode = self.eng.root.mode;
-        let _t = super::prof::Timer::start(super::prof::Phase::EvalNode);
-        let dom = domain_gates(self.eng.root, &entry.trunk);
+        // Rides in `EvalSeeded` to the end of `eval_finish`, so `eval_node`
+        // still spans the whole evaluation (stacked or not).
+        let t_node = super::prof::Timer::start(super::prof::Phase::EvalNode);
+        // #clip-stateful: THE call site that gets the accumulated state. The
+        // y-pack producers deliberately stay stateless (see `domain_gates_acc`);
+        // this is the pass whose bound gates the frontier.
+        let (dom, clip_acc) = {
+            let _t = super::prof::Timer::start(super::prof::Phase::EvalGates);
+            domain_gates_acc(self.eng.root, &entry.trunk, entry.clip_acc.as_deref())
+        };
+        // #mr-close-telemetry / #soundness-spine M2c: each emptiness exit
+        // carries its certificate's slack — the cover leaf's evidence (the
+        // emptiness DECISIONS are unchanged).
         if dom.infeasible {
             // #clip-and-verify VERIFY: the split set's halfspaces make this
             // domain's region empty. Discharged without paying the ~600 ms
             // backward pass — the exact "child that never closes" converted
             // into an instant close.
-            return Ok(EvalOut::Infeasible(policy_execution));
+            return Ok(EvalPrep::Done(Box::new(EvalOut::Infeasible(
+                policy_execution,
+                dom.infeasible_slack,
+            ))));
         }
         let pack = pack.clone();
         let mut ybox = YBox {
@@ -4484,14 +7848,79 @@ impl<'a> MarginRowBab<'a> {
             uy: pack.uy0.clone(),
         };
         ybox.clamp(&entry.heads);
+        // #soundness-spine M2c: the crossing slack is the emptiness leaf's
+        // certified EVIDENCE now, not only telemetry, so it is computed on
+        // every emptiness exit (O(n_y); the DECISION is still `is_empty`).
         if ybox.is_empty() {
-            return Ok(EvalOut::Infeasible(policy_execution));
+            return Ok(EvalPrep::Done(Box::new(EvalOut::Infeasible(
+                policy_execution,
+                ybox_crossing(&ybox),
+            ))));
         }
         ybox.intersect(&entry.ly, &entry.uy);
         if ybox.is_empty() {
-            return Ok(EvalOut::Infeasible(policy_execution));
+            return Ok(EvalPrep::Done(Box::new(EvalOut::Infeasible(
+                policy_execution,
+                ybox_crossing(&ybox),
+            ))));
         }
-        let gates = head_gates(&ybox, mode);
+        // #clip-head: THE insertion point. A head sign fix moved exactly ONE
+        // interval above (`YBox::clamp`); here its halfspace re-concretizes the
+        // OTHER head columns before the relaxation gates are derived, which is
+        // the term alpha-beta-CROWN's `clip_interm_domain` earns most of its
+        // per-domain improvement from on the traced rows.
+        //
+        // Applied to the LOCAL box only. The pack is `Arc`-shared and its LRU is
+        // keyed by TRUNK splits alone, so every sibling with a different head
+        // state holds the same pack; writing back would leak one child's
+        // constraints into all of them.
+        let clip_head_on = crate::preset_gates::margin_row_clip_head_enabled();
+        clip_head_armed_once(clip_head_on);
+        if clip_head_on {
+            let t_ch = Instant::now();
+            let mut ch = ClipHeadOut {
+                heads: entry.heads.len(),
+                ..ClipHeadOut::default()
+            };
+            match pack.head_slack.as_ref() {
+                Some(slack) => {
+                    let step = super::clip::tighten_head_box(
+                        &pack.al,
+                        &pack.au,
+                        slack,
+                        &pack.ly_fwd,
+                        &pack.uy_fwd,
+                        &entry.heads,
+                        self.eng.root.mid.as_slice(),
+                        self.eng.root.rad.as_slice(),
+                        &mut ybox.ly,
+                        &mut ybox.uy,
+                        super::clip::HEAD_H_CAP,
+                        super::clip::HEAD_C_CAP,
+                    );
+                    ch.hs = step.hs;
+                    ch.cols = step.cols;
+                    ch.moved = step.moved;
+                    ch.sum_delta = step.sum_delta;
+                    ch.closes = step.closes;
+                    ch.refused_cross = step.refused_cross;
+                    ch.refused_hs = usize::from(step.refused_hs);
+                }
+                None => ch.frame_failed = 1,
+            }
+            clip_head_report(&ch, t_ch.elapsed().as_micros());
+            policy_execution.clip_head_evals = policy_execution
+                .clip_head_evals
+                .saturating_add(usize::from(ch.hs > 0));
+            policy_execution.clip_head_moved =
+                policy_execution.clip_head_moved.saturating_add(ch.moved);
+            policy_execution.clip_head_closes =
+                policy_execution.clip_head_closes.saturating_add(ch.closes);
+            policy_execution.clip_head_refused = policy_execution
+                .clip_head_refused
+                .saturating_add(ch.refused_cross + ch.refused_hs + ch.frame_failed);
+        }
+        let gates = head_gates_with(&ybox, mode, self.eng.root.head_alpha.as_deref());
         // #margin-row-col-retire: narrow the margin batch to the SURVIVING
         // columns. Every retired index carries a certified `closed()` bound
         // from an ANCESTOR region — a superset of this domain — so dropping
@@ -4526,7 +7955,10 @@ impl<'a> MarginRowBab<'a> {
         }
         let mb: &MarginBatch = mb_local.as_ref().unwrap_or(&self.mb);
         let nf = mb.nf();
-        let ms = margin_seed(mb, &gates, &ybox, mode);
+        let ms = {
+            let _t = super::prof::Timer::start(super::prof::Phase::EvalSeed);
+            margin_seed(mb, &gates, &ybox, mode)
+        };
         // #margin-row-beta (NY_MARGIN_ROW_BETA=1, default OFF): attach the
         // entry's inherited split Lagrangians before the pass. Disarmed, the
         // beta map stays empty, the seed is the untouched base margin seed,
@@ -4622,7 +8054,29 @@ impl<'a> MarginRowBab<'a> {
         // Disarmed: `alpha_slots` stays empty, no gate is written, and every
         // pass below is bit-identical to the pre-domain-alpha lane.
         let alpha_policy = self.cfg.domain_alpha_policy.normalized();
-        let alpha_armed = alpha_policy.enabled;
+        // #dom-alpha-closure-gate: the policy's `enabled` is FROZEN into the config
+        // at `margin_row/mod.rs:537`, before any tree exists, so a tier check there
+        // is always evaluated at TIER_BASE. This site is inside the expansion loop,
+        // so the closure tier here is LIVE.
+        //
+        // MEASURED 2026-08-31: armed unconditionally, domain_alpha CONVERTS
+        // idx_5127_sidx_993 (certified, 5/5 reps, under all six cost settings) but
+        // LOSES 4 banked proofs to its own wall cost -- net -30, and -10 at best
+        // across every stride/min_depth/iters dial, with two losses that never
+        // return. The cost is structural, not a tuning artifact.
+        //
+        // The discriminator is the lane's OWN child-closure fraction: idx_5127
+        // escalates to tier 3 because its closure collapses (which is exactly why
+        // it cannot finish), while the rows domain_alpha loses are banked unsats
+        // that PROVE -- healthy closure, ladder never leaves TIER_BASE. Gating here
+        // spends the ascent only where the lane has already stalled, i.e. where the
+        // row was going to be lost anyway and the cost is therefore free.
+        //
+        // A STATIC gate on banked wall was tested and REFUTED: eight held rows sit
+        // at or above the lowest lost wall, and a row banked at 95.3s held while one
+        // at 75.0s was lost. Only a runtime progress signal separates them.
+        let alpha_armed =
+            alpha_policy.enabled || super::closure::tier() >= super::closure::TIER_BETA_DEEP;
         let mut alpha_slots: Vec<super::domain_alpha::Slot> = Vec::new();
         let mut alpha_cur: Vec<f64> = Vec::new();
         let mut alpha_warm = 0usize;
@@ -4710,7 +8164,50 @@ impl<'a> MarginRowBab<'a> {
             } else {
                 None
             };
-        let collect = Collect {
+        // The main pass's y-box magnitudes for the certified GPU seam (see
+        // `eval_main_pass`); computed here, where the unsplit body computed
+        // them, from the final local y-box.
+        let eval_y_abs: Vec<f64> = ybox
+            .ly
+            .iter()
+            .zip(&ybox.uy)
+            .map(|(l, u)| l.abs().max(u.abs()))
+            .collect();
+        Ok(EvalPrep::Seeded(Box::new(EvalSeeded {
+            t_node,
+            policy_execution,
+            epoch_execution,
+            width_execution,
+            clip_acc,
+            pack,
+            ybox,
+            gates,
+            mb_local,
+            survivors,
+            ms,
+            beta_armed,
+            betas,
+            head_betas,
+            beta_step,
+            percol,
+            pc,
+            head_admissible,
+            dom,
+            alpha_policy,
+            alpha_armed,
+            alpha_slots,
+            alpha_cur,
+            alpha_warm,
+            seed_main,
+            seed_main_pc,
+            eval_y_abs,
+        })))
+    }
+
+    /// The collection spec every certified pass of one domain eval uses (the
+    /// main pass and its β / domain-alpha trials).
+    fn eval_collect(&self, unst_rows: bool) -> Collect<'_> {
+        Collect {
             unst_abs: true,
             rows: if self.cfg.epoch_policy.tier0_exact > 0 {
                 self.cfg.retained.as_deref()
@@ -4722,8 +8219,14 @@ impl<'a> MarginRowBab<'a> {
             // read-only row copy taken BEFORE the domain-stack branch, so a
             // captured pass's bound is bit-identical to an uncaptured one — it
             // costs memory and a memcpy, and it refuses the dark GPU seam.
-            unst_rows: beta_armed || alpha_armed,
-        };
+            unst_rows,
+        }
+    }
+
+    /// One domain's OWN main certified pass (the per-domain half of
+    /// [`Self::eval_with_pack`]; the domain-stacked frontier's fallback).
+    fn eval_main_pass(&self, seeded: &EvalSeeded) -> Result<PassOut> {
+        let nf = self.seeded_mb(seeded).nf();
         // B5 (#margin-row-gpu-eft, SITE_EVAL): the ~600 ms main pass — 43.4%
         // of the lane — routes through the certified GPU lane's own seam.
         // Dark and fail-closed: with the lane disarmed (or on ANY refusal —
@@ -4733,28 +8236,75 @@ impl<'a> MarginRowBab<'a> {
         // error, so the lane needs the y-box magnitudes to concretize both
         // discrepancies into the bias-error lane (the `seed_penalty`
         // contract, same as the root pass at bab.rs:910-919).
-        let eval_y_abs: Vec<f64> = ybox
-            .ly
-            .iter()
-            .zip(&ybox.uy)
-            .map(|(l, u)| l.abs().max(u.abs()))
-            .collect();
         let lane_ctx = super::gpu_backward::LaneCtx {
-            y_abs: Some(&eval_y_abs),
+            y_abs: Some(&seeded.eval_y_abs),
             deadline: self.cfg.deadline,
             plan_cache: Some(&self.lane_cache),
         };
-        let mut pass = self.eng.run_collect_seamed(
-            seed_main_pc
-                .as_ref()
-                .or(seed_main.as_ref())
-                .unwrap_or(&ms.seed),
-            Some(&dom),
+        let _t_pass = super::prof::Timer::start(super::prof::Phase::EvalPass);
+        let _census_pass = super::census::SiteTimer::start(super::census::Site::EvalMain, nf);
+        self.eng.run_collect_seamed(
+            seeded.main_seed(),
+            Some(&seeded.dom),
             super::engine::LaneDir::Lower,
-            collect,
+            self.eval_collect(seeded.unst_rows()),
             &lane_ctx,
-        )?;
-        let per_j = per_class_direct(&self.eng, &pass, &ms, 0..nf);
+        )
+    }
+
+    /// The margin batch a seeded domain's seed was built under.
+    fn seeded_mb<'s>(&'s self, seeded: &'s EvalSeeded) -> &'s MarginBatch {
+        seeded.mb_local.as_ref().unwrap_or(&self.mb)
+    }
+
+    /// Everything a domain eval computes AFTER its main certified pass (see
+    /// [`Self::eval_with_pack`]), given that pass — the domain's own, or its
+    /// block of a domain-stacked pass (bit-identical by construction).
+    fn eval_finish(
+        &self,
+        entry: &DomainEntry,
+        seeded: Box<EvalSeeded>,
+        mut pass: PassOut,
+    ) -> Result<EvalOut> {
+        let EvalSeeded {
+            t_node: _t_node,
+            mut policy_execution,
+            epoch_execution,
+            width_execution,
+            clip_acc,
+            pack,
+            ybox,
+            gates,
+            mb_local,
+            survivors,
+            ms,
+            beta_armed,
+            mut betas,
+            mut head_betas,
+            mut beta_step,
+            percol,
+            mut pc,
+            head_admissible,
+            mut dom,
+            alpha_policy,
+            alpha_armed,
+            alpha_slots,
+            mut alpha_cur,
+            alpha_warm,
+            seed_main,
+            seed_main_pc,
+            eval_y_abs: _,
+        } = *seeded;
+        let mode = self.eng.root.mode;
+        let retire_on = self.cfg.col_retire;
+        let mb: &MarginBatch = mb_local.as_ref().unwrap_or(&self.mb);
+        let nf = mb.nf();
+        let collect = self.eval_collect(beta_armed || alpha_armed);
+        let per_j = {
+            let _t = super::prof::Timer::start(super::prof::Phase::EvalDirect);
+            per_class_direct(&self.eng, &pass, &ms, 0..nf)
+        };
+        let _t_compose = super::prof::Timer::start(super::prof::Phase::EvalCompose);
         let m2v = compose_viay(
             &self.eng,
             mb,
@@ -4765,6 +8315,7 @@ impl<'a> MarginRowBab<'a> {
             &pack.au_dots,
             mode,
         );
+        drop(_t_compose);
         // #margin-row-col-retire: certified per-column direct values backing
         // the retirement decision below. Accepted β trials refresh it — every
         // accepted `per_t[c]` is a valid column bound by per-column weak
@@ -4806,6 +8357,11 @@ impl<'a> MarginRowBab<'a> {
         // `beta_step` (accept ×1.5 capped, reject ×0.5, floor LAMBDA_MIN).
         // `NY_MARGIN_ROW_BETA_POLYAK=0` restores the legacy η sign-step
         // (reset each eval) so the A/B lives in one binary.
+        //
+        // #mr-close-telemetry: the main pass's bound, before any ascent (the
+        // β and domain-alpha ascents below only ever raise `b`, and each runs
+        // only while `b` is still open). Telemetry only.
+        let b_main = b;
         if beta_armed && !closed(mode, b) && percol {
             // ---- #margin-row-beta-percol ascent ----
             // Each of the K worst failing columns steps ITS OWN β from ITS
@@ -4852,6 +8408,7 @@ impl<'a> MarginRowBab<'a> {
                 let n_t = entry.trunk.len();
                 let mut execution_observed = false;
                 'ascent: for _ in 0..super::beta::iters() {
+                    let _t_beta = super::prof::Timer::start(super::prof::Phase::EvalBeta);
                     if self.cfg.deadline.is_some_and(|dl| Instant::now() > dl) {
                         break;
                     }
@@ -4983,16 +8540,22 @@ impl<'a> MarginRowBab<'a> {
                     } else {
                         None
                     };
-                    let trial = self.eng.run_collect(
-                        seed_trial
-                            .as_ref()
-                            .or(seed_main.as_ref())
-                            .unwrap_or(&ms.seed),
-                        Some(&dom),
-                        super::engine::LaneDir::Lower,
-                        None,
-                        collect,
-                    );
+                    let trial = {
+                        let _census = super::census::SiteTimer::start(
+                            super::census::Site::BetaTrialPercol,
+                            nf,
+                        );
+                        self.eng.run_collect(
+                            seed_trial
+                                .as_ref()
+                                .or(seed_main.as_ref())
+                                .unwrap_or(&ms.seed),
+                            Some(&dom),
+                            super::engine::LaneDir::Lower,
+                            None,
+                            collect,
+                        )
+                    };
                     let Ok(mut trial) = trial else { break };
                     let per_t = per_class_direct(&self.eng, &trial, &ms, 0..nf);
                     let mut any_accept = false;
@@ -5092,6 +8655,11 @@ impl<'a> MarginRowBab<'a> {
                 let mut t_last = 0.0f64;
                 let n_t = entry.trunk.len();
                 for _ in 0..super::beta::iters() {
+                    // #mr-census plan B1(a): the SHARED-β arm now carries the
+                    // same per-iteration `EvalBeta` phase timer as the per-column
+                    // arm, so the profile attributes its trials instead of
+                    // leaving them in the eval_node residue.
+                    let _t_beta = super::prof::Timer::start(super::prof::Phase::EvalBeta);
                     if self.cfg.deadline.is_some_and(|dl| Instant::now() > dl) {
                         break;
                     }
@@ -5149,13 +8717,19 @@ impl<'a> MarginRowBab<'a> {
                     // x*/vsigns the direction refresh below reads (the capture
                     // is a read-only row copy; the trial bound is
                     // bit-identical to an uncaptured pass).
-                    let trial = self.eng.run_collect(
-                        seed_trial.as_ref().unwrap_or(&ms.seed),
-                        Some(&dom),
-                        super::engine::LaneDir::Lower,
-                        None,
-                        collect,
-                    );
+                    let trial = {
+                        let _census = super::census::SiteTimer::start(
+                            super::census::Site::BetaTrialShared,
+                            nf,
+                        );
+                        self.eng.run_collect(
+                            seed_trial.as_ref().unwrap_or(&ms.seed),
+                            Some(&dom),
+                            super::engine::LaneDir::Lower,
+                            None,
+                            collect,
+                        )
+                    };
                     let Ok(mut trial) = trial else { break };
                     let per_t = per_class_direct(&self.eng, &trial, &ms, 0..nf);
                     let mut bt = f64::INFINITY;
@@ -5259,6 +8833,8 @@ impl<'a> MarginRowBab<'a> {
                 );
             }
         }
+        // #mr-close-telemetry: the bound after the β ascent (telemetry only).
+        let b_beta = b;
         // ---- #margin-row-domain-alpha ascent ----
         //
         // Re-optimize this domain's lower-line slopes against ITS OWN gates.
@@ -5321,6 +8897,7 @@ impl<'a> MarginRowBab<'a> {
                 != super::DomainAlphaRuntimePolicy::default().eta.to_bits();
             let mut grad = {
                 let t = Instant::now();
+                let _census = super::census::SiteTimer::start(super::census::Site::WalkAlpha, 1);
                 let g = super::alpha_opt::supergradient(
                     self.eng.net,
                     self.eng.root,
@@ -5377,16 +8954,20 @@ impl<'a> MarginRowBab<'a> {
                 // valid bound of this domain; at worst it is scored slightly
                 // loose, and acceptance is `> b` regardless.
                 let t_trial = Instant::now();
-                let trial = self.eng.run_collect(
-                    seed_main_pc
-                        .as_ref()
-                        .or(seed_main.as_ref())
-                        .unwrap_or(&ms.seed),
-                    Some(&dom),
-                    super::engine::LaneDir::Lower,
-                    None,
-                    collect,
-                );
+                let trial = {
+                    let _census =
+                        super::census::SiteTimer::start(super::census::Site::AlphaTrial, nf);
+                    self.eng.run_collect(
+                        seed_main_pc
+                            .as_ref()
+                            .or(seed_main.as_ref())
+                            .unwrap_or(&ms.seed),
+                        Some(&dom),
+                        super::engine::LaneDir::Lower,
+                        None,
+                        collect,
+                    )
+                };
                 super::domain_alpha::charge_trial(t_trial.elapsed().as_micros() as u64);
                 let Ok(mut trial) = trial else {
                     cap_boundary_reachable = false;
@@ -5474,6 +9055,8 @@ impl<'a> MarginRowBab<'a> {
                     // consults `grad` to decide whether one more trial was
                     // possible, so the refresh must run on every accept.
                     let t = Instant::now();
+                    let census_walk =
+                        super::census::SiteTimer::start(super::census::Site::WalkAlpha, 1);
                     grad = super::alpha_opt::supergradient(
                         self.eng.net,
                         self.eng.root,
@@ -5481,6 +9064,7 @@ impl<'a> MarginRowBab<'a> {
                         &pass,
                         worst_col,
                     );
+                    drop(census_walk);
                     super::domain_alpha::charge_grad(t.elapsed().as_micros() as u64);
                     if grad.is_none() {
                         cap_boundary_reachable = false;
@@ -5579,9 +9163,14 @@ impl<'a> MarginRowBab<'a> {
         // (direct/m1/m2v), so a retired column is exactly one the ancestor
         // PROVED on a region containing every descendant.
         let mut retired_out = entry.retired.clone();
+        // #mr-close-telemetry: each newly retired column's certified composite
+        // — its whole certificate on this domain's subtree when the domain
+        // stays open. Telemetry only.
+        let mut retire_certs = CertTally::default();
         if retire_on {
             let tracked = per_track.as_deref().unwrap_or(per_j.as_slice());
             let mut newly = 0usize;
+            let close_telemetry = close_telemetry_on(&self.cfg);
             for c in 0..nf {
                 let comp = tracked[c].max(ms.m1[c]).max(m2v[c]);
                 if closed(mode, comp) {
@@ -5593,6 +9182,9 @@ impl<'a> MarginRowBab<'a> {
                         if !retired_out.contains(&c16) {
                             retired_out.push(c16);
                             newly += 1;
+                            if close_telemetry {
+                                retire_certs.note(comp);
+                            }
                         }
                     }
                 }
@@ -5617,6 +9209,15 @@ impl<'a> MarginRowBab<'a> {
         }
         let coll = pass.coll.take().unwrap_or_default();
         let coll_rows = pass.coll_rows.take().unwrap_or_default();
+        // #mr-close-telemetry: the first stage whose bound closed (read only
+        // when `b` closes; see `b_main` / `b_beta`). Telemetry only.
+        let close_src = if closed(mode, b_main) {
+            CertKind::Eval
+        } else if closed(mode, b_beta) {
+            CertKind::Beta
+        } else {
+            CertKind::DomainAlpha
+        };
         Ok(EvalOut::Node(
             b,
             Box::new(NodeState {
@@ -5634,12 +9235,15 @@ impl<'a> MarginRowBab<'a> {
                 epoch_selection: EpochSelectionObservation::default(),
                 width_selection: WidthSelectionObservation::default(),
                 alpha: alpha_out,
+                clip_acc,
                 mb_local,
                 coll,
                 coll_rows,
                 pass,
                 dom,
                 pack,
+                close_src,
+                retire_certs,
             }),
         ))
     }
@@ -6062,6 +9666,9 @@ impl<'a> MarginRowBab<'a> {
             // the refreshed frame deliberately changes that index space.
             (eroot, None)
         } else {
+            // #epoch-carry: snapshot the root's per-layer alpha as the seed.
+            let epoch_alpha_seed: Vec<Vec<f64>> =
+                root.layers.iter().map(|l| l.alpha.clone()).collect();
             let built = RootGates::build_retaining_with_policy(
                 net,
                 &root.lo,
@@ -6071,7 +9678,21 @@ impl<'a> MarginRowBab<'a> {
                 self.cfg.retain_cfg.as_ref(),
                 &abs,
                 self.cfg.root_precision_policy,
-                super::BackwardIntermRuntimePolicy::default(),
+                // #epoch-carry: the RUN's BI policy, not `default()` (enabled:
+                // false). Passing the default made every epoch rebuild discard
+                // the root's #backward-interm tightening — the decl records 584
+                // discarded columns on idx_4169 — while `inherit_parent_intervals`
+                // then paid +0.0732 to claw part of it back AFTER the walk, which
+                // recovers the intervals but none of the downstream compounding.
+                self.cfg.backward_interm_policy,
+                // #epoch-carry: seed the rebuild with the root's alpha instead of
+                // re-deriving the `gates_from_box` area heuristic. Sound because
+                // ANY alpha in [0,1] is a valid lower relaxation, and
+                // `build_retaining_inner` re-derives `ms = max(alpha, s)` from the
+                // seeded alpha on commit, which is the one alpha-coupled certified
+                // quantity. Without this an epoch throws away `alpha_opt`'s gain
+                // (+0.019..+0.059 measured 2026-08-30) on every fire.
+                Some(&epoch_alpha_seed),
             );
             let Ok(pair) = built else {
                 // Rebuild failed (deadline / numeric): normal expansion instead.
@@ -6126,6 +9747,9 @@ impl<'a> MarginRowBab<'a> {
         let (nested_epoch_depth, nested_epoch_attempts, nested_epoch_generations) =
             self.cfg.nested_epoch_limits(incremental);
         let ncfg = BabConfig {
+            // #publish-deadline: a nested epoch subtree inherits the parent's
+            // publication authority unchanged.
+            publish_deadline: self.cfg.publish_deadline,
             k_head: self.cfg.k_head,
             contextual_k_head: self.cfg.contextual_k_head,
             k_trunk: self.cfg.k_trunk,
@@ -6145,6 +9769,7 @@ impl<'a> MarginRowBab<'a> {
             frontier: 1,
             frontier_contextual: 1,
             domain_stack: false,
+            domain_stack_main_eval: self.cfg.domain_stack_main_eval,
             domain_alpha_policy: self.cfg.domain_alpha_policy,
             epoch_policy: self.cfg.epoch_policy,
             epoch_frame_route: if incremental {
@@ -6160,6 +9785,8 @@ impl<'a> MarginRowBab<'a> {
             retain_cfg: self.cfg.retain_cfg,
             initial_heads: entry.heads.clone(),
             initial_ybox: Some((entry.ly.clone(), entry.uy.clone())),
+            // Head-group certificates cover only the unconditional outer box.
+            head_groups: None,
             // #margin-row-col-retire: the nested lane re-derives its own root
             // fail-set on the epoch gates; the outer retirement set is NOT
             // inherited (root frames differ), only the gate carries over.
@@ -6168,9 +9795,17 @@ impl<'a> MarginRowBab<'a> {
             beta_columns: self.cfg.beta_columns,
             parallel_prebuild: self.cfg.parallel_prebuild,
             root_precision_policy: self.cfg.root_precision_policy,
+            backward_interm_policy: self.cfg.backward_interm_policy,
             root_precision_execution: self.cfg.root_precision_execution,
             backward_interm_execution: self.cfg.backward_interm_execution,
             root_alpha_execution: self.cfg.root_alpha_execution,
+            // #wave-beta-bab: a nested epoch frame is a ReLU-split subdomain;
+            // it always runs the legacy tree.
+            wave: wave::WavePolicy::default(),
+            // The frozen-dual tier runs on the outer frame only.
+            frozen_dual_tier: self.cfg.frozen_dual_tier,
+            #[cfg(test)]
+            close_telemetry_off: self.cfg.close_telemetry_off,
         };
         let adv = self.stats.tree_classes.clone();
         // Entry-frozen presence semantics: `NY_EPOCH_DEBUG=0` and an empty
@@ -6191,8 +9826,33 @@ impl<'a> MarginRowBab<'a> {
         let t_epoch = Instant::now();
         self.stats.epoch_execution.nested_started =
             self.stats.epoch_execution.nested_started.saturating_add(1);
-        match MarginRowBab::run_inner(net, &eroot, self.mb.t, &adv, ncfg) {
-            Ok(MarginRowOutcome::Unsat(n)) => {
+        // Proof bundle v2: the nested frame's root is this leaf's region; its
+        // hints carry the leaf's ABSOLUTE literals (translated with THIS
+        // frame's root) as their prefix. Hint data only.
+        let nested_prefix = if self.ledger.hints.capturing() {
+            let map = SiteMap::from_root(self.eng.root, self.eng.net);
+            let own = hint_splits(
+                &entry.trunk,
+                &entry.heads,
+                self.cfg.initial_heads.len(),
+                entry.split_order,
+                &[],
+                &[],
+                None,
+            )
+            .and_then(|(splits, _)| map.absolute(&splits))
+            .unwrap_or_default();
+            let mut p = self.ledger.hint_prefix.clone();
+            p.extend(own);
+            p
+        } else {
+            Vec::new()
+        };
+        match MarginRowBab::run_inner(net, &eroot, self.mb.t, &adv, ncfg, nested_prefix) {
+            Ok(MarginRowOutcome::Unsat(n, token)) => {
+                // #soundness-spine M2c: the nested frame's sub-domain token is
+                // the evidence of the leaf the caller records next.
+                self.ledger.pending_subtree = Some(token);
                 super::prof::bump(super::prof::Counter::EpochClosed, 1);
                 if dbg {
                     eprintln!(
@@ -6239,6 +9899,14 @@ impl<'a> MarginRowBab<'a> {
                     .stats
                     .max_depth
                     .max(entry.trunk.len() + entry.heads.len() + n.max_depth);
+                // #mr-close-telemetry: the CLOSED subtree's certificates are
+                // this domain's proof (its root closes become `epoch_root`).
+                // A failed epoch's closes are not, and are never absorbed.
+                if close_telemetry_on(&self.cfg) {
+                    self.stats.close_integrity.absorb_nested(&n.close_integrity);
+                    self.stats.close_integrity.epoch_closes =
+                        self.stats.close_integrity.epoch_closes.saturating_add(1);
+                }
                 true
             }
             Ok(MarginRowOutcome::Unknown { stats, .. }) => {
@@ -6730,11 +10398,14 @@ impl<'a> MarginRowBab<'a> {
                 "margin_row: domain-stack assembly mismatch".into(),
             ));
         }
+        let census_score =
+            super::census::SiteTimer::start(super::census::Site::ScoreStacked, total);
         let pass = self.eng.run_domain_stacked(
             &Seed { s: seed, e: seed_e },
             &blocks,
             super::engine::LaneDir::Lower,
         )?;
+        drop(census_score);
         let low = self.eng.concretize_lower(&pass);
         if low.len() != total {
             return Err(NyError::InvalidSpec(
@@ -6749,6 +10420,18 @@ impl<'a> MarginRowBab<'a> {
             let nf = domain.nf;
             let width = domain.seed.s.ncols();
             let mut out = Vec::with_capacity(domain.n_candidates);
+            // #branch-parent-lift PERCOL probe — THIS is the scored site: the
+            // concurrent cifar100 lane runs the stacked scorer, so probing only
+            // the serial one would print nothing on a scored run (the "partial
+            // fixes of a set measure exactly zero" trap this file already
+            // records for #branch-reduceop).
+            let probe = super::parent_lift_enabled();
+            let mut percol = if probe {
+                vec![f64::NEG_INFINITY; nf]
+            } else {
+                Vec::new()
+            };
+            let mut side0 = if probe { vec![0.0f64; nf] } else { Vec::new() };
             for kc in 0..domain.n_candidates {
                 let mut pair = [f64::INFINITY, f64::INFINITY];
                 for (d_i, p) in pair.iter_mut().enumerate() {
@@ -6776,7 +10459,18 @@ impl<'a> MarginRowBab<'a> {
                                 "margin_row: non-finite stacked child bound".into(),
                             ));
                         }
-                        worst = worst.min(v.max(domain.m1[ri]));
+                        let vv = v.max(domain.m1[ri]);
+                        if probe {
+                            if d_i == 0 {
+                                side0[f] = vv;
+                            } else {
+                                let both = side0[f].min(vv);
+                                if both > percol[f] {
+                                    percol[f] = both;
+                                }
+                            }
+                        }
+                        worst = worst.min(vv);
                     }
                     if !worst.is_finite() {
                         return Err(NyError::NumericalInstability(
@@ -6786,6 +10480,11 @@ impl<'a> MarginRowBab<'a> {
                     *p = worst;
                 }
                 out.push((pair[0], pair[1]));
+            }
+            if probe {
+                let percol_lift = percol.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+                let collapsed = parent_lift(&out);
+                note_parent_lift_percol("stacked", nf, out.len(), collapsed, percol_lift);
             }
             all.push(out);
             offset += width;
@@ -6946,6 +10645,7 @@ impl<'a> MarginRowBab<'a> {
             deadline: self.cfg.deadline,
             plan_cache: Some(&self.lane_cache),
         };
+        let census_score = super::census::SiteTimer::start(super::census::Site::Score, total);
         let pass = self.eng.run_exc_seamed(
             &Seed { s: seed, e: seed_e },
             Some(&st.dom),
@@ -6953,8 +10653,19 @@ impl<'a> MarginRowBab<'a> {
             &exc,
             &lane_ctx,
         )?;
+        drop(census_score);
         let low = self.eng.concretize_lower(&pass);
         let mut out = Vec::with_capacity(n_t + n_h);
+        // #branch-parent-lift PERCOL probe (see `note_parent_lift_percol`):
+        // per COLUMN, the best over candidates of that candidate's worse child.
+        // Read-only bookkeeping over values the fold below already validated.
+        let probe = super::parent_lift_enabled();
+        let mut percol = if probe {
+            vec![f64::NEG_INFINITY; nf]
+        } else {
+            Vec::new()
+        };
+        let mut side0 = if probe { vec![0.0f64; nf] } else { Vec::new() };
         for kc in 0..(n_t + n_h) {
             let mut pair = [f64::INFINITY, f64::INFINITY];
             for (d_i, p) in pair.iter_mut().enumerate() {
@@ -6981,7 +10692,18 @@ impl<'a> MarginRowBab<'a> {
                             "margin_row: non-finite child bound".into(),
                         ));
                     }
-                    worst = worst.min(v.max(m1[r0 + f]));
+                    let vv = v.max(m1[r0 + f]);
+                    if probe {
+                        if d_i == 0 {
+                            side0[f] = vv;
+                        } else {
+                            let both = side0[f].min(vv);
+                            if both > percol[f] {
+                                percol[f] = both;
+                            }
+                        }
+                    }
+                    worst = worst.min(vv);
                 }
                 if !worst.is_finite() {
                     return Err(NyError::NumericalInstability(
@@ -6991,6 +10713,11 @@ impl<'a> MarginRowBab<'a> {
                 *p = worst;
             }
             out.push((pair[0], pair[1]));
+        }
+        if probe {
+            let percol_lift = percol.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+            let collapsed = parent_lift(&out);
+            note_parent_lift_percol("serial", nf, out.len(), collapsed, percol_lift);
         }
         Ok(Some(out))
     }
@@ -7040,7 +10767,9 @@ mod reduceop_tests {
 
 #[cfg(test)]
 mod ledger_tests {
-    use super::{closed, require_finite, BabConfig, Ledger, RoundMode};
+    use super::{
+        closed, require_finite, BabConfig, ChildSplit, HeadFix, Ledger, RoundMode, TrunkSplit,
+    };
 
     #[test]
     fn incremental_epoch_generation_budget_never_resets_in_nested_drivers() {
@@ -7103,39 +10832,126 @@ mod ledger_tests {
         }
     }
 
+    /// #soundness-spine M2c: a margin-row tree recorded through the lane's
+    /// own IR (trunk splits, head fixes, child splits) proves its cover.
     #[test]
-    fn kraft_accepts_complete_trees() {
-        for depths in [vec![0u32], vec![1, 1], vec![1, 2, 2], vec![2, 2, 2, 3, 3]] {
-            let mut l = Ledger::default();
-            for d in depths.iter() {
-                l.leaf(*d as usize);
-            }
-            assert!(l.kraft_ok(), "complete tree {depths:?} rejected");
-        }
-    }
-
-    #[test]
-    fn kraft_rejects_missing_or_extra_leaves() {
-        for depths in [
-            vec![1u32],    // missing sibling
-            vec![1, 2],    // missing 2
-            vec![1, 1, 2], // extra leaf
-            vec![0, 1],    // root plus child
-            vec![],        // empty
-        ] {
-            let mut l = Ledger::default();
-            for d in depths.iter() {
-                l.leaf(*d as usize);
-            }
-            assert!(!l.kraft_ok(), "incomplete tree {depths:?} accepted");
-        }
-    }
-
-    #[test]
-    fn kraft_rejects_overflow_depth() {
+    fn cover_ledger_accepts_complete_margin_row_trees() {
+        use crate::certify::margin_row::{bound_evidence, empty_evidence, leaf_path};
+        let mode = RoundMode::Outward;
+        // Root split on head 3; the ON side splits trunk (0, 2); the OFF side
+        // closes as a head-infeasible child, and the ON side's children close
+        // as a scored child and an evaluated entry respectively.
         let mut l = Ledger::default();
-        l.leaf(500);
-        assert!(!l.kraft_ok());
+        l.cover.leaf(
+            leaf_path(&[], &[], &[], Some(ChildSplit::Head((3, -1)))),
+            empty_evidence(mode, 1e-3),
+        );
+        l.cover.leaf(
+            leaf_path(&[(0, 2, 1)], &[(3, 1)], &[], None),
+            bound_evidence(mode, 0.25),
+        );
+        l.cover.leaf(
+            leaf_path(&[], &[(3, 1)], &[], Some(ChildSplit::Trunk((0, 2, -1)))),
+            bound_evidence(mode, 1e-9),
+        );
+        let cover = l.cover.prove(&[4, 7]).expect("complete tree");
+        assert_eq!(cover.leaves(), 3);
+        assert_eq!(cover.empty_leaves(), 1);
+        assert_eq!(cover.min_margin().to_bits(), 1e-9f64.to_bits());
+        // A nested frame records BELOW its inherited heads.
+        let mut nested = Ledger::default();
+        let root_heads = [(3usize, 1i8)];
+        nested.cover.leaf(
+            leaf_path(&[(1, 0, 1)], &root_heads, &root_heads, None),
+            bound_evidence(mode, 0.5),
+        );
+        nested.cover.leaf(
+            leaf_path(&[(1, 0, -1)], &root_heads, &root_heads, None),
+            bound_evidence(mode, 0.5),
+        );
+        assert!(nested.cover.proves_cover(&[4]));
+    }
+
+    /// The depth-only Kraft ledger this replaces accepted both of these; the
+    /// path gate refuses both, and refuses the ordinary incomplete shapes.
+    #[test]
+    fn cover_ledger_refuses_incomplete_margin_row_trees() {
+        use crate::certify::margin_row::{bound_evidence, leaf_path};
+        let mode = RoundMode::Outward;
+        let record = |leaves: &[(Vec<TrunkSplit>, Vec<HeadFix>)]| {
+            let mut l = Ledger::default();
+            for (trunk, heads) in leaves {
+                l.cover.leaf(
+                    leaf_path(trunk, heads, &[], None),
+                    bound_evidence(mode, 0.5),
+                );
+            }
+            l
+        };
+        let different_sites = record(&[(vec![(0, 5, -1)], vec![]), (vec![(0, 7, 1)], vec![])]);
+        assert!(different_sites.cover.kraft_ok());
+        assert!(!different_sites.cover.proves_cover(&[1]));
+        let duplicate = record(&[
+            (vec![(0, 1, 1), (0, 2, 1)], vec![]),
+            (vec![(0, 1, 1), (0, 2, 1)], vec![]),
+            (vec![(0, 1, -1)], vec![]),
+        ]);
+        assert!(duplicate.cover.kraft_ok());
+        assert!(!duplicate.cover.proves_cover(&[1]));
+        let missing = record(&[(vec![(0, 1, 1)], vec![])]);
+        assert!(!missing.cover.proves_cover(&[1]));
+        let empty = Ledger::default();
+        assert!(!empty.cover.proves_cover(&[1]));
+        // An uncertified close (zero margin) is not a leaf.
+        let mut zero = Ledger::default();
+        zero.cover.leaf(
+            leaf_path(&[(0, 1, 1)], &[], &[], None),
+            bound_evidence(mode, 0.0),
+        );
+        zero.cover.leaf(
+            leaf_path(&[(0, 1, -1)], &[], &[], None),
+            bound_evidence(mode, 0.5),
+        );
+        assert!(!zero.cover.proves_cover(&[1]));
+    }
+
+    /// Only the outer frame may speak for the instance, and an unscoped
+    /// ledger can never publish.
+    #[test]
+    fn frame_scope_is_instance_only_on_the_outer_frame() {
+        use super::{frame_scope, EpochFrameRoute, TokenScope};
+        let mut cfg = BabConfig {
+            epoch_frame_route: EpochFrameRoute::Outer,
+            ..BabConfig::default()
+        };
+        assert_eq!(frame_scope(&cfg), TokenScope::Instance);
+        cfg.epoch_frame_route = EpochFrameRoute::NestedFull;
+        assert_eq!(frame_scope(&cfg), TokenScope::Subdomain);
+        cfg.epoch_frame_route = EpochFrameRoute::NestedIncremental;
+        assert_eq!(frame_scope(&cfg), TokenScope::Subdomain);
+        assert_eq!(Ledger::default().scope, TokenScope::Subdomain);
+    }
+
+    /// Parity values no longer close (no closure predicate), while the root
+    /// SCHEDULE in Parity keeps its historical `>= 0` rule bit-for-bit.
+    #[test]
+    fn parity_never_closes_but_keeps_its_root_schedule() {
+        use super::root_schedules_closed;
+        for v in [0.0, -0.0, 1e-300, 0.5, f64::MAX] {
+            assert!(!closed(RoundMode::Parity, v), "parity closed {v:e}");
+            assert!(root_schedules_closed(RoundMode::Parity, v));
+        }
+        for v in [-1e-300, -0.5, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(!root_schedules_closed(RoundMode::Parity, v));
+        }
+        for v in [0.0, -0.0, f64::NAN, f64::INFINITY, -1.0] {
+            assert!(!closed(RoundMode::Outward, v));
+            assert!(!root_schedules_closed(RoundMode::Outward, v));
+        }
+        for v in [f64::from_bits(1), 1e-12, 0.5] {
+            assert!(closed(RoundMode::Outward, v));
+            assert!(root_schedules_closed(RoundMode::Outward, v));
+        }
     }
 }
 
@@ -7176,6 +10992,8 @@ mod pack_from_rows_tests {
                     input: 2,
                     weight: wh,
                     bias: vec![0.1, -0.1, 0.05, 0.0],
+                    bias_err: Vec::new(),
+                    weight_rel_err: 0.0,
                     shape: (n_y, n_in),
                 }, // t3 = y
                 TwinOpSpec::Relu { input: 3 },    // t4, head relu
@@ -7183,6 +11001,8 @@ mod pack_from_rows_tests {
                     input: 4,
                     weight: wo,
                     bias: vec![0.0, 0.1, -0.1],
+                    bias_err: Vec::new(),
+                    weight_rel_err: 0.0,
                     shape: (n_out, n_y),
                 }, // t5
             ],
@@ -7248,6 +11068,8 @@ mod pack_from_rows_tests {
 mod col_retire_tests {
     use ndarray::Array2;
 
+    use crate::margin_row::bounds::head_gates;
+
     use super::*;
     use crate::margin_row::engine::LaneDir;
     use crate::margin_row::spec::{TwinOpSpec, TwinSpec};
@@ -7282,6 +11104,8 @@ mod col_retire_tests {
                     input: 2,
                     weight: wh,
                     bias: vec![0.1, -0.1, 0.05, 0.0],
+                    bias_err: Vec::new(),
+                    weight_rel_err: 0.0,
                     shape: (N_Y, N_IN),
                 },
                 TwinOpSpec::Relu { input: 3 },
@@ -7289,6 +11113,8 @@ mod col_retire_tests {
                     input: 4,
                     weight: wo,
                     bias: vec![0.0, -4.0, 0.0, -0.05],
+                    bias_err: Vec::new(),
+                    weight_rel_err: 0.0,
                     shape: (N_OUT, N_Y),
                 },
             ],
@@ -7350,12 +11176,14 @@ mod col_retire_tests {
                 root_precision_execution: Default::default(),
                 backward_interm_execution: Default::default(),
                 root_alpha_execution: Default::default(),
+                close_integrity: CloseIntegrityEvidence::default(),
             },
             epoch_failures: 0,
             ledger: Ledger::default(),
             nested_ledgers_ok: true,
             lane_cache: crate::margin_row::gpu_backward::cache::PlanCache::default(),
             closure: crate::margin_row::closure::ClosureMonitor::new(false),
+            b5: stack_eval::B5Trace::default(),
         };
         let pack = re.pack;
         bab.lru.put(Vec::new(), pack.clone());
@@ -7376,6 +11204,8 @@ mod col_retire_tests {
             pc: Vec::new(),
             retired,
             alpha: Vec::new(),
+            clip_acc: None,
+            split_order: 0,
         }
     }
 
@@ -7655,7 +11485,9 @@ mod col_retire_tests {
                 beta_step: child.beta_step,
                 pc: child.pc.clone(),
                 retired: child.retired.clone(),
+                clip_acc: child.clip_acc.clone(),
                 alpha: child.alpha.clone(),
+                split_order: child.split_order,
             };
             if let EvalOut::Node(_, st2) = bab
                 .eval_with_pack(&child_pack, &centry)
@@ -7814,12 +11646,321 @@ mod closure_adaptive_tests {
         let mut a = ClosureMonitor::with_params(8, 8, 0.40, TIER_BETA);
         let mut b = ClosureMonitor::with_params(8, 8, 0.40, TIER_BETA);
         crate::margin_row::closure::reset();
-        let da = a.observe(8, 16, 0, 16, 0.8, Some(500.0));
+        // created 16 / closed 4 = window closure 0.25, inside the escalation
+        // BAND that 756e2df14 introduced (`ESCALATION_CLOSURE_FLOOR <= closure
+        // < thresh`). The old `closed = 0` driver now lands on the "stalled
+        // below the escalation floor" refusal, which would leave this test
+        // comparing two Holds and no longer witnessing that an ESCALATION --
+        // the decision that moves the tier -- is determined by the counters
+        // alone.
+        let da = a.observe(8, 16, 4, 16, 0.8, Some(500.0));
         crate::margin_row::closure::reset();
-        let db = b.observe(8, 16, 0, 16, 0.8, Some(500.0));
+        let db = b.observe(8, 16, 4, 16, 0.8, Some(500.0));
         assert_eq!(da, db);
         assert_eq!(da, Decision::Escalate(TIER_BETA));
         crate::margin_row::closure::reset();
         assert_eq!(tier(), TIER_BASE);
+    }
+}
+
+#[cfg(test)]
+mod publish_deadline_tests {
+    use super::BabConfig;
+    use std::time::{Duration, Instant};
+
+    /// `None` must fall back to the SEARCH deadline — byte-identical to the
+    /// behaviour before `#publish-deadline` existed.
+    #[test]
+    fn publish_deadline_none_falls_back_to_the_search_deadline() {
+        let now = Instant::now();
+        let cfg = BabConfig {
+            deadline: Some(now),
+            publish_deadline: None,
+            ..BabConfig::default()
+        };
+        assert_eq!(cfg.effective_publish_deadline(), Some(now));
+        let none = BabConfig {
+            deadline: None,
+            publish_deadline: None,
+            ..BabConfig::default()
+        };
+        assert_eq!(none.effective_publish_deadline(), None);
+    }
+
+    /// When set, it must WIN over the search deadline — that is the whole point:
+    /// a completed proof gets a later instant than the search did.
+    #[test]
+    fn publish_deadline_overrides_and_is_later_than_the_search_deadline() {
+        let now = Instant::now();
+        let cfg = BabConfig {
+            deadline: Some(now),
+            publish_deadline: Some(now + Duration::from_secs(2)),
+            ..BabConfig::default()
+        };
+        let eff = cfg.effective_publish_deadline().expect("set");
+        assert!(
+            eff > now,
+            "a completed proof must get MORE time than the search did, or the \
+             38% of runs that finish their tree and lose the verdict stay lost"
+        );
+        assert_eq!(eff, now + Duration::from_secs(2));
+    }
+
+    /// The grace must never eat the caller's whole wrap-up reserve. The caller
+    /// sets the lane deadline to `scored - 3s`; a grace >= 3s would push
+    /// publication past the SCORED deadline, which is the overrun this reserve
+    /// exists to prevent.
+    #[test]
+    fn the_publish_grace_constant_stays_inside_the_callers_reserve() {
+        let g = crate::margin_row::publish_grace();
+        if let Some(d) = g {
+            assert!(
+                d < Duration::from_secs(3),
+                "publish grace {d:?} must stay strictly below the caller's 3 s \
+                 wrap-up reserve (margin_row_bab.rs:2681)"
+            );
+        }
+        // Shipped default is inert: a Some() grace implies a positive
+        // constant or the acting router's armed authority (#router-r2 CR-R).
+        assert!(
+            g.is_none()
+                || crate::margin_row::PUBLISH_GRACE_SECS > 0.0
+                || ny_core::deadline_authority::global().is_armed(),
+            "a Some() grace implies a positive constant or an armed authority"
+        );
+    }
+}
+
+/// #root-eval-reuse (throughput plan B1(c)): the L1 root-eval dedupe is
+/// BIT-IDENTICAL to recomputing, and every in-place gate write invalidates it.
+#[cfg(test)]
+mod root_eval_reuse_tests {
+    use super::col_retire_tests::{build, spec4};
+    use super::*;
+
+    fn eq_bits(a: &[f64], b: &[f64], what: &str) {
+        assert_eq!(a.len(), b.len(), "{what}: length moved");
+        for (i, (x, y)) in a.iter().zip(b).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(), "{what}[{i}] moved: {x} vs {y}");
+        }
+    }
+
+    fn eq_pass(a: &PassOut, b: &PassOut, what: &str) {
+        assert_eq!(a.a.raw_dim(), b.a.raw_dim(), "{what}: shape moved");
+        eq_bits(
+            a.a.as_slice().expect("standard layout"),
+            b.a.as_slice().expect("standard layout"),
+            what,
+        );
+        match (&a.e, &b.e) {
+            (Some(x), Some(y)) => eq_bits(
+                x.as_slice().expect("standard layout"),
+                y.as_slice().expect("standard layout"),
+                what,
+            ),
+            (None, None) => {}
+            _ => panic!("{what}: error-lane presence moved"),
+        }
+        eq_bits(&a.b, &b.b, what);
+        eq_bits(&a.eb, &b.eb, what);
+    }
+
+    fn eq_root_eval(a: &RootEval, b: &RootEval) {
+        eq_bits(&a.dj, &b.dj, "dj");
+        assert_eq!(a.tree_classes, b.tree_classes, "tree_classes moved");
+        assert!(a.spec_alpha.is_none() && b.spec_alpha.is_none());
+        let (p, q) = (&a.pack, &b.pack);
+        eq_bits(&p.ly0, &q.ly0, "ly0");
+        eq_bits(&p.uy0, &q.uy0, "uy0");
+        eq_bits(&p.ly_fwd, &q.ly_fwd, "ly_fwd");
+        eq_bits(&p.uy_fwd, &q.uy_fwd, "uy_fwd");
+        eq_pass(&p.al, &q.al, "al");
+        eq_pass(&p.au, &q.au, "au");
+        eq_bits(&p.al_dots.abs_dot, &q.al_dots.abs_dot, "al_dots.abs");
+        eq_bits(&p.al_dots.err_dot, &q.al_dots.err_dot, "al_dots.err");
+        eq_bits(&p.au_dots.abs_dot, &q.au_dots.abs_dot, "au_dots.abs");
+        eq_bits(&p.au_dots.err_dot, &q.au_dots.err_dot, "au_dots.err");
+        assert_eq!(p.head_slack.is_some(), q.head_slack.is_some());
+    }
+
+    /// `root_eval_reuse_bit_identical`: a stored evaluation served to the
+    /// tree (`root_eval_reuse`) and to the ascent's frozen frame
+    /// (`root_rows_memo`) is bit-for-bit what recomputing produces; the
+    /// property is part of the key; an in-place alpha/ms write (what the
+    /// ascent's commit does) and a head-alpha install (what #head-alpha does)
+    /// both invalidate it; `run_inner`'s reuse releases the memo.
+    #[test]
+    fn root_eval_reuse_bit_identical() {
+        let net = TwinNet::compile(&spec4()).expect("compile");
+        let (_lo, _hi, mut root) = build(&net);
+        let adv = [1usize, 2, 3];
+        // The oracle: an unmemoized evaluation.
+        let fresh = {
+            let eng = BackwardEngine::new(&net, &root);
+            root_eval(&eng, &net, 0, &adv).expect("fresh root_eval")
+        };
+        {
+            let eng = BackwardEngine::new(&net, &root);
+            if !memo_eligible(&eng, &net) {
+                // A GPU lane is armed in this process: the memo must REFUSE,
+                // never serve — checked first. The bit-identity half cannot run
+                // here, and a test that returns early prints `... ok` exactly
+                // like a real pass (libtest captures the note), which is the
+                // VOID-read-as-PASS shape CLAUDE.md forbids. So it FAILS
+                // CLOSED: rerun without the NY_MARGIN_ROW_GPU* arming.
+                let _ = root_eval_store(&eng, &net, 0, &adv).expect("store");
+                assert!(
+                    root_eval_lookup(&eng, &net, 0, &adv).is_none(),
+                    "an armed GPU lane must make the memo refuse"
+                );
+                panic!(
+                    "root_eval_reuse_bit_identical: VOID — a GPU margin-row lane is armed in \
+                     this test process, so the bit-identity half cannot run (the refusal \
+                     half passed). Rerun with the GPU lanes dark."
+                );
+            }
+        }
+        // (1) The production store path (`certified_root_bound` = the alpha
+        // guard's published_before) returns the same number and stores.
+        let bound = crate::margin_row::rebake::certified_root_bound(&net, &root, 0, &adv)
+            .expect("certified_root_bound");
+        let fresh_min = fresh.dj.iter().copied().fold(f64::INFINITY, f64::min);
+        assert_eq!(
+            bound.to_bits(),
+            fresh_min.to_bits(),
+            "the store moved the bound"
+        );
+        {
+            let eng = BackwardEngine::new(&net, &root);
+            // (2) A hit, bit-identical to the oracle.
+            let hit = root_eval_lookup(&eng, &net, 0, &adv)
+                .expect("an unchanged gates generation must hit");
+            eq_root_eval(&hit, &fresh);
+            // (3) The ascent's frozen y-rows ARE `y_rows(None)`.
+            let rows = root_rows_memo(&net, &root).expect("rows hit");
+            let (al, au) = eng.y_rows(None).expect("y_rows");
+            eq_pass(rows.al(), &al, "rows.al");
+            eq_pass(rows.au(), &au, "rows.au");
+            // (4) The property is part of the key.
+            assert!(
+                root_eval_lookup(&eng, &net, 0, &[1, 2]).is_none(),
+                "a different adv set must miss"
+            );
+        }
+        // (5) An in-place gate write (the ascent's commit) invalidates.
+        let (li, j) = root
+            .layers
+            .iter()
+            .enumerate()
+            .find_map(|(li, l)| l.unst.first().map(|&j| (li, j)))
+            .expect("spec4's trunk relu has unstable neurons");
+        let saved = (root.layers[li].alpha[j], root.layers[li].ms[j]);
+        root.layers[li].alpha[j] = if saved.0 == 0.75 { 0.25 } else { 0.75 };
+        root.layers[li].ms[j] = root.layers[li].alpha[j].max(root.layers[li].s[j]);
+        {
+            let eng = BackwardEngine::new(&net, &root);
+            assert!(
+                root_eval_lookup(&eng, &net, 0, &adv).is_none(),
+                "an in-place alpha/ms write must move the gates generation"
+            );
+            assert!(root_rows_memo(&net, &root).is_none());
+            // The tree's path then recomputes: identical to an oracle on the
+            // mutated gates.
+            let via_reuse = root_eval_reuse(&eng, &net, 0, &adv).expect("reuse (miss)");
+            let oracle = root_eval(&eng, &net, 0, &adv).expect("oracle");
+            eq_root_eval(&via_reuse, &oracle);
+        }
+        // (6) Restoring the gates does NOT resurrect a hit: `root_eval_reuse`
+        // released the memo. A new store then hits again (the rollback case of
+        // the guard's before/after pair), bit-identically.
+        root.layers[li].alpha[j] = saved.0;
+        root.layers[li].ms[j] = saved.1;
+        {
+            let eng = BackwardEngine::new(&net, &root);
+            assert!(
+                root_eval_lookup(&eng, &net, 0, &adv).is_none(),
+                "run_inner's reuse must release the memo"
+            );
+            let stored = root_eval_store(&eng, &net, 0, &adv).expect("store");
+            eq_root_eval(&stored, &fresh);
+            let via_reuse = root_eval_reuse(&eng, &net, 0, &adv).expect("reuse (hit)");
+            eq_root_eval(&via_reuse, &fresh);
+        }
+        // (7) A head-alpha install (#head-alpha's commit) invalidates.
+        {
+            let eng = BackwardEngine::new(&net, &root);
+            let _ = root_eval_store(&eng, &net, 0, &adv).expect("store");
+        }
+        root.head_alpha = Some(vec![0.5; net.n_y]);
+        let eng = BackwardEngine::new(&net, &root);
+        assert!(
+            root_eval_lookup(&eng, &net, 0, &adv).is_none(),
+            "a head-alpha install must move the gates generation"
+        );
+    }
+
+    /// `root_eval_reuse_generation_covers_every_read_field`: each field the
+    /// fingerprint claims to cover actually moves it (a field silently dropped
+    /// from `gates_generation` would turn the memo stale on that field).
+    #[test]
+    fn root_eval_reuse_generation_covers_every_read_field() {
+        let net = TwinNet::compile(&spec4()).expect("compile");
+        let (_lo, _hi, mut root) = build(&net);
+        let base = gates_generation(&root);
+        let moved = |what: &str, root: &RootGates| {
+            assert_ne!(
+                gates_generation(root),
+                base,
+                "{what} is not in the gates generation"
+            );
+        };
+        let li = 0usize;
+        let bump = |v: &mut f64| *v = f64::from_bits(v.to_bits() ^ 1);
+        for field in 0..6 {
+            let layer = &mut root.layers[li];
+            let vec = match field {
+                0 => &mut layer.l,
+                1 => &mut layer.u,
+                2 => &mut layer.alpha,
+                3 => &mut layer.s,
+                4 => &mut layer.c,
+                _ => &mut layer.ms,
+            };
+            let old = vec[0];
+            bump(&mut vec[0]);
+            moved(&format!("layers[0] field #{field}"), &root);
+            let layer = &mut root.layers[li];
+            let vec = match field {
+                0 => &mut layer.l,
+                1 => &mut layer.u,
+                2 => &mut layer.alpha,
+                3 => &mut layer.s,
+                4 => &mut layer.c,
+                _ => &mut layer.ms,
+            };
+            vec[0] = old;
+            assert_eq!(gates_generation(&root), base, "restore must restore");
+        }
+        let old = root.mid[0];
+        bump(&mut root.mid[0]);
+        moved("mid", &root);
+        root.mid[0] = old;
+        let old = root.rad[0];
+        bump(&mut root.rad[0]);
+        moved("rad", &root);
+        root.rad[0] = old;
+        let old = root.xabs[0];
+        bump(&mut root.xabs[0]);
+        moved("xabs", &root);
+        root.xabs[0] = old;
+        let popped = root.layers[li].unst.pop();
+        moved("unst", &root);
+        if let Some(p) = popped {
+            root.layers[li].unst.push(p);
+        }
+        root.head_alpha = Some(vec![0.0; net.n_y]);
+        moved("head_alpha", &root);
+        root.head_alpha = None;
+        assert_eq!(gates_generation(&root), base);
     }
 }

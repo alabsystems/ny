@@ -241,7 +241,7 @@ fn assert_exact_square_enclosure(
         let bias = rat(beta[channel]) - rat(mean[channel]) * scale.clone();
         let exact_center = scale.clone() * rat(input.center()[value_index]) + bias;
         let mut required = (exact_center - rat(output.center()[value_index])).abs();
-        required += scale.clone().abs() * rat(input.box_remainder()[value_index]);
+        required += scale.abs() * rat(input.box_remainder()[value_index]);
         for generator in 0..input.alpha_dim() {
             let exact_coefficient = scale.clone() * rat(coefficient(input, generator, value_index));
             required +=

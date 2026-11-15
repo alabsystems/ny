@@ -8,9 +8,6 @@
 //! returns tighter bounds by solving optimization problems. LP/MIP solvers
 //! can produce tighter bounds than CROWN alone by encoding full network
 //! constraints.
-//!
-//! Design: `designs/2026-03-04-highs-mip-solver-integration.md`
-//! Part of #1763.
 
 use crate::Bound;
 

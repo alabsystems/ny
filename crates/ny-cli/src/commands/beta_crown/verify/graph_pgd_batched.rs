@@ -31,7 +31,7 @@ use super::graph_pgd::{
     constraint_target, gama_lambda_init, gama_reference_softmax, joint_gama_objective,
     reset_gama_lane, GraphPgdTarget,
 };
-use super::pgd_sampling::spsa_step_deadline_exceeded;
+use super::pgd_sampling::pgd_step_must_stop;
 use batching::{
     assign_batched_item, batched_item, fill_restart_perturbation, sample_uniform_batch,
     sample_uniform_point, RestartBatchLayout, SimpleRng,
@@ -291,6 +291,8 @@ pub(super) fn try_graph_pgd_upfront_batched_with_config(
     gemm_engine: Option<&dyn GemmEngine>,
     json: bool,
 ) -> Result<BatchedGraphPgdOutcome> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Attack);
     let pgd_start = Instant::now();
     let constraints = &vnnlib.output_constraints;
     let requested_gama_lambda = gama_lambda_init(&pgd_config);
@@ -345,7 +347,9 @@ pub(super) fn try_graph_pgd_upfront_batched_with_config(
             }
         };
 
-    if pgd_config.deadline.is_some_and(|d| Instant::now() >= d) {
+    // #attack-concurrent: `past_deadline` is this exact deadline test, OR the
+    // concurrent lane's cancellation token (`None` everywhere else).
+    if pgd_config.past_deadline() {
         super::graph_pgd::emit_graph_pgd_status(
             json,
             format_args!(
@@ -427,14 +431,14 @@ pub(super) fn try_graph_pgd_upfront_batched_with_config(
         })
         .collect();
 
-    // Apply OSI initialization per-restart if configured (#1449).
+    // Apply OSI initialization per-restart if configured.
     // OSI requires sequential forward passes per restart to push seeds toward
     // diverse output-space regions before the batched PGD loop.
     if matches!(pgd_config.initialization, PgdInitialization::Osi) && pgd_config.osi_steps > 0 {
         for restart in 0..pgd_config.num_restarts {
             // OSI runs sequential per-restart forwards — keep it preemptible
             // on expensive models (#four-walls).
-            if deadline.is_some_and(|d| Instant::now() >= d) {
+            if deadline.is_some_and(|d| Instant::now() >= d) || pgd_config.cancelled() {
                 emit_batch_deadline("OSI initialization");
                 return Ok(BatchedGraphPgdOutcome::Completed {
                     result: None,
@@ -512,7 +516,7 @@ pub(super) fn try_graph_pgd_upfront_batched_with_config(
     }
 
     for step in 0..pgd_config.num_steps {
-        if spsa_step_deadline_exceeded(step, pgd_config.deadline) {
+        if pgd_step_must_stop(step, &pgd_config) {
             super::graph_pgd::emit_graph_pgd_status(
                 json,
                 format_args!(
@@ -666,7 +670,7 @@ pub(super) fn try_graph_pgd_upfront_batched_with_config(
                 gama_steps[restart] = gama_steps[restart].saturating_add(1);
             }
 
-            // Restart-when-stuck (#4278): resample if projected step is a no-op.
+            // Restart-when-stuck: resample if projected step is a no-op.
             if let Some(ref prev) = previous_x {
                 if prev.iter().zip(x.iter()).all(|(&a, &b)| a == b) {
                     x = sample_uniform_point(input, &mut rngs[restart]);
@@ -724,7 +728,6 @@ pub(super) fn try_graph_pgd_upfront_batched_with_config(
     // mutated past the initial/OSI evaluation that seeded `output_batch`. Reuse
     // it for the final counterexample sweep instead of issuing a redundant batched
     // forward pass — this keeps the batched GEMM-dispatch count at two per step
-    // (#3955).
     for restart in 0..pgd_config.num_restarts {
         let output = batched_item(&output_batch, restart, layout);
         if super::check_unsafe_counterexample(&output, constraints) {

@@ -1131,18 +1131,13 @@ fn add_constant_tensor(
     output_shape: &[usize],
     budget: &mut ExactBudget<'_>,
 ) -> Option<ExactTensor> {
-    // Match `AddConstantLayer::propagate_ibp`: a rank-1 `[C]` constant on a
-    // rank-3 `[C,H,W]` tensor is a channel bias and is reshaped to `[C,1,1]`
-    // before broadcasting.  Ordinary trailing-axis broadcasting can also
-    // accept `[C,H,C]`, so using the raw shape there would silently evaluate a
-    // different function.
-    let raw_constant_shape = layer.constant().shape();
-    let channel_bias_shape = (raw_constant_shape.len() == 1
-        && input.shape.len() == 3
-        && raw_constant_shape[0] == input.shape[0])
-        .then(|| vec![raw_constant_shape[0], 1, 1]);
-    let constant_shape = channel_bias_shape.as_deref().unwrap_or(raw_constant_shape);
-    if crate::shape::broadcast_shapes(&input.shape, constant_shape).as_deref() != Some(output_shape)
+    // Match IBP/CROWN's single internal layout decision. In particular, this
+    // refuses a rank-1 `[C]` against `[C,H,C]` because channel-bias and strict
+    // right-aligned readings are both shape-valid but compute different
+    // functions without provenance selecting one.
+    let constant_shape = layer.effective_broadcast_shape(&input.shape).ok()?;
+    if crate::shape::broadcast_shapes(&input.shape, &constant_shape).as_deref()
+        != Some(output_shape)
     {
         return None;
     }
@@ -1154,7 +1149,7 @@ fn add_constant_tensor(
         constant_values.push(ExactAffine::constant(bounded_exact_f32(value, budget)?));
     }
     let constant = ExactTensor {
-        shape: constant_shape.to_vec(),
+        shape: constant_shape,
         values: constant_values,
     };
     binary_affine_tensor(
@@ -2551,7 +2546,7 @@ impl GraphNetwork {
                 None => rebuilt_wrapper = Some(current_wrapper),
                 _ => {}
             }
-            cursor = evaluation.endpoint.clone();
+            cursor = evaluation.endpoint;
             rebuilt_cells.push(expected);
             if cursor == problem.upper.0 {
                 break;
@@ -3062,21 +3057,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn add_constant_rank_one_channel_bias_matches_layer_semantics() {
+    fn rank_one_add_constant_graph(width: usize) -> GraphNetwork {
         let mut graph = GraphNetwork::new();
-        shape(&mut graph, NETWORK_INPUT, &[2, 1, 2]);
+        shape(&mut graph, NETWORK_INPUT, &[2, 1, width]);
         graph.add_node(GraphNode::from_input(
             "bias",
             Layer::AddConstant(AddConstantLayer::new(arr1(&[10.0_f32, 20.0]).into_dyn())),
         ));
-        shape(&mut graph, "bias", &[2, 1, 2]);
+        shape(&mut graph, "bias", &[2, 1, width]);
         graph.add_node(GraphNode::new(
             "channel_zero",
             Layer::Slice(SliceLayer::new(0, 0, 1)),
             vec!["bias".to_string()],
         ));
-        shape(&mut graph, "channel_zero", &[1, 1, 2]);
+        shape(&mut graph, "channel_zero", &[1, 1, width]);
         graph.add_node(GraphNode::new(
             "width_one",
             Layer::Slice(SliceLayer::new(2, 1, 2)),
@@ -3090,13 +3084,13 @@ mod tests {
         ));
         shape(&mut graph, "sigmoid", &[1, 1, 1]);
         graph.set_output("sigmoid");
+        graph
+    }
 
-        // Flat axis 1 is channel 0, width 1.  AddConstant's rank-1 special
-        // case adds channel bias 10 here; ordinary trailing-axis broadcast
-        // would incorrectly add width bias 20.
-        let problem = OneAxisExactProblem {
-            input_shape: vec![2, 1, 2],
-            fixed_inputs: vec![exact("0"); 4],
+    fn rank_one_add_constant_problem(width: usize) -> OneAxisExactProblem {
+        OneAxisExactProblem {
+            input_shape: vec![2, 1, width],
+            fixed_inputs: vec![exact("0"); 2 * width],
             free_axis: 1,
             lower: exact("-1"),
             upper: exact("1"),
@@ -3104,15 +3098,26 @@ mod tests {
                 relation: OneAxisConstraintRelation::GreaterEqual,
                 bound: exact("0.5"),
             }],
-        };
-        let certificate = graph
-            .exact_one_axis_phase_certificate_until(
-                &problem,
-                OneAxisPhaseLimits::default(),
-                deadline(),
+        }
+    }
+
+    #[test]
+    fn add_constant_rank_one_unambiguous_channel_layout_constructs_and_replays() {
+        // `[2]` against `[2,1,3]` can only be the internal channel-bias
+        // reading: strict right alignment would require last extent 2.
+        let graph = rank_one_add_constant_graph(3);
+        let problem = rank_one_add_constant_problem(3);
+        let attempt = graph.exact_one_axis_phase_certificate_until(
+            &problem,
+            OneAxisPhaseLimits::default(),
+            deadline(),
+        );
+        let certificate = attempt.certificate.unwrap_or_else(|| {
+            panic!(
+                "unambiguous channel layout should construct a certificate: {:?}",
+                attempt.decline
             )
-            .certificate
-            .expect("channel-bias certificate");
+        });
         assert_eq!(certificate.cells.len(), 1);
         assert_eq!(certificate.cells[0].core.slope, exact("1"));
         assert_eq!(certificate.cells[0].core.bias, exact("10"));
@@ -3126,6 +3131,23 @@ mod tests {
                 )
                 .accepted
         );
+    }
+
+    #[test]
+    fn add_constant_rank_one_ambiguous_layout_refuses_exact_certificate() {
+        // Flat axis 1 could mean channel bias 10 or trailing width bias 20.
+        // Without provenance selecting a reading, the exact lane must decline.
+        let graph = rank_one_add_constant_graph(2);
+        let problem = rank_one_add_constant_problem(2);
+        let result = graph.exact_one_axis_phase_certificate_until(
+            &problem,
+            OneAxisPhaseLimits::default(),
+            deadline(),
+        );
+        assert!(result.certificate.is_none());
+        let decline = result.decline.expect("ambiguous layout must decline");
+        assert_eq!(decline.reason, OneAxisPhaseDeclineReason::StructuralRefusal);
+        assert_eq!(decline.node.as_deref(), Some("bias"));
     }
 
     #[test]

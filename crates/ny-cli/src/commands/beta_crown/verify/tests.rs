@@ -2,9 +2,11 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+use super::disjunctive::another_clause_retry_pass;
 use super::{
     check_unsafe_counterexample, constraint_is_safety_proof, disjunctive_failure_to_final_status,
-    finalize_relational_status, verify_relational_constraints, AggregationMode, BetaCrownModel,
+    finalize_relational_status, first_unproved_constraint_detail, verify_relational_constraints,
+    AggregationMode, BetaCrownModel,
 };
 use ndarray::{arr1, arr2, Array1, Array2};
 use ny_onnx::vnnlib::{parse_vnnlib, OutputConstraint, VnnLibSpec};
@@ -120,7 +122,7 @@ fn disjunctive_counterexample_preserves_unsafe_verdict_1890() {
 
 #[test]
 fn finalize_relational_status_requires_verified_constraints_1890() {
-    let status = finalize_relational_status(AggregationMode::Conjunctive, 0, 2, 2);
+    let status = finalize_relational_status(AggregationMode::Conjunctive, 0, 2, 2, None);
     assert!(
         matches!(status, BabVerificationStatus::Unknown { .. }),
         "conjunctive result with only non-verified constraints must not be SAFE"
@@ -129,11 +131,124 @@ fn finalize_relational_status_requires_verified_constraints_1890() {
 
 #[test]
 fn finalize_relational_status_disjunction_requires_all_1887() {
-    let status = finalize_relational_status(AggregationMode::Disjunctive, 1, 2, 2);
+    let status = finalize_relational_status(AggregationMode::Disjunctive, 1, 2, 2, None);
     assert!(
         matches!(status, BabVerificationStatus::Unknown { .. }),
         "disjunctive result is SAFE only when every constraint is proved violated"
     );
+}
+
+/// #budget-abandonment FIX D. The conjunctive wrapper took COUNTS ONLY and
+/// discarded the per-constraint `Unknown { reason }`; in 7 of the 8 measured
+/// ml4acopf rows carrying this string the real cause (the failing clause never
+/// produced a root bound at all) was hidden behind it. The historical sentence
+/// must survive VERBATIM as a prefix so nothing matching it breaks.
+#[test]
+fn conjunctive_failure_message_carries_the_inner_reason_and_keeps_its_prefix() {
+    let detail = "constraint 1: Initial-bound warmup exceeded its deadline cap before branching";
+    let status = finalize_relational_status(AggregationMode::Conjunctive, 0, 1, 1, Some(detail));
+    let BabVerificationStatus::Unknown { reason } = status else {
+        panic!("a conjunctive property with no proved violation must be Unknown");
+    };
+    assert!(
+        reason.starts_with("No constraint was provably violated (1 constraints checked"),
+        "the historical sentence must remain a prefix, got {reason:?}"
+    );
+    assert!(
+        reason.contains("Initial-bound warmup exceeded its deadline cap before branching"),
+        "the inner reason must survive the wrapper, got {reason:?}"
+    );
+
+    // With nothing to report the message is byte-identical to the old one.
+    let bare = finalize_relational_status(AggregationMode::Conjunctive, 0, 2, 2, None);
+    let BabVerificationStatus::Unknown { reason } = bare else {
+        panic!("expected Unknown");
+    };
+    assert_eq!(
+        reason,
+        "No constraint was provably violated (2 constraints checked)"
+    );
+}
+
+/// #budget-abandonment FIX D, the one LIVE control-flow edge, declared rather
+/// than discovered. `disjunctive_unified::try_no_branchable_neuron_pgd_fallback`
+/// gates on `reason.contains("No unstable") && reason.contains("neurons")`.
+/// Before FIX D the conjunctive aggregate was a count-only sentence that could
+/// never match; now the inner reason is threaded through and it can, so the
+/// post-BaB PGD fallback newly fires on this route.
+///
+/// Moat-neutral: that fallback can only produce a `sat` CANDIDATE, which still
+/// passes `confirm_potential_violation` and the trusted ORT gate, and it
+/// touches no `unsat`. This test exists so the edge is a pinned decision.
+#[test]
+fn conjunctive_detail_reaches_the_no_branchable_neuron_pgd_gate() {
+    let detail = "constraint 1: No unstable ReLU neurons to branch on";
+    let status = finalize_relational_status(AggregationMode::Conjunctive, 0, 1, 1, Some(detail));
+    let BabVerificationStatus::Unknown { reason } = status else {
+        panic!("expected Unknown");
+    };
+    assert!(
+        reason.contains("No unstable") && reason.contains("neurons"),
+        "the inner cause must survive so #3769's fallback can see it, got {reason:?}"
+    );
+
+    // The count-only wrapper this replaced could NEVER match that gate, which
+    // is what made the new edge invisible in review.
+    let bare = finalize_relational_status(AggregationMode::Conjunctive, 0, 1, 1, None);
+    let BabVerificationStatus::Unknown { reason } = bare else {
+        panic!("expected Unknown");
+    };
+    assert!(
+        !(reason.contains("No unstable") && reason.contains("neurons")),
+        "the historical sentence must still not match the gate, got {reason:?}"
+    );
+}
+
+/// The detail is taken from the FIRST constraint that was not proved violated,
+/// in the order the loop checked them.
+#[test]
+fn first_unproved_constraint_detail_picks_the_first_failure_in_order() {
+    let results = vec![
+        ("1".to_string(), BabVerificationStatus::Verified),
+        (
+            "2".to_string(),
+            BabVerificationStatus::Unknown {
+                reason: "Max depth 100 reached".to_string(),
+            },
+        ),
+        ("3".to_string(), BabVerificationStatus::Timeout),
+    ];
+    assert_eq!(
+        first_unproved_constraint_detail(&results).as_deref(),
+        Some("constraint 2: Max depth 100 reached")
+    );
+
+    let all_verified = vec![("1".to_string(), BabVerificationStatus::Verified)];
+    assert_eq!(first_unproved_constraint_detail(&all_verified), None);
+}
+
+/// #budget-abandonment FIX B: every one of the four termination conditions
+/// stops the retry loop on its own, and the shipped default (0 passes) stops it
+/// immediately -- which is what makes the unset key byte-identical.
+#[test]
+fn clause_retry_stops_on_the_pass_cap_no_shrink_empty_set_or_a_spent_budget() {
+    // The shipped default: zero extra passes, so pass 0 is the only pass.
+    assert!(
+        !another_clause_retry_pass(0, 0, 56, 1, true),
+        "retry_passes=0 must reproduce today's SINGLE pass"
+    );
+    // Armed, with a shrink and time left: the ml4acopf shape (56 -> 1).
+    assert!(another_clause_retry_pass(0, 1, 56, 1, true));
+    // Pass cap.
+    assert!(!another_clause_retry_pass(1, 1, 56, 1, true));
+    // No shrink: the pass decided nothing, so another one would repeat it.
+    assert!(!another_clause_retry_pass(0, 3, 7, 7, true));
+    // A GROWN set cannot happen, but must not loop either.
+    assert!(!another_clause_retry_pass(0, 3, 7, 9, true));
+    // Nothing left undecided.
+    assert!(!another_clause_retry_pass(0, 3, 7, 0, true));
+    // Budget spent: never eat the publication margin for a retry.
+    assert!(!another_clause_retry_pass(0, 3, 56, 1, false));
 }
 
 /// Helper: build a simple linear network (1 input → N outputs) with given bias.
@@ -226,7 +341,7 @@ fn run_verify(network: Network, vnnlib: &VnnLibSpec) -> BetaCrownResult {
     .unwrap()
 }
 
-/// #1889 regression: Multi-constant conjunctive spec must check ALL constants.
+/// Regression: Multi-constant conjunctive spec must check ALL constants.
 ///
 /// Network: outputs Y_0=5.0, Y_1=0.0 (constant, zero-weight).
 /// Spec: Y_0 >= 3.99 AND Y_1 >= 3.99 (conjunctive unsafe region).
@@ -267,7 +382,7 @@ fn multi_constant_conjunctive_checks_all_constants_1889() {
     );
 }
 
-/// #1889 regression: Multi-constant disjunctive spec must verify ALL constants.
+/// Regression: Multi-constant disjunctive spec must verify ALL constants.
 ///
 /// Network: outputs Y_0=0.0, Y_1=0.0 (constant, zero-weight).
 /// Spec: Y_0 >= 100.0 OR Y_1 >= 100.0 (disjunctive unsafe region).
@@ -308,7 +423,7 @@ fn multi_constant_disjunctive_checks_all_constants_1889() {
     );
 }
 
-/// #1888 regression: Mixed relational+constant conjunctive spec must not drop constants.
+/// Regression: Mixed relational+constant conjunctive spec must not drop constants.
 ///
 /// Network: outputs Y_0=2.0, Y_1=1.0, Y_2=0.0 (constant, zero-weight).
 /// Spec: Y_1 <= Y_0 AND Y_2 >= 3.99 (mixed relational+constant, conjunctive).
@@ -350,7 +465,7 @@ fn mixed_relational_constant_conjunctive_checks_all_1888() {
     );
 }
 
-/// #1888 regression: Mixed relational+constant disjunctive spec preserves all constraints.
+/// Regression: Mixed relational+constant disjunctive spec preserves all constraints.
 ///
 /// Network: outputs Y_0=0.0, Y_1=1.0, Y_2=0.0 (constant).
 /// Spec: (Y_0 <= Y_1) OR (Y_2 >= 100.0) (disjunctive unsafe).
@@ -390,7 +505,7 @@ fn mixed_relational_constant_disjunctive_not_safe_1888() {
     );
 }
 
-/// #3209: check_unsafe_counterexample validates all relational constraints jointly.
+/// check_unsafe_counterexample validates all relational constraints jointly.
 #[test]
 fn check_unsafe_counterexample_all_hold_3209() {
     use ndarray::ArrayD;
@@ -409,7 +524,7 @@ fn check_unsafe_counterexample_all_hold_3209() {
     );
 }
 
-/// #3209: check_unsafe_counterexample rejects when any constraint fails.
+/// check_unsafe_counterexample rejects when any constraint fails.
 #[test]
 fn check_unsafe_counterexample_one_fails_3209() {
     use ndarray::ArrayD;
@@ -429,7 +544,7 @@ fn check_unsafe_counterexample_one_fails_3209() {
     );
 }
 
-/// #4375: out-of-range output indices must fail closed instead of silently
+/// Out-of-range output indices must fail closed instead of silently
 /// comparing against 0.0.
 #[test]
 fn check_unsafe_counterexample_oob_index_rejected_4375() {
@@ -569,7 +684,7 @@ fn conjunctive_pgd_upfront_nonstrict_equal_outputs_accepted_3779() {
     );
 }
 
-/// #3209: Cross-validation detects joint counterexample from per-constraint BaB.
+/// Cross-validation detects joint counterexample from per-constraint BaB.
 ///
 /// Network: Y_0=5, Y_1=3, Y_2=4 (constant output, zero-weight).
 /// Property: Y_1 <= Y_0 AND Y_2 <= Y_0 (conjunctive unsafe).
@@ -640,7 +755,7 @@ fn conjunctive_cross_validation_finds_joint_counterexample_3209() {
     );
 }
 
-/// #3209 audit: Directly exercise iterate_constraints cross-validation with eval_original.
+/// Directly exercise iterate_constraints cross-validation with eval_original.
 ///
 /// Uses mock verify_fn (returns Violated) + mock eval_original (all constraints hold)
 /// to verify cross-validation detects joint counterexamples. The end-to-end test above
@@ -719,7 +834,7 @@ fn iterate_constraints_cross_validates_counterexample_3209() {
     );
 }
 
-/// #3309: PGD attack must run for single-clause disjunctions.
+/// PGD attack must run for single-clause disjunctions.
 ///
 /// soundnessbench properties are parsed as `is_disjunction=true` with
 /// `output_constraint_clauses.len()==1`. Before this fix, PGD was skipped
@@ -802,7 +917,7 @@ fn single_clause_disjunction_runs_pgd_3309() {
     );
 }
 
-/// Build anti-correlated ReLU network for conjunctive BaB testing (#3334).
+/// Build anti-correlated ReLU network for conjunctive BaB testing.
 ///
 /// Network: 1 input → 2 hidden (ReLU) → 2 outputs.
 ///   Y_0 = relu(x - 0.4), Y_1 = relu(0.6 - x). Input: x ∈ [0, 1].
@@ -912,7 +1027,7 @@ fn build_graph_input_split_joint_clause_test_523(
     (graph, vnnlib, input, config)
 }
 
-/// #3334: Joint conjunctive BaB verifies a property that per-constraint BaB cannot.
+/// Joint conjunctive BaB verifies a property that per-constraint BaB cannot.
 ///
 /// Per-constraint BaB cannot verify this because neither constraint is universally
 /// false: Y_0 >= 0.3 IS satisfiable (x=0.9) and Y_1 >= 0.3 IS satisfiable (x=0.1).
@@ -922,8 +1037,6 @@ fn build_graph_input_split_joint_clause_test_523(
 ///   - Neuron 0 inactive (x < 0.4): Y_0 = 0 < 0.3 → obj 0 verified
 ///   - Neuron 1 inactive (x > 0.6): Y_1 = 0 < 0.3 → obj 1 verified
 ///   - Both active (x ∈ [0.4, 0.6]): max(Y_i) = 0.2 < 0.3 → both objs verified
-///
-/// Reference: designs/2026-03-05-joint-conjunctive-bab.md Phase 2.
 #[test]
 fn conjunctive_bab_verifies_joint_property_that_per_constraint_cannot_3334() {
     let (network, vnnlib, input, config) = build_conjunctive_bab_test_3334();
@@ -960,7 +1073,7 @@ fn conjunctive_bab_verifies_joint_property_that_per_constraint_cannot_3334() {
     );
 }
 
-/// #523 regression: graph input splitting must reach joint multi-objective clause verification.
+/// Regression: graph input splitting must reach joint multi-objective clause verification.
 ///
 /// This graph/property pair is jointly impossible but each individual constraint remains
 /// satisfiable somewhere in the input box, so per-constraint input splitting returns

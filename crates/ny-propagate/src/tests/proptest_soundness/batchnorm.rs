@@ -93,7 +93,7 @@ proptest! {
     }
 }
 
-/// Regression for #2183: BatchNorm CROWN bias path must accumulate in f64
+/// Regression: BatchNorm CROWN bias path must accumulate in f64
 /// and use directed rounding when casting back to f32.
 /// Converted from proptest with `_case in 0u8..1` (zero randomization).
 #[ntest::timeout(10000)]

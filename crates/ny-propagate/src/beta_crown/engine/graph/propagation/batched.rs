@@ -33,6 +33,7 @@ use ny_tensor::BoundedTensor;
 
 use crate::batched_domain::CachedLinearBounds;
 use crate::beta_crown::branching::GraphSplitHistory;
+use crate::beta_crown::engine::graph::objectives::objective_bounds;
 use crate::beta_crown::engine::graph::{DomainCrownResult, DomainSpecCrownResult};
 use crate::beta_crown::state::{GraphBetaState, GraphDomainAlphaState};
 use crate::bounds::{
@@ -45,6 +46,7 @@ use crate::network::{CrownDispatchPlan, ResnetSegmentSkeleton};
 use crate::{GraphNetwork, Layer, LinearBounds, NETWORK_INPUT};
 
 use super::super::super::BetaCrownVerifier;
+use super::warm_frontier;
 
 mod active_compaction_telemetry;
 mod adapters;
@@ -263,8 +265,6 @@ pub(in crate::beta_crown::engine::graph) struct GpuBetaOptSpec<'a> {
 /// `propagate_crown_batched_backward_internal_with_la` (lA capture) into a single
 /// traversal parameterized by mode, eliminating ~150 LOC of duplicated setup,
 /// traversal loop, and concretization logic.
-///
-/// Part of #1813 (wave 2 batched backward kernel dedup).
 pub(super) enum BatchedBackwardMode<'a> {
     /// Standard backward pass: seed all domains at output, no intermediate capture.
     Standard,
@@ -274,8 +274,6 @@ pub(super) enum BatchedBackwardMode<'a> {
     ///
     /// # Reference
     /// - alpha-beta-CROWN: `backward_bound.py:203-210` (initial_As warm-start)
-    /// - Design: `designs/2026-02-07-gpu-bab-la-reuse-closure.md` (Dir 2b)
-    /// - Issue: #1564, #1669
     WithLaCapture {
         histories: &'a [&'a GraphSplitHistory],
         cached_la: &'a [Option<&'a CachedLinearBounds>],
@@ -474,6 +472,162 @@ fn backward_input_relative_bounds_at_node_impl(
         return None;
     }
     Some(lb)
+}
+
+/// #warm-cache-err: record one node's pending per-domain blocks for the
+/// children's lA warm-start cache (`BatchedBackwardResult::intermediate_la`,
+/// published as `CachedLinearBounds`).
+///
+/// Each block's certified coefficient error is folded into its bias over that
+/// domain's box for the node (`bounds_caches[domain_idx][node_name]`, the box
+/// the block's columns multiply), because `CachedLinearBounds` stores no
+/// error. A block that cannot be folded soundly is not recorded, so that
+/// domain's children seed at the output for this node.
+fn capture_intermediate_blocks(
+    intermediate: &mut [HashMap<String, LinearBounds>],
+    node_name: &str,
+    node_lbs: &[Option<LinearBounds>],
+    bounds_caches: &[&HashMap<String, Arc<BoundedTensor>>],
+) -> Result<()> {
+    for (domain_idx, block) in node_lbs.iter().enumerate() {
+        let Some(block) = block else { continue };
+        let Some(target) = intermediate.get_mut(domain_idx) else {
+            continue;
+        };
+        let mut captured = block.clone();
+        let node_box = bounds_caches
+            .get(domain_idx)
+            .and_then(|cache| cache.get(node_name))
+            .map(Arc::as_ref);
+        if CachedLinearBounds::fold_capture_coeff_err(&mut captured, node_box, None)? {
+            target.insert(node_name.to_string(), captured);
+        }
+    }
+    Ok(())
+}
+
+/// #la-warm-frontier: record, per domain, the rest of the backward state at
+/// the moment `node_name`'s blocks were taken (every other pending block and
+/// the network-input slot of THAT domain), error-folded over that domain's
+/// boxes. Called right after [`capture_intermediate_blocks`] and before the
+/// node is dispatched; only domains whose main block was captured get one (a
+/// child needs both). See `warm_frontier.rs` for why a child may resume from it.
+#[allow(clippy::too_many_arguments)]
+fn capture_intermediate_frontiers(
+    frontiers: &mut [HashMap<String, crate::batched_domain::WarmFrontier>],
+    captured: &[HashMap<String, LinearBounds>],
+    node_name: &str,
+    node_lbs: &[Option<LinearBounds>],
+    pending: &IndexedPendingLinearBounds,
+    plan: &CrownDispatchPlan,
+    bounds_caches: &[&HashMap<String, Arc<BoundedTensor>>],
+    constrained_inputs: &[BoundedTensor],
+    counters: &warm_frontier::WarmFrontierCounters,
+    retained_bytes: &mut usize,
+) -> Result<()> {
+    capture_intermediate_frontiers_within(
+        frontiers,
+        captured,
+        node_name,
+        node_lbs,
+        pending,
+        plan,
+        bounds_caches,
+        constrained_inputs,
+        counters,
+        crate::network::crown_memory::cpu_crown_dense_budget_bytes(),
+        retained_bytes,
+    )
+}
+
+/// [`capture_intermediate_frontiers`] under an explicit snapshot budget.
+///
+/// #la-warm-frontier (review): a capture is admitted only while this PASS's
+/// retained frontier bytes (`retained_bytes`, every frontier recorded so far
+/// for every domain and node) plus the domain's pending state it is about to
+/// clone fit `budget_bytes`; otherwise it is REFUSED before anything is
+/// cloned (`capture_refused`, reason `memory`; that node's children take the
+/// cold pass). The accumulator captures already refuse a snapshot above the
+/// dense budget (`snapshot_dense_with_deadline`); the batched core, which
+/// snapshots EVERY domain of a batch at every split-site node, previously
+/// cloned unconditionally and without bound.
+#[allow(clippy::too_many_arguments)]
+fn capture_intermediate_frontiers_within(
+    frontiers: &mut [HashMap<String, crate::batched_domain::WarmFrontier>],
+    captured: &[HashMap<String, LinearBounds>],
+    node_name: &str,
+    node_lbs: &[Option<LinearBounds>],
+    pending: &IndexedPendingLinearBounds,
+    plan: &CrownDispatchPlan,
+    bounds_caches: &[&HashMap<String, Arc<BoundedTensor>>],
+    constrained_inputs: &[BoundedTensor],
+    counters: &warm_frontier::WarmFrontierCounters,
+    budget_bytes: usize,
+    retained_bytes: &mut usize,
+) -> Result<()> {
+    for (domain_idx, block) in node_lbs.iter().enumerate() {
+        if block.is_none() {
+            continue;
+        }
+        // The block exactly as this pass stored it for the children's cache.
+        let Some(branch_block) = captured.get(domain_idx).and_then(|map| map.get(node_name)) else {
+            continue;
+        };
+        let Some(target) = frontiers.get_mut(domain_idx) else {
+            continue;
+        };
+        if retained_bytes.saturating_add(pending.domain_pending_bytes(domain_idx)) > budget_bytes {
+            counters.record_capture(crate::batched_domain::FrontierCapture::Refused("memory"));
+            continue;
+        }
+        let cache = bounds_caches.get(domain_idx);
+        let input = constrained_inputs.get(domain_idx);
+        let capture = crate::batched_domain::WarmFrontier::capture(
+            branch_block,
+            pending.snapshot_domain(domain_idx, plan),
+            |key| {
+                if key == NETWORK_INPUT {
+                    input
+                } else {
+                    cache.and_then(|map| map.get(key)).map(Arc::as_ref)
+                }
+            },
+            None,
+        )?;
+        if let Some(frontier) = counters.record_capture(capture) {
+            *retained_bytes = retained_bytes.saturating_add(frontier.estimated_owned_bytes());
+            target.insert(node_name.to_string(), frontier);
+        }
+    }
+    Ok(())
+}
+
+/// #la-warm-frontier: resume one batched domain from `seed` (its branch
+/// node's block plus the validated frontier). Every index is resolved before
+/// the first seed is written, so the domain is seeded completely or not at
+/// all (`Ok(false)`: the caller seeds the output).
+fn seed_batched_frontier(
+    node_linear_bounds: &mut IndexedPendingLinearBounds,
+    plan: &CrownDispatchPlan,
+    domain_idx: usize,
+    branch_node: &str,
+    seed: warm_frontier::FrontierSeed,
+) -> Result<bool> {
+    let Some(branch_idx) = plan.index_of(branch_node) else {
+        return Ok(false);
+    };
+    let mut resolved = Vec::with_capacity(seed.members.len());
+    for (key, block) in seed.members {
+        let Some(idx) = plan.index_of(&key) else {
+            return Ok(false);
+        };
+        resolved.push((idx, block));
+    }
+    node_linear_bounds.seed_idx(branch_idx, domain_idx, seed.branch_block)?;
+    for (idx, block) in resolved {
+        node_linear_bounds.seed_idx(idx, domain_idx, block)?;
+    }
+    Ok(true)
 }
 
 /// #clip-interm-resnet (dark, `NY_CLIP_INTERM_RESNET=1`): FINITE input-relative
@@ -1173,7 +1327,7 @@ pub(in crate::beta_crown::engine::graph) fn build_call_skeleton<V: Borrow<Bounde
 /// `None` when the lengths mismatch or construction fails (the caller keeps
 /// the dense bound unchanged — sound). Per row: non-finite wide values keep
 /// the dense row; NaN dense values are kept verbatim so the existing NaN
-/// rejection (#2982) still fires; an inverted intersection (possible only from
+/// rejection still fires; an inverted intersection (possible only from
 /// f32 slop between two sound enclosures) keeps the dense row; otherwise
 /// `l = max(l_dense, l_wide)`, `u = min(u_dense, u_wide)`.
 pub(in crate::beta_crown::engine::graph) fn graft_compose_tightest(
@@ -1240,12 +1394,26 @@ impl BetaCrownVerifier {
     /// #mo-beta-graft master gate: preset/config `mo_beta_graft`
     /// (`bab.beta_graft`), env `NY_MO_BETA_GRAFT` overrides in both directions
     /// ("1" forces on, "0" forces off — the A/B knob).
-    fn mo_beta_graft_active(&self) -> bool {
+    pub(crate) fn mo_beta_graft_active(&self) -> bool {
         match std::env::var("NY_MO_BETA_GRAFT").ok().as_deref() {
             Some("1") => true,
             Some("0") => false,
             _ => self.config.mo_beta_graft,
         }
+    }
+
+    /// #chain-wide master gate: preset/config `bab_chain_wide`
+    /// (`bab.chain_wide`) or the historical dark env lever
+    /// `NY_BAB_CHAIN_WIDE=1`. ROUTING only — it arms the FC (pure
+    /// Linear/ReLU chain) admission gates on the wide GPU stacker lane (the
+    /// multi-objective single-pass `has_conv_layers` gate and the wide
+    /// entry's `EntryGraphNotConv` decline). The wide-chain base relaxation
+    /// is measured 2.4-2.9x LOOSER than the dense backward, so FC pure-chain
+    /// suffixes are only consumed on GRAFT calls (`graft_pure_chain`), whose
+    /// wide result is captured and composed elementwise-tightest with the
+    /// dense bound (#mo-beta-graft) — never returned as a replacement.
+    pub(crate) fn bab_chain_wide_active(&self) -> bool {
+        self.config.bab_chain_wide || crate::network::bab_chain_wide_enabled()
     }
 
     /// Unified batched backward pass implementation.
@@ -1272,7 +1440,6 @@ impl BetaCrownVerifier {
     ///
     /// # Reference
     /// - alpha-beta-CROWN: `auto_LiRPA/bound_general.py` (backward pass)
-    /// - Design: designs/2026-02-09-code-structure-wave2-graph-engine-split.md (Step 4.3)
     #[allow(clippy::too_many_arguments)]
     ///
     /// GPU beta-capable resnet per-domain fast-path for the batched DomainList backward
@@ -1285,7 +1452,6 @@ impl BetaCrownVerifier {
     /// the proven node-by-node batched backward. Default ON (opt out
     /// `NY_RESNET_BETA_GPU=0`), sound (β≥0 valid dual + sound GPU enclosure); CPU
     /// fallback preserves the 0-wrong moat.
-    #[allow(clippy::too_many_arguments)]
     fn try_gpu_beta_batched_resnet(
         &self,
         graph: &GraphNetwork,
@@ -1413,10 +1579,20 @@ impl BetaCrownVerifier {
         let _fallback_deadline_scope = local_wide_fallback.map(|gpu| {
             crate::sound_gpu_gate::GpuCrownBackendDeadlineScope::set(gpu, authority_deadline)
         });
-        if !graph
+        // #chain-wide (S2): the conv-only check is ROUTING POLICY, not a kernel
+        // limit — Chain segments are kind-agnostic and the segment extractor
+        // admits `Layer::Linear`. Lift it for FC (pure Linear/ReLU chain)
+        // graphs ONLY on graft calls with the typed `bab.chain_wide` key
+        // armed: `graft_pure_chain` marks the #mo-beta-graft composition call,
+        // whose wide result is CAPTURED and composed elementwise-tightest with
+        // the dense bound. Non-graft calls on non-conv graphs keep declining
+        // here, so the 2.4-2.9x-looser wide-chain bound can never REPLACE the
+        // dense bound on FC. Unarmed (default), this is byte-identical.
+        if !(graph
             .nodes
             .values()
             .any(|n| matches!(n.layer, Layer::Conv2d(_)))
+            || graft_pure_chain && self.bab_chain_wide_active())
         {
             note_wide_lane_decline(WideLaneDecline::EntryGraphNotConv);
             return None;
@@ -1462,7 +1638,12 @@ impl BetaCrownVerifier {
         // #batched-bab: the per-domain prep is `prep_resnet_domain` (module scope,
         // shared with the #interm-refine truncated backward), byte-identical to the
         // historical inline closure.
-        let allow_pure_chain = crate::network::bab_chain_wide_enabled() || graft_pure_chain;
+        // #chain-wide: the typed `bab.chain_wide` key joins the historical env
+        // lever here (both routed through `bab_chain_wide_active`). On FC
+        // graphs the entry gate above already restricted pure-chain admission
+        // to graft (composition) calls; on conv graphs this keeps the
+        // documented replacement semantics of `NY_BAB_CHAIN_WIDE=1`.
+        let allow_pure_chain = self.bab_chain_wide_active() || graft_pure_chain;
         // #extract-skeleton increment 3: the static skeleton now comes from
         // the verifier-level cross-batch cache (`self.skeleton_cache`) — a hit
         // re-validates `matches_graph` and serves the SAME `Arc` to every
@@ -2248,6 +2429,8 @@ impl BetaCrownVerifier {
         row_verified: &[bool],
         num_specs: usize,
     ) -> Option<(Vec<f32>, Vec<f32>, GraphBetaState)> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BetaOpt);
         if thresholds.len() != num_specs
             || row_verified.len() != num_specs
             || thresholds.iter().any(|threshold| !threshold.is_finite())
@@ -2349,7 +2532,7 @@ impl BetaCrownVerifier {
 
         for iter in 0..iterations {
             // Deadline between iterations: each GPU pass is bounded; stopping
-            // early just returns the best sound bounds so far (#3109 analog).
+            // early just returns the best sound bounds so far.
             if self.past_effective_graph_bab_deadline() {
                 if iter == 0 {
                     return None;
@@ -2549,6 +2732,8 @@ impl BetaCrownVerifier {
         Vec<Option<GraphBetaState>>,
         Vec<Option<GraphDomainAlphaState>>,
     )> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BetaOpt);
         let n_domains = preps.len();
         if n_domains == 0 || bounds_caches.len() != n_domains || beta_states.len() != n_domains {
             return None;
@@ -3893,18 +4078,19 @@ impl BetaCrownVerifier {
         mode: BatchedBackwardMode<'_>,
         mul_binary_alphas: Option<&HashMap<String, Array2<f32>>>,
     ) -> Result<BatchedBackwardResult> {
-        // Guard: empty domain batch would panic at bounds_caches[0] (line 124). (#2671)
+        // Guard: empty domain batch would panic at bounds_caches[0] (line 124).
         // The primary caller guards with ctx.is_empty() but this is a pub(super) fn
         // that could be called by other paths without that guard.
         if n_domains == 0 || bounds_caches.is_empty() {
             return Ok(BatchedBackwardResult {
                 results: Vec::new(),
                 intermediate_la: None,
+                intermediate_frontiers: None,
                 stage_timing: None,
             });
         }
 
-        // Structural invariant: all parallel arrays must match n_domains. (#2824, #2671)
+        // Structural invariant: all parallel arrays must match n_domains.
         // Runtime check — debug_assert is compiled out in release builds.
         if bounds_caches.len() != n_domains
             || constrained_inputs.len() != n_domains
@@ -4004,6 +4190,7 @@ impl BetaCrownVerifier {
                 return Ok(BatchedBackwardResult {
                     results,
                     intermediate_la: None,
+                    intermediate_frontiers: None,
                     stage_timing: None,
                 });
             }
@@ -4030,7 +4217,6 @@ impl BetaCrownVerifier {
         // at the branch point instead.
         //
         // Reference: alpha-beta-CROWN `initial_As` in backward_bound.py:203-210
-        //            Design: designs/2026-02-07-gpu-bab-la-reuse-closure.md (Dir 2b)
         let capture_intermediate = match &mode {
             BatchedBackwardMode::Standard => {
                 // Simple case: all domains seed at output
@@ -4044,7 +4230,7 @@ impl BetaCrownVerifier {
                 cached_la,
                 capture_intermediate,
             } => {
-                // Structural invariant: WithLaCapture arrays must match n_domains. (#2824, #2671)
+                // Structural invariant: WithLaCapture arrays must match n_domains.
                 if histories.len() != n_domains || cached_la.len() != n_domains {
                     return Err(NyError::InternalError(format!(
                         "WithLaCapture: array length mismatch (n_domains={n_domains}): \
@@ -4055,6 +4241,8 @@ impl BetaCrownVerifier {
                 }
 
                 let mut n_warm_started = 0usize;
+                let mut n_refused_incomplete = 0usize;
+                let mut n_frontier_resumed = 0usize;
 
                 for domain_idx in 0..n_domains {
                     let warm_started = 'warm: {
@@ -4076,6 +4264,54 @@ impl BetaCrownVerifier {
                             None => break 'warm false, // root domain, no branch point
                         };
 
+                        // #warm-dag: the cached block at the branch node bounds the
+                        // objective only if the output reaches it through a unary
+                        // chain (`propagation/warm_start_guard.rs`); otherwise the
+                        // parent still held skip-path blocks / diverted bias when it
+                        // captured it. Refuse and seed this domain at the output.
+                        if !super::warm_start_guard::la_warm_start_seed_is_complete(
+                            graph,
+                            output_node,
+                            branch_node,
+                        ) {
+                            // #la-warm-frontier (armed only): resume from the
+                            // branch node's block plus the whole frontier the
+                            // capturing pass held there, or stay cold.
+                            if let Some(counters) = self.la_warm_frontier_armed() {
+                                let domain_cache = &bounds_caches[domain_idx];
+                                match warm_frontier::resolve_frontier_seed(
+                                    graph,
+                                    branch_node,
+                                    cache,
+                                    1,
+                                    constrained_inputs[domain_idx].len(),
+                                    |key| domain_cache.get(key).map(|bounds| bounds.len()),
+                                ) {
+                                    Ok(seed) => {
+                                        if seed_batched_frontier(
+                                            &mut node_linear_bounds,
+                                            plan,
+                                            domain_idx,
+                                            branch_node,
+                                            seed,
+                                        )? {
+                                            counters.record_resumed(
+                                                warm_frontier::WarmFrontierSite::Batched,
+                                            );
+                                            n_frontier_resumed += 1;
+                                            break 'warm true;
+                                        }
+                                        counters.record_refusal(
+                                            warm_frontier::FrontierSeedRefusal::Invalid("index"),
+                                        );
+                                    }
+                                    Err(refusal) => counters.record_refusal(refusal),
+                                }
+                            }
+                            n_refused_incomplete += 1;
+                            break 'warm false;
+                        }
+
                         // Reconstruct full LinearBounds at the branch node
                         let warm_lb = match cache.linear_bounds(branch_node) {
                             Some(lb) => lb,
@@ -4089,6 +4325,9 @@ impl BetaCrownVerifier {
 
                         // Seed at the branch node for this domain
                         node_linear_bounds.seed_idx(branch_idx, domain_idx, warm_lb)?;
+                        if let Some(counters) = self.la_warm_frontier_armed() {
+                            counters.record_single_seed();
+                        }
                         n_warm_started += 1;
                         true
                     };
@@ -4098,7 +4337,27 @@ impl BetaCrownVerifier {
                     }
                 }
 
-                // Log warm-start statistics (#1669)
+                // Log warm-start statistics
+                if n_frontier_resumed > 0 {
+                    tracing::debug!(
+                        n_frontier_resumed,
+                        n_domains,
+                        "lA warm-start resumed {}/{} domains from their full backward frontier \
+                         (#la-warm-frontier)",
+                        n_frontier_resumed,
+                        n_domains
+                    );
+                }
+                if n_refused_incomplete > 0 {
+                    tracing::debug!(
+                        n_refused_incomplete = n_refused_incomplete,
+                        n_domains = n_domains,
+                        "lA warm-start refused for {}/{} domains: the output does not reach the \
+                         branch node through a unary chain (#warm-dag)",
+                        n_refused_incomplete,
+                        n_domains
+                    );
+                }
                 if n_warm_started > 0 {
                     tracing::debug!(
                         n_warm_started = n_warm_started,
@@ -4132,6 +4391,14 @@ impl BetaCrownVerifier {
             } else {
                 None
             };
+        // #la-warm-frontier: frontier storage, only when capturing AND armed.
+        let frontier_counters = self.la_warm_frontier_armed();
+        let mut intermediate_frontiers_per_domain: Option<
+            Vec<HashMap<String, crate::batched_domain::WarmFrontier>>,
+        > = (capture_intermediate && frontier_counters.is_some())
+            .then(|| (0..n_domains).map(|_| HashMap::new()).collect());
+        // #la-warm-frontier (review): this pass's retained frontier bytes.
+        let mut frontier_retained_bytes = 0usize;
         let nodes_by_idx = build_nodes_by_idx(graph, plan)?;
 
         // Backward propagation through nodes in reverse topological order.
@@ -4151,9 +4418,24 @@ impl BetaCrownVerifier {
 
             // Capture intermediate lA if enabled (before processing)
             if let Some(ref mut intermediate) = intermediate_per_domain {
-                for (domain_idx, lb_opt) in node_lbs.iter().enumerate() {
-                    if let Some(lb) = lb_opt {
-                        intermediate[domain_idx].insert(node_name.to_string(), lb.clone());
+                capture_intermediate_blocks(intermediate, node_name, &node_lbs, &cache_refs)?;
+                if let (Some(frontiers), Some(counters)) = (
+                    intermediate_frontiers_per_domain.as_mut(),
+                    frontier_counters,
+                ) {
+                    if warm_frontier::is_frontier_capture_site(&node.layer) {
+                        capture_intermediate_frontiers(
+                            frontiers,
+                            intermediate,
+                            node_name,
+                            &node_lbs,
+                            &node_linear_bounds,
+                            plan,
+                            &cache_refs,
+                            constrained_inputs,
+                            counters,
+                            &mut frontier_retained_bytes,
+                        )?;
                     }
                 }
             }
@@ -4176,6 +4458,7 @@ impl BetaCrownVerifier {
             )?;
         }
 
+        let objectives = vec![objective; n_domains];
         let results = Self::concretize_batched_results(
             constrained_inputs,
             bounds_caches,
@@ -4183,11 +4466,13 @@ impl BetaCrownVerifier {
             output_node,
             &output_shape,
             n_domains,
+            &objectives,
         )?;
 
         Ok(BatchedBackwardResult {
             results,
             intermediate_la: intermediate_per_domain,
+            intermediate_frontiers: intermediate_frontiers_per_domain,
             stage_timing: None, // Timing set by caller (batched_forward_then_backward)
         })
     }
@@ -4300,13 +4585,13 @@ impl BetaCrownVerifier {
                     Ok(())
                 }
             },
-            // #3166: Catch both UnsupportedOp and UnsupportedConfiguration.
+            // Catch both UnsupportedOp and UnsupportedConfiguration.
             Err(NyError::UnsupportedOp(msg) | NyError::UnsupportedConfiguration(msg)) => {
                 // Identity pass-through for UnsupportedOp is unsound: the layer's
                 // transformation is skipped entirely, producing incorrect bounds.
                 // For multi-input ops, passing same bounds to all inputs also
                 // double-counts contributions. Return error to trigger sequential
-                // fallback in the BaB loop (#1996, same fix class as #1934).
+                // fallback in the BaB loop.
                 Err(NyError::UnsupportedOp(format!(
                     "Batched CROWN backward at node '{}' ({}): {}",
                     node_name,
@@ -4326,6 +4611,15 @@ impl BetaCrownVerifier {
     /// Concretize final linear bounds at network input for each domain.
     ///
     /// Shared finalization step for both standard and lA-capture backward passes.
+    ///
+    /// `objectives[d]` is domain `d`'s objective row `c`: the backward pass
+    /// bounds `c·out`, while `cache[output_node]` is a forward (IBP) box on
+    /// `out` itself. #objective-tightening: that box is mapped through `c`
+    /// (`objectives::objective_bounds`, directed rounding) before it is used
+    /// as the IBP fallback or intersected with the CROWN interval (#2904).
+    /// Intersecting the raw box was sound only for `c = [1]`; on a
+    /// single-output net with `c = [-1]` it put the lower bound above the
+    /// true minimum.
     fn concretize_batched_results(
         constrained_inputs: &[BoundedTensor],
         bounds_caches: &[HashMap<String, Arc<BoundedTensor>>],
@@ -4333,16 +4627,31 @@ impl BetaCrownVerifier {
         output_node: &str,
         output_shape: &[usize],
         n_domains: usize,
+        objectives: &[&[f32]],
     ) -> Result<Vec<DomainCrownResult>> {
-        // Structural invariant: parallel arrays must match n_domains. (#2824, #2671)
-        if constrained_inputs.len() != n_domains || bounds_caches.len() != n_domains {
+        // Structural invariant: parallel arrays must match n_domains.
+        if constrained_inputs.len() != n_domains
+            || bounds_caches.len() != n_domains
+            || objectives.len() != n_domains
+        {
             return Err(NyError::InternalError(format!(
                 "concretize_batched_results: parallel array length mismatch \
-                 (n_domains={n_domains}): constrained_inputs={}, bounds_caches={}",
+                 (n_domains={n_domains}): constrained_inputs={}, bounds_caches={}, objectives={}",
                 constrained_inputs.len(),
                 bounds_caches.len(),
+                objectives.len(),
             )));
         }
+        // The forward box of `out` mapped through the objective, shaped like
+        // the CROWN output; `None` when the objective does not fit the box.
+        let objective_box = |forward: &BoundedTensor, objective: &[f32]| -> Option<BoundedTensor> {
+            let (lower, upper) = objective_bounds(forward, objective).ok()?;
+            BoundedTensor::new(
+                ndarray::ArrayD::from_elem(ndarray::IxDyn(output_shape), lower),
+                ndarray::ArrayD::from_elem(ndarray::IxDyn(output_shape), upper),
+            )
+            .ok()
+        };
 
         let mut results: Vec<DomainCrownResult> = Vec::with_capacity(n_domains);
 
@@ -4351,6 +4660,7 @@ impl BetaCrownVerifier {
 
         for domain_idx in 0..n_domains {
             let cache = &bounds_caches[domain_idx];
+            let objective = objectives[domain_idx];
 
             let output_bounds = if input_accumulated[domain_idx] {
                 let final_lb = input_bounds_vec
@@ -4362,12 +4672,12 @@ impl BetaCrownVerifier {
                             domain_idx
                         ))
                     })?;
-                // #2239: directed rounding on f64→f32 for soundness.
+                // Directed rounding on f64→f32 for soundness.
                 let crown_output = final_lb
                     .concretize_sound(&constrained_inputs[domain_idx])
                     .reshape(output_shape)?;
 
-                // #2904: Tighten CROWN backward bounds by intersecting with IBP
+                // Tighten CROWN backward bounds by intersecting with IBP
                 // forward bounds. The single-domain path (propagation.rs:655-712)
                 // checks for NaN/inverted CROWN output and falls back to IBP
                 // before attempting tightening. The batched path must match.
@@ -4384,21 +4694,27 @@ impl BetaCrownVerifier {
                     .any(|(&l, &u)| l > u);
 
                 if let Some(forward_bounds) = cache.get(output_node) {
+                    // #objective-tightening: `forward_bounds` encloses `out`,
+                    // the CROWN interval encloses `objective·out`.
+                    let forward_objective = objective_box(forward_bounds, objective);
                     if crown_has_bad || crown_inverted {
                         // CROWN backward produced invalid bounds. Fall back to
                         // forward (IBP) bounds entirely, matching single-domain
                         // path at propagation.rs:655-676.
-                        let fwd_has_bad = forward_bounds
-                            .lower()
-                            .iter()
-                            .chain(forward_bounds.upper().iter())
-                            .any(|v| !v.is_finite());
-                        let fwd_inverted = forward_bounds
-                            .lower()
-                            .iter()
-                            .zip(forward_bounds.upper().iter())
-                            .any(|(&l, &u)| l > u);
-                        if !fwd_has_bad && !fwd_inverted {
+                        let usable_forward = forward_objective.filter(|forward| {
+                            let fwd_has_bad = forward
+                                .lower()
+                                .iter()
+                                .chain(forward.upper().iter())
+                                .any(|v| !v.is_finite());
+                            let fwd_inverted = forward
+                                .lower()
+                                .iter()
+                                .zip(forward.upper().iter())
+                                .any(|(&l, &u)| l > u);
+                            !fwd_has_bad && !fwd_inverted
+                        });
+                        if let Some(forward) = usable_forward {
                             tracing::debug!(
                                 "Batched CROWN domain {}: falling back to IBP forward bounds \
                                  (crown_non_finite={}, crown_inverted={})",
@@ -4406,17 +4722,22 @@ impl BetaCrownVerifier {
                                 crown_has_bad,
                                 crown_inverted
                             );
-                            forward_bounds.as_ref().clone()
+                            forward
                         } else {
                             // Both CROWN and forward bounds are bad — return
                             // CROWN output and let downstream NaN guards handle it.
                             crown_output
                         }
-                    } else if crown_output.shape() == forward_bounds.shape() {
+                    } else if let Some(forward) = forward_objective
+                        .as_ref()
+                        .filter(|_| crown_output.shape() == forward_bounds.shape())
+                    {
+                        // Same trigger as before (a single-output net), now
+                        // against the objective-mapped box.
                         let (tightened, disjoint_count) =
                             crate::network::tighten_crown_with_forward_bounds(
                                 &crown_output,
-                                forward_bounds,
+                                forward,
                             )?;
                         if disjoint_count > 0 {
                             tracing::warn!(
@@ -4435,16 +4756,14 @@ impl BetaCrownVerifier {
                     crown_output
                 }
             } else {
-                // No backward pass reached input - fall back to IBP.
-                // (Owned copy of the single output tensor — pre-existing
-                // behavior on this fallback; the map clone is Arc-shallow.)
-                let output = cache
-                    .get(output_node)
-                    .ok_or_else(|| {
-                        NyError::InvalidSpec(format!("Output node {} not found", output_node))
-                    })?
-                    .as_ref()
-                    .clone();
+                // No backward pass reached input - fall back to IBP, mapped
+                // through the objective (#objective-tightening); the map clone
+                // is Arc-shallow.
+                let forward = cache.get(output_node).ok_or_else(|| {
+                    NyError::InvalidSpec(format!("Output node {} not found", output_node))
+                })?;
+                let output = objective_box(forward, objective)
+                    .unwrap_or_else(|| BoundedTensor::new_conservative(output_shape));
                 results.push((output, cache.clone()));
                 continue;
             };
@@ -4463,8 +4782,6 @@ impl BetaCrownVerifier {
     /// 1. The initial seed uses the full spec matrix (nrows > 1 allowed).
     /// 2. output_shape is `[spec_matrix.nrows()]` instead of `[1]`.
     /// 3. Concretization preserves per-domain input `LinearBounds`.
-    ///
-    /// Part of #4116 Packet A: dense-spec result surface.
     ///
     /// # Arguments
     /// * `spec_matrix` - Dense spec matrix with shape `(num_specs, output_dim)`.
@@ -4500,6 +4817,7 @@ impl BetaCrownVerifier {
             return Ok(BatchedSpecBackwardResult {
                 results: Vec::new(),
                 intermediate_la: None,
+                intermediate_frontiers: None,
                 stage_timing: None,
                 optimized_betas: None,
                 optimized_alphas: None,
@@ -4631,7 +4949,7 @@ impl BetaCrownVerifier {
         // (one resnet-kernel call per domain, num_specs=N in a single call — the ~Nx
         // speedup vs the dense node-by-node batched backward). cifar100 hits this driver
         // with num_specs=99. Gated, sound (β≥0 dual + sound GPU enclosure), CPU fallback.
-        // input_linear=None on this path → BaB uses its fallback split scoring (#4116).
+        // input_linear=None on this path → BaB uses its fallback split scoring.
         // Under the graft the wide result is CAPTURED (not returned): the dense
         // backward below still runs and the two bounds are composed at the end.
         if matches!(mode, BatchedBackwardMode::Standard) {
@@ -4697,6 +5015,7 @@ impl BetaCrownVerifier {
                     return Ok(BatchedSpecBackwardResult {
                         results,
                         intermediate_la: None,
+                        intermediate_frontiers: None,
                         stage_timing: None,
                         optimized_betas: Some(optimized_betas),
                         optimized_alphas,
@@ -4768,6 +5087,7 @@ impl BetaCrownVerifier {
                 return Ok(BatchedSpecBackwardResult {
                     results,
                     intermediate_la: None,
+                    intermediate_frontiers: None,
                     stage_timing: None,
                     optimized_betas: None,
                     optimized_alphas: None,
@@ -4811,6 +5131,8 @@ impl BetaCrownVerifier {
                 // pass and won't match the multi-row seed shape. Fall back to output
                 // seeding for all domains in this path.
                 let mut n_warm_started = 0usize;
+                let mut n_refused_incomplete = 0usize;
+                let mut n_frontier_resumed = 0usize;
 
                 for domain_idx in 0..n_domains {
                     let warm_started = 'warm: {
@@ -4826,6 +5148,49 @@ impl BetaCrownVerifier {
                             Some(n) => n,
                             None => break 'warm false,
                         };
+                        // #warm-dag: same completeness condition as the scalar
+                        // core (`propagation/warm_start_guard.rs`).
+                        if !super::warm_start_guard::la_warm_start_seed_is_complete(
+                            graph,
+                            output_node,
+                            branch_node,
+                        ) {
+                            // #la-warm-frontier (armed only): the frontier must
+                            // carry this call's `num_specs` rows.
+                            if let Some(counters) = self.la_warm_frontier_armed() {
+                                let domain_cache = bounds_caches[domain_idx];
+                                match warm_frontier::resolve_frontier_seed(
+                                    graph,
+                                    branch_node,
+                                    cache,
+                                    num_specs,
+                                    constrained_inputs[domain_idx].len(),
+                                    |key| domain_cache.get(key).map(|bounds| bounds.len()),
+                                ) {
+                                    Ok(seed) => {
+                                        if seed_batched_frontier(
+                                            &mut node_linear_bounds,
+                                            plan,
+                                            domain_idx,
+                                            branch_node,
+                                            seed,
+                                        )? {
+                                            counters.record_resumed(
+                                                warm_frontier::WarmFrontierSite::DenseSpec,
+                                            );
+                                            n_frontier_resumed += 1;
+                                            break 'warm true;
+                                        }
+                                        counters.record_refusal(
+                                            warm_frontier::FrontierSeedRefusal::Invalid("index"),
+                                        );
+                                    }
+                                    Err(refusal) => counters.record_refusal(refusal),
+                                }
+                            }
+                            n_refused_incomplete += 1;
+                            break 'warm false;
+                        }
                         let warm_lb = match cache.linear_bounds(branch_node) {
                             Some(lb) => lb,
                             None => break 'warm false,
@@ -4843,6 +5208,9 @@ impl BetaCrownVerifier {
                             None => break 'warm false,
                         };
                         node_linear_bounds.seed_idx(branch_idx, domain_idx, warm_lb)?;
+                        if let Some(counters) = self.la_warm_frontier_armed() {
+                            counters.record_single_seed();
+                        }
                         n_warm_started += 1;
                         true
                     };
@@ -4851,6 +5219,28 @@ impl BetaCrownVerifier {
                     }
                 }
 
+                if n_frontier_resumed > 0 {
+                    tracing::debug!(
+                        n_frontier_resumed,
+                        n_domains,
+                        num_specs,
+                        "dense-spec lA warm-start resumed {}/{} domains from their full backward \
+                         frontier (#la-warm-frontier)",
+                        n_frontier_resumed,
+                        n_domains
+                    );
+                }
+                if n_refused_incomplete > 0 {
+                    tracing::debug!(
+                        n_refused_incomplete = n_refused_incomplete,
+                        n_domains = n_domains,
+                        num_specs = num_specs,
+                        "dense-spec lA warm-start refused for {}/{} domains: the output does \
+                         not reach the branch node through a unary chain (#warm-dag)",
+                        n_refused_incomplete,
+                        n_domains
+                    );
+                }
                 if n_warm_started > 0 {
                     tracing::debug!(
                         n_warm_started = n_warm_started,
@@ -4872,6 +5262,14 @@ impl BetaCrownVerifier {
             } else {
                 None
             };
+        // #la-warm-frontier: frontier storage, only when capturing AND armed.
+        let frontier_counters = self.la_warm_frontier_armed();
+        let mut intermediate_frontiers_per_domain: Option<
+            Vec<HashMap<String, crate::batched_domain::WarmFrontier>>,
+        > = (capture_intermediate && frontier_counters.is_some())
+            .then(|| (0..n_domains).map(|_| HashMap::new()).collect());
+        // #la-warm-frontier (review): this pass's retained frontier bytes.
+        let mut frontier_retained_bytes = 0usize;
         let nodes_by_idx = build_nodes_by_idx(graph, plan)?;
 
         // Backward traversal — identical to scalar core.
@@ -4889,9 +5287,24 @@ impl BetaCrownVerifier {
             }
 
             if let Some(ref mut intermediate) = intermediate_per_domain {
-                for (domain_idx, lb_opt) in node_lbs.iter().enumerate() {
-                    if let Some(lb) = lb_opt {
-                        intermediate[domain_idx].insert(node_name.to_string(), lb.clone());
+                capture_intermediate_blocks(intermediate, node_name, &node_lbs, bounds_caches)?;
+                if let (Some(frontiers), Some(counters)) = (
+                    intermediate_frontiers_per_domain.as_mut(),
+                    frontier_counters,
+                ) {
+                    if warm_frontier::is_frontier_capture_site(&node.layer) {
+                        capture_intermediate_frontiers(
+                            frontiers,
+                            intermediate,
+                            node_name,
+                            &node_lbs,
+                            &node_linear_bounds,
+                            plan,
+                            bounds_caches,
+                            constrained_inputs,
+                            counters,
+                            &mut frontier_retained_bytes,
+                        )?;
                     }
                 }
             }
@@ -5028,6 +5441,7 @@ impl BetaCrownVerifier {
             return Ok(BatchedSpecBackwardResult {
                 results,
                 intermediate_la: intermediate_per_domain,
+                intermediate_frontiers: intermediate_frontiers_per_domain,
                 stage_timing: None,
                 // Children keep their inherited β/α (see above).
                 optimized_betas: None,
@@ -5039,6 +5453,7 @@ impl BetaCrownVerifier {
         Ok(BatchedSpecBackwardResult {
             results,
             intermediate_la: intermediate_per_domain,
+            intermediate_frontiers: intermediate_frontiers_per_domain,
             stage_timing: None,
             optimized_betas: None,
             optimized_alphas: None,
@@ -5046,7 +5461,7 @@ impl BetaCrownVerifier {
         })
     }
 
-    /// Per-domain-objective batched CROWN backward core (#4355).
+    /// Per-domain-objective batched CROWN backward core.
     ///
     /// Like `propagate_crown_batched_backward_core` but each domain gets its own
     /// 1-row objective vector instead of sharing one objective across all domains.
@@ -5074,6 +5489,7 @@ impl BetaCrownVerifier {
             return Ok(BatchedBackwardResult {
                 results: Vec::new(),
                 intermediate_la: None,
+                intermediate_frontiers: None,
                 stage_timing: None,
             });
         }
@@ -5146,6 +5562,14 @@ impl BetaCrownVerifier {
             } else {
                 None
             };
+        // #la-warm-frontier: frontier storage, only when capturing AND armed.
+        let frontier_counters = self.la_warm_frontier_armed();
+        let mut intermediate_frontiers_per_domain: Option<
+            Vec<HashMap<String, crate::batched_domain::WarmFrontier>>,
+        > = (capture_intermediate && frontier_counters.is_some())
+            .then(|| (0..n_domains).map(|_| HashMap::new()).collect());
+        // #la-warm-frontier (review): this pass's retained frontier bytes.
+        let mut frontier_retained_bytes = 0usize;
         let nodes_by_idx = build_nodes_by_idx(graph, plan)?;
 
         // Backward traversal — identical to scalar/spec cores.
@@ -5163,9 +5587,24 @@ impl BetaCrownVerifier {
             }
 
             if let Some(ref mut intermediate) = intermediate_per_domain {
-                for (domain_idx, lb_opt) in node_lbs.iter().enumerate() {
-                    if let Some(lb) = lb_opt {
-                        intermediate[domain_idx].insert(node_name.to_string(), lb.clone());
+                capture_intermediate_blocks(intermediate, node_name, &node_lbs, &cache_refs)?;
+                if let (Some(frontiers), Some(counters)) = (
+                    intermediate_frontiers_per_domain.as_mut(),
+                    frontier_counters,
+                ) {
+                    if warm_frontier::is_frontier_capture_site(&node.layer) {
+                        capture_intermediate_frontiers(
+                            frontiers,
+                            intermediate,
+                            node_name,
+                            &node_lbs,
+                            &node_linear_bounds,
+                            plan,
+                            &cache_refs,
+                            constrained_inputs,
+                            counters,
+                            &mut frontier_retained_bytes,
+                        )?;
                     }
                 }
             }
@@ -5188,6 +5627,7 @@ impl BetaCrownVerifier {
             )?;
         }
 
+        let objectives: Vec<&[f32]> = per_domain_objectives.iter().map(Vec::as_slice).collect();
         let results = Self::concretize_batched_results(
             constrained_inputs,
             bounds_caches,
@@ -5195,11 +5635,13 @@ impl BetaCrownVerifier {
             output_node,
             &output_shape,
             n_domains,
+            &objectives,
         )?;
 
         Ok(BatchedBackwardResult {
             results,
             intermediate_la: intermediate_per_domain,
+            intermediate_frontiers: intermediate_frontiers_per_domain,
             stage_timing: None, // Timing set by caller
         })
     }
@@ -5210,8 +5652,6 @@ impl BetaCrownVerifier {
     /// method captures the final input `LinearBounds` for each domain instead of
     /// discarding them, and returns `DomainSpecCrownResult` instead of the scalar
     /// `DomainCrownResult` tuple.
-    ///
-    /// Part of #4116 Packet A Step 2.
     ///
     /// `skip_node_bounds` (#lsnc-skip-node-bounds S3b): when true, the
     /// per-domain `node_bounds` map is left EMPTY instead of deep-cloned —
@@ -5292,7 +5732,7 @@ impl BetaCrownVerifier {
 
                 // Track whether CROWN backward produced numerically bad output.
                 // If so, input_linear must be None — the linear coefficients from an
-                // unstable backward pass cannot be trusted for split scoring. (#4116)
+                // unstable backward pass cannot be trusted for split scoring.
                 let mut crown_is_reliable = true;
 
                 if crown_has_bad || crown_inverted {
@@ -5306,7 +5746,7 @@ impl BetaCrownVerifier {
 
                 // Capture input_linear only when CROWN backward was reliable.
                 // Unreliable linear coefficients from NaN/Inf/inverted backward
-                // passes must not flow to split scoring. (#4116, self-audit finding 1)
+                // passes must not flow to split scoring.
                 results.push(DomainSpecCrownResult {
                     output_bounds,
                     // #lsnc-skip-node-bounds S3b: unread by input-split.

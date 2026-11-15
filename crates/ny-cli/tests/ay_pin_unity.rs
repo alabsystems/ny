@@ -25,11 +25,9 @@
 //! builder rejects it — which is why this cheap test exists at the `cargo test`
 //! layer, where it is seen immediately.
 //!
-//! This has now happened twice, both times because one crate was bumped alone:
-//!   * 2026-08-05, ny-mip -> 1f15fd8c while ny-cli stayed at 6bb7453d
-//!   * 2026-08-07, ny-mip -> 2e41cf2b while ny-cli stayed at 38a5d4f9
-//!
-//! Both were caught only by running the sealed builder by hand.
+//! This has happened twice, both times because ny-mip was bumped alone while
+//! ny-cli kept its old pin, and both were caught only by running the sealed
+//! builder by hand.
 //!
 //! When bumping AY, bump EVERY pin below together and regenerate `Cargo.lock`.
 
@@ -123,7 +121,7 @@ fn the_lockfile_resolves_exactly_one_ay_revision() {
         revisions.len(),
         1,
         "Cargo.lock resolves {} distinct AY revisions: {revisions:#?}\n\
-         Regenerate it after unifying the manifest pins; `cargo build --locked` (which the \
+         Regenerate it after unifying the manifest pins; `targo --unverified build --locked` (which the \
          sealed submission builder uses) refuses a lock that disagrees with the manifests.",
         revisions.len()
     );

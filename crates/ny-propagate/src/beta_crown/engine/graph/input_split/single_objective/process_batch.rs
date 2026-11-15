@@ -167,6 +167,13 @@ where
             .config
             .domain_is_verified(domain.lower_bound, domain.upper_bound, threshold)
         {
+            verifier.cover_note_box_bound(
+                objective,
+                threshold,
+                domain.input_bounds.as_ref(),
+                domain.lower_bound,
+                domain.upper_bound,
+            );
             lifecycle.domains_verified += 1;
             continue;
         }
@@ -272,6 +279,7 @@ where
 
     for (child, verified) in pending_children.into_iter().zip(verified_mask) {
         if verified {
+            verifier.cover_note_box_screened(objective, threshold, &child.input_bounds);
             *domains_verified_by_ibp += 1;
             lifecycle.domains_verified += 1;
             continue;
@@ -343,7 +351,9 @@ where
                 domains_screened_by_crown,
             )?;
             if let Some(child) = child {
-                push_single_objective_child(verifier, threshold, queue, lifecycle, child);
+                push_single_objective_child(
+                    verifier, objective, threshold, queue, lifecycle, child,
+                );
             }
             return Ok(());
         }
@@ -359,9 +369,11 @@ where
             engine,
         )?;
         if clip_result.verified {
+            verifier.cover_note_box_clip_closed(objective, threshold, &child_input);
             lifecycle.domains_verified += 1;
             return Ok(());
         }
+        verifier.cover_note_box_clip(objective, threshold, &child_input, &clip_result.bounds);
         child_input = clip_result.bounds;
         node_bounds_override = clip_result.complete_clip_node_bounds.map(Arc::new);
     }
@@ -414,6 +426,13 @@ where
             .config
             .domain_is_verified(domain.lower_bound, domain.upper_bound, threshold)
         {
+            verifier.cover_note_box_bound(
+                objective,
+                threshold,
+                domain.input_bounds.as_ref(),
+                domain.lower_bound,
+                domain.upper_bound,
+            );
             lifecycle.domains_verified += 1;
             continue;
         }
@@ -487,7 +506,7 @@ where
         }
 
         for child in child_domains.into_iter().flatten() {
-            push_single_objective_child(verifier, threshold, queue, lifecycle, child);
+            push_single_objective_child(verifier, objective, threshold, queue, lifecycle, child);
         }
     }
 
@@ -496,6 +515,7 @@ where
 
 fn push_single_objective_child(
     verifier: &BetaCrownVerifier,
+    objective: &[f32],
     threshold: f32,
     queue: &mut BinaryHeap<GraphInputDomain>,
     lifecycle: &mut GraphBabLifecycle,
@@ -508,6 +528,13 @@ fn push_single_objective_child(
     {
         queue.push(child);
     } else {
+        verifier.cover_note_box_bound(
+            objective,
+            threshold,
+            child.input_bounds.as_ref(),
+            child.lower_bound,
+            child.upper_bound,
+        );
         lifecycle.domains_verified += 1;
     }
 }

@@ -9,8 +9,8 @@ use ndarray::{Array1, Array2};
 use ny_core::GemmEngine;
 use ny_tensor::BoundedTensor;
 
-/// #envelope-grad gate (dark, default OFF ⇒ byte-identical): replace the
-/// local rule's `pre_lower[i]` factor with a point-forward value at the current
+/// #envelope-grad gate (default OFF ⇒ byte-identical): replace the local
+/// rule's `pre_lower[i]` factor with a point-forward value at the current
 /// binding row's concretization argmin.
 ///
 /// The shipped local rule is `Σ_j [A[j,i]]_+ · l_i`. Every factor is
@@ -30,33 +30,203 @@ use ny_tensor::BoundedTensor;
 /// ReLUs can differ. It is not sign-definite; the finite-difference fixtures in
 /// `backward/true_grad_oracle_tests.rs` show better aggregate error and sign
 /// recovery than the local rule, not an exact or uniformly better gradient.
-/// The gate remains dark, and no verdict conversion has been measured.
-pub(crate) fn envelope_grad_enabled() -> bool {
-    envelope_grad_enabled_with(None)
-}
-
-/// [`envelope_grad_enabled`] with the typed preset answer layered in.
 ///
-/// DELIVERY, and the reason this function exists: `vnncomp_scripts/run_instance.sh`
-/// exports no `NY_*` variables, so an env-only lever cannot fire in
-/// competition however well it measures (`ny-cli/tests/measured_gate_delivery.rs`
-/// guards that). The preset key `bab.alpha_crown.alpha_envelope_grad` is the
-/// path that actually reaches a scored run.
+/// DELIVERY, and the reason the typed value is threaded everywhere:
+/// `vnncomp_scripts/run_instance.sh` exports no `NY_*` variables, so an
+/// env-only lever cannot fire in competition however well it measures
+/// (`ny-cli/tests/measured_gate_delivery.rs` guards that). The preset key
+/// `bab.alpha_crown.alpha_envelope_grad` lands in
+/// `AlphaCrownConfig::alpha_envelope_grad`, and EVERY production reader passes
+/// that field here as `Some(..)`: the three GPU-warmup sites in
+/// `propagate_dag/gradients` and — since #alpha-envelope-grad-cpu — both CPU
+/// chain-rule call sites (the DAG lane's AnalyticChain replay and the
+/// sequential lane's `analytic_chain_gradients`). Before that fix the CPU
+/// chain gradient resolved `None` (env-only), so on every lane that runs it
+/// (malbeware, cora, vit, and any non-GPU-warmup graph ascent) the typed key
+/// was DARK and the ascent sat at `[alpha-ascent] ... frac=1.0000` — measured
+/// on vit as `[envelope-grad] OFF -> local rule` with the key set in the yaml
+/// (`reports/measured-2026/vit2023_reachability_2026-08-30/README.md` §9.4).
 ///
 /// Layering is `read_over_config`'s: an env value wins in BOTH directions so an
 /// A/B can still force the rule on or off over a preset that sets it; config
 /// second; the declaration default (`false`) last. A malformed env token is a
 /// REJECTION, not an arming — `"true"`, `" 1"`, `"01"` all leave the rule dark,
-/// which is deliberate and pinned by the lever's own tests.
+/// which is deliberate and pinned by the lever's own tests. A resolution error
+/// fails CLOSED to the shipped local rule.
 ///
-/// Fails closed to the shipped local rule if resolution errors.
-pub(crate) fn envelope_grad_enabled_with(config: Option<bool>) -> bool {
-    ny_levers::read_over_config(
+/// SOUNDNESS: none at stake. The choice only changes which α the ascent walks
+/// to; every α in `[0,1]` selects a valid lower relaxation
+/// (`alpha_sound_regardless`), α is clamped into `[0,1]` on every write, and
+/// every bound the ascent keeps is a CROWN pass evaluated at such an α — the
+/// gradient is steering data, never a bound. Pinned empirically by the
+/// sampled-containment tests in `propagate_dag/gradients/envelope_cpu_tests.rs`.
+pub(crate) fn envelope_grad_choice(config: Option<bool>) -> EnvelopeGradChoice {
+    EnvelopeGradChoice::from_resolution(ny_levers::read_over_config(
         &ny_levers::decls::root_alpha::ALPHA_ENVELOPE_GRAD,
         config.map(ny_levers::LeverValue::Bool),
-    )
-    .map(|resolved| resolved.value.as_bool())
-    .unwrap_or(false)
+    ))
+}
+
+/// [`envelope_grad_choice`], reduced to the on/off answer. The GPU-warmup
+/// sites in `propagate_dag/gradients` read it this way.
+pub(crate) fn envelope_grad_enabled_with(config: Option<bool>) -> bool {
+    envelope_grad_choice(config).enabled
+}
+
+/// One resolved #envelope-grad decision, carrying the lever layer that made
+/// it so the engagement line can prove WHICH route armed the rule (a typed
+/// preset value resolves as `config`; an env override as `legacy_env`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EnvelopeGradChoice {
+    /// `true` selects the envelope rule; `false` keeps the shipped local rule.
+    pub(crate) enabled: bool,
+    /// The layer that decided `enabled`; `None` when resolution failed and the
+    /// choice fell closed to the local rule.
+    pub(crate) source: Option<ny_levers::Source>,
+}
+
+impl EnvelopeGradChoice {
+    /// Fold one lever resolution into a choice. `Err` (an inadmissible typed
+    /// value) fails CLOSED to the shipped local rule.
+    pub(crate) fn from_resolution(
+        resolution: Result<ny_levers::Resolved, ny_levers::ResolveError>,
+    ) -> Self {
+        match resolution {
+            Ok(resolved) => Self {
+                enabled: resolved.value.as_bool(),
+                source: Some(resolved.source),
+            },
+            Err(_) => Self {
+                enabled: false,
+                source: None,
+            },
+        }
+    }
+
+    /// The source as the lever registry spells it (`default`, `config`,
+    /// `legacy_env`, `legacy_env_rejected`), or `resolve_error`.
+    pub(crate) fn source_label(self) -> &'static str {
+        self.source
+            .map_or("resolve_error", ny_levers::Source::as_str)
+    }
+}
+
+/// What one CPU chain-gradient call actually ran.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EnvelopeEngagement {
+    /// Not selected: the shipped local rule ran.
+    Off,
+    /// Selected, but no binding point could be formed (no α state on the
+    /// legacy face, or `x*` / the point forward failed): fell closed to the
+    /// local rule.
+    Unavailable,
+    /// Selected, and a binding point was formed for `nodes` ReLU nodes. Those
+    /// nodes use the envelope factor wherever the point's length matches the
+    /// pre-activation and an A matrix is present; every other node keeps the
+    /// local rule's `l`. `nodes` counts binding points, not changed gradients.
+    Active { nodes: usize },
+}
+
+/// Bitmask of the `(engagement, source)` states [`emit_cpu_envelope_engagement`]
+/// has already announced in this process. One line per DISTINCT state keeps the
+/// observable unconditional without printing once per α iteration per domain.
+static CPU_ENVELOPE_ANNOUNCED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// #alpha-envelope-grad-cpu ENGAGEMENT LINE — unconditional (no env gate), so
+/// a measurement can prove from stderr alone that the typed key fired on the
+/// CPU chain gradient:
+///
+/// ```text
+/// [alpha-envelope-grad] cpu=1 armed=1 source=config nodes=2/2 lane=cpu-chain reason=active
+/// ```
+///
+/// Printed once per distinct `(reason, source)` state per process, so it
+/// proves the state was reached at least once, not how often. `cpu=1` iff a
+/// binding point was formed for at least one ReLU node (see
+/// [`EnvelopeEngagement::Active`] for what `nodes=K` counts). `armed=1 cpu=0
+/// reason=binding-unavailable` is the fail-closed case; `armed=0` is the local
+/// rule. `source=config` is the typed preset route; `source=legacy_env` means an
+/// env override decided it, which cannot happen in competition. Absence of the
+/// line means the CPU chain gradient never ran in this process (the ascent took
+/// the GPU warmup lane, the local-gradient fallback, or a non-AnalyticChain
+/// method) — read `[chain-alpha-grad]` to tell which.
+fn emit_cpu_envelope_engagement(
+    choice: EnvelopeGradChoice,
+    engagement: EnvelopeEngagement,
+    relus: usize,
+) {
+    #[cfg(test)]
+    CPU_ENVELOPE_TALLY.with(|cell| {
+        let mut tally = cell.get();
+        tally.calls += 1;
+        if choice.enabled {
+            tally.armed += 1;
+        }
+        if matches!(engagement, EnvelopeEngagement::Active { .. }) {
+            tally.engaged += 1;
+        }
+        tally.last = Some((choice, engagement));
+        cell.set(tally);
+    });
+    let (kind, cpu, nodes, reason): (u32, u8, usize, &str) = match engagement {
+        EnvelopeEngagement::Off => (0, 0, 0, "off"),
+        EnvelopeEngagement::Unavailable => (1, 0, 0, "binding-unavailable"),
+        EnvelopeEngagement::Active { nodes } => (2, 1, nodes, "active"),
+    };
+    let source_slot: u32 = match choice.source_label() {
+        "default" => 1,
+        "config" => 2,
+        "legacy_env" => 3,
+        "legacy_env_rejected" => 4,
+        _ => 0,
+    };
+    let bit = 1u32 << (kind * 5 + source_slot);
+    if CPU_ENVELOPE_ANNOUNCED.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit != 0 {
+        return;
+    }
+    eprintln!(
+        "[alpha-envelope-grad] cpu={cpu} armed={} source={} nodes={nodes}/{relus} \
+         lane=cpu-chain reason={reason}",
+        u8::from(choice.enabled),
+        choice.source_label(),
+    );
+}
+
+/// Test-only evidence that the CPU chain gradient ran, and with which choice.
+/// Thread-local and NOT rate-limited, unlike the stderr line: every call counts.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CpuEnvelopeTally {
+    /// CPU chain-gradient calls on this thread since the last take.
+    pub(crate) calls: usize,
+    /// Calls whose choice selected the envelope rule.
+    pub(crate) armed: usize,
+    /// Calls that actually applied it ([`EnvelopeEngagement::Active`]).
+    pub(crate) engaged: usize,
+    /// The most recent call's choice and outcome.
+    pub(crate) last: Option<(EnvelopeGradChoice, EnvelopeEngagement)>,
+}
+
+#[cfg(test)]
+impl CpuEnvelopeTally {
+    pub(crate) const EMPTY: Self = Self {
+        calls: 0,
+        armed: 0,
+        engaged: 0,
+        last: None,
+    };
+}
+
+#[cfg(test)]
+thread_local! {
+    static CPU_ENVELOPE_TALLY: std::cell::Cell<CpuEnvelopeTally> =
+        const { std::cell::Cell::new(CpuEnvelopeTally::EMPTY) };
+}
+
+/// Read and reset this thread's [`CpuEnvelopeTally`].
+#[cfg(test)]
+pub(crate) fn take_cpu_envelope_tally() -> CpuEnvelopeTally {
+    CPU_ENVELOPE_TALLY.with(|cell| cell.replace(CpuEnvelopeTally::EMPTY))
 }
 
 /// The dark `x*` envelope diagnostic, shared by this CPU path and the DAG path
@@ -100,10 +270,14 @@ impl GraphNetwork {
         relu_nodes: &[String],
         intermediate: &GraphAlphaCrownIntermediate,
     ) -> Vec<Array1<f32>> {
+        // The legacy face has neither an AlphaCrownConfig nor an alpha state in
+        // scope: `None` resolves env/default only, and without an alpha state
+        // the envelope is unavailable, so this is the local rule.
         self.compute_graph_chain_rule_gradients_with_binding(
             input,
             relu_nodes,
             intermediate,
+            None,
             None,
             None,
         )
@@ -112,6 +286,14 @@ impl GraphNetwork {
     /// [`Self::compute_graph_chain_rule_gradients`] with the inputs the
     /// #envelope-grad rule needs. `alpha_state`/`engine` are `None` on the legacy
     /// face, which reproduces the local rule byte-for-byte.
+    ///
+    /// `envelope_config` is the TYPED answer, `Some(config.alpha_envelope_grad)`
+    /// at every production call site (#alpha-envelope-grad-cpu): the DAG lane's
+    /// AnalyticChain replay (`propagate_dag/gradients`) and the sequential
+    /// lane's `analytic_chain_gradients`. `None` resolves env/default only and
+    /// is reserved for the legacy face. Resolution and the unconditional
+    /// engagement line are [`envelope_grad_choice`] and
+    /// [`Self::chain_rule_gradients_with_choice`].
     pub(in crate::network::graph_alpha) fn compute_graph_chain_rule_gradients_with_binding(
         &self,
         input: &BoundedTensor,
@@ -119,18 +301,42 @@ impl GraphNetwork {
         intermediate: &GraphAlphaCrownIntermediate,
         alpha_state: Option<&GraphAlphaState>,
         engine: Option<&dyn GemmEngine>,
+        envelope_config: Option<bool>,
     ) -> Vec<Array1<f32>> {
-        self.chain_rule_gradients_inner(
+        self.chain_rule_gradients_with_choice(
             input,
             relu_nodes,
             intermediate,
             alpha_state,
             engine,
-            // The legacy face has no AlphaCrownConfig in scope; env-only here.
-            // The DAG lane (which is what cifar100 takes) threads the preset
-            // answer at its own call sites.
-            envelope_grad_enabled(),
+            envelope_grad_choice(envelope_config),
         )
+    }
+
+    /// The CPU chain gradient under an already-resolved [`EnvelopeGradChoice`],
+    /// plus its engagement line. Production reaches it only through
+    /// [`Self::compute_graph_chain_rule_gradients_with_binding`]; tests call it
+    /// directly with a choice resolved by the REAL lever layering against an
+    /// injected (empty) environment, so they cannot race process env.
+    pub(in crate::network::graph_alpha) fn chain_rule_gradients_with_choice(
+        &self,
+        input: &BoundedTensor,
+        relu_nodes: &[String],
+        intermediate: &GraphAlphaCrownIntermediate,
+        alpha_state: Option<&GraphAlphaState>,
+        engine: Option<&dyn GemmEngine>,
+        choice: EnvelopeGradChoice,
+    ) -> Vec<Array1<f32>> {
+        let (gradients, engagement) = self.chain_rule_gradients_inner(
+            input,
+            relu_nodes,
+            intermediate,
+            alpha_state,
+            engine,
+            choice.enabled,
+        );
+        emit_cpu_envelope_engagement(choice, engagement, relu_nodes.len());
+        gradients
     }
 
     /// Force the #envelope-grad rule without touching process-global env (cargo
@@ -152,6 +358,7 @@ impl GraphNetwork {
             engine,
             true,
         )
+        .0
     }
 
     fn chain_rule_gradients_inner(
@@ -162,7 +369,7 @@ impl GraphNetwork {
         alpha_state: Option<&GraphAlphaState>,
         engine: Option<&dyn GemmEngine>,
         use_envelope: bool,
-    ) -> Vec<Array1<f32>> {
+    ) -> (Vec<Array1<f32>>, EnvelopeEngagement) {
         // #envelope-grad: a concrete point-forward surrogate for `ĥ_i(x*)`
         // per ReLU node, or `None` ⇒ the local rule's `pre_lower[i]`. Computed
         // ONCE for the whole layer sweep.
@@ -194,6 +401,19 @@ impl GraphNetwork {
                 }
             }
         }
+        // #alpha-envelope-grad-cpu: the same three-way answer as the probe
+        // above, returned so the caller's UNCONDITIONAL engagement line can
+        // report it (the probe above stays env-gated and unchanged).
+        let engagement = match (use_envelope, &binding) {
+            (false, _) => EnvelopeEngagement::Off,
+            (true, None) => EnvelopeEngagement::Unavailable,
+            (true, Some(points)) => EnvelopeEngagement::Active {
+                nodes: relu_nodes
+                    .iter()
+                    .filter(|name| points.contains_key(*name))
+                    .count(),
+            },
+        };
         let mut gradients: Vec<Array1<f32>> = Vec::with_capacity(relu_nodes.len());
 
         for relu_name in relu_nodes {
@@ -202,7 +422,7 @@ impl GraphNetwork {
                 Some(a) => a,
                 None => {
                     // No intermediate stored for this ReLU — use pre-ReLU bounds
-                    // to determine correct gradient length (#1937). A length-1
+                    // to determine correct gradient length. A length-1
                     // fallback would panic in alpha update when the ReLU has >1 neuron.
                     let n = intermediate
                         .pre_relu_bounds(relu_name)
@@ -300,7 +520,7 @@ impl GraphNetwork {
                 // IEEE-754: NaN comparisons return false, so `l >= 0.0 || u <= 0.0`
                 // would fail for NaN bounds, treating them as "unstable" and flowing
                 // NaN into gradient arithmetic. Explicitly skip non-finite.
-                // Mirrors sequential path guard in helpers.rs (#2809).
+                // Mirrors sequential path guard in helpers.rs.
                 if !l.is_finite() || !u.is_finite() {
                     continue;
                 }
@@ -334,7 +554,7 @@ impl GraphNetwork {
                     let a_ji = a_at_relu[[j, i]];
 
                     // Guard: non-finite A coefficient cannot produce meaningful
-                    // gradient contributions. Mirrors sequential path guard (#2809).
+                    // gradient contributions. Mirrors sequential path guard.
                     if !a_ji.is_finite() {
                         continue;
                     }
@@ -374,7 +594,7 @@ impl GraphNetwork {
             gradients.push(grad);
         }
 
-        gradients
+        (gradients, engagement)
     }
 
     /// #joint-interm-grad: per-neuron sensitivity of the folded lower bound to a

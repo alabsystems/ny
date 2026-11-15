@@ -3,21 +3,36 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::crown_backward_cases::build_bench_cases;
+use ny_core::NaiveCpuGemmEngine;
+
+// The qualified-WGPU parity regressions below (#3813) need an UNCHARGED
+// verdict device, so they and every helper only they read are the
+// `gpu-tests-uncharged` lane (TEST_CONFORMANCE.md); the naive-engine parity
+// test runs in plain `gpu-tests`.
+#[cfg(feature = "gpu-tests-uncharged")]
 use ndarray::{arr1, arr2, ArrayD, IxDyn};
+#[cfg(feature = "gpu-tests-uncharged")]
 use ny_core::{
     ConvTranspose2dParams, GemmEngine, GpuCrownBackward, GpuCrownLayer, GpuCrownResult,
-    GpuCrownSeed, NaiveCpuGemmEngine,
+    GpuCrownSeed,
 };
+#[cfg(feature = "gpu-tests-uncharged")]
 use ny_propagate::layers::{Conv2dLayer, FlattenLayer, LinearLayer, ReLULayer};
+#[cfg(feature = "gpu-tests-uncharged")]
 use ny_propagate::{GraphNetwork, Layer, Network};
+#[cfg(feature = "gpu-tests-uncharged")]
 use ny_tensor::BoundedTensor;
+#[cfg(feature = "gpu-tests-uncharged")]
 use ny_test_utils::assert_bounded_tensor_close;
+#[cfg(feature = "gpu-tests-uncharged")]
 use std::collections::HashMap;
+#[cfg(feature = "gpu-tests-uncharged")]
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex, MutexGuard,
 };
 
+#[cfg(feature = "gpu-tests-uncharged")]
 fn require_verdict_device() -> Arc<crate::WgpuDevice> {
     match crate::WgpuDevice::new_for_verdict(crate::WgpuVerdictRequest::new()) {
         Ok(device) => Arc::new(device),
@@ -28,6 +43,7 @@ fn require_verdict_device() -> Arc<crate::WgpuDevice> {
     }
 }
 
+#[cfg(feature = "gpu-tests-uncharged")]
 fn gpu_test_serial_guard() -> MutexGuard<'static, ()> {
     static GPU_TEST_MUTEX: Mutex<()> = Mutex::new(());
     GPU_TEST_MUTEX
@@ -35,6 +51,7 @@ fn gpu_test_serial_guard() -> MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+#[cfg(feature = "gpu-tests-uncharged")]
 #[derive(Clone)]
 struct CountingWgpuEngine {
     device: Arc<crate::WgpuDevice>,
@@ -44,7 +61,7 @@ struct CountingWgpuEngine {
     /// extracted layer list contains a Conv2d.
     /// The graph planner may route a GPU-extractable unary conv chain through
     /// the GPU suffix instead of per-node `conv_transpose_2d`; both are valid
-    /// GPU conv acceleration paths for the #3813 regression.
+    /// GPU conv acceleration paths for this parity regression.
     suffix_calls: Arc<AtomicUsize>,
     /// Successful, production-accepted sound GPU CROWN backward calls whose
     /// extracted layer list contains a Conv2d.
@@ -54,6 +71,7 @@ struct CountingWgpuEngine {
     sound_seeded_calls: Arc<AtomicUsize>,
 }
 
+#[cfg(feature = "gpu-tests-uncharged")]
 impl CountingWgpuEngine {
     fn new(device: Arc<crate::WgpuDevice>) -> Self {
         Self {
@@ -93,6 +111,7 @@ impl CountingWgpuEngine {
     }
 }
 
+#[cfg(feature = "gpu-tests-uncharged")]
 impl GemmEngine for CountingWgpuEngine {
     fn gemm_f32(
         &self,
@@ -125,6 +144,7 @@ impl GemmEngine for CountingWgpuEngine {
     }
 }
 
+#[cfg(feature = "gpu-tests-uncharged")]
 impl GpuCrownBackward for CountingWgpuEngine {
     fn honors_crown_backward_deadline(&self) -> bool {
         true
@@ -219,6 +239,7 @@ impl GpuCrownBackward for CountingWgpuEngine {
     }
 }
 
+#[cfg(feature = "gpu-tests-uncharged")]
 fn build_small_conv_graph_case() -> (GraphNetwork, BoundedTensor) {
     let kernel =
         ArrayD::from_shape_vec(IxDyn(&[1, 1, 2, 2]), vec![0.5_f32, -0.25, 0.75, 0.4]).unwrap();
@@ -250,6 +271,7 @@ fn build_small_conv_graph_case() -> (GraphNetwork, BoundedTensor) {
     (graph, input)
 }
 
+#[cfg(feature = "gpu-tests-uncharged")]
 fn assert_node_bounds_close(
     actual: &HashMap<String, BoundedTensor>,
     expected: &HashMap<String, BoundedTensor>,
@@ -278,6 +300,7 @@ fn assert_node_bounds_close(
 /// returned interval is degenerate and equals `f(x)`. This gives a relaxation-
 /// free oracle for the true network output, used as the concrete reference for
 /// the soundness check (GPU CROWN lower bound must be <= true min output).
+#[cfg(feature = "gpu-tests-uncharged")]
 fn exact_output_at(graph: &GraphNetwork, point: &ArrayD<f32>) -> Vec<f32> {
     let degenerate =
         BoundedTensor::new(point.clone(), point.clone()).expect("degenerate point box is valid");
@@ -294,6 +317,7 @@ fn exact_output_at(graph: &GraphNetwork, point: &ArrayD<f32>) -> Vec<f32> {
 /// all-low / all-high / midpoint plus a deterministic LCG sweep of random
 /// interior points — enough to catch an unsound (too-tight) bound on this
 /// small network. `tol` absorbs f32 rounding in the forward evaluation.
+#[cfg(feature = "gpu-tests-uncharged")]
 fn assert_bounds_sound_by_sampling(
     graph: &GraphNetwork,
     input: &BoundedTensor,
@@ -356,6 +380,7 @@ fn assert_bounds_sound_by_sampling(
 /// true (relaxation-free) value, sampled densely across the input box. The
 /// degenerate-box IBP pass produces exact per-node values (`l == u`); for each
 /// node we assert `lower <= value <= upper` element-wise.
+#[cfg(feature = "gpu-tests-uncharged")]
 fn assert_node_bounds_sound_by_sampling(
     graph: &GraphNetwork,
     input: &BoundedTensor,
@@ -419,6 +444,7 @@ fn test_graph_crown_with_naive_engine_matches_sequential_bounds_for_small_case()
 }
 
 #[test]
+#[cfg(feature = "gpu-tests-uncharged")]
 fn test_graph_crown_qualified_wgpu_resident_conv_runs_soundly() {
     let _gpu_serial = gpu_test_serial_guard();
     let device = require_verdict_device();
@@ -467,6 +493,7 @@ fn test_graph_crown_qualified_wgpu_resident_conv_runs_soundly() {
 }
 
 #[test]
+#[cfg(feature = "gpu-tests-uncharged")]
 fn test_graph_crown_ibp_qualified_wgpu_resident_conv_runs_soundly() {
     let _gpu_serial = gpu_test_serial_guard();
     let device = require_verdict_device();

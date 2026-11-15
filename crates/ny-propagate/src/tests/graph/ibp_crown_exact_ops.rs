@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Regressions for exact shape/affine operators in the #3775 demand set.
+//! Regressions: exact shape/affine operators must not pull upstream CROWN-IBP demand.
 
 use crate::*;
 use ndarray::{arr1, arr2, ArrayD, IxDyn};

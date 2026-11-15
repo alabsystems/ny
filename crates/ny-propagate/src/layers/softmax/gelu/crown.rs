@@ -87,8 +87,6 @@ impl GELULayer {
     /// `alphas` has length `in_dim` — one alpha per neuron. Alpha values outside
     /// [0, 1] are clamped. Only applies to the Erf GELU sound path; for other
     /// configurations falls back to the standard relaxation.
-    ///
-    /// Part of #3221 Phase 4: alpha-CROWN per block.
     pub fn propagate_linear_batched_with_bounds_and_alpha(
         &self,
         bounds: &BatchedLinearBounds,
@@ -122,7 +120,6 @@ impl GELULayer {
     }
 
     /// Patches CROWN backward propagation with pre-activation bounds.
-    /// Part of #2613 Phase 2: generic activation Patches support.
     pub(crate) fn propagate_patches_with_bounds(
         &self,
         bounds: &crate::bounds::patches::PatchesLinearBounds,

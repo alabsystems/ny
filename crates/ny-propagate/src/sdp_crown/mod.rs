@@ -163,7 +163,6 @@ pub fn relu_sdp_offset_for_lambda(
     // The offset appears in lower-bound inequalities (c^T ReLU(x) >= g^T x + h),
     // so `as f32` (round-to-nearest-even) could round h upward → unsound.
     // `next_down_f32` subtracts 1 ULP, guaranteeing h_f32 <= h_f64.
-    // See issue #1676.
     Ok(next_down_f32(h as f32))
 }
 

@@ -285,7 +285,7 @@ fn test_dispatch_node_backward_add_splits_bias_with_shared_dispatch_1949() {
         .and_then(|opt| opt.as_ref())
         .expect("expected propagated bounds for residual input");
 
-    // After #2617: bias is in separate channel accumulated to NETWORK_INPUT ("_input").
+    // Bias is in a separate channel accumulated to NETWORK_INPUT ("_input").
     // Add dispatch pre-extracts incoming bias and passes zero-bias to propagation.
     // Total bias (bias_lower=2.0, bias_upper=4.0) goes via the separate channel.
     //
@@ -858,16 +858,16 @@ fn test_concretize_dense_specs_without_input_accumulation_uses_spec_ibp_fallback
 }
 
 // =========================================================================
-// Regression test for #1996: UnsupportedOp identity fallback removed
+// Regression test: UnsupportedOp identity fallback removed
 // =========================================================================
 
-/// Regression test #1996: layers returning UnsupportedOp from propagate_crown_backward
+/// Regression test: layers returning UnsupportedOp from propagate_crown_backward
 /// must cause the batched wildcard dispatch to return error, not silently pass bounds
 /// through unchanged (identity fallback).
 ///
-/// Before #1996, the Err(UnsupportedOp) arm in batched.rs:427 accumulated identity
+/// Previously the Err(UnsupportedOp) arm in batched.rs accumulated identity
 /// bounds on all inputs — unsound because the layer's transformation was skipped.
-/// After #1996, the error propagates up so the BaB loop can fall back to sequential.
+/// Now the error propagates up so the BaB loop can fall back to sequential.
 #[test]
 fn test_unsupported_op_returns_error_not_identity_1996() {
     use crate::GatherLayer;
@@ -1051,4 +1051,141 @@ fn wide_entry_records_a_reason_for_every_declined_candidate() {
          the blind spot this tally removes"
     );
     reset_wide_lane_telemetry_for_tests();
+}
+
+/// #la-warm-frontier (review): the batched-core frontier capture is admitted
+/// against a snapshot budget BEFORE it clones anything. Under an unbounded
+/// budget a domain with a pending skip block and a network-input channel
+/// records a two-member frontier; under a budget below its pending bytes the
+/// same capture is refused (`capture_refused`, nothing stored), and
+/// `domain_pending_bytes` is exactly the census of the blocks a snapshot would
+/// clone.
+#[test]
+fn la_warm_frontier_batched_capture_refuses_a_snapshot_over_budget() {
+    use super::warm_frontier::WarmFrontierCounters;
+    use crate::network::CrownDispatchPlan;
+
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input(
+        "a",
+        Layer::Linear(LinearLayer::new(arr2(&[[1.0]]), Some(arr1(&[0.0]))).expect("a")),
+    ));
+    graph.add_node(GraphNode::new(
+        "b",
+        Layer::Linear(LinearLayer::new(arr2(&[[1.0]]), Some(arr1(&[0.0]))).expect("b")),
+        vec!["a".to_string()],
+    ));
+    graph.set_output("b");
+    let plan = CrownDispatchPlan::build(&graph).expect("plan");
+    let block = |a: f32, b: f32| {
+        LinearBounds::new(arr2(&[[a]]), arr1(&[b]), arr2(&[[a]]), arr1(&[b])).expect("block")
+    };
+    let unit =
+        BoundedTensor::new(arr1(&[-1.0f32]).into_dyn(), arr1(&[1.0f32]).into_dyn()).expect("box");
+    let mut pending = IndexedPendingLinearBounds::new(&plan, 1);
+    pending
+        .seed_name("a", 0, block(0.5, 0.25))
+        .expect("skip block");
+    pending
+        .seed_name(NETWORK_INPUT, 0, block(0.0, -0.75))
+        .expect("input channel");
+    let expected_bytes = block(0.5, 0.25).memory_bytes() + block(0.0, -0.75).memory_bytes();
+    assert_eq!(pending.domain_pending_bytes(0), expected_bytes);
+
+    let branch = block(1.0, 0.0);
+    let captured = vec![HashMap::from([("b".to_string(), branch.clone())])];
+    let node_lbs = vec![Some(branch)];
+    let boxes: HashMap<String, Arc<BoundedTensor>> = HashMap::from([
+        ("a".to_string(), Arc::new(unit.clone())),
+        ("b".to_string(), Arc::new(unit.clone())),
+    ]);
+    let caches = vec![&boxes];
+    let inputs = vec![unit];
+
+    for (budget, admitted) in [
+        (usize::MAX, true),
+        (expected_bytes, true),
+        (expected_bytes - 1, false),
+        (0, false),
+    ] {
+        let counters = WarmFrontierCounters::default();
+        let mut frontiers = vec![HashMap::new()];
+        let mut retained = 0usize;
+        super::capture_intermediate_frontiers_within(
+            &mut frontiers,
+            &captured,
+            "b",
+            &node_lbs,
+            &pending,
+            &plan,
+            &caches,
+            &inputs,
+            &counters,
+            budget,
+            &mut retained,
+        )
+        .expect("capture");
+        let counts = counters.snapshot();
+        if admitted {
+            let frontier = frontiers[0]
+                .get("b")
+                .expect("an admitted capture records a frontier");
+            let keys: Vec<&str> = frontier.members().map(|(key, _)| key).collect();
+            let mut expected = vec![NETWORK_INPUT, "a"];
+            expected.sort_unstable();
+            assert_eq!(
+                keys, expected,
+                "budget {budget}: skip block and input channel"
+            );
+            assert_eq!(
+                (counts.captured, counts.capture_refused),
+                (1, 0),
+                "budget {budget}"
+            );
+            assert_eq!(
+                retained,
+                frontier.estimated_owned_bytes(),
+                "retained census"
+            );
+        } else {
+            assert!(
+                frontiers[0].is_empty(),
+                "budget {budget}: a refused capture stores nothing"
+            );
+            assert_eq!(
+                (counts.captured, counts.capture_refused),
+                (0, 1),
+                "budget {budget}"
+            );
+            assert_eq!(
+                retained, 0,
+                "budget {budget}: a refused capture retains nothing"
+            );
+        }
+    }
+
+    // CUMULATIVE: a pass that already retains frontier bytes admits a further
+    // capture only while retained + pending still fits the budget.
+    let counters = WarmFrontierCounters::default();
+    let mut frontiers = vec![HashMap::new()];
+    let mut retained = 1usize;
+    super::capture_intermediate_frontiers_within(
+        &mut frontiers,
+        &captured,
+        "b",
+        &node_lbs,
+        &pending,
+        &plan,
+        &caches,
+        &inputs,
+        &counters,
+        expected_bytes,
+        &mut retained,
+    )
+    .expect("capture");
+    assert!(
+        frontiers[0].is_empty(),
+        "retained + pending over budget must refuse"
+    );
+    assert_eq!(counters.snapshot().capture_refused, 1);
 }

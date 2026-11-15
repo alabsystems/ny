@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cached-plan support for GPU-resident IBP forward (#4268).
+//! Cached-plan support for GPU-resident IBP forward.
 
 use ny_core::{
     checked_shape_product, nan_propagating_max_zero, nan_propagating_min_zero, GpuIbpLayer,
@@ -13,6 +13,15 @@ use super::super::WgpuDevice;
 use super::ibp_forward::create_buffer;
 use super::{gpu_checked_u32, sanitize_readback};
 use crate::wgpu_device::params::{Conv2dIbpParams, LinearIbpParams, ReluIbpParams};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
+use std::time::Instant;
+#[path = "ibp_forward_plan_deadline.rs"]
+mod deadline;
+use deadline::{copy_plan_values, upload_plan_values};
+pub(super) use deadline::{effective_plan_deadline, poll_plan_deadline};
 
 enum PreparedIbpStep {
     Linear {
@@ -47,6 +56,10 @@ pub(super) struct WgpuIbpModelPlan {
     staging_lower: wgpu::Buffer,
     staging_upper: wgpu::Buffer,
     steps: Vec<PreparedIbpStep>,
+    serialize: Arc<Mutex<()>>,
+    uncaptured_errors: Arc<super::super::error_scope::UncapturedErrorState>,
+    poisoned: AtomicBool,
+    execution_serialize: Mutex<()>,
 }
 
 pub(super) fn shape_product_or_err(shape: &[usize], context: &str) -> Result<usize> {
@@ -222,10 +235,54 @@ impl WgpuDevice {
         layers: &[GpuIbpLayer],
         input_shape: &[usize],
     ) -> Result<WgpuIbpModelPlan> {
+        self.prepare_model_plan_internal_until(layers, input_shape, None)
+    }
+
+    pub(super) fn prepare_model_plan_internal_until(
+        &self,
+        layers: &[GpuIbpLayer],
+        input_shape: &[usize],
+        deadline: Option<Instant>,
+    ) -> Result<WgpuIbpModelPlan> {
+        poll_plan_deadline(deadline)?;
+        // Resident layers use only CHW/NCHW or small dense/view shapes. Finite
+        // entry refuses unbounded shape metadata before a whole product scan.
+        if deadline.is_some() && input_shape.len() > 8 {
+            return Err(NyError::UnsupportedConfiguration(
+                "deadline resident IBP requires shape rank at most8".into(),
+            ));
+        }
         let input_elements = shape_product_or_err(input_shape, "input")?;
-        let max_dim = max_resident_buffer_elems(layers, input_elements)?;
+        let max_dim = if deadline.is_none() {
+            max_resident_buffer_elems(layers, input_elements)?
+        } else {
+            let mut current = input_elements;
+            let mut maximum = input_elements;
+            for layer in layers {
+                poll_plan_deadline(deadline)?;
+                if matches!(layer,GpuIbpLayer::View{output_shape} if output_shape.len()>8) {
+                    return Err(NyError::UnsupportedConfiguration(
+                        "deadline resident IBP requires shape rank at most8".into(),
+                    ));
+                }
+                if matches!(
+                    layer,
+                    GpuIbpLayer::Conv2d { stride_h: 0, .. }
+                        | GpuIbpLayer::Conv2d { stride_w: 0, .. }
+                ) {
+                    return Err(NyError::InvalidSpec(
+                        "resident Conv2d stride must be positive".into(),
+                    ));
+                }
+                current = next_resident_dim(current, layer)?;
+                maximum = maximum.max(current);
+            }
+            maximum
+        };
         let f32_size = size_of::<f32>() as u64;
-        let max_buf_bytes = (max_dim as u64) * f32_size;
+        let max_buf_bytes = (max_dim as u64)
+            .checked_mul(f32_size)
+            .ok_or_else(|| NyError::InvalidSpec("resident IBP buffer byte size overflow".into()))?;
         let usage_rw = wgpu::BufferUsages::STORAGE
             | wgpu::BufferUsages::COPY_SRC
             | wgpu::BufferUsages::COPY_DST;
@@ -241,6 +298,7 @@ impl WgpuDevice {
         let mut cur_shape = input_shape.to_vec();
 
         for layer in layers {
+            poll_plan_deadline(deadline)?;
             match layer {
                 GpuIbpLayer::Linear {
                     weight,
@@ -277,16 +335,12 @@ impl WgpuDevice {
                         (&buf_lower_a, &buf_upper_a, &buf_lower_b, &buf_upper_b)
                     };
 
-                    let weight_pos: Vec<f32> = weight
-                        .iter()
-                        .map(|&w| nan_propagating_max_zero(w))
-                        .collect();
-                    let weight_neg: Vec<f32> = weight
-                        .iter()
-                        .map(|&w| nan_propagating_min_zero(w))
-                        .collect();
+                    let weight_pos: Vec<f32> =
+                        copy_plan_values(weight, nan_propagating_max_zero, deadline)?;
+                    let weight_neg: Vec<f32> =
+                        copy_plan_values(weight, nan_propagating_min_zero, deadline)?;
                     let bias_data: Vec<f32> = match bias {
-                        Some(bias) => bias.to_vec(),
+                        Some(bias) => copy_plan_values(bias, |x| x, deadline)?,
                         None => vec![0.0; *out_features],
                     };
 
@@ -317,8 +371,7 @@ impl WgpuDevice {
                         weight_size,
                         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                     );
-                    self.queue
-                        .write_buffer(&wp_buf, 0, bytemuck::cast_slice(&weight_pos));
+                    upload_plan_values(&self.queue, &wp_buf, &weight_pos, deadline)?;
 
                     let wn_buf = create_buffer(
                         &self.device,
@@ -326,8 +379,7 @@ impl WgpuDevice {
                         weight_size,
                         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                     );
-                    self.queue
-                        .write_buffer(&wn_buf, 0, bytemuck::cast_slice(&weight_neg));
+                    upload_plan_values(&self.queue, &wn_buf, &weight_neg, deadline)?;
 
                     let bias_buf = create_buffer(
                         &self.device,
@@ -335,8 +387,7 @@ impl WgpuDevice {
                         (*out_features as u64) * f32_size,
                         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                     );
-                    self.queue
-                        .write_buffer(&bias_buf, 0, bytemuck::cast_slice(&bias_data));
+                    upload_plan_values(&self.queue, &bias_buf, &bias_data, deadline)?;
 
                     let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("ibp_fwd_linear_bg"),
@@ -521,16 +572,12 @@ impl WgpuDevice {
                         (&buf_lower_a, &buf_upper_a, &buf_lower_b, &buf_upper_b)
                     };
 
-                    let weight_pos: Vec<f32> = weight
-                        .iter()
-                        .map(|&w| nan_propagating_max_zero(w))
-                        .collect();
-                    let weight_neg: Vec<f32> = weight
-                        .iter()
-                        .map(|&w| nan_propagating_min_zero(w))
-                        .collect();
+                    let weight_pos: Vec<f32> =
+                        copy_plan_values(weight, nan_propagating_max_zero, deadline)?;
+                    let weight_neg: Vec<f32> =
+                        copy_plan_values(weight, nan_propagating_min_zero, deadline)?;
                     let bias_data: Vec<f32> = match bias {
-                        Some(bias) => bias.to_vec(),
+                        Some(bias) => copy_plan_values(bias, |x| x, deadline)?,
                         None => vec![0.0; *out_channels],
                     };
 
@@ -568,8 +615,7 @@ impl WgpuDevice {
                         weight_size,
                         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                     );
-                    self.queue
-                        .write_buffer(&wp_buf, 0, bytemuck::cast_slice(&weight_pos));
+                    upload_plan_values(&self.queue, &wp_buf, &weight_pos, deadline)?;
 
                     let wn_buf = create_buffer(
                         &self.device,
@@ -577,8 +623,7 @@ impl WgpuDevice {
                         weight_size,
                         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                     );
-                    self.queue
-                        .write_buffer(&wn_buf, 0, bytemuck::cast_slice(&weight_neg));
+                    upload_plan_values(&self.queue, &wn_buf, &weight_neg, deadline)?;
 
                     let bias_buf = create_buffer(
                         &self.device,
@@ -586,8 +631,7 @@ impl WgpuDevice {
                         (*out_channels as u64) * f32_size,
                         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                     );
-                    self.queue
-                        .write_buffer(&bias_buf, 0, bytemuck::cast_slice(&bias_data));
+                    upload_plan_values(&self.queue, &bias_buf, &bias_data, deadline)?;
 
                     let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("ibp_fwd_conv_bg"),
@@ -717,6 +761,7 @@ impl WgpuDevice {
             wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         );
 
+        poll_plan_deadline(deadline)?;
         Ok(WgpuIbpModelPlan {
             device: self.device.clone(),
             queue: self.queue.clone(),
@@ -735,6 +780,10 @@ impl WgpuDevice {
             staging_lower,
             staging_upper,
             steps,
+            serialize: self.gpu_serialize.clone(),
+            uncaptured_errors: self.uncaptured_errors.clone(),
+            poisoned: AtomicBool::new(false),
+            execution_serialize: Mutex::new(()),
         })
     }
 }
@@ -746,6 +795,15 @@ impl GpuIbpModelPlan for WgpuIbpModelPlan {
         input_upper: &[f32],
         input_shape: &[usize],
     ) -> Result<GpuIbpResult> {
+        let _guard = self
+            .execution_serialize
+            .lock()
+            .map_err(|_| NyError::InternalError("cached IBP execution lock poisoned".into()))?;
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(NyError::InternalError(
+                "cached IBP plan discarded after an incomplete GPU submission".into(),
+            ));
+        }
         // Wrap GPU work in an error scope: a wgpu validation/internal/OOM error
         // returns Err (caller falls back to per-layer CPU) instead of aborting
         // via wgpu's panicking uncaptured-error handler (#live bug).
@@ -754,6 +812,20 @@ impl GpuIbpModelPlan for WgpuIbpModelPlan {
             "ibp_forward_cached",
             || self.ibp_forward_cached_inner(input_lower, input_upper, input_shape),
         )
+    }
+
+    fn supports_deadline_execution(&self) -> bool {
+        true
+    }
+
+    fn ibp_forward_cached_with_deadline(
+        &self,
+        input_lower: &[f32],
+        input_upper: &[f32],
+        input_shape: &[usize],
+        deadline: Instant,
+    ) -> Result<GpuIbpResult> {
+        self.execute_until(input_lower, input_upper, input_shape, deadline)
     }
 }
 
@@ -764,6 +836,18 @@ impl WgpuIbpModelPlan {
         input_upper: &[f32],
         input_shape: &[usize],
     ) -> Result<GpuIbpResult> {
+        self.ibp_forward_cached_inner_until(input_lower, input_upper, input_shape, None, &mut false)
+    }
+
+    fn ibp_forward_cached_inner_until(
+        &self,
+        input_lower: &[f32],
+        input_upper: &[f32],
+        input_shape: &[usize],
+        deadline: Option<Instant>,
+        submitted: &mut bool,
+    ) -> Result<GpuIbpResult> {
+        poll_plan_deadline(deadline)?;
         if input_shape != self.input_shape {
             return Err(NyError::InvalidSpec(format!(
                 "ibp_forward_cached: input shape mismatch, expected {:?}, got {:?}",
@@ -779,10 +863,8 @@ impl WgpuIbpModelPlan {
             )));
         }
 
-        self.queue
-            .write_buffer(&self.buf_lower_a, 0, bytemuck::cast_slice(input_lower));
-        self.queue
-            .write_buffer(&self.buf_upper_a, 0, bytemuck::cast_slice(input_upper));
+        upload_plan_values(&self.queue, &self.buf_lower_a, input_lower, deadline)?;
+        upload_plan_values(&self.queue, &self.buf_upper_a, input_upper, deadline)?;
 
         let mut encoder = self
             .device
@@ -791,6 +873,7 @@ impl WgpuIbpModelPlan {
             });
 
         for step in &self.steps {
+            poll_plan_deadline(deadline)?;
             match step {
                 PreparedIbpStep::Linear {
                     bind_group,
@@ -840,7 +923,13 @@ impl WgpuIbpModelPlan {
         encoder.copy_buffer_to_buffer(final_lower, 0, &self.staging_lower, 0, output_bytes);
         encoder.copy_buffer_to_buffer(final_upper, 0, &self.staging_upper, 0, output_bytes);
 
+        poll_plan_deadline(deadline)?;
         self.queue.submit(std::iter::once(encoder.finish()));
+        *submitted = true;
+
+        #[cfg(all(test, feature = "gpu-tests"))]
+        let _scripted_expiry = deadline::expiry_after_submit(deadline);
+        poll_plan_deadline(deadline)?;
 
         // Both staging buffers were filled by the SINGLE submit above, so they are
         // ready after one poll. Map them together with ONE blocking
@@ -857,7 +946,18 @@ impl WgpuIbpModelPlan {
         let mut result_upper = batched.pop().expect("2 readbacks");
         let mut result_lower = batched.pop().expect("2 readbacks");
 
-        sanitize_readback(&mut result_lower, &mut result_upper);
+        if deadline.is_none() {
+            sanitize_readback(&mut result_lower, &mut result_upper);
+        } else {
+            for (lower, upper) in result_lower
+                .chunks_mut(4096)
+                .zip(result_upper.chunks_mut(4096))
+            {
+                poll_plan_deadline(deadline)?;
+                sanitize_readback(lower, upper);
+            }
+        }
+        poll_plan_deadline(deadline)?;
 
         Ok(GpuIbpResult {
             lower_bounds: result_lower,

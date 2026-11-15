@@ -260,7 +260,7 @@ pub fn trace_op_soundness(op: &TraceOp) -> BridgeSoundness {
         | TraceOp::ConvTranspose1d { .. }
         | TraceOp::ConvTranspose2d { .. }
         | TraceOp::QLinear { .. }
-        // Cumsum: native `CumsumLayer` (#3919) — monotone => exact IBP with
+        // Cumsum: native `CumsumLayer` — monotone => exact IBP with
         // outward rounding, O(T) CROWN backward, no size cap.
         | TraceOp::Cumsum { .. } => Exact,
 

@@ -7,10 +7,11 @@ From the repository root:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip maturin
+python -m pip install --upgrade pip maturin pytest
 cd crates/ny-python
 maturin develop --release
 python -m pytest tests
 ```
 
-The Python module name is `ny`; the type stub is `ny.pyi`.
+The Python module name is `ny`; the type stub is `ny.pyi`. The wheel also
+installs the `ny_pytest` pytest plugin.

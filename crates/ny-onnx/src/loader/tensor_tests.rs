@@ -376,7 +376,7 @@ fn tensor_proto_to_array_decodes_int64_raw_data() {
     assert_eq!(arr[[3]], -1_000_000.0);
 }
 
-/// INT64 values outside f32 exact-integer range produce warnings (#2848).
+/// INT64 values outside f32 exact-integer range produce warnings.
 ///
 /// i64::MAX (9223372036854775807) is commonly used as a sentinel in ONNX Slice
 /// start/end. When cast to f32, it round-trips to 9223372036854775808.0 (2^63),
@@ -401,7 +401,7 @@ fn tensor_proto_to_array_int64_precision_loss_sentinel() {
     assert_eq!(arr[[3]], -(1i64 << 24) as f32);
 }
 
-/// INT32 values outside f32 exact-integer range produce warnings (#2848).
+/// INT32 values outside f32 exact-integer range produce warnings.
 #[test]
 fn tensor_proto_to_array_int32_precision_loss_boundary() {
     // 2^24 + 1 = 16777217, the first integer not exactly representable as f32
@@ -843,7 +843,7 @@ fn onnx_elem_type_to_dtype_rejects_unsupported_graph_dtypes() {
     }
 }
 
-// -- i64_to_f32_warned / i32_to_f32_warned unit tests (#2848) --
+// -- i64_to_f32_warned / i32_to_f32_warned unit tests --
 
 /// Values within f32 exact-integer range convert exactly.
 #[test]

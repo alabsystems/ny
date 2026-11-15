@@ -1,0 +1,61 @@
+[package]
+name = "ny-proofcheck"
+description = "B2.1 offline proof-bundle checker (ENGINE_PROGRAM §1.7 B2): own ONNX and VNN-LIB readers, own f64 Higham back-substitution, per-disjunct cover; downgrade-only, it never constructs a verdict"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# INDEPENDENCE (ENGINE_PROGRAM §1.7 B2; pinned by tests/independence_ratchet.rs).
+#
+# The checker re-derives every value it checks with its OWN code: its own
+# bounds-checked protobuf reader and ONNX lowering (BatchNormalization kept
+# unfolded as interval parameters), its own VNN-LIB reader and clause
+# canonicalizer, its own outward-rounded f64 back-substitution and its own
+# cover check. It may therefore NOT depend on any producer crate: not
+# ny-propagate (the lanes it checks), not ny-core, not ny-onnx (which itself
+# depends on ny-propagate), not prost or serde. The allowlist below is exact:
+#
+# * ny-cert — ONLY its total `json` reader/writer (no floats are trusted from
+#   it: region numbers are strings parsed with `f64::from_str`);
+# * sha2    — bundle integrity and the input-file hashes;
+# * rayon   — parallelism ACROSS nodes and row chunks (every row is summed
+#   sequentially in a fixed order, so the report is thread-count independent).
+#
+# Nothing may depend on this crate except ny-cli (the `ny proof-check`
+# subcommand), and no verdict path may read its output
+# (`crates/ny-cli/tests/proof_check_ratchet.rs`).
+[dependencies]
+ny-cert = { path = "../ny-cert" }
+sha2.workspace = true
+rayon.workspace = true
+
+[features]
+# The B2.3 checker-cost MEASUREMENT (`tests/fd_cost.rs`): it prints walls and
+# asserts only that the measured path is the fd rung, so it is an evidence job,
+# not a correctness test. It is absent from the default lane rather than
+# `#[ignore]`d in it (TEST_CONFORMANCE.md; `source_policy` forbids ignore):
+#   targo --unverified test -p ny-proofcheck --features benchmarks \
+#     --test fd_cost -- --nocapture --test-threads=1
+benchmarks = []
+# The INTEGRATOR lane (`tests/real_lowering_ort.rs`): the checker's lowering of
+# real corpus networks against ONNX Runtime. It needs the main tree's
+# gitignored benchmarks/vnncomp2026 and a python3 with numpy + onnxruntime, so
+# it is an explicit lane, a hard failure without them (TEST_CONFORMANCE.md):
+#   targo --unverified test -p ny-proofcheck --features external-vnncomp \
+#     --test real_lowering_ort -- --nocapture
+external-vnncomp = []
+
+[[test]]
+name = "fd_cost"
+required-features = ["benchmarks"]
+
+[[test]]
+name = "real_lowering_ort"
+required-features = ["external-vnncomp"]

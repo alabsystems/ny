@@ -10,8 +10,6 @@
 //! cross-variant consistency verification: Dense, Batched, and Patches
 //! backward paths must produce identical coefficient and bias values for
 //! identical mathematical inputs.
-//!
-//! Part of #3463.
 
 use crate::layers::activations::LinearRelaxation;
 use crate::layers::common::crown_elementwise_backward;

@@ -42,6 +42,10 @@
 # `NY_PRESET_LOAD_SMOKE=all cargo test --release -p ny-cli --bin ny
 #  preset::model_load_smoke_tests` with all three benchmark year-roots present:
 # 14 of 541 model files across 47 presets fail the loader's admission path.
+# (That stock spelling is the record of what ran. On ALab hosts Rust is
+# spelled `targo` (owner ruling 2026-09-23); re-inventory with
+# `NY_PRESET_LOAD_SMOKE=all targo --unverified test --release -p ny-cli --bin ny
+#  preset::model_load_smoke_tests`.)
 #
 # ALL FOURTEEN ARE 819b0554 ("feat: harden verifier soundness and expand NN4SYS
 # solves", 2026-08-04). Source-level bisect, decisive: the three refusal strings
@@ -124,26 +128,65 @@
 #     the runtime input. ny's graph is fixed-shape; admitting it would mean
 #     ASSUMING the patch coordinates are in range. See
 #     crates/ny-onnx/tests/cctsdb_cast_admission_loads.rs.
+#     [2026-08-31: PARTLY superseded — see the update below. patch-1 LOADS
+#     again; the runtime-coordinate range assumption is discharged where it
+#     always was, by the guarded Trunc lowering + per-cell enumeration driver.
+#     patch-3 keeps a narrower, true residual of this diagnosis.]
 #   cgan_2023         REGULAR   LOSS   9.5  — over-strict, retirable; the
 #     three-edit path is written out at the entry below.
 #   cgan2026          unscored  LOSS   0.0
 #
+# ===========================================================================
+# 2026-08-31 UPDATE — cctsdb Equal dtype-7 gate certified (819b0554 recovery)
+# ===========================================================================
+#
+# PAID OFF: the patch-1.onnx entry is DELETED because the model LOADS at HEAD.
+# The recovery is the certification design the pin test's own comment demanded,
+# not a gate relaxation (#cctsdb-expand-identity + #cctsdb-trunc-gated-index in
+# crates/ny-onnx/src/loader/parse/):
+#
+#   * the four dtype-7 Equals are PyTorch's `expand(-1,...)` keep-dims idiom
+#     over a runtime shape — `Equal(Shape(grid), -1*ones)` is CONSTANT
+#     all-false by ONNX semantics (dims are never negative); the loader
+#     certifies exactly that authored cone, canonicalizes the paired Where to
+#     Identity(Y), and deletes the constant-false comparison.  An uncertified
+#     dtype-7 comparison refuses verbatim (pinned by unit negatives:
+#     Equal(Shape, 0), Equal(runtime, runtime)).
+#   * the runtime INT64 index chain (patch coords via Gather -> Cast(->INT64))
+#     is admitted as a trunc-gated runtime index chain: every INT64 consumer
+#     position is still bounded by the structural control audit, the casts
+#     lower to guarded LayerType::Trunc, and range/exactness obligations are
+#     discharged at solve time (bounded-index ScatterND, taint-gated degrade,
+#     per-cell enumeration).
+#
+# STILL OWED: patch-3.onnx remains refused — but by a DIFFERENT, true residual,
+# so its entry below is REWRITTEN rather than deleted: its zero-patch values
+# tensor `ConstantOfShape_39` reads its shape from Shape(Slice(...)) whose
+# bounds come from the runtime input; ONNX Slice clamps, so that tensor's
+# EXTENT is genuinely runtime and the folder correctly cannot erase it
+# ("survived constant folding on a live data path", gate 25dee0c5).  patch-1's
+# equivalent cone has authored-constant bounds and folds to [1,3,64,64].
+#
+# RE-SWEEP, per this file's own rule: cctsdb_yolo_2023's banked rows were
+# re-measured at HEAD on 2026-08-31 (verdict_row_moat, official budgets):
+# patch-1's 8 banked-unsat rows recover, all sat rows hold, patch-3's 3
+# banked-unsat rows remain honest drops covered by the entry below.
+#
 waivers:
-  # ---- 819b0554: ONNX Equal schema requires FLOAT comparison operands --------
-  - model: benchmarks/vnncomp2025/benchmarks/cctsdb_yolo_2023/onnx/patch-1.onnx
-    error_contains: "has comparison operands dtype 7"
-    gate: 819b0554
-    since: "2026-08-04"
-    cost: >-
-      cctsdb_yolo_2023 (extended): with patch-3.onnx this is 39/39 instances and
-      39/39 banked solved rows. 100.0 -> 0.0 banked normalized, LOSS 100.0.
+  # ---- 25dee0c5 residual: runtime-extent ConstantOfShape cannot fold ---------
   - model: benchmarks/vnncomp2025/benchmarks/cctsdb_yolo_2023/onnx/patch-3.onnx
-    error_contains: "has comparison operands dtype 7"
-    gate: 819b0554
+    error_contains: "survived constant folding on a live data path"
+    gate: 25dee0c5
     since: "2026-08-04"
     cost: >-
-      cctsdb_yolo_2023 (extended): the second of the category's two models; see
-      patch-1.onnx. Jointly 100.0 -> 0.0 banked normalized, LOSS 100.0.
+      cctsdb_yolo_2023 (extended): 20/39 instances use patch-3; 3 banked-unsat
+      rows are blocked by this refusal (its 17 banked-sat rows recover through
+      the graph-free falsification lane, which needs no load). Roughly 7.7 of
+      100.0 banked normalized still at risk after the 2026-08-31 patch-1
+      recovery. Regaining these 3 rows needs a certificate for a
+      runtime-extent constant tensor (ConstantOfShape_39's shape is a clamped
+      runtime Slice extent), which is a real design change, not a gate
+      relaxation.
   # ---- 819b0554: INT64 shape arithmetic — RETIRED 2026-08-25 ----------------
   #
   # The two cgan entries that lived here are DELETED: both models load at HEAD.

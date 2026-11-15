@@ -145,7 +145,7 @@ pub(crate) fn process_cpu_fallback_batch(
                 }
             }
             GraphDomainResult::PropagationFailure => {
-                // #1852: propagation failed — sub-region unexplored.
+                // Propagation failed — sub-region unexplored.
                 // Must not return Verified while any domain has this status.
                 warn!(
                     "DomainList BaB: propagation failure in sequential fallback path — domain unresolved"
@@ -219,7 +219,7 @@ mod tests {
         assert!(!state.unresolved_due_to_no_unstable_neurons);
     }
 
-    /// Regression test for #2004: PropagationFailure must set
+    /// Regression test: PropagationFailure must set
     /// `unresolved_due_to_propagation_failure`, NOT `unresolved_due_to_no_unstable_neurons`.
     /// The bug caused build_final_result() to report "No unstable ReLU/Sign neurons"
     /// instead of "Child propagation failed" — misdirecting debugging.
@@ -227,7 +227,7 @@ mod tests {
     /// Drives `process_cpu_fallback_batch` with a picked batch that materializes
     /// to a domain with no stored node bounds under the `BoundImpact` heuristic,
     /// so branch-score computation inside `process_graph_domain_parallel` fails
-    /// for real (#1915) and the batch's PropagationFailure arm runs.
+    /// for real and the batch's PropagationFailure arm runs.
     #[ntest::timeout(10000)]
     #[test]
     fn test_propagation_failure_sets_correct_unresolved_flag() {

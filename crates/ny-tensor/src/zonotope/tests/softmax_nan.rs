@@ -2,13 +2,13 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! NaN safety tests for zonotope softmax (#2676 Site 1).
+//! NaN safety tests for zonotope softmax.
 //! Split from softmax.rs to stay under 1000-line limit.
 
 use super::super::*;
 use ndarray::{ArrayD, IxDyn};
 
-/// #2676 Site 1: softmax with NaN in center should produce finite output
+/// Softmax with NaN in center should produce finite output
 /// (uniform distribution fallback), not propagate NaN through division.
 #[test]
 fn test_softmax_affine_nan_center_returns_uniform_2676() {
@@ -48,7 +48,7 @@ fn test_softmax_affine_nan_center_returns_uniform_2676() {
     }
 }
 
-/// #2676 Site 1: causal softmax with NaN in center should produce finite output.
+/// Causal softmax with NaN in center should produce finite output.
 #[test]
 fn test_softmax_affine_causal_nan_center_returns_uniform_2676() {
     // Create a 2x2 zonotope with NaN in one entry.
@@ -79,7 +79,7 @@ fn test_softmax_affine_causal_nan_center_returns_uniform_2676() {
     );
 }
 
-/// #2676 Site 1: softmax 2D path with NaN in one row should handle gracefully.
+/// Softmax 2D path with NaN in one row should handle gracefully.
 #[test]
 fn test_softmax_affine_2d_nan_center_returns_uniform_2676() {
     // Create a 2x3 zonotope where row 1 has NaN.

@@ -385,8 +385,7 @@ proptest! {
     /// concretized CROWN bounds. Since BatchNorm is affine, this should hold
     /// with very tight tolerance.
     ///
-    /// Includes negative ny values to test the negative-scale CROWN path.
-    /// Reference: designs/2026-01-29-crown-affine-negative-scale.md
+    /// Includes negative gamma (scale) values to test the negative-scale CROWN path.
     /// Part of #40.
     #[ntest::timeout(10000)]
     #[test]

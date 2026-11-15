@@ -312,8 +312,7 @@ fn selu_saturated_box_hits_exact_asymptote() {
     // since the moment it landed. Repairing it by making production match the
     // old expectation would reintroduce the false proof; the direction
     // assertion below exists so that can never happen silently again.
-    let floor =
-        cast_f64_to_f32_down(-(f64::from(SeluLayer::LAMBDA) * f64::from(SeluLayer::ALPHA)));
+    let floor = cast_f64_to_f32_down(-(f64::from(SeluLayer::LAMBDA) * f64::from(SeluLayer::ALPHA)));
     assert_eq!(
         out.lower()[[0]],
         floor,

@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Tests for pipeline composition verification.
-//!
-//! Part of #3920.
 
 use super::*;
 use ndarray::{ArrayD, IxDyn};
@@ -152,7 +150,7 @@ fn test_pipeline_crown_is_weaker_than_alpha_crown_3920() {
 }
 
 /// NaN bounds in a stage certificate must be caught before the IEEE 754
-/// ordered comparison silently passes them through (#4007).
+/// ordered comparison silently passes them through.
 #[test]
 fn test_pipeline_rejects_nan_in_stage_bounds_4007() {
     let mut pipeline = PipelineVerifier::new();
@@ -294,7 +292,6 @@ fn test_pipeline_merges_soundness_across_stages_3920() {
 /// BetaCrown certificates cannot enter the pipeline because `BoundCertificate::try_new`
 /// rejects `MethodUsed::BetaCrown` at construction time. This test guards the public
 /// facade path reachable through `ny_api::composition::PipelineVerifier`.
-/// Part of #3920 beta-crown certificate guard design.
 #[test]
 fn test_pipeline_verifier_rejects_beta_crown_stage_contract_3920() {
     let bounds = make_bounds(&[0.0], &[1.0]);

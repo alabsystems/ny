@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Core CROWN-IBP per-node tightening loop (#3596, #3499).
+//! Core CROWN-IBP per-node tightening loop.
 
 use crate::network::crown_quality::crown_gain_stat;
 #[cfg(test)]
@@ -22,6 +22,9 @@ use super::demand::{
     nodes_requiring_crown_tightening, relu_only_intermediate_target_is_eligible,
     relu_stability_profile, required_consumer_counts, sparse_interm_diag_enabled,
     sparse_relu_row_plan_for_target, sparse_relu_rows_enabled, SparseReluRowPlan,
+};
+use super::row_refine::{
+    typed_sparse_schedule_rows, RowRefineOutcome, RowRefineRequest, RowSelection,
 };
 
 /// Batteries-included gate for the adaptive hopeless-class collector skip
@@ -48,6 +51,69 @@ fn is_structural_crown_skip(reason: CrownIbpFallbackReason) -> bool {
             | CrownIbpFallbackReason::StableReluRowsSkipped
             | CrownIbpFallbackReason::ObjectiveConeRowsSkipped
     )
+}
+
+/// Prefix shared by every `CpuMemoryExceeded` site raised inside the residual
+/// join (`CrownMergeAccumulator`): the Dense promotion guard, the f64 sidecar
+/// staging receipts and the hard-authority native Patches merge receipt.
+const MERGE_ACCUMULATOR_SITE_PREFIX: &str = "CrownMergeAccumulator";
+
+/// #patches-merge-expiry: ONE stderr line per target whose CROWN walk was
+/// refused at a residual-join merge and mapped to `MemoryBudgetExceeded`.
+///
+/// That mapping was logged only at `debug!`, so on yolo_2023 the merge-point
+/// refusal of `Conv_5`/`Add_8`/`Conv_12` (~22.5 GB asked of a ~12 GB budget)
+/// was invisible in every scored log. The line names the refusing site, the
+/// bytes it asked for and the budget that refused it. Rate-limited per
+/// (target, site): the first refusal prints, later ones only at powers of two,
+/// so repeated collections cannot flood the log. Observation only — nothing
+/// here touches a bound or a route.
+fn report_merge_memory_refusal(
+    target: &str,
+    site: &'static str,
+    required_bytes: usize,
+    budget_bytes: usize,
+) {
+    use std::sync::{Mutex, OnceLock, PoisonError};
+    static SEEN: OnceLock<Mutex<HashMap<(String, &'static str), u64>>> = OnceLock::new();
+
+    if !site.starts_with(MERGE_ACCUMULATOR_SITE_PREFIX) {
+        return;
+    }
+    let occurrence = {
+        let mut seen = SEEN
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let count = seen.entry((target.to_string(), site)).or_insert(0);
+        *count = count.saturating_add(1);
+        *count
+    };
+    if occurrence.is_power_of_two() {
+        eprintln!(
+            "[crown-ibp-merge-refusal] target={target} site=\"{site}\" \
+             required_bytes={required_bytes} budget_bytes={budget_bytes} \
+             occurrence={occurrence} -> MemoryBudgetExceeded: this target keeps its IBP bound"
+        );
+    }
+}
+
+/// Render the memory CHECKS that refused degraded targets for the
+/// quality-cliff summary: `site xN (largest required R B vs budget B B)`.
+fn describe_memory_refusal_sites(sites: &BTreeMap<&'static str, (usize, usize, usize)>) -> String {
+    if sites.is_empty() {
+        return "none".to_string();
+    }
+    sites
+        .iter()
+        .map(|(site, (targets, required_bytes, budget_bytes))| {
+            format!(
+                "\"{site}\" x{targets} (largest required {required_bytes} B vs budget \
+                 {budget_bytes} B)"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn sequential_fast_path_allowed(
@@ -127,7 +193,7 @@ fn collector_budget_rows(
 /// elementwise/pass-through costs, producing an optimistic estimate. Any
 /// unsupported layer, missing shape, or checked-arithmetic overflow returns
 /// `None`, which makes scheduling execute the walk unchanged.
-fn dense_crown_prefix_work_units(
+pub(super) fn dense_crown_prefix_work_units(
     graph: &GraphNetwork,
     target_node: &str,
     objective_rows: usize,
@@ -259,6 +325,9 @@ pub(crate) enum M1CollectorTraceEvent {
 pub(crate) struct M1CollectorTestControls {
     pub(crate) route_subset_budget_bytes: Option<usize>,
     pub(crate) fail_subset_node: Option<String>,
+    /// Force the k-row kernel's dense-seed refusal for one node, so the atomic
+    /// lane's fail-open arm has a witness the planner cannot produce.
+    pub(crate) dense_decline_subset_node: Option<String>,
     pub(crate) reject_full_fallback_budget_node: Option<String>,
     pub(crate) drift_fixed_wave_node: Option<String>,
     /// #cprime-admission: force the estimator's est_secs for one node so the
@@ -336,6 +405,41 @@ fn collector_force_subset_failure(node: &str) -> bool {
         let _ = node;
         false
     }
+}
+
+/// Test-only witness for the kernel's dense-seed refusal on the atomic lane.
+///
+/// `resolve_subset_indices` applies the same refusal at PLAN time, so a real
+/// run can never reach the kernel's copy of it; without an injection the
+/// fail-open arm below would be untestable and would rot.
+fn collector_force_subset_dense_decline(node: &str) -> bool {
+    #[cfg(test)]
+    {
+        M1_COLLECTOR_TEST_CONTROLS
+            .with(|slot| slot.borrow().dense_decline_subset_node.as_deref() == Some(node))
+    }
+    #[cfg(not(test))]
+    {
+        let _ = node;
+        false
+    }
+}
+
+/// Does a kernel decline leave the atomic target's authority intact?
+///
+/// `dense-budget` is a ROUTING refusal raised before any work, and the planner
+/// applies the identical predicate with the identical inputs — its own version
+/// of this refusal simply returns `None` and the target takes the established
+/// full-width/chunked walk, which the atomic lane then completes and publishes.
+/// Reaching the kernel's copy therefore means the two disagreed, and the
+/// correct response is the planner's: fall open. Promoting it to
+/// `atomic_subset_error` would convert a walk that was about to SUCCEED into a
+/// hard collection error.
+///
+/// Every other decline names a state the k-row walk could not start from at
+/// all, and keeps the historical hard authority boundary.
+fn subset_decline_is_fail_open(reason: &str) -> bool {
+    reason == "dense-budget"
 }
 
 fn collector_force_fixed_wave_drift(node: &str) -> bool {
@@ -531,6 +635,7 @@ fn retain_partial_crown_rows(
 impl GraphNetwork {
     /// Typed collection-mode variant used by the root alpha reference router.
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(test), expect(dead_code, reason = "component regression controls"))]
     pub(in crate::network::graph_alpha) fn collect_crown_ibp_bounds_core_inner_with_mode(
         &self,
         input: &BoundedTensor,
@@ -628,6 +733,7 @@ impl GraphNetwork {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(test), expect(dead_code, reason = "component regression controls"))]
     fn collect_crown_ibp_bounds_core_inner_with_cut_segment_and_prefix_cost_policy(
         &self,
         input: &BoundedTensor,
@@ -645,7 +751,48 @@ impl GraphNetwork {
         prefix_cost_admission_enabled: bool,
         runtime_policy: CrownIbpRuntimePolicy,
     ) -> Result<GraphCrownIbpBoundsResult> {
+        self.collect_crown_ibp_bounds_core_inner_with_head_rows(
+            input,
+            ibp_bounds,
+            deadline,
+            deadline_is_hard,
+            engine,
+            min_width_to_tighten,
+            cut_segment,
+            published_margin_indices,
+            downstream_resweep,
+            deadline_salvage_policy,
+            collection_mode,
+            cgan_narrow_target_max_rows,
+            prefix_cost_admission_enabled,
+            runtime_policy,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::network::graph_alpha) fn collect_crown_ibp_bounds_core_inner_with_head_rows(
+        &self,
+        input: &BoundedTensor,
+        ibp_bounds: HashMap<String, BoundedTensor>,
+        deadline: Option<Instant>,
+        deadline_is_hard: bool,
+        engine: Option<&dyn ny_core::GemmEngine>,
+        min_width_to_tighten: Option<f32>,
+        cut_segment: usize,
+        published_margin_indices: Option<std::sync::Arc<[usize]>>,
+        downstream_resweep: bool,
+        deadline_salvage_policy: PartialCrownDeadlineSalvagePolicy,
+        collection_mode: CrownIbpCollectionMode,
+        cgan_narrow_target_max_rows: Option<usize>,
+        prefix_cost_admission_enabled: bool,
+        runtime_policy: CrownIbpRuntimePolicy,
+        head_rows_policy: Option<super::head_rows::OriginalRootHeadRows>,
+    ) -> Result<GraphCrownIbpBoundsResult> {
         let honest_provenance_enabled = runtime_policy.honest_provenance_enabled;
+        // #cgan-collector-dense (E5): request-scoped dense (matrix) conv mode
+        // for every target walk of this collection.
+        let collector_dense = runtime_policy.collector_dense_override;
         let exec_order = self.exec_order()?;
         let margin_subset_indices = |output_dim| {
             crate::output_margin_seed::margin_subset_indices_from_published(
@@ -655,7 +802,7 @@ impl GraphNetwork {
         };
 
         // Linear-chain graphs can reuse the sequential `Network` CROWN-IBP
-        // collector, which already contains the #3599 GPU partial-backward
+        // collector, which already contains the GPU partial-backward
         // fast path and deadline support. The sequential collector checks
         // deadlines between each layer, matching the graph-native loop.
         //
@@ -671,7 +818,7 @@ impl GraphNetwork {
         //    wins because one backward pass is cheaper than O(N²) per-node
         //    backward passes on CPU.
         //
-        //    Measured heuristic (#3599):
+        //    Measured heuristic:
         //    - soundnessbench: 37% skip → sequential GPU 30x faster
         //    - metaroom: 69% skip → graph path 4.8x faster
         let budget = crate::network::crown_memory::cpu_crown_dense_budget_bytes();
@@ -680,7 +827,7 @@ impl GraphNetwork {
         // sequential collector cannot selectively skip large spatial targets,
         // so metaroom must stay on the graph-native collector when those nodes
         // dominate. The graph-native loop below uses a separate, patches-aware
-        // budget helper because it can still tighten those targets via #3813.
+        // budget helper because it can still tighten those targets via the patches-start path.
         let exceed_count = ibp_bounds
             .iter()
             .filter(|(_node_name, bound)| {
@@ -700,7 +847,32 @@ impl GraphNetwork {
         // implementation already exists would be invisible to the audit.
         let sparse_interm_diag = sparse_interm_diag_enabled();
         let environment_sparse_relu_rows = sparse_relu_rows_enabled();
+        // #cgan-unstable-rows: the TYPED delivery of the same gate. Already
+        // masked by `requires_shrink_only_publication()` at the collection
+        // entry (`crown.rs`), so a Standard collection is byte-identical with
+        // the key set; the mask is repeated here so this file states its own
+        // scope rather than inheriting it silently.
+        let typed_sparse_relu_rows = runtime_policy.collector_unstable_rows
+            && collection_mode.requires_shrink_only_publication();
+        let unstable_rows_max_permille = runtime_policy.collector_unstable_rows_max_permille;
+        let sparse_relu_rows_requested = environment_sparse_relu_rows || typed_sparse_relu_rows;
         let atomic_target_requested = collection_mode.is_cgan_sparse_target_complete();
+        // Initial scope excludes independently scheduled row/stacked/cut/patches
+        // routes. Their original policy is left in control; no new authority is
+        // inferred from an unavailable head opportunity.
+        let head_rows_enabled = head_rows_policy.is_some()
+            && collection_mode == CrownIbpCollectionMode::Standard
+            && deadline_is_hard
+            && deadline.is_some()
+            && cut_segment == 0
+            && !collector_dense
+            && !sparse_relu_rows_requested
+            && !deadline_salvage_policy.is_enabled()
+            && !runtime_policy.requires_graph_native_chunk_execution()
+            && cgan_narrow_target_max_rows.is_none()
+            && min_width_to_tighten.is_none()
+            && !super::cgan_stacked::stacked_backward_enabled()
+            && !super::resident_patches_root::enabled();
         let resident_patches_root = super::resident_patches_root::enabled();
         let resident_patches_window = super::resident_patches_root::begin_planning_if_enabled(
             resident_patches_root,
@@ -716,13 +888,13 @@ impl GraphNetwork {
                 window,
             );
         }
-        let sparse_output_node = if environment_sparse_relu_rows || atomic_target_requested {
+        let sparse_output_node = if sparse_relu_rows_requested || atomic_target_requested {
             resolve_collection_output_node(self, exec_order)
         } else {
             None
         };
         let early_demand_set =
-            if environment_sparse_relu_rows || atomic_target_requested || sparse_interm_diag {
+            if sparse_relu_rows_requested || atomic_target_requested || sparse_interm_diag {
                 Some(nodes_requiring_crown_tightening(
                     self,
                     exec_order,
@@ -761,7 +933,14 @@ impl GraphNetwork {
             );
         }
 
-        let sparse_relu_rows = environment_sparse_relu_rows || atomic_target_engaged;
+        let sparse_relu_rows = sparse_relu_rows_requested || atomic_target_engaged;
+        // #cgan-unstable-rows decline census. Printed unconditionally below so
+        // a null can be read as "declined" rather than "measured".
+        let mut unstable_rows_planned = 0usize;
+        let mut unstable_rows_all_stable = 0usize;
+        let mut unstable_rows_above_frac = 0usize;
+        let mut unstable_rows_not_relu_only = 0usize;
+        let mut unstable_rows_dense_declined = 0usize;
         let sparse_relu_row_plans = if atomic_target_engaged {
             atomic_target
                 .iter()
@@ -795,19 +974,54 @@ impl GraphNetwork {
                     }
                 })
                 .collect::<HashMap<_, _>>()
-        } else if environment_sparse_relu_rows {
+        } else if sparse_relu_rows_requested {
+            // #cgan-unstable-rows: ONE plan build for both routes. The typed
+            // route carries its own `max_frac` ceiling; the environment route
+            // keeps abc's 0.9 default, so its plans are bit-identical to the
+            // pre-change build.
+            let plan_max_permille = if typed_sparse_relu_rows {
+                unstable_rows_max_permille
+            } else {
+                super::DEFAULT_SPARSE_RELU_MAX_PERMILLE
+            };
             early_demand_set
                 .as_ref()
                 .expect("sparse row gate computes demand before the sequential route")
                 .iter()
                 .filter_map(|node_name| {
                     let bounds = ibp_bounds.get(node_name)?;
-                    let plan = sparse_relu_row_plan_for_target(
-                        self,
+                    let selection = self.select_unstable_rows(
                         node_name,
                         sparse_output_node.as_deref(),
                         bounds,
-                    )?;
+                        plan_max_permille,
+                    );
+                    let plan = match selection {
+                        RowSelection::Rows(plan) => plan,
+                        RowSelection::AllStable => {
+                            unstable_rows_all_stable += 1;
+                            // An all-stable target is still a legitimate empty
+                            // plan for the historical route (the #all-stable
+                            // skip consumes it separately); keep it so the
+                            // env route stays bit-identical.
+                            return Some((
+                                node_name.clone(),
+                                SparseReluRowPlan::all_stable(bounds.len()),
+                            ));
+                        }
+                        RowSelection::AboveMaxFrac { k, dim } => {
+                            unstable_rows_above_frac += 1;
+                            eprintln!(
+                                "[unstable-rows] root target='{node_name}' k={k}/{dim} secs=0.000 \
+                                 gain=n/a outcome=declined(above_frac)"
+                            );
+                            return None;
+                        }
+                        RowSelection::NotReluOnly => {
+                            unstable_rows_not_relu_only += 1;
+                            return None;
+                        }
+                    };
                     let patches_seed =
                         self.crown_ibp_target_can_start_in_patches(node_name, bounds);
                     if subset_seed_fits_dense_budget(
@@ -816,8 +1030,16 @@ impl GraphNetwork {
                         bounds.len(),
                         budget,
                     ) {
+                        unstable_rows_planned += 1;
                         Some((node_name.clone(), plan))
                     } else {
+                        unstable_rows_dense_declined += 1;
+                        eprintln!(
+                            "[unstable-rows] root target='{node_name}' k={}/{} secs=0.000 \
+                             gain=n/a outcome=declined(dense-budget)",
+                            plan.selected_len(),
+                            bounds.len(),
+                        );
                         info!(
                             "#sparse-relu-rows: node '{}' selected {}/{} rows, but its dense \
                              selector pair exceeds the {} byte budget; retaining the existing \
@@ -957,7 +1179,56 @@ impl GraphNetwork {
         // contract that keeps `min_width_to_tighten` off this fast path
         // (both change WHICH nodes are tightened). `None` (the shipped
         // default) leaves the fast-path decision byte-identical.
+        // #cgan-collector-dense (E5): one UNCONDITIONAL line per typed cGAN
+        // cascade so the collection's conv mode is observable armed or not.
+        // `patches_override` is the value every patches-eligible target walk
+        // receives below; `use_patches_mode` is the graph-level gate it is
+        // OR-ed with (`target_backward_patches.rs:107/:220`). The sequential
+        // shortcut has no conv-mode input at all (it seeds Patches for every
+        // spatial target), so dense mode declines it and takes the
+        // graph-native loop; the `route=` line below records which ran.
+        // #cgan-unstable-rows: ONE unconditional line per shrink-only cascade,
+        // armed or not. `source=typed` under an armed yaml with no NY_* set is
+        // the ARRIVAL PROOF for the preset route; `source=none` under an armed
+        // yaml is a CLI-bridge delivery failure, not a negative.
+        if collection_mode.requires_shrink_only_publication() {
+            let unstable_rows_source = match (typed_sparse_relu_rows, environment_sparse_relu_rows)
+            {
+                (true, true) => "typed+env",
+                (true, false) => "typed",
+                (false, true) => "env",
+                (false, false) => "none",
+            };
+            eprintln!(
+                "[unstable-rows] root armed={sparse_relu_rows_requested} \
+                 source={unstable_rows_source} max_frac={:.3} demanded={} planned={} \
+                 all_stable={unstable_rows_all_stable} above_frac={unstable_rows_above_frac} \
+                 not_relu_only={unstable_rows_not_relu_only} \
+                 dense_declined={unstable_rows_dense_declined}",
+                f64::from(unstable_rows_max_permille) / 1000.0,
+                early_demand_set.as_ref().map_or(0, HashSet::len),
+                unstable_rows_planned,
+            );
+        }
+        if collection_mode.requires_shrink_only_publication() {
+            eprintln!(
+                "[collector-mode] cgan_collector_dense={collector_dense} patches_override={} \
+                 use_patches_mode={} mode={collection_mode:?} sequential_declined={collector_dense}",
+                !collector_dense,
+                self.use_patches_mode,
+            );
+            if collector_dense && self.use_patches_mode {
+                eprintln!(
+                    "[collector-mode] WARN graph.use_patches_mode=true (conv_mode auto/patches): \
+                     the graph-level gate at target_backward_patches.rs still admits Patches; \
+                     cgan_collector_dense only clears the collector override, so this \
+                     cascade is NOT dense"
+                );
+            }
+        }
         if cut_segment == 0
+            && !head_rows_enabled
+            && !collector_dense
             && cgan_narrow_target_max_rows.is_none()
             && !runtime_policy.requires_graph_native_chunk_execution()
             && sequential_fast_path_allowed(
@@ -985,11 +1256,20 @@ impl GraphNetwork {
                 if sparse_interm_diag {
                     eprintln!("[NY_SPARSE_INTERM_DIAG_V1] collector_route=sequential");
                 }
+                if collection_mode.requires_shrink_only_publication() {
+                    eprintln!("[collector-mode] route=sequential mode={collection_mode:?}");
+                }
                 return Ok(result);
             }
         }
         if sparse_interm_diag {
             eprintln!("[NY_SPARSE_INTERM_DIAG_V1] collector_route=graph_native");
+        }
+        if collection_mode.requires_shrink_only_publication() {
+            eprintln!(
+                "[collector-mode] route=graph-native mode={collection_mode:?} \
+                 dense={collector_dense}"
+            );
         }
 
         // #crown-cut-segment (NY_CROWN_CUT_SEGMENT, default OFF = full-prefix
@@ -1090,6 +1370,12 @@ impl GraphNetwork {
         let mut crown_ibp_bounds: HashMap<String, BoundedTensor> = HashMap::new();
         let mut provenance: HashMap<String, BoundsProvenance> = HashMap::new();
         let mut fallback_events = Vec::new();
+        // #patches-merge-expiry: which memory CHECK refused each degraded
+        // target, keyed by the refusing site: (targets refused, largest
+        // required bytes, the budget that refused it). Read only by the
+        // degradation summary below; routing never consults it.
+        let mut memory_refusal_sites: BTreeMap<&'static str, (usize, usize, usize)> =
+            BTreeMap::new();
         let demand_set = early_demand_set
             .unwrap_or_else(|| nodes_requiring_crown_tightening(self, exec_order, &ibp_bounds));
         debug!(
@@ -1101,9 +1387,8 @@ impl GraphNetwork {
         // #all-stable-skip: never spend a CROWN walk on a node with ZERO unstable
         // rows. Unconditional, and independent of the sparse-row subset gate below.
         //
-        // CORRECTION 2026-08-03: 5f604b84 described this as "VALUE-IDENTICAL. No
-        // computed bound changes." That is WRONG and was measured wrong on 8 of 20
-        // A/B rows. The SKIPPED node's own box is unchanged — that part of the proof
+        // This skip is NOT value-identical (measured 2026-08-03: computed bounds changed on
+        // 8 of 20 A/B rows). The SKIPPED node's own box is unchanged — that part of the proof
         // below holds. But removing 14,336 of 32,868 row-weights from the demand set
         // makes `compute_weighted_per_node_budget_secs` (budget_policy.rs:429) hand
         // every SURVIVING target a ~1.8x larger slice, so targets that previously hit
@@ -1197,7 +1482,7 @@ impl GraphNetwork {
         let mut patches_budget =
             budget_policy::PatchesTighteningBudget::with_collection_deadline(deadline);
         // Preset-configurable floor/cap for the equal-share per-node budget
-        // (#cgan-bn11-budget). Default (all-None) reproduces the #3499/#4413
+        // (#cgan-bn11-budget). Default (all-None) reproduces the built-in
         // constants exactly; only presets that set the knobs (cgan_2023's
         // 150 s cap for the 28,800-dim BN_11 chunked backward) change policy.
         let per_node_time_budget = self.crown_ibp_per_node_time_budget;
@@ -1404,8 +1689,8 @@ impl GraphNetwork {
                         }
                         let ibp_bound = ibp_bounds.get(node_name)?;
                         let sparse_relu_plan = sparse_relu_row_plans.get(node_name);
-                        let is_patches_target =
-                            self.crown_ibp_target_can_start_in_patches(node_name, ibp_bound);
+                        let is_patches_target = !collector_dense
+                            && self.crown_ibp_target_can_start_in_patches(node_name, ibp_bound);
                         let subset_indices = resolve_subset_indices(
                             node_name,
                             ibp_bound,
@@ -1489,18 +1774,44 @@ impl GraphNetwork {
                 ibp_bounds
                     .get(node_name)
                     .map(|b| {
-                        let historical_selected_rows = sparse_relu_row_plans
-                            .get(node_name)
-                            .map_or_else(|| b.len(), |plan| plan.selected_len());
+                        // #cgan-unstable-rows: a TYPED sparse plan keeps the
+                        // FULL-row schedule weight. The plan shrinks the row
+                        // count by dim/k while the ancestor prefix the walk
+                        // still traverses is unchanged, so pricing it at k
+                        // starves the target into the very
+                        // PerNodeDeadlineExceeded this mechanism removes. The
+                        // share is re-read from the remaining window at every
+                        // node, so an over-allocated slice that finishes early
+                        // returns to the pool for free. Env and atomic plans
+                        // keep `selected_len()` so their frontier is unmoved.
+                        let historical_selected_rows =
+                            sparse_relu_row_plans.get(node_name).map_or_else(
+                                || b.len(),
+                                |plan| {
+                                    typed_sparse_schedule_rows(
+                                        typed_sparse_relu_rows && !atomic_target_engaged,
+                                        plan.selected_len(),
+                                        b.len(),
+                                    )
+                                },
+                            );
                         let route = chunk_aware_candidate_routes
                             .as_ref()
                             .and_then(|routes| routes.get(index))
                             .and_then(Option::as_ref);
                         let demanded_rows = route.map_or(historical_selected_rows, |route| {
-                            route
-                                .subset_indices
-                                .as_deref()
-                                .map_or_else(|| b.len(), <[usize]>::len)
+                            route.subset_indices.as_deref().map_or_else(
+                                || b.len(),
+                                |indices| {
+                                    typed_sparse_schedule_rows(
+                                        typed_sparse_relu_rows
+                                            && !atomic_target_engaged
+                                            && sparse_relu_row_plans.contains_key(node_name),
+                                        indices.len(),
+                                        b.len(),
+                                    )
+                                },
+                            )
                         });
                         demanded_rows_by_index[index] = demanded_rows;
                         budget_policy::demanded_target_work_weight(
@@ -1538,8 +1849,7 @@ impl GraphNetwork {
         let prefix_cost_weighted =
             budget_policy::prefix_cost_weighting_enabled(&per_node_time_budget)
                 && !chunk_aware_budget;
-        if budget_policy::prefix_cost_weighting_enabled(&per_node_time_budget)
-            && chunk_aware_budget
+        if budget_policy::prefix_cost_weighting_enabled(&per_node_time_budget) && chunk_aware_budget
         {
             eprintln!(
                 "[target-cost-weight] declined: M1 chunk-aware weighting is armed and \
@@ -1671,6 +1981,14 @@ impl GraphNetwork {
         // authority boundary), the CganSparseTargetComplete mode, sparse-row
         // planned targets, and the margin-subset OUTPUT node (their solo
         // routes use k-row seeds the stack does not model).
+        //
+        // #cgan-unstable-rows: arming the typed key is therefore also a
+        // REMOVAL from this stacked pass. Every target that receives a row plan
+        // drops out of `stacked_candidates` below, so a cascade-time change
+        // measured with the key armed is the sum of two effects — k-row seeds
+        // instead of full width, AND those targets walking solo instead of
+        // stacked. Read `[stacked]` alongside `[unstable-rows]` before
+        // attributing either.
         let mut stacked_results: HashMap<String, BoundedTensor> = HashMap::new();
         if super::cgan_stacked::stacked_backward_enabled()
             && !atomic_target_engaged
@@ -1806,10 +2124,10 @@ impl GraphNetwork {
         // #cprime-admission: estimate-then-refuse walk admission. Engaged only
         // when a collection deadline exists — an unbounded collection admits
         // everything, byte-identical to the historical loop. The rate basis is
-        // the per-process forward-linear probe (same GMAC unit as the walk
-        // estimate; cached OnceLock, so the probe is paid at most once per
-        // process, and lazily — only when a deadline-carrying non-patches
-        // candidate actually reaches admission), corrected by the census
+        // an already completed per-seam forward-linear calibration or the
+        // existing conservative fallback (same GMAC unit as the walk estimate).
+        // Reading it never starts or waits for a probe inside this clock.
+        // It is corrected by the census
         // prior until the FIRST completed walk in THIS collection replaces it
         // (self-calibrating).
         let mut walk_cost_model: Option<budget_policy::WalkCostModel> = None;
@@ -1841,8 +2159,39 @@ impl GraphNetwork {
         // first useful CROWN result and avoids unrelated graph branches.
         let mut downstream_resweep_sources = downstream_resweep.then(HashSet::<String>::new);
 
+        // No prior numerical walk runs on this eligible route. A completed
+        // selected result is committed here under its head deadline and held
+        // privately until the ordinary topological publication visit.
+        let mut head_rows = if head_rows_enabled {
+            deadline.and_then(|end| {
+                super::head_rows::run(
+                    self,
+                    input,
+                    &ibp_bounds,
+                    &demand_set,
+                    engine,
+                    end,
+                    collector_route_subset_budget_bytes(budget),
+                    prefix_cost_active,
+                )
+            })
+        } else {
+            None
+        };
+        if head_rows_enabled && head_rows.is_none() {
+            info!("Selective root head rows: no supported crossing head opportunity");
+        }
+        // The opportunity owns this target, including a declared pre-entry
+        // refusal; no later budget/row route retries it at full width.
+        if let Some(head) = head_rows.as_ref() {
+            if let Some(index) = exec_order.iter().position(|name| name == &head.target) {
+                global_budget_candidate_mask[index] = false;
+                global_budget_candidate_weights[index] = 0.0;
+            }
+        }
+
         for (layer_index, node_name) in exec_order.iter().enumerate() {
-            // Deadline check (#3109): if deadline exceeded, skip CROWN backward
+            // Deadline check: if deadline exceeded, skip CROWN backward
             // for remaining nodes and use IBP bounds instead. This is sound
             // (IBP bounds are valid, just looser).
             if !deadline_exceeded {
@@ -1925,6 +2274,45 @@ impl GraphNetwork {
             // the fail-open recompute declines a node), borrow the original
             // map entry without allocating or copying its tensors.
             let ibp_bound = composed_ibp_bound.as_ref().unwrap_or(original_ibp_bound);
+            if head_rows
+                .as_ref()
+                .is_some_and(|head| head.target == *node_name)
+            {
+                let mut head = head_rows.take().expect("matched private head opportunity");
+                let (published, completed_rows) =
+                    head.publish(ibp_bound, original_ibp_bound, deadline);
+                if let Some(sources) = downstream_resweep_sources.as_mut() {
+                    if published.lower() != original_ibp_bound.lower()
+                        || published.upper() != original_ibp_bound.upper()
+                    {
+                        sources.insert(node_name.clone());
+                    }
+                }
+                let details = format!(
+                    "node '{node_name}' selected head stage={} entered={} eligible={} selected={} completed={} total={} seed_bytes={} estimated_macs={} seconds={:.6} grant_seconds={} cached_rate={} rows={:?} original_selected={:?} published_selected={:?} full_width_retry=0 gpu_stage={} gpu_workspace_bytes={} gpu_work={}",
+                    head.stage, head.entered, head.eligible, head.selected, completed_rows,
+                    head.total, head.seed_bytes, head.estimated_macs, head.elapsed_secs,
+                    head.grant_secs, head.rate_macs_per_sec, &head.rows[..head.selected],
+                    head.selected_endpoints(original_ibp_bound), head.selected_endpoints(&published),
+                    head.gpu.stage, head.gpu.workspace_bytes, head.gpu.work,
+                );
+                info!("Selective root head rows: {details}");
+                crown_ibp_bounds.insert(node_name.clone(), published);
+                provenance.insert(
+                    node_name.clone(),
+                    BoundsProvenance::ForwardFallback(CrownIbpFallbackReason::SelectedHeadRows),
+                );
+                fallback_events.push(CrownIbpFallbackEvent {
+                    layer_index,
+                    layer_type: node
+                        .map(|node| node.layer.layer_type().to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    reason: CrownIbpFallbackReason::SelectedHeadRows,
+                    details,
+                });
+                skip_count += 1;
+                continue;
+            }
             let layer_type = node
                 .map(|node| node.layer.layer_type().to_string())
                 .unwrap_or_else(|| "Unknown".to_string());
@@ -1947,7 +2335,7 @@ impl GraphNetwork {
                 continue;
             }
 
-            // Demand-driven skip (#3775): no downstream nonlinear consumer needs this node.
+            // Demand-driven skip: no downstream nonlinear consumer needs this node.
             if !demand_set.contains(node_name) {
                 demand_skip_count += 1;
                 crown_ibp_bounds.insert(node_name.clone(), ibp_bound.clone());
@@ -2030,7 +2418,7 @@ impl GraphNetwork {
                 raw_rows: ibp_bound.len(),
             });
 
-            // When deadline exceeded, skip CROWN backward and use IBP directly (#3109).
+            // When deadline exceeded, skip CROWN backward and use IBP directly.
             // A stacked result is already computed — serving it is ~free and
             // sound, so it bypasses every pre-walk skip below.
             if deadline_exceeded && !stacked_results.contains_key(node_name) {
@@ -2050,10 +2438,10 @@ impl GraphNetwork {
             }
 
             // Memory budget check: the graph-native loop may keep spatial unary
-            // targets on the patches-start path from #3813, so only dense-only
+            // targets on the patches-start path, so only dense-only
             // targets trip this gate. This intentionally differs from the
             // sequential fast-path gate above, which must remain conservative
-            // enough to keep metaroom off the wrong collector (#3839).
+            // enough to keep metaroom off the wrong collector.
             //
             // Over-budget targets are no longer skipped to IBP: they reroute
             // through the bound-equivalent objective-chunked backward
@@ -2083,7 +2471,7 @@ impl GraphNetwork {
                 }
                 (
                     route.chunk_plan.map(|plan| plan.requested_rows),
-                    route.is_patches_target,
+                    route.is_patches_target && !collector_dense,
                 )
             } else {
                 // Historical lazy route resolution. Keeping this branch
@@ -2106,7 +2494,8 @@ impl GraphNetwork {
                     };
                 (
                     chunk_override,
-                    self.crown_ibp_target_can_start_in_patches(node_name, ibp_bound),
+                    !collector_dense
+                        && self.crown_ibp_target_can_start_in_patches(node_name, ibp_bound),
                 )
             };
             #[cfg(test)]
@@ -2146,7 +2535,7 @@ impl GraphNetwork {
             // Width-based skip: when the IBP interval is already tight, CROWN
             // backward cannot meaningfully tighten further.  Skipping saves the
             // ~5-7s per-node cost for the budget to reach deeper, wider nodes
-            // where tightening matters most (#3499).
+            // where tightening matters most.
             if !is_atomic_selected_target && !stacked_results.contains_key(node_name) {
                 if let Some(threshold) = min_width_to_tighten {
                     let ibp_max_width = ibp_bound.max_width();
@@ -2178,13 +2567,16 @@ impl GraphNetwork {
             }
 
             // Share the remaining deadline across the remaining globally
-            // eligible tightening targets, then clamp with the #4413 cap.
+            // eligible tightening targets, then clamp with the per-node cap.
             let patches_per_node = patches_budget
                 .remaining_deadline(is_patches_target, budget_policy::MIN_PER_NODE_BUDGET_SECS);
             // #skip-log-names-the-deciding-term: the weighted share that the floor
             // test actually rejected, recorded so the skip log can print IT rather
             // than the equal share, which is a different number.
             let mut rejected_weighted_secs: Option<f64> = None;
+            // #per-node-floor-dim-scale: the width the floor was scaled against,
+            // so the refusal line can print the floor this target was held to.
+            let mut rejected_cap_dims: Option<f64> = None;
             let mut per_node_deadline = if is_atomic_selected_target {
                 // No equal-share/adaptive cap: this is the one target the typed
                 // root strategy selected, so it owns the complete remaining
@@ -2214,6 +2606,7 @@ impl GraphNetwork {
                         ibp_bound.len() as f64,
                         separate_cap_dims,
                     );
+                    rejected_cap_dims = Some(cap_dims);
                     rejected_weighted_secs = budget_policy::weighted_per_node_budget_secs_unfloored(
                         remaining_secs,
                         remaining_weight_sum,
@@ -2257,14 +2650,44 @@ impl GraphNetwork {
                         }
                     })
                     .unwrap_or(0.0);
+                // #per-node-floor-dim-scale: the floor THIS target was held to
+                // (dark: the resolved constant; armed: scaled by its width).
+                let (held_floor_secs, floor_scaled) = budget_policy::effective_floor_secs_for_dims(
+                    &per_node_time_budget,
+                    rejected_cap_dims.unwrap_or(ibp_bound.len() as f64),
+                );
                 debug!(
-                    "CROWN-IBP DAG: node '{}' per-node budget {:.1}s < {:.1}s floor ({} tightening targets remain, {:.1}s left), using IBP",
+                    "CROWN-IBP DAG: node '{}' per-node budget {:.1}s < {:.3}s floor (resolved {:.1}s, scaled={}; {} tightening targets remain, {:.1}s left), using IBP",
                     node_name,
                     rejected_weighted_secs.unwrap_or(0.0),
+                    held_floor_secs,
                     per_node_floor_secs,
+                    floor_scaled,
                     remaining_global_candidates,
                     remaining_secs,
                 );
+                // #per-node-floor-dim-scale OBSERVABLE. UNCONDITIONAL on the key
+                // (`floor_scaled=0` prints on the dark arm), process-rate-limited
+                // to the first 16 refusals and then powers of two because a
+                // many-clause disjunction refuses the same cheap node per clause.
+                {
+                    static OCCURRENCES: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    if let Some(occ) =
+                        crate::network::graph_alpha::retained_occurrence(&OCCURRENCES)
+                    {
+                        eprintln!(
+                            "[per-node-floor] refused node={node_name} dim={} share_s={:.4} \
+                             floor_secs={held_floor_secs:.4} floor_scaled={} resolved_floor_secs={:.3} \
+                             targets_remaining={remaining_global_candidates} \
+                             window_left_s={remaining_secs:.1} occ={occ}",
+                            ibp_bound.len(),
+                            rejected_weighted_secs.unwrap_or(0.0),
+                            u8::from(floor_scaled),
+                            per_node_floor_secs,
+                        );
+                    }
+                }
                 skip_count += 1;
                 crown_ibp_bounds.insert(node_name.clone(), ibp_bound.clone());
                 // #per-node-floor-label: this target NEVER RAN. Recording it as
@@ -2283,11 +2706,14 @@ impl GraphNetwork {
                     reason: CrownIbpFallbackReason::PerNodeBudgetBelowFloor,
                     details: format!(
                         "node '{}' REFUSED before any backward step: per-node share {:.3}s is \
-                         below the {:.1}s floor ({} tightening targets remain, {:.1}s of \
-                         collection window left) — the walk did not run and did not overrun",
+                         below the {:.3}s floor (floor_secs={:.4} floor_scaled={}; {} tightening \
+                         targets remain, {:.1}s of collection window left) — the walk did not \
+                         run and did not overrun",
                         node_name,
                         rejected_weighted_secs.unwrap_or(0.0),
-                        per_node_floor_secs,
+                        held_floor_secs,
+                        held_floor_secs,
+                        u8::from(floor_scaled),
                         remaining_global_candidates,
                         remaining_secs,
                     ),
@@ -2368,7 +2794,9 @@ impl GraphNetwork {
                 && !deadline_salvage_policy.is_enabled()
                 && walk_cost_model.is_none()
             {
-                let rate = crate::network::forward_linear_measured_rate();
+                // This estimate is inside live node/collection clocks. Never
+                // start (or wait for) the unrelated startup rate probe here.
+                let rate = crate::network::core::graph::forward_linear_cached_rate();
                 walk_cost_model = Some(budget_policy::WalkCostModel::new(rate.macs_per_sec as f64));
             }
             if let (Some(model), Some(node_deadline), Some(collection_deadline)) =
@@ -2422,6 +2850,28 @@ impl GraphNetwork {
                             is_last_candidate,
                         );
                         budget_policy::note_walk_admission(model, node_name, decision);
+                        // #cgan-collector-dense (E5): the forward-linear MAC
+                        // proxy prices a different cost class than a dense
+                        // conv walk, so an upfront Refuse would leave the very
+                        // targets the experiment measures on their IBP baseline
+                        // and read as a negative. Under the key a Refuse is
+                        // logged and ADMITTED at its existing per-node deadline
+                        // (the per-node cap still bounds the walk; an overrun
+                        // falls back to IBP exactly as today).
+                        let decision = match decision {
+                            budget_policy::WalkAdmissionDecision::Refuse {
+                                estimated_secs,
+                                budget_secs,
+                            } if collector_dense => {
+                                eprintln!(
+                                    "[collector-mode] admission-bypass node='{node_name}' \
+                                     rows={effective_target_rows} est_secs={estimated_secs:.1} \
+                                     share_secs={budget_secs:.1} remaining_secs={remaining_secs:.1}"
+                                );
+                                budget_policy::WalkAdmissionDecision::Admit
+                            }
+                            other => other,
+                        };
                         match decision {
                             budget_policy::WalkAdmissionDecision::Admit => {}
                             budget_policy::WalkAdmissionDecision::AdmitWithMeasuredGrant {
@@ -2523,7 +2973,7 @@ impl GraphNetwork {
             }
 
             // Patches-eligible targets use the collector-specific entry point
-            // that overrides matrix conv_mode for this cut-free path (#3813).
+            // that overrides matrix conv_mode for this cut-free path.
             let node_start = Instant::now();
             let layer_type_for_log = layer_type.clone();
 
@@ -2684,77 +3134,146 @@ impl GraphNetwork {
             // from a completed-rate sample.
             let mut completed_prefix_walk_elapsed = None;
             let margin_subset_bound = subset_indices.and_then(|indices| {
-                let subset_walk_start =
-                    (prefix_cost_active && prefix_work_units.is_some()).then(Instant::now);
-                let subset_attempt = if collector_force_subset_failure(node_name) {
-                    Err(NyError::UnsupportedConfiguration(format!(
+                // #cgan-unstable-rows: ONE kernel owns the k-row walk, the
+                // scatter over the certified baseline and (for a typed sparse
+                // plan) the shrink-only intersection. `shrink_only` is false on
+                // every historical route, so the env/margin paths keep their
+                // byte-identical behaviour: the raw scatter travels to
+                // `intersect_completed_crown_target` exactly as before. On the
+                // typed route the extra intersection is IDEMPOTENT with that
+                // publication step (base ∩ (base ∩ crown) = base ∩ crown).
+                let typed_sparse_target =
+                    subset_is_sparse && typed_sparse_relu_rows && !is_atomic_selected_target;
+                // Test-only: drive the kernel's dense-seed refusal directly.
+                // The planner applies the identical test first, so on any real
+                // run the refusal below is unreachable — which is exactly why
+                // its fail-open arm needs an injected witness.
+                let force_dense_decline = collector_force_subset_dense_decline(node_name);
+                let outcome = if collector_force_subset_failure(node_name) {
+                    RowRefineOutcome::Failed(NyError::UnsupportedConfiguration(format!(
                         "test-injected subset failure for '{node_name}'"
                     )))
                 } else {
-                    self.propagate_crown_to_node_subset(
+                    self.refine_rows_over_box(RowRefineRequest {
                         input,
-                        node_name,
-                        &crown_ibp_bounds,
-                        &ibp_bounds,
+                        target: node_name,
+                        crown_bounds: &crown_ibp_bounds,
+                        ibp_bounds: &ibp_bounds,
+                        // The PUBLICATION baseline, which under
+                        // `#crown-ibp-downstream-resweep` is the composed box
+                        // and not `ibp_bounds[node_name]`. The historical
+                        // inline scatter wrote over exactly this reference.
+                        base: ibp_bound,
                         engine,
-                        if subset_is_sparse {
+                        rows: &indices,
+                        per_node_deadline,
+                        deadline_is_hard,
+                        collector_patches_override: is_patches_target,
+                        label: if subset_is_sparse {
                             "CROWN-IBP-sparse-relu-rows"
                         } else {
                             "CROWN-IBP-margin-subset"
                         },
-                        per_node_deadline,
-                        deadline_is_hard,
-                        is_patches_target,
-                        &indices,
-                        cut_ctx.as_ref(),
-                    )
+                        cut_ctx: cut_ctx.as_ref(),
+                        // Same predicate, same budget, same patches
+                        // representation the planner applied in
+                        // `resolve_subset_indices` — scope included — so this
+                        // re-check can only agree with it. A margin/cone
+                        // subset was never budget-refused and must not start
+                        // being refused now.
+                        dense_budget_bytes: if force_dense_decline {
+                            0
+                        } else {
+                            collector_route_subset_budget_bytes(budget)
+                        },
+                        enforce_dense_budget: subset_is_sparse || force_dense_decline,
+                        patches_seed: is_patches_target && !force_dense_decline,
+                        shrink_only: typed_sparse_target,
+                    })
                 };
-                let subset_walk_elapsed = subset_walk_start.map(|start| start.elapsed());
-                match subset_attempt {
-                    Ok((lower_rows, upper_rows)) => {
-                        match scatter_margin_rows_over_bounds(
-                            ibp_bound,
-                            &indices,
-                            &lower_rows,
-                            &upper_rows,
-                        ) {
-                            Ok(bounds) => {
-                                completed_prefix_walk_elapsed = subset_walk_elapsed;
-                                sparse_partial_succeeded = subset_is_sparse;
-                                info!(
-                                    "CROWN-IBP DAG: node '{}' {} subset seed engaged \
-                                         (k={} of {} rows; scattered over IBP)",
-                                    node_name,
-                                    if subset_is_sparse {
-                                        "sparse-ReLU"
-                                    } else {
-                                        "margin"
-                                    },
-                                    indices.len(),
-                                    ibp_bound.len()
-                                );
-                                Some(bounds)
-                            }
-                            Err(e) => {
-                                if is_atomic_selected_target && subset_is_sparse {
-                                    atomic_subset_error =
-                                        Some(NyError::UnsupportedConfiguration(format!(
-                                            "atomic sparse target '{}' scatter failed before \
-                                             complete publication: {e}",
-                                            node_name
-                                        )));
-                                } else {
-                                    debug!(
-                                        "CROWN-IBP DAG: node '{}' subset scatter \
-                                             failed ({e}); falling back to full-width backward",
-                                        node_name
-                                    );
-                                }
-                                None
-                            }
+                match outcome {
+                    RowRefineOutcome::Refined { bounds, k, secs } => {
+                        // Time only the dense walk represented by
+                        // `prefix_work_units`; the kernel measures exactly that.
+                        if prefix_cost_active && prefix_work_units.is_some() {
+                            completed_prefix_walk_elapsed = Some(Duration::from_secs_f64(secs));
                         }
+                        sparse_partial_succeeded = subset_is_sparse;
+                        if subset_is_sparse {
+                            eprintln!(
+                                "[unstable-rows] root target='{node_name}' k={k}/{} \
+                                 secs={secs:.3} outcome=refined",
+                                ibp_bound.len(),
+                            );
+                        }
+                        info!(
+                            "CROWN-IBP DAG: node '{}' {} subset seed engaged \
+                                 (k={} of {} rows; scattered over IBP)",
+                            node_name,
+                            if subset_is_sparse {
+                                "sparse-ReLU"
+                            } else {
+                                "margin"
+                            },
+                            k,
+                            ibp_bound.len()
+                        );
+                        Some(*bounds)
                     }
-                    Err(e) => {
+                    RowRefineOutcome::Disjoint { count } => {
+                        // Both inputs are valid enclosures, so this is a
+                        // numerical anomaly. Never publish the sound diagnostic
+                        // UNION: fail open to the full-width walk, which the
+                        // shrink-only publication step re-checks anyway.
+                        eprintln!(
+                            "[unstable-rows] root target='{node_name}' k={}/{} \
+                             outcome=disjoint={count}->fullwidth",
+                            indices.len(),
+                            ibp_bound.len(),
+                        );
+                        if is_atomic_selected_target && subset_is_sparse {
+                            atomic_subset_error = Some(NyError::UnsupportedConfiguration(format!(
+                                "atomic sparse target '{node_name}' produced {count} disjoint \
+                                 elements against its certified baseline"
+                            )));
+                        }
+                        None
+                    }
+                    RowRefineOutcome::Declined(reason) => {
+                        if subset_is_sparse {
+                            eprintln!(
+                                "[unstable-rows] root target='{node_name}' k={}/{} \
+                                 outcome=declined({reason})",
+                                indices.len(),
+                                ibp_bound.len(),
+                            );
+                        }
+                        if is_atomic_selected_target
+                            && subset_is_sparse
+                            && !subset_decline_is_fail_open(reason)
+                        {
+                            atomic_subset_error = Some(NyError::UnsupportedConfiguration(format!(
+                                "atomic sparse target '{node_name}' declined before publication: \
+                                 {reason}"
+                            )));
+                        } else {
+                            debug!(
+                                "CROWN-IBP DAG: node '{}' subset refinement declined ({reason}); \
+                                     falling back to full-width backward",
+                                node_name
+                            );
+                        }
+                        None
+                    }
+                    RowRefineOutcome::Failed(e) => {
+                        if subset_is_sparse {
+                            eprintln!(
+                                "[unstable-rows] root target='{node_name}' k={}/{} \
+                                 outcome=failed->fullwidth",
+                                indices.len(),
+                                ibp_bound.len(),
+                            );
+                        }
                         if is_atomic_selected_target && subset_is_sparse {
                             atomic_subset_error = Some(if e.is_deadline_exceeded() {
                                 e
@@ -2775,7 +3294,6 @@ impl GraphNetwork {
                     }
                 }
             });
-
             // A subset failure changes the route that will ACTUALLY execute.
             // Reweight the current candidate to the full target width and
             // recompute its live slice before entering the fail-open backward.
@@ -3125,7 +3643,7 @@ impl GraphNetwork {
                             collection_mode,
                         );
                         match intersection {
-                            // Per-element intersection succeeded (#2935).
+                            // Per-element intersection succeeded.
                             Some((tightened, disjoint)) => {
                                 if disjoint > 0 {
                                     debug!(
@@ -3346,12 +3864,12 @@ impl GraphNetwork {
                         node_name, completed_rows, total_rows, reason,
                     );
                 }
-                // #3166, #3602, #3499: UnsupportedOp/Configuration, ShapeMismatch,
+                // UnsupportedOp/Configuration, ShapeMismatch,
                 // or NumericalInstability from CROWN backward — IBP fallback is
                 // sound. NumericalInstability catches non-finite pre-activation
                 // bounds (e.g., from Sqrt, Softmax) that prevent CROWN relaxation.
                 // UnsupportedConfiguration now also covers per-node deadline
-                // exceeded (#3499), which returns from propagate_crown_to_node_core.
+                // exceeded, which returns from propagate_crown_to_node_core.
                 // CpuMemoryExceeded is the Conv2d backward memory-cap backstop
                 // (#conv-crown-oom): the dense coefficient buffer would exceed the
                 // per-buffer cap, so this target degrades to sound IBP instead of
@@ -3364,7 +3882,7 @@ impl GraphNetwork {
                     | NyError::CpuMemoryExceeded { .. }
                     | NyError::DeadlineExceeded(_)),
                 ) => {
-                    // #3795: structural match on DeadlineExceeded replaces string matching
+                    // Structural match on DeadlineExceeded replaces string matching
                     let reason = if e.is_deadline_exceeded() {
                         CrownIbpFallbackReason::PerNodeDeadlineExceeded
                     } else if e.is_cpu_memory_exceeded() {
@@ -3372,6 +3890,29 @@ impl GraphNetwork {
                     } else {
                         CrownIbpFallbackReason::CrownPropagationError
                     };
+                    // #patches-merge-expiry: name the CHECK that refused. The
+                    // mapping below is otherwise visible only at `debug!`, which
+                    // is how yolo_2023's residual-join refusals (Conv_5, Add_8,
+                    // Conv_12) went unseen in scored logs. Observation only.
+                    if let NyError::CpuMemoryExceeded {
+                        required_bytes,
+                        budget_bytes,
+                        site,
+                    } = &e
+                    {
+                        let entry = memory_refusal_sites.entry(*site).or_insert((0, 0, 0));
+                        entry.0 += 1;
+                        if *required_bytes >= entry.1 {
+                            entry.1 = *required_bytes;
+                            entry.2 = *budget_bytes;
+                        }
+                        report_merge_memory_refusal(
+                            node_name,
+                            site,
+                            *required_bytes,
+                            *budget_bytes,
+                        );
+                    }
                     debug!(
                         "CROWN-IBP DAG: {} CROWN backward failed ({}), using IBP",
                         node_name, e,
@@ -3491,6 +4032,58 @@ impl GraphNetwork {
             );
         }
 
+        // #vit-collector-throughput: the per-collection ADMISSION line.
+        // UNCONDITIONAL (both floor arms, every lane), because the refusal line
+        // above prints only on a refusal: a fully admitted collection used to
+        // print NO floor line at all, and that absence is not evidence
+        // (scratchpad/vbs/diag6/vit.md §3). It names the policy that decided
+        // admission (the dim-scaled floor, the resolved floor, the cost
+        // weighting, whether the #cprime-admission cost model was live) and the
+        // outcome by class, so "the floor refused it", "the cost model refused
+        // it" and "it was admitted and ran out of share" are distinguishable.
+        // It is followed by the collector-kernel engagement census, which
+        // prints only while a `bab.*` collector-kernel key is armed.
+        // Print-only; rate-limited to the first 16 collections and then powers
+        // of two, because an input-split lane re-collects per domain.
+        {
+            static POLICY_EVENTS: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            if let Some(occ) = crate::network::graph_alpha::retained_occurrence(&POLICY_EVENTS) {
+                let mut crown_kept = 0usize;
+                let mut refused_floor = 0usize;
+                let mut refused_cost = 0usize;
+                let mut deadline_cut = 0usize;
+                for prov in provenance.values() {
+                    match prov {
+                        BoundsProvenance::Crown => crown_kept += 1,
+                        BoundsProvenance::ForwardFallback(
+                            CrownIbpFallbackReason::PerNodeBudgetBelowFloor,
+                        ) => refused_floor += 1,
+                        BoundsProvenance::ForwardFallback(
+                            CrownIbpFallbackReason::WalkCostRefused,
+                        ) => refused_cost += 1,
+                        BoundsProvenance::ForwardFallback(
+                            CrownIbpFallbackReason::PerNodeDeadlineExceeded,
+                        ) => deadline_cut += 1,
+                        BoundsProvenance::ForwardFallback(_) => {}
+                    }
+                }
+                eprintln!(
+                    "[per-node-floor] policy floor_dim_scaled={} floor_secs={:.3} \
+                     prefix_cost_weighted={} cost_model={} admitted={crown_node_count} \
+                     crown_kept={crown_kept} refused_floor={refused_floor} \
+                     refused_cost={refused_cost} deadline_cut={deadline_cut} demanded={} \
+                     secs={collection_secs:.3} occ={occ}",
+                    u8::from(per_node_time_budget.floor_dim_scaled),
+                    per_node_floor_secs,
+                    u8::from(per_node_time_budget.prefix_cost_weighted),
+                    u8::from(walk_cost_model.is_some()),
+                    crown_node_count + skip_count,
+                );
+                crate::layers::collector_kernels::emit_census("collect");
+            }
+        }
+
         // #crown-degrade-visibility: report how many DEMANDED targets actually
         // completed with CROWN authority versus remaining fallback-grade
         // (including explicitly truncated partial-row hybrids), and why.
@@ -3594,15 +4187,26 @@ impl GraphNetwork {
                     let occurrence = receipt.occurrence;
                     let suppressed = receipt.suppressed_since_previous_checkpoint;
                     if quality_cliff {
+                        // Name the memory CHECK that refused, not a knob. The
+                        // previous text sent every memory refusal to the Conv2d
+                        // per-buffer cap, which governs only its own site; a
+                        // residual-join refusal is charged against the CROWN
+                        // dense budget and that cap cannot relieve it.
+                        let memory_checks = describe_memory_refusal_sites(&memory_refusal_sites);
                         warn!(
                             "CROWN-IBP DAG: {degraded}/{demanded_total} DEMANDED targets did not \
                          complete CROWN ({detail}); only {crown_kept} kept CROWN authority. \
                          Intermediate bounds remain fallback-grade (IBP plus any explicitly \
                          retained partial rows) — on a deep conv graph this compounds \
                          multiplicatively and the root bound may be far looser than the \
-                         collection time suggests. Raise the per-node budget \
-                         (crown_ibp_per_node_time_budget / alpha_crown.crown_ibp_intermediates) \
-                         or the Conv2d dense cap (NY_CROWN_MEM_CAP_MB) to recover tightness. \
+                         collection time suggests. Time-limited targets need a larger per-node \
+                         budget (crown_ibp_per_node_time_budget / \
+                         alpha_crown.crown_ibp_intermediates). Memory refusals by check: \
+                         {memory_checks}. Each site is charged against the budget it reports: \
+                         the Conv2d per-buffer cap governs only \
+                         conv2d::ops_transpose_gemm::backward_result, while the \
+                         CrownMergeAccumulator and Patches sites are charged against the CROWN \
+                         dense budget. \
                          Rate-limited quality-cliff occurrence #{occurrence}; {suppressed} \
                          intervening occurrences were suppressed before this checkpoint \
                          (first and powers of two are retained)."
@@ -3727,7 +4331,7 @@ fn compose_target_subset_indices(
 /// the backward walk. Refuse that path before allocation when it exceeds the
 /// same adaptive Dense budget as the full collector; the caller then uses the
 /// existing objective-chunked full-width path.
-fn subset_seed_fits_dense_budget(
+pub(super) fn subset_seed_fits_dense_budget(
     patches_seed: bool,
     selected_rows: usize,
     target_dim: usize,
@@ -4264,7 +4868,6 @@ mod downstream_resweep_tests {
 // #margin-subset-seed: `scatter_margin_rows_over_bounds` moved to
 // `crate::output_margin_seed` so the root CROWN backward and the DAG alpha
 // per-iteration backward share the exact same scatter (#margin-subset-alpha).
-use crate::output_margin_seed::scatter_margin_rows_over_bounds;
 
 #[cfg(test)]
 mod sparse_relu_row_helpers_tests {
@@ -4314,7 +4917,7 @@ mod sparse_relu_row_helpers_tests {
             intersect_sorted_rows(&[1, 3, 4, 8, 11], &[0, 3, 8, 9, 11]),
             vec![3, 8, 11]
         );
-        assert!(intersect_sorted_rows(&[1, 2], &[3, 4]).is_empty());
+        assert_eq!((intersect_sorted_rows(&[1, 2], &[3, 4])).len(), 0);
     }
 
     #[test]
@@ -4499,6 +5102,39 @@ mod sparse_relu_row_collector_tests {
         collect_with_deadline(graph, input, ibp, None)
     }
 
+    /// #cgan-unstable-rows: drive the collector through the TYPED gate with
+    /// `NY_CROWN_IBP_SPARSE_RELU_ROWS` unset, exactly as a scored run does.
+    fn collect_typed(
+        graph: &GraphNetwork,
+        input: &BoundedTensor,
+        ibp: std::collections::HashMap<String, BoundedTensor>,
+        collection_mode: CrownIbpCollectionMode,
+        unstable_rows: bool,
+        max_permille: u16,
+    ) -> GraphCrownIbpBoundsResult {
+        let mut policy = graph.crown_ibp_runtime_policy();
+        policy.collector_unstable_rows = unstable_rows;
+        policy.collector_unstable_rows_max_permille = max_permille;
+        graph
+            .collect_crown_ibp_bounds_core_inner_with_cut_segment_and_prefix_cost_policy(
+                input,
+                ibp,
+                None,
+                false,
+                None,
+                None,
+                0,
+                None,
+                false,
+                PartialCrownDeadlineSalvagePolicy::Disabled,
+                collection_mode,
+                None,
+                false,
+                policy,
+            )
+            .expect("typed CROWN-IBP collection")
+    }
+
     fn collect_with_deadline(
         graph: &GraphNetwork,
         input: &BoundedTensor,
@@ -4605,6 +5241,78 @@ mod sparse_relu_row_collector_tests {
                 .count()
                 <= 1,
             "the typed policy may publish at most its one selected target"
+        );
+    }
+
+    /// FAIL-OPEN: a dense-seed refusal on the atomic lane is a ROUTING
+    /// decision, not a broken authority boundary. The planner raises the same
+    /// refusal by returning `None`, after which the target takes the full-width
+    /// walk and publishes normally; the kernel's copy of the refusal must land
+    /// in the same place instead of becoming `atomic_subset_error` and turning
+    /// a walk that was about to succeed into a hard collection error.
+    #[test]
+    fn an_atomic_dense_budget_decline_falls_open_to_the_full_width_walk() {
+        // The env lock alone, WITHOUT a `ScopedEnvVar::unset`: the atomic lane
+        // builds its plan from `atomic_target` and never consults
+        // `NY_CROWN_IBP_SPARSE_RELU_ROWS`, so serialisation against the
+        // siblings that do scope it is all this needs — and adding another
+        // reader site would move the `source_frontier` reader manifest for a
+        // read this test does not make.
+        let _env_lock = ny_test_utils::env::lock_env();
+        let (graph, input) = mixed_stability_net();
+        let baseline = graph.collect_node_bounds(&input).expect("baseline");
+
+        // Control: the same lane with no injection takes the k-row route and
+        // keeps the stable rows at their baseline. (If this stopped holding,
+        // the injection below would be measuring nothing.)
+        let sparse = collect_atomic(
+            &graph,
+            &input,
+            baseline.clone(),
+            None,
+            PartialCrownDeadlineSalvagePolicy::Disabled,
+        );
+        let baseline_target = baseline.get("producer").expect("baseline target");
+        let sparse_target = sparse.bounds.get("producer").expect("sparse target");
+        assert_eq!(sparse_target.lower()[[2]], baseline_target.lower()[[2]]);
+
+        let (declined, _trace) = run_with_m1_collector_test_controls(
+            M1CollectorTestControls {
+                dense_decline_subset_node: Some("producer".to_string()),
+                ..M1CollectorTestControls::default()
+            },
+            || {
+                collect_atomic(
+                    &graph,
+                    &input,
+                    baseline.clone(),
+                    None,
+                    PartialCrownDeadlineSalvagePolicy::Disabled,
+                )
+            },
+        );
+        // The collection COMPLETED (a hard `atomic_subset_error` would have
+        // made `collect_atomic`'s `expect` panic) and still published its one
+        // CROWN claim.
+        let declined_target = declined.bounds.get("producer").expect("declined target");
+        assert!(matches!(
+            declined.provenance.get("producer"),
+            Some(BoundsProvenance::Crown)
+        ));
+        // Shrink-only against the certified baseline, on every row.
+        for row in 0..baseline_target.len() {
+            assert!(
+                declined_target.lower()[[row]] >= baseline_target.lower()[[row]]
+                    && declined_target.upper()[[row]] <= baseline_target.upper()[[row]],
+                "row {row} widened the certified baseline"
+            );
+        }
+        // And it is the FULL-WIDTH walk that ran: a row the k-row route leaves
+        // at its baseline is now tightened.
+        assert!(
+            declined_target.lower()[[2]] > baseline_target.lower()[[2]]
+                || declined_target.upper()[[2]] < baseline_target.upper()[[2]],
+            "the fail-open route must be the full-width walk, not the k-row subset"
         );
     }
 
@@ -4724,6 +5432,157 @@ mod sparse_relu_row_collector_tests {
         upper[[0, 0, 0]] = 1.0;
         let input = BoundedTensor::new(lower, upper).expect("input");
         (graph, input)
+    }
+
+    /// The TYPED key reaches the same selected rows the environment route
+    /// does, with the environment variable UNSET — and leaves every other row
+    /// at the certified baseline. This is the resolver-independent half of the
+    /// arrival proof: it exercises the collector, not the preset schema.
+    #[test]
+    fn typed_unstable_rows_match_selected_rows_and_keep_other_rows_at_baseline() {
+        // `lock_env()` and NOTHING else: every env-arming test in this module
+        // holds the same lock and restores `NY_CROWN_IBP_SPARSE_RELU_ROWS` on
+        // drop, so the ambient state under the lock is UNSET — which is what a
+        // scored run sees (`run_instance.sh` exports no NY_*). An explicit
+        // `ScopedEnvVar::unset` here would add a row to the reader frontier,
+        // and that ratchet may only ever be lowered.
+        let _env_lock = ny_test_utils::env::lock_env();
+        let (graph, input) = mixed_stability_net();
+        let ibp = graph.collect_node_bounds(&input).expect("IBP");
+
+        let full = collect_typed(
+            &graph,
+            &input,
+            ibp.clone(),
+            CrownIbpCollectionMode::CganComplete,
+            false,
+            900,
+        );
+        let sparse = collect_typed(
+            &graph,
+            &input,
+            ibp.clone(),
+            CrownIbpCollectionMode::CganComplete,
+            true,
+            900,
+        );
+
+        let producer_full = full.bounds.get("producer").expect("full producer");
+        let producer_sparse = sparse.bounds.get("producer").expect("sparse producer");
+        let producer_baseline = ibp.get("producer").expect("baseline producer");
+        for row in [0usize, 1] {
+            assert_eq!(producer_sparse.lower()[[row]], producer_full.lower()[[row]]);
+            assert_eq!(producer_sparse.upper()[[row]], producer_full.upper()[[row]]);
+        }
+        for row in [2usize, 3] {
+            assert_eq!(
+                producer_sparse.lower()[[row]],
+                producer_baseline.lower()[[row]]
+            );
+            assert_eq!(
+                producer_sparse.upper()[[row]],
+                producer_baseline.upper()[[row]]
+            );
+        }
+        assert!(matches!(
+            sparse.provenance.get("producer"),
+            Some(BoundsProvenance::Crown)
+        ));
+        // A sparse target that COMPLETES still keeps the map's completeness
+        // claim, so `[crown-root-map] all_demanded_targets_completed` does not
+        // flip merely because a target was walked over k rows.
+        assert!(sparse.all_requested_crown_targets_completed());
+        for (node, bound) in &sparse.bounds {
+            let baseline = ibp.get(node).expect("every node has a baseline");
+            for index in 0..bound.len() {
+                assert!(
+                    bound.lower()[[index]] >= baseline.lower()[[index]]
+                        && bound.upper()[[index]] <= baseline.upper()[[index]],
+                    "node '{node}' element {index} widened the certified baseline"
+                );
+            }
+        }
+    }
+
+    /// The typed key is MASKED by `requires_shrink_only_publication()`, so an
+    /// ordinary (Standard) collection is byte-identical with the key set. A
+    /// scored benchmark that is not on the typed cGAN cascade cannot move.
+    #[test]
+    fn typed_unstable_rows_leave_standard_mode_byte_identical() {
+        // `lock_env()` and NOTHING else: every env-arming test in this module
+        // holds the same lock and restores `NY_CROWN_IBP_SPARSE_RELU_ROWS` on
+        // drop, so the ambient state under the lock is UNSET — which is what a
+        // scored run sees (`run_instance.sh` exports no NY_*). An explicit
+        // `ScopedEnvVar::unset` here would add a row to the reader frontier,
+        // and that ratchet may only ever be lowered.
+        let _env_lock = ny_test_utils::env::lock_env();
+        let (graph, input) = mixed_stability_net();
+        let ibp = graph.collect_node_bounds(&input).expect("IBP");
+
+        let off = collect_typed(
+            &graph,
+            &input,
+            ibp.clone(),
+            CrownIbpCollectionMode::Standard,
+            false,
+            900,
+        );
+        let on = collect_typed(
+            &graph,
+            &input,
+            ibp,
+            CrownIbpCollectionMode::Standard,
+            true,
+            900,
+        );
+        for (node, bound) in &off.bounds {
+            let other = on.bounds.get(node).expect("same node set");
+            assert_eq!(bound.lower(), other.lower(), "node '{node}' lower");
+            assert_eq!(bound.upper(), other.upper(), "node '{node}' upper");
+        }
+        assert_eq!(off.provenance, on.provenance);
+    }
+
+    /// The typed `max_frac` ceiling declines a target whose unstable fraction
+    /// exceeds it, and the decline is fail-open: the target takes the existing
+    /// full-width walk and keeps CROWN provenance.
+    #[test]
+    fn typed_unstable_rows_max_frac_declines_to_the_full_width_walk() {
+        // `lock_env()` and NOTHING else: every env-arming test in this module
+        // holds the same lock and restores `NY_CROWN_IBP_SPARSE_RELU_ROWS` on
+        // drop, so the ambient state under the lock is UNSET — which is what a
+        // scored run sees (`run_instance.sh` exports no NY_*). An explicit
+        // `ScopedEnvVar::unset` here would add a row to the reader frontier,
+        // and that ratchet may only ever be lowered.
+        let _env_lock = ny_test_utils::env::lock_env();
+        let (graph, input) = mixed_stability_net();
+        let ibp = graph.collect_node_bounds(&input).expect("IBP");
+
+        let full = collect_typed(
+            &graph,
+            &input,
+            ibp.clone(),
+            CrownIbpCollectionMode::CganComplete,
+            false,
+            900,
+        );
+        // producer is 2/4 = 500 per mille unstable; a 400 ceiling refuses it.
+        let declined = collect_typed(
+            &graph,
+            &input,
+            ibp,
+            CrownIbpCollectionMode::CganComplete,
+            true,
+            400,
+        );
+        let producer_full = full.bounds.get("producer").expect("full producer");
+        let producer_declined = declined.bounds.get("producer").expect("declined producer");
+        assert_eq!(producer_declined.lower(), producer_full.lower());
+        assert_eq!(producer_declined.upper(), producer_full.upper());
+        assert!(matches!(
+            declined.provenance.get("producer"),
+            Some(BoundsProvenance::Crown)
+        ));
     }
 
     fn direct_strided_conv_transpose_383() -> (GraphNetwork, BoundedTensor) {
@@ -5297,11 +6156,83 @@ mod margin_subset_collector_tests {
         assert_eq!(pre_subset.lower(), pre_full.lower());
         assert_eq!(pre_subset.upper(), pre_full.upper());
     }
+
+    /// DARK GUARANTEE for `#cgan-unstable-rows`: the k-row kernel it introduced
+    /// serves the margin-subset route too, and that route has NEVER been
+    /// dense-budget refused — `resolve_subset_indices` guards the refusal with
+    /// `subset_is_sparse`. So starving the route's subset budget to one byte
+    /// must change NOTHING here: same rows seeded, same bounds, bit for bit.
+    /// A kernel-side precheck that ignores the planner's scoping fails this by
+    /// declining the subset and silently promoting every unreferenced row from
+    /// IBP to CROWN.
+    #[test]
+    fn a_starved_subset_budget_does_not_reroute_the_margin_subset() {
+        let (graph, input) = wide_output_net();
+        let ibp = graph.collect_node_bounds(&input).expect("IBP bounds");
+        let _guard = MarginOutputSeedGuard::publish(vec![200, 5]);
+
+        let default_budget = graph
+            .collect_crown_ibp_bounds_core_inner_with_cut_segment(
+                &input,
+                ibp.clone(),
+                None,
+                None,
+                None,
+                0,
+            )
+            .expect("margin-subset collection");
+        let (starved, _trace) = super::run_with_m1_collector_test_controls(
+            super::M1CollectorTestControls {
+                route_subset_budget_bytes: Some(1),
+                ..super::M1CollectorTestControls::default()
+            },
+            || {
+                graph
+                    .collect_crown_ibp_bounds_core_inner_with_cut_segment(
+                        &input,
+                        ibp.clone(),
+                        None,
+                        None,
+                        None,
+                        0,
+                    )
+                    .expect("starved-budget margin-subset collection")
+            },
+        );
+
+        let out_default = default_budget.bounds.get("out").expect("default out");
+        let out_starved = starved.bounds.get("out").expect("starved out");
+        let out_ibp = ibp.get("out").expect("ibp out");
+        assert_eq!(out_starved.lower(), out_default.lower());
+        assert_eq!(out_starved.upper(), out_default.upper());
+        // Non-vacuity: the margin route really did engage in BOTH runs, which
+        // is what the equality above is worth something for.
+        for i in 0..600 {
+            if i == 5 || i == 200 {
+                continue;
+            }
+            assert_eq!(
+                out_starved.lower()[[i]],
+                out_ibp.lower()[[i]],
+                "unreferenced row {i} must keep IBP: the subset was rerouted"
+            );
+        }
+        assert!(
+            [5_usize, 200].iter().any(|&i| {
+                out_starved.lower()[[i]] > out_ibp.lower()[[i]]
+                    || out_starved.upper()[[i]] < out_ibp.upper()[[i]]
+            }),
+            "the seeded rows must be CROWN-tightened in the starved run too"
+        );
+    }
 }
 
 #[cfg(test)]
 mod margin_subset_scatter_tests {
-    use super::scatter_margin_rows_over_bounds;
+    // The collector's own scatter now runs inside `row_refine`, so this file no
+    // longer imports the helper at module scope; these regressions still pin
+    // the scatter contract the kernel depends on.
+    use crate::output_margin_seed::scatter_margin_rows_over_bounds;
     use ndarray::{ArrayD, IxDyn};
     use ny_tensor::BoundedTensor;
 
@@ -5652,6 +6583,26 @@ mod walk_admission_collector_tests {
         (result, trace, ibp_for_result)
     }
 
+    #[test]
+    fn collector_cost_gate_reads_rate_without_requesting_calibration() {
+        let _env = ny_test_utils::env::lock_env();
+        let _sparse =
+            ny_test_utils::env::ScopedEnvVar::unset(super::super::demand::SPARSE_RELU_ROWS_ENV);
+        let _rate = ny_test_utils::env::ScopedEnvVar::unset("NY_FORWARD_LINEAR_MACS_PER_SEC");
+        budget_policy::reset_node_walk_records();
+        let counter = crate::network::core::graph::ForwardLinearRateAccessCounter::start();
+        let (result, _, _) = collect_with_controls(M1CollectorTestControls::default());
+        // The real graph-native deadline-scored gate is reached, regardless
+        // of whether another test has initialized the global calibration.
+        assert_eq!(counter.counts(), (1, 0));
+        for node in ["pre", "producer", "out"] {
+            assert_eq!(
+                result.provenance.get(node).copied(),
+                Some(BoundsProvenance::Crown)
+            );
+        }
+    }
+
     /// The unaffordable node is refused UPFRONT (typed WalkCostRefused, IBP
     /// bound kept, degradation event emitted), while the share it did not
     /// burn reaches the later demanded target, which still tightens to a
@@ -5660,12 +6611,24 @@ mod walk_admission_collector_tests {
     #[test]
     fn walk_admission_refuses_unaffordable_node_and_rolls_share_cprime_admission() {
         // Baseline: no forcing; every walk is cheap and admitted.
+        budget_policy::reset_node_walk_records();
         let (baseline, _, _) = collect_with_controls(M1CollectorTestControls::default());
         assert_eq!(
             baseline.provenance.get("producer").copied(),
             Some(BoundsProvenance::Crown),
             "baseline sanity: the cheap walk is admitted and completes"
         );
+
+        // The baseline's completed 'producer' walk is recorded on this thread
+        // (#walk-value-record) whenever its wall reaches the 50 ms
+        // calibration floor, which a microsecond walk does only when the host
+        // is loaded. The forced collection below would then consult that
+        // record and convert its refusal into a measured grant -- the face
+        // `verify_measured_record_converts_refusal_into_grant_walk_value_record`
+        // pins -- and 'producer' would keep CROWN (observed 2026-10-04 at
+        // load ~60: `left: Some(Crown)`). This test pins the record-free
+        // refusal, so the forced collection starts with no records.
+        budget_policy::reset_node_walk_records();
 
         // Forced: 'producer' estimates far past any share (the Conv_17
         // exhibit shape: estimate >> share).
@@ -5943,6 +6906,7 @@ mod target_cost_weight_tests {
         cap_secs: None,
         prefix_cost_weighted: false,
         max_target_share_frac: None,
+        floor_dim_scaled: false,
     };
 
     /// The two axes that could reprice these targets behind the test's back,
@@ -6189,11 +7153,8 @@ mod target_cost_weight_tests {
             for j in 0..17_u32 {
                 let x = -1.0 + f32::from(i as u16) / 8.0;
                 let y = -1.0 + f32::from(j as u16) / 8.0;
-                let point = BoundedTensor::new(
-                    arr1(&[x, y]).into_dyn(),
-                    arr1(&[x, y]).into_dyn(),
-                )
-                .expect("degenerate point box");
+                let point = BoundedTensor::new(arr1(&[x, y]).into_dyn(), arr1(&[x, y]).into_dyn())
+                    .expect("degenerate point box");
                 let values = graph.collect_node_bounds(&point).expect("point forward");
                 samples.push(
                     values

@@ -237,7 +237,7 @@ const ATTACK_TOLERANCE_IMPLEMENTED: bool = false;
 const LOSS_REDUCTION_FUNC_IMPLEMENTED: bool = false;
 
 /// `solver.mip.parallel_solvers` is reserved for the phase-split racing mode
-/// (`designs/scip.md` Phase C) and parsed for key compatibility only.
+/// and parsed for key compatibility only.
 const MIP_PARALLEL_SOLVERS_IMPLEMENTED: bool = false;
 
 /// `attack.surrogate_sign_gradient` and GAMA `attack.attack_mode` are read ONLY
@@ -493,6 +493,56 @@ pub(crate) fn validate_preset(preset: &PresetConfig, contract: &EngineContract) 
             });
         }
     }
+    // #genbab-candidates: `branching.candidates` and the GenBaB selector's
+    // candidate budget are two different fields with the same English name, and
+    // the yaml gives no hint which one it reached. `preset::apply` sends
+    // `branching.candidates` to `config.fsb_candidates`, whose only readers are
+    // `engine/branching/sequential.rs`, `gpu_bab/kfsb.rs` and
+    // `batched/kfsb_multi.rs`. A GenBaB preset runs none of them, so the value
+    // is dropped — and the selector meanwhile truncates to
+    // `NonlinearBranchingConfig::num_candidates`, default 1.
+    //
+    // Reported rather than silently repaired: the two keys mean different
+    // things, and guessing that a `candidates:` beside `method: nonlinear` was
+    // meant for the GenBaB budget would be exactly the kind of helpful
+    // reinterpretation that makes a preset mean something other than it says.
+    // `configs/vnncomp25/ml4acopf_2024.yaml` is the case in point: it asked for
+    // 100 here and ran at 1; it now ALSO sets `nonlinear_split.num_candidates:
+    // 100` (#genbab-selector-convention), so this line still fires for the
+    // `branching.candidates` key it keeps for abc key compatibility.
+    if preset.bab.branching.nonlinear_split.requests_genbab()
+        || matches!(
+            preset
+                .bab
+                .branching
+                .method
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("nonlinear" | "genbab")
+        )
+    {
+        if let Some(candidates) = preset.bab.branching.candidates {
+            out.push(Unhonoured {
+                field: "bab.branching.candidates",
+                requested: candidates.to_string(),
+                severity: ContractSeverity::PerformanceOnly,
+                scope: UnhonouredScope::Always,
+                engine_behaviour: "delivered to `fsb_candidates`, which on a GenBaB preset \
+                                   NOTHING reads — its readers are the sequential selector \
+                                   and the two kFSB lanes. The GenBaB selector truncates to \
+                                   `nonlinear_split.num_candidates` instead, default 1. Set \
+                                   THAT key to change the budget. Search order and cost only \
+                                   — a branch decision cannot make a child's bound unsound.",
+                citation: "preset::apply — branching.candidates -> fsb_candidates; \
+                           nonlinear_branching::selector truncate(num_candidates)",
+                accepted: Some(
+                    "branching heuristic only; cannot affect enclosure validity. Reported so \
+                     a preset that asks for N candidates is not read as having got them.",
+                ),
+            });
+        }
+    }
     let nonlinear = &preset.bab.branching.nonlinear_split;
     if let Some(filter) = nonlinear.filter.filter(|v| *v) {
         if !contract.nonlinear_split_filters {
@@ -501,9 +551,14 @@ pub(crate) fn validate_preset(preset: &PresetConfig, contract: &EngineContract) 
                 requested: filter.to_string(),
                 severity: ContractSeverity::PerformanceOnly,
                 scope: UnhonouredScope::Always,
-                engine_behaviour: "ignored; GenBaB branching evaluates its unfiltered \
-                                   candidate set. Search order and cost only — a branch \
-                                   decision cannot make a child's bound unsound.",
+                engine_behaviour: "ignored; nothing outside its own unit tests reads \
+                                   `NonlinearBranchingConfig::filter`. NOTE the candidate \
+                                   set is NOT 'unfiltered' in the sense this line used to \
+                                   claim: `selector.rs` sorts by score and then \
+                                   `truncate(num_candidates)`, whose default is 1. Raise it \
+                                   with `nonlinear_split.num_candidates`. Search order and \
+                                   cost only — a branch decision cannot make a child's \
+                                   bound unsound.",
                 citation: "preset::apply — no assignment into NonlinearBranchingConfig",
                 accepted: Some("branching heuristic only; cannot affect enclosure validity"),
             });
@@ -516,8 +571,10 @@ pub(crate) fn validate_preset(preset: &PresetConfig, contract: &EngineContract) 
                 requested: filter_beta.to_string(),
                 severity: ContractSeverity::PerformanceOnly,
                 scope: UnhonouredScope::Always,
-                engine_behaviour: "ignored; GenBaB branching evaluates its unfiltered \
-                                   candidate set. Search order and cost only.",
+                engine_behaviour: "ignored; nothing outside its own unit tests reads \
+                                   `NonlinearBranchingConfig::filter_beta`. The candidate \
+                                   set is truncated to `num_candidates` (default 1), not \
+                                   left unfiltered. Search order and cost only.",
                 citation: "preset::apply — no assignment into NonlinearBranchingConfig",
                 accepted: Some("branching heuristic only; cannot affect enclosure validity"),
             });
@@ -649,13 +706,19 @@ mod tests {
     #[test]
     fn empty_preset_reports_nothing() {
         let preset = PresetConfig::default();
-        assert!(validate_preset(&preset, &EngineContract::current()).is_empty());
+        assert_eq!(
+            (validate_preset(&preset, &EngineContract::current())).len(),
+            0
+        );
     }
 
     #[test]
     fn current_build_exposes_the_wgpu_proof_qualification_path() {
         let preset = preset_with_device("wgpu");
-        assert!(validate_preset(&preset, &EngineContract::current()).is_empty());
+        assert_eq!(
+            (validate_preset(&preset, &EngineContract::current())).len(),
+            0
+        );
     }
 
     #[test]
@@ -678,7 +741,10 @@ mod tests {
     #[test]
     fn cpu_device_is_always_honoured() {
         let preset = preset_with_device("cpu");
-        assert!(validate_preset(&preset, &EngineContract::current()).is_empty());
+        assert_eq!(
+            (validate_preset(&preset, &EngineContract::current())).len(),
+            0
+        );
     }
 
     /// Each predicate must be gated on the CAPABILITY, not written as an
@@ -803,7 +869,10 @@ mod tests {
     fn interm_domain_false_is_not_a_mismatch() {
         let mut preset = PresetConfig::default();
         preset.bab.clip.interm_domain = Some(false);
-        assert!(validate_preset(&preset, &EngineContract::current()).is_empty());
+        assert_eq!(
+            (validate_preset(&preset, &EngineContract::current())).len(),
+            0
+        );
     }
 
     /// The escape hatch must never be able to turn a mismatch into an abort,

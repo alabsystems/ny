@@ -30,4 +30,3 @@ tllverifybench_2023,onnx/tllBench_n=2_N=M=64_m=1_instance_7_0.onnx,vnnlib/proper
 tllverifybench_2023,onnx/tllBench_n=2_N=M=64_m=1_instance_7_1.onnx,vnnlib/property_N=64_1.vnnlib,prepared,sat,579.69
 tllverifybench_2023,onnx/tllBench_n=2_N=M=64_m=1_instance_7_2.onnx,vnnlib/property_N=64_2.vnnlib,prepared,sat,574.22
 tllverifybench_2023,onnx/tllBench_n=2_N=M=64_m=1_instance_7_3.onnx,vnnlib/property_N=64_3.vnnlib,prepared,sat,568.82
-tllverifybench_2023,onnx/test_nano.onnx,vnnlib/test_nano.vnnlib,0,unsat,1

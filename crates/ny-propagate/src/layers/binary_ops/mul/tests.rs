@@ -542,7 +542,7 @@ fn test_crown_mccormick_soundness_zero_crossing_intervals() -> Result<()> {
     Ok(())
 }
 
-/// Regression for #4247: reshape/broadcast paths can preserve non-standard
+/// Regression: reshape/broadcast paths can preserve non-standard
 /// strides, so MulBinary CROWN must flatten via iteration rather than rejecting
 /// the bounds with InternalError.
 #[ntest::timeout(10000)]
@@ -863,7 +863,7 @@ fn test_crown_rejects_mismatched_input_sizes() {
     assert!(matches!(err, NyError::ShapeMismatch { .. }));
 }
 
-/// Regression for #3499: alpha-parameterized MulBinary CROWN must support
+/// Regression: alpha-parameterized MulBinary CROWN must support
 /// broadcasted inputs like the ECAPA-TDNN SE blocks `[C,T] * [C,1]`.
 #[ntest::timeout(10000)]
 #[test]
@@ -893,7 +893,7 @@ fn test_crown_alpha_broadcast_soundness_se_block_pattern_3499() -> Result<()> {
     Ok(())
 }
 
-/// Regression for #3499: broadcasted RHS coefficients must be reduced by
+/// Regression: broadcasted RHS coefficients must be reduced by
 /// summation, matching alpha-beta-CROWN `reduce_broadcast_dims`.
 #[ntest::timeout(10000)]
 #[test]
@@ -918,7 +918,7 @@ fn test_crown_alpha_broadcast_rhs_columns_accumulate_3499() -> Result<()> {
     Ok(())
 }
 
-/// Regression for #4247: alpha-CROWN shares the same flattening surface as the
+/// Regression: alpha-CROWN shares the same flattening surface as the
 /// fixed McCormick path and must accept non-standard-layout bounds.
 #[ntest::timeout(10000)]
 #[test]
@@ -1180,7 +1180,7 @@ fn test_middle_coefficients_hand_computed() {
     assert_close(ny_u, -5.0, TOL);
 }
 
-// ---- McCormick NaN guard (#2741) ----
+// ---- McCormick NaN guard ----
 
 /// `select_mccormick_plane` must return conservative trivial bounds when any
 /// input is NaN, rather than propagating NaN coefficients through the CROWN
@@ -1295,7 +1295,7 @@ fn test_crown_rejects_infinite_input_bounds() {
     assert!(matches!(err, NyError::UnsupportedOp(_)));
 }
 
-// ---- Bias placement regression (#2520) ----
+// ---- Bias placement regression ----
 
 /// MulBinary returns two affine forms (for x and y) but only one shared
 /// McCormick constant. The bias must appear exactly once to avoid DAG-CROWN
@@ -1359,7 +1359,7 @@ fn test_batched_crown_mccormick_bias_only_on_primary_output_2520() -> Result<()>
     Ok(())
 }
 
-// ---- f64 bias accumulation and directed rounding (#2471) ----
+// ---- f64 bias accumulation and directed rounding ----
 
 /// Verify that CROWN bias uses directed rounding: lower_b <= upper_b for all outputs.
 /// With f32 accumulation and no directed rounding, cancellation-prone inputs
@@ -1471,7 +1471,7 @@ fn test_crown_f64_bias_directed_rounding_middle_2471() -> Result<()> {
     Ok(())
 }
 
-// ---- Batched CROWN with batched input bounds (#2521) ----
+// ---- Batched CROWN with batched input bounds ----
 
 /// Build a [2, 2, 2] batched identity coefficient matrix (batch=2, out_dim=2, n=2).
 fn make_batched_identity_2x2x2() -> BatchedLinearBounds {
@@ -1496,7 +1496,7 @@ fn make_batched_identity_2x2x2() -> BatchedLinearBounds {
 }
 
 /// Batched input bounds (input_len == batch_size * n) must index each batch
-/// into its own slice rather than broadcasting. Before the fix (#2521), a dead
+/// into its own slice rather than broadcasting. Before the fix, a dead
 /// conditional and silent `.min(input_len - 1)` clamp masked the wrong index.
 #[ntest::timeout(10000)]
 #[test]
@@ -1625,7 +1625,7 @@ fn test_batched_crown_middle_with_batched_input_bounds_2532() -> Result<()> {
     Ok(())
 }
 
-/// Regression for #4247: batched MulBinary CROWN must tolerate non-standard
+/// Regression: batched MulBinary CROWN must tolerate non-standard
 /// layouts in both the input bounds and the incoming batched coefficient/bias
 /// tensors, matching the contiguous semantics exactly.
 #[ntest::timeout(10000)]
@@ -1756,7 +1756,6 @@ proptest! {
     /// at all sampled points. Tests both McCormick and Middle relaxation modes.
     ///
     /// This covers the full CROWN backward path (not just plane selection).
-    /// Part of #3439 acceptance criteria.
     #[ntest::timeout(60000)]
     #[test]
     fn proptest_crown_backward_soundness(

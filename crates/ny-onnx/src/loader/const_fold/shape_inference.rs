@@ -45,6 +45,16 @@ impl ConstFoldLookups {
             return None;
         }
         if let Some(shape) = self.graph_shapes.get(tensor_name) {
+            // A recorded EMPTY shape is a proven rank 0, so `Shape` of it may
+            // fold to the empty vector. That holds by construction of every
+            // source of `graph_shapes`: a declared `[]` is never inserted (see
+            // `build_graph_shape_lookup`), and the inferred table records `[]`
+            // only when ORT proves rank 0 (`shape_infer::resolve_zero_dim_ranks`
+            // — ORT reports an untyped tensor with zero dims too, and that one
+            // is left out) or the static fallback derives it exactly. A tensor
+            // whose rank nobody proved is absent and falls through to the
+            // structural recursion below, which declines unmodelled producers.
+            //
             // A fully-static recorded shape is authoritative. A shape with
             // symbolic (-1 / 0) dims is only a FALLBACK in unbatched models:
             // recursive computation through Reshape/broadcast may recover the
@@ -287,6 +297,12 @@ impl ConstFoldLookups {
         let mut output_shape = self.infer_tensor_shape(&node.input[0], graph, weights, depth)?;
         let starts_name = node.input.get(1)?;
         let ends_name = node.input.get(2)?;
+        // Runtime slice bounds decline here, and MUST keep declining even when
+        // `ends` is structurally `start + k` for a constant k: ONNX Slice
+        // CLAMPS, so the extent is `min(start + k, dim) - start`, which is a
+        // function of the runtime start. cctsdb patch-1 is the worked
+        // counterexample — see
+        // `recursive_slice_shape_declines_structural_end_equals_start_plus_k`.
         let starts_vec = read_tensor_i64s(weights, starts_name)?;
         let ends_vec = read_tensor_i64s(weights, ends_name)?;
         let axes_vec = match node.input.get(3) {
@@ -399,6 +415,16 @@ fn extract_shape_from_type(type_proto: &Option<onnx_proto::TypeProto>) -> Vec<i6
         .unwrap_or_default()
 }
 
+/// Declared I/O / value_info shapes overlaid with the inferred table.
+///
+/// An empty declared shape is skipped: `extract_shape_from_type` cannot tell
+/// a declared rank 0 from an absent shape, so neither may fold. An empty
+/// INFERRED shape is kept, because the inferred table's `[]` is a proven rank
+/// 0 — ORT's zero-dim reports are settled by `shape_infer`'s rank probe
+/// (`resolve_zero_dim_ranks`), which leaves a tensor ORT could not type
+/// absent, and the static fallback emits only exact facts. That provenance
+/// guarantee, not a check here, is what keeps `Shape` of an untyped tensor
+/// from folding to a fabricated empty-shape constant.
 fn build_graph_shape_lookup(
     graph: &onnx_proto::GraphProto,
     inferred_shapes: &HashMap<String, Vec<i64>>,
@@ -564,6 +590,50 @@ mod tests {
         }
     }
 
+    fn node(op_type: &str, name: &str, inputs: &[&str], output: &str) -> onnx_proto::NodeProto {
+        onnx_proto::NodeProto {
+            input: inputs.iter().map(|input| input.to_string()).collect(),
+            output: vec![output.to_string()],
+            name: name.to_string(),
+            op_type: op_type.to_string(),
+            domain: String::new(),
+            attribute: Vec::new(),
+        }
+    }
+
+    /// The cctsdb `Slice_59` shape: a RUNTIME start (`coord`, the patch
+    /// coordinate) with `ends = Unsqueeze(Add(coord, 1))` — the same tensor
+    /// plus a literal constant.
+    fn runtime_start_slice_graph() -> (onnx_proto::GraphProto, WeightStore) {
+        let graph = onnx_proto::GraphProto {
+            input: vec![value_info("input", &[3]), value_info("coord", &[1])],
+            node: vec![
+                node("Unsqueeze", "Unsqueeze_56", &["coord"], "starts"),
+                node("Add", "Add_28", &["coord", "one"], "end_value"),
+                node("Unsqueeze", "Unsqueeze_57", &["end_value"], "ends"),
+                node(
+                    "Slice",
+                    "Slice_59",
+                    &["input", "starts", "ends", "axes", "steps"],
+                    "slice",
+                ),
+            ],
+            ..Default::default()
+        };
+        let mut weights = WeightStore::new();
+        weights.insert_integers(
+            "one".to_string(),
+            ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[]), vec![1i64]).unwrap(),
+        );
+        for (name, value) in [("axes", 0i64), ("steps", 1)] {
+            weights.insert_integers(
+                name.to_string(),
+                ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[1]), vec![value]).unwrap(),
+            );
+        }
+        (graph, weights)
+    }
+
     fn add_node(name: &str, output: &str, domain: &str) -> onnx_proto::NodeProto {
         onnx_proto::NodeProto {
             input: vec!["lhs".to_string(), "rhs".to_string()],
@@ -672,5 +742,87 @@ mod tests {
             None,
             "explicit-pad arithmetic must not infer SAME_* output shapes"
         );
+    }
+
+    /// `end = start + k` DOES NOT make the extent `k` — measured, not argued.
+    ///
+    /// A constant-extent rule for this pattern was proposed to unblock cctsdb
+    /// `Expand_102` ("only the OFFSET is data-dependent, the width is the
+    /// literal 1"). It is FALSE, because ONNX Slice clamps: the extent is
+    /// `min(start + k, dim) - start`, a function of the runtime start.
+    /// patch-1's own `Slice_59` is the counterexample, and its start is the
+    /// patch x-coordinate, which `spec_onnx_patch-1_idx_01045_0.vnnlib` bounds
+    /// to `[0, 62]` while the sliced axis is only 3 long (`Range_55` runs to
+    /// `Shape(ConstantOfShape)[1] == 3`). Measured with onnxruntime on
+    /// patch-1.onnx, x=0..62, y=20:
+    ///
+    /// ```text
+    ///   x <= 2 : Slice_59 -> (1,)  Expand_102 shape '322' = [1, 1, 1, 64]
+    ///   x >= 3 : Slice_59 -> (0,)  Expand_102 shape '322' = [1, 0, 1, 64]
+    /// ```
+    ///
+    /// and the ScatterND index grid it feeds is `(1,1,1,64,4)` vs an EMPTY
+    /// `(1,0,1,64,4)`, changing 64 mask entries versus 0. Folding the extent to
+    /// 1 would therefore build a graph that applies the patch for every x, when
+    /// the model applies none for 60 of the 63 admissible x — a silent semantic
+    /// swap, not a shape error, i.e. a route to a false `unsat`. The same
+    /// pattern with k=3 is what
+    /// `cctsdb_patch3_zero_patch_constant_of_shape_stays_refused` pins.
+    /// Declining is the sound answer; a static extent needs a proven start
+    /// bound (`0 <= start <= dim - k`), which the load path does not have.
+    #[test]
+    fn recursive_slice_shape_declines_structural_end_equals_start_plus_k() {
+        let (graph, weights) = runtime_start_slice_graph();
+        let lookups = ConstFoldLookups::new(&graph, &HashMap::new(), false);
+        assert_eq!(
+            lookups.infer_tensor_shape("slice", &graph, &weights, 8),
+            None,
+            "a runtime start makes the CLAMPED extent runtime data; \
+             `end = start + k` does not make it k"
+        );
+    }
+
+    #[test]
+    fn recursive_slice_shape_pins_constant_bounds_behaviour() {
+        let explicit = onnx_proto::GraphProto {
+            input: vec![value_info("input", &[8, 4])],
+            node: vec![node(
+                "Slice",
+                "explicit_slice",
+                &["input", "starts", "ends", "axes", "steps"],
+                "slice",
+            )],
+            ..Default::default()
+        };
+        let defaulted = onnx_proto::GraphProto {
+            input: vec![value_info("input", &[8, 4])],
+            node: vec![node(
+                "Slice",
+                "defaulted_slice",
+                &["input", "starts", "ends"],
+                "slice",
+            )],
+            ..Default::default()
+        };
+        let mut weights = WeightStore::new();
+        for (name, values) in [
+            ("starts", vec![2i64, -3]),
+            ("ends", vec![5i64, 99]),
+            ("axes", vec![0i64, 1]),
+            ("steps", vec![1i64, 1]),
+        ] {
+            weights.insert_integers(
+                name.to_string(),
+                ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[values.len()]), values).unwrap(),
+            );
+        }
+        for graph in [&explicit, &defaulted] {
+            let lookups = ConstFoldLookups::new(graph, &HashMap::new(), false);
+            assert_eq!(
+                lookups.infer_tensor_shape("slice", graph, &weights, 8),
+                Some(vec![3, 3]),
+                "constant starts/ends keep their exact clamped arithmetic"
+            );
+        }
     }
 }

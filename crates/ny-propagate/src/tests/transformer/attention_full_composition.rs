@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Attention full-composition routing regressions for #318.
+//! Attention full-composition routing regressions.
 
 use super::prelude::*;
 
@@ -98,7 +98,7 @@ fn test_graph_network_attention_crown_full_composition_entrypoint_318() {
     // therefore that the branch is exercised (asserted above), the result stays
     // finite and sound, and — critically — full composition is never *looser* than
     // the default. A strict "must differ" assertion is fragile and was firing here
-    // even though both lanes are correct and the experimental branch ran. (#318)
+    // even though both lanes are correct and the experimental branch ran.
     let default_width = default_bounds.max_width();
     let experimental_width = experimental_bounds.max_width();
     assert!(

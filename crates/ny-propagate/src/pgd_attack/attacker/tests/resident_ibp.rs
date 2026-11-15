@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Resident-forward regression test for #4081.
+//! Resident-forward regression test.
 
 use ndarray::{arr1, arr2};
 use ndarray::{ArrayD, IxDyn};
@@ -54,11 +54,12 @@ fn test_evaluate_batch_dense_chain_uses_single_resident_call_4081() {
         .evaluate_batch(&network, &inputs)
         .expect("dense PGD batch should use the resident fast path");
 
-    assert_eq!(engine.resident_calls(), 1);
-    assert_eq!(engine.gemm_calls(), 0);
+    // The named point route declines an uncached whole-network interval plan;
+    // its two Linear point kernels evaluate the actual source y=ReLU(x0).
+    assert_eq!(engine.resident_calls(), 0);
+    assert_eq!(engine.gemm_calls(), 2);
     assert_eq!(output.shape(), &[4, 1]);
-    assert_eq!(output[[0, 0]], 0.25);
-    assert_eq!(output[[3, 0]], 1.0);
+    assert_eq!(output, arr2(&[[0.0_f32], [0.0], [0.0], [0.5]]).into_dyn());
 }
 
 #[ntest::timeout(10000)]
@@ -143,10 +144,40 @@ fn test_evaluate_batch_flatten_linear_preserves_restart_axis_4345() {
         .expect("Flatten(0) -> Linear PGD batch should preserve the restart axis");
 
     assert_eq!(output.shape(), &[3, 1]);
-    assert_eq!(
-        output,
-        ArrayD::from_shape_vec(IxDyn(&[3, 1]), vec![1.0_f32, 5.0, 9.0]).unwrap()
-    );
+
+    // EXACT EQUALITY RETIRED (#linear-ibp-higham + #degenerate-ibp-gemm). This is a
+    // point forward: `evaluate_batch` -> `propagate_concrete_point_preserve_leading_axis`
+    // -> `LinearLayer::propagate_ibp_with_engine`, whose `lower == upper` arm is
+    // `certify_point_gemm`. A point input does NOT make an f32 GEMM exact, so that
+    // arm now publishes a NON-degenerate box and `BoundedTensor::center` returns its
+    // midpoint. 1.0, 5.0 and 9.0 are still the true forward values; they are no
+    // longer the bit-exact published ones, and the stale half of the assertion is
+    // the `assert_eq!`, not the literals.
+    //
+    // The shift is a BINADE effect, not a widening: the box is symmetric in ULP
+    // COUNTS, `[next_down(y - err) - k ulp, next_up(y + err) + k ulp]` with
+    // k = in_features + 2 = 6, but at y = 1.0 the grid step below is half the step
+    // above, so the midpoint lands above y. Ceiling: the k + 1 = 7 downward steps
+    // are worth at most 7*ulp(1.0)/2, so the midpoint moves by at most
+    // 7*ulp(1.0)/4 = 2.086e-7, plus <=0.5 ulp for rounding the midpoint itself
+    // = 2.682e-7. Rows 1 and 2 (y = 5.0, 9.0) are interior to their binades, the
+    // construction is symmetric there, and they stay bit-exact — which is exactly
+    // what the log showed: [[1.0000002], [5.0], [9.0]].
+    //
+    // 1e-6 is 3.7x that ceiling and 4.2x the observed 2.3841858e-7 (= 2*ulp(1.0)).
+    // It does not weaken what this test pins: the property is that Flatten(0) under a
+    // prepended restart axis routes input row i to output row i, and the expected
+    // values are 4.0 apart, so this tolerance is 4e6x below the separation that
+    // would let two restarts be confused.
+    let expected = [1.0_f32, 5.0, 9.0];
+    assert_eq!(output.len(), expected.len());
+    for (i, (&actual, &want)) in output.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (actual - want).abs() <= 1e-6,
+            "Flatten(0) -> Linear restart axis: output[{i}] = {actual}, want {want} \
+             (tol 1e-6; see the binade derivation above)"
+        );
+    }
 }
 
 #[ntest::timeout(10000)]

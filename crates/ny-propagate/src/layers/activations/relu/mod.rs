@@ -2,7 +2,8 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, ArrayD};
+use ny_core::dd::next_up_f64;
 use ny_core::{nan_propagating_max, NyError, Result};
 use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
 use std::borrow::Cow;
@@ -13,6 +14,7 @@ use crate::layers::common::{
     crown_elementwise_backward, crown_elementwise_backward_batched, nan_only_domain_guard,
     non_finite_domain_guard, BoundPropagation,
 };
+use crate::layers::linear::bias::{add_f64_down, add_f64_up, f32_to_f64_exact};
 use crate::{contiguous_flat_slice, BatchedLinearBounds, LinearBounds};
 
 mod ibp;
@@ -100,7 +102,7 @@ mod alpha_err_audit {
 /// Compute ReLU linear relaxation for a single neuron given pre-activation bounds [l, u].
 ///
 /// Returns (lower_slope, lower_intercept, upper_slope, upper_intercept) as a LinearRelaxation.
-/// Made pub(crate) for GPU CROWN layer descriptor extraction (#3397).
+/// Made pub(crate) for GPU CROWN layer descriptor extraction.
 #[inline]
 pub(crate) fn relu_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
     if l.is_nan() || u.is_nan() {
@@ -155,6 +157,73 @@ impl SpecRowAlphas<'_> {
             .copied()
             .flatten()
             .and_then(|slot| self.slot_alphas.get(slot))
+    }
+}
+
+/// Flat, read-only view of ONE pre-activation endpoint, in row-major logical
+/// order, borrowing whenever the endpoint is already standard layout.
+///
+/// Replaces the `pre_activation.flatten()` → `.lower()/.upper().clone()` →
+/// `into_dimensionality::<Ix1>()` chain that both dense CROWN backward entries
+/// ran on entry. That chain allocated and filled FOUR full-length buffers per
+/// call — the two `iter().copied().collect()`s inside `BoundedTensor::flatten`,
+/// then a `clone()` of each flattened endpoint — and built two `TrackedArrayD`
+/// endpoints it discarded, to produce arrays that are only ever READ (indexed
+/// in the relaxation and backward loops, then handed to
+/// `fold_coeff_err_into_bias` as slices). ReLU is the most-executed layer in
+/// the verifier, so that ran per node, per backward pass, per domain.
+///
+/// BIT-IDENTICAL, not merely close. [`contiguous_flat_slice`] returns
+/// `as_slice()` when the endpoint is standard layout, and ndarray's
+/// `as_slice()` is `Some` ONLY for a standard-layout array — whose memory
+/// order IS the row-major logical order `iter()` walks; otherwise it falls
+/// back to the SAME `iter().copied().collect()` that `flatten()` performed.
+/// Either arm therefore presents element `i` as the identical `f32` at the
+/// identical index, so every downstream read, product and accumulation keeps
+/// its original operand and its original order. Only the data movement is
+/// removed; no arithmetic is reordered, fused, or re-associated.
+#[cfg(not(test))]
+#[inline]
+fn pre_activation_flat(endpoint: &ArrayD<f32>) -> Cow<'_, [f32]> {
+    contiguous_flat_slice(endpoint)
+}
+
+/// Test build of [`pre_activation_flat`]: identical result, plus the
+/// engagement counter the zero-copy tests assert on.
+#[cfg(test)]
+fn pre_activation_flat(endpoint: &ArrayD<f32>) -> Cow<'_, [f32]> {
+    let flat = contiguous_flat_slice(endpoint);
+    flat_reads::record(matches!(flat, Cow::Borrowed(_)));
+    flat
+}
+
+/// Proof that a backward pass actually took the borrow, rather than only that
+/// two numbers agreed: reinstating `flatten()` would still produce equal
+/// floats, so an equality-only test cannot fail closed on the copies coming
+/// back. Counters are THREAD-LOCAL, so a parallel test driving the same
+/// backward cannot pollute another test's delta. The whole module is
+/// `cfg(test)`; release builds take the counter-free definition above.
+#[cfg(test)]
+mod flat_reads {
+    use std::cell::Cell;
+
+    thread_local! {
+        static BORROWED: Cell<usize> = const { Cell::new(0) };
+        static COPIED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn record(borrowed: bool) {
+        if borrowed {
+            BORROWED.with(|c| c.set(c.get() + 1));
+        } else {
+            COPIED.with(|c| c.set(c.get() + 1));
+        }
+    }
+
+    /// `(borrowed, copied)` pre-activation endpoint reads made on THIS thread
+    /// so far. Compare two snapshots to get one call's counts.
+    pub(super) fn snapshot() -> (usize, usize) {
+        (BORROWED.with(Cell::get), COPIED.with(Cell::get))
     }
 }
 
@@ -214,23 +283,12 @@ impl ReLULayer {
         debug!("ReLU layer SDP-CROWN backward propagation (ℓ2 ball offset)");
         non_finite_domain_guard("ReLU-SDP", pre_activation)?;
 
-        let pre_flat = pre_activation.flatten();
-        let pre_lower = pre_flat
-            .lower()
-            .clone()
-            .into_dimensionality::<ndarray::Ix1>()
-            .map_err(|_| NyError::ShapeMismatch {
-                expected: vec![pre_flat.len()],
-                got: pre_flat.lower().shape().to_vec(),
-            })?;
-        let pre_upper = pre_flat
-            .upper()
-            .clone()
-            .into_dimensionality::<ndarray::Ix1>()
-            .map_err(|_| NyError::ShapeMismatch {
-                expected: vec![pre_flat.len()],
-                got: pre_flat.upper().shape().to_vec(),
-            })?;
+        // Flat, READ-ONLY endpoints — see `pre_activation_flat` for why this
+        // borrow is bit-identical to the four-copy chain it replaces.
+        let pre_lower_flat = pre_activation_flat(pre_activation.lower());
+        let pre_upper_flat = pre_activation_flat(pre_activation.upper());
+        let pre_lower: &[f32] = &pre_lower_flat;
+        let pre_upper: &[f32] = &pre_upper_flat;
 
         let num_neurons = pre_lower.len();
         if bounds.num_inputs() != num_neurons {
@@ -314,8 +372,8 @@ impl ReLULayer {
                 let ua = bounds.upper_a()[[j, i]];
 
                 // Lower bound transform (same as standard CROWN, but without box intercept).
-                // Guard: skip zero coefficients to avoid 0*inf NaN (#1739).
-                // Directed rounding on slope products (#2786): next_down_f32 for lower_a,
+                // Guard: skip zero coefficients to avoid 0*inf NaN.
+                // Directed rounding on slope products: next_down_f32 for lower_a,
                 // next_up_f32 for upper_a. Moves bounds away from true value (sound).
                 new_lower_a[[j, i]] = if la > 0.0 {
                     next_down_f32(la * alpha[i])
@@ -549,11 +607,10 @@ impl ReLULayer {
     /// Same as `propagate_linear_with_bounds` but uses provided α values instead of heuristic.
     /// Also returns gradients ∂bounds/∂α for optimization.
     ///
-    /// This path intentionally remains custom after #1787 refactoring: the canonical
-    /// `crown_elementwise_backward` helper does not expose per-neuron gradient
-    /// accumulation for α parameters.
+    /// This path intentionally remains custom: the canonical `crown_elementwise_backward`
+    /// helper does not expose per-neuron gradient accumulation for α parameters.
     ///
-    /// # Dual Alpha (#3393)
+    /// # Dual Alpha
     ///
     /// When `alpha_upper` is `Some`, uses separate alpha values for the upper bound path
     /// (`ua < 0` case), matching the reference alpha-beta-CROWN which stores `alpha[0]`
@@ -661,23 +718,12 @@ impl ReLULayer {
         alpha_err_audit::record(bounds);
         non_finite_domain_guard("ReLU-alpha", pre_activation)?;
 
-        let pre_flat = pre_activation.flatten();
-        let pre_lower = pre_flat
-            .lower()
-            .clone()
-            .into_dimensionality::<ndarray::Ix1>()
-            .map_err(|_| NyError::ShapeMismatch {
-                expected: vec![pre_flat.len()],
-                got: pre_flat.lower().shape().to_vec(),
-            })?;
-        let pre_upper = pre_flat
-            .upper()
-            .clone()
-            .into_dimensionality::<ndarray::Ix1>()
-            .map_err(|_| NyError::ShapeMismatch {
-                expected: vec![pre_flat.len()],
-                got: pre_flat.upper().shape().to_vec(),
-            })?;
+        // Flat, READ-ONLY endpoints — see `pre_activation_flat` for why this
+        // borrow is bit-identical to the four-copy chain it replaces.
+        let pre_lower_flat = pre_activation_flat(pre_activation.lower());
+        let pre_upper_flat = pre_activation_flat(pre_activation.upper());
+        let pre_lower: &[f32] = &pre_lower_flat;
+        let pre_upper: &[f32] = &pre_upper_flat;
 
         let num_neurons = pre_lower.len();
         if bounds.num_inputs() != num_neurons {
@@ -755,20 +801,54 @@ impl ReLULayer {
 
         // Backward propagation with provided alpha values
         let mut new_lower_a = Array2::<f32>::zeros((num_outputs, num_neurons));
-        // Match canonical helper precision: accumulate bias in f64 to reduce cancellation.
-        let mut new_lower_b_f64 = bounds.lower_b().mapv(|v| v as f64);
+        // CERTIFIED CONSTANT (#vnncomp-aw-constant). The comment that used to
+        // stand here read "Match canonical helper precision: accumulate bias in
+        // f64 to reduce cancellation" — a measurement claim that is true of the
+        // PRECISION and false as a CERTIFICATE. Higham Thm 3.1 bounds the
+        // binary64 error of a length-`d` sum by `gamma^f64_d * SUM|summand|`,
+        // scaled by the MAGNITUDE of the terms, while the outward binary32 cast
+        // at publication allows only `~2^-24 * |result|`. Under cancellation the
+        // result collapses toward zero and that allowance collapses with it; the
+        // true error does not. Worked shape, reachable here with `num_neurons =
+        // 4097` (`certified_constant_tests` builds it): a seed of `+2^60 * i`
+        // followed by 4096 terms of `-i` and one of `-2^60 * i` sums to EXACTLY
+        // 0.0 in binary64 — `ulp(2^60 * i) = 256` swallows every unit term —
+        // where the truth is `-4096 * i`. Published as a lower bias 4096 ABOVE
+        // the truth: a false proof, on the most-executed backward in the
+        // verifier.
+        //
+        // The fix is idiom (b) of this crate's constant-certificate idioms
+        // (`layers/linear/bias.rs`), the SAME one the three certified
+        // element-wise twins take (`layers/common/crown_dense.rs`,
+        // `layers/common/crown_batched.rs`,
+        // `layers/trigonometric/s_shaped/shared.rs`): every accumulation below
+        // takes a DIRECTED binary64 step after each addition — `add_f64_down` on
+        // the lower accumulators, `add_f64_up` on the upper and on the
+        // non-negative error accumulators — so each accumulator is a certified
+        // bound on the exact real partial sum at EVERY step, not merely at the
+        // end. Idiom (b) rather than (a)'s magnitude-sum + gamma charge because
+        // each `a * lambda_intercept` term is an f32 x f32 product formed in f64
+        // and hence EXACT (24 + 24 <= 53 significand bits), so the accumulation
+        // is the ONLY error source and there is nothing else for a magnitude sum
+        // to cover.
+        //
+        // Seeds decode with `f32_to_f64_exact` rather than `as f64`: a plain
+        // hardware conversion may observe a binary32-subnormal seed as signed
+        // zero on a DAZ host, which for a lower bias reads `-1.4e-45` as `0.0`
+        // and moves the bound INWARD.
+        let mut new_lower_b_f64 = bounds.lower_b().mapv(f32_to_f64_exact);
         let mut new_upper_a = Array2::<f32>::zeros((num_outputs, num_neurons));
-        let mut new_upper_b_f64 = bounds.upper_b().mapv(|v| v as f64);
+        let mut new_upper_b_f64 = bounds.upper_b().mapv(f32_to_f64_exact);
 
-        // Track which output rows have non-finite coefficients after coeff × slope (#3086).
+        // Track which output rows have non-finite coefficients after coeff × slope.
         // When accumulated Inf coefficients multiply slopes, f32 can produce Inf/NaN.
         // Affected rows get zeroed A-coefficients and ±Inf bias (sound conservative fallback),
         // preserving precision in all other rows. Matches canonical pattern from
-        // crown_elementwise_backward_indexed (#3009) and crown_single (#2681).
+        // crown_elementwise_backward_indexed and crown_single.
         let mut lower_nonfinite_rows = vec![false; num_outputs];
         let mut upper_nonfinite_rows = vec![false; num_outputs];
 
-        // Dual alpha (#3393): separate gradients for lower and upper bound paths.
+        // Dual alpha: separate gradients for lower and upper bound paths.
         // gradient_lower[i] = ∂(sum of lower bounds)/∂α_lower[i]  (from la > 0 case)
         // gradient_upper[i] = ∂(sum of upper bounds)/∂α_upper[i]  (from ua < 0 case)
         // Reference: auto_LiRPA/operators/relu.py:647-652
@@ -797,8 +877,14 @@ impl ReLULayer {
         // `gap = |a_f64·slope_f64 − stored_f32|` is the directed-rounding distance
         // of the composed f32 product (present per-entry, matches crown_dense).
         //
-        // When the incoming bounds carry NO error, this whole block is skipped and
-        // the result is byte-identical to the pre-#35 code (no err attached).
+        // When the incoming bounds carry NO error, this whole block is skipped
+        // and no err is attached. It used to say the result was then
+        // "byte-identical to the pre-#35 code"; #vnncomp-aw-constant falsified
+        // that half of the claim — the CONSTANT accumulation below now takes a
+        // directed binary64 step per addition, so a row with cancelling
+        // intercept contributions publishes a strictly WIDER bias than the
+        // pre-#35 code did, err or no err. The skip is still exact: it changes
+        // nothing about the err planes.
         let track_err = bounds.has_coeff_err();
         let in_lower_err = bounds.lower_a_err();
         let in_upper_err = bounds.upper_a_err();
@@ -811,7 +897,12 @@ impl ReLULayer {
             (Array2::<f32>::zeros((0, 0)), Array2::<f32>::zeros((0, 0)))
         };
         // Per-row certified intercept (bias) error: subtracted from lower_b,
-        // added to upper_b (outward), accumulated in f64.
+        // added to upper_b (outward), accumulated in f64. These are NON-NEGATIVE
+        // CHARGE accumulators, so BOTH are summed with `add_f64_up`
+        // (#vnncomp-aw-constant): a round-to-nearest `+=` here UNDER-counts the
+        // charge — the same Higham/ULP mismatch as the bias sums, in the
+        // direction that SHRINKS a widening — and an under-counted widening is a
+        // false proof exactly like an over-tight bias.
         let mut lower_b_err = vec![0.0f64; num_outputs];
         let mut upper_b_err = vec![0.0f64; num_outputs];
 
@@ -827,7 +918,13 @@ impl ReLULayer {
             let val = if stable {
                 e64 * slope_used.abs() as f64 + gap
             } else {
-                e64 * (slope_used.abs() as f64 + other_slope.abs() as f64) + gap
+                // Two-line cover summed OUTWARD (see `cover_sum_up`), exactly as
+                // the certified element-wise twins sum theirs. The bare
+                // `|s_used| + |s_other|` is a round-to-nearest binary64 add and
+                // can land BELOW the true sum whenever the two slopes differ in
+                // exponent; this cover is what an ambiguous-sign coefficient's
+                // whole error rests on.
+                e64 * cover_sum_up(slope_used, other_slope) + gap
             };
             next_up_f32(val as f32)
         };
@@ -853,7 +950,7 @@ impl ReLULayer {
                 let l = pre_lower[i];
                 let u = pre_upper[i];
 
-                // Dual alpha (#3393): separate alpha values for lower and upper bound paths.
+                // Dual alpha: separate alpha values for lower and upper bound paths.
                 // alpha_lower_i: used when la > 0 (maximizes lower bound)
                 // alpha_upper_i: used when ua < 0 (minimizes upper bound)
                 // Reference: auto_LiRPA/operators/relu.py selected_alpha[0] vs [1]
@@ -876,8 +973,8 @@ impl ReLULayer {
                 };
 
                 // For lower bound output: maximize lower
-                // Guard: skip zero coefficients to avoid 0*inf NaN (#1739).
-                // Directed rounding on slope products (#2786): next_down_f32 for lower_a,
+                // Guard: skip zero coefficients to avoid 0*inf NaN.
+                // Directed rounding on slope products: next_down_f32 for lower_a,
                 // next_up_f32 for upper_a. Moves bounds away from true value (sound).
                 if la > 0.0 {
                     let product = la * alpha_lower_i;
@@ -896,7 +993,10 @@ impl ReLULayer {
                                 if !stable {
                                     // a_true could flip to the λ (upper) envelope,
                                     // whose intercept lowers the bound.
-                                    lower_b_err[j] += e as f64 * lambda_intercept[i].abs() as f64;
+                                    lower_b_err[j] = add_f64_up(
+                                        lower_b_err[j],
+                                        e as f64 * lambda_intercept[i].abs() as f64,
+                                    );
                                 }
                             }
                         }
@@ -906,7 +1006,7 @@ impl ReLULayer {
                     if track_gradients && is_crossing[i] {
                         // d(la * alpha * x)/d(alpha) at x = l_i gives la * l_i.
                         // The l_i < 0 factor is essential for correct sign.
-                        // Reference: backward.rs AnalyticChain gradient. Fix: #3294
+                        // Reference: backward.rs AnalyticChain gradient.
                         gradient_lower[i] += la * pre_lower[i];
                         // #spec-axis-alpha slice 2b: the SAME contribution,
                         // un-summed — row `slot`'s own ∂bound/∂α, feeding its
@@ -932,13 +1032,19 @@ impl ReLULayer {
                                 // The selected λ envelope's intercept always
                                 // contributes; e·|λ_int| also covers the unstable
                                 // flip to the 0-intercept (lower) envelope.
-                                lower_b_err[j] += e as f64 * lambda_intercept[i].abs() as f64;
+                                lower_b_err[j] = add_f64_up(
+                                    lower_b_err[j],
+                                    e as f64 * lambda_intercept[i].abs() as f64,
+                                );
                             }
                         }
                     } else {
                         lower_nonfinite_rows[j] = true;
                     }
-                    new_lower_b_f64[j] += la as f64 * lambda_intercept[i] as f64;
+                    // Certified accumulation (#vnncomp-aw-constant); see the
+                    // rationale above the accumulator declarations.
+                    new_lower_b_f64[j] =
+                        add_f64_down(new_lower_b_f64[j], la as f64 * lambda_intercept[i] as f64);
                 } else if track_err && la == 0.0 {
                     // Stored coefficient is exactly 0, but a_true ∈ [-e, e] may
                     // select either envelope: carry the full hull cover (no gap).
@@ -946,7 +1052,8 @@ impl ReLULayer {
                     if e != 0.0 {
                         new_lower_a_err[[j, i]] =
                             coeff_err_val(e, false, alpha_lower_i, lambda[i], 0.0);
-                        lower_b_err[j] += e as f64 * lambda_intercept[i].abs() as f64;
+                        lower_b_err[j] =
+                            add_f64_up(lower_b_err[j], e as f64 * lambda_intercept[i].abs() as f64);
                     }
                 }
 
@@ -966,15 +1073,19 @@ impl ReLULayer {
                                     coeff_err_val(e, stable, lambda[i], alpha_upper_i, gap);
                                 // Selected λ envelope's intercept contributes;
                                 // covers the unstable flip to the 0-intercept side.
-                                upper_b_err[j] += e as f64 * lambda_intercept[i].abs() as f64;
+                                upper_b_err[j] = add_f64_up(
+                                    upper_b_err[j],
+                                    e as f64 * lambda_intercept[i].abs() as f64,
+                                );
                             }
                         }
                     } else {
                         upper_nonfinite_rows[j] = true;
                     }
-                    new_upper_b_f64[j] += ua as f64 * lambda_intercept[i] as f64;
+                    new_upper_b_f64[j] =
+                        add_f64_up(new_upper_b_f64[j], ua as f64 * lambda_intercept[i] as f64);
                 } else if ua < 0.0 {
-                    // Dual alpha (#3393): use alpha_upper for the ua < 0 case.
+                    // Dual alpha: use alpha_upper for the ua < 0 case.
                     // Reference: auto_LiRPA/operators/clampmult.py:37-43
                     let product = ua * alpha_upper_i;
                     if product.is_finite() {
@@ -992,7 +1103,10 @@ impl ReLULayer {
                                 if !stable {
                                     // a_true could flip to the λ (upper) envelope,
                                     // whose intercept raises the bound.
-                                    upper_b_err[j] += e as f64 * lambda_intercept[i].abs() as f64;
+                                    upper_b_err[j] = add_f64_up(
+                                        upper_b_err[j],
+                                        e as f64 * lambda_intercept[i].abs() as f64,
+                                    );
                                 }
                             }
                         }
@@ -1012,7 +1126,8 @@ impl ReLULayer {
                     if e != 0.0 {
                         new_upper_a_err[[j, i]] =
                             coeff_err_val(e, false, lambda[i], alpha_upper_i, 0.0);
-                        upper_b_err[j] += e as f64 * lambda_intercept[i].abs() as f64;
+                        upper_b_err[j] =
+                            add_f64_up(upper_b_err[j], e as f64 * lambda_intercept[i].abs() as f64);
                     }
                 }
             }
@@ -1023,14 +1138,18 @@ impl ReLULayer {
         // accumulators stay 0), preserving byte-identical output.
         if track_err {
             for j in 0..num_outputs {
-                new_lower_b_f64[j] -= lower_b_err[j];
-                new_upper_b_f64[j] += upper_b_err[j];
+                // The discharge is a binary64 addition like any other — and the
+                // one most likely to CANCEL, since `-lower_b_err[j]` is
+                // subtracted from a bias of arbitrary sign and magnitude — so it
+                // takes the same directed step (#vnncomp-aw-constant).
+                new_lower_b_f64[j] = add_f64_down(new_lower_b_f64[j], -lower_b_err[j]);
+                new_upper_b_f64[j] = add_f64_up(new_upper_b_f64[j], upper_b_err[j]);
             }
         }
 
-        // #3086: Zero affected rows and set bias to ±Inf for rows with non-finite
+        // Zero affected rows and set bias to ±Inf for rows with non-finite
         // coefficient overflow. Only affected rows are degraded — all other rows
-        // preserve full precision. Pattern matches common/mod.rs #3009.
+        // preserve full precision. Pattern matches common/crown_dense.rs.
         let lower_affected = lower_nonfinite_rows.iter().filter(|&&r| r).count();
         let upper_affected = upper_nonfinite_rows.iter().filter(|&&r| r).count();
         if lower_affected > 0 || upper_affected > 0 {
@@ -1046,7 +1165,27 @@ impl ReLULayer {
         // loosening and (b) breaks the stacked-seed invariant that zero rows
         // stay exactly zero through every admitted step (#cgan-stacked-backward
         // injection guard: a nonzero find refuses the whole stacked pass).
-        // `v == 0.0` casts exactly, so no widening is required there.
+        //
+        // CORRECTED RATIONALE (#vnncomp-aw-constant). This comment used to end
+        // "`v == 0.0` casts exactly, so no widening is required there." That
+        // claim is true of the CAST and was FALSE of the ACCUMULATION that
+        // produced `v`, and `v == 0.0` is precisely the CANCELLING case: the one
+        // where the binary32 allowance `~2^-24 * |v|` collapses to 1.4e-45 while
+        // the true binary64 accumulation error does not collapse at all. Under
+        // the previous round-to-nearest `+=` a row whose exact bias was
+        // `-4096 * i` could reach exactly 0.0 (see the accumulation comment
+        // above) and this branch then published a lower bias 4096 ABOVE truth.
+        //
+        // The branch is sound now only because every accumulator above takes a
+        // directed binary64 step per addition. `add_f64_down`/`add_f64_up`
+        // short-circuit `term == 0.0` exactly, and otherwise step strictly
+        // outward, so a LOWER accumulator can hold exactly `+0.0` in only two
+        // ways: every term it saw was exactly zero (the structural zero row), or
+        // it stepped down from `+5e-324`, whose true sum is therefore >= 0.0.
+        // Both make `0.0` a sound lower bound. Symmetrically for the upper
+        // accumulator and `-0.0`. A row whose NONZERO terms merely cancel no
+        // longer lands on zero at all: it ends strictly outside and is published
+        // one binary32 ulp further out.
         let mut new_lower_b = new_lower_b_f64.mapv(|v| {
             if v == 0.0 {
                 0.0
@@ -1077,11 +1216,12 @@ impl ReLULayer {
             }
         }
 
-        // CROWN backward NaN firewall (#2812): final safety net catches any
+        // CROWN backward NaN firewall: final safety net catches any
         // missed corruption beyond per-row tracking. When the incoming bounds
         // carry certified coefficient error, propagate the sign-stability composed
-        // error (task #35); otherwise emit err-free bounds byte-identical to the
-        // pre-#35 path.
+        // error (task #35); otherwise emit err-free bounds — same CONSTRUCTOR as
+        // the pre-#35 path, but no longer the same bits: the certified constant
+        // accumulation (#vnncomp-aw-constant) widens a cancelling row's bias.
         let out = if track_err {
             let mut b = LinearBounds::new_or_conservative_with_err(
                 new_lower_a,
@@ -1105,12 +1245,13 @@ impl ReLULayer {
             // measured as an ~18x throughput regression on metaroom spec_114
             // (base unsat 17s vs carried timeout 306s, identical concurrent load).
             // Discharging here keeps soundness while restoring downstream cost.
-            // Non-contiguous pre-activation (rare) skips the fold: the error
-            // stays attached — still sound, just carries downstream at the
-            // higher cost.
-            if let (Some(pl), Some(pu)) = (pre_lower.as_slice(), pre_upper.as_slice()) {
-                b.fold_coeff_err_into_bias(pl, pu);
-            }
+            // The fold is unconditional. It already was: the removed
+            // `flatten()` handed this site a `Vec`-backed `Array1`, whose
+            // `as_slice()` is always `Some`, so the guard this replaces could
+            // never fail. `pre_activation_flat` likewise always yields a flat
+            // `&[f32]` (borrowed, or one contiguous copy for a non-standard
+            // layout), so the same fold runs on the same bytes.
+            b.fold_coeff_err_into_bias(pre_lower, pre_upper);
             b
         } else {
             LinearBounds::new_or_conservative(new_lower_a, new_lower_b, new_upper_a, new_upper_b)?
@@ -1165,11 +1306,16 @@ impl ReLULayer {
     ///     when `alpha_batch[d]` is `None`.
     ///
     /// Same relaxation (`relu_crossing_upper_chord` / `relu_linear_relaxation`), same
-    /// directed rounding (`next_down_f32`/`next_up_f32`), same per-row f64 bias
-    /// accumulation order, same certified coefficient-error carry, same non-finite
-    /// row degrade, and the same constructors — so the certified bound is neither
-    /// tighter nor looser, it is the SAME f32 bits. The bit-identity is asserted by
-    /// the kernel parity test in `tests_soundness.rs`.
+    /// directed rounding (`next_down_f32`/`next_up_f32`), same per-row bias
+    /// accumulation order AND the same per-step DIRECTED binary64 accumulation
+    /// (`add_f64_down`/`add_f64_up`, #vnncomp-aw-constant), the same outward
+    /// `cover_sum_up` two-line covers, the same certified coefficient-error carry,
+    /// the same exact-zero-preserving publication, the same non-finite row degrade,
+    /// and the same constructors — so the certified bound is neither tighter nor
+    /// looser, it is the SAME f32 bits. The bit-identity is asserted by the kernel
+    /// parity test in `tests_soundness.rs`; note that the HEURISTIC arm's reference
+    /// is `crown_elementwise_backward` in `layers/common/crown_dense.rs`, so this
+    /// file's arm must track THAT file's certificate, not merely its own twin.
     ///
     /// Returns `Ok(None)` (DECLINE → caller runs the byte-identical per-domain loop)
     /// whenever any domain is not in the clean fast-path class: non-contiguous or
@@ -1289,6 +1435,44 @@ impl ReLULayer {
     }
 }
 
+/// Outward `|a| + |b|` for the sign-flip two-line cover (#vnncomp-aw-constant).
+///
+/// PRIVATE COPY of `layers/common/crown_dense::cover_sum_up` (and of
+/// `crown_batched`'s and `trigonometric/s_shaped/shared`'s own copies), kept in
+/// step with them deliberately: the ReLU arms below are the SAME composition
+/// those helpers perform, reached through a different entry point, and
+/// `beta_crown::engine::graph::propagation::batched::tests_soundness` asserts
+/// their published error planes match at ZERO tolerance. A cover computed
+/// differently here would charge the same fold differently depending only on
+/// which arm the caller took — the exact asymmetry this class of defect is made
+/// of. If one copy changes, change all four.
+///
+/// The bare form `(a.abs() + b.abs()) as f64` performs the addition in BINARY32
+/// under round-to-nearest, so it can land BELOW the true sum; `a.abs() as f64 +
+/// b.abs() as f64` performs it in binary64 and can still land below it. That
+/// cover multiplies the incoming coefficient error into both published halves —
+/// `new_*_a_err` and, through `int_cover`, the bias widening `*_b_err` — so a
+/// cover rounded the wrong way under-counts BOTH, in the false-proof direction.
+/// Converting exactly first also keeps a binary32-subnormal operand alive on a
+/// DAZ host, where a hardware `as f64` may read it as zero, and removes a
+/// spurious binary32 overflow to `+inf` for two near-`f32::MAX` intercepts.
+///
+/// `sum == 0.0` returns an exact `0.0` rather than `next_up_f64(0.0) = 5e-324`:
+/// a relaxation with two zero intercepts contributes exactly nothing, and
+/// stepping it off zero would smear a subnormal charge across every cell.
+///
+/// Non-finite operands propagate: `+inf` stays `+inf`, NaN stays NaN and is
+/// sanitized to `+inf` by `new_or_conservative_with_err` — both vacuous, sound.
+#[inline]
+fn cover_sum_up(a: f32, b: f32) -> f64 {
+    let sum = f32_to_f64_exact(a).abs() + f32_to_f64_exact(b).abs();
+    if sum == 0.0 {
+        0.0
+    } else {
+        next_up_f64(sum)
+    }
+}
+
 /// Certified composed-coefficient error for one α-path entry — a verbatim copy of
 /// the closure in [`ReLULayer::propagate_linear_with_alpha`] so the batched path
 /// carries the SAME sign-stability error bits. `slope_used` is the envelope slope
@@ -1305,7 +1489,10 @@ fn relu_alpha_coeff_err_val(
     let val = if stable {
         e64 * slope_used.abs() as f64 + gap
     } else {
-        e64 * (slope_used.abs() as f64 + other_slope.abs() as f64) + gap
+        // Outward two-line cover — byte-for-byte the closure's
+        // (#vnncomp-aw-constant). An arm that covers differently from its twin
+        // is the same asymmetry one level down.
+        e64 * cover_sum_up(slope_used, other_slope) + gap
     };
     next_up_f32(val as f32)
 }
@@ -1362,8 +1549,11 @@ fn relu_batched_alpha_domain(
 
     let mut new_lower_a = Array2::<f32>::zeros((num_outputs, num_neurons));
     let mut new_upper_a = Array2::<f32>::zeros((num_outputs, num_neurons));
-    let mut new_lower_b_f64 = bounds.lower_b().mapv(|v| v as f64);
-    let mut new_upper_b_f64 = bounds.upper_b().mapv(|v| v as f64);
+    // Certified constant + exact seed decode, byte-for-byte the scalar arm's
+    // (#vnncomp-aw-constant); see the rationale in
+    // `propagate_linear_with_alpha_impl`, which this function transcribes.
+    let mut new_lower_b_f64 = bounds.lower_b().mapv(f32_to_f64_exact);
+    let mut new_upper_b_f64 = bounds.upper_b().mapv(f32_to_f64_exact);
 
     let track_err = bounds.has_coeff_err();
     let in_lower_err = bounds.lower_a_err();
@@ -1406,7 +1596,8 @@ fn relu_batched_alpha_domain(
                             new_lower_a_err[[j, i]] =
                                 relu_alpha_coeff_err_val(e, stable, alpha_lower_i, lam, gap);
                             if !stable {
-                                lower_b_err[j] += e as f64 * lam_int.abs() as f64;
+                                lower_b_err[j] =
+                                    add_f64_up(lower_b_err[j], e as f64 * lam_int.abs() as f64);
                             }
                         }
                     }
@@ -1425,19 +1616,20 @@ fn relu_batched_alpha_domain(
                             let stable = (-(la as f64)) > (e as f64);
                             new_lower_a_err[[j, i]] =
                                 relu_alpha_coeff_err_val(e, stable, lam, alpha_lower_i, gap);
-                            lower_b_err[j] += e as f64 * lam_int.abs() as f64;
+                            lower_b_err[j] =
+                                add_f64_up(lower_b_err[j], e as f64 * lam_int.abs() as f64);
                         }
                     }
                 } else {
                     lower_nf[j] = true;
                 }
-                new_lower_b_f64[j] += la as f64 * lam_int as f64;
+                new_lower_b_f64[j] = add_f64_down(new_lower_b_f64[j], la as f64 * lam_int as f64);
             } else if track_err && la == 0.0 {
                 let e = in_lower_err.map_or(0.0, |m| m[[j, i]]);
                 if e != 0.0 {
                     new_lower_a_err[[j, i]] =
                         relu_alpha_coeff_err_val(e, false, alpha_lower_i, lam, 0.0);
-                    lower_b_err[j] += e as f64 * lam_int.abs() as f64;
+                    lower_b_err[j] = add_f64_up(lower_b_err[j], e as f64 * lam_int.abs() as f64);
                 }
             }
 
@@ -1454,13 +1646,14 @@ fn relu_batched_alpha_domain(
                             let stable = (ua as f64) > (e as f64);
                             new_upper_a_err[[j, i]] =
                                 relu_alpha_coeff_err_val(e, stable, lam, alpha_upper_i, gap);
-                            upper_b_err[j] += e as f64 * lam_int.abs() as f64;
+                            upper_b_err[j] =
+                                add_f64_up(upper_b_err[j], e as f64 * lam_int.abs() as f64);
                         }
                     }
                 } else {
                     upper_nf[j] = true;
                 }
-                new_upper_b_f64[j] += ua as f64 * lam_int as f64;
+                new_upper_b_f64[j] = add_f64_up(new_upper_b_f64[j], ua as f64 * lam_int as f64);
             } else if ua < 0.0 {
                 let product = ua * alpha_upper_i;
                 if product.is_finite() {
@@ -1474,7 +1667,8 @@ fn relu_batched_alpha_domain(
                             new_upper_a_err[[j, i]] =
                                 relu_alpha_coeff_err_val(e, stable, alpha_upper_i, lam, gap);
                             if !stable {
-                                upper_b_err[j] += e as f64 * lam_int.abs() as f64;
+                                upper_b_err[j] =
+                                    add_f64_up(upper_b_err[j], e as f64 * lam_int.abs() as f64);
                             }
                         }
                     }
@@ -1486,7 +1680,7 @@ fn relu_batched_alpha_domain(
                 if e != 0.0 {
                     new_upper_a_err[[j, i]] =
                         relu_alpha_coeff_err_val(e, false, lam, alpha_upper_i, 0.0);
-                    upper_b_err[j] += e as f64 * lam_int.abs() as f64;
+                    upper_b_err[j] = add_f64_up(upper_b_err[j], e as f64 * lam_int.abs() as f64);
                 }
             }
         }
@@ -1494,13 +1688,30 @@ fn relu_batched_alpha_domain(
 
     if track_err {
         for j in 0..num_outputs {
-            new_lower_b_f64[j] -= lower_b_err[j];
-            new_upper_b_f64[j] += upper_b_err[j];
+            // Directed discharge, byte-for-byte the scalar arm's.
+            new_lower_b_f64[j] = add_f64_down(new_lower_b_f64[j], -lower_b_err[j]);
+            new_upper_b_f64[j] = add_f64_up(new_upper_b_f64[j], upper_b_err[j]);
         }
     }
 
-    let mut new_lower_b = new_lower_b_f64.mapv(|v| next_down_f32(v as f32));
-    let mut new_upper_b = new_upper_b_f64.mapv(|v| next_up_f32(v as f32));
+    // Publish EXACTLY as `propagate_linear_with_alpha_impl` does, exact zero
+    // preserved. This arm used to cast unconditionally, so a structural zero row
+    // — every incoming coefficient and bias zero, the shape
+    // `inject_stacked_identity_block` refuses on a nonzero find — published
+    // `-1.4e-45` here and `0.0` from the scalar twin: a bit-parity break in the
+    // one function whose entire contract is bit-identity. The zero branch is
+    // sound for the reason given at the scalar publication site: with directed
+    // steps an accumulator reaches exact `+0.0` only from all-zero terms or from
+    // a step down off `+5e-324`.
+    let mut new_lower_b = new_lower_b_f64.mapv(|v| {
+        if v == 0.0 {
+            0.0
+        } else {
+            next_down_f32(v as f32)
+        }
+    });
+    let mut new_upper_b =
+        new_upper_b_f64.mapv(|v| if v == 0.0 { 0.0 } else { next_up_f32(v as f32) });
     for j in 0..num_outputs {
         if lower_nf[j] {
             for i in 0..num_neurons {
@@ -1545,6 +1756,12 @@ fn relu_batched_alpha_domain(
 /// of `crown_elementwise_backward(bounds, pre, relu_linear_relaxation)` (finite
 /// pre-activation only), reusing the shared [`compose`] primitives so the composed
 /// coefficients and the ALWAYS-carried directed-rounding-gap error are bit-identical.
+///
+/// Its reference lives in ANOTHER FILE (`layers/common/crown_dense.rs`), so every
+/// certificate change there must land here in the same commit. It did not, once:
+/// certifying the dense twin's covers with `cover_sum_up` while this transcription
+/// still summed them in binary32 moved `upper_a_err` by 1 ULP and broke
+/// `test_batched_relu_bit_identical_to_per_domain_kernel_lsnc_step2`.
 #[allow(clippy::too_many_arguments)]
 fn relu_batched_heuristic_domain(
     bounds: &LinearBounds,
@@ -1566,8 +1783,14 @@ fn relu_batched_heuristic_domain(
 
     let mut new_lower_a = Array2::<f32>::zeros((num_outputs, num_neurons));
     let mut new_upper_a = Array2::<f32>::zeros((num_outputs, num_neurons));
-    let mut new_lower_b_f64 = bounds.lower_b().mapv(|x| x as f64);
-    let mut new_upper_b_f64 = bounds.upper_b().mapv(|x| x as f64);
+    // Certified constant + exact seed decode (#vnncomp-aw-constant), byte-for-byte
+    // the certified `crown_elementwise_backward_indexed` this function
+    // transcribes — see the rationale above that function's accumulators. The
+    // 1-ULP `upper_a_err` divergence the kernel-parity test caught was this arm
+    // still summing its two-line covers in binary32 after the dense twin had
+    // been certified; the covers below now use the same `cover_sum_up`.
+    let mut new_lower_b_f64 = bounds.lower_b().mapv(f32_to_f64_exact);
+    let mut new_upper_b_f64 = bounds.upper_b().mapv(f32_to_f64_exact);
 
     let in_lower_err = bounds.lower_a_err();
     let in_upper_err = bounds.upper_a_err();
@@ -1608,16 +1831,21 @@ fn relu_batched_heuristic_domain(
 
             let lr = compose::compose_lower(la, relax);
             new_lower_a[[j, i]] = lr.new_coeff;
-            new_lower_b_f64[j] += lr.intercept_contrib;
+            // Certified accumulation (#vnncomp-aw-constant), identical to the
+            // dense twin's.
+            new_lower_b_f64[j] = add_f64_down(new_lower_b_f64[j], lr.intercept_contrib);
             lower_nf[j] |= lr.nonfinite;
 
             let ur = compose::compose_upper(ua, relax);
             new_upper_a[[j, i]] = ur.new_coeff;
-            new_upper_b_f64[j] += ur.intercept_contrib;
+            new_upper_b_f64[j] = add_f64_up(new_upper_b_f64[j], ur.intercept_contrib);
             upper_nf[j] |= ur.nonfinite;
 
-            let slope_sum = (relax.lower_slope.abs() + relax.upper_slope.abs()) as f64;
-            let int_sum = (relax.lower_intercept.abs() + relax.upper_intercept.abs()) as f64;
+            // Outward two-line covers (see `cover_sum_up`). The dense twin
+            // computes these with the identical helper; summing them in binary32
+            // here is what broke `upper_a_err` bit-parity by 1 ULP.
+            let slope_sum = cover_sum_up(relax.lower_slope, relax.upper_slope);
+            let int_sum = cover_sum_up(relax.lower_intercept, relax.upper_intercept);
 
             {
                 let gap = if la != 0.0 {
@@ -1640,7 +1868,9 @@ fn relu_batched_heuristic_domain(
                     };
                     new_lower_a_err[[j, i]] = next_up_f32((ea * slope_cover + gap) as f32);
                     if ea != 0.0 {
-                        lower_b_err[j] += ea * int_cover;
+                        // Non-negative charge: `add_f64_up`, since a
+                        // round-to-nearest `+=` UNDER-counts a widening.
+                        lower_b_err[j] = add_f64_up(lower_b_err[j], ea * int_cover);
                     }
                 }
             }
@@ -1666,17 +1896,33 @@ fn relu_batched_heuristic_domain(
                     };
                     new_upper_a_err[[j, i]] = next_up_f32((ea * slope_cover + gap) as f32);
                     if ea != 0.0 {
-                        upper_b_err[j] += ea * int_cover;
+                        upper_b_err[j] = add_f64_up(upper_b_err[j], ea * int_cover);
                     }
                 }
             }
         }
-        new_lower_b_f64[j] -= lower_b_err[j];
-        new_upper_b_f64[j] += upper_b_err[j];
+        // Directed discharge — the most cancellation-prone add in the row.
+        new_lower_b_f64[j] = add_f64_down(new_lower_b_f64[j], -lower_b_err[j]);
+        new_upper_b_f64[j] = add_f64_up(new_upper_b_f64[j], upper_b_err[j]);
     }
 
-    let mut new_lower_b = new_lower_b_f64.mapv(|x| next_down_f32(x as f32));
-    let mut new_upper_b = new_upper_b_f64.mapv(|x| next_up_f32(x as f32));
+    // Publish EXACTLY as `crown_elementwise_backward_indexed` does, exact zero
+    // preserved. This arm used to cast unconditionally, so a structural zero row
+    // published `-1.4e-45` here and `0.0` from the dense reference — a latent
+    // bit-parity break in the one function whose entire contract is bit-identity
+    // (the kernel-parity test's random biases never land on exact zero, so it
+    // could not see this one). Sound for the reason given at the dense
+    // publication site: with directed steps an accumulator reaches exact `+0.0`
+    // only from all-zero terms or from a step down off `+5e-324`.
+    let mut new_lower_b = new_lower_b_f64.mapv(|x| {
+        if x == 0.0 {
+            0.0
+        } else {
+            next_down_f32(x as f32)
+        }
+    });
+    let mut new_upper_b =
+        new_upper_b_f64.mapv(|x| if x == 0.0 { 0.0 } else { next_up_f32(x as f32) });
     for j in 0..num_outputs {
         if lower_nf[j] {
             for i in 0..num_neurons {
@@ -1768,7 +2014,6 @@ impl ReLULayer {
     /// `d(sum of lower bounds)/d(alpha[i])`.
     ///
     /// Reference: alpha-beta-CROWN auto_LiRPA/operators/relu.py (Patches alpha backward)
-    /// Part of #3293
     pub(crate) fn propagate_patches_with_alpha(
         &self,
         bounds: &crate::bounds::patches::PatchesLinearBounds,
@@ -1852,8 +2097,6 @@ impl crate::layers::common::PatchesPropagation for ReLULayer {
     /// that would occur via ensure_dense() fallback.
     ///
     /// Reference: alpha-beta-CROWN auto_LiRPA/operators/relu.py (Patches backward)
-    /// Design: designs/2026-02-28-patches-mode-wrapper-enum-design.md Phase 2
-    /// Part of #2613
     fn propagate_patches_with_bounds(
         &self,
         bounds: &crate::bounds::patches::PatchesLinearBounds,
@@ -1870,5 +2113,498 @@ impl crate::layers::common::PatchesPropagation for ReLULayer {
     }
 }
 
+/// Zero-copy pre-activation reads in the two dense CROWN backward entries.
+///
+/// Every case asserts the change's OWN OBSERVABLE — `flat_reads`' borrow/copy
+/// counters — and not only that two sets of floats agree. Reinstating
+/// `BoundedTensor::flatten()` would still produce equal numbers, so an
+/// equality-only test would pass while the per-call copies came back; the
+/// counter delta is what fails closed.
+#[cfg(test)]
+mod zero_copy_pre_activation_tests {
+    use super::*;
+    use ndarray::IxDyn;
+
+    /// Finite ramp straddling zero, so the crossing and always-active arms
+    /// both run within a single call.
+    fn ramp(len: usize) -> Vec<f32> {
+        (0..len).map(|i| i as f32 * 0.25 - 1.0).collect()
+    }
+
+    /// A `[3, 2]` row-major source with reversed axes: logically `[2, 3]` and
+    /// NOT contiguous (the construction `util::contiguous`'s own test uses).
+    fn reversed_axes_owned(values: Vec<f32>) -> ArrayD<f32> {
+        ArrayD::from_shape_vec(IxDyn(&[3, 2]), values)
+            .expect("valid shape")
+            .view()
+            .reversed_axes()
+            .to_owned()
+    }
+
+    /// The same values in the same ROW-MAJOR LOGICAL order that
+    /// [`reversed_axes_owned`] presents: element `(i, j)` of the reversed
+    /// `[2, 3]` view is `src[j * 2 + i]`.
+    fn logical_order(v: &[f32]) -> Vec<f32> {
+        vec![v[0], v[2], v[4], v[1], v[3], v[5]]
+    }
+
+    fn assert_bits_eq_2d(actual: &Array2<f32>, expected: &Array2<f32>, label: &str) {
+        assert_eq!(actual.shape(), expected.shape(), "{label}: shape");
+        for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                e.to_bits(),
+                "{label}[{idx}]: {a} is not bit-identical to {e}"
+            );
+        }
+    }
+
+    fn assert_bits_eq_1d(actual: &Array1<f32>, expected: &Array1<f32>, label: &str) {
+        assert_eq!(actual.len(), expected.len(), "{label}: len");
+        for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                e.to_bits(),
+                "{label}[{idx}]: {a} is not bit-identical to {e}"
+            );
+        }
+    }
+
+    /// A standard-layout pre-activation — the layout every production ReLU
+    /// node arrives in — must be read by BORROW at both endpoints, and a
+    /// rank-2 endpoint must give bit-identical bounds to the rank-1 endpoint
+    /// holding the same values (the equivalence the removed `flatten()` used
+    /// to establish by copying).
+    #[ntest::timeout(5000)]
+    #[test]
+    fn alpha_backward_borrows_standard_layout_pre_activation() -> Result<()> {
+        let layer = ReLULayer::new();
+        let lower_2d = ArrayD::from_shape_vec(IxDyn(&[2, 3]), ramp(6)).expect("valid shape");
+        let upper_2d = lower_2d.mapv(|v| v + 2.0);
+        assert!(
+            lower_2d.as_slice().is_some() && upper_2d.as_slice().is_some(),
+            "precondition: a freshly built row-major endpoint is standard layout"
+        );
+        let pre_2d = BoundedTensor::new(lower_2d, upper_2d)?;
+        let pre_1d = BoundedTensor::new(
+            ArrayD::from_shape_vec(IxDyn(&[6]), ramp(6)).expect("valid shape"),
+            ArrayD::from_shape_vec(IxDyn(&[6]), ramp(6).iter().map(|v| v + 2.0).collect())
+                .expect("valid shape"),
+        )?;
+        let bounds = LinearBounds::identity(6);
+        let alpha = Array1::<f32>::from_elem(6, 0.5);
+
+        let before = flat_reads::snapshot();
+        let (out_2d, gl_2d, gu_2d) =
+            layer.propagate_linear_with_alpha(&bounds, &pre_2d, &alpha, None)?;
+        let mid = flat_reads::snapshot();
+        let (out_1d, gl_1d, gu_1d) =
+            layer.propagate_linear_with_alpha(&bounds, &pre_1d, &alpha, None)?;
+        let after = flat_reads::snapshot();
+
+        assert_eq!(
+            (mid.0 - before.0, mid.1 - before.1),
+            (2, 0),
+            "rank-2 standard-layout endpoints must both be BORROWED, \
+             i.e. 2 borrowed / 0 copied; got {before:?} -> {mid:?}"
+        );
+        assert_eq!(
+            (after.0 - mid.0, after.1 - mid.1),
+            (2, 0),
+            "rank-1 standard-layout endpoints must both be BORROWED, \
+             i.e. 2 borrowed / 0 copied; got {mid:?} -> {after:?}"
+        );
+
+        assert_bits_eq_2d(out_2d.lower_a(), out_1d.lower_a(), "lower_a");
+        assert_bits_eq_2d(out_2d.upper_a(), out_1d.upper_a(), "upper_a");
+        assert_bits_eq_1d(out_2d.lower_b(), out_1d.lower_b(), "lower_b");
+        assert_bits_eq_1d(out_2d.upper_b(), out_1d.upper_b(), "upper_b");
+        assert_bits_eq_1d(&gl_2d, &gl_1d, "gradient_lower");
+        assert_bits_eq_1d(&gu_2d, &gu_1d, "gradient_upper");
+        Ok(())
+    }
+
+    /// A non-standard-layout endpoint takes the COPY arm — the fallback that
+    /// reproduces exactly what `flatten()` used to do unconditionally — and
+    /// must yield bit-identical bounds to the same values laid out
+    /// contiguously.
+    #[ntest::timeout(5000)]
+    #[test]
+    fn alpha_backward_non_contiguous_pre_activation_is_bit_identical() -> Result<()> {
+        let layer = ReLULayer::new();
+        let src_lower = ramp(6);
+        let src_upper: Vec<f32> = src_lower.iter().map(|v| v + 2.0).collect();
+        let lower_nc = reversed_axes_owned(src_lower.clone());
+        let upper_nc = reversed_axes_owned(src_upper.clone());
+        assert!(
+            lower_nc.as_slice().is_none() && upper_nc.as_slice().is_none(),
+            "precondition: reversed-axes endpoints must be non-contiguous"
+        );
+
+        let pre_nc = BoundedTensor::new(lower_nc, upper_nc)?;
+        // The contiguous control: same values, same logical order.
+        let pre_c = BoundedTensor::new(
+            ArrayD::from_shape_vec(IxDyn(&[2, 3]), logical_order(&src_lower)).expect("valid shape"),
+            ArrayD::from_shape_vec(IxDyn(&[2, 3]), logical_order(&src_upper)).expect("valid shape"),
+        )?;
+        let bounds = LinearBounds::identity(6);
+        let alpha = Array1::<f32>::from_elem(6, 0.5);
+
+        let before = flat_reads::snapshot();
+        let (out_nc, gl_nc, gu_nc) =
+            layer.propagate_linear_with_alpha(&bounds, &pre_nc, &alpha, None)?;
+        let mid = flat_reads::snapshot();
+        let (out_c, gl_c, gu_c) =
+            layer.propagate_linear_with_alpha(&bounds, &pre_c, &alpha, None)?;
+        let after = flat_reads::snapshot();
+
+        assert_eq!(
+            (mid.0 - before.0, mid.1 - before.1),
+            (0, 2),
+            "non-contiguous endpoints must take the COPY arm, \
+             i.e. 0 borrowed / 2 copied; got {before:?} -> {mid:?}"
+        );
+        assert_eq!(
+            (after.0 - mid.0, after.1 - mid.1),
+            (2, 0),
+            "the contiguous control must take the BORROW arm, \
+             i.e. 2 borrowed / 0 copied; got {mid:?} -> {after:?}"
+        );
+
+        assert_bits_eq_2d(out_nc.lower_a(), out_c.lower_a(), "lower_a");
+        assert_bits_eq_2d(out_nc.upper_a(), out_c.upper_a(), "upper_a");
+        assert_bits_eq_1d(out_nc.lower_b(), out_c.lower_b(), "lower_b");
+        assert_bits_eq_1d(out_nc.upper_b(), out_c.upper_b(), "upper_b");
+        assert_bits_eq_1d(&gl_nc, &gl_c, "gradient_lower");
+        assert_bits_eq_1d(&gu_nc, &gu_c, "gradient_upper");
+        Ok(())
+    }
+
+    /// The SDP-CROWN entry carried the identical read, so it gets the
+    /// identical proof — its own `flatten()` + `clone()` chain is gone too.
+    /// `x_hat` keeps its separate `contiguous_flat_slice` call, which is not
+    /// a pre-activation read and so must not move these counters.
+    #[ntest::timeout(5000)]
+    #[test]
+    fn sdp_backward_borrows_standard_layout_pre_activation() -> Result<()> {
+        let layer = ReLULayer::new();
+        let lower = ArrayD::from_shape_vec(IxDyn(&[4]), ramp(4)).expect("valid shape");
+        let upper = lower.mapv(|v| v + 2.0);
+        let pre = BoundedTensor::new(lower, upper)?;
+        let bounds = LinearBounds::identity(4);
+        let x_hat = Array1::<f32>::zeros(4);
+
+        let before = flat_reads::snapshot();
+        let _out = layer.propagate_linear_with_bounds_sdp(&bounds, &pre, &x_hat, 0.5)?;
+        let after = flat_reads::snapshot();
+
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1),
+            (2, 0),
+            "SDP-CROWN backward must BORROW both standard-layout endpoints, \
+             i.e. 2 borrowed / 0 copied; got {before:?} -> {after:?}"
+        );
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests;
+
+/// Cancelling-constant certificate for the α-CROWN ReLU dense backward and for
+/// both domain-batched arms (#vnncomp-aw-constant).
+///
+/// These tests FAIL on the pre-fix code, where every bias accumulator here was a
+/// bare round-to-nearest binary64 `+=`. They are named individually so a filter
+/// that stops matching them fails loudly rather than silently passing zero tests
+/// (`cargo test <filter>` exits 0 on an empty match).
+///
+/// The shape is the one the ReLU backward can actually reach: the lower constant
+/// accumulator only ever receives `la * lambda_intercept` with `la < 0` and
+/// `lambda_intercept >= 0`, i.e. only NEGATIVE terms, so cancellation cannot come
+/// from the terms alone — it comes from the SEED. A seed of `+2^60 * i` (a bias
+/// arriving from the layer above) followed by `UNITS` terms of `-i` and one term
+/// of `-2^60 * i` is exactly that: every unit term vanishes into the seed's
+/// 256-wide binary64 ulp, the giant term then cancels the seed exactly, and the
+/// publication's exact-zero branch hands back `0.0` where the truth is
+/// `-UNITS * i`. The upper direction is the mirror image (`ua > 0`, seed
+/// `-2^60 * i`).
+#[cfg(test)]
+mod certified_constant_tests {
+    use super::*;
+
+    /// `2^60`, exactly representable in binary32.
+    const BIG: f32 = 1_152_921_504_606_846_976.0;
+    /// How many unit terms vanish into the seed.
+    const UNITS: usize = 4096;
+    /// `UNITS` unit neurons, then the one giant neuron that cancels the seed.
+    const N: usize = UNITS + 1;
+    /// Crossing pre-activation box (`l < 0 < u`) so every neuron takes the
+    /// triangle arm and carries a NONZERO upper-chord intercept.
+    const L: f32 = -2.0;
+    const U: f32 = 2.0;
+
+    /// The upper-chord intercept each neuron contributes, read from the
+    /// production helper rather than hard-coded: `relu_crossing_upper_chord`
+    /// rounds both chord parameters outward, so the intercept is NOT the tidy
+    /// `1.0` the geometry suggests and a hard-coded constant would silently stop
+    /// describing the code under test.
+    fn chord_intercept() -> f32 {
+        let (lambda, intercept) = relu_crossing_upper_chord(L, U, None);
+        assert!(
+            lambda.is_finite() && intercept.is_finite() && intercept > 0.0,
+            "test setup: a finite crossing box must yield a finite positive \
+             upper-chord intercept, got lambda={lambda} intercept={intercept}"
+        );
+        intercept
+    }
+
+    /// `2^60 * intercept`, which is exactly representable in binary32 (a power of
+    /// two times a 24-bit significand). The assertion is load-bearing: if the
+    /// seed were not EXACTLY the negation of the giant term, the pre-fix
+    /// accumulator would not land on exact zero and the counterexample would
+    /// prove nothing.
+    fn seed_constant(intercept: f32) -> f32 {
+        let exact = BIG as f64 * intercept as f64;
+        let seed = exact as f32;
+        assert_eq!(
+            f32_to_f64_exact(seed),
+            exact,
+            "test setup: the seed must equal 2^60 * intercept EXACTLY"
+        );
+        seed
+    }
+
+    /// One `[1, N]` cancelling row in BOTH directions, plus the crossing box.
+    fn cancelling_inputs() -> (LinearBounds, BoundedTensor, f32) {
+        let intercept = chord_intercept();
+        let seed = seed_constant(intercept);
+        let lower_a = Array2::from_shape_fn((1, N), |(_, i)| if i == N - 1 { -BIG } else { -1.0 });
+        let upper_a = Array2::from_shape_fn((1, N), |(_, i)| if i == N - 1 { BIG } else { 1.0 });
+        let bounds = LinearBounds::new(
+            lower_a,
+            Array1::from_elem(1, seed),
+            upper_a,
+            Array1::from_elem(1, -seed),
+        )
+        .expect("finite coefficients and biases");
+        let pre = BoundedTensor::new(
+            Array1::from_elem(N, L).into_dyn(),
+            Array1::from_elem(N, U).into_dyn(),
+        )
+        .expect("matching 1-D pre-activation shapes");
+        (bounds, pre, intercept)
+    }
+
+    /// Both directions, one call. Widening the accumulator to binary64 is not a
+    /// certificate: the exact biases are `∓UNITS * intercept` and a bare `+=`
+    /// lands on exactly `0.0`.
+    fn assert_certified(lower_b: &Array1<f32>, upper_b: &Array1<f32>, intercept: f32, arm: &str) {
+        // `UNITS` is a power of two and `intercept` has 24 significand bits, so
+        // both products are EXACT in binary64.
+        let true_lower = -(UNITS as f64) * intercept as f64;
+        let true_upper = (UNITS as f64) * intercept as f64;
+        assert!(
+            f32_to_f64_exact(lower_b[0]) <= true_lower,
+            "{arm}: lower bias {} is ABOVE its exact value {true_lower} — a false \
+             proof by {} (cancellation ate the binary64 accumulation error and the \
+             binary32 ULP of the result cannot pay for it)",
+            lower_b[0],
+            f32_to_f64_exact(lower_b[0]) - true_lower
+        );
+        assert!(
+            f32_to_f64_exact(upper_b[0]) >= true_upper,
+            "{arm}: upper bias {} is BELOW its exact value {true_upper} — a false \
+             proof by {}",
+            upper_b[0],
+            true_upper - f32_to_f64_exact(upper_b[0])
+        );
+        assert!(
+            lower_b[0].is_finite() && upper_b[0].is_finite(),
+            "{arm}: the certificate must loosen the bias, not vacate the row: \
+             lower={} upper={}",
+            lower_b[0],
+            upper_b[0]
+        );
+    }
+
+    fn assert_bits_eq_1d(actual: &Array1<f32>, expected: &Array1<f32>, label: &str) {
+        assert_eq!(actual.len(), expected.len(), "{label}: len");
+        for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                e.to_bits(),
+                "{label}[{idx}]: {a} is not bit-identical to {e}"
+            );
+        }
+    }
+
+    fn assert_bits_eq_2d(actual: &Array2<f32>, expected: &Array2<f32>, label: &str) {
+        assert_eq!(actual.shape(), expected.shape(), "{label}: shape");
+        for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                e.to_bits(),
+                "{label}[{idx}]: {a} is not bit-identical to {e}"
+            );
+        }
+    }
+
+    /// Every published plane, including the certified coefficient-error planes —
+    /// the ones the kernel-parity test caught diverging by 1 ULP.
+    fn assert_bounds_bit_identical(actual: &LinearBounds, expected: &LinearBounds, label: &str) {
+        assert_bits_eq_2d(
+            actual.lower_a(),
+            expected.lower_a(),
+            &format!("{label} lower_a"),
+        );
+        assert_bits_eq_2d(
+            actual.upper_a(),
+            expected.upper_a(),
+            &format!("{label} upper_a"),
+        );
+        assert_bits_eq_1d(
+            actual.lower_b(),
+            expected.lower_b(),
+            &format!("{label} lower_b"),
+        );
+        assert_bits_eq_1d(
+            actual.upper_b(),
+            expected.upper_b(),
+            &format!("{label} upper_b"),
+        );
+        match (actual.lower_a_err(), expected.lower_a_err()) {
+            (Some(a), Some(e)) => assert_bits_eq_2d(a, e, &format!("{label} lower_a_err")),
+            (None, None) => {}
+            (a, e) => panic!(
+                "{label}: lower_a_err PRESENCE differs (actual={} expected={}) — an \
+                 err plane that exists on one arm only is a certificate difference, \
+                 not a formatting one",
+                a.is_some(),
+                e.is_some()
+            ),
+        }
+        match (actual.upper_a_err(), expected.upper_a_err()) {
+            (Some(a), Some(e)) => assert_bits_eq_2d(a, e, &format!("{label} upper_a_err")),
+            (None, None) => {}
+            (a, e) => panic!(
+                "{label}: upper_a_err PRESENCE differs (actual={} expected={})",
+                a.is_some(),
+                e.is_some()
+            ),
+        }
+    }
+
+    fn dual_alphas() -> (Array1<f32>, Array1<f32>) {
+        (
+            Array1::<f32>::from_elem(N, 0.5),
+            Array1::<f32>::from_elem(N, 0.25),
+        )
+    }
+
+    /// The α-CROWN dense backward itself — `propagate_linear_with_alpha`, the
+    /// per-domain reference the input-split ReLU arm calls.
+    #[ntest::timeout(60000)]
+    #[test]
+    fn alpha_dense_backward_certifies_cancelling_constant_in_both_directions() {
+        let (bounds, pre, intercept) = cancelling_inputs();
+        let (alpha, alpha_upper) = dual_alphas();
+        let (out, _gradient_lower, _gradient_upper) = ReLULayer::new()
+            .propagate_linear_with_alpha(&bounds, &pre, &alpha, Some(&alpha_upper))
+            .expect("a finite crossing relaxation must not error");
+        assert_certified(out.lower_b(), out.upper_b(), intercept, "alpha dense");
+    }
+
+    /// The domain-batched α arm must be certified AND bit-identical to the scalar
+    /// α arm it transcribes — both live in this file, so a divergence here is a
+    /// fourth idiom, not a cross-file drift.
+    #[ntest::timeout(60000)]
+    #[test]
+    fn batched_alpha_domain_certifies_and_matches_scalar_alpha_bit_for_bit() {
+        let (bounds, pre, intercept) = cancelling_inputs();
+        let (alpha, alpha_upper) = dual_alphas();
+        let relu = ReLULayer::new();
+        let reference = relu
+            .propagate_linear_with_alpha(&bounds, &pre, &alpha, Some(&alpha_upper))
+            .expect("scalar alpha reference")
+            .0;
+        let batched = relu
+            .propagate_linear_multi_domain_relu(&[&bounds], &[&pre], &[Some((alpha, alpha_upper))])
+            .expect("batched relu ok")
+            .expect("finite contiguous inputs must not decline");
+        assert_eq!(batched.len(), 1, "one domain in, one domain out");
+        assert_certified(
+            batched[0].lower_b(),
+            batched[0].upper_b(),
+            intercept,
+            "batched alpha domain",
+        );
+        assert_bounds_bit_identical(&batched[0], &reference, "batched alpha vs scalar alpha:");
+    }
+
+    /// The domain-batched HEURISTIC arm must be certified AND bit-identical to
+    /// `propagate_linear_with_bounds` — whose certificate lives in ANOTHER file
+    /// (`layers/common/crown_dense.rs`). This is the pair the kernel-parity test
+    /// caught diverging by 1 ULP in `upper_a_err`.
+    #[ntest::timeout(60000)]
+    #[test]
+    fn batched_heuristic_domain_certifies_and_matches_dense_reference_bit_for_bit() {
+        let (bounds, pre, intercept) = cancelling_inputs();
+        let relu = ReLULayer::new();
+        let reference = relu
+            .propagate_linear_with_bounds(&bounds, &pre)
+            .expect("dense heuristic reference");
+        let batched = relu
+            .propagate_linear_multi_domain_relu(&[&bounds], &[&pre], &[None])
+            .expect("batched relu ok")
+            .expect("finite contiguous inputs must not decline");
+        assert_eq!(batched.len(), 1, "one domain in, one domain out");
+        assert_certified(
+            batched[0].lower_b(),
+            batched[0].upper_b(),
+            intercept,
+            "batched heuristic domain",
+        );
+        assert_certified(
+            reference.lower_b(),
+            reference.upper_b(),
+            intercept,
+            "dense heuristic reference",
+        );
+        assert_bounds_bit_identical(
+            &batched[0],
+            &reference,
+            "batched heuristic vs crown_dense reference:",
+        );
+    }
+
+    /// The two-line cover must never round INWARD. `cover_sum_up` is the helper
+    /// the sign-ambiguous error carry rests on in all three arms of this file;
+    /// the bare `(a.abs() + b.abs()) as f64` it replaced performs the addition in
+    /// BINARY32 and lands below the true sum whenever the two operands differ
+    /// enough in exponent.
+    #[ntest::timeout(5000)]
+    #[test]
+    fn cover_sum_up_never_rounds_the_two_line_cover_inward() {
+        // 1.0 + 2^-30: the exact sum needs 31 significand bits, so binary32
+        // round-to-nearest returns exactly 1.0 — BELOW the truth.
+        let a = 1.0f32;
+        let b = f32::from_bits(0x3080_0000); // 2^-30
+        assert_eq!(
+            (a.abs() + b.abs()) as f64,
+            1.0f64,
+            "test setup: the bare binary32 form must actually round inward here"
+        );
+        let exact = f32_to_f64_exact(a) + f32_to_f64_exact(b);
+        assert!(
+            cover_sum_up(a, b) >= exact,
+            "cover_sum_up({a}, {b}) = {} is BELOW the exact sum {exact}",
+            cover_sum_up(a, b)
+        );
+        // Two zero intercepts contribute exactly nothing: the cover must stay an
+        // exact 0.0 rather than smearing a 5e-324 charge across every cell.
+        assert_eq!(cover_sum_up(0.0, -0.0), 0.0);
+        // Signs are irrelevant to a cover of magnitudes.
+        assert_eq!(cover_sum_up(-a, b), cover_sum_up(a, -b));
+    }
+}

@@ -11,8 +11,6 @@
 //! - `try_finish_constrained_gpu_suffix` — seeded GPU suffix fast-exit
 //! - `process_constrained_backward_node` — per-node router (Linear/ReLU/generic)
 //! - `process_shared_dispatch_node` — generic operator backward dispatch
-//!
-//! Part of #4293 (directory-module split from former backward.rs monolith).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,6 +20,7 @@ use ny_core::{GpuCrownSeed, NyError, Result};
 use ny_tensor::BoundedTensor;
 use tracing::debug;
 
+use crate::batched_domain::CachedLinearBounds;
 use crate::bounds::patches::{CrownBounds, PatchesMaterializationPurpose};
 use crate::network::backward_dispatch::{
     dispatch_backward_layer, dispatch_backward_layer_finite_boundary, BackwardDispatchResult,
@@ -42,10 +41,19 @@ pub(super) struct ConstrainedNodeContext<'a> {
     pub first_input: &'a str,
 }
 
+/// Capture the block the constrained pass holds for `current.node_name` into
+/// the child warm-start map.
+///
+/// #warm-cache-err: `node_box` is the node's certified output box on this
+/// domain (the box the block's columns multiply). The block's certified
+/// coefficient error is folded over it before publication, because
+/// `CachedLinearBounds` stores no error; a block that cannot be folded
+/// soundly is left out (the child then seeds at the output for that node).
 fn capture_constrained_linear_bounds(
     current: &ConstrainedNodeContext<'_>,
     node_cb: &CrownBounds,
     captured_linear_bounds: &mut Option<HashMap<String, LinearBounds>>,
+    node_box: Option<&BoundedTensor>,
     deadline: Option<std::time::Instant>,
 ) -> Result<()> {
     let Some(linear_bounds_map) = captured_linear_bounds.as_mut() else {
@@ -65,7 +73,7 @@ fn capture_constrained_linear_bounds(
             )?;
         }
     }
-    let captured_lb = match node_cb {
+    let mut captured_lb = match node_cb {
         CrownBounds::Dense(lb) => lb.try_clone_with_deadline(deadline, retained_capture_bytes)?,
         CrownBounds::Patches(bounds) => bounds.to_dense_with_deadline_and_resident_for_purpose(
             deadline,
@@ -73,6 +81,13 @@ fn capture_constrained_linear_bounds(
             PatchesMaterializationPurpose::Other,
         )?,
     };
+    if !CachedLinearBounds::fold_capture_coeff_err(&mut captured_lb, node_box, deadline)? {
+        debug!(
+            node = current.node_name,
+            "Constrained CROWN: refusing an unfoldable coefficient-error capture (#warm-cache-err)"
+        );
+        return Ok(());
+    }
     super::super::ensure_constrained_propagation_deadline(
         deadline,
         "before constrained linear-bound capture publication",
@@ -274,6 +289,50 @@ fn verify_constrained_split_path_bias_zero_with_deadline(
 }
 
 impl BetaCrownVerifier {
+    /// #la-warm-frontier: record the rest of this pass's backward state at the
+    /// moment it popped `node_name` (called right after the take and the main
+    /// capture, before the node is processed). Only next to a captured main
+    /// block (a child needs both); a resource refusal records nothing, a
+    /// deadline is terminal like the main capture's.
+    fn capture_constrained_frontier(
+        &self,
+        params: &BackwardParams<'_>,
+        node_name: &str,
+        bounds_cache: &HashMap<String, Arc<BoundedTensor>>,
+        setup: &mut ConstrainedBackwardSetup<'_, '_>,
+    ) -> Result<()> {
+        let Some(counters) = self.la_warm_frontier_armed() else {
+            return Ok(());
+        };
+        let Some(branch_block) = setup
+            .state
+            .captured_linear_bounds
+            .as_ref()
+            .and_then(|captured| captured.get(node_name))
+        else {
+            return Ok(());
+        };
+        let constrained_input = params.constrained_input;
+        let capture = super::super::super::warm_frontier::capture_accumulator_frontier(
+            &setup.state.node_crown_bounds,
+            branch_block,
+            |key| {
+                if key == NETWORK_INPUT {
+                    Some(constrained_input)
+                } else {
+                    bounds_cache.get(key).map(Arc::as_ref)
+                }
+            },
+            params.deadline,
+        )?;
+        if let Some(frontier) = counters.record_capture(capture) {
+            if let Some(frontiers) = setup.state.captured_frontiers.as_mut() {
+                frontiers.insert(node_name.to_string(), frontier);
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn try_finish_constrained_gpu_suffix(
         &self,
         params: &BackwardParams<'_>,
@@ -459,8 +518,14 @@ impl BetaCrownVerifier {
             &current,
             &node_cb,
             &mut setup.state.captured_linear_bounds,
+            bounds_cache_mut.get(node_name).map(Arc::as_ref),
             params.deadline,
         )?;
+        if setup.state.captured_frontiers.is_some()
+            && super::super::super::warm_frontier::is_frontier_capture_site(&node.layer)
+        {
+            self.capture_constrained_frontier(params, node_name, &*bounds_cache_mut, setup)?;
+        }
 
         if is_standard
             && params.deadline.is_none()
@@ -742,8 +807,9 @@ mod capture_atomic_tests {
                 LinearBounds::identity(1),
             )]));
 
-            let error = capture_constrained_linear_bounds(&current, &carrier, &mut captures, None)
-                .expect_err("zero budget must refuse constrained linear capture");
+            let error =
+                capture_constrained_linear_bounds(&current, &carrier, &mut captures, None, None)
+                    .expect_err("zero budget must refuse constrained linear capture");
             assert!(
                 matches!(error, NyError::CpuMemoryExceeded { .. }),
                 "expected typed memory refusal, got {error:?}"
@@ -786,9 +852,14 @@ mod capture_atomic_tests {
             .checked_sub(Duration::from_secs(1))
             .expect("one-second deadline subtraction");
 
-        let error =
-            capture_constrained_linear_bounds(&current, &carrier, &mut captures, Some(expired))
-                .expect_err("expired capture must be terminal");
+        let error = capture_constrained_linear_bounds(
+            &current,
+            &carrier,
+            &mut captures,
+            None,
+            Some(expired),
+        )
+        .expect_err("expired capture must be terminal");
 
         assert!(error.is_deadline_exceeded());
         let CrownBounds::Patches(actual) = &carrier else {

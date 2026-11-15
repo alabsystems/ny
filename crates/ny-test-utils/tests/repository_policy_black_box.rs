@@ -75,6 +75,27 @@ fn canonical_ay_revision(manifest: &str) -> &str {
     revision
 }
 
+fn canonical_ay_version(manifest: &str) -> &str {
+    let marker = "git = \"https://github.com/alabsystems/ay.git\"";
+    let dependency = manifest
+        .lines()
+        .find(|line| line.contains(marker))
+        .expect("ny-mip must use the canonical AY Git source");
+    let version = dependency
+        .split_once("version = \"")
+        .expect("canonical AY dependency must carry a version")
+        .1
+        .split_once('"')
+        .expect("canonical AY version must be a quoted string")
+        .0;
+    assert_eq!(
+        version.split('.').count(),
+        3,
+        "AY version must be a three-part workspace version"
+    );
+    version
+}
+
 fn cargo_metadata_package_names(metadata: &str) -> BTreeSet<&str> {
     let packages = metadata
         .split_once("\"packages\":[")
@@ -169,6 +190,7 @@ fn active_ay_claims_are_aligned_with_the_canonical_manifest_pin() {
     let manifest = fs::read_to_string(root.join("crates/ny-mip/Cargo.toml"))
         .expect("ny-mip manifest must be readable");
     let revision = canonical_ay_revision(&manifest);
+    let version = canonical_ay_version(&manifest);
 
     let output = run_policy_tool("scripts/align_scored_audit_ay_pin.py", &["--check"]);
     let (stdout, stderr) = assert_success(&output, "AY claim alignment policy");
@@ -178,7 +200,7 @@ fn active_ay_claims_are_aligned_with_the_canonical_manifest_pin() {
     );
     assert_eq!(
         stdout.trim(),
-        format!("already aligned to AY {}", &revision[..8])
+        format!("already aligned to AY {}/{version}", &revision[..8])
     );
 
     for relative in [
@@ -197,12 +219,16 @@ fn active_ay_claims_are_aligned_with_the_canonical_manifest_pin() {
 #[test]
 fn documented_package_inventory_matches_cargo_metadata() {
     let root = workspace_root();
-    let output = Command::new("cargo")
+    // `$CARGO` is the targo that runs this test; `targo` otherwise (owner
+    // directive 2026-09-28: ALab builds use the Trust toolchain, no stock
+    // fallback). `metadata` needs no lane.
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "targo".into());
+    let output = Command::new(cargo)
         .args(["metadata", "--locked", "--format-version", "1", "--no-deps"])
         .current_dir(&root)
         .output()
-        .expect("Cargo must be available while Cargo-owned policy tests run");
-    let (stdout, stderr) = assert_success(&output, "cargo metadata");
+        .expect("targo must be available while Cargo-owned policy tests run");
+    let (stdout, stderr) = assert_success(&output, "targo metadata");
     assert!(
         stderr.is_empty(),
         "successful cargo metadata wrote stderr: {stderr}"

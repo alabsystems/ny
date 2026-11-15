@@ -80,7 +80,6 @@ impl BetaCrownVerifier {
     /// - `intermediate_la`: Map from node name to LinearBounds per domain
     ///
     /// # Reference
-    /// Issue: #1564 (lA matrix caching)
     /// alpha-beta-CROWN: `complete_verifier/tensor_storage.py` (all_lAs storage)
     pub(in crate::beta_crown::engine::graph) fn propagate_crown_batched_with_context_capture_la(
         &self,
@@ -90,7 +89,7 @@ impl BetaCrownVerifier {
         engine: &dyn GemmEngine,
     ) -> Result<BatchedBackwardResult> {
         // Capture intermediate lA only when warm-start is enabled — no point
-        // storing lA that will never be consumed. (#1669)
+        // storing lA that will never be consumed.
         let capture_intermediate = self.config.enable_la_warm_start;
         self.batched_forward_then_backward(
             graph,
@@ -117,6 +116,7 @@ impl BetaCrownVerifier {
         engine: &dyn GemmEngine,
         mode: BatchedBackwardMode<'_>,
     ) -> Result<BatchedBackwardResult> {
+        graph.ensure_proof_eligible()?;
         if ctx.is_empty() {
             return Ok(BatchedBackwardResult {
                 results: Vec::new(),
@@ -125,6 +125,7 @@ impl BetaCrownVerifier {
                 } else {
                     None
                 },
+                intermediate_frontiers: None,
                 stage_timing: None,
             });
         }
@@ -241,7 +242,6 @@ impl BetaCrownVerifier {
 
     /// Like `propagate_crown_with_batched_domains_full` but also returns
     /// forward/backward stage timing for executor-level observability.
-    /// Part of #4398 Packet B.
     pub(in crate::beta_crown::engine::graph) fn propagate_crown_with_batched_domains_full_timed(
         &self,
         graph: &GraphNetwork,
@@ -253,6 +253,7 @@ impl BetaCrownVerifier {
         Vec<Option<DomainCrownResult>>,
         Option<super::BatchedStageTiming>,
     )> {
+        graph.ensure_proof_eligible()?;
         if domains.is_empty() {
             return Ok((Vec::new(), None));
         }

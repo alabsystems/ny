@@ -76,6 +76,16 @@ pub(crate) struct ModelFacts {
     pub(crate) max_conv_out_channels: usize,
     /// On-disk ONNX size in bytes (coarse cross-check on the two above).
     pub(crate) file_size_bytes: u64,
+    /// #router-r5: every node's operator token from the scan (`op_type`, with
+    /// `:const` appended to Add/Sub/Mul/MatMul when an operand is an
+    /// initializer, to Div only when the DIVISOR is one, to Gemm only when A
+    /// or B is one, and `:dynamic` appended to Conv/ConvTranspose whose kernel
+    /// is not one — review fix: the operand POSITION decides linearity), for
+    /// the router's name-blind operator signature. Empty on the printer path
+    /// (the router then treats the signature as a lower bound). Never
+    /// serialized: no plan line or receipt changes.
+    #[serde(skip)]
+    pub(crate) op_tokens: std::collections::BTreeSet<String>,
 }
 
 /// Conv-model scale class for the attack-slice rule (rule 1).
@@ -185,6 +195,7 @@ impl ModelFacts {
             conv_layers,
             max_conv_out_channels,
             file_size_bytes,
+            op_tokens: std::collections::BTreeSet::new(),
         }
     }
 
@@ -211,6 +222,7 @@ impl ModelFacts {
             conv_layers: scan.conv_layers,
             max_conv_out_channels: scan.max_conv_out_channels,
             file_size_bytes: len,
+            op_tokens: scan.op_tokens,
         })
     }
 
@@ -265,6 +277,8 @@ struct GraphScan {
     param_count: usize,
     conv_layers: usize,
     max_conv_out_channels: usize,
+    /// #router-r5: operator tokens (see `ModelFacts::op_tokens`).
+    op_tokens: std::collections::BTreeSet<String>,
 }
 
 type ScanResult<T> = Result<T, &'static str>;
@@ -348,6 +362,11 @@ fn scan_onnx_graph(bytes: &[u8]) -> ScanResult<GraphScan> {
         std::collections::BTreeMap::new();
     let mut conv_weight_names: Vec<&str> = Vec::new();
     let mut conv_layers = 0usize;
+    // #router-r5: operator tokens; the operand-constness of the operators
+    // whose linearity depends on it is resolved after the loop (initializers
+    // follow the nodes).
+    let mut op_tokens: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut operand_ops: Vec<(&str, Vec<&str>)> = Vec::new();
     let mut param_count: u64 = 0;
     let mut i = 0usize;
     while i < graph.len() {
@@ -379,6 +398,14 @@ fn scan_onnx_graph(bytes: &[u8]) -> ScanResult<GraphScan> {
                         conv_weight_names.push(weight);
                     }
                 }
+                if matches!(
+                    op,
+                    "Add" | "Sub" | "Mul" | "Div" | "MatMul" | "Gemm" | "Conv" | "ConvTranspose"
+                ) {
+                    operand_ops.push((op, inputs));
+                } else if !op_tokens.contains(op) {
+                    op_tokens.insert(op.to_owned());
+                }
             }
             _ => {}
         }
@@ -398,10 +425,38 @@ fn scan_onnx_graph(bytes: &[u8]) -> ScanResult<GraphScan> {
         }
     }
 
+    // #router-r5 (review fix): the OPERAND POSITION decides linearity, not
+    // the mere presence of an initializer. `x / c` is linear in `x`, `c / x`
+    // is a reciprocal; `A·B (+C)` is linear in the computed factor only when
+    // A or B is fixed (a fixed bias C decides nothing); a convolution whose
+    // kernel is computed is a bilinear product. Each ambiguous case takes the
+    // token `router::facts::op_kinds` maps to the HARDER kind.
+    for (op, inputs) in operand_ops {
+        let fixed = |k: usize| {
+            inputs
+                .get(k)
+                .is_some_and(|input| init_dims.contains_key(input))
+        };
+        let token = match op {
+            "Div" if fixed(1) => format!("{op}:const"),
+            "Div" => op.to_owned(),
+            "Gemm" if fixed(0) || fixed(1) => format!("{op}:const"),
+            "Gemm" => op.to_owned(),
+            "Conv" | "ConvTranspose" if fixed(1) => op.to_owned(),
+            "Conv" | "ConvTranspose" => format!("{op}:dynamic"),
+            _ if inputs.iter().any(|input| init_dims.contains_key(input)) => {
+                format!("{op}:const")
+            }
+            _ => op.to_owned(),
+        };
+        op_tokens.insert(token);
+    }
+
     Ok(GraphScan {
         param_count: usize::try_from(param_count).map_err(|_| "param count overflow")?,
         conv_layers,
         max_conv_out_channels,
+        op_tokens,
     })
 }
 
@@ -1743,6 +1798,7 @@ pub(crate) fn resolve_and_materialize_with_runtime(
         conv_layers: 0,
         max_conv_out_channels: 0,
         file_size_bytes: 0,
+        op_tokens: std::collections::BTreeSet::new(),
     };
 
     let preset_cfg = match preset_path {
@@ -1943,6 +1999,7 @@ mod tests {
             conv_layers: 19,
             max_conv_out_channels: 128,
             file_size_bytes: 10_156_168,
+            op_tokens: std::collections::BTreeSet::new(),
         }
     }
 
@@ -1954,6 +2011,7 @@ mod tests {
             conv_layers: 20,
             max_conv_out_channels: 256,
             file_size_bytes: 15_243_961,
+            op_tokens: std::collections::BTreeSet::new(),
         }
     }
 
@@ -2008,6 +2066,7 @@ mod tests {
             conv_layers: 19,
             max_conv_out_channels: 128,
             file_size_bytes: 14_475_376,
+            op_tokens: std::collections::BTreeSet::new(),
         };
         assert_eq!(tiny.conv_scale(), ConvScale::Large);
         // No convolutions => no conv rule, whatever the param count.
@@ -2016,6 +2075,7 @@ mod tests {
             conv_layers: 0,
             max_conv_out_channels: 0,
             file_size_bytes: 1,
+            op_tokens: std::collections::BTreeSet::new(),
         };
         assert_eq!(dense.conv_scale(), ConvScale::SmallOrNone);
     }
@@ -2364,6 +2424,7 @@ mod tests {
             conv_layers: 0,
             max_conv_out_channels: 0,
             file_size_bytes: 20_000_000,
+            op_tokens: std::collections::BTreeSet::new(),
         };
         let plan = resolve_plan(&dense, 100, &cpu_backend(), None);
         assert_eq!(plan.disjunctive_pgd_fraction.value, None);
@@ -2607,6 +2668,72 @@ mod tests {
         );
         assert_eq!(scan.conv_layers, 2);
         assert_eq!(scan.max_conv_out_channels, 256);
+        // #router-r5: the operator tokens (review fix: Gemm's B operand is an
+        // initializer, so it is `Gemm:const` = linear; both convolutions read
+        // initializer kernels, so they stay plain `Conv`).
+        let tokens: Vec<&str> = scan.op_tokens.iter().map(String::as_str).collect();
+        assert_eq!(tokens, ["Conv", "Gemm:const", "Relu"]);
+    }
+
+    /// #router-r5 review: the operand POSITION decides linearity. `x / c` is
+    /// linear but `c / x` is a reciprocal; `Gemm(x, y, bias)` with both
+    /// factors computed is bilinear although its bias is an initializer; a
+    /// convolution reading a computed kernel is bilinear. The builder's
+    /// "any operand is an initializer" rule labelled all three linear, so a
+    /// sealed envelope over linear-only evidence would have covered them.
+    #[test]
+    fn router_r5_review_scan_marks_operand_position_not_mere_constness() {
+        let bytes = enc_model(
+            &[
+                enc_tensor("c", &[1]),
+                enc_tensor("bias", &[10]),
+                enc_tensor("k", &[8, 3, 3, 3]),
+            ],
+            &[
+                enc_node("Div", &["c", "x"]),
+                enc_node("Gemm", &["x", "y", "bias"]),
+                enc_node("Conv", &["x", "kernel_from_a_node"]),
+                enc_node("ConvTranspose", &["x", "k"]),
+            ],
+        );
+        let scan = scan_onnx_graph(&bytes).expect("scan");
+        let tokens: Vec<&str> = scan.op_tokens.iter().map(String::as_str).collect();
+        assert_eq!(tokens, ["Conv:dynamic", "ConvTranspose", "Div", "Gemm"]);
+        // The linear positions keep `:const`.
+        let bytes = enc_model(
+            &[enc_tensor("c", &[1]), enc_tensor("w", &[10, 10])],
+            &[enc_node("Div", &["x", "c"]), enc_node("Gemm", &["w", "x"])],
+        );
+        let scan = scan_onnx_graph(&bytes).expect("scan");
+        let tokens: Vec<&str> = scan.op_tokens.iter().map(String::as_str).collect();
+        assert_eq!(tokens, ["Div:const", "Gemm:const"]);
+        // ...and the conv layer count / width witness are unchanged by it.
+        let bytes = enc_model(
+            &[enc_tensor("k", &[8, 3, 3, 3])],
+            &[enc_node("Conv", &["x", "k"]), enc_node("Conv", &["x", "y"])],
+        );
+        let scan = scan_onnx_graph(&bytes).expect("scan");
+        assert_eq!(scan.conv_layers, 2);
+        assert_eq!(scan.max_conv_out_channels, 8);
+    }
+
+    /// #router-r5: a binary operator is `:const` iff an operand is an
+    /// initializer — resolved after the loop, so an initializer serialized
+    /// AFTER its consumer node still counts.
+    #[test]
+    fn scan_marks_binary_operators_with_an_initializer_operand() {
+        let bytes = enc_model(
+            &[enc_tensor("bias", &[10]), enc_tensor("w", &[10, 10])],
+            &[
+                enc_node("MatMul", &["x", "w"]),
+                enc_node("Add", &["h", "bias"]),
+                enc_node("Add", &["h", "skip"]),
+                enc_node("Mul", &["a", "b"]),
+            ],
+        );
+        let scan = scan_onnx_graph(&bytes).expect("scan");
+        let tokens: Vec<&str> = scan.op_tokens.iter().map(String::as_str).collect();
+        assert_eq!(tokens, ["Add", "Add:const", "MatMul:const", "Mul"]);
     }
 
     #[test]

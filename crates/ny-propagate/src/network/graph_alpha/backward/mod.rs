@@ -59,6 +59,20 @@ where
     fallback()
 }
 
+/// A caller-supplied exact dense output seed, and what its rows denote.
+///
+/// `rows_are_specs == false` is the historical gap-attribution face: the rows
+/// are shared-α objectives and per-spec δ must not apply. `true` is the
+/// #vit-margin-alpha certified C-row face: carrier row `j` IS margin row `j`
+/// of the caller's objective, so per-spec δ slots keyed by margin row apply
+/// (`AlphaRowScope::OutputSpecs { subset: None }`), and the walk records the
+/// incoming coefficient rows at every α-bearing bilinear node so the ascent
+/// can differentiate its interpolated McCormick planes.
+struct ExactOutputSeed {
+    seed: LinearBounds,
+    rows_are_specs: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PatchesResourceErrorDisposition {
     /// Preserve the deadline authority and return the error immediately.
@@ -395,7 +409,10 @@ impl GraphNetwork {
                 seed.ncols()
             )));
         }
-        let seed = LinearBounds::from_spec_matrix(seed.clone())?;
+        let seed = ExactOutputSeed {
+            seed: LinearBounds::from_spec_matrix(seed.clone())?,
+            rows_are_specs: false,
+        };
         if Instant::now() >= deadline {
             return Err(NyError::DeadlineExceeded(
                 "DAG alpha-CROWN exact seed deadline expired during validation".to_string(),
@@ -437,6 +454,100 @@ impl GraphNetwork {
         Ok((bounds, intermediate))
     }
 
+    /// #vit-margin-alpha: ONE certified backward seeded with the margin
+    /// C-rows (`seed`, `k × output_dim`) under the given ReLU α state
+    /// (including per-spec δ slots keyed by margin row) and bilinear
+    /// interpolation parameters.
+    ///
+    /// Returns the certified bounds on each seed row (`[k]`, concretized with
+    /// the crate's outward-rounded `concretize_sound`) and, when
+    /// `capture_intermediates`, the per-row A-matrices at every ReLU and at
+    /// every α-bearing bilinear node plus the final input-level relation.
+    ///
+    /// This is the SAME certified walk every DAG α iterate uses — only the
+    /// seed differs — so its output is an enclosure of `seed · f(x)` over the
+    /// input box for every α ∈ [0,1] and r ∈ [0,1]. The margin ascent calls it
+    /// once per iterate and once more, with the committed state, for the
+    /// certify-once publication.
+    ///
+    /// `mul_binary_alphas` (#vit-margin-alpha-complex, P6) is the FROZEN
+    /// MulBinary interpolation state the lane holds fixed when
+    /// `margin_alpha_freeze_mul_reciprocal` admits a MulBinary graph; `None`
+    /// is the historical route (fixed McCormick facets), byte-identical.
+    /// Reciprocal α needs no parameter: it rides in `alpha_state`, which the
+    /// lane never updates for that family.
+    ///
+    /// # Errors
+    ///
+    /// A malformed seed, an expired deadline, or any degradation that would
+    /// otherwise fall back to a full-output CROWN walk: the exact-seed face
+    /// refuses such fallbacks, so an `Ok` always carries the seeded walk's own
+    /// certified bounds.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn dag_alpha_margin_rows_pass(
+        &self,
+        input: &BoundedTensor,
+        node_bounds: &HashMap<String, BoundedTensor>,
+        exec_order: &[String],
+        output_dim: usize,
+        input_dim: usize,
+        relu_name_to_idx: &HashMap<String, usize>,
+        alpha_state: &GraphAlphaState,
+        engine: Option<&dyn GemmEngine>,
+        bilinear_alphas: Option<&HashMap<String, ndarray::Array4<f32>>>,
+        mul_binary_alphas: Option<&HashMap<String, ndarray::Array2<f32>>>,
+        deadline: Option<Instant>,
+        seed: &ndarray::Array2<f32>,
+        capture_intermediates: bool,
+    ) -> Result<(BoundedTensor, Option<GraphAlphaCrownIntermediate>)> {
+        if seed.nrows() == 0 || seed.ncols() != output_dim {
+            return Err(NyError::InvalidSpec(format!(
+                "DAG alpha-CROWN margin rows must be k x {output_dim} with k >= 1, got {}x{}",
+                seed.nrows(),
+                seed.ncols()
+            )));
+        }
+        let exact = ExactOutputSeed {
+            seed: LinearBounds::from_spec_matrix(seed.clone())?,
+            rows_are_specs: true,
+        };
+        let mut gradients = Vec::<Array1<f32>>::new();
+        let mut gradients_upper = Vec::<Array1<f32>>::new();
+        let mut intermediate = capture_intermediates.then(GraphAlphaCrownIntermediate::new);
+        let (bounds, final_linear_bounds, _, _, _) = self.dag_alpha_backward_pass_core(
+            input,
+            node_bounds,
+            exec_order,
+            output_dim,
+            input_dim,
+            relu_name_to_idx,
+            alpha_state,
+            None,
+            &mut gradients,
+            &mut gradients_upper,
+            false,
+            engine,
+            intermediate.as_mut(),
+            bilinear_alphas,
+            mul_binary_alphas,
+            deadline,
+            Some(exact),
+        )?;
+        if final_linear_bounds.is_none() {
+            return Err(NyError::InvalidSpec(
+                "DAG alpha-CROWN margin rows degraded before producing final linear bounds"
+                    .to_string(),
+            ));
+        }
+        if bounds.len() != seed.nrows() {
+            return Err(NyError::ShapeMismatch {
+                expected: vec![seed.nrows()],
+                got: bounds.shape().to_vec(),
+            });
+        }
+        Ok((bounds, intermediate))
+    }
+
     /// Shared backward pass core. When `intermediate` is `Some`, captures A-matrices and
     /// pre-ReLU bounds at each ReLU node for chain-rule gradient computation.
     ///
@@ -466,7 +577,7 @@ impl GraphNetwork {
         bilinear_alphas: Option<&HashMap<String, ndarray::Array4<f32>>>,
         mul_binary_alphas: Option<&HashMap<String, ndarray::Array2<f32>>>,
         deadline: Option<Instant>,
-        exact_output_seed: Option<LinearBounds>,
+        exact_output_seed: Option<ExactOutputSeed>,
     ) -> Result<(
         BoundedTensor,
         Option<LinearBounds>,
@@ -508,7 +619,7 @@ impl GraphNetwork {
             .collect();
         bounds_by_idx.push(Some(input)); // NETWORK_INPUT
 
-        // Phase 1: CrownBounds-aware initialization (#3293).
+        // Phase 1: CrownBounds-aware initialization.
         // Patches mode for 3D spatial output with Conv2d; matrix mode with cuts
         // (reference: abcrown.py:228-231).
         let mut node_crown_bounds = CrownMergeAccumulator::new_indexed(exec_order);
@@ -527,7 +638,12 @@ impl GraphNetwork {
         let has_conv2d = nodes_by_idx
             .iter()
             .any(|n| matches!(n.layer, Layer::Conv2d(_)));
-        let exact_seed_rows = if let Some(seed) = exact_output_seed.as_ref() {
+        // #vit-margin-alpha: resolved before the seed is moved into the walk.
+        let exact_seed_rows_are_specs = exact_output_seed
+            .as_ref()
+            .is_some_and(|exact| exact.rows_are_specs);
+        let exact_seed_rows = if let Some(exact) = exact_output_seed.as_ref() {
+            let seed = &exact.seed;
             if seed.num_outputs() == 0
                 || seed.num_inputs() != output_dim
                 || output_bounds.len() != output_dim
@@ -569,7 +685,7 @@ impl GraphNetwork {
         } else {
             crate::output_margin_seed::margin_subset_indices(output_dim)
         };
-        let initial_crown_bounds = if let Some(seed) = exact_output_seed {
+        let initial_crown_bounds = if let Some(ExactOutputSeed { seed, .. }) = exact_output_seed {
             debug!(
                 "DAG alpha-CROWN: exact dense output seed engaged (k={} of {} columns)",
                 seed.num_outputs(),
@@ -609,7 +725,12 @@ impl GraphNetwork {
         // output row (a k-row subset seed makes j a compact index, never a
         // spec id). The Patches seed keeps δ off until slice 3 wires the 7-D
         // arm; refresh walks never construct this context at all.
-        let row_scope = if exact_seed_rows.is_some() || use_patches_seed {
+        //
+        // #vit-margin-alpha: the certified C-row face's rows ARE the caller's
+        // margin rows (identity map), so δ slots keyed by margin row apply.
+        let row_scope = if exact_seed_rows_are_specs {
+            AlphaRowScope::OutputSpecs { subset: None }
+        } else if exact_seed_rows.is_some() || use_patches_seed {
             AlphaRowScope::Shared
         } else {
             AlphaRowScope::OutputSpecs {
@@ -621,6 +742,8 @@ impl GraphNetwork {
 
         // Track if we've accumulated bounds to the input
         let mut input_accumulated = false;
+        let mut attention_regions =
+            crate::network::graph_crown::attention_region::AttentionRegionQuery::new(deadline);
 
         // We need a mutable reference to the intermediate that persists across the loop,
         // so rebind it here.
@@ -671,7 +794,7 @@ impl GraphNetwork {
                 crate::patches_carrier_trace::enter_node("dag-alpha", node_name);
             }
 
-            // #3813 Slice 5: Dense→Patches re-entry at Conv2d boundaries.
+            // Dense→Patches re-entry at Conv2d boundaries.
             // Mirror of propagation.rs:455-490 for alpha-CROWN.
             // When classifier-head logits reach a Conv2d node through Dense rows
             // (after Linear/Flatten), convert to Patches so the Conv2d/ReLU Patches
@@ -697,7 +820,7 @@ impl GraphNetwork {
             // Use first input (not require_unary_input) because multi-input nodes
             // like MulBinary, BilinearCrown, Div, and Where resolve their full
             // input sets in their specific handlers or the shared dispatch core.
-            // Fix: #4113 (regression from #4097 tightening require_unary_input).
+            // Requiring a unary input here was a regression for those nodes.
             let first_input = node.inputs.first().map(String::as_str).ok_or_else(|| {
                 NyError::InvalidSpec(format!(
                     "Node '{}' ({}) has no inputs",
@@ -783,7 +906,7 @@ impl GraphNetwork {
 
             let is_patches = matches!(&node_cb, CrownBounds::Patches(_));
 
-            // === Non-ReLU Patches fast-path (#3293) ===
+            // === Non-ReLU Patches fast-path ===
             if is_patches && node.inputs.len() == 1 {
                 let memory_fallback_details = match crown_backward_step_patches(
                     &node.layer,
@@ -893,7 +1016,7 @@ impl GraphNetwork {
                 }
             }
 
-            // === Patches residual passthrough for Add/Sub (#4382) ===
+            // === Patches residual passthrough for Add/Sub ===
             match crate::network::core::graph::backward_helpers::try_apply_patches_residual_passthrough_with_deadline(
                 self,
                 node,
@@ -981,6 +1104,45 @@ impl GraphNetwork {
                 unreachable!("successful Dense-boundary preparation must publish Dense")
             };
             let node_lb = Self::apply_invprop_constraints(node_name, node_lb, invprop_state);
+            // A checked region replaces only this PV contribution. Other
+            // pending paths and the original alpha/proposal authority remain.
+            if !track_gradients
+                && intermediate.is_none()
+                && attention_regions.try_scalar(
+                    self,
+                    node,
+                    &node_lb,
+                    input,
+                    node_bounds,
+                    &mut node_crown_bounds,
+                    output_dim,
+                    input_dim,
+                    &mut input_accumulated,
+                    deadline,
+                )?
+            {
+                continue;
+            }
+
+            // #vit-margin-alpha (B4): on the certified C-row face only, record
+            // the incoming LOWER coefficient rows at every α-bearing bilinear
+            // node so the margin ascent can differentiate its interpolated
+            // McCormick planes. Every other walk (including the legacy
+            // AnalyticChain replay) records nothing and is byte-identical.
+            // Membership in the interpolation map IS the node test: its keys
+            // are exactly the `BilinearCrown` nodes the DAG init seeded plus
+            // the var×var `MatMul` nodes the margin ascent added, so no layer
+            // match is written here (this function is a dispatch-coverage
+            // site whose layer-reference set is pinned).
+            if exact_seed_rows_are_specs
+                && bilinear_alphas.is_some_and(|alphas| alphas.contains_key(node_name.as_str()))
+            {
+                if let Some(inter) = intermediate.as_deref_mut() {
+                    let retained = inter.logical_memory_bytes();
+                    let lower_a = node_lb.try_clone_lower_a_with_deadline(deadline, retained)?;
+                    inter.a_at_bilinear.insert(node_name.clone(), lower_a);
+                }
+            }
 
             // Try GPU suffix: if the remaining backward chain from this node to
             // NETWORK_INPUT is a GPU-extractable unary chain, offload the entire
@@ -1072,7 +1234,7 @@ impl GraphNetwork {
                 norm_inv_rms_override: None,
             };
 
-            // #3813: Catch ShapeMismatch from Dense Conv2d backward when graph
+            // Catch ShapeMismatch from Dense Conv2d backward when graph
             // restructuring (e.g., RSPLITTER) changes intermediate dimensions.
             // Fall back to plain CROWN (same as Unsupported path below).
             let result = match dispatch_backward_layer(&ctx, &node_lb) {

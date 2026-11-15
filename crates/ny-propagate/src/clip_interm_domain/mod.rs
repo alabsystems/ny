@@ -31,7 +31,6 @@
 //!
 //! ## References
 //!
-//! - Design: `designs/2026-01-29-clip-interm-domain.md`
 //! - Baseline: α,β-CROWN `complete_verifier/domain_clipper.py`
 //! - Paper: Wei et al., "Clip and Verify" (arXiv:2512.11087)
 

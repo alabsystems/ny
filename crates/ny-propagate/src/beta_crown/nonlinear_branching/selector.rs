@@ -16,7 +16,10 @@ impl NonlinearBranching {
     ///
     /// # Arguments
     /// * `network` - The graph network being verified
-    /// * `node_bounds` - Current bounds for each node in the network
+    /// * `node_bounds` - Current OUTPUT bounds of each node, keyed by node name
+    ///   (the domain's `node_bounds`), plus the network input under
+    ///   `NETWORK_INPUT`. A split node is scored on its INPUT's entry, never
+    ///   its own (#genbab-selector-convention).
     /// * `split_nodes` - Names of nodes eligible for splitting
     ///
     /// # Returns
@@ -137,19 +140,63 @@ impl NonlinearBranching {
                 continue;
             }
 
-            let bounds = match node_bounds.get(node_name) {
+            // Elementwise activations (#genbab-selector-convention): score on
+            // the node's INPUT interval, `node_bounds[node.inputs[0]]`.
+            //
+            // `node_bounds` is keyed by node name and holds each node's OUTPUT
+            // bounds (the constrained forward pass writes a ReLU's
+            // post-activation interval under the ReLU's own name). This used
+            // to read `node_bounds[node_name]` — the POST-activation interval —
+            // which broke GenBaB in two ways:
+            //   * a ReLU's post-activation lower bound is >= 0, so `score_neurons`
+            //     dropped EVERY ReLU neuron as stable: GenBaB never branched a
+            //     ReLU (ml4acopf's MLP ReLUs and ~33k lookup-table hinges);
+            //   * Sigmoid/Sin/Cos split points were computed in OUTPUT space and
+            //     then applied by `with_general_split` to the INPUT interval, so
+            //     a point outside it gave an empty child plus an unchanged one —
+            //     a no-op split re-picked until the depth cap.
+            // `find_splittable_graph_nodes` and `with_general_split` both read
+            // `node.inputs[0]`; this now agrees with them. Both production
+            // callers insert the network input under `NETWORK_INPUT`, so an
+            // activation fed directly by the input resolves too.
+            //
+            // SOUNDNESS: search-only. Children of any split union-cover the
+            // parent (see `points_strictly_partition`), and each child bound is
+            // produced by the same constrained propagation as before.
+            let pre_name = match node.inputs.first() {
+                Some(name) => name.as_str(),
+                None => continue,
+            };
+            let bounds = match node_bounds.get(pre_name) {
                 Some(b) => b,
                 None => continue,
             };
 
             // Score each neuron in this node
             let neuron_decisions = self.score_neurons(node_name, &node.layer, bounds)?;
+            // #genbab-selector-convention engagement: ReLU/Sign neurons that
+            // reach the candidate list at all (0 on the pre-fix selector).
+            if matches!(node.layer, Layer::ReLU(_) | Layer::Sign(_)) {
+                super::telemetry::record_zero_threshold_candidates(neuron_decisions.len());
+            }
             candidates.extend(neuron_decisions);
         }
 
-        // Sort by score (descending, NaN last — #2995) and return top-k
+        // Sort by score (descending, NaN last) and return top-k
         candidates.sort_by(|a, b| crate::cmp_utils::nan_last_descending_cmp(&a.score, &b.score));
         candidates.truncate(self.config.num_candidates);
+
+        // #genbab-selector-convention engagement observable. Every caller
+        // branches on `candidates[0]`, so that is the decision recorded.
+        super::telemetry::note_selector_armed();
+        if let Some(top) = candidates.first() {
+            let top_layer = top
+                .layer
+                .as_name()
+                .and_then(|name| network.node(name))
+                .map(|node| &node.layer);
+            super::telemetry::record_selection(top, top_layer);
+        }
         Ok(candidates)
     }
 
@@ -161,8 +208,7 @@ impl NonlinearBranching {
     /// Both BilinearCrown and MulBinary are McCormick-relaxed bilinear ops:
     /// splitting either input directly reduces the McCormick envelope gap
     /// (ux−lx)(uy−ly)/4, enabling BaB to close the relaxation error that
-    /// frozen root facets cannot. See designs/2026-03-04-286-attention-bilinear-alternative.md
-    /// Approach C.
+    /// frozen root facets cannot.
     ///
     /// SOUNDNESS: splittability only adds a candidate to the search; the
     /// resulting child bound is still produced by the directed-rounded

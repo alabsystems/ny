@@ -6,7 +6,7 @@
 //! Run it explicitly with:
 //!
 //! ```text
-//! cargo run --release -p ny-propagate --example audit_envelopes_snakecompare
+//! targo --unverified run --release -p ny-propagate --example audit_envelopes_snakecompare
 //! ```
 //
 // Obligation under test, for a `LinearRelaxation` produced from [l, u]:

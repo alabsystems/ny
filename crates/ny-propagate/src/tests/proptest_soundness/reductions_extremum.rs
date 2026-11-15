@@ -210,7 +210,7 @@ proptest! {
         );
     }
 
-    /// ReduceMax batched CROWN backward with identity bounds (#287).
+    /// ReduceMax batched CROWN backward with identity bounds.
     ///
     /// Tests propagate_linear_batched for ReduceMax (last axis, keepdims=true).
     /// With identity batched bounds, concretized results should contain all
@@ -287,7 +287,7 @@ proptest! {
         );
     }
 
-    /// ReduceMin batched CROWN backward with identity bounds (#287).
+    /// ReduceMin batched CROWN backward with identity bounds.
     ///
     /// Tests propagate_linear_batched for ReduceMin (last axis, keepdims=true).
     /// Verifies bounds are finite, ordered, and contain the center point's min.
@@ -443,7 +443,7 @@ proptest! {
 
     /// The center-point argmax/argmin can change at another valid point in the box.
     /// The soundness scanner must therefore report fixed-index ReduceMax/ReduceMin
-    /// as heuristic for CROWN-family methods instead of Sound (#3698).
+    /// as heuristic for CROWN-family methods instead of Sound.
     #[ntest::timeout(10000)]
     #[test]
     fn reduce_extremum_fixed_index_can_change_under_perturbation(scale in 1.0f32..100.0f32) {

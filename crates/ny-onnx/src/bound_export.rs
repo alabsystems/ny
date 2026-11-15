@@ -234,7 +234,7 @@ mod tests {
         export_bounds_safetensors(&node_bounds, &path).expect("export");
 
         let file_bytes = std::fs::read(&path).expect("read file");
-        assert!(!file_bytes.is_empty());
+        assert_ne!((file_bytes).len(), 0);
         let loaded = safetensors::SafeTensors::deserialize(&file_bytes).expect("deserialize");
         // 2 nodes × 2 tensors (lower + upper) = 4 tensors.
         assert_eq!(loaded.len(), 4, "expected 4 tensors in file");

@@ -197,6 +197,7 @@ def _make_install_fixture(tmp_path: Path, *, prebuilt_exit: int = 0) -> Path:
         """,
     )
     _write_executable(fake_bin / "cargo", "#!/bin/bash\nexit 99\n")
+    _write_executable(fake_bin / "targo", "#!/bin/bash\nexit 99\n")
     _write_executable(
         fake_bin / "git",
         '#!/bin/bash\necho git >> "${FAKE_COMMAND_LOG}"\nexit 1\n',

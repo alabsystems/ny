@@ -15,7 +15,7 @@
 //! - This keeps the public API in one place while splitting implementation
 //!
 //! ## Module map
-//! - `backward_node_dispatch`: shared per-node backward dispatch helpers (#3935)
+//! - `backward_node_dispatch`: shared per-node backward dispatch helpers
 //! - `helpers`: graph-pattern helpers (ex: softmax decomposition detection)
 //! - `propagation`: core CROWN backward pass (spec-free)
 //! - `point_vjp`: fast f32 point back-prop (exact point-Jacobian) for PGD attack
@@ -24,11 +24,13 @@
 //! - `spec_propagation`: spec-guided CROWN plus linear-bound extraction/fallback
 //! - `utils`: GraphNetwork helpers for accumulating/sanitizing bounds
 
+pub(crate) mod attention_region;
 mod backward_node_dispatch;
 mod helpers;
 mod point_vjp;
 pub(crate) mod point_vjp_batched;
 pub(crate) mod point_vjp_batched_resnet;
+pub(crate) mod point_vjp_batched_side;
 mod propagation;
 pub(crate) mod spec_propagation;
 mod utils;
@@ -42,6 +44,7 @@ pub use point_vjp_batched::{point_vjp_forward_masks, PointVjpBatchPlan};
 pub use point_vjp_batched_resnet::{
     point_vjp_resnet_forward_masks, PointVjpResnetPlan, PointVjpWavePlan,
 };
+pub use point_vjp_batched_side::{PointVjpF64Plan, PointVjpF64Tape};
 
 #[cfg(test)]
 #[path = "backward_node_dispatch_tests.rs"]

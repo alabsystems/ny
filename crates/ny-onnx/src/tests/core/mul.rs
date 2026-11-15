@@ -185,7 +185,7 @@ fn test_convert_mul_scale_attribute_to_mul_constant() {
     let layer = model.convert_layer(&spec).unwrap();
     match layer {
         PropLayer::MulConstant(layer) => {
-            assert!(layer.constant().shape().is_empty());
+            assert_eq!((layer.constant().shape()).len(), 0);
             let value = *layer
                 .constant()
                 .iter()
@@ -469,7 +469,7 @@ fn test_convert_mul_both_constants_returns_scalar_mul_constant() {
     let layer = model.convert_layer(&spec).unwrap();
     match layer {
         PropLayer::MulConstant(layer) => {
-            assert!(layer.constant().shape().is_empty());
+            assert_eq!((layer.constant().shape()).len(), 0);
             let value = *layer
                 .constant()
                 .iter()

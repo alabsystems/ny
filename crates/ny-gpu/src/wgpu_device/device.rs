@@ -20,7 +20,7 @@ pub struct AdapterProbe {
     pub device_type: String,
 }
 
-/// All pipeline + bind group layout pairs, extracted for function size (#3397).
+/// All pipeline + bind group layout pairs, extracted for function size.
 pub(super) struct PipelineSet {
     pub(super) linear_ibp: (wgpu::ComputePipeline, wgpu::BindGroupLayout),
     pub(super) matmul_ibp: (wgpu::ComputePipeline, wgpu::BindGroupLayout),
@@ -98,15 +98,24 @@ impl WgpuDevice {
         let (adapter, adapter_info) = Self::request_adapter().await?;
         info!("wgpu adapter: {}", Self::format_adapter_info(&adapter_info));
         // Resolve the shader-loading profile from the adapter's live capability,
-        // never its name. AUTO enables DenormPreserve only when passthrough is
-        // advertised; forced `1` refuses here if it cannot possibly work. The
-        // complete verdict ladder still measures the exact created device and
-        // is the only route to authority. A programmatic ForcedDisabled
-        // override (#flush-charge admission-config) instead forces the
-        // plain-WGSL path for every module on this device, refusing only when
-        // the user explicitly pinned `NY_GPU_DENORM_PRESERVE=1` (env wins).
+        // never its name. AUTO enables DenormPreserve only when the adapter can
+        // load the injected SPIR-V module through passthrough; forced `1`
+        // refuses here if it cannot possibly work. The complete verdict ladder
+        // still measures the exact created device and is the only route to
+        // authority. A programmatic ForcedDisabled override (#flush-charge
+        // admission-config) instead forces the plain-WGSL path for every module
+        // on this device, refusing only when the user explicitly pinned
+        // `NY_GPU_DENORM_PRESERVE=1` (env wins).
+        //
+        // `PASSTHROUGH_SHADERS` alone is not that capability: wgpu reads the
+        // SPIR-V payload only on Vulkan, and Metal advertises the feature for
+        // MSL. Testing the feature alone requested passthrough on every Apple
+        // device, every module then fell back and poisoned the loading-path
+        // contract, and verdict qualification refused before its ladder ran
+        // (`ny_gpu_passthrough::spirv_passthrough_supported` has the detail).
         let adapter_features = adapter.features();
-        let passthrough_supported = adapter_features.contains(wgpu::Features::PASSTHROUGH_SHADERS);
+        let passthrough_supported =
+            ny_gpu_passthrough::spirv_passthrough_supported(adapter_features, adapter_info.backend);
         let (denorm_preserve_policy, denorm_preserve_enabled) = match denorm_override {
             None => super::shader_loading::resolve_denorm_preserve(passthrough_supported)?,
             Some(super::shader_loading::DenormPreservePolicy::ForcedDisabled) => {
@@ -255,7 +264,7 @@ impl WgpuDevice {
             crown_host_timing_profile: std::sync::Mutex::new(CrownHostTimingProfileState::default()),
             crown_timestamp_profile: std::sync::Mutex::new(CrownTimestampProfileState::default()),
             uncaptured_errors,
-            gpu_serialize: std::sync::Mutex::new(()),
+            gpu_serialize: std::sync::Arc::new(std::sync::Mutex::new(())),
             crown_backward_deadline: std::sync::Mutex::new(None),
             f32_selfcheck: std::sync::OnceLock::new(),
             eft_selfcheck: std::sync::OnceLock::new(),

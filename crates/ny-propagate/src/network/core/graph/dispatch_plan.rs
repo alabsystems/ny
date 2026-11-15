@@ -11,10 +11,8 @@
 //! Reference pattern: DAG alpha-CROWN backward (`backward/mod.rs:186-263`)
 //! already uses inline `name_to_idx` / `nodes_by_idx` / `bounds_by_idx` Vecs.
 //! This struct extracts that pattern into a reusable artifact.
-//!
-//! Design: `designs/2026-03-21-issue-4258-crown-dispatch-plan-compiled.md` Phase 2.
 
-use std::collections::HashMap;
+use super::structural_map::TrackedStringMap;
 
 use ny_core::{NyError, Result};
 
@@ -40,7 +38,7 @@ pub(crate) struct CrownDispatchPlan {
     pub reverse_order: Vec<usize>,
 
     /// Map from node name to sequential index.
-    pub name_to_idx: HashMap<String, usize>,
+    pub name_to_idx: SharedNameIndex,
     /// Map from sequential index to node name.
     pub idx_to_name: Vec<String>,
 
@@ -84,7 +82,7 @@ impl CrownDispatchPlan {
         let network_input_idx = node_count; // sentinel at end
 
         // Build bidirectional name↔index maps.
-        let mut name_to_idx = HashMap::with_capacity(node_count + 1);
+        let mut name_to_idx = TrackedStringMap::with_capacity(node_count + 1);
         let mut idx_to_name = Vec::with_capacity(node_count + 1);
 
         for (i, name) in exec_order.iter().enumerate() {
@@ -135,7 +133,7 @@ impl CrownDispatchPlan {
         Ok(Self {
             exec_order: forward_order,
             reverse_order,
-            name_to_idx,
+            name_to_idx: SharedNameIndex::from_map(name_to_idx),
             idx_to_name,
             routes,
             has_conv2d,
@@ -147,7 +145,7 @@ impl CrownDispatchPlan {
     /// Classify a node into its dispatch route based on layer arity and input edges.
     fn classify_node(
         node: &super::GraphNode,
-        name_to_idx: &HashMap<String, usize>,
+        name_to_idx: &TrackedStringMap<usize>,
     ) -> Result<DispatchRoute> {
         let resolve = |input_name: &str| -> Result<usize> {
             name_to_idx.get(input_name).copied().ok_or_else(|| {
@@ -222,6 +220,10 @@ impl CrownDispatchPlan {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "dispatch_plan_allocation.rs"]
+mod allocation_receipt;
 
 #[cfg(test)]
 mod tests {
@@ -392,3 +394,7 @@ mod tests {
         assert_ne!(rebuilt_plan.output_node_idx, original_output_idx);
     }
 }
+
+#[path = "shared_name_index.rs"]
+mod shared_name_index;
+pub(crate) use shared_name_index::SharedNameIndex;

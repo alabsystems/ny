@@ -118,6 +118,191 @@ pub(super) fn select_mccormick_plane(
     }
 }
 
+/// Widen one accumulated McCormick/envelope CONSTANT outward by a certified
+/// bound on its own floating-point error (#mul-mccormick-const).
+///
+/// # The defect this closes
+///
+/// Every `propagate_linear_*` driver below folds the envelope constant as
+/// `const += w * c` in PLAIN round-to-nearest f64 and published it with no error
+/// term at all — only the final directed `f64 -> f32` cast. That cast covers the
+/// NARROWING and nothing else, so two distinct errors reached the verdict path
+/// uncharged, in the very functions whose COEFFICIENT half is already certified
+/// through `new_or_conservative_with_err` / `set_coeff_err`:
+///
+/// 1. **f64 accumulation.** Recursive summation of `adds + 1` summands satisfies
+///    `|fl(S) - S| <= gamma^f64_{adds} * sum|summand|` (Higham, *Accuracy and
+///    Stability*, Thm 3.1). The charge scales with the MAGNITUDE sum, not with
+///    `|S|`, so it does NOT vanish under cancellation — which is exactly when a
+///    result-scaled 1-ULP cast allowance under-counts it. Concretely, terms
+///    `+2^60`, `4096 x -1`, `-2^60` fold to EXACTLY `0.0` in f64 (`ulp(2^60) =
+///    256` swallows every `-1`) where the true constant is `-4096`; the old
+///    publication emitted `next_down_f32(0.0) = -1.4e-45`, a lower plane sitting
+///    `4096` ABOVE the true one.
+/// 2. **The plane constant itself.** In `McCormick` mode the `c` reaching this
+///    fold is `fl32(-lx*ly)` (or one of the three sibling corner products from
+///    [`select_mccormick_plane`]) — ONE round-to-nearest f32 multiply away from
+///    the exact McCormick constant, with NO outward margin. The exact lower plane
+///    `L1` satisfies `x*y - (ly*x + lx*y - lx*ly) = (x-lx)(y-ly) >= 0` with ZERO
+///    slack at the corner `(lx, ly)`, so a `c` that rounded UP by even half an
+///    ULP lifts the "lower" plane strictly ABOVE the bilinear surface there.
+///    (The `Middle`/alpha modes route through
+///    `bilinear::mccormick::certify_plane_constant`, which already rounds each
+///    plane constant OUTWARD, so for them this second charge is redundant slack
+///    rather than a repair. It is still applied: one uniform certificate cannot
+///    drift out of sync with the mode dispatch above it.)
+///
+/// # The certificate
+///
+/// ```text
+/// S_safe        = magnitude_sum      / (1 - gamma^f64_{adds+1})
+/// S_terms_safe  = term_magnitude_sum / (1 - gamma^f64_{adds+1})
+/// err           = gamma^f64_{adds+1} * S_safe  +  gamma^f32_3 * S_terms_safe
+/// out           = down(accumulated - err)   /   up(accumulated + err)
+/// ```
+///
+/// The `1/(1 - gamma)` inflation mirrors `conv2d::bound` and the certified twin
+/// `MatMulLayer::propagate_linear_binary` (`binary_ops/matmul/crown_dense.rs`,
+/// #matmul-dense-mccormick-const), which folds the SAME `sum w*c` over planes
+/// from the SAME [`select_mccormick_plane`] and must certify the same thing:
+/// `magnitude_sum` is itself an f64 round-to-nearest sum of non-negative values
+/// and can fall SHORT of the true magnitude sum by its own accumulation deficit,
+/// so charging against the raw figure could under-bound the very error it is
+/// meant to cover. The final directed f64 step absorbs the rounding of the
+/// widening subtract/add.
+///
+/// # Direction
+///
+/// `err >= 0` always (`gamma >= 0`, both magnitude sums are sums of `abs`
+/// values, `inflate >= 1`), so a `Lower` constant only ever moves DOWN and an
+/// `Upper` constant only ever moves UP. `adds == 0` returns the input
+/// bit-identically: no f64 addition ran and no plane was consumed, so there is
+/// genuinely nothing to charge. A NaN anywhere fails CLOSED to the infinite
+/// constant, which is strictly safer than the previous behaviour (a NaN bias
+/// tripped `validate_no_nan` and degraded the WHOLE relation, both directions,
+/// to `conservative`).
+fn widen_mccormick_constant(
+    accumulated: f64,
+    magnitude_sum: f64,
+    term_magnitude_sum: f64,
+    adds: usize,
+    dir: BoundDir,
+) -> f64 {
+    let trivial = match dir {
+        BoundDir::Lower => f64::NEG_INFINITY,
+        BoundDir::Upper => f64::INFINITY,
+    };
+    if adds == 0 {
+        // `accumulated` is the exact f64 image of the incoming f32 bias.
+        return accumulated;
+    }
+    let gamma_acc = crate::layers::linear::crown_single_gamma_n_f64(adds.saturating_add(1));
+    let inflate = if gamma_acc < 1.0 {
+        1.0 / (1.0 - gamma_acc)
+    } else {
+        f64::INFINITY
+    };
+    // Two f32 roundings per term are possible (the plane's own corner product,
+    // and any f32 scaling folded into it) plus one step of slack.
+    let gamma_plane = crate::layers::linear::crown_single_gamma_n_f32(3);
+    let err = gamma_acc * (magnitude_sum * inflate) + gamma_plane * (term_magnitude_sum * inflate);
+    if err.is_nan() {
+        return trivial;
+    }
+    if err <= 0.0 {
+        return accumulated;
+    }
+    let widened = match dir {
+        BoundDir::Lower => accumulated - err,
+        BoundDir::Upper => accumulated + err,
+    };
+    if widened.is_nan() {
+        return trivial;
+    }
+    match dir {
+        BoundDir::Lower => widened.next_down(),
+        BoundDir::Upper => widened.next_up(),
+    }
+}
+
+/// Running McCormick/envelope CONSTANT fold that carries its own Higham
+/// certificate (#mul-mccormick-const).
+///
+/// Replaces the bare `const_lower += w as f64 * c as f64` chains in all three
+/// CROWN-backward drivers below. Every driver folds the same shape — an incoming
+/// f32 bias plus one `w * plane_const` product per inner-loop step — so the
+/// certificate lives in ONE place and cannot drift between the scalar, alpha and
+/// batched arms the way the uncertified `+=` chains did.
+///
+/// `magnitude_sum` carries the incoming bias (the f64 accumulation charge is
+/// against EVERY summand); `term_magnitude_sum` excludes it (the per-term f32
+/// plane-rounding charge applies only to the plane terms). `adds` counts the f64
+/// additions actually performed, so a term-free fold charges exactly zero and is
+/// published bit-identically to the historical directed-cast result.
+struct McCormickConstFold {
+    accumulated: f64,
+    magnitude_sum: f64,
+    term_magnitude_sum: f64,
+    adds: usize,
+    dir: BoundDir,
+}
+
+impl McCormickConstFold {
+    /// Seed the fold with the incoming relation's f32 bias (exact in f64).
+    #[inline]
+    fn new(bias: f32, dir: BoundDir) -> Self {
+        let accumulated = f64::from(bias);
+        Self {
+            accumulated,
+            magnitude_sum: accumulated.abs(),
+            term_magnitude_sum: 0.0,
+            adds: 0,
+            dir,
+        }
+    }
+
+    /// Fold in one `w * plane_const` term and record its magnitude.
+    ///
+    /// The product is EXACT in f64 (an f32 x f32 product needs <= 48 < 53
+    /// significand bits), so the ONLY rounding introduced here is the f64 `+=`
+    /// — which is precisely what [`widen_mccormick_constant`] charges for.
+    #[inline]
+    fn add_term(&mut self, w: f32, plane_const: f32) {
+        let term = f64::from(w) * f64::from(plane_const);
+        self.accumulated += term;
+        let magnitude = term.abs();
+        self.magnitude_sum += magnitude;
+        self.term_magnitude_sum += magnitude;
+        self.adds += 1;
+    }
+
+    /// Collapse the fold to its trivially-true constant (`-inf` lower, `+inf`
+    /// upper) after a non-finite input box, and poison the magnitude sums so the
+    /// certificate can never certify a finite value out of a poisoned fold.
+    #[inline]
+    fn force_trivial(&mut self) {
+        self.accumulated = match self.dir {
+            BoundDir::Lower => f64::NEG_INFINITY,
+            BoundDir::Upper => f64::INFINITY,
+        };
+        self.magnitude_sum = f64::INFINITY;
+        self.term_magnitude_sum = f64::INFINITY;
+        self.adds = self.adds.saturating_add(1);
+    }
+
+    /// Publish the certified-outward f64 constant.
+    #[inline]
+    fn finish(&self) -> f64 {
+        widen_mccormick_constant(
+            self.accumulated,
+            self.magnitude_sum,
+            self.term_magnitude_sum,
+            self.adds,
+            self.dir,
+        )
+    }
+}
+
 impl MulBinaryLayer {
     /// Propagate IBP bounds through element-wise multiplication with broadcasting.
     ///
@@ -280,7 +465,7 @@ impl MulBinaryLayer {
         let n_a = input_a_bounds.len();
         let n_b = input_b_bounds.len();
 
-        // Verify shapes are broadcastable to the output dimension (#3499).
+        // Verify shapes are broadcastable to the output dimension.
         // The forward pass uses NumPy-style broadcasting: [512,5] * [512,1] → [512,5].
         // CROWN backward must reduce coefficients for broadcast inputs by summing
         // along the broadcast dimensions (alpha-beta-CROWN: reduce_broadcast_dims).
@@ -335,18 +520,24 @@ impl MulBinaryLayer {
         let mut lower_s_b = Array2::<f64>::zeros((num_outputs, n_b));
         let mut upper_s_a = Array2::<f64>::zeros((num_outputs, n_a));
         let mut upper_s_b = Array2::<f64>::zeros((num_outputs, n_b));
-        // Bias accumulation uses f64 to prevent catastrophic cancellation (#2471):
+        // Bias accumulation uses f64 to prevent catastrophic cancellation:
         // McCormick constant terms involve products of input bounds (e.g., -lx*ly, -ux*uy).
         // When accumulated across large inner dimensions (4096+ for SwiGLU), f32 loses
         // significant bits from alternating-sign cancellation.
-        // Same pattern as crown_dense.rs and common/mod.rs (#1745).
+        // Same pattern as crown_dense.rs and common/mod.rs.
+        // f64 REDUCES that cancellation; it does not ELIMINATE it, and the residual
+        // was published uncharged until #mul-mccormick-const. The fold now runs
+        // through `McCormickConstFold`, which carries the Higham magnitude sum
+        // alongside the running total and discharges it OUTWARD at `finish()`.
         let mut lower_b_total = Array1::<f64>::zeros(num_outputs);
         let mut upper_b_total = Array1::<f64>::zeros(num_outputs);
 
         // Process each output dimension
         for out_idx in 0..num_outputs {
-            let mut const_lower = bounds.lower_b()[out_idx] as f64;
-            let mut const_upper = bounds.upper_b()[out_idx] as f64;
+            let mut const_lower =
+                McCormickConstFold::new(bounds.lower_b()[out_idx], BoundDir::Lower);
+            let mut const_upper =
+                McCormickConstFold::new(bounds.upper_b()[out_idx], BoundDir::Upper);
 
             // For each output element position (element-wise: z[j] = x[a_j] * y[b_j]
             // where a_j/b_j follow broadcast mapping).
@@ -354,7 +545,7 @@ impl MulBinaryLayer {
                 let w_lower = bounds.lower_a()[[out_idx, j]];
                 let w_upper = bounds.upper_a()[[out_idx, j]];
 
-                // Broadcast-aware indexing (#3499): a_idx/b_idx map the output
+                // Broadcast-aware indexing: a_idx/b_idx map the output
                 // flat index j to the corresponding input element. For non-broadcast
                 // inputs these are identity (a_idx == j); for broadcast inputs
                 // (e.g., SE block [512,1] → [512,5]) multiple j values map to
@@ -391,7 +582,7 @@ impl MulBinaryLayer {
                         lower_a_b[[out_idx, b_idx]] += w_lower * ay_l;
                         lower_s_a[[out_idx, a_idx]] += (w_lower as f64).abs() * (ax_l as f64).abs();
                         lower_s_b[[out_idx, b_idx]] += (w_lower as f64).abs() * (ay_l as f64).abs();
-                        const_lower += w_lower as f64 * c_l as f64;
+                        const_lower.add_term(w_lower, c_l);
 
                         // Select McCormick plane for upper bound computation
                         let (ax_u, ay_u, c_u) = select_mccormick_plane(
@@ -408,7 +599,7 @@ impl MulBinaryLayer {
                         upper_a_b[[out_idx, b_idx]] += w_upper * ay_u;
                         upper_s_a[[out_idx, a_idx]] += (w_upper as f64).abs() * (ax_u as f64).abs();
                         upper_s_b[[out_idx, b_idx]] += (w_upper as f64).abs() * (ay_u as f64).abs();
-                        const_upper += w_upper as f64 * c_u as f64;
+                        const_upper.add_term(w_upper, c_u);
                     }
                     MulBinaryRelaxationMode::Middle => {
                         // Middle relaxation: fixed coefficients with interpolation r=0.5
@@ -427,7 +618,7 @@ impl MulBinaryLayer {
                                 (w_lower as f64).abs() * (alpha_l as f64).abs();
                             lower_s_b[[out_idx, b_idx]] +=
                                 (w_lower as f64).abs() * (beta_l as f64).abs();
-                            const_lower += w_lower as f64 * ny_l as f64;
+                            const_lower.add_term(w_lower, ny_l);
                         } else {
                             lower_a_a[[out_idx, a_idx]] += w_lower * alpha_u;
                             lower_a_b[[out_idx, b_idx]] += w_lower * beta_u;
@@ -435,7 +626,7 @@ impl MulBinaryLayer {
                                 (w_lower as f64).abs() * (alpha_u as f64).abs();
                             lower_s_b[[out_idx, b_idx]] +=
                                 (w_lower as f64).abs() * (beta_u as f64).abs();
-                            const_lower += w_lower as f64 * ny_u as f64;
+                            const_lower.add_term(w_lower, ny_u);
                         }
 
                         // For upper bound accumulation, select based on weight sign:
@@ -448,7 +639,7 @@ impl MulBinaryLayer {
                                 (w_upper as f64).abs() * (alpha_u as f64).abs();
                             upper_s_b[[out_idx, b_idx]] +=
                                 (w_upper as f64).abs() * (beta_u as f64).abs();
-                            const_upper += w_upper as f64 * ny_u as f64;
+                            const_upper.add_term(w_upper, ny_u);
                         } else {
                             upper_a_a[[out_idx, a_idx]] += w_upper * alpha_l;
                             upper_a_b[[out_idx, b_idx]] += w_upper * beta_l;
@@ -456,19 +647,31 @@ impl MulBinaryLayer {
                                 (w_upper as f64).abs() * (alpha_l as f64).abs();
                             upper_s_b[[out_idx, b_idx]] +=
                                 (w_upper as f64).abs() * (beta_l as f64).abs();
-                            const_upper += w_upper as f64 * ny_l as f64;
+                            const_upper.add_term(w_upper, ny_l);
                         }
                     }
                 }
             }
 
-            lower_b_total[out_idx] = const_lower;
-            upper_b_total[out_idx] = const_upper;
+            // Discharge the constant's OWN accumulation + plane-rounding error
+            // outward before it leaves f64 (#mul-mccormick-const).
+            lower_b_total[out_idx] = const_lower.finish();
+            upper_b_total[out_idx] = const_upper.finish();
         }
 
-        // Apply directed rounding on f64→f32 downcast (#2471):
+        // Apply directed rounding on f64→f32 downcast:
         // lower bounds round toward -inf, upper bounds round toward +inf.
-        // This ensures stored f32 bounds always contain the true mathematical value.
+        // CORRECTED CLAIM (#mul-mccormick-const): this cast covers the NARROWING
+        // and NOTHING else. The line that used to stand here — "this ensures
+        // stored f32 bounds always contain the true mathematical value" — was
+        // FALSE, and it is the false justification that let the constant half ship
+        // uncertified beside an already-certified coefficient half: the cast
+        // allows ~2^-24·|result| where the f64 fold's own error is
+        // gamma^f64_n·sum|term|, unbounded relative to a cancelling result, and it
+        // allows nothing at all for the round-to-nearest plane constant returned
+        // by `select_mccormick_plane`. Both are charged upstream by
+        // `McCormickConstFold::finish`, so the values reaching this line are
+        // ALREADY widened outward.
         let lower_b_f32 = lower_b_total.mapv(|v| next_down_f32(v as f32));
         let upper_b_f32 = upper_b_total.mapv(|v| next_up_f32(v as f32));
 
@@ -488,7 +691,7 @@ impl MulBinaryLayer {
 
         // MulBinary returns two affine forms (for x and y) but only one shared
         // McCormick constant term. Keep the full bias on bounds_a and zero
-        // bounds_b bias so DAG accumulation counts the constant exactly once (#2520).
+        // bounds_b bias so DAG accumulation counts the constant exactly once.
         let bounds_a = LinearBounds::new_or_conservative_with_err(
             lower_a_a,
             lower_b_f32,
@@ -595,8 +798,15 @@ impl MulBinaryLayer {
         let mut upper_s_b = Array2::<f64>::zeros((num_outputs, n_b));
 
         for out_idx in 0..num_outputs {
-            let mut const_lower = bounds.lower_b()[out_idx] as f64;
-            let mut const_upper = bounds.upper_b()[out_idx] as f64;
+            // Certified constant fold (#mul-mccormick-const): the alpha planes come
+            // from `interpolated_mccormick`, whose per-plane constant IS already
+            // rounded outward by `certify_plane_constant` — but that margin certifies
+            // ONE plane, not the f64 SUM of `n` of them, whose Higham residual
+            // gamma^f64_n·sum|w·ny| was published uncharged.
+            let mut const_lower =
+                McCormickConstFold::new(bounds.lower_b()[out_idx], BoundDir::Lower);
+            let mut const_upper =
+                McCormickConstFold::new(bounds.upper_b()[out_idx], BoundDir::Upper);
 
             for j in 0..n {
                 let w_lower = bounds.lower_a()[[out_idx, j]];
@@ -614,10 +824,10 @@ impl MulBinaryLayer {
                 if !lx.is_finite() || !ux.is_finite() || !ly.is_finite() || !uy.is_finite() {
                     // Trivial bounds: lower → -inf, upper → +inf.
                     if w_lower != 0.0 {
-                        const_lower = f64::NEG_INFINITY;
+                        const_lower.force_trivial();
                     }
                     if w_upper != 0.0 {
-                        const_upper = f64::INFINITY;
+                        const_upper.force_trivial();
                     }
                     continue;
                 }
@@ -635,13 +845,13 @@ impl MulBinaryLayer {
                     lower_a_b[[out_idx, b_idx]] += w_lower * beta_l;
                     lower_s_a[[out_idx, a_idx]] += (w_lower as f64).abs() * (alpha_l as f64).abs();
                     lower_s_b[[out_idx, b_idx]] += (w_lower as f64).abs() * (beta_l as f64).abs();
-                    const_lower += w_lower as f64 * ny_l as f64;
+                    const_lower.add_term(w_lower, ny_l);
                 } else {
                     lower_a_a[[out_idx, a_idx]] += w_lower * alpha_u;
                     lower_a_b[[out_idx, b_idx]] += w_lower * beta_u;
                     lower_s_a[[out_idx, a_idx]] += (w_lower as f64).abs() * (alpha_u as f64).abs();
                     lower_s_b[[out_idx, b_idx]] += (w_lower as f64).abs() * (beta_u as f64).abs();
-                    const_lower += w_lower as f64 * ny_u as f64;
+                    const_lower.add_term(w_lower, ny_u);
                 }
 
                 if w_upper >= 0.0 {
@@ -649,20 +859,25 @@ impl MulBinaryLayer {
                     upper_a_b[[out_idx, b_idx]] += w_upper * beta_u;
                     upper_s_a[[out_idx, a_idx]] += (w_upper as f64).abs() * (alpha_u as f64).abs();
                     upper_s_b[[out_idx, b_idx]] += (w_upper as f64).abs() * (beta_u as f64).abs();
-                    const_upper += w_upper as f64 * ny_u as f64;
+                    const_upper.add_term(w_upper, ny_u);
                 } else {
                     upper_a_a[[out_idx, a_idx]] += w_upper * alpha_l;
                     upper_a_b[[out_idx, b_idx]] += w_upper * beta_l;
                     upper_s_a[[out_idx, a_idx]] += (w_upper as f64).abs() * (alpha_l as f64).abs();
                     upper_s_b[[out_idx, b_idx]] += (w_upper as f64).abs() * (beta_l as f64).abs();
-                    const_upper += w_upper as f64 * ny_l as f64;
+                    const_upper.add_term(w_upper, ny_l);
                 }
             }
 
-            lower_b_total[out_idx] = const_lower;
-            upper_b_total[out_idx] = const_upper;
+            // Discharge the constant's OWN accumulation error outward before it
+            // leaves f64 (#mul-mccormick-const).
+            lower_b_total[out_idx] = const_lower.finish();
+            upper_b_total[out_idx] = const_upper.finish();
         }
 
+        // Directed f64 -> f32 narrowing ONLY. It is NOT a certificate for
+        // the fold above — see `widen_mccormick_constant`; the totals reaching this
+        // line are already widened outward (#mul-mccormick-const).
         let lower_b_f32 = lower_b_total.mapv(|v| next_down_f32(v as f32));
         let upper_b_f32 = upper_b_total.mapv(|v| next_up_f32(v as f32));
 
@@ -807,8 +1022,11 @@ impl MulBinaryLayer {
         let mut s_lower_a_b = vec![0.0_f64; coeff_len];
         let mut s_upper_a_a = vec![0.0_f64; coeff_len];
         let mut s_upper_a_b = vec![0.0_f64; coeff_len];
-        // Bias accumulation in f64 to prevent catastrophic cancellation (#2471).
-        // Same rationale as non-batched path above and crown_dense.rs (#1745).
+        // Bias accumulation in f64 to prevent catastrophic cancellation.
+        // Same rationale as non-batched path above and crown_dense.rs —
+        // including its correction: f64 REDUCES the cancellation but leaves a
+        // Higham residual that was published uncharged until #mul-mccormick-const.
+        // Each entry is folded through `McCormickConstFold` and widened OUTWARD.
         let mut lower_b_out = vec![0.0_f64; bias_len];
         let mut upper_b_out = vec![0.0_f64; bias_len];
 
@@ -828,8 +1046,10 @@ impl MulBinaryLayer {
         for batch_idx in 0..batch_size {
             for out_idx in 0..out_dim {
                 let out_flat_idx = batch_idx * out_dim + out_idx;
-                let mut const_lower = lower_b_flat[out_flat_idx] as f64;
-                let mut const_upper = upper_b_flat[out_flat_idx] as f64;
+                let mut const_lower =
+                    McCormickConstFold::new(lower_b_flat[out_flat_idx], BoundDir::Lower);
+                let mut const_upper =
+                    McCormickConstFold::new(upper_b_flat[out_flat_idx], BoundDir::Upper);
 
                 for j in 0..n {
                     let a_flat_idx = batch_idx * out_dim * n + out_idx * n + j;
@@ -871,7 +1091,7 @@ impl MulBinaryLayer {
                             lower_a_b[a_flat_idx] = w_lower * ay_l;
                             s_lower_a_a[a_flat_idx] = (w_lower as f64).abs() * (ax_l as f64).abs();
                             s_lower_a_b[a_flat_idx] = (w_lower as f64).abs() * (ay_l as f64).abs();
-                            const_lower += w_lower as f64 * c_l as f64;
+                            const_lower.add_term(w_lower, c_l);
 
                             // Select McCormick plane for upper bound
                             let (ax_u, ay_u, c_u) = select_mccormick_plane(
@@ -888,7 +1108,7 @@ impl MulBinaryLayer {
                             upper_a_b[a_flat_idx] = w_upper * ay_u;
                             s_upper_a_a[a_flat_idx] = (w_upper as f64).abs() * (ax_u as f64).abs();
                             s_upper_a_b[a_flat_idx] = (w_upper as f64).abs() * (ay_u as f64).abs();
-                            const_upper += w_upper as f64 * c_u as f64;
+                            const_upper.add_term(w_upper, c_u);
                         }
                         MulBinaryRelaxationMode::Middle => {
                             // Middle relaxation: fixed coefficients with interpolation r=0.5
@@ -903,7 +1123,7 @@ impl MulBinaryLayer {
                                     (w_lower as f64).abs() * (alpha_l as f64).abs();
                                 s_lower_a_b[a_flat_idx] =
                                     (w_lower as f64).abs() * (beta_l as f64).abs();
-                                const_lower += w_lower as f64 * ny_l as f64;
+                                const_lower.add_term(w_lower, ny_l);
                             } else {
                                 lower_a_a[a_flat_idx] = w_lower * alpha_u;
                                 lower_a_b[a_flat_idx] = w_lower * beta_u;
@@ -911,7 +1131,7 @@ impl MulBinaryLayer {
                                     (w_lower as f64).abs() * (alpha_u as f64).abs();
                                 s_lower_a_b[a_flat_idx] =
                                     (w_lower as f64).abs() * (beta_u as f64).abs();
-                                const_lower += w_lower as f64 * ny_u as f64;
+                                const_lower.add_term(w_lower, ny_u);
                             }
 
                             // For upper bound accumulation, select based on weight sign
@@ -922,7 +1142,7 @@ impl MulBinaryLayer {
                                     (w_upper as f64).abs() * (alpha_u as f64).abs();
                                 s_upper_a_b[a_flat_idx] =
                                     (w_upper as f64).abs() * (beta_u as f64).abs();
-                                const_upper += w_upper as f64 * ny_u as f64;
+                                const_upper.add_term(w_upper, ny_u);
                             } else {
                                 upper_a_a[a_flat_idx] = w_upper * alpha_l;
                                 upper_a_b[a_flat_idx] = w_upper * beta_l;
@@ -930,19 +1150,27 @@ impl MulBinaryLayer {
                                     (w_upper as f64).abs() * (alpha_l as f64).abs();
                                 s_upper_a_b[a_flat_idx] =
                                     (w_upper as f64).abs() * (beta_l as f64).abs();
-                                const_upper += w_upper as f64 * ny_l as f64;
+                                const_upper.add_term(w_upper, ny_l);
                             }
                         }
                     }
                 }
 
-                lower_b_out[out_flat_idx] = const_lower;
-                upper_b_out[out_flat_idx] = const_upper;
+                // Discharge the constant's OWN accumulation + plane-rounding error
+                // outward before it leaves f64 (#mul-mccormick-const).
+                lower_b_out[out_flat_idx] = const_lower.finish();
+                upper_b_out[out_flat_idx] = const_upper.finish();
             }
         }
 
-        // Apply directed rounding on f64→f32 downcast (#2471):
+        // Apply directed rounding on f64→f32 downcast:
         // lower bounds round toward -inf, upper bounds round toward +inf.
+        // This covers the NARROWING ONLY. The f64 fold's own Higham residual and
+        // the round-to-nearest plane constant from `select_mccormick_plane` are
+        // charged upstream by `McCormickConstFold::finish`, so the values reaching
+        // this line are ALREADY widened outward (#mul-mccormick-const). The
+        // batched arm shares the scalar arm's defect verbatim — same fold, same
+        // planes — so it must share the certificate.
         let lower_b_f32: Vec<f32> = lower_b_out
             .iter()
             .map(|&v| next_down_f32(v as f32))
@@ -977,7 +1205,7 @@ impl MulBinaryLayer {
         let lower_b_bias_shape = IxDyn(bounds.lower_b.shape());
         let upper_b_bias_shape = IxDyn(bounds.upper_b.shape());
         // Phase 4 audit: per-layer McCormick output — catches NaN from upstream via McCormick.
-        // Capture vec lengths before from_shape_vec moves them (#3110 pattern).
+        // Capture vec lengths before from_shape_vec moves them.
         let lower_a_a_len = lower_a_a.len();
         let lower_b_f32_len = lower_b_f32.len();
         let upper_a_a_len = upper_a_a.len();
@@ -1035,6 +1263,261 @@ impl MulBinaryLayer {
         bounds_b.set_coeff_err(lower_a_b_err, upper_a_b_err);
 
         Ok((bounds_a, bounds_b))
+    }
+}
+
+#[cfg(test)]
+mod mccormick_constant_certificate_tests {
+    use super::*;
+
+    /// Inner width of the counterexample: two `2^60`-scale taps plus 4096 unit
+    /// taps that the f64 running sum swallows whole.
+    const K: usize = 4098;
+    /// `2^30`; `BIG * BIG == 2^60` is exact in f32 and in f64.
+    const BIG: f32 = 1_073_741_824.0;
+
+    /// Degenerate (`lower == upper`) taps for both operands.
+    ///
+    /// `x = [2^30, 1, ..., 1, 2^30]`, `y = [-2^30, 1, ..., 1, 2^30]`, so the
+    /// McCormick constants `-x_j*y_j` are `+2^60`, then 4096 x `-1`, then `-2^60`.
+    fn degenerate_taps() -> (Vec<f32>, Vec<f32>) {
+        let mut xs = vec![1.0_f32; K];
+        let mut ys = vec![1.0_f32; K];
+        xs[0] = BIG;
+        ys[0] = -BIG;
+        xs[K - 1] = BIG;
+        ys[K - 1] = BIG;
+        (xs, ys)
+    }
+
+    /// `sum_j x_j*y_j`, computed exactly in i128.
+    fn exact_objective(xs: &[f32], ys: &[f32]) -> i128 {
+        (0..xs.len())
+            .map(|l| (f64::from(xs[l]) * f64::from(ys[l])) as i128)
+            .sum()
+    }
+
+    /// Exactly what the production loop folds: `w = 1`, `c = fl32(-x*y)`, product
+    /// exact in f64, plain round-to-nearest `+=`. This is the PRE-FIX published
+    /// value (up to the final directed f32 cast).
+    fn naive_f64_fold(xs: &[f32], ys: &[f32]) -> f64 {
+        let mut folded = 0.0_f64;
+        for l in 0..xs.len() {
+            folded += f64::from(-xs[l] * ys[l]);
+        }
+        folded
+    }
+
+    fn degenerate_input(values: &[f32]) -> BoundedTensor {
+        let array = ArrayD::from_shape_vec(IxDyn(&[values.len()]), values.to_vec())
+            .expect("degenerate input shape");
+        BoundedTensor::new(array.clone(), array).expect("degenerate BoundedTensor")
+    }
+
+    /// COUNTEREXAMPLE — the accumulated McCormick envelope CONSTANT must be
+    /// published with its own certified error term (#mul-mccormick-const).
+    ///
+    /// This is a WIRING test: it drives the public CROWN-backward entry point and
+    /// reads the PUBLISHED relation, so it fails if the certificate exists but is
+    /// not plumbed into `lower_b_total`.
+    ///
+    /// Both operands are DEGENERATE boxes (`lower == upper`), so all four
+    /// McCormick planes coincide, plane selection is irrelevant, and the
+    /// relaxation is exact at the single feasible point `(X, Y)`. Nothing is
+    /// broadcast, so each coefficient cell receives exactly ONE exact term and the
+    /// containment condition reduces to a statement about the constant alone:
+    ///
+    /// ```text
+    /// crown_lower(x, y) = sum_j (w*Y_j)*x_j + sum_j (w*X_j)*y_j + const
+    ///                   = 2*sum_j X_j*Y_j + const               (w = 1)
+    /// objective         =   sum_j X_j*Y_j  =  T
+    /// sound  <=>  const <= -T
+    /// ```
+    ///
+    /// The taps make the f64 fold catastrophically wrong: `+2^60`, then 4096 x
+    /// `-1`, then `-2^60`. `ulp(2^60) = 256`, so every `-1` rounds away and the
+    /// accumulator returns EXACTLY `0.0` while the true constant is `-4096`. The
+    /// pre-fix code published that `0.0` protected by nothing but the f64 -> f32
+    /// cast — `next_down_f32(0.0) = -1.4e-45` — i.e. a "lower" plane sitting
+    /// `4096` ABOVE the bilinear surface at a FEASIBLE point, which is a false
+    /// `unsat` available directly from the relation. This assertion FAILS on the
+    /// pre-fix code.
+    #[ntest::timeout(60000)]
+    #[test]
+    fn scalar_envelope_constant_carries_its_higham_charge() {
+        let (xs, ys) = degenerate_taps();
+        let objective = exact_objective(&xs, &ys);
+        assert_eq!(objective, 4096, "true objective sum_j X_j*Y_j");
+        let folded = naive_f64_fold(&xs, &ys);
+        assert_eq!(
+            folded, 0.0,
+            "premise: the plain f64 constant fold must cancel to 0, otherwise this \
+             test no longer exercises the defect"
+        );
+        assert!(
+            next_down_f32(folded as f32) > -(objective as f64) as f32,
+            "premise: the PRE-FIX publication must be unsound, otherwise this test \
+             cannot fail on the pre-fix code"
+        );
+
+        let input_a = degenerate_input(&xs);
+        let input_b = degenerate_input(&ys);
+        let bounds = LinearBounds::new(
+            Array2::from_elem((1, K), 1.0_f32),
+            Array1::zeros(1),
+            Array2::from_elem((1, K), 1.0_f32),
+            Array1::zeros(1),
+        )
+        .expect("incoming all-ones relation");
+
+        let layer = MulBinaryLayer;
+        let (bounds_a, bounds_b) = layer
+            .propagate_linear_binary(
+                &bounds,
+                &input_a,
+                &input_b,
+                MulBinaryRelaxationMode::McCormick,
+            )
+            .expect("scalar McCormick CROWN backward");
+
+        // Premise of the reduction above: every coefficient cell holds exactly one
+        // exact term, so the whole error budget lives in the constant.
+        for &l in &[0_usize, 1, K - 1] {
+            assert_eq!(
+                bounds_a.lower_a[[0, l]],
+                ys[l],
+                "A-side coefficient cell {l} must be the single exact term w*ly"
+            );
+            assert_eq!(
+                bounds_b.lower_a[[0, l]],
+                xs[l],
+                "B-side coefficient cell {l} must be the single exact term w*lx"
+            );
+        }
+
+        let published = f64::from(bounds_a.lower_b[0]) + f64::from(bounds_b.lower_b[0]);
+        assert!(
+            published <= -(objective as f64),
+            "published McCormick lower constant {published} must be <= {} — otherwise \
+             the lower relaxation sits ABOVE the bilinear surface at a feasible point",
+            -(objective as f64)
+        );
+    }
+
+    /// The batched twin shares the scalar arm's fold verbatim, so it must share
+    /// the certificate. Same counterexample through
+    /// [`MulBinaryLayer::propagate_linear_batched_binary`]; also FAILS pre-fix.
+    #[ntest::timeout(60000)]
+    #[test]
+    fn batched_envelope_constant_carries_its_higham_charge() {
+        let (xs, ys) = degenerate_taps();
+        let objective = exact_objective(&xs, &ys);
+        assert_eq!(objective, 4096, "true objective sum_j X_j*Y_j");
+        assert_eq!(
+            naive_f64_fold(&xs, &ys),
+            0.0,
+            "premise: the plain f64 constant fold must cancel to 0"
+        );
+
+        let input_a = degenerate_input(&xs);
+        let input_b = degenerate_input(&ys);
+        let ones = ArrayD::from_elem(IxDyn(&[1, K]), 1.0_f32);
+        let zeros = ArrayD::from_elem(IxDyn(&[1]), 0.0_f32);
+        let bounds =
+            BatchedLinearBounds::new(ones.clone(), zeros.clone(), ones, zeros, vec![K], vec![1])
+                .expect("incoming batched all-ones relation");
+
+        let layer = MulBinaryLayer;
+        let (bounds_a, bounds_b) = layer
+            .propagate_linear_batched_binary(
+                &bounds,
+                &input_a,
+                &input_b,
+                MulBinaryRelaxationMode::McCormick,
+            )
+            .expect("batched McCormick CROWN backward");
+
+        let coeff_a = bounds_a
+            .lower_a
+            .as_slice()
+            .expect("batched A-side coefficients are contiguous");
+        let coeff_b = bounds_b
+            .lower_a
+            .as_slice()
+            .expect("batched B-side coefficients are contiguous");
+        for &l in &[0_usize, 1, K - 1] {
+            assert_eq!(coeff_a[l], ys[l], "A-side cell {l} must be the exact w*ly");
+            assert_eq!(coeff_b[l], xs[l], "B-side cell {l} must be the exact w*lx");
+        }
+
+        let bias_a = *bounds_a
+            .lower_b
+            .iter()
+            .next()
+            .expect("batched A-side bias present");
+        let bias_b = *bounds_b
+            .lower_b
+            .iter()
+            .next()
+            .expect("batched B-side bias present");
+        let published = f64::from(bias_a) + f64::from(bias_b);
+        assert!(
+            published <= -(objective as f64),
+            "published batched McCormick lower constant {published} must be <= {}",
+            -(objective as f64)
+        );
+    }
+
+    /// Direction and fail-closed contract of the certificate itself.
+    ///
+    /// A term-free fold must be published BIT-IDENTICALLY (no f64 addition ran and
+    /// no plane was consumed, so there is nothing to charge); any fold with at
+    /// least one term may only move OUTWARD; a NaN anywhere must fail CLOSED to
+    /// the trivially-true constant rather than to a finite number.
+    #[test]
+    fn constant_certificate_is_outward_only_and_fails_closed() {
+        for &seed in &[0.0_f64, -1.5, 7.25, 1.0e18, f64::MIN_POSITIVE] {
+            assert_eq!(
+                widen_mccormick_constant(seed, seed.abs(), 0.0, 0, BoundDir::Lower).to_bits(),
+                seed.to_bits(),
+                "adds == 0 must be the identity (Lower)"
+            );
+            assert_eq!(
+                widen_mccormick_constant(seed, seed.abs(), 0.0, 0, BoundDir::Upper).to_bits(),
+                seed.to_bits(),
+                "adds == 0 must be the identity (Upper)"
+            );
+        }
+
+        for &(accumulated, s) in &[(0.0_f64, 1.0e18_f64), (-3.5, 12.0), (1.0e9, 1.0e9)] {
+            let lower = widen_mccormick_constant(accumulated, s, s, 4, BoundDir::Lower);
+            let upper = widen_mccormick_constant(accumulated, s, s, 4, BoundDir::Upper);
+            assert!(
+                lower < accumulated,
+                "Lower constant must move DOWN: {lower} !< {accumulated}"
+            );
+            assert!(
+                upper > accumulated,
+                "Upper constant must move UP: {upper} !> {accumulated}"
+            );
+        }
+
+        assert_eq!(
+            widen_mccormick_constant(f64::NAN, 1.0, 1.0, 1, BoundDir::Lower),
+            f64::NEG_INFINITY
+        );
+        assert_eq!(
+            widen_mccormick_constant(f64::NAN, 1.0, 1.0, 1, BoundDir::Upper),
+            f64::INFINITY
+        );
+        // A poisoned magnitude sum (the `force_trivial` state) can never certify a
+        // finite constant.
+        let mut poisoned = McCormickConstFold::new(0.0, BoundDir::Lower);
+        poisoned.force_trivial();
+        assert_eq!(poisoned.finish(), f64::NEG_INFINITY);
+        let mut poisoned_up = McCormickConstFold::new(0.0, BoundDir::Upper);
+        poisoned_up.force_trivial();
+        assert_eq!(poisoned_up.finish(), f64::INFINITY);
     }
 }
 

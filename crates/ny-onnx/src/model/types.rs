@@ -12,8 +12,9 @@ use ny_build::WeightRevision;
 use sha2::{Digest, Sha256};
 
 pub use ny_build::{
-    is_multi_output_split, resolve_dynamic_dim, resolve_dynamic_shape, AttributeValue, DataType,
-    LayerSpec, Network, TensorSpec, WeightRef, WeightStore,
+    concat_input_layout, is_multi_output_split, resolve_dynamic_dim, resolve_dynamic_shape,
+    AttributeValue, ConcatInputLayout, ConcatInputSlot, DataType, LayerSpec, Network, TensorSpec,
+    WeightRef, WeightStore,
 };
 
 /// Loaded ONNX model with weights and graph structure.

@@ -10,10 +10,10 @@
 //! [`WeightStore`]) and the conversion dispatch ([`ConvertContext`]) that turns
 //! layer specs into bound-propagation [`Layer`](ny_propagate::Layer) values.
 //!
-//! Part of the `ny-onnx` split (#1752): parsing stays in `ny-onnx`,
+//! Part of the `ny-onnx` split: parsing stays in `ny-onnx`,
 //! model types and construction logic live here.
 
-// Link macOS Accelerate BLAS for ndarray::dot() acceleration (#4259).
+// Link macOS Accelerate BLAS for ndarray::dot() acceleration.
 #[cfg(target_os = "macos")]
 extern crate blas_src;
 
@@ -34,16 +34,22 @@ mod weight_store;
 // Re-export model types at crate root for ergonomic imports.
 pub use convert::{model_is_unbatched, ConvertContext};
 pub use dequant_interval::{dequant_block_affine_interval, dequant_interval};
-pub use graph::{build_graph_network, GraphBuildInputs};
+pub use graph::{
+    build_graph_network, build_graph_network_with_linear_storage, concat_input_layout,
+    ConcatInputLayout, ConcatInputSlot, GraphBuildInputs,
+};
 pub use graph_model::GraphModel;
 pub use graph_model_builder::GraphModelBuilder;
-pub use graph_options::{CompoundNodePolicy, GraphNetworkOptions, MissingOutputPolicy};
+pub use graph_options::{
+    CompoundNodePolicy, GraphNetworkOptions, LinearStoragePolicy, MissingOutputPolicy,
+};
 pub(crate) use layernorm_mode::layernorm_mode_from_attrs;
 pub use mixed_precision::MixedPrecisionPolicy;
 pub use model_types::{
     is_multi_output_split, resolve_dynamic_dim, resolve_dynamic_shape, AttributeValue, DataType,
     LayerSpec, Network, TensorSpec, WeightRef, EXPAND_LIVE_SHAPE_REFERENCE_ATTR,
-    INTERNAL_CT_INSTANCE_NORM_ATTR, PAD_PRESERVE_ALL_AXES_ATTR,
+    INTERNAL_CT_INSTANCE_NORM_ATTR, INTERNAL_LEGACY_AXIS_AUTHORITY_ATTR,
+    PAD_PRESERVE_ALL_AXES_ATTR,
 };
 pub use propagate::{
     build_propagate_network, build_propagate_network_indexed, PropagateNetworkOptions,

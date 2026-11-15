@@ -15,11 +15,11 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
-// Spec-guided CROWN on the kokoro vocoder prefix subgraph (#3500 / #3596)
+// Spec-guided CROWN on the kokoro vocoder prefix subgraph
 //
 // Spec-guided CROWN targeting boundary samples is feasible because: (1) only
 // N backward passes for N specs, (2) deadline prevents hangs, and
-// (3) Conv1d CROWN backward now threads GemmEngine (#3598).
+// (3) Conv1d CROWN backward now threads GemmEngine.
 //
 // CROWN-IBP tightening comparison deferred: the prefix has only ~2 nodes so
 // tightening room is minimal, and the extra CROWN-IBP + second spec-guided

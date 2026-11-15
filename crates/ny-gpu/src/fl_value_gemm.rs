@@ -44,10 +44,12 @@
 //! contraction `k` is never split), one blocking WGPU submission per chunk,
 //! with a host-side deadline poll before every submission and after the last.
 //! Chunk rows are bounded by BOTH the caller's `max_dispatch_macs` cap and
-//! [`FL_VALUE_CHUNK_BUDGET_ELEMS`] (half the 128 MB wgpu binding budget), so
-//! no submission can approach the budget refusal m7 measured the best shapes
-//! against. At expiry the remaining chunks are abandoned and a typed
-//! [`NyError::DeadlineExceeded`] is returned — never a partial result.
+//! [`FlValueGemmDevice::chunk_budget_elems`] (half the device's LIVE binding
+//! capacity, floored at [`FL_VALUE_CHUNK_BUDGET_ELEMS`]), and the device's own
+//! GEMM gate reads that same live capacity, so no submission this tier admits
+//! can reach the device's binding refusal. At expiry the remaining chunks are
+//! abandoned and a typed [`NyError::DeadlineExceeded`] is returned — never a
+//! partial result.
 //!
 //! This capability view shares the process-global ordinary WGPU context with
 //! attack and alpha-gradient steering. It does not construct or retain a second
@@ -101,7 +103,14 @@ impl FlValueGemmDevice {
     /// Throughput only: this tier exposes a VALUE GEMM and never a certified
     /// bound, so a wider chunk changes how work is submitted, never what is
     /// proved.
-    fn chunk_budget_elems(&self) -> usize {
+    ///
+    /// Public, read-only: it is the exact per-submission element budget this
+    /// handle applies (B above it is a typed [`NyError::GpuMemoryExceeded`]
+    /// refusal; A/output row blocks are chunked to it). The GPU conformance
+    /// suite (`tests/fl_value_gemm_adversarial.rs`) derives its boundary
+    /// shapes from it instead of mirroring the formula by hand.
+    #[must_use]
+    pub fn chunk_budget_elems(&self) -> usize {
         (self.device.max_binding_elems_live() / 2).max(FL_VALUE_CHUNK_BUDGET_ELEMS)
     }
 }
@@ -280,7 +289,7 @@ impl GemmEngine for FlValueGemmDevice {
         // Result validation: poison is a typed refusal, never a value — the
         // caller's gamma/FTZ charge covers rounding, not overflow. TWO poison
         // forms exist because the WGSL GEMM shader's `nan_safe_clamp`
-        // (shaders.rs, #2258/#2708) preserves NaN but saturates overflow Inf
+        // (shaders.rs) preserves NaN but saturates overflow Inf
         // to the FINITE sentinel ±FALLBACK_BOUND (±1e10): an all-finite scan
         // alone would PUBLISH a clamped overflow, silently losing magnitude
         // the certificate does not cover. Any |v| >= FALLBACK_BOUND is
@@ -439,7 +448,7 @@ mod tests {
 
     /// Poisoned products must be typed refusals, never values. The WGSL GEMM
     /// shader saturates overflow Inf to the FINITE ±1e10 sentinel
-    /// (`nan_safe_clamp`, #2258) and preserves NaN (#2708) — so this pins the
+    /// (`nan_safe_clamp`) and preserves NaN — so this pins the
     /// sentinel-magnitude scan (an all-finite check alone would unsoundly
     /// publish clamped overflow) AND the NaN path.
     #[test]

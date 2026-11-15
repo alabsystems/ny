@@ -50,13 +50,13 @@ impl LogSumExpLayer {
         keepdims: bool,
         round_f32: fn(f32) -> f32,
     ) -> Result<ArrayD<f32>> {
-        // NaN-propagating fold: NaN in values must propagate through the max — see #2577.
+        // NaN-propagating fold: NaN in values must propagate through the max.
         let max_vals = values.fold_axis(Axis(axis), f32::NEG_INFINITY, |&acc, &x| {
             nan_propagating_max(acc, x)
         });
         let max_expanded = max_vals.clone().insert_axis(Axis(axis));
         // f64 accumulation for exp and sum_axis to prevent precision loss
-        // for large reduction axes (seq_len=512+). Part of #2423.
+        // for large reduction axes (seq_len=512+).
         //
         // Limit-correct shift at ±inf (dc9da0fde class): a plain `x - m`
         // yields inf - inf = NaN exactly on the element that ATTAINS an
@@ -86,7 +86,7 @@ impl LogSumExpLayer {
         let sum_exp_f64 = exp_shifted_f64.sum_axis(Axis(axis));
         let logsumexp = max_vals.mapv(|x| x as f64) + sum_exp_f64.mapv(|x| x.ln());
         // Directed rounding on f64→f32 cast: next_down for lower bounds,
-        // next_up for upper bounds. Part of #3245.
+        // next_up for upper bounds.
         let logsumexp_f32 = logsumexp.mapv(|x| round_f32(x as f32));
         if keepdims {
             Ok(logsumexp_f32.insert_axis(Axis(axis)).into_dyn())
@@ -106,7 +106,7 @@ impl BoundPropagation for LogSumExpLayer {
     /// to -inf, and a -inf element among finite ones contributes exp(-inf) =
     /// 0. Only NaN input bounds fail closed.
     ///
-    /// Category B per domain validation policy (designs/2026-02-07-domain-validation-policy.md):
+    /// Category B per domain validation policy:
     /// NaN carries no bound information and must be surfaced, not masked; a
     /// ±inf endpoint is the conservative-bounds convention for "unbounded in
     /// that direction" (deep-stack IBP overflow saturation, dc9da0fde class)
@@ -142,7 +142,7 @@ impl BoundPropagation for LogSumExpLayer {
         // Conservative construction: ±Inf endpoints are preserved — both the
         // exact ±inf limits from saturated inputs and Inf produced from large
         // FINITE inputs via exp() overflow are sound conservative bounds
-        // (#3030, #3060). NaN cannot arise from the NaN-guarded input, and
+        //NaN cannot arise from the NaN-guarded input, and
         // would still be repaired to the conservative direction here rather
         // than silently kept.
         BoundedTensor::new_repaired(lower, upper, RepairStrategy::Conservative)
@@ -184,7 +184,7 @@ impl LogSumExpLayer {
     ///
     /// Returns `NumericalInstability` if pre-activation bounds are non-finite.
     /// Returns conservative `[-inf, +inf]` constant bounds when asymmetric
-    /// incoming coefficients cause bound inversion during concretization (#2236).
+    /// incoming coefficients cause bound inversion during concretization.
     pub fn propagate_linear_with_bounds(
         &self,
         bounds: &LinearBounds,
@@ -393,10 +393,10 @@ mod tests {
         );
     }
 
-    /// Regression for #2713, updated for the dc9da0fde saturation class:
+    /// Regression test, updated for the dc9da0fde saturation class:
     /// all-NEG_INFINITY reduces to the exact -inf limit — sum(exp) = 0, so
-    /// LSE = -inf — and must NOT produce NaN (the failure #2713 guarded
-    /// against was -inf - -inf = NaN inside the max-shift).
+    /// LSE = -inf — and must NOT produce NaN (the original failure
+    /// was -inf - -inf = NaN inside the max-shift).
     #[test]
     fn test_ibp_all_neg_infinity_no_nan_2713() {
         let layer = LogSumExpLayer::new(vec![-1], false);
@@ -511,7 +511,7 @@ mod tests {
         assert!(matches!(err, NyError::NumericalInstability(_)));
     }
 
-    /// Regression test for #2236: asymmetric incoming coefficients must not
+    /// Regression test: asymmetric incoming coefficients must not
     /// cause NumericalInstability error. The concretize_sound fallback to
     /// [-inf, +inf] is a sound conservative result.
     #[test]

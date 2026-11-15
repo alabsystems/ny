@@ -7,12 +7,9 @@
 //! Unifies the alpha/IBP/CROWN-IBP mode selection shared by the graph BaB
 //! entry points before each path computes its mode-specific root objective
 //! bounds.
-//!
-//! Design: `designs/2026-03-14-issue-1860-graph-bab-service-convergence.md`
-//! Issue: #1860 (Packet C)
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ny_core::{GemmEngine, NyError, Result};
 use ny_tensor::BoundedTensor;
@@ -34,6 +31,10 @@ pub(crate) struct GraphBabBootstrap {
     /// evaluated directly; running alpha initialization again would only
     /// repeat the root transaction.
     typed_cgan_root_reusable: bool,
+    /// This root owns the complete certified reference used by its fixed-map
+    /// optimizer. Objective evaluation may reuse its output without collecting
+    /// another map; the alpha state itself never constitutes a proof.
+    pub(crate) retained_fixed_reference: bool,
     /// Exact number of optimizer updates represented by the alpha state when a
     /// multi-objective caller retained a DAG-alpha phase checkpoint. `None`
     /// means the bootstrap completed normally. This is scheduling/telemetry
@@ -95,7 +96,9 @@ pub(crate) fn compute_graph_bab_bootstrap(
     engine: Option<&dyn GemmEngine>,
     deadline: Option<Instant>,
 ) -> Result<GraphBabBootstrap> {
-    compute_graph_bab_bootstrap_with_policy(graph, input, config, engine, deadline, None, false)
+    compute_graph_bab_bootstrap_with_policy(
+        graph, input, config, engine, deadline, None, false, None,
+    )
 }
 
 /// Multi-objective-only bootstrap seam for the dark phase-cap checkpoint
@@ -117,6 +120,31 @@ pub(crate) fn compute_graph_bab_bootstrap_with_phase_cap_checkpoint(
         bootstrap_deadline,
         checkpoint_authority_deadline,
         true,
+        None,
+    )
+}
+
+/// Original-root policy with a paid local phase and separately live outer
+/// authority. The reference cap limits optional CROWN work after foundational
+/// IBP; both still obey the absolute phase deadline.
+pub(crate) fn compute_graph_bab_bootstrap_with_bounded_fixed_reference(
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    config: &BetaCrownConfig,
+    engine: Option<&dyn GemmEngine>,
+    phase_deadline: Instant,
+    authority_deadline: Instant,
+    reference_cap: Duration,
+) -> Result<GraphBabBootstrap> {
+    compute_graph_bab_bootstrap_with_policy(
+        graph,
+        input,
+        config,
+        engine,
+        Some(phase_deadline.min(authority_deadline)),
+        Some(authority_deadline),
+        false,
+        Some(reference_cap),
     )
 }
 
@@ -128,6 +156,7 @@ fn compute_graph_bab_bootstrap_with_policy(
     deadline: Option<Instant>,
     checkpoint_authority_deadline: Option<Instant>,
     allow_phase_cap_checkpoint: bool,
+    bounded_reference_cap: Option<Duration>,
 ) -> Result<GraphBabBootstrap> {
     // #phase-telemetry (dark, NY_PHASE_TELEMETRY=1, print-only): bracket the
     // whole warmup + intermediate-bounds collection so the phase is priceable
@@ -232,7 +261,7 @@ fn compute_graph_bab_bootstrap_with_policy(
             if cap_secs.is_finite() && cap_secs > 0.0 {
                 let now = Instant::now();
                 let capped = now
-                    .checked_add(std::time::Duration::from_secs_f64(cap_secs))
+                    .checked_add(Duration::from_secs_f64(cap_secs))
                     .unwrap_or(now);
                 (alpha_config.deadline, local_phase_cap_applied) =
                     apply_local_phase_cap(alpha_config.deadline, capped);
@@ -283,6 +312,7 @@ fn compute_graph_bab_bootstrap_with_policy(
         && !force_conv_patches_collect;
 
     let mut phase_cap_optimizer_updates = None;
+    let mut retained_fixed_reference = false;
     let (initial_node_bounds, root_alpha_state) = if force_conv_patches_collect
         && graph.has_conv_layers()
         && input.len() > LARGE_CONV_INPUT_NUMEL
@@ -300,7 +330,7 @@ fn compute_graph_bab_bootstrap_with_policy(
                 // This branch is itself the large-conv path. Falling back to a
                 // deadline-free plain-IBP sweep here can strand the verifier
                 // long after its authoritative wall-clock budget expires
-                // (#4321), exactly like the pre-deadline implementation. Let
+                //exactly like the pre-deadline implementation. Let
                 // the root coordinator translate expiry into a sound Timeout
                 // verdict instead.
                 return Err(e);
@@ -313,7 +343,7 @@ fn compute_graph_bab_bootstrap_with_policy(
              O(L²) per-node CROWN-IBP conv stall; reserving budget for BaB.",
             input.len()
         );
-        // Thread the global deadline (#4321): without it, the IBP intermediate
+        // Thread the global deadline: without it, the IBP intermediate
         // sweep over a deep conv DAG (TinyImageNet ResNet) runs unbounded and
         // overruns the verifier timeout, getting killed externally with no JSON
         // verdict. collect_node_bounds_core checks the deadline between nodes.
@@ -330,9 +360,42 @@ fn compute_graph_bab_bootstrap_with_policy(
         );
         // α-CROWN deliberately propagates DeadlineExceeded: the GPU/heap BaB
         // alpha entry points translate it into an explicit "warmup exceeded its
-        // deadline cap" Unknown (#4413) so per-domain budget is preserved. Do NOT
+        // deadline cap" Unknown so per-domain budget is preserved. Do NOT
         // swallow it into an IBP fallback here.
-        let outcome = if allow_phase_cap_checkpoint && local_phase_cap_applied {
+        let outcome = if let Some(reference_cap) =
+            bounded_reference_cap.filter(|_| alpha_config.iterations > 0)
+        {
+            let reference_cap = reference_cap.min(
+                alpha_config
+                    .deadline
+                    .unwrap()
+                    .saturating_duration_since(Instant::now())
+                    / 2,
+            );
+            if reference_cap.is_zero() {
+                return Err(NyError::DeadlineExceeded(
+                    "bounded root bootstrap has no live reference allocation".to_string(),
+                ));
+            }
+            let outcome = graph.collect_root_fixed_reference_alpha_with_engine(
+                input,
+                &alpha_config,
+                engine,
+                reference_cap,
+            )?;
+            let disposition = match &outcome {
+                GraphAlphaCollectionOutcome::Complete(_) => "optimized",
+                GraphAlphaCollectionOutcome::ReferenceOnly { .. } => "reference-only",
+                GraphAlphaCollectionOutcome::PhaseCapCheckpoint { .. } => "phase-checkpoint",
+            };
+            info!(
+                disposition,
+                reference_cap_s = reference_cap.as_secs_f64(),
+                "Bounded root fixed reference retained"
+            );
+            retained_fixed_reference = true;
+            outcome
+        } else if allow_phase_cap_checkpoint && local_phase_cap_applied {
             graph.collect_alpha_crown_bounds_dag_with_engine_phase_cap_checkpoint(
                 input,
                 &alpha_config,
@@ -344,7 +407,8 @@ fn compute_graph_bab_bootstrap_with_policy(
             GraphAlphaCollectionOutcome::Complete(result)
         };
         let (bounds, alpha) = match outcome {
-            GraphAlphaCollectionOutcome::Complete(result) => result,
+            GraphAlphaCollectionOutcome::Complete(result)
+            | GraphAlphaCollectionOutcome::ReferenceOnly { result } => result,
             GraphAlphaCollectionOutcome::PhaseCapCheckpoint {
                 result,
                 completed_iterations,
@@ -402,6 +466,7 @@ fn compute_graph_bab_bootstrap_with_policy(
         root_alpha_state,
         alpha_config,
         typed_cgan_root_reusable,
+        retained_fixed_reference,
         phase_cap_optimizer_updates,
     })
 }
@@ -472,6 +537,103 @@ pub(crate) fn compute_graph_root_output_bounds(
         config.crown_backward_layers,
     )
     .map(|result| result.bounds)
+}
+
+/// Which tier of the #budget-abandonment warmup-cap fallback produced a root
+/// enclosure. Telemetry only — both tiers are sound enclosures of the same
+/// output node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WarmupFallbackTier {
+    /// The identity-spec CROWN retry on a fresh slice of the REMAINING BaB
+    /// budget succeeded (`shared/init.rs` `use_forward_bounds` path, run over
+    /// the bootstrap's already-collected node bounds).
+    Crown,
+    /// The retry also expired (or had no budget), so the enclosure is the
+    /// bootstrap's own output-node interval — ZERO extra compute, the object
+    /// `stash_root_bounds_for_mip` already publishes.
+    Interval,
+}
+
+impl WarmupFallbackTier {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Crown => "crown",
+            Self::Interval => "interval",
+        }
+    }
+}
+
+/// #budget-abandonment FIX A: recover a root output enclosure after the
+/// ITERATIVE root optimization blew its warmup cap.
+///
+/// The caller has already paid for `compute_graph_bab_bootstrap`, whose
+/// mandatory node sweep visited every node and therefore CERTIFIED an
+/// enclosure for the output node. Today that object is discarded along with
+/// the deadline error and BaB never starts. This helper returns it, after one
+/// bounded attempt to improve on it:
+///
+/// 1. `Crown` — the identity-spec CROWN request over the bootstrap's node
+///    bounds, on `retry_deadline` (a fresh slice carved from the REMAINING BaB
+///    budget, NOT the expired warmup cap).
+/// 2. `Interval` — the bootstrap's output-node bounds verbatim.
+///
+/// SOUNDNESS: both are valid over-approximations of the output over the whole
+/// input region, and tier 2 is the WIDER of the two. Widening can only make
+/// `domain_is_verified_for_mode` / `domain_is_violation_for_mode` harder to
+/// satisfy, so no verdict is reachable here that the uncapped path would not
+/// also have allowed.
+///
+/// TOTAL, and deliberately infallible. It returns `None` -- "no fallback
+/// available" -- rather than an error, so every failure mode inside it leaves
+/// the caller holding the ORIGINAL deadline error. That error is the one
+/// `initial_bounds_deadline_status` already maps to a graceful `Unknown`; a
+/// fresh error out of here would escape that arm and fail the whole instance
+/// on a lane that never even performed this lookup before the key existed.
+///
+/// The earlier shape returned `Result` and propagated three things: a missing
+/// output node (`?` on `resolve_graph_output_bounds`), a reshape failure, and
+/// any non-deadline error from the CROWN retry. The first converted a
+/// recoverable row into a run-level error; the other two DISCARDED the
+/// already-certified tier-2 enclosure -- reintroducing, one level down, the
+/// exact abandonment this function exists to stop.
+pub(crate) fn graph_root_output_bounds_warmup_fallback(
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    config: &BetaCrownConfig,
+    engine: Option<&dyn GemmEngine>,
+    bootstrap: &GraphBabBootstrap,
+    retry_deadline: Option<Instant>,
+) -> Option<(BoundedTensor, WarmupFallbackTier)> {
+    // The already-certified enclosure. Resolve it FIRST: without it there is
+    // no fallback at all, and the caller must re-raise the original expiry.
+    let interval = match resolve_graph_output_bounds(graph, &bootstrap.initial_node_bounds) {
+        Ok(bounds) => bounds.clone(),
+        Err(err) => {
+            eprintln!("[warmup-fallback] no-enclosure: {err}");
+            return None;
+        }
+    };
+    let output_shape = interval.shape().to_vec();
+
+    if retry_deadline.is_some_and(|deadline| Instant::now() < deadline) {
+        let identity_spec = ndarray::Array2::<f32>::eye(interval.len());
+        // Tier 1 is BEST-EFFORT IN EVERY DIRECTION: a second expiry, a reshape
+        // failure, or any other error all fall through to the enclosure we
+        // already hold. Tier 2 is the wider of the two, so falling through can
+        // only cost tightness -- never a verdict.
+        if let Ok(output) = SpecCrownRequest::new(graph, input, &identity_spec, engine)
+            .node_bounds(&bootstrap.initial_node_bounds)
+            .deadline_opt(retry_deadline)
+            .truncate_after_opt(config.crown_backward_layers)
+            .run()
+        {
+            if let Ok(reshaped) = output.reshape(&output_shape) {
+                return Some((reshaped, WarmupFallbackTier::Crown));
+            }
+        }
+    }
+
+    Some((interval, WarmupFallbackTier::Interval))
 }
 
 #[cfg(test)]
@@ -548,6 +710,103 @@ mod tests {
         .expect("test input bounds should be valid");
 
         (graph, input)
+    }
+
+    /// The fallback is TOTAL: a bootstrap that carries no enclosure for the
+    /// output node yields `None` -- "no fallback available" -- and NOT an
+    /// error. The caller then re-raises the ORIGINAL deadline error, which
+    /// `initial_bounds_deadline_status` maps to a graceful `Unknown`. The
+    /// earlier `Result` shape converted that recoverable row into a run-level
+    /// failure on a lane that had never performed this lookup before.
+    #[test]
+    fn a_bootstrap_with_no_output_enclosure_declines_instead_of_erroring() {
+        let (graph, input) = build_test_graph();
+        let config = BetaCrownConfig {
+            use_alpha_crown: false,
+            ..Default::default()
+        };
+        let mut bootstrap = compute_graph_bab_bootstrap(&graph, &input, &config, None, None)
+            .expect("bootstrap should complete without a deadline");
+        // Strip the collected bounds: there is now nothing to fall back on.
+        bootstrap.initial_node_bounds.clear();
+
+        assert!(
+            graph_root_output_bounds_warmup_fallback(
+                &graph, &input, &config, None, &bootstrap, None,
+            )
+            .is_none(),
+            "a missing output enclosure must DECLINE, never fail the instance"
+        );
+    }
+
+    /// #budget-abandonment FIX A. When the iterative root pass errors with a
+    /// deadline, the fallback must hand back the enclosure the MANDATORY
+    /// bootstrap sweep already certified -- the same object, not a
+    /// recomputation. Asserted bit-for-bit against `resolve_graph_output_bounds`
+    /// on the very `initial_node_bounds` the bootstrap produced.
+    #[test]
+    fn warmup_fallback_returns_the_bootstrap_enclosure_when_the_retry_has_no_budget() {
+        let (graph, input) = build_test_graph();
+        let config = BetaCrownConfig {
+            use_alpha_crown: false,
+            ..Default::default()
+        };
+        let bootstrap = compute_graph_bab_bootstrap(&graph, &input, &config, None, None)
+            .expect("bootstrap should complete without a deadline");
+        let expected = resolve_graph_output_bounds(&graph, &bootstrap.initial_node_bounds)
+            .expect("bootstrap must carry the output node")
+            .clone();
+
+        // An ALREADY-EXPIRED retry deadline: tier 1 is skipped entirely, so
+        // what comes back is the zero-extra-compute enclosure.
+        let expired = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("expired instant");
+        let (bounds, tier) = graph_root_output_bounds_warmup_fallback(
+            &graph,
+            &input,
+            &config,
+            None,
+            &bootstrap,
+            Some(expired),
+        )
+        .expect("the fallback must succeed with no budget at all");
+
+        assert_eq!(tier, WarmupFallbackTier::Interval);
+        assert_eq!(
+            bounds
+                .lower()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .lower()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            "the fallback must publish the ALREADY-CERTIFIED lower bounds, bit for bit"
+        );
+        assert_eq!(
+            bounds
+                .upper()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .upper()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            "the fallback must publish the ALREADY-CERTIFIED upper bounds, bit for bit"
+        );
+    }
+
+    /// The tier labels are the measurement contract: `tier=` in the
+    /// `[warmup-fallback]` line is grepped by the sweep script.
+    #[test]
+    fn warmup_fallback_tier_labels_are_stable() {
+        assert_eq!(WarmupFallbackTier::Crown.label(), "crown");
+        assert_eq!(WarmupFallbackTier::Interval.label(), "interval");
     }
 
     fn build_typed_cgan_bootstrap_graph() -> (GraphNetwork, BoundedTensor) {

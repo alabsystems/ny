@@ -5,7 +5,7 @@
 //! Regression test: errors through the catch-all `_` arm in graph alpha-CROWN
 //! backward pass must propagate, not be silently swallowed.
 //!
-//! Part of #1972: The catch-all `_` arm in `backward.rs` distinguishes
+//! The catch-all `_` arm in `backward.rs` distinguishes
 //! `NyError::UnsupportedOp` (legitimate fallback) from other errors like
 //! `ShapeMismatch` (real bugs). This test exercises a `ShapeMismatch` through
 //! the catch-all to ensure it propagates as an error rather than being silently
@@ -113,7 +113,7 @@ fn setup_graph_with_catch_all_layer() -> (GraphNetwork, BoundedTensor) {
 /// unbounded linear bounds. The alpha-CROWN loop should succeed and produce
 /// valid (though conservative) bounds.
 ///
-/// Part of #2114: both the main loop and single-pass catch-all paths now
+/// Both the main loop and single-pass catch-all paths now
 /// consistently handle both successful dispatch and UnsupportedOp errors.
 #[ntest::timeout(10000)]
 #[test]
@@ -142,7 +142,7 @@ fn test_alpha_crown_catch_all_dispatches_opaque_skip_2114() {
 }
 
 /// Verify that the single-pass catch-all wraps non-UnsupportedOp errors with
-/// node context (part of #2114 fix).
+/// node context.
 ///
 /// Uses the same mismatched AddConstant graph as the main loop test, but
 /// through `propagate_alpha_crown` which exercises both paths. The error
@@ -215,7 +215,7 @@ fn setup_graph_with_sigmoid_multi_layer() -> (GraphNetwork, BoundedTensor) {
 }
 
 /// Verify that the catch-all `_` arm dispatches through CROWN backward by
-/// checking that alpha-CROWN produces tighter bounds than IBP (#2142).
+/// checking that alpha-CROWN produces tighter bounds than IBP.
 ///
 /// OpaqueSkipLayer returns [-inf, +inf] through both CROWN and IBP paths,
 /// making the dispatch path indistinguishable. This test uses Sigmoid (a

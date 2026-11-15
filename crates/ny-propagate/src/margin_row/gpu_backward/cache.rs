@@ -246,10 +246,16 @@ impl PlanStatic {
 
         // ---- head (the apply_linear statics, verbatim helper calls) ----
         let (w1, b1, (n_y, n_h)) = net.gemm1();
-        let rel = ds_weight_rel(0.0)?;
+        // #cct-margin-row-admission: a BN-folded head carries a certified
+        // fold error; charge it through the SAME helpers the conv statics
+        // use below (`ds_weight_rel(cv.weight_rel_err)`,
+        // `ds_bias_abs(&cv.bias, &cv.bias_err)`). Unfolded heads pass
+        // `(0.0, all-zero)` = the historical `(0.0, &[])` charge.
+        let (b1_err, w1_rel) = net.gemm1_fold_err();
+        let rel = ds_weight_rel(w1_rel)?;
         let (hb_bytes, hb_mass, hb_excess) = ds_scale_plane(b1)?;
         let head_bias = Some(BiasStatic {
-            berr: f32_up(ds_bias_abs(b1, &[])?)?,
+            berr: f32_up(ds_bias_abs(b1, b1_err)?)?,
             plane: ResidentPlane::new(hb_bytes, gpu),
             mass: hb_mass,
             excess: hb_excess,

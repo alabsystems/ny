@@ -14,18 +14,18 @@
 //!   weight tensor in `inputs[1]` (gc#4117).
 //! - `AdainSnake` / `AdainLeakyRelu`: constant gamma/beta → native
 //!   `LayerType::AdaIN` with precomputed style weights; variable gamma/beta →
-//!   decomposed InstanceNorm + Reshape + Mul + Add (#2987). Kokoro's
+//!   decomposed InstanceNorm + Reshape + Mul + Add. Kokoro's
 //!   `style_gamma = gamma + 1.0` residual convention is preserved on both
 //!   paths. The trailing activation is a native Snake or a decomposed
 //!   LeakyReLU.
 //! - `AdaLayerNorm` → LayerNorm + Add + Mul + Add
-//!   (`(1 + gamma) * LayerNorm(x, w, b) + beta`, #2547).
+//!   (`(1 + gamma) * LayerNorm(x, w, b) + beta`).
 //! - `FusedAdainResBlock` → ~20-30 primitive LayerSpecs: two
 //!   `(Linear(style) → split → InstanceNorm → affine → activation → Conv1d)`
-//!   phases plus the (optionally scaled) residual (#2547).
+//!   phases plus the (optionally scaled) residual.
 //!
 //! LeakyReLU is always decomposed to `α·x + (1−α)·ReLU(x)` for tight CROWN
-//! bounds (#2977) — native `LeakyReLULayer` returns IBP-wide CROWN bounds.
+//! bounds — native `LeakyReLULayer` returns IBP-wide CROWN bounds.
 
 use std::collections::HashMap;
 
@@ -652,7 +652,7 @@ fn try_native_adain(
 /// When gamma/beta are variable graph inputs (not constant weights), the
 /// compact 3-input `LayerType::AdaIN` form causes gamma-build to default
 /// `num_channels=1` (it can't find style params in the weight store).
-/// Decomposing into individual layers avoids this (#2987):
+/// Decomposing into individual layers avoids this:
 ///
 /// 1. InstanceNorm(x, ones(ch), zeros(ch)) → normalized `[C, T]`
 /// 2. Add(gamma, 1.0) → style_gamma `[C]` (Kokoro residual convention)
@@ -769,7 +769,7 @@ fn emit_variable_adain(
     Ok((specs, adain_out))
 }
 
-/// Emit decomposed LeakyReLU specs: `α*x + (1-α)*ReLU(x)` (#2977).
+/// Emit decomposed LeakyReLU specs: `α*x + (1-α)*ReLU(x)`.
 ///
 /// Mirrors NN's `emit_leaky_relu_specs` (prefix `{name}_lr`).
 fn emit_leaky_relu_specs(
@@ -922,7 +922,7 @@ fn emit_adain_phase(
     ));
 
     // Reshape gamma, beta: [C] → [C, 1] (unbatched convention for NY).
-    // gamma-build attribute-based Reshape does NOT strip batch (#2987), so the
+    // gamma-build attribute-based Reshape does NOT strip batch, so the
     // target must be unbatched [C, 1], not [-1, C, 1].
     let gamma_3d = format!("{name}_{phase}_gamma3d");
     let beta_3d = format!("{name}_{phase}_beta3d");
@@ -1021,7 +1021,7 @@ fn emit_activation(
         }
         ResBlockActivation::LeakyRelu { slope } => {
             // Decompose LeakyReLU(x, α) = α*x + (1-α)*ReLU(x) for tight CROWN
-            // bounds (#2977); NN uses the `{output_name}_lr` prefix here.
+            // bounds; NN uses the `{output_name}_lr` prefix here.
             let slope_f32 = checked_f64_to_f32(*slope, "LeakyRelu slope")?;
             emit_leaky_relu_specs(output_name, slope_f32, input_name, output_name, ctx, specs)
         }
@@ -1030,7 +1030,7 @@ fn emit_activation(
 
 /// Emit the decomposed Snake activation `x + (1/alpha) * sin²(alpha * x)` as
 /// 5 LayerSpecs (Mul, Sin, Pow, Mul, Add), constant-folding `1/alpha`
-/// (#2413). Mirrors NN's `emit_snake_activation`.
+///Mirrors NN's `emit_snake_activation`.
 fn emit_snake_activation(
     name: &str,
     phase: &str,
@@ -1042,7 +1042,7 @@ fn emit_snake_activation(
 ) -> Result<()> {
     let prefix = format!("{name}_{phase}_snake");
 
-    // Insert alpha weight and constant-fold 1/alpha (#2413).
+    // Insert alpha weight and constant-fold 1/alpha.
     let alpha_name = format!("{prefix}_alpha");
     let data = weight_f32(alpha, "FusedAdainResBlock Snake alpha")?;
     let alpha_arr = ArrayD::from_shape_vec(IxDyn(&alpha.shape), data)
@@ -1441,7 +1441,7 @@ mod tests {
     }
 
     /// AdainLeakyRelu with constant gamma/beta → native AdaIN + the
-    /// `α·x + (1−α)·ReLU(x)` LeakyReLU decomposition (#2977).
+    /// `α·x + (1−α)·ReLU(x)` LeakyReLU decomposition.
     #[test]
     fn adain_leaky_relu_constant_style() {
         let graph = ComputationGraph::from_nodes(vec![

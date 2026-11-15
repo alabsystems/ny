@@ -7,8 +7,6 @@
 //! Verifies multi-model pipelines (e.g., encoder → decoder → vocoder)
 //! by propagating bounds from one model's output to the next model's input.
 //! Each stage records its contribution to the certificate chain.
-//!
-//! Part of #3920.
 
 use ny_core::{NyError, Result, SoundnessProvenance};
 use ny_tensor::BoundedTensor;

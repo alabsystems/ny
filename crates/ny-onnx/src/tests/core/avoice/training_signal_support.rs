@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Shared output-width report assertion helpers for avoice training_signal
-//! tests (#3834).
+//! tests.
 //!
 //! All three avoice model families (speaker, talker, Kokoro) duplicate the
 //! same weak-region mining scaffold: metrics+provenance checks, hotspot contract,

@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Non-vacuous zonotope softmax regressions for #2479.
+//! Non-vacuous zonotope softmax regressions.
 //!
 //! These tests use per-element perturbations instead of `from_input_shared`, so
 //! the evaluated corners move off softmax's shift-invariant all-ones direction.

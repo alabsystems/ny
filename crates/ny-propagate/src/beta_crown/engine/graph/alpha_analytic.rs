@@ -374,7 +374,7 @@ pub(in crate::beta_crown::engine::graph) fn accumulate_alpha_gradients_for_row(
                     let u = data.pre_upper[j];
                     if l < 0.0 && u > 0.0 {
                         // d(lb)/d(α_j) = max(A_j, 0) · w_j, with w_j read
-                        // BEFORE the transform. NaN-safe max (#2643 analog);
+                        // BEFORE the transform. NaN-safe max;
                         // `accumulate_grad` drops non-finite values.
                         let grad = nan_propagating_max(data.coeff[j], 0.0) * v[j];
                         alpha_state.accumulate_grad(name, j, grad);
@@ -460,15 +460,34 @@ pub(in crate::beta_crown::engine::graph) fn relu_split_alpha_analytical_round(
         }
     }
 
+    // TRUST-REGION STEP (#alpha-analytic v3, 2026-08-29): v1 and v2 proved
+    // the DIRECTION correct (FD oracle) and the raw-magnitude step
+    // destructive — two independent row policies both saturated the delta
+    // store to its clamp rails and landed on the same -12.3 frontier. The
+    // raw gradient carries coefficient×activation scale; cap the LARGEST
+    // per-round delta move at TRUST (in delta space) while preserving the
+    // gradient's relative shape: step_i = grad_i · min(lr, TRUST/max|grad|).
+    const TRUST: f32 = 0.1;
     let mut max_grad = 0.0f32;
+    for neuron_map in alpha_state.neurons().values() {
+        for neuron in neuron_map.values() {
+            let grad = neuron.grad();
+            if grad.is_finite() {
+                max_grad = max_grad.max(grad.abs());
+            }
+        }
+    }
+    if max_grad <= 0.0 {
+        return Some(0.0);
+    }
+    let step = lr.min(TRUST / max_grad);
     for neuron_map in alpha_state.neurons_mut().values_mut() {
         for neuron in neuron_map.values_mut() {
             let grad = neuron.grad();
             if !grad.is_finite() {
                 continue;
             }
-            max_grad = max_grad.max(grad.abs());
-            neuron.set_alpha(neuron.alpha() + lr * grad);
+            neuron.set_alpha(neuron.alpha() + step * grad);
         }
     }
     Some(max_grad)
@@ -567,6 +586,143 @@ mod tests {
             .unwrap();
         let flat = output.flatten();
         (flat.lower()[[0]], node_bounds, intermediate)
+    }
+
+    /// PRODUCTION-COMPOSITION FD ORACLE (#alpha-analytic, 2026-08-29). The
+    /// 2-layer no-split fixture above passed while three deployed step
+    /// policies regressed identically (-12.3): the gap must live in what
+    /// production has and the fixture lacks — a MULTI-ReLU chain (branch
+    /// reconstruction at relu2 composes THROUGH relu1's relaxation) and a
+    /// SPLIT constraint with nonzero β. This oracle finite-differences the
+    /// actual spec-guided bound w.r.t. every unstable neuron's stored delta
+    /// in BOTH ReLU layers under exactly that shape; the neuron/layer where
+    /// the deployed gradient diverges from FD IS the direction bug.
+    #[test]
+    fn production_shape_fd_oracle_two_relus_with_split_beta() {
+        // 2 -> 3 -> relu1 -> 3 -> relu2 -> 1
+        let w1 = ndarray::arr2(&[[1.0f32, 0.4], [-0.5, 1.0], [0.6, -0.3]]);
+        let b1 = arr1(&[0.05f32, 0.1, 0.15]);
+        let w2 = ndarray::arr2(&[[0.8f32, -0.6, 0.5], [0.3, 0.9, -0.7], [-0.4, 0.2, 1.1]]);
+        let b2 = arr1(&[0.0f32, -0.05, 0.1]);
+        let w3 = ndarray::arr2(&[[1.0f32, -1.5, 0.75]]);
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input(
+            "linear1",
+            Layer::Linear(LinearLayer::new(w1, Some(b1)).unwrap()),
+        ));
+        graph.add_node(GraphNode::new(
+            "relu1",
+            Layer::ReLU(ReLULayer),
+            vec!["linear1".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "linear2",
+            Layer::Linear(LinearLayer::new(w2, Some(b2)).unwrap()),
+            vec!["relu1".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "relu2",
+            Layer::ReLU(ReLULayer),
+            vec!["linear2".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "linear3",
+            Layer::Linear(LinearLayer::new(w3, None).unwrap()),
+            vec!["relu2".to_string()],
+        ));
+        graph.set_output("linear3");
+        let input = BoundedTensor::new(
+            arr1(&[-1.0f32, -1.0]).into_dyn(),
+            arr1(&[2.0f32, 2.0]).into_dyn(),
+        )
+        .unwrap();
+
+        // One ACTIVE split on relu1 neuron 0 with a nonzero β, as production
+        // domains carry.
+        let mut history = GraphSplitHistory::new();
+        history.add_constraint(
+            crate::beta_crown::branching::GraphNeuronConstraint::new(
+                "relu1".to_string(),
+                0,
+                true,
+                1.0,
+            )
+            .unwrap(),
+        );
+        let mut beta_state = GraphBetaState::from_history(&history).unwrap();
+        for entry in beta_state.entries.iter_mut() {
+            entry.value = 0.4;
+        }
+        let verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+        let spec_matrix = ndarray::arr2(&[[1.0f32]]);
+        const STORED: f32 = 0.35;
+        const H: f32 = 1e-3;
+
+        let mut alpha_state = delta_alpha_state(&graph, &input, &history, STORED);
+        let (_, node_bounds, intermediate) = lower_bound_for(
+            &verifier,
+            &graph,
+            &input,
+            &history,
+            &beta_state,
+            &alpha_state,
+            &spec_matrix,
+        );
+        let relu_pre_boxes = collect_relu_pre_boxes(&graph, &node_bounds);
+        accumulate_alpha_gradients_for_row(
+            &graph,
+            &input,
+            &beta_state,
+            &mut alpha_state,
+            &intermediate,
+            &relu_pre_boxes,
+            spec_matrix.row(0),
+            0,
+        )
+        .expect("two-relu sequential chain must be supported");
+
+        let mut divergences = Vec::new();
+        for (node, n_neurons) in [("relu1", 3usize), ("relu2", 3usize)] {
+            for j in 0..n_neurons {
+                let Some(neuron) = alpha_state.neuron(node, j) else {
+                    continue; // stable or constrained: no α entry
+                };
+                let analytical = neuron.grad();
+                let mut plus = delta_alpha_state(&graph, &input, &history, STORED);
+                plus.neuron_mut(node, j).unwrap().set_alpha(STORED + H);
+                let (lb_plus, _, _) = lower_bound_for(
+                    &verifier,
+                    &graph,
+                    &input,
+                    &history,
+                    &beta_state,
+                    &plus,
+                    &spec_matrix,
+                );
+                let mut minus = delta_alpha_state(&graph, &input, &history, STORED);
+                minus.neuron_mut(node, j).unwrap().set_alpha(STORED - H);
+                let (lb_minus, _, _) = lower_bound_for(
+                    &verifier,
+                    &graph,
+                    &input,
+                    &history,
+                    &beta_state,
+                    &minus,
+                    &spec_matrix,
+                );
+                let fd = (lb_plus - lb_minus) / (2.0 * H);
+                let denom = fd.abs().max(analytical.abs()).max(1e-6);
+                if ((analytical - fd) / denom).abs() > 1e-2 {
+                    divergences.push(format!(
+                        "{node}[{j}]: analytical={analytical:.6} fd={fd:.6}"
+                    ));
+                }
+            }
+        }
+        assert!(
+            divergences.is_empty(),
+            "deployed gradient diverges from the production-shape FD oracle at: {divergences:?}"
+        );
     }
 
     /// The analytical per-parameter α gradient must match a central finite

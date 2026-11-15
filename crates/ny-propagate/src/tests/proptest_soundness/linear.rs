@@ -102,7 +102,7 @@ proptest! {
     }
 }
 
-/// Regression for #2183: Linear CROWN bias path must accumulate in f64 and
+/// Regression: Linear CROWN bias path must accumulate in f64 and
 /// apply directed rounding when casting to f32.
 /// Converted from proptest with `_case in 0u8..1` (zero randomization).
 #[ntest::timeout(10000)]

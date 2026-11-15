@@ -6,12 +6,10 @@ use super::{apply_preset, load_preset};
 use ny_propagate::{BetaCrownConfig, BranchingHeuristic, ConvMode};
 use std::path::Path;
 
-/// Part of #3813: Stage 1 regression — matrix-mode input split preset contract.
+/// Stage 1 regression — matrix-mode input split preset contract.
 ///
 /// Asserts the Stage 1 preset carries `conv_mode: matrix` into the no-cuts
-/// input-split lane, matching the EXECUTE design requirement.
-///
-/// Design: designs/2026-03-14-issue-3813-ibp-first-input-split-alternative.md
+/// input-split lane.
 #[test]
 fn relusplitter_rsplitter_matrix_input_split_preset_contract_3813() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Root avoice verifier-smoke entrypoint (#3950).
+//! Root avoice verifier-smoke entrypoint.
 //!
 //! Consolidates all avoice verifier-smoke tests behind a single root seam
 //! while delegating verifier-only containment helpers and family lanes into

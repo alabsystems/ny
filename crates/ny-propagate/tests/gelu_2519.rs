@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Public-API GELU proof coverage for #2519.
+//! Public-API GELU proof coverage.
 //!
 //! Covers:
 //! - `propagate_linear()` rejecting nonlinear GELU CROWN without pre-activation bounds

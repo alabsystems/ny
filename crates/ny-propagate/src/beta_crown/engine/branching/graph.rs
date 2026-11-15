@@ -23,7 +23,7 @@ impl BetaCrownVerifier {
             if !is_zero_threshold_binary_activation(&relu_node.layer) {
                 continue;
             }
-            // #2098: Skip nodes with empty inputs instead of fabricating NETWORK_INPUT.
+            // Skip nodes with empty inputs instead of fabricating NETWORK_INPUT.
             // A ReLU with no inputs is a graph construction bug — using network
             // input bounds would produce unsound branching decisions.
             let pre_name = match relu_node.inputs.first() {
@@ -43,18 +43,84 @@ impl BetaCrownVerifier {
                 }
             };
 
-            let flat = pre_bounds.flatten();
-            for neuron_idx in 0..flat.len() {
-                if domain
-                    .history
-                    .is_constrained(node_name, neuron_idx)
-                    .is_some()
+            // Hoisted out of the neuron loop: `is_constrained`
+            // (`branching/graph_history.rs:172`) hashes `node_name` on every
+            // call, against the two-level
+            // `relu_lookup: HashMap<String, HashMap<usize, bool>>` (:33). Here
+            // the loop below really does call it once per pre-activation
+            // element — unlike the α-init twin in
+            // `state/alpha/graph_init.rs`, this loop has no stable-neuron skip
+            // ahead of the constraint check.
+            //
+            // The guard can never UNDER-trigger. `relu_lookup` has exactly one
+            // writer, `GraphSplitHistory::add_constraint` (:117-118), which
+            // pushes the same constraint onto the public `constraints` vec (:24)
+            // in the same call, and no non-test code shrinks, reorders or
+            // rewrites that vec — the only two `constraints[0].node_name = …`
+            // sites are `engine/graph/resident_bab/operands.rs:1157` and `:1197`,
+            // both inside the `#[cfg(test)] mod tests` that opens at :746. So a
+            // node absent from `constraints` cannot hold a `relu_lookup` entry,
+            // and `is_constrained` would have returned `None` for it anyway.
+            //
+            // It can over-trigger in exactly one way: a node carrying a ReLU
+            // constraint on some OTHER neuron index. That merely runs the exact
+            // lookup the original always ran, so the skip decision — and
+            // therefore the returned candidate list — is unchanged. GenBaB is
+            // NOT such a case: those constraints land in
+            // `genbab_constraints`/`genbab_lookup` (:26, :38), which
+            // `is_constrained` never reads, so a GenBaB-only node makes this
+            // guard false and the exact lookup would have missed it too.
+            let node_may_be_constrained = domain
+                .history
+                .constraints
+                .iter()
+                .any(|c| c.node_name() == node_name.as_str());
+
+            // #flatten-to-read-a-scalar: this used to call `pre_bounds.flatten()`,
+            // which COPIES both endpoints into fresh `Vec<f32>`s
+            // (`ny-tensor bounded_tensor/core/shape_ops.rs:130-138`) purely to
+            // read two scalars per neuron — a full activation-sized pair of
+            // allocations per ReLU node, on a scan the batched lane maps over
+            // every domain of the batch (`multi_objective/batched/batched_multi.rs`
+            // runs it under `domains_to_process.par_iter()`). `flatten` fills
+            // those vectors with `self.lower.iter()` — `TrackedArrayD` derefs to
+            // `ArrayD<f32>` (`core/allocation_provenance.rs:217-224`), and
+            // `lower()` hands back that same array (`core/mod.rs:110-112`) — then
+            // wraps them with `from_parts_with_l2` (`core/mod.rs:162-172`), which
+            // is a bare struct literal: no repair, no clamp, no arithmetic. Both
+            // sides therefore go through the same `ArrayD::iter()`, so the zip
+            // below yields the same f32 values in the same order the flattened
+            // copy held, for any layout. This is the read the sibling
+            // `find_unstable_graph_neurons_multi_bounded` already documents.
+            //
+            // Zip length caveat, stated precisely because it is a behaviour
+            // change on one path: this scans `min(lower.len(), upper.len())`,
+            // whereas the old loop ran to `flat.len()` = `lower.len()` and
+            // indexed `upper`. Those agree only while the two endpoints have
+            // equal shapes, and equal shapes are a CALLER CONTRACT here, not a
+            // construction guarantee — `BoundedTensor::new`
+            // (`ny-tensor .../core/constructors.rs:142-148`) does reject a
+            // mismatch in every build, but the crate-internal
+            // `from_parts_unchecked` (`core/mod.rs:136-143`) enforces it with
+            // `debug_assert_eq!` only and `from_parts_with_l2` not at all. So in
+            // a release build with a violated contract and a shorter `upper`,
+            // the old code panicked on the index and this zip stops short
+            // instead, leaving the tail neurons out of the returned candidate
+            // list rather than aborting.
+            for (neuron_idx, (&l, &u)) in pre_bounds
+                .lower()
+                .iter()
+                .zip(pre_bounds.upper().iter())
+                .enumerate()
+            {
+                if node_may_be_constrained
+                    && domain
+                        .history
+                        .is_constrained(node_name, neuron_idx)
+                        .is_some()
                 {
                     continue;
                 }
-
-                let l = flat.lower()[[neuron_idx]];
-                let u = flat.upper()[[neuron_idx]];
 
                 if l < 0.0 && u > 0.0 {
                     unstable.push((node_name.clone(), neuron_idx));
@@ -186,7 +252,9 @@ impl BetaCrownVerifier {
         // `None` skips child evaluation inside the kFSB machinery gracefully.
         engine: Option<&dyn ny_core::GemmEngine>,
     ) -> Result<(String, usize, f32)> {
-        // Guard against empty unstable list (#1915).
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BranchSelect);
+        // Guard against empty unstable list.
         if unstable.is_empty() {
             return Err(ny_core::NyError::InternalError(
                 "select_graph_branch_multi: no unstable neurons to branch on".into(),
@@ -517,7 +585,7 @@ impl BetaCrownVerifier {
             if !is_zero_threshold_binary_activation(&relu_node.layer) {
                 continue;
             }
-            // #2098: Skip nodes with empty inputs instead of fabricating NETWORK_INPUT.
+            // Skip nodes with empty inputs instead of fabricating NETWORK_INPUT.
             // A ReLU with no inputs is a graph construction bug — using network
             // input bounds would produce unsound branching decisions.
             let pre_name = match relu_node.inputs.first() {
@@ -687,6 +755,8 @@ impl BetaCrownVerifier {
         unstable: &[(String, usize)],
         deadline: Option<std::time::Instant>,
     ) -> Result<(String, usize, f32)> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BranchSelect);
         if unstable.is_empty() {
             return Err(ny_core::NyError::InternalError(
                 "bounded multi-objective branch selector has no unstable neurons".into(),
@@ -782,7 +852,7 @@ impl BetaCrownVerifier {
     /// #mo-scorer-fix: real `LargestBoundWidth` scoring for the multi-objective
     /// selector — the neuron with the widest pre-activation interval (u - l),
     /// mirroring the sequential lane's `select_largest_width_neuron`. NaN
-    /// widths are skipped (#2588); `None` (nothing scorable) lets the caller
+    /// widths are skipped; `None` (nothing scorable) lets the caller
     /// fall through to the intercept ranking. Advisory-only ⇒ soundness-free.
     fn select_graph_branch_multi_width(
         &self,
@@ -901,6 +971,13 @@ impl BetaCrownVerifier {
         relu_nodes: &[String],
     ) -> Vec<(String, usize)> {
         let mut unstable = Vec::with_capacity(relu_nodes.len());
+        // This node's ReLU-constrained neuron indices, ascending, refilled once
+        // per node at the site below. Reused across nodes, so it keeps the
+        // capacity the busiest node has needed and stops reallocating after the
+        // first few refills. It holds at most one entry per ReLU constraint in
+        // the history — BaB depth — against the thousands of pre-activation
+        // elements the inner loop walks.
+        let mut constrained_idx: Vec<usize> = Vec::new();
 
         for node_name in relu_nodes {
             let relu_node = match graph.nodes.get(node_name) {
@@ -910,7 +987,7 @@ impl BetaCrownVerifier {
             if !is_zero_threshold_binary_activation(&relu_node.layer) {
                 continue;
             }
-            // #2098: Skip nodes with empty inputs instead of fabricating NETWORK_INPUT.
+            // Skip nodes with empty inputs instead of fabricating NETWORK_INPUT.
             // A ReLU with no inputs is a graph construction bug — using network
             // input bounds would produce unsound branching decisions.
             let pre_name = match relu_node.inputs.first() {
@@ -930,22 +1007,116 @@ impl BetaCrownVerifier {
                 }
             };
 
-            let flat = pre_bounds.flatten();
-            for neuron_idx in 0..flat.len() {
-                if domain
+            // Resolve the node's ReLU constraints ONCE per node. The loop below
+            // used to call `is_constrained` (`branching/graph_history.rs:172`)
+            // once per pre-activation ELEMENT: unlike the alpha-init twin in
+            // `state/alpha/graph_init.rs`, the historical loop had no
+            // stable-neuron skip ahead of the constraint check, so it paid for
+            // stable neurons too (the ordering below now supplies one). Every
+            // such call hashes `node_name` against the two-level
+            // `relu_lookup: HashMap<String, HashMap<usize, bool>>` (:33). That
+            // is `std`'s `HashMap` (`:9`), i.e. a full SipHash of the name's
+            // bytes, before the inner `usize` probe. What is left per neuron is
+            // a binary search over `constrained_idx`.
+            //
+            // `constrained_idx` is a SUPERSET of this node's `relu_lookup` keys,
+            // never a subset, and `is_constrained` still makes the final call —
+            // so the skip decision, and therefore the returned candidate list,
+            // is exactly what it was. The superset direction holds because
+            // `relu_lookup` is a PRIVATE field with exactly two writers:
+            // `GraphSplitHistory::new()`/`derive(Default)` (empty) and
+            // `add_constraint` (:117-118), which pushes the same constraint onto
+            // the public `constraints` vec (:24) in the same call (:122).
+            // Nothing else can desynchronize them: there is no
+            // `GraphSplitHistory` struct literal outside its own module (the
+            // private field forbids one), the type derives no serde impl, and
+            // the only non-test code that touches `constraints` is that single
+            // `push` — the two `constraints[0].node_name = …` sites,
+            // `engine/graph/resident_bab/operands.rs:1157` and `:1197`, are both
+            // inside the `#[cfg(test)] mod tests` that opens at :746.
+            //
+            // GenBaB constraints are correctly absent: they land in
+            // `genbab_constraints`/`genbab_lookup` (:26, :38), which
+            // `is_constrained` never reads, so a GenBaB-only node yields an
+            // empty `constrained_idx` and the old exact lookup would have missed
+            // it too. The two stay in agreement rather than one covering for the
+            // other.
+            constrained_idx.clear();
+            constrained_idx.extend(
+                domain
                     .history
-                    .is_constrained(node_name, neuron_idx)
-                    .is_some()
-                {
+                    .constraints
+                    .iter()
+                    .filter(|c| c.node_name() == node_name.as_str())
+                    .map(|c| c.neuron_idx()),
+            );
+            constrained_idx.sort_unstable();
+
+            // #flatten-to-read-a-scalar: this used to call `pre_bounds.flatten()`,
+            // which COPIES both endpoints into fresh `Vec<f32>`s
+            // (`ny-tensor bounded_tensor/core/shape_ops.rs:130-138`) purely to
+            // read two scalars per neuron — a full activation-sized pair of
+            // allocations per ReLU node, on a scan that
+            // `multi_objective/batched/batched_single.rs` maps over every domain
+            // of the batch under `domains_to_process.par_iter()`. `flatten`
+            // fills those vectors with `self.lower.iter()` — `TrackedArrayD`
+            // derefs to `ArrayD<f32>` (`core/allocation_provenance.rs:217-224`),
+            // and `lower()` hands back that same array (`core/mod.rs:110-112`) —
+            // then wraps them with `from_parts_with_l2` (`core/mod.rs:162-172`),
+            // which is a bare struct literal: no repair, no clamp, no
+            // arithmetic. Both sides therefore go through the same
+            // `ArrayD::iter()`, so the zip below yields the same f32 values in
+            // the same order the flattened copy held, for ANY memory layout —
+            // which `as_slice()` would NOT, since it is `None` on a
+            // non-standard-layout endpoint. This is the read the sibling
+            // `find_unstable_graph_neurons_multi_bounded` already documents
+            // ("reads already-owned arrays directly instead of
+            // flattening/cloning each producer tensor").
+            //
+            // Zip length caveat, stated precisely because it is a behaviour
+            // change on one path: this scans `min(lower.len(), upper.len())`,
+            // whereas the old loop ran to `flat.len()` = `lower.len()`
+            // (`core/mod.rs:195-197`) and indexed `upper`. Those agree only
+            // while the two endpoints have equal shapes, and equal shapes are a
+            // CALLER CONTRACT here, not a construction guarantee —
+            // `BoundedTensor::new` (`ny-tensor .../core/constructors.rs:142-148`)
+            // does reject a mismatch in every build, but the crate-internal
+            // `from_parts_unchecked` (`core/mod.rs:136-143`) enforces it with
+            // `debug_assert_eq!` only and `from_parts_with_l2` not at all. So in
+            // a release build with a violated contract and a shorter `upper`,
+            // the old code panicked on the index and this zip stops short
+            // instead, leaving the tail neurons out of the returned candidate
+            // list rather than aborting.
+            for (neuron_idx, (&l, &u)) in pre_bounds
+                .lower()
+                .iter()
+                .zip(pre_bounds.upper().iter())
+                .enumerate()
+            {
+                // Instability first. Both predicates are pure — `is_constrained`
+                // takes `&self` and only reads two maps — so testing them in
+                // either order selects the same indices, in the same ascending
+                // order, and on a node whose neurons are mostly stable this
+                // drops the constraint work for all of them. A NaN endpoint
+                // takes the same branch under either order: `l < 0.0 && u > 0.0`
+                // is false whenever either compare involves NaN.
+                if !(l < 0.0 && u > 0.0) {
                     continue;
                 }
 
-                let l = flat.lower()[[neuron_idx]];
-                let u = flat.upper()[[neuron_idx]];
-
-                if l < 0.0 && u > 0.0 {
-                    unstable.push((node_name.clone(), neuron_idx));
+                if !constrained_idx.is_empty() && constrained_idx.binary_search(&neuron_idx).is_ok()
+                {
+                    record_exact_constraint_lookup();
+                    if domain
+                        .history
+                        .is_constrained(node_name, neuron_idx)
+                        .is_some()
+                    {
+                        continue;
+                    }
                 }
+
+                unstable.push((node_name.clone(), neuron_idx));
             }
         }
 
@@ -974,7 +1145,7 @@ impl BetaCrownVerifier {
     /// intercept-only: (-l * u) / (u - l).
     ///
     /// When `k == 1`, returns the single best neuron (used by `select_graph_branch`).
-    /// For k > 1, the top-k candidates enable multi-depth splitting (#2767).
+    /// For k > 1, the top-k candidates enable multi-depth splitting.
     ///
     /// Reference: alpha-beta-CROWN `find_topk_scores()` in `base.py:97-168`.
     pub(in crate::beta_crown::engine) fn select_graph_branches(
@@ -984,6 +1155,8 @@ impl BetaCrownVerifier {
         unstable: &[(String, usize)],
         k: usize,
     ) -> Result<Vec<(String, usize, f32)>> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BranchSelect);
         if unstable.is_empty() {
             return Err(ny_core::NyError::InternalError(
                 "select_graph_branches: no unstable neurons to branch on".into(),
@@ -1077,5 +1250,304 @@ impl BetaCrownVerifier {
         scored.truncate(k);
 
         Ok(scored)
+    }
+}
+
+// Test-only count of the EXACT `GraphSplitHistory::is_constrained` lookups
+// performed by [`BetaCrownVerifier::find_unstable_graph_neurons`].
+//
+// The per-node constraint resolution in that scan is invisible from its return
+// value — the candidate list is identical by construction — so reverting it to
+// the historical per-neuron `is_constrained` call would break nothing that an
+// output-comparing test could see. This counter is what fails instead: the
+// fast lane reaches the exact map only for indices that survive BOTH the
+// instability test and the sorted-index binary search, so it is bounded by the
+// node's own ReLU-constraint count, while the historical loop reached it once
+// per pre-activation element.
+//
+// Thread-local, so tests running in parallel cannot observe each other's
+// counts, and `#[cfg(test)]`, so the shipped scan carries no counter at all.
+#[cfg(test)]
+thread_local! {
+    static TEST_EXACT_CONSTRAINT_LOOKUPS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_exact_constraint_lookup() {
+    TEST_EXACT_CONSTRAINT_LOOKUPS.with(|count| {
+        count.set(count.get().saturating_add(1));
+    });
+}
+
+// Production no-op twin of the counter above, so the call site is an ordinary
+// statement in every build. Without it the `#[cfg(test)]` attribute would leave
+// the release build with an `if` whose sole statement is another `if`, which is
+// `clippy::collapsible_if`; an empty `#[inline]` function optimizes away
+// instead.
+#[cfg(not(test))]
+#[inline(always)]
+fn record_exact_constraint_lookup() {}
+
+#[cfg(test)]
+fn reset_test_exact_constraint_lookups() {
+    TEST_EXACT_CONSTRAINT_LOOKUPS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn test_exact_constraint_lookups() -> usize {
+    TEST_EXACT_CONSTRAINT_LOOKUPS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use ny_tensor::BoundedTensor;
+
+    use super::{reset_test_exact_constraint_lookups, test_exact_constraint_lookups};
+    use crate::beta_crown::branching::GraphNeuronConstraint;
+    use crate::beta_crown::domain::GraphBabDomain;
+    use crate::beta_crown::{BetaCrownConfig, BetaCrownVerifier};
+    use crate::layers::ReLULayer;
+    use crate::{GraphNetwork, GraphNode, Layer};
+
+    /// A one-ReLU graph whose producer is an ordinary named node, so the scan
+    /// takes the `domain.node_bounds` branch rather than the network-input one.
+    fn single_relu_graph() -> GraphNetwork {
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::new(
+            "relu0",
+            Layer::ReLU(ReLULayer),
+            vec!["pre".to_string()],
+        ));
+        graph
+    }
+
+    fn domain_with(pre: BoundedTensor) -> GraphBabDomain {
+        let input = BoundedTensor::new(
+            ndarray::arr1(&[-1.0_f32]).into_dyn(),
+            ndarray::arr1(&[1.0_f32]).into_dyn(),
+        )
+        .expect("input bounds");
+        let mut node_bounds = HashMap::new();
+        node_bounds.insert("pre".to_string(), pre);
+        GraphBabDomain::root(node_bounds, -1.0, 1.0, &input, false).expect("root domain")
+    }
+
+    /// FAIL-CLOSED ENGAGEMENT PROOF for BOTH invisible halves of the scan: the
+    /// per-node constraint resolution AND the instability-first ordering.
+    ///
+    /// Drives the shipped `find_unstable_graph_neurons` — not a private copy —
+    /// over one node whose 64 pre-activation elements are a deliberate MIX:
+    /// even indices unstable (`l < 0 < u`), odd indices stable (alternating
+    /// stable-inactive `u <= 0` and stable-active `l >= 0`). The node carries
+    /// three ReLU constraints — one on an unstable index, two on stable ones.
+    ///
+    /// Neither half is visible in the returned candidate list: `is_constrained`
+    /// and the instability test are both pure, so either evaluation order and
+    /// either resolution strategy selects the same indices in the same
+    /// ascending order. The exact-lookup counter is the only observable, and
+    /// this test pins it at 1 — the one constrained neuron that is also
+    /// unstable. Each half breaks that number on its own:
+    ///
+    /// * restoring the per-neuron `is_constrained` call makes every neuron the
+    ///   loop reaches consult the exact map: 32 lookups if the instability test
+    ///   still stands in front of it, and 64 for the fully historical loop,
+    ///   which walked `0..flat.len()` testing the constraint FIRST, with no
+    ///   stable-neuron skip anywhere;
+    /// * keeping the per-node resolution but testing the constraint before
+    ///   `l < 0 && u > 0` lets the two constrained STABLE neurons reach the
+    ///   exact map as well: 3 lookups.
+    ///
+    /// The mix is what makes the second bullet observable, so the fixture
+    /// asserts its own stable/unstable split below. An all-unstable fixture —
+    /// which this test used until the ordering assertion was audited — leaves
+    /// the ordering unexercised and pins only the first bullet.
+    #[test]
+    fn find_unstable_graph_neurons_resolves_constraints_once_per_node() {
+        // Even index -> unstable (l < 0 < u). Odd index -> stable, alternating
+        // stable-inactive (u <= 0) and stable-active (l >= 0), so both stable
+        // shapes are represented.
+        fn bounds_for(idx: usize) -> (f32, f32) {
+            if idx.is_multiple_of(2) {
+                (-1.0, 1.0)
+            } else if idx % 4 == 1 {
+                (-2.0, -1.0)
+            } else {
+                (1.0, 2.0)
+            }
+        }
+        fn is_unstable(idx: usize) -> bool {
+            let (l, u) = bounds_for(idx);
+            l < 0.0 && u > 0.0
+        }
+
+        const WIDTH: usize = 64;
+        // Constrained AND unstable: the only index that may reach the exact map.
+        const CONSTRAINED_UNSTABLE: usize = 8;
+        // Constrained but stable: reachable only if the constraint test runs
+        // before the instability test.
+        const CONSTRAINED_STABLE_INACTIVE: usize = 9;
+        const CONSTRAINED_STABLE_ACTIVE: usize = 11;
+
+        let lower: Vec<f32> = (0..WIDTH).map(|idx| bounds_for(idx).0).collect();
+        let upper: Vec<f32> = (0..WIDTH).map(|idx| bounds_for(idx).1).collect();
+
+        assert!(
+            is_unstable(CONSTRAINED_UNSTABLE),
+            "the once-per-node pin needs its constrained neuron to be unstable, \
+             so that exactly one lookup survives the instability test"
+        );
+        assert!(
+            !is_unstable(CONSTRAINED_STABLE_INACTIVE) && !is_unstable(CONSTRAINED_STABLE_ACTIVE),
+            "the ordering pin needs constrained neurons the instability test \
+             REJECTS; with none, dropping the ordering costs no lookups and \
+             this test stops seeing it"
+        );
+        assert_eq!(
+            (0..WIDTH).filter(|&idx| is_unstable(idx)).count(),
+            WIDTH / 2,
+            "the fixture must stay a mix of stable and unstable neurons"
+        );
+
+        let pre = BoundedTensor::new(
+            ndarray::Array1::from_vec(lower).into_dyn(),
+            ndarray::Array1::from_vec(upper).into_dyn(),
+        )
+        .expect("mixed stable/unstable pre-activation bounds");
+
+        let graph = single_relu_graph();
+        let mut domain = domain_with(pre);
+        for (neuron_idx, is_active) in [
+            (CONSTRAINED_UNSTABLE, true),
+            (CONSTRAINED_STABLE_INACTIVE, false),
+            (CONSTRAINED_STABLE_ACTIVE, true),
+        ] {
+            domain.history.add_constraint(
+                GraphNeuronConstraint::new("relu0".to_string(), neuron_idx, is_active, 1.0)
+                    .expect("finite score"),
+            );
+        }
+
+        let verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+        let relu_nodes = vec!["relu0".to_string()];
+
+        reset_test_exact_constraint_lookups();
+        let unstable = verifier.find_unstable_graph_neurons(&graph, &domain, &relu_nodes);
+        let lookups = test_exact_constraint_lookups();
+
+        let expected: Vec<(String, usize)> = (0..WIDTH)
+            .filter(|&idx| is_unstable(idx) && idx != CONSTRAINED_UNSTABLE)
+            .map(|idx| ("relu0".to_string(), idx))
+            .collect();
+        assert_eq!(
+            unstable, expected,
+            "every unstable neuron but the constrained one, ascending; no stable \
+             neuron appears, constrained or not"
+        );
+
+        assert_eq!(
+            lookups, 1,
+            "the scan must resolve relu0's constraints once per node and reach \
+             is_constrained only for the constrained index that is ALSO \
+             unstable; got {lookups} exact lookups over {WIDTH} neurons — 3 \
+             means the instability-first ordering is gone, 32 or 64 mean the \
+             per-neuron lookup is back"
+        );
+    }
+
+    /// The zero-constraint case must never touch the exact map at all — the
+    /// common shape in BaB, where most ReLU nodes carry no split.
+    #[test]
+    fn find_unstable_graph_neurons_skips_the_exact_map_for_an_unconstrained_node() {
+        const WIDTH: usize = 32;
+
+        let pre = BoundedTensor::new(
+            ndarray::Array1::from_elem(WIDTH, -1.0_f32).into_dyn(),
+            ndarray::Array1::from_elem(WIDTH, 1.0_f32).into_dyn(),
+        )
+        .expect("all-unstable pre-activation bounds");
+
+        let graph = single_relu_graph();
+        let mut domain = domain_with(pre);
+        // A constraint on a DIFFERENT node: `constraints` is non-empty, so the
+        // guard cannot pass merely because the history is empty.
+        domain.history.add_constraint(
+            GraphNeuronConstraint::new("relu_other".to_string(), 3, false, 1.0)
+                .expect("finite score"),
+        );
+
+        let verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+        let relu_nodes = vec!["relu0".to_string()];
+
+        reset_test_exact_constraint_lookups();
+        let unstable = verifier.find_unstable_graph_neurons(&graph, &domain, &relu_nodes);
+        let lookups = test_exact_constraint_lookups();
+
+        assert_eq!(unstable.len(), WIDTH, "all {WIDTH} neurons are unstable");
+        assert_eq!(
+            lookups, 0,
+            "a node with no ReLU constraint of its own must never reach the \
+             exact map; got {lookups} lookups"
+        );
+    }
+
+    /// The endpoint read must follow `ArrayD::iter()` — logical row-major, which
+    /// is exactly what the retired `flatten()` collected — and NOT the raw
+    /// buffer. `reversed_axes()` keeps the original buffer with transposed
+    /// strides, so `as_slice()` is `None` and buffer order differs from logical
+    /// order; a substitution that read memory order would return a different
+    /// index set here.
+    #[test]
+    fn find_unstable_graph_neurons_reads_logical_order_on_a_transposed_tensor() {
+        // Row-major 2x3, then transposed to 3x2 without copying.
+        //   lower buffer [-1, 1, -1,  1, -1, 1] -> iter [-1,  1,  1, -1, -1, 1]
+        //   upper buffer [ 1, 2,  1,  2,  1, 2] -> iter [ 1,  2,  2,  1,  1, 2]
+        // so l < 0 < u holds at logical indices 0, 3, 4. Reading the BUFFER
+        // instead would make 0, 2, 4 unstable — a different index set, so the
+        // assertion below separates the two.
+        let lower =
+            ndarray::Array2::from_shape_vec((2, 3), vec![-1.0_f32, 1.0, -1.0, 1.0, -1.0, 1.0])
+                .expect("2x3 lower")
+                .reversed_axes()
+                .into_dyn();
+        let upper = ndarray::Array2::from_shape_vec((2, 3), vec![1.0_f32, 2.0, 1.0, 2.0, 1.0, 2.0])
+            .expect("2x3 upper")
+            .reversed_axes()
+            .into_dyn();
+        assert!(
+            lower.as_slice().is_none(),
+            "the test needs a non-standard layout for the read to be observable"
+        );
+
+        let pre = BoundedTensor::new(lower, upper).expect("transposed pre-activation bounds");
+
+        // Reference: what the retired `flatten()` read, computed the old way.
+        let flat = pre.flatten();
+        let reference: Vec<(String, usize)> = (0..flat.len())
+            .filter(|&idx| flat.lower()[[idx]] < 0.0 && flat.upper()[[idx]] > 0.0)
+            .map(|idx| ("relu0".to_string(), idx))
+            .collect();
+
+        let graph = single_relu_graph();
+        let domain = domain_with(pre);
+        let verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+        let relu_nodes = vec!["relu0".to_string()];
+        let unstable = verifier.find_unstable_graph_neurons(&graph, &domain, &relu_nodes);
+
+        assert_eq!(
+            unstable,
+            vec![
+                ("relu0".to_string(), 0),
+                ("relu0".to_string(), 3),
+                ("relu0".to_string(), 4),
+            ],
+            "logical (iter) order, not buffer order"
+        );
+        assert_eq!(
+            unstable, reference,
+            "must match what flatten() would have read"
+        );
     }
 }

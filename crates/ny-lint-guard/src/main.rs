@@ -3,27 +3,14 @@
 
 #![forbid(unsafe_code)]
 
-//! `ny-lint-guard` — a compiled, incremental clippy gate for the ny workspace.
+//! Local Tippy gate: `check` lints changed ny-* crates, `fix` applies fixes
+//! except the numeric lints listed below, and `full` lints every workspace
+//! member. Checks deny remaining warnings; discovery and final-check failures
+//! fail the gate.
 //!
-//! This repo has no CI, so the `-D warnings` lint gate (`make lint`) is only as
-//! green as the last person to run it, and the full workspace gate is too slow
-//! to run on every change. This tool runs stock clippy scoped to only the
-//! `ny-*` crates changed versus a baseline (default `origin/main`), so it
-//! finishes in seconds.
-//!
-//! Modes:
-//!   check   (default)  clippy the changed crates, fail on any warning
-//!   fix                auto-apply the mechanically-safe fixes, then list the rest
-//!   full               the complete workspace gate (== `cargo clippy` -D warnings)
-//!   crates             print the changed `ny-*` crate names and exit
-//!
-//! The `fix` mode holds the soundness-sensitive lints OUT of the autofix so
-//! clippy can never rewrite a bound computation or a NaN-rejecting comparison
-//! in this verifier; those are re-reported for a human to resolve with a scoped
-//! `#[allow]` + reason.
-//!
-//! Baseline override: `LINT_GUARD_BASE=<git-ref>` (falls back to `HEAD` if the
-//! ref does not resolve).
+//! `LINT_GUARD_BASE` selects the Git baseline (default `origin/main`, falling
+//! back to `HEAD` if unavailable). Changed-file discovery includes committed,
+//! staged, unstaged and untracked files.
 
 use std::collections::BTreeSet;
 use std::process::{Command, ExitCode};
@@ -40,23 +27,32 @@ const SOUNDNESS_LINTS: &[&str] = &[
 
 fn main() -> ExitCode {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "check".into());
+    let crates = match mode.as_str() {
+        "crates" | "check" | "fix" => match changed_crates() {
+            Ok(crates) => crates,
+            Err(error) => {
+                eprintln!("ny-lint-guard: {error}");
+                return ExitCode::FAILURE;
+            }
+        },
+        _ => Vec::new(),
+    };
     match mode.as_str() {
         "-h" | "--help" | "help" => {
             print_help();
             ExitCode::SUCCESS
         }
         "crates" => {
-            for c in changed_crates() {
+            for c in crates {
                 println!("{c}");
             }
             ExitCode::SUCCESS
         }
         "full" => {
-            eprintln!("ny-lint-guard: full workspace clippy gate (-D warnings)");
+            eprintln!("ny-lint-guard: full workspace Tippy gate (-D warnings)");
             run_gate(&[]) // empty package list => whole workspace
         }
         "check" => {
-            let crates = changed_crates();
             if crates.is_empty() {
                 println!(
                     "ny-lint-guard: no changed ny-* crates vs {} — nothing to gate.",
@@ -65,13 +61,12 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             eprintln!(
-                "ny-lint-guard: clippy gate on changed crates: {}",
+                "ny-lint-guard: Tippy gate on changed crates: {}",
                 crates.join(" ")
             );
             run_gate(&crates)
         }
         "fix" => {
-            let crates = changed_crates();
             if crates.is_empty() {
                 println!(
                     "ny-lint-guard: no changed ny-* crates vs {} — nothing to fix.",
@@ -92,11 +87,11 @@ fn main() -> ExitCode {
 
 fn print_help() {
     print!(
-        "ny-lint-guard — incremental clippy gate for the ny workspace\n\n\
+        "ny-lint-guard — incremental Tippy gate for the ny workspace\n\n\
          USAGE: ny-lint-guard [MODE]\n\n\
          MODES:\n\
-         \x20 check   (default)  clippy the crates changed vs origin/main; fail on any warning\n\
-         \x20 fix                auto-apply mechanically-safe fixes, then list what remains\n\
+         \x20 check   (default)  lint crates changed vs origin/main; fail on any warning\n\
+         \x20 fix                apply fixes except listed numeric lints, then check the rest\n\
          \x20 full               the complete workspace gate\n\
          \x20 crates             print the changed ny-* crate names\n\n\
          ENV:  LINT_GUARD_BASE=<git-ref>   baseline for \"changed\" (default origin/main)\n"
@@ -119,22 +114,28 @@ fn base() -> String {
 
 /// The `ny-*` crates with changes versus the baseline: committed-since-base,
 /// working-tree, staged, and untracked source files all count.
-fn changed_crates() -> Vec<String> {
+fn changed_crates() -> Result<Vec<String>, String> {
     let base = base();
     let mut files = String::new();
     for args in [
-        vec!["diff", "--name-only", &format!("{base}...HEAD")],
-        vec!["diff", "--name-only", "HEAD"],
-        vec!["diff", "--name-only", "--cached"],
-        vec!["ls-files", "--others", "--exclude-standard"],
+        vec!["diff", "--name-only", "-z", &format!("{base}...HEAD")],
+        vec!["diff", "--name-only", "-z", "HEAD"],
+        vec!["diff", "--name-only", "-z", "--cached"],
+        vec!["ls-files", "--others", "--exclude-standard", "-z"],
     ] {
-        if let Some(out) = git(&args) {
-            files.push_str(&String::from_utf8_lossy(&out.stdout));
-            files.push('\n');
+        let out =
+            git(&args).map_err(|error| format!("could not inspect changed files: {error}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
         }
+        files.push_str(&String::from_utf8_lossy(&out.stdout));
     }
     let mut set = BTreeSet::new();
-    for line in files.lines() {
+    for line in files.split('\0') {
         // "crates/ny-foo/src/..." -> "ny-foo"
         if let Some(rest) = line.strip_prefix("crates/") {
             if let Some(name) = rest.split('/').next() {
@@ -144,13 +145,16 @@ fn changed_crates() -> Vec<String> {
             }
         }
     }
-    set.into_iter().collect()
+    Ok(set.into_iter().collect())
 }
 
 /// Run the clippy gate (`-D warnings`) over the given packages, or the whole
 /// workspace when the list is empty. Returns clippy's exit status.
 fn run_gate(pkgs: &[String]) -> ExitCode {
-    let mut args = vec!["clippy".to_string()];
+    let mut args = vec![lint_subcommand().to_string()];
+    if pkgs.is_empty() {
+        args.push("--workspace".into());
+    }
     for p in pkgs {
         args.push("-p".into());
         args.push(p.clone());
@@ -159,15 +163,14 @@ fn run_gate(pkgs: &[String]) -> ExitCode {
     passthrough(cargo(&args))
 }
 
-/// Autofix the mechanically-safe lints on the changed crates (soundness lints
-/// held out), then report every diagnostic that remains.
+/// Apply fixes with the listed numeric lints disabled, then check all lints.
 fn run_fix(crates: &[String]) -> ExitCode {
     eprintln!(
-        "ny-lint-guard: auto-fixing mechanically-safe lints on: {}",
+        "ny-lint-guard: applying fixes except listed numeric lints on: {}",
         crates.join(" ")
     );
     let mut args = vec![
-        "clippy".to_string(),
+        lint_subcommand().to_string(),
         "--fix".into(),
         "--allow-dirty".into(),
         "--allow-staged".into(),
@@ -183,16 +186,23 @@ fn run_fix(crates: &[String]) -> ExitCode {
     }
     let _ = cargo(&args); // best-effort; report the residue regardless
 
-    eprintln!(
-        "\nny-lint-guard: remaining diagnostics (incl. the soundness-sensitive lints that must be\n\
-         resolved by hand — keep the literal and add a scoped #[allow] with a reason):"
-    );
-    let mut report = vec!["clippy".to_string()];
+    eprintln!("\nny-lint-guard: remaining diagnostics (numeric lints require manual review):");
+    let mut report = vec![lint_subcommand().to_string()];
     for p in crates {
         report.push("-p".into());
         report.push(p.clone());
     }
-    report.extend(["--all-targets", "--all-features", "--message-format=short"].map(String::from));
+    report.extend(
+        [
+            "--all-targets",
+            "--all-features",
+            "--message-format=short",
+            "--",
+            "-D",
+            "warnings",
+        ]
+        .map(String::from),
+    );
     match cargo_capture(&report) {
         Some(out) => {
             let text = format!(
@@ -200,33 +210,53 @@ fn run_fix(crates: &[String]) -> ExitCode {
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             );
-            let warnings: Vec<&str> = text.lines().filter(|l| l.contains(": warning:")).collect();
-            if warnings.is_empty() {
+            if out.status.success() {
                 println!("  (none — changed crates are clean)");
                 ExitCode::SUCCESS
             } else {
-                for w in &warnings {
-                    println!("{w}");
-                }
+                eprint!("{text}");
                 ExitCode::FAILURE
             }
         }
-        None => ExitCode::FAILURE,
+        None => {
+            eprintln!("ny-lint-guard: failed to spawn the remaining-diagnostics check");
+            ExitCode::FAILURE
+        }
     }
 }
 
 // ---- subprocess helpers ----
 
-fn git(args: &[&str]) -> Option<std::process::Output> {
-    Command::new("git").args(args).output().ok()
+fn git(args: &[&str]) -> std::io::Result<std::process::Output> {
+    Command::new("git").args(args).output()
+}
+
+/// The build tool: `$CARGO` (whatever runs this, normally targo), else
+/// `targo` from PATH. There is no bare-`cargo` fallback.
+fn targo() -> std::ffi::OsString {
+    std::env::var_os("CARGO").unwrap_or_else(|| "targo".into())
+}
+
+/// The Trust toolchain ships its clippy as `targo tippy`; a stock cargo
+/// spells it `clippy`.
+fn lint_subcommand() -> &'static str {
+    let tool = targo();
+    let is_targo = std::path::Path::new(&tool)
+        .file_stem()
+        .is_some_and(|stem| stem == "targo");
+    if is_targo {
+        "tippy"
+    } else {
+        "clippy"
+    }
 }
 
 fn cargo(args: &[String]) -> Option<std::process::ExitStatus> {
-    Command::new("cargo").args(args).status().ok()
+    Command::new(targo()).args(args).status().ok()
 }
 
 fn cargo_capture(args: &[String]) -> Option<std::process::Output> {
-    Command::new("cargo").args(args).output().ok()
+    Command::new(targo()).args(args).output().ok()
 }
 
 fn passthrough(status: Option<std::process::ExitStatus>) -> ExitCode {
@@ -234,7 +264,7 @@ fn passthrough(status: Option<std::process::ExitStatus>) -> ExitCode {
         Some(s) if s.success() => ExitCode::SUCCESS,
         Some(s) => ExitCode::from(s.code().unwrap_or(1) as u8),
         None => {
-            eprintln!("ny-lint-guard: failed to spawn cargo");
+            eprintln!("ny-lint-guard: failed to spawn targo (the Trust toolchain's cargo)");
             ExitCode::FAILURE
         }
     }

@@ -1,0 +1,27 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# smart_turn QDQ activation-relaxation CANARY (#smart-turn-qdq) — NOT a
+# production preset. The `_qdq_canary` suffix keeps it out of category
+# resolution: no scored run can pick it up. To arm the probe, copy this file
+# to `<dir>/vnncomp26/smart_turn_multimodal_2026.yaml` and pass
+# `--configs-dir <dir>` explicitly.
+#
+# What it arms: the DARK `model.qdq_activation_relaxation` gate —
+# (1) loader admission of the audio encoder's static
+#     `Shape -> Slice -> Cast(FLOAT) -> Sqrt` head-dim scaling as a
+#     deferred-fold obligation, and
+# (2) fusion of each activation `QuantizeLinear -> DequantizeLinear` pair
+#     (119 in smart-turn-multimodal-cpu.onnx) into the certified
+#     `QdqPerturbationLayer` enclosure.
+#
+# REPORT-ONLY: with this key armed, the vnncomp funnel withholds any
+# `unsat`/`sat` the internal verifier derives on a graph containing
+# relaxation layers, and the probe prints the pre-quantizer bounds instead
+# (`[qdq_relax]` stderr lines). The sound target for a future adjudicated
+# round: upper bound of `/classifier/classifier.6/Gemm_output_0` strictly
+# below s/2 = +0.004727089 (see
+# reports/measured-2026/smart_turn_bucket_bisect_2026-08-31/README.md).
+model:
+  qdq_activation_relaxation: true

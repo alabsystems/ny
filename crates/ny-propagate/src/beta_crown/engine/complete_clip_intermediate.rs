@@ -23,7 +23,6 @@
 //!
 //! - `auto_LiRPA/concretize_bounds.py:concretize_bounds` — two-pass approach
 //! - `auto_LiRPA/concretize_func.py:constraints_solving` — LP solver call
-//! - `designs/2026-03-17-issue-3552-complete-clipping-semantics-execution-packet.md` Packet 3
 
 use ndarray::{Array1, Array2};
 use ny_core::Result;
@@ -131,7 +130,6 @@ pub(in crate::beta_crown::engine) fn tighten_intermediate_with_spec_constraints(
         }
 
         // Determine budget from selection_ratio
-        // Reference: designs/2026-03-17-issue-3552-complete-clipping-semantics-execution-packet.md
         //   ratio < 0: tighten all unstable neurons
         //   ratio in [0, 1]: ceil(unstable_count * ratio), clamped to >= 1
         let budget = if selection_ratio < 0.0 {
@@ -266,7 +264,7 @@ fn select_neurons_by_uncertainty(
         .collect();
 
     // Sort descending by gap (largest uncertainty first).
-    // NaN-safe: nan_last_descending_cmp sorts NaN last (#4288).
+    // NaN-safe: nan_last_descending_cmp sorts NaN last.
     // Defense-in-depth: the is_finite() filter above excludes NaN gaps,
     // but the safe comparator prevents silent corruption if the filter changes.
     unstable.sort_by(|a, b| nan_last_descending_cmp(&a.1, &b.1));
@@ -372,7 +370,7 @@ mod tests {
         let lower = array![0.1, 0.2, 0.3];
         let upper = array![1.0, 2.0, 3.0];
         let selected = select_neurons_by_uncertainty(&lower, &upper, 5);
-        assert!(selected.is_empty());
+        assert_eq!((selected).len(), 0);
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 //! Composition of batched linear bounds for CROWN backward propagation.
 //!
-//! Extracted from `mod.rs` as part of #4212.
+//! Extracted from `mod.rs`.
 
 use super::BatchedLinearBounds;
 use crate::bounds::safe_math::{
@@ -219,13 +219,12 @@ impl BatchedLinearBounds {
         // which for n=768 (transformer hidden dim) can be ~5e-5 per element, compounding
         // across layers during backward propagation.
         //
-        // Reference: batched_interval_matvec (interval.rs) uses the same f64 pattern
-        // per #2214. alpha-beta-CROWN uses f64 intermediates (optimized_bounds.py:82).
-        // Fix for #2269.
+        // Reference: batched_interval_matvec (interval.rs) uses the same f64 pattern.
+        // alpha-beta-CROWN uses f64 intermediates (optimized_bounds.py:82).
         //
-        // Uses module-level functions: interval_mul_for_bounds (also verified by Kani proofs).
+        // Uses module-level functions: interval_mul_for_bounds.
         //
-        // Dispatch: BLAS SGEMM when all inputs are finite (#2220 Packet C),
+        // Dispatch: BLAS SGEMM when all inputs are finite,
         // scalar interval_mul_for_bounds fallback otherwise. The BLAS path
         // accumulates the coefficient dot in f32 and so returns a certified
         // per-coefficient error (`a_err = |stored − D_f64| + γ·S`); the scalar path

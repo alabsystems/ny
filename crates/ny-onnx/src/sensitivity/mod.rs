@@ -201,7 +201,7 @@ impl SensitivityResult {
     /// Get layers sorted by sensitivity (highest first, NaN last).
     ///
     /// Uses NaN-safe descending ordering so NaN-contaminated entries
-    /// sort deterministically to the end rather than corrupting rankings (#2601).
+    /// sort deterministically to the end rather than corrupting rankings.
     pub fn layers_by_sensitivity(&self) -> Vec<&LayerSensitivity> {
         let mut sorted: Vec<_> = self.layers.iter().collect();
         sorted.sort_by(|a, b| {
@@ -497,7 +497,7 @@ fn analyze_sensitivity_graph(
 
         // Concat MUST be checked before is_binary() because Layer::is_binary()
         // returns true for Concat. Without this ordering, n-ary Concat (3+ inputs)
-        // would silently drop inputs beyond the first two. (#2405)
+        // would silently drop inputs beyond the first two.
         let output = if let Layer::Concat(concat) = node.layer() {
             let resolve = |name: &str| -> Result<BoundedTensor, SensitivityError> {
                 if name == "_input" {

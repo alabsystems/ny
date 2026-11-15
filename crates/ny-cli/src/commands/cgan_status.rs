@@ -4,8 +4,9 @@
 
 /// Stable user-facing status for the dormant cGAN depth-two replay.
 ///
-/// The authenticated production leaf-row call deliberately supplies no
-/// depth-two context, so both row receipts are `NotRequested`. This module is
-/// compiled with and without `mip`, and the protected-cover example includes
-/// the same source, keeping every CLI/JSON surface on one token.
+/// The leaf-row call deliberately supplies no depth-two context, so both row
+/// receipts are `NotRequested`. The protected-cover example includes this
+/// source by path. (The production cGAN input-leaf route that also reported
+/// this token was category-name-keyed and env-dark, and was removed by
+/// #name-blind-routing, so the binary no longer declares this module.)
 pub(crate) const CGAN_DEPTH_TWO_PRODUCTION_MODE: &str = "disabled_not_requested";

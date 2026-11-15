@@ -1,26 +1,32 @@
 # ny Makefile
 # Build, test, benchmark, and profile commands
+#
+# Development runs every Rust command through targo, the Trust toolchain's
+# cargo, in an explicit lane (owner directive 2026-09-28): the unverified lane
+# for builds/tests/benches (no proof claim), `targo tippy` / `targo fmt` for
+# lint and format; the verified lane is `targo trust check` (publish/config.sh).
+# The public snapshot ships this Makefile as it is.
 
 PYTHON ?= python3
 
-.PHONY: all build test bench bench-html profile flamegraph clean clean-debug disk-usage test-python test-python-plugin test-python-tooling lint lint-tippy lint-clippy fmt fmt-fix deny proofs-check gate gate-fast
+.PHONY: all build build-debug test test-verbose test-python test-python-plugin test-python-tooling bench bench-propagate bench-gpu bench-html profile-samply flamegraph flamegraph-bench profile-dhat perf-check lint lint-fast lint-fix lint-tippy gate gate-fast deny fmt fmt-fix clean-debug clean disk-usage install-tools help
 
 # Default target
 all: build test
 
 # Build
 build:
-	cargo build --release
+	targo --unverified build --release
 
 build-debug:
-	cargo build
+	targo --unverified build
 
 # Testing
 test:
-	cargo test --release
+	targo --unverified test --release
 
 test-verbose:
-	cargo test --release -- --nocapture
+	targo --unverified test --release -- --nocapture
 
 # Python tests (ny-python package)
 # Requires: pip install maturin pytest (or: pip install ".[dev]" from crates/ny-python)
@@ -42,17 +48,17 @@ test-python-plugin:
 test-python-tooling:
 	@env -u PYTHONPATH -u PYTHONHOME PYTHONNOUSERSITE=1 $(PYTHON) -s -c 'import numpy, onnx, onnxruntime, pytest, sys, yaml; __import__("tomllib" if sys.version_info >= (3, 11) else "tomli")' >/dev/null 2>&1 || { echo "Python tooling dependencies are not importable in isolated mode by $(PYTHON). Use the README virtualenv setup, install requirements.txt there, and invoke make with PYTHON set to that interpreter."; exit 1; }
 	env -u PYTHONPATH -u PYTHONHOME PYTHONNOUSERSITE=1 $(PYTHON) -s -m pytest tests/ -q
-	NY_TEST_PYTHON="$(PYTHON)" cargo test --locked -p ny-test-utils --features python-tools --tests
+	NY_TEST_PYTHON="$(PYTHON)" targo --unverified test --locked -p ny-test-utils --features python-tools --tests
 
 # Benchmarking with Criterion
 bench:
-	cargo bench
+	targo --unverified bench
 
 bench-propagate:
-	cargo bench -p ny-propagate
+	targo --unverified bench -p ny-propagate
 
 bench-gpu:
-	cargo bench -p ny-gpu
+	targo --unverified bench -p ny-gpu
 
 # Open HTML reports
 bench-html:
@@ -62,25 +68,33 @@ bench-html:
 		echo "Open target/criterion/report/index.html in your browser"
 
 # Profiling with samply (Firefox Profiler compatible)
-# Install: cargo install samply
+# Install: targo --unverified install samply
 profile-samply:
 	@echo "Profiling with samply (opens Firefox Profiler)..."
-	cargo build --release --example profile -p ny-propagate
+	targo --unverified build --release --example profile -p ny-propagate
 	samply record ./target/release/examples/profile
 
-# Profiling with cargo-flamegraph
-# Install: cargo install flamegraph
+# Profiling with the `flamegraph` binary (crate flamegraph)
+# Install: targo --unverified install flamegraph
 # macOS: Requires dtrace permissions (SIP may need adjustment)
 # Linux: Requires perf
+# The build and the profile are separate steps: `cargo flamegraph` re-enters
+# `$CARGO build` without a lane, which targo refuses ("`targo build` refuses to
+# create an implicitly unverified artifact"), so build here and profile the binary.
+# The binary's path is read from the build's JSON messages (the `executable`
+# of the named target), so it is right under any CARGO_TARGET_DIR.
+BUILT_EXECUTABLE = $(PYTHON) -c 'import json, sys; exes = [m["executable"] for m in map(json.loads, sys.stdin) if m.get("reason") == "compiler-artifact" and m["target"]["name"] == sys.argv[1] and m.get("executable")]; print(exes[-1]) if exes else sys.exit("no executable for target " + sys.argv[1] + " in the build output")'
 flamegraph:
 	@echo "Generating flamegraph..."
-	cargo flamegraph --release --example profile -p ny-propagate -o flamegraph.svg
+	exe="$$(targo --unverified build --release --example profile -p ny-propagate --message-format=json-render-diagnostics | $(BUILT_EXECUTABLE) profile)" \
+	  && flamegraph -o flamegraph.svg -- "$$exe"
 	@echo "Flamegraph saved to flamegraph.svg"
 
 # Profile specific benchmark
 flamegraph-bench:
 	@echo "Generating flamegraph for benchmarks..."
-	cargo flamegraph --release --bench propagation -p ny-propagate -o flamegraph-bench.svg -- --bench
+	exe="$$(targo --unverified bench --no-run -p ny-propagate --bench propagation --message-format=json-render-diagnostics | $(BUILT_EXECUTABLE) propagation)" \
+	  && flamegraph -o flamegraph-bench.svg -- "$$exe" --bench
 	@echo "Flamegraph saved to flamegraph-bench.svg"
 
 # Memory profiling with DHAT (heap profiler)
@@ -91,54 +105,38 @@ profile-dhat:
 
 # Quick performance check
 perf-check:
-	cargo build --release --example profile -p ny-propagate
+	targo --unverified build --release --example profile -p ny-propagate
 	./target/release/examples/profile
 
-# Lint gate (formatting + stock clippy).
-#   lint-tippy  - tippy, the Trust toolchain's lint tool (newer clippy base than
-#                 the pinned stock toolchain, so it sees lints stock clippy doesn't);
-#                 optional — run separately, skips when the toolchain is absent
-#   lint-clippy - stock cargo clippy on the pinned toolchain (rust-toolchain.toml)
-lint: fmt lint-clippy
+# Lint gate: formatting + the whole-workspace clippy gate (-D warnings).
+# ny-lint-guard runs the build tool's clippy (`targo tippy` under Trust, plain
+# clippy if $CARGO is a stock cargo) over --all-targets --all-features.
+lint: fmt
+	targo --unverified run -q -p ny-lint-guard -- full
 
-lint-clippy:
-	cargo clippy --all-targets --all-features -- -D warnings
-
-# Fast, incremental lint gate — the compiled ny-lint-guard binary runs clippy
-# only on the ny-* crates changed vs origin/main (no CI, so drift is caught
-# locally in seconds). `lint-fix` auto-applies the mechanically-safe fixes and
-# lists the rest (soundness-sensitive lints are never auto-rewritten).
+# Incremental gate for ny-* crates changed vs origin/main. `lint-fix` applies
+# fixes except the four numeric lints listed in ny-lint-guard, then checks
+# remaining warnings.
 lint-fast:
-	cargo run -q -p ny-lint-guard -- check
+	targo --unverified run -q -p ny-lint-guard -- check
 
 lint-fix:
-	cargo run -q -p ny-lint-guard -- fix
+	targo --unverified run -q -p ny-lint-guard -- fix
 
-# Tippy requires the external Trust stage2 toolchain (not included in this
-# repo): set TRUST_STAGE2 to an installed stage2 tree (with targo/tippy). The
-# stock `lint` target remains public and portable, but an explicit
-# `lint-tippy` invocation is a real gate and must never silently skip.
-# CAVEAT: tippy carries a toolchain-integrity guard that snapshots EVERY
-# ancestor directory up to `/` — a toolchain under $HOME gets rejected
-# whenever anything churns a home-dir entry mid-run. Install the stage2 tree
-# to an ancestor-quiet path instead (rsync -a the stage2 build tree to a
-# shared, quiet location) and do not modify/rebuild the toolchain while
-# this target is running.
+# Override TRUST_STAGE2 to lint with another installed Trust tree. A missing
+# frontend fails this target; do not modify the selected toolchain during a run.
 TRUST_STAGE2 ?= $(HOME)/.rustup/toolchains/trust
 lint-tippy:
 	@test -n "$(TRUST_STAGE2)" && [ -x "$(TRUST_STAGE2)/bin/targo" ] || { \
 		echo "Trust stage2 toolchain not found at $(TRUST_STAGE2)."; \
-		echo "Build/link Trust or set TRUST_STAGE2 explicitly; use 'make lint-clippy' for the stock-only gate."; \
+		echo "Build/link Trust or set TRUST_STAGE2 explicitly."; \
 		exit 1; }
-	PATH="$(TRUST_STAGE2)/bin:$$PATH" "$(TRUST_STAGE2)/bin/targo" tippy --all-targets --all-features -- -D warnings
+	PATH="$(TRUST_STAGE2)/bin:$$PATH" "$(TRUST_STAGE2)/bin/targo" tippy --locked --workspace --all-targets --all-features -- -D warnings
 
-# First-party drift gate (no CI exists, so every push-storm re-drifts the
-# checks the audits keep re-zeroing by hand; this is the one local command
-# that runs them all). Per-check PASS/FAIL scoreboard, nonzero exit on any
-# FAIL. See scripts/gate.sh --help for the check list and --only <letter>.
-#   gate      - full gate: Rust hygiene + ny-cert/ny-cli/ny-propagate test
-#               slices + harness/package pytest + submission-packaging invariants
-#   gate-fast - Rust hygiene + ny-cert + packer unit tests only
+# Local drift gate. Each lane reports PASS, FAIL or VOID (missing prerequisites).
+# gate-fast runs lanes a-h; gate runs a-o, including model loading, soundness
+# oracles, API contracts, score-risk checks and advisory Trust verification.
+# See scripts/gate.sh --help for prerequisites and --only <letter>.
 gate:
 	scripts/gate.sh
 
@@ -146,29 +144,22 @@ gate-fast:
 	scripts/gate.sh --fast
 
 # RUSTSEC advisory, dependency-ban/source, and license gate (see deny.toml)
-# Install: cargo install cargo-deny
+# Install: targo --unverified install cargo-deny
+# cargo-deny reads Cargo.lock through `$CARGO metadata`; targo dispatches it with
+# CARGO=targo, and `targo metadata` needs no lane.
 deny:
-	@command -v cargo-deny >/dev/null 2>&1 || { echo "cargo-deny not found. Install with: cargo install cargo-deny"; exit 1; }
-	cargo deny check advisories
-	cargo deny check bans
-	cargo deny check licenses
-	cargo deny check sources
-
-# Type-check the Kani proof harness. It is workspace-excluded and carries its own
-# manifest, so no workspace command reaches it and it rots silently otherwise.
-# Its harnesses are `#[cfg(kani)]`-gated, so this compiles the proof-support code
-# without kani installed; `cargo kani` in that directory runs the proofs.
-# (crates/ny-cert/proofs/kani is not checkable this way — its harnesses are
-# ungated, so it only compiles under `cargo kani`, which injects the kani crate.)
-proofs-check:
-	cargo check --manifest-path proofs/kani/Cargo.toml --all-targets
+	@command -v cargo-deny >/dev/null 2>&1 || { echo "cargo-deny not found. Install with: targo --unverified install cargo-deny"; exit 1; }
+	targo deny check advisories
+	targo deny check bans
+	targo deny check licenses
+	targo deny check sources
 
 # Format check
 fmt:
-	cargo fmt --all -- --check
+	targo fmt --all -- --check
 
 fmt-fix:
-	cargo fmt --all
+	targo fmt --all
 
 # Clean targets (for managing 10-50GB build artifacts)
 # Use 'make clean-debug' for incremental cleanup, 'make clean' for full reset
@@ -183,7 +174,7 @@ clean-debug:
 
 # Full clean (removes all build artifacts)
 clean:
-	cargo clean
+	targo clean
 	rm -f flamegraph*.svg
 	rm -f perf.data*
 
@@ -195,12 +186,12 @@ disk-usage:
 	@echo "Breakdown:"
 	@du -sh target/*/ 2>/dev/null | sort -hr || echo "No subdirectories"
 
-# Install profiling tools
+# Install profiling tools. (cargo-criterion is not among them: it re-enters
+# `$CARGO bench` without a lane, which targo refuses.)
 install-tools:
 	@echo "Installing profiling tools..."
-	cargo install samply
-	cargo install flamegraph
-	cargo install cargo-criterion
+	targo --unverified install samply
+	targo --unverified install flamegraph
 	@echo "Done. Note: flamegraph may require additional system setup."
 	@echo "  macOS: May need to disable SIP or use dtrace permissions"
 	@echo "  Linux: Ensure perf is installed (linux-tools-generic)"
@@ -237,12 +228,10 @@ help:
 	@echo "  make clean        - Full clean (removes all build artifacts)"
 	@echo ""
 	@echo "Tools:"
-	@echo "  make install-tools - Install samply, flamegraph, criterion"
+	@echo "  make install-tools - Install samply, flamegraph"
 	@echo "  make gate         - First-party drift gate: Rust/Python hygiene + test slices + submission invariants"
-	@echo "  make gate-fast    - Fast drift gate: formatting + clippy + ny-cert + packer unit tests"
-	@echo "  make lint         - Rust formatting + stock clippy gate"
-	@echo "  make lint-tippy   - Trust toolchain tippy gate (requires stage2; set TRUST_STAGE2 if needed)"
-	@echo "  make lint-clippy  - Stock cargo clippy only"
+	@echo "  make gate-fast    - Drift checks a-h: Rust/Python hygiene, focused tests and packaging"
+	@echo "  make lint         - Rust formatting + workspace Tippy gate"
+	@echo "  make lint-tippy   - Trust toolchain tippy gate (set TRUST_STAGE2 if needed)"
 	@echo "  make fmt          - Check formatting"
 	@echo "  make deny         - Advisory, dependency/source, and license gate (cargo-deny)"
-	@echo "  make proofs-check - Type-check the Kani proof harness"

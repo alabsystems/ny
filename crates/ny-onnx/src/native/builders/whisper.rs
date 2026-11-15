@@ -183,7 +183,7 @@ pub(in crate::native) fn build_whisper_encoder(
             ],
         );
         let ln1_out = format!("block{}_ln1_out", block_idx);
-        let mut ln1_inputs = vec![add1_out.clone()];
+        let mut ln1_inputs = vec![add1_out];
         if let Some(ref g) = ln1_ny_name {
             ln1_inputs.push(g.clone());
         }

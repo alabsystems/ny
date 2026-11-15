@@ -1897,7 +1897,7 @@ fn backward_concat(
             }
         }
         let i = slot_idx.ok_or(Decline)?;
-        let mut local = multi.clone();
+        let mut local = multi;
         local[axis] = c - offsets[i];
         let p = flat_index(&local, &slot_shapes[i]);
         slot_backs[i].0[p] += a[k];

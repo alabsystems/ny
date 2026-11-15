@@ -191,7 +191,7 @@ impl BetaCrownVerifier {
     /// `auto_LiRPA/utils.py:107-113`, `multi_spec_keep_func_all` in
     /// `auto_LiRPA/utils.py:143-144`.
     /// `deadline`: If `Some`, the BaB engine derives its phase budgets from
-    /// remaining wall-clock time instead of `self.config.timeout` (#4321).
+    /// remaining wall-clock time instead of `self.config.timeout`.
     pub fn verify_graph_input_split_multi_objective_conjunctive(
         &self,
         graph: &GraphNetwork,
@@ -220,6 +220,9 @@ impl BetaCrownVerifier {
         deadline: Option<Instant>,
         authenticated_direct: Option<(&[f32], f32)>,
     ) -> Result<BetaCrownResult> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BabLoop);
+        graph.ensure_proof_eligible()?;
         self.config.validate()?;
         // This engine's root, queue, and child stopping rules all authorize a
         // verdict from `lower > threshold`. CLI callers sign-normalize upper
@@ -243,7 +246,7 @@ impl BetaCrownVerifier {
         }
 
         // Reject non-finite thresholds early. NaN thresholds make IEEE 754 comparisons
-        // silently false, causing BaB to run to exhaustion. Part of #3646.
+        // silently false, causing BaB to run to exhaustion.
         for (i, &t) in thresholds.iter().enumerate() {
             if !t.is_finite() {
                 return Err(NyError::NumericalInstability(format!(
@@ -256,6 +259,40 @@ impl BetaCrownVerifier {
 
         let graph = self.configured_graph_for_crown(graph);
         let graph = &graph;
+
+        // #lowdim-prover (typed opt-in `bab.branching.input_split.lowdim_prover`):
+        // on a small-input graph, try the sound forward-linear lane FIRST with
+        // half of this BaB slice. A leaf closes when ANY conjunct is proved
+        // impossible — the same `lower > threshold` stopping rule as this
+        // engine — and only a full proof returns early; Unproved/Declined fall
+        // through to the engine below unchanged. (`verify_upper_bound` was
+        // refused above, so the objectives are sign-normalized lower bounds.)
+        if self.config.input_split_lowdim_prover {
+            let start = Instant::now();
+            let slice = deadline
+                .map(|end| end.saturating_duration_since(start))
+                .unwrap_or(self.config.timeout);
+            let outcome = crate::lowdim::prove_conjunction_infeasible(
+                graph,
+                input,
+                objectives,
+                thresholds,
+                start + slice.mul_f32(self.config.lowdim_prover_share()),
+                &self.config.lowdim_config(),
+            );
+            crate::lowdim::emit_line(0, &outcome);
+            if let crate::lowdim::LowDimOutcome::Verified(stats) = outcome {
+                return Ok(BetaCrownResult {
+                    result: BabVerificationStatus::Verified,
+                    domains_explored: usize::try_from(stats.domains).unwrap_or(usize::MAX),
+                    time_elapsed: start.elapsed(),
+                    max_depth_reached: stats.max_depth as usize,
+                    output_bounds: None,
+                    cuts_generated: 0,
+                    domains_verified: usize::try_from(stats.closed).unwrap_or(usize::MAX),
+                });
+            }
+        }
 
         let num_specs = objectives.len();
         let spec_dim = objectives[0].len();
@@ -309,10 +346,10 @@ impl BetaCrownVerifier {
 
         let now = Instant::now();
         let mut lifecycle = GraphBabLifecycle::new(now);
-        // Warmup cap (#2206 Packet C, #4095): initial bounds get at most
+        // Warmup cap: initial bounds get at most
         // `initial_bounds_fraction` of the BaB timeout. Mirrors core.rs pattern.
         //
-        // When a wall-clock deadline is provided (#4321), derive the effective
+        // When a wall-clock deadline is provided, derive the effective
         // timeout from remaining time instead of the configured timeout.
         let pgd_frac = self
             .config
@@ -378,8 +415,8 @@ impl BetaCrownVerifier {
             }
         }
 
-        // Phase 4 (#3439): MulBinary SPSA alpha optimization.
-        // Uses initial_deadline so warmup phases respect the cap (#4095).
+        // Phase 4: MulBinary SPSA alpha optimization.
+        // Uses initial_deadline so warmup phases respect the cap.
         let mul_binary_alphas_multi = maybe_optimize_mul_binary_alphas(
             graph,
             input,
@@ -477,7 +514,7 @@ impl BetaCrownVerifier {
                 None
             };
 
-        // Root domain bounds via shared CROWN-or-IBP dispatch (#3453).
+        // Root domain bounds via shared CROWN-or-IBP dispatch.
         let (root_bounds, root_linear) = compute_crown_or_ibp_bounds_in_build_batches(
             graph,
             input,
@@ -512,6 +549,15 @@ impl BetaCrownVerifier {
             return Ok(lifecycle.build_result(BabVerificationStatus::Verified));
         }
         if let Some(source_thresholds) = affine_conic_source_thresholds {
+            // #split-hint: publish the ROOT plane's per-input influence vector once,
+            // so descendants that carry no plane of their own score by OUTPUT
+            // SENSITIVITY instead of falling back to pure width. Scoring only —
+            // `root_linear` itself still travels to `domain.linear_bounds` for the
+            // certified clip paths, untouched.
+            if let Some(plane) = root_linear.as_ref() {
+                self.install_root_split_hint(plane, self.config.verify_upper_bound);
+            }
+
             if let Some(evaluation) = root_linear.as_ref().and_then(|linear| {
                 affine_conic::evaluate_affine_conic_closure(linear, input, source_thresholds)
             }) {
@@ -671,7 +717,7 @@ impl BetaCrownVerifier {
                 selective_direct_telemetry.disabled = true;
             }
         }
-        // Use bab_timeout so post-BaB PGD reservation is respected (#4095).
+        // Use bab_timeout so post-BaB PGD reservation is respected.
         if lifecycle.start_time.elapsed() > bab_timeout {
             return Ok(lifecycle.timeout_result());
         }

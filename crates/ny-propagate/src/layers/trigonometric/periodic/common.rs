@@ -63,7 +63,7 @@ where
         }
         let slope_f32 = slope as f32;
         let max_abs_x = l.abs().max(u.abs());
-        // Compute error in f64, cast with next_up_f32 to avoid underestimate (#2636).
+        // Compute error in f64, cast with next_up_f32 to avoid underestimate.
         let slope_err = next_up_f32(((slope - slope_f32 as f64).abs() * max_abs_x) as f32);
         let intercept_f32 = next_down_f32((intercept as f32) - TRIG_RELAX_EPS - slope_err);
         let upper_intercept = next_up_f32((intercept as f32) + TRIG_RELAX_EPS + slope_err);
@@ -109,7 +109,7 @@ where
     let lower_slope_f32 = lower_slope as f32;
     let upper_slope_f32 = upper_slope as f32;
     // Compute error in f64 (max_abs_x is already f64), cast with next_up_f32
-    // to avoid rounding underestimate on intercept widening (#2636).
+    // to avoid rounding underestimate on intercept widening.
     let lower_err = next_up_f32(((lower_slope - lower_slope_f32 as f64).abs() * max_abs_x) as f32);
     let upper_err = next_up_f32(((upper_slope - upper_slope_f32 as f64).abs() * max_abs_x) as f32);
 

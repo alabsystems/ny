@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Deadline-threading regressions (#3816).
+//! Deadline-threading regressions.
 
 use ndarray::{arr1, arr2};
 use ny_core::NyError;
@@ -13,7 +13,7 @@ use crate::{
     ReLULayer,
 };
 // =========================================================================
-// Regression tests for #3816: constrained BaB CROWN deadline threading
+// Regression tests: constrained BaB CROWN deadline threading
 // =========================================================================
 
 /// Build a minimal Conv2d graph with proper 3D input shape:
@@ -57,7 +57,7 @@ fn build_conv2d_deadline_graph() -> GraphNetwork {
     graph
 }
 
-/// Regression test #3816: constrained backward CROWN (standard mode) must
+/// Regression test: constrained backward CROWN (standard mode) must
 /// respect the BaB deadline.
 ///
 /// Before this fix, `propagate_crown_with_graph_constraints` constructed
@@ -99,7 +99,7 @@ fn test_constrained_backward_expired_deadline_returns_error_3816() {
     );
 }
 
-/// Regression test #3816: constrained backward CROWN (storing intermediates
+/// Regression test: constrained backward CROWN (storing intermediates
 /// mode) must also respect the BaB deadline.
 ///
 /// Before this fix, `propagate_crown_with_graph_constraints_storing_intermediates`

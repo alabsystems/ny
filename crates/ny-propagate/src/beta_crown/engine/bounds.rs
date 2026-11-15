@@ -108,7 +108,7 @@ impl BetaCrownVerifier {
     /// Intersect the sequential α-CROWN root bound with the `GraphNetwork`
     /// α-CROWN bound for the equivalent network, returning the tighter (sound)
     /// bound. See call site in `compute_initial_bounds_and_layer_bounds_engine`
-    /// for the soundness rationale (#1817).
+    /// for the soundness rationale.
     ///
     /// Falls back to `seq_bounds` unchanged if conversion or graph propagation
     /// fails, or if shapes/finiteness don't line up — never widens the bound.
@@ -126,7 +126,7 @@ impl BetaCrownVerifier {
         // running the graph engine's patch-based backward here would add
         // significant work for marginal benefit. Keeping the graph tightening
         // scoped to dense MLP-style networks — where the sequential vs graph
-        // α-CROWN tightness gap actually manifests (#1817) — also avoids
+        // α-CROWN tightness gap actually manifests — also avoids
         // perturbing global patch-densification instrumentation used by tests.
         let has_patch_layers = network.layers().iter().any(|l| {
             matches!(
@@ -197,7 +197,7 @@ impl BetaCrownVerifier {
     /// Compute initial bounds with optional early termination and GPU acceleration.
     ///
     /// `deadline`: If set, alpha-CROWN optimization will bail early when this
-    /// wall-clock deadline is exceeded (#2698).
+    /// wall-clock deadline is exceeded.
     pub(in crate::beta_crown::engine) fn compute_initial_bounds_and_layer_bounds_engine(
         &self,
         network: &Network,
@@ -347,7 +347,7 @@ impl BetaCrownVerifier {
                 engine,
             )?;
 
-            // #1817: The sequential `Network` α-CROWN engine produces a looser
+            // The sequential `Network` α-CROWN engine produces a looser
             // root bound than the `GraphNetwork` α-CROWN engine for the *same*
             // network and *same* α config (e.g. upper 0.549 vs 0.484 on the
             // three-way comparison net), so the sequential BaB path fails to
@@ -426,7 +426,7 @@ impl BetaCrownVerifier {
     /// Compute initial bounds with optional early termination and GPU acceleration.
     ///
     /// `deadline`: If set, alpha-CROWN optimization will bail early when this
-    /// wall-clock deadline is exceeded (#2698).
+    /// wall-clock deadline is exceeded.
     #[cfg(test)]
     pub(in crate::beta_crown::engine) fn compute_initial_bounds_with_early_exit_engine(
         &self,
@@ -498,7 +498,7 @@ mod tests {
         }
     }
 
-    /// Test for #2102: INF-cancellation during accumulate_crown_bounds must produce
+    /// Regression test: INF-cancellation during accumulate_crown_bounds must produce
     /// sound conservative bounds (NEG_INFINITY/INFINITY), not NaN.
     ///
     /// Analogous to test_accumulate_crown_ibp_bounds_nan_safe_2093 in graph_alpha,
@@ -575,7 +575,7 @@ mod tests {
         );
     }
 
-    /// Test for #2102: NaN from upstream must be replaced with conservative infinity.
+    /// Regression test: NaN from upstream must be replaced with conservative infinity.
     ///
     /// safe_add_* replaces all NaN (whether from upstream or from INF cancellation)
     /// with conservative bounds: NEG_INFINITY for lower, INFINITY for upper.

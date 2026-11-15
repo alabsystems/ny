@@ -69,7 +69,7 @@ impl BoundPropagation for PowConstantLayer {
         let is_integer_exp = (p - p.round()).abs() < 1e-6;
         // Guard: extreme float exponents saturate to i32::MAX/MIN under `as i32`,
         // which can misclassify even exponents as odd. Reject exponents that
-        // overflow i32 range. (#2911)
+        // overflow i32 range.
         let p_rounded = p.round();
         if is_integer_exp && (!p_rounded.is_finite() || p_rounded.abs() > i32::MAX as f32) {
             return Err(NyError::InvalidSpec(format!(
@@ -84,7 +84,6 @@ impl BoundPropagation for PowConstantLayer {
         // Per-element check: each [l_i, u_i] must not span zero. A global
         // min/max check would falsely reject tensors where some elements are
         // positive and others are negative but none individually contain zero.
-        // See #1699.
         if p < 0.0 {
             for (i, (l, u)) in input.lower().iter().zip(input.upper().iter()).enumerate() {
                 if *l <= 0.0 && *u >= 0.0 {
@@ -111,7 +110,7 @@ impl BoundPropagation for PowConstantLayer {
                 let u = input.upper()[idx.clone()];
                 // Compute in f64 for precision, then cast with directed rounding.
                 // f32 powf can round either direction; directed rounding guarantees
-                // lower bounds round DOWN and upper bounds round UP. (#1483)
+                // lower bounds round DOWN and upper bounds round UP.
                 let l64 = l as f64;
                 let u64 = u as f64;
                 let lp64 = l64.powf(p64);
@@ -146,14 +145,14 @@ impl BoundPropagation for PowConstantLayer {
                 }
             }
 
-            // Centralized NaN/Inf repair at constructor (#3423, replaces ad-hoc #3030).
+            // Centralized NaN/Inf repair at constructor (replaces ad-hoc per-site repair).
             return BoundedTensor::new_repaired(out_lower, out_upper, RepairStrategy::Conservative);
         }
 
         // Non-integer exponents: x^p is undefined for x < 0 in reals.
         // For p < 0 non-integer: also need x > 0 (zero already rejected above).
         if !is_integer_exp {
-            // NaN-propagating fold — see #2577.
+            // NaN-propagating fold.
             let min_input = input
                 .lower()
                 .iter()
@@ -173,7 +172,7 @@ impl BoundPropagation for PowConstantLayer {
         //
         // Directed rounding: compute in f64, cast to f32 with next_down/next_up
         // to guarantee lower bounds are below and upper bounds are above the
-        // true value. Raw f32 powf can round either direction. (#1483)
+        // true value. Raw f32 powf can round either direction.
         let p64 = p as f64;
         if p < 0.0 {
             // Odd negative integer (p=-1,-3,...): monotonically decreasing.
@@ -184,7 +183,7 @@ impl BoundPropagation for PowConstantLayer {
             let out_upper = input
                 .lower()
                 .mapv(|v| next_up_f32((v as f64).powf(p64) as f32));
-            // Centralized NaN/Inf repair at constructor (#3423, replaces ad-hoc #3030).
+            // Centralized NaN/Inf repair at constructor (replaces ad-hoc per-site repair).
             BoundedTensor::new_repaired(out_lower, out_upper, RepairStrategy::Conservative)
         } else {
             let out_lower = input
@@ -193,7 +192,7 @@ impl BoundPropagation for PowConstantLayer {
             let out_upper = input
                 .upper()
                 .mapv(|v| next_up_f32((v as f64).powf(p64) as f32));
-            // Centralized NaN/Inf repair at constructor (#3423, replaces ad-hoc #3030).
+            // Centralized NaN/Inf repair at constructor (replaces ad-hoc per-site repair).
             BoundedTensor::new_repaired(out_lower, out_upper, RepairStrategy::Conservative)
         }
     }
@@ -295,7 +294,7 @@ impl PowConstantLayer {
     }
 
     /// Patches CROWN backward propagation with pre-activation bounds.
-    /// Part of #2613 Phase 2: generic activation Patches support.
+    /// Part of generic activation Patches support.
     pub(crate) fn propagate_patches_with_bounds(
         &self,
         bounds: &crate::bounds::patches::PatchesLinearBounds,

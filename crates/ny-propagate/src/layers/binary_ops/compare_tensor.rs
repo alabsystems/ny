@@ -7,7 +7,6 @@
 //! Output is {0.0, 1.0}. IBP-only — no meaningful CROWN linear relaxation
 //! exists for binary comparison (same pattern as WhereLayer).
 //!
-//! Reference: design doc `designs/2026-03-21-issue-4269-compare-propagation-layer.md`
 //! Supports transformer masking ops for external verifier consumers.
 
 use ndarray::{ArrayD, IxDyn};

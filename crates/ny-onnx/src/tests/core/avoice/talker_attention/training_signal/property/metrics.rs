@@ -6,8 +6,6 @@
 //!
 //! Validates that Packet C's recorded property metrics match the direct
 //! spec-guided propagation result.
-//!
-//! Part of #4089 property lane decomposition.
 
 use super::fixture::TalkerPropertySweepFixture;
 use super::*;

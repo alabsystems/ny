@@ -6,8 +6,6 @@
 //!
 //! Delegates to the shared batched CROWN infrastructure in
 //! [`super::super::crown_batched_common`] via the `NormLayer` trait.
-//!
-//! Reference: designs/2026-02-27-normalization-trait-dedup.md
 
 use ny_core::Result;
 use ny_tensor::BoundedTensor;

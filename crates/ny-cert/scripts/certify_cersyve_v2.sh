@@ -36,7 +36,7 @@ OUT="${1:?usage: certify_cersyve_v2.sh <out_dir>}"
 mkdir -p "$OUT"
 
 BIN="$NY_DIR/target/release/certify_onnx"
-[[ -x "$BIN" ]] || (cd "$NY_DIR" && cargo build --release -p ny-cert --bin certify_onnx)
+[[ -x "$BIN" ]] || (cd "$NY_DIR" && targo --unverified build --release -p ny-cert --bin certify_onnx)
 
 SYSTEMS=(double_integrator lane_keep pendulum point_mass unicycle)
 

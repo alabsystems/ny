@@ -59,8 +59,6 @@ pub(crate) fn check_domain_bounds(
 /// `check_termination`, `build_final_result`) are provided by
 /// `GraphBabLifecycle`. DomainList BaB callers use the same lifecycle type
 /// as ReLU split and multi-objective verifiers.
-///
-/// Part of #1860 (graph BaB service convergence, Packet A).
 pub(crate) type BabLoopState = GraphBabLifecycle;
 
 #[cfg(test)]
@@ -111,7 +109,7 @@ mod tests {
         );
     }
 
-    /// NaN bounds always produce Undecided (#2922). This documents why callers
+    /// NaN bounds always produce Undecided. This documents why callers
     /// must guard with is_finite() before calling check_domain_bounds — without
     /// the guard, NaN domains loop forever (Undecided → re-queue → re-check).
     #[test]
@@ -145,7 +143,7 @@ mod tests {
         );
     }
 
-    /// Inf bounds always produce Undecided (#2993). Inf indicates propagation
+    /// Inf bounds always produce Undecided. Inf indicates propagation
     /// failure (e.g., reciprocal zero-crossing), not a genuine result.
     #[test]
     fn test_check_domain_bounds_inf_always_undecided_2993() {
@@ -237,7 +235,7 @@ mod tests {
         }
     }
 
-    /// #1925: GenBaB no-split and no-unstable-neurons produce distinct reason
+    /// GenBaB no-split and no-unstable-neurons produce distinct reason
     /// strings in the terminal Unknown status.
     #[test]
     fn test_build_final_result_distinguishes_genbab_from_no_unstable_neurons() {

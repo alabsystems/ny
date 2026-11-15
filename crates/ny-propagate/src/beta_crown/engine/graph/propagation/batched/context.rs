@@ -47,7 +47,6 @@ pub struct BatchedBackwardContext<'a> {
     ///
     /// # Reference
     /// alpha-beta-CROWN: `auto_LiRPA/operators/relu.py` (optimizable slopes)
-    /// Issue: #1841
     pub alpha_states: Vec<Option<&'a GraphDomainAlphaState>>,
     /// Per-domain cached lA coefficients from parent backward pass.
     ///
@@ -57,7 +56,6 @@ pub struct BatchedBackwardContext<'a> {
     ///
     /// # Reference
     /// alpha-beta-CROWN: `complete_verifier/tensor_storage.py` (all_lAs)
-    /// Issue: #1564, #1669
     pub cached_la: Vec<Option<&'a CachedLinearBounds>>,
     /// Shared MulBinary alpha parameters for McCormick interpolation.
     ///
@@ -68,7 +66,6 @@ pub struct BatchedBackwardContext<'a> {
     ///
     /// # Reference
     /// - `input_split/mul_binary.rs` (SPSA optimizer)
-    /// - Issue: #4284, #3439 Phase 4
     pub mul_binary_alphas: Option<&'a std::collections::HashMap<String, ndarray::Array2<f32>>>,
 }
 
@@ -137,7 +134,6 @@ impl<'a> BatchedBackwardContext<'a> {
 ///
 /// # Reference
 /// alpha-beta-CROWN: `complete_verifier/tensor_storage.py` (all_lAs storage)
-/// Issue: #1564 (lA matrix caching)
 #[derive(Debug)]
 pub struct BatchedBackwardResult {
     /// Output bounds per domain: (output_bounds, node_bounds_cache).
@@ -151,8 +147,14 @@ pub struct BatchedBackwardResult {
     /// Only populated when `capture_intermediate = true` is passed to the
     /// backward pass function.
     pub intermediate_la: Option<Vec<std::collections::HashMap<String, LinearBounds>>>,
+    /// #la-warm-frontier: per domain, the frontier recorded at each captured
+    /// split-site node (`intermediate_frontiers[d][node]`). `None` unless the
+    /// pass captured lA with `bab.la_warm_frontier` armed; the caller attaches
+    /// it to the same domain's cache (`CachedLinearBounds::with_frontiers`).
+    pub intermediate_frontiers:
+        Option<Vec<std::collections::HashMap<String, crate::batched_domain::WarmFrontier>>>,
     /// Optional stage timing for forward/backward observability.
-    /// Populated by `batched_forward_then_backward`. Part of #4398 Packet B.
+    /// Populated by `batched_forward_then_backward`.
     pub stage_timing: Option<BatchedStageTiming>,
 }
 
@@ -160,7 +162,7 @@ pub struct BatchedBackwardResult {
 ///
 /// Captures forward (constraint propagation) and backward (CROWN relaxation)
 /// wall-clock time so callers can quantify the per-domain forward overhead vs
-/// the batched backward win.  Part of #4398 Packet B observability.
+/// the batched backward win.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BatchedStageTiming {
     pub forward_elapsed_s: f64,
@@ -180,8 +182,6 @@ pub struct DenseSpecStageTiming {
 /// Sibling of `BatchedBackwardResult` for the dense-spec (multi-row spec matrix) path.
 /// Preserves per-domain input `LinearBounds` from the CROWN backward pass, which the
 /// scalar path discards.
-///
-/// Part of #4116 Packet A: dense-spec result surface.
 #[derive(Debug)]
 pub struct BatchedSpecBackwardResult {
     /// Dense-spec output bounds per domain with input linear data.
@@ -189,6 +189,10 @@ pub struct BatchedSpecBackwardResult {
     /// Intermediate linear bounds per domain per node (same semantics as
     /// `BatchedBackwardResult::intermediate_la`).
     pub intermediate_la: Option<Vec<std::collections::HashMap<String, LinearBounds>>>,
+    /// #la-warm-frontier: same semantics as
+    /// `BatchedBackwardResult::intermediate_frontiers`.
+    pub intermediate_frontiers:
+        Option<Vec<std::collections::HashMap<String, crate::batched_domain::WarmFrontier>>>,
     /// Optional stage timing for dense-spec rebound observability.
     pub stage_timing: Option<DenseSpecStageTiming>,
     /// Per-domain β states optimized by the GPU per-domain β loop

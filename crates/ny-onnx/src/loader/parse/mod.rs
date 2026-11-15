@@ -4,12 +4,14 @@
 
 mod activation_schema;
 mod arithmetic_schema;
+mod expand_identity;
 mod linear_schema;
 mod literal_cone;
 mod metadata;
 mod prepare;
 mod quantization_preflight;
 mod reduction_schema;
+mod root_policy;
 mod schema_preflight;
 mod structural_schema;
 #[cfg(test)]
@@ -26,6 +28,7 @@ use tracing::{debug, warn};
 use super::batch_resolve::{resolve_batch_dim, VERIFICATION_BATCH_SIZE};
 use super::convert::convert_graph_to_layers;
 use super::external_data::{reject_external_data_without_origin, ExternalDataResolver};
+use super::shape_infer::static_infer::fallback_shapes_after_ort_failure;
 use super::shape_infer::subprocess::infer_tensor_shapes_via_subprocess;
 use super::shape_infer::{infer_tensor_shapes_from_ort, infer_tensor_shapes_from_ort_path};
 use super::{
@@ -35,7 +38,7 @@ use metadata::{build_parse_metadata, build_tensor_shapes, collect_opset_imports}
 use prepare::prepare_graph;
 
 /// Parse ONNX file to extract weights, layers, and I/O specs.
-pub(super) fn parse_onnx_file<P: AsRef<std::path::Path>>(
+pub(super) fn parse_onnx_file_with_root_policy<P: AsRef<std::path::Path>>(
     path: P,
     registry: &CustomOpRegistry,
     shape_inference_policy: ShapeInferencePolicy,
@@ -43,7 +46,8 @@ pub(super) fn parse_onnx_file<P: AsRef<std::path::Path>>(
     merge_linear_enabled: bool,
     batch_norm_folding: BatchNormFoldingPolicy,
     capture_raw_float32_initializer_provenance: bool,
-) -> Result<ParsedOnnx> {
+    qdq_activation_relaxation: bool,
+) -> Result<(ParsedOnnx, super::RootCutLoadReceipt)> {
     let mut external_data = ExternalDataResolver::for_model_path(path.as_ref())?;
     // Read the model and every later sidecar through one retained directory
     // capability (supports `.onnx` and `.onnx.gz`).
@@ -70,13 +74,14 @@ pub(super) fn parse_onnx_file<P: AsRef<std::path::Path>>(
             shape_infer_backend,
         )
     };
-    parse_onnx_model(
+    parse_onnx_model_with_root_policy(
         model,
         registry,
         inferred_shapes,
         merge_linear_enabled,
         batch_norm_folding,
         capture_raw_float32_initializer_provenance,
+        qdq_activation_relaxation,
         Some(&mut external_data),
     )
 }
@@ -90,21 +95,24 @@ pub(super) fn parse_onnx_bytes(
     merge_linear_enabled: bool,
     batch_norm_folding: BatchNormFoldingPolicy,
     capture_raw_float32_initializer_provenance: bool,
+    qdq_activation_relaxation: bool,
 ) -> Result<ParsedOnnx> {
     let model = decode_onnx_model(data)?;
     // The display-only `name` accepted by the public byte APIs must never be
     // interpreted as filesystem authority.
     reject_external_data_without_origin(&model)?;
     let inferred_shapes = infer_byte_shapes(data, shape_inference_policy, shape_infer_backend);
-    parse_onnx_model(
+    parse_onnx_model_with_root_policy(
         model,
         registry,
         inferred_shapes,
         merge_linear_enabled,
         batch_norm_folding,
         capture_raw_float32_initializer_provenance,
+        qdq_activation_relaxation,
         None,
     )
+    .map(|(parsed, _)| parsed)
 }
 
 fn decode_onnx_model(data: &[u8]) -> Result<onnx_proto::ModelProto> {
@@ -135,7 +143,11 @@ fn infer_file_shapes(
             };
             inferred.unwrap_or_else(|err| {
                 warn!("ONNX Runtime shape inference skipped: {}", err);
-                HashMap::new()
+                // ORT is unavailable (the child could not run, died, timed
+                // out or answered garbage; or in-process ORT errored). Fill
+                // what exact ORT-free rules can prove; everything else stays
+                // unknown, exactly as it did before this fallback existed.
+                fallback_shapes_after_ort_failure(data)
             })
         }
         ShapeInferencePolicy::Skip => HashMap::new(),
@@ -161,22 +173,27 @@ fn infer_byte_shapes(
             };
             inferred.unwrap_or_else(|err| {
                 warn!("ONNX Runtime shape inference skipped: {}", err);
-                HashMap::new()
+                // ORT is unavailable (the child could not run, died, timed
+                // out or answered garbage; or in-process ORT errored). Fill
+                // what exact ORT-free rules can prove; everything else stays
+                // unknown, exactly as it did before this fallback existed.
+                fallback_shapes_after_ort_failure(data)
             })
         }
         ShapeInferencePolicy::Skip => HashMap::new(),
     }
 }
 
-fn parse_onnx_model(
+fn parse_onnx_model_with_root_policy(
     mut model: onnx_proto::ModelProto,
     registry: &CustomOpRegistry,
     mut inferred_shapes: HashMap<String, Vec<i64>>,
     merge_linear_enabled: bool,
     batch_norm_folding: BatchNormFoldingPolicy,
     capture_raw_float32_initializer_provenance: bool,
+    qdq_activation_relaxation: bool,
     mut external_data: Option<&mut ExternalDataResolver>,
-) -> Result<ParsedOnnx> {
+) -> Result<(ParsedOnnx, super::RootCutLoadReceipt)> {
     let opset_imports = collect_opset_imports(&model)?;
 
     let mut graph = model
@@ -187,7 +204,11 @@ fn parse_onnx_model(
     // Validate authored standard schemas while attribute variants and their
     // operator-set authority are still visible. Constant folding can erase
     // both the producer node and the dtype/attribute provenance.
-    let literal_exemptions = schema_preflight::validate_standard_schemas(&graph, &opset_imports)?;
+    let literal_exemptions = schema_preflight::validate_standard_schemas(
+        &graph,
+        &opset_imports,
+        qdq_activation_relaxation,
+    )?;
 
     // Quantization constants are deliberately inspected at the raw protobuf
     // boundary.  `prepare_graph` normalizes authored integer/floating tensor
@@ -198,6 +219,7 @@ fn parse_onnx_model(
         &graph,
         &opset_imports,
         external_data.as_deref_mut(),
+        qdq_activation_relaxation,
     )?;
 
     // Pin a symbolic/dynamic leading (batch) dimension on runtime graph inputs
@@ -216,25 +238,65 @@ fn parse_onnx_model(
         );
     }
 
+    // Resolve on the original already-decoded graph, before constant/BN folds.
+    // Only bounded shape/storage metadata is read; no parameter payload clone.
+    // Explicit PreserveRaw/Legacy policies retain precedence. Custom lowering
+    // or affine-merge modes are outside this authored-f32 root source contract.
+    let structural = if !merge_linear_enabled
+        && registry.handlers().is_empty()
+        && matches!(
+            batch_norm_folding,
+            BatchNormFoldingPolicy::PreserveRaw | BatchNormFoldingPolicy::StructuralCertifiedRoot
+        ) {
+        root_policy::quote(&graph)
+    } else {
+        None
+    };
+    let batch_norm_folding =
+        if batch_norm_folding == BatchNormFoldingPolicy::StructuralCertifiedRoot {
+            if structural.as_ref().is_some_and(|q| q.conv_nodes > 0) {
+                BatchNormFoldingPolicy::PreserveRaw
+            } else {
+                BatchNormFoldingPolicy::LegacyEnvironment
+            }
+        } else {
+            batch_norm_folding
+        };
+    let root_policy = super::RootCutLoadReceipt::new(batch_norm_folding, structural.is_some());
+    if let Some(q) = structural {
+        debug!(
+            nodes = q.nodes,
+            extraction_bytes = q.extraction_bytes,
+            bn_channels = q.bn_channels,
+            "Authored unary root source structurally admitted before folding"
+        );
+    }
+
     let mut weights = WeightStore::new();
     if capture_raw_float32_initializer_provenance && !weights.enable_revision_tracking() {
         return Err(NyError::ModelLoad(
             "failed to enable raw initializer revision tracking before weight loading".to_string(),
         ));
     }
+    // The identity-cast erasure must not delete a node whose deferred schema
+    // refusal is dischargeable only by constant folding (#qdq-crown-followup).
+    let fold_obligated_outputs = literal_exemptions.fold_obligated_outputs();
     let original_float32_initializers = prepare_graph(
         &mut graph,
         &mut weights,
         &mut inferred_shapes,
         capture_raw_float32_initializer_provenance,
+        qdq_activation_relaxation,
+        &fold_obligated_outputs,
         external_data,
     )?;
 
     // Discharge every raw-schema refusal that was deferred because its node
-    // looked like a load-time literal. Constant folding has now run, so the
-    // question the preflight could not answer — "does this node still exist?" —
-    // is decidable. Any survivor re-raises its original refusal.
-    literal_exemptions.require_all_folded(&weights)?;
+    // looked like a load-time literal or a certified expand-identity cone.
+    // Constant folding and canonicalization have now run, so the question the
+    // preflight could not answer — "does this node still exist?" — is
+    // decidable. Any survivor re-raises its original refusal.
+    literal_exemptions.require_all_folded(&weights, &graph)?;
 
     // Build tensor shapes before graph conversion because proto-level fusion
     // inspects the raw ONNX graph and the staged weight set.
@@ -256,22 +318,26 @@ fn parse_onnx_model(
         &raw_int64_shape_values,
         merge_linear_enabled,
         batch_norm_folding,
+        qdq_activation_relaxation,
     )?;
 
     let metadata = build_parse_metadata(&graph, &weights, tensor_shapes)?;
 
-    // Validate no NaN in weights after all loading, folding, and fusion (#2791).
+    // Validate no NaN in weights after all loading, folding, and fusion.
     weights.validate_no_nan()?;
 
     Ok((
-        layers,
-        weights,
-        metadata.inputs,
-        metadata.outputs,
-        metadata.tensor_producer,
-        metadata.constant_tensors,
-        metadata.tensor_shapes,
-        opset_imports,
-        original_float32_initializers,
+        (
+            layers,
+            weights,
+            metadata.inputs,
+            metadata.outputs,
+            metadata.tensor_producer,
+            metadata.constant_tensors,
+            metadata.tensor_shapes,
+            opset_imports,
+            original_float32_initializers,
+        ),
+        root_policy,
     ))
 }

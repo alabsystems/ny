@@ -31,7 +31,7 @@ pub(super) fn backward_sqrt_node(
                 // in crown_tighten.rs can catch them and fall back to IBP.
                 // Wrapping in InvalidSpec prevents the catch from matching.
                 // Fix: same pattern as backward_dispatch/helpers.rs
-                // preserve_structured_error (#3602).
+                // preserve_structured_error.
                 match e {
                     NyError::UnsupportedConfiguration(_)
                     | NyError::UnsupportedOp(_)

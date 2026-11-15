@@ -65,9 +65,20 @@ bab:
   # BaB the next 40s without closing, and the MIP escalation started at ~89s with
   # a 23s clamp — it solved 24/24 clauses in ~12s wall but the per-clause slices
   # (~1s) cut the hard clauses, and the whole run overran the 100s scored budget.
-  # The MIP formulation is already exact for this family (single Conv+ReLU+Gemm
-  # unfolds to Linear-ReLU-Linear; first-layer IBP pre-activation bounds are
-  # exact on a box), so the fix is routing budget to the exact solver:
+  # The MIP formulation is already exact for this family in REAL arithmetic
+  # (single Conv+ReLU+Gemm unfolds to Linear-ReLU-Linear; the first-layer
+  # pre-activation bounds are the only Big-M constants). CORRECTION
+  # 2026-09-12 (#mip-conv-sound-enclosure): "first-layer IBP pre-activation
+  # bounds are exact on a box" was a real-arithmetic claim. In f32 the conv
+  # output is a K-term round-to-nearest dot product, and the plain IBP
+  # collector's Conv2d arm carried no directed rounding and no Higham
+  # widening, so its box could sit INSIDE the true range and the exact solver
+  # would then certify infeasibility of a model that excludes reachable points
+  # (a minted unsat). The single-hidden fast path now collects with
+  # `collect_ibp_bounds_sound` (certified Higham enclosure of the first affine
+  # output, strictly wider-or-equal); it is still exact-on-the-box in the sense
+  # that matters here — no CROWN/LP pass can tighten it soundly. The budget
+  # routing below is unchanged:
   # - attack 0.50 -> 0.15: every measured sat row (4 in the scorecard + the
   #   newly-sat 16-25 idx-11) is found by the sampling attack in <0.5s; the 26
   #   passing unsat rows clustered at ~48-57s were attack-slice + <9s of real
@@ -89,7 +100,6 @@ bab:
     # kfsb as the BaB fallback default. Reference uses MIP exclusively (no BaB).
     method: kfsb
     candidates: 5
-    reduceop: max
     # Exact wave-selector mirrors for governed search; runtime is unchanged.
     kfsb_multi_candidates: 5
     kfsb_multi_reduceop: max
@@ -98,8 +108,3 @@ bab:
     relaxed_iterations: 20
   alpha_crown:
     lr_alpha: 0.2
-    iterations: 100
-  beta_crown:
-    lr_alpha: 0.1
-    lr_beta: 0.15
-    iterations: 15

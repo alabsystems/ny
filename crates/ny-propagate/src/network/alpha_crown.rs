@@ -149,6 +149,7 @@ impl NetworkAlphaCrownExt for Network {
         config: &AlphaCrownConfig,
         engine: Option<&dyn GemmEngine>,
     ) -> Result<BoundedTensor> {
+        self.ensure_proof_eligible()?;
         // Disable the L2/Cauchy–Schwarz lever for the sequential-Network
         // alpha-CROWN scope (chokepoint for all sequential alpha-CROWN variants).
         // The CROWN-IBP intermediate bound collection and per-iteration SPSA
@@ -166,7 +167,7 @@ impl NetworkAlphaCrownExt for Network {
             ));
         }
 
-        // Early exits BEFORE expensive collect_crown_ibp_bounds (#3218):
+        // Early exits BEFORE expensive collect_crown_ibp_bounds:
         // Check for unsupported layer types and deep networks first.
 
         // Check for Conv2d/ConvTranspose2d/MaxPool2d layers - fall back to CROWN for now
@@ -203,7 +204,7 @@ impl NetworkAlphaCrownExt for Network {
         // Skip optimization and return CROWN bounds directly. Matches the
         // GraphNetwork DAG path check (propagate_dag.rs, bounds/alpha.rs).
         // Must be checked BEFORE collect_crown_ibp_bounds to avoid wasting
-        // the O(L²) intermediate bound computation. #3218
+        // the O(L²) intermediate bound computation.
         if config.adaptive_skip && relu_count > config.adaptive_skip_depth_threshold {
             debug!(
                 "Sequential α-CROWN: adaptive skip — {} ReLU layers > threshold {}, \
@@ -213,7 +214,7 @@ impl NetworkAlphaCrownExt for Network {
             return self.propagate_crown_with_engine_and_deadline(input, engine, config.deadline);
         }
 
-        // Deadline guard (#4321 / VNN-COMP no-JSON fix): the intermediate-bound
+        // Deadline guard (VNN-COMP no-JSON fix): the intermediate-bound
         // collection below is the O(L²) CROWN-IBP pass that dominates the
         // initial-bound cost on deep/wide networks (vggnet16, yolo, soundnessbench).
         // If the wall-clock deadline is already spent, do not even begin it —
@@ -227,7 +228,7 @@ impl NetworkAlphaCrownExt for Network {
 
         // Step 1: Run CROWN-IBP to collect tighter bounds at each layer
         // This matches the intermediate bound computation used in propagate_crown().
-        // Thread the deadline (#4321): on deep/wide nets this pass can run for many
+        // Thread the deadline: on deep/wide nets this pass can run for many
         // seconds; without a deadline it would blow past the competition --timeout
         // and get OS-killed before any JSON verdict is emitted. The deadline-aware
         // variant falls remaining layers back to (sound, looser) IBP bounds.
@@ -262,7 +263,7 @@ impl NetworkAlphaCrownExt for Network {
             &(0..relu_layer_indices.len()).collect::<Vec<_>>(),
         )?;
 
-        // Initialize INVPROP state if enabled and constraints provided (#371)
+        // Initialize INVPROP state if enabled and constraints provided
         let invprop_enabled = init_invprop_if_enabled(
             config,
             &mut alpha_state,
@@ -294,7 +295,7 @@ impl NetworkAlphaCrownExt for Network {
             }
         );
 
-        // Step 3: Optimization loop via shared backend (#2835)
+        // Step 3: Optimization loop via shared backend
         let mut backend = SequentialAlphaCrownBackend {
             network: self,
             layer_bounds: &layer_bounds,
@@ -364,6 +365,7 @@ impl Network {
         engine: Option<&dyn GemmEngine>,
         deadline: Option<std::time::Instant>,
     ) -> Result<BoundedTensor> {
+        self.ensure_proof_eligible()?;
         let bp_output = match run_simple_backward_pass(
             &self.layers,
             input,
@@ -390,6 +392,7 @@ impl Network {
         engine: Option<&dyn GemmEngine>,
         deadline: Option<std::time::Instant>,
     ) -> Result<AlphaCrownIntermediate> {
+        self.ensure_proof_eligible()?;
         let bp_output = match run_simple_backward_pass(
             &self.layers,
             input,
@@ -499,7 +502,7 @@ impl AlphaCrownBackend for SequentialAlphaCrownBackend<'_> {
     ) -> Result<(Vec<Array1<f32>>, Vec<Array1<f32>>)> {
         let eps = 1e-3;
         match config.gradient_method {
-            // SPSA/FiniteDiff: joint perturbation of both alpha paths — same gradient for both (#3393).
+            // SPSA/FiniteDiff: joint perturbation of both alpha paths — same gradient for both.
             GradientMethod::Spsa => {
                 let grads =
                     compute_spsa_gradients(alpha_state, eps, config.spsa_samples, |state| {
@@ -547,7 +550,7 @@ impl AlphaCrownBackend for SequentialAlphaCrownBackend<'_> {
                 let upper = grads.clone();
                 Ok((grads, upper))
             }
-            // Analytic: separate lower/upper gradients from backward pass (#3393).
+            // Analytic: separate lower/upper gradients from backward pass.
             GradientMethod::Analytic => Ok((gradients.to_vec(), gradients_upper.to_vec())),
             // AnalyticChain: chain-rule only computes lower gradients; use same for upper.
             // Follow-up: extend chain-rule to produce separate upper gradients.

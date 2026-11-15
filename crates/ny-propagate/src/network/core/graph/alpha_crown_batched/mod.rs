@@ -37,13 +37,14 @@ impl GraphNetwork {
     /// Falls back to plain batched CROWN if no BilinearCrown nodes exist.
     ///
     /// The `engine` parameter threads GPU GEMM acceleration into every batched
-    /// CROWN evaluation inside the optimizer and SPSA gradient loop (#3588).
+    /// CROWN evaluation inside the optimizer and SPSA gradient loop.
     pub(crate) fn propagate_alpha_crown_batched(
         &self,
         input: &BoundedTensor,
         config: &AlphaCrownConfig,
         engine: Option<&dyn GemmEngine>,
     ) -> Result<BoundedTensor> {
+        self.ensure_proof_eligible()?;
         let result = self.alpha_crown_batched_optimize(input, config, engine)?;
         Ok(result.bounds)
     }
@@ -111,7 +112,7 @@ impl GraphNetwork {
             }
             iter_count = iter + 1;
 
-            // Run batched CROWN backward with current bilinear alphas (#3588: engine-aware).
+            // Run batched CROWN backward with current bilinear alphas (engine-aware).
             let bounds = self.propagate_crown_batched_with_bilinear_alphas_and_engine(
                 input,
                 &bilinear_alphas,
@@ -165,7 +166,7 @@ impl GraphNetwork {
                 break;
             }
 
-            // Step 4: SPSA gradient estimation for bilinear alphas (#3588: engine-aware).
+            // Step 4: SPSA gradient estimation for bilinear alphas (engine-aware).
             let gradients =
                 self.spsa_bilinear_gradients(input, &mut bilinear_alphas, config, engine)?;
 

@@ -69,7 +69,6 @@ impl AdaIN1dLayer {
 
                     // Affine transform with sign analysis.
                     // Directed rounding on final bounds: bare f32 mul+add.
-                    // Part of #3344.
                     let (y_lo, y_hi) = if sg >= 0.0 {
                         (next_down_f32(sg * z_lo + sb), next_up_f32(sg * z_hi + sb))
                     } else {
@@ -90,7 +89,7 @@ impl AdaIN1dLayer {
     /// Requires all three inputs to have identical shapes (activation-shaped).
     /// Uses the 4-corner product hull for `g * z` plus additive `b`.
     ///
-    /// Mathematical contract (designs/2026-03-18-issue-4142-packet-a-ny-local-ternary.md):
+    /// Mathematical contract:
     /// ```text
     /// z ∈ [z_l, z_u], g ∈ [g_l, g_u], b ∈ [b_l, b_u]
     /// y = g * z + b
@@ -158,7 +157,7 @@ impl AdaIN1dLayer {
             let prod_lo = products.iter().copied().fold(f32::INFINITY, f32::min);
             let prod_hi = products.iter().copied().fold(f32::NEG_INFINITY, f32::max);
 
-            // Add style_beta bounds. Directed rounding (#3344).
+            // Add style_beta bounds. Directed rounding.
             out_lo_slice[i] = next_down_f32(prod_lo + b_lo[i]);
             out_hi_slice[i] = next_up_f32(prod_hi + b_hi[i]);
         }

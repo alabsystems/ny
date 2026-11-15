@@ -13,7 +13,9 @@ use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor, RepairStrategy};
 use super::super::types::{LayerNormLayer, LayerNormMode};
 use super::slices;
 use crate::bounds::{nan_propagating_max, nan_propagating_min};
-use crate::layers::normalization::math_common::outward_midpoint_radius;
+use crate::layers::normalization::math_common::{
+    outward_midpoint_radius, CENTERED_NORM_SECOND_ORDER_COEFF,
+};
 
 impl LayerNormLayer {
     /// Forward-mode IBP for LayerNorm using Jacobian-based propagation.
@@ -41,7 +43,7 @@ impl LayerNormLayer {
     /// ```
     ///
     /// Reference: Jacobian from `math.rs` (verified against finite differences).
-    /// Fix for #3098: replaces the unsound `max_radius / n` coupling correction.
+    /// Replaces the unsound `max_radius / n` coupling correction.
     #[inline]
     pub(crate) fn propagate_ibp_forward_mode(
         &self,
@@ -50,7 +52,7 @@ impl LayerNormLayer {
         let shape = input.shape();
         let ndim = shape.len();
         // Guard: zero-valued dimensions cause division-by-zero in batch index
-        // decoding. (#2806)
+        // decoding.
         if shape.contains(&0) {
             return Err(NyError::InvalidSpec(
                 "LayerNorm: zero-valued dimension in input shape".to_string(),
@@ -130,7 +132,7 @@ impl LayerNormLayer {
 
                 // Repair non-finite outputs: sensitivity * radius can produce Inf
                 // for large ny or small std. Consistent with IBP overflow
-                // strategy (#3030, #3060).
+                // strategy.
                 BoundedTensor::new_repaired(out_lower, out_upper, RepairStrategy::Conservative)
             }
             LayerNormMode::MeanOnly => {
@@ -139,23 +141,23 @@ impl LayerNormLayer {
                 // (independent of x), so forward-mode provides no accuracy benefit
                 // over conservative interval arithmetic. Use interval mean bounds
                 // for soundness: diff_l = xl - mean_upper, diff_u = xu - mean_lower.
-                // Fix for #3142: was using center-point mean, producing unsound bounds.
+                // A center-point mean here produces unsound bounds.
                 let mut out_lower = input.lower().clone();
                 let mut out_upper = input.upper().clone();
 
                 if ndim == 1 {
-                    // f64 accumulation for mean to prevent precision loss. Part of #2423.
+                    // f64 accumulation for mean to prevent precision loss.
                     if norm_size == 0 {
                         return Err(NyError::InvalidSpec(
                             "LayerNorm MeanOnly: zero norm_size".to_string(),
                         ));
                     }
                     let nf_64 = norm_size as f64;
-                    // Directed rounding: mean_l is a lower bound -> round down (#3270).
+                    // Directed rounding: mean_l is a lower bound -> round down.
                     let mean_l: f32 = next_down_f32(
                         (input.lower().iter().map(|&x| x as f64).sum::<f64>() / nf_64) as f32,
                     );
-                    // Directed rounding: mean_u is an upper bound -> round up (#3270).
+                    // Directed rounding: mean_u is an upper bound -> round up.
                     let mean_u: f32 = next_up_f32(
                         (input.upper().iter().map(|&x| x as f64).sum::<f64>() / nf_64) as f32,
                     );
@@ -164,12 +166,12 @@ impl LayerNormLayer {
                         let xu = input.upper()[[i]];
                         let g = self.ny[i];
                         let b = self.beta[i];
-                        // Directed rounding on intermediate deviation. Part of #3344.
+                        // Directed rounding on intermediate deviation.
                         let diff_l = next_down_f32(xl - mean_u);
                         let diff_u = next_up_f32(xu - mean_l);
 
                         // Directed rounding on final bounds: bare f32 mul+add
-                        // can lose up to 1 ULP per operation. Part of #3344.
+                        // can lose up to 1 ULP per operation.
                         if g >= 0.0 {
                             out_lower[[i]] = next_down_f32(g * diff_l + b);
                             out_upper[[i]] = next_up_f32(g * diff_u + b);
@@ -190,7 +192,7 @@ impl LayerNormLayer {
                             &mut full_idx[..prefix_len],
                         );
 
-                        // f64 accumulation for mean computation. Part of #2423.
+                        // f64 accumulation for mean computation.
                         let mut lower_sum: f64 = 0.0;
                         let mut upper_sum: f64 = 0.0;
                         for i in 0..norm_size {
@@ -199,9 +201,9 @@ impl LayerNormLayer {
                             lower_sum += input.lower()[idx] as f64;
                             upper_sum += input.upper()[idx] as f64;
                         }
-                        // Directed rounding: mean_l is a lower bound -> round down (#3270).
+                        // Directed rounding: mean_l is a lower bound -> round down.
                         let mean_l = next_down_f32((lower_sum / norm_size as f64) as f32);
-                        // Directed rounding: mean_u is an upper bound -> round up (#3270).
+                        // Directed rounding: mean_u is an upper bound -> round up.
                         let mean_u = next_up_f32((upper_sum / norm_size as f64) as f32);
 
                         for i in 0..norm_size {
@@ -212,11 +214,11 @@ impl LayerNormLayer {
                             let xu = input.upper()[idx];
                             let g = self.ny[i];
                             let b = self.beta[i];
-                            // Directed rounding on intermediate deviation. Part of #3344.
+                            // Directed rounding on intermediate deviation.
                             let diff_l = next_down_f32(xl - mean_u);
                             let diff_u = next_up_f32(xu - mean_l);
 
-                            // Directed rounding on final bounds. Part of #3344.
+                            // Directed rounding on final bounds.
                             if g >= 0.0 {
                                 out_lower[idx] = next_down_f32(g * diff_l + b);
                                 out_upper[idx] = next_up_f32(g * diff_u + b);
@@ -230,7 +232,7 @@ impl LayerNormLayer {
 
                 // Repair non-finite outputs: g * diff can produce Inf for large
                 // ny or wide input intervals. Consistent with IBP overflow
-                // strategy (#3030, #3060).
+                // strategy.
                 BoundedTensor::new_repaired(out_lower, out_upper, RepairStrategy::Conservative)
             }
         }
@@ -249,7 +251,7 @@ impl LayerNormLayer {
     /// ```
     /// where `z_i = (c_i - mean_c) / std_c`.
     ///
-    /// Fix for #3098: replaces the unsound `max_radius / n` coupling correction
+    /// Replaces the unsound `max_radius / n` coupling correction
     /// with exact Jacobian propagation plus a conservative second-order remainder.
     #[inline]
     fn forward_mode_standard_1d_slice(
@@ -263,7 +265,7 @@ impl LayerNormLayer {
         let nf_64 = nf as f64;
 
         // f64 accumulation for mean and variance to prevent catastrophic cancellation
-        // for large norm_size (768+). Part of #2423.
+        // for large norm_size (768+).
         // Reference: Higham, "Accuracy and Stability of Numerical Algorithms", S4.2.
         let mean_c_f64: f64 = center.iter().map(|&x| x as f64).sum::<f64>() / nf_64;
         let mean_c = mean_c_f64 as f32;
@@ -324,11 +326,11 @@ impl LayerNormLayer {
         }
         // Directed rounding: var_lower is a lower bound on variance -> round down.
         // Smaller variance -> smaller std denominator -> tighter (unsound) bounds
-        // if not rounded conservatively (#3270).
+        // if not rounded conservatively.
         let var_lower = next_down_f32((var_lower_f64 / nf_64) as f32);
         // Directed rounding on sqrt: std_min is a denominator -> round DOWN
         // (smaller denominator = larger R2 = sound). f64 intermediate for
-        // precision. Pattern from GroupNorm #3327, fix for #3332.
+        // precision. Pattern from GroupNorm.
         let std_min = next_down_f32(((var_lower as f64 + self.eps as f64).sqrt()) as f32);
 
         // Sound affine envelope on the normalized value z, to INTERSECT with the
@@ -396,7 +398,7 @@ impl LayerNormLayer {
             // First-order: output_radius_i = sum_j |J[i,j]| * radius_j
             // J[i,j] = ny_i / std_c * (delta_ij - 1/n - z_i * z_j / n)
             // f64 for both individual Jacobian entries and the sum to prevent
-            // cancellation in (delta_ij - 1/n - z_i*z_j/n). Part of #2423.
+            // cancellation in (delta_ij - 1/n - z_i*z_j/n).
             let g_i_f64 = g_i as f64;
             let mut first_order_radius_f64 = 0.0_f64;
             for j in 0..norm_size {
@@ -405,7 +407,7 @@ impl LayerNormLayer {
                     g_i_f64 / std_c_f64 * (delta_ij - 1.0 / nf_64 - z_f64[i] * z_f64[j] / nf_64);
                 first_order_radius_f64 += j_ij_f64.abs() * radius[j] as f64;
             }
-            // Directed rounding: radius widens output bounds -> round up (#3270).
+            // Directed rounding: radius widens output bounds -> round up.
             let first_order_radius = next_up_f32(first_order_radius_f64 as f32);
 
             // Second-order remainder: conservative bound on Hessian contribution.
@@ -427,10 +429,10 @@ impl LayerNormLayer {
             // Guard: if sigma_min^2 overflows to Inf (extreme center values ~1e19+),
             // the denominator becomes Inf and second_order would vanish via
             // IEEE 754 x/Inf=0, silently dropping the curvature correction
-            // (unsound). Emit Inf to trigger new_repaired fallback (#3423).
+            // (unsound). Emit Inf to trigger new_repaired fallback.
             let second_order_denom = nf.sqrt() * std_min * std_min;
             let second_order = if second_order_denom.is_finite() && second_order_denom > 0.0 {
-                3.5 * g_i.abs() * radius_sq_sum / second_order_denom
+                CENTERED_NORM_SECOND_ORDER_COEFF * g_i.abs() * radius_sq_sum / second_order_denom
             } else {
                 f32::INFINITY
             };
@@ -439,7 +441,7 @@ impl LayerNormLayer {
 
             // Directed rounding on final emit: y_center has f64->f32 rounding
             // error up to 0.5 ULP, and f32 subtraction/addition adds another
-            // 0.5 ULP. next_down/next_up compensates both. Part of #3344.
+            // 0.5 ULP. next_down/next_up compensates both.
             let jac_l = next_down_f32(y_center - output_radius);
             let jac_u = next_up_f32(y_center + output_radius);
 

@@ -5,10 +5,9 @@
 
 //! MIP/LP solving for neural network verification, on the ay backend.
 //!
-//! SOLVER POLICY (docs/SOLVER_POLICY.md): all solving in ny happens on ay
-//! (or ny's own native engines). HiGHS was deleted at LG3: verified ay
-//! certificates are the independent cross-check, exercised by the
-//! `mip-diff` gate's `--certify` mode.
+//! The default backend is the in-process `ay-milp` library. `AyProc` uses
+//! the external `ay` binary for conformance checks. `mip-diff --certify`
+//! checks exact certificates; see `docs/SOLVER_POLICY.md`.
 //!
 //! Provides complete MIP verification and LP bound tightening for FC+ReLU
 //! networks.
@@ -23,25 +22,19 @@
 //!
 //! # Architecture
 //!
-//! - [`ir`] — Solver-neutral MILP problem IR + per-backend lowerings
+//! - [`ir`] — Solver-neutral MILP problem representation
 //! - [`encoder`] — Network → [`ir::MilpProblem`] encoding (Big-M ReLU)
 //! - [`solver`] — Backend dispatch, solve + result extraction
 //! - [`config`] — Solver configuration
 //! - [`error`] — Typed errors via `thiserror`
-//!
-//! Part of #1763.
 
-// Link macOS Accelerate BLAS for ndarray::dot() acceleration (#4259).
+// Link macOS Accelerate BLAS for ndarray::dot() acceleration.
 #[cfg(target_os = "macos")]
 extern crate blas_src;
 
 mod ay;
 mod ay_lib;
-// Unwired falsification primitive (LP-guided sign-space search over binarized
-// `Sign` conv suffixes; docs/BNN_SIGN_SPACE_FALSIFICATION_2026-08-12.md). Not
-// on any verdict path: its outcome enum has no verified/unsat variant by
-// construction, so it can only ever propose a witness for the caller's
-// existing, unweakened validation gate to accept or reject.
+// SAT-only sign-space proposals; the CLI owns original-model witness replay.
 pub mod bnn_sign_space;
 pub mod certified_auxiliary_bounds64;
 pub mod certified_box64;
@@ -66,14 +59,27 @@ pub mod constrained_zonotope_tail_lp;
 pub mod dump;
 pub mod encoder;
 pub mod error;
+mod integer_cut_bank;
 pub mod ir;
-// Unwired budget primitive (LAYER A of the per-instance lane budget allocator:
-// a multiple-choice knapsack over source-declared cap ladders;
-// docs/LANE_BUDGET_ALLOCATION_MCKP_2026-08-19.md). Not on any verdict path and
-// not on any scored path: nothing calls it, and by construction no type on its
-// public surface can carry an instance answer.
+pub use integer_cut_bank::{IntegerCutBank, IntegerCutBankReport};
+// AY supplies only bounded, untrusted dual hints; NY owns source replay.
+pub mod head_phase_ay;
+// Multiple-choice knapsack over source-declared cap ladders, used by the CLI
+// attack-slice allocator. Its public types carry budgets, never verdicts.
 pub mod lane_allocation;
+// #hull-root / wave-6 T5: the LP-proposes / closed-form-or-rigorous-replay
+// certifies seam (reused by C7's LP-refined intermediates).
+pub mod lp_propose_certify;
+/// WCNF incumbent search through NY's existing in-process MIP backend.
+pub mod maxsat;
+// AY supplies untrusted proposals; the source-owned paired checker and CLI
+// formula/receipt gate remain the only neural UNSAT authority.
+pub mod paired_difference_ay;
 pub mod shared_tree_profile;
+// #hull-root: certified single-hidden-layer per-neuron hull root bound, and
+// (#hull-bab, `single_hidden_hull::bab`) the ReLU-split tree over it. Dark
+// unless `bab.single_hidden_hull: root|bab` is armed (ny-cli sequential lane).
+pub mod single_hidden_hull;
 pub mod solver;
 pub mod star_dual;
 pub mod star_lp;
@@ -87,7 +93,9 @@ pub mod tighten;
 // any verdict path; soundness proven by the module's own oracle tests.
 pub mod verified_sdp_bound;
 
-pub use ay_lib::{prove_infeasible_with_row_farkas, RowSide};
+pub use ay_lib::{
+    prove_infeasible_with_row_farkas, strict_side_artifact_unsat_admissions, RowSide,
+};
 pub use bnn_sign_space::TrustRegion;
 pub use bnn_sign_space::{
     classify_first_layer_unwired, f32_replay_slack_floor, falsify_bnn_sign_suffix_unwired,
@@ -292,6 +300,9 @@ pub use solver::{
     SplitUnsatCache,
 };
 pub use tighten::{obbt_relaxation_bounds, LpTightener, RelaxationObbt};
+// #relusplitter-lp-refine (wave-6 C7): its own line so sibling branches that
+// extend the list above do not conflict with it.
+pub use tighten::{count_unstable, triangle_gap_priority, LayerTightenReport};
 
 /// Convenience type alias for Results using [`MipError`].
 pub type Result<T> = std::result::Result<T, MipError>;

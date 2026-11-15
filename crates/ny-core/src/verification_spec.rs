@@ -32,7 +32,7 @@ pub struct VerificationSpec {
     output_constraints: Vec<OutputConstraint>,
 }
 
-/// Custom deserialization for `VerificationSpec` that validates invariants (#2367, #2778).
+/// Custom deserialization for `VerificationSpec` that validates invariants.
 ///
 /// Enforces the same bound contract as `new()` and `from_parts()`:
 /// - Input bounds must be finite, non-NaN, and ordered.
@@ -54,7 +54,7 @@ impl<'de> Deserialize<'de> for VerificationSpec {
             output_constraints: Vec<OutputConstraint>,
         }
         let raw = VerificationSpecRaw::deserialize(deserializer)?;
-        // Use the same shared validation as constructors (#2778).
+        // Use the same shared validation as constructors.
         validate_input_bounds(&raw.input_bounds).map_err(serde::de::Error::custom)?;
         validate_output_bounds(&raw.output_bounds).map_err(serde::de::Error::custom)?;
         validate_output_constraints(&raw.output_constraints).map_err(serde::de::Error::custom)?;

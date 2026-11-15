@@ -19,8 +19,9 @@ pub use options::{
 };
 /// Core ONNX graph, layer, tensor, and attribute model types.
 pub use types::{
-    is_multi_output_split, resolve_dynamic_dim, resolve_dynamic_shape, AttributeValue, DataType,
-    LayerSpec, Network, OnnxModel, TensorSpec, WeightRef,
+    concat_input_layout, is_multi_output_split, resolve_dynamic_dim, resolve_dynamic_shape,
+    AttributeValue, ConcatInputLayout, ConcatInputSlot, DataType, LayerSpec, Network, OnnxModel,
+    TensorSpec, WeightRef,
 };
 pub(crate) use types::{OriginalFloat32Initializer, OriginalOnnxNetwork};
 /// Model weight storage container keyed by tensor name.

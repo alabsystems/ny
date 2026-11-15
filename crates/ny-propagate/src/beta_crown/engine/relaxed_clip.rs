@@ -34,7 +34,6 @@ impl BetaCrownVerifier {
     ///
     /// # References
     ///
-    /// - `designs/2026-01-28-clip-and-verify-algorithms.md`
     /// - `alpha-beta-CROWN/complete_verifier/input_split/clip.py`
     pub(in crate::beta_crown::engine) fn apply_relaxed_clipping(
         &self,

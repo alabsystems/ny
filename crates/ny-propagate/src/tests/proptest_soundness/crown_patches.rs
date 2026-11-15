@@ -8,41 +8,30 @@
 //! produces identical A-matrices and biases to the Dense representation
 //! (`LinearBounds`) after conversion via `to_dense()`.
 //!
-//! Design: designs/2026-02-28-patches-mode-wrapper-enum-design.md
-//! Part of #2620, Epic #2613
-//!
 //! The wall-clock guards below are hang sentinels, not performance assertions.
 //! Keep enough scheduler headroom for the 500-case properties when unrelated
 //! crate suites are saturating a shared builder.
 //!
 //! WALL-CLOCK POLICY FOR THIS FILE: every `#[ntest::timeout(..)]` below is a
-//! HANG SENTINEL, not a performance assertion. Measured 2026-08-19, isolated
-//! and single-threaded, these properties cost 10-30s in a debug build, and the
-//! walls they used to carry (20-60s) were margins of 1.2-2.9x. That is not a
-//! sentinel, it is a coin flip that any concurrent load loses -- and they duly
-//! failed at both 4 and 8 test threads. They are now a uniform 300s, roughly
-//! 10-20x the measured isolated cost. The failure these exist to catch is an
-//! infinite loop, and no finite wall lets one of those through.
-//! MEASURE BEFORE LOWERING THEM.
+//! HANG SENTINEL, not a performance assertion, at a uniform 300s. The failure
+//! these exist to catch is an infinite loop, and no finite wall lets one of those
+//! through. MEASURE BEFORE LOWERING THEM.
 //!
 //! !! MEASUREMENT CORRECTION, 2026-08-20 !!
-//! Several wall-clock justifications in this file and its siblings were derived
-//! from timings taken while 14 stray busy-loop processes -- left running by my
-//! own earlier load experiment -- were saturating this 14-core box for 15+
-//! hours. Every "isolated" cost measured in that window is inflated, typically
-//! 5-7x. Re-measured on a clean box:
+//! The walls were raised from 20-60s on timings taken 2026-08-19 (10-30s
+//! isolated, read as "coin flips with no margin"). Those timings were taken while
+//! 14 stray busy-loop processes saturated this 14-core box, and every "isolated"
+//! cost from that window is inflated, typically 5-7x. Re-measured on a clean box:
 //!
 //!   obj_chunk_equivalence_and_containment   29.57s -> 4.15s   (wall margin 7.2x, NOT 1.01x)
 //!   convtranspose2d_relu_chain_soundness    16.44s -> 2.74s   (margin 7.3x, NOT 1.22x)
 //!   conv2d_relu_patches_vs_dense            12.59s -> 2.36s
 //!   cosine_distance_crown_bounds_noninvert  15.05s -> 2.60s  (at 16 cases)
 //!
-//! So the claim that these walls were "coin flips with no margin" was WRONG:
-//! they had 5-7x headroom and were tripping because of my contamination, not
-//! because they were mis-sized. The enlarged walls are retained -- a hang
-//! sentinel loses nothing by being generous, and CI hosts are shared -- but the
-//! reasoning that produced them does not stand, and no future change should
-//! cite those numbers.
+//! So the old walls had 5-7x headroom and tripped because of that contamination,
+//! not because they were mis-sized. The 300s walls are retained -- a hang sentinel
+//! loses nothing by being generous, and CI hosts are shared -- but no future change
+//! should cite the 2026-08-19 numbers.
 //!
 //! What is NOT affected: the env-leak findings. `budget_bytes: 0` and
 //! `crown=-inf` against a finite IBP are causal evidence of a leaked
@@ -61,9 +50,6 @@ use proptest::prelude::*;
 /// Both paths compute the same mathematical operation (convolution transpose),
 /// but the Dense path uses 6-nested scalar loops while Patches uses structured
 /// tensor operations. f32 accumulation order differs.
-///
-/// Reference: designs/2026-02-28-patches-mode-wrapper-enum-design.md (tolerance
-/// justification section)
 const PATCHES_DENSE_TOLERANCE: f32 = 1e-5;
 
 /// Generate a random kernel of shape (out_c, in_c, kh, kw) with values in
@@ -107,9 +93,6 @@ proptest! {
     /// Property: For any valid Conv2d layer, propagate_patches followed by
     /// to_dense() produces the same A-matrices and biases as propagate_linear
     /// on the Dense path.
-    ///
-    /// Reference: designs/2026-02-28-patches-mode-wrapper-enum-design.md
-    /// "Proptest Equivalence Specification — Test 1"
     #[ntest::timeout(300000)]
     #[test]
     fn proptest_conv2d_patches_vs_dense_identity(
@@ -257,9 +240,6 @@ proptest! {
     /// Property: For random inputs within bounds, CROWN bounds from both paths
     /// must contain the true convolution output.
     ///
-    /// Reference: designs/2026-02-28-patches-mode-wrapper-enum-design.md
-    /// "Proptest Equivalence Specification — Test 2"
-    ///
     /// HANG SENTINEL, NOT A PERFORMANCE ASSERTION: raised with its neighbours in
     /// this file, which were measured at 7.4-12.6s isolated and still tripped
     /// 30-90s walls under parallel load. MEASURE BEFORE LOWERING IT.
@@ -399,16 +379,12 @@ proptest! {
     /// Dense fallback) → Conv2d, the Patches path produces the same result as
     /// the Dense-only path.
     ///
-    /// Reference: designs/2026-02-28-patches-mode-wrapper-enum-design.md
-    /// "Proptest Equivalence Specification — Test 3"
-    ///
     /// Timeout raised 10s→20s→40s→90s→300s (#vnncomp-aw-soundness): the dense
     /// Conv2d CROWN backward f64-recomputes the coefficient for the sound
     /// certified error (≈2× the per-call cost).
     ///
-    /// The first four bumps were each a retune against whatever the suite's
-    /// contention happened to be that week, which is why there were four of
-    /// them. This one is derived from measurement instead. 2026-08-19:
+    /// The earlier bumps were retunes against ambient suite contention; this one
+    /// is derived from measurement (2026-08-19):
     ///
     ///   isolated                     7.43s
     ///   with 14 CPU burners pinned  32.21s   (4.3×)
@@ -587,15 +563,12 @@ proptest! {
     ///
     /// This is the key Phase 2 test — verifies that ReLU's Patches backward
     /// correctly scales patches coefficients by per-neuron relaxation slopes.
-    ///
-    /// Reference: designs/2026-02-28-patches-mode-wrapper-enum-design.md Phase 2
-    /// Part of #2613
-    // HANG SENTINEL, NOT A PERFORMANCE ASSERTION. Measured 2026-08-19: 12.59s
-    // isolated against the 30s wall it used to carry -- a 2.4x margin that does
-    // not survive a shared box. It failed at BOTH 4 and 8 test threads, once by
-    // timeout and once with "CPU memory exceeded at patch unfold plan", the
-    // latter being a leaked memory cap from a concurrent env writer rather than
-    // anything wrong with this test. 300s is ~24x. MEASURE BEFORE LOWERING IT.
+    // HANG SENTINEL, NOT A PERFORMANCE ASSERTION. Isolated cost on a clean box
+    // is 2.36s (2026-08-20); the 12.59s read on 2026-08-19 was inflated by stray
+    // load (see the correction in the module docs). Its one non-timeout failure,
+    // "CPU memory exceeded at patch unfold plan", was a leaked memory cap from a
+    // concurrent env writer rather than anything wrong with this test. 300s is
+    // over 100x. MEASURE BEFORE LOWERING IT.
     #[ntest::timeout(300000)]
     #[test]
     fn proptest_conv2d_relu_patches_vs_dense(
@@ -767,9 +740,6 @@ proptest! {
     ///
     /// This tests Phase 2 BatchNorm Patches: per-channel scaling of patches
     /// coefficients preserves equivalence with Dense per-column scaling.
-    ///
-    /// Reference: designs/2026-02-28-patches-mode-wrapper-enum-design.md Phase 2
-    /// Part of #2613
     #[ntest::timeout(300000)]
     #[test]
     fn proptest_conv2d_batchnorm_patches_vs_dense(
@@ -952,8 +922,6 @@ proptest! {
     /// Property: For any valid Conv2d layer and random unstable mask,
     /// filter_to_unstable() followed by to_dense() produces the same non-zero
     /// rows in the Dense A-matrix as the full Patches to_dense().
-    ///
-    /// Part of #2613 Phase 4 step 19
     #[ntest::timeout(300000)]
     #[test]
     fn proptest_sparse_patches_vs_dense_equivalence(

@@ -18,7 +18,7 @@ use super::spsa_accumulate::{
     accumulate_monotone_gradients, accumulate_reciprocal_gradients, accumulate_sqrt_gradients,
 };
 
-/// Compute the lower bound of `spec^T output` using interval arithmetic (#4355).
+/// Compute the lower bound of `spec^T output` using interval arithmetic.
 ///
 /// For each coefficient `c_i` in the spec vector:
 /// - If `c_i >= 0`, the lower bound contribution is `c_i * lower_i`
@@ -79,7 +79,7 @@ impl GraphNetwork {
         )
     }
 
-    /// Compute SPSA gradients targeting a specific spec-guided objective (#4355).
+    /// Compute SPSA gradients targeting a specific spec-guided objective.
     ///
     /// Instead of maximizing `sum(output_lower)`, maximizes the lower bound of
     /// `c^T output` where `c` is the spec vector. Used for per-disjunct alpha
@@ -113,7 +113,7 @@ impl GraphNetwork {
     /// Internal SPSA gradient computation with configurable objective.
     ///
     /// When `spec_objective` is `None`, targets `sum(output_lower)` (standard).
-    /// When `Some(spec)`, targets the lower bound of `spec^T output` (#4355).
+    /// When `Some(spec)`, targets the lower bound of `spec^T output`.
     #[allow(clippy::too_many_arguments)]
     fn compute_spsa_gradients_impl(
         &self,
@@ -143,7 +143,7 @@ impl GraphNetwork {
 
         // GraphAlphaState.alphas is a BTreeMap, so iteration is deterministic
         // (sorted by key). This ensures the seeded RNG consumes random numbers
-        // in a consistent order across runs. See #1976.
+        // in a consistent order across runs.
         for _ in 0..num_samples {
             let mut relu_perturbations: BTreeMap<String, Array1<f32>> = BTreeMap::new();
             for (name, alpha) in &alpha_state.alphas {
@@ -217,7 +217,7 @@ impl GraphNetwork {
             let monotone_perturbations = &all_monotone_perturbations[sample_idx];
             let sqrt_perturbations = &all_sqrt_perturbations[sample_idx];
             let reciprocal_perturbations = &all_reciprocal_perturbations[sample_idx];
-            // +eps perturbation (both lower and upper paths, #3393).
+            // +eps perturbation (both lower and upper paths).
             // `clone_for_backward` clones only the fields the backward pass reads
             // and leaves the unused Adam/SGD optimizer maps empty — these tasks are
             // only ever evaluated (never optimizer-updated), so the bound is
@@ -257,7 +257,7 @@ impl GraphNetwork {
             }
             all_tasks.push((sample_idx, true, alpha_plus));
 
-            // -eps perturbation (both lower and upper paths, #3393).
+            // -eps perturbation (both lower and upper paths).
             // Same lightweight clone as the +eps task above (optimizer maps unused).
             let mut alpha_minus = alpha_state.clone_for_backward();
             for (name, pert) in relu_perturbations {
@@ -298,7 +298,7 @@ impl GraphNetwork {
         // Step 3: Compute all CROWN bounds
         // Use sequential evaluation for small task counts (≤4) to ensure
         // deterministic floating-point results. Rayon parallelism can cause
-        // non-determinism via CPU cache effects and thread scheduling (#1975).
+        // non-determinism via CPU cache effects and thread scheduling.
         // For typical spsa_samples=1 (2 tasks), sequential is also faster
         // since it avoids thread pool overhead.
         let empty_map: std::collections::HashMap<String, BoundedTensor> =
@@ -311,12 +311,12 @@ impl GraphNetwork {
         )|
          -> Result<(usize, bool, f32)> {
             // Use layout-agnostic iter().sum() instead of as_slice() which returns
-            // None for non-contiguous arrays (#1939, #2024).
-            // Propagate CROWN errors instead of swallowing them (#2063).
+            // None for non-contiguous arrays.
+            // Propagate CROWN errors instead of swallowing them.
             // No per-node deadline for SPSA bound-evals: each eval is one of a
             // small fixed batch already bounded by the caller's iteration-level
             // deadline checks, and a mid-eval DeadlineExceeded here would be a
-            // hard error (this closure propagates Err, #2063).
+            // hard error (this closure propagates Err).
             let bounds = self.propagate_crown_to_node_with_alpha(
                 input,
                 output_node,
@@ -432,7 +432,7 @@ impl GraphNetwork {
         }
 
         // Average the gradients
-        // Guard against num_samples=0 to prevent NaN from division by zero (#2245, #2079).
+        // Guard against num_samples=0 to prevent NaN from division by zero.
         let num_samples_f32 = num_samples.max(1) as f32;
         for grad in avg_relu_grads.values_mut() {
             *grad /= num_samples_f32;
@@ -471,7 +471,7 @@ impl GraphNetwork {
             }
         }
 
-        // Sort by magnitude (descending, NaN last — #2995), with name+idx tiebreaker for determinism.
+        // Sort by magnitude (descending, NaN last), with name+idx tiebreaker for determinism.
         all_grads.sort_by(|a, b| {
             crate::cmp_utils::nan_last_descending_cmp(&a.0, &b.0)
                 .then_with(|| a.1.cmp(b.1))

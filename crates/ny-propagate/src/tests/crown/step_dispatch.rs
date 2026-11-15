@@ -11,8 +11,6 @@
 //!
 //! Soundness check: sample concrete points in the input region, evaluate the
 //! network, and verify all outputs fall within the CROWN bounds.
-//!
-//! Part of #3463 (Medium item: crown_backward_step dispatch coverage).
 
 use super::*;
 use crate::layers::{Conv1dLayer, ConvTranspose1dLayer, SliceLayer, TileLayer, TransposeLayer};

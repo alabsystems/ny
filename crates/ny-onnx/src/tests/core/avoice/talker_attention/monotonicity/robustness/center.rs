@@ -5,7 +5,7 @@
 use super::*;
 
 // ---------------------------------------------------------------------------
-// Phase 5/7: Center independence — non-vacuousness (#3497)
+// Phase 5/7: Center independence — non-vacuousness
 //
 // Phases 1-4 used zero-centered hidden_states. This is potentially degenerate:
 // Q*0 = 0 produces uniform attention. Phase 5 verifies monotonicity at

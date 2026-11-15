@@ -17,7 +17,7 @@ use super::support::{
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
-// Deep-prefix spec-guided CROWN (#3500)
+// Deep-prefix spec-guided CROWN
 //
 // The 2-node (ConvTranspose) prefix produces CROWN == IBP (0 tighter) because
 // the backward pass has minimal room to exploit linear relaxation. The 12-node

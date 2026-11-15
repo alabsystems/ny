@@ -4,7 +4,7 @@
 
 //! Constraint-aware CROWN propagation regression tests.
 //!
-//! Split by regression family from the original monolithic `tests.rs` (#4255).
+//! Split by regression family from the original monolithic `tests.rs`.
 
 pub(super) const TOL: f32 = 1e-6;
 
@@ -12,8 +12,10 @@ mod binary_soundness_audit;
 mod clip_alpha;
 mod concat;
 mod cone_delta;
+mod conv_family_certified;
 mod deadline;
 mod error_mapping;
+mod finalize_objective;
 mod forward_basic;
 mod genbab;
 mod operator_dispatch;

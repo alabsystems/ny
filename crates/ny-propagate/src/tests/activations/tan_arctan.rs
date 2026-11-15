@@ -82,7 +82,7 @@ fn test_arctan_ibp_monotonic_interval() {
     }
 }
 
-/// Regression test for #3316: arctan IBP bounds must stay in [-π/2, π/2] even for
+/// Regression test: arctan IBP bounds must stay in [-π/2, π/2] even for
 /// extreme inputs where directed rounding could push past the range boundary.
 /// arctan(1e10) → π/2 via f64 saturation, next_up_f32(π/2) > π/2.
 #[ntest::timeout(10000)]

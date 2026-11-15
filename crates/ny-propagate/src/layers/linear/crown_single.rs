@@ -16,14 +16,30 @@ use std::time::Instant;
 use tracing::debug;
 
 use super::bias::{
-    accumulate_bias_f64, add_coeff_err_bias_product_up, add_f64_down, add_f64_up, f32_to_f64_exact,
+    accumulate_bias_f64, accumulate_bias_f64_with_work, add_f64_down, add_f64_up, f32_to_f64_exact,
     finalize_bias_directed, nonnegative_f32_error_or_infinity, publish_error_up_normal,
-    BiasBlockParams,
+    sum_coeff_err_bias_up, BiasBlockParams,
 };
 use super::layout::resolve_backward_layout;
 use super::LinearLayer;
+use crate::amortise::{CooperativeWork, WeightedPoll};
 use crate::faer_parallelism::{mat_mul, mat_mul_f64};
+
+#[path = "crown_single/aw_storage.rs"]
+pub(crate) mod aw_storage;
+
+#[path = "crown_single/cpu_storage.rs"]
+pub(crate) mod cpu_storage;
+
+#[path = "crown_single/scalar_aw.rs"]
+pub(crate) mod scalar_aw;
+
+#[path = "crown_single/cooperative_copy.rs"]
+mod cooperative_copy;
+#[path = "crown_single/incoming_error_step.rs"]
+pub(crate) mod incoming_error_step;
 use crate::{contiguous_flat_slice_mut, LinearBounds};
+use cooperative_copy::copy_col_major_block_into_row_major;
 
 /// Measured CPU/GPU crossover for verdict-grade f64 `A·W`.
 ///
@@ -168,7 +184,21 @@ fn use_naive_f64_aw() -> bool {
 ///
 /// `a` is `(num_outputs, contraction)` and `w` is `(contraction, out)`.
 pub(crate) fn aw_f64_with_abssum(a_block: &Mat<f32>, w: &Mat<f32>) -> (Array2<f64>, Array2<f64>) {
-    aw_f64_with_abssum_unbounded(a_block, w)
+    aw_f64_with_abssum_unbounded(a_block, w, None)
+}
+
+/// [`aw_f64_with_abssum`] for a layer whose immutable weight carries the cached
+/// f64 widening (#linear-widened-weight-cache).
+///
+/// BIT-IDENTICAL to `aw_f64_with_abssum(a_block, layer.weight_faer())`: the
+/// cache substitutes two per-call `Mat::from_fn` rebuilds with the identical
+/// values in the identical layout (see [`WidenedWeightF64`]). No product, no
+/// sum, and no reduction order is touched.
+pub(crate) fn aw_f64_with_abssum_for_layer(
+    layer: &LinearLayer,
+    a_block: &Mat<f32>,
+) -> (Array2<f64>, Array2<f64>) {
+    aw_f64_with_abssum_unbounded(a_block, layer.weight_faer(), layer.weight_widened_f64())
 }
 
 /// Domain-batched twin of [`aw_f64_with_abssum`] (#iso-batched-rebound): the
@@ -224,6 +254,23 @@ pub(crate) fn aw_batched_f64_with_abssum(
     (a64, s)
 }
 
+/// [`aw_f64_with_abssum_and_deadline`] for a layer carrying the cached f64
+/// widening of its weight (#linear-widened-weight-cache). Same arithmetic, same
+/// routing, same polls — only the two `Mat::from_fn` weight rebuilds are
+/// skipped when the cache is populated.
+pub(crate) fn aw_f64_with_abssum_and_deadline_for_layer(
+    layer: &LinearLayer,
+    a_block: &Mat<f32>,
+    deadline: Option<Instant>,
+) -> Result<(Array2<f64>, Array2<f64>)> {
+    aw_f64_with_abssum_and_deadline(
+        a_block,
+        layer.weight_faer(),
+        layer.weight_widened_f64(),
+        deadline,
+    )
+}
+
 /// Deadline-aware twin of [`aw_f64_with_abssum`].
 ///
 /// A sufficiently large deadline-scoped call may use the process-global sound
@@ -238,13 +285,18 @@ pub(crate) fn aw_batched_f64_with_abssum(
 /// The ordinary `gemm_f64`/`gemm_f32` methods are never called under finite
 /// deadline authority. With `None`, preserve the existing acceleration policy
 /// and arithmetic unchanged.
+///
+/// `widened` is the caller's cached f64 widening of `w`
+/// (#linear-widened-weight-cache); passing `None` rebuilds it per call exactly
+/// as before. It never reaches the engine arms, which consume the f32 `w`.
 pub(crate) fn aw_f64_with_abssum_and_deadline(
     a_block: &Mat<f32>,
     w: &Mat<f32>,
+    widened: Option<&WidenedWeightF64>,
     deadline: Option<Instant>,
 ) -> Result<(Array2<f64>, Array2<f64>)> {
     let Some(deadline) = deadline else {
-        return Ok(aw_f64_with_abssum_unbounded(a_block, w));
+        return Ok(aw_f64_with_abssum_unbounded(a_block, w, widened));
     };
 
     // A comprehensive host sweep installs this call-local authority on every
@@ -253,7 +305,7 @@ pub(crate) fn aw_f64_with_abssum_and_deadline(
     // route directly. Ordinary callers do not install the guard and retain the
     // historical global admission byte-for-byte.
     if crate::sound_f64_gemm::cpu_only_f64_active() {
-        return aw_f64_with_abssum_cpu_deadline(a_block, w, deadline);
+        return aw_f64_with_abssum_cpu_deadline(a_block, w, widened, deadline);
     }
 
     let m = a_block.nrows();
@@ -279,9 +331,9 @@ pub(crate) fn aw_f64_with_abssum_and_deadline(
         // `m == 1` at 16.7 M MACs are 0.13× and 0.77× on faer).
         if let Some(result) = crate::sound_f64_gemm::with_engine_deadline(deadline, |engine| {
             if deadline_f64_engine_admits(engine, m, k, p) {
-                aw_f64_with_abssum_deadline_via_engine_or_cpu(engine, a_block, w, deadline)
+                aw_f64_with_abssum_deadline_via_engine_or_cpu(engine, a_block, w, widened, deadline)
             } else {
-                aw_f64_with_abssum_cpu_deadline(a_block, w, deadline)
+                aw_f64_with_abssum_cpu_deadline(a_block, w, widened, deadline)
             }
         })? {
             return result;
@@ -306,7 +358,7 @@ pub(crate) fn aw_f64_with_abssum_and_deadline(
         crate::sound_f64_gemm::start_background_initialization();
         let admitted = crate::sound_f64_gemm::with_preinitialized_engine(|engine| {
             deadline_f64_engine_admits(engine, m, k, p).then(|| {
-                aw_f64_with_abssum_deadline_via_engine_or_cpu(engine, a_block, w, deadline)
+                aw_f64_with_abssum_deadline_via_engine_or_cpu(engine, a_block, w, widened, deadline)
             })
         })
         .flatten();
@@ -315,7 +367,7 @@ pub(crate) fn aw_f64_with_abssum_and_deadline(
         }
     }
 
-    aw_f64_with_abssum_cpu_deadline(a_block, w, deadline)
+    aw_f64_with_abssum_cpu_deadline(a_block, w, widened, deadline)
 }
 
 #[inline]
@@ -366,11 +418,23 @@ fn deadline_f64_engine_admits(engine: &dyn GemmEngine, m: usize, k: usize, p: us
 }
 
 /// Historical unbounded implementation, including its optional global f64 GEMM.
-fn aw_f64_with_abssum_unbounded(a_block: &Mat<f32>, w: &Mat<f32>) -> (Array2<f64>, Array2<f64>) {
+///
+/// `widened` is the caller's cached f64 twin of `w`
+/// (#linear-widened-weight-cache); `None` rebuilds it per call exactly as
+/// before.
+fn aw_f64_with_abssum_unbounded(
+    a_block: &Mat<f32>,
+    w: &Mat<f32>,
+    widened: Option<&WidenedWeightF64>,
+) -> (Array2<f64>, Array2<f64>) {
     let m = a_block.nrows();
     let k = a_block.ncols();
     let p = w.ncols();
     debug_assert_eq!(w.nrows(), k);
+    // FAIL CLOSED: a cache that does not describe a `k×p` weight is discarded
+    // and the historical per-call widening runs, so a mis-plumbed cache can
+    // only cost throughput, never multiply the wrong operand.
+    let widened = widened.filter(|cached| cached.matches(k, p));
 
     // Sound GPU acceleration (#cuda-aw): offload the two f64 products `A·W` and
     // `|A|·|W|` to a process-global sound f64 GEMM engine (e.g. cuBLAS Dgemm) for
@@ -388,9 +452,9 @@ fn aw_f64_with_abssum_unbounded(a_block: &Mat<f32>, w: &Mat<f32>) -> (Array2<f64
     // instances). Above it the GPU's f64 throughput dominates (measured 2.46×
     // end-to-end on mnist_concat --method alpha, where large A·W dominate).
     if m.saturating_mul(k).saturating_mul(p) >= SOUND_F64_GEMM_MIN_MACS {
-        if let Some(Some(res)) =
-            crate::sound_f64_gemm::with_engine(|eng| aw_via_engine(eng, a_block, w, m, k, p))
-        {
+        if let Some(Some(res)) = crate::sound_f64_gemm::with_engine(|eng| {
+            aw_via_engine_widened(eng, a_block, w, widened, m, k, p)
+        }) {
             return res;
         }
     }
@@ -412,7 +476,7 @@ fn aw_f64_with_abssum_unbounded(a_block: &Mat<f32>, w: &Mat<f32>) -> (Array2<f64
     // are a valid basis for the same enclosure `est ± γ_n·S`; validated against a
     // high-precision oracle in `faer_aw_matches_naive_and_encloses_exact`. Inside
     // the per-domain rayon workers `mat_mul_f64`'s `current_par()` forces faer to
-    // `Par::Seq`, so there is no nested-Rayon deadlock (#4392).
+    // `Par::Seq`, so there is no nested-Rayon deadlock.
     if !use_naive_f64_aw() {
         // #rebound-scratch: pooled twin of the four `Mat::from_fn` operands +
         // two `mat_mul_f64` products. Same operands, same `current_par()`
@@ -422,14 +486,31 @@ fn aw_f64_with_abssum_unbounded(a_block: &Mat<f32>, w: &Mat<f32>) -> (Array2<f64
         // byte-for-byte historical reference (gate OFF / `NY_REBOUND_SCRATCH=0`).
         if crate::rebound_scratch::enabled() {
             let par = crate::faer_parallelism::current_par();
-            let (aw_cm, s_cm) = crate::rebound_scratch::pooled_aw_and_abssum(
-                m,
-                k,
-                p,
-                par,
-                |i, j| f32_to_f64_exact(a_block[(i, j)]),
-                |i, j| f32_to_f64_exact(w[(i, j)]),
-            );
+            let (aw_cm, s_cm) = match widened {
+                // #linear-widened-weight-cache: the pool recycled the `wf`/`wabs`
+                // BUFFERS but still re-converted the whole immutable weight into
+                // them on every call. The cached pair holds those very bytes in
+                // the same packed column-major order, so `matmul` receives a
+                // `MatRef` with identical dimensions, identical strides and
+                // identical contents — BIT-IDENTICAL, with the fill skipped.
+                Some(cached) => crate::rebound_scratch::pooled_aw_and_abssum_with_widened(
+                    m,
+                    k,
+                    p,
+                    par,
+                    |i, j| f32_to_f64_exact(a_block[(i, j)]),
+                    &cached.column_major,
+                    &cached.column_major_abs,
+                ),
+                None => crate::rebound_scratch::pooled_aw_and_abssum(
+                    m,
+                    k,
+                    p,
+                    par,
+                    |i, j| f32_to_f64_exact(a_block[(i, j)]),
+                    |i, j| f32_to_f64_exact(w[(i, j)]),
+                ),
+            };
             // Column-major product → row-major ndarray (element (i,j) at
             // `j*m + i`), identical values to reading the owned faer `Mat`.
             let a64 = Array2::from_shape_fn((m, p), |(i, j)| aw_cm[j * m + i]);
@@ -439,13 +520,32 @@ fn aw_f64_with_abssum_unbounded(a_block: &Mat<f32>, w: &Mat<f32>) -> (Array2<f64
             return (a64, s);
         }
         let a_f = Mat::<f64>::from_fn(m, k, |i, j| f32_to_f64_exact(a_block[(i, j)]));
-        let w_f = Mat::<f64>::from_fn(k, p, |i, j| f32_to_f64_exact(w[(i, j)]));
+        // Cached `W` when the layer carries one, else the historical per-call
+        // build. Both are owned `Mat<f64>` of the same `k×p` shape, so faer
+        // sees the same 64-byte-aligned allocation class and the same padded
+        // row capacity — the widening is EXACT, so the operand is identical
+        // bit-for-bit and the GEMM's reduction order cannot move.
+        let owned_w_f;
+        let w_f = match widened {
+            Some(cached) => &cached.faer,
+            None => {
+                owned_w_f = Mat::<f64>::from_fn(k, p, |i, j| f32_to_f64_exact(w[(i, j)]));
+                &owned_w_f
+            }
+        };
         // |A|, |W| are exact in f64 (abs of an exactly-widened f32 clears the
         // sign bit only), so the abs-sum GEMM sums the exact |a|·|w| products.
         let a_abs = Mat::<f64>::from_fn(m, k, |i, j| f32_to_f64_exact(a_block[(i, j)]).abs());
-        let w_abs = Mat::<f64>::from_fn(k, p, |i, j| f32_to_f64_exact(w[(i, j)]).abs());
-        let c = mat_mul_f64(&a_f, &w_f);
-        let s_mat = mat_mul_f64(&a_abs, &w_abs);
+        let owned_w_abs;
+        let w_abs = match widened {
+            Some(cached) => &cached.faer_abs,
+            None => {
+                owned_w_abs = Mat::<f64>::from_fn(k, p, |i, j| f32_to_f64_exact(w[(i, j)]).abs());
+                &owned_w_abs
+            }
+        };
+        let c = mat_mul_f64(&a_f, w_f);
+        let s_mat = mat_mul_f64(&a_abs, w_abs);
         let a64 = Array2::from_shape_fn((m, p), |(i, j)| c[(i, j)]);
         let s = Array2::from_shape_fn((m, p), |(i, j)| s_mat[(i, j)]);
         return (a64, s);
@@ -499,12 +599,13 @@ fn aw_f64_with_abssum_deadline_via_engine_or_cpu(
     engine: &dyn GemmEngine,
     a_block: &Mat<f32>,
     w: &Mat<f32>,
+    widened: Option<&WidenedWeightF64>,
     deadline: Instant,
 ) -> Result<(Array2<f64>, Array2<f64>)> {
     if let Some(result) = aw_via_engine_deadline(engine, a_block, w, deadline)? {
         return Ok(result);
     }
-    aw_f64_with_abssum_cpu_deadline(a_block, w, deadline)
+    aw_f64_with_abssum_cpu_deadline(a_block, w, widened, deadline)
 }
 
 /// Poll the Linear-CROWN f64 deadline with a phase-specific diagnostic.
@@ -735,6 +836,337 @@ fn deadline_aw_faer_owned_scratch_bytes(k: usize, p: usize, rows: usize) -> Opti
         .checked_mul(size_of::<f64>())
 }
 
+/// Resident bytes of one [`WidenedWeightF64`]: both owned faer matrices at
+/// their padded row capacity, plus the two packed column-major buffers.
+fn widened_weight_cache_bytes(k: usize, p: usize) -> Option<usize> {
+    let padded_k = faer_f64_padded_row_capacity(k)?;
+    let faer_elements = padded_k.checked_mul(p)?.checked_mul(2)?;
+    let packed_elements = k.checked_mul(p)?.checked_mul(2)?;
+    faer_elements
+        .checked_add(packed_elements)?
+        .checked_mul(size_of::<f64>())
+}
+
+/// Resident bytes of one [`EngineWeightOperands`]: the row-major f64 `W` and
+/// the row-major f32 `|W|`, both tightly packed `k·p` buffers, plus the `p`
+/// per-column `|W|` sums.
+fn engine_weight_operands_bytes(k: usize, p: usize) -> Option<usize> {
+    let elements = k.checked_mul(p)?;
+    let row_major = elements.checked_mul(size_of::<f64>())?;
+    let row_major_abs = elements.checked_mul(size_of::<f32>())?;
+    let column_sums = p.checked_mul(size_of::<f64>())?;
+    row_major
+        .checked_add(row_major_abs)?
+        .checked_add(column_sums)
+}
+
+/// Per-entry byte ceiling on a RETAINED widened weight. Deliberately NOT
+/// [`DEADLINE_AW_FAER_MAX_SCRATCH_BYTES`], and much smaller than it.
+///
+/// The two ceilings bound different things and sharing them is a memory bug.
+/// The scratch ceiling bounds what ONE chunked `A·W` may MATERIALISE — a
+/// transient allocation dropped at return, so its peak is one call deep. This
+/// one bounds what a layer RETAINS for the lifetime of the process. Reusing the
+/// 64 MiB scratch figure here would admit ~64 MiB of permanently resident f64
+/// PER LAYER; twenty 1024×1024 Linear layers is ~640 MiB of new steady-state
+/// RSS, on a box that has recorded a 118 GB anon-rss global OOM and which runs
+/// with NO memory governor when uncgrouped — exactly how the competition
+/// harness invokes `ny`, where a blowup loses the verdict outright.
+///
+/// 8 MiB admits every weight up to `k·p ≤ 262,144` (512×512 and below), which
+/// is where the per-call widening actually repeats often enough to matter.
+const WIDENED_WEIGHT_CACHE_MAX_ENTRY_BYTES: usize = 8 << 20;
+
+/// Aggregate ceiling across every live entry in the process. A per-entry
+/// ceiling alone does not bound a DEEP network — 200 layers each just under the
+/// entry ceiling is 1.6 GiB — so the total is capped independently of how many
+/// layers ask.
+///
+/// Lowering either ceiling costs only throughput on the widest layers: a
+/// refused entry falls back to the historical per-call widening, so refusal is
+/// a throughput choice and never a correctness one.
+const WIDENED_WEIGHT_CACHE_MAX_TOTAL_BYTES: usize = 256 << 20;
+
+/// Bytes currently held by live [`WidenedWeightF64`] entries. Charged on
+/// admission and released on drop, so a process that loads and drops several
+/// networks in turn does not leak budget across them.
+static WIDENED_WEIGHT_CACHE_RETAINED_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Charge `bytes` against the aggregate ceiling, or refuse. The compare-exchange
+/// loop is what makes the ceiling hold under concurrent first-use from several
+/// rayon workers; a plain `load`-then-`store` could admit two entries that only
+/// fit one.
+fn reserve_widened_weight_cache(bytes: usize) -> bool {
+    WIDENED_WEIGHT_CACHE_RETAINED_BYTES
+        .try_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |held| {
+                let next = held.checked_add(bytes)?;
+                (next <= WIDENED_WEIGHT_CACHE_MAX_TOTAL_BYTES).then_some(next)
+            },
+        )
+        .is_ok()
+}
+
+/// The f64 widening of an immutable layer weight, held ON the layer instead of
+/// rebuilt on every call (#linear-widened-weight-cache).
+///
+/// Every arm of the certified `A·W` + `|A|·|W|` pair needs `W` and `|W|` in
+/// f64, and each one re-widened the WHOLE weight into two freshly malloc'd
+/// `k×p` buffers — once per Linear layer, per domain, per backward pass — even
+/// though `LinearLayer`'s parameters are immutable after construction (see the
+/// `weight` field docs in the parent module; every other cached field there
+/// already relies on that invariant).
+///
+/// BOTH layouts are stored, because faer selects kernels by operand layout and
+/// neither may be substituted for the other:
+///
+/// * `faer` / `faer_abs` are owned `Mat<f64>`, i.e. byte-for-byte what
+///   `Mat::<f64>::from_fn(k, p, ..)` produces at the point of use — the same
+///   64-byte-aligned allocation and the same padded row capacity, hence the
+///   same `(row_stride, col_stride)` faer observes; while
+/// * `column_major` / `column_major_abs` are the tightly packed `k·p`
+///   column-major buffers `rebound_scratch`'s pooled fill produces, so
+///   `MatRef::from_column_major_slice(.., k, p)` over them carries exactly the
+///   strides that path already hands to `matmul`.
+///
+/// BIT-IDENTICAL. `f32→f64` widening is EXACT and f64 `abs` clears the sign bit
+/// only, so a cached entry equals the per-call one value-for-value; nothing is
+/// computed, reordered or skipped, only *not repeated*. The single thing that
+/// differs from a fresh build is the allocation's ADDRESS — and the pooled
+/// `rebound_scratch` path already hands faer recycled buffers of arbitrary
+/// address under a raw-bit parity moat, so these kernels are demonstrably
+/// address-independent on exactly these operands.
+pub(crate) struct WidenedWeightF64 {
+    faer: Mat<f64>,
+    faer_abs: Mat<f64>,
+    column_major: Vec<f64>,
+    column_major_abs: Vec<f64>,
+    /// The SAME weight in the flat row-major layouts the sound GEMM-engine arm
+    /// consumes, built only if that arm is ever reached for this layer — see
+    /// [`EngineWeightOperands`].
+    engine_operands: std::sync::OnceLock<Option<EngineWeightOperands>>,
+    /// What this entry charged to [`WIDENED_WEIGHT_CACHE_RETAINED_BYTES`], kept
+    /// so the release refunds exactly what admission took. The lazy
+    /// [`EngineWeightOperands`] carries and refunds its own charge separately.
+    retained_bytes: usize,
+}
+
+impl Drop for WidenedWeightF64 {
+    fn drop(&mut self) {
+        WIDENED_WEIGHT_CACHE_RETAINED_BYTES
+            .fetch_sub(self.retained_bytes, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+impl WidenedWeightF64 {
+    /// Census filled cache owners; constructors retain exactly their requested
+    /// faer column counts, whose row padding is visible through col_stride.
+    pub(super) fn retained_payload_bytes(&self) -> Option<usize> {
+        let matrix = |m: &Mat<f64>| {
+            usize::try_from(m.col_stride())
+                .ok()?
+                .checked_mul(m.ncols())?
+                .checked_mul(8)
+        };
+        let mut bytes = matrix(&self.faer)?.checked_add(matrix(&self.faer_abs)?)?;
+        bytes = bytes.checked_add(self.column_major.capacity().checked_mul(8)?)?;
+        bytes = bytes.checked_add(self.column_major_abs.capacity().checked_mul(8)?)?;
+        if let Some(Some(engine)) = self.engine_operands.get() {
+            bytes = bytes.checked_add(engine.row_major.capacity().checked_mul(8)?)?;
+            bytes = bytes.checked_add(engine.row_major_abs.capacity().checked_mul(4)?)?;
+            bytes = bytes.checked_add(engine.column_abs_sums.capacity().checked_mul(8)?)?;
+        }
+        Some(bytes)
+    }
+
+    /// The widening of `w`, or `None` when retaining it is not worth the
+    /// resident memory.
+    ///
+    /// Three gates, and they are not the same gate. First, a weight big enough
+    /// that the chunked faer arm would refuse it per call
+    /// ([`DEADLINE_AW_FAER_MAX_SCRATCH_BYTES`], through the same
+    /// [`deadline_aw_faer_owned_scratch_bytes`] predicate that makes
+    /// [`deadline_aw_faer_rows_per_chunk`] decline) has nothing to gain here,
+    /// so caching can never add retained memory to a path that stays scalar.
+    /// Then the entry's OWN resident footprint against
+    /// [`WIDENED_WEIGHT_CACHE_MAX_ENTRY_BYTES`] — retention is a different
+    /// budget from scratch and gets its own, smaller number. Then the process
+    /// total, so a deep network cannot accumulate past
+    /// [`WIDENED_WEIGHT_CACHE_MAX_TOTAL_BYTES`] one admissible layer at a time.
+    ///
+    /// Declining at any gate is free: the caller falls back to the historical
+    /// per-call widening, which is a throughput difference and not a numeric
+    /// one.
+    pub(crate) fn new(w: &Mat<f32>) -> Option<Self> {
+        let k = w.nrows();
+        let p = w.ncols();
+        if deadline_aw_faer_owned_scratch_bytes(k, p, 1)? > DEADLINE_AW_FAER_MAX_SCRATCH_BYTES {
+            return None;
+        }
+        let retained_bytes = widened_weight_cache_bytes(k, p)?;
+        if retained_bytes > WIDENED_WEIGHT_CACHE_MAX_ENTRY_BYTES {
+            return None;
+        }
+        // Every fallible step is done BEFORE the charge, so no `?` can return
+        // between reserving and constructing the value whose `Drop` refunds it.
+        let elements = k.checked_mul(p)?;
+        if !reserve_widened_weight_cache(retained_bytes) {
+            return None;
+        }
+
+        // Column-major fill order identical to
+        // `rebound_scratch::pooled_aw_and_abssum`'s ((i,j) at `j*k + i`), so the
+        // slices are interchangeable with the buffers it fills per call.
+        let mut column_major = Vec::with_capacity(elements);
+        let mut column_major_abs = Vec::with_capacity(elements);
+        for j in 0..p {
+            for i in 0..k {
+                let value = f32_to_f64_exact(w[(i, j)]);
+                column_major.push(value);
+                column_major_abs.push(value.abs());
+            }
+        }
+
+        Some(Self {
+            faer: Mat::<f64>::from_fn(k, p, |i, j| f32_to_f64_exact(w[(i, j)])),
+            faer_abs: Mat::<f64>::from_fn(k, p, |i, j| f32_to_f64_exact(w[(i, j)]).abs()),
+            column_major,
+            column_major_abs,
+            engine_operands: std::sync::OnceLock::new(),
+            retained_bytes,
+        })
+    }
+
+    /// Whether this entry describes a `k×p` weight. Every consumer filters on
+    /// it before substituting the cache, so a mis-plumbed cache degrades to the
+    /// historical per-call widening rather than multiplying a wrong-shaped
+    /// operand.
+    fn matches(&self, k: usize, p: usize) -> bool {
+        let elements = k.saturating_mul(p);
+        self.faer.nrows() == k
+            && self.faer.ncols() == p
+            && self.faer_abs.nrows() == k
+            && self.faer_abs.ncols() == p
+            && self.column_major.len() == elements
+            && self.column_major_abs.len() == elements
+    }
+
+    /// The engine-layout operands for this weight, built once on first use of
+    /// the sound-GEMM-engine arm (#linear-widened-weight-cache), or `None` when
+    /// retaining them is refused — in which case [`aw_via_engine_widened`]
+    /// rebuilds them per call exactly as it always did.
+    ///
+    /// FAIL CLOSED on shape: `w` must be the very weight this entry describes,
+    /// so a mis-plumbed cache degrades to the per-call rebuild rather than
+    /// handing the engine another layer's operands.
+    fn engine_operands(&self, w: &Mat<f32>) -> Option<&EngineWeightOperands> {
+        if self.faer.nrows() != w.nrows() || self.faer.ncols() != w.ncols() {
+            return None;
+        }
+        self.engine_operands
+            .get_or_init(|| EngineWeightOperands::new(w, self.retained_bytes))
+            .as_ref()
+    }
+}
+
+/// The same immutable weight in the layouts [`aw_via_engine_widened`] hands to
+/// [`GemmEngine::gemm_f64`] / [`GemmEngine::gemm_f32`], plus the per-column
+/// `|W|` sums its DAZ floor folds (#linear-widened-weight-cache).
+///
+/// Each of those three was rebuilt from scratch on every engine-arm call even
+/// though `LinearLayer`'s weight is immutable after construction — the same
+/// defect, and the same remedy, as the parent [`WidenedWeightF64`].
+///
+/// LAZY AND SEPARATELY CHARGED, deliberately. The engine arm runs only above
+/// [`SOUND_F64_GEMM_MIN_MACS`] and only when a process-global sound f64 engine
+/// is installed, so most layers holding a `WidenedWeightF64` never reach it;
+/// building these eagerly would add resident memory to every one of them.
+/// Admission is charged against the SAME
+/// [`WIDENED_WEIGHT_CACHE_RETAINED_BYTES`] pool, and against what the parent
+/// entry already took, so [`WIDENED_WEIGHT_CACHE_MAX_ENTRY_BYTES`] keeps
+/// bounding what ONE layer retains in total rather than being spent twice.
+/// A refusal costs only throughput.
+///
+/// BIT-IDENTICAL. [`GemmEngine`] defines both operands as flat ROW-MAJOR slices
+/// of a fixed length, so a cached buffer and a per-call one differ only in
+/// ADDRESS: `f32→f64` widening and `f32::abs` are exact, the flattening index
+/// (`(l, j)` at `l*p + j`) is the one the per-call loop used, and the engine
+/// rebuilds its view with the same dimensions either way (`FaerCpuGemmEngine`
+/// does so through `MatRef::from_row_major_slice(.., k, p)`, whose strides come
+/// from the dimensions, not the pointer). The column sums are the identical f64
+/// fold in the identical ascending-`l` order.
+struct EngineWeightOperands {
+    /// `W` widened to f64, flattened ROW-MAJOR (`(l, j)` at `l*p + j`).
+    row_major: Vec<f64>,
+    /// `|W|` in f32, same row-major flattening.
+    row_major_abs: Vec<f32>,
+    /// `Σ_l |W[l, j]|` per column `j` — the weight half of
+    /// [`daz_operand_flush_floor`]'s separable over-bound.
+    column_abs_sums: Vec<f64>,
+    /// What this entry charged to [`WIDENED_WEIGHT_CACHE_RETAINED_BYTES`].
+    retained_bytes: usize,
+}
+
+impl Drop for EngineWeightOperands {
+    fn drop(&mut self) {
+        WIDENED_WEIGHT_CACHE_RETAINED_BYTES
+            .fetch_sub(self.retained_bytes, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+impl EngineWeightOperands {
+    /// Build the engine-layout operands for `w`, or `None` when retaining them
+    /// is not worth the resident memory. `already_retained` is what the parent
+    /// [`WidenedWeightF64`] charged.
+    fn new(w: &Mat<f32>, already_retained: usize) -> Option<Self> {
+        let k = w.nrows();
+        let p = w.ncols();
+        let retained_bytes = engine_weight_operands_bytes(k, p)?;
+        if already_retained.checked_add(retained_bytes)? > WIDENED_WEIGHT_CACHE_MAX_ENTRY_BYTES {
+            return None;
+        }
+        let elements = k.checked_mul(p)?;
+        // Every fallible step is done BEFORE the charge, so no `?` can return
+        // between reserving and constructing the value whose `Drop` refunds it.
+        if !reserve_widened_weight_cache(retained_bytes) {
+            return None;
+        }
+
+        // Row-major fill order identical to the per-call loop in
+        // [`aw_via_engine_widened`] ((l,j) at `l*p + j`), so the slices are
+        // interchangeable with the buffers it fills today.
+        let mut row_major = Vec::with_capacity(elements);
+        let mut row_major_abs = Vec::with_capacity(elements);
+        for l in 0..k {
+            for j in 0..p {
+                let value = w[(l, j)];
+                row_major.push(f32_to_f64_exact(value));
+                row_major_abs.push(value.abs());
+            }
+        }
+
+        Some(Self {
+            row_major,
+            row_major_abs,
+            column_abs_sums: weight_column_abs_sums(w, k, p),
+            retained_bytes,
+        })
+    }
+
+    /// Whether this entry describes a `k×p` weight, checked by every consumer
+    /// before substitution for the same fail-closed reason as
+    /// [`WidenedWeightF64::matches`].
+    fn matches(&self, k: usize, p: usize) -> bool {
+        let elements = k.saturating_mul(p);
+        self.row_major.len() == elements
+            && self.row_major_abs.len() == elements
+            && self.column_abs_sums.len() == p
+    }
+}
+
 /// Admit a deadline-scoped faer chunk only when both widened weights and at
 /// least one complete row of operands/results fit under the scratch ceiling.
 ///
@@ -816,7 +1248,7 @@ fn deadline_aw_faer_rows_per_chunk(k: usize, p: usize, chunk_macs: usize) -> Opt
 ///
 /// The audit contract stays closed: `mat_mul_f64` is the plain faer CPU
 /// kernel (never the process-global engine; `current_par()` forces `Par::Seq`
-/// inside rayon domain workers, #4392), a single dispatch is bounded by
+/// inside rayon domain workers), a single dispatch is bounded by
 /// [`DEADLINE_AW_FAER_CHUNK_MACS`], and the deadline is polled between chunks
 /// and between the two GEMMs of a chunk. Shapes whose single-row dispatch
 /// `k·p` exceeds the quantum — where chunking cannot bound the stretch —
@@ -826,22 +1258,40 @@ fn deadline_aw_faer_rows_per_chunk(k: usize, p: usize, chunk_macs: usize) -> Opt
 fn aw_f64_with_abssum_pollable_cpu(
     a_block: &Mat<f32>,
     w: &Mat<f32>,
+    widened: Option<&WidenedWeightF64>,
     deadline: Option<Instant>,
 ) -> Result<(Array2<f64>, Array2<f64>)> {
     aw_f64_with_abssum_pollable_cpu_with_chunk_macs(
         a_block,
         w,
+        widened,
         deadline,
         DEADLINE_AW_FAER_CHUNK_MACS,
+    )
+}
+
+/// [`aw_f64_with_abssum_pollable_cpu`] for a layer carrying the cached f64
+/// widening of its weight (#linear-widened-weight-cache).
+pub(crate) fn aw_f64_with_abssum_pollable_cpu_for_layer(
+    layer: &LinearLayer,
+    a_block: &Mat<f32>,
+    deadline: Option<Instant>,
+) -> Result<(Array2<f64>, Array2<f64>)> {
+    aw_f64_with_abssum_pollable_cpu(
+        a_block,
+        layer.weight_faer(),
+        layer.weight_widened_f64(),
+        deadline,
     )
 }
 
 fn aw_f64_with_abssum_cpu_deadline(
     a_block: &Mat<f32>,
     w: &Mat<f32>,
+    widened: Option<&WidenedWeightF64>,
     deadline: Instant,
 ) -> Result<(Array2<f64>, Array2<f64>)> {
-    aw_f64_with_abssum_pollable_cpu(a_block, w, Some(deadline))
+    aw_f64_with_abssum_pollable_cpu(a_block, w, widened, Some(deadline))
 }
 
 /// Testable core of [`aw_f64_with_abssum_cpu_deadline`]. Production always
@@ -855,17 +1305,18 @@ fn aw_f64_with_abssum_cpu_deadline_with_chunk_macs(
     deadline: Instant,
     chunk_macs: usize,
 ) -> Result<(Array2<f64>, Array2<f64>)> {
-    aw_f64_with_abssum_pollable_cpu_with_chunk_macs(a_block, w, Some(deadline), chunk_macs)
+    aw_f64_with_abssum_pollable_cpu_with_chunk_macs(a_block, w, None, Some(deadline), chunk_macs)
 }
 
 fn aw_f64_with_abssum_pollable_cpu_with_chunk_macs(
     a_block: &Mat<f32>,
     w: &Mat<f32>,
+    widened: Option<&WidenedWeightF64>,
     deadline: Option<Instant>,
     chunk_macs: usize,
 ) -> Result<(Array2<f64>, Array2<f64>)> {
     let mut poll = || check_optional_aw_deadline(deadline, "during certified f64 A·W");
-    match aw_f64_with_abssum_chunked_poll(a_block, w, chunk_macs, &mut poll)? {
+    match aw_f64_with_abssum_chunked_poll_widened(a_block, w, widened, chunk_macs, &mut poll)? {
         Some((a64, s, _blocks)) => Ok((a64, s)),
         // Over-quantum / degenerate / kill-switch shapes: chunking cannot bound
         // the non-pollable stretch, so the historical per-MAC scalar loop
@@ -908,13 +1359,71 @@ fn aw_f64_with_abssum_pollable_cpu_with_chunk_macs(
 /// On a poll error mid-GEMM the typed error propagates unchanged and no
 /// partial result is published — the same contract as the scalar per-MAC
 /// paths.
+// Production reaches this through `aw_f64_with_abssum_chunked_poll_for_layer`
+// (which supplies the layer's cached widening); the cache-free entry survives as
+// the parity reference the linear test module drives directly.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn aw_f64_with_abssum_chunked_poll(
     a_block: &Mat<f32>,
     w: &Mat<f32>,
     chunk_macs: usize,
     poll: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Option<(Array2<f64>, Array2<f64>, usize)>> {
+    aw_f64_with_abssum_chunked_poll_widened(a_block, w, None, chunk_macs, poll)
+}
+
+/// [`aw_f64_with_abssum_chunked_poll`] for a layer carrying the cached f64
+/// widening of its weight (#linear-widened-weight-cache). Same chunking, same
+/// polls, same operands — the per-call `W` / `|W|` rebuild is simply already
+/// done.
+pub(crate) fn aw_f64_with_abssum_chunked_poll_for_layer(
+    layer: &LinearLayer,
+    a_block: &Mat<f32>,
+    chunk_macs: usize,
+    poll: &mut dyn FnMut() -> Result<()>,
+) -> Result<Option<(Array2<f64>, Array2<f64>, usize)>> {
+    aw_f64_with_abssum_chunked_poll_widened(
+        a_block,
+        layer.weight_faer(),
+        layer.weight_widened_f64(),
+        chunk_macs,
+        poll,
+    )
+}
+
+/// Body of [`aw_f64_with_abssum_chunked_poll`], with the caller's cached f64
+/// widening of `w` threaded in (#linear-widened-weight-cache). `None` rebuilds
+/// `W`/`|W|` per call exactly as before; everything else — chunk sizing, poll
+/// cadence, operands, GEMM calls and publication — is common to both arms.
+fn aw_f64_with_abssum_chunked_poll_widened(
+    a_block: &Mat<f32>,
+    w: &Mat<f32>,
+    widened: Option<&WidenedWeightF64>,
+    chunk_macs: usize,
+    poll: &mut dyn FnMut() -> Result<()>,
+) -> Result<Option<(Array2<f64>, Array2<f64>, usize)>> {
+    aw_f64_with_abssum_chunked_poll_with_storage(
+        a_block.as_ref(),
+        w.as_ref(),
+        widened,
+        chunk_macs,
+        poll,
+        &mut aw_storage::OwnedAwStorage,
+    )
+}
+
+/// Same original full-k numerical body with caller-owned storage. This alone
+/// does not enable the finite collector or validate retained source captures.
+pub(crate) fn aw_f64_with_abssum_chunked_poll_with_storage<S: aw_storage::AwStorage>(
+    a_block: faer::MatRef<'_, f32>,
+    w: faer::MatRef<'_, f32>,
+    widened: Option<&WidenedWeightF64>,
+    chunk_macs: usize,
+    poll: &mut dyn FnMut() -> Result<()>,
+    storage: &mut S,
+) -> Result<Option<(S::Output, S::Output, usize)>> {
     poll()?;
+    storage.checkpoint()?;
     let m = a_block.nrows();
     let k = a_block.ncols();
     let p = w.ncols();
@@ -924,6 +1433,9 @@ pub(crate) fn aw_f64_with_abssum_chunked_poll(
             got: vec![w.nrows(), p],
         });
     }
+    // FAIL CLOSED, as in `aw_f64_with_abssum_unbounded`: a cache that does not
+    // describe this `k×p` weight is discarded rather than used.
+    let widened = widened.filter(|cached| cached.matches(k, p));
 
     // A single row's dispatch is `k·p` MACs and must stay whole (full-`k`
     // contraction per call); if even that exceeds the quantum, chunking cannot
@@ -936,15 +1448,41 @@ pub(crate) fn aw_f64_with_abssum_chunked_poll(
         return Ok(None);
     }
 
+    storage.admit_products(m, k, p, rows_per_chunk, widened.is_some())?;
+
     // Widen W (and |W|) once — exact conversions, O(k·p) ≤ one quantum of
     // work per matrix, with a poll after each.
-    let w_f = Mat::<f64>::from_fn(k, p, |i, j| f32_to_f64_exact(w[(i, j)]));
+    //
+    // #linear-widened-weight-cache: `w` is the layer's IMMUTABLE weight, so a
+    // caller holding [`WidenedWeightF64`] supplies the identical pair, built
+    // once at first use, instead of re-malloc'ing and re-converting the entire
+    // weight on every Linear backward of every domain. BIT-IDENTICAL: the
+    // widening is EXACT, and the cached operand is an owned `Mat<f64>` of the
+    // same shape, allocation class and padded row capacity, so `mat_mul_f64`
+    // below cannot tell the two apart. The polls stay exactly where they were —
+    // the cached arm simply finds this quantum's work already done, so the
+    // deadline cadence and every abort seam are unchanged.
+    let owned_w_f;
+    let w_f = match widened {
+        Some(cached) => cached.faer.as_ref(),
+        None => {
+            owned_w_f = storage.matrix_from_fn(k, p, |i, j| f32_to_f64_exact(w[(i, j)]))?;
+            S::matrix_ref(&owned_w_f)
+        }
+    };
     poll()?;
-    let w_abs = Mat::<f64>::from_fn(k, p, |i, j| f32_to_f64_exact(w[(i, j)]).abs());
+    let owned_w_abs;
+    let w_abs = match widened {
+        Some(cached) => cached.faer_abs.as_ref(),
+        None => {
+            owned_w_abs = storage.matrix_from_fn(k, p, |i, j| f32_to_f64_exact(w[(i, j)]).abs())?;
+            S::matrix_ref(&owned_w_abs)
+        }
+    };
     poll()?;
 
-    let mut a64 = Array2::<f64>::zeros((m, p));
-    let mut s = Array2::<f64>::zeros((m, p));
+    let mut a64 = storage.output_zeros(m, p)?;
+    let mut s = storage.output_zeros(m, p)?;
     // Large zero-fills may themselves consume the remaining budget.
     poll()?;
 
@@ -954,26 +1492,48 @@ pub(crate) fn aw_f64_with_abssum_chunked_poll(
         let row_end = row_start.saturating_add(rows_per_chunk).min(m);
         let rows = row_end - row_start;
         poll()?;
-        let a_f = Mat::<f64>::from_fn(rows, k, |i, j| {
+        let a_f = storage.matrix_from_fn(rows, k, |i, j| {
             f32_to_f64_exact(a_block[(row_start + i, j)])
-        });
-        let a_abs = Mat::<f64>::from_fn(rows, k, |i, j| {
+        })?;
+        let a_abs = storage.matrix_from_fn(rows, k, |i, j| {
             f32_to_f64_exact(a_block[(row_start + i, j)]).abs()
-        });
-        let c = mat_mul_f64(&a_f, &w_f);
+        })?;
+        let c = aw_storage::product(storage, S::matrix_ref(&a_f), w_f)?;
         poll()?;
-        let s_mat = mat_mul_f64(&a_abs, &w_abs);
+        let s_mat = aw_storage::product(storage, S::matrix_ref(&a_abs), w_abs)?;
         poll()?;
-        for i in 0..rows {
-            for j in 0..p {
-                a64[[row_start + i, j]] = c[(i, j)];
-                s[[row_start + i, j]] = s_mat[(i, j)];
-            }
+        {
+            // Publish this block through the cache-tiled copy rather than the
+            // per-element `[[i, j]]` double loop: same values, same one
+            // assignment per destination element, no arithmetic at all — see
+            // `copy_col_major_block_into_row_major`.
+            storage.before_copy_pair(rows, p)?;
+            let mut copy_work = WeightedPoll::new(|_| {
+                storage.checkpoint()?;
+                poll()
+            });
+            let a64_buf = S::output_slice(&mut a64);
+            copy_col_major_block_into_row_major(
+                a64_buf,
+                S::matrix_ref(&c),
+                row_start,
+                p,
+                &mut copy_work,
+            )?;
+            let s_buf = S::output_slice(&mut s);
+            copy_col_major_block_into_row_major(
+                s_buf,
+                S::matrix_ref(&s_mat),
+                row_start,
+                p,
+                &mut copy_work,
+            )?;
         }
         blocks += 1;
         row_start = row_end;
     }
     poll()?;
+    storage.checkpoint()?;
     Ok(Some((a64, s, blocks)))
 }
 
@@ -1032,37 +1592,15 @@ fn aw_f64_with_abssum_cpu_pollable_scalar(
     let s_buf = s
         .as_slice_mut()
         .expect("s is freshly allocated row-major contiguous");
-    let mut skipped_k_since_poll = 0usize;
-    for i in 0..m {
-        check_optional_aw_deadline(deadline, "during certified f64 A·W")?;
-        let a64_row = &mut a64_buf[i * p..i * p + p];
-        let s_row = &mut s_buf[i * p..i * p + p];
-        for kk in 0..k {
-            let av = f32_to_f64_exact(a_block[(i, kk)]);
-            if av == 0.0 || p == 0 {
-                skipped_k_since_poll += 1;
-                if skipped_k_since_poll >= DEADLINE_POLL_SKIPPED_K {
-                    check_optional_aw_deadline(deadline, "during certified f64 A·W")?;
-                    skipped_k_since_poll = 0;
-                }
-                continue;
-            }
-
-            let av_abs = av.abs();
-            let mut j_start = 0usize;
-            while j_start < p {
-                let j_end = (j_start + DEADLINE_POLL_MACS).min(p);
-                for j in j_start..j_end {
-                    let wv = f32_to_f64_exact(w[(kk, j)]);
-                    a64_row[j] += av * wv;
-                    s_row[j] += av_abs * wv.abs();
-                }
-                check_optional_aw_deadline(deadline, "during certified f64 A·W")?;
-                j_start = j_end;
-            }
-        }
-    }
-    check_optional_aw_deadline(deadline, "during certified f64 A·W")?;
+    scalar_aw::legacy_into(
+        a_block.as_ref(),
+        w.as_ref(),
+        a64_buf,
+        s_buf,
+        deadline,
+        DEADLINE_POLL_MACS,
+        DEADLINE_POLL_SKIPPED_K,
+    )?;
     Ok((a64, s))
 }
 
@@ -1100,7 +1638,7 @@ const INCOMING_ERROR_POLL_MACS: usize = 1 << 12;
 /// scaled by a power of two), plus the subtract+divide inside
 /// `abs_inflate = 1/(1−γ)` — ≤ 7 roundings.
 ///
-/// CORRECTED 2026-08-12 (review defect 2): the naive "(1−u)^7 under-shoot, the
+/// The naive "(1−u)^7 under-shoot, the
 /// residue is O(u²)" reading is WRONG IN FORM. γ's own ≤2-rounding error is
 /// AMPLIFIED when it passes through `abs_inflate = 1/(1−γ)`; the resulting
 /// deficit is `≈ 2u·d/(1−2d)` with `d = (n+1)·2^-53` — not `O(u²)`, and
@@ -1110,7 +1648,7 @@ const INCOMING_ERROR_POLL_MACS: usize = 1 << 12;
 /// every `d ∈ [0, ½)` — so the margin dominates the amplified deficit at every
 /// reachable width. The `1 + 4·EPSILON` factor is belt-and-braces on top.
 /// DO NOT "simplify" `contraction + 1` to `contraction` on the strength of the
-/// old text: that removes the margin the proof rests on.
+/// naive reading: that removes the margin the proof rests on.
 const INCOMING_ERROR_SLACK_F64: f64 = 1.0 + 4.0 * f64::EPSILON;
 
 /// Test-only `(γ_{n+1}^{f64}, abs_inflate)` factors for the withdrawn
@@ -1383,14 +1921,8 @@ fn incoming_error_product_with_poll_quantum(
     };
 
     check()?;
-    let rows = error.nrows();
-    let output_columns = w_abs.ncols();
-    if error.ncols() < column_offset.saturating_add(contraction) || w_abs.nrows() != contraction {
-        return Err(NyError::ShapeMismatch {
-            expected: vec![rows, column_offset.saturating_add(contraction)],
-            got: vec![error.nrows(), error.ncols()],
-        });
-    }
+    let (rows, output_columns) =
+        incoming_error_step::shape(error.view(), column_offset, contraction, w_abs.as_ref())?;
     // #cgan-row7-h4, WITHDRAWN 2026-08-12 after adversarial review: a
     // `min(stepped, dual)` form was authored here to remove the per-add
     // next_up inflation (~n·u64 relative). It was CERTIFIED (validated
@@ -1407,39 +1939,15 @@ fn incoming_error_product_with_poll_quantum(
     // test-only, reviewed oracle helpers that such a lever would reuse.)
     let mut product = Array2::<f32>::zeros((rows, output_columns));
     check()?;
-    let mut operations = 0usize;
-    for i in 0..rows {
-        for j in 0..output_columns {
-            let mut stepped = 0.0f64;
-            for kk in 0..contraction {
-                if operations.is_multiple_of(poll_quantum) {
-                    check()?;
-                }
-                operations = operations.wrapping_add(1);
-                let error_value = nonnegative_f32_error_or_infinity(error[[i, column_offset + kk]]);
-                let weight_abs = nonnegative_f32_error_or_infinity(w_abs[(kk, j)]);
-                let term = if error_value == 0.0 || weight_abs == 0.0 {
-                    0.0
-                } else {
-                    error_value * weight_abs
-                };
-                // Certified coefficient errors and |W| are non-negative. A
-                // negative or NaN term violates that invariant; +inf is the
-                // conservative error enclosure. The stepped arm takes one
-                // successor after every RN addition, which dominates its exact
-                // real sum without any contraction-width assumption.
-                if term == 0.0 {
-                    continue;
-                }
-                if term > 0.0 {
-                    stepped = next_up_nonnegative_f64(stepped + term);
-                } else {
-                    stepped = f64::INFINITY;
-                }
-            }
-            product[[i, j]] = publish_error_up_normal(stepped);
-        }
-    }
+    incoming_error_step::legacy_into(
+        error.view(),
+        column_offset,
+        contraction,
+        w_abs.as_ref(),
+        product.view_mut(),
+        poll_quantum,
+        &check,
+    )?;
     check()?;
     Ok(product)
 }
@@ -1530,11 +2038,36 @@ fn f32_abssum_inflation(k: usize) -> Option<f64> {
 /// (`u = 2^-24`), not a TF32/tensor-core path — enforced by `CudaGemmEngine`'s
 /// pinned `CUBLAS_DEFAULT_MATH`. Returns `None` on any engine/dimension error so
 /// the caller falls back to the CPU loop.
-#[cfg_attr(test, allow(dead_code))]
+///
+/// This entry rebuilds the weight-side operands per call and is the cache-free
+/// parity reference; production reaches the body through
+/// [`aw_via_engine_widened`].
+#[allow(dead_code)] // the cache-free reference: production calls the widened twin.
 pub(crate) fn aw_via_engine(
     eng: &dyn GemmEngine,
     a_block: &Mat<f32>,
     w: &Mat<f32>,
+    m: usize,
+    k: usize,
+    p: usize,
+) -> Option<(Array2<f64>, Array2<f64>)> {
+    aw_via_engine_widened(eng, a_block, w, None, m, k, p)
+}
+
+/// [`aw_via_engine`] for a caller holding the layer's cached f64 widening
+/// (#linear-widened-weight-cache).
+///
+/// `W` (f64) and `|W|` (f32) both reach [`GemmEngine`] as flat ROW-MAJOR
+/// slices, and the DAZ floor folds `Σ_l |W[l, j]|` — three full passes over the
+/// layer's IMMUTABLE weight, rebuilt on every engine-arm call. The cache holds
+/// exactly those bytes in exactly that layout, so the engine receives operands
+/// it cannot distinguish from the ones it gets today and the published bits are
+/// unchanged; see [`EngineWeightOperands`]. `None` rebuilds them per call.
+fn aw_via_engine_widened(
+    eng: &dyn GemmEngine,
+    a_block: &Mat<f32>,
+    w: &Mat<f32>,
+    widened: Option<&WidenedWeightF64>,
     m: usize,
     k: usize,
     p: usize,
@@ -1550,27 +2083,51 @@ pub(crate) fn aw_via_engine(
             absa[i * k + kk] = x.abs();
         }
     }
-    let mut w64 = vec![0.0f64; k * p];
-    let mut absw = vec![0.0f32; k * p];
-    for kk in 0..k {
-        for j in 0..p {
-            let y = w[(kk, j)];
-            w64[kk * p + j] = f32_to_f64_exact(y);
-            absw[kk * p + j] = y.abs();
+    // FAIL CLOSED, as in `aw_f64_with_abssum_unbounded`: a cache that does not
+    // describe this `k×p` weight is discarded and the historical per-call
+    // rebuild below runs, so a mis-plumbed cache can only cost throughput.
+    let engine_weight = widened
+        .filter(|cached| cached.matches(k, p))
+        .and_then(|cached| cached.engine_operands(w))
+        .filter(|operands| operands.matches(k, p));
+    let built_w64;
+    let built_absw;
+    let (w64, absw): (&[f64], &[f32]) = match engine_weight {
+        Some(cached) => (cached.row_major.as_slice(), cached.row_major_abs.as_slice()),
+        None => {
+            let mut w64 = vec![0.0f64; k * p];
+            let mut absw = vec![0.0f32; k * p];
+            for kk in 0..k {
+                for j in 0..p {
+                    let y = w[(kk, j)];
+                    w64[kk * p + j] = f32_to_f64_exact(y);
+                    absw[kk * p + j] = y.abs();
+                }
+            }
+            built_w64 = w64;
+            built_absw = absw;
+            (built_w64.as_slice(), built_absw.as_slice())
         }
-    }
-    let aw = Array2::from_shape_vec((m, p), eng.gemm_f64(m, k, p, &a64, &w64).ok()?).ok()?;
+    };
+    let aw = Array2::from_shape_vec((m, p), eng.gemm_f64(m, k, p, &a64, w64).ok()?).ok()?;
 
     let s = match f32_abssum_inflation(k) {
         Some(f_hat) => {
-            let s32 = eng.gemm_f32(m, k, p, &absa, &absw).ok()?;
+            let s32 = eng.gemm_f32(m, k, p, &absa, absw).ok()?;
             if s32.len() != m * p {
                 return None;
             }
             // FTZ-safe underflow guard: ≤ 2k−1 f32 roundings, each losing < 2^-126
             // under flush-to-zero (design §2 step 5); placed INSIDE the F multiply.
             let g = 2.0f64 * (k as f64) * 2f64.powi(-126);
-            let daz = daz_operand_flush_floor(a_block, w, m, k, p);
+            let daz = daz_operand_flush_floor(
+                a_block,
+                w,
+                m,
+                k,
+                p,
+                engine_weight.map(|cached| cached.column_abs_sums.as_slice()),
+            );
             Array2::from_shape_fn((m, p), |(i, j)| {
                 let r = f32_to_f64_exact(s32[i * p + j]);
                 (r + g + daz[[i, j]]) * f_hat
@@ -1579,7 +2136,7 @@ pub(crate) fn aw_via_engine(
         None => {
             // k ≥ 2^23: the f32 factor degenerates; use the f64 S path.
             //
-            // HONEST SCOPE NOTE (2026-08-08, from an independent Codex review).
+            // HONEST SCOPE NOTE.
             // This branch is a RAW round-to-nearest f64 GEMM, and RN summation is
             // NOT guaranteed to be an elementwise UPPER bound on `Σ|a||w|` — it
             // can round down. So the blanket claim "S is always an over-bound",
@@ -1644,6 +2201,10 @@ fn f32_gemm_rn(a: &Mat<f32>, w: &Mat<f32>, m: usize, k: usize, p: usize) -> Arra
 /// `|w_lj|·FLT_MIN`). Separable over-bound `(‖a_i‖₁ + ‖w_j‖₁)·FLT_MIN` (`max(x,y) ≤
 /// x+y` for `x,y ≥ 0`), computed in O(mk+kp). `FLT_MIN = f32::MIN_POSITIVE = 2^-126`.
 /// Mirrors the resident CROWN combine + `ny_core::gemm::crown_aw_error_step`.
+///
+/// `weight_column_sums` is the caller's cached `Σ_l |W[l, j]|`
+/// (#linear-widened-weight-cache); `None`, or a fold that does not describe `p`
+/// columns, recomputes it per call exactly as before.
 #[allow(dead_code)] // reached via aw_f32_sound_bound + sound_abs_product_upper.
 fn daz_operand_flush_floor(
     a: &Mat<f32>,
@@ -1651,15 +2212,40 @@ fn daz_operand_flush_floor(
     m: usize,
     k: usize,
     p: usize,
+    weight_column_sums: Option<&[f64]>,
 ) -> Array2<f64> {
     let flt_min = f64::from(f32::MIN_POSITIVE);
     let row: Vec<f64> = (0..m)
         .map(|i| (0..k).map(|l| f32_to_f64_exact(a[(i, l)]).abs()).sum())
         .collect();
-    let col: Vec<f64> = (0..p)
-        .map(|j| (0..k).map(|l| f32_to_f64_exact(w[(l, j)]).abs()).sum())
-        .collect();
+    // The `w` half of the separable bound is loop-invariant over the layer's
+    // IMMUTABLE weight, so a caller holding the cache supplies the identical
+    // f64 values; FAIL CLOSED to the per-call fold on any length disagreement.
+    let built_col;
+    let col: &[f64] = match weight_column_sums {
+        Some(cached) if cached.len() == p => cached,
+        _ => {
+            built_col = weight_column_abs_sums(w, k, p);
+            built_col.as_slice()
+        }
+    };
     Array2::from_shape_fn((m, p), |(i, j)| (row[i] + col[j]) * flt_min)
+}
+
+/// `Σ_l |W[l, j]|` for every column `j` of a `k×p` weight, in f64.
+///
+/// Lifted verbatim out of [`daz_operand_flush_floor`]'s `col` fold so the
+/// cached and per-call forms are one expression rather than two spellings of
+/// it. `f32→f64` widening and `abs` are exact and `<f64 as Sum>` folds
+/// left-to-right from `0.0`, so the result is fixed by `(w, k, p)` alone.
+fn weight_column_abs_sums(w: &Mat<f32>, k: usize, p: usize) -> Vec<f64> {
+    (0..p)
+        .map(|j| {
+            (0..k)
+                .map(|l| f32_to_f64_exact(w[(l, j)]).abs())
+                .sum::<f64>()
+        })
+        .collect()
 }
 
 /// Provably-sound per-entry UPPER bound `S[i,j] ≥ (|A|·|W|)_exact[i,j]` for the
@@ -1715,7 +2301,7 @@ fn sound_abs_product_upper(
             // subnormal INPUT is flushed to 0 before the multiply — the result-flush
             // `g` cannot cover that weight-amplified loss. Add it (defensively) so the
             // returned S is `≥ P` even under input-flush.
-            let daz = daz_operand_flush_floor(a, w, m, k, p);
+            let daz = daz_operand_flush_floor(a, w, m, k, p, None);
             Array2::from_shape_fn((m, p), |(i, j)| {
                 (f32_to_f64_exact(r[[i, j]]) + g + daz[[i, j]]) * f_hat * contain_margin
             })
@@ -1808,7 +2394,7 @@ pub(crate) fn aw_f32_sound_bound(a_block: &Mat<f32>, w: &Mat<f32>) -> (Array2<f3
     // Weight-amplified DAZ operand-flush floor (#gpu-metal-daz): covers a DAZ-flushed
     // `c_hat` (subnormal input zeroed before the multiply → up to `|w|·FLT_MIN` lost),
     // which `ftz` (result-flush only) cannot. Negligible for normal-magnitude nets.
-    let daz = daz_operand_flush_floor(a_block, w, m, k, p);
+    let daz = daz_operand_flush_floor(a_block, w, m, k, p, None);
 
     let mut lower = Array2::<f32>::zeros((m, p));
     let mut upper = Array2::<f32>::zeros((m, p));
@@ -1909,7 +2495,7 @@ fn aw_eft_sound_bound(
 
     // Same floors, same expression, as the a-priori arm above.
     let ftz = 4.0 * (k as f64) * 2f64.powi(-126);
-    let daz = daz_operand_flush_floor(a_block, w, m, k, p);
+    let daz = daz_operand_flush_floor(a_block, w, m, k, p, None);
 
     let mut lower = Array2::<f32>::zeros((m, p));
     let mut upper = Array2::<f32>::zeros((m, p));
@@ -1999,7 +2585,7 @@ fn intersect_enclosure_downgrade_only(
 ///
 /// Uses faer for accelerated matrix multiplication (5-10x faster than ndarray::dot).
 ///
-/// # Non-finite coefficient handling (#2681)
+/// # Non-finite coefficient handling
 ///
 /// When `A @ W` overflows f32 and produces non-finite coefficients, the old approach
 /// of substituting `0.0` is unsound: it drops the input dimension's contribution,
@@ -2024,7 +2610,195 @@ fn propagate_linear_cpu_with_deadline<'a>(
     deadline: Option<Instant>,
     allow_global_f64_engine: bool,
 ) -> Result<Cow<'a, LinearBounds>> {
+    propagate_linear_cpu_with_deadline_and_stack(
+        layer,
+        bounds,
+        deadline,
+        allow_global_f64_engine,
+        crate::layers::collector_kernels::linear_position_stack_armed(),
+    )
+}
+
+/// Cap on one position-stacked certified `A·W` (#vit-collector-throughput P3):
+/// the stacked f32 operand plus the two f64 results (`a64`, `S`). Above it the
+/// historical per-position loop runs instead (the stack is declined, counted,
+/// and nothing else changes). The per-position loop's own peak is one
+/// position's worth of the same buffers, so this bounds the extra residency
+/// the stack can ever add.
+const POSITION_STACK_MAX_BYTES: usize = 512 << 20;
+
+/// One position-stacked certified `A·W` + `|A|·|W|` over EVERY token position
+/// of a sequence Linear (#vit-collector-throughput P3).
+///
+/// Row `pos * rows_per_position + i` of `a64` / `s` is row `i` of the
+/// per-position stacked block the historical loop builds for position `pos`
+/// (lower rows `0..R` over upper rows `R..2R`), so [`Self::position_block`]
+/// returns exactly the pair that loop's per-position call returns.
+pub(crate) struct PositionStackedAw {
+    a64: Array2<f64>,
+    s: Array2<f64>,
+    rows_per_position: usize,
+}
+
+impl PositionStackedAw {
+    /// The `(a64, s)` rows that belong to position `pos`, as owned arrays of
+    /// the per-position call's shape `(2R, in_features)`.
+    fn position_block(&self, pos: usize) -> (Array2<f64>, Array2<f64>) {
+        let start = pos * self.rows_per_position;
+        let end = start + self.rows_per_position;
+        (
+            self.a64.slice(ndarray::s![start..end, ..]).to_owned(),
+            self.s.slice(ndarray::s![start..end, ..]).to_owned(),
+        )
+    }
+}
+
+/// Build the position-stacked block and run ONE certified f64 `A·W` over it
+/// through the SAME entry the per-position loop uses (#vit-collector-throughput
+/// P3). `Ok(None)` declines (a size overflow or [`POSITION_STACK_MAX_BYTES`]);
+/// the caller then runs the historical per-position loop.
+///
+/// SOUNDNESS. The coefficient certificate the caller publishes,
+/// `|stored - exact| <= cast gap + gamma_n * S + propagated incoming error`, is
+/// per ELEMENT and summation-order independent (Higham Thm 3.1), and every row
+/// of the stack keeps its FULL `k = out_features` contraction inside one call —
+/// the stack only adds ROWS. So whichever reducer runs it:
+///
+/// * the CPU reducers (the pollable row-chunked faer GEMM, the naive scalar
+///   loop, the rebound-scratch pool) compute each element by the same
+///   `k`-reduction whatever the row count, which is the row-count independence
+///   already pinned for the chunked and domain-batched twins
+///   (`pollable_chunked_aw_matches_unchunked_faer_bitwise`,
+///   `aw_batched_matches_per_domain_bit_for_bit`) — BIT-IDENTICAL, pinned here
+///   by `linear_position_stacked_backward_bit_identical_cpu`;
+/// * once the stacked product crosses [`SOUND_F64_GEMM_MIN_MACS`] it may run on
+///   the process-global sound f64 engine (deadline-bounded when a deadline is
+///   present), whose `a64` and `S` are validated f64 results of the same exact
+///   products — sound through the same `gamma_n * S` charge, NOT bit-identical.
+///   This is the intended effect on vit (per-position 2R x 48 x 48 products sit
+///   below the engine gate; the 17-position stack crosses it).
+fn position_stacked_aw(
+    layer: &LinearLayer,
+    bounds: &LinearBounds,
+    layout: &super::layout::LinearBackwardLayout,
+    deadline: Option<Instant>,
+    allow_global_f64_engine: bool,
+) -> Result<Option<PositionStackedAw>> {
+    let num_outputs = layout.num_outputs;
+    let Some(rows_per_position) = num_outputs.checked_mul(2) else {
+        return Ok(None);
+    };
+    let Some(total_rows) = rows_per_position.checked_mul(layout.num_positions) else {
+        return Ok(None);
+    };
+    let stacked_bytes = total_rows
+        .checked_mul(layout.out_features)
+        .and_then(|cells| cells.checked_mul(size_of::<f32>()))
+        .and_then(|input| {
+            total_rows
+                .checked_mul(layout.in_features)
+                .and_then(|cells| cells.checked_mul(2 * size_of::<f64>()))
+                .and_then(|outputs| outputs.checked_add(input))
+        });
+    if stacked_bytes.is_none_or(|bytes| bytes > POSITION_STACK_MAX_BYTES) || total_rows == 0 {
+        return Ok(None);
+    }
+    let out_features = layout.out_features;
+    let stacked = Mat::<f32>::from_fn(total_rows, out_features, |r, j| {
+        let pos = r / rows_per_position;
+        let i = r % rows_per_position;
+        let in_start = pos * out_features;
+        if i < num_outputs {
+            bounds.lower_a()[[i, in_start + j]]
+        } else {
+            bounds.upper_a()[[i - num_outputs, in_start + j]]
+        }
+    });
+    // Telemetry only: the route the stacked call is ELIGIBLE for (an installed
+    // engine may still hand an individual product back to the CPU reducer).
+    let engine_route = allow_global_f64_engine
+        && !crate::sound_f64_gemm::cpu_only_f64_active()
+        && deadline_f64_accelerator_eligible(total_rows, out_features, layout.in_features)
+        && crate::sound_f64_gemm::is_installed();
+    let (a64, s) = if allow_global_f64_engine {
+        aw_f64_with_abssum_and_deadline_for_layer(layer, &stacked, deadline)?
+    } else {
+        aw_f64_with_abssum_pollable_cpu_for_layer(layer, &stacked, deadline)?
+    };
+    if a64.dim() != (total_rows, layout.in_features) || s.dim() != (total_rows, layout.in_features)
+    {
+        return Ok(None);
+    }
+    crate::layers::collector_kernels::record_linear_stack(
+        layout.num_positions,
+        total_rows,
+        engine_route,
+    );
+    Ok(Some(PositionStackedAw {
+        a64,
+        s,
+        rows_per_position,
+    }))
+}
+
+/// [`propagate_linear_cpu_with_deadline`] with the position-stack choice
+/// explicit (#vit-collector-throughput P3). `stack_positions == false` is the
+/// historical per-position loop byte-for-byte; production passes the typed
+/// `bab.linear_position_stack` latch, tests pass both values.
+fn propagate_linear_cpu_with_deadline_and_stack<'a>(
+    layer: &LinearLayer,
+    bounds: &'a LinearBounds,
+    deadline: Option<Instant>,
+    allow_global_f64_engine: bool,
+    stack_positions: bool,
+) -> Result<Cow<'a, LinearBounds>> {
+    let mut work = WeightedPoll::new(|_| {
+        check_optional_aw_deadline(deadline, "during shared CPU Linear loops")
+    });
+    propagate_linear_cpu_with_deadline_stack_and_work(
+        layer,
+        bounds,
+        deadline,
+        allow_global_f64_engine,
+        stack_positions,
+        &mut work,
+    )
+}
+
+// One numerical body for ordinary callers and injected cooperative controls.
+// This adapter covers the outer loops only. Allocations, inner AW preparation,
+// cache/scratch ownership and final LinearBounds validation still need hooks.
+fn propagate_linear_cpu_with_deadline_stack_and_work<'a, P: CooperativeWork>(
+    layer: &LinearLayer,
+    bounds: &'a LinearBounds,
+    deadline: Option<Instant>,
+    allow_global_f64_engine: bool,
+    stack_positions: bool,
+    work: &mut P,
+) -> Result<Cow<'a, LinearBounds>> {
+    propagate_linear_cpu_with_storage(
+        layer,
+        bounds,
+        deadline,
+        allow_global_f64_engine,
+        stack_positions,
+        work,
+        &mut cpu_storage::OwnedCpuStorage,
+    )
+    .map(Cow::Owned)
+}
+
+pub(crate) fn propagate_linear_cpu_with_storage<S: cpu_storage::CpuStorage, P: CooperativeWork>(
+    layer: &LinearLayer,
+    bounds: &LinearBounds,
+    deadline: Option<Instant>,
+    allow_global_f64_engine: bool,
+    stack_positions: bool,
+    work: &mut P,
+    storage: &mut S,
+) -> Result<S::Output> {
     debug!("Linear layer CROWN backward propagation");
+    work.checkpoint()?;
 
     if deadline.is_some_and(|d| Instant::now() >= d) {
         return Err(NyError::DeadlineExceeded(
@@ -2045,36 +2819,64 @@ fn propagate_linear_cpu_with_deadline<'a>(
         );
     }
 
-    let mut new_lower_a = Array2::<f32>::zeros((num_outputs, layout.total_in_features));
-    let mut new_upper_a = Array2::<f32>::zeros((num_outputs, layout.total_in_features));
+    storage.admit(
+        layer,
+        bounds,
+        &layout,
+        deadline,
+        allow_global_f64_engine,
+        stack_positions,
+        work,
+    )?;
+
+    let mut new_lower_a = storage.coefficient_zeros(num_outputs, layout.total_in_features)?;
+    let mut new_upper_a = storage.coefficient_zeros(num_outputs, layout.total_in_features)?;
     // Certified per-coefficient error matrices (#vnncomp-aw-soundness): the
     // SOUND A·W. Each entry bounds `|stored - true_coeff|` and is consumed at
     // concretize as an S-scaled, box-magnitude-scaled penalty.
-    let mut new_lower_a_err = Array2::<f32>::zeros((num_outputs, layout.total_in_features));
-    let mut new_upper_a_err = Array2::<f32>::zeros((num_outputs, layout.total_in_features));
-    // #1863: Use f64 accumulators for bias to match nonlinear path's precision
-    // standard (common.rs:170-175, fix for catastrophic cancellation #1745).
-    let mut lower_bias_contrib = Array1::<f64>::zeros(num_outputs);
-    let mut upper_bias_contrib = Array1::<f64>::zeros(num_outputs);
+    let mut new_lower_a_err = storage.coefficient_zeros(num_outputs, layout.total_in_features)?;
+    let mut new_upper_a_err = storage.coefficient_zeros(num_outputs, layout.total_in_features)?;
+    // Use f64 accumulators for bias to match nonlinear path's precision
+    // standard (common.rs:170-175, fix for catastrophic cancellation).
+    let mut lower_bias_contrib = storage.accumulator_zeros(num_outputs)?;
+    let mut upper_bias_contrib = storage.accumulator_zeros(num_outputs)?;
 
-    // Track which output rows have non-finite coefficients (#2681).
+    // Track which output rows have non-finite coefficients.
     // These rows will be overridden with ±inf bias after the position loop.
-    let mut lower_nonfinite_rows = vec![false; num_outputs];
-    let mut upper_nonfinite_rows = vec![false; num_outputs];
+    let mut lower_nonfinite_rows = storage.row_flags_zeros(num_outputs)?;
+    let mut upper_nonfinite_rows = storage.row_flags_zeros(num_outputs)?;
 
     // Incoming certified error on this bounds object's coefficients (from a
     // prior linear backward composed through earlier layers). When present, it
     // is propagated as `Σ_k err_in[i, in_start+k]·|W[k,j]|`.
     let in_lower_err = bounds.lower_a_err();
     let in_upper_err = bounds.upper_a_err();
-    // |W| once per call (reused per position); shape (contraction, in_features).
-    let w_abs = Mat::<f32>::from_fn(weight_rows, in_features, |k, j| {
-        layer.weight_faer()[(k, j)].abs()
-    });
     let n_contraction = weight_rows;
     let gamma = gamma_n_f64(n_contraction);
 
+    // #vit-collector-throughput P3 (typed `bab.linear_position_stack`, dark by
+    // default): one certified A·W over every position instead of one per
+    // position. `None` (dark, a single position, or a declined size) keeps the
+    // historical per-position call below exactly.
+    let position_stack = if stack_positions && layout.num_positions > 1 {
+        let stacked = storage.position_stack(
+            layer,
+            bounds,
+            &layout,
+            deadline,
+            allow_global_f64_engine,
+            work,
+        )?;
+        if stacked.is_none() {
+            crate::layers::collector_kernels::record_linear_stack_declined();
+        }
+        stacked
+    } else {
+        None
+    };
+
     for pos in 0..layout.num_positions {
+        work.checkpoint()?;
         let in_start = pos * layout.out_features;
         let out_start = pos * in_features;
 
@@ -2089,80 +2891,48 @@ fn propagate_linear_cpu_with_deadline<'a>(
         let legacy_f32 = allow_global_f64_engine
             && cfg!(debug_assertions)
             && std::env::var("NY_AW_LEGACY_F32").is_ok();
-        let (stacked_a64, stacked_s) = if legacy_f32 {
-            let lower_block = Mat::<f32>::from_fn(num_outputs, layout.out_features, |i, j| {
-                bounds.lower_a()[[i, in_start + j]]
-            });
-            let upper_block = Mat::<f32>::from_fn(num_outputs, layout.out_features, |i, j| {
-                bounds.upper_a()[[i, in_start + j]]
-            });
-            let ml = mat_mul(&lower_block, layer.weight_faer());
-            let mu = mat_mul(&upper_block, layer.weight_faer());
-            let a64 = Array2::from_shape_fn((2 * num_outputs, in_features), |(i, j)| {
-                if i < num_outputs {
-                    f32_to_f64_exact(ml[(i, j)])
-                } else {
-                    f32_to_f64_exact(mu[(i - num_outputs, j)])
-                }
-            });
-            let s = Array2::<f64>::zeros((2 * num_outputs, in_features));
-            (a64, s)
-        } else {
-            // Stack lower OVER upper into one (2·num_outputs × out_features) block:
-            // both sides multiply the SAME weight, so the f64 A·W + abs-sum runs as
-            // ONE engine GEMM pair over the stacked block instead of two — halving
-            // the cuBLAS launch/sync/transfer overhead on the sound-f64 seam (and
-            // pushing more work above the offload gate). Rows are independent in
-            // `aw_f64_with_abssum` (per-`i` f64 accumulation), so the split halves
-            // are bit-identical to two separate calls on the CPU path.
-            let stacked = Mat::<f32>::from_fn(2 * num_outputs, layout.out_features, |i, j| {
-                if i < num_outputs {
-                    bounds.lower_a()[[i, in_start + j]]
-                } else {
-                    bounds.upper_a()[[i - num_outputs, in_start + j]]
-                }
-            });
-            if allow_global_f64_engine {
-                aw_f64_with_abssum_and_deadline(&stacked, layer.weight_faer(), deadline)?
-            } else {
-                aw_f64_with_abssum_pollable_cpu(&stacked, layer.weight_faer(), deadline)?
-            }
-        };
+        let (stacked_a64, stacked_s) = storage.aw_for_position(
+            layer,
+            bounds,
+            &layout,
+            pos,
+            deadline,
+            allow_global_f64_engine,
+            legacy_f32,
+            position_stack.as_ref(),
+            work,
+        )?;
 
         // Propagated incoming error: P[i,j] = Σ_k err_in[i,in_start+k]·|W[k,j]|.
-        let prop_lower = match (in_lower_err, deadline) {
-            (Some(error), Some(limit)) => Some(incoming_error_product_deadline(
+        //
+        // #linear-abs-weight-cache: `|W|` (shape `weight_rows × in_features`)
+        // is the layer's construction-time constant, taken from its cache
+        // instead of rebuilt per call, and read ONLY from these `Some(error)`
+        // arms — a call with no incoming certified-error plane no longer
+        // allocates and fills it just to drop it. Same bits: `abs` on the same
+        // immutable `weight_faer`, same dimensions (`layout.out_features ==
+        // weight_rows` on both `resolve_backward_layout` branches).
+        let prop_lower = match in_lower_err {
+            Some(error) => Some(storage.incoming_error(
+                layer,
                 error,
                 in_start,
                 layout.out_features,
-                &w_abs,
-                limit,
+                deadline,
+                work,
             )?),
-            (Some(error), None) => Some(incoming_error_product(
-                error,
-                in_start,
-                layout.out_features,
-                &w_abs,
-                None,
-            )?),
-            (None, _) => None,
+            None => None,
         };
-        let prop_upper = match (in_upper_err, deadline) {
-            (Some(error), Some(limit)) => Some(incoming_error_product_deadline(
+        let prop_upper = match in_upper_err {
+            Some(error) => Some(storage.incoming_error(
+                layer,
                 error,
                 in_start,
                 layout.out_features,
-                &w_abs,
-                limit,
+                deadline,
+                work,
             )?),
-            (Some(error), None) => Some(incoming_error_product(
-                error,
-                in_start,
-                layout.out_features,
-                &w_abs,
-                None,
-            )?),
-            (None, _) => None,
+            None => None,
         };
 
         // Place result in output, tracking non-finite or near-overflow coefficients
@@ -2170,8 +2940,10 @@ fn propagate_linear_cpu_with_deadline<'a>(
         // f32 overflow before they actually reach Inf, preventing NaN from subsequent
         // multiplications. See CROWN_COEFF_MAX documentation.
         for i in 0..num_outputs {
+            work.before(2)?;
             let upper_i = num_outputs + i;
             for j in 0..in_features {
+                work.before(128)?;
                 let l = stacked_a64[[i, j]] as f32;
                 let u = stacked_a64[[upper_i, j]] as f32;
                 // Certified error: cast rounding |a64 - stored| + γ_n·S + propagated
@@ -2212,15 +2984,16 @@ fn propagate_linear_cpu_with_deadline<'a>(
                 out_features: layout.out_features,
                 col_offset: in_start,
             };
-            let lower_slice = contiguous_flat_slice_mut(&mut lower_bias_contrib)?;
-            let upper_slice = contiguous_flat_slice_mut(&mut upper_bias_contrib)?;
-            accumulate_bias_f64(
+            let lower_slice = S::accumulator_slice_mut(&mut lower_bias_contrib)?;
+            let upper_slice = S::accumulator_slice_mut(&mut upper_bias_contrib)?;
+            accumulate_bias_f64_with_work(
                 &mut (lower_slice, upper_slice),
                 |i, j| bounds.lower_a()[[i, j]],
                 |i, j| bounds.upper_a()[[i, j]],
                 bias,
                 &block,
-            );
+                work,
+            )?;
         }
     }
 
@@ -2232,48 +3005,79 @@ fn propagate_linear_cpu_with_deadline<'a>(
     if let Some(ref bias) = layer.bias {
         if let Some(le) = in_lower_err {
             for i in 0..num_outputs {
-                let mut e = 0.0f64;
-                for j in 0..bias.len() {
-                    e = add_coeff_err_bias_product_up(e, le[[i, j]], bias[j]);
-                }
+                work.before(2)?;
+                let e = sum_coeff_err_bias_up(
+                    le.view(),
+                    i,
+                    bias.view(),
+                    layout.num_positions,
+                    &mut |units| {
+                        check_optional_aw_deadline(
+                            deadline,
+                            "during incoming-error bias propagation",
+                        )?;
+                        if units == 0 {
+                            work.checkpoint()
+                        } else {
+                            work.before(units)
+                        }
+                    },
+                )?;
                 lower_bias_contrib[i] = add_f64_down(lower_bias_contrib[i], -e);
             }
         }
         if let Some(ue) = in_upper_err {
             for i in 0..num_outputs {
-                let mut e = 0.0f64;
-                for j in 0..bias.len() {
-                    e = add_coeff_err_bias_product_up(e, ue[[i, j]], bias[j]);
-                }
+                work.before(2)?;
+                let e = sum_coeff_err_bias_up(
+                    ue.view(),
+                    i,
+                    bias.view(),
+                    layout.num_positions,
+                    &mut |units| {
+                        check_optional_aw_deadline(
+                            deadline,
+                            "during incoming-error bias propagation",
+                        )?;
+                        if units == 0 {
+                            work.checkpoint()
+                        } else {
+                            work.before(units)
+                        }
+                    },
+                )?;
                 upper_bias_contrib[i] = add_f64_up(upper_bias_contrib[i], e);
             }
         }
     }
 
-    // Finalize bias with directed rounding (#2164)
-    let (mut new_lower_b, mut new_upper_b) = if layer.bias.is_some() {
-        finalize_bias_directed(
-            &lower_bias_contrib,
-            &upper_bias_contrib,
-            bounds.lower_b(),
-            bounds.upper_b(),
-        )
-    } else {
-        (bounds.lower_b().clone(), bounds.upper_b().clone())
-    };
+    // Finalize bias with directed rounding
+    let (mut new_lower_b, mut new_upper_b) = storage.finish_biases(
+        &lower_bias_contrib,
+        &upper_bias_contrib,
+        bounds.lower_b(),
+        bounds.upper_b(),
+        layer.bias.is_some(),
+        work,
+    )?;
 
-    // #2681/#1932: For rows with non-finite or near-overflow A-matrix coefficients,
+    // For rows with non-finite or near-overflow A-matrix coefficients,
     // zero the entire row and set bias to ±inf. This makes the concretized bound
     // [-inf, +inf] for that output neuron — sound but maximally loose.
     //
-    // #1932 extends #2681: besides catching actual Inf/NaN, we now also catch
+    // Besides catching actual Inf/NaN, this also catches
     // coefficients exceeding CROWN_COEFF_MAX (1e10). This prevents near-overflow
     // f32 coefficients from producing NaN in subsequent multiplications.
     //
     // Reference: alpha-beta-CROWN does no coefficient clamping (relies on float64
     // dynamic range). Our f32 path needs proactive protection.
-    let lower_affected = lower_nonfinite_rows.iter().filter(|&&r| r).count();
-    let upper_affected = upper_nonfinite_rows.iter().filter(|&&r| r).count();
+    let mut lower_affected = 0;
+    let mut upper_affected = 0;
+    for i in 0..num_outputs {
+        work.before(2)?;
+        lower_affected += usize::from(lower_nonfinite_rows[i]);
+        upper_affected += usize::from(upper_nonfinite_rows[i]);
+    }
     if lower_affected > 0 || upper_affected > 0 {
         debug!(
             "Linear CROWN backward (faer): overflow/magnitude in {}/{} lower rows, \
@@ -2281,8 +3085,10 @@ fn propagate_linear_cpu_with_deadline<'a>(
             lower_affected, num_outputs, upper_affected, num_outputs
         );
         for i in 0..num_outputs {
+            work.before(2)?;
             if lower_nonfinite_rows[i] {
                 for j in 0..layout.total_in_features {
+                    work.before(2)?;
                     new_lower_a[[i, j]] = 0.0;
                     new_lower_a_err[[i, j]] = 0.0;
                 }
@@ -2290,6 +3096,7 @@ fn propagate_linear_cpu_with_deadline<'a>(
             }
             if upper_nonfinite_rows[i] {
                 for j in 0..layout.total_in_features {
+                    work.before(2)?;
                     new_upper_a[[i, j]] = 0.0;
                     new_upper_a_err[[i, j]] = 0.0;
                 }
@@ -2298,16 +3105,21 @@ fn propagate_linear_cpu_with_deadline<'a>(
         }
     }
 
-    // CROWN backward NaN firewall (#2812): conservative fallback instead of hard error.
+    work.checkpoint()?;
+
+    // CROWN backward NaN firewall: conservative fallback instead of hard error.
     // SOUND coefficient interval carried via the certified error matrices.
-    Ok(Cow::Owned(LinearBounds::new_or_conservative_with_err(
+    let result = storage.publish(
         new_lower_a,
         new_lower_b,
         new_upper_a,
         new_upper_b,
         new_lower_a_err,
         new_upper_a_err,
-    )?))
+        work,
+    )?;
+    work.checkpoint()?;
+    Ok(result)
 }
 
 /// CROWN backward propagation using an optional GEMM engine for acceleration.
@@ -2515,8 +3327,6 @@ fn propagate_linear_via_gemm(
 
     let in_lower_err = bounds.lower_a_err();
     let in_upper_err = bounds.upper_a_err();
-    let weight_faer = layer.weight_faer();
-    let w_abs = Mat::<f32>::from_fn(weight_rows, in_features, |k, j| weight_faer[(k, j)].abs());
     // The engine GEMM accumulates in f32 → use the f32 growth factor (sound).
     let gamma = gamma_n_f32(weight_rows);
 
@@ -2560,15 +3370,18 @@ fn propagate_linear_via_gemm(
             bounds.upper_a()[[i, in_start + j]]
         });
         let (lower_reference, lower_s) =
-            aw_f64_with_abssum_and_deadline(&lower_faer, weight_faer, deadline)?;
+            aw_f64_with_abssum_and_deadline_for_layer(layer, &lower_faer, deadline)?;
         let (upper_reference, upper_s) =
-            aw_f64_with_abssum_and_deadline(&upper_faer, weight_faer, deadline)?;
+            aw_f64_with_abssum_and_deadline_for_layer(layer, &upper_faer, deadline)?;
+        // #linear-abs-weight-cache: `|W|` from the layer's cache rather than a
+        // per-call rebuild, and only when an incoming error plane exists. Same
+        // operand, same `abs`, same shape — the engine GEMM above is untouched.
         let prop_lower = match in_lower_err {
             Some(error) => Some(incoming_error_product(
                 error,
                 in_start,
                 layout.out_features,
-                &w_abs,
+                layer.weight_abs_faer(),
                 deadline,
             )?),
             None => None,
@@ -2578,7 +3391,7 @@ fn propagate_linear_via_gemm(
                 error,
                 in_start,
                 layout.out_features,
-                &w_abs,
+                layer.weight_abs_faer(),
                 deadline,
             )?),
             None => None,
@@ -2641,19 +3454,35 @@ fn propagate_linear_via_gemm(
     if let Some(ref bias) = layer.bias {
         if let Some(le) = in_lower_err {
             for i in 0..num_outputs {
-                let mut e = 0.0f64;
-                for j in 0..bias.len() {
-                    e = add_coeff_err_bias_product_up(e, le[[i, j]], bias[j]);
-                }
+                let e = sum_coeff_err_bias_up(
+                    le.view(),
+                    i,
+                    bias.view(),
+                    layout.num_positions,
+                    &mut |_| {
+                        check_optional_aw_deadline(
+                            deadline,
+                            "during incoming-error bias propagation",
+                        )
+                    },
+                )?;
                 lower_bias_contrib[i] = add_f64_down(lower_bias_contrib[i], -e);
             }
         }
         if let Some(ue) = in_upper_err {
             for i in 0..num_outputs {
-                let mut e = 0.0f64;
-                for j in 0..bias.len() {
-                    e = add_coeff_err_bias_product_up(e, ue[[i, j]], bias[j]);
-                }
+                let e = sum_coeff_err_bias_up(
+                    ue.view(),
+                    i,
+                    bias.view(),
+                    layout.num_positions,
+                    &mut |_| {
+                        check_optional_aw_deadline(
+                            deadline,
+                            "during incoming-error bias propagation",
+                        )
+                    },
+                )?;
                 upper_bias_contrib[i] = add_f64_up(upper_bias_contrib[i], e);
             }
         }
@@ -2802,7 +3631,7 @@ mod aw_f32_sound_tests {
         let w_vals = [[1e20f32, 2.0], [3.0, 1e-40], [5.0, 6.0]];
         let a = Mat::<f32>::from_fn(2, 3, |i, j| a_vals[i][j]);
         let w = Mat::<f32>::from_fn(3, 2, |i, j| w_vals[i][j]);
-        let floor = daz_operand_flush_floor(&a, &w, 2, 3, 2);
+        let floor = daz_operand_flush_floor(&a, &w, 2, 3, 2, None);
         for i in 0..2 {
             for j in 0..2 {
                 let worst: f64 = (0..3)
@@ -3156,13 +3985,14 @@ mod aw_f32_sound_tests {
 #[cfg(test)]
 mod faer_f64_aw_tests {
     use super::{
-        aw_f64_with_abssum, aw_f64_with_abssum_and_deadline,
-        aw_f64_with_abssum_cpu_deadline_scalar, aw_f64_with_abssum_deadline_via_engine_or_cpu,
+        aw_f64_with_abssum, aw_f64_with_abssum_and_deadline, aw_f64_with_abssum_chunked_poll,
+        aw_f64_with_abssum_chunked_poll_for_layer, aw_f64_with_abssum_cpu_deadline_scalar,
+        aw_f64_with_abssum_deadline_via_engine_or_cpu, aw_f64_with_abssum_for_layer,
         aw_via_engine_deadline, deadline_aw_faer_rows_per_chunk, deadline_f64_accelerator_eligible,
         f32_to_f64_exact, gamma_n_f64, incoming_error_product, incoming_error_product_deadline,
         incoming_error_product_gemm, incoming_error_product_with_poll_quantum,
-        next_up_nonnegative_f64, propagate_linear_pollable_cpu, LinearBounds, LinearLayer,
-        DEADLINE_AW_FAER_CHUNK_MACS, DEADLINE_F64_ACCELERATOR_MAX_DISPATCH_MACS,
+        next_up_nonnegative_f64, propagate_linear_cpu, propagate_linear_pollable_cpu, LinearBounds,
+        LinearLayer, DEADLINE_AW_FAER_CHUNK_MACS, DEADLINE_F64_ACCELERATOR_MAX_DISPATCH_MACS,
         INCOMING_ERROR_POLL_MACS, SOUND_F64_GEMM_MIN_MACS,
     };
     use faer::Mat;
@@ -3187,6 +4017,101 @@ mod faer_f64_aw_tests {
         fn signed(&mut self, scale: f32) -> f32 {
             let u = (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32; // [0,1)
             (u * 2.0 - 1.0) * scale
+        }
+    }
+
+    /// #linear-widened-weight-cache moat: the layer-held f64 widening must
+    /// publish the SAME BITS as the historical per-call rebuild, in BOTH operand
+    /// layouts it serves — the packed column-major buffers the rebound-scratch
+    /// pool consumes (gate ON, the production default) and the owned `Mat<f64>`
+    /// the plain faer arm consumes (gate OFF, the A/B reference) — and in the
+    /// row-block-chunked arm, whose per-block publication is now cache-tiled.
+    ///
+    /// `k = 33` is deliberately NOT a multiple of the eight-row faer padding, so
+    /// a cached `Mat<f64>` whose row capacity differed from a freshly built
+    /// one's would show up here rather than coincidentally agreeing.
+    #[test]
+    fn layer_widened_weight_cache_is_bit_identical_to_per_call_widening() {
+        // (M, K, P). The second shape is the one that matters for
+        // `copy_col_major_block_into_row_major`: it tiles in 32x32 blocks, so a
+        // shape with P <= 32 never executes the ragged COLUMN tail
+        // (`col_end = (col_start + TILE).min(dst_cols)`). M=70/P=45 is ragged in
+        // BOTH axes and spans more than one tile in each.
+        for (m, k, p) in [(7usize, 33usize, 12usize), (70, 33, 45)] {
+            layer_widened_weight_cache_parity_case(m, k, p);
+        }
+    }
+
+    fn layer_widened_weight_cache_parity_case(m: usize, k: usize, p: usize) {
+        let mut rng = SplitMix64(0x0A11_CACE);
+        let weight = Array2::<f32>::from_shape_fn((k, p), |_| rng.signed(1.5));
+        let layer = LinearLayer::new(weight, None).expect("test layer builds");
+        let a = Mat::<f32>::from_fn(m, k, |_, _| rng.signed(2.0));
+
+        // The lever's own observable. Without it every assertion below would be
+        // comparing the uncached path against itself and could never fail.
+        assert!(
+            layer.weight_widened_f64().is_some(),
+            "a {k}x{p} weight is far under the retention ceiling: the cache must \
+             populate, else this parity test is vacuous"
+        );
+
+        for pooled in [false, true] {
+            let _gate = crate::rebound_scratch::TestGateOverride::new(pooled);
+            let (reference_a64, reference_s) = aw_f64_with_abssum(&a, layer.weight_faer());
+            let (cached_a64, cached_s) = aw_f64_with_abssum_for_layer(&layer, &a);
+            for i in 0..m {
+                for j in 0..p {
+                    assert_eq!(
+                        cached_a64[[i, j]].to_bits(),
+                        reference_a64[[i, j]].to_bits(),
+                        "cached A·W diverged at [{i},{j}] (rebound pool {pooled})"
+                    );
+                    assert_eq!(
+                        cached_s[[i, j]].to_bits(),
+                        reference_s[[i, j]].to_bits(),
+                        "cached S diverged at [{i},{j}] (rebound pool {pooled})"
+                    );
+                }
+            }
+        }
+
+        // Chunked (deadline / bounded-facade) arm, which also exercises the
+        // cache-tiled row-block publication against the same reference.
+        let mut poll = || -> Result<()> { Ok(()) };
+        let (reference_a64, reference_s, reference_blocks) = aw_f64_with_abssum_chunked_poll(
+            &a,
+            layer.weight_faer(),
+            DEADLINE_AW_FAER_CHUNK_MACS,
+            &mut poll,
+        )
+        .expect("chunked reference completes")
+        .expect("this shape is chunk-bounded");
+        let (cached_a64, cached_s, cached_blocks) = aw_f64_with_abssum_chunked_poll_for_layer(
+            &layer,
+            &a,
+            DEADLINE_AW_FAER_CHUNK_MACS,
+            &mut poll,
+        )
+        .expect("chunked cached completes")
+        .expect("this shape is chunk-bounded");
+        assert_eq!(
+            cached_blocks, reference_blocks,
+            "the cache must not change the row-block schedule"
+        );
+        for i in 0..m {
+            for j in 0..p {
+                assert_eq!(
+                    cached_a64[[i, j]].to_bits(),
+                    reference_a64[[i, j]].to_bits(),
+                    "chunked cached A·W diverged at [{i},{j}]"
+                );
+                assert_eq!(
+                    cached_s[[i, j]].to_bits(),
+                    reference_s[[i, j]].to_bits(),
+                    "chunked cached S diverged at [{i},{j}]"
+                );
+            }
         }
     }
 
@@ -3578,6 +4503,7 @@ mod faer_f64_aw_tests {
                 &engine,
                 &a,
                 &w,
+                None,
                 Instant::now() + Duration::from_mins(1),
             )
             .unwrap_or_else(|error| panic!("{outcome:?} should fall back to CPU: {error}"));
@@ -3603,6 +4529,7 @@ mod faer_f64_aw_tests {
             &engine,
             &a,
             &w,
+            None,
             Instant::now() + Duration::from_mins(1),
         )
         .expect_err("second-product deadline must be terminal");
@@ -3679,9 +4606,13 @@ mod faer_f64_aw_tests {
         let a = Mat::<f32>::from_fn(2, 5, |i, j| a_vals[i][j]);
         let w = Mat::<f32>::from_fn(5, 3, |i, j| w_vals[i][j]);
 
-        let (actual_a, actual_s) =
-            aw_f64_with_abssum_and_deadline(&a, &w, Some(Instant::now() + Duration::from_mins(1)))
-                .expect("live deadline should complete");
+        let (actual_a, actual_s) = aw_f64_with_abssum_and_deadline(
+            &a,
+            &w,
+            None,
+            Some(Instant::now() + Duration::from_mins(1)),
+        )
+        .expect("live deadline should complete");
         let (twin_a, twin_s) = aw_f64_with_abssum(&a, &w);
         for i in 0..2 {
             for j in 0..3 {
@@ -3726,6 +4657,7 @@ mod faer_f64_aw_tests {
         let error = aw_f64_with_abssum_and_deadline(
             &a,
             &w,
+            None,
             Some(
                 Instant::now()
                     .checked_sub(Duration::from_secs(1))
@@ -3895,8 +4827,7 @@ mod faer_f64_aw_tests {
 
     // WAS DORMANT — this function carried no `#[test]` and had NEVER RUN. A
     // duplicated `#[test]` on the function above was masking it from clippy's
-    // dead-code pass; removing that duplicate surfaced it. (Found twice
-    // independently on 2026-08-18.)
+    // dead-code pass; removing that duplicate surfaced it.
     //
     // It is ENABLED because the open question has now been answered by running
     // it: it PASSES. The concern against enabling it was that its outcome was
@@ -4088,6 +5019,204 @@ mod faer_f64_aw_tests {
             "a zero-width enclosure must exclude the exact A·W somewhere (confirms the \
              enclosure width is load-bearing, i.e. the containment check is non-vacuous)"
         );
+    }
+
+    /// #linear-abs-weight-cache. The layer's cached `|W|` must be the SAME BITS
+    /// in the same shape as the
+    /// `Mat::<f32>::from_fn(rows, cols, |k, j| weight_faer[(k, j)].abs())` that
+    /// the six backward sites rebuilt on every call.
+    ///
+    /// FAILS CLOSED. The cell is asserted COLD before the accessor runs and
+    /// FILLED immediately after, so this cannot degenerate into comparing the
+    /// per-call expression against itself: if a future edit stops routing
+    /// through the cache, or a fixture warms it early, the observable
+    /// assertions fail rather than the parity silently becoming vacuous.
+    #[test]
+    fn weight_abs_cache_is_bit_identical_to_the_per_call_build() {
+        // Every f32 class whose sign bit `abs` must clear without disturbing
+        // the payload: negative zero, both subnormal signs, ±inf and ±NaN.
+        let weight = arr2(&[
+            [-1.5_f32, 0.0, -0.0, f32::MIN_POSITIVE],
+            [f32::from_bits(1), -f32::from_bits(1), 3.25, -7.5],
+            [f32::INFINITY, f32::NEG_INFINITY, f32::NAN, -f32::NAN],
+        ]);
+        let layer = LinearLayer::new(weight, None).expect("abs-cache fixture builds");
+
+        assert!(
+            layer.weight_abs_faer.get().is_none(),
+            "a freshly constructed layer must hold a COLD |W| cell, else the \
+             parity below proves nothing"
+        );
+
+        // The exact expression the six production sites used to evaluate per
+        // call, over the same immutable operand.
+        let rebuilt = Mat::<f32>::from_fn(
+            layer.weight_faer().nrows(),
+            layer.weight_faer().ncols(),
+            |k, j| layer.weight_faer()[(k, j)].abs(),
+        );
+        assert!(
+            layer.weight_abs_faer.get().is_none(),
+            "building the reference must not warm the cell being tested"
+        );
+
+        let cached = layer.weight_abs_faer();
+        assert!(
+            layer.weight_abs_faer.get().is_some(),
+            "the accessor must FILL the cell it claims to cache into"
+        );
+
+        assert_eq!(
+            (cached.nrows(), cached.ncols()),
+            (rebuilt.nrows(), rebuilt.ncols()),
+            "cached |W| shape must match the per-call build"
+        );
+        for k in 0..rebuilt.nrows() {
+            for j in 0..rebuilt.ncols() {
+                assert_eq!(
+                    cached[(k, j)].to_bits(),
+                    rebuilt[(k, j)].to_bits(),
+                    "|W|[{k},{j}] differs bitwise from the per-call build"
+                );
+            }
+        }
+
+        // Second call hands back the SAME allocation: nothing is rebuilt, which
+        // is the whole point of the change.
+        assert!(
+            std::ptr::eq(cached, layer.weight_abs_faer()),
+            "a second accessor call must reuse the filled Mat, not rebuild it"
+        );
+    }
+
+    /// #linear-abs-weight-cache. An A/B of the two OPERANDS through the only
+    /// consumer the six sites have: `incoming_error_product`. Cached `|W|` and a
+    /// freshly built `|W|` must publish bit-identical products, which is the
+    /// substitution the change actually performs.
+    ///
+    /// FAILS CLOSED via the cold/filled assertions around the cached call.
+    #[test]
+    fn incoming_error_product_is_bit_identical_from_the_cached_abs_weight() {
+        let mut rng = SplitMix64(0x0AB5_10E7_2026_0828);
+        let (contraction, in_features, rows) = (7usize, 5usize, 4usize);
+        let weight = Array2::from_shape_fn((contraction, in_features), |_| rng.signed(2.0));
+        let layer = LinearLayer::new(weight, None).expect("abs-cache consumer fixture builds");
+        let error = Array2::from_shape_fn((rows, contraction), |_| rng.signed(1.0).abs());
+
+        assert!(
+            layer.weight_abs_faer.get().is_none(),
+            "consumer fixture must start COLD"
+        );
+        let rebuilt = Mat::<f32>::from_fn(contraction, in_features, |k, j| {
+            layer.weight_faer()[(k, j)].abs()
+        });
+        let from_rebuilt = incoming_error_product(&error, 0, contraction, &rebuilt, None)
+            .expect("per-call |W| composition succeeds");
+
+        let from_cache =
+            incoming_error_product(&error, 0, contraction, layer.weight_abs_faer(), None)
+                .expect("cached |W| composition succeeds");
+        assert!(
+            layer.weight_abs_faer.get().is_some(),
+            "the cached arm must have gone through the layer's cell"
+        );
+
+        assert_eq!(from_cache.dim(), from_rebuilt.dim());
+        for ((i, j), value) in from_cache.indexed_iter() {
+            assert_eq!(
+                value.to_bits(),
+                from_rebuilt[[i, j]].to_bits(),
+                "composed incoming error [{i},{j}] differs between cached and \
+                 per-call |W|"
+            );
+        }
+    }
+
+    /// #linear-abs-weight-cache ENGAGEMENT, both directions. The CPU backward
+    /// must route its `Σ_k err_in·|W|` through the layer's cell when an incoming
+    /// certified-error plane is present, and must not build `|W|` AT ALL when
+    /// there is none — the second half is the allocation the eager per-call
+    /// build could not skip.
+    #[test]
+    fn linear_backward_fills_the_abs_weight_cache_only_when_an_error_plane_exists() {
+        let weight = arr2(&[[1.0_f32, -2.0], [-3.0, 4.0], [0.5, -0.25]]);
+        let bias = Array1::from_vec(vec![0.125_f32, -0.5, 2.0]);
+
+        let plain = LinearBounds::new(
+            arr2(&[[1.0_f32, -1.0, 2.0], [0.5, 2.0, -1.5]]),
+            Array1::from_vec(vec![0.25_f32, -0.75]),
+            arr2(&[[1.5_f32, -0.5, 2.5], [1.0, 2.5, -1.0]]),
+            Array1::from_vec(vec![0.5_f32, -0.25]),
+        )
+        .expect("engagement bounds fixture builds");
+
+        let without_error_plane =
+            LinearLayer::new(weight.clone(), Some(bias.clone())).expect("layer builds");
+        assert!(without_error_plane.weight_abs_faer.get().is_none());
+        let _plain_result = propagate_linear_cpu(&without_error_plane, &plain)
+            .expect("backward without error plane");
+        assert!(
+            without_error_plane.weight_abs_faer.get().is_none(),
+            "a call whose incoming bounds carry NO certified-error plane must not \
+             allocate |W| at all"
+        );
+
+        let mut with_error_plane_bounds = plain.clone();
+        with_error_plane_bounds.set_coeff_err(
+            Array2::from_elem((2, 3), 0.125_f32),
+            Array2::from_elem((2, 3), 0.25_f32),
+        );
+        assert!(
+            with_error_plane_bounds.lower_a_err().is_some()
+                && with_error_plane_bounds.upper_a_err().is_some(),
+            "set_coeff_err must have attached both planes, else the assertion below \
+             would pass for the wrong reason"
+        );
+
+        let with_error_plane = LinearLayer::new(weight, Some(bias)).expect("layer builds");
+        assert!(with_error_plane.weight_abs_faer.get().is_none());
+        let _error_result = propagate_linear_cpu(&with_error_plane, &with_error_plane_bounds)
+            .expect("backward with error plane");
+        assert!(
+            with_error_plane.weight_abs_faer.get().is_some(),
+            "the CPU backward must compose Σ err_in·|W| through the layer's cache"
+        );
+    }
+
+    /// #linear-abs-weight-cache lifetime. Clones SHARE the filled cell (the
+    /// cloned layer's inputs are the same weight), and the one supported
+    /// mutation boundary — `replace_parameters`, which `set_weight`/`set_bias`
+    /// both delegate to — commits through `*self = Self::new(..)`, so a stale
+    /// `|W|` cannot survive a parameter replacement.
+    #[test]
+    fn weight_abs_cache_is_shared_by_clones_and_replaced_with_the_parameters() {
+        let mut layer =
+            LinearLayer::new(arr2(&[[1.0_f32, -2.0], [-3.0, 4.0]]), None).expect("layer builds");
+        assert_eq!(layer.weight_abs_faer()[(0, 1)], 2.0);
+
+        let clone = layer.clone();
+        assert!(
+            clone.weight_abs_faer.get().is_some(),
+            "a clone must inherit the FILLED cell, matching the other lazy caches"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&layer.weight_abs_faer, &clone.weight_abs_faer),
+            "clones must share the cell, not copy its contents"
+        );
+
+        layer
+            .replace_parameters(arr2(&[[-9.0_f32, 0.5], [0.25, -0.125]]), None)
+            .expect("parameter replacement succeeds");
+        assert!(
+            layer.weight_abs_faer.get().is_none(),
+            "replace_parameters must leave a COLD |W| cell, never a stale one"
+        );
+        assert_eq!(layer.weight_abs_faer()[(0, 0)], 9.0);
+
+        // The clone kept the OLD parameters, so it must still see the OLD |W|:
+        // the replacement swapped the whole layer, it did not mutate a shared
+        // cell out from under an existing handle.
+        assert_eq!(clone.weight_abs_faer()[(0, 1)], 2.0);
     }
 }
 
@@ -4372,8 +5501,9 @@ mod engine_aware_macs_floor_tests {
         set_engine_aware_macs_floor_for_test(Some(false));
         let (a, w) = random_operands(9, 64, 64, 0x51D2_A77E);
         let deadline = Instant::now() + Duration::from_mins(1);
-        let (gated_a, gated_s) = super::aw_f64_with_abssum_and_deadline(&a, &w, Some(deadline))
-            .expect("sub-threshold deadline product");
+        let (gated_a, gated_s) =
+            super::aw_f64_with_abssum_and_deadline(&a, &w, None, Some(deadline))
+                .expect("sub-threshold deadline product");
         let (cpu_a, cpu_s) =
             // Review defect 7: compare against the SCALAR core, not the faer
             // path. Once the deadline arm became faer-backed, a faer-backed
@@ -4593,7 +5723,7 @@ mod engine_aware_macs_floor_tests {
         for kk in 0..k {
             let product = f64::from(a[(i, kk)]) * f64::from(w[(kk, j)]);
             let exact = BigRational::from_float(product).expect("finite exact product");
-            abs_sum += exact.clone().abs();
+            abs_sum += exact.abs();
             sum += exact;
         }
         (sum, abs_sum)
@@ -4643,7 +5773,7 @@ mod engine_aware_macs_floor_tests {
             aw_f64_with_abssum_cpu_deadline_scalar(&a, &w, deadline).expect("cpu reduction");
             // What production would actually run for this shape when armed.
             let (routed_aw, routed_s) =
-                aw_f64_with_abssum_deadline_via_engine_or_cpu(faer, &a, &w, deadline)
+                aw_f64_with_abssum_deadline_via_engine_or_cpu(faer, &a, &w, None, deadline)
                     .expect("routed product");
 
             let gamma = gamma_n_f64(k);
@@ -5099,7 +6229,7 @@ mod deadline_rounding_discipline_tests {
         let mut rng = SplitMix64(0x0C6A_00C1);
         let a = Mat::<f32>::from_fn(4, 96, |_, _| rng.signed(2.0));
         let w = Mat::<f32>::from_fn(96, 5, |_, _| rng.signed(1.0));
-        let (da, ds) = aw_f64_with_abssum_and_deadline(&a, &w, None).expect("unbounded A·W");
+        let (da, ds) = aw_f64_with_abssum_and_deadline(&a, &w, None, None).expect("unbounded A·W");
         let (ua, us) = aw_f64_with_abssum(&a, &w);
         for i in 0..4 {
             for j in 0..5 {
@@ -5239,3 +6369,349 @@ mod deadline_rounding_discipline_tests {
         value.to_f64().expect("exact reference fits f64 range")
     }
 }
+
+/// Engine-arm half of the #linear-widened-weight-cache moat: the layer-held
+/// ROW-MAJOR engine operands and the per-column `|W|` fold must publish the
+/// SAME BITS as the per-call rebuilds they replace, and the SHIPPED engine arm
+/// must actually consume them.
+#[cfg(test)]
+mod engine_weight_operands_tests {
+    use super::{
+        aw_via_engine, aw_via_engine_widened, daz_operand_flush_floor, weight_column_abs_sums,
+        LinearLayer,
+    };
+    use crate::faer_parallelism::FaerCpuGemmEngine;
+    use faer::Mat;
+    use ndarray::Array2;
+    use ny_core::GemmEngine;
+
+    /// The lever's own observable, plus bit parity.
+    ///
+    /// FAILS CLOSED: revert `aw_via_engine_widened` to always rebuild the
+    /// weight operands and every float below still matches, but the layer's
+    /// `engine_operands` cell stays empty and the fill assertion fails. The
+    /// parity half alone could never catch that.
+    #[test]
+    fn engine_arm_consumes_the_layer_cached_row_major_operands() {
+        // `k = 33` is deliberately not a multiple of the eight-row faer padding.
+        let (m, k, p) = (9usize, 33usize, 12usize);
+        let weight = Array2::<f32>::from_shape_fn((k, p), |(i, j)| {
+            (((i * 37 + j * 13) % 29) as f32 - 14.0) / 7.0
+        });
+        let layer = LinearLayer::new(weight, None).expect("test layer builds");
+        let a = Mat::<f32>::from_fn(m, k, |i, j| (((i * 11 + j * 5) % 19) as f32 - 9.0) / 3.0);
+        let engine = &FaerCpuGemmEngine as &dyn GemmEngine;
+
+        let cached = layer
+            .weight_widened_f64()
+            .expect("a 33x12 weight is far under the retention ceiling");
+        assert!(
+            cached.engine_operands.get().is_none(),
+            "the engine-operand cell must start empty, else the fill assertion is vacuous"
+        );
+
+        // The cache-free entry first: it must NOT populate the cell, so a fill
+        // observed after the widened call can only have come from that call.
+        let (reference_aw, reference_s) =
+            aw_via_engine(engine, &a, layer.weight_faer(), m, k, p).expect("faer engine reference");
+        assert!(
+            cached.engine_operands.get().is_none(),
+            "the cache-free entry must not populate the layer's cell"
+        );
+
+        let (fast_aw, fast_s) = aw_via_engine_widened(
+            engine,
+            &a,
+            layer.weight_faer(),
+            layer.weight_widened_f64(),
+            m,
+            k,
+            p,
+        )
+        .expect("faer engine cached arm");
+        let filled = cached
+            .engine_operands
+            .get()
+            .expect("the shipped engine arm must consult the cell")
+            .as_ref()
+            .expect("a 33x12 weight is admissible, so the fast lane must engage");
+        assert_eq!(filled.row_major.len(), k * p);
+        assert_eq!(filled.row_major_abs.len(), k * p);
+        assert_eq!(filled.column_abs_sums.len(), p);
+        assert_eq!(
+            filled.retained_bytes,
+            filled.row_major.len() * size_of::<f64>()
+                + filled.row_major_abs.len() * size_of::<f32>()
+                + filled.column_abs_sums.len() * size_of::<f64>(),
+            "the charge must equal the bytes actually retained, or Drop's refund drifts"
+        );
+
+        for i in 0..m {
+            for j in 0..p {
+                assert_eq!(
+                    fast_aw[[i, j]].to_bits(),
+                    reference_aw[[i, j]].to_bits(),
+                    "cached A·W diverged at [{i},{j}]"
+                );
+                assert_eq!(
+                    fast_s[[i, j]].to_bits(),
+                    reference_s[[i, j]].to_bits(),
+                    "cached S diverged at [{i},{j}]"
+                );
+            }
+        }
+
+        // Built once and shared, not rebuilt per call.
+        let again = layer
+            .weight_widened_f64()
+            .expect("the widening cache is still present")
+            .engine_operands(layer.weight_faer())
+            .expect("still admissible");
+        assert!(
+            std::ptr::eq(filled, again),
+            "the engine operands must be built once and shared"
+        );
+    }
+
+    /// A weight whose engine operands would push the layer's TOTAL retention
+    /// past `WIDENED_WEIGHT_CACHE_MAX_ENTRY_BYTES` is refused — and refusal is
+    /// free: the engine arm rebuilds per call and publishes the same bits.
+    ///
+    /// 500x500 = 250,000 elements. The parent entry charges
+    /// `(504*500 + 500*500) * 2 * 8 = 8,032,000` B, under the 8 MiB ceiling, so
+    /// the widening itself is admitted; the engine operands would add
+    /// `250,000*8 + 250,000*4 + 500*8 = 3,004,000` B, and `11,036,000 >
+    /// 8,388,608`. Re-derive both figures from the constants if this fails.
+    #[test]
+    fn engine_operands_over_the_entry_ceiling_are_refused_without_changing_bits() {
+        let (m, k, p) = (1usize, 500usize, 500usize);
+        let weight = Array2::<f32>::from_shape_fn((k, p), |(i, j)| {
+            (((i * 7 + j * 3) % 31) as f32 - 15.0) / 11.0
+        });
+        let layer = LinearLayer::new(weight, None).expect("test layer builds");
+        let a = Mat::<f32>::from_fn(m, k, |_, j| ((j % 23) as f32 - 11.0) / 5.0);
+        let engine = &FaerCpuGemmEngine as &dyn GemmEngine;
+
+        let cached = layer
+            .weight_widened_f64()
+            .expect("500x500 is under the widening entry ceiling");
+        let (reference_aw, reference_s) =
+            aw_via_engine(engine, &a, layer.weight_faer(), m, k, p).expect("faer engine reference");
+        let (fast_aw, fast_s) = aw_via_engine_widened(
+            engine,
+            &a,
+            layer.weight_faer(),
+            layer.weight_widened_f64(),
+            m,
+            k,
+            p,
+        )
+        .expect("faer engine cached arm");
+        assert!(
+            cached
+                .engine_operands
+                .get()
+                .expect("the arm must have consulted the cell")
+                .is_none(),
+            "the engine operands must be REFUSED at this size, not retained"
+        );
+        for i in 0..m {
+            for j in 0..p {
+                assert_eq!(
+                    fast_aw[[i, j]].to_bits(),
+                    reference_aw[[i, j]].to_bits(),
+                    "a refused cache must not change A·W at [{i},{j}]"
+                );
+                assert_eq!(
+                    fast_s[[i, j]].to_bits(),
+                    reference_s[[i, j]].to_bits(),
+                    "a refused cache must not change S at [{i},{j}]"
+                );
+            }
+        }
+    }
+
+    /// The cached per-column `|W|` fold is the identical f64 value, and a fold
+    /// that does not describe `p` columns FAILS CLOSED to recomputation rather
+    /// than being indexed.
+    #[test]
+    fn daz_floor_with_cached_column_sums_is_bit_identical() {
+        let (m, k, p) = (2usize, 3usize, 2usize);
+        // Subnormal / tiny-normal / large mix, as in the worst-case DAZ test.
+        let a_vals = [[1e-40f32, 2.0, 3.0], [0.5, 1e-38, 4.0]];
+        let w_vals = [[1e20f32, 2.0], [3.0, 1e-40], [5.0, 6.0]];
+        let a = Mat::<f32>::from_fn(m, k, |i, j| a_vals[i][j]);
+        let w = Mat::<f32>::from_fn(k, p, |i, j| w_vals[i][j]);
+
+        let reference = daz_operand_flush_floor(&a, &w, m, k, p, None);
+        let sums = weight_column_abs_sums(&w, k, p);
+        let cached = daz_operand_flush_floor(&a, &w, m, k, p, Some(&sums));
+        let short = daz_operand_flush_floor(&a, &w, m, k, p, Some(&sums[..p - 1]));
+        for i in 0..m {
+            for j in 0..p {
+                assert_eq!(
+                    cached[[i, j]].to_bits(),
+                    reference[[i, j]].to_bits(),
+                    "the cached column fold diverged at [{i},{j}]"
+                );
+                assert_eq!(
+                    short[[i, j]].to_bits(),
+                    reference[[i, j]].to_bits(),
+                    "a wrong-length fold must be recomputed, not indexed, at [{i},{j}]"
+                );
+            }
+        }
+    }
+}
+
+/// #vit-collector-throughput P3: the position-stacked certified `A·W` is
+/// BIT-IDENTICAL to the per-position loop on the CPU reducers — every
+/// published coefficient, bias and certified-error cell — with and without a
+/// layer bias, with and without an incoming coefficient-error plane, on the
+/// deadline-free and the deadline-bearing routes, and with the global-engine
+/// route allowed and forbidden. Shapes stay below `SOUND_F64_GEMM_MIN_MACS`
+/// (asserted), so no arm can reach the process-global engine, which is sound
+/// but not bit-identical by design.
+#[cfg(test)]
+mod position_stack_tests {
+    use super::super::layout::resolve_backward_layout;
+    use super::super::LinearLayer;
+    use super::{
+        position_stacked_aw, propagate_linear_cpu_with_deadline_and_stack, SOUND_F64_GEMM_MIN_MACS,
+    };
+    use crate::LinearBounds;
+    use ndarray::{Array1, Array2};
+    use std::time::{Duration, Instant};
+
+    /// SplitMix64: deterministic, dependency-free, bit-reproducible.
+    struct SplitMix(u64);
+
+    impl SplitMix {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn range(&mut self, lo: f32, hi: f32) -> f32 {
+            let unit = (self.next_u64() >> 40) as f32 / (1_u64 << 24) as f32;
+            lo + (hi - lo) * unit
+        }
+
+        fn coeff(&mut self) -> f32 {
+            if self.next_u64().is_multiple_of(8) {
+                0.0
+            } else {
+                self.range(-2.0, 2.0)
+            }
+        }
+    }
+
+    fn bits(bounds: &LinearBounds) -> Vec<u32> {
+        let mut out: Vec<u32> = bounds.lower_a().iter().map(|v| v.to_bits()).collect();
+        out.extend(bounds.upper_a().iter().map(|v| v.to_bits()));
+        out.extend(bounds.lower_b().iter().map(|v| v.to_bits()));
+        out.extend(bounds.upper_b().iter().map(|v| v.to_bits()));
+        out.push(u32::from(bounds.lower_a_err().is_some()));
+        out.push(u32::from(bounds.upper_a_err().is_some()));
+        for err in [bounds.lower_a_err(), bounds.upper_a_err()]
+            .into_iter()
+            .flatten()
+        {
+            out.extend(err.iter().map(|v| v.to_bits()));
+        }
+        out
+    }
+
+    #[test]
+    fn linear_position_stacked_backward_bit_identical_cpu() {
+        let mut rng = SplitMix(0x57AC_4ED0_2026_0926);
+        // (out_features, in_features, positions, rows, bias, incoming error)
+        let cases: &[(usize, usize, usize, usize, bool, bool)] = &[
+            // vit_2023 token-position Linear: 17 positions of a 48-wide layer.
+            (48, 48, 17, 5, true, true),
+            (48, 48, 17, 4, false, false),
+            // vit MLP expansion width.
+            (48, 192, 17, 3, true, true),
+            (7, 5, 2, 4, true, false),
+            (16, 8, 3, 3, false, true),
+        ];
+        let far = Instant::now() + Duration::from_secs(3600);
+        for (case, &(out_f, in_f, positions, rows, with_bias, with_err)) in cases.iter().enumerate()
+        {
+            let weight = Array2::from_shape_fn((out_f, in_f), |_| rng.range(-1.0, 1.0));
+            let bias = with_bias.then(|| Array1::from_shape_fn(out_f, |_| rng.range(-0.5, 0.5)));
+            let layer = LinearLayer::new(weight, bias).expect("well-formed layer");
+            let cols = positions * out_f;
+            let lower_a = Array2::from_shape_fn((rows, cols), |_| rng.coeff());
+            let upper_a = Array2::from_shape_fn((rows, cols), |_| rng.coeff());
+            let lower_b = Array1::from_shape_fn(rows, |_| rng.range(-1.0, 1.0));
+            let upper_b = Array1::from_shape_fn(rows, |_| rng.range(-1.0, 1.0));
+            let bounds = if with_err {
+                let lower_err = Array2::from_shape_fn((rows, cols), |_| rng.range(0.0, 1e-5));
+                let upper_err = Array2::from_shape_fn((rows, cols), |_| rng.range(0.0, 1e-5));
+                LinearBounds::new_or_conservative_with_err(
+                    lower_a, lower_b, upper_a, upper_b, lower_err, upper_err,
+                )
+                .expect("well-formed bounds")
+            } else {
+                LinearBounds::new(lower_a, lower_b, upper_a, upper_b).expect("well-formed bounds")
+            };
+            // Precondition: every arm stays on a CPU reducer.
+            assert!(2 * rows * positions * out_f * in_f < SOUND_F64_GEMM_MIN_MACS);
+            let layout = resolve_backward_layout(rows, cols, out_f, in_f).expect("layout");
+            assert_eq!(layout.num_positions, positions);
+
+            for (deadline, allow_global) in [
+                (None, true),
+                (None, false),
+                (Some(far), true),
+                (Some(far), false),
+            ] {
+                let label = format!(
+                    "case {case} deadline={} allow_global={allow_global}",
+                    deadline.is_some()
+                );
+                // The stack must ENGAGE here: a decline would compare the
+                // per-position loop with itself.
+                assert!(
+                    position_stacked_aw(&layer, &bounds, &layout, deadline, allow_global)
+                        .expect("stacked A·W")
+                        .is_some(),
+                    "{label}: the position stack declined"
+                );
+                let per_position = propagate_linear_cpu_with_deadline_and_stack(
+                    &layer,
+                    &bounds,
+                    deadline,
+                    allow_global,
+                    false,
+                )
+                .expect("per-position loop");
+                let stacked = propagate_linear_cpu_with_deadline_and_stack(
+                    &layer,
+                    &bounds,
+                    deadline,
+                    allow_global,
+                    true,
+                )
+                .expect("position-stacked");
+                assert_eq!(
+                    bits(&per_position),
+                    bits(&stacked),
+                    "{label}: the stacked backward differs from the per-position loop"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "crown_single/cooperative_work_tests.rs"]
+mod cooperative_work_tests;
+
+#[cfg(test)]
+#[path = "crown_single/sequence_error_tests.rs"]
+mod sequence_error_tests;

@@ -55,7 +55,7 @@ impl BetaCrownVerifier {
     /// Check timeout and domain limit termination conditions.
     ///
     /// `bab_timeout` is the budget the BaB loop derived at entry: wall-clock
-    /// deadline aware (#4321) and minus the post-BaB PGD reservation (#4095), so
+    /// deadline aware and minus the post-BaB PGD reservation, so
     /// the loop stops early enough for post-BaB PGD to get its reserved time.
     /// Recomputing it here from `config.timeout` (as this used to) re-granted BaB
     /// a fresh full budget measured from loop entry, ignoring wall-clock time

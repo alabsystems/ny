@@ -26,7 +26,6 @@ impl PReluLayer {
     ///
     /// Returns an error if `slope` is empty, since `get_slope()` indexes
     /// with modulo by `slope.len()` which would panic on zero.
-    /// Part of #2865.
     pub fn new(slope: Array1<f32>) -> Result<Self> {
         if slope.is_empty() {
             return Err(NyError::InvalidSpec(
@@ -59,7 +58,7 @@ impl PReluLayer {
         }
     }
 
-    /// Compute per-channel spatial stride via shared helper. Part of #4169.
+    /// Compute per-channel spatial stride via shared helper.
     fn per_channel_stride(&self, total_elements: usize) -> Result<usize> {
         crate::layers::common::per_channel::per_channel_spatial_stride(
             total_elements,
@@ -72,7 +71,7 @@ impl PReluLayer {
     ///
     /// Maps `flat_idx / stride` to the channel index, which is correct for
     /// inputs with spatial dimensions (row-major layout: elements within a
-    /// channel are contiguous). Part of #4169.
+    /// channel are contiguous).
     #[inline]
     fn slope_for_flat(&self, flat_idx: usize, stride: usize) -> f32 {
         if self.slope.len() == 1 {
@@ -90,7 +89,7 @@ impl PReluLayer {
 /// directed rounding to ensure the bound is sound after f32 conversion.
 ///
 /// When alpha <= 1 the function is convex at origin (chord is upper bound);
-/// when alpha > 1 it is concave (chord is lower bound). Part of #3313.
+/// when alpha > 1 it is concave (chord is lower bound).
 pub(super) fn prelu_crossing_relaxation(l: f32, u: f32, alpha: f32) -> LinearRelaxation {
     let l_f64 = l as f64;
     let u_f64 = u as f64;
@@ -215,7 +214,6 @@ impl BoundPropagation for PReluLayer {
 
         // Per-channel slope: compute stride so flat index maps to correct channel.
         // For [C, T] input with C-channel slope, stride = T, channel = i / T.
-        // Part of #4168.
         let stride = self.per_channel_stride(flat_lower.len())?;
         for i in 0..flat_lower.len() {
             let slope = self.slope_for_flat(i, stride);
@@ -243,7 +241,6 @@ impl BoundPropagation for PReluLayer {
                 // For x >= 0: PReLU(x) = x >= 0.
                 // True minimum is 0 at x=0; true maximum is max(slope*l, u) at endpoints.
                 // Previous code incorrectly included slope*u (slope applied to positive x).
-                // Part of #1914.
                 lower[i] = 0.0;
                 upper[i] = nan_propagating_max(slope * l, u);
             }
@@ -285,7 +282,7 @@ impl PReluLayer {
     ///
     /// Computes per-channel stride from `pre_activation.len()` before building
     /// the relaxation closure, so each flat neuron index maps to the correct
-    /// channel slope even for spatial inputs (`[C, H, W]`). Part of #4168.
+    /// channel slope even for spatial inputs (`[C, H, W]`).
     #[inline]
     pub fn propagate_linear_with_bounds(
         &self,
@@ -303,7 +300,6 @@ impl PReluLayer {
     /// Batched CROWN backward propagation with pre-activation bounds (stride-based).
     ///
     /// Same stride-based channel mapping as `propagate_linear_with_bounds`.
-    /// Part of #4168.
     #[inline]
     pub fn propagate_linear_batched_with_bounds(
         &self,

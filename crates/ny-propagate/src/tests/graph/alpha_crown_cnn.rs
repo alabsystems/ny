@@ -196,7 +196,7 @@ fn build_deep_conv2d_2relu_graph() -> (Network, GraphNetwork, BoundedTensor) {
     (network, graph, input)
 }
 
-/// Regression test for #3293: alpha-CROWN on Conv2d graph uses Patches mode.
+/// Regression test: alpha-CROWN on Conv2d graph uses Patches mode.
 #[ntest::timeout(60000)]
 #[test]
 fn test_graph_alpha_crown_conv2d_patches_mode_3293() {
@@ -213,7 +213,7 @@ fn test_graph_alpha_crown_conv2d_patches_mode_3293() {
     eprintln!("#3293 Conv2d (1-ReLU): IBP={ibp_width:.6}, CROWN={crown_width:.6}, alpha-CROWN={alpha_width:.6}, improvement={pct:.2}%");
 }
 
-/// Regression test for #3293 Approach B: alpha-CROWN on deep CNN with 2 ReLU layers.
+/// Regression test Approach B: alpha-CROWN on deep CNN with 2 ReLU layers.
 ///
 /// Validates chain-rule gradient propagation through multiple Patches layers.
 /// Expected improvement > 0.06% (the vacuous 1-ReLU baseline).
@@ -237,8 +237,6 @@ fn test_graph_alpha_crown_deep_cnn_2relu_3293() {
 ///
 /// Uses deterministic xorshift64 RNG from the seed to generate kernel weights.
 /// Input shape: [1, 5, 5], epsilon: 0.3 (wide enough for many unstable neurons).
-///
-/// Part of #3293 verification plan step 4.
 fn build_random_2relu_cnn(seed: u64) -> (Network, GraphNetwork, BoundedTensor) {
     let mut rng = seed;
     let mut next_f32 = |lo: f32, hi: f32| -> f32 {
@@ -287,7 +285,7 @@ fn build_random_2relu_cnn(seed: u64) -> (Network, GraphNetwork, BoundedTensor) {
     (network, graph, input)
 }
 
-/// Design doc Step 3 (#3293): Verify AnalyticChain chain-rule gradients are
+/// Verify AnalyticChain chain-rule gradients are
 /// non-zero for Patches-mode CNN ReLUs.
 ///
 /// Previous tests use the default SPSA gradient method. This test directly
@@ -299,8 +297,6 @@ fn build_random_2relu_cnn(seed: u64) -> (Network, GraphNetwork, BoundedTensor) {
 /// storage fix (backward.rs:244-256). If intermediates were not stored for
 /// Patches-mode ReLUs, `compute_graph_chain_rule_gradients` would return zeros
 /// and alpha values would never update.
-///
-/// Reference: designs/2026-03-04-alpha-gradient-patches-alternative.md Step 3
 #[ntest::timeout(60000)]
 #[test]
 fn test_analytic_chain_cnn_patches_gradient_nonzero_3293() {
@@ -336,10 +332,10 @@ fn test_analytic_chain_cnn_patches_gradient_nonzero_3293() {
     );
 
     // Key assertion: AnalyticChain gradients must be non-zero for Patches ReLUs.
-    // If the Patches→Dense intermediate storage (#3293 Approach B) works correctly,
+    // If the Patches→Dense intermediate storage works correctly,
     // chain-rule gradients guide alpha optimization to strictly tighter bounds.
     // For 2-ReLU CNNs, multi-layer chain-rule chaining gives measurable improvement
-    // (observed: ~3.7%). Threshold at 1.0% per design doc verification plan.
+    // (observed: ~3.7%). Threshold at 1.0%.
     let improvement_pct = if crown_width > 0.0 {
         (1.0 - alpha_width / crown_width) * 100.0
     } else {
@@ -360,8 +356,6 @@ fn test_analytic_chain_cnn_patches_gradient_nonzero_3293() {
 ///
 /// Simpler case: single Conv2d → ReLU → Conv2d. Tests that Patches→Dense
 /// intermediate storage works even with a single ReLU layer.
-///
-/// Part of #3293 Step 3.
 #[ntest::timeout(60000)]
 #[test]
 fn test_analytic_chain_cnn_1relu_gradient_nonzero_3293() {
@@ -431,7 +425,7 @@ proptest! {
 
     /// Proptest: alpha-CROWN on random Patches-mode 2-ReLU CNNs is sound.
     ///
-    /// Verifies design doc step 4 (#3293): for any CNN with Patches-mode ReLUs,
+    /// Verifies that, for any CNN with Patches-mode ReLUs,
     /// alpha-CROWN produces bounds that are:
     /// 1. At least as tight as CROWN (alpha optimization doesn't worsen bounds)
     /// 2. Sound (concrete outputs within computed bounds)
@@ -439,9 +433,6 @@ proptest! {
     /// Indirectly validates that AnalyticChain gradients are non-zero for Patches
     /// ReLUs, because zero gradients would mean alpha stays at initialization and
     /// alpha-CROWN = CROWN exactly. Any improvement demonstrates working gradients.
-    ///
-    /// Reference: designs/2026-03-04-alpha-gradient-patches-alternative.md
-    /// Part of #3293
     #[ntest::timeout(60000)]
     #[test]
     fn proptest_alpha_crown_patches_2relu_soundness(seed in any::<u64>()) {

@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Kokoro duration predictor verification tests for #3497.
+//! Kokoro duration predictor verification tests.
 //!
 //! The Kokoro duration predictor outputs `duration_logits [B, T, 50]` where
 //! the 50 channels are independent Bernoulli bins. Expected duration is
@@ -23,7 +23,6 @@
 //!    exercised separately by the loader tests.
 //!
 //! Sources:
-//! - designs/2026-03-11-avoice-phase1-onnx-execution.md (section 4)
 //! - `./avoice/scripts/export_kokoro_onnx.py` (output shape)
 //! - `./avoice/crates/avoice-tts/src/kokoro/model_ops.rs`
 

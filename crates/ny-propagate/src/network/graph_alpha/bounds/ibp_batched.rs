@@ -348,7 +348,7 @@ impl GraphNetwork {
             };
 
             // Same firewall, same position, same context string as the
-            // reference (#3768).
+            // reference.
             check_nan_firewall(
                 &output_bounds,
                 "collect_node_bounds",

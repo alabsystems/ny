@@ -6,12 +6,8 @@
 //!
 //! Method and evidence: `docs/BNN_SIGN_SPACE_FALSIFICATION_2026-08-12.md`.
 //!
-//! # Status: default-off, UNWIRED, SAT-only
-//!
-//! Nothing outside this module's own `#[cfg(test)]` oracle calls
-//! [`falsify_bnn_sign_suffix_unwired`]. It is not reachable from any verifier
-//! command or verdict path, mirroring the posture of
-//! [`crate::verified_sdp_bound`] and [`crate::certified_box64`].
+//! The CLI's sign-space lane calls this search through the re-exported
+//! `falsify_bnn_sign_suffix_unwired` API; the historical suffix is retained.
 //!
 //! [`SignSpaceOutcome`] **has no `Verified`/`Unsat` variant by construction**,
 //! exactly as [`crate::solver::OneSidedSatDecline`] has none: a falsifier can

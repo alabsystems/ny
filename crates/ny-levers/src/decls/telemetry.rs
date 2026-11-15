@@ -100,8 +100,10 @@ const SEG_PROBE_READERS: &[ReaderSite] = &[
 ];
 
 /// `NY_PHASE_TELEMETRY` is the one deliberately-shared name in this batch:
-/// five read sites across three packages, all printing complementary phase
+/// four read sites across three packages, all printing complementary phase
 /// markers under the SAME switch so one variable arms the whole timing lane.
+/// (A fifth, the SafeNLP direct-first route markers in beta-crown dispatch,
+/// went with that category-keyed, env-dark route in #name-blind-routing.)
 const PHASE_TELEMETRY_READERS: &[ReaderSite] = &[
     ReaderSite {
         scope: PHASE_TELEMETRY_SCOPE,
@@ -138,15 +140,6 @@ const PHASE_TELEMETRY_READERS: &[ReaderSite] = &[
         role: "post-command CUDA deadline-GEMM aggregate line (still a raw \
                `env::var` read; migrates with batch B3)",
         site: "crates/ny-cli/src/main.rs:178",
-    },
-    ReaderSite {
-        scope: Scope {
-            package: "ny-cli",
-            subsystem: "beta-crown-dispatch",
-        },
-        role: "SafeNLP direct-first route markers (still a raw `env::var_os` \
-               read; migrates with batch B3)",
-        site: "crates/ny-cli/src/commands/beta_crown/dispatch.rs:460",
     },
 ];
 

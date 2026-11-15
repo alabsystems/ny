@@ -23,7 +23,12 @@ pub(crate) mod crown_batched_soa;
 pub(crate) mod crown_single;
 mod ibp;
 mod layout;
+#[allow(dead_code)]
+pub(crate) mod original_affine;
+mod point;
 mod spectral;
+
+pub use point::{LinearPointArm, LinearPointReceipt};
 
 /// Re-export of the f64 dot-product growth factor `γ_n` used by the conv2d
 /// CROWN-backward error path (#vnncomp-aw-soundness).
@@ -102,6 +107,46 @@ pub struct LinearLayer {
     weight_t_rm: std::sync::Arc<std::sync::OnceLock<Vec<f32>>>,
     w_pos_t_rm: std::sync::Arc<std::sync::OnceLock<Vec<f32>>>,
     w_neg_t_rm: std::sync::Arc<std::sync::OnceLock<Vec<f32>>>,
+    /// Lazily cached f64 widening of `weight_faer` — `W` and `|W|`, in both the
+    /// owned-`Mat` and packed column-major layouts the certified `A·W` +
+    /// `|A|·|W|` kernels consume (#linear-widened-weight-cache). Same defect and
+    /// same remedy as the three transpose caches above: `crown_single`'s
+    /// chunked, unbounded and rebound-scratch arms each rebuilt TWO full f64
+    /// copies of the entire weight per call, and that call is reached once per
+    /// Linear layer per domain per backward pass. `None` inside the cell means
+    /// the weight is too large to retain (the ceiling the faer path already
+    /// declines at), so those calls keep widening per call. `Arc<OnceLock<..>>`
+    /// keeps the clone/cache-sharing semantics of the fields above, and rests on
+    /// the same invariant: `weight` is immutable after construction. Lazy, so a
+    /// layer no certified f64 path ever touches pays no memory.
+    weight_f64: std::sync::Arc<std::sync::OnceLock<Option<crown_single::WidenedWeightF64>>>,
+    /// Lazily cached `|W|` as an owned faer `Mat<f32>`
+    /// (#linear-abs-weight-cache) — the operand every certified incoming-error
+    /// composition `P[i,j] = Σ_k err_in[i,k]·|W[k,j]|` contracts against. Six
+    /// production backward sites (two in `crown_single`, three in
+    /// `crown_batched`, one in `crown_batched_multi_domain`) each rebuilt this
+    /// whole `out_features × in_features` matrix on EVERY call, hoisted out of
+    /// their inner position/batch loop but not out of the call, and each of
+    /// those calls is reached once per Linear layer per domain per backward
+    /// pass. Same invariant as the four cells above: `weight` — hence
+    /// `weight_faer` — is immutable after construction, and the one supported
+    /// mutation boundary ([`Self::replace_parameters`], which `set_weight` and
+    /// `set_bias` both delegate to) commits through `*self = Self::new(..)`, so
+    /// this cell is replaced with the parameters rather than surviving them.
+    ///
+    /// No retention ceiling, unlike `weight_f64`, and deliberately so: this is
+    /// ONE more f32 copy of the weight beside the six the constructor already
+    /// retains unconditionally (`weight`, `w_pos`, `w_neg`, `w_pos_t_faer`,
+    /// `w_neg_t_faer`, `weight_faer`), so it cannot introduce a resident-memory
+    /// class the layer does not already have. `weight_f64` retains four f64
+    /// copies — eight times the weight, and a class of its own — which is why
+    /// it needs the per-entry and process-total gates and this does not.
+    ///
+    /// Lazy, and read ONLY from inside the `Some(err_in)` arms at all six
+    /// sites: a call whose incoming bounds carry no certified-error plane
+    /// allocated and filled the whole matrix and dropped it unused, and now
+    /// does not build it at all.
+    weight_abs_faer: std::sync::Arc<std::sync::OnceLock<Mat<f32>>>,
 }
 
 impl Clone for LinearLayer {
@@ -125,6 +170,8 @@ impl Clone for LinearLayer {
             weight_t_rm: self.weight_t_rm.clone(),
             w_pos_t_rm: self.w_pos_t_rm.clone(),
             w_neg_t_rm: self.w_neg_t_rm.clone(),
+            weight_f64: self.weight_f64.clone(),
+            weight_abs_faer: self.weight_abs_faer.clone(),
         }
     }
 }
@@ -143,6 +190,28 @@ fn transpose_to_row_major_vec_of(array: &Array2<f32>) -> Vec<f32> {
     transposed
 }
 
+fn linear_bytes_add(a: usize, b: usize) -> Result<usize> {
+    a.checked_add(b)
+        .ok_or_else(|| NyError::InvalidSpec("Linear allocation size overflow".into()))
+}
+fn linear_bytes_mul(a: usize, b: usize) -> Result<usize> {
+    a.checked_mul(b)
+        .ok_or_else(|| NyError::InvalidSpec("Linear allocation size overflow".into()))
+}
+fn faer_f32_bytes_bound(rows: usize, columns: usize) -> Result<usize> {
+    // Qualified to faer 0.24's 64-byte row alignment for owned f32 matrices.
+    let padded = rows
+        .checked_next_multiple_of(16)
+        .ok_or_else(|| NyError::InvalidSpec("Linear faer padding overflow".into()))?;
+    linear_bytes_mul(linear_bytes_mul(padded, columns)?, 4)
+}
+fn faer_f32_payload_bytes(matrix: &Mat<f32>) -> Result<usize> {
+    // These private matrices are built from_fn/clone, never reserve extra cols.
+    let stride = usize::try_from(matrix.col_stride())
+        .map_err(|_| NyError::InvalidSpec("Linear faer negative stride".into()))?;
+    linear_bytes_mul(linear_bytes_mul(stride, matrix.ncols())?, 4)
+}
+
 impl std::fmt::Debug for LinearLayer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LinearLayer")
@@ -156,13 +225,134 @@ impl std::fmt::Debug for LinearLayer {
 }
 
 impl LinearLayer {
+    /// Retained requested bytes, including padded faer storage and every filled
+    /// lazy cache. Shared Arc cache owners are attributed to each layer here;
+    /// callers counting cloned layers may conservatively count them twice.
+    /// This census excludes allocator bookkeeping/slack and is not process RSS.
+    pub fn retained_bytes(&self) -> Result<usize> {
+        let mut bytes = Self::allocation_control_bytes()?;
+        for n in [
+            self.weight.retained_payload_bytes()?,
+            self.w_pos.retained_payload_bytes()?,
+            self.w_neg.retained_payload_bytes()?,
+            self.row_l2_norms.retained_payload_bytes()?,
+            self.bias
+                .as_ref()
+                .map_or(Ok(0), |a| a.retained_payload_bytes())?,
+        ] {
+            bytes = linear_bytes_add(bytes, n)?;
+        }
+        for m in [&self.w_pos_t_faer, &self.w_neg_t_faer, &self.weight_faer] {
+            bytes = linear_bytes_add(bytes, faer_f32_payload_bytes(m)?)?;
+        }
+        for cell in [&self.weight_t_rm, &self.w_pos_t_rm, &self.w_neg_t_rm] {
+            if let Some(values) = cell.get() {
+                bytes = linear_bytes_add(bytes, linear_bytes_mul(values.capacity(), 4)?)?;
+            }
+        }
+        if let Some(Some(values)) = self.weight_f64.get() {
+            bytes = linear_bytes_add(
+                bytes,
+                values.retained_payload_bytes().ok_or_else(|| {
+                    NyError::InvalidSpec("Linear widened-cache census overflow".into())
+                })?,
+            )?;
+        }
+        if let Some(m) = self.weight_abs_faer.get() {
+            bytes = linear_bytes_add(bytes, faer_f32_payload_bytes(m)?)?;
+        }
+        Ok(bytes)
+    }
+
+    fn allocation_control_bytes() -> Result<usize> {
+        // Include the inline owner plus every Arc control/OnceLock allocation.
+        // Rust's control prefix has two usize counters; round up for alignment.
+        let arc = |payload: usize| linear_bytes_add(payload, 3 * size_of::<usize>());
+        let vec_cell = arc(size_of::<std::sync::OnceLock<Vec<f32>>>())?;
+        let wide_cell = arc(size_of::<
+            std::sync::OnceLock<Option<crown_single::WidenedWeightF64>>,
+        >())?;
+        let abs_cell = arc(size_of::<std::sync::OnceLock<Mat<f32>>>())?;
+        linear_bytes_add(
+            size_of::<Self>(),
+            linear_bytes_add(
+                linear_bytes_mul(vec_cell, 3)?,
+                linear_bytes_add(wide_cell, abs_cell)?,
+            )?,
+        )
+    }
+
+    /// Conservative retained capacity BEFORE constructing a fresh layer and
+    /// running point/IBP forwards: all six constructor copies, row norms/bias,
+    /// padded faer rows, three f32 transpose caches and the f32 absolute cache.
+    /// Certified backward's optional f64 caches require separate admission.
+    pub fn point_retained_bytes_bound(out: usize, inner: usize, bias: bool) -> Result<usize> {
+        let weights = linear_bytes_mul(linear_bytes_mul(out, inner)?, 4)?;
+        let transpose = faer_f32_bytes_bound(inner, out)?;
+        let original = faer_f32_bytes_bound(out, inner)?;
+        let arrays = linear_bytes_add(
+            linear_bytes_mul(weights, 6)?,
+            linear_bytes_mul(out, if bias { 8 } else { 4 })?,
+        )?;
+        linear_bytes_add(
+            Self::allocation_control_bytes()?,
+            linear_bytes_add(
+                arrays,
+                linear_bytes_add(
+                    linear_bytes_mul(transpose, 2)?,
+                    linear_bytes_mul(original, 2)?,
+                )?,
+            )?,
+        )
+    }
+
+    /// Construction overlap: the graph builder deep-clones its temporary layer,
+    /// conversion can copy parameters twice, and spectral norm retains one f64
+    /// column sum per input. Full retained graph capacity is charged separately.
+    pub fn construction_scratch_bytes_bound(out: usize, inner: usize, bias: bool) -> Result<usize> {
+        linear_bytes_add(
+            Self::point_retained_bytes_bound(out, inner, bias)?,
+            linear_bytes_add(
+                linear_bytes_mul(linear_bytes_mul(out, inner)?, 8)?,
+                linear_bytes_mul(inner, 8)?,
+            )?,
+        )
+    }
+
+    /// Constructor maps/copies, spectral/Frobenius/induced sums and row norms.
+    /// There is no SVD: spectral scratch is O(inner), work is O(out*inner).
+    pub fn construction_work_bound(out: usize, inner: usize) -> Result<u64> {
+        let work = linear_bytes_add(
+            linear_bytes_mul(linear_bytes_mul(out, inner)?, 32)?,
+            linear_bytes_mul(linear_bytes_add(out, inner)?, 8)?,
+        )?;
+        u64::try_from(work)
+            .map_err(|_| NyError::InvalidSpec("Linear construction work overflow".into()))
+    }
+
+    /// Temporary padded faer products and ndarray copies simultaneously live in
+    /// the N-D IBP path used by the concrete graph route. Graph cache endpoints
+    /// and the retained lazy caches are charged by their separate owners.
+    pub fn point_scratch_bytes_bound(out: usize, inner: usize, rows: usize) -> Result<usize> {
+        let copies = linear_bytes_mul(linear_bytes_mul(rows, linear_bytes_add(out, inner)?)?, 32)?;
+        let inputs = linear_bytes_mul(faer_f32_bytes_bound(rows, inner)?, 4)?;
+        let outputs = linear_bytes_mul(faer_f32_bytes_bound(rows, out)?, 8)?;
+        let absolute_products = linear_bytes_add(
+            faer_f32_bytes_bound(inner, rows)?,
+            faer_f32_bytes_bound(out, rows)?,
+        )?;
+        linear_bytes_add(
+            copies,
+            linear_bytes_add(inputs, linear_bytes_add(outputs, absolute_products)?)?,
+        )
+    }
+
     /// Create a new linear layer from weight matrix and optional bias.
     /// Precomputes W+, W-, their transposes as faer matrices, and spectral norm for fast IBP.
     pub fn new(weight: Array2<f32>, bias: Option<Array1<f32>>) -> Result<Self> {
         // Ensure weight is C-contiguous (standard layout) for GEMM engine paths
         // that require as_slice(). ndarray 0.17 clone() preserves F-layout, so
         // weights from const-fold or from_dynamic may arrive non-contiguous.
-        // Ref: #4221, design doc 2026-03-20-issue-4221-linear-weight-contiguity-guard.md
         let weight = if weight.is_standard_layout() {
             weight
         } else {
@@ -177,7 +367,7 @@ impl LinearLayer {
             }
         }
         // Precompute W+ and W- for IBP (big speedup - avoids recomputing every call)
-        // Use NaN-propagating variants so NaN weights poison bounds (#2432).
+        // Use NaN-propagating variants so NaN weights poison bounds.
         let w_pos = weight.mapv(nan_propagating_max_zero);
         let w_neg = weight.mapv(nan_propagating_min_zero);
 
@@ -225,6 +415,8 @@ impl LinearLayer {
             weight_t_rm: std::sync::Arc::new(std::sync::OnceLock::new()),
             w_pos_t_rm: std::sync::Arc::new(std::sync::OnceLock::new()),
             w_neg_t_rm: std::sync::Arc::new(std::sync::OnceLock::new()),
+            weight_f64: std::sync::Arc::new(std::sync::OnceLock::new()),
+            weight_abs_faer: std::sync::Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -246,6 +438,63 @@ impl LinearLayer {
     pub(super) fn w_neg_t_row_major(&self) -> &[f32] {
         self.w_neg_t_rm
             .get_or_init(|| transpose_to_row_major_vec_of(&self.w_neg))
+    }
+
+    /// The f64 widening of [`Self::weight_faer`], built once on first use and
+    /// shared across clones (#linear-widened-weight-cache). `None` when the
+    /// weight exceeds the retention ceiling, in which case the certified `A·W`
+    /// kernels widen per call exactly as they always did.
+    ///
+    /// Value-identical to widening in the kernel: `f32→f64` is EXACT and f64
+    /// `abs` clears the sign bit, so the cached operands are the same bits in
+    /// the same layout. See [`crown_single::WidenedWeightF64`].
+    ///
+    /// DEADLINE COST OF FIRST USE. Callers evaluate this as an ARGUMENT, so the
+    /// one-time build runs before the callee's first `poll()`. Every subsequent
+    /// call for the layer gets strictly MORE deadline headroom (it no longer
+    /// widens at all), but the first pays the build in one unpolled stretch.
+    /// That stretch is bounded by `WIDENED_WEIGHT_CACHE_MAX_ENTRY_BYTES` (8
+    /// MiB, `crown_single`) — a weight above it is refused and never built —
+    /// which is a fraction of the work in one `DEADLINE_AW_FAER_CHUNK_MACS`
+    /// quantum, the granularity the chunked arm already treats as an acceptable
+    /// gap between polls. So it is accounted for rather than machinery-fixed:
+    /// tightening the ceiling tightens this bound with it.
+    pub(crate) fn weight_widened_f64(&self) -> Option<&crown_single::WidenedWeightF64> {
+        self.weight_f64
+            .get_or_init(|| crown_single::WidenedWeightF64::new(&self.weight_faer))
+            .as_ref()
+    }
+
+    /// `|W|` as an owned faer `Mat<f32>`, built once on first use and shared
+    /// across clones (#linear-abs-weight-cache). Shape is
+    /// `[out_features, in_features]`, i.e. [`Self::weight_faer`]'s own shape.
+    ///
+    /// BIT-IDENTICAL to the per-call
+    /// `Mat::<f32>::from_fn(rows, cols, |k, j| weight_faer[(k, j)].abs())` it
+    /// replaced. `f32::abs` clears the sign bit and rounds nothing, the operand
+    /// is the same immutable `weight_faer`, and the constructor, dimensions and
+    /// fill order are the ones each call site used: every site's `(rows, cols)`
+    /// resolves to `(weight_faer.nrows(), weight_faer.ncols())` — the scalar
+    /// and multi-domain sites through `resolve_backward_layout`, which yields
+    /// `out_features == weight_rows` on BOTH of its branches, and the batched
+    /// sites through the entry check that refuses any
+    /// `mid_dim != layer.out_features()`.
+    ///
+    /// LAYOUT is preserved (an owned `Mat` from the identical constructor), and
+    /// independently cannot matter here: the only consumers are
+    /// `crown_single::incoming_error_product`'s two arms, which read
+    /// `nrows()`/`ncols()` and individual `w_abs[(k, j)]` elements and copy
+    /// them into a freshly built `Vec<f64>` before any `matmul`. No faer kernel
+    /// ever observes this matrix's own storage, so faer's layout-driven kernel
+    /// selection has nothing to key on.
+    pub(super) fn weight_abs_faer(&self) -> &Mat<f32> {
+        self.weight_abs_faer.get_or_init(|| {
+            Mat::<f32>::from_fn(
+                self.weight_faer.nrows(),
+                self.weight_faer.ncols(),
+                |k, j| self.weight_faer[(k, j)].abs(),
+            )
+        })
     }
 
     /// Create from a flat row-major weight buffer and optional flat bias.
@@ -437,9 +686,9 @@ impl LinearLayer {
         crown_single::propagate_linear_with_engine(self, bounds, engine)
     }
 
-    /// Deadline-aware CROWN backward propagation (#4321).
+    /// Deadline-aware CROWN backward propagation.
     ///
-    /// ROUTING (#pollable-faer status, 2026-08-19). When a deadline is
+    /// ROUTING (#pollable-faer). When a deadline is
     /// present, the dense `A @ W` + `|A|·|W|` pair runs on the pollable
     /// row-block-chunked faer host path
     /// (`crown_single::aw_f64_with_abssum_cpu_deadline`, restored by

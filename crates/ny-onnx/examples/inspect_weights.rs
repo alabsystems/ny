@@ -4,7 +4,7 @@
 
 //! Example: Inspect weights in a PyTorch model file.
 //!
-//! Usage: cargo run --example inspect_weights --features pytorch -- <model_path>
+//! Usage: targo --unverified run --example inspect_weights --features pytorch -- <model_path>
 
 use std::env;
 

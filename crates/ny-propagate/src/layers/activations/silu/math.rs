@@ -79,7 +79,6 @@ pub(crate) fn silu_critical_point() -> f32 {
 ///   2 + x(1 - 2σ(x)) = 0
 ///
 /// Left inflection p₁ ≈ -2.3994, right inflection p₂ ≈ +2.3994.
-/// Reference: designs/2026-02-08-silu-crown-relaxation.md, "Key points" table.
 pub(crate) fn silu_inflection_points() -> (f32, f32) {
     *SILU_INFLECTION_POINTS.get_or_init(|| {
         // f(x) = 2 + x(1 - 2σ(x))
@@ -129,9 +128,9 @@ pub(crate) fn silu_inflection_points() -> (f32, f32) {
 /// intermediate evaluation BEFORE min/max selection. Plain `as f32` rounds to
 /// nearest — a candidate min could round UP, causing the final min to miss the
 /// true minimum. next_down/next_up on the final result alone cannot recover if
-/// the wrong candidate was selected. (#3245, #3336)
+/// the wrong candidate was selected.
 ///
-/// Ref: GELU (#3336) and f64→f32 cast (#3132) directed rounding fixes.
+/// Ref: GELU and f64→f32 cast directed rounding fixes.
 pub(crate) fn silu_min_max(l: f32, u: f32) -> (f32, f32) {
     let fl = silu_eval_f64(l as f64) as f32;
     let fu = silu_eval_f64(u as f64) as f32;
@@ -152,7 +151,7 @@ pub(crate) fn silu_min_max(l: f32, u: f32) -> (f32, f32) {
 
 /// Evaluate SiLU in f64 to avoid catastrophic cancellation in chord slope.
 /// SiLU(x) = x · σ(x) where σ is the logistic sigmoid.
-/// Used by relaxation.rs for f64-precision verification checks (#2434).
+/// Used by relaxation.rs for f64-precision verification checks.
 #[inline]
 pub(crate) fn silu_eval_f64(x: f64) -> f64 {
     if !x.is_finite() {
@@ -182,7 +181,7 @@ pub(crate) fn silu_eval_f64(x: f64) -> f64 {
 /// - `upper_intercept`: guaranteed `slope*x + upper_intercept >= true_chord(x)` ∀x∈[l,u]
 ///
 /// Ref: Exp (exp.rs:119-125), ELU (elu.rs:121-124) directed rounding pattern.
-/// Fixes: #2434 — SiLU chord used raw `as f32` without directed rounding.
+/// Previously the SiLU chord used raw `as f32` without directed rounding.
 #[inline]
 pub(crate) fn silu_chord(l: f32, u: f32) -> (f32, f32, f32) {
     debug_assert!(
@@ -224,7 +223,7 @@ pub(crate) fn silu_chord(l: f32, u: f32) -> (f32, f32, f32) {
 /// the subtraction loses most significant digits in f32.
 ///
 /// Ref: Exp (exp.rs:119-125), ELU (elu.rs:121-124) directed rounding pattern.
-/// Fixes: #2434 — SiLU tangent used raw `as f32` without directed rounding.
+/// Previously the SiLU tangent used raw `as f32` without directed rounding.
 #[inline]
 pub(crate) fn silu_tangent(d: f32, max_abs_x: f32) -> (f32, f32, f32) {
     let d64 = d as f64;

@@ -360,7 +360,7 @@ pub(crate) fn get_gelu_tanh_precompute() -> &'static GeluTanhPrecomputeTables {
 ///
 /// Returns `(slope, lower_intercept, upper_intercept)` where the lower intercept
 /// is rounded down and the upper intercept is rounded up to absorb f64→f32
-/// truncation error. This follows the SiLU directed rounding pattern (#1822, #3146).
+/// truncation error. This follows the SiLU directed rounding pattern.
 ///
 /// `max_abs_x` is the maximum absolute value of x over the evaluation interval,
 /// used to bound the slope truncation error: |slope64 - slope_f32| * max_abs_x.
@@ -417,7 +417,7 @@ pub(crate) fn gelu_tanh_tangent_at(d: f32, max_abs_x: f32) -> (f32, f32, f32) {
 /// value everywhere. The safety margin accounts for the maximum undetected
 /// error between adjacent sample points using the curvature bound.
 ///
-/// # Mathematical justification (#2445)
+/// # Mathematical justification
 ///
 /// Between adjacent sample points separated by `h = (u-l)/N_INTERVALS`, the
 /// maximum undetected "bulge" of GELU past a linear bound is bounded by:

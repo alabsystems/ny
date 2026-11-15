@@ -9922,7 +9922,7 @@ mod tests {
     fn binary32_point_leaf(input: &CertifiedInputBox) -> [f32; PROTECTED_LATENT_SYMBOLS] {
         assert_eq!(input.len(), PROTECTED_LATENT_SYMBOLS);
         std::array::from_fn(|index| {
-            let midpoint = (input.lower()[index] + input.upper()[index]) * 0.5;
+            let midpoint = f64::midpoint(input.lower()[index], input.upper()[index]);
             let point = midpoint as f32;
             assert!(f64::from(point) >= input.lower()[index]);
             assert!(f64::from(point) <= input.upper()[index]);
@@ -10401,7 +10401,7 @@ mod tests {
             assert_eq!(*leaf_index, expected);
             assert_eq!(center.len(), PROTECTED_LATENT_SYMBOLS);
             for (axis, &coordinate) in center.iter().enumerate() {
-                let midpoint = (input.lower()[axis] + input.upper()[axis]) * 0.5;
+                let midpoint = f64::midpoint(input.lower()[axis], input.upper()[axis]);
                 let quarter_width = (input.upper()[axis] - input.lower()[axis]) * 0.25;
                 let positive = ((expected >> (PROTECTED_LATENT_SYMBOLS - axis - 1)) & 1) != 0;
                 assert_eq!(

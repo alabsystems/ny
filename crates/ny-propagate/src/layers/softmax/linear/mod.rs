@@ -10,6 +10,7 @@
 //! along the softmax axis.
 
 mod batched;
+mod grouped_sound;
 mod heuristic;
 mod sound;
 #[cfg(test)]
@@ -22,8 +23,6 @@ use tracing::debug;
 
 use crate::LinearBounds;
 
-use super::super::common::BoundPropagation;
-use super::bounds::constant_bounds_from_output;
 use super::layer::SoftmaxLayer;
 
 impl SoftmaxLayer {
@@ -64,14 +63,17 @@ impl SoftmaxLayer {
                 || pre_activation.upper().iter().any(|&v| !v.is_finite());
             if has_non_finite {
                 debug!("Softmax sound mode: non-finite pre-activation bounds; falling back to IBP constant bounds");
-                let output_bounds = self.propagate_ibp(pre_activation)?;
-                return constant_bounds_from_output(bounds, &output_bounds);
+                // Each sound group handles non-finite logits with a checked
+                // constant carrier and preserves incoming coefficient error.
             }
         }
 
         let shape = pre_activation.shape();
         let ndim = shape.len();
         let axis = crate::layers::common::resolve_axis_i32(self.axis, ndim, "Softmax")?;
+        if use_sound && ndim >= 2 {
+            return self.propagate_grouped_sound(bounds, pre_activation, axis);
+        }
 
         match ndim {
             1 => {
@@ -155,7 +157,7 @@ impl SoftmaxLayer {
 
         let mut out_lower_a = Array2::<f32>::zeros((num_outputs, rows * cols));
         let mut out_upper_a = Array2::<f32>::zeros((num_outputs, rows * cols));
-        // Cross-group bias accumulation in f64 to prevent catastrophic cancellation (#2489).
+        // Cross-group bias accumulation in f64 to prevent catastrophic cancellation.
         // Each group's bias is computed in f64 with directed rounding, but accumulating
         // many groups back in f32 negates the per-group precision. For column-wise softmax
         // over sequence_length=512, this is 512 f32 additions.
@@ -262,7 +264,7 @@ impl SoftmaxLayer {
             }
         }
 
-        // Directed rounding on f64→f32 downcast (#2489):
+        // Directed rounding on f64→f32 downcast:
         // lower bounds round toward -inf, upper bounds round toward +inf.
         let out_lower_b = out_lower_b.mapv(|v| next_down_f32(v as f32));
         let out_upper_b = out_upper_b.mapv(|v| next_up_f32(v as f32));
@@ -333,7 +335,7 @@ impl SoftmaxLayer {
 
         let mut out_lower_a = Array2::<f32>::zeros((num_outputs, total_size));
         let mut out_upper_a = Array2::<f32>::zeros((num_outputs, total_size));
-        // Cross-group bias accumulation in f64 (#2489), same rationale as 2D path.
+        // Cross-group bias accumulation in f64, same rationale as 2D path.
         let mut out_lower_b = Array1::<f64>::zeros(num_outputs);
         let mut out_upper_b = Array1::<f64>::zeros(num_outputs);
 
@@ -362,7 +364,7 @@ impl SoftmaxLayer {
         let mut group_multi = [0usize; 8];
         let mut full_idx = [0usize; 8];
         // Pre-allocate flat index buffer once outside the group loop to avoid
-        // num_groups heap allocations (#2237 Finding 3).
+        // num_groups heap allocations.
         let mut flat_indices_for_group = Vec::with_capacity(softmax_size);
         for group_idx in 0..num_groups {
             // Convert group_idx to indices on non-axis dimensions
@@ -439,7 +441,7 @@ impl SoftmaxLayer {
             out_upper_b += &group_result.upper_b().mapv(|v| v as f64);
         }
 
-        // Directed rounding on f64→f32 downcast (#2489).
+        // Directed rounding on f64→f32 downcast.
         let out_lower_b = out_lower_b.mapv(|v| next_down_f32(v as f32));
         let out_upper_b = out_upper_b.mapv(|v| next_up_f32(v as f32));
 

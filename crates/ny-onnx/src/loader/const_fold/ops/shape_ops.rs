@@ -95,7 +95,7 @@ pub(super) fn try_fold_shape_node(
             }
             crate::loader::numeric_cast::i64_to_f32_checked(dim, "Shape constant fold")
                 .unwrap_or_else(|_| {
-                    // #2360: Keep the legacy float view for compatibility, but preserve the
+                    // Keep the legacy float view for compatibility, but preserve the
                     // exact payload in WeightStore::integers.
                     crate::loader::numeric_cast::i64_to_f32_warned(dim, "Shape constant fold")
                 })

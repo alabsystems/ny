@@ -5,7 +5,7 @@
 //! Graph-level input-split BaB verifier for `BetaCrownVerifier`.
 //!
 //! Split from the original monolithic `input_split.rs` into a directory module
-//! following the conv1d/types shell-first pattern (#3973).
+//! following the conv1d/types shell-first pattern.
 //!
 //! - `shared` — Domain types, priority ordering, helper functions
 //! - `adv_check` — Lightweight PGD probe for early SAT detection
@@ -15,13 +15,20 @@
 //! - `root_bounds` — Root intermediate-bound warmup selection
 //! - `single_objective` — Single-objective input-split verifier loop
 //! - `multi_objective` — Multi-objective conjunctive verifier loop
-//! - `disjunctive_multi_clause` — Multi-clause disjunctive (OR-of-AND) verifier loop (#3740)
+//! - `disjunctive_multi_clause` — Multi-clause disjunctive (OR-of-AND) verifier loop
 
 pub(crate) mod adv_check;
 pub(super) mod batched_clip;
 pub(crate) mod batching;
 pub(crate) mod bounds_eval;
 pub(crate) mod build_batches;
+/// `#cgan-child-seed`: plan, memory admission and observables for the seeded,
+/// optionally parallel child-refine prepass (default-dark typed keys).
+mod child_seed;
+/// `#cgan-child-zono`: certified per-child zonotope intermediates for the
+/// deferred rebound and the fresh clip (default-dark typed key
+/// `bab.alpha_crown.cgan_child_zono_refresh`).
+mod child_zono;
 mod disjunctive_multi_clause;
 /// Lane hooks for the lsnc certified f64 tail pass
 /// (docs/LSNC_F64_TAIL_DESIGN.md; gate `NY_F64_TAIL=1`, default OFF).
@@ -34,6 +41,8 @@ pub(crate) mod grouped_semantics;
 pub(crate) mod ibp_prescreen;
 mod ibp_prescreen_flat;
 pub(crate) mod loop_batch_size;
+/// #router-r6 `rule.trial_width`: the loop's live batch and its dormancy.
+pub(crate) mod loop_width;
 pub(crate) mod metrics;
 pub(crate) mod mul_binary;
 mod multi_obj_domain;

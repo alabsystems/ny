@@ -73,10 +73,17 @@ bab:
   branching:
     method: kfsb
     candidates: 10
-    reduceop: max
     # Exact wave-selector mirrors for governed search; runtime is unchanged.
     kfsb_multi_candidates: 10
     kfsb_multi_reduceop: max
+    # #flip-bundle (2026-08-30): wave kFSB selector, +9.6 frontier vs blind
+    # argmax (receipted). Shipped with optimize_disjuncts_separately below
+    # after its staged gate was met — see the FC ledger: 2 GT-unsat FC
+    # conversions at official 90s (RSPLITTER 256x4 prop_14/prop_10, unsat
+    # 3/3 each, GT-confirmed by alpha_beta_crown AND nnenum) and the full
+    # verdict-row moat under the bundle: 44 holds / 0 contradictions /
+    # 0 flips / 0 drops (verdict_row_moat exit 0).
+    kfsb_multi: true
   cuts:
     # Fail closed until proof-derived cuts are folded through backward CROWN.
     enabled: false
@@ -97,9 +104,15 @@ bab:
     # but compensates with matrix Conv mode (fast backward) and auto_enlarge.
     iterations: 20
   beta_crown:
-    lr_alpha: 0.1
     lr_beta: 0.01
-    iterations: 15
+    # #flip-bundle (2026-08-30): ONE shared relu-split tree with the full
+    # budget (vs 9x ~2.5s per-clause restarts). Became net-positive when the
+    # child-birth #alpha-split-refresh law landed (probe row -10.30 ->
+    # -3.3257 deterministic 3/3 at 60s); gate receipts in the kfsb_multi
+    # comment above and the FC ledger. The delta-form split_refresh alpha
+    # and sparse SPSA schedule are default-on in code; this key changes
+    # ROUTING only.
+    optimize_disjuncts_separately: true
   phase_budget:
     # #reclaim-pgd (measured 2026-08-01 at HEAD 533a3100, official budgets).
     #

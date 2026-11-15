@@ -4,11 +4,10 @@
 
 //! SBAR: certificate-producing simplex-barycentric attention relaxation.
 //!
-//! This is the executable, Clean-checkable core of Pillar 2
-//! (`docs/SBAR_ATTENTION_RELAXATION.md`). For a single attention (head, query)
-//! the support function of the relaxed output in a readout direction `w` reduces
-//! (after the *exact* inner-`V` corner step, §3.2) to a linear program over the
-//! **box-truncated probability simplex**
+//! This is the executable, Clean-checkable core of Pillar 2. For a single attention
+//! (head, query) the support function of the relaxed output in a readout direction
+//! `w` reduces (after the *exact* inner-`V` corner step, §3.2) to a linear program
+//! over the **box-truncated probability simplex**
 //!
 //! ```text
 //!   maximize   Σ_j g_j · p_j

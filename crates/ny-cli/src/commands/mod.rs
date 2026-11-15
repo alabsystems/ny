@@ -31,9 +31,19 @@ pub(crate) mod bench_acasxu;
 pub(crate) mod bench_vnncomp;
 pub(crate) mod beta_crown;
 pub(crate) mod bnn_falsification_policy;
-pub(crate) mod cgan_status;
+// #cctsdb-subbox: spec-aware two-sub-box disjunction for patch-attack models
+// whose graph cannot be built as one unit. Reached ONLY from the vnncomp arm
+// where the model already failed to load.
+pub(crate) mod cctsdb_subbox;
 pub(crate) mod coupled_delta;
 pub(crate) mod coverage;
+// #cgan-child-zono: real-model soundness pins for the shared certified
+// zonotope core (the four ConvT cGANs, Z1 parity, sat leaves, refusals).
+#[cfg(test)]
+mod cgan_child_zono_tests;
+// #cgan-child-zono: the dense core against ny-mip's exact-dyadic CZ oracle.
+#[cfg(all(test, feature = "mip"))]
+mod cgan_child_zono_oracle_tests;
 // Qualification milestone: compiled and tested under `mip`. Historically
 // deliberately unreachable from commands/verdicts; since #cz-hybrid its
 // `qualification` submodule exposes one wired production entry, reached only
@@ -46,12 +56,17 @@ pub(crate) mod cz_metaroom_unwired;
 #[cfg(feature = "mip")]
 pub(crate) mod cz_metaroom_wired;
 // Default-dark real-model qualification machinery. Its public probe reports
-// remain verdict-neutral; the beta-crown cGAN input-leaf module is the sole
-// property-bound authority layer for the private scalar leaf-row API.
+// remain verdict-neutral. The beta-crown cGAN input-leaf module that used to
+// be its property-bound authority layer was category-name-keyed and
+// env-dark (`NY_CGAN_INPUT_LEAF`), and was removed by #name-blind-routing; the
+// probes stay reachable from the `cz_cgan_*` examples and their own tests.
 #[cfg(feature = "mip")]
 #[allow(dead_code)]
 pub(crate) mod cz_cgan_sequential_unwired;
+/// #graph-bab-cover-ledger: the graph lane's instance door at publication.
+pub(crate) mod graph_cover_publish;
 pub(crate) mod gt;
+pub(crate) mod head_verify;
 pub(crate) mod inspect;
 pub(crate) mod inspect_model;
 pub(crate) mod json_error;
@@ -59,12 +74,24 @@ pub(crate) mod lane_allocation;
 pub(crate) mod lane_schedule;
 pub(crate) mod lipschitz;
 pub(crate) mod margin_row_bab;
+pub(crate) mod original_property_census;
+pub(crate) mod original_source_census;
+pub(crate) mod prepared_root_publication;
+pub(crate) mod prepared_root_route;
+pub(crate) mod prepared_root_source;
+/// ENGINE_PROGRAM §1.7 B1: the scored entry point's proof sink (`NullSink`
+/// under Competition, the streaming proof-hint bundle under Proof).
+pub(crate) mod proof_bundle;
+pub(crate) mod proof_check;
 pub(crate) mod relational_equiv;
+pub(crate) mod safenlp_input_head;
 pub(crate) mod terminal_peel;
 #[cfg(test)]
 mod tests;
 pub(crate) mod tll_structure;
 pub(crate) mod tutorial;
+/// #soundness-spine M2b: the only door to a published `unsat`.
+pub(crate) mod unsat_receipt;
 pub(crate) mod verify;
 pub(crate) mod vnncomp;
 pub(crate) mod vnncomp_2025_tracks;
@@ -82,21 +109,10 @@ pub(crate) mod whisper;
 
 pub(crate) use json_error::{find_json_cli_error, JsonCliError};
 
-/// Shape-inference execution backend for CLI-owned model loads.
-///
-/// Real `ny` processes delegate ONNX Runtime shape inference to a child
-/// process (`current_exe()` re-invoked with the hidden
-/// [`ny_onnx::SHAPE_INFER_SUBCOMMAND`] entry served in `main.rs`): malformed
-/// models can make ORT's native layer abort or fault despite Rust panic
-/// recovery. In a child, that failure is just a non-zero exit status and the
-/// load degrades to the sound no-inferred-shapes fallback.
-///
-/// Unit-test builds keep the historical in-process backend: under `cargo test`
-/// `current_exe()` is the libtest harness, which cannot serve the hidden
-/// subcommand (it would treat it as a test-name filter and print harness
-/// chatter on stdout), so delegating there would silently drop shape inference
-/// for every in-crate test. Integration tests spawn the real `ny` binary,
-/// which is compiled without `cfg(test)` and exercises the subprocess backend.
+/// Isolate ORT shape inference in a child so a native crash can fall back to
+/// exact static inference. Unit tests use the in-process backend because their
+/// executable is the libtest harness, not the hidden shape-inference server;
+/// integration tests exercise the real CLI subprocess path.
 pub(crate) fn cli_shape_infer_backend() -> ny_onnx::ShapeInferBackend {
     #[cfg(test)]
     {
@@ -118,17 +134,8 @@ pub(crate) fn cli_shape_infer_backend() -> ny_onnx::ShapeInferBackend {
     }
 }
 
-/// Resolve the VNN-COMP 2026 corpus root across BOTH checkout spellings.
-///
-/// Upstream's repository is named `vnncomp2026_benchmarks`, so a plain
-/// `git clone` lands there; every other corpus in this tree (vnncomp2023 /
-/// 2024 / 2025) sits under its bare year, and `.gitignore` lists both
-/// spellings. Test sites that hardcoded one of the two panicked with "fixtures
-/// missing" against a corpus that was present under the other name, which made
-/// the whole `external-vnncomp` lane unrunnable on a correct checkout.
-///
-/// Returns `None` only when NEITHER layout exists — callers keep their own
-/// hard failure, so a genuinely absent corpus is still never a silent skip.
+/// Find either supported VNN-COMP 2026 checkout layout. Callers fail explicitly
+/// when neither directory exists.
 #[cfg(all(test, feature = "mip", feature = "external-vnncomp"))]
 pub(crate) fn vnncomp2026_benchmarks_root() -> Option<std::path::PathBuf> {
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));

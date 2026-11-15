@@ -85,13 +85,15 @@ impl BetaCrownVerifier {
         cut_pool: &mut CutPool,
         engine: Option<&dyn GemmEngine>,
     ) -> Result<(BoundedTensor, IntermediateLinearBounds)> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BetaOpt);
         // Check if any optimization is needed
         let has_beta = !beta_state.is_empty();
         let has_alpha = !alpha_state.is_empty() && self.config.use_alpha_crown;
         let has_cuts = !cut_pool.is_empty() && self.config.enable_cuts;
 
         // Skip optimization if nothing to optimize.
-        // Sound concretization is unconditional since #2239.
+        // Sound concretization is unconditional.
         if (!has_beta && !has_alpha && !has_cuts) || self.config.beta_iterations == 0 {
             return self.compute_bounds_capturing_intermediate(
                 network,
@@ -116,7 +118,7 @@ impl BetaCrownVerifier {
         };
 
         for iter in 0..self.config.beta_iterations {
-            // Deadline check (#3109): bail early if verification timeout budget
+            // Deadline check: bail early if verification timeout budget
             // is exhausted. Return current best bounds instead of running all iterations.
             if self.past_effective_graph_bab_deadline() {
                 info!(
@@ -148,7 +150,7 @@ impl BetaCrownVerifier {
                 engine,
             )?;
 
-            // #2950: Check for infeasible output bounds (lower > upper).
+            // Check for infeasible output bounds (lower > upper).
             // BaB splits can make a domain infeasible — continuing to optimize
             // is wasted work. Mark with (+inf, -inf) sentinel and return early.
             // Reference: alpha-beta-CROWN optimized_bounds.py:626-644.
@@ -183,7 +185,7 @@ impl BetaCrownVerifier {
                 );
             }
 
-            // Compute gradients; skip when all bounds are NaN/+Inf (#2561).
+            // Compute gradients; skip when all bounds are NaN/+Inf.
             if let Some(obj_idx) = objective_lower_idx {
                 self.compute_joint_gradients(
                     network,
@@ -217,7 +219,7 @@ impl BetaCrownVerifier {
                     let mut max_grad = 0.0f32;
                     for cut in cut_pool.cuts_mut() {
                         cut.gradient_step_adam(&self.config.adaptive_config, t);
-                        // NaN-aware: f32::max silently drops NaN (#2939).
+                        // NaN-aware: f32::max silently drops NaN.
                         max_grad = nan_propagating_max(max_grad, cut.lambda_grad().abs());
                     }
                     max_grad
@@ -246,7 +248,7 @@ impl BetaCrownVerifier {
                         .unwrap_or(self.config.beta_lr);
                     let mut max_grad = 0.0f32;
                     for cut in cut_pool.cuts_mut() {
-                        // NaN-aware: f32::max silently drops NaN (#2939).
+                        // NaN-aware: f32::max silently drops NaN.
                         let grad_abs = cut.gradient_step_sgd(lr);
                         max_grad = nan_propagating_max(max_grad, grad_abs);
                     }
@@ -260,7 +262,7 @@ impl BetaCrownVerifier {
             // NaN-aware aggregation: f32::max silently drops NaN, which would hide
             // NaN gradients from the convergence check and allow premature termination.
             // After NaN recovery (in gradient_step), the loop should continue to let
-            // the reset parameters re-optimize. (#2939)
+            // the reset parameters re-optimize.
             let max_grad = nan_propagating_max(
                 nan_propagating_max(max_beta_grad, max_alpha_grad),
                 max_cut_grad,
@@ -343,13 +345,15 @@ impl BetaCrownVerifier {
         parent_intermediate: &IntermediateLinearBounds,
         engine: Option<&dyn GemmEngine>,
     ) -> Result<(BoundedTensor, IntermediateLinearBounds)> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BetaOpt);
         // Check if any optimization is needed
         let has_beta = !beta_state.is_empty();
         let has_alpha = !alpha_state.is_empty() && self.config.use_alpha_crown;
         let has_cuts = !cut_pool.is_empty() && self.config.enable_cuts;
 
         // Skip optimization if nothing to optimize.
-        // Sound concretization is unconditional since #2239.
+        // Sound concretization is unconditional.
         if (!has_beta && !has_alpha && !has_cuts) || self.config.beta_iterations == 0 {
             return self.compute_bounds_from_layer(
                 network,
@@ -376,7 +380,7 @@ impl BetaCrownVerifier {
         };
 
         for iter in 0..self.config.beta_iterations {
-            // Deadline check (#3109): bail early if verification timeout budget
+            // Deadline check: bail early if verification timeout budget
             // is exhausted. Return current best bounds instead of running all iterations.
             if self.past_effective_graph_bab_deadline() {
                 info!(
@@ -407,7 +411,7 @@ impl BetaCrownVerifier {
                 engine,
             )?;
 
-            // #2950: Check for infeasible output bounds (lower > upper).
+            // Check for infeasible output bounds (lower > upper).
             // Same early exit as optimize_joint_bounds — see that function for rationale.
             if has_inverted_output_bounds(&bounds) {
                 trace!(
@@ -439,7 +443,7 @@ impl BetaCrownVerifier {
                 );
             }
 
-            // Compute gradients; skip when all bounds are NaN/+Inf (#2561).
+            // Compute gradients; skip when all bounds are NaN/+Inf.
             if let Some(obj_idx) = objective_lower_idx {
                 self.compute_joint_gradients(
                     network,
@@ -473,7 +477,7 @@ impl BetaCrownVerifier {
                     let mut max_grad = 0.0f32;
                     for cut in cut_pool.cuts_mut() {
                         cut.gradient_step_adam(&self.config.adaptive_config, t);
-                        // NaN-aware: f32::max silently drops NaN (#2939).
+                        // NaN-aware: f32::max silently drops NaN.
                         max_grad = nan_propagating_max(max_grad, cut.lambda_grad().abs());
                     }
                     max_grad
@@ -502,7 +506,7 @@ impl BetaCrownVerifier {
                         .unwrap_or(self.config.beta_lr);
                     let mut max_grad = 0.0f32;
                     for cut in cut_pool.cuts_mut() {
-                        // NaN-aware: f32::max silently drops NaN (#2939).
+                        // NaN-aware: f32::max silently drops NaN.
                         let grad_abs = cut.gradient_step_sgd(lr);
                         max_grad = nan_propagating_max(max_grad, grad_abs);
                     }
@@ -513,7 +517,7 @@ impl BetaCrownVerifier {
                 (beta_grad, alpha_grad, cut_grad)
             };
 
-            // NaN-aware aggregation: f32::max silently drops NaN (#2939).
+            // NaN-aware aggregation: f32::max silently drops NaN.
             let max_grad = nan_propagating_max(
                 nan_propagating_max(max_beta_grad, max_alpha_grad),
                 max_cut_grad,

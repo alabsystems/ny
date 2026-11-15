@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Regression coverage for #3775 demand-policy parity in the sequential
+//! Regression coverage demand-policy parity in the sequential
 //! graph CROWN-IBP fast path.
 
 use ndarray::{arr1, arr2};

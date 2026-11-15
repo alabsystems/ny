@@ -12,7 +12,7 @@ pub(crate) fn graph_crown_dispatch_fallback_reason(
 ) -> Option<CrownIbpFallbackReason> {
     match err {
         NyError::ShapeMismatch { .. } => Some(CrownIbpFallbackReason::ShapeMismatch),
-        // #3795: structural match replaces fragile string matching on "per-node deadline exceeded"
+        // Structural match replaces fragile string matching on "per-node deadline exceeded"
         NyError::DeadlineExceeded(_) => Some(CrownIbpFallbackReason::PerNodeDeadlineExceeded),
         NyError::UnsupportedOp(_)
         | NyError::UnsupportedConfiguration(_)
@@ -41,7 +41,7 @@ mod tests {
             )),
             Some(CrownIbpFallbackReason::CrownPropagationError)
         );
-        // #3795: DeadlineExceeded variant replaces UnsupportedConfiguration string matching
+        // DeadlineExceeded variant replaces UnsupportedConfiguration string matching
         assert_eq!(
             graph_crown_dispatch_fallback_reason(&NyError::DeadlineExceeded(
                 "Conv2d CROWN backward: per-node deadline exceeded".to_string()

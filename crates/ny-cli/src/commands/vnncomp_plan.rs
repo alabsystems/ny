@@ -22,7 +22,8 @@ use std::path::{Path, PathBuf};
 
 use crate::plan_resolver::{ModelFacts, ResolvedPlan};
 
-/// Handle `ny vnncomp plan CATEGORY ONNX VNNLIB BUDGET [--configs-dir DIR] [--json]`.
+/// Handle `ny vnncomp plan CATEGORY ONNX VNNLIB BUDGET [--configs-dir DIR] [--json]
+/// [--router [--router-target-host HOST]]`.
 pub(crate) fn handle_vnncomp_plan_command(
     category: &str,
     onnx: &Path,
@@ -30,6 +31,8 @@ pub(crate) fn handle_vnncomp_plan_command(
     budget_secs: u64,
     configs_dir: Option<PathBuf>,
     json: bool,
+    router: bool,
+    router_target_host: Option<&str>,
 ) -> Result<()> {
     let backend = crate::compute_backend::detect();
 
@@ -116,6 +119,89 @@ pub(crate) fn handle_vnncomp_plan_command(
             &plan,
         );
     }
+    if router {
+        print_router_plan(
+            &facts,
+            vnnlib,
+            budget_secs,
+            plan.ledger.nominal_internal_tier_secs,
+            router_target_host,
+        )?;
+    }
+    Ok(())
+}
+
+/// #router-r1: the shadow router's plan for the same row, from the same
+/// loaded-model facts (`--router`), optionally against a declared target host
+/// (`--router-target-host`, measurement only: it changes plan values, never a
+/// lane). The printer owns no decision: it calls the router's own pure plan.
+fn print_router_plan(
+    facts: &ModelFacts,
+    vnnlib: &Path,
+    budget_secs: u64,
+    internal_secs: u64,
+    router_target_host: Option<&str>,
+) -> Result<()> {
+    let target_host = router_target_host
+        .map(|token| {
+            ny_core::router::facts::HostClass::from_token(token).with_context(|| {
+                format!("--router-target-host must be one of gb10, g5, m5, other; got {token:?}")
+            })
+        })
+        .transpose()?;
+    // The relational route's own predicate, from the property's prelude (the
+    // same probe `RelationalRouteDecision` runs on the scored path).
+    let prelude = ny_onnx::vnnlib::load_vnnlib_network_prelude(vnnlib).ok();
+    let ctx = crate::router::StartContext {
+        levers: None,
+        authority: crate::router::Authority::Frozen,
+        model: Some(facts),
+        model_bytes: Some(facts.file_size_bytes),
+        facts_reason: None,
+        declared_networks: prelude.map(|p| p.declared_networks as u64),
+        relational_selected: Some(prelude.is_some_and(|p| p.is_multi_network())),
+        official_budget_secs: budget_secs,
+        internal_secs,
+        join_margin: super::vnncomp::CONCURRENT_LANE_JOIN_MARGIN,
+        anchor: std::time::Instant::now(),
+        target_host,
+        // #router-r5: the printer has no category file: nothing is pinned.
+        pinned_keys: Vec::new(),
+        // #router-r6: nor is any trial knob.
+        trial_pinned_keys: Vec::new(),
+        // #admission-precision: the same property read the scored start makes.
+        spec: super::beta_crown::spec_shape::read_spec(vnnlib),
+    };
+    let (input, router_plan) =
+        crate::router::printer_plan(&ctx).map_err(|error| anyhow::anyhow!(error))?;
+    println!();
+    println!("router (#router-r1, shadow; the plan a scored run with router.mode: shadow logs):");
+    for line in crate::router::printer_lines(&input, &router_plan) {
+        println!("  {line}");
+    }
+    Ok(())
+}
+
+/// #router-r1: `ny vnncomp plan --replay <result>.flight.json` — re-run the
+/// router's pure plan and checkpoints on the logged inputs; any divergence is
+/// an error (non-zero exit).
+pub(crate) fn handle_router_replay(flight_json: &Path) -> Result<()> {
+    let text = fs::read_to_string(flight_json)
+        .with_context(|| format!("reading flight record {}", flight_json.display()))?;
+    let flight: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("parsing flight record {}", flight_json.display()))?;
+    let record = flight.get("router").with_context(|| {
+        format!(
+            "{} carries no `router` record (the router was off for that row)",
+            flight_json.display()
+        )
+    })?;
+    let report = crate::router::replay(record)
+        .map_err(|error| anyhow::anyhow!("router replay DIVERGED: {error}"))?;
+    println!(
+        "[router] replay ok plan_sha={} checkpoints={} skipped_truncated={}",
+        report.plan_sha8, report.checkpoints, report.skipped
+    );
     Ok(())
 }
 
@@ -127,7 +213,7 @@ fn print_human(
     facts: &ModelFacts,
     plan: &ResolvedPlan,
 ) {
-    println!("=== ny vnncomp plan (I2) ===");
+    println!("=== ny vnncomp plan ===");
     println!("category: {category}");
     println!("onnx:     {}", onnx.display());
     println!(
@@ -137,7 +223,7 @@ fn print_human(
     );
     match preset_path {
         Some(path) => println!("preset:   {}", path.display()),
-        None => println!("preset:   none (auto defaults — see the scored path's warning)"),
+        None => println!("preset:   none (built-in defaults)"),
     }
     println!("host:     {} [{}]", plan.backend_kind, plan.backend_summary);
     println!();

@@ -191,7 +191,7 @@ mod tests {
     fn combine_sound_with_sound_is_sound() {
         let combined = SoundnessProvenance::sound().combine(&SoundnessProvenance::sound());
         assert_eq!(combined.mode(), VerificationSoundnessMode::Sound);
-        assert!(combined.heuristics_used().is_empty());
+        assert_eq!(combined.heuristics_used().len(), 0);
     }
 
     #[test]
@@ -235,7 +235,7 @@ mod tests {
     fn heuristic_constructor_sets_mode_without_listing() {
         let p = SoundnessProvenance::heuristic();
         assert_eq!(p.mode(), VerificationSoundnessMode::Heuristic);
-        assert!(p.heuristics_used().is_empty());
+        assert_eq!(p.heuristics_used().len(), 0);
     }
 
     #[test]
@@ -244,7 +244,7 @@ mod tests {
         // Heuristic, even though no HeuristicUsed entries are listed.
         let combined = SoundnessProvenance::sound().combine(&SoundnessProvenance::heuristic());
         assert_eq!(combined.mode(), VerificationSoundnessMode::Heuristic);
-        assert!(combined.heuristics_used().is_empty());
+        assert_eq!(combined.heuristics_used().len(), 0);
         // Symmetric.
         let combined2 = SoundnessProvenance::heuristic().combine(&SoundnessProvenance::sound());
         assert_eq!(combined2.mode(), VerificationSoundnessMode::Heuristic);
@@ -254,7 +254,7 @@ mod tests {
     fn combine_all_empty_is_sound() {
         let combined = SoundnessProvenance::combine_all(std::iter::empty());
         assert_eq!(combined.mode(), VerificationSoundnessMode::Sound);
-        assert!(combined.heuristics_used().is_empty());
+        assert_eq!(combined.heuristics_used().len(), 0);
     }
 
     #[test]
@@ -277,6 +277,6 @@ mod tests {
         let provenance: SoundnessProvenance =
             serde_json::from_str(json).expect("valid provenance JSON");
         assert_eq!(provenance.mode(), VerificationSoundnessMode::Heuristic);
-        assert!(provenance.heuristics_used().is_empty());
+        assert_eq!(provenance.heuristics_used().len(), 0);
     }
 }

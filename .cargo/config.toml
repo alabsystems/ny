@@ -1,17 +1,8 @@
-# The PUBLIC snapshot's .cargo/config.toml. Copied over the export's
-# .cargo/config.toml by transforms.sh (T7); the private repo keeps the
-# Trust-verify opt-out.
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
 #
-# WHY THIS FILE EXISTS. ny's publish/manifest.txt exports `.cargo` (unlike
-# nn, which deliberately excludes it), because this file carries settings the
-# public workflow genuinely needs: git-fetch-with-cli for the pinned public
-# ay git dep, deterministic single-threaded libtest execution (the memory
-# cap), and the aarch64-linux fp16 baseline without which gemm-f16 does not
-# assemble on Grace/GB10-class hosts. The private copy additionally carries
-# `-Ztrust-verify=off` rustflags for the Trust toolchain; stock stable rustc
-# rejects every `-Z` flag at parse time, so shipping those lines publicly
-# would break every public build on the stock pin. This file is the private
-# config MINUS the Trust opt-out blocks, byte-stable otherwise.
+# Choose the verification lane per targo command; keep Trust policy in
+# Cargo.toml rather than per-unit compiler overrides here.
 
 [net]
 git-fetch-with-cli = true
@@ -27,12 +18,12 @@ git-fetch-with-cli = true
 [env]
 RUST_TEST_THREADS = "1"
 
-# gemm-f16 0.19 (candle's f16 GEMM backend) contains unconditional fp16 inline
-# asm (`fmla v.8h`) that LLVM refuses to assemble unless the target carries the
-# `fp16` (fullfp16) feature. Apple aarch64 targets have it in their BASELINE,
-# which is why macOS dev boxes never see this; generic aarch64-unknown-linux-gnu
-# does not, so a Linux-aarch64 host fails at `cargo test` time inside a
-# third-party crate. Enabling the feature is a baseline statement for ARMv8.2
-# FP16 hosts, not a -Ctarget-cpu=native machine coupling.
+# Develop AY in its own checkout, publish it, then pin its Git revision in
+# ny-mip/Cargo.toml. Keep the real Git provenance for sealed builds.
+# Do not source-replace internal repositories with vendored copies.
+
+# gemm-f16 emits fullfp16 instructions on aarch64. Deployment hosts (Grace
+# and Apple Silicon) support them; generic Linux-aarch64 does not enable the
+# feature by default. Keep this target baseline independent of the build host.
 [target.aarch64-unknown-linux-gnu]
 rustflags = ["-C", "target-feature=+fp16"]

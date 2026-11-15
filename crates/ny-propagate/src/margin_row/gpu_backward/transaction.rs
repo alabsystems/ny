@@ -19,8 +19,7 @@
 //! are called; its dispatch path (process-global backend, backend deadline
 //! lease) is exactly what this module exists to not repeat.
 //!
-//! # The certified-error contract (§4.2, per accumulation site — TIGHTENED
-//! # in the error-charge session, 2026-08-20)
+//! # The certified-error contract (§4.2, per accumulation site)
 //!
 //! Value lanes are double-single (ds32) end to end, INCLUDING the weights and
 //! biases: every f64 parameter rides as an exact-split ds pair (normal-band
@@ -32,9 +31,12 @@
 //! DOCUMENTED per-op bounds (`gamma_ds_dot`: 10u^2/tap vs the old blanket
 //! 32u^2/tap) and RIDES THE MASS it belongs to:
 //!
-//! * head gemm — `g_head = up(gamma_ds_dot(n_y+2) (+) ds_weight_rel(0))`
-//!   gathered on `sum |W||S|` in-kernel (the head's f64 weights are the
-//!   lane's exact algebra — no fold term);
+//! * head gemm — `g_head = up(gamma_ds_dot(n_y+2) (+) ds_weight_rel(rel))`
+//!   gathered on `sum |W||S|` in-kernel, where `rel` is the head's certified
+//!   BN-fold error (`TwinNet::gemm1_fold_err`, #cct-margin-row-admission) and
+//!   is 0 for every unfolded head (the historical exact-algebra charge); the
+//!   head bias statics carry the fold's `bias_err` through the same
+//!   `ds_bias_abs` the conv biases use;
 //! * gate transform — E contracts by `m = max(|slopes|)` plus one `DS_UNIT`
 //!   op on the produced magnitude, in-kernel; intercept partials carry
 //!   `E*|c| + DS_UNIT*|partial|` and the reduce adds `gamma_ds_dot` on the
@@ -50,7 +52,7 @@
 //!   `2*DS_UNIT*|b_running|` carry;
 //! * residual merge — `E_a + E_b + 2*DS_UNIT*|L_sum|` (the CPU `merge_into`
 //!   carry with the unit swapped);
-//! * split floor (verify-fix, 2026-08-20) — the EXACT per-element split
+//! * split floor — the EXACT per-element split
 //!   residuals (`(v - hi) - lo`, exact in f64, [`ds_split_residual`]) in
 //!   EXCESS of the guaranteed in-kernel relative covers are accumulated
 //!   host-side per split site and carried through host-tracked operator
@@ -105,10 +107,10 @@ use super::{
 /// Smallest positive NORMAL f32 (2^-126), as f64: the absolute flush floor —
 /// one flushed/unrepresentable rounding costs at most this much, absolutely.
 ///
-/// RE-DERIVATION UNDER PRESERVED DENORMALS (error-charge session, 2026-08-20;
-/// the resolved DenormPreserve channel is an ADMISSION requirement, so the
-/// floor may assume it): the barrier TwoSum residual is exactly representable
-/// for ALL inputs when subnormals exist (Hauser's theorem — the error of an
+/// RE-DERIVATION UNDER PRESERVED DENORMALS (the resolved DenormPreserve
+/// channel is an ADMISSION requirement, so the floor may assume it): the
+/// barrier TwoSum residual is exactly representable for ALL inputs when
+/// subnormals exist (Hauser's theorem — the error of an
 /// f32 addition is itself an f32), so ADDS owe nothing here. What remains,
 /// and keeps the floor IRREDUCIBLE IN KIND rather than removable:
 ///
@@ -149,7 +151,7 @@ const FLUSH_OPS_PER_TAP: f64 = 32.0;
 /// the old `U32_UNIT` (2^-24) downcast ball everywhere in this lane — the
 /// single largest term of the pre-tightening published radius.
 ///
-/// SUBNORMAL EXCEPTION (verify-fix, 2026-08-20 — the refuted charge): when
+/// SUBNORMAL EXCEPTION: when
 /// `hi` or `lo` lands f32-SUBNORMAL (`|w| < ~2^-102` puts `lo` there,
 /// `|w| < 2^-126` puts `hi` there), that component's rounding is ABSOLUTE
 /// (`<= 2^-150` half-ulp of the subnormal grid), not relative, and the
@@ -355,8 +357,8 @@ pub(super) struct Step {
 }
 
 /// The current backward frontier: coefficient ds plane, error f32 plane,
-/// logical width (neurons) — plus the HOST-tracked split-floor bookkeeping
-/// (verify-fix, 2026-08-20): `amax` bounds the plane's largest coefficient
+/// logical width (neurons) — plus the HOST-tracked split-floor bookkeeping:
+/// `amax` bounds the plane's largest coefficient
 /// magnitude and `sabs` the per-element ABSOLUTE split-residual error the
 /// device E plane does NOT cover (both directed UP at every host op; both
 /// exactly 0.0 whenever every parameter split so far was normal-band).
@@ -402,7 +404,7 @@ pub(super) struct BuiltProgram<'p> {
     /// Absolute flush floors (§4.1), per E element / per eb entry.
     pub(super) flush_e: f64,
     pub(super) flush_eb: f64,
-    /// Absolute split-floor channel (verify-fix, 2026-08-20): the exact
+    /// Absolute split-floor channel: the exact
     /// per-element parameter-split residual excess (subnormal band) carried
     /// to the FINAL coefficient plane / the bias accumulators through the
     /// host-tracked operator norms. Added per E element / per eb entry at
@@ -703,7 +705,7 @@ impl<'a, 'b> Builder<'a, 'b> {
     /// running accumulators. The fold's own ds envelope is charged EXACTLY
     /// once, in-kernel, as `g_reduce * sum|q|` (the pre-tightening build also
     /// passed the same `gamma_ds(n+2)` as a caller-side `g_src` on the same
-    /// mass — a double charge, removed 2026-08-20). `split_contrib` is the
+    /// mass — a double charge, removed). `split_contrib` is the
     /// caller-computed per-row split-floor slack this fold moves into the
     /// bias channel (plane slack x scale mass + scale split excess x plane
     /// amax; the bias accumulators are terminal, so no later amplification).
@@ -1868,7 +1870,7 @@ pub(super) fn ds_split_excess(v: f64, hi: f32, lo: f32, cover: f64) -> f64 {
 /// `|v - hi - lo| <= 2^-48 |v|` and is charged through [`DS_SPLIT_REL`]
 /// (weights/biases) or the gate transform's `2 * DS_UNIT` term (gates); in
 /// the f32-SUBNORMAL band that relative claim FAILS (component rounding is
-/// ABSOLUTE there — the refuted charge, verify-fix 2026-08-20) and the
+/// ABSOLUTE there) and the
 /// uncovered part is charged exactly through [`ds_split_excess`] into the
 /// split-floor channel.
 pub(super) fn ds_split_f64(v: f64) -> Result<(f32, f32), Refusal> {

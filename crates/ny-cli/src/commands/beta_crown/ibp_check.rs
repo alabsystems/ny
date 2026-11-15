@@ -4,7 +4,7 @@
 
 //! IBP fast-path check for VNNLIB constraint verification.
 
-/// Check if IBP bounds verify all VNNLIB constraints (IBP fast-path). #3218
+/// Check if IBP bounds verify all VNNLIB constraints (IBP fast-path).
 ///
 /// For classification properties (disjunctive with relational constraints), this
 /// checks if the IBP lower bound of the true label exceeds the IBP upper bound

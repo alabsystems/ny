@@ -34,6 +34,9 @@ impl BetaCrownVerifier {
         reduce_op: KfsbReduceOp,
         only_nodes: &std::collections::HashSet<String>,
     ) -> std::collections::HashMap<(String, usize), BabsrScoreParts> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost =
+            ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BranchPrescore);
         let node_bounds = node_bounds.into();
         let mut scores = std::collections::HashMap::new();
 
@@ -209,6 +212,9 @@ impl BetaCrownVerifier {
         // `None` is byte-identical to the historical walk.
         mut adjoint_sink: Option<&mut std::collections::HashMap<String, Array2<f32>>>,
     ) -> Result<std::collections::HashMap<(String, usize), BabsrScoreParts>> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost =
+            ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BranchPrescore);
         let check_deadline = || {
             if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                 Err(ny_core::NyError::DeadlineExceeded(
@@ -482,6 +488,9 @@ impl BetaCrownVerifier {
         graph: &GraphNetwork,
         domain: &GraphBabDomain,
     ) -> Result<std::collections::HashMap<(String, usize), f32>> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost =
+            ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BranchPrescore);
         let mut scores = std::collections::HashMap::new();
         let node_names = graph.exec_order()?;
         if node_names.is_empty() {

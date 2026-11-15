@@ -282,3 +282,213 @@ fn ground_truth_load_error_is_operational_not_falsified() {
     ]);
     assert_exit(&output, OPERATIONAL_ERROR);
 }
+
+// ---------------------------------------------------------------------------
+// `ny proof-check` (ENGINE_PROGRAM §1.7 B2.1)
+// ---------------------------------------------------------------------------
+
+fn proof_check_mlp_onnx() -> Vec<u8> {
+    use ny_onnx::onnx_proto::tensor_shape_proto::{dimension, Dimension};
+    use ny_onnx::onnx_proto::{
+        AttributeProto, GraphProto, ModelProto, NodeProto, TensorProto, TensorShapeProto,
+        TensorTypeProto, TypeProto, ValueInfoProto,
+    };
+    use prost::Message;
+    let vi = |name: &str, dims: &[i64]| ValueInfoProto {
+        name: name.to_owned(),
+        r#type: Some(TypeProto {
+            tensor_type: Some(TensorTypeProto {
+                elem_type: 1,
+                shape: Some(TensorShapeProto {
+                    dim: dims
+                        .iter()
+                        .map(|&d| Dimension {
+                            value: Some(dimension::Value::DimValue(d)),
+                        })
+                        .collect(),
+                }),
+            }),
+        }),
+    };
+    let t = |name: &str, dims: &[i64], v: &[f32]| TensorProto {
+        name: name.to_owned(),
+        dims: dims.to_vec(),
+        data_type: 1,
+        float_data: v.to_vec(),
+        ..Default::default()
+    };
+    let gemm = |inputs: [&str; 3], out: &str| NodeProto {
+        op_type: "Gemm".to_owned(),
+        input: inputs.iter().map(|s| (*s).to_owned()).collect(),
+        output: vec![out.to_owned()],
+        attribute: vec![AttributeProto {
+            name: "transB".to_owned(),
+            i: Some(1),
+            r#type: 2,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    // z = [x0+x1, x0-x1, x0+x1+5]; y0 = relu(z0) + relu(z1) + 2^-20, y1 = 0.
+    let model = ModelProto {
+        ir_version: 8,
+        graph: Some(GraphProto {
+            node: vec![
+                gemm(["x", "W1", "B1"], "z"),
+                NodeProto {
+                    op_type: "Relu".to_owned(),
+                    input: vec!["z".to_owned()],
+                    output: vec!["h".to_owned()],
+                    ..Default::default()
+                },
+                gemm(["h", "W2", "B2"], "y"),
+            ],
+            initializer: vec![
+                t("W1", &[3, 2], &[1.0, 1.0, 1.0, -1.0, 1.0, 1.0]),
+                t("B1", &[3], &[0.0, 0.0, 5.0]),
+                t("W2", &[2, 3], &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
+                t("B2", &[2], &[1.0 / 1_048_576.0, 0.0]),
+            ],
+            input: vec![vi("x", &[1, 2])],
+            output: vec![vi("y", &[1, 2])],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    model.encode_to_vec()
+}
+
+fn proof_check_bundle(
+    onnx: &std::path::Path,
+    vnnlib: &std::path::Path,
+    leaves: &[(Vec<[u64; 3]>, Vec<f64>)],
+) -> Vec<u8> {
+    proof_check_bundle_closed(onnx, vnnlib, leaves, "bound")
+}
+
+/// [`proof_check_bundle`] with every node closed as `close` (`bound` or `opaque`).
+fn proof_check_bundle_closed(
+    onnx: &std::path::Path,
+    vnnlib: &std::path::Path,
+    leaves: &[(Vec<[u64; 3]>, Vec<f64>)],
+    close: &str,
+) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let digest = |p: &std::path::Path| {
+        let b = std::fs::read(p).expect("fixture");
+        (format!("{:x}", Sha256::digest(&b)), b.len())
+    };
+    let (osha, olen) = digest(onnx);
+    let (vsha, vlen) = digest(vnnlib);
+    let mut lines = vec![
+        serde_json::json!({
+            "kind": "header", "schema": "ny-proof-bundle/v2", "build": "cli-contract",
+            "profile": "proof", "profile_source": "cli", "lane": "margin_row",
+            "site_space": "onnx-relu-input/v1", "input_space": "onnx-input0-flat/v1",
+            "onnx": {"path": onnx.display().to_string(), "sha256": osha, "bytes": olen},
+            "vnnlib": {"path": vnnlib.display().to_string(), "sha256": vsha, "bytes": vlen},
+        }),
+        serde_json::json!({"kind": "sites", "tensors": [{"id": 1, "name": "z", "size": 3, "op": 1}]}),
+        serde_json::json!({"kind": "clauses", "region": 0, "list": [{"id": 1, "atoms": ["Y0:1,Y1:-1<=0"]}]}),
+    ];
+    for (k, (lits, beta)) in leaves.iter().enumerate() {
+        lines.push(serde_json::json!({
+            "kind": "node", "id": k, "region": 0, "lits": lits, "close": close, "src": "tree",
+            "dis": [1], "hint": {"beta": beta, "lift": false, "margin": 1e-6},
+        }));
+    }
+    lines.push(serde_json::json!({
+        "kind": "verdict", "source": "authorized", "required": [1], "min_margin": 1e-6,
+        "nodes": leaves.len(),
+    }));
+    lines.push(serde_json::json!({"kind": "published", "result": "unsat"}));
+    let mut body = String::new();
+    for l in &lines {
+        body.push_str(&l.to_string());
+        body.push('\n');
+    }
+    let end = serde_json::json!({
+        "kind": "end",
+        "lines": lines.len() + 1,
+        "sha256": format!("{:x}", Sha256::digest(body.as_bytes())),
+    });
+    body.push_str(&end.to_string());
+    body.push('\n');
+    body.into_bytes()
+}
+
+/// ENGINE_PROGRAM §1.7 B2.1: `ny proof-check` exits with the documented
+/// code — 0 verified, 10 unconfirmed, 20 invalid, 30 malformed, 4 for a usage
+/// error or an unreadable input — and its `PROOF_CHECK_DONE` line carries the
+/// REAL code first (`rc=<code> `), on stderr and as the last stdout line.
+#[test]
+fn cli_proof_check_exit_codes_are_the_documented_contract() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let onnx = dir.path().join("mlp.onnx");
+    let vnnlib = dir.path().join("prop.vnnlib");
+    std::fs::write(&onnx, proof_check_mlp_onnx()).expect("onnx");
+    std::fs::write(
+        &vnnlib,
+        "(declare-const X_0 Real)\n(declare-const X_1 Real)\n(declare-const Y_0 Real)\n\
+         (declare-const Y_1 Real)\n(assert (>= X_0 -1))\n(assert (<= X_0 1))\n\
+         (assert (>= X_1 -1))\n(assert (<= X_1 1))\n(assert (or (and (>= Y_1 Y_0))))\n",
+    )
+    .expect("vnnlib");
+    let leaves = vec![
+        (vec![[1, 0, 1], [1, 1, 1]], vec![1.0, 1.0]),
+        (vec![[1, 0, 1], [1, 1, 0]], vec![1.0, 0.0]),
+        (vec![[1, 0, 0], [1, 1, 1]], vec![0.0, 1.0]),
+        (vec![[1, 0, 0], [1, 1, 0]], vec![0.0, 0.0]),
+    ];
+    let check = |name: &str, bytes: &[u8], expected: i32| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, bytes).expect("bundle");
+        let output = run_ny(&[
+            "proof-check",
+            path.to_str().expect("UTF-8"),
+            "--threads",
+            "2",
+        ]);
+        assert_exit(&output, expected);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let done = format!("PROOF_CHECK_DONE rc={expected} ");
+        assert!(
+            stderr.contains(&done),
+            "{name}: stderr lacks `{done}`:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("[proof-check] verdict="),
+            "{name}:\n{stderr}"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.lines().last().is_some_and(|l| l.starts_with(&done)),
+            "{name}: the last stdout line is the DONE line:\n{stdout}"
+        );
+    };
+    check(
+        "ok.proof.jsonl",
+        &proof_check_bundle(&onnx, &vnnlib, &leaves),
+        0,
+    );
+    // Unconfirmed (10) needs a node the checker cannot discharge. A root-only
+    // `bound` node no longer qualifies: since B2.2 the clip rung confirms it on
+    // this true property. An `opaque` route claim is never confirmed.
+    check(
+        "opaque.proof.jsonl",
+        &proof_check_bundle_closed(&onnx, &vnnlib, &[(Vec::new(), Vec::new())], "opaque"),
+        10,
+    );
+    check(
+        "gap.proof.jsonl",
+        &proof_check_bundle(&onnx, &vnnlib, &leaves[..3]),
+        20,
+    );
+    check("garbage.proof.jsonl", b"not a bundle\n", 30);
+    // Operational: an unreadable bundle and a usage error.
+    let missing = dir.path().join("missing.proof.jsonl");
+    let output = run_ny(&["proof-check", missing.to_str().expect("UTF-8")]);
+    assert_exit(&output, OPERATIONAL_ERROR);
+    let output = run_ny(&["proof-check", "x.proof.jsonl", "--refine", "maybe"]);
+    assert_exit(&output, OPERATIONAL_ERROR);
+}

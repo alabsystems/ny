@@ -68,7 +68,6 @@ impl ActiveInputLayout {
             strides,
         }
     }
-
 }
 
 /// A contiguous axis-aligned tile of one active input's index space.
@@ -174,18 +173,33 @@ pub fn materialize_corner(
     }
 }
 
+/// One completed Hadamard level's outcome.
+#[derive(Debug, Clone)]
+pub struct LevelProposal {
+    /// Proposed per-block signs (block 0 keeps the incumbent; the caller tries
+    /// both of its orientations explicitly).
+    pub signs: Vec<i8>,
+    /// Recovered per-block directional effects. On a locally affine objective
+    /// `effects[b] = P * w_b` for `b > 0` (Hadamard orthogonality over the
+    /// `P` probes). `effects[0]` rides the constant column and is confounded
+    /// with the probe mean, so it says nothing about block 0's orientation and
+    /// MUST NOT be ranked against the others.
+    pub effects: Vec<f64>,
+}
+
 /// One Hadamard level: estimate every block's orientation effect around the
 /// incumbent corner and propose the per-block sign flips.
 ///
 /// `probe(signs)` evaluates the surrogate objective at the corner given by the
 /// signs (bigger = better); `None` aborts (deadline / evaluation failure) and
-/// surfaces as `None` here. Returns the proposed signs; the CALLER evaluates
-/// the proposal and decides acceptance — only measured values are ever kept.
+/// surfaces as `None` here. Returns the proposed signs plus the recovered
+/// per-block effects; the CALLER evaluates the proposal and decides acceptance
+/// — only measured values are ever kept.
 pub fn hadamard_level_proposal(
     block_count: usize,
     incumbent_signs: &[i8],
     probe: &mut dyn FnMut(&[i8]) -> Option<f64>,
-) -> Option<Vec<i8>> {
+) -> Option<LevelProposal> {
     debug_assert_eq!(block_count, incumbent_signs.len());
     let probes = block_count.next_power_of_two().max(2);
     let mut effect = vec![0.0f64; block_count];
@@ -210,13 +224,68 @@ pub fn hadamard_level_proposal(
     // Block 0 rides the constant column: its "effect" is the probe mean, which
     // says nothing about its orientation. Keep the incumbent sign; the caller
     // tries both of its orientations explicitly.
-    Some(
-        incumbent_signs
-            .iter()
-            .enumerate()
-            .map(|(b, &s)| if b == 0 || effect[b] >= 0.0 { s } else { -s })
-            .collect(),
-    )
+    let signs = incumbent_signs
+        .iter()
+        .enumerate()
+        .map(|(b, &s)| if b == 0 || effect[b] >= 0.0 { s } else { -s })
+        .collect();
+    Some(LevelProposal {
+        signs,
+        effects: effect,
+    })
+}
+
+/// Keep the `keep` highest-|effect| blocks ACTIVE and move every other block,
+/// with its incumbent sign, onto the frozen set (#flat-ladder-depth).
+///
+/// Block 0 ALWAYS stays active: its effect entry rides the Hadamard's constant
+/// column and is confounded with the probe mean, so it cannot be ranked.
+/// Retained blocks keep their relative order (so the ladder's positional
+/// "block 0" identity is stable). Returns the retained count.
+///
+/// This is the mechanism behind the typed `attack.flat_surrogate_max_blocks`
+/// cap: unarmed, the ladder never calls it and `split_all` doubles the block
+/// count each level exactly as before.
+pub fn retain_top_effect_blocks(
+    blocks: &mut Vec<TensorBlock>,
+    signs: &mut Vec<i8>,
+    effects: &[f64],
+    keep: usize,
+    frozen_blocks: &mut Vec<TensorBlock>,
+    frozen_signs: &mut Vec<i8>,
+) -> usize {
+    debug_assert_eq!(blocks.len(), signs.len());
+    debug_assert_eq!(blocks.len(), effects.len());
+    if blocks.len() <= keep {
+        return blocks.len();
+    }
+    // Rank blocks 1.. by |effect| descending; block 0 is force-retained.
+    let mut order: Vec<usize> = (1..blocks.len()).collect();
+    order.sort_by(|&a, &b| {
+        effects[b]
+            .abs()
+            .partial_cmp(&effects[a].abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut keep_mask = vec![false; blocks.len()];
+    keep_mask[0] = true;
+    for &i in order.iter().take(keep.saturating_sub(1)) {
+        keep_mask[i] = true;
+    }
+    let mut kept_blocks = Vec::with_capacity(keep);
+    let mut kept_signs = Vec::with_capacity(keep);
+    for (i, (block, sign)) in blocks.drain(..).zip(signs.drain(..)).enumerate() {
+        if keep_mask[i] {
+            kept_blocks.push(block);
+            kept_signs.push(sign);
+        } else {
+            frozen_blocks.push(block);
+            frozen_signs.push(sign);
+        }
+    }
+    *blocks = kept_blocks;
+    *signs = kept_signs;
+    blocks.len()
 }
 
 /// Split every splittable block, children inheriting the parent's sign.
@@ -328,8 +397,18 @@ mod tests {
         .expect("no aborts");
         assert_eq!(probes, 8);
         // Optimal signs are sign(w_b); block 0 keeps the incumbent.
-        assert_eq!(proposal, vec![1, -1, 1, -1, 1, -1, 1, -1]);
-        assert!(objective(&proposal) > objective(&incumbent));
+        assert_eq!(proposal.signs, vec![1, -1, 1, -1, 1, -1, 1, -1]);
+        assert!(objective(&proposal.signs) > objective(&incumbent));
+        // On an exactly-affine objective the recovered effect of block b > 0
+        // is P * w_b (orthogonality of the Hadamard rows over the 8 probes).
+        for (b, &w) in weights.iter().enumerate().skip(1) {
+            assert!(
+                (proposal.effects[b] - 8.0 * w).abs() < 1e-9,
+                "effects[{b}] = {}, expected {}",
+                proposal.effects[b],
+                8.0 * w
+            );
+        }
     }
 
     /// The multi-resolution ladder drives a nonlinear-but-monotone objective to
@@ -375,7 +454,7 @@ mod tests {
             .expect("no aborts");
             // Try both orientations of block 0, keep the best measured corner.
             for flip0 in [false, true] {
-                let mut candidate = proposal.clone();
+                let mut candidate = proposal.signs.clone();
                 if flip0 {
                     candidate[0] = -candidate[0];
                 }
@@ -390,6 +469,160 @@ mod tests {
         assert!(
             best >= optimum - 0.5,
             "ladder reached {best}, optimum {optimum}"
+        );
+    }
+
+    /// Retention keeps block 0 unconditionally, keeps the highest-|effect|
+    /// blocks after it, preserves relative order, and moves everything else —
+    /// with its sign — onto the frozen set.
+    #[test]
+    fn retain_top_effect_blocks_keeps_block0_and_the_largest_effects() {
+        let layout = ActiveInputLayout::new(0, vec![8]);
+        let mut blocks: Vec<TensorBlock> = (0..8)
+            .map(|i| TensorBlock {
+                input: 0,
+                ranges: vec![(i, i + 1)],
+            })
+            .collect();
+        let mut signs: Vec<i8> = vec![1, -1, 1, -1, 1, -1, 1, -1];
+        // Block 0's effect is a HUGE decoy (the constant column would show
+        // exactly this); it must be retained by position, not by rank.
+        let effects = [1e9, 0.1, 7.0, 0.2, -9.0, 0.3, 2.0, -0.4];
+        let mut frozen_blocks = Vec::new();
+        let mut frozen_signs = Vec::new();
+        let kept = retain_top_effect_blocks(
+            &mut blocks,
+            &mut signs,
+            &effects,
+            4,
+            &mut frozen_blocks,
+            &mut frozen_signs,
+        );
+        assert_eq!(kept, 4);
+        // Retained: block 0 (forced) + blocks 4 (|-9|), 2 (7), 6 (2), in
+        // original relative order.
+        let retained: Vec<usize> = blocks.iter().map(|b| b.ranges[0].0).collect();
+        assert_eq!(retained, vec![0, 2, 4, 6]);
+        assert_eq!(signs, vec![1, 1, 1, 1]);
+        let frozen: Vec<usize> = frozen_blocks.iter().map(|b| b.ranges[0].0).collect();
+        assert_eq!(frozen, vec![1, 3, 5, 7]);
+        assert_eq!(frozen_signs, vec![-1, -1, -1, -1]);
+        // Active + frozen still partition the whole index space.
+        let mut seen = [0u8; 8];
+        for block in blocks.iter().chain(frozen_blocks.iter()) {
+            block.for_each_offset(&layout, &mut |offset| seen[offset] += 1);
+        }
+        assert!(seen.iter().all(|&c| c == 1));
+        // A set already within the cap is untouched.
+        let kept = retain_top_effect_blocks(
+            &mut blocks,
+            &mut signs,
+            &effects[..4],
+            4,
+            &mut frozen_blocks,
+            &mut frozen_signs,
+        );
+        assert_eq!(kept, 4);
+        assert_eq!(frozen_blocks.len(), 4);
+    }
+
+    /// The CAPPED ladder (#flat-ladder-depth): per-level probe cost stays
+    /// bounded by the cap while refinement continues to single coordinates —
+    /// the uncapped schedule would need 64-block levels to get there.
+    #[test]
+    fn capped_ladder_refines_deeper_at_bounded_per_level_cost() {
+        let layout = ActiveInputLayout::new(0, vec![4, 16]);
+        // Concentrate the mass on an 8-coordinate heavy run at the START of
+        // the tensor (so the force-retained positional block 0 is part of it),
+        // with MIXED signs but unequal magnitudes: every contiguous sub-run of
+        // `5, -4, 5, -4, ...` has a nonzero sum, so a heavy-containing tile
+        // outranks the 0.01 background at EVERY granularity and effect-ranked
+        // retention keeps the right region. (An equal-magnitude alternation
+        // would cancel over whole tiles and blind the selection — that is a
+        // real property of the mechanism, not a bug in it.)
+        let mut weights = vec![0.01f64; 64];
+        for (i, w) in weights.iter_mut().enumerate().take(8) {
+            *w = if i % 2 == 0 { 5.0 } else { -4.0 };
+        }
+        let lo = vec![-1.0f32; 64];
+        let hi = vec![1.0f32; 64];
+        let affine = |x: &[f32]| -> f64 {
+            x.iter()
+                .zip(&weights)
+                .map(|(&v, &w)| f64::from(v) * w)
+                .sum()
+        };
+
+        let cap = 16usize;
+        let mut blocks = vec![TensorBlock::covering(0, &layout.shape)];
+        let mut signs = vec![1i8];
+        let mut frozen_blocks: Vec<TensorBlock> = Vec::new();
+        let mut frozen_signs: Vec<i8> = Vec::new();
+        let mut x = vec![0.0f32; 64];
+        let layouts = [layout];
+        let mut best = f64::NEG_INFINITY;
+        let mut max_level_probes = 0usize;
+        let mut last_effects: Option<Vec<f64>> = None;
+        loop {
+            if blocks.len().saturating_mul(2) > cap {
+                if let Some(effects) = last_effects.take() {
+                    retain_top_effect_blocks(
+                        &mut blocks,
+                        &mut signs,
+                        &effects,
+                        cap / 2,
+                        &mut frozen_blocks,
+                        &mut frozen_signs,
+                    );
+                    materialize_corner(&frozen_blocks, &frozen_signs, &layouts, &lo, &hi, &mut x);
+                }
+            }
+            if !split_all(&mut blocks, &mut signs) {
+                break;
+            }
+            let mut level_probes = 0usize;
+            let proposal = hadamard_level_proposal(blocks.len(), &signs, &mut |s| {
+                level_probes += 1;
+                materialize_corner(&blocks, s, &layouts, &lo, &hi, &mut x);
+                Some(affine(&x))
+            })
+            .expect("no aborts");
+            max_level_probes = max_level_probes.max(level_probes);
+            for flip0 in [false, true] {
+                let mut candidate = proposal.signs.clone();
+                if flip0 {
+                    candidate[0] = -candidate[0];
+                }
+                materialize_corner(&blocks, &candidate, &layouts, &lo, &hi, &mut x);
+                let value = affine(&x);
+                if value > best {
+                    best = value;
+                    signs = candidate;
+                }
+            }
+            last_effects = Some(proposal.effects);
+        }
+        // Per-level cost is capped: never more than `cap` probes per level.
+        assert!(
+            max_level_probes <= cap,
+            "a level spent {max_level_probes} probes, cap {cap}"
+        );
+        // Refinement went ALL the way down inside the retained region: the
+        // active blocks are single coordinates, which the uncapped schedule
+        // only reaches with a 64-probe level.
+        assert!(blocks
+            .iter()
+            .all(|b| b.ranges.iter().all(|&(s, e)| e - s == 1)));
+        assert!(!frozen_blocks.is_empty(), "the cap must have engaged");
+        // The heavy run is fully recovered: the 8 heavy coordinates fit inside
+        // the cap/2 retained blocks, the final Hadamard level over single
+        // coordinates recovers each sign exactly (the objective is exactly
+        // affine), and the frozen positive background was already at its
+        // optimal hi face when it froze.
+        let heavy: f64 = weights[..8].iter().map(|w| w.abs()).sum();
+        assert!(
+            best >= heavy,
+            "capped ladder reached {best}, heavy mass {heavy}"
         );
     }
 }

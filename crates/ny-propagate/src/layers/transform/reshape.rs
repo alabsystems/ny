@@ -9,7 +9,7 @@ use ny_core::{checked_shape_product, reshape_copy_axis_from_sentinel, NyError, R
 use ny_tensor::BoundedTensor;
 use std::borrow::Cow;
 
-use crate::{layers::common::BoundPropagation, LinearBounds};
+use crate::{layers::common::BoundPropagation, BatchedLinearBounds, LinearBounds};
 
 /// Reshape layer: changes tensor shape while preserving total elements.
 ///
@@ -42,7 +42,11 @@ impl ReshapeLayer {
                 infer_idx = Some(i);
             } else if dim == 0 {
                 if i < input_shape.len() {
-                    known_product *= input_shape[i];
+                    known_product = known_product.checked_mul(input_shape[i]).ok_or_else(|| {
+                        NyError::InvalidSpec(
+                            "Reshape: known target dimensions overflow usize".into(),
+                        )
+                    })?;
                 } else {
                     return Err(NyError::InvalidSpec(format!(
                         "Reshape dimension 0 at index {} but input only has {} dims",
@@ -58,9 +62,15 @@ impl ReshapeLayer {
                         input_shape.len()
                     )));
                 }
-                known_product *= input_shape[axis];
+                known_product = known_product
+                    .checked_mul(input_shape[axis])
+                    .ok_or_else(|| {
+                        NyError::InvalidSpec(
+                            "Reshape: known target dimensions overflow usize".into(),
+                        )
+                    })?;
             } else {
-                // Guard: negative dims (other than -1, 0) are invalid per ONNX spec (#2911)
+                // Guard: negative dims (other than -1, 0) are invalid per ONNX spec
                 if dim < 0 {
                     return Err(NyError::InvalidSpec(format!(
                         "Reshape dimension {} at index {} is invalid (only -1 and 0 are \
@@ -68,7 +78,12 @@ impl ReshapeLayer {
                         dim, i,
                     )));
                 }
-                known_product *= dim as usize;
+                let extent = usize::try_from(dim).map_err(|_| {
+                    NyError::InvalidSpec("Reshape: target dimension exceeds usize".into())
+                })?;
+                known_product = known_product.checked_mul(extent).ok_or_else(|| {
+                    NyError::InvalidSpec("Reshape: known target dimensions overflow usize".into())
+                })?;
             }
         }
         Ok((infer_idx, known_product))
@@ -119,6 +134,54 @@ impl ReshapeLayer {
         }
 
         Ok(output_shape)
+    }
+
+    /// Preserve a complete property row through its authored reshape.
+    ///
+    /// A full-column carrier indexes every tensor cell in logical C order;
+    /// splitting a feature axis into heads does not turn property rows into
+    /// tensor batches. This exact metadata remap remains available when an
+    /// optional attention corridor declines its resource admission. Genuine
+    /// local/batched carriers return `None` and keep their existing firewall.
+    pub(crate) fn try_remap_global_batched(
+        &self,
+        bounds: &BatchedLinearBounds,
+        input_shape: &[usize],
+    ) -> Result<Option<BatchedLinearBounds>> {
+        let authored_output = self.compute_output_shape(input_shape)?;
+        // Equal volumes cannot authenticate a stale transpose, a different
+        // authored batch layout, or a carrier for another graph edge.
+        if bounds.input_shape() != authored_output.as_slice() {
+            return Err(NyError::InvalidSpec(format!(
+                "Batched CROWN Reshape authored output mismatch: expected {:?}, got {:?}",
+                authored_output,
+                bounds.input_shape(),
+            )));
+        }
+        bounds.validate_internal_shapes()?;
+        let shape = bounds.lower_a().shape();
+        let columns = shape[shape.len() - 1];
+        let rows = shape[shape.len() - 2];
+        if checked_shape_product(&shape[..shape.len() - 2]) != Some(1)
+            || checked_shape_product(&authored_output) != Some(columns)
+        {
+            return Ok(None);
+        }
+        if rows == 0
+            || columns == 0
+            || bounds.lower_b().len() != rows
+            || checked_shape_product(bounds.output_shape()) != Some(rows)
+        {
+            return Err(NyError::InvalidSpec(
+                "Batched CROWN Reshape full-column property-row layout mismatch".into(),
+            ));
+        }
+        // No contraction, coefficient cast, repacking or block expansion occurs.
+        // The logical column order and both independent error planes survive
+        // bitwise, as do biases, property-row order and singleton storage axes.
+        let mut result = bounds.clone();
+        result.input_shape = input_shape.to_vec();
+        Ok(Some(result))
     }
 }
 

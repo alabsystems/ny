@@ -9,7 +9,7 @@ use crate::network::core::{GraphNetwork, GraphNode};
 use ndarray::{arr1, arr2};
 use std::collections::HashMap;
 
-/// Regression test for #2063: SPSA must propagate CROWN failures instead of
+/// Regression test: SPSA must propagate CROWN failures instead of
 /// silently substituting 0.0 objective values.
 ///
 /// Before the fix, `.ok().map(...).unwrap_or(0.0)` swallowed CROWN errors.
@@ -72,7 +72,7 @@ fn spsa_propagates_crown_failure_instead_of_swallowing() {
     );
 }
 
-/// Regression test for #2245: SPSA with num_samples=0 must not produce NaN
+/// Regression test: SPSA with num_samples=0 must not produce NaN
 /// from division by zero in gradient averaging.
 #[test]
 fn spsa_zero_samples_does_not_produce_nan() {

@@ -6,8 +6,6 @@
 //!
 //! Uses the joint DAG alpha-CROWN path that optimizes both ReLU and BilinearCrown
 //! alphas simultaneously, matching the real attention pattern.
-//!
-//! Reference: designs/2026-03-04-286-attention-bilinear-alternative.md Phase 3
 
 use std::fmt::Write as _;
 

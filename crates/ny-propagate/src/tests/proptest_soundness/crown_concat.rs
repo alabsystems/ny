@@ -7,14 +7,14 @@
 //! Concat Y = concat(A, B) is a linear operation (element permutation/stacking).
 //! CROWN backward splits the coefficient matrix at the boundary:
 //!   coeffs[:, :size_a] → bounds_a, coeffs[:, size_a:] → bounds_b
-//! with bias halved using directed rounding (#2173).
+//! with bias halved using directed rounding.
 //!
 //! Soundness property: for all (a, b) in input bounds,
 //!   crown_lower[i] <= concat(a, b)[i] <= crown_upper[i]
 //!
 //! As a linear op, CROWN-IBP equivalence should hold (within FP tolerance).
 //!
-//! Part of #3104: last remaining binary ops CROWN proptest gap (Concat).
+//! Closes the last remaining binary ops CROWN proptest gap (Concat).
 //!
 //! WALL-CLOCK POLICY FOR THIS FILE: every `#[ntest::timeout(..)]` below is a
 //! HANG SENTINEL, not a performance assertion, and the walls are deliberately

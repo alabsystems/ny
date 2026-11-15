@@ -6,8 +6,6 @@
 //!
 //! Tests `optimize_graph_beta_spsa`, `optimize_graph_beta_analytical`,
 //! `evaluate_graph_child_bounds`, and `propagate_crown_with_graph_beta_and_intermediates`.
-//!
-//! Issue: #1892
 
 use super::gpu_bab::simple_graph_network;
 use super::prelude::*;

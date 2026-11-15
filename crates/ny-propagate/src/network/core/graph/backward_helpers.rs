@@ -5,7 +5,7 @@
 //! Shared graph-wide backward helpers for CROWN bound accumulation.
 //!
 //! These helpers are used across graph-CROWN, graph-alpha, and beta-CROWN graph
-//! constraint coordinators. Hoisted from `graph_crown/utils.rs` (#3936) to make
+//! constraint coordinators. Hoisted from `graph_crown/utils.rs` to make
 //! the cross-engine dependency explicit and eliminate module-boundary leaks.
 
 use crate::bounds::patches::{CrownBounds, PatchesLinearBounds};
@@ -114,8 +114,46 @@ pub(crate) fn mask_linear_bounds_columns(
             Array1::zeros(node_lb.upper_b().len()),
         )
     };
-    LinearBounds::new_or_conservative(lower_a, lower_b, upper_a, upper_b)
-        .expect("masking preserves A/bias shapes; new_or_conservative cannot fail on shape")
+    // Carry the COEFFICIENT-ERROR plane through the same column mask.
+    //
+    // `new_or_conservative` hardcodes `lower_a_err: None`, so publishing through it
+    // ERASES the plane. Nothing re-charges it downstream: `bounds/concretize.rs`
+    // computes its coefficient penalty from exactly these fields and charges ZERO
+    // when they are None, so the incoming error — the upstream Linear/Conv's full
+    // Higham charge — would simply vanish and this branch's bound would be tighter
+    // than the arithmetic justifies.
+    //
+    // A structural op must move the ERROR plane exactly as it moves the VALUE plane,
+    // so mask the same columns rather than discharging into the bias: masking costs
+    // no tightness at all, and a zeroed coefficient genuinely carries zero error.
+    // The bias rule above applies to the error plane too — it is per-output and must
+    // not be double-counted — but the error plane is per-COLUMN, and the columns this
+    // branch keeps are disjoint from the other branch's, so no double-count arises.
+    match (node_lb.lower_a_err(), node_lb.upper_a_err()) {
+        (Some(le), Some(ue)) => {
+            let mut lower_a_err = le.clone();
+            let mut upper_a_err = ue.clone();
+            for (col, &m) in mask.iter().enumerate() {
+                if m != keep_true {
+                    for row in 0..lower_a_err.nrows() {
+                        lower_a_err[[row, col]] = 0.0;
+                        upper_a_err[[row, col]] = 0.0;
+                    }
+                }
+            }
+            LinearBounds::new_or_conservative_with_err(
+                lower_a,
+                lower_b,
+                upper_a,
+                upper_b,
+                lower_a_err,
+                upper_a_err,
+            )
+            .expect("masking preserves A/bias/err shapes; constructor cannot fail on shape")
+        }
+        _ => LinearBounds::new_or_conservative(lower_a, lower_b, upper_a, upper_b)
+            .expect("masking preserves A/bias shapes; new_or_conservative cannot fail on shape"),
+    }
 }
 
 /// Minimum dense row count for Dense->Patches re-entry
@@ -696,7 +734,7 @@ pub(crate) fn node_admits_patches_backward_step(node: &GraphNode) -> bool {
     }
 }
 
-/// Try patches-native residual passthrough for Add/Sub nodes (#4382).
+/// Try patches-native residual passthrough for Add/Sub nodes.
 ///
 /// Returns `Ok(true)` if this node was handled in patches form (caller should
 /// skip the Dense fallback). Returns `Ok(false)` if not applicable.
@@ -841,6 +879,27 @@ pub(crate) fn patches_finite_authority_refuses(
     deadline_is_hard: bool,
     deadline: Option<Instant>,
 ) -> bool {
+    finite_authority_refuses_native_patches(
+        deadline_is_hard,
+        deadline,
+        &PATCHES_ALPHA_GRAPH_PRESERVE,
+    )
+}
+
+/// The ONE `NY_PATCHES_FINITE_EXPIRY` decision for every graph-lane native
+/// Patches set-mate, parameterised only by which engagement counters record it.
+///
+/// [`patches_finite_authority_refuses`] is this with the
+/// `patches-alpha-graph` counters; the residual-join merge in
+/// `CrownMergeAccumulator::merge_crown_with_deadline_authority`
+/// (#patches-merge-expiry, audit N6) is this with `patches-merge-graph`. A
+/// separate counter pair keeps the merge's saved/discarded counts from being
+/// read as the fan-out's, while the decision itself cannot drift between them.
+pub(crate) fn finite_authority_refuses_native_patches(
+    deadline_is_hard: bool,
+    deadline: Option<Instant>,
+    counters: &DeadlinePreserveCounters,
+) -> bool {
     if !deadline_is_hard {
         return false;
     }
@@ -853,7 +912,7 @@ pub(crate) fn patches_finite_authority_refuses(
     // [deadline-preserve] BUG #18: count the decision either way. Hard
     // authority only — a soft internal timestamp never carried an optimizer
     // state to preserve. Recording is after the decision; routing unchanged.
-    PATCHES_ALPHA_GRAPH_PRESERVE.record(refuses);
+    counters.record(refuses);
     refuses
 }
 
@@ -1100,30 +1159,30 @@ impl GraphNetwork {
         )
     }
 
-    /// Runtime invariant check for #2617/#2530 split-path bounds (#2656).
+    /// Runtime invariant check for split-path bounds.
     ///
     /// `BackwardDispatchResult::Binary`/`Nary` must carry bias only in the
     /// separate channel; each per-input `LinearBounds` path must have zero bias.
     /// Violation would silently double-count bias, producing unsound (too-tight) bounds.
     ///
-    /// Originally `debug_assert!`, upgraded to runtime check (#2656): the cost of
+    /// Originally `debug_assert!`, upgraded to runtime check: the cost of
     /// iterating the bias vector is negligible vs. the CROWN backward matrix
     /// multiplications, and this invariant guards against a class of severe
-    /// soundness bugs (#2520, #2527, #2529, #2530).
+    /// soundness bugs.
     ///
-    /// Converted from `assert!` to `Result` (#2907) to eliminate a production
+    /// Converted from `assert!` to `Result` to eliminate a production
     /// panic cliff — callers can now propagate the error cleanly instead of
     /// crashing the entire verification run.
     #[inline]
     pub(crate) fn verify_split_path_bias_zero(bounds: &LinearBounds, context: &str) -> Result<()> {
-        // Tolerance for floating-point rounding artifacts (#2700).
+        // Tolerance for floating-point rounding artifacts.
         // Split-path bias must be exactly zero by construction, but accumulated
         // float ops can produce negligible artifacts (e.g., 1e-38).
         const TOLERANCE: f32 = 1e-30;
 
         for (label, bias) in [("lower_b", bounds.lower_b()), ("upper_b", bounds.upper_b())] {
             // Check NaN explicitly first — IEEE 754 NaN == 0.0 returns false,
-            // which would produce the misleading "non-zero" message (#2700).
+            // which would produce the misleading "non-zero" message.
             if bias.iter().any(|v| v.is_nan()) {
                 return Err(NyError::InvalidSpec(format!(
                     "{context} produced NaN in {label} split-path bounds \
@@ -1141,7 +1200,7 @@ impl GraphNetwork {
         Ok(())
     }
 
-    /// CrownBounds-aware bias accumulation for DAG-CROWN (Phase 1b, #2613).
+    /// CrownBounds-aware bias accumulation for DAG-CROWN.
     ///
     /// Same logic as [`accumulate_bias_to_network_input`] but operates on a
     /// `CrownBounds` map. When inserting a new NETWORK_INPUT entry, wraps as

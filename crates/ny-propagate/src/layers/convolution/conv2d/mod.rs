@@ -58,7 +58,6 @@ pub use types::{Conv2dLayer, ConvTranspose2dLayer};
 /// Kernel shape: (out_c, in_c_per_group, kh, kw) where in_c_per_group = total_in_c / groups.
 ///
 /// Reference: alpha-beta-CROWN `auto_LiRPA/operators/convolution.py:85-115`.
-/// Design doc: `designs/2026-03-06-conv-crown-backward-gemm.md` (#3382).
 // Justification: Conv2d backward GEMM needs all conv parameters (kernel, stride,
 // padding, sizes, channels, groups) plus the engine; grouping into a struct would lose
 // clarity for this internal function.

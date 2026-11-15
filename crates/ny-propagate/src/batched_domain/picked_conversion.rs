@@ -23,7 +23,6 @@ impl BatchedDomains {
     /// `BatchedDomainOptions::default()` (no intermediate transfer).
     ///
     /// # Reference
-    /// Design: `designs/2026-02-03-batched-domain-pickout-gpu-transfer.md`
     /// Alpha-beta-CROWN: `complete_verifier/branching_domains.py`:270-305
     pub fn from_picked_domains(picked: PickedDomains) -> Self {
         Self::from_picked_domains_with_options(picked, BatchedDomainOptions::default())
@@ -45,9 +44,8 @@ impl BatchedDomains {
     /// * `options` - Options controlling intermediate bound transfer
     ///
     /// # Reference
-    /// Design: `designs/2026-02-03-batched-domain-pickout-gpu-transfer.md`
     /// Alpha-beta-CROWN: `complete_verifier/branching_domains.py`:270-305
-    /// Fix: #1655 — enable_interm_transfer was a no-op on the pick_out path
+    /// Fix: enable_interm_transfer was previously a no-op on the pick_out path
     pub fn from_picked_domains_with_options(
         picked: PickedDomains,
         options: BatchedDomainOptions,

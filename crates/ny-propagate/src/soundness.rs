@@ -137,7 +137,7 @@ pub fn soundness_provenance_for_graph(
 /// Scan layers for heuristic/unsound switches and produce a soundness provenance report.
 ///
 /// Uses `PropagationMethod` enum instead of string matching to prevent
-/// silent mismatches when new variants are added. Ref: #2807.
+/// silent mismatches when new variants are added.
 pub(crate) fn soundness_provenance_for_layers<'a, I>(
     layers: I,
     actual_method: &PropagationMethod,
@@ -171,9 +171,11 @@ where
     let mut reduce_extremum_fixed_index_nodes = 0usize;
     // Other sampling-based relaxations (GELU/Sin/Cos) share a coarse-grained marker.
     let mut sampling_relaxations_present = false;
+    let mut diagnostic_point_only_present = false;
 
     for layer in layers {
         match layer {
+            Layer::PointLinear(_) => diagnostic_point_only_present = true,
             Layer::LayerNorm(ln) => {
                 if ln.forward_mode {
                     layernorm_forward_mode_nodes += 1;
@@ -252,7 +254,6 @@ where
             // Exhaustive listing of layers with no heuristic flags.
             // Adding a new Layer variant will produce a compile error here,
             // forcing explicit consideration of whether it needs heuristic scanning.
-            // See: #2475
             Layer::Linear(_)
             // Interval-valued frozen constant: an outward-rounded ENCLOSURE, not
             // a sampled or heuristic relaxation. Nothing to scan for here.
@@ -406,7 +407,15 @@ where
         }
     }
 
-    SoundnessProvenance::from_heuristics(heuristics_used)
+    let provenance = SoundnessProvenance::from_heuristics(heuristics_used);
+    if diagnostic_point_only_present {
+        // Metadata never qualifies the point-only representation. Proof entry
+        // points refuse it; a separately requested diagnostic report must not
+        // describe it as an ordinary certified Linear.
+        provenance.combine(&SoundnessProvenance::heuristic())
+    } else {
+        provenance
+    }
 }
 
 #[cfg(test)]
@@ -462,7 +471,7 @@ mod tests {
         assert_eq!(count, 1);
     }
 
-    /// Test count_sqrt_negative_domain_from_bounds with pre-computed bounds (#3184).
+    /// Test count_sqrt_negative_domain_from_bounds with pre-computed bounds.
     #[ntest::timeout(5000)]
     #[test]
     fn test_sqrt_negative_domain_from_precomputed_bounds() {
@@ -476,7 +485,7 @@ mod tests {
         assert_eq!(count, 1);
     }
 
-    /// Verify from_bounds returns 0 when no sqrt nodes have negative inputs (#3184).
+    /// Verify from_bounds returns 0 when no sqrt nodes have negative inputs.
     #[ntest::timeout(5000)]
     #[test]
     fn test_sqrt_negative_domain_from_bounds_positive_input() {
@@ -512,7 +521,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #2533: SiLU uses analytical relaxation (chord+tangent),
+    /// Regression test: SiLU uses analytical relaxation (chord+tangent),
     /// not sampling. A network containing only SiLU should be classified as Sound.
     #[ntest::timeout(5000)]
     #[test]
@@ -724,7 +733,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #2807: IBP method should skip heuristic scanning
+    /// Regression test: IBP method should skip heuristic scanning
     /// (heuristics are only relevant for CROWN-family methods).
     #[ntest::timeout(5000)]
     #[test]
@@ -762,7 +771,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #2807: each CROWN variant should detect heuristic flags.
+    /// Regression test: each CROWN variant should detect heuristic flags.
     #[ntest::timeout(5000)]
     #[test]
     fn test_soundness_provenance_all_crown_variants_detect_heuristics() {

@@ -189,7 +189,7 @@ fn test_abs_crown_soundness() {
     }
 }
 
-/// Regression test for #1780: subnormal crossing intervals must keep a sound upper CROWN line.
+/// Regression test: subnormal crossing intervals must keep a sound upper CROWN line.
 #[ntest::timeout(10000)]
 #[test]
 fn test_abs_crown_subnormal_upper_soundness_1780() {

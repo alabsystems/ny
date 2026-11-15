@@ -94,7 +94,7 @@ pub(super) struct BufferPool {
     /// Staging buffer for output readback
     pub(super) gemm_staging_buffer: Option<(wgpu::Buffer, usize)>,
 
-    // CROWN backward buffers (persistent GPU A-matrices, #3397)
+    // CROWN backward buffers (persistent GPU A-matrices)
     /// Params uniform buffer for CROWN backward shaders (fixed size)
     pub(super) crown_params_buffer: Option<wgpu::Buffer>,
     /// A-matrix lower bounds — ping buffer (num_specs × max_dim)
@@ -128,7 +128,7 @@ pub(super) struct BufferPool {
     /// Staging buffer for concretized output readback
     pub(super) crown_staging_upper: Option<(wgpu::Buffer, usize)>,
 
-    // Conv2d CROWN backward intermediate buffers (#3397)
+    // Conv2d CROWN backward intermediate buffers
     /// Reshaped A-matrix lower: (total_spatial, out_c)
     pub(super) conv_reshaped_lower: Option<(wgpu::Buffer, usize)>,
     /// Reshaped A-matrix upper: (total_spatial, out_c)
@@ -237,7 +237,7 @@ impl BufferPool {
     /// Release all CROWN backward buffer slots, returning memory to the system.
     ///
     /// Call between models in the VNN-COMP runner to prevent cross-model memory
-    /// accumulation from the grow-only buffer pool (#3515).
+    /// accumulation from the grow-only buffer pool.
     // Used in tests and Phase 2 VNN-COMP runner integration.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn release_crown_buffers(&mut self) {
@@ -423,7 +423,7 @@ mod tests {
         assert!(!oversized(mib, 1), "1 MiB is below the shrink floor");
     }
 
-    /// Verify release_crown_buffers clears all CROWN-related pool slots (#3515).
+    /// Verify release_crown_buffers clears all CROWN-related pool slots.
     #[test]
     fn test_release_crown_buffers_clears_all_slots() {
         let mut pool = BufferPool::default();

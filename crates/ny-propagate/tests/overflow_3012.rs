@@ -76,7 +76,7 @@ fn test_convtranspose2d_crown_batched_input_dims_overflow_returns_error_3012() {
 // NyError::InvalidSpec) works end-to-end; the pool guards use the identical
 // code pattern (see average.rs:362 and max.rs:276).
 //
-// The remaining #3012 packets add guards to ndarray-backed shapes (MulBinary and
+// The remaining overflow guards protect ndarray-backed shapes (MulBinary and
 // decomposed normalization row counts). Those exact overflows are similarly
 // impossible to realize end-to-end because ndarray must already accept the shape,
 // so we regression-test the shared helper that now routes those guard failures.

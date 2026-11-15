@@ -215,7 +215,7 @@ fn test_graph_network_zonotope_non_2d_fallback() {
     assert_eq!(result.shape(), &[2]);
 }
 
-/// #3548: non-finite graph input should be rejected as a fallback-class error
+/// Non-finite graph input should be rejected as a fallback-class error
 /// before zonotope construction so callers can degrade to IBP.
 #[ntest::timeout(10000)]
 #[test]
@@ -242,7 +242,7 @@ fn test_graph_network_zonotope_non_finite_input_returns_unsupported_configuratio
     }
 }
 
-/// Regression test for #2470: GELU zonotope must use GELU math, not SiLU.
+/// Regression test: GELU zonotope must use GELU math, not SiLU.
 ///
 /// Verifies that zonotope propagation through a GELU layer produces bounds
 /// that contain sampled GELU outputs. Before the fix, this used `silu_affine()`
@@ -335,8 +335,8 @@ fn test_graph_network_zonotope_gelu_soundness_2470() {
     }
 }
 
-/// #2991: Empty-input AddConstant is now caught at construction time by
-/// GraphNode::try_new() arity validation (#2481, #2686).
+/// Empty-input AddConstant is now caught at construction time by
+/// GraphNode::try_new() arity validation.
 #[ntest::timeout(10000)]
 #[test]
 fn test_graph_network_zonotope_node_missing_unary_input_returns_invalid_spec() {
@@ -360,7 +360,7 @@ fn test_graph_network_zonotope_node_missing_unary_input_returns_invalid_spec() {
     );
 }
 
-/// #2991: Empty-input ReLU is now caught at construction time.
+/// Empty-input ReLU is now caught at construction time.
 #[ntest::timeout(10000)]
 #[test]
 fn test_graph_network_zonotope_fallback_missing_unary_input_returns_invalid_spec() {
@@ -424,7 +424,7 @@ fn build_attention_context_graph(dim: usize) -> GraphNetwork {
     graph
 }
 
-/// #3457/#3464: unsupported zonotope softmax configs must downgrade to
+/// Unsupported zonotope softmax configs must downgrade to
 /// `UnsupportedConfiguration` so graph-level propagation falls back to IBP
 /// instead of surfacing a hard `InvalidSpec`.
 #[ntest::timeout(10000)]
@@ -457,7 +457,7 @@ fn test_graph_network_zonotope_softmax_unsupported_axis_falls_back_to_ibp() {
     assert_bounded_tensor_close(&zonotope_bounds, &ibp_bounds, 1e-6, "softmax fallback");
 }
 
-/// #318, #3464: attention-context `MatMul(transpose_b=false)` should stay on a
+/// Attention-context `MatMul(transpose_b=false)` should stay on a
 /// sound zonotope path even when Softmax and V no longer share symbols.
 #[ntest::timeout(10000)]
 #[test]

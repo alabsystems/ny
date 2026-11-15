@@ -4,7 +4,7 @@
 
 //! Tests for variable-style AdaIN1d (ternary layer).
 //!
-//! Part of #4142. Covers:
+//! Covers:
 //! - Variable-style constructor and arity predicates
 //! - Fixed-style accessor rejection on variable-style
 //! - Ternary IBP soundness (4-corner product hull)

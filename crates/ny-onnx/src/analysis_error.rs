@@ -11,7 +11,7 @@
 //! `DiffError` is intentionally excluded — it has additional variants specific
 //! to the model comparison use case (ORT runtime, IO, NPY, shape mismatch).
 //!
-//! # Structured payloads (Issue #2295)
+//! # Structured payloads
 //!
 //! `LoadError` and `PropagationError` wrap `Box<NyError>` instead of `String`
 //! to preserve programmatic error discrimination across the analysis boundary.

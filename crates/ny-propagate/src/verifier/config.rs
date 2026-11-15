@@ -11,7 +11,7 @@ use ny_core::VerificationSpec;
 use std::time::Instant;
 
 impl Verifier {
-    /// Build α-CROWN config from propagation config with optional deadline (#2987).
+    /// Build α-CROWN config from propagation config with optional deadline.
     ///
     /// When `deadline` is `Some`, the α-CROWN optimization loop will bail early
     /// via `past_deadline()` if the verification timeout budget is exhausted.

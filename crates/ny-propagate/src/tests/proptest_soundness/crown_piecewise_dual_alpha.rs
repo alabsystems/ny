@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Proptest soundness for dual-alpha ReLU CROWN backward (#3393).
+//! Proptest soundness for dual-alpha ReLU CROWN backward.
 //!
 //! Tests `propagate_linear_with_alpha` with `Some(alpha_upper)`, exercising the
 //! dual alpha path where lower and upper bound objectives use independent alpha

@@ -6,7 +6,7 @@
 //!
 //! Compares CPU baseline vs wgpu GPU implementations.
 //!
-//! Run with: cargo bench -p ny-gpu
+//! Run with: targo --unverified bench -p ny-gpu
 //! HTML reports: target/criterion/report/index.html
 //!
 //! ## Isolated Kernel Benchmarks

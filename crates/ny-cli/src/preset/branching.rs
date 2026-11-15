@@ -9,6 +9,43 @@ use ny_propagate::BranchingHeuristic;
 use super::PresetConfig;
 use crate::commands::beta_crown::branching::{parse_branching_heuristic, RELU_TOKEN};
 
+/// #genbab-candidates: build the GenBaB config from the preset instead of
+/// taking `NonlinearBranchingConfig::default()` wholesale.
+///
+/// WHY THIS EXISTS. `NonlinearBranchingConfig::num_candidates` defaults to **1**
+/// and `selector.rs` ends `candidates.truncate(self.config.num_candidates)`
+/// after sorting by score — so GenBaB branching considers exactly ONE candidate
+/// per split. No preset key could raise it: both GenBaB construction sites took
+/// `::default()`.
+///
+/// Meanwhile `configs/vnncomp25/ml4acopf_2024.yaml` writes `candidates: 100`
+/// under `branching:`, which `preset::apply` sends to `config.fsb_candidates` —
+/// a field read only by the sequential selector, the GPU kFSB lane and
+/// kFSB-multi (`engine/branching/sequential.rs`, `gpu_bab/kfsb.rs`,
+/// `batched/kfsb_multi.rs`). ml4acopf runs none of them. So the 100 it asks for
+/// has never reached the selector it meant, and the selector it meant has been
+/// running at 1.
+///
+/// ONLY `num_candidates` is delivered here, deliberately. The sibling
+/// `filter`/`filter_beta` fields are declared on `NonlinearBranchingConfig` and
+/// read by NOTHING outside their own unit tests (checked across the crate), so
+/// wiring them would be a fake fix that silences a contract entry without
+/// changing behaviour. `preset/contract.rs` continues to report them unhonoured,
+/// which is correct.
+///
+/// `configs/vnncomp25/ml4acopf_2024.yaml` sets `nonlinear_split.num_candidates:
+/// 100` (#genbab-selector-convention); every other preset keeps the `Default`
+/// of 1. VALUE-NEUTRAL today: both GenBaB consumers branch on `decisions[0]`
+/// and the sort is stable, so the chosen split does not depend on the budget
+/// until a consumer (the BBPS filter) reads `decisions[1..]`.
+fn genbab_config(preset: &PresetConfig) -> NonlinearBranchingConfig {
+    let mut config = NonlinearBranchingConfig::default();
+    if let Some(candidates) = preset.bab.branching.nonlinear_split.num_candidates {
+        config.num_candidates = candidates;
+    }
+    config
+}
+
 /// Branching selection resolved from a preset file.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ResolvedBranching {
@@ -33,7 +70,7 @@ pub(crate) fn resolve_branching(preset: &PresetConfig) -> Result<Option<Resolved
         // changes a verdict.
         if preset.bab.branching.nonlinear_split.requests_genbab() {
             return Ok(Some(ResolvedBranching {
-                heuristic: BranchingHeuristic::GenBaB(NonlinearBranchingConfig::default()),
+                heuristic: BranchingHeuristic::GenBaB(genbab_config(preset)),
                 use_relu_split: true,
             }));
         }
@@ -42,10 +79,14 @@ pub(crate) fn resolve_branching(preset: &PresetConfig) -> Result<Option<Resolved
             use_relu_split: false,
         }));
     };
-    parse_resolved_branching(method, input_split_enabled).map(Some)
+    parse_resolved_branching(method, input_split_enabled, genbab_config(preset)).map(Some)
 }
 
-fn parse_resolved_branching(method: &str, input_split_enabled: bool) -> Result<ResolvedBranching> {
+fn parse_resolved_branching(
+    method: &str,
+    input_split_enabled: bool,
+    genbab: NonlinearBranchingConfig,
+) -> Result<ResolvedBranching> {
     let normalized = method.to_ascii_lowercase();
     if normalized == RELU_TOKEN {
         return Ok(ResolvedBranching {
@@ -62,7 +103,7 @@ fn parse_resolved_branching(method: &str, input_split_enabled: bool) -> Result<R
     // tuning keep input splitting — selecting GenBaB requires naming it here.
     if normalized == "nonlinear" || normalized == "genbab" {
         return Ok(ResolvedBranching {
-            heuristic: BranchingHeuristic::GenBaB(NonlinearBranchingConfig::default()),
+            heuristic: BranchingHeuristic::GenBaB(genbab),
             use_relu_split: true,
         });
     }
@@ -81,7 +122,7 @@ fn parse_resolved_branching(method: &str, input_split_enabled: bool) -> Result<R
     let heuristic = parse_branching_method(method)?;
     // kFSB and kFSB-intercept-only are ReLU-splitting strategies: they select
     // which ReLU neuron to pin active/inactive. Route them through the graph
-    // ReLU-split path, not input splitting. (#4300)
+    // ReLU-split path, not input splitting.
     let use_relu_split = matches!(
         heuristic,
         BranchingHeuristic::Kfsb

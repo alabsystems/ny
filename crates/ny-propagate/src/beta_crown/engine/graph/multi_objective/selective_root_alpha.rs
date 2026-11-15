@@ -103,6 +103,18 @@ pub(in crate::beta_crown::engine::graph) fn install_child_continuation_state(
     domain.beta_state = beta_state;
     if let Some(alpha_state) = alpha_state {
         domain.alpha_state = alpha_state;
+        // Coherence: an installed ascended α REPLACES the shared child
+        // α (the dense-adapter `optimized_alphas` path — dark unless
+        // NY_WIDE_ALPHA_UNSHARED=1). Any inherited per-disjunct α snapshots
+        // belong to the replaced α family; clear them at the replacement site
+        // so two inconsistent α families never coexist, imitating the
+        // SelectiveExpandedWarmup provenance arm below. Deliberately scoped to
+        // ACTUAL replacement: the `None` arm (the ubiquitous inherited-α path)
+        // preserves per-disjunct α for the sequential-lane per-disjunct
+        // evaluator and its Complete-Clip/root-transport consumers — blanket
+        // clears are rejected by design
+        // (docs/REGRESSION_FC_UNSAT_LOST_2026-08-14.md, S3 design map (c)).
+        domain.clear_per_disjunct_alphas();
     }
     apply_child_continuation_state_provenance(domain, provenance);
 }
@@ -645,9 +657,21 @@ mod tests {
             (next.beta_state().entries[0].value() - 0.73).abs() < f32::EPSILON,
             "next child must warm-start the existing split from W beta"
         );
+        // #alpha-split-refresh at child birth: the installed W alpha (0.37,
+        // rebased from the ROOT candidate — ancestor-box values) does not
+        // survive verbatim into descendants. The still-unstable neuron keeps
+        // its optimizable ENTRY, but its store is the neutral delta 0.5 with
+        // split_refresh=true (composed slope = the next child's current-box
+        // heuristic). Beta warm-start and the W node-bounds cache transfer
+        // are unchanged. Receipted law: stale inherited alpha measurably
+        // loses to the plain current-box heuristic (REGRESSION doc).
         assert!(
-            (next.alpha_state().alpha("relu", 2) - 0.37).abs() < f32::EPSILON,
-            "next child must inherit W alpha for a still-unstable neuron"
+            next.alpha_state().split_refresh(),
+            "next child stored alpha must be delta-form"
+        );
+        assert!(
+            (next.alpha_state().alpha("relu", 2) - 0.5).abs() < f32::EPSILON,
+            "next child must neutralize the inherited W alpha to the 0.5 delta"
         );
         assert!(next.cached_las().iter().all(Option::is_none));
         assert!(next.per_disjunct_alphas().is_none());

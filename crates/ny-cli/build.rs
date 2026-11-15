@@ -233,7 +233,9 @@ fn major_minor(version: &str) -> String {
 /// the same release number are different compilers, and the Trust toolchain
 /// (`build-ny-with-trust-toolchain`) is different again.
 fn rustc_identity() -> String {
-    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    // Cargo/targo always set RUSTC for build scripts; the fallback names the
+    // Trust compiler (owner directive 2026-09-28), never a bare `rustc`.
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "trustc".to_string());
     let Ok(output) = std::process::Command::new(&rustc).arg("-vV").output() else {
         return "unknown".to_string();
     };
@@ -265,7 +267,10 @@ fn watch_git_metadata(root: Option<&std::path::Path>) {
     for path in ["HEAD", "refs", "index"] {
         if let Some(resolved) = git_stdout(root, &["rev-parse", "--git-path", path]) {
             if !resolved.is_empty() {
-                println!("cargo:rerun-if-changed={resolved}");
+                // Git resolves relative metadata paths from `root`, while
+                // Cargo resolves rerun paths from this crate's directory.
+                let watched = root.join(resolved);
+                println!("cargo:rerun-if-changed={}", watched.display());
             }
         }
     }

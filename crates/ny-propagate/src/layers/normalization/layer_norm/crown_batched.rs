@@ -12,8 +12,6 @@
 //! Keeps LayerNorm-specific logic: MeanOnly early-return and the analytical
 //! MeanOnly batched backward pass (no sampling needed since mean subtraction
 //! is linear).
-//!
-//! Reference: designs/2026-03-14-issue-2077-layernorm-shared-decomposed-crown.md
 
 use ndarray::{Array2, Array3};
 use ny_core::{checked_shape_product, NyError, Result};
@@ -23,6 +21,7 @@ use tracing::{debug, warn};
 use super::types::{LayerNormCrownMode, LayerNormLayer, LayerNormMode};
 use crate::layers::normalization::crown_batched_common::sampling_crown_batched;
 use crate::layers::normalization::decomposed::decomposed_norm_crown_backward;
+use crate::layers::normalization::radial;
 use crate::BatchedLinearBounds;
 
 impl LayerNormLayer {
@@ -84,7 +83,7 @@ impl LayerNormLayer {
         }
 
         if self.crown_mode == LayerNormCrownMode::IbpValidated {
-            return Ok(decomposed_norm_crown_backward(
+            let baseline = decomposed_norm_crown_backward(
                 bounds,
                 &self.ny,
                 &self.beta,
@@ -92,7 +91,20 @@ impl LayerNormLayer {
                 pre_activation,
                 self.forward_mode,
             )?
-            .bounds);
+            .bounds;
+            return if !self.forward_mode {
+                radial::refine_batched(
+                    bounds,
+                    baseline,
+                    pre_activation,
+                    &self.ny,
+                    Some(&self.beta),
+                    self.eps,
+                    true,
+                )
+            } else {
+                Ok(baseline)
+            };
         }
 
         sampling_crown_batched("layernorm", bounds, pre_activation, |b, pa| {
@@ -175,7 +187,7 @@ impl LayerNormLayer {
         let mut new_upper_b = Array2::<f32>::zeros((total_batch, out_dim));
 
         if norm_size > (1 << 24) {
-            // f32 precision guard (#2136)
+            // f32 precision guard
             return Err(NyError::InternalError(format!(
                 "LayerNorm dimension {norm_size} exceeds f32 exact integer range"
             )));
@@ -184,8 +196,8 @@ impl LayerNormLayer {
 
         for b in 0..total_batch {
             for j in 0..out_dim {
-                // Accumulate sums and bias in f64 to prevent catastrophic cancellation (#2169).
-                // Consistent with the scalar path (crown_scalar.rs, fixed by #2164).
+                // Accumulate sums and bias in f64 to prevent catastrophic cancellation.
+                // Consistent with the scalar path (crown_scalar.rs).
                 let mut lower_sum = 0.0_f64;
                 let mut upper_sum = 0.0_f64;
                 let mut lower_bias = 0.0_f64;
@@ -203,7 +215,7 @@ impl LayerNormLayer {
                 let lower_mean_term = lower_sum * inv_n;
                 let upper_mean_term = upper_sum * inv_n;
 
-                // NaN guard (#3027, P1#759): use per-ROW strategy matching scalar path.
+                // NaN guard: use per-ROW strategy matching scalar path.
                 // When Inf coefficients from compose() NaN→Inf fallback contaminate
                 // mean_term, non-Inf elements get `finite - Inf = -Inf` which creates
                 // lower_a > upper_a inversions. The per-element guard missed this because
@@ -214,7 +226,7 @@ impl LayerNormLayer {
                 for i in 0..norm_size {
                     let g = self.ny[i] as f64;
                     // Standard f64→f32 rounding for A-matrix (round-to-nearest), matching
-                    // alpha-beta-CROWN. Directed rounding on A is not unconditionally sound (#2208).
+                    // alpha-beta-CROWN. Directed rounding on A is not unconditionally sound.
                     let la = lower_a[[b, j, i]] as f64 * g - lower_mean_term;
                     let ua = upper_a[[b, j, i]] as f64 * g - upper_mean_term;
                     if la.is_nan() || ua.is_nan() {

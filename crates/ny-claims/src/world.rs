@@ -132,8 +132,8 @@ mod tests {
 
     #[test]
     fn a_real_build_stamp_line_parses() {
-        // Verbatim from `scratchpad/m3ab/identity.txt`, the sealed identity of
-        // the binary that ran the voided M3 A/B.
+        // Verbatim from `reports/measured-2026/m3_ab_2026-08-22_VOID/identity.txt`,
+        // the sealed identity of the binary that ran the voided M3 A/B.
         let line = "NY_BUILD_ID_V1 version=0.3.4760+dirty.c8171fe3.63f0465b features=mip,cuda \
                     backend=cuda+wgpu markers=margin-row-gpu-eft-impl-v9 \
                     commit=c8171fe3e01166ef26715dde60b4afd31dab495b dirty=true revision=4760 \

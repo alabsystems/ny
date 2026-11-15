@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Property-based verification of batched CROWN memory budget guards (#3550).
+//! Property-based verification of batched CROWN memory budget guards.
 //!
 //! Verifies:
 //! 1. Budget estimation arithmetic is correct (no overflow wrap-around)

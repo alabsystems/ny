@@ -127,6 +127,52 @@ pub struct IntervalConstLayer {
     kind: IntervalConstKind,
 }
 
+/// Read-only view of an [`IntervalConstLayer`]'s enclosure, for the
+/// `#lowdim-prover` lane's own lowering (#lsnc-lane), which discharges the
+/// radius itself (`lowdim::compile`: every term's coefficient error is charged
+/// against the operand's rigorous magnitude, every offset becomes an outward
+/// interval constant).
+///
+/// Crate-private and always BOTH halves: no reader can take the midpoint
+/// without also being handed the radius, which is the point-fold hazard this
+/// layer's own module header exists to prevent.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum IntervalConstView<'a> {
+    /// `y = x W^T`, `W in [center.weight() - radius, center.weight() + radius]`
+    /// (plus `center.bias()`, exact, when present).
+    Linear {
+        center: &'a LinearLayer,
+        radius: &'a Array2<f32>,
+    },
+    /// `y = x + c`, `c in [center - radius, center + radius]`, broadcast into
+    /// an activation of `input_len` elements.
+    Offset {
+        center: &'a ArrayD<f32>,
+        radius: &'a ArrayD<f32>,
+        input_len: usize,
+    },
+}
+
+impl IntervalConstLayer {
+    /// The enclosure this layer carries, midpoint and radius together.
+    pub(crate) fn lane_view(&self) -> IntervalConstView<'_> {
+        match &self.kind {
+            IntervalConstKind::Linear { center, radius } => {
+                IntervalConstView::Linear { center, radius }
+            }
+            IntervalConstKind::Offset {
+                center,
+                radius,
+                input_len,
+            } => IntervalConstView::Offset {
+                center,
+                radius,
+                input_len: *input_len,
+            },
+        }
+    }
+}
+
 impl IntervalConstLayer {
     /// Build `y = x W^T` with `W` enclosed by `center +- radius`.
     ///

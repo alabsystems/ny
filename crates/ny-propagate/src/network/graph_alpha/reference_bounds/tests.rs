@@ -540,7 +540,7 @@ fn test_nan_candidate_rejected_at_bounded_tensor_construction_3684() {
     // NaN defense-in-depth: the merge function's NaN guard is unreachable
     // through normal API usage because BoundedTensor constructors reject NaN.
     // This test documents that invariant. The NaN guard in merge_tighter_bounds
-    // is a safety net in case a future code path bypasses validation (#3684).
+    // is a safety net in case a future code path bypasses validation.
     let result = BoundedTensor::new_allow_infinite(
         arr1(&[f32::NAN, 2.0]).into_dyn(),
         arr1(&[3.0, 4.0]).into_dyn(),
@@ -814,7 +814,7 @@ fn test_merge_reference_bound_maps_single_source_fast_path() {
 /// Performance proof: shape-mismatched nodes in merge produce O(N) work,
 /// not O(N²). When all nodes are shape-mismatched, the merge skips all
 /// entries and returns the original current map unchanged. This verifies
-/// the skip path (#4384) doesn't accidentally re-process entries.
+/// the skip path doesn't accidentally re-process entries.
 #[test]
 fn test_merge_reference_bound_maps_all_mismatched_is_linear() {
     let mut current: HashMap<String, BoundedTensor> = HashMap::new();
@@ -859,7 +859,7 @@ mod proptest_merge {
         #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(500) })]
 
         /// Property: merge_tighter_bounds never produces inverted bounds and
-        /// never loosens the current interval (#3684).
+        /// never loosens the current interval.
         #[test]
         fn merge_never_inverts_or_loosens_3684(
             (cur_l, cur_u) in valid_interval(100.0),

@@ -81,9 +81,9 @@ const MAX_DEPTH: u16 = 24;
 /// Nodes bounded per parallel wave.
 const WAVE_SIZE: usize = 256;
 
-/// #mscn-throughput A/B knobs: env overrides for the wave/chunk sizes so the
-/// 7.5x campaign (ledger charter 2026-07-19) can sweep the schedule space
-/// without rebuilds. Schedule-only — every setting bounds the same boxes with
+/// #mscn-throughput A/B knobs: env overrides for the wave/chunk sizes so a
+/// throughput campaign can sweep the schedule space without rebuilds.
+/// Schedule-only — every setting bounds the same boxes with
 /// the same sound walks; unset ⇒ the shipped constants, byte-identical.
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -1248,6 +1248,18 @@ struct F64LeafEscalation<'a> {
     /// Waves where the batched centered pass failed and MVF candidates fell
     /// back to per-node centered walks (byte-identical legacy behavior).
     batched_mvf_fallbacks: AtomicUsize,
+    /// #nn4sys-instrument. Clause-obligations that passed the near-closing
+    /// filter of the `#nn4sys-dual` f64 tail, i.e. the tail's CANDIDATE set.
+    /// Counted only while the tail is armed; the screen summary reports the
+    /// arming separately so a zero here cannot be read as "the tail ran and
+    /// found nothing" when it never ran at all.
+    tail_near_closing: AtomicUsize,
+    /// Certified f64 CROWN tail calls actually issued (a candidate whose
+    /// clause has no tail spec never reaches `f64_tail_box_attempt`).
+    tail_attempts: AtomicUsize,
+    /// Clause-obligations the tail closed that the interval, centered and
+    /// mono bounds on the same node could not.
+    tail_closed: AtomicUsize,
 }
 
 /// Build the escalation context if the model and environment allow it.
@@ -1281,6 +1293,9 @@ fn f64_leaf_escalation(model_net: &BetaCrownModel) -> Option<F64LeafEscalation<'
                 batched_fallbacks: AtomicUsize::new(0),
                 batched_mvf_boxes: AtomicUsize::new(0),
                 batched_mvf_fallbacks: AtomicUsize::new(0),
+                tail_near_closing: AtomicUsize::new(0),
+                tail_attempts: AtomicUsize::new(0),
+                tail_closed: AtomicUsize::new(0),
             })
         }
         _ => None,
@@ -3015,8 +3030,15 @@ fn bound_node_f64(
                 .iter()
                 .copied()
                 .filter(|&c| clause_near_closing_f64(&out64, &clauses[c]))
+                .inspect(|_| {
+                    // #nn4sys-instrument: the CANDIDATE count, taken before the
+                    // spec conversion can silently drop a clause. Relaxed is
+                    // sufficient — these are counters, never a decision input.
+                    esc.tail_near_closing.fetch_add(1, Ordering::Relaxed);
+                })
                 .filter(|&c| {
                     clause_to_tail_spec(&clauses[c], out_dim).is_some_and(|(spec, ths, sizes)| {
+                        esc.tail_attempts.fetch_add(1, Ordering::Relaxed);
                         ny_propagate::network::f64_tail_box_attempt(
                             graph,
                             &node.bounds,
@@ -3029,6 +3051,8 @@ fn bound_node_f64(
                     })
                 })
                 .collect();
+            esc.tail_closed
+                .fetch_add(tail_closed.len(), Ordering::Relaxed);
             if !tail_closed.is_empty() {
                 unresolved.retain(|c| {
                     if tail_closed.contains(c) {
@@ -3284,6 +3308,137 @@ fn refine_clause_boxes_counted_with_phase_target_override(
     )
 }
 
+/// #nn4sys-instrument — one screen run's complete measurement.
+///
+/// Every field here is already computed by the screen and handed to the
+/// `info!` below; the scored binary then DROPS all of it, because
+/// `main.rs` maps `verbose == 0` to `Level::WARN` and
+/// `vnncomp_scripts/run_instance.sh` passes no `-v`. So a run that never
+/// entered this lane and a run that entered and proved nothing are
+/// byte-identical from outside, and every null measured on nn4sys is VOID by
+/// construction. This struct exists so that stops being true.
+///
+/// It is TELEMETRY, not a lever: it reads no environment variable of its own,
+/// takes no branch, and its counters are all `Ordering::Relaxed`.
+struct ScreenSummary {
+    clauses: usize,
+    seeded_clauses: usize,
+    groups: usize,
+    roots: usize,
+    roots_bounded_once: usize,
+    verified: usize,
+    nodes: usize,
+    max_depth: u16,
+    deadline_hit: bool,
+    late_wave_boxes_discarded: usize,
+    exact_2048_dual: bool,
+    pilot: bool,
+    wave_cap: usize,
+    f64_leaf_available: bool,
+    f64_attempts: usize,
+    f64_rescued: usize,
+    mvf_attempts: usize,
+    mvf_rescued: usize,
+    mono_attempts: usize,
+    mono_rescued: usize,
+    batched_waves: usize,
+    batched_boxes: usize,
+    batched_mvf_boxes: usize,
+    crown_attempts: usize,
+    crown_avg_ms: f64,
+    crown_shed: bool,
+    crown_skips: usize,
+    tail_armed: bool,
+    tail_near_closing: usize,
+    tail_attempts: usize,
+    tail_closed: usize,
+    elapsed_s: f64,
+}
+
+/// Screen-run ordinal. `refine_clause_boxes_counted_seeded` is re-entered per
+/// box group through the child-timeout ledger (`disjunctive.rs`), so an
+/// un-ordinalled line could not be attributed to a run and two lines could not
+/// be told apart from one line printed twice.
+static SCREEN_ORDINAL: AtomicUsize = AtomicUsize::new(0);
+
+/// Emit the screen's measurement UNCONDITIONALLY, once per screen run.
+///
+/// The marker prefix `NY_NN4SYS_SCREEN_V1 ordinal=` is deliberately the text
+/// that precedes the FIRST placeholder: `format_args!` splits a format string
+/// at every `{}`, so only a fragment between placeholders exists verbatim in
+/// the binary, and that fragment is what a provenance grep must look for.
+///
+/// The line is also mirrored into the flight sidecar, because a row that is
+/// HARD STOPPED loses its stderr tail but keeps its record.
+///
+/// NOTE for whoever measures with it: `ny benchmarks run` nulls the child's
+/// stdout and forces `RUST_LOG=error` (`vnncomp_benchmarks.rs`), and it
+/// surfaces only a bounded stderr tail on `Error`. Drive `ny vnncomp v1`
+/// directly with per-row stderr capture or this line will not be there.
+fn emit_screen_summary(summary: ScreenSummary) {
+    let ordinal = SCREEN_ORDINAL.fetch_add(1, Ordering::Relaxed);
+    let (cover_armed, cover_src, cover_depth) =
+        super::nn4sys_scalar_cover::cover_screen_telemetry();
+    let ScreenSummary {
+        clauses,
+        seeded_clauses,
+        groups,
+        roots,
+        roots_bounded_once,
+        verified,
+        nodes,
+        max_depth,
+        deadline_hit,
+        late_wave_boxes_discarded,
+        exact_2048_dual,
+        pilot,
+        wave_cap,
+        f64_leaf_available,
+        f64_attempts,
+        f64_rescued,
+        mvf_attempts,
+        mvf_rescued,
+        mono_attempts,
+        mono_rescued,
+        batched_waves,
+        batched_boxes,
+        batched_mvf_boxes,
+        crown_attempts,
+        crown_avg_ms,
+        crown_shed,
+        crown_skips,
+        tail_armed,
+        tail_near_closing,
+        tail_attempts,
+        tail_closed,
+        elapsed_s,
+    } = summary;
+    let line = format!(
+        "NY_NN4SYS_SCREEN_V1 ordinal={ordinal} clauses={clauses} \
+seeded_clauses={seeded_clauses} groups={groups} roots={roots} \
+roots_bounded_once={roots_bounded_once} verified={verified} nodes={nodes} \
+max_depth={max_depth} deadline_hit={deadline_hit} \
+late_wave_boxes_discarded={late_wave_boxes_discarded} \
+exact_2048_dual={exact_2048_dual} pilot={pilot} wave_cap={wave_cap} \
+f64_leaf_available={f64_leaf_available} f64_attempts={f64_attempts} \
+f64_rescued={f64_rescued} mvf_attempts={mvf_attempts} mvf_rescued={mvf_rescued} \
+mono_attempts={mono_attempts} mono_rescued={mono_rescued} \
+batched_waves={batched_waves} batched_boxes={batched_boxes} \
+batched_mvf_boxes={batched_mvf_boxes} crown_attempts={crown_attempts} \
+crown_avg_ms={crown_avg_ms:.1} crown_shed={crown_shed} crown_skips={crown_skips} \
+cover_armed={cover_armed} cover_src={cover_src} cover_depth={cover_depth} \
+tail_armed={tail_armed} \
+tail_near_closing={tail_near_closing} tail_attempts={tail_attempts} \
+tail_closed={tail_closed} elapsed_s={elapsed_s:.3}"
+    );
+    eprintln!("{line}");
+    crate::flight::note(
+        "nn4sys_box_refine",
+        crate::flight::FlightStatus::Ran,
+        Some(line),
+    );
+}
+
 /// Run the mature box-refinement screen with independently authenticated
 /// per-clause proof facts already discharged. A cardinality mismatch discards
 /// the seed wholesale. Seeded clauses never enter a root group, so the legacy
@@ -3433,6 +3588,19 @@ fn refine_clause_boxes_counted_seeded(
         (groups, HashMap::new(), None)
     };
     let mut queue = ordered_root_queue(groups, &ctx_extra_depth);
+
+    // #nn4sys-instrument. These three numbers decide whether a root-complete
+    // drain and a late-wave harvest are worth building, and NOTHING in the
+    // scored binary reports them today: `roots` is the depth-0 obligation
+    // count the screen starts from, `roots_bounded_once` how many of them ever
+    // reached a published bound (the queue drains from its TAIL, so a run can
+    // spend its whole slice deep in one lineage), and
+    // `late_wave_boxes_discarded` how much already-COMPUTED work the
+    // conservative post-deadline wave transition throws away.
+    let roots = queue.len();
+    let mut roots_bounded_once = 0usize;
+    let mut late_wave_boxes_discarded = 0usize;
+    let mut max_depth = 0u16;
 
     let mut nodes_processed = 0usize;
     let mut deadline_hit = false;
@@ -3662,11 +3830,22 @@ fn refine_clause_boxes_counted_seeded(
         // conservative deadline tail mark it unproven.
         if completed_wave_must_be_discarded(deadline, Instant::now()) {
             deadline_hit = true;
+            // #nn4sys-instrument: every `NodeOutcome` in this wave is already
+            // computed and is about to be thrown away. This is the ONLY
+            // discard site where that is true — the batched-deadline stop
+            // above breaks before `bound_node` runs — so it is counted alone.
+            late_wave_boxes_discarded += wave.len();
             queue.extend(wave);
             break;
         }
 
         for (node, outcome) in wave.iter().zip(outcomes) {
+            // #nn4sys-instrument: counted HERE, after both discard checks, so
+            // "bounded once" means bounded AND published.
+            if node.depth == 0 {
+                roots_bounded_once += 1;
+            }
+            max_depth = max_depth.max(node.depth);
             for &c in &outcome.proven {
                 open_nodes[c] -= 1;
             }
@@ -3852,6 +4031,52 @@ fn refine_clause_boxes_counted_seeded(
         })
         .unwrap_or((false, 0, 0, 0, 0, 0));
     let (crown_attempts, crown_avg_ms, crown_shed, crown_skips) = crown_gate.stats();
+    let (tail_near_closing, tail_attempts, tail_closed) = f64_leaf
+        .as_ref()
+        .map(|esc| {
+            (
+                esc.tail_near_closing.load(Ordering::Relaxed),
+                esc.tail_attempts.load(Ordering::Relaxed),
+                esc.tail_closed.load(Ordering::Relaxed),
+            )
+        })
+        .unwrap_or((0, 0, 0));
+    let f64_leaf_available = f64_leaf.is_some();
+    let elapsed_s = start.elapsed().as_secs_f64();
+    emit_screen_summary(ScreenSummary {
+        clauses: n,
+        seeded_clauses,
+        groups: num_groups,
+        roots,
+        roots_bounded_once,
+        verified,
+        nodes: nodes_processed,
+        max_depth,
+        deadline_hit,
+        late_wave_boxes_discarded,
+        exact_2048_dual: exact_mscn_2048_dual,
+        pilot: mvf_deadline_pilot_active,
+        wave_cap: effective_mvf_wave_cap,
+        f64_leaf_available,
+        f64_attempts,
+        f64_rescued,
+        mvf_attempts,
+        mvf_rescued,
+        mono_attempts,
+        mono_rescued,
+        batched_waves,
+        batched_boxes,
+        batched_mvf_boxes: mvf_boxes,
+        crown_attempts,
+        crown_avg_ms,
+        crown_shed,
+        crown_skips,
+        tail_armed: dual_f64_tail_enabled(),
+        tail_near_closing,
+        tail_attempts,
+        tail_closed,
+        elapsed_s,
+    });
     info!(
         clauses = n,
         seeded_clauses,
@@ -3894,7 +4119,7 @@ fn refine_clause_boxes_counted_seeded(
         ctx_cover_gaps = ctx_state
             .as_ref()
             .map_or(0, |s| s.cover_gaps.load(Ordering::Relaxed)),
-        elapsed_s = start.elapsed().as_secs_f64(),
+        elapsed_s,
         "Box-refinement clause screen complete"
     );
     if verified < n {

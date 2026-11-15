@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Graph tests for the local Qwen3 mel128 DSP bridge (#3719).
+//! Graph tests for the local Qwen3 mel128 DSP bridge.
 
 use std::f64::consts::PI;
 use std::sync::{Mutex, OnceLock};

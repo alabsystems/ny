@@ -33,7 +33,7 @@ impl BoundPropagation for LogLayer {
     fn propagate_ibp(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
         // Validate input is strictly positive to ensure sound bounds.
         // If input bounds allow non-positive values, log is undefined.
-        // NaN-propagating fold: NaN in input must not be silently absorbed — see #2577.
+        // NaN-propagating fold: NaN in input must not be silently absorbed.
         // NaN.is_nan() || NaN <= 0.0 is false, so we also check explicitly.
         let min_input = input
             .lower()
@@ -49,7 +49,7 @@ impl BoundPropagation for LogLayer {
 
         // Directed rounding: compute ln in f64 for precision, cast to f32 with
         // next_down/next_up to guarantee lower bounds round DOWN and upper bounds
-        // round UP. Raw f32 ln can round either direction. (#1483)
+        // round UP. Raw f32 ln can round either direction.
         let lower = input
             .lower()
             .mapv(|x| next_down_f32((x as f64).ln() as f32));
@@ -185,7 +185,7 @@ pub fn log_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
     // Use f64 intermediates to prevent catastrophic cancellation.
     // The chord slope (log(u) - log(l)) / (u - l) is a classic cancellation
     // case when l and u are close: both numerator and denominator approach 0.
-    // Same pattern as Exp fix (#1745).
+    // Same pattern as Exp fix.
     let l64 = l as f64;
     let u64 = u as f64;
 
@@ -528,7 +528,7 @@ mod tests {
         assert!(layer.requires_pre_activation_bounds());
     }
 
-    // ── Domain guard tests (#2565) ──────────────────────────────────────
+    // ── Domain guard tests ──────────────────────────────────────
 
     #[test]
     fn test_crown_backward_rejects_non_positive_lower() {

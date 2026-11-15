@@ -44,7 +44,7 @@ mod tests {
         assert_eq!(truncate_name("very_long_layer_name", 10), "...er_name");
     }
 
-    // Edge cases for width < 4 (#3042)
+    // Edge cases for width < 4
 
     #[test]
     fn test_width_zero() {
@@ -81,7 +81,7 @@ mod tests {
         assert_eq!(truncate_name("", 0), "");
     }
 
-    // Multi-byte UTF-8 tests (#3042)
+    // Multi-byte UTF-8 tests
 
     #[test]
     fn test_multibyte_utf8_short() {

@@ -5,7 +5,8 @@
 pub(crate) use super::{
     contains_output_constraint, get_number, load_vnnlib, parse_expr, parse_expressions,
     parse_var_index, parse_vnnlib, parse_vnnlib_assignment_declarations, resolve_var_info,
-    tokenize, Expr, OutputConstraint, TensorDeclarationKind, VnnLibSpec,
+    snap_box_outward_from_subnormals, tokenize, Expr, OutputConstraint, TensorDeclarationKind,
+    VnnLibSpec,
 };
 pub(crate) use ny_core::NyError;
 

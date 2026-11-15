@@ -17,7 +17,7 @@ pub struct MeasurementArgs {
     profile_gpu: bool,
     profile_host: bool,
     production_only: bool,
-    /// Enable GraphNetwork measurement phases (#3716).
+    /// Enable GraphNetwork measurement phases.
     ///
     /// When set, the benchmark converts each sequential workload to a
     /// `GraphNetwork` and measures the graph CROWN-IBP collection path that
@@ -30,7 +30,7 @@ pub struct MeasurementArgs {
     /// checker for GPU evidence refreshes.
     graph_engine_only: bool,
     /// Also run the full graph CROWN backward (`--graph-full`). Extremely slow
-    /// (43+ min for metaroom) and NOT the VNN-COMP code path (#3716).
+    /// (43+ min for metaroom) and NOT the VNN-COMP code path.
     /// Requires `--case <name>` so the benchmark cannot accidentally launch a
     /// multi-hour sweep across every workload.
     graph_full: bool,
@@ -148,7 +148,7 @@ impl MeasurementArgs {
         self.production_only
     }
 
-    /// Whether to include GraphNetwork measurement phases (#3716).
+    /// Whether to include GraphNetwork measurement phases.
     #[must_use]
     pub fn graph(&self) -> bool {
         self.graph
@@ -161,7 +161,7 @@ impl MeasurementArgs {
         self.graph_engine_only
     }
 
-    /// Whether to include the expensive full graph CROWN backward (#3716).
+    /// Whether to include the expensive full graph CROWN backward.
     #[must_use]
     pub fn graph_full(&self) -> bool {
         self.graph_full

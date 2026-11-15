@@ -1045,7 +1045,7 @@ fn fresh_domain_clip_completed_at_deadline_loses_authority_deterministically() {
 /// Verify that `push_batched_relaxed_survivors` checks grouped disjunctive
 /// verification on concretized post-clip bounds, not just box infeasibility.
 ///
-/// Without #4367, children whose linear-bound concretization exceeds the grouped
+/// Without this check, children whose linear-bound concretization exceeds the grouped
 /// thresholds would be pushed to the queue instead of being counted as verified.
 ///
 /// Tests `push_batched_relaxed_survivors` directly with pre-built FlatPendingChild
@@ -1315,7 +1315,7 @@ fn build_three_child_survivors_4366() -> Vec<FlatPendingChild> {
     ]
 }
 
-/// Regression for #4366 batched clip: three children with distinct dispositions.
+/// Regression for the batched clip: three children with distinct dispositions.
 /// Child A: infeasible by clip. Child B: verified by grouped check. Child C: queued.
 ///
 /// The infeasibility of child A comes from COMBINING its two rows (x<=0.2 AND
@@ -1442,9 +1442,8 @@ fn test_batched_clip_disjoint_or_clause_survives_disj() {
 /// Neither row alone makes [0, 1] infeasible, but together they prove the child
 /// box is empty (must be ≤0.3 AND ≥0.7).
 ///
-/// Part of #4367 acceptance criteria: "a regression proves the grouped path can
-/// eliminate a child through combined multi-spec clipping that no single row
-/// proves alone."
+/// This proves the grouped path can eliminate a child through combined multi-spec
+/// clipping that no single row proves alone.
 #[test]
 fn test_joint_multispec_clip_finds_combined_infeasibility_4367() {
     use super::super::push_survivors::push_batched_relaxed_survivors;
@@ -1458,7 +1457,7 @@ fn test_joint_multispec_clip_finds_combined_infeasibility_4367() {
 
     // ONE conjunctive clause of two rows: BOTH rows must hold for a
     // counterexample, so combining them proves the child empty. (This is the
-    // #4367 "combined infeasibility" capability; expressing it as `[1, 1]` would
+    // "combined infeasibility" capability; expressing it as `[1, 1]` would
     // be two INDEPENDENT OR clauses — each individually feasible — which under
     // the clause-aware clip (#disj-cross-clause-clip-unsat) is correctly NOT
     // infeasible.)

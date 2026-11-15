@@ -209,7 +209,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Regression test for #1930: differing model bytes must produce differing hashes.
+    /// Regression test: differing model bytes must produce differing hashes.
     #[ntest::timeout(5000)]
     #[test]
     fn test_compute_model_hash_different_bytes_different_hash() {
@@ -238,7 +238,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Regression test for #1930: single-byte change must be detected.
+    /// Regression test: single-byte change must be detected.
     #[ntest::timeout(5000)]
     #[test]
     fn test_compute_model_hash_single_byte_change_detected() {

@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Zonotope softmax output containment tests (#2744).
+//! Zonotope softmax output containment tests.
 //!
 //! Verifies that zonotope bounds after softmax_affine and
 //! softmax_affine_causal contain the true softmax at sampled points.
@@ -74,8 +74,6 @@ fn assert_contained(
 /// Creates a small 1D zonotope (3 error terms, 3 dimensions), applies
 /// softmax_affine, samples N points, computes true softmax, and verifies
 /// that the zonotope output bounds contain every true softmax output.
-///
-/// Part of #2744.
 #[test]
 fn test_softmax_affine_1d_sampling_containment_2744() {
     // Build zonotope: center=[0.5, -0.3, 1.0], 3 correlated error terms.
@@ -126,8 +124,6 @@ fn test_softmax_affine_1d_sampling_containment_2744() {
 /// Creates a 2D zonotope (3 error terms, shape [3, 3]), applies causal
 /// softmax, samples N points, and verifies containment of the true
 /// causal softmax at each sample.
-///
-/// Part of #2744.
 #[test]
 fn test_softmax_affine_causal_sampling_containment_2744() {
     // Build zonotope: shape (4, 3, 3) = [center + 3 errors, seq_q=3, seq_k=3]
@@ -190,8 +186,6 @@ fn test_softmax_affine_causal_sampling_containment_2744() {
 
 /// A zonotope with zero radius (concrete point) should produce exact
 /// softmax output with zero-width bounds.
-///
-/// Part of #2744.
 #[test]
 fn test_softmax_affine_zero_radius_exact_2744() {
     let values = arr1(&[1.0_f32, 2.0, 3.0]);
@@ -234,8 +228,6 @@ fn test_softmax_affine_zero_radius_exact_2744() {
 }
 
 /// Zero-radius causal softmax should produce exact output.
-///
-/// Part of #2744.
 #[test]
 fn test_softmax_affine_causal_zero_radius_exact_2744() {
     let values = arr2(&[[0.5_f32, 0.3, -0.2], [1.0, -0.5, 0.8], [-0.3, 0.7, 0.1]]);

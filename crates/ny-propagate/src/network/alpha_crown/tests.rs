@@ -10,7 +10,7 @@ use crate::network::Network;
 use ndarray::{arr1, arr2, Array1, ArrayD, IxDyn};
 use ny_tensor::BoundedTensor;
 
-/// Regression test for #2085:
+/// Regression test:
 /// production alpha-CROWN path should support non-flat output shapes
 /// (best_* is shaped like CROWN output; per-iteration concretization is flat).
 #[ntest::timeout(10000)]
@@ -78,7 +78,7 @@ fn alpha_crown_handles_non_flat_output_best_bound_update_path() {
     }
 }
 
-/// Regression test for #2079: SPSA gradient averaging must not produce NaN/Inf
+/// Regression test: SPSA gradient averaging must not produce NaN/Inf
 /// when spsa_samples == 0. The fix is `.max(1)` on the divisor, matching the
 /// pattern in propagate_dag.rs:544 and propagate_sequential.rs:587.
 #[test]
@@ -113,7 +113,7 @@ fn spsa_zero_samples_does_not_produce_nan() {
     assert_eq!(nonzero_grads[0][2], 6.0);
 }
 
-/// Regression test for #2189: α-CROWN intermediates fallback on UnsupportedOp
+/// Regression test: α-CROWN intermediates fallback on UnsupportedOp
 /// must return constant final_bounds matching full-network CROWN bounds.
 #[ntest::timeout(10000)]
 #[test]
@@ -194,7 +194,7 @@ fn alpha_crown_intermediates_unsupported_fallback_uses_constant_final_bounds_218
     }
 }
 
-// ===== #2809 regression tests: NaN-unsafe branching in AnalyticChain =====
+// ===== Regression tests: NaN-unsafe branching in AnalyticChain =====
 
 use std::collections::HashMap;
 
@@ -221,7 +221,7 @@ fn make_alpha_state(alphas: Vec<Array1<f32>>, masks: Vec<Array1<bool>>) -> Alpha
 /// NaN in pre-ReLU bounds must not enter gradient computation.
 /// Before the fix, NaN bounds would pass the `l >= 0.0 || u <= 0.0` check
 /// (both comparisons false for NaN), treating NaN bounds as "unstable" and
-/// flowing NaN into gradient arithmetic. (#2809)
+/// flowing NaN into gradient arithmetic.
 #[test]
 fn test_chain_gradient_nan_pre_relu_bounds_produces_zero_gradient() {
     let alpha_state = make_alpha_state(vec![arr1(&[0.5, 0.5])], vec![arr1(&[true, true])]);
@@ -248,7 +248,7 @@ fn test_chain_gradient_nan_pre_relu_bounds_produces_zero_gradient() {
 
 /// NaN in A-matrix coefficients must not silently drop contributions.
 /// Before the fix, NaN a_ji would cause `a_ji > 0.0` to return false,
-/// silently skipping the contribution without signaling. (#2809)
+/// silently skipping the contribution without signaling.
 #[test]
 fn test_chain_gradient_nan_a_coefficient_skips_contribution() {
     let alpha_state = make_alpha_state(vec![arr1(&[0.5])], vec![arr1(&[true])]);
@@ -268,7 +268,7 @@ fn test_chain_gradient_nan_a_coefficient_skips_contribution() {
 }
 
 /// Inf in pre-ReLU bounds must not enter gradient computation.
-/// Inf bounds are non-finite and should be treated as "skip" like NaN. (#2809)
+/// Inf bounds are non-finite and should be treated as "skip" like NaN.
 #[test]
 fn test_chain_gradient_inf_pre_relu_bounds_produces_zero_gradient() {
     let alpha_state = make_alpha_state(vec![arr1(&[0.5])], vec![arr1(&[true])]);

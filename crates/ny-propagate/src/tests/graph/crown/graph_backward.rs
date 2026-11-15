@@ -5,7 +5,7 @@
 //! Graph CROWN backward unit tests: targeted coverage for graph-level
 //! CROWN backward on DAGs with skip connections.
 //!
-//! Part of #3463: these topologies were previously tested only through
+//! These topologies were previously tested only through
 //! high-level public API wrappers on sequential or FFN-only graphs.
 //! This module tests:
 //! - Soundness on DAGs with skip connections (residual blocks)
@@ -287,7 +287,7 @@ fn generate_sample_points(hidden: usize, epsilon: f32, n_random: usize) -> Vec<A
 #[ntest::timeout(60000)]
 #[test]
 fn test_alpha_crown_at_least_as_tight_as_fixed_on_ffn_block() {
-    // Serialized against budget=0 tests to prevent CROWN fallback (#3515).
+    // Serialized against budget=0 tests to prevent CROWN fallback.
     tests::with_crown_dense_budget_mb("2048", || {
         let hidden = 4;
         let epsilon = 0.01_f32;
@@ -353,7 +353,7 @@ fn test_fixed_block_crown_soundness_on_ffn() {
             .unwrap();
 
         // Happy-path CROWN must report Crown provenance, not ForwardFallback.
-        // Regression guard: silent fallback would widen bounds without warning (#4256).
+        // Regression guard: silent fallback would widen bounds without warning.
         assert_eq!(
             provenance,
             BoundsProvenance::Crown,
@@ -397,7 +397,7 @@ fn test_fixed_block_crown_soundness_on_ffn() {
 /// Uses `propagate_crown_fixed_slope` (not `propagate_crown`) because the
 /// public `propagate_crown` routes through DAG alpha-CROWN which optimizes
 /// ReLU slopes. Spec-guided CROWN uses fixed heuristic slopes, so the
-/// correct comparison target is fixed-slope CROWN. (#3619 alpha-CROWN)
+/// correct comparison target is fixed-slope CROWN.
 #[ntest::timeout(10000)]
 #[test]
 fn test_spec_guided_crown_identity_matches_non_spec_on_dag() {
@@ -435,7 +435,7 @@ fn test_spec_guided_crown_identity_matches_non_spec_on_dag() {
 /// public `propagate_crown` routes through DAG alpha-CROWN with optimized
 /// slopes — alpha-CROWN's tighter per-output bounds make the post-hoc
 /// difference tighter than what fixed-slope spec-guided CROWN can achieve,
-/// invalidating the tightness comparison. (#3619 alpha-CROWN)
+/// invalidating the tightness comparison.
 #[ntest::timeout(10000)]
 #[test]
 fn test_spec_guided_crown_difference_tighter_than_posthoc_on_dag() {
@@ -495,7 +495,7 @@ fn test_spec_guided_crown_difference_tighter_than_posthoc_on_dag() {
 // ───────────────────────────────────────────────────────────────────────
 // 4. Decomposed InstanceNorm CROWN within a block
 // ───────────────────────────────────────────────────────────────────────
-// Part of #3830: InstanceNorm1d now dispatches through the decomposed
+// InstanceNorm1d now dispatches through the decomposed
 // primitive-chain backward path inside `crown_backward_within_block`, preserving
 // soundness without falling back to bias-only IBP.
 

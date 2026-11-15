@@ -21,7 +21,6 @@ use super::super::validate::validate_norm_eps;
 /// Reference: Wu & He, "Group Normalization," ECCV 2018.
 ///
 /// Used in Demucs DConv sub-layers (dilated Conv1d + GroupNorm + GELU).
-/// Part of #3205.
 #[derive(Debug, Clone)]
 pub struct GroupNormLayer {
     /// Scale parameter per channel (ny), shape [C]

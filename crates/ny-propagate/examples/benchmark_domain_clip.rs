@@ -4,7 +4,7 @@
 
 //! Benchmark for domain clipping operations
 //!
-//! Run with: cargo run --release --example benchmark_domain_clip -p ny-propagate
+//! Run with: targo --unverified run --release --example benchmark_domain_clip -p ny-propagate
 
 use ndarray::{ArrayD, IxDyn};
 use ny_propagate::domain_clip::{ClipStrategy, DomainClipConfig, DomainClipper};

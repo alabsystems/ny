@@ -53,7 +53,6 @@ bab:
   branching:
     method: kfsb
     candidates: 5
-    reduceop: max
     # Exact wave-selector mirrors for governed search; runtime is unchanged.
     kfsb_multi_candidates: 5
     kfsb_multi_reduceop: max
@@ -61,10 +60,7 @@ bab:
     relaxed: true
   alpha_crown:
     lr_alpha: 0.2
-    iterations: 100
   beta_crown:
-    lr_alpha: 0.1
-    lr_beta: 0.15
     iterations: 10
   # Phase budget overrides (#2206 Packet E).
   # Evidence: alpha-CROWN warmup dominates the 150s budget (100 iterations at

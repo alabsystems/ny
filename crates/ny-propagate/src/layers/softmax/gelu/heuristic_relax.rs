@@ -72,18 +72,18 @@ pub fn gelu_linear_relaxation(
     u: f32,
     approximation: GeluApproximation,
 ) -> (f32, f32, f32, f32) {
-    // Handle infinite/NaN bounds: identity relaxation is UNSOUND (see #1837).
+    // Handle infinite/NaN bounds: identity relaxation is UNSOUND.
     // GELU(x) = x·Φ(x), so GELU(x) ≥ x fails for 0 < x < +∞ where Φ(x) < 1.
     if let Some(result) = gelu_infinite_bounds_relaxation(l, u, approximation) {
         return result;
     }
 
-    // Maximum absolute value for directed rounding slope_err pattern (#3329).
+    // Maximum absolute value for directed rounding slope_err pattern.
     let max_abs_x = l.abs().max(u.abs());
 
     // Handle degenerate cases
     if (u - l).abs() < 1e-8 {
-        // Point interval: f64 derivative + directed rounding (#3329).
+        // Point interval: f64 derivative + directed rounding.
         let slope_f64 = gelu_derivative_f64(l as f64, approximation);
         let slope = slope_f64 as f32;
         let slope_err = next_up_f32(((slope_f64 - slope as f64).abs() * max_abs_x as f64) as f32);
@@ -99,7 +99,7 @@ pub fn gelu_linear_relaxation(
 
     // Compute chord slope and intercept in f64 to avoid catastrophic cancellation
     // when u ≈ l (both numerator and denominator approach 0 in f32).
-    // Same pattern as GELU-sound (#2488), exp/log (#1745), ELU/SELU (#1754).
+    // Same pattern as GELU-sound, exp/log, ELU/SELU.
     let gl64 = gelu_eval_f64(l as f64, approximation);
     let gu64 = gelu_eval_f64(u as f64, approximation);
     // Keep slope in f64 for intercept to avoid secondary precision loss.
@@ -107,13 +107,13 @@ pub fn gelu_linear_relaxation(
     let chord_slope64 = (gu64 - gl64) / (u as f64 - l as f64);
     let chord_intercept64 = gl64 - chord_slope64 * l as f64;
     let chord_slope = chord_slope64 as f32;
-    // Directed rounding: absorb f64→f32 slope truncation error in intercepts (#3329).
+    // Directed rounding: absorb f64→f32 slope truncation error in intercepts.
     let chord_slope_err =
         next_up_f32(((chord_slope64 - chord_slope as f64).abs() * max_abs_x as f64) as f32);
     let chord_intercept = chord_intercept64 as f32;
 
     // Sample the interval to find max deviation from chord.
-    // Scale sample count with interval width to maintain density (#3329).
+    // Scale sample count with interval width to maintain density.
     let width = u - l;
     let num_samples = 100usize.max(((width * 20.0) as usize).min(10_000));
     let mut max_above_chord = 0.0_f32; // max(GELU(x) - chord(x))
@@ -156,12 +156,12 @@ pub fn gelu_linear_relaxation(
     let eps = 1e-5 + sample_gap;
 
     // Lower bound: chord shifted down by max_below_chord (ensures chord - shift <= GELU)
-    // Directed rounding: next_down + slope_err for sound lower bound (#3329).
+    // Directed rounding: next_down + slope_err for sound lower bound.
     let lower_slope = chord_slope;
     let lower_intercept = next_down_f32(chord_intercept - max_below_chord - eps - chord_slope_err);
 
     // Upper bound: chord shifted up by max_above_chord (ensures GELU <= chord + shift)
-    // Directed rounding: next_up + slope_err for sound upper bound (#3329).
+    // Directed rounding: next_up + slope_err for sound upper bound.
     let upper_slope = chord_slope;
     let upper_intercept = next_up_f32(chord_intercept + max_above_chord + eps + chord_slope_err);
 
@@ -178,7 +178,7 @@ fn gelu_tangent_relaxation(
     u: f32,
     approximation: GeluApproximation,
 ) -> (f32, f32, f32, f32) {
-    // Handle infinite/NaN bounds: identity relaxation is UNSOUND (see #1837).
+    // Handle infinite/NaN bounds: identity relaxation is UNSOUND.
     if let Some(result) = gelu_infinite_bounds_relaxation(l, u, approximation) {
         return result;
     }
@@ -186,7 +186,7 @@ fn gelu_tangent_relaxation(
     let max_abs_x = l.abs().max(u.abs());
 
     if (u - l).abs() < 1e-8 {
-        // Point interval: f64 derivative + directed rounding (#3329).
+        // Point interval: f64 derivative + directed rounding.
         let slope_f64 = gelu_derivative_f64(l as f64, approximation);
         let slope = slope_f64 as f32;
         let slope_err = next_up_f32(((slope_f64 - slope as f64).abs() * max_abs_x as f64) as f32);
@@ -200,7 +200,7 @@ fn gelu_tangent_relaxation(
         );
     }
 
-    // Tangent line at center — f64 intermediate for precision (#3329).
+    // Tangent line at center — f64 intermediate for precision.
     // Bit-identical tangent anchor: f32::midpoint rounds differently at overflow/subnormal edges.
     #[allow(clippy::manual_midpoint)]
     let c = (l + u) / 2.0;
@@ -212,7 +212,7 @@ fn gelu_tangent_relaxation(
     let intercept = intercept_f64 as f32;
 
     // Find max deviation from tangent line (above and below).
-    // Scale sample count with interval width to maintain density (#3329).
+    // Scale sample count with interval width to maintain density.
     let width = u - l;
     let num_samples = 50usize.max(((width * 20.0) as usize).min(10_000));
     let mut max_above = 0.0_f32;
@@ -247,11 +247,11 @@ fn gelu_tangent_relaxation(
         }
     }
 
-    // Analytical inter-sample error bound (#3329): |g''|_max * h² / 8, |g''|_max ≤ 1.0.
+    // Analytical inter-sample error bound: |g''|_max * h² / 8, |g''|_max ≤ 1.0.
     let h = width / num_samples as f32;
     let sample_gap = h * h / 8.0;
     let eps = 1e-5 + sample_gap;
-    // Directed rounding + slope_err for sound intercepts (#3329).
+    // Directed rounding + slope_err for sound intercepts.
     let lower_intercept = next_down_f32(intercept - max_below - eps - slope_err);
     let upper_intercept = next_up_f32(intercept + max_above + eps + slope_err);
 
@@ -268,7 +268,7 @@ fn gelu_two_slope_relaxation(
     u: f32,
     approximation: GeluApproximation,
 ) -> (f32, f32, f32, f32) {
-    // Handle infinite/NaN bounds: identity relaxation is UNSOUND (see #1837).
+    // Handle infinite/NaN bounds: identity relaxation is UNSOUND.
     if let Some(result) = gelu_infinite_bounds_relaxation(l, u, approximation) {
         return result;
     }
@@ -276,7 +276,7 @@ fn gelu_two_slope_relaxation(
     let max_abs_x = l.abs().max(u.abs());
 
     if (u - l).abs() < 1e-8 {
-        // Point interval: f64 derivative + directed rounding (#3329).
+        // Point interval: f64 derivative + directed rounding.
         let slope_f64 = gelu_derivative_f64(l as f64, approximation);
         let slope = slope_f64 as f32;
         let slope_err = next_up_f32(((slope_f64 - slope as f64).abs() * max_abs_x as f64) as f32);
@@ -291,7 +291,7 @@ fn gelu_two_slope_relaxation(
     }
 
     // Compute f64 endpoint evaluations for chord slope precision.
-    // Same pattern as GELU-sound (#2488), exp/log (#1745), ELU/SELU (#1754).
+    // Same pattern as GELU-sound, exp/log, ELU/SELU.
     let gl64 = gelu_eval_f64(l as f64, approximation);
     let gu64 = gelu_eval_f64(u as f64, approximation);
 
@@ -303,7 +303,7 @@ fn gelu_two_slope_relaxation(
     // Bit-identical tangent anchors: f32::midpoint rounds differently at overflow edges.
     #[allow(clippy::manual_midpoint)]
     let candidates = [l, u, (l + u) / 2.0];
-    // Scale sample count with interval width to maintain density (#3329).
+    // Scale sample count with interval width to maintain density.
     let width = u - l;
     let num_samples = 30usize.max(((width * 20.0) as usize).min(10_000));
     // Analytical inter-sample error bound: |g''|_max * h² / 8, |g''|_max ≤ 1.0.
@@ -316,7 +316,7 @@ fn gelu_two_slope_relaxation(
     let mut best_lower_intercept = f32::NEG_INFINITY;
 
     for &point in &candidates {
-        // f64 tangent with directed rounding (#3329).
+        // f64 tangent with directed rounding.
         let p_f64 = point as f64;
         let slope_f64 = gelu_derivative_f64(p_f64, approximation);
         let slope = slope_f64 as f32;
@@ -335,7 +335,7 @@ fn gelu_two_slope_relaxation(
         }
 
         // Shift intercept down by min_margin to ensure soundness.
-        // Directed rounding: next_down + slope_err (#3329).
+        // Directed rounding: next_down + slope_err.
         let adjusted_intercept = next_down_f32(intercept + min_margin - eps - slope_err);
 
         // We want the highest lower bound (closest to function)
@@ -381,7 +381,7 @@ fn gelu_two_slope_relaxation(
     let mut best_upper_intercept = f32::INFINITY;
 
     for &point in &candidates {
-        // f64 tangent with directed rounding (#3329).
+        // f64 tangent with directed rounding.
         let p_f64 = point as f64;
         let slope_f64 = gelu_derivative_f64(p_f64, approximation);
         let slope = slope_f64 as f32;
@@ -400,7 +400,7 @@ fn gelu_two_slope_relaxation(
         }
 
         // Shift intercept up to ensure soundness.
-        // Directed rounding: next_up + slope_err (#3329).
+        // Directed rounding: next_up + slope_err.
         let adjusted_intercept = next_up_f32(intercept + max_margin + eps + slope_err);
 
         // We want the lowest upper bound (closest to function)

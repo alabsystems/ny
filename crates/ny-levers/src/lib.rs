@@ -66,6 +66,10 @@ pub mod decls;
 /// A lever with no cell written resolves exactly as it did before promotion,
 /// which is what makes a promotion commit byte-identical on shipped configs.
 pub mod gate;
+/// #router-r1: the router's v0 ACTION SPACE, derived from [`space::axes`] and
+/// the declarations (preset-delivered, non-Unsafe, moat None/Low) minus a
+/// deny-list. The only keys a router-emitted value may ever name.
+pub mod router_action_space;
 /// The SEARCH SPACE over levers: which knobs an automated search may move, what
 /// values survive the parser, and which combinations are provably inert.
 pub mod space;

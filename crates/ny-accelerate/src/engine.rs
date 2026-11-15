@@ -387,7 +387,7 @@ impl AccelerateGemmEngine {
 
     fn faer_gemm_f32(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
         // Mirrors `ny_propagate::faer_parallelism::{FaerCpuGemmEngine::gemm_f32,
-        // current_par}`: inside a rayon worker force `Par::Seq` (the #4392
+        // current_par}`: inside a rayon worker force `Par::Seq` (the
         // nested-Rayon rule), otherwise use the configured global parallelism.
         let par = if rayon::current_thread_index().is_some() {
             Par::Seq

@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for BatchedLinearBounds NaN validation (#2979).
+//! Tests for BatchedLinearBounds NaN validation.
 //!
 //! Mirrors linear_validation.rs but for BatchedLinearBounds. Unlike LinearBounds,
 //! BatchedLinearBounds allows ±Inf in coefficients because compose() legitimately

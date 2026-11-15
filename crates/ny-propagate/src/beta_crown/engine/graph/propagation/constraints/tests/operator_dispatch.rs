@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Operator dispatch regressions: sigmoid, max-binary, conv2d, conv1d,
-//! conv-transpose1d (#1934, #1995, #2000).
+//! conv-transpose1d.
 
 use ndarray::{arr1, arr2};
 
@@ -18,16 +18,15 @@ use super::TOL;
 
 use ny_test_utils::assert_bounded_tensor_close;
 // =========================================================================
-// Regression tests for #1934: wildcard identity fallback in constrained
+// Regression tests: wildcard identity fallback in constrained
 // backward CROWN dispatch replaced with generic BoundPropagation dispatch.
-// Same fix class as #1929 (graph_alpha/bounds.rs).
 // =========================================================================
 
 /// Build a graph with Sigmoid (nonlinear unary op, not explicitly handled in
 /// the constrained backward dispatch table): linear1(1→1) → sigmoid → linear2(1→1).
 ///
 /// Sigmoid was previously handled by the wildcard `_` arm, which passed bounds
-/// through unchanged (identity) — unsound for a nonlinear layer. After #1934,
+/// through unchanged (identity) — unsound for a nonlinear layer. After the fix,
 /// the generic dispatch routes through `BoundPropagation::propagate_crown_backward`,
 /// which correctly calls `propagate_linear_with_bounds` for nonlinear layers.
 pub(super) fn build_sigmoid_graph() -> GraphNetwork {
@@ -52,7 +51,7 @@ pub(super) fn build_sigmoid_graph() -> GraphNetwork {
     graph
 }
 
-/// Regression test #1934: Sigmoid through constrained backward CROWN must produce
+/// Regression test: Sigmoid through constrained backward CROWN must produce
 /// sound bounds (not the identity fallback which was unsound for nonlinear ops).
 ///
 /// Without the fix, the wildcard arm treated Sigmoid as identity, so CROWN bounds
@@ -116,7 +115,7 @@ fn test_constrained_backward_sigmoid_soundness_1934() {
     );
 }
 
-/// Regression test #1934: Sigmoid through constrained backward CROWN with
+/// Regression test: Sigmoid through constrained backward CROWN with
 /// StoringIntermediates mode must produce same bounds as Standard mode.
 #[test]
 fn test_constrained_backward_sigmoid_parity_1934() {
@@ -155,8 +154,8 @@ fn test_constrained_backward_sigmoid_parity_1934() {
 ///                          max1 → linear2(1→1)
 /// _input → linear1b(1→1) ↗
 ///
-/// MaxBinary has no CROWN backward handler and is a multi-input op. After #1934,
-/// this should return UnsupportedOp error instead of silently using identity.
+/// MaxBinary is a multi-input op. It must go through the n-ary dispatch
+/// instead of silently using identity.
 fn build_max_binary_graph() -> GraphNetwork {
     use crate::MaxBinaryLayer;
 
@@ -182,7 +181,7 @@ fn build_max_binary_graph() -> GraphNetwork {
     graph
 }
 
-/// #1934 (updated): a binary layer (MaxBinary) through constrained backward
+/// A binary layer (MaxBinary) through constrained backward
 /// CROWN must produce SOUND bounds via the n-ary dispatch (routing coefficients
 /// to BOTH inputs) — NOT silently use identity on input[0] (the old unsound
 /// path), and NOT error out (the old over-conservative behavior that pinned BaB
@@ -230,13 +229,13 @@ fn test_constrained_backward_multi_input_is_sound_1934() {
 }
 
 // =========================================================================
-// Regression test for #1995: Conv2d/ConvTranspose2d identity fallback removed
+// Regression test: Conv2d/ConvTranspose2d identity fallback removed
 // =========================================================================
 
 /// Build a graph where a Conv2d node receives 1D pre-activation bounds
-/// (shape < 3D). Before #1995, the backward pass silently used identity
+/// (shape < 3D). Previously, the backward pass silently used identity
 /// pass-through, skipping the convolution weight matrix — unsound.
-/// After #1995, this returns UnsupportedOp error.
+/// Now this returns UnsupportedOp error.
 ///
 /// Graph: linear1(1→1) → conv2d(1×1×1×1 kernel) → output
 ///
@@ -263,12 +262,12 @@ fn build_conv2d_1d_preact_graph() -> GraphNetwork {
     graph
 }
 
-/// Regression test #1995: Conv2d with 1D input must return error at some point
+/// Regression test: Conv2d with 1D input must return error at some point
 /// in the pipeline — not silently pass bounds through unchanged (identity fallback).
 ///
 /// The forward pass (IBP) catches shape mismatches for Conv2d with < 3D input.
 /// If forward somehow produced 1D bounds (e.g., from domain overrides in BaB),
-/// the backward pass now also returns UnsupportedOp instead of identity (#1995).
+/// the backward pass now also returns UnsupportedOp instead of identity.
 /// This test verifies the end-to-end error behavior.
 #[test]
 fn test_conv2d_sub3d_preact_returns_error_not_identity_1995() {
@@ -284,7 +283,7 @@ fn test_conv2d_sub3d_preact_returns_error_not_identity_1995() {
         verifier.propagate_crown_with_graph_constraints(&graph, &input, &context, None, None);
 
     // Must be an error — either from forward (shape mismatch) or backward (UnsupportedOp).
-    // Before #1995, the backward path would silently use identity if reached.
+    // Previously, the backward path would silently use identity if reached.
     assert!(
         result.is_err(),
         "Conv2d with 1D input shape should return error, not silently use identity."
@@ -292,7 +291,7 @@ fn test_conv2d_sub3d_preact_returns_error_not_identity_1995() {
 }
 
 // =========================================================================
-// Regression tests for #2000: Conv1d/ConvTranspose1d backward dispatch
+// Regression tests: Conv1d/ConvTranspose1d backward dispatch
 // =========================================================================
 
 /// Build a graph with Conv1d receiving proper 2D input:
@@ -301,7 +300,7 @@ fn test_conv2d_sub3d_preact_returns_error_not_identity_1995() {
 /// Input shape: [1, 8] (in_channels=1, in_length=8)
 /// Conv1d output: [2, 6], flatten → [1, 12], relu → [1, 12], linear → [1, 1]
 ///
-/// Before #2000, Conv1d fell through to the generic backward dispatch which
+/// Previously, Conv1d fell through to the generic backward dispatch which
 /// called propagate_crown_backward without setting input_length, causing
 /// "Conv1d CROWN requires input_length to be set" error.
 fn build_conv1d_graph() -> GraphNetwork {
@@ -342,8 +341,8 @@ fn build_conv1d_graph() -> GraphNetwork {
     graph
 }
 
-/// Regression test #2000: Conv1d through constrained backward CROWN must
-/// succeed and produce sound bounds. Before #2000, Conv1d had no explicit
+/// Regression test: Conv1d through constrained backward CROWN must
+/// succeed and produce sound bounds. Previously, Conv1d had no explicit
 /// handler in the constrained backward dispatch — it fell through to the
 /// generic path which failed because input_length was not set.
 #[test]
@@ -437,7 +436,7 @@ fn build_conv_transpose1d_graph() -> GraphNetwork {
     graph
 }
 
-/// Regression test #2000: ConvTranspose1d through constrained backward CROWN.
+/// Regression test: ConvTranspose1d through constrained backward CROWN.
 #[test]
 fn test_constrained_backward_conv_transpose1d_dispatch_2000() {
     use ndarray::ArrayD;

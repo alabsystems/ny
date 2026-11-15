@@ -6,7 +6,7 @@
 //!
 //! These free functions contain the core optimization logic shared between
 //! `AlphaState` (sequential networks, Vec-indexed) and `GraphAlphaState`
-//! (DAG networks, BTreeMap-indexed). Extracted per #2201 to prevent divergence.
+//! (DAG networks, BTreeMap-indexed). Extracted to prevent divergence.
 
 use ndarray::Array1;
 use ny_core::Result;
@@ -16,7 +16,7 @@ use super::AdamParams;
 
 /// Extract contiguous lower/upper slices from a BoundedTensor.
 ///
-/// Uses `as_standard_layout().into_owned()` to handle non-contiguous tensors (#1933).
+/// Uses `as_standard_layout().into_owned()` to handle non-contiguous tensors.
 /// Returns (lower_owned, upper_owned) as contiguous Array1 views.
 pub(super) fn extract_contiguous_bounds(
     pre_flat: &BoundedTensor,
@@ -70,7 +70,7 @@ pub(super) fn init_alpha_from_bounds(
 /// For each unstable neuron (mask = true):
 /// - vel = momentum * vel - lr * gradient
 /// - alpha += vel
-/// - Clamp to [0, 1] and sanitize NaN (#2025)
+/// - Clamp to [0, 1] and sanitize NaN
 pub(super) fn update_alphas_sgd(
     alpha: &mut Array1<f32>,
     gradient: &Array1<f32>,
@@ -102,7 +102,7 @@ pub(super) fn update_alphas_sgd(
 /// - v = β₂ * v + (1 - β₂) * grad²
 /// - m_hat = m / (1 - β₁^t), v_hat = v / (1 - β₂^t)
 /// - alpha -= lr * m_hat / (√v_hat + ε)
-/// - Clamp to [0, 1] and sanitize NaN (#2025)
+/// - Clamp to [0, 1] and sanitize NaN
 pub(super) fn update_alphas_adam(
     alpha: &mut Array1<f32>,
     gradient: &Array1<f32>,
@@ -112,7 +112,7 @@ pub(super) fn update_alphas_adam(
     params: &AdamParams,
 ) {
     let t_f = params.t.max(1) as f32;
-    // Guard: beta=1.0 makes bias_correction=0, causing division by zero (#2315).
+    // Guard: beta=1.0 makes bias_correction=0, causing division by zero.
     let bias_correction1 = (1.0 - params.beta1.powf(t_f)).max(f32::EPSILON);
     let bias_correction2 = (1.0 - params.beta2.powf(t_f)).max(f32::EPSILON);
 
@@ -128,7 +128,7 @@ pub(super) fn update_alphas_adam(
 
             alpha[i] -= params.learning_rate * m_hat / (v_hat.sqrt() + params.epsilon);
 
-            // Clamp to [0, 1] and sanitize NaN (#2025).
+            // Clamp to [0, 1] and sanitize NaN.
             // NaN.clamp(0.0, 1.0) returns NaN in Rust, so NaN from gradient
             // computation would permanently corrupt alpha/m/v state.
             // Matches sanitize_alpha() in beta_crown/state/alpha/mod.rs.

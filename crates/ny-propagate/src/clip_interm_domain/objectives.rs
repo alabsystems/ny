@@ -29,7 +29,6 @@ use ndarray::Array1;
 ///
 /// # References
 ///
-/// - `designs/2026-01-29-clip-interm-domain.md` Section "Select objectives"
 /// - `alpha-beta-CROWN/complete_verifier/docs/abcrown_all_params.yaml:201`
 pub fn select_objective_neurons(
     lower_bounds: &Array1<f32>,
@@ -39,7 +38,7 @@ pub fn select_objective_neurons(
 ) -> Vec<usize> {
     let n = lower_bounds.len();
 
-    // Validate array dimensions match (#2136: active in release builds).
+    // Validate array dimensions match (active in release builds).
     assert_eq!(
         lower_bounds.len(),
         upper_bounds.len(),
@@ -75,7 +74,7 @@ pub fn select_objective_neurons(
         scores.push((i, score));
     }
 
-    // Sort by score descending (NaN-scored items sort last — #2995)
+    // Sort by score descending (NaN-scored items sort last)
     scores.sort_by(|a, b| crate::cmp_utils::nan_last_descending_cmp(&a.1, &b.1));
 
     // Take top-k

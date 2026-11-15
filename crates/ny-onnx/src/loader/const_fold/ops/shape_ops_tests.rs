@@ -63,7 +63,7 @@ fn squeeze_singleton_vector_produces_float_scalar() {
     );
 
     let folded = try_fold(&squeeze_node(), &weights, false).expect("Squeeze should fold");
-    assert!(folded.float_data.shape().is_empty());
+    assert_eq!((folded.float_data.shape()).len(), 0);
     assert_eq!(
         folded.float_data.iter().copied().collect::<Vec<_>>(),
         vec![42.0]
@@ -83,9 +83,9 @@ fn squeeze_singleton_vector_preserves_integer_scalar_rank() {
     );
 
     let folded = try_fold(&squeeze_node(), &weights, false).expect("Squeeze should fold");
-    assert!(folded.float_data.shape().is_empty());
+    assert_eq!((folded.float_data.shape()).len(), 0);
     let integer_data = folded.integer_data.expect("exact integer payload");
-    assert!(integer_data.shape().is_empty());
+    assert_eq!((integer_data.shape()).len(), 0);
     assert_eq!(
         integer_data.iter().copied().collect::<Vec<_>>(),
         vec![16_777_217]
@@ -215,6 +215,56 @@ fn shape_const_fold_honors_start_end_attributes() {
         vec![80, 3000],
         "Shape(start=-2) must report the trailing two dims"
     );
+}
+
+/// The Shape fold's side of the rank-probe contract. An inferred `[]` is
+/// trusted as a proven rank 0 and `Shape` of it folds to the empty vector, so
+/// the inferred table must leave a tensor ORT could not type ABSENT
+/// (`shape_infer::resolve_zero_dim_ranks`) — and `Shape` of an absent tensor
+/// whose producer the structural recursion does not model (a ScatterND, as for
+/// cctsdb `patch-1` tensor `362`'s consumer chain) must not fold at all.
+#[test]
+fn shape_const_fold_trusts_a_recorded_scalar_and_never_an_absent_rank() {
+    let graph = GraphProto {
+        input: vec![tensor_value_info("x", &[2, 3])],
+        node: vec![
+            NodeProto {
+                input: vec!["x".to_string(), "idx".to_string(), "upd".to_string()],
+                output: vec!["untyped".to_string()],
+                op_type: "ScatterND".to_string(),
+                ..Default::default()
+            },
+            NodeProto {
+                input: vec!["x".to_string()],
+                output: vec!["scalar".to_string()],
+                op_type: "ReduceSum".to_string(),
+                attribute: vec![attr_int("keepdims", 0)],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    // As the ORT path now records them: the proven scalar is `[]`, the
+    // untyped tensor is absent.
+    let inferred: HashMap<String, Vec<i64>> = HashMap::from([("scalar".to_string(), Vec::new())]);
+    let lookups = ConstFoldLookups::new(&graph, &inferred, false);
+    let weights = WeightStore::new();
+    let shape_of = |input: &str| NodeProto {
+        input: vec![input.to_string()],
+        output: vec![format!("shape_of_{input}")],
+        op_type: "Shape".to_string(),
+        ..Default::default()
+    };
+
+    assert!(
+        try_fold_shape_node(&shape_of("untyped"), &graph, &lookups, &weights).is_none(),
+        "Shape of a tensor with no recorded rank must not fold"
+    );
+    let folded = try_fold_shape_node(&shape_of("scalar"), &graph, &lookups, &weights)
+        .expect("Shape of a proven rank-0 tensor folds");
+    assert_eq!(folded.float_data.shape(), &[0]);
+    let integers = folded.integer_data.expect("exact INT64 empty vector");
+    assert_eq!(integers.shape(), &[0]);
 }
 
 #[test]
@@ -380,7 +430,7 @@ fn shape_then_gather_preserves_large_dimension_integer_store_2360() {
     let integer_data = axis_size
         .integer_data
         .expect("Gather should preserve exact integer payload");
-    assert!(integer_data.shape().is_empty());
+    assert_eq!((integer_data.shape()).len(), 0);
     assert_eq!(
         integer_data.iter().copied().collect::<Vec<_>>(),
         vec![16_777_217]
@@ -452,7 +502,7 @@ fn shape_cast_then_gather_preserves_large_dimension_integer_store_2360() {
     let integer_data = axis_size
         .integer_data
         .expect("Gather should preserve exact integer payload after Cast");
-    assert!(integer_data.shape().is_empty());
+    assert_eq!((integer_data.shape()).len(), 0);
     assert_eq!(
         integer_data.iter().copied().collect::<Vec<_>>(),
         vec![16_777_217]
@@ -462,7 +512,6 @@ fn shape_cast_then_gather_preserves_large_dimension_integer_store_2360() {
 /// Regression test for Prover audit finding: INT64→INT32 Cast with values
 /// outside i32 range must materialize the actual wrapping result, not keep
 /// the pre-cast float_data.
-/// See: P1 commit 5e7a2f0 "Re: #2360, Re: #3769 audit Cast overflow semantics"
 #[test]
 fn cast_int64_to_int32_overflow_materializes_wrapped_value_2360() {
     let mut weights = WeightStore::new();

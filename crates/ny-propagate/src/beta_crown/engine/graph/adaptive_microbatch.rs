@@ -34,7 +34,7 @@ const MIB: usize = 1024 * 1024;
 /// This is a verbatim copy of `DEFAULT_GPU_MEMORY_BUDGET_MB` in
 /// `ny-gpu/src/wgpu_device/ops/crown_memory_estimate.rs`, which predates this
 /// module: it arrived with the initial import (`3c6c271b`) as the **WGPU** CROWN
-/// backward budget for #3515. `runtime_device_budget_bytes` below duplicates
+/// backward budget. `runtime_device_budget_bytes` below duplicates
 /// that function whole — same `NY_GPU_MEMORY_BUDGET_MB` override, same
 /// `min(system / 2, 8 GiB)` policy, same `system_memory_bytes` helper down to
 /// the macOS `sysctl hw.memsize` branch.

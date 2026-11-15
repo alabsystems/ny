@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Finite differences gradient computation for DAG α-CROWN.
-//!
-//! Extracted from `gradients.rs` as part of #4187.
 
 use super::super::super::runtime_state::DagAlphaRuntimeState;
 use super::super::DagAlphaLoopContext;
@@ -33,7 +31,7 @@ impl GraphNetwork {
         num_relus: usize,
         eps: f32,
     ) -> Result<Vec<Array1<f32>>> {
-        // Pass current bilinear/mul_binary alphas through backward calls (#3287, #3439).
+        // Pass current bilinear/mul_binary alphas through backward calls.
         let (bl_fd, mb_fd) = alpha_refs(ctx, bilinear_alphas, mul_binary_alphas);
 
         let mut scratch = zeros_like_gradients(gradients);
@@ -41,7 +39,7 @@ impl GraphNetwork {
         let original_graph = runtime.snapshot_graph();
 
         // Wrap in closure so `?` returns to the closure, not the
-        // outer function. Ensures alpha restoration on error (#2554).
+        // outer function. Ensures alpha restoration on error.
         let result = (|| -> Result<Vec<Array1<f32>>> {
             let mut grads = Vec::with_capacity(num_relus);
 
@@ -66,7 +64,7 @@ impl GraphNetwork {
                     let (orig_alpha, orig_alpha_upper) =
                         runtime.relu_alpha_entry(relu_idx, neuron_idx)?;
 
-                    // f(alpha + eps) — perturb both paths (#3393)
+                    // f(alpha + eps) — perturb both paths
                     runtime.set_relu_alpha_entry(
                         relu_idx,
                         neuron_idx,
@@ -75,7 +73,7 @@ impl GraphNetwork {
                     )?;
                     scratch.iter_mut().for_each(|g| g.fill(0.0));
                     scratch_upper.iter_mut().for_each(|g| g.fill(0.0));
-                    // Propagate CROWN errors (#2065, #1941).
+                    // Propagate CROWN errors.
                     let bounds_plus = self.dag_alpha_backward_pass_with_engine(
                         ctx.input,
                         node_bounds,
@@ -92,10 +90,10 @@ impl GraphNetwork {
                         mb_fd,
                         ctx.config.deadline,
                     )?;
-                    // Filter -Inf to prevent NaN gradient from (-Inf)-(-Inf) (#3272, #2857).
+                    // Filter -Inf to prevent NaN gradient from (-Inf)-(-Inf).
                     let lower_plus: f32 = finite_lower_sum(bounds_plus.lower());
 
-                    // f(alpha - eps) — perturb both paths (#3393)
+                    // f(alpha - eps) — perturb both paths
                     runtime.set_relu_alpha_entry(
                         relu_idx,
                         neuron_idx,
@@ -104,7 +102,7 @@ impl GraphNetwork {
                     )?;
                     scratch.iter_mut().for_each(|g| g.fill(0.0));
                     scratch_upper.iter_mut().for_each(|g| g.fill(0.0));
-                    // Propagate CROWN errors (#2065, #1941).
+                    // Propagate CROWN errors.
                     let bounds_minus = self.dag_alpha_backward_pass_with_engine(
                         ctx.input,
                         node_bounds,
@@ -121,7 +119,7 @@ impl GraphNetwork {
                         mb_fd,
                         ctx.config.deadline,
                     )?;
-                    // Filter -Inf to prevent NaN gradient from (-Inf)-(-Inf) (#3272, #2857).
+                    // Filter -Inf to prevent NaN gradient from (-Inf)-(-Inf).
                     let lower_minus: f32 = finite_lower_sum(bounds_minus.lower());
 
                     // Per-neuron restore (inside closure)
@@ -141,7 +139,7 @@ impl GraphNetwork {
         })();
 
         // Always restore alpha state, including early error
-        // returns from `?` inside the closure (#2554, #3393).
+        // returns from `?` inside the closure.
         runtime.restore_graph(&original_graph);
         result
     }

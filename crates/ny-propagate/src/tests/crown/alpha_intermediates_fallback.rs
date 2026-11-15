@@ -63,7 +63,7 @@ fn assert_bias_and_concrete_match_crown(
     }
 }
 
-/// Regression test for #2189: AnalyticChain intermediates fallback on UnsupportedOp
+/// Regression test: AnalyticChain intermediates fallback on UnsupportedOp
 /// must return constant CROWN bounds (A=0, b=CROWN concrete bounds), not identity.
 #[ntest::timeout(10000)]
 #[test]
@@ -80,8 +80,8 @@ fn test_analytic_chain_intermediates_unsupported_op_returns_constant_bounds_2189
         .propagate_alpha_crown_with_intermediates_impl(&input, &layer_bounds, &alpha_state, None)
         .expect("UnsupportedOp intermediates path should fallback to CROWN and succeed");
 
-    assert!(intermediate.a_at_relu.is_empty());
-    assert!(intermediate.pre_relu_bounds.is_empty());
+    assert_eq!((intermediate.a_at_relu).len(), 0);
+    assert_eq!((intermediate.pre_relu_bounds).len(), 0);
 
     let crown_bounds = network.propagate_crown(&input).unwrap();
     assert_zero_slopes(

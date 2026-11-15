@@ -265,7 +265,7 @@ fn test_clip_crown_soundness_non_crossing() {
 fn test_clip_crown_crossing_soundness() {
     // Previously UNSOUND: Clip CROWN used the same chord for both upper and
     // lower bounds when crossing boundaries. Fixed by 6-case analytical
-    // relaxation. Reference: designs/2026-02-08-piecewise-crown-relaxation-fixes.md Part 1
+    // relaxation.
     //
     // Interval [-2, 0.5] crosses the lower boundary of clip(0, 1).
     // Case 5 (lower boundary crossing): upper = chord, lower = adaptive.
@@ -310,7 +310,7 @@ fn test_clip_crown_crossing_soundness() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_clip_crown_nan_inf_guard() {
-    // Updated for #2977: CROWN backward domain_guard rejects non-finite pre-activation
+    // CROWN backward domain_guard rejects non-finite pre-activation
     // with NumericalInstability. Previously this tested maximally-loose fallback bounds;
     // now it verifies the early rejection is correct.
     let layer = ClipLayer::new(0.0, 6.0);

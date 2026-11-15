@@ -9,6 +9,7 @@ use ny_core::{
     NyError, Result,
 };
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::time::Instant;
 
 use super::ops::{
@@ -393,6 +394,17 @@ fn patches_f64_reference_gap(
     // The scalar form measured ~2x the compose cost and pushed targets past the
     // per-node cap (Conv_11 7.3 s -> 12.3 s), which cost more bounds than the
     // tightening won. Same operator matrix the f32 seam uses, widened to f64.
+    //
+    // NOT CACHED, and the reason is ownership rather than cost. A cache would
+    // have to be held by something immutable that outlives the call, and there
+    // is no such owner here: `Conv2dPatchesParams` is rebuilt from `&self` on
+    // every call (so a cell on it could never hit), while `Conv2dLayer::kernel`
+    // — the only longer-lived candidate — is a `pub` field on a `Clone` struct
+    // that callers inside and outside this crate both reassign and mutate in
+    // place, so a layer-owned cell would need a reset at every one of those
+    // writers. The matrix is not even a per-layer constant: it also depends on
+    // the INCOMING patch extent `(prev_kh, prev_kw)`, which is a property of the
+    // composition so far, not of this convolution.
     if let Ok((m32, k_dim, n_dim)) =
         crate::layers::convolution::conv2d::conv2d_transpose_operator_matrix(
             p.kernel, p.sh, p.sw, prev_kh, prev_kw, new_kh, new_kw, p.in_c, p.groups,
@@ -404,10 +416,55 @@ fn patches_f64_reference_gap(
                 NyError::InvalidSpec("Conv2d Patches f64 input matrix size overflow".into())
             })?;
             let mut pmat = vec![0.0f64; pmat_len];
+            // #pmat-contiguous-block: for a standard-layout 6-D `incoming` of
+            // shape `(spec_oc, spec_oh, spec_ow, out_c, prev_kh, prev_kw)`, one
+            // position's `(c, ki, kj)` slab is `k_dim` CONTIGUOUS elements whose
+            // in-slab offset `(c * prev_kh + ki) * prev_kw + kj` is exactly the
+            // destination offset the loop below writes. The whole triple loop is
+            // therefore an elementwise exact widening of one contiguous run, and
+            // taking it as a run removes a dynamic-rank stride dot product plus
+            // six per-axis bounds checks PER ELEMENT.
+            //
+            // Bit-identical: `f32_to_f64_exact_bits` is a pure bit transform, and
+            // the slab identity above means each destination slot receives the
+            // same source element as before. The block is used only when the flat
+            // layout has been CONFIRMED (contiguous standard layout, rank 6, the
+            // trailing three axes equal to `(out_c, prev_kh, prev_kw)`, `k_dim`
+            // their product, and the computed run wholly inside the buffer);
+            // anything else keeps the original indexed form, which also preserves
+            // its out-of-range panic rather than converting it into a silent
+            // wrong answer.
+            let incoming_flat = incoming.as_slice().filter(|_| {
+                let shape = incoming.shape();
+                shape.len() == 6
+                    && shape[3] == p.out_c
+                    && shape[4] == prev_kh
+                    && shape[5] == prev_kw
+                    && p.out_c
+                        .checked_mul(prev_kh)
+                        .and_then(|v| v.checked_mul(prev_kw))
+                        == Some(k_dim)
+            });
             pmat.par_chunks_mut(k_dim)
                 .enumerate()
                 .for_each(|(idx, row)| {
                     let (_r, soc, soh, sow) = decode(idx);
+                    let slab = incoming_flat.and_then(|incoming_slice| {
+                        let shape = incoming.shape();
+                        let position = soc
+                            .checked_mul(shape[1])
+                            .and_then(|v| v.checked_add(soh))
+                            .and_then(|v| v.checked_mul(shape[2]))
+                            .and_then(|v| v.checked_add(sow))
+                            .and_then(|v| v.checked_mul(k_dim))?;
+                        incoming_slice.get(position..)?.get(..k_dim)
+                    });
+                    if let Some(slab) = slab {
+                        for (dst, &src) in row.iter_mut().zip(slab) {
+                            *dst = f32_to_f64_exact_bits(src);
+                        }
+                        return;
+                    }
                     for c in 0..p.out_c {
                         for ki in 0..prev_kh {
                             for kj in 0..prev_kw {
@@ -829,8 +886,6 @@ impl PatchesPropagation for Conv2dLayer {
     /// - new_kh = (prev_kh - 1) * stride_h + kh
     /// - new_stride = prev_stride * conv_stride
     /// - new_padding = prev_padding * conv_stride + conv_padding
-    ///
-    /// Design: designs/2026-02-28-patches-mode-wrapper-enum-design.md
     fn propagate_patches(&self, bounds: &PatchesLinearBounds) -> Result<CrownBounds> {
         self.propagate_patches_engine(bounds, None)
     }
@@ -1231,18 +1286,52 @@ impl Conv2dLayer {
                     got: vec![in_c_per_group.saturating_mul(p.groups), p.out_c, p.groups],
                 });
             }
-            checked_shape_product(&[p.out_c, p.out_h, p.out_w, p.in_c, p.kh, p.kw]).ok_or_else(
-                || NyError::InvalidSpec("Conv2d identity Patches tensor size overflow".into()),
-            )?;
-            let mut patches =
-                ArrayD::<f32>::zeros(IxDyn(&[p.out_c, p.out_h, p.out_w, p.in_c, p.kh, p.kw]));
+            let patch_elems =
+                checked_shape_product(&[p.out_c, p.out_h, p.out_w, p.in_c, p.kh, p.kw])
+                    .ok_or_else(|| {
+                        NyError::InvalidSpec("Conv2d identity Patches tensor size overflow".into())
+                    })?;
+            // #identity-patches-flat: the destination is a fresh standard-layout
+            // 6-D tensor, so every store below has a closed-form flat address.
+            // Filling it through the contiguous backing slice with hoisted
+            // strides replaces, PER ELEMENT, an `IxDyn` stride dot product plus
+            // its per-axis bounds checks with a single add — and the `(ki, kj)`
+            // block for a fixed `(oc, ic_local)` is `kh * kw` contiguous elements
+            // in BOTH tensors, so the two innermost loops collapse into one
+            // `copy_from_slice`.
+            //
+            // Bit-identity is by construction rather than by measurement: no
+            // float is read, written, or rounded differently. The same kernel
+            // values land at the same flat addresses (`checked_shape_product`
+            // above bounds the full 6-D product, so every partial stride product
+            // and every address below it is overflow-free), each destination
+            // element is written at most once, and everything not written stays
+            // at the `+0.0` the buffer starts at — the same `+0.0` `ArrayD::zeros`
+            // used to supply.
+            let mut patch_flat = vec![0.0f32; patch_elems];
             check_patches_deadline(deadline, "after identity-patches allocation")?;
+            // `as_slice` is `None` only for a kernel that is not in standard
+            // layout; the fallback iterator visits elements in the array's
+            // LOGICAL `(oc, ic_local, ki, kj)` order for any layout, which is the
+            // order the flat offsets below assume.
+            let kernel_flat: Cow<'_, [f32]> = match p.kernel.as_slice() {
+                Some(flat) => Cow::Borrowed(flat),
+                None => Cow::Owned(p.kernel.iter().copied().collect()),
+            };
+            let kernel_spatial = p.kh * p.kw;
+            let stride_ic = kernel_spatial;
+            let stride_ow = p.in_c * stride_ic;
+            let stride_oh = p.out_w * stride_ow;
+            let stride_oc = p.out_h * stride_oh;
             let out_c_per_group = p.out_c / p.groups;
             let mut position = 0usize;
             for oc in 0..p.out_c {
                 let group_idx = oc / out_c_per_group;
                 let ic_start = group_idx * in_c_per_group;
+                let oc_base = oc * stride_oc;
+                let kernel_oc_base = oc * in_c_per_group * kernel_spatial;
                 for oh in 0..p.out_h {
+                    let oh_base = oc_base + oh * stride_oh;
                     for ow in 0..p.out_w {
                         if position.is_multiple_of(64) {
                             check_patches_deadline(
@@ -1251,19 +1340,24 @@ impl Conv2dLayer {
                             )?;
                         }
                         position += 1;
+                        let ow_base = oh_base + ow * stride_ow;
                         for ic_local in 0..in_c_per_group {
-                            let ic = ic_start + ic_local;
-                            for ki in 0..p.kh {
-                                for kj in 0..p.kw {
-                                    patches[[oc, oh, ow, ic, ki, kj]] =
-                                        p.kernel[[oc, ic_local, ki, kj]];
-                                }
-                            }
+                            let dst = ow_base + (ic_start + ic_local) * stride_ic;
+                            let src = kernel_oc_base + ic_local * kernel_spatial;
+                            patch_flat[dst..dst + kernel_spatial]
+                                .copy_from_slice(&kernel_flat[src..src + kernel_spatial]);
                         }
                     }
                 }
             }
             check_patches_deadline(deadline, "after identity coefficient propagation")?;
+            let patches = ArrayD::<f32>::from_shape_vec(
+                IxDyn(&[p.out_c, p.out_h, p.out_w, p.in_c, p.kh, p.kw]),
+                patch_flat,
+            )
+            .map_err(|e| {
+                NyError::InternalError(format!("Conv2d identity Patches tensor shape: {e}"))
+            })?;
             Ok(PatchesData {
                 coeff_err: None,
                 patches: Some(patches),
@@ -4187,5 +4281,279 @@ mod coeff_err_tests {
             zlb.iter().chain(zub.iter()).all(|v| v.is_finite()),
             "all-zero bias with +INF err must not poison or NaN: {zlb:?} {zub:?}"
         );
+    }
+
+    /// #identity-patches-flat pin: the stride-hoisted flat fill must reproduce
+    /// the 6-D indexed fill EXACTLY — the same kernel value at the same
+    /// coordinate, and `+0.0` at every off-group coordinate of a grouped
+    /// convolution, where `ic_start` is what decides which quarter of the
+    /// channel axis is written.
+    ///
+    /// IT FAILS CLOSED on the layout assumption, which is the actual risk this
+    /// change introduces. The fill reads the kernel through `as_slice` when the
+    /// buffer is contiguous and through the logical-order iterator when it is
+    /// not, so the test runs BOTH arms off one logically identical kernel and
+    /// asserts the fixture really does take a different arm each time (one
+    /// `as_slice().is_some()`, one `.is_none()`). Read the permuted kernel's raw
+    /// buffer instead of its logical order and the values land transposed, which
+    /// this catches; assume contiguity and the permuted arm produces garbage.
+    #[test]
+    fn identity_patches_flat_fill_matches_indexed_reference() {
+        let (out_c, in_c, groups) = (4usize, 6usize, 2usize);
+        let (kh, kw, out_h, out_w) = (3usize, 2usize, 3usize, 4usize);
+        let (in_h, in_w) = (7usize, 9usize);
+        let in_c_per_group = in_c / groups;
+        let out_c_per_group = out_c / groups;
+        let kernel = ArrayD::from_shape_vec(
+            IxDyn(&[out_c, in_c_per_group, kh, kw]),
+            det_fill(out_c * in_c_per_group * kh * kw, 19),
+        )
+        .expect("kernel shape");
+        assert!(
+            kernel.as_slice().is_some(),
+            "fixture: the contiguous arm must really be contiguous"
+        );
+
+        // The same logical kernel with a NON-standard layout: lay the data out
+        // in reversed axis order, then permute the axes back. `as_slice` is
+        // `None` for the result while `iter()` still yields logical order. No
+        // axis is length 1, because `is_standard_layout` skips unit axes and a
+        // permuted `[N, 1, 1, 1]` would still report C-order.
+        let mut reversed = vec![0.0f32; out_c * in_c_per_group * kh * kw];
+        for oc in 0..out_c {
+            for ic_local in 0..in_c_per_group {
+                for ki in 0..kh {
+                    for kj in 0..kw {
+                        reversed[((kj * kh + ki) * in_c_per_group + ic_local) * out_c + oc] =
+                            kernel[[oc, ic_local, ki, kj]];
+                    }
+                }
+            }
+        }
+        let permuted_kernel =
+            ArrayD::from_shape_vec(IxDyn(&[kw, kh, in_c_per_group, out_c]), reversed)
+                .expect("reversed kernel shape")
+                .permuted_axes(vec![3, 2, 1, 0]);
+        assert_eq!(permuted_kernel.shape(), kernel.shape());
+        assert!(
+            permuted_kernel.as_slice().is_none(),
+            "fixture: the fallback arm must really be non-contiguous"
+        );
+        assert_eq!(
+            permuted_kernel, kernel,
+            "fixture: both arms must carry the same logical kernel"
+        );
+
+        let mut expected = ArrayD::<f32>::zeros(IxDyn(&[out_c, out_h, out_w, in_c, kh, kw]));
+        for oc in 0..out_c {
+            let ic_start = (oc / out_c_per_group) * in_c_per_group;
+            for oh in 0..out_h {
+                for ow in 0..out_w {
+                    for ic_local in 0..in_c_per_group {
+                        for ki in 0..kh {
+                            for kj in 0..kw {
+                                expected[[oc, oh, ow, ic_start + ic_local, ki, kj]] =
+                                    kernel[[oc, ic_local, ki, kj]];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            expected.iter().any(|v| *v == 0.0),
+            "fixture: grouping must leave off-group coordinates at zero"
+        );
+        assert!(
+            expected.iter().any(|v| *v != 0.0),
+            "fixture: the kernel must not be all zeros"
+        );
+
+        let identity = PatchesData {
+            coeff_err: None,
+            patches: None,
+            geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
+            identity: true,
+            output_shape: (out_c, out_h, out_w),
+            input_shape: (in_c, in_h, in_w),
+            unstable_idx: None,
+        };
+        for (label, layer_kernel) in [("contiguous", &kernel), ("permuted", &permuted_kernel)] {
+            let params = Conv2dPatchesParams {
+                kernel: layer_kernel,
+                in_c,
+                out_c,
+                groups,
+                kh,
+                kw,
+                sh: 2,
+                sw: 1,
+                ph: 1,
+                pw: 0,
+                in_h,
+                in_w,
+                out_h,
+                out_w,
+            };
+            let out = Conv2dLayer::conv2d_patches_backward(&identity, &params, None)
+                .expect("identity patches");
+            let built = out
+                .patches
+                .as_ref()
+                .expect("the identity arm must emit a patches tensor");
+            assert_eq!(built.shape(), expected.shape(), "{label}: shape");
+            assert_bits_eq(
+                label,
+                built
+                    .as_slice()
+                    .expect("the built tensor must be standard layout"),
+                expected.as_slice().expect("reference is standard layout"),
+            );
+            assert!(!out.identity, "{label}: identity must be consumed");
+            assert_eq!(
+                out.output_shape,
+                (out_c, out_h, out_w),
+                "{label}: output shape"
+            );
+            assert_eq!(out.input_shape, (in_c, in_h, in_w), "{label}: input shape");
+        }
+    }
+
+    /// #pmat-contiguous-block pin: the contiguous-slab read of `incoming` must
+    /// deliver the f64 reference GEMM exactly the operand the 6-D indexed loop
+    /// delivered.
+    ///
+    /// IT FAILS CLOSED because the two arms are DIFFERENT CODE, not the same
+    /// code called twice: the contiguous `incoming` takes the new slab lane and
+    /// a logically identical, axis-permuted `incoming` takes the preserved
+    /// indexed lane (the fixture asserts one `as_slice().is_some()` and the
+    /// other `.is_none()`, and that the two carry equal logical contents). Get
+    /// the slab offset or the in-slab order wrong and the reference is computed
+    /// from a permuted operand, so the two certificates part company.
+    #[test]
+    fn patches_f64_reference_gap_slab_matches_indexed_fallback() {
+        let (out_c, in_c, groups) = (2usize, 4usize, 2usize);
+        let in_c_per_group = in_c / groups;
+        let (kh, kw, sh, sw) = (2usize, 2usize, 2usize, 1usize);
+        let (prev_kh, prev_kw) = (2usize, 3usize);
+        let (new_kh, new_kw) = ((prev_kh - 1) * sh + kh, (prev_kw - 1) * sw + kw);
+        let (spec_oc, spec_oh, spec_ow) = (2usize, 2usize, 3usize);
+        let num_positions = spec_oc * spec_oh * spec_ow;
+        let patch_volume = in_c * new_kh * new_kw;
+
+        let kernel = ArrayD::from_shape_vec(
+            IxDyn(&[out_c, in_c_per_group, kh, kw]),
+            det_fill(out_c * in_c_per_group * kh * kw, 5),
+        )
+        .expect("kernel shape");
+        let params = Conv2dPatchesParams {
+            kernel: &kernel,
+            in_c,
+            out_c,
+            groups,
+            kh,
+            kw,
+            sh,
+            sw,
+            ph: 0,
+            pw: 0,
+            in_h: 1,
+            in_w: 1,
+            out_h: 1,
+            out_w: 1,
+        };
+
+        let incoming_shape = [spec_oc, spec_oh, spec_ow, out_c, prev_kh, prev_kw];
+        let incoming_len: usize = incoming_shape.iter().product();
+        let incoming = ArrayD::from_shape_vec(IxDyn(&incoming_shape), det_fill(incoming_len, 71))
+            .expect("incoming shape");
+        assert!(
+            incoming.as_slice().is_some(),
+            "fixture: the slab arm must really be contiguous"
+        );
+
+        // Logically identical, reversed layout: no axis is length 1, so
+        // `as_slice` genuinely reports `None` and the indexed lane is taken.
+        let mut reversed = vec![0.0f32; incoming_len];
+        for a in 0..spec_oc {
+            for b in 0..spec_oh {
+                for c in 0..spec_ow {
+                    for d in 0..out_c {
+                        for e in 0..prev_kh {
+                            for f in 0..prev_kw {
+                                let flat =
+                                    ((((f * prev_kh + e) * out_c + d) * spec_ow + c) * spec_oh + b)
+                                        * spec_oc
+                                        + a;
+                                reversed[flat] = incoming[[a, b, c, d, e, f]];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let permuted_incoming = ArrayD::from_shape_vec(
+            IxDyn(&[prev_kw, prev_kh, out_c, spec_ow, spec_oh, spec_oc]),
+            reversed,
+        )
+        .expect("reversed incoming shape")
+        .permuted_axes(vec![5, 4, 3, 2, 1, 0]);
+        assert_eq!(permuted_incoming.shape(), incoming.shape());
+        assert!(
+            permuted_incoming.as_slice().is_none(),
+            "fixture: the fallback arm must really be non-contiguous"
+        );
+        assert_eq!(
+            permuted_incoming, incoming,
+            "fixture: both arms must carry the same logical patch tensor"
+        );
+
+        let new_patches = ArrayD::from_shape_vec(
+            IxDyn(&[spec_oc, spec_oh, spec_ow, in_c, new_kh, new_kw]),
+            det_fill(num_positions * patch_volume, 137),
+        )
+        .expect("composed patches shape");
+        let decode = |idx: usize| -> (usize, usize, usize, usize) {
+            let per_spec = spec_oh * spec_ow;
+            (0, idx / per_spec, (idx % per_spec) / spec_ow, idx % spec_ow)
+        };
+
+        let slab = patches_f64_reference_gap(
+            &new_patches,
+            &incoming,
+            &params,
+            (prev_kh, prev_kw),
+            (new_kh, new_kw),
+            num_positions,
+            patch_volume,
+            &decode,
+            None,
+        )
+        .expect("slab arm must not error")
+        .expect("the batched f64 reference must be reachable for this geometry");
+        let indexed = patches_f64_reference_gap(
+            &new_patches,
+            &permuted_incoming,
+            &params,
+            (prev_kh, prev_kw),
+            (new_kh, new_kw),
+            num_positions,
+            patch_volume,
+            &decode,
+            None,
+        )
+        .expect("indexed arm must not error")
+        .expect("the batched f64 reference must be reachable for this geometry");
+
+        assert_eq!(slab.len(), num_positions, "one certificate per position");
+        assert!(
+            slab.iter().all(|v| v.is_finite()),
+            "fixture must not produce a non-finite certificate: {slab:?}"
+        );
+        assert!(
+            slab.iter().any(|&v| v > 0.0),
+            "fixture must produce a measurable gap, else the comparison is vacuous"
+        );
+        assert_bits_eq("pmat slab vs indexed fallback", &slab, &indexed);
     }
 }

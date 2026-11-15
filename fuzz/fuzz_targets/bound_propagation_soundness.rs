@@ -33,10 +33,15 @@
 //! point-box IBP "forward eval" and the box propagation.
 //!
 //! NOTE: This target is written against the `ny-fuzz` crate structure and
-//! mirrors the existing targets exactly. It requires a nightly toolchain plus
-//! `cargo-fuzz` to actually run (`cargo +nightly fuzz run
-//! bound_propagation_soundness`). If that toolchain is unavailable in the
-//! current environment the target still compiles as part of the fuzz crate.
+//! mirrors the existing targets exactly. On the Trust toolchain run it with
+//! `fuzz/run.sh bound_propagation_soundness`: it builds the target on
+//! `targo --unverified` with cargo-fuzz's coverage instrumentation and no
+//! sanitizer, then runs libFuzzer. The AddressSanitizer build stays
+//! `cargo +nightly fuzz run bound_propagation_soundness` on a nightly with
+//! `cargo-fuzz`: STOCK EXCEPTION (Trust lacks the ASan runtime cargo-fuzz
+//! links; measured `trustc -Zsanitizer=address` -> ld: library
+//! 'rustc-trust_rt.asan' not found). Either way the target also compiles as
+//! part of the fuzz crate.
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;

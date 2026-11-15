@@ -13,6 +13,7 @@ use tracing::{debug, info, warn};
 use crate::beta_crown::result::{
     record_global_timeout_deadline_source, BabVerificationStatus, BetaCrownResult,
 };
+use crate::network::ibp::{propagate_concrete_point_until, LeadingAxisMode};
 use crate::pgd_attack::PgdAttacker;
 use crate::Network;
 
@@ -41,6 +42,8 @@ impl BetaCrownVerifier {
         original_result: BetaCrownResult,
         deadline: Option<Instant>,
     ) -> Result<BetaCrownResult> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Attack);
         if !self.config.enable_pgd_attack {
             return Ok(original_result);
         }
@@ -62,13 +65,24 @@ impl BetaCrownVerifier {
         // Run PGD attack
         // For verify_upper_bound=true: looking for output >= threshold
         // For verify_upper_bound=false: looking for output <= threshold
-        let attack_result = attacker.attack(
+        let attack_result = match attacker.attack(
             network,
             input,
             0, // Output index (scalar output assumed)
             threshold,
             self.config.verify_upper_bound,
-        )?;
+        ) {
+            Ok(result) => result,
+            Err(error) if PgdAttacker::has_deadline_source(&error) && attacker.past_deadline() => {
+                if original_was_timeout {
+                    record_global_timeout_deadline_source(deadline);
+                }
+                // Expired optional falsification has no authority to replace
+                // the incoming certified/undecided result with an error.
+                return Ok(original_result);
+            }
+            Err(error) => return Err(error),
+        };
         let terminal_deadline_observed = attacker.deadline_exhausted();
 
         if attack_result.found_counterexample {
@@ -90,7 +104,18 @@ impl BetaCrownVerifier {
             // the attacker's engine/cached-plan path. This keeps the
             // confirmation step independent from the evaluator used during PGD.
             // Reference: alpha-beta-CROWN default_adv_example_finalizer + test_conditions.
-            let reeval_output = independent_concrete_forward(network, &cx_input)?;
+            let reeval_output = match independent_concrete_forward(network, &cx_input, deadline) {
+                Ok(output) => output,
+                Err(error)
+                    if PgdAttacker::has_deadline_source(&error) && attacker.past_deadline() =>
+                {
+                    if original_was_timeout {
+                        record_global_timeout_deadline_source(deadline);
+                    }
+                    return Ok(original_result);
+                }
+                Err(error) => return Err(error),
+            };
             let reeval_value = reeval_output.iter().next().copied().ok_or_else(|| {
                 NyError::InternalError(
                     "Re-validation forward pass produced empty output".to_string(),
@@ -139,6 +164,15 @@ impl BetaCrownVerifier {
             let counterexample = cx_input.iter().copied().collect();
             let output = reeval_output.iter().copied().collect();
 
+            // Containment and publication allocation do not create a fresh
+            // attack grant. A late witness retains the incoming result.
+            if attacker.past_deadline() {
+                if original_was_timeout {
+                    record_global_timeout_deadline_source(deadline);
+                }
+                return Ok(original_result);
+            }
+
             return Ok(BetaCrownResult {
                 result: BabVerificationStatus::Violated {
                     counterexample,
@@ -169,7 +203,17 @@ impl BetaCrownVerifier {
 fn independent_concrete_forward(
     network: &Network,
     candidate: &ndarray::ArrayD<f32>,
+    deadline: Option<Instant>,
 ) -> Result<ndarray::ArrayD<f32>> {
+    let deadline = match (deadline, ny_core::instance_budget::deadline()) {
+        (Some(phase), Some(instance)) => Some(phase.min(instance)),
+        (phase, instance) => phase.or(instance),
+    };
+    if deadline.is_some_and(|d| Instant::now() >= d) {
+        return Err(NyError::DeadlineExceeded(
+            "PGD independent concrete confirmation".into(),
+        ));
+    }
     let concrete = BoundedTensor::concrete(candidate.clone())?;
     // TRUE concrete (point) forward, collapsing to the interval center after each
     // layer. `propagate_ibp` propagates a BOX; for a point input the per-layer
@@ -178,8 +222,17 @@ fn independent_concrete_forward(
     // `propagate_ibp(...).lower()` here re-confirmed false counterexamples that ORT
     // then rejected (cgan_2023 unknown-downgrade). #cgan-eval. Engine-free CPU path
     // keeps this re-validation independent of the attacker's evaluator.
-    let output = network.propagate_concrete_point(&concrete, None)?;
-    Ok(output.center())
+    let output =
+        propagate_concrete_point_until(network, &concrete, None, LeadingAxisMode::Plain, deadline)?;
+    output.center_with_poll(|| {
+        if deadline.is_some_and(|limit| Instant::now() >= limit) {
+            Err(NyError::DeadlineExceeded(
+                "PGD independent confirmation output".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    })
 }
 
 /// Check that a candidate counterexample input is within the given input bounds.
@@ -212,7 +265,117 @@ fn input_within_bounds(candidate: &ndarray::ArrayD<f32>, bounds: &BoundedTensor)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{arr1, ArrayD};
+    use crate::layers::{Layer, LinearLayer};
+    use ndarray::{arr1, arr2, ArrayD};
+    use std::time::Duration;
+
+    fn phase_test_verifier() -> BetaCrownVerifier {
+        let mut verifier = BetaCrownVerifier::default();
+        verifier.config.enable_pgd_attack = true;
+        verifier.config.pgd_restarts = 2;
+        verifier.config.pgd_steps = 0;
+        verifier.config.verify_upper_bound = true;
+        verifier
+    }
+
+    fn phase_test_network() -> Network {
+        let mut network = Network::new();
+        network.add_layer(Layer::Linear(
+            LinearLayer::new(arr2(&[[1.0]]), None).unwrap(),
+        ));
+        network
+    }
+
+    fn incoming_timeout() -> BetaCrownResult {
+        BetaCrownResult {
+            result: BabVerificationStatus::Timeout,
+            domains_explored: 7,
+            domains_verified: 3,
+            cuts_generated: 2,
+            max_depth_reached: 4,
+            time_elapsed: Duration::from_millis(5),
+            output_bounds: Some(
+                BoundedTensor::new(arr1(&[-1.0_f32]).into_dyn(), arr1(&[3.0_f32]).into_dyn())
+                    .unwrap(),
+            ),
+        }
+    }
+
+    #[test]
+    fn expired_optional_pgd_preserves_the_incoming_timeout_and_complete_bounds() {
+        let input =
+            BoundedTensor::new(arr1(&[1.0_f32]).into_dyn(), arr1(&[2.0_f32]).into_dyn()).unwrap();
+        let result = phase_test_verifier()
+            .try_pgd_attack_with_deadline(
+                &phase_test_network(),
+                &input,
+                0.0,
+                incoming_timeout(),
+                Some(
+                    Instant::now()
+                        .checked_sub(Duration::from_millis(1))
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+        assert!(matches!(result.result, BabVerificationStatus::Timeout));
+        assert_eq!(result.domains_explored, 7);
+        assert_eq!(result.domains_verified, 3);
+        assert_eq!(result.cuts_generated, 2);
+        assert_eq!(result.max_depth_reached, 4);
+        assert_eq!(result.time_elapsed, Duration::from_millis(5));
+        let bounds = result.output_bounds.unwrap();
+        assert_eq!(bounds.lower()[[0]], -1.0);
+        assert_eq!(bounds.upper()[[0]], 3.0);
+    }
+
+    #[test]
+    fn live_optional_pgd_witness_still_crosses_independent_forward_and_containment() {
+        let input =
+            BoundedTensor::new(arr1(&[1.0_f32]).into_dyn(), arr1(&[2.0_f32]).into_dyn()).unwrap();
+        let result = phase_test_verifier()
+            .try_pgd_attack_with_deadline(
+                &phase_test_network(),
+                &input,
+                0.0,
+                incoming_timeout(),
+                Some(Instant::now() + Duration::from_secs(30)),
+            )
+            .unwrap();
+        let BabVerificationStatus::Violated {
+            counterexample,
+            output,
+        } = result.result
+        else {
+            panic!("live known witness was not independently accepted");
+        };
+        assert_eq!(counterexample.len(), 1);
+        assert!((1.0..=2.0).contains(&counterexample[0]));
+        assert_eq!(output, counterexample);
+        assert_eq!(result.domains_explored, 7);
+        assert_eq!(result.domains_verified, 3);
+        assert_eq!(result.max_depth_reached, 4);
+    }
+
+    #[test]
+    fn live_optional_pgd_does_not_reclassify_a_genuine_shape_failure_as_expiry() {
+        let wrong_input = BoundedTensor::new(
+            arr1(&[1.0_f32, 1.0]).into_dyn(),
+            arr1(&[2.0_f32, 2.0]).into_dyn(),
+        )
+        .unwrap();
+        let error = phase_test_verifier()
+            .try_pgd_attack_with_deadline(
+                &phase_test_network(),
+                &wrong_input,
+                0.0,
+                incoming_timeout(),
+                Some(Instant::now() + Duration::from_secs(30)),
+            )
+            .unwrap_err();
+        assert!(!error.is_deadline_exceeded(), "{error:?}");
+        assert!(error.to_string().contains("Shape mismatch"), "{error:?}");
+    }
 
     /// Candidate within bounds → true.
     #[ntest::timeout(5000)]

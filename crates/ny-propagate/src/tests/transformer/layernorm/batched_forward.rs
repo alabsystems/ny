@@ -199,8 +199,8 @@ fn test_layernorm_batched_mean_only_linear_bounds() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_layernorm_batched_mean_only_counterexample_rounding_regression() {
-    // Regression from #2175: large-magnitude ny/A values stress f32 rounding.
-    // A-matrix uses round-to-nearest (#2208); soundness via bias directed rounding.
+    // Regression: large-magnitude ny/A values stress f32 rounding.
+    // A-matrix uses round-to-nearest; soundness via bias directed rounding.
     let hidden = 3;
     let ny = arr1(&[44308008.0_f32, -54247556.0, 89054136.0]);
     let lower_a_row = [52456016.0_f32, -99578792.0, -10922561.0];
@@ -350,7 +350,7 @@ fn test_layernorm_forward_mode_vs_conservative() {
 
         // Soundness check: sample concrete points and verify forward-mode
         // bounds contain the true output. Forward mode is not guaranteed
-        // tighter than conservative for all cases (#3169).
+        // tighter than conservative for all cases.
         let tol = 1e-2; // sampling tolerance for heuristic bounds
         for sample_idx in 0..10 {
             let mut point = ArrayD::zeros(IxDyn(&[batch * seq, hidden]));
@@ -415,7 +415,7 @@ fn test_layernorm_forward_mode_low_variance_center() {
     //
     // When bounds' midpoint (center) has near-zero variance, sensitivity = ny/std
     // is large (std ≈ sqrt(eps) ≈ 0.003 → ~356× amplification for ny=1).
-    // Capping was removed (#2074) because it produced unsound bounds.
+    // Capping was removed because it produced unsound bounds.
     // The bounds are still finite and valid — just loose for low-variance inputs.
 
     let hidden = 8;
@@ -448,7 +448,7 @@ fn test_layernorm_forward_mode_low_variance_center() {
         assert!(l <= u, "Bounds must be ordered: lower={l} > upper={u}");
     }
 
-    // Amplification is high without sensitivity capping (#2074 removed for soundness).
+    // Amplification is high without sensitivity capping (removed for soundness).
     // No arbitrary threshold — just verify soundness via sampling.
     let tol = 1e-2;
     for sample_idx in 0..20 {

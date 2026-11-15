@@ -4,7 +4,7 @@
 
 use ndarray::Array1;
 use ny_core::{NyError, Result};
-use ny_propagate::layers::LinearLayer;
+use ny_propagate::layers::{LinearLayer, PointLinearLayer};
 use ny_propagate::Layer;
 use tracing::debug;
 
@@ -44,7 +44,7 @@ impl ConvertContext<'_> {
             )));
         }
 
-        // Read ONNX Gemm attributes (#2244)
+        // Read ONNX Gemm attributes
         let alpha = match spec.attributes.get("alpha") {
             Some(AttributeValue::Float(v)) => *v,
             None => 1.0,
@@ -115,6 +115,44 @@ impl ConvertContext<'_> {
             .weights
             .get(weight_name)
             .ok_or_else(|| NyError::ModelLoad(format!("Weight {} not found", weight_name)))?;
+
+        if let crate::LinearStoragePolicy::OriginalPoint(policy) = self.linear_storage {
+            let original = weight
+                .view()
+                .into_dimensionality::<ndarray::Ix2>()
+                .map_err(|_| NyError::ShapeMismatch {
+                    expected: vec![0, 0],
+                    got: weight.shape().to_vec(),
+                })?;
+            let transpose = match trans_b_explicit {
+                Some(trans_b) => !trans_b,
+                None => match spec.weights.as_ref() {
+                    Some(reference) => {
+                        reference.shape.len() == 2
+                            && original.nrows() == reference.shape[1]
+                            && original.ncols() == reference.shape[0]
+                    }
+                    None => true,
+                },
+            };
+            let bias = spec
+                .inputs
+                .get(2)
+                .filter(|name| !name.is_empty())
+                .map(|name| {
+                    self.weights
+                        .get(name)
+                        .ok_or_else(|| NyError::ModelLoad(format!("Bias {name} not found")))
+                })
+                .transpose()?;
+            return PointLinearLayer::from_original_view(
+                original,
+                transpose,
+                bias.map(|b| b.view()),
+                policy,
+            )
+            .map(Layer::PointLinear);
+        }
 
         // Weight shape for LinearLayer: (out_features, in_features)
         let mut weight_2d = weight

@@ -29,13 +29,11 @@ bab:
     # graph engine) for this high-dim conv net (3072-element input) — input-splitting
     # is hopeless. candidates/reduceop still tune kFSB. See branching.rs.
     candidates: 7
-    reduceop: max
     # #kfsb-multi: arm the wave-batched multi-objective kFSB selector. Measured
     # Pareto on cifar100 (9/9 instances strictly better bound trajectory, 0
     # verdict regressions, wall never extended). Kill switch: NY_MO_KFSB=0.
     kfsb_multi: true
   beta_crown:
-    lr_alpha: 0.1
     lr_beta: 0.2
     iterations: 10
   alpha_crown:

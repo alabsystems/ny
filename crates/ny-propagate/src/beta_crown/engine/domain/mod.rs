@@ -14,7 +14,7 @@ mod strengthening;
 use crate::beta_crown::domain::BabDomain;
 
 /// Result of processing a single domain, carrying both children and failure info.
-/// #1865: Prevents silent domain dropping by explicitly tracking propagation failures
+/// Prevents silent domain dropping by explicitly tracking propagation failures
 /// and no-branch conditions that would otherwise cause false Verified results.
 pub(crate) struct DomainProcessingResult {
     pub children: Vec<BabDomain>,

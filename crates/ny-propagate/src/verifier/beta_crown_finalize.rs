@@ -59,7 +59,7 @@ impl Verifier {
 
         match result.result {
             BabVerificationStatus::Verified => {
-                // Per-output validation (#2241): BaB proved min(all_outputs) > min_threshold,
+                // Per-output validation: BaB proved min(all_outputs) > min_threshold,
                 // but each output must meet its *own* bound. Downgrade to Unknown if any
                 // individual output's computed bounds don't satisfy its spec requirement.
                 for (computed, required) in output_bounds.iter().zip(spec.output_bounds()) {
@@ -239,7 +239,7 @@ impl Verifier {
     /// Apply BaB output bounds to the fallback array, skipping NaN entries.
     ///
     /// NaN bounds indicate numerical corruption in CROWN propagation or BaB.
-    /// These are logged as warnings rather than silently dropped (#2589).
+    /// These are logged as warnings rather than silently dropped.
     pub(super) fn apply_bab_output_bounds(output_bounds: &mut [Bound], bab_bounds: &BoundedTensor) {
         let mut nan_count = 0usize;
         for (idx, (&l, &u)) in bab_bounds

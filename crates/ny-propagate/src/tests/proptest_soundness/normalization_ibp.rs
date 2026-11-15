@@ -7,8 +7,6 @@
 //! These tests verify that both conservative and forward-mode IBP
 //! produce sound bounds: for any x in [l, u], f(x) lies within
 //! the computed output bounds.
-//!
-//! Part of #3160, #3195, #3326.
 
 use crate::layers::common::BoundPropagation;
 use crate::layers::normalization::AdaIN1dLayer;
@@ -154,7 +152,7 @@ proptest! {
 
     /// RmsNorm forward-mode IBP soundness with large perturbation.
     ///
-    /// Regression test for the σ_min fix (#3159): large boxes can include
+    /// Regression test for the σ_min fix: large boxes can include
     /// points near zero where RMS is very small, causing output to diverge
     /// from center-point predictions.
     #[ntest::timeout(10000)]
@@ -363,7 +361,7 @@ proptest! {
 
     /// InstanceNorm1d forward-mode with large perturbation.
     ///
-    /// Regression test for σ_min fix (#3159): exercises the path where
+    /// Regression test for σ_min fix: exercises the path where
     /// the input box reaches zero-variance configurations.
     #[ntest::timeout(10000)]
     #[test]
@@ -672,10 +670,8 @@ proptest! {
 // LayerNorm: y_i = ny_i * (x_i - mean(x)) / sqrt(var(x) + eps) + beta_i
 //
 // These proptest soundness tests were missing despite being present for all
-// other normalization layers (RmsNorm, InstanceNorm1d, AdaIN1d) since #3160.
+// other normalization layers (RmsNorm, InstanceNorm1d, AdaIN1d).
 // LayerNorm is the most commonly used normalization layer in transformers.
-//
-// Part of #3195.
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(300) })]
@@ -811,7 +807,7 @@ proptest! {
 
     /// LayerNorm forward-mode IBP soundness with large perturbation.
     ///
-    /// Regression test for the σ_min fix (#3098): large boxes can include
+    /// Regression test for the σ_min fix: large boxes can include
     /// points near constant-input configurations where variance is very small,
     /// causing output to diverge from center-point predictions.
     #[ntest::timeout(10000)]

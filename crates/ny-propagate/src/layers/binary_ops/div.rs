@@ -51,7 +51,7 @@ fn div_bounds_elementwise(
         .for_each(|ol, ou, &al, &au, &bl, &bu| {
             if al >= 0.0 {
                 // Both bounds non-negative: f(b) = a/b is decreasing in b
-                // Directed rounding: lower bound rounds down, upper bound rounds up (#2855)
+                // Directed rounding: lower bound rounds down, upper bound rounds up
                 *ol = next_down_f32(al / bu);
                 *ou = next_up_f32(au / bl);
             } else if au <= 0.0 {
@@ -284,7 +284,7 @@ mod tests {
         let a = make_bt(&[-2.0, 1.0], &[3.0, 5.0]);
         let b = make_bt(&[0.5, 1.0], &[2.0, 3.0]);
         let result = layer.propagate_ibp_binary(&a, &b).unwrap();
-        // With directed rounding (#2855), bounds are guaranteed to contain all true
+        // With directed rounding, bounds are guaranteed to contain all true
         // values — no tolerance needed.
         for k in 0..=20 {
             let t = k as f32 / 20.0;
@@ -323,7 +323,7 @@ mod tests {
     }
 
     /// Directed rounding regression: lower bound must be <= exact, upper must be >= exact.
-    /// Uses non-representable result (2/3) to confirm rounding direction. (#2855)
+    /// Uses non-representable result (2/3) to confirm rounding direction.
     #[test]
     fn test_ibp_directed_rounding() {
         let layer = DivLayer;

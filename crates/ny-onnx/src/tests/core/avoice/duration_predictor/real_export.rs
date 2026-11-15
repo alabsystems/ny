@@ -155,10 +155,7 @@ fn test_real_duration_predictor_crown_no_looser_than_ibp_3497() {
 /// tightening.
 ///
 /// This is the diagnostic gate for the "Verified on Kokoro duration predictor"
-/// acceptance criterion in #3497.
-///
-/// Sources:
-/// - designs/2026-03-11-avoice-phase1-onnx-execution.md (section 4)
+/// acceptance criterion.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
 #[cfg(feature = "external-avoice")]
@@ -206,10 +203,6 @@ fn test_real_duration_predictor_epsilon_sensitivity_3497() {
 /// relaxation, as demonstrated by 59.82% tightening on the synthetic BiLSTM
 /// surrogate. The real model should show comparable behavior when the input
 /// perturbation does not saturate the gates.
-///
-/// Sources:
-/// - designs/2026-03-11-avoice-phase1-onnx-execution.md (section 4)
-/// - reports/research/issue-3497-monotonicity-current.md (BiLSTM tightening)
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
 #[cfg(feature = "external-avoice")]

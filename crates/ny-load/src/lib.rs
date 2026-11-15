@@ -18,7 +18,7 @@
 //! Additional formats (PyTorch, CoreML, GGUF, NNet, ONNX protobuf) will
 //! migrate here from `ny-onnx` in subsequent iterations.
 
-// Link macOS Accelerate BLAS for ndarray::dot() acceleration (#4259).
+// Link macOS Accelerate BLAS for ndarray::dot() acceleration.
 #[cfg(target_os = "macos")]
 extern crate blas_src;
 

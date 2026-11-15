@@ -47,7 +47,7 @@ pub(super) fn initial_target_crown_bounds(
 /// patches mode even when the global `use_patches_mode` is false (matrix mode
 /// for BaB cuts). The collector doesn't use cutting planes, so the matrix-mode
 /// constraint doesn't apply to it. This avoids 30s+ per-node dense Conv2d
-/// backward passes during intermediate bound collection (#3813).
+/// backward passes during intermediate bound collection.
 pub(super) fn initial_target_crown_bounds_with_override(
     graph: &GraphNetwork,
     target_node: &str,
@@ -95,7 +95,7 @@ pub(super) fn initial_target_crown_bounds_with_override(
 /// Gate Patches mode with use_patches_mode: matrix mode forces Dense
 /// (abcrown.py:228-231). Exception: the CROWN-IBP collector may override this
 /// gate because it doesn't use cutting planes — only the BaB backward needs
-/// matrix mode for cuts (#3813).
+/// matrix mode for cuts.
 pub(super) fn target_allows_patches_start(
     graph: &GraphNetwork,
     target_node: &str,
@@ -216,7 +216,7 @@ pub(super) fn try_patches_target_step_core(
     alpha_state: Option<&GraphAlphaState>,
 ) -> Result<bool> {
     // Gate re-entry with use_patches_mode: matrix mode skips re-entry (abcrown.py:228-231).
-    // Exception: collector_patches_override allows re-entry in the CROWN-IBP collector (#3813).
+    // Exception: collector_patches_override allows re-entry in the CROWN-IBP collector.
     let patches_mode = graph.use_patches_mode || collector_patches_override;
     try_dense_spatial_patches_reentry_with_deadline_authority(
         node_cb,
@@ -233,7 +233,7 @@ pub(super) fn try_patches_target_step_core(
         return Ok(false);
     }
 
-    // Patches residual passthrough for Add/Sub (#4382)
+    // Patches residual passthrough for Add/Sub
     if crate::network::core::graph::backward_helpers::try_apply_patches_residual_passthrough_with_deadline_authority(
         graph,
         node,

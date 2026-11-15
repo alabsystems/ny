@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! GemmEngine-aware streaming CROWN tests (#3959).
+//! GemmEngine-aware streaming CROWN tests.
 //!
 //! Verifies that `propagate_crown_streaming_with_engine` threads the engine
 //! through the backward pass and produces bounds matching the no-engine
@@ -15,7 +15,7 @@ use ny_test_utils::CountingGemmEngine;
 /// Streaming CROWN with GemmEngine must produce bounds matching the no-engine
 /// baseline, verifying that the engine is threaded through the backward pass.
 ///
-/// Regression for #3959: streaming/tests had zero GemmEngine coverage.
+/// Regression: streaming/tests had zero GemmEngine coverage.
 #[ntest::timeout(10000)]
 #[test]
 fn streaming_crown_with_engine_matches_baseline_3959() {

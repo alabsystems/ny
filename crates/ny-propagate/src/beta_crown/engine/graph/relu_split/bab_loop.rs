@@ -28,6 +28,7 @@ use crate::beta_crown::engine::graph::domain_batch::{
 };
 use crate::beta_crown::engine::graph::shared::init::{
     compute_graph_bab_bootstrap, compute_graph_root_output_bounds,
+    graph_root_output_bounds_warmup_fallback, WarmupFallbackTier,
 };
 use crate::beta_crown::engine::graph::shared::setup::{
     build_graph_bab_setup, build_graph_cut_pool, build_root_alpha_state,
@@ -42,6 +43,9 @@ use super::super::super::BetaCrownVerifier;
 use super::super::objectives::objective_bounds;
 use super::domain_filter::PreFilterOutcome;
 use super::queue_budget::{enforce_graph_queue_budget, GraphBabQueueBudget};
+
+/// The ledger lane name of the single-objective ReLU-split driver.
+const RELU_SPLIT_LANE: &str = "graph_relu_split";
 
 /// Initial bounds for the BaB loop: (node_bounds, optional_alpha_state, root_lower, root_upper).
 type InitialBounds = (
@@ -97,9 +101,38 @@ impl BetaCrownVerifier {
     ///
     /// `deadline`: If `Some`, the engine derives its phase budgets from remaining
     /// wall-clock time (`deadline - now`) instead of `self.config.timeout`. This
-    /// accounts for time consumed by pre-BaB phases (PGD, IBP). Part of #4321.
+    /// accounts for time consumed by pre-BaB phases (PGD, IBP).
+    ///
+    /// #graph-bab-cover-ledger: the search runs under an armed completeness
+    /// ledger (split-literal paths below `input`); a `Verified` it returns is
+    /// kept only if the ledger's certified leaves cover the root (see
+    /// `graph::cover_ledger`).
     #[instrument(skip(self, graph, input, objective, engine, deadline), fields(threshold, input_shape = ?input.shape(), num_nodes = graph.nodes.len()))]
     pub(crate) fn verify_graph_relu_split_impl(
+        &self,
+        graph: &GraphNetwork,
+        input: &BoundedTensor,
+        objective: &[f32],
+        threshold: f32,
+        engine: Option<&dyn GemmEngine>,
+        deadline: Option<Instant>,
+    ) -> Result<BetaCrownResult> {
+        graph.ensure_proof_eligible()?;
+        let scope = self.graph_cover.arm_paths(
+            RELU_SPLIT_LANE,
+            graph,
+            input,
+            objective,
+            threshold,
+            self.config.verify_upper_bound,
+        );
+        let result = self.verify_graph_relu_split_unledgered(
+            graph, input, objective, threshold, engine, deadline,
+        )?;
+        Ok(self.settle_graph_cover(RELU_SPLIT_LANE, scope, result, deadline))
+    }
+
+    fn verify_graph_relu_split_unledgered(
         &self,
         graph: &GraphNetwork,
         input: &BoundedTensor,
@@ -115,16 +148,31 @@ impl BetaCrownVerifier {
         let graph = &graph;
         let now = Instant::now();
         let mut lifecycle = GraphBabLifecycle::new(now);
+        // #budget-abandonment FIX C: unconditional depth-cap summary on every
+        // exit path of this entry point, including the `?` returns below.
+        let _depth_drop = super::depth_drop::DepthDropScope::new(self.config.max_depth);
+        // DELIVERY PROOF, unconditional. Both #budget-abandonment keys print
+        // their RESOLVED values on every entry, so "the yaml never reached this
+        // cell" and "the key arrived and never fired" are distinguishable
+        // WITHOUT the fix having to fire. The `[warmup-fallback]` line below
+        // only prints when the warmup actually expires; on a row where it does
+        // not, this is the only evidence the key was delivered.
+        eprintln!(
+            "[budget-keys] warmup_fallback={} retry_passes={} max_depth={}",
+            u8::from(self.config.initial_bounds_warmup_fallback),
+            self.config.disjunctive_clause_retry_passes,
+            self.config.max_depth
+        );
 
         // Steps 1-2: Collect initial node bounds and compute initial output bounds
-        // Thread deadline so α-CROWN bails early if timeout budget exhausted (#2698)
+        // Thread deadline so α-CROWN bails early if timeout budget exhausted
         //
-        // Warmup cap (#2206 Packet C, #4095): initial bounds get at most
+        // Warmup cap: initial bounds get at most
         // `initial_bounds_fraction` of the BaB timeout. Without this cap,
         // alpha-CROWN warmup consumes the entire budget on graph models
         // (soundnessbench, cifar100, tinyimagenet) and the BaB loop never starts.
         //
-        // When a wall-clock deadline is provided (#4321), derive the effective
+        // When a wall-clock deadline is provided, derive the effective
         // timeout from remaining time instead of the configured timeout.
         let pgd_frac = self
             .config
@@ -144,7 +192,7 @@ impl BetaCrownVerifier {
         // every node before BaB can start, so it gets the full global deadline —
         // capping it at `initial_bounds_fraction` choked conv-heavy DAGs (yolo,
         // tinyimagenet) into "deadline exceeded before node 'Conv_0'" with most of
-        // the budget unused (#4321). The warmup cap is retained only for the
+        // the budget unused. The warmup cap is retained only for the
         // genuinely-iterative root α-CROWN output-bound optimization below.
         let bootstrap_deadline = Some(GraphBabLifecycle::fail_closed_deadline(now, bab_timeout));
         let iterative_deadline = {
@@ -158,16 +206,21 @@ impl BetaCrownVerifier {
                 bab_timeout.mul_f32(frac),
             ))
         };
-        let (initial_node_bounds, root_alpha_state, root_lower, root_upper) = match self
-            .compute_relu_split_initial_bounds(
-                graph,
-                input,
-                objective,
-                threshold,
-                engine,
-                bootstrap_deadline,
-                iterative_deadline,
-            ) {
+        // #phase-cost: the initial bounds are this lane's root bounding.
+        let root_phase_cost =
+            ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::RootBounds);
+        let initial_bounds = self.compute_relu_split_initial_bounds(
+            graph,
+            input,
+            objective,
+            threshold,
+            engine,
+            bootstrap_deadline,
+            iterative_deadline,
+            now,
+        );
+        drop(root_phase_cost);
+        let (initial_node_bounds, root_alpha_state, root_lower, root_upper) = match initial_bounds {
             Ok(bounds) => bounds,
             Err(error) if error.is_deadline_exceeded() => {
                 // The foundational bootstrap owns the full BaB deadline; if
@@ -199,7 +252,21 @@ impl BetaCrownVerifier {
             root_lower, root_upper, threshold, self.config.verify_upper_bound
         );
 
-        // Quick verification/violation check.
+        // Quick verification/violation check. A root close is the ledger's
+        // whole tree: the root's (empty) path with the root's bound.
+        if self
+            .config
+            .domain_is_verified(root_lower, root_upper, threshold)
+        {
+            self.cover_note_bound(
+                objective,
+                threshold,
+                &crate::beta_crown::branching::GraphSplitHistory::new(),
+                None,
+                root_lower,
+                root_upper,
+            );
+        }
         if let Some(early_result) =
             self.check_root_early_exit(root_lower, root_upper, threshold, &mut lifecycle)?
         {
@@ -208,19 +275,21 @@ impl BetaCrownVerifier {
 
         // Timeout guard: initial bounds computation (alpha-CROWN, CROWN-IBP)
         // may consume the entire budget for large models. Check before
-        // entering the BaB loop (#2698). Use bab_timeout (not full timeout)
-        // so post-BaB PGD reservation is respected (#4095).
+        // entering the BaB loop. Use bab_timeout (not full timeout)
+        // so post-BaB PGD reservation is respected.
         if lifecycle.start_time.elapsed() > bab_timeout {
             return Ok(lifecycle.timeout_result());
         }
 
+        // #phase-cost: from here to every return is the BaB loop.
+        let _bab_phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::BabLoop);
         let graph_setup = build_graph_bab_setup(graph, &initial_node_bounds);
 
         // Create root domain and initialize alpha state.
         // When root α-CROWN optimization was run, transfer the optimized alpha
-        // values to the root domain. This is the fix for #1851 Cause 1 — without
-        // this, the SPSA/Adam-optimized alphas are discarded and replaced by the
-        // `u > -l` heuristic, causing a massive bound quality gap.
+        // values to the root domain. Without this, the SPSA/Adam-optimized alphas
+        // are discarded and replaced by the `u > -l` heuristic, causing a massive
+        // bound quality gap.
         let mut root_domain = GraphBabDomain::root(
             initial_node_bounds,
             root_lower,
@@ -275,7 +344,7 @@ impl BetaCrownVerifier {
         )?;
         let relu_nodes = graph_setup.relu_nodes;
 
-        // Lambda optimization state (for cuts) — read from config (#2761)
+        // Lambda optimization state (for cuts) — read from config
         let mut lambda_opt_iter = 0usize;
         let lambda_opt_interval = self.config.lambda_opt_interval.max(1);
         let lambda_lr = self.config.lambda_lr;
@@ -354,6 +423,29 @@ impl BetaCrownVerifier {
 
             if batch.is_empty() {
                 break;
+            }
+
+            // #graph-bab-cover-ledger: the pre-filter closes every popped
+            // domain whose bound already clears the threshold; record those
+            // closes (the same predicate, on the same bounds) before it
+            // consumes the batch.
+            if self.graph_cover.is_armed() {
+                for domain in &batch {
+                    if self.config.domain_is_verified(
+                        domain.lower_bound,
+                        domain.upper_bound,
+                        threshold,
+                    ) {
+                        self.cover_note_bound(
+                            objective,
+                            threshold,
+                            &domain.history,
+                            Some(&domain.beta_state),
+                            domain.lower_bound,
+                            domain.upper_bound,
+                        );
+                    }
+                }
             }
 
             // Pre-filter batch: check verified/violation/depth, generate cuts
@@ -691,7 +783,7 @@ impl BetaCrownVerifier {
             )?;
             batch_index += 1;
 
-            // Adaptive batch sizing (#4303): double when queue supplied a full batch.
+            // Adaptive batch sizing: double when queue supplied a full batch.
             self.config.try_enlarge_batch_size(
                 &mut batch_size,
                 domains_to_process.len(),
@@ -724,6 +816,7 @@ impl BetaCrownVerifier {
         engine: Option<&dyn GemmEngine>,
         bootstrap_deadline: Option<Instant>,
         iterative_deadline: Option<Instant>,
+        phase_start: Instant,
     ) -> Result<InitialBounds> {
         // #margin-subset-seed: publish the spec-referenced OUTPUT indices (the
         // objective's nonzero coefficient positions) for the scope of this
@@ -739,9 +832,9 @@ impl BetaCrownVerifier {
             crate::output_margin_seed::MarginOutputSeedGuard::publish_from_objective(objective);
 
         // Step 1: Shared bootstrap — select alpha/IBP/CROWN-IBP mode and collect
-        // intermediate node bounds. Delegates to the shared graph-BaB init service
-        // (#1860 Packet C). Uses the global deadline: this foundational sweep is
-        // mandatory and must reach every node (#4321).
+        // intermediate node bounds. Delegates to the shared graph-BaB init service.
+        // Uses the global deadline: this foundational sweep is mandatory and must
+        // reach every node.
         let mut bootstrap =
             compute_graph_bab_bootstrap(graph, input, &self.config, engine, bootstrap_deadline)?;
 
@@ -771,16 +864,95 @@ impl BetaCrownVerifier {
         // from the objective vector, not the spec-matrix approach used by
         // multi-objective or GPU BaB.
         // Deadline check: fall back to IBP if deadline exceeded before expensive CROWN
-        // backward pass. α-CROWN threads deadline via alpha_config already. (#3328)
-        let initial_output = compute_graph_root_output_bounds(
+        // backward pass. α-CROWN threads deadline via alpha_config already.
+        //
+        // #budget-abandonment FIX A. An expiry HERE is the warmup cap, not the
+        // instance: the mandatory node sweep above already finished and its
+        // certified output-node enclosure is in `bootstrap.initial_node_bounds`.
+        // Before this key existed the `?` threw that object away together with
+        // the error, `initial_bounds_deadline_status` mapped it to `Unknown`,
+        // and BaB never started -- measured on 14_ieee_ml4acopf: bootstrap
+        // 0 -> 121.0 s against a 114 s cap with 449 s of 600 still on the clock.
+        let mut warmup_fallback: Option<(WarmupFallbackTier, f64, f64, f64)> = None;
+        let initial_output = match compute_graph_root_output_bounds(
             graph,
             input,
             &self.config,
             engine,
             &bootstrap,
             iterative_deadline,
-        )?;
+        ) {
+            Ok(output) => output,
+            Err(error) if error.is_deadline_exceeded() => {
+                let now = Instant::now();
+                let cap_s = iterative_deadline.map_or(0.0, |dl| {
+                    dl.saturating_duration_since(phase_start).as_secs_f64()
+                });
+                let elapsed_s = now.saturating_duration_since(phase_start).as_secs_f64();
+                let remaining_s = bootstrap_deadline
+                    .map_or(0.0, |dl| dl.saturating_duration_since(now).as_secs_f64());
+                let armed = self.config.initial_bounds_warmup_fallback;
+                // Only a PHASE-only expiry is recoverable. If the global BaB
+                // deadline is spent too, the instance really is over and the
+                // caller must still map it to `Timeout`.
+                let expiry = ny_core::phase_yield::classify_expiry(
+                    now,
+                    iterative_deadline,
+                    bootstrap_deadline,
+                );
+                let phase_only = matches!(expiry, ny_core::phase_yield::Expiry::PhaseOnly);
+                if !armed || !phase_only {
+                    // Unconditional, at default verbosity: an ABSENT line means
+                    // the binary has no lever, so a null from it is VOID.
+                    eprintln!(
+                        "[warmup-fallback] armed={} fired=0 tier=none cap_s={cap_s:.1} \
+elapsed_s={elapsed_s:.1} remaining_s={remaining_s:.1} root=[none,none] thr={threshold}",
+                        u8::from(armed)
+                    );
+                    return Err(error);
+                }
+                // A fresh slice of the REMAINING BaB budget, not the expired
+                // cap, and never past the global deadline.
+                let frac = self
+                    .config
+                    .phase_budget
+                    .initial_bounds_fraction
+                    .clamp(0.0, 1.0);
+                let retry_deadline = bootstrap_deadline.map(|global| {
+                    let slice = global.saturating_duration_since(now).mul_f32(frac);
+                    GraphBabLifecycle::fail_closed_deadline(now, slice).min(global)
+                });
+                let Some((output, tier)) = graph_root_output_bounds_warmup_fallback(
+                    graph,
+                    input,
+                    &self.config,
+                    engine,
+                    &bootstrap,
+                    retry_deadline,
+                ) else {
+                    // No enclosure available. Re-raise the ORIGINAL deadline
+                    // error so `initial_bounds_deadline_status` still maps this
+                    // row to a graceful `Unknown` rather than failing the run.
+                    eprintln!(
+                        "[warmup-fallback] armed=1 fired=0 tier=none cap_s={cap_s:.1} \
+elapsed_s={elapsed_s:.1} remaining_s={remaining_s:.1} root=[none,none] thr={threshold}"
+                    );
+                    return Err(error);
+                };
+                warmup_fallback = Some((tier, cap_s, elapsed_s, remaining_s));
+                output
+            }
+            Err(error) => return Err(error),
+        };
         let (root_lower, root_upper) = objective_bounds(&initial_output, objective)?;
+        if let Some((tier, cap_s, elapsed_s, remaining_s)) = warmup_fallback {
+            eprintln!(
+                "[warmup-fallback] armed=1 fired=1 tier={} cap_s={cap_s:.1} \
+elapsed_s={elapsed_s:.1} remaining_s={remaining_s:.1} root=[{root_lower},{root_upper}] \
+thr={threshold}",
+                tier.label()
+            );
+        }
 
         Ok((
             bootstrap.initial_node_bounds,

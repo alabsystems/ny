@@ -742,8 +742,6 @@ impl WgpuDevice {
     /// Create the small-K GEMM pipeline, sharing the bind group layout from
     /// the tiled GEMM pipeline. Both shaders use the same bindings (params, A,
     /// B, out), so pre-built bind groups work with either pipeline.
-    ///
-    /// Reference: #3599 (tall-skinny GEMM specialization)
     pub(super) fn create_gemm_f32_small_k_pipeline(
         device: &wgpu::Device,
         denorm_preserve: bool,
@@ -890,7 +888,7 @@ impl WgpuDevice {
     }
 
     /// Create ReLU IBP pipeline: in-place max(x, 0) on lower/upper buffers.
-    /// Part of #4081 (GPU-resident IBP forward).
+    /// Part of the GPU-resident IBP forward.
     pub(super) fn create_relu_ibp_pipeline(
         device: &wgpu::Device,
         denorm_preserve: bool,
@@ -960,7 +958,7 @@ impl WgpuDevice {
     }
 
     /// Create Add IBP pipeline: element-wise interval addition for residual
-    /// connections. Part of #4319 (graph-DAG resident IBP).
+    /// connections. Part of the graph-DAG resident IBP.
     pub(super) fn create_add_ibp_pipeline(
         device: &wgpu::Device,
         denorm_preserve: bool,
@@ -1067,7 +1065,7 @@ impl WgpuDevice {
     }
 
     /// Create AvgPool IBP pipeline: windowed/global average pooling for
-    /// interval bounds. Part of #4320 (AveragePool graph-DAG resident IBP).
+    /// interval bounds. Part of the AveragePool graph-DAG resident IBP.
     pub(super) fn create_avgpool_ibp_pipeline(
         device: &wgpu::Device,
         denorm_preserve: bool,

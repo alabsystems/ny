@@ -4,7 +4,7 @@
 
 //! Setup and warm-start seeding for constrained backward CROWN.
 //!
-//! Part of #4293 (directory-module split from former backward.rs monolith).
+//! Directory-module split from the former backward.rs monolith.
 
 use std::collections::HashMap;
 use std::mem::size_of;
@@ -172,7 +172,7 @@ impl BetaCrownVerifier {
         let input_dim = params.constrained_input.len();
 
         // Seed selection: spec_matrix (multi-row) > objective (single-row) > identity.
-        // spec_matrix support added for batched multi-objective CROWN (#4306).
+        // spec_matrix support added for batched multi-objective CROWN.
         //
         // `output_dim` (the SETUP field) is the number of backward output ROWS —
         // i.e. the seed's row count (num_specs / 1 / raw). This is the dimension of
@@ -242,6 +242,8 @@ impl BetaCrownVerifier {
         };
 
         let mut node_crown_bounds = crate::network::CrownMergeAccumulator::new();
+        // #la-warm-frontier: a frontier resume may seed the input channel.
+        let mut input_accumulated = false;
         // A verifier timeout is ordinary Dense constrained-CROWN authority, not
         // by itself permission to disable the historical lA warm start. Keep
         // the opaque cache reconstruction outside the explicitly bounded
@@ -252,8 +254,45 @@ impl BetaCrownVerifier {
                 .context
                 .engine
                 .is_some_and(|engine| engine.forbids_unbounded_cpu_fallback());
+        // #warm-dag: the cached block at the branch node is a bound on the
+        // objective only when the output reaches that node through a unary
+        // chain; otherwise skip-path blocks and the diverted binary-node bias
+        // were still pending when the parent captured it and the seed would
+        // drop them (`propagation/warm_start_guard.rs`). Such a child takes
+        // the cold pass from the output below.
         let warm_started = if self.config.enable_la_warm_start && !explicitly_bounded {
             match (params.seed_cache, params.context.history.last_branch_node()) {
+                (Some(cache), Some(branch_node))
+                    if !super::super::super::warm_start_guard::la_warm_start_seed_is_complete(
+                        params.graph,
+                        output_node,
+                        branch_node,
+                    ) =>
+                {
+                    debug!(
+                        branch_node,
+                        output_node,
+                        "Constrained CROWN lA warm-start refused: the output does not reach the \
+                         branch node through a unary chain (#warm-dag)"
+                    );
+                    // #la-warm-frontier (armed only): resume from the branch
+                    // node's block PLUS the whole frontier the capturing pass
+                    // held there; any missing / invalid frontier stays cold.
+                    match self.la_warm_frontier_armed() {
+                        Some(counters) => self.seed_constrained_frontier(
+                            params,
+                            cache,
+                            branch_node,
+                            output_dim,
+                            input_dim,
+                            bounds_cache,
+                            counters,
+                            &mut node_crown_bounds,
+                            &mut input_accumulated,
+                        )?,
+                        None => false,
+                    }
+                }
                 (Some(cache), Some(branch_node)) => {
                     super::super::ensure_constrained_propagation_deadline(
                         params.deadline,
@@ -272,6 +311,9 @@ impl BetaCrownVerifier {
                             branch_node,
                             "Constrained CROWN lA warm-start: seeded backward pass at last branch node"
                         );
+                        if let Some(counters) = self.la_warm_frontier_armed() {
+                            counters.record_single_seed();
+                        }
                         true
                     } else {
                         false
@@ -300,8 +342,74 @@ impl BetaCrownVerifier {
                 node_crown_bounds,
                 intermediate,
                 captured_linear_bounds: params.capture_linear_bounds.then(HashMap::new),
-                input_accumulated: false,
+                captured_frontiers: (params.capture_linear_bounds
+                    && self.la_warm_frontier_armed().is_some())
+                .then(HashMap::new),
+                input_accumulated,
             },
         })
+    }
+
+    /// #la-warm-frontier: seed the constrained pass at `branch_node` with the
+    /// cached block AND the frontier the capturing pass held there, after
+    /// validating it against this pass (rows, node widths, input width,
+    /// topological order). Returns `Ok(false)` (the caller seeds the output)
+    /// on any refusal; nothing is inserted unless everything validated.
+    #[allow(clippy::too_many_arguments)]
+    fn seed_constrained_frontier(
+        &self,
+        params: &BackwardParams<'_>,
+        cache: &crate::batched_domain::CachedLinearBounds,
+        branch_node: &str,
+        output_dim: usize,
+        input_dim: usize,
+        bounds_cache: &HashMap<String, Arc<BoundedTensor>>,
+        counters: &super::super::super::warm_frontier::WarmFrontierCounters,
+        node_crown_bounds: &mut crate::network::CrownMergeAccumulator,
+        input_accumulated: &mut bool,
+    ) -> Result<bool> {
+        use super::super::super::warm_frontier::{resolve_frontier_seed, WarmFrontierSite};
+        super::super::ensure_constrained_propagation_deadline(
+            params.deadline,
+            "before constrained lA frontier reconstruction",
+        )?;
+        let seed = match resolve_frontier_seed(
+            params.graph,
+            branch_node,
+            cache,
+            output_dim,
+            input_dim,
+            |key| bounds_cache.get(key).map(|bounds| bounds.len()),
+        ) {
+            Ok(seed) => seed,
+            Err(refusal) => {
+                counters.record_refusal(refusal);
+                return Ok(false);
+            }
+        };
+        super::super::ensure_constrained_propagation_deadline(
+            params.deadline,
+            "after constrained lA frontier reconstruction",
+        )?;
+        let members = seed.members.len();
+        node_crown_bounds.insert(
+            branch_node.to_string(),
+            params.patches_policy.seed_bounds(seed.branch_block),
+        );
+        for (key, block) in seed.members {
+            if key == crate::NETWORK_INPUT {
+                node_crown_bounds.insert(key, crate::bounds::patches::CrownBounds::Dense(block));
+                *input_accumulated = true;
+            } else {
+                node_crown_bounds.insert(key, params.patches_policy.seed_bounds(block));
+            }
+        }
+        counters.record_resumed(WarmFrontierSite::Constrained);
+        debug!(
+            branch_node,
+            members,
+            "Constrained CROWN lA warm-start: resumed from the full frontier (#la-warm-frontier)"
+        );
+        Ok(true)
     }
 }

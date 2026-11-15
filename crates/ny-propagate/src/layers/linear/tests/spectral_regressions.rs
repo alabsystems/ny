@@ -8,7 +8,7 @@ use ndarray::{array, Array2};
 #[ntest::timeout(10000)]
 #[test]
 fn test_spectral_norm_handles_dominant_direction_missing_from_seed() {
-    // Regression for #2389:
+    // Regression:
     // Old fixed-seed power iteration started with v[0] = 0. For a diagonal matrix where
     // the dominant singular direction is axis 0, the estimate could never reach sigma_max.
     //

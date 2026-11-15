@@ -165,6 +165,13 @@ impl GraphNetwork {
         // bottleneck (the relusplitter preset records 257.56 s CPU vs 12.97 s
         // GPU for exactly this GEMM).
         //
+        // PROVENANCE of that 257.56 s / 12.97 s pair (corrected 2026-09-10): it
+        // is the March-15-2026 WGPU measurement of a graph CROWN-IBP collection
+        // on a soundnessbench-shaped 6-Conv2d workload, recorded at
+        // `configs/vnncomp25/relusplitter.yaml:36-38`. It is NOT a cgan
+        // measurement and NOT a CUDA one; docs/HANDOFF_2026-09-02.md quoted it
+        // as "cgan's dominant GEMM, ~20x available", which it is not.
+        //
         // The consequence of admitting on OOM alone is stark: on
         // `CIFAR100_resnet_medium` NOT ONE of the 11 demanded targets qualifies
         // at the default 2 GiB budget (largest is target_dim 14400 → a 1.659 GB

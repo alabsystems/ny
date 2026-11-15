@@ -11,8 +11,6 @@
 //! - All shaders define a `fn main` entry point
 //! - WGSL source compiles on the host adapter
 //! - NaN safety constants are consistent across shaders
-//!
-//! Part of #1908.
 
 use super::ops::StridedGatherParams;
 use super::params::{
@@ -800,7 +798,7 @@ fn test_all_shaders_use_binding_0_as_uniform() {
 }
 
 // ============================================================================
-// Fallback bound constant consistency (#2258, #2390)
+// Fallback bound constant consistency
 // ============================================================================
 // All shaders that perform arithmetic on bounds define FALLBACK_BOUND.
 // These must match crate::FALLBACK_BOUND to ensure GPU and CPU paths produce
@@ -831,7 +829,6 @@ fn test_fallback_bound_consistent_across_shaders() {
 fn test_nan_safety_functions_present_in_ibp_shaders() {
     // IBP shaders that compute bounds via multiplication/accumulation must have
     // is_non_finite + nan_safe_lower + nan_safe_upper guards.
-    // Part of #2390: added SCALE_IBP_SHADER.
     for (name, source) in [
         ("LINEAR_IBP_SHADER", LINEAR_IBP_SHADER),
         ("MATMUL_IBP_SHADER", MATMUL_IBP_SHADER),
@@ -857,7 +854,6 @@ fn test_nan_safety_functions_present_in_ibp_shaders() {
 fn test_nan_safety_functions_present_in_softmax_shaders() {
     // SOFTMAX_REDUCE_SHADER: must guard max reduction (max(x, NaN) is
     // implementation-defined in WGSL) and exp output overflow.
-    // Part of #2390.
     assert!(
         SOFTMAX_REDUCE_SHADER.contains("fn is_non_finite("),
         "SOFTMAX_REDUCE_SHADER must define is_non_finite helper"
@@ -869,7 +865,6 @@ fn test_nan_safety_functions_present_in_softmax_shaders() {
 
     // SOFTMAX_APPLY_SHADER: must guard division output to catch NaN/Inf
     // and clamp probability bounds to [0, 1].
-    // Part of #2390.
     assert!(
         SOFTMAX_APPLY_SHADER.contains("fn is_non_finite("),
         "SOFTMAX_APPLY_SHADER must define is_non_finite helper"
@@ -879,9 +874,8 @@ fn test_nan_safety_functions_present_in_softmax_shaders() {
 #[test]
 fn test_nan_safety_functions_present_in_gemm_shader() {
     // GEMM shader uses nan_safe_clamp (NaN → preserved for downstream detection,
-    // Inf → clamp to ±FALLBACK_BOUND) via x != x check. #2708: NaN is no longer
+    // Inf → clamp to ±FALLBACK_BOUND) via x != x check. NaN is no longer
     // replaced with 0.0 (which was unsound — silently drops coefficient contribution).
-    // Part of #2366, #2708.
     assert!(
         GEMM_F32_SHADER.contains("fn nan_safe_clamp("),
         "GEMM_F32_SHADER must define nan_safe_clamp helper"

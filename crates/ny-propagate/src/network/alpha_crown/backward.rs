@@ -9,8 +9,6 @@
 //! identical layer-iteration logic. This module extracts that shared skeleton
 //! into `backward_pass_core`, parameterized by `BackwardPassConfig` to capture
 //! the small differences between call sites.
-//!
-//! Reference: designs/2026-02-14-alpha-crown-backward-dedup.md
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -51,7 +49,7 @@ pub(super) struct BackwardPassOutput {
     /// Gradients at each ReLU layer for lower alpha path (populated when `track_gradients` is true).
     pub gradients: Vec<Array1<f32>>,
     /// Gradients at each ReLU layer for upper alpha path (populated when `track_gradients` is true).
-    /// Used for independent optimization of alpha_upper (#3393).
+    /// Used for independent optimization of alpha_upper.
     pub gradients_upper: Vec<Array1<f32>>,
     /// A matrices at each ReLU (populated when `store_intermediates` is true).
     /// In reverse layer order (caller should reverse for forward order).
@@ -97,7 +95,7 @@ fn propagate_generic_layer_backward(
 ) -> Result<(LinearBounds, Option<BackwardPassResult>)> {
     check_backward_deadline(deadline, "before generic layer dispatch")?;
 
-    // Conv layers: use engine-aware path for GPU acceleration (#3598).
+    // Conv layers: use engine-aware path for GPU acceleration.
     let backward_result = match layer {
         Layer::Conv1d(c) => {
             let input_shape = pre_activation.shape();
@@ -150,9 +148,9 @@ fn propagate_generic_layer_backward(
     check_backward_deadline(deadline, "after generic layer dispatch")?;
     match backward_result {
         Ok(next) => Ok((next, None)),
-        // #3166: Catch UnsupportedConfiguration alongside UnsupportedOp.
-        // #2888: NumericalInstability also triggers fallback.
-        // #3813: ShapeMismatch from Dense Conv2d backward when graph restructuring
+        // Catch UnsupportedConfiguration alongside UnsupportedOp.
+        // NumericalInstability also triggers fallback.
+        // ShapeMismatch from Dense Conv2d backward when graph restructuring
         // (e.g., RSPLITTER) changes intermediate dimensions. IBP fallback is sound.
         Err(
             e @ NyError::UnsupportedOp(_)
@@ -168,7 +166,7 @@ fn propagate_generic_layer_backward(
             );
             Ok((linear_bounds.clone(), Some(BackwardPassResult::Fallback)))
         }
-        // #3107: LayerError may wrap critical errors — inspect source before fallback.
+        // LayerError may wrap critical errors — inspect source before fallback.
         Err(NyError::LayerError { source, .. })
             if matches!(
                 source.as_ref(),
@@ -236,7 +234,7 @@ pub(super) fn backward_pass_core(
         }
     }
 
-    // Initialize gradient storage if tracking (both lower and upper alpha paths, #3393)
+    // Initialize gradient storage if tracking (both lower and upper alpha paths)
     let mut gradients: Vec<Array1<f32>> = if config.track_gradients {
         config
             .relu_layer_indices
@@ -275,6 +273,9 @@ pub(super) fn backward_pass_core(
         };
 
         match layer {
+            Layer::PointLinear(_) => {
+                return Err(crate::network::proof_eligibility::diagnostic_only());
+            }
             Layer::Linear(l) => {
                 let next = l.propagate_linear_with_engine_and_deadline(
                     &linear_bounds,
@@ -331,7 +332,7 @@ pub(super) fn backward_pass_core(
                         r.propagate_linear_with_bounds(&linear_bounds, pre_activation)?;
                 }
             }
-            // === All other layers: exhaustive trait dispatch (#3424) ===
+            // === All other layers: exhaustive trait dispatch ===
             // Every variant listed — no catch-all. Compiler catches new variants.
             Layer::Conv1d(_)
             | Layer::Conv2d(_)
@@ -475,7 +476,7 @@ pub(super) fn backward_pass_core(
     }
 
     check_backward_deadline(config.deadline, "before input augmentation")?;
-    // Input-level INVPROP augmentation (#2928).
+    // Input-level INVPROP augmentation.
     // After the backward loop completes, apply constraint augmentation at the
     // network input level if configured. Mirrors graph path:
     // propagate_sequential.rs lines 478-504.

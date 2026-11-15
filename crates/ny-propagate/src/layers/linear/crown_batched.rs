@@ -357,7 +357,7 @@ pub(crate) fn propagate_linear_batched_maybe_engine_with_pollable(
     let mut new_upper_err = Array2::from_shape_vec((total_rows, in_dim), upper_err_flat)
         .map_err(|_| NyError::InvalidSpec("Cannot reshape upper_err".to_string()))?;
 
-    // Track which output rows have non-finite coefficients (#2681).
+    // Track which output rows have non-finite coefficients.
     let mut lower_nonfinite_rows = vec![false; total_rows];
     let mut upper_nonfinite_rows = vec![false; total_rows];
     // #pollable-faer: the scan and bias folds below are the remaining
@@ -398,7 +398,7 @@ pub(crate) fn propagate_linear_batched_maybe_engine_with_pollable(
         }
     }
 
-    // #2681/#1932: For rows with non-finite or near-overflow A-matrix coefficients,
+    // For rows with non-finite or near-overflow A-matrix coefficients,
     // zero the entire row. Bias override (to ±inf) happens after bias computation.
     let lower_affected = lower_nonfinite_rows.iter().filter(|&&r| r).count();
     let upper_affected = upper_nonfinite_rows.iter().filter(|&&r| r).count();
@@ -428,7 +428,7 @@ pub(crate) fn propagate_linear_batched_maybe_engine_with_pollable(
     let new_upper_err = ArrayD::from_shape_vec(IxDyn(&out_a_shape), new_upper_err_vec)
         .map_err(|_| NyError::InvalidSpec("Cannot reshape upper_err".to_string()))?;
 
-    // Compute bias contribution: A @ bias + old_b (#2427: shared helper).
+    // Compute bias contribution: A @ bias + old_b (shared helper).
     let (new_lower_b, new_upper_b) = if let Some(ref bias) = layer.bias {
         let lower_b_3d = bounds
             .lower_b
@@ -517,7 +517,7 @@ pub(crate) fn propagate_linear_batched_maybe_engine_with_pollable(
         (bounds.lower_b.clone(), bounds.upper_b.clone())
     };
 
-    // #2681: Override bias to ±inf for rows with non-finite A-matrix coefficients.
+    // Override bias to ±inf for rows with non-finite A-matrix coefficients.
     // The A-coefficients were already zeroed above; now set bias so concretized
     // bounds become [-inf, +inf] for those rows (sound, maximally loose).
     let mut new_lower_b = new_lower_b;
@@ -545,7 +545,7 @@ pub(crate) fn propagate_linear_batched_maybe_engine_with_pollable(
         *last_dim = in_dim;
     }
 
-    // CROWN backward NaN firewall (#2812): conservative fallback instead of aborting
+    // CROWN backward NaN firewall: conservative fallback instead of aborting
     // when matmul produces NaN/Inf. Has own non-finite row handling but this catches
     // any remaining contamination from upstream biases or missed rows.
     let mut result = BatchedLinearBounds::new_or_conservative(
@@ -585,7 +585,7 @@ fn compute_batched_linear_coefficients_cpu(
 ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
     use crate::faer_parallelism::mat_mul;
     use crate::layers::linear::crown_single::{
-        aw_f64_with_abssum, gamma_n_f64, incoming_error_product,
+        aw_f64_with_abssum_for_layer, gamma_n_f64, incoming_error_product,
     };
 
     let total_rows = total_batch * out_dim;
@@ -594,9 +594,6 @@ fn compute_batched_linear_coefficients_cpu(
     let mut lower_err_flat = vec![0.0_f32; total_rows * in_dim];
     let mut upper_err_flat = vec![0.0_f32; total_rows * in_dim];
     let gamma = gamma_n_f64(mid_dim);
-    // |W| once (reused per batch): the incoming error propagates as
-    // `P[i,j] = Σ_k err_in[i,k]·|W[k,j]|`, mirroring the scalar `propagate_linear`.
-    let w_abs = Mat::<f32>::from_fn(mid_dim, in_dim, |k, j| layer.weight_faer()[(k, j)].abs());
 
     // TEST-ONLY (NY_AW_LEGACY_F32): reproduce the OLD optimistic batched path —
     // round-to-nearest f32 faer GEMM for `A·W` with NO certified error — so the
@@ -627,15 +624,30 @@ fn compute_batched_linear_coefficients_cpu(
             continue;
         }
 
-        let (lower_a64, lower_s) = aw_f64_with_abssum(&a_lower_faer, layer.weight_faer());
-        let (upper_a64, upper_s) = aw_f64_with_abssum(&a_upper_faer, layer.weight_faer());
+        // #linear-widened-weight-cache: same operands and same faer arm; the
+        // layer's immutable weight is widened to f64 once instead of on every
+        // batch of every call, so the published bits are unchanged.
+        let (lower_a64, lower_s) = aw_f64_with_abssum_for_layer(layer, &a_lower_faer);
+        let (upper_a64, upper_s) = aw_f64_with_abssum_for_layer(layer, &a_upper_faer);
 
         // Propagated incoming error P[i,j] = Σ_k err_in[i,k]·|W[k,j]| (per batch).
+        //
+        // #linear-abs-weight-cache: `|W|` (`mid_dim × in_dim`, and `mid_dim ==
+        // layer.out_features()` is enforced at the batched entry) comes from
+        // the layer's cache instead of being rebuilt once per CALL, and is read
+        // only when an incoming error plane exists. `abs` on the same immutable
+        // `weight_faer` — identical bits, identical shape.
         let prop_lower = match in_lower_err_3d.as_ref() {
             Some(error) => {
                 let block =
                     Array2::from_shape_fn((out_dim, mid_dim), |(i, k)| error[[batch_idx, i, k]]);
-                Some(incoming_error_product(&block, 0, mid_dim, &w_abs, None)?)
+                Some(incoming_error_product(
+                    &block,
+                    0,
+                    mid_dim,
+                    layer.weight_abs_faer(),
+                    None,
+                )?)
             }
             None => None,
         };
@@ -643,7 +655,13 @@ fn compute_batched_linear_coefficients_cpu(
             Some(error) => {
                 let block =
                     Array2::from_shape_fn((out_dim, mid_dim), |(i, k)| error[[batch_idx, i, k]]);
-                Some(incoming_error_product(&block, 0, mid_dim, &w_abs, None)?)
+                Some(incoming_error_product(
+                    &block,
+                    0,
+                    mid_dim,
+                    layer.weight_abs_faer(),
+                    None,
+                )?)
             }
             None => None,
         };
@@ -787,7 +805,9 @@ fn compute_batched_linear_coefficients_pollable_faer(
     engine: &dyn GemmEngine,
     block_macs: usize,
 ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
-    use crate::layers::linear::crown_single::{aw_f64_with_abssum_chunked_poll, gamma_n_f64};
+    use crate::layers::linear::crown_single::{
+        aw_f64_with_abssum_chunked_poll_for_layer, gamma_n_f64,
+    };
 
     bounded_poll(engine)?;
     let total_rows = total_batch * out_dim;
@@ -804,8 +824,6 @@ fn compute_batched_linear_coefficients_pollable_faer(
     bounded_poll(engine)?;
 
     let gamma = gamma_n_f64(mid_dim);
-    // |W| once (reused per batch), exactly as the unbounded host path.
-    let w_abs = Mat::<f32>::from_fn(mid_dim, in_dim, |k, j| layer.weight_faer()[(k, j)].abs());
     bounded_poll(engine)?;
 
     for batch_idx in 0..total_batch {
@@ -817,23 +835,18 @@ fn compute_batched_linear_coefficients_pollable_faer(
         let a_upper_faer = Mat::<f32>::from_fn(out_dim, mid_dim, |i, j| a_upper[[i, j]]);
 
         let mut poll = || bounded_poll(engine);
-        let Some((lower_a64, lower_s, lower_blocks)) = aw_f64_with_abssum_chunked_poll(
-            &a_lower_faer,
-            layer.weight_faer(),
-            block_macs,
-            &mut poll,
-        )?
+        // #linear-widened-weight-cache: identical chunking, identical polls,
+        // identical operands — the per-call `W` / `|W|` widening is taken from
+        // the layer instead of rebuilt.
+        let Some((lower_a64, lower_s, lower_blocks)) =
+            aw_f64_with_abssum_chunked_poll_for_layer(layer, &a_lower_faer, block_macs, &mut poll)?
         else {
             return Err(NyError::UnsupportedOp(
                 "bounded Linear batched CROWN: shape exceeds the pollable-faer block budget".into(),
             ));
         };
-        let Some((upper_a64, upper_s, upper_blocks)) = aw_f64_with_abssum_chunked_poll(
-            &a_upper_faer,
-            layer.weight_faer(),
-            block_macs,
-            &mut poll,
-        )?
+        let Some((upper_a64, upper_s, upper_blocks)) =
+            aw_f64_with_abssum_chunked_poll_for_layer(layer, &a_upper_faer, block_macs, &mut poll)?
         else {
             return Err(NyError::UnsupportedOp(
                 "bounded Linear batched CROWN: shape exceeds the pollable-faer block budget".into(),
@@ -842,12 +855,24 @@ fn compute_batched_linear_coefficients_pollable_faer(
         POLLABLE_FAER_BLOCKS.fetch_add((lower_blocks + upper_blocks) as u64, Ordering::Relaxed);
 
         // Propagated incoming error P[i,j] = Σ_k err_in[i,k]·|W[k,j]| (per batch).
+        //
+        // #linear-abs-weight-cache: `|W|` from the layer's cache, exactly as
+        // the unbounded host path above. POLL CADENCE IS UNCHANGED — the count
+        // and order of `bounded_poll` calls is the same, and the one-time fill
+        // this may perform on a layer's first error-carrying call is the SAME
+        // `mid_dim × in_dim` fill that used to run unconditionally in this
+        // function on every call, moved into a neighbouring gap rather than
+        // added to one.
         let prop_lower = match in_lower_err_3d.as_ref() {
             Some(error) => {
                 let block =
                     Array2::from_shape_fn((out_dim, mid_dim), |(i, k)| error[[batch_idx, i, k]]);
                 Some(incoming_error_product_row_blocked(
-                    &block, &w_abs, in_dim, block_macs, engine,
+                    &block,
+                    layer.weight_abs_faer(),
+                    in_dim,
+                    block_macs,
+                    engine,
                 )?)
             }
             None => None,
@@ -857,7 +882,11 @@ fn compute_batched_linear_coefficients_pollable_faer(
                 let block =
                     Array2::from_shape_fn((out_dim, mid_dim), |(i, k)| error[[batch_idx, i, k]]);
                 Some(incoming_error_product_row_blocked(
-                    &block, &w_abs, in_dim, block_macs, engine,
+                    &block,
+                    layer.weight_abs_faer(),
+                    in_dim,
+                    block_macs,
+                    engine,
                 )?)
             }
             None => None,
@@ -921,7 +950,7 @@ fn compute_batched_linear_coefficients_engine(
     engine: &dyn GemmEngine,
 ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
     use crate::layers::linear::crown_single::{
-        aw_f64_with_abssum, gamma_n_f32, incoming_error_product,
+        aw_f64_with_abssum_for_layer, gamma_n_f32, incoming_error_product,
     };
 
     let weight_slice = layer
@@ -937,9 +966,6 @@ fn compute_batched_linear_coefficients_engine(
 
     // Certified error (CPU f64), independent of the GPU point coefficient.
     let gamma = gamma_n_f32(mid_dim);
-    let weight_faer = layer.weight_faer();
-    // |W| for the incoming-error propagation P[i,j] = Σ_k err_in[i,k]·|W[k,j]|.
-    let w_abs = Mat::<f32>::from_fn(mid_dim, in_dim, |k, j| weight_faer[(k, j)].abs());
     let mut lower_err = vec![0.0f32; total_rows * in_dim];
     let mut upper_err = vec![0.0f32; total_rows * in_dim];
     // total_rows = total_batch * out_dim; lower_a_3d is [total_batch, out_dim, mid_dim].
@@ -950,14 +976,28 @@ fn compute_batched_linear_coefficients_engine(
         let a_upper = upper_a_3d.slice(s![batch_idx, .., ..]);
         let a_lower_faer = Mat::<f32>::from_fn(out_dim, mid_dim, |i, j| a_lower[[i, j]]);
         let a_upper_faer = Mat::<f32>::from_fn(out_dim, mid_dim, |i, j| a_upper[[i, j]]);
-        let (lower_reference, lower_s) = aw_f64_with_abssum(&a_lower_faer, weight_faer);
-        let (upper_reference, upper_s) = aw_f64_with_abssum(&a_upper_faer, weight_faer);
+        // #linear-widened-weight-cache: this reference product is the same faer
+        // arm over the same operands (`layer.weight_faer()`), with the layer's
+        // cached f64 widening in place of a per-batch rebuild.
+        let (lower_reference, lower_s) = aw_f64_with_abssum_for_layer(layer, &a_lower_faer);
+        let (upper_reference, upper_s) = aw_f64_with_abssum_for_layer(layer, &a_upper_faer);
         // Propagated incoming error per batch.
+        //
+        // #linear-abs-weight-cache: `|W|` from the layer's cache rather than a
+        // per-call rebuild, read only when an incoming error plane exists. The
+        // engine `gemm_f32` above still takes `layer.weight` as a slice and is
+        // untouched.
         let prop_lower = match in_lower_err_3d.as_ref() {
             Some(error) => {
                 let block =
                     Array2::from_shape_fn((out_dim, mid_dim), |(i, k)| error[[batch_idx, i, k]]);
-                Some(incoming_error_product(&block, 0, mid_dim, &w_abs, None)?)
+                Some(incoming_error_product(
+                    &block,
+                    0,
+                    mid_dim,
+                    layer.weight_abs_faer(),
+                    None,
+                )?)
             }
             None => None,
         };
@@ -965,7 +1005,13 @@ fn compute_batched_linear_coefficients_engine(
             Some(error) => {
                 let block =
                     Array2::from_shape_fn((out_dim, mid_dim), |(i, k)| error[[batch_idx, i, k]]);
-                Some(incoming_error_product(&block, 0, mid_dim, &w_abs, None)?)
+                Some(incoming_error_product(
+                    &block,
+                    0,
+                    mid_dim,
+                    layer.weight_abs_faer(),
+                    None,
+                )?)
             }
             None => None,
         };
@@ -995,4 +1041,78 @@ fn compute_batched_linear_coefficients_engine(
     }
 
     Ok((result_lower, result_upper, lower_err, upper_err))
+}
+
+#[cfg(test)]
+mod abs_weight_cache_engagement_tests {
+    use super::{propagate_linear_batched, BatchedLinearBounds, LinearLayer};
+    use ndarray::{arr2, Array1, ArrayD, IxDyn};
+
+    /// `out_features = 3` (the batched `mid_dim`), `in_features = 2`.
+    fn fixture_layer() -> LinearLayer {
+        LinearLayer::new(
+            arr2(&[[1.0_f32, -2.0], [-3.0, 4.0], [0.5, -0.25]]),
+            Some(Array1::from_vec(vec![0.125_f32, -0.5, 2.0])),
+        )
+        .expect("batched abs-cache fixture layer builds")
+    }
+
+    /// Coefficients shaped `[batch = 2, out_dim = 2, mid_dim = 3]`.
+    fn fixture_bounds() -> BatchedLinearBounds {
+        let a = ArrayD::from_shape_vec(
+            IxDyn(&[2, 2, 3]),
+            vec![
+                1.0_f32, -1.0, 2.0, 0.5, 2.0, -1.5, -0.25, 1.25, 0.75, 3.0, -0.5, 1.0,
+            ],
+        )
+        .expect("batched coefficient fixture");
+        let b = ArrayD::from_shape_vec(IxDyn(&[2, 2]), vec![0.25_f32, -0.75, 0.5, -0.25])
+            .expect("batched bias fixture");
+        BatchedLinearBounds::new(a.clone(), b.clone(), a, b, vec![2, 3], vec![2, 2])
+            .expect("batched bounds fixture builds")
+    }
+
+    /// #linear-abs-weight-cache ENGAGEMENT for the batched CPU arm
+    /// (`compute_batched_linear_coefficients_cpu`), in BOTH directions: the
+    /// layer's `|W|` cell must fill when the incoming bounds carry a certified
+    /// error plane, and must stay COLD when they do not — the second half is
+    /// the `mid_dim × in_dim` allocation this arm used to build and drop unused
+    /// on every error-free call.
+    ///
+    /// FAILS CLOSED. If a future edit reinstates a local `Mat::from_fn` here,
+    /// the `is_some()` assertion fails rather than the change passing silently.
+    #[test]
+    fn batched_cpu_backward_fills_the_abs_weight_cache_only_with_an_error_plane() {
+        let without_error_plane = fixture_layer();
+        let plain = fixture_bounds();
+        assert!(
+            without_error_plane.weight_abs_faer.get().is_none(),
+            "fixture layer must start with a COLD |W| cell"
+        );
+        let _plain_result = propagate_linear_batched(&without_error_plane, &plain)
+            .expect("batched backward without error plane");
+        assert!(
+            without_error_plane.weight_abs_faer.get().is_none(),
+            "batched bounds carrying NO certified-error plane must not build |W| at all"
+        );
+
+        let with_error_plane = fixture_layer();
+        let mut carrying = fixture_bounds();
+        carrying.set_coeff_err(
+            ArrayD::from_elem(IxDyn(&[2, 2, 3]), 0.125_f32),
+            ArrayD::from_elem(IxDyn(&[2, 2, 3]), 0.25_f32),
+        );
+        assert!(
+            carrying.lower_a_err.is_some() && carrying.upper_a_err.is_some(),
+            "set_coeff_err must have attached both planes, else the assertion below \
+             would pass for the wrong reason"
+        );
+        assert!(with_error_plane.weight_abs_faer.get().is_none());
+        let _carried_result = propagate_linear_batched(&with_error_plane, &carrying)
+            .expect("batched backward with error plane");
+        assert!(
+            with_error_plane.weight_abs_faer.get().is_some(),
+            "the batched CPU arm must compose Σ err_in·|W| through the layer's cache"
+        );
+    }
 }

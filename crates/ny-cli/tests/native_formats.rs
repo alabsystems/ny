@@ -16,7 +16,7 @@
 //!
 //! To run external model tests:
 //! ```bash
-//! cargo test -p ny-cli --features external-models
+//! targo --unverified test -p ny-cli --features external-models
 //! ```
 
 #[cfg(feature = "external-models")]
@@ -368,7 +368,7 @@ fn test_layer_by_layer_requires_native_model() {
         "Expected failure for --layer-by-layer on ONNX without --native"
     );
 
-    // #395: stderr must be empty when --json emits errors
+    // Stderr must be empty when --json emits errors
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.is_empty(),
@@ -419,7 +419,7 @@ fn test_block_wise_requires_native_model() {
         "Expected failure for --block-wise on ONNX without --native"
     );
 
-    // #395: stderr must be empty when --json emits errors
+    // Stderr must be empty when --json emits errors
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.is_empty(),
@@ -595,7 +595,7 @@ fn test_soundness_provenance_crown_method() {
 }
 
 // =============================================================================
-// Require-Sound Gate Tests (#394)
+// Require-Sound Gate Tests
 // =============================================================================
 
 /// Test that --require-sound succeeds when verification is sound
@@ -671,7 +671,7 @@ fn test_require_sound_forces_sound_relaxations_for_softmax() {
     let v: serde_json::Value =
         serde_json::from_str(&stdout).expect("Expected valid JSON output on stdout");
 
-    // #395: Verify stderr is empty when --json mode emits output
+    // Verify stderr is empty when --json mode emits output
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.is_empty(),
@@ -744,7 +744,7 @@ fn test_require_sound_incompatible_with_layer_by_layer() {
     let v: serde_json::Value =
         serde_json::from_str(&stdout).expect("Expected valid JSON error output on stdout");
 
-    // #395: Verify stderr is empty when --json mode emits errors
+    // Verify stderr is empty when --json mode emits errors
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.is_empty(),
@@ -806,7 +806,7 @@ fn test_require_sound_incompatible_with_block_wise() {
     let v: serde_json::Value =
         serde_json::from_str(&stdout).expect("Expected valid JSON error output on stdout");
 
-    // #395: Verify stderr is empty when --json mode emits errors
+    // Verify stderr is empty when --json mode emits errors
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.is_empty(),

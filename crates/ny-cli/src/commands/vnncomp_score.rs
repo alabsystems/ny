@@ -96,9 +96,42 @@ impl ScoreYear {
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum Witnesses {
+    /// Published organiser truth first; failing that, a SAT witness must be
+    /// CORROBORATED before it may convict. This is the default.
+    ///
+    /// Three rules, in order, per instance:
+    ///
+    /// 1. If the released corpus ships the organisers' own adjudication for the
+    ///    instance (`SCORING/results.txt`, a `True Result:` line written after
+    ///    they replayed and validated the counterexample files), that verdict is
+    ///    authoritative: matching it is +10, contradicting it is -150.
+    /// 2. Otherwise a SAT claimed by TWO OR MORE participants is credible and
+    ///    convicts a contradicting UNSAT at -150, exactly as `AssumedValid` does.
+    /// 3. Otherwise, if exactly one participant claims SAT and at least one other
+    ///    claims UNSAT, the instance is DISPUTED. Nobody scores it — not the lone
+    ///    witness, not the tools it contradicts — and the conflict is listed in
+    ///    the report.
+    ///
+    /// Rule 3 exists because under `AssumedValid` a single unreproduced witness
+    /// silently sets a whole category's denominator. Measured on the released
+    /// 2026 corpus: `agate` alone claims SAT on 8 `cgan2026` rows and 5 `nn4sys`
+    /// rows, which is enough to make `agate` the modeled cgan2026 leader at 180
+    /// while alpha-beta-CROWN, pyrat, sobolbox and vibecheck are convicted for
+    /// holding the same rows UNSAT. The organisers scored those 13 witnesses
+    /// `malformed_ce` and charged `agate` -150 on each.
+    ///
+    /// Rule 3 is deliberately symmetric and deliberately NOT a way to recover
+    /// points: it withholds the +10 from the lone SAT and from the UNSAT majority
+    /// alike, so no participant — NY included — can profit from a dispute.
+    Adjudicated,
     /// Every SAT row is assumed to carry a strictly valid counterexample, so an
-    /// UNSAT contradicted by one takes the real -150. Conservative: it is the
-    /// model that punishes NY for a wrong answer, and the default.
+    /// UNSAT contradicted by one takes the real -150. Retained because every
+    /// board figure recorded before 2026-08-30 was computed with it, and because
+    /// it is the pessimistic bound on NY's own exposure.
+    ///
+    /// It is NOT conservative in the field-wide sense: it also lets one
+    /// uncorroborated, organiser-rejected witness convict every tool that
+    /// disagrees with it, which moves the winner-relative denominator.
     AssumedValid,
     /// No counterexample is ever opened, so nothing convicts a contradicting
     /// UNSAT and every claimed verdict earns +10.
@@ -108,15 +141,13 @@ pub(crate) enum Witnesses {
     /// `SCORING-ZERO-TOL/plots_scored/latex/total.tex`: this model returns
     /// alpha-beta-CROWN 1566.9 and PyRAT 1228.4, matching exactly.
     ///
-    /// CORRECTION (2026-08-02): an earlier version of this comment justified the
-    /// match by claiming the published run "scored with `SKIP_CE_FILES = True`",
-    /// i.e. never validated counterexamples. That inference is FALSE and is
-    /// retracted. `settings.py:63` sets `ALWAYS_CHECK_COUNTEREXAMPLES = True`;
-    /// `SKIP_CE_FILES` only relaxes a file-exists `assert` at
-    /// `process_results.py:330` and does not disable checking. The published run
-    /// checked 5,744 counterexamples across 1,197 instances and applied 62 live
-    /// -150 penalties (`results.txt:111602`). The numerical agreement above is
-    /// real; only the old explanation for it was wrong.
+    /// The published run DID validate counterexamples (checked 2026-08-02):
+    /// `settings.py:63` sets `ALWAYS_CHECK_COUNTEREXAMPLES = True`, and
+    /// `SKIP_CE_FILES = True` only relaxes a file-exists `assert` at
+    /// `process_results.py:330`. It checked 5,744 counterexamples across 1,197
+    /// instances and applied 62 live -150 penalties (`results.txt:111602`). The
+    /// numerical agreement above is real; it does not come from skipped
+    /// counterexample checks.
     ///
     /// Use it to answer "where would NY have placed", and ONLY that. It rewards
     /// unsound tools: on cifar100 it makes NNV the winner at 190/200 over
@@ -128,6 +159,10 @@ pub(crate) enum Witnesses {
 impl Witnesses {
     fn label(self) -> &'static str {
         match self {
+            Self::Adjudicated => {
+                "published organiser truth first, then corroborated SAT witnesses; \
+                 uncorroborated contested SAT is DISPUTED and scores nobody"
+            }
             Self::AssumedValid => "SAT witnesses assumed valid (contradicted UNSAT scores -150)",
             Self::Unvalidated => {
                 "counterexamples not opened by this model (reproduces the published totals)"
@@ -171,7 +206,7 @@ fn known_benchmark(year: ScoreYear, benchmark: &str) -> bool {
 }
 
 /// A decided verdict, or the absence of one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Verdict {
     Sat,
@@ -305,9 +340,39 @@ impl InstanceKey {
             self.vnnlib.clone(),
         )
     }
+
+    /// Identity as the organisers' scoring log writes it: `<model-stem>` and
+    /// `<property-stem>` joined by `-`, with directories and extensions dropped.
+    ///
+    /// `None` for relational instances, whose model field holds several paths
+    /// encoded as JSON and therefore has no single stem. The log does not name
+    /// them this way either, so no truth is claimed for them rather than a
+    /// wrong one being manufactured.
+    fn ground_truth_key(&self) -> Option<GroundTruthKey> {
+        if self.onnx.starts_with('[') {
+            return None;
+        }
+        let model = identity_stem(&self.onnx);
+        let property = identity_stem(&self.vnnlib);
+        if model.is_empty() || property.is_empty() {
+            return None;
+        }
+        Some((self.benchmark.clone(), format!("{model}-{property}")))
+    }
 }
 
 type SemanticKey = (String, String, String);
+
+/// `(benchmark, "<model-stem>-<property-stem>")`, the organisers' row identity.
+type GroundTruthKey = (String, String);
+
+/// Basename with the `.onnx`, `.onnx.gz` or `.vnnlib` suffix removed.
+fn identity_stem(path: &str) -> &str {
+    let base = normalized_basename(path.trim());
+    let base = base.strip_suffix(".gz").unwrap_or(base);
+    let base = base.strip_suffix(".onnx").unwrap_or(base);
+    base.strip_suffix(".vnnlib").unwrap_or(base)
+}
 
 fn normalized_basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
@@ -843,6 +908,149 @@ fn load_official_field(root: &Path) -> Result<OfficialField> {
     Ok(field)
 }
 
+/// Where a released results corpus keeps the organisers' own scoring log.
+const GROUND_TRUTH_RELATIVE_PATH: &str = "SCORING/results.txt";
+
+/// The organisers' published per-instance adjudication.
+///
+/// A released VNN-COMP results corpus ships the scoring run's own log at
+/// `SCORING/results.txt`. For every scored instance it records a `True Result:`
+/// line — the verdict the ORGANISERS settled on after replaying and validating
+/// every submitted counterexample file. That is strictly better evidence than
+/// anything this tool can infer from raw verdict columns, which carry no witness
+/// validation at all, so where it exists it is authoritative and nothing else is
+/// consulted for that instance.
+///
+/// The log identifies a row by `<model-stem>-<property-stem>` with directories
+/// dropped, and that is ambiguous in exactly one released 2026 category:
+/// `safenlp_2024` reuses property filenames across `medical/` and `ruarobot/`,
+/// putting two published rows on each of 26 ids, **16 of which carry two
+/// DIFFERENT `True Result:` verdicts**. Those are DROPPED and reported, never resolved
+/// by taking whichever row was read last — the same basename-join hazard that
+/// once manufactured 123 phantom contradictions in this repository.
+#[derive(Debug, Default)]
+pub(crate) struct GroundTruth {
+    verdicts: BTreeMap<GroundTruthKey, Verdict>,
+    /// Keys seen with two DIFFERENT verdicts, hence unusable for scoring.
+    ambiguous: BTreeSet<String>,
+    /// Human-readable provenance, printed with the score.
+    source: String,
+}
+
+impl GroundTruth {
+    fn get(&self, key: &InstanceKey) -> Option<Verdict> {
+        self.verdicts.get(&key.ground_truth_key()?).copied()
+    }
+
+    /// Not named `len`: clippy's `len_without_is_empty` would then demand an
+    /// `is_empty` whose only honest answer is already a refusal at parse time.
+    fn instance_count(&self) -> usize {
+        self.verdicts.len()
+    }
+}
+
+/// Extract the first quoted element of a Python list literal, e.g. the instance
+/// name in `Row: ['lindex-lindex_400', '1.0 (h)', ...]`.
+fn first_quoted_element(rest: &str) -> Option<String> {
+    let rest = rest.trim_start();
+    let quote = rest.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let body = &rest[quote.len_utf8()..];
+    let end = body.find(quote)?;
+    Some(body[..end].to_string())
+}
+
+/// Parse the organisers' scoring log into per-instance truth.
+///
+/// The log is line-oriented: a `Category <id>:` line opens a category, a
+/// `Row: [...]` line names an instance, and the `True Result:` line that follows
+/// it carries the adjudicated verdict (or `-` when the organisers left the row
+/// undecided, which claims nothing and is skipped).
+fn parse_ground_truth_log(body: &str, source: &str) -> Result<GroundTruth> {
+    let mut seen = BTreeMap::<GroundTruthKey, BTreeSet<Verdict>>::new();
+    let mut benchmark: Option<String> = None;
+    let mut pending: Option<String> = None;
+    for line in body.lines() {
+        let line = line.trim_end();
+        if let Some(rest) = line.strip_prefix("Category ") {
+            if let Some(name) = rest.strip_suffix(':') {
+                let (_, canonical) = ScoreYear::from_category_prefix(name.trim());
+                benchmark = Some(canonical.to_string());
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("Row: [") {
+            pending = first_quoted_element(rest);
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("True Result:") else {
+            continue;
+        };
+        let (Some(benchmark), Some(instance)) = (benchmark.as_ref(), pending.take()) else {
+            continue;
+        };
+        let verdict = match rest.trim() {
+            "sat" => Verdict::Sat,
+            "unsat" => Verdict::Unsat,
+            // `-` means the organisers themselves recorded no truth here.
+            _ => continue,
+        };
+        seen.entry((benchmark.clone(), instance))
+            .or_default()
+            .insert(verdict);
+    }
+    if seen.is_empty() {
+        bail!(
+            "no `True Result:` rows parsed from organiser ground truth at {source}; an empty \
+             truth table is a PARSE FAILURE, not a clean absence of truth"
+        );
+    }
+    let mut truth = GroundTruth {
+        source: source.to_string(),
+        ..Default::default()
+    };
+    for (key, verdicts) in seen {
+        match verdicts.iter().copied().collect::<Vec<_>>().as_slice() {
+            [only] => {
+                truth.verdicts.insert(key, *only);
+            }
+            _ => {
+                truth.ambiguous.insert(format!("{} | {}", key.0, key.1));
+            }
+        }
+    }
+    Ok(truth)
+}
+
+/// Resolve a `--ground-truth` argument, which may be the released corpus root,
+/// the `SCORING` directory inside it, or the log file itself.
+fn load_ground_truth(path: &Path) -> Result<GroundTruth> {
+    let file = if path.is_dir() {
+        let nested = path.join(GROUND_TRUTH_RELATIVE_PATH);
+        if nested.is_file() {
+            nested
+        } else {
+            let direct = path.join("results.txt");
+            if direct.is_file() {
+                direct
+            } else {
+                bail!(
+                    "no organiser scoring log under {}: expected {} or results.txt",
+                    path.display(),
+                    GROUND_TRUTH_RELATIVE_PATH
+                )
+            }
+        }
+    } else {
+        path.to_path_buf()
+    };
+    let body = std::fs::read_to_string(&file)
+        .with_context(|| format!("read organiser ground truth {}", file.display()))?;
+    parse_ground_truth_log(&body, &file.display().to_string())
+}
+
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct BenchProgress {
     pub(crate) benchmark: String,
@@ -872,6 +1080,21 @@ pub(crate) struct BenchProgress {
     pub(crate) current_raw_score: Option<i64>,
     pub(crate) current_correct: Option<usize>,
     pub(crate) current_incorrect: Option<usize>,
+    /// Decided current rows withheld from scoring because the instance is
+    /// disputed: one participant claims SAT, others hold UNSAT, and no
+    /// published organiser truth settles it.
+    pub(crate) current_disputed: Option<usize>,
+    /// Every disputed instance in this benchmark, both sides named. Never
+    /// summarized away — a withheld row is a claim about the field, not a
+    /// rounding detail.
+    pub(crate) disputed_rows: Vec<String>,
+    /// Instances scored against published organiser truth rather than inferred
+    /// witness credibility.
+    pub(crate) truth_resolved_instances: Option<usize>,
+    /// What the current rows would score if every field SAT were assumed valid.
+    /// Reported whenever it differs from `current_raw_score`, so declining to
+    /// score a disputed row can never quietly become a point gain.
+    pub(crate) current_raw_score_assumed_valid: Option<i64>,
     /// Strongest participating tool's raw score, including current.
     pub(crate) field_best_raw_score: Option<i64>,
     /// `max(0, 100 * current_raw / field_best_raw)`.
@@ -915,6 +1138,20 @@ pub(crate) struct ProgressReport {
     pub(crate) modeled_score_caveat: Option<&'static str>,
     /// Present when no `--budget-year` was supplied, so runtimes went unchecked.
     pub(crate) unchecked_budget_caveat: Option<&'static str>,
+    /// Decided current rows withheld from scoring across all benchmarks.
+    pub(crate) total_disputed: usize,
+    /// Disputed instances found across all benchmarks (current rows or not).
+    pub(crate) total_disputed_instances: usize,
+    /// Provenance of the published organiser truth, when one was loaded.
+    pub(crate) ground_truth_source: Option<String>,
+    /// Instances in the loaded truth table, before matching.
+    pub(crate) ground_truth_instances: usize,
+    /// Instances actually scored against published truth.
+    pub(crate) ground_truth_resolved_instances: usize,
+    /// Organiser row identities that two instances share with DIFFERENT
+    /// verdicts. These are dropped, never guessed, and are listed so the
+    /// ambiguity is visible rather than silently resolved.
+    pub(crate) ground_truth_ambiguous_keys: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -922,19 +1159,157 @@ struct ModeledOfficialScore {
     current_raw: i64,
     current_correct: usize,
     current_incorrect: usize,
+    /// Decided current rows withheld from scoring as disputed.
+    current_disputed: usize,
+    /// One line per disputed instance in this benchmark, both sides named.
+    disputes: Vec<String>,
+    /// Instances in this benchmark settled by published organiser truth.
+    truth_resolved: usize,
     field_best_raw: i64,
     normalized: f64,
+    /// What `current` would score if every field SAT were taken at face value.
+    current_raw_assumed_valid: i64,
+}
+
+/// Label used for the locally measured rows wherever a participant is named.
+const CURRENT_LABEL: &str = "ny (current)";
+
+/// How one instance's verdicts are scored, decided ONCE from every
+/// participant's claim on that instance rather than row by row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstanceRuling {
+    /// The organisers published a verdict for this instance. Match it for +10,
+    /// contradict it for -150; no other evidence is consulted.
+    Truth(Verdict),
+    /// A credible SAT witness exists, so a contradicting UNSAT is wrong.
+    WitnessCredible,
+    /// Nothing convicts here: either no SAT was claimed at all, or the only SAT
+    /// claim is uncontested. Every decided verdict earns +10.
+    Uncontested,
+    /// Exactly one participant claims SAT, at least one claims UNSAT, and no
+    /// published truth settles it. Scoring either side would let one
+    /// unreproduced witness set the category denominator, so NOBODY scores and
+    /// the conflict is reported instead.
+    Disputed,
+}
+
+/// Per-instance rulings for one benchmark, and what reaching them surfaced.
+#[derive(Debug, Default)]
+struct Adjudication {
+    rulings: BTreeMap<SemanticKey, InstanceRuling>,
+    /// One line per disputed instance, naming BOTH sides.
+    disputes: Vec<String>,
+    /// Instances settled by published organiser truth.
+    truth_resolved: usize,
+}
+
+impl Adjudication {
+    fn ruling(&self, key: &InstanceKey) -> InstanceRuling {
+        self.rulings
+            .get(&key.semantic_key())
+            .copied()
+            .unwrap_or(InstanceRuling::Uncontested)
+    }
+}
+
+/// Decide, for every instance of one benchmark, what its verdicts are worth.
+///
+/// The claim census spans the locally measured rows AND every field tool, so a
+/// witness is judged by the whole field rather than by whoever happens to be
+/// scored at the moment. That matters: the ruling is shared by `current` and by
+/// each competitor when the winner-relative denominator is computed, which is
+/// what stops one tool from being scored under a different model than the tool
+/// it is normalized against.
+fn adjudicate(
+    benchmark: &str,
+    current: &ResultRows,
+    field: &OfficialField,
+    scored_instances: &BTreeSet<InstanceKey>,
+    truth: Option<&GroundTruth>,
+    witnesses: Witnesses,
+) -> Adjudication {
+    // Only instances the field actually scores can be adjudicated; a row that
+    // exists solely in the local bank earns nothing either way, and counting it
+    // would inflate the reported truth coverage.
+    let scored = scored_instances
+        .iter()
+        .map(InstanceKey::semantic_key)
+        .collect::<BTreeSet<_>>();
+    type Claims = (BTreeSet<String>, BTreeSet<String>, InstanceKey);
+    let mut claims = BTreeMap::<SemanticKey, Claims>::new();
+    let mut participants: Vec<(&str, &ResultRows)> = vec![(CURRENT_LABEL, current)];
+    participants.extend(field.iter().map(|(tool, rows)| (tool.as_str(), rows)));
+    for (tool, rows) in participants {
+        for (key, entry) in rows {
+            if key.benchmark != benchmark || !scored.contains(&key.semantic_key()) {
+                continue;
+            }
+            let slot = claims
+                .entry(key.semantic_key())
+                .or_insert_with(|| (BTreeSet::new(), BTreeSet::new(), key.clone()));
+            match entry.verdict {
+                Verdict::Sat => {
+                    slot.0.insert(tool.to_string());
+                }
+                Verdict::Unsat => {
+                    slot.1.insert(tool.to_string());
+                }
+                Verdict::Undecided => {}
+            }
+        }
+    }
+
+    let mut out = Adjudication::default();
+    for (semantic, (sats, unsats, key)) in claims {
+        let ruling = match witnesses {
+            Witnesses::Unvalidated => InstanceRuling::Uncontested,
+            Witnesses::AssumedValid => {
+                if sats.is_empty() {
+                    InstanceRuling::Uncontested
+                } else {
+                    InstanceRuling::WitnessCredible
+                }
+            }
+            Witnesses::Adjudicated => match truth.and_then(|truth| truth.get(&key)) {
+                Some(verdict) => {
+                    out.truth_resolved += 1;
+                    InstanceRuling::Truth(verdict)
+                }
+                None if sats.len() >= 2 => InstanceRuling::WitnessCredible,
+                None if sats.len() == 1 && !unsats.is_empty() => {
+                    out.disputes.push(format!(
+                        "{} [SAT claimed ONLY by {}; UNSAT held by {}; no published truth \
+                         settles it, so NOBODY scores this row and it sets no denominator]",
+                        key.display_name(),
+                        sats.iter().cloned().collect::<Vec<_>>().join(", "),
+                        unsats.iter().cloned().collect::<Vec<_>>().join(", "),
+                    ));
+                    InstanceRuling::Disputed
+                }
+                None => InstanceRuling::Uncontested,
+            },
+        };
+        out.rulings.insert(semantic, ruling);
+    }
+    out
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct RowScore {
+    raw: i64,
+    correct: usize,
+    incorrect: usize,
+    /// Decided rows withheld from scoring because the instance is disputed.
+    disputed: usize,
 }
 
 fn score_rows(
     rows: &ResultRows,
     scored_instances: &BTreeSet<InstanceKey>,
-    valid_sat_witnesses: &BTreeSet<SemanticKey>,
+    adjudication: &Adjudication,
     over_budget: &BTreeSet<InstanceKey>,
-) -> (i64, usize, usize) {
-    let mut raw = 0_i64;
-    let mut correct = 0_usize;
-    let mut incorrect = 0_usize;
+) -> RowScore {
+    let mut score = RowScore::default();
     for (key, entry) in rows {
         if !scored_instances.contains(key) {
             continue;
@@ -945,23 +1320,37 @@ fn score_rows(
         if over_budget.contains(key) {
             continue;
         }
-        match entry.verdict {
-            Verdict::Sat => {
-                raw += POINTS_CORRECT;
-                correct += 1;
+        if entry.verdict == Verdict::Undecided {
+            continue;
+        }
+        match adjudication.ruling(key) {
+            InstanceRuling::Truth(truth) => {
+                if entry.verdict == truth {
+                    score.raw += POINTS_CORRECT;
+                    score.correct += 1;
+                } else {
+                    score.raw += PENALTY_INCORRECT;
+                    score.incorrect += 1;
+                }
             }
-            Verdict::Unsat if valid_sat_witnesses.contains(&key.semantic_key()) => {
-                raw += PENALTY_INCORRECT;
-                incorrect += 1;
+            InstanceRuling::WitnessCredible => match entry.verdict {
+                Verdict::Sat => {
+                    score.raw += POINTS_CORRECT;
+                    score.correct += 1;
+                }
+                _ => {
+                    score.raw += PENALTY_INCORRECT;
+                    score.incorrect += 1;
+                }
+            },
+            InstanceRuling::Uncontested => {
+                score.raw += POINTS_CORRECT;
+                score.correct += 1;
             }
-            Verdict::Unsat => {
-                raw += POINTS_CORRECT;
-                correct += 1;
-            }
-            Verdict::Undecided => {}
+            InstanceRuling::Disputed => score.disputed += 1,
         }
     }
-    (raw, correct, incorrect)
+    score
 }
 
 /// Outcome of checking one benchmark's solved rows against official budgets.
@@ -994,8 +1383,11 @@ const UNDER_MEASURED_FRACTION: f64 = 0.90;
 /// Solved rows past their budget are phantom points and are excluded from
 /// scoring. Undecided rows recorded well BELOW their budget are the inverse
 /// defect: the row never got the time the competition gives it (the class the
-/// `NY_MEASURE_CAP=120` default in `scripts/measure_ny_scorecard.sh` produced
-/// against 900s cgan budgets), so it must not be read as a capability limit.
+/// FORMER `NY_MEASURE_CAP=120` default in `scripts/measure_ny_scorecard.sh`
+/// produced against 900s cgan budgets, until `866e21946` made no-cap the
+/// default), so it must not be read as a capability limit. The audit stays,
+/// because the BANK still holds those rows even though the generator no
+/// longer makes new ones.
 /// Neither direction is a formality — one invents points, the other buries
 /// them.
 fn audit_budgets(current: &ResultRows, budgets: &BudgetTable, benchmark: &str) -> BudgetAudit {
@@ -1056,6 +1448,7 @@ fn modeled_official_score(
     track: ScoreTrack,
     over_budget: &BTreeSet<InstanceKey>,
     witnesses: Witnesses,
+    truth: Option<&GroundTruth>,
 ) -> Option<ModeledOfficialScore> {
     if !track.includes(year, benchmark) {
         return None;
@@ -1070,50 +1463,56 @@ fn modeled_official_score(
         return None;
     }
 
-    // Which SAT rows are treated as counterexamples that can convict a
-    // contradicting UNSAT. Under `Witnesses::Unvalidated` nothing convicts,
-    // because the published board never opened the counterexample files.
-    let valid_sat_witnesses = match witnesses {
-        Witnesses::AssumedValid => current
-            .iter()
-            .chain(field.values().flat_map(|rows| rows.iter()))
-            .filter(|(key, entry)| key.benchmark == benchmark && entry.verdict == Verdict::Sat)
-            .map(|(key, _)| key.semantic_key())
-            .collect::<BTreeSet<_>>(),
-        Witnesses::Unvalidated => BTreeSet::new(),
-    };
-
-    let (current_raw, current_correct, current_incorrect) = score_rows(
+    // One ruling per instance, shared by `current` and by every competitor, so
+    // the denominator is computed under the SAME model as the numerator.
+    let adjudication = adjudicate(
+        benchmark,
         current,
+        field,
         &scored_instances,
-        &valid_sat_witnesses,
-        over_budget,
+        truth,
+        witnesses,
     );
+    let current_score = score_rows(current, &scored_instances, &adjudication, over_budget);
     // The official field's runtimes came from the real harness, which enforces
     // the timeout itself, so no exclusion applies to the competitors' rows. Only
     // locally measured results can be over budget.
     let no_exclusions = BTreeSet::new();
-    let mut field_best_raw = current_raw;
+    let mut field_best_raw = current_score.raw;
     for rows in field.values() {
-        let (raw, _, _) = score_rows(
-            rows,
-            &scored_instances,
-            &valid_sat_witnesses,
-            &no_exclusions,
-        );
+        let raw = score_rows(rows, &scored_instances, &adjudication, &no_exclusions).raw;
         field_best_raw = field_best_raw.max(raw);
     }
     let normalized = if field_best_raw > 0 {
-        (100.0 * current_raw as f64 / field_best_raw as f64).max(0.0)
+        (100.0 * current_score.raw as f64 / field_best_raw as f64).max(0.0)
     } else {
         0.0
     };
+
+    // The pessimistic twin, always computed and reported whenever it disagrees:
+    // what `current` would score if every SAT claim in the field were taken at
+    // face value. Withholding a disputed row must never be a quiet way to
+    // recover points, so the number it would have cost stays visible.
+    let assumed_valid = adjudicate(
+        benchmark,
+        current,
+        field,
+        &scored_instances,
+        None,
+        Witnesses::AssumedValid,
+    );
+    let assumed_valid_raw = score_rows(current, &scored_instances, &assumed_valid, over_budget).raw;
+
     Some(ModeledOfficialScore {
-        current_raw,
-        current_correct,
-        current_incorrect,
+        current_raw: current_score.raw,
+        current_correct: current_score.correct,
+        current_incorrect: current_score.incorrect,
+        current_disputed: current_score.disputed,
+        disputes: adjudication.disputes,
+        truth_resolved: adjudication.truth_resolved,
         field_best_raw,
         normalized,
+        current_raw_assumed_valid: assumed_valid_raw,
     })
 }
 
@@ -1130,6 +1529,11 @@ pub(crate) struct ScoreOptions {
     pub(crate) budget_years: Vec<u32>,
     /// How SAT rows are treated. Worth >100 points, so never implicit.
     pub(crate) witnesses: Witnesses,
+    /// Published organiser adjudication (`SCORING/results.txt` in a released
+    /// results corpus, or the corpus root containing it). When `--official`
+    /// points at an unsanitized corpus this is found automatically; a sanitized
+    /// copy that dropped `SCORING/` needs it passed explicitly.
+    pub(crate) ground_truth: Option<PathBuf>,
 }
 
 fn validate_year_hints(rows: &ResultRows, selected: ScoreYear, corpus: &str) -> Result<()> {
@@ -1177,6 +1581,21 @@ pub(crate) fn run_score(opts: &ScoreOptions) -> Result<ProgressReport> {
         .as_deref()
         .map(load_official_field)
         .transpose()?;
+    // Published organiser truth, when one is reachable. An explicit path wins;
+    // otherwise the released corpus is asked for its own scoring log, which the
+    // field loader already skips when collecting result CSVs.
+    let ground_truth = match (&opts.ground_truth, &opts.official) {
+        (Some(path), _) => Some(load_ground_truth(path)?),
+        (None, Some(root)) => {
+            let log = root.join(GROUND_TRUTH_RELATIVE_PATH);
+            if log.is_file() {
+                Some(load_ground_truth(&log)?)
+            } else {
+                None
+            }
+        }
+        (None, None) => None,
+    };
     if let Some(year) = score_year {
         validate_year_hints(&current, year, "current results")?;
         validate_year_hints(&reference, year, "baseline results")?;
@@ -1243,6 +1662,12 @@ pub(crate) fn run_score(opts: &ScoreOptions) -> Result<ProgressReport> {
         unchecked_budget_caveat: budgets
             .as_ref()
             .map_or(Some(UNCHECKED_BUDGET_CAVEAT), |_| None),
+        ground_truth_source: ground_truth.as_ref().map(|truth| truth.source.clone()),
+        ground_truth_instances: ground_truth.as_ref().map_or(0, GroundTruth::instance_count),
+        ground_truth_ambiguous_keys: ground_truth
+            .as_ref()
+            .map(|truth| truth.ambiguous.iter().cloned().collect())
+            .unwrap_or_default(),
         ..Default::default()
     };
     let mut normalized_total = 0.0;
@@ -1296,19 +1721,25 @@ pub(crate) fn run_score(opts: &ScoreOptions) -> Result<ProgressReport> {
                 opts.track,
                 &over_budget_keys,
                 opts.witnesses,
+                ground_truth.as_ref(),
             )
         }) {
             progress.current_raw_score = Some(score.current_raw);
             progress.current_correct = Some(score.current_correct);
             progress.current_incorrect = Some(score.current_incorrect);
+            progress.current_disputed = Some(score.current_disputed);
+            progress.truth_resolved_instances = Some(score.truth_resolved);
+            progress.current_raw_score_assumed_valid = Some(score.current_raw_assumed_valid);
+            progress.disputed_rows = score.disputes;
             progress.field_best_raw_score = Some(score.field_best_raw);
             progress.normalized = Some(score.normalized);
+            report.total_disputed += score.current_disputed;
+            report.total_disputed_instances += progress.disputed_rows.len();
+            report.ground_truth_resolved_instances += score.truth_resolved;
             normalized_total += score.normalized;
             report.officially_scored_benchmarks += 1;
             if progress.rows_compared == 0 {
-                report
-                    .scored_categories_with_no_rows
-                    .push(benchmark.clone());
+                report.scored_categories_with_no_rows.push(benchmark);
             }
         }
 
@@ -1421,12 +1852,40 @@ fn print_report(report: &ProgressReport, opts: &ScoreOptions) {
                 report.officially_scored_benchmarks,
             );
             println!("witness model: {}", opts.witnesses.label());
+            match &report.ground_truth_source {
+                Some(source) => {
+                    println!(
+                        "ground truth: {} instance(s) from {source}; {} scored against it",
+                        report.ground_truth_instances, report.ground_truth_resolved_instances
+                    );
+                    println!(
+                        "  note: a raw results CSV cannot express two organiser rules (a \
+                         rejected counterexample is charged -150; a counterexample correct only \
+                         up to tolerance still earns +10), so modeled totals can differ \
+                         slightly from the published board."
+                    );
+                }
+                None if opts.witnesses == Witnesses::Adjudicated => println!(
+                    "ground truth: NONE SUPPLIED — no organiser adjudication was reachable, so \
+                     every instance fell back to corroboration. Pass --ground-truth <corpus> \
+                     (the released tree's {}); a sanitized field copy usually drops it. An \
+                     absent truth table is a WEAKER model, not a clean one.",
+                    GROUND_TRUTH_RELATIVE_PATH
+                ),
+                None => {}
+            }
+            if !report.ground_truth_ambiguous_keys.is_empty() {
+                println!(
+                    "  {} organiser row id(s) are shared by instances with different published \
+                     verdicts and were dropped rather than guessed: {}",
+                    report.ground_truth_ambiguous_keys.len(),
+                    report.ground_truth_ambiguous_keys.join(", ")
+                );
+            }
             if opts.witnesses == Witnesses::Unvalidated {
                 println!(
-                    "  this reproduces the PUBLISHED 2025 board (validated: alpha-beta-CROWN \
-                     1566.9, PyRAT 1228.4) and therefore rewards unsound tools — on cifar100 it \
-                     ranks NNV first at 190/200 while NNV holds 19 UNSAT rows another tool \
-                     contradicts with a SAT witness."
+                    "  unvalidated: this reproduces the published totals, which reward \
+                     unsound verdicts; use it only to compare placements."
                 );
             }
             println!(
@@ -1442,12 +1901,9 @@ fn print_report(report: &ProgressReport, opts: &ScoreOptions) {
 
     if !report.scored_categories_with_no_rows.is_empty() {
         println!(
-            "\n*** {} SCORED CATEGOR{} HAVE NO MEASURED ROWS and therefore score a guaranteed \
-             ZERO: {}. The usual cause is a bank directory that was not supplied, NOT an absence \
-             of results — this repository keeps TWO banks, `reports/measured/` and \
-             `reports/measured-ext/`, and scoring only the first silently under-counted the \
-             extended track by 182 normalized points. Pass every bank with repeated --results \
-             before reading a total. ***",
+            "\n*** {} SCORED CATEGOR{} HAVE NO MEASURED ROWS and score zero: {}. This \
+             usually means a results directory was not passed; pass every bank with \
+             repeated --results before reading a total. ***",
             report.scored_categories_with_no_rows.len(),
             if report.scored_categories_with_no_rows.len() == 1 {
                 "Y"
@@ -1527,11 +1983,9 @@ fn print_report(report: &ProgressReport, opts: &ScoreOptions) {
     if report.total_under_measured > 0 {
         println!(
             "\n*** INVALID MEASUREMENTS: {} undecided row(s) were recorded below 90% of \
-             their own official per-instance timeout. These rows were never given the time \
-             the competition gives them, so they say NOTHING about capability — do not \
-             prioritize (or deprioritize) work from them. Re-measure each at the budget \
-             from instances.csv (`ny benchmarks run` does; scripts/measure_ny_scorecard.sh \
-             caps at NY_MEASURE_CAP=120s by default). ***",
+             their own official per-instance timeout, so they say nothing about \
+             capability. Re-measure each at its instances.csv budget (`ny benchmarks \
+             run` and scripts/measure_ny_scorecard.sh both do so by default). ***",
             report.total_under_measured
         );
         for benchmark in &report.benchmarks {
@@ -1567,6 +2021,53 @@ fn print_report(report: &ProgressReport, opts: &ScoreOptions) {
                     benchmark.at_budget_solves.len() - opts.show_rows
                 );
             }
+        }
+    }
+
+    if report.total_disputed_instances > 0 {
+        println!(
+            "\n*** DISPUTED WITNESSES: {} instance(s) carry a SAT claimed by exactly ONE \
+             participant and contradicted by others, with no published organiser truth to \
+             settle them. Under --witnesses assumed-valid each of these would convict every \
+             tool that disagrees at -150 and would set this category's winner-relative \
+             DENOMINATOR off a single unreproduced witness. They are withheld from scoring \
+             instead — for BOTH sides — and listed here. {} decided current row(s) are among \
+             them. Adjudicate them against evidence; do not read a withheld row as agreement. \
+             ***",
+            report.total_disputed_instances, report.total_disputed
+        );
+        for benchmark in &report.benchmarks {
+            for row in benchmark.disputed_rows.iter().take(opts.show_rows) {
+                println!("  {}: {}", benchmark.benchmark, row);
+            }
+            if benchmark.disputed_rows.len() > opts.show_rows {
+                println!(
+                    "  {}: ... and {} more",
+                    benchmark.benchmark,
+                    benchmark.disputed_rows.len() - opts.show_rows
+                );
+            }
+        }
+        let mut moved = report
+            .benchmarks
+            .iter()
+            .filter_map(|benchmark| {
+                let raw = benchmark.current_raw_score?;
+                let pessimistic = benchmark.current_raw_score_assumed_valid?;
+                (raw != pessimistic).then(|| {
+                    format!(
+                        "{} {raw} (assumed-valid: {pessimistic})",
+                        benchmark.benchmark
+                    )
+                })
+            })
+            .peekable();
+        if moved.peek().is_some() {
+            println!(
+                "  PESSIMISTIC TWIN — current raw under this model vs. under assumed-valid, \
+                 so withholding a disputed row can never quietly read as a gain: {}",
+                moved.collect::<Vec<_>>().join("; ")
+            );
         }
     }
 
@@ -1610,6 +2111,19 @@ mod tests {
             show_rows: 5,
             budget_years: Vec::new(),
             witnesses: Witnesses::AssumedValid,
+            ground_truth: None,
+        }
+    }
+
+    /// Give every instance in `rows` the same ruling, for the score_rows unit
+    /// tests that predate per-instance adjudication.
+    fn ruling_for_all(rows: &ResultRows, ruling: InstanceRuling) -> Adjudication {
+        Adjudication {
+            rulings: rows
+                .keys()
+                .map(|key| (key.semantic_key(), ruling))
+                .collect(),
+            ..Default::default()
         }
     }
 
@@ -2475,10 +2989,10 @@ mod tests {
 
         // Excluded rows earn nothing: a solve past the timeout scores zero.
         let scored = rows.keys().cloned().collect::<BTreeSet<_>>();
-        let witnesses = BTreeSet::new();
-        let (raw, correct, _) = score_rows(&rows, &scored, &witnesses, &audit.keys);
-        assert_eq!(correct, 1, "only the in-budget row scores");
-        assert_eq!(raw, POINTS_CORRECT);
+        let uncontested = ruling_for_all(&rows, InstanceRuling::Uncontested);
+        let score = score_rows(&rows, &scored, &uncontested, &audit.keys);
+        assert_eq!(score.correct, 1, "only the in-budget row scores");
+        assert_eq!(score.raw, POINTS_CORRECT);
     }
 
     #[test]
@@ -2494,16 +3008,16 @@ mod tests {
         let rows = load(&bank).expect("load bank");
         let audit = audit_budgets(&rows, &budgets, "nn4sys");
         let scored = rows.keys().cloned().collect::<BTreeSet<_>>();
-        let witnesses = rows.keys().map(InstanceKey::semantic_key).collect();
+        let convicting = ruling_for_all(&rows, InstanceRuling::WitnessCredible);
 
         // Past the timeout the harness reports a timeout, so the row is neither
         // a solve nor a wrong answer.
-        let (raw, correct, incorrect) = score_rows(&rows, &scored, &witnesses, &audit.keys);
-        assert_eq!((raw, correct, incorrect), (0, 0, 0));
+        let score = score_rows(&rows, &scored, &convicting, &audit.keys);
+        assert_eq!((score.raw, score.correct, score.incorrect), (0, 0, 0));
 
         // Without the exclusion the same contradiction is the real -150.
-        let (raw, _, incorrect) = score_rows(&rows, &scored, &witnesses, &BTreeSet::new());
-        assert_eq!((raw, incorrect), (PENALTY_INCORRECT, 1));
+        let score = score_rows(&rows, &scored, &convicting, &BTreeSet::new());
+        assert_eq!((score.raw, score.incorrect), (PENALTY_INCORRECT, 1));
     }
 
     #[test]
@@ -2551,9 +3065,11 @@ mod tests {
         let corpus = TempDir::new().expect("corpus");
         let budgets = budgets_from_categories(&nn4sys_corpus(&corpus)).expect("load budgets");
         let results = TempDir::new().expect("results");
-        // The defect this guards: scripts/measure_ny_scorecard.sh's default
-        // NY_MEASURE_CAP=120 banked ~101s "timeouts" against 800-1200s budgets,
-        // which were then read as capability limits.
+        // The defect this guards: scripts/measure_ny_scorecard.sh's FORMER
+        // default NY_MEASURE_CAP=120 banked ~101s "timeouts" against 800-1200s
+        // budgets, which were then read as capability limits. The default is
+        // now 0 (no cap), but the banked rows outlive the generator fix, so
+        // the audit must keep catching them.
         let bank = write_file(
             &results,
             "nn4sys.csv",
@@ -2627,6 +3143,359 @@ mod tests {
         // still score until evidence says otherwise.
         assert!(audit.keys.is_empty());
         assert_eq!(audit.checked, 2);
+    }
+
+    // ---------------------------------------------------------------------
+    // Witness adjudication: an uncorroborated SAT must not set a denominator.
+    // ---------------------------------------------------------------------
+
+    /// Five cgan2026 rows the organisers adjudicated `unsat`, one tool that
+    /// answers them correctly, and one tool whose SAT claim nobody reproduces.
+    ///
+    /// Shaped after the live 2026 corpus: `agate` alone claims SAT on 8
+    /// `cgan2026` rows that `cgan2026_official_truth.json` and the organisers'
+    /// own log both call `unsat`, and the organisers charged it -150 on each.
+    fn planted_witness_corpus(official: &TempDir) {
+        // Decides all five correctly.
+        write_file(
+            official,
+            "honest/results.csv",
+            "cgan2026,onnx/m.onnx,vnnlib/p1.vnnlib,0,unsat,1\n\
+             cgan2026,onnx/m.onnx,vnnlib/p2.vnnlib,0,unsat,1\n\
+             cgan2026,onnx/m.onnx,vnnlib/p3.vnnlib,0,unsat,1\n\
+             cgan2026,onnx/m.onnx,vnnlib/p4.vnnlib,0,unsat,1\n\
+             cgan2026,onnx/m.onnx,vnnlib/p5.vnnlib,0,unsat,1\n",
+        );
+        // Claims SAT on four of them and nobody corroborates it.
+        write_file(
+            official,
+            "planted/results.csv",
+            "cgan2026,onnx/m.onnx,vnnlib/p1.vnnlib,0,sat,1\n\
+             cgan2026,onnx/m.onnx,vnnlib/p2.vnnlib,0,sat,1\n\
+             cgan2026,onnx/m.onnx,vnnlib/p3.vnnlib,0,sat,1\n\
+             cgan2026,onnx/m.onnx,vnnlib/p4.vnnlib,0,sat,1\n",
+        );
+    }
+
+    /// NY holds three of the contested rows plus the uncontested one.
+    fn planted_witness_current(dir: &TempDir) -> PathBuf {
+        write_file(
+            dir,
+            "current.csv",
+            "cgan2026,onnx/m.onnx,vnnlib/p1.vnnlib,0,unsat,1\n\
+             cgan2026,onnx/m.onnx,vnnlib/p2.vnnlib,0,unsat,1\n\
+             cgan2026,onnx/m.onnx,vnnlib/p3.vnnlib,0,unsat,1\n\
+             cgan2026,onnx/m.onnx,vnnlib/p5.vnnlib,0,unsat,1\n",
+        )
+    }
+
+    fn organiser_log(dir: &TempDir, body: &str) -> PathBuf {
+        write_file(dir, "SCORING/results.txt", body)
+    }
+
+    fn cgan_truth_log() -> String {
+        let mut body = String::from("Category 2026_cgan2026:\n");
+        for property in ["p1", "p2", "p3", "p4", "p5"] {
+            body.push_str(&format!("Row: ['m-{property}', '1.0 (h)', '1.0 (v)']\n"));
+            body.push_str("True Result: unsat\n");
+        }
+        body
+    }
+
+    fn bench<'a>(report: &'a ProgressReport, name: &str) -> &'a BenchProgress {
+        report
+            .benchmarks
+            .iter()
+            .find(|benchmark| benchmark.benchmark == name)
+            .unwrap_or_else(|| panic!("{name} present in report"))
+    }
+
+    /// THE REGRESSION THIS FIX EXISTS FOR.
+    ///
+    /// Under `assumed-valid` the planted tool's four unreproduced SAT claims
+    /// convict everyone who disagrees, which makes the planted tool the field
+    /// leader and hands it the winner-relative DENOMINATOR. Scoring against the
+    /// organisers' published adjudication has to leave that denominator with the
+    /// tool that answered correctly, and must not charge NY for the same
+    /// refuted witness.
+    #[test]
+    fn a_single_tool_witness_contradicting_published_truth_does_not_set_the_denominator() {
+        let dir = TempDir::new().expect("tempdir");
+        let current = planted_witness_current(&dir);
+        let official = TempDir::new().expect("official");
+        planted_witness_corpus(&official);
+        let truth_dir = TempDir::new().expect("truth");
+        let log = organiser_log(&truth_dir, &cgan_truth_log());
+
+        // Arm A — the defect, pinned so the fix is measured against it.
+        let mut broken = opts(current.clone(), None);
+        broken.official = Some(official.path().to_path_buf());
+        broken.year = Some(ScoreYear::Y2026);
+        broken.witnesses = Witnesses::AssumedValid;
+        let report = run_score(&broken).expect("assumed-valid score");
+        let cgan = bench(&report, "cgan2026");
+        assert_eq!(
+            cgan.field_best_raw_score,
+            Some(40),
+            "assumed-valid hands the denominator to the planted tool's four \
+             unreproduced witnesses"
+        );
+        assert_eq!(
+            cgan.current_raw_score,
+            Some(3 * PENALTY_INCORRECT + POINTS_CORRECT)
+        );
+        assert_eq!(cgan.current_incorrect, Some(3));
+
+        // Arm B — the fix. Same rows, same field, organiser truth supplied.
+        let mut fixed = opts(current, None);
+        fixed.official = Some(official.path().to_path_buf());
+        fixed.year = Some(ScoreYear::Y2026);
+        fixed.witnesses = Witnesses::Adjudicated;
+        fixed.ground_truth = Some(log);
+        let report = run_score(&fixed).expect("adjudicated score");
+        let cgan = bench(&report, "cgan2026");
+        assert_eq!(
+            cgan.field_best_raw_score,
+            Some(50),
+            "the denominator belongs to the tool that matches published truth"
+        );
+        assert_eq!(
+            cgan.current_raw_score,
+            Some(4 * POINTS_CORRECT),
+            "NY's four unsat rows all match published truth"
+        );
+        assert_eq!(cgan.current_incorrect, Some(0));
+        assert_eq!(cgan.current_disputed, Some(0));
+        assert_eq!(cgan.truth_resolved_instances, Some(5));
+        assert_eq!(report.ground_truth_resolved_instances, 5);
+        assert!(
+            report
+                .ground_truth_source
+                .as_deref()
+                .is_some_and(|source| source.contains("results.txt")),
+            "the truth's provenance must be reported: {:?}",
+            report.ground_truth_source
+        );
+        // The verdict counts are untouched; only their price changed.
+        assert_eq!(cgan.current_solved, 4);
+    }
+
+    /// With no published truth to appeal to, a lone contested SAT settles
+    /// nothing — so it scores nobody, in EITHER direction, and is reported.
+    #[test]
+    fn an_uncorroborated_contested_sat_is_disputed_and_scores_no_participant() {
+        let dir = TempDir::new().expect("tempdir");
+        let current = planted_witness_current(&dir);
+        let official = TempDir::new().expect("official");
+        planted_witness_corpus(&official);
+
+        let mut adjudicated = opts(current, None);
+        adjudicated.official = Some(official.path().to_path_buf());
+        adjudicated.year = Some(ScoreYear::Y2026);
+        adjudicated.witnesses = Witnesses::Adjudicated;
+        let report = run_score(&adjudicated).expect("adjudicated score");
+        let cgan = bench(&report, "cgan2026");
+
+        assert_eq!(
+            cgan.disputed_rows.len(),
+            4,
+            "each contested row is reported: {:?}",
+            cgan.disputed_rows
+        );
+        assert_eq!(
+            cgan.current_disputed,
+            Some(3),
+            "NY decided three of the four"
+        );
+        assert_eq!(
+            cgan.current_raw_score,
+            Some(POINTS_CORRECT),
+            "only the uncontested row scores"
+        );
+        assert_eq!(cgan.current_incorrect, Some(0));
+        assert_eq!(
+            cgan.field_best_raw_score,
+            Some(POINTS_CORRECT),
+            "the lone witness cannot lift the planted tool above the field"
+        );
+        // The withheld rows must not read as a quiet gain.
+        assert_eq!(
+            cgan.current_raw_score_assumed_valid,
+            Some(3 * PENALTY_INCORRECT + POINTS_CORRECT),
+            "the pessimistic twin stays visible"
+        );
+        assert!(
+            cgan.disputed_rows
+                .iter()
+                .all(|row| row.contains("planted") && row.contains("honest")),
+            "a dispute must name BOTH sides: {:?}",
+            cgan.disputed_rows
+        );
+        assert_eq!(report.total_disputed_instances, 4);
+        assert_eq!(report.total_disputed, 3);
+        assert!(report.ground_truth_source.is_none());
+    }
+
+    /// The fix is not an amnesty. A SAT two participants agree on is credible
+    /// evidence and still convicts an UNSAT that contradicts it — including
+    /// NY's own.
+    #[test]
+    fn a_corroborated_sat_still_convicts_a_contradicting_unsat() {
+        let dir = TempDir::new().expect("tempdir");
+        let current = write_file(
+            &dir,
+            "current.csv",
+            "cgan2026,onnx/m.onnx,vnnlib/p1.vnnlib,0,unsat,1\n",
+        );
+        let official = TempDir::new().expect("official");
+        write_file(
+            &official,
+            "first/results.csv",
+            "cgan2026,onnx/m.onnx,vnnlib/p1.vnnlib,0,sat,1\n",
+        );
+        write_file(
+            &official,
+            "second/results.csv",
+            "cgan2026,onnx/m.onnx,vnnlib/p1.vnnlib,0,sat,1\n",
+        );
+
+        let mut adjudicated = opts(current, None);
+        adjudicated.official = Some(official.path().to_path_buf());
+        adjudicated.year = Some(ScoreYear::Y2026);
+        adjudicated.witnesses = Witnesses::Adjudicated;
+        let report = run_score(&adjudicated).expect("adjudicated score");
+        let cgan = bench(&report, "cgan2026");
+        assert_eq!(cgan.current_raw_score, Some(PENALTY_INCORRECT));
+        assert_eq!(cgan.current_incorrect, Some(1));
+        assert_eq!(cgan.current_disputed, Some(0));
+        assert_eq!((cgan.disputed_rows).len(), 0);
+    }
+
+    /// Published truth outranks corroboration in BOTH directions: when the
+    /// organisers say `sat`, an UNSAT majority does not save a wrong answer.
+    #[test]
+    fn published_truth_outranks_a_disagreeing_majority() {
+        let dir = TempDir::new().expect("tempdir");
+        let current = write_file(
+            &dir,
+            "current.csv",
+            "cgan2026,onnx/m.onnx,vnnlib/p1.vnnlib,0,unsat,1\n",
+        );
+        let official = TempDir::new().expect("official");
+        write_file(
+            &official,
+            "first/results.csv",
+            "cgan2026,onnx/m.onnx,vnnlib/p1.vnnlib,0,unsat,1\n",
+        );
+        write_file(
+            &official,
+            "second/results.csv",
+            "cgan2026,onnx/m.onnx,vnnlib/p1.vnnlib,0,unsat,1\n",
+        );
+        let truth_dir = TempDir::new().expect("truth");
+        let log = organiser_log(
+            &truth_dir,
+            "Category 2026_cgan2026:\nRow: ['m-p1', '1.0 (h)']\nTrue Result: sat\n",
+        );
+
+        let mut adjudicated = opts(current, None);
+        adjudicated.official = Some(official.path().to_path_buf());
+        adjudicated.year = Some(ScoreYear::Y2026);
+        adjudicated.witnesses = Witnesses::Adjudicated;
+        adjudicated.ground_truth = Some(log);
+        let report = run_score(&adjudicated).expect("adjudicated score");
+        let cgan = bench(&report, "cgan2026");
+        assert_eq!(
+            cgan.current_raw_score,
+            Some(PENALTY_INCORRECT),
+            "no SAT witness exists anywhere in the field, yet the published truth \
+             still convicts the contradicting UNSAT"
+        );
+        assert_eq!(cgan.current_incorrect, Some(1));
+    }
+
+    /// The organisers' row id drops directories, and `safenlp_2024` reuses
+    /// property filenames across `medical/` and `ruarobot/`. Where that collapse
+    /// puts two DIFFERENT published verdicts on one id, the id is unusable: it
+    /// must be dropped and named, never resolved by taking whichever row parsed
+    /// last. A vnnlib-only join once manufactured 123 phantom contradictions.
+    #[test]
+    fn an_ambiguous_organiser_row_id_is_dropped_and_named_not_guessed() {
+        let log = "Category 2026_safenlp_2024:\n\
+                   Row: ['perturbations_0-hyperrectangle_570', '1.0 (v)']\n\
+                   True Result: sat\n\
+                   Row: ['perturbations_0-hyperrectangle_570', '1.0 (h)']\n\
+                   True Result: unsat\n\
+                   Row: ['perturbations_0-hyperrectangle_1', '1.0 (h)']\n\
+                   True Result: unsat\n";
+        let truth = parse_ground_truth_log(log, "fixture").expect("parse truth");
+        assert_eq!(
+            truth.instance_count(),
+            1,
+            "only the unambiguous row survives"
+        );
+        assert!(truth.verdicts.contains_key(&(
+            "safenlp_2024".to_string(),
+            "perturbations_0-hyperrectangle_1".to_string()
+        )));
+        assert_eq!(
+            truth.ambiguous.iter().cloned().collect::<Vec<_>>(),
+            vec!["safenlp_2024 | perturbations_0-hyperrectangle_570".to_string()],
+            "the conflicted id must be named, not silently absent"
+        );
+    }
+
+    /// A truth table that parsed nothing is a parse failure, not a clean absence
+    /// of truth — the same shape as an empty grep read as evidence.
+    #[test]
+    fn an_organiser_log_with_no_true_result_rows_is_a_parse_failure() {
+        let error = parse_ground_truth_log(
+            "Category 2026_cgan2026:\nsomething else entirely\n",
+            "fixture",
+        )
+        .expect_err("empty truth must refuse");
+        assert!(
+            error.to_string().contains("PARSE FAILURE"),
+            "the refusal must say why: {error}"
+        );
+    }
+
+    /// `True Result: -` is the organisers recording that they have no verdict.
+    /// It must claim nothing rather than being read as a decided row.
+    #[test]
+    fn an_undecided_organiser_row_claims_no_truth() {
+        let log = "Category 2026_cgan2026:\n\
+                   Row: ['m-p1', '1.0 (v)']\n\
+                   True Result: -\n\
+                   Row: ['m-p2', '1.0 (h)']\n\
+                   True Result: unsat\n";
+        let truth = parse_ground_truth_log(log, "fixture").expect("parse truth");
+        assert_eq!(truth.instance_count(), 1);
+        assert!(truth.ambiguous.is_empty());
+        assert!(!truth
+            .verdicts
+            .contains_key(&("cgan2026".to_string(), "m-p1".to_string())));
+    }
+
+    /// A released corpus carries its own scoring log, and pointing `--official`
+    /// at it must find that log without a second flag.
+    #[test]
+    fn organiser_truth_is_found_inside_an_unsanitized_official_corpus() {
+        let dir = TempDir::new().expect("tempdir");
+        let current = planted_witness_current(&dir);
+        let official = TempDir::new().expect("official");
+        planted_witness_corpus(&official);
+        organiser_log(&official, &cgan_truth_log());
+
+        let mut adjudicated = opts(current, None);
+        adjudicated.official = Some(official.path().to_path_buf());
+        adjudicated.year = Some(ScoreYear::Y2026);
+        adjudicated.witnesses = Witnesses::Adjudicated;
+        let report = run_score(&adjudicated).expect("adjudicated score");
+        assert_eq!(report.ground_truth_resolved_instances, 5);
+        let cgan = bench(&report, "cgan2026");
+        assert_eq!(cgan.field_best_raw_score, Some(50));
+        assert_eq!(cgan.current_disputed, Some(0));
     }
 
     /// The witness model is worth more than 100 normalized points, so both arms

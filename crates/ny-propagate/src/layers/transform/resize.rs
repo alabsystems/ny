@@ -93,7 +93,12 @@ impl ResizeLayer {
     }
 
     /// Map each flattened output position to the flattened input position it reads.
-    fn build_output_to_input_map(&self, input_shape: &[usize]) -> Result<Vec<usize>> {
+    ///
+    /// `pub(crate)` for `#fl-resize`: the certified forward-linear image
+    /// composition gathers upstream rows through THIS map rather than deriving
+    /// its own, so the forward and backward directions cannot disagree about
+    /// which input a given output reads.
+    pub(crate) fn build_output_to_input_map(&self, input_shape: &[usize]) -> Result<Vec<usize>> {
         let output_shape = self.output_shape(input_shape)?;
         let output_size = checked_shape_product(&output_shape).ok_or_else(|| {
             NyError::InvalidSpec(format!(

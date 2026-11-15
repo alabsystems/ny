@@ -11,7 +11,7 @@
 //! Reference: Moore, R.E. (1966). *Interval Analysis*. Prentice-Hall.
 //! 4-corner interval multiplication: [a,b]*[c,d] = [min(ac,ad,bc,bd), max(ac,ad,bc,bd)]
 //!
-//! Part of #3517 composition soundness hardening.
+//! Part of the composition soundness hardening.
 
 use std::collections::HashMap;
 

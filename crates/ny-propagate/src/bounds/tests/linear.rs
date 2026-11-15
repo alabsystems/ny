@@ -715,7 +715,7 @@ fn test_concretize_l2_ball_nan_coefficients_fail_closed() {
 }
 
 /// concretize_checked should return Ok with sound results when dimensions match.
-/// #2239: concretize_checked now delegates to concretize_sound (directed rounding),
+/// concretize_checked now delegates to concretize_sound (directed rounding),
 /// so lower bounds may be 1 ULP below and upper bounds 1 ULP above exact values.
 #[ntest::timeout(5000)]
 #[test]
@@ -757,10 +757,21 @@ fn test_concretize_checked_dimension_mismatch() {
 }
 
 /// concretize_checked should agree with concretize_sound when dimensions match.
-/// #2239: concretize_checked now delegates to concretize_sound, not concretize.
-#[ntest::timeout(5000)]
+/// concretize_checked now delegates to concretize_sound, not concretize.
+///
+/// The wall is 300 s, not this file's usual 5 s: the body runs in
+/// microseconds, but it now holds the shared env lock, and a reader waits
+/// behind every queued writer (`std::sync::RwLock` is writer-preferring; see
+/// `docs/TEST_SUITE_ENV_LEAK_AND_MEASUREMENT_RETRACTION_2026-08-20.md` §2).
+#[ntest::timeout(300000)]
 #[test]
 fn test_concretize_checked_matches_concretize_sound() {
+    // Both calls admit through `cpu_crown_dense_budget_bytes`, which reads
+    // `NY_DENSE_BUDGET_MB`. Sibling fixtures set it to 0 under the env write
+    // lock; an unguarded read that overlaps one is refused and falls back to
+    // [-inf, +inf] (measured: checked lower [-inf, -inf] vs sound finite under
+    // --test-threads=4, 2026-10-04).
+    let _env = crate::tests::lock_env_shared();
     let lower_a = Array2::from_shape_vec((2, 3), vec![1.0, -0.5, 0.3, -0.2, 0.8, -0.1]).unwrap();
     let upper_a = Array2::from_shape_vec((2, 3), vec![1.2, -0.3, 0.5, 0.0, 1.0, 0.1]).unwrap();
     let bounds = LinearBounds {
@@ -847,7 +858,7 @@ fn test_concretize_sound_with_infinite_inputs() {
 /// concretize with NaN in input bounds should produce conservative bounds, not NaN.
 ///
 /// Matches BatchedLinearBounds::concretize behavior (via interval_mul_for_bounds)
-/// which returns (-inf, +inf) for NaN inputs. See #2210.
+/// which returns (-inf, +inf) for NaN inputs.
 #[ntest::timeout(5000)]
 #[test]
 fn test_concretize_nan_input_bounds_returns_conservative() {
@@ -861,7 +872,7 @@ fn test_concretize_nan_input_bounds_returns_conservative() {
     };
     // NaN in lower bound of first dimension.
     // Lower accumulator: la.max(0.0)*in_l[0] = 1.0*NaN → NaN → -inf in concretize_f64_inner.
-    // f64_to_bounded_tensor repair (#2287): when lower is non-finite (-inf),
+    // f64_to_bounded_tensor repair: when lower is non-finite (-inf),
     // the entire element is widened to [-inf, +inf] (sound conservative fallback).
     let input = unchecked_bounds(
         ArrayD::from_shape_vec(IxDyn(&[2]), vec![f32::NAN, 1.0]).unwrap(),
@@ -912,7 +923,7 @@ fn test_concretize_sound_nan_input_bounds_returns_conservative() {
         "concretize_sound should not produce NaN upper bound; got NaN"
     );
     // Upper accumulator poisoned by NaN → non-finite after inner computation.
-    // new_repaired(Widen) (#2287, #3423) widens the entire element to [-inf, +inf]
+    // new_repaired(Widen) widens the entire element to [-inf, +inf]
     // when either bound is non-finite (sound conservative fallback).
     assert_eq!(result.lower()[[0]], f32::NEG_INFINITY);
     assert_eq!(result.upper()[[0]], f32::INFINITY);
@@ -941,7 +952,7 @@ fn test_concretize_nan_bias_returns_conservative() {
         "concretize should not produce NaN lower bound from NaN bias; got NaN"
     );
     // Lower bias is NaN → lower accumulator poisoned → -inf in concretize_f64_inner.
-    // f64_to_bounded_tensor repair (#2287): non-finite lower triggers symmetric
+    // f64_to_bounded_tensor repair: non-finite lower triggers symmetric
     // widening of entire element to [-inf, +inf].
     assert_eq!(result.lower()[[0]], f32::NEG_INFINITY);
     assert!(!result.upper()[[0]].is_nan());
@@ -974,7 +985,6 @@ fn test_concretize_nan_both_input_bounds_returns_conservative() {
 }
 
 /// concretize with mismatched input dimension returns conservative bounds instead of panicking.
-/// Regression test for #2222.
 #[ntest::timeout(5000)]
 #[test]
 fn test_concretize_input_dimension_mismatch_returns_conservative() {
@@ -999,7 +1009,6 @@ fn test_concretize_input_dimension_mismatch_returns_conservative() {
 }
 
 /// concretize_sound with mismatched input dimension returns conservative bounds instead of panicking.
-/// Regression test for #2222.
 #[ntest::timeout(5000)]
 #[test]
 fn test_concretize_sound_input_dimension_mismatch_returns_conservative() {
@@ -1024,7 +1033,6 @@ fn test_concretize_sound_input_dimension_mismatch_returns_conservative() {
 }
 
 /// concretize with too many inputs also returns conservative bounds.
-/// Regression test for #2222.
 #[ntest::timeout(5000)]
 #[test]
 fn test_concretize_too_many_inputs_returns_conservative() {
@@ -1049,7 +1057,7 @@ fn test_concretize_too_many_inputs_returns_conservative() {
 
 /// `concretize_sound` with malformed internal shapes (lower_a/upper_a dimension
 /// mismatch) returns conservative `[-inf, +inf]` bounds instead of panicking.
-/// Regression test for #2222 — ensures `validate_internal_shapes` guard covers
+/// Regression test — ensures `validate_internal_shapes` guard covers
 /// the sound concretization path, not just `concretize`.
 #[ntest::timeout(5000)]
 #[test]
@@ -1102,7 +1110,7 @@ fn test_concretize_sound_too_many_inputs_returns_conservative() {
 /// produce a value higher than the upper bound coefficients for one output,
 /// simulating the numerical instability that causes CROWN backward to produce
 /// inversions. Verifies that concretize_sound repairs the inverted element
-/// to [-inf, +inf] while leaving valid elements intact (#2287).
+/// to [-inf, +inf] while leaving valid elements intact.
 #[ntest::timeout(5000)]
 #[test]
 fn test_concretize_sound_repairs_inversions() {
@@ -1248,7 +1256,7 @@ fn test_concretize_sound_fallbacks_never_claim_infeasibility() {
 
 /// NaN in A-matrix coefficients must produce conservative bounds, not silently zero.
 ///
-/// Regression test for #2415: Rust's `f32::max(NaN, 0.0) = 0.0` (IEEE 754-2008)
+/// Regression test: Rust's `f32::max(NaN, 0.0) = 0.0` (IEEE 754-2008)
 /// silently absorbed NaN coefficients into zero, dropping the neuron's contribution.
 /// The fix uses NaN-propagating max/min so NaN poisons the accumulator and triggers
 /// the NaN guard → conservative [-inf, +inf] bounds.
@@ -1289,7 +1297,7 @@ fn test_concretize_nan_a_matrix_coefficient_returns_conservative() {
 
 /// NaN in upper_a coefficient must also produce conservative bounds.
 ///
-/// Regression test for #2415 (upper path).
+/// Regression test (upper path).
 #[ntest::timeout(5000)]
 #[test]
 fn test_concretize_nan_upper_a_coefficient_returns_conservative() {
@@ -1351,7 +1359,7 @@ fn test_concretize_nan_coefficient_invalidates_entire_proof_object() {
     assert_eq!(result.lower()[[1]], f32::NEG_INFINITY);
     assert_eq!(result.upper()[[1]], f32::INFINITY);
 }
-/// #1932: concretize defense-in-depth — coefficients exceeding CROWN_COEFF_MAX
+/// Concretize defense-in-depth — coefficients exceeding CROWN_COEFF_MAX
 /// but below f32::MAX must produce conservative bounds for the affected row.
 ///
 /// This tests the *secondary* defense path in `concretize_f64_inner`:
@@ -1407,9 +1415,9 @@ fn test_concretize_large_coeff_exceeding_crown_coeff_max_1932() {
     );
 }
 
-/// #1932/#3202: When only upper_a exceeds CROWN_COEFF_MAX, the guard should
-/// degrade upper to +inf. KNOWN FAILURE until #3202 fix: dot-product write-back
-/// overwrites the infinity. This is defense-in-depth consistency (P2), not
+/// When only upper_a exceeds CROWN_COEFF_MAX, the guard should
+/// degrade upper to +inf, and the dot-product write-back must not overwrite
+/// the infinity. This is defense-in-depth consistency (P2), not
 /// direct soundness — f64 intermediates prevent overflow for sub-f32::MAX coefficients.
 #[ntest::timeout(5000)]
 #[test]
@@ -1445,7 +1453,7 @@ fn test_concretize_large_upper_coeff_degrade_1932() {
     );
 }
 
-/// #1932: concretize defense-in-depth — negative large coefficients also trigger guard.
+/// Concretize defense-in-depth — negative large coefficients also trigger guard.
 #[ntest::timeout(5000)]
 #[test]
 fn test_concretize_large_negative_coeff_triggers_guard_1932() {
@@ -1479,7 +1487,7 @@ fn test_concretize_large_negative_coeff_triggers_guard_1932() {
     );
 }
 
-/// #1932: concretize_sound also applies the CROWN_COEFF_MAX defense-in-depth.
+/// concretize_sound also applies the CROWN_COEFF_MAX defense-in-depth.
 /// Both lower_a and upper_a exceed threshold → both degrade.
 #[ntest::timeout(5000)]
 #[test]
@@ -1534,8 +1542,8 @@ fn test_exact_crown_transport_sentinel_is_never_a_coefficient() {
     }
 }
 
-// #2907 concretize panic-cliff tests moved to panic_cliff.rs
-// #2977 NaN validation tests moved to linear_validation.rs
+// Concretize panic-cliff tests are in panic_cliff.rs.
+// NaN validation tests are in linear_validation.rs.
 
 // --- new_or_conservative tests (moved from linear.rs inline module) ---
 
@@ -1627,7 +1635,7 @@ fn test_conservative_shape() {
     assert!(c.upper_b().iter().all(|v| *v == f32::INFINITY));
 }
 
-// --- new_repaired() tests (#3423 Step 2) ---
+// --- new_repaired() tests ---
 
 /// Conservative strategy: NaN coefficient → 0.0, finite preserved.
 #[ntest::timeout(5000)]
@@ -1811,7 +1819,7 @@ fn test_new_repaired_finite_passthrough() {
     }
 }
 
-/// Regression #2220 / #concretize-soundness-hardening: non-batched concretize_sound
+/// Regression #concretize-soundness-hardening: non-batched concretize_sound
 /// with n=4096 must contain the **f64-exact-product** reference under heavy
 /// cancellation. As of the soundness-hardening sweep the non-batched scalar path
 /// forms each per-term product in f64 (operands cast f32→f64, so f32×f32 products

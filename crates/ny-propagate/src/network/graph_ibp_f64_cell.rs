@@ -548,6 +548,7 @@ impl GraphNetwork {
     /// node. Fails closed (`UnsupportedOp`/`InvalidSpec`) on anything outside
     /// the supported op set — the caller must treat that as "cell undecided".
     pub fn propagate_ibp_f64_cell(&self, input: &Interval64) -> Result<Interval64> {
+        self.ensure_proof_eligible()?;
         require_f64_interval_proof_environment()?;
 
         // Restrict evaluation to ancestors of the output: dead branches (e.g.
@@ -587,6 +588,9 @@ impl GraphNetwork {
     /// conditions (e.g. a Div divisor interval containing zero for a specific
     /// box) can still fail an individual walk — always fail-closed on `Err`.
     pub fn supports_ibp_f64_cell(&self) -> bool {
+        if self.ensure_proof_eligible().is_err() {
+            return false;
+        }
         match self.output_ancestors() {
             Ok(needed) => needed.iter().all(|name| {
                 self.node(name)
@@ -613,6 +617,428 @@ impl GraphNetwork {
         }
         Ok(needed)
     }
+
+    /// #vit-bank-gate: sound f64 point walk for the CONTAINMENT FENCE ONLY.
+    ///
+    /// The same walk as [`Self::propagate_ibp_f64_cell`] (output ancestors in
+    /// execution order, fail-closed on anything unsupported), except that it
+    /// returns EVERY walked node's enclosure and additionally evaluates
+    /// `Softmax` and `ReduceMean`, which the cell's op set lacks and every
+    /// vit_2023 graph contains.
+    ///
+    /// Why a separate entry point and not two new `eval_node` arms: the cell
+    /// is PROOF AUTHORITY on several lanes (cell enumeration, the box-refine
+    /// f64 leaf escalation, the nn4sys scalar cover, the witness gates), each
+    /// gated on [`Self::supports_ibp_f64_cell`]. Widening that op set would
+    /// switch those lanes on for every Softmax model — a verdict-surface change
+    /// a fence has no business making. Here the two extra ops are dispatched
+    /// BEFORE `eval_node`, so `cell_supports_layer`, `eval_node` and every
+    /// proof caller stay byte-identical
+    /// (`f64_fence_walk_leaves_the_proof_cell_op_set_unchanged`).
+    ///
+    /// Soundness contract: identical to the cell's. Softmax uses the
+    /// libm-free certified exponential (`exp_neg_certified`) with outward
+    /// rounding on every difference, sum and reciprocal; ReduceMean is the
+    /// cell's Higham-widened ReduceSum followed by an outward-rounded division
+    /// by the exact element count. The consumer is downgrade-only: a defect
+    /// here can at worst refuse a correct proof, never mint one.
+    pub fn propagate_f64_fence_nodes(
+        &self,
+        input: &Interval64,
+    ) -> Result<HashMap<String, Interval64>> {
+        self.ensure_proof_eligible()?;
+        require_f64_interval_proof_environment()?;
+        let needed = self.output_ancestors()?;
+        let mut cache: HashMap<String, Interval64> = HashMap::new();
+        let exec_order = self.exec_order()?;
+        for node_name in exec_order {
+            if !needed.contains(node_name.as_str()) {
+                continue;
+            }
+            let node = self.node(node_name).ok_or_else(|| {
+                NyError::InvalidSpec(format!("f64 fence walk: missing node '{node_name}'"))
+            })?;
+            let out = {
+                let resolve = |name: &str| -> Result<Interval64> {
+                    if name == NETWORK_INPUT {
+                        return Ok(input.clone());
+                    }
+                    cache.get(name).cloned().ok_or_else(|| {
+                        NyError::InvalidSpec(format!("f64 fence walk: '{name}' not computed"))
+                    })
+                };
+                match node.layer() {
+                    Layer::Softmax(softmax) => {
+                        let inputs = node_inputs(node, &resolve)?;
+                        let x = inputs.first().ok_or_else(|| {
+                            NyError::InvalidSpec("f64 fence walk: Softmax has no input".to_string())
+                        })?;
+                        eval_softmax_fence(softmax, x)?
+                    }
+                    Layer::ReduceMean(reduce) => {
+                        let inputs = node_inputs(node, &resolve)?;
+                        let x = inputs.first().ok_or_else(|| {
+                            NyError::InvalidSpec(
+                                "f64 fence walk: ReduceMean has no input".to_string(),
+                            )
+                        })?;
+                        eval_reduce_mean_fence(reduce, x)?
+                    }
+                    // #softmax-fixed-index: the rewrite's two transcendental
+                    // ops. Dispatched here, not in `eval_node`, for the same
+                    // reason as Softmax: the PROOF cell's op set must not grow.
+                    // Without them the lane fence cannot evaluate a rewritten
+                    // vit graph and disarms (`no-evaluable-sample`).
+                    Layer::Exp(_) => {
+                        let inputs = node_inputs(node, &resolve)?;
+                        let x = inputs.first().ok_or_else(|| {
+                            NyError::InvalidSpec("f64 fence walk: Exp has no input".to_string())
+                        })?;
+                        eval_exp_fence(x)
+                    }
+                    Layer::Reciprocal(_) => {
+                        let inputs = node_inputs(node, &resolve)?;
+                        let x = inputs.first().ok_or_else(|| {
+                            NyError::InvalidSpec(
+                                "f64 fence walk: Reciprocal has no input".to_string(),
+                            )
+                        })?;
+                        eval_reciprocal_fence(x)
+                    }
+                    // vit lowers every var x var attention product to
+                    // `BilinearCrown` (ny-build convert/matmul.rs). Its FORWARD
+                    // semantics are exactly a MatMul with the same `transpose_b`
+                    // and `scale` (only the CROWN relaxation differs), so the
+                    // fence evaluates it through the cell's own MatMul kernels —
+                    // fence-only, the proof cell's op set does not grow. Without
+                    // this arm the fence could not walk vit at all (int/wave3
+                    // gate, 2026-09-25: `unsupported layer BilinearCrown`).
+                    Layer::BilinearCrown(bilinear) => {
+                        let inputs = node_inputs(node, &resolve)?;
+                        let as_matmul = crate::layers::MatMulLayer::try_new(
+                            bilinear.transpose_b,
+                            bilinear.scale,
+                        )?;
+                        match (inputs.first(), inputs.get(1)) {
+                            (Some(a), Some(b)) if a.shape().len() > 2 || b.shape().len() > 2 => {
+                                eval_matmul_batched_fence(&as_matmul, a, b)?
+                            }
+                            (Some(a), Some(b)) => eval_matmul(&as_matmul, a, b)?,
+                            _ => {
+                                return Err(NyError::InvalidSpec(
+                                    "f64 fence walk: BilinearCrown needs two inputs".to_string(),
+                                ))
+                            }
+                        }
+                    }
+                    // Attention products are rank-3 ([heads, tokens, dim]); the
+                    // cell's MatMul is rank-2 only and fails closed on them.
+                    Layer::MatMul(matmul) => {
+                        let inputs = node_inputs(node, &resolve)?;
+                        match (inputs.first(), inputs.get(1)) {
+                            (Some(a), Some(b)) if a.shape().len() > 2 || b.shape().len() > 2 => {
+                                eval_matmul_batched_fence(matmul, a, b)?
+                            }
+                            _ => eval_node(node.layer(), node, &resolve)?,
+                        }
+                    }
+                    layer => eval_node(layer, node, &resolve)?,
+                }
+            };
+            cache.insert(node_name.clone(), out);
+        }
+        if !cache.contains_key(self.output_name()) {
+            return Err(NyError::InvalidSpec(
+                "f64 fence walk: output node not computed".to_string(),
+            ));
+        }
+        Ok(cache)
+    }
+}
+
+/// #vit-bank-gate: rigorous enclosure of `exp(t)` for one binary64 `t`,
+/// TOTAL over every input (the fence walk must not panic).
+///
+/// Built only from [`exp_neg_certified`], so no platform-libm accuracy
+/// assumption enters. For `t > 0`, `exp(t) = 1 / exp(-t)` with the reciprocal
+/// rounded outward; `exp_neg_certified` never returns a zero upper endpoint, so
+/// the lower reciprocal is finite or a (valid) `f64::MAX`.
+///
+/// Non-finite inputs only arise from an overflowed outward-rounded difference
+/// and are mapped to enclosures valid for ANY real they could stand for:
+/// `-inf` -> `[0, min_subnormal]`, `+inf` -> `[f64::MAX, +inf]`, NaN ->
+/// `[0, +inf]`.
+pub(crate) fn exp_certified_total(t: f64) -> (f64, f64) {
+    if t.is_nan() {
+        return (0.0, f64::INFINITY);
+    }
+    if t == f64::NEG_INFINITY {
+        return (0.0, f64::from_bits(1));
+    }
+    if t == f64::INFINITY {
+        return (f64::MAX, f64::INFINITY);
+    }
+    if t <= 0.0 {
+        // Exact negation; `-t >= 0` as `exp_neg_certified` requires.
+        return exp_neg_certified(-t);
+    }
+    let (neg_lower, neg_upper) = exp_neg_certified(t);
+    // exp(-t) is in [neg_lower, neg_upper] with neg_upper > 0.
+    let lower = (1.0 / neg_upper).next_down();
+    let upper = if neg_lower > 0.0 {
+        (1.0 / neg_lower).next_up()
+    } else {
+        f64::INFINITY
+    };
+    (if lower > 0.0 { lower } else { 0.0 }, upper)
+}
+
+/// #vit-bank-gate: sound enclosure of one softmax lane.
+///
+/// softmax_i(x) = 1 / (1 + sum_{j != i} exp(x_j - x_i)) is increasing in x_i
+/// and decreasing in every x_j, so over the box its exact range is
+/// `[1 / (1 + sum exp(u_j - l_i)), 1 / (1 + sum exp(l_j - u_i))]`. Every
+/// difference is rounded outward (`next_up` for the upper argument,
+/// `next_down` for the lower one), every exponential comes from
+/// [`exp_certified_total`], every partial sum is rounded in its own direction,
+/// and the two reciprocals are rounded outward. The exact denominators are at
+/// least 1, which floors the downward one, and the result is clipped to
+/// `[0, 1]`, the range of every softmax coordinate.
+fn softmax_lane_fence(
+    lower: ndarray::ArrayView1<'_, f64>,
+    upper: ndarray::ArrayView1<'_, f64>,
+    mut out_lower: ndarray::ArrayViewMut1<'_, f64>,
+    mut out_upper: ndarray::ArrayViewMut1<'_, f64>,
+) {
+    let n = lower.len();
+    for i in 0..n {
+        let mut denominator_up = 1.0_f64;
+        let mut denominator_down = 1.0_f64;
+        for j in 0..n {
+            if j == i {
+                continue;
+            }
+            let difference_up = (upper[j] - lower[i]).next_up();
+            let difference_down = (lower[j] - upper[i]).next_down();
+            denominator_up = (denominator_up + exp_certified_total(difference_up).1).next_up();
+            denominator_down =
+                (denominator_down + exp_certified_total(difference_down).0).next_down();
+        }
+        if denominator_down < 1.0 {
+            denominator_down = 1.0;
+        }
+        let low = (1.0 / denominator_up).next_down();
+        let high = (1.0 / denominator_down).next_up();
+        out_lower[i] = if low > 0.0 { low } else { 0.0 };
+        out_upper[i] = if high < 1.0 { high } else { 1.0 };
+    }
+}
+
+/// #softmax-fixed-index: fence-only elementwise `exp`. Monotone increasing,
+/// so the enclosure is `[exp(l), exp(u)]` with each end taken from
+/// [`exp_certified_total`] in its own direction — no platform-libm accuracy
+/// assumption, and total over every f64 (`±inf`, NaN).
+fn eval_exp_fence(x: &Interval64) -> Interval64 {
+    Interval64 {
+        lower: x.lower.mapv(|l| exp_certified_total(l).0),
+        upper: x.upper.mapv(|u| exp_certified_total(u).1),
+    }
+}
+
+/// #softmax-fixed-index: fence-only elementwise `1/x`. On an interval of one
+/// strict sign `1/x` is decreasing, so the enclosure is `[1/u, 1/l]`: each IEEE
+/// quotient is correctly rounded, then stepped one ulp outward. An interval
+/// that reaches zero (or carries a NaN end) maps to the whole line, which is
+/// valid for any real it could stand for; a fence that cannot bound a
+/// coordinate can only refuse, never mint.
+fn eval_reciprocal_fence(x: &Interval64) -> Interval64 {
+    let mut lower = x.lower.clone();
+    let mut upper = x.upper.clone();
+    ndarray::Zip::from(&mut lower)
+        .and(&mut upper)
+        .and(&x.lower)
+        .and(&x.upper)
+        .for_each(|out_lower, out_upper, &l, &u| {
+            let one_sign = !l.is_nan() && !u.is_nan() && (l > 0.0 || u < 0.0);
+            let (lo, hi) = if one_sign {
+                ((1.0 / u).next_down(), (1.0 / l).next_up())
+            } else {
+                (f64::NEG_INFINITY, f64::INFINITY)
+            };
+            *out_lower = lo;
+            *out_upper = hi;
+        });
+    Interval64 { lower, upper }
+}
+
+/// #vit-bank-gate: fence-only Softmax (see [`softmax_lane_fence`]). A
+/// non-finite input endpoint fails closed: the fence then reports the walk as
+/// inconclusive rather than comparing against a vacuous `[0, 1]`.
+fn eval_softmax_fence(softmax: &crate::layers::SoftmaxLayer, x: &Interval64) -> Result<Interval64> {
+    let ndim = x.shape().len();
+    if ndim == 0 {
+        return Err(NyError::InvalidSpec(
+            "f64 fence walk: Softmax on a rank-0 tensor".to_string(),
+        ));
+    }
+    let axis = resolve_axis_i64(i64::from(softmax.axis), ndim, "Softmax")?;
+    if x.lower
+        .iter()
+        .chain(x.upper.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err(NyError::InvalidSpec(
+            "f64 fence walk: Softmax input carries a non-finite endpoint".to_string(),
+        ));
+    }
+    let mut lower = x.lower.clone();
+    let mut upper = x.upper.clone();
+    ndarray::Zip::from(lower.lanes_mut(ndarray::Axis(axis)))
+        .and(upper.lanes_mut(ndarray::Axis(axis)))
+        .and(x.lower.lanes(ndarray::Axis(axis)))
+        .and(x.upper.lanes(ndarray::Axis(axis)))
+        .for_each(|out_lower, out_upper, in_lower, in_upper| {
+            softmax_lane_fence(in_lower, in_upper, out_lower, out_upper);
+        });
+    Ok(Interval64 { lower, upper })
+}
+
+/// #vit-bank-gate: fence-only ReduceMean = the cell's Higham-widened
+/// [`eval_reduce_sum`] over the same axes/keepdims, then an outward-rounded
+/// division by the exact element count (an integer below 2^53, so exact in
+/// binary64). Empty `axes` reduces every axis, as `ReduceMeanLayer` does.
+fn eval_reduce_mean_fence(
+    reduce: &crate::layers::ReduceMeanLayer,
+    x: &Interval64,
+) -> Result<Interval64> {
+    let ndim = x.shape().len();
+    let axes: Vec<usize> = if reduce.axes.is_empty() {
+        (0..ndim).collect()
+    } else {
+        reduce
+            .axes
+            .iter()
+            .map(|&axis| resolve_axis_i64(axis, ndim, "ReduceMean"))
+            .collect::<Result<Vec<_>>>()?
+    };
+    let mut count: usize = 1;
+    for &axis in &axes {
+        count = count.checked_mul(x.shape()[axis]).ok_or_else(|| {
+            NyError::InvalidSpec("f64 fence walk: ReduceMean element count overflow".to_string())
+        })?;
+    }
+    if count == 0 || (count as u64) > (1_u64 << 53) {
+        return Err(NyError::InvalidSpec(format!(
+            "f64 fence walk: ReduceMean element count {count} is not a positive exact binary64 integer"
+        )));
+    }
+    let sum_layer = crate::layers::ReduceSumLayer::new(reduce.axes.clone(), reduce.keepdims);
+    let sum = eval_reduce_sum(&sum_layer, x)?;
+    let divisor = count as f64;
+    Ok(Interval64 {
+        lower: sum.lower.mapv(|value| (value / divisor).next_down()),
+        upper: sum.upper.mapv(|value| (value / divisor).next_up()),
+    })
+}
+
+/// #vit-bank-gate: split a rank >= 2 interval into its trailing 2-D matrices,
+/// in logical (row-major) order — the leading axes are outermost, so each
+/// matrix is one contiguous block of `rows * cols` elements.
+fn split_trailing_matrices(x: &Interval64) -> Result<Vec<Interval64>> {
+    let rank = x.shape().len();
+    if rank < 2 {
+        return Err(NyError::UnsupportedOp(format!(
+            "f64 fence walk: batched MatMul operand of rank {rank}"
+        )));
+    }
+    let (rows, cols) = (x.shape()[rank - 2], x.shape()[rank - 1]);
+    let count: usize = x.shape()[..rank - 2].iter().product();
+    let per = rows.checked_mul(cols).ok_or_else(|| {
+        NyError::InvalidSpec("f64 fence walk: batched MatMul size overflow".to_string())
+    })?;
+    let lower: Vec<f64> = x.lower.iter().copied().collect();
+    let upper: Vec<f64> = x.upper.iter().copied().collect();
+    let mut out = Vec::with_capacity(count);
+    for slice in 0..count {
+        let span = slice * per..(slice + 1) * per;
+        let matrix = |values: &[f64]| {
+            ArrayD::from_shape_vec(IxDyn(&[rows, cols]), values[span.clone()].to_vec())
+                .map_err(|e| NyError::InvalidSpec(format!("f64 fence walk: matrix split: {e}")))
+        };
+        out.push(Interval64 {
+            lower: matrix(lower.as_slice())?,
+            upper: matrix(upper.as_slice())?,
+        });
+    }
+    Ok(out)
+}
+
+/// #vit-bank-gate: fence-only batched MatMul. Operands of rank >= 3 with
+/// IDENTICAL leading (batch) axes, or one rank-2 operand broadcast across the
+/// other's batch; anything else fails closed. Every batch slice is the cell's
+/// own [`eval_matmul_scalar`] (Higham-widened, honouring the layer's
+/// `transpose_b` and `scale`), so the enclosure argument is the cell's, slice
+/// by slice; the slices are only re-stacked.
+fn eval_matmul_batched_fence(
+    layer: &crate::layers::MatMulLayer,
+    a: &Interval64,
+    b: &Interval64,
+) -> Result<Interval64> {
+    let (rank_a, rank_b) = (a.shape().len(), b.shape().len());
+    if rank_a < 2 || rank_b < 2 {
+        return Err(NyError::UnsupportedOp(format!(
+            "f64 fence walk: batched MatMul needs rank >= 2 operands (got {:?} x {:?})",
+            a.shape(),
+            b.shape()
+        )));
+    }
+    let batch_a = &a.shape()[..rank_a - 2];
+    let batch_b = &b.shape()[..rank_b - 2];
+    let batch: Vec<usize> = if batch_a == batch_b || batch_b.is_empty() {
+        batch_a.to_vec()
+    } else if batch_a.is_empty() {
+        batch_b.to_vec()
+    } else {
+        return Err(NyError::UnsupportedOp(format!(
+            "f64 fence walk: batched MatMul batch axes differ ({:?} x {:?})",
+            a.shape(),
+            b.shape()
+        )));
+    };
+    let a_slices = split_trailing_matrices(a)?;
+    let b_slices = split_trailing_matrices(b)?;
+    let count: usize = batch.iter().product();
+    let mut lower: Vec<f64> = Vec::new();
+    let mut upper: Vec<f64> = Vec::new();
+    let mut matrix_shape: Option<Vec<usize>> = None;
+    for slice in 0..count {
+        let a_slice = a_slices
+            .get(if a_slices.len() == 1 { 0 } else { slice })
+            .ok_or_else(|| {
+                NyError::InvalidSpec("f64 fence walk: batched MatMul slice missing".to_string())
+            })?;
+        let b_slice = b_slices
+            .get(if b_slices.len() == 1 { 0 } else { slice })
+            .ok_or_else(|| {
+                NyError::InvalidSpec("f64 fence walk: batched MatMul slice missing".to_string())
+            })?;
+        let product = eval_matmul_scalar(layer, a_slice, b_slice)?;
+        if matrix_shape.is_none() {
+            matrix_shape = Some(product.shape().to_vec());
+        }
+        lower.extend(product.lower.iter().copied());
+        upper.extend(product.upper.iter().copied());
+    }
+    let mut shape = batch;
+    shape.extend(matrix_shape.unwrap_or_else(|| vec![0, 0]));
+    Ok(Interval64 {
+        lower: ArrayD::from_shape_vec(IxDyn(&shape), lower).map_err(|e| {
+            NyError::InvalidSpec(format!("f64 fence walk: batched MatMul out: {e}"))
+        })?,
+        upper: ArrayD::from_shape_vec(IxDyn(&shape), upper).map_err(|e| {
+            NyError::InvalidSpec(format!("f64 fence walk: batched MatMul out: {e}"))
+        })?,
+    })
 }
 
 /// Resolve this node's inputs in ONNX order (interleaving Concat constants).
@@ -774,12 +1200,13 @@ pub(super) fn eval_node(
         }
         Layer::Transpose(transpose) => {
             let x = unary()?;
-            if transpose.axes.len() != x.shape().len() {
-                return Err(NyError::InvalidSpec(
-                    "f64 cell eval: Transpose perm rank mismatch".to_string(),
-                ));
-            }
-            let perm = transpose.axes.clone();
+            // The SAME resolution the proof path uses: a perm authored for the batched
+            // rank (vit's 4-D attention Transposes) arrives at an unbatched tensor, and an
+            // empty perm means swap-last-two. A raw length check refused every such node
+            // and left the fence unable to walk vit at all (int/wave2 gate, 2026-09-25).
+            let perm = transpose.resolve_perm(x.shape().len()).map_err(|_| {
+                NyError::InvalidSpec("f64 cell eval: Transpose perm rank mismatch".to_string())
+            })?;
             Ok(Interval64 {
                 lower: x
                     .lower
@@ -795,7 +1222,7 @@ pub(super) fn eval_node(
                     .to_owned(),
             })
         }
-        Layer::Gather(gather) => eval_gather(gather, unary()?),
+        Layer::Gather(gather) => eval_gather(gather, unary()?, inputs.get(1)),
         Layer::Concat(concat) => eval_concat(concat, &inputs),
         Layer::Resize(resize) => eval_resize(resize, unary()?),
         Layer::MaxPool2d(pool) => eval_maxpool(pool, unary()?),
@@ -975,10 +1402,55 @@ fn resolve_axis_i64(axis: i64, ndim: usize, op: &str) -> Result<usize> {
     Ok(resolved as usize)
 }
 
-fn eval_gather(gather: &crate::layers::GatherLayer, x: &Interval64) -> Result<Interval64> {
-    let indices = gather.constant_indices().ok_or_else(|| {
-        NyError::UnsupportedOp("f64 cell eval: Gather requires constant indices".to_string())
-    })?;
+/// Exact integer indices carried by a per-cell interval, if it has any.
+///
+/// #cell-gather-runtime-indices: inside a cell the enumerated free dims are
+/// PINNED to concrete integers, so a "runtime" index tensor is frequently a
+/// degenerate interval holding an exact integral value. When it is, the
+/// selection it describes is deterministic and the gather is exact, so the
+/// historical `constant_indices()`-only refusal was a conservative guard from
+/// before per-cell evaluation existed rather than a soundness requirement.
+///
+/// The condition is checked, never assumed: every element must satisfy
+/// `lower == upper` (the value cannot vary within the cell) AND be integral
+/// (`fract() == 0`, so it names a row rather than a point between rows) and
+/// finite. Anything else returns `None` and the caller's original refusal
+/// stands verbatim — this is strictly an ADDITIONAL way to succeed.
+fn exact_integer_indices(interval: &Interval64) -> Option<ArrayD<i64>> {
+    let lower = &interval.lower;
+    let upper = &interval.upper;
+    if lower.shape() != upper.shape() {
+        return None;
+    }
+    let mut out = ArrayD::<i64>::zeros(lower.raw_dim());
+    for ((slot, &lo), &hi) in out.iter_mut().zip(lower.iter()).zip(upper.iter()) {
+        if !lo.is_finite() || lo != hi || lo.fract() != 0.0 {
+            return None;
+        }
+        *slot = lo as i64;
+    }
+    Some(out)
+}
+
+fn eval_gather(
+    gather: &crate::layers::GatherLayer,
+    x: &Interval64,
+    runtime_indices: Option<&Interval64>,
+) -> Result<Interval64> {
+    let derived = gather
+        .constant_indices()
+        .is_none()
+        .then(|| runtime_indices.and_then(exact_integer_indices))
+        .flatten();
+    let indices = match (gather.constant_indices(), derived.as_ref()) {
+        (Some(authored), _) => authored,
+        (None, Some(exact)) => exact,
+        (None, None) => {
+            return Err(NyError::UnsupportedOp(
+                "f64 cell eval: Gather requires constant indices".to_string(),
+            ))
+        }
+    };
     let axis = resolve_axis_i64(gather.axis_raw(), x.shape().len(), "Gather")?;
     let axis_len = x.shape()[axis] as i64;
     // Output shape: data[..axis] ++ indices.shape ++ data[axis+1..]
@@ -3864,5 +4336,446 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #cell-gather-runtime-indices: a per-cell index tensor that is a POINT
+    /// with integral values names an exact selection, so the gather is
+    /// deterministic and must evaluate.
+    #[test]
+    fn exact_integer_indices_accepts_a_point_integral_interval() {
+        let v = ArrayD::from_shape_vec(IxDyn(&[3]), vec![0.0_f64, 2.0, 1.0]).unwrap();
+        let interval = Interval64 {
+            lower: v.clone(),
+            upper: v,
+        };
+        let got = exact_integer_indices(&interval).expect("point-integral indices are exact");
+        assert_eq!(got.into_raw_vec_and_offset().0, vec![0_i64, 2, 1]);
+    }
+
+    /// The guard that keeps this sound: an index that still VARIES inside the
+    /// cell names no single row, so it must keep refusing.
+    #[test]
+    fn exact_integer_indices_refuses_a_non_degenerate_interval() {
+        let interval = Interval64 {
+            lower: ArrayD::from_shape_vec(IxDyn(&[2]), vec![0.0_f64, 1.0]).unwrap(),
+            upper: ArrayD::from_shape_vec(IxDyn(&[2]), vec![0.0_f64, 2.0]).unwrap(),
+        };
+        assert!(
+            exact_integer_indices(&interval).is_none(),
+            "an index that varies within the cell must not be used as an exact selection"
+        );
+    }
+
+    /// A pinned but FRACTIONAL value sits between rows and names no index.
+    #[test]
+    fn exact_integer_indices_refuses_a_fractional_point() {
+        let v = ArrayD::from_shape_vec(IxDyn(&[2]), vec![0.0_f64, 1.5]).unwrap();
+        let interval = Interval64 {
+            lower: v.clone(),
+            upper: v,
+        };
+        assert!(
+            exact_integer_indices(&interval).is_none(),
+            "a fractional pinned index names no row and must refuse"
+        );
+    }
+
+    /// Non-finite endpoints can never name a row.
+    #[test]
+    fn exact_integer_indices_refuses_non_finite() {
+        let v = ArrayD::from_shape_vec(IxDyn(&[1]), vec![f64::INFINITY]).unwrap();
+        let interval = Interval64 {
+            lower: v.clone(),
+            upper: v,
+        };
+        assert!(exact_integer_indices(&interval).is_none());
+    }
+
+    // ---- #vit-bank-gate: the fence-only walk ---------------------------------
+
+    fn fence_softmax_graph(axis: i32) -> GraphNetwork {
+        let mut g = GraphNetwork::new();
+        g.add_node(GraphNode::from_input(
+            "sm",
+            Layer::Softmax(crate::layers::SoftmaxLayer::new(axis)),
+        ));
+        g.set_output("sm");
+        g
+    }
+
+    /// Plain libm softmax: a concrete ORACLE only, with no proof authority
+    /// (Rust does not specify the platform `exp` error), hence the 1e-14
+    /// slack in the comparisons below.
+    fn libm_softmax(x: &[f64]) -> Vec<f64> {
+        let max = x.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let e: Vec<f64> = x.iter().map(|v| (v - max).exp()).collect();
+        let sum: f64 = e.iter().sum();
+        e.iter().map(|v| v / sum).collect()
+    }
+
+    /// ENCLOSURE + TIGHTNESS: the fence Softmax contains the concrete softmax
+    /// at a point (and is point-tight), and contains every sampled forward of
+    /// a box.
+    #[test]
+    fn f64_fence_softmax_encloses_point_and_box_forwards() {
+        let g = fence_softmax_graph(-1);
+        let logits = [0.3_f64, -1.7, 2.25, 0.0, 5.5];
+        let point =
+            Interval64::point(ArrayD::from_shape_vec(IxDyn(&[5]), logits.to_vec()).unwrap());
+        let walk = g.propagate_f64_fence_nodes(&point).expect("fence walk");
+        let out = &walk["sm"];
+        let oracle = libm_softmax(&logits);
+        for i in 0..5 {
+            let (lo, hi) = (out.lower[[i]], out.upper[[i]]);
+            assert!(lo <= hi, "coordinate {i}: inverted enclosure");
+            assert!(
+                lo - 1e-14 <= oracle[i] && oracle[i] <= hi + 1e-14,
+                "coordinate {i}: [{lo}, {hi}] excludes the concrete softmax {}",
+                oracle[i]
+            );
+            assert!(
+                hi - lo < 1e-12,
+                "coordinate {i}: a POINT softmax enclosure must be tight, got [{lo}, {hi}]"
+            );
+        }
+
+        let lo = [-0.5_f64, 0.25, -2.0];
+        let hi = [0.75_f64, 1.5, 0.5];
+        let boxed = Interval64 {
+            lower: arr1(&lo).into_dyn(),
+            upper: arr1(&hi).into_dyn(),
+        };
+        let walk = g.propagate_f64_fence_nodes(&boxed).expect("fence walk");
+        let out = &walk["sm"];
+        for i in 0..3 {
+            assert!(0.0 <= out.lower[[i]] && out.lower[[i]] <= out.upper[[i]]);
+            assert!(out.upper[[i]] <= 1.0);
+        }
+        for s in 0..64_usize {
+            let t = [
+                (s % 4) as f64 / 3.0,
+                ((s / 4) % 4) as f64 / 3.0,
+                ((s / 16) % 4) as f64 / 3.0,
+            ];
+            let x: Vec<f64> = (0..3).map(|k| lo[k] + t[k] * (hi[k] - lo[k])).collect();
+            let y = libm_softmax(&x);
+            for i in 0..3 {
+                assert!(
+                    out.lower[[i]] - 1e-14 <= y[i] && y[i] <= out.upper[[i]] + 1e-14,
+                    "sample {s} coordinate {i}: {} outside [{}, {}]",
+                    y[i],
+                    out.lower[[i]],
+                    out.upper[[i]]
+                );
+            }
+        }
+    }
+
+    /// The axis is honoured on a rank-2 tensor: axis 0 normalises columns,
+    /// axis -1 normalises rows.
+    #[test]
+    fn f64_fence_softmax_respects_the_axis() {
+        let values = vec![0.1_f64, 0.2, 0.3, 1.0, -1.0, 0.5];
+        let x = Interval64::point(ArrayD::from_shape_vec(IxDyn(&[2, 3]), values.clone()).unwrap());
+
+        let rows = fence_softmax_graph(-1)
+            .propagate_f64_fence_nodes(&x)
+            .expect("fence walk");
+        for r in 0..2 {
+            let oracle = libm_softmax(&values[r * 3..r * 3 + 3]);
+            for c in 0..3 {
+                let (lo, hi) = (rows["sm"].lower[[r, c]], rows["sm"].upper[[r, c]]);
+                assert!(lo - 1e-14 <= oracle[c] && oracle[c] <= hi + 1e-14);
+            }
+        }
+
+        let columns = fence_softmax_graph(0)
+            .propagate_f64_fence_nodes(&x)
+            .expect("fence walk");
+        for c in 0..3 {
+            let oracle = libm_softmax(&[values[c], values[3 + c]]);
+            for r in 0..2 {
+                let (lo, hi) = (columns["sm"].lower[[r, c]], columns["sm"].upper[[r, c]]);
+                assert!(lo - 1e-14 <= oracle[r] && oracle[r] <= hi + 1e-14);
+            }
+        }
+    }
+
+    /// TOTALITY: logits far outside exp's finite range produce finite,
+    /// ordered, [0,1]-clipped enclosures (no NaN, no panic), and the dominant
+    /// coordinate is still certified near 1.
+    #[test]
+    fn f64_fence_softmax_is_total_on_extreme_logits() {
+        let g = fence_softmax_graph(-1);
+        let logits = [900.0_f64, -900.0, 0.0, 1.0e-300];
+        let point =
+            Interval64::point(ArrayD::from_shape_vec(IxDyn(&[4]), logits.to_vec()).unwrap());
+        let walk = g.propagate_f64_fence_nodes(&point).expect("fence walk");
+        let out = &walk["sm"];
+        for i in 0..4 {
+            let (lo, hi) = (out.lower[[i]], out.upper[[i]]);
+            assert!(lo.is_finite() && hi.is_finite());
+            assert!(
+                0.0 <= lo && lo <= hi && hi <= 1.0,
+                "coordinate {i}: [{lo}, {hi}]"
+            );
+        }
+        assert!(
+            out.lower[[0]] > 0.999_999,
+            "dominant logit: {}",
+            out.lower[[0]]
+        );
+        assert!(
+            out.upper[[1]] < 1.0e-300,
+            "dominated logit: {}",
+            out.upper[[1]]
+        );
+    }
+
+    /// ReduceMean encloses the EXACT mean (dyadic inputs make it exactly
+    /// representable) and is point-tight.
+    #[test]
+    fn f64_fence_reduce_mean_encloses_the_exact_mean() {
+        let mut g = GraphNetwork::new();
+        g.add_node(GraphNode::from_input(
+            "mean",
+            Layer::ReduceMean(crate::layers::ReduceMeanLayer::new(vec![-1], false)),
+        ));
+        g.set_output("mean");
+        let values = vec![0.5_f64, 0.25, -1.0, 3.0, 1.5, 2.5, -0.75, 0.125];
+        let x = Interval64::point(ArrayD::from_shape_vec(IxDyn(&[2, 4]), values).unwrap());
+        let walk = g.propagate_f64_fence_nodes(&x).expect("fence walk");
+        let out = &walk["mean"];
+        assert_eq!(out.lower.shape(), &[2]);
+        let exact = [0.6875_f64, 0.84375];
+        for r in 0..2 {
+            assert!(out.lower[[r]] <= exact[r] && exact[r] <= out.upper[[r]]);
+            assert!(out.upper[[r]] - out.lower[[r]] < 1e-12);
+        }
+    }
+
+    /// #softmax-fixed-index: the fence `exp` and `1/x` enclose the concrete
+    /// value at points and across boxes, and `1/x` over an interval that
+    /// reaches zero is the whole line.
+    #[test]
+    fn f64_fence_exp_and_reciprocal_enclose_points_and_boxes() {
+        let lo = arr1(&[-3.0_f64, -0.5, 0.0, 1.25, 20.0]).into_dyn();
+        let hi = arr1(&[-2.0_f64, 0.5, 0.0, 2.0, 21.0]).into_dyn();
+        let exp = eval_exp_fence(&Interval64 {
+            lower: lo.clone(),
+            upper: hi.clone(),
+        });
+        for i in 0..5 {
+            assert!(exp.lower[[i]] <= exp.upper[[i]], "coordinate {i}: inverted");
+            for t in [0.0_f64, 0.25, 0.5, 0.75, 1.0] {
+                let x = lo[[i]] + t * (hi[[i]] - lo[[i]]);
+                // libm is an ORACLE only (no proof authority), hence the slack.
+                let y = x.exp();
+                assert!(
+                    exp.lower[[i]] <= y * (1.0 + 1e-14) && y * (1.0 - 1e-14) <= exp.upper[[i]],
+                    "coordinate {i}: exp({x}) = {y} outside [{}, {}]",
+                    exp.lower[[i]],
+                    exp.upper[[i]]
+                );
+            }
+        }
+        assert!(exp.lower[[2]] <= 1.0 && 1.0 <= exp.upper[[2]]);
+        assert!(
+            exp.upper[[2]] - exp.lower[[2]] < 1e-12,
+            "exp(0) must stay tight"
+        );
+
+        let rlo = arr1(&[1.0_f64, 0.5, -4.0, -1.0, 0.0]).into_dyn();
+        let rhi = arr1(&[1.0_f64, 3.0, -0.25, 1.0, 2.0]).into_dyn();
+        let recip = eval_reciprocal_fence(&Interval64 {
+            lower: rlo,
+            upper: rhi,
+        });
+        assert!(recip.lower[[0]] <= 1.0 && 1.0 <= recip.upper[[0]]);
+        assert!(recip.upper[[0]] - recip.lower[[0]] < 1e-15);
+        for x in [0.5_f64, 1.0, 2.0, 3.0] {
+            assert!(recip.lower[[1]] <= 1.0 / x && 1.0 / x <= recip.upper[[1]]);
+        }
+        for x in [-4.0_f64, -1.0, -0.25] {
+            assert!(recip.lower[[2]] <= 1.0 / x && 1.0 / x <= recip.upper[[2]]);
+        }
+        for i in [3, 4] {
+            assert_eq!(
+                (recip.lower[[i]], recip.upper[[i]]),
+                (f64::NEG_INFINITY, f64::INFINITY),
+                "coordinate {i}: an interval reaching zero must map to the whole line"
+            );
+        }
+    }
+
+    /// #softmax-fixed-index: the lane fence can walk a REWRITTEN softmax graph
+    /// (Exp and Reciprocal included) and the walk contains the concrete
+    /// softmax, point-tight; the PROOF cell still refuses that graph.
+    #[test]
+    fn f64_fence_walk_evaluates_the_fixed_index_softmax_rewrite() {
+        let mut g = fence_softmax_graph(-1);
+        let centre = [0.3_f32, -1.7, 2.25, 0.0, 1.0, 0.5, -0.5, 2.0];
+        let input = ny_tensor::BoundedTensor::new(
+            ArrayD::from_shape_vec(IxDyn(&[2, 4]), centre.iter().map(|c| c - 0.25).collect())
+                .unwrap(),
+            ArrayD::from_shape_vec(IxDyn(&[2, 4]), centre.iter().map(|c| c + 0.25).collect())
+                .unwrap(),
+        )
+        .unwrap();
+        let report = g
+            .decompose_softmax_complex_fixed_index(&input)
+            .expect("fixed-index rewrite");
+        assert_eq!(report.decomposed.len(), 1);
+        assert!(
+            !g.supports_ibp_f64_cell(),
+            "Exp/Reciprocal must stay OUTSIDE the proof cell's op set"
+        );
+        for s in 0..16_usize {
+            let x: Vec<f64> = centre
+                .iter()
+                .enumerate()
+                .map(|(k, &c)| f64::from(c) + 0.25 * (((s + k) % 5) as f64 / 2.0 - 1.0))
+                .collect();
+            let point =
+                Interval64::point(ArrayD::from_shape_vec(IxDyn(&[2, 4]), x.clone()).unwrap());
+            let walk = g
+                .propagate_f64_fence_nodes(&point)
+                .expect("the fence walk must evaluate the rewritten graph");
+            let out = &walk["sm"];
+            for r in 0..2 {
+                let y = libm_softmax(&x[r * 4..(r + 1) * 4]);
+                for (i, &value) in y.iter().enumerate() {
+                    let (lo, hi) = (out.lower[[r, i]], out.upper[[r, i]]);
+                    assert!(
+                        lo - 1e-14 <= value && value <= hi + 1e-14,
+                        "sample {s} row {r} coordinate {i}: softmax {value} outside [{lo}, {hi}]"
+                    );
+                    assert!(hi - lo < 1e-9, "a point walk must stay tight: [{lo}, {hi}]");
+                }
+            }
+        }
+    }
+
+    /// MOAT PIN: the fence walk must not widen the PROOF cell's op set.
+    /// `supports_ibp_f64_cell` gates cell enumeration, the box-refine f64
+    /// leaf escalation, the nn4sys scalar cover and the witness gates; a
+    /// Softmax/ReduceMean graph must stay outside it and the proof walk must
+    /// still fail closed, while only the fence walk evaluates them.
+    #[test]
+    fn f64_fence_walk_leaves_the_proof_cell_op_set_unchanged() {
+        let g = fence_softmax_graph(-1);
+        assert!(
+            !g.supports_ibp_f64_cell(),
+            "Softmax must stay OUTSIDE the proof cell's op set"
+        );
+        let point = Interval64::point(
+            ArrayD::from_shape_vec(IxDyn(&[3]), vec![0.0_f64, 1.0, 2.0]).unwrap(),
+        );
+        assert!(
+            g.propagate_ibp_f64_cell(&point).is_err(),
+            "the proof walk must still fail closed on Softmax"
+        );
+        assert!(g.propagate_f64_fence_nodes(&point).is_ok());
+
+        let mut mean = GraphNetwork::new();
+        mean.add_node(GraphNode::from_input(
+            "mean",
+            Layer::ReduceMean(crate::layers::ReduceMeanLayer::new(vec![], true)),
+        ));
+        mean.set_output("mean");
+        assert!(!mean.supports_ibp_f64_cell());
+        assert!(mean.propagate_ibp_f64_cell(&point).is_err());
+        assert!(mean.propagate_f64_fence_nodes(&point).is_ok());
+    }
+
+    /// On the cell's own op set the fence walk is BIT-IDENTICAL to the proof
+    /// walk (same `eval_node`), and it returns every walked node.
+    #[test]
+    fn f64_fence_walk_matches_the_cell_and_returns_every_node() {
+        let g = build_mscn_like_graph();
+        let x = box64([-0.5, 0.25, -1.0, 0.125], [0.75, 1.5, -0.25, 0.875]);
+        let cell = g.propagate_ibp_f64_cell(&x).expect("cell walk");
+        let walk = g.propagate_f64_fence_nodes(&x).expect("fence walk");
+        assert_eq!(cell.lower, walk["out"].lower);
+        assert_eq!(cell.upper, walk["out"].upper);
+        for name in [
+            "lin", "relu", "head", "mul", "add", "sum", "relu_sum", "denom", "div", "out",
+        ] {
+            assert!(walk.contains_key(name), "fence walk dropped node {name}");
+        }
+    }
+
+    /// Batched (rank-3) MatMul, the vit attention shape: every head's product
+    /// encloses the exact product on dyadic data, `transpose_b` is honoured per
+    /// head, a rank-2 operand broadcasts across the batch, mismatched batches
+    /// refuse, and the PROOF cell's rank-2 MatMul still refuses rank-3.
+    #[test]
+    fn f64_fence_batched_matmul_encloses_every_head() {
+        let a_vals: Vec<f64> = (0..12_i32).map(|v| f64::from(v) - 5.0).collect();
+        let b_vals: Vec<f64> = (0..12_i32).map(|v| 0.5 * f64::from(v) - 2.0).collect();
+        let a =
+            Interval64::point(ArrayD::from_shape_vec(IxDyn(&[2, 2, 3]), a_vals.clone()).unwrap());
+        let b =
+            Interval64::point(ArrayD::from_shape_vec(IxDyn(&[2, 3, 2]), b_vals.clone()).unwrap());
+        let plain = MatMulLayer::new(false, None);
+
+        let out = eval_matmul_batched_fence(&plain, &a, &b).expect("batched product");
+        assert_eq!(out.lower.shape(), &[2, 2, 2]);
+        for h in 0..2 {
+            for i in 0..2 {
+                for j in 0..2 {
+                    let exact: f64 = (0..3)
+                        .map(|k| a_vals[h * 6 + i * 3 + k] * b_vals[h * 6 + k * 2 + j])
+                        .sum();
+                    let (lo, hi) = (out.lower[[h, i, j]], out.upper[[h, i, j]]);
+                    assert!(
+                        lo <= exact && exact <= hi,
+                        "head {h} [{i},{j}]: {exact} outside [{lo},{hi}]"
+                    );
+                    assert!(hi - lo < 1e-9);
+                }
+            }
+        }
+
+        let gram = eval_matmul_batched_fence(&MatMulLayer::new(true, None), &a, &a)
+            .expect("batched product with transpose_b");
+        assert_eq!(gram.lower.shape(), &[2, 2, 2]);
+        for h in 0..2 {
+            for i in 0..2 {
+                for j in 0..2 {
+                    let exact: f64 = (0..3)
+                        .map(|k| a_vals[h * 6 + i * 3 + k] * a_vals[h * 6 + j * 3 + k])
+                        .sum();
+                    assert!(gram.lower[[h, i, j]] <= exact && exact <= gram.upper[[h, i, j]]);
+                }
+            }
+        }
+
+        let shared_b = Interval64::point(
+            ArrayD::from_shape_vec(IxDyn(&[3, 2]), b_vals[..6].to_vec()).unwrap(),
+        );
+        let broadcast = eval_matmul_batched_fence(&plain, &a, &shared_b).expect("broadcast");
+        assert_eq!(broadcast.lower.shape(), &[2, 2, 2]);
+        for h in 0..2 {
+            for i in 0..2 {
+                for j in 0..2 {
+                    let exact: f64 = (0..3)
+                        .map(|k| a_vals[h * 6 + i * 3 + k] * b_vals[k * 2 + j])
+                        .sum();
+                    assert!(
+                        broadcast.lower[[h, i, j]] <= exact && exact <= broadcast.upper[[h, i, j]]
+                    );
+                }
+            }
+        }
+
+        let mismatched = Interval64::point(
+            ArrayD::from_shape_vec(IxDyn(&[3, 3, 2]), vec![0.0_f64; 18]).unwrap(),
+        );
+        assert!(eval_matmul_batched_fence(&plain, &a, &mismatched).is_err());
+        assert!(
+            eval_matmul_scalar(&plain, &a, &b).is_err(),
+            "the proof cell's MatMul must still fail closed on rank-3"
+        );
     }
 }

@@ -128,7 +128,7 @@ fn test_normalize_output_constraints_rejects_mixed_and_or() {
     assert!(err.to_string().contains("Mixed input-only"));
 }
 
-/// Regression test for #3192: VNNLIB disjunctive format with mixed input+output
+/// Regression test: VNNLIB disjunctive format with mixed input+output
 /// constraints in `(and ...)` clauses (nn4sys lindex pattern).
 /// Input bounds within `and` clauses must be accepted and extracted as per-clause
 /// preconditions, not rejected.
@@ -223,11 +223,11 @@ fn test_normalize_output_constraints_input_box_disjunction_alone_is_dropped() {
         vnn_normalize::NormalizeOptions::default(),
     )
     .unwrap();
-    assert!(normalized.clauses.is_empty());
-    assert!(normalized.per_clause_input_bounds.is_empty());
+    assert_eq!((normalized.clauses).len(), 0);
+    assert_eq!((normalized.per_clause_input_bounds).len(), 0);
 }
 
-/// Regression test for #3192: single mixed `and` (non-disjunctive) should also work.
+/// Regression test: single mixed `and` (non-disjunctive) should also work.
 #[ntest::timeout(10000)]
 #[test]
 fn test_normalize_output_constraints_accepts_single_mixed_and_3192() {

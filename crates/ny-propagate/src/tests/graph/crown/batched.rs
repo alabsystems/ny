@@ -10,7 +10,7 @@ use ndarray::{arr1, arr2};
 #[ntest::timeout(10000)]
 #[test]
 fn test_graph_network_batched_crown_parity_for_missing_activation_dispatch() {
-    // #1753 regression: GraphNetwork batched CROWN must track the same unary activation
+    // Regression: GraphNetwork batched CROWN must track the same unary activation
     // dispatch as sequential Network batched CROWN.
     struct ActivationCase {
         name: &'static str,
@@ -191,7 +191,7 @@ fn test_graph_network_batched_crown_parity_for_missing_activation_dispatch() {
                 seq_l,
                 seq_u
             );
-            // Post-#2990: sequential path intersects output with IBP bounds using
+            // The sequential path intersects output with IBP bounds using
             // collect_ibp_bounds(), while graph path intersects with its own forward-bound
             // cache (CROWN-IBP). Different intermediate bound sources produce different
             // intersection results, so we verify both are sound rather than exact parity.
@@ -225,7 +225,7 @@ fn test_graph_network_batched_crown_parity_for_missing_activation_dispatch() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_graph_network_batched_crown_unsupported_unary_falls_back() {
-    // Regression contract from #1753 design: unsupported unary ops in GraphNetwork
+    // Regression contract: unsupported unary ops in GraphNetwork
     // batched CROWN should trigger partial/IBP fallback, not hard-fail.
     let layer = Layer::SkipMerge(SkipMergeLayer::new());
     assert!(
@@ -270,9 +270,9 @@ fn test_graph_network_batched_crown_unsupported_unary_falls_back() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_graph_network_batched_crown_three_input_concat_reaches_fallback_4136() {
-    // #4136 regression: multi-input nodes like Concat must NOT be rejected by
+    // Regression: multi-input nodes like Concat must NOT be rejected by
     // the stale require_unary_input() guard before dispatch. The batched CROWN
-    // backward loop must use first-input resolution (like DAG-CROWN after #4113)
+    // backward loop must use first-input resolution (like DAG-CROWN)
     // so that the existing unsupported-layer fallback produces IBP bounds.
     //
     // Graph: _input → a (AddConstant(0.0))
@@ -282,7 +282,7 @@ fn test_graph_network_batched_crown_three_input_concat_reaches_fallback_4136() {
     //        output = concat
     //
     // Concat is unsupported in batched CROWN, so the fallback should produce
-    // IBP-equivalent bounds. Before #4136, this would fail with
+    // IBP-equivalent bounds. Before the fix, this would fail with
     // "requires exactly 1 input but has 3".
     let mut graph = GraphNetwork::new();
     graph.add_node(GraphNode::from_input(
@@ -345,7 +345,7 @@ fn test_graph_network_batched_crown_three_input_concat_reaches_fallback_4136() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_graph_network_batched_crown_tightens_to_ibp_reference_4242() {
-    // #4242 regression: post-concretization batched CROWN must intersect with
+    // Regression: post-concretization batched CROWN must intersect with
     // the output node's forward bounds. An identity graph is the minimal case
     // where concretize_sound() alone widens the interval; tightening should
     // recover the exact IBP output bounds.
@@ -395,7 +395,7 @@ fn test_graph_network_batched_crown_tightens_to_ibp_reference_4242() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_graph_network_batched_crown_leaky_relu_provenance_4240() {
-    // #4240 regression: batched CROWN must use tighten_crown_output_with_provenance
+    // Regression: batched CROWN must use tighten_crown_output_with_provenance
     // so that provenance reflects whether forward-bound tightening was applied.
     // LeakyReLU(0.01) with x in [-10, 10] is the canonical case:
     //   IBP:   [-0.1, 10]  (exact for monotone activation)

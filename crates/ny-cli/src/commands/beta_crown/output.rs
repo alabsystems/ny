@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use super::AppliedTerminalPeel;
 use crate::commands::backend::ProofBackendReceipt;
-use crate::commands::verify::{exit_codes, json_f32};
+use crate::commands::verify::{exit_codes, json_f32, preview_f32s};
 use crate::{BackendArg, CompleteVerifierArg};
 
 use std::cell::{Cell, RefCell};
@@ -55,6 +55,49 @@ pub(crate) struct CapturedDeadlinePlan {
     pub(crate) configured_deadline_caused_terminal_timeout: bool,
 }
 
+pub(crate) struct CapturedVerification {
+    json: String,
+    hull_elapsed: Option<Duration>,
+    #[cfg(feature = "mip")]
+    hull: Option<std::sync::Arc<super::hull_publication::HullPublicationAuthority>>,
+}
+
+impl CapturedVerification {
+    fn ordinary(json: String) -> Self {
+        Self {
+            json,
+            hull_elapsed: None,
+            #[cfg(feature = "mip")]
+            hull: None,
+        }
+    }
+    pub(crate) fn json(&self) -> &str {
+        &self.json
+    }
+    pub(crate) fn hull_elapsed(&self) -> Option<Duration> {
+        self.hull_elapsed
+    }
+    pub(crate) fn has_hull(&self) -> bool {
+        #[cfg(feature = "mip")]
+        {
+            self.hull.is_some()
+        }
+        #[cfg(not(feature = "mip"))]
+        {
+            false
+        }
+    }
+    #[cfg(feature = "mip")]
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        String,
+        Option<std::sync::Arc<super::hull_publication::HullPublicationAuthority>>,
+    ) {
+        (self.json, self.hull)
+    }
+}
+
 thread_local! {
     /// In-process capture sink for the competition JSON verdict.
     ///
@@ -71,7 +114,9 @@ thread_local! {
     /// the process exit is purely a control-flow concern (the exit code is a
     /// CLI-ergonomics signal, not part of the soundness contract; the VNN-COMP result
     /// is carried entirely by the JSON `status`/`counterexample_vnnlib` fields).
-    static CAPTURE_SINK: RefCell<Option<String>> = const { RefCell::new(None) };
+    static CAPTURE_SINK: RefCell<Option<CapturedVerification>> = const { RefCell::new(None) };
+    #[cfg(feature = "mip")]
+    static CAPTURE_IDENTITY: RefCell<Option<std::sync::Arc<()>>> = const { RefCell::new(None) };
 
     /// Caller-local terminal-ingress provenance for the same capture session.
     ///
@@ -96,11 +141,13 @@ thread_local! {
 
 /// Begin capturing the competition JSON verdict on this thread.
 ///
-/// Any previously captured value is cleared. Call [`take_captured_json`] afterwards
-/// to retrieve the rendered verdict, and [`end_capture`] (or the returned value's
-/// drop) to stop capturing.
+/// Clears the previous value. Retrieve the verdict and its retained authority
+/// with [`take_captured_verification`], then call [`end_capture`] when finished.
 pub(crate) fn begin_capture() {
-    CAPTURE_SINK.with(|sink| *sink.borrow_mut() = Some(String::new()));
+    CAPTURE_SINK
+        .with(|sink| *sink.borrow_mut() = Some(CapturedVerification::ordinary(String::new())));
+    #[cfg(feature = "mip")]
+    CAPTURE_IDENTITY.with(|identity| *identity.borrow_mut() = Some(std::sync::Arc::new(())));
     CAPTURE_TERMINAL_INGRESS.with(|ingress| ingress.set(CapturedTerminalIngress::None));
     CAPTURE_DEADLINE_PLAN.with(|plan| plan.set(None));
     CAPTURE_CONFIGURED_DEADLINE.with(|deadline| deadline.set(None));
@@ -109,6 +156,8 @@ pub(crate) fn begin_capture() {
 /// Stop capturing on this thread, discarding any buffered verdict.
 pub(crate) fn end_capture() {
     CAPTURE_SINK.with(|sink| *sink.borrow_mut() = None);
+    #[cfg(feature = "mip")]
+    CAPTURE_IDENTITY.with(|identity| *identity.borrow_mut() = None);
     CAPTURE_TERMINAL_INGRESS.with(|ingress| ingress.set(CapturedTerminalIngress::None));
     CAPTURE_DEADLINE_PLAN.with(|plan| plan.set(None));
     CAPTURE_CONFIGURED_DEADLINE.with(|deadline| deadline.set(None));
@@ -116,14 +165,55 @@ pub(crate) fn end_capture() {
 
 /// Take the captured competition JSON verdict, if capture is active and a verdict
 /// was rendered. Returns `None` when not capturing or when no verdict was produced.
+#[cfg(test)]
 pub(crate) fn take_captured_json() -> Option<String> {
     CAPTURE_SINK.with(|sink| {
         let mut guard = sink.borrow_mut();
         match guard.as_mut() {
-            Some(buf) if !buf.is_empty() => Some(std::mem::take(buf)),
+            Some(buf) if !buf.json.is_empty() => {
+                #[cfg(feature = "mip")]
+                if buf.hull.is_some() {
+                    return None;
+                }
+                Some(std::mem::take(&mut buf.json))
+            }
             _ => None,
         }
     })
+}
+
+/// Read the exact last emitted bytes without consuming the active capture.
+/// Only the typed MIP publisher uses this to bind its successful publication;
+/// a string read here alone carries no proof authority. A retained hull
+/// publication must move atomically with its owner and is never exposed here.
+#[cfg(feature = "mip")]
+pub(super) fn snapshot_captured_json() -> Option<String> {
+    CAPTURE_SINK.with(|sink| {
+        sink.borrow()
+            .as_ref()
+            .filter(|value| !value.json.is_empty() && !value.has_hull())
+            .map(|value| value.json.clone())
+    })
+}
+
+/// One atomic move: JSON cannot be separated from its retained authority by
+/// the competition capture consumer. End-capture drops only untaken owners.
+pub(crate) fn take_captured_verification() -> Option<CapturedVerification> {
+    CAPTURE_SINK.with(|sink| {
+        let mut sink = sink.borrow_mut();
+        match sink.as_mut() {
+            Some(value) if !value.json.is_empty() => Some(std::mem::replace(
+                value,
+                CapturedVerification::ordinary(String::new()),
+            )),
+            _ => None,
+        }
+    })
+}
+
+#[cfg(feature = "mip")]
+pub(super) fn capture_identity() -> Option<std::sync::Arc<()>> {
+    CAPTURE_IDENTITY.with(|identity| identity.borrow().clone())
 }
 
 /// Mark the active capture as owned by the admitted marked-margin SafeNLP
@@ -140,7 +230,7 @@ pub(super) fn mark_captured_safenlp_marked_margin_terminal() {
 
 /// Take terminal-ingress provenance for the active in-process capture.
 ///
-/// Like [`take_captured_json`], this does not end the capture session; callers
+/// Like [`take_captured_verification`], this does not end the capture session; callers
 /// still invoke [`end_capture`] so every thread-local field is reset together.
 pub(crate) fn take_captured_terminal_ingress() -> CapturedTerminalIngress {
     CAPTURE_TERMINAL_INGRESS.with(Cell::take)
@@ -210,13 +300,238 @@ pub(super) fn emit_competition_json(json: &str) -> bool {
     CAPTURE_SINK.with(|sink| {
         let mut guard = sink.borrow_mut();
         if let Some(buf) = guard.as_mut() {
-            *buf = json.to_string();
+            *buf = CapturedVerification::ordinary(json.to_string());
             true
         } else {
             println!("{json}");
             false
         }
     })
+}
+
+/// The source-bound hull publisher uses a borrowed streaming payload. The
+/// existing renderer remains unchanged for every legacy outcome.
+#[cfg(feature = "mip")]
+pub(super) fn output_hull_result(
+    report: BetaCrownResult,
+    proof: std::sync::Arc<super::hull_publication::HullPublicationProof>,
+    property: Option<&Path>,
+    threshold: f32,
+    json: bool,
+    effective_config: &EffectiveTreatmentProjection,
+) -> Result<()> {
+    use super::hull_publication::{HullPublicationAuthority, JsonWriter, HULL_JSON_BYTES};
+    // A caller-side timeout downgrade cannot retain a Verified publication.
+    if !matches!(report.result, BabVerificationStatus::Verified) {
+        drop(proof);
+        return output_result(
+            &report,
+            &property.map(Path::to_path_buf),
+            None,
+            0.0,
+            threshold,
+            false,
+            json,
+            false,
+            effective_config,
+        );
+    }
+    proof.checkpoint()?;
+    let storage = proof.reserve_publication(HULL_JSON_BYTES * 2 + 4096)?;
+    hull_json_source_preflight(effective_config, property, &proof)?;
+    let mut writer = JsonWriter::new()?;
+    let stats = proof.search();
+    let scope = proof.scope();
+    let mut hex = [0_u8; 64];
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    for (i, byte) in scope.iter().copied().enumerate() {
+        hex[2 * i] = DIGITS[(byte >> 4) as usize];
+        hex[2 * i + 1] = DIGITS[(byte & 15) as usize];
+    }
+    #[derive(Serialize)]
+    struct HullObservation<'a> {
+        schema: &'static str,
+        original_scope: &'a str,
+        lower_bound: f64,
+        search_attempts: u64,
+        search_evaluations: u64,
+        certificate_proposals: u64,
+        certificate_evaluations: u64,
+        original_replays: u64,
+        selected_policy: &'static str,
+        census: &'static str,
+    }
+    #[derive(Serialize)]
+    struct HullJson<'a> {
+        status: &'static str,
+        reason: Option<&'static str>,
+        counterexample: Option<&'static str>,
+        counterexample_vnnlib: Option<&'static str>,
+        property_file: Option<&'a Path>,
+        epsilon: Option<f32>,
+        threshold: f32,
+        domains_explored: usize,
+        domains_verified: usize,
+        cuts_generated: usize,
+        max_depth_reached: usize,
+        time_elapsed_s: f64,
+        output_bound_width: Option<f32>,
+        method: &'static str,
+        effective_config: &'a EffectiveTreatmentProjection,
+        hull_resource: HullObservation<'a>,
+    }
+    let payload = HullJson {
+        status: "verified",
+        reason: None,
+        counterexample: None,
+        counterexample_vnnlib: None,
+        property_file: property,
+        epsilon: None,
+        threshold,
+        domains_explored: report.domains_explored,
+        domains_verified: report.domains_verified,
+        cuts_generated: report.cuts_generated,
+        max_depth_reached: report.max_depth_reached,
+        time_elapsed_s: report.time_elapsed.as_secs_f64(),
+        output_bound_width: None,
+        method: "single_hidden_hull_original_replay",
+        effective_config,
+        hull_resource: HullObservation {
+            schema: "ny_hull_resource_publication_v1",
+            original_scope: std::str::from_utf8(&hex)?,
+            lower_bound: proof.lower_bound(),
+            search_attempts: stats.search_attempts,
+            search_evaluations: stats.search_evaluations,
+            certificate_proposals: stats.certificate_proposals,
+            certificate_evaluations: stats.certificate_evaluations,
+            original_replays: 1,
+            selected_policy: match stats.selected_policy {
+                ny_mip::single_hidden_hull::PositiveLowerSlopePolicy::Proportional => {
+                    "proportional"
+                }
+                ny_mip::single_hidden_hull::PositiveLowerSlopePolicy::Area => "area",
+            },
+            census: "participating-hull-only;loader-and-legacy-engines-unqualified",
+        },
+    };
+    serde_json::to_writer_pretty(&mut writer, &payload)?;
+    let rendered = writer.finish()?;
+    #[cfg(test)]
+    super::hull_publication::tests::after_format(&proof);
+    // Formatting and the original ledger's allocation admission are complete
+    // before the final scope/deadline/cancellation/environment gate.
+    proof.checkpoint()?;
+    let identity = capture_identity();
+    anyhow::ensure!(
+        proof.capture_matches(identity.as_ref()),
+        "foreign hull capture session"
+    );
+    let authority = HullPublicationAuthority::new(proof, storage)?;
+    let captured = CAPTURE_SINK.with(|sink| -> Result<bool> {
+        let mut sink = sink.borrow_mut();
+        if let Some(value) = sink.as_mut() {
+            *value = CapturedVerification {
+                json: rendered,
+                hull_elapsed: Some(report.time_elapsed),
+                hull: Some(authority.clone()),
+            };
+            Ok(true)
+        } else {
+            authority.checkpoint()?;
+            if json {
+                println!("{rendered}");
+            } else {
+                println!(
+                    "\n--- Result ---\nStatus: VERIFIED\nTime: {:.3}s",
+                    report.time_elapsed.as_secs_f64()
+                );
+            }
+            Ok(false)
+        }
+    })?;
+    if captured {
+        crate::flight::note(
+            "hull_resource",
+            crate::flight::FlightStatus::Ran,
+            Some(
+                "outcome=verified origin=original-replay census=participating-hull-only".to_owned(),
+            ),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "mip")]
+fn hull_json_source_preflight(
+    config: &EffectiveTreatmentProjection,
+    property: Option<&Path>,
+    proof: &super::hull_publication::HullPublicationProof,
+) -> Result<()> {
+    use super::hull_publication::HULL_JSON_BYTES;
+    let mut content = property.map_or(0, |path| path.as_os_str().len());
+    anyhow::ensure!(
+        content <= HULL_JSON_BYTES,
+        "hull JSON property path exceeds bounded source"
+    );
+    let mut add = |text: &str| -> Result<()> {
+        content = content
+            .checked_add(text.len())
+            .ok_or_else(|| anyhow::anyhow!("hull JSON source overflow"))?;
+        anyhow::ensure!(
+            content <= HULL_JSON_BYTES,
+            "hull JSON source exceeds prepaid work"
+        );
+        Ok(())
+    };
+    let route = &config.route;
+    for text in [
+        &route.selected_backend,
+        &route.requested_backend,
+        &route.effective_backend,
+        &route.proof_backend,
+        &route.proof_backend_provenance,
+    ] {
+        add(text)?;
+    }
+    for text in [
+        &route.backend_selection_reason,
+        &route.wgpu_qualification_provenance,
+        &route.wgpu_failed_rung,
+        &route.backend_fallback_reason,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        add(text)?;
+    }
+    for names in [
+        &config.invprop.apply_output_constraints_to,
+        &config.invprop.directly_optimize,
+    ] {
+        anyhow::ensure!(
+            names.len() <= HULL_JSON_BYTES,
+            "hull JSON vector exceeds bounded source"
+        );
+        for (i, name) in names.iter().enumerate() {
+            if i % 1024 == 0 {
+                proof.checkpoint()?;
+            }
+            add(name)?;
+        }
+    }
+    if let Some(rows) = config
+        .invprop
+        .top_level_output_constraint_matrix
+        .as_ref()
+        .and_then(|matrix| matrix.clause_row_counts.as_ref())
+    {
+        anyhow::ensure!(
+            rows.len() <= HULL_JSON_BYTES,
+            "hull JSON row metadata exceeds bounded source"
+        );
+    }
+    proof.checkpoint()?;
+    Ok(())
 }
 
 const EFFECTIVE_TREATMENT_SCHEMA: &str = "ny_beta_crown_effective_treatment_v1";
@@ -303,7 +618,18 @@ struct EffectiveAlphaProjection {
     fix_interm_bounds: bool,
     cgan_sparse_target_complete_root: bool,
     cgan_complete_crown_ibp_root: bool,
+    cgan_crown_root_map: bool,
+    cgan_collector_dense: bool,
+    cgan_unstable_rows: bool,
+    cgan_unstable_rows_max_frac: f32,
     cgan_narrow_target_max_rows: Option<usize>,
+    cgan_child_interm_refine_max_secs: Option<f64>,
+    cgan_child_interm_refine_seed_from_parent: bool,
+    cgan_child_interm_refine_parallel: usize,
+    cgan_child_interm_refine_fresh_clip_map: bool,
+    cgan_child_zono_refresh_enabled: bool,
+    cgan_child_zono_refresh_max_generators: u32,
+    cgan_child_zono_refresh_max_secs: Option<f32>,
     full_conv_alpha: bool,
     adaptive_skip: bool,
     adaptive_skip_depth_threshold: usize,
@@ -719,7 +1045,35 @@ impl EffectiveTreatmentProjection {
                     .alpha_config
                     .cgan_sparse_target_complete_root,
                 cgan_complete_crown_ibp_root: config.alpha_config.cgan_complete_crown_ibp_root,
+                cgan_crown_root_map: config.alpha_config.cgan_crown_root_map,
+                cgan_collector_dense: config.alpha_config.cgan_collector_dense,
+                cgan_unstable_rows: config.alpha_config.cgan_unstable_rows,
+                cgan_unstable_rows_max_frac: config.alpha_config.cgan_unstable_rows_max_frac,
                 cgan_narrow_target_max_rows: config.alpha_config.cgan_narrow_target_max_rows,
+                cgan_child_interm_refine_max_secs: config
+                    .alpha_config
+                    .cgan_child_interm_refine_max_secs,
+                cgan_child_interm_refine_seed_from_parent: config
+                    .alpha_config
+                    .cgan_child_interm_refine_seed_from_parent,
+                cgan_child_interm_refine_parallel: config
+                    .alpha_config
+                    .cgan_child_interm_refine_parallel,
+                cgan_child_interm_refine_fresh_clip_map: config
+                    .alpha_config
+                    .cgan_child_interm_refine_fresh_clip_map,
+                cgan_child_zono_refresh_enabled: config
+                    .alpha_config
+                    .cgan_child_zono_refresh
+                    .enabled,
+                cgan_child_zono_refresh_max_generators: config
+                    .alpha_config
+                    .cgan_child_zono_refresh
+                    .max_generators,
+                cgan_child_zono_refresh_max_secs: config
+                    .alpha_config
+                    .cgan_child_zono_refresh
+                    .max_secs,
                 full_conv_alpha: config.alpha_config.full_conv_alpha,
                 adaptive_skip: config.alpha_config.adaptive_skip,
                 adaptive_skip_depth_threshold: config.alpha_config.adaptive_skip_depth_threshold,
@@ -1371,6 +1725,31 @@ fn beta_crown_json_payload(
     }
 }
 
+/// #attack-concurrent: the captured-route competition JSON for a β-CROWN
+/// result, rendered WITHOUT the thread-local capture sink. It is byte-for-byte
+/// what [`output_result`] stores in the sink on the in-process VNN-COMP route
+/// (json mode, capturing: no standalone witness sealing), so the concurrent
+/// attack lane — which runs on its own thread, where the main thread's sink is
+/// not visible — hands the scored publisher exactly the JSON the main path's
+/// translation would have parsed.
+pub(super) fn render_captured_competition_json(
+    result: &BetaCrownResult,
+    property: Option<&Path>,
+    epsilon: f32,
+    effective_threshold: f32,
+    effective_config: &EffectiveTreatmentProjection,
+) -> Result<String> {
+    let payload = beta_crown_json_payload(
+        result,
+        property,
+        epsilon,
+        effective_threshold,
+        effective_config.terminal_peel_activation(),
+        Some(effective_config),
+    );
+    format_competition_json(payload)
+}
+
 #[cfg(feature = "mip")]
 fn verification_result_json_payload(
     result: &VerificationResult,
@@ -1513,7 +1892,7 @@ fn beta_crown_exit_code(status: &BabVerificationStatus) -> i32 {
     match status {
         BabVerificationStatus::Verified => exit_codes::VERIFIED,
         BabVerificationStatus::Violated { .. } => exit_codes::VIOLATED,
-        // #3678 rewrites property-backed PotentialViolation to Violated/Unknown before
+        // Property-backed PotentialViolation is rewritten to Violated/Unknown before
         // this renderer. The remaining surface is the propertyless threshold path, so
         // shell-level status should stay conservative rather than imply a confirmed SAT.
         BabVerificationStatus::PotentialViolation { .. }
@@ -1559,7 +1938,7 @@ pub(super) fn output_result(
         let rendered = format_competition_json(payload)?;
         if emit_competition_json(&rendered) {
             // Verdict captured in-process (vnncomp path): do NOT print or exit;
-            // the caller reads it via `take_captured_json` and translates it.
+            // the caller takes the retained verification and translates it.
             return Ok(());
         }
     } else {
@@ -1622,10 +2001,10 @@ pub(super) fn output_result(
                             violated, effective_threshold
                         );
                     }
-                    println!("Counterexample input: {:?}", counterexample);
+                    println!("Counterexample input: {}", preview_f32s(counterexample));
                     let (label, displayed_output) =
                         applied_terminal_peel.human_witness_output(output);
-                    println!("{label}: {:?}", displayed_output);
+                    println!("{label}: {}", preview_f32s(&displayed_output));
                 }
                 BabVerificationStatus::PotentialViolation { .. } => {
                     println!("Status: POTENTIAL VIOLATION");
@@ -1668,7 +2047,6 @@ pub(super) fn output_result(
     }
 
     // Apply exit codes matching the verify command contract.
-    // Per designs/2026-02-03-smt-result-semantics.md.
     // Keep the process contract aligned with the JSON contract. A refused
     // witness is Unknown, never the original Violated/SAT exit code.
     let exit_code = if publication_refused {
@@ -1918,6 +2296,10 @@ mod tests {
         on_config.alpha_config.learning_rate = 0.25;
         on_config.alpha_config.cgan_sparse_target_complete_root = true;
         on_config.alpha_config.cgan_complete_crown_ibp_root = true;
+        on_config.alpha_config.cgan_crown_root_map = true;
+        on_config.alpha_config.cgan_collector_dense = true;
+        on_config.alpha_config.cgan_unstable_rows = true;
+        on_config.alpha_config.cgan_unstable_rows_max_frac = 0.75;
         on_config.beta_iterations = 8;
         on_config.enable_clip_interm_domain = true;
         on_config.clip_interm_topk = 20;
@@ -1992,6 +2374,20 @@ mod tests {
             true
         );
         assert_eq!(on_json["alpha_crown"]["cgan_complete_crown_ibp_root"], true);
+        assert_eq!(off_json["alpha_crown"]["cgan_crown_root_map"], false);
+        assert_eq!(on_json["alpha_crown"]["cgan_crown_root_map"], true);
+        assert_eq!(off_json["alpha_crown"]["cgan_collector_dense"], false);
+        assert_eq!(on_json["alpha_crown"]["cgan_collector_dense"], true);
+        assert_eq!(off_json["alpha_crown"]["cgan_unstable_rows"], false);
+        assert_eq!(on_json["alpha_crown"]["cgan_unstable_rows"], true);
+        assert_eq!(
+            off_json["alpha_crown"]["cgan_unstable_rows_max_frac"],
+            serde_json::json!(f64::from(0.9f32))
+        );
+        assert_eq!(
+            on_json["alpha_crown"]["cgan_unstable_rows_max_frac"],
+            serde_json::json!(f64::from(0.75f32))
+        );
         assert_eq!(off_json["beta_crown"]["iterations"], 15);
         assert_eq!(on_json["beta_crown"]["iterations"], 8);
         assert_eq!(off_json["clip"]["interm_domain"], false);

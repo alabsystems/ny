@@ -5,7 +5,7 @@
 //! GPU integration tests for wgpu device operations.
 //!
 //! These tests require a GPU and are gated behind the `gpu-tests` feature.
-//! Run with: `cargo test -p ny-gpu --features gpu-tests`
+//! Run with: `targo --unverified test -p ny-gpu --features gpu-tests`
 //!
 //! Without the feature, these tests are not compiled — preventing silent
 //! green passes on CI machines without GPU hardware.
@@ -298,6 +298,170 @@ fn test_wgpu_gemm_f32_basic() {
     }
 }
 
+/// #hard-caps: `gemm_f32`'s buffer-fit gate must read the LIVE binding limit
+/// (`max_binding_elems_live`), like every other buffer-fit gate since
+/// `d153bf0a4`. `B` just past wgpu's DEFAULT 128 MiB wall (the static
+/// `MAX_BINDING_ELEMS`) must be computed on an adapter that grants more; on
+/// one that grants only the default it is the typed refusal, naming the live
+/// budget. Before the fix the static wall refused it on every adapter, so the
+/// FL value tier (which admits `B` up to half the live limit) got
+/// `GpuMemoryExceeded` for shapes it had admitted.
+#[test]
+#[cfg(feature = "gpu-tests")]
+fn test_wgpu_gemm_f32_b_past_static_wall_reads_live_limit() {
+    let _gpu_serial = gpu_test_serial_guard();
+    let device = require_device();
+    let (m, k) = (2usize, 1152usize);
+    let n = crate::wgpu_device::MAX_BINDING_ELEMS / k + 1;
+    assert!(k * n > crate::wgpu_device::MAX_BINDING_ELEMS);
+    // Integer-valued operands: every coefficient is exact in f32.
+    let a: Vec<f32> = (0..m * k).map(|x| ((x * 7 + 3) % 3) as f32 - 1.0).collect();
+    let b: Vec<f32> = (0..k * n)
+        .map(|x| ((x * 13 + 5) % 5) as f32 - 2.0)
+        .collect();
+    let result = device.gemm_f32(m, k, n, &a, &b);
+    if k * n > device.max_binding_elems_live() {
+        match result {
+            Err(ny_core::NyError::GpuMemoryExceeded { budget_bytes, .. }) => {
+                assert_eq!(budget_bytes, device.max_binding_bytes_live());
+            }
+            Err(other) => panic!("default-limit adapter: unexpected error: {other}"),
+            Ok(out) => panic!(
+                "default-limit adapter: expected refusal, got {} values",
+                out.len()
+            ),
+        }
+        return;
+    }
+    let out = result.unwrap_or_else(|e| {
+        panic!(
+            "B of {} elements fits the live binding limit ({}), must compute: {e}",
+            k * n,
+            device.max_binding_elems_live()
+        )
+    });
+    assert_eq!(out.len(), m * n);
+    for i in 0..m {
+        for j in [0usize, 1, n / 2, n - 1] {
+            let mut want = 0i64;
+            for t in 0..k {
+                want += a[i * k + t] as i64 * b[t * n + j] as i64;
+            }
+            assert_eq!(out[i * n + j], want as f32, "({i},{j})");
+        }
+    }
+}
+
+/// #hard-caps, the other side of the gate: `B` one column past the LIVE
+/// binding limit is the typed refusal naming the live budget, on every
+/// adapter (the static-wall pin above only reaches its refusal branch on an
+/// adapter that grants just wgpu's default). `B` is a zeroed allocation the
+/// gate refuses before reading, so this stays cheap on a 4 GiB grant.
+#[test]
+#[cfg(feature = "gpu-tests")]
+fn test_wgpu_gemm_f32_b_past_live_limit_is_typed_refusal() {
+    let _gpu_serial = gpu_test_serial_guard();
+    let device = require_device();
+    let live = device.max_binding_elems_live();
+    let (m, k) = (1usize, 1024usize);
+    let n = live / k + 1;
+    assert!(k * n > live && k * n - live <= k);
+    let a = vec![1.0f32; m * k];
+    let b = vec![0.0f32; k * n];
+    match device.gemm_f32(m, k, n, &a, &b) {
+        Err(ny_core::NyError::GpuMemoryExceeded {
+            required_bytes,
+            budget_bytes,
+        }) => {
+            assert_eq!(required_bytes, k * n * 4, "refusal must name B's bytes");
+            assert_eq!(budget_bytes, device.max_binding_bytes_live());
+        }
+        Err(other) => panic!("B past the live limit: unexpected error: {other}"),
+        Ok(out) => panic!(
+            "B past the live limit must refuse, got {} values",
+            out.len()
+        ),
+    }
+}
+
+/// The row splits read the same live limit as the B gate: a contraction
+/// length past wgpu's DEFAULT 128 MiB wall (k > `MAX_BINDING_ELEMS`) fits the
+/// live limit on a big-binding adapter, so it must compute. A split on the
+/// static constant gives 0 rows here (refused as a zero-row batch). On an
+/// adapter that grants only the default, the same `B` is the typed refusal.
+/// `A` and `B` are zero except the first and last contraction index, so the
+/// product is exact and reads both far ends of the bindings.
+#[test]
+#[cfg(feature = "gpu-tests")]
+fn test_wgpu_gemm_f32_k_past_static_wall_splits_on_live_limit() {
+    let _gpu_serial = gpu_test_serial_guard();
+    let device = require_device();
+    let (m, n) = (2usize, 1usize);
+    let k = crate::wgpu_device::MAX_BINDING_ELEMS + 1;
+    let mut a = vec![0.0f32; m * k];
+    let mut b = vec![0.0f32; k * n];
+    for i in 0..m {
+        a[i * k] = (i + 1) as f32; // first contraction index
+        a[i * k + k - 1] = (i + 3) as f32; // last contraction index (end of A)
+    }
+    b[0] = 5.0;
+    b[k - 1] = 7.0; // end of B
+    let result = device.gemm_f32(m, k, n, &a, &b);
+    if k * n > device.max_binding_elems_live() {
+        match result {
+            Err(ny_core::NyError::GpuMemoryExceeded { budget_bytes, .. }) => {
+                assert_eq!(budget_bytes, device.max_binding_bytes_live());
+            }
+            Err(other) => panic!("default-limit adapter: unexpected error: {other}"),
+            Ok(out) => panic!(
+                "default-limit adapter: expected refusal, got {} values",
+                out.len()
+            ),
+        }
+        return;
+    }
+    let out = result.unwrap_or_else(|e| {
+        panic!(
+            "k = {k} fits the live binding limit ({}), must compute: {e}",
+            device.max_binding_elems_live()
+        )
+    });
+    assert_eq!(out.len(), m * n);
+    for (i, &got) in out.iter().enumerate() {
+        let want = (i + 1) as f32 * 5.0 + (i + 3) as f32 * 7.0;
+        assert_eq!(got, want, "row {i}");
+    }
+}
+
+/// Rows past the TILED shader's dispatch grid (65535 × 16 = 1,048,560) with
+/// k above the small-K threshold must still compute: `gemm_f32` has to batch
+/// them for the tiled shader, the only one k = 65 can use. With the live
+/// split, a single 1.1M-row batch reached the tiled shader and came back as
+/// "dispatch exceeds 65535" (a CPU fallback for the attack-steering and FL
+/// tiers); the static split never got there. Integer operands: exact in f32.
+#[test]
+#[cfg(feature = "gpu-tests")]
+fn test_wgpu_gemm_f32_rows_past_tiled_dispatch_limit_large_k() {
+    let _gpu_serial = gpu_test_serial_guard();
+    let device = require_device();
+    let (m, k, n) = (1_100_000usize, 65usize, 1usize);
+    let a: Vec<f32> = (0..m * k).map(|x| ((x * 7 + 3) % 3) as f32 - 1.0).collect();
+    let b: Vec<f32> = (0..k * n)
+        .map(|x| ((x * 13 + 5) % 5) as f32 - 2.0)
+        .collect();
+    let out = device
+        .gemm_f32(m, k, n, &a, &b)
+        .unwrap_or_else(|e| panic!("{m}x{k}x{n} must compute: {e}"));
+    assert_eq!(out.len(), m * n);
+    for i in [0usize, 430_184, 430_185, 1_048_559, 1_048_560, m - 1] {
+        let mut want = 0i64;
+        for t in 0..k {
+            want += a[i * k + t] as i64 * b[t * n] as i64;
+        }
+        assert_eq!(out[i * n], want as f32, "row {i}");
+    }
+}
+
 /// `gemm_interval_sound` must produce a sound enclosure when its underlying
 /// `gemm_f32` runs on the real GPU (round-to-nearest, GPU reduction order).
 ///
@@ -423,7 +587,7 @@ fn test_wgpu_crown_aw_error_step_sound_on_gpu() {
 /// Regression: parallel GEMM calls on one device must not recycle the shared
 /// staging buffer while an earlier readback is still mapped.
 ///
-/// #3813 row 151 hit:
+/// Observed failure on row 151:
 /// `Queue::submit -> Buffer with 'gemm_staging_buffer' label is still mapped`
 /// from Rayon-parallel Conv2d transpose GEMM calls under the WGPU relusplitter
 /// path. This test exercises the same shared-device pattern directly.
@@ -476,16 +640,16 @@ fn test_wgpu_gemm_f32_parallel_shared_device_reuses_staging_safely_3813() {
     }
 }
 
-/// Verify that explicit NaN inputs remain downstream-detectable after GEMM (#2708).
+/// Verify that explicit NaN inputs remain downstream-detectable after GEMM.
 /// A corrupted CROWN A-matrix row must not collapse to an ordinary finite value
 /// such as 0.0. The later concretize step detects either raw NaN or the exact
 /// `FALLBACK_BOUND` sentinel and degrades the row to maximally loose bounds.
 /// Accepting an arbitrary bounded finite output here would re-allow the
-/// pre-#2708 bug where NaN was rewritten away and a corrupted coefficient
+/// earlier bug where NaN was rewritten away and a corrupted coefficient
 /// contribution was silently dropped.
 ///
 /// This test isolates the NaN case. Finite overflow and fallback-sentinel
-/// handling are covered by the separate shader/seeded regressions for #2708.
+/// handling are covered by the separate shader/seeded regressions.
 #[test]
 #[cfg(feature = "gpu-tests")]
 fn test_wgpu_gemm_f32_nan_input_preserves_detectable_corruption_2708() {
@@ -818,7 +982,7 @@ fn test_wgpu_attention_ibp_fused_small() {
 
 // ==================== sanitize_readback unit tests (no GPU required) ====================
 
-/// Regression test #2785: sanitize_readback replaces NaN/Inf with ±FALLBACK_BOUND.
+/// Regression test: sanitize_readback replaces NaN/Inf with ±FALLBACK_BOUND.
 #[test]
 fn test_sanitize_readback_nan_inf_replaced_2785() {
     use crate::FALLBACK_BOUND;
@@ -842,7 +1006,7 @@ fn test_sanitize_readback_nan_inf_replaced_2785() {
     assert_eq!(upper[3], FALLBACK_BOUND);
 }
 
-/// Regression test #2785: sanitize_readback with all-finite data is no-op.
+/// Regression test: sanitize_readback with all-finite data is no-op.
 #[test]
 fn test_sanitize_readback_finite_unchanged_2785() {
     let mut lower = vec![-5.0f32, 0.0, 100.0];
@@ -856,7 +1020,7 @@ fn test_sanitize_readback_finite_unchanged_2785() {
     assert_eq!(upper, upper_orig);
 }
 
-/// Regression test #3307: sanitize_readback must repair finite inverted bounds.
+/// Regression test: sanitize_readback must repair finite inverted bounds.
 #[test]
 fn test_sanitize_readback_finite_inversion_repaired_3307() {
     use crate::FALLBACK_BOUND;
@@ -872,7 +1036,7 @@ fn test_sanitize_readback_finite_inversion_repaired_3307() {
     assert_eq!(upper[1], 4.0);
 }
 
-/// Parallel regression for #3877: linear_ibp staging buffer race.
+/// Parallel regression: linear_ibp staging buffer race.
 ///
 /// Before the fix, 4 IBP ops (linear_ibp, matmul_ibp, softmax_ibp,
 /// attention_ibp_fused) dropped the BufferPool MutexGuard before readback,
@@ -1161,7 +1325,7 @@ fn test_wgpu_resident_ibp_forward_matches_sequential_conv2d_chain_4275() {
 }
 
 // ============================================================================
-// DAG resident IBP forward tests (#4319)
+// DAG resident IBP forward tests
 // ============================================================================
 
 /// CPU reference for a 2×2 residual DAG: Linear→ReLU→Add(relu, input).
@@ -2090,6 +2254,212 @@ fn test_conv_transpose_plan_cache_pair_matches_uncached_and_cpu_and_reuses() {
         .expect("clear conv_transpose plan cache after test");
 }
 
+/// #hard-caps: the cached fused pair's buffer-fit gate must read the LIVE
+/// binding limit, like its per-call twin `conv_transpose_2d` has since
+/// d153bf0a4. The pair stacks lower over upper, so its GEMM output binding is
+/// twice a single call's: here each single call (78.6 MB) fits wgpu's DEFAULT
+/// 128 MiB wall, but the fused pair (157.3 MB) does not. With the static gate
+/// the plan path refused it on every adapter while two per-call dispatches of
+/// the same work ran, so the fused, weight-resident path was lost exactly on
+/// the large layers it exists for.
+///
+/// On an adapter that grants more than the default the pair must compute, bit
+/// for bit equal to two per-call dispatches and exactly equal to the CPU
+/// reference (integer-valued operands: every partial sum is an integer below
+/// 2^24, so f32 is exact in any order). On one that grants only the default it
+/// is the typed refusal naming the live budget.
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn test_conv_transpose_plan_pair_past_static_wall_reads_live_limit() {
+    use ny_core::{GemmEngine, NaiveCpuGemmEngine};
+
+    let _gpu_serial = gpu_test_serial_guard();
+    let device = require_device();
+    device
+        .clear_conv_transpose_plan_cache()
+        .expect("clear conv_transpose plan cache");
+
+    // Conv 16->2 channels, 5x5 kernel, 36x36 input -> 32x32 output, 48 specs.
+    let params = ny_core::ConvTranspose2dParams {
+        num_specs: 48,
+        out_channels: 2,
+        in_channels: 16,
+        out_h: 32,
+        out_w: 32,
+        in_h: 36,
+        in_w: 36,
+        kernel_h: 5,
+        kernel_w: 5,
+        stride_h: 1,
+        stride_w: 1,
+        pad_h: 0,
+        pad_w: 0,
+    };
+    let single_rows = params.num_specs * params.out_h * params.out_w;
+    let kernel_cols = params.in_channels * params.kernel_h * params.kernel_w;
+    let fused_gemm_out = 2 * single_rows * kernel_cols;
+    let static_wall = crate::wgpu_device::MAX_BINDING_ELEMS;
+    // Preconditions: the fused output binding is past 128 MiB (and past the
+    // static element budget); one per-call output binding is not, so the
+    // per-call reference runs on every adapter.
+    assert!(fused_gemm_out * 4 > 128 * 1024 * 1024, "{fused_gemm_out}");
+    assert!(
+        fused_gemm_out > static_wall,
+        "{fused_gemm_out} vs {static_wall}"
+    );
+    assert!(single_rows * kernel_cols <= static_wall);
+
+    let a_len = single_rows * params.out_channels;
+    let a_lower: Vec<f32> = (0..a_len)
+        .map(|i| ((i * 7 + 3) % 11) as f32 - 5.0)
+        .collect();
+    let a_upper: Vec<f32> = (0..a_len)
+        .map(|i| ((i * 5 + 1) % 13) as f32 - 6.0)
+        .collect();
+    let weight_col: Vec<f32> = (0..params.out_channels * kernel_cols)
+        .map(|i| ((i * 13 + 5) % 9) as f32 - 4.0)
+        .collect();
+    let w_arc: Arc<[f32]> = Arc::from(weight_col.clone());
+
+    let result = device.conv_transpose_2d_pair_cached(&a_lower, &a_upper, &w_arc, &params);
+    if fused_gemm_out > device.max_binding_elems_live() {
+        match result {
+            Err(ny_core::NyError::GpuMemoryExceeded { budget_bytes, .. }) => {
+                assert_eq!(budget_bytes, device.max_binding_bytes_live());
+            }
+            Err(other) => panic!("default-limit adapter: unexpected error: {other}"),
+            Ok(_) => panic!("default-limit adapter: the fused pair must refuse"),
+        }
+        assert_eq!(device.conv_transpose_plan_cache_len(), 0);
+        return;
+    }
+    let (lower, upper) = result.unwrap_or_else(|e| {
+        panic!(
+            "fused pair GEMM output of {fused_gemm_out} elements fits the live binding \
+             limit ({}), the cached plan must compute it: {e}",
+            device.max_binding_elems_live()
+        )
+    });
+    assert_eq!(
+        device.conv_transpose_plan_cache_len(),
+        1,
+        "the admitted pair must build and cache exactly one plan"
+    );
+
+    let gpu_lower = device
+        .conv_transpose_2d(&a_lower, &weight_col, &params)
+        .expect("per-call lower");
+    let gpu_upper = device
+        .conv_transpose_2d(&a_upper, &weight_col, &params)
+        .expect("per-call upper");
+    let cpu_lower = NaiveCpuGemmEngine
+        .conv_transpose_2d(&a_lower, &weight_col, &params)
+        .expect("cpu lower");
+    let cpu_upper = NaiveCpuGemmEngine
+        .conv_transpose_2d(&a_upper, &weight_col, &params)
+        .expect("cpu upper");
+    let out_elems = params.num_specs * params.in_channels * params.in_h * params.in_w;
+    for (name, got, per_call, cpu) in [
+        ("lower", &lower, &gpu_lower, &cpu_lower),
+        ("upper", &upper, &gpu_upper, &cpu_upper),
+    ] {
+        assert_eq!(got.len(), out_elems, "{name} length");
+        assert!(
+            got.iter()
+                .zip(per_call.iter())
+                .all(|(g, p)| g.to_bits() == p.to_bits()),
+            "{name}: the fused plan must be bit-identical to two per-call dispatches"
+        );
+        if let Some(i) = (0..out_elems).find(|&i| got[i] != cpu[i]) {
+            panic!("{name}[{i}]: gpu {} != exact cpu {}", got[i], cpu[i]);
+        }
+    }
+    assert!(
+        lower.iter().any(|v| *v != 0.0) && upper.iter().any(|v| *v != 0.0),
+        "non-degenerate result"
+    );
+
+    device
+        .clear_conv_transpose_plan_cache()
+        .expect("clear conv_transpose plan cache after test");
+}
+
+/// #hard-caps, the other side of the gate: a fused pair whose GEMM output
+/// binding is just past the LIVE limit is the typed refusal naming the live
+/// budget, on every adapter, and caches nothing. The gate refuses before any
+/// buffer is allocated, so this stays cheap on a 4 GiB grant (host inputs are
+/// under 1 MB).
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn test_conv_transpose_plan_pair_past_live_limit_is_typed_refusal() {
+    let _gpu_serial = gpu_test_serial_guard();
+    let device = require_device();
+    device
+        .clear_conv_transpose_plan_cache()
+        .expect("clear conv_transpose plan cache");
+
+    let live = device.max_binding_elems_live();
+    // 1 -> 1024 channels, 3x3 kernel, 10x10 input -> 8x8 output: each spec adds
+    // 2 * 64 fused GEMM rows of 9216 columns. Take the fewest specs past `live`.
+    let (out_channels, in_channels, out_hw, kernel) = (1usize, 1024usize, 8usize, 3usize);
+    let kernel_cols = in_channels * kernel * kernel;
+    let per_spec = 2 * out_hw * out_hw * kernel_cols;
+    let num_specs = live / per_spec + 1;
+    let fused_gemm_out = num_specs * per_spec;
+    assert!(fused_gemm_out > live && fused_gemm_out - live <= per_spec);
+    let params = ny_core::ConvTranspose2dParams {
+        num_specs,
+        out_channels,
+        in_channels,
+        out_h: out_hw,
+        out_w: out_hw,
+        in_h: out_hw + kernel - 1,
+        in_w: out_hw + kernel - 1,
+        kernel_h: kernel,
+        kernel_w: kernel,
+        stride_h: 1,
+        stride_w: 1,
+        pad_h: 0,
+        pad_w: 0,
+    };
+    // The refusal must come from the binding gate, not the dispatch-grid check
+    // that runs first: the fused GEMM grid fits wgpu's 65535 per dimension.
+    let fused_rows = 2 * num_specs * out_hw * out_hw;
+    assert!(fused_rows.div_ceil(16) <= 65_535 && kernel_cols.div_ceil(16) <= 65_535);
+    // Every other binding of this pair is inside the live budget, so the
+    // refusal names the GEMM output.
+    let fused_out_elems = 2 * num_specs * in_channels * params.in_h * params.in_w;
+    assert!(fused_out_elems < fused_gemm_out && fused_rows * out_channels < live);
+
+    let a_len = num_specs * out_hw * out_hw * out_channels;
+    let a_lower = vec![1.0f32; a_len];
+    let a_upper = vec![2.0f32; a_len];
+    let w_arc: Arc<[f32]> = Arc::from(vec![0.5f32; out_channels * kernel_cols]);
+    match device.conv_transpose_2d_pair_cached(&a_lower, &a_upper, &w_arc, &params) {
+        Err(ny_core::NyError::GpuMemoryExceeded {
+            required_bytes,
+            budget_bytes,
+        }) => {
+            assert_eq!(
+                required_bytes,
+                fused_gemm_out * 4,
+                "refusal must name the GEMM output binding's bytes"
+            );
+            assert_eq!(budget_bytes, device.max_binding_bytes_live());
+        }
+        Err(other) => panic!("fused pair past the live limit: unexpected error: {other}"),
+        Ok((lower, _)) => panic!(
+            "fused pair past the live limit must refuse, got {} values",
+            lower.len()
+        ),
+    }
+    assert_eq!(
+        device.conv_transpose_plan_cache_len(),
+        0,
+        "a refused pair must not leave a plan in the cache"
+    );
+}
+
 // ============================================================================
 // SOUND GPU IBP forward oracle (docs/SOUND_GPU_IBP_PLAN.md §7, T1.1 keystone).
 // ============================================================================
@@ -2619,7 +2989,7 @@ fn sound_gpu_ibp_add_encloses_truth_t1_1() {
                 // Unconditional, including the near-overflow config: a finite
                 // endpoint encloses at ANY magnitude, so the shader must pass it
                 // through — `FALLBACK_BOUND` is the non-finite sentinel, not a cap
-                // (#2549 pins the same contract on the CPU linear path).
+                // (a CPU linear-path regression pins the same contract).
                 assert!(glo <= tlo, "S1 add lo violation {i}: {glo} > {tlo}");
                 assert!(ghi >= thi, "S1 add hi violation {i}: {ghi} < {thi}");
                 checks += 1;
@@ -2630,7 +3000,7 @@ fn sound_gpu_ibp_add_encloses_truth_t1_1() {
     eprintln!("sound GPU IBP add oracle: {checks} enclosure checks, 0 violations");
 }
 
-/// #2549 on the GPU: the sound Add passes a FINITE endpoint through at ANY
+/// On the GPU, the sound Add passes a FINITE endpoint through at ANY
 /// magnitude. `FALLBACK_BOUND` marks a non-finite endpoint whose true value is
 /// unknown; a finite sum past it is already a valid enclosure, so clamping it
 /// toward zero would emit a box that fails to contain the truth — the
@@ -3064,8 +3434,8 @@ fn sound_gpu_ibp_conv2d_superset_of_cpu_sound_t1_1() {
 
         // GPU sound conv via the verdict-wired chain driver.
         let layer = GpuIbpLayer::Conv2d {
-            weight: Arc::from(weight.clone()),
-            bias: Some(Arc::from(bias.clone())),
+            weight: Arc::from(weight),
+            bias: Some(Arc::from(bias)),
             out_channels: out_c,
             in_channels: in_c,
             kernel_h: kh,

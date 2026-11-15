@@ -6,7 +6,6 @@
 //!
 //! Accepts flat 1D lower/upper arrays per child and a shared shape, avoiding
 //! per-child BoundedTensor construction before the prescreen pass.
-//! Part of #4366 Packet A.
 
 use ndarray::{Array2, ArrayD, IxDyn};
 use ny_core::{GemmEngine, NyError, Result};

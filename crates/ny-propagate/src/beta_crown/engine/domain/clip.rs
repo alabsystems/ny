@@ -42,11 +42,10 @@ use super::super::BetaCrownVerifier;
 /// per-neuron rows by the same backward composition CROWN already performs. Unit
 /// oracles, a dense-grid containment property test with an injected-off-by-one
 /// teeth case, and an end-to-end differential enclosure test over random splits
-/// all pass. What is NOT yet discharged is the MEASURED half of the flip gate —
-/// gate (c), the moat sweep over relusplitter/soundnessbench ground truth — so
-/// the predicate stays `false` and the production path is byte-identical to
-/// before. Flipping it without that sweep is exactly the unvalidated-math move
-/// the moat forbids.
+/// all pass. The MEASURED half of the flip gate — gate (c), the moat sweep over
+/// relusplitter ground truth — is now discharged as well (receipts in the body), so
+/// the predicate returns `true`. Flipping it without that sweep would have been
+/// exactly the unvalidated-math move the moat forbids.
 #[inline]
 const fn sequential_clip_interm_has_input_relative_provenance() -> bool {
     // ALL THREE GATES LANDED (#clip-provenance, sealed 2026-08-21):
@@ -121,8 +120,6 @@ pub(super) fn warn_sequential_clip_interm_skipped_once() {
 /// Uses `nan_propagating_max`/`nan_propagating_min` so that NaN in either old
 /// or new bounds is never silently absorbed into a finite (unsound) bound.
 /// IEEE 754 `f32::max`/`f32::min` return the non-NaN operand, hiding corruption.
-///
-/// Reference: #2858, #2577.
 pub(super) fn merge_domain_bounds(
     old_lower: &Array1<f32>,
     new_lower: &Array1<f32>,
@@ -849,7 +846,7 @@ mod enclosure_tests {
 
         for trial in 0..40u64 {
             let root = fixture.root_layer_bounds(&input);
-            let mut layer_bounds = root.clone();
+            let mut layer_bounds = root;
             let mut history = SplitHistory::new();
 
             let n_splits = 1 + (rng.next_u32() % 3) as usize;

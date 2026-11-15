@@ -2,13 +2,13 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Budget policy helpers for graph CROWN-IBP collection (#3839).
+//! Budget policy helpers for graph CROWN-IBP collection.
 //!
 //! Two separate policies exist because the sequential fast-path gate and the
 //! graph-native per-node guard serve different purposes:
 //! - The fast-path gate decides which *collector* runs — it must be conservative.
 //! - The graph-native guard decides per-node execution — it may consult
-//!   `crown_ibp_target_can_start_in_patches()` from #3813.
+//!   `crown_ibp_target_can_start_in_patches()`.
 
 use crate::layers::Layer;
 use crate::network::core::GraphNetwork;
@@ -24,7 +24,7 @@ use super::target_backward::{
     ObjectiveChunkFixedWavePlan, ObjectiveChunkRoutePlan,
 };
 
-/// Minimum useful per-node time budget in seconds for DAG CROWN-IBP (#3499).
+/// Minimum useful per-node time budget in seconds for DAG CROWN-IBP.
 ///
 /// KNOWN PATHOLOGY ON SMALL GRAPHS — measured 2026-08-25, NOT fixed here.
 /// `compute_weighted_per_node_budget_secs` refuses a target when its weighted
@@ -42,15 +42,12 @@ use super::target_backward::{
 /// The targets are `dim=2` to `dim=8`; none of them needs 2 seconds, and none of
 /// them ever ran.
 ///
-/// THE LABEL IS FIXED (#per-node-floor-label, 2026-08-25). `crown_tighten.rs`
-/// used to report this below-floor REFUSAL with the same
-/// `PerNodeDeadlineExceeded` reason it uses for a genuine deadline overrun, so
-/// the log read like a timeout and hid this cliff for weeks. The refusal now
-/// carries `CrownIbpFallbackReason::PerNodeBudgetBelowFloor` and its fallback
-/// event says "REFUSED before any backward step". Same TIME class, same
-/// completeness accounting, same bounds — only the claim is corrected. The
-/// quoted log line above is therefore HISTORICAL; at HEAD it reads
-/// `PerNodeBudgetBelowFloor=9`.
+/// `crown_tighten.rs` labels this below-floor REFUSAL
+/// `CrownIbpFallbackReason::PerNodeBudgetBelowFloor` (#per-node-floor-label,
+/// 2026-08-25), not the `PerNodeDeadlineExceeded` reason of a genuine deadline
+/// overrun, and its fallback event says "REFUSED before any backward step". Same
+/// TIME class, same completeness accounting, same bounds. The log line quoted
+/// above predates that label; it now reads `PerNodeBudgetBelowFloor=9`.
 ///
 /// The 2.0 s value is calibrated against conv targets around
 /// `PRESET_CAP_REFERENCE_DIMS` (28,800) rows wide, where it is sensible.
@@ -65,7 +62,7 @@ use super::target_backward::{
 /// `reports/measured-2026/lsnc_relu_artifacts/s1_per_node_floor/README.md`.
 pub(crate) const MIN_PER_NODE_BUDGET_SECS: f64 = 2.0;
 
-/// FLOOR for the global per-node time budget in seconds (#4413).
+/// FLOOR for the global per-node time budget in seconds.
 ///
 /// Historically this was a hard CAP: no target could ever exceed 12 s, whatever
 /// the collection's actual budget. It now serves as the floor of the
@@ -402,6 +399,37 @@ fn resolved_per_node_time_budget(
     }
 }
 
+/// The floor one target is actually held to (#per-node-floor-dim-scale):
+/// `(floor_secs, scaled)`.
+///
+/// Dark (`floor_dim_scaled == false`), this is the resolved floor unchanged and
+/// `scaled == false` — byte-identical to the constant-floor comparison. Armed,
+/// the resolved floor is multiplied by `min(1, raw_node_dims /
+/// PRESET_CAP_REFERENCE_DIMS)`, the SAME reference width `dim_scaled_cap_secs`
+/// scales the cap against, so a 128-wide dense target is held to
+/// `2.0 * 128 / 28_800 ≈ 0.0089 s` while a 28,800-row (or wider) conv keeps the
+/// full floor. Non-finite or non-positive dims fall back to the unscaled floor
+/// rather than to zero: a bad width must not admit everything.
+///
+/// WHY the floor and not the share: the share is cost-proportional
+/// (`remaining * weight / weight_sum`) and the floor was calibrated for
+/// 28,800-row conv targets, so comparing them refuses exactly the CHEAP nodes —
+/// on 11/11 retained ml4acopf early-quit logs 20/118/128-wide dense targets,
+/// including the first two Gemm layers of the 118-bus net, were refused before
+/// any work while the whole cascade used 20 s of 600 (the doc on
+/// `MIN_PER_NODE_BUDGET_SECS` records the same pathology on lsnc_relu).
+pub(super) fn effective_floor_secs_for_dims(
+    budget: &CrownIbpPerNodeTimeBudget,
+    raw_node_dims: f64,
+) -> (f64, bool) {
+    let floor_secs = resolve_per_node_time_budget(budget).floor_secs;
+    if !budget.floor_dim_scaled || !raw_node_dims.is_finite() || raw_node_dims <= 0.0 {
+        return (floor_secs, false);
+    }
+    let ratio = (raw_node_dims / PRESET_CAP_REFERENCE_DIMS).min(1.0);
+    (floor_secs * ratio, true)
+}
+
 /// Resolved floor and base cap after applying environment/preset overrides.
 ///
 /// An unset cap reports the 12 s lower clamp here; the scheduling functions
@@ -416,10 +444,10 @@ pub(super) fn effective_per_node_time_budget(
 }
 
 /// Default aggregate time budget in seconds for patches-startable nodes in the
-/// graph-native CROWN-IBP collector (#3839).
+/// graph-native CROWN-IBP collector.
 ///
 /// This caps the total wall-clock time spent on nodes that pass the dense
-/// memory guard via the #3813 patches-start path when no global deadline is
+/// memory guard via the patches-start path when no global deadline is
 /// present.
 pub(super) const DEFAULT_PATCHES_TIGHTENING_BUDGET_SECS: f64 = 5.0;
 
@@ -880,7 +908,9 @@ pub(crate) fn prefix_cost_multipliers(
                 if !is_admitted {
                     return 1.0;
                 }
-                cost.map_or(1.0, |c| (c / min_cost).clamp(1.0, PREFIX_COST_MULTIPLIER_MAX))
+                cost.map_or(1.0, |c| {
+                    (c / min_cost).clamp(1.0, PREFIX_COST_MULTIPLIER_MAX)
+                })
             })
             .collect(),
     )
@@ -1006,7 +1036,10 @@ pub(crate) fn compute_weighted_per_node_budget_secs(
         budget,
     );
     let capped = share.min(cap_secs);
-    (capped >= resolved.floor_secs).then_some(capped)
+    // #per-node-floor-dim-scale: dark, this is `resolved.floor_secs` exactly.
+    let (floor_secs, _scaled) = effective_floor_secs_for_dims(budget, raw_node_dims);
+    debug_assert!(budget.floor_dim_scaled || floor_secs == resolved.floor_secs);
+    (capped >= floor_secs).then_some(capped)
 }
 
 /// Sum-of-shares budget for ONE stacked multi-target backward
@@ -1553,7 +1586,9 @@ impl GraphNetwork {
     /// sum, so their targets are ADMITTED — fail-open to today's policy,
     /// never a new refusal class. `None` when no weighted ancestor exists or
     /// the graph lacks shape info (also admit).
-    /// `node_shapes` supplies each ancestor's PROPAGATED input geometry.
+    /// `node_shapes` supplies each ancestor's PROPAGATED output geometry.
+    /// Conv2d uses that output grid directly; only its declared input-shape
+    /// fallback must pass through `output_size()`.
     ///
     /// #cprime-shape-source (2026-08-03): this used to read
     /// `layer.input_shape`, which the pipeline never populates on the stored
@@ -1614,18 +1649,25 @@ impl GraphNetwork {
             };
             let per_row: u128 = match &node.layer {
                 Layer::Conv2d(conv) => {
-                    let Some((in_h, in_w)) = shape_of(name).or(conv.input_shape) else {
+                    // A mapped node bound describes this Conv's OUTPUT, not
+                    // its input. Applying output_size again double-applies
+                    // stride/padding/dilation. Revalidate public geometry even
+                    // when the mapped grid bypasses that method.
+                    if conv.validate_geometry().is_err() {
+                        continue;
+                    }
+                    let Some((out_h, out_w)) = shape_of(name).or_else(|| {
+                        let (in_h, in_w) = conv.input_shape?;
+                        conv.output_size(in_h, in_w).ok()
+                    }) else {
                         continue;
                     };
-                    // Verify finding (#cprime-admission attack 1): the executed
-                    // grouped transpose-GEMM contracts in_c/groups per group, and
-                    // the layer's own output_size() accounts for dilation — the
-                    // naive formula over-priced by x groups (x256 depthwise) and
-                    // x1.78 on dilated convs, turning fail-open into wrongful
-                    // refusals on such nets.
-                    let Ok((out_h, out_w)) = conv.output_size(in_h, in_w) else {
+                    if out_h == 0 || out_w == 0 {
                         continue;
-                    };
+                    }
+                    // The grouped transpose-GEMM contracts in_c/groups per
+                    // group. A valid propagated grid already reflects dilation;
+                    // output_size handles it for the declared-input fallback.
                     let (kh, kw) = conv.kernel_size();
                     let in_c_per_group = if conv.kernel.ndim() == 4 {
                         conv.kernel.shape()[1]
@@ -1787,7 +1829,7 @@ pub(super) fn merge_per_node_deadlines(
 impl GraphNetwork {
     /// The sequential collector cannot selectively skip large spatial targets,
     /// so the fast-path gate must conservatively count every dense-overflow
-    /// target when deciding whether to reuse that collector. #3839
+    /// target when deciding whether to reuse that collector.
     pub(super) fn counts_toward_sequential_skip_fraction(
         bounds: &BoundedTensor,
         budget: usize,
@@ -1796,8 +1838,8 @@ impl GraphNetwork {
     }
 
     /// The graph-native collector may keep spatial Conv2d targets on the
-    /// patches-start path landed by #3813, so its per-target budget guard is
-    /// intentionally looser than the sequential fast-path gate. #3839
+    /// patches-start path, so its per-target budget guard is intentionally
+    /// looser than the sequential fast-path gate.
     ///
     /// #patches-dense-peak — WHY THIS PREDICATE CANNOT SEE THE cifar_bias_field_46
     /// MISS, and why widening it is NOT the repair.
@@ -1947,8 +1989,9 @@ mod tests {
     const DEFAULT_BUDGET: CrownIbpPerNodeTimeBudget = CrownIbpPerNodeTimeBudget {
         floor_secs: None,
         cap_secs: None,
-    prefix_cost_weighted: false,
+        prefix_cost_weighted: false,
         max_target_share_frac: None,
+        floor_dim_scaled: false,
     };
 
     /// #cgan-stacked-backward: the stacked pass receives the SUM of its
@@ -2172,8 +2215,9 @@ mod tests {
         let preset = CrownIbpPerNodeTimeBudget {
             floor_secs: Some(1.25),
             cap_secs: Some(150.0),
-        prefix_cost_weighted: false,
+            prefix_cost_weighted: false,
             max_target_share_frac: None,
+            floor_dim_scaled: false,
         };
         assert_eq!(
             resolve_per_node_time_budget_from_raw(&preset, Some("invalid"), Some("-1")),
@@ -2420,8 +2464,9 @@ mod tests {
         let budget = CrownIbpPerNodeTimeBudget {
             floor_secs: None,
             cap_secs: Some(150.0),
-        prefix_cost_weighted: false,
+            prefix_cost_weighted: false,
             max_target_share_frac: None,
+            floor_dim_scaled: false,
         };
         // A single remaining candidate with a long deadline now gets the full
         // preset cap instead of the 12 s constant.
@@ -2444,14 +2489,102 @@ mod tests {
         let budget = CrownIbpPerNodeTimeBudget {
             floor_secs: Some(1.0),
             cap_secs: None,
-        prefix_cost_weighted: false,
+            prefix_cost_weighted: false,
             max_target_share_frac: None,
+            floor_dim_scaled: false,
         };
         // 6/4 = 1.5 s share clears a 1.0 s floor (would be skipped at 2.0 s).
         assert_eq!(
             compute_global_per_node_budget_secs(6.0, 4, &budget),
             Some(1.5)
         );
+    }
+
+    /// #per-node-floor-dim-scale: the constant floor refuses a cheap node
+    /// whose share is 0.05 s; the dim-scaled floor admits it; a 28,800-dim
+    /// target keeps the full 2.0 s floor on both arms; and a preset floor
+    /// composes (it is what gets scaled).
+    #[test]
+    fn per_node_floor_dim_scale_admits_cheap_nodes_and_keeps_the_reference_floor() {
+        let _env = default_budget_env();
+        let dark = CrownIbpPerNodeTimeBudget {
+            floor_secs: None,
+            cap_secs: None,
+            prefix_cost_weighted: false,
+            max_target_share_frac: None,
+            floor_dim_scaled: false,
+        };
+        let armed = CrownIbpPerNodeTimeBudget {
+            floor_dim_scaled: true,
+            ..dark
+        };
+        // A dim=128 dense target holding 1/20 of the weight in a 1 s window:
+        // share = 0.05 s.
+        let (remaining, weight_sum, weight, dims) = (1.0, 20.0, 1.0, 128.0);
+        assert_eq!(
+            compute_weighted_per_node_budget_secs(remaining, weight_sum, weight, dims, &dark),
+            None,
+            "unarmed: 0.05 s share is refused below the 2.0 s constant floor"
+        );
+        assert_eq!(
+            compute_weighted_per_node_budget_secs(remaining, weight_sum, weight, dims, &armed),
+            Some(0.05),
+            "armed: the floor scales to 2.0 * 128 / 28_800 ≈ 0.0089 s and admits the node"
+        );
+        assert_eq!(
+            effective_floor_secs_for_dims(&dark, dims),
+            (MIN_PER_NODE_BUDGET_SECS, false)
+        );
+        let (scaled_floor, scaled) = effective_floor_secs_for_dims(&armed, dims);
+        assert!(scaled);
+        assert!(
+            (scaled_floor - MIN_PER_NODE_BUDGET_SECS * 128.0 / PRESET_CAP_REFERENCE_DIMS).abs()
+                < 1e-12,
+            "scaled floor {scaled_floor}"
+        );
+
+        // A 28,800-dim target keeps the 2.0 s floor on BOTH arms: a 1.9 s share
+        // is refused, a 2.0 s share is admitted.
+        let ref_dims = PRESET_CAP_REFERENCE_DIMS;
+        for budget in [&dark, &armed] {
+            assert_eq!(
+                effective_floor_secs_for_dims(budget, ref_dims).0,
+                MIN_PER_NODE_BUDGET_SECS
+            );
+            assert_eq!(
+                compute_weighted_per_node_budget_secs(19.0, 10.0, 1.0, ref_dims, budget),
+                None,
+                "1.9 s share below the 2.0 s floor at the reference width"
+            );
+            assert_eq!(
+                compute_weighted_per_node_budget_secs(20.0, 10.0, 1.0, ref_dims, budget),
+                Some(2.0),
+                "2.0 s share clears the 2.0 s floor at the reference width"
+            );
+        }
+        // Wider than the reference: the ratio clamps at 1, the floor never grows.
+        assert_eq!(
+            effective_floor_secs_for_dims(&armed, 61_504.0),
+            (MIN_PER_NODE_BUDGET_SECS, true)
+        );
+        // Composes with a preset floor: 1.0 s * 128 / 28_800.
+        let preset_armed = CrownIbpPerNodeTimeBudget {
+            floor_secs: Some(1.0),
+            ..armed
+        };
+        let (composed, scaled) = effective_floor_secs_for_dims(&preset_armed, dims);
+        assert!(scaled);
+        assert!(
+            (composed - 128.0 / 28_800.0).abs() < 1e-12,
+            "composed floor {composed}"
+        );
+        // A bad width must not admit everything.
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                effective_floor_secs_for_dims(&armed, bad),
+                (MIN_PER_NODE_BUDGET_SECS, false)
+            );
+        }
     }
 
     #[test]
@@ -2461,8 +2594,9 @@ mod tests {
             let budget = CrownIbpPerNodeTimeBudget {
                 floor_secs: bad,
                 cap_secs: bad,
-            prefix_cost_weighted: false,
+                prefix_cost_weighted: false,
                 max_target_share_frac: None,
+                floor_dim_scaled: false,
             };
             assert_eq!(
                 effective_per_node_time_budget(&budget),
@@ -2485,8 +2619,9 @@ mod tests {
         let budget = CrownIbpPerNodeTimeBudget {
             floor_secs: None,
             cap_secs: Some(150.0),
-        prefix_cost_weighted: false,
+            prefix_cost_weighted: false,
             max_target_share_frac: None,
+            floor_dim_scaled: false,
         };
         // The 61,504-dim imgSz64 generator target: ratio 2.1355..^2 = 4.56;
         // 150 * 4.56 = 684 s clamps to the 600 s ceiling. With 765 s remaining
@@ -2525,8 +2660,9 @@ mod tests {
         let budget = CrownIbpPerNodeTimeBudget {
             floor_secs: None,
             cap_secs: Some(12.0),
-        prefix_cost_weighted: false,
+            prefix_cost_weighted: false,
             max_target_share_frac: None,
+            floor_dim_scaled: false,
         };
 
         let wide =
@@ -2591,8 +2727,9 @@ mod tests {
         let budget = CrownIbpPerNodeTimeBudget {
             floor_secs: None,
             cap_secs: Some(700.0),
-        prefix_cost_weighted: false,
+            prefix_cost_weighted: false,
             max_target_share_frac: None,
+            floor_dim_scaled: false,
         };
         assert_eq!(
             compute_weighted_per_node_budget_secs(10_000.0, 100_000.0, 61_504.0, 61_504.0, &budget,),
@@ -2665,8 +2802,9 @@ mod tests {
         let budget = CrownIbpPerNodeTimeBudget {
             floor_secs: None,
             cap_secs: Some(150.0),
-        prefix_cost_weighted: false,
+            prefix_cost_weighted: false,
             max_target_share_frac: None,
+            floor_dim_scaled: false,
         };
         let scheduling_weight = 9_000.0;
         let raw_node_dims = 61_504.0;
@@ -2770,8 +2908,9 @@ mod tests {
         let budget = CrownIbpPerNodeTimeBudget {
             floor_secs: None,
             cap_secs: Some(150.0),
-        prefix_cost_weighted: false,
+            prefix_cost_weighted: false,
             max_target_share_frac: None,
+            floor_dim_scaled: false,
         };
         let raw_dims = 28_800.0;
         let work_weight = objective_fixed_wave_work_weight(28_800, 4) as f64;
@@ -3671,6 +3810,7 @@ mod target_cost_weight_policy_tests {
         cap_secs: None,
         prefix_cost_weighted: false,
         max_target_share_frac: None,
+        floor_dim_scaled: false,
     };
 
     /// `collector_walk_macs` returns `2 · rows · Σ per_row`, so dividing the row
@@ -3717,8 +3857,7 @@ mod target_cost_weight_policy_tests {
     fn prefix_cost_multipliers_normalise_to_the_cheapest_admitted_target() {
         let costs = [Some(64.0), Some(1088.0), Some(2112.0)];
         let admitted = [true, true, true];
-        let multipliers =
-            prefix_cost_multipliers(&costs, &admitted).expect("every target priced");
+        let multipliers = prefix_cost_multipliers(&costs, &admitted).expect("every target priced");
         assert_eq!(multipliers, vec![1.0, 17.0, 33.0]);
     }
 
@@ -3799,9 +3938,8 @@ mod target_cost_weight_policy_tests {
             (uncapped_share - 360.0).abs() < 1e-9,
             "dark policy hands one node 90% of the window: {uncapped_share}"
         );
-        let capped_share =
-            compute_weighted_per_node_budget_secs(400.0, 100.0, 90.0, 90.0, &capped)
-                .expect("capped share");
+        let capped_share = compute_weighted_per_node_budget_secs(400.0, 100.0, 90.0, 90.0, &capped)
+            .expect("capped share");
         assert!(
             (capped_share - 100.0).abs() < 1e-9,
             "the cap must clamp it to 25% of the window: {capped_share}"
@@ -3875,3 +4013,7 @@ mod target_cost_weight_policy_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "budget_policy_conv_output_tests.rs"]
+mod conv_output_geometry_tests;

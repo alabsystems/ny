@@ -6,8 +6,6 @@
 //!
 //! Verifies that RoPE composes correctly with other layers in a GraphNetwork,
 //! including both IBP forward and CROWN backward propagation.
-//!
-//! Part of #3155.
 
 use crate::*;
 use ndarray::{arr1, arr2};

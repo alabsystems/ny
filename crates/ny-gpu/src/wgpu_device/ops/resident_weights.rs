@@ -44,6 +44,20 @@
 //! conv-transpose plan caches, so all pointer-keyed entries (and their
 //! keep-alive `Arc`s) drop together before any new model's weights are built.
 //!
+//! ## A failed upload is never cached
+//!
+//! wgpu reports a failed `create_buffer` or `write_buffer` (out of memory, or
+//! a size past a device limit) through the error scopes and still hands back a
+//! buffer handle, so a cached entry could hold an invalid buffer that fails
+//! every later call with the same weight until `clear_crown_working_set`. A
+//! miss therefore uploads inside its own error scope and caches the buffer
+//! only when that scope is clean. Inside a checked transaction (the
+//! deadline-bounded intermediate sweeps) a nested scope is not allowed: its
+//! pop has no deadline. There the transaction's own scopes cover the upload,
+//! the new entry stays UNCOMMITTED, a clean `finish` commits it, and a
+//! transaction that ends any other way evicts it
+//! (`discard_transaction_resident_weights`).
+//!
 //! ## Gate
 //!
 //! `NY_RESIDENT_WEIGHTS=0` opts out (per-call upload, no caching) — the A/B
@@ -54,6 +68,7 @@ use std::sync::Arc;
 
 use ny_core::{NyError, Result};
 
+use super::super::error_scope::run_gpu_checked_on_device;
 use super::super::WgpuDevice;
 
 /// Which derived form of the constant weight bytes a resident buffer holds.
@@ -113,6 +128,11 @@ pub(crate) struct ResidentWeightEntry {
     keep_alive: Arc<[f32]>,
     /// The GPU-resident buffer holding the derived form's bytes, uploaded once.
     buffer: Arc<wgpu::Buffer>,
+    /// Uploaded inside a checked transaction whose error scopes have not yet
+    /// popped clean, so the upload is not yet known to have succeeded. The
+    /// transaction's clean `finish` clears it; a transaction that ends any
+    /// other way evicts every entry still carrying it.
+    uncommitted: bool,
 }
 
 /// Whether the resident-weight cache is enabled (default ON;
@@ -155,8 +175,26 @@ impl WgpuDevice {
         weight: &Arc<[f32]>,
         form: WeightForm,
     ) -> Result<Arc<wgpu::Buffer>> {
+        self.resident_weight_buf_with(weight, form, || self.upload_weight_form(weight, form))
+    }
+
+    /// [`Self::resident_weight_buf`] with the upload passed in. Production
+    /// passes [`Self::upload_weight_form`]; the gpu-tests pins pass an upload
+    /// that hits a wgpu error, standing in for an allocation failure they
+    /// cannot provoke on demand.
+    ///
+    /// A miss uploads inside its OWN wgpu error scope and caches the buffer
+    /// only when that scope is clean, except inside a checked transaction,
+    /// where the entry is cached UNCOMMITTED and the transaction commits or
+    /// evicts it (module doc, "A failed upload is never cached").
+    fn resident_weight_buf_with(
+        &self,
+        weight: &Arc<[f32]>,
+        form: WeightForm,
+        upload: impl FnOnce() -> Result<wgpu::Buffer>,
+    ) -> Result<Arc<wgpu::Buffer>> {
         if !resident_weights_enabled() {
-            return Ok(Arc::new(self.upload_weight_form(weight, form)?));
+            return Ok(Arc::new(upload()?));
         }
 
         let key = resident_weight_key(weight, form);
@@ -176,7 +214,16 @@ impl WgpuDevice {
             }
         }
 
-        let buffer = Arc::new(self.upload_weight_form(weight, form)?);
+        // Outside a transaction the upload gets its own scope, so a failed
+        // upload returns `Err` before anything is cached. Inside one, a nested
+        // scope is not allowed (its pop has no deadline); the transaction's
+        // scopes cover the upload and decide the entry's fate.
+        let in_transaction = self.checked_transaction_active();
+        let buffer = Arc::new(if in_transaction {
+            upload()?
+        } else {
+            run_gpu_checked_on_device(&self.device, form.label(), upload)?
+        });
         let mut cache = self.resident_weight_buffers.lock().map_err(|err| {
             NyError::InternalError(format!("resident weight cache lock poisoned: {err}"))
         })?;
@@ -185,8 +232,44 @@ impl WgpuDevice {
         let entry = cache.entry(key).or_insert_with(|| ResidentWeightEntry {
             keep_alive: Arc::clone(weight),
             buffer,
+            uncommitted: in_transaction,
         });
         Ok(Arc::clone(&entry.buffer))
+    }
+
+    /// Trust the uploads a checked transaction made: its error scopes popped
+    /// clean, so every upload under them succeeded. Called by the
+    /// transaction's successful `finish`/`finish_bounded`.
+    ///
+    /// Recovers a poisoned lock: a panic elsewhere leaves the map itself
+    /// intact, and this runs on the transaction's finishing path.
+    pub(in crate::wgpu_device) fn commit_transaction_resident_weights(&self) {
+        let mut cache = self
+            .resident_weight_buffers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for entry in cache.values_mut() {
+            entry.uncommitted = false;
+        }
+    }
+
+    /// Evict every upload that no clean transaction finish has committed.
+    /// Called when a checked transaction ends (an error, an expired deadline,
+    /// or an early `?` exit drops it before a clean `finish`, and after a
+    /// clean finish any later upload is still uncommitted), and when one
+    /// begins, so uncommitted entries only ever belong to the transaction in
+    /// progress. Such an upload may hold an invalid buffer; keeping it would
+    /// fail every later call with the same weight until
+    /// `clear_crown_working_set`.
+    ///
+    /// Recovers a poisoned lock and never panics: it runs from the
+    /// transaction's `Drop`.
+    pub(in crate::wgpu_device) fn discard_transaction_resident_weights(&self) {
+        let mut cache = self
+            .resident_weight_buffers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.retain(|_, entry| !entry.uncommitted);
     }
 
     /// Allocate + upload the derived bytes for `form` (the once-per-key path).
@@ -480,6 +563,169 @@ mod gpu_tests {
                 .expect("fresh");
             assert_eq!(read_back(&device, &fresh_buf, 64), vec![-9.0f32; 64]);
         }
+
+        device.clear_crown_working_set().expect("clear");
+        assert_eq!(device.resident_weight_cache_len(), 0);
+    }
+
+    /// An upload that wgpu rejects, standing in for a `create_buffer` that
+    /// fails (out of memory, or a size past a device limit): wgpu reports the
+    /// error through the error scopes and still hands back a handle.
+    fn invalid_upload(device: &WgpuDevice) -> Result<wgpu::Buffer> {
+        let past_limit = device
+            .device
+            .limits()
+            .max_buffer_size
+            .checked_add(4)
+            .expect("max_buffer_size + 4 fits u64");
+        Ok(device.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("resident weight fault pin: past max_buffer_size"),
+            size: past_limit,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        }))
+    }
+
+    /// (e) An upload that hit a wgpu error never enters the cache. Before the
+    /// fix the buffer was cached inside the caller's scope: that call failed,
+    /// and every later call with the same weight got the invalid buffer until
+    /// `clear_crown_working_set`.
+    #[test]
+    fn resident_weight_upload_with_gpu_error_is_not_cached() {
+        let _g = gpu_test_serial_guard();
+        let device = require_device();
+        device.clear_crown_working_set().expect("clear");
+
+        let w: Arc<[f32]> = Arc::from(vec![1.5f32, -2.0, 0.25, -0.5]);
+        let failed = device.run_gpu_checked("resident weight upload fault pin", || {
+            device.resident_weight_buf_with(&w, WeightForm::Raw, || invalid_upload(&device))
+        });
+        let cached_after_failure = device.resident_weight_cache_len();
+        match &failed {
+            Err(NyError::InternalError(msg)) => assert!(
+                msg.contains("wgpu validation error"),
+                "the upload's wgpu error must fail the call: {msg}"
+            ),
+            Err(other) => panic!("expected the upload's wgpu validation error, got {other}"),
+            Ok(_) => panic!("an upload that hit a wgpu error must not return a buffer"),
+        }
+        assert_eq!(
+            cached_after_failure, 0,
+            "an upload that hit a wgpu error must not enter the resident weight cache"
+        );
+
+        let retry = device
+            .resident_weight_buf(&w, WeightForm::Raw)
+            .expect("the same weight uploads clean after a failed upload");
+        assert_eq!(device.resident_weight_cache_len(), 1);
+        assert_eq!(read_back(&device, &retry, w.len()), w[..].to_vec());
+
+        device.clear_crown_working_set().expect("clear");
+        assert_eq!(device.resident_weight_cache_len(), 0);
+    }
+
+    /// (f) Inside a checked transaction an upload cannot push its own error
+    /// scope (its pop has no deadline), so the transaction decides: a clean
+    /// `finish` keeps the upload, a transaction whose scopes caught the
+    /// upload's error evicts it, and so does one dropped before finishing (an
+    /// early `?` exit).
+    #[test]
+    fn resident_weight_upload_in_a_transaction_is_kept_only_after_a_clean_finish() {
+        use std::time::{Duration, Instant};
+
+        let _g = gpu_test_serial_guard();
+        let device = require_device();
+        device.clear_crown_working_set().expect("clear");
+        let deadline = || Instant::now() + Duration::from_secs(60);
+        let w: Arc<[f32]> = Arc::from(vec![3.0f32, -1.0, 0.5, -0.25]);
+
+        // A clean transaction commits its upload: the entry survives the
+        // transaction and serves the next call without a re-upload.
+        let committed = {
+            let mut transaction = device
+                .begin_gpu_checked_transaction("resident weight commit pin", deadline())
+                .expect("begin");
+            let buf = device
+                .resident_weight_buf(&w, WeightForm::Raw)
+                .expect("upload inside the transaction");
+            transaction
+                .finish("resident weight commit pin")
+                .expect("a clean transaction finishes");
+            buf
+        };
+        assert_eq!(
+            device.resident_weight_cache_len(),
+            1,
+            "a clean transaction keeps its upload"
+        );
+        let uploads = device.resident_weight_upload_count();
+        let hit = device
+            .resident_weight_buf(&w, WeightForm::Raw)
+            .expect("hit after the commit");
+        assert!(
+            Arc::ptr_eq(&committed, &hit),
+            "the committed entry serves the hit"
+        );
+        assert_eq!(
+            device.resident_weight_upload_count(),
+            uploads,
+            "no re-upload"
+        );
+        assert_eq!(read_back(&device, &hit, w.len()), w[..].to_vec());
+        device.clear_crown_working_set().expect("clear");
+
+        // A transaction whose scopes catch the upload's wgpu error evicts it.
+        let error = {
+            let mut transaction = device
+                .begin_gpu_checked_transaction("resident weight fault pin", deadline())
+                .expect("begin");
+            let buf = device
+                .resident_weight_buf_with(&w, WeightForm::Raw, || invalid_upload(&device))
+                .expect("inside a transaction the upload leaves its error to the transaction");
+            drop(buf);
+            assert_eq!(
+                device.resident_weight_cache_len(),
+                1,
+                "the upload is cached, uncommitted, while the transaction runs"
+            );
+            transaction
+                .finish("resident weight fault pin")
+                .expect_err("the transaction's scopes catch the upload's validation error")
+        };
+        assert!(
+            error.to_string().contains("validation"),
+            "unexpected transaction error: {error}"
+        );
+        assert_eq!(
+            device.resident_weight_cache_len(),
+            0,
+            "a transaction that did not finish clean must evict the upload it made"
+        );
+
+        // A transaction dropped before finishing (an early `?` exit) evicts
+        // its uploads too: nothing proved them good.
+        {
+            let _transaction = device
+                .begin_gpu_checked_transaction("resident weight early exit pin", deadline())
+                .expect("begin");
+            device
+                .resident_weight_buf(&w, WeightForm::Raw)
+                .expect("upload inside the transaction");
+        }
+        assert_eq!(
+            device.resident_weight_cache_len(),
+            0,
+            "a transaction dropped before finishing must evict its uploads"
+        );
+
+        // Outside any transaction the same weight uploads clean.
+        let retry = device
+            .resident_weight_buf(&w, WeightForm::Raw)
+            .expect("clean upload after the failed transaction");
+        assert_eq!(device.resident_weight_cache_len(), 1);
+        assert_eq!(read_back(&device, &retry, w.len()), w[..].to_vec());
 
         device.clear_crown_working_set().expect("clear");
         assert_eq!(device.resident_weight_cache_len(), 0);

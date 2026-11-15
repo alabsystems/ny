@@ -65,8 +65,10 @@ use ny_core::f32_to_f64_exact;
 use ny_onnx::{load_onnx_with_config, OnnxLoadConfig};
 use ny_propagate::Interval64;
 
+use super::unsat_receipt::UnsatReceipt;
 use super::vnncomp::VnncompResult;
 use ny_onnx::{CompoundNodePolicy, GraphNetworkOptions};
+use ny_propagate::certify::LegacyUnsatAuthority;
 
 mod model_identity;
 mod property_identity;
@@ -152,6 +154,8 @@ fn round_up(v: f64) -> f64 {
 /// self-check/enclosure failure, or bound too loose) so the caller falls
 /// through to the generic verifier with no behavior change.
 pub(crate) fn try_tll_unsat(onnx: &Path, vnnlib: &Path) -> Option<VnncompResult> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Exact);
     // Keep publication unreachable during qualification of the complete raw
     // model + exact-decimal property authentication chain.
     if !TLL_PROPERTY_SOURCE_AUTHENTICATED {
@@ -271,7 +275,9 @@ fn try_tll_unsat_authenticated(onnx: &Path, vnnlib: &Path) -> Option<VnncompResu
                     "min-of-max"
                 }
             );
-            return Some(VnncompResult::Unsat);
+            return Some(VnncompResult::Unsat(UnsatReceipt::legacy_uncovered(
+                LegacyUnsatAuthority::TllStructure,
+            )));
         }
     }
     None
@@ -647,7 +653,7 @@ mod tests {
         );
         assert_eq!(
             try_tll_unsat_authenticated(Path::new(&model), Path::new(&property)),
-            Some(VnncompResult::Unsat)
+            Some(VnncompResult::test_unsat())
         );
     }
 

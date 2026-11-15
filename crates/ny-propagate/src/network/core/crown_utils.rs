@@ -6,7 +6,7 @@
 //! propagation paths.
 //!
 //! Moved from `graph_crown/propagation.rs` to break the bidirectional dependency
-//! between `core/` and `graph_crown/` (#2380).
+//! between `core/` and `graph_crown/`.
 
 use ny_core::{nan_propagating_max, nan_propagating_min, NyError, Result};
 use ny_tensor::BoundedTensor;
@@ -24,7 +24,7 @@ pub(crate) fn tighten_crown_with_forward_bounds(
     crown_output: &BoundedTensor,
     output_bounds: &BoundedTensor,
 ) -> Result<(BoundedTensor, usize)> {
-    // Upgraded from debug_assert_eq! to runtime check (#2875, #2920 WP-C).
+    // Upgraded from debug_assert_eq! to runtime check.
     // In release mode, mismatched shapes silently truncate the zip, producing
     // partial tightening with incorrect disjoint_count.
     if crown_output.shape() != output_bounds.shape() {
@@ -46,7 +46,7 @@ pub(crate) fn tighten_crown_with_forward_bounds(
         .zip(output_lower.iter().zip(output_upper.iter()))
     {
         // NaN-safe: nan_propagating_{max,min} return NaN if either operand is NaN,
-        // preventing silent absorption (IEEE 754: NaN.max(x) = x). (#2643)
+        // preventing silent absorption (IEEE 754: NaN.max(x) = x).
         let tightened_lower = nan_propagating_max(*cl, *il);
         let tightened_upper = nan_propagating_min(*cu, *iu);
         if tightened_lower <= tightened_upper {
@@ -64,7 +64,7 @@ pub(crate) fn tighten_crown_with_forward_bounds(
         }
     }
 
-    // Use new_allow_infinite: CROWN output may contain ±Inf from #2681
+    // Use new_allow_infinite: CROWN output may contain ±Inf from the
     // non-finite row fallback. After per-element intersection with finite IBP
     // bounds, affected elements become finite. If both CROWN and IBP are
     // infinite for an element, ±Inf is the correct (maximally loose) result.
@@ -118,7 +118,7 @@ mod tests {
         assert_eq!(tightened.upper()[[0]], 4.0);
     }
 
-    /// #2681: ±Inf CROWN bounds (from non-finite A-matrix row fallback) should
+    /// ±Inf CROWN bounds (from non-finite A-matrix row fallback) should
     /// be tightened to IBP via per-element intersection. This is the core
     /// mechanism that makes per-row IBP fallback work.
     #[test]

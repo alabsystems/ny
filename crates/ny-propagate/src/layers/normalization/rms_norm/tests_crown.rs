@@ -5,12 +5,10 @@
 //! CROWN backward tests for RmsNorm layer.
 //!
 //! Tests the CROWN scalar path (crown_common.rs) including:
-//! - NaN/Inf pre-activation guard (non-finite → constant bounds, #3259)
+//! - NaN/Inf pre-activation guard (non-finite → constant bounds)
 //! - Sound mode refusal
 //! - Cut mode identity passthrough
 //! - Jacobian overflow → NumericalInstability
-//!
-//! Part of #3103.
 
 use ndarray::{arr1, ArrayD, IxDyn};
 use ny_core::NyError;
@@ -24,9 +22,9 @@ use crate::LinearBounds;
 // ── CROWN scalar NaN/Inf pre-activation guard tests ─────────────────────────
 // These test the non-finite guard in crown_common.rs which returns constant
 // bounds (A=0, bias=[-inf, +inf]) when pre-activation bounds contain NaN or
-// Inf. Previously returned unsound identity passthrough (#3259).
+// Inf. Previously returned unsound identity passthrough.
 
-/// NaN in pre-activation lower bound triggers constant bounds fallback (#3259).
+/// NaN in pre-activation lower bound triggers constant bounds fallback.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_scalar_nan_pre_activation_lower_returns_constant_bounds() {
@@ -65,7 +63,7 @@ fn test_crown_scalar_nan_pre_activation_lower_returns_constant_bounds() {
     );
 }
 
-/// NaN in pre-activation upper bound triggers constant bounds fallback (#3259).
+/// NaN in pre-activation upper bound triggers constant bounds fallback.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_scalar_nan_pre_activation_upper_returns_constant_bounds() {
@@ -103,7 +101,7 @@ fn test_crown_scalar_nan_pre_activation_upper_returns_constant_bounds() {
     );
 }
 
-/// Inf in pre-activation bounds triggers constant bounds fallback (#3259).
+/// Inf in pre-activation bounds triggers constant bounds fallback.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_scalar_inf_pre_activation_returns_constant_bounds() {
@@ -189,9 +187,9 @@ fn test_crown_cut_mode_returns_identity() {
     assert_eq!(result.upper_a(), bounds.upper_a());
 }
 
-/// IBP-validated margins widen CROWN bounds for near-zero inputs (#3162).
+/// IBP-validated margins widen CROWN bounds for near-zero inputs.
 ///
-/// The #3162 regression seed (c0=0, c1=-0.131, c2=0, hw0=0.05, hw1=0.22, hw2=0.05)
+/// The regression seed (c0=0, c1=-0.131, c2=0, hw0=0.05, hw1=0.22, hw2=0.05)
 /// has near-zero inputs where the RMS denominator is small and the function
 /// has extreme curvature. Without IBP validation, sampling-only margins are
 /// insufficient and CROWN returns unsound bounds.
@@ -208,7 +206,7 @@ fn test_crown_ibp_margin_widens_near_zero_inputs_3162() {
         .expect("valid RmsNorm")
         .with_crown_mode(LayerNormCrownMode::IbpValidated);
 
-    // #3162 regression seed: near-zero centers with small half-widths
+    // Regression seed: near-zero centers with small half-widths
     let pre_act = BoundedTensor::new(
         ArrayD::from_shape_vec(IxDyn(&[3]), vec![-0.05, -0.351, -0.05]).expect("valid shape"),
         ArrayD::from_shape_vec(IxDyn(&[3]), vec![0.05, 0.089, 0.05]).expect("valid shape"),

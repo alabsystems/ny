@@ -9,9 +9,9 @@ use super::const_fold::{
     is_exact_materialized_int64_cast,
 };
 use super::fusion::{
-    fold_batch_norm_into_conv_linear_with_context, try_discriminate_instance_norm,
-    try_fuse_causal_softmax, try_fuse_gelu, try_fuse_gelu_tanh, try_fuse_layer_norm,
-    try_fuse_logsumexp, try_fuse_merge_linear,
+    fold_batch_norm_into_conv_linear_with_context, try_collapse_relu_pairs,
+    try_discriminate_instance_norm, try_fuse_causal_softmax, try_fuse_gelu, try_fuse_gelu_tanh,
+    try_fuse_layer_norm, try_fuse_logsumexp, try_fuse_merge_linear,
 };
 use super::{BatchNormFoldingPolicy, CustomOpRegistry};
 use crate::onnx_proto;
@@ -57,11 +57,16 @@ const DECOMPOSED_TANH_GELU_SOURCE_AUTHENTICATED: bool = false;
 // this semantic remap can publish.
 const DECOMPOSED_INSTANCE_NORM_SOURCE_AUTHENTICATED: bool = false;
 
-// The current perturbation radius is not an outward-rounded enclosure of the
-// full QuantizeLinear -> DequantizeLinear f32 pipeline at saturation ties.
-// Keep it dark until division, ties-to-even, clamp, dequant multiplication,
-// and bound addition are all accounted for with directed rounding.
-const QDQ_PERTURBATION_SOURCE_AUTHENTICATED: bool = false;
+// Activation QuantizeLinear -> DequantizeLinear fusion is governed by the
+// dark `OnnxLoadConfig::qdq_activation_relaxation` gate (typed preset key
+// `model.qdq_activation_relaxation`, default OFF), NOT by a const in this
+// block. The historical `QDQ_PERTURBATION_SOURCE_AUTHENTICATED = false` const
+// stood here while the half-scale radius lacked a FLOAT32 certificate;
+// `QdqPerturbationLayer::try_certified` now carries the outward-rounded
+// enclosure of the full typed pipeline (division AND reciprocal-multiply
+// kernel models, ties-to-even, saturation, reconstruction multiply), with the
+// exhaustive containment suite in `ny-propagate`'s
+// `layers/misc/qdq_perturbation/tests.rs` as its certificate.
 
 // Conv/Gemm -> BatchNormalization folding: governed by `BatchNormFoldingPolicy`,
 // NOT by a const in this block.
@@ -179,6 +184,7 @@ pub(super) fn convert_graph_to_layers(
     raw_int64_shape_values: &std::collections::HashSet<String>,
     merge_linear_enabled: bool,
     batch_norm_folding: BatchNormFoldingPolicy,
+    qdq_activation_relaxation: bool,
 ) -> Result<Vec<LayerSpec>> {
     use std::collections::{HashMap, HashSet};
 
@@ -260,12 +266,32 @@ pub(super) fn convert_graph_to_layers(
         if node_is_fully_materialized_constant(node, weights, graph_output_names) {
             continue;
         }
-        if node.op_type == "QuantizeLinear" && QDQ_PERTURBATION_SOURCE_AUTHENTICATED {
+        if node.op_type == "QuantizeLinear" && qdq_activation_relaxation {
             if let Some((spec, taken)) =
                 try_fuse_qdq_relaxation(nodes, idx, &consumers_by_input, graph_output_names)
             {
                 fused_starts.insert(idx, spec);
                 consumed.extend(taken);
+                continue;
+            }
+        }
+        // #relu-pair-collapse: an exact undo of a ReLU split (relusplitter).
+        // Bit-exact pattern match, no rounding: the rewritten graph is the same
+        // real function. Always on; the line below is its observable.
+        if node.op_type == "Gemm" {
+            if let Some(collapse) = try_collapse_relu_pairs(
+                nodes,
+                idx,
+                &consumers_by_input,
+                weights,
+                graph_output_names,
+            ) {
+                eprintln!(
+                    "[relu-pair-collapse] node={} split_rows={} passthrough_rows={}",
+                    node.name, collapse.split_rows, collapse.passthrough_rows
+                );
+                fused_starts.extend(collapse.starts);
+                consumed.extend(collapse.consumed);
                 continue;
             }
         }

@@ -2598,16 +2598,16 @@ fn reduce_complete_clip_gpu_gather(
 /// Map the refusal recorded by `prep_resnet_domain_with` onto the distinct
 /// `gather_prep_*` identifier reported for the per-parent prep exit.
 ///
-/// Measured 2026-08-10 on relusplitter `oval21 base_kw`, that ONE exit is 664 of
-/// 789 waves, so the flat `gather_prep_resnet_domain` label is the new dominant
-/// bucket and splitting it is the next question, not a later one.
+/// Measured 2026-08-10 on relusplitter `oval21 base_kw`, that ONE exit was 664 of
+/// 789 waves, so it is split per refusal reason; the flat `gather_prep_resnet_domain`
+/// label is only the fallback for an unrecognised reason.
 fn complete_clip_prep_refusal_label(reason: &str) -> &'static str {
     match reason {
         "prep_extract_segments" => "gather_prep_extract_segments",
         // #clip-gather-probe L3: the extraction's own exit labels, forwarded by
         // `prep_resnet_domain_with`. Measured 2026-08-10 on relusplitter `oval21
         // base_kw`, `gather_prep_extract_segments` was 613 of 616 waves that reached
-        // the gather, so splitting THAT bucket is the next question.
+        // the gather, so THAT bucket is split per extraction exit below.
         "extract_cycle_guard" => "gather_extract_cycle_guard",
         "extract_bn_at_input" => "gather_extract_bn_at_input",
         "extract_step_non_relu_alpha" => "gather_extract_step_non_relu_alpha",
@@ -10407,7 +10407,7 @@ mod tests {
 /// constructor and fails fast when no device earns all five authority rungs.
 #[cfg(test)]
 #[derive(Default)]
-pub(super) struct HermeticSoundGpuCrownEngine {
+pub(in crate::beta_crown::engine) struct HermeticSoundGpuCrownEngine {
     bound_calls: std::sync::atomic::AtomicUsize,
     gradient_calls: std::sync::atomic::AtomicUsize,
     /// Cooperative-cancellation deadline, scoped by the caller exactly as a real
@@ -11271,11 +11271,11 @@ mod gpu_tests {
     /// a portable unit test.  Once selected it has no skip path: adapter
     /// creation, the five-rung authority qualification, extraction, dispatch,
     /// and enclosure checking all fail loudly on debt or unsupported hardware.
-    #[cfg(feature = "gpu-tests")]
+    #[cfg(feature = "gpu-tests-uncharged")]
     #[test]
     fn interm_refine_public_qualified_wgpu_sound_fold_is_non_vacuous() {
         let device = ny_gpu::WgpuDevice::new_for_verdict(ny_gpu::WgpuVerdictRequest::new())
-            .expect("gpu-tests requires a WGPU device that passes all five authority rungs");
+            .expect("gpu-tests-uncharged requires an adapter passing the UNCHARGED five-rung ladder (subnormal-preserving, EFT-exact: measured on Vulkan+DenormPreserve); a pure-flush adapter (Apple/Metal) refuses by hardware");
         let engine: &dyn GemmEngine = &device;
         let gpu = engine
             .as_gpu_crown_backward()
@@ -16027,7 +16027,7 @@ fn root_tighten_relu_preactivations_with_options(
         };
         report.base_folds_completed += 1;
         let mut best_l = base.lower_bounds.clone();
-        let mut best_u = base.upper_bounds.clone();
+        let mut best_u = base.upper_bounds;
         let obj0: f32 = best_l.iter().filter(|v| v.is_finite()).sum();
         let mut best_obj = obj0;
 
@@ -17071,8 +17071,14 @@ mod root_sparse_target_tests {
             scoped_sparse_crown_targets(&graph, &bounds, 2, 2, 1),
             vec!["res1".to_string()]
         );
-        assert!(scoped_sparse_crown_targets(&graph, &bounds, 1, 2, 4).is_empty());
-        assert!(scoped_sparse_crown_targets(&graph, &bounds, 2, 0, 4).is_empty());
+        assert_eq!(
+            (scoped_sparse_crown_targets(&graph, &bounds, 1, 2, 4)).len(),
+            0
+        );
+        assert_eq!(
+            (scoped_sparse_crown_targets(&graph, &bounds, 2, 0, 4)).len(),
+            0
+        );
     }
 }
 

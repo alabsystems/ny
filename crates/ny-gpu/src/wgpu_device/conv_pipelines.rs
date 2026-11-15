@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Conv2d CROWN backward GPU pipeline creation (#3397).
+//! Conv2d CROWN backward GPU pipeline creation.
 //!
 //! Split from crown_pipelines.rs for file size compliance.
 
@@ -10,7 +10,7 @@ use super::shaders::{CONV_COL2IM_SHADER, CONV_RESHAPE_SHADER};
 use super::WgpuDevice;
 
 impl WgpuDevice {
-    /// Conv2d A-matrix reshape pipeline (#3397).
+    /// Conv2d A-matrix reshape pipeline.
     /// 3 bindings: params (uniform), src (read), dst (write).
     pub(super) fn create_conv_reshape_pipeline(
         device: &wgpu::Device,
@@ -80,7 +80,7 @@ impl WgpuDevice {
         (pipeline, bind_group_layout)
     }
 
-    /// Conv2d col2im gather pipeline (#3397).
+    /// Conv2d col2im gather pipeline.
     /// 3 bindings: params (uniform), gemm_out (read), dst (write).
     pub(super) fn create_conv_col2im_pipeline(
         device: &wgpu::Device,

@@ -8,8 +8,6 @@
 //! matching the alpha-beta-CROWN-style RmsNorm decomposition. `Sampling`
 //! remains the explicit opt-in heuristic path and still delegates to the
 //! shared sampling-based CROWN linearization in [`super::super::crown_common`].
-//!
-//! Reference: designs/2026-03-14-rmsnorm-shared-decomposed-crown.md
 
 use ny_core::{checked_shape_product, NyError, Result};
 use ny_tensor::BoundedTensor;
@@ -23,6 +21,7 @@ use crate::layers::normalization::decomposed::{
     scalar_bounds_to_batched, scalar_bounds_to_batched_multi_dim, InvRmsOverride,
 };
 use crate::layers::normalization::layer_norm::types::LayerNormCrownMode;
+use crate::layers::normalization::radial;
 use crate::LinearBounds;
 
 impl RmsNormLayer {
@@ -74,12 +73,25 @@ impl RmsNormLayer {
             pre_shape, batch_size, norm_size
         );
         let reshaped_pre = pre_activation.reshape(&[batch_size, norm_size])?;
-        let batched_bounds = scalar_bounds_to_batched_multi_dim(bounds, batch_size, norm_size)?;
+        let checked_route =
+            self.crown_mode == LayerNormCrownMode::IbpValidated && !self.forward_mode;
+        let batched_bounds = if checked_route {
+            radial::scalar_to_batched_multi(bounds, batch_size, norm_size)?
+        } else {
+            scalar_bounds_to_batched_multi_dim(bounds, batch_size, norm_size)?
+        };
         let result = self.propagate_linear_batched_with_bounds_inv_rms(
             &batched_bounds,
             &reshaped_pre,
             inv_rms_override,
         )?;
+        if checked_route {
+            return Ok(Some(radial::batched_to_scalar_multi(
+                &result,
+                bounds.lower_b(),
+                bounds.upper_b(),
+            )?));
+        }
         Ok(Some(batched_bounds_to_scalar_multi_dim(
             &result,
             bounds.lower_b(),
@@ -156,10 +168,14 @@ impl RmsNormLayer {
         }
 
         // IbpValidated: route through decomposed primitive-chain CROWN backward
-        // (same decomposed path as block-wise graph CROWN). Part of #3821.
+        // (same decomposed path as block-wise graph CROWN).
         if self.crown_mode == LayerNormCrownMode::IbpValidated {
             let flattened_bounds = BoundedTensor::new(pre_lower.into_dyn(), pre_upper.into_dyn())?;
-            let batched_bounds = scalar_bounds_to_batched(bounds)?;
+            let batched_bounds = if !self.forward_mode {
+                radial::scalar_to_batched(bounds)?
+            } else {
+                scalar_bounds_to_batched(bounds)?
+            };
             // Flattened scalar path => exactly one normalization group (b=0).
             let override_for_group = inv_rms_override
                 .and_then(|w| w.first().copied().flatten())
@@ -179,10 +195,75 @@ impl RmsNormLayer {
                     &flattened_bounds,
                 )?,
             };
+            if !self.forward_mode {
+                let refined = radial::refine_batched(
+                    &batched_bounds,
+                    decomposed.bounds,
+                    &flattened_bounds,
+                    &self.ny,
+                    None,
+                    self.eps,
+                    false,
+                )?;
+                return radial::batched_to_scalar(&refined);
+            }
             return batched_bounds_to_scalar(&decomposed.bounds);
         }
 
         // Sampling: heuristic Jacobian-based linearization (no IBP validation)
         sampling_crown_scalar(self, bounds, &pre_lower, &pre_upper)
+    }
+
+    /// Direct checked Taylor carrier for the mathematical real RMSNorm.
+    /// It covers the full input box; it does not assume a GenBaB inv-rms
+    /// window. Default CROWN retains the conditional baseline unless this
+    /// full-box candidate dominates it pointwise.
+    pub fn propagate_radial_linear_with_bounds(
+        &self,
+        bounds: &LinearBounds,
+        pre_activation: &BoundedTensor,
+        budget: Option<&crate::certify::work::WorkBudget>,
+    ) -> Result<LinearBounds> {
+        if self.forward_mode {
+            return Err(NyError::UnsupportedOp(
+                "radial RMSNorm requires the mathematical real contract".into(),
+            ));
+        }
+        let mut bridge_lease = radial::admit_bridge(bounds, budget)?;
+        let shape = pre_activation.shape();
+        let n = *shape
+            .last()
+            .ok_or_else(|| NyError::InvalidSpec("radial RMSNorm needs a last dimension".into()))?;
+        let groups = checked_shape_product(&shape[..shape.len() - 1])
+            .ok_or_else(|| NyError::InvalidSpec("radial RMSNorm batch overflow".into()))?;
+        let result = if groups == 1 {
+            let b = radial::scalar_to_batched(bounds)?;
+            radial::batched_to_scalar(&radial::candidate_batched(
+                &b,
+                pre_activation,
+                &self.ny,
+                None,
+                self.eps,
+                false,
+                budget,
+            )?)
+        } else {
+            let b = radial::scalar_to_batched_multi(bounds, groups, n)?;
+            radial::batched_to_scalar_multi(
+                &radial::candidate_batched(
+                    &b,
+                    pre_activation,
+                    &self.ny,
+                    None,
+                    self.eps,
+                    false,
+                    budget,
+                )?,
+                bounds.lower_b(),
+                bounds.upper_b(),
+            )
+        }?;
+        radial::complete_bridge(&mut bridge_lease)?;
+        Ok(result)
     }
 }

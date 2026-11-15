@@ -54,9 +54,22 @@ impl BetaCrownVerifier {
                 let verified =
                     self.config
                         .domain_is_verified(child.lower_bound, child.upper_bound, threshold);
+                if verified {
+                    self.cover_note_bound(
+                        objective,
+                        threshold,
+                        &child.history,
+                        Some(&child.beta_state),
+                        child.lower_bound,
+                        child.upper_bound,
+                    );
+                }
                 ChildOutcome::Evaluated(Box::new(child), verified)
             }
-            Err(ref e) if e.is_infeasible_domain() => ChildOutcome::Infeasible,
+            Err(ref e) if e.is_infeasible_domain() => {
+                self.cover_note_infeasible(objective, threshold, &child.history, None);
+                ChildOutcome::Infeasible
+            }
             Ok(false) | Err(_) => ChildOutcome::Failed,
         }
     }
@@ -74,8 +87,12 @@ impl BetaCrownVerifier {
         engine: Option<&dyn GemmEngine>,
     ) -> Result<ChildOutcome> {
         let Some(child) =
-            domain.with_constraint(graph, constraint, self.config.verify_upper_bound)?
+            domain.with_constraint(graph, constraint.clone(), self.config.verify_upper_bound)?
         else {
+            // `Ok(None)` ONLY for a genuinely empty half-space (see
+            // `GraphBabDomain::with_constraint`): on the ledger, that child's
+            // region is closed empty.
+            self.cover_note_infeasible(objective, threshold, &domain.history, Some(&constraint));
             return Ok(ChildOutcome::NoChild);
         };
 

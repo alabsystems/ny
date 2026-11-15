@@ -559,7 +559,7 @@ fn test_native_model_to_graph_network() {
         }
         Err(e) => {
             // IBP fails for this fixture due to shape mismatches in the conv stem.
-            // This is a known limitation tracked in #1721. Assert the specific
+            // This is a known limitation. Assert the specific
             // expected error to avoid silently passing when IBP breaks for
             // other reasons. When conv stem IBP is implemented, this branch
             // should never execute — the Ok branch has full soundness checks.
@@ -608,7 +608,7 @@ fn test_hf_config_default_values() {
     let json = r#"{}"#;
     let hf_config: HfConfig = serde_json::from_str(json).expect("Failed to parse");
 
-    assert!(hf_config.architectures.is_empty());
+    assert_eq!((hf_config.architectures).len(), 0);
     assert_eq!(hf_config.model_type, "");
     assert!(hf_config.d_model.is_none());
     assert!(hf_config.num_hidden_layers.is_none());

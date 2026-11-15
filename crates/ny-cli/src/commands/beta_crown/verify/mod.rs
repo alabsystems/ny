@@ -12,6 +12,11 @@
 
 mod attack_budget;
 mod attack_extension;
+/// Root-pruned, per-disjunct, many-restart attack stage
+/// (#attack-open-disjuncts, VIBECHECK_PLAN §6.V3). Typed preset keys
+/// `attack.open_disjunct_*`, dark by default; attack-only. `pub(super)` so
+/// vnncomp's entry hook can arm the margin-row root publication.
+pub(super) mod attack_open_disjuncts;
 /// Adaptive attack stall cutoff (#attack-stall, design S4): stop a disjunctive
 /// PGD phase whose margin has plateaued and let the bound/BaB phases have the
 /// rest. Default-inert; attack-budget only.
@@ -24,7 +29,7 @@ mod disjunctive_box_refine;
 mod disjunctive_per_disjunct;
 mod disjunctive_pgd;
 mod disjunctive_precheck;
-/// Unified input-split disjunctive BaB lane (Packet B of #3740).
+/// Unified input-split disjunctive BaB lane.
 mod disjunctive_unified;
 mod graph;
 mod graph_pgd;
@@ -35,6 +40,11 @@ mod graph_pgd_fast_gradient_evidence;
 mod graph_pgd_init;
 mod graph_pgd_vjp_batched;
 mod graph_pgd_vjp_batched_disj;
+/// #disj-odi (FRONTIER_PLAN §7.F1): ODI phase and dangerous-class focus lanes
+/// for the batched disjunctive exact-VJP driver. Typed preset keys
+/// `attack.pgd_disj_odi` / `attack.pgd_disj_focus_lanes`, dark by default;
+/// attack-only.
+mod graph_pgd_vjp_disj_odi;
 /// Default-off exact adaptive complete cover for authenticated NN4SYS clause
 /// boxes with two or three genuinely ranged input coordinates.
 mod nn4sys_nd_cover;
@@ -51,6 +61,8 @@ mod potential_violation;
 mod sequential;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_attack_concurrent;
 #[cfg(test)]
 mod tests_conjunctive_routing;
 #[cfg(test)]
@@ -82,6 +94,10 @@ pub(crate) use super::constraint_plan::{
     build_constraint_objective, build_multi_objectives, classify_constraints, AggregationMode,
 };
 pub(crate) use super::engine_dispatch::dispatch_graph_constraint;
+/// #admission-precision: the graph lane's multi-objective route check, for the
+/// bit-identity tests (`spec_shape_tests`).
+#[cfg(test)]
+pub(crate) use graph::multi_objective_route;
 pub(in crate::commands::beta_crown) use pgd_precheck::{try_pgd_before_mip, PgdMipPrecheck};
 pub(in crate::commands::beta_crown) use potential_violation::confirm_potential_violation;
 // Private use — accessible from child modules (disjunctive, tests, etc.)
@@ -183,7 +199,9 @@ pub(super) fn verify_relational_constraints(
         super::attack_arming::AttackEngineSource::Static(gemm_engine),
         json,
         &ledger,
-    )
+        None,
+    )?
+    .into_ordinary()
 }
 
 /// Dispatch relational verification under an already-started authoritative
@@ -206,7 +224,11 @@ pub(super) fn verify_relational_constraints_with_ledger(
     attack_engine_source: super::attack_arming::AttackEngineSource<'_>,
     json: bool,
     ledger: &PhaseBudgetLedger,
-) -> Result<BetaCrownResult> {
+    // #attack-concurrent: the race context for the top-level conjunctive
+    // lanes. The disjunctive lane never runs the upfront PGD these sites race,
+    // so it is not handed on there.
+    concurrent: Option<&super::attack_concurrent::ConcurrentAttackCtx<'_>>,
+) -> Result<super::verification_outcome::VerificationOutcome> {
     // ENTRY to the sign-normalized objective subtree: every lane below builds
     // its rows with `build_constraint_objective`, whose violation-semantics
     // encoding is decided by `lower(spec·Y) > threshold` for EVERY row. Pin the
@@ -227,7 +249,11 @@ pub(super) fn verify_relational_constraints_with_ledger(
     // one clause the disjunctive aggregation (UNSAT ⇔ ALL clauses impossible)
     // degenerates to exactly the conjunctive reading of that clause, so the
     // verdict semantics are unchanged.
-    if vnnlib.has_multi_constraint_disjunction() || vnnlib.has_boxed_clause_disjunction() {
+    //
+    //
+    // #admission-precision: the check is `enters_disjunctive_lane`, the
+    // router's `admission::disjunctive_lane` on the one extractor's shape.
+    if enters_disjunctive_lane(vnnlib) {
         return disjunctive::verify_multi_clause_disjunction(
             model_net,
             input,
@@ -244,7 +270,34 @@ pub(super) fn verify_relational_constraints_with_ledger(
             attack_engine_source,
             json,
             ledger,
-        );
+        )
+        .map(super::verification_outcome::VerificationOutcome::ordinary);
+    }
+
+    // Only this whole-instance unary route may retain an original hull proof.
+    // Clause/subdomain legacy callers below cannot mint instance authority.
+    if let BetaCrownModel::Sequential(network) = model_net {
+        if planned_sequential_conjunction_graph_config(config, vnnlib, use_relu_split).is_none() {
+            return sequential::verify_sequential_relational_outcome(
+                network,
+                input,
+                vnnlib,
+                config,
+                verifier,
+                pgd_attack,
+                pgd_restarts,
+                pgd_steps,
+                timeout,
+                gemm_engine,
+                json,
+                ledger,
+                true,
+                // #attack-concurrent x the instance-hull route (eng15 merge):
+                // this direct Sequential entry is the conjunctive SeqUpfront
+                // site's top-level caller, so it carries the race context.
+                concurrent,
+            );
+        }
     }
 
     verify_relational_constraints_impl(
@@ -263,7 +316,20 @@ pub(super) fn verify_relational_constraints_with_ledger(
         attack_engine_source,
         json,
         ledger,
+        None,
+        concurrent,
     )
+    .map(super::verification_outcome::VerificationOutcome::ordinary)
+}
+
+/// #admission-precision: whether the relational verifier forwards `vnnlib`
+/// to the multi-clause disjunctive lane (`verify_multi_clause_disjunction`):
+/// a top-level OR of two or more clauses, or clauses with their own input
+/// boxes (`has_multi_constraint_disjunction() ||
+/// has_boxed_clause_disjunction()`). The check is the router's
+/// `ny_core::router::admission::disjunctive_lane` on `spec_shape::shape_of`.
+pub(crate) fn enters_disjunctive_lane(vnnlib: &VnnLibSpec) -> bool {
+    ny_core::router::admission::disjunctive_lane(&super::spec_shape::shape_of(vnnlib))
 }
 
 /// Whether a sequential relational property needs the shared multi-row graph lane.
@@ -294,15 +360,27 @@ pub(super) fn should_upgrade_sequential_conjunction_to_graph(
     vnnlib: &VnnLibSpec,
     use_relu_split: bool,
 ) -> bool {
-    if classify_constraints(vnnlib).aggregation != AggregationMode::Conjunctive
-        || vnnlib.output_constraints.len() < 2
-    {
-        return false;
-    }
-    // Reducible same-LHS input-split properties (acasxu prop_2/3/4) keep the
-    // sequential lane and its per-domain CROWN-IBP intermediates. ReLU splitting
-    // and non-reducible conjunctions still upgrade.
-    use_relu_split || sequential::normalize_same_lhs_reduction(vnnlib).is_none()
+    // A conjunction (`classify_constraints(..).aggregation == Conjunctive`, i.e.
+    // not `is_disjunction`) of at least two atoms. Reducible same-LHS
+    // input-split properties (acasxu prop_2/3/4) keep the sequential lane and
+    // its per-domain CROWN-IBP intermediates. ReLU splitting and non-reducible
+    // conjunctions still upgrade.
+    //
+    // #admission-precision: the check is the router's
+    // `admission::sequential_conjunction_upgrade` on the one extractor's
+    // shape (`same_lhs_reducible` is `normalize_same_lhs_reduction(..)
+    // .is_some()`, `disjunction` the aggregation the planner reads).
+    ny_core::router::admission::sequential_conjunction_upgrade(
+        &super::spec_shape::shape_of(vnnlib),
+        use_relu_split,
+    )
+}
+
+/// #admission-precision: whether the sequential lane's same-LHS relational
+/// reduction applies (`spec_shape::shape_of` reads it through this, so the
+/// shape and the lane share the reduction itself).
+pub(super) fn same_lhs_reducible(vnnlib: &VnnLibSpec) -> bool {
+    sequential::normalize_same_lhs_reduction(vnnlib).is_some()
 }
 
 /// Adapt the bound bootstrap when a same-LHS Sequential conjunction is routed
@@ -373,6 +451,12 @@ fn verify_relational_constraints_impl(
     attack_engine_source: super::attack_arming::AttackEngineSource<'_>,
     json: bool,
     ledger: &PhaseBudgetLedger,
+    // #disjunctive-shared-bootstrap: only the serial disjunctive loop passes
+    // `Some`, and only for a `BetaCrownModel::Graph` on the ReLU-split route.
+    shared_bootstrap: Option<&ny_propagate::SharedGraphBootstrap>,
+    // #attack-concurrent: only the top-level conjunctive dispatch passes
+    // `Some` (the disjunctive lane's nested calls run no upfront PGD).
+    concurrent: Option<&super::attack_concurrent::ConcurrentAttackCtx<'_>>,
 ) -> Result<BetaCrownResult> {
     // For conjunctive properties with >=2 constraints on Sequential models, convert
     // to Graph and use the multi-objective conjunctive BaB path. Joint BaB is
@@ -394,7 +478,6 @@ fn verify_relational_constraints_impl(
     //
     // `use_relu_split` is threaded through unchanged below: input-split callers
     // still enter the graph input-split engine, not ReLU-split BaB.
-    // Reference: designs/2026-03-05-joint-conjunctive-bab.md Phase 4.
     if let BetaCrownModel::Sequential(network) = model_net {
         if let Some(mut graph_config) =
             planned_sequential_conjunction_graph_config(config, vnnlib, use_relu_split)
@@ -430,6 +513,10 @@ fn verify_relational_constraints_impl(
                 attack_engine_source,
                 json,
                 ledger,
+                // A graph built here from the Sequential model is not the one
+                // any shared bootstrap was computed on.
+                None,
+                concurrent,
             );
         }
     }
@@ -449,6 +536,8 @@ fn verify_relational_constraints_impl(
             attack_engine_source,
             json,
             ledger,
+            shared_bootstrap,
+            concurrent,
         )
     } else {
         let network = match model_net {
@@ -473,6 +562,7 @@ fn verify_relational_constraints_impl(
             gemm_engine,
             json,
             ledger,
+            concurrent,
         )
     }
 }
@@ -528,12 +618,58 @@ fn disjunctive_failure_to_final_status(
     }
 }
 
+/// Describe the first constraint that was NOT proved violated, for the
+/// conjunctive failure message.
+///
+/// #budget-abandonment FIX D. `finalize_relational_status` used to take COUNTS
+/// ONLY, so the per-constraint `BabVerificationStatus::Unknown { reason }` --
+/// the only place the real cause is written down -- was discarded at
+/// `constraint_iter.rs`. Measured at HEAD on 11 ml4acopf rows driven
+/// individually at the official 600 s: 8 rows carried
+/// "No constraint was provably violated", and in 7 of them the failing clause
+/// had NEVER PRODUCED A ROOT BOUND (the warmup-cap abandonment, FIX A) --
+/// invisible behind the wrapper. The historical sentence is kept verbatim as a
+/// prefix.
+///
+/// THIS IS NOT PURELY COSMETIC, and the earlier claim that it was ("text only,
+/// no control flow") is withdrawn. Unknown reason STRINGS gate control flow in
+/// this subsystem: `disjunctive_unified.rs` matches
+/// `reason.contains("No unstable") && reason.contains("neurons")` to decide
+/// whether to run the post-BaB no-branchable-neuron PGD fallback, and
+/// it is the only such matcher on a production path here. With the inner
+/// reason threaded through, a conjunctive aggregate whose first unproved
+/// constraint ended for that cause now MATCHES where the count-only wrapper
+/// never could, so the fallback attack can newly fire on the
+/// `disjunctive.rs` -> `verify_relational_constraints_impl` -> conjunctive
+/// route. That is INTENDED: the fallback exists to attack exactly that cause, and the
+/// wrapper was suppressing it. It is also moat-neutral -- the fallback can only
+/// produce a `sat` CANDIDATE, which still passes `confirm_potential_violation`
+/// and the trusted ONNX-Runtime gate before it is scored, and it cannot alter
+/// any `unsat`. Pinned by
+/// `conjunctive_detail_reaches_the_no_branchable_neuron_pgd_gate`.
+pub(super) fn first_unproved_constraint_detail(
+    results: &[(String, BabVerificationStatus)],
+) -> Option<String> {
+    results.iter().find_map(|(desc, status)| match status {
+        BabVerificationStatus::Verified => None,
+        BabVerificationStatus::Unknown { reason } => Some(format!("constraint {desc}: {reason}")),
+        BabVerificationStatus::Timeout => Some(format!(
+            "constraint {desc}: timed out before proving violation"
+        )),
+        BabVerificationStatus::PotentialViolation { .. } => Some(format!(
+            "constraint {desc}: may hold (no counterexample confirmed)"
+        )),
+        BabVerificationStatus::Violated { .. } => None,
+    })
+}
+
 /// Compute final relational status from aggregation mode and safety-proof count.
 fn finalize_relational_status(
     aggregation: AggregationMode,
     proved_violated_count: usize,
     total_constraint_count: usize,
     checked_constraints: usize,
+    first_unproved: Option<&str>,
 ) -> BabVerificationStatus {
     match aggregation {
         AggregationMode::Disjunctive => {
@@ -553,10 +689,19 @@ fn finalize_relational_status(
                 BabVerificationStatus::Verified
             } else {
                 BabVerificationStatus::Unknown {
-                    reason: format!(
-                        "No constraint was provably violated ({} constraints checked)",
-                        checked_constraints
-                    ),
+                    reason: match first_unproved {
+                        // The historical sentence stays verbatim as a PREFIX so
+                        // nothing that matches it breaks; the inner reason is
+                        // appended inside the same parenthesis.
+                        Some(detail) => format!(
+                            "No constraint was provably violated ({} constraints checked; {})",
+                            checked_constraints, detail
+                        ),
+                        None => format!(
+                            "No constraint was provably violated ({} constraints checked)",
+                            checked_constraints
+                        ),
+                    },
                 }
             }
         }
@@ -570,7 +715,7 @@ fn finalize_relational_status(
 /// satisfied at the output, meaning this is a genuine unsafe input.
 ///
 /// Used by both graph and sequential paths for cross-validating per-constraint
-/// BaB counterexamples against the full property. Part of #3209.
+/// BaB counterexamples against the full property.
 pub(super) fn check_unsafe_counterexample(
     output: &ArrayD<f32>,
     constraints: &[OutputConstraint],
@@ -583,7 +728,7 @@ pub(super) fn check_unsafe_counterexample(
     }
 
     /// Safely retrieve an output value by index. Returns `None` on OOB,
-    /// preventing silent 0.0 substitution. Part of #4375.
+    /// preventing silent 0.0 substitution.
     fn out_at(output: &ArrayD<f32>, i: usize) -> Option<f32> {
         output.iter().nth(i).copied()
     }
@@ -649,7 +794,7 @@ pub(super) fn verify_standard(
                         output_dim
                     );
                 }
-                // Build augmented network via shared eval helper (#1881 Step 4)
+                // Build augmented network via shared eval helper
                 let mut coeffs = vec![0.0f32; output_dim];
                 coeffs[output_idx] = 1.0;
                 let augmented = augment_network_with_spec(network, coeffs)?;
@@ -685,7 +830,7 @@ pub(super) fn verify_standard(
             }
             let mut objective = vec![0.0f32; output_dim];
             objective[output_idx] = 1.0;
-            // Dispatch via shared engine adapter (#1881)
+            // Dispatch via shared engine adapter
             Ok(dispatch_graph_constraint(
                 verifier,
                 graph,

@@ -80,7 +80,7 @@ pub(super) fn screen_child_domain(
     if verifier.config.enable_relaxed_clip {
         let child_shape = child_input.lower().shape().to_vec();
         if parent_linear_bounds.is_some() {
-            // #3870 Gap B: prefer parent linear bounds for child clipping.
+            // Prefer parent linear bounds for child clipping.
             // The child box is a subset of the parent, so the parent's CROWN
             // linear coefficients are valid over-approximations for clipping.
             let result = clip_child_with_parent_linear(
@@ -204,7 +204,7 @@ pub(super) fn screen_child_domain(
     };
 
     if verifier.config.reorder_bab {
-        // #3870: When complete clipping's Lagrangian path returns no active
+        // When complete clipping's Lagrangian path returns no active
         // constraints (e.g., the spec constraint is fully covered at the input
         // level for a simple graph), the deferred CROWN pass still benefits from
         // carrying IBP bounds for the clipped child input. These bounds are at
@@ -273,7 +273,8 @@ pub(super) fn screen_child_domain(
     meta.update_bounds(child_lower_bound, child_upper_bound)?;
     meta.cached_la = child_linear_bounds
         .as_ref()
-        .map(|lb| Arc::new(cache_input_split_linear_bounds(lb)));
+        .and_then(|lb| cache_input_split_linear_bounds(lb, &child_input))
+        .map(Arc::new);
     meta.set_node_bounds_override(None)?;
     meta.set_needs_bounding(false);
 

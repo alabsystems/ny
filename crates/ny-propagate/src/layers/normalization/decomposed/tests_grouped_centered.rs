@@ -8,8 +8,6 @@
 //! produces sound linear bounds that always contain the true GroupNorm output.
 //! GroupNorm normalizes each group of channels independently across all channels
 //! in the group and all spatial/time positions.
-//!
-//! Part of #4209.
 
 use super::grouped_centered::decomposed_grouped_centered_crown_backward;
 use super::tests_support::{constant_batched_bounds, interpolate};

@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Clip-in-alpha CROWN and forward-linear-bounds regressions (#3776, #3438, #3813 warm-start).
+//! Clip-in-alpha CROWN, forward-linear-bounds and warm-start regressions.
 
 use std::collections::HashMap;
 
@@ -392,8 +392,6 @@ fn test_constrained_backward_warm_start_seeds_last_branch_node_3813() {
 /// identical across different objectives. This proves the existing joint
 /// multi-objective route is preserved — if per-clause decomposition were used,
 /// each clause would have a different constraint set and different tightening.
-///
-/// Part of #3776.
 #[test]
 fn test_clip_in_alpha_crown_multi_objective_shared_tightening_3776() {
     let graph = build_two_relu_clip_graph();

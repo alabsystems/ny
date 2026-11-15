@@ -19,7 +19,7 @@
 //! learnable parameters) into a composition of primitives that all carry
 //! sound CROWN relaxations and, critically, optimizable alpha state in the
 //! DAG alpha loop: Reciprocal tangent points (`ReciprocalAlpha`) and
-//! MulBinary alphas (#3439). This is the analog of alpha-beta-CROWN's
+//! MulBinary alphas. This is the analog of alpha-beta-CROWN's
 //! `bound_opts={'softmax': 'complex'}` (vnncomp23 vit winner recipe).
 //!
 //! # The shift constant
@@ -49,7 +49,7 @@
 //!   backward (`is_softmax_decomposition_mul`); any non-finite coefficient at
 //!   the MulBinary triggers `MulBinaryDispatchResult::SoftmaxNonFinite` →
 //!   sound IBP fallback, and Exp/Reciprocal CROWN domain-guard errors degrade
-//!   to sound per-node IBP concretization (#3596). The NaN firewall remains
+//!   to sound per-node IBP concretization. The NaN firewall remains
 //!   the backstop but is not relied upon.
 //!
 //! Rewrites are opt-in per preset (`solver.alpha-crown.softmax: complex`) and
@@ -78,14 +78,25 @@ use super::{GraphNetwork, GraphNode, NETWORK_INPUT};
 /// gate on the input-interval radius.
 pub const SOFTMAX_COMPLEX_SHIFT_GUARD: f64 = 80.0;
 
-/// Outcome of [`GraphNetwork::decompose_softmax_complex`].
+/// Outcome of [`GraphNetwork::decompose_softmax_complex`] and
+/// [`GraphNetwork::decompose_softmax_complex_fixed_index`].
 #[derive(Debug, Default)]
 pub struct SoftmaxComplexReport {
     /// Softmax nodes replaced by the primitive subgraph.
     pub decomposed: Vec<String>,
     /// Softmax nodes left untouched (direct-LSE path), with the reason.
     pub skipped: Vec<(String, String)>,
+    /// Fixed-index rewrite only: decomposed nodes whose PLAIN-IBP relative
+    /// logit `u_i - l_{j*}` exceeds [`SOFTMAX_COMPLEX_SHIFT_GUARD`]. The
+    /// constant-shift rewrite skips such nodes; the fixed-index rewrite keeps
+    /// them (see `softmax_fixed_index.rs`) and only counts them here. Always
+    /// empty for the constant-shift rewrite.
+    pub wide_ibp: Vec<String>,
 }
+
+// #softmax-fixed-index: the `complex_fixed_index` variant of this rewrite.
+#[path = "softmax_fixed_index.rs"]
+mod fixed_index;
 
 /// Per-node rewrite plan computed before any graph mutation.
 struct NodePlan {
@@ -361,11 +372,21 @@ impl GraphNetwork {
         self.declared_shapes.insert(sum_name, reduced_shape.clone());
         self.declared_shapes.insert(recip_name, reduced_shape);
 
-        // Structural mutation: clear exec-order / ancestor / dispatch caches.
+        // The forward-linear and CROWN-IBP caches hold bounds for the old
+        // Softmax graph, while their request keys contain no graph-structure
+        // identity. A structural rewrite must drop those proof objects before
+        // it can retain any post-rewrite cache authority.
+        self.invalidate_forward_linear_cache();
+        // Clear exec-order / ancestor / dispatch caches and mint a fresh graph
+        // semantic identity for the rewritten node set.
         self.invalidate_exec_order_cache();
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "softmax_complex_cache_tests.rs"]
+mod cache_invalidation_tests;
 
 #[cfg(test)]
 mod tests {
@@ -442,7 +463,7 @@ mod tests {
         );
         let report = graph.decompose_softmax_complex(&input).unwrap();
         assert_eq!(report.decomposed, vec!["sm".to_string()]);
-        assert!(report.skipped.is_empty());
+        assert_eq!((report.skipped).len(), 0);
         assert_eq!(graph.num_nodes(), 5);
 
         // Chain shape: sm = MulBinary(sm/sm_exp, sm/sm_recip), recip <- sum <- exp <- shift.
@@ -549,7 +570,7 @@ mod tests {
             );
 
             // Sample: box center, 64 random points, and axis-aligned vertices.
-            let mut samples: Vec<Vec<f32>> = vec![centers.clone()];
+            let mut samples: Vec<Vec<f32>> = vec![centers];
             for _ in 0..64 {
                 samples.push(
                     lower
@@ -589,7 +610,7 @@ mod tests {
         let mut graph = softmax_graph(-1);
         let input = box_tensor(&[1, 3], vec![-200.0; 3], vec![200.0; 3]);
         let report = graph.decompose_softmax_complex(&input).unwrap();
-        assert!(report.decomposed.is_empty());
+        assert_eq!((report.decomposed).len(), 0);
         assert_eq!(report.skipped.len(), 1);
         assert!(
             report.skipped[0].1.contains("exp guard"),

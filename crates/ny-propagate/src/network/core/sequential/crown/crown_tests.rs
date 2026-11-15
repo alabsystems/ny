@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Integration tests for sequential CROWN propagation.
-//!
-//! Extracted from `crown.rs` inline tests as part of #4233 Packet A.
 
 use super::bounds_validation::has_nan_bounds;
 use super::{
@@ -164,7 +162,7 @@ fn propagate_crown_inf_weight_per_element_intersection() -> Result<()> {
     Ok(())
 }
 
-/// #2681: Soundness regression test — CROWN through a network with
+/// Soundness regression test — CROWN through a network with
 /// differentiated output rows produces sound, non-NaN bounds.
 ///
 /// Note: A single linear layer does NOT trigger CROWN A-matrix overflow
@@ -297,7 +295,7 @@ fn propagate_crown_with_tile_layer_succeeds() -> Result<()> {
         crown_output.upper()[[0]].is_finite(),
         "CROWN upper bound should be finite"
     );
-    // CROWN should be at least as tight as IBP (after #2990 intersection)
+    // CROWN should be at least as tight as IBP (after the IBP intersection)
     assert!(
         crown_output.lower()[[0]] >= ibp_output.lower()[[0]] - 1e-5,
         "CROWN lower ({}) should be >= IBP lower ({})",
@@ -319,8 +317,6 @@ fn propagate_crown_with_tile_layer_succeeds() -> Result<()> {
 /// Before the explicit `Layer::Slice` arm in `crown_backward_step`, Slice fell
 /// to the wildcard dispatch. The explicit arm matches the Tile/Transpose pattern
 /// for consistency and defense in depth.
-///
-/// Reference: #3105
 #[test]
 fn propagate_crown_with_slice_layer_succeeds() -> Result<()> {
     use crate::layers::SliceLayer;
@@ -373,8 +369,8 @@ fn propagate_crown_with_slice_layer_succeeds() -> Result<()> {
 }
 
 /// Verify that has_degraded_bounds detects non-finite values (NaN, Inf).
-/// Used by fast.rs (#2287) and SDP-CROWN for paths that need full
-/// non-finite detection. The main tightening path uses `has_nan_bounds` (#2681).
+/// Used by fast.rs and SDP-CROWN for paths that need full
+/// non-finite detection. The main tightening path uses `has_nan_bounds`.
 #[test]
 fn has_degraded_bounds_detects_non_finite() -> Result<()> {
     let valid = BoundedTensor::new(arr1(&[-1.0]).into_dyn(), arr1(&[1.0]).into_dyn())?;
@@ -391,7 +387,7 @@ fn has_degraded_bounds_detects_non_finite() -> Result<()> {
         "NaN lower should be detected"
     );
 
-    // Inf detection — the primary post-#2287 case (repaired elements become [-inf, +inf])
+    // Inf detection — the primary case (repaired elements become [-inf, +inf])
     let inf_bounds = BoundedTensor::new_unchecked(
         arr1(&[f32::NEG_INFINITY]).into_dyn(),
         arr1(&[f32::INFINITY]).into_dyn(),
@@ -403,7 +399,7 @@ fn has_degraded_bounds_detects_non_finite() -> Result<()> {
     Ok(())
 }
 
-/// Verify that has_nan_bounds detects NaN but not ±Inf (#2681).
+/// Verify that has_nan_bounds detects NaN but not ±Inf.
 #[test]
 fn has_nan_bounds_distinguishes_nan_from_inf() -> Result<()> {
     let valid = BoundedTensor::new(arr1(&[-1.0]).into_dyn(), arr1(&[1.0]).into_dyn())?;
@@ -417,7 +413,7 @@ fn has_nan_bounds_distinguishes_nan_from_inf() -> Result<()> {
         BoundedTensor::new_unchecked(arr1(&[f32::NAN]).into_dyn(), arr1(&[1.0]).into_dyn())?;
     assert!(has_nan_bounds(&nan_lower), "NaN should be detected");
 
-    // ±Inf should NOT be detected — handled by per-element intersection (#2681)
+    // ±Inf should NOT be detected — handled by per-element intersection
     let inf_bounds = BoundedTensor::new_unchecked(
         arr1(&[f32::NEG_INFINITY]).into_dyn(),
         arr1(&[f32::INFINITY]).into_dyn(),
@@ -429,7 +425,7 @@ fn has_nan_bounds_distinguishes_nan_from_inf() -> Result<()> {
     Ok(())
 }
 
-/// #2681: When CROWN produces ±inf for some rows (from non-finite A-matrix
+/// When CROWN produces ±inf for some rows (from non-finite A-matrix
 /// row fallback), tighten_crown_output should do per-row IBP fallback —
 /// not fall back to IBP for the entire network.
 ///
@@ -476,7 +472,7 @@ fn tighten_crown_output_per_row_ibp_fallback_2681() -> Result<()> {
     Ok(())
 }
 
-/// #2681: NaN bounds still trigger full IBP fallback (not per-element).
+/// NaN bounds still trigger full IBP fallback (not per-element).
 #[test]
 fn tighten_crown_output_nan_falls_back_to_ibp() -> Result<()> {
     let crown_output = BoundedTensor::new_unchecked(
@@ -512,9 +508,9 @@ fn tighten_crown_output_nan_falls_back_to_ibp() -> Result<()> {
     Ok(())
 }
 
-/// #3301: Shape mismatch with matching element count → reshape CROWN to
-/// match forward shape, then intersect. Verifies the #3300 defensive
-/// reshape path (crown.rs lines 570-587).
+/// Shape mismatch with matching element count → reshape CROWN to
+/// match forward shape, then intersect. Verifies the defensive shape-tolerant
+/// reshape path in tighten.rs.
 ///
 /// Uses non-uniform per-element bounds to verify that the reshape preserves
 /// row-major element ordering (element [i,j] maps to [i*3+j] in flat layout).
@@ -567,7 +563,7 @@ fn tighten_crown_output_shape_mismatch_reshape_3301() -> Result<()> {
     Ok(())
 }
 
-/// #3301: Different element counts → skip intersection entirely, return
+/// Different element counts → skip intersection entirely, return
 /// CROWN output unchanged. Verifies the logging-only skip path
 /// (crown.rs lines 598-607).
 #[test]

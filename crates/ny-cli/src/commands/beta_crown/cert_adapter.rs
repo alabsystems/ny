@@ -296,6 +296,23 @@ fn build_problem_for_margin(
     })
 }
 
+/// #soundness-spine M2a: the one `[proof-artifact]` line of a requested
+/// certificate, printed when the emission pass ends by any exit. Write-only.
+#[derive(Default)]
+struct ArtifactRecord {
+    written: bool,
+}
+
+impl Drop for ArtifactRecord {
+    fn drop(&mut self) {
+        if self.written {
+            eprintln!("[proof-artifact] artifact=written");
+        } else {
+            eprintln!("[proof-artifact] artifact=none(not_emitted; see the cert: log line)");
+        }
+    }
+}
+
 /// Emit a proof-carrying certificate sidecar for a `Verified` verdict, if
 /// enabled by `ProofOpts` and the network/property are eligible.
 ///
@@ -311,12 +328,16 @@ pub(super) fn maybe_emit_certificate(
     if !matches!(result.result, BabVerificationStatus::Verified) {
         return;
     }
-    // Gate 2: proof/cert features must be enabled (default on; off in
-    // competition mode).
+    // Gate 2: proof/cert features must be enabled (the Proof profile's sink;
+    // the Competition profile wires a null sink).
     if !ctx.proof_opts.should_emit_certificate() {
         return;
     }
-    // Gate 2b (#3328): the certificate is an OPTIONAL post-verdict sidecar, but
+    // #soundness-spine M2a: a requested artifact that is NOT written is
+    // RECORDED (`artifact=none`), never a refusal of the verdict — the `cert:`
+    // log line of whichever exit declined carries the detail.
+    let mut artifact = ArtifactRecord::default();
+    // Gate 2b: the certificate is an OPTIONAL post-verdict sidecar, but
     // exact-rational deep-CROWN can run for tens of seconds on adversarial nets
     // (e.g. acasxu's 6-layer unstable-ReLU stack, whose interned rationals grow
     // to thousands of bits). It must NEVER push the CLI past the caller's overall
@@ -541,14 +562,20 @@ pub(super) fn maybe_emit_certificate(
             }
         };
         match std::fs::write(&out_path, text) {
-            Ok(()) => info!(
-                "cert: wrote machine-checkable certificate (proves {}; {} hidden layers; exact bound {}) to {}",
-                margin.label,
-                problem.depth(),
-                lower_bound,
+            Ok(()) => {
+                artifact.written = true;
+                info!(
+                    "cert: wrote machine-checkable certificate (proves {}; {} hidden layers; exact bound {}) to {}",
+                    margin.label,
+                    problem.depth(),
+                    lower_bound,
+                    out_path.display()
+                );
+            }
+            Err(e) => warn!(
+                "cert: failed to write sidecar to {}: {e}",
                 out_path.display()
             ),
-            Err(e) => warn!("cert: failed to write sidecar to {}: {e}", out_path.display()),
         }
         return;
     }
@@ -626,49 +653,72 @@ mod tests {
         assert!(margin_for_constraint(&OutputConstraint::GreaterEq(2, 3)).is_some());
     }
 
+    /// #soundness-spine M2a: the profile selects only the artifact SINK; the
+    /// verdict-bearing artifact authority is `--require-certificate` alone, so
+    /// a Proof run no longer refuses runtime-certified verdicts it cannot
+    /// export (it records `artifact=none` instead).
     #[test]
-    fn proof_opts_resolves_competition_mode() {
+    fn proof_opts_resolve_sinks_from_profile_and_authority_from_require_certificate() {
         use crate::commands::beta_crown::ProofOpts;
+        use ny_core::proof_profile::{EntryPoint, ProofProfile, ResolvedProofProfile};
         use ny_propagate::VerificationArtifactAuthority;
 
-        // Default: proof ON.
+        let proof = ResolvedProofProfile::resolve(EntryPoint::Interactive, None);
+        let competition = ResolvedProofProfile::resolve(EntryPoint::VnncompV1, None);
+        assert_eq!(proof.mode, ProofProfile::Proof);
+        assert_eq!(competition.mode, ProofProfile::Competition);
+
+        // Default (Proof): the certificate sink is ON, and verdicts are NOT
+        // refused for want of an exportable proof.
         let default = ProofOpts::default();
         assert!(default.should_emit_certificate());
         assert_eq!(
             default.verification_artifact_authority(),
-            VerificationArtifactAuthority::CertificateExport
-        );
-        // Competition mode: proof OFF.
-        let competition = ProofOpts {
-            competition_mode: true,
-            ..Default::default()
-        };
-        assert!(!competition.should_emit_certificate());
-        assert_eq!(
-            competition.verification_artifact_authority(),
             VerificationArtifactAuthority::VerdictOnly
         );
-        // Explicit --emit-certificate wins over competition mode.
+        // Competition: null sink, same verdict authority.
+        let scored = ProofOpts {
+            profile: competition,
+            ..Default::default()
+        };
+        assert!(!scored.should_emit_certificate());
+        assert_eq!(
+            scored.verification_artifact_authority(),
+            VerificationArtifactAuthority::VerdictOnly
+        );
+        // Explicit --emit-certificate wins over the profile's sink choice, and
+        // still does not make export verdict-bearing.
         let forced_export = ProofOpts {
-            competition_mode: true,
+            profile: competition,
             emit_certificate: Some(true),
             ..Default::default()
         };
         assert!(forced_export.should_emit_certificate());
         assert_eq!(
             forced_export.verification_artifact_authority(),
-            VerificationArtifactAuthority::CertificateExport
+            VerificationArtifactAuthority::VerdictOnly
         );
-        // Explicit --no-certificate wins outside competition mode.
+        // Explicit --no-certificate wins under Proof.
         let forced_verdict = ProofOpts {
             emit_certificate: Some(false),
             ..Default::default()
         };
         assert!(!forced_verdict.should_emit_certificate());
-        assert_eq!(
-            forced_verdict.verification_artifact_authority(),
-            VerificationArtifactAuthority::VerdictOnly
-        );
+        // Only --require-certificate selects the refusing authority, in BOTH
+        // profiles, and it always attempts the sidecar.
+        for profile in [proof, competition] {
+            let required = ProofOpts {
+                profile,
+                require_certificate: true,
+                emit_certificate: Some(false),
+                ..Default::default()
+            };
+            assert!(required.should_emit_certificate());
+            assert_eq!(
+                required.verification_artifact_authority(),
+                VerificationArtifactAuthority::CertificateExport
+            );
+        }
     }
 
     /// The GPU CROWN soundness gate is unconditional; compatibility flags and
@@ -684,9 +734,12 @@ mod tests {
             ..Default::default()
         }
         .sound_gpu_crown_required());
-        // Competition mode is sound under the same unconditional policy.
+        // The competition profile is sound under the same unconditional policy.
         assert!(ProofOpts {
-            competition_mode: true,
+            profile: ny_core::proof_profile::ResolvedProofProfile::resolve(
+                ny_core::proof_profile::EntryPoint::VnncompV1,
+                None,
+            ),
             allow_unsound_gpu_crown: true,
             ..Default::default()
         }

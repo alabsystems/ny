@@ -5,11 +5,11 @@
 //! Curated inter-model composition surface for external consumers.
 //!
 //! This module exposes the in-memory certificate, mixer, pipeline, and
-//! property-checking surface approved for Packet A of `#3920`.
+//! property-checking surface.
 //! After matching `BoundCertificationResult::Certified`, callers can feed the
 //! certificate directly into `SpecBuilder::try_input_source(...)` through the
 //! public `VerificationBoundsSource` bridge.
-//! Persisted proof bundles remain owned by `#1436`.
+//! Persisted proof bundles are not part of this surface.
 
 pub use ny_propagate::composition::certificate::{
     BoundCertificate, BoundCertificationResult, BoundProvenance,

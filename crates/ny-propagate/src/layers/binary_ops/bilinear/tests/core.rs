@@ -277,7 +277,7 @@ fn test_interpolated_mccormick_soundness() {
 }
 
 /// Regression test: zero batch dimension in `propagate_linear_batched_binary`
-/// must return an error, not panic with `% 0`. (#2819)
+/// must return an error, not panic with `% 0`.
 #[ntest::timeout(10000)]
 #[test]
 fn test_batched_binary_zero_batch_dim_returns_error() {
@@ -307,7 +307,7 @@ fn test_batched_binary_zero_batch_dim_returns_error() {
 }
 
 /// Regression test: zero batch dimension in alpha-parameterized variant
-/// must return an error, not panic with `% 0`. (#2819)
+/// must return an error, not panic with `% 0`.
 #[ntest::timeout(10000)]
 #[test]
 fn test_batched_binary_with_alpha_zero_batch_dim_returns_error() {
@@ -322,7 +322,7 @@ fn test_batched_binary_with_alpha_zero_batch_dim_returns_error() {
     let b_bounds = BoundedTensor::new(b_lower, b_upper).unwrap();
 
     let downstream = crate::BatchedLinearBounds::identity(&[2, 4]).unwrap();
-    // Alpha shape: [4, m, n, k] = [4, 2, 4, 3] — direction-dependent r_l/r_u (#3287)
+    // Alpha shape: [4, m, n, k] = [4, 2, 4, 3] — direction-dependent r_l/r_u
     let alphas = ndarray::Array4::ones((4, 2, 4, 3));
 
     let result = layer.propagate_linear_batched_binary_with_alpha(
@@ -343,7 +343,7 @@ fn test_batched_binary_with_alpha_zero_batch_dim_returns_error() {
 }
 
 /// Regression test: NaN in input bounds must propagate through batch-reduced
-/// global intervals, NOT be absorbed by f32::min/max. (#3120)
+/// global intervals, NOT be absorbed by f32::min/max.
 ///
 /// Before the fix, `q_l_global.min(NaN)` returned `q_l_global` (NaN absorbed),
 /// producing clean-looking McCormick coefficients from corrupted intervals.
@@ -394,7 +394,7 @@ fn test_batched_binary_nan_input_bounds_propagate_3120() {
     }
 }
 
-/// Same as above but for the alpha-parameterized variant. (#3120)
+/// Same as above but for the alpha-parameterized variant.
 #[ntest::timeout(10000)]
 #[test]
 fn test_batched_binary_with_alpha_nan_input_bounds_propagate_3120() {
@@ -412,7 +412,7 @@ fn test_batched_binary_with_alpha_nan_input_bounds_propagate_3120() {
     let b_bounds = BoundedTensor::new(b_lower, b_upper).unwrap();
 
     let downstream = crate::BatchedLinearBounds::identity(&[2, 4]).unwrap();
-    // Alpha shape: [4, m, n, k] = [4, 2, 4, 3] — direction-dependent r_l/r_u (#3287)
+    // Alpha shape: [4, m, n, k] = [4, 2, 4, 3] — direction-dependent r_l/r_u
     let alphas = ndarray::Array4::ones((4, 2, 4, 3));
 
     let result = layer.propagate_linear_batched_binary_with_alpha(

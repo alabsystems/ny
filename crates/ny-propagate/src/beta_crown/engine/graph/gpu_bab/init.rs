@@ -22,8 +22,10 @@ use crate::beta_crown::engine::graph::input_split::root_bounds::{
     collect_input_split_root_node_bounds, input_split_root_authority_deadline,
 };
 use crate::beta_crown::engine::graph::input_split::shared::compute_crown_or_ibp_bounds;
+use crate::beta_crown::engine::graph::objectives::objective_bounds;
 use crate::beta_crown::engine::graph::shared::init::{
     compute_graph_bab_bootstrap, compute_graph_root_output_bounds,
+    graph_root_output_bounds_warmup_fallback, WarmupFallbackTier,
 };
 use crate::beta_crown::engine::graph::shared::setup::{build_root_alpha_state, GraphBabSetup};
 use crate::beta_crown::NonlinearBranching;
@@ -35,13 +37,26 @@ use super::super::domain_conversion::create_root_processed_domain;
 
 pub(crate) const INPUT_SPLIT_LINEAR_BOUNDS_CACHE_KEY: &str = "__graph_input_split_linear__";
 
-pub(crate) fn cache_input_split_linear_bounds(linear: &LinearBounds) -> CachedLinearBounds {
+/// Cache a domain's input-relative linear bounds for its input-split children.
+///
+/// #warm-cache-err: `input_box` is the domain's own input box, the box the
+/// bounds were computed over. Their certified coefficient error is folded
+/// into the bias over it (every child box lies inside it) because
+/// `CachedLinearBounds` stores no error; `None` when that is not possible, so
+/// children recompute instead of reading an uncertified block.
+pub(crate) fn cache_input_split_linear_bounds(
+    linear: &LinearBounds,
+    input_box: &BoundedTensor,
+) -> Option<CachedLinearBounds> {
+    let mut folded = linear.clone();
+    if !CachedLinearBounds::fold_capture_coeff_err(&mut folded, Some(input_box), None)
+        .unwrap_or(false)
+    {
+        return None;
+    }
     let mut linear_map = HashMap::with_capacity(1);
-    linear_map.insert(
-        INPUT_SPLIT_LINEAR_BOUNDS_CACHE_KEY.to_string(),
-        linear.clone(),
-    );
-    CachedLinearBounds::from_linear_bounds_map(linear_map)
+    linear_map.insert(INPUT_SPLIT_LINEAR_BOUNDS_CACHE_KEY.to_string(), folded);
+    Some(CachedLinearBounds::from_linear_bounds_map(linear_map))
 }
 
 pub(crate) fn restore_input_split_linear_bounds(metadata: &DomainMetadata) -> Option<LinearBounds> {
@@ -74,13 +89,18 @@ pub(crate) struct InitResult {
     pub root_upper: f32,
     /// Reusable root context for GPU DomainList input split.
     pub input_split_bootstrap: Option<InputSplitBootstrap>,
+    /// #budget-abandonment FIX A (mirror on this lane): which fallback tier
+    /// rescued the root enclosure after the iterative warmup blew its cap.
+    /// `None` = the ordinary path produced the bounds. Telemetry only; the
+    /// caller prints it as `[warmup-fallback]`.
+    pub warmup_fallback_tier: Option<WarmupFallbackTier>,
 }
 
 /// Compute initial bounds using the configured graph bootstrap mode.
 ///
 /// Returns intermediate node bounds, alpha state, and spec-guided output bounds.
 ///
-/// Two deadlines mirror the CPU β-CROWN ReLU-split pattern (#4321/#4413):
+/// Two deadlines mirror the CPU β-CROWN ReLU-split pattern:
 ///   * `deadline` (full BaB budget) gates the mandatory foundational node-bounds
 ///     sweep, which must reach every node so conv-heavy DAGs are not choked into a
 ///     premature "deadline exceeded before node 'Conv_0'";
@@ -105,7 +125,7 @@ pub(crate) fn compute_initial_bounds(
 
     // Step 2: Compute spec-guided CROWN output bounds.
     //
-    // #1817/#1848: The objective vector defines a linear combination of outputs
+    // The objective vector defines a linear combination of outputs
     // (e.g., [0,0,0,0,1] for "output 4 < threshold"). Using spec-guided CROWN
     // propagates the objective through the backward pass directly, preserving
     // output correlations and producing much tighter bounds than post-hoc
@@ -181,6 +201,7 @@ pub(crate) fn compute_initial_bounds(
             initial_output,
             root_lower,
             root_upper,
+            warmup_fallback_tier: None,
             input_split_bootstrap: Some(InputSplitBootstrap {
                 spec_matrix,
                 fixed_node_bounds,
@@ -193,21 +214,56 @@ pub(crate) fn compute_initial_bounds(
     }
 
     // α-CROWN runs the iterative warmup *inside* the bootstrap, so it must honor
-    // the capped `iterative_deadline` (#4413). The non-alpha foundational IBP /
+    // the capped `iterative_deadline`. The non-alpha foundational IBP /
     // CROWN-IBP node-bounds sweep is mandatory and gets the full `deadline` to
-    // avoid choking conv-heavy DAGs (#4321).
+    // avoid choking conv-heavy DAGs.
     let bootstrap_deadline = if config.use_alpha_crown {
         iterative_deadline
     } else {
         deadline
     };
     let bootstrap = compute_graph_bab_bootstrap(graph, input, config, engine, bootstrap_deadline)?;
-    let spec_output = SpecCrownRequest::new(graph, input, &spec_matrix, engine)
+
+    // #budget-abandonment FIX A, mirrored on the DomainList lane. NOTE THE
+    // LIMIT: under `use_alpha_crown` this lane hands the BOOTSTRAP itself the
+    // capped `iterative_deadline` (above), so a bootstrap expiry leaves no
+    // collected node bounds to fall back on and still propagates. What is
+    // covered is the same defect as the CPU ReLU-split lane -- the bootstrap
+    // completed, and only the iterative spec/root optimization on top of it
+    // blew the cap.
+    let mut warmup_fallback_tier: Option<WarmupFallbackTier> = None;
+    let spec_result = SpecCrownRequest::new(graph, input, &spec_matrix, engine)
         .node_bounds(&bootstrap.initial_node_bounds)
         .alpha_state_opt(bootstrap.root_alpha_state.as_ref())
         .deadline_opt(iterative_deadline)
         .truncate_after_opt(config.crown_backward_layers)
-        .run()?;
+        .run();
+    let (spec_output, fallback_output) = match spec_result {
+        Ok(output) => (output, None),
+        Err(err) if is_recoverable_warmup_expiry(&err, config, iterative_deadline, deadline) => {
+            let Some((output, tier)) = graph_root_output_bounds_warmup_fallback(
+                graph,
+                input,
+                config,
+                engine,
+                &bootstrap,
+                warmup_retry_deadline(config, deadline),
+            ) else {
+                // No enclosure: re-raise the original expiry unchanged.
+                return Err(err);
+            };
+            let (lower, upper) = objective_bounds(&output, objective)?;
+            warmup_fallback_tier = Some(tier);
+            (
+                BoundedTensor::new(
+                    ndarray::arr1(&[lower]).into_dyn(),
+                    ndarray::arr1(&[upper]).into_dyn(),
+                )?,
+                Some(output),
+            )
+        }
+        Err(err) => return Err(err),
+    };
     if spec_output.is_empty() {
         return Err(NyError::InvalidSpec(
             "spec-guided CROWN produced empty output tensor".to_string(),
@@ -227,14 +283,45 @@ pub(crate) fn compute_initial_bounds(
     // embedded config. The shared root-output helper treats its explicit
     // deadline as phase authority; GPU BaB does not own the multi-objective
     // checkpoint grace and therefore must not widen back to iterative_deadline.
-    let initial_output = compute_graph_root_output_bounds(
-        graph,
-        input,
-        config,
-        engine,
-        &bootstrap,
-        bootstrap.alpha_config.deadline,
-    )?;
+    let initial_output = if let Some(output) = fallback_output {
+        // The spec pass already expired; re-running the full-output
+        // optimization would only expire again. Publish the same enclosure.
+        output
+    } else {
+        match compute_graph_root_output_bounds(
+            graph,
+            input,
+            config,
+            engine,
+            &bootstrap,
+            bootstrap.alpha_config.deadline,
+        ) {
+            Ok(output) => output,
+            Err(err)
+                if is_recoverable_warmup_expiry(
+                    &err,
+                    config,
+                    bootstrap.alpha_config.deadline,
+                    deadline,
+                ) =>
+            {
+                let Some((output, tier)) = graph_root_output_bounds_warmup_fallback(
+                    graph,
+                    input,
+                    config,
+                    engine,
+                    &bootstrap,
+                    warmup_retry_deadline(config, deadline),
+                ) else {
+                    // No enclosure: re-raise the original expiry unchanged.
+                    return Err(err);
+                };
+                warmup_fallback_tier = Some(tier);
+                output
+            }
+            Err(err) => return Err(err),
+        }
+    };
 
     info!(
         "DomainList BaB: initial bounds [{:.4}, {:.4}], threshold: {:.4}",
@@ -250,6 +337,41 @@ pub(crate) fn compute_initial_bounds(
         root_lower,
         root_upper,
         input_split_bootstrap: None,
+        warmup_fallback_tier,
+    })
+}
+
+/// #budget-abandonment FIX A: is this error a warmup-CAP expiry the fallback
+/// may recover, rather than the instance genuinely ending?
+///
+/// Three conditions, all required: the error is a deadline expiry, the key is
+/// armed, and the GLOBAL BaB deadline is still live. A spent global deadline
+/// still propagates so the caller maps it to `Timeout` exactly as before.
+fn is_recoverable_warmup_expiry(
+    err: &NyError,
+    config: &BetaCrownConfig,
+    phase_deadline: Option<Instant>,
+    global_deadline: Option<Instant>,
+) -> bool {
+    matches!(err, NyError::DeadlineExceeded(_))
+        && config.initial_bounds_warmup_fallback
+        && matches!(
+            ny_core::phase_yield::classify_expiry(Instant::now(), phase_deadline, global_deadline),
+            ny_core::phase_yield::Expiry::PhaseOnly
+        )
+}
+
+/// A fresh slice of the REMAINING BaB budget for the fallback's CROWN retry --
+/// never the expired cap, and never past the global deadline.
+fn warmup_retry_deadline(
+    config: &BetaCrownConfig,
+    global_deadline: Option<Instant>,
+) -> Option<Instant> {
+    let frac = config.phase_budget.initial_bounds_fraction.clamp(0.0, 1.0);
+    let now = Instant::now();
+    global_deadline.map(|global| {
+        let slice = global.saturating_duration_since(now).mul_f32(frac);
+        now.checked_add(slice).unwrap_or(now).min(global)
     })
 }
 
@@ -266,7 +388,7 @@ pub(crate) fn create_domain_list(
 ) -> Result<(DomainList, Vec<String>)> {
     // Sort layer names for deterministic ordering.
     //
-    // #3089: derive the returned sorted layer names from the GRAPH nodes, not from
+    // Derive the returned sorted layer names from the GRAPH nodes, not from
     // `init.initial_node_bounds`. In input-split mode without an alpha/forward-bounds
     // bootstrap, `initial_node_bounds` is empty (collect_input_split_root_node_bounds
     // returns None), but downstream GPU/CPU batch processing in the BaB loop still
@@ -301,7 +423,7 @@ pub(crate) fn create_domain_list(
         // children (appended at back). This preserves sorted ordering between
         // sort intervals, matching CPU BinaryHeap's best-first behavior.
         // DepthFirst (LIFO/stack) processes new children before sorted domains,
-        // biasing toward deep, hard-to-verify regions. See #3870.
+        // biasing toward deep, hard-to-verify regions.
         traversal: ny_tensor::TreeTraversal::BreadthFirst,
         layer_names: domain_list_layer_names.clone(),
         layer_shapes,
@@ -336,9 +458,8 @@ pub(crate) fn create_domain_list(
         meta.set_alpha_state(Some(domain_alpha));
         if let Some(bootstrap) = init.input_split_bootstrap.as_ref() {
             if let Some(root_linear_bounds) = bootstrap.root_linear_bounds.as_ref() {
-                meta.cached_la = Some(Arc::new(cache_input_split_linear_bounds(
-                    root_linear_bounds,
-                )));
+                meta.cached_la =
+                    cache_input_split_linear_bounds(root_linear_bounds, input).map(Arc::new);
             }
         }
     }

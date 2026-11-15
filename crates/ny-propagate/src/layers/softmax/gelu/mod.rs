@@ -26,9 +26,8 @@ use crate::LinearBounds;
 
 pub use heuristic_relax::RelaxationMode;
 
-// Re-exports for tests and Kani proofs. These functions have no production callers outside this
-// module but are exercised by unit tests via `super::*` and `crate::layers::*` (#3240),
-// and by external Kani proof harnesses via the `kani-proofs` feature (#2305).
+// Re-exports for tests. These functions have no production callers outside this module
+// but are exercised by unit tests via `super::*` and `crate::layers::*`.
 pub use eval::{gelu_eval, gelu_tanh_inflection_point};
 pub use heuristic_relax::{adaptive_gelu_linear_relaxation, gelu_linear_relaxation};
 pub use sound_relax::{gelu_sound_linear_relaxation, gelu_tanh_sound_linear_relaxation};
@@ -148,7 +147,7 @@ impl BoundPropagation for GELULayer {
             });
         }
 
-        // Conservative-bounds convention (#3423 / deep-IBP overflow class): a
+        // Conservative-bounds convention (deep-IBP overflow class): a
         // deep stack under production-scale weights can legitimately saturate
         // this layer's input to ±inf (outward-rounded Linear IBP overflows f32
         // upstream), and `gelu_bound_interval` maps those endpoints to the
@@ -199,7 +198,7 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(256) })]
 
-        /// #1836 acceptance: exercise GELU(erf) eval on ANY f32 plus explicit IEEE corner values.
+        /// Exercise GELU(erf) eval on ANY f32 plus explicit IEEE corner values.
         #[test]
         fn proptest_gelu_erf_eval_handles_special_values(x in f32_any_with_specials()) {
             let y = gelu_erf(x);
@@ -214,7 +213,7 @@ mod tests {
             }
         }
 
-        /// #1836 acceptance: exercise GELU(tanh) eval on ANY f32 plus explicit IEEE corner values.
+        /// Exercise GELU(tanh) eval on ANY f32 plus explicit IEEE corner values.
         #[test]
         fn proptest_gelu_tanh_eval_handles_special_values(x in f32_any_with_specials()) {
             let y = gelu_tanh(x);
@@ -229,7 +228,7 @@ mod tests {
             }
         }
 
-        /// #1836 acceptance: finite-width IBP intervals must not produce NaN bounds.
+        /// Finite-width IBP intervals must not produce NaN bounds.
         #[test]
         fn proptest_gelu_ibp_no_nan_for_finite_intervals(a in prop::num::f32::ANY, b in prop::num::f32::ANY) {
             prop_assume!(a.is_finite() && b.is_finite());
@@ -252,7 +251,7 @@ mod tests {
         }
     }
 
-    // ── f64 chord precision proptest (#2624) ─────────────────────────
+    // ── f64 chord precision proptest ─────────────────────────
 
     /// ULP distance between two f32 values, handling sign correctly.
     fn ulp_distance(a: f32, b: f32) -> u64 {
@@ -270,7 +269,7 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(500) })]
 
-        /// #2624: Verify GELU heuristic chord slope has f64 precision for narrow intervals.
+        /// Verify GELU heuristic chord slope has f64 precision for narrow intervals.
         /// For intervals with width in [1e-8, 1e-4], gelu_linear_relaxation uses a chord
         /// slope computed in f64. Verify the returned slope matches an independent f64 reference.
         #[test]
@@ -308,7 +307,7 @@ mod tests {
         }
     }
 
-    /// Regression test for #1836: gelu_erf(-inf) must return 0, not NaN.
+    /// Regression test: gelu_erf(-inf) must return 0, not NaN.
     /// GELU(x) = 0.5 * x * (1 + erf(x/√2)); at x = -inf this is 0.5*(-inf)*0 = NaN
     /// without the guard. Correct limit: GELU(-inf) = 0.
     #[test]
@@ -317,7 +316,7 @@ mod tests {
         assert_eq!(result, 0.0, "gelu_erf(-inf) should be 0.0, got {result}");
     }
 
-    /// Regression test for #1836: gelu_erf(+inf) must return +inf.
+    /// Regression test: gelu_erf(+inf) must return +inf.
     #[test]
     fn test_gelu_erf_pos_infinity_returns_pos_infinity() {
         let result = gelu_erf(f32::INFINITY);
@@ -328,21 +327,21 @@ mod tests {
         );
     }
 
-    /// Regression test for #1836: gelu_erf(NaN) must return NaN.
+    /// Regression test: gelu_erf(NaN) must return NaN.
     #[test]
     fn test_gelu_erf_nan_returns_nan() {
         let result = gelu_erf(f32::NAN);
         assert!(result.is_nan(), "gelu_erf(NaN) should be NaN, got {result}");
     }
 
-    /// Regression test for #1836: gelu_tanh(-inf) must return 0, not NaN.
+    /// Regression test: gelu_tanh(-inf) must return 0, not NaN.
     #[test]
     fn test_gelu_tanh_neg_infinity_returns_zero() {
         let result = gelu_tanh(f32::NEG_INFINITY);
         assert_eq!(result, 0.0, "gelu_tanh(-inf) should be 0.0, got {result}");
     }
 
-    /// Regression test for #1836: gelu_tanh(+inf) must return +inf.
+    /// Regression test: gelu_tanh(+inf) must return +inf.
     #[test]
     fn test_gelu_tanh_pos_infinity_returns_pos_infinity() {
         let result = gelu_tanh(f32::INFINITY);
@@ -353,7 +352,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #1836: gelu_tanh(NaN) must return NaN.
+    /// Regression test: gelu_tanh(NaN) must return NaN.
     #[test]
     fn test_gelu_tanh_nan_returns_nan() {
         let result = gelu_tanh(f32::NAN);
@@ -363,7 +362,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #1836: gelu_eval dispatches correctly for both approximations.
+    /// Regression test: gelu_eval dispatches correctly for both approximations.
     #[test]
     fn test_gelu_eval_infinite_bounds() {
         assert_eq!(gelu_eval(f32::NEG_INFINITY, GeluApproximation::Erf), 0.0);
@@ -378,7 +377,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #1836: gelu_bound_interval with infinite inputs must not produce NaN.
+    /// Regression test: gelu_bound_interval with infinite inputs must not produce NaN.
     #[test]
     fn test_gelu_bound_interval_infinite_inputs() {
         let (min_v, max_v) =

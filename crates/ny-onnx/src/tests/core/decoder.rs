@@ -322,11 +322,10 @@ fn test_decoder_sequential_gpu_fails_closed() {
     }
 }
 
-// ================= SwiGLU MLP Subgraph Tests (#3181) =================
+// ================= SwiGLU MLP Subgraph Tests =================
 //
 // Tests for the mlp_subgraph dispatcher: GELU backward compat, SwiGLU detection,
 // and structural fallback.
-// Reference: designs/2026-03-01-swiglu-mlp-decoder-block.md
 
 /// Helper to build a minimal DecoderModel from LayerSpecs + WeightStore.
 ///

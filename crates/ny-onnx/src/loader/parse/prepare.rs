@@ -33,6 +33,8 @@ pub(super) fn prepare_graph(
     weights: &mut WeightStore,
     inferred_shapes: &mut HashMap<String, Vec<i64>>,
     capture_raw_float32_initializer_provenance: bool,
+    qdq_activation_relaxation: bool,
+    fold_obligated_outputs: &HashSet<String>,
     mut external_data: Option<&mut ExternalDataResolver>,
 ) -> Result<HashMap<String, OriginalFloat32Initializer>> {
     let mut original_float32_initializers = HashMap::new();
@@ -66,6 +68,18 @@ pub(super) fn prepare_graph(
     if let Some(resolver) = external_data.as_deref_mut() {
         resolver.materialize_attribute_tensors(&mut graph.node)?;
     }
+
+    // #cctsdb-expand-identity: discharge the certified constant-false
+    // `Equal(Shape, <negative>)` / pass-through `Where` cones BEFORE constant
+    // folding, on the same authored graph the schema preflight certified.  A
+    // cone that fails to canonicalize keeps its deferred schema refusal, which
+    // `require_all_folded` re-raises verbatim after this function returns.
+    super::expand_identity::canonicalize_expand_identity_cones(graph);
+
+    // #cctsdb-readout-continuity: FLOAT32 casts are exact identities that
+    // `convert` already drops; erase them here WITH consumer rewiring so the
+    // builder never reads a name whose producer vanished.
+    super::expand_identity::canonicalize_identity_float_casts(graph, fold_obligated_outputs);
 
     // Extract weights from initializers.
     for init in &graph.initializer {
@@ -104,7 +118,7 @@ pub(super) fn prepare_graph(
     }
 
     extract_constant_nodes_as_weights(&graph.node, weights)?;
-    fold_constant_nodes(graph, weights, inferred_shapes);
+    fold_constant_nodes(graph, weights, inferred_shapes, qdq_activation_relaxation);
     infer_concat_reshape_shapes(graph, weights);
 
     // Lower composite reductions into primitives we already support.
@@ -1120,7 +1134,7 @@ pub(super) fn lower_reduce_l2_nodes(nodes: &mut Vec<onnx_proto::NodeProto>) {
         let input = node.input[0].clone();
         let output = node.output[0].clone();
         let domain = node.domain.clone();
-        let reduce_attrs = node.attribute.clone();
+        let reduce_attrs = node.attribute;
         let square_output = format!("{base_name}__reduce_l2_square");
         let exponent_output = format!("{base_name}__reduce_l2_exponent");
         let sum_output = format!("{base_name}__reduce_l2_sum");
@@ -2008,6 +2022,8 @@ mod tests {
                 &mut WeightStore::new(),
                 &mut HashMap::new(),
                 false,
+                false,
+                &HashSet::new(),
                 None,
             )
             .expect_err("authored values must not collide with ny's private Reshape encoding");
@@ -2081,6 +2097,8 @@ mod tests {
                 &mut weights,
                 &mut HashMap::new(),
                 capture_provenance,
+                false,
+                &HashSet::new(),
                 None,
             )
             .expect_err("duplicate names must never be resolved by last-write-wins");
@@ -2102,6 +2120,8 @@ mod tests {
             &mut WeightStore::new(),
             &mut HashMap::new(),
             false,
+            false,
+            &HashSet::new(),
             None,
         )
         .expect_err("empty initializer names are invalid ONNX");
@@ -2129,6 +2149,8 @@ mod tests {
             &mut WeightStore::new(),
             &mut HashMap::new(),
             false,
+            false,
+            &HashSet::new(),
             None,
         )
         .expect_err("initializer and node output must not share an SSA value name");
@@ -2168,6 +2190,8 @@ mod tests {
                 &mut WeightStore::new(),
                 &mut HashMap::new(),
                 false,
+                false,
+                &HashSet::new(),
                 None,
             )
             .expect_err("duplicate graph I/O metadata is ambiguous");
@@ -2189,6 +2213,8 @@ mod tests {
             &mut WeightStore::new(),
             &mut HashMap::new(),
             false,
+            false,
+            &HashSet::new(),
             None,
         )
         .expect_err("ONNX graph values must have a single producer");
@@ -2242,8 +2268,16 @@ mod tests {
         };
 
         let mut weights = WeightStore::new();
-        prepare_graph(&mut graph, &mut weights, &mut HashMap::new(), false, None)
-            .expect("prepare should succeed");
+        prepare_graph(
+            &mut graph,
+            &mut weights,
+            &mut HashMap::new(),
+            false,
+            false,
+            &HashSet::new(),
+            None,
+        )
+        .expect("prepare should succeed");
 
         let reshape_shape = weights
             .get_integers("reshape_shape")
@@ -2323,8 +2357,16 @@ mod tests {
         };
 
         let mut weights = WeightStore::new();
-        prepare_graph(&mut graph, &mut weights, &mut HashMap::new(), false, None)
-            .expect("a constant Shape/Div/Cast/Unsqueeze/Concat chain should prepare");
+        prepare_graph(
+            &mut graph,
+            &mut weights,
+            &mut HashMap::new(),
+            false,
+            false,
+            &HashSet::new(),
+            None,
+        )
+        .expect("a constant Shape/Div/Cast/Unsqueeze/Concat chain should prepare");
 
         assert_eq!(
             weights
@@ -2354,7 +2396,7 @@ mod tests {
                 rewritten.op_type, "Identity",
                 "only the postvalidated loader path may erase a folded INT64 Cast"
             );
-            assert!(rewritten.attribute.is_empty());
+            assert_eq!((rewritten.attribute).len(), 0);
         }
     }
 
@@ -2443,8 +2485,16 @@ mod tests {
         };
 
         let mut weights = WeightStore::new();
-        prepare_graph(&mut graph, &mut weights, &mut HashMap::new(), false, None)
-            .expect("the authored static shape Cast chain should fold exactly");
+        prepare_graph(
+            &mut graph,
+            &mut weights,
+            &mut HashMap::new(),
+            false,
+            false,
+            &HashSet::new(),
+            None,
+        )
+        .expect("the authored static shape Cast chain should fold exactly");
 
         for name in [
             "spatial_area",
@@ -2506,6 +2556,8 @@ mod tests {
             &mut WeightStore::new(),
             &mut HashMap::new(),
             false,
+            false,
+            &HashSet::new(),
             None,
         )
         .expect_err("dynamic INT64 Cast must be rejected before any fusion can consume it");
@@ -2561,6 +2613,8 @@ mod tests {
                 &mut WeightStore::new(),
                 &mut HashMap::new(),
                 false,
+                false,
+                &HashSet::new(),
                 None,
             )
             .unwrap_err();
@@ -2624,8 +2678,16 @@ mod tests {
         };
 
         let mut weights = WeightStore::new();
-        let error = prepare_graph(&mut graph, &mut weights, &mut HashMap::new(), false, None)
-            .expect_err("FLOAT Range sidecars must not manufacture raw INT64 Cast provenance");
+        let error = prepare_graph(
+            &mut graph,
+            &mut weights,
+            &mut HashMap::new(),
+            false,
+            false,
+            &HashSet::new(),
+            None,
+        )
+        .expect_err("FLOAT Range sidecars must not manufacture raw INT64 Cast provenance");
         assert_eq!(
             weights
                 .get("quotient")
@@ -2684,6 +2746,8 @@ mod tests {
             &mut WeightStore::new(),
             &mut HashMap::new(),
             false,
+            false,
+            &HashSet::new(),
             None,
         )
         .expect_err("arithmetic must not erase private dynamic-shape provenance");
@@ -2732,6 +2796,8 @@ mod tests {
             &mut WeightStore::new(),
             &mut HashMap::new(),
             false,
+            false,
+            &HashSet::new(),
             None,
         )
         .expect_err("FLOAT Gather indices must not enter the raw INT64 proof");
@@ -2801,6 +2867,8 @@ mod tests {
                 &mut WeightStore::new(),
                 &mut HashMap::new(),
                 false,
+                false,
+                &HashSet::new(),
                 None,
             )
             .expect_err("malformed Gather axis must invalidate the INT64 shape proof");
@@ -2873,6 +2941,8 @@ mod tests {
             &mut WeightStore::new(),
             &mut HashMap::new(),
             false,
+            false,
+            &HashSet::new(),
             None,
         )
         .expect_err("competing Constant payloads must invalidate the INT64 shape proof");
@@ -2923,6 +2993,8 @@ mod tests {
             &mut WeightStore::new(),
             &mut HashMap::new(),
             false,
+            false,
+            &HashSet::new(),
             None,
         )
         .expect_err("two-input Unsqueeze must not also carry an axes attribute");
@@ -2966,6 +3038,8 @@ mod tests {
             &mut WeightStore::new(),
             &mut HashMap::new(),
             false,
+            false,
+            &HashSet::new(),
             None,
         )
         .expect_err("terminal Reshape must have exactly two inputs and one output");
@@ -3018,6 +3092,8 @@ mod tests {
                 &mut WeightStore::new(),
                 &mut HashMap::new(),
                 false,
+                false,
+                &HashSet::new(),
                 None,
             )
             .expect_err("malformed Concat axis must invalidate the INT64 shape proof");
@@ -3098,8 +3174,16 @@ mod tests {
         ]);
         let mut weights = WeightStore::new();
         let mut inferred_shapes = inferred_shapes;
-        prepare_graph(&mut graph, &mut weights, &mut inferred_shapes, false, None)
-            .expect("prepare should succeed");
+        prepare_graph(
+            &mut graph,
+            &mut weights,
+            &mut inferred_shapes,
+            false,
+            false,
+            &HashSet::new(),
+            None,
+        )
+        .expect("prepare should succeed");
 
         let reshape_shape = weights
             .get_integers("reshape_shape")

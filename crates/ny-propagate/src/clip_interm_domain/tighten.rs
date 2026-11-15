@@ -51,7 +51,6 @@ use super::PreprocessedConstraints;
 ///
 /// # References
 ///
-/// - `designs/2026-01-29-clip-interm-domain.md` Section "Constrained concretization"
 /// - `auto_LiRPA/concretize_func.py:constraints_solving`
 pub fn tighten_with_constraints(
     constraints: &PreprocessedConstraints,
@@ -401,7 +400,6 @@ pub(crate) fn compute_unconstrained_bounds(
 ///
 /// # References
 ///
-/// - `designs/2026-01-29-clip-interm-domain.md`
 /// - `alpha-beta-CROWN/complete_verifier/domain_clipper.py`
 // Justification: Domain clipping needs split history, two closure callbacks (for split/objective
 // linear bounds), layer bounds, input bounds, topk, and optional coefficients — all independent.
@@ -514,11 +512,11 @@ pub fn merge_bounds(
     for (i, &idx) in selected_indices.iter().enumerate() {
         // Use nan_propagating_max/min so upstream NaN is never silently absorbed
         // into a finite bound. IEEE 754 f32::max/min return the non-NaN operand,
-        // hiding corruption. See #2858, #2577.
+        // hiding corruption.
         let new_l = nan_propagating_max(original_lower[idx], tightened_lower[i]);
         let new_u = nan_propagating_min(original_upper[idx], tightened_upper[i]);
 
-        // #3307: this is an intentional keep-original fallback, not a silent repair.
+        // This is an intentional keep-original fallback, not a silent repair.
         // The pre-tightening interval is already a sound overapproximation, so if
         // tightening would invert or introduce NaN, keeping the original bounds
         // preserves soundness without discarding valid prior information.
@@ -526,7 +524,7 @@ pub fn merge_bounds(
         // NaN comparisons return false, so NaN bounds skip the update — the
         // original (pre-tightening) bounds are preserved. This means tightening
         // silently fails for neurons with NaN-tainted CROWN backward results.
-        // The NaN is NOT propagated downstream. (#2967)
+        // The NaN is NOT propagated downstream.
         if new_l <= new_u {
             lower[idx] = new_l;
             upper[idx] = new_u;

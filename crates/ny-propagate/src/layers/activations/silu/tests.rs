@@ -322,7 +322,7 @@ fn test_proptest_regression_crossing_left() {
     assert_sound(-2.62, 11.73, ls, li, us, ui);
 }
 
-/// Regression test for #2874: narrow crossing intervals near inflection points
+/// Regression test: narrow crossing intervals near inflection points
 /// exercise the f64-intermediate chord computation in `silu_relaxation_crossing()`.
 /// The inline f32 chord `(fu - fl) / (u - l)` suffers catastrophic cancellation
 /// when `u - l` is small; the fix delegates to `silu_chord()` which uses f64.
@@ -489,7 +489,7 @@ fn test_propagate_linear_requires_preact() {
     assert!(layer.requires_pre_activation_bounds());
 }
 
-// ── f64 chord precision proptest (#2624) ─────────────────────────────
+// ── f64 chord precision proptest ─────────────────────────────
 
 /// Reference SiLU in f64, independent of the crate implementation.
 fn silu_f64_reference(x: f64) -> f64 {
@@ -508,7 +508,7 @@ fn silu_f64_reference(x: f64) -> f64 {
 /// `silu_min_max` (math.rs) is the one implementation in this family that
 /// already does it right, and says why: it computes each candidate with
 /// `silu_eval_f64` and applies `next_down_f32` / `next_up_f32` to EACH
-/// intermediate BEFORE the min/max selection (#3245, #3336). Since
+/// intermediate BEFORE the min/max selection. Since
 /// `next_up_f32(f32_RN(v)) > v` and `next_down_f32(f32_RN(v)) < v` strictly, the
 /// published constants carry at least one f32 ULP of one-sided margin, so this
 /// test must pass with room to spare. If it ever fails, the failure is in the
@@ -619,7 +619,7 @@ fn ulp_distance(a: f32, b: f32) -> u64 {
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(1000) })]
 
-    /// #2624: Verify silu_chord produces f64-quality results for narrow intervals.
+    /// Verify silu_chord produces f64-quality results for narrow intervals.
     /// For intervals with width in [1e-8, 1e-4], the chord slope must match
     /// a pure f64 reference within 1 ULP.
     #[test]
@@ -662,12 +662,12 @@ proptest! {
         );
     }
 
-    /// #2434: Verify silu_sound_linear_relaxation produces strictly sound bounds.
+    /// Verify silu_sound_linear_relaxation produces strictly sound bounds.
     /// For random intervals, the lower bound must satisfy
     ///   lower_slope * x + lower_intercept <= SiLU(x)  for all x in [l, u]
     /// and the upper bound must satisfy
     ///   upper_slope * x + upper_intercept >= SiLU(x)  for all x in [l, u]
-    /// with NO positive tolerance. Directed rounding (#3146) guarantees this.
+    /// with NO positive tolerance. Directed rounding guarantees this.
     ///
     /// Evaluation is in f64 to test the mathematical relationship between the
     /// f32 coefficients and SiLU. The f32 evaluation of `a*x + b` introduces
@@ -716,7 +716,7 @@ proptest! {
         }
     }
 
-    /// #2846: Verify silu_tangent produces f64-quality results at large |d|.
+    /// Verify silu_tangent produces f64-quality results at large |d|.
     /// When |d| is large, SiLU(d) ≈ d and slope*d ≈ d, so the subtraction
     /// silu_eval(d) - slope*d loses most significant digits in f32. The f64
     /// intermediate upgrade must preserve intercept precision within 1 ULP.

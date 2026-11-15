@@ -3058,11 +3058,11 @@ mod tests {
     /// tables are the trait-sanctioned degraded mode (pre-concretization
     /// path); an exploded payload would be rejected and would surface here as
     /// a loud failure, not a silent skip.
-    #[cfg(feature = "gpu-tests")]
+    #[cfg(feature = "gpu-tests-uncharged")]
     #[test]
     fn true_grad_gpu_replay_matches_cpu_replay_on_device() {
         let device = ny_gpu::WgpuDevice::new_for_verdict(ny_gpu::WgpuVerdictRequest::new())
-            .expect("gpu-tests requires a WGPU device passing all five authority rungs");
+            .expect("gpu-tests-uncharged requires an adapter passing the UNCHARGED five-rung ladder (subnormal-preserving, EFT-exact: measured on Vulkan+DenormPreserve); a pure-flush adapter (Apple/Metal) refuses by hardware");
         let engine: &dyn ny_core::GemmEngine = &device;
         let gpu = engine
             .as_gpu_crown_backward()

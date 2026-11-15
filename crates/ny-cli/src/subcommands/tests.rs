@@ -7,6 +7,68 @@
 use super::{BackendArg, Cli, Commands, LayerNormModeArg, LogFormat, MipSolverArg};
 use clap::{Command, CommandFactory, Parser};
 
+#[cfg(feature = "mip")]
+#[test]
+fn internal_head_phase_advice_is_hidden_and_accepts_no_model_or_flags() {
+    let cli = Cli::try_parse_from(["ny", "__head-phase-ay-advice"]).unwrap();
+    assert!(matches!(
+        cli.into_parts().2,
+        Commands::InternalHeadPhaseAyAdvice
+    ));
+    let mut command = Cli::command();
+    let hidden = command
+        .find_subcommand("__head-phase-ay-advice")
+        .expect("compiled helper command");
+    assert!(hidden.is_hide_set());
+    assert!(!command
+        .render_help()
+        .to_string()
+        .contains("__head-phase-ay-advice"));
+    for extra in ["model.onnx", "{}", "--backend", "--timeout"] {
+        assert!(Cli::try_parse_from(["ny", "__head-phase-ay-advice", extra]).is_err());
+    }
+}
+
+#[cfg(not(feature = "mip"))]
+#[test]
+fn internal_head_phase_advice_is_absent_without_mip() {
+    assert!(Cli::try_parse_from(["ny", "__head-phase-ay-advice"]).is_err());
+    assert!(Cli::command()
+        .find_subcommand("__head-phase-ay-advice")
+        .is_none());
+}
+
+#[cfg(feature = "mip")]
+#[test]
+fn internal_head_functional_advice_is_hidden_and_accepts_no_model_or_flags() {
+    let cli = Cli::try_parse_from(["ny", "__head-functional-ay-advice"]).unwrap();
+    assert!(matches!(
+        cli.into_parts().2,
+        Commands::InternalHeadFunctionalAyAdvice
+    ));
+    let mut command = Cli::command();
+    let hidden = command
+        .find_subcommand("__head-functional-ay-advice")
+        .expect("compiled functional helper command");
+    assert!(hidden.is_hide_set());
+    assert!(!command
+        .render_help()
+        .to_string()
+        .contains("__head-functional-ay-advice"));
+    for extra in ["model.onnx", "{}", "--backend", "--timeout"] {
+        assert!(Cli::try_parse_from(["ny", "__head-functional-ay-advice", extra]).is_err());
+    }
+}
+
+#[cfg(not(feature = "mip"))]
+#[test]
+fn internal_head_functional_advice_is_absent_without_mip() {
+    assert!(Cli::try_parse_from(["ny", "__head-functional-ay-advice"]).is_err());
+    assert!(Cli::command()
+        .find_subcommand("__head-functional-ay-advice")
+        .is_none());
+}
+
 #[test]
 fn cli_beta_crown_default_mip_solver_is_preset_driven() {
     // No `--mip-solver` parses as None: the handler then applies the preset's
@@ -68,8 +130,7 @@ fn cli_beta_crown_parses_queue_memory_cap() {
 
 #[test]
 fn cli_beta_crown_explicit_mip_solver_wins() {
-    // An explicit `--mip-solver ay` must parse as Some(AY): it is the
-    // one-flag rollback that overrides a preset's `solver.mip.mip_solver: scip`.
+    // An explicit solver remains distinguishable from an omitted preset value.
     let cli = Cli::parse_from(["ny", "beta-crown", "model.onnx", "--mip-solver", "ay"]);
     let (_, _, command) = cli.into_parts();
     match command {
@@ -412,12 +473,10 @@ fn cli_top_level_about_matches_repo_scope() {
 /// `ny --version` must report the DERIVED build version, not the frozen
 /// `Cargo.toml` one (#binary-identity).
 ///
-/// This test previously asserted the opposite — that clap tracks
-/// `CARGO_PKG_VERSION` — which is exactly the property that made every binary
-/// of this campaign answer `ny 0.3.0`. `[workspace.package] version` did not
-/// move while the verifier changed underneath it many times, so on
-/// 2026-08-21 a manifest sealed against one binary and 330 rows measured by
-/// another could not be told apart by their reported versions.
+/// Tracking `CARGO_PKG_VERSION` made every binary of this campaign answer
+/// `ny 0.3.0`: `[workspace.package] version` did not move while the verifier
+/// changed underneath it, so on 2026-08-21 a manifest sealed against one binary
+/// and 330 rows measured by another could not be told apart by their versions.
 #[test]
 fn cli_version_is_the_derived_build_version_not_the_frozen_cargo_patch() {
     let cmd = Cli::command();
@@ -499,26 +558,6 @@ fn cli_vnncomp_v1_protocol_argv_is_unchanged() {
 }
 
 #[test]
-fn cli_vnncomp_v1_help_marks_cgan_depth_two_production_disabled() {
-    let command = Cli::command();
-    let vnncomp = command
-        .find_subcommand("vnncomp")
-        .expect("vnncomp subcommand should exist");
-    let v1 = vnncomp
-        .find_subcommand("v1")
-        .expect("vnncomp v1 subcommand should exist");
-    let help = v1
-        .get_long_about()
-        .or_else(|| v1.get_about())
-        .expect("vnncomp v1 help should exist")
-        .to_string();
-    assert!(help.contains("NY_CGAN_INPUT_LEAF=1"));
-    assert!(help.contains("requires an `mip` build"));
-    assert!(help.contains("depth-two replay is production-disabled"));
-    assert!(help.contains("disabled_not_requested"));
-}
-
-#[test]
 fn cli_vnncomp_plan_parses_instance_shape() {
     // I2: the plan printer takes the same instance quadruple as the scored
     // path, minus RESULTS_FILE, plus --json.
@@ -544,11 +583,196 @@ fn cli_vnncomp_plan_parses_instance_shape() {
                     ..
                 },
         } => {
-            assert_eq!(category, "cifar100_2024");
-            assert_eq!(budget_secs, 100);
+            assert_eq!(category.as_deref(), Some("cifar100_2024"));
+            assert_eq!(budget_secs, Some(100));
             assert_eq!(configs_dir, None);
             assert!(json);
         }
         _ => panic!("expected vnncomp plan command"),
     }
+}
+
+/// #soundness-spine M2a: `ny beta-crown` resolves to the `proof` profile unless
+/// `--proof-profile` (or the deprecated `--competition-mode`) overrides it;
+/// `--require-certificate` is opt-in; an unknown profile is a flag error.
+#[test]
+fn cli_beta_crown_proof_profile_flags_parse_exactly() {
+    use ny_core::proof_profile::ProofProfile;
+    let cli = Cli::parse_from(["ny", "beta-crown", "model.onnx"]);
+    let (_, _, command) = cli.into_parts();
+    match command {
+        Commands::BetaCrown(args) => {
+            assert_eq!(args.proof_profile, None);
+            assert!(!args.competition_mode);
+            assert!(!args.require_certificate);
+        }
+        _ => panic!("expected beta-crown command"),
+    }
+    let cli = Cli::parse_from([
+        "ny",
+        "beta-crown",
+        "model.onnx",
+        "--proof-profile",
+        "competition",
+        "--require-certificate",
+    ]);
+    let (_, _, command) = cli.into_parts();
+    match command {
+        Commands::BetaCrown(args) => {
+            assert_eq!(args.proof_profile, Some(ProofProfile::Competition));
+            assert!(args.require_certificate);
+        }
+        _ => panic!("expected beta-crown command"),
+    }
+    assert!(
+        Cli::try_parse_from(["ny", "beta-crown", "model.onnx", "--proof-profile", "fast"]).is_err()
+    );
+    // The deprecated spelling cannot be combined with the new one.
+    assert!(Cli::try_parse_from([
+        "ny",
+        "beta-crown",
+        "model.onnx",
+        "--proof-profile",
+        "proof",
+        "--competition-mode"
+    ])
+    .is_err());
+}
+
+/// #soundness-spine M2a: the scored entry point takes a `--proof-profile`
+/// override for banking and moat runs; without it the argv is byte-identical
+/// to the competition harness's.
+#[test]
+fn cli_vnncomp_v1_accepts_a_proof_profile_override() {
+    use ny_core::proof_profile::ProofProfile;
+    let base = [
+        "ny",
+        "vnncomp",
+        "v1",
+        "cifar100_2024",
+        "model.onnx",
+        "prop.vnnlib",
+        "out/results.txt",
+        "100",
+    ];
+    let cli = Cli::parse_from(base);
+    let (_, _, command) = cli.into_parts();
+    match command {
+        Commands::Vnncomp {
+            action: super::VnncompAction::V1 { proof_profile, .. },
+        } => assert_eq!(proof_profile, None),
+        _ => panic!("expected vnncomp v1 command"),
+    }
+    let cli = Cli::parse_from(base.iter().copied().chain(["--proof-profile", "proof"]));
+    let (_, _, command) = cli.into_parts();
+    match command {
+        Commands::Vnncomp {
+            action: super::VnncompAction::V1 { proof_profile, .. },
+        } => assert_eq!(proof_profile, Some(ProofProfile::Proof)),
+        _ => panic!("expected vnncomp v1 command"),
+    }
+}
+
+/// #phase-cost: `ny vnncomp v1 ... --phase-cost <off|coarse|detail>` is
+/// optional (absent = the coarse default resolved in `main`), parses exactly,
+/// and a typo is a usage error rather than a silent default.
+#[test]
+fn cli_vnncomp_v1_phase_cost_flag_parses_exactly() {
+    use ny_core::phase_cost::DetailLevel;
+    let base = [
+        "ny",
+        "vnncomp",
+        "v1",
+        "cifar100_2024",
+        "model.onnx",
+        "prop.vnnlib",
+        "out/results.txt",
+        "100",
+    ];
+    let level = |extra: &[&str]| -> Option<DetailLevel> {
+        let cli = Cli::parse_from(base.iter().copied().chain(extra.iter().copied()));
+        let (_, _, command) = cli.into_parts();
+        match command {
+            Commands::Vnncomp {
+                action: super::VnncompAction::V1 { phase_cost, .. },
+            } => phase_cost,
+            _ => panic!("expected vnncomp v1 command"),
+        }
+    };
+    assert_eq!(level(&[]), None);
+    assert_eq!(level(&["--phase-cost", "off"]), Some(DetailLevel::Off));
+    assert_eq!(
+        level(&["--phase-cost", "coarse"]),
+        Some(DetailLevel::Coarse)
+    );
+    assert_eq!(
+        level(&["--phase-cost", "detail"]),
+        Some(DetailLevel::Detail)
+    );
+    assert!(Cli::try_parse_from(base.iter().copied().chain(["--phase-cost", "fine"])).is_err());
+    assert_eq!(ny_core::phase_cost::DEFAULT_LEVEL, DetailLevel::Coarse);
+}
+
+/// ENGINE_PROGRAM §1.7 B2.1: `ny proof-check <BUNDLE>` parses to the
+/// documented defaults, every flag lands in its field, and a bad `--refine`
+/// value or a missing bundle is a usage error.
+#[test]
+fn cli_proof_check_args_parse_exactly() {
+    use super::OnOff;
+    let cli = Cli::parse_from(["ny", "proof-check", "run.proof.jsonl"]);
+    let (_, _, command) = cli.into_parts();
+    match command {
+        Commands::ProofCheck(args) => {
+            assert_eq!(args.bundle, std::path::PathBuf::from("run.proof.jsonl"));
+            assert_eq!(args.onnx, None);
+            assert_eq!(args.vnnlib, None);
+            assert_eq!(args.report, None);
+            assert_eq!(args.threads, None);
+            assert_eq!(args.mem_gib.to_bits(), 8.0f64.to_bits());
+            assert_eq!(args.budget_s.to_bits(), 3600.0f64.to_bits());
+            assert_eq!(args.refine, OnOff::On);
+            assert_eq!(args.refute_points, 16);
+            assert!(!args.json);
+        }
+        _ => panic!("expected proof-check command"),
+    }
+    let cli = Cli::parse_from([
+        "ny",
+        "proof-check",
+        "b.jsonl",
+        "--onnx",
+        "n.onnx",
+        "--vnnlib",
+        "p.vnnlib",
+        "--report",
+        "r.json",
+        "--threads",
+        "3",
+        "--mem-gib",
+        "2.5",
+        "--budget-s",
+        "90",
+        "--refine",
+        "off",
+        "--refute-points",
+        "4",
+        "--json",
+    ]);
+    let (_, _, command) = cli.into_parts();
+    match command {
+        Commands::ProofCheck(args) => {
+            assert_eq!(args.onnx, Some(std::path::PathBuf::from("n.onnx")));
+            assert_eq!(args.vnnlib, Some(std::path::PathBuf::from("p.vnnlib")));
+            assert_eq!(args.report, Some(std::path::PathBuf::from("r.json")));
+            assert_eq!(args.threads, Some(3));
+            assert_eq!(args.mem_gib.to_bits(), 2.5f64.to_bits());
+            assert_eq!(args.budget_s.to_bits(), 90.0f64.to_bits());
+            assert_eq!(args.refine, OnOff::Off);
+            assert_eq!(args.refute_points, 4);
+            assert!(args.json);
+        }
+        _ => panic!("expected proof-check command"),
+    }
+    assert!(Cli::try_parse_from(["ny", "proof-check", "b", "--refine", "maybe"]).is_err());
+    assert!(Cli::try_parse_from(["ny", "proof-check"]).is_err());
 }

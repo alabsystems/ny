@@ -3,7 +3,7 @@
 # Author: Andrew Yates <andrewyates.name@gmail.com>
 # SPDX-License-Identifier: Apache-2.0
 #
-# Orchestrator for #4359 NVIDIA/Vulkan validation.
+# Orchestrator for NVIDIA/Vulkan validation.
 # Captures host facts, runs ny-gpu workloads, runs compare-backends,
 # optionally runs alpha-beta-CROWN, and writes a JSON manifest.
 #
@@ -12,11 +12,12 @@
 #
 # Environment overrides (for testing):
 #   NVIDIA_SMI_CMD      - command for nvidia-smi (default: nvidia-smi)
-#   CARGO_CMD           - command for cargo (default: cargo)
+#   CARGO_CMD           - the build tool (default: targo, run in its --unverified
+#                         lane; any other name, e.g. a stock cargo, gets no lane flag)
 #   NY_BIN           - path to ny binary (default: ./target/release/ny)
 #   BENCHMARK_SCRIPT    - path to benchmark_vnncomp.sh (default: scripts/benchmark_vnncomp.sh)
-#   RUSTC_CMD           - command for rustc version check (default: rustc)
-#   CARGO_VERSION_CMD   - command for cargo version check (default: cargo)
+#   RUSTC_CMD           - command for compiler version check (default: trustc)
+#   CARGO_VERSION_CMD   - command for build-tool version check (default: targo)
 #   TIME_CMD            - command for /usr/bin/time (default: /usr/bin/time)
 #   ABCROWN_DIR         - path to an alpha-beta-CROWN complete_verifier checkout
 #                         (github.com/Verified-Intelligence/alpha-beta-CROWN);
@@ -30,7 +31,14 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Configurable commands (overridable for testing)
 NVIDIA_SMI_CMD="${NVIDIA_SMI_CMD:-nvidia-smi}"
-CARGO_CMD="${CARGO_CMD:-cargo}"
+# The Trust toolchain (owner directive 2026-09-28); no stock fallback.
+CARGO_CMD="${CARGO_CMD:-targo}"
+# targo refuses a build that names no lane; an override naming another build
+# tool (the public snapshot's stock cargo) takes no lane flag.
+CARGO_LANE=()
+if [[ "$(basename -- "$CARGO_CMD")" == targo ]]; then
+    CARGO_LANE=(--unverified)
+fi
 NY_BIN="${NY_BIN:-./target/release/ny}"
 BENCHMARK_SCRIPT="${BENCHMARK_SCRIPT:-${REPO_ROOT}/scripts/benchmark_vnncomp.sh}"
 TIME_CMD="${TIME_CMD:-/usr/bin/time}"
@@ -248,10 +256,10 @@ echo "--- Step 1: Capturing host facts ---"
     uname -a
     echo ""
     echo "--- rustc ---"
-    "${RUSTC_CMD:-rustc}" -Vv 2>&1 || echo "rustc not found"
+    "${RUSTC_CMD:-trustc}" -Vv 2>&1 || echo "trustc not found"
     echo ""
     echo "--- cargo ---"
-    "${CARGO_VERSION_CMD:-cargo}" -V 2>&1 || echo "cargo not found"
+    "${CARGO_VERSION_CMD:-targo}" -V 2>&1 || echo "targo not found"
     echo ""
     echo "--- nvidia-smi ---"
     "${NVIDIA_SMI_CMD}" --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>&1 || echo "nvidia-smi not available"
@@ -274,7 +282,7 @@ fi
 
 MEASURE_PIPE_STATUSES=()
 if RUST_LOG=ny_gpu=info,ny_propagate=info \
-    "${CARGO_CMD}" run -p ny-gpu --release --example measure_crown_backward_workloads -- \
+    "${CARGO_CMD}" ${CARGO_LANE[@]+"${CARGO_LANE[@]}"} run -p ny-gpu --release --example measure_crown_backward_workloads -- \
     --graph-engine-only \
     --output "${MEASURE_CSV}" \
     2>&1 | tee "${MEASURE_LOG}"; then

@@ -62,7 +62,7 @@ fn test_picked_domains_find_unstable_neurons_batched_empty() {
     let unstable = picked
         .find_unstable_neurons_batched(&relu_pre_map)
         .expect("find_unstable_neurons_batched should handle empty batch");
-    assert!(unstable.is_empty());
+    assert_eq!((unstable).len(), 0);
 }
 
 #[ntest::timeout(10000)]

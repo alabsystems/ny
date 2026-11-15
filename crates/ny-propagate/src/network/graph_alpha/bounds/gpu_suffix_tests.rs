@@ -4,6 +4,7 @@
 
 use super::gpu_suffix::{
     take_only_gpu_layer, try_finish_target_gpu_suffix_with_pending_input, GpuSuffixPlan,
+    GpuSuffixSeedRelation,
 };
 use super::*;
 use crate::bounds::patches::CrownBounds;
@@ -126,7 +127,7 @@ impl GpuCrownBackward for SeededSuffixScriptedEngine {
             "seeded GPU suffix should run exactly once, got call #{}",
             call_idx + 1
         );
-        // With alpha-aware GPU suffix (#4312), the ReLU node is extracted as
+        // With alpha-aware GPU suffix, the ReLU node is extracted as
         // an Activation layer. Exact layer sequence varies by graph topology
         // (diamond vs skip-merge), so validate Activation presence, not order.
         assert!(
@@ -678,7 +679,10 @@ fn test_try_finish_target_gpu_suffix_with_pending_input_skips_when_other_nodes_r
     let result = try_finish_target_gpu_suffix_with_pending_input(
         &input,
         "linear2",
-        &node_lb,
+        GpuSuffixSeedRelation {
+            bounds: &node_lb,
+            node_output_box: None,
+        },
         &plan,
         Some(&engine),
         None,
@@ -745,7 +749,10 @@ fn finite_gpu_suffix_declines_before_host_seed_copy_and_preserves_pending_input(
     let result = try_finish_target_gpu_suffix_with_pending_input(
         &input,
         "linear2",
-        &node_lb,
+        GpuSuffixSeedRelation {
+            bounds: &node_lb,
+            node_output_box: None,
+        },
         &plan,
         Some(&engine),
         Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
@@ -760,7 +767,7 @@ fn finite_gpu_suffix_declines_before_host_seed_copy_and_preserves_pending_input(
 }
 
 // ---------------------------------------------------------------------------
-// Packet C (#4340): plan-shape coverage
+// Packet C: plan-shape coverage
 // ---------------------------------------------------------------------------
 
 #[test]

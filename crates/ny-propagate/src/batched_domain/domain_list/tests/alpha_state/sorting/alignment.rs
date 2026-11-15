@@ -4,7 +4,7 @@
 
 use super::*;
 
-/// Regression test for #1845 handoff gap: sorting must preserve alpha metadata
+/// Regression test handoff gap: sorting must preserve alpha metadata
 /// alignment with each domain's bound record.
 #[ntest::timeout(10000)]
 #[test]

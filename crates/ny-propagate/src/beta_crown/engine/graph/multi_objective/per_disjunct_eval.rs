@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Per-disjunct alpha evaluation in BaB child domain processing (#4355).
+//! Per-disjunct alpha evaluation in BaB child domain processing.
 //!
 //! When `optimize_disjuncts_separately` is enabled and the domain carries
 //! per-disjunct alpha states, evaluates each unverified disjunct with its
@@ -66,7 +66,7 @@ pub(super) struct PerDisjunctContext<'a> {
 }
 
 impl BetaCrownVerifier {
-    /// Process a child domain using per-disjunct alpha states (#4355).
+    /// Process a child domain using per-disjunct alpha states.
     ///
     /// Dispatches to batched evaluation when ≥2 active disjuncts; falls back to
     /// serial reference for 0-1 active disjuncts or on batched error.
@@ -93,7 +93,7 @@ impl BetaCrownVerifier {
         self.process_per_disjunct_serial(ctx, parent, child, is_active, &pruned_targets)
     }
 
-    /// Batched per-disjunct evaluation (#4355 Packet B).
+    /// Batched per-disjunct evaluation.
     ///
     /// Packs N active disjuncts as N pseudo-domains with the same constrained
     /// input but per-disjunct alpha and objective. Forward bounds computed once.
@@ -252,19 +252,28 @@ impl BetaCrownVerifier {
         }
 
         // Extract captured lA from intermediate results.
+        // #la-warm-frontier: per pseudo-domain frontiers (`None` unless the
+        // pass ran armed), attached to the same pseudo-domain's cache.
+        let mut frontiers_per_active = result.intermediate_frontiers.map(Vec::into_iter);
         let active_cached_las: Vec<Option<crate::batched_domain::CachedLinearBounds>> =
             if let Some(intermediate_la) = result.intermediate_la {
                 intermediate_la
                     .into_iter()
                     .map(|la_map| {
+                        let frontiers = frontiers_per_active.as_mut().and_then(Iterator::next);
                         if la_map.is_empty() {
                             None
                         } else {
-                            Some(
+                            let cache =
                                 crate::batched_domain::CachedLinearBounds::from_linear_bounds_map(
                                     la_map,
-                                ),
-                            )
+                                );
+                            Some(match frontiers {
+                                Some(frontiers) if !frontiers.is_empty() => {
+                                    cache.with_frontiers(frontiers)
+                                }
+                                _ => cache,
+                            })
                         }
                     })
                     .collect()
@@ -381,6 +390,11 @@ impl BetaCrownVerifier {
                 }
                 Err(ref e) if e.is_infeasible_domain() => {
                     tracing::debug!("Per-disjunct {full_idx} infeasible (empty): {e}");
+                    // #vit-margin-alpha-complex (P8): an emptiness claim;
+                    // counted for the fenced run's gate (bookkeeping only).
+                    super::containment_fence_lane::note_emptiness_claim(
+                        super::containment_fence_lane::EmptinessClaim::PerDisjunct,
+                    );
                     return Ok(PerDisjunctChildOutcome::Verified(None));
                 }
                 Err(e) => {

@@ -38,7 +38,7 @@ fn test_directed_steps_preserve_subnormal_bit_order() {
     assert_eq!(shift_down_n_ulps(negative, 3).to_bits(), 0x8000_000a);
 }
 
-/// Regression test for #3149: infinity sentinels must be preserved.
+/// Regression test: infinity sentinels must be preserved.
 /// `mark_infeasible_all()` uses (+inf, -inf) to mark infeasible neurons.
 /// Directed rounding must not convert these into finite bounds.
 #[test]
@@ -192,7 +192,7 @@ fn test_shift_n_ulps_infinity_passthrough() {
     assert_eq!(shift_down_n_ulps(f32::NEG_INFINITY, 10), f32::NEG_INFINITY);
 }
 
-/// Regression test for #3149: opposite-sign infinity must be preserved.
+/// Regression test: opposite-sign infinity must be preserved.
 /// `mark_infeasible_all()` uses sentinel (+inf lower, -inf upper).
 /// `round_for_soundness_n_ulps` calls `shift_down_n_ulps(+inf, n)` on lower
 /// and `shift_up_n_ulps(-inf, n)` on upper. Both must preserve infinity.
@@ -285,7 +285,7 @@ fn test_shift_n_ulps_typical_linear_layer() {
     ); // Should be ~0.012 for 770 ULPs at magnitude 42
 }
 
-// -- Regression tests for #2788: large-n overflow in zero/cross-zero branches --
+// -- Regression tests: large-n overflow in zero/cross-zero branches --
 
 /// shift_up from 0.0 with n >= inf_bits must saturate to +inf, not produce NaN.
 #[test]

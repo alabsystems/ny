@@ -15,14 +15,14 @@ use ort::session::Session;
 use prost::Message;
 use std::collections::HashMap;
 #[cfg(feature = "ort")]
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 #[cfg(feature = "ort")]
 use std::io::Write;
 use std::path::Path;
 #[cfg(feature = "ort")]
 use std::sync::mpsc;
 #[cfg(feature = "ort")]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(feature = "ort")]
 use tempfile::TempPath;
 #[cfg(feature = "ort")]
@@ -35,12 +35,22 @@ use super::const_fold::is_standard_onnx_domain;
 /// Maximum time to wait for ONNX Runtime shape inference session creation.
 /// Models with problematic shape inference (e.g., Gemm with non-rank-2 inputs)
 /// can cause ORT to hang indefinitely in its C++ optimization passes.
+///
+/// ONE budget for the whole inference: the rank probe
+/// ([`resolve_zero_dim_ranks`]) is not started once the budget is spent, and
+/// its session waits only for what the first session left. The probe can
+/// overrun the budget only by the time it takes to BUILD the probe model (one
+/// decode + encode of the model, plus writing it out on the file-backed
+/// in-process path) when the first session ends just short of the budget —
+/// small against the 15 s margin between this budget and the parent's
+/// `SUBPROCESS_DEADLINE`, which backstops the subprocess child.
 #[cfg(feature = "ort")]
 const ORT_SHAPE_INFERENCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(feature = "ort")]
 const DEFAULT_IR_VERSION: i64 = 9;
-#[cfg(any(feature = "ort", test))]
+// Shared with the static fallback, which normalises a missing / non-positive
+// default-domain opset exactly as `normalize_model_for_ort` does.
 pub(super) const DEFAULT_OPSET_VERSION: i64 = 13;
 
 #[cfg(feature = "ort")]
@@ -70,9 +80,12 @@ fn normalize_model_for_ort(model: &mut onnx_proto::ModelProto) {
 /// The ONNX Runtime `commit_from_memory` call is a blocking FFI call into C++
 /// that can hang indefinitely on models with problematic shape inference (e.g.,
 /// Gemm nodes with non-rank-2 inputs). This spawns the call on a background
-/// thread and enforces a deadline.
+/// thread and enforces `deadline`.
 #[cfg(feature = "ort")]
-fn create_ort_session_from_memory_with_timeout(bytes: Vec<u8>) -> Result<Session> {
+fn create_ort_session_from_memory_with_timeout(
+    bytes: Vec<u8>,
+    deadline: Duration,
+) -> Result<Session> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let result = crate::runtime::session_builder()
@@ -84,16 +97,16 @@ fn create_ort_session_from_memory_with_timeout(bytes: Vec<u8>) -> Result<Session
             });
         let _ = tx.send(result);
     });
-    match rx.recv_timeout(ORT_SHAPE_INFERENCE_TIMEOUT) {
+    match rx.recv_timeout(deadline) {
         Ok(result) => result,
         Err(mpsc::RecvTimeoutError::Timeout) => {
             warn!(
-                "ONNX Runtime shape inference timed out after {}s — skipping",
-                ORT_SHAPE_INFERENCE_TIMEOUT.as_secs()
+                "ONNX Runtime shape inference timed out after {:.1}s — skipping",
+                deadline.as_secs_f64()
             );
             Err(NyError::ModelLoad(format!(
-                "ONNX Runtime shape inference timed out after {}s",
-                ORT_SHAPE_INFERENCE_TIMEOUT.as_secs()
+                "ONNX Runtime shape inference timed out after {:.1}s",
+                deadline.as_secs_f64()
             )))
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -109,7 +122,10 @@ fn create_ort_session_from_memory_with_timeout(bytes: Vec<u8>) -> Result<Session
 
 /// Create an ORT session from a file path with a timeout guard.
 #[cfg(feature = "ort")]
-fn create_ort_session_from_file_with_timeout(path: std::path::PathBuf) -> Result<Session> {
+fn create_ort_session_from_file_with_timeout(
+    path: std::path::PathBuf,
+    deadline: Duration,
+) -> Result<Session> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let result = crate::runtime::session_builder()
@@ -121,16 +137,16 @@ fn create_ort_session_from_file_with_timeout(path: std::path::PathBuf) -> Result
             });
         let _ = tx.send(result);
     });
-    match rx.recv_timeout(ORT_SHAPE_INFERENCE_TIMEOUT) {
+    match rx.recv_timeout(deadline) {
         Ok(result) => result,
         Err(mpsc::RecvTimeoutError::Timeout) => {
             warn!(
-                "ONNX Runtime shape inference timed out after {}s — skipping",
-                ORT_SHAPE_INFERENCE_TIMEOUT.as_secs()
+                "ONNX Runtime shape inference timed out after {:.1}s — skipping",
+                deadline.as_secs_f64()
             );
             Err(NyError::ModelLoad(format!(
-                "ONNX Runtime shape inference timed out after {}s",
-                ORT_SHAPE_INFERENCE_TIMEOUT.as_secs()
+                "ONNX Runtime shape inference timed out after {:.1}s",
+                deadline.as_secs_f64()
             )))
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -144,22 +160,18 @@ fn create_ort_session_from_file_with_timeout(path: std::path::PathBuf) -> Result
     }
 }
 
+/// ONNX Runtime's shape table for `model_bytes`: tensor name -> dims, with
+/// `-1` for a symbolic dim.
+///
+/// An entry is present only when ORT's own type for the tensor carries it.
+/// In particular `[]` means ORT's type for the tensor has rank 0: a tensor
+/// ORT could not type at all (the C API reports it with zero dims too) is
+/// ABSENT, never recorded as a scalar — see [`resolve_zero_dim_ranks`].
 #[cfg(feature = "ort")]
 pub(super) fn infer_tensor_shapes_from_ort(
     model_bytes: &[u8],
 ) -> Result<HashMap<String, Vec<i64>>> {
-    let exposed = expose_intermediate_outputs(model_bytes)?;
-    if !exposed.has_runtime_inputs {
-        return Ok(HashMap::new());
-    }
-    if exposed.bytes.is_empty() {
-        return Err(NyError::ModelLoad(
-            "ONNX model bytes empty after exposing intermediate outputs".to_string(),
-        ));
-    }
-    let normalized_bytes = normalize_bytes_for_ort(&exposed.bytes)?;
-    let session = create_ort_session_from_memory_with_timeout(normalized_bytes)?;
-    Ok(collect_shapes_from_session(&session))
+    infer_tensor_shapes_through(model_bytes, &SessionSource::Memory)
 }
 
 #[cfg(not(feature = "ort"))]
@@ -170,10 +182,70 @@ pub(super) fn infer_tensor_shapes_from_ort(
     Ok(HashMap::new())
 }
 
+/// [`infer_tensor_shapes_from_ort`] for a model that came from `path`: ORT
+/// loads it from a temporary file beside `path` (from memory for `.gz`), and
+/// the rank probe loads the same way.
 #[cfg(feature = "ort")]
 pub(super) fn infer_tensor_shapes_from_ort_path(
     path: &Path,
     model_bytes: &[u8],
+) -> Result<HashMap<String, Vec<i64>>> {
+    let source = if is_gz_path(path) {
+        SessionSource::Memory
+    } else {
+        SessionSource::FileBeside(path)
+    };
+    infer_tensor_shapes_through(model_bytes, &source)
+}
+
+/// Where an ORT shape-inference session is committed from. The first session
+/// and the rank probe of one load use the SAME source, so the probe sees the
+/// model exactly as the first session did.
+#[cfg(feature = "ort")]
+enum SessionSource<'a> {
+    /// In-memory bytes: the byte API, the subprocess child, and `.gz` paths.
+    Memory,
+    /// A temporary file beside this model path (or in the system temp dir when
+    /// that is unusable; see [`write_temp_onnx_file`]).
+    FileBeside(&'a Path),
+}
+
+/// A committed session and the temporary file it was loaded from.
+#[cfg(feature = "ort")]
+struct CommittedSession {
+    session: Session,
+    // Fields drop in declaration order, so the backing file outlives the
+    // session, exactly as the pre-probe code's locals did.
+    _backing_file: Option<TempPath>,
+}
+
+#[cfg(feature = "ort")]
+fn commit_session(
+    source: &SessionSource<'_>,
+    bytes: Vec<u8>,
+    deadline: Duration,
+) -> Result<CommittedSession> {
+    match source {
+        SessionSource::Memory => Ok(CommittedSession {
+            session: create_ort_session_from_memory_with_timeout(bytes, deadline)?,
+            _backing_file: None,
+        }),
+        SessionSource::FileBeside(path) => {
+            let temp_path = write_temp_onnx_file(path, &bytes)?;
+            let file_path = temp_path_ref(&temp_path).to_path_buf();
+            let session = create_ort_session_from_file_with_timeout(file_path, deadline)?;
+            Ok(CommittedSession {
+                session,
+                _backing_file: Some(temp_path),
+            })
+        }
+    }
+}
+
+#[cfg(feature = "ort")]
+fn infer_tensor_shapes_through(
+    model_bytes: &[u8],
+    source: &SessionSource<'_>,
 ) -> Result<HashMap<String, Vec<i64>>> {
     let exposed = expose_intermediate_outputs(model_bytes)?;
     if !exposed.has_runtime_inputs {
@@ -185,16 +257,19 @@ pub(super) fn infer_tensor_shapes_from_ort_path(
         ));
     }
     let normalized_bytes = normalize_bytes_for_ort(&exposed.bytes)?;
-    if is_gz_path(path) {
-        let session = create_ort_session_from_memory_with_timeout(normalized_bytes)?;
-        return Ok(collect_shapes_from_session(&session));
-    }
-
-    let temp_path = write_temp_onnx_file(path, &normalized_bytes)?;
-    let file_path = temp_path_ref(&temp_path).to_path_buf();
-    let session = create_ort_session_from_file_with_timeout(file_path)?;
-
-    Ok(collect_shapes_from_session(&session))
+    let started = Instant::now();
+    // The first session is dropped before the probe session is built, so the
+    // two never hold the model's weights at the same time.
+    let reported = {
+        let first = commit_session(source, normalized_bytes, ORT_SHAPE_INFERENCE_TIMEOUT)?;
+        collect_shapes_from_session(&first.session)
+    };
+    Ok(resolve_zero_dim_ranks(
+        reported,
+        &exposed.bytes,
+        source,
+        started,
+    ))
 }
 
 #[cfg(not(feature = "ort"))]
@@ -288,33 +363,310 @@ fn temp_builder() -> tempfile::Builder<'static, 'static> {
     builder
 }
 
+/// What one ORT session reported, before any zero-dim report is decided.
 #[cfg(feature = "ort")]
-fn collect_shapes_from_session(session: &Session) -> HashMap<String, Vec<i64>> {
-    let mut shapes = HashMap::new();
-
-    for input in session.inputs() {
-        if let Some(shape) = input.dtype().tensor_shape() {
-            insert_shape_if_informative(&mut shapes, input.name(), shape);
-        }
-    }
-
-    for output in session.outputs() {
-        if let Some(shape) = output.dtype().tensor_shape() {
-            insert_shape_if_informative(&mut shapes, output.name(), shape);
-        }
-    }
-
-    shapes
+#[derive(Debug, Default)]
+struct SessionShapes {
+    /// Tensors ORT reported with rank >= 1 and at least one positive dim.
+    shapes: HashMap<String, Vec<i64>>,
+    /// Tensors ORT reported with ZERO dims. That is ambiguous: ORT's C API
+    /// (`GetDimensionsCount`, which the `ort` crate reads) returns 0 both for a
+    /// proven rank-0 tensor and for a tensor whose type carries no shape at
+    /// all, i.e. whose rank ORT does not know. Measured on ORT 1.28 (the build
+    /// ny links) with cctsdb `patch-1.onnx`: tensor `362`, runtime
+    /// `[1,1,x,64]`, reported `ndims=0`. Ordered so the probe model is
+    /// deterministic.
+    zero_dims: BTreeSet<String>,
 }
 
+#[cfg(feature = "ort")]
+fn collect_shapes_from_session(session: &Session) -> SessionShapes {
+    let mut collected = SessionShapes::default();
+    for outlet in session.inputs().iter().chain(session.outputs()) {
+        let name = outlet.name();
+        let Some(shape) = outlet.dtype().tensor_shape() else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        if shape.is_empty() {
+            collected.zero_dims.insert(name.to_string());
+        } else {
+            insert_shape_if_informative(&mut collected.shapes, name, shape);
+        }
+    }
+    // A name ORT reported both with and without dims (an input that is also
+    // an output) is a self-contradiction: record nothing for it.
+    let SessionShapes { shapes, zero_dims } = &mut collected;
+    zero_dims.retain(|name| shapes.remove(name).is_none());
+    collected
+}
+
+/// Record a NON-EMPTY `shape` for `name` when at least one dim is a positive
+/// extent (the rest may be symbolic `-1`).
+///
+/// A zero-dim report is never recorded here: from a session it is ambiguous
+/// between "rank 0" and "rank unknown" (see [`SessionShapes::zero_dims`]), and
+/// only [`resolve_zero_dim_ranks`] may turn it into `[]`, after ORT proves
+/// rank 0.
 #[cfg(feature = "ort")]
 fn insert_shape_if_informative(shapes: &mut HashMap<String, Vec<i64>>, name: &str, shape: &[i64]) {
     if name.is_empty() {
         return;
     }
-    if shape.is_empty() || shape.iter().any(|dim| *dim > 0) {
+    if shape.iter().any(|dim| *dim > 0) {
         shapes.insert(name.to_string(), shape.to_vec());
     }
+}
+
+/// Settle every zero-dim report: `[]` for each tensor whose ORT type has
+/// rank 0, nothing for the rest.
+///
+/// The check is one extra ORT session over the first session's exact model
+/// plus a standard `Shape` node on each candidate, exposed as a graph output
+/// ([`build_rank_probe_model`]). `Shape(x)` always has rank 1 and length
+/// rank(x), so ORT's inferred type for it is `[0]` exactly when its own shape
+/// inference holds a rank-0 type for `x`, and `[-1]` when `x` has no shape
+/// information (measured on ORT 1.26 through Python and on 1.28 through the C
+/// API). Only models with at least one zero-dim report pay for the probe.
+///
+/// Fail-safe in every direction: no budget left, a probe that fails to build or
+/// commit, a probe output ORT omits, or any report other than exactly `[0]`
+/// leaves the tensor UNKNOWN — the loader then treats it as it treats any
+/// tensor ORT could not type. A shape is never guessed. One failure costs the
+/// whole batch (every candidate of that model stays unknown), never a guess;
+/// only TENSOR-typed reports are candidates (`collect_shapes_from_session`
+/// skips sequence/map/optional values, which have no `tensor_shape()`), so a
+/// sequence output cannot make `Shape` invalid and sink the batch (the `ort`
+/// crate does type a SPARSE tensor as a tensor; `Shape` rejects it, and that
+/// batch fails closed). ny's `onnx_proto::TypeProto` models only
+/// `tensor_type`, so a sequence / map / optional / sparse type DECLARATION
+/// reaches ORT empty after the re-encode here: such a value is typed by ORT's
+/// own inference or not at all.
+///
+/// What `[0]` certifies is ORT's TYPE for `x`, with the same authority as
+/// every non-empty entry of the table: ORT's own inference, or the model's
+/// graph-input declarations, initializer dims and TERMINAL graph-output
+/// declarations, which `expose_intermediate_outputs` leaves in place as the
+/// I/O contract (it strips the shapes of intermediate `value_info` and of
+/// re-consumed outputs, and types an exposed Cast / shape-preserving output
+/// only from those same sources). ORT enforces graph-input ranks at run time
+/// but not a main-graph output declaration (measured on ORT 1.26: a terminal
+/// output declared `[]`, or `[3]`, over an untyped producer runs as `[2, 6]`),
+/// so a model that mis-declares a terminal output gets that declaration here,
+/// exactly as it did before the probe and exactly as it does for a non-empty
+/// declared shape — and the loader's `build_tensor_shapes` seeds that
+/// declaration directly in any case. A terminal output is never an input of a
+/// main-graph `Shape`, so the Shape constant folders cannot fold it.
+/// Control flow is enforced rather than trusted: ORT checks an If body output
+/// against its type at run time ("OrtValue shape verification failed"),
+/// including a type that came from a stale subgraph `value_info` (which this
+/// pass does not strip; both measured on ORT 1.26), so a false `[0]` on an If
+/// output belongs to a model ORT cannot run; a loop-carried value's shape is
+/// dropped by ONNX's Loop inference; and ny's converter names no control-flow
+/// or sequence op.
+///
+/// Measured over the VNN-COMP corpus (every distinct model, 2026-09-28): the
+/// rule keeps all 299 true scalars in the 950 models of at most 30 MB and all
+/// 107 in the 27 larger ones, and drops exactly cctsdb `patch-1` `362` and
+/// `patch-3` `onnx::ScatterND_338`, whose runtime shapes are rank 4.
+/// Re-measured by the review over all 959 distinct models (sha-deduplicated,
+/// both years): 24 models carry 408 zero-dim reports, the probe proves 406,
+/// every one of which is rank 0 at run time, and leaves the two cctsdb
+/// tensors unknown; the ORT 1.28 C API (the build ny links) reproduces the
+/// same zero-dim OUTPUT reports on all 959 models (inputs are declarations)
+/// and the same probe verdicts on all 408. The probe session costs about one first session: ORT 1.28 C API,
+/// default session options, three interleaved runs each on a loaded box —
+/// cGAN transformer (273 MB, 99 candidates) first 0.34–0.40 s, probe
+/// 0.41–0.42 s, peak RSS 727 vs 743 MB; smart_turn (42.5 MB) 0.074–0.076 s vs
+/// 0.068–0.078 s; collins yolov5nano (7.5 MB) 0.012–0.013 s vs 0.016–0.017 s.
+/// Building the probe adds one decode + encode of the exposed model (not timed
+/// in Rust; Python upb on the same cGAN bytes: 0.07–0.11 s + 0.46–0.52 s).
+#[cfg(feature = "ort")]
+fn resolve_zero_dim_ranks(
+    reported: SessionShapes,
+    exposed_bytes: &[u8],
+    source: &SessionSource<'_>,
+    started: Instant,
+) -> HashMap<String, Vec<i64>> {
+    let SessionShapes {
+        mut shapes,
+        zero_dims,
+    } = reported;
+    if zero_dims.is_empty() {
+        return shapes;
+    }
+    let proven = match prove_rank_zero(exposed_bytes, &zero_dims, source, started) {
+        Ok(proven) => proven,
+        Err(err) => {
+            warn!(
+                "[shape-rank-probe] rank probe unavailable ({err}); recording no shape for the \
+                 {} tensor(s) ONNX Runtime reported with zero dims",
+                zero_dims.len()
+            );
+            HashSet::new()
+        }
+    };
+    debug!(
+        "[shape-rank-probe] zero-dim reports={} proven rank 0={} left unknown={}",
+        zero_dims.len(),
+        proven.len(),
+        zero_dims.len().saturating_sub(proven.len())
+    );
+    for name in proven {
+        shapes.insert(name, Vec::new());
+    }
+    shapes
+}
+
+/// The candidates whose ORT type has rank 0 (a subset of `candidates`). The
+/// probe session gets only what is left of the inference budget that started
+/// with the first session (`started`), measured after the probe model is
+/// built; it is not built at all once that budget is spent.
+#[cfg(feature = "ort")]
+fn prove_rank_zero(
+    exposed_bytes: &[u8],
+    candidates: &BTreeSet<String>,
+    source: &SessionSource<'_>,
+    started: Instant,
+) -> Result<HashSet<String>> {
+    let spent = || NyError::ModelLoad("the shape-inference budget is spent".to_string());
+    if started.elapsed() >= ORT_SHAPE_INFERENCE_TIMEOUT {
+        return Err(spent());
+    }
+    let probe = build_rank_probe_model(exposed_bytes, candidates)?;
+    let remaining = ORT_SHAPE_INFERENCE_TIMEOUT.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Err(spent());
+    }
+    let committed = commit_session(source, probe.bytes, remaining)?;
+    let mut proven = HashSet::new();
+    for output in committed.session.outputs() {
+        let Some(candidate) = probe.candidate_by_output.get(output.name()) else {
+            continue;
+        };
+        let reported = output.dtype().tensor_shape().map(|shape| &**shape);
+        if probe_proves_rank_zero(reported) {
+            proven.insert(candidate.clone());
+        }
+    }
+    Ok(proven)
+}
+
+/// Whether ORT's inferred dims for a `Shape(x)` probe output prove rank(x) == 0:
+/// exactly `[0]`. `[-1]` (length unknown), `[]` (the probe itself untyped),
+/// any other length, or no report at all prove nothing.
+#[cfg(feature = "ort")]
+fn probe_proves_rank_zero(probe_dims: Option<&[i64]>) -> bool {
+    probe_dims == Some(&[0_i64][..])
+}
+
+/// Probe outputs are named from this prefix; [`fresh_name`] keeps them clear
+/// of every name the model already uses.
+#[cfg(feature = "ort")]
+const RANK_PROBE_PREFIX: &str = "__ny_rank_probe_";
+
+/// The rank-probe model and which candidate each probe output measures.
+#[cfg(feature = "ort")]
+struct RankProbeModel {
+    bytes: Vec<u8>,
+    /// Probe output name -> the candidate tensor it measures.
+    candidate_by_output: HashMap<String, String>,
+}
+
+/// `exposed_bytes` (the first session's model before `normalize_bytes_for_ort`,
+/// which is re-applied here) plus, per candidate, one default-domain `Shape`
+/// node whose output is a new graph output. Nothing else changes, so ORT
+/// types every original tensor exactly as in the first session.
+#[cfg(feature = "ort")]
+fn build_rank_probe_model(
+    exposed_bytes: &[u8],
+    candidates: &BTreeSet<String>,
+) -> Result<RankProbeModel> {
+    let mut model = onnx_proto::ModelProto::decode(exposed_bytes).map_err(|e| {
+        NyError::ModelLoad(format!(
+            "Failed to parse ONNX protobuf for the rank probe: {e}"
+        ))
+    })?;
+    normalize_model_for_ort(&mut model);
+    let graph = model
+        .graph
+        .as_mut()
+        .ok_or_else(|| NyError::ModelLoad("ONNX model has no graph".to_string()))?;
+    let mut taken = HashSet::new();
+    collect_graph_names(graph, &mut taken);
+    let mut candidate_by_output = HashMap::with_capacity(candidates.len());
+    for (index, candidate) in candidates.iter().enumerate() {
+        let output = fresh_name(&mut taken, &format!("{RANK_PROBE_PREFIX}{index}"));
+        let node_name = fresh_name(&mut taken, &format!("{RANK_PROBE_PREFIX}node_{index}"));
+        graph.node.push(onnx_proto::NodeProto {
+            input: vec![candidate.clone()],
+            output: vec![output.clone()],
+            name: node_name,
+            op_type: "Shape".to_string(),
+            domain: String::new(),
+            attribute: Vec::new(),
+        });
+        graph.output.push(onnx_proto::ValueInfoProto {
+            name: output.clone(),
+            r#type: None,
+        });
+        candidate_by_output.insert(output, candidate.clone());
+    }
+    let mut bytes = Vec::new();
+    model.encode(&mut bytes).map_err(|e| {
+        NyError::ModelLoad(format!("Failed to serialize the rank-probe model: {e}"))
+    })?;
+    Ok(RankProbeModel {
+        bytes,
+        candidate_by_output,
+    })
+}
+
+/// Every name `graph` uses — values, initializers, node names — including
+/// inside control-flow subgraphs, which see the outer scope.
+#[cfg(feature = "ort")]
+fn collect_graph_names(graph: &onnx_proto::GraphProto, names: &mut HashSet<String>) {
+    for info in graph
+        .input
+        .iter()
+        .chain(&graph.output)
+        .chain(graph.value_info())
+    {
+        names.insert(info.name.clone());
+    }
+    for initializer in &graph.initializer {
+        names.insert(initializer.name.clone());
+    }
+    for sparse in &graph.sparse_initializer {
+        if let Some(values) = &sparse.values {
+            names.insert(values.name.clone());
+        }
+    }
+    for node in &graph.node {
+        names.insert(node.name.clone());
+        names.extend(node.input.iter().cloned());
+        names.extend(node.output.iter().cloned());
+        for attribute in &node.attribute {
+            for subgraph in attribute.g.iter().chain(&attribute.graphs) {
+                collect_graph_names(subgraph, names);
+            }
+        }
+    }
+}
+
+/// `base`, or `base_<n>` for the smallest `n` that is unused; the result is
+/// reserved in `taken`.
+#[cfg(feature = "ort")]
+fn fresh_name(taken: &mut HashSet<String>, base: &str) -> String {
+    let mut name = base.to_string();
+    let mut suffix = 0_usize;
+    while !taken.insert(name.clone()) {
+        suffix += 1;
+        name = format!("{base}_{suffix}");
+    }
+    name
 }
 
 #[cfg(feature = "ort")]
@@ -710,6 +1062,7 @@ fn expose_intermediate_outputs(model_bytes: &[u8]) -> Result<ExposedModel> {
     })
 }
 
+pub(crate) mod static_infer;
 pub(crate) mod subprocess;
 
 // NOTE: Keep test modules uniquely named to avoid duplicate module collisions.
@@ -719,7 +1072,20 @@ pub(crate) mod subprocess;
 mod expose_intermediate_outputs_serialization_tests;
 #[cfg(all(test, feature = "ort"))]
 mod expose_intermediate_outputs_tests;
+// The zero-dim rank probe needs ORT to run at all.
+#[cfg(all(test, feature = "ort"))]
+mod ort_rank_probe_tests;
 // The subprocess protocol itself is feature-independent (without `ort` the
 // server answers with an empty shape table), so its tests are not gated.
 #[cfg(test)]
 mod subprocess_tests;
+// The static fallback is ORT-free; its rule tests are feature-independent
+// (the ORT differential cases inside gate themselves on `ort`).
+#[cfg(test)]
+mod static_infer_tests;
+// Loader-level fallback behaviour, plus the in-process-ORT differential.
+#[cfg(test)]
+mod static_infer_loader_tests;
+// Corpus comparison against the committed ORT reference tables.
+#[cfg(test)]
+mod static_infer_corpus_tests;

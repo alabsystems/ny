@@ -32,8 +32,6 @@ pub(crate) type DomainCrownResult = (BoundedTensor, HashMap<String, Arc<BoundedT
 /// - split-dimension scoring (SB heuristic),
 /// - clip reuse,
 /// - multi-objective pruning parity.
-///
-/// Part of #4116 Packet A: dense-spec result surface.
 #[derive(Debug)]
 pub struct DomainSpecCrownResult {
     pub output_bounds: BoundedTensor,
@@ -86,6 +84,9 @@ pub(crate) mod adaptive_microbatch;
 mod alpha_analytic;
 pub(in crate::beta_crown::engine::graph) mod clip_alpha;
 pub(in crate::beta_crown::engine::graph) mod clip_complete;
+mod cover_ledger;
+#[cfg(test)]
+mod cover_ledger_tests;
 pub(crate) mod domain_batch;
 pub(crate) mod domain_conversion;
 #[cfg(test)]
@@ -94,8 +95,12 @@ pub(crate) mod gpu_bab;
 #[doc(hidden)]
 pub mod gpu_beta_debug;
 pub(crate) mod input_split;
+pub(crate) mod mo_cover;
 mod multi_objective;
 mod objectives;
+/// #finalize-objective: the certified interval image of a box through one
+/// objective row, shared with the atomic CUDA rows reference guard.
+pub(crate) use objectives::objective_bounds;
 pub(crate) mod propagation;
 mod relu_split;
 mod relu_split_bounds;

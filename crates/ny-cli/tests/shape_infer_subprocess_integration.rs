@@ -11,7 +11,8 @@
 //!   client backend accepts it end-to-end through `load_onnx_bytes_with_config`;
 //! - garbage input exits non-zero (the parent's inference-unavailable signal);
 //! - a subprocess that dies without answering degrades the load to the
-//!   graceful no-inferred-shapes fallback instead of an error or crash.
+//!   ORT-free static shape fallback (exact rules only) instead of an error or
+//!   crash; nothing from the failed exchange itself is ever used.
 
 use ny_onnx::{onnx_proto, OnnxLoadConfig, ShapeInferBackend, SHAPE_INFER_SUBCOMMAND};
 use prost::Message;
@@ -115,7 +116,7 @@ fn real_binary_serves_versioned_shape_table() {
         serde_json::from_slice(&output.stdout).expect("stdout is a single JSON document");
     assert_eq!(
         response.get("version").and_then(|v| v.as_u64()),
-        Some(1),
+        Some(2),
         "response must carry the protocol version tag: {response}"
     );
     let shapes = response
@@ -158,20 +159,23 @@ fn real_binary_rejects_garbage_input_with_nonzero_exit() {
 
 #[cfg(unix)]
 #[test]
-fn dead_subprocess_degrades_to_graceful_no_shapes_load() {
+fn dead_subprocess_degrades_to_static_shape_fallback_load() {
     // `/usr/bin/false` exits non-zero without answering — the same observable
-    // as an ORT SIGABRT under panic=abort. The load must still succeed; only
-    // the ORT-inferred intermediate shape is lost.
+    // as an ORT SIGABRT under panic=abort, and as the x86-under-qemu child
+    // that exits 127 because it cannot exec. The load must still succeed.
+    // Nothing is taken from the failed exchange; "sum" now comes from the
+    // ORT-free static fallback, whose Add rule is exact ([1,3] + [1,3]).
     let bytes = build_add_relu_model_bytes();
     let config =
         OnnxLoadConfig::default().with_shape_infer_backend(ShapeInferBackend::Subprocess {
             exe: PathBuf::from("/usr/bin/false"),
         });
     let model = ny_onnx::load_onnx_bytes_with_config("add_relu", &bytes, &config)
-        .expect("dead subprocess must degrade to a no-inferred-shapes load, not an error");
-    assert!(
-        !model.tensor_shapes().contains_key("sum"),
-        "no shapes may be fabricated from a failed subprocess exchange"
+        .expect("dead subprocess must degrade to the static fallback, not an error");
+    assert_eq!(
+        model.tensor_shapes().get("sum").map(Vec::as_slice),
+        Some([1, 3].as_slice()),
+        "the static fallback's exact shape must reach the loaded model"
     );
     // The declared I/O contract still comes from the proto itself.
     assert_eq!(

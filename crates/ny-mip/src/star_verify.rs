@@ -699,7 +699,9 @@ where
                                 Some(fast)
                             } else {
                                 // STAGE B — the tighter column encoding, only for coordinates
-                                // the cheap bound left straddling zero.
+                                // the cheap bound left straddling zero. The EXACT query
+                                // (`exact_bounds`), not the rigorous one: a hair-straddle is
+                                // exactly what the NS tier's outward padding cannot resolve.
                                 stats.ns_declined += 1;
                                 let req = lp_request(&star, vec![(c_i, g_i.clone())])?;
                                 let mut col_sess = StarLpSession::new(
@@ -707,7 +709,7 @@ where
                                     budget.lp_time_limit,
                                     budget.deadline,
                                 )?;
-                                col_sess.bounds(0)?
+                                col_sess.exact_bounds(0)?
                             };
                             stats.ns_exact_lp += t_lp.elapsed().as_nanos();
                             if now("star exact-LP publication") >= budget.deadline {

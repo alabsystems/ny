@@ -86,7 +86,7 @@ fn log_packet2_comparison(comparison: &Packet2Comparison) {
 }
 
 /// Packet 2: compose suffix LinearBounds with prefix MFA LinearBounds and
-/// intersect with standard (concretize-first) bounds for best-of-both (#3499).
+/// intersect with standard (concretize-first) bounds for best-of-both.
 ///
 /// The composition pipeline:
 /// 1. Gets MFA LinearBounds from the direct-boundary prefix packet
@@ -98,8 +98,6 @@ fn log_packet2_comparison(comparison: &Packet2Comparison) {
 /// The intersection is always no worse than standard (both are valid
 /// over-approximations). Composition helps when cross-dimensional MFA
 /// correlation outweighs the McCormick decomposition looseness.
-///
-/// Reference: designs/2026-03-13-issue-3499-suffix-linear-certificate-composition.md
 #[cfg_attr(not(debug_assertions), ntest::timeout(1800000))]
 #[test]
 #[cfg(feature = "external-avoice")]

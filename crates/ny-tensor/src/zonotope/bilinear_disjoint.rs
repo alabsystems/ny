@@ -169,7 +169,7 @@ impl ZonotopeTensor {
     ///
     /// This is the conservative path for bilinear products after an interval fallback
     /// has broken the original shared-symbol provenance, such as Packet C's
-    /// `softmax @ V` seam in Whisper attention (#318).
+    /// `softmax @ V` seam in Whisper attention.
     ///
     /// The result preserves each operand's linear error terms separately and
     /// collapses all mixed bilinear products into one new radius term.

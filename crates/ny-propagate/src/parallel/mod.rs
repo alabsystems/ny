@@ -191,7 +191,7 @@ impl ParallelVerifier {
         self.verify_parallel_impl_with_engine(graph, input, axis, num_positions, self.engine())
     }
 
-    /// Internal parallel implementation with GPU engine (#3598).
+    /// Internal parallel implementation with GPU engine.
     fn verify_parallel_impl_with_engine(
         &self,
         graph: &GraphNetwork,
@@ -264,7 +264,7 @@ impl ParallelVerifier {
         self.verify_serial_impl_with_engine(graph, input, axis, num_positions, self.engine())
     }
 
-    /// Internal serial implementation with GPU engine (#3598).
+    /// Internal serial implementation with GPU engine.
     fn verify_serial_impl_with_engine(
         &self,
         graph: &GraphNetwork,
@@ -353,7 +353,7 @@ pub fn verify_parallel(
         .output_bounds)
 }
 
-/// Engine-aware convenience function for parallel position verification (#3772).
+/// Engine-aware convenience function for parallel position verification.
 pub fn verify_parallel_with_engine(
     graph: &GraphNetwork,
     input: &BoundedTensor,
@@ -384,7 +384,7 @@ pub fn verify_parallel_with_method(
         .output_bounds)
 }
 
-/// Engine-aware convenience function for parallel position verification with custom method (#3772).
+/// Engine-aware convenience function for parallel position verification with custom method.
 pub fn verify_parallel_with_method_and_engine(
     graph: &GraphNetwork,
     input: &BoundedTensor,
@@ -413,7 +413,7 @@ fn crown_with_fallback(
     context: &str,
     engine: Option<&dyn GemmEngine>,
 ) -> Result<BoundedTensor> {
-    // #3598: Use engine-aware variants for GPU acceleration.
+    // Use engine-aware variants for GPU acceleration.
     graph
         .propagate_crown_batched_with_provenance_and_engine(input, engine)
         .map(|result| result.bounds)

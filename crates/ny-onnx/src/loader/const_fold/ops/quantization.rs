@@ -75,16 +75,24 @@ fn try_fold_dequantize_linear(
     }
     let zero_point = match node.input.get(2).filter(|name| !name.is_empty()) {
         Some(name) => {
-            // ONNX requires x and x_zero_point to have the same quantized type.
-            // INT32 dequantization has no zero point.
-            if x_range == (i32::MIN as i64, i32::MAX as i64) {
-                return None;
-            }
             let (values, range) = authenticated_quantized_integers(weights, name)?;
             if range != x_range {
                 return None;
             }
-            Some(values)
+            // ONNX requires x and x_zero_point to have the same quantized
+            // type, and INT32 dequantization requires its zero point to be 0.
+            // An exporter-authored ALL-ZERO INT32 zero point is bit-identical
+            // to the omitted one (#smart-turn-qdq; such a node only reaches
+            // this fold through the gated preflight admission); anything
+            // nonzero stays unfolded and the node fails closed downstream.
+            if x_range == (i32::MIN as i64, i32::MAX as i64) {
+                if values.iter().any(|&value| value != 0) {
+                    return None;
+                }
+                None
+            } else {
+                Some(values)
+            }
         }
         None => None,
     };
@@ -293,12 +301,20 @@ fn quant_param_for_input_i64(
 }
 
 fn quant_axis(node: &onnx_proto::NodeProto, rank: usize) -> Option<usize> {
-    let axis = node
+    let authored = node
         .attribute
         .iter()
         .find(|attr| attr.name == "axis")
-        .map(|attr| attr.i_value())
-        .unwrap_or(1);
+        .map(|attr| attr.i_value());
+    // A RANK-1 (bias) input with the exporter DEFAULT axis (no authored
+    // attribute) has exactly one axis, and the preflight admits that shape
+    // only under the #smart-turn-qdq gate after proving the parameter length
+    // matches; axis 0 is the only consistent reading. An AUTHORED axis is
+    // never remapped.
+    if authored.is_none() && rank == 1 {
+        return Some(0);
+    }
+    let axis = authored.unwrap_or(1);
     let axis = if axis < 0 { axis + rank as i64 } else { axis };
     usize::try_from(axis).ok().filter(|&axis| axis < rank)
 }

@@ -24,7 +24,7 @@ pub struct BenchCase {
     network: Network,
     input: BoundedTensor,
     parameter_count: usize,
-    /// Conservative estimate of CPU CROWN backward peak memory in bytes (#3515).
+    /// Conservative estimate of CPU CROWN backward peak memory in bytes.
     estimated_cpu_peak_bytes: usize,
 }
 
@@ -78,7 +78,7 @@ impl BenchCase {
     }
 
     /// Convert the sequential `Network` to a `GraphNetwork` for graph-path
-    /// benchmarking (#3716). Real VNN-COMP ONNX models load as `GraphNetwork`,
+    /// benchmarking. Real VNN-COMP ONNX models load as `GraphNetwork`,
     /// so this conversion lets us measure the actual code path that competition
     /// workloads exercise.
     pub fn to_graph_network(&self) -> Result<GraphNetwork> {
@@ -96,7 +96,7 @@ impl BenchCase {
     /// This is the critical path for real VNN-COMP models: for each intermediate
     /// node, it runs backward CROWN to the input then intersects with IBP bounds.
     /// The `engine` parameter threads GPU GEMM acceleration through per-node
-    /// backward passes (#3549).
+    /// backward passes.
     pub fn run_graph_crown_ibp_collection(&self, engine: Option<&dyn GemmEngine>) -> Result<()> {
         let graph = self.to_graph_network()?;
         graph

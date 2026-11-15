@@ -4,7 +4,7 @@
 
 //! Profiling benchmark for ny operations
 //!
-//! Run with: cargo build --release -p ny-propagate --example profile && \
+//! Run with: targo --unverified build --release -p ny-propagate --example profile && \
 //!           ./target/release/examples/profile
 
 use ndarray::{Array2, ArrayD, IxDyn};

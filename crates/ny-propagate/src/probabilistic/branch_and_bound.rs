@@ -7,12 +7,10 @@
 //! Splits the input domain into subregions, computes CROWN + distributional
 //! bounds per subregion, and combines them using the law of total variance.
 //! Enhanced with probability weighting, exact conditional moments, and
-//! distributional gradient-guided splitting (#4249).
+//! distributional gradient-guided splitting.
 //!
 //! Reference: Boetius, Leue, Sutter, "Branch-and-Bound for Probabilistic
 //! Verification of Neural Networks", ICML 2025.
-//!
-//! Part of #3921 / #4249.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -84,7 +82,7 @@ struct Region {
 
 impl PartialEq for Region {
     fn eq(&self, other: &Self) -> bool {
-        // Must be consistent with Ord::cmp which uses total_cmp (#4288).
+        // Must be consistent with Ord::cmp which uses total_cmp.
         // f64 == returns false for NaN == NaN, but total_cmp returns Equal.
         self.max_weighted_variance
             .total_cmp(&other.max_weighted_variance)
@@ -101,7 +99,7 @@ impl Ord for Region {
     fn cmp(&self, other: &Self) -> Ordering {
         // Use total_cmp for NaN safety: NaN sorts after all finite values,
         // so NaN-variance regions get highest priority in the max-heap.
-        // This prevents BinaryHeap corruption when upstream moments produce NaN (#4288).
+        // This prevents BinaryHeap corruption when upstream moments produce NaN.
         self.max_weighted_variance
             .total_cmp(&other.max_weighted_variance)
     }
@@ -464,7 +462,7 @@ pub(crate) fn truncated_gaussian_mean(mu: f64, sigma: f64, lower: f64, upper: f6
     mu + sigma * (gaussian_pdf(a) - gaussian_pdf(b)) / cdf_diff
 }
 
-/// Find the maximum element, propagating NaN (unlike `f32::max` which discards NaN). (#4288)
+/// Find the maximum element, propagating NaN (unlike `f32::max` which discards NaN).
 fn max_element(arr: &ArrayD<f32>) -> f32 {
     arr.iter().copied().fold(f32::NEG_INFINITY, |a, x| {
         if a.is_nan() || x.is_nan() {

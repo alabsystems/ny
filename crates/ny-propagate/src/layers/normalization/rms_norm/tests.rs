@@ -341,9 +341,9 @@ fn test_ibp_soundness_random_sampling() {
     }
 }
 
-// ── Forward-mode IBP soundness: Jacobian-based (#3098) ──────────────────────
+// ── Forward-mode IBP soundness: Jacobian-based ──────────────────────
 
-/// Regression test for #3098: forward-mode IBP must contain all concrete
+/// Regression test: forward-mode IBP must contain all concrete
 /// evaluations, not just the center point. The old `max_radius / n` coupling
 /// correction underestimated denominator perturbation.
 ///
@@ -478,4 +478,4 @@ fn test_ibp_forward_mode_soundness_custom_gamma() {
     }
 }
 
-// CROWN tests moved to tests_crown.rs (#3103) to keep file under 500-line limit.
+// CROWN tests moved to tests_crown.rs to keep file under 500-line limit.

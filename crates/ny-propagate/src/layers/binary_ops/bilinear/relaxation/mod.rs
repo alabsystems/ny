@@ -7,7 +7,7 @@ mod build;
 #[cfg(test)]
 mod interval;
 
-/// Element-wise McCormick relaxation with per-batch coefficients (#286 Approach A).
+/// Element-wise McCormick relaxation with per-batch coefficients.
 ///
 /// For z = X @ Y^T (or X @ Y) where X: [batch..., m, k], Y: [batch..., n, k]:
 /// - Each element z[b,i,j] = sum_l x[b,i,l] * y[b,j,l] is relaxed via McCormick
@@ -23,7 +23,6 @@ mod interval;
 /// For batch_size>1, produces tighter bounds than batch-reduced global intervals.
 ///
 /// # Reference
-/// - Design: `designs/2026-03-04-286-attention-bilinear-alternative.md` Approach A
 /// - auto_LiRPA: `operators/bivariate.py` MulHelper.interpolated_relaxation
 /// - McCormick (1976): "Computability of global solutions to factorable nonconvex programs"
 #[derive(Debug, Clone)]
@@ -48,6 +47,6 @@ pub(crate) struct BilinearRelaxation {
     transpose_b: bool,
 }
 
-// CompactMcCormick removed (#286 Phase 5): superseded by BilinearRelaxation with
+// CompactMcCormick removed: superseded by BilinearRelaxation with
 // per-batch coefficients and broadcast sign-split composition. See git history for
 // the original global-interval implementation used as a test baseline.

@@ -14,12 +14,14 @@ use crate::onnx_proto::{self, AttributeProto, GraphProto, NodeProto};
 use ny_core::{NyError, Result};
 use std::collections::{HashMap, HashSet};
 
+use super::expand_identity::ExpandIdentityCones;
 use super::literal_cone::{is_exact_integer_literal_node, LiteralCone, LiteralExemptions};
 use super::quantization_preflight::RawDtypeResolver;
 
 const FLOAT: i32 = 1;
 const INT32: i32 = 6;
 const INT64: i32 = 7;
+const BOOL: i32 = 9;
 
 const AUDITED_OPERATORS: &[&str] = &[
     "Shape",
@@ -36,24 +38,61 @@ const AUDITED_OPERATORS: &[&str] = &[
     "Range",
 ];
 
-/// The set of INT64 values `validate_structural_schemas` PROVED are exact
-/// static shape control.
+/// The INT64 values `validate_structural_schemas` classified, in two disjoint
+/// ledgers.
 ///
 /// This is authentication evidence, not permission. Its only consumer is
 /// `validate_arithmetic_float32_data_path`, which uses it to choose between
-/// refusing a node outright and DEFERRING that refusal to the post-folding
-/// ratchet. A value in here has been shown to have an all-static cone rooted
-/// only in initializers, `Constant` and `Shape`; a runtime-rooted chain never
-/// enters, which is what keeps cctsdb_yolo refused.
+/// refusing a node outright, DEFERRING that refusal to the post-folding
+/// ratchet, or (runtime ledger only) admitting a certified trunc-gated index
+/// computation as a real layer.
+///
+/// * `values`: PROVED exact static shape control — an all-static cone rooted
+///   only in initializers, `Constant` and `Shape`.  A runtime-rooted chain
+///   never enters this set.
+/// * `runtime`: #cctsdb-trunc-gated-index — a runtime-rooted INT64 chain whose
+///   only runtime roots are `Cast(-> INT64)` reads of the verified FLOAT data
+///   path (each of which lowers to a guarded `LayerType::Trunc`), propagated
+///   through the same exact-integer producer list as the static proof.  Values
+///   here are NOT static; they are integer index computations the solver
+///   evaluates at runtime.  Their consumer positions are separately bounded by
+///   `require_control_only_consumers`, which audits EVERY INT64 node output in
+///   the graph, so a chain can only terminate in declared integer-control or
+///   exact layout positions (Slice starts/ends, ScatterND indices, shape
+///   operands, ...) or the load still refuses.  The range obligations the pin
+///   test spec demands (values finite, in destination range, `< 2^24` in the
+///   f32 mirror, Slice bounds in range) are discharged where they always were:
+///   by the guarded Trunc lowering, the bounded-index dynamic ScatterND path,
+///   the taint-gated IBP degrade, and the per-cell enumeration driver, all of
+///   which fail closed to `unknown` rather than concluding unsat on an
+///   unproven cell.
 #[derive(Debug, Default)]
 pub(super) struct StructuralAuthentication {
     values: HashSet<String>,
+    runtime: HashSet<String>,
 }
 
 impl StructuralAuthentication {
     pub(super) fn contains(&self, value: &str) -> bool {
         self.values.contains(value)
     }
+
+    pub(super) fn contains_runtime(&self, value: &str) -> bool {
+        self.runtime.contains(value)
+    }
+}
+
+/// The classification `require_static_source` proves for an INT64 value.
+///
+/// Ordered: `TruncGatedRuntime` dominates, so a chain mixing static and
+/// trunc-gated inputs is classified runtime as a whole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Int64SourceClass {
+    /// Exact static shape control (initializer/`Constant`/`Shape` roots only).
+    Static,
+    /// #cctsdb-trunc-gated-index: additionally rooted in guarded truncations
+    /// of the verified FLOAT data path.
+    TruncGatedRuntime,
 }
 
 pub(super) fn validate_structural_schemas(
@@ -61,6 +100,8 @@ pub(super) fn validate_structural_schemas(
     opset_imports: &HashMap<String, i64>,
     literals: &LiteralCone,
     exemptions: &mut LiteralExemptions,
+    accept_static_int64_cast_to_float: bool,
+    expand_identity: &ExpandIdentityCones,
 ) -> Result<StructuralAuthentication> {
     let standard_opset = opset_imports
         .get("")
@@ -93,11 +134,14 @@ pub(super) fn validate_structural_schemas(
             _ => unreachable!("operator filtered above"),
         }
     }
-    let authenticated =
-        validate_int64_structural_control_paths(graph, &mut dtypes, literals, exemptions)?;
-    Ok(StructuralAuthentication {
-        values: authenticated,
-    })
+    validate_int64_structural_control_paths(
+        graph,
+        &mut dtypes,
+        literals,
+        exemptions,
+        accept_static_int64_cast_to_float,
+        expand_identity,
+    )
 }
 
 /// Test-only: validate and immediately discharge any literal-cone deferral.
@@ -111,9 +155,16 @@ pub(super) fn validate_structural_schemas_unfolded(
 ) -> Result<()> {
     let literals = LiteralCone::new(graph);
     let mut exemptions = LiteralExemptions::default();
-    let _authenticated =
-        validate_structural_schemas(graph, opset_imports, &literals, &mut exemptions)?;
-    exemptions.require_all_folded(&crate::WeightStore::new())
+    let expand_identity = ExpandIdentityCones::certify(graph);
+    let _authenticated = validate_structural_schemas(
+        graph,
+        opset_imports,
+        &literals,
+        &mut exemptions,
+        false,
+        &expand_identity,
+    )?;
+    exemptions.require_all_folded(&crate::WeightStore::new(), graph)
 }
 
 fn validate_shape(node: &NodeProto, opset: i64, dtypes: &mut RawDtypeResolver<'_>) -> Result<()> {
@@ -1374,8 +1425,17 @@ fn validate_int64_structural_control_paths<'graph>(
     dtypes: &mut RawDtypeResolver<'graph>,
     literals: &LiteralCone,
     exemptions: &mut LiteralExemptions,
-) -> Result<HashSet<String>> {
-    let mut audit = Int64ControlPathAudit::new(graph, dtypes, literals, exemptions);
+    accept_static_int64_cast_to_float: bool,
+    expand_identity: &ExpandIdentityCones,
+) -> Result<StructuralAuthentication> {
+    let mut audit = Int64ControlPathAudit::new(
+        graph,
+        dtypes,
+        literals,
+        exemptions,
+        accept_static_int64_cast_to_float,
+        expand_identity,
+    );
 
     // Seed every authored INT64 constant, not just the outputs of the
     // structural operators above.  An initializer can otherwise enter an
@@ -1407,6 +1467,35 @@ fn validate_int64_structural_control_paths<'graph>(
         }
     }
 
+    // #cctsdb-trunc-gated-index: classify runtime-rooted INT64 index
+    // arithmetic.  The data-input loop above only reaches values consumed by
+    // audited STRUCTURAL operators; an integer Add/Sub/Mul/Div chain (for
+    // example cctsdb's occlusion-patch index grid, `Add_84..Add_86`) is
+    // consumed by other arithmetic and by `Shape`, so its values were never
+    // classified and `validate_arithmetic_float32_data_path` could not tell it
+    // from an unproven integer activation.  Run the same source proof over
+    // each such output and RECORD the classification; a proof failure here is
+    // deliberately not a refusal — the arithmetic gate keeps its own verbatim
+    // refusal for chains that do not certify.  The pass is scoped to graphs
+    // that actually contain a trunc-gated runtime root, so models without the
+    // idiom are classified (and refused) exactly as before.
+    for node in &graph.node {
+        if !is_standard_onnx_domain(&node.domain)
+            || !matches!(node.op_type.as_str(), "Add" | "Sub" | "Mul" | "Div")
+            || node.output.len() != 1
+            || node.output[0].is_empty()
+        {
+            continue;
+        }
+        let output = &node.output[0];
+        if audit.dtypes.resolve(output)? != Some(INT64)
+            || !audit.node_cone_reaches_trunc_gated_root(node)
+        {
+            continue;
+        }
+        let _ = audit.require_static_source(output, &mut HashSet::new());
+    }
+
     // Likewise seed every standard-node INT64 result.  This covers integer
     // layout/control chains whose producer (for example Gather) is validated
     // by another schema module while preserving Shape -> Gather -> control:
@@ -1422,7 +1511,10 @@ fn validate_int64_structural_control_paths<'graph>(
             }
         }
     }
-    Ok(audit.authenticated)
+    Ok(StructuralAuthentication {
+        values: audit.authenticated,
+        runtime: audit.runtime,
+    })
 }
 
 fn structural_data_input_indices(node: &NodeProto) -> Vec<usize> {
@@ -1440,11 +1532,19 @@ struct Int64ControlPathAudit<'graph, 'dtype, 'cone> {
     dtypes: &'dtype mut RawDtypeResolver<'graph>,
     literals: &'cone LiteralCone,
     exemptions: &'cone mut LiteralExemptions,
+    /// Dark QDQ lane (see `OnnxLoadConfig::with_qdq_activation_relaxation`):
+    /// admit `Cast(to=FLOAT)` on a PROVEN-STATIC INT64 structural value as a
+    /// deferred-fold obligation instead of refusing outright.
+    accept_static_int64_cast_to_float: bool,
+    expand_identity: &'cone ExpandIdentityCones,
     initializers: HashSet<&'graph str>,
     producers: HashMap<&'graph str, Vec<usize>>,
     graph_outputs: HashSet<&'graph str>,
     /// Values this pass PROVED are exact static shape control.
     authenticated: HashSet<String>,
+    /// Values this pass certified as trunc-gated runtime index chains
+    /// (#cctsdb-trunc-gated-index); disjoint from `authenticated`.
+    runtime: HashSet<String>,
 }
 
 impl<'graph, 'dtype, 'cone> Int64ControlPathAudit<'graph, 'dtype, 'cone> {
@@ -1453,6 +1553,8 @@ impl<'graph, 'dtype, 'cone> Int64ControlPathAudit<'graph, 'dtype, 'cone> {
         dtypes: &'dtype mut RawDtypeResolver<'graph>,
         literals: &'cone LiteralCone,
         exemptions: &'cone mut LiteralExemptions,
+        accept_static_int64_cast_to_float: bool,
+        expand_identity: &'cone ExpandIdentityCones,
     ) -> Self {
         let initializers = graph
             .initializer
@@ -1477,17 +1579,24 @@ impl<'graph, 'dtype, 'cone> Int64ControlPathAudit<'graph, 'dtype, 'cone> {
             dtypes,
             literals,
             exemptions,
+            accept_static_int64_cast_to_float,
+            expand_identity,
             initializers,
             producers,
             graph_outputs,
             authenticated: HashSet::new(),
+            runtime: HashSet::new(),
         }
     }
 
-    fn require_static_source(&mut self, value: &str, active: &mut HashSet<String>) -> Result<()> {
+    fn require_static_source(
+        &mut self,
+        value: &str,
+        active: &mut HashSet<String>,
+    ) -> Result<Int64SourceClass> {
         if self.initializers.contains(value) {
             self.authenticated.insert(value.to_string());
-            return Ok(());
+            return Ok(Int64SourceClass::Static);
         }
         if !active.insert(value.to_string()) {
             return Err(NyError::ModelLoad(format!(
@@ -1509,9 +1618,39 @@ impl<'graph, 'dtype, 'cone> Int64ControlPathAudit<'graph, 'dtype, 'cone> {
                 )));
             }
             match producer.op_type.as_str() {
-                "Constant" | "Shape" => Ok(()),
+                "Constant" | "Shape" => Ok(Int64SourceClass::Static),
                 "Cast" if cast_target_dtype(&producer) == Some(INT64) => {
-                    self.require_all_inputs_static(&producer, active)
+                    match self.require_all_inputs_static(&producer, active) {
+                        Ok(class) => Ok(class),
+                        // #cctsdb-trunc-gated-index: an INT64 Cast whose source
+                        // is the runtime FLOAT data path cannot be static — but
+                        // it is the one runtime root this audit certifies.  The
+                        // Cast lowers to a guarded `LayerType::Trunc` (the
+                        // fail-closed f32->f32 reading of round-toward-zero
+                        // that `validate_skipped_nodes_are_semantic_identities`
+                        // pins), so every value it emits is an integer the
+                        // solver actually models; where those integers may GO
+                        // is still bounded by `require_control_only_consumers`
+                        // over every INT64 output in the graph.  A FLOAT
+                        // initializer or `Constant` source authenticates as
+                        // Static above and never reaches this arm; any other
+                        // failed non-FLOAT source keeps its refusal verbatim.
+                        Err(static_refusal) => {
+                            if self.cast_reads_runtime_float(&producer)? {
+                                Ok(Int64SourceClass::TruncGatedRuntime)
+                            } else {
+                                Err(static_refusal)
+                            }
+                        }
+                    }
+                }
+                // #cctsdb-expand-identity: a certified pass-through `Where` is
+                // a value-identity of its `Y` input (the canonicalization
+                // rewrites it to exactly `Identity(Y)` or the load refuses),
+                // so its source class is `Y`'s.  An uncertified `Where` falls
+                // through to the refusal below, unchanged.
+                "Where" if self.expand_identity.is_certified_where(&producer) => {
+                    self.require_static_source(&producer.input[2], active)
                 }
                 "Identity"
                 | "Gather"
@@ -1529,10 +1668,11 @@ impl<'graph, 'dtype, 'cone> Int64ControlPathAudit<'graph, 'dtype, 'cone> {
                 // `Div_59 = Gather(Shape(input.47), Const) / Const`. Safety is
                 // carried by the RECURSION, not by this operator list: every
                 // input must itself authenticate, and the recursion bottoms out
-                // only at an initializer, `Constant` or `Shape`. A chain rooted
-                // in a runtime value therefore still meets an unlisted producer
-                // and is refused exactly as before — cctsdb_yolo's comparison
-                // cone continues to fail, which its own waiver asserts.
+                // only at an initializer, `Constant`, `Shape`, or the certified
+                // trunc-gated FLOAT Cast above (which taints the whole chain's
+                // class to TruncGatedRuntime rather than admitting it as
+                // static). A chain rooted in any other runtime value still
+                // meets an unlisted producer and is refused exactly as before.
                 "Add" | "Sub" | "Mul" | "Div" => {
                     self.require_all_inputs_static(&producer, active)
                 }
@@ -1543,26 +1683,156 @@ impl<'graph, 'dtype, 'cone> Int64ControlPathAudit<'graph, 'dtype, 'cone> {
             }
         })();
         active.remove(value);
-        if result.is_ok() {
-            // Record what this pass PROVED static. `validate_arithmetic_float32
-            // _data_path` consults it so a node carrying such a value defers
-            // its FLOAT32 refusal to the post-folding ratchet instead of
-            // refusing outright; `literal_cone` cannot answer for these because
-            // it deliberately excludes `Shape`.
-            self.authenticated.insert(value.to_string());
+        if let Ok(class) = result {
+            // Record what this pass PROVED. `validate_arithmetic_float32
+            // _data_path` consults both ledgers so a node carrying such values
+            // defers (Static: to the post-folding ratchet) or is admitted as a
+            // certified runtime index computation (TruncGatedRuntime);
+            // `literal_cone` cannot answer for these because it deliberately
+            // excludes `Shape`.
+            match class {
+                Int64SourceClass::Static => {
+                    self.authenticated.insert(value.to_string());
+                }
+                Int64SourceClass::TruncGatedRuntime => {
+                    self.runtime.insert(value.to_string());
+                }
+            }
         }
         result
+    }
+
+    /// Whether this `Cast(-> INT64)` reads the runtime FLOAT data path.
+    fn cast_reads_runtime_float(&mut self, node: &NodeProto) -> Result<bool> {
+        let [input] = node.input.as_slice() else {
+            return Ok(false);
+        };
+        if input.is_empty() {
+            return Ok(false);
+        }
+        Ok(self.dtypes.resolve(input)? == Some(FLOAT))
+    }
+
+    /// Cheap scope guard for the classification seeding pass: does this node's
+    /// transitive producer cone contain a `Cast(-> INT64)` of a runtime FLOAT
+    /// value?  Initializer- and `Constant`-sourced FLOAT casts are excluded so
+    /// graphs without the trunc-gated idiom are never newly classified.
+    /// Unresolvable dtypes are treated as "no" — this guard can only SKIP the
+    /// seeding, never refuse a load.
+    fn node_cone_reaches_trunc_gated_root(&mut self, node: &NodeProto) -> bool {
+        let mut stack: Vec<String> = node
+            .input
+            .iter()
+            .filter(|input| !input.is_empty())
+            .cloned()
+            .collect();
+        let mut visited: HashSet<String> = HashSet::new();
+        while let Some(value) = stack.pop() {
+            if !visited.insert(value.clone()) || self.initializers.contains(value.as_str()) {
+                continue;
+            }
+            let Some(producers) = self.producers.get(value.as_str()) else {
+                continue;
+            };
+            let [producer_index] = producers.as_slice() else {
+                continue;
+            };
+            let producer = self.graph.node[*producer_index].clone();
+            if !is_standard_onnx_domain(&producer.domain) {
+                continue;
+            }
+            if producer.op_type == "Cast" && cast_target_dtype(&producer) == Some(INT64) {
+                if let [input] = producer.input.as_slice() {
+                    let source_is_authored_constant = self.initializers.contains(input.as_str())
+                        || self.producers.get(input.as_str()).is_some_and(|indices| {
+                            matches!(indices.as_slice(),
+                                [index] if self.graph.node[*index].op_type == "Constant")
+                        });
+                    if !input.is_empty()
+                        && !source_is_authored_constant
+                        && matches!(self.dtypes.resolve(input), Ok(Some(FLOAT)))
+                    {
+                        return true;
+                    }
+                }
+            }
+            stack.extend(
+                producer
+                    .input
+                    .iter()
+                    .filter(|input| !input.is_empty())
+                    .cloned(),
+            );
+        }
+        false
+    }
+
+    /// Is `consumer` a `Cast(-> FLOAT)` reading `value`, where `value` traces
+    /// back — through single-producer, value-preserving integer `Cast`s and
+    /// `Identity` — to an `ArgMax`/`ArgMin` output or to a `Cast` of a BOOL
+    /// (`{0,1}`) result?  See the call site: those roots are f32-native
+    /// certified layer outputs, so the crossing reinterprets nothing.
+    fn is_exact_f32_readout_cast(&mut self, consumer: &NodeProto, value: &str) -> Result<bool> {
+        if consumer.op_type != "Cast" || cast_target_dtype(consumer) != Some(FLOAT) {
+            return Ok(false);
+        }
+        let mut current = value.to_string();
+        let mut visited: HashSet<String> = HashSet::new();
+        loop {
+            if !visited.insert(current.clone()) {
+                return Ok(false);
+            }
+            let Some(indices) = self.producers.get(current.as_str()) else {
+                return Ok(false);
+            };
+            let [producer_index] = indices.as_slice() else {
+                return Ok(false);
+            };
+            let producer = self.graph.node[*producer_index].clone();
+            if !is_standard_onnx_domain(&producer.domain) {
+                return Ok(false);
+            }
+            match producer.op_type.as_str() {
+                "ArgMax" | "ArgMin" => {
+                    return Ok(producer.input.len() == 1 && !producer.input[0].is_empty());
+                }
+                "Cast" if matches!(cast_target_dtype(&producer), Some(INT32) | Some(INT64)) => {
+                    let [input] = producer.input.as_slice() else {
+                        return Ok(false);
+                    };
+                    if input.is_empty() {
+                        return Ok(false);
+                    }
+                    // A BOOL source is a `{0,1}` f32 lane already: root found.
+                    if self.dtypes.resolve(input)? == Some(BOOL) {
+                        return Ok(true);
+                    }
+                    current = input.clone();
+                }
+                "Identity" => {
+                    let [input] = producer.input.as_slice() else {
+                        return Ok(false);
+                    };
+                    if input.is_empty() {
+                        return Ok(false);
+                    }
+                    current = input.clone();
+                }
+                _ => return Ok(false),
+            }
+        }
     }
 
     fn require_all_inputs_static(
         &mut self,
         node: &NodeProto,
         active: &mut HashSet<String>,
-    ) -> Result<()> {
+    ) -> Result<Int64SourceClass> {
+        let mut class = Int64SourceClass::Static;
         for input in node.input.iter().filter(|input| !input.is_empty()) {
-            self.require_static_source(input, active)?;
+            class = class.max(self.require_static_source(input, active)?);
         }
-        Ok(())
+        Ok(class)
     }
 
     fn require_control_only_consumers(
@@ -1605,6 +1875,25 @@ impl<'graph, 'dtype, 'cone> Int64ControlPathAudit<'graph, 'dtype, 'cone> {
                 if is_int64_control_input(&consumer.op_type, input_index) {
                     continue;
                 }
+                // #cctsdb-trunc-gated-index (readout side): `Cast(-> FLOAT)`
+                // of an INT64 lane that is itself the f32-native result of a
+                // modeled operator — an ArgMax/ArgMin index (cctsdb's
+                // `ArgMax_198 -> Cast_199`) or a `{0,1}` BOOL mask routed
+                // through integer casts (`Equal_200 -> Cast_201 -> Cast_247 ->
+                // Cast_248`, the class mask).  No authored i64 payload exists
+                // on these edges at runtime: ny models ArgMax/ArgMin natively
+                // (`LayerType::Argmax`, sound integer-index intervals in f32
+                // under the layer's own contract — op_map names cctsdb_yolo's
+                // detection heads as the motivating case), BOOL results are
+                // `{0,1}` f32 lanes, integer-target Casts on them lower to the
+                // guarded `Trunc`, and `op_map` drops a FLOAT32 Cast only as
+                // an exact identity.  So the value crossing into the float
+                // data path IS a certified layer output, not a reinterpreted
+                // integer.  Any other INT64 producer feeding a FLOAT Cast
+                // falls through to the historical leak refusal below.
+                if input_index == 0 && self.is_exact_f32_readout_cast(&consumer, value)? {
+                    continue;
+                }
                 if !is_int64_layout_chain_input(&consumer, input_index) {
                     let refusal = NyError::UnsupportedOp(format!(
                         "raw ONNX INT64 structural value '{value}' reaches data input {input_index} of '{}' ({}); this would leak integer values into ny's f32 runtime graph",
@@ -1616,11 +1905,46 @@ impl<'graph, 'dtype, 'cone> Int64ControlPathAudit<'graph, 'dtype, 'cone> {
                     // obligation requires the loader to erase it into a literal
                     // before propagation. If folding does not erase it, the
                     // refusal above is re-raised (see `literal_cone`).
-                    if !is_exact_integer_literal_node(&consumer, self.literals, self.dtypes)? {
-                        return Err(refusal);
+                    if is_exact_integer_literal_node(&consumer, self.literals, self.dtypes)? {
+                        self.exemptions.record(&consumer, &refusal);
+                        continue;
                     }
-                    self.exemptions.record(&consumer, &refusal);
-                    continue;
+                    // Dark QDQ lane only: a `Cast(to=FLOAT)` whose data input
+                    // is a PROVEN-STATIC INT64 structural value (transformer
+                    // attention's `Shape -> Slice -> Cast -> Sqrt` head-dim
+                    // scaling) computes a value decided by the model bytes and
+                    // static shape metadata alone — shape plumbing, not a
+                    // bound-path activation. `require_static_source` is the
+                    // proof: it bottoms out only at initializers, `Constant`,
+                    // or `Shape`, so a chain rooted in a runtime VALUE still
+                    // refuses exactly as before. The acceptance is a DEFERRAL,
+                    // not a pass: `require_all_folded` re-raises this refusal
+                    // after constant folding unless the Cast was erased into a
+                    // WeightStore literal, so a Cast that would reach the f32
+                    // runtime graph still fails closed with today's message.
+                    if self.accept_static_int64_cast_to_float
+                        && consumer.op_type == "Cast"
+                        && input_index == 0
+                        && cast_target_dtype(&consumer) == Some(FLOAT)
+                        && self
+                            .require_static_source(value, &mut HashSet::new())
+                            .is_ok()
+                    {
+                        self.exemptions.record(&consumer, &refusal);
+                        continue;
+                    }
+                    // #cctsdb-expand-identity: likewise no leak when the
+                    // consumer is a certified all-false `Equal(Shape, <neg>)`
+                    // or its paired pass-through `Where` — those nodes are
+                    // erased by the prepare-time canonicalization, and the
+                    // refusal re-raises verbatim if they survive it.
+                    if self.expand_identity.is_certified_equal(&consumer)
+                        || self.expand_identity.is_certified_where(&consumer)
+                    {
+                        self.exemptions.record_canonicalizable(&consumer, &refusal);
+                        continue;
+                    }
+                    return Err(refusal);
                 }
                 for output in consumer.output.iter().filter(|output| !output.is_empty()) {
                     let dtype = self.dtypes.resolve(output)?.ok_or_else(|| {

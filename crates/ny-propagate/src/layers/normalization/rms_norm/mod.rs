@@ -30,6 +30,8 @@ mod tests_crown;
 mod tests_ibpvalidated;
 #[cfg(test)]
 mod tests_multi_dim;
+#[cfg(test)]
+mod tests_radial;
 pub mod types;
 
 pub use types::RmsNormLayer;

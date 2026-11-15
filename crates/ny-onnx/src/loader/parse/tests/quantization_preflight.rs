@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::super::parse_onnx_bytes;
-use super::super::quantization_preflight::validate_quantization_schemas;
+use super::super::quantization_preflight::{
+    validate_quantization_schemas, validate_quantization_schemas_with_external,
+};
 use crate::loader::{
     BatchNormFoldingPolicy, CustomOpRegistry, ShapeInferBackend, ShapeInferencePolicy,
 };
@@ -177,6 +179,92 @@ fn accepts_canonical_float32_qdq_and_infers_quantize_output_dtype() {
     };
 
     validate_quantization_schemas(&graph, &opsets(23)).expect("canonical Q/DQ should validate");
+}
+
+#[test]
+fn rank1_bias_default_axis_and_scalar_zp_pair_are_gated() {
+    // #smart-turn-qdq: a rank-1 (bias) DequantizeLinear whose per-axis scale
+    // keeps the exporter DEFAULT axis 1 refuses today; under the gate, axis 0
+    // is the only consistent reading and the node is admitted. Length
+    // mismatches keep refusing in both states.
+    let mut graph = q_graph("DequantizeLinear", INT8, vec![]);
+    // Make the scale rank-1 (per-axis) of length 1 == input length.
+    for tensor in &mut graph.initializer {
+        if tensor.name == "scale" {
+            tensor.dims = vec![1];
+        }
+        if tensor.name == "zp" {
+            tensor.dims = vec![1];
+        }
+    }
+    let error = validate_quantization_schemas(&graph, &opsets(23))
+        .expect_err("default path must refuse the rank-1 default-axis per-axis parameter");
+    assert!(error.to_string().contains("outside input"), "{error}");
+    validate_quantization_schemas_with_external(&graph, &opsets(23), None, true)
+        .expect("gate must admit the rank-1 bias default-axis reading");
+
+    // Scalar zero point against a one-element rank-1 scale: gated admission.
+    // Use an AUTHORED axis 0 so the default path reaches the zero-point shape
+    // check (with the default axis it refuses one check earlier, on the axis).
+    for tensor in &mut graph.initializer {
+        if tensor.name == "zp" {
+            tensor.dims.clear();
+        }
+    }
+    graph.node[0].attribute.push(AttributeProto {
+        name: "axis".to_string(),
+        r#type: attribute_type::INT,
+        i: Some(0),
+        ..Default::default()
+    });
+    let error = validate_quantization_schemas(&graph, &opsets(23))
+        .expect_err("default path must refuse the scalar-vs-[1] zero point pair");
+    assert!(error.to_string().contains("must exactly match"), "{error}");
+    validate_quantization_schemas_with_external(&graph, &opsets(23), None, true)
+        .expect("gate must admit the semantically-identical scalar pair");
+}
+
+#[test]
+fn int32_dq_explicit_zero_point_is_gated_and_proof_scoped() {
+    // #smart-turn-qdq: an EXPLICIT all-zero INT32 zero point (the exporter
+    // spelling of the required omitted-zero semantics) refuses on the default
+    // path exactly as today, is admitted only under the dark gate, and a
+    // NONZERO INT32 zero point refuses in BOTH gate states.
+    let mut graph = q_graph("DequantizeLinear", INT32, vec![]);
+    graph.initializer.push({
+        let mut zp = initializer("zp", INT32);
+        zp.dims.clear();
+        zp
+    });
+    graph.node[0].input = vec!["x".to_string(), "scale".to_string(), "zp".to_string()];
+
+    let error = validate_quantization_schemas(&graph, &opsets(23))
+        .expect_err("default path must refuse the explicit INT32 zero point");
+    assert!(
+        error
+            .to_string()
+            .contains("INT32 DequantizeLinear input must not specify a zero point"),
+        "{error}"
+    );
+    validate_quantization_schemas_with_external(&graph, &opsets(23), None, true)
+        .expect("gate must admit the authored all-zero INT32 zero point");
+
+    // Nonzero value: refused in both states.
+    for tensor in &mut graph.initializer {
+        if tensor.name == "zp" {
+            tensor.int32_data[0] = 1;
+        }
+    }
+    for gate in [false, true] {
+        let error = validate_quantization_schemas_with_external(&graph, &opsets(23), None, gate)
+            .expect_err("a nonzero INT32 zero point must refuse in both gate states");
+        assert!(
+            error
+                .to_string()
+                .contains("INT32 DequantizeLinear input must not specify a zero point"),
+            "{error}"
+        );
+    }
 }
 
 #[test]
@@ -868,6 +956,7 @@ fn parse_rejects_invalid_constant_only_quantization_before_it_can_fold_away() {
         false,
         BatchNormFoldingPolicy::LegacyEnvironment,
         false,
+        false,
     )
     .expect_err("raw opset-invalid Q must fail before constant folding");
     assert!(
@@ -911,6 +1000,7 @@ fn parse_rejects_opset10_vector_scale_before_constant_quantization_can_fold() {
         &ShapeInferBackend::InProcess,
         false,
         BatchNormFoldingPolicy::LegacyEnvironment,
+        false,
         false,
     )
     .expect_err("opset-10 vector scale must fail before constant folding");

@@ -16,8 +16,6 @@
 //! These are smoke tests: they verify model loading, preset application, and
 //! JSON output validity. They do NOT assert that instances are solved — that
 //! requires feature-specific builds (MIP) and longer timeouts.
-//!
-//! Part of #3218.
 
 #[path = "common/vnncomp.rs"]
 mod vnncomp_support;

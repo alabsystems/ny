@@ -228,7 +228,7 @@ pub(super) struct CrownConcretizeParams {
     pub(super) _padding: [u32; 2],
 }
 
-/// Parameters for the Add IBP shader (#4319).
+/// Parameters for the Add IBP shader.
 /// Element-wise addition of two interval bound pairs (residual connections).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -237,7 +237,7 @@ pub(super) struct AddIbpParams {
     pub(super) _padding: [u32; 3],
 }
 
-/// Parameters for the ReLU IBP in-place shader (#4081).
+/// Parameters for the ReLU IBP in-place shader.
 /// Elementwise max(x, 0) on lower and upper bound buffers.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -246,7 +246,7 @@ pub(super) struct ReluIbpParams {
     pub(super) _padding: [u32; 3],
 }
 
-/// Parameters for the resident Conv2d IBP shader (#4275).
+/// Parameters for the resident Conv2d IBP shader.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub(super) struct Conv2dIbpParams {
@@ -267,7 +267,7 @@ pub(super) struct Conv2dIbpParams {
     pub(super) _padding: [u32; 2],
 }
 
-/// Parameters for the AveragePool IBP shader (#4320).
+/// Parameters for the AveragePool IBP shader.
 /// Windowed or global average pooling on interval bound pairs.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -288,7 +288,7 @@ pub(super) struct AvgPoolIbpParams {
     pub(super) _padding: [u32; 3],
 }
 
-/// Parameters for the Conv2d A-matrix reshape shader (#3397).
+/// Parameters for the Conv2d A-matrix reshape shader.
 /// Transforms A from (S, OC*OH*OW) to (S*OH*OW, OC).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -299,7 +299,7 @@ pub(super) struct ConvReshapeParams {
     pub(super) _padding: u32,
 }
 
-/// Parameters for the Conv2d col2im gather shader (#3397).
+/// Parameters for the Conv2d col2im gather shader.
 /// Gathers GEMM output into scattered input-space A-matrix.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]

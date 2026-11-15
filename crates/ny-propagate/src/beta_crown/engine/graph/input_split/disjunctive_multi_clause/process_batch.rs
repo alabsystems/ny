@@ -46,8 +46,41 @@ pub(super) fn graph_ibp_prescreen_error_should_skip(err: &NyError) -> bool {
     }
 }
 
+/// #sb-plane: decide what happens to a popped domain's rebound plane on the
+/// fresh-clip route.
+///
+/// Returns the plane the SB split-dimension scorer may use, and leaves the
+/// carrier itself in the state the fresh clip requires. Three cases:
+///
+/// * fresh clip OFF — the carrier is untouched and `None` is returned: the
+///   caller keeps passing `domain.linear_bounds` exactly as today.
+/// * fresh clip ON, key OFF — the carrier is cleared and `None` is returned:
+///   the historical drop, SB takes its documented width-only fallback.
+/// * fresh clip ON, key ON — the plane is MOVED out of the carrier (which is
+///   left `None`, so no edge helper, clip, or verified check downstream can
+///   reach it through the domain) and returned for the split decision only.
+///
+/// Generic over the plane type so the seam is unit-testable without a
+/// `LinearBounds` fixture; the caller instantiates it at `LinearBounds`.
+#[inline]
+pub(super) fn take_sb_plane_under_fresh_clip<T>(
+    fresh_clip_enabled: bool,
+    keep_for_sb: bool,
+    carrier: &mut Option<T>,
+) -> Option<T> {
+    if !fresh_clip_enabled {
+        return None;
+    }
+    if keep_for_sb {
+        carrier.take()
+    } else {
+        *carrier = None;
+        None
+    }
+}
+
 /// Pending child with flat 1D lower/upper arrays. BoundedTensor construction
-/// is deferred until after IBP prescreen filtering. Part of #4366 Packet A.
+/// is deferred until after IBP prescreen filtering.
 pub(super) struct FlatPendingChild {
     pub(super) flat_lower: ArrayD<f32>,
     pub(super) flat_upper: ArrayD<f32>,
@@ -78,6 +111,27 @@ fn decline_fresh_clip_after_deadline(
         }
     } else {
         outcome
+    }
+}
+
+/// `#cgan-child-seed` (`cgan_child_interm_refine_fresh_clip_map`): move the
+/// popped domain's retained child-local intermediate map out of its carrier
+/// for the fresh clip.
+///
+/// * key OFF — the carrier is untouched and `None` is returned: the clip
+///   bounds against the root map alone, byte-identically to before (and the
+///   deferred rebound has already cleared the carrier on this path).
+/// * key ON — the map is MOVED out (the carrier is left `None`, exactly as the
+///   historical rebound left it) and handed to the clip's bounder, which
+///   intersects it with the root map and fresh IBP as the rebound did.
+///
+/// Generic over the payload so the seam is unit-testable without a map.
+#[inline]
+pub(super) fn take_fresh_clip_domain_map<T>(enabled: bool, carrier: &mut Option<T>) -> Option<T> {
+    if enabled {
+        carrier.take()
+    } else {
+        None
     }
 }
 
@@ -113,6 +167,20 @@ where
     );
 
     let source = Arc::clone(&domain.input_bounds);
+    // #cgan-child-seed: the domain's own refined map, valid on `source` (the
+    // rebound computed and consumed it for exactly this box). `None` unless
+    // the typed key is set, which keeps the dark path byte-identical.
+    // #cgan-child-zono: the per-child certified zonotope entries ride the same
+    // carrier (the deferred rebound retained them for this clip) and are taken
+    // under their own typed key. Both dark: nothing is taken, as before.
+    let child_seed_map_enabled = verifier
+        .config
+        .alpha_config
+        .cgan_child_interm_refine_fresh_clip_map;
+    let child_zono_map_enabled = verifier.config.alpha_config.cgan_child_zono_refresh.enabled;
+    let fresh_clip_map_enabled = child_seed_map_enabled || child_zono_map_enabled;
+    let domain_map =
+        take_fresh_clip_domain_map(fresh_clip_map_enabled, &mut domain.node_bounds_override);
     let outcome = clip_with_fresh_exact_domain_planes(
         source.as_ref(),
         thresholds,
@@ -125,7 +193,7 @@ where
                     "fresh exact-domain full-spec CROWN deadline expired before bounding".into(),
                 ));
             }
-            let (_objective_bounds, linear) = compute_bounds(exact_domain, None)?;
+            let (_objective_bounds, linear) = compute_bounds(exact_domain, domain_map.as_deref())?;
             if FreshClipInstant::now() >= deadline {
                 return Err(NyError::DeadlineExceeded(
                     "fresh exact-domain full-spec CROWN deadline expired after bounding".into(),
@@ -145,6 +213,20 @@ where
         FreshClipInstant::now(),
     );
     telemetry.record(source.as_ref(), &outcome);
+    if child_seed_map_enabled {
+        super::super::child_seed::observe_fresh_clip_map(
+            domain_map.is_some(),
+            matches!(outcome.status, FreshDomainClipStatus::AllClausesRefuted),
+            matches!(outcome.status, FreshDomainClipStatus::Applied),
+        );
+    }
+    if child_zono_map_enabled {
+        super::super::child_zono::observe_fresh_clip(
+            domain_map.is_some(),
+            matches!(outcome.status, FreshDomainClipStatus::AllClausesRefuted),
+            matches!(outcome.status, FreshDomainClipStatus::Applied),
+        );
+    }
     match outcome.status {
         FreshDomainClipStatus::Applied => {
             domain.input_bounds = Arc::new(outcome.bounds);
@@ -282,19 +364,28 @@ where
     let mut child_shape: Option<Vec<usize>> = None;
     // #relational-bab option B: per-wave α edge-pass budget.
     let mut edge_alpha_budget = verifier.config.input_split_edge_alpha_top;
+    // #iso-edge-cap: this wave's edge governor (unarmed = the historical path).
+    let mut edge_governor =
+        super::edge_cap::EdgeWaveGovernor::for_wave(bab_wall, lifecycle.start_time);
 
     for mut domain in domains {
         if bab_wall.expired(lifecycle.start_time) {
             return Ok(Some(lifecycle.timeout_result()));
         }
-        if lifecycle.domains_explored >= verifier.config.max_domains {
+        // #cap-extend: with `batch_size > 1` the cap trip happens HERE far more
+        // often than at the loop head, so this site both consults the extended
+        // cap and is allowed to GRANT it. Reading `config.max_domains` and
+        // stopping unconditionally is what made the armed canary produce no
+        // marker at all on cgan2026 row 7.
+        if lifecycle.domains_explored >= lifecycle.domain_cap(verifier.config.max_domains)
+            && !super::try_grant_cap_extend(lifecycle, &verifier.config, queue.len())
+        {
+            let domain_cap = lifecycle.domain_cap(verifier.config.max_domains);
             return Ok(Some(lifecycle.build_result(
                 BabVerificationStatus::Unknown {
                     reason: format!(
                         "Domain limit {}: {}/{} verified",
-                        verifier.config.max_domains,
-                        lifecycle.domains_verified,
-                        lifecycle.domains_explored
+                        domain_cap, lifecycle.domains_verified, lifecycle.domains_explored
                     ),
                 },
             )));
@@ -303,15 +394,24 @@ where
         lifecycle.domains_explored += 1;
         lifecycle.max_depth_reached = lifecycle.max_depth_reached.max(domain.depth);
 
-        if fresh_domain_clip_telemetry.enabled() {
-            // This route exists precisely because the graph's domain-stacked
-            // rebound planes are not trusted. Drop the old carrier before any
-            // edge helper or branch heuristic can consume it. The fresh
-            // non-domain-stacked full-spec planes remain private to the clip
-            // primitive and are dropped there as well, so SB intentionally
-            // takes its documented width-only fallback below.
-            domain.linear_bounds = None;
-        }
+        // This route exists precisely because the graph's domain-stacked
+        // rebound planes are not trusted as clip/verdict AUTHORITY. Drop the
+        // old carrier before any edge helper or clip can consume it. The fresh
+        // non-domain-stacked full-spec planes remain private to the clip
+        // primitive and are dropped there as well.
+        //
+        // #sb-plane: the SB split-dimension scorer is a HEURISTIC — it chooses
+        // WHERE to split, never whether a domain is verified — so the plane
+        // may still inform it. With `input_split_sb_keep_plane_under_fresh_clip`
+        // the plane is moved out of the domain into this local (the domain is
+        // left `None`, exactly as the drop leaves it) and fed ONLY to the SB
+        // call below. Without the key, SB takes its documented width-only
+        // fallback, byte-identically to before.
+        let sb_plane_under_fresh_clip = take_sb_plane_under_fresh_clip(
+            fresh_domain_clip_telemetry.enabled(),
+            verifier.config.input_split_sb_keep_plane_under_fresh_clip,
+            &mut domain.linear_bounds,
+        );
 
         if lifecycle.domains_explored.is_multiple_of(1000) || lifecycle.domains_explored <= 5 {
             trace!(
@@ -335,49 +435,28 @@ where
         // most negative gaps). Verified ⇒ done; still-short ⇒ the domain
         // continues with the α-improved, monotonicity-guarded bounds into
         // the MILP finisher / split path below.
-        if verifier.config.input_split_edge_alpha && edge_alpha_budget > 0 {
-            if let Some(row_indices) = edge_domain_rows(
-                &domain,
-                thresholds,
-                clause_sizes,
-                verifier.config.input_split_edge_milp_gap,
-                verifier.config.input_split_edge_milp_depth,
-                spec_matrix.nrows(),
-            ) {
-                edge_alpha_budget -= 1;
-                if let Some(fresh) = try_edge_alpha_pass(
-                    verifier,
-                    graph,
-                    &domain,
-                    spec_matrix,
-                    &row_indices,
-                    engine,
-                    lifecycle.deadline(bab_wall.horizon()),
-                ) {
-                    domain.obj_bounds =
-                        super::super::batching::tighten_obj_lower_bounds(&domain.obj_bounds, fresh);
-                    if disjunctive_domain_verified(&domain.obj_bounds, thresholds, clause_sizes) {
-                        lifecycle.domains_verified += 1;
-                        continue;
-                    }
-                }
-            }
-        }
+        //
         // #relational-bab EDGE-DOMAIN ESCALATION (config-gated + oracle
         // -attached, default inert): a near-verified deep domain is offered
         // to the exact Graph-MIP leaf oracle BEFORE further splitting (and
         // before the max_depth drop). `VerifiedAllRows` is certified-UNSAT
         // -only per the oracle contract; anything else falls through to the
         // unchanged split path.
-        if try_edge_milp_escalation(
+        //
+        // #iso-edge-cap: both run through ONE seam shared by the three twin
+        // loops; unarmed it is the historical sequence statement for
+        // statement (see `escalate_edge_domain`).
+        if escalate_edge_domain(
             verifier,
             graph,
-            &domain,
+            &mut domain,
             spec_matrix,
             thresholds,
             clause_sizes,
             engine,
             lifecycle.deadline(bab_wall.horizon()),
+            &mut edge_alpha_budget,
+            &mut edge_governor,
         ) {
             lifecycle.domains_verified += 1;
             continue;
@@ -421,9 +500,15 @@ where
                 }
             })
             .collect();
+        // #sb-plane: `.or()` is exact — under the fresh clip the domain's
+        // carrier is `None` (moved or cleared above) and off the fresh clip the
+        // moved plane is `None`, so this is today's argument plus the kept
+        // plane, never both.
         let split_dim = verifier.select_input_dimension_sb(
             domain.input_bounds.as_ref(),
-            domain.linear_bounds.as_ref(),
+            sb_plane_under_fresh_clip
+                .as_ref()
+                .or(domain.linear_bounds.as_ref()),
             Some(domain_bounds.as_slice()),
             Some(thresholds),
         );
@@ -462,13 +547,12 @@ where
         let mid = l + (u - l) / 2.0;
         let shape = domain.input_bounds.as_ref().lower().shape().to_vec();
         if child_shape.is_none() {
-            child_shape = Some(shape.clone());
+            child_shape = Some(shape);
         }
         let mut child_lower = flat.lower().clone();
         let mut child_upper = flat.upper().clone();
 
         // Left child: [l, mid] on split_dim. Store flat — no reshape yet.
-        // Part of #4366 Packet A.
         child_lower[[split_dim]] = l;
         child_upper[[split_dim]] = mid;
         pending_children.push(FlatPendingChild {
@@ -512,7 +596,7 @@ where
     }
 
     // Batched IBP prescreen from flat rows — avoids N per-child BoundedTensor
-    // allocations. Part of #4366 Packet A.
+    // allocations.
     let shape = child_shape.as_deref().ok_or_else(|| {
         NyError::InvalidSpec(
             "no child shape recorded despite non-empty pending_children".to_string(),
@@ -549,7 +633,7 @@ where
         Err(err) => return Err(err),
     };
 
-    // Partition survivors: IBP-verified vs alive. Part of #4366 Packet C.
+    // Partition survivors: IBP-verified vs alive.
     let mut survivors: Vec<FlatPendingChild> = Vec::new();
     for (child, verified) in pending_children.into_iter().zip(verified_mask) {
         if verified {
@@ -620,18 +704,29 @@ where
 {
     // #relational-bab option B: per-wave α edge-pass budget.
     let mut edge_alpha_budget = verifier.config.input_split_edge_alpha_top;
+    // #iso-edge-cap: this wave's edge governor (unarmed = the historical path).
+    // THIS is the loop the relational (isomorphic) lane runs: its inline
+    // config is `reorder_bab` without `input_split_ibp_enhancement`.
+    let mut edge_governor =
+        super::edge_cap::EdgeWaveGovernor::for_wave(bab_wall, lifecycle.start_time);
     for mut domain in domains {
         if bab_wall.expired(lifecycle.start_time) {
             return Ok(Some(lifecycle.timeout_result()));
         }
-        if lifecycle.domains_explored >= verifier.config.max_domains {
+        // #cap-extend: with `batch_size > 1` the cap trip happens HERE far more
+        // often than at the loop head, so this site both consults the extended
+        // cap and is allowed to GRANT it. Reading `config.max_domains` and
+        // stopping unconditionally is what made the armed canary produce no
+        // marker at all on cgan2026 row 7.
+        if lifecycle.domains_explored >= lifecycle.domain_cap(verifier.config.max_domains)
+            && !super::try_grant_cap_extend(lifecycle, &verifier.config, queue.len())
+        {
+            let domain_cap = lifecycle.domain_cap(verifier.config.max_domains);
             return Ok(Some(lifecycle.build_result(
                 BabVerificationStatus::Unknown {
                     reason: format!(
                         "Domain limit {}: {}/{} verified",
-                        verifier.config.max_domains,
-                        lifecycle.domains_verified,
-                        lifecycle.domains_explored
+                        domain_cap, lifecycle.domains_verified, lifecycle.domains_explored
                     ),
                 },
             )));
@@ -661,46 +756,23 @@ where
         // -capped per wave (pops are worst-gap-first, so the cap keeps the
         // most negative gaps). Verified ⇒ done; still-short ⇒ the domain
         // continues with the α-improved, monotonicity-guarded bounds into
-        // the MILP finisher / split path below.
-        if verifier.config.input_split_edge_alpha && edge_alpha_budget > 0 {
-            if let Some(row_indices) = edge_domain_rows(
-                &domain,
-                thresholds,
-                clause_sizes,
-                verifier.config.input_split_edge_milp_gap,
-                verifier.config.input_split_edge_milp_depth,
-                spec_matrix.nrows(),
-            ) {
-                edge_alpha_budget -= 1;
-                if let Some(fresh) = try_edge_alpha_pass(
-                    verifier,
-                    graph,
-                    &domain,
-                    spec_matrix,
-                    &row_indices,
-                    engine,
-                    lifecycle.deadline(bab_wall.horizon()),
-                ) {
-                    domain.obj_bounds =
-                        super::super::batching::tighten_obj_lower_bounds(&domain.obj_bounds, fresh);
-                    if disjunctive_domain_verified(&domain.obj_bounds, thresholds, clause_sizes) {
-                        lifecycle.domains_verified += 1;
-                        continue;
-                    }
-                }
-            }
-        }
-        // #relational-bab EDGE-DOMAIN ESCALATION (config-gated + oracle
-        // -attached, default inert): see `try_edge_milp_escalation`.
-        if try_edge_milp_escalation(
+        // the MILP finisher / split path below. Then the #relational-bab
+        // EDGE-DOMAIN ESCALATION (config-gated + oracle-attached, default
+        // inert): see `try_edge_milp_escalation`.
+        //
+        // #iso-edge-cap: both through the one shared seam; unarmed it is the
+        // historical sequence statement for statement.
+        if escalate_edge_domain(
             verifier,
             graph,
-            &domain,
+            &mut domain,
             spec_matrix,
             thresholds,
             clause_sizes,
             engine,
             lifecycle.deadline(bab_wall.horizon()),
+            &mut edge_alpha_budget,
+            &mut edge_governor,
         ) {
             lifecycle.domains_verified += 1;
             continue;
@@ -920,6 +992,181 @@ pub(super) fn edge_domain_rows(
     (!rows.is_empty()).then_some(rows)
 }
 
+/// #iso-edge-cap: the per-domain EDGE ESCALATION shared by the three twin
+/// batch loops (`process_reorder_prescreen_batch`, `process_per_child_batch`,
+/// `child_batch::process_reorder_prescreen_child_batch`) — the α-slope edge
+/// pass, then the edge-MILP escalation. Returns `true` iff the domain is
+/// VERIFIED by either; the caller counts it and moves to the next domain,
+/// exactly as the inline blocks this replaces did.
+///
+/// UNARMED (`governor.is_armed() == false`, every shipped preset): the
+/// historical sequence statement for statement. `effort_deadline` is the
+/// `lifecycle.deadline(bab_wall.horizon())` every call site passed to both
+/// helpers before — a single instant, so computing it once changes nothing.
+///
+/// ARMED (`bab.branching.input_split.edge_wave_cap`): see
+/// [`escalate_edge_domain_governed`] and `edge_cap.rs`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn escalate_edge_domain(
+    verifier: &BetaCrownVerifier,
+    graph: &GraphNetwork,
+    domain: &mut MultiObjInputDomain,
+    spec_matrix: &Array2<f32>,
+    thresholds: &[f32],
+    clause_sizes: &[usize],
+    engine: Option<&dyn GemmEngine>,
+    effort_deadline: std::time::Instant,
+    edge_alpha_budget: &mut usize,
+    governor: &mut super::edge_cap::EdgeWaveGovernor,
+) -> bool {
+    if governor.is_armed() {
+        return escalate_edge_domain_governed(
+            verifier,
+            graph,
+            domain,
+            spec_matrix,
+            thresholds,
+            clause_sizes,
+            engine,
+            effort_deadline,
+            edge_alpha_budget,
+            governor,
+        );
+    }
+    if verifier.config.input_split_edge_alpha && *edge_alpha_budget > 0 {
+        if let Some(row_indices) = edge_domain_rows(
+            domain,
+            thresholds,
+            clause_sizes,
+            verifier.config.input_split_edge_milp_gap,
+            verifier.config.input_split_edge_milp_depth,
+            spec_matrix.nrows(),
+        ) {
+            *edge_alpha_budget -= 1;
+            if let Some(fresh) = try_edge_alpha_pass(
+                verifier,
+                graph,
+                domain,
+                spec_matrix,
+                &row_indices,
+                engine,
+                effort_deadline,
+            ) {
+                domain.obj_bounds =
+                    super::super::batching::tighten_obj_lower_bounds(&domain.obj_bounds, fresh);
+                if disjunctive_domain_verified(&domain.obj_bounds, thresholds, clause_sizes) {
+                    return true;
+                }
+            }
+        }
+    }
+    try_edge_milp_escalation(
+        verifier,
+        graph,
+        domain,
+        spec_matrix,
+        thresholds,
+        clause_sizes,
+        engine,
+        effort_deadline,
+    )
+}
+
+/// #iso-edge-cap: the GOVERNED edge escalation.
+///
+/// Same gates, same order, same helpers' bound math as the unarmed path. Four
+/// differences, each of which can only REMOVE edge work:
+///
+/// 1. a step is started only while `governor.may_start(now)` — the wave's
+///    spent edge wall below its allowance AND the scored stop not yet passed;
+///    an eligible step refused here is counted (`skipped`), which is the cap's
+///    own engagement count;
+/// 2. the ITERATIVE part of each step (the α optimisation loop; the MILP solve
+///    slice) runs against `governor.work_deadline(now)` =
+///    `min(stop, now + remaining allowance)`, while every BOUND-SHAPING
+///    deadline (node collection, α-state init, the final per-row CROWN pass)
+///    stays `effort_deadline`, so bound quality is unchanged — a sub-2 s
+///    deadline would drop every per-node CROWN grant under the budget policy's
+///    floor and silently degrade the pass to IBP-grade intermediates;
+/// 3. edge-α's own node collection over the domain's exact input box is handed
+///    to the edge-MILP request, so a domain that ran edge-α pays ONE
+///    collection, not two;
+/// 4. an edge-MILP proof completed at or after the scored stop is declined.
+///
+/// SOUNDNESS: a verified domain still needs either edge-α's monotone
+/// `tighten_obj_lower_bounds` merge of sound bounds (any α slope yields a
+/// sound bound, so an optimisation cut short is merely looser) or the
+/// oracle's certified `VerifiedAllRows`.
+#[allow(clippy::too_many_arguments)]
+fn escalate_edge_domain_governed(
+    verifier: &BetaCrownVerifier,
+    graph: &GraphNetwork,
+    domain: &mut MultiObjInputDomain,
+    spec_matrix: &Array2<f32>,
+    thresholds: &[f32],
+    clause_sizes: &[usize],
+    engine: Option<&dyn GemmEngine>,
+    effort_deadline: std::time::Instant,
+    edge_alpha_budget: &mut usize,
+    governor: &mut super::edge_cap::EdgeWaveGovernor,
+) -> bool {
+    let mut reusable_node_bounds: Option<HashMap<String, BoundedTensor>> = None;
+    if verifier.config.input_split_edge_alpha && *edge_alpha_budget > 0 {
+        if let Some(row_indices) = edge_domain_rows(
+            domain,
+            thresholds,
+            clause_sizes,
+            verifier.config.input_split_edge_milp_gap,
+            verifier.config.input_split_edge_milp_depth,
+            spec_matrix.nrows(),
+        ) {
+            let started = std::time::Instant::now();
+            if governor.may_start(started) {
+                *edge_alpha_budget -= 1;
+                governor.note_alpha_pass();
+                let pass = try_edge_alpha_pass_bounded(
+                    verifier,
+                    graph,
+                    domain,
+                    spec_matrix,
+                    &row_indices,
+                    engine,
+                    effort_deadline,
+                    governor.work_deadline(started),
+                );
+                governor.charge(started.elapsed());
+                reusable_node_bounds = pass.node_bounds;
+                if let Some(fresh) = pass.fresh {
+                    domain.obj_bounds =
+                        super::super::batching::tighten_obj_lower_bounds(&domain.obj_bounds, fresh);
+                    if disjunctive_domain_verified(&domain.obj_bounds, thresholds, clause_sizes) {
+                        governor.note_verified();
+                        return true;
+                    }
+                }
+            } else {
+                governor.note_skipped();
+            }
+        }
+    }
+    if try_edge_milp_escalation_governed(
+        verifier,
+        graph,
+        domain,
+        spec_matrix,
+        thresholds,
+        clause_sizes,
+        engine,
+        effort_deadline,
+        reusable_node_bounds,
+        governor,
+    ) {
+        governor.note_verified();
+        return true;
+    }
+    false
+}
+
 /// #relational-bab OPTION B: per-domain α-CROWN pass on an EDGE domain.
 /// One short α collection provides the state STRUCTURE + α-tightened
 /// per-node bounds; each UNVERIFIED row then gets its slopes RE-TARGETED by
@@ -1017,6 +1264,140 @@ fn edge_alpha_child_config(
     child.cgan_sparse_target_complete_root = false;
     child.cgan_complete_crown_ibp_root = false;
     child
+}
+
+/// What one BOUNDED edge-α pass produced (#iso-edge-cap).
+pub(super) struct EdgeAlphaPass {
+    /// Fresh bounds for exactly the rows the pass finished (`±inf` elsewhere,
+    /// the caller's monotone merge keeps everything else); `None` when no row
+    /// finished.
+    pub(super) fresh: Option<Vec<(f32, f32)>>,
+    /// The pass's own per-node collection over the domain's EXACT input box —
+    /// sound pre-activation boxes for that box — for the edge-MILP request to
+    /// reuse instead of recomputing; `None` when the collection failed.
+    pub(super) node_bounds: Option<HashMap<String, BoundedTensor>>,
+}
+
+/// #iso-edge-cap: [`try_edge_alpha_pass`] with the effort shape and the work
+/// limit kept apart.
+///
+/// `effort_deadline` shapes every BOUND exactly as the unbounded pass does —
+/// the node collection, the default-slope α-state init and the final per-row
+/// CROWN pass — so bound quality is unchanged. `work_deadline` bounds only the
+/// iterative per-row α optimisation (its config deadline, checked every
+/// iteration) and whether another row is started. A row whose optimisation is
+/// cut short still yields a SOUND bound (any α in `[0, 1]` does), and the rows
+/// finished before a failure are kept rather than discarded: each is a sound
+/// bound for its own row over the domain's box.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn try_edge_alpha_pass_bounded(
+    verifier: &BetaCrownVerifier,
+    graph: &GraphNetwork,
+    domain: &MultiObjInputDomain,
+    spec_matrix: &Array2<f32>,
+    row_indices: &[usize],
+    engine: Option<&dyn GemmEngine>,
+    effort_deadline: std::time::Instant,
+    work_deadline: std::time::Instant,
+) -> EdgeAlphaPass {
+    let input = domain.input_bounds.as_ref();
+    // Same relaxation base as the unbounded pass and as the rebound: per-node
+    // CROWN-IBP over THIS domain's exact box, shaped by the effort deadline.
+    let Ok(alpha_bounds) =
+        crate::network::collect_intermediate_bounds(graph, input, Some(effort_deadline), engine)
+    else {
+        return EdgeAlphaPass {
+            fresh: None,
+            node_bounds: None,
+        };
+    };
+    let fresh = edge_alpha_rows_bounded(
+        verifier,
+        graph,
+        input,
+        spec_matrix,
+        row_indices,
+        engine,
+        &alpha_bounds,
+        effort_deadline,
+        work_deadline,
+    );
+    EdgeAlphaPass {
+        fresh,
+        node_bounds: Some(alpha_bounds),
+    }
+}
+
+/// The per-row half of [`try_edge_alpha_pass_bounded`].
+#[allow(clippy::too_many_arguments)]
+fn edge_alpha_rows_bounded(
+    verifier: &BetaCrownVerifier,
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    spec_matrix: &Array2<f32>,
+    row_indices: &[usize],
+    engine: Option<&dyn GemmEngine>,
+    alpha_bounds: &HashMap<String, BoundedTensor>,
+    effort_deadline: std::time::Instant,
+    work_deadline: std::time::Instant,
+) -> Option<Vec<(f32, f32)>> {
+    if std::time::Instant::now() >= work_deadline {
+        return None;
+    }
+    let init_config = edge_alpha_child_config(&verifier.config.alpha_config, 0, effort_deadline);
+    let (_, init_alpha) = graph
+        .collect_alpha_crown_bounds_dag_with_engine(input, &init_config, engine)
+        .ok()?;
+    let row_config = edge_alpha_child_config(
+        &verifier.config.alpha_config,
+        verifier.config.input_split_edge_alpha_iters.max(1),
+        work_deadline,
+    );
+    let num_specs = spec_matrix.nrows();
+    let mut fresh = vec![(f32::NEG_INFINITY, f32::INFINITY); num_specs];
+    let mut finished_any = false;
+    for &j in row_indices {
+        if std::time::Instant::now() >= work_deadline {
+            break;
+        }
+        let row = spec_matrix.row(j).to_vec();
+        let Ok(optimized) = graph.optimize_alpha_for_spec_objective(
+            input,
+            alpha_bounds,
+            &init_alpha,
+            &row_config,
+            &row,
+            engine,
+        ) else {
+            break;
+        };
+        let Ok(row_spec) = Array2::from_shape_vec((1, row.len()), row) else {
+            break;
+        };
+        let Ok((bounds, _linear)) =
+            super::super::shared::compute_crown_or_ibp_bounds_with_node_bounds(
+                graph,
+                input,
+                &row_spec,
+                engine,
+                Some(alpha_bounds),
+                None,
+                Some(&optimized),
+                None,
+                Some(effort_deadline),
+                None,
+                false,
+            )
+        else {
+            break;
+        };
+        let Ok(row_bounds) = super::super::shared::extract_obj_bounds(&bounds, 1) else {
+            break;
+        };
+        fresh[j] = row_bounds[0];
+        finished_any = true;
+    }
+    finished_any.then_some(fresh)
 }
 
 /// Offer one still-undecided domain to the default-dark input-box-only oracle.
@@ -1242,5 +1623,211 @@ where
     }
 }
 
+/// #iso-edge-cap: [`try_edge_milp_escalation`] under the wave's edge governor.
+///
+/// The input-box leaf (a separate, independently gated seam, default dark) is
+/// consulted first EXACTLY as on the unarmed path. The Graph-MIP half then:
+///
+/// * declines outright at or after the scored stop (the AUTHORITY boundary,
+///   never later than the horizon the unarmed path used);
+/// * starts only while `governor.may_start(now)` (an eligible refusal is
+///   counted as `skipped`);
+/// * REUSES `reusable_node_bounds` — edge-α's collection over this domain's
+///   exact input box — when present, and otherwise collects exactly as the
+///   unarmed path does (same function, same effort deadline);
+/// * does not start a solve once the collection has used up the work
+///   deadline;
+/// * hands the oracle `work_deadline = min(stop, now + remaining allowance)`,
+///   so the solve slice the oracle derives from it fits inside the allowance
+///   (the ny-cli oracle declines any slice under 1 s, i.e. any work deadline
+///   under ~4 s away — see `edge_cap.rs`);
+/// * declines a proof completed at or after the stop.
+///
+/// Returns `true` ONLY on the certified `VerifiedAllRows` contract.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn try_edge_milp_escalation_governed(
+    verifier: &BetaCrownVerifier,
+    graph: &GraphNetwork,
+    domain: &MultiObjInputDomain,
+    spec_matrix: &Array2<f32>,
+    thresholds: &[f32],
+    clause_sizes: &[usize],
+    engine: Option<&dyn GemmEngine>,
+    effort_deadline: std::time::Instant,
+    reusable_node_bounds: Option<HashMap<String, BoundedTensor>>,
+    governor: &mut super::edge_cap::EdgeWaveGovernor,
+) -> bool {
+    use crate::beta_crown::graph_mip_leaf::{GraphMipLeafRequest, GraphMipLeafVerdict};
+
+    if try_input_leaf_escalation_with_clock(
+        verifier,
+        graph,
+        domain,
+        spec_matrix,
+        thresholds,
+        clause_sizes,
+        effort_deadline,
+        std::time::Instant::now,
+    ) {
+        return true;
+    }
+    if !verifier.config.input_split_edge_milp {
+        return false;
+    }
+    let authority = governor.stop_deadline();
+    let started = std::time::Instant::now();
+    if started >= authority {
+        trace!("edge-MILP (governed): the scored stop has passed; escalation declined");
+        return false;
+    }
+    let Some(oracle) = verifier.graph_mip_leaf_oracle() else {
+        return false;
+    };
+    let Some(row_indices) = edge_domain_rows(
+        domain,
+        thresholds,
+        clause_sizes,
+        verifier.config.input_split_edge_milp_gap,
+        verifier.config.input_split_edge_milp_depth,
+        spec_matrix.nrows(),
+    ) else {
+        return false;
+    };
+    if !governor.may_start(started) {
+        governor.note_skipped();
+        return false;
+    }
+    let work_deadline = governor.work_deadline(started);
+    let rows: Vec<(Vec<f32>, f32)> = row_indices
+        .into_iter()
+        .map(|j| (spec_matrix.row(j).to_vec(), thresholds[j]))
+        .collect();
+    let collected = if let Some(reused) = reusable_node_bounds {
+        governor.note_milp_reuse();
+        reused
+    } else {
+        governor.note_milp_collect();
+        // Same sound per-node boxes, same effort deadline, as the unarmed
+        // path. Failure declines (fail-closed).
+        match crate::network::collect_intermediate_bounds(
+            graph,
+            domain.input_bounds.as_ref(),
+            Some(effort_deadline),
+            engine,
+        ) {
+            Ok(collected) => collected,
+            Err(_) => {
+                governor.charge(started.elapsed());
+                return false;
+            }
+        }
+    };
+    if std::time::Instant::now() >= work_deadline {
+        governor.charge(started.elapsed());
+        trace!("edge-MILP (governed): the collection used up the work deadline; solve declined");
+        return false;
+    }
+    let node_bounds: HashMap<String, Arc<BoundedTensor>> = collected
+        .into_iter()
+        .map(|(name, bounds)| (name, Arc::new(bounds)))
+        .collect();
+    let request = GraphMipLeafRequest {
+        graph,
+        input_bounds: domain.input_bounds.as_ref(),
+        node_bounds: &node_bounds,
+        splits: Vec::new(),
+        rows,
+        depth: domain.depth,
+        deadline: Some(work_deadline),
+    };
+    governor.note_milp_consult();
+    let verdict = oracle.solve_leaf(&request);
+    governor.charge(started.elapsed());
+    if std::time::Instant::now() >= authority {
+        trace!("edge-MILP (governed): completed at or after the scored stop; result declined");
+        return false;
+    }
+    matches!(verdict, GraphMipLeafVerdict::VerifiedAllRows)
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod sb_plane_seam_tests {
+    use super::take_sb_plane_under_fresh_clip;
+
+    /// Fresh clip OFF: the carrier is untouched and nothing is moved, so the
+    /// caller's `.or(domain.linear_bounds.as_ref())` sees exactly today's plane.
+    #[test]
+    fn fresh_clip_off_leaves_the_carrier_alone() {
+        let mut carrier = Some(7u8);
+        assert_eq!(
+            take_sb_plane_under_fresh_clip(false, true, &mut carrier),
+            None
+        );
+        assert_eq!(carrier, Some(7));
+        assert_eq!(
+            take_sb_plane_under_fresh_clip(false, false, &mut carrier),
+            None
+        );
+        assert_eq!(carrier, Some(7));
+    }
+
+    /// Fresh clip ON, key OFF: the historical drop — carrier cleared, SB gets
+    /// nothing (width-only fallback).
+    #[test]
+    fn fresh_clip_on_without_key_drops_the_plane() {
+        let mut carrier = Some(7u8);
+        assert_eq!(
+            take_sb_plane_under_fresh_clip(true, false, &mut carrier),
+            None
+        );
+        assert_eq!(carrier, None);
+    }
+
+    /// Fresh clip ON, key ON: the plane is MOVED to the split decision and the
+    /// domain no longer carries it, so no clip or verified check downstream can
+    /// reach it through the domain.
+    #[test]
+    fn fresh_clip_on_with_key_moves_the_plane_out_of_the_domain() {
+        let mut carrier = Some(7u8);
+        assert_eq!(
+            take_sb_plane_under_fresh_clip(true, true, &mut carrier),
+            Some(7)
+        );
+        assert_eq!(
+            carrier, None,
+            "the kept plane must not remain on the domain"
+        );
+        // A second pop of an already-empty carrier yields nothing.
+        assert_eq!(
+            take_sb_plane_under_fresh_clip(true, true, &mut carrier),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod fresh_clip_domain_map_seam_tests {
+    use super::take_fresh_clip_domain_map;
+
+    /// Key OFF: nothing is moved and the carrier is untouched, so the clip
+    /// keeps passing `None` exactly as before the key existed.
+    #[test]
+    fn fresh_clip_domain_map_dark_passes_none_and_leaves_the_carrier() {
+        let mut carrier = Some(7u8);
+        assert_eq!(take_fresh_clip_domain_map(false, &mut carrier), None);
+        assert_eq!(carrier, Some(7));
+    }
+
+    /// Key ON: the retained map is MOVED to the clip and the domain no longer
+    /// carries it, so nothing downstream (split, children) can inherit it.
+    #[test]
+    fn fresh_clip_domain_map_armed_moves_the_map_out_of_the_domain() {
+        let mut carrier = Some(7u8);
+        assert_eq!(take_fresh_clip_domain_map(true, &mut carrier), Some(7));
+        assert_eq!(carrier, None, "the map must not remain on the domain");
+        assert_eq!(take_fresh_clip_domain_map(true, &mut carrier), None);
+    }
+}

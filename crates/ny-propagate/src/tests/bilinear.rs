@@ -33,7 +33,7 @@ fn identity_downstream_for_2x2_output() -> BatchedLinearBounds {
 }
 
 /// Assert concretized bounds are NaN-free and ordered (lower <= upper).
-/// concretize_sound's new_repaired(Widen) replaces NaN pairs with [-inf, +inf] (#3423);
+/// concretize_sound's new_repaired(Widen) replaces NaN pairs with [-inf, +inf];
 /// this helper verifies the contract is upheld.
 fn assert_concretized_sound(bounds: &BoundedTensor, label: &str) {
     for (j, (&lo, &hi)) in bounds.lower().iter().zip(bounds.upper().iter()).enumerate() {
@@ -352,7 +352,7 @@ fn test_bilinear_crown_no_scale_succeeds() {
 
 /// Test soundness: concretized output bounds must be ordered (lower <= upper).
 ///
-/// After sign-split broadcast McCormick backward (#286 Approach A), CROWN coefficient
+/// After sign-split broadcast McCormick backward, CROWN coefficient
 /// matrices `lower_a` and `upper_a` are NOT guaranteed to be element-wise ordered
 /// because they are computed independently for each bound direction (matching
 /// auto_LiRPA `propagate_A_xy`). The correctness property is that concretized bounds
@@ -541,7 +541,7 @@ fn test_bilinear_crown_zero_bounds() {
 }
 
 /// Test batch-reduced global intervals with 3D batched inputs.
-/// Verifies that the fix for #292 correctly computes min lower / max upper
+/// Verifies that the reduction correctly computes min lower / max upper
 /// across batch positions for sound McCormick plane selection.
 #[ntest::timeout(10000)]
 #[test]
@@ -681,7 +681,7 @@ fn test_bilinear_crown_global_intervals_multi_dim_batch_matches_flat_batch() {
 }
 
 // =========================================================================
-// Alpha-CROWN BilinearCrown tests (#295)
+// Alpha-CROWN BilinearCrown tests
 // =========================================================================
 
 /// Test BilinearCrown with alpha parameters produces valid bounds.
@@ -712,7 +712,7 @@ fn test_bilinear_crown_with_alpha_valid_bounds() {
 
     let downstream = identity_downstream_for_2x2_output();
 
-    // Test with alpha = 1.0 (default, uses L1/U1 planes). Shape [4, m, n, k] (#3287).
+    // Test with alpha = 1.0 (default, uses L1/U1 planes). Shape [4, m, n, k].
     let alphas = Array4::ones((4, 2, 2, 2));
     let result = bilinear.propagate_linear_batched_binary_with_alpha(
         &downstream,
@@ -876,7 +876,7 @@ fn test_bilinear_crown_alpha_affects_bounds() {
 
     let downstream = identity_downstream_for_2x2_output();
 
-    // Alpha = 0 (uses L2/U2 planes). Shape [4, m, n, k] (#3287).
+    // Alpha = 0 (uses L2/U2 planes). Shape [4, m, n, k].
     let alphas_zero = Array4::zeros((4, 2, 2, 2));
     let result_zero = bilinear.propagate_linear_batched_binary_with_alpha(
         &downstream,
@@ -885,7 +885,7 @@ fn test_bilinear_crown_alpha_affects_bounds() {
         Some(&alphas_zero),
     );
 
-    // Alpha = 1 (uses L1/U1 planes). Shape [4, m, n, k] (#3287).
+    // Alpha = 1 (uses L1/U1 planes). Shape [4, m, n, k].
     let alphas_one = Array4::ones((4, 2, 2, 2));
     let result_one = bilinear.propagate_linear_batched_binary_with_alpha(
         &downstream,
@@ -945,7 +945,7 @@ fn test_bilinear_crown_with_alpha_point_bounds() {
 
     let downstream = identity_downstream_for_2x2_output();
 
-    // With point bounds, alpha value shouldn't matter. Shape [4, m, n, k] (#3287).
+    // With point bounds, alpha value shouldn't matter. Shape [4, m, n, k].
     let alphas_zero = Array4::zeros((4, 2, 2, 2));
     let alphas_one = Array4::ones((4, 2, 2, 2));
 

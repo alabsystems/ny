@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Host-side timing profile for GPU CROWN backward orchestration (#3599).
+//! Host-side timing profile for GPU CROWN backward orchestration.
 
 use std::collections::BTreeMap;
 

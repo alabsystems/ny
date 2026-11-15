@@ -5,7 +5,7 @@
 //! Average pooling layer for bound propagation.
 
 use ndarray::{Array2, ArrayD, IxDyn};
-use ny_core::{checked_shape_product, NyError, Result};
+use ny_core::{checked_shape_product, require_f64_interval_proof_environment, NyError, Result};
 use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor, RepairStrategy};
 use std::borrow::Cow;
 
@@ -38,6 +38,29 @@ pub struct AveragePoolLayer {
     pub padding: (usize, usize),
     /// Whether to count padding zeros in divisor
     pub count_include_pad: bool,
+    /// GlobalAveragePool over ALL trailing spatial axes of an UNBATCHED
+    /// rank-4 `(C, D, H, W)` input (3 spatial dims, mirroring `Conv3d`'s
+    /// naming). Set ONLY by the ONNX lowering
+    /// (`ny-build/src/convert/pooling.rs`) when the node is a global pool
+    /// whose recorded ONNX input rank is 5 (`N, C, D, H, W` — the loader
+    /// batch-squeezes to rank 4). Never set for the 2-D sentinel path, so
+    /// every layer built by [`AveragePoolLayer::new`] keeps today's behaviour
+    /// bit-identically.
+    ///
+    /// Why a flag and not runtime rank dispatch: a rank-4 tensor at this layer
+    /// is AMBIGUOUS — `(batch, C, H, W)` (the live batched-2D path) and
+    /// `(C, D, H, W)` (a batch-squeezed 3D-CNN) have identical shapes and
+    /// different correct answers. Only the lowering, which sees the ONNX
+    /// declared rank, can decide; the wrong-axis interpretation is exactly the
+    /// defect this flag fixes (#rank4-global-avgpool: smart_turn's
+    /// `[512, 4, 7, 7]` layer4 output pooled only H,W, handing the downstream
+    /// fc Gemm 2048 elements against its 512-column weight).
+    ///
+    /// Reach when set: certified IBP only (`propagate_ibp` /
+    /// `propagate_ibp_sound`). CROWN backward, Patches, the GPU IBP plan,
+    /// `output_size`, and the spec-influence cone all FAIL CLOSED on this
+    /// flag — the same IBP-only contract `Conv3d` ships under.
+    pub global_3d: bool,
 }
 
 impl AveragePoolLayer {
@@ -53,6 +76,24 @@ impl AveragePoolLayer {
             stride,
             padding,
             count_include_pad,
+            global_3d: false,
+        }
+    }
+
+    /// Create a GlobalAveragePool over all 3 trailing spatial axes of an
+    /// unbatched rank-4 `(C, D, H, W)` input. See [`Self::global_3d`].
+    ///
+    /// Geometry fields keep the global sentinel convention: kernel `(0, 0)`
+    /// (so [`Self::is_global`] holds and every `is_global`-refusing consumer
+    /// keeps refusing), stride `(1, 1)`, padding `(0, 0)`,
+    /// `count_include_pad = false` (a global window has no padding).
+    pub fn new_global_3d() -> Self {
+        Self {
+            kernel_size: (0, 0),
+            stride: (1, 1),
+            padding: (0, 0),
+            count_include_pad: false,
+            global_3d: true,
         }
     }
 
@@ -70,6 +111,17 @@ impl AveragePoolLayer {
     /// under `count_include_pad=false` — so any value emitted for them is
     /// fabricated. ONNX Runtime rejects this geometry.
     pub fn output_size(&self, input_h: usize, input_w: usize) -> Result<(usize, usize)> {
+        // FAIL CLOSED on the global-3d flag: this signature answers for the
+        // trailing (H, W) pair only, so a caller planning geometry from it
+        // would silently keep the temporal axis un-pooled — the exact
+        // wrong-axis defect the flag exists to fix.
+        if self.global_3d {
+            return Err(NyError::UnsupportedOp(
+                "AveragePool global-3d: 2-D output_size is undefined for a pool over all \
+                 trailing spatial axes; only certified IBP is implemented"
+                    .to_string(),
+            ));
+        }
         // Global pooling: kernel_size (0, 0) means pool entire spatial dims
         if self.is_global() {
             return Ok((1, 1));
@@ -109,6 +161,14 @@ impl BoundPropagation for AveragePoolLayer {
         // and uses F.avg_pool2d for forward over NCHW inputs
         // (auto_LiRPA/operators/pooling.py:522-527).
 
+        // Global-3d pool: a fully separate branch. The generic code below
+        // interprets rank 4 as (batch, C, H, W), which is exactly the
+        // wrong-axis reading the flag forbids. Branching FIRST keeps the
+        // default path below byte-identical when the flag is off.
+        if self.global_3d {
+            return self.propagate_ibp_global_3d(input);
+        }
+
         // Validate input shape: expect (channels, height, width) or
         // (batch, channels, height, width).
         let input_shape = input.lower().shape();
@@ -141,7 +201,7 @@ impl BoundPropagation for AveragePoolLayer {
             };
             let mut out_lower = ArrayD::zeros(IxDyn(&out_shape));
             let mut out_upper = ArrayD::zeros(IxDyn(&out_shape));
-            // Guard zero spatial dimensions to prevent 0/0 = NaN (#2924).
+            // Guard zero spatial dimensions to prevent 0/0 = NaN.
             // Matches the non-global path's count.max(1) pattern.
             let divisor = (in_h * in_w).max(1) as f32;
 
@@ -155,8 +215,8 @@ impl BoundPropagation for AveragePoolLayer {
                         // which can pull the lower sum up / the upper sum down →
                         // uncertified). f32→f64 widening is exact, so only the f64
                         // sum rounds (a sub-ULP residual), and the single f64→f32
-                        // store is then directed-rounded OUTWARD (#3338,
-                        // #vnncomp-aw-soundness — mirrors conv becc501 / IBP
+                        // store is then directed-rounded OUTWARD
+                        // (#vnncomp-aw-soundness — mirrors conv becc501 / IBP
                         // batched_interval_matvec_finite).
                         let mut sum_lower = 0.0f64;
                         let mut sum_upper = 0.0f64;
@@ -167,7 +227,7 @@ impl BoundPropagation for AveragePoolLayer {
                             }
                         }
                         // Directed rounding of the f64→f32 store: lower→-∞,
-                        // upper→+∞ (#3338).
+                        // upper→+∞.
                         out_lower[[batch_idx, c, 0, 0]] =
                             next_down_f32((sum_lower / divisor64) as f32);
                         out_upper[[batch_idx, c, 0, 0]] =
@@ -185,20 +245,20 @@ impl BoundPropagation for AveragePoolLayer {
                             sum_upper += input.upper()[[c, ih, iw]] as f64;
                         }
                     }
-                    // Directed rounding of the f64→f32 store: lower→-∞, upper→+∞ (#3338).
+                    // Directed rounding of the f64→f32 store: lower→-∞, upper→+∞.
                     out_lower[[c, 0, 0]] = next_down_f32((sum_lower / divisor64) as f32);
                     out_upper[[c, 0, 0]] = next_up_f32((sum_upper / divisor64) as f32);
                 }
             }
 
             // NaN in output indicates NaN in input (data corruption, not overflow).
-            // Must check before new_repaired which would silently swallow NaN (#2812, #3423).
+            // Must check before new_repaired which would silently swallow NaN.
             if out_lower.iter().any(|v| v.is_nan()) || out_upper.iter().any(|v| v.is_nan()) {
                 return Err(NyError::NumericalInstability(
                     "AveragePool IBP (global): NaN in bounds (from NaN input)".into(),
                 ));
             }
-            // Repair non-finite outputs (Inf→fallback) for consistency with linear IBP (#3030).
+            // Repair non-finite outputs (Inf→fallback) for consistency with linear IBP.
             return BoundedTensor::new_repaired(out_lower, out_upper, RepairStrategy::Conservative);
         }
 
@@ -260,7 +320,7 @@ impl BoundPropagation for AveragePoolLayer {
                                 count.max(1) as f64
                             };
 
-                            // Directed rounding of the f64→f32 store: lower→-∞, upper→+∞ (#3338).
+                            // Directed rounding of the f64→f32 store: lower→-∞, upper→+∞.
                             out_lower[[batch_idx, c, oh, ow]] =
                                 next_down_f32((sum_lower / divisor) as f32);
                             out_upper[[batch_idx, c, oh, ow]] =
@@ -308,7 +368,7 @@ impl BoundPropagation for AveragePoolLayer {
                             count.max(1) as f64
                         };
 
-                        // Directed rounding of the f64→f32 store: lower→-∞, upper→+∞ (#3338).
+                        // Directed rounding of the f64→f32 store: lower→-∞, upper→+∞.
                         out_lower[[c, oh, ow]] = next_down_f32((sum_lower / divisor) as f32);
                         out_upper[[c, oh, ow]] = next_up_f32((sum_upper / divisor) as f32);
                     }
@@ -317,13 +377,13 @@ impl BoundPropagation for AveragePoolLayer {
         }
 
         // NaN in output indicates NaN in input (data corruption, not overflow).
-        // Must check before new_repaired which would silently swallow NaN (#2812, #3423).
+        // Must check before new_repaired which would silently swallow NaN.
         if out_lower.iter().any(|v| v.is_nan()) || out_upper.iter().any(|v| v.is_nan()) {
             return Err(NyError::NumericalInstability(
                 "AveragePool IBP: NaN in bounds (from NaN input)".into(),
             ));
         }
-        // Repair non-finite outputs (Inf→fallback) for consistency with linear IBP (#3030).
+        // Repair non-finite outputs (Inf→fallback) for consistency with linear IBP.
         BoundedTensor::new_repaired(out_lower, out_upper, RepairStrategy::Conservative)
     }
 
@@ -354,6 +414,80 @@ impl BoundPropagation for AveragePoolLayer {
 }
 
 impl AveragePoolLayer {
+    /// IBP for the [`Self::global_3d`] pool: mean over ALL trailing spatial
+    /// axes of an unbatched rank-4 `(C, D, H, W)` input → `(C, 1, 1, 1)`.
+    ///
+    /// CONTAINMENT: the mean is linear with positive weights `1/(D·H·W)`, so
+    /// in REAL arithmetic the interval image of a box is exactly the box of
+    /// the endpoint means: `y_l[c] = mean(x_l[c,·,·,·])`,
+    /// `y_u[c] = mean(x_u[c,·,·,·])`. The float conventions mirror the 2-D
+    /// global path above verbatim: each endpoint sum is accumulated in f64
+    /// (f32→f64 widening is exact, so only the f64 sum rounds) and the single
+    /// f64→f32 store is directed-rounded 1 ULP outward
+    /// (`next_down`/`next_up`). As above, that certifies the CAST, not
+    /// the f64 accumulation residual — verdict paths go through
+    /// [`Self::propagate_ibp_sound`], whose Higham `γ⁶⁴_{k+1}·S/d` term uses
+    /// `k = D·H·W` for this branch (charging the 2-D `H·W` there would
+    /// UNDER-state the residual).
+    ///
+    /// Rank ≠ 4 REFUSES — including rank 5: no batched global-3d path exists,
+    /// and a rank-5 spatial pool (4 spatial dims, ONNX rank 6) remains
+    /// unsupported (pinned by `global_3d_refuses_rank5_input`).
+    fn propagate_ibp_global_3d(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
+        let input_shape = input.lower().shape();
+        if input_shape.len() != 4 {
+            return Err(NyError::InvalidSpec(format!(
+                "AveragePool global-3d IBP requires an unbatched rank-4 (C, D, H, W) input, \
+                 got rank {} {:?}; rank-5+ spatial pooling is not supported",
+                input_shape.len(),
+                input_shape
+            )));
+        }
+        let (channels, in_d, in_h, in_w) = (
+            input_shape[0],
+            input_shape[1],
+            input_shape[2],
+            input_shape[3],
+        );
+
+        let out_shape = vec![channels, 1, 1, 1];
+        let mut out_lower = ArrayD::zeros(IxDyn(&out_shape));
+        let mut out_upper = ArrayD::zeros(IxDyn(&out_shape));
+        // Guard zero spatial dimensions to prevent 0/0 = NaN, matching the
+        // 2-D global path's `.max(1)` convention.
+        let divisor64 = (in_d * in_h * in_w).max(1) as f64;
+
+        for c in 0..channels {
+            // SOUND: f64 window-sum accumulation — an f32 running sum rounds
+            // to nearest, which can pull the lower sum UP / the upper sum
+            // DOWN (uncertified). See the 2-D global path
+            // (#vnncomp-aw-soundness).
+            let mut sum_lower = 0.0f64;
+            let mut sum_upper = 0.0f64;
+            for id in 0..in_d {
+                for ih in 0..in_h {
+                    for iw in 0..in_w {
+                        sum_lower += input.lower()[[c, id, ih, iw]] as f64;
+                        sum_upper += input.upper()[[c, id, ih, iw]] as f64;
+                    }
+                }
+            }
+            // Directed rounding of the f64→f32 store: lower→-∞, upper→+∞.
+            out_lower[[c, 0, 0, 0]] = next_down_f32((sum_lower / divisor64) as f32);
+            out_upper[[c, 0, 0, 0]] = next_up_f32((sum_upper / divisor64) as f32);
+        }
+
+        // NaN in output indicates NaN in input (data corruption, not overflow).
+        // Must check before new_repaired which would silently swallow NaN.
+        if out_lower.iter().any(|v| v.is_nan()) || out_upper.iter().any(|v| v.is_nan()) {
+            return Err(NyError::NumericalInstability(
+                "AveragePool IBP (global-3d): NaN in bounds (from NaN input)".into(),
+            ));
+        }
+        // Repair non-finite outputs (Inf→fallback) for consistency with linear IBP.
+        BoundedTensor::new_repaired(out_lower, out_upper, RepairStrategy::Conservative)
+    }
+
     /// SOUND IBP forward — the AveragePool analogue of
     /// `Conv2dLayer::propagate_ibp_sound_with_engine` (#vnncomp-aw-soundness,
     /// avgpool 1-ULP-arm item).
@@ -401,6 +535,12 @@ impl AveragePoolLayer {
     /// encloses the true average-pool output; looser only ⇒ Timeout, never a
     /// false proof.
     pub fn propagate_ibp_sound(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
+        // The Higham residual and adjacent-float publication below are proof
+        // arithmetic only under round-to-nearest binary64 with gradual
+        // underflow. Check the live calling thread before doing any f64 work;
+        // callers may construct AveragePool directly and therefore cannot
+        // inherit this precondition from a loader or model constructor.
+        require_f64_interval_proof_environment()?;
         let y = self.propagate_ibp(input)?;
 
         // S_o/d_o: the SAME pooling forward on the degenerate |x| box.
@@ -412,10 +552,16 @@ impl AveragePoolLayer {
         let s = s_bt.upper(); // xmax ≥ 0, weights +1/d ⇒ upper ≥ f64 value of S/d
 
         // k = max #terms in one window sum. propagate_ibp above validated
-        // ndim ∈ {3, 4} with spatial dims last, so indexing is in range.
+        // ndim ∈ {3, 4} with spatial dims last (global-3d: ndim == 4 exactly,
+        // (C, D, H, W)), so indexing is in range.
         let shape = input.shape();
         let (in_h, in_w) = (shape[shape.len() - 2], shape[shape.len() - 1]);
-        let k = if self.is_global() {
+        let k = if self.global_3d {
+            // The global-3d window sums D·H·W terms per channel; charging the
+            // 2-D `in_h·in_w` here would UNDER-state the Higham residual
+            // (γ is monotone in its index) — an unsound certificate.
+            shape[1].saturating_mul(in_h).saturating_mul(in_w).max(1)
+        } else if self.is_global() {
             in_h.saturating_mul(in_w).max(1)
         } else {
             self.kernel_size.0.saturating_mul(self.kernel_size.1).max(1)
@@ -459,6 +605,18 @@ impl AveragePoolLayer {
         bounds: &LinearBounds,
         pre_activation: &BoundedTensor,
     ) -> Result<LinearBounds> {
+        // Global-3d pool: a fully separate backward. The generic scatter below
+        // distributes coefficients over a 2-D (H, W) window, which on a
+        // (C, D, H, W) input is the wrong-axis Jacobian — so the flag branches
+        // FIRST, exactly as `propagate_ibp` does. The previously pinned
+        // refusal (#rank4-global-avgpool's IBP-only contract) MOVES here into
+        // a sound backward: the Jacobian of the full-volume mean is an exact
+        // uniform 1/(D·H·W) scatter per channel
+        // (#qdq-crown-followup; pinned still-refused case: any pre-activation
+        // that is not exactly unbatched rank-4, including rank 5).
+        if self.global_3d {
+            return self.propagate_linear_with_bounds_global_3d(bounds, pre_activation);
+        }
         let input_shape = pre_activation.shape();
         let ndim = input_shape.len();
 
@@ -723,6 +881,175 @@ impl AveragePoolLayer {
         }
 
         // Bias passes through unchanged (linear operation has no bias)
+        LinearBounds::new_or_conservative_with_err(
+            new_lower_a,
+            bounds.lower_b().clone(),
+            new_upper_a,
+            bounds.upper_b().clone(),
+            lower_err,
+            upper_err,
+        )
+    }
+
+    /// CROWN backward for the [`Self::global_3d`] pool (#qdq-crown-followup).
+    ///
+    /// The full-volume mean is linear: for each channel `c`,
+    /// `y[c] = (1/(D·H·W)) · Σ_{d,h,w} x[c, d, h, w]`, so the Jacobian is an
+    /// EXACT uniform scatter `J[c, (c, d, h, w)] = 1/(D·H·W)` (zero across
+    /// channels) and the backward is
+    /// `A'[i, (c, d, h, w)] = A[i, c] · (1/(D·H·W))` — exactly ONE product per
+    /// output column, no accumulation. Conventions mirror the 2-D GLOBAL
+    /// branch of [`Self::propagate_linear_with_bounds`] verbatim:
+    ///
+    /// - the weight is the same `1.0 / divisor` f32 the forward divides by
+    ///   (divisor `(D·H·W).max(1)`, matching `propagate_ibp_global_3d`'s
+    ///   zero-spatial guard);
+    /// - the fresh f32 coefficient error is charged as `γ³²_n · row_max(A)`
+    ///   with `n = 1` — the 2-D path computes
+    ///   `n = min(⌈kh/sh⌉·⌈kw/sw⌉, out_h·out_w)` which is exactly 1 for a
+    ///   global pool (one output window), and the single `A[i,c]·weight`
+    ///   product is one rounding, covered by `γ_1` (#vnncomp-aw-soundness);
+    /// - any INCOMING certified coefficient error is composed EXACTLY
+    ///   per-column: the same positive-weight scatter applied to `|e|`,
+    ///   accumulated in f64 and rounded outward at assembly (defensive; the
+    ///   dispatcher normally discharges it into the bias first — AvgPool is
+    ///   deliberately not a `propagates_coeff_err` carrier, see `query.rs`).
+    ///
+    /// Pre-activation rank ≠ 4 REFUSES — the still-refused pin for this
+    /// capability step: a rank-5 SPATIAL pool (4 spatial dims, ONNX rank 6)
+    /// and any batched global-3d input remain unsupported, mirroring
+    /// `propagate_ibp_global_3d`'s contract.
+    fn propagate_linear_with_bounds_global_3d(
+        &self,
+        bounds: &LinearBounds,
+        pre_activation: &BoundedTensor,
+    ) -> Result<LinearBounds> {
+        let input_shape = pre_activation.shape();
+        if input_shape.len() != 4 {
+            return Err(NyError::InvalidSpec(format!(
+                "AveragePool global-3d CROWN requires an unbatched rank-4 (C, D, H, W) \
+                 pre-activation, got rank {} {:?}; rank-5+ spatial pooling is not supported",
+                input_shape.len(),
+                input_shape
+            )));
+        }
+        let (channels, in_d, in_h, in_w) = (
+            input_shape[0],
+            input_shape[1],
+            input_shape[2],
+            input_shape[3],
+        );
+
+        // Engagement receipt (once per process) — eprintln!, NOT tracing: the
+        // default filter suppresses info!-level events (see the identical note
+        // on `[global_3d_avgpool] armed` in ny-build/src/convert/pooling.rs).
+        // A probe must be able to prove this backward FIRED rather than infer
+        // it from an absent refusal.
+        static GLOBAL_3D_CROWN_ANNOUNCED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !GLOBAL_3D_CROWN_ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[global_3d_crown] armed: AveragePool global-3d CROWN backward engaged \
+                 (exact uniform 1/(D*H*W) scatter per channel)"
+            );
+        }
+
+        let input_size = checked_shape_product(&[channels, in_d, in_h, in_w]).ok_or_else(|| {
+            NyError::InvalidSpec(format!(
+                "AveragePool global-3d CROWN: input size product overflows: \
+                 ch={channels} d={in_d} h={in_h} w={in_w}"
+            ))
+        })?;
+        // Output is (C, 1, 1, 1) → C flat coordinates.
+        let output_size = channels;
+        if bounds.num_inputs() != output_size {
+            return Err(NyError::ShapeMismatch {
+                expected: vec![output_size],
+                got: vec![bounds.num_inputs()],
+            });
+        }
+        let num_outputs = bounds.num_outputs();
+
+        // The FULL-VOLUME divisor. A 2-D `in_h * in_w` here is the wrong-axis
+        // Jacobian this branch exists to forbid (planted-red in the commit).
+        let divisor = (in_d * in_h * in_w).max(1) as f32;
+        let weight = 1.0 / divisor;
+        let w64 = weight as f64;
+
+        let mut new_lower_a = Array2::<f32>::zeros((num_outputs, input_size));
+        let mut new_upper_a = Array2::<f32>::zeros((num_outputs, input_size));
+
+        // EXACT per-column composition of any incoming certified coefficient
+        // error — the same positive-weight scatter applied to |e| (mirrors the
+        // 2-D path's defensive fallback; 0 in production, where the dispatcher
+        // discharges the incoming err into the bias before this runs).
+        let in_lower_err = bounds.lower_a_err();
+        let in_upper_err = bounds.upper_a_err();
+        let mut prop_lower = in_lower_err.map(|_| Array2::<f64>::zeros((num_outputs, input_size)));
+        let mut prop_upper = in_upper_err.map(|_| Array2::<f64>::zeros((num_outputs, input_size)));
+
+        let plane = in_h * in_w;
+        let volume = in_d * plane;
+        for c in 0..channels {
+            let y_flat = c;
+            for d in 0..in_d {
+                for h in 0..in_h {
+                    for w in 0..in_w {
+                        let x_flat = c * volume + d * plane + h * in_w + w;
+                        for out_idx in 0..num_outputs {
+                            // A'[i, x] = A[i, y] · weight — a single product,
+                            // never accumulated (each input cell belongs to
+                            // exactly one channel's one output window).
+                            new_lower_a[[out_idx, x_flat]] =
+                                bounds.lower_a()[[out_idx, y_flat]] * weight;
+                            new_upper_a[[out_idx, x_flat]] =
+                                bounds.upper_a()[[out_idx, y_flat]] * weight;
+                            if let (Some(pl), Some(e)) = (prop_lower.as_mut(), in_lower_err) {
+                                pl[[out_idx, x_flat]] = (e[[out_idx, y_flat]] as f64).abs() * w64;
+                            }
+                            if let (Some(pu), Some(e)) = (prop_upper.as_mut(), in_upper_err) {
+                                pu[[out_idx, x_flat]] = (e[[out_idx, y_flat]] as f64).abs() * w64;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // SOUND fresh coefficient error, mirroring the 2-D path's global case:
+        // n_contraction = 1 (a global pool has exactly one output window per
+        // channel, so each backward coefficient is ONE f32 product — one
+        // rounding, covered by γ³²_1·row_max(A)·1). The f32 gamma is the honest
+        // constant: the stored coefficient IS the f32 product
+        // (#vnncomp-aw-soundness, same charge the 2-D global branch computes
+        // via min(⌈kh/sh⌉·⌈kw/sw⌉, out_h·out_w) = 1).
+        let n_contraction = 1usize;
+        let gamma = crate::layers::linear::crown_single_gamma_n_f32(n_contraction);
+        let weight_l1 = n_contraction as f64;
+        let row_max = |a: &Array2<f32>, i: usize| -> f64 {
+            let mut m = 0.0f64;
+            for k in 0..a.ncols() {
+                let v = (a[[i, k]] as f64).abs();
+                if v > m {
+                    m = v;
+                }
+            }
+            m
+        };
+        let mut lower_err = Array2::<f32>::zeros(new_lower_a.raw_dim());
+        let mut upper_err = Array2::<f32>::zeros(new_upper_a.raw_dim());
+        for i in 0..num_outputs {
+            let s_l = gamma * row_max(bounds.lower_a(), i) * weight_l1;
+            let s_u = gamma * row_max(bounds.upper_a(), i) * weight_l1;
+            for p in 0..lower_err.ncols() {
+                let pl = prop_lower.as_ref().map_or(0.0, |m| m[[i, p]]);
+                let pu = prop_upper.as_ref().map_or(0.0, |m| m[[i, p]]);
+                lower_err[[i, p]] = next_up_f32((s_l + pl) as f32);
+                upper_err[[i, p]] = next_up_f32((s_u + pu) as f32);
+            }
+        }
+
+        // Bias passes through unchanged (linear operation has no bias).
         LinearBounds::new_or_conservative_with_err(
             new_lower_a,
             bounds.lower_b().clone(),

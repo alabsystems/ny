@@ -67,7 +67,7 @@ GIT_FETCH_ENV = {
 PIPELINE_COMMANDS: list[dict[str, Any]] = [
     {
         "name": "cargo_check",
-        "cmd": ["cargo", "check", "--workspace"],
+        "cmd": ["targo", "--unverified", "check", "--workspace"],
         # Includes time waiting for the per-repo cargo lock.
         "timeout": 3600,
         # Typical budget needed for a clean build on a workstation.
@@ -77,7 +77,7 @@ PIPELINE_COMMANDS: list[dict[str, Any]] = [
     },
     {
         "name": "ny_onnx_gguf_check",
-        "cmd": ["cargo", "check", "-p", "ny-onnx", "--features", "gguf"],
+        "cmd": ["targo", "--unverified", "check", "-p", "ny-onnx", "--features", "gguf"],
         # Includes time waiting for the per-repo cargo lock.
         "timeout": 3600,
         "min_budget_sec": 300,
@@ -86,7 +86,7 @@ PIPELINE_COMMANDS: list[dict[str, Any]] = [
     },
     {
         "name": "cli_help",
-        "cmd": ["cargo", "run", "-p", "ny-cli", "--", "--help"],
+        "cmd": ["targo", "--unverified", "run", "-p", "ny-cli", "--", "--help"],
         # Includes time waiting for the per-repo cargo lock + compilation.
         "timeout": 900,
         "min_budget_sec": 120,
@@ -747,7 +747,7 @@ def main(argv: list[str] | None = None) -> int:
     check_gguf_sources(hc)
     check_graph_crown_artifacts(hc)
 
-    # Run syspolicyd preflight before pipeline commands (#4230).
+    # Run syspolicyd preflight before pipeline commands.
     # If the host cannot start fresh binaries, skip the expensive cargo pipeline.
     syspolicyd_result = check_syspolicyd_health(hc)
     if syspolicyd_result.get("status") == "fail":

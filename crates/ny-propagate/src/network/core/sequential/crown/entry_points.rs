@@ -4,9 +4,8 @@
 
 //! Public CROWN entry-point wrappers for sequential networks.
 //!
-//! Extracted from `crown.rs` as part of #4233 Packet B. These are thin
-//! delegation wrappers around `propagate_crown_core` and
-//! `propagate_crown_with_layer_bounds_*` which remain in `crown.rs`.
+//! These are thin delegation wrappers around `propagate_crown_core` and
+//! `propagate_crown_with_layer_bounds_*`, which live in `crown.rs`.
 
 use crate::layers::Layer;
 use ny_core::{GemmEngine, Result};
@@ -70,7 +69,7 @@ impl Network {
     /// 2. Initialize linear bounds at output: A = I, b = 0 (output = output)
     /// 3. Propagate backward through each layer using tighter intermediate bounds
     /// 4. Concretize final linear bounds using input bounds
-    /// 5. Intersect with forward bounds to ensure output is at least as tight as forward pass (#2990)
+    /// 5. Intersect with forward bounds to ensure output is at least as tight as forward pass
     pub fn propagate_crown(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
         self.propagate_crown_with_engine(input, None)
     }
@@ -84,13 +83,13 @@ impl Network {
         self.propagate_crown_with_engine_and_deadline(input, engine, None)
     }
 
-    /// CROWN backward propagation with optional deadline enforcement (#3328).
+    /// CROWN backward propagation with optional deadline enforcement.
     ///
     /// When `deadline` is `Some`, checks at the start of each backward layer
     /// iteration. If exceeded, falls back to IBP (always sound and cheap).
     /// O(layer_count) granularity — each check costs ~ns vs ~5-10s per layer.
     ///
-    /// GPU fast-path (#3397): when the engine supports [`GpuCrownBackward`] and all
+    /// GPU fast-path: when the engine supports [`GpuCrownBackward`] and all
     /// layers are GPU-supported (Linear + ReLU), the entire backward loop runs on GPU
     /// with A-matrices kept on device. Only the final concretized bounds are read back.
     pub fn propagate_crown_with_engine_and_deadline(
@@ -112,7 +111,7 @@ impl Network {
         self.propagate_crown_core(input, None, engine, deadline, crown_backward_layers)
     }
 
-    /// Propagate CROWN bounds using pre-computed per-layer IBP bounds (#3397).
+    /// Propagate CROWN bounds using pre-computed per-layer IBP bounds.
     ///
     /// Skips the internal IBP forward pass inside CROWN-IBP collection, saving
     /// ~59s for soundnessbench-scale models. The `precomputed_ibp` must have
@@ -154,11 +153,10 @@ impl Network {
         )
     }
 
-    /// CROWN-IBP: Run CROWN with IBP as the inner bound (#3043 dedup).
+    /// CROWN-IBP: Run CROWN with IBP as the inner bound.
     ///
-    /// Deduplicated in #3043 / #2535: the previous implementation was a copy of
-    /// `propagate_crown_with_engine` differing only in the engine parameter
-    /// and tracing labels. This duplication caused #2990 and #3037.
+    /// Delegates to `propagate_crown_with_engine`: a former separate copy that
+    /// differed only in the engine parameter and tracing labels caused bugs.
     #[inline]
     pub fn propagate_crown_ibp(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
         self.propagate_crown_with_engine(input, None)

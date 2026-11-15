@@ -237,7 +237,7 @@ fn direct_and_across_reshape_bn_folds_preserve_observable_values() {
 }
 
 /// Square weight (2x2) with transB=1: BN scales along axis 0 (rows).
-/// Without #2309 fix, this accidentally passed because axis 0 was the default.
+/// This passes even if transB is ignored, because axis 0 is the default.
 #[test]
 fn test_fold_batch_norm_into_gemm_square_weight_trans_b() {
     let mut gemm = make_node("Gemm", &["x", "gemm_w", "gemm_b"], &["gemm_y"]);
@@ -273,8 +273,8 @@ fn test_fold_batch_norm_into_gemm_square_weight_trans_b() {
 }
 
 /// Square weight (2x2) with transB=0: BN scales along axis 1 (columns).
-/// This is the case that #2309 fixed -- without the fix, axis 0 was used
-/// regardless of transB, producing wrong fused weights for square matrices.
+/// This is the discriminating case: using axis 0 regardless of transB would
+/// produce wrong fused weights for square matrices.
 #[test]
 fn test_fold_batch_norm_into_gemm_square_weight_no_trans_b() {
     let gemm = make_node("Gemm", &["x", "gemm_w", "gemm_b"], &["gemm_y"]);
@@ -312,7 +312,6 @@ fn test_fold_batch_norm_into_gemm_square_weight_no_trans_b() {
 /// Gemm with transA=1: fusion must be skipped because the BN fold equations
 /// assume standard (non-transposed) input layout. When transA=1, the matmul
 /// semantics change and the BN node must be retained for correct inference.
-/// Regression test for #2320.
 #[test]
 fn test_fold_batch_norm_skips_gemm_trans_a() {
     let mut gemm = make_node("Gemm", &["x", "gemm_w", "gemm_b"], &["gemm_y"]);
@@ -357,7 +356,6 @@ fn test_fold_batch_norm_skips_gemm_trans_a() {
 /// Gemm with alpha=2.0: fusion must be skipped because the BN fold equations
 /// assume alpha=1.0 (standard Y = A * B + C). When alpha!=1.0, the matmul
 /// output is scaled before BN sees it, producing incorrect fused weights.
-/// Regression test for #2319.
 #[test]
 fn test_fold_batch_norm_skips_gemm_non_default_alpha() {
     let mut gemm = make_node("Gemm", &["x", "gemm_w", "gemm_b"], &["gemm_y"]);
@@ -397,7 +395,6 @@ fn test_fold_batch_norm_skips_gemm_non_default_alpha() {
 /// Gemm with beta=0.5: fusion must be skipped because the BN fold equations
 /// assume beta=1.0. When beta!=1.0, the bias term C is pre-scaled, so
 /// fuse_bias would produce incorrect results.
-/// Regression test for #2319.
 #[test]
 fn test_fold_batch_norm_skips_gemm_non_default_beta() {
     let mut gemm = make_node("Gemm", &["x", "gemm_w", "gemm_b"], &["gemm_y"]);
@@ -564,7 +561,6 @@ fn test_fold_batch_norm_skips_shared_existing_bias() {
 /// BN node without explicit epsilon attribute: `batch_norm_epsilon()` should
 /// fall back to `DEFAULT_BATCH_NORM_EPSILON` (1e-5). The fused weights differ
 /// from epsilon=0 because denominator = sqrt(var + 1e-5) != sqrt(var).
-/// Regression test for #2321.
 #[test]
 fn test_fold_batch_norm_default_epsilon_fallback() {
     let conv = make_node("Conv", &["x", "conv_w"], &["conv_y"]);
@@ -606,7 +602,6 @@ fn test_fold_batch_norm_default_epsilon_fallback() {
 
 /// var=0, eps=0: denominator = sqrt(0) = 0.0. The `denominator <= 0.0` guard
 /// (batch_norm_fold.rs:196) should reject this, returning None and skipping fusion.
-/// Regression test for #2321.
 #[test]
 fn test_fold_batch_norm_var_zero_eps_zero_rejected() {
     let conv = make_node("Conv", &["x", "conv_w"], &["conv_y"]);
@@ -761,7 +756,7 @@ fn test_fold_batch_norm_skips_grouped_conv_transpose() {
         fold_batch_norm_into_conv_linear(&mut nodes, &mut weights)
     });
     assert!(consumed.is_empty(), "grouped ConvTranspose must not fold");
-    assert!(!nodes[1].output.is_empty());
+    assert_ne!((nodes[1].output).len(), 0);
 }
 
 /// NY_BN_FOLD_EXT=0 disables the ConvTranspose and Gemm->Reshape->BN folds but
@@ -943,7 +938,6 @@ fn test_fold_gemm_reshape_bn_guards_skip() {
 
 /// var=0, eps=1e-5: denominator = sqrt(0 + 1e-5) = sqrt(1e-5) > 0.
 /// Fusion should succeed because epsilon prevents the zero-denominator case.
-/// Regression test for #2321.
 #[test]
 fn test_fold_batch_norm_var_zero_eps_positive_succeeds() {
     let conv = make_node("Conv", &["x", "conv_w"], &["conv_y"]);

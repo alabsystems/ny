@@ -783,8 +783,6 @@ where
 /// * `relaxation_fn` - `(l, u) -> LinearRelaxation`
 ///
 /// Reference: alpha-beta-CROWN auto_LiRPA/operators/relu.py (Patches backward)
-/// Design: designs/2026-02-28-patches-mode-wrapper-enum-design.md Phase 2, Step 8
-/// Part of #2613
 pub(crate) fn crown_elementwise_backward_patches<F>(
     bounds: &PatchesLinearBounds,
     pre_activation: &BoundedTensor,
@@ -985,7 +983,6 @@ where
     }
 
     // Sparse patches: 4D (unstable_size, in_c, kH, kW). Delegate to sparse path.
-    // Part of #2613 Phase 4 step 19
     if lower_a_data.unstable_idx.is_some() {
         // Sparse carriers are refused by the finite-deadline validator and are
         // affine-only. Preserve their historical relaxation construction here;
@@ -1298,7 +1295,7 @@ where
         };
 
     // Create output patches and bias. Bias uses f64 to prevent catastrophic
-    // cancellation (#1745), matching the Dense path in crown_elementwise_backward_indexed.
+    // cancellation, matching the Dense path in crown_elementwise_backward_indexed.
     if POLL {
         poll()?;
     }
@@ -1369,7 +1366,7 @@ where
         bounds.upper_b.mapv(|x| x as f64)
     };
 
-    // Track non-finite rows for ±Inf fallback (#3009)
+    // Track non-finite rows for ±Inf fallback
     let mut lower_nonfinite = if let Some(admission) = anchored_admission.as_mut() {
         admission.zeroed(
             logical_rows,
@@ -1807,7 +1804,7 @@ where
         poll()?;
     }
 
-    // #3009: Non-finite row fallback for Patches activation CROWN backward.
+    // Non-finite row fallback for Patches activation CROWN backward.
     let mut lower_affected = 0usize;
     let mut upper_affected = 0usize;
     for (index, (&lower, &upper)) in lower_nonfinite
@@ -2072,7 +2069,7 @@ where
             // Err emission: f64 compute, one outward next_up_f32 at the f32
             // cast (spec I4). Non-finite (∞ overflow or NaN from ∞·0) emits
             // +INF — the degrade poison — NEVER NaN (spec I5). Nonfinite
-            // rows are zeroed + bias-poisoned by the #3009 fallback below, so
+            // rows are zeroed + bias-poisoned by the non-finite row fallback below, so
             // err 0.0 is exact there (vacuous certificate).
             let lterm = if oe_l != 0.0 {
                 proof_mul_nonnegative(oe_l, max_slope_sum)

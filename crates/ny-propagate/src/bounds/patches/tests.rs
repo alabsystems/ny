@@ -358,7 +358,7 @@ fn test_should_fallback_uses_area_crossover() {
     assert!(!pd_thin.should_fallback_to_dense());
 }
 
-/// Gate test (#2613): Patches mode uses dramatically less memory than Dense.
+/// Gate test: Patches mode uses dramatically less memory than Dense.
 #[test]
 fn test_patches_vs_dense_memory_savings_2613() {
     type CnnConfig<'a> = (

@@ -12,8 +12,11 @@ mod instance_norm;
 mod layer_norm;
 mod logsumexp;
 mod merge_linear;
+mod relu_pair_collapse;
 
-pub(super) use batch_norm_fold::fold_batch_norm_into_conv_linear_with_context;
+pub(super) use batch_norm_fold::{
+    enclosure_dropping_fold_applied, fold_batch_norm_into_conv_linear_with_context,
+};
 #[cfg(test)]
 pub(super) use batch_norm_fold::{fold_batch_norm_into_conv_linear, gemm_has_exact_default_affine};
 pub(super) use causal_softmax::try_fuse_causal_softmax;
@@ -23,6 +26,7 @@ pub(super) use instance_norm::try_discriminate_instance_norm;
 pub(super) use layer_norm::try_fuse_layer_norm;
 pub(super) use logsumexp::try_fuse_logsumexp;
 pub(super) use merge_linear::try_fuse_merge_linear;
+pub(super) use relu_pair_collapse::try_collapse_relu_pairs;
 
 #[cfg(test)]
 mod tests;

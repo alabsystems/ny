@@ -51,14 +51,10 @@ bab:
   branching:
     method: input
     candidates: 5
-    reduceop: max
   clip:
     relaxed: true
     relaxed_iterations: 20
   alpha_crown:
     lr_alpha: 0.2
-    iterations: 100
   beta_crown:
-    lr_alpha: 0.1
-    lr_beta: 0.15
     iterations: 25

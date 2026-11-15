@@ -45,7 +45,7 @@ fn tan_interval_has_asymptote(l: f32, u: f32) -> bool {
     k_start <= k_end
 }
 
-/// Directed rounding: compute in f64, apply next_down/next_up. (#3245)
+/// Directed rounding: compute in f64, apply next_down/next_up.
 fn tan_bound_interval(l: f32, u: f32) -> (f32, f32) {
     if tan_interval_has_asymptote(l, u) {
         return (f32::NEG_INFINITY, f32::INFINITY);
@@ -117,7 +117,6 @@ pub(super) fn tan_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
     }
     // Narrow-interval tangent with directed rounding.
     // Adds slope-error compensation matching trig_tangent_secant_relaxation (common.rs:64-70).
-    // Fixes: #3190 — slope truncation error was not compensated.
     if (u - l).abs() < 1e-8 {
         let tan_l = (l as f64).tan();
         let slope = tan_d_f64(l as f64);
@@ -270,7 +269,6 @@ impl TanLayer {
     }
 
     /// Patches CROWN backward propagation with pre-activation bounds.
-    /// Part of #2613 Phase 2: generic activation Patches support.
     pub(crate) fn propagate_patches_with_bounds(
         &self,
         bounds: &crate::bounds::patches::PatchesLinearBounds,

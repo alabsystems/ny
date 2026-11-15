@@ -777,11 +777,11 @@ fn test_reduce_min_crown_backward_scatter() {
     );
 }
 
-// ========== NaN propagation regression tests (#3318) ==========
+// ========== NaN propagation regression tests ==========
 //
 // These tests verify the defense-in-depth chain for NaN inputs:
 // 1. nan_propagating_max/min propagates NaN through the fold (instead of absorbing)
-// 2. BoundedTensor::new_repaired(Conservative) catches the NaN and widens to ±inf (#3423)
+// 2. BoundedTensor::new_repaired(Conservative) catches the NaN and widens to ±inf
 //
 // Before the fix, f32::max/min silently absorbed NaN, producing tight-but-wrong
 // bounds that passed BoundedTensor::new without any repair firing.
@@ -1080,7 +1080,7 @@ fn test_reduce_max_batched_crown_keepdims_false_rejected() {
     );
 }
 
-// ========== Out-of-range axis validation (regression for #1951) ==========
+// ========== Out-of-range axis validation (regression) ==========
 
 #[test]
 fn test_reduce_mean_negative_axis_out_of_range() {
@@ -1174,7 +1174,7 @@ fn test_reduce_sum_boundary_negative_axis() {
     assert_eq!(resolved, vec![0]);
 }
 
-// ========== Batched CROWN backward tests (#3221) ==========
+// ========== Batched CROWN backward tests ==========
 
 use crate::BatchedLinearBounds;
 

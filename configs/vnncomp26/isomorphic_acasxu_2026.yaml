@@ -4,7 +4,11 @@
 #
 # isomorphic_acasxu_2026 — VNN-COMP 2026 relational (dual-network) category.
 #
-# THIS PRESET CARRIES EXACTLY ONE KEY, AND IT IS A DEADLINE POLICY.
+# This category enables the measured original-tower search worker beside the
+# scored-wall deadline policy. Across the complete50original-budget sweep it
+# accepted26cases versus23for scheduling alone; all3new UNSAT conversions
+# repeated3/3against both the prior image and the same-image advice-off control.
+# See reports/measured-2026/paired-relational-composed-repeated-conversions-20261107.
 #
 # Relational categories deliberately bypass the YAML preset path for model and
 # solver SHAPE: they do not verify the preset's network, they build a DIFFERENCE
@@ -12,7 +16,12 @@
 # branching tuning describe a graph that is never constructed. That bypass is
 # correct and is left alone.
 #
-# A deadline policy is not a shape. The family's measured defect was caused
+# The attack flags select scoped scheduling and cached CPU point/VJP advice.
+# Proposals still pass the original dual-model/full-property witness gate;
+# proof results still come from the original shared-input difference graph.
+# Search draws, node/depth limits and original case budgets are unchanged.
+#
+# The deadline policy addresses the family's measured defect, caused
 # precisely by the deadline having no preset-reachable authority over it:
 #
 #   * the official per-instance budget is 100 s and the internal tier is 95 s;
@@ -40,3 +49,7 @@
 
 solver:
   scored_wall_clamp: true
+
+attack:
+  concurrent: true
+  relational_point_vjp: true

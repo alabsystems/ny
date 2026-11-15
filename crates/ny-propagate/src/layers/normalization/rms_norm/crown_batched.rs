@@ -8,8 +8,6 @@
 //! matching the alpha-beta-CROWN-style RmsNorm decomposition. `Sampling`
 //! remains the explicit opt-in heuristic path and still delegates to the
 //! shared batched CROWN infrastructure in [`super::super::crown_batched_common`].
-//!
-//! Reference: designs/2026-03-14-rmsnorm-shared-decomposed-crown.md
 
 use ny_core::{NyError, Result};
 use ny_tensor::BoundedTensor;
@@ -22,6 +20,7 @@ use crate::layers::normalization::decomposed::{
     InvRmsOverride,
 };
 use crate::layers::normalization::layer_norm::types::LayerNormCrownMode;
+use crate::layers::normalization::radial;
 use crate::BatchedLinearBounds;
 
 impl RmsNormLayer {
@@ -85,7 +84,7 @@ impl RmsNormLayer {
         }
 
         // IbpValidated: route directly through decomposed primitive-chain CROWN backward.
-        // The decomposed path operates on BatchedLinearBounds natively. Part of #3821.
+        // The decomposed path operates on BatchedLinearBounds natively.
         if self.crown_mode == LayerNormCrownMode::IbpValidated {
             // Per-group windows: batched `b` index == normalization group.
             let override_struct = inv_rms_override.and_then(|windows| {
@@ -109,7 +108,19 @@ impl RmsNormLayer {
                     decomposed_rms_norm_crown_backward(bounds, &self.ny, self.eps, pre_activation)?
                 }
             };
-            return Ok(result.bounds);
+            return if !self.forward_mode {
+                radial::refine_batched(
+                    bounds,
+                    result.bounds,
+                    pre_activation,
+                    &self.ny,
+                    None,
+                    self.eps,
+                    false,
+                )
+            } else {
+                Ok(result.bounds)
+            };
         }
 
         // Sampling: heuristic loop-over-batch-positions via scalar path

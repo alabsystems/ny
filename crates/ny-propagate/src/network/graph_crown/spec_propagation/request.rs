@@ -6,7 +6,7 @@
 //!
 //! Replaces the 24-function combinatorial wrapper surface with a single
 //! `SpecCrownRequest` builder that collects optional parameters and executes
-//! the core backward loop. Part of #4220 / #2622.
+//! the core backward loop.
 
 use crate::batched_domain::CachedLinearBounds;
 use crate::bounds::{GraphAlphaState, LinearBounds};
@@ -74,6 +74,14 @@ pub(crate) struct SpecCrownRequest<'a> {
     /// its ReLU node. Every facet is a proven superset half-space with `β_c ≥ 0`,
     /// so the injected margin lower bound stays sound (Invariant MN).
     mn_pool: Option<&'a crate::multineuron::MultiNeuronPool>,
+
+    /// #la-warm-frontier: when `Some` (the verifier's counters, handed over
+    /// only while `bab.la_warm_frontier` is armed) and a cache is captured,
+    /// every split-site node also records the rest of the backward state at
+    /// its pop, attached to the returned cache. `None` = byte-identical.
+    warm_frontier: Option<
+        &'a crate::beta_crown::engine::graph::propagation::warm_frontier::WarmFrontierCounters,
+    >,
 }
 
 impl<'a> SpecCrownRequest<'a> {
@@ -99,7 +107,20 @@ impl<'a> SpecCrownRequest<'a> {
             capture_linear_cache: false,
             wants_input_linear: false,
             mn_pool: None,
+            warm_frontier: None,
         }
+    }
+
+    /// #la-warm-frontier: record frontiers next to the captured cache (see the
+    /// field). Pass the verifier's counters only while the key is armed.
+    pub(crate) fn warm_frontier_opt(
+        mut self,
+        counters: Option<
+            &'a crate::beta_crown::engine::graph::propagation::warm_frontier::WarmFrontierCounters,
+        >,
+    ) -> Self {
+        self.warm_frontier = counters;
+        self
     }
 
     /// Attach a multi-neuron group-facet pool for §2.2 backward injection
@@ -250,6 +271,7 @@ impl<'a> SpecCrownRequest<'a> {
     /// multi-neuron pool) declines the request instead. Passing `None` for alpha
     /// to the ResNet extractor selects its fresh adaptive ReLU slopes.
     pub(crate) fn run_fresh_slope_sound_gpu_bounds_only(self) -> Result<Option<BoundedTensor>> {
+        self.graph.ensure_proof_eligible()?;
         let Some(node_bounds) = self.precomputed_node_bounds else {
             return Ok(None);
         };
@@ -300,6 +322,7 @@ impl<'a> SpecCrownRequest<'a> {
     /// row, certified node bounds, a mandatory private deadline, the dedicated
     /// call-local GPU API, and no cache/linear/fallback publication.
     pub(crate) fn run_alpha_sound_gpu_bounds_only(self) -> Result<Option<BoundedTensor>> {
+        self.graph.ensure_proof_eligible()?;
         let Some(node_bounds) = self.precomputed_node_bounds else {
             return Ok(None);
         };
@@ -364,6 +387,7 @@ impl<'a> SpecCrownRequest<'a> {
         self,
         skeleton: &ResnetSegmentSkeleton,
     ) -> Result<Option<DeadlineBoundedResnetRowsResult>> {
+        self.graph.ensure_proof_eligible()?;
         let Some(node_bounds) = self.precomputed_node_bounds else {
             return Ok(None);
         };
@@ -451,6 +475,7 @@ impl<'a> SpecCrownRequest<'a> {
             self.crown_backward_layers,
             self.wants_input_linear,
             self.mn_pool,
+            self.warm_frontier,
         )
     }
 }

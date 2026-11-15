@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Direct proof-coverage tests for batched/block-wise CROWN guard surfaces (#4280).
+//! Direct proof-coverage tests for batched/block-wise CROWN guard surfaces.
 
 use crate::*;
 use ndarray::{arr1, ArrayD, IxDyn};

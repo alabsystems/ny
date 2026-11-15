@@ -55,7 +55,7 @@ def create_simple_linear_model(weight: np.ndarray, bias: np.ndarray, name: str) 
 def run_ny_verify(model_path: str, epsilon: float = 0.01) -> dict:
     """Run ny verify and capture result."""
     cmd = [
-        "cargo", "run", "--release", "--bin", "ny", "--",
+        "targo", "--unverified", "run", "--release", "--bin", "ny", "--",
         "verify", model_path, "--epsilon", str(epsilon), "--json",
         "--strict", "--require-sound",
     ]

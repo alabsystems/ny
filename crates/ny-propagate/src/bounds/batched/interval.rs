@@ -169,7 +169,7 @@ pub fn batched_interval_matvec_checked(
 
     // Fast path: when all coefficients and inputs are finite, skip NaN/Inf/0*inf
     // checks in the inner loop. This eliminates per-element branch overhead and
-    // enables compiler auto-vectorization. (#2220 Packet B)
+    // enables compiler auto-vectorization.
     let all_finite = a_l_flat.iter().all(|v| v.is_finite())
         && a_u_flat.iter().all(|v| v.is_finite())
         && x_l_flat.iter().all(|v| v.is_finite())

@@ -16,12 +16,12 @@
 //! endpoint so the certificate does not depend on host FTZ state.
 //!
 //! References:
-//! - Issue #1863: f64 accumulation requirement
-//! - Issue #2164: directed-rounding finalization
 //! - `common.rs:170-175`: nonlinear path's equivalent precision standard
 
-use ndarray::Array1;
+use crate::amortise::{CooperativeWork, NoPoll, POLL_CHUNK_UNITS};
+use ndarray::{Array1, ArrayView1, ArrayView2, ArrayViewMut1};
 use ny_core::dd::{next_down_f64, next_up_f64};
+use ny_core::{NyError, Result};
 use ny_tensor::{next_down_f32, next_up_f32};
 
 const F64_FRACTION_BITS: u32 = 52;
@@ -63,14 +63,14 @@ pub(crate) fn f32_to_f64_exact(value: f32) -> f64 {
 }
 
 #[inline]
-fn binary32_min_normal_as_f64() -> f64 {
+pub(crate) fn binary32_min_normal_as_f64() -> f64 {
     f64::from_bits(((F64_EXPONENT_BIAS - 126) as u64) << F64_FRACTION_BITS)
 }
 
 /// Directed binary64-to-binary32 lower conversion that never publishes a
 /// subnormal binary32 endpoint.
 #[inline]
-fn f64_to_f32_down_no_subnormal(value: f64) -> f32 {
+pub(crate) fn f64_to_f32_down_no_subnormal(value: f64) -> f32 {
     if value.is_nan() || value == f64::NEG_INFINITY {
         return f32::NEG_INFINITY;
     }
@@ -107,7 +107,7 @@ fn f64_to_f32_down_no_subnormal(value: f64) -> f32 {
 /// Directed binary64-to-binary32 upper conversion that never publishes a
 /// subnormal binary32 endpoint.
 #[inline]
-fn f64_to_f32_up_no_subnormal(value: f64) -> f32 {
+pub(crate) fn f64_to_f32_up_no_subnormal(value: f64) -> f32 {
     if value.is_nan() || value == f64::INFINITY {
         return f32::INFINITY;
     }
@@ -218,6 +218,60 @@ pub(crate) fn add_coeff_err_bias_product_up(acc: f64, coeff_err: f32, bias: f32)
     add_f64_up(acc, err * bias_abs)
 }
 
+/// Bound the incoming coefficient-error contribution of a shared bias at ALL
+/// repeated positions. A flattened error column `pos * bias.len() + j` is
+/// multiplied by the bias of feature `j`, not only at position zero.
+///
+/// The caller observes its original authority before each bounded batch and
+/// on entry/return. No new deadline or budget is created. Shape errors can
+/// allocate diagnostics; this is not a complete allocator contract.
+pub(crate) fn sum_coeff_err_bias_up(
+    error: ArrayView2<'_, f32>,
+    row: usize,
+    bias: ArrayView1<'_, f32>,
+    positions: usize,
+    before: &mut impl FnMut(usize) -> Result<()>,
+) -> Result<f64> {
+    before(0)?;
+    before(64)?;
+    let columns = bias.len().checked_mul(positions).ok_or_else(|| {
+        NyError::InvalidSpec("Linear incoming-error bias layout overflows usize".into())
+    })?;
+    if row >= error.nrows() || error.ncols() != columns {
+        return Err(NyError::ShapeMismatch {
+            expected: vec![error.nrows().max(row.saturating_add(1)), columns],
+            got: vec![error.nrows(), error.ncols()],
+        });
+    }
+    let mut total = 0.0;
+    if columns != 0 {
+        const TERM_UNITS: usize = 32;
+        const TERMS: usize = POLL_CHUNK_UNITS / TERM_UNITS;
+        for pos in 0..positions {
+            let start = pos * bias.len();
+            let mut j = 0;
+            while j < bias.len() {
+                let count = (bias.len() - j).min(TERMS);
+                before(count * TERM_UNITS)?;
+                for index in j..j + count {
+                    total = add_coeff_err_bias_product_up(
+                        total,
+                        error[[row, start + index]],
+                        bias[index],
+                    );
+                }
+                j += count;
+            }
+        }
+    }
+    before(0)?;
+    Ok(total)
+}
+
+#[cfg(test)]
+#[path = "bias/sequence_error_tests.rs"]
+mod sequence_error_tests;
+
 /// Parameters for one position block of bias accumulation.
 pub(crate) struct BiasBlockParams {
     /// Number of output rows in the A matrix.
@@ -234,7 +288,7 @@ pub(crate) struct BiasBlockParams {
 ///   `accum.0[i] += sum_j A_lower[i, offset+j] * bias[j]`  (lower)
 ///   `accum.1[i] += sum_j A_upper[i, offset+j] * bias[j]`  (upper)
 ///
-/// All arithmetic is in f64 to prevent catastrophic cancellation (#1863).
+/// All arithmetic is in f64 to prevent catastrophic cancellation.
 pub(crate) fn accumulate_bias_f64(
     accum: &mut (&mut [f64], &mut [f64]),
     lower_a_val: impl Fn(usize, usize) -> f32,
@@ -242,8 +296,28 @@ pub(crate) fn accumulate_bias_f64(
     bias: &Array1<f32>,
     block: &BiasBlockParams,
 ) {
+    accumulate_bias_f64_with_work(accum, lower_a_val, upper_a_val, bias, block, &mut NoPoll)
+        .expect("NoPoll cannot refuse a fixed bias work batch");
+}
+
+/// Same ordered arithmetic, with the caller's cooperative authority. Output is
+/// private scratch and MUST be discarded on refusal. Each pair of f64 MACs,
+/// conversions and accumulator accesses is priced at 32 f32-equivalent units.
+pub(crate) fn accumulate_bias_f64_with_work<P: CooperativeWork>(
+    accum: &mut (&mut [f64], &mut [f64]),
+    lower_a_val: impl Fn(usize, usize) -> f32,
+    upper_a_val: impl Fn(usize, usize) -> f32,
+    bias: &Array1<f32>,
+    block: &BiasBlockParams,
+    poll: &mut P,
+) -> Result<()> {
+    poll.checkpoint()?;
+    if block.out_features == 0 {
+        return poll.checkpoint();
+    }
     for i in 0..block.num_outputs {
         for j in 0..block.out_features {
+            poll.before(32)?;
             let col = block.col_offset + j;
             let bias_value = f32_to_f64_exact(bias[j]);
             let lower_term = f32_to_f64_exact(lower_a_val(i, col)) * bias_value;
@@ -252,6 +326,46 @@ pub(crate) fn accumulate_bias_f64(
             accum.1[i] = add_f64_up(accum.1[i], upper_term);
         }
     }
+    poll.checkpoint()
+}
+
+#[inline]
+fn finalize_lower_bias(old: f32, accum: f64) -> f32 {
+    f64_to_f32_down_no_subnormal(add_f64_down(f32_to_f64_exact(old), accum))
+}
+
+#[inline]
+fn finalize_upper_bias(old: f32, accum: f64) -> f32 {
+    f64_to_f32_up_no_subnormal(add_f64_up(f32_to_f64_exact(old), accum))
+}
+
+/// Finalize into fixed-shape caller-owned storage, including strided views.
+/// Allocation and lifetime accounting remain the caller's responsibility.
+/// This shares the scalar arithmetic with the historical allocating helper;
+/// no partial output may be published after an error.
+pub(crate) fn finalize_bias_directed_into<P: CooperativeWork>(
+    lower_accum: ArrayView1<'_, f64>,
+    upper_accum: ArrayView1<'_, f64>,
+    old_lower_b: ArrayView1<'_, f32>,
+    old_upper_b: ArrayView1<'_, f32>,
+    mut lower_b: ArrayViewMut1<'_, f32>,
+    mut upper_b: ArrayViewMut1<'_, f32>,
+    poll: &mut P,
+) -> Result<()> {
+    poll.checkpoint()?;
+    assert_eq!(lower_accum.len(), old_lower_b.len());
+    assert_eq!(upper_accum.len(), old_upper_b.len());
+    assert_eq!(lower_b.len(), old_lower_b.len());
+    assert_eq!(upper_b.len(), old_upper_b.len());
+    for i in 0..old_lower_b.len() {
+        poll.before(16)?;
+        lower_b[i] = finalize_lower_bias(old_lower_b[i], lower_accum[i]);
+    }
+    for i in 0..old_upper_b.len() {
+        poll.before(16)?;
+        upper_b[i] = finalize_upper_bias(old_upper_b[i], upper_accum[i]);
+    }
+    poll.checkpoint()
 }
 
 /// Finalize bias accumulators with directed rounding.
@@ -272,16 +386,17 @@ pub(crate) fn finalize_bias_directed(
     assert_eq!(upper_accum.len(), old_upper_b.len());
     (
         Array1::from_shape_fn(old_lower_b.len(), |i| {
-            f64_to_f32_down_no_subnormal(add_f64_down(
-                f32_to_f64_exact(old_lower_b[i]),
-                lower_accum[i],
-            ))
+            finalize_lower_bias(old_lower_b[i], lower_accum[i])
         }),
         Array1::from_shape_fn(old_upper_b.len(), |i| {
-            f64_to_f32_up_no_subnormal(add_f64_up(f32_to_f64_exact(old_upper_b[i]), upper_accum[i]))
+            finalize_upper_bias(old_upper_b[i], upper_accum[i])
         }),
     )
 }
+
+#[cfg(test)]
+#[path = "bias/cooperative_tests.rs"]
+mod cooperative_tests;
 
 #[cfg(test)]
 mod tests {

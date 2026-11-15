@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Multi-dimensional scalar RMSNorm CROWN regressions.
-//!
-//! Part of #4148.
 
 use ndarray::{arr1, arr2, Array1, ArrayD, IxDyn};
 use ny_core::Result;
@@ -12,9 +10,7 @@ use ny_tensor::BoundedTensor;
 use proptest::prelude::*;
 
 use super::types::RmsNormLayer;
-use crate::layers::normalization::decomposed::{
-    batched_bounds_to_scalar_multi_dim, scalar_bounds_to_batched_multi_dim,
-};
+use crate::layers::normalization::decomposed::scalar_bounds_to_batched_multi_dim;
 use crate::layers::normalization::LayerNormCrownMode;
 use crate::LinearBounds;
 
@@ -96,8 +92,11 @@ fn test_crown_scalar_multi_dim_rmsnorm_matches_batched_4148() -> Result<()> {
     let reshaped = pre_act.reshape(&[batch_size, norm_size])?;
     let batched_bounds = scalar_bounds_to_batched_multi_dim(&bounds, batch_size, norm_size)?;
     let expected = layer.propagate_linear_batched_with_bounds(&batched_bounds, &reshaped)?;
-    let expected_scalar =
-        batched_bounds_to_scalar_multi_dim(&expected, bounds.lower_b(), bounds.upper_b())?;
+    let expected_scalar = crate::layers::normalization::radial::batched_to_scalar_multi(
+        &expected,
+        bounds.lower_b(),
+        bounds.upper_b(),
+    )?;
 
     assert_eq!(actual.lower_a(), expected_scalar.lower_a());
     assert_eq!(actual.lower_b(), expected_scalar.lower_b());

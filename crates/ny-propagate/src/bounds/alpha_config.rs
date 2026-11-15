@@ -8,7 +8,7 @@
 //! intermediate storage types (`AlphaCrownIntermediate`, `GraphAlphaCrownIntermediate`),
 //! and supporting enums (`GradientMethod`, `MultiSpecKeep`).
 //!
-//! Extracted from `alpha.rs` per #2201 to keep alpha state logic under 900 LOC.
+//! Extracted from the alpha module to keep alpha state logic under 900 LOC.
 
 use super::LinearBounds;
 use crate::invprop::{InvpropConfig, OutputConstraints};
@@ -93,7 +93,7 @@ impl AlphaSpecEarlyExit {
 
     /// True when the projected scalar bounds already prove the property. Mirrors
     /// `BetaCrownConfig::domain_is_verified_for_mode` exactly (rejects all
-    /// non-finite inputs; #2993). Used by the warmup loop to break early.
+    /// non-finite inputs). Used by the warmup loop to break early.
     #[must_use]
     pub fn is_verified(&self, lower: f32, upper: f32) -> bool {
         if !lower.is_finite() || !upper.is_finite() || lower > upper || !self.threshold.is_finite()
@@ -302,7 +302,6 @@ pub struct GraphAlphaCrownIntermediate {
     /// Alpha gradients at each ReLU node, keyed by node name.
     /// Each entry is ∂(lower_bound)/∂α for each neuron at that ReLU.
     /// Populated when alpha state is provided during the backward pass.
-    /// Issue: #1841
     pub alpha_gradients: std::collections::HashMap<String, Array1<f32>>,
 
     /// Upper-path alpha gradients at each ReLU node, keyed by node name.
@@ -314,6 +313,14 @@ pub struct GraphAlphaCrownIntermediate {
     /// Patches gate. Kept private so general graph-alpha consumers cannot mistake
     /// a partial matrix for the historical full `a_at_relu` relation.
     beta_sparse_a_at_relu: std::collections::HashMap<String, GraphBetaSparseA>,
+
+    /// #vit-margin-alpha (B4): the incoming LOWER coefficient rows at every
+    /// α-bearing bilinear node (`BilinearCrown` or var×var `MatMul`), keyed by
+    /// node name, shape `(num_outputs, num_bilinear_outputs)`. Populated ONLY
+    /// by the spec-row exact-seed walk of the certified margin ascent, which
+    /// differentiates its interpolated McCormick planes against these rows;
+    /// every other walk leaves it empty, so no existing caller changes.
+    pub(crate) a_at_bilinear: std::collections::HashMap<String, Array2<f32>>,
 }
 
 impl GraphAlphaCrownIntermediate {
@@ -326,6 +333,7 @@ impl GraphAlphaCrownIntermediate {
             alpha_gradients: std::collections::HashMap::new(),
             alpha_gradients_upper: std::collections::HashMap::new(),
             beta_sparse_a_at_relu: std::collections::HashMap::new(),
+            a_at_bilinear: std::collections::HashMap::new(),
         }
     }
 
@@ -370,6 +378,11 @@ impl GraphAlphaCrownIntermediate {
                         .saturating_mul(size_of::<usize>()),
                 )
                 .saturating_add(sparse.values.len().saturating_mul(size_of::<f32>()));
+        }
+        for (key, values) in &self.a_at_bilinear {
+            bytes = bytes
+                .saturating_add(key.len())
+                .saturating_add(values.len().saturating_mul(size_of::<f32>()));
         }
         bytes
     }
@@ -490,6 +503,77 @@ impl AdamParams {
     }
 }
 
+/// `#cgan-child-zono` (default-dark): certified per-child DeepZ zonotope
+/// intermediates for the input-split deferred rebound
+/// (`bab.alpha_crown.cgan_child_zono_refresh`).
+///
+/// When `enabled`, every deferred child of the input-split BaB gets a
+/// certified binary64 zonotope pass over ITS OWN box (the shared
+/// `crate::zono_core` engine), each ReLU's pre-activation box intersected with
+/// the inherited map (root CROWN map, then the domain's own override) before
+/// DeepZ picks its slope. The resulting pre-activation boxes are merged
+/// shrink-only into the map the batched CROWN rebound and the fresh
+/// exact-domain clip consume. `enabled: false` (the default) is byte-identical
+/// to the historical lane: the prepass does no work and prints nothing.
+///
+/// SOUNDNESS. The child box is a sub-box of the root box, so the root map and
+/// the child's own zonotope both enclose the child's reachable set, and so
+/// does their intersection; DeepZ's identity holds for any valid enclosure.
+/// Every rounding and the BatchNorm coefficient error is charged; any
+/// refusal, NaN or deadline leaves the domain on its previous map.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CganChildZonoRefreshConfig {
+    /// Arm the per-child zonotope refresh.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Generator budget per child; rows beyond it fold (soundly) into the
+    /// remainder. Default 16384: Z1 measured a 1024 cap costing 83 leaves
+    /// instead of 15 on row 7 and never saw more than 4,153 generators, so the
+    /// default must not bind. `0` is refused, never read as "unlimited".
+    #[serde(default = "CganChildZonoRefreshConfig::default_max_generators")]
+    pub max_generators: u32,
+    /// Per-child wall budget in seconds. `None`: bounded only by the BaB
+    /// deadline. Expiry refuses that child (it keeps its previous map).
+    #[serde(default)]
+    pub max_secs: Option<f32>,
+}
+
+impl CganChildZonoRefreshConfig {
+    /// The default generator budget (Z1 §3.3 item 3).
+    pub const DEFAULT_MAX_GENERATORS: u32 = 16_384;
+    /// Smallest admissible generator budget.
+    pub const MIN_MAX_GENERATORS: u32 = 8;
+    /// Largest admissible generator budget.
+    pub const MAX_MAX_GENERATORS: u32 = 1 << 20;
+
+    const fn default_max_generators() -> u32 {
+        Self::DEFAULT_MAX_GENERATORS
+    }
+
+    /// Whether a configured generator budget is admissible.
+    #[must_use]
+    pub fn max_generators_is_valid(value: u32) -> bool {
+        (Self::MIN_MAX_GENERATORS..=Self::MAX_MAX_GENERATORS).contains(&value)
+    }
+
+    /// Whether a configured per-child budget is admissible (finite, positive).
+    #[must_use]
+    pub fn max_secs_is_valid(value: f32) -> bool {
+        value.is_finite() && value > 0.0
+    }
+}
+
+impl Default for CganChildZonoRefreshConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_generators: Self::DEFAULT_MAX_GENERATORS,
+            max_secs: None,
+        }
+    }
+}
+
 /// Optimizer type for alpha parameter updates.
 ///
 /// Ported from α,β-CROWN's proven configurations:
@@ -513,8 +597,15 @@ pub enum MultiSpecKeep {
     All,
 }
 
+/// abc's `minimum_sparsity` default (`backward_bound.py:580-589`), which is
+/// also the fraction the `NY_CROWN_IBP_SPARSE_RELU_ROWS` route has always
+/// applied. Keeping it as the serde default makes an unset key byte-identical.
+const fn default_cgan_unstable_rows_max_frac() -> f32 {
+    0.9
+}
+
 /// Serde default for `early_stop_patience` field (backward compat with configs
-/// serialized before #3298).
+/// serialized before the field was added).
 fn default_early_stop_patience() -> usize {
     10
 }
@@ -611,6 +702,97 @@ pub struct AlphaCrownConfig {
     /// the complete cascade needed by the cGAN root certificate.
     #[serde(default)]
     pub cgan_complete_crown_ibp_root: bool,
+    /// Publish the complete cGAN root cascade map to the input-split BaB under
+    /// `bound_prop_method: crown` (`#crown-root-map`).
+    ///
+    /// [`Self::cgan_complete_crown_ibp_root`] names the collector; this key
+    /// names a CONSUMER. The input-split root collector selects its arm by
+    /// `bound_prop_method` alone, and its `crown` arm historically returned no
+    /// intermediate map at all, so on the shipped cgan lane (`crown`) the
+    /// cascade that every cgan yaml arms was consulted by nothing: the BaB
+    /// children bounded on IBP/forward-linear intermediates (measured
+    /// 2026-09-10, `root_node_bounds=None`, root margin -5.8945 against abc's
+    /// plain-CROWN -0.0034 on the same row). When set, the `crown` arm runs the
+    /// same reference collector the alpha arm runs and publishes its map (no
+    /// alpha state) — but only when BOTH publication guards hold
+    /// (`input_split_ibp_enhancement` and `input_split_stacked_rebound`, see
+    /// `#root-map-two-guards`), only when the graph is typed-cGAN eligible,
+    /// and only when the collector reports the typed cascade as its actual
+    /// source. Anything else declines to the historical `(None, None)`.
+    ///
+    /// SOUNDNESS. The published map is the certified forward-linear baseline
+    /// intersected shrink-only with the CROWN-IBP cascade; under the two
+    /// guards every consumer MERGES it with its own per-domain bounds, so it
+    /// can only tighten. Default-dark until a sealed official-budget row
+    /// measures it.
+    #[serde(default)]
+    pub cgan_crown_root_map: bool,
+    /// Run the typed cGAN CROWN-IBP root cascade in DENSE (matrix) conv mode
+    /// (`#cgan-collector-dense`, experiment E5; default-dark).
+    ///
+    /// The collector historically forces Patches for spatial conv targets on
+    /// BOTH of its routes: the graph-native loop ORs
+    /// `collector_patches_override` into the `use_patches_mode` gate
+    /// (`target_backward_patches.rs`), and the sequential linear-chain
+    /// shortcut (`network/ibp/crown_ibp.rs`) has no conv-mode input at all.
+    /// So `conv_mode: matrix` never reached intermediate-bound collection
+    /// (measured 2026-09-10 on cgan_2023 nCh_3 prop_0: the cascade's own
+    /// CROWN was looser than the forward-linear baseline on ~125k of ~155k
+    /// elements while the generator's unstable counts matched abc exactly).
+    /// When set, the cascade (a) declines the sequential shortcut, (b) passes
+    /// `collector_patches_override=false` to every target walk, and (c) does
+    /// not let the forward-linear MAC proxy refuse a walk upfront, so on a
+    /// `conv_mode: matrix` graph every conv backward is the dense A-matrix
+    /// product alpha-beta-CROWN runs. Cost, not soundness: dense and patches
+    /// are two evaluations of the same linear relaxation. Observable:
+    /// `[collector-mode] cgan_collector_dense=… patches_override=…
+    /// use_patches_mode=…`, once per typed cascade, armed or not.
+    #[serde(default)]
+    pub cgan_collector_dense: bool,
+    /// `#cgan-unstable-rows` (default-dark): inside the typed, shrink-only
+    /// cGAN root cascade, seed each demanded ReLU-preactivation target's CROWN
+    /// backward with ONLY the rows that the certified forward-linear baseline
+    /// leaves sign-unstable (`l < 0 < u`) or unresolved, instead of the full
+    /// `[dim x dim]` identity.
+    ///
+    /// This is alpha-beta-CROWN's `sparse_intermediate_bounds`
+    /// (`auto_LiRPA/backward_bound.py:568-604` builds the one-hot C over
+    /// `get_unstable_locations`' index set; `bound_general.py:1097-1126`
+    /// supplies the reference). The mechanism already exists in this collector
+    /// — it was reachable only through the raw `NY_CROWN_IBP_SPARSE_RELU_ROWS`
+    /// environment variable, which `vnncomp_scripts/run_instance.sh` never
+    /// exports, so it could not fire in competition. This key is the typed
+    /// delivery of the same bool; the environment variable still wins.
+    ///
+    /// SOUNDNESS: cost, not authority. Omitted rows keep the certified
+    /// forward-linear enclosure the cascade was seeded with, selected rows are
+    /// `baseline ∩ CROWN_row` from the same `run_target_backward_pass` the
+    /// full-width walk uses, and any disjoint element rejects the whole target
+    /// and retains the baseline. A wrong row mask therefore yields a LOOSER
+    /// map, never an unsound one. Eligibility is restricted to targets whose
+    /// every bound-demanding consumer is a ReLU (`demand.rs`), whose
+    /// relaxation is magnitude-independent for a sign-stable row — abc's own
+    /// admissibility condition (`bound_general.py:1102-1104`).
+    ///
+    /// Masked by `CrownIbpCollectionMode::requires_shrink_only_publication()`,
+    /// so an ordinary (Standard) collection is byte-identical with the key set.
+    /// Observable, armed or not: `[unstable-rows] root armed=… source=…`.
+    #[serde(default)]
+    pub cgan_unstable_rows: bool,
+    /// Maximum fraction of a target's rows that may be selected before
+    /// `cgan_unstable_rows` gives up on sparsity for that target and takes the
+    /// existing full-width/chunked walk.
+    ///
+    /// Default `0.9` — alpha-beta-CROWN's `minimum_sparsity`
+    /// (`backward_bound.py:580-589`), and the value the environment route has
+    /// always used. Stored to the collection policy as integer per mille, so
+    /// `0.9` reproduces the historical `selected * 10 <= total * 9` predicate
+    /// exactly and cache identity never compares floats. Clamped to `[0, 1]`.
+    ///
+    /// SCHEDULING ONLY: it decides whether a target is walked sparsely or
+    /// densely, never what is written to a row.
+    #[serde(default = "default_cgan_unstable_rows_max_frac")]
+    pub cgan_unstable_rows_max_frac: f32,
     /// Row ceiling for demanded CROWN targets inside the complete cGAN root
     /// cascade (`#cgan-narrow-target-budget`).
     ///
@@ -632,6 +814,86 @@ pub struct AlphaCrownConfig {
     /// root over-approximation is actually manufactured.
     #[serde(default)]
     pub cgan_narrow_target_max_rows: Option<usize>,
+    /// Per-child wall budget, in seconds, for CHILD-SIDE intermediate
+    /// refinement (`#cgan-child-interm-refine`).
+    ///
+    /// `None` (default) is today's behaviour exactly: the complete cGAN
+    /// cascade is root-only, and every BaB child is bounded against the frozen
+    /// ROOT intermediate map plus the objective backward pass.
+    ///
+    /// When set — and only when `cgan_complete_crown_ibp_root` is also armed,
+    /// so a child can never enter a lane its root did not — each deferred child
+    /// re-runs the cascade on ITS OWN box under this wall, and the resulting
+    /// map is intersected into that child's intermediate bounds.
+    ///
+    /// The budget is deliberately the ONLY dial, and it is deliberately not
+    /// optional: an unbounded per-child cascade is the O(N^2) pass that
+    /// `fix_interm_bounds = true` exists to avoid, so arming the lane without
+    /// saying what it may spend is not representable.
+    ///
+    /// SOUNDNESS. This selects a different sound enclosure, never a looser
+    /// relaxation. The cascade is the same collector the root lane ships, run
+    /// on the child's box: a certified forward-linear seed plus a shrink-only
+    /// CROWN pass over it. Spending less time can only make the collector
+    /// salvage back to that seed — the bound the dark path would have
+    /// published anyway — so the budget is verdict-neutral in both directions.
+    #[serde(default)]
+    pub cgan_child_interm_refine_max_secs: Option<f64>,
+    /// `#cgan-child-seed` (default-dark): seed each child cascade's certified
+    /// forward-linear baseline with the domain's INHERITED intermediate map —
+    /// the frozen root CROWN map intersected with any child-local override
+    /// the domain already carries — before the shrink-only CROWN cascade runs.
+    ///
+    /// Only meaningful while `cgan_child_interm_refine_max_secs` is armed (the
+    /// prepass it modifies does not exist otherwise). `false` is today's
+    /// behaviour exactly: the child cascade starts from the forward-linear map
+    /// on its own box, so the sparse ReLU-row selector walks every row the
+    /// (roughly ten times looser) forward-linear seed leaves unstable in the
+    /// discriminator, rather than the rows the root CROWN map leaves unstable.
+    ///
+    /// SOUNDNESS. Intersection of certified enclosures of the SAME reachable
+    /// set: the root map encloses the root box's image, and the root box
+    /// contains the child box; a child-local override is, by its own contract,
+    /// an enclosure of the child box's image; the forward-linear baseline is
+    /// computed on the child box itself. The intersection therefore still
+    /// contains the child's reachable set, and the cascade only ever shrinks
+    /// its baseline. Any node whose seed entry is shape-mismatched, NaN, or
+    /// disjoint from the baseline in any element keeps its baseline entry
+    /// untouched (fail closed), and no node absent from the baseline is added.
+    #[serde(default)]
+    pub cgan_child_interm_refine_seed_from_parent: bool,
+    /// `#cgan-child-seed` (default-dark): run up to this many child cascades
+    /// of one deferred batch CONCURRENTLY. `0` and `1` are the serial
+    /// reference, i.e. today's behaviour.
+    ///
+    /// Scheduling only: every child's map is a pure function of its own box,
+    /// the shared config and the domain's inherited map, and results are
+    /// applied in the original domain order, so concurrency cannot change what
+    /// is published (bit-identical to serial whenever no deadline or memory
+    /// budget binds). The requested width is only a CEILING: each tranche is
+    /// re-admitted against a per-worker RSS estimate, the live process memory
+    /// headroom (which on Linux includes `MemAvailable` even with no cgroup,
+    /// i.e. the competition configuration), and an absolute byte cap; an
+    /// unobservable headroom runs serially.
+    #[serde(default)]
+    pub cgan_child_interm_refine_parallel: usize,
+    /// `#cgan-child-seed` (default-dark): hand a popped domain's own refined
+    /// intermediate map to the fresh exact-domain clip (`process_batch.rs`),
+    /// which otherwise recomputes its planes against the frozen root map only.
+    ///
+    /// Only meaningful while `cgan_child_interm_refine_max_secs` is armed: the
+    /// deferred rebound then keeps the child-local map it just consumed on the
+    /// domain until the clip takes it. The map is an enclosure of that domain's
+    /// box (see `cgan_child_interm_refine_seed_from_parent`), and the clip's
+    /// bounder intersects it with the root map and fresh IBP exactly as the
+    /// rebound did, so the planes it builds are valid on the domain box.
+    #[serde(default)]
+    pub cgan_child_interm_refine_fresh_clip_map: bool,
+    /// `#cgan-child-zono` (default-dark): certified per-child zonotope
+    /// intermediates for the input-split deferred rebound and the fresh clip.
+    /// See [`CganChildZonoRefreshConfig`].
+    #[serde(default)]
+    pub cgan_child_zono_refresh: CganChildZonoRefreshConfig,
     /// Sparse alpha optimization: only optimize the top K% most influential alphas.
     ///
     /// After the first iteration, alphas are ranked by gradient magnitude and only
@@ -651,7 +913,7 @@ pub struct AlphaCrownConfig {
     /// on patience-based early stopping (`early_stop_patience`) to terminate when
     /// optimization stalls. With the threshold at 20, adaptive skip silently prevented
     /// α-CROWN from running on production graph models (HTDemucs, Whisper, Kokoro, etc.),
-    /// causing CROWN bounds identical to IBP (#3918).
+    /// causing CROWN bounds identical to IBP.
     pub adaptive_skip: bool,
     /// Depth threshold for adaptive skipping.
     ///
@@ -659,7 +921,7 @@ pub struct AlphaCrownConfig {
     /// if `adaptive_skip` is enabled. This threshold is retained for explicit opt-in
     /// uses of the heuristic even though the default configuration disables it.
     ///
-    /// Default: 20 (raised from 8 for medium-depth DAGs, #3619)
+    /// Default: 20 (raised from 8 for medium-depth DAGs)
     pub adaptive_skip_depth_threshold: usize,
     /// Run a pilot iteration to check if α-CROWN helps before full optimization.
     ///
@@ -668,7 +930,7 @@ pub struct AlphaCrownConfig {
     /// remaining iterations.
     ///
     /// This catches cases where depth isn't the only factor (e.g., already tight bounds).
-    /// Default: false (#3298 — pilot exits too early for deep DAG networks)
+    /// Default: false (pilot exits too early for deep DAG networks)
     pub adaptive_skip_pilot: bool,
     /// Minimum improvement required from pilot iteration to continue optimization.
     ///
@@ -771,7 +1033,7 @@ pub struct AlphaCrownConfig {
     /// alpha parameter. When false, alphas are shared across the spatial
     /// (channel) dimension, dramatically reducing the number of alpha parameters
     /// for large conv layers. The reference α,β-CROWN cifar100 config sets this
-    /// to false — without it, conv alpha count is ~63x too high (#4404).
+    /// to false — without it, conv alpha count is ~63x too high.
     ///
     /// Default: true (preserves current per-neuron behavior until channel-shared
     /// layout is activated in later slices).
@@ -864,6 +1126,13 @@ pub struct AlphaCrownConfig {
     /// validity. The real risk is SCHEDULE — the rule adds a point-forward pass
     /// per iteration — which is why this is a per-benchmark key rather than a
     /// compiled default.
+    ///
+    /// READERS (#alpha-envelope-grad-cpu): the GPU warmup/rescale sites AND the
+    /// CPU chain-rule gradient on both the DAG lane (AnalyticChain replay) and
+    /// the sequential lane. The CPU sites used to resolve env-only, so this
+    /// field was dark on every graph ascent that does not take the GPU warmup
+    /// lane; arrival is now printed as `[alpha-envelope-grad] cpu=1 ...
+    /// source=config`.
     #[serde(default)]
     pub alpha_envelope_grad: bool,
 
@@ -900,7 +1169,7 @@ pub struct AlphaCrownConfig {
     #[serde(skip)]
     pub skip_zero_iteration_collection_initial_bound: bool,
 
-    /// Wall-clock deadline for alpha optimization (#2698).
+    /// Wall-clock deadline for alpha optimization.
     ///
     /// When set, the optimization loop checks this deadline at the start of each
     /// iteration and returns current best bounds if exceeded. This prevents
@@ -952,6 +1221,169 @@ pub struct AlphaCrownConfig {
     /// `None`, so a config that never names it is byte-identical.
     #[serde(default)]
     pub alpha_zero_yield_frac: Option<f64>,
+
+    /// #inert-ascent-exit (typed key `bab.alpha_crown.inert_ascent_exit_iters`): retire the DAG
+    /// α ascent after this many CONSECUTIVE iterations whose best improvement was EXACTLY zero
+    /// — the iterate never beat the best, so the frame is not moving (an IBP-grade root, an
+    /// α family with nothing to move). The historical `early_stop_patience` rule (10
+    /// iterations below `tolerance`) keeps running alongside; whichever fires first wins.
+    ///
+    /// Sound by construction: the exit takes the same `should_save_best` route as ordinary
+    /// convergence and returns the already-certified elementwise best. Stopping sooner can
+    /// return a looser certified enclosure; it cannot manufacture an invalid bound.
+    ///
+    /// Valid values are `>= 1`; `Some(0)` is treated as unset. Default `None`, so a config
+    /// that never names it is byte-identical (`propagate_dag::ascent_patience_exit`).
+    #[serde(default)]
+    pub inert_ascent_exit_iters: Option<usize>,
+
+    /// #vit-crown-interm (typed key `solver.alpha-crown.crown_ibp_reference_cap_secs`):
+    /// wall cap, in whole seconds, on the `fix_interm_bounds = false` reference route.
+    ///
+    /// The typed `fix_interm_bounds: false` route collects a per-node CROWN-IBP
+    /// reference map before the DAG alpha loop (`bounds/alpha.rs`), may collect it a
+    /// second time after the loop, and then runs a full all-node alpha pass. On
+    /// vit_2023 `ibp_3_3_8` one uncapped collection cost 46-50 s of the 100 s budget
+    /// and turned a row plain IBP decides in ~10 s (`ibp_3_3_8_7322`) into a timeout
+    /// (`docs/VIT_INTERM_FLOOR_CONVERSION_2026-08-08.md` §5). Setting this key bounds
+    /// the route's cost in three places, and ONLY on that route
+    /// (`fix_interm_bounds = false`; a config with `true` — which every input-split
+    /// warm-start child is forced to — resolves no cap and is inert):
+    ///
+    /// 1. the reference collection's CROWN tightening sweep gets this cap
+    ///    (`CrownIbpCollectOptions::tightening_cap`): targets it does not finish KEEP
+    ///    their certified IBP box, finished ones keep their CROWN∩IBP box, and the map
+    ///    is always complete — the cap can never error the root out;
+    /// 2. the DAG loop's pre-loop initial bound and the post-loop publication reuse
+    ///    that map (the optimizer's shrink-only artifact) instead of re-collecting it
+    ///    under a possibly expired alpha deadline, which would publish plain IBP;
+    /// 3. the post-loop all-node alpha pass stops after this many seconds and fills
+    ///    every node it did not reach from that same reference map.
+    ///
+    /// SOUND by construction: every published node box is either a completed CROWN
+    /// enclosure intersected with its certified IBP box, or that IBP box. The cap only
+    /// decides how many targets get the tighter of the two.
+    ///
+    /// A present `NY_CROWN_IBP_COLLECTOR_CAP_SECS` still wins for step 1 (the existing
+    /// research override). Valid values are `1..=3600`; the preset loader rejects
+    /// anything else and [`Self::crown_ibp_reference_cap`] ignores it fail-closed.
+    /// Default `None`, so a config that never names it is byte-identical.
+    #[serde(default)]
+    pub crown_ibp_reference_cap_secs: Option<u64>,
+
+    /// #vit-margin-alpha (B1–B3): typed form of the former env-only
+    /// `NY_ROOT_ALPHA_MARGIN_GRADIENT` child gate (lever
+    /// `ny_levers::decls::root_alpha::ROOT_ALPHA_MARGIN_GRADIENT`, preset key
+    /// `bab.alpha_crown.root_alpha_margin_gradient`). Subordinate to
+    /// [`Self::root_alpha_margin`]: without the parent gate it is never read.
+    ///
+    /// Armed, the root α loss becomes the spec's margin C-rows. On a graph the
+    /// resident joint-adjoint lane already accepts (ReLU-only optimizer state)
+    /// that lane keeps its historical behavior; on a graph carrying bilinear
+    /// α state (vit: every var×var MatMul is lowered to `BilinearCrown`), the
+    /// certified C-row margin ascent (`propagate_dag/margin_alpha.rs`) runs
+    /// instead and publishes a certify-once margin bound for the root.
+    ///
+    /// SOUND: steering and selection only. Every α ∈ [0,1] and every
+    /// interpolation parameter r ∈ [0,1] selects a certified relaxation, and
+    /// the only bound published is a fresh certified pass. Default `false`, so
+    /// a config that never names it is byte-identical. The env var still wins
+    /// wherever it is present (`ny_levers::read_over_config` layering).
+    #[serde(default)]
+    pub root_alpha_margin_gradient: bool,
+
+    /// #vit-margin-alpha (B4): optimize the bilinear McCormick interpolation
+    /// parameters (4 per product element, `[4, m, n, k]`, shared over batch
+    /// dims) of every `BilinearCrown` and var×var `MatMul` node inside the
+    /// certified C-row margin ascent, checkpointed together with the ReLU α
+    /// and published through the same certify-once pass. Lever
+    /// `ny_levers::decls::root_alpha::ROOT_ALPHA_MATMUL`, preset key
+    /// `bab.alpha_crown.matmul_alpha`. Inert unless that lane runs.
+    ///
+    /// SOUND: every r ∈ [0,1] yields a convex combination of two valid
+    /// McCormick planes whose constant is certified outward
+    /// (`bilinear::mccormick::certify_plane_constant`). Default `false`
+    /// (fixed midpoint planes, byte-identical).
+    #[serde(default)]
+    pub matmul_alpha: bool,
+
+    /// #vit-margin-alpha-complex (P6): let the certified C-row margin ascent
+    /// (`propagate_dag/margin_alpha.rs`) take a root whose graph ALSO carries
+    /// MulBinary and/or Reciprocal α state, with those two families' α FROZEN
+    /// at their DAG-init values for the whole lane (every fold, the committed
+    /// checkpoint and the certify-once pass). The fixed-index softmax
+    /// decomposition (`softmax: complex_fixed_index`) plants exactly one
+    /// Reciprocal and one MulBinary per softmax, which is why the lane refused
+    /// every vit root that used it (`[alpha-margin] armed=0
+    /// reason=unsupported_alpha_family`). Only the ReLU α (+ per-row δ) and the
+    /// attention McCormick parameters (`matmul_alpha`) move. Preset key
+    /// `bab.alpha_crown.margin_alpha_freeze_mul_reciprocal` (or the
+    /// `solver.alpha-crown` twin). Inert unless the margin lane is requested.
+    ///
+    /// SOUND: any FIXED relaxation is valid — the frozen MulBinary planes are
+    /// the certified interpolated McCormick planes at r = 0.5 (the DAG init),
+    /// the frozen Reciprocal lines are its init tangent/chord — and the
+    /// published bound is one fresh certified pass with exactly that state
+    /// (abc's `disable_optimization` analogue). Sigmoid/Tanh/Sqrt α still
+    /// refuse. Default `false`: the lane refuses those graphs exactly as before.
+    #[serde(default)]
+    pub margin_alpha_freeze_mul_reciprocal: bool,
+
+    /// #vit-root-alpha (ENGINE_PROGRAM §2 V2): which SEARCH runs inside the
+    /// certified C-row margin lane (`propagate_dag/margin_alpha.rs`).
+    ///
+    /// * `ascent` (the default): today's certified ascent, bit for bit — every
+    ///   iterate a certified fold, then the certify-once pass.
+    /// * `joint_f32`: the lane lowers its graph into a plain-data search copy
+    ///   (self-checked against its own point forward), hands it with the
+    ///   certified boxes FROZEN to the injected untrusted backend (ny-bbe's CPU
+    ///   f32 search: ReLU slopes, the attention products' McCormick planes and
+    ///   the fixed-index softmax's MulBinary planes, jointly, against the margin
+    ///   rows), ingests the returned parameters through a clamp gate (non-finite
+    ///   → incumbent, the rest into `[0, 1]`), runs ONE certified fold with
+    ///   them, keeps that state only when its margin score is STRICTLY better
+    ///   than the incumbent's, and publishes the per-row intersection of the two
+    ///   certified folds (never looser than the incumbent; WITHDRAWN, with an
+    ///   unconditional `[bbe-alarm]` line, if the two are ever disjoint).
+    ///
+    /// Preset key `bab.alpha_crown.margin_alpha_search` (or the
+    /// `solver.alpha-crown` twin). Inert unless the margin lane runs. The
+    /// certified fold runs through the lane's own backward, so it takes
+    /// `bab.bilinear_gemm_kernel` (V1) when that key is armed.
+    ///
+    /// SOUND: the search reaches the bound only as parameters the gate clamps
+    /// into their valid domain; every published number is a certified fold.
+    #[serde(default)]
+    pub margin_alpha_search: MarginAlphaSearch,
+}
+
+/// Which search the certified C-row margin lane runs
+/// (`AlphaCrownConfig::margin_alpha_search`, #vit-root-alpha).
+///
+/// The serde tokens are the preset key's values ([`Self::TOKENS`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum MarginAlphaSearch {
+    /// The certified ascent (default; bit-identical to the lane before V2).
+    #[default]
+    #[serde(rename = "ascent")]
+    Ascent,
+    /// The injected untrusted joint f32 search (V2), certified once.
+    #[serde(rename = "joint_f32")]
+    JointF32,
+}
+
+impl MarginAlphaSearch {
+    /// The preset vocabulary, in declaration order.
+    pub const TOKENS: [&'static str; 2] = ["ascent", "joint_f32"];
+
+    /// The canonical token.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Ascent => "ascent",
+            Self::JointF32 => "joint_f32",
+        }
+    }
 }
 
 impl Default for AlphaCrownConfig {
@@ -972,7 +1404,7 @@ impl Default for AlphaCrownConfig {
             momentum: 0.9,
             // AnalyticChain: true chain-rule gradients, closest to reference α,β-CROWN's
             // loss.backward() (optimized_bounds.py:870). SPSA with 1 sample is noise-dominated
-            // for networks with many unstable neurons (#2035).
+            // for networks with many unstable neurons.
             gradient_method: GradientMethod::AnalyticChain,
             spsa_samples: 1, // Only used when gradient_method is Spsa
             // Default to true: use IBP bounds for intermediates (fast O(N)).
@@ -984,21 +1416,43 @@ impl Default for AlphaCrownConfig {
             // Complete cGAN root collection is separately default-dark until
             // its production-shaped official-row A/B passes.
             cgan_complete_crown_ibp_root: false,
+            // Publishing the cascade map to the `crown` input-split arm is
+            // default-dark until a sealed official-budget row measures it.
+            cgan_crown_root_map: false,
+            // Dense-mode collection is an E5 experiment key: default-dark.
+            cgan_collector_dense: false,
+            // #cgan-unstable-rows: typed delivery of the existing sparse
+            // ReLU-row collector gate. Default-dark until a sealed
+            // official-budget cgan row measures it.
+            cgan_unstable_rows: false,
+            cgan_unstable_rows_max_frac: default_cgan_unstable_rows_max_frac(),
             // Narrow-target collection ceiling is default-dark: it changes
             // which targets the cascade spends its budget on, so it stays off
             // until a sealed official-budget row measures it.
             cgan_narrow_target_max_rows: None,
+            // Child-side intermediate refinement is default-dark: it replaces a
+            // map lookup with a per-child CROWN cascade, which is a large cost
+            // change on every domain.
+            cgan_child_interm_refine_max_secs: None,
+            // #cgan-child-seed: all three child-cascade refinements are
+            // default-dark; false/0/false is the historical serial, unseeded
+            // prepass and the historical root-map-only fresh clip.
+            cgan_child_interm_refine_seed_from_parent: false,
+            cgan_child_interm_refine_parallel: 0,
+            cgan_child_interm_refine_fresh_clip_map: false,
+            // #cgan-child-zono: default-dark (enabled: false, budget 16384).
+            cgan_child_zono_refresh: CganChildZonoRefreshConfig::default(),
             // Sparse optimization: focus on top 30% most influential alphas.
             // Reduces SPSA variance when perturbing fewer coordinates.
             sparse_ratio: 0.3,
-            // Adaptive skip disabled by default (#3918): the upstream reference has
+            // Adaptive skip disabled by default: the upstream reference has
             // no depth gate — it relies on early_stop_patience to terminate stalled
             // optimization. The threshold of 20 silently prevented α-CROWN from running
             // on all production graph models (>20 ReLU nodes), producing IBP-identical
             // bounds. The retained threshold (20) only applies when explicitly enabled.
             adaptive_skip: false,
             adaptive_skip_depth_threshold: 20,
-            // Pilot iteration disabled by default (#3298): the 1e-3 absolute threshold
+            // Pilot iteration disabled by default: the 1e-3 absolute threshold
             // exits too early for deep DAG networks (ResNet-2b) where gradient attenuation
             // makes first-iteration improvement tiny. The reference α,β-CROWN has no pilot
             // concept — it uses patience-based early stopping instead (early_stop_patience).
@@ -1007,7 +1461,7 @@ impl Default for AlphaCrownConfig {
             pilot_improvement_threshold: 1e-3,
             // Patience: 10 consecutive non-improving iterations before stopping.
             // Matches α,β-CROWN's early_stop_patience=10 (optimized_bounds.py:75-77).
-            // Previously hardcoded to 3 — too aggressive for deep DAG networks (#3298).
+            // Previously hardcoded to 3 — too aggressive for deep DAG networks.
             early_stop_patience: 10,
             // Optimizer: Adam (ported from α,β-CROWN's proven configuration)
             optimizer: Optimizer::Adam,
@@ -1057,6 +1511,16 @@ impl Default for AlphaCrownConfig {
             spec_ascent: None,
             root_alpha_margin: false,
             alpha_zero_yield_frac: None,
+            inert_ascent_exit_iters: None,
+            // #vit-crown-interm: no cap on the fix_interm_bounds=false route.
+            crown_ibp_reference_cap_secs: None,
+            // #vit-margin-alpha: both default-dark; no shipped preset arms them.
+            root_alpha_margin_gradient: false,
+            matmul_alpha: false,
+            // #vit-margin-alpha-complex: default-dark; no shipped preset arms it.
+            margin_alpha_freeze_mul_reciprocal: false,
+            // #vit-root-alpha: the certified ascent; no shipped preset arms V2.
+            margin_alpha_search: MarginAlphaSearch::Ascent,
         }
     }
 }
@@ -1082,6 +1546,51 @@ impl AlphaCrownConfig {
     /// to preempt).
     pub fn alpha_zero_yield_frac_is_valid(fraction: f64) -> bool {
         fraction.is_finite() && fraction > 0.0 && fraction < 0.9
+    }
+
+    /// Whether a configured #inert-ascent-exit patience is admissible: at
+    /// least one exactly-zero iteration must be observed before the exit can
+    /// fire, so `0` is not a patience but a request to skip the ascent, which
+    /// is what `iterations: 0` is for.
+    pub fn inert_ascent_exit_iters_is_valid(iters: usize) -> bool {
+        iters >= 1
+    }
+
+    /// Largest admissible `#cgan-child-seed` concurrency request
+    /// (`cgan_child_interm_refine_parallel`). The runtime admission narrows
+    /// any request further; this only rejects a value no host can honour.
+    pub const MAX_CGAN_CHILD_INTERM_REFINE_PARALLEL: usize = 64;
+
+    /// Whether a configured `#cgan-child-seed` concurrency request is
+    /// admissible: `0` (serial) through [`Self::MAX_CGAN_CHILD_INTERM_REFINE_PARALLEL`].
+    pub fn cgan_child_interm_refine_parallel_is_valid(width: usize) -> bool {
+        width <= Self::MAX_CGAN_CHILD_INTERM_REFINE_PARALLEL
+    }
+
+    /// Largest admissible #vit-crown-interm reference cap, matching the
+    /// historical collector-cap parser's ceiling.
+    pub const MAX_CROWN_IBP_REFERENCE_CAP_SECS: u64 = 3_600;
+
+    /// Whether a configured #vit-crown-interm reference cap is admissible:
+    /// whole seconds in `1..=3600`. `0` would mean "never tighten anything",
+    /// which is what `fix_interm_bounds: true` already is.
+    pub fn crown_ibp_reference_cap_secs_is_valid(secs: u64) -> bool {
+        (1..=Self::MAX_CROWN_IBP_REFERENCE_CAP_SECS).contains(&secs)
+    }
+
+    /// The effective #vit-crown-interm cap, or `None` when this config is not
+    /// on the `fix_interm_bounds = false` route or carries no admissible cap.
+    ///
+    /// Fail-closed for programmatic callers: an inadmissible value resolves to
+    /// "no cap", i.e. the historical uncapped route.
+    #[must_use]
+    pub fn crown_ibp_reference_cap(&self) -> Option<std::time::Duration> {
+        if self.fix_interm_bounds {
+            return None;
+        }
+        self.crown_ibp_reference_cap_secs
+            .filter(|&secs| Self::crown_ibp_reference_cap_secs_is_valid(secs))
+            .map(std::time::Duration::from_secs)
     }
 
     /// Resolve a directly-constructed or deserialized fraction fail-closed.
@@ -1129,7 +1638,7 @@ impl AlphaCrownConfig {
         )
     }
 
-    /// Check whether the deadline has been exceeded (#2698).
+    /// Check whether the deadline has been exceeded.
     ///
     /// Returns `true` if a deadline is set and the current time is past it.
     pub fn past_deadline(&self) -> bool {

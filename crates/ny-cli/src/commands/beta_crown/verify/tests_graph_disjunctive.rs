@@ -559,10 +559,48 @@ fn graph_multi_clause_disjunction_conv2d_gpu_bab_matches_direct_clause_dispatch_
         reason.starts_with("Clause 1:"),
         "#3862 gpu_bab=true must bypass the shared multi-objective fast path and return per-clause reasoning, got: {reason}"
     );
+
+    // #budget-abandonment FIX D made the per-constraint reason VISIBLE inside
+    // this sentence, and that immediately showed the two routes ending for
+    // DIFFERENT inner causes under this test's 5 s budget and `max_domains: 0`:
+    // the direct dispatch's root warmup can burn the entire budget
+    // (`[warmup-fallback] armed=0 fired=0 cap_s=0.9 elapsed_s=5.0
+    // remaining_s=0.0`) and report `Timeout`, while the clause route reaches the
+    // `max_domains: 0` trip first and reports "Domain limit 0 reached".
+    // `check_termination` tests the clock BEFORE the domain cap, so which one
+    // wins is a wall-clock race between two 5 s runs -- not a routing fact.
+    // Before FIX D both sides collapsed to the same count-only sentence and the
+    // difference was simply invisible; the equality this test passed on was the
+    // wrapper's, not the route's.
+    //
+    // So assert what this test is actually about: the same routing-bearing sentence,
+    // naming the same constraint, each carrying SOME terminal cause. Pinning
+    // WHICH cause won the race would make this test flaky by design.
+    let split_detail = |text: &str| -> (String, String) {
+        match text.split_once("; constraint ") {
+            Some((head, detail)) => (head.to_string(), detail.trim_end_matches(')').to_string()),
+            None => (text.to_string(), String::new()),
+        }
+    };
+    let constraint_of = |detail: &str| -> String {
+        detail
+            .split_once(": ")
+            .map_or_else(String::new, |(desc, _)| desc.to_string())
+    };
+    let (reason_head, reason_detail) = split_detail(&reason);
+    let (direct_head, direct_detail) = split_detail(&format!("Clause 1: {direct_reason}"));
     assert_eq!(
-        reason,
-        format!("Clause 1: {direct_reason}"),
+        reason_head, direct_head,
         "#3862 disjunctive gpu_bab routing should match the direct single-clause GPU-BaB dispatch"
+    );
+    assert_eq!(
+        constraint_of(&reason_detail),
+        constraint_of(&direct_detail),
+        "#3862 both routes must fail on the SAME constraint"
+    );
+    assert!(
+        !reason_detail.is_empty() && !direct_detail.is_empty(),
+        "#budget-abandonment FIX D: both routes must name an inner cause, got {reason_detail:?} and {direct_detail:?}"
     );
 }
 
@@ -637,12 +675,10 @@ fn unified_input_split_pruning_keeps_per_clause_input_bounds_4257() {
 }
 
 /// Sequential model with use_relu_split=false should use the grouped input-split
-/// disjunctive BaB lane (Packet B of #3740). The grouped lane converts Sequential
+/// disjunctive BaB lane. The grouped lane converts Sequential
 /// → Graph and runs one shared BaB tree instead of the per-clause timeout-slicing
 /// loop. The result should NOT contain "Clause 1:" prefix because the grouped
 /// verifier does not decompose into per-clause sub-problems.
-///
-/// Part of #3740 Packet B.
 #[test]
 fn sequential_input_split_disjunction_uses_grouped_lane_3740() {
     let network = build_two_output_sequential_network();
@@ -693,7 +729,6 @@ fn sequential_input_split_disjunction_uses_grouped_lane_3740() {
 }
 
 /// Graph model with use_relu_split=false should also use the grouped lane.
-/// Part of #3740 Packet B.
 #[test]
 fn graph_input_split_disjunction_uses_grouped_lane_3740() {
     let (graph, input) = build_single_relu_anti_correlated_graph_for_disjunction();
@@ -734,7 +769,6 @@ fn graph_input_split_disjunction_uses_grouped_lane_3740() {
 
 /// Per-clause input bounds should force the clause-by-clause fallback,
 /// not the grouped lane. The grouped lane does not support per-clause domains.
-/// Part of #3740 Packet B.
 #[test]
 fn per_clause_input_bounds_keeps_clause_fallback_3740() {
     let (graph, input) = build_single_relu_anti_correlated_graph_for_disjunction();
@@ -814,9 +848,9 @@ fn make_asymmetric_disjunction_spec() -> ny_onnx::vnnlib::VnnLibSpec {
 }
 
 /// Regression: grouped relaxed clip must not short-circuit on a single
-/// satisfied clause. Before Packet B1, `clip_outcome.verified` (a conjunctive
+/// satisfied clause. Previously, `clip_outcome.verified` (a conjunctive
 /// "any row proved" scalar) caused false Verified results for grouped
-/// OR-of-AND specs. Part of #3740 Packet B1.
+/// OR-of-AND specs.
 #[test]
 fn graph_input_split_disjunction_relaxed_clip_requires_all_clauses_3740() {
     let (graph, input) = build_single_relu_anti_correlated_graph_for_disjunction();
@@ -867,7 +901,7 @@ fn graph_input_split_disjunction_relaxed_clip_requires_all_clauses_3740() {
 
 /// Regression: grouped complete clip must not short-circuit on a single
 /// satisfied clause. Same false-positive shape as the relaxed path but
-/// exercising the complete clip code path. Part of #3740 Packet B1.
+/// exercising the complete clip code path.
 #[test]
 fn graph_input_split_disjunction_complete_clip_requires_all_clauses_3740() {
     let (graph, input) = build_single_relu_anti_correlated_graph_for_disjunction();
@@ -912,4 +946,204 @@ fn graph_input_split_disjunction_complete_clip_requires_all_clauses_3740() {
          whole-domain verification for grouped OR-of-AND specs, got {:?}",
         result.result
     );
+}
+
+// ============================================================
+// #disjunctive-shared-bootstrap
+// ============================================================
+
+/// Run the serial ReLU-split disjunction under a thread-local INFO subscriber
+/// and return (verdict, captured log text). The tiny one-ReLU graph stays on
+/// the synchronous route, so the bootstrap's own `info!` lines and the
+/// `[shared-bootstrap]` line land in the capture.
+fn run_serial_disjunction_captured(
+    vnnlib: &ny_onnx::vnnlib::VnnLibSpec,
+    config: &BetaCrownConfig,
+) -> (BabVerificationStatus, String) {
+    let (graph, input) = build_single_relu_anti_correlated_graph_for_disjunction();
+    let verifier = BetaCrownVerifier::new(config.clone());
+    let captured = CapturedTracing::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .without_time()
+        .with_target(false)
+        .with_writer(captured.clone())
+        .finish();
+    let result = tracing::subscriber::with_default(subscriber, || {
+        verify_relational_constraints(
+            &BetaCrownModel::Graph(Box::new(graph)),
+            &input,
+            vnnlib,
+            config,
+            &verifier,
+            true,  // use_relu_split
+            false, // gpu_bab
+            false, // pgd_attack
+            0,     // pgd_restarts
+            0,     // pgd_steps
+            5,     // timeout
+            None,  // gemm_engine
+            true,  // json
+        )
+    })
+    .unwrap();
+    (result.result, captured.text())
+}
+
+/// Bootstraps observed: `compute_graph_bab_bootstrap` logs exactly one
+/// `Computing <mode> initial bounds` line per bootstrap, whatever the mode.
+fn bootstrap_count(logs: &str) -> usize {
+    logs.lines()
+        .filter(|line| line.contains("Computing ") && line.contains(" initial bounds"))
+        .count()
+}
+
+fn shared_bootstrap_line(logs: &str) -> &str {
+    logs.lines()
+        .find(|line| line.contains("[shared-bootstrap]"))
+        .unwrap_or_else(|| panic!("no [shared-bootstrap] line in:\n{logs}"))
+}
+
+/// Armed, the serial loop bootstraps ONCE and both clauses reuse it; dark, it
+/// bootstraps once PER CLAUSE. The verdict is the same either way.
+#[test]
+fn serial_relu_split_disjunction_shares_one_bootstrap_when_armed() {
+    let vnnlib = make_disjunction_spec();
+    let dark = make_graph_disjunction_config();
+    let mut armed = dark.clone();
+    armed.disjunctive_shared_bootstrap = true;
+
+    let (dark_verdict, dark_logs) = run_serial_disjunction_captured(&vnnlib, &dark);
+    let (armed_verdict, armed_logs) = run_serial_disjunction_captured(&vnnlib, &armed);
+
+    let dark_line = shared_bootstrap_line(&dark_logs);
+    assert!(
+        dark_line.contains("armed=0") && dark_line.contains("computed=0 reason=dark"),
+        "dark line: {dark_line}"
+    );
+    assert_eq!(
+        bootstrap_count(&dark_logs),
+        2,
+        "dark: one bootstrap per clause:\n{dark_logs}"
+    );
+
+    let armed_line = shared_bootstrap_line(&armed_logs);
+    assert!(
+        armed_line.contains("armed=1 route=relu_split computed=1 reason=ok"),
+        "armed line: {armed_line}"
+    );
+    assert!(
+        armed_line.contains("reused=2 fallback_box=0 clauses=2"),
+        "both clauses must consume the shared bootstrap: {armed_line}"
+    );
+    assert_eq!(
+        bootstrap_count(&armed_logs),
+        1,
+        "armed: exactly ONE bootstrap for the whole disjunction:\n{armed_logs}"
+    );
+    assert_eq!(
+        std::mem::discriminant(&dark_verdict),
+        std::mem::discriminant(&armed_verdict),
+        "dark {dark_verdict:?} vs armed {armed_verdict:?}"
+    );
+}
+
+/// A clause carrying its own input box re-bootstraps on THAT box; the other
+/// clause still reuses the shared one.
+#[test]
+fn shared_bootstrap_refuses_clauses_with_their_own_input_box() {
+    let mut vnnlib = make_disjunction_spec();
+    let mut per_clause = std::collections::BTreeMap::new();
+    per_clause.insert(0, (-0.5, 0.5));
+    vnnlib.per_clause_input_bounds = vec![per_clause, std::collections::BTreeMap::new()];
+    let mut armed = make_graph_disjunction_config();
+    armed.disjunctive_shared_bootstrap = true;
+
+    let (_, logs) = run_serial_disjunction_captured(&vnnlib, &armed);
+    let line = shared_bootstrap_line(&logs);
+    assert!(
+        line.contains("computed=1 reason=ok") && line.contains("reused=1 fallback_box=1"),
+        "the boxed clause must fall back and the plain one reuse: {line}"
+    );
+    assert_eq!(
+        bootstrap_count(&logs),
+        2,
+        "one shared bootstrap plus one per-clause bootstrap on the clause box:\n{logs}"
+    );
+}
+
+/// INVPROP conditions node bounds on the clause's own output constraint, so
+/// nothing may be shared: the cache refuses before computing anything.
+#[test]
+fn shared_bootstrap_refuses_invprop() {
+    let vnnlib = make_disjunction_spec();
+    let mut armed = make_graph_disjunction_config();
+    armed.disjunctive_shared_bootstrap = true;
+    armed.use_alpha_crown = true;
+    armed.alpha_config.iterations = 1;
+    armed.alpha_config.adaptive_skip = false;
+    armed.alpha_config.invprop.enabled = true;
+    armed.alpha_config.invprop.optimize_gammas = false;
+    armed.alpha_config.output_constraints = None;
+
+    let (_, logs) = run_serial_disjunction_captured(&vnnlib, &armed);
+    let line = shared_bootstrap_line(&logs);
+    assert!(
+        line.contains("armed=1 route=relu_split computed=0 reason=invprop"),
+        "{line}"
+    );
+    assert!(
+        logs.contains("GraphNetwork α-CROWN: INVPROP enabled with 1 constraints"),
+        "the per-clause INVPROP rebind must still fire:\n{logs}"
+    );
+}
+
+/// The input-split route never read the precomputed slot; the cache says so
+/// instead of computing a bootstrap nobody would consume.
+#[test]
+fn shared_bootstrap_names_the_route_that_declines() {
+    let (graph, input) = build_single_relu_anti_correlated_graph_for_disjunction();
+    let vnnlib = make_disjunction_spec();
+    let mut armed = make_graph_disjunction_config();
+    armed.disjunctive_shared_bootstrap = true;
+    let verifier = BetaCrownVerifier::new(armed.clone());
+    let captured = CapturedTracing::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .without_time()
+        .with_target(false)
+        .with_writer(captured.clone())
+        .finish();
+    let _ = tracing::subscriber::with_default(subscriber, || {
+        verify_relational_constraints(
+            &BetaCrownModel::Graph(Box::new(graph)),
+            &input,
+            &vnnlib,
+            &armed,
+            &verifier,
+            false, // use_relu_split = false -> input split
+            false, // gpu_bab
+            false, // pgd_attack
+            0,     // pgd_restarts
+            0,     // pgd_steps
+            5,     // timeout
+            None,  // gemm_engine
+            true,  // json
+        )
+    })
+    .unwrap();
+    let logs = captured.text();
+    // The input-split spec may be decided by a grouped lane before the serial
+    // loop; only assert the line's content when the loop ran.
+    if let Some(line) = logs
+        .lines()
+        .find(|line| line.contains("[shared-bootstrap]"))
+    {
+        assert!(
+            line.contains("armed=1 route=input_split computed=0 reason=route"),
+            "{line}"
+        );
+    }
 }

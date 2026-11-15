@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Infeasible-domain and propagation-failure regressions (#1978, #2926).
+//! Infeasible-domain and propagation-failure regressions.
 
 use std::collections::HashMap;
 
@@ -16,7 +16,7 @@ use crate::{
 
 use super::two_neuron::{build_two_neuron_input_bounds, build_two_neuron_relu_graph};
 // =========================================================================
-// Regression tests for #1978: propagation error → PropagationFailure mapping
+// Regression tests: propagation error → PropagationFailure mapping
 // =========================================================================
 
 /// Build a graph where pre-activation bounds at relu1 are always positive:
@@ -126,7 +126,7 @@ fn build_correlated_zero_relu_graph() -> GraphNetwork {
     graph
 }
 
-/// Regression test for #1978: `propagate_crown_with_graph_constraints` must return
+/// Regression test: `propagate_crown_with_graph_constraints` must return
 /// `Err` (not silently produce stale bounds) when given an infeasible inactive
 /// ReLU constraint. This is the prerequisite for the BaB loop mapping errors to
 /// `GraphDomainResult::PropagationFailure`.
@@ -153,7 +153,7 @@ fn test_infeasible_inactive_constraint_returns_error_1978() {
     );
 }
 
-/// Regression test for #1978: same as above but for an infeasible active constraint
+/// Regression test: same as above but for an infeasible active constraint
 /// where pre-activation upper bound is strictly negative.
 #[test]
 fn test_infeasible_active_constraint_returns_error_1978() {
@@ -178,7 +178,7 @@ fn test_infeasible_active_constraint_returns_error_1978() {
     );
 }
 
-/// Regression test for #1978: `propagate_crown_with_graph_beta` (the wrapper
+/// Regression test: `propagate_crown_with_graph_beta` (the wrapper
 /// called by the BaB NoUnstable path) must also propagate the error from
 /// infeasible constraints, not swallow it.
 #[test]
@@ -207,7 +207,7 @@ fn test_propagate_crown_with_graph_beta_propagates_infeasible_error_1978() {
 }
 
 // ---------------------------------------------------------------------------
-// #2926: InfeasibleDomain error variant tests
+// InfeasibleDomain error variant tests
 // ---------------------------------------------------------------------------
 
 /// Verify that single-constraint infeasibility (inactive on always-positive)
@@ -248,7 +248,7 @@ fn test_infeasible_active_returns_infeasible_domain_variant_2926() {
     );
 }
 
-/// Regression for `#4354`: inherited node caches must not turn a sound child
+/// Regression: inherited node caches must not turn a sound child
 /// into a false infeasible domain.
 ///
 /// Setup: two-neuron ReLU graph, neuron 0 constrained active.
@@ -289,7 +289,7 @@ fn test_inherited_relu_cache_conflict_falls_back_to_fresh_child_bounds_4354() {
     );
     // relu1 CROWN-IBP bounds: both entries are stale/conflicting. Neuron 0
     // exercises the active-arm fallback; neuron 1 exercises the unconstrained
-    // fallback retained from #4354.
+    // fallback.
     base_bounds.insert(
         "relu1".to_string(),
         Arc::new(

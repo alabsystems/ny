@@ -118,6 +118,7 @@ impl GraphNetwork {
         F: Fn(BlockProgress),
         G: Fn(&BlockBoundsInfo, u64, usize),
     {
+        self.ensure_proof_eligible()?;
         let start_time = std::time::Instant::now();
         let prior_elapsed_ms = resume_from.map(|c| c.elapsed_ms).unwrap_or(0);
 
@@ -236,7 +237,7 @@ impl GraphNetwork {
                 callback(BlockProgress {
                     block_index: block_idx,
                     total_blocks,
-                    block_name: block_name.clone(),
+                    block_name,
                     elapsed: start_time.elapsed(),
                     current_max_sensitivity: max_sensitivity,
                     degraded_so_far: degraded_blocks,
@@ -287,7 +288,7 @@ impl GraphNetwork {
                 .fold(0.0_f32, nan_propagating_max)
         };
 
-        // Unified dispatch (#2405). Uses resolve_node_inputs for all layer
+        // Unified dispatch. Uses resolve_node_inputs for all layer
         // types, with custom Binary/Unary handling for zonotope tightening.
         let resolved = resolve_node_inputs(node, node_name, &mut |name| {
             self.bounds_for_block(name, block_input, bounds_cache)
@@ -297,7 +298,7 @@ impl GraphNetwork {
         if matches!(&node.layer, Layer::OpaqueSkip(_)) && node.inputs.len() > 1 {
             // Only runs for multi-input OpaqueSkip, where `require_unary_input`
             // (which rejects >1 input) would always error. Use the first declared
-            // input directly for the diagnostic shape comparison (#2666 regression).
+            // input directly for the diagnostic shape comparison.
             let first_input_name = node.inputs[0].as_str();
             let first_shape = self
                 .bounds_for_block(first_input_name, block_input, bounds_cache)?
@@ -430,7 +431,7 @@ impl GraphNetwork {
             has_infinite,
         };
 
-        // NaN firewall (#2812 Slice 3, #2706). Metadata recorded above.
+        // NaN firewall. Metadata recorded above.
         check_nan_firewall(
             &output_bounds,
             "IBP block-wise",
@@ -516,7 +517,7 @@ mod tests {
     /// Construct a GraphNode with empty inputs, bypassing the debug_assert in
     /// GraphNode::new() which validates min_inputs. This is intentional — these
     /// tests exercise the downstream error path in resolve_block_input_shape(),
-    /// not the constructor guard (#2481).
+    /// not the constructor guard.
     fn make_empty_input_node(name: &str, layer: Layer) -> GraphNode {
         GraphNode {
             name: name.to_string(),

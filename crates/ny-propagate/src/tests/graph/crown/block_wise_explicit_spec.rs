@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Explicit `BlockSpec` regression tests (#4024).
+//! Explicit `BlockSpec` regression tests.
 //!
 //! Tests that consumer-supplied block boundaries with non-`layer{N}` node
 //! names and sparse block indices preserve metadata through
@@ -78,7 +78,7 @@ fn build_two_block_trace_graph(hidden: usize, expansion: usize) -> GraphNetwork 
     graph
 }
 
-/// #4024 regression: explicit `BlockSpec` with non-`layer{N}` node names and
+/// Regression: explicit `BlockSpec` with non-`layer{N}` node names and
 /// sparse block indices preserves consumer-chosen metadata through
 /// `BlockWiseCrownResult`.
 #[ntest::timeout(10000)]

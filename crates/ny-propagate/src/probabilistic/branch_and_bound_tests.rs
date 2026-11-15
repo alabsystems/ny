@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Tests for branch-and-bound distributional bound refinement.
-//! Part of #3921 / #4249.
 
 use super::*;
 use ndarray::{Array1, Array2, ArrayD, IxDyn};
@@ -392,7 +391,7 @@ fn test_truncated_gaussian_mean_symmetric() {
 }
 
 /// Verify that NaN variance regions don't corrupt the BinaryHeap ordering.
-/// Before #4288 fix, `partial_cmp(...).unwrap_or(Equal)` made NaN regions
+/// Before the fix, `partial_cmp(...).unwrap_or(Equal)` made NaN regions
 /// compare equal to everything, violating total order. With `total_cmp`,
 /// NaN sorts after all finite values → highest priority in max-heap.
 #[test]
@@ -471,7 +470,7 @@ fn test_bab_region_nan_variance_does_not_corrupt_heap() {
     );
 }
 
-/// Regression test for #4288: Region::PartialEq must be consistent with Ord.
+/// Regression test: Region::PartialEq must be consistent with Ord.
 ///
 /// Before fix, `PartialEq::eq` used f64's `==` (NaN != NaN = true), while
 /// `Ord::cmp` used `total_cmp` (NaN == NaN = Equal). This violates the trait
@@ -535,7 +534,7 @@ fn test_region_partial_eq_consistent_with_ord_4288() {
     assert_ne!(nan_a, finite_a);
 }
 
-/// Regression test for #4288: max_element must propagate NaN.
+/// Regression test: max_element must propagate NaN.
 ///
 /// Before fix, `f32::max` (IEEE 754 minNum semantics) silently discards NaN,
 /// so `max_element([1.0, NaN, 2.0])` returned `2.0` instead of `NaN`.

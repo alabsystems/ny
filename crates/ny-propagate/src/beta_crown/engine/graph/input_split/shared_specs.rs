@@ -5,14 +5,13 @@
 //! Dense-spec batched bounds helper for multi-objective input-split paths.
 //!
 //! Extracted from `shared.rs` to stay under the 500-line file limit.
-//! Part of #4116 Packet A Step 4.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use ndarray::Array2;
-use ny_core::{GemmEngine, NaiveCpuGemmEngine, Result};
+use ny_core::{GemmEngine, NaiveCpuGemmEngine, NyError, Result};
 use ny_tensor::BoundedTensor;
 use tracing::info;
 
@@ -34,8 +33,6 @@ use super::shared::compute_crown_or_ibp_bounds;
 /// Unlike `BatchedScalarBounds` which collapses to scalar lower/upper pairs, this
 /// carrier preserves the multi-row BoundedTensor output and the full input LinearBounds
 /// for each domain. Used by the dense-spec input-split helper.
-///
-/// Part of #4116 Packet A Step 4.
 #[derive(Debug)]
 pub(crate) struct BatchedSpecBounds {
     pub(crate) bounds: Vec<BoundedTensor>,
@@ -50,11 +47,9 @@ pub(crate) struct BatchedSpecBounds {
 /// that later packets can use for multi-objective input-split batching.
 ///
 /// Uses the graph batched-backward kernel when the input-split feature set matches
-/// that surface. Supports α-CROWN global alpha state (#4210) and shared reference
+/// that surface. Supports α-CROWN global alpha state and shared reference
 /// bounds. Falls back to rayon-parallel per-domain CROWN for MulBinary alpha cache,
 /// truncated CROWN backward, or IBP-enhanced reference-bound merge.
-///
-/// Part of #4116 Packet A Step 4.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_crown_or_ibp_bounds_batched_specs(
     graph: &GraphNetwork,
@@ -97,6 +92,7 @@ pub(crate) fn compute_crown_or_ibp_bounds_batched_specs(
             ibp_enhancement,
             stacked_rebound,
             nested_deadline,
+            None,
         )? {
             return Ok(result);
         }
@@ -158,6 +154,117 @@ pub(crate) fn compute_crown_or_ibp_bounds_batched_specs(
     })
 }
 
+/// `#cgan-child-zono`: [`compute_crown_or_ibp_bounds_batched_specs`] with a
+/// PER-DOMAIN replacement for some entries of the shared reference map.
+///
+/// `domain_overrides[i]`, when present, holds node entries that REPLACE the
+/// shared `alpha_node_bounds` entries of the same name for domain `i` only.
+/// The caller (the armed zonotope prepass) guarantees every replacement is
+/// the root entry intersected shrink-only with a certified enclosure of that
+/// domain's box (`merge_reference_bound_maps`), so each per-domain map is a
+/// valid enclosure of the domain's reachable set and no tighter than the
+/// intersection of two such enclosures. Domains without replacements use the
+/// shared map exactly as [`compute_crown_or_ibp_bounds_batched_specs`] does.
+///
+/// Only the armed prepass calls this; every other caller keeps the historical
+/// shared-map entry point, whose call into the batched kernel is unchanged.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_crown_or_ibp_bounds_batched_specs_with_domain_overrides(
+    graph: &GraphNetwork,
+    input_bounds_batch: &[&BoundedTensor],
+    domain_overrides: &[Option<HashMap<String, BoundedTensor>>],
+    spec_matrix: &Array2<f32>,
+    engine: Option<&dyn GemmEngine>,
+    alpha_node_bounds: Option<&HashMap<String, BoundedTensor>>,
+    alpha_state: Option<&GraphAlphaState>,
+    mul_binary_alphas: Option<&HashMap<String, Array2<f32>>>,
+    deadline: Option<Instant>,
+    crown_backward_layers: Option<usize>,
+    ibp_enhancement: bool,
+    stacked_rebound: bool,
+    nested_deadline: Option<bool>,
+) -> Result<BatchedSpecBounds> {
+    if domain_overrides.len() != input_bounds_batch.len() {
+        return Err(NyError::InvalidSpec(format!(
+            "per-domain reference overrides: {} maps for {} domains",
+            domain_overrides.len(),
+            input_bounds_batch.len()
+        )));
+    }
+    let joint_bilinear_requires_scalar = crate::joint_bilinear::joint_bilinear_armed()
+        && input_bounds_batch
+            .iter()
+            .any(|input| crate::joint_bilinear::joint_bilinear_may_apply(graph, input));
+    if !joint_bilinear_requires_scalar {
+        if let Some(result) = try_compute_crown_or_ibp_bounds_batched_specs_with_batched_backward(
+            graph,
+            input_bounds_batch,
+            spec_matrix,
+            engine,
+            alpha_node_bounds,
+            alpha_state,
+            mul_binary_alphas,
+            deadline,
+            crown_backward_layers,
+            ibp_enhancement,
+            stacked_rebound,
+            nested_deadline,
+            Some(domain_overrides),
+        )? {
+            return Ok(result);
+        }
+    }
+
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    // Per-domain fallback (the kernel declined the batch): each domain gets
+    // the FULL shared map with its replacements merged in, so the
+    // no-enhancement route (which substitutes the child map for the shared
+    // one) still sees every node.
+    let total_start = Instant::now();
+    let results: Result<Vec<(BoundedTensor, Option<LinearBounds>)>> = (0..input_bounds_batch.len())
+        .into_par_iter()
+        .map(|idx| {
+            let _rayon_task_guard = RayonTaskGuard::new();
+            let child_map = match domain_overrides[idx].as_ref() {
+                Some(replacements) => crate::network::merge_reference_bound_maps(
+                    alpha_node_bounds,
+                    Some(replacements),
+                )?,
+                None => None,
+            };
+            super::shared::compute_crown_or_ibp_bounds_with_node_bounds(
+                graph,
+                input_bounds_batch[idx],
+                spec_matrix,
+                engine,
+                alpha_node_bounds,
+                child_map.as_ref(),
+                alpha_state,
+                mul_binary_alphas,
+                deadline,
+                crown_backward_layers,
+                ibp_enhancement,
+            )
+        })
+        .collect();
+    let (bounds, linear_bounds): (Vec<BoundedTensor>, Vec<Option<LinearBounds>>) =
+        results?.into_iter().unzip();
+    Ok(BatchedSpecBounds {
+        bounds,
+        linear_bounds,
+        rebound_timing: DenseSpecReboundTiming {
+            mode: DenseSpecReboundMode::RayonFallback,
+            domains: input_bounds_batch.len(),
+            num_specs: spec_matrix.nrows(),
+            total_elapsed_s: total_start.elapsed().as_secs_f64(),
+            forward_elapsed_s: None,
+            backward_elapsed_s: None,
+            materialize_elapsed_s: None,
+        },
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn try_compute_crown_or_ibp_bounds_batched_specs_with_batched_backward(
     graph: &GraphNetwork,
@@ -172,12 +279,13 @@ fn try_compute_crown_or_ibp_bounds_batched_specs_with_batched_backward(
     ibp_enhancement: bool,
     stacked_rebound: bool,
     nested_deadline: Option<bool>,
+    domain_overrides: Option<&[Option<HashMap<String, BoundedTensor>>]>,
 ) -> Result<Option<BatchedSpecBounds>> {
     // Gate: fall back to rayon par_iter for features the batched kernel
     // doesn't yet support.
-    // Part of #4210: alpha_state gate lifted by converting
+    // alpha_state gate lifted by converting
     //   GraphAlphaState → GraphDomainAlphaState.
-    // Part of #4210: ibp_enhancement gate lifted — the batched kernel's
+    // ibp_enhancement gate lifted — the batched kernel's
     //   `compute_constrained_forward_bounds` seeds from `base_bounds`
     //   (warmup alpha_node_bounds) which gives valid intermediate bounds.
     //   The per-domain ibp_enhancement path additionally intersects fresh
@@ -185,7 +293,7 @@ fn try_compute_crown_or_ibp_bounds_batched_specs_with_batched_backward(
     //   extra IBP pass UNLESS `stacked_rebound` is also enabled
     //   (#cgan-batched-stack: `input_split_batched_ibp_refresh` restores the
     //   per-domain intersect so relaxations re-anchor as boxes shrink).
-    // Part of #4284: mul_binary_alphas gate lifted — root-optimized alphas
+    // mul_binary_alphas gate lifted — root-optimized alphas
     //   are shared across all domains and threaded through the batched
     //   backward context to DispatchContext per-node.
     if input_bounds_batch.is_empty() || crown_backward_layers.is_some() {
@@ -205,13 +313,45 @@ fn try_compute_crown_or_ibp_bounds_batched_specs_with_batched_backward(
                 .map(|(k, v)| (k.clone(), Arc::new(v.clone())))
                 .collect()
         });
+    // #cgan-child-zono: a domain with replacement entries gets the shared map
+    // (the same `Arc`s, no tensor copies) with those entries swapped in. Only
+    // the armed zonotope prepass passes `Some`; `None` leaves the shared map
+    // below exactly as it was. Replacements are ignored without a shared map,
+    // so a per-domain map is never missing a node the shared one carries.
+    let per_domain_node_bounds: Option<Vec<Option<HashMap<String, Arc<BoundedTensor>>>>> =
+        match (domain_overrides, &arc_node_bounds) {
+            (Some(overrides), Some(shared)) => {
+                if overrides.len() != input_bounds_batch.len() {
+                    return Err(NyError::InvalidSpec(format!(
+                        "per-domain reference overrides: {} maps for {} domains",
+                        overrides.len(),
+                        input_bounds_batch.len()
+                    )));
+                }
+                Some(
+                    overrides
+                        .iter()
+                        .map(|replacements| {
+                            replacements.as_ref().map(|replacements| {
+                                let mut map = shared.clone();
+                                for (name, bounds) in replacements {
+                                    map.insert(name.clone(), Arc::new(bounds.clone()));
+                                }
+                                map
+                            })
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
+        };
 
     // Convert global α-CROWN state to per-neuron format for the batched kernel.
     // All input-split sub-domains share the same global alpha from the warmup
     // pass ("fix_interm_bounds" pattern). The converter stores entries only for
     // neurons that were unstable at the root level; the batched backward core's
     // build_alpha_array handles per-domain stable/unstable classification at
-    // runtime using per-domain pre-activation bounds. Part of #4210.
+    // runtime using per-domain pre-activation bounds.
     let domain_alpha: Option<GraphDomainAlphaState> =
         alpha_state.map(GraphDomainAlphaState::from_global_alpha_state_for_input_split);
 
@@ -240,9 +380,13 @@ fn try_compute_crown_or_ibp_bounds_batched_specs_with_batched_backward(
         batched: &batched,
         histories,
         beta_states: vec![None; n],
-        base_bounds: match &arc_node_bounds {
-            Some(bounds) => vec![Some(bounds); n],
-            None => vec![None; n],
+        base_bounds: match (&per_domain_node_bounds, &arc_node_bounds) {
+            (Some(per_domain), shared) => per_domain
+                .iter()
+                .map(|map| map.as_ref().or(shared.as_ref()))
+                .collect(),
+            (None, Some(bounds)) => vec![Some(bounds); n],
+            (None, None) => vec![None; n],
         },
         // #cone-delta: shared warmup maps have no tracked delta — fail closed.
         delta_seeds: vec![None; n],
@@ -288,7 +432,7 @@ fn try_compute_crown_or_ibp_bounds_batched_specs_with_batched_backward(
     // ULP but is equally sound; a tighter/looser sound bound only ever changes
     // how many domains verify, never the verdict. Inside the rayon per-domain
     // workers `current_par()` forces faer to `Par::Seq`, so there is no nested
-    // Rayon (#4392). Set `NY_BATCHED_NAIVE_ENGINE=1` to restore the historical
+    // Rayon. Set `NY_BATCHED_NAIVE_ENGINE=1` to restore the historical
     // byte-identical naive engine (the gate-OFF A/B + parity reference).
     let force_naive = std::env::var_os("NY_BATCHED_NAIVE_ENGINE").is_some();
     let resolved_engine: &dyn GemmEngine = match engine {

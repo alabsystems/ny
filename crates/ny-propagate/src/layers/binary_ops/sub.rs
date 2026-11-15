@@ -89,7 +89,7 @@ impl SubLayer {
             let out_upper = ndarray::Zip::from(&a_upper)
                 .and(&b_lower)
                 .map_collect(|&x, &y| sub_up_f32(x, y));
-            // Centralized NaN/Inf repair at constructor (#3423, replaces ad-hoc #2742).
+            // Centralized NaN/Inf repair at constructor (replaces an ad-hoc repair).
             return BoundedTensor::new_repaired(out_lower, out_upper, RepairStrategy::Conservative);
         };
 
@@ -99,7 +99,7 @@ impl SubLayer {
         let out_upper = ndarray::Zip::from(&a_upper)
             .and(&b_lower)
             .map_collect(|&x, &y| sub_up_f32(x, y));
-        // Centralized NaN/Inf repair at constructor (#3423, replaces ad-hoc #2742).
+        // Centralized NaN/Inf repair at constructor (replaces an ad-hoc repair).
         BoundedTensor::new_repaired(out_lower, out_upper, RepairStrategy::Conservative)
     }
 
@@ -117,7 +117,7 @@ impl SubLayer {
     ) -> Result<(LinearBounds, LinearBounds)> {
         // C = A - B => W·C + b = W·A - W·B + b.
         // Split the bias for graph accumulation.
-        // Directed rounding on f32 halving to preserve soundness (#2173).
+        // Directed rounding on f32 halving to preserve soundness.
         let lower_b_half = bounds.lower_b().mapv(|v| next_down_f32(v * 0.5));
         let upper_b_half = bounds.upper_b().mapv(|v| next_up_f32(v * 0.5));
 
@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn test_crown_bias_splitting_directed_rounding_subnormal_underflow() {
-        // Regression for #2173: halving smallest subnormal underflows to 0.0,
+        // Regression: halving smallest subnormal underflows to 0.0,
         // so directed rounding must widen to keep bounds sound.
         let layer = SubLayer;
         let tiny = f32::from_bits(1); // smallest positive subnormal
@@ -341,10 +341,9 @@ mod tests {
 
     #[test]
     fn test_ibp_infinite_bounds_repaired() {
-        // Regression for #2742: NaN subtraction results (inf - inf) must be
+        // Regression: NaN subtraction results (inf - inf) must be
         // widened to ±inf, and ±inf endpoints pass through unchanged — a
         // non-finite endpoint proves nothing, so no finite substitute is sound
-        // (#3423).
         let layer = SubLayer;
         // Element 0: conservative [-inf, +inf] — produces -inf and +inf (not NaN).
         // Element 1: finite arithmetic.
@@ -378,7 +377,7 @@ mod tests {
 
     #[test]
     fn test_ibp_infinite_bounds_broadcast_repaired() {
-        // Regression for #2742: broadcast path also needs NaN repair (now via new_repaired, #3423).
+        // Regression: broadcast path also needs NaN repair (now via new_repaired).
         let layer = SubLayer;
         // A shape [1, 2], B shape [2, 2] — forces broadcast path.
         let a = BoundedTensor::new_allow_infinite(

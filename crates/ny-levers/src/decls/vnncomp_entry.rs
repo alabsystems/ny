@@ -99,6 +99,24 @@ const POSTBAB_RESERVE_READERS: &[ReaderSite] = &[
     },
 ];
 
+const POSTBAB_RESTART_READERS: &[ReaderSite] = &[
+    ReaderSite {
+        scope: VNNCOMP_POSTBAB,
+        role: "project attack.post_bab_restarts into the frozen scored-run LeverSet",
+        site: "crates/ny-cli/src/commands/vnncomp.rs:preset_delivered_config_value",
+    },
+    ReaderSite {
+        scope: VNNCOMP_POSTBAB,
+        role: "resolve one immutable restart-diversity count from the same LeverSet as the flight receipt",
+        site: "crates/ny-cli/src/commands/vnncomp.rs:PostBabRestartPolicy::from_levers",
+    },
+    ReaderSite {
+        scope: VNNCOMP_POSTBAB,
+        role: "re-enter the converged stage-0 alternation from deterministically diversified basins",
+        site: "crates/ny-cli/src/commands/vnncomp.rs:try_postbab_falsify",
+    },
+];
+
 const POSTBAB_ATTACK_READERS: &[ReaderSite] = &[
     ReaderSite {
         scope: VNNCOMP_POSTBAB,
@@ -119,6 +137,24 @@ const POSTBAB_ATTACK_READERS: &[ReaderSite] = &[
         scope: VNNCOMP_POSTBAB,
         role: "publish the effective and lower authorities plus the resulting route in a versioned execution event",
         site: "crates/ny-cli/src/commands/vnncomp.rs:PostBabWrapperPolicy::receipt_details",
+    },
+];
+
+const POINT_FOLDED_TWIN_READERS: &[ReaderSite] = &[
+    ReaderSite {
+        scope: VNNCOMP_POSTBAB,
+        role: "project attack.point_folded_twin into the frozen scored-run LeverSet",
+        site: "crates/ny-cli/src/commands/vnncomp.rs:preset_delivered_config_value",
+    },
+    ReaderSite {
+        scope: VNNCOMP_POSTBAB,
+        role: "resolve one immutable twin-lane admission from the same LeverSet as the flight receipt",
+        site: "crates/ny-cli/src/commands/vnncomp/attack_twin_lane.rs:PointFoldedTwinPolicy::from_levers",
+    },
+    ReaderSite {
+        scope: VNNCOMP_POSTBAB,
+        role: "run exact-gradient PGD on the point-folded attack twin in the post-BaB tail when the real net is outside the exact-gradient fragment",
+        site: "crates/ny-cli/src/commands/vnncomp.rs:try_postbab_falsify",
     },
 ];
 
@@ -185,11 +221,14 @@ branch-and-bound, so it changes which verdict is reachable before the deadline."
         bucket: Bucket::Auto,
         moat: MoatRisk::High,
         doc: "\
-Whole-second clamp applied only to contextual automatic multi-clause-\
-disjunction admission. The historical parser trims whitespace and accepts every \
+Whole-second clamp applied only to automatic multi-clause-disjunction \
+admission: the contextual route, and multi-clause disjunctions under the typed \
+`attack.upfront_attack: true` force, which keeps them on their automatic \
+admission. The historical parser trims whitespace and accepts every \
 u64. An admissible environment value overrides \
 `attack.upfront_attack_auto_cap_secs`; absence uses that typed value or four \
-seconds. Forced and typed-relational routes deliberately retain the ordinary \
+seconds. Forced admissions (environment force, or a single-clause row under the \
+typed force) and typed-relational routes deliberately retain the ordinary \
 cap. This is a scored budget allocation and can change deadline reachability.",
         provenance: Provenance::Measured {
             commit: "14fe1182a",
@@ -315,6 +354,41 @@ post-BaB execution receipt before they receive engagement credit.",
         readers: POSTBAB_RESERVE_READERS,
     };
 
+    /// Diversified-restart count for the converged post-BaB attack stack.
+    pub POSTBAB_RESTARTS = LeverDecl {
+        name: "NY_POSTBAB_RESTARTS",
+        kind: LeverKind::U64Trimmed,
+        default: DefaultSpec::U64(0),
+        bucket: Bucket::Auto,
+        moat: MoatRisk::High,
+        doc: "\
+Maximum number of diversified restarts of the post-BaB stage-0 alternation \
+(ULP-jitter + Newton-feasibility) after the seeded descent self-terminates \
+with `no improvement; stopping` while attack window remains. Zero (the \
+default) preserves the historical single-descent stack byte-for-byte. A \
+positive count re-enters the alternation from deterministically seeded \
+basins — uniform, corner, and orthogonal-jitter-away-from-the-converged-point \
+starts, cycled per restart, with the RNG seed derived from the row's model \
+and property file names so a verdict is a pure function of the instance and \
+never of ambient Date/random state. The best ORT margin is kept across \
+restarts, every candidate still passes the unchanged in-attack zero-tolerance \
+acceptance, and the caller still routes any witness through the unchanged \
+`gate_sat_with_trusted_oracle`, so the lever can only ADD `sat` verdicts \
+through the existing gate. Restarts spend only the post-BaB attack window: \
+arming reserves two seconds per requested restart (at most half the window) \
+out of the seeded DESCENT's share of that same window — the standard window \
+is oversubscribed, so a purely-leftover restart lane would receive ~0 s at \
+exactly the window that competes — and each restart then takes an equal \
+share of the reserve (two-second floor). The verifier grant and every \
+deadline outside the attack lane are untouched, so proof time is never \
+reduced.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "default-zero is bit-identical to the shipped stack; the arming motivation is the 2026-08-31 window probe (reports/measured-2026/soundnessbench_window_probe_2026-08-31/README.md), which measured the stage-0 stack CONVERGENT — bit-identical fixed points at 11 s and 49.6 s windows — so diversity, not window length, is the open axis; armed effect is not yet measured, and any sat it produces still passes the unchanged trusted-ORT gate",
+        },
+        owner: VNNCOMP_POSTBAB,
+        readers: POSTBAB_RESTART_READERS,
+    };
+
     /// Independent enable/kill policy for the outer post-BaB falsifier.
     pub POSTBAB_ATTACK = LeverDecl {
         name: "NY_POSTBAB_ATTACK",
@@ -345,6 +419,47 @@ flight policy event.",
         },
         owner: VNNCOMP_POSTBAB,
         readers: POSTBAB_ATTACK_READERS,
+    };
+
+    /// Exact-gradient falsification on a point-folded ATTACK twin
+    /// (#lsnc-attack-twin).
+    pub ATTACK_POINT_FOLDED_TWIN = LeverDecl {
+        name: "NY_ATTACK_POINT_FOLDED_TWIN",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(false),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Admits the post-BaB point-folded-twin falsification lane. When the real graph \
+is STATICALLY outside the exact point-VJP fragment because the exact loader \
+failed a constant-only cone closed (a rounded binary32 product it will not \
+fold), the lane builds an ATTACK-ONLY twin whose constant cones ONNX Runtime \
+evaluated once and baked in (ny_onnx::attack_twin::PointFoldedAttackTwin, a \
+distinct type with no route to any bound API), and runs projected Adam PGD \
+with face-biased restarts on it, ORT-checking every iterate against the \
+ORIGINAL model. A point is returned only when the trusted ONNX Runtime forward \
+of the original model violates the property at zero tolerance, and the caller \
+re-runs the unchanged gate_sat_with_trusted_oracle on it, so the lane can only \
+ADD sat verdicts. It runs in the post-BaB tail — after the verdict is already \
+non-sat — and takes the whole window only when the ordinary tail has no \
+seeded stage to run (at most half of it otherwise), so it never takes proof \
+time from branch-and-bound. Exact \"1\" arms it and exact \"0\" disarms it; \
+absence defers to the typed key attack.point_folded_twin, whose absence is \
+false. MoatRisk::High because arming changes which lane owns the post-BaB \
+tail and therefore which counterexamples are reachable inside the budget.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "default-false; armed by exactly one shipped preset \
+                     (configs/vnncomp25/lsnc_relu.yaml, pinned by \
+                     only_the_lsnc_relu_preset_arms_the_point_folded_twin) AHEAD of its \
+                     measurement, which is still owed (rows 14/17/58 x 3 reps at 25 s plus the \
+                     lsnc_relu moat) before this becomes Measured; the motivating numpy prototype (exact-f64 twin gradient, Adam, alpha 0.03 x width, \
+                     face-snapped restarts) reached the field's X_5 = +2 counterexample clause on \
+                     lsnc_relu 2026 rows 14/17/58 in 6-9% of 100-step restarts; every candidate \
+                     still passes the unchanged trusted-ORT gate and the lane has no \
+                     verdict-bearing return variant, so it cannot produce unsat",
+        },
+        owner: VNNCOMP_POSTBAB,
+        readers: POINT_FOLDED_TWIN_READERS,
     };
 }
 
@@ -463,6 +578,36 @@ mod tests {
             .expect("absence resolves to the historical enabled default");
         assert_eq!(default.value, LeverValue::Bool(true));
         assert_eq!(default.source, Source::Default);
+    }
+
+    /// #lsnc-attack-twin: absent everything the lane is dark; the typed preset
+    /// value arrives with `Source::Config` (the route a scored run takes, since
+    /// the harness exports no `NY_*`); an exact `0` still kills it.
+    #[test]
+    fn point_folded_twin_is_dark_by_default_and_the_typed_key_arms_it() {
+        let absent = read_over_config_with(&ATTACK_POINT_FOLDED_TWIN, |_| None, None)
+            .expect("absence is admissible");
+        assert_eq!(absent.value, LeverValue::Bool(false));
+        assert_eq!(absent.source, Source::Default);
+
+        let typed = read_over_config_with(
+            &ATTACK_POINT_FOLDED_TWIN,
+            |_| None,
+            Some(LeverValue::Bool(true)),
+        )
+        .expect("the typed key is admissible");
+        assert_eq!(typed.value, LeverValue::Bool(true));
+        assert_eq!(typed.source, Source::Config);
+        assert_ne!(typed.source, Source::LegacyEnv);
+
+        let killed = read_over_config_with(
+            &ATTACK_POINT_FOLDED_TWIN,
+            |_| Some("0".to_owned()),
+            Some(LeverValue::Bool(true)),
+        )
+        .expect("an exact 0 is an admissible disarm");
+        assert_eq!(killed.value, LeverValue::Bool(false));
+        assert_eq!(killed.source, Source::LegacyEnv);
     }
 
     #[cfg(unix)]

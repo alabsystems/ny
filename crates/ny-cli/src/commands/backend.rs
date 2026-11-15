@@ -516,7 +516,7 @@ pub(crate) fn register_qualified_wgpu_proof_engine(
     if ny_propagate::sound_gpu_gate::prewarm_sound_gpu_crown() {
         // INFO, not WARN: registration SUCCEEDED. The fail-closed arm below is
         // the warning. At WARN this reached stderr at default verbosity and
-        // broke `--json`'s empty-stderr contract (#395) on any machine with a
+        // broke `--json`'s empty-stderr contract on any machine with a
         // qualifying GPU.
         info!(
             "qualified WGPU proof engine registered: process-global sound CROWN slot \

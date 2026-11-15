@@ -11,8 +11,6 @@
 //!
 //! These helpers are placed in `ny-core` so every crate in the workspace
 //! can use them without depending on `ny-propagate`.
-//!
-//! Reference: Issue #2577 — NaN-absorbing fold pattern across 24+ production sites.
 
 /// NaN-propagating `min(a, b)` for fold-based lower bound computation.
 ///
@@ -60,8 +58,6 @@ pub fn nan_propagating_max(a: f32, b: f32) -> f32 {
 ///
 /// Identical semantics to [`nan_propagating_min`] but operates on `f64` values.
 /// Use as: `.fold(f64::INFINITY, nan_propagating_min_f64)`.
-///
-/// Reference: Issue #2616 — extend NaN-safe fold pattern to f64 sites.
 #[inline]
 #[must_use]
 pub fn nan_propagating_min_f64(a: f64, b: f64) -> f64 {
@@ -76,8 +72,6 @@ pub fn nan_propagating_min_f64(a: f64, b: f64) -> f64 {
 ///
 /// Identical semantics to [`nan_propagating_max`] but operates on `f64` values.
 /// Use as: `.fold(f64::NEG_INFINITY, nan_propagating_max_f64)`.
-///
-/// Reference: Issue #2616 — extend NaN-safe fold pattern to f64 sites.
 #[inline]
 #[must_use]
 pub fn nan_propagating_max_f64(a: f64, b: f64) -> f64 {
@@ -97,8 +91,6 @@ pub fn nan_propagating_max_f64(a: f64, b: f64) -> f64 {
 /// Used in CROWN A-matrix coefficient splitting: positive coefficients multiply
 /// upper bounds, negative coefficients multiply lower bounds. A NaN coefficient
 /// must poison the accumulator, not silently become zero.
-///
-/// Reference: Issue #2415 — NaN A-matrix coefficients silently become zero.
 #[inline]
 #[must_use]
 pub fn nan_propagating_max_zero(a: f32) -> f32 {
@@ -115,8 +107,6 @@ pub fn nan_propagating_max_zero(a: f32) -> f32 {
 ///
 /// Mirror of [`nan_propagating_max_zero`] for the negative-coefficient branch.
 /// Returns `a` if `a <= 0.0`, `0.0` if `a > 0.0`, and `NaN` if `a` is NaN.
-///
-/// Reference: Issue #2415.
 #[inline]
 #[must_use]
 pub fn nan_propagating_min_zero(a: f32) -> f32 {

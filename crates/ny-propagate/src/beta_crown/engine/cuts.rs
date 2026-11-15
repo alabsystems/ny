@@ -41,7 +41,7 @@ impl BetaCrownVerifier {
                         .inputs
                         .first()
                         .map(|s| s.as_str())
-                        // #2098: Return None for nodes with empty inputs.
+                        // Return None for nodes with empty inputs.
                         .or_else(|| {
                             tracing::warn!(node = %term.node_name, "ReLU node has empty inputs");
                             None

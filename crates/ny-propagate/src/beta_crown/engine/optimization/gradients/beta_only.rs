@@ -106,6 +106,9 @@ impl BetaCrownVerifier {
             let layer_constraints = constraints.get(&layer_idx);
 
             match layer {
+                Layer::PointLinear(_) => {
+                    return Err(crate::network::proof_eligibility::diagnostic_only());
+                }
                 Layer::Linear(linear) => {
                     let weight = linear.weight();
                     let mut new_lower_a = lin_bounds.lower_a().dot(weight);
@@ -123,7 +126,7 @@ impl BetaCrownVerifier {
                         lin_bounds.upper_b().clone()
                     };
 
-                    // #2977: Non-finite row fallback (matching crown_single.rs #2681).
+                    // Non-finite row fallback (matching crown_single.rs).
                     // Dot products of finite weights can overflow to Inf in f32. For rows
                     // with non-finite coefficients, zero the entire row and set bias to
                     // ±Inf — sound but maximally loose for that output.
@@ -162,7 +165,7 @@ impl BetaCrownVerifier {
                     relu_relaxations[layer_idx] = Some(relaxation);
                     lin_bounds = new_bounds;
                 }
-                // === All other layers: exhaustive error (#3424) ===
+                // === All other layers: exhaustive error ===
                 // Analytical β gradients only support Linear/ReLU networks.
                 Layer::Conv1d(_)
                 | Layer::Conv2d(_)
@@ -320,6 +323,9 @@ impl BetaCrownVerifier {
             }
 
             match layer {
+                Layer::PointLinear(_) => {
+                    return Err(crate::network::proof_eligibility::diagnostic_only());
+                }
                 Layer::Linear(linear) => {
                     let in_dim = linear.weight().ncols();
                     let out_dim = linear.weight().nrows();
@@ -363,7 +369,7 @@ impl BetaCrownVerifier {
                     w_aug[n] = w_const;
                     w = w_aug;
                 }
-                // === All other layers: exhaustive error (#3424) ===
+                // === All other layers: exhaustive error ===
                 Layer::Conv1d(_)
                 | Layer::Conv2d(_)
                 | Layer::Conv3d(_)

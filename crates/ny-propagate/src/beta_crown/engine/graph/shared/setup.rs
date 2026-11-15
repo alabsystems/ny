@@ -7,9 +7,6 @@
 //! Centralizes the root setup steps shared across the graph-BaB engines:
 //! preparing immutable root setup inputs, discovering ReLU nodes in a
 //! deterministic order, and building the root alpha state.
-//!
-//! Design: `designs/2026-03-14-issue-1860-graph-bab-service-convergence.md`
-//! Issue: #1860 (Packet B)
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,7 +42,7 @@ pub(crate) fn build_initial_node_bounds_arc(
 /// Collect zero-threshold binary activation (ReLU and Sign) node names in
 /// deterministic branching order.
 ///
-/// Part of #3769: Sign neurons use the same x=0 threshold as ReLU, so they
+/// Sign neurons use the same x=0 threshold as ReLU, so they
 /// are first-class branching candidates for graph BaB.
 pub(crate) fn build_sorted_relu_nodes(graph: &GraphNetwork) -> Vec<String> {
     let mut relu_nodes: Vec<String> = graph

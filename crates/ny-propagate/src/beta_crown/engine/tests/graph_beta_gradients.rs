@@ -9,7 +9,7 @@ use super::prelude::*;
 #[ntest::timeout(10000)]
 #[test]
 fn test_graph_beta_from_history_initializes_zero_beta() {
-    // Unit test for #1817: verify that GraphBetaState::from_history().unwrap() initializes
+    // Unit test: verify that GraphBetaState::from_history().unwrap() initializes
     // all β values to 0.0 (DEFAULT_BETA_INIT). The CROWN equivalence property is
     // tested by test_graph_constrained_crown_tightening in gpu_bab.rs.
     let history = GraphSplitHistory::new()
@@ -591,7 +591,7 @@ fn test_benchmark_analytical_vs_finite_diff_multi_objective() {
     );
 }
 
-/// Regression test for #2247: accumulate_grad must update ALL entries matching
+/// Regression test: accumulate_grad must update ALL entries matching
 /// a `(node_name, neuron_idx)` pair, not just the first.
 ///
 /// When GenBaB creates multiple constraints at the same neuron (different split
@@ -684,7 +684,7 @@ fn test_accumulate_grad_single_constraint_unchanged_2247() {
     );
 }
 
-/// Regression test for #2263: gradient_step_adam must not produce NaN/Inf
+/// Regression test: gradient_step_adam must not produce NaN/Inf
 /// when called with t=0 (missing t.max(1) guard).
 #[ntest::timeout(10000)]
 #[test]
@@ -751,7 +751,7 @@ fn test_gradient_step_adam_t_one_sane_2263() {
     );
 }
 
-/// Regression test for #2575/#2586: gradient_step_adam must not produce
+/// Regression test: gradient_step_adam must not produce
 /// NaN/Inf when beta1=1.0 (disables momentum — valid config).
 #[ntest::timeout(10000)]
 #[test]
@@ -784,7 +784,7 @@ fn test_gradient_step_adam_beta1_one_no_div_by_zero_2575() {
     );
 }
 
-/// Regression test for #2575/#2586: gradient_step_adam must not produce
+/// Regression test: gradient_step_adam must not produce
 /// NaN/Inf when beta2=1.0.
 #[ntest::timeout(10000)]
 #[test]
@@ -817,8 +817,8 @@ fn test_gradient_step_adam_beta2_one_no_div_by_zero_2575() {
     );
 }
 
-/// Test for #3112: NaN gradients are filtered at accumulate_grad gate.
-/// Previously (#2596), NaN entered the optimizer and was cleaned up post-step.
+/// Test: NaN gradients are filtered at the accumulate_grad gate.
+/// Previously, NaN entered the optimizer and was cleaned up post-step.
 /// Now, accumulate_grad skips NaN entirely — optimizer state is never corrupted.
 #[ntest::timeout(10000)]
 #[test]
@@ -841,7 +841,7 @@ fn test_gradient_step_adam_nan_gradient_filtered_at_gate_3112() {
         "beta should be positive after normal step"
     );
 
-    // Inject NaN gradient — filtered at the gate by #3112.
+    // Inject NaN gradient — filtered at the gate.
     beta_state.zero_grad();
     beta_state.accumulate_grad("relu1", 0, f32::NAN);
     assert_eq!(

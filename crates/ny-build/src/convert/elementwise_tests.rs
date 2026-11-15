@@ -5,7 +5,7 @@
 use super::ConvertContext;
 use crate::{AttributeValue, LayerSpec, WeightStore};
 use ndarray::{ArrayD, IxDyn};
-use ny_core::LayerType;
+use ny_core::{LayerType, NyError};
 use ny_propagate::layers::{BoundPropagation, CompareOp};
 use ny_propagate::Layer;
 use ny_tensor::BoundedTensor;
@@ -264,9 +264,7 @@ fn convert_softmax_adjusts_positive_axis_for_unbatched_mode_3499() {
 }
 
 #[test]
-fn convert_softmax_positive_axis_unknown_rank_keeps_legacy() {
-    // Unknown recorded rank keeps the legacy `axis - 1` adjustment
-    // (ny-synthesized-subgraph compatibility; see remap_axis_trailing).
+fn convert_softmax_positive_axis_unknown_rank_refuses() {
     let ctx = make_context();
     let spec = LayerSpec {
         name: "/asp/Softmax".to_string(),
@@ -277,14 +275,10 @@ fn convert_softmax_positive_axis_unknown_rank_keeps_legacy() {
         attributes: HashMap::from([("axis".to_string(), AttributeValue::Int(2))]),
     };
 
-    let layer = ctx
+    let error = ctx
         .convert_elementwise(&spec)
-        .expect("softmax conversion should succeed")
-        .expect("softmax layer should be converted");
-    match layer {
-        Layer::Softmax(softmax) => assert_eq!(softmax.axis, 1),
-        other => panic!("expected Softmax layer, got {:?}", other),
-    }
+        .expect_err("unknown rank must not authorize an axis-minus-one guess");
+    assert!(matches!(error, NyError::UnsupportedOp(_)));
 }
 
 #[test]
@@ -731,7 +725,7 @@ fn convert_integer_cast_retains_destination_domain_in_trunc_layer() {
             .propagate_ibp(&out_of_range)
             .expect_err("the exclusive positive Cast boundary must fail closed");
         assert!(
-            matches!(error, ny_core::NyError::SoundnessRefusal(_)),
+            matches!(error, NyError::SoundnessRefusal(_)),
             "target={target} returned the wrong refusal: {error:?}"
         );
     }
@@ -850,4 +844,184 @@ fn convert_epsilon_expand_rejects_invalid_radii_and_arity() {
         error.to_string().contains("unsupported attribute"),
         "{error}"
     );
+}
+
+#[test]
+fn public_gelu_conversion_rejects_unknown_serialized_approximation_strings() {
+    let weights = WeightStore::new();
+    let shapes = HashMap::new();
+    let constants = HashSet::new();
+    let context = ConvertContext::new(&weights, &shapes, &constants);
+    for approximate in [
+        "",
+        "fast",
+        "erf",
+        "TANH",
+        "tanh ",
+        "gelu-erf-exact-real/v1",
+        "silu-exact-real/v1",
+    ] {
+        let spec: LayerSpec = serde_json::from_value(serde_json::json!({
+            "name": "gelu_unknown",
+            "layer_type": LayerType::GELU,
+            "inputs": ["x"],
+            "outputs": ["y"],
+            "weights": null,
+            "attributes": {"approximate": {"String": approximate}}
+        }))
+        .expect("the public layer declaration must deserialize before conversion");
+        let error = context
+            .convert_layer(&spec)
+            .expect_err("unknown approximation must not silently become GELU-erf");
+        assert!(matches!(&error, NyError::ModelLoad(_)), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("gelu_unknown"), "{message}");
+        assert!(
+            message.contains("unsupported approximate value"),
+            "{message}"
+        );
+        assert!(message.contains("'none' or 'tanh'"), "{message}");
+    }
+}
+
+#[test]
+fn public_gelu_conversion_rejects_wrong_typed_serialized_approximation_values() {
+    let weights = WeightStore::new();
+    let shapes = HashMap::new();
+    let constants = HashSet::new();
+    let context = ConvertContext::new(&weights, &shapes, &constants);
+    for approximate in [
+        serde_json::json!({"Float": 0.0}),
+        serde_json::json!({"Int": 1}),
+        serde_json::json!({"Floats": [0.0]}),
+        serde_json::json!({"Ints": [1]}),
+    ] {
+        let spec: LayerSpec = serde_json::from_value(serde_json::json!({
+            "name": "gelu_wrong_type",
+            "layer_type": LayerType::GELU,
+            "inputs": ["x"],
+            "outputs": ["y"],
+            "weights": null,
+            "attributes": {"approximate": approximate}
+        }))
+        .expect("all public AttributeValue variants are valid layer-declaration JSON");
+        let error = context
+            .convert_layer(&spec)
+            .expect_err("a present non-string approximation must not select the default");
+        assert!(matches!(&error, NyError::ModelLoad(_)), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("gelu_wrong_type"), "{message}");
+        assert!(
+            message.contains("'approximate' must be STRING"),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn public_gelu_graph_builder_preserves_malformed_approximation_refusals_in_both_modes() {
+    for approximate in [
+        serde_json::json!({"String": "fast"}),
+        serde_json::json!({"Int": 1}),
+    ] {
+        let spec: LayerSpec = serde_json::from_value(serde_json::json!({
+            "name": "gelu_bad_graph",
+            "layer_type": LayerType::GELU,
+            "inputs": ["x"],
+            "outputs": ["y"],
+            "weights": null,
+            "attributes": {"approximate": approximate}
+        }))
+        .expect("public neutral layer declaration");
+        let model = crate::GraphModelBuilder::new("gelu_bad_graph")
+            .input("x", &[2], crate::DataType::Float32)
+            .output("y", &[2], crate::DataType::Float32)
+            .layer(spec)
+            .tensor_shape("x", &[2])
+            .tensor_shape("y", &[2])
+            .build();
+        for options in [
+            crate::GraphNetworkOptions::default(),
+            crate::GraphNetworkOptions::permissive(),
+        ] {
+            let Err(error) = model.build_graph_network(options) else {
+                panic!("malformed approximation must stay a graph-conversion error");
+            };
+            assert!(matches!(&error, NyError::ModelLoad(_)), "{error}");
+            let message = error.to_string();
+            assert!(message.contains("gelu_bad_graph"), "{message}");
+            assert!(message.contains("approximate"), "{message}");
+        }
+    }
+}
+
+#[test]
+fn public_gelu_missing_none_and_tanh_preserve_typed_and_graph_bound_bits() {
+    use ny_propagate::layers::{GELULayer, GeluApproximation};
+
+    let weights = WeightStore::new();
+    let shapes = HashMap::new();
+    let constants = HashSet::new();
+    let context = ConvertContext::new(&weights, &shapes, &constants);
+    let input = BoundedTensor::new(
+        ArrayD::from_shape_vec(IxDyn(&[2]), vec![-1.0, 0.25]).unwrap(),
+        ArrayD::from_shape_vec(IxDyn(&[2]), vec![0.5, 2.0]).unwrap(),
+    )
+    .unwrap();
+    let bits = |tensor: &BoundedTensor| {
+        tensor
+            .lower()
+            .iter()
+            .chain(tensor.upper().iter())
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    };
+    for (attributes, expected) in [
+        (serde_json::json!({}), GeluApproximation::Erf),
+        (
+            serde_json::json!({"approximate": {"String": "none"}}),
+            GeluApproximation::Erf,
+        ),
+        (
+            serde_json::json!({"approximate": {"String": "tanh"}}),
+            GeluApproximation::Tanh,
+        ),
+    ] {
+        let spec: LayerSpec = serde_json::from_value(serde_json::json!({
+            "name": "gelu_valid_graph",
+            "layer_type": LayerType::GELU,
+            "inputs": ["x"],
+            "outputs": ["y"],
+            "weights": null,
+            "attributes": attributes
+        }))
+        .expect("valid public serialized GELU declaration");
+        let converted = context
+            .convert_layer(&spec)
+            .expect("supported approximation");
+        let Layer::GELU(layer) = converted else {
+            panic!("public conversion must preserve the GELU operator");
+        };
+        assert_eq!(layer.approximation, expected);
+        assert!(layer.is_sound());
+        let reference = GELULayer::new(expected)
+            .propagate_ibp(&input)
+            .expect("unchanged typed GELU reference");
+        let direct = layer.propagate_ibp(&input).expect("converted GELU IBP");
+        assert_eq!(direct.shape(), reference.shape());
+        assert_eq!(bits(&direct), bits(&reference));
+        let model = crate::GraphModelBuilder::new("gelu_valid_graph")
+            .input("x", &[2], crate::DataType::Float32)
+            .output("y", &[2], crate::DataType::Float32)
+            .layer(spec)
+            .tensor_shape("x", &[2])
+            .tensor_shape("y", &[2])
+            .build();
+        let graph = model
+            .build_graph_network(crate::GraphNetworkOptions::default())
+            .expect("valid GELU graph must remain supported");
+        let output = graph.propagate_ibp(&input).expect("valid graph GELU IBP");
+        assert_eq!(output.shape(), reference.shape());
+        assert_eq!(bits(&output), bits(&reference));
+    }
 }

@@ -20,13 +20,13 @@ impl LayerNormLayer {
             ));
         }
         if x.len() > (1 << 24) {
-            // f32 precision guard (#2136)
+            // f32 precision guard
             return Err(NyError::InternalError(format!(
                 "LayerNorm dimension {} exceeds f32 exact integer range",
                 x.len()
             )));
         }
-        // f64 accumulation to avoid catastrophic cancellation (#3325)
+        // f64 accumulation to avoid catastrophic cancellation
         let n = x.len() as f64;
         let mean = x.iter().map(|&xi| xi as f64).sum::<f64>() / n;
         Ok(match self.mode {
@@ -68,7 +68,7 @@ impl LayerNormLayer {
             ));
         }
         let n = x.len();
-        // f64 accumulation to avoid catastrophic cancellation in Jacobian (#3325)
+        // f64 accumulation to avoid catastrophic cancellation in Jacobian
         let nf = n as f64;
 
         let mean = x.iter().map(|&xi| xi as f64).sum::<f64>() / nf;

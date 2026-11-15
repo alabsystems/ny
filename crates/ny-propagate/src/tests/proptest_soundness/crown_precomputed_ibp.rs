@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Property-based verification of pre-computed IBP bounds reuse (#3397).
+//! Property-based verification of pre-computed IBP bounds reuse.
 //!
 //! Verifies:
 //! 1. CROWN with pre-computed IBP produces identical bounds to CROWN without
@@ -111,7 +111,7 @@ proptest! {
 
     /// CROWN with pre-computed IBP produces identical bounds to CROWN without.
     ///
-    /// The pre-computed IBP optimization (#3397) is purely a performance
+    /// The pre-computed IBP optimization is purely a performance
     /// optimization: it should not change the mathematical result. This test
     /// generates random 3-layer networks and verifies that both paths produce
     /// identical output bounds.

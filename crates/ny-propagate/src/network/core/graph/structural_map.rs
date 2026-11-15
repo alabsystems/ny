@@ -78,6 +78,10 @@ impl TrackedStringMapAllocationFactV1 {
 pub(crate) struct TrackedStringMap<V> {
     inner: InnerMap<V>,
     table_allocation_high_water_bytes: usize,
+    // Sum of the capacities of the keys ACTUALLY retained in the table.
+    // None is a closed observation after arithmetic failure or an unwinding
+    // value mutation. It must never become a public-capacity estimate.
+    key_payload_capacity_bytes: Option<usize>,
 }
 
 impl<V> TrackedStringMap<V> {
@@ -85,11 +89,24 @@ impl<V> TrackedStringMap<V> {
         Self::from_inner(InnerMap::with_hasher(RandomState::new()))
     }
 
+    /// Reserve a String-map table and observe its actual pinned allocation.
+    /// Nested key/value owners still need their own capacity accounting.
+    pub(super) fn with_capacity(capacity: usize) -> Self {
+        Self::from_inner(InnerMap::with_capacity_and_hasher(
+            capacity,
+            RandomState::new(),
+        ))
+    }
+
     fn from_inner(inner: InnerMap<V>) -> Self {
         let table_allocation_high_water_bytes = inner.allocation_size();
+        let key_payload_capacity_bytes = inner
+            .keys()
+            .try_fold(0usize, |sum, key| sum.checked_add(key.capacity()));
         Self {
             inner,
             table_allocation_high_water_bytes,
+            key_payload_capacity_bytes,
         }
     }
 
@@ -122,8 +139,25 @@ impl<V> TrackedStringMap<V> {
         }
     }
 
+    /// Exact String-key payload capacity, maintained on every mutation.
+    /// Fixed-cost observation avoids iterating a sparse table in a bounded
+    /// query. V1 table facts remain separate; nested values are not included.
+    pub(crate) fn key_payload_capacity_bytes_v2(&self) -> Option<usize> {
+        self.key_payload_capacity_bytes
+    }
+
     pub(super) fn insert(&mut self, key: String, value: V) -> Option<V> {
-        let replaced = self.inner.insert(key, value);
+        let replaced = match self.inner.entry(key) {
+            hashbrown::hash_map::Entry::Occupied(mut entry) => Some(entry.insert(value)),
+            hashbrown::hash_map::Entry::Vacant(entry) => {
+                let capacity = entry.key().capacity();
+                entry.insert(value);
+                self.key_payload_capacity_bytes = self
+                    .key_payload_capacity_bytes
+                    .and_then(|bytes| bytes.checked_add(capacity));
+                None
+            }
+        };
         self.refresh_table_allocation_high_water();
         replaced
     }
@@ -139,19 +173,25 @@ impl<V> TrackedStringMap<V> {
     }
 
     pub(super) fn remove(&mut self, key: &str) -> Option<V> {
-        let removed = self.inner.remove(key);
-        self.refresh_table_allocation_high_water();
-        removed
+        self.remove_entry(key).map(|(_, value)| value)
     }
 
     pub(super) fn remove_entry(&mut self, key: &str) -> Option<(String, V)> {
         let removed = self.inner.remove_entry(key);
+        if let Some((key, _)) = &removed {
+            self.key_payload_capacity_bytes = self
+                .key_payload_capacity_bytes
+                .and_then(|bytes| bytes.checked_sub(key.capacity()));
+        }
         self.refresh_table_allocation_high_water();
         removed
     }
 
     pub(super) fn clear(&mut self) {
+        // A panicking V::drop must leave a closed nested-key observation.
+        self.key_payload_capacity_bytes = None;
         self.inner.clear();
+        self.key_payload_capacity_bytes = Some(0);
         self.refresh_table_allocation_high_water();
     }
 
@@ -177,7 +217,12 @@ impl<V> TrackedStringMap<V> {
     }
 
     pub(super) fn retain(&mut self, mut keep: impl FnMut(&String, &mut V) -> bool) {
+        self.key_payload_capacity_bytes = None;
         self.inner.retain(|key, value| keep(key, value));
+        self.key_payload_capacity_bytes = self
+            .inner
+            .keys()
+            .try_fold(0usize, |sum, key| sum.checked_add(key.capacity()));
         self.refresh_table_allocation_high_water();
     }
 }
@@ -300,13 +345,14 @@ mod tests {
 
     /// Literal V1 KAT for the reviewed x86_64 table layout. These values bind
     /// the dependency pin to bucket storage, control bytes, layout padding,
-    /// and the wrapper's inline high-water field. They are deliberately not
+    /// and the wrapper's inline high-water/key-capacity fields. The new nested
+    /// key observation adds sixteen inline bytes on this target. These are not
     /// inferred from logical capacity.
     #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
     #[test]
     fn pinned_hashbrown_0_16_1_allocation_layout_kat() {
         let mut map = TrackedStringMap::<u64>::new();
-        assert_eq!(size_of::<TrackedStringMap<u64>>(), 56);
+        assert_eq!(size_of::<TrackedStringMap<u64>>(), 72);
 
         map.try_reserve(64).unwrap();
         let reserved = observation(&map);
@@ -314,7 +360,7 @@ mod tests {
         assert_eq!(reserved.conservative_table_high_water_charge_bytes(), 4_240);
         assert_eq!(
             reserved.conservative_accounting_charge_bytes_including_inline(),
-            Some(4_296)
+            Some(4_312)
         );
 
         map.insert("one".to_owned(), 1);

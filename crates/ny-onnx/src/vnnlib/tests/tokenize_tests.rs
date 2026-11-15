@@ -40,7 +40,7 @@ fn test_tokenize_with_string() {
 #[test]
 fn test_tokenize_empty() {
     let tokens = tokenize("").unwrap();
-    assert!(tokens.is_empty());
+    assert_eq!((tokens).len(), 0);
 }
 
 #[ntest::timeout(10000)]

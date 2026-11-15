@@ -245,7 +245,7 @@ fn build_relu_child_from_picked(
 /// Branch a domain directly from batched `PickedDomains` for the ReLU GPU happy path,
 /// without materializing an intermediate parent `GraphBabDomain`.
 ///
-/// This is Direction 2 of #1668: instead of `graph_domain_from_picked` -> `with_constraint`,
+/// Instead of `graph_domain_from_picked` -> `with_constraint`,
 /// this reads the single needed neuron value directly from the batched arrays for the
 /// feasibility check, then materializes `node_bounds` only once and shares them between
 /// both children via `Arc`. This eliminates:
@@ -267,10 +267,6 @@ fn build_relu_child_from_picked(
 /// `(Option<active_child>, Option<inactive_child>, propagation_failure)`:
 /// either child is `None` if infeasible; `propagation_failure=true` means
 /// branch child construction failed (for example NaN-contaminated input bounds).
-///
-/// # Reference
-/// Issue: #1668 (zero-copy domain flow)
-/// Design: `designs/2026-02-07-gpu-bab-zero-copy-domain-flow.md` Direction 2
 // Justification: ReLU branching needs domain index, picked domains, graph, input,
 // split info, context, config, beta state, and engine — all from BaB tree context.
 #[allow(clippy::too_many_arguments)]

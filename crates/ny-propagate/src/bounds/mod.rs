@@ -40,9 +40,11 @@ mod tests;
 
 pub use alpha::{
     AdamParams, AlphaCrownConfig, AlphaCrownIntermediate, AlphaSpecAscent, AlphaSpecEarlyExit,
-    AlphaState, GradientMethod, GraphAlphaCrownIntermediate, GraphAlphaState, MultiSpecKeep,
-    Optimizer,
+    AlphaState, CganChildZonoRefreshConfig, GradientMethod, GraphAlphaCrownIntermediate,
+    GraphAlphaState, MarginAlphaSearch, MultiSpecKeep, Optimizer,
 };
+// #vit-margin-alpha: certify-once margin publication (root merge + tests).
+pub use alpha::{MarginAlphaPublication, MarginMergeStats, MarginPublicationRefusal};
 pub(crate) use alpha_s_shaped::{MonotoneSShapedAlpha, MonotoneSShapedPathAlpha};
 pub(crate) use alpha_s_shaped_update::MonotoneSShapedGradients;
 pub(crate) use alpha_sqrt::SqrtGradients;
@@ -57,7 +59,7 @@ pub use linear::LinearBounds;
 pub use linear::{slack_probe_enabled, slack_probe_take};
 pub use linear_f64::LinearBounds64;
 /// NaN-propagating comparisons (re-exported from ny-core) and safe bound arithmetic.
-/// Only items with crate-internal consumers are re-exported here (#3240).
+/// Only items with crate-internal consumers are re-exported here.
 pub(crate) use safe_math::{
     nan_propagating_max, nan_propagating_max_zero, nan_propagating_min, nan_propagating_min_zero,
 };
@@ -65,7 +67,7 @@ pub use safe_math::{safe_mul_for_bounds, safe_mul_for_bounds_f64};
 
 // Test-only re-exports: these functions have no production callers but are exercised
 // by unit tests that import via `crate::bounds::*`. Gated behind #[cfg(test)] so they
-// don't leak into the public API (#3240).
+// don't leak into the public API.
 #[cfg(test)]
 pub(crate) use batched::{
     batched_interval_matvec, batched_interval_matvec_checked, batched_matvec,

@@ -58,16 +58,17 @@ impl ConvertContext<'_> {
         // whether the runtime inputs kept their ONNX rank or were
         // batch-stripped — the mscn deep-set Concat over retained-rank
         // `[1, d]` inputs miscompiled to a leading-axis stack under the
-        // legacy `axis - 1` guess). Unknown rank keeps the legacy adjustment
-        // (ny-synthesized subgraphs, e.g. the LSTM unroller, were authored
-        // against it). ONNX Concat requires equal-rank inputs, so the first
-        // input's recorded rank speaks for all of them.
+        // legacy `axis - 1` guess). Unknown rank refuses unless an internal
+        // lowering carries explicit legacy-axis provenance. ONNX Concat
+        // requires equal-rank inputs, so the first input's recorded rank speaks
+        // for all of them.
         let axis = self.remap_axis_trailing(
             "Concat",
             &spec.name,
             &spec.inputs[0],
             onnx_axis,
             super::LegacyBatchAxisPolicy::KeepZeroWarn,
+            super::legacy_axis_authority(spec)?,
         )?;
 
         debug!(
@@ -198,8 +199,8 @@ impl ConvertContext<'_> {
             })
             .unwrap_or(0);
 
-        // Trailing-relative remap with legacy fallback for unknown recorded
-        // ranks — see `convert_concat` above and
+        // Trailing-relative remap with authenticated internal-only fallback for
+        // unknown recorded ranks — see `convert_concat` above and
         // `ConvertContext::remap_axis_trailing`.
         let axis = self.remap_axis_trailing(
             "Concat",
@@ -207,6 +208,7 @@ impl ConvertContext<'_> {
             &spec.inputs[0],
             onnx_axis,
             super::LegacyBatchAxisPolicy::KeepZeroWarn,
+            super::legacy_axis_authority(spec)?,
         )?;
 
         debug!(

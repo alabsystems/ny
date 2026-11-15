@@ -28,7 +28,7 @@ use crate::bounds::GraphAlphaState;
 
 use super::*;
 
-/// Root fixture shared by the oracles: the 2-ReLU DAG from #3870 plus a
+/// Root fixture shared by the oracles: the 2-ReLU DAG plus a
 /// root-optimized α seed built the same way the warmup path does.
 fn warm_rebound_fixture() -> (
     GraphNetwork,

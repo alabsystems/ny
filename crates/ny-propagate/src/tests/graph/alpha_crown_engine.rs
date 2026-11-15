@@ -4,7 +4,7 @@
 
 //! DAG alpha-CROWN engine parity regressions.
 //!
-//! `#3499` threads a `GemmEngine` into the ECAPA stage-local alpha helper via
+//! A `GemmEngine` is threaded into the ECAPA stage-local alpha helper via
 //! `collect_alpha_crown_bounds_dag_with_engine(...)`. These tests lock down the
 //! lower-level contract directly: using an explicit GEMM engine must preserve
 //! the collected DAG alpha bounds and alpha state relative to `engine=None`,

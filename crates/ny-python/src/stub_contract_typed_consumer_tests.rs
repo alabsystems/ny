@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Contract tests for the typed consumer-facing Python surface added in #3942.
+//! Contract tests for the typed consumer-facing Python surface.
 //!
 //! Keeps `ny.pyi` and the runtime module aligned for nested typed fields that
 //! top-level export parity alone cannot catch.

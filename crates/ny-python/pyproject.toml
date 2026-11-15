@@ -4,7 +4,11 @@ build-backend = "maturin"
 
 [project]
 name = "ny"
-version = "0.4.0"
+# The version has ONE source: `[workspace.package] version` in the root
+# Cargo.toml (ny-python inherits it). maturin stamps the wheel from Cargo when
+# `version` is dynamic, so a release bump that moves only Cargo manifests can
+# no longer leave this file behind (0.5.0 shipped with 0.4.0 here: ac4cf1483).
+dynamic = ["version"]
 description = "Python bindings for ny neural network verification"
 readme = "README.md"
 requires-python = ">=3.9"

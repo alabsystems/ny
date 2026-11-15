@@ -19,7 +19,7 @@
 //!
 //! Invoking the former commands now prints the quarantine notice and exits
 //! without GPU work:
-//! `cargo run -p ny-onnx --release --example cut_fold_cifar100_resident -- c2`
+//! `targo --unverified run -p ny-onnx --release --example cut_fold_cifar100_resident -- c2`
 //! or replace `c2` with `c2b`.
 
 use ndarray::{Array2, ArrayD, IxDyn};
@@ -657,7 +657,7 @@ fn main() {
         Some("c2b") => c2b_signed_cut_fold_resident_root_margin_experiment(),
         _ => panic!(
             "select exactly one experiment: \
-             cargo run -p ny-onnx --release --example cut_fold_cifar100_resident -- c2|c2b"
+             targo --unverified run -p ny-onnx --release --example cut_fold_cifar100_resident -- c2|c2b"
         ),
     }
 }

@@ -2,13 +2,14 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cached static staging plans for GPU CROWN backward (#3397).
+//! Cached static staging plans for GPU CROWN backward.
 
 use std::sync::Arc;
 
 use ny_core::{GpuCrownLayer, NyError, Result};
 use wgpu::util::DeviceExt;
 
+use super::super::error_scope::run_gpu_checked_on_device;
 use super::super::WgpuDevice;
 use super::crown_backward_types::{
     build_dispatch_plan, conv2d_buffer_sizes, layer_input_dim, DispatchStep,
@@ -33,9 +34,9 @@ pub(crate) struct PreparedCrownPlan {
     pub(super) steps: Vec<DispatchStep>,
     pub(super) staging_buf: wgpu::Buffer,
     pub(super) dynamic_uploads: Vec<DynamicUpload>,
-    /// Dedicated working buffers owned by this plan (#3397 Step 4).
+    /// Dedicated working buffers owned by this plan.
     pub(super) working: super::crown_plan_working::CrownWorkingBuffers,
-    /// Pre-built bind groups for each dispatch step (#3397 Step 4).
+    /// Pre-built bind groups for each dispatch step.
     pub(super) step_bind_groups: Vec<super::crown_plan_working::StepBindGroups>,
     /// Keep-alive clones of every static weight `Arc` this plan was built from
     /// (#perf-plan-cache CORRECTNESS FIX). The cache key hashes weights by
@@ -86,6 +87,35 @@ impl WgpuDevice {
         num_specs: usize,
         first_dim: usize,
     ) -> Result<Arc<PreparedCrownPlan>> {
+        self.get_or_prepare_crown_plan_with(layers, num_specs, first_dim, || {
+            PreparedCrownPlan::build(self, layers, num_specs, first_dim)
+        })
+    }
+
+    /// [`Self::get_or_prepare_crown_plan`] with the plan builder passed in.
+    /// Production passes [`PreparedCrownPlan::build`]; the gpu-tests pin
+    /// passes a real build that also hits a wgpu error, standing in for an
+    /// allocation failure it cannot provoke on demand.
+    ///
+    /// A miss builds the plan inside its OWN wgpu error scope and caches it
+    /// only when that scope is clean. wgpu reports a failed `create_buffer`
+    /// (out of memory, or a size past a device limit) through the error scopes
+    /// and still hands back a buffer handle, so `build` returns `Ok` with an
+    /// invalid buffer in it. Building inside the caller's scope alone
+    /// (`crown_backward_gpu_seeded`'s `run_gpu_checked`) failed that call but
+    /// had already cached the plan, and every later call with the same layers
+    /// and shape hit it and failed too, until the next
+    /// `clear_crown_working_set`. The conv_transpose plan cache had the same
+    /// defect (`get_or_prepare_conv_transpose_plan_with`). Every caller runs
+    /// under a plain `run_gpu_checked`, never inside a checked transaction, so
+    /// the nested scope cannot outlive a transaction deadline.
+    fn get_or_prepare_crown_plan_with(
+        &self,
+        layers: &[GpuCrownLayer],
+        num_specs: usize,
+        first_dim: usize,
+        build: impl FnOnce() -> Result<PreparedCrownPlan>,
+    ) -> Result<Arc<PreparedCrownPlan>> {
         let key = crown_plan_key(layers, num_specs, first_dim);
         {
             let cache = self.crown_plan_cache.lock().map_err(|err| {
@@ -96,8 +126,10 @@ impl WgpuDevice {
             }
         }
 
-        let plan = Arc::new(PreparedCrownPlan::build(
-            self, layers, num_specs, first_dim,
+        let plan = Arc::new(run_gpu_checked_on_device(
+            &self.device,
+            "CROWN plan build",
+            build,
         )?);
         let mut cache = self.crown_plan_cache.lock().map_err(|err| {
             NyError::InternalError(format!("crown plan cache lock poisoned: {err}"))
@@ -105,7 +137,7 @@ impl WgpuDevice {
         Ok(cache.entry(key).or_insert_with(|| plan.clone()).clone())
     }
 
-    /// Clear the CROWN plan cache, freeing cached staging buffers (#3515).
+    /// Clear the CROWN plan cache, freeing cached staging buffers.
     ///
     /// Call between models in the VNN-COMP runner alongside
     /// `BufferPool::release_crown_buffers()` to prevent cross-model memory
@@ -403,7 +435,7 @@ impl PreparedCrownPlan {
             })
             .collect();
 
-        // Step 4 (#3397): Create dedicated working buffers and pre-build
+        // Step 4: Create dedicated working buffers and pre-build
         // all bind groups at plan creation time, eliminating per-call
         // pool allocation and bind group creation overhead.
         let input_dim = final_dim;
@@ -462,4 +494,114 @@ fn collect_static_weight_arcs(layers: &[GpuCrownLayer]) -> Vec<Arc<[f32]>> {
         }
     }
     arcs
+}
+
+#[cfg(all(test, feature = "gpu-tests"))]
+mod gpu_tests {
+    use super::*;
+    use crate::wgpu_device::test_support::{gpu_test_serial_guard, require_device};
+    use ny_core::GpuCrownBackward;
+
+    fn cached_plans(device: &WgpuDevice) -> usize {
+        device
+            .crown_plan_cache
+            .lock()
+            .map(|cache| cache.len())
+            .unwrap_or(usize::MAX)
+    }
+
+    /// A plan whose build hit a wgpu error never enters the CROWN plan cache.
+    ///
+    /// The fault stands in for a `create_buffer` that fails (out of memory, or
+    /// a size past a device limit): wgpu reports it through the error scopes
+    /// and still hands back a handle, so the build returns `Ok` with an
+    /// invalid buffer in its working set. Before the fix the plan was cached
+    /// inside the caller's scope, the call failed, and every later call with
+    /// the same layers hit the broken plan (its first `write_buffer` targets
+    /// the invalid buffer) until `clear_crown_working_set`.
+    #[test]
+    fn crown_plan_build_with_gpu_error_is_not_cached() {
+        let _gpu_serial = gpu_test_serial_guard();
+        let device = require_device();
+        device
+            .clear_crown_plan_cache()
+            .expect("clear CROWN plan cache");
+
+        let layers = vec![GpuCrownLayer::Linear {
+            weight: vec![0.5f32, -0.3, 0.2, 0.4].into(),
+            bias: Some(vec![0.1f32, -0.1].into()),
+            out_features: 2,
+            in_features: 2,
+            cert_err: Default::default(),
+        }];
+        let spec = vec![1.0f32, 0.0, 0.0, 1.0];
+        let (input_lower, input_upper) = ([-1.0f32, -1.0], [1.0f32, 1.0]);
+        let reference = device
+            .crown_backward_gpu(&layers, &spec, 2, &input_lower, &input_upper)
+            .expect("clean CROWN backward reference");
+        device
+            .clear_crown_plan_cache()
+            .expect("clear CROWN plan cache after the reference");
+
+        let past_limit = device
+            .device
+            .limits()
+            .max_buffer_size
+            .checked_add(4)
+            .expect("max_buffer_size + 4 fits u64");
+        let failed = device.run_gpu_checked("CROWN plan build fault pin", || {
+            device.get_or_prepare_crown_plan_with(&layers, 2, 2, || {
+                let mut plan = PreparedCrownPlan::build(&device, &layers, 2, 2)?;
+                plan.working.a_lower_0 = device.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("crown plan fault pin: past max_buffer_size"),
+                    size: past_limit,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                Ok(plan)
+            })
+        });
+        let cached_after_failure = cached_plans(&device);
+        let retry = device.crown_backward_gpu(&layers, &spec, 2, &input_lower, &input_upper);
+        let cached_after_retry = cached_plans(&device);
+        device
+            .clear_crown_plan_cache()
+            .expect("clear CROWN plan cache after the pin");
+
+        match &failed {
+            Err(NyError::InternalError(msg)) => assert!(
+                msg.contains("wgpu validation error"),
+                "the build's wgpu error must fail the call: {msg}"
+            ),
+            Err(other) => panic!("expected the build's wgpu validation error, got {other}"),
+            Ok(_) => panic!("a build that hit a wgpu error must not return a plan"),
+        }
+        let retry = retry.unwrap_or_else(|e| {
+            panic!(
+                "the same layers must build clean after a failed build (plans cached by \
+                 the failed build: {cached_after_failure}): {e}"
+            )
+        });
+        assert_eq!(
+            cached_after_failure, 0,
+            "a build that hit a wgpu error must not enter the CROWN plan cache"
+        );
+        assert_eq!(
+            cached_after_retry, 1,
+            "the clean retry builds and caches one plan"
+        );
+        for (name, got, want) in [
+            ("lower", &retry.lower_bounds, &reference.lower_bounds),
+            ("upper", &retry.upper_bounds, &reference.upper_bounds),
+        ] {
+            assert_eq!(got.len(), want.len(), "{name} length");
+            assert!(
+                got.iter()
+                    .zip(want.iter())
+                    .all(|(g, w)| g.to_bits() == w.to_bits()),
+                "{name}: the rebuilt plan must be bit-identical to a clean build: \
+                 {got:?} vs {want:?}"
+            );
+        }
+    }
 }

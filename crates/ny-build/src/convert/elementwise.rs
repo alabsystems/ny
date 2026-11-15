@@ -41,6 +41,7 @@ impl ConvertContext<'_> {
             data_name,
             i64::from(onnx_axis),
             super::LegacyBatchAxisPolicy::RejectZero,
+            super::legacy_axis_authority(spec)?,
         )?;
         i32::try_from(remapped).map_err(|_| {
             NyError::ModelLoad(format!(
@@ -452,8 +453,21 @@ impl ConvertContext<'_> {
             }
             LayerType::GELU => {
                 let approximation = match spec.attributes.get("approximate") {
+                    None => GeluApproximation::Erf,
+                    Some(AttributeValue::String(s)) if s == "none" => GeluApproximation::Erf,
                     Some(AttributeValue::String(s)) if s == "tanh" => GeluApproximation::Tanh,
-                    _ => GeluApproximation::Erf,
+                    Some(AttributeValue::String(_)) => {
+                        return Err(NyError::ModelLoad(format!(
+                            "GELU {} unsupported approximate value (expected 'none' or 'tanh')",
+                            spec.name
+                        )));
+                    }
+                    Some(_) => {
+                        return Err(NyError::ModelLoad(format!(
+                            "GELU {} attribute 'approximate' must be STRING",
+                            spec.name
+                        )));
+                    }
                 };
                 Ok(Some(Layer::GELU(GELULayer::new(approximation))))
             }

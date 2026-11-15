@@ -1310,14 +1310,22 @@ mod tests {
 #[cfg(all(test, feature = "gpu-tests"))]
 mod gpu_tests {
     use super::*;
-    use crate::wgpu_device::test_support::{gpu_test_serial_guard, require_verdict_device};
+    use crate::wgpu_device::test_support::gpu_test_serial_guard;
+    // The certified-radius merge test needs an UNCHARGED verdict device; its
+    // fixtures and imports are that lane's. The dedicated-device fault test
+    // below runs in plain `gpu-tests`.
+    #[cfg(feature = "gpu-tests-uncharged")]
+    use crate::wgpu_device::test_support::require_verdict_device;
+    #[cfg(feature = "gpu-tests-uncharged")]
     use ny_core::{
         CertifiedWeightError, GpuBackwardSlot, GpuCrownBackward, GpuIntermediateInjection,
         GpuIntermediateSweepPlan,
     };
+    #[cfg(feature = "gpu-tests-uncharged")]
     use ny_test_utils::env::ScopedEnvVar;
     use std::time::{Duration, Instant};
 
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn certified_zero_linear(bias_abs_err: f32) -> GpuCrownLayer {
         GpuCrownLayer::Linear {
             weight: Arc::from([0.0]),
@@ -1331,6 +1339,7 @@ mod gpu_tests {
         }
     }
 
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn certified_residual_plan(subtract: bool) -> GpuIntermediateSweepPlan {
         let residual = if subtract {
             GpuBackwardOp::Sub {
@@ -1376,6 +1385,7 @@ mod gpu_tests {
     }
 
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn live_add_and_sub_merge_both_certified_bias_radii() {
         let _serial = gpu_test_serial_guard();
         let _coalesce = ScopedEnvVar::unset("NY_FOLD_COALESCE");

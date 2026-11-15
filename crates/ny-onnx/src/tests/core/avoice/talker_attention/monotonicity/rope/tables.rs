@@ -5,15 +5,13 @@
 use super::*;
 
 // ---------------------------------------------------------------------------
-// Phase 4: Real RoPE frequency tables (#3497)
+// Phase 4: Real RoPE frequency tables
 //
 // The tests above use identity RoPE (cos=1, sin=0), which verifies
 // content-similarity-only monotonicity. Phase 4 uses precomputed Qwen3-TTS
 // RoPE frequency tables with the current avoice `rope_theta=1_000_000`,
 // runtime `head_dim=128`, and exported cos/sin width `rope_dim=64` to verify
 // monotonicity with actual positional encoding.
-//
-// Reference: designs/2026-03-11-issue-3497-centroid-monotonicity-verification-path.md §Phase 4
 // ---------------------------------------------------------------------------
 
 fn assert_rope_tables_finite_and_bounded(cos: &ArrayD<f32>, sin: &ArrayD<f32>) {

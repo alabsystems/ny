@@ -21,7 +21,7 @@
 //! - [`pool::TensorPool`]: Thread-local memory pool for buffer reuse.
 //! - [`pool::PooledBuffer`]: Auto-returning buffer handle.
 
-// Link macOS Accelerate BLAS for ndarray::dot() acceleration (#4259).
+// Link macOS Accelerate BLAS for ndarray::dot() acceleration.
 #[cfg(target_os = "macos")]
 extern crate blas_src;
 
@@ -48,14 +48,14 @@ pub mod zonotope;
 
 /// Double-precision bounded tensor for f64 propagation (soundnessbench, sat_relu).
 pub use bounded_tensor::BoundedTensor64;
-/// Shared inverted-bounds repair strategy for propagation and readback code. Part of #3307.
+/// Shared inverted-bounds repair strategy for propagation and readback code.
 pub use bounded_tensor::InversionRepair;
 /// Optional per-normalization-slice Euclidean-ball annotation on a [`BoundedTensor`]
 /// enabling exact Cauchy–Schwarz tightening at the downstream `Linear`.
 pub use bounded_tensor::L2Constraint;
-/// Strategy for automatic NaN/Inf repair at BoundedTensor construction. Part of #3423.
+/// Strategy for automatic NaN/Inf repair at BoundedTensor construction.
 pub use bounded_tensor::RepairStrategy;
-/// Shared inverted-bounds repair helpers. Part of #3307.
+/// Shared inverted-bounds repair helpers.
 pub use bounded_tensor::{repair_inverted_bounds, repair_inverted_bounds_nd};
 /// Interval-bounded tensor type for representing input regions with lower/upper bounds.
 pub use bounded_tensor::{

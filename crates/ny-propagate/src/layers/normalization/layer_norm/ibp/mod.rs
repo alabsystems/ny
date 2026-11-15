@@ -116,7 +116,7 @@ impl BoundPropagation for LayerNormLayer {
             // finite real input — Standard mode's |z_i| ≤ sqrt(n-1) clamp holds
             // regardless of input magnitude, MeanOnly yields [-inf, +inf] — and
             // matches the existing internal-overflow route (`has_nonfinite_mean`
-            // → `fallback_output_bounds`, #3030/#3060). Skipping the L2 lever
+            // → `fallback_output_bounds`). Skipping the L2 lever
             // annotation here only forgoes tightening (sound). NaN input still
             // fails closed inside `validate_ibp_input`.
             ValidatedIbpInput::Saturated => {

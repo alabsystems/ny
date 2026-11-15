@@ -33,9 +33,7 @@ use super::shared::array_element_at;
 /// `(left_child, right_child)` — either is `None` if the split dimension has zero width.
 ///
 /// # Reference
-/// - Design: `designs/2026-02-10-input-split-domain-list.md` Phase 1 §1.3
 /// - alpha-beta-CROWN: `input_split/branching_domains.py:UnsortedInputDomainList`
-/// - Issue: #1891
 pub fn branch_input_split_from_picked(
     idx: usize,
     picked: &PickedDomains,
@@ -146,8 +144,6 @@ pub fn branch_input_split_from_picked(
 /// # Reference
 /// - alpha-beta-CROWN `input_split/branching_heuristics.py`: `sb` method
 ///   scores `|lA| * (x_U - x_L) / 2`
-/// - Design: `designs/2026-02-10-input-split-domain-list.md` §1.2
-/// - Issue: #1891
 #[cfg(test)]
 pub fn select_input_split_dimension(picked: &PickedDomains, idx: usize) -> Result<(usize, f32)> {
     let input_lower = picked.input_lowers.index_axis(Axis(0), idx);

@@ -429,7 +429,7 @@ fn test_conv2d_wrong_input_channels_returns_none() {
     );
 }
 
-/// Regression test (#4319): verify that the residual-add DAG CPU IBP produces
+/// Regression test: verify that the residual-add DAG CPU IBP produces
 /// correct bounds, confirming the integration path is sound.
 ///
 /// DAG: input -> linear1 -> relu -> linear2 -> Add(input, linear2) -> output
@@ -470,7 +470,7 @@ fn test_residual_add_dag_cpu_ibp_parity_4319() {
     );
 }
 
-/// Verify that the lowered DAG plan has correct element counts for each op (#4319).
+/// Verify that the lowered DAG plan has correct element counts for each op.
 #[test]
 fn test_residual_dag_op_element_counts() {
     let graph = build_residual_dag();
@@ -515,7 +515,7 @@ fn test_residual_dag_op_element_counts() {
     }
 }
 
-/// Regression test (#4320): ResNet-style graph with global average pool
+/// Regression test: ResNet-style graph with global average pool
 /// should produce correct CPU IBP bounds and lower successfully.
 ///
 /// DAG: input → conv1(1×1) → relu → global_avg_pool → output
@@ -585,9 +585,6 @@ fn test_resnet_avgpool_cpu_ibp_parity_4320() {
 /// perturbed point. This test verifies that call succeeds on a graph
 /// containing AveragePool with engine=None, which is exactly what
 /// adv_check does when no GPU device is available.
-///
-/// Part of #4320 acceptance criteria: "a new regression proves resident DAG
-/// usage from the adv-check caller path".
 #[test]
 fn test_adv_check_ibp_with_engine_on_avgpool_graph_4320() {
     let mut graph = GraphNetwork::new();

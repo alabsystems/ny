@@ -5,7 +5,7 @@
 //! Straight-through-estimator Sign surrogate regression tests
 //! (#surrogate-sign, `attack: surrogate_sign_gradient`).
 //!
-//! The legacy tanh(β·x) smooth relaxation (#3769) saturates to a zero
+//! The legacy tanh(β·x) smooth relaxation saturates to a zero
 //! finite-difference once Sign pre-activations leave `[-1, 1]` scale — the
 //! traffic_signs BNN regime (QConv pre-activations in the tens to hundreds).
 //! The STE surrogate (sign(x) → x during ATTACK gradient probes only) keeps a

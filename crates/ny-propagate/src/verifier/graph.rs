@@ -37,14 +37,12 @@ fn actual_method_for_crown_result(result: &CrownBackwardResult) -> PropagationMe
     }
 }
 
-/// Policy-critical errors that must not degrade to IBP (#3706).
+/// Policy-critical errors that must not degrade to IBP.
 ///
 /// `SoundnessRefusal` means a layer deliberately refused CROWN for policy
 /// reasons (e.g., LayerNorm in `Sound` mode). `InternalError` means a
 /// programmer-invariant violation. Both must propagate as hard errors rather
 /// than being silently converted into IBP fallback results.
-///
-/// Reference: #1743 (sequential fix), #3107 (lower graph-CROWN dispatch fix).
 fn graph_crown_error_must_propagate(error: &NyError) -> bool {
     matches!(
         error,
@@ -61,7 +59,7 @@ fn graph_crown_error_must_propagate(error: &NyError) -> bool {
 /// CROWN calls may also report `Ibp` when their returned provenance already
 /// reflects a forward-bound fallback. Internal alpha-CROWN degradations that
 /// are absorbed before reaching this helper may still remain labeled `Crown`.
-/// Checks `deadline` before each fallback attempt (#2987).
+/// Checks `deadline` before each fallback attempt.
 pub(super) fn crown_fallback_chain(
     graph: &GraphNetwork,
     input_bounds: &BoundedTensor,
@@ -80,12 +78,12 @@ pub(super) fn crown_fallback_chain(
             Ok((result.bounds, method))
         }
         Err(e) => {
-            // Policy-critical errors must not degrade to IBP (#3706).
+            // Policy-critical errors must not degrade to IBP.
             if graph_crown_error_must_propagate(&e) {
                 return Err(e);
             }
             debug!("Batched CROWN failed ({}); trying flat CROWN", e);
-            // Check deadline before flat CROWN fallback (#2987)
+            // Check deadline before flat CROWN fallback
             if deadline.map(|d| Instant::now() >= d).unwrap_or(false) {
                 info!("Timeout during CROWN fallback chain after batched CROWN failure");
                 let b = graph.propagate_ibp(input_bounds)?;
@@ -102,7 +100,7 @@ pub(super) fn crown_fallback_chain(
                     Ok((result.bounds, method))
                 }
                 Err(e2) => {
-                    // Policy-critical errors must not degrade to IBP (#3706).
+                    // Policy-critical errors must not degrade to IBP.
                     if graph_crown_error_must_propagate(&e2) {
                         return Err(e2);
                     }
@@ -141,7 +139,7 @@ impl Verifier {
         spec: &VerificationSpec,
         engine: Option<&dyn GemmEngine>,
     ) -> Result<VerificationResult> {
-        // Guard: reject empty spec before wasting propagation compute (#2266)
+        // Guard: reject empty spec before wasting propagation compute
         if spec.output_bounds().is_empty() {
             return Err(NyError::InvalidSpec(
                 "empty output_bounds in specification — nothing to verify".to_string(),

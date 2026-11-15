@@ -26,7 +26,7 @@ pub const CLEAN_LAKE_PACKAGE: &str = "crownproof";
 /// Canonical internal Clean Git remote. Publication rewrites this dependency.
 pub const CLEAN_GIT_URL: &str = "https://github.com/alabsystems/clean.git";
 /// Audited Clean revision containing every theorem in [`CITED_THEOREMS`].
-pub const CLEAN_GIT_REV: &str = "9a9b16e44b9233d0c387839ea205a22fb77ac4bb";
+pub const CLEAN_GIT_REV: &str = "e7ae5d418cbac2e1a029369a5b5eda690d471c5c";
 /// Clean's Lake package root within its repository.
 pub const CLEAN_LAKE_SUBDIR: &str = "crown-proofs/lean";
 /// Lean module directory below the Clean Lake package root.
@@ -886,6 +886,7 @@ mod tests {
         actual.trim_end_matches(".git") == expected.trim_end_matches(".git")
     }
 
+    #[cfg(feature = "external-lean")]
     fn git_stdout(dir: &Path, args: &[&str]) -> Result<String, String> {
         let output = std::process::Command::new("git")
             .arg("-C")
@@ -906,7 +907,12 @@ mod tests {
             .map_err(|e| format!("git output was not UTF-8 in {}: {e}", dir.display()))
     }
 
-    fn validated_clean_corpus_root() -> Result<PathBuf, String> {
+    /// The HERMETIC half of the pin guard: `lakefile.toml` and the checked-in
+    /// `lake-manifest.json` name exactly the audited Clean and Mathlib
+    /// revisions, and the corpus path they derive is [`clean_corpus_root`].
+    /// Reads two tracked files and needs no dependency checkout, so it runs in
+    /// the default lane. Returns `(clean_package_root, mathlib_root, corpus)`.
+    fn validated_lake_pins() -> Result<(PathBuf, PathBuf, PathBuf), String> {
         let lean_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("proofs/lean");
         let lakefile = std::fs::read_to_string(lean_root.join("lakefile.toml"))
             .map_err(|e| format!("read lakefile.toml: {e}"))?;
@@ -994,6 +1000,20 @@ mod tests {
                 clean_corpus_root().display()
             ));
         }
+        let mathlib_root = lean_root
+            .join(&manifest.packages_dir)
+            .join(MATHLIB_LAKE_PACKAGE);
+        Ok((package_root, mathlib_root, corpus))
+    }
+
+    /// The EXTERNAL half: the exact pinned Clean and Mathlib checkouts are on
+    /// disk at their audited revisions with unmodified theorem sources. A
+    /// downloaded corpus is not part of the hermetic default lane
+    /// (TEST_CONFORMANCE.md), so every caller lives in the `external-lean`
+    /// lane, where an absent checkout fails fast with the path and the remedy.
+    #[cfg(feature = "external-lean")]
+    fn validated_clean_corpus_root() -> Result<PathBuf, String> {
+        let (package_root, mathlib_root, corpus) = validated_lake_pins()?;
         if !corpus.is_dir() {
             return Err(format!(
                 "Clean dependency corpus missing at {} (run `lake update`)",
@@ -1022,9 +1042,6 @@ mod tests {
             ));
         }
 
-        let mathlib_root = lean_root
-            .join(&manifest.packages_dir)
-            .join(MATHLIB_LAKE_PACKAGE);
         if !mathlib_root.is_dir() {
             return Err(format!(
                 "Mathlib dependency checkout missing at {} (run `lake update`)",
@@ -1224,29 +1241,17 @@ theorem holed : True := by sorry\n";
         assert!(contains_token(holed, b"sorry"));
     }
 
-    /// The load-bearing integrity test: every theorem the checker cites must be
-    /// declared and sorry-free in the exact pinned Clean dependency. A failure
-    /// here means the proof-carrying soundness claim rests on a missing or
-    /// unproven lemma.
+    /// The hermetic half of the pin guard, in the default lane: the tracked
+    /// `lakefile.toml` and `lake-manifest.json` name exactly the audited Clean
+    /// and Mathlib revisions, and derive [`clean_corpus_root`]. Grounding the
+    /// cited theorems needs the downloaded checkout, so it is the
+    /// `external-lean` lane's `pinned_corpus` module below.
     #[test]
-    fn all_cited_theorems_are_grounded() -> Result<(), String> {
-        let root = validated_clean_corpus_root()?;
-        assert!(
-            root.is_dir(),
-            "Clean dependency corpus missing at {}",
-            root.display()
-        );
-        for &thm in CITED_THEOREMS {
-            // An unreadable corpus is an `Err` and FAILS the test (fail-closed):
-            // grounding is never assumed when the source cannot be checked.
-            let status = citation_status(&root, thm).map_err(|e| format!("read corpus: {e}"))?;
-            assert_eq!(
-                status,
-                CitationStatus::Grounded,
-                "cited theorem `{thm}` is not grounded (status: {status:?}) — \
-                 the #[trust::cite] foundation is broken",
-            );
-        }
+    fn lake_pins_name_the_exact_audited_dependencies() -> Result<(), String> {
+        let (package_root, mathlib_root, corpus) = validated_lake_pins()?;
+        assert_eq!(corpus, clean_corpus_root());
+        assert!(corpus.starts_with(&package_root));
+        assert!(mathlib_root.ends_with(MATHLIB_LAKE_PACKAGE));
         Ok(())
     }
 
@@ -1265,13 +1270,13 @@ theorem holed : True := by sorry\n";
     }
 
     /// Close the drift loop: discover every Rust source below `src/`, then require
-    /// every `#[trust::cite(crownproof::X)]` to be registered and grounded. A new
-    /// source file or citation therefore cannot escape through a stale hardcoded
-    /// scan list.
+    /// every `#[trust::cite(crownproof::X)]` to be registered. A new source file
+    /// or citation therefore cannot escape through a stale hardcoded scan list.
+    /// Registered means grounded: `pinned_corpus` resolves every source citation
+    /// and every [`CITED_THEOREMS`] entry against the exact pinned checkout.
     #[test]
     fn cited_list_matches_source_annotations() -> Result<(), String> {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let root = validated_clean_corpus_root()?;
         let sources = citation_sources(dir)?;
         let mut found = std::collections::BTreeSet::new();
         for (file, src) in &sources {
@@ -1282,11 +1287,6 @@ theorem holed : True := by sorry\n";
                     CITED_THEOREMS.contains(&thm.as_str()),
                     "citation `{thm}` in {file} is not in the verified CITED_THEOREMS set \
                      — it would escape the grounding guard",
-                );
-                assert_eq!(
-                    citation_status(&root, thm).map_err(|e| format!("read corpus: {e}"))?,
-                    CitationStatus::Grounded,
-                    "source citation `{thm}` in {file} is not grounded in the corpus",
                 );
             }
         }
@@ -1319,9 +1319,9 @@ theorem holed : True := by sorry\n";
     /// The cite-map sidecar (`proofs/cite-map.json`, consumed by the planned
     /// trust_verify cite-discharge) must stay in sync with the `#[trust::cite]`
     /// annotations across all discovered citation-bearing Rust sources (checker +
-    /// producers), and every mapped theorem must be grounded. [`CITED_SOURCES`]
-    /// supplies only the module/type qualifier and must exactly cover that
-    /// discovered set.
+    /// producers). [`CITED_SOURCES`] supplies only the module/type qualifier and
+    /// must exactly cover that discovered set. That every mapped theorem is
+    /// grounded is checked against the pinned checkout by `pinned_corpus`.
     #[test]
     fn cite_map_matches_source() -> Result<(), String> {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1386,14 +1386,105 @@ theorem holed : True := by sorry\n";
             src, mapped,
             "cite-map.json out of sync with #[trust::cite] in NY source"
         );
-        let root = validated_clean_corpus_root()?;
-        for (_f, thm) in &mapped {
-            assert_eq!(
-                citation_status(&root, thm).map_err(|e| format!("read corpus: {e}"))?,
-                CitationStatus::Grounded,
-                "cite-map theorem `{thm}` is not grounded",
+        Ok(())
+    }
+
+    fn cite_map_theorems() -> Result<std::collections::BTreeSet<String>, String> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let map_text = std::fs::read_to_string(dir.join("proofs/cite-map.json"))
+            .map_err(|e| format!("read cite-map: {e}"))?;
+        let map_json: crate::json::Json =
+            crate::json::from_str(&map_text).map_err(|e| format!("parse cite-map: {e}"))?;
+        map_json["citations"]
+            .as_array()
+            .ok_or("citations array")?
+            .iter()
+            .map(|c| {
+                c["theorem"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| "cite-map citation without a theorem".to_owned())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cite_map_theorems_are_registered() -> Result<(), String> {
+        for thm in cite_map_theorems()? {
+            assert!(
+                CITED_THEOREMS.contains(&thm.as_str()),
+                "cite-map theorem `{thm}` is not in CITED_THEOREMS — it would escape the \
+                 grounding guard"
             );
         }
         Ok(())
+    }
+
+    /// GROUNDING against the exact pinned Clean checkout — the `external-lean`
+    /// lane (`targo --unverified test -p ny-cert --features external-lean --lib
+    /// pinned_corpus`, gate lane [b]).
+    ///
+    /// These read the downloaded `.lake/packages` checkout, which the hermetic
+    /// default lane must not need (TEST_CONFORMANCE.md). Until they moved here
+    /// they ran in the default lane, so every host without that checkout — this
+    /// was the state of any fresh worktree since the vendored copy was replaced
+    /// by the Lake dependency in 8511be9a3 — reported six "test failures" that
+    /// were a missing download. Selected, an absent or drifted checkout fails
+    /// fast naming the path and the `lake update` remedy.
+    #[cfg(feature = "external-lean")]
+    mod pinned_corpus {
+        use super::*;
+
+        /// The load-bearing integrity test: every theorem the checker cites must
+        /// be declared and sorry-free in the exact pinned Clean dependency. A
+        /// failure here means the proof-carrying soundness claim rests on a
+        /// missing or unproven lemma.
+        #[test]
+        fn all_cited_theorems_are_grounded() -> Result<(), String> {
+            let root = validated_clean_corpus_root()?;
+            for &thm in CITED_THEOREMS {
+                // An unreadable corpus is an `Err` and FAILS the test
+                // (fail-closed): grounding is never assumed when the source
+                // cannot be checked.
+                let status =
+                    citation_status(&root, thm).map_err(|e| format!("read corpus: {e}"))?;
+                assert_eq!(
+                    status,
+                    CitationStatus::Grounded,
+                    "cited theorem `{thm}` is not grounded (status: {status:?}) — \
+                     the #[trust::cite] foundation is broken",
+                );
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn source_citations_are_grounded() -> Result<(), String> {
+            let root = validated_clean_corpus_root()?;
+            let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+            for (file, src) in &citation_sources(dir)? {
+                for thm in citations_in_source(src) {
+                    assert_eq!(
+                        citation_status(&root, &thm).map_err(|e| format!("read corpus: {e}"))?,
+                        CitationStatus::Grounded,
+                        "source citation `{thm}` in {file} is not grounded in the corpus",
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn cite_map_theorems_are_grounded() -> Result<(), String> {
+            let root = validated_clean_corpus_root()?;
+            for thm in cite_map_theorems()? {
+                assert_eq!(
+                    citation_status(&root, &thm).map_err(|e| format!("read corpus: {e}"))?,
+                    CitationStatus::Grounded,
+                    "cite-map theorem `{thm}` is not grounded",
+                );
+            }
+            Ok(())
+        }
     }
 }

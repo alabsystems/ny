@@ -15,7 +15,6 @@ use super::{check_clip_deadline_with, shape_err, CLIP_DEADLINE_POLL_STRIDE};
 ///
 /// # References
 ///
-/// - `designs/2026-01-28-clip-and-verify-algorithms.md:318`
 /// - `alpha-beta-CROWN/auto_LiRPA/concretize_func.py:_dist_rearrange`
 #[cfg(test)]
 pub(crate) fn rearrange_constraints(
@@ -93,7 +92,7 @@ where
             distances.push((distance, k));
         }
 
-        // Sort descending (furthest constraints first, NaN last — #2995)
+        // Sort descending (furthest constraints first, NaN last).
         // A total index tie-break lets the allocation-free checked heapsort
         // preserve the old stable input order for equal distances.
         super::deadline_heapsort_by(

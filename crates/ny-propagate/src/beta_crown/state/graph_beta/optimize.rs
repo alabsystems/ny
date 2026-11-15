@@ -21,9 +21,9 @@ impl GraphBetaState {
     /// this used `get_entry_mut()` which returns only the first match — leaving
     /// subsequent entries with zero gradient and frozen beta values.
     ///
-    /// Fix for #2247: iterate all entries, matching the pattern used by
+    /// Fix: iterate all entries, matching the pattern used by
     /// `get_signed_beta()` which correctly sums contributions from all entries.
-    /// NaN guard (#3112): skip non-finite gradients to prevent NaN from entering the
+    /// NaN guard: skip non-finite gradients to prevent NaN from entering the
     /// optimizer state. Without this, a single NaN gradient poisons m/v accumulators.
     pub fn accumulate_grad(&mut self, node_name: &str, neuron_idx: usize, grad: f32) {
         if !grad.is_finite() {

@@ -513,7 +513,7 @@ fn geometric_offsets_are_fine_near_edge_and_cover_span() {
     assert!(finest <= w / 1000.0, "finest step {finest} too coarse");
     assert!(coarsest > finest * 10.0, "grid should be graded");
     // Degenerate inputs.
-    assert!(geometric_offsets(0.0, STAGE_POINTS).is_empty());
-    assert!(geometric_offsets(-1.0, STAGE_POINTS).is_empty());
-    assert!(geometric_offsets(1.0, 1).is_empty());
+    assert_eq!((geometric_offsets(0.0, STAGE_POINTS)).len(), 0);
+    assert_eq!((geometric_offsets(-1.0, STAGE_POINTS)).len(), 0);
+    assert_eq!((geometric_offsets(1.0, 1)).len(), 0);
 }

@@ -7,7 +7,7 @@
 //!
 //! These types describe a loaded neural network's structure before conversion
 //! to propagation types. They are intentionally decoupled from the full
-//! `OnnxModel` to allow construction code to live in a separate crate (#1752).
+//! `OnnxModel` to allow construction code to live in a separate crate.
 
 use ny_core::LayerType;
 use serde::{Deserialize, Serialize};
@@ -101,6 +101,20 @@ pub const INTERNAL_CT_INSTANCE_NORM_ATTR: &str = "__ny_internal_ct_instance_norm
 /// may set this integer attribute to `1`; raw ONNX schema validation rejects
 /// this non-standard attribute.
 pub const PAD_PRESERVE_ALL_AXES_ATTR: &str = "__ny_pad_preserve_all_axes";
+
+/// Internal source-semantics marker for a [`LayerSpec`] whose axes were authored
+/// after ny's leading-batch removal, rather than in raw ONNX tensor layout.
+///
+/// A format-neutral producer may set integer `1` only when every axis on the
+/// node already denotes ny's internal batch-stripped layout. The converter may
+/// then preserve that interpretation when source rank metadata is unavailable.
+/// This marker grants no solver, proof, certificate, admission, or verdict
+/// authority.
+///
+/// Raw ONNX schema preflight rejects this non-standard attribute before trusted
+/// loader rewrites run. The ONNX loader adds it only to nodes synthesized by a
+/// lowering that establishes the internal-axis contract.
+pub const INTERNAL_LEGACY_AXIS_AUTHORITY_ATTR: &str = "__ny_internal_legacy_axis_authority";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AttributeValue {

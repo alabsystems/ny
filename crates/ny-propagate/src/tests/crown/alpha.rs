@@ -451,7 +451,7 @@ fn test_native_invprop_malformed_gamma_bound_axis_fails_closed() {
     assert_eq!(malformed_bounds.upper(), baseline_bounds.upper());
 }
 
-/// Regression for #1803/#2977: α-CROWN ReLU NaN guard now rejects non-finite
+/// Regression: α-CROWN ReLU NaN guard now rejects non-finite
 /// pre-activation with NumericalInstability via domain_guard.
 #[test]
 fn test_relu_alpha_crown_nan_guard_sets_infinite_upper_bias() {
@@ -476,7 +476,7 @@ fn test_relu_alpha_crown_nan_guard_sets_infinite_upper_bias() {
     );
 }
 
-/// Regression test for #2584 item 4: near-zero-width crossing ReLU intervals
+/// Regression test item 4: near-zero-width crossing ReLU intervals
 /// in the alpha-CROWN backward path must remain finite and sound.
 #[ntest::timeout(10000)]
 #[test]
@@ -928,7 +928,7 @@ fn test_alpha_crown_spsa_vs_finite_diff() {
     assert!(spsa_width <= crown_width + 1e-4, "SPSA bounds unsound");
     assert!(fd_width <= crown_width + 1e-4, "FD bounds unsound");
 
-    // #2035: Both gradient methods must show measurable improvement on 80-neuron network.
+    // Both gradient methods must show measurable improvement on 80-neuron network.
     assert!(
         spsa_improvement > 0.01,
         "SPSA (50 iters) must improve >0.01%. Got {spsa_improvement:.4}%"
@@ -942,7 +942,7 @@ fn test_alpha_crown_spsa_vs_finite_diff() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_alpha_direct_impact() {
-    // #2035: Uses the 4-layer MLP (2→4→4→2) with 8 crossing neurons where
+    // Uses the 4-layer MLP (2→4→4→2) with 8 crossing neurons where
     // the per-neuron alpha heuristic is suboptimal (ignores downstream weights).
     let (network, input) = build_2035_test_network();
 
@@ -957,7 +957,7 @@ fn test_alpha_direct_impact() {
         "α-CROWN must not be worse than CROWN: {alpha_width:.6} vs {crown_width:.6}"
     );
 
-    // #2035: α-CROWN must measurably improve over CROWN.
+    // α-CROWN must measurably improve over CROWN.
     let improvement_pct = (crown_width - alpha_width) / crown_width * 100.0;
     assert!(
         improvement_pct > 0.1,
@@ -1197,7 +1197,7 @@ fn test_alpha_crown_adaptive_skip() {
     // Shallow-network tests moved to test_alpha_crown_adaptive_skip_shallow_improves.
 }
 
-/// #2035: Shallow network (< adaptive_skip threshold) must NOT skip α-CROWN
+/// Shallow network (< adaptive_skip threshold) must NOT skip α-CROWN
 /// and must produce measurable improvement over CROWN.
 #[ntest::timeout(10000)]
 #[test]
@@ -1385,14 +1385,14 @@ fn test_alpha_crown_analytic_chain_gradients() {
         );
     }
 
-    // #2035: AnalyticChain must produce measurable improvement over CROWN.
+    // AnalyticChain must produce measurable improvement over CROWN.
     assert!(
         chain_improvement > 0.1,
         "AnalyticChain must improve >0.1% over CROWN. Got {chain_improvement:.2}%"
     );
 }
 
-/// Regression test for #1946: AnalyticChain must not silently swallow errors
+/// Regression test: AnalyticChain must not silently swallow errors
 /// from `propagate_alpha_crown_with_intermediates_impl`.
 ///
 /// Before the fix, AnalyticChain used `unwrap_or_else(|_| default())` which
@@ -1466,7 +1466,7 @@ fn test_analytic_chain_does_not_silently_swallow_errors_1946() {
     }
 }
 
-/// Regression test for #1939: non-contiguous arrays must produce correct sums.
+/// Regression test: non-contiguous arrays must produce correct sums.
 ///
 /// Before the fix, α-CROWN convergence tracking used `as_slice().map(sum).unwrap_or(-inf)`
 /// which returns -inf (or 0.0) for non-contiguous arrays (as_slice() returns None).
@@ -1503,7 +1503,7 @@ fn test_lower_sum_non_contiguous_layout_1939() {
     );
 }
 
-/// Regression test for #2013: duplicate init_invprop_state must return an error,
+/// Regression test: duplicate init_invprop_state must return an error,
 /// not panic via assert!.
 #[ntest::timeout(10000)]
 #[test]
@@ -1532,7 +1532,7 @@ fn test_init_invprop_state_duplicate_returns_error() {
     }
 }
 
-/// Regression test for #1935: SPSA numerical gradients must propagate CROWN
+/// Regression test: SPSA numerical gradients must propagate CROWN
 /// single-pass errors instead of silently substituting concrete_bounds.
 ///
 /// Before the fix, `.unwrap_or_else(|_| concrete_bounds.clone())` swallowed
@@ -1589,7 +1589,7 @@ fn test_single_pass_error_propagates_not_swallowed_1935() {
     );
 }
 
-/// Regression test for #1935: SPSA numerical gradients propagate errors
+/// Regression test: SPSA numerical gradients propagate errors
 /// through the full alpha-CROWN optimization loop.
 ///
 /// Verifies that SPSA on a well-formed network produces valid bounds
@@ -1636,7 +1636,7 @@ fn test_spsa_alpha_crown_happy_path_produces_valid_bounds_1935() {
 }
 
 // ============================================================
-// Sequential Network UnsupportedOp Fallback Tests (#2138)
+// Sequential Network UnsupportedOp Fallback Tests
 // ============================================================
 
 /// Sequential Network alpha-CROWN with an unsupported layer (NonZero) must
@@ -1647,7 +1647,7 @@ fn test_spsa_alpha_crown_happy_path_produces_valid_bounds_1935() {
 /// The fallback calls `propagate_crown_with_engine`, which in turn falls
 /// back to IBP for NonZero.
 ///
-/// Part of #2138: verifies the sequential Network alpha-CROWN UnsupportedOp
+/// Verifies the sequential Network alpha-CROWN UnsupportedOp
 /// fallback path has coverage (previously zero coverage, only GraphNetwork
 /// was tested via `catch_all_error_propagation.rs`).
 #[ntest::timeout(10000)]
@@ -1727,8 +1727,6 @@ fn test_sequential_alpha_crown_unsupported_op_fallback_2138() {
 /// 1. Alpha-CROWN succeeds (falls back to CROWN instead of erroring)
 /// 2. Bounds are sound (contain sampled concrete outputs)
 /// 3. Bounds are at least as tight as IBP
-///
-/// Part of #2140: zero test coverage for sequential alpha-CROWN UnsupportedOp fallback.
 #[ntest::timeout(10000)]
 #[test]
 fn test_alpha_crown_sequential_unsupported_op_fallback_2140() {
@@ -1856,7 +1854,7 @@ fn test_alpha_crown_sequential_unsupported_op_fallback_2140() {
     }
 }
 
-/// Regression test for #2835: alpha-CROWN with extreme weights that produce
+/// Regression test: alpha-CROWN with extreme weights that produce
 /// non-finite gradients must still return finite, sound bounds. The non-finite
 /// gradient guard at alpha_crown.rs:380 should skip the corrupted update,
 /// preserving the current alpha values.
@@ -1891,7 +1889,7 @@ fn test_alpha_crown_non_finite_gradient_guard_extreme_weights_2835() {
 
     // The key assertion: alpha-CROWN must not panic or return non-finite bounds.
     // The non-finite gradient guard should silently skip corrupted updates.
-    // #2876: Require Ok — no Err escape hatch. Use is_finite() to catch +/-Inf.
+    // Require Ok — no Err escape hatch. Use is_finite() to catch +/-Inf.
     let bounds = network
         .propagate_alpha_crown_with_config(&input, &config)
         .expect("alpha-CROWN must succeed with extreme weights (non-finite gradient guard should handle overflow)");
@@ -1917,7 +1915,7 @@ fn test_alpha_crown_non_finite_gradient_guard_extreme_weights_2835() {
     }
 }
 
-/// Helper: builds the 4-layer MLP (2→4→4→2) used across #2035 regression tests.
+/// Helper: builds the 4-layer MLP (2→4→4→2) used across the α-CROWN improvement regression tests.
 /// Has 8 neurons across 2 ReLU layers with many crossing neurons for input ∈ [-0.5, 0.5]².
 fn build_2035_test_network() -> (Network, BoundedTensor) {
     let mut network = Network::new();
@@ -1945,7 +1943,7 @@ fn build_2035_test_network() -> (Network, BoundedTensor) {
     (network, input)
 }
 
-/// Regression test for #2035: default α-CROWN (AnalyticChain) must strictly improve
+/// Regression test: default α-CROWN (AnalyticChain) must strictly improve
 /// bounds over CROWN on a network with unstable neurons.
 ///
 /// Root cause: SPSA with 1 sample produces noise-dominated gradients (O(n) variance).
@@ -1982,7 +1980,7 @@ fn test_alpha_crown_analytic_chain_improves_over_crown_2035() {
     );
 }
 
-/// Regression test for #2035: default α-CROWN on a 4→8→8→2 network must produce
+/// Regression test: default α-CROWN on a 4→8→8→2 network must produce
 /// measurable improvement over CROWN using the new AnalyticChain default.
 #[ntest::timeout(10000)]
 #[test]

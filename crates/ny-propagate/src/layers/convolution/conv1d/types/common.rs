@@ -79,7 +79,7 @@ pub(super) fn build_backward_batch_context(
     })
 }
 
-/// Zero A-matrix rows that contain non-finite coefficients (#3256, #2812).
+/// Zero A-matrix rows that contain non-finite coefficients.
 ///
 /// Rows flagged as non-finite get all coefficients set to 0.0 so the
 /// corresponding bias will be overridden to ±inf in `finalize_bias_bounds`.
@@ -184,7 +184,7 @@ pub(super) fn finalize_bias_bounds(
             out_len,
         )?;
 
-        // #3256: Override bias for non-finite A-matrix rows.
+        // Override bias for non-finite A-matrix rows.
         for row_idx in 0..total_rows {
             if lower_nonfinite_rows[row_idx] {
                 new_lower_b[row_idx] = f32::NEG_INFINITY;
@@ -203,7 +203,7 @@ pub(super) fn finalize_bias_bounds(
                 .map_err(|_| NyError::InvalidSpec("Cannot reshape new_upper_b".to_string()))?,
         ))
     } else {
-        // #3256: Even without conv bias, override for non-finite A-matrix rows.
+        // Even without conv bias, override for non-finite A-matrix rows.
         let mut lb = bounds.lower_b.clone();
         let mut ub = bounds.upper_b.clone();
         let lower_affected = lower_nonfinite_rows.iter().any(|&r| r);

@@ -327,7 +327,7 @@ mod tests {
             "a translatable graph must report no refusals: {:?}",
             refusals(&graph)
         );
-        assert!(refusals_multi_input(&graph).is_empty());
+        assert_eq!((refusals_multi_input(&graph)).len(), 0);
     }
 
     /// (2) One refused node yields exactly one refusal, fully populated.
@@ -448,7 +448,7 @@ mod tests {
                 is_translatable(&op),
                 "coverage: a sound lowering exists in principle for {op:?}"
             );
-            let graph = graph_with(op.clone(), &[2]);
+            let graph = graph_with(op, &[2]);
             let found = refusals(&graph);
             assert_eq!(
                 found.len(),
@@ -586,15 +586,15 @@ mod tests {
     /// and the graph-wide F32 dtype gate all return the empty list.
     #[test]
     fn pre_loop_graph_gates_all_return_the_empty_list() {
-        assert!(refusals(&ComputationGraph::from_nodes(vec![])).is_empty());
+        assert_eq!((refusals(&ComputationGraph::from_nodes(vec![]))).len(), 0);
 
         // Duplicate node id: `analyze_graph` refuses before any node is walked.
         let duplicate = ComputationGraph::from_nodes(vec![
             node(0, "x", TraceOp::Input, &[], &[4]),
             node(0, "x_again", TraceOp::Relu, &[], &[4]),
         ]);
-        assert!(refusals(&duplicate).is_empty());
-        assert!(refusals_multi_input(&duplicate).is_empty());
+        assert_eq!((refusals(&duplicate)).len(), 0);
+        assert_eq!((refusals_multi_input(&duplicate)).len(), 0);
 
         // Graph-wide dtype gate: a reachable non-F32 node that matches none of
         // the carve-outs. The refusal IS an `UnsupportedOp`, but it is raised

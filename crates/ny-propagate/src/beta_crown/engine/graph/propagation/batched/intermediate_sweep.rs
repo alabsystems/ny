@@ -315,6 +315,74 @@ fn select_balanced_tightening_rows_chunk(
     (!selected.is_empty() && deadline_live(deadline)).then(|| Arc::from(selected))
 }
 
+/// #sweep-crossing-targets: the row census of ONE FROZEN target box.
+///
+/// Taken from the frozen transcript and never from the live map, so a census is
+/// stable for a whole accumulation even as earlier chunks tighten `bounds`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FrozenRowCensus {
+    /// Elements in the box, point rows included.
+    dim: usize,
+    /// Rows the balanced selector would file as CROSSING.
+    crossing: usize,
+    /// Rows the balanced selector would consider at all (`lower != upper`).
+    nonpoint: usize,
+}
+
+/// Count the crossing and non-point rows of one frozen target box.
+///
+/// `None` means the DEADLINE lapsed mid-scan and is a refusal. It is never "this
+/// target has no crossing rows"; that answer is `Some(census)` with
+/// `census.crossing == 0`. Conflating the two would let an expiry silently
+/// delete targets, which is precisely the failure this signature exists to make
+/// unrepresentable.
+///
+/// The crossing predicate is the one [`select_balanced_tightening_rows_chunk`]
+/// uses to fill its `crossing` ordering, with the finiteness that
+/// `finite_ordered_box` separately guarantees written out rather than assumed,
+/// so a census can never disagree with the selector about what a crossing row
+/// is.
+fn frozen_row_census(frozen_bound: &BoundedTensor, deadline: Instant) -> Option<FrozenRowCensus> {
+    let mut crossing = 0usize;
+    let mut nonpoint = 0usize;
+    for (index, (&lower, &upper)) in frozen_bound
+        .lower()
+        .iter()
+        .zip(frozen_bound.upper())
+        .enumerate()
+    {
+        if index.is_multiple_of(TRANSCRIPT_POLL_STRIDE) && !deadline_live(deadline) {
+            return None;
+        }
+        if lower == upper {
+            continue;
+        }
+        nonpoint = nonpoint.saturating_add(1);
+        if lower.is_finite() && upper.is_finite() && lower < 0.0 && upper > 0.0 {
+            crossing = crossing.saturating_add(1);
+        }
+    }
+    Some(FrozenRowCensus {
+        dim: frozen_bound.len(),
+        crossing,
+        nonpoint,
+    })
+}
+
+/// `NY_SWEEP_CROSSING_TARGETS_ONLY` — DARK. Off, the comprehensive sweep spends
+/// its per-chunk row budget uniformly across every eligible target and stops the
+/// whole accumulation at the first target to run out of ordering; that is the
+/// shipped path and this reader returns `false` for absent, `"0"`, malformed and
+/// non-UTF-8 values alike.
+///
+/// Read ONCE per sweep and threaded down as a `bool`; there is no per-target
+/// read and no raw `env::var` anywhere on this path.
+fn crossing_only_targets_enabled() -> bool {
+    ny_levers::read(&ny_levers::decls::comprehensive_rows::SWEEP_CROSSING_TARGETS_ONLY)
+        .value
+        .as_bool()
+}
+
 fn resolve_bounds<'a>(
     name: &str,
     input: &'a BoundedTensor,
@@ -1308,6 +1376,8 @@ pub(in crate::beta_crown::engine::graph) fn root_phase_resident_gpu_intermediate
     absolute_max_device_bytes: usize,
     bounds: &mut HashMap<String, BoundedTensor>,
 ) -> RootIntermediateSweepAttempt {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::IntermRefresh);
     if !deadline_live(deadline) {
         return RootIntermediateSweepAttempt::Failed;
     }
@@ -1535,6 +1605,8 @@ pub(in crate::beta_crown::engine::graph) fn root_comprehensive_gpu_intermediate_
     influence: Option<&HashMap<String, Vec<f32>>>,
     bounds: &mut HashMap<String, BoundedTensor>,
 ) -> RootIntermediateSweepAttempt {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::IntermRefresh);
     if !deadline_live(deadline) {
         return RootIntermediateSweepAttempt::Failed;
     }
@@ -1613,6 +1685,80 @@ pub(in crate::beta_crown::engine::graph) fn root_comprehensive_gpu_intermediate_
         frozen.push((node_name, frozen_bound.clone()));
     }
 
+    // #interm-crossing-census, print-only and LEVER-FREE: no per-node crossing
+    // count is emitted anywhere else in this tree, so the whole row-allocation
+    // question has been argued from one incidental `sel=8/8192` line. This is a
+    // single pass over boxes already in hand, behind the existing phase-telemetry
+    // gate. With that gate off and the elision lever off, nothing below this
+    // point is computed and the sweep proceeds byte for byte as before.
+    let crossing_only = crossing_only_targets_enabled();
+    let telemetry = crate::phase_telemetry::phase_telemetry_enabled();
+    let mut census: Vec<FrozenRowCensus> = Vec::new();
+    if crossing_only || telemetry {
+        if census.try_reserve_exact(frozen.len()).is_err() {
+            return RootIntermediateSweepAttempt::CleanDecline;
+        }
+        for (node_name, frozen_bound) in &frozen {
+            // The only `None` the census can return is an expiry, and an expiry
+            // is a refusal: it must never be read as "no crossing rows".
+            let Some(counts) = frozen_row_census(frozen_bound, deadline) else {
+                return RootIntermediateSweepAttempt::Failed;
+            };
+            if telemetry {
+                eprintln!(
+                    "[interm-crossing-census] pre={node_name} dim={} crossing={} nonpoint={}",
+                    counts.dim, counts.crossing, counts.nonpoint,
+                );
+            }
+            census.push(counts);
+        }
+    }
+
+    // #sweep-crossing-targets, ARMED ONLY. Two changes, both selection-only:
+    // a target whose FROZEN box has no crossing row is elided from every chunk,
+    // and each surviving target carries its OWN window cursor so the first
+    // target to run out of ordering no longer stops the others.
+    //
+    // No new authority and no new bound math. Every surviving row is bounded by
+    // the identical sound backend sweep and published through the identical
+    // shrink-only `intersection_per_element_with_poll`, so the worst an elision
+    // can do is spend fewer rows than it could have. It is graded High-risk for
+    // the same reason `#root-objective-directed-rows` is: it changes WHICH
+    // pre-activations get tightened on the authoritative route.
+    //
+    // Off, both vectors stay empty, are never indexed, and the shared
+    // `chunk_skip` plus the global `exhausted` break below are byte-identical to
+    // the pre-lever path.
+    let mut live_target: Vec<bool> = Vec::new();
+    let mut skip_by_target: Vec<usize> = Vec::new();
+    if crossing_only {
+        if live_target.try_reserve_exact(frozen.len()).is_err()
+            || skip_by_target.try_reserve_exact(frozen.len()).is_err()
+        {
+            return RootIntermediateSweepAttempt::CleanDecline;
+        }
+        for counts in &census {
+            live_target.push(counts.crossing > 0);
+            skip_by_target.push(0);
+        }
+        let live_count = live_target.iter().filter(|live| **live).count();
+        eprintln!(
+            "[root-comprehensive-gpu-interm-sweep] crossing-only elision live={live_count}/{} \
+             (elided targets keep exactly the bounds they already hold)",
+            frozen.len()
+        );
+        if live_count == 0 {
+            // Fail closed rather than hand `prepare_root_intermediate_sweep` an
+            // empty target set and have it report a structural refusal it did
+            // not diagnose. Nothing has been committed at this point.
+            eprintln!(
+                "[root-comprehensive-gpu-interm-sweep] crossing-only elision leaves no live \
+                 target; declining the route with the live map untouched"
+            );
+            return RootIntermediateSweepAttempt::CleanDecline;
+        }
+    }
+
     // #interm-row-chunking: the bounded sweep is hard-capped at ~128 rows/target
     // by device memory (the backend declines 256 outright), which is ~2.8%
     // coverage, and the measured benefit is LINEAR in coverage (0.026
@@ -1659,11 +1805,33 @@ pub(in crate::beta_crown::engine::graph) fn root_comprehensive_gpu_intermediate_
         if selected.try_reserve_exact(frozen.len()).is_err() {
             return RootIntermediateSweepAttempt::CleanDecline;
         }
-        for (node_name, frozen_bound) in &frozen {
-            // #interm-row-chunking: take the window `[chunk_skip, +row_limit)` of
+        // #sweep-crossing-targets: `(frozen index, rows taken)` for this chunk.
+        // Applied to the per-target cursors only after the chunk COMMITS, so a
+        // backend decline retries the identical window at the next rung — the
+        // same discipline the shared `chunk_skip` already follows. Empty and
+        // untouched when the lever is off.
+        let mut chunk_rows: Vec<(usize, usize)> = Vec::new();
+        if crossing_only && chunk_rows.try_reserve_exact(frozen.len()).is_err() {
+            return RootIntermediateSweepAttempt::CleanDecline;
+        }
+        for (target_index, (node_name, frozen_bound)) in frozen.iter().enumerate() {
+            // #sweep-crossing-targets: a target with no crossing row in its
+            // frozen box, or one that has already run off the end of its own
+            // ordering, is omitted from this chunk entirely. It is never pushed
+            // with an empty row set — an empty `selected_rows` is not a valid
+            // plan entry.
+            if crossing_only && !live_target[target_index] {
+                continue;
+            }
+            // #interm-row-chunking: take the window `[skip, +row_limit)` of
             // the balanced ordering rather than always its head, so successive
-            // chunks cover DISJOINT rows. `chunk_skip == 0` on the first pass is
+            // chunks cover DISJOINT rows. `skip == 0` on the first pass is
             // byte-identical to the historical head-only selection.
+            //
+            // The cursor is the SHARED `chunk_skip` on the shipped path and this
+            // target's own cursor when `#sweep-crossing-targets` is armed. Both
+            // are cut from the same frozen transcript, so windows stay disjoint
+            // and stable as earlier chunks tighten the live map.
             //
             // A `None` here is no longer automatically a decline: once at least
             // one chunk has been committed, running off the end of a target's
@@ -1673,18 +1841,31 @@ pub(in crate::beta_crown::engine::graph) fn root_comprehensive_gpu_intermediate_
             // A target with no influence entry, or one whose entries are all
             // zero, falls back to width: an all-zero key would collapse the
             // ordering to index order, which is strictly worse than width.
+            let skip = if crossing_only {
+                skip_by_target[target_index]
+            } else {
+                chunk_skip
+            };
             let node_influence = influence
                 .and_then(|map| map.get(node_name))
                 .filter(|weights| weights.iter().any(|w| *w != 0.0))
                 .map(Vec::as_slice);
             let selected_rows = select_balanced_tightening_rows_chunk(
                 frozen_bound,
-                chunk_skip,
+                skip,
                 row_limit,
                 deadline,
                 node_influence,
             );
             let Some(selected_rows) = selected_rows else {
+                // #sweep-crossing-targets: per-target exhaustion drops THIS
+                // target and keeps the survivors, instead of stopping every
+                // target at the first one to run out. Strictly more coverage,
+                // and everything already committed stays valid either way.
+                if crossing_only && skip > 0 {
+                    live_target[target_index] = false;
+                    continue;
+                }
                 if chunk_skip > 0 {
                     exhausted = true;
                     break;
@@ -1695,12 +1876,31 @@ pub(in crate::beta_crown::engine::graph) fn root_comprehensive_gpu_intermediate_
                     RootIntermediateSweepAttempt::Failed
                 };
             };
+            if crossing_only {
+                chunk_rows.push((target_index, selected_rows.len()));
+            }
             selected.push(SelectedSweepTarget {
                 node_name: node_name.clone(),
                 selected_rows,
                 frozen_bound: frozen_bound.clone(),
                 role: None,
             });
+        }
+        // #sweep-crossing-targets: every survivor ran out in the same chunk.
+        // That is completion, not a decline: report what the committed chunks
+        // actually tightened rather than falling into the structural-refusal
+        // branch below, which would misreport a finished accumulation as an
+        // unpreparable target set.
+        if crossing_only && selected.is_empty() {
+            eprintln!(
+                "[root-comprehensive-gpu-interm-sweep] crossing-only accumulation exhausted \
+                 chunks={chunks_done}/{max_chunks} tightened_total={accumulated_tightened}"
+            );
+            return if chunks_done > 0 {
+                RootIntermediateSweepAttempt::Completed(accumulated_tightened)
+            } else {
+                RootIntermediateSweepAttempt::CleanDecline
+            };
         }
         let Some(prepared) =
             prepare_root_intermediate_sweep(graph, input, bounds, selected, deadline)
@@ -1819,6 +2019,13 @@ pub(in crate::beta_crown::engine::graph) fn root_comprehensive_gpu_intermediate_
         accumulated_tightened = accumulated_tightened.saturating_add(tightened);
         chunks_done += 1;
         chunk_skip = chunk_skip.saturating_add(row_limit);
+        // #sweep-crossing-targets: advance each survivor's OWN cursor by the
+        // rows it actually took, so its next window starts exactly where this
+        // one ended and the per-target windows stay disjoint. `chunk_rows` is
+        // empty when the lever is off, so this loop does nothing there.
+        for &(target_index, rows) in &chunk_rows {
+            skip_by_target[target_index] = skip_by_target[target_index].saturating_add(rows);
+        }
         if exhausted || chunks_done >= max_chunks || !deadline_live(deadline) {
             if max_chunks > 1 {
                 eprintln!(
@@ -1848,6 +2055,8 @@ pub(in crate::beta_crown::engine::graph) fn root_wide_demanded_intermediate_swee
     max_device_bytes: usize,
     bounds: &mut HashMap<String, BoundedTensor>,
 ) -> RootIntermediateSweepAttempt {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::IntermRefresh);
     // The builder is multi-target-ready, but the first production slice is one
     // target per atomic request. Refuse a future policy widening until its
     // selection/commit scheduling receives its own measured review.
@@ -2463,10 +2672,10 @@ mod tests {
         assert_eq!(row_retry_ladder(512), vec![512, 256, 128, 64, 32]);
         assert_eq!(row_retry_ladder(33), vec![33, 32]);
         assert_eq!(row_retry_ladder(17), vec![17]);
-        assert!(row_retry_ladder(0).is_empty());
+        assert_eq!((row_retry_ladder(0)).len(), 0);
         assert_eq!(comprehensive_row_retry_ladder(32, 8), vec![32, 16, 8]);
         assert_eq!(comprehensive_row_retry_ladder(16, 8), vec![16, 8]);
-        assert!(comprehensive_row_retry_ladder(4, 8).is_empty());
+        assert_eq!((comprehensive_row_retry_ladder(4, 8)).len(), 0);
         assert_eq!(
             phase_resident_comprehensive_row_retry_ladder(32, 8, 32),
             vec![32, 16, 8]
@@ -2479,7 +2688,10 @@ mod tests {
             phase_resident_comprehensive_row_retry_ladder(32, 16, 32),
             vec![32, 16]
         );
-        assert!(phase_resident_comprehensive_row_retry_ladder(8, 16, 32).is_empty());
+        assert_eq!(
+            (phase_resident_comprehensive_row_retry_ladder(8, 16, 32)).len(),
+            0
+        );
     }
 
     #[test]
@@ -3383,6 +3595,290 @@ mod tests {
         assert_eq!(live["target"].lower()[[0]], -0.25);
         assert_eq!(live["target"].upper()[[0]], 0.25);
         assert_eq!(live["target"].l2_constraint(), Some(&l2));
+    }
+
+    const CROSSING_ONLY: &str = "NY_SWEEP_CROSSING_TARGETS_ONLY";
+
+    /// stem -> wide0 -> relu0 -> wide1 -> relu1 -> wide2 -> relu2.
+    ///
+    /// Three eligible pre-activations with deliberately different row supplies:
+    /// `wide0` is fully crossing, `wide1` is half crossing and half POINT rows
+    /// (so it runs out of ordering first), and `wide2` is entirely sign-stable —
+    /// the dead target `#sweep-crossing-targets` elides.
+    fn three_target_crossing_fixture(
+        dimension: usize,
+    ) -> (GraphNetwork, HashMap<String, BoundedTensor>, BoundedTensor) {
+        assert!(dimension >= 4 && dimension.is_multiple_of(2));
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input(
+            "stem",
+            Layer::Reshape(ReshapeLayer::new(vec![dimension as i64])),
+        ));
+        graph.add_node(GraphNode::new(
+            "wide0",
+            Layer::Add(AddLayer),
+            vec!["stem".into(), "stem".into()],
+        ));
+        graph.add_node(GraphNode::new(
+            "relu0",
+            Layer::ReLU(ReLULayer),
+            vec!["wide0".into()],
+        ));
+        graph.add_node(GraphNode::new(
+            "wide1",
+            Layer::Add(AddLayer),
+            vec!["relu0".into(), "stem".into()],
+        ));
+        graph.add_node(GraphNode::new(
+            "relu1",
+            Layer::ReLU(ReLULayer),
+            vec!["wide1".into()],
+        ));
+        graph.add_node(GraphNode::new(
+            "wide2",
+            Layer::Add(AddLayer),
+            vec!["relu1".into(), "stem".into()],
+        ));
+        graph.add_node(GraphNode::new(
+            "relu2",
+            Layer::ReLU(ReLULayer),
+            vec!["wide2".into()],
+        ));
+        graph.set_output("relu2");
+        graph
+            .exec_order()
+            .expect("cache deterministic execution order");
+
+        let input = BoundedTensor::new(
+            ArrayD::from_elem(IxDyn(&[dimension]), -1.0),
+            ArrayD::from_elem(IxDyn(&[dimension]), 1.0),
+        )
+        .expect("input box");
+        let full = |half: usize, value: f32, tail: f32| {
+            let lower = ArrayD::from_shape_fn(IxDyn(&[dimension]), |index| {
+                if index[0] < half {
+                    -value
+                } else {
+                    tail
+                }
+            });
+            let upper = ArrayD::from_shape_fn(IxDyn(&[dimension]), |index| {
+                if index[0] < half {
+                    value
+                } else {
+                    tail
+                }
+            });
+            BoundedTensor::new(lower, upper).expect("box")
+        };
+        let bounds = HashMap::from([
+            ("stem".into(), input.clone()),
+            // Every row crosses: the widest row supply of the three.
+            ("wide0".into(), full(dimension, 2.0, 0.0)),
+            ("relu0".into(), full(0, 0.0, 0.0)),
+            // Half crossing, half POINT: half the row supply, so this target
+            // runs off the end of its own ordering before `wide0` does.
+            ("wide1".into(), full(dimension / 2, 4.0, 0.0)),
+            ("relu1".into(), full(0, 0.0, 0.0)),
+            // Strictly positive: NON-POINT everywhere, CROSSING nowhere. This is
+            // the target the elision drops.
+            (
+                "wide2".into(),
+                BoundedTensor::new(
+                    ArrayD::from_elem(IxDyn(&[dimension]), 1.0),
+                    ArrayD::from_elem(IxDyn(&[dimension]), 5.0),
+                )
+                .expect("wide2 box"),
+            ),
+            ("relu2".into(), full(0, 0.0, 0.0)),
+        ]);
+        (graph, bounds, input)
+    }
+
+    /// One comprehensive sweep over the three-target fixture, returning the
+    /// backend transcript and the live map it left behind.
+    fn run_three_target_sweep(
+        dimension: usize,
+        chunks: usize,
+        accept_at_rows: usize,
+    ) -> (
+        RootIntermediateSweepAttempt,
+        Vec<RecordedRequest>,
+        Vec<(String, Vec<u32>, Vec<u32>)>,
+    ) {
+        let (graph, mut bounds, input) = three_target_crossing_fixture(dimension);
+        let backend = DeclineUntilSmallBackend::new(accept_at_rows);
+        let attempt = root_comprehensive_gpu_intermediate_sweep(
+            &graph,
+            &input,
+            &backend,
+            Instant::now() + Duration::from_secs(20),
+            dimension,
+            dimension,
+            32,
+            4,
+            12 * 1024 * 1024 * 1024,
+            chunks,
+            // influence: None => the historical width ordering, byte for byte.
+            None,
+            &mut bounds,
+        );
+        let attempts = backend.attempts.lock().expect("attempt lock").clone();
+        (attempt, attempts, map_bits(&bounds))
+    }
+
+    fn rows_for(request: &RecordedRequest, target_id: u64) -> Option<&[u32]> {
+        request
+            .target_rows
+            .iter()
+            .find(|(id, _)| *id == target_id)
+            .map(|(_, rows)| rows.as_slice())
+    }
+
+    #[test]
+    fn frozen_row_census_separates_crossing_from_merely_non_point() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mixed = bounded(&[-1.0, 0.0, 1.0, 2.0], &[1.0, 0.0, 3.0, 2.0]);
+        assert_eq!(
+            frozen_row_census(&mixed, deadline),
+            Some(FrozenRowCensus {
+                dim: 4,
+                crossing: 1,
+                nonpoint: 2,
+            })
+        );
+
+        // Wide but sign-stable everywhere: usable rows, zero crossing rows. This
+        // is exactly the shape the elision drops, and the shape the balanced
+        // selector still happily fills a whole chunk with.
+        let stable = bounded(&[1.0, 2.0], &[5.0, 9.0]);
+        assert_eq!(
+            frozen_row_census(&stable, deadline),
+            Some(FrozenRowCensus {
+                dim: 2,
+                crossing: 0,
+                nonpoint: 2,
+            })
+        );
+        assert!(select_balanced_tightening_rows(&stable, 2, deadline).is_some());
+
+        // A lapsed deadline is a REFUSAL, never "no crossing rows".
+        let expired = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("monotonic clock has a prior instant");
+        assert_eq!(frozen_row_census(&stable, expired), None);
+    }
+
+    #[test]
+    fn crossing_targets_lever_is_dark_and_the_off_path_is_byte_identical() {
+        let baseline = crate::tests::with_serialized_env_vars_removed(&[CROSSING_ONLY], || {
+            run_three_target_sweep(16, 2, 64)
+        });
+        assert!(!baseline.1.is_empty(), "the unarmed sweep must dispatch");
+        assert_eq!(baseline.1[0].targets, 3, "all three targets, uniformly");
+        assert_eq!(baseline.1[0].rows, 24, "3 targets x 8 rows");
+
+        // Absent, an explicit `0`, and every non-token spelling must all take the
+        // identical code path — same requests, same identities, same live map.
+        for value in ["0", "true", "yes", " 1 ", ""] {
+            let armed_off =
+                crate::tests::with_serialized_env_vars(&[(CROSSING_ONLY, value)], || {
+                    run_three_target_sweep(16, 2, 64)
+                });
+            assert_eq!(
+                format!("{:?}", armed_off.0),
+                format!("{:?}", baseline.0),
+                "{value}"
+            );
+            assert_eq!(
+                format!("{:?}", armed_off.1),
+                format!("{:?}", baseline.1),
+                "{value}: the backend transcript must not move"
+            );
+            assert_eq!(
+                armed_off.2, baseline.2,
+                "{value}: the live map must not move"
+            );
+        }
+    }
+
+    #[test]
+    fn dead_targets_are_elided_and_survivors_are_unchanged() {
+        let off = crate::tests::with_serialized_env_vars_removed(&[CROSSING_ONLY], || {
+            run_three_target_sweep(16, 1, 64)
+        });
+        let on = crate::tests::with_serialized_env_vars(&[(CROSSING_ONLY, "1")], || {
+            run_three_target_sweep(16, 1, 64)
+        });
+
+        assert_eq!(off.1.len(), 1);
+        assert_eq!(on.1.len(), 1);
+        assert_eq!(off.1[0].targets, 3);
+        assert_eq!(on.1[0].targets, 2, "the sign-stable target is elided");
+        assert_eq!(off.1[0].rows, 24);
+        assert_eq!(on.1[0].rows, 16, "the freed rows are NOT redistributed");
+
+        // The elision is elision, not reordering: every target that survives
+        // gets element-for-element the rows it got before.
+        let survivors: Vec<u64> = on.1[0]
+            .target_rows
+            .iter()
+            .map(|(target_id, _)| *target_id)
+            .collect();
+        assert_eq!(survivors.len(), 2);
+        for target_id in survivors {
+            assert_eq!(
+                rows_for(&on.1[0], target_id),
+                rows_for(&off.1[0], target_id),
+                "target {target_id} must keep its exact row window"
+            );
+        }
+
+        // And the request can only have got SMALLER, so no new device-memory
+        // decline risk is introduced.
+        assert!(on.1[0].rows < off.1[0].rows);
+        assert_eq!(on.1[0].max_device_bytes, off.1[0].max_device_bytes);
+    }
+
+    #[test]
+    fn per_target_cursors_stay_disjoint_and_outlive_a_target_that_runs_out() {
+        let (attempt, attempts, _) =
+            crate::tests::with_serialized_env_vars(&[(CROSSING_ONLY, "1")], || {
+                run_three_target_sweep(16, 4, 64)
+            });
+        assert!(
+            matches!(attempt, RootIntermediateSweepAttempt::Completed(_)),
+            "exhausting every survivor is completion, not a decline: {attempt:?}"
+        );
+
+        // `wide1` supplies 8 non-point rows and `wide0` supplies 16, so `wide1`
+        // runs out one chunk before `wide0`. Under the shared cursor that ended
+        // the whole accumulation; per target it drops only itself.
+        assert_eq!(attempts.len(), 2, "{attempts:?}");
+        assert_eq!(attempts[0].targets, 2, "both crossing targets in chunk 1");
+        assert_eq!(attempts[0].rows, 16);
+        assert_eq!(
+            attempts[1].targets, 1,
+            "only the survivor is left in chunk 2"
+        );
+        assert_eq!(attempts[1].rows, 8);
+
+        // The survivor's second window is DISJOINT from its first, and the two
+        // together cover its whole row supply exactly once.
+        let (survivor, second) = attempts[1].target_rows[0].clone();
+        let first = rows_for(&attempts[0], survivor)
+            .expect("the survivor must appear in the first chunk too")
+            .to_vec();
+        assert_eq!(first.len(), 8);
+        assert_eq!(second.len(), 8);
+        assert!(
+            first.iter().all(|row| !second.contains(row)),
+            "windows must not overlap: {first:?} vs {second:?}"
+        );
+        let mut union = first;
+        union.extend(second);
+        union.sort_unstable();
+        assert_eq!(union, (0u32..16).collect::<Vec<_>>());
     }
 
     #[test]

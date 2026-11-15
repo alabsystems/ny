@@ -228,7 +228,7 @@ fn load_native(
         })
         .unwrap_or_else(|| vec![native_model.config.hidden_dim]);
 
-    // SAFETY(#2983): Dynamic dims mapped to 16, so all factors are positive.
+    // SAFETY: Dynamic dims mapped to 16, so all factors are positive.
     let output_dim = network
         .outputs
         .first()
@@ -285,7 +285,7 @@ fn load_onnx_model(
         .map(|i| ny_onnx::resolve_dynamic_shape(&i.shape, 1))
         .unwrap_or_else(|| vec![100]);
 
-    // SAFETY(#2983): Dynamic dims resolved, so all factors are positive.
+    // SAFETY: Dynamic dims resolved, so all factors are positive.
     let output_dim = onnx_network
         .outputs
         .first()

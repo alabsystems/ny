@@ -19,7 +19,8 @@ pub(crate) enum BackendArg {
     /// CPU with Rayon parallelization (default, always available)
     #[default]
     Cpu,
-    /// wgpu compute request; verdict-bearing proof routes currently fall back to CPU
+    /// wgpu compute request; a proof route uses the GPU only after the adapter passes
+    /// live verdict qualification, and falls back to CPU otherwise
     Wgpu,
 }
 
@@ -129,8 +130,8 @@ impl From<LayerNormNormModeArg> for LayerNormMode {
 
 /// Gradient method for alpha-CROWN optimization.
 ///
-/// The `#[default]` mirrors the engine default (`GradientMethod::AnalyticChain`,
-/// #2035); when the flag is omitted (`None`) the engine default applies directly.
+/// The `#[default]` mirrors the engine default (`GradientMethod::AnalyticChain`);
+/// when the flag is omitted (`None`) the engine default applies directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub(crate) enum AlphaGradientMethodArg {
     /// SPSA zero-order optimization (O(1) passes per iteration; noise-dominated

@@ -6,7 +6,6 @@
 //! groups==1 fast-path equivalence.
 //!
 //! Split from `crown_convolution.rs` to keep files under 1000 lines.
-//! Part of #3647.
 //!
 //! WALL-CLOCK POLICY FOR THIS FILE: every `#[ntest::timeout(..)]` below is a
 //! HANG SENTINEL, not a performance assertion, and the walls are deliberately
@@ -38,7 +37,7 @@ proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(200) })]
 
     // =========================================================================
-    // Conv1d CROWN soundness with dilation > 1 (#3647)
+    // Conv1d CROWN soundness with dilation > 1
     // =========================================================================
 
     /// Conv1d CROWN backward soundness with random dilation in {1, 2, 3}.
@@ -48,8 +47,6 @@ proptest! {
     /// `gl * stride + ki * dilation - padding` which must be correct for all
     /// dilation values. This proptest exercises the dilation>1 code path
     /// in ops_gemm.rs:154 and ops.rs conv1d_transpose.
-    ///
-    /// Part of #3647.
     #[ntest::timeout(300000)]
     #[test]
     fn soundness_conv1d_crown_dilation_3647(
@@ -134,7 +131,7 @@ proptest! {
     }
 
     // =========================================================================
-    // Conv1d CROWN soundness with groups > 1 (#3647)
+    // Conv1d CROWN soundness with groups > 1
     // =========================================================================
 
     /// Conv1d CROWN backward soundness with groups in {1, 2, 4}.
@@ -144,8 +141,6 @@ proptest! {
     /// scatter logic (ops_gemm.rs:118-170) that differ from the groups==1 fast
     /// path. This proptest exercises the groups>1 code path with randomized
     /// kernels and inputs.
-    ///
-    /// Part of #3647.
     #[ntest::timeout(300000)]
     #[test]
     fn soundness_conv1d_crown_groups_3647(
@@ -241,7 +236,7 @@ proptest! {
     }
 
     // =========================================================================
-    // Conv1d CROWN groups==1 fast path equivalence (#3647)
+    // Conv1d CROWN groups==1 fast path equivalence
     // =========================================================================
 
     /// Verify that the groups==1 fast path (ops_gemm.rs:172-252) produces
@@ -250,8 +245,6 @@ proptest! {
     ///
     /// This catches divergence between the two code paths that would only
     /// manifest as subtle numerical differences in production.
-    ///
-    /// Part of #3647.
     #[ntest::timeout(300000)]
     #[test]
     fn soundness_conv1d_crown_groups1_fast_path_equiv_3647(

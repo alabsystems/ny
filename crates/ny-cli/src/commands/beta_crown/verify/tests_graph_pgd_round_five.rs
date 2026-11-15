@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! PGD gradient ascent direction regression test (#4285).
+//! PGD gradient ascent direction regression test.
 //!
 //! Verifies that PGD gradient steps push toward constraint *satisfaction*
 //! in VNN-LIB semantics. VNN-LIB constraints describe the UNSAFE region —
@@ -12,7 +12,7 @@
 use super::*;
 use ny_onnx::vnnlib::OutputConstraint;
 
-/// Regression test for #4285: PGD gradient steps converge toward counterexamples.
+/// Regression test: PGD gradient steps converge toward counterexamples.
 ///
 /// Network: y = 5*x + 2.5
 /// Input: [-1, 1], output range: [-2.5, 7.5]
@@ -67,7 +67,7 @@ fn test_pgd_gradient_ascent_finds_counterexample_4285() {
     );
 }
 
-/// #4419: Verify that `independent_graph_forward` produces the same output as
+/// Verify that `independent_graph_forward` produces the same output as
 /// `evaluate_graph` with engine=None, confirming the re-validation path is
 /// functionally equivalent to the attack evaluator on CPU.
 #[test]
@@ -86,7 +86,7 @@ fn test_independent_graph_forward_matches_evaluate_graph_4419() {
     );
 }
 
-/// #4419: Verify that `independent_graph_forward` produces approximately the
+/// Verify that `independent_graph_forward` produces approximately the
 /// same output as `evaluate_graph` with a GemmEngine. Small floating-point
 /// differences are expected because the engine and fallback CPU paths use
 /// different GEMM implementations. This is exactly the kind of drift that
@@ -112,7 +112,7 @@ fn test_independent_graph_forward_close_to_engine_evaluation_4419() {
     }
 }
 
-/// #4419: End-to-end test that a graph PGD counterexample returned by
+/// End-to-end test that a graph PGD counterexample returned by
 /// `try_graph_pgd_upfront` has been independently re-validated.
 ///
 /// The returned output should match what `independent_graph_forward` produces,

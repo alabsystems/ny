@@ -256,6 +256,48 @@ def test_lever_receipt_v3_ignored_evidence_and_v2_compatibility() -> None:
         assert not archive._valid_v3_lever_state(bad_state, ambient_env=bad_ambient)
 
 
+@pytest.mark.parametrize(
+    "name", ["NY_MARGIN_ROW_HEAD_GROUPS", "NY_MARGIN_ROW_HEAD_DIRECTIONAL_CUTS"]
+)
+@pytest.mark.parametrize("enabled", [False, True])
+def test_owner_directed_default_provenance_has_exact_scope(
+    name: str, enabled: bool
+) -> None:
+    state = _v3_lever_state()
+    entry = state["receipt"]["levers"][0]
+    entry.update(
+        name=name, value=enabled, bucket="default_on", moat="high",
+        provenance="owner_directed",
+    )
+    ambient = {"NY_PHASE_TELEMETRY": "1"}
+    assert archive._valid_v3_lever_state(state, ambient_env=ambient)
+    for field, value in [
+        ("name", "NY_UNAUTHORIZED_DEFAULT"), ("bucket", "debug"),
+        ("moat", "low"), ("value", 1), ("provenance", "unmeasured"),
+    ]:
+        invalid = json.loads(json.dumps(state))
+        invalid["receipt"]["levers"][0][field] = value
+        assert not archive._valid_v3_lever_state(invalid, ambient_env=ambient)
+
+
+def test_historical_v1_receipt_refuses_owner_directed_defaults() -> None:
+    import regular_bank_evidence as bank_evidence
+
+    receipt = {
+        "schema": "ny-levers/receipt/v1",
+        "lever_count": 1,
+        "env_overridden": 0,
+        "levers": [{
+            "name": "NY_MARGIN_ROW_HEAD_GROUPS", "value": True,
+            "source": "default", "bucket": "default_on", "moat": "high",
+            "provenance": "guard",
+        }],
+    }
+    assert bank_evidence._valid_v2_lever_receipt(receipt, ambient_env={})
+    receipt["levers"][0]["provenance"] = "owner_directed"
+    assert not bank_evidence._valid_v2_lever_receipt(receipt, ambient_env={})
+
+
 def _v3_flight_record() -> dict[str, object]:
     return {
         "schema_version": 3,

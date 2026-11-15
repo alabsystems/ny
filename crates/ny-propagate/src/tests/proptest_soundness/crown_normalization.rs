@@ -14,8 +14,6 @@
 //!
 //! Calls `propagate_linear_with_bounds()` directly on layer types (not via
 //! Layer enum dispatch) to isolate the CROWN implementation under test.
-//!
-//! Part of #3103, #3820.
 
 use crate::layers::normalization::{
     AdaIN1dLayer, InstanceNorm1dLayer, LayerNormCrownMode, LayerNormLayer, RmsNormLayer,
@@ -53,7 +51,6 @@ proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(500) })]
 
     /// RmsNorm CROWN structural: identity params, identity incoming.
-    /// Part of #3103.
     #[ntest::timeout(60000)]
     #[test]
     fn structural_rmsnorm_crown_sampling_identity(
@@ -118,7 +115,6 @@ proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(500) })]
 
     /// RmsNorm CROWN soundness with identity incoming, tight perturbation.
-    /// Part of #3103.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_rmsnorm_crown_identity_tight(
@@ -192,7 +188,6 @@ proptest! {
     }
 
     /// RmsNorm CROWN soundness with negative-coefficient incoming bounds.
-    /// Part of #3103.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_rmsnorm_crown_negcoeff(
@@ -286,7 +281,6 @@ proptest! {
     /// LayerNorm CROWN soundness with identity incoming, tight perturbation.
     /// Verifies that for sampled concrete inputs within bounds, the true
     /// LayerNorm output falls within the CROWN-computed bounds.
-    /// Part of #2167.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_layernorm_crown_identity_tight(
@@ -365,7 +359,6 @@ proptest! {
     }
 
     /// LayerNorm CROWN soundness with negative-coefficient incoming bounds.
-    /// Part of #2167.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_layernorm_crown_negcoeff(
@@ -451,7 +444,6 @@ proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(500) })]
 
     /// InstanceNorm1d CROWN structural: 2 channels, 3 timesteps.
-    /// Part of #3103.
     #[ntest::timeout(60000)]
     #[test]
     fn structural_instancenorm_crown_sampling(
@@ -496,7 +488,6 @@ proptest! {
     }
 
     /// InstanceNorm1d CROWN soundness: 2 channels, 3 timesteps, tight perturbation.
-    /// Part of #3103.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_instancenorm_crown_identity_tight(
@@ -574,7 +565,6 @@ proptest! {
     }
 
     /// InstanceNorm1d CROWN soundness with negative incoming coefficients.
-    /// Part of #3103.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_instancenorm_crown_negcoeff(
@@ -650,7 +640,6 @@ proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(500) })]
 
     /// AdaIN1d CROWN structural: 2 channels, 2 timesteps.
-    /// Part of #3103.
     #[ntest::timeout(60000)]
     #[test]
     fn structural_adain_crown_sampling(
@@ -700,7 +689,6 @@ proptest! {
     }
 
     /// AdaIN1d CROWN soundness: 2 channels, 2 timesteps, tight perturbation.
-    /// Part of #3103.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_adain_crown_identity_tight(
@@ -789,7 +777,6 @@ proptest! {
 
     /// AdaIN1d CROWN soundness with negative incoming coefficients.
     /// 1 channel, 3 timesteps.
-    /// Part of #3103.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_adain_crown_negcoeff(

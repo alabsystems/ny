@@ -17,7 +17,7 @@ crate-type = ["cdylib"]
 # Also avoids doc filename collision with ny-cli's `ny` binary.
 doc = false
 
-# NOTE: Rust tests work with cargo test -p ny-python (no Python needed).
+# NOTE: Rust tests work with targo --unverified test -p ny-python (no Python needed).
 # For Python integration tests: maturin develop && pytest
 
 [dependencies]

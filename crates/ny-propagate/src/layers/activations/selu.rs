@@ -44,7 +44,7 @@ impl BoundPropagation for SeluLayer {
     #[inline]
     fn propagate_ibp(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
         // Guard: NaN input bounds fail closed — NaN.exp() = NaN would flow
-        // silently into output bounds. (#3203, Finding 2)
+        // silently into output bounds.
         //
         // ±Inf endpoints are NOT rejected (deep-stack IBP overflow saturation,
         // dc9da0fde class): the closures below are limit-correct at infinity —
@@ -59,7 +59,7 @@ impl BoundPropagation for SeluLayer {
         }
 
         // Directed rounding: for x < 0, exp is a transcendental that can round
-        // either direction. Compute in f64, cast with next_down/next_up. (#1483)
+        // either direction. Compute in f64, cast with next_down/next_up.
         // For x >= 0, SELU(x) = lambda*x — multiplication may also round,
         // so apply directed rounding there too for consistency.
         let lambda64 = Self::LAMBDA as f64;
@@ -75,8 +75,8 @@ impl BoundPropagation for SeluLayer {
                 cast_f64_to_f32_down(lambda64 * f64::from(x))
             } else {
                 // Range clamp: SELU(x) >= -lambda*alpha for all x. next_down_f32
-                // can push past this for extreme negative inputs. (#3316)
-                // NaN-propagating: .max() swallows NaN (IEEE 754-2008). (#3316)
+                // can push past this for extreme negative inputs.
+                // NaN-propagating:.max() swallows NaN (IEEE 754-2008).
                 nan_propagating_max(
                     cast_f64_to_f32_down(lambda64 * alpha64 * (f64::from(x).exp() - 1.0)),
                     selu_floor,
@@ -117,7 +117,7 @@ impl BoundPropagation for SeluLayer {
 /// for all x in [l, u].
 ///
 /// Delegates to the shared ELU-family relaxation (elu_family.rs) parameterized with
-/// SELU's fixed constants. Part of #2834.
+/// SELU's fixed constants.
 ///
 /// Ref: alpha-beta-CROWN auto_LiRPA/operators/nonlinear.py (SELU relaxation)
 fn selu_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
@@ -140,8 +140,9 @@ fn selu_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
         // require an infinite endpoint. That is precisely the guard 5d48d59e9
         // relaxed on the IBP side, so the landmine sits in the path of the work.
         // Lowering a lower intercept is unconditionally sound: it only loosens.
-        saturation: cast_f64_to_f32_down(-(f64::from(SeluLayer::LAMBDA)
-            * f64::from(SeluLayer::ALPHA))),
+        saturation: cast_f64_to_f32_down(
+            -(f64::from(SeluLayer::LAMBDA) * f64::from(SeluLayer::ALPHA)),
+        ),
         scale: la64,
         alpha: alpha64,
         globally_convex: false,
@@ -182,7 +183,7 @@ mod tests {
         y as f32
     }
 
-    /// Check SELU relaxation soundness using the consolidated helper from tests/mod.rs (#2496).
+    /// Check SELU relaxation soundness using the consolidated helper from src/tests/mod.rs.
     fn assert_relaxation_soundness(l: f32, u: f32, tol: f32) {
         let relaxation = selu_linear_relaxation(l, u);
         assert_relaxation_sound(l, u, relaxation, selu_eval, tol, "SELU");
@@ -344,7 +345,7 @@ mod tests {
     /// function actually drops below for every x < -17.93 — a false hold.
     ///
     /// This class is invisible to the shared grid helper: `assert_relaxation_sound`
-    /// (tests/mod.rs) asserts `lower <= f(x) + tol`, i.e. it PERMITS the certified
+    /// (src/tests/mod.rs) asserts `lower <= f(x) + tol`, i.e. it PERMITS the certified
     /// lower bound to exceed the function by up to `tol`, and every SELU call site
     /// passes tol >= 1e-5 — three orders of magnitude above this error. The one
     /// zero-tolerance proptest samples `l in -10.0..10.0`, which cannot reach
@@ -545,7 +546,7 @@ mod tests {
         assert!(layer.propagate_crown_backward(&bounds, None).is_err());
     }
 
-    // ── IBP guard regression tests (#3203) ────────────────────────────
+    // ── IBP guard regression tests ────────────────────────────
 
     #[test]
     fn test_ibp_nan_input_lower_rejected() {
@@ -627,7 +628,7 @@ mod tests {
         assert!(out.upper()[[0]] >= SeluLayer::LAMBDA - 1e-5);
     }
 
-    // ── NaN propagation regression tests (#2714) ──────────────────────
+    // ── NaN propagation regression tests ──────────────────────
 
     #[test]
     fn test_relaxation_nan_lower_returns_nan_fallback_2714() {
@@ -656,7 +657,7 @@ mod tests {
         );
     }
 
-    // ── CROWN relaxation soundness proptest (#3285) ─────────────────────
+    // ── CROWN relaxation soundness proptest ─────────────────────
 
     /// Reference SELU in f64, independent of the crate f32 implementation.
     fn selu_f64_reference(x: f64) -> f64 {
@@ -810,7 +811,7 @@ mod tests {
     proptest::proptest! {
         #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(1000) })]
 
-        /// #3285: Verify selu_linear_relaxation produces strictly sound bounds.
+        /// Verify selu_linear_relaxation produces strictly sound bounds.
         /// For random intervals, the lower bound must satisfy
         ///   lower_slope * x + lower_intercept <= SELU(x)  for all x in [l, u]
         /// and the upper bound must satisfy

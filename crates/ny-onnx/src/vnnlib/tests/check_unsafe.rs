@@ -40,8 +40,8 @@ fn test_is_unsafe_with_no_output_constraints() {
 
     let spec = parse_vnnlib(content).unwrap();
 
-    assert!(spec.output_constraints.is_empty());
-    assert!(spec.output_constraint_clauses.is_empty());
+    assert_eq!((spec.output_constraints).len(), 0);
+    assert_eq!((spec.output_constraint_clauses).len(), 0);
     assert!(!spec.is_unsafe(&[0.25]));
 }
 

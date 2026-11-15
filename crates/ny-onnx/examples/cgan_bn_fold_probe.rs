@@ -5,7 +5,7 @@
 //! Real-corpus qualification for the extended cGAN BatchNorm folds.
 //!
 //! Usage:
-//! `NY_CGAN_PROBE_ONNX=... NY_CGAN_PROBE_VNNLIB=... cargo run -p ny-onnx \
+//! `NY_CGAN_PROBE_ONNX=... NY_CGAN_PROBE_VNNLIB=... targo --unverified run -p ny-onnx \
 //!  --release --example cgan_bn_fold_probe`
 //!
 //! Hermetic default coverage remains in the 1,500 fixed-seed ONNX Runtime

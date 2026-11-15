@@ -361,7 +361,7 @@ fn test_gain_reduction_ibp_soundness() {
         );
     }
 
-    // Acceptance criterion from #3260: gain ∈ [max_atten, 1.0]
+    // Acceptance criterion: gain ∈ [max_atten, 1.0]
     assert!(
         ibp_bounds.lower()[[0]] >= params.max_atten - FP_TOLERANCE,
         "Lower bound below max_atten: {}",

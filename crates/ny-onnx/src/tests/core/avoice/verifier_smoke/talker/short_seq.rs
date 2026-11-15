@@ -9,8 +9,6 @@ use super::*;
 /// [0, 1].
 ///
 /// Uses IBP on the short sequence lane (seq_len=4) for runtime stability.
-///
-/// Part of #3654.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
 #[cfg(feature = "external-avoice")]
@@ -46,8 +44,6 @@ fn test_avoice_talker_softmax_range_verifier_smoke_3654() {
 /// Verify the short-seq talker softmax root smoke does not certify an
 /// impossible property. Softmax outputs are non-negative, so requiring every
 /// output to stay at or below `-0.1` must return `Unknown(BoundsTooLoose)`.
-///
-/// Part of #4061.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
 #[cfg(feature = "external-avoice")]

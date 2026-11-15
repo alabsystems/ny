@@ -28,6 +28,15 @@ pub(crate) enum NodeBoundsView<'a> {
     Plain(&'a HashMap<String, BoundedTensor>),
     /// Map of `Arc`-shared tensors (constrained / batched BaB callers).
     Shared(&'a HashMap<String, Arc<BoundedTensor>>),
+    /// The exact input/output projection used by a target backward step.
+    /// Prefer tightened bounds, then the original IBP map, without cloning
+    /// either map's tensors. Unrelated entries remain invisible to dispatch.
+    Target {
+        tightened: &'a HashMap<String, BoundedTensor>,
+        ibp: &'a HashMap<String, BoundedTensor>,
+        node_name: &'a str,
+        inputs: &'a [String],
+    },
 }
 
 impl<'a> NodeBoundsView<'a> {
@@ -36,6 +45,37 @@ impl<'a> NodeBoundsView<'a> {
         match self {
             Self::Plain(m) => m.get(name),
             Self::Shared(m) => m.get(name).map(|a| a.as_ref()),
+            Self::Target {
+                tightened,
+                ibp,
+                node_name,
+                inputs,
+            } => {
+                // Match the historical temporary map exactly: all dynamic
+                // inputs except NETWORK_INPUT, then the current output box.
+                // Dispatch resolves NETWORK_INPUT through network_input.
+                if name != *node_name
+                    && (name == crate::network::core::NETWORK_INPUT
+                        || !inputs.iter().any(|input| input == name))
+                {
+                    return None;
+                }
+                tightened.get(name).or_else(|| ibp.get(name))
+            }
+        }
+    }
+
+    pub(crate) fn target(
+        tightened: &'a HashMap<String, BoundedTensor>,
+        ibp: &'a HashMap<String, BoundedTensor>,
+        node_name: &'a str,
+        inputs: &'a [String],
+    ) -> Self {
+        Self::Target {
+            tightened,
+            ibp,
+            node_name,
+            inputs,
         }
     }
 }
@@ -70,16 +110,16 @@ pub(crate) struct DispatchContext<'a> {
     pub engine: Option<&'a dyn GemmEngine>,
     /// Optional wall-clock deadline for deadline-aware backward kernels.
     pub deadline: Option<Instant>,
-    /// Optional bilinear alpha parameters for McCormick interpolation (#3287).
+    /// Optional bilinear alpha parameters for McCormick interpolation.
     /// Maps node name → [4, m, n, k] alpha array. When present and a
     /// BilinearCrown node is found in the map, uses `interpolated_mccormick`
     /// with optimizable r_l/r_u instead of the fixed midpoint heuristic.
     pub bilinear_alphas: Option<&'a HashMap<String, ndarray::Array4<f32>>>,
-    /// Relaxation mode for MulBinary CROWN backward (#3439).
+    /// Relaxation mode for MulBinary CROWN backward.
     /// Controls which McCormick envelope selection strategy to use for
     /// element-wise multiplication layers. Used when no alpha is available.
     pub mul_binary_relaxation: MulBinaryRelaxationMode,
-    /// Optional MulBinary alpha parameters for interpolated McCormick (#3439).
+    /// Optional MulBinary alpha parameters for interpolated McCormick.
     /// Maps node name → [2, n] alpha array where row 0 = r_l, row 1 = r_u.
     /// When present and a MulBinary node is found in the map, uses
     /// `propagate_linear_binary_with_alpha` with optimizable interpolation.
@@ -108,12 +148,11 @@ pub(crate) enum BackwardDispatchResult {
     /// Two sets of A-matrix bounds for `node.inputs[0]` and `node.inputs[1]`,
     /// plus a single bias pair accumulated exactly once by the engine.
     ///
-    /// # Separate bias channel (#2617, #2530)
+    /// # Separate bias channel
     ///
     /// Each `LinearBounds` in `bounds_a`/`bounds_b` MUST have `lower_b = upper_b = 0`.
     /// All bias goes through `bias_lower`/`bias_upper`. The engine accumulates
-    /// bias exactly once, eliminating the class of bias-splitting bugs (#2520,
-    /// #2527, #2529, #2530).
+    /// bias exactly once, eliminating the class of bias-splitting bugs.
     ///
     /// Reference: alpha-beta-CROWN `backward_bound.py:253-296` — engine
     /// accumulates bias once via `lb = lb + lower_b`.
@@ -127,7 +166,7 @@ pub(crate) enum BackwardDispatchResult {
     /// constant/skipped input), plus a single bias pair accumulated exactly
     /// once by the engine.
     ///
-    /// # Separate bias channel (#2617, #2530)
+    /// # Separate bias channel
     ///
     /// Each `LinearBounds` MUST have `lower_b = upper_b = 0`.
     /// All bias goes through `bias_lower`/`bias_upper`.

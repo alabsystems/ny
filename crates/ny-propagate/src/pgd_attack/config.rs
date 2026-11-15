@@ -4,7 +4,7 @@
 
 //! Configuration for PGD attacks.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -45,8 +45,20 @@ pub struct ExactVjpPgdConfig {
     pub lane_window: usize,
     /// Enable endgame exploit recycling.
     pub exploit: bool,
-    /// Tau-hinge threshold for odd conjunctive lanes; zero disables.
+    /// Tau-hinge threshold for odd conjunctive lanes; zero disables. The
+    /// disjunctive focus wave (#disj-odi, [`Self::disj_focus_lanes`]) reuses
+    /// it as its per-lane hinge.
     pub hinge_tau: f32,
+    /// #disj-odi: run [`Self::odi_steps`] output-diversified-initialization
+    /// steps (scale [`Self::odi_eta`]) on the DYNAMIC lanes of every
+    /// disjunctive exact-VJP wave. Default false: the disjunctive driver never
+    /// consults the ODI fields and stays byte-identical.
+    pub disj_odi: bool,
+    /// #disj-odi: dangerous-class focus lanes the disjunctive exact-VJP
+    /// driver appends after its restart waves (ODI init, tau-hinge margin of
+    /// the pinned class, momentum-sign steps on a cosine schedule). Zero
+    /// disables.
+    pub disj_focus_lanes: usize,
 }
 
 impl Default for ExactVjpPgdConfig {
@@ -63,6 +75,8 @@ impl Default for ExactVjpPgdConfig {
             lane_window: 0,
             exploit: true,
             hinge_tau: 0.0,
+            disj_odi: false,
+            disj_focus_lanes: 0,
         }
     }
 }
@@ -173,6 +187,10 @@ impl ExactVjpPgdConfig {
             Some(LeverValue::Bool(self.exploit))
         } else if std::ptr::eq(decl, &raw const d::HINGE_TAU) {
             Some(LeverValue::F64(f64::from(self.hinge_tau)))
+        } else if std::ptr::eq(decl, &raw const d::DISJ_ODI) {
+            Some(LeverValue::Bool(self.disj_odi))
+        } else if std::ptr::eq(decl, &raw const d::DISJ_FOCUS_LANES) {
+            Some(LeverValue::U64(self.disj_focus_lanes as u64))
         } else {
             None
         }
@@ -251,9 +269,132 @@ impl ExactVjpPgdConfig {
             lane_window: required_usize(&d::LANE_WINDOW, value(&d::LANE_WINDOW)?)?,
             exploit: boolean(&d::EXPLOIT, value(&d::EXPLOIT)?)?,
             hinge_tau: scalar_f32(&d::HINGE_TAU, value(&d::HINGE_TAU)?)?,
+            disj_odi: boolean(&d::DISJ_ODI, value(&d::DISJ_ODI)?)?,
+            disj_focus_lanes: required_usize(&d::DISJ_FOCUS_LANES, value(&d::DISJ_FOCUS_LANES)?)?,
         };
         policy.validate()?;
         Ok(policy)
+    }
+}
+
+/// Default floor on each attacked disjunct's share of the open-disjunct stage
+/// wall, in seconds (Vibecheck `phase26_pgd_per_spec_min_per_spec: 0.5`).
+pub const OPEN_DISJUNCT_DEFAULT_MIN_SECS: f32 = 0.5;
+/// Default wall cap of the open-disjunct stage's attack (after its root
+/// wait), in seconds.
+pub const OPEN_DISJUNCT_DEFAULT_MAX_SECS: f32 = 10.0;
+/// Default restarts per attacked disjunct (Vibecheck tinyimagenet
+/// `pgd_restarts: 100`).
+pub const OPEN_DISJUNCT_DEFAULT_RESTARTS: usize = 100;
+/// Default share of the time remaining at stage start that the whole stage
+/// (root wait + attack) may consume.
+pub const OPEN_DISJUNCT_DEFAULT_MAX_FRAC: f32 = 0.25;
+
+/// Typed policy of the root-pruned, per-disjunct, many-restart attack stage
+/// (#attack-open-disjuncts, VIBECHECK_PLAN §6.V3).
+///
+/// Preset keys (all under `attack:`): `open_disjunct_restrict`,
+/// `open_disjunct_min_secs`, `open_disjunct_max_secs`,
+/// `open_disjunct_restarts`, `open_disjunct_root_wait_secs`,
+/// `open_disjunct_max_frac`. The stage runs
+/// after the disjunctive attack phase of a multi-clause disjunction: it takes
+/// the margin-row lane's certified root per-class bounds (when published),
+/// drops every disjunct the root closed, orders the rest by root lower bound
+/// (lowest first), and assigns restart `r` to open disjunct `r % n_open`, each
+/// restart ascending its OWN disjunct's margin with the exact batched VJP,
+/// from uniform (even cycles) or OSI (odd cycles) starts.
+///
+/// SOUNDNESS: attack-only. It changes where candidates are proposed, never how
+/// one is accepted: every candidate passes the unchanged
+/// `re_evaluate_and_confirm` (noise-scaled 1e-4 floor, attack box, per-clause
+/// box) and then the trusted-ORT `gate_sat_with_trusted_oracle`. It cannot
+/// produce `unsat`. Dark by default: `restrict: false` means the stage does
+/// not exist and the root publication is never armed.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OpenDisjunctAttackConfig {
+    /// Master switch (`attack.open_disjunct_restrict`).
+    pub restrict: bool,
+    /// Floor on each attacked disjunct's share of the stage wall, seconds
+    /// (`attack.open_disjunct_min_secs`). When `n_open * min_secs` exceeds
+    /// the stage budget, only the lowest-root-bound disjuncts that fit are
+    /// attacked; none is given less than this share.
+    pub min_secs: f32,
+    /// Wall cap of the ATTACK, seconds (`attack.open_disjunct_max_secs`),
+    /// counted from the end of the root wait (the wait is capped separately by
+    /// `root_wait_secs`); the whole stage is further clamped by `max_frac` and
+    /// the instance deadline.
+    pub max_secs: f32,
+    /// Restarts per attacked disjunct (`attack.open_disjunct_restarts`); the
+    /// stage ends early when all of them have run.
+    pub restarts: usize,
+    /// Longest wait for the lane's certified root, seconds
+    /// (`attack.open_disjunct_root_wait_secs`). Zero uses a root only if it
+    /// is already published; a lane that is not running is never waited on.
+    pub root_wait_secs: f32,
+    /// Share of the time remaining to the verifier's overall deadline at
+    /// stage start that the WHOLE stage — root wait plus attack — may use
+    /// (`attack.open_disjunct_max_frac`, in `(0, 1]`). This is what keeps one
+    /// arming safe across budget tiers (cct runs 30/120/550 s rows): the
+    /// absolute seconds above are caps, and `1 - max_frac` of the clock is
+    /// what the BaB hand-off always keeps. The root wait never runs past this
+    /// limit less one `min_secs` floor, so a lane that never publishes cannot
+    /// turn the stage into a pure wait.
+    pub max_frac: f32,
+}
+
+impl Default for OpenDisjunctAttackConfig {
+    fn default() -> Self {
+        Self {
+            restrict: false,
+            min_secs: OPEN_DISJUNCT_DEFAULT_MIN_SECS,
+            max_secs: OPEN_DISJUNCT_DEFAULT_MAX_SECS,
+            restarts: OPEN_DISJUNCT_DEFAULT_RESTARTS,
+            root_wait_secs: 0.0,
+            max_frac: OPEN_DISJUNCT_DEFAULT_MAX_FRAC,
+        }
+    }
+}
+
+impl OpenDisjunctAttackConfig {
+    /// Longest any of the stage's time keys may be, seconds. Longer than every
+    /// VNN-COMP instance budget (the longest is 1800 s), and small enough that
+    /// every `Duration`/`Instant` conversion downstream is exact and cannot
+    /// overflow.
+    pub const MAX_SECS_CAP: f32 = 3600.0;
+
+    /// Reject values that cannot describe a stage: non-finite, negative or
+    /// absurdly large times, a zero per-disjunct floor (it would let an
+    /// unbounded number of disjuncts share the wall), or zero restarts.
+    pub fn validate(self) -> Result<(), String> {
+        for (name, value) in [
+            ("attack.open_disjunct_min_secs", self.min_secs),
+            ("attack.open_disjunct_max_secs", self.max_secs),
+            ("attack.open_disjunct_root_wait_secs", self.root_wait_secs),
+        ] {
+            if !value.is_finite() || !(0.0..=Self::MAX_SECS_CAP).contains(&value) {
+                return Err(format!(
+                    "{name} must be finite and in [0, {}], got {value}",
+                    Self::MAX_SECS_CAP
+                ));
+            }
+        }
+        if self.min_secs <= 0.0 {
+            return Err(format!(
+                "attack.open_disjunct_min_secs must be > 0, got {}",
+                self.min_secs
+            ));
+        }
+        if self.restarts == 0 {
+            return Err("attack.open_disjunct_restarts must be >= 1".to_string());
+        }
+        if !(self.max_frac > 0.0 && self.max_frac <= 1.0) {
+            return Err(format!(
+                "attack.open_disjunct_max_frac must be in (0, 1], got {}",
+                self.max_frac
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -286,7 +427,7 @@ pub struct PgdConfig {
     pub optimizer: PgdOptimizer,
     pub alpha_mode: PgdAlphaMode,
     pub adam: AdamClippingParams,
-    /// GAMA guidance weight λ₀ (#1449, `attack_mode: diversed_GAMA_PGD`).
+    /// GAMA guidance weight λ₀ (`attack_mode: diversed_GAMA_PGD`).
     ///
     /// `Some(λ₀)` makes relational-target attack steps ascend the GAMA loss
     /// `softmax_margin + λ·‖P − softmax‖²` (Sriramanan et al., NeurIPS 2020)
@@ -323,8 +464,106 @@ pub struct PgdConfig {
     pub dense_sweep_max_dims: usize,
     /// Total forward-evaluation budget for the dense sweep (grid + refinement).
     pub dense_sweep_points: usize,
+    /// Box-corner seeds for the first N restarts (#attack-vertex-geometry,
+    /// `attack: corner_seed_restarts`).
+    ///
+    /// Restart `k < N` (the restart whose seed is `seed + k`) starts at
+    /// `corner_seed_point(k, ..)`
+    /// ([`corner_seed_point`](crate::pgd_attack::corner_seed_point)):
+    /// the lower corner, then the upper corner, then random box vertices.
+    /// Every restart `k >= N` keeps its historical Uniform/OSI seed and RNG
+    /// stream exactly, so `0` (the default) is byte-identical to the
+    /// pre-corner schedule. Attack-only: a corner is a point of the box and
+    /// every candidate is re-validated downstream.
+    pub corner_seed_restarts: usize,
     /// Frozen per-run policy for batched exact point-VJP graph attacks.
     pub exact_vjp: ExactVjpPgdConfig,
+    /// Cooperative cancellation (#attack-concurrent): `Some(token)` makes
+    /// [`Self::past_deadline`] (and every attack loop that polls its deadline
+    /// through [`Self::past_deadline`] / [`Self::cancelled`]) report "stop"
+    /// as soon as the token is cancelled, so a concurrent attack lane stops at
+    /// its next step or restart boundary when the proof it races decides.
+    ///
+    /// `None` (the default, and every caller except the concurrent attack
+    /// lane) keeps every loop byte-identical: the deadline test is exactly the
+    /// historical `deadline.is_some_and(|d| now >= d)`. Attack-only: stopping
+    /// a search early can only withhold a candidate, never mint a verdict.
+    pub cancel: Option<PgdCancelToken>,
+    /// #attack-setup-regrant: the search slice a falsification PHASE declared,
+    /// re-granted ONCE from the instant its search can start when the phase's
+    /// own setup (dispatch prelude, batched-VJP plan construction) already
+    /// consumed [`Self::deadline`] — see [`PgdSetupRegrant`].
+    ///
+    /// `None` (the default, and every caller except the global disjunctive
+    /// PGD phase) keeps every driver byte-identical. Attack-only: it can only
+    /// move WHEN candidate generation stops, never mint a verdict.
+    pub setup_regrant: Option<PgdSetupRegrant>,
+}
+
+/// #attack-setup-regrant: what a driver may re-grant when its slice expired
+/// before its first search step.
+///
+/// The disjunctive PGD slice is an instant anchored at the BaB ledger start, so
+/// everything that runs before the first wave — the BaB-dispatch prelude and
+/// the batched exact-VJP plan construction — is charged against it. On a large
+/// model that setup can exceed the whole slice and the falsifier then performs
+/// ZERO steps (`exact_vjp_execution inactive_reason=deadline_before_start`).
+/// A driver that receives this re-grants, once, `min(now + slice, cap)` at
+/// the moment its search is ready — the slice the phase DECLARED, spent on
+/// search rather than on setup — and only when the original deadline has
+/// already passed there, so a falsifier that already runs keeps its exact
+/// historical deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PgdSetupRegrant {
+    /// The declared search slice (the phase's fraction, measured from the
+    /// phase start; already clamped by the ledger's caps).
+    pub slice: Duration,
+    /// Never past this instant (the caller's overall deadline).
+    pub cap: Instant,
+}
+
+impl PgdSetupRegrant {
+    /// The re-granted deadline at `now`, or `None` when nothing may be
+    /// re-granted: the original `deadline` is still live (or unbounded), or
+    /// the cap leaves no time after `now`.
+    #[must_use]
+    pub fn regranted_deadline(self, deadline: Option<Instant>, now: Instant) -> Option<Instant> {
+        let expired = deadline.is_some_and(|limit| now >= limit);
+        if !expired {
+            return None;
+        }
+        let fresh = now
+            .checked_add(self.slice)
+            .map_or(self.cap, |end| end.min(self.cap));
+        (fresh > now).then_some(fresh)
+    }
+}
+
+/// Cooperative cancellation handle for a PGD attack (#attack-concurrent).
+///
+/// One shared flag: [`Self::cancel`] latches it, every clone observes it.
+/// Cancellation is a token, never a deadline write — the attack's own
+/// deadline is unchanged and a cancelled attack simply stops at its next poll.
+#[derive(Debug, Clone, Default)]
+pub struct PgdCancelToken(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl PgdCancelToken {
+    /// A fresh, uncancelled token.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Latch the cancellation. Idempotent.
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether [`Self::cancel`] has been called on this token or any clone.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 impl Default for PgdConfig {
@@ -348,14 +587,29 @@ impl Default for PgdConfig {
             dense_low_dim_sweep: false,
             dense_sweep_max_dims: 3,
             dense_sweep_points: 32_768,
+            corner_seed_restarts: 0,
             exact_vjp: ExactVjpPgdConfig::default(),
+            cancel: None,
+            setup_regrant: None,
         }
     }
 }
 
 impl PgdConfig {
+    /// Whether the attack must stop now: its deadline has passed, or its
+    /// cancellation token (#attack-concurrent) was cancelled. With
+    /// `cancel: None` this is exactly the historical deadline test.
     pub fn past_deadline(&self) -> bool {
-        self.deadline.map(|d| Instant::now() >= d).unwrap_or(false)
+        self.deadline.map(|d| Instant::now() >= d).unwrap_or(false) || self.cancelled()
+    }
+
+    /// Whether this attack's cancellation token (#attack-concurrent) has been
+    /// cancelled. Always `false` with `cancel: None`.
+    #[must_use]
+    pub fn cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(PgdCancelToken::is_cancelled)
     }
 
     pub fn fast() -> Self {
@@ -451,6 +705,47 @@ impl PgdConfig {
 }
 
 #[cfg(test)]
+mod cancel_token_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// #attack-concurrent: with `cancel: None` (every caller but the
+    /// concurrent attack lane) `past_deadline` is exactly the historical
+    /// deadline test; a cancelled token stops the attack whatever its
+    /// deadline, and every clone observes one cancellation.
+    #[test]
+    #[expect(
+        clippy::redundant_clone,
+        reason = "Exercise clone propagation of deadline, cancellation and shared accounting ownership."
+    )]
+    fn past_deadline_without_a_token_is_the_historical_deadline_test() {
+        let mut config = PgdConfig::default();
+        assert!(config.cancel.is_none(), "dark by default");
+        assert!(!config.past_deadline() && !config.cancelled());
+        config.deadline = Some(Instant::now() + Duration::from_secs(60));
+        assert!(!config.past_deadline());
+        config.deadline = Some(Instant::now());
+        assert!(config.past_deadline());
+
+        let token = PgdCancelToken::new();
+        let armed = PgdConfig {
+            deadline: Some(Instant::now() + Duration::from_secs(60)),
+            cancel: Some(token.clone()),
+            ..PgdConfig::default()
+        };
+        assert!(!armed.past_deadline() && !armed.cancelled());
+        let remote = token.clone();
+        remote.cancel();
+        assert!(token.is_cancelled());
+        assert!(armed.cancelled() && armed.past_deadline());
+        assert!(
+            armed.clone().past_deadline(),
+            "a config clone shares the token"
+        );
+    }
+}
+
+#[cfg(test)]
 mod exact_vjp_policy_tests {
     use super::*;
     use ny_levers::decls::exact_vjp_pgd::EXACT_VJP_PGD_LEVERS;
@@ -467,6 +762,42 @@ mod exact_vjp_policy_tests {
         assert_eq!(policy.disjunctive_batch_width(), 32);
         assert_eq!(policy.effective_wave_steps(1_000), 1_000);
         policy.validate().unwrap();
+    }
+
+    /// #disj-odi: both keys are dark by default, resolve per frozen set, and a
+    /// set that names neither resolves to exactly the historical policy.
+    #[test]
+    fn disj_odi_keys_are_dark_by_default_and_resolve_per_run() {
+        use ny_levers::decls::exact_vjp_pgd::{DISJ_FOCUS_LANES, DISJ_ODI};
+
+        let policy = ExactVjpPgdConfig::default();
+        assert!(!policy.disj_odi);
+        assert_eq!(policy.disj_focus_lanes, 0);
+
+        let armed = ny_levers::LeverSet::freeze_with(&registry(), |name| {
+            if name == DISJ_ODI.name {
+                Some("1".to_string())
+            } else if name == DISJ_FOCUS_LANES.name {
+                Some("32".to_string())
+            } else {
+                None
+            }
+        });
+        let dark = ny_levers::LeverSet::freeze_with(&registry(), |_| None);
+        let armed = ExactVjpPgdConfig::from_levers(&armed).unwrap();
+        let dark = ExactVjpPgdConfig::from_levers(&dark).unwrap();
+        assert!(armed.disj_odi);
+        assert_eq!(armed.disj_focus_lanes, 32);
+        assert_eq!(
+            ExactVjpPgdConfig {
+                disj_odi: false,
+                disj_focus_lanes: 0,
+                ..armed
+            },
+            dark,
+            "arming the two keys must change nothing else in the policy"
+        );
+        assert_eq!(dark, ExactVjpPgdConfig::default());
     }
 
     #[test]
@@ -569,5 +900,66 @@ mod exact_vjp_policy_tests {
         ] {
             assert!(invalid.validate().is_err(), "accepted {invalid:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod setup_regrant_tests {
+    use super::*;
+
+    /// #attack-setup-regrant: a deadline that already passed is re-granted the
+    /// declared slice from `now`, clamped to the cap; a live or unbounded
+    /// deadline is never touched; a cap at or before `now` grants nothing.
+    #[test]
+    fn regrant_fires_only_on_an_expired_deadline_and_respects_the_cap() {
+        let now = Instant::now();
+        let slice = Duration::from_millis(1_800);
+        let far_cap = now + Duration::from_secs(20);
+        let regrant = PgdSetupRegrant {
+            slice,
+            cap: far_cap,
+        };
+        let expired = now
+            .checked_sub(Duration::from_millis(500))
+            .expect("half a second before now is representable");
+        assert_eq!(
+            regrant.regranted_deadline(Some(expired), now),
+            Some(now + slice)
+        );
+        // Exactly at the deadline counts as expired (the drivers' own test).
+        assert_eq!(
+            regrant.regranted_deadline(Some(now), now),
+            Some(now + slice)
+        );
+        // Live and unbounded deadlines keep their historical value.
+        assert_eq!(
+            regrant.regranted_deadline(Some(now + Duration::from_millis(1)), now),
+            None
+        );
+        assert_eq!(regrant.regranted_deadline(None, now), None);
+        // The cap binds.
+        let near_cap = PgdSetupRegrant {
+            slice,
+            cap: now + Duration::from_millis(300),
+        };
+        assert_eq!(
+            near_cap.regranted_deadline(Some(expired), now),
+            Some(now + Duration::from_millis(300))
+        );
+        // A spent cap grants nothing.
+        let spent = PgdSetupRegrant { slice, cap: now };
+        assert_eq!(spent.regranted_deadline(Some(expired), now), None);
+        // A zero slice grants nothing.
+        let empty = PgdSetupRegrant {
+            slice: Duration::ZERO,
+            cap: far_cap,
+        };
+        assert_eq!(empty.regranted_deadline(Some(expired), now), None);
+    }
+
+    /// Dark by default on every constructor.
+    #[test]
+    fn setup_regrant_is_dark_by_default() {
+        assert!(PgdConfig::default().setup_regrant.is_none());
     }
 }

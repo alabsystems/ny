@@ -70,6 +70,8 @@ pub struct LayerProfile {
     #[pyo3(get)]
     pub mean_output_width: f32,
     #[pyo3(get)]
+    pub unstable_count: usize,
+    #[pyo3(get)]
     pub median_output_width: f32,
     #[pyo3(get)]
     pub growth_ratio: f32,
@@ -333,6 +335,7 @@ fn convert_profile_result(result: profile::ProfileResult) -> PyResult<ProfileRes
             input_width: l.input_width,
             output_width: l.output_width,
             mean_output_width: l.mean_output_width,
+            unstable_count: l.unstable_count,
             median_output_width: l.median_output_width,
             growth_ratio: l.growth_ratio,
             cumulative_expansion: l.cumulative_expansion,

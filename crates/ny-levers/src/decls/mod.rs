@@ -18,25 +18,34 @@
 
 pub mod bab_budget;
 pub mod bab_diagnostics;
+pub mod certified_root_cut;
 pub mod cgan_stacked;
 pub mod collection;
 pub mod comprehensive_rows;
 pub mod conv_ibp_blocked;
 pub mod crown_ibp_budget;
+pub mod crown_partial_seed;
 pub mod cuda;
 pub mod dark_probes;
 pub mod diagnostics;
 pub mod exact_vjp_pgd;
+pub mod forward_linear;
 pub mod graph_mip;
+pub mod kernel_inputs;
 pub mod kfsb;
+pub mod lowdim_lane;
 pub mod margin_row;
 pub mod measurement;
 pub mod mo_alpha_heuristic;
+pub mod mo_cover;
 pub mod mo_optimizer;
+pub mod nn4sys_1d_cover;
 pub mod nn4sys_ctx_group;
+pub mod no_cell_enum;
 pub mod onnx;
 pub mod pollable_faer;
 pub mod root_alpha;
+pub mod router;
 pub mod safenlp_cycle;
 pub mod seq_weighted_budget;
 pub mod sound_channel;
@@ -51,24 +60,33 @@ static REGISTRIES: &[&Registry] = &[
     &bab_budget::BAB_BUDGET_LEVERS,
     &bab_diagnostics::BAB_DIAGNOSTIC_LEVERS,
     &cgan_stacked::CGAN_STACKED_LEVERS,
+    &certified_root_cut::ROOT_CERTIFIED_CUT_LEVERS,
     &collection::COLLECTION_LEVERS,
     &comprehensive_rows::COMPREHENSIVE_ROWS_LEVERS,
     &conv_ibp_blocked::CONV_IBP_BLOCKED_LEVERS,
     &crown_ibp_budget::CROWN_IBP_BUDGET_LEVERS,
+    &crown_partial_seed::CROWN_PARTIAL_SEED_LEVERS,
     &cuda::CUDA_LEVERS,
     &dark_probes::DARK_PROBE_LEVERS,
     &diagnostics::DIAGNOSTIC_LEVERS,
     &exact_vjp_pgd::EXACT_VJP_PGD_LEVERS,
+    &forward_linear::FORWARD_LINEAR_LEVERS,
     &graph_mip::GRAPH_MIP_LEVERS,
     &kfsb::KFSB_LEVERS,
+    &kernel_inputs::KERNEL_INPUT_LEVERS,
+    &lowdim_lane::LOWDIM_LANE_LEVERS,
     &margin_row::MARGIN_ROW_LEVERS,
     &measurement::MEASUREMENT_LEVERS,
     &mo_alpha_heuristic::MO_ALPHA_HEURISTIC_LEVERS,
+    &mo_cover::MO_COVER_LEVERS,
     &mo_optimizer::MO_OPTIMIZER_LEVERS,
+    &nn4sys_1d_cover::NN4SYS_1D_COVER_LEVERS,
     &nn4sys_ctx_group::NN4SYS_CTX_GROUP_LEVERS,
+    &no_cell_enum::NO_CELL_ENUM_LEVERS,
     &onnx::ONNX_LEVERS,
     &pollable_faer::POLLABLE_FAER_LEVERS,
     &root_alpha::ROOT_ALPHA_LEVERS,
+    &router::ROUTER_LEVERS,
     &safenlp_cycle::SAFENLP_CYCLE_LEVERS,
     &seq_weighted_budget::SEQ_WEIGHTED_BUDGET_LEVERS,
     &sound_channel::SOUND_CHANNEL_LEVERS,
@@ -92,8 +110,8 @@ mod tests {
         let all = crate::all();
         assert_eq!(
             all.len(),
-            200,
-            "Phase 0 declared two levers; batch B1 prep adds five telemetry declarations; \
+            304,
+            "Three existing kernel/calibration inputs are now governed, with unchanged defaults and raw compatibility predicates. The owner-directed same-source root cut adds one governed default-on declaration. Phase 0 declared two levers; batch B1 prep adds five telemetry declarations; \
              true-gradient GPU replay adds one governed legacy-armed selector; collection \
              policy prep adds three centrally parsed compatibility overrides; terminal-Softmax \
              work adds one governed transform gate and two test-only corpus selectors; the \
@@ -243,8 +261,273 @@ mod tests {
              #margin-row-domain-alpha SCHEDULE adds its three dark High-risk knobs \
              (depth floor, depth stride, closure-gap window) deciding WHICH domains pay \
              for the measured-NULL per-domain ascent, carried resolved on the frozen \
-             DomainAlphaRuntimePolicy"
+             DomainAlphaRuntimePolicy; and the #domain-stack cross-domain \
+             scoring lane adds one dark High-risk SCHEDULE gate \
+             (NY_MARGIN_ROW_DOMAIN_STACK), delivered by margin_row.domain_stack \
+             -- promoted out of a raw env read because run_instance.sh exports \
+             no NY_*, so the mechanism could not be armed on a scored binary at \
+             all and its wall-clock effect was unmeasurable through the route \
+             that competes; it scores every domain in a frontier batch in ONE \
+             wide certified pass instead of one pass per domain, and its \
+             reductions are column-local, so a stacked score is bit-identical to \
+             the independent one and the gate selects a SCHEDULE rather than a \
+             relaxation; and #interm-alpha adds one dark High-risk \
+             per-START-NODE prefix-alpha candidate dose inside the backward-intermediate \
+             phase (NY_MARGIN_ROW_INTERM_ALPHA, delivered by margin_row.interm_alpha), \
+             every candidate box intersected shrink-only into the published box, so the \
+             dose prices wall against the BI budget rather than admitting a looser bound \
+             ; and STATEFUL Clip-and-Verify (#clip-stateful) adds one \
+             dark High-risk gate (NY_MARGIN_ROW_CLIP_STATEFUL) that makes the margin-row \
+             clip's intermediate tightening ACCUMULATE per domain and be inherited parent \
+             -> child -- the alpha-beta-CROWN 2024->2025 cifar100 diff, which added \
+             clip_interm_domain and had to REMOVE interm_transfer:False in the same two \
+             lines, because clipping makes per-domain intermediate bounds mutate and a \
+             config that refuses to transfer them is only valid while they never change; and \
+             #branch-parent-lift adds one dark High-risk Debug gate (NY_MARGIN_ROW_PARENT_LIFT) \
+             that folds the branching scores the expansion ALREADY paid for into the child \
+             bound floor: `score_candidates` certifies an (l_i, r_i) pair for every \
+             shortlisted candidate and the expansion discards ~31 of them, though each \
+             still certifies something about the PARENT; `false` keeps the historical discard; \
+             and the #flat-ladder-depth selective Hadamard refinement cap adds one governed \
+             default-zero SCHEDULE selector (NY_FLAT_SURROGATE_MAX_BLOCKS, delivered by \
+             attack.flat_surrogate_max_blocks) — 0 keeps the split-all ladder byte-identical, \
+             cap>=2 freezes low-effect blocks so deeper levels stay affordable inside a fixed \
+             official budget; and post-BaB restart diversity (#postbab-restart-diversity) adds one \
+             governed default-zero High-risk restart count (NY_POSTBAB_RESTARTS, delivered by \
+             attack.post_bab_restarts) — the 2026-08-31 soundnessbench window probe measured the \
+             stage-0 attack stack CONVERGENT, bit-identical fixed points at 11 s and 49.6 s windows, \
+             so the open axis is basin DIVERSITY: re-enter the converged alternation from \
+             deterministically row-seeded uniform/corner/orthogonal-jitter basins, every candidate \
+             still passing the unchanged trusted-ORT gate; and the #flat-surrogate-transfer \
+             surrogate->real transfer stage adds one governed default-false Debug gate \
+             (NY_FLAT_SURROGATE_TRANSFER, delivered by attack.flat_surrogate_transfer) — false \
+             keeps the surrogate search byte-identical, true walks the real output's quantizer \
+             staircase from the surrogate optimum through the unchanged acceptance stack; \
+             and the cct engine-wiring pair (#patches-engine-refusal-containment / \
+             #fast-f32-prewarm-all-hosts, reports/measured-2026/cct_bound_gap_2026-08-31) adds \
+             two governed default-false High-risk gates: NY_PATCHES_ENGINE_REFUSAL_CONTAINMENT \
+             (delivered by bab.patches_engine_refusal_containment) treats a POLICY-refusing GEMM \
+             engine at the Conv2d Patches compose seam as an absent accelerator so the walk \
+             keeps its byte-identical CPU scatter in patches, and NY_FAST_F32_PREWARM \
+             (delivered by bab.fast_f32_prewarm) materializes the registered fast-f32 GEMM \
+             factory on the vnncomp route for every build so finite-deadline consumers stop \
+             failing closed to the quarantined proof adapter, plus one governed declaration of the \
+             seam's pre-existing legacy-truthy kill switch NY_PATCHES_GPU, whose live reads \
+             remain counted reader-frontier debt; and #metaroom-mip-governor adds TWO \
+             governed default-dark SCHEDULE levers for the two MIP lanes measured spending \
+             110 s of a 210 s metaroom budget to decide nothing: \
+             NY_MIP_LEAF_UNDECIDED_STREAK_CAP (delivered by \
+             bab.mip.leaf_undecided_streak_cap, 0 = today's no-cap behaviour) stops the \
+             Graph-MIP leaf oracle after N consecutive undecided consults, and \
+             NY_MIP_ESCALATE_SKIP_CERTIFIED (delivered by \
+             bab.mip.escalation_skips_certified_clauses) seeds the disjunctive escalation's \
+             pending set from the UNCERTIFIED clauses only -- both MoatRisk::Low because \
+             declining a leaf is what its Undecided already does and a skipped clause \
+             carries the same certified infeasibility bound ny publishes unsat on; and \
+             #nn4sys-1d-cover promotes the \
+             exact one-axis complete-cover prepass as THREE coupled declarations rather \
+             than one -- NY_NN4SYS_1D_COMPLETE_COVER (delivered by bab.nn4sys_1d_cover) \
+             is the master, NY_NN4SYS_1D_COVER_DEPTH (bab.nn4sys_1d_cover_depth) is not \
+             optional beside it because the pass is ALL-OR-NOTHING and the master alone \
+             would deliver the reader's DEFAULT_DEPTH of 8 into it, and \
+             NY_NN4SYS_1D_COVER_SLICE (bab.nn4sys_1d_cover_slice) is a closed-interval \
+             FRACTION of the caller's remaining deadline rather than the legacy \
+             millisecond constant, because nn4sys budgets span 20s to 800s in one \
+             benchmark and an unfenced prepass can consume the whole screen slice and \
+             return nothing; and \
+             #clip-head adds one dark High-risk gate \
+             (NY_MARGIN_ROW_CLIP_HEAD, delivered by margin_row.clip_head) that builds \
+             Clip-and-Verify halfspaces from a domain\'s HEAD sign fixes: halfspaces_for_splits \
+             reads LayerGates::clip_rows and the root gates carry TRUNK relus only, so a head fix \
+             has always clamped ONE interval and tightened nothing else, while on the traced \
+             alpha-beta-CROWN rows the head layer is where 10 of 12 splits land and where \
+             clip_interm_domain earns most of its per-domain improvement; it needs no clip_rows \
+             retention because its certified lines are columns of the y-pack the eval already \
+             holds, which is what lets a category that retains nothing arm it; and the \
+             crossing-only sweep allocation adds one dark High-risk selector that \
+             spends the chunk row budget only where a crossing row remains; and \
+             #dense-sparse-seed adds one High-risk closed-unit-interval threshold \
+             (NY_CROWN_PARTIAL_DENSE_MIN_STABLE, delivered by \
+             bab.crown_partial_dense_min_stable) whose 0.9 default is the historical \
+             literal of the sequential CROWN-IBP partial walk's Dense unstable-rows \
+             seed, so absence is byte-identical, and whose armed value applies only to \
+             ReLU-successor targets; and #lsnc-attack-twin adds one dark High-risk post-BaB \
+             attack gate (NY_ATTACK_POINT_FOLDED_TWIN, delivered by attack.point_folded_twin) \
+             that runs exact-gradient PGD on an ONNX-Runtime point-folded ATTACK twin when \
+             the exact loader leaves the real net outside the point-VJP fragment, every \
+             candidate still passing the unchanged trusted-ORT gate; and #lsnc-lane adds \
+             one dark High-risk loader gate (delivered by \
+             bab.branching.input_split.lowdim_interval_twin) that builds the lowdim \
+             lane's PRIVATE interval twin of a model whose exact load left OpaqueSkip \
+             nodes, the global interval carrier staying EnvOnly and dark; and #lsnc-lane \
+             stage 2 adds one dark High-risk bound gate (delivered by \
+             bab.branching.input_split.lowdim_joint_quadratic) that bounds the lowdim \
+             lane's ReduceSum(Mul) sites by the joint quadratic bound; and #lsnc-lane \
+             stage 3 adds three dark High-risk search gates (delivered by \
+             bab.branching.input_split.lowdim_split / lowdim_clip / lowdim_parallel): the \
+             lane's split rule, its relaxed clip with each box's own planes, and \
+             deciding its domains inside the rayon tasks; and #vit-margin-alpha \
+             promotes the env-only NY_ROOT_ALPHA_MARGIN_GRADIENT child gate to a declared \
+             typed key (bab.alpha_crown.root_alpha_margin_gradient) and adds \
+             NY_ROOT_ALPHA_MATMUL (bab.alpha_crown.matmul_alpha), both dark High-risk \
+             selectors of the certified C-row margin ascent; and #mr-errlane \
+             (margin-row throughput plan B3) adds one dark High-risk Debug \
+             ENUM selector (NY_MARGIN_ROW_ERR_ENVELOPE, delivered by \
+             margin_row.err_envelope: off | envelope | per_channel | audit) choosing how \
+             the backward engine carries its CERTIFIED coefficient-error lane -- per \
+             column (today, byte-identical), or as one envelope per row or per channel \
+             that dominates it by monotone induction, which only loosens the certified \
+             penalty; `audit` publishes `off` and shadows both envelopes to measure \
+             their looseness; and #graph-free-candidates (#smart-turn-x86-harvest) adds \
+             one dark Low-risk Debug INSTRUMENT (NY_GRAPH_FREE_CANDIDATE_SIDEFILE, \
+             delivered by attack.graph_free_candidate_sidefile) that writes every \
+             counterexample candidate the graph-free lane offers to its unchanged \
+             acceptance gates, with the gate that decided it, to a per-row JSONL for \
+             offline replay on a checker-parity x86 configuration -- report-only, \
+             nothing it writes is read back; and \
+             #mr-gpu-eval adds one dark High-risk Debug gate \
+             (NY_MARGIN_ROW_GPU_CONV, delivered by margin_row.gpu_conv) that runs the \
+             certified pass's conv backward products as full-contraction f64 GEMMs on the \
+             process-global sound f64 engine, certified by the lane's unchanged \
+             order-independent charges; and #frozen-dual-state adds one High-risk \
+             Debug gate (NY_MARGIN_ROW_FROZEN_DUAL_BAB, delivered by \
+             margin_row.frozen_dual_bab) arming V1 stage A, the certified frozen \
+             alpha-zonotope query state of the frozen dual-ascent BaB, which stage A only \
+             builds, reports and drops; and #frozen-dual-bab (V1 stage B) makes that gate arm \
+             the certified search tier over the state and adds its two dark High-risk Debug \
+             knobs (NY_MARGIN_ROW_FROZEN_DUAL_BAB_NODE_CAP and \
+             NY_MARGIN_ROW_FROZEN_DUAL_BAB_SECS, delivered by \
+             margin_row.frozen_dual_bab_node_cap / margin_row.frozen_dual_bab_secs); and #lowdim-bundle adds four dark High-risk \
+             #lowdim-prover keys (delivered by bab.branching.input_split.lowdim_varying_dims \
+             / lowdim_alpha_iters / lowdim_leaf_attack_every / lowdim_shared_worklist): \
+             varying-dims admission with rigorous Sigmoid planes, per-leaf boundary alpha \
+             on the objective pass, an attack-only worst-leaf PGD whose hits the trusted \
+             confirmers decide, and one shared worklist across the fold's families; and \
+             #root-certify-once adds one dark High-risk Debug gate and three dark \
+             High-risk Debug knobs (NY_MARGIN_ROW_ROOT_CERTIFY_ONCE, _ITERS, _REFRESH, \
+             _SECS, delivered by margin_row.root_certify_once / _iters / _refresh / \
+             _secs): the Phase-0.5 root alpha ascent run UNTRUSTED on a Parity scratch \
+             root, then ONE certified evaluation kept only if it strictly beats the \
+             certified incumbent. \
+             and #bi-gpu adds one dark High-risk Debug gate (NY_MARGIN_ROW_BI_GPU, \
+             delivered by margin_row.bi_gpu) that runs the backward-interm and \
+             joint-refresh prefix pass pairs on #mr-gpu-eval's certified sound f64 conv \
+             route through a scoped, per-pair-accounted, RSS-admitted route; \
+             and #bi-patch adds one dark High-risk Debug gate and two dark High-risk \
+             Debug knobs (NY_MARGIN_ROW_BI_PATCH, _RATIO, _MB, delivered by \
+             margin_row.bi_patch / _ratio / _mb) that run the backward-interm and \
+             joint-refresh prefix pass pairs as per-column receptive-field walks. \
+             And #bbe-joint-root (ENGINE_PROGRAM M5a) adds one dark High-risk Debug \
+             ENUM selector (NY_MARGIN_ROW_ROOT_SEARCH, delivered by \
+             margin_row.root_search: ascent | joint_f32) choosing which UNTRUSTED search \
+             proposes the #root-certify-once slopes -- today's ascent (bit-identical) or \
+             the injected ny-bbe joint-alpha root search -- whose slopes still reach the \
+             certified root only through the existing ingest gate. \
+             And #breakpoint-dual adds one High-risk Debug knob \
+             (NY_MARGIN_ROW_FROZEN_DUAL_REFINE_STEPS, delivered by \
+             margin_row.frozen_dual_refine_steps, default 0) whose untrusted breakpoint \
+             proposals are retained only after strict improvement in the unchanged \
+             certified frozen-dual node evaluator; its tier cover ledger is unchanged. \
+             The parent and four refinement steps are enabled by the user-directed \
+             CIFAR100/TinyImageNet category presets in bounded automatic mode, while \
+             generic defaults remain false/zero and competition gains remain unmeasured. \
+             And #fd-shared-state (ENGINE_PROGRAM M3) adds one dark High-risk Debug ENUM \
+             selector (NY_MARGIN_ROW_FROZEN_DUAL_BAB_STATE, delivered by \
+             margin_row.frozen_dual_bab_state: per_class | shared) choosing whether the \
+             frozen-dual tier builds each class's state inside its share (bit-identical) or \
+             ONE shared trunk of rows before the shares plus a one-column tail per class. \
+             And #root-box-source (ENGINE_PROGRAM M5b) adds one dark High-risk Debug \
+             ENUM selector (NY_MARGIN_ROW_ROOT_BOX_SOURCE, delivered by \
+             margin_row.root_box_source: tableau | patch_backward) choosing how every \
+             root walk builds its trunk boxes -- the forward tableau (bit-identical) or \
+             a certified IBP reference plus a certified patch-backward pass over the \
+             reference-unstable neurons, intersected shrink-only. \
+             And #wide-fd-search (ENGINE_PROGRAM M4) adds one dark High-risk Debug ENUM \
+             selector (NY_MARGIN_ROW_FROZEN_DUAL_BAB_SEARCH, delivered by \
+             margin_row.frozen_dual_bab_search: f64 | cpu_f32 | cuda | auto) choosing which \
+             search scores the frozen-dual tier's nodes -- its own f64 search (bit-identical) \
+             or an injected UNTRUSTED backend whose proposals the tier certifies in f64 and \
+             splits otherwise. \
+             And #wave-beta-bab (ENGINE_PROGRAM M6) adds one dark High-risk Debug ENUM \
+             selector (NY_MARGIN_ROW_TREE_MODE, delivered by margin_row.tree_mode: legacy | \
+             wave | wave_cuda) choosing the margin-row outer frame's tree engine -- today's \
+             best-first tree (bit-identical) or waves of injected UNTRUSTED beta-CROWN search \
+             (on the CPU, or on the device with the CPU as fall-through) whose claims a \
+             private pool certifies with the lane's own evaluator -- and two dark \
+             High-risk Debug knobs (NY_MARGIN_ROW_TREE_WAVE_BATCH, \
+             NY_MARGIN_ROW_TREE_WAVE_CERT_THREADS, delivered by margin_row.tree_wave_batch \
+             / margin_row.tree_wave_cert_threads); and #router-r1 adds the two \
+             SafeToSearch shadow-mode selectors NY_ROUTER_MODE / NY_OPTIMIZER_MODE \
+             (router.mode / optimizer.mode). \
+             And #m8-input-split-batch (ENGINE_PROGRAM M8a) adds two dark High-risk Debug \
+             ENUM selectors of the lowdim lane (delivered by \
+             bab.branching.input_split.lowdim_batch_engine and \
+             bab.branching.input_split.engine: legacy | bbe) -- the wave bounder \
+             (the lane's own f64 forms, bit-identical, or an injected UNTRUSTED \
+             forward-linear search whose claims the lane certifies) and the multi-clause \
+             scheduler (one tree per clause, or one disjunction tree per shared box and \
+             the fold's shared worklist); and the #vit-v3-bankable multi-objective \
+             cover certification adds one dark High-risk enum (NY_MO_COVER_CERTIFY: \
+             off | ledger | replay), downgrade-only in both armed modes. \
+             And #router-r2 (ROUTER_PROGRAM R2) adds the seven acting-rule ablation \
+             switches NY_ROUTER_RULE_ADMISSION / _CONTRACTS / _CAP_AUTHORITY / _TERMINAL / \
+             _HAND_ON / _PUBLISH_GRACE / _DERIVED_CAPS (router.rules.*: BoolOverride, default \
+             true = participates only when router.mode is on; UNSAFE_AXES, never searched). \
+             And #router-r3 (ROUTER_PROGRAM R3) adds the four O-STOP optimizer-rule ablation \
+             switches for rule.governor, rule.ia_yield, rule.attack_defer and \
+             rule.root_admission (optimizer.rules.*: BoolOverride, default true = participates \
+             only when optimizer.mode is on; UNSAFE_AXES, never searched). \
+             And #router-r4 (ROUTER_PROGRAM R4) adds acting set 3's two ablation switches \
+             NY_ROUTER_RULE_LEASE (CR-L) and NY_ROUTER_RULE_FAR_HAND_ON (CR-F) (router.rules.*: \
+             BoolOverride, default true = participates only when router.mode is on; UNSAFE_AXES, \
+             never searched). \
+             And #router-r5 (ROUTER_PROGRAM R5) adds acting set 4's two ablation switches \
+             NY_ROUTER_RULE_ROUTE (CR-RS) and NY_ROUTER_RULE_GAP_CONTRACT (CR-G) \
+             (router.rules.*: BoolOverride, default true = participates only when router.mode \
+             is on; UNSAFE_AXES, never searched). \
+             And #router-r6 (ROUTER_PROGRAM R6) adds the four O-TRIAL optimizer-rule \
+             ablation switches NY_OPTIMIZER_RULE_TRIAL_WIDTH / _TRIAL_LR_BACKOFF / \
+             _TRIAL_SPLIT_RESTART / _TRIAL_ATTACK_HALVING (optimizer.rules.trial_*: \
+             BoolOverride, default true = participates only when optimizer.mode is on; \
+             UNSAFE_AXES, never searched). \
+             And #router-r7 (ROUTER_PROGRAM R7) adds NY_OPTIMIZER_PRIORS (optimizer.priors: \
+             Bool, default false = the router reads no offline prior; UNSAFE_AXES, never \
+             searched). \
+             And #head-groups (d0f718885) adds one High-risk Bool \
+             (NY_MARGIN_ROW_HEAD_GROUPS, delivered by margin_row.head_groups) arming one \
+             bounded complete head-phase cover pass on the outer margin-row root. \
+             The user-directed directional-cut route adds one High-risk Bool \
+             (NY_MARGIN_ROW_HEAD_DIRECTIONAL_CUTS, margin_row.head_directional_cuts); \
+             both this stage and its parent groups are now default true. \
+             And #head-phase-cover adds one dark High-risk Debug count \
+             (NY_MARGIN_ROW_HEAD_PHASE_COVER, delivered by margin_row.head_phase_cover) \
+             for a complete Source phase cover of at most seven selected heads. \
+             And #fl-alpha-composition declares the four forward-linear reference \
+             switches its tests scrub (forward_linear, +4): the shared \
+             NY_NO_FORWARD_LINEAR_REF and NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF kill \
+             switches (both tracked LEGACY-ARMED-UNQUALIFIED), the dark \
+             NY_FORWARD_LINEAR_SEQ_CONV_REF research gate, and NY_FORWARD_LINEAR_F32, the \
+             legacy env route of the model.forward_linear_f32_seam key -- all High-risk \
+             Debug exact-\"1\" Booleans whose raw readers stay counted reader debt. \
+             And the environment-reader cleanup declares three test-only corpus/request \
+             paths and the legacy classwise research schedule without promoting it. \
+             The count is re-derived from the declarations at each merge."
         );
+        assert!(all
+            .get(crate::decls::margin_row::MARGIN_ROW_HEAD_GROUPS.name)
+            .is_some());
+        assert!(all
+            .get(crate::decls::margin_row::MARGIN_ROW_HEAD_DIRECTIONAL_CUTS.name)
+            .is_some());
+        assert!(all
+            .get(crate::decls::margin_row::MARGIN_ROW_HEAD_PHASE_COVER.name)
+            .is_some());
+        assert!(all
+            .get(crate::decls::dark_probes::GRAPH_FREE_CANDIDATE_SIDEFILE.name)
+            .is_some());
+        assert!(all.get("NY_SWEEP_CROSSING_TARGETS_ONLY").is_some());
+        assert!(all.get("NY_MIP_LEAF_UNDECIDED_STREAK_CAP").is_some());
+        assert!(all.get("NY_MIP_ESCALATE_SKIP_CERTIFIED").is_some());
         assert!(all.get("NY_MO_ALPHA_HEURISTIC").is_some());
         assert!(all.get("NY_MO_BETA_SPSA").is_some());
         assert!(all.get("NY_MO_ALPHA_STEP").is_some());
@@ -254,6 +537,11 @@ mod tests {
         assert!(all.get("NY_BRANCH_KFSB_CHILDSIM").is_some());
         assert!(all.get("NY_MARGIN_ROW_EPOCH_PARENT_TOPK").is_some());
         assert!(all.get("NY_JOINT_BILINEAR_QUAD").is_some());
+        assert!(all.get("NY_MARGIN_ROW_CLIP_STATEFUL").is_some());
+        assert!(all.get("NY_MARGIN_ROW_PARENT_LIFT").is_some());
+        assert!(all
+            .get(crate::decls::margin_row::MARGIN_ROW_ERR_ENVELOPE.name)
+            .is_some());
         assert!(all.get("NY_CONST_MATMUL_INTERVAL").is_some());
         assert!(all.get("NY_SAFENLP_MIP_CYCLE").is_some());
         assert!(all.get("NY_NN4SYS_CTX_GROUP").is_some());
@@ -346,6 +634,12 @@ mod tests {
         assert!(all.get("NY_NO_CHUNK_WAVE_PAR").is_some());
         assert!(all.get("NY_PATCHES_DEADLINE_FLAT_BIAS").is_some());
         assert!(all.get("NY_CROWN_HONEST_PROVENANCE").is_some());
+        assert!(all
+            .get(crate::decls::forward_linear::NO_FORWARD_LINEAR_REF.name)
+            .is_some());
+        assert!(all
+            .get(crate::decls::forward_linear::FORWARD_LINEAR_F32.name)
+            .is_some());
     }
 
     #[test]
@@ -364,8 +658,27 @@ mod tests {
         }
     }
 
+    const OWNER_DIRECTED_DEFAULTS: &[&str] = &[
+        "NY_MARGIN_ROW_HEAD_DIRECTIONAL_CUTS",
+        "NY_MARGIN_ROW_HEAD_GROUPS",
+        "NY_ROOT_CERTIFIED_CUT",
+    ];
+
+    fn admissible_owner_direction(name: &str, provenance: Provenance) -> bool {
+        let Provenance::OwnerDirected {
+            directive,
+            limitations,
+        } = provenance
+        else {
+            return false;
+        };
+        OWNER_DIRECTED_DEFAULTS.contains(&name)
+            && !directive.trim().is_empty()
+            && !limitations.trim().is_empty()
+    }
+
     #[test]
-    fn every_default_on_lever_has_admissible_evidence() {
+    fn every_default_on_lever_has_admissible_evidence_or_scoped_owner_direction() {
         for decl in crate::all().all() {
             if decl.bucket == Bucket::DefaultOn {
                 assert!(
@@ -374,10 +687,52 @@ mod tests {
                         Provenance::ValueNeutral { .. }
                             | Provenance::Measured { .. }
                             | Provenance::Guard { .. }
-                    ),
-                    "{}: a shipped arm needs admissible evidence MERGE RECONCILIATION 2026-08-24: this total is the UNION of two sessions that promoted levers concurrently, and it is the third time this assertion has caught a merge — auto-merge keeps one side's integer while both sides' declarations land, so the number must be re-derived from the registry rather than taken from either branch. 125 -> 134.",
+                    ) || admissible_owner_direction(decl.name, decl.provenance),
+                    "{}: a shipped arm needs admissible evidence or exact scoped user direction",
                     decl.name
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn owner_directed_defaults_have_exact_scope_and_honest_receipt_tags() {
+        let all = crate::all();
+        let names: Vec<_> = all
+            .all()
+            .iter()
+            .filter(|decl| matches!(decl.provenance, Provenance::OwnerDirected { .. }))
+            .map(|decl| decl.name)
+            .collect();
+        assert_eq!(names, OWNER_DIRECTED_DEFAULTS);
+        let levers = crate::LeverSet::freeze_with(all, |_| None);
+        let receipt = levers.receipt();
+        for &name in OWNER_DIRECTED_DEFAULTS {
+            let decl = all.get(name).unwrap();
+            assert!(admissible_owner_direction(name, decl.provenance));
+            assert_eq!(decl.bucket, Bucket::DefaultOn);
+            assert_eq!(decl.default, DefaultSpec::Bool(true));
+            assert_eq!(decl.moat, MoatRisk::High);
+            let row = receipt["levers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["name"].as_str() == Some(name))
+                .unwrap();
+            assert_eq!(row["provenance"], "owner_directed");
+            assert_eq!(row["value"], true);
+            assert!(!admissible_owner_direction(
+                "NY_UNAUTHORIZED_DEFAULT",
+                decl.provenance
+            ));
+            for (directive, limitations) in [("", "limits"), ("  ", "limits"), ("request", "")] {
+                assert!(!admissible_owner_direction(
+                    name,
+                    Provenance::OwnerDirected {
+                        directive,
+                        limitations
+                    }
+                ));
             }
         }
     }
@@ -396,6 +751,8 @@ mod tests {
             "NY_BAB_RESNET_WIDE",
             "NY_CPU_COMPUTE_ENGINE",
             "NY_GRAPH_MIP_LEAF_SAT",
+            "NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF",
+            "NY_NO_FORWARD_LINEAR_REF",
             "NY_NO_WALK_RECORD_ADMISSION",
             "NY_TRUE_GRAD_GPU_REPLAY",
         ];

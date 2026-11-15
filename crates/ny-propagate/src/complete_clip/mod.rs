@@ -18,7 +18,6 @@
 //!
 //! ## References
 //!
-//! - Design: `designs/2026-01-28-clip-and-verify-algorithms.md` Section 3
 //! - Baseline: `alpha-beta-CROWN/auto_LiRPA/concretize_func.py:constraints_solving`
 //! - Paper: Wei et al., "Clip and Verify: Fast and Accurate Neural Network
 //!   Verification via Clipping," arXiv:2512.11087
@@ -386,7 +385,6 @@ fn shape_err(e: ShapeError) -> NyError {
 ///
 /// # References
 ///
-/// - `designs/2026-01-28-clip-and-verify-algorithms.md:358`
 /// - `alpha-beta-CROWN/auto_LiRPA/concretize_func.py:constraints_solving`
 // Justification: Complete CLIP needs input bounds (x_l, x_u), objective vector,
 // constraint matrix (A, b), sign, rearrange flag, and iteration count — all independent.

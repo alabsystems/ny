@@ -690,7 +690,7 @@ fn forward_linear_cold_build_admission_preserves_cached_hits_body() {
 ///
 /// Before the fix, the root-candidate block intercepted the request, returned
 /// early with `None` linear, and silently defeated every linear-extraction
-/// caller — measured on cifar100: the PGD exact-gradient path (#4274) paid a
+/// caller — measured on cifar100: the PGD exact-gradient path paid a
 /// full certified forward-linear walk at a concrete point per step only to
 /// get `None` back. The linear-consuming route must take the CPU backward
 /// loop, the only producer of the linear map.
@@ -815,8 +815,9 @@ fn forward_linear_fingerprint_distinguishes_f32_seam() {
 /// positive rate and the per-process cache serves the second call.
 ///
 /// The env override is removed (serialized) so this deterministically
-/// exercises the probe/fallback path; either source is legitimate here (a
-/// heavily loaded debug host may hit the probe's 5 s rep deadline and fall
+/// exercises the probe/fallback path; either source is legitimate here (an
+/// unoptimized unit-test build takes the fallback without probing, and a
+/// heavily loaded optimized one may hit the probe's 5 s rep deadline and fall
 /// back — the fallback constant is also positive and cached).
 #[ntest::timeout(120000)]
 #[test]
@@ -855,6 +856,56 @@ fn forward_linear_rate_calibration_is_positive_and_cached() {
             "cached calibration must not re-run the probe"
         );
     });
+}
+
+/// #fl-calib-debug-tests: which builds measure, pinned by counting probe reps
+/// rather than by a clock. An unoptimized build of this crate's unit tests
+/// takes the shipped constant and starts no rep, in this test or in any other
+/// (the counter is process-wide), so a default-lane verdict never depends on a
+/// 5 s probe another test did or did not pay first. An optimized build starts
+/// at least one rep and reports a measurement or the fallback.
+#[ntest::timeout(120000)]
+#[test]
+fn calibration_probe_runs_in_optimized_builds_only() {
+    use std::sync::atomic::Ordering;
+    let optimized = !cfg!(debug_assertions);
+    assert_eq!(
+        forward_linear_probe_runs_in_this_build(),
+        optimized,
+        "unit tests probe exactly when the build is optimized"
+    );
+    // Called directly, not through the per-process cache: no env, no cached
+    // state.
+    if !optimized {
+        for seam_f32 in [false, true] {
+            let calibration = calibrate_forward_linear_rate(None, seam_f32);
+            assert_eq!(calibration.source, "fallback");
+            assert_eq!(
+                calibration.macs_per_sec,
+                FORWARD_LINEAR_F64_MACS_PER_SEC_FALLBACK
+            );
+            assert_eq!(calibration.seam_f32, seam_f32);
+            assert_eq!(calibration.probe_macs, 0);
+            assert_eq!(calibration.probe_secs, 0.0);
+        }
+        assert_eq!(
+            FORWARD_LINEAR_PROBE_REPS_STARTED.load(Ordering::Relaxed),
+            0,
+            "an unoptimized unit-test build must not start a probe rep"
+        );
+    } else {
+        let calibration = calibrate_forward_linear_rate(None, false);
+        assert!(
+            FORWARD_LINEAR_PROBE_REPS_STARTED.load(Ordering::Relaxed) >= 1,
+            "an optimized build must run the probe"
+        );
+        assert!(
+            matches!(calibration.source, "probe" | "fallback"),
+            "got {}",
+            calibration.source
+        );
+        assert!(calibration.macs_per_sec > 0);
+    }
 }
 
 /// #forward-linear-cost-gate: the manual escape hatch keeps absolute
@@ -969,9 +1020,27 @@ fn forward_linear_refusal_message_carries_measured_rate() {
 /// ADVERSARIAL VERIFY (#forward-linear-cost-gate): over-admission damage
 /// bound. Force the gate to lie fast (absurdly optimistic env rate), admit a
 /// build that is hundreds of GMACs (hours in a debug binary), and confirm the
-/// MID-BUILD deadline abort fires: typed `DeadlineExceeded`, wall time equal
-/// to the deadline plus at most poll-granularity overshoot, and the admission
+/// MID-BUILD deadline abort fires: typed `DeadlineExceeded` from one of the
+/// build's own deadline polls, at or after the deadline, and the admission
 /// record honestly says the gate admitted on the "env" rate.
+///
+/// How far past the deadline the abort lands is a wall-clock measurement, not
+/// a correctness property (TEST_CONFORMANCE.md "Measurements"): it is the
+/// length of the unpolled stretch the deadline falls in, stretched by host
+/// load. This test prints it; the evidence example
+/// `forward_linear_over_admission_abort` bounds it. Measured 2026-10-04
+/// (debug): 9.0 s at load ~30, where the deadline fell in conv0's non-finite
+/// row scan over two 32768 x 3072 coefficient matrices
+/// (`detect_and_fix_nonfinite_rows`, which polls nothing), and 31.7 s at load
+/// ~60, which failed the 30 s bound this test used to assert.
+///
+/// What the default lane holds for this path without a clock is its polled
+/// half: `image::deadline_tests` pins that a GEMM tile between two polls is
+/// capped in MACs (`finite_deadline_gemm_tile_caps_rows_for_long_contractions`),
+/// that an expired deadline refuses before the engine is launched and that a
+/// result arriving after the deadline is never published. The stretch measured
+/// above has no such oracle because it has no poll; docs/DECISIONS.md D24 says
+/// what switching it to the pollable scan needs.
 #[ntest::timeout(240000)]
 #[test]
 fn adv_over_admission_is_bounded_by_mid_build_deadline_abort() {
@@ -1036,6 +1105,11 @@ fn adv_over_admission_is_bounded_by_mid_build_deadline_abort() {
             let NyError::DeadlineExceeded(message) = &error else {
                 panic!("mid-build abort must be DeadlineExceeded, got {error:?}");
             };
+            // ...raised by one of the build's own deadline polls.
+            assert!(
+                message.contains("forward-linear") && message.contains("deadline"),
+                "the abort must come from a forward-linear build poll: {message}"
+            );
             // It must be the MID-BUILD abort, not the up-front cost refusal.
             assert!(
                 !message.contains("cold build needs"),
@@ -1051,24 +1125,21 @@ fn adv_over_admission_is_bounded_by_mid_build_deadline_abort() {
             }
 
             // Damage bound: the build ran essentially to the deadline (it was
-            // admitted, and the work was unbounded)...
+            // admitted, and the work was unbounded) and then stopped instead of
+            // running its remaining hours. Load can only lengthen the wall, so
+            // this lower bound does not depend on the host.
             assert!(
                 wall >= std::time::Duration::from_secs(DEADLINE_SECS - 3),
                 "build should have run to the deadline; aborted after {wall:?} ({message})"
             );
-            // ...and the overshoot past the deadline is bounded by the poll
-            // granularity (per exec-node + per 2^26-MAC GEMM tile), not by the
-            // remaining hours of admitted work.
+            // The overshoot past the deadline is printed, not asserted: see the
+            // doc comment and the `forward_linear_over_admission_abort` example.
             let overshoot = wall.saturating_sub(std::time::Duration::from_secs(DEADLINE_SECS));
             eprintln!(
                 "MEASURED over-admission abort: wall={:.3}s overshoot={:.3}s message={}",
                 wall.as_secs_f64(),
                 overshoot.as_secs_f64(),
                 message
-            );
-            assert!(
-                overshoot < std::time::Duration::from_secs(30),
-                "mid-build abort overshoot {overshoot:?} exceeds any claimed poll granularity"
             );
         },
     );
@@ -1127,4 +1198,231 @@ fn adv_deadline_free_build_never_consults_the_gate() {
             );
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// #fl-f32-seam-key: the preset override for the f32 value-GEMM seam.
+//
+// These run SERIALLY-SENSITIVE process-global state, so each restores the
+// unset sentinel before returning. They assert the OVERRIDE PRECEDENCE
+// contract only — never a bound value, because the seam's numeric effect is
+// covered by the existing f32 parity oracles in `tests_image.rs`.
+// ---------------------------------------------------------------------------
+
+/// Restores the unset seam sentinel when dropped, including on a failed
+/// assertion, so a red test cannot leak an installed override into siblings.
+struct SeamOverrideReset;
+
+impl Drop for SeamOverrideReset {
+    fn drop(&mut self) {
+        FORWARD_LINEAR_F32_SEAM_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// With no override installed, the seam's environment arm IS its declaration
+/// (`ny_levers::decls::forward_linear::FORWARD_LINEAR_F32`): on every input it
+/// answers what `ny_levers::read_with` resolves, which is the historical
+/// exact-`"1"` predicate; and an installed override still wins over the
+/// environment in both directions. Names the variable through its declaration,
+/// so it adds no literal or reader site to the ny-levers source frontier.
+/// Runs under the workspace env WRITE lock, which also keeps the transient
+/// override away from every env-scoped forward-linear fixture.
+#[test]
+fn f32_seam_env_fallback_agrees_with_its_declaration() {
+    let decl = &ny_levers::decls::forward_linear::FORWARD_LINEAR_F32;
+    crate::tests::with_env_edits(|env| {
+        let _reset = SeamOverrideReset;
+        for raw in [
+            None,
+            Some("0"),
+            Some("1"),
+            Some("true"),
+            Some(" 1"),
+            Some(""),
+        ] {
+            match raw {
+                Some(value) => env.set(decl.name, value),
+                None => env.remove(decl.name),
+            }
+            FORWARD_LINEAR_F32_SEAM_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+            let declared = ny_levers::read_with(decl, |_| raw.map(str::to_owned))
+                .value
+                .as_bool();
+            assert_eq!(declared, raw == Some("1"), "{raw:?}");
+            assert_eq!(
+                forward_linear_f32_seam_armed(),
+                declared,
+                "{raw:?}: the unset-override arm disagrees with the declaration"
+            );
+            set_forward_linear_f32_seam(!declared);
+            assert_eq!(
+                forward_linear_f32_seam_armed(),
+                !declared,
+                "{raw:?}: an installed override must win over the environment"
+            );
+        }
+    });
+}
+
+#[test]
+fn f32_seam_override_precedence_over_the_legacy_env_route() {
+    // NOTE: this test deliberately does NOT read `NY_FORWARD_LINEAR_F32`.
+    // Doing so would add a reader site to the ny-levers source frontier and
+    // turn this change from a ratchet LOWERING into a lateral move. The
+    // fallback-to-env path is covered by the dedicated oracle
+    // `crates/ny-propagate/tests/fl_f32_cpu_engine_seam.rs` and by
+    // `f32_seam_env_fallback_agrees_with_its_declaration`; what is unique
+    // here is the OVERRIDE PRECEDENCE contract, asserted below. Serialized on
+    // the env write lock with the other override tests.
+    let _env = ny_test_utils::env::lock_env();
+    let _reset = SeamOverrideReset;
+    FORWARD_LINEAR_F32_SEAM_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+
+    set_forward_linear_f32_seam(true);
+    assert!(
+        forward_linear_f32_seam_armed(),
+        "an armed preset override must win regardless of the env route"
+    );
+
+    set_forward_linear_f32_seam(false);
+    assert!(
+        !forward_linear_f32_seam_armed(),
+        "a DISARMED preset override must win too — it is not merely 'unset'"
+    );
+
+    // Restore the sentinel so sibling tests see the shipped default.
+    FORWARD_LINEAR_F32_SEAM_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[test]
+fn f32_seam_image_module_shares_the_parent_reader() {
+    // The two historical read sites keyed BOTH the cache fingerprint and the
+    // rate calibration, so a split view would have been a correctness hazard.
+    // Arm via the parent and require the image module's gate to agree.
+    let _env = ny_test_utils::env::lock_env();
+    let _reset = SeamOverrideReset;
+    set_forward_linear_f32_seam(true);
+    assert!(image::forward_linear_f32_gemm_enabled_for_tests());
+    set_forward_linear_f32_seam(false);
+    assert!(!image::forward_linear_f32_gemm_enabled_for_tests());
+    FORWARD_LINEAR_F32_SEAM_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[test]
+fn cached_rate_cold_slots_do_not_initialize_or_poison_later_calibration() {
+    for seam in [false, true] {
+        let slot = std::sync::OnceLock::new();
+        let rate = forward_linear_rate_without_probe_from(&slot, None, seam);
+        assert_eq!(rate.source, "fallback");
+        assert_eq!(rate.macs_per_sec, FORWARD_LINEAR_F64_MACS_PER_SEC_FALLBACK);
+        assert_eq!(rate.seam_f32, seam);
+        assert_eq!((rate.probe_macs, rate.probe_secs), (0, 0.0));
+        assert!(
+            slot.get().is_none(),
+            "read-only fallback must leave calibration cold"
+        );
+        let calls = std::cell::Cell::new(0);
+        let measured = *slot.get_or_init(|| {
+            calls.set(calls.get() + 1);
+            ForwardLinearRateCalibration {
+                macs_per_sec: 17_000_000_000,
+                source: "probe",
+                seam_f32: seam,
+                probe_macs: 123,
+                probe_secs: 0.25,
+            }
+        });
+        let later = forward_linear_rate_without_probe_from(&slot, None, seam);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(later.macs_per_sec, measured.macs_per_sec);
+        assert_eq!(later.source, "probe");
+        assert_eq!((later.probe_macs, later.probe_secs), (123, 0.25));
+    }
+}
+
+#[test]
+fn cached_rate_keeps_env_precedence_invalid_tokens_and_seam_slots() {
+    let off = std::sync::OnceLock::new();
+    let on = std::sync::OnceLock::new();
+    off.set(ForwardLinearRateCalibration {
+        macs_per_sec: 11,
+        source: "probe",
+        seam_f32: false,
+        probe_macs: 20,
+        probe_secs: 0.5,
+    })
+    .unwrap();
+    on.set(ForwardLinearRateCalibration {
+        macs_per_sec: 22,
+        source: "probe",
+        seam_f32: true,
+        probe_macs: 30,
+        probe_secs: 0.75,
+    })
+    .unwrap();
+    assert_ne!(
+        std::ptr::from_ref(forward_linear_rate_slot(false)),
+        std::ptr::from_ref(forward_linear_rate_slot(true))
+    );
+    for (slot, seam, expected) in [(&off, false, 11), (&on, true, 22)] {
+        for raw in [None, Some("0"), Some("-1"), Some("garbage"), Some(" 5")] {
+            let rate = forward_linear_rate_without_probe_from(slot, raw, seam);
+            assert_eq!(rate.macs_per_sec, expected);
+            assert_eq!(rate.source, "probe");
+            assert_eq!(rate.seam_f32, seam);
+        }
+        let rate = forward_linear_rate_without_probe_from(slot, Some("123000000000"), seam);
+        assert_eq!(rate.macs_per_sec, 123_000_000_000);
+        assert_eq!(rate.source, "env");
+        assert_eq!((rate.probe_macs, rate.probe_secs), (0, 0.0));
+        assert_eq!(slot.get().unwrap().macs_per_sec, expected);
+    }
+}
+
+#[test]
+fn cached_rate_does_not_wait_for_in_progress_initializer() {
+    use std::sync::{mpsc, Arc, OnceLock};
+    use std::time::Duration;
+    let slot = Arc::new(OnceLock::new());
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let writer_slot = Arc::clone(&slot);
+    let writer = std::thread::spawn(move || {
+        writer_slot.get_or_init(|| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            ForwardLinearRateCalibration {
+                macs_per_sec: 17,
+                source: "probe",
+                seam_f32: false,
+                probe_macs: 2,
+                probe_secs: 0.5,
+            }
+        });
+    });
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (read_tx, read_rx) = mpsc::channel();
+    let reader_slot = Arc::clone(&slot);
+    let reader = std::thread::spawn(move || {
+        read_tx
+            .send(forward_linear_rate_without_probe_from(
+                &reader_slot,
+                None,
+                false,
+            ))
+            .unwrap();
+    });
+    // Release/join even if the read times out: a regression must fail the
+    // assertion without leaving an initializer or blocked reader behind.
+    let observed = read_rx.recv_timeout(Duration::from_secs(5));
+    release_tx.send(()).unwrap();
+    writer.join().unwrap();
+    reader.join().unwrap();
+    let observed = observed.expect("get-only rate must return before initializer release");
+    assert_eq!(observed.source, "fallback");
+    assert_eq!(
+        observed.macs_per_sec,
+        FORWARD_LINEAR_F64_MACS_PER_SEC_FALLBACK
+    );
+    assert_eq!(slot.get().unwrap().source, "probe");
 }

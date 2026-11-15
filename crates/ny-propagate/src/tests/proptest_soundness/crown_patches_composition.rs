@@ -6,18 +6,12 @@
 //!
 //! Separated from crown_patches.rs to keep files under 1000 lines.
 //!
-//! Design: designs/2026-02-28-patches-mode-wrapper-enum-design.md
-//! Part of #2613
-//!
 //! WALL-CLOCK POLICY FOR THIS FILE: every `#[ntest::timeout(..)]` below is a
-//! HANG SENTINEL, not a performance assertion. Measured 2026-08-19, isolated
-//! and single-threaded, these properties cost 10-30s in a debug build, and the
-//! walls they used to carry (20-60s) were margins of 1.2-2.9x. That is not a
-//! sentinel, it is a coin flip that any concurrent load loses -- and they duly
-//! failed at both 4 and 8 test threads. They are now a uniform 300s, roughly
-//! 10-20x the measured isolated cost. The failure these exist to catch is an
-//! infinite loop, and no finite wall lets one of those through.
-//! MEASURE BEFORE LOWERING THEM.
+//! HANG SENTINEL, not a performance assertion, at a uniform 300s. The failure
+//! these exist to catch is an infinite loop, and no finite wall lets one of those
+//! through. The 2026-08-19 timings once cited for these walls (10-30s isolated)
+//! were inflated 5-7x by stray load on the measuring box; see the 2026-08-20
+//! correction in `crown_patches.rs`. MEASURE BEFORE LOWERING THEM.
 
 use crate::bounds::patches::{CrownBounds, PatchesLinearBounds};
 use crate::layers::activations::ReLULayer;
@@ -57,9 +51,6 @@ proptest! {
     ///
     /// This is the key composition test — verifies that non-identity patches
     /// are correctly composed through Conv1 via conv2d_transpose.
-    ///
-    /// Reference: designs/2026-02-28-patches-mode-wrapper-enum-design.md Phase 1
-    /// Part of #2613
     #[ntest::timeout(300000)]
     #[test]
     fn proptest_conv2d_relu_conv2d_patches_composition(
@@ -236,16 +227,14 @@ proptest! {
     /// Verifies that the macro-generated `propagate_patches_with_bounds` for SiLU
     /// produces identical bounds to the Dense path. This validates the generic
     /// activation Patches support added in Phase 2 step 11.
-    ///
-    /// Part of #2613
     // This 200-case nonlinear differential sweep needs the same shared-host
     // allowance as the neighboring pooling sweeps.
     //
     // HANG SENTINEL, NOT A PERFORMANCE ASSERTION. Measured 2026-08-19:
     // 0.96s isolated, 5.93s with 14 CPU burners pinned (6.2×). The 20s wall was
-    // only 3.4× the contended cost and tripped under `--test-threads=8`; 120s
-    // is ~20×, and brings this into line with the 60s its composition siblings
-    // in this same file already use. MEASURE BEFORE RAISING IT AGAIN.
+    // only 3.4× the contended cost and tripped under `--test-threads=8`; the
+    // 300s wall is ~50× and matches the file-wide policy above.
+    // MEASURE BEFORE RAISING IT AGAIN.
     #[ntest::timeout(300000)]
     #[test]
     fn proptest_conv2d_silu_patches_vs_dense(

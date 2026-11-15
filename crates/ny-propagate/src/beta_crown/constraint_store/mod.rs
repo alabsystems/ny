@@ -17,8 +17,6 @@
 //! # Sources
 //!
 //! - ay ClauseDB: `crates/ay-sat/src/clause_db.rs`
-//! - Design doc: `designs/2026-01-29-linear-constraint-store.md`
-//! - Issue: #234
 
 pub mod arena;
 pub mod domain;

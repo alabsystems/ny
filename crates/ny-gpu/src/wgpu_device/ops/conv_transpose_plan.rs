@@ -75,8 +75,9 @@ use std::sync::Arc;
 
 use ny_core::{ConvTranspose2dParams, NyError, Result};
 
+use super::super::error_scope::run_gpu_checked_on_device;
 use super::super::WgpuDevice;
-use super::gemm::{select_gemm_dispatch, MAX_BINDING_ELEMS, WGPU_MAX_BINDING_BYTES};
+use super::gemm::select_gemm_dispatch;
 use super::gpu_checked_u32;
 use crate::wgpu_device::params::{ConvCol2imParams, GemmParams};
 
@@ -268,6 +269,33 @@ impl WgpuDevice {
         params: &ConvTranspose2dParams,
         total_rows: usize,
     ) -> Result<(Arc<PreparedConvTransposePlan>, bool)> {
+        self.get_or_prepare_conv_transpose_plan_with(weight_col, params, total_rows, || {
+            PreparedConvTransposePlan::build(self, weight_col, params, total_rows)
+        })
+    }
+
+    /// [`Self::get_or_prepare_conv_transpose_plan`] with the plan builder
+    /// passed in. Production passes [`PreparedConvTransposePlan::build`]; the
+    /// gpu-tests pin passes a real build that also hits a wgpu error, standing
+    /// in for an allocation failure it cannot provoke on demand.
+    ///
+    /// A miss builds the plan inside its OWN wgpu error scope and caches it
+    /// only when that scope is clean. wgpu reports a failed `create_buffer`
+    /// (out of memory, or a size past a device limit) through the error scopes
+    /// and still hands back a buffer handle, so `build` returns `Ok` with an
+    /// invalid buffer in it. Building inside the caller's scope alone (the
+    /// pair path's `run_gpu_checked`) failed that call but had already cached
+    /// the plan, and every later call with the same weights and shape hit it
+    /// and failed too, until the next `clear_crown_working_set`. The live
+    /// binding gate admits bindings up to the adapter's grant (4 GiB - 4 B on
+    /// an M5 Max), so a plan can now ask for allocations the device refuses.
+    fn get_or_prepare_conv_transpose_plan_with(
+        &self,
+        weight_col: &Arc<[f32]>,
+        params: &ConvTranspose2dParams,
+        total_rows: usize,
+        build: impl FnOnce() -> Result<PreparedConvTransposePlan>,
+    ) -> Result<(Arc<PreparedConvTransposePlan>, bool)> {
         let key = conv_transpose_plan_key(weight_col, params, total_rows);
         {
             let cache = self.conv_transpose_plan_cache.lock().map_err(|err| {
@@ -282,8 +310,10 @@ impl WgpuDevice {
             }
         }
 
-        let plan = Arc::new(PreparedConvTransposePlan::build(
-            self, weight_col, params, total_rows,
+        let plan = Arc::new(run_gpu_checked_on_device(
+            &self.device,
+            "conv_transpose_2d plan build",
+            build,
         )?);
         let mut cache = self.conv_transpose_plan_cache.lock().map_err(|err| {
             NyError::InternalError(format!("conv_transpose plan cache lock poisoned: {err}"))
@@ -418,16 +448,22 @@ impl PreparedConvTransposePlan {
             )));
         }
 
-        if gemm_k * gemm_n > MAX_BINDING_ELEMS
-            || gemm_m * gemm_k > MAX_BINDING_ELEMS
-            || gemm_out_elems > MAX_BINDING_ELEMS
-            || out_elems > MAX_BINDING_ELEMS
-        {
-            return Err(NyError::GpuMemoryExceeded {
-                required_bytes: gemm_out_elems.max(out_elems) * size_of::<f32>(),
-                budget_bytes: WGPU_MAX_BINDING_BYTES,
-            });
-        }
+        // #hard-caps: the SAME live-limit gate as the per-call
+        // `conv_transpose_2d`. This used to compare against the static
+        // `MAX_BINDING_ELEMS` (wgpu's DEFAULT 128 MiB binding) after the per-call
+        // gate had moved to the live limit (d153bf0a4), so on an adapter granting
+        // more (an M5 Max grants 4 GiB - 4 B) the plan refused every pair whose
+        // bindings were past 112 MB. Stacking lower over upper doubles the GEMM
+        // output binding, so pairs whose single calls fit the old wall still hit
+        // it, and ny-propagate's `ops_transpose_gemm.rs` abandoned the fused,
+        // weight-resident pair for its per-matrix path. That cost throughput,
+        // never a bound: the verdict-bearing WGPU routes (`GemmEngine for
+        // WgpuDevice`, `ComputeDevice::Wgpu`) refuse this pair outright while
+        // WGPU is quarantined, so in production only the attack-steering engine
+        // (`AttackSteeringDevice`) reaches this plan, and its results only steer
+        // a falsification search that re-checks every candidate. Runs before any
+        // buffer is allocated, so a refused pair leaves nothing in the cache.
+        device.check_conv_transpose_bindings_live(gemm_m, gemm_k, gemm_n, out_elems)?;
 
         let out_workgroups = out_elems.div_ceil(256);
         let col2im_workgroups = gpu_checked_u32(out_workgroups, "conv_t2d_plan col2im_workgroups")?;
@@ -746,5 +782,115 @@ mod tests {
         p2.stride_h = 2;
         let other = conv_transpose_plan_key(&w, &p2, 32);
         assert_ne!(base, other, "stride change must affect the key");
+    }
+
+    /// #hard-caps: a plan whose build hits a wgpu error is never cached.
+    ///
+    /// The builder makes a real plan, then swaps in a staging buffer past
+    /// `max_buffer_size`. wgpu refuses it the way it refuses an allocation it
+    /// cannot make: an error in the scope and a buffer handle that is invalid.
+    /// Nothing is allocated. That build must fail its call and leave the cache
+    /// empty. The same key must then build clean and compute exactly what two
+    /// per-call dispatches compute. If the broken plan were cached, the retry
+    /// would hit it and fail as well.
+    #[cfg(feature = "gpu-tests")]
+    #[test]
+    fn plan_build_with_gpu_error_is_not_cached() {
+        let _gpu_serial = crate::wgpu_device::test_support::gpu_test_serial_guard();
+        let device = crate::wgpu_device::test_support::require_device();
+        device
+            .clear_conv_transpose_plan_cache()
+            .expect("clear conv_transpose plan cache");
+
+        let single = params();
+        let pair = ConvTranspose2dParams {
+            num_specs: 2 * single.num_specs,
+            ..single
+        };
+        let single_rows = single.num_specs * single.out_h * single.out_w;
+        let total_rows = 2 * single_rows;
+        let kernel_cols = single.in_channels * single.kernel_h * single.kernel_w;
+        let weight: Vec<f32> = (0..single.out_channels * kernel_cols)
+            .map(|i| ((i * 13 + 5) % 9) as f32 - 4.0)
+            .collect();
+        let w: Arc<[f32]> = Arc::from(weight.clone());
+        let a_len = single_rows * single.out_channels;
+        let a_lower: Vec<f32> = (0..a_len)
+            .map(|i| ((i * 7 + 3) % 11) as f32 - 5.0)
+            .collect();
+        let a_upper: Vec<f32> = (0..a_len)
+            .map(|i| ((i * 5 + 1) % 13) as f32 - 6.0)
+            .collect();
+
+        let past_limit = device
+            .device
+            .limits()
+            .max_buffer_size
+            .checked_add(4)
+            .expect("max_buffer_size + 4 fits u64");
+        let failed = device.run_gpu_checked("conv_transpose plan build fault pin", || {
+            device.get_or_prepare_conv_transpose_plan_with(&w, &pair, total_rows, || {
+                let mut plan = PreparedConvTransposePlan::build(&device, &w, &pair, total_rows)?;
+                plan.staging_buf = device.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("conv_t2d_plan_staging fault pin: past max_buffer_size"),
+                    size: past_limit,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                Ok(plan)
+            })
+        });
+        let cached_after_failure = device.conv_transpose_plan_cache_len();
+        let retry = device.conv_transpose_2d_pair_cached(&a_lower, &a_upper, &w, &single);
+        let cached_after_retry = device.conv_transpose_plan_cache_len();
+
+        match &failed {
+            Err(NyError::InternalError(msg)) => assert!(
+                msg.contains("wgpu validation error"),
+                "the build's wgpu error must fail the call: {msg}"
+            ),
+            Err(other) => panic!("expected the build's wgpu validation error, got {other}"),
+            Ok(_) => panic!("a build that hit a wgpu error must not return a plan"),
+        }
+        let (lower, upper) = retry.unwrap_or_else(|e| {
+            panic!(
+                "the same key must build clean after a failed build (plans cached by the \
+                 failed build: {cached_after_failure}): {e}"
+            )
+        });
+        assert_eq!(
+            cached_after_failure, 0,
+            "a build that hit a wgpu error must not enter the plan cache"
+        );
+        assert_eq!(
+            cached_after_retry, 1,
+            "the clean retry builds and caches one plan"
+        );
+        let per_call_lower = device
+            .conv_transpose_2d(&a_lower, &weight, &single)
+            .expect("per-call lower");
+        let per_call_upper = device
+            .conv_transpose_2d(&a_upper, &weight, &single)
+            .expect("per-call upper");
+        for (name, got, want) in [
+            ("lower", &lower, &per_call_lower),
+            ("upper", &upper, &per_call_upper),
+        ] {
+            assert_eq!(got.len(), want.len(), "{name} length");
+            assert!(
+                got.iter()
+                    .zip(want.iter())
+                    .all(|(g, w)| g.to_bits() == w.to_bits()),
+                "{name}: the rebuilt plan must be bit-identical to per-call dispatches"
+            );
+        }
+        assert!(
+            lower.iter().any(|v| *v != 0.0) && upper.iter().any(|v| *v != 0.0),
+            "non-degenerate result"
+        );
+
+        device
+            .clear_conv_transpose_plan_cache()
+            .expect("clear conv_transpose plan cache after test");
     }
 }

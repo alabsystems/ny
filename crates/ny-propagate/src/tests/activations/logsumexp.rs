@@ -133,7 +133,7 @@ fn test_logsumexp_layer_enum_dispatch() {
 }
 
 // ==================== Domain validation tests ====================
-// Per domain validation policy (designs/2026-02-07-domain-validation-policy.md):
+// Per domain validation policy:
 // LogSumExp is Category B — NaN input bounds fail closed. ±Inf endpoints are
 // the deep-stack IBP overflow saturation convention (dc9da0fde class) and
 // propagate as the exact extended-real limits: a -inf element among finite

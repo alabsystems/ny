@@ -528,3 +528,185 @@ fn fd_oracle_true_alpha_gradient_matches_local_rule_refuted() {
          {max_err_true_b:.2e}, local err {max_err_local_b:.2e})"
     );
 }
+
+/// #alpha-envelope-grad-cpu: at the 0 clamp — where the shipped local rule
+/// parks EVERY alpha (`[alpha-ascent] ... at_clamp=N frac=1.0000` on the
+/// malbeware, cora and vit gap rows) — the TYPED key must change the CPU chain
+/// gradient, and change it in the one way that matters: the local field is
+/// `<= 0` everywhere, so the loop's projected step leaves every alpha at 0
+/// forever, while the envelope field has a positive component, so alpha
+/// LEAVES the clamp.
+///
+/// Both arms are resolved through the REAL lever layering on the REAL
+/// declaration (`read_over_config_with`) with an injected EMPTY environment, so
+/// the test cannot race process env and proves the typed value — `config`, not
+/// `legacy_env` — decides the rule. The step uses `GraphAlphaState::update`
+/// with the DAG loop's own sign convention (`neg_grad`, `alpha_update.rs`), and
+/// the verdict is read through `clamp_saturation`, the counter the
+/// `[alpha-ascent]` line prints.
+#[ntest::timeout(60000)]
+#[test]
+fn typed_envelope_grad_moves_alpha_off_the_zero_clamp_on_the_cpu_chain() {
+    use super::gradients::{take_cpu_envelope_tally, EnvelopeEngagement, EnvelopeGradChoice};
+    use ny_levers::decls::root_alpha::ALPHA_ENVELOPE_GRAD;
+    use ny_levers::{read_over_config_with, LeverValue, Source};
+
+    let resolve = |typed: bool| {
+        EnvelopeGradChoice::from_resolution(read_over_config_with(
+            &ALPHA_ENVELOPE_GRAD,
+            |_| None,
+            Some(LeverValue::Bool(typed)),
+        ))
+    };
+    let on = resolve(true);
+    let off = resolve(false);
+    assert_eq!(
+        on,
+        EnvelopeGradChoice {
+            enabled: true,
+            source: Some(Source::Config),
+        },
+        "a typed `true` with no env override must arm the rule from the config layer"
+    );
+    assert_eq!(
+        off,
+        EnvelopeGradChoice {
+            enabled: false,
+            source: Some(Source::Config),
+        },
+        "a typed `false` with no env override must keep the local rule"
+    );
+
+    let h = OracleHarness::new();
+    // Every alpha AT the 0 clamp: the absorbing state of the local rule.
+    let st = h.make_alpha_state(&[0.0; 4], &[0.0; 4]);
+    for name in ["relu1", "relu2"] {
+        let mask = st.unstable_mask.get(name).expect("mask");
+        assert!(
+            mask.iter().all(|&m| m),
+            "{name}: every neuron must be unstable so every alpha is live"
+        );
+    }
+    let mut g = vec![Array1::<f32>::zeros(4), Array1::<f32>::zeros(4)];
+    let mut gu = vec![Array1::<f32>::zeros(4), Array1::<f32>::zeros(4)];
+    let (_b, inter) = h
+        .graph
+        .dag_alpha_backward_pass_with_intermediates(
+            &h.input,
+            &h.ibp,
+            &h.exec_order,
+            1,
+            3,
+            &h.relu_name_to_idx,
+            &st,
+            None,
+            &mut g,
+            &mut gu,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("alpha backward with intermediates");
+    let names = vec!["relu1".to_string(), "relu2".to_string()];
+
+    let _ = take_cpu_envelope_tally();
+    let g_off =
+        h.graph
+            .chain_rule_gradients_with_choice(&h.input, &names, &inter, Some(&st), None, off);
+    let tally_off = take_cpu_envelope_tally();
+    let g_on =
+        h.graph
+            .chain_rule_gradients_with_choice(&h.input, &names, &inter, Some(&st), None, on);
+    let tally_on = take_cpu_envelope_tally();
+
+    assert_eq!(
+        (tally_off.calls, tally_off.armed, tally_off.engaged),
+        (1, 0, 0),
+        "off arm: one call, local rule, got {tally_off:?}"
+    );
+    assert_eq!(
+        tally_off.last,
+        Some((off, EnvelopeEngagement::Off)),
+        "off arm must report the local rule"
+    );
+    assert_eq!(
+        (tally_on.calls, tally_on.armed, tally_on.engaged),
+        (1, 1, 1),
+        "on arm: one call, armed AND applied, got {tally_on:?}"
+    );
+    assert_eq!(
+        tally_on.last,
+        Some((on, EnvelopeEngagement::Active { nodes: 2 })),
+        "on arm must apply the envelope factor on both ReLU nodes"
+    );
+
+    assert_eq!(g_off.len(), 2, "one gradient array per ReLU (off)");
+    assert_eq!(g_on.len(), 2, "one gradient array per ReLU (on)");
+    let (mut differs, mut positive_on) = (false, false);
+    for (k, name) in ["relu1", "relu2"].iter().enumerate() {
+        for i in 0..4 {
+            let (lo, en) = (g_off[k][i], g_on[k][i]);
+            eprintln!("[alpha-envelope-grad-test] {name}[{i}] local={lo:+.5} envelope={en:+.5}");
+            assert!(
+                lo <= 1e-6,
+                "{name}[{i}]: the local rule is sign-definite <= 0 (local_rule_nonpos), got {lo}"
+            );
+            if (en - lo).abs() > 1e-6 {
+                differs = true;
+            }
+            if en > 1e-3 {
+                positive_on = true;
+            }
+        }
+    }
+    assert!(
+        differs,
+        "the typed key must CHANGE the CPU chain gradient at the clamp"
+    );
+    assert!(
+        positive_on,
+        "at the 0 clamp the envelope field must have a positive component, or \
+         alpha can never leave the clamp and the key buys nothing"
+    );
+
+    // One projected step each, with the DAG loop's sign convention: it passes
+    // `-grad` to the optimizer, so a positive gradient RAISES alpha.
+    let step = |grads: &[Array1<f32>]| {
+        let mut state = st.clone();
+        for (k, name) in ["relu1", "relu2"].iter().enumerate() {
+            let neg_grad = grads[k].mapv(|v| -v);
+            state.update(name, &neg_grad, 0.1, 0.0);
+        }
+        state
+    };
+    let after_off = step(g_off.as_slice());
+    let after_on = step(g_on.as_slice());
+    for name in ["relu1", "relu2"] {
+        let alphas = after_off.alphas.get(name).expect("off alphas");
+        assert!(
+            alphas.iter().all(|&a| a == 0.0),
+            "{name}: under the local rule every alpha must stay AT the 0 clamp, got {alphas:?}"
+        );
+    }
+    let raised = ["relu1", "relu2"]
+        .iter()
+        .flat_map(|name| after_on.alphas.get(*name).expect("on alphas").iter())
+        .filter(|&&a| a > 0.0)
+        .count();
+    assert!(
+        raised > 0,
+        "under the envelope rule at least one alpha must leave the 0 clamp"
+    );
+    let (committed_off, at_clamp_off) = after_off.clamp_saturation();
+    let (committed_on, at_clamp_on) = after_on.clamp_saturation();
+    assert_eq!(
+        committed_off, committed_on,
+        "same unstable set in both arms"
+    );
+    assert!(
+        at_clamp_on < at_clamp_off,
+        "the `[alpha-ascent]` at_clamp counter must FALL under the typed key \
+         (off {at_clamp_off}/{committed_off}, on {at_clamp_on}/{committed_on})"
+    );
+}

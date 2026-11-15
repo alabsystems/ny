@@ -259,7 +259,7 @@ fn test_solve_dual_variable_gradient_negative() {
 }
 
 // =========================================================================
-// CPU tests for monotonicity and feasibility (#348)
+// CPU tests for monotonicity and feasibility
 // =========================================================================
 
 /// Test monotonicity: tighter constraints should yield tighter (or equal) bounds.

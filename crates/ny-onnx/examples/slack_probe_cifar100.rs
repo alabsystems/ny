@@ -16,7 +16,7 @@
 //! precision — the decisive datum the GPU/Metal lane could not produce.
 //!
 //! Run (real benchmark assets; release):
-//! `cargo run -p ny-onnx --release --example slack_probe_cifar100`
+//! `targo --unverified run -p ny-onnx --release --example slack_probe_cifar100`
 
 use ndarray::{Array2, ArrayD, IxDyn};
 use ny_onnx::vnnlib::load_vnnlib;

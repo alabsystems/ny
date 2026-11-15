@@ -9,7 +9,7 @@ use crate::verifier::Verifier;
 use ndarray::{arr1, arr2};
 use ny_core::{Bound, NyError, VerificationSpec};
 
-/// Regression test for #2584 item 3: near-zero-width crossing ReLU intervals
+/// Regression test item 3: near-zero-width crossing ReLU intervals
 /// in the SDP-CROWN ReLU backward path must remain finite and sound.
 #[ntest::timeout(10000)]
 #[test]
@@ -333,7 +333,7 @@ fn test_graphnetwork_sdp_crown_via_verifier_rejects_box_spec() {
     );
 }
 
-// ============== Non-finite c/g rejection tests (issue #2752) ==============
+// ============== Non-finite c/g rejection tests ==============
 //
 // These verify that relu_sdp_offset_for_lambda and relu_sdp_offset_opt reject
 // non-finite c/g coefficients instead of silently swallowing NaN via f64::min().

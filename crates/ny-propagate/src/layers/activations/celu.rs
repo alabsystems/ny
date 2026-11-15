@@ -58,7 +58,7 @@ impl BoundPropagation for CeluLayer {
         let alpha = self.alpha;
         // Guard: alpha near zero causes x/alpha overflow to Inf, then
         // alpha * Inf = Inf or 0 * Inf = NaN. Reject non-positive or
-        // non-finite alpha. (#2911)
+        // non-finite alpha.
         if !alpha.is_finite() || alpha <= 0.0 {
             return Err(NyError::InvalidSpec(format!(
                 "CeluLayer requires finite positive alpha, got {}",
@@ -71,14 +71,14 @@ impl BoundPropagation for CeluLayer {
         // (`OpaqueSkipLayer::unbounded_like` builds exactly that); rejecting it
         // as `NumericalInstability` aborted the WHOLE graph-IBP pass, because
         // that variant is not in `is_degradable_error`. Pattern: AddConstant
-        // (add_constant.rs:69-79). (#3278)
+        // (add_constant.rs:69-79).
         if input.lower().iter().any(|x| x.is_nan()) || input.upper().iter().any(|x| x.is_nan()) {
             return Err(NyError::NumericalInstability(
                 "CELU IBP: NaN input bounds".to_string(),
             ));
         }
         // Directed rounding: for x < 0, exp is a transcendental that can round
-        // either direction. Compute in f64, cast with next_down/next_up. (#1483)
+        // either direction. Compute in f64, cast with next_down/next_up.
         // For x >= 0, CELU(x) = x is exact (no rounding needed).
         let alpha64 = alpha as f64;
         let celu_lower = |x: f32| -> f32 {
@@ -86,8 +86,8 @@ impl BoundPropagation for CeluLayer {
                 x
             } else {
                 // Range clamp: CELU(x) >= -alpha for all x. next_down_f32 can push
-                // past -alpha for extreme negative inputs (exp(x/alpha) → 0). (#3316)
-                // NaN-propagating: .max() swallows NaN (IEEE 754-2008). (#3316)
+                // past -alpha for extreme negative inputs (exp(x/alpha) → 0).
+                // NaN-propagating:.max() swallows NaN (IEEE 754-2008).
                 nan_propagating_max(
                     next_down_f32((alpha64 * ((x as f64 / alpha64).exp() - 1.0)) as f32),
                     -alpha,
@@ -114,7 +114,7 @@ impl BoundPropagation for CeluLayer {
         // (the subtraction is exp(..) - 1 with exp(..) in [0, inf)), no
         // 0 * inf and no inf / inf (alpha is finite and non-zero). So NaN can
         // only come from a NaN input, which the guard above already rejects,
-        // and NaN in the output still hard-errors here. (#3278)
+        // and NaN in the output still hard-errors here.
         BoundedTensor::new_allow_infinite(lower, upper)
     }
     impl_elementwise_activation!(
@@ -137,11 +137,10 @@ impl BoundPropagation for CeluLayer {
 /// Delegates to the shared ELU-family relaxation (elu_family.rs) parameterized with
 /// CELU's mathematical expressions. CELU is globally convex (f'(0-) = 1 = f'(0+)),
 /// so the crossing case uses chord upper + tangent lower (tighter than chord+deviation).
-/// Part of #2834.
 ///
 /// Ref: alpha-beta-CROWN auto_LiRPA/operators/nonlinear.py (CELU relaxation)
 pub(crate) fn celu_linear_relaxation(l: f32, u: f32, alpha: f32) -> LinearRelaxation {
-    // Guard: non-positive or non-finite alpha causes x/alpha overflow. (#2911)
+    // Guard: non-positive or non-finite alpha causes x/alpha overflow.
     if !alpha.is_finite() || alpha <= 0.0 {
         return LinearRelaxation::nan_fallback();
     }
@@ -186,7 +185,7 @@ mod tests {
         }
     }
 
-    /// Independent f64 CELU reference for strict proptest. (#3292)
+    /// Independent f64 CELU reference for strict proptest.
     fn celu_f64_reference(x: f64, alpha: f64) -> f64 {
         if x >= 0.0 {
             x
@@ -539,7 +538,7 @@ mod tests {
         assert!(matches!(err, NyError::InvalidSpec(_)));
     }
 
-    /// Regression test for #2911: near-zero alpha causes x/alpha overflow.
+    /// Regression test: near-zero alpha causes x/alpha overflow.
     #[test]
     fn test_ibp_bad_alpha_returns_error_2911() {
         let input =
@@ -588,7 +587,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #2911: celu_linear_relaxation with bad alpha.
+    /// Regression test: celu_linear_relaxation with bad alpha.
     #[test]
     fn test_relaxation_bad_alpha_returns_conservative_2911() {
         // alpha = 0: should return conservative bounds
@@ -616,7 +615,7 @@ mod tests {
         assert_eq!(ui, f32::INFINITY);
     }
 
-    // ── IBP guard regression tests (#3278) ────────────────────────────
+    // ── IBP guard regression tests ────────────────────────────
 
     #[test]
     fn test_ibp_nan_input_lower_rejected_3278() {
@@ -642,7 +641,7 @@ mod tests {
         assert!(matches!(err, NyError::NumericalInstability(_)));
     }
 
-    /// #3278 originally rejected ±Inf here too. That was wrong: ±Inf is what an
+    /// The NaN guard originally rejected ±Inf here too. That was wrong: ±Inf is what an
     /// upstream OpaqueSkip legitimately emits, and `NumericalInstability` is not
     /// degradable, so one tainted element aborted the whole graph-IBP pass.
     /// CELU must now widen instead — saturating to -alpha on the left.
@@ -663,7 +662,7 @@ mod tests {
         assert_eq!(out.upper()[[0]], f32::INFINITY);
     }
 
-    // ── OpaqueSkip taint propagation (#3278 follow-up) ─────────────────
+    // ── OpaqueSkip taint propagation ───────────────────────────────────
 
     /// Probe: a mixed tensor where one element carries an upstream OpaqueSkip's
     /// `[-inf, +inf]` and the other is a normal finite interval. The tainted
@@ -841,9 +840,9 @@ mod tests {
         }
     }
 
-    // ── Strict zero-tolerance CROWN relaxation proptest (#3292) ──────────
+    // ── Strict zero-tolerance CROWN relaxation proptest ──────────
     //
-    // Pattern from #3285: f64-evaluated reference with zero tolerance catches
+    // Pattern: f64-evaluated reference with zero tolerance catches
     // f32 cancellation bugs invisible to magnitude-scaled tolerance tests.
 
     proptest! {
@@ -851,7 +850,7 @@ mod tests {
 
         /// Strict soundness proptest for CELU CROWN relaxation (alpha=1.0).
         /// Uses f64 reference (celu_f64_reference) with zero tolerance on 200-point grid.
-        /// Ref: alpha-beta-CROWN auto_LiRPA CELU relaxation, #3292.
+        /// Ref: alpha-beta-CROWN auto_LiRPA CELU relaxation.
         #[test]
         fn proptest_celu_relaxation_strict_soundness(
             l in -10.0f32..10.0,

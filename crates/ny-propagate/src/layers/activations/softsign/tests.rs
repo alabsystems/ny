@@ -133,7 +133,7 @@ fn f32_any_with_specials() -> impl Strategy<Value = f32> {
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(256) })]
 
-    /// #1836 acceptance: exercise Softsign scalar eval on ANY f32 plus explicit IEEE corner values.
+    /// Exercise Softsign scalar eval on ANY f32 plus explicit IEEE corner values.
     #[test]
     fn proptest_softsign_eval_handles_special_values(x in f32_any_with_specials()) {
         let y = softsign_scalar(x);
@@ -149,8 +149,8 @@ proptest! {
         }
     }
 
-    /// #1836 acceptance: finite-width IBP intervals must not produce NaN bounds.
-    /// #3316: bounds must also respect the mathematical range [-1, 1].
+    /// Finite-width IBP intervals must not produce NaN bounds.
+    /// Bounds must also respect the mathematical range [-1, 1].
     #[test]
     fn proptest_softsign_ibp_no_nan_for_finite_intervals(a in prop::num::f32::ANY, b in prop::num::f32::ANY) {
         prop_assume!(a.is_finite() && b.is_finite());
@@ -416,12 +416,12 @@ fn test_crown_backward_non_identity_bounds() -> Result<()> {
     Ok(())
 }
 
-// ── f64 chord precision proptest (#2624) ─────────────────────────────
+// ── f64 chord precision proptest ─────────────────────────────
 
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(1000) })]
 
-    /// #2624, #3146: Verify softsign_chord_f64 matches f64 reference with directed rounding.
+    /// Verify softsign_chord_f64 matches f64 reference with directed rounding.
     /// Slope must match exactly; directed rounding bounds must bracket the reference intercept.
     #[test]
     fn proptest_softsign_chord_f64_precision(l in -10.0f32..10.0, width_exp in -8.0f64..-4.0) {
@@ -448,7 +448,7 @@ proptest! {
     }
 }
 
-/// Regression test for #1836: softsign_scalar(-inf) must return -1, not NaN.
+/// Regression test: softsign_scalar(-inf) must return -1, not NaN.
 /// Softsign(x) = x / (1 + |x|); at x = -inf: (-inf)/inf = NaN
 /// without the guard. Correct limit: Softsign(-inf) = -1.
 #[test]
@@ -457,21 +457,21 @@ fn test_softsign_neg_infinity_returns_neg_one() {
     assert_eq!(result, -1.0, "softsign(-inf) should be -1.0, got {result}");
 }
 
-/// Regression test for #1836: softsign_scalar(+inf) must return +1.
+/// Regression test: softsign_scalar(+inf) must return +1.
 #[test]
 fn test_softsign_pos_infinity_returns_pos_one() {
     let result = softsign_scalar(f32::INFINITY);
     assert_eq!(result, 1.0, "softsign(+inf) should be 1.0, got {result}");
 }
 
-/// Regression test for #1836: softsign_scalar(NaN) must return NaN.
+/// Regression test: softsign_scalar(NaN) must return NaN.
 #[test]
 fn test_softsign_nan_returns_nan() {
     let result = softsign_scalar(f32::NAN);
     assert!(result.is_nan(), "softsign(NaN) should be NaN, got {result}");
 }
 
-/// Regression test for #3316: softsign IBP with extreme finite inputs must respect
+/// Regression test: softsign IBP with extreme finite inputs must respect
 /// the mathematical range (-1, 1). Without the range clamp, next_down_f32(-1.0)
 /// pushes the lower bound to -1.0000001 and next_up_f32(1.0) pushes the upper
 /// bound to 1.0000001 for inputs where softsign_f64(x) rounds to exactly ±1.0.
@@ -493,7 +493,7 @@ fn test_softsign_ibp_extreme_range_clamp_3316() {
     );
 }
 
-/// Regression test for #1836: IBP with infinite input bounds must not produce NaN.
+/// Regression test: IBP with infinite input bounds must not produce NaN.
 /// Softsign maps ±inf to ±1 (finite), so the IBP output should succeed.
 #[test]
 fn test_softsign_ibp_infinite_bounds_no_nan() {
@@ -513,7 +513,7 @@ fn test_softsign_ibp_infinite_bounds_no_nan() {
     for &v in result.upper().iter() {
         assert!(!v.is_nan(), "Softsign IBP upper must not be NaN, got {v}");
     }
-    // After range clamp (#3316), bounds must stay within [-1, 1] even for infinite inputs.
+    // After range clamp, bounds must stay within [-1, 1] even for infinite inputs.
     assert!(
         result.lower()[0] >= -1.0,
         "softsign lower for [-inf, inf] should be >= -1.0 after range clamp (#3316), got {}",
@@ -526,7 +526,7 @@ fn test_softsign_ibp_infinite_bounds_no_nan() {
     );
 }
 
-// ── CROWN relaxation soundness proptest (#3285) ─────────────────────────
+// ── CROWN relaxation soundness proptest ─────────────────────────
 
 /// Reference Softsign in f64, independent of the crate f32 implementation.
 fn softsign_f64_reference(x: f64) -> f64 {
@@ -536,7 +536,7 @@ fn softsign_f64_reference(x: f64) -> f64 {
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(1000) })]
 
-    /// #3285: Verify softsign_linear_relaxation produces strictly sound bounds.
+    /// Verify softsign_linear_relaxation produces strictly sound bounds.
     /// For random intervals, the lower bound must satisfy
     ///   lower_slope * x + lower_intercept <= Softsign(x)  for all x in [l, u]
     /// and the upper bound must satisfy

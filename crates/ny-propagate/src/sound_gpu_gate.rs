@@ -16,10 +16,8 @@
 //! `a_pos·x_l + a_neg·x_u` in round-to-nearest f32, and the FAST backward `A·W`
 //! shaders carry NO `γ_n·S` certified error.
 //!
-//! CORRECTED 2026-08-04 — this paragraph used to add "(WGSL has no f64, so the
-//! CPU's exact approach cannot port directly)", and five downstream sites came
-//! to quote that as the reason ALL GPU CROWN is off the verdict path. It is a
-//! statement about the FAST lane only, and the parenthetical inference is false.
+//! This applies to the FAST lane only; it is not a reason to keep ALL GPU CROWN
+//! off the verdict path, and WGSL having no f64 is no barrier to a sound lane.
 //! The SOUND-resident wgpu lane already carries a certified `γ_k·S` term in pure
 //! f32 (`CROWN_AW_ERROR_COMBINE_SHADER`; host-side outward-rounded uniforms —
 //! ny-gpu `wgpu_device/sound_consts.rs:13`: "no f64 ever enters a WGSL body"),
@@ -964,6 +962,22 @@ pub(crate) fn sound_gpu_crown_for_wide_with_deadline(
     )
 }
 
+/// Get-only candidates for the original-root checked-support/cut route.
+/// No old shadow/wide environment gate applies: the root's frozen policy and
+/// BOTH new capability predicates govern it. Neither factory can run here.
+pub(crate) fn preinitialized_root_cut_engines() -> [Option<&'static dyn GemmEngine>; 2] {
+    [
+        SOUND_GPU_CROWN_ENGINE
+            .get()
+            .and_then(Option::as_ref)
+            .map(|e| e.as_ref()),
+        WIDE_SOUND_GPU_CROWN_ENGINE
+            .get()
+            .and_then(Option::as_ref)
+            .map(|e| e.as_ref()),
+    ]
+}
+
 /// Observe an already-materialized resident Cut-CROWN backend without invoking
 /// either process-global factory.
 #[inline]
@@ -1050,7 +1064,7 @@ pub fn is_sound_gpu_crown_required() -> bool {
 /// the gate is engaged this returns `None`, so the caller takes its proven-sound
 /// CPU fallback — even if a fully-capable GPU engine was handed in.
 ///
-/// NOTE (corrected 2026-07-05): the five verdict-relevant CROWN sites now call
+/// NOTE: the five verdict-relevant CROWN sites now call
 /// [`gpu_crown_backward_route`] (which *permits* a sound GPU-resident backward to
 /// decide a verdict under the gate), NOT this helper. This `None`-masking variant
 /// has only test callers and is retained as the strict "GPU never decides a bound"

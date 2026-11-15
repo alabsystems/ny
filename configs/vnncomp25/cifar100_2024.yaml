@@ -84,6 +84,140 @@ attack:
 # the verifier — see `concurrent_presets_never_also_hold_a_reserve`, which
 # checks the effective reserve through the real policy function.
 margin_row:
+  # #breakpoint-dual: user-directed default activation for this category in
+  # both the 2025 and 2026 routes. Four untrusted search steps feed the existing
+  # certified node evaluator. The automatic tier uses at most 4 s / 5% of
+  # remaining time, 8192 nodes per objective and 256 MiB of state. Dense row
+  # estimates >=64 MiB select one objective, otherwise at most two.
+  # Competition benefit and a full both-year regression comparison remain unmeasured.
+  frozen_dual_bab: true
+  frozen_dual_refine_steps: 4
+  # #mr-stack + #mr-errlane (throughput plan B5 + B3) ARMED 2026-09-26 on the scratchpad/mrab A/B (pin ny_wave5_b44d1404b,
+  # official 100 s, 3 reps x {ctl, stack, stack+envelope}): cifar100 idx_2050 and idx_4921 timeout 3/3 -> UNSAT 3/3; idx_1298
+  # 91 -> 68 s, idx_3894 93 -> 71 s, idx_7258 61 -> 47 s; tiny idx_2146/7943 +54-106% tree expansions (no verdict change).
+  # Stacking ALONE loses rows (3894 unknown 3/3) — only the pair ships. The envelope dominates the per-column penalty
+  # (worst max_pen_env 6.0e-9); stacking is bit-identical.
+  domain_stack: true
+  err_envelope: envelope
+  # #dom-alpha-closure-gate ARMED 2026-09-01. Arms the closure ladder so the
+  # lane escalates on its OWN child-closure fraction; `bab.rs` then fires the
+  # per-domain alpha ascent when tier >= TIER_BETA_DEEP.
+  #
+  # WHY: domain_alpha is abc's per-domain alpha with parent warm-start
+  # (its decl cites domain_updater.py:123-128) and was armed by NOTHING.
+  # Armed GLOBALLY it converts idx_5127_sidx_993 but costs banked proofs.
+  # Gated on the closure signal it fires ONLY where the lane has already
+  # stalled -- where the row was going to be lost anyway, so the cost is free.
+  #
+  # MEASURED, this config vs shipped, 79 banked rows (50 unsat + 29 sat):
+  #   held 79, lost 0, flips 0; the gate fired on ONE row (8 ascent calls)
+  #   idx_5127_sidx_993: timeout -> UNSAT, certified (ledger=Some(true)),
+  #   reproduced 5/5 and on this shipped config at 85.3s.
+  # max_tier 2 stops below TIER_EPOCH, whose root-gain discard is a measured
+  # regression. A STATIC gate on banked wall was tested and REFUTED.
+  # #margin-row-col-retire ARMED 2026-09-15 — ny's tree-level spec pruning.
+  #
+  # WHAT: retires a margin column once an ancestor has certified it closed, so
+  # DESCENDANTS RECOMPUTE ONLY THE SURVIVING COLUMNS. cifar100 carries 99
+  # objectives per domain and today every descendant re-derives all 99 even
+  # where an ancestor already certified closure. Structurally this is
+  # alpha-beta-CROWN's `prune_after_crown`.
+  #
+  # MEASURED, one pinned binary, official 100 s, zero NY_*:
+  #   CONVERSION: idx_5831_sidx_5506 timeout@99s (control) -> unsat@93s (armed),
+  #     engaged with its own observable (cr_lines=9 newly=1 retired=2 survivors=1).
+  #     SOUND: abc / NeuralSAT / PyRAT / NNV all say unsat, ZERO tools say sat.
+  #   MOAT: 15 banked unsats at 0.72-0.95 budget utilisation — the rows a
+  #     slowdown kills first — 15/15 HELD, 0 lost, 0 sat. EIGHT of those are
+  #     GENUINE ENGAGEMENT TESTS (cr_lines>0) and all eight held, including
+  #     idx_5242_sidx_1208, the campaign's first-ever conversion, where the
+  #     lever fires 8 times and the row still proves (59 s vs 79.8 s banked).
+  #   RARITY: 0 further conversions in 56 more resnet_medium rows (pooled ~1 in
+  #     57). This is worth ONE row (+0.53 published board), not a front. It is
+  #     armed because it is free when it does not fire: it engaged on 44/45
+  #     timeout rows but only 8/15 unsat rows, since retirement needs an
+  #     ancestor to have certified closure, which fast proofs never reach.
+  #
+  # resnet_large is unaffected by construction: cr_lines=0 there, so the lever
+  # provably never acts on that half of the category.
+  column_retire: true
+  # #bi-topk — DELIBERATELY NOT ARMED HERE. `#auto-alloc` owns this parameter.
+  #
+  # The hand-armed `bi_topk: 128` converted idx_9372_sidx_3515 (10/10, control
+  # 0/3, moat 80/80) and that measurement stands. But arming it in the yaml and
+  # ALSO running the allocator is self-defeating: the allocator prices the root
+  # from the value it is given, so a pre-narrowed `topk` drops the work proxy
+  # ~4x (7.48 -> ~1.9), the root looks affordable, and it declines to shed
+  # `interm_alpha` — losing idx_1280_sidx_5310, the conversion that shed buys.
+  #
+  # Hand-calibrating a parameter the allocator exists to choose is the very
+  # defect this category has four times over. So the yaml states the CEILING
+  # (absent = the full-work 1024 default) and the allocator narrows per model.
+  closure_adaptive: true
+  closure_max_tier: 2
+  # #branch-reduceop + #interm-alpha: the MEASURED conversion pair.
+  # 2026-08-30, official 100s, 171 rows (all 124 banked-timeout + all 47
+  # banked-unsat), engagement 171/171 armed so the nulls are REAL not VOID:
+  #   pool 124 -> 1 unsat (idx_5242_sidx_1208), 54 timeout, 69 unknown
+  #   moat  47 -> 47 unsat, ZERO breaks, mean wall 43.0s (21.9-71.2)
+  # Neither lever converts alone: base timeout 3/3 (frontier -0.03711);
+  # reduceop alone timeout 6/6 (-0.00301); the pair unsat 5/5. reduceop reaches
+  # better-ranked domains (De Palma eq. 22, which abc's own tuned cifar100 and
+  # tinyimagenet configs select) and stalls 0.003 short; interm_alpha's
+  # per-start-node relaxation closes it. More expansion does NOT substitute:
+  # k_trunk=1 buys 5.8x the expansions and a WORSE frontier (-0.05918).
+  # YAML ROUTE PROVEN 2026-08-30 with zero NY_* in the environment:
+  #   control (keys absent) -> interm_alpha_armed=0, reduceop mode=min, timeout
+  #   armed   (keys below)  -> interm_alpha_armed=1, mode=max 10/10, UNSAT
+  # That proof is required, not inferred: run_instance.sh exports zero NY_*,
+  # and this key route was measured DARK on 2026-08-27 (space.rs:1971).
+  # SOUND: reduceop is ranker-only; interm_alpha intersects shrink-only and
+  # alpha*z <= relu(z) holds for any alpha in [0,1].
+  branch_reduce_max: true
+  # #branch-parent-lift: fold the branching scores the expansion ALREADY paid
+  # for into the child bound floor. Each scored candidate's two children COVER
+  # the parent, so min(l_i, r_i) lower-bounds it and max_i of that is free
+  # evidence ny was discarding for all but the one candidate it split on.
+  # MEASURED 2026-08-30, official 100s, 171 rows, engagement 124/124 pool rows:
+  #   converts idx_8739_sidx_1540 (timeout -> unsat), a row the armed pair alone
+  #     does NOT convert
+  #   moat 47/47 unsat, ZERO breaks
+  #   wall cost ZERO (mean ia_secs 18.08 armed vs 18.15 unarmed)
+  #   FEWER expansions on 3 of 5 dose-response rows (386->346, 146->125, 324->304)
+  # It is not mainly a tightener: per expansion it gains +0.05-0.09 on the parent
+  # but only ~+0.0007 reaches the frontier, because it lifts the domain being
+  # EXPANDED while the frontier is the min over all OPEN domains. The payoff is
+  # DOMAIN ELIMINATION, which on an expansion-limited front is returned budget.
+  # SOUND, and not trust-free: l_i/r_i are the same certified concretize_lower
+  # outputs the expansion already CLOSES children on, so that half is inherited.
+  # It additionally needs a premise nothing else in the lane uses -- that a
+  # candidate's two children COVER the parent. That holds for both candidate
+  # kinds (trunk = ReLU sign dichotomy, head = y_i>=0 vs y_i<=0) and is recorded
+  # as bab.rs::CANDIDATES_ARE_A_COVER. A future non-dichotomy candidate would
+  # break it with every existing test green, which is why it is MoatRisk::High.
+  parent_lift: true
+  # #clip-and-verify: abc's OWN per-node intermediate tightening
+  # (`clip_interm_domain`), which abc enables on exactly cifar100 and
+  # tinyimagenet. ny implements the same algorithm in the margin-row lane citing
+  # the same paper (Zhou et al., NeurIPS 2025) — and it was DARK on the proving
+  # lane: the `clip:` block below sits under top-level `bab:`, i.e. the GRAPH
+  # engine, not this one. `clip_rows` is REQUIRED: it defaults false, and without
+  # retained rows `halfspaces_for_splits` cannot build a halfspace at all.
+  # MEASURED 2026-08-31, official 100s:
+  #   idx_1798_sidx_1061 timeout -> UNSAT 5 of 8 reps, certified
+  #     (ledger=Some(true), root_bound=-0.1959, exp=404, maxDepth=15)
+  #   MOAT 47/47 unsat, ZERO breaks — including all five thin-margin rows:
+  #     idx_9883 86.0s (9.5s margin), idx_484 84.2s, idx_2993 81.9s,
+  #     idx_8012 81.7s, idx_5410 80.2s
+  #   WALL COST ZERO: moat mean 51.2s, no row above 90s. idx_484 proves FASTER
+  #     under clip (84.2s) than on the shipped config (87.3s).
+  # Contrast `interm_alpha: 5`, which also converts idx_1798 but adds 7-10s and
+  # LOST idx_484 + idx_9883 (net -10, docs/IDX1798_NOT_BANKABLE_2026-08-31.md).
+  # Clip buys the same row for free. SOUND: the halfspaces are the certified
+  # line minus its own recovered slack, so a wrong one costs tightness only.
+  clip_interm: true
+  clip_rows: true
+  interm_alpha: 2
   adaptive_reserve: true
   concurrent: true
   root_f32: true
@@ -144,6 +278,44 @@ margin_row:
   # the ~42s its proof needs, and the row did NOT convert.
   alpha_opt: true
 
+  # #alpha-cols-min ARMED 2026-09-22 — the ascent was steering by the WRONG
+  # GRADIENT and had been since it shipped.
+  #
+  # THE DEFECT. `alpha_opt.rs:854-861` maximizes `worst = scored[0].0`, the
+  # single MINIMUM column, but builds its direction from `mean_supergradient`
+  # over the `cfg.cols` = 8 worst columns. The objective is a MIN; the gradient
+  # was a MEAN. Seven non-binding columns dilute the direction for the one that
+  # defines the objective. ny's own pre-registered disagreement probe reads FUND
+  # on these rows (frac=0.228, cos_mean=0.639).
+  #
+  # MEASURED, pin ny_specalpha_0301 (sha256 c82a6301197412d0), official 100 s
+  # budget, isolated --configs-dir, engagement asserted per run via `cols=` in
+  # the `[alpha-opt] done` line (a mismatch VOIDs the row):
+  #   ROOT      published_guard -0.722016 (cols=1) vs -0.745390 (cols=8)
+  #             = +0.0234 on the PUBLISHED certified root. Monotone
+  #             dose-response 8 -> 2 -> 1 (-0.740904 / -0.729086 / -0.721090
+  #             frozen-frame), which noise does not produce.
+  #   MOAT      51/51 banked cifar100 unsats HELD, 0 lost, 0 void — the whole
+  #             banked set, both models (25 medium + 26 large).
+  #   WALL      NOT a cost. On the 15 moat rows that ran slowest, a shipped-
+  #             preset control is SLOWER than this arm on every one measured
+  #             (e.g. 70.9 vs 65.8 s, 68.7 vs 62.4 s, 70.4 vs 66.4 s); the
+  #             gap against the BANK is stale-bank, not this lever.
+  #   MARGIN    idx_5831, 4 reps/arm, 8/8 unsat: 85.08 s mean (spread 0.74)
+  #             vs 92.87 s (spread 3.09). -7.8 s and 4x tighter scatter.
+  #
+  # ⚠ HONEST SCOPE: this converts NOTHING on its own — 0 of 27 resnet_medium
+  # gap rows at the official budget, void=0, fully powered. It is armed as a
+  # STRICT IMPROVEMENT (better published root, less wall, clean moat), not as a
+  # conversion. The gap rows need ~15-30 more expansions and this does not
+  # supply them.
+  #
+  # ⚠ `alpha_cols` has exactly ONE functional consumer —
+  # `.take(cfg.cols.min(nf).max(1))` at alpha_opt.rs:858 — so it selects a
+  # search DIRECTION only. Every candidate is re-scored by the unchanged
+  # certified `eval`, and `cfg.guard` reverts unless the independently
+  # recomputed published root improves. It cannot publish an unsound bound.
+  alpha_cols: 1
 bab:
   # #root-cap-100s: hard-cap the ROOT alpha-CROWN warmup (and the
   # intermediate-bound collection inside it) so the margin-row BaB actually gets
@@ -190,7 +362,6 @@ bab:
     # graph engine) for this high-dim conv net (3072-element input) — input-splitting
     # is hopeless. candidates/reduceop still tune kFSB. See branching.rs.
     candidates: 7
-    reduceop: max
     # Exact wave-selector mirrors for governed search; runtime is unchanged.
     kfsb_multi_candidates: 7
     kfsb_multi_reduceop: max
@@ -310,7 +481,6 @@ bab:
     # for controlled work; ship only after the evidence rule in the cited
     # lever-census §8 is actually met.
   beta_crown:
-    lr_alpha: 0.1
     lr_beta: 0.2
     iterations: 10
   # Match the reference Complete Clipping policy for this ResNet lane: tighten

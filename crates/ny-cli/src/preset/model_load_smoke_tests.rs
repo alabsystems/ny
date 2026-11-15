@@ -27,7 +27,16 @@
 //!      `benchmarks/` — reported PASS while enforcing exactly nothing. That is
 //!      how a bare-worktree control talked a lane into calling a REAL failure
 //!      "inherited". The real-model guard therefore lives in the explicit
-//!      `external-vnncomp` lane, where absent data is an actionable failure.
+//!      `external-vnncomp` lane, where absent data FAILS BOTH tests: the load
+//!      guard first loads every model that IS present (a load failure is its
+//!      own, earlier, panic), prints its `model file(s) checked` line, and
+//!      then fails naming how many inputs it could not check; and
+//!      `shipped_preset_benchmark_data_is_present` fails naming every missing
+//!      path and the stake it leaves unguarded. Neither test returns success
+//!      over data it did not see, whichever one is selected by name. So a
+//!      partial checkout neither aborts the guard before its loads nor reads
+//!      as a load regression, and gate lane [i] — which can tell the guard's
+//!      absent-data failure from a load failure by that line — reports VOID.
 //!   3. A preset whose benchmark root has no recorded stake fails
 //!      `every_shipped_preset_declares_its_banked_score_at_risk`, which needs no
 //!      benchmark data at all — so a new preset cannot enter the repo without
@@ -363,12 +372,94 @@ fn is_benchmark_repo_checkout(data_root: &Path) -> bool {
     data_root.join(".git").exists() || data_root.join("setup.sh").is_file()
 }
 
+/// Is `path` (below `data_root`) part of the benchmark repository's committed
+/// tree at its checked-out `HEAD`?
+///
+/// This separates the two meanings of "a category directory is missing from a
+/// checkout". A path the checkout's own `HEAD` carries but the disk does not is
+/// DATA THIS BOX LACKS — a sparse checkout (`git sparse-checkout`, which this
+/// Mac's `vnncomp2025` clone is: 5 of 26 categories materialized) or files
+/// deleted from the working tree. A path `HEAD` does not carry is a PRESET
+/// DEFECT: no download of this repository can ever satisfy it. Reading the
+/// first as the second made lane [i] report `PRESET POINTS AT A MISSING
+/// CATEGORY` for `acasxu_2023` on a box that simply had not materialized it,
+/// and the panic aborted the guard before one present model was loaded.
+///
+/// `false` whenever git cannot answer (a `setup.sh`-only checkout without a
+/// `.git`): the caller then keeps treating the path as a preset defect, the
+/// strict reading.
+#[cfg(feature = "external-vnncomp")]
+fn tracked_at_checkout_head(data_root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(data_root) else {
+        return false;
+    };
+    if relative.as_os_str().is_empty() {
+        return false;
+    }
+    // `ls-tree` resolves pathspecs against the working directory, so `-C
+    // data_root` is right even when the year root is a subdirectory of the
+    // repository (or a symlink to one).
+    git_in_checkout(data_root)
+        .args(["ls-tree", "--name-only", "HEAD", "--"])
+        .arg(relative)
+        .output()
+        .is_ok_and(|output| output.status.success() && !output.stdout.is_empty())
+}
+
+/// Git's repository-local environment: `git rev-parse --local-env-vars` (git
+/// 2.50) plus the push-quarantine path — the same list `tests/conftest.py`
+/// drops for the pytest suite.
+#[cfg(feature = "external-vnncomp")]
+const GIT_REPOSITORY_LOCAL_ENV: [&str; 16] = [
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_QUARANTINE_PATH",
+];
+
+/// `git -C <year root>` with git's repository-local environment removed.
+///
+/// Git resolves the repository from `GIT_DIR` BEFORE it looks at `-C`, and git
+/// itself exports `GIT_DIR` to what it runs from a linked worktree (hooks,
+/// `git bisect run`, `git rebase -x`). With it inherited, the question "does
+/// the BENCHMARK checkout's HEAD track this category?" was answered by the
+/// enclosing ny repository, which tracks none of them: every sparse category
+/// read as a preset defect again (`PRESET POINTS AT A MISSING CATEGORY`), the
+/// false red this classifier exists to remove. Measured 2026-10-08 on the
+/// release test binary: 31 `missing:` paths without `GIT_DIR`, that panic with
+/// it. The direction was strict (never a false VOID or pass), but a guard that
+/// changes its answer under `git bisect run` cannot be bisected.
+#[cfg(feature = "external-vnncomp")]
+fn git_in_checkout(data_root: &Path) -> std::process::Command {
+    let mut git = std::process::Command::new("git");
+    git.arg("-C").arg(data_root);
+    for name in GIT_REPOSITORY_LOCAL_ENV {
+        git.env_remove(name);
+    }
+    git
+}
+
 /// One preset the guard could NOT check because its benchmark data is absent.
 #[cfg(feature = "external-vnncomp")]
 struct AbsentData {
     preset: String,
     root_rel: String,
-    data_root: PathBuf,
+    /// The exact path this box lacks.
+    missing: PathBuf,
+    /// Why it counts as absent data rather than a preset defect.
+    why: &'static str,
 }
 
 /// Every shipped preset's model inventory, plus the presets whose benchmark data
@@ -394,7 +485,17 @@ fn inventories(stakes: &BTreeMap<String, RootStake>) -> (Vec<PresetInventory>, V
             absent.push(AbsentData {
                 preset,
                 root_rel,
-                data_root,
+                missing: data_root,
+                why: "benchmark repository not checked out",
+            });
+            continue;
+        }
+        if !root.is_dir() && tracked_at_checkout_head(&data_root, &root) {
+            absent.push(AbsentData {
+                preset,
+                root_rel,
+                missing: root,
+                why: "tracked at the checkout's HEAD but not on disk (sparse or partial checkout)",
             });
             continue;
         }
@@ -412,6 +513,15 @@ fn inventories(stakes: &BTreeMap<String, RootStake>) -> (Vec<PresetInventory>, V
             .as_deref()
             .unwrap_or("instances.csv");
         let csv_path = root.join(csv_name);
+        if !csv_path.is_file() && tracked_at_checkout_head(&data_root, &csv_path) {
+            absent.push(AbsentData {
+                preset,
+                root_rel,
+                missing: csv_path,
+                why: "tracked at the checkout's HEAD but not on disk (sparse or partial checkout)",
+            });
+            continue;
+        }
         assert!(
             csv_path.is_file(),
             "PRESET POINTS AT A MISSING INSTANCE LIST — {preset} declares general.csv_name \
@@ -434,6 +544,122 @@ fn inventories(stakes: &BTreeMap<String, RootStake>) -> (Vec<PresetInventory>, V
         });
     }
     (out, absent)
+}
+
+/// The `benchmarks/vnncompYYYY` year root a repo path lives under, if any.
+#[cfg(feature = "external-vnncomp")]
+fn year_data_root(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|ancestor| {
+            ancestor
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("vnncomp"))
+        })
+        .map(Path::to_path_buf)
+}
+
+/// Why a benchmark file missing from disk is DATA this box lacks rather than a
+/// defect, if it is: its year root is not a checkout, the checkout's `HEAD`
+/// tracks it, or only its `.gz` exists (on disk or at `HEAD`) because the
+/// repository's `setup.sh` has not unpacked it here — VNN-COMP repositories
+/// track `onnx/<model>.onnx.gz` and the instance lists name `onnx/<model>.onnx`.
+/// `None` means nothing explains the absence: a defect for the caller to fail.
+#[cfg(feature = "external-vnncomp")]
+fn absent_data_reason(path: &Path) -> Option<&'static str> {
+    let data_root = year_data_root(path)?;
+    if !is_benchmark_repo_checkout(&data_root) {
+        return Some("benchmark repository not checked out");
+    }
+    if tracked_at_checkout_head(&data_root, path) {
+        return Some("tracked at the checkout's HEAD but not on disk (sparse or partial checkout)");
+    }
+    let mut gz = path.as_os_str().to_owned();
+    gz.push(".gz");
+    let gz = PathBuf::from(gz);
+    if gz.is_file() || tracked_at_checkout_head(&data_root, &gz) {
+        return Some(
+            "only its .gz is in the checkout: the repository's setup.sh has not unpacked it here",
+        );
+    }
+    None
+}
+
+/// Waived models this box lacks for a DATA reason ([`absent_data_reason`]). A
+/// waived path nothing explains stays a defect for the guard to fail on.
+#[cfg(feature = "external-vnncomp")]
+fn absent_waived_models(waivers: &[LoadWaiver]) -> Vec<AbsentData> {
+    let root = repo_root();
+    let mut out = Vec::new();
+    for waiver in waivers {
+        let path = root.join(&waiver.model);
+        if path.exists() {
+            continue;
+        }
+        let Some(why) = absent_data_reason(&path) else {
+            continue;
+        };
+        out.push(AbsentData {
+            preset: format!("<model-load waiver> {}", waiver.model),
+            root_rel: String::new(),
+            missing: path,
+            why,
+        });
+    }
+    out
+}
+
+/// Models a present preset's instance list names that this box lacks for a
+/// DATA reason ([`absent_data_reason`]). The guard does not load them; a
+/// missing model nothing explains still reaches the loader and FAILS as
+/// MISSING-MODEL-FILE.
+#[cfg(feature = "external-vnncomp")]
+fn absent_inventory_models(inventories: &[PresetInventory]) -> Vec<AbsentData> {
+    let mut out = Vec::new();
+    for inventory in inventories {
+        for model in &inventory.models {
+            let path = inventory.root.join(model);
+            if path.exists() {
+                continue;
+            }
+            if let Some(why) = absent_data_reason(&path) {
+                out.push(AbsentData {
+                    preset: inventory.preset.clone(),
+                    root_rel: inventory.root_rel.clone(),
+                    missing: path,
+                    why,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Render the absent-data inventory with each entry's exact missing path and stake.
+#[cfg(feature = "external-vnncomp")]
+fn absent_report(absent: &[AbsentData], stakes: &BTreeMap<String, RootStake>) -> String {
+    absent
+        .iter()
+        .map(|entry| {
+            let stake = if entry.root_rel.is_empty() {
+                "SCORE AT RISK: see the waiver's recorded cost".to_owned()
+            } else {
+                stake_label(&entry.root_rel, stakes)
+            };
+            format!(
+                "{}\n      root:    {}\n      missing: {}\n      why:     {}\n      {stake}",
+                entry.preset,
+                if entry.root_rel.is_empty() {
+                    "-"
+                } else {
+                    entry.root_rel.as_str()
+                },
+                entry.missing.display(),
+                entry.why,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n  ")
 }
 
 /// Classify a loader failure so the report names the CAUSE, not just the diff.
@@ -618,47 +844,27 @@ fn every_shipped_preset_model_still_loads() {
     );
 
     let stakes = score_at_risk();
-    let (inventories, absent) = inventories(&stakes);
+    let (inventories, mut absent) = inventories(&stakes);
+    let waivers = load_waivers();
+    absent.extend(absent_inventory_models(&inventories));
+    absent.extend(absent_waived_models(&waivers));
 
-    // ABSENT DATA IS A HARD FAILURE.
-    //
-    // The old code printed a note and returned Ok, so a worktree with no
-    // `benchmarks/` reported PASS while checking zero models. That vacuous green
-    // is how a bare-worktree control convinced a lane that a REAL load failure
-    // was "inherited". Absent data now fails, loudly, with the stake it is
-    // failing to protect.
-    let absent_roots: BTreeSet<String> =
-        absent.iter().map(|entry| entry.root_rel.clone()).collect();
-    let (absent_total, absent_benchmarks) = total_at_risk(&absent_roots, &stakes);
-    let absent_report: Vec<String> = absent
-        .iter()
-        .map(|entry| {
-            format!(
-                "{}\n      root:    {}\n      missing: {}\n      {}",
-                entry.preset,
-                entry.root_rel,
-                entry.data_root.display(),
-                stake_label(&entry.root_rel, &stakes)
-            )
-        })
-        .collect();
+    // Absent data does not stop the loads and is never passed. This guard
+    // loads every model that IS on the box first (a partial checkout used to
+    // abort it before the first load), so a model that stopped loading fails
+    // with its own panic; only then does it fail for the inputs it could not
+    // check (the last assertion below). `shipped_preset_benchmark_data_is_present`
+    // names each missing path. There is deliberately NO early return here, not
+    // even when nothing at all is present: the first draft of this split (in
+    // review, never on main) returned success in that case, so selecting this
+    // test by name on a box with no benchmark data exited 0 having loaded
+    // nothing — the vacuous green the module header describes (TEST_CONFORMANCE:
+    // no early success return when a prerequisite is absent). An empty inventory
+    // with nothing absent is still a guard enforcing nothing.
     assert!(
-        absent.is_empty(),
-        "BENCHMARK DATA IS NOT CHECKED OUT — this guard verified NOTHING for {} preset(s) \
-         covering {absent_benchmarks} benchmark(s) worth {absent_total:.1} banked normalized. A \
-         pass here would be VACUOUS, and a vacuous pass is exactly how a real load failure gets \
-         mistaken for an inherited one.\n\nFix it by making the data reachable — \
-         benchmarks/download_benchmarks.sh, or in a worktree symlink the year roots from your \
-         main checkout:\n    ln -sfn <main-checkout>/benchmarks/vnncomp2025 \
-         <worktree>/benchmarks/vnncomp2025\n\nThe default hermetic suite can run without the \
-         external-vnncomp feature, but a selected external conformance lane never turns missing \
-         data into a pass.\n\n  {}",
-        absent.len(),
-        absent_report.join("\n  ")
-    );
-    assert!(
-        !inventories.is_empty(),
-        "no shipped preset produced a model inventory — the guard would enforce nothing"
+        !inventories.is_empty() || !absent.is_empty(),
+        "no shipped preset produced a model inventory and no data is absent — the guard would \
+         enforce nothing"
     );
 
     // Load each distinct (model file, optimization-flag set) ONCE even when
@@ -677,6 +883,11 @@ fn every_shipped_preset_model_still_loads() {
         let mut representatives: BTreeMap<String, (PathBuf, u64)> = BTreeMap::new();
         for model in &inventory.models {
             let path = inventory.root.join(model);
+            if absent.iter().any(|entry| entry.missing == path) {
+                // Data this box lacks: reported by
+                // shipped_preset_benchmark_data_is_present, never loaded or passed.
+                continue;
+            }
             let size = path.metadata().map(|meta| meta.len()).unwrap_or(u64::MAX);
             if load_all {
                 representatives.insert(model.clone(), (path, size));
@@ -708,14 +919,20 @@ fn every_shipped_preset_model_still_loads() {
     // Every WAIVED model is loaded unconditionally, even when the family sample
     // would have skipped it: the waiver list is the debt ledger, and a debt that
     // silently disappears from the sample can never be shown to be paid off.
-    let waivers = load_waivers();
     let root = repo_root();
     let sampled: BTreeSet<PathBuf> = planned.keys().map(|(path, _)| path.clone()).collect();
+    let absent_paths: BTreeSet<&Path> =
+        absent.iter().map(|entry| entry.missing.as_path()).collect();
     for waiver in &waivers {
         let path = root.join(&waiver.model);
         if sampled.contains(&path) {
             // Already sampled: a preset entry covers it, with that preset's own
             // flags.
+            continue;
+        }
+        if absent_paths.contains(path.as_path()) {
+            // Data this box lacks (listed by absent_waived_models): reported by
+            // shipped_preset_benchmark_data_is_present, never loaded or passed.
             continue;
         }
         assert!(
@@ -819,11 +1036,106 @@ fn every_shipped_preset_model_still_loads() {
             eprintln!("  {entry}");
         }
     }
+    // Printed only after every assertion about the models that ARE here has
+    // held. Gate lane [i] requires this exact line before it will read the
+    // absent-data failure below as VOID instead of FAIL.
     eprintln!(
         "preset load smoke: {} model file(s) checked across {checked_presets} preset(s) (mode={})",
         planned.len(),
         if load_all { "all" } else { "family-sample" }
     );
+    assert!(
+        absent.is_empty(),
+        "BENCHMARK DATA IS NOT ON THIS BOX — every model that IS here loaded ({} model file(s) \
+         across {checked_presets} preset(s)), but {} input(s) could NOT be checked because this \
+         box lacks them. This is VOID, not a pass: the guard cannot vouch for a model it did not \
+         load. Run shipped_preset_benchmark_data_is_present for each missing path, why it counts \
+         as absent data rather than a preset defect, and the stake it leaves unguarded.",
+        planned.len(),
+        absent.len()
+    );
+}
+
+/// THE DATA HALF OF THE GUARD. Every benchmark input a shipped preset (or a
+/// recorded waiver) needs is on this box.
+///
+/// ABSENT DATA IS A HARD FAILURE, never a vacuous pass: the guard above cannot
+/// vouch for a model it could not load, and fails for it too once its loads are
+/// done. This is a separate test so that ITS failure MEANS exactly "this box
+/// lacks data" — each entry names the exact missing path, why it counts as
+/// absent data rather than a preset defect, and the stake it leaves unguarded
+/// — and gate lane [i] reports the pair as VOID (exit distinct from a FAIL)
+/// instead of as a load regression.
+#[cfg(feature = "external-vnncomp")]
+#[test]
+fn shipped_preset_benchmark_data_is_present() {
+    let stakes = score_at_risk();
+    let (inventories, mut absent) = inventories(&stakes);
+    absent.extend(absent_inventory_models(&inventories));
+    absent.extend(absent_waived_models(&load_waivers()));
+    let absent_roots: BTreeSet<String> = absent
+        .iter()
+        .filter(|entry| !entry.root_rel.is_empty())
+        .map(|entry| entry.root_rel.clone())
+        .collect();
+    let (absent_total, absent_benchmarks) = total_at_risk(&absent_roots, &stakes);
+    assert!(
+        absent.is_empty(),
+        "BENCHMARK DATA IS NOT ON THIS BOX — the model-load guard could not check {} input(s) \
+         covering {absent_benchmarks} benchmark(s) worth {absent_total:.1} banked normalized. \
+         This is VOID, not a pass: nothing was verified for them.\n\nFix it by making the data \
+         reachable — benchmarks/download_benchmarks.sh (a sparse checkout needs `git -C \
+         <year-root> sparse-checkout add benchmarks/<category>` and the repository's setup.sh), \
+         or in a worktree symlink the year roots from your main checkout:\n    ln -sfn \
+         <main-checkout>/benchmarks/vnncomp2025 <worktree>/benchmarks/vnncomp2025\n\n  {}",
+        absent.len(),
+        absent_report(&absent, &stakes)
+    );
+}
+
+/// Every `git` this guard runs against a benchmark checkout drops git's
+/// repository-local environment, so an inherited `GIT_DIR` (hooks, `git bisect
+/// run`, `git rebase -x` from a linked worktree) cannot redirect the query to
+/// the enclosing repository.
+#[cfg(feature = "external-vnncomp")]
+#[test]
+fn checkout_queries_drop_gits_repository_local_environment() {
+    let git = git_in_checkout(Path::new("benchmarks/vnncomp2025"));
+    let removed: BTreeSet<String> = git
+        .get_envs()
+        .filter(|(_, value)| value.is_none())
+        .map(|(name, _)| name.to_string_lossy().into_owned())
+        .collect();
+    let kept: Vec<String> = git
+        .get_envs()
+        .filter(|(_, value)| value.is_some())
+        .map(|(name, _)| name.to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        kept.is_empty(),
+        "the checkout query sets no variable: {kept:?}"
+    );
+    for name in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+    ] {
+        assert!(
+            removed.contains(name),
+            "{name} must be removed from the checkout query's environment; removed: {removed:?}"
+        );
+    }
+    assert_eq!(removed.len(), GIT_REPOSITORY_LOCAL_ENV.len());
+    let arguments: Vec<String> = git
+        .get_args()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(arguments, ["-C", "benchmarks/vnncomp2025"]);
 }
 
 #[test]

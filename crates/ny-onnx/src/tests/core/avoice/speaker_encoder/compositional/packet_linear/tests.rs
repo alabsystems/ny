@@ -65,12 +65,9 @@ fn test_ecapa_raw_input_prefix_graphs_extracted_3499() {
     }
 }
 
-/// Core regression for the direct-boundary alternative design (#3499):
+/// Core regression for the direct-boundary alternative design:
 /// the MFA bounds from direct raw-input certificates should be strictly no
 /// looser than the stage-local interval-chained MFA bounds.
-///
-/// Reference: designs/2026-03-13-issue-3499-linear-boundary-certificates-alternative.md
-/// Acceptance criterion 1.
 #[cfg_attr(not(debug_assertions), ntest::timeout(1800000))]
 #[test]
 #[cfg(feature = "external-avoice")]

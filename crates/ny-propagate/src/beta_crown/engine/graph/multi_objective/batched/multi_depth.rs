@@ -157,8 +157,17 @@ pub(super) fn expand_multi_objective_truth_table(
                     Ok(Some(child)) => {
                         next.push((child, first_phase.or(Some(is_active))));
                     }
-                    Ok(None) => {}
-                    Err(error) if error.is_infeasible_domain() => {}
+                    // #vit-margin-alpha-complex (P8): an empty leaf
+                    // half-space is an emptiness claim; counted for the fenced
+                    // run's gate (bookkeeping only).
+                    Ok(None) => super::super::containment_fence_lane::note_emptiness_claim(
+                        super::super::containment_fence_lane::EmptinessClaim::MultiDepth,
+                    ),
+                    Err(error) if error.is_infeasible_domain() => {
+                        super::super::containment_fence_lane::note_emptiness_claim(
+                            super::super::containment_fence_lane::EmptinessClaim::MultiDepth,
+                        );
+                    }
                     Err(_) => return Err(MultiDepthRefusal::ChildConstruction),
                 }
             }
@@ -289,7 +298,7 @@ mod tests {
                 .expect_err("duplicate cannot define a truth table"),
             MultiDepthRefusal::DuplicateDecision
         );
-        assert!(parent.history().constraints.is_empty());
+        assert_eq!((parent.history().constraints).len(), 0);
         assert_eq!(parent.depth(), 0);
     }
 
@@ -384,6 +393,6 @@ mod tests {
             .expect_err("five-second reserve should decline"),
             MultiDepthRefusal::DeadlineReserve
         );
-        assert!(parent.history().constraints.is_empty());
+        assert_eq!((parent.history().constraints).len(), 0);
     }
 }

@@ -364,7 +364,7 @@ impl WgpuDevice {
         // Keep the shared buffer-pool lock alive until readback completes.
         // Otherwise concurrent Rayon threads can recycle staging buffers
         // while a previous `map_async`/`unmap` cycle is still in flight,
-        // triggering wgpu's "Buffer ... is still mapped" validation panic (#3877).
+        // triggering wgpu's "Buffer... is still mapped" validation panic.
         let _pool_guard = pool;
 
         // === WRITE DATA TO BUFFERS ===
@@ -752,7 +752,7 @@ impl WgpuDevice {
         let mut result_lower = Self::read_buffer(&self.device, &staging_lower, output_size)?;
         let mut result_upper = Self::read_buffer(&self.device, &staging_upper, output_size)?;
 
-        // Defense-in-depth: sanitize NaN/Inf from GPU readback (#2785).
+        // Defense-in-depth: sanitize NaN/Inf from GPU readback.
         super::super::sanitize_readback(&mut result_lower, &mut result_upper);
 
         // Build output shape: [batch, heads, seq, dim]

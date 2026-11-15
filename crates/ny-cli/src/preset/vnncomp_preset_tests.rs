@@ -52,6 +52,429 @@ fn no_shipped_preset_arms_solver_dark_bound_paths() {
     );
 }
 
+/// #lowdim-bundle: the four typed lowdim-lane keys (varying-dims admission +
+/// Sigmoid, boundary alpha, in-lane leaf attack, the fold's shared worklist)
+/// parse as their typed fields and stay ABSENT from every shipped preset, so
+/// every scored run resolves them at their dark declaration defaults. Non-
+/// vacuity: the scan must parse at least one preset, and a preset that sets a
+/// key must round-trip it into the typed field (checked on a synthetic yaml).
+#[test]
+fn lowdim_bundle_keys_stay_dark_in_every_shipped_preset() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+    let mut parsed = 0usize;
+    let mut armed = Vec::new();
+    for year in ["vnncomp24", "vnncomp25", "vnncomp26"] {
+        let dir = root.join(year);
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("preset directory entry").path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).expect("readable shipped preset");
+            let preset: PresetConfig = serde_yaml::from_str(&text)
+                .unwrap_or_else(|error| panic!("preset {} must parse: {error}", path.display()));
+            parsed += 1;
+            let split = &preset.bab.branching.input_split;
+            if split.lowdim_varying_dims.is_some()
+                || split.lowdim_alpha_iters.is_some()
+                || split.lowdim_leaf_attack_every.is_some()
+                || split.lowdim_shared_worklist.is_some()
+                || split.lowdim_batch_engine.is_some()
+                || split.engine.is_some()
+            {
+                armed.push(path);
+            }
+        }
+    }
+    assert!(parsed > 0, "VOID: no shipped preset was parsed");
+    assert!(
+        armed.is_empty(),
+        "the #lowdim-bundle keys must stay absent from every shipped preset until measured: \
+         {armed:?}"
+    );
+    let synthetic: PresetConfig = serde_yaml::from_str(
+        "bab:\n  branching:\n    input_split:\n      lowdim_varying_dims: true\n      \
+         lowdim_alpha_iters: 20\n      lowdim_leaf_attack_every: 40\n      \
+         lowdim_shared_worklist: true\n      lowdim_batch_engine: bbe\n      \
+         engine: bbe\n",
+    )
+    .expect("the bundle keys parse");
+    let split = &synthetic.bab.branching.input_split;
+    assert_eq!(split.lowdim_varying_dims, Some(true));
+    assert_eq!(split.lowdim_alpha_iters, Some(20));
+    assert_eq!(split.lowdim_leaf_attack_every, Some(40));
+    assert_eq!(split.lowdim_shared_worklist, Some(true));
+    // M8a (#m8-input-split-batch): the two lane keys parse their tokens, and
+    // an unknown token fails the preset parse (deny_unknown_fields does not
+    // cover enum values; the serde enum does).
+    assert_eq!(
+        split.lowdim_batch_engine,
+        Some(ny_propagate::lowdim::LowDimBatchEngine::Bbe)
+    );
+    assert_eq!(
+        split.engine,
+        Some(ny_propagate::lowdim::InputSplitEngine::Bbe)
+    );
+    assert!(serde_yaml::from_str::<PresetConfig>(
+        "bab:\n  branching:\n    input_split:\n      lowdim_batch_engine: cuda\n",
+    )
+    .is_err());
+    assert!(serde_yaml::from_str::<PresetConfig>(
+        "bab:\n  branching:\n    input_split:\n      engine: graph\n",
+    )
+    .is_err());
+}
+
+#[test]
+fn qdq_activation_relaxation_stays_dark_in_every_resolvable_preset() {
+    // #smart-turn-qdq: the certified QDQ relaxation is REPORT-ONLY this round.
+    // The only yaml allowed to arm `model.qdq_activation_relaxation` is the
+    // explicitly-suffixed canary, which category resolution can never pick up
+    // — asserted directly below, so a rename cannot silently promote it.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+    let mut armed = Vec::new();
+
+    for year in ["vnncomp24", "vnncomp25", "vnncomp26"] {
+        let dir = root.join(year);
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("preset directory entry").path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).expect("readable shipped preset");
+            let preset: PresetConfig = serde_yaml::from_str(&text)
+                .unwrap_or_else(|error| panic!("preset {} must parse: {error}", path.display()));
+            if preset.model.qdq_activation_relaxation == Some(true) {
+                armed.push(
+                    path.strip_prefix(&root)
+                        .expect("preset below config root")
+                        .to_path_buf(),
+                );
+            }
+        }
+    }
+    armed.sort();
+    assert_eq!(
+        armed,
+        [
+            // The multi-input canary (#multi-input-propagation) layers the
+            // concat-view gate ON TOP of the QDQ gate, so the funnel's
+            // report-only latch stays engaged when the bounds half finally
+            // runs; it is equally suffixed and equally unreachable through
+            // category resolution (asserted below).
+            Path::new("vnncomp26/smart_turn_multimodal_2026_multiinput_canary.yaml").to_path_buf(),
+            Path::new("vnncomp26/smart_turn_multimodal_2026_qdq_canary.yaml").to_path_buf(),
+        ],
+        "only the suffixed canaries may arm the dark QDQ relaxation gate"
+    );
+
+    // And the canary must be unreachable through category resolution: the
+    // effective smart_turn preset (if any) must not arm the gate.
+    if let Some(effective) =
+        crate::commands::vnncomp::resolve_preset_path(&root, "smart_turn_multimodal_2026")
+    {
+        let preset = load_preset(&effective).expect("effective smart_turn preset loads");
+        assert_ne!(
+            preset.model.qdq_activation_relaxation,
+            Some(true),
+            "category resolution must never arm the QDQ canary: {}",
+            effective.display()
+        );
+    }
+}
+
+#[test]
+fn nn4sys_1d_cover_stays_dark_in_every_resolvable_preset() {
+    // #nn4sys-1d-cover: the exact one-axis complete cover is DARK in
+    // production. The only yaml allowed to arm any of its three keys is the
+    // explicitly suffixed canary, which category resolution can never pick up
+    // — asserted directly below, so a rename cannot silently promote it.
+    //
+    // Both halves matter and neither substitutes for the other: the first
+    // says WHICH file arms the keys, the second says the file a scored nn4sys
+    // run would actually load does not.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+    let mut armed = Vec::new();
+
+    for year in ["vnncomp24", "vnncomp25", "vnncomp26"] {
+        let dir = root.join(year);
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("preset directory entry").path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).expect("readable shipped preset");
+            let preset: PresetConfig = serde_yaml::from_str(&text)
+                .unwrap_or_else(|error| panic!("preset {} must parse: {error}", path.display()));
+            if preset.bab.nn4sys_1d_cover.is_some()
+                || preset.bab.nn4sys_1d_cover_depth.is_some()
+                || preset.bab.nn4sys_1d_cover_slice.is_some()
+            {
+                armed.push(
+                    path.strip_prefix(&root)
+                        .expect("preset below config root")
+                        .to_path_buf(),
+                );
+            }
+        }
+    }
+    armed.sort();
+    assert_eq!(
+        armed,
+        [Path::new("vnncomp25/nn4sys_1dcover_canary.yaml").to_path_buf()],
+        "only the suffixed canary may arm the #nn4sys-1d-cover keys"
+    );
+
+    // The canary must actually arm all THREE, or the delivery proof it exists
+    // to carry is vacuous — and the depth in particular, because the cover's
+    // pass is all-or-nothing and a master without its depth is inert.
+    let canary = load_preset(&root.join("vnncomp25/nn4sys_1dcover_canary.yaml"))
+        .expect("the canary preset loads");
+    assert_eq!(canary.bab.nn4sys_1d_cover, Some(true));
+    assert_eq!(canary.bab.nn4sys_1d_cover_depth, Some(24));
+    assert_eq!(canary.bab.nn4sys_1d_cover_slice, Some(0.25));
+
+    // And the canary must be unreachable through category resolution: the
+    // effective nn4sys preset must arm none of the three.
+    let effective = crate::commands::vnncomp::resolve_preset_path(&root, "nn4sys")
+        .expect("nn4sys resolves to a shipped preset");
+    assert!(
+        effective.ends_with("nn4sys.yaml"),
+        "category resolution must land on the production preset, not a canary: {}",
+        effective.display()
+    );
+    let preset = load_preset(&effective).expect("effective nn4sys preset loads");
+    assert_eq!(preset.bab.nn4sys_1d_cover, None);
+    assert_eq!(preset.bab.nn4sys_1d_cover_depth, None);
+    assert_eq!(preset.bab.nn4sys_1d_cover_slice, None);
+}
+
+#[test]
+fn multi_input_concat_stays_dark_in_every_resolvable_preset() {
+    // #multi-input-propagation: the concat-view mechanism is DARK. The only
+    // yaml allowed to arm `model.multi_input_concat` is the explicitly
+    // suffixed canary, which category resolution can never pick up — asserted
+    // directly below, so a rename cannot silently promote it.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+    let mut armed = Vec::new();
+
+    for year in ["vnncomp24", "vnncomp25", "vnncomp26"] {
+        let dir = root.join(year);
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("preset directory entry").path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).expect("readable shipped preset");
+            let preset: PresetConfig = serde_yaml::from_str(&text)
+                .unwrap_or_else(|error| panic!("preset {} must parse: {error}", path.display()));
+            if preset.model.multi_input_concat == Some(true) {
+                armed.push(
+                    path.strip_prefix(&root)
+                        .expect("preset below config root")
+                        .to_path_buf(),
+                );
+            }
+        }
+    }
+    armed.sort();
+    assert_eq!(
+        armed,
+        [Path::new("vnncomp26/smart_turn_multimodal_2026_multiinput_canary.yaml").to_path_buf()],
+        "only the suffixed canary may arm the dark multi-input concat gate"
+    );
+
+    // And the canary must be unreachable through category resolution: the
+    // effective smart_turn preset (if any) must not arm the gate.
+    if let Some(effective) =
+        crate::commands::vnncomp::resolve_preset_path(&root, "smart_turn_multimodal_2026")
+    {
+        let preset = load_preset(&effective).expect("effective smart_turn preset loads");
+        assert_ne!(
+            preset.model.multi_input_concat,
+            Some(true),
+            "category resolution must never arm the multi-input canary: {}",
+            effective.display()
+        );
+    }
+}
+
+#[test]
+fn patches_engine_wiring_stays_dark_in_every_resolvable_preset() {
+    // #patches-engine-refusal-containment / #fast-f32-prewarm-all-hosts
+    // (reports/measured-2026/cct_bound_gap_2026-08-31): both bound-path keys
+    // are DARK. The only yaml allowed to set either is the explicitly
+    // suffixed cct canary, which category resolution can never pick up —
+    // asserted directly below, so a rename cannot silently promote it.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+    let mut armed = Vec::new();
+
+    for year in ["vnncomp24", "vnncomp25", "vnncomp26"] {
+        let dir = root.join(year);
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("preset directory entry").path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).expect("readable shipped preset");
+            let preset: PresetConfig = serde_yaml::from_str(&text)
+                .unwrap_or_else(|error| panic!("preset {} must parse: {error}", path.display()));
+            if preset.bab.patches_engine_refusal_containment.is_some()
+                || preset.bab.fast_f32_prewarm.is_some()
+            {
+                armed.push(
+                    path.strip_prefix(&root)
+                        .expect("preset below config root")
+                        .to_path_buf(),
+                );
+            }
+        }
+    }
+    armed.sort();
+    assert_eq!(
+        armed,
+        [
+            Path::new("vnncomp26/challenging_certified_training_2026_patcheswiring_canary.yaml")
+                .to_path_buf()
+        ],
+        "only the suffixed canary may set the dark cct engine-wiring keys"
+    );
+
+    // And the canary must be unreachable through category resolution: the
+    // effective cct preset (if any) must not arm either gate.
+    if let Some(effective) =
+        crate::commands::vnncomp::resolve_preset_path(&root, "challenging_certified_training_2026")
+    {
+        let preset = load_preset(&effective).expect("effective cct preset loads");
+        assert_ne!(
+            preset.bab.patches_engine_refusal_containment,
+            Some(true),
+            "category resolution must never arm the patches-containment canary: {}",
+            effective.display()
+        );
+        assert_ne!(
+            preset.bab.fast_f32_prewarm,
+            Some(true),
+            "category resolution must never arm the fast-f32-prewarm canary: {}",
+            effective.display()
+        );
+    }
+}
+
+/// The engine-wiring canary must differ from the shipped cct preset by
+/// exactly its TWO typed treatment keys. Normalizing both and requiring full
+/// serialized equality pins every other loader, attack, and solver knob to
+/// the production values, so the canary measurement is attributable to the
+/// wiring pair alone.
+#[test]
+fn patcheswiring_canary_differs_by_exactly_the_two_typed_keys() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let production =
+        load_preset(&repo_root.join("configs/vnncomp26/challenging_certified_training_2026.yaml"))
+            .unwrap();
+    let canary =
+        load_preset(&repo_root.join(
+            "configs/vnncomp26/challenging_certified_training_2026_patcheswiring_canary.yaml",
+        ))
+        .unwrap();
+
+    assert_eq!(production.bab.patches_engine_refusal_containment, None);
+    assert_eq!(production.bab.fast_f32_prewarm, None);
+    assert_eq!(canary.bab.patches_engine_refusal_containment, Some(true));
+    assert_eq!(canary.bab.fast_f32_prewarm, Some(true));
+
+    let mut normalized_canary = canary;
+    normalized_canary.bab.patches_engine_refusal_containment =
+        production.bab.patches_engine_refusal_containment;
+    normalized_canary.bab.fast_f32_prewarm = production.bab.fast_f32_prewarm;
+    assert_eq!(
+        serde_json::to_value(&normalized_canary).unwrap(),
+        serde_json::to_value(&production).unwrap(),
+        "the patches-wiring canary may differ from the shipped cct preset only at \
+         bab.patches_engine_refusal_containment and bab.fast_f32_prewarm"
+    );
+}
+
+/// #dense-sparse-seed: `bab.crown_partial_dense_min_stable` is armed by the cct
+/// preset alone (plus its patches-wiring canary, which must stay identical to
+/// it outside its own two keys), at exactly alpha-beta-CROWN's 0.1 — and
+/// category resolution hands that value to the scored cct route. Arming it on
+/// any other category is a separate, measured decision that must edit this
+/// list.
+#[test]
+fn only_cct_arms_crown_partial_dense_min_stable() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+    let mut armed: Vec<(PathBuf, f64)> = Vec::new();
+
+    for year in ["vnncomp24", "vnncomp25", "vnncomp26"] {
+        let dir = root.join(year);
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("preset directory entry").path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).expect("readable shipped preset");
+            let preset: PresetConfig = serde_yaml::from_str(&text)
+                .unwrap_or_else(|error| panic!("preset {} must parse: {error}", path.display()));
+            if let Some(value) = preset.bab.crown_partial_dense_min_stable {
+                armed.push((
+                    path.strip_prefix(&root)
+                        .expect("preset below config root")
+                        .to_path_buf(),
+                    value,
+                ));
+            }
+        }
+    }
+    armed.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        armed,
+        vec![
+            (
+                Path::new("vnncomp26/challenging_certified_training_2026.yaml").to_path_buf(),
+                0.1,
+            ),
+            (
+                Path::new(
+                    "vnncomp26/challenging_certified_training_2026_patcheswiring_canary.yaml"
+                )
+                .to_path_buf(),
+                0.1,
+            ),
+        ],
+        "only the cct preset (and its canary) may arm bab.crown_partial_dense_min_stable"
+    );
+
+    let effective =
+        crate::commands::vnncomp::resolve_preset_path(&root, "challenging_certified_training_2026")
+            .expect("the cct category resolves an explicit preset");
+    let preset = load_preset(&effective).expect("effective cct preset loads");
+    assert_eq!(
+        preset.bab.crown_partial_dense_min_stable,
+        Some(0.1),
+        "category resolution must deliver the armed threshold: {}",
+        effective.display()
+    );
+}
+
 #[test]
 fn only_vnncomp25_cifar100_arms_root_alpha_phase_checkpoint() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
@@ -156,6 +579,35 @@ fn effective_cifar100_2024_preset_arms_kfsb_cert_reuse() {
 }
 
 #[test]
+fn breakpoint_category_defaults_resolve_on_both_competition_years() {
+    let configs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+    for category in ["cifar100_2024", "tinyimagenet_2024"] {
+        let expected = configs.join("vnncomp25").join(format!("{category}.yaml"));
+        let scored = crate::commands::vnncomp::resolve_preset_path(&configs, category)
+            .expect("the scored category must resolve a preset");
+        assert_eq!(
+            scored, expected,
+            "{category} must retain its effective category preset"
+        );
+        for year in [2025, 2026] {
+            let sweep = crate::commands::vnncomp::sweep_preset_path(&configs, year, category)
+                .expect("both competition years must resolve the category preset");
+            assert_eq!(
+                sweep, scored,
+                "{year} {category}: sweep and scored defaults disagree"
+            );
+            let preset = load_preset(&sweep).expect("the effective category preset must load");
+            assert_eq!(preset.margin_row.frozen_dual_bab, Some(true));
+            assert_eq!(preset.margin_row.frozen_dual_refine_steps, Some(4));
+            assert_eq!(preset.margin_row.frozen_dual_bab_secs, None);
+            assert_eq!(preset.margin_row.frozen_dual_bab_node_cap, None);
+            assert_eq!(preset.margin_row.concurrent, Some(true));
+            assert_eq!(preset.general.device.as_deref(), Some("wgpu"));
+        }
+    }
+}
+
+#[test]
 fn only_vnncomp25_acas_arms_relational_exact_gradient_wrapper() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
     let mut armed = Vec::new();
@@ -251,11 +703,181 @@ fn no_shipped_preset_arms_mo_cuda_bounded_shared_executor() {
     );
 }
 
+/// #vit-bank-gate + #vit-margin-alpha-complex (P8): the containment fence
+/// and its ORT adjudication are SCOPED TO vit_2023. They are verdict-surface
+/// changes — the fence refuses proofs (and, armed, fails closed on an
+/// unfenced root-terminal authority or any emptiness claim) — built as the
+/// vit bank gate, so no other category may ever set either key; a preset
+/// that does fails here. Arming them on vit_2023 itself is a measured
+/// decision that lands in its own commit (with its moat); this test permits
+/// it but does not require it, and prints the current vit state.
+#[test]
+fn mo_containment_fence_is_scoped_to_vit_2023() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+    let mut outside_scope = Vec::new();
+    let mut vit_state = Vec::new();
+    let mut parsed = 0usize;
+    let mut saw_vit = false;
+
+    for year in ["vnncomp24", "vnncomp25", "vnncomp26"] {
+        let dir = root.join(year);
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("preset directory entry").path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).expect("readable shipped preset");
+            let preset: PresetConfig = serde_yaml::from_str(&text)
+                .unwrap_or_else(|error| panic!("preset {} must parse: {error}", path.display()));
+            parsed += 1;
+            let is_vit = path.file_stem().and_then(|stem| stem.to_str()) == Some("vit_2023");
+            saw_vit |= is_vit;
+            for (key, set) in [
+                (
+                    "bab.mo_containment_fence",
+                    preset.bab.mo_containment_fence.is_some(),
+                ),
+                (
+                    "bab.mo_root_ort_adjudication",
+                    preset.bab.mo_root_ort_adjudication.is_some(),
+                ),
+            ] {
+                match (set, is_vit) {
+                    (true, true) => vit_state.push(format!("{} sets {key}", path.display())),
+                    (true, false) => outside_scope.push(format!("{} sets {key}", path.display())),
+                    (false, _) => {}
+                }
+            }
+        }
+    }
+
+    assert!(parsed > 0, "the shipped preset directories must resolve");
+    assert!(
+        saw_vit,
+        "the scope anchor configs/<year>/vit_2023.yaml must exist, or this scoping is vacuous"
+    );
+    eprintln!("[vit-bank-gate-scope] vit_2023 fence keys: {vit_state:?}");
+    assert!(
+        outside_scope.is_empty(),
+        "the containment fence and its ORT adjudication are the vit_2023 bank gate; no other \
+         shipped preset may set them: {outside_scope:?}"
+    );
+}
+
+/// #vit-v3-bankable: `bab.mo_cover_certify` is armed by no shipped preset
+/// until its measurement (the vit bank protocol, docs/engine_program/
+/// VIT_BANKABILITY.md) commits an arming.
+#[test]
+fn no_shipped_preset_arms_the_mo_cover_certify_key() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+    let mut armed = Vec::new();
+    let mut parsed = 0usize;
+    for year in ["vnncomp24", "vnncomp25", "vnncomp26"] {
+        let Ok(entries) = fs::read_dir(root.join(year)) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("preset directory entry").path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).expect("readable shipped preset");
+            let preset: PresetConfig = serde_yaml::from_str(&text)
+                .unwrap_or_else(|error| panic!("preset {} must parse: {error}", path.display()));
+            parsed += 1;
+            if preset.bab.mo_cover_certify.is_some() {
+                armed.push(format!(
+                    "{year}/{}",
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                ));
+            }
+        }
+    }
+    assert!(parsed > 0, "the shipped preset directories must resolve");
+    assert!(
+        armed.is_empty(),
+        "these shipped presets set bab.mo_cover_certify without a measurement commit: {armed:?}"
+    );
+}
+
+/// #vit-collector-throughput / #vit-batched-bilinear: the four collector-kernel
+/// keys ship DARK. They are throughput levers whose arming is a measured
+/// decision (and, for vit, no vit yaml ships before the P8 bank gate), so every
+/// shipped preset must omit all four until the commit that carries the
+/// measurement edits this test.
+#[test]
+fn no_shipped_preset_arms_vit_collector_kernel_keys() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+    let mut armed = Vec::new();
+    let mut parsed = 0usize;
+
+    for year in ["vnncomp24", "vnncomp25", "vnncomp26"] {
+        let dir = root.join(year);
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("preset directory entry").path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).expect("readable shipped preset");
+            let preset: PresetConfig = serde_yaml::from_str(&text)
+                .unwrap_or_else(|error| panic!("preset {} must parse: {error}", path.display()));
+            parsed += 1;
+            for (key, set) in [
+                (
+                    "bab.bilinear_rowpar_kernel",
+                    preset.bab.bilinear_rowpar_kernel.is_some(),
+                ),
+                (
+                    "bab.linear_position_stack",
+                    preset.bab.linear_position_stack.is_some(),
+                ),
+                (
+                    "bab.reciprocal_unbounded_upper",
+                    preset.bab.reciprocal_unbounded_upper.is_some(),
+                ),
+                (
+                    "bab.bilinear_gemm_kernel",
+                    preset.bab.bilinear_gemm_kernel.is_some(),
+                ),
+            ] {
+                if set {
+                    armed.push(format!("{} sets {key}", path.display()));
+                }
+            }
+        }
+    }
+
+    assert!(parsed > 0, "the shipped preset directories must resolve");
+    assert!(
+        armed.is_empty(),
+        "the vit collector-kernel keys must remain absent from every shipped preset until \
+         their own measured arming commit: {armed:?}"
+    );
+}
+
 #[test]
 fn cifar100_critical_alpha_bracket_uses_beta_crown_lr_not_adaptive_default() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let cifar = load_preset(&repo_root.join("configs/vnncomp25/cifar100_2024.yaml")).unwrap();
-    assert_eq!(cifar.bab.beta_crown.lr_alpha, Some(0.1));
+    // #general-defaults 2026-08-31: the yaml no longer STATES lr_alpha, because
+    // `BetaCrownConfig::default().alpha_lr` is now 0.1 -- the value 13 of the 14
+    // scored configs that set it were all writing by hand. The key's absence is
+    // therefore not a regression; what this test guards is the RESOLVED value,
+    // asserted below after `apply_preset`, which is strictly stronger than a yaml
+    // pin (it also catches a key that is present but overridden downstream).
+    // If the engine default ever drifts off 0.1, the assertion below fails.
+    assert!(
+        cifar.bab.beta_crown.lr_alpha.is_none_or(|v| v == 0.1),
+        "cifar100 may omit lr_alpha (default 0.1) or state 0.1, but not disagree"
+    );
 
     let mut config = BetaCrownConfig::default();
     apply_preset(&mut config, &cifar).unwrap();
@@ -416,8 +1038,18 @@ fn cifar100_branch_width_is_pinned_and_scoped() {
     assert_eq!(cifar.margin_row.k_trunk, Some(16));
 
     let tiny = load_preset(&repo_root.join("configs/vnncomp25/tinyimagenet_2024.yaml")).unwrap();
-    assert_eq!(tiny.margin_row.k_head, None);
-    assert_eq!(tiny.margin_row.k_trunk, None);
+    assert_eq!(
+        tiny.margin_row.k_head, None,
+        "k_head is still untransferred and unmeasured on tiny"
+    );
+    // #k-trunk-narrow: tiny arms k_trunk on ITS OWN evidence, not by transfer —
+    // which is what this test exists to police. MEASURED 2026-09-16: the branch
+    // shortlist was scoring seven trunk candidates that essentially never win
+    // (`trunk_split=0` over 214 splits, and `score_candidates` is the LARGEST
+    // phase on this category at 50.4%). 5 paired rows +49% expansions, 25
+    // candidate rows -> 1 control-verified conversion (idx_2045_sidx_7367,
+    // ctl 2/2 timeout vs arm 2/2 unsat), 18 banked unsats clean.
+    assert_eq!(tiny.margin_row.k_trunk, Some(1));
 
     // #backward-interm ships to BOTH wall categories — each on its own
     // measured evidence and its own pre-registered ship gate (2026-08-19).
@@ -440,6 +1072,8 @@ fn margin_row_fields_set(m: &MarginRowPreset) -> Vec<&'static str> {
         concurrent,
         root_f32,
         tableau_f32,
+        domain_stack,
+        err_envelope,
         lru,
         parallel,
         k_head,
@@ -448,13 +1082,29 @@ fn margin_row_fields_set(m: &MarginRowPreset) -> Vec<&'static str> {
         gpu,
         gpu_batch,
         gpu_backward,
+        gpu_conv,
+        frozen_dual_bab,
+        frozen_dual_bab_node_cap,
+        frozen_dual_bab_secs,
+        frozen_dual_refine_steps,
+        frozen_dual_bab_state,
+        frozen_dual_bab_search,
+        tree_mode,
+        tree_wave_batch,
+        tree_wave_cert_threads,
         alpha_opt,
         alpha_iters,
         alpha_secs,
         alpha_lr,
         alpha_cols,
         alpha_guard,
+        spec_alpha,
+        spec_alpha_width,
+        spec_alpha_cands,
+        spec_alpha_rounds,
+        spec_alpha_entries,
         clip,
+        clip_head,
         clip_interm,
         clip_rows,
         clip_topk,
@@ -465,6 +1115,7 @@ fn margin_row_fields_set(m: &MarginRowPreset) -> Vec<&'static str> {
         bi_chunk,
         bi_chunk_secs,
         bi_topk,
+        interm_alpha,
         beta,
         beta_eta,
         beta_iters,
@@ -478,8 +1129,26 @@ fn margin_row_fields_set(m: &MarginRowPreset) -> Vec<&'static str> {
         rebake,
         rebake_rounds,
         rebake_secs,
+        bi_window,
+        joint_refresh,
+        joint_refresh_secs,
+        head_groups,
+        head_directional_cuts,
+        head_phase_cover,
+        root_certify_once,
+        root_certify_once_iters,
+        root_certify_once_refresh,
+        root_certify_once_secs,
+        root_search,
+        root_box_source,
+        bi_gpu,
+        bi_patch,
+        bi_patch_ratio,
+        bi_patch_mb,
+        ibp_seed,
         closure_adaptive,
         branch_reduce_max,
+        parent_lift,
         backward_interm,
         domain_alpha,
         domain_alpha_iters,
@@ -487,6 +1156,7 @@ fn margin_row_fields_set(m: &MarginRowPreset) -> Vec<&'static str> {
         domain_alpha_min_depth,
         domain_alpha_stride,
         domain_alpha_gap,
+        clip_stateful,
         bi_secs,
         epoch_tier0,
         epoch_universe,
@@ -498,7 +1168,7 @@ fn margin_row_fields_set(m: &MarginRowPreset) -> Vec<&'static str> {
         verifier_threads,
         concurrent_threads,
     } = m;
-    let flags: [(&'static str, bool); 64] = [
+    let flags: [(&'static str, bool); 102] = [
         ("reserve_secs", reserve_secs.is_some()),
         ("adaptive_reserve", adaptive_reserve.is_some()),
         ("reserve_max_frac", reserve_max_frac.is_some()),
@@ -506,6 +1176,8 @@ fn margin_row_fields_set(m: &MarginRowPreset) -> Vec<&'static str> {
         ("concurrent", concurrent.is_some()),
         ("root_f32", root_f32.is_some()),
         ("tableau_f32", tableau_f32.is_some()),
+        ("domain_stack", domain_stack.is_some()),
+        ("err_envelope", err_envelope.is_some()),
         ("lru", lru.is_some()),
         ("parallel", parallel.is_some()),
         ("k_head", k_head.is_some()),
@@ -514,13 +1186,35 @@ fn margin_row_fields_set(m: &MarginRowPreset) -> Vec<&'static str> {
         ("gpu", gpu.is_some()),
         ("gpu_batch", gpu_batch.is_some()),
         ("gpu_backward", gpu_backward.is_some()),
+        ("gpu_conv", gpu_conv.is_some()),
+        ("frozen_dual_bab", frozen_dual_bab.is_some()),
+        (
+            "frozen_dual_bab_node_cap",
+            frozen_dual_bab_node_cap.is_some(),
+        ),
+        ("frozen_dual_bab_secs", frozen_dual_bab_secs.is_some()),
+        (
+            "frozen_dual_refine_steps",
+            frozen_dual_refine_steps.is_some(),
+        ),
+        ("frozen_dual_bab_state", frozen_dual_bab_state.is_some()),
+        ("frozen_dual_bab_search", frozen_dual_bab_search.is_some()),
+        ("tree_mode", tree_mode.is_some()),
+        ("tree_wave_batch", tree_wave_batch.is_some()),
+        ("tree_wave_cert_threads", tree_wave_cert_threads.is_some()),
         ("alpha_opt", alpha_opt.is_some()),
         ("alpha_iters", alpha_iters.is_some()),
         ("alpha_secs", alpha_secs.is_some()),
         ("alpha_lr", alpha_lr.is_some()),
         ("alpha_cols", alpha_cols.is_some()),
         ("alpha_guard", alpha_guard.is_some()),
+        ("spec_alpha", spec_alpha.is_some()),
+        ("spec_alpha_width", spec_alpha_width.is_some()),
+        ("spec_alpha_cands", spec_alpha_cands.is_some()),
+        ("spec_alpha_rounds", spec_alpha_rounds.is_some()),
+        ("spec_alpha_entries", spec_alpha_entries.is_some()),
         ("clip", clip.is_some()),
+        ("clip_head", clip_head.is_some()),
         ("clip_interm", clip_interm.is_some()),
         ("clip_rows", clip_rows.is_some()),
         ("clip_topk", clip_topk.is_some()),
@@ -531,6 +1225,7 @@ fn margin_row_fields_set(m: &MarginRowPreset) -> Vec<&'static str> {
         ("bi_chunk", bi_chunk.is_some()),
         ("bi_chunk_secs", bi_chunk_secs.is_some()),
         ("bi_topk", bi_topk.is_some()),
+        ("interm_alpha", interm_alpha.is_some()),
         ("beta", beta.is_some()),
         ("beta_eta", beta_eta.is_some()),
         ("beta_iters", beta_iters.is_some()),
@@ -544,8 +1239,29 @@ fn margin_row_fields_set(m: &MarginRowPreset) -> Vec<&'static str> {
         ("rebake", rebake.is_some()),
         ("rebake_rounds", rebake_rounds.is_some()),
         ("rebake_secs", rebake_secs.is_some()),
+        ("bi_window", bi_window.is_some()),
+        ("joint_refresh", joint_refresh.is_some()),
+        ("joint_refresh_secs", joint_refresh_secs.is_some()),
+        ("head_groups", head_groups.is_some()),
+        ("head_directional_cuts", head_directional_cuts.is_some()),
+        ("head_phase_cover", head_phase_cover.is_some()),
+        ("root_certify_once", root_certify_once.is_some()),
+        ("root_certify_once_iters", root_certify_once_iters.is_some()),
+        (
+            "root_certify_once_refresh",
+            root_certify_once_refresh.is_some(),
+        ),
+        ("root_certify_once_secs", root_certify_once_secs.is_some()),
+        ("root_search", root_search.is_some()),
+        ("root_box_source", root_box_source.is_some()),
+        ("bi_gpu", bi_gpu.is_some()),
+        ("bi_patch", bi_patch.is_some()),
+        ("bi_patch_ratio", bi_patch_ratio.is_some()),
+        ("bi_patch_mb", bi_patch_mb.is_some()),
+        ("ibp_seed", ibp_seed.is_some()),
         ("closure_adaptive", closure_adaptive.is_some()),
         ("branch_reduce_max", branch_reduce_max.is_some()),
+        ("parent_lift", parent_lift.is_some()),
         ("backward_interm", backward_interm.is_some()),
         ("domain_alpha", domain_alpha.is_some()),
         ("domain_alpha_iters", domain_alpha_iters.is_some()),
@@ -553,6 +1269,7 @@ fn margin_row_fields_set(m: &MarginRowPreset) -> Vec<&'static str> {
         ("domain_alpha_min_depth", domain_alpha_min_depth.is_some()),
         ("domain_alpha_stride", domain_alpha_stride.is_some()),
         ("domain_alpha_gap", domain_alpha_gap.is_some()),
+        ("clip_stateful", clip_stateful.is_some()),
         ("bi_secs", bi_secs.is_some()),
         ("epoch_tier0", epoch_tier0.is_some()),
         ("epoch_universe", epoch_universe.is_some()),
@@ -587,17 +1304,35 @@ fn margin_row_fields_set(m: &MarginRowPreset) -> Vec<&'static str> {
 /// | `lru` / `parallel` | absent (64 / all workers) | absent (64 / all workers) | typed delivery makes both measured throughput defaults searchable without silently arming a new YAML treatment; explicit parallel `0` is the serial control and typed `1` is invalid because legacy `1` means all |
 /// | `k_head` / `k_trunk` | `16` | absent (8) | cifar's evidence is a frontier explosion; this lane runs a 2-expansion tree |
 /// | `k_adaptive` | absent | absent | typed delivery exists; measured 3/3 on cifar, but it remains dark and unmeasured on tiny |
-/// | `alpha_opt` | `true` | absent | cifar100 retains its own timeout-to-UNSAT conversion and 9/9 moat; Tiny stays dark because the same pre-tree wall displaced needed tree work |
-/// | `gpu*`; explicit alpha tuning; `clip*` / beta / rebake fields | absent | absent | typed search delivery only; cifar100 consumes the alpha defaults under `alpha_opt`, but no explicit tuning or other treatment is qualified to ship without its own sealed A/B |
-/// | `closure_adaptive` | absent | absent | #closure-adaptive ships dark pending its own measurement; arming it on one category is exactly the transfer this test exists to make deliberate |
+/// | `alpha_opt` | `true` | `true` | cifar100 retains its own timeout-to-UNSAT conversion and 9/9 moat. Tiny ARMED 2026-09-22 (#tiny-alpha-aligned): its 2026-08-30 loss had two causes, both now fixed — the MEAN-over-8-columns direction (`alpha_cols`) and the unset `alpha_secs` cap. Marginal rows convert 7/10 armed vs 1/10 shipped (p=0.0099), root bit-identical every rep |
+/// | `alpha_cols` | `1` (measured) | `1` (measured) | the ascent's objective is the MIN column, its gradient was a MEAN over 8, so one column aligns them. Real root gain on both categories; on cifar100 it converts nothing ALONE (0 of 27), on tiny it is half of the pair above |
+/// | `alpha_secs` | absent (20 default) | `35.0` | tiny's ascent SATURATES the 20 s default cap; cifar100 has no evidence either way, so it keeps the default |
+/// | `gpu*`; other explicit alpha tuning; `clip*` / beta / rebake fields | absent | absent | typed search delivery only; no other explicit tuning or treatment is qualified to ship without its own sealed A/B |
+/// | `closure_adaptive` (+ `closure_max_tier`) | `true` / `2` | absent | ARMED ON CIFAR100'S OWN EVIDENCE 2026-09-01. The ladder escalates on the lane's OWN trailing child-closure fraction and `bab.rs` fires the per-domain alpha ascent at `TIER_BETA_DEEP`, so this is a self-configuring gate, not a tuned constant: it refuses to escalate after 75% of budget (`NO_ESCALATE_AFTER_FRAC`), must afford 3x the current per-expansion cost, and rolls back an escalation that ran 4x slower without raising closure. 79-row moat vs shipped: held 79, lost 0, flips 0; fired on ONE row; converts idx_5127_sidx_993 (certified, 5/5). Armed GLOBALLY it is net -30 -- the gate is what makes it positive. `max_tier` 2 stops below `TIER_EPOCH`, whose root-gain discard is a measured regression. Tiny stays dark pending its own moat: 61 of its 74 banked unsats publish within 10 s of the 100 s wall, and the LOWER rung (`TIER_BETA`) was measured there at +1 conversion vs -4 proofs and refused |
 /// | `backward_interm` | `true` | `true` | shipped to each on its own ship gate (2026-08-19) |
 /// | `domain_alpha` (+ `_iters`, `_eta`, and the SCHEDULE `_min_depth` / `_stride` / `_gap`) | absent | absent | #margin-row-domain-alpha ships dark pending its pre-registered 2x2 (off / clip / alpha / BOTH) on idx_1298 and idx_4597 — and the schedule grid is MEASURED NULL (2026-08-24: zero conversions at every operating point; see margin_row/domain_alpha.rs); arming it on one category is exactly the transfer this test exists to make deliberate |
 /// | `bi_secs` | `40` (measured) | ABSENT | the old "2.16x overrun" rationale confused root-build `secs=` with phase `work_secs=`. The later Tiny dose response solved idx_5185 only 1/4 and did not bank; idx_9611 failed under every dose on that dirty binary, so it is not a causal loss. Tableau-f32 later changed the timing frame again. Tiny stays at 20 pending a clean current-binary 20-vs-30 receipt-closed A/B; see docs/BI_DOSE_RESPONSE_5185_2026-08-24.md |
 /// | `bi_chunk_secs` | ABSENT | ABSENT | #bi-adaptive-chunk ships DARK (default 0 = the historical fixed grain). The exploratory idx_9611 observation used unretained logs and a dirty binary, and its declaration cited an unrelated commit; it is context, not scored provenance. Any non-zero value remains an unmeasured experiment requiring a sealed execution receipt |
 /// | `epoch_tier0` / `epoch_universe` / `epoch_retain` | absent | absent | typed delivery makes the ranker measurable from the clean scorecard, but promotion does not arm the July ranker result on any shipped category |
 /// | `epoch_depth` / `epoch_attempts` / `epoch_parent_topk` | absent | absent | typed delivery exists so the clean scorecard can measure it, but the authoritative refresh remains dark pending a sealed A/B |
+/// | `bi_secs` | `40` (measured) | absent (20 default) | the same-day cifar transfer was REVERTED by 3ce02e38a before it was ever scored — tiny's rows hug the publication wall |
+/// | `branch_reduce_max` | `true` (measured) | absent | #branch-reduceop. abc's OWN tuned cifar100 and tinyimagenet configs both set `reduceop: max` (De Palma eq. 22), overriding abc's global `min` default on exactly the two benchmarks ny fails; ny hardcoded `min`. Armed on cifar100 2026-08-30 with #interm-alpha as a PAIR — neither converts alone. Tiny stays dark pending its own moat sweep: 60 of its 65 banked unsats publish at 89.5-97.1 s of 100 s |
+/// | `interm_alpha` | `2` (measured) | absent | #interm-alpha, the other half of that pair. Dose 2 = chord-parallel + flipped area-heuristic vertex, intersected SHRINK-ONLY, so a wrong dose costs wall (`ia_secs`) and never soundness. Gate was the FULL bank: 124 banked-timeout + 47 banked-unsat rows, engagement 171/171, moat 47/47 with zero breaks, and a yaml-route proof with zero `NY_*` set (control: no `[interm-alpha]` line and timeout; armed: `armed=1`, `mode=max` 10/10, UNSAT) |
+/// | `domain_stack` + `err_envelope` | `true` + `envelope` (measured) | `true` + `envelope` (measured) | ARMED 2026-09-26 as a PAIR (scratchpad/mrab, 3 reps x 3 arms, 100 s): cifar100 idx_2050/idx_4921 timeout 3/3 -> unsat 3/3, the other rows 22-26% faster; tiny +54-106% expansions. Stack ALONE loses idx_3894 3/3, so it never ships alone; the envelope only loosens the certified penalty (worst 6.0e-9) and stacking is bit-identical |
+/// | `parent_lift` | `true` (measured) | absent | #branch-parent-lift. Converts idx_8739_sidx_1540 (a row the pair alone does not) at ZERO wall cost, moat 47/47, engagement 124/124. Tiny stays dark: it changes tree shape and 63 of 74 tiny unsats publish within 10 s of the wall |
 /// | `early_exit` | absent (= ON) | absent (= ON) | default; the key exists only as a kill switch |
-/// | `verifier_threads` | absent | absent | Front B's unmeasured scheduling seam |
+/// | `bi_topk` | ABSENT (the allocator owns it) | absent | #bi-topk-128 measured a real conversion (idx_9372_sidx_3515, 10/10, control 0/3, moat 80/80, tight rows +18.1s) but is NOT armed here: `#auto-alloc` narrows it per instance from the model's own work proxy. Arming it in the yaml would pre-narrow the value the allocator prices from, dropping the proxy ~4x so the root looks affordable and the allocator declines to shed `interm_alpha` — losing idx_1280_sidx_5310. The yaml states the CEILING; the allocator states the instance |
+/// | `column_retire` | `true` (measured) | absent | #margin-row-col-retire. Retires a margin column once an ancestor certified it closed. Converts `idx_5831_sidx_5506` (+0.53); 15 banked unsats held with 8 genuine engagement tests; rarity ~1 in 57, so worth ONE row. resnet_large is unaffected by construction (`cr_lines=0`) |
+/// | `verifier_threads` | absent | absent | Front B's seam, MEASURED NEGATIVE 2026-09-17: 9 runs, engagement 9/9, `exp=22` on every run, lane 34.87s (shared 20) vs 35.33s (private 18) vs 37.57s (private 16). Monotone in LANE width, not verifier contention — the wall presets run the verifier on `device: wgpu`, so there is no starvation to relieve and a cap only takes threads off the lane |
+/// | `frozen_dual_bab` (+ `_node_cap`, `_secs`) | `true` (tuning keys absent) | `true` (tuning keys absent) | User-directed default activation of the certified tier: automatic mode uses at most 4 s / 5% remaining time, 8192 nodes per objective and 256 MiB state; dense row estimates >=64 MiB select one objective, otherwise at most two. Explicit positive seconds retain manual mode. Official-budget benefit and the full both-year comparison remain unmeasured |
+/// | `frozen_dual_bab_state` | absent | absent | #fd-shared-state (ENGINE_PROGRAM M3) ships DARK on BOTH (`per_class`, bit-identical): `shared` builds ONE trunk of rows under slopes shared across the open classes before the fair shares (tiny t4863 spends 11.41 s of its 27.2 s tier in six per-class builds; t8853 refused all 15 on the ~1.3 s shares) and gives each class a one-column margin tail. Inert unless `frozen_dual_bab` is armed; arming needs the yaml-route `[frozen-dual] trunk state=shared` proof, the shared-lambda root-loss and classes-built measurement x3, the tier-engaged sat negative control and a both-year moat |
+/// | `frozen_dual_bab_search` | absent | absent | #wide-fd-search (ENGINE_PROGRAM M4) ships DARK on BOTH (`f64`, bit-identical): `cpu_f32` / `cuda` / `auto` hand each frozen-dual level's scoring to an injected untrusted backend whose proposals the tier certifies in f64 and splits otherwise. Inert unless `frozen_dual_bab` is armed; arming needs the yaml-route `[bbe] armed=1 backend= probe=ok` proof, the S1 certified nodes/s, the refuted/claimed rate, a ctl-vs-armed x3 per category and a both-year moat |
+/// | `tree_mode` (+ `tree_wave_batch`, `tree_wave_cert_threads`) | absent | absent | #wave-beta-bab (ENGINE_PROGRAM M6) ships DARK on BOTH (`legacy`, bit-identical): `wave` runs the margin-row outer frame as waves of injected untrusted output-only beta-CROWN search whose claims a private pool certifies with the lane's own Outward domain evaluation (frozen -> clip -> y-pack ladder; a refuted claim is split, never closed) behind the same path-based cover gate. Arming needs the yaml-route `[bbe] phase=wave armed=1 backend=` proof, the certified closes/s, the refuted/claimed rate (<= 20%), a ctl-vs-armed x3 per category with 0 banked rows lost, and a both-year moat |
+/// | `root_box_source` | absent | absent | #root-box-source (ENGINE_PROGRAM M5b) ships DARK on BOTH (`tableau`, bit-identical): `patch_backward` builds every root walk's trunk boxes from a certified IBP reference plus a certified #bi-patch receptive-field backward over the reference-unstable neurons, intersected shrink-only, instead of the forward tableau (20.4-22.0 s of tiny's root). It cannot produce clip rows, Tier-0 retained rows or the f32 tableau walk, so it is REFUSED at validation next to `clip_rows` (cifar100), `root_f32` (both) or `tableau_f32` (tiny) and at runtime on any other route (`[root-box] refused reason=`); it subsumes backward_interm. Arming therefore first needs an A/B that attributes dropping those keys, then the yaml-route `[root-box] source=patch_backward` proof, the root-wall measurement against the kill line (certify_s > 0.5 x the tableau build keeps the tableau), a ctl-vs-armed x3 per category and a both-year moat |
+/// | `root_search` | absent | absent | #bbe-joint-root (ENGINE_PROGRAM M5a) ships DARK on BOTH (`ascent`, bit-identical): `joint_f32` swaps #root-certify-once's untrusted ascent for the injected ny-bbe joint-alpha root search, whose slopes still reach the certified root only through the ingest gate and one certified evaluation. Inert unless `root_certify_once` is armed; arming needs the yaml-route `[bbe] phase=joint_root` proof, the S3 measurement, a ctl-vs-armed x3 per category and a both-year moat |
+/// | `frozen_dual_refine_steps` | `4` | `4` | User-directed category default: untrusted multi-cut and coordinate search inside the bounded frozen-dual tier; every hint passes the unchanged node certifier and only strict certified improvements are retained. Competition gain remains unmeasured; generic default stays 0 |
+/// | `root_certify_once` (+ `_iters`, `_refresh`, `_secs`) | absent | absent | #root-certify-once (Phase-0.5 root alpha, search-untrusted / certify-once) ships DARK on BOTH: armed, it runs the root ascent uncertified on a Parity scratch after every existing root-alpha owner and publishes ONE certified evaluation only if it strictly beats today's certified root, so it can only add root wall unless `alpha_opt`/`alpha_secs` are lowered in the same arm. Arming needs a ctl-vs-armed x3 per category (with the certified ascent kept AND with it replaced), the sat negative control and a both-year moat |
+/// | `ibp_seed` | absent | absent | #mr-ibp-seed ships DARK on BOTH, and BY CONSTRUCTION it cannot engage on either: both categories' trunks are residual resnets, and phase 1 declines residual trunks (`declined=residual`, byte-identical). Its target is `challenging_certified_training_2026`'s IBP-trained eps8 CNN7 chain; arming it there needs the GAP conversion x3 (5323, 3144w, 9352, 1031), the 8090/8397 negative controls and the cct moat |
 /// | `concurrent_threads` | absent | absent | unmeasured lane-width seam; omission uses the shared global pool without a verifier request, or derives only from observed host-minus-actual-global width with one; explicit `0` forces shared global |
 #[test]
 fn margin_row_wall_preset_field_diff_is_deliberate() {
@@ -612,9 +1347,31 @@ fn margin_row_wall_preset_field_diff_is_deliberate() {
             "adaptive_reserve",
             "concurrent",
             "root_f32",
+            // #mr-stack + #mr-errlane ARMED 2026-09-26 (scratchpad/mrab): converts
+            // idx_2050 and idx_4921 3/3 vs control 0/3; only the PAIR ships.
+            "domain_stack",
+            "err_envelope",
             "k_head",
             "k_trunk",
+            "frozen_dual_bab",
+            "frozen_dual_refine_steps",
             "alpha_opt",
+            // #alpha-cols-1 ARMED 2026-09-22 (commit 6b52dcdc5): aligns the
+            // ascent's gradient with its MIN-column objective.
+            "alpha_cols",
+            "clip_interm",
+            "clip_rows",
+            // #dom-alpha-closure-gate ARMED 2026-09-01: the closure ladder now
+            // escalates on the lane's own child-closure fraction, and bab.rs fires
+            // the per-domain alpha ascent at TIER_BETA_DEEP. 79-row moat vs shipped:
+            // held 79, lost 0, flips 0; the gate fired on ONE row. Converts
+            // idx_5127_sidx_993 (certified, reproduced 5/5).
+            "closure_max_tier",
+            "interm_alpha",
+            "column_retire",
+            "closure_adaptive",
+            "branch_reduce_max",
+            "parent_lift",
             "backward_interm",
             "bi_secs",
         ],
@@ -627,6 +1384,24 @@ fn margin_row_wall_preset_field_diff_is_deliberate() {
             "concurrent",
             "root_f32",
             "tableau_f32",
+            // #mr-stack + #mr-errlane ARMED 2026-09-26 with cifar100: +54-106% tree
+            // expansions on tiny idx_2146/7943; the full-category moat decides it.
+            "domain_stack",
+            "err_envelope",
+            // #k-trunk-narrow, armed on tiny's OWN evidence 2026-09-16 (see
+            // `cifar100_branch_width_is_pinned_and_scoped`): `trunk_split=0`
+            // over 214 splits while `score_candidates` is this category's
+            // LARGEST phase, +49% expansions over 5 paired rows, and one
+            // control-verified conversion with 18 banked unsats clean.
+            "k_trunk",
+            "frozen_dual_bab",
+            "frozen_dual_refine_steps",
+            // #tiny-alpha-aligned ARMED 2026-09-22 (commit c8230d7f5): the root
+            // ascent with the aligned gradient and the unpinned cost cap.
+            // Marginal rows 7/10 armed vs 1/10 shipped (p=0.0099).
+            "alpha_opt",
+            "alpha_secs",
+            "alpha_cols",
             "backward_interm",
         ],
         "tinyimagenet margin_row field set changed; update the diff table above"
@@ -637,15 +1412,18 @@ fn margin_row_wall_preset_field_diff_is_deliberate() {
     assert_eq!(cifar.margin_row.k_head, Some(16));
     assert_eq!(cifar.margin_row.k_trunk, Some(16));
     assert_eq!(cifar.margin_row.bi_secs, Some(40));
+    assert_eq!(cifar.margin_row.alpha_cols, Some(1));
+    assert_eq!(cifar.margin_row.domain_stack, Some(true));
+    assert_eq!(tiny.margin_row.domain_stack, Some(true));
+    assert_eq!(tiny.margin_row.alpha_opt, Some(true));
+    assert_eq!(tiny.margin_row.alpha_cols, Some(1));
+    assert_eq!(tiny.margin_row.alpha_secs, Some(35.0));
     assert_eq!(tiny.margin_row.reserve_secs, Some(0));
     // #backward-interm budget is CIFAR-ONLY and the asymmetry is deliberate.
-    // It was transplanted to tinyimagenet on 2026-08-22 and REVERTED the same
-    // day, before it was ever scored (the yaml at tinyimagenet_2024.yaml:138
-    // carries the reasoning and the pre-registered A/B). The commit that did
-    // the revert ALSO left this loop asserting Some(40) for BOTH presets, so
-    // the preset-diff safety net was red and asserting a value its own commit
-    // had removed. Asserted asymmetrically now, which is the whole point of
-    // this test.
+    // A transplant to tinyimagenet was REVERTED before it was ever scored (the
+    // yaml at tinyimagenet_2024.yaml:138 carries the reasoning and the
+    // pre-registered A/B), so the two presets are asserted asymmetrically,
+    // which is the whole point of this test.
     //
     // THE REVERT STANDS, AND IT HAS NOW BEEN MEASURED DIRECTLY — but both
     // justifications that stood here failed, the second by MISREADING THIS
@@ -685,6 +1463,24 @@ fn margin_row_wall_preset_field_diff_is_deliberate() {
     for (name, m) in wall_presets {
         assert_eq!(m.concurrent, Some(true), "{name} arms the concurrent lane");
         assert_eq!(m.root_f32, Some(true), "{name} arms the sound f32 root");
+        assert_eq!(
+            m.frozen_dual_bab,
+            Some(true),
+            "{name} enables the bounded tier"
+        );
+        assert_eq!(
+            m.frozen_dual_refine_steps,
+            Some(4),
+            "{name} requests four certified refinement steps"
+        );
+        assert_eq!(
+            m.frozen_dual_bab_node_cap, None,
+            "{name} uses the automatic node ceiling"
+        );
+        assert_eq!(
+            m.frozen_dual_bab_secs, None,
+            "{name} uses bounded automatic mode"
+        );
         assert_eq!(m.lru, None, "{name}: LRU stays on its measured default 64");
         assert_eq!(
             m.parallel, None,
@@ -713,6 +1509,11 @@ fn margin_row_wall_preset_field_diff_is_deliberate() {
         );
         assert_eq!(m.epoch_depth, None, "{name}: epochs remain default-off");
         assert_eq!(
+            m.err_envelope,
+            Some(ny_propagate::margin_row::ErrLane::Envelope),
+            "{name}: #mr-errlane ships armed as a pair with domain_stack (2026-09-26 A/B)"
+        );
+        assert_eq!(
             m.epoch_attempts, None,
             "{name}: epoch attempts stay defaulted"
         );
@@ -720,47 +1521,203 @@ fn margin_row_wall_preset_field_diff_is_deliberate() {
             m.epoch_parent_topk, None,
             "{name}: parent refresh remains dark"
         );
+        // `bi_secs` is cifar-only again: 3ce02e38a reverted tinyimagenet's
+        // unmeasured 40 before it was ever scored (60 of its 65 banked unsats
+        // publish at 89.5-97.1 s of 100 s, so extra root seconds come straight
+        // out of publication headroom). That commit left this test asserting
+        // the withdrawn value, so `-p ny-cli --bins` has not compiled-and-passed
+        // since; repaired here rather than left as ambient red.
+        assert_eq!(
+            cifar.margin_row.bi_secs,
+            Some(40),
+            "cifar100 keeps the measured 40 s backward-interm budget"
+        );
+        assert_eq!(
+            tiny.margin_row.bi_secs, None,
+            "tinyimagenet rides the 20 s default (3ce02e38a)"
+        );
+        let _ = m.bi_secs;
+        assert_eq!(m.k_adaptive, None, "{name}: the ratchet is still env-only");
         assert_eq!(
             m.early_exit, None,
             "{name}: early exit rides its ON default"
         );
         assert_eq!(
             m.verifier_threads, None,
-            "{name}: #verifier-thread-cap is unmeasured; ship it with an A/B"
+            "{name}: #verifier-thread-cap is MEASURED NEGATIVE (2026-09-17) — \
+             keep it unset. 9 runs on tinyimagenet idx_4330_sidx_3504, 3 arms x \
+             3 reps, arm order rotated, engagement 9/9, exp=22 on every run \
+             (identical trees): lane 34.87s on the shared 20-wide pool, 35.33s \
+             at a private 18, 37.57s at a private 16. Lane time is monotone in \
+             LANE width, not in verifier contention — the verifier runs on \
+             device: wgpu and its host-CPU appetite is under two threads\u{2019} \
+             worth, so partitioning the pool only takes threads off the lane"
         );
         assert_eq!(
             m.concurrent_threads, None,
             "{name}: concurrent lane width is unmeasured; omission preserves derived/global policy"
         );
+        // #clip-stateful DEFAULT OFF pin. All three Clip-and-Verify keys are
+        // newly DELIVERABLE (they were env-only, so no scored run could ever
+        // have armed them) and all three ship DARK. Arming any of them is a
+        // separate, measured decision — the depth-indexed gating-bound A/B on
+        // idx_1298 and idx_4597 is pre-registered and unrun.
+        assert_eq!(
+            m.clip_stateful, None,
+            "{name}: stateful clip accumulation ships dark"
+        );
+        // #clip-head DEFAULT OFF pin. MoatRisk::High and UNMEASURED: the
+        // halfspace is a necessary condition of its split only because the
+        // certified slack is subtracted, so this key ships dark until the
+        // pre-registered engagement proof (`[clip-head] armed` plus a `call=`
+        // line with `hs>0`, zero `NY_*` in the environment) and the wall-hugger
+        // moat have both run. Arming it removes this pin, the PromotedKey and
+        // the unarmed-promotions row, in the commit carrying the measurement.
+        assert_eq!(
+            m.clip_head, None,
+            "{name}: head-split clip halfspaces ship dark until measured"
+        );
+        // #branch-reduceop and #interm-alpha are cifar-only, so they are
+        // asserted per preset below rather than across the loop.
+        let _ = m.branch_reduce_max;
+        let _ = m.interm_alpha;
+        let _ = m.parent_lift;
     }
 
-    // The diff is COMPLETE: no third shipped preset carries a margin_row key,
+    // #branch-reduceop + #interm-alpha: ARMED on cifar100 2026-08-30, dark on
+    // tinyimagenet. The pair is the campaign's first measured conversion —
+    // idx_5242_sidx_1208 timeout -> unsat, 5/5 reps, with neither lever
+    // converting alone (base timeout 3/3, reduceop-only timeout 6/6). The
+    // arming gate was the FULL bank: all 124 banked-timeout rows plus all 47
+    // banked-unsat rows, engagement 171/171 armed so the nulls are real, and
+    // the moat came back 47/47 unsat with zero breaks. The yaml route itself
+    // was PROVEN with zero NY_* in the environment (control: no
+    // [interm-alpha] line, reduceop mode=min, timeout; armed: armed=1,
+    // mode=max 10/10, unsat) — required because run_instance.sh exports no
+    // NY_* and this route measured DARK on 2026-08-27 (space.rs:1971).
+    assert_eq!(
+        cifar.margin_row.branch_reduce_max,
+        Some(true),
+        "cifar100 arms #branch-reduceop (De Palma eq. 22, abc's own tuned choice here)"
+    );
+    assert_eq!(
+        cifar.margin_row.interm_alpha,
+        Some(2),
+        "cifar100 arms #interm-alpha at the measured dose 2"
+    );
+    // tinyimagenet is NOT armed: 60 of its 65 banked unsats publish at
+    // 89.5-97.1 s of 100 s, so an extra per-start-node pass comes straight out
+    // of publication headroom. Arming it needs its own moat sweep.
+    assert_eq!(
+        tiny.margin_row.branch_reduce_max, None,
+        "tinyimagenet keeps #branch-reduceop dark pending its own sweep"
+    );
+    assert_eq!(
+        tiny.margin_row.interm_alpha, None,
+        "tinyimagenet keeps #interm-alpha dark pending its own sweep"
+    );
+    // #branch-parent-lift: ARMED on cifar100 2026-08-30. It converts
+    // idx_8739_sidx_1540, a row the reduceop+interm_alpha pair alone does not,
+    // at ZERO wall cost, with the moat coming back 47/47 unsat and engagement
+    // on 124/124 pool rows. Dark on tinyimagenet: it changes tree shape, and
+    // 63 of that benchmark's 74 banked unsats publish within 10 s of the wall,
+    // so it needs its own moat sweep there.
+    assert_eq!(
+        cifar.margin_row.parent_lift,
+        Some(true),
+        "cifar100 arms #branch-parent-lift"
+    );
+    assert_eq!(
+        tiny.margin_row.parent_lift, None,
+        "tinyimagenet keeps #branch-parent-lift dark pending its own sweep"
+    );
+    // #clip-and-verify: ARMED on cifar100 2026-08-31. It converts
+    // idx_1798_sidx_1061 (5 of 8 reps, certified) at ZERO wall cost, with the
+    // moat 47/47 including all five thin-margin rows. Dark on tinyimagenet: no
+    // clip row has ever been measured there and its preset forbids blind cifar
+    // transfers by name.
+    assert_eq!(
+        cifar.margin_row.clip_interm,
+        Some(true),
+        "cifar100 arms #clip-and-verify intermediate tightening"
+    );
+    assert_eq!(
+        cifar.margin_row.clip_rows,
+        Some(true),
+        "cifar100 retains the clip halfspace rows (clip_interm is inert without them)"
+    );
+    assert_eq!(
+        tiny.margin_row.clip_interm, None,
+        "tinyimagenet keeps clip dark pending its own measurement"
+    );
+
+    // The diff is COMPLETE: no other shipped preset carries a margin_row key,
     // so nothing outside this table can inherit one of these decisions.
+    //
+    // #cct-margin-row-admission: configs/vnncomp26 SHADOWS configs/vnncomp25
+    // and vnncomp26 presets carry lane settings, so scan both years. The cct
+    // preset and its patches-wiring canary are pinned field-for-field (and
+    // canary-verbatim) by the cct test. SafeNLP's two explicitly directed
+    // default-on switches are pinned by the head-directional test below.
+    const PINNED_ELSEWHERE: &[&str] = &[
+        "challenging_certified_training_2026",
+        "challenging_certified_training_2026_patcheswiring_canary",
+        "safenlp_2024",
+    ];
     let mut others: Vec<String> = Vec::new();
-    for entry in fs::read_dir(&dir).expect("read configs/vnncomp25") {
-        let path = entry.expect("dir entry").path();
-        if path.extension().is_none_or(|e| e != "yaml") {
-            continue;
-        }
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .expect("preset stem")
-            .to_string();
-        if stem == "cifar100_2024" || stem == "tinyimagenet_2024" {
-            continue;
-        }
-        let cfg = load_preset(&path).unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
-        let set = margin_row_fields_set(&cfg.margin_row);
-        if !set.is_empty() {
-            others.push(format!("{stem}: {set:?}"));
+    let mut pinned_elsewhere_seen: Vec<String> = Vec::new();
+    for year_dir in [dir, repo_root.join("configs/vnncomp26")] {
+        for entry in
+            fs::read_dir(&year_dir).unwrap_or_else(|e| panic!("read {}: {e}", year_dir.display()))
+        {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_none_or(|e| e != "yaml") {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .expect("preset stem")
+                .to_string();
+            if stem == "cifar100_2024" || stem == "tinyimagenet_2024" {
+                continue;
+            }
+            let cfg = load_preset(&path).unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
+            let set = margin_row_fields_set(&cfg.margin_row);
+            if set.is_empty() {
+                continue;
+            }
+            if PINNED_ELSEWHERE.contains(&stem.as_str()) {
+                pinned_elsewhere_seen.push(stem);
+                continue;
+            }
+            others.push(format!("{}: {set:?}", path.display()));
         }
     }
     assert!(
         others.is_empty(),
-        "a third preset now sets margin_row keys, so the two-category diff above is \
-         no longer the whole story: {others:?}"
+        "another preset now sets margin_row keys, so the diff above is no longer \
+         the whole story: {others:?}"
     );
+    pinned_elsewhere_seen.sort();
+    assert_eq!(
+        pinned_elsewhere_seen, PINNED_ELSEWHERE,
+        "the sanctioned vnncomp26 margin_row carriers moved or disarmed; update \
+         PINNED_ELSEWHERE and its dedicated field-for-field pin tests together"
+    );
+}
+
+#[test]
+fn safenlp_head_directional_defaults_are_the_exact_shipped_margin_row_block() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let preset = load_preset(&repo_root.join("configs/vnncomp26/safenlp_2024.yaml")).unwrap();
+    assert_eq!(
+        margin_row_fields_set(&preset.margin_row),
+        ["head_groups", "head_directional_cuts"],
+        "the shipped SafeNLP margin block must contain only its two directed switches"
+    );
+    assert_eq!(preset.margin_row.head_groups, Some(true));
+    assert_eq!(preset.margin_row.head_directional_cuts, Some(true));
 }
 
 /// #tinyimagenet-alloc-parity-no-go: the CIFAR allocation trio regressed the
@@ -850,7 +1807,7 @@ fn nn4sys_preset_matches_reference_input_split_schedule_4354() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let preset = load_preset(&repo_root.join("configs/vnncomp25/nn4sys.yaml")).unwrap();
 
-    // pgd_order: skip — PGD disabled for nn4sys (Part of #4354)
+    // pgd_order: skip — PGD disabled for nn4sys
     assert_eq!(preset.attack.pgd_order.as_deref(), Some("skip"));
     assert_eq!(
         preset.bab.phase_budget.post_bab_pgd_fraction,
@@ -1236,7 +2193,7 @@ fn vit_2023_preset_keeps_softmax_complex_disabled() {
     assert!((config.phase_budget.disjunctive_pgd_fraction - 0.05).abs() < 1e-6);
 }
 
-/// cgan_2023 root-collection scheduling caps (#4413, #cgan-bn11-budget):
+/// cgan_2023 root-collection scheduling caps (#cgan-bn11-budget):
 /// the preset's per-node CROWN-IBP cap and aggregate α reference-refresh cap
 /// flow through to the exact typed configs consumed by the collectors. The
 /// per-node floor and refresh fraction retain their built-in defaults.
@@ -1305,8 +2262,16 @@ fn cgan_2023_preset_raises_crown_ibp_per_node_cap() {
     assert_eq!(config.phase_budget.disjunctive_pgd_max_secs, Some(5));
     assert_eq!(config.phase_budget.post_bab_pgd_fraction, 0.0);
     assert_eq!(config.phase_budget.initial_bounds_fraction, 0.45);
-    // The current forward-linear precheck returns as soon as its shared map is
-    // available, so this remains a ceiling rather than spent time.
+    // The forward-linear precheck does not return early: its 0.85 share is
+    // SPENT TIME. Measured 2026-08-30 on cgan2026 row 10 (`cGAN_imgSz64_nCh_1`
+    // `prop_2`, official 900 s): the phase runs to `elapsed_s=717.884` — 80% of
+    // the whole budget, 94% of the 0.85*900 = 765 s ceiling — and returns
+    // `verified=0`. A single-variable arm capping it to 150 s leaves BaB's
+    // first six `[disjunctive-trajectory]` rows BIT-IDENTICAL, so the phase's
+    // output is a pure discard on that row. 0.85 is therefore a REAL grant, not
+    // a ceiling; the only absolute bound is `disjunctive_precheck_max_secs`,
+    // which both cgan presets now arm at 60 s (see #precheck-abs-cap below).
+    // See reports/measured-2026/precheck_discard_2026-08-30/.
     assert_eq!(config.phase_budget.disjunctive_precheck_fraction, 0.85);
 }
 
@@ -1347,6 +2312,671 @@ fn cgan_forward_alpha_surrogate_canary_differs_by_exactly_one_typed_field() {
         serde_json::to_value(&production).unwrap(),
         "forward-alpha canary may differ from shipped cGAN only at forward_linear_spec_alpha"
     );
+}
+
+/// `#cgan-child-interm-refine`: the measurement canary must differ from the
+/// shipped cgan2026 preset by exactly its TWO typed treatment fields — the
+/// per-child wall budget and the REUSED `cgan_narrow_target_max_rows` ceiling
+/// (#cgan-narrow-target-budget) that makes the child cascade refine only
+/// narrow targets. Normalizing both and requiring full serialized equality
+/// makes canary drift (the multi-variable-arm failure the narrow-target
+/// canary was once caught in) a test failure instead of a silent measurement
+/// hazard. The resolver-level apply assertions are necessary but NOT
+/// sufficient reachability evidence: the lever's own `[cgan-child-interm-refine]
+/// armed` line from a run with the armed yaml and no `NY_*` set is the proof
+/// the Measure phase must still collect.
+#[test]
+fn cgan_child_interm_refine_canary_differs_by_exactly_two_typed_fields() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let production = load_preset(&repo_root.join("configs/vnncomp26/cgan2026.yaml")).unwrap();
+    let canary =
+        load_preset(&repo_root.join("configs/vnncomp26/cgan2026_child_interm_refine_canary.yaml"))
+            .unwrap();
+
+    assert_eq!(
+        production.bab.alpha_crown.cgan_child_interm_refine_max_secs, None,
+        "the SHIPPED cgan2026 preset must keep child refinement dark"
+    );
+    assert_eq!(production.bab.alpha_crown.cgan_narrow_target_max_rows, None);
+    assert_eq!(
+        canary.bab.alpha_crown.cgan_child_interm_refine_max_secs,
+        Some(120.0)
+    );
+    assert_eq!(
+        canary.bab.alpha_crown.cgan_narrow_target_max_rows,
+        Some(4096),
+        "the child canary must arm the REUSED narrow-target ceiling at the \
+         measured value-law boundary; without it every child would pay the \
+         wide generator targets the leave-one-out priced at zero"
+    );
+
+    let mut normalized_canary = canary.clone();
+    normalized_canary
+        .bab
+        .alpha_crown
+        .cgan_child_interm_refine_max_secs = None;
+    normalized_canary
+        .bab
+        .alpha_crown
+        .cgan_narrow_target_max_rows = None;
+    assert_eq!(
+        serde_json::to_value(&normalized_canary).unwrap(),
+        serde_json::to_value(&production).unwrap(),
+        "child-interm-refine canary may differ from shipped cgan2026 only at \
+         its two typed treatment fields"
+    );
+
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &canary).unwrap();
+    assert_eq!(
+        config.alpha_config.cgan_child_interm_refine_max_secs,
+        Some(120.0)
+    );
+    assert_eq!(config.alpha_config.cgan_narrow_target_max_rows, Some(4096));
+    assert!(
+        config.alpha_config.cgan_complete_crown_ibp_root,
+        "the child budget is inert by construction without the root arm; the \
+         canary must carry both"
+    );
+}
+
+/// `#cgan-child-seed`: the three child-cascade keys are MEASUREMENT keys. No
+/// shipped preset (production or canary, either alpha block) may name them
+/// until the commit that carries their measurement arms them, and the scan
+/// must actually parse presets or it is a void pass.
+#[test]
+fn cgan_child_seed_keys_are_dark_in_every_shipped_preset() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+    let mut named = Vec::new();
+    let mut parsed = 0usize;
+    for year in ["vnncomp24", "vnncomp25", "vnncomp26"] {
+        let Ok(entries) = fs::read_dir(root.join(year)) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("preset directory entry").path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).expect("readable shipped preset");
+            let preset: PresetConfig = serde_yaml::from_str(&text)
+                .unwrap_or_else(|error| panic!("preset {} must parse: {error}", path.display()));
+            parsed += 1;
+            for (block, alpha) in [
+                ("solver.alpha_crown", &preset.solver.alpha_crown),
+                ("bab.alpha_crown", &preset.bab.alpha_crown),
+            ] {
+                if alpha.cgan_child_interm_refine_seed_from_parent.is_some()
+                    || alpha.cgan_child_interm_refine_parallel.is_some()
+                    || alpha.cgan_child_interm_refine_fresh_clip_map.is_some()
+                {
+                    named.push(format!("{}: {block}", path.display()));
+                }
+            }
+        }
+    }
+    assert!(
+        parsed > 0,
+        "no shipped preset was parsed, so this darkness check is VOID, not a pass"
+    );
+    assert!(
+        named.is_empty(),
+        "the #cgan-child-seed keys must stay dark in every shipped preset until their \
+         measurement lands: {named:?}"
+    );
+}
+
+/// `#cgan-child-seed`: each typed key reaches its `AlphaCrownConfig` field
+/// from yaml, an absent key keeps the dark default, and an unhonourable
+/// concurrency request is refused at load instead of silently clamped.
+#[test]
+fn cgan_child_seed_keys_apply_from_yaml_and_refuse_an_out_of_range_width() {
+    let armed: PresetConfig = serde_yaml::from_str(
+        r#"
+bab:
+  alpha_crown:
+    cgan_complete_crown_ibp_root: true
+    cgan_child_interm_refine_max_secs: 120.0
+    cgan_child_interm_refine_seed_from_parent: true
+    cgan_child_interm_refine_parallel: 4
+    cgan_child_interm_refine_fresh_clip_map: true
+"#,
+    )
+    .expect("armed child-seed preset");
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &armed).expect("armed child-seed preset should apply");
+    assert!(
+        config
+            .alpha_config
+            .cgan_child_interm_refine_seed_from_parent
+    );
+    assert_eq!(config.alpha_config.cgan_child_interm_refine_parallel, 4);
+    assert!(config.alpha_config.cgan_child_interm_refine_fresh_clip_map);
+    assert_eq!(
+        config.alpha_config.cgan_child_interm_refine_max_secs,
+        Some(120.0)
+    );
+
+    let budget_only: PresetConfig = serde_yaml::from_str(
+        r#"
+bab:
+  alpha_crown:
+    cgan_complete_crown_ibp_root: true
+    cgan_child_interm_refine_max_secs: 120.0
+"#,
+    )
+    .expect("budget-only preset");
+    let mut dark = BetaCrownConfig::default();
+    apply_preset(&mut dark, &budget_only).expect("budget-only preset should apply");
+    assert!(
+        !dark.alpha_config.cgan_child_interm_refine_seed_from_parent,
+        "arming the historical prepass alone must not seed it"
+    );
+    assert_eq!(dark.alpha_config.cgan_child_interm_refine_parallel, 0);
+    assert!(!dark.alpha_config.cgan_child_interm_refine_fresh_clip_map);
+
+    let too_wide: PresetConfig = serde_yaml::from_str(
+        r#"
+bab:
+  alpha_crown:
+    cgan_child_interm_refine_parallel: 65
+"#,
+    )
+    .expect("out-of-range width still parses");
+    let mut refused = BetaCrownConfig::default();
+    assert!(
+        apply_preset(&mut refused, &too_wide).is_err(),
+        "a width above AlphaCrownConfig::MAX_CGAN_CHILD_INTERM_REFINE_PARALLEL must be \
+         refused at load"
+    );
+}
+
+/// `#cgan-child-zono`: the per-child zonotope refresh is a MEASUREMENT key.
+/// No shipped preset (production or canary, either alpha block) may name it
+/// until the commit that carries its measurement arms it, and the scan must
+/// actually parse presets or it is a void pass.
+#[test]
+fn cgan_child_zono_refresh_is_dark_in_every_shipped_preset() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+    let mut named = Vec::new();
+    let mut parsed = 0usize;
+    for year in ["vnncomp24", "vnncomp25", "vnncomp26"] {
+        let Ok(entries) = fs::read_dir(root.join(year)) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("preset directory entry").path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).expect("readable shipped preset");
+            let preset: PresetConfig = serde_yaml::from_str(&text)
+                .unwrap_or_else(|error| panic!("preset {} must parse: {error}", path.display()));
+            parsed += 1;
+            for (block, alpha) in [
+                ("solver.alpha_crown", &preset.solver.alpha_crown),
+                ("bab.alpha_crown", &preset.bab.alpha_crown),
+            ] {
+                if alpha.cgan_child_zono_refresh.is_some() {
+                    named.push(format!("{}: {block}", path.display()));
+                }
+            }
+        }
+    }
+    assert!(
+        parsed > 0,
+        "no shipped preset was parsed, so this darkness check is VOID, not a pass"
+    );
+    assert!(
+        named.is_empty(),
+        "bab.alpha_crown.cgan_child_zono_refresh must stay dark in every shipped preset \
+         until its measurement lands: {named:?}"
+    );
+}
+
+/// `#cgan-child-zono`: every sub-key reaches `AlphaCrownConfig` from yaml, an
+/// absent block keeps the dark default, a partial block keeps the other
+/// defaults, and an inadmissible budget (`0` included — it never means
+/// "unlimited") is refused at load instead of silently clamped.
+#[test]
+fn cgan_child_zono_refresh_applies_from_yaml_and_refuses_bad_values() {
+    let armed: PresetConfig = serde_yaml::from_str(
+        r#"
+bab:
+  alpha_crown:
+    cgan_child_zono_refresh:
+      enabled: true
+      max_generators: 4096
+      max_secs: 2.5
+"#,
+    )
+    .expect("armed zonotope preset");
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &armed).expect("armed zonotope preset should apply");
+    let refresh = config.alpha_config.cgan_child_zono_refresh;
+    assert!(refresh.enabled);
+    assert_eq!(refresh.max_generators, 4096);
+    assert_eq!(refresh.max_secs, Some(2.5));
+
+    let enabled_only: PresetConfig = serde_yaml::from_str(
+        r#"
+bab:
+  alpha_crown:
+    cgan_child_zono_refresh:
+      enabled: true
+"#,
+    )
+    .expect("enabled-only preset");
+    let mut partial = BetaCrownConfig::default();
+    apply_preset(&mut partial, &enabled_only).expect("enabled-only preset should apply");
+    assert!(partial.alpha_config.cgan_child_zono_refresh.enabled);
+    assert_eq!(
+        partial.alpha_config.cgan_child_zono_refresh.max_generators, 16_384,
+        "an unnamed budget keeps the non-binding default"
+    );
+    assert_eq!(partial.alpha_config.cgan_child_zono_refresh.max_secs, None);
+
+    let mut dark = BetaCrownConfig::default();
+    apply_preset(&mut dark, &PresetConfig::default()).expect("empty preset");
+    assert!(!dark.alpha_config.cgan_child_zono_refresh.enabled);
+
+    for bad in [
+        "max_generators: 0",
+        "max_generators: 4",
+        "max_generators: 2000000",
+        "max_secs: 0.0",
+        "max_secs: -1.0",
+        "max_secs: .nan",
+    ] {
+        let yaml = format!("bab:\n  alpha_crown:\n    cgan_child_zono_refresh:\n      {bad}\n");
+        let preset: PresetConfig = serde_yaml::from_str(&yaml).expect("bad value still parses");
+        let mut refused = BetaCrownConfig::default();
+        assert!(
+            apply_preset(&mut refused, &preset).is_err(),
+            "`{bad}` must be refused at load"
+        );
+    }
+    let unknown: Result<PresetConfig, _> = serde_yaml::from_str(
+        "bab:\n  alpha_crown:\n    cgan_child_zono_refresh:\n      budget: 5\n",
+    );
+    assert!(
+        unknown.is_err(),
+        "the block is closed: unknown sub-keys are rejected"
+    );
+}
+
+/// Named V2 test 12: the zonotope refresh reaches the lane through the TYPED
+/// preset key. Its plan records where the arming came from, and the key has
+/// no environment reader at all, so an armed plan built from yaml must report
+/// `Source::Config` — never `Source::LegacyEnv`.
+#[test]
+fn child_zono_preset_source_is_typed() {
+    let armed: PresetConfig = serde_yaml::from_str(
+        r#"
+bab:
+  alpha_crown:
+    cgan_child_zono_refresh:
+      enabled: true
+"#,
+    )
+    .expect("armed zonotope preset");
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &armed).expect("armed zonotope preset should apply");
+    let plan = ny_propagate::zono_core::cgan_child_zono_plan(&config)
+        .expect("the yaml key must produce an armed plan");
+    assert_ne!(plan.source, ny_levers::Source::LegacyEnv);
+    assert_eq!(plan.source, ny_levers::Source::Config);
+    assert_eq!(plan.max_generators, 16_384);
+    assert!(
+        ny_propagate::zono_core::cgan_child_zono_plan(&BetaCrownConfig::default()).is_none(),
+        "without the key there is no plan and no work"
+    );
+}
+
+/// `#fwd-root-screen`: the forward root screen is a MEASUREMENT key. No
+/// shipped preset (any year, production or canary) may name either of its
+/// keys until the commit carrying the measurement arms ml4acopf, and the scan
+/// must actually parse presets or it is a void pass.
+#[test]
+fn forward_root_screen_is_dark_in_every_shipped_preset() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+    let mut named = Vec::new();
+    let mut parsed = 0usize;
+    for year in ["vnncomp24", "vnncomp25", "vnncomp26"] {
+        let Ok(entries) = fs::read_dir(root.join(year)) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("preset directory entry").path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).expect("readable shipped preset");
+            let preset: PresetConfig = serde_yaml::from_str(&text)
+                .unwrap_or_else(|error| panic!("preset {} must parse: {error}", path.display()));
+            parsed += 1;
+            if preset.bab.forward_root_screen.is_some()
+                || preset.bab.forward_root_screen_max_mb.is_some()
+            {
+                named.push(path.display().to_string());
+            }
+        }
+    }
+    assert!(
+        parsed > 0,
+        "no shipped preset was parsed, so this darkness check is VOID, not a pass"
+    );
+    assert!(
+        named.is_empty(),
+        "bab.forward_root_screen[_max_mb] must stay dark in every shipped preset until its \
+         measurement lands: {named:?}"
+    );
+    let mut dark = BetaCrownConfig::default();
+    apply_preset(&mut dark, &PresetConfig::default()).expect("empty preset");
+    assert!(
+        !dark.forward_root_screen,
+        "an empty preset leaves the screen dark"
+    );
+    assert_eq!(dark.forward_root_screen_max_mb, 8192);
+}
+
+/// `#fwd-root-screen`: both keys reach `BetaCrownConfig` from yaml, an explicit
+/// `false` disarms, an omitted ceiling keeps the default, and an inadmissible
+/// ceiling (`0` included — it never means "unlimited") is refused at load.
+#[test]
+fn forward_root_screen_applies_from_yaml_and_refuses_bad_values() {
+    let armed: PresetConfig = serde_yaml::from_str(
+        "bab:\n  forward_root_screen: true\n  forward_root_screen_max_mb: 2048\n",
+    )
+    .expect("armed screen preset");
+    assert_eq!(armed.bab.forward_root_screen, Some(true));
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &armed).expect("armed screen preset should apply");
+    assert!(config.forward_root_screen);
+    assert_eq!(config.forward_root_screen_max_mb, 2048);
+
+    let enabled_only: PresetConfig =
+        serde_yaml::from_str("bab:\n  forward_root_screen: true\n").expect("enabled only");
+    let mut partial = BetaCrownConfig::default();
+    apply_preset(&mut partial, &enabled_only).expect("enabled-only preset should apply");
+    assert!(partial.forward_root_screen);
+    assert_eq!(partial.forward_root_screen_max_mb, 8192);
+
+    let disarmed: PresetConfig =
+        serde_yaml::from_str("bab:\n  forward_root_screen: false\n").expect("disarmed");
+    let mut config = BetaCrownConfig {
+        forward_root_screen: true,
+        ..BetaCrownConfig::default()
+    };
+    apply_preset(&mut config, &disarmed).expect("disarmed preset should apply");
+    assert!(
+        !config.forward_root_screen,
+        "an explicit false must reach the config"
+    );
+
+    for bad in ["0", "63", "1048577"] {
+        let yaml = format!("bab:\n  forward_root_screen_max_mb: {bad}\n");
+        let preset: PresetConfig = serde_yaml::from_str(&yaml).expect("bad value still parses");
+        let mut refused = BetaCrownConfig::default();
+        assert!(
+            apply_preset(&mut refused, &preset).is_err(),
+            "`forward_root_screen_max_mb: {bad}` must be refused at load"
+        );
+    }
+    assert!(
+        serde_yaml::from_str::<PresetConfig>("bab:\n  forward_root_scren: true\n").is_err(),
+        "a misspelt key must be refused, not silently ignored"
+    );
+}
+
+/// Named V4 test 8: the screen reaches the lane through the TYPED preset key.
+/// Its plan records where the arming came from, and the key has no
+/// environment reader at all, so a plan built from yaml must report
+/// `Source::Config` — never `Source::LegacyEnv`.
+#[test]
+fn fwd_root_screen_preset_source_is_typed() {
+    let armed: PresetConfig =
+        serde_yaml::from_str("bab:\n  forward_root_screen: true\n").expect("armed preset");
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &armed).expect("armed preset should apply");
+    let plan = ny_propagate::zono_core::forward_root_screen_plan(&config)
+        .expect("the yaml key must produce an armed plan");
+    assert_ne!(plan.source, ny_levers::Source::LegacyEnv);
+    assert_eq!(plan.source, ny_levers::Source::Config);
+    assert_eq!(plan.max_bytes, 8192u64 << 20);
+    assert!(
+        ny_propagate::zono_core::forward_root_screen_plan(&BetaCrownConfig::default()).is_none(),
+        "without the key there is no plan and no work"
+    );
+}
+/// `#relusplitter-lp-refine`: the rigorous LP root refiner is a MEASUREMENT
+/// key. No shipped preset (any year, production or canary) may name it until
+/// the commit carrying the relusplitter measurement arms it, and the scan must
+/// actually parse presets or it is a void pass.
+#[test]
+fn mip_refine_intermediates_is_dark_in_every_shipped_preset() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+    let mut named = Vec::new();
+    let mut parsed = 0usize;
+    for year in ["vnncomp24", "vnncomp25", "vnncomp26"] {
+        let Ok(entries) = fs::read_dir(root.join(year)) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("preset directory entry").path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).expect("readable shipped preset");
+            let preset: PresetConfig = serde_yaml::from_str(&text)
+                .unwrap_or_else(|error| panic!("preset {} must parse: {error}", path.display()));
+            parsed += 1;
+            if preset.bab.mip_refine_intermediates.is_some() {
+                named.push(path.display().to_string());
+            }
+        }
+    }
+    assert!(
+        parsed > 0,
+        "no shipped preset was parsed, so this darkness check is VOID, not a pass"
+    );
+    assert!(
+        named.is_empty(),
+        "bab.mip_refine_intermediates must stay dark in every shipped preset until its \
+         measurement lands: {named:?}"
+    );
+    let mut dark = BetaCrownConfig::default();
+    apply_preset(&mut dark, &PresetConfig::default()).expect("empty preset");
+    assert_eq!(
+        dark.mip_refine_intermediates, None,
+        "an empty preset attaches no refiner"
+    );
+}
+
+/// `#relusplitter-lp-refine`: the key reaches `BetaCrownConfig` from yaml with
+/// its defaults filled, explicit values survive, a misspelt sub-key or key is
+/// refused at parse, and an inadmissible value is refused at load (never
+/// clamped).
+#[test]
+fn mip_refine_intermediates_applies_from_yaml_and_refuses_bad_values() {
+    let armed: PresetConfig = serde_yaml::from_str(
+        "bab:\n  mip_refine_intermediates:\n    layers: 3\n    budget_frac: 0.25\n",
+    )
+    .expect("armed refiner preset");
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &armed).expect("armed refiner preset should apply");
+    assert_eq!(
+        config.mip_refine_intermediates,
+        Some(ny_propagate::MipRefineIntermediates {
+            layers: 3,
+            budget_frac: 0.25,
+        })
+    );
+
+    let defaults: PresetConfig =
+        serde_yaml::from_str("bab:\n  mip_refine_intermediates: {}\n").expect("defaults only");
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &defaults).expect("defaults preset should apply");
+    assert_eq!(
+        config.mip_refine_intermediates,
+        Some(ny_propagate::MipRefineIntermediates::default())
+    );
+
+    for bad in [
+        "bab:\n  mip_refine_intermediates:\n    layers: 0\n",
+        "bab:\n  mip_refine_intermediates:\n    layers: 65\n",
+        "bab:\n  mip_refine_intermediates:\n    budget_frac: 0.0\n",
+        "bab:\n  mip_refine_intermediates:\n    budget_frac: 0.95\n",
+    ] {
+        let preset: PresetConfig = serde_yaml::from_str(bad).expect("bad value still parses");
+        let mut refused = BetaCrownConfig::default();
+        assert!(
+            apply_preset(&mut refused, &preset).is_err(),
+            "`{bad}` must be refused at load"
+        );
+    }
+    for misspelt in [
+        "bab:\n  mip_refine_intermediates:\n    layer: 3\n",
+        "bab:\n  mip_refine_intermediate:\n    layers: 3\n",
+    ] {
+        assert!(
+            serde_yaml::from_str::<PresetConfig>(misspelt).is_err(),
+            "`{misspelt}` must be refused, not silently ignored"
+        );
+    }
+}
+
+/// `#vit-zono-root`: the certified forward-zonotope root map is a MEASUREMENT
+/// key. No shipped preset (any year, production or canary) may name any of its
+/// three keys until the commit carrying the vit measurement (and the vit bank
+/// gate) arms it, and the scan must actually parse presets or it is a void
+/// pass.
+#[test]
+fn vit_zono_root_is_dark_in_every_shipped_preset() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+    let mut named = Vec::new();
+    let mut parsed = 0usize;
+    for year in ["vnncomp24", "vnncomp25", "vnncomp26"] {
+        let Ok(entries) = fs::read_dir(root.join(year)) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("preset directory entry").path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).expect("readable shipped preset");
+            let preset: PresetConfig = serde_yaml::from_str(&text)
+                .unwrap_or_else(|error| panic!("preset {} must parse: {error}", path.display()));
+            parsed += 1;
+            if preset.bab.vit_zono_root.is_some()
+                || preset.bab.vit_zono_root_max_mb.is_some()
+                || preset.bab.vit_zono_root_max_secs.is_some()
+            {
+                named.push(path.display().to_string());
+            }
+        }
+    }
+    assert!(
+        parsed > 0,
+        "no shipped preset was parsed, so this darkness check is VOID, not a pass"
+    );
+    assert!(
+        named.is_empty(),
+        "bab.vit_zono_root[_max_mb|_max_secs] must stay dark in every shipped preset until its \
+         measurement lands: {named:?}"
+    );
+    let mut dark = BetaCrownConfig::default();
+    apply_preset(&mut dark, &PresetConfig::default()).expect("empty preset");
+    assert!(
+        !dark.vit_zono_root,
+        "an empty preset leaves the root map dark"
+    );
+    assert_eq!(dark.vit_zono_root_max_mb, 8192);
+    assert!((dark.vit_zono_root_max_secs - 30.0).abs() < f32::EPSILON);
+    assert!(
+        ny_propagate::zono_core::vit_zono_root_plan(&dark).is_none(),
+        "without the key there is no plan and no work"
+    );
+}
+
+/// `#vit-zono-root`: all three keys reach `BetaCrownConfig` from yaml, an
+/// explicit `false` disarms, omitted ceilings keep their defaults, and an
+/// inadmissible ceiling (`0` included — it never means "unlimited") is refused
+/// at load, as is a misspelt key.
+#[test]
+fn vit_zono_root_applies_from_yaml_and_refuses_bad_values() {
+    let armed: PresetConfig = serde_yaml::from_str(
+        "bab:\n  vit_zono_root: true\n  vit_zono_root_max_mb: 2048\n  vit_zono_root_max_secs: 12.5\n",
+    )
+    .expect("armed root-map preset");
+    assert_eq!(armed.bab.vit_zono_root, Some(true));
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &armed).expect("armed root-map preset should apply");
+    assert!(config.vit_zono_root);
+    assert_eq!(config.vit_zono_root_max_mb, 2048);
+    assert!((config.vit_zono_root_max_secs - 12.5).abs() < f32::EPSILON);
+
+    let enabled_only: PresetConfig =
+        serde_yaml::from_str("bab:\n  vit_zono_root: true\n").expect("enabled only");
+    let mut partial = BetaCrownConfig::default();
+    apply_preset(&mut partial, &enabled_only).expect("enabled-only preset should apply");
+    assert!(partial.vit_zono_root);
+    assert_eq!(partial.vit_zono_root_max_mb, 8192);
+    assert!((partial.vit_zono_root_max_secs - 30.0).abs() < f32::EPSILON);
+
+    let disarmed: PresetConfig =
+        serde_yaml::from_str("bab:\n  vit_zono_root: false\n").expect("disarmed");
+    let mut config = BetaCrownConfig {
+        vit_zono_root: true,
+        ..BetaCrownConfig::default()
+    };
+    apply_preset(&mut config, &disarmed).expect("disarmed preset should apply");
+    assert!(
+        !config.vit_zono_root,
+        "an explicit false must reach the config"
+    );
+
+    for bad in ["0", "63", "1048577"] {
+        let yaml = format!("bab:\n  vit_zono_root_max_mb: {bad}\n");
+        let preset: PresetConfig = serde_yaml::from_str(&yaml).expect("bad value still parses");
+        let mut refused = BetaCrownConfig::default();
+        assert!(
+            apply_preset(&mut refused, &preset).is_err(),
+            "`vit_zono_root_max_mb: {bad}` must be refused at load"
+        );
+    }
+    for bad in ["0", "-1", "3601", ".nan", ".inf"] {
+        let yaml = format!("bab:\n  vit_zono_root_max_secs: {bad}\n");
+        let preset: PresetConfig = serde_yaml::from_str(&yaml).expect("bad value still parses");
+        let mut refused = BetaCrownConfig::default();
+        assert!(
+            apply_preset(&mut refused, &preset).is_err(),
+            "`vit_zono_root_max_secs: {bad}` must be refused at load"
+        );
+    }
+    assert!(
+        serde_yaml::from_str::<PresetConfig>("bab:\n  vit_zono_rot: true\n").is_err(),
+        "a misspelt key must be refused, not silently ignored"
+    );
+}
+
+/// `#vit-zono-root`: the root map reaches the lane through the TYPED preset
+/// key. Its plan records where the arming came from, and the key has no
+/// environment reader at all, so a plan built from yaml must report
+/// `Source::Config` — never `Source::LegacyEnv`.
+#[test]
+fn vit_zono_root_preset_source_is_typed() {
+    let armed: PresetConfig =
+        serde_yaml::from_str("bab:\n  vit_zono_root: true\n").expect("armed preset");
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &armed).expect("armed preset should apply");
+    let plan = ny_propagate::zono_core::vit_zono_root_plan(&config)
+        .expect("the yaml key must produce an armed plan");
+    assert_ne!(plan.source, ny_levers::Source::LegacyEnv);
+    assert_eq!(plan.source, ny_levers::Source::Config);
+    assert_eq!(plan.max_bytes, 8192u64 << 20);
+    assert!((plan.max_secs - 30.0).abs() < 1e-9);
 }
 
 #[test]
@@ -1420,9 +3050,43 @@ fn cgan_sparse_target_complete_canary_differs_by_exactly_three_knobs() {
     );
 }
 
+/// #precheck-abs-cap: the absolute ceiling (seconds) cgan2026 puts on the
+/// disjunctive CROWN / Alpha-CROWN precheck phases. Held in ONE place so the
+/// yaml, the parsed preset, and the applied `BetaCrownConfig` cell cannot drift
+/// apart. Value chosen from measurement, not preference — see
+/// `reports/measured-2026/precheck_ship_2026-08-30/NOTES.md`.
+const CGAN2026_PRECHECK_MAX_SECS: u64 = 60;
+
 /// cgan2026 resamples properties over the same seven ONNX models as cgan_2023.
 /// Keep model-cost and sound-fallback scheduling levers aligned without
 /// transferring any result-count claim between competitions.
+///
+/// `bab.phase_budget.disjunctive_precheck_max_secs` (#precheck-abs-cap) was
+/// armed on cgan2026 first (2026-08-30) and on cgan_2023 only after its own A/B,
+/// a MOAT decision rather than a tuning taste:
+///
+///  * cgan2026 banks ZERO `unsat` (12 sat + 8 timeout + 1 unknown). All 12 sat
+///    are decided by the upfront PGD / trusted-ORT attack in 0.1-1.3 s, which is
+///    STRICTLY UPSTREAM of the precheck phase (`disjunctive.rs`: the attack lane
+///    runs before `crown_precheck_clauses`). Bounding the precheck therefore
+///    cannot lose a banked verdict here; it can only hand BaB more seconds.
+///  * cgan_2023 banks TWO `unsat` — `imgSz32_nCh_1` prop_3 at 542.6 s and
+///    `imgSz32_nCh_3` prop_1 at 808.0 s. Those are a live regression surface, so
+///    the cap was not transferred there unmeasured; the A/B over those two rows
+///    (2026-09-10, recorded in the test body) held both, and both presets now
+///    arm the same value.
+///
+/// Measured basis: `reports/measured-2026/precheck_discard_2026-08-30/` (the
+/// phase is a pure discard on row 10: capping it 4.8x leaves BaB's first six
+/// `[disjunctive-trajectory]` rows BIT-IDENTICAL) and
+/// `reports/measured-2026/precheck_ship_2026-08-30/` (the value, chosen across
+/// all eight open rows).
+///
+/// The normalization below is deliberately NARROW — this one field and nothing
+/// else. The final block of this test PROVES it is narrow by showing that a
+/// second divergence, inside `phase_budget` and outside it, still trips the
+/// equality. Without that block a widened normalization could silently license
+/// arbitrary drift between the two presets.
 #[test]
 fn cgan2026_mirrors_byte_identical_model_schedule_levers() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -1443,10 +3107,30 @@ fn cgan2026_mirrors_byte_identical_model_schedule_levers() {
         cgan_2026.bab.crown_ibp_per_node_cap_secs,
         cgan_2025.bab.crown_ibp_per_node_cap_secs
     );
+    // #precheck-abs-cap: state the cap positively on both presets, so the
+    // normalization below can never quietly absorb some OTHER value. The
+    // cgan_2023 A/B (2026-09-10, GB10, HEAD f8768e4cd, zero NY_*): both banked
+    // unsat rows held and got faster under the cap (542.6 -> 308.5 s,
+    // 808.0 -> 555.4 s), so cgan_2023 arms the same measured value.
     assert_eq!(
-        serde_json::to_value(&cgan_2026.bab.phase_budget).unwrap(),
+        cgan_2025.bab.phase_budget.disjunctive_precheck_max_secs,
+        Some(CGAN2026_PRECHECK_MAX_SECS),
+        "cgan_2023 must arm the measured precheck absolute cap (A/B 2026-09-10)"
+    );
+    assert_eq!(
+        cgan_2026.bab.phase_budget.disjunctive_precheck_max_secs,
+        Some(CGAN2026_PRECHECK_MAX_SECS),
+        "cgan2026 must arm the measured precheck absolute cap"
+    );
+
+    let mut normalized_phase_budget = cgan_2026.bab.phase_budget.clone();
+    normalized_phase_budget.disjunctive_precheck_max_secs =
+        cgan_2025.bab.phase_budget.disjunctive_precheck_max_secs;
+    assert_eq!(
+        serde_json::to_value(&normalized_phase_budget).unwrap(),
         serde_json::to_value(&cgan_2025.bab.phase_budget).unwrap(),
-        "byte-identical model schedules must retain the proven phase ceilings"
+        "byte-identical model schedules must retain the proven phase ceilings \
+         apart from the measured precheck absolute cap"
     );
     assert_eq!(
         serde_json::to_value(&cgan_2026.bab.branching).unwrap(),
@@ -1474,10 +3158,34 @@ fn cgan2026_mirrors_byte_identical_model_schedule_levers() {
     let mut normalized_2026 = cgan_2026.clone();
     normalized_2026.general.root_path = cgan_2025.general.root_path.clone();
     normalized_2026.general.device = cgan_2025.general.device.clone();
+    normalized_2026
+        .bab
+        .phase_budget
+        .disjunctive_precheck_max_secs = cgan_2025.bab.phase_budget.disjunctive_precheck_max_secs;
     assert_eq!(
         serde_json::to_value(&normalized_2026).unwrap(),
         serde_json::to_value(&cgan_2025).unwrap(),
-        "byte-identical cGAN presets may differ only in corpus path and selected device"
+        "byte-identical cGAN presets may differ only in corpus path, selected \
+         device, and the measured precheck absolute cap"
+    );
+
+    // ABLE TO FAIL. The three normalizations above are the whole licence this
+    // test grants; anything else must still be caught. Demonstrate that with a
+    // second divergence INSIDE phase_budget (the block the cap widened) and one
+    // OUTSIDE it, both applied to the already-normalized preset.
+    let mut second_divergence = normalized_2026.clone();
+    second_divergence.bab.phase_budget.initial_bounds_fraction = Some(0.44);
+    assert_ne!(
+        serde_json::to_value(&second_divergence).unwrap(),
+        serde_json::to_value(&cgan_2025).unwrap(),
+        "the precheck-cap normalization must not mask any other phase_budget drift"
+    );
+    let mut third_divergence = normalized_2026;
+    third_divergence.bab.batch_size = Some(63);
+    assert_ne!(
+        serde_json::to_value(&third_divergence).unwrap(),
+        serde_json::to_value(&cgan_2025).unwrap(),
+        "the precheck-cap normalization must not mask drift outside phase_budget"
     );
 
     let mut config = BetaCrownConfig::default();
@@ -1488,6 +3196,15 @@ fn cgan2026_mirrors_byte_identical_model_schedule_levers() {
     assert_eq!(config.phase_budget.attack_extension_fraction, 0.0);
     assert_eq!(config.phase_budget.initial_bounds_fraction, 0.45);
     assert_eq!(config.phase_budget.disjunctive_precheck_fraction, 0.85);
+    // #precheck-abs-cap: assert the APPLIED cell, not only the parsed preset.
+    // `apply.rs:1130` is the bridge that writes it, and a bridge like this has
+    // been silently clobbered in a merge before while the resolver-side test
+    // stayed green. 0.85 * 900 = 765 s is a REAL grant here (measured 717.884 s
+    // spent for `verified=0`), so this absolute ceiling is the only bound.
+    assert_eq!(
+        config.phase_budget.disjunctive_precheck_max_secs,
+        Some(CGAN2026_PRECHECK_MAX_SECS)
+    );
     assert_eq!(config.phase_budget.post_bab_pgd_fraction, 0.0);
     assert_eq!(config.branching_heuristic, BranchingHeuristic::InputSplit);
     assert_eq!(config.fsb_candidates, 5);
@@ -1707,9 +3424,14 @@ fn cgan_generator_relu_phase_split_canary_is_explicit_and_scoped() {
     assert_eq!(canary.bab.clip.relaxed, Some(true));
     assert_eq!(canary.bab.clip.relaxed_iterations, Some(20));
     assert_eq!(canary.bab.alpha_crown.lr_alpha, Some(0.2));
-    assert_eq!(canary.bab.alpha_crown.iterations, Some(100));
-    assert_eq!(canary.bab.beta_crown.lr_alpha, Some(0.1));
-    assert_eq!(canary.bab.beta_crown.lr_beta, Some(0.15));
+    // #general-defaults 2026-08-31: 100 IS the engine default
+    // (alpha_config.rs, citing abc arguments.py:354), so stating it was a no-op in
+    // 24 configs. Absent or 100 are the same resolved value; disagreement is not.
+    assert!(canary.bab.alpha_crown.iterations.is_none_or(|v| v == 100));
+    // #general-defaults: beta alpha_lr default corrected 0.01 -> 0.1 (13 of 14).
+    assert!(canary.bab.beta_crown.lr_alpha.is_none_or(|v| v == 0.1));
+    // #general-defaults: beta_lr default corrected 0.05 -> 0.15 (11 of 14).
+    assert!(canary.bab.beta_crown.lr_beta.is_none_or(|v| v == 0.15));
     assert_eq!(canary.bab.beta_crown.iterations, Some(25));
 }
 
@@ -1822,20 +3544,24 @@ fn yolo_2023_preset_auto_kfsb_arms_typed_critical_row_policy() {
     assert!(config.use_multi_objective_critical_kfsb);
 }
 
-/// yolo_2023 pins the historical 12-second base cap after an official 2026 row
-/// showed that every useful target completed within 8.715 seconds while two
-/// later targets consumed 51.772 and 31.142 seconds before falling back to IBP.
+/// yolo_2023 carries NO per-node CROWN-IBP cap. The historical 12-second cap was
+/// set because Conv_12/Conv_20 "consumed 51.772 and 31.142 seconds before falling
+/// back to IBP" — but they fell back because the residual patches merge refused
+/// on deadline PRESENCE (audit N6, regression 7b0140d09). With that fixed, the
+/// cap was the only thing starving Conv_20/Conv_25: MEASURED 2026-09-23 on the
+/// GB10, prop_000001 at the official 300 s, capped = 5/7 CROWN targets and a
+/// watchdog SIGKILL at 308 s, uncapped = 7/7 CROWN and UNSAT at 76.3 s. Re-adding
+/// a cap must re-measure that row first.
 #[test]
-fn yolo_2023_preset_caps_doomed_crown_ibp_targets() {
+fn yolo_2023_preset_leaves_crown_ibp_targets_uncapped() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let preset = load_preset(&repo_root.join("configs/vnncomp25/yolo_2023.yaml")).unwrap();
 
-    assert_eq!(preset.bab.crown_ibp_per_node_cap_secs, Some(12.0));
+    assert_eq!(preset.bab.crown_ibp_per_node_cap_secs, None);
 
     let mut config = BetaCrownConfig::default();
     apply_preset(&mut config, &preset).unwrap();
-    assert_eq!(config.crown_ibp_per_node_cap_secs, Some(12.0));
-    assert_eq!(config.crown_ibp_per_node_time_budget().cap_secs, Some(12.0));
+    assert_eq!(config.crown_ibp_per_node_cap_secs, None);
 }
 
 /// Presets that do not opt in carry no per-node overrides: the collector keeps
@@ -1979,4 +3705,362 @@ fn disjunctive_pgd_cap_stays_scoped_to_presets_that_measured_it() {
             "{name} must not inherit relusplitter's absolute cap"
         );
     }
+}
+
+/// #sb-plane delivery: the typed key parses from yaml, reaches
+/// `BetaCrownConfig` through `apply_preset`, defaults dark, and NO production
+/// cgan preset arms it (the measurement runs on a canary copy). Fails if the
+/// key stops flowing, if the default flips, or if someone arms production
+/// without a measured promotion.
+#[test]
+fn sb_keep_plane_under_fresh_clip_parses_flows_to_config_and_ships_dark() {
+    // Parse route: a minimal yaml naming only this key.
+    let armed_text =
+        "bab:\n  branching:\n    input_split:\n      sb_keep_plane_under_fresh_clip: true\n";
+    let armed: PresetConfig = serde_yaml::from_str(armed_text).unwrap();
+    assert_eq!(
+        armed
+            .bab
+            .branching
+            .input_split
+            .sb_keep_plane_under_fresh_clip,
+        Some(true)
+    );
+    let mut armed_config = BetaCrownConfig::default();
+    assert!(
+        !armed_config.input_split_sb_keep_plane_under_fresh_clip,
+        "the engine default must be dark"
+    );
+    apply_preset(&mut armed_config, &armed).unwrap();
+    assert!(
+        armed_config.input_split_sb_keep_plane_under_fresh_clip,
+        "the typed key must reach BetaCrownConfig"
+    );
+
+    // An explicit `false` is delivered too (not conflated with absent).
+    let disarmed_text = armed_text.replace("true", "false");
+    let disarmed: PresetConfig = serde_yaml::from_str(&disarmed_text).unwrap();
+    assert_eq!(
+        disarmed
+            .bab
+            .branching
+            .input_split
+            .sb_keep_plane_under_fresh_clip,
+        Some(false)
+    );
+
+    // Production cgan presets ship DARK: key absent, resolved config false.
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for relative in [
+        "configs/vnncomp25/cgan_2023.yaml",
+        "configs/vnncomp26/cgan2026.yaml",
+    ] {
+        let production = load_preset(&repo_root.join(relative)).unwrap();
+        assert_eq!(
+            production
+                .bab
+                .branching
+                .input_split
+                .sb_keep_plane_under_fresh_clip,
+            None,
+            "{relative} must not arm #sb-plane without a measured promotion"
+        );
+        let mut production_config = BetaCrownConfig::default();
+        apply_preset(&mut production_config, &production).unwrap();
+        assert!(
+            !production_config.input_split_sb_keep_plane_under_fresh_clip,
+            "{relative} must resolve #sb-plane dark"
+        );
+    }
+}
+
+/// #cap-extend delivery: PROMOTED 2026-09-10. Production cgan2026 (and
+/// cgan_2023, kept byte-identical by the mirror test) now arm the disjunctive
+/// domain-cap extension, measured on the GB10 (HEAD f8768e4cd, zero NY_*):
+/// nCh_1 prop_1 timeout -> unsat 833-838 s (3/3), both banked unsat rows held.
+/// The canary yaml is retained and must be byte-identical to production, so
+/// the key still flows to `BetaCrownConfig` and nobody can silently re-darken
+/// production while the canary keeps reading as the armed arm.
+#[test]
+fn cgan2026_cap_extend_is_promoted_and_flows_to_config() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let production = load_preset(&repo_root.join("configs/vnncomp26/cgan2026.yaml")).unwrap();
+    let canary =
+        load_preset(&repo_root.join("configs/vnncomp26/cgan2026_capextend_canary.yaml")).unwrap();
+
+    // Production is ARMED (promotion 2026-09-10), and the key is DELIVERED.
+    assert_eq!(
+        production.bab.branching.input_split.cap_extend_near_closure,
+        Some(true),
+        "production cgan2026 must arm #cap-extend (promoted 2026-09-10)"
+    );
+    let mut production_config = BetaCrownConfig::default();
+    apply_preset(&mut production_config, &production).unwrap();
+    assert!(production_config.input_split_cap_extend_near_closure);
+
+    // Canary is ARMED, and the key is DELIVERED to the engine config.
+    assert_eq!(
+        canary.bab.branching.input_split.cap_extend_near_closure,
+        Some(true)
+    );
+    let mut canary_config = BetaCrownConfig::default();
+    apply_preset(&mut canary_config, &canary).unwrap();
+    assert!(canary_config.input_split_cap_extend_near_closure);
+
+    // Since the promotion the canary is byte-identical to production.
+    assert_eq!(
+        serde_json::to_value(&canary).unwrap(),
+        serde_json::to_value(&production).unwrap(),
+        "cap-extend canary must equal production cgan2026 after the 2026-09-10 promotion"
+    );
+}
+
+/// #cct-margin-row-admission: the cct preset arms EXACTLY cifar100_2024's
+/// margin-row lane levers at cifar100's values, with tinyimagenet_2024's
+/// reserve pattern (`reserve_secs: 0` + `concurrent`) in place of cifar100's
+/// `adaptive_reserve` — cct's 120 s / 550 s tiers would otherwise hold a 45 s
+/// reserve AND run the concurrent lane (see
+/// `concurrent_presets_never_also_hold_a_reserve`). Category resolution must
+/// deliver the block, and the patches-wiring canary must carry it verbatim.
+#[test]
+fn cct_margin_row_block_is_cifar100_lane_levers_with_zero_reserve() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let cifar = load_preset(&repo_root.join("configs/vnncomp25/cifar100_2024.yaml")).unwrap();
+    let cct =
+        load_preset(&repo_root.join("configs/vnncomp26/challenging_certified_training_2026.yaml"))
+            .unwrap();
+
+    // `domain_stack` + `err_envelope` were armed on cifar100 (and tiny) on
+    // their OWN A/B (2026-09-26, scratchpad/mrab); cct has no measurement of
+    // the pair yet (WAVE6_PLAN M12), so it is a deliberate, recorded divergence
+    // until a cct A/B arms it here. User-directed bounded frozen-dual defaults
+    // are scoped to CIFAR100/TinyImageNet; CCT keeps the parent and refinement
+    // keys absent as another explicit divergence.
+    let mut want: Vec<&str> = margin_row_fields_set(&cifar.margin_row)
+        .into_iter()
+        .filter(|f| {
+            !matches!(
+                *f,
+                "adaptive_reserve"
+                    | "domain_stack"
+                    | "err_envelope"
+                    | "frozen_dual_bab"
+                    | "frozen_dual_refine_steps"
+            )
+        })
+        .collect();
+    want.push("reserve_secs");
+    want.sort_unstable();
+    let mut got = margin_row_fields_set(&cct.margin_row);
+    got.sort_unstable();
+    assert_eq!(
+        got, want,
+        "cct margin_row preserves its recorded divergences from CIFAR100's lane levers"
+    );
+
+    let (c, x) = (&cct.margin_row, &cifar.margin_row);
+    assert_eq!(c.reserve_secs, Some(0));
+    assert_eq!(c.adaptive_reserve, None);
+    assert_eq!(c.frozen_dual_bab, None);
+    assert_eq!(c.frozen_dual_refine_steps, None);
+    assert_eq!(c.concurrent, Some(true));
+    assert_eq!(c.concurrent, x.concurrent);
+    assert_eq!(c.root_f32, x.root_f32);
+    assert_eq!(c.k_head, x.k_head);
+    assert_eq!(c.k_trunk, x.k_trunk);
+    assert_eq!(c.alpha_opt, x.alpha_opt);
+    assert_eq!(c.alpha_cols, x.alpha_cols);
+    assert_eq!(c.clip_interm, x.clip_interm);
+    assert_eq!(c.clip_rows, x.clip_rows);
+    assert_eq!(c.closure_max_tier, x.closure_max_tier);
+    assert_eq!(c.interm_alpha, x.interm_alpha);
+    assert_eq!(c.column_retire, x.column_retire);
+    assert_eq!(c.closure_adaptive, x.closure_adaptive);
+    assert_eq!(c.branch_reduce_max, x.branch_reduce_max);
+    assert_eq!(c.parent_lift, x.parent_lift);
+    assert_eq!(c.backward_interm, x.backward_interm);
+    assert_eq!(c.bi_secs, x.bi_secs);
+
+    let effective = crate::commands::vnncomp::resolve_preset_path(
+        &repo_root.join("configs"),
+        "challenging_certified_training_2026",
+    )
+    .expect("the cct category resolves an explicit preset");
+    let resolved = load_preset(&effective).expect("effective cct preset loads");
+    assert_eq!(resolved.margin_row.concurrent, Some(true));
+    assert_eq!(resolved.margin_row.reserve_secs, Some(0));
+
+    let canary =
+        load_preset(&repo_root.join(
+            "configs/vnncomp26/challenging_certified_training_2026_patcheswiring_canary.yaml",
+        ))
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&canary.margin_row).unwrap(),
+        serde_json::to_value(&cct.margin_row).unwrap(),
+        "the patches-wiring canary must carry the production margin_row block verbatim"
+    );
+}
+
+/// `#vgg-gpu-crown`: the certified GPU patches-CROWN root pass is a
+/// MEASUREMENT key. No shipped preset (any year, production or canary) may
+/// name it until the commit carrying the vggnet16 spec15-17 measurement arms
+/// it, and the scan must actually parse presets or it is a void pass.
+#[test]
+fn gpu_patches_crown_is_dark_in_every_shipped_preset() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+    let mut named = Vec::new();
+    let mut parsed = 0usize;
+    for year in ["vnncomp24", "vnncomp25", "vnncomp26"] {
+        let Ok(entries) = fs::read_dir(root.join(year)) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("preset directory entry").path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).expect("readable shipped preset");
+            let preset: PresetConfig = serde_yaml::from_str(&text)
+                .unwrap_or_else(|error| panic!("preset {} must parse: {error}", path.display()));
+            parsed += 1;
+            if preset.bab.gpu_patches_crown.is_some() {
+                named.push(path.display().to_string());
+            }
+        }
+    }
+    assert!(
+        parsed > 0,
+        "no shipped preset was parsed, so this darkness check is VOID, not a pass"
+    );
+    assert!(
+        named.is_empty(),
+        "bab.gpu_patches_crown must stay dark in every shipped preset until its \
+         measurement lands: {named:?}"
+    );
+    let mut dark = BetaCrownConfig::default();
+    apply_preset(&mut dark, &PresetConfig::default()).expect("empty preset");
+    assert_eq!(
+        dark.gpu_patches_crown, None,
+        "an empty preset arms no GPU patches-CROWN pass"
+    );
+}
+
+/// `#vgg-gpu-crown`: the key reaches `BetaCrownConfig` from yaml with its
+/// defaults filled, explicit values (including `precision: f32`) survive, a
+/// misspelt sub-key or key is refused at parse, and an inadmissible value is
+/// refused at load (never clamped).
+#[test]
+fn gpu_patches_crown_applies_from_yaml_and_refuses_bad_values() {
+    let armed: PresetConfig = serde_yaml::from_str(
+        "bab:\n  gpu_patches_crown:\n    chunk_rows: 128\n    max_mb: 4096\n    \
+         gpu_tile_mb: 512\n    precision: f32\n    depth: 4\n    screen: false\n    \
+         budget_frac: 0.8\n    max_secs: 1000.0\n    min_perturbed: 100000\n",
+    )
+    .expect("armed GPU patches-CROWN preset");
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &armed).expect("armed preset should apply");
+    let pass = config.gpu_patches_crown.expect("the key must land");
+    assert_eq!(pass.chunk_rows, 128);
+    assert_eq!(pass.max_mb, 4096);
+    assert_eq!(pass.gpu_tile_mb, 512);
+    assert_eq!(pass.precision, ny_propagate::GpuPatchesPrecision::F32);
+    assert_eq!(pass.depth, 4);
+    assert!(!pass.screen);
+    assert!((pass.budget_frac - 0.8).abs() < 1e-12);
+    assert!((pass.max_secs - 1000.0).abs() < 1e-12);
+    assert_eq!(pass.min_perturbed, 100_000);
+    assert!(
+        (pass.headroom_frac - ny_propagate::GpuPatchesCrownConfig::default().headroom_frac).abs()
+            < 1e-12,
+        "an unset sub-key keeps its default"
+    );
+
+    let defaults: PresetConfig =
+        serde_yaml::from_str("bab:\n  gpu_patches_crown: {}\n").expect("defaults only");
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &defaults).expect("defaults preset should apply");
+    assert_eq!(
+        config.gpu_patches_crown,
+        Some(ny_propagate::GpuPatchesCrownConfig::default())
+    );
+
+    for bad in [
+        "bab:\n  gpu_patches_crown:\n    chunk_rows: 0\n",
+        "bab:\n  gpu_patches_crown:\n    max_mb: 0\n",
+        "bab:\n  gpu_patches_crown:\n    headroom_frac: 1.5\n",
+        "bab:\n  gpu_patches_crown:\n    gpu_tile_mb: 0\n",
+        "bab:\n  gpu_patches_crown:\n    depth: 65\n",
+        "bab:\n  gpu_patches_crown:\n    budget_frac: 0.99\n",
+        "bab:\n  gpu_patches_crown:\n    max_secs: 0.0\n",
+    ] {
+        let preset: PresetConfig = serde_yaml::from_str(bad).expect("bad value still parses");
+        let mut refused = BetaCrownConfig::default();
+        assert!(
+            apply_preset(&mut refused, &preset).is_err(),
+            "`{bad}` must be refused at load"
+        );
+    }
+    for misspelt in [
+        "bab:\n  gpu_patches_crown:\n    chunk_row: 3\n",
+        "bab:\n  gpu_patches_crown:\n    precision: f16\n",
+        "bab:\n  gpu_patch_crown: {}\n",
+    ] {
+        assert!(
+            serde_yaml::from_str::<PresetConfig>(misspelt).is_err(),
+            "`{misspelt}` must be refused, not silently ignored"
+        );
+    }
+}
+
+/// `#disj-odi`: the disjunctive exact-VJP ODI and focus-lane keys are
+/// MEASUREMENT keys. No shipped preset (any year, production or canary) may
+/// name either until the commit carrying the tinyimagenet idx_1831/idx_5529
+/// conversion and the both-year moat arms cifar100/tinyimagenet, and the scan
+/// must actually parse presets or it is a void pass.
+#[test]
+fn disj_odi_keys_are_dark_in_every_shipped_preset() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+    let mut named = Vec::new();
+    let mut parsed = 0usize;
+    for year in ["vnncomp24", "vnncomp25", "vnncomp26"] {
+        let Ok(entries) = fs::read_dir(root.join(year)) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("preset directory entry").path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).expect("readable shipped preset");
+            let preset: PresetConfig = serde_yaml::from_str(&text)
+                .unwrap_or_else(|error| panic!("preset {} must parse: {error}", path.display()));
+            parsed += 1;
+            if preset.attack.pgd_disj_odi.is_some() || preset.attack.pgd_disj_focus_lanes.is_some()
+            {
+                named.push(path.display().to_string());
+            }
+            let mut config = BetaCrownConfig::default();
+            if apply_preset(&mut config, &preset).is_ok() {
+                assert!(
+                    !config.pgd_exact_vjp.disj_odi && config.pgd_exact_vjp.disj_focus_lanes == 0,
+                    "{} resolves an armed #disj-odi policy",
+                    path.display()
+                );
+            }
+        }
+    }
+    assert!(
+        parsed > 0,
+        "no shipped preset was parsed, so this darkness check is VOID, not a pass"
+    );
+    assert!(
+        named.is_empty(),
+        "attack.pgd_disj_odi / attack.pgd_disj_focus_lanes must stay dark in every shipped \
+         preset until their measurement lands: {named:?}"
+    );
+    let mut dark = BetaCrownConfig::default();
+    apply_preset(&mut dark, &PresetConfig::default()).expect("empty preset");
+    assert!(!dark.pgd_exact_vjp.disj_odi);
+    assert_eq!(dark.pgd_exact_vjp.disj_focus_lanes, 0);
 }

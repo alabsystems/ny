@@ -4,8 +4,6 @@
 
 //! Proptest IBP soundness tests for misc layers: Gather, Where, NonZero,
 //! SkipMerge, OpaqueSkip, Floor, Ceil, Round, Sign, Reciprocal (zero-crossing).
-//!
-//! Part of #40, #2564.
 
 use crate::layers::common::BoundPropagation;
 use crate::layers::{
@@ -495,7 +493,6 @@ proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(500) })]
 
     /// Floor IBP soundness: for any x in [l, u], floor(x) is within IBP bounds.
-    /// Part of #2564.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_floor_ibp(intervals in prop::collection::vec(valid_interval(20.0), 4)) {
@@ -512,7 +509,6 @@ proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(500) })]
 
     /// Ceil IBP soundness: for any x in [l, u], ceil(x) is within IBP bounds.
-    /// Part of #2564.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_ceil_ibp(intervals in prop::collection::vec(valid_interval(20.0), 4)) {
@@ -529,7 +525,6 @@ proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(500) })]
 
     /// Round IBP soundness: for any x in [l, u], round(x) is within IBP bounds.
-    /// Part of #2564.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_round_ibp(intervals in prop::collection::vec(valid_interval(20.0), 4)) {
@@ -601,7 +596,6 @@ proptest! {
     /// Sign IBP soundness: for any x in [l, u], sign(x) is within IBP bounds.
     /// Exercises all sign_interval_bounds branches: purely positive, purely
     /// negative, crossing zero, touching zero from one side.
-    /// Part of #2564.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_sign_ibp(intervals in prop::collection::vec(valid_interval(20.0), 4)) {
@@ -611,7 +605,6 @@ proptest! {
 
     /// Sign IBP with intervals guaranteed to cross zero — exercises the
     /// (-1, 1) fallback path in sign_interval_bounds.
-    /// Part of #2564.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_sign_ibp_crossing_zero(
@@ -650,7 +643,6 @@ proptest! {
     /// Reciprocal IBP soundness for multi-element tensor with all-positive intervals.
     /// Verifies the elementwise propagation is correct across multiple dimensions.
     /// Complements the single-element tests in elementwise.rs.
-    /// Part of #2564.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_reciprocal_ibp_multi_element(
@@ -665,7 +657,6 @@ proptest! {
 
     /// Reciprocal IBP soundness for multi-element tensor with mixed positive/negative.
     /// Each element is independently positive or negative (no zero-crossing per element).
-    /// Part of #2564.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_reciprocal_ibp_multi_mixed(
@@ -686,11 +677,10 @@ proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(500) })]
 
     /// Reciprocal IBP with zero-crossing interval returns Ok with conservative
-    /// fallback bounds since #3030 added new_repaired before BoundedTensor::new.
+    /// fallback bounds since new_repaired was added before BoundedTensor::new.
     /// The Inf endpoints are preserved (a non-finite endpoint carries no proven
     /// bound, so no finite substitute is sound). Verify the bounds contain
     /// sampled reciprocal values at the interval endpoints (away from zero).
-    /// Part of #2564.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_reciprocal_ibp_zero_crossing(
@@ -703,7 +693,7 @@ proptest! {
         let layer = ReciprocalLayer::new();
         let result = layer.propagate_ibp(&input);
 
-        // #3030 new_repaired accepts ±Inf endpoints (NaN widens to ±inf) → Ok
+        // new_repaired accepts ±Inf endpoints (NaN widens to ±inf) → Ok
         let output = result.expect("Reciprocal IBP zero-crossing should return Ok after #3030 repair");
         let out_lower = output.lower()[[0]];
         let out_upper = output.upper()[[0]];
@@ -722,7 +712,7 @@ proptest! {
     }
 
     /// Reciprocal IBP with zero endpoint returns Ok with conservative fallback
-    /// bounds since #3030 added new_repaired. Part of #2564.
+    /// bounds since new_repaired was added.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_reciprocal_ibp_zero_endpoint(val in 0.01f32..10.0, side: bool) {
@@ -731,7 +721,7 @@ proptest! {
         let layer = ReciprocalLayer::new();
         let result = layer.propagate_ibp(&input);
 
-        // #3030 new_repaired accepts ±Inf endpoints (NaN widens to ±inf) → Ok
+        // new_repaired accepts ±Inf endpoints (NaN widens to ±inf) → Ok
         let output = result.expect("Reciprocal IBP zero-endpoint should return Ok after #3030 repair");
         let out_lower = output.lower()[[0]];
         let out_upper = output.upper()[[0]];

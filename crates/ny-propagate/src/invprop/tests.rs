@@ -245,7 +245,7 @@ fn test_invprop_state() {
     assert_eq!(layer1.gammas[[0, 0, 0]], 0.0);
 }
 
-/// Regression test (#2712): mark_infeasible returns Err on out-of-bounds batch_idx
+/// Regression test: mark_infeasible returns Err on out-of-bounds batch_idx
 /// instead of panicking.
 #[ntest::timeout(5000)]
 #[test]
@@ -329,7 +329,7 @@ fn test_ny_params_roundtrip() {
         .expect("invariant: layer2 was just added");
     assert_eq!(layer2.gammas[[0, 0, 0]], 1.2); // Index 12 (first of layer2)
 
-    // Regression test (#2712): wrong-length params returns Err instead of panicking
+    // Regression test: wrong-length params returns Err instead of panicking
     let bad_params: Vec<f32> = vec![0.0; 5]; // wrong length (expected 16)
     let result = state.update_ny_params(&bad_params);
     assert!(result.is_err(), "wrong-length params should return Err");

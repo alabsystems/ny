@@ -68,7 +68,7 @@ fn test_sigmoid_range() {
     }
 }
 
-/// Regression test for #3316: sigmoid IBP bounds must stay in [0, 1] even for
+/// Regression test: sigmoid IBP bounds must stay in [0, 1] even for
 /// extreme inputs where directed rounding could push past the range boundary.
 /// sigmoid(-1000) → 0 via f64 underflow, next_down_f32(0.0) = -1e-45.
 /// sigmoid(1000) → 1 via f64 saturation, next_up_f32(1.0) > 1.

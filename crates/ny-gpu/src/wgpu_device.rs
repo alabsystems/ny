@@ -290,10 +290,10 @@ pub struct WgpuDevice {
     // MatMul IBP pipeline
     matmul_ibp_pipeline: wgpu::ComputePipeline,
     matmul_ibp_bind_group_layout: wgpu::BindGroupLayout,
-    // ReLU IBP pipeline (in-place max(x,0) for resident forward, #4081)
+    // ReLU IBP pipeline (in-place max(x,0) for resident forward)
     relu_ibp_pipeline: wgpu::ComputePipeline,
     relu_ibp_bind_group_layout: wgpu::BindGroupLayout,
-    // Conv2d IBP pipeline (resident forward, #4275)
+    // Conv2d IBP pipeline (resident forward)
     conv2d_ibp_pipeline: wgpu::ComputePipeline,
     conv2d_ibp_bind_group_layout: wgpu::BindGroupLayout,
     // Softmax IBP pipeline (two passes: reduce + apply)
@@ -310,12 +310,12 @@ pub struct WgpuDevice {
     // GEMM pipelines (CROWN linear backward)
     gemm_f32_pipeline: wgpu::ComputePipeline,
     gemm_f32_bind_group_layout: wgpu::BindGroupLayout,
-    // Small-K GEMM: flat kernel for K ≤ 64, no shared memory/barriers (#3599)
+    // Small-K GEMM: flat kernel for K ≤ 64, no shared memory/barriers
     gemm_f32_small_k_pipeline: wgpu::ComputePipeline,
-    // CROWN backward pipelines (persistent GPU A-matrices, #3397)
+    // CROWN backward pipelines (persistent GPU A-matrices)
     crown_activation_backward_pipeline: wgpu::ComputePipeline,
     crown_activation_backward_bind_group_layout: wgpu::BindGroupLayout,
-    // ReLU dual-alpha activation backward (#4313) — same bind-group layout as standard activation
+    // ReLU dual-alpha activation backward — same bind-group layout as standard activation
     crown_activation_relu_dual_alpha_pipeline: wgpu::ComputePipeline,
     crown_maxpool2d_backward_pipeline: wgpu::ComputePipeline,
     crown_maxpool2d_backward_bind_group_layout: wgpu::BindGroupLayout,
@@ -332,15 +332,15 @@ pub struct WgpuDevice {
     /// adapters never do because their DAG route deliberately declines.
     intermediate_sweep_dag_pipelines:
         std::sync::OnceLock<shaders_intermediate_sweep::SweepDagPipelines>,
-    // Conv2d CROWN backward pipelines (#3397)
+    // Conv2d CROWN backward pipelines
     conv_reshape_pipeline: wgpu::ComputePipeline,
     conv_reshape_bind_group_layout: wgpu::BindGroupLayout,
     conv_col2im_pipeline: wgpu::ComputePipeline,
     conv_col2im_bind_group_layout: wgpu::BindGroupLayout,
-    // Add IBP pipeline (element-wise interval addition for residual, #4319)
+    // Add IBP pipeline (element-wise interval addition for residual)
     add_ibp_pipeline: wgpu::ComputePipeline,
     add_ibp_bind_group_layout: wgpu::BindGroupLayout,
-    // AvgPool IBP pipeline (windowed/global average pooling, #4320)
+    // AvgPool IBP pipeline (windowed/global average pooling)
     avgpool_ibp_pipeline: wgpu::ComputePipeline,
     avgpool_ibp_bind_group_layout: wgpu::BindGroupLayout,
     /// Buffer pool for reuse across calls
@@ -427,9 +427,9 @@ pub struct WgpuDevice {
     /// (`wgpu-28.0.0/src/api/buffer.rs:572`) and racing on the same compute
     /// buffers (a soundness hazard). Holding this lock for the duration of each
     /// op makes GPU submission single-threaded, which is correct and matches the
-    /// sequential GPU usage the buffer pool already assumes (#3813). See
+    /// sequential GPU usage the buffer pool already assumes. See
     /// `error_scope.rs::run_gpu_checked`.
-    gpu_serialize: std::sync::Mutex<()>,
+    gpu_serialize: std::sync::Arc<std::sync::Mutex<()>>,
     /// Cooperative-cancellation deadline for multi-dispatch CROWN backward calls
     /// (#w4-refresh-deadline). Set/cleared via the `GpuCrownBackward` trait's
     /// `set_crown_backward_deadline`; checked between spec batches
@@ -510,7 +510,7 @@ pub struct WgpuDevice {
 }
 
 impl WgpuDevice {
-    /// Clear the reusable GPU CROWN working set for long-lived runners (#3515).
+    /// Clear the reusable GPU CROWN working set for long-lived runners.
     ///
     /// This drops only the CROWN-specific pooled buffers and cached staging
     /// plans, preserving the shared device and compiled pipelines.

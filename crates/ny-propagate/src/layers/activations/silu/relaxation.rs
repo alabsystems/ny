@@ -8,7 +8,6 @@
 //! using chord + tangent bounds based on convexity structure.
 //!
 //! Reference: alpha-beta-CROWN BoundGelu, gelu.py:320-383
-//! Reference: designs/2026-02-08-silu-crown-relaxation.md
 
 use super::math::{
     silu_chord, silu_critical_point, silu_derivative, silu_eval_f64, silu_inflection_points,
@@ -32,7 +31,6 @@ use tracing::warn;
 /// - p₁ < x < p₂ ≈ +2.40: convex → tangent lower, chord upper
 /// - x > p₂: concave → chord lower, tangent upper
 ///
-/// Reference: designs/2026-02-08-silu-crown-relaxation.md
 /// Source: alpha-beta-CROWN BoundGelu, gelu.py:320-383
 pub fn silu_sound_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
     // Handle NaN: no valid relaxation possible.
@@ -43,7 +41,6 @@ pub fn silu_sound_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
     // Handle infinite bounds: SiLU(x) → 0 as x → -∞, SiLU(x) → x as x → +∞.
     // No finite linear bound can contain SiLU over an infinite range on the
     // positive side. Return maximally loose bounds.
-    // Reference: designs/2026-02-08-silu-crown-relaxation.md, "Fix for Bug 1"
     if u == f32::INFINITY {
         return LinearRelaxation::nan_fallback();
     }
@@ -81,7 +78,7 @@ pub fn silu_sound_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
 }
 
 /// Relaxation for an interval entirely in the convex region [p1, p2].
-/// Tangent lower, chord upper. With directed rounding (#2434).
+/// Tangent lower, chord upper. With directed rounding.
 fn silu_relaxation_convex(l: f32, u: f32) -> LinearRelaxation {
     let max_abs_x = l.abs().max(u.abs());
     // Bit-identical tangent anchor: f32::midpoint rounds differently at overflow/subnormal edges.
@@ -89,7 +86,7 @@ fn silu_relaxation_convex(l: f32, u: f32) -> LinearRelaxation {
     let (ls, ls_lower_i, _ls_upper_i) = silu_tangent((l + u) / 2.0, max_abs_x);
     let (us, _us_lower_i, us_upper_i) = silu_chord(l, u);
     // Verify soundness: tangent (with sound lower intercept) must be below SiLU.
-    // Strict comparison in f64: directed rounding (#3146) absorbs f64→f32 slope
+    // Strict comparison in f64: directed rounding absorbs f64→f32 slope
     // truncation error, but f32 evaluation of the check itself can mask sub-ULP
     // violations. Using f64 catches these. Ref: alpha-beta-CROWN uses exact <=.
     let lower_at_l = ls as f64 * l as f64 + ls_lower_i as f64;
@@ -98,7 +95,7 @@ fn silu_relaxation_convex(l: f32, u: f32) -> LinearRelaxation {
         // Tangent as lower bound (lower_intercept), chord as upper bound (upper_intercept).
         return LinearRelaxation::new(ls, ls_lower_i, us, us_upper_i);
     }
-    // Fallback to constant bounds if numerical issues arise (#2981 Slice 4).
+    // Fallback to constant bounds if numerical issues arise.
     // Sound (over-approximation) but looser than tangent bounds.
     warn!(
         "SiLU convex tangent verification failed on [{l}, {u}], \
@@ -109,7 +106,7 @@ fn silu_relaxation_convex(l: f32, u: f32) -> LinearRelaxation {
 }
 
 /// Relaxation for an interval entirely in a concave region (left or right).
-/// Chord lower, tangent upper (Jensen's inequality). With directed rounding (#2434).
+/// Chord lower, tangent upper (Jensen's inequality). With directed rounding.
 fn silu_relaxation_concave(l: f32, u: f32) -> LinearRelaxation {
     let max_abs_x = l.abs().max(u.abs());
     let (ls, ls_lower_i, _ls_upper_i) = silu_chord(l, u);
@@ -117,7 +114,7 @@ fn silu_relaxation_concave(l: f32, u: f32) -> LinearRelaxation {
     #[allow(clippy::manual_midpoint)]
     let (us, _us_lower_i, us_upper_i) = silu_tangent((l + u) / 2.0, max_abs_x);
     // Verify soundness: tangent (with sound upper intercept) must be above SiLU.
-    // Strict comparison in f64 (#2434): catches sub-ULP violations masked by f32.
+    // Strict comparison in f64: catches sub-ULP violations masked by f32.
     // Ref: alpha-beta-CROWN uses exact >= in check_upper().
     let upper_at_l = us as f64 * l as f64 + us_upper_i as f64;
     let upper_at_u = us as f64 * u as f64 + us_upper_i as f64;
@@ -125,7 +122,7 @@ fn silu_relaxation_concave(l: f32, u: f32) -> LinearRelaxation {
         // Chord as lower bound (lower_intercept), tangent as upper bound (upper_intercept).
         return LinearRelaxation::new(ls, ls_lower_i, us, us_upper_i);
     }
-    // Fallback: sound but looser (#2981 Slice 4).
+    // Fallback: sound but looser.
     warn!(
         "SiLU concave tangent verification failed on [{l}, {u}], \
          falling back to constant bounds"
@@ -166,7 +163,7 @@ fn silu_relaxation_concave(l: f32, u: f32) -> LinearRelaxation {
 fn silu_relaxation_crossing(l: f32, u: f32, p1: f32, p2: f32) -> LinearRelaxation {
     let (min_val, max_val) = silu_min_max(l, u);
 
-    // Use f64-intermediate chord helper with directed rounding (#2434).
+    // Use f64-intermediate chord helper with directed rounding.
     let (chord_slope, _chord_lower_i, chord_upper_i) = silu_chord(l, u);
 
     let crosses_left = l < p1;
@@ -262,7 +259,7 @@ fn verify_upper_bound(l: f32, u: f32, slope: f32, intercept: f32) -> bool {
             x -= g / gp;
             x = x.clamp(l, u);
         }
-        // Strict f64 comparison (#2434): if SiLU exceeds line anywhere, line is
+        // Strict f64 comparison: if SiLU exceeds line anywhere, line is
         // not a valid upper bound. f64 catches sub-ULP violations masked by f32.
         let deviation = silu_eval_f64(x as f64) - (slope as f64 * x as f64 + intercept as f64);
         if deviation > 0.0 {
@@ -272,7 +269,7 @@ fn verify_upper_bound(l: f32, u: f32, slope: f32, intercept: f32) -> bool {
     // Also check the critical point and inflection points explicitly.
     // For crossing intervals, the deviation maximum can occur near an inflection
     // point where curvature changes sign. Consistent with find_upper_tangent_binary
-    // which checks [l, u, critical, p1, p2]. (#2434 audit F1)
+    // which checks [l, u, critical, p1, p2].
     let critical = silu_critical_point();
     let (p1, p2) = silu_inflection_points();
     for &x in &[critical, p1, p2] {
@@ -305,16 +302,10 @@ fn find_lower_tangent_binary(l: f32, u: f32, p1: f32, p2: f32) -> Option<(f32, f
     }
 
     // Find the rightmost d where tangent is valid at l.
-    // Kani 0.66.0 does not support `?` on `Option` (E0277: `std::ops::Try` not implemented).
-    // Use explicit match instead. See #2305.
-    #[allow(clippy::question_mark)]
     let d_max_for_l = if l >= p1 {
         search_u // l in convex region — no constraint
     } else {
-        match binary_search_tangent_below(search_l, search_u, l, true) {
-            Some(d) => d,
-            None => return None,
-        }
+        binary_search_tangent_below(search_l, search_u, l, true)?
     };
 
     // Find the leftmost d where tangent is valid at u.
@@ -327,7 +318,7 @@ fn find_lower_tangent_binary(l: f32, u: f32, p1: f32, p2: f32) -> Option<(f32, f
                 // Even the rightmost tangent violates at u. Try d_max_for_l directly.
                 // Use raw tangent for verification check.
                 let (ts, ti) = silu_tangent_raw(d_max_for_l);
-                // Strict f64 check (#2434): raw tangent must not exceed SiLU at u.
+                // Strict f64 check: raw tangent must not exceed SiLU at u.
                 if ts as f64 * u as f64 + ti as f64 <= silu_eval_f64(u as f64) {
                     // Return directed-rounded lower intercept for final output.
                     let max_abs_x = l.abs().max(u.abs());
@@ -351,7 +342,7 @@ fn find_lower_tangent_binary(l: f32, u: f32, p1: f32, p2: f32) -> Option<(f32, f
     // Use raw tangent for verification, directed-rounded for output.
     let (ts, ti) = silu_tangent_raw(d_opt);
 
-    // Final safety: verify at endpoints and critical point in f64 (#2434).
+    // Final safety: verify at endpoints and critical point in f64.
     // The returned intercept will be directed-rounded via silu_tangent().
     let critical = silu_critical_point();
     for &x in &[l, u, critical] {
@@ -380,7 +371,7 @@ fn binary_search_tangent_below(
     find_rightmost: bool,
 ) -> Option<f32> {
     let tangent_below_at = |d: f32| -> bool {
-        // Strict f64 check (#2434): tangent at d must not exceed SiLU at x.
+        // Strict f64 check: tangent at d must not exceed SiLU at x.
         let (ts, ti) = silu_tangent_raw(d);
         ts as f64 * x as f64 + ti as f64 <= silu_eval_f64(x as f64)
     };
@@ -418,7 +409,7 @@ fn binary_search_tangent_below(
 /// line is a valid upper bound for SiLU on [l, u], using binary search.
 ///
 /// Uses `silu_tangent_raw` for candidate checking, `silu_tangent` with
-/// directed rounding for the final output (#2434).
+/// directed rounding for the final output.
 ///
 /// Reference: alpha-beta-CROWN gelu.py:122-139 (d_upper_right precomputation)
 fn find_upper_tangent_binary(l: f32, u: f32, p2: f32) -> Option<(f32, f32)> {
@@ -429,7 +420,7 @@ fn find_upper_tangent_binary(l: f32, u: f32, p2: f32) -> Option<(f32, f32)> {
     }
 
     // Check if tangent at d is above SiLU(x) — use raw tangent for search.
-    // Strict f64 check (#2434): tangent must not fall below SiLU at x.
+    // Strict f64 check: tangent must not fall below SiLU at x.
     let tangent_above_at = |d: f32, x: f32| -> bool {
         let (ts, ti) = silu_tangent_raw(d);
         ts as f64 * x as f64 + ti as f64 >= silu_eval_f64(x as f64)
@@ -464,7 +455,7 @@ fn find_upper_tangent_binary(l: f32, u: f32, p2: f32) -> Option<(f32, f32)> {
     // Verify at the critical point and inflection point.
     let critical = silu_critical_point();
     let (p1, _) = silu_inflection_points();
-    // Strict f64 check (#2434): raw tangent must not fall below SiLU.
+    // Strict f64 check: raw tangent must not fall below SiLU.
     // The returned intercept will be directed-rounded via silu_tangent().
     for &x in &[l, u, critical, p1, p2] {
         if x >= l && x <= u && (ts as f64 * x as f64 + ti as f64) < silu_eval_f64(x as f64) {

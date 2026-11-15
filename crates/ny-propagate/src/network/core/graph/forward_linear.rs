@@ -94,7 +94,7 @@ fn forward_linear_cold_build_admitted_at(deadline: Option<Instant>, now: Instant
 }
 
 /// Last-resort forward-linear throughput constant, in MACs per second, used
-/// only when the startup micro-calibration probe cannot run or fails
+/// when a deadline-scored caller has no completed calibration, or the probe fails
 /// (#forward-linear-cost-gate).
 ///
 /// Measured ONCE on `CIFAR100_resnet_medium`: the cold build is 559.4 G f64
@@ -141,11 +141,64 @@ fn forward_linear_instance_budget_enabled() -> bool {
 /// the existing `NY_FORWARD_LINEAR_F32=1`, uncached environment read. The seam
 /// changes which GEMM implementation the deadline dispatch chain reaches, so
 /// both the calibrated rate and the cache fingerprint are keyed on it.
-fn forward_linear_f32_seam_armed() -> bool {
-    matches!(
-        std::env::var("NY_FORWARD_LINEAR_F32").ok().as_deref(),
-        Some("1")
-    )
+/// Process-wide preset override for the f32 value-GEMM seam
+/// (#fl-f32-seam-key): 0 = unset (fall back to the legacy env read), 1 = on,
+/// 2 = off.
+///
+/// WHY THIS EXISTS. The seam was reachable ONLY through
+/// `NY_FORWARD_LINEAR_F32`, and `vnncomp_scripts/run_instance.sh` exports ZERO
+/// `NY_*` variables — so a measured **1.9x** end-to-end speedup (and ~40x on
+/// the value GEMMs themselves, cuBLAS Sgemm vs the GB10's 0.41 TF/s Dgemm) was
+/// dead capability in competition. This makes it deliverable by typed preset
+/// key while leaving the env route intact for A/B sweeps.
+///
+/// Process-global rather than graph-local because the seam is read from
+/// `image.rs` deep inside the composition, where no `&self` is in scope, and
+/// because one scored `ny vnncomp v1` invocation is one instance.
+static FORWARD_LINEAR_F32_SEAM_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// Arm or disarm the f32 value-GEMM seam from a resolved preset
+/// (#fl-f32-seam-key). Call once, before any bound is computed.
+///
+/// The CLI passes the value already LAYERED against the
+/// `ny_levers::decls::forward_linear::FORWARD_LINEAR_F32` declaration
+/// (`resolve_forward_linear_f32_seam`: a scored run's frozen `LeverSet`, i.e.
+/// its flight receipt; interactively the environment over the typed key), so
+/// the override that wins in [`forward_linear_f32_seam_armed`] is the value the
+/// receipt records rather than the raw preset key.
+///
+/// ⚠ PRECISION-NEGATIVE: the seam is SOUND (the larger f32 accumulation error
+/// is bounded by the Higham factor `gamma_{K+4}^f32 * S` plus an FTZ underflow
+/// guard, discharged into the bias through the same certified-error channel the
+/// f64 path uses) but LOOSER. Arming it can cost verdicts on categories ny
+/// currently verifies — `docs/CIFAR100_BOUND_PARITY_ORACLE.md` measured 0 gains
+/// and 1 regression on cifar100. Arm only per-preset, on measured evidence.
+pub fn set_forward_linear_f32_seam(enabled: bool) {
+    FORWARD_LINEAR_F32_SEAM_OVERRIDE.store(
+        if enabled { 1 } else { 2 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The single source of truth for the seam's state: the installed (already
+/// layered) override first, then the declared lever's environment read.
+/// `image.rs` defers to this so the two historical read sites can never
+/// disagree.
+///
+/// The environment arm reads THROUGH the declaration
+/// (`ny_levers::decls::forward_linear::FORWARD_LINEAR_F32`, `LeverKind::Bool`:
+/// exact `"1"` arms, `"0"` and every rejected token stay on the f64 path), so
+/// the run and its flight receipt resolve the variable with the same code and
+/// cannot drift apart (#fl-alpha-composition).
+pub(crate) fn forward_linear_f32_seam_armed() -> bool {
+    match FORWARD_LINEAR_F32_SEAM_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => ny_levers::read(&ny_levers::decls::forward_linear::FORWARD_LINEAR_F32)
+            .value
+            .as_bool(),
+    }
 }
 
 /// One process-wide calibration of the forward-linear build throughput
@@ -164,43 +217,112 @@ struct ForwardLinearRateCalibration {
     probe_secs: f64,
 }
 
-/// Effective forward-linear build throughput for admission prediction.
-///
-/// Order of authority:
-/// 1. `NY_FORWARD_LINEAR_MACS_PER_SEC` — the existing manual escape hatch,
-///    absolute precedence, no probe runs.
-/// 2. A per-process measured rate from [`calibrate_forward_linear_rate`],
-///    cached in a `OnceLock` PER SEAM MODE (the f32 seam reaches a different
-///    GEMM implementation under deadline, so the two rates differ ~2x on CPU
-///    hosts and more where an accelerator serves only one of them).
-/// 3. [`FORWARD_LINEAR_F64_MACS_PER_SEC_FALLBACK`] when the probe fails.
-fn forward_linear_rate_calibration(
-    engine: Option<&dyn GemmEngine>,
-) -> ForwardLinearRateCalibration {
-    let seam_f32 = forward_linear_f32_seam_armed();
-    if let Some(rate) = std::env::var("NY_FORWARD_LINEAR_MACS_PER_SEC")
-        .ok()
-        .and_then(|v| v.parse::<u128>().ok())
-        .filter(|&v| v > 0)
-    {
-        return ForwardLinearRateCalibration {
-            macs_per_sec: rate,
-            source: "env",
-            seam_f32,
-            probe_macs: 0,
-            probe_secs: 0.0,
-        };
-    }
-    static RATE_SEAM_OFF: std::sync::OnceLock<ForwardLinearRateCalibration> =
-        std::sync::OnceLock::new();
-    static RATE_SEAM_ON: std::sync::OnceLock<ForwardLinearRateCalibration> =
-        std::sync::OnceLock::new();
-    let slot = if seam_f32 {
+static RATE_SEAM_OFF: std::sync::OnceLock<ForwardLinearRateCalibration> =
+    std::sync::OnceLock::new();
+static RATE_SEAM_ON: std::sync::OnceLock<ForwardLinearRateCalibration> = std::sync::OnceLock::new();
+
+fn forward_linear_rate_slot(
+    seam_f32: bool,
+) -> &'static std::sync::OnceLock<ForwardLinearRateCalibration> {
+    if seam_f32 {
         &RATE_SEAM_ON
     } else {
         &RATE_SEAM_OFF
+    }
+}
+
+fn forward_linear_rate_override(
+    raw: Option<&str>,
+    seam_f32: bool,
+) -> Option<ForwardLinearRateCalibration> {
+    let rate = raw
+        .and_then(|v| v.parse::<u128>().ok())
+        .filter(|&v| v > 0)?;
+    Some(ForwardLinearRateCalibration {
+        macs_per_sec: rate,
+        source: "env",
+        seam_f32,
+        probe_macs: 0,
+        probe_secs: 0.0,
+    })
+}
+
+fn forward_linear_rate_fallback(seam_f32: bool) -> ForwardLinearRateCalibration {
+    ForwardLinearRateCalibration {
+        macs_per_sec: FORWARD_LINEAR_F64_MACS_PER_SEC_FALLBACK,
+        source: "fallback",
+        seam_f32,
+        probe_macs: 0,
+        probe_secs: 0.0,
+    }
+}
+
+// get() neither starts an initializer nor waits for one in progress. A cold
+// fallback is deliberately NOT stored: an explicit calibration caller may
+// still initialize this seam later.
+fn forward_linear_rate_without_probe_from(
+    slot: &std::sync::OnceLock<ForwardLinearRateCalibration>,
+    raw: Option<&str>,
+    seam_f32: bool,
+) -> ForwardLinearRateCalibration {
+    forward_linear_rate_override(raw, seam_f32)
+        .or_else(|| slot.get().copied())
+        .unwrap_or_else(|| forward_linear_rate_fallback(seam_f32))
+}
+
+/// Effective forward-linear build throughput for admission prediction.
+///
+/// Explicit initializing callers retain env > per-seam probe > fallback.
+/// Deadline-scored collector walks instead use forward_linear_cached_rate.
+fn forward_linear_rate_calibration(
+    engine: Option<&dyn GemmEngine>,
+) -> ForwardLinearRateCalibration {
+    #[cfg(test)]
+    record_rate_access(false);
+    let seam_f32 = forward_linear_f32_seam_armed();
+    let raw = ny_levers::read_raw(&ny_levers::decls::kernel_inputs::FORWARD_LINEAR_MACS_PER_SEC);
+    if let Some(rate) = forward_linear_rate_override(raw.as_deref(), seam_f32) {
+        return rate;
+    }
+    *forward_linear_rate_slot(seam_f32)
+        .get_or_init(|| calibrate_forward_linear_rate(engine, seam_f32))
+}
+
+// Thread-local request census makes the collector regression independent of
+// global cache warmth, test ordering, and the debug-build probe bypass.
+#[cfg(test)]
+thread_local! {
+    static RATE_ACCESS_COUNTS: std::cell::Cell<Option<(usize, usize)>> = const {
+        std::cell::Cell::new(None)
     };
-    *slot.get_or_init(|| calibrate_forward_linear_rate(engine, seam_f32))
+}
+#[cfg(test)]
+fn record_rate_access(cached_only: bool) {
+    RATE_ACCESS_COUNTS.with(|slot| {
+        if let Some((cached, initializing)) = slot.get() {
+            slot.set(Some((
+                cached + usize::from(cached_only),
+                initializing + usize::from(!cached_only),
+            )));
+        }
+    });
+}
+#[cfg(test)]
+pub(crate) struct ForwardLinearRateAccessCounter(Option<(usize, usize)>);
+#[cfg(test)]
+impl ForwardLinearRateAccessCounter {
+    pub(crate) fn start() -> Self {
+        Self(RATE_ACCESS_COUNTS.with(|slot| slot.replace(Some((0, 0)))))
+    }
+    pub(crate) fn counts(&self) -> (usize, usize) {
+        RATE_ACCESS_COUNTS.with(|slot| slot.get().expect("active rate counter"))
+    }
+}
+#[cfg(test)]
+impl Drop for ForwardLinearRateAccessCounter {
+    fn drop(&mut self) {
+        RATE_ACCESS_COUNTS.with(|slot| slot.set(self.0));
+    }
 }
 
 /// Census-representative single-conv probe workload: contraction 1152
@@ -260,6 +382,19 @@ fn calibration_diag_enabled() -> bool {
     *D.get_or_init(|| std::env::var("NY_FL_CALIB_DIAG").is_ok_and(|v| v == "1"))
 }
 
+/// Whether [`calibrate_forward_linear_rate`] measures in this build: always,
+/// except in an unoptimized build of this crate's unit tests, where the probe
+/// cannot finish inside its rep deadline (see that function's last paragraph).
+const fn forward_linear_probe_runs_in_this_build() -> bool {
+    !cfg!(all(test, debug_assertions))
+}
+
+/// Probe reps started in this process. Unit tests only: it lets the test that
+/// pins which builds measure count reps instead of reading a clock.
+#[cfg(test)]
+static FORWARD_LINEAR_PROBE_REPS_STARTED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Startup micro-calibration: time the calibration fixture through
 /// [`collect_forward_linear_state_dag`] — the EXACT production build path, so
 /// the measured rate captures the full deadline dispatch precedence
@@ -275,17 +410,29 @@ fn calibration_diag_enabled() -> bool {
 /// warm-up discard is then waived so the probe still reports a measurement).
 /// Each rep is bounded by a 5 s deadline. Any error falls back to the
 /// conservative shipped constant.
+///
+/// An unoptimized build of this crate's own unit tests does not probe
+/// (`#fl-calib-debug-tests`): it takes the shipped constant at once. There the
+/// probe could only time out. Measured 2026-10-08 (M5 Max, debug lib test
+/// binary, load 54-75): with the per-rep diagnostic armed (`#fl-calib-diag`)
+/// the calibration ran 5.03-5.10 s and no rep completed (3 of 3), and the first
+/// collector walk admission of a fresh process took 5.00-5.03 s (10 of 10, two
+/// builds). So the calibration was this same constant every time, 5 s late.
+/// The probe is lazy, so those 5 s came out of whichever test first reached a
+/// deadline-carrying admission: 93% of the 5.4 s root-warmup cap of a 30 s BaB
+/// test. That test then verified, fell back to IBP or returned `Unknown`
+/// depending on host load and on whether another test had run first
+/// (`test_gpu_bab_conv2d_graph_branching` failed that way in gate [d]'s conv2d
+/// slice and passed alone 5 of 5). Optimized test builds and every non-test
+/// build still measure.
 fn calibrate_forward_linear_rate(
     engine: Option<&dyn GemmEngine>,
     seam_f32: bool,
 ) -> ForwardLinearRateCalibration {
-    let fallback = ForwardLinearRateCalibration {
-        macs_per_sec: FORWARD_LINEAR_F64_MACS_PER_SEC_FALLBACK,
-        source: "fallback",
-        seam_f32,
-        probe_macs: 0,
-        probe_secs: 0.0,
-    };
+    let fallback = forward_linear_rate_fallback(seam_f32);
+    if !forward_linear_probe_runs_in_this_build() {
+        return fallback;
+    }
     let Some((graph, input)) = forward_linear_calibration_fixture(seam_f32) else {
         return fallback;
     };
@@ -295,6 +442,8 @@ fn calibrate_forward_linear_rate(
     let mut best: Option<f64> = None;
     let mut warmup_elapsed: Option<f64> = None;
     for rep in 0..3 {
+        #[cfg(test)]
+        FORWARD_LINEAR_PROBE_REPS_STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let deadline = Instant::now() + FORWARD_LINEAR_CALIBRATION_REP_DEADLINE;
         let started = Instant::now();
         if collect_forward_linear_state_dag(
@@ -390,6 +539,30 @@ pub fn forward_linear_measured_rate() -> ForwardLinearRateObservation {
     }
 }
 
+/// Read a usable rate without starting or waiting for micro-calibration.
+///
+/// The deadline-scored CROWN collector needs an admission estimate inside an
+/// already running node/collection clock. Preserve env precedence and reuse
+/// a completed calibration for the active seam; otherwise use the unchanged
+/// conservative fallback. This does not initialize either calibration slot.
+pub(crate) fn forward_linear_cached_rate() -> ForwardLinearRateObservation {
+    #[cfg(test)]
+    record_rate_access(true);
+    let seam_f32 = forward_linear_f32_seam_armed();
+    let raw = ny_levers::read_raw(&ny_levers::decls::kernel_inputs::FORWARD_LINEAR_MACS_PER_SEC);
+    let calibration = forward_linear_rate_without_probe_from(
+        forward_linear_rate_slot(seam_f32),
+        raw.as_deref(),
+        seam_f32,
+    );
+    ForwardLinearRateObservation {
+        macs_per_sec: u64::try_from(calibration.macs_per_sec).unwrap_or(u64::MAX),
+        source: calibration.source,
+        seam_f32: calibration.seam_f32,
+        probe_secs: calibration.probe_secs,
+    }
+}
+
 /// Flight-recorder snapshot of the most recent forward-linear cold-build
 /// admission decision (#forward-linear-cost-gate, I7): the calibrated rate
 /// with its provenance, the seam mode, and predicted-vs-remaining seconds.
@@ -427,6 +600,46 @@ pub fn forward_linear_admission_record() -> Option<ForwardLinearAdmissionRecord>
         .lock()
         .ok()
         .and_then(|guard| guard.clone())
+}
+
+/// `#fl-map-lru` — EXPERIMENT constant. `0` ships (the historical single slot).
+///
+/// Measured on cgan `upsample_prop_0` AFTER the cap-extend replay is removed:
+/// 1080 redundant cold builds remain, at SHORT reuse distances
+/// (min=2, median=45, p75=53, max=116). Simulated LRU over that real request
+/// sequence:
+///
+/// ```text
+/// capacity   2 ->  367 hits ( 9.6%)  ~ 61 s
+///           32 -> 1001 hits (26.2%)  ~166 s
+///           64 -> 1073 hits (28.0%)  ~178 s
+///          128 -> 1080 hits (28.2%)  ~179 s (saturates)
+/// ```
+///
+/// So 64 recovers ~178 s = 15% of a 1200 s budget for ZERO bound change.
+///
+/// ⚠ THIS ONLY PAYS WITH `#cap-extend-floor`. On the PRE-fix sequence the same
+/// simulation gave **0 hits at every capacity from 1 to 2048** — the whole-tree
+/// replay put every reuse at distance exactly 2500, so nothing short of holding
+/// all 2500 maps resident (a unified-memory hazard here) could hit. Fixing the
+/// upstream scheduler CHANGED the access sequence. A cache simulation is valid
+/// only for the sequence it was measured on.
+pub(crate) const FL_MAP_LRU_CAP: usize = 0;
+
+/// `#fl-map-lru` insertion policy, extracted so the eviction rule is testable
+/// without constructing cache fingerprints.
+///
+/// Most-recent at the front, evict from the back, never admit a duplicate, and
+/// do nothing at all when `cap == 0`.
+fn lru_admit<T>(lru: &mut Vec<T>, entry: T, cap: usize, same: impl Fn(&T, &T) -> bool) {
+    if cap == 0 {
+        return;
+    }
+    if lru.iter().any(|e| same(e, &entry)) {
+        return;
+    }
+    lru.insert(0, entry);
+    lru.truncate(cap);
 }
 
 impl GraphNetwork {
@@ -571,11 +784,15 @@ impl GraphNetwork {
     /// `NY_NO_FORWARD_LINEAR_REF=1` (disable-flag principle). Shared by the
     /// alpha reference collection, the spec-propagation setup, and the CLI
     /// attack-phase cache warmer (#w5-bab-throughput) so all consult ONE policy.
+    ///
+    /// Read through its declaration
+    /// (`ny_levers::decls::forward_linear::NO_FORWARD_LINEAR_REF`, exact `"1"`),
+    /// so the flight receipt and this gate cannot disagree
+    /// (#fl-alpha-composition).
     pub fn forward_linear_reference_enabled() -> bool {
-        !matches!(
-            std::env::var("NY_NO_FORWARD_LINEAR_REF").ok().as_deref(),
-            Some("1")
-        )
+        !ny_levers::read(&ny_levers::decls::forward_linear::NO_FORWARD_LINEAR_REF)
+            .value
+            .as_bool()
     }
 
     /// Gate for ConvTranspose2d/BatchNorm image forward-linear references:
@@ -603,13 +820,15 @@ impl GraphNetwork {
     /// records 12 official SAT rows, 7 timeouts, and 2 unknowns; the separate
     /// `test_nano` UNSAT is a synthetic regression moat. Those records guide
     /// regression testing but are not an audited verdict-parity claim.
+    ///
+    /// Read through its declaration
+    /// (`ny_levers::decls::forward_linear::NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF`,
+    /// exact `"1"`), so the flight receipt and this gate cannot disagree
+    /// (#fl-alpha-composition).
     pub fn forward_linear_conv_transpose_reference_enabled() -> bool {
-        !matches!(
-            std::env::var("NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF")
-                .ok()
-                .as_deref(),
-            Some("1")
-        )
+        !ny_levers::read(&ny_levers::decls::forward_linear::NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF)
+            .value
+            .as_bool()
     }
 
     /// Whether intermediate-bound collection should attempt the cached
@@ -630,11 +849,22 @@ impl GraphNetwork {
             return false;
         };
         let sequential = self.is_sequential_graph(order);
+        // #fl-seq-no-transpose: the sequential arm historically required BOTH
+        // Conv2d and ConvTranspose2d, which targets the cGAN image surface and
+        // excludes by construction any sequential Conv2d graph built with
+        // Upsample+Conv instead of ConvTranspose (measured: the cGAN `upsample`
+        // variant). The graph-local, default-off gate below admits that shape.
+        // It cannot loosen a bound: a forward-linear reference is an enclosure
+        // either way and admitting it can only tighten, per this module's own
+        // `forward_linear_conv_transpose_reference_enabled` doc. The shared and
+        // ConvTranspose-specific kill switches both still apply.
+        let transpose_arm = self.has_conv_transpose2d_layers()
+            || self.forward_linear_sequential_without_conv_transpose_enabled();
         (!sequential && self.has_conv_layers())
             || (sequential
                 && Self::forward_linear_conv_transpose_reference_enabled()
                 && self.has_conv2d_layers()
-                && self.has_conv_transpose2d_layers())
+                && transpose_arm)
     }
 
     /// Whether an image-only forward-linear consumer should attempt the
@@ -771,7 +1001,13 @@ impl GraphNetwork {
         #[cfg(test)]
         record_forward_linear_collection_request();
         Ok(self
-            .collect_forward_linear_state_cached_impl(input, engine, deadline, false)?
+            // #fl-s-shaped-untyped: graph-local, default OFF -> literal `false`.
+            .collect_forward_linear_state_cached_impl(
+                input,
+                engine,
+                deadline,
+                self.forward_linear_s_shaped_untyped_enabled(),
+            )?
             .0)
     }
 
@@ -816,7 +1052,13 @@ impl GraphNetwork {
         std::sync::Arc<HashMap<String, BoundedTensor>>,
         Option<std::sync::Arc<LinearBounds>>,
     )> {
-        self.collect_forward_linear_state_cached_impl(input, engine, deadline, false)
+        // #fl-s-shaped-untyped: graph-local, default OFF -> literal `false`.
+        self.collect_forward_linear_state_cached_impl(
+            input,
+            engine,
+            deadline,
+            self.forward_linear_s_shaped_untyped_enabled(),
+        )
     }
 
     #[allow(clippy::type_complexity)]
@@ -830,12 +1072,19 @@ impl GraphNetwork {
         std::sync::Arc<HashMap<String, BoundedTensor>>,
         Option<std::sync::Arc<LinearBounds>>,
     )> {
+        self.ensure_proof_eligible()?;
         let allow_conv_transpose = Self::forward_linear_conv_transpose_reference_enabled();
+        // #fl-sigmoid: this bit goes into the forward-linear cache FINGERPRINT
+        // (`forward_linear_cache_fingerprint_with_typed_tanh`), so it must track
+        // exactly which graphs the typed flag changes behaviour for. Now that the
+        // typed surface admits Sigmoid as well as Tanh, a Sigmoid-only graph is
+        // typed-active too — omitting it would let an entry collected with the
+        // typed surface OFF serve a request with it ON.
         let typed_tanh_active = allow_typed_tanh
             && self
                 .nodes
                 .values()
-                .any(|node| matches!(node.layer, Layer::Tanh(_)));
+                .any(|node| matches!(node.layer, Layer::Tanh(_) | Layer::Sigmoid(_)));
         let fingerprint = forward_linear_cache_fingerprint_with_typed_tanh(
             input,
             None,
@@ -847,6 +1096,18 @@ impl GraphNetwork {
         if let Ok(guard) = self.cached_forward_linear_map.fixed.read() {
             if let Some(entry) = guard.as_ref() {
                 if entry.fingerprint.exact_match(&fingerprint) {
+                    return Ok((std::sync::Arc::clone(&entry.map), entry.output_lb.clone()));
+                }
+            }
+        }
+        // #fl-map-lru: bounded companion lookup, exact-match only. Disarmed
+        // (`FL_MAP_LRU_CAP == 0`) this block is skipped entirely.
+        if FL_MAP_LRU_CAP != 0 {
+            if let Ok(guard) = self.cached_forward_linear_map.fixed_lru.read() {
+                if let Some(entry) = guard
+                    .iter()
+                    .find(|e| e.fingerprint.exact_match(&fingerprint))
+                {
                     return Ok((std::sync::Arc::clone(&entry.map), entry.output_lb.clone()));
                 }
             }
@@ -944,14 +1205,25 @@ impl GraphNetwork {
         )?;
         let build_cost = build_start.elapsed();
         check_forward_linear_deadline(deadline, "fixed-cache publication")?;
+        let entry = ForwardLinearCacheEntry {
+            fingerprint,
+            map: std::sync::Arc::clone(&map),
+            output_lb: output_lb.clone(),
+            build_cost,
+        };
+        // #fl-map-lru: publish into the bounded companion FIRST, so the entry
+        // `fixed` is about to overwrite survives. Most-recent at the front;
+        // evict from the back once at capacity.
+        if FL_MAP_LRU_CAP != 0 {
+            if let Ok(mut lru) = self.cached_forward_linear_map.fixed_lru.write() {
+                lru_admit(&mut lru, entry.clone(), FL_MAP_LRU_CAP, |a, b| {
+                    a.fingerprint.exact_match(&b.fingerprint)
+                });
+            }
+        }
         if let Ok(mut guard) = self.cached_forward_linear_map.fixed.write() {
             check_forward_linear_deadline(deadline, "fixed-cache publication")?;
-            *guard = Some(ForwardLinearCacheEntry {
-                fingerprint,
-                map: std::sync::Arc::clone(&map),
-                output_lb: output_lb.clone(),
-                build_cost,
-            });
+            *guard = Some(entry);
         }
         Ok((map, output_lb))
     }
@@ -996,6 +1268,7 @@ impl GraphNetwork {
         std::sync::Arc<HashMap<String, BoundedTensor>>,
         Option<std::sync::Arc<LinearBounds>>,
     )> {
+        self.ensure_proof_eligible()?;
         let fingerprint = forward_linear_cache_fingerprint(
             input,
             Some(relu_alphas),
@@ -1961,6 +2234,7 @@ fn collect_forward_linear_state_dag(
     HashMap<String, BoundedTensor>,
     HashMap<String, LinearBounds>,
 )> {
+    graph.ensure_proof_eligible()?;
     let exec_order = graph.topological_sort()?;
 
     // Image mode (#vnncomp-image-forward-linear): conv DAGs route through the
@@ -2290,8 +2564,25 @@ fn image_mode_supported(layer: &Layer, allow_conv_transpose: bool, allow_typed_t
             | Layer::Reshape(_)
             | Layer::Squeeze(_)
             | Layer::Unsqueeze(_)
-    ) || (allow_conv_transpose && matches!(layer, Layer::ConvTranspose2d(_) | Layer::BatchNorm(_)))
-        || (allow_typed_tanh && matches!(layer, Layer::Tanh(_)))
+    ) || (allow_conv_transpose
+        && matches!(
+            layer,
+            // #fl-resize: Resize rides the SAME flag as ConvTranspose2d/BatchNorm
+            // rather than getting one of its own. That costs no new surface: the
+            // cGAN `upsample` variant is the shape this admits, and it carries
+            // BatchNorm too, so it already required this flag. The flag is really
+            // "the extended cGAN image op set", not "ConvTranspose specifically".
+            Layer::ConvTranspose2d(_) | Layer::BatchNorm(_) | Layer::Resize(_)
+        ))
+        // #fl-sigmoid: Tanh received a typed escape hatch for the cGAN cascade and
+        // Sigmoid never did, which is the whole reason
+        // `cGAN_imgSz32_nCh_3_nonlinear_activations` refuses at Step 1 on
+        // `Sigmoid_27` after PASSING all five eligibility conjuncts. Both are
+        // monotone S-shaped nodes composed through the SAME generic
+        // `compose_s_shaped_diag_forward`, so admitting one and not the other was
+        // a coverage gap, not a soundness boundary. Still behind the same typed
+        // flag, so the ordinary (untyped) surface is unchanged.
+        || (allow_typed_tanh && matches!(layer, Layer::Tanh(_) | Layer::Sigmoid(_)))
 }
 
 /// Resolve an upstream forward-linear map without cloning stored matrices
@@ -2450,6 +2741,15 @@ fn compose_image_node(
                 resolve_running_bounds(pred, node_bounds, ibp_node_bounds, input, node_name)?;
             image::compose_tanh_diag_forward(node_name, &upstream, pre_activation, input_mag)
         }
+        // #fl-sigmoid: same shape as the Tanh arm above; both delegate to the
+        // one generic S-shaped composition.
+        Layer::Sigmoid(_) => {
+            let pred = single_input(layer)?;
+            let upstream = resolve_upstream_linear_ref(pred, linear_bounds, input_dim, node_name)?;
+            let pre_activation =
+                resolve_running_bounds(pred, node_bounds, ibp_node_bounds, input, node_name)?;
+            image::compose_sigmoid_diag_forward(node_name, &upstream, pre_activation, input_mag)
+        }
         Layer::Add(_) => {
             if inputs.len() != 2 {
                 return Err(unsupported_forward_linear_node(
@@ -2475,6 +2775,23 @@ fn compose_image_node(
                 deadline,
                 None,
             )
+        }
+        // #fl-resize: the duplicate-fan-in sibling of the exact passthrough
+        // below. Nearest-neighbour Resize replicates rather than reorders, so
+        // the composed map is a row GATHER and still exact.
+        Layer::Resize(resize) => {
+            let pred = single_input(layer)?;
+            let upstream = resolve_upstream_linear_ref(pred, linear_bounds, input_dim, node_name)?;
+            let pre_activation =
+                resolve_running_bounds(pred, node_bounds, ibp_node_bounds, input, node_name)?;
+            let out_to_in = resize.build_output_to_input_map(pre_activation.shape())?;
+            if out_to_in.len() != output_dim {
+                return Err(NyError::ShapeMismatch {
+                    expected: vec![output_dim],
+                    got: vec![out_to_in.len()],
+                });
+            }
+            image::compose_resize_nearest_forward(node_name, &upstream, &out_to_in)
         }
         Layer::Flatten(_) | Layer::Reshape(_) | Layer::Squeeze(_) | Layer::Unsqueeze(_) => {
             // Pure C-order shape ops: the flattened coefficient layout is
@@ -2803,3 +3120,73 @@ fn layer_debug_name(layer: &Layer) -> String {
 mod tests;
 #[cfg(test)]
 mod tests_image;
+
+#[cfg(test)]
+mod fl_map_lru_tests {
+    use super::{lru_admit, FL_MAP_LRU_CAP};
+
+    fn admit(v: &mut Vec<u32>, e: u32, cap: usize) {
+        lru_admit(v, e, cap, |a, b| a == b);
+    }
+
+    #[test]
+    fn capacity_zero_never_admits_anything() {
+        // This is the SHIPPED path: the companion slot must stay untouched so
+        // the cache is exactly the historical single slot.
+        let mut v: Vec<u32> = Vec::new();
+        admit(&mut v, 1, 0);
+        admit(&mut v, 2, 0);
+        assert!(v.is_empty(), "cap 0 must be a no-op, got {v:?}");
+    }
+
+    #[test]
+    fn the_most_recent_entry_sits_at_the_front_and_the_oldest_is_evicted() {
+        let mut v: Vec<u32> = Vec::new();
+        for e in 1..=5 {
+            admit(&mut v, e, 3);
+        }
+        assert_eq!(v, vec![5, 4, 3], "front is most-recent; 1 and 2 evicted");
+    }
+
+    #[test]
+    fn a_duplicate_is_not_admitted_twice() {
+        // Entries are keyed by an EXACT fingerprint, so a duplicate is the same
+        // request; admitting it again would evict a distinct entry for nothing.
+        let mut v: Vec<u32> = Vec::new();
+        admit(&mut v, 7, 4);
+        admit(&mut v, 8, 4);
+        admit(&mut v, 7, 4);
+        assert_eq!(v, vec![8, 7], "no duplicate, and no reordering churn");
+    }
+
+    #[test]
+    fn capacity_one_degenerates_to_the_single_slot() {
+        let mut v: Vec<u32> = Vec::new();
+        admit(&mut v, 1, 1);
+        admit(&mut v, 2, 1);
+        assert_eq!(v, vec![2]);
+    }
+
+    #[test]
+    fn the_measured_reuse_window_fits_inside_the_intended_capacity() {
+        // Measured max reuse distance on the post-cap-extend sequence is 116,
+        // and the simulation saturates at 128. A capacity of 64 captured 28.0%.
+        // Pin the arithmetic so a future capacity change is a deliberate one.
+        let mut v: Vec<u32> = Vec::new();
+        for e in 0..64u32 {
+            admit(&mut v, e, 64);
+        }
+        assert_eq!(v.len(), 64);
+        assert_eq!(v[0], 63, "front is most-recent");
+        assert_eq!(v[63], 0, "the 64-back entry is still resident");
+    }
+
+    #[test]
+    fn fl_map_lru_ships_disabled() {
+        assert_eq!(
+            FL_MAP_LRU_CAP, 0,
+            "0 keeps the historical single slot; the companion vector is never \
+read or written, so the disarmed path is bit-identical by construction"
+        );
+    }
+}

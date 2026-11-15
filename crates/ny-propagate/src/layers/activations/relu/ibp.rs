@@ -10,7 +10,7 @@ use ny_tensor::BoundedTensor;
 use crate::bounds::nan_propagating_max_zero;
 
 /// IBP propagation for ReLU activation.
-/// Uses NaN-propagating max(0) so NaN bounds poison rather than silently vanish (#2432).
+/// Uses NaN-propagating max(0) so NaN bounds poison rather than silently vanish.
 pub(crate) fn relu_ibp(input: &BoundedTensor) -> Result<BoundedTensor> {
     let lower = input.lower().mapv(nan_propagating_max_zero);
     let upper = input.upper().mapv(nan_propagating_max_zero);

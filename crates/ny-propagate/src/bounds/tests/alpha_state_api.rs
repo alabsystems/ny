@@ -64,7 +64,7 @@ fn test_alpha_state_invprop_accessors_and_double_init() {
     assert!(state.invprop().is_none());
     assert!(state.invprop_mut().is_none());
     assert_eq!(state.num_ny_params(), 0);
-    assert!(state.ny_params().is_empty());
+    assert_eq!((state.ny_params()).len(), 0);
     state
         .update_ny_params(&[1.0, 2.0])
         .expect("updating ny params without invprop should be a no-op");

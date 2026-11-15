@@ -516,7 +516,7 @@ fn build_swiglu_soundness_graph() -> (
     (graph, input, up_weights, up_bias, gate_weights, gate_bias)
 }
 
-/// Soundness test (#2386): sample random points in the input interval and verify
+/// Soundness test: sample random points in the input interval and verify
 /// the true SwiGLU output (up * silu(gate)) falls within bounds.
 #[ntest::timeout(10000)]
 #[test]
@@ -709,8 +709,8 @@ fn test_full_block_zonotope_propagation() {
 
     // Full zonotope propagation through complex networks may be looser than IBP
     // due to accumulated linearization errors from LayerNorm and Softmax.
-    // The 2x threshold was set before soundness fixes (#2473: sum-of-radii for softmax,
-    // #2522: per-element error terms) that correctly increased conservatism, giving
+    // The 2x threshold was set before soundness fixes (sum-of-radii for softmax,
+    // per-element error terms) that correctly increased conservatism, giving
     // ~16.5x. The LayerNorm affine error terms were later widened again to cover the
     // box-wide variation of mean(x) and 1/sqrt(var(x)+eps) that the center-pinned
     // linearization ignored (previously an under-approximation of the true error);
@@ -719,7 +719,6 @@ fn test_full_block_zonotope_propagation() {
     // The value of zonotope propagation is in specific patterns (Q@K^T diagonals,
     // tested in test_zonotope_vs_ibp_attention_qkt_diagonal_tightness) rather than
     // overall bound tightness for full attention blocks.
-    // Ref: #3004 tracks improving the zonotope pipeline for this case.
     assert!(
         zonotope_width <= ibp_width * 40.0,
         "Zonotope bounds should not be catastrophically looser than IBP (got {:.4} vs {:.4}, ratio={:.1}x)",

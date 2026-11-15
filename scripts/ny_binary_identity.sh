@@ -157,7 +157,7 @@ case "${LINE}" in
         die "${BIN} does not support ${MODE_FLAG}.
   This binary predates #binary-identity, so nothing it produces can name its
   own build. Rebuild before measuring:
-    cargo build --release -p ny-cli --features ${SCORED_FEATURES}"
+    targo --unverified build --release -p ny-cli --features ${SCORED_FEATURES}"
         ;;
 esac
 
@@ -197,7 +197,7 @@ if [ -n "${EXPECT_FEATURES}" ]; then
   expected: ${EXPECT_FEATURES}
   found:    ${FOUND_FEATURES}   (ny ${FOUND_VERSION})
   binary:   ${BIN}
-  Rebuild with: cargo build --release -p ny-cli --features ${EXPECT_FEATURES}
+  Rebuild with: targo --unverified build --release -p ny-cli --features ${EXPECT_FEATURES}
   (or set NY_SCORED_FEATURES to declare a deliberately non-scored lane)"
     fi
 fi

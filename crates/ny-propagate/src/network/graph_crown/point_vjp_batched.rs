@@ -80,6 +80,22 @@ pub struct PointVjpBatchPlan {
     ops_forward: Vec<VjpForwardOp>,
 }
 
+impl PointVjpBatchPlan {
+    /// One CPU point forward over the prepared attack template. Unlike the
+    /// restart-batched entry, this does not enter Rayon or allocate ReLU masks.
+    /// This is candidate-generation arithmetic, not a certified bound.
+    pub fn forward_point(&self, point: &[f32]) -> Result<Vec<f32>> {
+        point_vjp_forward_one_impl::<false>(self, point).map(|(_, output)| output)
+    }
+
+    /// One CPU point forward and its ReLU masks, in the same backward slot
+    /// order as the restart-batched entry. A caller can reuse the immutable
+    /// template for a CPU adjoint without reconstructing graph tensors.
+    pub fn forward_point_masks(&self, point: &[f32]) -> Result<(Vec<Vec<f32>>, Vec<f32>)> {
+        point_vjp_forward_one(self, point)
+    }
+}
+
 impl GraphNetwork {
     /// Build the batched point-VJP plan for this graph, or `None` when the graph
     /// is outside the supported pure-chain fragment (caller falls back to the
@@ -91,11 +107,28 @@ impl GraphNetwork {
     /// Conv2d/constant extraction; the ReLU slots' template values are never
     /// used, they are replaced per restart by the masks).
     pub fn build_point_vjp_batch_plan(&self, input: &BoundedTensor) -> Option<PointVjpBatchPlan> {
-        if self.nodes.is_empty() {
+        self.build_point_vjp_batch_plan_with_deadline(input, None)
+    }
+
+    /// Build an attack template under an existing absolute deadline. Shape
+    /// discovery uses the graph's deadline-aware CPU path; setup does not
+    /// create or re-grant an attack allowance.
+    pub fn build_point_vjp_batch_plan_with_deadline(
+        &self,
+        input: &BoundedTensor,
+        deadline: Option<std::time::Instant>,
+    ) -> Option<PointVjpBatchPlan> {
+        let stopped = || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
+        if stopped() || self.nodes.is_empty() {
             return None;
         }
         let center = BoundedTensor::concrete(input.center()).ok()?;
-        let node_bounds = self.collect_node_bounds(&center).ok()?;
+        let node_bounds = match deadline {
+            Some(deadline) => self
+                .collect_node_bounds_with_engine_and_deadline(&center, None, Some(deadline))
+                .ok()?,
+            None => self.collect_node_bounds(&center).ok()?,
+        };
         let output_name = self.output_name().to_string();
         let output_dim = node_bounds.get(&output_name)?.len();
         let input_dim = input.len();
@@ -110,6 +143,9 @@ impl GraphNetwork {
         let max_steps = self.nodes.len() + 1;
         let mut steps = 0usize;
         while current != NETWORK_INPUT {
+            if stopped() {
+                return None;
+            }
             steps += 1;
             if steps > max_steps {
                 return None;
@@ -154,6 +190,9 @@ impl GraphNetwork {
         let slot_of = |idx: usize| mask_positions.iter().position(|&p| p == idx);
         let mut ops_forward = Vec::with_capacity(layers.len());
         for idx in (0..layers.len()).rev() {
+            if stopped() {
+                return None;
+            }
             let op = match &layers[idx] {
                 GpuCrownLayer::Linear { .. } => VjpForwardOp::Linear { idx },
                 GpuCrownLayer::Conv2d { .. } => VjpForwardOp::Conv2d { idx },
@@ -169,6 +208,9 @@ impl GraphNetwork {
             ops_forward.push(op);
         }
 
+        if stopped() {
+            return None;
+        }
         Some(PointVjpBatchPlan {
             layers_backward: layers,
             mask_positions,
@@ -208,11 +250,22 @@ pub fn point_vjp_forward_masks(
 
 /// One point's forward over the template: masks (per slot, fold order) + output.
 fn point_vjp_forward_one(plan: &PointVjpBatchPlan, x: &[f32]) -> Result<(Vec<Vec<f32>>, Vec<f32>)> {
+    point_vjp_forward_one_impl::<true>(plan, x)
+}
+
+fn point_vjp_forward_one_impl<const CAPTURE_MASKS: bool>(
+    plan: &PointVjpBatchPlan,
+    x: &[f32],
+) -> Result<(Vec<Vec<f32>>, Vec<f32>)> {
     if x.len() != plan.input_dim {
         return Err(NyError::shape_mismatch(vec![plan.input_dim], vec![x.len()]));
     }
     let mut buf: Vec<f32> = x.to_vec();
-    let mut masks: Vec<Vec<f32>> = vec![Vec::new(); plan.mask_positions.len()];
+    let mut masks: Vec<Vec<f32>> = if CAPTURE_MASKS {
+        vec![Vec::new(); plan.mask_positions.len()]
+    } else {
+        Vec::new()
+    };
     for op in &plan.ops_forward {
         buf = match *op {
             VjpForwardOp::Linear { idx } => {
@@ -265,10 +318,12 @@ fn point_vjp_forward_one(plan: &PointVjpBatchPlan, x: &[f32]) -> Result<(Vec<Vec
                 if buf.len() != num_neurons {
                     return Err(NyError::shape_mismatch(vec![num_neurons], vec![buf.len()]));
                 }
-                masks[slot] = buf
-                    .iter()
-                    .map(|&v| if v > 0.0 { 1.0 } else { 0.0 })
-                    .collect();
+                if CAPTURE_MASKS {
+                    masks[slot] = buf
+                        .iter()
+                        .map(|&v| if v > 0.0 { 1.0 } else { 0.0 })
+                        .collect();
+                }
                 buf.iter().map(|&v| v.max(0.0)).collect()
             }
         };

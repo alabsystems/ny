@@ -111,8 +111,6 @@ fn kokoro_vocoder_output_shape_from_ort(
 /// the mel128 builder's input contract.  Uses ORT directly, bypassing the
 /// slow `to_graph_network()` const-folding path that makes `features_t >= 5`
 /// infeasible on CPU.
-///
-/// Reference: designs/2026-03-15-issue-3719-ort-concrete-speaker-bridge.md
 #[cfg(feature = "ort")]
 pub(crate) fn kokoro_vocoder_concrete_waveform_from_ort(
     feature_t: usize,
@@ -374,11 +372,10 @@ fn test_graph_avoice_kokoro_vocoder_fixed_aux_fuses_instance_norm_3591() {
 }
 
 // ---------------------------------------------------------------------------
-// Packet 0: graph enumeration diagnostic (#3500)
+// Packet 0: graph enumeration diagnostic
 //
 // Prints the full node inventory in topological order, counting
 // ConvTranspose nodes as natural cut points for prefix subgraph extraction.
-// Reference: designs/2026-03-11-issue-3500-shallow-vocoder-subpath.md §Packet 0
 //
 // Budget: under the corrected har contract (har_t=60*T+1), to_graph_network()
 // const-folds the frozen har branch through the full HiFi-GAN upsampler chain
@@ -386,7 +383,6 @@ fn test_graph_avoice_kokoro_vocoder_fixed_aux_fuses_instance_norm_3591() {
 // temporal samples through 3 ConvTranspose stages.  This costs ~90-120s in
 // debug mode, but with concurrent cargo lock contention the wall time can
 // exceed 180s.  Budget raised to 300s to avoid flaky timeouts under load.
-// See #3500 commit notes for the const-fold bottleneck analysis.
 // ---------------------------------------------------------------------------
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]

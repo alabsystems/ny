@@ -189,9 +189,6 @@ pub(super) fn guard_dense_materialization_budget(
 /// - `Ok(CrownStepResult::IbpFallback(_))` — caller should fall back to IBP.
 /// - `Err(e)` — propagation error.
 ///
-/// # Design reference
-///
-/// See `designs/2026-03-13-crown-backward-step-dispatch-bridge.md` for rationale.
 /// Delegates per-layer shape setup and trait dispatch to `dispatch_backward_layer`
 /// (backward_dispatch module), with pre-filters for ReLU and multi-input ops.
 pub(super) fn crown_backward_step(
@@ -267,8 +264,9 @@ pub(super) fn crown_backward_step_with_dispatch_boundary(
     // form: Where(cond, const_true, const_false) where `cond` is the chain input
     // (= pre_activation). Both branches are constants, so the output is a constant
     // vector w.r.t. the chain input. `embedded_constant_select_output` returns the
-    // EXACT per-element select when `cond` is bound-independent (lower == upper)
-    // and the sound IBP union otherwise — strictly no looser than the generic IBP
+    // EXACT per-element select when `cond`'s interval lies on one side of 0.5
+    // (`determined_branch`; the condition is BOOL-valued by contract) and the
+    // sound IBP union otherwise — strictly no looser than the generic IBP
     // fallback that follows. Concretize the accumulated CROWN bounds against that
     // (zero-A, constant-bias result), tightening UNSAT for cctsdb/nn4sys/vit
     // masks. A non-embedded sequential Where (3 named edges) cannot exist, so it
@@ -382,9 +380,9 @@ pub(super) fn crown_backward_step_with_dispatch_boundary(
     };
 
     // dispatch_backward_layer may raise UnsupportedOp (e.g., Conv1d with
-    // shape < 2 dims), NumericalInstability, ShapeMismatch (#3813: Dense
-    // Conv2d backward when graph restructuring changes dimensions), or
-    // DeadlineExceeded is verifier authority and must remain structured. Other
+    // shape < 2 dims), NumericalInstability, or ShapeMismatch (Dense Conv2d
+    // backward when graph restructuring changes dimensions). DeadlineExceeded
+    // is verifier authority and must remain structured. Other
     // unsupported/unstable errors are graceful per-layer IBP fallbacks.
     let dispatched = if finite_structured_boundary {
         dispatch_backward_layer_finite_boundary(&ctx, linear_bounds)
@@ -608,7 +606,7 @@ fn crown_backward_relu(
             msg,
             deadline,
         ),
-        // #3813: ShapeMismatch triggers per-layer IBP concretization (same as
+        // ShapeMismatch triggers per-layer IBP concretization (same as
         // crown_backward_step). RSPLITTER models change intermediate dimensions,
         // causing shape mismatches in ReLU backward propagation. IBP fallback
         // is always sound.

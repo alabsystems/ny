@@ -1,0 +1,4251 @@
+{
+  "schema_version": 1,
+  "year": 2025,
+  "timeout_cap": null,
+  "configs": {
+    "canonical_path": "<home>/ny-wt-ship27/configs/vnncomp25",
+    "sha256": "8761a57e661d3d2150f65faa423ff9ac6c3eba0088ab5c31622792ee337e701c"
+  },
+  "executable": {
+    "canonical_path": "<home>/ny-pins/ny_wave6_cf376ec20",
+    "sha256": "4b1656c9978e31af5ae607190e92c28506853f2ada28ee88ae029c8596e55135"
+  },
+  "build_id": "NY_BUILD_ID_V1 version=0.5.6157 features=mip,cuda backend=cuda+wgpu markers=margin-row-gpu-eft-impl-v9 commit=cf376ec2054b365210906e8894cd28d082fbe4bc dirty=false revision=6157 source=clean profile=release target=aarch64-unknown-linux-gnu rustc=1.99.0-dev-1183ee6ed stamp=63913e1bc53fdd22c9ffdd3c321f44aaf028d3dc7860d93d97a1deb9381bd9a0 exe=4b1656c9978e31af5ae607190e92c28506853f2ada28ee88ae029c8596e55135 id=cb1fa286a839fa13e983d3ce473cfd68dd4f656a99c6d2db04e1a1ae36db9e14",
+  "build_provenance": "ny.vnncomp.unsealed.v1|status=unsealed|",
+  "target_os": "linux",
+  "target_arch": "aarch64",
+  "compute_backend": "cuda [cuda: compiled, NVIDIA kernel driver=present, 1 process-visible device(s), libcuda+libcublas=present, engine lazy/unconfirmed; wgpu adapter: Vulkan (NVIDIA GB10, IntegratedGpu); sound verdict path: CUDA f64 GEMM seams + CPU f64 CROWN (resident CUDA CROWN behind its gates)]",
+  "host": "spark-f904 | unknown-cpu | 20 cores | 121 GiB",
+  "arm": [],
+  "ambient_env_schema": "ny-cli/ambient-env/v3",
+  "ambient_env": {
+    "NY_BOX_QUIET_GRACE": "300",
+    "NY_BOX_WAIT_LOCK": "21600",
+    "NY_BOX_WAIT_QUIET": "21600"
+  },
+  "witness_dir": {
+    "canonical_path": "<home>/ny/reports/sweeps/ship27/cifar100_2024-2025.witnesses",
+    "sha256": "617190548e0bc4d738a585946612ee3ec370fdb09410771b701f5762892fa9d8"
+  },
+  "instance_selection": {
+    "mode": "all"
+  },
+  "selected_rows": {
+    "cifar100_2024": {
+      "schema": "ny-search/measured-row-set/v1",
+      "count": 200,
+      "sha256": "4e4ec6569faf9d0f7fb660f1198f9aeb4c326f87151bc5fa265e96ec9b98601b"
+    }
+  },
+  "selected_row_inputs_schema": "ny-cli/selected-row-inputs/v2",
+  "selected_row_inputs": {
+    "cifar100_2024": [
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_7641_sidx_1041_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 0,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_7641_sidx_1041_eps_0.0039.vnnlib",
+            "sha256": "80a12b1dc2625f8da6505e8251a06abce4eac036bbb73a08e07c585e52fee818"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_2132_sidx_6868_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 1,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_2132_sidx_6868_eps_0.0039.vnnlib",
+            "sha256": "66d1a8359f9816844c5be16aa6a98237e133c53f812dbdfa13e19ff9de84656b"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_6232_sidx_3020_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 2,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_6232_sidx_3020_eps_0.0039.vnnlib",
+            "sha256": "33e795c8421b7b19125f32415adb9cee09b2f90cb83152c4cd3aa03810e91ec3"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_9694_sidx_2810_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 3,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_9694_sidx_2810_eps_0.0039.vnnlib",
+            "sha256": "478c88ff1f9aa8e51c01cb2c09b18d0143736aa64695a3574ece78f627eb3d82"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_4760_sidx_4651_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 4,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_4760_sidx_4651_eps_0.0039.vnnlib",
+            "sha256": "ba08bfebd5af28683196fc35b9252b04a04914ef5a81a2633f7b52e4c6699cd2"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_6135_sidx_4586_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 5,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_6135_sidx_4586_eps_0.0039.vnnlib",
+            "sha256": "87f0de10cdac116668585f7897d305be5f0c3a97a0a435a0c7d39bd9b616c84f"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_4921_sidx_3617_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 6,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_4921_sidx_3617_eps_0.0039.vnnlib",
+            "sha256": "d5a4b4a071b8a38127861185f92c07b1f40c2e75a9e4015247b1b9c3df4a4c98"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_5242_sidx_1208_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 7,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_5242_sidx_1208_eps_0.0039.vnnlib",
+            "sha256": "0ae6b7bc0c0c862593eff041f588fa794953685b14df1a1db0f2d673f19fa72b"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_2176_sidx_3285_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 8,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_2176_sidx_3285_eps_0.0039.vnnlib",
+            "sha256": "b0a649c3e232f90bb297752e4f3529d14c5e48096a9b96631e42d6b9cb2a1bf7"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_8762_sidx_3374_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 9,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_8762_sidx_3374_eps_0.0039.vnnlib",
+            "sha256": "9becbd271ec51bff025764d0961b6773444594c8f4f2c6475fbc876051c708e8"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_7704_sidx_3701_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 10,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_7704_sidx_3701_eps_0.0039.vnnlib",
+            "sha256": "c508645aecb7042aa37fa1c6c98088026438b2a3a5fd270e8c2eabd2998cf4db"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_4752_sidx_1800_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 11,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_4752_sidx_1800_eps_0.0039.vnnlib",
+            "sha256": "370e0f7173fa4f645c742795c053b7c2cd4b81500778bf927ca8f74297fbe154"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_6415_sidx_4543_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 12,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_6415_sidx_4543_eps_0.0039.vnnlib",
+            "sha256": "71d265ea20466d1ea86fba4a9d8e6d1851673e8b6c68eeaffe29250eabcc3b71"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_2477_sidx_388_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 13,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_2477_sidx_388_eps_0.0039.vnnlib",
+            "sha256": "f7832a361605ea8187e1abd4956ff0b1e0c67bd1b426df938e31f094f5383635"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_6553_sidx_7265_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 14,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_6553_sidx_7265_eps_0.0039.vnnlib",
+            "sha256": "099439008c24da80372a3ff13c8f6a5d2dd0b0e0f36ce381fc4edaabb6eebd59"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_8600_sidx_2721_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 15,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_8600_sidx_2721_eps_0.0039.vnnlib",
+            "sha256": "307d6ddff2f3fc2ea126bd9ee26177db4bf4063cff413efbae3c855d5477a6a8"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_7258_sidx_3539_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 16,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_7258_sidx_3539_eps_0.0039.vnnlib",
+            "sha256": "51885c22a09f5fc46d4254357f47c07e36b5a00aab41d97057cd0c33f03464d2"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_6659_sidx_4583_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 17,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_6659_sidx_4583_eps_0.0039.vnnlib",
+            "sha256": "c614df277647ed881e75a3663051403e09a2261f5d2c1d3241e3b30f4f61e258"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_885_sidx_7654_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 18,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_885_sidx_7654_eps_0.0039.vnnlib",
+            "sha256": "f02c8ccd07ccfc1af779f5ff1dcd796d5569b99daa20c70623dfd0226157ee20"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_3006_sidx_928_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 19,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_3006_sidx_928_eps_0.0039.vnnlib",
+            "sha256": "0de434ff374fcf2aa369d0432bb659ed4ba679eafc1a16f9135b348ac8e968f9"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_1588_sidx_6654_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 20,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_1588_sidx_6654_eps_0.0039.vnnlib",
+            "sha256": "4ec58bdcfd871a459fddac65caef74aa0bb7825dea1eb54f985adf5e4c2e528c"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_8594_sidx_5815_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 21,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_8594_sidx_5815_eps_0.0039.vnnlib",
+            "sha256": "ef5c77eab884d317cde09a4a2aa58c0f453a4fbea123d22fad715498cb1166f5"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_9658_sidx_1660_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 22,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_9658_sidx_1660_eps_0.0039.vnnlib",
+            "sha256": "6d08d5df965e5d9ee54964b272c25e1b7252c8aa59e8acc3f173fa8e4cd55524"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_8505_sidx_1690_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 23,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_8505_sidx_1690_eps_0.0039.vnnlib",
+            "sha256": "569b198df84f90788cce1ce181761cbbcba1ad75311fa18bc8745fb8ace59cb4"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_8945_sidx_3584_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 24,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_8945_sidx_3584_eps_0.0039.vnnlib",
+            "sha256": "d440af1f436a9d2b6ade413c897a9c93b8307eac99a06963c8c1d347196ddcac"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_6585_sidx_533_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 25,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_6585_sidx_533_eps_0.0039.vnnlib",
+            "sha256": "3491f8ebef6734fd79514e5f6084fa9864854d613f965cdb16b277a8d5b0e932"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_6573_sidx_5525_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 26,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_6573_sidx_5525_eps_0.0039.vnnlib",
+            "sha256": "85b27b63f8a4bd1b9060710a1c240aed0b7405aa5b5b2084c24006141088013d"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_8619_sidx_4461_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 27,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_8619_sidx_4461_eps_0.0039.vnnlib",
+            "sha256": "b646908d49e12dfbeb779a55fcaef665031c48ee50ed11f5253c20069dd3f555"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_54_sidx_9735_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 28,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_54_sidx_9735_eps_0.0039.vnnlib",
+            "sha256": "eaa92f0026004640ee28abf6d294a826f528269386c4a52366e65a75ed0fe635"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_4429_sidx_1471_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 29,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_4429_sidx_1471_eps_0.0039.vnnlib",
+            "sha256": "a0fd1008fcd127ac83840bc00c8f10e995e513bebb22aa9394b2e789d2333720"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_1190_sidx_8846_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 30,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_1190_sidx_8846_eps_0.0039.vnnlib",
+            "sha256": "cbfbdfa172c1a7e0a6145bab6243044f615d668a20c728e1279c3a742c01ed7b"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_7569_sidx_2906_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 31,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_7569_sidx_2906_eps_0.0039.vnnlib",
+            "sha256": "346e839ca4075c52cb1cf2ddc8cf0303746c34c453761dc93e361a680507b74e"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_9897_sidx_9124_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 32,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_9897_sidx_9124_eps_0.0039.vnnlib",
+            "sha256": "562890a9706888b8a4ede089693e847c9d2e4988aa100eed97901253b87c978f"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_5831_sidx_5506_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 33,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_5831_sidx_5506_eps_0.0039.vnnlib",
+            "sha256": "e3f5d7374e9e835d13e1055dfee03816981321060ce342714db2e437f251a77a"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_4169_sidx_9758_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 34,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_4169_sidx_9758_eps_0.0039.vnnlib",
+            "sha256": "be121ff0586f9f72d18b84b786c1886038d9f0ed8dd1a7a89b35e1c16be022f3"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_8196_sidx_3864_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 35,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_8196_sidx_3864_eps_0.0039.vnnlib",
+            "sha256": "cf070a9f913db3184e08fd7f7ea658a95a7e2f1b33b6b5fb37c95e426ce3cd57"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_6583_sidx_8860_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 36,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_6583_sidx_8860_eps_0.0039.vnnlib",
+            "sha256": "79c56dc78a7fb13c1625686a9563bf468fff3aff4e8d983ea2de434c513f4ecf"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_8523_sidx_9936_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 37,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_8523_sidx_9936_eps_0.0039.vnnlib",
+            "sha256": "979c6db09e69aee32d727ff33727d8a1f82457cf4a244a5fbf8affba66283d79"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_3418_sidx_4225_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 38,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_3418_sidx_4225_eps_0.0039.vnnlib",
+            "sha256": "734dd2fe2af3fd6b88cd2a7fc2a15ad937c1885050adae2a7ac6f9a9936923a8"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_7431_sidx_7329_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 39,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_7431_sidx_7329_eps_0.0039.vnnlib",
+            "sha256": "dd367193554f3f02aeb6322913e02b0d1bc3154cf10f54e8e5d5c10d6a6d16fd"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_6010_sidx_5369_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 40,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_6010_sidx_5369_eps_0.0039.vnnlib",
+            "sha256": "7f0368be0904d1f38fc9af9effcdfc82199c7abb931c31eadc9c73c018663f5d"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_5127_sidx_993_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 41,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_5127_sidx_993_eps_0.0039.vnnlib",
+            "sha256": "e53f5566d52894ad742b60591cc5ccd24c75a0070b25965616d0a458156c59d4"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_6263_sidx_7644_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 42,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_6263_sidx_7644_eps_0.0039.vnnlib",
+            "sha256": "8f65976c1840a52a763692470df2202350897715cf83bec717263630a7750837"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_5001_sidx_1154_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 43,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_5001_sidx_1154_eps_0.0039.vnnlib",
+            "sha256": "64caaecc04a0216d3bab6f3b07b04a3081ef891f96fac1e2e8662b512211a4f0"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_4597_sidx_282_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 44,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_4597_sidx_282_eps_0.0039.vnnlib",
+            "sha256": "79e6f1df30687494d2dc6401fe773168ecb016cc17dbe80e841cdc4905e3ad98"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_3184_sidx_9092_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 45,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_3184_sidx_9092_eps_0.0039.vnnlib",
+            "sha256": "9981a992949c422ed666433e3ebd44f7f4a517488156978ecb42790407cb5c4f"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_3343_sidx_1406_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 46,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_3343_sidx_1406_eps_0.0039.vnnlib",
+            "sha256": "ee4e899fe521ce5fd2c3dd1dd24c09723789dadd2b1769102fb3e2bebf43269f"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_8330_sidx_7593_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 47,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_8330_sidx_7593_eps_0.0039.vnnlib",
+            "sha256": "faf82fef88721cd2caf749481c9b2ad3db7ee72dd9c2dcae0e43c9e87c5aecbc"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_5634_sidx_9441_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 48,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_5634_sidx_9441_eps_0.0039.vnnlib",
+            "sha256": "65f6f9e716a97fc2b5b27bf5fc738496ef9dd455aae58c9688033c07ef64cd0f"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_7478_sidx_6593_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 49,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_7478_sidx_6593_eps_0.0039.vnnlib",
+            "sha256": "f3516dfe181c952de54717bd3cb0807bf92d790b9e3ea80134a06e9b75488a96"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_913_sidx_2404_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 50,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_913_sidx_2404_eps_0.0039.vnnlib",
+            "sha256": "295075c963461299d128f9514cefbc8b99082d11e42ee5403c57d39ec689addc"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_1761_sidx_3933_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 51,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_1761_sidx_3933_eps_0.0039.vnnlib",
+            "sha256": "f2a5e14de263f19a36d06a2200197e111f3cb7467eaf0f524edb09e3253b667b"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_1798_sidx_1061_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 52,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_1798_sidx_1061_eps_0.0039.vnnlib",
+            "sha256": "fa9e4cdb1a51508f9523b53f463f45d6ac936ce7095c8f6b28acb0d6f532ee0b"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_8450_sidx_9332_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 53,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_8450_sidx_9332_eps_0.0039.vnnlib",
+            "sha256": "96a193b2bb753a9d47b9966f315faee737376758fde7c442c2ef2b13f9543b10"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_1592_sidx_3741_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 54,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_1592_sidx_3741_eps_0.0039.vnnlib",
+            "sha256": "5a000f390b8e40ce1e2008eed0e5601307025308e510381b079e4acef2a770b5"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_230_sidx_1968_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 55,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_230_sidx_1968_eps_0.0039.vnnlib",
+            "sha256": "2b0182049f9e5577f42ca1be11783d323b80fcc286bfd027672c0ca1c4ebcfe8"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_5791_sidx_5659_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 56,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_5791_sidx_5659_eps_0.0039.vnnlib",
+            "sha256": "a50097057ee2c81ff36e1e5265a7b459da5d65466d1c76cd483a282e5c19698a"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_4475_sidx_752_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 57,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_4475_sidx_752_eps_0.0039.vnnlib",
+            "sha256": "375f220df7d14690066577e8b1bf60a9f1541122d40b244a2341ff9200b62397"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_3247_sidx_1605_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 58,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_3247_sidx_1605_eps_0.0039.vnnlib",
+            "sha256": "4afb4831a9b0728974b903c3dded74b47ed0eded44b9978f2cd8b7cf4b77350c"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_2557_sidx_6196_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 59,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_2557_sidx_6196_eps_0.0039.vnnlib",
+            "sha256": "9c689bdb88f05f8d5710778f8505f044a3f108635a8d5d229a169b2dfc1e4db8"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_4191_sidx_3301_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 60,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_4191_sidx_3301_eps_0.0039.vnnlib",
+            "sha256": "d9e519e7d3fbfe5b7f1a5ec1c88802df41da634176ab897c519c3246d4e60c08"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_2697_sidx_4836_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 61,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_2697_sidx_4836_eps_0.0039.vnnlib",
+            "sha256": "ac0561dc5ed3495bcd41e73722bdfb0329c75c1a6f6fabb8cbc4c7d51bd7708f"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_9665_sidx_9074_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 62,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_9665_sidx_9074_eps_0.0039.vnnlib",
+            "sha256": "4c87a5415fa4a1fce130238add4e9a70f4bb85e94e50e7ce8edcfdd8f816606c"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_9518_sidx_9183_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 63,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_9518_sidx_9183_eps_0.0039.vnnlib",
+            "sha256": "df23c377a5de6dab1f85861995f46bd6abe86b45562feca6f78d74b3c208c359"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_5973_sidx_7841_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 64,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_5973_sidx_7841_eps_0.0039.vnnlib",
+            "sha256": "001ea3a6f7aaf2fd7d1b5b82b50e2869c3f8cd64b05cffcaad0345355c29e39f"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_9845_sidx_200_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 65,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_9845_sidx_200_eps_0.0039.vnnlib",
+            "sha256": "95a080be6e29665f2c9a7e725d1f2a0831d3ff2524de4b7a8c0b9e90fb7bd6d3"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_2779_sidx_6416_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 66,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_2779_sidx_6416_eps_0.0039.vnnlib",
+            "sha256": "308af396cb45eea5f01d6b42249db73ecd87b2745b11dfec79769e3159b474bc"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_6292_sidx_5430_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 67,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_6292_sidx_5430_eps_0.0039.vnnlib",
+            "sha256": "fb63b19bb8631c7127bf84f7d9f78291842e82bbdef2c4daf226bcd2fa347d8f"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_8642_sidx_9095_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 68,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_8642_sidx_9095_eps_0.0039.vnnlib",
+            "sha256": "0b96cfd469846aabd7e707e580c5df229f755cb2a184a2e85588e420d01fe330"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_6049_sidx_4719_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 69,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_6049_sidx_4719_eps_0.0039.vnnlib",
+            "sha256": "d27284fc78b1ea34425c17b77561f1eca76281aef82aa20e791123ac429b3fae"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_8739_sidx_1540_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 70,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_8739_sidx_1540_eps_0.0039.vnnlib",
+            "sha256": "7e3afea5520c9c9c2ddd71c390883d784d9c9dbcbe2e4bf8034ee31b2d1ba870"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_7034_sidx_4129_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 71,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_7034_sidx_4129_eps_0.0039.vnnlib",
+            "sha256": "e654ecc5b991a939d7ebc0ddcd28a9877147d5ecbbbdbf9d41852bb5ee99c86b"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_1498_sidx_792_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 72,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_1498_sidx_792_eps_0.0039.vnnlib",
+            "sha256": "ac8f51107fbb0deaee7fd5a03a93e84641e46210c55c78fe8ab0d30dabb3ca2d"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_3898_sidx_9109_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 73,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_3898_sidx_9109_eps_0.0039.vnnlib",
+            "sha256": "aea3c0335a02f4e61ec4634e4fe712c428dbe436af9b5f9f83c10f2b24e23e15"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_854_sidx_6893_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 74,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_854_sidx_6893_eps_0.0039.vnnlib",
+            "sha256": "1b9cc2ed447b74596e7b52321bcc829374c05ea2bc7c7a2b8b0bc4780289aab7"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_9502_sidx_7197_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 75,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_9502_sidx_7197_eps_0.0039.vnnlib",
+            "sha256": "d7f524f6dc23289be8809106726a3fccbe498a1a7797101af4f7c7d90cb6cf11"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_2551_sidx_9941_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 76,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_2551_sidx_9941_eps_0.0039.vnnlib",
+            "sha256": "bfb360fdf1b23deb22f448cc2ac1a40d4b6eb7ce60f9a1bb0ee4b6f8fd7cf457"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_7658_sidx_1537_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 77,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_7658_sidx_1537_eps_0.0039.vnnlib",
+            "sha256": "8c064640fd2733ea67dd25b1bf71da25cd935b9b4476d5969248270e7bf7a105"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_9726_sidx_4400_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 78,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_9726_sidx_4400_eps_0.0039.vnnlib",
+            "sha256": "05b842d0d01ca65f14bf68b5f1e8444fde68eac89dc05639b020881dd779d3d1"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_9313_sidx_6462_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 79,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_9313_sidx_6462_eps_0.0039.vnnlib",
+            "sha256": "0436158f7db5fcbea28467a460a28fb82020bc814fa56a896f5ed5b375a8b25c"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_815_sidx_1902_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 80,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_815_sidx_1902_eps_0.0039.vnnlib",
+            "sha256": "9197726e63846fdb38ffb537b28a7f1d52cae003a1828245ff89a04b14a050ac"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_6491_sidx_3620_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 81,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_6491_sidx_3620_eps_0.0039.vnnlib",
+            "sha256": "262bd3283e17e857db91064ad865c8340c271ad30324159d96b00f1b53ea25b3"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_4605_sidx_6225_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 82,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_4605_sidx_6225_eps_0.0039.vnnlib",
+            "sha256": "a2ed523085fffd01255fb291f0ced4c81315d78426d936790052f7f03bfc5e51"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_2352_sidx_2704_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 83,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_2352_sidx_2704_eps_0.0039.vnnlib",
+            "sha256": "0a2d080304f11a38f9bcfb0bbe7a877895bc33feedd00cc2ce09889a6a037523"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_1642_sidx_7494_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 84,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_1642_sidx_7494_eps_0.0039.vnnlib",
+            "sha256": "b56e74b000b9b2ceb95f1da173e89958048b61487c8c7540b51a16ba7d59f2b8"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_8502_sidx_2893_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 85,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_8502_sidx_2893_eps_0.0039.vnnlib",
+            "sha256": "34c4533bd3eeef8be75012a87cd6e1bed2999f10fd19c721d48509fda523d876"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_4964_sidx_5266_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 86,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_4964_sidx_5266_eps_0.0039.vnnlib",
+            "sha256": "0aefbbad1445b41fcf21da2437bae008910ec61f3a257d0e8bf9812e651c0a11"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_6369_sidx_8824_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 87,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_6369_sidx_8824_eps_0.0039.vnnlib",
+            "sha256": "c5f390b06e79bb3373c6c73dcec15a1b61917558a89253a5a818e273b0024cd2"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_966_sidx_2330_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 88,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_966_sidx_2330_eps_0.0039.vnnlib",
+            "sha256": "42307068cc5a5c6f3c848e355dda8831784f5eb55233be21248276aafa1274f7"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_9162_sidx_4337_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 89,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_9162_sidx_4337_eps_0.0039.vnnlib",
+            "sha256": "ccc829c83b1bd4b32329640e3ef0ba72dcfda111163ff431d50144b57753f178"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_425_sidx_9099_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 90,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_425_sidx_9099_eps_0.0039.vnnlib",
+            "sha256": "2df3f6c495d03385fae4fa4bf8ff44bb3a915dd953e5e1fd2aeaae2da91e0010"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_4898_sidx_6695_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 91,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_4898_sidx_6695_eps_0.0039.vnnlib",
+            "sha256": "4974bcbead79ddf6185ca14f5401b54b8f6af6b20e069779edc5019276368ed6"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_7500_sidx_40_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 92,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_7500_sidx_40_eps_0.0039.vnnlib",
+            "sha256": "e90ddc048dbd68498e6529689be996ae60a635646db740e363e3d8b95402b950"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_7176_sidx_1522_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 93,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_7176_sidx_1522_eps_0.0039.vnnlib",
+            "sha256": "84d0d7649fc4dbbdca4ff8d43c65e18fbb65fcf34233d6d99c3f0251cc03b6eb"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_2050_sidx_8228_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 94,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_2050_sidx_8228_eps_0.0039.vnnlib",
+            "sha256": "828d9994695a5aea65667360a26a36dfb51c5bf0e4fe19c7478c64f730fd2426"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_7470_sidx_4555_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 95,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_7470_sidx_4555_eps_0.0039.vnnlib",
+            "sha256": "40b4f92bef2b897e60fae86c415c50470e3f9cb15755c5a3bccdd30c0aef651f"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_5797_sidx_6343_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 96,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_5797_sidx_6343_eps_0.0039.vnnlib",
+            "sha256": "013660e726b03023e62ef4e07397d93177e6a0bb1f8622a72379812ba5299e38"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_5894_sidx_5577_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 97,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_5894_sidx_5577_eps_0.0039.vnnlib",
+            "sha256": "f644725ac2dbaf58f456df61edda469210c56655609b75a2ba3b9e38969d4b00"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_3852_sidx_2848_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 98,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_3852_sidx_2848_eps_0.0039.vnnlib",
+            "sha256": "85e344ec3d873ec3cf84dd511161930e18b999d2da459c98cc8be16e284c58a5"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_medium.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_medium_prop_idx_2925_sidx_8815_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 99,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",
+                "sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_2925_sidx_8815_eps_0.0039.vnnlib",
+            "sha256": "847038d2dcc8720907b1994a83b1b5375a19377ae55ce9eb5df9d99e468a9d7c"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_496_sidx_1194_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 100,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_496_sidx_1194_eps_0.0039.vnnlib",
+            "sha256": "692ccba01ec0a9308fac5e35a4512693a8892a0b9adea8b5fe06883728837d7c"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_4385_sidx_9116_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 101,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_4385_sidx_9116_eps_0.0039.vnnlib",
+            "sha256": "c021ac7c83ad2405fbb2c32bf687413a9796ffaf90c98f8926073ca388d9bc6e"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_5308_sidx_1650_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 102,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_5308_sidx_1650_eps_0.0039.vnnlib",
+            "sha256": "962d278c6835db6ee300d07184961c4e9317ce80ce067325b9eea3840285691e"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_4757_sidx_803_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 103,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_4757_sidx_803_eps_0.0039.vnnlib",
+            "sha256": "af5e19948a4e5ac1e076cc27f7623c2cfdb378bf9555352fe944cdb12f8bba8a"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_4227_sidx_5883_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 104,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_4227_sidx_5883_eps_0.0039.vnnlib",
+            "sha256": "7bb96d58875e9860a56a83a0935205751ad6dce94a114f74b4efed358e32a9cd"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_8589_sidx_3105_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 105,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_8589_sidx_3105_eps_0.0039.vnnlib",
+            "sha256": "ef672ad2798e923d5910298d7767c1f6e2ac42a0b2f31fb923ce5a37a8dca768"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_8476_sidx_3906_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 106,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_8476_sidx_3906_eps_0.0039.vnnlib",
+            "sha256": "1ffb9a4cc23cc796cba5a1ef2260153c708dbbe0f6dfd9f70367336d9666553b"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_1456_sidx_5797_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 107,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_1456_sidx_5797_eps_0.0039.vnnlib",
+            "sha256": "f47b6c8f665c00a6bb5d5ed7f146f215e79ba23067c7fc2e14f2041c6bd932ec"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_998_sidx_7605_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 108,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_998_sidx_7605_eps_0.0039.vnnlib",
+            "sha256": "b3503dbd5660be24212daefd3a4cb7b60d9f539e250a05fa4abd0f8cad85e4bf"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_9778_sidx_7516_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 109,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_9778_sidx_7516_eps_0.0039.vnnlib",
+            "sha256": "c5666e00977faa2fb8ade94157db307df89bcbd02fd245b1e6ee7d97c5063bc5"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_1063_sidx_7948_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 110,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_1063_sidx_7948_eps_0.0039.vnnlib",
+            "sha256": "f9b77b99fe82813df69b11e9ed2c378798c6d252277ab107ce3dd68429285b76"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_1426_sidx_3855_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 111,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_1426_sidx_3855_eps_0.0039.vnnlib",
+            "sha256": "066e27fbede0d5f147c68f198dff1d04a7d818a0411c8a94fb66c124da6a1ab8"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_3355_sidx_212_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 112,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_3355_sidx_212_eps_0.0039.vnnlib",
+            "sha256": "72277c001a4e56881d1e550d3648151f08dc1edf4afaf0f2036b27672c2f4cef"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_1439_sidx_8354_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 113,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_1439_sidx_8354_eps_0.0039.vnnlib",
+            "sha256": "4425caad857d90470a6db6f60de288d8a685676f2ae5a02076b6cd5baa65b3a3"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_3585_sidx_3469_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 114,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_3585_sidx_3469_eps_0.0039.vnnlib",
+            "sha256": "d19b43b56dcddb4af81cf81a44ef3f0a0f2b861c5da2a0729fb888dbe3759bfa"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_2636_sidx_1992_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 115,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_2636_sidx_1992_eps_0.0039.vnnlib",
+            "sha256": "038afb9d14a088225d6e9904f4f2fa7177c41dda3ec8bbf83e4a58c9d72a7ad0"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_6101_sidx_3593_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 116,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_6101_sidx_3593_eps_0.0039.vnnlib",
+            "sha256": "5e737cb8136bb3325ca3a083005ef3d5a4625f3e9b9db7bf4c70ef3571b45828"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_1059_sidx_6596_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 117,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_1059_sidx_6596_eps_0.0039.vnnlib",
+            "sha256": "caca9ef2245019dd70883661bd5c102544f64152ddc0ea8f967eb8ed0882e996"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_9773_sidx_3718_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 118,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_9773_sidx_3718_eps_0.0039.vnnlib",
+            "sha256": "885ee9f008a908094ab00d00124436cc0483454b40c775c57fa9a43b2b3388e1"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_7890_sidx_4421_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 119,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_7890_sidx_4421_eps_0.0039.vnnlib",
+            "sha256": "e7ac14c1a2801a062ff6e72cccae6121b10e7806a6052a44ee0fc87c9e22db7a"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_2993_sidx_2485_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 120,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_2993_sidx_2485_eps_0.0039.vnnlib",
+            "sha256": "2b5f71b56583f18c42a521b71dc637e6bcac3a970903c9e90479ed03a0add864"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_1105_sidx_9000_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 121,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_1105_sidx_9000_eps_0.0039.vnnlib",
+            "sha256": "0409ddfb7bcc05c37ef5ae1441516a6300bbd53fadc63b9e25fc3119ed24b8fe"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_383_sidx_3388_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 122,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_383_sidx_3388_eps_0.0039.vnnlib",
+            "sha256": "3c450b6d6ec6f6af89b342ef2afc424980a9cbffb9ab83037f17bd996c397e6d"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_6341_sidx_3142_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 123,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_6341_sidx_3142_eps_0.0039.vnnlib",
+            "sha256": "40bb5f46cd7d53e1ae1ce469518ddd5564ff852d7367b7cea009ba84942eb405"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_2132_sidx_6868_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 124,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_2132_sidx_6868_eps_0.0039.vnnlib",
+            "sha256": "66d1a8359f9816844c5be16aa6a98237e133c53f812dbdfa13e19ff9de84656b"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_3443_sidx_918_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 125,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_3443_sidx_918_eps_0.0039.vnnlib",
+            "sha256": "ea1a0aae2fefd6ece3f32c49a80e3b3e4177df1956f5862cf38b345f1a6ca2ca"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_8119_sidx_972_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 126,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_8119_sidx_972_eps_0.0039.vnnlib",
+            "sha256": "2edcd67ea62120e5a71d20ee0c78ff05dcc4ecc92b1290b85aa2d71b96804714"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_484_sidx_161_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 127,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_484_sidx_161_eps_0.0039.vnnlib",
+            "sha256": "9a9d5752c1124238947ff1ebff629a3ee8f82cd4a975178efbd3c127ecef4bd6"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_62_sidx_313_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 128,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_62_sidx_313_eps_0.0039.vnnlib",
+            "sha256": "290ca610e6f3c1c2622c60dd5a4e561dd74df66db1bf14db178bb329f82e6508"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_6269_sidx_6873_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 129,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_6269_sidx_6873_eps_0.0039.vnnlib",
+            "sha256": "9266088346428b3dbcea3817a0b0c5e9c6b63fc689045f86c48b7b24c3109edb"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_3703_sidx_3842_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 130,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_3703_sidx_3842_eps_0.0039.vnnlib",
+            "sha256": "ed0cb7c7f6b8e73ad162992f40ddef94a1ccb3c61d29b5ccf35a2a1aa9b0d841"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_2998_sidx_6947_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 131,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_2998_sidx_6947_eps_0.0039.vnnlib",
+            "sha256": "c2cf50d401dc074459e68b729ca7a028bbb1bd3800bddbee661f5d548b679628"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_7926_sidx_589_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 132,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_7926_sidx_589_eps_0.0039.vnnlib",
+            "sha256": "08b8fb55522b758106f9f729ccadb29a00b13b8bb0052b513bb36036b69ba1a4"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_3681_sidx_4987_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 133,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_3681_sidx_4987_eps_0.0039.vnnlib",
+            "sha256": "11be08ead4e07ab4ae5e668723d015c32b932417ef29d6b285422bb833b7f6b4"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_5410_sidx_2762_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 134,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_5410_sidx_2762_eps_0.0039.vnnlib",
+            "sha256": "c15e7f74552e8328445ead2d3f759aa63d810f9edfccbc021dc80ba1978d5c02"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_1280_sidx_5310_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 135,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_1280_sidx_5310_eps_0.0039.vnnlib",
+            "sha256": "a439604d33ca5bf5416498fa7f6b0702b59ba338574080f24045d783f7cbd312"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_7233_sidx_4318_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 136,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_7233_sidx_4318_eps_0.0039.vnnlib",
+            "sha256": "7ea385b4f4d1e0b624c17c5de837a92a4f25ddc4f4b617db136ae5fc24f0f1d6"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_2724_sidx_6459_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 137,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_2724_sidx_6459_eps_0.0039.vnnlib",
+            "sha256": "543ea231e35e0c79274514b6eadfa0802d54a62997774de275ec28f9ce65f270"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_3894_sidx_5803_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 138,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_3894_sidx_5803_eps_0.0039.vnnlib",
+            "sha256": "f3807905191ee164541cba5b49713d88a5b41582503a47fa92944b1fc4acacaa"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_3858_sidx_134_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 139,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_3858_sidx_134_eps_0.0039.vnnlib",
+            "sha256": "179a60b7e63f544d261f5c2eca019726c25bc7efd2a7bb649fe85ceb64b7bd73"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_8005_sidx_2582_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 140,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_8005_sidx_2582_eps_0.0039.vnnlib",
+            "sha256": "dc0e9b728fb45f19ce2d726d0a46ffafadbcc70f3064afd0dd15a43b391ecfd0"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_1298_sidx_33_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 141,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_1298_sidx_33_eps_0.0039.vnnlib",
+            "sha256": "dfe4098f4c35e84c98d18d19ca528c598450a34a6115b52aa955fc1b4694d594"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_9935_sidx_75_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 142,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_9935_sidx_75_eps_0.0039.vnnlib",
+            "sha256": "229c3d11033c81749e303074dc61d7936916f3ea48d144ae604c1dbaaa1d4763"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_276_sidx_476_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 143,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_276_sidx_476_eps_0.0039.vnnlib",
+            "sha256": "8bb708f8c3336ec0eda546b3e8dab4fb96bb4ffe6f62334ee591c3a7d7b9c1c2"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_1913_sidx_2767_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 144,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_1913_sidx_2767_eps_0.0039.vnnlib",
+            "sha256": "fc86fa640c1fbc148d807d0c0801be1500ac044b1089ee1e9d582a351254339e"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_1309_sidx_8525_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 145,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_1309_sidx_8525_eps_0.0039.vnnlib",
+            "sha256": "0353027d54ac7e323b42dd651db12560173cab0e76ef1d9ba6f0d7c517455998"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_4862_sidx_9853_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 146,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_4862_sidx_9853_eps_0.0039.vnnlib",
+            "sha256": "e280ae1be787e8db65b6de11954112e058fa472957b99802a1ee6f285a824616"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_7554_sidx_8201_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 147,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_7554_sidx_8201_eps_0.0039.vnnlib",
+            "sha256": "8a2be1e8c3eefc424d1c5ec99589813906047c1f7eaea7727c313c1089077dc7"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_4571_sidx_3801_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 148,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_4571_sidx_3801_eps_0.0039.vnnlib",
+            "sha256": "cfd7670e4af2510b32f0ab712c68fd9613af13289e72d27aa8c77d937fd34e88"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_5769_sidx_1524_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 149,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_5769_sidx_1524_eps_0.0039.vnnlib",
+            "sha256": "841a76f425a6b7ded404941e8ea53750afa6262f24d21582acfc0b22c4e47f41"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_8748_sidx_4804_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 150,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_8748_sidx_4804_eps_0.0039.vnnlib",
+            "sha256": "1f113e06209a5c1da580c3645cd6516f4f306b5cc17e960d7d3cd95e6abb1f5d"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_3950_sidx_4217_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 151,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_3950_sidx_4217_eps_0.0039.vnnlib",
+            "sha256": "1d16231db298de27a05cef4ba49ad01bdbc4ef902ff2c26e30379f717e101a02"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_7886_sidx_7064_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 152,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_7886_sidx_7064_eps_0.0039.vnnlib",
+            "sha256": "2d1600265f15fae933dcc6dcc16e6b368ae7ff6b9b7a77e16f3c2fd72d9cb7d8"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_4652_sidx_1371_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 153,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_4652_sidx_1371_eps_0.0039.vnnlib",
+            "sha256": "5b425e64c837085d070e219e8ac0e29012b30f2ef9f8e3af1ec7f5e00bc8e507"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_1938_sidx_6556_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 154,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_1938_sidx_6556_eps_0.0039.vnnlib",
+            "sha256": "1888905ae84afd8b1e380201e4a3377aa00fe250a15af224ce5b6c167b8f1c44"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_8332_sidx_4482_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 155,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_8332_sidx_4482_eps_0.0039.vnnlib",
+            "sha256": "33e13da3e57ebcb3d5c451a1b1bce8ba484aba4594576192f8d83d94bb59bbb6"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_2302_sidx_3657_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 156,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_2302_sidx_3657_eps_0.0039.vnnlib",
+            "sha256": "3b77bbfebefc9da2961edfebd21f52d1f1d18865eb1cf42fce95a9a873c0fcfa"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_7104_sidx_9469_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 157,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_7104_sidx_9469_eps_0.0039.vnnlib",
+            "sha256": "d1b195ac5dcf2151fe37725df60ef39a21f459c2f6bc49ba89eb35d0e76dcf36"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_2783_sidx_8903_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 158,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_2783_sidx_8903_eps_0.0039.vnnlib",
+            "sha256": "b207bdb06e33e964bc52575b9cecf7cb833adb828c8c4344a4279fdd99300c6f"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_6491_sidx_3620_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 159,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_6491_sidx_3620_eps_0.0039.vnnlib",
+            "sha256": "262bd3283e17e857db91064ad865c8340c271ad30324159d96b00f1b53ea25b3"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_5162_sidx_8126_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 160,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_5162_sidx_8126_eps_0.0039.vnnlib",
+            "sha256": "c67e88f7a0a36f6dec78aa2d3d751c500e815078673662a1633b26b5e294e7be"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_8502_sidx_2893_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 161,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_8502_sidx_2893_eps_0.0039.vnnlib",
+            "sha256": "34c4533bd3eeef8be75012a87cd6e1bed2999f10fd19c721d48509fda523d876"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_3143_sidx_9413_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 162,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_3143_sidx_9413_eps_0.0039.vnnlib",
+            "sha256": "c71b55ea7773b2e465352251c529e51bd36603bfea8d9bf08c1f12abc074c86d"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_656_sidx_2209_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 163,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_656_sidx_2209_eps_0.0039.vnnlib",
+            "sha256": "84625044638a52b6db22ebce98138832a21388de6e58cad08989376cd088ada2"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_4322_sidx_9995_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 164,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_4322_sidx_9995_eps_0.0039.vnnlib",
+            "sha256": "08232034ac5b117741969727212c2eee336d080453a2facebaec20cd8d44937b"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_5804_sidx_1885_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 165,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_5804_sidx_1885_eps_0.0039.vnnlib",
+            "sha256": "535b22caa0b5a0a395f35c059f99b8f63d62c24e89e54e2247294e63b0788768"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_2630_sidx_1753_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 166,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_2630_sidx_1753_eps_0.0039.vnnlib",
+            "sha256": "bdbd4493fbcc15ee7518afc86491eb183da4725a0525ad4af82cebc51b121b8c"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_2461_sidx_2912_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 167,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_2461_sidx_2912_eps_0.0039.vnnlib",
+            "sha256": "6f14afd30d46fe4e681eac7efe71cd10584cedb5fa31249c0a0f155e36f32338"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_4486_sidx_8828_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 168,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_4486_sidx_8828_eps_0.0039.vnnlib",
+            "sha256": "4e538ca52f2185981fc76fe2a4bec94988f71f05ae33aced159afd8fe25680af"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_5810_sidx_7106_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 169,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_5810_sidx_7106_eps_0.0039.vnnlib",
+            "sha256": "8e321a658ecfbb8c65670206bf19f69b9c22e9a319f8094fc4d86d7be900f99a"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_6343_sidx_1886_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 170,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_6343_sidx_1886_eps_0.0039.vnnlib",
+            "sha256": "9a54bb520cf92be946fcf2c83433d5ed85f19a9dd79609be07cd77742ce42a48"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_9640_sidx_7273_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 171,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_9640_sidx_7273_eps_0.0039.vnnlib",
+            "sha256": "3dae449029ed170b4927ec1ad46da0f3f55f8affbf326f0c6fb428120624ae4a"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_5522_sidx_5863_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 172,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_5522_sidx_5863_eps_0.0039.vnnlib",
+            "sha256": "c02f073b889b3d43ecefc40e98bd0af1e191c34769f0817fd8a5afb998c916cb"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_9460_sidx_4347_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 173,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_9460_sidx_4347_eps_0.0039.vnnlib",
+            "sha256": "a130af3402c5c255d75d5f92d8eebf4304f5cd223509956f19bd3d69ed68fd34"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_8865_sidx_700_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 174,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_8865_sidx_700_eps_0.0039.vnnlib",
+            "sha256": "c4b90bf18ea53b41333044061b36f52656744ee59b1190a998b86539d2675beb"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_8395_sidx_8915_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 175,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_8395_sidx_8915_eps_0.0039.vnnlib",
+            "sha256": "3038941a0d8c87eda8f4eafd864de2201542c24cb9d254517b8d8eea3a816c64"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_9883_sidx_7162_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 176,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_9883_sidx_7162_eps_0.0039.vnnlib",
+            "sha256": "190a4da249f2fef3c61983ab91505b4b7dc7a341de381b1765527c80aadb4a35"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_3573_sidx_2903_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 177,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_3573_sidx_2903_eps_0.0039.vnnlib",
+            "sha256": "e8277a8df6eb7ea811bfcf1d0fb6ed3a25f1fd5b1fcf7d63018b255d28547bff"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_6418_sidx_7923_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 178,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_6418_sidx_7923_eps_0.0039.vnnlib",
+            "sha256": "857896b3467039fca36ff3237acc4bc19660cce481f406c1375526b78741fe2d"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_2668_sidx_2652_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 179,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_2668_sidx_2652_eps_0.0039.vnnlib",
+            "sha256": "d1893150cb6595f40533885734ee9a25df07a8fd45d2e02548b53f3dab8a1dcc"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_1216_sidx_6431_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 180,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_1216_sidx_6431_eps_0.0039.vnnlib",
+            "sha256": "4866d621441efd5bb8f568c09f6d3ff52b05e5bc7688c1f136ba4fa15bcb489c"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_6583_sidx_8860_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 181,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_6583_sidx_8860_eps_0.0039.vnnlib",
+            "sha256": "79c56dc78a7fb13c1625686a9563bf468fff3aff4e8d983ea2de434c513f4ecf"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_5546_sidx_4338_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 182,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_5546_sidx_4338_eps_0.0039.vnnlib",
+            "sha256": "bff876dd0b2c183d1f2526f8846dcf873cf15b4dbd607f0729920b0fde6fc7e8"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_9845_sidx_200_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 183,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_9845_sidx_200_eps_0.0039.vnnlib",
+            "sha256": "95a080be6e29665f2c9a7e725d1f2a0831d3ff2524de4b7a8c0b9e90fb7bd6d3"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_8012_sidx_5910_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 184,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_8012_sidx_5910_eps_0.0039.vnnlib",
+            "sha256": "9f149839ca2b06fc87938f77661f6a15e7c9b5973961642866c2b2578438dcd6"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_7884_sidx_6926_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 185,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_7884_sidx_6926_eps_0.0039.vnnlib",
+            "sha256": "83e209cf455eef065184a448ba1abe20c868c30d9ec01a152e7c7d18ba634108"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_8381_sidx_4474_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 186,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_8381_sidx_4474_eps_0.0039.vnnlib",
+            "sha256": "ffe1d75f7f05682ceb5b7c82e8464d677fdfdc706c544a2d3702384e21085383"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_483_sidx_7371_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 187,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_483_sidx_7371_eps_0.0039.vnnlib",
+            "sha256": "e352f67c6331a260521fd8cb1e4972bb64e0edc441457863286c2fb1ee83b240"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_7640_sidx_9025_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 188,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_7640_sidx_9025_eps_0.0039.vnnlib",
+            "sha256": "0fb68963314172ed705b84a63bf113a76efc9924ef93ca539fc4f3756904d362"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_5230_sidx_242_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 189,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_5230_sidx_242_eps_0.0039.vnnlib",
+            "sha256": "12137497164f5f2f0c119d62a46fede8dc136c9ec12ec57f84dfeb3b711f1e8c"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_9476_sidx_5602_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 190,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_9476_sidx_5602_eps_0.0039.vnnlib",
+            "sha256": "fbea8d6538b9ef44c1b93a76815710186f554eeadcae8c3ab3b110e418e15eb0"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_7866_sidx_7980_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 191,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_7866_sidx_7980_eps_0.0039.vnnlib",
+            "sha256": "91014bb0e2b937b3fcad5b53fe33b3444c65c7688c0f785cf32625a5631c1a55"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_7436_sidx_5742_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 192,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_7436_sidx_5742_eps_0.0039.vnnlib",
+            "sha256": "36ee9c6403f47881d6b6a3d1baac0b584a68e9b339ef6e1f147378dd7ef9a902"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_2624_sidx_917_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 193,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_2624_sidx_917_eps_0.0039.vnnlib",
+            "sha256": "aa7a768ae22a862ac85bdf8aeac22630fa5878672933cf519b3d561f721408ac"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_1241_sidx_5679_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 194,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_1241_sidx_5679_eps_0.0039.vnnlib",
+            "sha256": "929f6424bd800f66f521db9291da968f5be3a20775cd62f510b540c07103d71f"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_3812_sidx_8477_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 195,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_3812_sidx_8477_eps_0.0039.vnnlib",
+            "sha256": "79d877d6e885ec416340b8b0e287093d374023210ad9c852dd8292a6733cc633"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_9372_sidx_3515_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 196,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_9372_sidx_3515_eps_0.0039.vnnlib",
+            "sha256": "2a6826b1ac04e99cc9fb5e58f9f105af74b02497785ee53be2e703f84e757ea6"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_1590_sidx_2858_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 197,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_1590_sidx_2858_eps_0.0039.vnnlib",
+            "sha256": "198bdb3244d531b2b2200b1b9b46df5c942e5e3e0f98ec58014a87a815d84826"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_6337_sidx_2381_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 198,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_6337_sidx_2381_eps_0.0039.vnnlib",
+            "sha256": "edcc2bb669c394788e5d6e51498a45fc4166769ef9797c312a152d032b9c322d"
+          }
+        }
+      },
+      {
+        "onnx": "onnx/CIFAR100_resnet_large.onnx",
+        "vnnlib": "vnnlib/CIFAR100_resnet_large_prop_idx_6757_sidx_2400_eps_0.0039.vnnlib",
+        "occurrence": 0,
+        "instance_index": 199,
+        "inputs": {
+          "onnx": [
+            {
+              "artifact": {
+                "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_large.onnx",
+                "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16"
+              },
+              "external_data": []
+            }
+          ],
+          "vnnlib": {
+            "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_large_prop_idx_6757_sidx_2400_eps_0.0039.vnnlib",
+            "sha256": "569ff9d10c69ae5e3f8528128682af4461775dd18d6272c3ed7ec49157870609"
+          }
+        }
+      }
+    ]
+  },
+  "instances_csv": {
+    "cifar100_2024": {
+      "canonical_path": "<home>/ny/benchmarks/vnncomp2025/benchmarks/cifar100_2024/instances.csv",
+      "sha256": "aa656d7a73529ba7c41b5618440f543ba4677418bb44115d384b644cc034f9ee"
+    }
+  }
+}

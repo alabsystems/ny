@@ -112,5 +112,5 @@ pub(super) fn assert_folded_tensor(
 }
 
 pub(super) fn fold(graph: &crate::onnx_proto::GraphProto, weights: &mut WeightStore) {
-    super::super::fold_constant_nodes(graph, weights, &mut std::collections::HashMap::new())
+    super::super::fold_constant_nodes(graph, weights, &mut std::collections::HashMap::new(), false)
 }

@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Graph-DAG resident IBP plan types (#4276, #4318).
+//! Graph-DAG resident IBP plan types.
 //!
 //! Separate from `gemm_gpu_ibp.rs` (sequential resident IBP) to avoid
 //! cross-worker file ownership conflicts.
@@ -18,8 +18,6 @@ use super::gpu_ibp::GpuIbpResult;
 /// Unlike sequential [`super::GpuIbpLayer`], each op references its input(s) by
 /// index within the plan's op list. Index `usize::MAX` is the sentinel for
 /// the network input tensor.
-///
-/// Reference: designs/2026-03-21-issue-4276-dag-ibp-child-packets.md §Packet A
 #[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum GpuDagIbpOp {

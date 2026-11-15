@@ -249,7 +249,7 @@ fn test_softsign_crown_wide_interval() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_softsign_crown_nan_inf_guard() {
-    // Updated for #2977: CROWN backward domain_guard rejects non-finite
+    // CROWN backward domain_guard rejects non-finite
     // pre-activation with NumericalInstability.
     let layer = SoftsignLayer::new();
     let linear_bounds = LinearBounds::identity(1);

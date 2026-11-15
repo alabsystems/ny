@@ -6,7 +6,7 @@
 //! CROWN-shaped contractions, through the SAME `GemmEngine` entry point
 //! production uses (so the G1/G2 guard scan is inside the measurement).
 //!
-//! `cargo run --release -p ny-accelerate --example accelerate_seam_bench`
+//! `targo --unverified run --release -p ny-accelerate --example accelerate_seam_bench`
 
 fn main() {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

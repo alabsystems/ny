@@ -115,7 +115,12 @@ impl ClipLayer {
 ///
 /// Reference: alpha-beta-CROWN BoundHardTanh.bound_relax()
 /// at auto_LiRPA/operators/activations.py:275-403
-fn clip_linear_relaxation(l: f32, u: f32, min_val: f32, max_val: f32) -> LinearRelaxation {
+pub(crate) fn clip_linear_relaxation(
+    l: f32,
+    u: f32,
+    min_val: f32,
+    max_val: f32,
+) -> LinearRelaxation {
     // NaN/Inf guard: BoundedTensor::new rejects non-finite inputs, but
     // callers using new_unchecked can still feed invalid intervals.
     // Clip output is always in [min_val, max_val], so constant bounds
@@ -151,7 +156,7 @@ fn clip_linear_relaxation(l: f32, u: f32, min_val: f32, max_val: f32) -> LinearR
         // Entirely within [min, max]: identity
         LinearRelaxation::identity()
     } else if l < min_val && u > max_val {
-        // Case 4: Crosses both boundaries. Directed rounding (#3337).
+        // Case 4: Crosses both boundaries. Directed rounding.
         // Upper: line through (l, min) to (max, max). Lower: (min, min) to (u, max).
         let max_abs = l.abs().max(u.abs()) as f64;
         let (l64, u64) = (l as f64, u as f64);
@@ -166,7 +171,7 @@ fn clip_linear_relaxation(l: f32, u: f32, min_val: f32, max_val: f32) -> LinearR
         let il = next_down_f32((min64 - sl64 * min64) as f32 - sl_err);
         LinearRelaxation::new(sl, il, su, iu)
     } else if l < min_val {
-        // Case 5: Crosses lower boundary only. Directed rounding (#3337).
+        // Case 5: Crosses lower boundary only. Directed rounding.
         let max_abs = l.abs().max(u.abs()) as f64;
         let (l64, u64) = (l as f64, u as f64);
         let su64 = (u64 - min_val as f64) / (u64 - l64);
@@ -176,7 +181,7 @@ fn clip_linear_relaxation(l: f32, u: f32, min_val: f32, max_val: f32) -> LinearR
         let iu = next_up_f32((u64 - su64 * u64) as f32 + su_err);
         LinearRelaxation::new(ls, li, su, iu)
     } else {
-        // Case 6: Crosses upper boundary only. Directed rounding (#3337).
+        // Case 6: Crosses upper boundary only. Directed rounding.
         let max_abs = l.abs().max(u.abs()) as f64;
         let (l64, u64) = (l as f64, u as f64);
         let sl64 = (max_val as f64 - l64) / (u64 - l64);

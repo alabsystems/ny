@@ -39,7 +39,7 @@ impl MultiNormBounds {
         BoundedTensor::new(lower.into_dyn(), upper.into_dyn())
     }
 
-    /// Concretize with f64 accumulators and directed rounding for soundness (#2239, #2364).
+    /// Concretize with f64 accumulators and directed rounding for soundness.
     ///
     /// Uses f64 accumulators in `norm_q_f64()` and f64 arithmetic for the
     /// `eps * norm` subtraction/addition, then casts to f32 with directed
@@ -53,7 +53,7 @@ impl MultiNormBounds {
     /// Reference: same pattern as `BatchedLinearBounds::concretize_sound`
     /// (`bounds/batched/mod.rs:276`). Prior version used f32 accumulators in
     /// `norm_q()`, which had O(dim_in * eps_f32) error — insufficient for
-    /// dim_in ≥ 768 (see #2364 error analysis).
+    /// dim_in ≥ 768.
     pub fn concretize_sound(&self) -> Result<BoundedTensor> {
         let (_, _, dim_in, _) = self.lw.dim();
         let dim_per_word = dim_in / self.perturbed_words;
@@ -77,7 +77,7 @@ impl MultiNormBounds {
         // Cast f64→f32 with directed rounding: lower toward -inf, upper toward +inf.
         let lower_f32 = lower.mapv(|v| next_down_f32(v as f32));
         let upper_f32 = upper.mapv(|v| next_up_f32(v as f32));
-        // Repair NaN/Inf at the type boundary (#3423). Widen strategy replaces NaN
+        // Repair NaN/Inf at the type boundary. Widen strategy replaces NaN
         // with ±inf and fixes inversions.
         BoundedTensor::new_repaired(
             lower_f32.into_dyn(),
@@ -138,7 +138,7 @@ impl MultiNormBounds {
         out
     }
 
-    /// Compute Lq dual norm with f64 accumulators for soundness (#2364).
+    /// Compute Lq dual norm with f64 accumulators for soundness.
     ///
     /// Same algorithm as `norm_q()` but accumulates in f64 to avoid
     /// O(dim_in * eps_f32) rounding error. Each f32 element is promoted to f64

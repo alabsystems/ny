@@ -3,7 +3,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Sparse CROWN merging utilities for IBP/CROWN-IBP intersection.
+//!
+//! #crown-partial-sound-forward: both merge helpers publish the IBP operand
+//! VERBATIM on every position the sparse seed did not track, so the operand is
+//! typed [`CertifiedIbpBox`] — a plain `Layer::propagate_ibp` box (round-to-
+//! nearest f32 on the conv family, documented inward under cancellation) cannot
+//! be handed to them without a compile error.
 
+use super::forward::CertifiedIbpBox;
 use crate::contiguous_flat_slice;
 use ndarray::{ArrayD, IxDyn};
 use ny_core::{NyError, Result};
@@ -16,12 +23,15 @@ use ny_tensor::{BoundedTensor, RepairStrategy};
 /// dense matrix). This function replaces those zero-row entries with the
 /// original IBP bounds, which are already tight for stable neurons.
 ///
-/// Part of #2613 Phase 4 step 19
+/// `ibp` is the CERTIFIED per-layer box (`propagate_ibp_certified`): untracked
+/// positions are published from it verbatim, and tracked positions take the
+/// per-element intersection, so both halves of the result enclose.
 pub(super) fn merge_sparse_crown_with_ibp(
     crown: &BoundedTensor,
-    ibp: &BoundedTensor,
+    ibp: &CertifiedIbpBox,
     tracked_flat: &[usize],
 ) -> Result<BoundedTensor> {
+    let ibp = ibp.as_tensor();
     let crown_lower = crown.lower();
     let crown_upper = crown.upper();
     let ibp_lower = ibp.lower();
@@ -113,8 +123,6 @@ pub(super) fn merge_sparse_crown_with_ibp(
 ///
 /// Reference: Same instability criterion as `UnstableIdx::from_ibp_bounds`
 /// (bounds/patches.rs) but for flat Dense tensors instead of spatial (C,H,W).
-///
-/// Part of #3599 Phase 2
 pub(super) fn find_unstable_dense_indices(
     lower: &[f32],
     upper: &[f32],
@@ -154,14 +162,16 @@ pub(super) fn find_unstable_dense_indices(
 /// IBP bounds, which is a no-op for stable positions (intersection of IBP with
 /// itself = IBP) and tightens unstable positions.
 ///
-/// Part of #3599 Phase 2
+/// `ibp` is the CERTIFIED per-layer box (`propagate_ibp_certified`): stable
+/// positions are published from it verbatim.
 pub(super) fn scatter_sparse_crown_into_ibp(
     crown_lower: &[f32],
     crown_upper: &[f32],
-    ibp: &BoundedTensor,
+    ibp: &CertifiedIbpBox,
     unstable_indices: &[usize],
     output_shape: &[usize],
 ) -> Result<BoundedTensor> {
+    let ibp = ibp.as_tensor();
     let ibp_lower = ibp.lower();
     let ibp_upper = ibp.upper();
     let ibp_lower_slice = contiguous_flat_slice(ibp_lower);

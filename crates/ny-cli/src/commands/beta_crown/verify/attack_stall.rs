@@ -327,7 +327,7 @@ pub(super) fn report_stall_cut(
     }
     if !json {
         println!(
-            "  Attack stall cutoff (#attack-stall): best margin {best:.5} has not improved for a full probe window at {location}; handing the remaining ATTACK budget to the bound/BaB phases (this says nothing about the property)."
+            "  Attack stalled at {location} (best margin {best:.5}); moving the remaining attack budget to bounding. This says nothing about the property."
         );
     }
 }

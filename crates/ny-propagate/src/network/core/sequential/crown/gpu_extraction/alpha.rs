@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Alpha-aware ReLU GPU CROWN layer extraction (#4312, #4313).
+//! Alpha-aware ReLU GPU CROWN layer extraction.
 //!
 //! Builds the legacy `GpuCrownLayer::Activation` descriptor for same-slope
 //! alpha cases and upgrades to `GpuCrownLayer::ActivationReluDualAlpha` only
@@ -98,7 +98,6 @@ pub(crate) fn gpu_relu_affine_cell(
 /// - `cross_intercept = chord_intercept(l, u)` (bias for chord paths)
 ///
 /// Reference: auto_LiRPA/operators/relu.py:641-652
-/// Reference: designs/2026-03-21-issue-4313-relu-dual-alpha-four-slice-abi.md
 pub(crate) fn extract_relu_gpu_layer_with_alpha(
     pre_l: &[f32],
     pre_u: &[f32],

@@ -10,24 +10,16 @@
 mod alpha_update;
 mod collect;
 mod diagnostics;
-// #[cfg(test)] mod fl_composition_tests;
-//
-// DECLARATION WITHDRAWN 2026-08-02: `a0e388bd` added this `mod` but never committed
-// `fl_composition_tests.rs` — the file exists on no branch
-// (`git log --all --diff-filter=A` finds nothing). Because it is `#[cfg(test)]` the
-// LIB still builds, so the gap is invisible to `cargo build`; it breaks only
-// `cargo test -p ny-propagate`, which fails with
-//
-//     error[E0583]: file not found for module `fl_composition_tests`
-//
-// i.e. this crate's ~8,900-test suite — including its soundness oracles — could not
-// compile at all and therefore could not gate anything.
-//
-// Re-land the missing file and this line together, in one commit.
+#[cfg(test)]
+mod fl_composition_tests;
 mod gradients;
 mod init;
 #[cfg(test)]
 mod iter0_parity_tests;
+// #vit-margin-alpha: the certified C-row margin ascent (B1–B4, certify-once).
+mod margin_alpha;
+// #graph-lane-search (M7): V2's self-checked GraphSearchNet lowering, shared.
+pub(crate) use margin_alpha::search_lowering;
 mod preloop_cuda_rows;
 mod spec_axis;
 mod supplements;
@@ -66,6 +58,110 @@ thread_local! {
     /// endpoint of the pre-recovery global best. Test-only route evidence.
     pub(super) static INVPROP_ZERO_GAMMA_RECOVERY_IMPROVEMENTS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+}
+
+/// Why the patience test retired the ascent (#inert-ascent-exit).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AscentPatienceExit {
+    /// The historical rule: `early_stop_patience` consecutive iterations
+    /// improved by less than `tolerance`.
+    Converged,
+    /// The typed rule (`bab.alpha_crown.inert_ascent_exit_iters`): N
+    /// consecutive iterations improved by EXACTLY zero.
+    Inert,
+}
+
+/// Effective `inert_ascent_exit_iters`: the typed key, fail-closed on the
+/// one value that cannot mean anything (`0` would fire before the first
+/// improvement is even measured). `None` = today's ten-iteration patience,
+/// byte-identical.
+pub(super) fn inert_ascent_exit_iters(config: &AlphaCrownConfig) -> Option<usize> {
+    config
+        .inert_ascent_exit_iters
+        .filter(|n| AlphaCrownConfig::inert_ascent_exit_iters_is_valid(*n))
+}
+
+/// The ONE patience decision the DAG ascent takes per iteration
+/// (#inert-ascent-exit). Kept pure so the unit tests exercise exactly the
+/// predicate the loop calls.
+///
+/// MEASURED (2026-09-12, ml4acopf 118_ieee-linear-nonresidual/prop2,
+/// `S/measure_budget3/ml4_118lnrp2_armed.log`): the CROWN-IBP collector had
+/// refused the first two Gemm layers below the per-node floor, the root frame
+/// was IBP-grade (`lower_sum = -8645509120`), and the ascent logged
+/// `best_impr = 7.168e3` at iter 0 then `best_impr = 0.000e0` from iter 5,
+/// finally `Converged at iteration 10 (best improvement < 0.0001 for 10
+/// iters)` — ten iterations bought nothing and burned the 114 s warmup cap,
+/// which (unarmed) abandoned BaB with 448 s of 600 left.
+///
+/// Both exits take the same `should_save_best` route, so stopping earlier
+/// returns an enclosure the unguarded loop was entitled to return: sound,
+/// looser-or-equal, never a minted bound. Unarmed (`None`) the second arm is
+/// unreachable and the predicate is the historical one, unchanged.
+pub(super) fn ascent_patience_exit(
+    iter: usize,
+    no_improve_iters: usize,
+    inert_iters: usize,
+    config: &AlphaCrownConfig,
+    gamma_probe_available: bool,
+) -> Option<AscentPatienceExit> {
+    if iter == 0 || gamma_probe_available {
+        return None;
+    }
+    if no_improve_iters >= config.early_stop_patience {
+        return Some(AscentPatienceExit::Converged);
+    }
+    if inert_ascent_exit_iters(config).is_some_and(|n| inert_iters >= n) {
+        return Some(AscentPatienceExit::Inert);
+    }
+    None
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only route evidence for the ascent exit line: `(iters, exit)` of
+    /// the most recent DAG ascent on this thread.
+    pub(super) static LAST_ALPHA_ASCENT_EXIT: std::cell::RefCell<Option<(usize, &'static str)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The `[alpha-ascent]` line (#inert-ascent-exit). See the call site for the
+/// rate-limit rationale; the FIRST ascent of a process always prints.
+fn emit_alpha_ascent_exit_line(
+    config: &AlphaCrownConfig,
+    iters: usize,
+    exit: &'static str,
+    best_impr_last: f64,
+    lower_sum: f32,
+    secs: f64,
+    saturation: (usize, usize),
+) {
+    #[cfg(test)]
+    LAST_ALPHA_ASCENT_EXIT.with(|cell| *cell.borrow_mut() = Some((iters, exit)));
+    static OCCURRENCES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let Some(occ) = crate::network::graph_alpha::retained_occurrence(&OCCURRENCES) else {
+        return;
+    };
+    let armed = inert_ascent_exit_iters(config);
+    // #graph-alpha-saturation appended to the SAME line, so absence of the
+    // fields means the binary lacks the counter rather than that nothing was
+    // saturated. `frac=1.0` with a low `iters=` is the untouched BINARY
+    // initialisation — a NULL, not a finding. See
+    // `GraphAlphaState::clamp_saturation`.
+    let (committed, at_clamp) = saturation;
+    let frac = if committed > 0 {
+        at_clamp as f64 / committed as f64
+    } else {
+        f64::NAN
+    };
+    eprintln!(
+        "[alpha-ascent] armed={} exit_iters={} iters={iters} exit={exit} \
+         best_impr_last={best_impr_last:.3e} lower_sum={lower_sum:.6e} secs={secs:.2} \
+         patience={} occ={occ} committed={committed} at_clamp={at_clamp} frac={frac:.4}",
+        u8::from(armed.is_some()),
+        armed.unwrap_or(0),
+        config.early_stop_patience,
+    );
 }
 
 fn install_invprop_seed_params(
@@ -160,6 +256,13 @@ fn retain_completed_deadline_error(
     error: &NyError,
 ) -> bool {
     policy_enabled && completed_iterations > 0 && matches!(error, NyError::DeadlineExceeded(_))
+}
+
+/// Distinguish a certified map needing no optimizer from an optimizer episode.
+/// The former never earns a completed-iteration or checkpoint claim.
+pub(in crate::network::graph_alpha) enum RootFixedReferenceCollection {
+    ReferenceOnly(DagAlphaCollectionArtifact),
+    Optimized(DagAlphaCollectionArtifact),
 }
 
 /// Internal result of one DAG alpha optimization episode.
@@ -278,26 +381,44 @@ fn root_alpha_margin_state(config: &AlphaCrownConfig) -> (bool, Option<&AlphaSpe
     root_alpha_margin_state_from(config, raw.as_deref())
 }
 
-/// Subordinate dark gate for the margin-directed warmup gradient.
+/// Subordinate gate for the margin-directed root α.
+///
+/// #vit-margin-alpha (B3): PROMOTED from an env-only child gate to the typed
+/// key `bab.alpha_crown.root_alpha_margin_gradient`
+/// (`AlphaCrownConfig::root_alpha_margin_gradient`, lever
+/// `ny_levers::decls::root_alpha::ROOT_ALPHA_MARGIN_GRADIENT`). The scored
+/// wrapper exports no `NY_*` variables, so the env-only form could never fire
+/// in competition.
 ///
 /// The effective parent gate (typed default or `NY_ROOT_ALPHA_MARGIN=1`) owns
-/// the spec rows and whole-state checkpoint. Do not even read this child gate
+/// the spec rows and whole-state checkpoint. Do not even resolve this child
 /// unless the parent is armed: setting the child by itself must preserve the
 /// legacy warmup byte path.
-fn parse_root_alpha_margin_gradient(raw: Option<&str>) -> bool {
-    raw == Some("1")
+///
+/// Resolution is `ny_levers::read_over_config` over the typed value, so the
+/// legacy environment token still wins in BOTH directions (exact `1` arms,
+/// exact `0` kills a preset-armed key), a malformed token is a kill switch,
+/// and a resolution error fails CLOSED to off.
+fn root_alpha_margin_gradient_choice(config: &AlphaCrownConfig) -> bool {
+    ny_levers::read_over_config(
+        &ny_levers::decls::root_alpha::ROOT_ALPHA_MARGIN_GRADIENT,
+        Some(ny_levers::LeverValue::Bool(
+            config.root_alpha_margin_gradient,
+        )),
+    )
+    .is_ok_and(|resolved| resolved.value.as_bool())
 }
 
-fn root_alpha_margin_gradient_enabled_if<F>(parent_enabled: bool, read: F) -> bool
+fn root_alpha_margin_gradient_enabled_if<F>(parent_enabled: bool, resolve: F) -> bool
 where
-    F: FnOnce() -> Option<String>,
+    F: FnOnce() -> bool,
 {
-    parent_enabled && parse_root_alpha_margin_gradient(read().as_deref())
+    parent_enabled && resolve()
 }
 
-fn root_alpha_margin_gradient_enabled(parent_enabled: bool) -> bool {
+fn root_alpha_margin_gradient_enabled(parent_enabled: bool, config: &AlphaCrownConfig) -> bool {
     root_alpha_margin_gradient_enabled_if(parent_enabled, || {
-        std::env::var("NY_ROOT_ALPHA_MARGIN_GRADIENT").ok()
+        root_alpha_margin_gradient_choice(config)
     })
 }
 
@@ -705,6 +826,7 @@ impl GraphNetwork {
             final_alpha_bound_only_enabled(),
             DagAlphaLoopResultUse::BoundsOnly,
             false,
+            false,
         )
         .map(|artifact| artifact.output_bounds)
     }
@@ -722,7 +844,10 @@ impl GraphNetwork {
         final_bound_only_gate: bool,
         result_use: DagAlphaLoopResultUse,
         retain_completed_on_deadline: bool,
+        root_fixed_reference: bool,
     ) -> Result<DagAlphaCollectionArtifact> {
+        // #phase-cost: see `ny_core::phase_cost` (observability only).
+        let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::AlphaOpt);
         let DagAlphaInitState {
             node_bounds,
             node_bounds_source,
@@ -903,7 +1028,9 @@ impl GraphNetwork {
         // NEVER aliases `engine`.
         let (root_alpha_margin, spec_ascent) = root_alpha_margin_state(config);
         let alpha_steering_owned: Option<std::sync::Arc<dyn GemmEngine>> =
-            if root_alpha_margin_gradient_enabled(root_alpha_margin) && spec_ascent.is_some() {
+            if root_alpha_margin_gradient_enabled(root_alpha_margin, config)
+                && spec_ascent.is_some()
+            {
                 crate::alpha_gradient_steering::steering_engine()
             } else {
                 None
@@ -1060,14 +1187,26 @@ impl GraphNetwork {
                     //     It is compatible under the same Step-1 gate and lets
                     //     this bound consume the paid-for root tightening.
                     //   - Ibp: Step 1 might upgrade to per-node CROWN-IBP (and
-                    //     its plain-IBP arm is the scalar f64 path, #4219), so
+                    //     its plain-IBP arm is the scalar f64 path), so
                     //     preserve the legacy internal collection byte-for-byte.
                     let step1_would_use_forward_linear =
                         self.should_collect_forward_linear_intermediate_reference();
-                    let reuse_init_bounds = can_reuse_initial_node_bounds(
-                        node_bounds_source,
-                        step1_would_use_forward_linear,
-                    );
+                    // #vit-crown-interm: under `crown_ibp_reference_cap_secs` the
+                    // capped CROWN-IBP init map IS this route's reference, so the
+                    // initial bound reuses it rather than re-running Step 1 (on a
+                    // conv DAG whose forward-linear reference refuses — vit's
+                    // `/0/Transpose` — that re-run is a second, uncapped
+                    // collection). Sound: a certified same-box enclosure map.
+                    // The explicit root policy owns a certified map from this same
+                    // graph/input call. It chooses that map even where the legacy
+                    // quality policy would collect a different forward-linear map.
+                    let reuse_init_bounds = root_fixed_reference
+                        || can_reuse_initial_node_bounds(
+                            node_bounds_source,
+                            step1_would_use_forward_linear,
+                        )
+                        || (config.crown_ibp_reference_cap().is_some()
+                            && matches!(node_bounds_source, AlphaReferenceBoundsSource::CrownIbp));
                     let collector_cap = if reuse_init_bounds {
                         None
                     } else {
@@ -1120,8 +1259,7 @@ impl GraphNetwork {
         };
         let mut best_lower: ArrayD<f32> = crown_bounds.lower().clone();
         let mut best_upper: ArrayD<f32> = crown_bounds.upper().clone();
-        // Use finite-only sum to prevent -Inf poisoning the early-stopping metric (#2857).
-        // Prior layout-agnostic fix: #1939.
+        // Use finite-only sum to prevent -Inf poisoning the early-stopping metric.
         let mut best_lower_sum: f32 = finite_lower_sum(crown_bounds.lower());
         let mut prev_best_lower_sum = best_lower_sum;
         let mut best_invprop_gap: Option<f64> = None;
@@ -1130,7 +1268,8 @@ impl GraphNetwork {
         // the effective gate is set AND the caller supplied a multi-row spec
         // objective. When either is absent this stays `None` and every branch below
         // is inert, so the loop is byte-identical to the legacy path.
-        let margin_gradient_requested = root_alpha_margin_gradient_enabled(root_alpha_margin);
+        let margin_gradient_requested =
+            root_alpha_margin_gradient_enabled(root_alpha_margin, config);
         let margin_hinge_steering = root_alpha_margin_hinge_enabled(margin_gradient_requested);
         // A GraphAlphaState snapshot is the complete optimizer state only for
         // the ReLU-only path.  Refuse rather than mix a best ReLU checkpoint
@@ -1162,6 +1301,84 @@ impl GraphNetwork {
             root_alpha_true_armed,
         );
         let margin_gradient_eligible = margin_gradient_eligibility.is_eligible();
+        // #vit-margin-alpha (B1–B4): the certified C-row margin ascent takes
+        // exactly the roots the resident lane refuses for carrying bilinear α
+        // state (every vit attention product) — see `margin_alpha.rs`. Every
+        // refusal, including a first certified fold the exact-seed face
+        // declines, hands NOTHING over: the legacy loop below then runs exactly
+        // as before, after an unconditional `[alpha-margin] armed=0 reason=…`
+        // line whenever any of the lane's keys is set.
+        let margin_admission = margin_alpha::margin_ascent_admission(
+            margin_gradient_requested,
+            spec_ascent.is_some(),
+            matches!(result_use, DagAlphaLoopResultUse::BoundsAndState),
+            margin_gradient_eligibility,
+            margin_gradient_requested && config.matmul_alpha && self.graph_has_var_matmul(),
+            has_mul_binary,
+            has_s_shaped,
+            has_sqrt,
+            has_reciprocal,
+            config.margin_alpha_freeze_mul_reciprocal,
+            invprop_gamma_optimization_active,
+            config.iterations,
+        );
+        // #vit-margin-alpha-complex (P6): the freeze key's own engagement
+        // line, whatever the admission decided (print-only).
+        if config.margin_alpha_freeze_mul_reciprocal {
+            margin_alpha::emit_margin_alpha_frozen_line(
+                margin_admission,
+                mul_binary_alphas.len(),
+                runtime.graph().reciprocal_alpha_names().count(),
+                has_s_shaped,
+                has_sqrt,
+            );
+        }
+        match (margin_admission.is_admitted(), spec_ascent) {
+            (true, Some(ascent)) => match self.prepare_margin_alpha_lane(
+                &ctx,
+                reference_bounds.current(),
+                &runtime,
+                &bilinear_alphas,
+                &bilinear_adam_m,
+                &bilinear_adam_v,
+                &mul_binary_alphas,
+                ascent,
+            ) {
+                Ok(prepared) => {
+                    return self.run_margin_alpha_lane(
+                        &ctx,
+                        prepared,
+                        runtime,
+                        reference_bounds,
+                        node_bounds_source,
+                        crown_bounds,
+                    );
+                }
+                Err(reason) => margin_alpha::emit_margin_alpha_refusal(reason),
+            },
+            // Any of the lane's typed keys set but the lane did not run: say
+            // why, so a refusal is never read as a negative result. A child
+            // key without its parent gate is the likeliest yaml mistake, so it
+            // gets its own token (the child is still never RESOLVED without
+            // the parent; this reads only the typed config fields).
+            // #vit-root-alpha: an armed V2 selector on a root the lane did not
+            // take must say so too, or its silence reads like "the search found
+            // nothing". Dark (`ascent`) the condition is unchanged.
+            _ if margin_gradient_requested
+                || config.root_alpha_margin_gradient
+                || config.matmul_alpha
+                || config.margin_alpha_freeze_mul_reciprocal
+                || config.margin_alpha_search != crate::bounds::MarginAlphaSearch::Ascent =>
+            {
+                let reason = if root_alpha_margin {
+                    margin_admission.reason()
+                } else {
+                    "parent_root_alpha_margin_dark"
+                };
+                margin_alpha::emit_margin_alpha_refusal(reason);
+            }
+            _ => {}
+        }
         // Null-run guard: this repo has repeatedly lost sessions to gates that were
         // armed in the environment but inert in the code (quarantine-dead readers,
         // configs that never reached the operative lane). Say plainly, once, whether
@@ -1205,6 +1422,13 @@ impl GraphNetwork {
         // eligibility alone is not a dispatch result.
         let mut previous_margin_joint_dispatched = false;
         let mut no_improve_iters = 0usize;
+        // #inert-ascent-exit state: consecutive iterations whose best
+        // improvement was EXACTLY zero (the iterate never beat the best), and
+        // the exit bookkeeping for the unconditional `[alpha-ascent]` line.
+        let mut inert_iters = 0usize;
+        let mut last_best_improvement = f64::NAN;
+        let mut ascent_exit: &'static str = "other";
+        let ascent_started_at = std::time::Instant::now();
         // #alpha-zero-yield state: when the ascent last actually improved, and
         // the size of the window it is being paid out of.
         let mut last_improvement_at = std::time::Instant::now();
@@ -1279,7 +1503,7 @@ impl GraphNetwork {
                     "dag-alpha-warmup iter={iter} start"
                 ));
             }
-            // Deadline check (#2962): bail early if verification timeout budget
+            // Deadline check: bail early if verification timeout budget
             // is exhausted. Return current best bounds instead of running all iterations.
             // Matches pattern in alpha_crown_loop.rs:112 and bounds/alpha.rs:114.
             if config.past_deadline() {
@@ -1287,6 +1511,7 @@ impl GraphNetwork {
                     "DAG α-CROWN: deadline exceeded at iteration {}/{}, returning best bounds",
                     iter, config.iterations
                 );
+                ascent_exit = "budget";
                 break;
             }
             let is_last_iter = iter == config.iterations - 1;
@@ -1311,12 +1536,12 @@ impl GraphNetwork {
             } else {
                 Vec::new()
             };
-            // Separate upper-path gradient buffer (#3393).
+            // Separate upper-path gradient buffer.
             let mut gradients_upper: Vec<Array1<f32>> =
                 gradients.iter().map(|g| Array1::zeros(g.len())).collect();
 
             // Run backward pass through DAG with alpha values.
-            // Pass bilinear/mul_binary alphas so nonlinear nodes use interpolated bounds (#3287, #3439).
+            // Pass bilinear/mul_binary alphas so nonlinear nodes use interpolated bounds.
             let (bilinear_ref, mul_binary_ref) =
                 gradients::alpha_refs(&ctx, &bilinear_alphas, &mul_binary_alphas);
             // A nonzero INVPROP dual conditions this backward pass on the
@@ -1463,7 +1688,7 @@ impl GraphNetwork {
 
             // Update element-wise best bounds with layout-agnostic iteration.
             // This handles non-standard layout arrays and shape-only ndim mismatch
-            // as long as element counts match (#2076, #2087).
+            // as long as element counts match.
             // Skip during warmup window to avoid locking in noisy early-iteration bounds.
             // Matches α,β-CROWN's start_save_best (optimized_bounds.py:785-797).
             if returnable_box_iterate && config.should_save_best(iter, is_last_iter) {
@@ -1490,7 +1715,7 @@ impl GraphNetwork {
             // valid. Worst case is a weaker bound, never a wrong one.
             let mut margin_gradient_objective: Option<BindingMarginObjective> = None;
             if let Some(ascent) = spec_ascent {
-                // Layout-agnostic (#1939, #2076, #2087): this loop genuinely sees
+                // Layout-agnostic: this loop genuinely sees
                 // non-standard layouts, where `as_slice()` returns None. Falling back
                 // to a logical-order copy keeps the gate from silently becoming a
                 // no-op on exactly those graphs — a null run is worse than a cost,
@@ -1569,7 +1794,7 @@ impl GraphNetwork {
                 }
             }
 
-            // Finite-only sum for early stopping (#2857). Layout-agnostic (#1939).
+            // Finite-only sum for early stopping. Layout-agnostic.
             let lower_sum: f32 = finite_lower_sum(concrete_bounds.lower());
             let gamma_gap_control =
                 invprop_gamma_optimization_active && invprop_gap_score.is_some();
@@ -1594,13 +1819,14 @@ impl GraphNetwork {
 
             // NaN detection: if any bound element is NaN, the backward pass produced
             // garbage. Break early to avoid wasting remaining iterations — the
-            // post-loop has_nan check will fall back to CROWN. (#2597)
+            // post-loop has_nan check will fall back to CROWN.
             if concrete_bounds.lower().iter().any(|v| v.is_nan())
                 || concrete_bounds.upper().iter().any(|v| v.is_nan())
             {
                 warn!(
                     "DAG α-CROWN: NaN in bounds at iteration {iter}, aborting optimization (#2597)"
                 );
+                ascent_exit = "nan";
                 break;
             }
             // The bound fold is now an atomic, finite publication.  Later
@@ -1628,6 +1854,7 @@ impl GraphNetwork {
                      returning best bounds",
                     iter, config.iterations
                 );
+                ascent_exit = "budget";
                 break;
             }
 
@@ -1648,6 +1875,7 @@ impl GraphNetwork {
                                  (root bound [{:.4}, {:.4}] clears threshold {})",
                                 iter, root_lower, root_upper, spec.threshold
                             );
+                            ascent_exit = "spec_verified";
                             break;
                         }
                     }
@@ -1811,6 +2039,7 @@ impl GraphNetwork {
                 info!(
                     "DAG α-CROWN: optional INVPROP probe reached the deadline at iteration {iter}; returning best global bounds"
                 );
+                ascent_exit = "budget";
                 break 'alpha_iterations;
             }
 
@@ -1818,6 +2047,7 @@ impl GraphNetwork {
                 info!(
                     "DAG α-CROWN: deadline exceeded by INVPROP probe at iteration {iter}, returning best global bounds"
                 );
+                ascent_exit = "budget";
                 break;
             }
 
@@ -1840,6 +2070,15 @@ impl GraphNetwork {
             } else {
                 f64::from(best_lower_sum - prev_best_lower_sum)
             };
+            last_best_improvement = best_improvement;
+            // #inert-ascent-exit: an improvement of EXACTLY zero (or negative,
+            // which the objective-specific arms can report) means this iterate
+            // did not beat the best at all — the frame is not moving.
+            if best_improvement <= 0.0 {
+                inert_iters += 1;
+            } else {
+                inert_iters = 0;
+            }
             // #alpha-divergence-bail (dark, `NY_ALPHA_DIVERGENCE_BAIL=1`, default
             // OFF ⇒ byte-identical): abandon an ascent that has visibly blown up
             // instead of paying `early_stop_patience` more iterations to discover
@@ -1884,6 +2123,7 @@ impl GraphNetwork {
                      {iter}; the α state has diverged. Abandoning the ascent and keeping \
                      the best iterate."
                 );
+                ascent_exit = "diverged";
                 break;
             }
 
@@ -1932,6 +2172,23 @@ impl GraphNetwork {
                                 iter,
                             )?;
                         }
+                        // #alpha-zero-yield OBSERVABLE. The `info!` above is a tracing
+                        // event, and RUST_LOG is not honoured on this path, so the gate was
+                        // effectively SILENT: an armed run could not be distinguished from an
+                        // unarmed one, which makes any null from it VACUOUS by the same rule
+                        // that voided several levers this campaign. Every other lever in this
+                        // tree announces itself on stderr (`[beta] armed`,
+                        // `[closure] policy ARMED`, `[ctx-group]`, `[safenlp-cycle] armed`);
+                        // match that convention so the promotion A/B the 2026-08-11 census
+                        // asked for can actually assert engagement.
+                        eprintln!(
+                            "[alpha-zero-yield] retired iter={iter} idle_s={:.2} window_s={:.2} \
+                             frac={:.3} returned_s={:.2}",
+                            idle.as_secs_f64(),
+                            window.as_secs_f64(),
+                            frac,
+                            (window.as_secs_f64() - idle.as_secs_f64()).max(0.0)
+                        );
                         info!(
                             "DAG α-CROWN #alpha-zero-yield: {:.1}s of a {:.1}s window with no \
                              improvement over the best iterate (iteration {iter}); retiring the \
@@ -1939,12 +2196,18 @@ impl GraphNetwork {
                             idle.as_secs_f64(),
                             window.as_secs_f64()
                         );
+                        ascent_exit = "zero_yield";
                         break;
                     }
                 }
             }
-            if iter > 0 && no_improve_iters >= config.early_stop_patience && !gamma_probe_available
-            {
+            if let Some(exit) = ascent_patience_exit(
+                iter,
+                no_improve_iters,
+                inert_iters,
+                config,
+                gamma_probe_available,
+            ) {
                 if returnable_box_iterate && !config.should_save_best(iter, false) {
                     update_elementwise_best_bounds(
                         &mut best_lower,
@@ -1953,10 +2216,28 @@ impl GraphNetwork {
                         iter,
                     )?;
                 }
-                info!(
-                    "DAG α-CROWN: Converged at iteration {} (best improvement < {} for {} iters)",
-                    iter, config.tolerance, no_improve_iters
-                );
+                match exit {
+                    AscentPatienceExit::Converged => {
+                        ascent_exit = "converged";
+                        info!(
+                            "DAG α-CROWN: Converged at iteration {} (best improvement < {} for {} iters)",
+                            iter, config.tolerance, no_improve_iters
+                        );
+                    }
+                    AscentPatienceExit::Inert => {
+                        // #inert-ascent-exit: same `should_save_best` route as
+                        // ordinary convergence, so the returned enclosure is one
+                        // the unguarded loop was also entitled to return.
+                        ascent_exit = "inert";
+                        info!(
+                            "DAG α-CROWN: inert ascent at iteration {} (best improvement exactly \
+                             zero for {} iters; typed exit after {} iters)",
+                            iter,
+                            inert_iters,
+                            inert_ascent_exit_iters(config).unwrap_or(0)
+                        );
+                    }
+                }
                 break;
             }
 
@@ -1964,10 +2245,10 @@ impl GraphNetwork {
             // Must be iter >= 1 (not iter == 0) because iteration 0 uses CROWN-initialized
             // alpha values and always produces bounds identical to plain CROWN. The first
             // alpha update happens at the END of iter 0, so iter 1 is the first iteration
-            // that reflects optimized alpha values. (#3293)
+            // that reflects optimized alpha values.
             if iter == 1 && config.adaptive_skip && config.adaptive_skip_pilot && !gamma_gap_control
             {
-                // Compute improvement over initial CROWN bounds (#2857, #1939).
+                // Compute improvement over initial CROWN bounds.
                 let initial_lower_sum: f32 = finite_lower_sum(crown_bounds.lower());
                 let pilot_improvement = if previous_margin_joint_dispatched {
                     // The first finite margin score is the pilot baseline. The
@@ -1987,7 +2268,10 @@ impl GraphNetwork {
                          α-CROWN optimization is not helping, skipping remaining iterations.",
                         pilot_improvement, config.pilot_improvement_threshold
                     );
-                    // Return best bounds found so far (CROWN or pilot iteration bounds)
+                    // Return best bounds found so far (CROWN or pilot iteration bounds).
+                    // This exit returns before the shared post-loop `[alpha-ascent]`
+                    // line, so it records no `ascent_exit` (an assignment here was
+                    // never read).
                     let mut pilot_lower = best_lower.clone();
                     let mut pilot_upper = best_upper.clone();
                     let widened = clamp_inverted_best_bounds(
@@ -1996,7 +2280,7 @@ impl GraphNetwork {
                         "dag-alpha-crown-pilot-exit",
                     );
                     if widened > 0 {
-                        // Fall back to CROWN bounds for inverted elements (#3754).
+                        // Fall back to CROWN bounds for inverted elements.
                         for (best, &crown) in
                             pilot_lower.iter_mut().zip(crown_bounds.lower().iter())
                         {
@@ -2321,7 +2605,7 @@ impl GraphNetwork {
                 return Err(error);
             }
 
-            // Destructure to separate immutable and mutable borrows (#2297).
+            // Destructure to separate immutable and mutable borrows.
             // `numerical_gradients_upper` is `None` for non-Analytic methods,
             // avoiding a full Vec<Array1<f32>> clone per iteration.
             let gradients::GradientDispatchResult {
@@ -2601,6 +2885,9 @@ impl GraphNetwork {
             prev_best_invprop_gap = best_invprop_gap;
             prev_best_margin_score = best_margin_score;
             previous_margin_joint_dispatched = margin_dispatch.joint_dispatched();
+            if is_last_iter {
+                ascent_exit = "iters_exhausted";
+            }
         }
 
         // #phase-telemetry: shared loop exit (normal completion and every
@@ -2611,6 +2898,20 @@ impl GraphNetwork {
                 "dag-alpha-warmup loop-exit iters={phase_iters_started}"
             ));
         }
+        // #inert-ascent-exit OBSERVABLE, on the same shared exit. UNCONDITIONAL
+        // on the key (armed=0 prints too, so a null can never be mistaken for a
+        // negative); process-rate-limited to the first 16 ascents and then
+        // powers of two, because the DAG ascent runs once per clause on a
+        // many-clause disjunction. `occ=` is the occurrence ordinal.
+        emit_alpha_ascent_exit_line(
+            config,
+            phase_iters_started,
+            ascent_exit,
+            last_best_improvement,
+            best_lower_sum,
+            ascent_started_at.elapsed().as_secs_f64(),
+            runtime.graph().clamp_saturation(),
+        );
 
         diagnostics::log_gradient_skip_summary(
             total_gradient_skips,
@@ -2791,7 +3092,7 @@ impl GraphNetwork {
         // Infinite bounds are sound overapproximations from inversion widening
         // (clamp_inverted_best_bounds sets inverted elements to [-inf, +inf]).
         // The previous is_finite() check incorrectly discarded ALL optimization
-        // progress when any single element was infinite (#2854).
+        // progress when any single element was infinite.
         let alpha_state = runtime.into_graph_alpha_state();
         let reference_bounds = reference_bounds.into_current();
         let has_nan =
@@ -2803,7 +3104,7 @@ impl GraphNetwork {
                 clamp_inverted_best_bounds(&mut best_lower, &mut best_upper, "dag-alpha-crown");
 
             if widened > 0 {
-                // Fall back to CROWN bounds for inverted elements (#3754).
+                // Fall back to CROWN bounds for inverted elements.
                 // Cross-iteration elementwise merge can produce inversions on DAG
                 // topologies (e.g. diamond: branches with zero weights cause SPSA
                 // noise to oscillate alpha slopes). The initial CROWN bounds are
@@ -2887,11 +3188,11 @@ mod tests {
         alpha_zero_yield_frac_from, binding_margin_lower_objective, can_reuse_initial_node_bounds,
         cumulative_alpha_refresh_allowance, debit_alpha_refresh_budget,
         hinge_margin_lower_objective, margin_gradient_eligibility, parse_alpha_divergence_bail,
-        parse_alpha_refresh_fraction, parse_root_alpha_margin, parse_root_alpha_margin_gradient,
-        parse_root_alpha_margin_hinge, retain_completed_deadline_error, retain_warmup_iter_cache,
-        root_alpha_margin_enabled_from, root_alpha_margin_gradient_enabled_if,
-        root_alpha_margin_hinge_enabled, root_alpha_margin_state_from, AlphaReferenceBoundsSource,
-        DagAlphaLoopResultUse, MarginGradientEligibility, ALPHA_DIVERGENCE_FACTOR,
+        parse_alpha_refresh_fraction, parse_root_alpha_margin, parse_root_alpha_margin_hinge,
+        retain_completed_deadline_error, retain_warmup_iter_cache, root_alpha_margin_enabled_from,
+        root_alpha_margin_gradient_enabled_if, root_alpha_margin_hinge_enabled,
+        root_alpha_margin_state_from, AlphaReferenceBoundsSource, DagAlphaLoopResultUse,
+        MarginGradientEligibility, ALPHA_DIVERGENCE_FACTOR,
     };
     use crate::bounds::{AlphaCrownConfig, AlphaSpecAscent, AlphaSpecEarlyExit};
     use std::cell::Cell;
@@ -3456,29 +3757,54 @@ mod tests {
         );
     }
 
+    /// #vit-margin-alpha (B3): the child gate is now the TYPED key resolved
+    /// env-over-config by the lever registry. The exact-token rule the old
+    /// hand parser enforced is the registry's `LeverKind::Bool` rule, pinned
+    /// here on the real declaration through the lookup-injected seam (no
+    /// process env mutation), and the child is still never resolved without
+    /// its parent.
     #[test]
-    fn root_alpha_margin_gradient_gate_is_exact_and_not_read_without_parent() {
-        assert!(parse_root_alpha_margin_gradient(Some("1")));
-        for raw in ["0", "true", "on", "yes", " 1", "1 ", "", "01", "2", "-1"] {
+    fn root_alpha_margin_gradient_gate_is_typed_exact_and_not_read_without_parent() {
+        let decl = &ny_levers::decls::root_alpha::ROOT_ALPHA_MARGIN_GRADIENT;
+        let resolve = |raw: Option<&str>, config: bool| {
+            ny_levers::read_over_config_with(
+                decl,
+                |_| raw.map(str::to_string),
+                Some(ny_levers::LeverValue::Bool(config)),
+            )
+            .expect("bool lever resolves")
+        };
+        let typed = resolve(None, true);
+        assert!(typed.value.as_bool(), "the typed key alone arms the child");
+        assert_eq!(typed.source, ny_levers::Source::Config);
+        assert!(!resolve(None, false).value.as_bool(), "default dark");
+        assert!(
+            resolve(Some("1"), false).value.as_bool(),
+            "env 1 still arms"
+        );
+        let killed = resolve(Some("0"), true);
+        assert!(!killed.value.as_bool(), "env 0 kills a preset-armed key");
+        assert_eq!(killed.source, ny_levers::Source::LegacyEnv);
+        for raw in ["true", "on", "yes", " 1", "1 ", "", "01", "2", "-1"] {
+            let resolved = resolve(Some(raw), true);
             assert!(
-                !parse_root_alpha_margin_gradient(Some(raw)),
+                !resolved.value.as_bool(),
                 "{raw:?} must not arm the margin-gradient child"
             );
+            assert_eq!(resolved.source, ny_levers::Source::LegacyEnvRejected);
         }
-        assert!(!parse_root_alpha_margin_gradient(None));
 
         let read = Cell::new(false);
         assert!(!root_alpha_margin_gradient_enabled_if(false, || {
             read.set(true);
-            Some("1".to_string())
+            true
         }));
         assert!(
             !read.get(),
-            "the child environment variable must not be read outside its parent gate"
+            "the child gate must not be resolved outside its parent gate"
         );
-        assert!(root_alpha_margin_gradient_enabled_if(true, || {
-            Some("1".to_string())
-        }));
+        assert!(root_alpha_margin_gradient_enabled_if(true, || true));
+        assert!(!root_alpha_margin_gradient_enabled_if(true, || false));
     }
 
     #[test]
@@ -3721,6 +4047,103 @@ mod tests {
         assert!(
             binding_margin_lower_objective(&ascent, &[0.0], &[1.0]).is_none(),
             "shape mismatch must refuse rather than optimize a partial conjunction"
+        );
+    }
+}
+
+#[cfg(test)]
+mod inert_ascent_exit_tests {
+    use super::{ascent_patience_exit, inert_ascent_exit_iters, AscentPatienceExit};
+    use crate::bounds::AlphaCrownConfig;
+
+    fn config(inert: Option<usize>) -> AlphaCrownConfig {
+        AlphaCrownConfig {
+            early_stop_patience: 10,
+            inert_ascent_exit_iters: inert,
+            ..AlphaCrownConfig::default()
+        }
+    }
+
+    /// Walk the predicate the way the loop does: every iteration improves by
+    /// exactly zero, so both counters climb together. Unarmed, the exit is the
+    /// historical one at patience 10; armed with N=3 the inert exit fires at
+    /// iteration 2 (three zero iterations: 0, 1, 2).
+    fn first_exit(cfg: &AlphaCrownConfig) -> Option<(usize, AscentPatienceExit)> {
+        let (mut no_improve, mut inert) = (0usize, 0usize);
+        for iter in 0..50 {
+            no_improve += 1;
+            inert += 1;
+            if let Some(exit) = ascent_patience_exit(iter, no_improve, inert, cfg, false) {
+                return Some((iter, exit));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn unarmed_exits_at_the_historical_patience_only() {
+        assert_eq!(inert_ascent_exit_iters(&config(None)), None);
+        assert_eq!(
+            first_exit(&config(None)),
+            Some((9, AscentPatienceExit::Converged)),
+            "patience 10 reaches 10 at iteration 9"
+        );
+    }
+
+    #[test]
+    fn armed_exits_after_n_exactly_zero_iterations() {
+        assert_eq!(inert_ascent_exit_iters(&config(Some(3))), Some(3));
+        assert_eq!(
+            first_exit(&config(Some(3))),
+            Some((2, AscentPatienceExit::Inert)),
+            "three exactly-zero iterations (0, 1, 2) retire the ascent at iteration 2"
+        );
+        // A run that is stalling but NOT exactly inert keeps the historical rule:
+        // sub-tolerance improvements count for patience, not for inertness.
+        let cfg = config(Some(3));
+        let mut no_improve = 0usize;
+        let mut exit = None;
+        for iter in 0..50 {
+            no_improve += 1;
+            let inert = 0;
+            if let Some(e) = ascent_patience_exit(iter, no_improve, inert, &cfg, false) {
+                exit = Some((iter, e));
+                break;
+            }
+        }
+        assert_eq!(exit, Some((9, AscentPatienceExit::Converged)));
+    }
+
+    #[test]
+    fn zero_is_not_a_patience_and_iteration_zero_never_exits() {
+        assert_eq!(
+            inert_ascent_exit_iters(&config(Some(0))),
+            None,
+            "Some(0) is fail-closed to dark"
+        );
+        assert_eq!(
+            first_exit(&config(Some(0))),
+            Some((9, AscentPatienceExit::Converged))
+        );
+        // Iteration 0 is the CROWN-initialised bound; neither rule may fire there.
+        assert_eq!(
+            ascent_patience_exit(0, 10, 10, &config(Some(1)), false),
+            None
+        );
+        // The armed rule needs `iter > 0` too: N=1 fires at iteration 1.
+        assert_eq!(
+            ascent_patience_exit(1, 2, 2, &config(Some(1)), false),
+            Some(AscentPatienceExit::Inert)
+        );
+        // The gamma probe keeps its precedence over both rules.
+        assert_eq!(
+            ascent_patience_exit(5, 10, 10, &config(Some(1)), true),
+            None
+        );
+        // The historical rule wins when both are satisfied on the same iteration.
+        assert_eq!(
+            ascent_patience_exit(9, 10, 10, &config(Some(10)), false),
+            Some(AscentPatienceExit::Converged)
         );
     }
 }

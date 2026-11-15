@@ -9,7 +9,7 @@
 //! them (2 output-direction spec rows [[+1],[-1]]), and reports domains/second.
 //!
 //! Run:
-//!   cargo run -p ny-cli --release --example microbench_mscn_backward
+//!   targo --unverified run -p ny-cli --release --example microbench_mscn_backward
 //! Optional args: <onnx> <vnnlib> <batch_sizes csv> <shared_root 0|1>
 
 use std::collections::HashMap;

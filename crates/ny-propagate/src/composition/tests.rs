@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Unit tests for multi-network composition (Packet A, #3517).
+//! Unit tests for multi-network composition (Packet A).
 //! All tests use synthetic BoundedTensor values — no ONNX, no fixture dir.
 
 use std::collections::HashMap;

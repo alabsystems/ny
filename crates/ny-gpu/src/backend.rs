@@ -92,15 +92,13 @@ pub const fn wgpu_backend_compiled() -> bool {
 /// exact returned device gains CROWN authority only after all five live rungs
 /// pass. Every other WGPU proof route remains quarantined operation by operation.
 ///
-/// CORRECTED 2026-08-04: this used to end "and, on this host, because WGSL has
-/// no f64". WGSL indeed has no f64, but that is NOT a reason to withhold
-/// authority — the sound-resident lane certifies its error in pure f32 (Higham
-/// `γ_k·S` with outward-rounded host uniforms), and the EFT/double-single
-/// channel supplies an f64-grade compensated residual without f64. Its two
-/// primitives measured bit-exact on an Apple M5 Max/Metal adapter on 2026-08-04
-/// (509/509 and 307/307 lanes, 0 ULP). Bit-exact primitives are necessary and
-/// NOT sufficient; see `docs/METAL_EFT_VIABLE_2026-08-04.md`.
-///
+/// WGSL has no f64, but that is NOT a reason to withhold authority — the
+/// sound-resident lane certifies its error in pure f32 (Higham `γ_k·S` with
+/// outward-rounded host uniforms), and the EFT/double-single channel supplies
+/// an f64-grade compensated residual without f64. Its two primitives measured
+/// bit-exact on an Apple M5 Max/Metal adapter on 2026-08-04 (509/509 and
+/// 307/307 lanes, 0 ULP). Bit-exact primitives are necessary and NOT
+/// sufficient; see `docs/METAL_EFT_VIABLE_2026-08-04.md`.
 #[must_use]
 pub const fn wgpu_proof_authority() -> bool {
     #[cfg(feature = "wgpu")]
@@ -353,7 +351,7 @@ impl ComputeDevice {
         }
     }
 
-    /// Release reusable GPU CROWN buffers between long-lived runs (#3515).
+    /// Release reusable GPU CROWN buffers between long-lived runs.
     pub fn clear_crown_working_set(&self) -> Result<()> {
         match self {
             ComputeDevice::Cpu(_) => Ok(()),
@@ -759,6 +757,7 @@ mod dag_ibp_routing_tests {
     /// A qualified proof device opens exactly the CROWN accessor. All broader
     /// engine and resident-forward surfaces remain closed.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn qualified_compute_device_opens_only_crown_backward() {
         let device = ComputeDevice::new_for_proof(WgpuVerdictRequest::new())
             .expect("gpu-tests proof routing requires a conformant WGPU adapter");

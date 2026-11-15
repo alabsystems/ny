@@ -38,9 +38,6 @@ use super::history::constraints_from_history;
 /// * `layer_names` - Ordered list of layer names
 /// * `enable_interm_transfer` - Whether to include intermediate bounds
 /// * `cached_la` - Optional cached linear bounds per domain
-///
-/// # Reference
-/// Issue: #1564 (lA matrix caching)
 pub fn processed_from_graph_domains_with_la(
     domains: &[GraphBabDomain],
     layer_names: &[String],
@@ -81,7 +78,7 @@ pub fn processed_from_graph_domains_with_la(
     let input_lowers = batched.input_lowers().as_array().clone();
     let input_uppers = batched.input_uppers().as_array().clone();
 
-    // Structural invariant: parallel arrays must match batch_size. (#2637)
+    // Structural invariant: parallel arrays must match batch_size.
     let bs = batched.batch_size();
     debug_assert_eq!(batched.lower_bounds().len(), bs);
     debug_assert_eq!(batched.upper_bounds().len(), bs);
@@ -102,7 +99,6 @@ pub fn processed_from_graph_domains_with_la(
                 cached_la.as_ref().and_then(|v| v.get(i).cloned()),
                 // Preserve alpha state from source domains. BatchedDomains strips
                 // alpha during tensor stacking, so we read it directly.
-                // Issue: #1845
                 if domains[i].alpha_state.is_empty() {
                     None
                 } else {
@@ -128,7 +124,7 @@ pub fn processed_from_graph_domains_with_la(
 
 /// Convert GraphBabDomains to ProcessedDomains directly, bypassing BatchedDomains.
 ///
-/// Direction 3 of #1668: This builds `ProcessedDomains` by stacking per-domain
+/// This builds `ProcessedDomains` by stacking per-domain
 /// tensors directly into batched `ArrayD<f32>` arrays, avoiding the
 /// `BatchedDomains::from_graph_domains_with_options` → extract → clone round-trip.
 ///
@@ -147,10 +143,6 @@ pub fn processed_from_graph_domains_with_la(
 /// * `domains` - The child domains to convert
 /// * `layer_names` - Ordered list of layer names
 /// * `cached_la` - Optional cached linear bounds per domain
-///
-/// # Reference
-/// Issue: #1668 (zero-copy domain flow)
-/// Design: `designs/2026-02-07-gpu-bab-zero-copy-domain-flow.md` Direction 3
 pub fn processed_from_graph_domains_direct(
     domains: &[GraphBabDomain],
     layer_names: &[String],
@@ -231,7 +223,7 @@ pub fn processed_from_graph_domains_direct(
     let global_lbs: Vec<f32> = domains.iter().map(|d| d.lower_bound).collect();
     let global_ubs: Vec<f32> = domains.iter().map(|d| d.upper_bound).collect();
 
-    // Structural invariant: cached_la must cover batch_size. (#2637)
+    // Structural invariant: cached_la must cover batch_size.
     if let Some(ref la) = cached_la {
         debug_assert!(la.len() >= batch_size);
     }
@@ -272,7 +264,7 @@ pub fn processed_from_graph_domains_direct(
 /// Build ProcessedDomains directly from backward pass results, skipping per-domain
 /// GraphBabDomain materialization on the output side.
 ///
-/// Direction 3 extension of #1668: After the batched backward pass produces per-domain
+/// After the batched backward pass produces per-domain
 /// `(BoundedTensor, HashMap<String, BoundedTensor>)` results, this function stacks the
 /// updated node caches directly into ProcessedDomains format without writing them back
 /// into individual `GraphBabDomain.node_bounds` and then re-stacking.
@@ -291,10 +283,6 @@ pub fn processed_from_graph_domains_direct(
 /// * `keep_mask` - Which domains survived verification/violation/depth filtering
 /// * `layer_names` - Ordered list of layer names
 /// * `cached_la` - Optional captured lA per domain (only for kept domains, in kept-domain order)
-///
-/// # Reference
-/// Issue: #1668 (zero-copy domain flow)
-/// Design: `designs/2026-02-07-gpu-bab-zero-copy-domain-flow.md` Direction 3
 pub fn processed_from_backward_results(
     node_caches: Vec<HashMap<String, Arc<BoundedTensor>>>,
     children: &[GraphBabDomain],

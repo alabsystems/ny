@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for queue-cap eviction (#2326): eviction must keep the most
+//! Tests for queue-cap eviction: eviction must keep the most
 //! promising domains, and every eviction must be recorded in
 //! `evicted_count()` so the BaB loop can refuse to report Verified after
 //! discarding unexplored search space.

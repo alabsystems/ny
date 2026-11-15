@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Multi-row spec matrix support for constrained backward CROWN (#4306).
+//! Multi-row spec matrix support for constrained backward CROWN.
 //!
 //! Extracted from `mod.rs` to keep the constraints module within the 500-line limit.
 
@@ -45,6 +45,7 @@ impl BetaCrownVerifier {
         std::collections::HashMap<String, Arc<BoundedTensor>>,
         Option<CachedLinearBounds>,
     )> {
+        graph.ensure_proof_eligible()?;
         let deadline = self.effective_graph_bab_deadline();
         ensure_constrained_propagation_deadline(
             deadline,
@@ -100,6 +101,7 @@ impl BetaCrownVerifier {
         beta_state: Option<&GraphBetaState>,
         spec_matrix: &ndarray::Array2<f32>,
     ) -> Result<DomainCrownResultWithIntermediates> {
+        graph.ensure_proof_eligible()?;
         let deadline = self.effective_graph_bab_deadline();
         ensure_constrained_propagation_deadline(
             deadline,

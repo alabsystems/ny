@@ -23,7 +23,7 @@ const KOKORO_AUDIO_SAMPLES_PER_FEATURE_FRAME: usize = 300;
 const KOKORO_HAR_STFT_HOP_SIZE: usize = 5;
 
 // ---------------------------------------------------------------------------
-// Contract accessor boundary (#3917)
+// Contract accessor boundary
 //
 // Centralizes exporter-owned `min_fixed_aux_t` behind a cached, fallback-safe
 // accessor so child modules do not need to import the raw constant directly.
@@ -252,7 +252,7 @@ pub(crate) fn bounded_kokoro_features_input_centered(
 }
 
 // ---------------------------------------------------------------------------
-// Fallback regression test (#3917)
+// Fallback regression test
 // ---------------------------------------------------------------------------
 
 #[test]

@@ -275,20 +275,27 @@ fn outcome_bound(outcome: &Outcome, sense: Sense) -> Option<f64> {
 /// column against an already-built session. This type exposes that: pay the setup once per
 /// node, then query every coordinate cheaply.
 ///
-/// Bounds come from `rigorous_bound`, so they carry the same rigour as the batch path.
+/// Bounds come from `rigorous_bound`, so they carry the same rigour as the batch path. The
+/// one exception is [`Self::exact_bounds`], the driver's STAGE B tight fallback, which takes
+/// the EXACT optimum (`tighten_col_bounds`) — see its doc for why `rigorous_bound` no longer
+/// serves there, and why it is not the default (it is ~100x slower on a many-target session).
 ///
-/// ## NOT YET WIRED INTO THE DRIVER
+/// ## WIRED INTO THE DRIVER (this header used to say it was not)
 ///
-/// A first attempt to use one session per driver node regressed the search: coordinates the
-/// batch path resolved came back unresolved here, so the search split to its depth cap
-/// instead of deciding. No wrong answer was produced (soundness never depended on it), but
-/// the driver got weaker, so it was reverted.
+/// `star_verify` builds one of these lazily per node (`star_verify.rs`, the
+/// `node_session` local) and also takes the column-materialised form for the cases that
+/// need it. The only `#[cfg(test)]` in that file is far below those sites, so this is a
+/// production path, not a test fixture. Re-derive with a FULL caller census before
+/// believing any statement in this paragraph — the previous one outlived its truth.
 ///
-/// The cause was a misuse on THIS side, not an AY defect: `tighten_col_bounds_rigorous`
-/// RETURNS the two `Outcome`s and does not commit them (there is no `narrow_col_bounds`
-/// inside it), so reading `col_bounds` afterwards still reports a free target column's
-/// original `(-inf, +inf)`. The bound must be taken from `Outcome::Bound { dual_bound, .. }`,
-/// which is what [`Self::bounds`] now does.
+/// The history is worth keeping, because the failure was ours. A first attempt regressed
+/// the search: coordinates the batch path resolved came back unresolved here, so the search
+/// split to its depth cap instead of deciding. No wrong answer was produced (soundness never
+/// depended on it), but the driver got weaker, so it was reverted. The cause was a misuse on
+/// THIS side, not an AY defect: `tighten_col_bounds_rigorous` RETURNS the two `Outcome`s and
+/// does not commit them (there is no `narrow_col_bounds` inside it), so reading `col_bounds`
+/// afterwards still reports a free target column's original `(-inf, +inf)`. The bound must be
+/// taken from `Outcome::Bound { dual_bound, .. }`, which is what [`Self::bounds`] does.
 pub struct StarLpSession {
     session: LpSession,
     targets: Vec<AyCol>,
@@ -421,6 +428,64 @@ impl StarLpSession {
             return Ok(None);
         };
         match self.session.tighten_col_bounds_rigorous(col) {
+            Ok((lo, hi)) => {
+                if matches!(lo, Outcome::Infeasible { .. })
+                    || matches!(hi, Outcome::Infeasible { .. })
+                {
+                    return Ok(Some((f64::NAN, f64::NAN)));
+                }
+                // Read the OUTCOMES. The call does not narrow the model, so `col_bounds`
+                // would still report the target column's original free box.
+                Ok(Some((
+                    outcome_bound(&lo, Sense::Minimize).unwrap_or(f64::NEG_INFINITY),
+                    outcome_bound(&hi, Sense::Maximize).unwrap_or(f64::INFINITY),
+                )))
+            }
+            Err(e) => Err(MipError::Solver(e.to_string())),
+        }
+    }
+
+    /// Exact bounds for one target, by index into the request's `targets`.
+    ///
+    /// Returns `None` when the index is out of range. An infeasible model surfaces as
+    /// a `(NaN, NaN)` pair (and as [`Self::infeasible`] on the same query).
+    ///
+    /// ## Why the exact optimum, not `rigorous_bound`
+    ///
+    /// This is the driver's STAGE B: it is reached only when the alpha-only expression
+    /// bound left a neuron straddling zero by a hair, and its whole job is the TIGHT value —
+    /// the one that says a split child's pre-activation is `>= 0`, not `>= -1.6e-15`.
+    /// `tighten_col_bounds` is `(optimize min, optimize max)`: float search adjudicated by
+    /// exact replay, else the exact rim, so an `Optimal` is the exact rational optimum,
+    /// outward-rounded here by `outcome_bound`.
+    ///
+    /// `tighten_col_bounds_rigorous` used to deliver that same value on this encoding,
+    /// because its Neumaier–Shcherbina tier priced the FREE target column against the
+    /// declared box, declined, and fell through to `optimize`. From ay 95088f2bc4 on
+    /// ("price the NS tier over the rows' implied box"; first reached by the eec6fd64 -> 0.27.0
+    /// bump; an ancestor of the current pin) the NS tier answers free
+    /// columns by design, so the same call now returns a sound but outward-padded bound
+    /// (measured on `star_verify_tests::small_net`, active child of neuron 0:
+    /// `(-1.55e-15, 2.000000000000004)` where the rim gives `(0.0, 2.0)`). `classify` cannot
+    /// resolve a bound that straddles zero, so the driver re-split the same neuron until
+    /// `max_depth` — four `star_verify` tests went `Unknown("max split depth 64 reached")`.
+    ///
+    /// ## Why this is NOT what [`Self::bounds`] does
+    ///
+    /// The exact query is expensive on a session with many targets: on
+    /// `star_lp_tests::lp_shape_matrix_contract`'s `(5, 4, 50)` fixture a repeat query costs
+    /// ~860 ms here against ~9 ms for `tighten_col_bounds_rigorous`, and the `(5, 20, 50)`
+    /// fixture then runs past its wall-clock deadline (Unknown -> inf). STAGE B builds a
+    /// single-target session per marginal straddle, where the exact query costs ~27 ms, so
+    /// only that caller pays for exactness.
+    ///
+    /// # Errors
+    /// [`MipError::Solver`] on a backend failure.
+    pub fn exact_bounds(&mut self, idx: usize) -> Result<Option<(f64, f64)>> {
+        let Some(&col) = self.targets.get(idx) else {
+            return Ok(None);
+        };
+        match self.session.tighten_col_bounds(col) {
             Ok((lo, hi)) => {
                 if matches!(lo, Outcome::Infeasible { .. })
                     || matches!(hi, Outcome::Infeasible { .. })

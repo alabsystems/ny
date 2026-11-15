@@ -15,8 +15,8 @@
 //! passes while the shipped binary silently runs the other branch.
 //!
 //! A 5-way audit on 2026-08-17 found 30 candidates -> 8 confirmed -> 4 root
-//! causes and prescribed exactly this guard; it was never built, and within four
-//! months the class regenerated at
+//! causes and prescribed exactly this guard; it was not built then, and the
+//! class regenerated at
 //! `batched/backward_core.rs` (`dispatch_node_backward`, the `Layer::Linear`
 //! arm, introduced by `6f49a660`). This module is that guard.
 //!

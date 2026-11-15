@@ -61,10 +61,8 @@ fn log_all_crown_ibp_fallbacks(
     }
 }
 
-/// Level 0 diagnostic for #3499: identify which node/op in Stage A triggers
+/// Level 0 diagnostic: identify which node/op in Stage A triggers
 /// CROWN-IBP fallback during the tightening loop.
-///
-/// Reference: `designs/2026-03-13-issue-3499-res2net-bound-widening-root-cause.md`
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
 #[cfg(feature = "external-avoice")]
@@ -139,7 +137,7 @@ fn test_ecapa_stage_a_crown_ibp_fallback_diagnostic_3499() {
     assert_finite_and_ordered(crown_output, "Stage A CROWN-IBP output");
 }
 
-/// Regression for #3499/#3718: the ECAPA stage-local tightening helper must
+/// Regression: the ECAPA stage-local tightening helper must
 /// thread a GemmEngine into Conv1d CROWN backward instead of staying on the
 /// default CPU-only collector path.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]

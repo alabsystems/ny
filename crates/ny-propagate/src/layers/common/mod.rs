@@ -60,7 +60,6 @@ pub(crate) const PARALLEL_ELEMENT_THRESHOLD: usize = 65536;
 ///
 /// Factors out the repeated parallel-zip pattern used by Tanh, Sigmoid, Arctan,
 /// Softplus, Sin, Cos, and similar layers whose IBP differs only in the bound function.
-/// Part of #2914.
 pub(crate) fn ibp_bound_interval_parallel(
     input: &BoundedTensor,
     bound_fn: fn(f32, f32) -> (f32, f32),
@@ -101,7 +100,6 @@ pub(crate) fn ibp_bound_interval_parallel(
 ///
 /// Reference: exp.rs and log.rs use domain-specific guards; this is the generic
 /// "reject non-finite" guard for activations without restricted domains.
-/// Part of #2836.
 pub(crate) fn non_finite_domain_guard(
     layer_name: &str,
     pre_activation: &BoundedTensor,
@@ -192,8 +190,6 @@ pub(crate) fn resolve_axis_i32(axis: i32, ndim: usize, layer_name: &str) -> Resu
 /// - Only for operators whose positive ONNX axes were stored as `axis - 1`.
 /// - Negative stored axes pass through to `resolve_axis_i32` unchanged.
 /// - Non-negative stored axes are shifted right by one (`axis + 1`).
-///
-/// Part of #4096.
 pub(crate) fn resolve_axis_i32_with_restored_leading_axis(
     axis: i32,
     ndim: usize,
@@ -280,7 +276,6 @@ macro_rules! impl_elementwise_activation {
         ///
         /// Scales 6D patches coefficients by per-neuron relaxation slopes,
         /// keeping bounds in sparse Patches form for CNN memory optimization.
-        /// Part of #2613 Phase 2 step 11.
         #[inline]
         pub(crate) fn propagate_patches_with_bounds(
             &self,
@@ -329,7 +324,6 @@ macro_rules! impl_elementwise_activation {
         ///
         /// Scales 6D patches coefficients by per-neuron relaxation slopes,
         /// keeping bounds in sparse Patches form for CNN memory optimization.
-        /// Part of #2613 Phase 2 step 11.
         #[inline]
         pub(crate) fn propagate_patches_with_bounds(
             &self,

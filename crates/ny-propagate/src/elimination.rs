@@ -192,7 +192,7 @@ pub fn eliminate_dead_neurons(
     Ok((result, certificate))
 }
 
-/// Mutable accumulator state threaded through elimination passes (#2622).
+/// Mutable accumulator state threaded through elimination passes.
 struct EliminationState {
     pending: Option<PendingColumnOps>,
     optimized_layers: Vec<Layer>,

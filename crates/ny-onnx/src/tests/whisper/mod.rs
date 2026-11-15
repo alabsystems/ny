@@ -7,7 +7,7 @@
 //! Tests backed by the generated `whisper_tiny_encoder.onnx` artifact belong
 //! to the explicit `external-whisper` conformance lane. Generate it with
 //! `scripts/export_whisper_encoder.py`, then run
-//! `cargo run -p ny-onnx --bin ny_onnx_conformance -- whisper`. Missing assets
+//! `targo --unverified run -p ny-onnx --bin ny_onnx_conformance -- whisper`. Missing assets
 //! fail that lane; fixture-free synthetic tests remain in the default suite.
 
 mod helpers;

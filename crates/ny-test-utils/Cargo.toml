@@ -36,6 +36,14 @@ name = "repository_policy_black_box"
 path = "tests/repository_policy_black_box.rs"
 required-features = ["python-tools"]
 
+# The VNN-COMP release pipeline (docs/RELEASE.md): verify_release.py, the release
+# path of install_tool.sh, the `release` receipt kind and the scored
+# run_instance.sh environment closure, driven as external programs.
+[[test]]
+name = "release_pipeline_black_box"
+path = "tests/release_pipeline_black_box.rs"
+required-features = ["python-tools"]
+
 [dependencies]
 ny-core = { path = "../ny-core", optional = true }
 ny-tensor = { path = "../ny-tensor", optional = true }

@@ -320,7 +320,6 @@ pub struct VnnLibSpec {
 /// overflow widens to `+inf`, while negative overflow has the tighter valid
 /// upper endpoint `f32::MIN`. A finite sentinel chosen without regard to sign
 /// can shrink `A*y <= rhs` and manufacture an empty candidate-violation region.
-/// See #2360, #2658.
 fn rhs_with_overflow_guard(v: f64) -> f32 {
     ny_core::f64_to_f32_up(v)
 }
@@ -410,7 +409,7 @@ impl VnnLibSpec {
     /// VNN-LIB boundary — where the original `X_i` variable names are still
     /// known — yields a diagnostic that names the offending variable, instead of
     /// the downstream numeric `input_bounds[i]` index error from the core spec
-    /// validator (#2800).
+    /// validator.
     pub fn validate_input_bounds(&self) -> ny_core::Result<()> {
         for (i, (lower, upper)) in self.input_bounds.iter().enumerate() {
             if lower.is_nan() || upper.is_nan() {
@@ -444,7 +443,7 @@ impl VnnLibSpec {
     }
 
     /// Deprecated compatibility alias for [`split_input_bounds`](Self::split_input_bounds).
-    #[deprecated(note = "use split_input_bounds")]
+    #[deprecated(since = "0.1.0", note = "use split_input_bounds")]
     pub fn get_input_bounds(&self) -> (Vec<f64>, Vec<f64>) {
         self.split_input_bounds()
     }
@@ -454,14 +453,21 @@ impl VnnLibSpec {
     /// Lower bounds are rounded toward -inf (`next_down_f32`) and upper bounds
     /// toward +inf (`next_up_f32`) so the f32 region is a superset of the f64
     /// region specified in the VNN-LIB file. Plain `as f32` round-to-nearest
-    /// could shrink the verified region and miss counterexamples (#2658).
+    /// could shrink the verified region and miss counterexamples.
+    ///
+    /// Subnormal endpoints are then snapped OUTWARD to `0.0`/`±f32::MIN_POSITIVE`
+    /// by [`snap_box_outward_from_subnormals`] — still a superset, and required
+    /// because the sound-GPU charged-flush lane refuses any input box carrying a
+    /// subnormal endpoint (`#flush-charge`, fail-closed). Without the snap, the
+    /// one-ULP nudge itself MINTS subnormals: a literal `0.0` lower bound
+    /// converts to f32 exactly and `next_down_f32(0.0)` is `-2^-149`.
     pub fn split_input_bounds_f32(&self) -> (Vec<f32>, Vec<f32>) {
         use ny_tensor::{next_down_f32, next_up_f32};
-        let lower: Vec<f32> = self
+        let mut lower: Vec<f32> = self
             .input_bounds
             .iter()
             .map(|(l, _)| {
-                // #2360: Guard f64→f32 overflow. Values beyond f32 range silently
+                // Guard f64→f32 overflow. Values beyond f32 range silently
                 // become ±inf; use -f32::MAX as the most conservative finite lower.
                 let v = *l as f32;
                 if v.is_finite() {
@@ -471,7 +477,7 @@ impl VnnLibSpec {
                 }
             })
             .collect();
-        let upper: Vec<f32> = self
+        let mut upper: Vec<f32> = self
             .input_bounds
             .iter()
             .map(|(_, u)| {
@@ -483,11 +489,12 @@ impl VnnLibSpec {
                 }
             })
             .collect();
+        snap_box_outward_from_subnormals(&mut lower, &mut upper);
         (lower, upper)
     }
 
     /// Deprecated compatibility alias for [`split_input_bounds_f32`](Self::split_input_bounds_f32).
-    #[deprecated(note = "use split_input_bounds_f32")]
+    #[deprecated(since = "0.1.0", note = "use split_input_bounds_f32")]
     pub fn get_input_bounds_f32(&self) -> (Vec<f32>, Vec<f32>) {
         self.split_input_bounds_f32()
     }
@@ -731,13 +738,13 @@ impl VnnLibSpec {
                     rhs[row] = 0.0;
                 }
                 OutputConstraint::LessEqConst(i, c) | OutputConstraint::LessThanConst(i, c) => {
-                    // Y_i <= c — round rhs UP to widen (sound). See #2658.
+                    // Y_i <= c — round rhs UP to widen (sound).
                     a_matrix[[row, *i]] = 1.0;
                     rhs[row] = rhs_with_overflow_guard(*c);
                 }
                 OutputConstraint::GreaterEqConst(i, c)
                 | OutputConstraint::GreaterThanConst(i, c) => {
-                    // -Y_i <= -c — round rhs UP (i.e., -c toward +inf). See #2658.
+                    // -Y_i <= -c — round rhs UP (i.e., -c toward +inf).
                     a_matrix[[row, *i]] = -1.0;
                     rhs[row] = rhs_with_overflow_guard(-*c);
                 }
@@ -805,6 +812,45 @@ impl Default for VnnLibSpec {
     }
 }
 
+/// Snap subnormal box endpoints OUTWARD so the box carries no subnormal
+/// values while remaining a SUPERSET of the original box.
+///
+/// The sound-GPU charged-flush lane refuses (fail-closed) any input box with
+/// a subnormal endpoint: a subnormal's DAZ loss under an accumulated
+/// coefficient error is un-chargeable (`#flush-charge`,
+/// `crown_concretize_sound.rs`). VNN-LIB files never contain subnormal
+/// literals — such endpoints are minted by the defensive one-ULP outward
+/// nudge in [`VnnLibSpec::split_input_bounds_f32`]: a literal `0.0` lower
+/// bound converts to f32 exactly, and `next_down_f32(0.0)` manufactures
+/// `-2^-149` (bits `0x8000_0001`).
+///
+/// Widening rule (each endpoint moves OUTWARD only):
+/// - lower endpoints move toward -inf: negative subnormal →
+///   `-f32::MIN_POSITIVE`, positive subnormal → `0.0`;
+/// - upper endpoints move toward +inf: positive subnormal →
+///   `f32::MIN_POSITIVE`, negative subnormal → `0.0`.
+///
+/// The result is a superset enclosure — any bound sound for the widened box
+/// is sound for the original — at a cost of at most `2^-126` per endpoint.
+/// Afterwards every endpoint is exactly `0.0` or has
+/// `abs() >= f32::MIN_POSITIVE`, so the charged-flush refusal predicate
+/// passes. Normals, zeros, infinities and NaN pass through untouched (the
+/// GPU path has its own finiteness checks).
+pub fn snap_box_outward_from_subnormals(lower: &mut [f32], upper: &mut [f32]) {
+    for l in lower.iter_mut() {
+        if l.is_subnormal() {
+            // Widen toward -inf.
+            *l = if *l < 0.0 { -f32::MIN_POSITIVE } else { 0.0 };
+        }
+    }
+    for u in upper.iter_mut() {
+        if u.is_subnormal() {
+            // Widen toward +inf.
+            *u = if *u > 0.0 { f32::MIN_POSITIVE } else { 0.0 };
+        }
+    }
+}
+
 #[cfg(test)]
 mod referenced_output_indices_tests {
     use super::{OutputConstraint, VnnLibSpec};
@@ -841,7 +887,7 @@ mod referenced_output_indices_tests {
     #[test]
     fn empty_spec_references_nothing() {
         let spec = VnnLibSpec::new();
-        assert!(spec.referenced_output_indices().is_empty());
+        assert_eq!((spec.referenced_output_indices()).len(), 0);
     }
 
     /// The TinyYOLO (yolo_2023) shape this was built for: 5 of 21,125 outputs.

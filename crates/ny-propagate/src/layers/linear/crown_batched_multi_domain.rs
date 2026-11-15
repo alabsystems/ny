@@ -10,8 +10,8 @@ use ny_core::{is_crown_coeff_safe, GemmEngine, NyError, Result};
 use tracing::debug;
 
 use super::bias::{
-    accumulate_bias_f64, add_coeff_err_bias_product_up, add_f64_down, add_f64_up, f32_to_f64_exact,
-    finalize_bias_directed, publish_error_up_normal, BiasBlockParams,
+    accumulate_bias_f64, add_f64_down, add_f64_up, f32_to_f64_exact, finalize_bias_directed,
+    publish_error_up_normal, sum_coeff_err_bias_up, BiasBlockParams,
 };
 use super::crown_single::{aw_f64_with_abssum, gamma_n_f32, incoming_error_product};
 use super::layout::resolve_backward_layout;
@@ -82,14 +82,12 @@ pub(crate) fn propagate_linear_batched_with_engine(
 
     // Certified-error machinery (#vnncomp-aw-soundness). The contraction width of
     // the `A·W` GEMM is `layout.out_features` (== weight_rows), the GEMM `k`-dim;
-    // its f32 accumulation error is `γ_n^{f32}·S`. `|W|` (shape
-    // [out_features, in_features]) is reused across positions/domains for both the
-    // S-scaling and the incoming-error propagation `Σ_k err_in·|W|`.
+    // its f32 accumulation error is `γ_n^{f32}·S`. `S` comes from
+    // `aw_f64_with_abssum` over `weight_faer` below; `|W|` (shape
+    // [out_features, in_features]) is the incoming-error propagation's operand
+    // and now comes from the layer's cache — see the `prop_lower` site.
     let gamma = gamma_n_f32(layout.out_features);
     let weight_faer = layer.weight_faer();
-    let w_abs = Mat::<f32>::from_fn(layout.out_features, in_features, |k, j| {
-        weight_faer[(k, j)].abs()
-    });
 
     let mut results: Vec<LinearBounds> = Vec::with_capacity(n_domains);
     // Per-domain certified per-coefficient error accumulators (same layout as the
@@ -179,12 +177,22 @@ pub(crate) fn propagate_linear_batched_with_engine(
             let (upper_reference, upper_s) = aw_f64_with_abssum(&a_upper_faer, weight_faer);
 
             // Propagated incoming error: P[i,j] = Σ_k err_in[i,in_start+k]·|W[k,j]|.
+            //
+            // #linear-abs-weight-cache: `|W|` was rebuilt once per CALL — an
+            // `out_features × in_features` allocation and fill amortised over
+            // positions and domains but not over calls — from a construction-
+            // time constant. It now comes from the layer's cache, and only when
+            // a domain actually carries a certified-error plane. Identical
+            // bits: `abs` on the same immutable `weight_faer`, and
+            // `layout.out_features == weight_faer.nrows()` on both
+            // `resolve_backward_layout` branches, so the shape is the one this
+            // site built.
             let prop_lower = match bounds.lower_a_err() {
                 Some(error) => Some(incoming_error_product(
                     error,
                     in_start,
                     layout.out_features,
-                    &w_abs,
+                    layer.weight_abs_faer(),
                     None,
                 )?),
                 None => None,
@@ -194,7 +202,7 @@ pub(crate) fn propagate_linear_batched_with_engine(
                     error,
                     in_start,
                     layout.out_features,
-                    &w_abs,
+                    layer.weight_abs_faer(),
                     None,
                 )?),
                 None => None,
@@ -265,19 +273,25 @@ pub(crate) fn propagate_linear_batched_with_engine(
         for (domain_idx, bounds) in bounds_batch.iter().enumerate() {
             if let Some(le) = bounds.lower_a_err() {
                 for i in 0..num_outputs {
-                    let mut e = 0.0f64;
-                    for j in 0..bias.len() {
-                        e = add_coeff_err_bias_product_up(e, le[[i, j]], bias[j]);
-                    }
+                    let e = sum_coeff_err_bias_up(
+                        le.view(),
+                        i,
+                        bias.view(),
+                        layout.num_positions,
+                        &mut |_| Ok(()),
+                    )?;
                     bias_accum[domain_idx].0[i] = add_f64_down(bias_accum[domain_idx].0[i], -e);
                 }
             }
             if let Some(ue) = bounds.upper_a_err() {
                 for i in 0..num_outputs {
-                    let mut e = 0.0f64;
-                    for j in 0..bias.len() {
-                        e = add_coeff_err_bias_product_up(e, ue[[i, j]], bias[j]);
-                    }
+                    let e = sum_coeff_err_bias_up(
+                        ue.view(),
+                        i,
+                        bias.view(),
+                        layout.num_positions,
+                        &mut |_| Ok(()),
+                    )?;
                     bias_accum[domain_idx].1[i] = add_f64_up(bias_accum[domain_idx].1[i], e);
                 }
             }
@@ -347,3 +361,7 @@ pub(crate) fn propagate_linear_batched_with_engine(
 
     Ok(results)
 }
+
+#[cfg(test)]
+#[path = "crown_batched_multi_domain/sequence_error_tests.rs"]
+mod sequence_error_tests;

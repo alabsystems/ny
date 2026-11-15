@@ -195,7 +195,7 @@ proptest! {
     /// Per-channel MulConstant broadcast soundness for ONNX-style `[C, 1] -> [C, T]`.
     ///
     /// Verifies that dense CROWN backward reconstructs the true broadcasted scale
-    /// pattern instead of flat tiling. Part of #3896.
+    /// pattern instead of flat tiling.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_mulconstant_crown_per_channel_broadcast_3896(
@@ -331,7 +331,7 @@ proptest! {
             ))?;
         // Use concretize_sound() which applies directed rounding (next_down/up_f32)
         // at the final f64->f32 cast, covering accumulated ULP error from the
-        // DivConstant->MulConstant coefficient scaling path (#1483).
+        // DivConstant->MulConstant coefficient scaling path.
         let concrete = crown_result.concretize_sound(&input);
 
         // CROWN-IBP equivalence
@@ -411,7 +411,7 @@ proptest! {
             .map_err(|e| TestCaseError::fail(
                 format!("propagate_linear failed: {e}")
             ))?;
-        // Use concretize_sound() for directed rounding at the final cast (#1483).
+        // Use concretize_sound() for directed rounding at the final cast.
         let concrete = crown_result.concretize_sound(&input);
         let crown_lower = concrete.lower()[[0]];
         let crown_upper = concrete.upper()[[0]];
@@ -440,7 +440,7 @@ proptest! {
     /// Per-channel DivConstant broadcast soundness for ONNX-style `[C, 1] -> [C, T]`.
     ///
     /// Verifies that dense CROWN backward reconstructs the true broadcasted
-    /// divisor pattern for the widened `DivConstantLayer` surface in `#3896`.
+    /// divisor pattern for the widened `DivConstantLayer` surface.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_divconstant_crown_per_channel_broadcast_3896(

@@ -4,8 +4,6 @@
 
 //! Final concretization for constrained backward CROWN.
 //!
-//! Part of #4293 (directory-module split from former backward.rs monolith).
-//!
 //! The legacy post-hoc graph cut contribution used to be applied here. It was
 //! deleted: it was never a certified GCP-CROWN fold (the scalar was added after
 //! concretization, outside the backward relaxation) and
@@ -29,6 +27,70 @@ use super::super::super::super::super::BetaCrownVerifier;
 use super::{
     BackwardCrownResult, BackwardParams, ConstrainedBackwardSetup, ConstrainedBackwardState,
 };
+
+/// The rows the constrained walk was seeded with (setup.rs precedence: the
+/// spec matrix, else the objective row; the identity seed has no rows).
+#[derive(Clone, Copy)]
+enum SeedRows<'a> {
+    Spec(&'a ndarray::Array2<f32>),
+    Objective(&'a [f32]),
+}
+
+/// #finalize-objective: map the output node's forward box through the seeded
+/// rows with the certified directed-rounding interval dot product
+/// (`objectives::objective_bounds`, the reducer the #2904 batched fallback
+/// uses), one entry per row, in the seed's output shape. A row the box does
+/// not fit (never the case after setup.rs validated the seed width) yields
+/// the conservative `(-inf, +inf)` rather than a guess.
+fn map_output_box_through_seed_rows(
+    output_box: &BoundedTensor,
+    rows: SeedRows<'_>,
+    output_shape: &[usize],
+    deadline: Option<Instant>,
+) -> Result<BoundedTensor> {
+    let row_count = match rows {
+        SeedRows::Spec(spec) => spec.nrows(),
+        SeedRows::Objective(_) => 1,
+    };
+    if output_shape.iter().product::<usize>() != row_count {
+        return Err(NyError::InternalError(format!(
+            "constrained IBP fallback: seed has {row_count} rows but the result shape is \
+             {output_shape:?}"
+        )));
+    }
+    let mut lower = Vec::with_capacity(row_count);
+    let mut upper = Vec::with_capacity(row_count);
+    let mut push = |row: &[f32]| {
+        let (lo, hi) = crate::beta_crown::engine::graph::objective_bounds(output_box, row)
+            .unwrap_or((f32::NEG_INFINITY, f32::INFINITY));
+        lower.push(lo);
+        upper.push(hi);
+    };
+    match rows {
+        SeedRows::Objective(objective) => push(objective),
+        SeedRows::Spec(spec) => {
+            for row in spec.rows() {
+                super::super::ensure_constrained_propagation_deadline(
+                    deadline,
+                    "during constrained IBP fallback spec-row projection",
+                )?;
+                match row.as_slice() {
+                    Some(slice) => push(slice),
+                    None => push(&row.to_vec()),
+                }
+            }
+        }
+    }
+    let shape = ndarray::IxDyn(output_shape);
+    BoundedTensor::new_allow_infinite(
+        ndarray::ArrayD::from_shape_vec(shape.clone(), lower).map_err(|error| {
+            NyError::InternalError(format!("constrained IBP fallback lower shape: {error}"))
+        })?,
+        ndarray::ArrayD::from_shape_vec(shape, upper).map_err(|error| {
+            NyError::InternalError(format!("constrained IBP fallback upper shape: {error}"))
+        })?,
+    )
+}
 
 fn constrained_capture_logical_memory_bytes(
     intermediate: Option<&GraphAlphaCrownIntermediate>,
@@ -74,6 +136,7 @@ impl BetaCrownVerifier {
             mut node_crown_bounds,
             mut intermediate,
             mut captured_linear_bounds,
+            captured_frontiers,
             input_accumulated,
         } = state;
 
@@ -95,6 +158,19 @@ impl BetaCrownVerifier {
                     retained_capture_bytes,
                 )?
                 .ok_or_else(|| NyError::InvalidSpec("No linear bounds at input".to_string()))?;
+            // #finalize-objective: the input block is the whole bound only if
+            // every contribution reached it. A block still pending at a node
+            // the walk never processed (one not in `exec_order` below its
+            // producer) would be dropped from the concretization, tightening
+            // the bound by that path's entire contribution. The full
+            // topological order never leaves one; refuse rather than publish.
+            if !node_crown_bounds.is_empty() {
+                return Err(NyError::SoundnessRefusal(
+                    "constrained backward reached the input with a contribution still \
+                     pending at an unprocessed node"
+                        .to_string(),
+                ));
+            }
             let final_lb = match final_cb {
                 CrownBounds::Dense(bounds) => bounds,
                 CrownBounds::Patches(bounds) => {
@@ -146,11 +222,20 @@ impl BetaCrownVerifier {
                     .map_or(0, LinearBounds::memory_bytes),
             );
             let staged_linear_bounds = if captured_linear_bounds.is_some() {
-                Some(if params.deadline.is_some() {
+                let mut staged = if params.deadline.is_some() {
                     final_lb.try_clone_with_deadline(params.deadline, retained_capture_bytes)?
                 } else {
                     final_lb.clone()
-                })
+                };
+                // #warm-cache-err: `CachedLinearBounds` stores no coefficient
+                // error; fold it over this domain's input box before
+                // publication, or leave the input block out of the cache.
+                CachedLinearBounds::fold_capture_coeff_err(
+                    &mut staged,
+                    Some(params.constrained_input),
+                    params.deadline,
+                )?
+                .then_some(staged)
             } else {
                 None
             };
@@ -204,41 +289,78 @@ impl BetaCrownVerifier {
                     "[#1817] CROWN backward did NOT reach input, falling back to IBP output bounds"
                 );
             }
-            // #cone-delta increment 2 residual copy: this IBP fallback (backward
-            // did not reach the input) must hand out an OWNED tensor. The Arc is
-            // usually uniquely held here (the output node is always in the
-            // recompute cone), so the finite route moves it. Only the legacy
-            // unbounded route may use the opaque shared-Arc deep clone.
             let cached_output = bounds_cache_mut.get(output_node).ok_or_else(|| {
                 NyError::InvalidSpec(format!("Output node {} not found", output_node))
             })?;
-            if params.deadline.is_some() && Arc::strong_count(cached_output) != 1 {
-                return Err(NyError::UnsupportedConfiguration(format!(
-                    "finite constrained IBP fallback requires unique output ownership; shared {} clone is not cooperatively pollable",
-                    output_node
-                )));
-            }
-            super::super::ensure_constrained_propagation_deadline(
-                params.deadline,
-                "before constrained IBP fallback publication",
-            )?;
-            let cached_output = bounds_cache_mut
-                .remove(output_node)
-                .expect("output presence was checked before removal");
-            if params.deadline.is_some() {
-                Arc::try_unwrap(cached_output).map_err(|_| {
-                    NyError::UnsupportedConfiguration(format!(
-                        "finite constrained IBP fallback lost unique ownership of {}",
-                        output_node
-                    ))
-                })?
+            // #finalize-objective: the walk was seeded with the spec rows `C`
+            // or the objective row `c` (setup.rs), so its result must bound
+            // `C·out` / `c·out`. The forward box of the output node bounds
+            // `out` itself; it is mapped through the same rows, outward, before
+            // it may stand in for the backward result. Publishing the raw box
+            // was unsound for any row other than a unit selector (`c = [-1]`
+            // put the lower bound at `min out` where the truth is `-max out`)
+            // and the wrong shape for a multi-row spec. The output entry stays
+            // in the cache (it is only read here).
+            let seed_rows = match (params.spec_matrix, params.objective) {
+                (Some(spec), _) => Some(SeedRows::Spec(spec)),
+                (None, Some(objective)) => Some(SeedRows::Objective(objective)),
+                (None, None) => None,
+            };
+            if let Some(rows) = seed_rows {
+                let mapped = map_output_box_through_seed_rows(
+                    cached_output,
+                    rows,
+                    &output_shape,
+                    params.deadline,
+                )?;
+                super::super::ensure_constrained_propagation_deadline(
+                    params.deadline,
+                    "before constrained IBP fallback publication",
+                )?;
+                mapped
             } else {
-                Arc::unwrap_or_clone(cached_output)
+                // Identity seed: the output box IS the bound.
+                // #cone-delta increment 2 residual copy: this IBP fallback
+                // (backward did not reach the input) must hand out an OWNED
+                // tensor. The Arc is usually uniquely held here (the output
+                // node is always in the recompute cone), so the finite route
+                // moves it. Only the legacy unbounded route may use the opaque
+                // shared-Arc deep clone.
+                if params.deadline.is_some() && Arc::strong_count(cached_output) != 1 {
+                    return Err(NyError::UnsupportedConfiguration(format!(
+                        "finite constrained IBP fallback requires unique output ownership; shared {} clone is not cooperatively pollable",
+                        output_node
+                    )));
+                }
+                super::super::ensure_constrained_propagation_deadline(
+                    params.deadline,
+                    "before constrained IBP fallback publication",
+                )?;
+                let cached_output = bounds_cache_mut
+                    .remove(output_node)
+                    .expect("output presence was checked before removal");
+                if params.deadline.is_some() {
+                    Arc::try_unwrap(cached_output).map_err(|_| {
+                        NyError::UnsupportedConfiguration(format!(
+                            "finite constrained IBP fallback lost unique ownership of {}",
+                            output_node
+                        ))
+                    })?
+                } else {
+                    Arc::unwrap_or_clone(cached_output)
+                }
             }
         };
 
         let captured_la = if input_accumulated {
-            captured_linear_bounds.map(CachedLinearBounds::from_linear_bounds_map)
+            captured_linear_bounds.map(|map| {
+                let cache = CachedLinearBounds::from_linear_bounds_map(map);
+                // #la-warm-frontier: `None` unless armed (bit-identical dark).
+                match captured_frontiers {
+                    Some(frontiers) if !frontiers.is_empty() => cache.with_frontiers(frontiers),
+                    _ => cache,
+                }
+            })
         } else {
             None
         };

@@ -22,7 +22,7 @@ pub(crate) fn gelu_erf(x: f32) -> f32 {
     // Guard against 0 * inf = NaN when x = ±inf.
     // GELU(x) = 0.5 * x * (1 + erf(x/√2)). At x = -inf: 0.5*(-inf)*(1+(-1)) = 0*inf = NaN.
     // Correct limits: GELU(-inf) = 0, GELU(+inf) = +inf.
-    // Ref: SiLU guard pattern (silu.rs:100-105), fix for #1836.
+    // Ref: SiLU guard pattern (src/layers/activations/silu/math.rs).
     if !x.is_finite() {
         if x.is_nan() {
             return f32::NAN;
@@ -37,7 +37,7 @@ pub(crate) fn gelu_tanh(x: f32) -> f32 {
     // Guard against 0 * inf = NaN when x = ±inf.
     // GELU_tanh(x) = 0.5 * x * (1 + tanh(...)). At x = -inf: 0.5*(-inf)*(1+(-1)) = 0*inf = NaN.
     // Correct limits: GELU(-inf) = 0, GELU(+inf) = +inf.
-    // Ref: SiLU guard pattern (silu.rs:100-105), fix for #1836.
+    // Ref: SiLU guard pattern (src/layers/activations/silu/math.rs).
     if !x.is_finite() {
         if x.is_nan() {
             return f32::NAN;
@@ -104,7 +104,7 @@ pub(crate) fn gelu_erf_f64(x: f64) -> f64 {
     // Guard against 0 * inf = NaN when x = ±inf.
     // GELU(x) = 0.5 * x * (1 + erf(x/√2)). At x = -inf: 0.5*(-inf)*(1+(-1)) = 0*inf = NaN.
     // Correct limits: GELU(-inf) = 0, GELU(+inf) = +inf.
-    // Ref: f32 guard at eval.rs:18-31, fix for #1836, fix for #2504.
+    // Ref: the matching f32 guard above.
     if !x.is_finite() {
         if x.is_nan() {
             return f64::NAN;
@@ -117,7 +117,7 @@ pub(crate) fn gelu_erf_f64(x: f64) -> f64 {
 
 pub(crate) fn gelu_tanh_f64(x: f64) -> f64 {
     // Guard against 0 * inf = NaN when x = ±inf.
-    // Ref: f32 guard at eval.rs:33-46, fix for #2504.
+    // Ref: the matching f32 guard above.
     if !x.is_finite() {
         if x.is_nan() {
             return f64::NAN;
@@ -128,7 +128,7 @@ pub(crate) fn gelu_tanh_f64(x: f64) -> f64 {
     0.5 * x * (1.0 + (sqrt_2_over_pi * (x + 0.044715 * x * x * x)).tanh())
 }
 
-/// Evaluate GELU in f64 using the specified approximation. (#3245)
+/// Evaluate GELU in f64 using the specified approximation.
 fn gelu_eval_f64(x: f64, approximation: GeluApproximation) -> f64 {
     match approximation {
         GeluApproximation::Erf => gelu_erf_f64(x),
@@ -140,7 +140,6 @@ pub(crate) fn gelu_derivative_erf_f64(x: f64) -> f64 {
     // Guard: GELU'(-inf) = 0, GELU'(+inf) = 1.
     // At x = -inf: phi→0, x*pdf→0 (Gaussian decays faster than x grows).
     // At x = +inf: phi→1, x*pdf→0.
-    // Ref: fix for #2504.
     if !x.is_finite() {
         if x.is_nan() {
             return f64::NAN;
@@ -158,7 +157,6 @@ pub(crate) fn gelu_derivative_erf_f64(x: f64) -> f64 {
 
 pub(crate) fn gelu_derivative_tanh_f64(x: f64) -> f64 {
     // Guard: GELU'(-inf) = 0, GELU'(+inf) = 1.
-    // Ref: fix for #2504.
     if !x.is_finite() {
         if x.is_nan() {
             return f64::NAN;
@@ -316,9 +314,9 @@ pub(crate) fn gelu_critical_point(approximation: GeluApproximation) -> f32 {
 /// intermediate evaluation BEFORE min/max selection. Plain `as f32` rounds to
 /// nearest — a candidate min could round UP, causing the final min to miss the
 /// true minimum. next_down/next_up on the final result alone cannot recover if
-/// the wrong candidate was selected. (#3245, #3336)
+/// the wrong candidate was selected.
 ///
-/// Ref: SiLU (#3146) and f64→f32 cast (#3132) directed rounding fixes.
+/// Ref: SiLU and f64→f32 cast directed rounding fixes.
 pub(crate) fn gelu_bound_interval(l: f32, u: f32, approximation: GeluApproximation) -> (f32, f32) {
     let gl = gelu_eval_f64(l as f64, approximation) as f32;
     let gu = gelu_eval_f64(u as f64, approximation) as f32;
@@ -353,11 +351,9 @@ pub(crate) fn gelu_bound_interval(l: f32, u: f32, approximation: GeluApproximati
 /// The previous identity relaxation (1, 0, 1, 0) was **unsound**: the lower
 /// bound GELU(x) ≥ x fails for 0 < x where Φ(x) < 1, e.g. GELU(0.3) ≈ 0.185 < 0.3.
 ///
-/// Fix follows SiLU pattern (silu.rs:241-263, fix for #1673):
+/// Fix follows the SiLU pattern (src/layers/activations/silu/relaxation.rs):
 /// - NaN or u = +∞: maximally loose (no finite linear bound contains GELU over [l, +∞))
 /// - l = -∞, u finite: constant bounds using function range over (-∞, u]
-///
-/// Reference: SiLU infinite bounds fix, silu.rs:241-263
 pub(crate) fn gelu_infinite_bounds_relaxation(
     l: f32,
     u: f32,
@@ -382,7 +378,7 @@ pub(crate) fn gelu_infinite_bounds_relaxation(
     // l = -∞, u finite (or u = -∞ degenerate): GELU(-∞) = 0, and GELU has a finite minimum.
     // Use constant (slope=0) bounds based on the function's range over (-∞, u].
     // Guard: if l is not -inf (e.g., l=+inf from upstream corruption), return maximally
-    // loose bounds instead of panicking. Consistent with NaN fallback above. (#2739)
+    // loose bounds instead of panicking. Consistent with NaN fallback above.
     if l != f32::NEG_INFINITY {
         return Some((0.0, f32::NEG_INFINITY, 0.0, f32::INFINITY));
     }
@@ -650,7 +646,7 @@ mod tests {
     }
 
     /// Malformed non-finite intervals (e.g., l=+inf u=-inf, l=0 u=-inf) must not
-    /// panic — return maximally loose bounds instead. Regression test for #2739.
+    /// panic — return maximally loose bounds instead.
     #[test]
     fn test_infinite_bounds_relaxation_malformed_no_panic() {
         // l=+inf, u=-inf: degenerate empty interval
@@ -733,7 +729,7 @@ mod tests {
     }
 
     // =========================================================================
-    // f64 infinity guards (#2504)
+    // f64 infinity guards
     // =========================================================================
 
     /// gelu_erf_f64 must handle ±infinity and NaN correctly.

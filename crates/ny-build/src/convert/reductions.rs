@@ -32,7 +32,7 @@ impl ConvertContext<'_> {
                 return Err(NyError::ModelLoad(format!(
                     "{} '{}' has invalid noop_with_empty_axes attribute {:?}",
                     spec.layer_type, spec.name, other
-                )))
+                )));
             }
         };
 
@@ -43,7 +43,7 @@ impl ConvertContext<'_> {
                 return Err(NyError::ModelLoad(format!(
                     "{} '{}' has invalid axes attribute {:?}",
                     spec.layer_type, spec.name, other
-                )))
+                )));
             }
         };
         let input_axes_name = spec.inputs.get(1).filter(|name| !name.is_empty());
@@ -175,6 +175,7 @@ impl ConvertContext<'_> {
                     data_name,
                     axis,
                     super::LegacyBatchAxisPolicy::KeepZeroWarn,
+                    super::legacy_axis_authority(spec)?,
                 )
             })
             .collect()

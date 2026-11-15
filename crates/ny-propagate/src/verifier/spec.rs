@@ -113,7 +113,7 @@ impl Verifier {
         actual_method: Option<MethodUsed>,
         provenance: SoundnessProvenance,
     ) -> Result<VerificationResult> {
-        // Guard: empty output spec would trivially verify any network (#2238)
+        // Guard: empty output spec would trivially verify any network
         if required.is_empty() {
             return Err(NyError::InvalidSpec(
                 "empty output_bounds in specification — nothing to verify".to_string(),
@@ -136,7 +136,7 @@ impl Verifier {
 
         let output_bounds = Self::flatten_output_bounds(output);
 
-        // Guard: zip truncation would silently skip spec requirements (#2230)
+        // Guard: zip truncation would silently skip spec requirements
         if output_bounds.len() < required.len() {
             return Err(NyError::InvalidSpec(format!(
                 "Network produced {} output bounds but spec requires {}",

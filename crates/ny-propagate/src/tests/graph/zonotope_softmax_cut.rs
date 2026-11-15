@@ -43,7 +43,7 @@ fn assert_bounds_within_ibp_and_tightened(
     );
 }
 
-/// #318 Packet B: the explicit Softmax interval cut must be operator-local.
+/// The explicit Softmax interval cut must be operator-local.
 ///
 /// Nodes before Softmax should stay on the ordinary zonotope path, while the
 /// Softmax node itself should match the existing IBP fallback behavior exactly.

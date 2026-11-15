@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Batched GEMM implementations for Conv1d/ConvTranspose1d CROWN backward (#3598).
+//! Batched GEMM implementations for Conv1d/ConvTranspose1d CROWN backward.
 //!
 //! Extracted from `ops.rs` for file size limits. These functions replace the
 //! per-row scalar loops with single GEMM + col2im/im2col operations, enabling
@@ -119,7 +119,7 @@ pub(crate) fn conv1d_transpose_batched_gemm(
     let total_spatial = num_objectives * out_len;
 
     if groups > 1 {
-        // Per-group GEMM with engine dispatch (#3598).
+        // Per-group GEMM with engine dispatch.
         let mut result_flat = vec![0.0f32; num_objectives * conv_in_size];
 
         for g in 0..groups {

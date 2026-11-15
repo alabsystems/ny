@@ -17,7 +17,6 @@
 //!
 //! ## References
 //!
-//! - Design: `designs/2026-01-28-clip-and-verify-algorithms.md` Section 2
 //! - Baseline: `alpha-beta-CROWN/complete_verifier/input_split/clip.py`
 //! - Paper: Wei et al., "Clip and Verify: Fast and Accurate Neural Network
 //!   Verification via Clipping," arXiv:2512.11087
@@ -25,17 +24,46 @@
 use ndarray::{Array2, ArrayD};
 use ny_core::{
     dd::{next_down_f64, next_up_f64},
-    Result,
+    require_f64_interval_proof_environment, Result,
 };
 use ny_core::{nan_propagating_max, nan_propagating_min};
 use ny_tensor::{next_down_f32, next_up_f32};
 
 use crate::bounds::{certified_affine_sum_f32, OutwardDirection};
 
+mod box_reconstruction;
+use box_reconstruction::reconstruct_input_box;
+
+#[cfg(test)]
+#[path = "relaxed_clip/form_support_tests.rs"]
+mod form_support_tests;
+
+#[cfg(test)]
+#[path = "relaxed_clip/box_reconstruction_tests.rs"]
+mod box_reconstruction_tests;
+
 struct RelaxedClipOptions {
     num_iterations: usize,
     is_lower: bool,
     preserve_infeasible: bool,
+}
+
+/// The implemented candidate folds certify only the lower affine form.
+///
+/// In the upper form the coefficient-sign folds must be mirrored: using the
+/// lower-form folds can remove inputs that satisfy the upper inequality.  All
+/// production callers request the lower form, so refuse the unsupported form
+/// instead of exposing an uncertified clipping result through the public or
+/// specialized row entry points.
+#[inline]
+fn require_supported_relaxed_clip_form(is_lower: bool) -> Result<()> {
+    if is_lower {
+        Ok(())
+    } else {
+        Err(ny_core::NyError::SoundnessRefusal(
+            "relaxed clipping has no certified upper-form candidate folds".to_string(),
+        ))
+    }
 }
 
 /// Outward enclosure of `a·x_hat ± |a|·eps + bias`.
@@ -114,7 +142,8 @@ fn outward_clip_candidate(
 /// * `lbias` - CROWN bias, shape: `(batch, n_spec)`
 /// * `thresholds` - Verification thresholds (usually zeros), shape: `(batch, n_spec)`
 /// * `num_iterations` - Number of iterative refinement passes (typically 1)
-/// * `is_lower` - True for lower bound problem (dm_lb), false for upper
+/// * `is_lower` - Must be true. The upper affine form is refused because its
+///   mirrored candidate folds are not yet certified.
 ///
 /// # Returns
 ///
@@ -142,7 +171,6 @@ fn outward_clip_candidate(
 ///
 /// # References
 ///
-/// - `designs/2026-01-28-clip-and-verify-algorithms.md:188`
 /// - `alpha-beta-CROWN/complete_verifier/input_split/clip.py:_clip_main_fn`
 pub fn relaxed_clip(
     x_l: &ArrayD<f32>,
@@ -224,6 +252,8 @@ fn relaxed_clip_internal(
     thresholds: &ArrayD<f32>,
     options: RelaxedClipOptions,
 ) -> Result<(ArrayD<f32>, ArrayD<f32>, Vec<bool>)> {
+    require_supported_relaxed_clip_form(options.is_lower)?;
+    require_f64_interval_proof_environment()?;
     if relaxed_clip_fast_enabled() {
         relaxed_clip_internal_fast(x_l, x_u, l_a, lbias, thresholds, options)
     } else {
@@ -239,6 +269,8 @@ fn relaxed_clip_internal_scalar(
     thresholds: &ArrayD<f32>,
     options: RelaxedClipOptions,
 ) -> Result<(ArrayD<f32>, ArrayD<f32>, Vec<bool>)> {
+    require_supported_relaxed_clip_form(options.is_lower)?;
+    require_f64_interval_proof_environment()?;
     // Validate shapes
     let x_shape = x_l.shape();
     let x_u_shape = x_u.shape();
@@ -313,10 +345,17 @@ fn relaxed_clip_internal_scalar(
             }
         }
 
-        // x_hat = (x_L + x_U) / 2  (centroid)
-        // eps = (x_U - x_L) / 2    (half-widths)
-        let x_hat = (&x_l_out + &x_u_out) / 2.0;
-        let eps = (&x_u_out - &x_l_out) / 2.0;
+        // Reconstruct an enclosing centre/radius box. The historical
+        // round-to-nearest pair could describe a strict subset of the input.
+        let mut x_hat = ArrayD::<f32>::zeros(vec![batch, x_dim]);
+        let mut eps = ArrayD::<f32>::zeros(vec![batch, x_dim]);
+        for b in 0..batch {
+            for dim in 0..x_dim {
+                let (centre, radius) = reconstruct_input_box(x_l_out[[b, dim]], x_u_out[[b, dim]]);
+                x_hat[[b, dim]] = centre;
+                eps[[b, dim]] = radius;
+            }
+        }
 
         // For each dimension, compute the clipping update
         // We iterate per-dimension to avoid creating large intermediate tensors
@@ -335,9 +374,10 @@ fn relaxed_clip_internal_scalar(
             // candidate INWARD by up to half a ULP and cut a boundary violation — a false
             // "hold". Both bound directions want `concrete_minus_one` minimized (it enters
             // the numerator negated), so we keep it an underestimate: `dm_lb` is already a
-            // round-DOWN concretization, and the per-dim reconstruction is done in f64 so no
-            // extra round-to-nearest error creeps in before the single directed round. This
-            // mirrors the directed rounding in `concretize_bounds` (#2303).
+            // round-DOWN concretization. The centre/radius snapshot encloses the exact input
+            // endpoints, and the candidate reconstruction is done in f64 before the single
+            // directed publication round. This mirrors the directed rounding in
+            // `concretize_bounds`.
             // Shape: (batch, n_spec)
             let mut curr_x = Array2::<f32>::zeros((batch, n_spec));
             for b in 0..batch {
@@ -388,7 +428,7 @@ fn relaxed_clip_internal_scalar(
                     if l_a_dim[[b, s]] < 0.0 {
                         // NaN-propagating: if curr_x is NaN (from division by
                         // near-zero coefficient), propagate rather than absorb
-                        // via IEEE 754 max semantics (#2812 Slice 1).
+                        // via IEEE 754 max semantics.
                         max_lower_candidate =
                             nan_propagating_max(max_lower_candidate, curr_x[[b, s]]);
                     }
@@ -443,8 +483,9 @@ fn relaxed_clip_internal_scalar(
 /// Flat-slice, allocation-free reimplementation of [`relaxed_clip_internal_scalar`].
 ///
 /// BIT-IDENTICAL to the scalar reference: every floating-point operation is the
-/// same expression evaluated in the same order (per-dimension f64 reconstruction,
-/// directed `next_down_f32`/`next_up_f32` rounding, NaN-propagating max/min, and
+/// same expression evaluated in the same order (certified centre/radius snapshots,
+/// per-dimension f64 candidate reconstruction, directed
+/// `next_down_f32`/`next_up_f32` rounding, NaN-propagating max/min, and
 /// revert-to-ORIGINAL-input on NaN / infeasible-without-`preserve_infeasible`).
 /// The only change is mechanical: read/write via row-major flat indices on
 /// standard-layout slices instead of `ndarray::Index`, and hoist the per-dim
@@ -463,6 +504,8 @@ fn relaxed_clip_internal_fast(
     thresholds: &ArrayD<f32>,
     options: RelaxedClipOptions,
 ) -> Result<(ArrayD<f32>, ArrayD<f32>, Vec<bool>)> {
+    require_supported_relaxed_clip_form(options.is_lower)?;
+    require_f64_interval_proof_environment()?;
     // Validate shapes (identical checks to the scalar reference).
     let x_shape = x_l.shape();
     let x_u_shape = x_u.shape();
@@ -562,13 +605,11 @@ fn relaxed_clip_internal_fast(
             }
         }
 
-        // x_hat = (x_L + x_U) / 2 ; eps = (x_U - x_L) / 2 (over the whole batch).
-        // Bit-identical centroid anchor: f32::midpoint rounds differently at
-        // overflow/subnormal edges and the produced bounds must not move.
-        #[allow(clippy::manual_midpoint)]
+        // Enclosing centre/radius reconstruction over the whole batch.
         for i in 0..batch * x_dim {
-            x_hat[i] = (xl[i] + xu[i]) / 2.0;
-            eps[i] = (xu[i] - xl[i]) / 2.0;
+            let (centre, radius) = reconstruct_input_box(xl[i], xu[i]);
+            x_hat[i] = centre;
+            eps[i] = radius;
         }
 
         for dim in 0..x_dim {
@@ -685,7 +726,7 @@ pub(crate) struct SingleSpecRowClipScratch {
     /// `relaxed_clip_with_infeasible_mask` call; the caller merges it into its
     /// cross-row latch).
     pub(crate) row_verified: Vec<bool>,
-    /// Iteration-start centroid / half-width snapshots for ONE entry.
+    /// Iteration-start enclosing centre / radius snapshots for ONE entry.
     x_hat: Vec<f32>,
     eps: Vec<f32>,
 }
@@ -728,7 +769,7 @@ impl SingleSpecRowClipScratch {
 /// batch entry `b` this evaluates exactly the arithmetic of
 /// `relaxed_clip_internal_fast` on inputs `x_l = xl`, `x_u = xu`,
 /// `l_a[b, 0, :] = a[b*x_dim..]`, `lbias[b, 0] = bias[b]`,
-/// `thresholds[b, 0] = thr[b]`: the per-iteration centroid/half-width
+/// `thresholds[b, 0] = thr[b]`: the per-iteration enclosing centre/radius
 /// snapshots, the in-order f64 `dm_lb` accumulation with directed rounding,
 /// the f64 candidate reconstruction with a single directed outward round, the
 /// near-zero `±inf` sentinel, the literal `nan_propagating_max/min` folds, the
@@ -765,6 +806,8 @@ pub(crate) fn relaxed_clip_single_spec_row_fast(
     is_lower: bool,
     scratch: &mut SingleSpecRowClipScratch,
 ) -> Result<()> {
+    require_supported_relaxed_clip_form(is_lower)?;
+    require_f64_interval_proof_environment()?;
     if xl.len() != m * x_dim
         || xu.len() != m * x_dim
         || a.len() != m * x_dim
@@ -810,13 +853,11 @@ pub(crate) fn relaxed_clip_single_spec_row_fast(
             // Iteration-start snapshots for entry b (the reference computes
             // these for the whole batch before any update of the iteration;
             // entry b's row is untouched between that point and b's updates).
-            // Bit-identical centroid anchor (BIT-PARITY class): f32::midpoint
-            // rounds differently at overflow/subnormal edges and the produced
-            // bounds must not move.
-            #[allow(clippy::manual_midpoint)]
+            // Same enclosing reconstruction as the scalar and batched paths.
             for d in 0..x_dim {
-                scratch.x_hat[d] = (xl[base + d] + xu[base + d]) / 2.0;
-                scratch.eps[d] = (xu[base + d] - xl[base + d]) / 2.0;
+                let (centre, radius) = reconstruct_input_box(xl[base + d], xu[base + d]);
+                scratch.x_hat[d] = centre;
+                scratch.eps[d] = radius;
             }
 
             let mut changed = false;
@@ -914,7 +955,6 @@ pub(crate) fn relaxed_clip_single_spec_row_fast(
 ///
 /// # References
 ///
-/// - `designs/2026-01-28-clip-and-verify-algorithms.md:250`
 /// - `alpha-beta-CROWN/complete_verifier/input_split/clip.py:concretize_bounds`
 pub fn concretize_bounds(
     x_hat: &ArrayD<f32>,
@@ -923,7 +963,7 @@ pub fn concretize_bounds(
     lbias: &ArrayD<f32>,
     is_lower: bool,
 ) -> Array2<f32> {
-    // Directed rounding: lower bounds round down, upper bounds round up (#2303).
+    // Directed rounding: lower bounds round down, upper bounds round up.
     let round: fn(f64) -> f32 = if is_lower {
         |v| next_down_f32(v as f32)
     } else {
@@ -943,7 +983,7 @@ pub fn concretize_bounds(
             });
             // NaN guard: if NaN entered the accumulator (e.g., from NaN CROWN
             // coefficients via safe_add overflow), fall back to conservative
-            // bounds matching concretize_f64_inner (#2963, #2577).
+            // bounds matching concretize_f64_inner.
             result[[b, s]] = if val.is_nan() {
                 if is_lower {
                     f32::NEG_INFINITY
@@ -1057,7 +1097,7 @@ mod tests {
             }
         }
 
-        for &is_lower in &[true, false] {
+        for &is_lower in &[true] {
             for &preserve_infeasible in &[false, true] {
                 for &num_iterations in &[1usize, 20] {
                     let opts = || RelaxedClipOptions {
@@ -1169,7 +1209,7 @@ mod tests {
         bias[10] = f32::INFINITY;
         bias[8] = f32::NEG_INFINITY;
 
-        for &is_lower in &[true, false] {
+        for &is_lower in &[true] {
             for &num_iterations in &[1usize, 3, 20] {
                 // Reference: the fast path with (m, 1, x_dim) tensors.
                 let x_l_ref = ArrayD::from_shape_vec(vec![m, x_dim], xl.clone()).unwrap();
@@ -1511,7 +1551,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Edge Case Tests (Part of #280)
+    // Edge Case Tests
     // ========================================================================
 
     #[ntest::timeout(10000)]
@@ -1672,7 +1712,7 @@ mod tests {
         assert!(new_u[[0, 2]] < 10.0, "x3 upper should be tightened");
     }
 
-    /// Regression test for #2963: NaN in CROWN coefficients must produce
+    /// Regression test: NaN in CROWN coefficients must produce
     /// conservative -inf/+inf bounds instead of propagating NaN.
     #[ntest::timeout(10000)]
     #[test]
@@ -1711,7 +1751,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #2963: NaN in bias must produce conservative bounds.
+    /// Regression test: NaN in bias must produce conservative bounds.
     #[ntest::timeout(10000)]
     #[test]
     fn test_concretize_bounds_nan_bias_produces_conservative_bounds() {

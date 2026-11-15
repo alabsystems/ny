@@ -31,14 +31,14 @@ impl PgdAttacker<'_> {
         seed: u64,
     ) -> Result<RestartResult> {
         let mut rng = self.seeded_rng(seed);
-        let mut x = self.initialize_restart(network, input_bounds, &mut rng)?;
+        let mut x = self.initialize_restart_for_seed(network, input_bounds, &mut rng, seed)?;
         let mut evals = 0;
         let mut consecutive_nan_skips: u32 = 0;
         // Maximum consecutive NaN gradient steps before aborting a restart.
-        // Same threshold as standard PGD attacker (#2968).
+        // Same threshold as standard PGD attacker.
         const MAX_CONSECUTIVE_NAN_SKIPS: u32 = 5;
 
-        // Create step state for this restart (#4277: AdamClipping optimizer).
+        // Create step state for this restart (AdamClipping optimizer).
         let mut step_state = self.config().create_step_state(input_bounds);
 
         for _step in 0..self.config().num_steps {
@@ -60,11 +60,11 @@ impl PgdAttacker<'_> {
 
             let gradient_diff = &grad_i - &grad_j;
 
-            // NaN guard (#2745): If either SPSA gradient estimate produces NaN
+            // NaN guard: If either SPSA gradient estimate produces NaN
             // (e.g., Exp overflow, unstable LayerNorm), the difference gradient
             // becomes NaN. Applying it corrupts x, which project() then silently
             // resets to the lower corner, discarding all PGD search progress.
-            // Same pattern as attacker.rs (#2721, #2968).
+            // Same pattern as attacker.rs.
             if gradient_diff.iter().any(|v| v.is_nan()) {
                 consecutive_nan_skips += 1;
                 if consecutive_nan_skips >= MAX_CONSECUTIVE_NAN_SKIPS {
@@ -79,7 +79,7 @@ impl PgdAttacker<'_> {
             }
             consecutive_nan_skips = 0;
 
-            // Apply the step using the configured optimizer (#4277).
+            // Apply the step using the configured optimizer.
             let projected = step_state.step(&gradient_diff, &x, input_bounds, verify_upper_bound);
             x = projected;
         }
@@ -160,7 +160,7 @@ impl PgdAttacker<'_> {
         let mut failed_restarts = 0usize;
 
         for restart in 0..self.config().num_restarts {
-            // Deadline check (#3109)
+            // Deadline check
             if self.past_deadline() {
                 break;
             }
@@ -218,7 +218,7 @@ impl PgdAttacker<'_> {
             }
         }
 
-        // All restarts failed — surface as error (#3096).
+        // All restarts failed — surface as error.
         if best_counterexample.is_none() && failed_restarts > 0 {
             return Err(NyError::InternalError(format!(
                 "PGD difference attack: all {} restarts failed ({} errors). \
@@ -260,7 +260,7 @@ impl PgdAttacker<'_> {
                 if found.load(Ordering::Relaxed) {
                     return None;
                 }
-                // Deadline check (#3109)
+                // Deadline check
                 if self.past_deadline() {
                     return None;
                 }

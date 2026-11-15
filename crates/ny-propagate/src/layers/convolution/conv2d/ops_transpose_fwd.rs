@@ -26,7 +26,7 @@ pub(crate) fn conv2d_transpose_forward(
     dilation: (usize, usize),
     output_padding: (usize, usize),
 ) -> Result<ArrayD<f32>> {
-    // Guard: ndim checks prevent panic on shape indexing (#2920 WP-B).
+    // Guard: ndim checks prevent panic on shape indexing.
     if input.ndim() != 3 {
         return Err(NyError::ShapeMismatch {
             expected: vec![3],

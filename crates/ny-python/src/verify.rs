@@ -336,7 +336,7 @@ fn parse_mul_binary_relaxation(mode: &str) -> PyResult<MulBinaryRelaxationMode> 
     }
 }
 
-/// Derive BaB threshold from spec output bounds (#3229).
+/// Derive BaB threshold from spec output bounds.
 ///
 /// Same pattern as `Verifier::verify_beta_crown` in
 /// `ny-propagate/src/verifier/network.rs:183-195`.
@@ -370,7 +370,7 @@ pub(crate) const NO_OUTPUT_SPEC_REASON: &str =
 /// Endpoints may be infinite for one-sided constraints, but the spec as a
 /// whole must constrain something: an all-(-inf, +inf) requirement is
 /// satisfied by every network, so it is rejected rather than reported as
-/// `Verified` — the same triviality class as the empty-spec guard (#2266).
+/// `Verified` — the same triviality class as the empty-spec guard.
 pub(crate) fn build_output_spec_bounds(
     bounds: &[(f32, f32)],
     output_dim: usize,
@@ -448,7 +448,7 @@ pub(crate) fn fold_unspecified_property(result: RustVerificationResult) -> RustV
     }
 }
 
-/// Per-output spec check for a BaB `Verified` verdict (#2241).
+/// Per-output spec check for a BaB `Verified` verdict.
 ///
 /// BaB proves `min(all outputs) >= threshold`, where `threshold` is the
 /// global minimum of the finite required lower bounds, so a `Verified` status
@@ -740,7 +740,7 @@ fn run_verification(
 
     let input_dim = checked_verification_shape_product(&input_shape, "input")?;
 
-    // Dynamic output dims also use batch_size; invalid negatives are errors (#2689).
+    // Dynamic output dims also use batch_size; invalid negatives are errors.
     let output_dim = match onnx_network.outputs.first() {
         Some(output_spec) => {
             let (shape, has_dynamic) =
@@ -798,7 +798,7 @@ fn run_verification(
             ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&input_shape), upper)
                 .map_err(|e| ny_core::NyError::InvalidSpec(e.to_string()))?,
         )?;
-        // Derive BaB threshold from spec output bounds (#3229).
+        // Derive BaB threshold from spec output bounds.
         let threshold = derive_bab_threshold(spec.output_bounds());
         let bab_result = beta_verifier.verify(&prop_network, &input_tensor, threshold)?;
         let mut provenance =
@@ -812,8 +812,8 @@ fn run_verification(
             });
             provenance = RustSoundnessProvenance::from_heuristics(heuristics);
         }
-        // Extract actual output bounds from BaB result when available (#2802).
-        // NaN sanitization: NaN → conservative (-inf, +inf) per #2663.
+        // Extract actual output bounds from BaB result when available.
+        // NaN sanitization: NaN → conservative (-inf, +inf).
         // Inverted bounds guard: fall back to [-inf, +inf] when lower > upper
         // (numerical corruption) — matches apply_bab_output_bounds in network.rs:352.
         let actual_output_bounds: Option<Vec<RustBound>> =

@@ -67,7 +67,7 @@ fn test_batched_linear_bounds_concretize_identity() {
 
     let output = bounds.concretize(&input).unwrap();
 
-    // Identity concretize with directed rounding (#2391): lower bounds are
+    // Identity concretize with directed rounding: lower bounds are
     // rounded down (next_down_f32) and upper bounds rounded up (next_up_f32), so
     // we check soundness containment (lb <= true_lower, ub >= true_upper) within
     // 1 ULP. The BLAS path now accumulates the dot product in f64 (operands cast
@@ -291,7 +291,7 @@ fn test_batched_concretize_sound_identity_widens() {
     }
 }
 
-/// Regression #2214/#2220: batched concretize_sound with n=4096 uses BLAS DGEMV
+/// Regression: batched concretize_sound with n=4096 uses BLAS DGEMV
 /// (f64 accumulation of f32-cast operands). Verify lower <= upper, and that the
 /// result is TIGHT — within a handful of result-ULPs of the EXACT-product f64
 /// reference — even though alternating-sign coefficients maximize cancellation.

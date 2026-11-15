@@ -59,7 +59,7 @@ impl BetaCrownVerifier {
             lifecycle.domains_explored += 1;
             lifecycle.max_depth_reached = lifecycle.max_depth_reached.max(domain.depth);
 
-            // Guard: drop NaN/Inf-bounded domains (same as GPU prefilter.rs:46-56, #2953).
+            // Guard: drop NaN/Inf-bounded domains (same as GPU prefilter.rs:46-56).
             // Without this, NaN domains fall through domain_is_verified/domain_is_violation
             // to Undecided, enter splitting, and produce NaN children indefinitely.
             if !domain.lower_bound.is_finite() || !domain.upper_bound.is_finite() {
@@ -120,6 +120,10 @@ impl BetaCrownVerifier {
             }
 
             if domain.depth >= self.config.max_depth {
+                // #budget-abandonment FIX C: the drop is silent in the result
+                // (only a sticky flag and a reason string), so count it for the
+                // unconditional `[depth-drop]` summary.
+                super::depth_drop::record(domain.depth);
                 lifecycle.unresolved_due_to_depth = true;
                 continue;
             }

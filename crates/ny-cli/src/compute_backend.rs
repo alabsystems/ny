@@ -41,16 +41,14 @@
 //!   an Apple M5 Max / Metal adapter on 2026-08-04 (fma TwoProduct 509/509
 //!   lanes, fma-barrier TwoSum 307/307, 0 ULP).
 //!
-//!   CORRECTED 2026-08-06 (`#u2b`): the sentence that used to end the paragraph
-//!   above — "and the shipped per-adapter gate `verify_eft_primitives()` passes
-//!   there" — was true when written and is now FALSE BY CONSTRUCTION. Bit-exact
-//!   primitives were never the whole precondition: the compensated channel's
-//!   residual identity also requires GRADUAL UNDERFLOW, and this adapter is
-//!   measured to flush subnormals (DAZ + FTZ, 7/15 probe lanes, and an EFT
-//!   residual is among the silently-zeroed lanes). `verify_eft_primitives()`
-//!   now ENTAILS `verify_gradual_underflow()`, so it reports `false` on this
-//!   adapter and the compensated channel refuses itself here. The raw probes
-//!   still pass — that is a measurement, not an authorization.
+//!   Bit-exact primitives are not the whole precondition (`#u2b`, 2026-08-06):
+//!   the compensated channel's residual identity also requires GRADUAL
+//!   UNDERFLOW, and this adapter is measured to flush subnormals (DAZ + FTZ,
+//!   7/15 probe lanes, and an EFT residual is among the silently-zeroed lanes).
+//!   `verify_eft_primitives()` now ENTAILS `verify_gradual_underflow()`, so it
+//!   reports `false` on this adapter and the compensated channel refuses itself
+//!   here. The raw probes still pass — that is a measurement, not an
+//!   authorization.
 //!
 //!   U1/U3/U4/U5/U6 and B0 are now discharged, and the raw `WgpuDevice` CROWN
 //!   source gate and public integration are open. Authority still requires an
@@ -754,7 +752,7 @@ mod tests {
     #[test]
     fn host_probe_is_populated_and_load_parses_on_this_platform() {
         let probe = host();
-        assert!(!probe.hostname.is_empty());
+        assert_ne!(probe.hostname, "");
         assert!(
             probe.logical_cores > 0,
             "available_parallelism should resolve on every dev/CI host"

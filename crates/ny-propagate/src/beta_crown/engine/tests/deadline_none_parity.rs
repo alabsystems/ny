@@ -66,7 +66,7 @@ fn equivalent_deadline(timeout: Duration) -> Option<Instant> {
 /// `deadline - now`, not `config.timeout`. Uses a 300s configured timeout
 /// with a 100ms deadline; the engine must finish within 2s (generous margin
 /// for test overhead). If the deadline were ignored, the 300s timeout would
-/// blow past the limit. Part of #4321 acceptance criterion 5.
+/// blow past the limit.
 #[ntest::timeout(5000)]
 #[test]
 fn test_short_deadline_caps_engine_relu_split_4321() {

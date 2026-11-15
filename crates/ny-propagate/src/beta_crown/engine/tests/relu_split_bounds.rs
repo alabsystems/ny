@@ -8,8 +8,6 @@
 //! This module has ZERO test coverage in the existing suite. These tests
 //! establish basic correctness by cross-validating against the direct
 //! `verify_graph_relu_split` path, which is already tested in cutting_planes.rs.
-//!
-//! Issue: #1892
 
 use super::prelude::*;
 use crate::beta_crown::domain::GraphPrecomputedBounds;
@@ -146,6 +144,12 @@ fn test_relu_split_with_bounds_violation_matches_direct() {
         max_domains: 64,
         max_depth: 8,
         timeout: Duration::from_secs(2),
+        // Ascent off: see the beta_iterations note on
+        // test_graph_beta_crown_relu_split_detects_violation_relu_input
+        // (cutting_planes.rs) — the ascent path's no-unstable rescue bound is
+        // too loose to certify this violation; pinned so the test keeps
+        // asserting direct/precomputed violation parity.
+        beta_iterations: 0,
         ..Default::default()
     };
     let verifier = BetaCrownVerifier::new(config);
@@ -279,7 +283,7 @@ fn test_compute_initial_graph_bounds_with_stored_engine_threads_gemm() {
     );
 }
 
-/// Regression test for #3707: the loop-top non-finite guard must drop
+/// Regression test: the loop-top non-finite guard must drop
 /// internally constructed NaN/Inf domains before they reach verification or
 /// branching checks.
 ///
@@ -326,7 +330,7 @@ fn test_relu_split_with_bounds_non_finite_domain_guard_3707() {
     );
 }
 
-/// Structural regression for #3707: both child branches in
+/// Structural regression: both child branches in
 /// `relu_split_with_bounds` must guard non-finite child bounds before calling
 /// `domain_priority(...)`, and they must map the drop to
 /// `unresolved_due_to_propagation_failure`.
@@ -463,7 +467,7 @@ fn test_relu_split_with_bounds_shape_mismatch_error() {
 }
 
 // ============================================================
-// Warmup deadline tests (#4260)
+// Warmup deadline tests
 // ============================================================
 
 /// `compute_initial_graph_bounds` returns bounds rather than a verifier status,
@@ -500,5 +504,313 @@ fn test_compute_initial_graph_bounds_expired_deadline_refuses_fresh_fallback_426
     assert!(
         matches!(error, ny_core::NyError::DeadlineExceeded(_)),
         "expected typed deadline refusal, got {error:?}"
+    );
+}
+
+// ============================================================
+// #disjunctive-shared-bootstrap: the shared bootstrap keeps the root alpha
+// and the precomputed lane consumes it.
+// ============================================================
+
+/// The shared bootstrap KEEPS the optimised root alpha (unlike
+/// `compute_initial_graph_bounds`, which drops it), the precomputed lane
+/// reports it consumed those slopes (`root_src=spec`), and the verdict matches
+/// the direct per-objective lane on both a provable and an unprovable
+/// objective. y = |x0 - x1| over [-1,1]^2.
+#[ntest::timeout(30000)]
+#[test]
+fn shared_bootstrap_keeps_root_alpha_and_precomputed_lane_matches_direct() {
+    let graph = super::gpu_bab::simple_graph_network();
+    let input =
+        BoundedTensor::new(arr1(&[-1.0, -1.0]).into_dyn(), arr1(&[1.0, 1.0]).into_dyn()).unwrap();
+    let mut config = BetaCrownConfig {
+        use_alpha_crown: true,
+        use_crown_ibp: false,
+        enable_cuts: false,
+        max_domains: 64,
+        max_depth: 8,
+        batch_size: 1,
+        timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    config.alpha_config.iterations = 2;
+    config.alpha_config.adaptive_skip = false;
+    let verifier = BetaCrownVerifier::new(config);
+
+    let shared = verifier
+        .compute_shared_graph_bootstrap(&graph, &input, vec![0], None, None)
+        .expect("shared bootstrap")
+        .expect("with no deadline the bootstrap is always shared");
+    assert!(
+        shared.has_root_alpha(),
+        "the shared bootstrap must keep the alpha state the bootstrap optimised"
+    );
+    assert!(!shared.warmup_fallback_fired);
+    assert!(shared.precomputed().root_alpha_state.is_some());
+    assert!(!shared.node_bounds().is_empty());
+
+    for threshold in [-0.5_f32, 0.5] {
+        let direct = verifier
+            .verify_graph_relu_split(&graph, &input, &[1.0], threshold)
+            .unwrap();
+        let via_shared = verifier
+            .verify_graph_relu_split_with_bounds(
+                &graph,
+                &input,
+                &[1.0],
+                threshold,
+                &shared.precomputed(),
+            )
+            .unwrap();
+        assert_eq!(
+            std::mem::discriminant(&direct.result),
+            std::mem::discriminant(&via_shared.result),
+            "thr={threshold}: direct {:?} vs shared {:?}",
+            direct.result,
+            via_shared.result
+        );
+    }
+}
+
+/// An already-spent deadline makes the shared-alpha spec pass decline; the
+/// lane must then fall back to the projection of the caller's output box and
+/// still return `Ok` -- the projection proves the trivially-true objective at
+/// the root, so the verdict is `Verified`, never an error.
+#[ntest::timeout(30000)]
+#[test]
+fn shared_bootstrap_spec_root_falls_back_to_projection_on_expired_deadline() {
+    use std::time::Instant;
+
+    let graph = super::gpu_bab::simple_graph_network();
+    let input =
+        BoundedTensor::new(arr1(&[-1.0, -1.0]).into_dyn(), arr1(&[1.0, 1.0]).into_dyn()).unwrap();
+    let mut config = BetaCrownConfig {
+        use_alpha_crown: true,
+        use_crown_ibp: false,
+        enable_cuts: false,
+        timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    config.alpha_config.iterations = 2;
+    config.alpha_config.adaptive_skip = false;
+    let verifier = BetaCrownVerifier::new(config);
+    let shared = verifier
+        .compute_shared_graph_bootstrap(&graph, &input, vec![0], None, None)
+        .expect("shared bootstrap")
+        .expect("shared");
+    assert!(shared.has_root_alpha());
+
+    let expired = Some(
+        Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap(),
+    );
+    let result = verifier
+        .verify_graph_relu_split_with_bounds_with_engine(
+            &graph,
+            &input,
+            &[1.0],
+            -0.5,
+            &shared.precomputed(),
+            None,
+            expired,
+        )
+        .expect("an expired spec pass must fall back to the projection, not fail");
+    assert!(
+        matches!(result.result, BabVerificationStatus::Verified),
+        "the projection proves y >= -0.5 at the root: {:?}",
+        result.result
+    );
+}
+
+/// A spent bootstrap deadline is a DECLINE (`Ok(None)`), never an error: the
+/// caller then runs the per-clause bootstrap exactly as before.
+#[ntest::timeout(10000)]
+#[test]
+fn shared_bootstrap_declines_on_spent_deadline() {
+    use std::time::Instant;
+
+    let graph = super::gpu_bab::simple_graph_network();
+    let input =
+        BoundedTensor::new(arr1(&[-1.0, -1.0]).into_dyn(), arr1(&[1.0, 1.0]).into_dyn()).unwrap();
+    let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+        use_alpha_crown: true,
+        timeout: Duration::from_secs(5),
+        ..Default::default()
+    });
+    let expired = Some(
+        Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap(),
+    );
+    let shared = verifier
+        .compute_shared_graph_bootstrap(&graph, &input, vec![0], expired, expired)
+        .expect("a spent deadline is a decline, not an error");
+    assert!(shared.is_none());
+}
+
+// ============================================================
+// #genbab-precomputed-lane
+// ============================================================
+
+/// THE DEFECT, in miniature. `relu_split_bounds.rs` is the only BaB lane that
+/// never reads `branching_heuristic`; it scores ReLU nodes only. So a domain
+/// whose ReLUs are all STABLE has nothing to split, and the lane returns
+/// immediately — having explored exactly one domain, reached depth zero, and
+/// spent none of its budget.
+///
+/// This is the ml4acopf `14_ieee prop1` clause-39 signature reproduced in three
+/// nodes: there the lane printed `Found 3 ReLU nodes for branching`, performed
+/// ZERO splits, returned in ~48 microseconds while holding a 562 s allowance,
+/// and the row published `unknown` with 98.0% of its 600 s budget unspent.
+///
+/// Graph: y = relu(x), x in [0.5, 1.0] — the ReLU is stable-active, so the
+/// output is exactly [0.5, 1.0]. Property `y >= 0.8` is genuinely inconclusive
+/// on that box, and no ReLU split can refine it.
+#[ntest::timeout(10000)]
+#[test]
+fn stable_relus_leave_the_precomputed_lane_with_nothing_to_split() {
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input("relu", Layer::ReLU(ReLULayer)));
+    graph.set_output("relu");
+
+    let input = BoundedTensor::new(arr1(&[0.5]).into_dyn(), arr1(&[1.0]).into_dyn()).unwrap();
+
+    let config = BetaCrownConfig {
+        verify_upper_bound: false,
+        use_alpha_crown: false,
+        use_crown_ibp: false,
+        enable_cuts: false,
+        max_domains: 4096,
+        max_depth: 64,
+        timeout: Duration::from_secs(30),
+        ..Default::default()
+    };
+    let verifier = BetaCrownVerifier::new(config);
+    let (node_bounds, output_bounds) = verifier
+        .compute_initial_graph_bounds(&graph, &input, None)
+        .unwrap();
+    let precomputed = GraphPrecomputedBounds::new(&node_bounds, &output_bounds);
+
+    let result = verifier
+        .verify_graph_relu_split_with_bounds(&graph, &input, &[1.0], 0.8, &precomputed)
+        .unwrap();
+
+    assert!(
+        !matches!(result.result, BabVerificationStatus::Verified),
+        "the property is genuinely inconclusive on this box; got {:?}",
+        result.result
+    );
+    assert_eq!(
+        result.max_depth_reached, 0,
+        "no split is possible, so the lane must never reach depth 1"
+    );
+    assert!(
+        result.time_elapsed < Duration::from_secs(30),
+        "the lane returns immediately rather than using its budget — that is \
+         the defect, not a property worth preserving"
+    );
+}
+
+/// SAFETY: arming #genbab-precomputed-lane must be INERT when the configured
+/// heuristic is not GenBaB. The key only unlocks a route; it must never change
+/// a lane whose heuristic never asked for that route.
+#[ntest::timeout(10000)]
+#[test]
+fn genbab_precomputed_lane_is_inert_when_the_heuristic_is_not_genbab() {
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input("relu", Layer::ReLU(ReLULayer)));
+    graph.set_output("relu");
+    let input = BoundedTensor::new(arr1(&[-1.0]).into_dyn(), arr1(&[1.0]).into_dyn()).unwrap();
+
+    let base = BetaCrownConfig {
+        verify_upper_bound: false,
+        use_alpha_crown: false,
+        use_crown_ibp: false,
+        enable_cuts: false,
+        max_domains: 64,
+        max_depth: 8,
+        timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+
+    let dark = BetaCrownVerifier::new(base.clone());
+    let armed = BetaCrownVerifier::new(BetaCrownConfig {
+        genbab_on_precomputed_lane: true,
+        ..base
+    });
+
+    let (node_bounds, output_bounds) = dark
+        .compute_initial_graph_bounds(&graph, &input, None)
+        .unwrap();
+    let precomputed = GraphPrecomputedBounds::new(&node_bounds, &output_bounds);
+
+    let dark_result = dark
+        .verify_graph_relu_split_with_bounds(&graph, &input, &[1.0], -0.5, &precomputed)
+        .unwrap();
+    let armed_result = armed
+        .verify_graph_relu_split_with_bounds(&graph, &input, &[1.0], -0.5, &precomputed)
+        .unwrap();
+
+    assert_eq!(
+        dark_result.result, armed_result.result,
+        "the key must not move a verdict when the heuristic is not GenBaB"
+    );
+    assert_eq!(
+        dark_result.max_depth_reached, armed_result.max_depth_reached,
+        "nor the search shape"
+    );
+}
+
+/// SAFETY: arming it WITH a GenBaB heuristic, on a ReLU-only graph, must still
+/// not move the verdict. Branching only decides which sound sub-box to bound
+/// next. (Since #genbab-selector-convention the GenBaB selector CAN split this
+/// ReLU — it scores the pre-activation interval — so the armed route may now
+/// descend where it used to stop at `no_branch`; the verdict must not move.)
+#[ntest::timeout(20000)]
+#[test]
+fn genbab_precomputed_lane_keeps_the_verdict_on_a_relu_only_graph() {
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input("relu", Layer::ReLU(ReLULayer)));
+    graph.set_output("relu");
+    let input = BoundedTensor::new(arr1(&[-1.0]).into_dyn(), arr1(&[1.0]).into_dyn()).unwrap();
+
+    let genbab = BranchingHeuristic::GenBaB(
+        crate::beta_crown::nonlinear_branching::NonlinearBranchingConfig::default(),
+    );
+    let base = BetaCrownConfig {
+        verify_upper_bound: false,
+        use_alpha_crown: false,
+        use_crown_ibp: false,
+        enable_cuts: false,
+        max_domains: 64,
+        max_depth: 8,
+        timeout: Duration::from_secs(5),
+        branching_heuristic: genbab,
+        ..Default::default()
+    };
+
+    let dark = BetaCrownVerifier::new(base.clone());
+    let armed = BetaCrownVerifier::new(BetaCrownConfig {
+        genbab_on_precomputed_lane: true,
+        ..base
+    });
+
+    let (node_bounds, output_bounds) = dark
+        .compute_initial_graph_bounds(&graph, &input, None)
+        .unwrap();
+    let precomputed = GraphPrecomputedBounds::new(&node_bounds, &output_bounds);
+
+    let dark_result = dark
+        .verify_graph_relu_split_with_bounds(&graph, &input, &[1.0], -0.5, &precomputed)
+        .unwrap();
+    let armed_result = armed
+        .verify_graph_relu_split_with_bounds(&graph, &input, &[1.0], -0.5, &precomputed)
+        .unwrap();
+
+    assert_eq!(
+        dark_result.result, armed_result.result,
+        "routing through GenBaB must not change a verdict on a graph with no \
+         nonlinear node to split"
     );
 }

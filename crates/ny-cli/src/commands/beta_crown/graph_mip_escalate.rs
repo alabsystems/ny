@@ -154,7 +154,23 @@ fn graph_mip_solver_config(
     }
 }
 
-fn graph_mip_min_slice_secs() -> u64 {
+/// Whole-net encode-nnz admission cap (`NY_GRAPH_MIP_MAX_NNZ`, default 5M).
+///
+/// ONE resolution point, shared by the runtime gate below and `#mip-demand`'s
+/// pre-BaB static probe (`dispatch::graph_mip_statically_over_nnz_cap`), so the
+/// reservation decision and the admission decision can never disagree about the
+/// cap they are comparing against.
+pub(super) fn graph_mip_max_nnz() -> usize {
+    std::env::var("NY_GRAPH_MIP_MAX_NNZ")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(5_000_000)
+}
+
+/// Minimum slice the whole-net encode needs (`NY_GRAPH_MIP_MIN_SLICE_S`,
+/// default 20 s). Shared with `#mip-demand`'s pre-BaB reserve sizing for the
+/// same reason as [`graph_mip_max_nnz`].
+pub(super) fn graph_mip_min_slice_secs() -> u64 {
     std::env::var("NY_GRAPH_MIP_MIN_SLICE_S")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
@@ -239,6 +255,8 @@ pub(super) fn try_graph_mip_escalation_with_treatment(
     effective_treatment: Option<&EffectiveTreatmentProjection>,
     json: bool,
 ) -> Result<bool> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Mip);
     if !graph_mip_enabled() {
         return Ok(false);
     }
@@ -347,10 +365,7 @@ pub(super) fn try_graph_mip_escalation_with_treatment(
     // default-on, this makes the escalation DECLINE cheaply (pre-encode) on any
     // net ay cannot hold; raise `NY_GRAPH_MIP_MAX_NNZ` as ay's solver + memory
     // footprint grow.
-    let max_nnz = std::env::var("NY_GRAPH_MIP_MAX_NNZ")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .unwrap_or(5_000_000);
+    let max_nnz = graph_mip_max_nnz();
     match super::graph_mip_leaf::estimate_encode_nnz(graph, &flat_bounds) {
         Some(nnz) if nnz <= max_nnz => {
             info!("Graph-MIP: estimated encode nnz {nnz} (cap {max_nnz})");
@@ -665,7 +680,7 @@ fn solve_graph_disjunctive(
             provenance: Default::default(),
             output_bounds: inf_bounds(),
             proof: None,
-            actual_method: Some(ny_core::MethodUsed::MipHiGHS),
+            actual_method: Some(super::mip_highs::mip_unsat_method_tag()),
         })
     } else {
         if let Some(reason) = &undecided_reason {
@@ -711,7 +726,7 @@ fn map_graph_mip_result(
                 provenance: Default::default(),
                 output_bounds: inf_bounds(),
                 proof: None,
-                actual_method: Some(ny_core::MethodUsed::MipHiGHS),
+                actual_method: Some(super::mip_highs::mip_unsat_method_tag()),
             }
         }
         MipResult::Unsat { certified: false } => {

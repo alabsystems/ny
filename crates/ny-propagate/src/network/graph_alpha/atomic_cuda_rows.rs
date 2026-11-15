@@ -64,6 +64,12 @@ pub(crate) enum AtomicCudaRowsRefusal {
         elements: usize,
     },
     ReferenceNonFiniteOrInverted,
+    /// The reference does not enclose the certified image of the target box
+    /// through spec row `row`, so it is not proved to bound that row
+    /// (#finalize-objective).
+    ReferenceOutsideSpecImage {
+        row: usize,
+    },
     ResnetGpuDisabled,
     SkeletonDisabled,
     SkeletonRefused,
@@ -112,6 +118,7 @@ impl AtomicCudaRowsRefusal {
             Self::MissingTargetBounds => "missing_target_bounds",
             Self::ReferenceShape { .. } => "reference_shape",
             Self::ReferenceNonFiniteOrInverted => "reference_nonfinite_or_inverted",
+            Self::ReferenceOutsideSpecImage { .. } => "reference_outside_spec_image",
             Self::ResnetGpuDisabled => "resnet_gpu_disabled",
             Self::SkeletonDisabled => "skeleton_disabled",
             Self::SkeletonRefused => "skeleton_refused",
@@ -199,6 +206,81 @@ fn validate_exact_vector(
         .any(|(&lower, &upper)| !lower.is_finite() || !upper.is_finite() || lower > upper)
     {
         return Err(numeric_refusal);
+    }
+    Ok(())
+}
+
+/// #finalize-objective (e): admit the caller's reference only when it is
+/// PROVED to bound the spec rows.
+///
+/// The reference is intersected with the CUDA rows and, on any committed
+/// refusal, published AS the spec-row bound (`ReferenceRetained`), so it must
+/// already bound `spec · target`; checking its shape alone admits a raw
+/// target box handed over with a non-identity row, the defect class the
+/// constrained backward's IBP fallback had. Every row's certified image of
+/// the target box, `S_i ⊇ {spec_i · y : y ∈ target}`, is computed here; a
+/// reference with `R_i ⊇ S_i` for every row is then a bound on the rows by
+/// containment, whatever produced it.
+///
+/// Unit rows (a single `1` coefficient, zeros elsewhere) are projected
+/// exactly (`spec_i · y = y_j`); every other row uses `objective_bounds`, the
+/// reducer each current caller builds its reference with, so the identity
+/// pre-loop (raw box, unit rows) and the root-C routes (the same box through
+/// the same rows) are admitted bit-exactly. A reference TIGHTER than the
+/// target box's image (a CROWN row bound, say) is refused: it needs its own
+/// proof threaded through here before it may be used.
+fn reference_encloses_spec_image(
+    reference: &BoundedTensor,
+    spec_matrix: &Array2<f32>,
+    target_bounds: &BoundedTensor,
+    deadline: Instant,
+) -> AssemblyResult<()> {
+    let target_lower: Vec<f32> = target_bounds.lower().iter().copied().collect();
+    let target_upper: Vec<f32> = target_bounds.upper().iter().copied().collect();
+    let reference_lower: Vec<f32> = reference.lower().iter().copied().collect();
+    let reference_upper: Vec<f32> = reference.upper().iter().copied().collect();
+    if reference_lower.len() != spec_matrix.nrows()
+        || target_lower.len() != spec_matrix.ncols()
+        || target_upper.len() != spec_matrix.ncols()
+    {
+        return Err(AtomicCudaRowsRefusal::ReferenceShape {
+            elements: reference_lower.len(),
+        });
+    }
+    for (row_idx, row) in spec_matrix.rows().into_iter().enumerate() {
+        if Instant::now() >= deadline {
+            return Err(AtomicCudaRowsRefusal::DeadlineExceeded);
+        }
+        let mut unit = None;
+        let mut is_unit = true;
+        for (column, &value) in row.iter().enumerate() {
+            if value == 1.0 && unit.is_none() {
+                unit = Some(column);
+            } else if value != 0.0 {
+                is_unit = false;
+                break;
+            }
+        }
+        let image = match unit.filter(|_| is_unit) {
+            Some(column) => Some((target_lower[column], target_upper[column])),
+            None => {
+                let owned;
+                let slice = match row.as_slice() {
+                    Some(slice) => slice,
+                    None => {
+                        owned = row.to_vec();
+                        owned.as_slice()
+                    }
+                };
+                crate::beta_crown::engine::graph::objective_bounds(target_bounds, slice).ok()
+            }
+        };
+        let encloses = image.is_some_and(|(image_lower, image_upper)| {
+            reference_lower[row_idx] <= image_lower && image_upper <= reference_upper[row_idx]
+        });
+        if !encloses {
+            return Err(AtomicCudaRowsRefusal::ReferenceOutsideSpecImage { row: row_idx });
+        }
     }
     Ok(())
 }
@@ -426,6 +508,14 @@ impl<'a> AtomicCudaRowsRequest<'a> {
             self.spec_matrix.nrows(),
             |elements| AtomicCudaRowsRefusal::ReferenceShape { elements },
             AtomicCudaRowsRefusal::ReferenceNonFiniteOrInverted,
+        ) {
+            return refuse_before(refusal);
+        }
+        if let Err(refusal) = reference_encloses_spec_image(
+            self.reference,
+            self.spec_matrix,
+            target_bounds,
+            self.deadline,
         ) {
             return refuse_before(refusal);
         }
@@ -877,5 +967,118 @@ mod tests {
                 },
             }
         ));
+    }
+
+    /// #finalize-objective (e): the reference is intersected with the CUDA
+    /// rows and, on any committed refusal, published AS the spec-row bound,
+    /// so it must already bound `spec · target`. Every current caller builds
+    /// it that way (the identity pre-loop hands over the raw box with unit
+    /// rows; the root-C routes project the same box through the same rows
+    /// with `objective_bounds`), but only the reference's SHAPE was checked,
+    /// so a caller handing over the raw target box with a non-identity row
+    /// (the constrained-finalize bug class) was admitted. Here `target` is
+    /// `relu(x) ∈ [0, 1]`: under `c = [-1]` its image is `[-1, 0]`, under
+    /// `c = [2]` it is `[0, 2]`, and the raw box `[0, 1]` bounds neither.
+    /// RED on the pre-fix tree: the request ran on (and refused later for an
+    /// unrelated reason), never naming the reference.
+    #[test]
+    fn request_refuses_a_reference_that_is_not_a_bound_on_the_spec_rows() {
+        const GUARD: &str = "reference_outside_spec_image";
+        let graph = GraphNetwork::new();
+        let input = vector_bounds(vec![-1.0], vec![1.0]);
+        let target = vector_bounds(vec![0.0], vec![1.0]);
+        let alpha_state = GraphAlphaState::new();
+        let node_bounds = HashMap::from([("output".to_string(), target.clone())]);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let reason = |spec: &Array2<f32>, reference: &BoundedTensor| -> Option<&'static str> {
+            match AtomicCudaRowsRequest::new(
+                &graph,
+                &input,
+                "output",
+                &node_bounds,
+                &alpha_state,
+                spec,
+                reference,
+                deadline,
+            )
+            .run()
+            {
+                AtomicCudaRowsOutcome::RefusedBeforeCommit { refusal } => {
+                    Some(refusal.telemetry_reason())
+                }
+                AtomicCudaRowsOutcome::Committed(_) => None,
+            }
+        };
+        let row = |c: f32| Array2::from_elem((1, 1), c);
+
+        let mut wrong = Vec::new();
+        // The raw target box under a negated and a scaled row, and a two-row
+        // spec whose second row it does not bound.
+        for (label, spec) in [
+            ("c=[-1]", row(-1.0)),
+            ("c=[2]", row(2.0)),
+            ("C=[[1],[-1]]", ndarray::arr2(&[[1.0f32], [-1.0]])),
+        ] {
+            let reference = if spec.nrows() == 1 {
+                target.clone()
+            } else {
+                vector_bounds(vec![0.0, 0.0], vec![1.0, 1.0])
+            };
+            let got = reason(&spec, &reference);
+            println!("[finalize-objective] atomic raw-box {label} -> {got:?}");
+            if got != Some(GUARD) {
+                wrong.push(format!(
+                    "{label}: raw target box admitted as a spec-row reference ({got:?})"
+                ));
+            }
+        }
+        // Controls: every reference that DOES bound the rows passes the guard
+        // (it is refused later, for this empty graph, by something else). A
+        // reference built the way the root-C callers build theirs, the
+        // certified `objective_bounds` image of the same box through the same
+        // row, is admitted bit-exactly, as is anything looser; an image built
+        // from the EXACT endpoints (`[-1, 0]` for `c = [-1]`) is one ulp
+        // tighter than the certified image and is refused, by design.
+        let image = |c: &[f32]| {
+            let (lower, upper) =
+                crate::beta_crown::engine::graph::objective_bounds(&target, c).expect("image");
+            (lower, upper)
+        };
+        let (neg_lo, neg_hi) = image(&[-1.0]);
+        let (two_lo, two_hi) = image(&[2.0]);
+        for (label, spec, reference) in [
+            ("identity raw box", row(1.0), target.clone()),
+            (
+                "c=[-1] certified image",
+                row(-1.0),
+                vector_bounds(vec![neg_lo], vec![neg_hi]),
+            ),
+            (
+                "c=[2] certified image",
+                row(2.0),
+                vector_bounds(vec![two_lo], vec![two_hi]),
+            ),
+            (
+                "c=[-1] looser",
+                row(-1.0),
+                vector_bounds(vec![-3.0], vec![0.5]),
+            ),
+            (
+                "C=[[1],[-1]] certified image",
+                ndarray::arr2(&[[1.0f32], [-1.0]]),
+                vector_bounds(vec![0.0, neg_lo], vec![1.0, neg_hi]),
+            ),
+        ] {
+            let got = reason(&spec, &reference);
+            println!("[finalize-objective] atomic control {label} -> {got:?}");
+            if got == Some(GUARD) {
+                wrong.push(format!("{label}: a sound reference was refused"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        println!(
+            "[finalize-objective] TEST_COMPLETE \
+             name=request_refuses_a_reference_that_is_not_a_bound_on_the_spec_rows"
+        );
     }
 }

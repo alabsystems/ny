@@ -25,6 +25,17 @@ const SPSA_MAX_DELTA_RANGE_RATIO: f32 = 0.5;
 const SPSA_ZERO_DIFF_EPS: f32 = 1e-8;
 
 impl PgdAttacker<'_> {
+    fn rademacher_until(&self, features: usize, rng: &mut StdRng) -> Result<Array1<f32>> {
+        self.checkpoint("before SPSA perturbation allocation")?;
+        let mut values = Vec::with_capacity(features);
+        for feature in 0..features {
+            if feature.is_multiple_of(4_096) {
+                self.checkpoint("during SPSA perturbation initialization")?;
+            }
+            values.push(if rng.random::<bool>() { 1.0 } else { -1.0 });
+        }
+        Ok(Array1::from_vec(values))
+    }
     fn spsa_max_delta(&self, input_bounds: &BoundedTensor) -> f32 {
         let max_width = input_bounds
             .lower()
@@ -87,7 +98,7 @@ impl PgdAttacker<'_> {
 
     /// Estimate gradient using SPSA while keeping probes inside the input box.
     ///
-    /// Two strategies depending on network type (#3769):
+    /// Two strategies depending on network type:
     ///
     /// **Networks with Sign layers (BNNs):** Use smooth Sign relaxation
     /// (`tanh(β*x)` instead of `sign(x)`) for SPSA probes. This gives a
@@ -166,7 +177,7 @@ impl PgdAttacker<'_> {
         Ok((last_gradient, evals))
     }
 
-    /// SPSA gradient estimation using smooth Sign relaxation (#3769).
+    /// SPSA gradient estimation using smooth Sign relaxation.
     ///
     /// For networks with Sign layers, finite-difference through the original
     /// discrete Sign gives zero gradient unless the perturbation happens to cross
@@ -227,7 +238,8 @@ impl PgdAttacker<'_> {
         output_idx: usize,
         rngs: &mut [StdRng],
     ) -> Result<(ArrayD<f32>, usize)> {
-        // Dispatch to smooth Sign path for BNN networks (#3769)
+        self.checkpoint("before batched SPSA preparation")?;
+        // Dispatch to smooth Sign path for BNN networks
         let has_sign = network.layers.iter().any(|l| matches!(l, Layer::Sign(_)));
         if has_sign {
             return self.estimate_gradient_spsa_batch_smooth_sign(
@@ -261,9 +273,10 @@ impl PgdAttacker<'_> {
 
         let mut perturbation_batch = ArrayD::zeros(IxDyn(inputs.shape()));
         for (batch_idx, rng) in rngs.iter_mut().enumerate() {
-            let perturbation: Array1<f32> = (0..features)
-                .map(|_| if rng.random::<bool>() { 1.0 } else { -1.0 })
-                .collect();
+            if batch_idx.is_multiple_of(32) {
+                self.checkpoint("during batched SPSA perturbation initialization")?;
+            }
+            let perturbation = self.rademacher_until(features, rng)?;
             let perturbation = perturbation
                 .into_shape_with_order(IxDyn(input_shape))
                 .map_err(|err| {
@@ -279,6 +292,7 @@ impl PgdAttacker<'_> {
 
         let mut resolved = vec![false; batch_size];
         loop {
+            self.checkpoint("before batched SPSA finite differences")?;
             let input_plus =
                 self.project_batch(&(inputs + &(&perturbation_batch * delta)), input_bounds)?;
             let input_minus =
@@ -295,6 +309,9 @@ impl PgdAttacker<'_> {
             let mut unresolved = 0usize;
 
             for (batch_idx, is_resolved) in resolved.iter_mut().enumerate() {
+                if batch_idx.is_multiple_of(32) {
+                    self.checkpoint("during batched SPSA result scan")?;
+                }
                 if *is_resolved {
                     continue;
                 }
@@ -352,7 +369,7 @@ impl PgdAttacker<'_> {
         Ok((gradient_batch, evals))
     }
 
-    /// Batched SPSA with smooth Sign relaxation (#3769).
+    /// Batched SPSA with smooth Sign relaxation.
     ///
     /// Single-pass: evaluate all restarts through `tanh(β*x)` in one batch,
     /// compute finite-difference gradient. No multi-scale delta growth needed.
@@ -364,6 +381,7 @@ impl PgdAttacker<'_> {
         output_idx: usize,
         rngs: &mut [StdRng],
     ) -> Result<(ArrayD<f32>, usize)> {
+        self.checkpoint("before batched Sign SPSA preparation")?;
         let Some((&batch_size, input_shape)) = inputs.shape().split_first() else {
             return Err(NyError::InvalidSpec(
                 "batched SPSA requires input shape [N, ...]".to_string(),
@@ -383,9 +401,10 @@ impl PgdAttacker<'_> {
 
         let mut perturbation_batch = ArrayD::zeros(IxDyn(inputs.shape()));
         for (batch_idx, rng) in rngs.iter_mut().enumerate() {
-            let perturbation: Array1<f32> = (0..features)
-                .map(|_| if rng.random::<bool>() { 1.0 } else { -1.0 })
-                .collect();
+            if batch_idx.is_multiple_of(32) {
+                self.checkpoint("during batched Sign SPSA perturbation initialization")?;
+            }
+            let perturbation = self.rademacher_until(features, rng)?;
             let perturbation = perturbation
                 .into_shape_with_order(IxDyn(input_shape))
                 .map_err(|err| {
@@ -399,6 +418,7 @@ impl PgdAttacker<'_> {
                 .assign(&perturbation);
         }
 
+        self.checkpoint("before batched Sign SPSA finite differences")?;
         let input_plus =
             self.project_batch(&(inputs + &(&perturbation_batch * delta)), input_bounds)?;
         let input_minus =
@@ -416,6 +436,9 @@ impl PgdAttacker<'_> {
         let (output_plus, output_minus) = outputs.view().split_at(Axis(0), batch_size);
 
         for batch_idx in 0..batch_size {
+            if batch_idx.is_multiple_of(32) {
+                self.checkpoint("during batched Sign SPSA result scan")?;
+            }
             let y_plus = output_plus
                 .index_axis(Axis(0), batch_idx)
                 .iter()

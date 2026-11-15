@@ -7,8 +7,6 @@
 //! Starts with identity bounds at the block's output and propagates backward
 //! through the block's nodes. Binary ops (MatMul, MulBinary) trigger partial
 //! CROWN fallback. LayerNorm and RmsNorm dispatch to decomposed backward.
-//!
-//! Part of #3221, #3447.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -82,7 +80,7 @@ fn has_non_finite_block_bounds_with_deadline(
 ///
 /// Groups parameters that are invariant across all nodes in a single
 /// block backward pass, keeping `apply_ibp_fallback_at_node` within
-/// clippy's argument limit. Part of #3812.
+/// clippy's argument limit.
 struct BlockBackwardCtx<'a> {
     label: &'a str,
     block_node_bounds: &'a HashMap<String, BoundedTensor>,
@@ -93,7 +91,7 @@ struct BlockBackwardCtx<'a> {
 
 /// Block-local indexed pending bounds for the block-wise backward loop.
 ///
-/// Packet D (#4298) only needs Dense propagation within a block, but the
+/// Packet D only needs Dense propagation within a block, but the
 /// carrier stores `BatchedCrownBounds` so merges can reuse the existing
 /// checked Dense merge path without reimplementing the f64 sidecar logic.
 struct BlockIndexedPendingBounds {
@@ -202,7 +200,7 @@ impl GraphNetwork {
             Err(error) if error.is_deadline_exceeded() => return Ok(deadline_fallback()),
             result => result?,
         };
-        // #4242: upgrade to provenance-aware tightening for consistency with all
+        // Upgrade to provenance-aware tightening for consistency with all
         // other CROWN orchestrators. Detects inverted bounds in addition to NaN.
         let (tightened, provenance) = match tighten_crown_output_with_provenance_and_deadline(
             result,
@@ -226,7 +224,7 @@ impl GraphNetwork {
     /// Run CROWN backward propagation within a single block (test-only convenience).
     ///
     /// Production code should use `crown_backward_within_block_with_engine` directly
-    /// so the engine parameter is not silently discarded (#3772).
+    /// so the engine parameter is not silently discarded.
     #[cfg(test)]
     pub(crate) fn crown_backward_within_block(
         &self,
@@ -248,11 +246,11 @@ impl GraphNetwork {
         )
     }
 
-    /// Engine-aware variant of `crown_backward_within_block` (#3597).
+    /// Engine-aware variant of `crown_backward_within_block`.
     ///
     /// When `alpha_state` is `Some`, GELU layers dispatch through per-neuron
     /// alpha parameters for tighter lower bounds (alpha-CROWN). When `None`,
-    /// GELU uses standard CROWN relaxation. Part of #3447.
+    /// GELU uses standard CROWN relaxation.
     pub(crate) fn crown_backward_within_block_with_engine(
         &self,
         block_nodes: &[String],
@@ -342,7 +340,7 @@ impl GraphNetwork {
         };
 
         // Initialize identity bounds at block output.
-        // Guard: check CPU dense budget before allocating (#3550).
+        // Guard: check CPU dense budget before allocating.
         check_batched_identity_budget(budget_label, &output_shape)?;
         let mut linear_bounds =
             BlockIndexedPendingBounds::new_with_deadline(block_input_idx + 1, deadline);
@@ -427,7 +425,7 @@ impl GraphNetwork {
                 // Decomposes into x→mean→d=x-mean→d²→var→sqrt→1/std→d*inv_std→γ·norm+β
                 // and propagates CROWN backward through each. If the decomposition
                 // fails or produces non-finite coefficients, fall back to
-                // interval-derived bias-only bounds. Part of #318.
+                // interval-derived bias-only bounds.
                 //
                 // Reference: alpha-beta-CROWN auto_LiRPA/operators/normalization.py:303-331
                 Layer::LayerNorm(ln) => {
@@ -479,7 +477,6 @@ impl GraphNetwork {
                 // RmsNorm: decomposed CROWN backward through primitives.
                 // Decomposes into x→x²→mean(x²)→sqrt→1/rms→x*inv_rms→γ·norm
                 // (simpler than LayerNorm: no mean subtraction, no beta).
-                // Part of #3387.
                 Layer::RmsNorm(rn) => {
                     match decomposed_rms_norm_crown_backward(
                         &node_lb,
@@ -524,7 +521,7 @@ impl GraphNetwork {
 
                 // InstanceNorm1d: decomposed CROWN backward through per-channel
                 // primitives. Calls decomposed_norm_crown_backward once per channel
-                // since InstanceNorm is LayerNorm applied per-channel. Part of #3830.
+                // since InstanceNorm is LayerNorm applied per-channel.
                 Layer::InstanceNorm1d(inst) => {
                     match decomposed_instance_norm_crown_backward_channel_batched(
                         &node_lb,
@@ -572,7 +569,7 @@ impl GraphNetwork {
 
                 // AdaIN1d: fixed-style InstanceNorm1d with effective affine
                 // parameters. Reuse the same decomposed per-channel helper as
-                // InstanceNorm instead of partial fallback. Part of #3912.
+                // InstanceNorm instead of partial fallback.
                 Layer::AdaIN1d(adain) => {
                     match adain.effective_instance_norm().and_then(|effective| {
                         decomposed_instance_norm_crown_backward_channel_batched(
@@ -643,10 +640,10 @@ impl GraphNetwork {
 
                 // GELU: when alpha_state is provided, use per-neuron alpha
                 // parameters for tighter lower bounds. Otherwise fall through
-                // to standard CROWN backward. Part of #3447.
+                // to standard CROWN backward.
                 Layer::GELU(gelu) if alpha_state.is_some() => {
                     // Match guard guarantees alpha_state is Some; use safe
-                    // destructuring instead of expect() (#3812).
+                    // destructuring instead of expect().
                     let state = match alpha_state {
                         Some(s) => s,
                         None => {
@@ -681,8 +678,8 @@ impl GraphNetwork {
                         Ok(new_lb) => {
                             linear_bounds.accumulate_dense(first_input_idx, new_lb)?;
                         }
-                        // #2888: NumericalInstability also triggers partial CROWN fallback.
-                        // SoundnessRefusal must still propagate — see error.rs:109-110 (#3106).
+                        // NumericalInstability also triggers partial CROWN fallback.
+                        // SoundnessRefusal must still propagate — see error.rs:109-110.
                         //
                         // ShapeMismatch is also recoverable here: it arises when an
                         // upstream layer hands this layer bounds in an incompatible
@@ -757,7 +754,6 @@ impl GraphNetwork {
     /// Used when a node cannot be propagated through analytically (unsupported
     /// layer, non-finite decomposed result, etc.). Deduplicates the 4
     /// identical fallback blocks in `crown_backward_within_block_with_engine`.
-    /// Part of #3812.
     fn apply_ibp_fallback_at_node(
         &self,
         node_name: &str,
@@ -906,10 +902,18 @@ mod tests {
             .into_batched_dense_checked("test_block_indexed_pending_bounds_merges_sentinel_slot")
             .expect("residual slot should stay dense");
 
+        // 2 + 3 is exact in f64 and 5 is an f32: the merged coefficient is
+        // published exactly with no error plane (a one-ulp outward nudge is no
+        // certificate for a coefficient on a signed input; D14). The bias
+        // keeps its directed step.
         assert_eq!(
             sentinel.lower_a()[[0, 0]],
-            next_down_f32(5.0),
+            5.0,
             "indexed sentinel slot should merge lower A contributions"
+        );
+        assert!(
+            !sentinel.has_coeff_err(),
+            "an exact, representable fan-in sum needs no coefficient-error plane"
         );
         assert_eq!(
             sentinel.lower_b()[0],

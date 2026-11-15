@@ -80,7 +80,7 @@ proptest! {
 }
 
 // ========================================================================
-// Large-input overflow guard tests (#2625)
+// Large-input overflow guard tests
 //
 // When l or u is near f32::MAX, the slope-rounding error adjustment
 // (slope_error * max_abs_x) can overflow and produce Inf/vacuous
@@ -172,7 +172,7 @@ fn test_arctan_large_input_no_inf() {
 }
 
 /// Test crossing-origin interval with large magnitude — this exercises the
-/// tangent-point table path where slopes are non-trivial (#2625).
+/// tangent-point table path where slopes are non-trivial.
 /// Uses ±1000 (beyond table's X_LIMIT=500 range) to exercise the default
 /// tangent point fallback without triggering isize overflow in table index.
 #[ntest::timeout(10000)]
@@ -487,7 +487,7 @@ fn test_s_shaped_alpha_nonfinite_tangent_fails_closed() {
 }
 
 // ========================================================================
-// CROWN backward soundness tests (#2292)
+// CROWN backward soundness tests
 //
 // These test propagate_linear_with_bounds (the full CROWN backward path),
 // not just the per-element relaxation functions. They exercise:
@@ -496,7 +496,7 @@ fn test_s_shaped_alpha_nonfinite_tangent_fails_closed() {
 //   - BoundedTensor → LinearBounds extraction
 // ========================================================================
 
-// assert_crown_backward_sound extracted to crate::tests::assert_crown_backward_sound (#2307)
+// assert_crown_backward_sound extracted to crate::tests::assert_crown_backward_sound
 use crate::tests::assert_crown_backward_sound;
 
 #[ntest::timeout(10000)]
@@ -526,9 +526,9 @@ fn test_arctan_crown_backward_soundness() {
     assert_crown_backward_sound(&layer, &intervals, f32::atan);
 }
 
-// ── Strict zero-tolerance CROWN relaxation proptests (#3292) ─────────
+// ── Strict zero-tolerance CROWN relaxation proptests ─────────
 //
-// Pattern from #3285: f64-evaluated reference with zero tolerance catches
+// An f64-evaluated reference with zero tolerance catches
 // f32 cancellation bugs invisible to magnitude-scaled tolerance tests.
 // Ref: silu/tests.rs proptest_silu_relaxation_strict_soundness
 
@@ -537,7 +537,7 @@ proptest! {
 
     /// Strict soundness proptest for sigmoid CROWN relaxation.
     /// Uses f64 reference (sigmoid_f64) with zero tolerance on 200-point grid.
-    /// Ref: alpha-beta-CROWN auto_LiRPA sigmoid relaxation, #3292.
+    /// Ref: alpha-beta-CROWN auto_LiRPA sigmoid relaxation.
     #[test]
     fn proptest_sigmoid_relaxation_strict_soundness(
         l in -10.0f32..10.0,
@@ -577,7 +577,7 @@ proptest! {
 
     /// Strict soundness proptest for tanh CROWN relaxation.
     /// Uses f64 reference (tanh_f64) with zero tolerance on 200-point grid.
-    /// Ref: alpha-beta-CROWN auto_LiRPA tanh relaxation, #3292.
+    /// Ref: alpha-beta-CROWN auto_LiRPA tanh relaxation.
     #[test]
     fn proptest_tanh_relaxation_strict_soundness(
         l in -10.0f32..10.0,
@@ -616,7 +616,7 @@ proptest! {
 
     /// Strict soundness proptest for arctan CROWN relaxation.
     /// Uses f64 reference (f64::atan) with zero tolerance on 200-point grid.
-    /// Mirrors the sigmoid/tanh strict-soundness guards (#3292); added alongside
+    /// Mirrors the sigmoid/tanh strict-soundness guards; added alongside
     /// the parallel-to-chord single-convexity tangent tightening so the
     /// arctan path has the same zero-tolerance enclosure check.
     #[test]

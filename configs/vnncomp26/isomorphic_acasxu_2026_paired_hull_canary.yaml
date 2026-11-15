@@ -1,0 +1,14 @@
+# Explicit research opt-in; category resolution cannot select this suffix.
+# The kernel and standalone harness are tested. Full CLI build and scored
+# route arrival remain required before promoting to the default preset.
+solver:
+  scored_wall_clamp: true
+  paired_difference:
+    max_seconds: 60.0
+    max_domains: 100000
+    max_lp_seconds: 20.0
+    # Reduced floating proposals; NY independently checks the full source LP.
+    lp_backend: ay
+    lp_memory_mib: 2048
+    lp_steps: 2000
+    workers: 8

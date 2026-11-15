@@ -49,6 +49,7 @@ impl GraphNetwork {
     where
         F: Fn(LayerProgress),
     {
+        self.ensure_proof_eligible()?;
         let start_time = std::time::Instant::now();
 
         if self.nodes.is_empty() {
@@ -106,7 +107,7 @@ impl GraphNetwork {
                     .fold(0.0_f32, nan_propagating_max)
             };
 
-            // Unified dispatch (#2405). Uses resolve_node_inputs for all layer
+            // Unified dispatch. Uses resolve_node_inputs for all layer
             // types, with custom Binary handling for zonotope tightening.
             let resolved = resolve_node_inputs(node, node_name, &mut |name| {
                 Ok(self.bounds_ref(name, input, &bounds_cache)?.clone())
@@ -203,7 +204,7 @@ impl GraphNetwork {
                 has_infinite,
             };
 
-            // NaN firewall (#2812 Slice 3, #2706). Metadata recorded above.
+            // NaN firewall. Metadata recorded above.
             check_nan_firewall(
                 &output_bounds,
                 "IBP detailed",

@@ -22,6 +22,28 @@ const BENCHMARK_CORPUS: Scope = Scope {
 declare_levers! {
     registry ONNX_LEVERS;
 
+    /// `NY_VIT_BENCH` — explicit ViT corpus input for diagnostic controls.
+    pub VIT_BENCH = LeverDecl {
+        name: "NY_VIT_BENCH",
+        kind: LeverKind::Text,
+        default: DefaultSpec::Unset,
+        bucket: Bucket::Debug,
+        moat: MoatRisk::None,
+        doc: "Selects the external ViT corpus for diagnostic tests/examples only. \
+              Readers freeze RawLeverInputs so path-valued callers preserve exact \
+              OS bytes; the historical String-valued example keeps its default \
+              on non-Unicode input. Empty values stay explicit rather than absent. \
+              Missing fixture bytes fail the diagnostic; no verifier consumes it.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "test/example input selector only; no production verdict or default changes",
+        },
+        owner: BENCHMARK_CORPUS,
+        readers: &[
+            ReaderSite { scope: BENCHMARK_CORPUS, role: "select the zero-width diagnostic corpus with the legacy Unicode fallback", site: "crates/ny-onnx/examples/vit_zero_width_node_bisect.rs:bench_dir" },
+            ReaderSite { scope: BENCHMARK_CORPUS, role: "select the exact original attention-region fixture with OS-byte fidelity", site: "crates/ny-cli/tests/attention_region_arrival.rs:fixture_dir" },
+        ],
+    };
+
     /// `NY_STRIP_TERMINAL_SOFTMAX` — staged argmax-complement rewrite.
     pub STRIP_TERMINAL_SOFTMAX = LeverDecl {
         name: "NY_STRIP_TERMINAL_SOFTMAX",

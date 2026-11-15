@@ -13,7 +13,7 @@ use crate::network::{GraphNetwork, GraphNode, Network};
 use std::time::Instant;
 
 /// Build a deep+wide Linear/ReLU graph whose root spec-CROWN output-bound
-/// backward is dominated by a single very wide `Linear` GEMM (#4321).
+/// backward is dominated by a single very wide `Linear` GEMM.
 ///
 /// Architecture (all Linear weights are small so bounds stay finite):
 ///   x[in_dim] -> [Linear(hidden->hidden)+ReLU]*depth -> Linear(hidden->out_dim)
@@ -173,7 +173,7 @@ fn dd_zonotope_prebootstrap_early_verified_rejects_cut_authority() {
     crate::dd_zonotope::certified_box::reset_for_test();
 }
 
-/// Regression (#4321): a deep+wide Linear/ReLU graph with many output specs must
+/// Regression: a deep+wide Linear/ReLU graph with many output specs must
 /// RELIABLY self-terminate at its deadline instead of running a single
 /// uninterrupted root output-bound GEMM past the budget (which, in production,
 /// gets the process externally killed with no JSON verdict).
@@ -252,8 +252,6 @@ fn test_deep_wide_linear_root_self_terminates_at_deadline_4321() {
 ///
 /// Y₀ = max(x, 0) + 0.5, Y₁ = -max(x, 0) + 0.5. Sum = 1.0 (constant).
 /// Root CROWN bounds: Y₀ ∈ [0.5, 1.5], Y₁ ∈ [-0.5, 0.5].
-///
-/// Reference: designs/2026-03-05-joint-conjunctive-bab.md Phase 2 step 4
 fn build_single_relu_anti_correlated_graph() -> (GraphNetwork, BoundedTensor) {
     let linear1 = LinearLayer::new(ndarray::Array2::eye(1), None).unwrap();
     let w2 = ndarray::arr2(&[[1.0_f32], [-1.0]]);
@@ -822,7 +820,7 @@ fn test_conjunctive_all_violated_root_returns_unknown_3334() {
     );
 }
 
-/// Regression for #2266: empty objectives must be rejected, not trivially verified.
+/// Regression: empty objectives must be rejected, not trivially verified.
 #[ntest::timeout(5000)]
 #[test]
 fn test_empty_objectives_returns_error_2266() {
@@ -888,7 +886,7 @@ fn upper_mode_constant_counterexample_is_rejected_before_false_root_verified() {
     );
 }
 
-/// #3383: mismatched objectives/thresholds lengths must return error, not silently truncate.
+/// Mismatched objectives/thresholds lengths must return error, not silently truncate.
 ///
 /// .zip() truncates to the shorter iterator. Without the entry-point guard,
 /// disjunctive mode would skip unchecked objectives (conservative but wrong),
@@ -1006,7 +1004,7 @@ fn build_multi_relu_graph() -> (GraphNetwork, BoundedTensor) {
     (graph, input)
 }
 
-/// Regression test for #3388: multi-objective conjunctive BaB must respect timeout.
+/// Regression test: multi-objective conjunctive BaB must respect timeout.
 ///
 /// Without the per-domain deadline check in sequential processing, the BaB loop
 /// only checks the timeout between batches. For large networks with many
@@ -1060,7 +1058,7 @@ fn test_conjunctive_bab_respects_timeout_3388() {
     );
 }
 
-/// Regression test for #3388: disjunctive multi-objective BaB also respects timeout.
+/// Regression test: disjunctive multi-objective BaB also respects timeout.
 ///
 /// Same scenario as the conjunctive test but with disjunctive semantics.
 /// Disjunctive mode also uses the sequential path for small networks
@@ -1110,8 +1108,8 @@ fn test_disjunctive_bab_respects_timeout_3388() {
     );
 }
 
-/// Regression for #4260: multi-objective root fallback must respect the warmup
-/// deadline from `#4095`. With `initial_bounds_fraction: 0.0`, the capped
+/// Regression: multi-objective root fallback must respect the warmup
+/// deadline. With `initial_bounds_fraction: 0.0`, the capped
 /// deadline expires instantly. The non-alpha fallback branches must use
 /// `bootstrap.alpha_config.deadline` (the capped value), not `None`.
 ///

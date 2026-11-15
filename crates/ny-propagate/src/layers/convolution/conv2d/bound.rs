@@ -4,15 +4,47 @@
 
 use ndarray::{Array2, ArrayD, ArrayViewD};
 use ny_core::{checked_shape_product, GemmEngine, NyError, Result};
-use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor, RepairStrategy};
+use ny_tensor::{next_up_f32, BoundedTensor, RepairStrategy};
 use std::borrow::Cow;
 use std::time::Instant;
 use tracing::{debug, warn};
 
 use super::super::crown_helpers::{
     compute_conv_bias_f64, compute_conv_bias_f64_with_poll, detect_and_fix_nonfinite_rows,
-    detect_and_fix_nonfinite_rows_with_poll, guard_nan_weights,
+    detect_and_fix_nonfinite_rows_with_poll, guard_nan_weights, higham_widen_ibp,
 };
+use super::bound_transpose::contains_binary32_subnormal;
+
+/// Replace every binary32 subnormal with `+0.0`, preserving all other bits.
+///
+/// This is the operand a DAZ device sees. Detection is by BITS, matching
+/// [`contains_binary32_subnormal`] — floating-point classification is exactly
+/// what DAZ perturbs, so it cannot be trusted to make this decision.
+fn flush_binary32_subnormals(values: &ArrayD<f32>) -> ArrayD<f32> {
+    values.mapv(|value| {
+        let magnitude = value.to_bits() & 0x7fff_ffff;
+        if magnitude != 0 && magnitude < f32::MIN_POSITIVE.to_bits() {
+            0.0
+        } else {
+            value
+        }
+    })
+}
+
+/// Elementwise union (hull) of two bounded tensors: `min` of lowers, `max` of
+/// uppers. Enclosing BOTH operands is what makes the `#daz-two-mode` arm sound
+/// regardless of which mode the device is in.
+fn union_bounded(a: &BoundedTensor, b: &BoundedTensor) -> Result<BoundedTensor> {
+    let mut lower = a.lower().clone();
+    ndarray::Zip::from(&mut lower)
+        .and(b.lower())
+        .for_each(|l, &o| *l = l.min(o));
+    let mut upper = a.upper().clone();
+    ndarray::Zip::from(&mut upper)
+        .and(b.upper())
+        .for_each(|u, &o| *u = u.max(o));
+    BoundedTensor::new_allow_infinite(lower, upper)
+}
 use super::ops_ibp_blocked::{
     certified_conv_ibp_route, conv2d_ibp_forward_grouped_certified_f64_blocked_with_deadline,
     ConvIbpBlockedRoute, CONV_IBP_BLOCK_MACS,
@@ -164,7 +196,7 @@ impl Conv2dLayer {
                     }
                 }
 
-                // Repair non-finite outputs for consistency with linear IBP (#3030).
+                // Repair non-finite outputs for consistency with linear IBP.
                 let result =
                     BoundedTensor::new_repaired(lower_y, upper_y, RepairStrategy::Conservative)?;
                 check_ibp_deadline(deadline, "before publishing the result")?;
@@ -248,7 +280,7 @@ impl Conv2dLayer {
                     }
                 }
 
-                // Repair non-finite outputs for consistency with linear IBP (#3030).
+                // Repair non-finite outputs for consistency with linear IBP.
                 let result =
                     BoundedTensor::new_repaired(lower_y, upper_y, RepairStrategy::Conservative)?;
                 check_ibp_deadline(deadline, "before publishing the batched result")?;
@@ -374,10 +406,80 @@ impl Conv2dLayer {
         engine: Option<&dyn GemmEngine>,
         deadline: Option<Instant>,
     ) -> Result<BoundedTensor> {
+        self.propagate_ibp_sound_inner(input, engine, deadline, false)
+    }
+
+    /// The certified IBP body. `assume_no_subnormal` is set only by the
+    /// `#daz-two-mode` union arm, whose operands are flushed by construction;
+    /// it makes the one-step recursion structurally obvious.
+    fn propagate_ibp_sound_inner(
+        &self,
+        input: &BoundedTensor,
+        engine: Option<&dyn GemmEngine>,
+        deadline: Option<Instant>,
+        assume_no_subnormal: bool,
+    ) -> Result<BoundedTensor> {
         if let Some(limit) = deadline {
             return self.propagate_ibp_sound_certified_f64_with_deadline(input, limit);
         }
         let y = self.propagate_ibp_with_engine(input, engine)?;
+
+        // DAZ can erase a subnormal source operand BEFORE multiplication. That
+        // lost contribution is not bounded by the binary32 underflow floor: the
+        // other (normal) operand can amplify it up to O(1), so the Higham
+        // widening below cannot repair it after the fact. Detect by BITS (not
+        // by floating-point classification, which DAZ itself would perturb) and
+        // fail open to the correctly shaped universal interval.
+        //
+        // Ported from ConvTranspose2d (`bound_transpose.rs:361`), which is the
+        // same construction and already carried this guard; Conv2d is the only
+        // member of the five-way conv family that had neither this refusal nor
+        // the FTZ floor below.
+        if !assume_no_subnormal
+            && (contains_binary32_subnormal(&self.kernel)
+                || contains_binary32_subnormal(input.lower())
+                || contains_binary32_subnormal(input.upper()))
+        {
+            // #daz-two-mode: DAZ is a MODE, not a per-element accident. On any
+            // given device either every subnormal operand of an operation is
+            // treated as zero or none is, so the hardware's true behaviour is
+            // one of exactly TWO functions: this layer with its subnormals
+            // intact, or the same layer with every subnormal operand flushed to
+            // zero. The elementwise union of the two certified IBP results
+            // therefore ENCLOSES whichever the device performs, which is all
+            // soundness requires — and it is enormously tighter than the
+            // universal interval this arm used to return.
+            //
+            // Why the universal interval was costing real proofs: two subnormal
+            // weights out of 60,826 in collins_rul_cnn_2022's
+            // NN_rul_small_window_20 (initializer `fc_1_W`, a 1x1 conv kernel)
+            // poisoned EVERY conv IBP in a Conv-only network, so the whole
+            // model concretized to +/-inf and three banked unsat rows (0.7-21 s)
+            // became `unknown` at the full 300 s budget with "BoundedTensor::
+            // concrete: values contain NaN or Inf". Flushing exactly those two
+            // weights restores the proof in 11.5 s, which is what identified
+            // this arm; bisected to a5ffc1bcc.
+            debug!(
+                "Conv2d certified IBP: subnormal kernel/input endpoint; \
+                 unioning the flushed and unflushed certified bounds \
+                 (#daz-two-mode)"
+            );
+            let flushed_kernel = flush_binary32_subnormals(&self.kernel);
+            let flushed_input = BoundedTensor::new_allow_infinite(
+                flush_binary32_subnormals(input.lower()),
+                flush_binary32_subnormals(input.upper()),
+            )?;
+            let flushed_layer = Self {
+                kernel: flushed_kernel,
+                ..self.clone()
+            };
+            // The flushed layer has NO subnormal operand by construction, so
+            // this recursion terminates in exactly one step.
+            let flushed =
+                flushed_layer.propagate_ibp_sound_inner(&flushed_input, engine, deadline, true)?;
+            let unflushed = self.propagate_ibp_sound_inner(input, engine, deadline, true)?;
+            return union_bounded(&unflushed, &flushed);
+        }
 
         // S_o = Σ_k |W_ok| · max(|x_l_k|, |x_u_k|): run the interval forward with the
         // absolute kernel (so W+ = |W|, W- = 0) on the degenerate `xmax` box.
@@ -403,58 +505,28 @@ impl Conv2dLayer {
         let s_bt = abs_layer.propagate_ibp_with_engine(&xmax_bounds, engine)?;
         let s = s_bt.lower(); // |kernel|, xmax ≥ 0 ⇒ lower == upper == S
 
-        // Higham growth factor γ_{K+2} (u = 2^-24), +2 covers the W+/W- combine and
-        // bias add on top of the K window MACs. Saturate to +inf if K·u ≥ 1.
+        // Per-output fan-in: in_per_group·kh·kw (stride/dilation only REDUCE tap
+        // count, padding taps are skipped, so this is an upper bound).
         let (kh, kw) = self.kernel_size();
         let in_per_group = self.in_channels() / self.groups;
         let macs = in_per_group.saturating_mul(kh).saturating_mul(kw);
-        let k = (macs.saturating_add(2)) as f64;
-        const U: f64 = 1.0 / (1u64 << 24) as f64; // f32 unit roundoff 2^-24
-        let gamma = if k * U < 1.0 {
-            (k * U) / (1.0 - k * U)
-        } else {
-            f64::INFINITY
-        };
-        // S_o is computed by a round-to-NEAREST f32 abs-conv, so S_f32 can fall SHORT
-        // of the true abssum S by up to its own Higham accumulation error γ_macs·S.
-        // Inflate it OUTWARD by 1/(1−γ_macs) ≥ that deficit so S_safe ≥ S_true —
-        // otherwise γ·S_f32 can UNDER-bound the true Higham error for very large convs
-        // (macs > ~5793, e.g. 1024-ch 3×3). (#vnncomp-aw-soundness self-audit.)
-        let gamma_macs = {
-            let m = macs as f64;
-            if m * U < 1.0 {
-                (m * U) / (1.0 - m * U)
-            } else {
-                f64::INFINITY
-            }
-        };
-        let s_inflate = if gamma_macs < 1.0 {
-            1.0 / (1.0 - gamma_macs)
-        } else {
-            f64::INFINITY
-        };
 
-        let (mut lower, mut upper) = (y.lower().to_owned(), y.upper().to_owned());
-        let widen = |lo_o: &mut f32, up_o: &mut f32, s_o: f32| {
-            let mag = (lo_o.abs()).max(up_o.abs()) as f64;
-            // err_o = up( γ·S_safe + 2u·|y_o| ): covers the K MACs (γ·S) plus the
-            // bias add / W+/W- combine roundings (2u·|y|). S_safe = S_f32·s_inflate
-            // ≥ S_true (S computed in round-to-nearest f32 above).
-            let s_safe = s_o as f64 * s_inflate;
-            let err = next_up_f32((gamma * s_safe + 2.0 * U * mag) as f32);
-            if err.is_finite() {
-                *lo_o = next_down_f32(*lo_o - err);
-                *up_o = next_up_f32(*up_o + err);
-            } else {
-                *lo_o = f32::NEG_INFINITY;
-                *up_o = f32::INFINITY;
-            }
-        };
-        ndarray::Zip::from(&mut lower)
-            .and(&mut upper)
-            .and(s)
-            .for_each(|lo_o, up_o, &s_o| widen(lo_o, up_o, s_o));
-        BoundedTensor::new_repaired(lower, upper, RepairStrategy::Conservative)
+        // Delegate to the canonical widening rather than hand-rolling it. The
+        // inline form this replaces charged only γ_{K+2}·S_safe + 2u·|y|, and so
+        // omitted three terms the helper carries:
+        //   * the binary32 FTZ absolute floor (n·2^-126/(1−n·u)), applied both
+        //     inside S_safe and in the error estimate. The Higham γ·S term is
+        //     purely RELATIVE and provably cannot see a flush-to-zero event —
+        //     see the exact-rational counterexample at crown_helpers.rs:1439.
+        //   * publication through `f64_to_f32_{down,up}_no_subnormal`, which
+        //     keeps the published endpoint on the normal grid instead of
+        //     landing in the subnormal range the FTZ term is accounting for.
+        //   * an `err >= 0` guard: the old arm tested only `is_finite()`, so a
+        //     negative certificate would have moved BOTH endpoints INWARD —
+        //     the one failure mode that turns a widening into a tightening.
+        // ConvTranspose2d, Conv1d, ConvTranspose1d and Conv3d were all already
+        // safe here; Conv2d was the sole hand-rolled outlier.
+        higham_widen_ibp(&y, s, macs)
     }
 
     /// Dispatch ONE certified f64 finite-deadline window forward to the
@@ -508,7 +580,7 @@ impl Conv2dLayer {
     /// Bias is folded into the kernel's f64 accumulation (and its abs-sum), so
     /// no separate bias pass runs. Engine-free by construction; the output is
     /// repaired conservatively for consistency with the other IBP arms
-    /// (#3030) and the deadline is re-checked before publication.
+    /// and the deadline is re-checked before publication.
     fn propagate_ibp_sound_certified_f64_with_deadline(
         &self,
         input: &BoundedTensor,
@@ -597,7 +669,7 @@ impl Conv2dLayer {
     /// Requires `input_shape` to be set for proper shape computation.
     ///
     /// Reference: linear/crown_single.rs `propagate_linear_with_engine` for the
-    /// same pattern applied to Linear layers (#3399).
+    /// same pattern applied to Linear layers.
     pub fn propagate_linear_with_engine<'a>(
         &self,
         bounds: &'a LinearBounds,
@@ -610,7 +682,7 @@ impl Conv2dLayer {
     ///
     /// When `deadline` is present, large GEMM workloads are chunked so the
     /// backward pass can abort inside a single Conv2d node instead of running
-    /// past the verifier timeout. Part of #3795.
+    /// past the verifier timeout.
     pub fn propagate_linear_with_engine_and_deadline<'a>(
         &self,
         bounds: &'a LinearBounds,
@@ -644,7 +716,7 @@ impl Conv2dLayer {
         // Guard: reject NaN weights at CROWN backward entry. The IBP path uses
         // nan_propagating_max_zero/min_zero which handle NaN in kernel splitting.
         // The CROWN path passes self.kernel directly to conv2d_transpose, which
-        // would silently produce NaN coefficient matrices. (#2747)
+        // would silently produce NaN coefficient matrices.
         guard_nan_weights(&self.kernel, self.bias.as_ref(), "Conv2d")?;
 
         let (out_h, out_w) = self.output_size(in_h, in_w)?;
@@ -670,16 +742,15 @@ impl Conv2dLayer {
 
         // Batched GEMM replaces per-row conv2d_transpose with per-group GEMM + col2im.
         // For groups=1, this is a single GEMM. For groups>1, each group gets its own GEMM.
-        // Design: designs/2026-03-06-conv-crown-backward-gemm.md (#3382).
-        // #3399: engine parameter enables GPU acceleration via GemmEngine.
-        // #3770: groups parameter enables depthwise/grouped convolutions.
+        // Engine parameter enables GPU acceleration via GemmEngine.
+        // Groups parameter enables depthwise/grouped convolutions.
         // Fused lower+upper conv_transpose. Both A-matrices share the same
         // Conv2d kernel, so the GPU engine keeps the per-group weight column
         // GPU-resident across the two and stacks them into one dispatch (pure
         // perf, bit-identical). On the CPU/dilated/chunked-deadline paths this
         // delegates to two independent per-matrix calls — identical to the
         // prior two-call behavior, including the inter-GEMM deadline check
-        // (#3795). See conv2d_transpose_pair_batched_gemm_grouped_with_deadline.
+        //See conv2d_transpose_pair_batched_gemm_grouped_with_deadline.
         // SOUND coefficient (#vnncomp-aw-soundness — conv f32-accumulation bug).
         // The f32 GEMM+col2im pair accumulates `Σ a·kernel` in f32; its real
         // error is `γ_n^f32·S` (~2^29× the f64 factor), NOT `γ_n^f64·S`. Using the
@@ -1288,7 +1359,7 @@ impl Conv2dLayer {
         }
 
         poll_authority()?;
-        // CROWN backward NaN firewall (#2812): conservative fallback instead of hard error.
+        // CROWN backward NaN firewall: conservative fallback instead of hard error.
         // SOUND transpose-conv coefficient interval carried via the error matrices.
         let published = if finite_authority {
             // Every coefficient row has just passed the pollable

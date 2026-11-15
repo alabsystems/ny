@@ -19,7 +19,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/_clean_pinned.sh"
 prepare_pinned_clean "$WORK/clean"
 
 OUT="$WORK/certs"; mkdir -p "$OUT"
-( cd "$NY_DIR" && cargo run -q --release -p ny-cert --example emit_sbar -- "$SEED_START" "$COUNT" "$OUT" )
+( cd "$NY_DIR" && targo --unverified run -q --release -p ny-cert --example emit_sbar -- "$SEED_START" "$COUNT" "$OUT" )
 BATCH="$WORK/sbar-certificates.json"
 python3 - "$OUT" "$BATCH" <<'PY'
 import json

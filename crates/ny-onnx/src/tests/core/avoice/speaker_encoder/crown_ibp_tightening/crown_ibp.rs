@@ -44,7 +44,7 @@ fn log_cosine_distance_comparison(ibp: &CosineDistanceResult, cibp: &CosineDista
     );
 }
 
-/// Compute adaptive width skip threshold from IBP bounds (#3499).
+/// Compute adaptive width skip threshold from IBP bounds.
 ///
 /// Returns the median `max_width()` across all nodes, scaled by a fraction.
 /// Nodes with IBP width below this threshold are already tight enough that
@@ -70,7 +70,7 @@ fn adaptive_width_threshold(ibp_bounds: &HashMap<String, BoundedTensor>, fractio
     threshold
 }
 
-/// Run CROWN-IBP tightening on the encoder and return tightened bounds (#3499).
+/// Run CROWN-IBP tightening on the encoder and return tightened bounds.
 fn tighten_encoder_bounds(
     base_graph: &GraphNetwork,
     input: &BoundedTensor,
@@ -127,7 +127,7 @@ fn tighten_encoder_bounds(
             )
         })
         .count();
-    // Log fallback reason distribution for diagnostic insight (#3499).
+    // Log fallback reason distribution for diagnostic insight.
     let mut reason_counts: HashMap<String, usize> = HashMap::new();
     for prov in cibp.provenance.values() {
         let key = match prov {
@@ -194,7 +194,7 @@ fn log_crown_ibp_acceptance(result: &CosineDistanceResult) {
 }
 
 /// Per-node CROWN-IBP tightening on the base encoder produces tighter cosine
-/// distance bounds than pure IBP intermediates (#3499).
+/// distance bounds than pure IBP intermediates.
 ///
 /// Uses a deadline to bound wall-clock time: ~5s per CROWN backward pass on
 /// the 187-node ECAPA-TDNN encoder, so the deadline controls how many nodes
@@ -218,7 +218,7 @@ fn test_speaker_cosine_crown_ibp_tightened_intermediates_improve_distance_3499()
 
     // Adaptive width threshold: skip CROWN for nodes whose IBP max_width
     // is below 10% of the median.  This saves ~5-7s per skipped node,
-    // allowing the budget to reach deeper layers (#3499).
+    // allowing the budget to reach deeper layers.
     let skip_threshold = adaptive_width_threshold(&ibp_bounds, 0.1);
 
     let budget = 300u64.saturating_sub(t_start.elapsed().as_secs());

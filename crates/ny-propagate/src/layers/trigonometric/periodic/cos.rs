@@ -64,11 +64,11 @@ pub(super) fn cos_bound_interval(l: f32, u: f32) -> (f32, f32) {
     }
 
     // Directed rounding: compute in f64, apply next_down/next_up for endpoint
-    // evaluations. Exact extrema (-1.0, 1.0) don't need rounding. (#3245)
+    // evaluations. Exact extrema (-1.0, 1.0) don't need rounding.
     let cl = (l as f64).cos() as f32;
     let cu = (u as f64).cos() as f32;
     // Range clamp: cos(x) ∈ [-1, 1]. Directed rounding can push past ±1
-    // for inputs near extrema (e.g., cos(ε) ≈ 1 → next_up > 1). (#3316)
+    // for inputs near extrema (e.g., cos(ε) ≈ 1 → next_up > 1).
     let mut min_val = next_down_f32(cl.min(cu)).max(-1.0);
     let mut max_val = next_up_f32(cl.max(cu)).min(1.0);
 
@@ -125,7 +125,6 @@ pub(super) fn cos_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
 
     // Narrow-interval tangent with directed rounding.
     // Adds slope-error compensation matching trig_tangent_secant_relaxation (common.rs:64-70).
-    // Fixes: #3190 — slope truncation error was not compensated.
     if (u - l).abs() < 1e-8 {
         let cos_l = (l as f64).cos();
         let slope = -(l as f64).sin();
@@ -215,7 +214,6 @@ impl CosLayer {
     }
 
     /// Patches CROWN backward propagation with pre-activation bounds.
-    /// Part of #2613 Phase 2: generic activation Patches support.
     pub(crate) fn propagate_patches_with_bounds(
         &self,
         bounds: &crate::bounds::patches::PatchesLinearBounds,

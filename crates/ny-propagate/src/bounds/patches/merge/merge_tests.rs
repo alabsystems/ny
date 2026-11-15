@@ -1241,3 +1241,132 @@ fn test_merge_7d_all_zero_rows_emit_smallest_subnormal_err() {
         }
     }
 }
+
+// #patches-merge-expiry: the native merge's transient-footprint receipt
+// (`native_merge_peak_bytes`), which a hard finite-authority join charges
+// against the CROWN dense budget before entering the non-pollable merge.
+
+/// Pinned on the real yolo_2023 `Conv_5` residual join: a `[16,52,52,3,7,7]`
+/// pad-3 carrier and a `[16,52,52,3,3,3]` pad-1 carrier. The narrow side pads
+/// to 7x7, so `S = 16*52*52*3*7*7` and `R = 16*52*52 = 43,264`; the receipt is
+/// `(12 S + 16 R) * 4` bytes = 308,039,680 (~294 MiB) in either arrival order —
+/// against the ~22.5 GB the Dense promotion asked for the same join.
+#[test]
+fn native_merge_receipt_is_exact_on_the_yolo_conv5_join() {
+    let wide = make_simple_patches(
+        (16, 52, 52),
+        (3, 52, 52),
+        (7, 7),
+        (1, 1),
+        (3, 3, 3, 3),
+        0.01,
+        0.51,
+    );
+    let narrow = make_simple_patches(
+        (16, 52, 52),
+        (3, 52, 52),
+        (3, 3),
+        (1, 1),
+        (1, 1, 1, 1),
+        0.02,
+        0.52,
+    );
+    let side_elements = 16 * 52 * 52 * 3 * 7 * 7;
+    let row_elements = 16 * 52 * 52;
+    let expected = (12 * side_elements + 16 * row_elements) * size_of::<f32>();
+    assert_eq!(expected, 308_039_680);
+    assert_eq!(
+        wide.native_merge_peak_bytes(&narrow).unwrap(),
+        Some(expected)
+    );
+    assert_eq!(
+        narrow.native_merge_peak_bytes(&wide).unwrap(),
+        Some(expected)
+    );
+}
+
+/// A virtual identity is charged at its MATERIALIZED, padded size
+/// (`[C,H,W,C,1,1]` grown to the peer's 5x5 window), in either arrival order —
+/// the yolo_2023 `Add_8` join shape with channels reduced to 4.
+#[test]
+fn native_merge_receipt_charges_a_virtual_identity_at_its_padded_size() {
+    let identity = PatchesLinearBounds::identity((4, 52, 52), (4, 52, 52));
+    let branch = make_simple_patches(
+        (4, 52, 52),
+        (4, 52, 52),
+        (5, 5),
+        (1, 1),
+        (2, 2, 2, 2),
+        0.01,
+        0.51,
+    );
+    let side_elements = 4 * 52 * 52 * 4 * 5 * 5;
+    let row_elements = 4 * 52 * 52;
+    let expected = (12 * side_elements + 16 * row_elements) * size_of::<f32>();
+    assert_eq!(
+        identity.native_merge_peak_bytes(&branch).unwrap(),
+        Some(expected)
+    );
+    assert_eq!(
+        branch.native_merge_peak_bytes(&identity).unwrap(),
+        Some(expected)
+    );
+}
+
+/// The receipt shares `try_merge_inplace`'s preflight: every pair the native
+/// operator declines reports `None` (no merge will run, nothing to charge), so
+/// a hard-authority join keeps the legacy Dense route for it unchanged.
+#[test]
+fn native_merge_receipt_is_none_exactly_when_the_merge_declines() {
+    let mut incomparable_a =
+        make_simple_patches((2, 3, 3), (2, 3, 3), (3, 3), (1, 1), (2, 0, 1, 1), 0.5, 1.0);
+    let incomparable_b =
+        make_simple_patches((2, 3, 3), (2, 3, 3), (3, 3), (1, 1), (0, 2, 1, 1), 0.5, 1.0);
+    assert_eq!(
+        incomparable_a
+            .native_merge_peak_bytes(&incomparable_b)
+            .unwrap(),
+        None
+    );
+    assert!(!incomparable_a.try_merge_inplace(&incomparable_b).unwrap());
+
+    let mut stride_a =
+        make_simple_patches((2, 1, 1), (2, 3, 3), (3, 3), (1, 1), (0, 0, 0, 0), 0.5, 1.0);
+    let stride_b =
+        make_simple_patches((2, 1, 1), (2, 3, 3), (3, 3), (2, 2), (0, 0, 0, 0), 0.5, 1.0);
+    assert_eq!(stride_a.native_merge_peak_bytes(&stride_b).unwrap(), None);
+    assert!(!stride_a.try_merge_inplace(&stride_b).unwrap());
+
+    let mut anchored =
+        make_simple_patches((1, 2, 2), (1, 3, 3), (2, 2), (1, 1), (0, 0, 0, 0), 0.5, 1.0);
+    let peer = anchored.clone();
+    let geometry = PatchGeometry::anchored(vec![0, 1], vec![0, 1]).unwrap();
+    anchored.lower_a.geometry = geometry.clone();
+    anchored.upper_a.geometry = geometry;
+    assert_eq!(anchored.native_merge_peak_bytes(&peer).unwrap(), None);
+    assert!(!anchored.try_merge_inplace(&peer).unwrap());
+
+    let mut compatible_a = make_simple_patches(
+        (2, 3, 3),
+        (2, 3, 3),
+        (3, 3),
+        (1, 1),
+        (1, 1, 1, 1),
+        0.25,
+        0.75,
+    );
+    let compatible_b = make_simple_patches(
+        (2, 3, 3),
+        (2, 3, 3),
+        (3, 3),
+        (1, 1),
+        (1, 1, 1, 1),
+        0.125,
+        0.5,
+    );
+    assert_eq!(
+        compatible_a.native_merge_peak_bytes(&compatible_b).unwrap(),
+        Some((12 * (2 * 3 * 3 * 2 * 3 * 3) + 16 * (2 * 3 * 3)) * size_of::<f32>())
+    );
+    assert!(compatible_a.try_merge_inplace(&compatible_b).unwrap());
+}

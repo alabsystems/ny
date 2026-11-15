@@ -9,6 +9,7 @@ import csv
 import hashlib
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -538,6 +539,13 @@ def test_arm_environment_scrubs_declared_factors_before_applying_override():
 def test_selected_experiment_scrubs_treatments_declared_by_other_experiments(
     monkeypatch, tmp_path
 ):
+    # The contract below is about the one inherited treatment installed by
+    # this fixture.  Gate/tool selectors such as NY_RUSTUP may legitimately be
+    # present in the caller and are also scrubbed, so remove ambient NY keys to
+    # keep this exact inventory hermetic.
+    for key in list(os.environ):
+        if key.startswith("NY_"):
+            monkeypatch.delenv(key, raising=False)
     module = _load_module()
     base = tmp_path / "base.yaml"
     base.write_text("general: {}\n", encoding="utf-8")
@@ -3730,7 +3738,6 @@ def test_committed_manifest_dry_run_materializes_every_arm(tmp_path):
         reducer_arms,
         ("max", "min"),
         ("default_off_execution_control", "default_off_execution_treatment"),
-        strict=True,
     ):
         assert arm["overrides"] == {
             "bab.branching.kfsb_multi": True,

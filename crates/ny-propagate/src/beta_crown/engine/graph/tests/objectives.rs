@@ -7,8 +7,6 @@
 //! Tests `objective_bounds_multi`, `propagate_multi_objective_with_beta`,
 //! and `optimize_graph_beta_analytical_multi_objective` including the
 //! `best_beta_snapshot` comparison logic.
-//!
-//! Issue: #1892 (AC5)
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -678,7 +676,7 @@ fn test_multi_objective_analytical_optimization() {
     assert!(!node_cache.is_empty());
 }
 
-/// Regression test for #4306: multi-objective analytical optimization should
+/// Regression test: multi-objective analytical optimization should
 /// evaluate all objectives through the batched spec-matrix path.
 ///
 /// With zero Adam learning rate, the optimization loop still executes but beta
@@ -862,7 +860,7 @@ fn test_multi_objective_all_verified_mask() {
     assert!(obj_bounds[0].0.is_finite());
 }
 
-/// Regression for #3813: child-domain multi-objective propagation should prune
+/// Regression: child-domain multi-objective propagation should prune
 /// already-verified OR-specs while preserving a live finite authority.
 ///
 /// An already-expired authority is now terminal before any spec row starts, so
@@ -924,10 +922,10 @@ fn test_multi_objective_pruned_targets_skip_verified_deadline_slot_3813() {
 }
 
 // ============================================================
-// #3109: multi-objective β-opt deadline granularity
+// Multi-objective β-opt deadline granularity
 // ============================================================
 
-/// Regression for the multi-objective β-opt deadline-granularity fix (#3109),
+/// Regression for the multi-objective β-opt deadline-granularity fix,
 /// "already past" case.
 ///
 /// IMPORTANT: `BetaCrownVerifier::new` (engine/core.rs) OVERWRITES
@@ -996,7 +994,7 @@ fn test_multi_objective_beta_opt_past_deadline_bails_promptly_3109() {
     );
 }
 
-/// Core regression for the #3109 fix: a deadline reached *during* the loop must
+/// Core regression: a deadline reached *during* the loop must
 /// break out and return the best bounds captured from a COMPLETED iteration,
 /// WITHOUT running (or erroring on) the final spec-guided pass + snapshot eval.
 ///

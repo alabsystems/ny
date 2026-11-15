@@ -477,7 +477,7 @@ pub(crate) fn build_verification_spec(
             load_vnnlib(prop_path)?
         };
 
-        // Apply shrink_eps at f64 precision before f32 conversion (#4299).
+        // Apply shrink_eps at f64 precision before f32 conversion.
         // Reference: alpha-beta-CROWN `shrink_vnnlib` (`specifications.py:535-540`).
         if let Some(eps) = shrink_eps {
             shrink_vnnlib_input_bounds_checked(&mut vnnlib, eps)?;

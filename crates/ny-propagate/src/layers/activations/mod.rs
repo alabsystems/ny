@@ -12,7 +12,7 @@ use ny_tensor::next_up_f32;
 /// for `x` in `[l, u]`.
 ///
 /// Replaces bare `(f32, f32, f32, f32)` tuples — named fields prevent silent field swaps
-/// that would produce unsound bounds. Part of #2978.
+/// that would produce unsound bounds.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[must_use]
 pub struct LinearRelaxation {
@@ -120,7 +120,7 @@ pub(crate) fn relu_crossing_upper_chord(l: f32, u: f32, min_width: Option<f32>) 
 }
 
 /// Bridge conversion: legacy `(lower_slope, lower_intercept, upper_slope, upper_intercept)` tuple
-/// to the validated struct. Used during the #2978 migration for call sites not yet converted.
+/// to the validated struct. Used by call sites not yet migrated to the struct.
 impl From<(f32, f32, f32, f32)> for LinearRelaxation {
     #[inline]
     fn from(
@@ -173,6 +173,7 @@ mod thresholded_relu;
 pub(crate) mod validate;
 
 pub use celu::CeluLayer;
+pub(crate) use clip::clip_linear_relaxation;
 pub use clip::ClipLayer;
 pub use elu::EluLayer;
 pub use exp::exp_linear_relaxation;

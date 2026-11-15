@@ -9,6 +9,49 @@ use ny_core::NyError;
 
 use super::*;
 
+#[test]
+fn fixed_rank_capacity_observer_reuses_pointer_offset_overflow_checks_and_moves_exact_owner() {
+    for corruption in 0..3 {
+        let (original, expected) = spare_weight(128);
+        let before = original.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        let mut tracked = TrackedLinearArray::new(original);
+        assert_eq!(
+            tracked.observed_payload_bytes_v1().unwrap(),
+            Some(expected.capacity * 4)
+        );
+        let TrackedArrayStateV1::Accounted(mut state) = tracked.allocation else {
+            panic!("fixture is accounted")
+        };
+        match corruption {
+            0 => state.logical_data_identity = state.logical_data_identity.wrapping_add(4),
+            1 => state.logical_offset = Some(usize::MAX),
+            2 => state.element_capacity = usize::MAX,
+            _ => unreachable!(),
+        }
+        tracked.allocation = TrackedArrayStateV1::Accounted(state);
+        assert!(matches!(
+            tracked.observed_payload_bytes_v1(),
+            Err(NyError::InvalidSpec(_))
+        ));
+        let original = tracked.into_array();
+        assert_eq!(original.as_ptr() as usize, expected.logical);
+        assert_eq!(
+            original.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            before
+        );
+    }
+    let (original, expected) = spare_weight(64);
+    let original = original.reversed_axes();
+    let ptr = original.as_ptr();
+    let strides = original.strides().to_vec();
+    let tracked = TrackedLinearArray::new(original);
+    assert!(tracked.observed_payload_bytes_v1().unwrap().is_none());
+    let original = tracked.into_array();
+    assert_eq!(original.as_ptr(), ptr);
+    assert_eq!(original.strides(), strides);
+    assert_eq!(original.as_ptr() as usize, expected.logical);
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RawExpectation {
     base: usize,

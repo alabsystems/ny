@@ -58,7 +58,7 @@ fn build_two_relu_graph() -> (GraphNetwork, BoundedTensor, GraphBabDomain, Vec<S
     (graph, input, domain, relu_nodes)
 }
 
-/// Integration test for #2767: verify multi-depth branching with split_depth > 1
+/// Integration test: verify multi-depth branching with split_depth > 1
 /// enters the multi-depth code path and doesn't crash.
 #[ntest::timeout(10000)]
 #[test]
@@ -122,7 +122,7 @@ fn parallel_fallback_caps_parent_at_max_depth_minus_one() {
     );
 }
 
-/// Regression test for #1915: if graph branch selection fails in the parallel
+/// Regression test: if graph branch selection fails in the parallel
 /// path, domain processing must return `PropagationFailure` instead of silently
 /// continuing with stale state.
 #[ntest::timeout(5000)]

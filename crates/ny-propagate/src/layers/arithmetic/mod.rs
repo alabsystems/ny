@@ -25,8 +25,10 @@ mod validate;
 mod abs;
 mod pow;
 pub(crate) mod pow_relaxation;
-mod sqrt;
+pub(crate) mod sqrt;
 
+#[cfg(test)]
+mod add_constant_broadcast_tests;
 #[cfg(test)]
 mod tests;
 
@@ -41,7 +43,7 @@ pub use pow::PowConstantLayer;
 pub use pow_relaxation::pow2_linear_relaxation;
 pub use sqrt::SqrtLayer;
 
-// Re-export relaxation functions for decomposed normalization CROWN (#318)
-// and tests (#3240).
+// Re-export relaxation functions for decomposed normalization CROWN
+// and tests.
 pub use abs::abs_linear_relaxation;
 pub use sqrt::sqrt_linear_relaxation;

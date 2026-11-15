@@ -26,9 +26,9 @@ Suites:
   all          Every external-data and hardware test
 
 Examples:
-  cargo run -p ny-onnx --bin ny_onnx_conformance -- whisper --lib
-  cargo run -p ny-onnx --bin ny_onnx_conformance -- vnncomp --release
-  cargo run -p ny-onnx --release --features external-vnncomp \
+  targo --unverified run -p ny-onnx --bin ny_onnx_conformance -- whisper --lib
+  targo --unverified run -p ny-onnx --bin ny_onnx_conformance -- vnncomp --release
+  targo --unverified run -p ny-onnx --release --features external-vnncomp \
       --example vit-zero-width-node-bisect -- scan
 
 Model-backed tests honor NY_TEST_MODELS_DIR.  Individual tests print their
@@ -88,8 +88,17 @@ fn main() -> ExitCode {
     };
 
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+    // `$CARGO` is the build tool running this (targo in the Trust toolchain,
+    // owner directive 2026-09-28); targo otherwise. targo builds only in a
+    // named lane, so it is handed `--unverified`; a stock cargo has no lanes.
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("targo"));
+    let is_targo = Path::new(&cargo)
+        .file_stem()
+        .is_some_and(|stem| stem == "targo");
     let mut command = Command::new(cargo);
+    if is_targo {
+        command.arg("--unverified");
+    }
     command
         .current_dir(workspace)
         .args(["test", "-p", "ny-onnx", "--features", features]);
@@ -107,11 +116,12 @@ fn main() -> ExitCode {
             .collect::<Vec<_>>()
             .join(" ")
     );
+    let program = quoted(command.get_program());
     match command.status() {
         Ok(status) if status.success() => ExitCode::SUCCESS,
         Ok(status) => ExitCode::from(status.code().unwrap_or(1).clamp(1, 255) as u8),
         Err(error) => {
-            eprintln!("failed to launch cargo test: {error}");
+            eprintln!("failed to launch {program} test: {error}");
             ExitCode::FAILURE
         }
     }

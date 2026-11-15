@@ -4,11 +4,6 @@
 
 //! Tests for `propagate_crown_with_specs_and_engine_with_bounds` — the precomputed
 //! node-bounds path in spec-guided CROWN.
-//!
-//! Covers #1959 acceptance criteria:
-//! - Direct tests exist for `propagate_crown_with_specs_and_engine_with_bounds`
-//!
-//! Reference: designs/2026-02-10-network-beta-crown-coverage-wave-plan.md Step 2
 
 use crate::*;
 use ndarray::{arr1, arr2, ArrayD, IxDyn};
@@ -386,7 +381,7 @@ fn test_spec_with_tighter_precomputed_bounds_gives_tighter_results() {
     );
 }
 
-/// Run spec-guided CROWN with optional fixed/reference node bounds. Helper for #3870 test.
+/// Run spec-guided CROWN with optional fixed/reference node bounds. Helper for the reference-bounds test.
 fn run_spec_crown_3870(
     graph: &GraphNetwork,
     input: &BoundedTensor,
@@ -670,7 +665,6 @@ fn test_spec_batched_matches_per_row_relu_graph() {
 
 /// Build graph: input [2,3] / (ReduceSum(input, axis=-1, keepdims=true) + 3.0) → [2,3].
 /// Leading-axis broadcast [2,3] / [2,1] — the L2-normalization pattern.
-/// Part of #3626, #3499.
 fn build_leading_axis_broadcast_div_graph() -> GraphNetwork {
     use ndarray::{ArrayD, IxDyn};
 
@@ -713,7 +707,7 @@ fn eval_leading_axis_broadcast_div(x: &[f32; 6]) -> [f32; 6] {
 ///
 /// Before the fix, flat stride `elem += b_len` grouped {0,2,4} and {1,3,5}
 /// instead of the correct {0,1,2} and {3,4,5} for leading-axis broadcasts.
-/// Part of #3626, #3499. Requested by Prover audit of commit 021ded490.
+/// Requested by Prover audit of commit 021ded490.
 #[ntest::timeout(60000)]
 #[test]
 fn test_div_crown_leading_axis_broadcast_regression_3626() {
@@ -778,7 +772,6 @@ fn test_div_crown_leading_axis_broadcast_regression_3626() {
 /// Element-wise Div (b_len == n) where the numerator can be negative.
 /// This exercises the element-wise branch in spec_propagation.rs, which
 /// is distinct from the broadcasting branch tested by the _3626 regression test.
-/// Part of #3626.
 fn build_elementwise_div_graph() -> GraphNetwork {
     use ndarray::{ArrayD, IxDyn};
 
@@ -805,7 +798,7 @@ fn eval_elementwise_div(x: &[f32; 2]) -> [f32; 2] {
 
 /// Soundness test: element-wise Div CROWN with mixed-sign numerator.
 ///
-/// Counterexample from reports/prover/2026-03-12-issue-3626-div-crown-audit.md:
+/// Counterexample from the Prover audit:
 /// For x ∈ [-1, 0], num(x) = x, den(x) = x + 2, y(x) = x/(x+2).
 /// At x = -0.5: actual = -0.333..., element-wise interval scaling gives -0.25 (unsound).
 ///
@@ -815,8 +808,8 @@ fn eval_elementwise_div(x: &[f32; 2]) -> [f32; 2] {
 /// y ≈ a_scaled * num cannot simultaneously be a lower bound for both positive
 /// and negative numerator values.
 ///
-/// Part of #3626. Filed by Prover: confirms the audit report counterexample
-/// exercises the actual code path and produces an unsound bound.
+/// Filed by Prover: drives the audit counterexample through the actual code path
+/// and requires every sampled output to lie within the CROWN bounds.
 #[ntest::timeout(60000)]
 #[test]
 fn test_elementwise_div_crown_soundness_mixed_sign_3626() {
@@ -867,7 +860,7 @@ fn test_elementwise_div_crown_soundness_mixed_sign_3626() {
     );
 }
 
-/// Build the #3680 extracted-stage reproducer graph:
+/// Build the extracted-stage reproducer graph:
 /// `_input [1,1,5] → slice(axis=-1, 1..4) → pad(constant, +1/+1)
 ///                  → conv1d(1→1, k=2) → add(skip_slice) → out [1,1,4]`
 ///
@@ -920,7 +913,7 @@ fn build_extracted_stage_graph_3680() -> (GraphNetwork, BoundedTensor) {
     (graph, input)
 }
 
-/// Regression #3680: spec-guided CROWN must accept identity spec on an
+/// Regression: spec-guided CROWN must accept identity spec on an
 /// extracted-subgraph with N-D target (Slice → Pad → Conv1d → Add skip).
 ///
 /// Exercises the spec-propagation path through

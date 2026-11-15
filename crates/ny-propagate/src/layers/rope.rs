@@ -94,8 +94,7 @@ impl RopeLayer {
                 )));
             }
             // RoPE tables are only valid rotations when each stored `(cos, sin)` pair
-            // stays on the unit circle. Reference:
-            // designs/archive/2026-02-28-rope-layer-ibp-crown-propagation.md
+            // stays on the unit circle.
             let norm_sq = f64::from(c).mul_add(f64::from(c), f64::from(s) * f64::from(s));
             if (norm_sq - 1.0).abs() > UNIT_ROTATION_TOLERANCE {
                 return Err(NyError::InvalidSpec(format!(
@@ -170,8 +169,6 @@ impl RopeLayer {
 /// what a single ULP adjustment can recover. Directed rounding (`next_down_f32` /
 /// `next_up_f32`) is applied after casting back to f32, ensuring the computed interval
 /// always contains the true output.
-///
-/// Reference: designs/2026-02-28-rope-layer-ibp-crown-propagation.md
 #[inline]
 fn linear_combination_bounds(
     a: f32,
@@ -292,7 +289,7 @@ impl BoundPropagation for RopeLayer {
             // Accumulate in f64 to prevent intermediate product rounding from
             // compounding beyond what concretization's directed rounding can recover.
             // Directed rounding on f64→f32 cast: lower_a rounds DOWN, upper_a rounds UP.
-            // This is sound regardless of coefficient sign — see R1 proof on #3308.
+            // This is sound regardless of coefficient sign.
             let c = self.cos_freqs[i] as f64;
             let s = self.sin_freqs[i] as f64;
             let col_even = 2 * i;
@@ -374,7 +371,7 @@ impl RopeLayer {
         for b in 0..total_batch {
             for i in 0..self.num_pairs() {
                 // Accumulate in f64 (same rationale as propagate_linear).
-                // Directed rounding: lower_a DOWN, upper_a UP (#3308).
+                // Directed rounding: lower_a DOWN, upper_a UP.
                 let c = self.cos_freqs[i] as f64;
                 let s = self.sin_freqs[i] as f64;
                 let col_even = 2 * i;

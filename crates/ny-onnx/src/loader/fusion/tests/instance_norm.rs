@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Unit tests for InstanceNorm/LayerNorm discrimination (#3591).
+//! Unit tests for InstanceNorm/LayerNorm discrimination.
 //!
 //! The discriminator `try_discriminate_instance_norm` takes a `LayerSpec`
 //! already typed as `LayerNorm` (from `try_fuse_layer_norm`) and remaps it
@@ -159,7 +159,7 @@ fn test_discriminate_4d_channel_dim_remaps_to_instance_norm() {
 }
 
 // ---------------------------------------------------------------------------
-// End-to-end proto-level integration tests (#3591)
+// End-to-end proto-level integration tests
 //
 // These exercise the full ONNX proto → try_fuse_layer_norm →
 // try_discriminate_instance_norm pipeline. The discriminator unit tests
@@ -197,7 +197,7 @@ fn build_maps(
 /// This is the exact pattern the kokoro vocoder's AdaIN produces after
 /// freezing the style auxiliary input.
 ///
-/// Part of #3591: integration test for proto-level InstanceNorm fusion.
+/// Integration test for proto-level InstanceNorm fusion.
 #[test]
 fn test_full_pipeline_3d_channel_ny_produces_instance_norm_3591() {
     // Build decomposed ReduceMean→Sub→Mul(self)→ReduceMean→Add(eps)→Sqrt→
@@ -265,7 +265,7 @@ fn test_full_pipeline_3d_channel_ny_produces_instance_norm_3591() {
 /// Full pipeline: same normalization pattern but with ny matching the
 /// last (reduced) dim should stay as LayerNorm after discrimination.
 ///
-/// Part of #3591: negative integration test for proto-level discrimination.
+/// Negative integration test for proto-level discrimination.
 #[test]
 fn test_full_pipeline_3d_last_dim_ny_stays_layer_norm_3591() {
     let mut mean1 = make_node("ReduceMean", &["x"], &["mean1"]);

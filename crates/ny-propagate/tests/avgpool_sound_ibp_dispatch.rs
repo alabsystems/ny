@@ -28,6 +28,7 @@ use ny_propagate::{GraphNetwork, Layer, Network};
 use ny_tensor::{next_up_f32, BoundedTensor};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
+use std::time::{Duration, Instant};
 
 const TWO30: f32 = 1_073_741_824.0; // 2^30
 const TINY: f32 = 1.0 / 1_073_741_824.0; // 2^-30 exactly (power-of-two divide is exact)
@@ -108,6 +109,62 @@ fn layer_sound_ibp_encloses_under_cancellation() {
     let (layer, input) = cancellation_case();
     let sound = layer.propagate_ibp_sound(&input).unwrap();
     assert_encloses_true_avg(&sound, "AveragePoolLayer::propagate_ibp_sound");
+}
+
+/// The graph-alpha node-bound collectors feed nonlinear relaxations and must
+/// not take the generic AveragePool arm. Exercise the cancellation falsifier
+/// through both deadline authorities and pin that the authority itself cannot
+/// change the published box.
+#[test]
+fn graph_alpha_collectors_use_certified_avgpool_under_both_deadline_authorities() {
+    let (layer, input) = cancellation_case();
+    let graph = GraphNetwork::from_sequential(&single_layer_network(layer)).unwrap();
+
+    let without_deadline = graph
+        .collect_node_bounds_with_engine(&input, None)
+        .expect("deadline-free graph-alpha node bounds");
+    let without_deadline = without_deadline
+        .get("layer_0")
+        .expect("single sequential layer is named layer_0");
+    assert_encloses_true_avg(
+        without_deadline,
+        "GraphNetwork::collect_node_bounds_with_engine AveragePool",
+    );
+
+    let with_deadline = graph
+        .collect_node_bounds_with_engine_and_deadline(
+            &input,
+            None,
+            Some(Instant::now() + Duration::from_secs(60)),
+        )
+        .expect("finite-deadline graph-alpha node bounds");
+    let with_deadline = with_deadline
+        .get("layer_0")
+        .expect("single sequential layer is named layer_0");
+    assert_encloses_true_avg(
+        with_deadline,
+        "GraphNetwork::collect_node_bounds_with_engine_and_deadline AveragePool",
+    );
+
+    let endpoint_bits = |bounds: &BoundedTensor| {
+        (
+            bounds
+                .lower()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            bounds
+                .upper()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(
+        endpoint_bits(without_deadline),
+        endpoint_bits(with_deadline),
+        "AveragePool node boxes must not depend on deadline authority"
+    );
 }
 
 /// Dispatch pinning: every SOUND driver must route AveragePool to the certified
@@ -251,7 +308,7 @@ fn sound_ibp_encloses_exact_reference_on_random_mixed_sign_windows() {
             &layer.propagate_ibp_sound(&input).unwrap(),
             "AveragePoolLayer::propagate_ibp_sound",
         );
-        let net = single_layer_network(layer.clone());
+        let net = single_layer_network(layer);
         check(
             &net.propagate_ibp_sound(&input).unwrap(),
             "Network::propagate_ibp_sound",

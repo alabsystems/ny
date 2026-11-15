@@ -39,7 +39,7 @@ fn resolve_reduction_axes(axes: &[i64], ndim: usize, layer_name: &str) -> Result
         .collect::<Result<Vec<_>>>()?;
 
     // Reject duplicate axes — double-reduction produces wrong bounds or panics
-    // when `output_shape.remove(axis)` shifts indices. (#2946)
+    // when `output_shape.remove(axis)` shifts indices.
     let mut seen = std::collections::HashSet::new();
     for &axis in &resolved {
         if !seen.insert(axis) {
@@ -188,7 +188,6 @@ fn reduce_backward(
 
     // Guard: zero-sized dimension in input causes zero strides, which panics
     // in the flat-index decomposition below (`remaining / stride` where stride=0).
-    // Part of #2816.
     if input_shape.contains(&0) {
         return Err(NyError::InvalidSpec(
             "reduce_backward: input has zero-sized dimension".to_string(),
@@ -416,7 +415,7 @@ impl BoundPropagation for ReduceMeanLayer {
         }
 
         // Directed-cast the f64 accumulators OUTWARD to f32 (lower down, upper up), then the
-        // centralized NaN/Inf repair (#3423). The directed cast is what makes the box ENCLOSE
+        // centralized NaN/Inf repair. The directed cast is what makes the box ENCLOSE
         // the true value past the f32 grid (#vnncomp-aw-soundness self-audit). Sign witnesses
         // keep provably sign-bounded reductions (mean of non-negatives, e.g. variances) from
         // being stepped across zero — see `directed_cast_with_sign_witness`.
@@ -472,7 +471,7 @@ impl ReduceMeanLayer {
                     axes
                 ))
             })?;
-        // Guard: zero reduction count produces Inf scale. (#2816)
+        // Guard: zero reduction count produces Inf scale.
         if reduction_count == 0 {
             return Err(NyError::InvalidSpec(
                 "ReduceMean: reduction over zero-sized axes".to_string(),
@@ -540,8 +539,18 @@ impl BoundPropagation for ReduceSumLayer {
             // Compute sum along this axis (in f64)
             let axis_obj = Axis(axis);
 
-            let new_lower = lower.sum_axis(axis_obj);
-            let new_upper = upper.sum_axis(axis_obj);
+            // `sum_axis` accumulates round-to-NEAREST, and that chain is the only
+            // error in this node (the f32->f64 widening above is exact). Charge it
+            // with the exact-residual sum (idiom (c)), the same machinery the
+            // ReduceMean sibling in this file already uses. Enclosures compose
+            // across axes because the fold is monotone in each operand: take the
+            // DOWN end for the lower box and the UP end for the upper box.
+            let new_lower = lower.map_axis(axis_obj, |lane| {
+                certified_mean::certified_sum_enclosure(lane.iter().copied()).0
+            });
+            let new_upper = upper.map_axis(axis_obj, |lane| {
+                certified_mean::certified_sum_enclosure(lane.iter().copied()).1
+            });
 
             if self.keepdims {
                 // Insert a dimension of size 1 at the reduced axis
@@ -568,7 +577,7 @@ impl BoundPropagation for ReduceSumLayer {
         }
 
         // Directed-cast the f64 accumulators OUTWARD to f32 (lower down, upper up), then the
-        // centralized NaN/Inf repair (#3423). The directed cast is what makes the box ENCLOSE
+        // centralized NaN/Inf repair. The directed cast is what makes the box ENCLOSE
         // the true value past the f32 grid (#vnncomp-aw-soundness self-audit). Sign witnesses
         // keep provably sign-bounded reductions (sums of non-negatives, e.g. sums of squares)
         // from being stepped across zero — see `directed_cast_with_sign_witness`.

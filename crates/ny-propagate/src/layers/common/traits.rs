@@ -91,9 +91,6 @@ pub trait BoundPropagation {
 /// Linear layers implement `propagate_patches()`. Nonlinear layers (activations)
 /// implement `propagate_patches_with_bounds()` to receive pre-activation bounds
 /// for computing relaxation slopes.
-///
-/// Reference: designs/2026-02-28-patches-mode-wrapper-enum-design.md
-/// Part of #2613
 pub(crate) trait PatchesPropagation {
     /// CROWN backward with Patches coefficients (for LINEAR layers).
     /// Returns either Patches (preserving sparse structure) or Dense

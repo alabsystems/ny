@@ -13,8 +13,6 @@
 //! verify the single-ReLU backward pass. These tests verify the full
 //! graph-level integration: alpha initialization, backward pass threading,
 //! gradient computation, and optimizer update across multiple layers.
-//!
-//! Part of #3393.
 
 use crate::bounds::AlphaCrownConfig;
 use crate::tests::proptest_soundness::{sample_points, valid_interval, FP_TOLERANCE};
@@ -76,7 +74,7 @@ fn proptest_alpha_config() -> AlphaCrownConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Deterministic test: Dual-alpha divergence and tightness (#3393 AC item 4)
+// Deterministic test: Dual-alpha divergence and tightness
 // ---------------------------------------------------------------------------
 
 /// Build a Linear(2→4)→ReLU→Linear(4→2) graph for alpha-CROWN testing.
@@ -115,7 +113,7 @@ fn total_width(bounds: &BoundedTensor) -> f32 {
         .sum()
 }
 
-/// Test #3393 AC item 4: Dual-alpha optimization produces tighter intermediate
+/// Dual-alpha optimization produces tighter intermediate
 /// bounds than baseline. Both lower and upper alphas are populated and
 /// updated after optimization. With SPSA gradients, both paths receive the
 /// same gradient so they converge to the same values (divergence requires
@@ -142,7 +140,7 @@ fn test_dual_alpha_tighter_intermediate_bounds_3393() {
 
     // Verify both lower and upper alphas are populated and equal (SPSA uses
     // the same gradient for both paths, so they converge).  Divergence is
-    // only expected with analytic per-path gradients (#3782 Slice 1).
+    // only expected with analytic per-path gradients.
     for (node_name, lower_alpha) in &alpha_state.alphas {
         let upper_alpha = alpha_state
             .alphas_upper
@@ -194,8 +192,6 @@ proptest! {
     /// pass grad_upper threading, and dual optimizer updates.
     ///
     /// Network: Linear(2->3) -> ReLU -> Linear(3->2) -> ReLU
-    ///
-    /// Part of #3393.
     #[ntest::timeout(60000)]
     #[test]
     fn proptest_graph_alpha_crown_sequential_dual_alpha_soundness(
@@ -206,6 +202,11 @@ proptest! {
         (l1, u1) in valid_interval(2.0),
         (l2, u2) in valid_interval(2.0),
     ) {
+        // Seed-sensitive: the SPSA trajectory reads the process-global
+        // restart offset; serialize against offset writers (random.rs
+        // `restart_offset_test_lock` — the 2026-08-30 root-caused flake).
+        let _serial = random::restart_offset_test_lock();
+
         let w1 = Array2::from_shape_vec((3, 2), w1_vec).unwrap();
         let b1 = Array1::from_vec(b1_vec);
         let w2 = Array2::from_shape_vec((2, 3), w2_vec).unwrap();
@@ -318,8 +319,6 @@ proptest! {
     /// dual alpha threading through both branches. The merge node means
     /// relu1's gradient accumulates contributions from both paths, and the
     /// upper gradient must independently accumulate both contributions.
-    ///
-    /// Part of #3393.
     #[ntest::timeout(60000)]
     #[test]
     fn proptest_graph_alpha_crown_diamond_dag_dual_alpha_soundness(
@@ -437,10 +436,10 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
-// Regression: DAG CROWN-IBP SPSA must update upper-path alphas (#3782 Slice 1)
+// Regression: DAG CROWN-IBP SPSA must update upper-path alphas
 // ---------------------------------------------------------------------------
 
-/// Before the fix in #3782, `collect_alpha_crown_bounds_dag_with_engine()`
+/// Before the fix, `collect_alpha_crown_bounds_dag_with_engine()`
 /// only updated lower-path alphas during the SPSA loop — upper-path alphas
 /// stayed at their initialisation values. This test verifies that at least
 /// one unstable neuron's upper alpha diverges from its initial value after
@@ -485,7 +484,7 @@ fn test_dag_spsa_updates_upper_alphas_3782() {
     }
 
     // At least one unstable neuron's upper alpha must have moved from its
-    // initialisation value.  Before #3782 this assertion would fail because
+    // initialisation value.  Before the fix this assertion would fail because
     // the SPSA loop never called update_*_upper().
     let mut any_upper_moved = false;
     for (name, opt_upper) in &opt_state.alphas_upper {

@@ -274,13 +274,13 @@ impl AlphaCrownBackend for InfiniteBoundsBackend {
     }
 }
 
-/// Regression test for #2909: Sequential α-CROWN must not discard optimization
+/// Regression test: Sequential α-CROWN must not discard optimization
 /// progress when bounds contain infinities from clamp_inverted_best_bounds.
 ///
 /// The old `is_finite()` check treated [-inf, +inf] overapproximations as
 /// invalid, falling back to plain CROWN and discarding all element-wise
-/// optimization progress. The fix uses `!is_nan()` instead (cf. DAG path
-/// fix in #2854).
+/// optimization progress. The fix uses `!is_nan()` instead, as the DAG path
+/// does.
 #[test]
 fn test_alpha_crown_infinite_bounds_no_fallback_regression_2909() {
     // Bounds with one finite element and one infinite element (from inversion widening).
@@ -441,7 +441,7 @@ fn test_alpha_crown_nan_bounds_trigger_fallback_2909() {
     );
 }
 
-/// Regression test for #2597: `finite_lower_sum` must produce a finite result
+/// Regression test: `finite_lower_sum` must produce a finite result
 /// even when the input array contains NaN and ±Inf elements.
 ///
 /// Without the finite filter, `[1.0, NaN, 2.0].iter().sum()` = NaN,
@@ -539,7 +539,7 @@ impl AlphaCrownBackend for InfBackwardBackend {
     }
 }
 
-/// Regression test for #2597: -Inf in backward pass lower bounds must not
+/// Regression test: -Inf in backward pass lower bounds must not
 /// cause the optimization loop to waste all iterations.
 ///
 /// In production, NaN from backward pass instability is repaired to -Inf by

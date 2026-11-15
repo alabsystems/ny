@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Centroid-monotonicity spec construction and property sweep fixture assembly.
-//!
-//! Part of #4089 property lane decomposition.
 
 use super::*;
 

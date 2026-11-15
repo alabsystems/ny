@@ -25,7 +25,7 @@ prepare_pinned_clean "$WORK/clean"
 
 echo "Emitting NY certificates for seeds [$SEED_START, $((SEED_START+COUNT)))…"
 OUT="$WORK/certs"; mkdir -p "$OUT"
-( cd "$NY_DIR" && cargo run -q --release -p ny-cert --example emit_random -- "$SEED_START" "$COUNT" "$OUT" >/dev/null )
+( cd "$NY_DIR" && targo --unverified run -q --release -p ny-cert --example emit_random -- "$SEED_START" "$COUNT" "$OUT" >/dev/null )
 
 echo "=== Checking every emitted certificate with Clean's verifier ==="
 BATCH="$WORK/certificates.json"

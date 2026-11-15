@@ -6,7 +6,7 @@
 //!
 //! Tests all match arms: Linear, Add, Sub, SkipMerge, OpaqueSkip, Conv1d
 //! dimension error, Conv2d dimension error, MatMul/BilinearCrown input
-//! count error, MulBinary → Binary (#3439), ReLU/Where → Unsupported,
+//! count error, MulBinary → Binary, ReLU/Where → Unsupported,
 //! Flatten via catch-all.
 
 use std::collections::HashMap;
@@ -234,7 +234,7 @@ fn dispatch_opaque_skip_no_inputs_returns_error() {
 }
 
 // ===================================================================
-// ReLU, Where return Unsupported; MulBinary returns Binary (#3439)
+// ReLU, Where return Unsupported; MulBinary returns Binary
 // ===================================================================
 
 #[test]
@@ -255,7 +255,7 @@ fn dispatch_relu_returns_unsupported() {
     }
 }
 
-/// MulBinary dispatches via McCormick CROWN backward (#3439).
+/// MulBinary dispatches via McCormick CROWN backward.
 #[test]
 fn dispatch_mulbinary_returns_binary_3439() {
     let layer = Layer::MulBinary(MulBinaryLayer);
@@ -275,7 +275,7 @@ fn dispatch_mulbinary_returns_binary_3439() {
             bias_lower,
             bias_upper,
         } => {
-            // #2617: A-matrix bounds must have zero bias
+            // A-matrix bounds must have zero bias
             assert!(bounds_a.lower_b.iter().all(|&v| v == 0.0));
             assert!(bounds_a.upper_b.iter().all(|&v| v == 0.0));
             assert!(bounds_b.lower_b.iter().all(|&v| v == 0.0));

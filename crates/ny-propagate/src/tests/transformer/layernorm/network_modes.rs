@@ -314,13 +314,12 @@ fn test_network_layernorm_cut_mode_succeeds() {
     }
 }
 
-// ── IbpValidated measurement tests (#3221) ──────────────────────────────
+// ── IbpValidated measurement tests ──────────────────────────────
 //
 // These tests measure whether the IbpValidated CROWN mode produces
 // meaningfully tight bounds through normalization layers. This is the
-// acceptance criterion for #3221: bounds through norm layers must not
-// be degenerate (~1e11 width). The design doc at
-// designs/2026-03-03-ibp-validated-norm-crown.md specifies the measurement:
+// acceptance criterion: bounds through norm layers must not be degenerate
+// (~1e11 width). The measurement:
 //   Input bounds: [-5, 5] on dimension 128
 //   Expected: CROWN bounds width < 50 (comparable to scalar verification)
 //   Previous: IBP-only produced ~1e11 width at tensor level
@@ -361,7 +360,7 @@ fn validated_widths(bounds: &BoundedTensor) -> Vec<f32> {
         .collect()
 }
 
-/// Log CROWN vs IBP measurement results for #3221.
+/// Log CROWN vs IBP measurement results.
 fn log_measurement(label: &str, crown_widths: &[f32], ibp_widths: &[f32]) {
     let avg_c = crown_widths.iter().sum::<f32>() / crown_widths.len() as f32;
     let max_c = crown_widths.iter().cloned().fold(0.0_f32, f32::max);
@@ -443,8 +442,7 @@ fn test_network_layernorm_ibp_validated_bounds_finite_and_sound() {
 #[ntest::timeout(120000)]
 #[test]
 fn test_network_layernorm_ibp_validated_dim128_measurement() {
-    // #3221 acceptance criterion: dim 128, input [-5, 5].
-    // Design doc: designs/2026-03-03-ibp-validated-norm-crown.md
+    // Acceptance criterion: dim 128, input [-5, 5].
     let hidden = 128;
     let (network, _, _) = build_ln_measurement_network(hidden);
 
@@ -539,7 +537,7 @@ fn build_deep_ln_network(hidden: usize) -> Network {
 #[ntest::timeout(60000)]
 #[test]
 fn test_network_layernorm_deep_crown_vs_ibp() {
-    // #3221 key test: Linear → ReLU → Linear → LayerNorm → Linear.
+    // Key test: Linear → ReLU → Linear → LayerNorm → Linear.
     // CROWN should be strictly tighter than IBP because ReLU's linear
     // relaxation captures cross-layer correlations that IBP loses.
     // This validates that IbpValidated CROWN through normalization
@@ -713,7 +711,7 @@ fn test_network_layernorm_deep_soundness_sampling() {
             })
             .collect();
         let x = ArrayD::from_shape_vec(IxDyn(&[1, hidden]), x_flat).unwrap();
-        let x_bt = BoundedTensor::new(x.clone(), x.clone()).unwrap();
+        let x_bt = BoundedTensor::new(x.clone(), x).unwrap();
         let y = network.propagate_ibp(&x_bt).unwrap();
 
         for i in 0..hidden {

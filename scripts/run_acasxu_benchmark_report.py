@@ -98,7 +98,7 @@ def main() -> int:
 
     ny_path = Path(args.ny)
     if not ny_path.exists():
-        print(f"ny binary not found at {ny_path}. Build with cargo build -p ny-cli --release.")
+        print(f"ny binary not found at {ny_path}. Build with targo --unverified build -p ny-cli --release.")
         return 1
 
     cmd = [

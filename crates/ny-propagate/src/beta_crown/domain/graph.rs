@@ -25,13 +25,16 @@ use crate::NETWORK_INPUT;
 /// Domain for GraphNetwork branch-and-bound with ReLU splitting.
 ///
 /// Fields are `pub(crate)` to enforce construction through validated methods
-/// that reject NaN bounds (#3125, #2982). Use accessor methods for reads
+/// that reject NaN bounds. Use accessor methods for reads
 /// and `update_bounds()` for bound/priority updates.
 #[derive(Debug, Clone)]
 pub struct GraphBabDomain {
     /// Split history for this domain.
     pub(crate) history: GraphSplitHistory,
-    /// Pre-activation bounds for each node (before applying ReLU constraints).
+    /// OUTPUT bounds of each node, keyed by node name. An activation's
+    /// PRE-activation interval therefore lives under its INPUT's name
+    /// (`node.inputs[0]`), never under its own — the entry under a ReLU's own
+    /// name is its post-activation interval (#genbab-selector-convention).
     /// Uses Arc for cheap cloning during branch-and-bound splits.
     pub(crate) node_bounds: std::collections::HashMap<String, Arc<BoundedTensor>>,
     /// Lower bound on the objective.
@@ -54,7 +57,6 @@ pub struct GraphBabDomain {
     ///
     /// # Reference
     /// alpha-beta-CROWN: `auto_LiRPA/operators/relu.py` (optimizable slopes)
-    /// Issue: #1841
     pub(crate) alpha_state: GraphDomainAlphaState,
     /// Cached lA coefficients from the parent domain's backward pass.
     ///
@@ -63,14 +65,13 @@ pub struct GraphBabDomain {
     /// the parent's lA cache; it is invalidated on the next backward pass and
     /// replaced with freshly captured lA.
     ///
-    /// Wrapped in `Arc` for O(1) cloning during child domain creation (#2326).
+    /// Wrapped in `Arc` for O(1) cloning during child domain creation.
     /// The cached bounds are read-only after creation -- children only read them
     /// to warm-start the backward pass. When the child needs fresh bounds, the
     /// entire `Option<Arc<...>>` is replaced, not mutated in place.
     ///
     /// # Reference
     /// alpha-beta-CROWN: `complete_verifier/tensor_storage.py` (all_lAs)
-    /// Issue: #1564, #1669, #2326
     pub(crate) cached_la: Option<Arc<CachedLinearBounds>>,
     /// #cone-delta: pre-activation node names of the constraints added since
     /// `node_bounds` was last fixpointed.
@@ -118,7 +119,7 @@ impl Ord for GraphBabDomain {
 impl GraphBabDomain {
     /// Create root domain with initial bounds.
     ///
-    /// Returns `Err(NumericalInstability)` if bounds are non-finite (#2982, #3125).
+    /// Returns `Err(NumericalInstability)` if bounds are non-finite.
     pub fn root(
         node_bounds: std::collections::HashMap<String, BoundedTensor>,
         lower_bound: f32,
@@ -153,10 +154,36 @@ impl GraphBabDomain {
 
     /// Apply a constraint to create a child domain.
     ///
-    /// Returns `Ok(None)` if the constraint makes the domain infeasible.
-    /// Returns `Err(...)` if an internal error occurs (e.g., shape mismatch
-    /// in flatten→reshape roundtrip). This distinguishes genuine infeasibility
-    /// from bugs that would silently drop domains (#2302).
+    /// Returns `Ok(None)` ONLY when the requested half-space is genuinely
+    /// empty: `x >= 0` against `u < 0`, `x <= 0` against `l > 0`, or an
+    /// input-box tightening that inverts the interval. Those three are the
+    /// only conditions under which "no child" describes a real sub-region.
+    ///
+    /// Every STRUCTURAL inconsistency is an `Err` instead — a missing split
+    /// node, a non-activation split node, an activation with no input, missing
+    /// pre-activation bounds, or an out-of-range neuron index. This mirrors
+    /// `MultiObjectiveGraphBabDomain::with_constraint_policy`
+    /// (`domain/multi_objective.rs`), whose doc states the reason: "treating a
+    /// missing node/bound or invalid neuron index as an empty region could
+    /// silently erase coverage from the BaB tree."
+    ///
+    /// # Why the distinction is a soundness property, not tidiness
+    ///
+    /// `Ok(None)` reads downstream as prune-and-forget and latches NOTHING:
+    /// `relu_split/child_eval.rs` maps it to `ChildOutcome::NoChild`, which
+    /// `relu_split/split.rs` handles with an empty arm; the GPU batched paths
+    /// (`gpu_bab/batched_gpu.rs`, `gpu_bab/kfsb.rs`) simply push no child; and
+    /// `with_multi_constraints` (below) drops the whole combination. If BOTH
+    /// children of a parent take such a branch, the parent's sub-region leaves
+    /// the search with no `unresolved_*` flag set, and
+    /// `GraphBabLifecycle::build_final_result` then publishes `Verified` over a
+    /// queue that was NOT exhaustive — a false `unsat`. An `Err` cannot do
+    /// that: `NyError::InternalError` is not `is_infeasible_domain()`, so every
+    /// caller takes its fail-closed arm (`PropagationFailure`, `Err(idx)`, or
+    /// `?` out of the BaB loop).
+    ///
+    /// A shape mismatch in the flatten→reshape roundtrip is likewise an
+    /// internal bug, not infeasibility.
     pub fn with_constraint(
         &self,
         graph: &GraphNetwork,
@@ -168,35 +195,68 @@ impl GraphBabDomain {
         let is_active = constraint.is_active;
 
         // Constraints are on the *pre-activation* of this ReLU/Sign, i.e. its input node.
-        // Both ReLU and Sign split at x=0 with identical half-space semantics (#3769).
-        let relu_node = match graph.nodes.get(node_name) {
-            Some(node) => node,
-            None => return Ok(None),
-        };
+        // Both ReLU and Sign split at x=0 with identical half-space semantics.
+        //
+        // (a) The constraint names a node the graph does not contain. A split
+        // is only ever chosen from `graph.nodes` (`find_unstable_graph_neurons`,
+        // `engine/branching/graph.rs`), so a miss means the constraint and the
+        // graph disagree — malformed input, never "this constraint does not
+        // apply here".
+        let relu_node = graph.nodes.get(node_name).ok_or_else(|| {
+            NyError::InternalError(format!(
+                "with_constraint: split node '{node_name}' is missing from the graph"
+            ))
+        })?;
+        // (b) A `GraphNeuronConstraint` IS a zero-threshold activation split
+        // (`is_zero_threshold_binary_activation` == ReLU|Sign); a non-zero
+        // branching point becomes a `GenBabConstraint` instead
+        // (`NeuronSplit::is_relu_split`). Carrying one on a Linear/Conv node is
+        // structurally impossible, not an empty region.
         if !matches!(relu_node.layer, Layer::ReLU(_) | Layer::Sign(_)) {
-            return Ok(None);
+            return Err(NyError::InternalError(format!(
+                "with_constraint: split node '{node_name}' is not a ReLU or Sign"
+            )));
         }
-        let pre_name = match relu_node.inputs.first().map(|s| s.as_str()) {
-            Some(name) => name,
-            None => {
-                // #2098: Return None for nodes with empty inputs instead of fabricating NETWORK_INPUT.
-                tracing::warn!("ReLU node has empty inputs — cannot determine pre-activation");
-                return Ok(None);
-            }
-        };
+        // (c) An activation with no inputs is a graph construction bug —
+        // there is no pre-activation to constrain. The branch selector skips
+        // such nodes entirely, so reaching here means the graph changed under
+        // the constraint.
+        let pre_name = relu_node
+            .inputs
+            .first()
+            .map(|s| s.as_str())
+            .ok_or_else(|| {
+                NyError::InternalError(format!(
+                    "with_constraint: split node '{node_name}' has no input — cannot determine \
+                     pre-activation"
+                ))
+            })?;
 
+        // (d) The domain carries no bounds for the pre-activation. Feasibility
+        // is then unevaluable; declining silently would delete the parent's
+        // sub-region rather than describe it.
         let pre_bounds: &BoundedTensor = if pre_name == NETWORK_INPUT {
             self.input_bounds.as_ref()
         } else {
-            match self.node_bounds.get(pre_name) {
-                Some(b) => b.as_ref(),
-                None => return Ok(None),
-            }
+            self.node_bounds
+                .get(pre_name)
+                .map(AsRef::as_ref)
+                .ok_or_else(|| {
+                    NyError::InternalError(format!(
+                        "with_constraint: pre-activation bounds for '{pre_name}' are missing"
+                    ))
+                })?
         };
         let flat = pre_bounds.flatten();
 
+        // (e) Out-of-range neuron index: the constraint does not name a neuron
+        // of this tensor at all.
         if neuron_idx >= flat.len() {
-            return Ok(None);
+            return Err(NyError::InternalError(format!(
+                "with_constraint: neuron index {neuron_idx} is out of bounds for '{node_name}' \
+                 (size {})",
+                flat.len()
+            )));
         }
 
         let l = flat.lower()[[neuron_idx]];
@@ -204,7 +264,7 @@ impl GraphBabDomain {
 
         // Explicit NaN/Inf guard: non-finite neuron bounds make the feasibility
         // check below unreliable (IEEE 754: NaN < 0.0 = false, so NaN passes).
-        // Mirrors the NaN guard in with_general_split (#2954). (#2599)
+        // Mirrors the NaN guard in with_general_split.
         if !l.is_finite() || !u.is_finite() {
             return Err(NyError::NumericalInstability(format!(
                 "with_constraint: non-finite neuron bounds for {node_name}[{neuron_idx}] \
@@ -218,7 +278,10 @@ impl GraphBabDomain {
             )));
         }
 
-        // Feasibility check for intersection with the half-space.
+        // Genuine feasibility: the half-space really does miss `[l, u]`, so the
+        // child's region is EMPTY and `Ok(None)` is the correct description.
+        // These two, plus the input-box inversion below, are the ONLY `Ok(None)`
+        // returns — see this method's doc comment.
         // Use strict inequalities so boundary cases (x==0) remain feasible.
         if is_active && u < 0.0 {
             return Ok(None);
@@ -235,7 +298,7 @@ impl GraphBabDomain {
             let mut upper_flat = flat.upper().clone();
 
             if is_active {
-                // NaN-safe: propagate NaN instead of silently clamping to 0.0 (#2643)
+                // NaN-safe: propagate NaN instead of silently clamping to 0.0
                 lower_flat[[neuron_idx]] = nan_propagating_max(lower_flat[[neuron_idx]], 0.0);
             } else {
                 upper_flat[[neuron_idx]] = nan_propagating_min(upper_flat[[neuron_idx]], 0.0);
@@ -245,7 +308,7 @@ impl GraphBabDomain {
             }
 
             // Shape errors in flatten→reshape roundtrip indicate an internal bug,
-            // not legitimate infeasibility (#2302).
+            // not legitimate infeasibility.
             let lower_new = lower_flat
                 .into_shape_clone(ndarray::IxDyn(&shape))
                 .map_err(|e| {
@@ -326,7 +389,7 @@ impl GraphBabDomain {
     ///
     /// # Returns
     /// `Ok(Some(domain))` for valid child, `Ok(None)` if infeasible,
-    /// `Err(...)` on internal error (shape mismatch etc.) (#2302).
+    /// `Err(...)` on internal error (shape mismatch etc.).
     pub fn with_general_split(
         &self,
         graph: &GraphNetwork,
@@ -414,15 +477,15 @@ impl GraphBabDomain {
         }
 
         // Feasibility check: new bounds must intersect with current bounds.
-        // Use NaN-propagating ops so NaN bounds are not silently absorbed (#2954).
+        // Use NaN-propagating ops so NaN bounds are not silently absorbed.
         // IEEE 754: NaN.max(x) = x would hide corruption; nan_propagating_max
-        // returns NaN, consistent with with_constraint (#2643).
+        // returns NaN, consistent with with_constraint.
         let effective_l = nan_propagating_max(current_l, new_lower);
         let effective_u = nan_propagating_min(current_u, new_upper);
 
         // Explicit NaN guard: if either effective bound is NaN, the split
         // inputs are corrupted. Reject immediately rather than letting NaN
-        // flow into constraints or child BoundedTensor (#2954).
+        // flow into constraints or child BoundedTensor.
         if effective_l.is_nan() || effective_u.is_nan() {
             return Err(NyError::NumericalInstability(format!(
                 "with_general_split: NaN in effective bounds for {node_name}[{neuron_idx}] \
@@ -445,7 +508,7 @@ impl GraphBabDomain {
             lower_flat[[neuron_idx]] = effective_l;
             upper_flat[[neuron_idx]] = effective_u;
 
-            // Shape errors in flatten→reshape roundtrip indicate an internal bug (#2302).
+            // Shape errors in flatten→reshape roundtrip indicate an internal bug.
             let lower_new = lower_flat
                 .into_shape_clone(ndarray::IxDyn(&shape))
                 .map_err(|e| {
@@ -465,8 +528,20 @@ impl GraphBabDomain {
             self.input_bounds.clone()
         };
 
-        // Determine constraint type based on split
-        let new_history = if split.is_relu_split() {
+        // Determine constraint type based on split.
+        //
+        // #genbab-selector-convention: a point of exactly 0.0 is a ReLU split
+        // ONLY on a zero-threshold node (ReLU/Sign). `is_relu_split()` looks at
+        // the bounds alone, so a Sin/Sigmoid/MulBinary/BilinearCrown split whose
+        // midpoint is exactly 0.0 — any interval symmetric about 0, e.g. an
+        // operand in [-1, 1] — used to become a `GraphNeuronConstraint` on a
+        // non-ReLU node, which `build_constraint_lookups` rejects
+        // ("references non-ReLU/Sign node"): both children failed propagation
+        // and the domain went to PropagationFailure. Fail-closed, never
+        // unsound, but it cost the sub-tree. Those splits now take the GenBaB
+        // arm below (a split-point constraint at 0.0), which is what they are.
+        let zero_threshold_node = matches!(node.layer, Layer::ReLU(_) | Layer::Sign(_));
+        let new_history = if split.is_relu_split() && zero_threshold_node {
             // ReLU split (at 0): use standard ReLU constraint
             let constraint = GraphNeuronConstraint {
                 node_name: node_name.to_string(),
@@ -619,12 +694,37 @@ impl GraphBabDomain {
     /// Returns fewer than 2^k children when constraints conflict with bounds.
     ///
     /// Reference: alpha-beta-CROWN `set_branched_bounds()` in `domain_updater.py:63-304`.
-    /// Part of #2767 (multi-depth ReLU splitting).
     pub fn with_multi_constraints(
         &self,
         graph: &GraphNetwork,
         splits: &[(String, usize, f32)],
         verify_upper_bound: bool,
+    ) -> Result<Vec<Self>> {
+        self.with_multi_constraints_inner(graph, splits, verify_upper_bound, None)
+    }
+
+    /// [`Self::with_multi_constraints`], reporting every PRUNED combination
+    /// to `on_empty` as the partially-constrained domain's history plus the
+    /// half-space `with_constraint` found empty (`Ok(None)`). That region
+    /// contains the pruned combination's, so the report is the fact that
+    /// closes it (#graph-bab-cover-ledger). The children returned are
+    /// identical to the unobserved call's.
+    pub(crate) fn with_multi_constraints_observed(
+        &self,
+        graph: &GraphNetwork,
+        splits: &[(String, usize, f32)],
+        verify_upper_bound: bool,
+        on_empty: &mut dyn FnMut(&GraphSplitHistory, &GraphNeuronConstraint),
+    ) -> Result<Vec<Self>> {
+        self.with_multi_constraints_inner(graph, splits, verify_upper_bound, Some(on_empty))
+    }
+
+    fn with_multi_constraints_inner(
+        &self,
+        graph: &GraphNetwork,
+        splits: &[(String, usize, f32)],
+        verify_upper_bound: bool,
+        mut on_empty: Option<&mut dyn FnMut(&GraphSplitHistory, &GraphNeuronConstraint)>,
     ) -> Result<Vec<Self>> {
         if splits.is_empty() {
             return Ok(vec![self.clone()]);
@@ -656,9 +756,13 @@ impl GraphBabDomain {
                     is_active,
                     score: *score,
                 };
+                let reported = on_empty.is_some().then(|| constraint.clone());
                 match domain.with_constraint(graph, constraint, verify_upper_bound)? {
                     Some(new_domain) => domain = new_domain,
                     None => {
+                        if let (Some(report), Some(constraint)) = (on_empty.as_mut(), &reported) {
+                            report(&domain.history, constraint);
+                        }
                         feasible = false;
                         break;
                     }
@@ -673,7 +777,7 @@ impl GraphBabDomain {
         Ok(children)
     }
 
-    // --- Accessor methods (#3125) ---
+    // --- Accessor methods ---
 
     /// Lower bound on the objective.
     pub fn lower_bound(&self) -> f32 {
@@ -731,7 +835,7 @@ impl GraphBabDomain {
         &self.alpha_state
     }
 
-    /// Cached lA coefficients (Arc-wrapped for O(1) child cloning, #2326).
+    /// Cached lA coefficients (Arc-wrapped for O(1) child cloning).
     pub fn cached_la(&self) -> &Option<Arc<CachedLinearBounds>> {
         &self.cached_la
     }
@@ -740,7 +844,7 @@ impl GraphBabDomain {
     ///
     /// Used by `graph_domain_from_picked()` to reconstruct domains from batched
     /// DomainList storage. Returns `Err(NumericalInstability)` if bounds or
-    /// priority contain NaN (#3125, #2982).
+    /// priority contain NaN.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_metadata(
         history: GraphSplitHistory,
@@ -782,7 +886,7 @@ impl GraphBabDomain {
     ///
     /// Used by `branch_relu_from_picked()` for ReLU-split children. Increments
     /// depth from metadata. Returns `Err(NumericalInstability)` if bounds or
-    /// priority are non-finite (#3125, #2982).
+    /// priority are non-finite.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn child_from_metadata(
         history: GraphSplitHistory,
@@ -819,7 +923,7 @@ impl GraphBabDomain {
         })
     }
 
-    /// Update bounds and priority atomically. Rejects non-finite values (#2982, #3125).
+    /// Update bounds and priority atomically. Rejects non-finite values.
     pub(crate) fn update_bounds(&mut self, lower: f32, upper: f32, priority: f32) -> Result<()> {
         super::validate_domain_interval("GraphBaB domain update", lower, upper)?;
         if !priority.is_finite() {
@@ -976,7 +1080,124 @@ mod tests {
         assert!(error.to_string().contains("inverted"));
     }
 
-    /// Regression test for #2599: with_constraint must reject NaN neuron bounds.
+    /// (d) of the five structural conditions: the domain carries no bounds for
+    /// the split node's pre-activation.
+    ///
+    /// This used to return `Ok(None)`. `Ok(None)` is the caller's signal that
+    /// the child's region is EMPTY, and every consumer prunes it without
+    /// latching an `unresolved_*` flag — so an unevaluable split silently
+    /// deleted the parent's sub-region from the search. The multi-objective
+    /// twin has always returned `Err` here
+    /// (`multi_objective.rs`, "pre-activation bounds for '{pre_name}' are
+    /// missing"); the two now agree.
+    #[test]
+    fn graph_with_constraint_fails_closed_on_missing_pre_activation_bounds() {
+        let (graph, mut domain) = simple_graph_and_domain();
+        // "linear1" is relu1's pre-activation (see `simple_graph_and_domain`).
+        assert!(
+            domain.node_bounds.remove("linear1").is_some(),
+            "fixture must actually carry the pre-activation entry being removed"
+        );
+        let constraint = GraphNeuronConstraint {
+            node_name: "relu1".to_string(),
+            neuron_idx: 0,
+            is_active: true,
+            score: 1.0,
+        };
+        let error = domain
+            .with_constraint(&graph, constraint, false)
+            .expect_err("missing pre-activation bounds must fail closed, not prune silently");
+        assert!(
+            matches!(error, NyError::InternalError(_)),
+            "structural inconsistency must be an internal error: {error}"
+        );
+        assert!(
+            !error.is_infeasible_domain(),
+            "unevaluable is not empty — an infeasible-domain classification would put every \
+             caller back on the prune-and-forget arm: {error}"
+        );
+        assert!(
+            error.to_string().contains("pre-activation bounds"),
+            "error should name the missing pre-activation: {error}"
+        );
+    }
+
+    /// WIRING: a structural refusal must reach the caller as an error, not as
+    /// "this combination has no children".
+    ///
+    /// `with_multi_constraints` translates `Ok(None)` into `feasible = false`
+    /// and drops the child. With every combination dropped it returned
+    /// `Ok(vec![])` — an empty child set that `relu_split/aggregate.rs`
+    /// iterates without complaint, so the parent left the queue with nothing
+    /// recorded and `build_final_result` could publish `Verified` over a
+    /// non-exhaustive search. Driving the caller (not the leaf) is the point:
+    /// this fails if the refusal is ever reintroduced as `Ok(None)` even when
+    /// the leaf's own test is intact.
+    #[test]
+    fn with_multi_constraints_propagates_structural_refusal_instead_of_emptying_the_child_set() {
+        let (graph, domain) = simple_graph_and_domain();
+        let splits = vec![("nonexistent_relu".to_string(), 0, 1.0)];
+
+        let error = domain
+            .with_multi_constraints(&graph, &splits, false)
+            .expect_err("a split on a node outside the graph must not read as 'no children'");
+        assert!(
+            matches!(error, NyError::InternalError(_)),
+            "structural inconsistency must be an internal error: {error}"
+        );
+        assert!(
+            !error.is_infeasible_domain(),
+            "a missing split node is not an empty region: {error}"
+        );
+    }
+
+    /// The over-correction guard: a GENUINELY empty half-space must still be
+    /// `Ok(None)`, not an error. Turning these into errors would convert
+    /// ordinary, correct pruning into propagation failures on every row.
+    #[test]
+    fn graph_with_constraint_still_returns_none_for_a_genuinely_empty_half_space() {
+        let (graph, mut domain) = simple_graph_and_domain();
+        // Force relu1's pre-activation strictly positive: the inactive branch
+        // (x <= 0) is then empty, and the active branch is non-empty.
+        let stable_positive = BoundedTensor::new(
+            ndarray::arr1(&[1.0_f32, 1.0]).into_dyn(),
+            ndarray::arr1(&[2.0_f32, 2.0]).into_dyn(),
+        )
+        .unwrap();
+        domain
+            .node_bounds
+            .insert("linear1".to_string(), Arc::new(stable_positive));
+
+        let inactive = GraphNeuronConstraint {
+            node_name: "relu1".to_string(),
+            neuron_idx: 0,
+            is_active: false,
+            score: 1.0,
+        };
+        assert!(
+            domain
+                .with_constraint(&graph, inactive, false)
+                .expect("an empty half-space is not an error")
+                .is_none(),
+            "l > 0 with the inactive branch is genuinely infeasible — still Ok(None)"
+        );
+
+        let active = GraphNeuronConstraint {
+            node_name: "relu1".to_string(),
+            neuron_idx: 0,
+            is_active: true,
+            score: 1.0,
+        };
+        assert!(
+            domain
+                .with_constraint(&graph, active, false)
+                .expect("a feasible half-space is not an error")
+                .is_some(),
+            "the active branch is non-empty and must still yield a child"
+        );
+    }
+
+    /// Regression test: with_constraint must reject NaN neuron bounds.
     ///
     /// IEEE 754: NaN < 0.0 = false, so without an explicit guard, NaN bounds
     /// silently pass both feasibility checks (u < 0.0 and l > 0.0).
@@ -1013,7 +1234,7 @@ mod tests {
         );
     }
 
-    /// Regression test for #2599: with_constraint must reject NaN upper bound.
+    /// Regression test: with_constraint must reject NaN upper bound.
     #[test]
     fn test_with_constraint_rejects_nan_upper_bound() {
         let (graph, mut domain) = simple_graph_and_domain();
@@ -1041,7 +1262,7 @@ mod tests {
         );
     }
 
-    /// Test multi-constraint child creation (Phase 3, #2767).
+    /// Test multi-constraint child creation (multi-depth ReLU splitting).
     ///
     /// With 2 unstable neurons in relu1 (both cross zero), splitting depth=2
     /// should produce up to 4 children (2^2), each with a unique combination
@@ -1186,7 +1407,7 @@ mod tests {
 
         let splits = vec![("relu1".to_string(), 0, 1.0), ("relu1".to_string(), 1, 0.8)];
         let children = root.with_multi_constraints(&graph, &splits, false).unwrap();
-        assert!(!children.is_empty());
+        assert_ne!((children).len(), 0);
         for child in &children {
             assert_eq!(
                 child.delta_pre_nodes(),
@@ -1217,7 +1438,7 @@ mod tests {
         assert_eq!(child.delta_pre_nodes(), &["linear1".to_string()]);
     }
 
-    /// Regression test for #2599: with_general_split must reject NaN current bounds.
+    /// Regression test: with_general_split must reject NaN current bounds.
     ///
     /// nan_propagating_max/min correctly propagate NaN through the effective
     /// bound computation, and the explicit NaN guard catches the result.
@@ -1253,7 +1474,7 @@ mod tests {
         assert!(err.contains("NaN"), "error should mention NaN: {err}");
     }
 
-    /// Regression test for #2599: with_general_split must reject NaN current upper.
+    /// Regression test: with_general_split must reject NaN current upper.
     #[test]
     fn test_with_general_split_rejects_nan_current_upper() {
         let (graph, mut domain) = simple_graph_and_domain();

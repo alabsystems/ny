@@ -1,0 +1,2 @@
+binary <home>/ny-pins/ny_wave6_cf376ec20 sha256 4b1656c9978e31af; configs ship27 @c17414427; ny benchmarks run --year 2025 at official budgets via ny_box.sh measure (refine2/ship27_sweep_v1.sh)
+  BANKCMP cersyve-2025 rows=12 held=12 converted=0 lost=0 emergency=0 unmatched=0

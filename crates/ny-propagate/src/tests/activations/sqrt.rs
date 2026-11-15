@@ -93,7 +93,7 @@ fn test_sqrt_ibp_basic() {
     }
 }
 
-/// Design: #424 (gate negative sqrt via heuristic marking, not error).
+/// Design: gate negative sqrt via heuristic marking, not error.
 /// Sqrt clamps negative inputs to 0; soundness provenance scanner detects and
 /// flags SqrtNegativeDomain so the verifier reports heuristic mode.
 #[ntest::timeout(10000)]
@@ -120,7 +120,7 @@ fn test_sqrt_ibp_clamps_negative_1635() {
         );
     }
 
-    // SOUNDNESS CONTRACT (#424): When propagate_ibp clamps negative inputs,
+    // SOUNDNESS CONTRACT: When propagate_ibp clamps negative inputs,
     // the soundness provenance scanner must detect SqrtNegativeDomain so the
     // verifier marks the result as Heuristic. Verify the scanner catches this.
     let mut network = Network::new();

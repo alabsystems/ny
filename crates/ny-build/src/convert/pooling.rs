@@ -23,7 +23,7 @@ fn parse_non_negative_usize(
 }
 
 /// Validate that pool strides are >= 1 to prevent divide-by-zero in output-size
-/// formulas. Part of #2872 (pool stride=0 panic cliff).
+/// formulas (the pool stride=0 panic cliff).
 fn validate_pool_strides(
     strides: (usize, usize),
     op_name: &str,
@@ -235,11 +235,52 @@ impl ConvertContext<'_> {
         // GlobalAveragePool has no kernel_shape - we handle it by using the input shape
         self.ensure_supported_pool_auto_pad(spec, "AveragePool")?;
         self.ensure_supported_pool_attributes(spec, "AveragePool", false)?;
+        let mut global_3d = false;
         let kernel_shape = match spec.attributes.get("kernel_shape") {
             Some(_) => parse_pair_attr(spec, "AveragePool", "kernel_shape", (0, 0))?,
             None => {
-                // GlobalAveragePool: will use full spatial dimensions
-                // For now, use a placeholder that will need runtime shape info
+                // GlobalAveragePool: will use full spatial dimensions.
+                //
+                // The (0, 0) sentinel is inherently 2-D: the propagation layer
+                // pools the trailing (H, W) pair only. On a rank-5 ONNX input
+                // (N, C, D, H, W — batch-squeezed to (C, D, H, W) internally)
+                // that reading is WRONG-AXIS: it treats C as batch and D as
+                // channels, leaves the temporal axis un-pooled, and emits C·D
+                // elements where ONNX declares C (#rank4-global-avgpool,
+                // smart_turn video backbone: [512, 4, 7, 7] → 2048 vs the fc
+                // Gemm's 512 columns). Only the lowering sees the declared
+                // ONNX rank, so the decision is made HERE, via the dedicated
+                // global-3d constructor: mean over ALL trailing spatial axes.
+                //
+                // Conservative envelope: rank unknown or any other rank keeps
+                // today's 2-D sentinel path verbatim (rank 4 is the correct
+                // 2-D case; rank 6+ stays wrong-shape and fails closed
+                // downstream, pinned by
+                // `global_average_pool_rank6_input_keeps_2d_sentinel`), and an
+                // unbatched model keeps it too — `model_unbatched` maps ONNX
+                // shapes verbatim, so its rank-5 tensor stays rank 5
+                // internally, which the global-3d layer refuses at rank != 4.
+                if !self.model_unbatched {
+                    if spec
+                        .inputs
+                        .first()
+                        .and_then(|name| self.recorded_onnx_rank(name))
+                        == Some(5)
+                    {
+                        global_3d = true;
+                        // Engagement receipt — eprintln!, NOT tracing: the default
+                        // filter suppresses info!-level events (the 2026-09-01 probe
+                        // proved it: builder.rs's info! twin of "[multi_input] armed"
+                        // never reaches stderr; the line that does is model_load.rs's
+                        // eprintln!). A probe must be able to prove this lowering
+                        // fired rather than infer it from an absent failure.
+                        eprintln!(
+                            "[global_3d_avgpool] armed: GlobalAveragePool '{}' pools all 3 \
+                             trailing spatial axes (ONNX rank-5 input)",
+                            spec.name
+                        );
+                    }
+                }
                 (0, 0) // Indicates global pooling
             }
         };
@@ -254,6 +295,15 @@ impl ConvertContext<'_> {
             Some(AttributeValue::Int(v)) => *v != 0,
             _ => false,
         };
+
+        if global_3d {
+            // Attribute validation above ran identically (auto_pad, ceil_mode,
+            // strides ≥ 1, symmetric pads); a global window then ignores
+            // stride/pads exactly as the 2-D global sentinel path does. The
+            // constructor pins the sentinel geometry, so `is_global()` holds
+            // and every is_global-refusing consumer keeps refusing.
+            return Ok(Layer::AveragePool(AveragePoolLayer::new_global_3d()));
+        }
 
         Ok(Layer::AveragePool(AveragePoolLayer::new(
             kernel_shape,
@@ -475,7 +525,7 @@ mod tests {
         }
     }
 
-    // Regression tests for #2872: pooling stride=0 panic cliff
+    // Regression tests: pooling stride=0 panic cliff
 
     #[ntest::timeout(10000)]
     #[test]
@@ -589,7 +639,7 @@ mod tests {
             .expect("GlobalAveragePool with default strides=(1,1) must be accepted");
     }
 
-    // Positive-path tests: verify correct value extraction (Part of #2311)
+    // Positive-path tests: verify correct value extraction
 
     #[ntest::timeout(10000)]
     #[test]
@@ -657,6 +707,107 @@ mod tests {
                 assert_eq!(ap.stride, (1, 1), "global pool defaults stride to (1,1)");
                 assert_eq!(ap.padding, (0, 0));
                 assert!(!ap.count_include_pad, "default count_include_pad is false");
+            }
+            other => panic!("expected AveragePool, got: {other:?}"),
+        }
+    }
+
+    // ===== Global-3d lowering (#rank4-global-avgpool) =====
+
+    fn shapes_with_input_rank(rank: usize) -> HashMap<String, Vec<i64>> {
+        let mut shapes = HashMap::new();
+        // Symbolic batch dims are recorded as non-positive values; only the
+        // LENGTH feeds recorded_onnx_rank, matching real loader records.
+        shapes.insert("input".to_string(), vec![1; rank]);
+        shapes
+    }
+
+    #[ntest::timeout(10000)]
+    #[test]
+    fn global_average_pool_rank5_input_lowers_to_global_3d() {
+        // A rank-5 ONNX input (N, C, D, H, W) — the 3D-CNN case — must lower
+        // to the global-3d layer: pool ALL trailing spatial axes, not the 2-D
+        // sentinel whose wrong-axis reading leaves the temporal axis un-pooled
+        // (smart_turn: [512, 4, 7, 7] -> fc Gemm "expected [512], got [2048]").
+        let (ws, _, constants) = make_context();
+        let shapes = shapes_with_input_rank(5);
+        let ctx = ConvertContext::new(&ws, &shapes, &constants);
+        let spec = average_pool_spec(HashMap::new());
+        let layer = ctx
+            .convert_average_pool(&spec)
+            .expect("rank-5 GlobalAveragePool must lower");
+        match layer {
+            Layer::AveragePool(ap) => {
+                assert!(ap.global_3d, "rank-5 ONNX input must set global_3d");
+                assert!(ap.is_global(), "global-3d keeps the (0,0) sentinel");
+                assert_eq!(ap.kernel_size, (0, 0));
+                assert_eq!(ap.stride, (1, 1));
+                assert_eq!(ap.padding, (0, 0));
+                assert!(!ap.count_include_pad);
+            }
+            other => panic!("expected AveragePool, got: {other:?}"),
+        }
+    }
+
+    #[ntest::timeout(10000)]
+    #[test]
+    fn global_average_pool_rank4_and_unknown_rank_keep_2d_sentinel() {
+        // Rank 4 (N, C, H, W) is the correct 2-D case; unknown rank is
+        // ambiguous and must stay conservative. Both keep today's path.
+        for shapes in [shapes_with_input_rank(4), HashMap::new()] {
+            let (ws, _, constants) = make_context();
+            let ctx = ConvertContext::new(&ws, &shapes, &constants);
+            let spec = average_pool_spec(HashMap::new());
+            let layer = ctx
+                .convert_average_pool(&spec)
+                .expect("GlobalAveragePool must lower");
+            match layer {
+                Layer::AveragePool(ap) => {
+                    assert!(!ap.global_3d, "2-D / unknown rank must NOT set global_3d");
+                    assert!(ap.is_global());
+                }
+                other => panic!("expected AveragePool, got: {other:?}"),
+            }
+        }
+    }
+
+    #[ntest::timeout(10000)]
+    #[test]
+    fn global_average_pool_rank6_input_keeps_2d_sentinel() {
+        // Rank 6+ (4+ spatial dims) remains UNSUPPORTED: the lowering keeps
+        // today's 2-D sentinel, whose wrong element count fails closed at the
+        // first shape-checked consumer — no silent capability widening.
+        let (ws, _, constants) = make_context();
+        let shapes = shapes_with_input_rank(6);
+        let ctx = ConvertContext::new(&ws, &shapes, &constants);
+        let spec = average_pool_spec(HashMap::new());
+        let layer = ctx
+            .convert_average_pool(&spec)
+            .expect("rank-6 GlobalAveragePool keeps today's lowering");
+        match layer {
+            Layer::AveragePool(ap) => {
+                assert!(!ap.global_3d, "rank-6 must NOT set global_3d");
+            }
+            other => panic!("expected AveragePool, got: {other:?}"),
+        }
+    }
+
+    #[ntest::timeout(10000)]
+    #[test]
+    fn global_average_pool_unbatched_model_keeps_2d_sentinel() {
+        // model_unbatched maps ONNX shapes verbatim (no batch squeeze), so a
+        // rank-5 tensor stays rank 5 internally — which the global-3d layer
+        // refuses at rank != 4. The lowering must not set the flag there.
+        let (ws, _, constants) = make_context();
+        let shapes = shapes_with_input_rank(5);
+        let ctx = ConvertContext::new(&ws, &shapes, &constants).with_model_unbatched(true);
+        let spec = average_pool_spec(HashMap::new());
+        let layer = ctx
+            .convert_average_pool(&spec)
+            .expect("GlobalAveragePool must lower");
+        match layer {
+            Layer::AveragePool(ap) => {
+                assert!(!ap.global_3d, "unbatched model must NOT set global_3d");
             }
             other => panic!("expected AveragePool, got: {other:?}"),
         }

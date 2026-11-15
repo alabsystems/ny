@@ -35,10 +35,6 @@ bab:
   alpha_crown:
     lr_alpha: 0.25
     iterations: 5
-  beta_crown:
-    lr_alpha: 0.1
-    lr_beta: 0.15
-    iterations: 15
   clip:
     relaxed: true
     relaxed_iterations: 20

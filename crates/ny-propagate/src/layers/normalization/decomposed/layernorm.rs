@@ -7,8 +7,6 @@
 //! Decomposes LayerNorm into primitives and propagates CROWN backward through
 //! each step:
 //!   x → mean(x) → d=x-mean → d² → var=mean(d²) → sqrt(var+eps) → 1/std → d*inv_std → γ·norm+β
-//!
-//! Part of #2077, #318.
 
 use ndarray::{Array1, Array2};
 use ny_core::{checked_dim_product, checked_shape_product, NyError, Result};
@@ -36,7 +34,7 @@ use super::{
 /// Uses McCormick relaxation for bilinear `d * inv_std`, directed rounding for
 /// all compositions, and fan-out summation at `d` for product + variance paths.
 ///
-/// Ref: `auto_LiRPA/operators/normalization.py:303-331`. Part of #2077, #318.
+/// Ref: `auto_LiRPA/operators/normalization.py:303-331`.
 pub(crate) fn decomposed_norm_crown_backward(
     a_output: &BatchedLinearBounds,
     ny: &Array1<f32>,
@@ -45,6 +43,17 @@ pub(crate) fn decomposed_norm_crown_backward(
     x_ibp: &BoundedTensor,
     forward_mode: bool,
 ) -> Result<DecomposedNormBackwardResult> {
+    if !forward_mode {
+        return crate::layers::normalization::radial::baseline::checked_baseline(
+            a_output,
+            ny,
+            Some(beta),
+            eps,
+            x_ibp,
+            true,
+            None,
+        );
+    }
     let a_shape = a_output.lower_a().shape();
     let ndim = a_shape.len();
     if ndim < 2 {

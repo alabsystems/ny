@@ -131,7 +131,7 @@ fn test_thresholded_relu_crown_soundness() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_thresholded_relu_crown_l_eq_alpha_regression_1759() {
-    // Regression for #1759: l == alpha used to trigger alpha/(alpha-l) division by zero.
+    // Regression: l == alpha used to trigger alpha/(alpha-l) division by zero.
     // Validate both positive and negative alpha boundaries produce finite sound bounds.
     for &alpha in &[1.0, -1.0] {
         let pre_lower = ArrayD::from_shape_vec(IxDyn(&[1]), vec![alpha]).unwrap();

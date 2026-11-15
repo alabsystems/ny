@@ -27,6 +27,12 @@ fn validate_quantization_attributes(spec: &LayerSpec) -> Result<()> {
     let quantize = spec.layer_type == ny_core::LayerType::QuantizeLinear;
     for (name, value) in &spec.attributes {
         let supported = match (quantize, name.as_str(), value) {
+            // Internal marker set ONLY by the gated activation Q->DQ fusion in
+            // ny-onnx (`try_fuse_qdq_relaxation`, dark
+            // `qdq_activation_relaxation` load-config gate). The fusion refuses
+            // authored attributes, so this marker never coexists with any
+            // authored quantization attribute.
+            (true, "qdq_relaxation", AttributeValue::Int(1)) => true,
             (_, "axis", AttributeValue::Int(_)) => true,
             (_, "block_size", AttributeValue::Int(0)) => true,
             (true, "saturate", AttributeValue::Int(value)) => matches!(value, 0 | 1),
@@ -50,6 +56,14 @@ fn validate_quantization_attributes(spec: &LayerSpec) -> Result<()> {
 
 impl ConvertContext<'_> {
     pub(crate) fn convert_dequantize_linear(&self, spec: &LayerSpec) -> Result<Layer> {
+        if matches!(
+            self.linear_storage,
+            crate::LinearStoragePolicy::OriginalPoint(_)
+        ) {
+            return Err(NyError::UnsupportedConfiguration(
+                "original point storage: dequantized affine conversion needs its own qualified adapter".into(),
+            ));
+        }
         validate_quantization_attributes(spec)?;
         if spec.inputs.len() < 2 {
             return Err(NyError::ModelLoad(format!(
@@ -105,6 +119,14 @@ impl ConvertContext<'_> {
     }
 
     pub(crate) fn convert_quantize_linear(&self, spec: &LayerSpec) -> Result<Layer> {
+        if matches!(
+            self.linear_storage,
+            crate::LinearStoragePolicy::OriginalPoint(_)
+        ) {
+            return Err(NyError::UnsupportedConfiguration(
+                "original point storage: quantized activation conversion needs its own qualified adapter".into(),
+            ));
+        }
         validate_quantization_attributes(spec)?;
         if spec.inputs.len() < 2 {
             return Err(NyError::ModelLoad(format!(
@@ -119,10 +141,85 @@ impl ConvertContext<'_> {
                 spec.name
             )));
         }
+        if spec.attributes.get("qdq_relaxation") == Some(&AttributeValue::Int(1)) {
+            return self.convert_qdq_activation_relaxation(spec);
+        }
         Err(NyError::UnsupportedOp(format!(
             "QuantizeLinear {} with activation input is unsupported: rounding is non-linear",
             spec.name
         )))
+    }
+
+    /// Lower a fused activation `QuantizeLinear -> DequantizeLinear` pair to
+    /// the certified enclosure layer (dark `qdq_activation_relaxation` gate).
+    ///
+    /// The `qdq_relaxation` marker is set only by ny-onnx's gated fusion,
+    /// which has already proven the Q and DQ nodes share identical scale and
+    /// zero-point inputs and carry no authored attributes; this function
+    /// authenticates the parameters themselves and builds the certified
+    /// envelope of `ny_propagate::layers::QdqPerturbationLayer`.
+    fn convert_qdq_activation_relaxation(&self, spec: &LayerSpec) -> Result<Layer> {
+        let input_shape = self.tensor_shape_usize_required(&spec.inputs[0], &spec.name)?;
+        let scale = self.required_constant(&spec.inputs[1], "scale", &spec.name)?;
+        let (zero_point, range) = match spec.inputs.get(2).filter(|name| !name.is_empty()) {
+            Some(name) => self.authenticated_quantized_integer_value(name).ok_or_else(|| {
+                NyError::UnsupportedOp(format!(
+                    "QuantizeLinear {} QDQ relaxation requires an authenticated integral zero_point '{name}'",
+                    spec.name
+                ))
+            })?,
+            None => (ArrayD::zeros(IxDyn(&[])), DEFAULT_QUANT_RANGE),
+        };
+        // Only the 8-bit ranges carry the certified envelope (the containment
+        // suite in ny-propagate covers exactly uint8 and int8).
+        if !matches!(range, (0, 255) | (-128, 127)) {
+            return Err(NyError::UnsupportedOp(format!(
+                "QuantizeLinear {} QDQ relaxation is certified only for uint8/int8, got range {range:?}",
+                spec.name
+            )));
+        }
+        let scales: Vec<f32> = scale.iter().copied().collect();
+        let zero_points: Vec<i64> = zero_point.iter().copied().collect();
+        let slots = scales.len().max(zero_points.len());
+        if slots == 0
+            || !(scales.len() == slots || scales.len() == 1)
+            || !(zero_points.len() == slots || zero_points.len() == 1)
+        {
+            return Err(NyError::UnsupportedOp(format!(
+                "QuantizeLinear {} QDQ relaxation has unbroadcastable scale/zero_point shapes {:?} vs {:?}",
+                spec.name,
+                scale.shape(),
+                zero_point.shape()
+            )));
+        }
+        // The layer applies parameter slots to the flattened tensor's TRAILING
+        // axis by cyclic indexing. The fusion refuses authored attributes, so
+        // ONNX's default quantization axis 1 applies; that is the trailing
+        // axis exactly when the internal (unbatched) shape is rank 1. Anything
+        // else fails closed rather than silently mis-mapping channels.
+        if slots > 1 && !(input_shape.len() == 1 && slots == input_shape[0]) {
+            return Err(NyError::UnsupportedOp(format!(
+                "QuantizeLinear {} QDQ relaxation supports per-axis parameters only on a trailing quantization axis (internal shape {input_shape:?}, {slots} slots)",
+                spec.name
+            )));
+        }
+        let scales_expanded: Vec<f32> = (0..slots).map(|i| scales[i % scales.len()]).collect();
+        let zero_points_expanded: Vec<i64> = (0..slots)
+            .map(|i| zero_points[i % zero_points.len()])
+            .collect();
+        let layer = ny_propagate::layers::QdqPerturbationLayer::try_certified(
+            &scales_expanded,
+            &zero_points_expanded,
+            range.0,
+            range.1,
+        )?;
+        debug!(
+            "QuantizeLinear {} lowered to certified QDQ relaxation ({} slot(s), eps[0]={:e})",
+            spec.name,
+            layer.param_slots(),
+            layer.epsilon()
+        );
+        Ok(Layer::QdqPerturbation(layer))
     }
 
     pub(crate) fn evaluate_dequantize_linear_constant(
@@ -650,19 +747,81 @@ mod tests {
 
     #[ntest::timeout(10000)]
     #[test]
-    fn direct_qdq_relaxation_attribute_is_rejected_until_float32_envelope_is_certified() {
+    fn activation_quantize_without_relaxation_marker_refuses_exactly_as_before() {
+        // The default path (no `qdq_relaxation` marker, which only the gated
+        // ny-onnx fusion can set) must refuse with the historical message,
+        // byte-identical.
         let weights = scale_only_weights();
-        let (shapes, constants) = (HashMap::new(), HashSet::new());
+        let shapes = HashMap::from([("x".to_string(), vec![4_i64])]);
+        let constants = HashSet::new();
         let ctx = ConvertContext::new(&weights, &shapes, &constants);
-        let spec = quantize_spec(
-            vec!["x", "scale"],
-            vec![("output_dtype", AttributeValue::Int(3))],
-            true,
-        );
+        let spec = quantize_spec(vec!["x", "scale"], vec![], false);
         let error = ctx
             .convert_quantize_linear(&spec)
-            .expect_err("synthetic qdq_relaxation must not bypass typed Q/DQ semantics");
-        assert!(error.to_string().contains("qdq_relaxation"), "{error}");
+            .expect_err("activation QuantizeLinear without the fusion marker must refuse");
+        assert_eq!(
+            error.to_string(),
+            "Unsupported operation: QuantizeLinear quantize with activation input is \
+             unsupported: rounding is non-linear"
+        );
+    }
+
+    #[ntest::timeout(10000)]
+    #[test]
+    fn qdq_relaxation_marker_builds_the_certified_layer() {
+        let weights = scale_only_weights();
+        let shapes = HashMap::from([("x".to_string(), vec![4_i64])]);
+        let constants = HashSet::new();
+        let ctx = ConvertContext::new(&weights, &shapes, &constants);
+        let spec = quantize_spec(vec!["x", "scale"], vec![], true);
+        let layer = ctx
+            .convert_quantize_linear(&spec)
+            .expect("fused qdq_relaxation spec must lower to the certified layer");
+        match layer {
+            ny_propagate::Layer::QdqPerturbation(qdq) => {
+                assert_eq!(qdq.param_slots(), 1);
+                // uint8 default range with scale 1.0: eps just above 0.5.
+                assert!(qdq.epsilon() > 0.5 && qdq.epsilon() < 0.51);
+            }
+            other => panic!("expected QdqPerturbation, got {}", other.layer_type()),
+        }
+    }
+
+    #[ntest::timeout(10000)]
+    #[test]
+    fn qdq_relaxation_int8_zero_point_uses_signed_range() {
+        let weights = int8_zero_point_weights();
+        let shapes = HashMap::from([("x".to_string(), vec![4_i64])]);
+        let constants = HashSet::new();
+        let ctx = ConvertContext::new(&weights, &shapes, &constants);
+        let spec = quantize_spec(vec!["x", "scale", "zp"], vec![], true);
+        let layer = ctx
+            .convert_quantize_linear(&spec)
+            .expect("int8 fused qdq_relaxation spec must lower");
+        assert!(matches!(layer, ny_propagate::Layer::QdqPerturbation(_)));
+    }
+
+    #[ntest::timeout(10000)]
+    #[test]
+    fn qdq_relaxation_refuses_nontrailing_per_axis_parameters() {
+        let mut weights = WeightStore::new();
+        weights.insert(
+            "scale".to_string(),
+            ArrayD::from_shape_vec(IxDyn(&[3]), vec![0.1, 0.2, 0.3]).unwrap(),
+        );
+        // Rank-2 internal shape: default ONNX axis 1 is NOT the trailing axis
+        // of the flattened layout, so this must fail closed.
+        let shapes = HashMap::from([("x".to_string(), vec![3_i64, 4])]);
+        let constants = HashSet::new();
+        let ctx = ConvertContext::new(&weights, &shapes, &constants);
+        let spec = quantize_spec(vec!["x", "scale"], vec![], true);
+        let error = ctx
+            .convert_quantize_linear(&spec)
+            .expect_err("non-trailing per-axis parameters must refuse");
+        assert!(
+            error.to_string().contains("trailing quantization axis"),
+            "{error}"
+        );
     }
 
     #[ntest::timeout(10000)]

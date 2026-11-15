@@ -283,9 +283,15 @@ fn try_flatten_f32<'a>(
         .map_err(|_| admission.allocation_error(site))?;
     admission.reconcile_capacity::<f32>(len, values.capacity(), site)?;
     deadline.checkpoint(site)?;
-    for &value in array {
-        values.push(value);
-        deadline.work(1, site)?;
+    // #poll-amortise: this arm is reached only for a NON-standard layout, so
+    // there is no slice to memcpy; amortise the poll and keep the walk.
+    {
+        let mut poll = crate::amortise::ChunkedPoll::new(|units| deadline.work(units, site));
+        for &value in array {
+            values.push(value);
+            crate::amortise::ReductionPoll::tick(&mut poll)?;
+        }
+        crate::amortise::ReductionPoll::flush(&mut poll)?;
     }
     deadline.checkpoint(site)?;
     Ok(Cow::Owned(values))
@@ -306,9 +312,15 @@ fn try_publish_f64_array(
         .map_err(|_| admission.allocation_error(site))?;
     admission.reconcile_capacity::<f32>(len, values.capacity(), site)?;
     deadline.checkpoint(site)?;
-    for &value in source {
-        values.push(publish(value));
-        deadline.work(1, site)?;
+    // #poll-amortise: the directed f64->f32 publication is per element by
+    // nature; only the poll is amortised, at the shared stride.
+    {
+        let mut poll = crate::amortise::ChunkedPoll::new(|units| deadline.work(units, site));
+        for &value in source {
+            values.push(publish(value));
+            crate::amortise::ReductionPoll::tick(&mut poll)?;
+        }
+        crate::amortise::ReductionPoll::flush(&mut poll)?;
     }
     deadline.checkpoint(site)?;
     Ok(Array1::from_vec(values).into_dyn())
@@ -614,8 +626,8 @@ impl LinearBounds {
     }
 
     pub(crate) fn validate_internal_shapes(&self) -> Result<()> {
-        let lower_shape = self.lower_a.shape().to_vec();
-        let upper_shape = self.upper_a.shape().to_vec();
+        let lower_shape = self.lower_a.shape();
+        let upper_shape = self.upper_a.shape();
         if lower_shape != upper_shape {
             return Err(NyError::InvalidSpec(format!(
                 "LinearBounds invariant violated: lower_a shape {:?} != upper_a shape {:?}",
@@ -668,7 +680,7 @@ impl LinearBounds {
     /// rows use self-checked double-double accumulation; non-finite rows fall
     /// back to directing every binary64 addition outward.
     ///
-    /// Handles ±Inf coefficients from `safe_add` accumulation (#3032):
+    /// Handles ±Inf coefficients from `safe_add` accumulation:
     /// rows with Inf bias or CROWN_COEFF_MAX overflow are short-circuited
     /// to ±Inf, and any NaN from the dot product is replaced with ±Inf.
     fn concretize_f64_inner(
@@ -746,7 +758,7 @@ impl LinearBounds {
         let lower_err = self.lower_a_err.as_ref();
         let upper_err = self.upper_a_err.as_ref();
         for i in 0..m {
-            // #1932: Defense-in-depth magnitude pre-check. If the bias is already
+            // Defense-in-depth magnitude pre-check. If the bias is already
             // ±inf (from CROWN backward row degradation), skip the dot product for
             // that bound — the row is already maximally loose. Also check for any
             // A coefficient exceeding CROWN_COEFF_MAX, which should not happen if
@@ -849,7 +861,7 @@ impl LinearBounds {
             // or NaN coefficients via safe_mul_for_bounds), fall back to conservative
             // bounds matching BatchedLinearBounds::concretize / interval_mul_for_bounds.
             //
-            // #3202: Only write back dot-product results for non-degraded bounds.
+            // Only write back dot-product results for non-degraded bounds.
             // When lower_degraded/lower_row_overflow is set, lower[i] was already
             // set to -inf above. Writing sum_l here would silently overwrite that
             // defense, defeating the CROWN_COEFF_MAX guard. Same for upper.
@@ -884,11 +896,11 @@ impl LinearBounds {
     /// Guarantees output has no NaN and no inversions (lower > upper).
     /// NaN is already replaced with ±Inf in `concretize_f64_inner`.
     /// Non-finite f32 values (from Inf coefficients produced by `safe_add`
-    /// accumulation, #3032) are repaired to `[-inf, +inf]` per-element.
+    /// accumulation) are repaired to `[-inf, +inf]` per-element.
     /// Any remaining inversions (from numerical instability in CROWN backward)
     /// are repaired per-element to `[-inf, +inf]`, which is always a sound
     /// overapproximation. This eliminates the need for post-concretize guards
-    /// at every call site (#2287).
+    /// at every call site.
     fn f64_to_bounded_tensor(
         &self,
         lower_f64: Array1<f64>,
@@ -1097,7 +1109,7 @@ impl LinearBounds {
                 input_bounds.shape().to_vec(),
             ));
         }
-        // #2239: directed rounding on f64→f32 for soundness.
+        // Directed rounding on f64→f32 for soundness.
         Ok(self.concretize_sound(input_bounds))
     }
 
@@ -1128,6 +1140,25 @@ impl LinearBounds {
     /// REQUIRES: `input_bounds.numel() == self.num_inputs()`.
     /// ENSURES: `result.lower()[i]` is a sound lower bound (rounded toward -∞).
     /// ENSURES: `result.upper()[i]` is a sound upper bound (rounded toward +∞).
+    ///
+    /// # Only for an ENCLOSURE (#concretize-vacuity)
+    ///
+    /// Each row is published as ONE interval, so a row whose certified lower
+    /// lands above its certified upper is repaired to `[-inf, +inf]`
+    /// (`f64_to_bounded_tensor_with_deadline`). For a relation that
+    /// encloses something that can only mean a broken relation or an empty box,
+    /// and widening is the fail-closed answer. It also means this method cannot
+    /// read the two endpoints of a relation that is only a SHARE of an
+    /// enclosure — one operand half of the MatMul / `BilinearCrown` McCormick
+    /// split (whose constant is halved onto each side), or one node's share of a
+    /// CROWN frontier. A share's lower may legitimately sit above its own upper
+    /// (e.g. at a point); each endpoint is then still a valid contribution to its
+    /// side of the sum, and the repair discards both. Sum the shares first — as
+    /// `backward_dispatch` and the input accumulator do — and concretize the sum.
+    /// (The per-node IBP / Div `ConcretizeCurrentNode` fallbacks, the graph-α cut
+    /// segment and the truncated-frontier collapse DO concretize a node's share
+    /// here; an inverted share then vacates its row — sound, but loose. Pinned by
+    /// `matmul_operand_share_can_invert_over_a_genuine_box_so_per_share_concretization_vacates`.)
     pub fn concretize_sound(&self, input_bounds: &BoundedTensor) -> BoundedTensor {
         match self.concretize_sound_with_deadline(input_bounds, None) {
             Ok(bounds) => bounds,

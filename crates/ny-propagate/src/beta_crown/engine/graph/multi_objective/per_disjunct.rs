@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Per-disjunct alpha optimization for multi-objective graph BaB (#4355).
+//! Per-disjunct alpha optimization for multi-objective graph BaB.
 //!
 //! When `optimize_disjuncts_separately` is enabled, each unverified disjunct
 //! gets its own alpha state optimized to prove that specific output constraint.

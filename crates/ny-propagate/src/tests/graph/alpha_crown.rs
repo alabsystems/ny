@@ -603,13 +603,13 @@ fn test_graph_dag_alpha_crown_slice_backward_semantics() {
     }
 }
 
-/// Regression test #2099: alpha-CROWN with empty-input ReLU returns InvalidSpec,
+/// Regression test: alpha-CROWN with empty-input ReLU returns InvalidSpec,
 /// not an index-out-of-bounds panic.
 #[ntest::timeout(10000)]
 #[test]
 fn test_alpha_crown_empty_inputs_relu_returns_invalid_spec_2099() {
-    // Updated for #2991: GraphNode::new() now asserts arity at construction time
-    // (#2481, #2686). Use try_new() to verify construction-time validation.
+    // GraphNode::new() now asserts arity at construction time
+    //Use try_new() to verify construction-time validation.
     let err = GraphNode::try_new("relu", Layer::ReLU(ReLULayer), vec![])
         .expect_err("empty-input ReLU should return InvalidSpec at construction");
     assert!(
@@ -623,7 +623,7 @@ fn test_alpha_crown_empty_inputs_relu_returns_invalid_spec_2099() {
     );
 }
 
-/// Regression test #2113: alpha-CROWN best-bounds merge returns InternalError
+/// Regression test: alpha-CROWN best-bounds merge returns InternalError
 /// on element-count mismatch instead of panicking via assert_eq!.
 ///
 /// The shape-mismatch path is an InternalError guard that fires when CROWN
@@ -636,7 +636,7 @@ fn test_alpha_crown_empty_inputs_relu_returns_invalid_spec_2099() {
 fn test_alpha_crown_best_bounds_merge_no_panic_2113() {
     // Build a sequential graph: Linear -> ReLU -> Linear -> ReLU
     // This exercises the best-bounds merge loop in propagate_sequential.rs
-    // where assert_eq! was replaced with Result-based error handling (#2113).
+    // where assert_eq! was replaced with Result-based error handling.
     let mut graph = GraphNetwork::new();
 
     let w1 = arr2(&[[1.0_f32, -0.5], [0.5, 1.0], [-1.0, 0.3]]);
@@ -802,7 +802,7 @@ fn assert_output_at_least_ibp(
     }
 }
 
-/// Regression test for #2251: collect_alpha_crown_bounds_dag element-wise best
+/// Regression test: collect_alpha_crown_bounds_dag element-wise best
 /// output bound tracking. Before the fix, the optimization loop tracked only a
 /// scalar sum comparison which could discard per-dimension tightness.
 #[ntest::timeout(10000)]
@@ -916,9 +916,9 @@ fn assert_sequential_relu_soundness(bounds: &BoundedTensor) {
     }
 }
 
-/// Regression test for #2477: sequential alpha-CROWN uses CROWN-IBP.
+/// Regression test: sequential alpha-CROWN uses CROWN-IBP.
 ///
-/// Strengthened for #2512: computes CROWN output bounds using IBP-only vs CROWN-IBP
+/// Computes CROWN output bounds using IBP-only vs CROWN-IBP
 /// intermediates, then verifies α-CROWN is at least as tight as CROWN-with-CROWN-IBP.
 /// If propagate_sequential.rs:105 were reverted to `collect_node_bounds`, α-CROWN
 /// would match the looser IBP baseline and this assertion would fail.

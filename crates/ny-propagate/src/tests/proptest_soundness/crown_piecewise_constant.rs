@@ -8,8 +8,6 @@
 //! These layers have zero-slope relaxations (constant bounds equivalent to IBP).
 //! CROWN backward with identity incoming bounds should produce slope=0 and
 //! intercepts equal to the IBP bounds.
-//!
-//! Part of #40, #1793.
 
 use crate::layers::{CeilLayer, FloorLayer, RoundLayer, SignLayer, TruncLayer};
 use crate::LinearBounds;

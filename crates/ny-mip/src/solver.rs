@@ -2,17 +2,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 //
-// MIP solver wrapper for neural network verification: lowers the
-// solver-neutral IR to the ay backend at solve time (SOLVER POLICY:
-// docs/SOLVER_POLICY.md — ay is the only solver in ny; HiGHS was deleted
-// at LG3 once verified ay certificates replaced it as the independent
-// cross-check).
-//
-// Two use cases:
-// 1. Complete verification: check feasibility of constrained region
-//    (SAT = counterexample exists, UNSAT = property verified)
-// 2. LP bound tightening: minimize/maximize neuron values subject to
-//    network constraints (see `tighten`)
+// Feasibility and LP bound tightening through AY. SAT points require caller
+// replay; certified infeasibility can exclude the encoded unsafe region.
+// See docs/SOLVER_POLICY.md.
 
 use crate::config::{MipBackend, MipConfig, MipFeasibilityIngress};
 use crate::encoder::MipParts;
@@ -126,7 +118,7 @@ pub enum OneSidedSatProbe {
 }
 
 /// Cap on the number of binaries fixed by phase-split racing: 2^4 = 16
-/// subproblems, matching the core counts this targets (designs/scip.md).
+/// subproblems, matching the core counts this targets.
 const MAX_SPLIT_K: usize = 4;
 
 /// Validate and classify a caller-identified one-sided row.
@@ -1239,8 +1231,8 @@ impl SplitUnsatCache {
 
 /// Aggregate phase-split subproblem results into the parent verdict.
 ///
-/// SOUNDNESS CONTRACT (designs/scip.md Phase C): the subproblems exactly
-/// partition the parent's feasible set, so:
+/// SOUNDNESS CONTRACT: the subproblems exactly partition the parent's
+/// feasible set, so:
 /// - any `Sat` is a feasible parent point -> return it (first wins);
 /// - `Unsat` requires EXACTLY `expected` Unsat sub-verdicts — a missing,
 ///   Timeout, or Error sub-result forces `Timeout`, never `Unsat`.
@@ -1432,6 +1424,70 @@ impl MipSolver {
         self.check_feasibility_with_warm_start(None)
     }
 
+    /// Check one serial MILP domain while reusing independently replayed
+    /// integer cuts. The bank is updated only by an in-budget completed solve.
+    ///
+    /// Every cut is replayed against this domain's original MILP before it is
+    /// installed. A certified UNSAT then composes those integer premises with
+    /// NY's replay of the augmented-model proof. This does not confer LP-only
+    /// `CertifiedRow` or continuous lower-bound authority. Sibling domains must
+    /// preserve the actual source rows and integrality used by every cut.
+    ///
+    /// This explicit serial entry requires historical AY ingress and disabled
+    /// phase racing; required shared-prefix policies cannot silently fall back.
+    pub fn check_feasibility_with_integer_cut_bank(
+        &self,
+        bank: &mut crate::IntegerCutBank,
+    ) -> Result<MipResult> {
+        if self.config.backend != MipBackend::Ay
+            || self.config.feasibility_ingress != MipFeasibilityIngress::Historical
+            || self.config.parallel_split != 1
+            || self.safenlp_shared_prefix != SafeNlpSharedPrefixState::Disabled
+            || self.safenlp_target_fsb_prefix != SafeNlpTargetFsbPrefixState::Disabled
+        {
+            return Err(MipError::Solver(
+                "integer cut banking requires serial historical AY ingress".into(),
+            ));
+        }
+        // Charge bank cloning, lowering, cut replay and outcome replay to one
+        // original absolute envelope, including the existing window floor.
+        let timeout_secs = self.effective_feasibility_timeout_secs();
+        if !timeout_secs.is_finite() {
+            return Err(MipError::Solver(
+                "integer cut solve requires a finite timeout".into(),
+            ));
+        }
+        if timeout_secs <= 0.0 {
+            return Ok(MipResult::Timeout);
+        }
+        let deadline = std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs_f64(timeout_secs))
+            .ok_or_else(|| MipError::Solver("integer cut solve deadline overflow".into()))?;
+        let deadline = self
+            .config
+            .ay_hard_deadline
+            .map_or(deadline, |outer| deadline.min(outer));
+        let Some(bank_snapshot) = bank.snapshot_with_deadline(deadline) else {
+            return Ok(MipResult::Timeout);
+        };
+        let _ = crate::dump::maybe_dump(&self.parts.problem);
+        let (result, completed_bank) = crate::ay_lib::check_feasibility_with_integer_cut_bank(
+            &self.parts.problem,
+            timeout_secs,
+            Some(deadline),
+            self.config.ay_node_warm_time_limit,
+            &self.parts.input_vars,
+            &self.parts.output_vars,
+            None,
+            &self.ay_branch_hint_order(),
+            Some(bank_snapshot),
+        )?;
+        if let Some(completed) = completed_bank {
+            *bank = completed;
+        }
+        Ok(result)
+    }
+
     /// Check feasibility with an optional warm-start primal solution.
     ///
     /// If `warm_start_cols` is provided, the solver attempts to seed the
@@ -1442,10 +1498,8 @@ impl MipSolver {
     ///
     /// When phase-split racing is enabled (`MipConfig::parallel_split`, the
     /// default) and the problem has unstable ReLU binaries, the check races
-    /// the 2^k fixed-prefix subproblems across threads (designs/scip.md
-    /// Phase C); otherwise it is a single serial solve.
-    ///
-    /// Part of #3865: PGD-to-HiGHS warm start.
+    /// the 2^k fixed-prefix subproblems across threads; otherwise it is a
+    /// single serial solve.
     pub fn check_feasibility_with_warm_start(
         &self,
         warm_start_cols: Option<&[f64]>,
@@ -1832,7 +1886,6 @@ impl MipSolver {
     /// advice policy: widest-first by default, closest-to-stable first under
     /// `NY_MIP_STABILITY_HINTS=1`. Here `k = ceil(log2(threads))` capped at
     /// [`MAX_SPLIT_K`] and at the number of available binaries.
-    /// designs/scip.md Phase C.
     fn split_plan(&self) -> Option<Vec<ir::Col>> {
         let threads = match self.config.parallel_split {
             0 => std::thread::available_parallelism()
@@ -1923,7 +1976,7 @@ impl MipSolver {
         )
     }
 
-    /// Phase-split parallel racing (designs/scip.md Phase C).
+    /// Phase-split parallel racing.
     ///
     /// Enumerates all 2^k assignments of the chosen ReLU indicator binaries,
     /// clones the IR per assignment with those binaries FIXED (bounds pinned

@@ -5,8 +5,7 @@
 //! End-to-end tests for CROWN-IBP intermediate tightening on transformer-style
 //! graphs containing unary ops (GELU, SiLU, Softmax, LayerNorm, RmsNorm).
 //!
-//! These tests verify the Phase 3 acceptance criteria from
-//! `designs/2026-03-13-issue-3628-transformer-intermediate-bounds-architecture.md`:
+//! These tests verify:
 //! - Narrowed blocklist allows CROWN-IBP collection for unary transformer ops
 //! - Demand-driven selection produces strictly tighter intermediates than IBP
 //! - Demand-driven provenance correctly skips non-demand nodes
@@ -76,10 +75,8 @@ fn build_relu_gelu_graph() -> GraphNetwork {
     graph
 }
 
-/// #3628/#3775: Verify the narrowed blocklist allows CROWN-IBP collection
+/// Verify the narrowed blocklist allows CROWN-IBP collection
 /// and that demand-driven tightening produces strictly tighter intermediates.
-///
-/// Reference: designs/2026-03-13-issue-3628-transformer-intermediate-bounds-architecture.md
 #[ntest::timeout(60000)]
 #[test]
 fn test_gelu_graph_crown_ibp_tightening_3628() {

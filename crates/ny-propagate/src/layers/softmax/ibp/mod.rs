@@ -20,8 +20,6 @@ impl SoftmaxLayer {
     /// When restart batching adds a leading axis, positive stored axes (which
     /// used unbatched convention `axis - 1` at load time) must shift right by
     /// one to resolve against the correct sample-space dimension.
-    ///
-    /// Part of #4096.
     pub fn propagate_ibp_preserve_leading_axis(
         &self,
         input: &BoundedTensor,
@@ -73,7 +71,7 @@ impl SoftmaxLayer {
                     // Sanity guard: every score must be finite after the max-upper shift.
                     // (The per-ratio shift below uses its own dominant term, but this shared
                     // shift confirms no exp overflows; non-finite -> conservative [0, 1].)
-                    // #2423/#3245: f64 throughout for precision + directed-rounding soundness.
+                    // f64 throughout for precision + directed-rounding soundness.
                     let n = in_lower_lane.len();
                     let max_upper_f64 = max_upper as f64;
                     for i in 0..n {
@@ -92,13 +90,13 @@ impl SoftmaxLayer {
                     }
 
                     // Second pass: per-coordinate monotone optimum with a PER-RATIO
-                    // shift, in f64, cast to f32 with directed rounding. (#3245, #4231)
+                    // shift, in f64, cast to f32 with directed rounding.
                     //
                     // The exact per-coordinate optimum is:
                     //   p_hi[i] = exp(u_i) / (exp(u_i) + sum_{j!=i} exp(l_j))
                     //   p_lo[i] = exp(l_i) / (exp(l_i) + sum_{j!=i} exp(u_j))
                     //
-                    // SOUNDNESS (#4231): the previous code shifted EVERY exp by a single
+                    // SOUNDNESS: the previous code shifted EVERY exp by a single
                     // shared `max_upper` and added SOFTMAX_EPSILON to the denominator. In
                     // the underflow / large-score-gap regime (a key whose own scores sit
                     // ~745+ below the shared shift) that drives the numerator exp(u_i - M)

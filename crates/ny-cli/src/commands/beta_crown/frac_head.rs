@@ -126,6 +126,10 @@ pub(super) fn try_frac_head_verification(
         return None;
     };
     let start = Instant::now();
+    // #phase-cost: see `ny_core::phase_cost` (observability only). Entered
+    // AFTER the kill-switch read so that site's reviewed source anchor (the
+    // tokens around the literal) is unchanged.
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Exact);
 
     let plan = detect(graph, input_shape, vnnlib)?;
     info!(

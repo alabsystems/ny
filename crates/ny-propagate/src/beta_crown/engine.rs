@@ -56,6 +56,33 @@ pub struct BetaCrownVerifier {
     /// Configuration.
     pub config: BetaCrownConfig,
     engine: Option<Arc<dyn GemmEngine>>,
+    /// `#split-hint`: per-input influence magnitudes derived ONCE from the ROOT
+    /// plane, used by the input-split dimension selector when a domain has no
+    /// plane of its own.
+    ///
+    /// # Why this exists
+    /// `input_split_scores` scores a dimension by `width` alone whenever
+    /// `domain.linear_bounds` is `None` — an OUTPUT-BLIND choice. Measured on
+    /// cgan `upsample_prop_0`: 16 consecutive batches with the queue pinned at
+    /// exactly 2640, `head_depth` climbing 78 -> 93, and `best_gap` FROZEN at
+    /// -0.0001. Fifteen levels of splitting bought zero bound improvement. The
+    /// root HAS a plane; children are built with `linear_bounds: None` and throw
+    /// that information away.
+    ///
+    /// # ⛔ Why it is a SEPARATE field and not a synthesized `linear_bounds`
+    /// `domain.linear_bounds` is NOT selector-only. `screen_child` feeds it to
+    /// `clip_with_precomputed_linear` / `complete_clip_with_precomputed_specs`
+    /// and, on `clip_outcome.verified`, does `domains_verified += 1; return` —
+    /// DECLARING THE DOMAIN VERIFIED — then tightens the child input box from
+    /// it. Putting an uncertified vector there is a false-`unsat` generator.
+    /// **This field is read at exactly one site, the scorer, and must never be
+    /// consumed by a bound, a clip, or a verification.**
+    ///
+    /// # Soundness
+    /// WHICH dimension is split is schedule-only: splitting any dimension is
+    /// sound, so this needs no certification. `OnceLock` so it is written once
+    /// at the root and read freely thereafter without `&mut`.
+    root_split_hint: std::sync::OnceLock<Vec<f32>>,
     input_split_metrics_sink: Option<Arc<dyn InputSplitMetricsSink>>,
     graph_domain_batch_metrics_sink: Option<Arc<dyn GraphDomainBatchMetricsSink>>,
     /// Optional per-domain joint-margin closer for same-LHS conjunctive
@@ -66,6 +93,9 @@ pub struct BetaCrownVerifier {
     /// this is byte-for-byte inert unless the CLI attaches it for a same-LHS
     /// max-diff reduction (acasxu prop_2/3/4).
     joint_margin_closer: Option<Arc<JointMarginCloser>>,
+    /// Concrete original-singleton source continuation. It never imports
+    /// generic leaves as proof and shares the original invocation authority.
+    input_head_continuation: Option<Arc<crate::margin_row::InputHeadContinuation>>,
     /// Optional Graph-MIP LEAF oracle (increment 6,
     /// `docs/GRAPH_MIP_LEAF_SOLVER.md`): consulted by the graph ReLU-split
     /// BaB right before an UNDECIDED child is requeued, to decide the
@@ -73,6 +103,21 @@ pub struct BetaCrownVerifier {
     /// admission). Runtime-only and attached by the MIP-enabled CLI unless
     /// `NY_GRAPH_MIP_LEAF=0`; `None` is byte-for-byte inert.
     graph_mip_leaf_oracle: Option<Arc<dyn crate::beta_crown::graph_mip_leaf::GraphMipLeafOracle>>,
+    /// #vit-margin-alpha-complex (P8): optional INDEPENDENT forward (ONNX
+    /// Runtime, attached by ny-cli only when `bab.mo_root_ort_adjudication`
+    /// is armed) that the default-off containment fence uses to adjudicate a
+    /// ROOT-terminal multi-objective `Verified`. Runtime-only; `None` (never
+    /// attached) is byte-for-byte inert. Preserved across `with_config_from`.
+    root_adjudication_oracle:
+        Option<Arc<dyn crate::beta_crown::root_adjudication::RootAdjudicationOracle>>,
+    /// #relusplitter-lp-refine (wave-6 C7): optional ROOT intermediate-bound
+    /// refiner (ny-cli's rigorous LP refiner, attached only when
+    /// `bab.mip_refine_intermediates` is armed). The multi-objective graph
+    /// root intersects its certified candidates shrink-only into the stored
+    /// node boxes before the root objective pass and the BaB setup. Runtime-
+    /// only; `None` (never attached) is byte-for-byte inert. Preserved across
+    /// `with_config_from`.
+    root_interm_refiner: Option<Arc<dyn crate::beta_crown::root_interm_refine::RootIntermRefiner>>,
     /// Exact root intermediate-bound result shared by deterministic restarts of
     /// one top-level grouped-disjunctive verification call. The CLI attaches a
     /// fresh cache for explicitly typed cGAN roots and under the ordinary
@@ -125,6 +170,30 @@ pub struct BetaCrownVerifier {
     /// lifetime; descendant waves and later eligible waves remain on the
     /// ordinary selector without minting another private deadline.
     pub(crate) attribution_diag_fired: std::sync::atomic::AtomicBool,
+    /// #graph-bab-cover-ledger: the completeness-ledger frame a ledgered graph
+    /// BaB driver arms for one invocation (`certify::graph`). Idle — one
+    /// relaxed atomic load per recording site — unless a driver armed it.
+    /// Fresh per verifier (`with_config_from` builds a new one), so a
+    /// sub-verifier never records into its parent's frame.
+    pub(crate) graph_cover: crate::certify::graph::GraphCoverSlot,
+    /// #la-warm-frontier: engagement counters of the frontier-complete lA warm
+    /// start (captures, resumes, refusals). Shared with every sub-verifier
+    /// built by `with_config_from`, so one lane's `[la-warm-frontier]` line
+    /// counts its sub-verifiers' seeds too. Telemetry only.
+    pub(crate) la_warm_frontier_counters:
+        Arc<graph::propagation::warm_frontier::WarmFrontierCounters>,
+    /// #kfsb-production: the armed single-shot kFSB scorer's counters, its
+    /// per-decision line cap and the lane's R4 fan-out lease. Shared with
+    /// every sub-verifier built by `with_config_from` (one lane, one
+    /// `[kfsb-single-shot] summary` line, one line budget). Telemetry and
+    /// admission only.
+    pub(crate) kfsb_single_shot_telemetry:
+        Arc<graph::gpu_bab::kfsb_fanout::KfsbSingleShotTelemetry>,
+    /// #vit-v3-bankable: the multi-objective cover-certification run state
+    /// (replay base, β hints, leaf-oracle closes) paired with a rows frame on
+    /// `graph_cover`. Idle unless a disjunctive multi-objective call armed it
+    /// (`bab.mo_cover_certify`). Fresh per verifier, like `graph_cover`.
+    pub(crate) mo_cover: graph::mo_cover::MoCoverState,
 }
 
 /// #extract-skeleton increment 3: verifier-lifetime cache of
@@ -200,10 +269,9 @@ struct RelaxedClipOutcome {
 ///
 /// Unlike `RelaxedClipOutcome`, this does NOT collapse per-row lower bounds into
 /// a single `verified` boolean. Grouped/disjunctive callers need the per-row
-/// lower bounds for their own OR-within-clause and AND-across-clauses reduction
-/// (see `#3740`).
+/// lower bounds for their own OR-within-clause and AND-across-clauses reduction.
 ///
-/// Production code now uses `batched_relaxed_clip_from_flat` (#4366) with
+/// Production code now uses `batched_relaxed_clip_from_flat` with
 /// direct concretization, so this struct is only needed by test helpers.
 #[cfg(test)]
 #[derive(Debug)]

@@ -274,7 +274,7 @@ fn test_sparse_bounds_merge_into_error_without_masks() {
     assert!(result.is_err());
 }
 
-/// Regression test for #2084/#2091: merge_into must not silently skip the
+/// Regression test: merge_into must not silently skip the
 /// bounds merge when layer bounds are non-contiguous.
 ///
 /// The original bug was that `as_slice_mut()` returned `None` for a
@@ -331,7 +331,7 @@ fn test_sparse_bounds_merge_into_noncontiguous_normalizes_layout() {
 
     // merge_into must NOT silently skip the merge: it normalizes the
     // non-contiguous array in place and returns Ok rather than dropping the
-    // tightening pass (the original #2084/#2091 bug).
+    // tightening pass (the original bug).
     sparse
         .merge_into(&mut batched)
         .expect("merge_into should normalize non-contiguous bounds and succeed");

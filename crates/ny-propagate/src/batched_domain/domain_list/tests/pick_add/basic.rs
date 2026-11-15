@@ -183,7 +183,7 @@ fn test_pick_out_batched_preserves_data() {
 
     // Verify constraint history is preserved
     assert_eq!(picked.metadata[0].constraints.len(), 0);
-    assert!(!picked.metadata[1].constraints.is_empty());
+    assert_ne!((picked.metadata[1].constraints).len(), 0);
 }
 
 #[ntest::timeout(10000)]
@@ -390,7 +390,7 @@ fn test_sort_by_domain_priority_upper_mode_matches_cpu_heap_3870() {
     assert_eq!(picked.metadata[2].depth(), 1);
 }
 
-/// Regression for #3870: cached_la (linear bounds for SB scoring) must survive
+/// Regression: cached_la (linear bounds for SB scoring) must survive
 /// the DomainList add → sort → pick round-trip. If sorting drops or misaligns
 /// cached_la, the GPU input-split SB scorer falls back to width-only splitting,
 /// which selects the wrong split dimension on lsnc_relu-shaped models.
@@ -506,7 +506,7 @@ fn test_cached_linear_bounds_survive_sort_roundtrip_3870() {
     assert!(!picked.metadata[1].needs_bounding());
 }
 
-/// Regression for #4406: sort_by_domain_priority must succeed when the
+/// Regression: sort_by_domain_priority must succeed when the
 /// underlying QueueTensorStorage has wrapped (BreadthFirst with add→pick→add
 /// cycle). Before this fix, the sort path called `global_lbs.tensor()` which
 /// rejects non-contiguous wrapped queue data. The fix derives sort scores from
@@ -623,7 +623,7 @@ fn test_sort_by_domain_priority_wrapped_queue_lower_mode_4406() {
     assert_eq!(list.len(), 4);
 
     // Step 4: sort_by_domain_priority must succeed despite wrapped queue.
-    // Before the #4406 fix this panicked with:
+    // Before the fix this panicked with:
     //   "QueueTensorStorage::tensor() requires contiguous data"
     list.sort_by_domain_priority(false).unwrap();
 

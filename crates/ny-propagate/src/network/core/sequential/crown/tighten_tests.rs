@@ -8,8 +8,7 @@
 //! intersection, and provenance tracking.
 //!
 //! Reference: alpha-beta-CROWN `optimized_bounds.py:937-947`.
-//! Reference: #3043 — duplication of intersection caused #2990 and #3037.
-//! Part of #4205.
+//! Duplicated intersection logic has caused regressions before.
 
 use super::*;
 use ndarray::{arr1, Array1};
@@ -103,7 +102,7 @@ fn test_tighten_crown_output_multi_element() -> Result<()> {
 
 // ── tighten_crown_output: shape mismatch handling ─────────────────────────
 
-/// Shape mismatch with same element count: reshape CROWN to match forward (#3300).
+/// Shape mismatch with same element count: reshape CROWN to match forward.
 #[test]
 fn test_tighten_crown_output_shape_mismatch_same_count_reshapes() -> Result<()> {
     // Forward: shape [1, 2, 2] (3D array with 4 elements)

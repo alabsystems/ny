@@ -7,7 +7,7 @@ use ndarray::ArrayD;
 #[cfg(test)]
 use ny_core::{NyError, Result};
 
-// Re-export NaN-propagating helpers from ny_core (canonical home per #2654).
+// Re-export NaN-propagating helpers from ny_core (their canonical home).
 pub use ny_core::{nan_propagating_max_zero, nan_propagating_min_zero};
 
 pub(crate) use ny_core::f32_to_f64_exact as f32_to_f64_exact_for_bounds;
@@ -302,7 +302,7 @@ pub fn sign_split_compose_for_bounds(ds_l: f32, ds_u: f32, c_l: f32, c_u: f32) -
     (lower, upper)
 }
 
-// Re-export NaN-propagating min/max from ny_core (canonical home per #2654).
+// Re-export NaN-propagating min/max from ny_core (their canonical home).
 pub use ny_core::{nan_propagating_max, nan_propagating_min};
 
 /// Safe addition for lower bounds (NaN → -inf).
@@ -344,11 +344,11 @@ mod tests {
     use super::*;
 
     // Unit tests for nan_propagating_{max,min}_zero and nan_propagating_{min,max}
-    // live in ny-core/src/nan_math.rs (canonical home per #2654).
+    // live in ny-core/src/nan_math.rs (their canonical home).
     // This module only tests safe_math-specific functions and composition.
 
     /// Verify that NaN propagation through the full safe_mul_for_bounds chain works.
-    /// This is the end-to-end test for the #2415 fix: NaN coefficient → NaN output.
+    /// This is the end-to-end regression test: NaN coefficient → NaN output.
     #[test]
     fn test_nan_coefficient_propagates_through_safe_mul() {
         // With the old code: NaN.max(0.0) = 0.0, safe_mul(0.0, 1.0) = 0.0 → NaN absorbed
@@ -433,7 +433,7 @@ mod tests {
 
     /// Opposing infinite plane contributions cancel to NaN per-side; widen to
     /// the sound saturating bound rather than leaking NaN. Mirrors the N-D
-    /// compose NaN-fallback regression (#4204).
+    /// compose NaN-fallback regression.
     #[test]
     fn test_sign_split_compose_opposing_infinities_widen() {
         // ds_l > 0 selects c_l = -inf for lower; ds_u > 0 selects c_u = +inf.

@@ -179,7 +179,6 @@ impl BatchNormLayer {
         // No swap for s < 0: CROWN backward composes by substitution, not IBP.
         // Negative s just flips coefficient sign; downstream nonlinear relaxations
         // already branch on coefficient sign.
-        // Reference: designs/2026-01-29-crown-affine-negative-scale.md
         //
         // Vectorized as a broadcast multiply with a zero-mask reproducing
         // `safe_mul_for_bounds` EXACTLY: whenever `a == 0` OR `s == 0` the product

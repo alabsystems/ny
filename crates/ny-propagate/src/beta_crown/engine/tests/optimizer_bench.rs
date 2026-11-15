@@ -157,7 +157,7 @@ fn test_benchmark_adam_baseline() {
     );
 
     // Verifier should explore domains even if the problem doesn't converge.
-    // After #1865, the verifier correctly returns Unknown when domains hit
+    // The verifier correctly returns Unknown when domains hit
     // depth/propagation limits instead of falsely claiming Verified.
     assert!(result.iterations > 0, "Should explore at least one domain");
 }
@@ -444,7 +444,7 @@ Convergence rate: {}/{} ({:.0}%)",
         (converged_count as f32 / total as f32) * 100.0
     );
 
-    // After #1865, the verifier correctly returns Unknown when domains hit
+    // The verifier correctly returns Unknown when domains hit
     // depth/propagation limits. Convergence is not guaranteed for hard problems.
     // The comparison table is still useful for relative optimizer analysis.
     // If any converge, verify their bounds are valid.
@@ -531,7 +531,7 @@ fn test_optimizer_lr_schedule_comparison() {
         results.push(result);
     }
 
-    // After #1865, the verifier correctly returns Unknown when domains hit
+    // The verifier correctly returns Unknown when domains hit
     // depth/propagation limits. Convergence is not guaranteed for hard problems.
     let converged_count = results.iter().filter(|r| r.converged).count();
     println!(

@@ -436,7 +436,7 @@ pub fn run_inference(
     let mut result = Vec::new();
     for (_name, output) in outputs.iter() {
         let (shape, data) = output.try_extract_tensor::<f32>()?;
-        // #2983: ORT shapes are i64; use try_from to reject negative dimensions.
+        // ORT shapes are i64; use try_from to reject negative dimensions.
         let shape_vec: Vec<usize> = shape
             .iter()
             .map(|&d| usize::try_from(d).unwrap_or(1))
@@ -477,7 +477,7 @@ pub fn run_inference_bytes(
     let mut result = Vec::new();
     for (_name, output) in outputs.iter() {
         let (shape, data) = output.try_extract_tensor::<f32>()?;
-        // #2983: ORT shapes are i64; use try_from to reject negative dimensions.
+        // ORT shapes are i64; use try_from to reject negative dimensions.
         let shape_vec: Vec<usize> = shape
             .iter()
             .map(|&d| usize::try_from(d).unwrap_or(1))
@@ -796,7 +796,7 @@ pub fn run_inference_with_intermediates(
     for (name, output) in outputs.iter() {
         match output.try_extract_tensor::<f32>() {
             Ok((shape, data)) => {
-                // #2983: ORT shapes are i64; use try_from to reject negative dimensions.
+                // ORT shapes are i64; use try_from to reject negative dimensions.
                 let shape_vec: Vec<usize> = shape
                     .iter()
                     .map(|&d| usize::try_from(d).unwrap_or(1))
@@ -854,7 +854,7 @@ pub fn run_inference_with_intermediates_bytes(
     for (name, output) in outputs.iter() {
         match output.try_extract_tensor::<f32>() {
             Ok((shape, data)) => {
-                // #2983: ORT shapes are i64; use try_from to reject negative dimensions.
+                // ORT shapes are i64; use try_from to reject negative dimensions.
                 let shape_vec: Vec<usize> = shape
                     .iter()
                     .map(|&d| usize::try_from(d).unwrap_or(1))

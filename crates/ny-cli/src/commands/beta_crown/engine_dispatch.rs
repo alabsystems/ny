@@ -8,8 +8,6 @@
 //! (GPU BaB, ReLU split, input split) that both `beta_crown verify` and
 //! `bench_acasxu` can call with the appropriate engine. This eliminates
 //! the hardcoded `engine: None` in the benchmark path.
-//!
-//! Part of #1881: CLI verification semantics unification.
 
 use anyhow::Result;
 use ny_core::GemmEngine;
@@ -30,7 +28,7 @@ use ny_tensor::BoundedTensor;
 /// Both `verify.rs` and `bench_acasxu.rs` should call this instead of
 /// directly calling the verifier methods, ensuring consistent engine wiring.
 ///
-/// Part of #3870: the `gpu_bab` check was previously nested under `use_relu_split`,
+/// The `gpu_bab` check was previously nested under `use_relu_split`,
 /// which blocked `InputSplit + gpu_bab` from reaching the DomainList engine.
 // Justification: This dispatch function forwards the exact parameter set needed
 // by the underlying verifier methods — model, bounds, spec, execution mode,

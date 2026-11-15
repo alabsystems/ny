@@ -12,8 +12,84 @@
 # throughput regression. The GPU engine is only beneficial for large models
 # where matmul cost exceeds kernel dispatch overhead. Part of #3870.
 #
-# NOTE: max_domains raised to 10M (reference uses infinity). With default
-# 100K and 13 disjunctive clauses, only 3 clauses fit in 25s budget.
+# NOTE (2026-08-28, CORRECTED): the superseded note kept at the bottom of this
+# block INVERTED the recommendation it was read for, and reading it as a
+# throughput brief has already cost this project sessions. `max_domains` stays
+# at 10M — this is a comment-only correction — but the reasoning below it is
+# what to act on.
+#
+# 1. TENSOR-BATCHED CROWN ALREADY SHIPPED — it is not a "Phase 2 target".
+#    `834906092` (2026-07-18) landed the `#lsnc-batched-bwd` SoA
+#    batched-tensor backward, crates/ny-propagate/src/beta_crown/engine/graph/
+#    propagation/batched/batched_bwd.rs, behind `NY_INPUT_SPLIT_BATCHED_BWD`
+#    and — per the house pattern and its own subject line — DEFAULT OFF. The
+#    default was flipped ON the same day by a SEPARATE commit, `392407671`,
+#    after its verdict-identity check; ON is what the tree carries today
+#    (batched_bwd.rs:92 doc, :114-127). Do not merge the two: `git show --stat
+#    834906092` announces "(default OFF)" in its first line, so attributing the
+#    default to it makes this note contradict the first thing it tells you to
+#    read. The lane is pinned bit-identical to the reference per-domain loop.
+#    `392407671`'s A/B measured 2.5-2.7x on the matched-batch backward and
+#    1.5-2.4x big-batch domains/s. The mechanism the old note asks for exists
+#    and has been in the tree for six weeks.
+#
+# 2. AND IT IS DARK ON EVERY SCORED RUN. Five days later `6f49a660d`
+#    (2026-07-23) put a decline at the head of `try_backward_soa`
+#    (batched_bwd.rs:646-657). Read it precisely: expiry IS tested, but only to
+#    convert an ALREADY-BLOWN deadline into `Err(DeadlineExceeded)` (:651-655);
+#    a LIVE deadline falls straight through to `return Ok(None)` (:656). So it
+#    is the deadline's PRESENCE, not its expiry, that disables the lane, and
+#    the caller (batched.rs:4744) falls through to the untouched reference
+#    loop. The
+#    deadline is `effective_graph_bab_deadline()` (engine/core.rs:140), which
+#    is `Some` whenever a timeout is configured, i.e. on every run under an
+#    official budget. So the fast lane is reachable only from tests and
+#    no-deadline research runs, and competition runs the OLD loop by
+#    construction. The gap is DEAD CAPABILITY, not missing capability, and no
+#    amount of further kernel work changes that until the decline is lifted or
+#    given a cooperative cancellation seam. (Same commit is the standing prime
+#    suspect for the dist_shift / cgan-row-7 deadline cliffs —
+#    docs/BIG3_CORE_CAMPAIGN_2026-08-19.md:315.)
+#
+# 3. lsnc's OWN 0/65 IS NOT A THROUGHPUT DEFICIT AT ALL, so it cannot fund
+#    throughput work even if (2) were fixed. Re-measured 2026-08-25, see
+#    lsnc_relu.yaml:12-34: in the shipped configuration every lsnc_relu row
+#    PGD cannot falsify returns `unknown` from a HARD BOUND-PATH ERROR after
+#    ~8.1 s, having explored ZERO domains. Three both-constant MatMuls fail
+#    `try_fold_matmul_exact`, the Lyapunov matrix Q is lost to an unbounded
+#    OpaqueSkip, and the root bound is [-inf, +inf]. The only mechanism that
+#    makes this model boundable is NY_CONST_MATMUL_INTERVAL, which is
+#    `Deliver::EnvOnly` by explicit soundness policy and therefore cannot fire
+#    from a preset. At zero domains explored an infinitely fast domain loop
+#    still scores 0/65 — and the old note's "only 3 of 13 clauses fit in 25s"
+#    cannot be reproduced in the scored lane at all, because BaB never starts.
+#
+# 4. RECONCILING (1) WITH (3), because at a glance they contradict each other:
+#    if lsnc never explores a domain, how did `392407671` measure "gate-off
+#    closes 1/16, gate-on closes 15/16" ON lsnc? Because the two statements
+#    describe DIFFERENT CONFIGURATIONS. That A/B ran `relu_quadrotor2d_state`
+#    with the SoA gate armed by hand and with the model made boundable — a
+#    gate-off arm that closes 1/16 is an arm in which the search DOES start,
+#    which the shipped lane (root bound [-inf,+inf], zero domains) cannot do.
+#    The 2026-08-25 re-measurement is of the SHIPPED configuration: this
+#    preset, no NY_* set, official 25 s budget, through run_instance.sh.
+#    So both are true, and together they say the thing that matters: the SoA
+#    lane's speedup on lsnc is REAL and it converts ZERO SCORED ROWS, because
+#    the rows it accelerates are only reachable behind a lever
+#    (NY_CONST_MATMUL_INTERVAL) that cannot fire in competition. A throughput
+#    win measured on a lever-armed arm is not a competition win; that is the
+#    same substitution this whole note exists to stop.
+#
+# CONSEQUENCE — DO NOT JUSTIFY DOMAIN-THROUGHPUT WORK ON lsnc. Throughput may
+# be worth doing for benchmarks that actually enter BaB; this preset cannot
+# supply the evidence for it, and every key below is dead in the scored lane
+# for the same reason lsnc_relu.yaml:31-33 gives. Re-derive rather than
+# trusting this paragraph: `git show --stat 834906092`, `git show 6f49a660d --
+# crates/ny-propagate/src/beta_crown/engine/graph/propagation/batched/
+# batched_bwd.rs`, and read `try_backward_soa`'s first ten lines.
+#
+# (superseded) NOTE: max_domains raised to 10M (reference uses infinity). With
+# default 100K and 13 disjunctive clauses, only 3 clauses fit in 25s budget.
 # The remaining gap is per-domain throughput: ny achieves ~10K domains/s
 # (loop-batched CROWN) vs reference ~100K+ domains/s (tensor-batched CROWN).
 # True tensor-batched CROWN is the Phase 2 target for closing the 0/65 gap.
@@ -36,7 +112,6 @@ bab:
   branching:
     method: input
     candidates: 5
-    reduceop: max
     input_split:
       enable: true
       sb_coeff_thresh: 1.0e-2
@@ -56,8 +131,5 @@ bab:
     post_bab_pgd_fraction: 0.10
   alpha_crown:
     lr_alpha: 0.2
-    iterations: 100
   beta_crown:
-    lr_alpha: 0.1
-    lr_beta: 0.15
     iterations: 25

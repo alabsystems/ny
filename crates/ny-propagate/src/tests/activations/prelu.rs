@@ -112,7 +112,7 @@ fn test_prelu_ibp_negative_slope_crossing() {
     // With negative slope and crossing: min at x=0 (PReLU(0) = 0),
     // max at endpoints: max(slope*l, u) = max(1.0, 3.0) = 3.0.
     // So correct bounds = [0.0, 3.0].
-    // Part of #1914: previously computed lower = -1.5 (applied slope to positive u).
+    // Previously computed lower = -1.5 (applied slope to positive u).
     let lower = ArrayD::from_elem(IxDyn(&[1]), -2.0f32);
     let upper = ArrayD::from_elem(IxDyn(&[1]), 3.0f32);
     let input = BoundedTensor::new(lower, upper).unwrap();
@@ -121,7 +121,7 @@ fn test_prelu_ibp_negative_slope_crossing() {
     let prelu = PReluLayer::from_scalar(slope);
     let output = prelu.propagate_ibp(&input).unwrap();
 
-    // Exact bounds after #1914 fix
+    // Exact bounds after the fix
     assert!(
         (output.lower()[[0]] - 0.0).abs() < 1e-6,
         "PReLU neg slope crossing: lower should be 0.0, got {}",

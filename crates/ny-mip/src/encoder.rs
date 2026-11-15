@@ -36,7 +36,7 @@ pub struct MipEncoder {
     binary_vars: Vec<Col>,
     /// Pre-activation width `u - l` per unstable neuron, aligned with
     /// `binary_vars`. Phase-split racing branches on the widest binaries
-    /// (widest pre-activation range = least constrained). designs/scip.md.
+    /// (widest pre-activation range = least constrained).
     binary_widths: Vec<f64>,
     /// Current frontier: output of the last-encoded layer.
     current_vars: Vec<Col>,
@@ -181,7 +181,6 @@ impl MipEncoder {
     /// fixed big_m=1e6 approach and matches the standard MILP formulation.
     ///
     /// Reference:  encoder/layers.rs:298 (encode_relu_bigm)
-    /// Reference: design doc designs/2026-03-04-highs-mip-solver-integration.md
     pub fn encode_relu(&mut self, pre_activation_bounds: &[Bound]) -> Result<()> {
         let n = self.current_vars.len();
         if pre_activation_bounds.len() != n {
@@ -511,7 +510,7 @@ pub struct MipParts {
     /// Binary ReLU indicator column indices.
     pub binary_vars: Vec<Col>,
     /// Pre-activation width `u - l` per unstable neuron, aligned with
-    /// `binary_vars`. Drives phase-split branching selection (designs/scip.md).
+    /// `binary_vars`. Drives phase-split branching selection.
     pub binary_widths: Vec<f64>,
     /// Total number of columns in the problem (for warm-start vector sizing).
     pub num_cols: usize,
@@ -629,7 +628,7 @@ mod tests {
         encoder.finalize();
         let parts = encoder.into_parts();
 
-        assert!(parts.binary_vars.is_empty());
+        assert_eq!(parts.binary_vars, [] as [Col; 0]);
         assert_eq!(parts.problem.num_cols(), 2);
         assert_eq!(parts.problem.num_rows(), 2);
         assert_eq!(parts.problem.cols()[parts.output_vars[0].0].lb, 0.0);
@@ -681,7 +680,7 @@ mod tests {
         assert_eq!(parts.problem.cols()[parts.output_vars[1].0].lb, 0.0);
         assert_eq!(parts.problem.cols()[parts.output_vars[1].0].ub, 0.0);
         assert_eq!(parts.output_vars[2], parts.input_vars[2]);
-        assert!(parts.binary_vars.is_empty());
+        assert_eq!(parts.binary_vars, [] as [Col; 0]);
     }
 
     #[test]

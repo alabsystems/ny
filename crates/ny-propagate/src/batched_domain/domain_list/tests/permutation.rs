@@ -48,7 +48,7 @@ fn test_apply_permutation_single_element() {
     assert_eq!(data, vec![42]);
 }
 
-/// Regression test for #2998 Slice A: wrong-length permutation returns
+/// Regression test Slice A: wrong-length permutation returns
 /// `NyError::InternalError` instead of panicking.
 #[test]
 fn test_apply_permutation_wrong_length_returns_error_2998() {

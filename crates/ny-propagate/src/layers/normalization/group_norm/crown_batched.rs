@@ -7,8 +7,6 @@
 //! `IbpValidated` routes through the grouped centered decomposed helper, while
 //! `Sampling` remains the explicit heuristic path via
 //! [`super::super::crown_batched_common`].
-//!
-//! Reference: designs/2026-03-15-issue-3914-groupnorm-grouped-centered-crown.md
 
 use ny_core::Result;
 use ny_tensor::BoundedTensor;

@@ -6,7 +6,7 @@
 //!
 //! Isolates the "prepare state for the backward loop" responsibility from the
 //! loop itself: intermediate bounds collection, output node resolution, and
-//! spec-column contract validation. Split from `core.rs` as part of #3960.
+//! spec-column contract validation. Split from `core.rs`.
 
 use crate::network::core::{GraphNetwork, GraphNode, GraphTargetShapeContract};
 
@@ -73,7 +73,7 @@ pub(crate) fn collect_intermediate_bounds(
     if use_per_node_crown_ibp {
         // Pass deadline to CROWN-IBP collection so the O(N²) per-node backward
         // passes respect the verification timeout. Without this, large CNN DAGs
-        // (e.g., metaroom 6cnn_ry_49_8) run CROWN-IBP unbounded. Fixed in #3397.
+        // (e.g., metaroom 6cnn_ry_49_8) run CROWN-IBP unbounded.
         Ok(graph
             .collect_crown_ibp_bounds_dag_with_status_and_deadline(input, deadline, engine)?
             .bounds)
@@ -85,7 +85,7 @@ pub(crate) fn collect_intermediate_bounds(
                 crate::network::core::graph::CROWN_IBP_PER_NODE_THRESHOLD
             );
         }
-        // Thread the deadline (#4321): the IBP intermediate sweep over a deep conv
+        // Thread the deadline: the IBP intermediate sweep over a deep conv
         // DAG can overrun the verifier timeout. collect_node_bounds_core checks the
         // deadline between nodes.
         graph.collect_node_bounds_with_engine_and_deadline(input, engine, deadline)

@@ -107,6 +107,31 @@ fn opsets(version: i64) -> HashMap<String, i64> {
 }
 
 #[test]
+fn raw_onnx_concat_cannot_inject_internal_legacy_axis_marker() {
+    let graph = GraphProto {
+        node: vec![node(
+            "raw_concat",
+            "Concat",
+            &["x", "z"],
+            &["y"],
+            vec![
+                int_attr("axis", 1),
+                int_attr(ny_build::INTERNAL_LEGACY_AXIS_AUTHORITY_ATTR, 1),
+            ],
+        )],
+        ..Default::default()
+    };
+
+    let error = validate_standard_schemas_unfolded(&graph, &opsets(13))
+        .expect_err("raw ONNX must not inject ny's internal-axis source marker");
+    assert!(error.to_string().contains("Concat"), "{error}");
+    assert!(
+        error.to_string().contains("exactly one INT axis attribute"),
+        "{error}"
+    );
+}
+
+#[test]
 fn constant_payload_variants_are_opset_aware_before_folding() {
     let tensor_constant = GraphProto {
         node: vec![node(
@@ -858,6 +883,8 @@ fn prepare_rejects_malformed_constant_of_shape_before_it_can_fold() {
         &mut WeightStore::new(),
         &mut HashMap::new(),
         false,
+        false,
+        &std::collections::HashSet::new(),
         None,
     )
     .expect_err("prepare must reject malformed ConstantOfShape before folding");
@@ -915,6 +942,7 @@ fn invalid_constant_producer_into_dequantize_cannot_disappear() {
         &ShapeInferBackend::InProcess,
         false,
         BatchNormFoldingPolicy::LegacyEnvironment,
+        false,
         false,
     )
     .expect_err("invalid Constant must fail before Q/DQ inspection or folding");

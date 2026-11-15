@@ -136,6 +136,9 @@ pub(super) fn compute_sequential_gradients(
                 engine,
                 analytic_gradients,
                 iter,
+                // #alpha-envelope-grad-cpu: the typed preset value, never the
+                // env-only `None` this lane used to resolve.
+                Some(config.alpha_envelope_grad),
             )?,
         ),
     };
@@ -170,7 +173,7 @@ fn spsa_gradients(
         // Average over multiple samples to reduce variance.
         for _sample in 0..config.spsa_samples {
             // Generate random Bernoulli perturbation (+1/-1) for each alpha.
-            // Uses zip to avoid unchecked indexing (#2499).
+            // Uses zip to avoid unchecked indexing.
             let perturbations: Vec<Array1<f32>> = alpha_state
                 .alphas
                 .iter()
@@ -190,7 +193,7 @@ fn spsa_gradients(
                 })
                 .collect();
 
-            // Apply +epsilon perturbation from original (both paths, #3393).
+            // Apply +epsilon perturbation from original (both paths).
             for ((alpha, orig), pert) in alpha_state
                 .alphas
                 .iter_mut()
@@ -211,7 +214,7 @@ fn spsa_gradients(
                     *a = (o + SEQUENTIAL_GRAD_EPS * p).clamp(0.0, 1.0);
                 }
             }
-            // Propagate CROWN errors instead of swallowing them (#2064, #1941).
+            // Propagate CROWN errors instead of swallowing them.
             let bounds_plus = graph.propagate_alpha_crown_single_pass_sequential_graph(
                 SequentialSinglePassRequest {
                     input,
@@ -226,7 +229,7 @@ fn spsa_gradients(
             )?;
             let lower_plus: f32 = finite_lower_sum(bounds_plus.lower());
 
-            // Apply -epsilon perturbation from original (both paths, #3393).
+            // Apply -epsilon perturbation from original (both paths).
             for ((alpha, orig), pert) in alpha_state
                 .alphas
                 .iter_mut()
@@ -247,7 +250,7 @@ fn spsa_gradients(
                     *a = (o - SEQUENTIAL_GRAD_EPS * p).clamp(0.0, 1.0);
                 }
             }
-            // Propagate CROWN errors instead of swallowing them (#2064, #1941).
+            // Propagate CROWN errors instead of swallowing them.
             let bounds_minus = graph.propagate_alpha_crown_single_pass_sequential_graph(
                 SequentialSinglePassRequest {
                     input,
@@ -262,7 +265,7 @@ fn spsa_gradients(
             )?;
             let lower_minus: f32 = finite_lower_sum(bounds_minus.lower());
 
-            // SPSA gradient estimate (#2499: zip eliminates indexing).
+            // SPSA gradient estimate (zip eliminates indexing).
             let diff = lower_plus - lower_minus;
             for ((grad, mask), pert) in avg_grads
                 .iter_mut()
@@ -279,7 +282,7 @@ fn spsa_gradients(
         Ok(())
     })();
 
-    // Always restore alpha state, including early error returns from `?` (#3393).
+    // Always restore alpha state, including early error returns from `?`.
     restore_alpha_snapshot(alpha_state, &original_alphas, &original_alphas_upper);
     result?;
 
@@ -305,7 +308,7 @@ fn finite_difference_gradients(
     let original_alphas: Vec<Array1<f32>> = alpha_state.alphas.clone();
     let original_alphas_upper: Vec<Array1<f32>> = alpha_state.alphas_upper.clone();
     let result = (|| -> Result<Vec<Array1<f32>>> {
-        // Per-neuron central differences (#2499: use enumerate+zip to
+        // Per-neuron central differences (use enumerate+zip to
         // bounds-check relu_idx against alphas/mask vectors).
         let mut grads = Vec::with_capacity(alpha_state.alphas.len());
         for (relu_idx, mask) in alpha_state
@@ -325,12 +328,12 @@ fn finite_difference_gradients(
                 let orig_alpha = alpha_state.alphas[relu_idx][neuron_idx];
                 let orig_alpha_upper = alpha_state.alphas_upper[relu_idx][neuron_idx];
 
-                // f(alpha + epsilon) — perturb both paths (#3393)
+                // f(alpha + epsilon) — perturb both paths
                 alpha_state.alphas[relu_idx][neuron_idx] =
                     (orig_alpha + SEQUENTIAL_GRAD_EPS).clamp(0.0, 1.0);
                 alpha_state.alphas_upper[relu_idx][neuron_idx] =
                     (orig_alpha_upper + SEQUENTIAL_GRAD_EPS).clamp(0.0, 1.0);
-                // Propagate CROWN errors (#2064, #1941).
+                // Propagate CROWN errors.
                 let bounds_plus = graph.propagate_alpha_crown_single_pass_sequential_graph(
                     SequentialSinglePassRequest {
                         input,
@@ -345,12 +348,12 @@ fn finite_difference_gradients(
                 )?;
                 let lower_plus: f32 = finite_lower_sum(bounds_plus.lower());
 
-                // f(alpha - epsilon) — perturb both paths (#3393)
+                // f(alpha - epsilon) — perturb both paths
                 alpha_state.alphas[relu_idx][neuron_idx] =
                     (orig_alpha - SEQUENTIAL_GRAD_EPS).clamp(0.0, 1.0);
                 alpha_state.alphas_upper[relu_idx][neuron_idx] =
                     (orig_alpha_upper - SEQUENTIAL_GRAD_EPS).clamp(0.0, 1.0);
-                // Propagate CROWN errors (#2064, #1941).
+                // Propagate CROWN errors.
                 let bounds_minus = graph.propagate_alpha_crown_single_pass_sequential_graph(
                     SequentialSinglePassRequest {
                         input,
@@ -376,7 +379,7 @@ fn finite_difference_gradients(
         Ok(grads)
     })();
 
-    // Always restore alpha state, including early error returns from `?` (#3393).
+    // Always restore alpha state, including early error returns from `?`.
     restore_alpha_snapshot(alpha_state, &original_alphas, &original_alphas_upper);
     result
 }
@@ -393,6 +396,9 @@ fn analytic_chain_gradients(
     engine: Option<&dyn GemmEngine>,
     analytic_gradients: &[Array1<f32>],
     iter: usize,
+    // `Some(config.alpha_envelope_grad)` from the caller; see
+    // `GraphNetwork::compute_graph_chain_rule_gradients_with_binding`.
+    envelope_config: Option<bool>,
 ) -> Result<Vec<Array1<f32>>> {
     // True chain-rule gradients using intermediate A matrices.
     // Run backward pass that stores A matrices at each ReLU node.
@@ -443,6 +449,7 @@ fn analytic_chain_gradients(
             &intermediate,
             Some(&graph_alpha_state),
             engine,
+            envelope_config,
         )),
         Err(error) => {
             // Fall back to local gradients if intermediate storage failed.

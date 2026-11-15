@@ -7,6 +7,7 @@ import errno
 import importlib.util
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -18,6 +19,16 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "ny_measurement_provenance.py"
 ARCHIVE_SCRIPT = REPO_ROOT / "scripts" / "archive_vnncomp_sat_result.py"
+# The measurement fixtures pin the toolchain THIS checkout pins (the Trust
+# toolchain, owner directive 2026-09-28, in development and in the public
+# snapshot): the provenance probe asks the real rustup for that
+# channel's compiler, so a channel this host has no compiler for fails every
+# fixture for a reason unrelated to the code under test.
+PINNED_CHANNEL = re.search(
+    r'^\s*channel\s*=\s*"([^"]+)"',
+    (REPO_ROOT / "rust-toolchain.toml").read_text(encoding="utf-8"),
+    re.MULTILINE,
+).group(1)
 AY_REV = "1560972ade2b04a702dfbd13a2de5444ea216009"
 HOST_STATE_FIXTURE = {
     "schema": "ny_measurement_host_state_v1",
@@ -893,10 +904,28 @@ def _margin_row_root_alpha_event(
     }
 
 
-def _margin_row_root_alpha_disabled_event() -> dict[str, object]:
+def _root_alpha_configured_fields(context: dict[str, str]) -> dict[str, str]:
+    """The root-ascent event's configured fields for a sealed runtime context."""
+    return {
+        "alpha_iters": context["NY_MARGIN_ROW_ALPHA_ITERS"],
+        "alpha_secs_bits": _f64_bits(float(context["NY_MARGIN_ROW_ALPHA_SECS"])),
+        "alpha_lr_bits": _f64_bits(float(context["NY_MARGIN_ROW_ALPHA_LR"])),
+        "alpha_cols": context["NY_MARGIN_ROW_ALPHA_COLS"],
+        "alpha_guard": (
+            "true" if context["NY_MARGIN_ROW_ALPHA_GUARD"] == "1" else "false"
+        ),
+        "rebake_enabled": (
+            "true" if context["NY_MARGIN_ROW_REBAKE"] == "1" else "false"
+        ),
+        "rebake_rounds": context["NY_MARGIN_ROW_REBAKE_ROUNDS"],
+        "rebake_secs_bits": _f64_bits(float(context["NY_MARGIN_ROW_REBAKE_SECS"])),
+    }
+
+
+def _margin_row_root_alpha_disabled_event(**configured: str) -> dict[str, object]:
     return _margin_row_root_alpha_event(
+        **{"alpha_iters": "20", **configured},
         alpha_enabled="false",
-        alpha_iters="20",
         standalone_suppressed="1",
         standalone_attempted="0",
         standalone_completed="0",
@@ -1469,7 +1498,7 @@ def _measurement_repos(tmp_path: Path) -> tuple[Path, Path]:
         "/target/\n/reports/\n/benchmarks/\n", encoding="utf-8"
     )
     (repo / "rust-toolchain.toml").write_text(
-        '[toolchain]\nchannel = "1.95.0"\ncomponents = ["rustfmt", "clippy"]\n',
+        f'[toolchain]\nchannel = "{PINNED_CHANNEL}"\ncomponents = ["rustfmt", "clippy"]\n',
         encoding="utf-8",
     )
     (repo / "Cargo.lock").write_text(
@@ -1520,6 +1549,12 @@ def _measurement_repos(tmp_path: Path) -> tuple[Path, Path]:
 
 def _clear_ny_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     for key in list(os.environ):
+        # The pinned compiler probe still needs the caller's rustup registry.
+        # This is a reviewed provenance-only key, excluded from the solver
+        # environment; clearing it selects ~/.rustup instead and breaks an
+        # otherwise valid Trust installation in an isolated RUSTUP_HOME.
+        if key == "RUSTUP_HOME":
+            continue
         if (
             key.startswith(("NY_", "AY_", "MIMALLOC_", "LD_"))
             or key.upper().startswith("MIMALLOC_")
@@ -1535,6 +1570,23 @@ def _clear_ny_environment(monkeypatch: pytest.MonkeyPatch) -> None:
             monkeypatch.delenv(key, raising=False)
     monkeypatch.delenv("GPU_AVAILABLE", raising=False)
     monkeypatch.setenv("NY_BUILD_FEATURES", "mip,cuda")
+
+
+def test_fixture_environment_preserves_only_the_rustup_registry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rustup_home = str(tmp_path / "isolated-rustup")
+    monkeypatch.setenv("RUSTUP_HOME", rustup_home)
+    monkeypatch.setenv("RUSTUP_TOOLCHAIN", "unrelated-override")
+    monkeypatch.setenv("RUSTUP_UNREVIEWED_CONTROL", "1")
+
+    _clear_ny_environment(monkeypatch)
+
+    assert os.environ["RUSTUP_HOME"] == rustup_home
+    assert "RUSTUP_TOOLCHAIN" not in os.environ
+    assert "RUSTUP_UNREVIEWED_CONTROL" not in os.environ
+    assert "RUSTUP_HOME" in provenance.SOLVER_ENVIRONMENT_EXCLUDED_KEYS
 
 
 def test_mo_kfsb_predicate_requires_a_causal_master_binding(
@@ -3305,7 +3357,11 @@ def test_start_manifest_hashes_worktree_and_excludes_secrets(
     _clear_ny_environment(monkeypatch)
     monkeypatch.setenv("NY_MEASURE_CAP", "120")
     monkeypatch.setenv("NY_MARGIN_ROW_ADAPTIVE_RESERVE", "1")
-    monkeypatch.setenv("NY_MARGIN_ROW_DOMAIN_STACK", "1")
+    # NY_MARGIN_ROW_DOMAIN_STACK used to sit here as an ungoverned pass-through.
+    # 64eedcf91 (2026-08-28) promoted it to a governed search axis delivered by
+    # the `margin_row.domain_stack` preset key, and a governed axis set directly
+    # outside the execution predicate is refused (the run would be confounded):
+    # test_start_manifest_refuses_a_promoted_axis_set_outside_the_predicate.
     monkeypatch.setenv("NY_MARGIN_ROW_CLASSWISE", "1")
     monkeypatch.setenv("NY_ROOT_GEMM", "faer")
     monkeypatch.setenv("NY_WARMUP_ITERS", "03")
@@ -3339,7 +3395,7 @@ def test_start_manifest_hashes_worktree_and_excludes_secrets(
     assert manifest["solver_binary"]["declared_build_features"] == ["mip", "cuda"]
     assert manifest["dependencies"]["ay"]["git_revision"] == AY_REV
     assert manifest["dependencies"]["cuda_runtime"] == CUDA_RUNTIME_FIXTURE
-    assert manifest["rust_toolchain"]["channel"] == "1.95.0"
+    assert manifest["rust_toolchain"]["channel"] == PINNED_CHANNEL
     assert manifest["rust_toolchain"]["probe_tool"]["sha256"]
     assert manifest["provenance_tools"]["git"]["sha256"]
     assert manifest["benchmark"]["remotes"] == [
@@ -3355,7 +3411,7 @@ def test_start_manifest_hashes_worktree_and_excludes_secrets(
     )
     assert manifest["environment"]["values"]["NY_MEASURE_CAP"] == "120"
     assert manifest["environment"]["values"]["NY_MARGIN_ROW_ADAPTIVE_RESERVE"] == "1"
-    assert manifest["environment"]["values"]["NY_MARGIN_ROW_DOMAIN_STACK"] == "1"
+    assert "NY_MARGIN_ROW_DOMAIN_STACK" not in manifest["environment"]["values"]
     assert manifest["environment"]["values"]["NY_MARGIN_ROW_CLASSWISE"] == "1"
     assert manifest["environment"]["values"]["NY_ROOT_GEMM"] == "faer"
     assert manifest["environment"]["values"]["NY_WARMUP_ITERS"] == "03"
@@ -3388,6 +3444,32 @@ def test_start_manifest_hashes_worktree_and_excludes_secrets(
     assert b"must-never-appear" not in manifest_bytes
     assert b"supersecret" not in manifest_bytes
     assert b"token=hidden" not in manifest_bytes
+
+
+def test_start_manifest_refuses_a_promoted_axis_set_outside_the_predicate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A governed axis set directly is a second, unrequested treatment.
+
+    NY_MARGIN_ROW_DOMAIN_STACK became a governed search axis in 64eedcf91
+    (promoted to the `margin_row.domain_stack` preset key). Exported beside a
+    predicate that does not request it, it would change the run under
+    measurement while the manifest attributed the result to the predicate's
+    axis alone, so capture refuses and names it.
+    """
+    repo, benchmark_root = _measurement_repos(tmp_path)
+    _clear_ny_environment(monkeypatch)
+    monkeypatch.setenv("NY_MEASURE_CAP", "120")
+    monkeypatch.setenv("NY_MARGIN_ROW_DOMAIN_STACK", "1")
+    monkeypatch.setattr(provenance, "_gpu_identity", lambda: {"fixture": True})
+    monkeypatch.setattr(provenance, "_capture_host_state", lambda: HOST_STATE_FIXTURE)
+
+    with pytest.raises(
+        provenance.ProvenanceError,
+        match=r"direct governed inputs do not equal.*NY_MARGIN_ROW_DOMAIN_STACK",
+    ):
+        _capture(repo, benchmark_root, run_id="promoted-axis-outside-predicate")
 
 
 def test_start_manifest_refuses_current_evidence_without_a_predicate(
@@ -3443,6 +3525,97 @@ def test_pinned_toolchain_version_probe_must_succeed(
             declared_tool_path=true_executable,
             declared_tool_kind="rustc",
         )
+
+
+@pytest.mark.parametrize("trust_identity", (True, False))
+def test_native_trust_toolchain_capture_binds_the_actual_compiler(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    trust_identity: bool,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "rust-toolchain.toml").write_text(
+        '[toolchain]\nchannel = "trust"\n', encoding="utf-8"
+    )
+    compiler = tmp_path / "native trustc"
+    compiler.write_text(
+        "#!/bin/sh\nprintf '%s\\n' 'rustc 1.101.0-dev'"
+        + (" 'trust: 0.12.0+gfixture'" if trust_identity else "")
+        + "\n",
+        encoding="utf-8",
+    )
+    compiler.chmod(0o755)
+    monkeypatch.delenv("NY_MEASURE_RUSTUP_BIN", raising=False)
+
+    def find_native(name: str) -> str | None:
+        assert name == "trustc", "native capture consulted another compiler route"
+        return str(compiler)
+
+    monkeypatch.setattr(provenance, "_find_executable", find_native)
+    if not trust_identity:
+        with pytest.raises(provenance.ProvenanceError, match="Trust version identity"):
+            provenance._parse_toolchain(repo)
+        return
+    captured = provenance._parse_toolchain(repo)
+    assert captured["probe_tool"]["kind"] == "rustc"
+    assert captured["rustc"]["resolved_path"] == str(compiler)
+    assert captured["rustc"]["sha256"] == provenance._sha256(compiler.read_bytes())
+    assert "trust: 0.12.0+gfixture" in captured["version_stdout"]
+    assert provenance._recapture_rust_toolchain(repo, captured) == captured
+    compiler.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    with pytest.raises(provenance.ProvenanceError, match="version probe failed"):
+        provenance._recapture_rust_toolchain(repo, captured)
+
+
+def test_trust_toolchain_capture_refuses_an_ambient_stock_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "rust-toolchain.toml").write_text(
+        '[toolchain]\nchannel = "trust"\n', encoding="utf-8"
+    )
+    monkeypatch.delenv("NY_MEASURE_RUSTUP_BIN", raising=False)
+
+    def absent_frontend(name: str) -> None:
+        assert name in {"trustc", "rustup"}, "capture attempted a stock fallback"
+        return None
+
+    monkeypatch.setattr(provenance, "_find_executable", absent_frontend)
+    with pytest.raises(provenance.ProvenanceError, match="neither native Trust nor rustup"):
+        provenance._parse_toolchain(tmp_path)
+
+
+def test_explicit_rustup_capture_keeps_its_selected_compiler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "rust-toolchain.toml").write_text(
+        '[toolchain]\nchannel = "trust"\n', encoding="utf-8"
+    )
+    selector = tmp_path / "rustup"
+    compiler = tmp_path / "selected compiler"
+    for executable in (selector, compiler):
+        executable.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+        executable.chmod(0o755)
+    monkeypatch.setenv("NY_MEASURE_RUSTUP_BIN", str(selector))
+
+    def no_discovery(name: str) -> None:
+        raise AssertionError(f"explicit selection consulted ambient {name}")
+
+    def selected_probe(command: list[str], **_kwargs: object):
+        if command[0] == str(selector):
+            assert command[1:] == ["which", "--toolchain", "trust", "rustc"]
+            output = f"{compiler}\n".encode()
+        else:
+            assert command == [str(compiler), "--version", "--verbose"]
+            output = b"rustc 1.101.0-dev\ntrust: 0.12.0+gselected\n"
+        return subprocess.CompletedProcess(command, 0, stdout=output, stderr=b"")
+
+    monkeypatch.setattr(provenance, "_find_executable", no_discovery)
+    monkeypatch.setattr(provenance, "_run", selected_probe)
+    captured = provenance._parse_toolchain(tmp_path)
+    assert captured["probe_tool"]["kind"] == "rustup"
+    assert captured["rustc"]["resolved_path"] == str(compiler)
+    assert provenance._recapture_rust_toolchain(tmp_path, captured) == captured
 
 
 def test_untracked_content_changes_worktree_evidence_digest(
@@ -10471,9 +10644,29 @@ def test_margin_row_root_alpha_uses_preset_context_and_splits_mixed_categories(
     assert dict(assignment["runtime_context_source_assignment"])[
         "NY_MARGIN_ROW_ALPHA_OPT"
     ] == "legacy_env"
+    # The rest of the root-ascent context comes from the PRESET: where cifar100
+    # sets a typed key (it arms `margin_row.alpha_cols: 1` since 6b52dcdc5) the
+    # sealed value is the preset's token under `config` authority; where it
+    # does not, the default stands.
+    context = dict(assignment["runtime_context_assignment"])
+    sources = dict(assignment["runtime_context_source_assignment"])
+    preset_cols = ny_search.preset_effective_token(
+        cifar, "preset:margin_row.alpha_cols"
+    )
+    if preset_cols is None:
+        assert sources["NY_MARGIN_ROW_ALPHA_COLS"] == "default"
+    else:
+        assert context["NY_MARGIN_ROW_ALPHA_COLS"] == preset_cols
+        assert sources["NY_MARGIN_ROW_ALPHA_COLS"] == "config"
+    # The binary's terminal event reports the configuration it ran with, i.e.
+    # the sealed context. Building it from the defaults is what broke this test
+    # when 6b52dcdc5 armed alpha_cols on cifar100: the fixture kept reporting
+    # cols=8 under `default` authority against a sealed `1` from `config`.
     record = _execution_predicate_record(
         [("NY_MARGIN_ROW_ALPHA_OPT", "0", False)],
-        _margin_row_root_alpha_disabled_event(),
+        _margin_row_root_alpha_disabled_event(
+            **_root_alpha_configured_fields(context)
+        ),
     )
     assert provenance.validate_execution_predicate_requirement(
         record, raw, assignment=assignment
@@ -13191,3 +13384,87 @@ def test_stale_solver_binary_is_refused_before_measurement(tmp_path) -> None:
     with pytest.raises(provenance.ProvenanceError) as excinfo:
         provenance._capture_build_coherence(repo, binary)
     assert "predates the worktree" in str(excinfo.value)
+
+
+
+def test_source_space_resolves_typed_kernel_declaration_names() -> None:
+    import ny_search
+
+    space = ny_search.parse_space_rs()
+    assert {
+        "NY_CONVTRANSPOSE_SOUND_F64_GPU",
+        "NY_CONV_SKIP_DEAD_F32",
+        "NY_FORWARD_LINEAR_MACS_PER_SEC",
+    } <= set(space.unsafe_names)
+
+
+def test_source_axis_name_uses_declaration_value_and_refuses_unknown_symbol(
+    tmp_path: Path,
+) -> None:
+    import ny_search
+
+    (tmp_path / "kernel_inputs.rs").write_text(
+        'pub RENAMED_SYMBOL = LeverDecl { name: "NY_ACTUAL_DECLARATION", };',
+        encoding="utf-8",
+    )
+    record = "name: crate::decls::kernel_inputs::RENAMED_SYMBOL.name,"
+    assert ny_search._axis_name(record, tmp_path) == "NY_ACTUAL_DECLARATION"
+    with pytest.raises(ValueError, match="cannot uniquely resolve axis declaration"):
+        ny_search._axis_name(record.replace("RENAMED_SYMBOL", "MISSING"), tmp_path)
+    with pytest.raises(ValueError, match="cannot resolve axis declaration"):
+        ny_search._axis_name(record.replace("kernel_inputs", "missing_module"), tmp_path)
+    declaration = 'pub RENAMED_SYMBOL = LeverDecl { name: "NY_ACTUAL_DECLARATION", };'
+    (tmp_path / "kernel_inputs.rs").write_text(declaration + "\n" + declaration, encoding="utf-8")
+    with pytest.raises(ValueError, match="cannot uniquely resolve axis declaration"):
+        ny_search._axis_name(record, tmp_path)
+
+
+def test_space_rs_axis_named_by_its_declaration_resolves_to_the_declared_literal(
+    tmp_path: Path,
+) -> None:
+    """`space.rs` may name a lever as `crate::decls::<module>::<CONST>.name`
+    (57e94d145) instead of repeating the literal. The fallback parser reads
+    the name from that declaration in the same checkout, and refuses a
+    constant the module does not declare instead of guessing."""
+    import ny_search  # noqa: PLC0415
+
+    decls = tmp_path / "decls"
+    decls.mkdir()
+    (decls / "kernel_inputs.rs").write_text(
+        "declare_levers! {\n"
+        "    pub OTHER = LeverDecl {\n"
+        '        name: "NY_OTHER",\n'
+        "    };\n"
+        "    pub SOUND_GATE = LeverDecl {\n"
+        '        name: "NY_SOUND_GATE",\n'
+        "        kind: LeverKind::Text,\n"
+        "    };\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    record = (
+        "    Axis {\n"
+        "        name: crate::decls::kernel_inputs::%s.name,\n"
+        "        domain: Domain::Bool,\n"
+        "        class: Class::SafeToSearch,\n"
+        "        deliver: Deliver::EnvOnly,\n"
+        "    },\n"
+    )
+    axes = ny_search._parse_axes(record % "SOUND_GATE", decls)
+    assert [axis.name for axis in axes] == ["NY_SOUND_GATE"]
+    with pytest.raises(ValueError, match="does not declare"):
+        ny_search._parse_axes(record % "MISSING_GATE", decls)
+    with pytest.raises(ValueError, match="unreadable"):
+        ny_search._parse_axes(record.replace("kernel_inputs", "absent_module") % "SOUND_GATE", decls)
+
+
+def test_every_declaration_named_axis_in_space_rs_is_parsed() -> None:
+    import ny_search  # noqa: PLC0415
+
+    text = ny_search.SPACE_RS.read_text(encoding="utf-8")
+    referenced = re.findall(r"name:\s*crate::decls::(\w+)::([A-Z0-9_]+)\.name\b", text)
+    assert referenced, "space.rs names no axis through its declaration; drop this test"
+    space = ny_search.parse_space_rs()
+    parsed = {axis.name for axis in space.axes} | set(space.unsafe_names)
+    for module, constant in referenced:
+        assert ny_search._declared_lever_name(ny_search.DECLS_DIR, module, constant) in parsed

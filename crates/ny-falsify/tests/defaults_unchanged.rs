@@ -41,7 +41,7 @@ fn arming_defaults_to_dark() {
     assert_eq!(Arming::default(), Arming::Dark);
     assert_eq!(Registry::default().arming(), Arming::Dark);
     assert_eq!(Registry::new().arming(), Arming::Dark);
-    assert!(Registry::new().names().is_empty());
+    assert_eq!(Registry::new().names(), [] as [ny_falsify::StrategyName; 0]);
     // Registering a strategy does not arm it.
     let registry = Registry::new()
         .with(Box::new(SpecialPoints))

@@ -5,7 +5,7 @@
 //! CROWN backward soundness tests for InstanceNorm1d.
 //!
 //! Tests both the sampling-based fallback path and the decomposed
-//! `IbpValidated` path introduced in #3830.
+//! `IbpValidated` path.
 
 use super::types::InstanceNorm1dLayer;
 use crate::layers::normalization::decomposed::decomposed_instance_norm_crown_backward;
@@ -480,9 +480,9 @@ fn test_crown_backward_soundness_multi_config() {
 // ── CROWN scalar NaN/Inf pre-activation guard tests ─────────────────────────
 // These test the non-finite guard in crown_common.rs which returns constant
 // bounds (A=0, bias=[-inf, +inf]) when pre-activation bounds contain NaN or
-// Inf. Previously returned unsound identity passthrough (#3259).
+// Inf. Previously returned unsound identity passthrough.
 
-/// NaN in pre-activation upper bound triggers constant bounds fallback (#3259).
+/// NaN in pre-activation upper bound triggers constant bounds fallback.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_scalar_nan_pre_activation_upper_returns_constant_bounds() {
@@ -544,7 +544,7 @@ fn test_crown_cut_mode_returns_identity() {
     assert_eq!(result.upper_a(), bounds.upper_a());
 }
 
-/// NaN in pre-activation lower bound triggers constant bounds fallback (#3259).
+/// NaN in pre-activation lower bound triggers constant bounds fallback.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_scalar_nan_pre_activation_lower_returns_constant_bounds() {
@@ -584,7 +584,7 @@ fn test_crown_scalar_nan_pre_activation_lower_returns_constant_bounds() {
     );
 }
 
-/// Inf in pre-activation bounds triggers constant bounds fallback (#3259).
+/// Inf in pre-activation bounds triggers constant bounds fallback.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_scalar_inf_pre_activation_returns_constant_bounds() {

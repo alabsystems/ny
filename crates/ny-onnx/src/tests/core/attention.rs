@@ -542,12 +542,11 @@ fn format_onnx_decision_report(results: &[OnnxEpsMeasurement]) -> String {
     report
 }
 
-/// Phase 3 decision gate (#286): McCormick broadcast+alpha vs IBP on ONNX attention model.
+/// Phase 3 decision gate: McCormick broadcast+alpha vs IBP on ONNX attention model.
 ///
 /// Loads minimal_attention_core.onnx (self-attention with asymmetric Q/K weights)
 /// and compares IBP, CROWN, and alpha-CROWN at eps = {0.001, 0.01, 0.05, 0.1}.
 ///
-/// Reference: designs/2026-03-04-286-attention-bilinear-alternative.md Phase 3
 /// Reference: auto_LiRPA operators/bivariate.py:39-75
 #[ntest::timeout(120000)]
 #[test]

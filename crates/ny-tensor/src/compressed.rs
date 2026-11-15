@@ -170,7 +170,7 @@ impl CompressedBounds {
     /// become ±Inf during compression. The directed rounding in `from_bounded_tensor`
     /// ensures only sound infinities appear: lower bounds get -Inf (widened toward -∞)
     /// and upper bounds get +Inf (widened toward +∞). Rejecting these would cause
-    /// runtime failures for networks with large-valued bounds. (#2358)
+    /// runtime failures for networks with large-valued bounds.
     pub fn to_bounded_tensor(&self) -> Result<BoundedTensor> {
         let lower_f32: Vec<f32> = self.lower.iter().map(|&v| v.to_f32()).collect();
         let upper_f32: Vec<f32> = self.upper.iter().map(|&v| v.to_f32()).collect();
@@ -294,7 +294,7 @@ impl CompressedBounds {
         let mut max_upper_error = 0.0f32;
 
         // Use nan_propagating_max instead of f32::max — IEEE 754 maxNum absorbs
-        // NaN, silently dropping NaN errors from corrupted data. (#3291 F2)
+        // NaN, silently dropping NaN errors from corrupted data.
         for (orig, comp) in original.lower().iter().zip(compressed.lower.iter()) {
             let restored = comp.to_f32();
             let error = (orig - restored).abs();

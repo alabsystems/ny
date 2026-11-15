@@ -5747,6 +5747,7 @@ def _parse_toolchain(
         else []
     )
     channel = channel_match.group(1)
+    native_trust = False
     if declared_tool_path is None:
         configured_rustup = os.environ.get("NY_MEASURE_RUSTUP_BIN", "")
         if configured_rustup:
@@ -5765,11 +5766,21 @@ def _parse_toolchain(
         )
         tool = str(tool_identity["resolved_path"])
     else:
-        rustup = _find_executable("rustup")
-        if rustup is not None:
+        trustc = _find_executable("trustc") if channel == "trust" else None
+        rustup = _find_executable("rustup") if trustc is None else None
+        if trustc is not None:
+            # `rustc` denotes a directly captured compiler in this record,
+            # rather than a rustup selector. Bind native Trust's real path,
+            # bytes and verbose identity through the same capture/recapture.
+            tool_kind = "rustc"
+            tool = trustc
+            native_trust = True
+        elif rustup is not None:
             tool_kind = "rustup"
             tool = rustup
         else:
+            if channel == "trust":
+                raise ProvenanceError("neither native Trust nor rustup is available")
             rustc = _find_executable("rustc")
             if rustc is None:
                 raise ProvenanceError("neither rustup nor rustc is available")
@@ -5840,6 +5851,12 @@ def _parse_toolchain(
             "pinned rustc version probe failed "
             f"({version_result.returncode}): {detail}"
         )
+    if native_trust and re.search(
+        r"^trust: [0-9]+\.",
+        version_result.stdout.decode("utf-8", "replace"),
+        re.MULTILINE,
+    ) is None:
+        raise ProvenanceError("native Trust compiler lacks its Trust version identity")
     if (
         _capture_executable_identity(
             str(tool_identity["declared_path"]),

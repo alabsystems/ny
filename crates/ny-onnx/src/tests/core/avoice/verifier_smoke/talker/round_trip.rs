@@ -6,8 +6,6 @@ use super::*;
 
 /// Verify the talker attention softmax through the GraphModel round-trip
 /// path (ONNX -> GraphModel -> GraphNetwork -> Verifier).
-///
-/// Part of #3923.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
 #[cfg(feature = "external-avoice")]

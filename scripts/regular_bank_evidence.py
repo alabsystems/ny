@@ -2160,6 +2160,9 @@ def _valid_v2_lever_receipt(value: object, *, ambient_env: object) -> bool:
             or moat not in archive.LEVER_MOATS
             or not isinstance(lever_provenance, str)
             or lever_provenance not in archive.LEVER_PROVENANCE
+            # This validator is only for historical receipt/v1. Owner-directed
+            # defaults were introduced with the current receipt/v3 producer.
+            or lever_provenance == "owner_directed"
             or not archive._valid_lever_value(entry.get("value"))
             or (
                 lever_provenance == "unmeasured"

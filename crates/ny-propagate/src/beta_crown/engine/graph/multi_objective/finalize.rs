@@ -6,8 +6,6 @@
 //!
 //! Thin adapter over `GraphBabLifecycle::build_final_result()` that adds
 //! the multi-objective-specific "could not verify all objectives" fallback.
-//!
-//! Part of #1860 (graph BaB service convergence, Packet A).
 
 use std::time::Duration;
 
@@ -21,7 +19,7 @@ use crate::beta_crown::result::{BabVerificationStatus, BetaCrownResult};
 /// If the queue is empty and domains were verified, returns Verified.
 /// Otherwise returns Unknown "could not verify all objectives".
 ///
-/// #1861/#1866: Check for unresolved domains before claiming Verified.
+/// Check for unresolved domains before claiming Verified.
 pub(super) fn finalize_multi_objective_result(
     lifecycle: &GraphBabLifecycle,
     queue_is_empty: bool,

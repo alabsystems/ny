@@ -2,7 +2,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use super::gpu_suffix::{try_finish_target_gpu_suffix_with_pending_input, GpuSuffixPlan};
+use super::gpu_suffix::{
+    try_finish_target_gpu_suffix_with_pending_input, GpuSuffixPlan, GpuSuffixSeedRelation,
+};
 use super::target_backward_patches::{
     initial_target_crown_bounds_with_override, resolve_preactivation, target_allows_patches_start,
     try_patches_residual_target_step, try_patches_target_step_core,
@@ -10,8 +12,8 @@ use super::target_backward_patches::{
 use super::*;
 use crate::bounds::patches::PatchesMaterializationPurpose;
 use crate::bounds::LinearBounds;
-use crate::network::core::graph::CrownIbpRuntimePolicy;
 use crate::network::core::apply_dense_backward_dispatch_result_with_deadline;
+use crate::network::core::graph::CrownIbpRuntimePolicy;
 use crate::network::CrownMergeAccumulator;
 use ndarray::{Array1, Array2, Ix1};
 use ny_tensor::{next_down_f32, next_up_f32};
@@ -32,6 +34,122 @@ const OUTPUT_CONDITIONED_TWO_SEED_MAX_ROWS: usize = ny_core::DEADLINE_BOUNDED_RE
 struct AdditionalTargetBackwardSeed<'a> {
     node_name: &'a str,
     bounds: CrownBounds,
+}
+
+/// Deferred construction of the per-target [`GpuSuffixPlan`].
+///
+/// `GpuSuffixPlan::build` is not a descriptor-only pass. It walks every entry
+/// of `relevant_nodes` and materializes an OWNED `GpuCrownLayer` for each
+/// eligible node: a `Layer::Linear` copies the entire weight matrix out of the
+/// layer (`crown/gpu_extraction.rs`, `linear.weight.as_slice()?.to_vec()`), a
+/// `Layer::Conv2d` copies the kernel and expands the per-channel bias to
+/// `out_c * oh * ow` floats, and every activation fills four `Vec<f32>` of
+/// `num_neurons`. Built eagerly once per target, that is O(targets x
+/// ancestors) whole-weight copies per bound collection, and the alpha lane
+/// repeats the collection every iteration.
+///
+/// The plan has exactly ONE reader: the `plan.contains(node_name)` lookup in
+/// `try_finish_target_gpu_suffix_with_plan`, reached only through the single
+/// `try_finish_target_gpu_suffix_with_pending_input` call in
+/// [`GraphNetwork::run_target_backward_pass_core`]. That lookup runs AFTER the
+/// finisher's deadline refusals and AFTER
+/// `sound_gpu_gate::gpu_crown_backward_route_with_deadline` has returned a
+/// backend, so a walk with no GPU CROWN route paid for every one of those
+/// copies and read none of them. Deferring the build to
+/// [`Self::plan_for_finisher`] removes that cost from the CPU route entirely.
+///
+/// Only WHEN and WHETHER a descriptor is built changes; the plan is consulted
+/// at the same site with the same contents and never enters CPU bound
+/// arithmetic. `GpuSuffixPlan::build` is a pure function of the six borrows
+/// held here — graph/bound-map lookups, `&self` alpha accessors, and per-neuron
+/// relaxation arithmetic — with no shared-state caching (the
+/// `GraphAlphaState::gpu_suffix_ineligible` negative cache belongs to the
+/// resnet/extraction path and is never touched by `build`), no ordering
+/// dependency, and no telemetry beyond one `debug!` on an unexpected extracted
+/// layer count. A plan built later is therefore the same plan.
+///
+/// `OnceLock` rather than `OnceCell`: [`GraphNetwork::propagate_crown_to_node_chunked`]
+/// shares one plan across rayon workers on its fixed-wave route, so this type
+/// must stay `Sync`.
+struct LazyGpuSuffixPlan<'a> {
+    relevant_nodes: &'a [String],
+    graph: &'a GraphNetwork,
+    input: &'a BoundedTensor,
+    crown_bounds: &'a std::collections::HashMap<String, BoundedTensor>,
+    ibp_bounds: &'a std::collections::HashMap<String, BoundedTensor>,
+    alpha_state: Option<&'a GraphAlphaState>,
+    /// Handed to a backward step that provably cannot reach
+    /// `plan.contains(..)`. Built from an empty node list, so it is an empty
+    /// `HashMap` and allocates nothing.
+    empty: GpuSuffixPlan,
+    plan: std::sync::OnceLock<GpuSuffixPlan>,
+}
+
+impl<'a> LazyGpuSuffixPlan<'a> {
+    fn new(
+        relevant_nodes: &'a [String],
+        graph: &'a GraphNetwork,
+        input: &'a BoundedTensor,
+        crown_bounds: &'a std::collections::HashMap<String, BoundedTensor>,
+        ibp_bounds: &'a std::collections::HashMap<String, BoundedTensor>,
+        alpha_state: Option<&'a GraphAlphaState>,
+    ) -> Self {
+        Self {
+            relevant_nodes,
+            graph,
+            input,
+            crown_bounds,
+            ibp_bounds,
+            alpha_state,
+            empty: GpuSuffixPlan::build(&[], graph, input, crown_bounds, ibp_bounds, alpha_state),
+            plan: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The plan to hand to the GPU-suffix finisher at one backward step.
+    ///
+    /// Mirror the finisher's existing precedence: expiry, finite-authority
+    /// headroom, then backend route, all before `plan.contains(..)`. Returning
+    /// the empty plan after either deadline refusal cannot affect arithmetic:
+    /// remaining time only decreases and the headroom policy is latched, so
+    /// the finisher will refuse before reading it. Its own original checks
+    /// remain authoritative, including the typed error when expiry arrives.
+    ///
+    /// This avoids constructing private weight/activation descriptors for a
+    /// short live request that is already known to take the CPU fallback. It
+    /// does not weaken the headroom gate or change the request's deadline.
+    fn plan_for_finisher(
+        &self,
+        engine: Option<&dyn ny_core::GemmEngine>,
+        deadline: Option<std::time::Instant>,
+    ) -> &GpuSuffixPlan {
+        if let Some(limit) = deadline {
+            if std::time::Instant::now() >= limit
+                || crate::sound_gpu_gate::gpu_suffix_declines_under_finite_authority(limit)
+            {
+                return &self.empty;
+            }
+        }
+        if crate::sound_gpu_gate::gpu_crown_backward_route_with_deadline(engine, deadline).is_none()
+        {
+            return &self.empty;
+        }
+        self.get_or_build()
+    }
+
+    /// Materialize the plan, at most once per target walk.
+    fn get_or_build(&self) -> &GpuSuffixPlan {
+        self.plan.get_or_init(|| {
+            GpuSuffixPlan::build(
+                self.relevant_nodes,
+                self.graph,
+                self.input,
+                self.crown_bounds,
+                self.ibp_bounds,
+                self.alpha_state,
+            )
+        })
+    }
 }
 
 /// Multi-target stacked-seed injection plan (#cgan-stacked-backward,
@@ -299,6 +417,26 @@ fn output_conditioned_cpu_error_box_is_usable(
             .all(|(&lower, &upper)| lower.is_finite() && upper.is_finite() && lower <= upper)
 }
 
+/// The box a relation over this CURRENT node's output discharges its
+/// certified coefficient error over: the node's CROWN bounds when they are a
+/// usable finite enclosure of the expected width, else its IBP bounds, else
+/// none (the caller then refuses).
+fn current_node_output_error_box<'a>(
+    node_name: &str,
+    expected_width: usize,
+    crown_bounds: &'a std::collections::HashMap<String, BoundedTensor>,
+    ibp_bounds: &'a std::collections::HashMap<String, BoundedTensor>,
+) -> Option<&'a BoundedTensor> {
+    crown_bounds
+        .get(node_name)
+        .filter(|bounds| output_conditioned_cpu_error_box_is_usable(bounds, expected_width))
+        .or_else(|| {
+            ibp_bounds
+                .get(node_name)
+                .filter(|bounds| output_conditioned_cpu_error_box_is_usable(bounds, expected_width))
+        })
+}
+
 /// Discharge an additional-seed CPU frontier's incoming coefficient error over
 /// the box for the value its columns multiply: this CURRENT node's output.
 ///
@@ -314,20 +452,15 @@ fn fold_output_conditioned_additional_seed_error_for_cpu(
 ) -> Result<()> {
     if node_lb.has_coeff_err() {
         let expected_width = node_lb.num_inputs();
-        let current_node_box = crown_bounds
-            .get(node_name)
-            .filter(|bounds| output_conditioned_cpu_error_box_is_usable(bounds, expected_width))
-            .or_else(|| {
-                ibp_bounds.get(node_name).filter(|bounds| {
-                    output_conditioned_cpu_error_box_is_usable(bounds, expected_width)
-                })
-            })
-            .ok_or_else(|| {
-                NyError::SoundnessRefusal(format!(
-                    "output-conditioned additional-seed CPU backward at '{node_name}' requires a \
-                     finite ordered current-node output box of width {expected_width}"
-                ))
-            })?;
+        let current_node_box =
+            current_node_output_error_box(node_name, expected_width, crown_bounds, ibp_bounds)
+                .ok_or_else(|| {
+                    NyError::SoundnessRefusal(format!(
+                        "output-conditioned additional-seed CPU backward at '{node_name}' \
+                         requires a finite ordered current-node output box of width \
+                         {expected_width}"
+                    ))
+                })?;
         node_lb.fold_coeff_err_over_box_eager(current_node_box);
     }
 
@@ -1210,7 +1343,7 @@ fn box_is_finite(b: &BoundedTensor) -> bool {
 impl GraphNetwork {
     /// Shared backward CROWN core for per-target CROWN-IBP and α-CROWN.
     /// `collector_patches_override=true` enables patches mode for spatial Conv2d
-    /// even in matrix conv_mode — used by the CROWN-IBP collector (#3813).
+    /// even in matrix conv_mode — used by the CROWN-IBP collector.
     ///
     /// `chunk_override` (#cgan-bn11-chunk): explicit objective row-chunk size
     /// that takes precedence over the `NY_CROWN_OBJ_CHUNK` env knob. `None`
@@ -1406,7 +1539,7 @@ impl GraphNetwork {
                 target_bounds,
                 collector_patches_override,
             );
-            let gpu_suffix_plan = GpuSuffixPlan::build(
+            let gpu_suffix_plan = LazyGpuSuffixPlan::new(
                 &relevant_nodes,
                 self,
                 input,
@@ -1469,8 +1602,17 @@ impl GraphNetwork {
             collector_patches_override,
             per_node_deadline,
         )?;
-        let gpu_suffix_plan = // O(N) plan replaces O(N*K) rescans (#4340)
-            GpuSuffixPlan::build(&relevant_nodes, self, input, crown_bounds, ibp_bounds, alpha_state);
+        // O(N) plan replaces O(N*K) rescans. The descriptors behind it
+        // are DEFERRED: `LazyGpuSuffixPlan` materializes them only if a backward
+        // step actually routes to a GPU CROWN backend.
+        let gpu_suffix_plan = LazyGpuSuffixPlan::new(
+            &relevant_nodes,
+            self,
+            input,
+            crown_bounds,
+            ibp_bounds,
+            alpha_state,
+        );
 
         // Single-pass: seed the full objective and run one backward pass. The
         // `None` result means no input contribution accumulated, in which case
@@ -1533,6 +1675,7 @@ impl GraphNetwork {
         engine: Option<&dyn ny_core::GemmEngine>,
         deadline: Option<std::time::Instant>,
     ) -> Result<LinearBounds> {
+        self.ensure_proof_eligible()?;
         self.propagate_crown_input_linear_to_node_with_limits(
             input,
             target_node,
@@ -1711,8 +1854,15 @@ impl GraphNetwork {
         } else {
             None
         };
+        // This walk can never consult the plan: `run_target_backward_pass_linear`
+        // passes `capture_input_linear = true` to `run_target_backward_pass_core`,
+        // and the only `try_finish_target_gpu_suffix_with_pending_input` call in
+        // this file is guarded by `!capture_input_linear`. Under
+        // `LazyGpuSuffixPlan` that costs nothing — no descriptor is built —
+        // while still handing the real plan to any future reader rather than a
+        // silently empty one.
         let gpu_suffix_plan =
-            GpuSuffixPlan::build(&relevant_nodes, self, input, crown_bounds, ibp_bounds, None);
+            LazyGpuSuffixPlan::new(&relevant_nodes, self, input, crown_bounds, ibp_bounds, None);
 
         // Allocate the complete, preflighted return payload once. Chunks are
         // copied directly into their deterministic row ranges, so we never hold
@@ -1883,7 +2033,7 @@ impl GraphNetwork {
         target_dim: usize,
         input_dim: usize,
         allow_patches: bool,
-        gpu_suffix_plan: &GpuSuffixPlan,
+        gpu_suffix_plan: &LazyGpuSuffixPlan<'_>,
         initial_bounds: CrownBounds,
         cut_ctx: Option<&CrownCutContext>,
         flat_bias_enabled: Option<bool>,
@@ -1941,7 +2091,7 @@ impl GraphNetwork {
         target_dim: usize,
         input_dim: usize,
         allow_patches: bool,
-        gpu_suffix_plan: &GpuSuffixPlan,
+        gpu_suffix_plan: &LazyGpuSuffixPlan<'_>,
         initial_bounds: CrownBounds,
         cut_ctx: Option<&CrownCutContext>,
     ) -> Result<Option<LinearBounds>> {
@@ -1995,7 +2145,7 @@ impl GraphNetwork {
         target_dim: usize,
         input_dim: usize,
         allow_patches: bool,
-        gpu_suffix_plan: &GpuSuffixPlan,
+        gpu_suffix_plan: &LazyGpuSuffixPlan<'_>,
         initial_bounds: CrownBounds,
         cut_ctx: Option<&CrownCutContext>,
         additional_seed: Option<AdditionalTargetBackwardSeed<'_>>,
@@ -2316,7 +2466,7 @@ impl GraphNetwork {
                 }
             }
 
-            // Resolve first input; multi-input nodes skip to dedicated branches (#4112).
+            // Resolve first input; multi-input nodes skip to dedicated branches.
             let (first_input_name, pre_activation) = if node.inputs.len() == 1 {
                 let name = node.require_unary_input().map_err(|_| {
                     NyError::InvalidSpec(format!(
@@ -2470,10 +2620,31 @@ impl GraphNetwork {
             // whose seeds have not injected yet would be concretized as the
             // zero functional.
             if !capture_input_linear && !has_additional_seed && !has_stacked_seed_plan {
+                // The ONLY read of the plan in this file, and the point at which
+                // its descriptors are built: the finisher reaches
+                // `plan.contains(..)` only after it has routed to a GPU CROWN
+                // backend, so `plan_for_finisher` defers the whole extraction
+                // until that is known. A CPU-only walk never builds one.
+                let gpu_suffix_plan = gpu_suffix_plan.plan_for_finisher(engine, per_node_deadline);
+                // #gpu-suffix-coeff-err: an err-carrying relation is charged
+                // over this node's own output box before the device sees it.
+                let node_output_box = if node_lb.has_coeff_err() {
+                    current_node_output_error_box(
+                        node_name,
+                        node_lb.num_inputs(),
+                        crown_bounds,
+                        ibp_bounds,
+                    )
+                } else {
+                    None
+                };
                 if let Some(bounds) = try_finish_target_gpu_suffix_with_pending_input(
                     input,
                     node_name,
-                    &node_lb,
+                    GpuSuffixSeedRelation {
+                        bounds: &node_lb,
+                        node_output_box,
+                    },
                     gpu_suffix_plan,
                     engine,
                     per_node_deadline,
@@ -2537,7 +2708,7 @@ impl GraphNetwork {
                     Some(alpha) => {
                         match sigmoid.propagate_linear_with_alpha(&node_lb, pre_activation, alpha) {
                             Ok(bounds) => bounds,
-                            // #4118: a monotone alpha bundle whose width disagrees with the
+                            // A monotone alpha bundle whose width disagrees with the
                             // pre-activation (e.g. a stale warm-started bundle reused across a
                             // reshape) surfaces as ShapeMismatch. Fixed-slope CROWN is always a
                             // sound relaxation, so retry this node locally instead of failing the
@@ -2585,7 +2756,7 @@ impl GraphNetwork {
                     Some(alpha) => {
                         match tanh.propagate_linear_with_alpha(&node_lb, pre_activation, alpha) {
                             Ok(bounds) => bounds,
-                            // #4118: see the Sigmoid branch — a mismatched monotone alpha bundle
+                            // See the Sigmoid branch — a mismatched monotone alpha bundle
                             // falls back to the sound fixed-slope relaxation for this node only.
                             Err(NyError::ShapeMismatch { expected, got }) => {
                                 warn!(
@@ -2976,53 +3147,19 @@ impl GraphNetwork {
                     )?;
                 }
             } else {
-                // Strict finite-boundary dispatch is intentionally O(1) before
-                // operator admission. Do not build the legacy combined map (or
-                // clone its tensors) on that route; the strict dispatcher only
-                // admits allocation-free control outcomes. Ordinary Dense
-                // dispatch retains the exact historical merged lookup map.
-                let combined_bounds = if finite_structured_boundary {
-                    None
+                let dispatch_node_bounds = if finite_structured_boundary {
+                    // Preserve strict boundary admission's existing borrowed map.
+                    ibp_bounds.into()
                 } else {
-                    let mut combined = std::collections::HashMap::new();
-                    for inp_name in &node.inputs {
-                        if inp_name == NETWORK_INPUT {
-                            continue;
-                        }
-                        if let Some(b) = crown_bounds.get(inp_name) {
-                            combined.insert(inp_name.clone(), b.clone());
-                        } else if let Some(b) = ibp_bounds.get(inp_name) {
-                            combined.insert(inp_name.clone(), b.clone());
-                        }
-                    }
-                    // #cgan-coeff-err-fold: also expose THIS node's own output box.
-                    // `dispatch_backward_layer` folds any incoming certified
-                    // coefficient error into the bias via
-                    // `ctx.node_bounds.get(ctx.node_name)` when the layer is not an
-                    // err-carrier (BatchNorm, pooling, ...). Without the node's own
-                    // bounds that fold degraded EVERY err-carrying row to
-                    // `[-inf, +inf]` (`discharge_coeff_err_to_conservative`), which
-                    // collapsed the whole per-target CROWN backward to IBP on
-                    // conv->BatchNorm stacks (cGAN generators: conv backward attaches
-                    // a fresh gamma_n*S err, the following BatchNorm found no output
-                    // box, and the target bound became vacuous before the IBP
-                    // intersection masked it as "Crown"). Sound: the fold is the
-                    // established precise discharge over the node's certified output
-                    // enclosure; providing the box only replaces the +/-inf degrade.
-                    if let Some(b) = crown_bounds
-                        .get(node_name)
-                        .or_else(|| ibp_bounds.get(node_name))
-                    {
-                        combined.insert(node_name.clone(), b.clone());
-                    }
-                    Some(combined)
-                };
-                let dispatch_node_bounds = match combined_bounds.as_ref() {
-                    Some(combined) => combined.into(),
-                    // The strict route never reads this view before producing
-                    // its allocation-free outcome; provide an existing map so
-                    // admission itself requires no synthesized allocation.
-                    None => ibp_bounds.into(),
+                    // The same current-output/dynamic-input projection and
+                    // tightened-before-IBP precedence as the historical owned
+                    // temporary map, borrowing certified tensors in place.
+                    crate::network::backward_dispatch::NodeBoundsView::target(
+                        crown_bounds,
+                        ibp_bounds,
+                        node_name,
+                        &node.inputs,
+                    )
                 };
 
                 let ctx = DispatchContext {
@@ -3228,8 +3365,11 @@ impl GraphNetwork {
     /// Bound-equivalent to the single pass by row-independence: the conv col2im
     /// scatter, the per-row CROWN error term, and the per-row concretize are all
     /// row-local, so concretizing rows `r0..r1` in isolation yields the same
-    /// values they would take in a full-objective pass. The `GpuSuffixPlan` is
-    /// objective-independent and is built once by the caller and reused here.
+    /// values they would take in a full-objective pass. The GPU suffix plan is
+    /// objective-independent, so the caller's single [`LazyGpuSuffixPlan`] is
+    /// threaded through every chunk; its `OnceLock` means the descriptors are
+    /// built at most once for the whole target, by whichever chunk first routes
+    /// to a GPU backend (`None` for every CPU-only walk).
     ///
     /// `chunk_size` is the STARTING width and `chunk_ceiling` the widest chunk
     /// the caller admits (a memory bound when the caller asked for chunking;
@@ -3258,7 +3398,7 @@ impl GraphNetwork {
         target_dim: usize,
         input_dim: usize,
         allow_patches: bool,
-        gpu_suffix_plan: &GpuSuffixPlan,
+        gpu_suffix_plan: &LazyGpuSuffixPlan<'_>,
         chunk_size: usize,
         chunk_ceiling: usize,
         cut_ctx: Option<&CrownCutContext>,
@@ -3291,8 +3431,9 @@ impl GraphNetwork {
         {
             // Hard-deadline chunking still performs whole-target setup before its
             // between-chunk polls: endpoint flatten/copy, range-vector
-            // allocation, GPU-suffix planning, and dense subset-seed
-            // allocation/fill. Refuse at the entry boundary until those phases
+            // allocation, GPU-suffix planning (now deferred into the walk by
+            // `LazyGpuSuffixPlan`, and reached only on a GPU route), and dense
+            // subset-seed allocation/fill. Refuse at the entry boundary until those phases
             // are cooperative. Small finite targets that do not require this
             // driver continue through the ordinary non-chunked path; `None`
             // retains the historical objective-chunk evaluator exactly.
@@ -3908,7 +4049,7 @@ impl GraphNetwork {
         };
         let seed = build_subset_seed(target_dim, rows, spatial, per_node_deadline)?;
         let gpu_suffix_plan =
-            GpuSuffixPlan::build(&relevant_nodes, self, input, crown_bounds, ibp_bounds, None);
+            LazyGpuSuffixPlan::new(&relevant_nodes, self, input, crown_bounds, ibp_bounds, None);
         let k = rows.len();
         // Flat [k] restore contract: the produced bounds line up 1:1 with `rows`.
         let subset_contract =
@@ -4138,7 +4279,7 @@ impl GraphNetwork {
         };
         let row_contract =
             GraphTargetShapeContract::from_bounds(target_node, &flat_bounds_view(rows.len())?);
-        let gpu_suffix_plan = GpuSuffixPlan::build(
+        let gpu_suffix_plan = LazyGpuSuffixPlan::new(
             &relevant_nodes,
             self,
             input,
@@ -4338,8 +4479,11 @@ impl GraphNetwork {
         )?;
         let contract =
             GraphTargetShapeContract::from_bounds(deepest_name, &flat_bounds_view(total_rows)?);
+        // Like the input-linear capture, this walk can never consult the plan:
+        // it always passes `stacked_seed_plan = Some(..)`, and the finisher call
+        // is guarded by `!has_stacked_seed_plan`. Deferred, so nothing is built.
         let gpu_suffix_plan =
-            GpuSuffixPlan::build(&relevant_nodes, self, input, crown_bounds, ibp_bounds, None);
+            LazyGpuSuffixPlan::new(&relevant_nodes, self, input, crown_bounds, ibp_bounds, None);
         let produced = self.run_target_backward_pass_core(
             input,
             deepest_name,
@@ -6797,6 +6941,13 @@ mod target_input_linear_tests {
                 (certificate, raw_certificate, direct)
             },
         );
+        // The concretizations below run after the env scope above has closed,
+        // and their admission reads `NY_DENSE_BUDGET_MB`. Sibling fixtures set it
+        // to 0 under the env write lock; an unguarded read that overlaps one is
+        // refused and falls back to [-inf, +inf] (measured: raw lower -inf vs
+        // direct finite under --test-threads=4, 2026-10-04). Readers take the
+        // shared half, after the write scope, so this cannot self-deadlock.
+        let _env = crate::tests::lock_env_shared();
         assert_eq!(
             (certificate.num_outputs(), certificate.num_inputs()),
             (80, input_dim)
@@ -7242,13 +7393,11 @@ mod cut_segment_env_tests {
             ] {
                 env.remove(key);
             }
-            let frozen = std::sync::Arc::new(ny_levers::LeverSet::freeze_with(
-                ny_levers::all(),
-                |name| {
+            let frozen =
+                std::sync::Arc::new(ny_levers::LeverSet::freeze_with(ny_levers::all(), |name| {
                     (name == ny_levers::decls::crown_ibp_budget::CROWN_OBJ_CHUNK.name)
                         .then(|| "32".to_owned())
-                },
-            ));
+                }));
             let (mut graph, input) = demanded_conv_transpose_33();
             graph.set_frozen_levers(Some(frozen));
             let ibp = graph.collect_node_bounds(&input).expect("certified IBP");
@@ -7609,3 +7758,7 @@ pub(super) fn crown_bounds_nonfinite_kind(cb: &CrownBounds) -> Option<&'static s
     }
     None
 }
+
+#[cfg(test)]
+#[path = "target_backward_lazy_suffix_tests.rs"]
+mod lazy_suffix_preflight_tests;

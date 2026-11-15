@@ -18,7 +18,7 @@ fn test_silu_affine_2d_center_copy() {
     let orig_n_err = z.n_error_terms;
     let result = z.silu_affine().unwrap();
 
-    // Per-element error terms (#2486): shape [1,2] adds 1*2 = 2 error terms
+    // Per-element error terms: shape [1,2] adds 1*2 = 2 error terms
     let seq_len = 1;
     let dim = 2;
     assert_eq!(
@@ -311,7 +311,7 @@ fn test_silu_affine_2d_error_formula() {
 /// Cancellation regression through the 2D SiLU path.
 /// Same pattern as `test_silu_affine_linear_projection_soundness_1d_independent_error_terms`
 /// in silu_affine_mutation_1d.rs, but exercises the 2D code path.
-/// Fixes #2486 (same class of bug as GELU #2470).
+/// Same class of bug as the GELU shared error symbol.
 #[test]
 fn test_silu_affine_linear_projection_soundness_2d_independent_error_terms() {
     fn silu(x: f32) -> f32 {

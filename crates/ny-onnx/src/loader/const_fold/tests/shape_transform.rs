@@ -233,7 +233,7 @@ fn test_expand_onnx_semantics_shape_mismatch() {
     assert!((out[[2]] - 30.0).abs() < 1.0e-6);
 }
 
-/// Regression test for #3602: Expand with -1 in target shape (ONNX convention
+/// Regression test: Expand with -1 in target shape (ONNX convention
 /// meaning "use data dimension"). The ml4acopf model produces target shape
 /// [1, -1] via ConstantOfShape→Mul→Equal→Where chain. After broadcast [1, 20]
 /// the leading-1 is squeezed to [20] for unbatched-mode compatibility.

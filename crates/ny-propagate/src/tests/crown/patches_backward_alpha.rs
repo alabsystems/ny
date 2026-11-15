@@ -7,8 +7,6 @@
 //! Covers: alpha composition for crossing neurons, directed-rounding bias,
 //! gradient d(lower_bound_sum)/d(alpha[i]) accumulation, and identity
 //! pass-through for always-active neurons.
-//!
-//! Part of #3463
 
 use crate::bounds::patches::{
     CrownBounds, PatchGeometry, PatchesData, PatchesLinearBounds, UnstableIdx,
@@ -299,7 +297,7 @@ fn test_crown_relu_backward_patches_with_alpha_sparse_delegates_to_dense() {
 // Equivalence test: optimized `crown_relu_backward_patches_with_alpha`
 // must be bit-identical to the pre-optimization indexed reference.
 //
-// Perf change (#3293): the production loop was switched from per-element
+// Perf change: the production loop was switched from per-element
 // `ArrayD[[...]]` dynamic indexing to contiguous flat-slice iteration with a
 // monotonic cursor, and the patches-tensor deep clone was removed in favor of
 // borrowing. These tests pin every f32 of both patches tensors, both bias

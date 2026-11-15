@@ -41,10 +41,10 @@ fn test_relu_always_branches_at_zero() {
     assert_eq!(points, vec![0.0]);
 
     let points = branching.branching_points(1.0, 3.0, &Layer::ReLU(ReLULayer));
-    assert!(points.is_empty());
+    assert_eq!((points).len(), 0);
 
     let points = branching.branching_points(-3.0, -1.0, &Layer::ReLU(ReLULayer));
-    assert!(points.is_empty());
+    assert_eq!((points).len(), 0);
 }
 
 #[ntest::timeout(5000)]
@@ -90,7 +90,7 @@ fn test_bbps_score_weights_by_activation() {
     assert!(score_near_zero > score_far);
 }
 
-/// Regression test for #1933: score_neurons must handle non-contiguous tensors.
+/// Regression test: score_neurons must handle non-contiguous tensors.
 #[test]
 fn test_score_neurons_non_contiguous_1933() {
     let lower_c = ArrayD::from_shape_vec(
@@ -120,7 +120,7 @@ fn test_score_neurons_non_contiguous_1933() {
     );
 }
 
-/// Regression test (#2882): score_neurons must skip neurons with NaN/Inf bounds.
+/// Regression test: score_neurons must skip neurons with NaN/Inf bounds.
 #[ntest::timeout(5000)]
 #[test]
 fn test_score_neurons_nan_bounds_skipped_2882() {
@@ -144,7 +144,7 @@ fn test_score_neurons_nan_bounds_skipped_2882() {
     assert!(decisions[0].score.is_finite());
 }
 
-/// #3769 Slice 3: Sign branches at zero just like ReLU.
+/// Sign branches at zero just like ReLU.
 #[ntest::timeout(5000)]
 #[test]
 fn test_sign_branches_at_zero_3769() {
@@ -157,14 +157,14 @@ fn test_sign_branches_at_zero_3769() {
 
     // Stable positive: no branching points
     let points = branching.branching_points(1.0, 3.0, &sign);
-    assert!(points.is_empty());
+    assert_eq!((points).len(), 0);
 
     // Stable negative: no branching points
     let points = branching.branching_points(-3.0, -1.0, &sign);
-    assert!(points.is_empty());
+    assert_eq!((points).len(), 0);
 }
 
-/// #3769 Slice 3: score_neurons skips stable Sign neurons.
+/// score_neurons skips stable Sign neurons.
 #[ntest::timeout(5000)]
 #[test]
 fn test_sign_score_neurons_skips_stable_3769() {
@@ -184,7 +184,7 @@ fn test_sign_score_neurons_skips_stable_3769() {
     );
 }
 
-/// #3769 Slice 3: score_neurons returns decisions for unstable Sign neurons.
+/// score_neurons returns decisions for unstable Sign neurons.
 #[ntest::timeout(5000)]
 #[test]
 fn test_sign_score_neurons_finds_unstable_3769() {
@@ -309,7 +309,7 @@ fn test_bbps_smooth_activation_numerical_values() {
     );
 }
 
-/// #3769 Slice 3: BBPS scoring for Sign matches ReLU scoring semantics.
+/// BBPS scoring for Sign matches ReLU scoring semantics.
 /// The BBPS formula `width * (1 - dist_to_zero / width)` favors intervals where
 /// zero is close to one edge (small dist_to_zero), because splitting there makes
 /// one child very narrow (effectively solved). Sign and ReLU should produce

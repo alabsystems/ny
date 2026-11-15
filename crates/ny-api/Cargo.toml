@@ -12,43 +12,12 @@ readme.workspace = true
 workspace = true
 
 [features]
-# REQUIRED. Every [[test]] target below carries `required-features` (bar one),
-# and cargo SILENTLY skips a test target whose required features are unmet — no
-# warning, exit 0. With no `default` key this crate's default feature set is
-# empty, so `cargo test -p ny-api` compiled the lib, ran only the unfeatured
-# unit tests, and skipped the integration binaries while reporting success.
-# That is the "matched nothing reads as pass" trap shipped as build
-# configuration rather than as a test filter.
-#
-# `cert` is the NARROWEST default that arms every target reachable WITHOUT a
-# hardware dependency. Counted on the merged tree 2026-08-27 (12 [[test]]
-# targets, 76 #[test] fns under tests/):
-#   - 8 targets require `propagate`            40 tests
-#   - 2 targets require `cert`                 16 tests  (lipschitz_sound,
-#                                                         facade_expansion_contract)
-#   - 1 target declares no required-features    9 tests  (complete_facade_contract)
-#   - 1 target requires `gpu`                  11 tests  (gpu_facade_contract)
-# so `cert` arms 65 of the 76.
-#
-#   - `propagate` alone would leave lipschitz_sound and facade_expansion_contract
-#     dark, i.e. half-fix the very defect this key exists to close.
-#   - `full` would enable `complete` -> ny-mip -> the git-pinned `ay-milp`, which
-#     NO test target requires and which would newly enter the offline vendored
-#     submission build. Do not "round up" to `full`.
-#   - `gpu` is deliberately NOT in the default: it adds a real `ny-gpu` + `wgpu`
-#     edge, i.e. a hardware dependency, to every plain `cargo build -p ny-api`.
-#     gpu_facade_contract's 11 tests therefore stay gated. That is a KNOWN and
-#     NAMED gap, not an oversight — gate lane [k] states it so this key cannot
-#     be mistaken for full coverage. Run them with --features gpu on a host
-#     that has a device.
-#   - Deleting the `required-features` gates instead is not an option: the test
-#     files import `#[cfg(feature = ...)]`-gated modules directly, so a
-#     featureless `cargo test -p ny-api` would fail to COMPILE. The gates are
-#     correct; the missing default was the bug.
-#
-# Costs the competition binary nothing: crates/ny-cli/Cargo.toml already
-# declares ny-api with features = ["cert"], and the submission builds -p ny-cli,
-# so its dependency closure is unchanged.
+# Default to propagation and certificate contracts without the optional MIP or
+# GPU dependencies. `propagate` alone would omit the certificate test targets.
+# Keep required-features: these tests import feature-gated modules, and the
+# build tool skips targets whose requirements are unmet. Complete verification
+# and GPU contracts require explicit `complete` and `gpu` selection below.
+# The CLI already requests `cert`, so this default adds no dependency to it.
 default = ["cert"]
 propagate = ["dep:ny-build", "dep:ny-propagate", "dep:ndarray", "dep:ny-levers"]
 # Proof-carrying certificates (exact-rational Farkas/entailment, Clean-checkable).
@@ -57,15 +26,13 @@ cert = ["propagate", "dep:ny-cert", "dep:serde_json"]
 complete = ["propagate", "dep:ny-mip"]
 # Everything: propagation facade + certificates + complete MIP.
 full = ["propagate", "cert", "complete"]
-# GPU participation (WGPU/Metal/Vulkan), OFF by default.
-#
-# Enabling this adds a REAL `ny-gpu` edge so a facade consumer can name and
-# construct the typed verdict request. It grants nothing: ny still qualifies
-# every device by live MEASUREMENT and refuses, typed, when a rung does not
-# pass. `wgpu` is named explicitly rather than relied on through ny-gpu's
-# defaults because the typed constructors are `#[cfg(feature = "wgpu")]` —
-# without it this feature would export names that do not exist.
+# Optional typed GPU requests still require live device qualification. Enable
+# ny-gpu/wgpu explicitly because its typed constructors are feature-gated.
 gpu = ["propagate", "dep:ny-gpu", "ny-gpu/wgpu"]
+# Explicit real-adapter qualification probes. These are excluded from ordinary
+# unit runs because they create a WGPU context and compile verdict-critical
+# pipelines, but they execute normally (never as ignored tests) when selected.
+gpu-tests = ["gpu"]
 
 [dependencies]
 ny-build = { path = "../ny-build", optional = true }

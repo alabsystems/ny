@@ -61,7 +61,7 @@ impl ObjectiveAggregation {
 /// queue scheduling and objective-directed branch guidance.
 ///
 /// Fields are `pub(crate)` to enforce construction through validated methods
-/// that reject NaN bounds (#3125, #2982).
+/// that reject NaN bounds.
 #[derive(Debug, Clone)]
 pub struct MultiObjectiveGraphBabDomain {
     /// Split history for this domain.
@@ -89,7 +89,7 @@ pub struct MultiObjectiveGraphBabDomain {
     /// This mirrors `GraphBabDomain::alpha_state` so multi-objective BaB can
     /// reuse root α-CROWN optimized slopes and warm-start child domains.
     pub(crate) alpha_state: GraphDomainAlphaState,
-    /// Per-disjunct α states for `optimize_disjuncts_separately` mode (#4355).
+    /// Per-disjunct α states for `optimize_disjuncts_separately` mode.
     ///
     /// When populated, each entry is an α state optimized for a specific
     /// disjunct (OR clause). BaB evaluation runs separate 1-row CROWN
@@ -113,8 +113,7 @@ pub struct MultiObjectiveGraphBabDomain {
     ///
     /// # Reference
     /// alpha-beta-CROWN: `complete_verifier/branching_domains.py:94-99` (all_lAs)
-    /// Design: `designs/2026-03-15-issue-3813-multi-objective-la-warm-start.md`
-    /// Issue: #3813
+    ///
     /// The coefficient payload is immutable after publication and shared
     /// across descendants.  A CIFAR root carries one cache per objective over
     /// every graph node; deep-cloning those ndarrays for both children made
@@ -132,6 +131,13 @@ pub struct MultiObjectiveGraphBabDomain {
     /// bounding pass. Mirrors `GraphBabDomain::delta_pre_nodes` — see that
     /// field's doc for the full contract and the fail-closed gate.
     pub(crate) delta_pre_nodes: Vec<String>,
+    /// B2.2: the multi-objective driver's WRITE-ONLY proof tape, shared by
+    /// every domain of one invocation (`certify::lane_proof`). `None` — the
+    /// Competition profile, and every domain built outside an armed driver —
+    /// records nothing. [`Self::update_bounds`] records a domain's CLOSE (its
+    /// region, its verified objectives, its β) when the new bounds close it
+    /// under its aggregation; nothing ever reads the tape back.
+    pub(crate) proof_tape: Option<Arc<crate::certify::lane_proof::TapeRecorder>>,
 }
 
 impl PartialEq for MultiObjectiveGraphBabDomain {
@@ -182,7 +188,7 @@ impl MultiObjectiveGraphBabDomain {
     ///
     /// This compatibility constructor preserves the original public API.
     /// Conjunctive callers must use [`Self::root_with_aggregation`] explicitly.
-    /// Returns `Err(NumericalInstability)` if any objective bounds contain NaN (#2982).
+    /// Returns `Err(NumericalInstability)` if any objective bounds contain NaN.
     pub fn root(
         node_bounds: std::collections::HashMap<String, BoundedTensor>,
         objective_bounds: Vec<(f32, f32)>,
@@ -283,6 +289,7 @@ impl MultiObjectiveGraphBabDomain {
             // post-bounding replacement — delta unknown until the first
             // bounding pass clears it.
             delta_pre_nodes: super::delta_pre_nodes_unknown(),
+            proof_tape: None,
         })
     }
 
@@ -340,6 +347,63 @@ impl MultiObjectiveGraphBabDomain {
         self.verified.iter().filter(|&&v| v).count()
     }
 
+    /// #vit-v3-bankable: the certified emptiness SLACK of the half-space
+    /// `constraint` on this domain, read from exactly the bound
+    /// [`Self::with_constraint`] tests: `Some(-u)` for an active literal whose
+    /// certified pre-activation upper bound `u` is negative, `Some(l)` for an
+    /// inactive literal whose certified lower bound `l` is positive, `None`
+    /// when the half-space is not shown empty (or the bound is missing,
+    /// non-finite or inverted — the cases `with_constraint` reports as errors).
+    /// A `Some` is the finite interval certificate the cover ledger records
+    /// for a construction-time empty child; `with_constraint` returns
+    /// `Ok(None)` exactly when this is `Some` (pinned by
+    /// `mo_cover_split_emptiness_slack_matches_with_constraint`).
+    #[must_use]
+    pub(crate) fn split_emptiness_slack(
+        &self,
+        graph: &GraphNetwork,
+        constraint: &GraphNeuronConstraint,
+    ) -> Option<f64> {
+        let relu_node = graph.nodes.get(&constraint.node_name)?;
+        if !matches!(relu_node.layer, Layer::ReLU(_) | Layer::Sign(_)) {
+            return None;
+        }
+        let pre_name = relu_node.inputs.first().map(String::as_str)?;
+        let pre_bounds: &BoundedTensor = if pre_name == NETWORK_INPUT {
+            self.input_bounds.as_ref()
+        } else {
+            self.node_bounds.get(pre_name).map(AsRef::as_ref)?
+        };
+        if constraint.neuron_idx >= pre_bounds.len() {
+            return None;
+        }
+        let at = |array: &ndarray::ArrayD<f32>| -> f32 {
+            array.as_slice().map_or_else(
+                || {
+                    array
+                        .iter()
+                        .nth(constraint.neuron_idx)
+                        .copied()
+                        .unwrap_or(f32::NAN)
+                },
+                |slice| slice[constraint.neuron_idx],
+            )
+        };
+        let l = at(pre_bounds.lower());
+        let u = at(pre_bounds.upper());
+        if !l.is_finite() || !u.is_finite() || l > u {
+            return None;
+        }
+        let slack = if constraint.is_active && u < 0.0 {
+            -f64::from(u)
+        } else if !constraint.is_active && l > 0.0 {
+            f64::from(l)
+        } else {
+            return None;
+        };
+        (slack > 0.0).then_some(slack)
+    }
+
     /// Apply a constraint to create a child domain.
     ///
     /// Returns `Ok(None)` only when the requested half-space is infeasible.
@@ -389,7 +453,7 @@ impl MultiObjectiveGraphBabDomain {
         let neuron_idx = constraint.neuron_idx;
         let is_active = constraint.is_active;
 
-        // Constraints are on the *pre-activation* of this ReLU/Sign (#3769)
+        // Constraints are on the *pre-activation* of this ReLU/Sign
         let relu_node = graph.nodes.get(node_name).ok_or_else(|| {
             NyError::InternalError(format!(
                 "with_constraint (multi-obj): split node '{node_name}' is missing"
@@ -484,7 +548,7 @@ impl MultiObjectiveGraphBabDomain {
             let mut upper_flat = flat.upper().clone();
 
             if is_active {
-                // NaN-safe: propagate NaN instead of silently clamping to 0.0 (#2643)
+                // NaN-safe: propagate NaN instead of silently clamping to 0.0
                 lower_flat[[neuron_idx]] = nan_propagating_max(lower_flat[[neuron_idx]], 0.0);
             } else {
                 upper_flat[[neuron_idx]] = nan_propagating_min(upper_flat[[neuron_idx]], 0.0);
@@ -493,7 +557,7 @@ impl MultiObjectiveGraphBabDomain {
                 return Ok(None);
             }
 
-            // Shape errors in flatten→reshape roundtrip indicate an internal bug (#2302).
+            // Shape errors in flatten→reshape roundtrip indicate an internal bug.
             let lower_new = lower_flat
                 .into_shape_clone(ndarray::IxDyn(&shape))
                 .map_err(|e| {
@@ -532,13 +596,28 @@ impl MultiObjectiveGraphBabDomain {
             GraphBetaState::DEFAULT_BETA_INIT,
         )?;
         let alpha_state = if inherit_optional_warm_starts {
-            GraphDomainAlphaState::from_parent_node_bounds_map(
+            let mut state = GraphDomainAlphaState::from_parent_node_bounds_map(
                 &self.alpha_state,
                 graph,
                 &self.node_bounds,
                 &new_history,
                 new_input_bounds.as_ref(),
-            )
+            );
+            // #alpha-split-refresh at CHILD BIRTH (STRUCTURAL, default-on):
+            // every split child stores delta-form alpha around its CURRENT-box
+            // heuristic instead of the ancestor-box absolute values the line
+            // above just copied in. Receipted law: stale inherited alpha
+            // measurably loses to the plain current-box heuristic — on
+            // `cora_2024 cifar10-set img398` inheriting the ascended ROOT
+            // alpha through this site (channel A) alone costs unsat 5.5-6.5 s
+            // -> ~24 s timeout; children born from the heuristic recover
+            // unsat 3/3 (REGRESSION doc, steering-flow discrimination
+            // receipts, 2026-08-30). The root itself (no constraints) keeps
+            // its optimized state untouched, so the root bound is unaffected.
+            if !new_history.constraints.is_empty() {
+                state.neutralize_for_split_refresh();
+            }
+            state
         } else {
             // The bounded lane never enters analytical alpha optimization.
             // An empty state selects the independently sound heuristic ReLU
@@ -546,7 +625,7 @@ impl MultiObjectiveGraphBabDomain {
             // every frontier domain.
             GraphDomainAlphaState::empty()
         };
-        // Inherit per-disjunct alphas from parent, building child states (#4355).
+        // Inherit per-disjunct alphas from parent, building child states.
         let per_disjunct_alphas = inherit_optional_warm_starts
             .then(|| {
                 self.per_disjunct_alphas.as_ref().map(|parent_alphas| {
@@ -596,12 +675,13 @@ impl MultiObjectiveGraphBabDomain {
                 delta.push(pre_name.to_string());
                 delta
             },
+            proof_tape: self.proof_tape.clone(),
         }))
     }
 
     /// Update bounds and verification status after propagation.
     ///
-    /// Returns `Err(NumericalInstability)` if any objective bounds contain NaN (#2982).
+    /// Returns `Err(NumericalInstability)` if any objective bounds contain NaN.
     pub fn update_bounds(
         &mut self,
         new_bounds: Vec<(f32, f32)>,
@@ -638,7 +718,56 @@ impl MultiObjectiveGraphBabDomain {
         self.objective_bounds = new_bounds;
         self.verified = new_verified;
         self.priority = new_priority;
+        self.note_close_on_tape();
         Ok(())
+    }
+
+    /// B2.2: record this domain's certified objectives on the proof tape (a
+    /// no-op without one). Every objective the new bounds verify is a TRUE
+    /// fact about the domain's region, whether or not it closes the domain:
+    /// a disjunction's objective verified at an internal node (the root,
+    /// typically) is where that clause's cover lives, since the search may
+    /// never re-bound it below. The tape records EACH verified objective,
+    /// with the domain's β as the dual-point hint. A domain whose objective
+    /// vector is not the tape's (a re-indexed sub-problem) records nothing.
+    /// Write-only.
+    pub(crate) fn note_close_on_tape(&self) {
+        let Some(tape) = &self.proof_tape else {
+            return;
+        };
+        if self.verified.len() != tape.objective_count() || !self.any_verified() {
+            return;
+        }
+        let groups: Vec<Vec<u32>> = self
+            .verified
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| **v)
+            .filter_map(|(i, _)| u32::try_from(i).ok().map(|i| vec![i]))
+            .collect();
+        // The certified margin of the closing objectives (hint).
+        let margin = self
+            .objective_bounds
+            .iter()
+            .zip(&self.verified)
+            .filter(|(_, v)| **v)
+            .map(|((l, u), _)| {
+                if self.verify_upper {
+                    -f64::from(*u)
+                } else {
+                    f64::from(*l)
+                }
+            })
+            .fold(f64::INFINITY, f64::min);
+        tape.note_splits(
+            &self.history,
+            None,
+            Some(&self.beta_state),
+            crate::certify::lane_proof::TapeClose::Bound,
+            groups,
+            margin,
+            true,
+        );
     }
 
     /// Check if any objective is conclusively violated (provably cannot be verified).
@@ -661,7 +790,7 @@ impl MultiObjectiveGraphBabDomain {
                 })
     }
 
-    /// Lower bound on the first objective. Debug-asserts non-empty (#3263 F2).
+    /// Lower bound on the first objective. Debug-asserts non-empty.
     pub fn lower_bound(&self) -> f32 {
         debug_assert!(!self.objective_bounds.is_empty(), "empty objectives");
         self.objective_bounds
@@ -670,7 +799,7 @@ impl MultiObjectiveGraphBabDomain {
             .unwrap_or(f32::NAN)
     }
 
-    /// Upper bound on the first objective. Debug-asserts non-empty (#3263 F2).
+    /// Upper bound on the first objective. Debug-asserts non-empty.
     pub fn upper_bound(&self) -> f32 {
         debug_assert!(!self.objective_bounds.is_empty(), "empty objectives");
         self.objective_bounds
@@ -692,6 +821,7 @@ impl MultiObjectiveGraphBabDomain {
     /// `INFINITY` for no unverified row, but rejects mismatched layouts rather
     /// than silently zip-truncating objective state.
     #[deprecated(
+        since = "0.2.0",
         note = "use aggregation-aware MultiObjectiveGraphBabDomain::priority on a validated domain"
     )]
     pub fn conjunctive_priority(
@@ -901,7 +1031,7 @@ impl MultiObjectiveGraphBabDomain {
         self.alpha_state = state;
     }
 
-    /// Per-disjunct α states for `optimize_disjuncts_separately` mode (#4355).
+    /// Per-disjunct α states for `optimize_disjuncts_separately` mode.
     pub fn per_disjunct_alphas(&self) -> Option<&[GraphDomainAlphaState]> {
         self.per_disjunct_alphas.as_deref()
     }
@@ -955,6 +1085,7 @@ impl MultiObjectiveGraphBabDomain {
             // A verified shell cannot propagate. If a future regression tries,
             // the unknown sentinel keeps every delta-based cache gate closed.
             delta_pre_nodes: super::delta_pre_nodes_unknown(),
+            proof_tape: self.proof_tape.clone(),
         }
     }
 
@@ -1058,6 +1189,7 @@ mod tests {
             per_disjunct_alphas: None,
             cached_las: vec![None; num_objectives],
             delta_pre_nodes: Vec::new(),
+            proof_tape: None,
         }
     }
 
@@ -1395,7 +1527,7 @@ mod tests {
         assert!(popped.priority.is_nan());
     }
 
-    // --- cached_las (lA warm-start, #3813) ---
+    // --- cached_las (lA warm-start) ---
 
     #[test]
     fn test_root_cached_las_length_matches_num_objectives() {

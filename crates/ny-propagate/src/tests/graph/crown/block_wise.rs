@@ -5,7 +5,6 @@
 //! Per-block CROWN tests: tightness comparison and soundness sampling.
 //!
 //! Tests for `GraphNetwork::propagate_crown_block_wise()`.
-//! Part of #3221.
 
 use ndarray::{Array1, Array2, ArrayD, IxDyn};
 
@@ -94,9 +93,8 @@ fn test_per_block_crown_vs_ibp_two_blocks() {
     // each block because CROWN exploits activation (GELU) correlations.
     //
     // Expected: crown_ibp_ratio < 1.0 for blocks with activations.
-    // Part of #3221.
     //
-    // Serialized against budget=0 tests to prevent CROWN fallback (#3515).
+    // Serialized against budget=0 tests to prevent CROWN fallback.
     tests::with_crown_dense_budget_mb("2048", || {
         let hidden = 4;
         let expansion = 2;
@@ -148,7 +146,7 @@ fn test_per_block_crown_vs_ibp_two_blocks() {
                 block.block_name
             );
             // Per-block CROWN bounds should be comparable to IBP. With directed
-            // rounding on normalization CROWN backward coefficients (#3344), CROWN
+            // rounding on normalization CROWN backward coefficients, CROWN
             // can be slightly wider than IBP for small models (n=4) where rounding
             // overhead dominates. The soundness test (test_per_block_crown_soundness_sampling)
             // verifies the bounds still contain all concrete evaluations.
@@ -172,7 +170,7 @@ fn test_per_block_crown_vs_ibp_two_blocks() {
     });
 }
 
-/// #3550 regression: zero CPU dense budget disables per-block CROWN and reuses
+/// Regression: zero CPU dense budget disables per-block CROWN and reuses
 /// the already-computed IBP block widths instead of allocating batched identities.
 #[ntest::timeout(10000)]
 #[test]
@@ -208,7 +206,7 @@ fn test_per_block_crown_zero_budget_uses_ibp_width_3550() {
     });
 }
 
-/// #3550 regression: alpha per-block CROWN skips optimization when the fixed
+/// Regression: alpha per-block CROWN skips optimization when the fixed
 /// batched backward path is disabled by the shared CPU dense budget.
 #[ntest::timeout(10000)]
 #[test]
@@ -257,10 +255,8 @@ fn test_phase3_whole_network_vs_per_block_crown() {
     // Phase 3 measurement: per-block CROWN's value proposition.
     // Whole-network CROWN through LayerNorm ≈ IBP (normalization kills correlation),
     // but per-block CROWN captures within-block GELU correlations (ratio ≈ 0.3).
-    // Reference: designs/2026-03-03-per-block-crown-transformer-verification.md
-    // Part of #3221.
     //
-    // Serialized against budget=0 tests to prevent CROWN fallback (#3515).
+    // Serialized against budget=0 tests to prevent CROWN fallback.
     tests::with_crown_dense_budget_mb("2048", || {
         let graph = build_two_block_ffn_graph(4, 2);
         let input = BoundedTensor::from_epsilon(ArrayD::zeros(IxDyn(&[4])), 0.01).unwrap();
@@ -300,14 +296,14 @@ fn test_phase3_whole_network_vs_per_block_crown() {
         println!("Avg per-block={avg_ratio:.4}, whole-net={whole_ratio:.4}");
 
         // Whole-network CROWN not dramatically tighter than IBP.
-        // Lowered from 0.5 to 0.3: LayerNorm IbpValidated decomposition (#3972)
+        // Lowered from 0.5 to 0.3: LayerNorm IbpValidated decomposition
         // improved CROWN tightness through normalization layers.
         assert!(
             whole_ratio >= 0.3,
             "Whole-net ratio={whole_ratio:.4}: firewall violated"
         );
         // Per-block CROWN provides bounds comparable to IBP. With directed rounding
-        // on normalization CROWN backward coefficients (#3344), the per-block ratio
+        // on normalization CROWN backward coefficients, the per-block ratio
         // increased from ~0.47 to ~1.04 for small models (n=4) where rounding
         // overhead dominates. The soundness test still passes — bounds contain all
         // concrete evaluations. For larger models, CROWN's advantage re-emerges
@@ -336,9 +332,8 @@ fn test_per_block_crown_soundness_sampling() {
     // block's layers via IBP with degenerate (point) intervals. Verifies that
     // every concrete output falls within the CROWN lower/upper bounds.
     //
-    // Part of #3221.
     //
-    // Serialized against budget=0 tests to prevent CROWN fallback (#3515).
+    // Serialized against budget=0 tests to prevent CROWN fallback.
     tests::with_crown_dense_budget_mb("2048", || {
         let hidden = 4;
         let expansion = 2;
@@ -365,7 +360,7 @@ fn test_per_block_crown_soundness_sampling() {
             let (crown_bounds, _stats, provenance) = graph
                 .crown_backward_within_block(nodes_in_block, &block_node_bounds, &block_input)
                 .unwrap();
-            // Regression guard: silent fallback would widen bounds without warning (#4256).
+            // Regression guard: silent fallback would widen bounds without warning.
             assert_eq!(
                 provenance,
                 BoundsProvenance::Crown,
@@ -451,10 +446,8 @@ fn test_per_block_crown_soundness_sampling() {
 fn test_phase4_alpha_crown_per_block() {
     // Phase 4: alpha-CROWN per block with optimizable GELU slopes.
     // Alpha-CROWN should produce bounds at least as tight as fixed CROWN (alpha=0.5).
-    // Reference: designs/2026-03-03-per-block-crown-transformer-verification.md Phase 4.
-    // Part of #3221.
     //
-    // Serialized against budget=0 tests to prevent CROWN fallback (#3515).
+    // Serialized against budget=0 tests to prevent CROWN fallback.
     tests::with_crown_dense_budget_mb("2048", || {
         let hidden = 4;
         let expansion = 2;
@@ -521,9 +514,8 @@ fn test_phase4_alpha_crown_wider_epsilon() {
     //
     // Reference: In alpha-beta-CROWN, per-neuron alpha optimization produces
     // 2-15% tighter bounds on GELU/SiLU networks (vnncomp benchmarks).
-    // Part of #3221 Phase 4.
     //
-    // Serialized against budget=0 tests to prevent CROWN fallback (#3515).
+    // Serialized against budget=0 tests to prevent CROWN fallback.
     tests::with_crown_dense_budget_mb("2048", || {
         let hidden = 8;
         let expansion = 4;
@@ -647,9 +639,7 @@ fn test_alpha_crown_executes_and_fixed_crown_is_sound_sampling() {
     // summaries, not the optimized bounded tensors themselves, so the direct
     // soundness witness available at this layer remains `crown_backward_within_block`.
     //
-    // Part of #3221 Phase 4.
-    //
-    // Serialized against budget=0 tests to prevent CROWN fallback (#3515).
+    // Serialized against budget=0 tests to prevent CROWN fallback.
     tests::with_crown_dense_budget_mb("2048", || {
         let hidden = 4;
         let expansion = 2;
@@ -769,9 +759,8 @@ fn test_per_block_crown_soundness_larger_scale() {
     // At hidden=16 corner enumeration is 2^16=65536, so we use random sampling
     // with more samples to exercise higher-dimensional interactions.
     //
-    // Part of #3221.
     //
-    // Serialized against budget=0 tests to prevent CROWN fallback (#3515).
+    // Serialized against budget=0 tests to prevent CROWN fallback.
     tests::with_crown_dense_budget_mb("2048", || {
         let hidden = 16;
         let expansion = 4;

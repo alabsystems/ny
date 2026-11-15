@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! NaN-safe accumulation tests for batched CROWN backward pass (#2102).
+//! NaN-safe accumulation tests for batched CROWN backward pass.
 //!
 //! Tests that the indexed pending-bounds helper correctly handles:
 //! - INF-cancellation (INF + NEG_INFINITY → sound conservative bound, not NaN)
@@ -43,7 +43,7 @@ fn make_pending(node_name: &str, n_domains: usize) -> IndexedPendingLinearBounds
     IndexedPendingLinearBounds::new(plan, n_domains)
 }
 
-/// Test for #2102: INF-cancellation in batched CROWN accumulation must produce
+/// Test: INF-cancellation in batched CROWN accumulation must produce
 /// sound conservative bounds, not NaN.
 ///
 /// The batched variant stores `Vec<Option<LinearBounds>>` per node, indexed by
@@ -125,7 +125,7 @@ fn test_accumulate_crown_bounds_batched_inf_cancellation_safe_2102() {
     );
 }
 
-/// Test for #2102: NaN from upstream becomes conservative infinity in batched accumulation.
+/// Test: NaN from upstream becomes conservative infinity in batched accumulation.
 ///
 /// safe_add_* replaces all NaN with conservative bounds (NEG_INFINITY for lower,
 /// INFINITY for upper). Exercises the intermediate node path (not "_input").
@@ -196,7 +196,7 @@ fn test_accumulate_crown_bounds_batched_nan_input_preserved_2102() {
     );
 }
 
-/// Test for #2102: NaN in upper_a and lower_b positions (complementary to the test above
+/// Test: NaN in upper_a and lower_b positions (complementary to the test above
 /// which only covers lower_a and upper_b).
 ///
 /// A bug in safe_add polarity that only affects upper_a or lower_b would not be caught

@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for `VnnLibSpec::shrink_input_bounds` (#4299).
+//! Tests for `VnnLibSpec::shrink_input_bounds`.
 
 use super::VnnLibSpec;
 

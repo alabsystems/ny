@@ -35,7 +35,7 @@ pub(crate) fn conv1d_transpose(
             "conv1d_transpose: groups must be >= 1".to_string(),
         ));
     }
-    // Guard: ndim checks prevent panic on shape indexing (#2920 WP-B).
+    // Guard: ndim checks prevent panic on shape indexing.
     if input.ndim() < 2 {
         return Err(NyError::ShapeMismatch {
             expected: vec![2],
@@ -123,7 +123,7 @@ pub(crate) fn conv1d_transpose_forward(
             "conv1d_transpose_forward: groups must be >= 1".to_string(),
         ));
     }
-    // Guard: ndim checks prevent panic on shape indexing (#2920 WP-B).
+    // Guard: ndim checks prevent panic on shape indexing.
     if input.ndim() < 2 {
         return Err(NyError::ShapeMismatch {
             expected: vec![2],
@@ -240,7 +240,7 @@ pub(crate) fn conv1d_single(
             "conv1d_single: groups must be >= 1".to_string(),
         ));
     }
-    // Guard: ndim checks prevent panic on shape indexing (#2920 WP-B).
+    // Guard: ndim checks prevent panic on shape indexing.
     if input.ndim() < 2 {
         return Err(NyError::ShapeMismatch {
             expected: vec![2],

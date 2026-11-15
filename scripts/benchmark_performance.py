@@ -442,7 +442,7 @@ def load_criterion_data():
 
     criterion_dir = Path("target/criterion")
     if not criterion_dir.exists():
-        print("SKIP: no prior Criterion data found (run: cargo bench)")
+        print("SKIP: no prior Criterion data found (run: targo --unverified bench)")
         return {}
 
     results = {}
@@ -503,7 +503,10 @@ def main() -> int:
     # Check binary exists
     if not NY_BIN.exists():
         print("Building release binary...")
-        subprocess.run(["cargo", "build", "--release", "-p", "ny-cli"], check=True)
+        subprocess.run(
+            ["targo", "--unverified", "build", "--release", "-p", "ny-cli"],
+            check=True,
+        )
 
     print("=" * 60)
     print("ny Performance Benchmark Suite")

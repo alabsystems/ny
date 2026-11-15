@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Constrained forward-tightening regressions (#1901).
+//! Constrained forward-tightening regressions.
 
 use crate::beta_crown::{GraphCrownContext, GraphSplitHistory};
 use crate::{BetaCrownConfig, BetaCrownVerifier};

@@ -6,7 +6,7 @@
 //!
 //! Generic approach that handles ANY constraint type, not just same-target
 //! relational patterns. Checks ALL constraints jointly after each step.
-//! This addresses #3209 where per-constraint PGD finds individual violations
+//! This addresses the case where per-constraint PGD finds individual violations
 //! but never checks if any single input satisfies ALL constraints simultaneously.
 //!
 //! Mirrors the graph path's `try_graph_pgd_upfront` approach for sequential
@@ -105,6 +105,58 @@ impl SimpleRng {
     }
 }
 
+/// Separate xorshift seed for the random-vertex corner slots
+/// (#attack-vertex-geometry), so the vertices never share the uniform/SPSA
+/// stream `SimpleRng::new(42)`.
+const SAMPLING_CORNER_VERTEX_SEED: u64 = 0xC0DE_C0A7_5EED_0001;
+
+/// #attack-vertex-geometry ENGAGEMENT OBSERVABLE for the engine's upfront
+/// sampling+SPSA restarts. Printed exactly once per call, on every exit path
+/// (early hit, deadline, exhaustion), whenever `corner_seed_restarts > 0`, so
+/// an armed run that never reached this lane prints nothing, one that reached
+/// it and missed prints `hit=0`, and a hit says whether a corner restart made it.
+struct SamplingCornerReceipt {
+    requested: usize,
+    seeded: usize,
+    hit_restart: Option<usize>,
+}
+
+impl SamplingCornerReceipt {
+    fn new(requested: usize) -> Self {
+        Self {
+            requested,
+            seeded: 0,
+            hit_restart: None,
+        }
+    }
+
+    fn line(&self) -> Option<String> {
+        (self.requested > 0).then(|| {
+            format!(
+                "[pgd-init] schema=ny-cli/pgd-init/v1 lane=engine_sampling corner_seeds={} \
+                 seeded={} hit={} hit_restart={} hit_by_corner={}",
+                self.requested,
+                self.seeded,
+                u8::from(self.hit_restart.is_some()),
+                self.hit_restart
+                    .map_or_else(|| "none".to_string(), |restart| restart.to_string()),
+                u8::from(
+                    self.hit_restart
+                        .is_some_and(|restart| restart < self.seeded)
+                ),
+            )
+        })
+    }
+}
+
+impl Drop for SamplingCornerReceipt {
+    fn drop(&mut self) {
+        if let Some(line) = self.line() {
+            eprintln!("{line}");
+        }
+    }
+}
+
 /// Check whether the PGD deadline has been exceeded.
 ///
 /// Previously checked only every 50 steps (`step % 50 == 49`), which caused
@@ -114,10 +166,16 @@ impl SimpleRng {
 /// take seconds per step, so coarse deadline polling is insufficient.
 ///
 /// Now checks every step. `Instant::now()` costs ~20ns, negligible vs step cost.
-///
-/// Part of #2206 (Packet D: tighten deadline enforcement).
 pub(super) fn spsa_step_deadline_exceeded(_step: usize, deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|limit| Instant::now() >= limit)
+}
+
+/// #attack-concurrent: a PGD loop's per-step stop test — its deadline
+/// ([`spsa_step_deadline_exceeded`]) OR its cancellation token
+/// ([`PgdConfig::cancelled`]). With `cancel: None` (every caller but the
+/// concurrent attack lane) this is exactly [`spsa_step_deadline_exceeded`].
+pub(super) fn pgd_step_must_stop(step: usize, pgd_config: &PgdConfig) -> bool {
+    spsa_step_deadline_exceeded(step, pgd_config.deadline) || pgd_config.cancelled()
 }
 
 /// Random sampling + SPSA conjunctive attack for sequential networks.
@@ -127,7 +185,7 @@ pub(super) fn spsa_step_deadline_exceeded(_step: usize, deadline: Option<Instant
 /// 2. Uses SPSA to optimize toward satisfying the worst constraint
 /// 3. Checks ALL constraints after each step (early termination)
 ///
-/// This addresses #3209 where the classified PgdAttacker approach:
+/// This addresses gaps in the classified PgdAttacker approach, which:
 /// - Never checks random start points (many violation regions are large)
 /// - Never checks intermediate SPSA steps (only the final point)
 /// - Uses two separate SPSA perturbations per step (higher variance)
@@ -148,7 +206,6 @@ pub(super) fn try_conjunctive_sampling_attack(
 
     let num_restarts = pgd_config.num_restarts;
     let num_steps = pgd_config.num_steps;
-    let deadline = pgd_config.deadline;
     let spsa_delta = pgd_config
         .suggested_spsa_delta(input)
         .max(pgd_config.spsa_delta);
@@ -157,7 +214,7 @@ pub(super) fn try_conjunctive_sampling_attack(
     let hi = input.upper();
     // Materialize bounds to contiguous slices. When lower/upper are non-contiguous
     // (e.g., from reshape/slice/transpose), as_slice() returns None. Previously this
-    // silently fell back to &[], causing PGD to search [0,1]^n. (#3263 F3)
+    // silently fell back to &[], causing PGD to search [0,1]^n.
     let lo_owned: Vec<f32>;
     let lo_slice: &[f32] = match lo.as_slice() {
         Some(s) => s,
@@ -183,19 +240,33 @@ pub(super) fn try_conjunctive_sampling_attack(
     }
 
     let mut rng = SimpleRng::new(42);
+    // #attack-vertex-geometry: the first `corner_seed_restarts` restarts start
+    // at box corners (lower, upper, then random vertices from a SEPARATE
+    // stream). Default 0 draws nothing from `corner_rng`, never takes the
+    // corner branch and prints nothing, so the schedule is byte-identical.
+    let corner_seeds = pgd_config.corner_seed_restarts.min(num_restarts);
+    let mut corner_rng = SimpleRng::new(SAMPLING_CORNER_VERTEX_SEED);
+    let mut corner_receipt = SamplingCornerReceipt::new(pgd_config.corner_seed_restarts);
 
     for restart in 0..num_restarts {
-        if deadline.is_some_and(|d| Instant::now() >= d) {
+        // #attack-concurrent: `past_deadline` is this exact deadline test, OR
+        // the concurrent lane's cancellation token (`None` everywhere else).
+        if pgd_config.past_deadline() {
             tracing::info!("Sampling PGD: deadline exceeded at restart {restart}/{num_restarts}");
             break;
         }
-        let vals: Vec<f32> = (0..n)
-            .map(|i| {
-                let l = lo_slice[i];
-                let h = hi_slice[i];
-                l + rng.next_f32() * (h - l)
-            })
-            .collect();
+        let vals: Vec<f32> = if restart < corner_seeds {
+            corner_receipt.seeded += 1;
+            ny_propagate::corner_seed_point(restart, lo_slice, hi_slice, || corner_rng.next_bool())
+        } else {
+            (0..n)
+                .map(|i| {
+                    let l = lo_slice[i];
+                    let h = hi_slice[i];
+                    l + rng.next_f32() * (h - l)
+                })
+                .collect()
+        };
         let mut x = ArrayD::from_shape_vec(IxDyn(lo.shape()), vals)?;
         let mut step_state = PgdStepState::from_config(
             pgd_config.optimizer,
@@ -214,14 +285,15 @@ pub(super) fn try_conjunctive_sampling_attack(
                     restart
                 );
             }
+            corner_receipt.hit_restart = Some(restart);
             return Ok(Some((x, output)));
         }
 
         for step in 0..num_steps {
-            // Intra-step deadline check every 50 steps (#3781). This mirrors the
+            // Intra-step deadline check every 50 steps. This mirrors the
             // graph PGD guard and prevents one expensive restart from consuming
             // the entire sequential verification budget.
-            if spsa_step_deadline_exceeded(step, deadline) {
+            if pgd_step_must_stop(step, pgd_config) {
                 tracing::info!(
                     "Sampling PGD: deadline exceeded at restart {restart}, step {step}/{num_steps}"
                 );
@@ -280,6 +352,7 @@ pub(super) fn try_conjunctive_sampling_attack(
                         restart, step
                     );
                 }
+                corner_receipt.hit_restart = Some(restart);
                 return Ok(Some((x, output)));
             }
         }
@@ -306,7 +379,7 @@ pub(super) fn has_constant_bound_constraints(constraints: &[OutputConstraint]) -
 
 /// Count how many constant-bound constraints are satisfied by the output.
 fn count_satisfied_const_bounds(output: &ArrayD<f32>, constraints: &[OutputConstraint]) -> usize {
-    // Materialize to contiguous slice (#3263 F3).
+    // Materialize to contiguous slice.
     let out_owned: Vec<f32>;
     let out_flat: &[f32] = match output.as_slice() {
         Some(s) => s,
@@ -366,7 +439,7 @@ pub(super) fn try_constant_bound_attack(
         );
     }
 
-    // Materialize bounds to contiguous slices (#3263 F3).
+    // Materialize bounds to contiguous slices.
     let lo_owned: Vec<f32>;
     let lo_slice: &[f32] = match lower.as_slice() {
         Some(s) => s,
@@ -390,7 +463,7 @@ pub(super) fn try_constant_bound_attack(
     let mut try_point =
         |point: ArrayD<f32>, label: &str| -> Result<Option<(ArrayD<f32>, ArrayD<f32>)>> {
             let output = super::pgd::evaluate_network(network, &point, gemm_engine)?;
-            // Use the unified constraint checker (#3269 F3) which checks ALL
+            // Use the unified constraint checker, which checks ALL
             // constraint types (relational + constant-bound), not just constants.
             if super::check_unsafe_counterexample(&output, constraints) {
                 if !json {

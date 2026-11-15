@@ -54,7 +54,7 @@ pub(super) fn eval_conv1d(layer: &Conv1dLayer, input_flat: &[f32], shape: &[usiz
     out.lower().iter().copied().collect()
 }
 
-/// Regression for #2183: Conv1d batched CROWN bias path must use f64
+/// Regression: Conv1d batched CROWN bias path must use f64
 /// accumulation with directed rounding on the final f32 cast.
 /// Converted from proptest with `_case in 0u8..1` (zero randomization).
 #[ntest::timeout(300000)]
@@ -126,7 +126,7 @@ fn directed_rounding_conv1d_batched_bias_2183() {
     );
 }
 
-/// Regression for #2183: Conv2d batched CROWN bias path must use f64
+/// Regression: Conv2d batched CROWN bias path must use f64
 /// accumulation with directed rounding on the final f32 cast.
 /// Converted from proptest with `_case in 0u8..1` (zero randomization).
 #[ntest::timeout(300000)]

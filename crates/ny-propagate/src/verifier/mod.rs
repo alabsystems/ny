@@ -60,7 +60,7 @@ impl Verifier {
         }
     }
 
-    #[deprecated(note = "renamed to new_with_engine for consistency")]
+    #[deprecated(since = "0.1.0", note = "renamed to new_with_engine for consistency")]
     pub fn with_engine(config: PropagationConfig, engine: Arc<dyn GemmEngine>) -> Self {
         Self::new_with_engine(config, engine)
     }
@@ -71,7 +71,7 @@ impl Verifier {
 
     /// Resolve engine precedence: per-call engine overrides stored engine.
     ///
-    /// Mirrors `BetaCrownVerifier::resolve_engine` for API consistency (#4099).
+    /// Mirrors `BetaCrownVerifier::resolve_engine` for API consistency.
     pub(crate) fn resolve_engine<'a>(
         &'a self,
         engine: Option<&'a dyn GemmEngine>,

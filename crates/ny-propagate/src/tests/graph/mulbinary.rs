@@ -564,7 +564,7 @@ fn test_mulbinary_default_is_mccormick() {
 }
 
 // =========================================================================
-// IBP interval multiplication regression tests (#1816)
+// IBP interval multiplication regression tests
 // =========================================================================
 
 /// Verify IBP multiplication matches BoundedTensor::mul for same-shape inputs.
@@ -682,7 +682,7 @@ fn test_mulbinary_ibp_all_negative() {
 }
 
 /// Infinite bounds must not be clamped away in MulBinary IBP.
-/// Regression for #1816: old implementation clamped infinities to finite values.
+/// Regression: the old implementation clamped infinities to finite values.
 #[ntest::timeout(10000)]
 #[test]
 fn test_mulbinary_ibp_infinite_bounds_match_shared_kernel() {

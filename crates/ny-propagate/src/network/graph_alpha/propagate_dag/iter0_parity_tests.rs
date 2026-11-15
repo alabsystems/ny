@@ -16,7 +16,7 @@
 //! The equality is STRUCTURAL, not coincidental: `init_alpha_from_bounds`
 //! seeds every unstable neuron's α with the identical adaptive rule the
 //! fixed-slope CROWN backward uses (`u > -l ⇒ 1 else 0`,
-//! `relu_crown_relaxation` in `network/relu_relax.rs`), and the default
+//! `relu_linear_relaxation` in `layers/activations/relu/mod.rs`), and the default
 //! `full_conv_alpha=true` keeps α per-neuron, so the iteration-0 relaxation is
 //! the CROWN relaxation. Any divergence means one of the two folds evaluated a
 //! different representation — exactly the 1e23 defect class.
@@ -196,7 +196,7 @@ fn run_iter0_pair(alpha_override: Option<f32>) -> (BoundedTensor, BoundedTensor)
 /// Tolerance: BIT-EXACT (`f32::to_bits` equality), zero epsilon. WHY the code
 /// path warrants it: the α init writes the identical adaptive lower slope the
 /// fixed-slope CROWN backward computes (`u > -l ⇒ 1 else 0` in both
-/// `init_alpha_from_bounds` and `relu_crown_relaxation`), the default
+/// `init_alpha_from_bounds` and `relu_linear_relaxation`), the default
 /// `full_conv_alpha=true` keeps α per-neuron (no channel reduction), and both
 /// folds route linear layers through the shared backward dispatch — so
 /// iteration 0 performs the same arithmetic as the baseline walk, and
@@ -208,7 +208,7 @@ fn run_iter0_pair(alpha_override: Option<f32>) -> (BoundedTensor, BoundedTensor)
 /// that refactor's actual error bound instead of loosening this blindly.
 fn check_iter0_parity(baseline: &BoundedTensor, iter0: &BoundedTensor) -> Result<(), String> {
     // Element-count equality, not shape equality: the loop itself is
-    // layout-agnostic here (#2076, #2087 — `update_elementwise_best_bounds`
+    // layout-agnostic here (`update_elementwise_best_bounds`
     // accepts a shape-only ndim mismatch), and the two folds legitimately
     // disagree on a leading unit axis ([1, 10] vs [10]).
     if baseline.lower().len() != iter0.lower().len() {

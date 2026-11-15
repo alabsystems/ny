@@ -495,7 +495,7 @@ fn test_adaptive_optimization_convergence() {
 
 /// Test that compute_bounds_from_layer produces equivalent results to full computation.
 ///
-/// This tests the intermediate bound transfer optimization (#1513): when a child domain
+/// This tests the intermediate bound transfer optimization: when a child domain
 /// only needs to recompute from a split layer, partial computation should give the same
 /// results as full computation.
 #[ntest::timeout(10000)]
@@ -879,7 +879,7 @@ fn test_compute_bounds_from_layer_partial_parent_falls_back_to_full_recompute() 
     );
 }
 
-/// Regression test for #2595: DomainAlphaState Adam must reset m/v on NaN gradient.
+/// Regression test: DomainAlphaState Adam must reset m/v on NaN gradient.
 #[ntest::timeout(10000)]
 #[test]
 fn test_domain_alpha_state_nan_gradient_resets_adam_state_2595() {
@@ -912,7 +912,7 @@ fn test_domain_alpha_state_nan_gradient_resets_adam_state_2595() {
     assert!(!n.alpha.is_nan(), "alpha should not be NaN");
 }
 
-/// Regression test for #2608: DomainAlphaState SGD+momentum must reset velocity on NaN gradient.
+/// Regression test: DomainAlphaState SGD+momentum must reset velocity on NaN gradient.
 ///
 /// Without the guard, NaN gradient corrupts the velocity field permanently:
 /// - NaN grad → velocity = momentum * v + lr * NaN = NaN

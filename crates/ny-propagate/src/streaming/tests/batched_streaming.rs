@@ -139,7 +139,7 @@ fn test_streaming_batched_crown_linear_only() {
     }
 }
 
-/// #3550 regression: zero CPU dense budget forces batched streaming CROWN to
+/// Regression: zero CPU dense budget forces batched streaming CROWN to
 /// reuse the regular streaming fallback instead of allocating a batched identity.
 #[ntest::timeout(10000)]
 #[test]
@@ -307,7 +307,7 @@ fn test_streaming_batched_crown_unsupported_logsumexp_falls_back_to_regular() {
 /// Parity test: batched vs non-batched streaming CROWN for networks with
 /// element-wise activations. Each is sandwiched between linear layers.
 ///
-/// Part of #1708: verifies that the generic `crown_elementwise_backward_batched`
+/// Verifies that the generic `crown_elementwise_backward_batched`
 /// produces equivalent bounds to the non-batched `crown_elementwise_backward`.
 #[ntest::timeout(10000)]
 #[test]

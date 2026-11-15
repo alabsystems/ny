@@ -115,6 +115,7 @@ impl GraphNetwork {
         node_bounds: &std::collections::HashMap<String, V>,
         output_node_name: &str,
     ) -> Result<BoundedTensor> {
+        self.ensure_proof_eligible()?;
         let output_bounds = node_bounds
             .get(output_node_name)
             .map(std::borrow::Borrow::borrow)
@@ -140,6 +141,7 @@ impl GraphNetwork {
         output_node_name: &str,
         deadline: Option<Instant>,
     ) -> Result<BoundedTensor> {
+        self.ensure_proof_eligible()?;
         let Some(deadline) = deadline else {
             return self.propagate_crown_with_specs_fallback_ibp(
                 input,
@@ -450,13 +452,13 @@ impl GraphNetwork {
         Ok((lower, upper))
     }
 
-    /// Accumulate CrownBounds for a given input node (Phase 1b, #2613).
+    /// Accumulate CrownBounds for a given input node.
     ///
     /// On first insertion, preserves the CrownBounds variant (Patches stays Patches
     /// so the next layer backward can operate on sparse structure). On subsequent
     /// accumulations (merge points), delegates to the checked Crown merge, which preserves
     /// compatible Patches carriers in-place and falls back to Dense+f64 for
-    /// incompatible or mixed carriers (#4382).
+    /// incompatible or mixed carriers.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn accumulate_crown_bounds_to_input_with_deadline(
         &self,
@@ -533,7 +535,7 @@ impl GraphNetwork {
     /// Concretize the current DAG/spec-CROWN frontier and collapse it onto the
     /// network input accumulator.
     ///
-    /// This is the shared truncation primitive for #3813: the backward pass can
+    /// This is the shared truncation primitive: the backward pass can
     /// stop at any frontier as long as each remaining node contribution is
     /// concretized with sound forward bounds before the final input concretization.
     /// Mirrors alpha-beta-CROWN's use of fixed intermediate bounds during BaB.
@@ -622,11 +624,11 @@ impl GraphNetwork {
     }
 
     /// Element-wise addition of two arrays with NaN→conservative-infinity
-    /// fallback (#2951). Generic over array dimension: works for `Array1`,
+    /// fallback. Generic over array dimension: works for `Array1`,
     /// `Array2`, `ArrayD`, etc. Returns a conservative (all ±Inf) array if
-    /// shapes mismatch instead of panicking (#2907).
+    /// shapes mismatch instead of panicking.
     ///
-    /// # Inf coefficient invariant (#3032)
+    /// # Inf coefficient invariant
     ///
     /// When accumulating CROWN backward contributions across DAG merge points,
     /// NaN results (from inf + (-inf) cancellation) are replaced with ±Inf.
@@ -691,7 +693,7 @@ impl GraphNetwork {
     ///
     /// Replaces every NaN element in the sum with the conservative bound
     /// (−Inf for lower, +Inf for upper). This is the source of ±Inf
-    /// coefficients in accumulated `LinearBounds` (see #3032).
+    /// coefficients in accumulated `LinearBounds`.
     fn safe_add_same_shape<D, S>(
         existing: &Array<f32, D>,
         new: &ArrayBase<S, D>,
@@ -702,7 +704,7 @@ impl GraphNetwork {
         S: Data<Elem = f32>,
     {
         // Use map_collect to construct the output directly, avoiding a
-        // clone() + overwrite cycle that doubles allocation (#2220 F13).
+        // clone() + overwrite cycle that doubles allocation.
         Zip::from(existing)
             .and(new)
             .map_collect(|&e, &n| Self::safe_add_elem(e, n, is_lower))
@@ -729,7 +731,7 @@ impl GraphNetwork {
         match BoundedTensor::new_allow_infinite(lower, upper) {
             Ok(sanitized) => sanitized,
             Err(err) => {
-                // #2812 Finding 49: Return conservative infinity bounds, not the
+                // Return conservative infinity bounds, not the
                 // original unsanitized bounds which may contain NaN or inverted pairs.
                 tracing::warn!(
                     "sanitize_bounds_for_fallback: shape mismatch {err}; \
@@ -748,7 +750,7 @@ impl GraphNetwork {
     ///
     /// Checks both IBP bounds AND accumulated linear bounds for Inf/NaN. If either is
     /// non-finite, sanitizes to IBP-only bounds. concretize_sound() guarantees no
-    /// NaN/inversion (#2287).
+    /// NaN/inversion.
     ///
     /// Part of design: crown-batched-partial-fallback-dedup (Slice 1).
     pub(crate) fn partial_crown_fallback(
@@ -789,7 +791,7 @@ impl GraphNetwork {
             .any(|v: &f32| !v.is_finite())
     }
 
-    /// Accumulate `BatchedCrownBounds` for a given input node (Phase 4, #2613).
+    /// Accumulate `BatchedCrownBounds` for a given input node.
     ///
     /// Mirrors [`accumulate_crown_bounds_to_input_with_deadline`] for the batched path.
     /// On first insertion, preserves the variant (Patches stays Patches).
@@ -819,7 +821,7 @@ impl GraphNetwork {
                 node_bounds.insert(input_name.to_string(), new_bounds);
             }
         } else {
-            // Merge point: convert both to Dense, then safe_add (#3550: checked).
+            // Merge point: convert both to Dense, then safe_add (checked).
             let new_blb = new_bounds
                 .into_batched_dense_checked("accumulate_batched_crown_bounds_to_input:new")?;
             let key = if is_network_input {

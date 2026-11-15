@@ -5,10 +5,8 @@
 //! Batched-vs-non-batched equivalence proptest for SubConstant CROWN backward.
 //!
 //! Mirrors the AddConstant batched proptest (`add_constant_batched_matches_non_batched`)
-//! to validate that the batched f64 accumulation + directed rounding path (#2423)
+//! to validate that the batched f64 accumulation + directed rounding path
 //! produces results consistent with the non-batched path.
-//!
-//! Part of #2423.
 
 use crate::layers::arithmetic::SubConstantLayer;
 use crate::layers::common::BoundPropagation;
@@ -25,7 +23,7 @@ proptest! {
 
     /// SubConstant (y = x - c) batched CROWN must match non-batched affine substitution.
     ///
-    /// The batched path uses f64 sum_axis + f64 multiply + directed rounding (#2423).
+    /// The batched path uses f64 sum_axis + f64 multiply + directed rounding.
     /// The non-batched path uses scalar_row_sum_f64 + directed rounding.
     /// Both should produce equivalent results within FP tolerance.
     #[ntest::timeout(10000)]

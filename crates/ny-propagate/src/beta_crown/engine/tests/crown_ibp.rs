@@ -802,7 +802,7 @@ fn test_configured_sequential_flat_bias_policy_reaches_fresh_and_precomputed_exe
 /// #cgan-bn11-budget: the preset-configurable per-node CROWN-IBP time budget
 /// on `BetaCrownConfig` is stamped onto every engine-configured graph clone,
 /// so the collector's budget computation (`crown_tighten.rs`) sees the preset
-/// value. Default config = all-None = the built-in #3499/#4413 constants.
+/// value. Default config = all-None = the built-in constants.
 #[test]
 fn test_configured_graph_carries_crown_ibp_per_node_time_budget() {
     use crate::types::CrownIbpPerNodeTimeBudget;
@@ -828,9 +828,11 @@ fn test_configured_graph_carries_crown_ibp_per_node_time_budget() {
         "default configured graph must retain the one-frontier memory guard"
     );
 
-    // cgan_2023-shaped config: cap 150 s, floor unset, direct IBP endgame.
+    // cgan_2023-shaped config: cap 150 s, floor unset, direct IBP endgame —
+    // plus the #per-node-floor-dim-scale flag, which must ride along.
     let verifier = BetaCrownVerifier::new(BetaCrownConfig {
         crown_ibp_per_node_cap_secs: Some(150.0),
+        crown_ibp_per_node_floor_dim_scaled: true,
         chunk_wave_parallel_enabled: true,
         alpha_config: crate::AlphaCrownConfig {
             forward_linear_deadline_fallback_to_ibp: true,
@@ -844,8 +846,9 @@ fn test_configured_graph_carries_crown_ibp_per_node_time_budget() {
         CrownIbpPerNodeTimeBudget {
             floor_secs: None,
             cap_secs: Some(150.0),
-        prefix_cost_weighted: false,
+            prefix_cost_weighted: false,
             max_target_share_frac: None,
+            floor_dim_scaled: true,
         },
     );
     assert!(configured.forward_linear_deadline_fallback_to_ibp);

@@ -14,7 +14,6 @@ use crate::bounds::{nan_propagating_max, nan_propagating_min};
 ///
 /// Reference: alpha-beta-CROWN `optimized_bounds.py:626-644` detects infeasibility
 /// and sets `lower=+inf, upper=-inf` to signal the BaB engine to prune the domain.
-/// (#2950)
 pub(super) fn has_inverted_output_bounds(bounds: &BoundedTensor) -> bool {
     bounds
         .lower()
@@ -25,7 +24,7 @@ pub(super) fn has_inverted_output_bounds(bounds: &BoundedTensor) -> bool {
 
 /// Extension trait for `BoundedTensor` to get scalar values.
 ///
-/// # NaN/Inf handling (soundness fix for #2561)
+/// # NaN/Inf handling (soundness fix)
 ///
 /// When all bounds are NaN/Inf (e.g., from CROWN numerical instability),
 /// these methods return conservative fallbacks instead of panicking:
@@ -46,7 +45,7 @@ pub(super) trait BoundedTensorExt {
 impl BoundedTensorExt for BoundedTensor {
     fn lower_scalar(&self) -> f32 {
         // Empty tensors produce inverted bounds (INF, -INF) which cause false
-        // verification results. See #2096.
+        // verification results.
         debug_assert!(
             !self.lower().is_empty(),
             "BoundedTensorExt::lower_scalar called on empty tensor — \
@@ -65,7 +64,7 @@ impl BoundedTensorExt for BoundedTensor {
         // If fold returned INFINITY, all values were NaN/+Inf — return conservative
         // fallback instead of panicking. NEG_INFINITY is the most conservative lower
         // bound: it can never cause false verification (NEG_INFINITY > threshold is
-        // always false). See #2561.
+        // always false).
         if result == f32::INFINITY && !self.lower().is_empty() {
             warn!(
                 "BoundedTensorExt::lower_scalar: all {} lower bounds are NaN/+Inf, \
@@ -79,7 +78,7 @@ impl BoundedTensorExt for BoundedTensor {
 
     fn upper_scalar(&self) -> f32 {
         // Empty tensors produce inverted bounds (INF, -INF) which cause false
-        // verification results. See #2096.
+        // verification results.
         debug_assert!(
             !self.upper().is_empty(),
             "BoundedTensorExt::upper_scalar called on empty tensor — \
@@ -88,7 +87,7 @@ impl BoundedTensorExt for BoundedTensor {
         // Skip NaN and -Inf values.
         // NaN: f32::max(x, NaN) returns NaN, silently corrupting decisions.
         // -Inf upper bound causes false verification in verify_upper_bound mode
-        // (ub < threshold is always true when ub = -Inf). See #2438.
+        // (ub < threshold is always true when ub = -Inf).
         // Keep +Inf: it is a valid conservative upper bound and must not be discarded.
         let result = self
             .upper()
@@ -99,7 +98,6 @@ impl BoundedTensorExt for BoundedTensor {
         // If fold returned NEG_INFINITY, all values were NaN/-Inf — return conservative
         // fallback instead of panicking. INFINITY is the most conservative upper bound:
         // it can never cause false verification (INFINITY < threshold is always false).
-        // See #2561.
         if result == f32::NEG_INFINITY && !self.upper().is_empty() {
             warn!(
                 "BoundedTensorExt::upper_scalar: all {} upper bounds are NaN/-Inf, \
@@ -112,7 +110,7 @@ impl BoundedTensorExt for BoundedTensor {
     }
 
     fn argmin_lower_flat_idx(&self) -> Option<usize> {
-        // Empty tensors would return index 0 which is meaningless. See #2096.
+        // Empty tensors would return index 0 which is meaningless.
         debug_assert!(
             !self.lower().is_empty(),
             "BoundedTensorExt::argmin_lower_flat_idx called on empty tensor — \
@@ -177,7 +175,7 @@ mod tests {
         assert_eq!(bt.argmin_lower_flat_idx(), Some(0));
     }
 
-    /// Test #2096: NaN values in bounds must be skipped, not propagated.
+    /// NaN values in bounds must be skipped, not propagated.
     /// Without NaN guards, f32::min(x, NaN) returns NaN, silently corrupting
     /// downstream verification decisions.
     #[test]
@@ -196,7 +194,7 @@ mod tests {
         assert_eq!(bt.argmin_lower_flat_idx(), Some(1));
     }
 
-    /// Regression test for #2096: empty tensors trigger debug_assert.
+    /// Regression test: empty tensors trigger debug_assert.
     /// In debug builds this panics; in release builds it returns conservative
     /// fallbacks (NEG_INFINITY / INFINITY / None).
     #[cfg(debug_assertions)]
@@ -226,7 +224,7 @@ mod tests {
         let _ = bt.argmin_lower_flat_idx();
     }
 
-    /// #2561: All-NaN lower bounds return None from argmin (no valid index).
+    /// All-NaN lower bounds return None from argmin (no valid index).
     #[test]
     fn argmin_lower_returns_none_on_all_nan() {
         let l = ArrayD::from_shape_vec(IxDyn(&[2]), vec![f32::NAN, f32::NAN]).unwrap();
@@ -235,7 +233,7 @@ mod tests {
         assert_eq!(bt.argmin_lower_flat_idx(), None);
     }
 
-    /// #2561: All-NaN lower bounds return NEG_INFINITY (conservative fallback).
+    /// All-NaN lower bounds return NEG_INFINITY (conservative fallback).
     /// NEG_INFINITY can never cause false verification since NEG_INFINITY > threshold
     /// is always false.
     #[test]
@@ -246,7 +244,7 @@ mod tests {
         assert_eq!(bt.lower_scalar(), f32::NEG_INFINITY);
     }
 
-    /// #2561: All-NaN upper bounds return INFINITY (conservative fallback).
+    /// All-NaN upper bounds return INFINITY (conservative fallback).
     /// INFINITY can never cause false verification since INFINITY < threshold
     /// is always false.
     #[test]
@@ -257,7 +255,7 @@ mod tests {
         assert_eq!(bt.upper_scalar(), f32::INFINITY);
     }
 
-    /// #2414: Inf lower bound must be filtered — Inf > threshold is always true,
+    /// Inf lower bound must be filtered — Inf > threshold is always true,
     /// causing false verification.
     #[test]
     fn inf_lower_is_filtered() {
@@ -269,7 +267,7 @@ mod tests {
         assert_eq!(bt.argmin_lower_flat_idx(), Some(1));
     }
 
-    /// #2414: -Inf does not affect max upper bound selection.
+    /// -Inf does not affect max upper bound selection.
     #[test]
     fn neg_inf_upper_does_not_change_max() {
         let l = ArrayD::from_shape_vec(IxDyn(&[3]), vec![-5.0, -1.0, -3.0]).unwrap();
@@ -278,7 +276,7 @@ mod tests {
         assert_eq!(bt.upper_scalar(), 5.0);
     }
 
-    /// #2561: All-Inf lower bounds return NEG_INFINITY (conservative fallback).
+    /// All-Inf lower bounds return NEG_INFINITY (conservative fallback).
     #[test]
     fn all_inf_lower_returns_neg_infinity() {
         let l = ArrayD::from_shape_vec(IxDyn(&[2]), vec![f32::INFINITY, f32::INFINITY]).unwrap();
@@ -296,7 +294,7 @@ mod tests {
         assert_eq!(bt.upper_scalar(), f32::INFINITY);
     }
 
-    /// #2561: All -Inf upper bounds return INFINITY (conservative fallback).
+    /// All -Inf upper bounds return INFINITY (conservative fallback).
     #[test]
     fn all_neg_inf_upper_returns_infinity() {
         let l = ArrayD::from_shape_vec(IxDyn(&[2]), vec![-1.0, -2.0]).unwrap();
@@ -306,7 +304,7 @@ mod tests {
         assert_eq!(bt.upper_scalar(), f32::INFINITY);
     }
 
-    /// #2561: Mixed NaN/-Inf upper bounds return INFINITY (conservative fallback).
+    /// Mixed NaN/-Inf upper bounds return INFINITY (conservative fallback).
     #[test]
     fn all_nan_or_neg_inf_upper_returns_infinity() {
         let l = ArrayD::from_shape_vec(IxDyn(&[3]), vec![-1.0, -2.0, -3.0]).unwrap();
@@ -316,7 +314,7 @@ mod tests {
         assert_eq!(bt.upper_scalar(), f32::INFINITY);
     }
 
-    /// #2438: -Inf upper bounds are filtered from max computation.
+    /// -Inf upper bounds are filtered from max computation.
     #[test]
     fn neg_inf_upper_is_filtered() {
         let l = ArrayD::from_shape_vec(IxDyn(&[3]), vec![-5.0, -1.0, -3.0]).unwrap();
@@ -335,7 +333,7 @@ mod tests {
         assert_eq!(bt.argmin_lower_flat_idx(), Some(0));
     }
 
-    /// #2561: All-Inf lower bounds return None from argmin.
+    /// All-Inf lower bounds return None from argmin.
     #[test]
     fn argmin_lower_returns_none_on_all_inf() {
         let l = ArrayD::from_shape_vec(IxDyn(&[2]), vec![f32::INFINITY, f32::INFINITY]).unwrap();
@@ -344,7 +342,7 @@ mod tests {
         assert_eq!(bt.argmin_lower_flat_idx(), None);
     }
 
-    /// #2561: Mixed NaN/+Inf lower bounds return NEG_INFINITY from lower_scalar.
+    /// Mixed NaN/+Inf lower bounds return NEG_INFINITY from lower_scalar.
     #[test]
     fn mixed_nan_inf_lower_returns_neg_infinity() {
         let l =
@@ -354,7 +352,7 @@ mod tests {
         assert_eq!(bt.lower_scalar(), f32::NEG_INFINITY);
     }
 
-    /// #2561: Mixed NaN/+Inf lower bounds return None from argmin.
+    /// Mixed NaN/+Inf lower bounds return None from argmin.
     #[test]
     fn argmin_lower_returns_none_on_mixed_nan_inf() {
         let l =

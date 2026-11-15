@@ -297,7 +297,7 @@ fn test_v20_arithmetic_expression_supported() {
     assert_eq!(spec.num_inputs, 2);
     assert_eq!(spec.num_outputs, 1);
     assert!((spec.input_bounds[0].1 - 1.0).abs() < 1e-10);
-    assert!(spec.output_constraints.is_empty());
+    assert_eq!((spec.output_constraints).len(), 0);
 }
 
 #[ntest::timeout(10000)]
@@ -313,7 +313,7 @@ fn test_v20_arithmetic_expression_supported_without_version() {
     assert_eq!(spec.num_inputs, 2);
     assert_eq!(spec.num_outputs, 1);
     assert!((spec.input_bounds[0].1 - 1.0).abs() < 1e-10);
-    assert!(spec.output_constraints.is_empty());
+    assert_eq!((spec.output_constraints).len(), 0);
 }
 
 #[ntest::timeout(10000)]

@@ -275,7 +275,7 @@ fn build_soundness_refusal_graph() -> (GraphNetwork, BoundedTensor) {
     (graph, input)
 }
 
-/// After #4113, Sqrt CROWN backward handles negative pre-activation lower bounds
+/// Sqrt CROWN backward handles negative pre-activation lower bounds
 /// by clamping the relaxation domain to [0, u] instead of returning
 /// UnsupportedConfiguration. This produces tighter CROWN-IBP bounds than a
 /// wholesale IBP fallback.
@@ -287,7 +287,7 @@ fn test_graph_crown_ibp_sqrt_unsupported_configuration_falls_back_to_exact_ibp_3
     graph.set_output("sqrt");
 
     // Input includes negative lower bound -- previously caused fallback, now
-    // handled by domain clamping inside the Sqrt relaxation (#4113).
+    // handled by domain clamping inside the Sqrt relaxation.
     let input = BoundedTensor::new(
         arr1(&[-0.25_f32, 0.0, 4.0]).into_dyn(),
         arr1(&[0.25_f32, 1.0, 9.0]).into_dyn(),
@@ -319,11 +319,11 @@ fn test_graph_crown_ibp_sqrt_unsupported_configuration_falls_back_to_exact_ibp_3
     assert_sqrt_soundness_by_sampling(crown_bounds, &[0.0, 0.0, 4.0], &[0.25, 1.0, 9.0]);
 }
 
-/// After #4113, Sqrt CROWN backward no longer falls back on negative
+/// Sqrt CROWN backward no longer falls back on negative
 /// pre-activation lower bounds.  The downstream Linear output node receives
 /// proper CROWN bounds.  The intermediate sqrt node itself gets a
 /// `DemandDrivenSkip` provenance because no downstream nonlinear consumer
-/// demands tightened pre-activation bounds at the sqrt producer (#3775).
+/// demands tightened pre-activation bounds at the sqrt producer.
 #[ntest::timeout(10000)]
 #[test]
 fn test_graph_crown_ibp_downstream_sqrt_unsupported_configuration_falls_back_to_exact_ibp_3840() {

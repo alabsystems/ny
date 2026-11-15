@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Domain guard rejection tests for CROWN backward entry points (#3070).
+//! Domain guard rejection tests for CROWN backward entry points.
 //!
 //! Most activations use `non_finite_domain_guard` and reject any non-finite
 //! (NaN or ±Inf) pre-activation bounds with `NumericalInstability`.
@@ -13,8 +13,6 @@
 //! relaxation. Those two layers are covered by
 //! `test_domain_guard_relu_rejects_nan_accepts_inf` and
 //! `test_domain_guard_leaky_relu_rejects_nan_accepts_inf`.
-//!
-//! Part of #3070, #1696.
 
 use crate::layers::activations::{
     CeluLayer, ClipLayer, EluLayer, HardSigmoidLayer, HardSwishLayer, LeakyReLULayer, MishLayer,

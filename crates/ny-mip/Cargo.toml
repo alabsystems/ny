@@ -27,7 +27,7 @@ ny-levers = { path = "../ny-levers" }
 # ay-milp is the in-process MILP/LP backend, rev-pinned to a commit SHA
 # (never a floating branch); see docs/SOLVER_POLICY.md. Engine-dependent lanes
 # must verify that the revision contains the features their budget model uses.
-ay-milp = { version = "0.20.0", git = "https://github.com/alabsystems/ay.git", rev = "0ef4657b7ebca2855d9d044823a40825c8c300dd" }
+ay-milp = { version = "0.28.0", git = "https://github.com/alabsystems/ay.git", rev = "9dfa20b5790b03c8ffe57fbbe67316ece665c5be" }
 num-bigint.workspace = true
 num-rational = "0.4"
 num-traits = "0.2"
@@ -51,6 +51,7 @@ blas-src.workspace = true
 ny-test-utils = { path = "../ny-test-utils" }
 ntest.workspace = true
 proptest.workspace = true
+tempfile.workspace = true
 
 # No required-features: every mip-diff mode (lib-vs-proc diff, --certify)
 # works in the default build.
@@ -63,3 +64,7 @@ path = "src/bin/mip-diff.rs"
 [[bin]]
 name = "mip-shared-tree-profile"
 path = "src/bin/mip-shared-tree-profile.rs"
+
+[[bin]]
+name = "ny-maxsat"
+path = "src/bin/ny-maxsat.rs"

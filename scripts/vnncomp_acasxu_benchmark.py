@@ -154,7 +154,7 @@ def run_benchmark(method: str, timeout: int, verbose: bool) -> list:
         sys.exit(1)
     if not NY_BIN.exists():
         print(f"Error: ny binary not found: {NY_BIN}")
-        print("Run: cargo build --release -p ny-cli")
+        print("Run: targo --unverified build --release -p ny-cli")
         sys.exit(1)
 
     # Count total verification instances

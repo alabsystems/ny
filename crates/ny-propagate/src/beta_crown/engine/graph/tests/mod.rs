@@ -5,12 +5,17 @@
 //! Tests for graph-specific β-CROWN verifier logic.
 //!
 //! Extracted from inline `#[cfg(test)]` blocks for maintainability.
-//! Part of #1876.
 
 mod clip_complete_selector;
 mod conv_mode;
 mod domain_conversion;
 mod domain_process;
 mod gpu_bab;
+mod kfsb_production;
+mod kfsb_single_shot;
+mod kfsb_single_shot_review;
 mod multi_objective_alpha;
 mod objectives;
+mod warm_cache_rounding_error;
+mod warm_frontier;
+mod warm_start_seed;

@@ -8,8 +8,8 @@
 //! - `batched`: Batched CROWN parity and fallback tests
 //! - `binary_ops`: Add and MatMul backward propagation tests
 //! - `layernorm`: LayerNorm and ConvTranspose2d CROWN tests
-//! - `spec_guided`: Spec-guided CROWN (#593) tests
-//! - `regression_2099`: Regression tests for #2099 (empty-input panics)
+//! - `spec_guided`: Spec-guided CROWN tests
+//! - `regression_2099`: Regression tests for empty-input panics
 
 mod batched;
 mod batched_engine;
@@ -189,7 +189,7 @@ fn test_graph_network_skip_merge_multi_input_errors() {
     );
 }
 
-/// Regression test for #2062: CROWN backward propagation must report fallback
+/// Regression test: CROWN backward propagation must report fallback
 /// provenance when a layer is unsupported (NonZero has data-dependent output shape).
 ///
 /// Without provenance, callers cannot distinguish tight CROWN bounds from
@@ -277,7 +277,7 @@ fn test_graph_crown_backward_reports_crown_provenance_on_success_2062() {
     assert!(!result.is_fallback());
 }
 
-/// Regression test for #2502: forward-bound tightening must apply to non-softmax
+/// Regression test: forward-bound tightening must apply to non-softmax
 /// DAGs as well, keeping final CROWN bounds no wider than forward IBP bounds.
 #[ntest::timeout(10000)]
 #[test]
@@ -447,7 +447,7 @@ fn test_graph_crown_relaxation_deadline_expired_returns_typed_deadline_3398() {
     assert!(matches!(error, NyError::DeadlineExceeded(_)));
 }
 
-/// #3398: the batched deadline wrapper must expose IBP fallback provenance, not raw bounds alone.
+/// The batched deadline wrapper must expose IBP fallback provenance, not raw bounds alone.
 #[ntest::timeout(10000)]
 #[test]
 fn test_graph_crown_batched_deadline_expired_returns_ibp_provenance_3398() {

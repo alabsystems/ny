@@ -65,7 +65,7 @@ fn test_beta_crown_ml4acopf_input_split_falls_back_on_shape_mismatch() {
     );
 }
 
-/// Regression test for #3602: the exact 14_ieee prop9 disjunctive DAG case must
+/// Regression test: the exact 14_ieee prop9 disjunctive DAG case must
 /// not re-surface the historical `expected [1], got [2]` shape mismatch.
 #[ntest::timeout(60000)]
 #[test]

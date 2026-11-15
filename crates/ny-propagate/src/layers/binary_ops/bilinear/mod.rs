@@ -9,6 +9,8 @@ use super::matmul::MatMulLayer;
 use crate::layers::activations::validate::validate_finite;
 
 mod batched;
+#[cfg(test)]
+mod gemm_tests;
 mod linear;
 pub(super) mod mccormick;
 mod nd_compose;
@@ -47,7 +49,7 @@ pub struct BilinearCrownLayer {
     /// Whether to transpose the second input (K^T pattern).
     pub(crate) transpose_b: bool,
     /// Optional scaling factor (e.g., 1/sqrt(d_k) for attention).
-    /// `pub(crate)` to prevent bypassing `try_new` finite validation (#4307).
+    /// `pub(crate)` to prevent bypassing `try_new` finite validation.
     pub(crate) scale: Option<f32>,
 }
 

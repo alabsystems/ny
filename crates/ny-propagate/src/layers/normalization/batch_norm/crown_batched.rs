@@ -41,7 +41,7 @@ impl BatchNormLayer {
     ///
     /// No upper/lower swap for negative scale: CROWN backward composes by
     /// substitution, not IBP. Downstream nonlinear relaxations branch on
-    /// coefficient sign. Reference: designs/2026-01-29-crown-affine-negative-scale.md
+    /// coefficient sign.
     pub fn propagate_linear_batched_with_bounds(
         &self,
         bounds: &BatchedLinearBounds,

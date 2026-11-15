@@ -60,7 +60,7 @@ pub struct MipConfig {
     /// LP tightening and all historical callers leave it at
     /// [`MipFeasibilityIngress::Historical`].
     pub feasibility_ingress: MipFeasibilityIngress,
-    /// Parallel phase-split racing width (designs/scip.md Phase C).
+    /// Parallel phase-split racing width.
     ///
     /// Feasibility checks split the 2^k assignments of the k widest unstable
     /// ReLU indicator binaries into independent subproblems solved

@@ -371,7 +371,7 @@ fn load_pytorch_shards(shard_paths: &[PathBuf]) -> Result<WeightStore> {
         shard_paths.len()
     );
     // Defense-in-depth: validate combined store even though each shard was
-    // individually validated. Catches NaN from future post-merge processing. (#2791)
+    // individually validated. Catches NaN from future post-merge processing.
     combined.validate_no_nan()?;
     Ok(combined)
 }
@@ -414,7 +414,7 @@ fn load_sharded_safetensors(dir: &Path) -> Result<WeightStore> {
 
     info!("Loaded {} tensors from sharded SafeTensors", combined.len());
     // Defense-in-depth: validate combined store even though each shard was
-    // individually validated. Catches NaN from future post-merge processing. (#2791)
+    // individually validated. Catches NaN from future post-merge processing.
     combined.validate_no_nan()?;
     Ok(combined)
 }

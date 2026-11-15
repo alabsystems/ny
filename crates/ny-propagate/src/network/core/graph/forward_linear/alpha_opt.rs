@@ -2582,6 +2582,8 @@ pub(crate) fn optimize_margin_alphas(
     deadline: Option<Instant>,
     retained_request_bytes: usize,
 ) -> Result<Option<(BTreeMap<String, Array1<f32>>, AlphaOptStats)>> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::AlphaOpt);
     let out_dim = spec_matrix.ncols();
     if spec_matrix.nrows() == 0
         || out_dim != output_lb.num_outputs()

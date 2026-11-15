@@ -1,17 +1,10 @@
 # ny-cert: the proof-carrying soundness spec (Trust = Clean fusion)
 
-This crate is NY's **proof-carrying** core: it emits exact-rational Farkas/entailment
-certificates that an independent, tiny-TCB Clean kernel re-checks, and whose Rust
-*checker* is itself **machine-proven by the Trust verifying compiler**. This is the
-one axis on which NY is first-of-kind versus the entire VNN-COMP field (α,β-CROWN
-included): a verdict is a *kernel-checkable proof*, not a float claim — even a future
-float bug surfaces as a **rejected certificate**, never a trusted false `unsat`.
-
-> Honest scope: VNN-COMP scores coverage + speed only and gives zero credit for this.
-> On raw coverage NY does **not** out-cover the SOTA champion α,β-CROWN (official
-> VNN-COMP 2025: α,β-CROWN 1st of 8). This document records the *soundness moat*,
-> which is real, novel, and orthogonal to the competition's scoring. See "VNN-COMP
-> positioning" below.
+ny-cert emits exact-rational Farkas/entailment certificates that Clean's kernel
+re-checks. The Rust checker carries Trust contracts whose soundness link is a
+Clean theorem. A float bug in certificate production therefore surfaces as a
+rejected certificate, never a trusted false `unsat`. VNN-COMP scoring does not
+measure this (see "VNN-COMP positioning").
 
 ## The one soundness obligation (the fixed point)
 
@@ -21,132 +14,124 @@ For premises `gᵢ : S → ℚ`, non-negative multipliers `μᵢ ≥ 0`, output 
 > if each `gᵢ` is a sound `≤ 0` relaxation on valid states **and** `Σ μᵢ·gᵢ = −out − c`,
 > then `∀ s. valid s → out s ≥ −c`.
 
-This is **`farkas_premise_combination`** in the `Crownproof.Bridge` module —
-sorry-free, Lean-proven, and independently re-typechecked by Clean's 3-axiom
-kernel (`KERNEL_IMPORT.md`). ReLU / depth-k / softmax / LayerNorm / β-CROWN are
-instantiations.
+This is **`farkas_premise_combination`** in the `Crownproof.Bridge` module:
+Lean-proven, sorry-free (checked by `cite_check`), and resting only on
+`[propext, Classical.choice, Quot.sound]` (`proofs/lean/AXIOM_AUDIT.txt`).
+ReLU / depth-k / softmax / LayerNorm / β-CROWN are instantiations.
 
 Clean is a pinned Lake dependency, not vendored source. `proofs/lean/lakefile.toml`
-uses private Clean commit `9a9b16e44b9233d0c387839ea205a22fb77ac4bb` with
-`subDir = "crown-proofs/lean"`; the dependency supplies `Crownproof`. NY's 67
-NY-origin modules live in the separate `NyProof` library under
-`proofs/lean/NyProof/`. The dependency contains the shared soundness-method
-proofs (Bridge, Deep, DeepK, Sbar, Gelu, LayerNorm, McCormick, Rsqrt, the
-Hull/ConvHull proofs, the Complete* proofs, cert checkers, and BaB/branch
-proofs), while NY retains only its overlays, generated instances, and audit.
-See `proofs/lean/PROVENANCE.md` for the exact ownership classification.
+uses private Clean commit `e7ae5d418cbac2e1a029369a5b5eda690d471c5c` with
+`subDir = "crown-proofs/lean"`; the dependency supplies `Crownproof`, including
+the shared soundness-method proofs (Bridge, Deep, DeepK, Sbar, Gelu, LayerNorm,
+McCormick, Rsqrt, Hull/ConvHull, Complete*, cert checkers, BaB/branch). NY-origin
+modules live in the separate `NyProof` library under `proofs/lean/NyProof/`.
+`proofs/lean/PROVENANCE.md` classifies every module.
 
 ## Trust-verified status of the Rust checker (the moat, realized)
 
-`targo trust check -p ny-cert` (contract verification uses the external Trust
-toolchain — optional, not included in this repository), verified end-to-end at L0 (panic-freedom + arithmetic-safety + bounded-allocation):
+Contract verification needs the external Trust toolchain. The 2026-06-27 L0
+survey (L0 = panic-freedom + arithmetic safety + bounded allocation) reported:
 
 | Function (`src/selfcheck.rs`) | Status | Clean grounding |
 |---|---|---|
 | `check_farkas`     | **VERIFIED** | `farkas_premise_combination` |
 | `check_entailment` | **VERIFIED** | `farkas_premise_combination` |
-| `check_chain`      | **VERIFIED** | `cert_list_sound` / `farkas_combine_list` |
+| `check_chain`      | **VERIFIED** | `farkas_premise_combination` per step, composed by the cut rule (list form: `cert_list_sound`) |
 
-`check_farkas`/`check_entailment` required a *sound Trust-toolchain improvement* (not a
-spec weakening): the `UnboundedAllocation` gate now recognizes that collecting from an
-already-materialized std collection (`coeffs.keys().cloned().collect()`,
-`a.keys().chain(b.keys())…`) is bounded by the source's own already-gated allocation
-(trust commit `cab286f009`).
-
-Overall `ny-cert` at L0 (live trustc survey, 2026-06-27): **163 / 238 functions
-verified**, 171 / 501 obligations proved; the three checker entry points above each
-verify clean (1 obligation, proved, verdict `Verified`).
+Since the 2026-08-19 toolchain, the strict lane (`targo trust check`) refuses
+the ny-cert unit before compiling it: `ny-contracts` (lib name `trust`, which
+supplies `#[ensures]`/`#[trust::cite]`) is a proc-macro crate, and evidence-grade
+verification enforces a no-proc-macro TCB boundary. Re-run the lane before
+quoting either result as current.
 
 ## L1 functional contracts (the soundness postconditions)
 
-The checker carries its **L1 soundness contracts** as *captured* obligations:
-`#[ensures]` on `check_farkas`/`check_entailment`/`check_chain` (e.g.
-`Ok(c) ⇒ ¬c.is_positive()` — accepting a cert yields a Farkas contradiction). Mechanism
-(verified working via `targo trust survey --contracts`): bare `#[ensures]` +
-`#![cfg_attr(trust_verify, feature(contracts))]` + `core::contracts::ensures` under
-tRustc / NY's `ny-contracts` compatibility macros under stable → a **static
-postcondition VC**.
+The checker carries its L1 soundness contracts as `#[ensures]` postconditions:
 
-The Clean groundings are kernel-checked through the pinned `Crownproof`
-dependency and NY's `NyProof.AxiomAudit` module. The Rust `cite_check` resolver
-must consume that dependency boundary rather than a copied local corpus; until
-that resolver migration is complete, it must fail closed instead of treating a
-missing in-tree mirror as successful citation evidence.
+- `check_farkas`: `Ok(c) ⇒ ¬c.is_positive()` (an accepted cert is a Farkas
+  contradiction).
+- `check_entailment`, `check_chain`: `Ok((derived, claimed)) ⇒ derived ≤ claimed`.
+
+Mechanism: `lib.rs` sets `#![cfg_attr(trust_verify, feature(contracts))]`.
+Under `--cfg trust_verify`, `selfcheck.rs` imports `core::contracts::ensures`,
+the builtin that emits a static postcondition VC. Otherwise it imports the
+no-op `ny-contracts` macro. Each checker also carries
+`#[trust::cite(crownproof::farkas_premise_combination)]`.
+
+`cite_check` resolves every cited theorem against the pinned dependency
+checkout (`proofs/lean/.lake/packages/crownproof/crown-proofs/lean/Crownproof`).
+It validates the lakefile requirement, the `lake-manifest.json` entry, and the
+checkout's `HEAD` against `CLEAN_GIT_REV`, and fails closed when the checkout is
+missing (run `lake update`). It never reads a copied local corpus.
 
 ## Remaining proof work — the cite-discharge (the literal fusion)
 
-**Empirical status (live `--contracts` survey, 2026-06-27, trustc `df0b82fe5`)**: the
-P1.2-A/B front-end lowering (the `matches!`/`is_positive` contract lowering in
-`trust_contract_query.rs` + the `{base}_sign` LIA theory in `spec_parse.rs`) is landed,
-and **the L1 postconditions are now CAPTURED as real VCs**: the survey of
-`check_farkas` / `check_entailment` / `check_chain` shows **3 assertion obligations each**
-(previously the `matches!(.., is_positive())` predicate was *rejected* by the contract
-front-end — not a VC at all). The full verifier reports them `unknown`
-(`unsupported MIR FullVerification::Postcondition`): ay does **not** discharge the modular
-functional proof over the opaque bignum `Rat` type (tracking `combined.constant` through
-`combine()` + the control-flow guard) — the deeper item #2, still open (needs
-full-verifier postcondition-MIR support **and** ay's `Rat` modular reasoning). **This
-captured-but-unknown state is exactly the cite-discharge premise → `CertifiedModuloCite`.**
-(Datatype reasoning is *not* the blocker — ay already has `Sort::Datatype`; the earlier
-"M-SORT cliff" framing is stale.)
+In the 2026-06-27 `--contracts` survey, the L1 postconditions of the three
+checkers were captured as real VCs (3 assertion obligations each). The full
+verifier reported them `unknown` (`unsupported MIR
+FullVerification::Postcondition`): ay does not yet discharge the modular proof
+over the opaque bignum `Rat` (tracking `combined.constant` through `combine()`
+and the control-flow guard). This captured-but-unknown state is the premise of
+`CertifiedModuloCite`.
 
-The discharge path is the **cite-discharge** — exactly the Trust = Clean fusion: since
-ay alone cannot prove the soundness link, ground the postcondition in
-`farkas_premise_combination` (which *does* prove it in Clean, kernel-checked,
-`cite_check`-verified sorry-free). Mechanism: a cite-map → `trust_verify` discharges the
-postcondition *modulo* the cited theorem → honest `Certified-modulo-cited-theorem` tag
-(reusing the `cite_check` resolver). This is a `trust_verify` (rustc-fork) change +
-toolchain rebuild — a focused, soundness-critical effort. A green `--contracts` build of
-`ny-cert` then becomes a kernel-checked theorem that *accepting a certificate implies the
-bound holds*, on an explicit, minimal trust base (ay + the cited Clean theorems).
+The discharge path is the cite-discharge: `trust_verify` discharges the
+postcondition modulo the cited Clean theorem, reusing the `cite_check`
+resolver, and reports `CertifiedModuloCite`. This is a change to `trust_verify`
+(the rustc fork) plus a toolchain rebuild. A green `--contracts` build of
+ny-cert then becomes a kernel-checked theorem that accepting a certificate
+implies the bound holds, on an explicit trust base (ay + the cited Clean
+theorems).
+
+`src/proof_carrying.rs` already composes the same status outside the verifier
+(`compose_from_surveys`, `classify`) from the two survey JSONs and the cite
+check. No code in the workspace calls it.
 
 ## Float adequacy (`R_float ⊑ R_real`): closed by construction for emitted certs
 
-The float-soundness TCB once flagged as the program's open go/no-go is **not in the
-proof-carrying path**. The authoritative ny-cert certificate path is **exact**:
-`f32_to_rat` (`certify_onnx.rs:225`) lifts every f32 weight *losslessly* to an `n/2^k`
-bignum rational (verified: 0 round-trip failures in 100k random f32s), and the entire
-CROWN backward pass / relaxation-slope math then runs in exact `Rat` (`crown.rs`,
-`crown_deep::{preact_bounds_crown, crown_bound_z_exact}`). So **for emitted certificates
-`R_float = R_real` exactly** — there is no float in the cert math, and
-`farkas_premise_combination`'s "every premise ≤ 0 on valid states" holds over ℚ
-unchanged. `R_float ⊑ R_real` is therefore *closed by construction* on this path.
+The certificate path is exact. `f32_to_rat` (`src/bin/certify_onnx.rs`, via
+`Rat::from_f32_exact`) lifts every f32 weight losslessly to an `n/2^k` rational
+(tested by `from_f32_exact_is_lossless_and_fails_closed` in `src/rational.rs`).
+The CROWN backward pass and relaxation slopes then run in exact `Rat`
+(`crown.rs`, `crown_deep::{preact_bounds_crown, crown_bound_z_exact}`). For
+emitted certificates `R_float = R_real` exactly, so `farkas_premise_combination`'s
+"every premise ≤ 0 on valid states" holds over ℚ unchanged.
 
-The residual float TCB is narrow and already-contained: (a) the fast
-`preact_bounds_crown_snapped` f64 path (`crown_deep.rs:551`) is, by its own code
-(`:790-799`), **cut-DISCOVERY-only** and falls back to the exact-rational path for the
-verdict; (b) the broader ny-propagate f32 verifier does *directed outward
-rounding* (`round_to_precision_outward`/`next_up`/`next_down`) but is not
-certificate-emitting. The per-op adequacy lemma set (affine / box / ReLU-chord
-`R_float ⊑ R_real`) is tractable as Clean lemmas composed through the Farkas core
-(`affine_premise_adequacy` prototyped); it would de-TCB the fast/non-cert paths but is
-**not needed for the soundness of emitted certificates**.
+The former f64 `preact_bounds_crown_snapped` fast path has been removed.
+`preact_bounds_crown` is exact by default; its opt-in `interm_round` config
+outward-rounds each layer's bounds to 53-significant-bit dyadics
+(`dyadic_round_out`), which only widens them. The residual float TCB is the
+non-certificate ny-propagate verifier, which uses directed outward rounding
+(`next_up`/`next_down`) and emits no certificate. `NyProof/FloatAdequacy.lean`
+proves the per-op directed-rounding lemmas (`interval_outward_contains`,
+`affine_lower_adequate`/`affine_upper_adequate`, `box_adequate`,
+`relu_chord_upper_adequate`, `float_bound_implies_real`). They de-TCB the
+non-certificate paths and are not needed for emitted-certificate soundness.
 
-**Correction (2026-06-29) — directed rounding is necessary but NOT sufficient for
-transcendental ops.** The `dn/up` model (`FloatAdequacy.lean`) assumes correctly
-outward-rounded operations; it is structurally blind to transcendental *underflow*,
-which is correct IEEE-754 yet can make an algorithm under-approximate. A reachable
-**false proof** was found and fixed in ny-propagate's softmax IBP: a shared row-max
-shift made `exp(score − M)` underflow to exactly `0.0` and a `+SOFTMAX_EPSILON`
-denominator term swamped the survivors, collapsing a *reachable* key's `p_hi` to `~0`
-so the certified interval **excluded a reachable true softmax of `1.0`**. The fix is a
-per-ratio shift (the dominant term becomes `exp(0)=1`, no underflow, no epsilon).
-`SoftmaxFloatRange.lean` makes this a theorem: it models finite-precision `exp` as an
-**under-estimating** operator `FExp` (named float TCB: `nonneg`, `le_exp : f x ≤ exp x`,
-`at_zero : f 0 = 1` — structure fields, not axioms) and proves
-`softmax_phi_upper_sound` (the per-ratio form is a sound over-approximation, general `n`)
-while `softmax_phi_shared_unsound` **constructively refutes** the shared-shift form
-(flush-to-zero `FExp` + a `>745`-gap witness → computed `0 <` true `1`). `lake build`
-clean; `#print axioms` on both `= [propext, Classical.choice, Quot.sound]`. This is the
-first real-IEEE (vs abstract-rounding) adequacy lemma; it de-TCBs the transcendental
-residual the `dn/up` lemmas could not reach.
+**Directed rounding is necessary but not sufficient for transcendental ops.**
+The `dn/up` model assumes correctly outward-rounded operations and cannot see
+transcendental underflow, which is correct IEEE-754 yet can make an algorithm
+under-approximate. ny-propagate's softmax IBP once shifted every `exp` by a
+shared row max: `exp(score − M)` underflowed to `0.0`, a `+SOFTMAX_EPSILON`
+denominator term swamped the survivors, and a reachable key's `p_hi` collapsed
+to `~0`, so the certified interval excluded a reachable true softmax of `1.0`
+(a false proof). The fix shifts each ratio by its own dominant term
+(`exp(0) = 1`, no underflow, no epsilon); see
+`crates/ny-propagate/src/layers/softmax/ibp/mod.rs`.
+
+`NyProof/SoftmaxFloatRange.lean` makes this a theorem. It models
+finite-precision `exp` as an under-estimating operator `FExp` whose structure
+fields (`nonneg`, `le_exp : f x ≤ exp x`, `at_zero : f 0 = 1`) name the float
+TCB as hypotheses, not axioms. `softmax_phi_upper_sound` proves the per-ratio
+form a sound over-approximation (general `n`); `softmax_phi_shared_unsound`
+constructively refutes the shared-shift form (flush-to-zero `FExp` + a
+`>745`-gap witness → computed `0 <` true `1`). The module prints axioms for
+both; the expected result is `[propext, Classical.choice, Quot.sound]`.
 
 ## TCB manifest (the named trust base — machine-tracked)
 
-The adequacy binding and the rest of the trust base are integrated as a structured,
-machine-readable manifest — **`proofs/tcb.json`** — not prose alone: each emitted
-certificate's named assumptions, their status, the residual TCB they imply, and the
-discharge path that would retire each. Rows:
+The trust base is recorded in the machine-readable manifest
+**`proofs/tcb.json`**: each row's assumption, status, residual TCB, and the
+discharge path that would retire it. This table mirrors it:
 
 | Row | Status | Retired by |
 |---|---|---|
@@ -154,21 +139,15 @@ discharge path that would retire each. Rows:
 | `clean_kernel` (cited theorems valid) | kernel-checked | irreducible (the 3-axiom trust root) |
 | `ay_discharge` (L1 captured) | modulo-cite | teach ay modular `Rat` reasoning → `CertifiedToAxioms` |
 
-Next (build-gated): wire cert emission to attest the manifest **by default**
-(batteries-included — on, not opt-in) and add a `tcb_check` drift-guard mirroring
-`cite_check`.
+`tcb_check`'s tests fail when this table and `tcb.json` disagree on row ids or
+statuses, or when a `.lean` file named in a row's `discharge_path` is missing
+from `proofs/lean/NyProof/` or from that row's "Retired by" cell. Certificate
+emission does not yet attest the manifest.
 
-## VNN-COMP positioning (honest, measured)
+## VNN-COMP positioning
 
-NY was not an official VNN-COMP 2025 or 2026 entrant, so it has no official
-score, rank, or defensible “would place mid-field” result. The repository's
-latest reproducible aggregate is instead a stale, local counterfactual ledger
-measured at a pinned commit; later bank changes have not been re-aggregated and
-most inherited SAT rows lack organizer-replayable witness bundles. Coverage
-research remains useful, but it must not be presented as an official or current
-competition placement. See
-the internal current-state note (`docs/CURRENT_STATE_2026-08-10.md`, not part of the public snapshot)
-for the canonical values, provenance limits, and current evidence boundary.
-
-The proof-carrying machinery above remains a separate technical contribution;
-VNN-COMP scoring does not certify that axis.
+NY has not been an official VNN-COMP entrant, so it has no official score or
+rank. Its local, reproducible measurements and their limits are described in
+[`reports/measured/README.md`](../../reports/measured/README.md). The
+proof-carrying machinery above is a separate contribution; VNN-COMP scoring
+does not measure it.

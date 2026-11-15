@@ -31,7 +31,7 @@ fn test_encoder_layer_graph_extraction() {
     }
 
     // Verify the graph has a stable node count after filtering shape-computing ops.
-    // Node count increased from 25-27 to 27-29 after #697 fix: data-carrying Concat
+    // Node count increased from 25-27 to 27-29 after a fix: data-carrying Concat
     // nodes with evaluated_constants are now correctly retained in the graph instead
     // of being skipped by the shape-computing Concat filter.
     let node_count = graph.num_nodes();
@@ -130,7 +130,7 @@ fn test_encoder_layer_graph_ibp() {
     );
     let node_count = graph.num_nodes();
     let inter_node = node_count - input_dependent;
-    // Range widened from 20..=25 to 22..=27 after #697: data-carrying Concat
+    // Range widened from 20..=25 to 22..=27: data-carrying Concat
     // nodes are now retained, increasing total node count by ~2.
     assert!(
         (22..=27).contains(&inter_node),

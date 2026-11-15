@@ -282,7 +282,7 @@ fn core_operator_lookalikes_in_ai_onnx_ml_require_explicit_registration() {
 /// side by side.
 ///
 /// This pins the conversion-level half of that refusal. The load-path half is
-/// pinned end to end in `tests/core/native_ops.rs`.
+/// pinned end to end in `src/tests/core/native_ops.rs`.
 #[test]
 fn legacy_simplified_layer_normalization_is_refused_at_conversion() {
     let mut node = normalization_node("SimplifiedLayerNormalization");
@@ -508,7 +508,11 @@ fn unauthenticated_semantic_rewrites_remain_dark() {
     const { assert!(!DECOMPOSED_ERF_GELU_SOURCE_AUTHENTICATED) };
     const { assert!(!DECOMPOSED_TANH_GELU_SOURCE_AUTHENTICATED) };
     const { assert!(!DECOMPOSED_INSTANCE_NORM_SOURCE_AUTHENTICATED) };
-    const { assert!(!QDQ_PERTURBATION_SOURCE_AUTHENTICATED) };
+    // QDQ activation-relaxation fusion is deliberately NOT in this list any
+    // more: it is governed by the dark `OnnxLoadConfig` gate (typed preset key
+    // `model.qdq_activation_relaxation`, default OFF — pinned by
+    // `qdq_fusion_stays_dark_by_default` below), backed by the certified
+    // envelope in `QdqPerturbationLayer::try_certified`.
     // BatchNorm folding is deliberately NOT in this list: it is governed by
     // `BatchNormFoldingPolicy` (default LegacyEnvironment = folds enabled), and
     // the hard const that used to pin it dark silently cost 15 field-confirmed
@@ -814,7 +818,7 @@ fn custom_domain_missing_opset_reports_unknown() {
     }
 }
 
-/// Slice maps to data-path, unknown ops error, skip ops return None. (#2931)
+/// Slice maps to data-path, unknown ops error, skip ops return None.
 #[test]
 fn op_map_categories_2931() {
     let reg = CustomOpRegistry::default();
@@ -872,6 +876,7 @@ fn tile_repeats_input_normalizes_to_single_unbatched_axis() {
         &std::collections::HashSet::new(),
         false,
         BatchNormFoldingPolicy::LegacyEnvironment,
+        false,
     )
     .expect("Tile with a single non-unit repeat axis should normalize");
 
@@ -904,6 +909,7 @@ fn conv_with_rank3_kernel_normalizes_to_conv1d_3500() {
         &std::collections::HashSet::new(),
         false,
         BatchNormFoldingPolicy::LegacyEnvironment,
+        false,
     )
     .expect("Conv with a rank-3 kernel should normalize");
 
@@ -934,6 +940,7 @@ fn conv_transpose_with_rank3_kernel_normalizes_to_conv_transpose1d_3500() {
         &std::collections::HashSet::new(),
         false,
         BatchNormFoldingPolicy::LegacyEnvironment,
+        false,
     )
     .expect("ConvTranspose with a rank-3 kernel should normalize");
 
@@ -1060,6 +1067,7 @@ fn graph_conversion_cannot_bypass_int_cast_rejection_with_a_materialized_output(
         &std::collections::HashSet::new(),
         false,
         BatchNormFoldingPolicy::LegacyEnvironment,
+        false,
     )
     .expect_err("generic graph conversion must reject INT64 Cast regardless of staged weights");
     assert!(matches!(error, NyError::UnsupportedOp(_)), "{error}");
@@ -1082,6 +1090,7 @@ fn graph_conversion_rejects_cast_with_empty_required_input_before_custom_overrid
         &std::collections::HashSet::new(),
         false,
         BatchNormFoldingPolicy::LegacyEnvironment,
+        false,
     )
     .expect_err("Cast with an empty required input must fail before a custom override");
     assert!(matches!(error, NyError::UnsupportedOp(_)), "{error}");
@@ -1204,6 +1213,7 @@ fn exactly_materialized_int64_casts_are_skipped_only_on_static_reshape_shape_con
         &static_int64_raw_values(),
         false,
         BatchNormFoldingPolicy::LegacyEnvironment,
+        false,
     )
     .expect("the exact constant Cast cone should reach only Reshape's shape port");
 
@@ -1229,6 +1239,7 @@ fn materialized_int64_cast_rejects_graph_output_and_unproven_constant_folds() {
         &static_int64_raw_values(),
         false,
         BatchNormFoldingPolicy::LegacyEnvironment,
+        false,
     )
     .expect_err("an authored INT64 graph output must remain unsupported");
     assert!(error.to_string().contains("targets dtype 7"), "{error}");
@@ -1271,6 +1282,7 @@ fn materialized_int64_cast_rejects_graph_output_and_unproven_constant_folds() {
         &std::collections::HashSet::new(),
         false,
         BatchNormFoldingPolicy::LegacyEnvironment,
+        false,
     )
     .expect_err("an unproven materialized INT64 Cast must fail closed");
     assert!(error.to_string().contains("targets dtype 7"), "{error}");
@@ -1317,6 +1329,7 @@ fn runtime_int64_cast_lowers_to_trunc_in_graph_conversion() {
         &std::collections::HashSet::new(),
         false,
         BatchNormFoldingPolicy::LegacyEnvironment,
+        false,
     )
     .expect("a runtime INT64 Cast must convert, not fail closed");
     assert_eq!(
@@ -1365,6 +1378,7 @@ fn int64_cast_skip_requires_integer_provenance_and_exact_f32_mirror() {
             &static_int64_raw_values(),
             false,
             BatchNormFoldingPolicy::LegacyEnvironment,
+            false,
         )
         .expect_err("an unproven materialized INT64 Cast must reach the fail-closed handler");
         assert!(error.to_string().contains("targets dtype 7"), "{error}");

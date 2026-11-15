@@ -264,7 +264,7 @@ fn test_bound_tightener_trait() {
     assert!(result[0].lower() >= 1.99, "got {}", result[0].lower());
 }
 
-/// Regression test for #3340: f64→f32 directed rounding in LP tighten.
+/// Regression test: f64→f32 directed rounding in LP tighten.
 ///
 /// Uses a NEGATIVE midpoint so the lower bound stays < 0, avoiding the
 /// early-exit at tighten_neuron:177 (`if new_lb >= 0.0`). This ensures

@@ -47,7 +47,7 @@ acasxu_2023,onnx/ACASXU_run2a_1_1_batch_2000.onnx,vnnlib/prop_2.vnnlib,prepared,
 acasxu_2023,onnx/ACASXU_run2a_1_2_batch_2000.onnx,vnnlib/prop_2.vnnlib,prepared,sat,7.9,l1audit-20260804-d1282d23
 acasxu_2023,onnx/ACASXU_run2a_1_3_batch_2000.onnx,vnnlib/prop_2.vnnlib,prepared,sat,4.55,l1audit-20260804-d1282d23
 acasxu_2023,onnx/ACASXU_run2a_1_4_batch_2000.onnx,vnnlib/prop_2.vnnlib,prepared,sat,31.85,l1audit-20260804-d1282d23
-acasxu_2023,onnx/ACASXU_run2a_1_5_batch_2000.onnx,vnnlib/prop_2.vnnlib,prepared,timeout,113.65,l1audit-20260804-d1282d23
+acasxu_2023,onnx/ACASXU_run2a_1_5_batch_2000.onnx,vnnlib/prop_2.vnnlib,prepared,sat,113.9,next3-114ff7e23-20260929
 acasxu_2023,onnx/ACASXU_run2a_1_6_batch_2000.onnx,vnnlib/prop_2.vnnlib,prepared,sat,111.5,l1audit-20260804-d1282d23
 acasxu_2023,onnx/ACASXU_run2a_1_7_batch_2000.onnx,vnnlib/prop_2.vnnlib,prepared,unsat,45.81,l1audit-20260804-d1282d23
 acasxu_2023,onnx/ACASXU_run2a_1_8_batch_2000.onnx,vnnlib/prop_2.vnnlib,prepared,unsat,46.67,l1audit-20260804-d1282d23
@@ -71,7 +71,7 @@ acasxu_2023,onnx/ACASXU_run2a_3_7_batch_2000.onnx,vnnlib/prop_2.vnnlib,prepared,
 acasxu_2023,onnx/ACASXU_run2a_3_8_batch_2000.onnx,vnnlib/prop_2.vnnlib,prepared,sat,0.65,l1audit-20260804-d1282d23
 acasxu_2023,onnx/ACASXU_run2a_3_9_batch_2000.onnx,vnnlib/prop_2.vnnlib,prepared,sat,0.24,l1audit-20260804-d1282d23
 acasxu_2023,onnx/ACASXU_run2a_4_1_batch_2000.onnx,vnnlib/prop_2.vnnlib,prepared,sat,1.45,l1audit-20260804-d1282d23
-acasxu_2023,onnx/ACASXU_run2a_4_2_batch_2000.onnx,vnnlib/prop_2.vnnlib,prepared,unknown,110.53
+acasxu_2023,onnx/ACASXU_run2a_4_2_batch_2000.onnx,vnnlib/prop_2.vnnlib,prepared,unsat,71.7,next3-114ff7e23-20260929
 acasxu_2023,onnx/ACASXU_run2a_4_3_batch_2000.onnx,vnnlib/prop_2.vnnlib,prepared,sat,0.66,l1audit-20260804-d1282d23
 acasxu_2023,onnx/ACASXU_run2a_4_4_batch_2000.onnx,vnnlib/prop_2.vnnlib,prepared,sat,1.24,l1audit-20260804-d1282d23
 acasxu_2023,onnx/ACASXU_run2a_4_5_batch_2000.onnx,vnnlib/prop_2.vnnlib,prepared,sat,0.34,l1audit-20260804-d1282d23
@@ -178,10 +178,9 @@ acasxu_2023,onnx/ACASXU_run2a_5_6_batch_2000.onnx,vnnlib/prop_4.vnnlib,prepared,
 acasxu_2023,onnx/ACASXU_run2a_5_7_batch_2000.onnx,vnnlib/prop_4.vnnlib,prepared,unsat,44.57,l1audit-20260804-d1282d23
 acasxu_2023,onnx/ACASXU_run2a_5_8_batch_2000.onnx,vnnlib/prop_4.vnnlib,prepared,unsat,44.6,l1audit-20260804-d1282d23
 acasxu_2023,onnx/ACASXU_run2a_5_9_batch_2000.onnx,vnnlib/prop_4.vnnlib,prepared,unsat,44.61,l1audit-20260804-d1282d23
-acasxu_2023,onnx/ACASXU_run2a_1_1_batch_2000.onnx,vnnlib/prop_5.vnnlib,prepared,unsat,106.66,l1audit-20260804-d1282d23
+acasxu_2023,onnx/ACASXU_run2a_1_1_batch_2000.onnx,vnnlib/prop_5.vnnlib,prepared,unsat,59.1,next3-114ff7e23-20260929
 acasxu_2023,onnx/ACASXU_run2a_1_1_batch_2000.onnx,vnnlib/prop_6.vnnlib,prepared,unsat,28.53,l1audit-20260804-d1282d23
 acasxu_2023,onnx/ACASXU_run2a_1_9_batch_2000.onnx,vnnlib/prop_7.vnnlib,prepared,sat,106.93,l1audit-20260804-d1282d23
 acasxu_2023,onnx/ACASXU_run2a_2_9_batch_2000.onnx,vnnlib/prop_8.vnnlib,prepared,sat,0.93,l1audit-20260804-d1282d23
 acasxu_2023,onnx/ACASXU_run2a_3_3_batch_2000.onnx,vnnlib/prop_9.vnnlib,prepared,unsat,63.7,l1audit-20260804-d1282d23
-acasxu_2023,onnx/ACASXU_run2a_4_5_batch_2000.onnx,vnnlib/prop_10.vnnlib,prepared,unsat,79.37,l1audit-20260804-d1282d23
-acasxu_2023,onnx/test_nano.onnx,vnnlib/test_nano.vnnlib,0,unsat,0
+acasxu_2023,onnx/ACASXU_run2a_4_5_batch_2000.onnx,vnnlib/prop_10.vnnlib,prepared,unsat,57.9,next3-114ff7e23-20260929

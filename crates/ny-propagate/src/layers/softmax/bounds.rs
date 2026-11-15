@@ -4,7 +4,7 @@
 
 use ndarray::{Array2, ArrayD, IxDyn};
 use ny_core::{NyError, Result};
-use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
+use ny_tensor::BoundedTensor;
 
 use crate::{BatchedLinearBounds, LinearBounds};
 
@@ -53,35 +53,55 @@ pub(super) fn batched_constant_bounds_from_output(
     bounds: &BatchedLinearBounds,
     output_bounds: &BoundedTensor,
 ) -> Result<BatchedLinearBounds> {
-    let expected_shape = bounds.output_shape.clone();
-    let got_shape = output_bounds.shape().to_vec();
-    if expected_shape != got_shape {
-        return Err(NyError::ShapeMismatch {
-            expected: expected_shape,
-            got: got_shape,
+    let bytes = bounds
+        .lower_a()
+        .len()
+        .checked_mul(8)
+        .and_then(|n| {
+            bounds
+                .lower_b()
+                .len()
+                .checked_mul(8)
+                .and_then(|b| n.checked_add(b))
+        })
+        .ok_or_else(|| NyError::UnsupportedOp("causal constant carrier memory overflow".into()))?;
+    let cap = crate::network::crown_memory::cpu_crown_dense_budget_bytes();
+    if bytes > cap {
+        return Err(NyError::CpuMemoryExceeded {
+            required_bytes: bytes,
+            budget_bytes: cap,
+            site: "causal softmax constant carrier",
         });
     }
-
+    // The probability box is the INPUT of the requested CROWN carrier.
+    // Compose both signed A planes, original biases and coefficient errors
+    // before replacing the result by a constant. Copying raw probabilities
+    // is valid only for an identity carrier, not an arbitrary objective.
+    let deadline = ny_core::instance_budget::deadline();
+    let concretized = bounds.concretize_sound_with_deadline(output_bounds, deadline)?;
+    let (lower_b, upper_b) = concretized.into_parts();
+    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        return Err(NyError::DeadlineExceeded(
+            "causal softmax constant carrier".into(),
+        ));
+    }
     let a_shape = bounds.lower_a().shape().to_vec();
     let lower_a = ArrayD::zeros(IxDyn(&a_shape));
     let upper_a = ArrayD::zeros(IxDyn(&a_shape));
-
-    // Apply directed rounding to bias terms for soundness (#2787).
-    // The non-batched path uses concretize_sound which applies next_down/next_up.
-    // Without this, rounding errors in IBP output bounds propagate unsoundly
-    // through CROWN backward.
-    let lower_b = output_bounds.lower().mapv(next_down_f32);
-    let upper_b = output_bounds.upper().mapv(next_up_f32);
-
-    // Phase 4 audit: IBP fallback — A=0 (trivially valid), biases from BoundedTensor.
-    BatchedLinearBounds::new_or_conservative(
+    let result = BatchedLinearBounds::new_or_conservative(
         lower_a,
         lower_b,
         upper_a,
         upper_b,
         bounds.input_shape.clone(),
         bounds.output_shape.clone(),
-    )
+    )?;
+    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        return Err(NyError::DeadlineExceeded(
+            "causal softmax constant carrier".into(),
+        ));
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -195,7 +215,7 @@ mod tests {
         assert_eq!(result.lower_b.len(), n);
     }
 
-    /// Regression test for #2281: concretize_sound can produce inverted bounds
+    /// Regression test: concretize_sound can produce inverted bounds
     /// (lower > upper) when asymmetric coefficients combine with directed rounding.
     /// The inversion guard should fall back to [-inf, +inf] for those elements.
     #[test]
@@ -270,15 +290,7 @@ mod tests {
     #[test]
     fn batched_constant_bounds_bias_matches_output() {
         let shape = vec![2, 3];
-        let a_shape = vec![2, 3, 3];
-        let bounds = BatchedLinearBounds::from_parts_unchecked(
-            ArrayD::zeros(IxDyn(&a_shape)),
-            ArrayD::zeros(IxDyn(&shape)),
-            ArrayD::zeros(IxDyn(&a_shape)),
-            ArrayD::zeros(IxDyn(&shape)),
-            shape.clone(),
-            shape.clone(),
-        );
+        let bounds = BatchedLinearBounds::identity(&shape).unwrap();
 
         let lower_vals = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
         let upper_vals = vec![0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
@@ -376,22 +388,14 @@ mod tests {
         assert_eq!(result.output_shape, shape);
     }
 
-    /// Regression test for #2787: batched path must apply directed rounding
+    /// Regression test: batched path must apply directed rounding
     /// to lower_b/upper_b, matching the non-batched concretize_sound behavior.
     #[test]
     fn batched_constant_bounds_applies_directed_rounding_2787() {
         use ny_tensor::{next_down_f32, next_up_f32};
 
         let shape = vec![3];
-        let a_shape = vec![3, 3];
-        let bounds = BatchedLinearBounds::from_parts_unchecked(
-            ArrayD::zeros(IxDyn(&a_shape)),
-            ArrayD::zeros(IxDyn(&shape)),
-            ArrayD::zeros(IxDyn(&a_shape)),
-            ArrayD::zeros(IxDyn(&shape)),
-            shape.clone(),
-            shape.clone(),
-        );
+        let bounds = BatchedLinearBounds::identity(&shape).unwrap();
 
         let lower_vals = vec![0.25, 0.5, 1.0];
         let upper_vals = vec![0.75, 1.5, 2.0];
@@ -407,9 +411,9 @@ mod tests {
         // lower_b must be next_down of original lower (strictly less for finite nonzero)
         for (i, (&lb, &orig)) in result.lower_b.iter().zip(lower_vals.iter()).enumerate() {
             let expected = next_down_f32(orig);
-            assert_eq!(
-                lb, expected,
-                "lower_b[{i}] = {lb} should be next_down_f32({orig}) = {expected}"
+            assert!(
+                lb <= expected && lb >= next_down_f32(expected),
+                "lower_b[{i}]={lb}"
             );
             assert!(lb < orig, "lower_b must be strictly less than original");
         }
@@ -417,9 +421,9 @@ mod tests {
         // upper_b must be next_up of original upper (strictly greater for finite nonzero)
         for (i, (&ub, &orig)) in result.upper_b.iter().zip(upper_vals.iter()).enumerate() {
             let expected = next_up_f32(orig);
-            assert_eq!(
-                ub, expected,
-                "upper_b[{i}] = {ub} should be next_up_f32({orig}) = {expected}"
+            assert!(
+                ub >= expected && ub <= next_up_f32(expected),
+                "upper_b[{i}]={ub}"
             );
             assert!(ub > orig, "upper_b must be strictly greater than original");
         }

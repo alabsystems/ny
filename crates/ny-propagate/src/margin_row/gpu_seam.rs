@@ -688,9 +688,15 @@ pub(crate) fn build_plan_ext(
         return Err(Refusal::Unmappable("head gemm shape"));
     }
     let mut rho_star = 0.0f64;
-    // The head Gemm's weights are EXACT in the lane's own algebra (the gemm1
-    // arm charges no weight_rel_err), so only the f32 downcast is charged.
-    let head_err = weight_error(0.0, b1, &[])?;
+    // The head Gemm's weights are exact in the lane's own algebra UNLESS the
+    // extractor folded a BatchNormalization into them
+    // (#cct-margin-row-admission). Hand the fold's certified error to the
+    // same `weight_error` composition the Conv layers use, so the device
+    // charges fold + f32 downcast together; an unfolded head passes
+    // `(0.0, all-zero)`, which is the historical `(0.0, &[])` charge
+    // (`err_bias` starts at 0 and takes the max over the entries).
+    let (b1_err, w1_rel) = net.gemm1_fold_err();
+    let head_err = weight_error(w1_rel, b1, b1_err)?;
     rho_star = rho_star.max(f64::from(head_err.weight_rel_err));
     let head = GpuCrownLayer::Linear {
         weight: Arc::from(to_f32_params_rel(w1, U32_UNIT)?),

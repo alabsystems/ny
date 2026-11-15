@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! GenBaB integration tests for BilinearCrown BaB splitting (#286 Phase 5).
+//! GenBaB integration tests for BilinearCrown BaB splitting.
 //!
 //! Split from `genbab.rs` for the 500-line limit.
 
@@ -66,11 +66,10 @@ fn total_bound_width(bounds: &BoundedTensor) -> f32 {
         .sum()
 }
 
-/// BaB verification works end-to-end on a graph containing BilinearCrown
-/// (#286 Phase 5). GenBaB splits GELU and BilinearCrown inputs to tighten
+/// BaB verification works end-to-end on a graph containing BilinearCrown.
+/// GenBaB splits GELU and BilinearCrown inputs to tighten
 /// McCormick relaxation and verify sum(QK^T) ≥ -0.5 (true min is 0).
 ///
-/// Source: designs/2026-03-04-286-attention-bilinear-alternative.md (Approach C)
 /// Reference: auto_LiRPA BoundMatMul.splittable (linear.py:948)
 #[ntest::timeout(60000)]
 #[test]
@@ -124,7 +123,7 @@ fn test_bilinear_crown_bab_splitting_integration() {
     );
 }
 
-/// McCormick CROWN is at least as tight as IBP for BilinearCrown (#286).
+/// McCormick CROWN is at least as tight as IBP for BilinearCrown.
 #[ntest::timeout(10000)]
 #[test]
 fn test_bilinear_crown_vs_ibp_measurement() {

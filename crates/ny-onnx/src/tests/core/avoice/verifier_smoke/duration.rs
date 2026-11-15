@@ -73,8 +73,6 @@ fn assert_duration_verifier_result(
 /// Verify the surrogate duration predictor expected-duration property through
 /// `Verifier::verify_graph(...)`. Expected durations from 50 Bernoulli sigmoid
 /// bins are always in [0, 50].
-///
-/// Part of #3654.
 #[cfg_attr(not(debug_assertions), ntest::timeout(120000))]
 #[test]
 fn test_avoice_duration_predictor_expected_duration_verifier_smoke_3654() {

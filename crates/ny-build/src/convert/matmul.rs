@@ -31,6 +31,19 @@ impl ConvertContext<'_> {
         let a_is_weight = self.weights.get(input_a).is_some();
         let b_is_weight = self.weights.get(input_b).is_some();
 
+        if matches!(
+            self.linear_storage,
+            crate::LinearStoragePolicy::OriginalPoint(_)
+        ) && (a_is_weight
+            || b_is_weight
+            || self.weights.get_interval(input_a).is_some()
+            || self.weights.get_interval(input_b).is_some())
+        {
+            return Err(NyError::UnsupportedConfiguration(
+                "original point storage: static/interval MatMul affine conversion needs a separately priced adapter; dynamic activation MatMul remains supported".into(),
+            ));
+        }
+
         let transpose_b = match spec.attributes.get("transpose_b") {
             Some(AttributeValue::Int(v)) => *v != 0,
             Some(AttributeValue::Float(v)) => *v != 0.0,
@@ -270,7 +283,7 @@ impl ConvertContext<'_> {
         } else if !a_is_weight && !b_is_weight {
             // Neither input is a weight - true bounded MatMul (e.g., Q @ K^T or probs @ V).
             // Use BilinearCrownLayer for all bilinear MatMuls regardless of transpose_b.
-            // BilinearCrown uses CompactMcCormick for seq > 64 (#286), avoiding the
+            // BilinearCrown uses CompactMcCormick for seq > 64, avoiding the
             // O(seq^4) dense identity that blocks the MatMul retry path in crown_batched.rs.
             // CompactMcCormick supports both transpose_b configurations (verified by proptests).
             debug!(
@@ -657,7 +670,7 @@ mod tests {
         ));
     }
 
-    /// Regression test for #2666: MatMul with extra inputs must be rejected.
+    /// Regression test: MatMul with extra inputs must be rejected.
     #[test]
     fn convert_matmul_rejects_extra_inputs_2666() {
         let weights = WeightStore::new();

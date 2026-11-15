@@ -155,7 +155,7 @@ fn confirm_pgd_candidate(
         return Ok(None);
     }
 
-    // Part of #4419: independent re-validation via CPU-only forward pass.
+    // Independent re-validation via CPU-only forward pass.
     // The PGD evaluator used the same engine for optimization and output
     // computation. Re-evaluate with engine=None to confirm independently.
     let revalidated = evaluate_network(network, &counterexample, None)?;
@@ -284,6 +284,8 @@ pub(super) fn try_conjunctive_pgd_attack_with_config(
     gemm_engine: Option<&dyn GemmEngine>,
     json: bool,
 ) -> Result<Option<BetaCrownResult>> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Attack);
     let attack_kind = classify_conjunctive_attack(&vnnlib.output_constraints);
 
     if let Some(kind) = attack_kind {
@@ -369,6 +371,8 @@ pub(super) fn try_conjunctive_pgd_attack_upfront_with_config(
     gemm_engine: Option<&dyn GemmEngine>,
     json: bool,
 ) -> Result<Option<(ArrayD<f32>, ArrayD<f32>)>> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Attack);
     // Phase 1: Generic sampling+SPSA attack.
     // Keep the SPSA step floor, but respect explicitly tuned restart counts.
     let (sampling_restarts, sampling_steps) =
@@ -376,7 +380,7 @@ pub(super) fn try_conjunctive_pgd_attack_upfront_with_config(
     let sampling_config = PgdConfig {
         num_restarts: sampling_restarts,
         num_steps: sampling_steps,
-        ..pgd_config
+        ..pgd_config.clone()
     };
     if let Some(result) = super::pgd_sampling::try_conjunctive_sampling_attack(
         network,
@@ -448,13 +452,15 @@ pub(super) fn try_pgd_before_mip_with_candidate_with_config(
     gemm_engine: Option<&dyn GemmEngine>,
     json: bool,
 ) -> Result<super::PgdMipPrecheck> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Attack);
     // Phase 1: Generic sampling+SPSA attack.
     let (sampling_restarts, sampling_steps) =
         upfront_conjunctive_sampling_budget(pgd_config.num_restarts, pgd_config.num_steps);
     let sampling_config = PgdConfig {
         num_restarts: sampling_restarts,
         num_steps: sampling_steps,
-        ..pgd_config
+        ..pgd_config.clone()
     };
     if let Some(result) = super::pgd_sampling::try_conjunctive_sampling_attack(
         network,
@@ -478,7 +484,7 @@ pub(super) fn try_pgd_before_mip_with_candidate_with_config(
             Ok(pgd_result) => {
                 let best_output_value = pgd_result.best_output_value;
                 // Preserve the best candidate input for warm-starting MIP even when
-                // PGD does not prove a full counterexample (#3865).
+                // PGD does not prove a full counterexample.
                 let warm_start_input = pgd_result.counterexample.clone();
                 if let Some((counterexample, output)) = confirm_pgd_candidate(
                     network,

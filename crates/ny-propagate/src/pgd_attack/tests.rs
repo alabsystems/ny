@@ -703,7 +703,7 @@ fn test_pgd_estimate_gradient_spsa_with_bounds_escapes_sign_plateau_3769() {
     );
     assert_eq!(baseline_evals, 2);
 
-    // Smooth Sign relaxation (#3769): Sign networks dispatch to tanh(β*x)
+    // Smooth Sign relaxation: Sign networks dispatch to tanh(β*x)
     // approximation for gradient estimation, giving nonzero gradient in only
     // 2 evaluations (no multi-scale delta growth needed).
     let mut bounded_rng = StdRng::seed_from_u64(42);
@@ -1108,9 +1108,9 @@ fn test_pgd_reproducibility_with_seed() {
     );
 }
 
-// ============== Error Handling Tests (#3096) ==============
+// ============== Error Handling Tests ==============
 
-/// Regression test for #3096: when all PGD restarts fail, the function must
+/// Regression test: when all PGD restarts fail, the function must
 /// return Err — not Ok(PgdResult { found_counterexample: false }) which callers
 /// would misinterpret as "no counterexample found" (i.e., property verified).
 #[ntest::timeout(10000)]
@@ -1219,7 +1219,7 @@ fn test_pgd_partial_restart_failure_still_succeeds_3096() {
     );
 }
 
-/// Regression test for #3096: difference attack sequential all-restarts-fail returns Err.
+/// Regression test: difference attack sequential all-restarts-fail returns Err.
 #[ntest::timeout(10000)]
 #[test]
 fn test_pgd_difference_all_restarts_fail_returns_err_3096() {
@@ -1251,7 +1251,7 @@ fn test_pgd_difference_all_restarts_fail_returns_err_3096() {
     );
 }
 
-/// Regression test for #3096: conjunctive attack sequential all-restarts-fail returns Err.
+/// Regression test: conjunctive attack sequential all-restarts-fail returns Err.
 #[ntest::timeout(10000)]
 #[test]
 fn test_pgd_conjunctive_all_restarts_fail_returns_err_3096() {
@@ -1283,10 +1283,10 @@ fn test_pgd_conjunctive_all_restarts_fail_returns_err_3096() {
     );
 }
 
-// ============== NaN Gradient Guard Tests (#2745) ==============
+// ============== NaN Gradient Guard Tests ==============
 //
 // These tests verify the NaN gradient skip guard added to attack_conjunctive.rs
-// and attack_difference.rs. The guard uses the same pattern as attacker.rs (#2721, #2968):
+// and attack_difference.rs. The guard uses the same pattern as attacker.rs:
 // skip NaN gradient steps, abort after 5 consecutive NaN steps.
 //
 // We use simulation-based tests (same approach as attacker.rs) rather than integration
@@ -1324,7 +1324,7 @@ fn simulate_nan_abort_loop_2745(
     (clean_steps, total_iterations)
 }
 
-/// Regression test for #2745: 5 consecutive NaN gradients trigger abort.
+/// Regression test: 5 consecutive NaN gradients trigger abort.
 #[test]
 fn test_nan_guard_aborts_after_five_consecutive_2745() {
     let (clean, total) = simulate_nan_abort_loop_2745(100, &[true; 100]);
@@ -1332,7 +1332,7 @@ fn test_nan_guard_aborts_after_five_consecutive_2745() {
     assert_eq!(total, 5, "should abort after exactly 5 NaN steps");
 }
 
-/// Regression test for #2745: NaN counter resets on clean gradient step.
+/// Regression test: NaN counter resets on clean gradient step.
 #[test]
 fn test_nan_guard_counter_resets_on_clean_step_2745() {
     // Pattern: 4 NaN, 1 clean, repeating (never hits 5 consecutive)
@@ -1342,9 +1342,9 @@ fn test_nan_guard_counter_resets_on_clean_step_2745() {
     assert_eq!(total, 100, "all 100 steps consumed — no abort");
 }
 
-// ============== Batched PGD Tests (#3954 Slice 3) ==============
+// ============== Batched PGD Tests ==============
 
-/// Regression test for #3954: batched PGD attack finds counterexample.
+/// Regression test: batched PGD attack finds counterexample.
 /// When engine is present, attack() dispatches to attack_batched() which
 /// processes all restarts in lockstep with one GPU dispatch per step.
 #[ntest::timeout(10000)]
@@ -1385,7 +1385,7 @@ fn test_pgd_batched_finds_counterexample_3954() {
     assert!(cx[[0]] < 0.0, "counterexample should be at x < 0");
 }
 
-/// Regression test for #3954: batched PGD reduces GEMM dispatch count.
+/// Regression test: batched PGD reduces GEMM dispatch count.
 /// With batching, S steps use S+1 GEMM calls (one per step + one final)
 /// instead of N*(2*S+1) individual calls.
 #[ntest::timeout(10000)]
@@ -1427,7 +1427,7 @@ fn test_pgd_batched_reduces_gemm_dispatches_3954() {
     );
 }
 
-/// Regression test for #3954: batched PGD produces valid result when property holds.
+/// Regression test: batched PGD produces valid result when property holds.
 #[ntest::timeout(10000)]
 #[test]
 fn test_pgd_batched_no_counterexample_when_property_holds_3954() {
@@ -1470,7 +1470,7 @@ fn test_pgd_batched_no_counterexample_when_property_holds_3954() {
     assert_eq!(result.restarts_completed, 5);
 }
 
-/// Regression test for #3954: batched PGD with multidimensional input.
+/// Regression test: batched PGD with multidimensional input.
 #[ntest::timeout(10000)]
 #[test]
 fn test_pgd_batched_multidimensional_input_3954() {
@@ -1514,7 +1514,7 @@ fn test_pgd_batched_multidimensional_input_3954() {
     assert_eq!(result.restarts_completed, 5);
 }
 
-/// Regression test for #3954: batched PGD all-restarts-fail returns Err.
+/// Regression test: batched PGD all-restarts-fail returns Err.
 #[ntest::timeout(10000)]
 #[test]
 fn test_pgd_batched_all_restarts_fail_returns_err_3954() {
@@ -1548,7 +1548,7 @@ fn test_pgd_batched_all_restarts_fail_returns_err_3954() {
     );
 }
 
-/// Regression test for #2745: counter resets then hits 5 consecutive.
+/// Regression test: counter resets then hits 5 consecutive.
 #[test]
 fn test_nan_guard_reset_then_trigger_2745() {
     // Pattern: 3 NaN, 1 clean, then 5+ NaN → abort

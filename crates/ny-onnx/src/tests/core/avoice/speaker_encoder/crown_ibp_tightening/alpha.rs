@@ -173,7 +173,7 @@ fn log_alpha_crown_acceptance(
 }
 
 /// Epsilon sweep: find the perturbation scale at which IBP produces non-vacuous
-/// cosine distance bounds on the 190-node ECAPA-TDNN speaker encoder (#3499).
+/// cosine distance bounds on the 190-node ECAPA-TDNN speaker encoder.
 ///
 /// Tests epsilons from 1e-3 down to 1e-7 using pure IBP on the dot and norm_sq
 /// component graphs. Nested input boxes must produce nested component bounds,
@@ -252,7 +252,7 @@ fn test_speaker_cosine_ibp_epsilon_sweep_3499() {
     );
 }
 
-/// α-CROWN exploration: optimize ReLU slopes on cosine component graphs (#3499).
+/// α-CROWN exploration: optimize ReLU slopes on cosine component graphs.
 /// Uses `collect_alpha_crown_bounds_dag` with `adaptive_skip: false`.
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]

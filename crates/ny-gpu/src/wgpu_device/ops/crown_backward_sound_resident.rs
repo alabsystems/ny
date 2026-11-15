@@ -11873,9 +11873,9 @@ mod concretize_error_taint_tests {
 #[cfg(all(test, feature = "gpu-tests"))]
 mod tests {
     use super::*;
-    use crate::wgpu_device::test_support::{
-        gpu_test_serial_guard, require_device, require_verdict_device,
-    };
+    #[cfg(feature = "gpu-tests-uncharged")]
+    use crate::wgpu_device::test_support::require_verdict_device;
+    use crate::wgpu_device::test_support::{gpu_test_serial_guard, require_device};
     // Blessed env-mutation choke point (clippy env wall): all env writes in
     // these tests are ScopedEnvVar guards, serialized by gpu_test_serial_guard.
     use ny_core::{GpuCrownBackward, GpuCrownLayer, GpuResnetBatchedDomainRef};
@@ -11887,6 +11887,7 @@ mod tests {
     /// tests only. This is not a verdict seam: it uses directed host arithmetic
     /// and requires the frontier to carry no C1 receipt. Production callers must
     /// use `concretize_resident_coeff`, whose armed consult rejects this frontier.
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn concretize_unworded_test_frontier(
         coeff: &ResidentCoeff,
         num_specs: usize,
@@ -11965,6 +11966,7 @@ mod tests {
         (lower, upper)
     }
 
+    #[cfg(feature = "gpu-tests-uncharged")]
     #[allow(clippy::too_many_arguments)]
     fn unworded_resident_test_bounds(
         device: &WgpuDevice,
@@ -11988,6 +11990,7 @@ mod tests {
         ))
     }
 
+    #[cfg(feature = "gpu-tests-uncharged")]
     #[allow(clippy::too_many_arguments)]
     fn unworded_resident_test_chunked(
         device: &WgpuDevice,
@@ -12023,6 +12026,7 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "gpu-tests-uncharged")]
     #[allow(clippy::too_many_arguments)]
     fn unworded_resnet_test_bounds(
         device: &WgpuDevice,
@@ -12078,6 +12082,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn worded_conv_runtime_returns_clean_receipt() {
         let _g = gpu_test_serial_guard();
         let _words = ScopedEnvVar::set("NY_GPU_TAINT_WORDS", "1");
@@ -12117,6 +12122,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn worded_conv_gate_preserves_asymmetric_value_bits() {
         let _g = gpu_test_serial_guard();
         let _eft = ScopedEnvVar::unset("NY_EFT_ERR");
@@ -12172,6 +12178,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn worded_conv_catches_gemm_saturation_cancelled_by_col2im() {
         let _g = gpu_test_serial_guard();
         let _words = ScopedEnvVar::set("NY_GPU_TAINT_WORDS", "1");
@@ -12335,6 +12342,7 @@ mod tests {
     /// every value bit and return an explicit clean receipt. Performance data
     /// belongs in Criterion, not an ignored unit test.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn taint_gate_census_shape_preserves_values() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -12421,6 +12429,7 @@ mod tests {
     /// serialized by `gpu_test_serial_guard` — every ScopedEnvVar is created
     /// INSIDE the guard's scope and dropped (restoring the var) before it.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn taint_walk_gate_off_is_bit_identical() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -12529,6 +12538,7 @@ mod tests {
     /// though the downscaled VALUE (1e10·0.5 = 5e9) passes every magnitude
     /// guard. The clean spec row stays zero (words are never invented).
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn taint_walk_seeds_and_carries() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -12585,6 +12595,7 @@ mod tests {
     /// the word's single path to `rows_dev`, pinning the on-device conjunct
     /// through the whole walk.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn taint_walk_bias_conjunct_annihilates_on_device() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -12656,6 +12667,7 @@ mod tests {
     /// When any EFT precondition refuses the channel, this oracle instead pins
     /// the required fail-closed Higham fallback.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn taint_walk_eft_word_refuses_min_combine_tightening() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -12829,6 +12841,7 @@ mod tests {
     /// None: the segment composition must produce a real word set, otherwise
     /// an ARMED C1 consult would refuse every resnet row to the CPU path.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn taint_resnet_compose_gate_off_identical_and_clean_rows() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -12918,6 +12931,7 @@ mod tests {
     /// → seam OR → Residual branch sub-walk + skip add). Other rows stay zero
     /// (words are never invented; the seam OR is per-row exact).
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn taint_resnet_compose_sentinel_row_survives_composition() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -13151,6 +13165,7 @@ mod tests {
     /// chunked bounds enclose exactly what the proven single-dispatch sound bound
     /// encloses (which itself encloses the CPU f64+γ·S bound).
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn spec_row_chunk_is_exact_vs_unchunked() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -13277,6 +13292,7 @@ mod tests {
     /// single output column, which would mask a row-indexing error that a dense row
     /// exposes.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn spec_row_chunk_is_exact_vs_unchunked_conv_chain() {
         let _g = gpu_test_serial_guard();
         // This is a raw coefficient/chunking oracle, not a verdict-path test.
@@ -13526,6 +13542,7 @@ mod tests {
     ///       while DROPPING the bias channel visibly diverges (the ≈0.7× degradation
     ///       the design doc §2 predicts and the FD validators encode).
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn joint_alpha_gradient_matches_gpu_serial_bound_fd() {
         use ny_core::joint_alpha_grad::{
             joint_alpha_gradient, joint_lower_bound_debug, JointGradConfig,
@@ -13819,6 +13836,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn matmul(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
         (0..rows)
             .map(|r| (0..cols).map(|c| w[r * cols + c] * x[c]).sum())
@@ -13829,6 +13847,7 @@ mod tests {
     /// post/bias/pre subset may leak into the objective when any sibling term is
     /// out of range or non-finite.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_resident_cut_fold_malformed_entries_are_atomic_noops() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -13961,6 +13980,7 @@ mod tests {
     /// env/registry state must now leave the ordinary resident verifier exactly
     /// unchanged and record zero applications.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_resident_cut_fold_k3_geometry_is_quarantined() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -14112,6 +14132,7 @@ mod tests {
     /// must equal pre_lower[k]·Σ_j max(W2[j,k],0). Confirms the capture is wired into
     /// the real backward (not just the standalone primitive) and is byte-additive.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_resident_backward_captures_relu_alpha_gradients() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -14223,6 +14244,7 @@ mod tests {
     /// captured gradient must equal pre_lower[c]·Σ_a max((W_A·W_C)[a,c], 0). Confirms
     /// the per-branch slicing, cross-segment accumulation, and 3-tuple return.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_resnet_seeded_fold_captures_gradients_across_segments() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -14340,6 +14362,7 @@ mod tests {
     /// [xl,xu] gives a closed form we check the GPU sound bound against (sound ⇒ GPU lower ≤
     /// exact, upper ≥ exact, within ULP). Also a β=0 control = the no-beta bound, byte-exact.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_resnet_beta_matches_cpu_formula() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -14473,6 +14496,7 @@ mod tests {
 
     /// R1: resident single bias-free Linear encloses the host reference + samples.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_backward_sound_resident_single_linear_matches_host() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -14540,6 +14564,7 @@ mod tests {
     /// outward. On a preserving path this is a widening-only non-regression; the
     /// live gradual-underflow probe, not Vulkan/NVIDIA naming, establishes that fact.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_backward_sound_resident_daz_subnormal_coeff_stays_outward() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -14594,6 +14619,7 @@ mod tests {
     /// Net: x → W1·x+b1 (h) → W2·(...)+b2 (dout). Backward layers are output→input:
     /// [W2-layer, W1-layer]. Must enclose the host reference AND sampled outputs.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_backward_sound_resident_multilayer_bias_matches_host() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -14685,6 +14711,7 @@ mod tests {
     /// net affine — resident must enclose the affine forward AND the host;
     /// (b) an arbitrary valid relaxation — resident must enclose the host.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_backward_sound_resident_activation_matches_host() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -14854,6 +14881,7 @@ mod tests {
     /// walk must enclose sampled forward outputs. Dedicated tests above pin the
     /// worded route and gate-on/off identity separately.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_backward_sound_resident_single_conv_raw_is_sound() {
         let _g = gpu_test_serial_guard();
         // Raw Conv arithmetic/enclosure oracle; explicitly disable receipts so
@@ -14940,6 +14968,7 @@ mod tests {
     /// U_hi(x)=upper_a·(W·x+b)+upper_b — validating that the seed coefficient AND
     /// bias are incorporated soundly.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_backward_sound_resident_seeded_frontier_is_sound() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -15011,6 +15040,7 @@ mod tests {
     /// backward must enclose the sampled out — validating the fork + branch backward
     /// + certified skip-add (the core residual operation for resnets).
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_backward_sound_resident_residual_block_is_sound() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -15072,6 +15102,7 @@ mod tests {
     /// between blocks (seeding err=0 between segments would be unsound). Backward
     /// segments: [Chain(Linear_out), Residual(F2), Residual(F1)].
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_backward_sound_resident_stacked_resnet_is_sound() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -15162,6 +15193,7 @@ mod tests {
     /// output, so a too-small `frontier_abs` would fail — and (b) no looser than the
     /// un-concretized bound on the deep stack (the keystone's purpose).
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_backward_resnet_err_concretize_caps_soundly() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -15345,6 +15377,7 @@ mod tests {
     /// bias, with the incoming bias counted once). Backward: [Chain(Linear_out),
     /// ResidualProj(F, P)].
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_backward_sound_resident_projection_block_is_sound() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -15426,6 +15459,7 @@ mod tests {
     /// Resident must enclose the host reference AND the true conv-relu-linear
     /// forward. Backward layers (output→input): [Linear, Activation, Conv2d].
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_backward_sound_resident_conv_relu_linear_is_sound() {
         let _g = gpu_test_serial_guard();
         // Raw Conv arithmetic/enclosure oracle; production AUTO is covered by
@@ -15597,6 +15631,7 @@ mod tests {
     ///       slack-scale tolerance), and
     ///   (3) at depth the per-entry bound is DECISIVELY tighter (the fold fix).
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_backward_conv_err_per_entry_tighter_than_rowmax_and_sound() {
         let _g = gpu_test_serial_guard();
         // Compare the two Conv error algorithms directly. The legacy row-max
@@ -15829,6 +15864,7 @@ mod tests {
     /// width stays finite and ≥2× tighter than OFF, no looser than SEGMENT, and every
     /// sampled concrete output is enclosed (soundness preserved).
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_backward_deep_relu_resnet_fine_concretize_caps_explosion() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -16216,6 +16252,7 @@ mod tests {
     ///      bound with or without `node_abs` (the threshold never fires ⇒ no fine pass ⇒ the verdict
     ///      default path is byte-for-byte unchanged — no always-on per-ReLU cost).
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_backward_resnet_auto_fallback_uses_fine_no_env() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -16790,6 +16827,7 @@ mod tests {
     /// — independent of any GPU reduction order. A second leg runs the real GPU path
     /// for a sound-and-not-loose regression.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_backward_sound_resident_aw_combine_slack_covers_f32_gemm_undercount() {
         // ---- LEG 1: deterministic worst-case combine math (toggles with the fix) ----
         // Mirror the shader (CROWN_AW_ERROR_COMBINE_SHADER): the per-element error is
@@ -16982,6 +17020,7 @@ mod tests {
     /// `gpu_upper >= cpu_upper` (a tiny outward epsilon only, never inward), and
     /// `gpu_lower <= y <= gpu_upper` for the true outputs.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_backward_gpu_sound_encloses_cpu_sound_and_samples_adversarial() {
         use ny_core::GpuCrownBackward;
         let _g = gpu_test_serial_guard();
@@ -17251,6 +17290,7 @@ mod tests {
     /// #u2b composition it was FALSE on this box (measured: 72/72 specs
     /// tightened on an adapter with `verify_gradual_underflow() == false`).
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn eft_err_channel_ab_tightens_and_stays_sound() {
         use ny_core::GpuCrownBackward;
         let _g = gpu_test_serial_guard();
@@ -17623,6 +17663,7 @@ mod tests {
     /// reused verbatim by increment 2 (switching CHECK A to two-sided `|batched −
     /// serial| ≤ tol` once the wide kernel reorders each row's own contraction).
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_batched_reference_stacker_matches_serial_per_domain() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -17820,6 +17861,7 @@ mod tests {
     /// byte-identical to the unbounded sound entry, and a refusal (never a
     /// late publication) once the deadline has passed.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_batched_wide_sound_lane_taken_and_encloses_serial_reference() {
         let _g = gpu_test_serial_guard();
         // The wide lane is DEFAULT-ON; make the arming explicit + scoped so a
@@ -18028,6 +18070,7 @@ mod tests {
     ///    matches it two-sided: the same differential-oracle contract the
     ///    homogeneous wide lane is held to.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_batched_wide_subgroup_publishes_and_encloses_serial_reference() {
         // Review defect 1 (mirror): the unit pin in crown_backward/tests.rs
         // writes the same NY_BAB_RESNET_WIDE_SUBGROUP under lock_env() only.
@@ -18325,6 +18368,7 @@ mod tests {
     /// and 2 byte-unchanged. This is the soundness gate for routing pure conv-chain
     /// BaB re-bounds down the wide batched lane (NY_BAB_CHAIN_WIDE).
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_batched_chain_only_conv_matches_serial_per_domain() {
         let _g = gpu_test_serial_guard();
         // This is verdict-facing: AUTO must carry Conv words and run the full
@@ -18524,6 +18568,7 @@ mod tests {
     /// CONTAM stays BIT-EXACT (wide-vs-wide): mutating one domain must not perturb any
     /// other domain's block.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_batched_wide_multi_segment_matches_serial_per_domain() {
         let _g = gpu_test_serial_guard();
         // This is a verdict-facing entry: pin today's typed refusal, while
@@ -18784,6 +18829,7 @@ mod tests {
     /// of the pre-activation lower-A matrix. The final requested column is
     /// deliberately out of range and must retain the legacy `+0.0` behavior.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_dense_strided_gather_is_bit_exact() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -18859,6 +18905,7 @@ mod tests {
     /// per-domain col ∈ the union) + CONTAM (mutating one domain's slopes leaves other
     /// domains' gather blocks byte-unchanged — no cross-domain gather leak).
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_batched_wide_grad_gather_matches_serial_per_domain() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -19067,6 +19114,7 @@ mod tests {
     /// slopes/bounds/pre_lower make cross-domain blending (the risk mode: grads
     /// batch-averaged across domains) fail loudly.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_batched_wide_alpha_grads_match_serial_per_domain() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -19423,6 +19471,7 @@ mod tests {
     /// small conv resnet, ~1e-3 relative. PLUS the same CONTAMINATION leg as
     /// the chain test (per-domain mask isolation across the residual fold).
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_point_vjp_batched_resnet_matches_sequential_exact_gradient() {
         use ndarray::{Array1, Array2, Array4, ArrayD, IxDyn};
         use ny_propagate::{
@@ -19610,6 +19659,7 @@ mod tests {
     /// −1.31 hole cannot recur, because the sub-chunk result equals the sound single-pass
     /// result exactly.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn crown_batched_wide_subchunk_is_bit_identical_to_single_pass() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -19791,7 +19841,11 @@ mod tests {
 
 #[cfg(all(test, feature = "gpu-tests"))]
 mod u1_composed_sequence_integrity {
+    // The device half of this module is the uncharged lane's; the CPU-twin
+    // pin below runs in plain `gpu-tests` too.
+    #[cfg(feature = "gpu-tests-uncharged")]
     use crate::wgpu_device::test_support::{gpu_test_serial_guard, require_verdict_device};
+    #[cfg(feature = "gpu-tests-uncharged")]
     use wgpu::util::DeviceExt;
 
     /// CPU twin of `GEMM_F32_EFT_TWIN_SHADER`, replicating its op sequence
@@ -19872,6 +19926,7 @@ mod u1_composed_sequence_integrity {
     /// so only bit-equality discriminates a correctly-compiled sequence from a
     /// reassociated one that happens to be conservative.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn eft_twin_matches_cpu_sequence_bitwise_at_crown_shapes() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -20059,15 +20114,19 @@ mod u5_activation_lipschitz {
     //! `e_prod`/`e_sub` lanes at 2⁻¹²⁶-edge operands).
     // The certified-coefficient fixtures appended to this module (cert_err_*,
     // resnet_coeff_fixture and its projection twin) build real layer/segment
-    // plans, which this module's original two imports did not cover.
-    use crate::wgpu_device::test_support::{
-        gpu_test_serial_guard, require_device, require_verdict_device,
-    };
+    // plans, which this module's original two imports did not cover. Items
+    // only the uncharged-authority tests read carry that lane's cfg.
+    #[cfg(feature = "gpu-tests-uncharged")]
+    use crate::wgpu_device::test_support::require_verdict_device;
+    use crate::wgpu_device::test_support::{gpu_test_serial_guard, require_device};
     use crate::WgpuDevice;
+    #[cfg(feature = "gpu-tests-uncharged")]
     use ny_core::dd::next_up_f64;
+    #[cfg(feature = "gpu-tests-uncharged")]
     use ny_core::f32_to_f64_exact;
     use ny_core::GpuCrownBackward;
     use ny_core::{GpuCrownLayer, GpuCrownSeed, GpuResnetSegment};
+    #[cfg(feature = "gpu-tests-uncharged")]
     use ny_test_utils::env::ScopedEnvVar;
     use std::sync::Arc;
     use wgpu::util::DeviceExt;
@@ -20680,6 +20739,7 @@ mod u5_activation_lipschitz {
     /// and the declared weight/bias band, computed in f64 by enumerating the four
     /// corners of each `(w*, x)` product interval. This is the truth the
     /// published bound must enclose — not an approximation of it.
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn cert_err_true_extremes(
         fx: &CertErrFixture,
         w_rel: f64,
@@ -20715,6 +20775,7 @@ mod u5_activation_lipschitz {
     /// uncharged bound demonstrably fails to enclose the same oracle, so the test
     /// cannot pass vacuously.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn cert_err_widens_and_encloses_the_perturbed_weight_oracle() {
         let _guard = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -20835,6 +20896,7 @@ mod u5_activation_lipschitz {
     /// Host-side OUTWARD concretization of a published `CertifiedCoeffs`
     /// frontier over one input box. Deliberately independent of the device
     /// concretize so the self-consistency check below is a real cross-check.
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn concretize_certified_coeffs(
         c: &ny_core::CertifiedCoeffs,
         input_lower: &[f32],
@@ -20892,6 +20954,7 @@ mod u5_activation_lipschitz {
     /// the bounds entry's answer. It must also actually publish COEFFICIENTS —
     /// `dim` is the input width, not a concretized scalar per row.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn certified_coeffs_entry_concretizes_to_the_bounds_entry() {
         let _guard = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -21086,6 +21149,7 @@ mod u5_activation_lipschitz {
     /// alone would agree either way.
     #[cfg(feature = "gpu-tests")]
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn resnet_batched_certified_coeffs_match_the_single_domain_egress() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -21196,7 +21260,7 @@ mod u5_activation_lipschitz {
     /// and the F-before-P `node_abs` split were unreached by any test — and
     /// that is exactly the branch where a fold-order drift is possible. This
     /// fixture emits a genuine `ResidualProj` (BOTH branches non-empty).
-    #[cfg(feature = "gpu-tests")]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn resnet_proj_coeff_fixture() -> (Vec<GpuResnetSegment>, GpuCrownSeed, Vec<f32>, Vec<f32>) {
         let (segments, seed, lo, hi) = resnet_coeff_fixture();
         let mid = 6usize;
@@ -21239,6 +21303,7 @@ mod u5_activation_lipschitz {
     /// THERE too, not just on the identity-skip shape.
     #[cfg(feature = "gpu-tests")]
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn resnet_proj_certified_coeffs_concretize_to_the_resnet_bounds_entry() {
         let _g = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -21315,6 +21380,7 @@ mod u5_activation_lipschitz {
     /// exact same nonzero coefficient radii.
     #[cfg(feature = "gpu-tests")]
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn resnet_certified_coeffs_ignore_domain_abs_frontiers() {
         let _guard = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -21365,6 +21431,7 @@ mod u5_activation_lipschitz {
     }
 
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn resnet_certified_coeffs_concretize_to_the_resnet_bounds_entry() {
         let _guard = gpu_test_serial_guard();
         let device = require_verdict_device();
@@ -21445,6 +21512,7 @@ mod u5_activation_lipschitz {
     /// Modes whose kernels cannot carry the charge must REFUSE a nonzero
     /// declaration rather than silently drop it.
     #[test]
+    #[cfg(feature = "gpu-tests-uncharged")]
     fn cert_err_refuses_the_modes_that_cannot_charge_it() {
         let _guard = gpu_test_serial_guard();
         let device = require_verdict_device();

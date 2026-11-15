@@ -50,7 +50,7 @@ result on the strength of it.
 To fix a mismatch, build the binary from the pinned rev and point $NY_AY at it:
 
     git -C <ay-repo> worktree add --detach /tmp/ay-pinned <REV>
-    cargo build --release --manifest-path /tmp/ay-pinned/Cargo.toml \\
+    targo --unverified build --release --manifest-path /tmp/ay-pinned/Cargo.toml \\
         --bin ay --features cli
     export NY_AY=/tmp/ay-pinned/target/release/ay
 """

@@ -7,8 +7,6 @@
 //! Keeps the shared-helper parity and fused-IBP envelope assertions separate
 //! from the general CROWN regression file so the RMSNorm test modules stay
 //! within the 500-line file-size limit.
-//!
-//! Part of #3821, #3875.
 
 use ndarray::{arr1, arr2, ArrayD, Ix1, Ix2, IxDyn};
 use ny_core::Result;

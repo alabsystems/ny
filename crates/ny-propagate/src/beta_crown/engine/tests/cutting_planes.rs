@@ -705,6 +705,18 @@ fn test_graph_beta_crown_relu_split_detects_violation_relu_input() {
         max_domains: 64,
         max_depth: 8,
         timeout: Duration::from_secs(2),
+        // #general-defaults 2026-08-31 (26b9d74f7) flipped the engine default
+        // beta_iterations 0 -> 15. Under beta ascent the no-unstable-left rescue
+        // path (graph/relu_split_bounds.rs, propagate_crown_with_graph_beta)
+        // reports a looser bound on the split-stable child, so the bound-based
+        // violation check misses and the run ends Unknown("No unstable ReLU/Sign
+        // neurons left in some domains") instead of PotentialViolation. That is a
+        // COMPLETENESS gap in the ascent path (conservative direction — Unknown,
+        // never a wrong verdict); it predates the default flip but was invisible
+        // while ascent shipped OFF. This test covers BaB split/violation
+        // mechanics, so it pins ascent off to keep asserting the detection it was
+        // written for.
+        beta_iterations: 0,
         ..Default::default()
     });
 
@@ -717,6 +729,53 @@ fn test_graph_beta_crown_relu_split_detects_violation_relu_input() {
             BabVerificationStatus::PotentialViolation { .. }
         ),
         "Expected PotentialViolation, got {:?}",
+        result.result
+    );
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn test_graph_beta_crown_relu_split_detects_violation_under_beta_ascent() {
+    // #beta-ascent-sat: the ascent-ON twin of
+    // `test_graph_beta_crown_relu_split_detects_violation_relu_input`.
+    // Same trivially-false property (y = relu(x), x in [-1,1] |= y > 0.5), but
+    // with the SHIPPED engine default `beta_iterations = 15` rather than a pin
+    // to 0. The inactive child (x <= 0) is exactly y == 0, so a violation
+    // witness exists and BaB must report PotentialViolation.
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input("relu", Layer::ReLU(ReLULayer)));
+    graph.set_output("relu");
+
+    let input = BoundedTensor::new(arr1(&[-1.0]).into_dyn(), arr1(&[1.0]).into_dyn()).unwrap();
+
+    let config = BetaCrownConfig {
+        verify_upper_bound: false,
+        use_alpha_crown: false,
+        use_crown_ibp: false,
+        enable_cuts: false,
+        max_domains: 64,
+        max_depth: 8,
+        timeout: Duration::from_secs(2),
+        ..Default::default()
+    };
+    // Guard the premise: this test is only meaningful while ascent is on by
+    // default. If the default is ever flipped back to 0 the test silently
+    // becomes a duplicate of the pinned one, so assert the premise loudly.
+    assert!(
+        config.beta_iterations > 0,
+        "premise: engine default beta_iterations must be > 0 for this test to cover the ascent path"
+    );
+    let verifier = BetaCrownVerifier::new(config);
+
+    let result = verifier
+        .verify_graph_relu_split(&graph, &input, &[1.0], 0.5)
+        .unwrap();
+    assert!(
+        matches!(
+            result.result,
+            BabVerificationStatus::PotentialViolation { .. }
+        ),
+        "Expected PotentialViolation under beta ascent, got {:?}",
         result.result
     );
 }
@@ -827,6 +886,9 @@ fn test_graph_beta_crown_relu_split_supports_conv2d() {
         max_domains: 64,
         max_depth: 8,
         timeout: Duration::from_secs(2),
+        // Ascent off: see the beta_iterations note on
+        // test_graph_beta_crown_relu_split_detects_violation_relu_input.
+        beta_iterations: 0,
         ..Default::default()
     });
 
@@ -928,13 +990,13 @@ fn test_graph_beta_crown_relu_split_residual() {
     );
 }
 
-// #1861 Regression Tests: Verify that unresolved/violated domains prevent false Verified.
+// Regression Tests: Verify that unresolved/violated domains prevent false Verified.
 // ======================================================================================
 
 #[ntest::timeout(10000)]
 #[test]
 fn test_multi_objective_violated_domain_must_not_return_verified_1861() {
-    // Regression test for #1861: multi-objective path was silently dropping
+    // Regression test: multi-objective path was silently dropping
     // violated domains and still returning Verified when queue emptied.
     //
     // Network: y = relu(x), x ∈ [-1, 1]
@@ -975,7 +1037,7 @@ fn test_multi_objective_violated_domain_must_not_return_verified_1861() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_multi_objective_depth_limit_returns_unknown_1861() {
-    // Regression test for #1861: multi-objective path was silently dropping
+    // Regression test: multi-objective path was silently dropping
     // depth-limited domains without flagging them as unresolved.
     //
     // Network: x ∈ R^2, y = W2 * relu(W1 * x)
@@ -1253,7 +1315,7 @@ fn test_try_add_strengthened_cut_no_constraints() {
     assert!(cut_pool.is_empty());
 }
 
-/// Regression test for #2575: CuttingPlane Adam must not produce NaN/Inf
+/// Regression test: CuttingPlane Adam must not produce NaN/Inf
 /// when beta1=1.0, beta2=1.0, or t=0 (division-by-zero guard).
 #[ntest::timeout(5000)]
 #[test]
@@ -1315,7 +1377,7 @@ fn test_cutting_plane_adam_div_by_zero_guard_2575() {
     );
 }
 
-/// Regression test for #2598: CuttingPlane Adam must reset state on NaN gradient,
+/// Regression test: CuttingPlane Adam must reset state on NaN gradient,
 /// and evaluate() must return 0.0 (not NaN) for corrupted cuts.
 #[ntest::timeout(5000)]
 #[test]
@@ -1355,7 +1417,7 @@ fn test_cutting_plane_nan_lambda_guard_2598() {
     assert_eq!(result, 0.0, "evaluate() should return 0.0 for NaN lambda");
 }
 
-// #2422: Cut contribution broadcast guard tests
+// Cut contribution broadcast guard tests
 // =========================================================================
 
 /// Helper: compute bounds with and without cuts for a given output layer.

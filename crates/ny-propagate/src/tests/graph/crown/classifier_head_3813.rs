@@ -237,12 +237,12 @@ fn test_alpha_crown_classifier_head_matrix_mode_skips_patches_reentry_3813() {
     // conv_mode.rs tests which run in a more controlled environment.
 }
 
-/// #3813 Slice 5: Alpha-CROWN Dense→Patches re-entry at Conv2d boundaries.
+/// Alpha-CROWN Dense→Patches re-entry at Conv2d boundaries.
 ///
 /// The classifier-head Conv2d→ReLU→Flatten→Linear graph starts alpha-CROWN in
-/// Dense mode (1D logits output). Without Slice 5, the Dense backward hits
+/// Dense mode (1D logits output). Without this re-entry, the Dense backward hits
 /// Conv2d → ShapeMismatch → falls back to graph CROWN (losing alpha optimization).
-/// With Slice 5, Dense→Patches re-entry at the Conv2d boundary lets the Patches
+/// With it, the switch to Patches at the Conv2d boundary lets the Patches
 /// fast-path handle the Conv2d backward, preserving alpha optimization.
 ///
 /// Verification:

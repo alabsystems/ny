@@ -5,7 +5,7 @@
 //! Graph-level decomposition of RmsNorm and InstanceNorm into primitive ops.
 //!
 //! Companion to `compound_nodes.rs` which handles LayerNorm. Split out to
-//! keep each file under 500 lines (#4399).
+//! keep each file under 500 lines.
 
 use std::collections::{HashMap, HashSet};
 

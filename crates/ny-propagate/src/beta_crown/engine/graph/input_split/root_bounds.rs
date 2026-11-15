@@ -382,7 +382,10 @@ fn root_collection_options_identity(
     // appended below, so the byte layout changed. The tag is bumped rather than
     // silently extended — a v2 entry keyed under the old layout must never be
     // served to a run whose collection schedule differs.
-    bytes.extend_from_slice(b"ny.disjunctive-root-cache.options.v3\0");
+    // v4 (#per-node-floor-dim-scale): the floor's dim-scaling flag joins the
+    // scheduling fields below — it decides which targets publish CROWN∩IBP
+    // versus their IBP fallback, so it is semantic key material too.
+    bytes.extend_from_slice(b"ny.disjunctive-root-cache.options.v4\0");
     bytes.push(u8::from(config.use_alpha_crown));
     bytes.push(u8::from(config.use_forward_bounds));
     bytes.push(u8::from(config.use_crown_ibp));
@@ -399,6 +402,7 @@ fn root_collection_options_identity(
     // fallback — so two runs differing only here produce different (both sound)
     // root maps. They are semantic cache key material, not diagnostics.
     bytes.push(u8::from(config.crown_ibp_prefix_cost_weighted));
+    bytes.push(u8::from(config.crown_ibp_per_node_floor_dim_scaled));
     for value in [
         config.crown_ibp_per_node_floor_secs,
         config.crown_ibp_per_node_cap_secs,
@@ -578,11 +582,32 @@ fn root_bounds_cache_key(
     })
 }
 
+/// Whether the `crown` arm of [`collect_input_split_root_node_bounds`] is
+/// asked to publish the complete cGAN cascade map (`#crown-root-map`).
+///
+/// Arm selection is by `bound_prop_method` alone, so the request is only
+/// meaningful when neither the alpha nor the forward-linear arm is selected.
+/// The two publication guards are part of the request, not a later check: a
+/// root that fails a guard publishes nothing, so nothing of its collection
+/// could be cached either.
+fn crown_root_map_requested(config: &BetaCrownConfig) -> bool {
+    !config.use_alpha_crown
+        && !config.use_forward_bounds
+        && config.alpha_config.cgan_crown_root_map
+        && config.input_split_ibp_enhancement
+        && config.input_split_stacked_rebound
+}
+
 /// Exact key for only the deterministic typed reference map. Unlike the
 /// whole-result key, this deliberately permits restart-seeded alpha methods
 /// and supplement-bearing operators: no alpha or optimizer state is stored in
 /// this tier. Eligibility is the same exact typed/Step-1 predicate used by
 /// alpha initialization, and every ordinary root returns `None`.
+///
+/// `#crown-root-map`: the `crown` arm shares this tier when it publishes the
+/// complete cascade map, so a restart reuses the transaction exactly instead
+/// of paying it again. That arm only ever runs the COMPLETE cascade, so the
+/// sparse policy is not part of its eligibility.
 fn typed_reference_map_cache_key(
     cache: &InputSplitRootBoundsCache,
     graph: &GraphNetwork,
@@ -590,12 +615,15 @@ fn typed_reference_map_cache_key(
     config: &BetaCrownConfig,
     engine: Option<&dyn GemmEngine>,
 ) -> Option<RootBoundsCacheKey> {
-    if !config.use_alpha_crown {
-        return None;
-    }
     let exec_order = graph.exec_order().ok()?;
-    let typed = graph.cgan_complete_crown_ibp_root_eligible(&config.alpha_config, exec_order)
-        || graph.cgan_sparse_target_complete_root_eligible(&config.alpha_config, exec_order);
+    let typed = if config.use_alpha_crown {
+        graph.cgan_complete_crown_ibp_root_eligible(&config.alpha_config, exec_order)
+            || graph.cgan_sparse_target_complete_root_eligible(&config.alpha_config, exec_order)
+    } else if crown_root_map_requested(config) {
+        graph.cgan_complete_crown_ibp_root_eligible(&config.alpha_config, exec_order)
+    } else {
+        false
+    };
     if !typed {
         return None;
     }
@@ -609,12 +637,38 @@ fn typed_reference_map_cache_key(
 
 /// Collect the input-split ROOT node-bound map.
 ///
-/// # CONTRACT FOR ANY FUTURE ARM THAT RETURNS `Some(map)` (#root-map-two-guards)
+/// # WHICH ARM RUNS, AND THE CONTRACT FOR RETURNING `Some(map)` (#root-map-two-guards)
 ///
-/// Every arm below currently returns `None` for the map. That is load-bearing:
-/// publishing a root-scope node-bound map is NOT verdict-neutral, and the two
+/// The arm is selected by `bound_prop_method` alone (`preset/apply.rs:441-462`):
+///
+/// * `alpha-crown` (`use_alpha_crown`)      -> `(Some(alpha map), Some(alpha state))`
+/// * `forward+backward` / `forward+crown`
+///   (`use_forward_bounds`)                 -> `(Some(forward-linear map), None)`
+/// * `crown`, or no method set              -> **`(None, None)`** — the final `else`
+///   — unless the default-dark typed key `bab.alpha_crown.cgan_crown_root_map`
+///   is set, in which case that arm publishes `(Some(complete-cascade map),
+///   None)` under the two guards below (`#crown-root-map`; see the arm itself).
+///
+/// So a `bound_prop_method: crown` lane (cgan_2023 and cgan2026 are the shipped
+/// examples) hands its BaB children NO root map at all: `alpha_node_bounds` is
+/// `None` at `disjunctive_multi_clause.rs:1450`, which makes the merge in
+/// `build_input_split_reference_bounds` and the `child_node_bounds.or(...)` in
+/// `shared.rs:392` EQUIVALENT, and leaves each child with only its own override
+/// intersected with its own fresh per-domain pass. `root_alpha_available=false`
+/// on the `NY_WARM_ALPHA` line is that fact's runtime observable. An offline
+/// model that assumed children inherit the root's refined intermediates was
+/// ~1600x off on the child bound and produced a false "relaxation floor"
+/// verdict for cgan2026 row 7 — see
+/// `reports/measured-2026/cgan2026_child_bound_anchor_2026-08-30/`.
+///
+/// (This paragraph replaces "Every arm below currently returns `None` for the
+/// map", which was already untrue of two arms on the day it was written in
+/// e4c890bed.)
+///
+/// Publishing a root-scope node-bound map is NOT verdict-neutral, and the two
 /// conditions that make it safe are NOT implied by each other. Establish BOTH
-/// before returning `Some`, or you will silently turn `unsat` into `unknown`.
+/// before adding an arm that returns `Some`, or you will silently turn `unsat`
+/// into `unknown`.
 ///
 /// 1. `config.input_split_ibp_enhancement` — the SCALAR lane only ever MERGES a
 ///    supplied root map with the per-domain bounds. With the flag off it treats
@@ -648,6 +702,8 @@ pub(crate) fn collect_input_split_root_node_bounds(
     Option<HashMap<String, BoundedTensor>>,
     Option<GraphAlphaState>,
 )> {
+    // #phase-cost: see `ny_core::phase_cost` (observability only).
+    let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::RootBounds);
     // Root-joint authority is independent of restart-cache availability. A
     // non-cache route and a cache miss owe the same absolute scored wall.
     let overall_deadline = root_joint_authority_deadline;
@@ -1118,7 +1174,141 @@ pub(crate) fn collect_input_split_root_node_bounds(
             Err(err) => Err(err),
         }
     } else {
-        Ok((None, None))
+        // #crown-root-map (default-dark; typed key
+        // `bab.alpha_crown.cgan_crown_root_map`). This arm historically
+        // returned `(None, None)`, so under `bound_prop_method: crown` the BaB
+        // children of a typed-cGAN root bounded on IBP/forward-linear
+        // intermediates while the complete cascade that every shipped cgan
+        // yaml arms (`cgan_complete_crown_ibp_root`) was consulted by NOTHING
+        // on this lane (measured 2026-09-10 on cgan_2023 nCh_3 prop_0:
+        // `root_node_bounds=None`, root margin -5.8945 against abc's
+        // plain-CROWN -0.0034 on the same box). The reference collector is not
+        // alpha-specific despite its name: on a typed-eligible graph it
+        // returns the certified forward-linear baseline intersected
+        // shrink-only with the CROWN-IBP cascade and reports that provenance.
+        //
+        // Publish that map — with NO alpha state — only when all three hold:
+        // the key is armed, BOTH publication guards of the doc block above
+        // hold (`input_split_ibp_enhancement` so the scalar lane MERGES rather
+        // than overrides, `input_split_stacked_rebound` so the batched rebound
+        // merges rather than clones verbatim), and the graph is typed-eligible.
+        // Publish only on the collector's OWN typed provenance: a declined
+        // baseline routes to an ordinary collector whose map is sound but is
+        // not the mechanism this key names, and publishing it would let a
+        // silently-refused cascade read as a negative result rather than a
+        // void one. Every other outcome, including any error, declines to the
+        // historical `(None, None)`; this arm never fails the run.
+        //
+        // The line below is UNCONDITIONAL so map presence is observable on
+        // every crown-arm root, armed or not. `nodes=0` with `armed=true` is a
+        // decline and is always followed by its reason.
+        let armed = config.alpha_config.cgan_crown_root_map;
+        let guards = config.input_split_ibp_enhancement && config.input_split_stacked_rebound;
+        let exec_order = graph.exec_order().ok();
+        let eligible = exec_order.is_some_and(|exec_order| {
+            graph.cgan_complete_crown_ibp_root_eligible(&config.alpha_config, exec_order)
+        });
+        let Some(exec_order) = exec_order.filter(|_| armed && guards && eligible) else {
+            eprintln!(
+                "[crown-root-map] armed={armed} eligible={eligible} guards={guards} nodes=0 \
+                 source=none secs=0.000 mode={mode_label}"
+            );
+            if armed {
+                let reason = if guards && eligible {
+                    "exec_order"
+                } else if guards {
+                    "ineligible"
+                } else {
+                    "guards"
+                };
+                eprintln!(
+                    "[crown-root-map] declined reason={reason} ibp_enhancement={} \
+                     stacked_rebound={} cgan_complete_crown_ibp_root={} fix_interm_bounds={} \
+                     mode={mode_label}",
+                    config.input_split_ibp_enhancement,
+                    config.input_split_stacked_rebound,
+                    config.alpha_config.cgan_complete_crown_ibp_root,
+                    config.alpha_config.fix_interm_bounds,
+                );
+            }
+            return Ok((None, None));
+        };
+        let started = Instant::now();
+        let mut alpha_config = config.alpha_config.clone();
+        alpha_config.deadline = initial_deadline;
+        info!("Computing complete cGAN cascade root map for {mode_label} (crown arm)...");
+        let (collected, from_cache) = match cached_typed_reference {
+            Some(reference) => (Ok((reference.bounds, reference.source)), true),
+            None => {
+                // Same producer contract as the alpha arm's lifted Step 1: the
+                // DAG-alpha entry disables the L2 guard before its Step 1, so
+                // the published map is the one that arm would have produced.
+                let _l2_lever_off = crate::l2_lever_gate::L2LeverGuard::disabled();
+                (
+                    graph.collect_alpha_reference_bounds_with_engine_and_source(
+                        input,
+                        &alpha_config,
+                        engine,
+                        exec_order,
+                    ),
+                    false,
+                )
+            }
+        };
+        let secs = started.elapsed().as_secs_f64();
+        match collected {
+            Ok((bounds, source)) if source.is_cgan_complete_crown_ibp() => {
+                eprintln!(
+                    "[crown-root-map] armed=true eligible=true guards=true nodes={} \
+                     source={source:?} secs={secs:.3} cached={from_cache} mode={mode_label}",
+                    bounds.len(),
+                );
+                let reference = PrecomputedAlphaReferenceBounds { bounds, source };
+                if !from_cache {
+                    if let Some((cache, key)) = typed_reference_cache_key.as_ref() {
+                        cache.store_typed_reference(key.clone(), &reference);
+                        eprintln!(
+                            "[restart-root-cache] typed-map store mode={mode_label} nodes={} \
+                             alpha=false",
+                            reference.bounds.len(),
+                        );
+                    }
+                }
+                let value = (Some(reference.bounds), None);
+                // A no-alpha root is restart-deterministic, so the whole-result
+                // tier is the one a grouped restart actually consults (it is
+                // keyed before the typed tier); store there like the
+                // forward-linear arm does, or every restart re-pays the cascade.
+                if let Some((cache, key)) = cache_key {
+                    cache.store(key, &value);
+                    eprintln!(
+                        "[restart-root-cache] store mode={mode_label} nodes={} alpha=false",
+                        value.0.as_ref().map_or(0, HashMap::len),
+                    );
+                }
+                Ok(value)
+            }
+            Ok((bounds, source)) => {
+                eprintln!(
+                    "[crown-root-map] armed=true eligible=true guards=true nodes=0 \
+                     source={source:?} secs={secs:.3} mode={mode_label}"
+                );
+                eprintln!(
+                    "[crown-root-map] declined reason=source_not_typed_cascade \
+                     source={source:?} discarded_nodes={} mode={mode_label}",
+                    bounds.len(),
+                );
+                Ok((None, None))
+            }
+            Err(err) => {
+                eprintln!(
+                    "[crown-root-map] armed=true eligible=true guards=true nodes=0 \
+                     source=none secs={secs:.3} mode={mode_label}"
+                );
+                eprintln!("[crown-root-map] declined reason=error error={err} mode={mode_label}");
+                Ok((None, None))
+            }
+        }
     }
 }
 

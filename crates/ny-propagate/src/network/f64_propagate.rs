@@ -214,7 +214,7 @@ fn intersect_bounds_f64(a: &BoundedTensor64, b: &BoundedTensor64) -> Result<Boun
 
     // Use checked constructor: the intersection/union loop preserves matching shapes
     // and the union fallback guarantees lower <= upper for every element.
-    // The f64 path is not performance-critical (soundnessbench only). (#4253)
+    // The f64 path is not performance-critical (soundnessbench only).
     BoundedTensor64::new(lower, upper)
 }
 
@@ -256,8 +256,6 @@ pub fn convert_linear_layers_to_f64(
 ///
 /// Supports: Linear, Conv2d, ReLU, Flatten (no-op on bounds).
 /// Returns `Err` for any unsupported layer type.
-///
-/// Reference: design step 6 of `designs/2026-03-04-f64-propagation-path.md`.
 pub fn convert_network_to_f64(layers: &[crate::layers::Layer]) -> Result<Vec<SequentialLayerF64>> {
     use crate::layers::Layer;
 

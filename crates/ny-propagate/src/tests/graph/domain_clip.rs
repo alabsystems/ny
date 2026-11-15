@@ -185,7 +185,7 @@ fn test_domain_clipping_soundness() {
     ];
 
     for test_input in test_inputs {
-        let concrete = BoundedTensor::concrete(test_input.clone()).unwrap();
+        let concrete = BoundedTensor::concrete(test_input).unwrap();
         let concrete_output = graph.propagate_ibp(&concrete).unwrap();
 
         // Concrete output should be within clipped bounds

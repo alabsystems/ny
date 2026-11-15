@@ -290,7 +290,7 @@ impl BoundPropagation for GatherLayer {
             return BoundedTensor::new_allow_infinite(lower, upper);
         }
 
-        // NaN-propagating folds: NaN in input bounds must propagate — see #2577.
+        // NaN-propagating folds: NaN in input bounds must propagate.
         let lower_min = input
             .lower()
             .map_axis(Axis(axis), |lane| {

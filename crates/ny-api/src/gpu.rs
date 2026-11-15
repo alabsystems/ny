@@ -42,8 +42,10 @@
 //! pipelines never came up, the ladder never ran: the report's adapter is
 //! `None`, every rung reads [`WgpuVerdictRungOutcome::NotRun`], and
 //! `failed_rung()` is `None`. Code that assumes a named rung is always present
-//! is wrong — that second shape is exactly what an `UnchargedOnly` request
-//! returns on Apple/Metal today.
+//! is wrong — that second shape is what any host with no adapter returns (and
+//! what an `UnchargedOnly` request returned on Apple/Metal until 216f5aba1,
+//! when a SPIR-V passthrough request Metal cannot load poisoned the loading
+//! path before the ladder ran).
 //!
 //! Only the CROWN-backward trait seam opens on a qualified device. GEMM,
 //! convolution, IBP, DAG-IBP, and attention stay QUARANTINED and return `Err`
@@ -56,23 +58,21 @@
 //!
 //! **macOS / Metal — the two routes give OPPOSITE answers, so name the one you
 //! mean.** Measured live on 2026-08-27, Apple M4 Pro (IntegratedGpu, Metal), by
-//! the two `#[ignore]`d probes in this module's tests:
+//! the two explicit `gpu-tests` probes in this module's tests:
 //!
-//! * [`FlushChargeAdmission::UnchargedOnly`] → **REFUSED**, and it refuses
-//!   BEFORE the ladder runs. The uncharged constructor requires the
-//!   `DenormPreserve` loading path; Metal rejects the passthrough shader
-//!   ("does not contain any code compatible with this backend"), so
-//!   materializing the verdict-critical pipelines fails the loading-path
-//!   contract. The refusal you get therefore has
-//!   [`WgpuVerdictReport::adapter`] `== None`,
-//!   [`WgpuVerdictReport::failed_rung`] `== None`, and all five rungs
-//!   [`WgpuVerdictRungOutcome::NotRun`] — reason `"WGPU device initialization
-//!   did not complete"`. Do NOT write code that expects a named failing rung
-//!   here. (The earlier hardware record,
-//!   `docs/WGPU_METAL_CURRENT_QUALIFICATION_2026-08-11.md` on an M5 Max, got
-//!   further and scored 3/5 — rungs 1/4/5 pass, rungs 2 and 3 fail, first
-//!   failing rung `EFT primitives`. Either shape is a legitimate uncharged
-//!   outcome on Apple; both are refusals.)
+//! * [`FlushChargeAdmission::UnchargedOnly`] → **REFUSED by the ladder**, at
+//!   a named rung. Measured 2026-10-02, Apple M5 Max (IntegratedGpu, Metal):
+//!   [`WgpuVerdictReport::adapter`] names the adapter with
+//!   `denorm_preserve=false policy=auto`, and
+//!   [`WgpuVerdictReport::failed_rung`] is `EFT primitives` — the hardware is
+//!   pure-flush, so the uncharged ladder cannot pass there (the same 3/5 shape
+//!   as `docs/WGPU_METAL_CURRENT_QUALIFICATION_2026-08-11.md`: rungs 2 and 3
+//!   fail). Until 216f5aba1 the refusal came BEFORE the ladder instead (adapter
+//!   `None`, every rung `NotRun`, reason "WGPU device initialization did not
+//!   complete"): AUTO requested DenormPreserve SPIR-V passthrough because Metal
+//!   advertises `PASSTHROUGH_SHADERS` for MSL, Metal rejected the module ("does
+//!   not contain any code compatible with this backend"), and the fallback
+//!   poisoned the loading-path contract. Code must still handle both shapes.
 //! * [`FlushChargeAdmission::AllowFlushCharged`] → **QUALIFIED** on that same
 //!   host: `backend_provenance()` `== "wgpu-qualified-crown-flush-charged"`,
 //!   [`QualifiedGpuCrown::flush_charged`] `== true`, and
@@ -630,10 +630,10 @@ mod tests {
     /// reported `EFT primitives` (the first non-passing rung in ladder order).
     ///
     /// Run with:
-    /// `cargo test -p ny-api --features gpu --lib gpu::tests::live_uncharged
-    /// -- --ignored --nocapture`
+    /// `targo --unverified test -p ny-api --features gpu-tests --lib
+    /// gpu::tests::live_uncharged_qualification_reports_its_rungs -- --exact --nocapture`
+    #[cfg(feature = "gpu-tests")]
     #[test]
-    #[ignore = "creates a real WGPU context and compiles pipelines; run deliberately"]
     fn live_uncharged_qualification_reports_its_rungs() {
         match qualify_gpu_crown(FlushChargeAdmission::UnchargedOnly) {
             Ok(qualified) => {
@@ -680,9 +680,9 @@ mod tests {
 
     /// LIVE: run the real ladder on this host's adapter, charged route allowed.
     ///
-    /// `#[ignore]`d because it creates a WGPU context and compiles the
-    /// verdict-critical pipelines — deliberate, one at a time, never in a bulk
-    /// run. What it pins is the CONTRACT, on any hardware: the attempt returns
+    /// Feature-gated because it creates a WGPU context and compiles the
+    /// verdict-critical pipelines — deliberate, one at a time, never in an
+    /// ordinary bulk run. What it pins is the CONTRACT, on any hardware: the attempt returns
     /// a typed `Result` and never panics; a refusal carries an inspectable
     /// report; a success really does advertise the sound CROWN accessor (the
     /// admission predicate in `admit` already enforced that) and can be
@@ -694,10 +694,10 @@ mod tests {
     /// OPEN — a refusal is the correct expectation only for `UnchargedOnly`.
     ///
     /// Run with:
-    /// `cargo test -p ny-api --features gpu --lib gpu::tests::live_qualification
-    /// -- --ignored --nocapture`
+    /// `targo --unverified test -p ny-api --features gpu-tests --lib
+    /// gpu::tests::live_qualification_is_typed_and_fail_closed -- --exact --nocapture`
+    #[cfg(feature = "gpu-tests")]
     #[test]
-    #[ignore = "creates a real WGPU context and compiles pipelines; run deliberately"]
     fn live_qualification_is_typed_and_fail_closed() {
         match qualify_gpu_crown(FlushChargeAdmission::AllowFlushCharged) {
             Ok(qualified) => {

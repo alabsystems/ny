@@ -4,5 +4,6 @@
 
 mod bilinear;
 mod config;
+mod convention;
 mod integration;
 mod scoring;

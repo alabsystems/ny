@@ -345,7 +345,7 @@ proptest! {
     }
 }
 
-/// Regression for #2183: MaxPool CROWN fallback bias path must accumulate
+/// Regression: MaxPool CROWN fallback bias path must accumulate
 /// constants in f64 and apply directed rounding on the final f32 cast.
 /// Converted from proptest with `_case in 0u8..1` (zero randomization).
 #[ntest::timeout(10000)]
@@ -368,7 +368,7 @@ fn directed_rounding_maxpool_crown_bias_2183() {
     // the lower/upper rows LINEARLY through i* (no constant accumulated). The
     // surviving constant-bias arms are la<0 (lower_b += la*max_upper) and ua>0
     // (upper_b += ua*max_upper). We drive THOSE arms here to keep exercising the
-    // f64 directed-rounding guard (#2183): la=-1, ua=+1.
+    // f64 directed-rounding guard: la=-1, ua=+1.
     let incoming = LinearBounds::new(
         Array2::from_elem((1, 100), -1.0_f32),
         Array1::zeros(1),

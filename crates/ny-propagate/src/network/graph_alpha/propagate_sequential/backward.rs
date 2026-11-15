@@ -145,7 +145,7 @@ impl GraphNetwork {
         };
         let (linear_bounds, _, _) = match self.sequential_backward_pass(backward_pass) {
             Ok(result) => result,
-            // #3166: Catch both UnsupportedOp and UnsupportedConfiguration.
+            // Catch both UnsupportedOp and UnsupportedConfiguration.
             // DeadlineExceeded remains structured verifier authority.
             Err(NyError::UnsupportedOp(_) | NyError::UnsupportedConfiguration(_)) => {
                 return self
@@ -191,6 +191,9 @@ fn propagate_sequential_backward_node(
     gradient_buffers: &mut SequentialGradientBuffers<'_>,
 ) -> Result<()> {
     match layer {
+        Layer::PointLinear(_) => {
+            return Err(crate::network::proof_eligibility::diagnostic_only());
+        }
         Layer::Linear(linear) => {
             let next = linear.propagate_linear_with_engine_and_deadline(
                 linear_bounds,
@@ -244,7 +247,7 @@ fn propagate_sequential_backward_node(
                 *linear_bounds = next;
             }
         }
-        // === All other layers: exhaustive trait dispatch (#3424) ===
+        // === All other layers: exhaustive trait dispatch ===
         // Every variant listed — no catch-all. Compiler catches new variants.
         #[rustfmt::skip]
         Layer::Conv1d(_) | Layer::Conv2d(_) | Layer::Conv3d(_) | Layer::ConvTranspose1d(_) | Layer::ConvTranspose2d(_)
@@ -439,10 +442,10 @@ fn propagate_sequential_generic_layer_backward(
 ) -> Result<LinearBounds> {
     check_sequential_backward_deadline(deadline, "before generic layer dispatch")?;
 
-    // Conv layers: use engine-aware path for GPU acceleration (#3598).
+    // Conv layers: use engine-aware path for GPU acceleration.
     // Local macros deduplicate the clone-set-propagate pattern shared by
     // Conv1d/ConvTranspose1d (set_input_length) and Conv2d/ConvTranspose2d
-    // (set_input_shape). Both pairs are structurally identical. (#3812)
+    // (set_input_shape). Both pairs are structurally identical.
     macro_rules! conv1d_backward {
         ($conv:expr) => {{
             let in_len = *pre_activation
@@ -488,12 +491,12 @@ fn propagate_sequential_generic_layer_backward(
     check_sequential_backward_deadline(deadline, "after generic layer dispatch")?;
     match backward_result {
         Ok(lb) => Ok(lb),
-        // #3166: Catch both UnsupportedOp and UnsupportedConfiguration.
+        // Catch both UnsupportedOp and UnsupportedConfiguration.
         // DeadlineExceeded and SoundnessRefusal are verifier authority and must
         // remain structured rather than being relabeled UnsupportedOp.
-        // #3813: ShapeMismatch from Dense Conv2d backward when graph restructuring
+        // ShapeMismatch from Dense Conv2d backward when graph restructuring
         // (e.g., RSPLITTER) changes intermediate dimensions — fallback to CROWN.
-        // #2888: NumericalInstability from non-finite pre-activation bounds.
+        // NumericalInstability from non-finite pre-activation bounds.
         Err(
             NyError::UnsupportedOp(_)
             | NyError::UnsupportedConfiguration(_)

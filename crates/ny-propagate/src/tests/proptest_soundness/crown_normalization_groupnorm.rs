@@ -15,8 +15,6 @@
 //!
 //! Covers: scalar CROWN (identity, negcoeff), asymmetric incoming,
 //! batched CROWN (identity, negcoeff).
-//!
-//! Part of #3258.
 
 use crate::layers::normalization::{GroupNormLayer, LayerNormCrownMode};
 use crate::{BatchedLinearBounds, LinearBounds};
@@ -61,7 +59,6 @@ proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(500) })]
 
     /// GroupNorm CROWN structural: identity params, identity incoming.
-    /// Part of #3258.
     #[ntest::timeout(60000)]
     #[test]
     fn structural_groupnorm_crown_sampling_identity(
@@ -128,7 +125,6 @@ proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(500) })]
 
     /// GroupNorm CROWN soundness with identity incoming, tight perturbation.
-    /// Part of #3258.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_groupnorm_crown_identity_tight(
@@ -199,7 +195,6 @@ proptest! {
     }
 
     /// GroupNorm CROWN soundness with negative-coefficient incoming bounds.
-    /// Part of #3258.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_groupnorm_crown_negcoeff(
@@ -282,7 +277,6 @@ proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(500) })]
 
     /// GroupNorm CROWN soundness with asymmetric incoming (lower_a != upper_a).
-    /// Part of #3258.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_groupnorm_crown_asymmetric(
@@ -379,7 +373,6 @@ proptest! {
 
     /// GroupNorm batched CROWN soundness with identity incoming.
     /// Uses C=2, T=3 (in_dim=6), batch=2, num_groups=1.
-    /// Part of #3258.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_groupnorm_batched_crown_identity_tight(
@@ -478,7 +471,6 @@ proptest! {
 
     /// GroupNorm batched CROWN soundness with non-trivial incoming coefficients.
     /// Uses C=2, T=3 (in_dim=6), batch=2, out_dim=1, num_groups=1.
-    /// Part of #3258.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_groupnorm_batched_crown_negcoeff(
@@ -584,7 +576,6 @@ proptest! {
 // group's CROWN backward is independent.
 //
 // Re: P1 iter 42 finding — GroupNorm CROWN proptests need num_groups > 1.
-// Part of #3258.
 // =============================================================================
 
 proptest! {
@@ -593,7 +584,6 @@ proptest! {
     /// GroupNorm CROWN soundness with 2 groups, identity incoming.
     /// C=4, T=2, num_groups=2 → cpg=2, 4 elements per group, 8 total.
     /// Exercises group-splitting logic in CROWN backward path.
-    /// Part of #3258.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_groupnorm_crown_2groups_identity(
@@ -682,7 +672,6 @@ proptest! {
 
     /// GroupNorm CROWN soundness with 2 groups and negative-coefficient incoming.
     /// C=4, T=2, num_groups=2, incoming has mixed-sign coefficients.
-    /// Part of #3258.
     #[ntest::timeout(60000)]
     #[test]
     fn soundness_groupnorm_crown_2groups_negcoeff(

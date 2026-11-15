@@ -161,7 +161,7 @@ pub(super) fn assert_centroid_bounds_no_looser(
 }
 
 // ---------------------------------------------------------------------------
-// Shared centroid monotonicity statistics (#3497)
+// Shared centroid monotonicity statistics
 //
 // Used by monotonicity.rs and crown_ibp_tightening.rs to compute and compare
 // centroid-based monotonicity metrics from softmax probability bounds.

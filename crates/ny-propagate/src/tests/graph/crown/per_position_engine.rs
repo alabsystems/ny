@@ -4,14 +4,14 @@
 
 //! Per-position CROWN regressions for engine threading and sampled soundness.
 //!
-//! The engine-threading design (#3772) requires behavioral proof that
+//! The engine-threading design requires behavioral proof that
 //! `propagate_crown_per_position_with_engine` and
 //! `propagate_crown_within_graph_with_engine` thread the GemmEngine through
 //! to actual GEMM calls. These tests use a `CountingGemmEngine` wrapper
 //! to verify `gemm_calls() > 0` while preserving bound parity with the
 //! bare (engine=None) variants.
 //!
-//! This module also covers #2557 by checking that bare per-position CROWN
+//! This module also checks that bare per-position CROWN
 //! preserves `[..., output_dim]` shape and encloses concrete outputs sampled
 //! from a multi-position input tensor.
 
@@ -88,7 +88,7 @@ fn assert_multi_position_sample_contained(bounds: &BoundedTensor, sample: &Array
     }
 }
 
-/// #2557 regression: multi-position per-position CROWN must preserve shape
+/// Regression: multi-position per-position CROWN must preserve shape
 /// and contain sampled concrete outputs from each position.
 #[ntest::timeout(10000)]
 #[test]
@@ -130,7 +130,7 @@ fn test_crown_per_position_multi_position_soundness_2557() {
     }
 }
 
-/// #3772 regression: `propagate_crown_per_position_with_engine` must thread
+/// Regression: `propagate_crown_per_position_with_engine` must thread
 /// the GemmEngine through to CROWN backward GEMM calls.
 ///
 /// Uses a 2D input [2, 2] to exercise the per-position loop (positions 0 and 1).
@@ -169,7 +169,7 @@ fn test_crown_per_position_with_engine_threads_gemm_3772() {
     );
 }
 
-/// #3772 regression: `propagate_crown_within_graph_with_engine` must thread
+/// Regression: `propagate_crown_within_graph_with_engine` must thread
 /// the GemmEngine through to CROWN backward GEMM calls.
 #[ntest::timeout(10000)]
 #[test]
@@ -210,7 +210,7 @@ fn test_crown_within_graph_with_engine_threads_gemm_3772() {
     );
 }
 
-/// #3772 regression: `propagate_crown_within_graph_with_stats_and_engine`
+/// Regression: `propagate_crown_within_graph_with_stats_and_engine`
 /// must return the same stats as the bare variant while threading the engine.
 #[ntest::timeout(10000)]
 #[test]

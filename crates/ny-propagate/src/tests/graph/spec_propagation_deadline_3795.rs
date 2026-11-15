@@ -67,10 +67,10 @@ fn run_spec_guided_conv2d_deadline_probe(
     )
 }
 
-/// Regression for #3795/#3881: a single large Conv2d node must honor the verifier
+/// Regression: a single large Conv2d node must honor the verifier
 /// deadline from inside the node-local GEMM path instead of relying on an
 /// external watchdog. Sub-floor per-node budgets keep the global deadline
-/// so CROWN LinearBounds are preserved on short-budget tiny graphs (#3881).
+/// so CROWN LinearBounds are preserved on short-budget tiny graphs.
 #[ntest::timeout(10000)]
 #[test]
 fn test_spec_guided_conv2d_per_node_deadline_fallback_3795() {

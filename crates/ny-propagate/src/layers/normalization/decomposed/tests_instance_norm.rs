@@ -8,8 +8,6 @@
 //! which delegates to grouped centered-normalization with `num_groups == num_channels`)
 //! and the channel-batched adapter (`decomposed_instance_norm_crown_backward_channel_batched`,
 //! which processes each batch position independently).
-//!
-//! Part of #4209.
 
 use super::instance_norm::{
     decomposed_instance_norm_crown_backward,

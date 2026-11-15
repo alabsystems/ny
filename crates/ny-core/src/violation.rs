@@ -93,7 +93,7 @@ impl ViolatedConstraint {
         for (idx, (&value, bound)) in output.iter().zip(bounds.iter()).enumerate() {
             // NaN output is always a violation — it cannot satisfy any finite bound.
             // IEEE 754: NaN < x and NaN > x are both false, so without this guard
-            // a NaN counterexample would silently pass as non-violating. (#3291 F1)
+            // a NaN counterexample would silently pass as non-violating.
             if value.is_nan() {
                 return Some(Self::new(
                     idx,

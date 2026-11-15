@@ -78,7 +78,7 @@ fn step_domain_alpha_neuron_adam(
     neuron.set_alpha(neuron.alpha * decay_factor + update);
     // NaN guard: set_alpha catches NaN→0.5 but m/v remain NaN,
     // permanently corrupting this neuron's optimizer. Reset all state.
-    // Matches sequential alpha.rs:136-140 pattern. (#2595)
+    // Matches sequential alpha.rs:136-140 pattern.
     if !neuron.adam_m.is_finite() || !neuron.adam_v.is_finite() {
         neuron.adam_m = 0.0;
         neuron.adam_v = 0.0;
@@ -220,7 +220,7 @@ impl DomainAlphaState {
 
     /// Accumulate gradient for a specific neuron.
     ///
-    /// NaN guard (#3112): skip non-finite gradients to prevent NaN from entering the
+    /// NaN guard: skip non-finite gradients to prevent NaN from entering the
     /// optimizer state. Without this, a single NaN gradient poisons m/v accumulators
     /// and wastes an Adam step before the post-step guard resets everything.
     pub fn accumulate_grad(&mut self, layer_idx: usize, neuron_idx: usize, grad: f32) {
@@ -238,7 +238,7 @@ impl DomainAlphaState {
         let mut max_grad = 0.0f32;
 
         for n in self.neurons.values_mut() {
-            // NaN-aware convergence tracking: f32::max silently drops NaN (#2939).
+            // NaN-aware convergence tracking: f32::max silently drops NaN.
             max_grad = nan_propagating_max(max_grad, n.grad.abs());
 
             // Update with momentum
@@ -247,7 +247,7 @@ impl DomainAlphaState {
             // Gradient ascent (we want to maximize lower bound)
             n.set_alpha(n.alpha + n.velocity);
             // NaN guard: set_alpha catches NaN→0.5 but velocity remains NaN,
-            // permanently corrupting this neuron's momentum. Reset velocity. (#2608)
+            // permanently corrupting this neuron's momentum. Reset velocity.
             if !n.velocity.is_finite() {
                 n.velocity = 0.0;
             }
@@ -268,7 +268,7 @@ impl DomainAlphaState {
     /// - v_max = max(v_max, v)
     /// - v_hat = v_max / (1 - β₂^t)  (use v_max instead of v)
     ///
-    /// Returns the maximum raw gradient magnitude for convergence check (#2416).
+    /// Returns the maximum raw gradient magnitude for convergence check.
     pub fn gradient_step_adam(&mut self, config: &AdaptiveOptConfig, t: usize) -> f32 {
         let mut max_grad = 0.0f32;
         let t_float = t.max(1) as f32;
@@ -278,7 +278,7 @@ impl DomainAlphaState {
             None
         };
 
-        // Bias correction factors — .max(EPSILON) guards division by zero (#2315, #2556)
+        // Bias correction factors —.max(EPSILON) guards division by zero
         let beta1_corr = if config.bias_correction {
             (1.0f32 - config.beta1.powf(t_float)).max(f32::EPSILON)
         } else {
@@ -296,11 +296,11 @@ impl DomainAlphaState {
         for (&(layer_idx, _neuron_idx), neuron) in &mut self.neurons {
             let scheduled_lr = scheduled_alpha_lr(base_scheduled_lr, config, layer_idx);
 
-            // NaN-aware convergence tracking: f32::max silently drops NaN (#2939).
+            // NaN-aware convergence tracking: f32::max silently drops NaN.
             // Use raw gradient (not m_hat) for convergence check. m_hat is an EMA
             // (β₁=0.9) that lags the true gradient — after a flat→steep transition,
             // m_hat stays near zero for several iterations, causing premature
-            // termination. Raw gradient reflects the current landscape. (#2416)
+            // termination. Raw gradient reflects the current landscape.
             // GraphBetaState already uses raw gradient; this makes all states consistent.
             let grad_abs = step_domain_alpha_neuron_adam(
                 neuron,

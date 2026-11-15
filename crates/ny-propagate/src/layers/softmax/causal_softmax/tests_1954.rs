@@ -9,7 +9,7 @@ use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
 /// Dense reference that mirrors the production row-decomposed path.
 ///
 /// Assembles a full `(total_size × total_size)` block-diagonal Jacobian
-/// (verifying the structural claim from #1954) but estimates error margins
+/// (verifying the structural claim) but estimates error margins
 /// per-row using the same sampling hash as the production row helper.
 /// This tests algebraic equivalence of the row-decomposition, not sampling
 /// divergence from a hypothetical global-sampling alternative.

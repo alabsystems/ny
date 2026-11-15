@@ -70,7 +70,7 @@ impl WgpuDevice {
 /// The small-K shader covers TILE_DIM × (TILE_DIM × SMALL_K_ROWS_PER_THREAD).
 pub(super) const GEMM_TILE_DIM: usize = 16;
 
-/// K dimension threshold for small-K GEMM shader eligibility (#3599).
+/// K dimension threshold for small-K GEMM shader eligibility.
 ///
 /// The small-K shader (no shared memory, no barriers, ROWS_PER_THREAD=4) is
 /// only used as a dispatch-limit fallback when the tiled shader's workgroup Y
@@ -82,7 +82,7 @@ pub(super) const GEMM_TILE_DIM: usize = 16;
 /// when used unconditionally. It remains necessary for soundnessbench Conv2
 /// (M=1,572,864) where tiled dispatch Y = 98,304 > 65,535.
 ///
-/// Reference: #3599 (benchmark data at gpu_crown_backward_timing_smallk_*.csv)
+/// Reference: benchmark data at gpu_crown_backward_timing_smallk_*.csv.
 pub(super) const GEMM_SMALL_K_THRESHOLD: u32 = 64;
 
 /// Rows per thread in the small-K GEMM shader.
@@ -90,16 +90,52 @@ pub(super) const GEMM_SMALL_K_THRESHOLD: u32 = 64;
 /// Must match `ROWS_PER_THREAD` constant in `GEMM_F32_SMALL_K_SHADER`.
 pub(super) const SMALL_K_ROWS_PER_THREAD: usize = 4;
 
-/// Maximum M rows per dispatch to stay within the wgpu workgroup grid limit.
+/// Maximum M rows per dispatch of the TILED shader: wgpu requires each
+/// dispatch dimension to be ≤ 65535 and its Y = ceil(M/16), so
+/// 65535 × 16 = 1,048,560.
+const MAX_M_FOR_TILED_DISPATCH: usize = 65535 * GEMM_TILE_DIM;
+
+/// Maximum M rows per dispatch of the SMALL-K shader: Y = ceil(M/64), so
+/// 65535 × 64 = 4,194,240.
+const MAX_M_FOR_SMALL_K_DISPATCH: usize = 65535 * GEMM_TILE_DIM * SMALL_K_ROWS_PER_THREAD;
+
+/// Maximum M rows ONE dispatch can cover for contraction length `k`: the grid
+/// limit of the shader [`select_gemm_dispatch`] can pick for that `k`.
 ///
-/// wgpu requires each dispatch dimension to be ≤ 65535. The effective M tile
-/// depends on the shader:
-/// - Tiled shader: dispatch Y = ceil(M/16), max M = 65535 × 16 = 1,048,560
-/// - Small-K shader: dispatch Y = ceil(M/64), max M = 65535 × 64 = 4,194,240
+/// Only `k ≤ GEMM_SMALL_K_THRESHOLD` can reach the small-K shader; above it
+/// the tiled shader is the only choice, so a batch of more than 1,048,560 rows
+/// is refused by `gemm_f32_single`'s defensive dispatch check. Capping every
+/// `k` at the small-K limit used to be harmless only because the static
+/// 128 MiB binding split (`MAX_BINDING_ELEMS / k`, at most 430,185 rows for
+/// k ≥ 65) always bound first; once the split reads the live binding limit
+/// (#hard-caps) it no longer does, so the cap must follow the shader.
+const fn max_m_for_dispatch(k: usize) -> usize {
+    if k <= GEMM_SMALL_K_THRESHOLD as usize {
+        MAX_M_FOR_SMALL_K_DISPATCH
+    } else {
+        MAX_M_FOR_TILED_DISPATCH
+    }
+}
+
+/// Rows per M-batch for `WgpuDevice::gemm_f32`: bounded by the A binding
+/// (rows × k), the output binding (rows × n), and the dispatch grid of the
+/// shader chosen for `k`.
 ///
-/// We use the larger limit since `gemm_f32` selects the shader at dispatch time.
-/// Without this cap, large workloads cause a wgpu validation panic. See #3603.
-const MAX_M_FOR_DISPATCH: usize = 65535 * GEMM_TILE_DIM * SMALL_K_ROWS_PER_THREAD;
+/// `max_elems` must be the SAME budget the caller's B gate applied. With
+/// `m, k, n > 0` and `k·n ≤ max_elems` (the gate), `k ≤ max_elems` and
+/// `n ≤ max_elems`, so the result is ≥ 1. A split on a smaller budget than the
+/// gate (for example the static `MAX_BINDING_ELEMS` under a live gate) gives 0
+/// rows for k or n above it, and `gemm_f32_batched` would never advance.
+///
+/// Pure, so the batch/dispatch agreement is pinned without a GPU.
+fn gemm_batch_rows(m: usize, k: usize, n: usize, max_elems: usize) -> usize {
+    let max_m_for_a = max_elems.checked_div(k).unwrap_or(m);
+    let max_m_for_out = max_elems.checked_div(n).unwrap_or(m);
+    max_m_for_a
+        .min(max_m_for_out)
+        .min(max_m_for_dispatch(k))
+        .min(m)
+}
 
 #[derive(Clone, Copy)]
 struct CheckedGemmLengths {
@@ -151,7 +187,7 @@ fn allocate_host_gemm_output(shape: CheckedGemmLengths) -> Result<Vec<f32>> {
 ///
 /// Pure function output — no GPU state needed. Used by both the standalone
 /// `gemm_f32_single()` path and the CROWN backward encoder to ensure the
-/// same shader-selection rule applies everywhere (#3599 Prover finding).
+/// same shader-selection rule applies everywhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct GemmDispatch {
     /// Whether the small-K shader should be used instead of the tiled shader.
@@ -173,7 +209,7 @@ pub(super) struct GemmDispatch {
 /// This is the single source of truth for dispatch selection — both
 /// `gemm_f32_single()` and `gemm_pipeline_and_dispatch()` call this.
 ///
-/// Reference: #3599 (benchmark evidence at f249911c9, ff03f9d16)
+/// Reference: benchmark evidence at commits f249911c9, ff03f9d16.
 pub(super) fn select_gemm_dispatch(m: u32, k: u32, n: u32) -> GemmDispatch {
     let wg_x = n.div_ceil(GEMM_TILE_DIM as u32);
     let tiled_wg_y = m.div_ceil(GEMM_TILE_DIM as u32);
@@ -216,25 +252,43 @@ impl WgpuDevice {
             return allocate_host_gemm_output(shape);
         }
 
-        // Check if any buffer exceeds the wgpu binding limit after 1.2× growth.
+        // Check if any buffer exceeds the binding limit after 1.2× growth.
         // B matrix (k×n) cannot be split, so if it alone exceeds the limit,
         // return an error to let the caller fall back to CPU.
-        if shape.rhs > MAX_BINDING_ELEMS {
+        //
+        // #hard-caps: the LIVE device limit, not wgpu's 128 MiB default. The
+        // sweep that moved the conv_transpose gate (d153bf0a4), crown_backward
+        // (664af6bf) and the FL value tier's chunk budget (16034c8fc) to
+        // `max_binding_elems_live` missed this gate, so the FL tier admitted B
+        // up to half the live capacity and this gate then refused everything
+        // past 112 MB (M5 Max: 4 GiB - 4 B granted, 1.79 GB admitted).
+        let max_elems = self.max_binding_elems_live();
+        if shape.rhs > max_elems {
             return Err(NyError::GpuMemoryExceeded {
                 required_bytes: shape.rhs_bytes,
-                budget_bytes: WGPU_MAX_BINDING_BYTES,
+                budget_bytes: self.max_binding_bytes_live(),
             });
         }
 
-        // Compute max M rows per batch: limited by A buffer (batch_m × k),
-        // output buffer (batch_m × n), and wgpu dispatch dimension limit.
-        // All three limits are ≥ 1 when m,k,n > 0 (early return above).
-        let max_m_for_a = MAX_BINDING_ELEMS.checked_div(k).unwrap_or(m);
-        let max_m_for_out = MAX_BINDING_ELEMS.checked_div(n).unwrap_or(m);
-        let batch_m = max_m_for_a
-            .min(max_m_for_out)
-            .min(MAX_M_FOR_DISPATCH)
-            .min(m);
+        // Max M rows per batch: limited by the A buffer (batch_m × k), the
+        // output buffer (batch_m × n), and the dispatch grid of the shader
+        // selected for k. The gate above and both splits read the SAME
+        // `max_elems`, so batch_m ≥ 1 (see `gemm_batch_rows`).
+        //
+        // With the live limit, one large-A or large-output call can leave each
+        // `gemm_*` pool slot holding up to the granted binding size (about
+        // 4 GiB on Apple M-series; host RAM on unified memory) instead of at most
+        // 128 MiB, as conv_transpose's live gate already allows. The
+        // #gpu-pool-highwater rule reallocates a slot at the next request
+        // that is much smaller.
+        let batch_m = gemm_batch_rows(m, k, n, max_elems);
+        if batch_m == 0 {
+            // Unreachable while the gate and the splits share `max_elems`;
+            // refuse rather than let `gemm_f32_batched` loop without advancing.
+            return Err(NyError::InternalError(format!(
+                "wgpu gemm_f32: zero-row batch for {m}x{k}x{n} (binding budget {max_elems} elements)"
+            )));
+        }
 
         // Wrap the GPU work in an error scope so a wgpu validation/internal/OOM
         // error returns Err (caller falls back to CPU) instead of aborting the
@@ -252,9 +306,9 @@ impl WgpuDevice {
     ///
     /// Uses the tiled shader by default. Falls back to the small-K shader only
     /// when K ≤ threshold AND the tiled shader would exceed the 65535 dispatch
-    /// limit. See `GEMM_SMALL_K_THRESHOLD` doc for benchmark rationale (#3599).
+    /// limit. See `GEMM_SMALL_K_THRESHOLD` doc for benchmark rationale.
     ///
-    /// Caller must ensure M ≤ `MAX_M_FOR_DISPATCH` and N dispatch fits in 65535.
+    /// Caller must ensure M ≤ `max_m_for_dispatch(k)` and N dispatch fits in 65535.
     fn gemm_f32_single(
         &self,
         m: usize,
@@ -267,7 +321,7 @@ impl WgpuDevice {
         let k_u32 = gpu_checked_u32(k, "gemm k")?;
         let n_u32 = gpu_checked_u32(n, "gemm n")?;
 
-        // Single source of truth for shader selection (#3599).
+        // Single source of truth for shader selection.
         let dispatch = select_gemm_dispatch(m_u32, k_u32, n_u32);
 
         // Defensive check: wgpu dispatch dimensions must be ≤ 65535.
@@ -339,7 +393,7 @@ impl WgpuDevice {
         // Keep the shared buffer-pool lock alive until readback completes.
         // Otherwise concurrent Rayon GEMM calls can recycle `gemm_staging_buffer`
         // while a previous `map_async`/`unmap` cycle is still in flight, which
-        // triggers wgpu's "Buffer ... is still mapped" validation panic (#3813).
+        // triggers wgpu's "Buffer... is still mapped" validation panic.
         self.queue
             .write_buffer(&params_buffer, 0, bytemuck::cast_slice(&[params]));
         self.queue
@@ -382,7 +436,7 @@ impl WgpuDevice {
                 timestamp_writes: None,
             });
 
-            // Select pipeline and dispatch from shared selector (#3599).
+            // Select pipeline and dispatch from shared selector.
             let pipeline = if dispatch.use_small_k {
                 &self.gemm_f32_small_k_pipeline
             } else {
@@ -656,6 +710,89 @@ mod tests {
         assert!(!d.use_small_k, "metaroom shape should use tiled");
         assert_eq!(d.wg_y, 35_840_u32.div_ceil(16));
         assert!(d.wg_y <= 65535);
+    }
+
+    /// Largest binding budget any adapter can grant: wgpu's
+    /// `max_storage_buffer_binding_size` is a `u32` byte count, after the
+    /// pool's 1.2× growth: 894,784,853 elements. An M5 Max grants 4 GiB - 4 B
+    /// (live budget 894,784,852 elements, measured).
+    const LARGEST_LIVE_BUDGET: usize = (u32::MAX as usize) * 5 / 6 / size_of::<f32>();
+
+    /// #hard-caps: every M-batch `gemm_f32` hands one dispatch must fit the
+    /// grid of the shader `select_gemm_dispatch` picks for it, under the static
+    /// budget AND the largest live one. Capping all k at the small-K limit
+    /// handed k ≥ 65 batches of up to 4,194,240 rows to the tiled shader
+    /// (limit 1,048,560): m = 1.1M, k = 65 came back as "dispatch exceeds 65535"
+    /// and fell to the CPU once the split read the live limit.
+    #[test]
+    fn gemm_batch_rows_fit_the_selected_shader_dispatch() {
+        for max_elems in [MAX_BINDING_ELEMS, LARGEST_LIVE_BUDGET] {
+            for k in [1usize, 2, 24, 63, 64, 65, 66, 128, 1152] {
+                for n in [1usize, 2, 8, 288] {
+                    for m in [
+                        1usize,
+                        M_EXACT_BOUNDARY as usize,
+                        M_EXACT_BOUNDARY as usize + 1,
+                        1_100_000,
+                        1_953_125,
+                        MAX_M_FOR_SMALL_K_DISPATCH,
+                        MAX_M_FOR_SMALL_K_DISPATCH + 1,
+                        50_000_000,
+                    ] {
+                        let rows = gemm_batch_rows(m, k, n, max_elems);
+                        let at = format!("m={m} k={k} n={n} budget={max_elems}: rows={rows}");
+                        assert!(rows >= 1 && rows <= m, "{at}");
+                        assert!(rows * k <= max_elems && rows * n <= max_elems, "{at}");
+                        let rows_u32 = u32::try_from(rows).expect("batch rows fit u32");
+                        let d = select_gemm_dispatch(rows_u32, k as u32, n as u32);
+                        assert!(
+                            d.wg_y <= 65535,
+                            "{at}: wg_y={} small_k={}",
+                            d.wg_y,
+                            d.use_small_k
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The splits read the budget the B gate read. A k (or n) past wgpu's
+    /// DEFAULT 128 MiB wall but inside a live budget must still get rows: a
+    /// split on the static `MAX_BINDING_ELEMS` under a live gate gives 0 here,
+    /// and `gemm_f32_batched` never advances.
+    #[test]
+    fn gemm_batch_rows_split_on_the_gate_budget() {
+        let past_static = MAX_BINDING_ELEMS + 1;
+        assert_eq!(gemm_batch_rows(3, past_static, 1, LARGEST_LIVE_BUDGET), 3);
+        assert_eq!(gemm_batch_rows(3, 1, past_static, LARGEST_LIVE_BUDGET), 3);
+        assert_eq!(
+            gemm_batch_rows(usize::MAX, past_static, 1, LARGEST_LIVE_BUDGET),
+            LARGEST_LIVE_BUDGET / past_static
+        );
+        // At the gate's own edge (k·n == budget) one row still fits, on the
+        // static budget and on the live one.
+        for budget in [MAX_BINDING_ELEMS, LARGEST_LIVE_BUDGET] {
+            assert_eq!(gemm_batch_rows(5, budget, 1, budget), 1);
+            assert_eq!(gemm_batch_rows(5, 1, budget, budget), 1);
+        }
+    }
+
+    #[test]
+    fn max_m_for_dispatch_follows_the_shader_for_k() {
+        assert_eq!(max_m_for_dispatch(1), MAX_M_FOR_SMALL_K_DISPATCH);
+        assert_eq!(
+            max_m_for_dispatch(GEMM_SMALL_K_THRESHOLD as usize),
+            MAX_M_FOR_SMALL_K_DISPATCH
+        );
+        assert_eq!(
+            max_m_for_dispatch(GEMM_SMALL_K_THRESHOLD as usize + 1),
+            M_EXACT_BOUNDARY as usize
+        );
+        // The tiled limit is exactly the boundary the selector tests pin.
+        assert_eq!(MAX_M_FOR_TILED_DISPATCH, M_EXACT_BOUNDARY as usize);
+        let d = select_gemm_dispatch(MAX_M_FOR_SMALL_K_DISPATCH as u32, 64, 1);
+        assert!(d.use_small_k && d.wg_y == 65535);
     }
 
     #[test]

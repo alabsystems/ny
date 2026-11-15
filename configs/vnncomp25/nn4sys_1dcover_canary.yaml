@@ -1,0 +1,99 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# #nn4sys-1d-cover CANARY — nn4sys.yaml plus the three exact one-axis
+# complete-cover keys, armed.
+#
+# THIS FILE IS UNREACHABLE BY CATEGORY RESOLUTION, BY CONSTRUCTION.
+# `resolve_preset_path` joins `{candidate}.yaml` for the candidates
+# `preset_basename_candidates` produces, and those are only the lowercased
+# category and its year-stripped base — `nn4sys`, never
+# `nn4sys_1dcover_canary`. So a scored run can never pick it up, and arming
+# these keys here changes no verdict. Pinned from both ends by
+# `nn4sys_1d_cover_stays_dark_in_every_resolvable_preset`
+# (crates/ny-cli/src/preset/vnncomp_preset_tests.rs): this is the ONLY yaml
+# that may arm the three keys, AND the effective `nn4sys` preset must not.
+#
+# It exists so the delivery route can be proved on the REAL path — a live run
+# with `--configs-dir` pointed here and ZERO `NY_*` set, asserting the
+# box-refinement screen's own line reports
+# `cover_armed=true cover_src=preset cover_depth=24`. The resolver unit tests
+# exercise the resolver; they do not exercise the CLI bridge that writes the
+# cell, and per this repo's own history that bridge was once silently
+# clobbered in a merge while every reachability test stayed green.
+#
+# Depth 24 is the reader's `HARD_MAX_DEPTH`, deliberately: the cover's pass is
+# ALL-OR-NOTHING, so the question the canary exists to answer is whether the
+# cover can complete at all, not whether a cheap depth is affordable.
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/nn4sys
+  csv_name: instances.csv
+
+solver:
+  batch_size: 256
+  auto_enlarge_batch_size: true
+  bound_prop_method: forward+crown
+
+attack:
+  pgd_order: skip
+  pgd_restarts: 10
+
+bab:
+  # #nn4sys-1d-cover, armed. Every other key in this file is
+  # byte-identical to configs/vnncomp25/nn4sys.yaml.
+  nn4sys_1d_cover: true
+  nn4sys_1d_cover_depth: 24
+  nn4sys_1d_cover_slice: 0.25
+  batch_size: 64
+  # NN4SYS is a proof-only suite (all 195 published 2025 rows are UNSAT).
+  # `attack.pgd_order: skip` disables the engine attacker; make both independent
+  # tail consumers explicit as well so no proof time is reserved for disabled
+  # PGD and the VNN-COMP wrapper does not reload the 151 MB dual model.
+  phase_budget:
+    post_bab_pgd_fraction: 0.0
+    vnncomp_post_bab_attack: false
+  clip:
+    relaxed: true
+  branching:
+    method: input
+    candidates: 10
+    input_split:
+      enable: true
+      sb_coeff_thresh: 0.1
+      reorder_bab: true
+      # Saturation-Escape Branching (#nn4sys-seb-dark, B8): arm the dual-pool
+      # input brancher AND the precheck budget cap that lets the per-clause
+      # input-split BaB loop run at all (without it the box-refinement screen
+      # holds a 0.95 fraction and the loop is reached with ~0 budget, returning
+      # unknown without ever branching).
+      # MEASURED (decision probe, scratchpad/invprop_ab/
+      # mscn_dual_SEB_probe_RESULTS_2026-07-20.txt): 1-D mscn dual disjuncts
+      # close in 7-20 leaves, 2-D in 57-369 with SEB vs 697/timeout blind;
+      # CROWN-per-box flips 0/1200 (companion probe, same date) — branching is
+      # the only lever on this pool. HYP: transfer from the probe's simulated
+      # bisection to full-instance scored wall time is unpriced until the
+      # Measure phase runs the category. Env NY_SAT_ESCAPE_BRANCH still
+      # overrides (0 kills, 1 forces).
+      # MEASURED ON SCORED WALL TIME, 2026-08-01 — and the hypothesis above is
+      # REFUTED. The probe's simulated bisection did not transfer. A/B over the
+      # first 12 `_dual` rows at their official budgets (RTX 5080, 10-CPU cgroup,
+      # NY_SAT_ESCAPE_BRANCH forcing each arm):
+      #
+      #   armed  (sat_escape_branch: true)   unsat  1 / 12
+      #   unarmed                            unsat  8 / 12
+      #
+      # Arming SEB LOSES 7 of 12 rows it previously proved. The mechanism is in
+      # this file's own budget note above and at
+      # ny-cli/src/commands/beta_crown/verify/disjunctive.rs:549-558: arming caps
+      # the per-clause precheck slice at `.min(0.5)` where the unarmed path takes
+      # `.max(0.95)`. On the mscn dual band the precheck lane is what actually
+      # closes the disjuncts, so halving it costs far more than the SEB brancher
+      # returns. At ~0.5155 nn4sys points per row this band is ~11.9 points.
+      #
+      # Left OFF until an A/B on scored wall time — not a bisection probe —
+      # shows a gain. NY_SAT_ESCAPE_BRANCH=1 still forces it for experiments.
+      sat_escape_branch: false
+  alpha_crown:
+    lr_alpha: 0.2

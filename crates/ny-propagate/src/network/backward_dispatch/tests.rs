@@ -677,7 +677,7 @@ fn dispatch_relu_returns_unsupported() {
     }
 }
 
-/// MulBinary now dispatches via McCormick CROWN backward (#3439).
+/// MulBinary now dispatches via McCormick CROWN backward.
 /// Both input bounds resolve to `node_bounds` entries "a" and "b".
 #[test]
 fn dispatch_mulbinary_returns_binary_3439() {
@@ -698,7 +698,7 @@ fn dispatch_mulbinary_returns_binary_3439() {
             bias_lower,
             bias_upper,
         } => {
-            // #2617/#2530: A-matrix bounds must have zero bias
+            // A-matrix bounds must have zero bias
             assert!(
                 bounds_a.lower_b.iter().all(|&v| v == 0.0),
                 "bounds_a lower_b should be zero"
@@ -723,7 +723,7 @@ fn dispatch_mulbinary_returns_binary_3439() {
     }
 }
 
-/// MulBinary dispatch with alpha parameters uses interpolated McCormick (#3439 Phase 2).
+/// MulBinary dispatch with alpha parameters uses interpolated McCormick.
 #[test]
 fn dispatch_mulbinary_with_alpha_returns_binary_3439() {
     let layer = Layer::MulBinary(MulBinaryLayer);
@@ -1121,10 +1121,10 @@ fn dispatch_flatten_via_trait_returns_single() {
 }
 
 // ===================================================================
-// Concat N-ary: separate bias channel (#2617, supersedes #2529)
+// Concat N-ary: separate bias channel
 // ===================================================================
 
-/// Regression test for #2529/#2617: Concat with constant-input bias goes through
+/// Regression test: Concat with constant-input bias goes through
 /// the separate bias channel (not split across per-input bounds).
 #[test]
 fn dispatch_concat_nary_constant_input_bias_in_separate_channel_2617() {
@@ -1173,7 +1173,7 @@ fn dispatch_concat_nary_constant_input_bias_in_separate_channel_2617() {
             );
             assert!(entries.onnx_slots()[0].is_some(), "Input 0 should be Some");
             assert!(entries.onnx_slots()[2].is_some(), "Input 2 should be Some");
-            // Bias = incoming bias + W*constant for constant positions (#4112).
+            // Bias = incoming bias + W*constant for constant positions.
             // lower_a slice for the constant (col 2) is ones(1,1), constant=42.0
             // → contribution ≈ 42.0; total ≈ 0.9 + 42.0 = 42.9
             let expected_lower = 0.9_f32 + 42.0_f32;
@@ -1318,10 +1318,10 @@ fn resolve_input_bounds_missing_node_returns_error() {
 }
 
 // ===================================================================
-// NumericalInstability → Unsupported fallback (#2888)
+// NumericalInstability → Unsupported fallback
 // ===================================================================
 
-/// Regression test for #2888: NumericalInstability from a layer's CROWN backward
+/// Regression test: NumericalInstability from a layer's CROWN backward
 /// (e.g., Exp with non-finite pre-activation bounds) must return Unsupported,
 /// not propagate as a hard error. The caller uses this to fall back to IBP.
 #[test]
@@ -1342,7 +1342,7 @@ fn dispatch_numerical_instability_returns_unsupported_2888() {
     let ctx = make_ctx(&layer, &pre_act, &net_input, &node_bounds, &inputs);
     let lb = identity_lb(2);
 
-    // Before #2888 fix: this would return Err(NumericalInstability).
+    // Before the fix: this would return Err(NumericalInstability).
     // After fix: returns Ok(Unsupported) so callers can fall back to IBP.
     let result = dispatch_backward_layer(&ctx, &lb)
         .expect("NumericalInstability should be caught as Unsupported, not propagated as error");

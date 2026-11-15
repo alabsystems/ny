@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Types and helpers for the batched GPU CROWN backward pass (#3397).
+//! Types and helpers for the batched GPU CROWN backward pass.
 //!
 //! Contains `DispatchStep`, `StagingBuilder`, the dispatch plan builder,
 //! and dimension query helpers.
@@ -67,7 +67,7 @@ pub(super) enum DispatchStep {
         num_specs_u32: u32,
         ping: usize,
         /// When true, dispatch the ReLU dual-alpha pipeline instead of
-        /// the standard activation pipeline (#4313).
+        /// the standard activation pipeline.
         dual_alpha: bool,
     },
     BiasAccumulate {

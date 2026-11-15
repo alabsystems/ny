@@ -608,7 +608,7 @@ fn test_empty_inputs() {
     assert_finite(result, "relu_sdp_offset_opt empty inputs");
 }
 
-// ============== Directed rounding tests (issue #1676) ==============
+// ============== Directed rounding tests ==============
 
 #[ntest::timeout(10000)]
 #[test]

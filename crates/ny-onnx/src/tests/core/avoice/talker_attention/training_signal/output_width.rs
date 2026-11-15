@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Talker attention output-width smoke and ranking tests (#3520 Packet B).
+//! Talker attention output-width smoke and ranking tests (Packet B).
 //!
 //! Proves the weak-region mining pipeline works on a multi-input model
 //! after auxiliary inputs (cos/sin/mask) are frozen via `freeze_inputs`.
@@ -41,8 +41,6 @@ fn talker_smoke_region_spec(seq_len: usize, epsilon: f32) -> Vec<RegionSpec> {
 /// Uses short seq_len=4 and tight epsilon=5e-4 to minimize CROWN runtime.
 /// The key proof: `mine_weak_regions_model` works on a multi-input model
 /// after `freeze_inputs` reduces it to a single activation input.
-///
-/// Part of #3520 Packet B.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
 #[cfg(feature = "external-avoice")]
@@ -112,8 +110,6 @@ fn test_talker_training_signal_smoke_3520() {
 /// Multi-region ranking: mines 2 regions with different epsilons to prove
 /// the talker sweep ranks wider bounds higher. Deterministic ordering
 /// is already proven by unit tests; this confirms it on real attention weights.
-///
-/// Part of #3520 Packet B.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
 #[cfg(feature = "external-avoice")]

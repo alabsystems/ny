@@ -14,6 +14,7 @@ use super::softmax::{CausalSoftmaxLayer, SoftmaxLayer};
 use crate::LinearBounds;
 
 mod crown_ternary;
+mod directional;
 
 /// Attention mask behavior for self-attention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,7 +81,7 @@ impl SelfAttentionLayer {
             ));
         }
         if head_dim > (1 << 24) {
-            // f32 precision guard (#2136)
+            // f32 precision guard
             return Err(NyError::InternalError(format!(
                 "head_dim {head_dim} exceeds f32 exact integer range"
             )));

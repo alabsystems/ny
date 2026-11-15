@@ -20,7 +20,7 @@ use super::child_eval::ChildOutcome;
 impl BetaCrownVerifier {
     /// Process domains sequentially with cut support and full SPSA β optimization.
     ///
-    /// `split_depth` controls multi-depth ReLU splitting (#2767): when > 1,
+    /// `split_depth` controls multi-depth ReLU splitting: when > 1,
     /// selects top-k unstable neurons and creates 2^k child domains per parent.
     /// Reference: alpha-beta-CROWN depth mode (`domain_updater.py:63-304`).
     #[allow(clippy::too_many_arguments)]
@@ -106,6 +106,16 @@ impl BetaCrownVerifier {
                 let l = output.lower_scalar();
                 let u = output.upper_scalar();
                 let verified = self.config.domain_is_verified(l, u, threshold);
+                if verified {
+                    self.cover_note_bound(
+                        objective,
+                        threshold,
+                        &domain.history,
+                        Some(&domain.beta_state),
+                        l,
+                        u,
+                    );
+                }
                 GraphDomainResult::NoUnstable {
                     lower: l,
                     upper: u,
@@ -114,6 +124,7 @@ impl BetaCrownVerifier {
             }
             Err(ref e) if e.is_infeasible_domain() => {
                 debug!(error = %e, depth = domain.depth, "NoUnstable domain infeasible (empty)");
+                self.cover_note_infeasible(objective, threshold, &domain.history, None);
                 GraphDomainResult::AlreadyVerified
             }
             Err(e) => {
@@ -157,8 +168,14 @@ impl BetaCrownVerifier {
                 return Ok(vec![GraphDomainResult::PropagationFailure]);
             }
         };
-        let child_domains =
-            domain.with_multi_constraints(graph, &branches, self.config.verify_upper_bound)?;
+        let child_domains = domain.with_multi_constraints_observed(
+            graph,
+            &branches,
+            self.config.verify_upper_bound,
+            &mut |history, constraint| {
+                self.cover_note_infeasible(objective, threshold, history, Some(constraint));
+            },
+        )?;
         debug!(
             depth = domain.depth,
             split_k = branches.len(),

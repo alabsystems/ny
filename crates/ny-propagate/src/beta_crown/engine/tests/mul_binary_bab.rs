@@ -6,7 +6,7 @@
 //!
 //! Verifies that MulBinary (element-wise multiply) nodes are handled correctly
 //! in the graph input-split BaB path via canonical dispatch → McCormick
-//! envelopes. Part of #3439.
+//! envelopes.
 
 use super::prelude::*;
 use crate::layers::binary_ops::MulBinaryLayer;

@@ -16,11 +16,8 @@
 
 use crate::layers::Layer;
 
-// `DispatchVerdict::Refused` is deliberately NOT imported: nothing on these
-// four paths currently fails closed, and an unused import is a cheap reminder
-// that the bucket is empty by observation rather than by oversight (pinned in
-// `tests::no_variant_is_currently_refused_on_any_dispatcher`).
-use super::DispatchVerdict::{self, FallsBack, Supported};
+// Diagnostic point-only representations have no proof fallback.
+use super::DispatchVerdict::{self, FallsBack, Refused, Supported};
 
 // ===================================================================
 // 1. Dense CROWN backward — `network::backward_dispatch::dispatch_backward_layer`
@@ -29,14 +26,15 @@ use super::DispatchVerdict::{self, FallsBack, Supported};
 /// Classify `layer` against the canonical DENSE CROWN backward dispatcher.
 ///
 /// Ground truth: `dispatch_backward_layer_inner` in
-/// `network/backward_dispatch/dispatch.rs`, which has been exhaustive (no
-/// catch-all) since #3424. `Supported` here means that dispatcher has an arm
+/// `network/backward_dispatch/dispatch.rs`, which is exhaustive (no
+/// catch-all). `Supported` here means that dispatcher has an arm
 /// producing real linear bounds; `FallsBack` means the arm exists but returns
 /// `BackwardDispatchResult::Unsupported`, which every caller turns into a sound
 /// IBP concretization of the node.
 #[allow(clippy::match_same_arms, clippy::too_many_lines)]
 pub(super) fn dense_crown_backward(layer: &Layer) -> DispatchVerdict {
     match layer {
+        Layer::PointLinear(_) => Refused("diagnostic point-only representation"),
         // --- Real dense arms -------------------------------------------------
         Layer::Linear(_)
         | Layer::IntervalConst(_)
@@ -215,6 +213,7 @@ pub(super) fn dense_crown_backward(layer: &Layer) -> DispatchVerdict {
 #[allow(clippy::match_same_arms, clippy::too_many_lines)]
 pub(super) fn batched_crown_backward(layer: &Layer) -> DispatchVerdict {
     match layer {
+        Layer::PointLinear(_) => Refused("diagnostic point-only representation"),
         // --- Real batched arms (unary) --------------------------------------
         // Every elementwise activation routes through the macro-generated arms.
         Layer::ReLU(_)
@@ -310,8 +309,8 @@ pub(super) fn batched_crown_backward(layer: &Layer) -> DispatchVerdict {
         // records that the ARM exists, not that every node takes it.
         Layer::Add(_) | Layer::ExpandLikeLastAxis(_) | Layer::MatMul(_) | Layer::MulBinary(_)
         | Layer::BilinearCrown(_) => Supported,
-        // REGRESSION SITE: the dense dispatcher has had a `Sub` arm since
-        // #2617; the batched one had none, so every `Sub` node — the join of
+        // REGRESSION SITE: the dense dispatcher has long had a `Sub` arm; the
+        // batched one had none, so every `Sub` node — the join of
         // every fusion difference-graph — concretized through the
         // correlation-blind interval difference.
         Layer::Sub(_) => Supported,
@@ -427,6 +426,7 @@ pub(super) fn batched_arm_is_graph_level(layer: &Layer) -> bool {
 #[allow(clippy::match_same_arms, clippy::too_many_lines)]
 pub(super) fn alpha_entry(layer: &Layer) -> DispatchVerdict {
     match layer {
+        Layer::PointLinear(_) => Refused("diagnostic point-only representation"),
         // --- Alpha-bearing --------------------------------------------------
         Layer::ReLU(_) => Supported,
         Layer::Sigmoid(_) | Layer::Tanh(_) => Supported,
@@ -604,6 +604,7 @@ enum BlockWiseArm {
 fn block_wise_arm(layer: &Layer) -> BlockWiseArm {
     use BlockWiseArm::{InheritsBatchedUnary, Own};
     match layer {
+        Layer::PointLinear(_) => Own(Refused("diagnostic point-only representation")),
         // --- Explicit block-wise arms ---------------------------------------
         // Add: identity backward to both inputs — the residual join, and the
         // reason the fallback arms below must NOT return early.

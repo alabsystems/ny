@@ -58,7 +58,7 @@ impl CutKind {
 ///
 /// Uses atomic types instead of `Cell` so that `GraphCutPool` (which contains
 /// `CutMetadata` via `GraphCuttingPlane`) is `Sync` and can be shared as a
-/// read-only view in Rayon `par_iter()` closures. Part of #3813.
+/// read-only view in Rayon `par_iter()` closures.
 ///
 /// All operations use `Relaxed` ordering — these are statistical counters for
 /// eviction heuristics, not synchronization points.

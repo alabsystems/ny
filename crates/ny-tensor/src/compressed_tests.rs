@@ -572,7 +572,6 @@ fn test_widen_for_soundness_expected_magnitude() {
 fn test_to_bounded_tensor_error_on_corrupt_shape() {
     // Test that to_bounded_tensor() returns error when shape doesn't match data
     // This exercises the error path at lines 108-111 and 114-116.
-    // Part of #163: verify decompression error propagation
     let lower = vec![f16::from_f32(0.0), f16::from_f32(1.0)]; // len=2
     let upper = vec![f16::from_f32(1.0), f16::from_f32(2.0)]; // len=2
     let shape = vec![3]; // expects len=3, but we only have 2 elements
@@ -593,7 +592,7 @@ fn test_to_bounded_tensor_error_on_corrupt_shape() {
 
 /// Directed rounding: from_bounded_tensor must round lower bounds DOWN
 /// and upper bounds UP, even when the f32 value is not exactly representable
-/// in f16. (#3039)
+/// in f16.
 #[test]
 fn test_from_bounded_tensor_directed_rounding() {
     // 1000.123 is not exactly representable in f16.
@@ -628,7 +627,7 @@ fn test_from_bounded_tensor_directed_rounding() {
 /// f16 overflow: values > 65504 become ±Inf in f16. to_bounded_tensor() must
 /// succeed (not reject Inf) because directed rounding ensures only sound
 /// infinities appear: lower bounds get -Inf (widened), upper bounds get +Inf
-/// (widened). (#2358)
+/// (widened).
 #[test]
 fn test_to_bounded_tensor_handles_f16_overflow_2358() {
     // Create bounds that exceed f16::MAX (~65504) — these overflow to ±Inf in f16.
@@ -639,7 +638,7 @@ fn test_to_bounded_tensor_handles_f16_overflow_2358() {
     let compressed = CompressedBounds::from_bounded_tensor(&bounds);
     assert!(compressed.has_overflow(), "Should detect f16 overflow");
 
-    // CRITICAL: decompression must NOT return Err. Before #2358 fix,
+    // CRITICAL: decompression must NOT return Err. Before the fix,
     // this would fail with NumericalInstability because BoundedTensor::new
     // rejects Inf values.
     let restored = compressed.to_bounded_tensor();
@@ -693,7 +692,7 @@ fn test_to_bounded_tensor_handles_f16_overflow_2358() {
 }
 
 /// Proptest: from_bounded_tensor → to_bounded_tensor round-trip always produces
-/// bounds ⊇ originals (soundness property). (#3039)
+/// bounds ⊇ originals (soundness property).
 ///
 /// For every element: restored_lower <= original_lower AND restored_upper >= original_upper.
 /// This is guaranteed by directed rounding (from_f32_down for lower, from_f32_up for upper).
@@ -776,7 +775,7 @@ mod proptest_roundtrip {
 
 /// max_precision_loss must propagate NaN errors, not absorb them.
 /// f32::max absorbs NaN per IEEE 754 maxNum semantics — nan_propagating_max
-/// correctly returns NaN when either argument is NaN. (#3291 F2)
+/// correctly returns NaN when either argument is NaN.
 #[test]
 fn test_max_precision_loss_nan_propagation() {
     // Create a BoundedTensor with a NaN in lower bounds

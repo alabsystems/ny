@@ -27,7 +27,7 @@ use super::{
 ///
 /// Delegates to the grouped centered-normalization adapter with one channel per
 /// group (`num_groups == num_channels`), preserving the single shared flat
-/// centered-normalization implementation from #1744.
+/// centered-normalization implementation.
 pub(crate) fn decomposed_instance_norm_crown_backward(
     a_output: &BatchedLinearBounds,
     ny: &Array1<f32>,
@@ -55,7 +55,7 @@ pub(crate) fn decomposed_instance_norm_crown_backward(
 /// where channels already live in the batch dimensions and each coefficient
 /// row covers only one channel's time axis. This adapter applies the shared
 /// LayerNorm decomposed helper independently to each flattened batch position
-/// and reassembles the original batched layout. Part of #3830.
+/// and reassembles the original batched layout.
 pub(crate) fn decomposed_instance_norm_crown_backward_channel_batched(
     a_output: &BatchedLinearBounds,
     ny: &Array1<f32>,

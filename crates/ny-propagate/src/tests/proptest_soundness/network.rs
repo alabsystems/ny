@@ -114,7 +114,7 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(100) })]
 
-    /// #3437: when `ReduceMax(fixed=false)` forces the unary catch-all onto the
+    /// When `ReduceMax(fixed=false)` forces the unary catch-all onto the
     /// per-layer IBP concretization path, the resulting network bounds must stay
     /// sound and no worse than plain IBP.
     #[ntest::timeout(10000)]
@@ -208,7 +208,7 @@ proptest! {
 // =============================================================================
 // MULTI-LAYER CROWN COMPOSITION SOUNDNESS TESTS
 //
-// Part of #2842: The IBP tests above verify forward-bound propagation. These
+// The IBP tests above verify forward-bound propagation. These
 // CROWN composition tests verify the backward linear relaxation path, which
 // is the primary bound-tightening algorithm. CROWN backward composition is
 // where soundness bugs hide — a correct single-layer relaxation can produce

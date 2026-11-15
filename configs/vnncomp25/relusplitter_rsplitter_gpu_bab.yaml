@@ -35,6 +35,4 @@ bab:
     lr_alpha: 0.2
     iterations: 20
   beta_crown:
-    lr_alpha: 0.1
     lr_beta: 0.01
-    iterations: 15

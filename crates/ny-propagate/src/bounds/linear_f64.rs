@@ -271,7 +271,7 @@ impl LinearBounds64 {
 
         // Use checked constructor: concretize_dot_products() widens NaN to +/-Inf and
         // repair_inversions() restores lower <= upper, so new() should always succeed.
-        // The f64 path is not performance-critical (soundnessbench only). (#4253)
+        // The f64 path is not performance-critical (soundnessbench only).
         BoundedTensor64::new(lower.into_dyn(), upper.into_dyn())
     }
 

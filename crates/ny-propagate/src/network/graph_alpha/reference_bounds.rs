@@ -171,7 +171,7 @@ pub(crate) fn merge_reference_bound_maps(
                     // different shapes for the same node name when IBP and
                     // CROWN see pre- vs post-concat views. Keeping the
                     // current (wider) bounds is sound — the node just won't
-                    // benefit from IBP tightening. (#4384)
+                    // benefit from IBP tightening.
                     if current_bounds.shape() != candidate_bounds.shape() {
                         tracing::debug!(
                             target = target.as_str(),
@@ -221,7 +221,7 @@ fn merge_tighter_bounds(
             |new_lower, new_upper, &cur_lower, &cur_upper, &cand_lower, &cand_upper| {
                 // Defense-in-depth: NaN candidates are silently discarded by
                 // f32::max/min (IEEE 754-2008 maxNum semantics), but we guard
-                // explicitly and log for visibility (#3684).
+                // explicitly and log for visibility.
                 if cand_lower.is_nan() || cand_upper.is_nan() {
                     nan_count += 1;
                     *new_lower = cur_lower;
@@ -237,7 +237,7 @@ fn merge_tighter_bounds(
                 // over-approximation. Adapts to BoundedTensor's strict
                 // lower <= upper invariant (the Python reference proceeds
                 // silently since PyTorch tensors have no validity check).
-                // Source: #3684, optimized_bounds.py:356-361.
+                // Source: optimized_bounds.py:356-361.
                 if merged_lower > merged_upper {
                     disjoint_count += 1;
                     *new_lower = cur_lower;

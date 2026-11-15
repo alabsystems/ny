@@ -21,6 +21,7 @@ Example usage:
     ...     assert_equivalent(diff, tolerance=1e-4)
 """
 
+from ny_pytest._version import resolve_version
 from ny_pytest.assertions import (
     assert_bounds,
     assert_equivalent,
@@ -50,4 +51,8 @@ __all__ = [
     "QuantizationError",
 ]
 
-__version__ = "0.4.0"
+# Derived, never written here: `[workspace.package] version` in the root
+# Cargo.toml is the single source (see ny_pytest/_version.py). The default
+# Cargo lane (crates/ny-test-utils/tests/python_package_version.rs) fails if a
+# literal comes back.
+__version__ = resolve_version()

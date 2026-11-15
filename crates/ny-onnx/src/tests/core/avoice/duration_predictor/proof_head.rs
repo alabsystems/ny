@@ -15,7 +15,7 @@ const KOKORO_DURATION_MAX_FRAMES: f32 = 50.0;
 pub(super) const KOKORO_DEFAULT_SPEED: f32 = 1.0;
 
 // ---------------------------------------------------------------------------
-// Contract accessor boundary (#3917)
+// Contract accessor boundary
 //
 // Centralizes exporter-owned duration head/bin/frame semantics behind a cached,
 // fallback-safe accessor. `KOKORO_REAL_DURATION_SEQUENCE_LEN = 4` in
@@ -310,7 +310,7 @@ pub(super) fn avg_bound_width(bounds: &BoundedTensor) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
-// Fallback regression test (#3917)
+// Fallback regression test
 // ---------------------------------------------------------------------------
 
 #[test]
